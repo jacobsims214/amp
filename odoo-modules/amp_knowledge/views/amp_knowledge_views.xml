@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data>
+
+        <!-- ── List view ──────────────────────────────────────────────────── -->
+        <record id="view_amp_knowledge_entry_list" model="ir.ui.view">
+            <field name="name">amp.knowledge.entry.list</field>
+            <field name="model">amp.knowledge.entry</field>
+            <field name="arch" type="xml">
+                <list string="Knowledge Base">
+                    <field name="title"/>
+                    <field name="entry_type"/>
+                    <field name="project_id" optional="show"/>
+                    <field name="epic_id" optional="hide"/>
+                    <field name="tags" optional="show"/>
+                    <field name="created_by_agent" optional="show"/>
+                    <field name="create_date" optional="show"/>
+                </list>
+            </field>
+        </record>
+
+        <!-- ── Form view ──────────────────────────────────────────────────── -->
+        <record id="view_amp_knowledge_entry_form" model="ir.ui.view">
+            <field name="name">amp.knowledge.entry.form</field>
+            <field name="model">amp.knowledge.entry</field>
+            <field name="arch" type="xml">
+                <form string="Knowledge Entry">
+                    <sheet>
+                        <div class="oe_title">
+                            <h1>
+                                <field name="title" placeholder="Short, searchable title…"/>
+                            </h1>
+                        </div>
+                        <group>
+                            <group string="Classification">
+                                <field name="entry_type"/>
+                                <field name="tags" placeholder="odoo19, manifest, assets"/>
+                                <field name="created_by_agent"/>
+                            </group>
+                            <group string="Linked To">
+                                <field name="project_id"/>
+                                <field name="epic_id"
+                                       domain="[('project_id', '=', project_id)]"
+                                       invisible="not project_id"/>
+                                <field name="story_id"
+                                       domain="[('epic_id', '=', epic_id)]"
+                                       invisible="not epic_id"/>
+                                <field name="task_id"
+                                       domain="[('story_id', '=', story_id)]"
+                                       invisible="not story_id"/>
+                            </group>
+                        </group>
+                        <field name="content" widget="html"/>
+                    </sheet>
+                    <div class="oe_chatter">
+                        <field name="message_follower_ids"/>
+                        <field name="activity_ids"/>
+                        <field name="message_ids"/>
+                    </div>
+                </form>
+            </field>
+        </record>
+
+        <!-- ── Search view ────────────────────────────────────────────────── -->
+        <record id="view_amp_knowledge_entry_search" model="ir.ui.view">
+            <field name="name">amp.knowledge.entry.search</field>
+            <field name="model">amp.knowledge.entry</field>
+            <field name="arch" type="xml">
+                <search string="Search Knowledge">
+                    <field name="title"
+                           filter_domain="['|', '|', ('title', 'ilike', self), ('content_text', 'ilike', self), ('tags', 'ilike', self)]"
+                           string="Title / Content / Tags"/>
+                    <field name="project_id"/>
+                    <field name="created_by_agent"/>
+                    <separator/>
+                    <filter string="Decisions"  name="decisions"  domain="[('entry_type', '=', 'decision')]"/>
+                    <filter string="Findings"   name="findings"   domain="[('entry_type', '=', 'finding')]"/>
+                    <filter string="How-Tos"    name="howto"      domain="[('entry_type', '=', 'howto')]"/>
+                    <filter string="Issues"     name="issues"     domain="[('entry_type', '=', 'issue')]"/>
+                    <filter string="Context"    name="context"    domain="[('entry_type', '=', 'context')]"/>
+                    <group>
+                        <filter string="Project"  name="by_project" domain="[]" context="{'group_by': 'project_id'}"/>
+                        <filter string="Type"     name="by_type"    domain="[]" context="{'group_by': 'entry_type'}"/>
+                        <filter string="Agent"    name="by_agent"   domain="[]" context="{'group_by': 'created_by_agent'}"/>
+                    </group>
+                </search>
+            </field>
+        </record>
+
+        <!-- ── Window action ──────────────────────────────────────────────── -->
+        <record id="action_amp_knowledge_entry" model="ir.actions.act_window">
+            <field name="name">Knowledge Base</field>
+            <field name="res_model">amp.knowledge.entry</field>
+            <field name="view_mode">list,form</field>
+            <field name="search_view_id" ref="view_amp_knowledge_entry_search"/>
+            <field name="help" type="html">
+                <p class="o_view_nocontent_smiling_face">No knowledge entries yet</p>
+                <p>Agents write here when they discover something worth sharing:
+                   decisions, patterns, gotchas, how-tos.</p>
+            </field>
+        </record>
+
+    </data>
+</odoo>

@@ -1,0 +1,12 @@
+services:
+  amp-mcp:
+    build: ./mcp-go
+    container_name: amp-odoo-mcp
+    ports:
+      - "8000:8000"
+    environment:
+      - ODOO_URL=${ODOO_URL:-http://host.docker.internal:8069}
+      - ODOO_DB=${ODOO_DB}
+      - ODOO_USER=${ODOO_USER}
+      - ODOO_PASSWORD=${ODOO_PASSWORD}
+    restart: unless-stopped

@@ -1,0 +1,56 @@
+.o_amp_project_kanban .oe_kanban_card {
+    border-left: 4px solid #875a7b;
+}
+
+.o_amp_project_kanban .oe_kanban_card[data-state="active"] {
+    border-left-color: #28a745;
+}
+
+.o_amp_project_kanban .oe_kanban_card[data-state="archived"] {
+    border-left-color: #6c757d;
+}
+
+.o_amp_dashboard {
+    padding: 20px;
+}
+
+.o_amp_dashboard .card {
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    border: none;
+}
+
+.o_amp_dashboard .card-title {
+    color: #875a7b;
+    font-weight: bold;
+}
+
+.o_amp_critical_path {
+    border: 2px solid #ffc107 !important;
+    background-color: #fffbf0;
+}
+
+.o_amp_task_blocked {
+    background-color: #f8d7da;
+    border-color: #dc3545;
+}
+
+.o_amp_task_ready {
+    background-color: #d4edda;
+    border-color: #28a745;
+}
+
+.oe_stat_button .o_stat_info .o_stat_value {
+    font-size: 20px;
+    font-weight: bold;
+    color: #875a7b;
+}
+
+.oe_stat_button .o_stat_info .o_stat_text {
+    font-size: 11px;
+    color: #666;
+}
+
+.o_progressbar .o_progressbar_value {
+    font-weight: bold;
+    color: #875a7b;
+}

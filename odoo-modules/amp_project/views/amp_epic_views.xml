@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data>
+        <!-- Epic Tree View -->
+        <record id="view_amp_epic_tree" model="ir.ui.view">
+            <field name="name">amp.epic.tree</field>
+            <field name="model">amp.epic</field>
+            <field name="arch" type="xml">
+                <list string="Epics" decoration-muted="state == 'cancelled'" decoration-success="state == 'completed'">
+                    <field name="sequence" widget="handle"/>
+                    <field name="name"/>
+                    <field name="code"/>
+                    <field name="project_id"/>
+                    <field name="state" widget="badge"/>
+                    <field name="story_count"/>
+                    <field name="task_count"/>
+                    <field name="progress_percentage" widget="progressbar"/>
+                    <field name="priority" widget="priority"/>
+                </list>
+            </field>
+        </record>
+        
+        <!-- Epic Form View -->
+        <record id="view_amp_epic_form" model="ir.ui.view">
+            <field name="name">amp.epic.form</field>
+            <field name="model">amp.epic</field>
+            <field name="arch" type="xml">
+                <form string="Epic">
+                    <header>
+                        <button name="action_move_to_planning" string="Start Planning" type="object" class="oe_highlight" invisible="state != 'backlog'"/>
+                        <button name="action_start" string="Start Epic" type="object" class="oe_highlight" invisible="state not in ('backlog', 'planning')"/>
+                        <button name="action_complete" string="Complete" type="object" class="oe_highlight" invisible="state == 'completed'"/>
+                        <field name="state" widget="statusbar" statusbar_visible="backlog,planning,in_progress,completed"/>
+                    </header>
+                    <sheet>
+                        <div class="oe_button_box" name="button_box">
+                            <button name="action_view_stories" type="object" class="oe_stat_button" icon="fa-book">
+                                <field name="story_count" widget="statinfo" string="Stories"/>
+                            </button>
+                        </div>
+                        <div class="oe_title">
+                            <h1>
+                                <field name="name" placeholder="Epic Name"/>
+                            </h1>
+                        </div>
+                        <group>
+                            <group>
+                                <field name="project_id"/>
+                                <field name="code"/>
+                                <field name="description"/>
+                            </group>
+                            <group>
+                                <field name="priority" widget="priority"/>
+                                <field name="progress_percentage" widget="progressbar"/>
+                            </group>
+                        </group>
+                        <notebook>
+                            <page string="Stories">
+                                <field name="story_ids" context="{'default_epic_id': id, 'default_project_id': project_id}">
+                                    <list>
+                                        <field name="sequence" widget="handle"/>
+                                        <field name="name"/>
+                                        <field name="state"/>
+                                        <field name="task_count"/>
+                                        <field name="is_ready"/>
+                                    </list>
+                                </field>
+                            </page>
+                            <page string="DAG Data">
+                                <field name="dag_json"/>
+                            </page>
+                        </notebook>
+                    </sheet>
+                    <div class="oe_chatter">
+                        <field name="message_follower_ids"/>
+                        <field name="activity_ids"/>
+                        <field name="message_ids"/>
+                    </div>
+                </form>
+            </field>
+        </record>
+        
+        <!-- Epic Kanban View -->
+        <record id="view_amp_epic_kanban" model="ir.ui.view">
+            <field name="name">amp.epic.kanban</field>
+            <field name="model">amp.epic</field>
+            <field name="arch" type="xml">
+                <kanban default_group_by="state">
+                    <field name="name"/>
+                    <field name="state"/>
+                    <field name="story_count"/>
+                    <field name="progress_percentage"/>
+                    <templates>
+                        <t t-name="card">
+                            <div class="oe_kanban_card">
+                                <div class="o_kanban_record_top">
+                                    <strong><field name="name"/></strong>
+                                </div>
+                                <div class="o_kanban_record_body">
+                                    <field name="progress_percentage" widget="progressbar"/>
+                                    <div class="mt-2">
+                                        <span class="badge bg-info"><field name="story_count"/> Stories</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </t>
+                    </templates>
+                </kanban>
+            </field>
+        </record>
+        
+        <!-- Epic Action -->
+        <record id="action_amp_epic" model="ir.actions.act_window">
+            <field name="name">Epics</field>
+            <field name="res_model">amp.epic</field>
+            <field name="view_mode">kanban,list,form</field>
+        </record>
+    </data>
+</odoo>

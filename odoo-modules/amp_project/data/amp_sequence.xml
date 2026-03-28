@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data noupdate="1">
+        <!-- Default sequences for AMP models -->
+        <record id="seq_amp_project" model="ir.sequence">
+            <field name="name">AMP Project</field>
+            <field name="code">amp.project</field>
+            <field name="prefix">PROJ-</field>
+            <field name="padding">4</field>
+            <field name="company_id" eval="False"/>
+        </record>
+        
+        <record id="seq_amp_epic" model="ir.sequence">
+            <field name="name">AMP Epic</field>
+            <field name="code">amp.epic</field>
+            <field name="prefix">EPIC-</field>
+            <field name="padding">4</field>
+            <field name="company_id" eval="False"/>
+        </record>
+        
+        <record id="seq_amp_story" model="ir.sequence">
+            <field name="name">AMP Story</field>
+            <field name="code">amp.story</field>
+            <field name="prefix">STORY-</field>
+            <field name="padding">4</field>
+            <field name="company_id" eval="False"/>
+        </record>
+        
+        <record id="seq_amp_task" model="ir.sequence">
+            <field name="name">AMP Task</field>
+            <field name="code">amp.task</field>
+            <field name="prefix">TASK-</field>
+            <field name="padding">5</field>
+            <field name="company_id" eval="False"/>
+        </record>
+    </data>
+</odoo>

@@ -1,0 +1,18 @@
+{
+  "version": "1.0.0",
+  "project_id": 2,
+  "project_code": "amp-platform",
+  "project_name": "AMP Platform Development",
+  "created_at": "2026-03-28T10:00:00Z",
+  "last_session": "2026-03-28T10:00:00Z",
+  "current_epic_id": 3,
+  "current_story_id": null,
+  "active_task_ids": [],
+  "kb_entry_ids": [],
+  "context": {
+    "repository": "AMP Platform",
+    "description": "Agentic Management Platform - Odoo-based project management with AI agent orchestration",
+    "components": ["MCP Server", "Odoo Modules", "Skills", "Documentation"],
+    "notes": "Initial project setup"
+  }
+}

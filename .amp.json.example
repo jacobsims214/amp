@@ -1,0 +1,17 @@
+{
+  "version": "1.0.0",
+  "project_id": 123,
+  "project_code": "my-amp-project",
+  "project_name": "My AMP Project",
+  "created_at": "2026-03-28T10:00:00Z",
+  "last_session": "2026-03-28T15:30:00Z",
+  "current_epic_id": 456,
+  "current_story_id": 789,
+  "active_task_ids": [101, 102, 103],
+  "kb_entry_ids": [201, 202, 203],
+  "context": {
+    "key_decisions": ["Use PostgreSQL for database", "Implement JWT authentication"],
+    "active_agents": ["amp-worker-1", "amp-worker-2"],
+    "notes": "Initial project setup complete"
+  }
+}

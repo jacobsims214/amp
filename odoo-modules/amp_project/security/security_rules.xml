@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data noupdate="0">
+        <!-- Record rules for multi-company (if needed) -->
+        <record id="amp_project_comp_rule" model="ir.rule">
+            <field name="name">AMP Project: multi-company</field>
+            <field name="model_id" ref="model_amp_project"/>
+            <field name="global" eval="True"/>
+            <field name="domain_force">[(1,'=',1)]</field>
+        </record>
+        
+        <record id="amp_epic_comp_rule" model="ir.rule">
+            <field name="name">AMP Epic: multi-company</field>
+            <field name="model_id" ref="model_amp_epic"/>
+            <field name="global" eval="True"/>
+            <field name="domain_force">[(1,'=',1)]</field>
+        </record>
+        
+        <record id="amp_story_comp_rule" model="ir.rule">
+            <field name="name">AMP Story: multi-company</field>
+            <field name="model_id" ref="model_amp_story"/>
+            <field name="global" eval="True"/>
+            <field name="domain_force">[(1,'=',1)]</field>
+        </record>
+        
+        <record id="amp_task_comp_rule" model="ir.rule">
+            <field name="name">AMP Task: multi-company</field>
+            <field name="model_id" ref="model_amp_task"/>
+            <field name="global" eval="True"/>
+            <field name="domain_force">[(1,'=',1)]</field>
+        </record>
+    </data>
+</odoo>

@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<!-- ── TaskCard ─────────────────────────────────────────────────────────────── -->
+<t t-name="amp_project.TaskCard">
+    <div t-on-click.stop="() => this.openTask()"
+         t-attf-class="amp-task-card
+             #{props.task.dag_critical_path ? ' critical-path' : ''}
+             #{props.task.state === 'blocked' ? ' is-blocked' : ''}
+             #{props.task._flash ? ' flash-update' : ''}"
+         t-attf-style="border-left: 3px solid #{priorityColor}">
+
+        <!-- Agent badge -->
+        <t t-if="props.task.agent_id">
+            <span class="amp-agent-badge" t-att-title="props.task.agent_id">
+                <t t-esc="agentInitials"/>
+            </span>
+        </t>
+
+        <!-- Critical path marker -->
+        <t t-if="props.task.dag_critical_path">
+            <span class="amp-critical-badge">⚡</span>
+        </t>
+
+        <!-- Task name -->
+        <div class="amp-task-name" t-esc="props.task.name"/>
+
+        <!-- Story breadcrumb (only show when epic filter hides story context) -->
+        <t t-if="props.task.story_name">
+            <div class="amp-task-story" t-esc="props.task.story_name"/>
+        </t>
+
+        <!-- Footer: priority dot + metadata chips -->
+        <div class="amp-task-footer">
+            <span class="amp-priority-dot"
+                  t-attf-style="background:#{priorityColor}"
+                  t-att-title="priorityLabel"/>
+            <t t-if="props.task.dag_level > 0">
+                <span class="amp-chip" t-attf-title="DAG level">L<t t-esc="props.task.dag_level"/></span>
+            </t>
+            <t t-if="props.task.dependency_count > 0">
+                <span class="amp-chip" t-attf-title="#{props.task.dependency_count} deps">🔗<t t-esc="props.task.dependency_count"/></span>
+            </t>
+            <t t-if="props.task.planned_hours > 0">
+                <span class="amp-chip"><t t-esc="props.task.planned_hours"/>h</span>
+            </t>
+        </div>
+    </div>
+</t>
+
+<!-- ── AmpBoard ──────────────────────────────────────────────────────────────── -->
+<t t-name="amp_project.AmpBoard">
+    <div class="amp-board-root">
+
+        <!-- ── Sidebar ────────────────────────────────────────────────────── -->
+        <div class="amp-sidebar">
+            <div class="amp-sidebar-header">
+                <span class="amp-logo">⚡ AMP</span>
+                <small>Live Board</small>
+            </div>
+            <div class="amp-project-list">
+                <t t-foreach="state.projects" t-as="proj" t-key="proj.id">
+                    <div t-on-click="() => this.onProjectClick(proj.id)"
+                         t-attf-class="amp-project-item#{state.selectedProjectId === proj.id ? ' selected' : ''}">
+                        <div class="amp-project-item-name" t-esc="proj.name"/>
+                        <div class="amp-project-item-meta">
+                            <t t-esc="proj.task_count"/> tasks ·
+                            <t t-esc="proj.progress_percentage"/>%
+                            <t t-if="proj.active_agent_count > 0">
+                                · <span class="amp-agent-live">●</span> <t t-esc="proj.active_agent_count"/>
+                            </t>
+                        </div>
+                        <div class="amp-mini-progress">
+                            <div class="amp-mini-progress-fill"
+                                 t-attf-style="width:#{proj.progress_percentage}%"/>
+                        </div>
+                    </div>
+                </t>
+                <t t-if="state.projects.length === 0">
+                    <div class="amp-empty-projects">No projects found.</div>
+                </t>
+            </div>
+        </div>
+
+        <!-- ── Main area ──────────────────────────────────────────────────── -->
+        <div class="amp-main">
+
+            <!-- Header -->
+            <div class="amp-header" t-if="state.project">
+                <div class="amp-header-left">
+                    <div class="amp-project-title">
+                        <t t-esc="state.project.name"/>
+                        <span class="amp-project-code" t-if="state.project.code">
+                            · <t t-esc="state.project.code"/>
+                        </span>
+                    </div>
+                    <div class="amp-stats-row">
+                        <div class="amp-stat">
+                            <span class="amp-stat-val" t-esc="state.project.task_count"/>
+                            <span class="amp-stat-lbl">tasks</span>
+                        </div>
+                        <div class="amp-stat">
+                            <span class="amp-stat-val done" t-esc="state.project.completed_task_count"/>
+                            <span class="amp-stat-lbl">done</span>
+                        </div>
+                        <div class="amp-stat">
+                            <span class="amp-stat-val blocked" t-esc="state.project.blocked_task_count"/>
+                            <span class="amp-stat-lbl">blocked</span>
+                        </div>
+                        <div class="amp-stat">
+                            <span class="amp-stat-val agents" t-esc="state.project.active_agent_count"/>
+                            <span class="amp-stat-lbl">agents</span>
+                        </div>
+                        <div class="amp-progress-wrap">
+                            <div class="amp-progress-bar">
+                                <div class="amp-progress-fill" t-attf-style="width:#{progressBarWidth}"/>
+                            </div>
+                            <span class="amp-progress-pct"><t t-esc="state.project.progress_percentage"/>%</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="amp-toolbar">
+                    <select class="amp-select" t-on-change="(ev) => this.onEpicFilter(ev)">
+                        <option value="">All Epics</option>
+                        <t t-foreach="state.epics" t-as="epic" t-key="epic.id">
+                            <option t-att-value="epic.id" t-esc="epic.name"
+                                    t-att-selected="state.filter.epicId === epic.id"/>
+                        </t>
+                    </select>
+                    <select class="amp-select" t-on-change="(ev) => this.onAgentFilter(ev)">
+                        <option value="">All Agents</option>
+                        <t t-foreach="uniqueAgents" t-as="agent" t-key="agent">
+                            <option t-att-value="agent" t-esc="agent"
+                                    t-att-selected="state.filter.agentId === agent"/>
+                        </t>
+                    </select>
+                    <input type="text" class="amp-search" placeholder="Search tasks…"
+                           t-on-input="(ev) => this.onSearchInput(ev)"/>
+                    <button t-on-click="() => this.onToggleCompleted()"
+                            t-attf-class="amp-btn#{state.filter.showCompleted ? ' active' : ''}">
+                        <t t-if="state.filter.showCompleted">Hide Done</t>
+                        <t t-else="">Show Done</t>
+                    </button>
+                    <button class="amp-btn" t-on-click="() => this.onRefresh()"
+                            t-att-disabled="state.loading">⟳</button>
+                </div>
+            </div>
+
+            <!-- Loading -->
+            <div t-if="state.loading and !state.project" class="amp-center">
+                <div class="amp-spinner"/>
+                <span>Loading board…</span>
+            </div>
+
+            <!-- Error -->
+            <div t-elif="state.error" class="amp-center amp-error">
+                ⚠ <t t-esc="state.error"/>
+            </div>
+
+            <!-- No project selected -->
+            <div t-elif="!state.selectedProjectId" class="amp-center amp-empty">
+                <div class="amp-empty-icon">⚡</div>
+                <h3>Select a project</h3>
+                <p>Choose a project from the sidebar to open the live board.</p>
+            </div>
+
+            <!-- ── Board ─────────────────────────────────────────────────── -->
+            <t t-elif="state.project">
+                <div class="amp-board-scroll">
+                    <div class="amp-board-inner">
+
+                        <!-- Column headers — sticky top -->
+                        <div class="amp-col-headers">
+                            <div class="amp-row-label-cell amp-col-header-spacer"/>
+                            <t t-foreach="states" t-as="col" t-key="col.key">
+                                <div class="amp-col-header"
+                                     t-attf-style="border-top:3px solid #{col.color}">
+                                    <span class="amp-col-label" t-esc="col.label"/>
+                                    <span class="amp-col-badge" t-esc="columnCount(col.key)"/>
+                                </div>
+                            </t>
+                        </div>
+
+                        <!-- Epics and their stories -->
+                        <t t-foreach="visibleEpics" t-as="epic" t-key="epic.id">
+
+                            <!-- Epic header -->
+                            <div class="amp-epic-header">
+                                <span class="amp-epic-name">◈ <t t-esc="epic.name"/></span>
+                                <div class="amp-epic-progress-bar">
+                                    <div class="amp-epic-progress-fill"
+                                         t-attf-style="width:#{epic.progress_percentage}%"/>
+                                </div>
+                                <span class="amp-epic-pct"><t t-esc="epic.progress_percentage"/>%</span>
+                            </div>
+
+                            <!-- Story rows -->
+                            <t t-foreach="epic.stories" t-as="story" t-key="story.id">
+                                <div class="amp-story-row">
+
+                                    <!-- Story label cell -->
+                                    <div class="amp-row-label-cell">
+                                        <div class="amp-story-name" t-esc="story.name"/>
+                                        <div class="amp-story-meta">
+                                            <t t-esc="story.task_count"/> tasks
+                                            · <t t-esc="story.progress_percentage"/>%
+                                        </div>
+                                        <span t-if="story.is_ready" class="amp-ready-pill">Ready</span>
+                                    </div>
+
+                                    <!-- Task columns -->
+                                    <t t-foreach="states" t-as="col" t-key="col.key">
+                                        <div class="amp-task-cell"
+                                             t-att-data-state="col.key">
+                                            <t t-foreach="tasksForColumn(story, col.key)"
+                                               t-as="task" t-key="task.id">
+                                                <TaskCard task="task"/>
+                                            </t>
+                                        </div>
+                                    </t>
+                                </div>
+                            </t>
+
+                        </t>
+
+                        <!-- No epics yet -->
+                        <t t-if="state.epics.length === 0">
+                            <div class="amp-center amp-empty" style="padding:40px">
+                                <h3>No epics yet</h3>
+                                <p>Ask the manager agent to plan some work.</p>
+                            </div>
+                        </t>
+
+                    </div>
+                </div>
+            </t>
+
+        </div><!-- /amp-main -->
+    </div><!-- /amp-board-root -->
+</t>
+
+</templates>

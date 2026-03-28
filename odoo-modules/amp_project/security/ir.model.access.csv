@@ -1,0 +1,9 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_amp_project_user,amp.project user,model_amp_project,base.group_user,1,1,1,0
+access_amp_project_manager,amp.project manager,model_amp_project,base.group_system,1,1,1,1
+access_amp_epic_user,amp.epic user,model_amp_epic,base.group_user,1,1,1,0
+access_amp_epic_manager,amp.epic manager,model_amp_epic,base.group_system,1,1,1,1
+access_amp_story_user,amp.story user,model_amp_story,base.group_user,1,1,1,0
+access_amp_story_manager,amp.story manager,model_amp_story,base.group_system,1,1,1,1
+access_amp_task_user,amp.task user,model_amp_task,base.group_user,1,1,1,0
+access_amp_task_manager,amp.task manager,model_amp_task,base.group_system,1,1,1,1

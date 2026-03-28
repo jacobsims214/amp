@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data>
+        <!-- AMP Project Tree View -->
+        <record id="view_amp_project_tree" model="ir.ui.view">
+            <field name="name">amp.project.tree</field>
+            <field name="model">amp.project</field>
+            <field name="arch" type="xml">
+                <list string="AMP Projects" decoration-muted="state == 'archived'" decoration-info="state == 'active'">
+                    <field name="name"/>
+                    <field name="code"/>
+                    <field name="state" widget="badge" decoration-success="state == 'active'" decoration-muted="state == 'archived'"/>
+                    <field name="epic_count"/>
+                    <field name="task_count"/>
+                    <field name="completed_task_count"/>
+                    <field name="progress_percentage" widget="progressbar"/>
+                    <field name="active_agent_count"/>
+                    <field name="last_session"/>
+                </list>
+            </field>
+        </record>
+        
+        <!-- AMP Project Form View -->
+        <record id="view_amp_project_form" model="ir.ui.view">
+            <field name="name">amp.project.form</field>
+            <field name="model">amp.project</field>
+            <field name="arch" type="xml">
+                <form string="AMP Project">
+                    <header>
+                        <button name="action_activate" string="Activate" type="object" class="oe_highlight" invisible="state != 'draft'"/>
+                        <button name="action_archive" string="Archive" type="object" invisible="state == 'archived'"/>
+                        <button name="action_sync_session" string="Sync Session" type="object"/>
+                        <field name="state" widget="statusbar" statusbar_visible="draft,active,archived"/>
+                    </header>
+                    <sheet>
+                        <div class="oe_button_box" name="button_box">
+                            <button name="action_view_epics" type="object" class="oe_stat_button" icon="fa-sitemap">
+                                <field name="epic_count" widget="statinfo" string="Epics"/>
+                            </button>
+                            <button name="action_view_knowledge" type="object" class="oe_stat_button" icon="fa-book">
+                                <span class="o_stat_text">Knowledge</span>
+                            </button>
+                        </div>
+                        <div class="oe_title">
+                            <h1>
+                                <field name="name" placeholder="Project Name"/>
+                            </h1>
+                        </div>
+                        <group>
+                            <group>
+                                <field name="code"/>
+                                <field name="description"/>
+                            </group>
+                            <group>
+                                <field name="epic_count"/>
+                                <field name="story_count"/>
+                                <field name="task_count"/>
+                                <field name="progress_percentage" widget="progressbar"/>
+                                <field name="active_agent_count"/>
+                                <field name="last_session"/>
+                            </group>
+                        </group>
+                        <notebook>
+                            <page string="Epics">
+                                <field name="epic_ids" context="{'default_project_id': id}">
+                                    <list>
+                                        <field name="sequence" widget="handle"/>
+                                        <field name="name"/>
+                                        <field name="state"/>
+                                        <field name="story_count"/>
+                                        <field name="progress_percentage" widget="progressbar"/>
+                                    </list>
+                                </field>
+                            </page>
+                            <page string="Activity Log">
+                                <field name="message_ids" widget="mail_thread"/>
+                            </page>
+                        </notebook>
+                    </sheet>
+                    <div class="oe_chatter">
+                        <field name="message_follower_ids"/>
+                        <field name="activity_ids"/>
+                        <field name="message_ids"/>
+                    </div>
+                </form>
+            </field>
+        </record>
+        
+        <!-- AMP Project Kanban View -->
+        <record id="view_amp_project_kanban" model="ir.ui.view">
+            <field name="name">amp.project.kanban</field>
+            <field name="model">amp.project</field>
+            <field name="arch" type="xml">
+                <kanban class="o_amp_project_kanban">
+                    <field name="name"/>
+                    <field name="code"/>
+                    <field name="state"/>
+                    <field name="epic_count"/>
+                    <field name="task_count"/>
+                    <field name="completed_task_count"/>
+                    <field name="progress_percentage"/>
+                    <field name="active_agent_count"/>
+                    <templates>
+                        <t t-name="card">
+                            <div t-attf-class="oe_kanban_card oe_kanban_global_click">
+                                <div class="o_kanban_record_top">
+                                    <div class="o_kanban_record_headings">
+                                        <strong class="o_kanban_record_title">
+                                            <field name="name"/>
+                                        </strong>
+                                    </div>
+                                    <span class="float-end">
+                                        <field name="state" widget="badge" decoration-success="state == 'active'" decoration-muted="state == 'archived'"/>
+                                    </span>
+                                </div>
+                                <div class="o_kanban_record_body">
+                                    <div>
+                                        <span t-if="record.code.value">[<field name="code"/>]</span>
+                                    </div>
+                                    <div class="mt-2">
+                                        <span class="badge bg-primary"><field name="epic_count"/> Epics</span>
+                                        <span class="badge bg-info"><field name="task_count"/> Tasks</span>
+                                        <span class="badge bg-success" t-if="record.completed_task_count.value > 0"><field name="completed_task_count"/> Done</span>
+                                    </div>
+                                    <div class="mt-2">
+                                        <field name="progress_percentage" widget="progressbar"/>
+                                    </div>
+                                    <div class="mt-2" t-if="record.active_agent_count.value > 0">
+                                        <i class="fa fa-robot"></i> <field name="active_agent_count"/> Active Agents
+                                    </div>
+                                </div>
+                            </div>
+                        </t>
+                    </templates>
+                </kanban>
+            </field>
+        </record>
+        
+        <!-- AMP Project Search View -->
+        <record id="view_amp_project_search" model="ir.ui.view">
+            <field name="name">amp.project.search</field>
+            <field name="model">amp.project</field>
+            <field name="arch" type="xml">
+                <search string="Search AMP Projects">
+                    <field name="name"/>
+                    <field name="code"/>
+                    <filter string="Active" name="active" domain="[('state', '=', 'active')]"/>
+                    <filter string="Draft" name="draft" domain="[('state', '=', 'draft')]"/>
+                    <filter string="Archived" name="archived" domain="[('state', '=', 'archived')]"/>
+                </search>
+            </field>
+        </record>
+        
+        <!-- Action for Projects -->
+        <record id="action_amp_project" model="ir.actions.act_window">
+            <field name="name">AMP Projects</field>
+            <field name="res_model">amp.project</field>
+            <field name="view_mode">kanban,list,form</field>
+            <field name="help" type="html">
+                <p class="o_view_nocontent_smiling_face">
+                    Create your first AMP Project
+                </p>
+                <p>
+                    Projects are the root container for your agent-managed work.
+                </p>
+            </field>
+        </record>
+    </data>
+</odoo>
