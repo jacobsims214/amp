@@ -1,0 +1,236 @@
+---
+name: amp-kb
+description: How to search the AMP knowledge base before starting work, and how to write documents that embed well for semantic search
+---
+
+# AMP Knowledge Base Skill
+
+The KB is a per-project document store with **hybrid keyword + semantic search**. The
+semantic layer uses `nomic-embed-text` embeddings — it understands meaning, not just
+keywords. "goroutine lifecycle" will find a doc about actors. "authentication system"
+will find a doc about JWT middleware. But only if the doc is written in a way that
+gives the model enough natural language to work with.
+
+---
+
+## Rule 1: Search before you start
+
+After reading your ticket, search the KB immediately:
+
+```
+amp_kb_search(project_id=PROJECT_ID, query="<task name + key terms>")
+```
+
+Use multiple searches if needed — the model understands concepts so use natural queries:
+
+```
+amp_kb_search(project_id=2, query="how does authentication work in this system")
+amp_kb_search(project_id=2, query="database connection handling")
+amp_kb_search(project_id=2, query="actor state machine task lifecycle")
+```
+
+- Relevant result → read with `amp_kb_get` before touching anything
+- No results → proceed, but document what you learn when done
+
+---
+
+## Rule 2: Write when you learn something
+
+Write a KB doc when you:
+- Discover how a component actually works (especially if non-obvious)
+- Make an architectural decision with trade-offs
+- Find a gotcha, edge case, or behaviour that surprised you
+- Complete work that future agents will build on
+- Correct something that turned out to be wrong
+
+---
+
+## Rule 3: How to write content that embeds well
+
+This is the most important rule. **The embedding model converts your prose into a
+vector. Sparse, code-heavy docs produce weak vectors. Dense, specific prose produces
+strong vectors that surface on relevant queries.**
+
+### Write in natural language paragraphs, not just bullet lists
+
+The model was trained on prose. It extracts meaning from complete sentences.
+
+**Weak embedding** — the model gets almost nothing to work with:
+```
+# Auth System
+- Uses JWT
+- Tokens expire in 24h  
+- See internal/handler/auth.go
+```
+
+**Strong embedding** — the model understands the concept and all its related terms:
+```
+# Auth System
+
+The authentication system uses JSON Web Tokens (JWT) with RS256 signing. When a user
+logs in via POST /auth/login, the server validates their credentials against the users
+table, generates a signed JWT containing the user ID and roles, and returns it as a
+bearer token. The token expires after 24 hours. All protected routes check for a valid
+Authorization: Bearer header via the auth middleware in internal/handler/auth.go.
+
+The decision to use RS256 over HS256 was made so the public key can be distributed to
+downstream services for verification without sharing the signing secret. The private key
+is loaded from the SIGNING_KEY environment variable at startup.
+```
+
+The second version will surface on queries like: "how does login work", "JWT token
+validation", "bearer token auth", "RS256 vs HS256", "protected routes middleware" —
+none of which appear verbatim in the doc.
+
+### Name the concepts explicitly, then explain them
+
+The model connects synonyms when concepts are named clearly. Say the thing, then
+explain it:
+
+```
+The actor model (also called the message-passing concurrency model) is the core
+concurrency primitive in this system. Each actor is a goroutine with a private
+mailbox channel. Actors never share memory — they communicate only by sending
+immutable messages to each other's mailboxes.
+```
+
+This single paragraph will match: "goroutine channels", "concurrency model", "message
+passing", "immutable state", "mailbox pattern", "Go actor pattern" — all by semantic
+proximity, not keyword match.
+
+### State decisions AND the reasoning behind them
+
+The reasoning is often what future agents are searching for:
+
+```
+We chose pgvector over a dedicated vector database (Qdrant, Weaviate) because:
+1. The project already uses PostgreSQL — no new service to operate
+2. At fewer than 10,000 documents per project, query latency is under 5ms
+3. Migrations and schema changes stay in one place
+
+The tradeoff is that at very large scale (100k+ documents) a dedicated vector DB
+would offer better ANN index performance. This can be reconsidered if needed.
+```
+
+A future agent asking "why not use Qdrant" or "when should we switch vector databases"
+will find this document.
+
+### Include the specific symbols that will be searched
+
+After the explanatory prose, include the concrete details:
+
+```
+Key files:
+- internal/kb/service.go — KB business logic, WriteDoc, Search
+- internal/kb/service.go:collectionHasEmbedding — checks if semantic search is active
+
+Key types:
+- kb.Service — main KB service, holds Typesense client
+- kb.Doc — full document with content field
+- kb.SearchResult — search hit with excerpt and score
+```
+
+These exact identifiers (file paths, function names, type names) are still matched by
+the keyword layer of the hybrid search.
+
+### One concept per document
+
+Documents are chunked at ~500 tokens. If a single doc covers five unrelated topics,
+each chunk will embed as a confused mixture. Write focused documents:
+
+- `architecture/auth.md` — just about authentication
+- `architecture/actors.md` — just about the actor model
+- `decisions/001-pgvector-vs-qdrant.md` — just about that one decision
+
+A focused 300-word doc embeds better than a sprawling 2000-word doc.
+
+---
+
+## Document structure template
+
+Use this structure for most KB docs:
+
+```markdown
+# [Clear, specific title that names the concept]
+
+[1-3 paragraph overview written in plain prose. Name the concept, explain what it
+does, why it exists, and how it fits into the system. Use the vocabulary that someone
+would search with — not just the vocabulary used internally.]
+
+## How it works
+
+[Explain the mechanism. Be specific about the steps, the data flow, the key
+decisions. Write for someone who has never seen this codebase.]
+
+## Why it was built this way
+
+[The reasoning behind the design. What alternatives were considered and rejected.
+What tradeoffs were made. This is gold for future agents making related decisions.]
+
+## Gotchas and edge cases
+
+[Non-obvious behaviours, things that broke, things to watch out for. Write these
+in plain language: "If you do X without doing Y first, Z will happen."]
+
+## Key files and types
+
+[Concrete references: file paths, function names, type names, config keys. These
+feed the keyword layer of hybrid search.]
+```
+
+---
+
+## Path naming conventions
+
+| Category | Path pattern | When to use |
+|----------|-------------|-------------|
+| `architecture/<topic>.md` | How a component works, system design |
+| `decisions/<NNN>-<topic>.md` | Why a decision was made, ADRs |
+| `how-to/<topic>.md` | Step-by-step operational guides |
+| `discoveries/<topic>.md` | Findings from exploration, surprises |
+| `apis/<service>.md` | API shapes, endpoint contracts |
+
+---
+
+## Tag discipline
+
+Tags feed the keyword layer and the faceted browsing UI. Use 3-6 specific tags per doc.
+
+**Good — specific, technical, searchable:**
+`auth`, `jwt`, `actors`, `protoactor`, `dag`, `pgvector`, `typesense`, `ollama`,
+`mcp`, `database`, `migrations`, `docker`, `typescript`, `react`, `sse`, `api`,
+`testing`, `security`, `performance`
+
+**Bad — generic, meaningless for search:**
+`docs`, `notes`, `important`, `todo`, `misc`, `general`, `info`, `update`
+
+Tags should answer: "what would someone type in a search bar to find this?"
+
+---
+
+## MCP tool reference
+
+```
+amp_kb_search {project_id, query, tags?, limit?}
+  → {results: [{path, title, excerpt, tags, score}]}
+  Use natural language queries. The model understands concepts.
+
+amp_kb_get {project_id, path}
+  → full doc with content field (full markdown)
+  Read this before touching related code.
+
+amp_kb_write {project_id, path, title, content, tags, author?}
+  → writes and re-indexes the doc (embeddings regenerated automatically)
+
+amp_kb_list {project_id, tag?}
+  → [{path, title, tags, updated_at}] — all docs, no content
+
+amp_kb_delete {project_id, path}
+  → removes doc and all its chunks from the index
+
+amp_kb_tags {project_id}
+  → [{tag, count}] — browse what's in the KB
+
+amp_kb_reindex {project_id}
+  → re-embeds all docs (use if Ollama model was changed)
+```

@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: amp-postgres
+    environment:
+      POSTGRES_USER: amp
+      POSTGRES_PASSWORD: amp
+      POSTGRES_DB: amp
+    ports:
+      - "5432:5432"
+    volumes:
+      - amp-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amp"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  typesense:
+    image: typesense/typesense:30.1
+    container_name: amp-typesense
+    ports:
+      - "8108:8108"
+    volumes:
+      - amp-tsdata:/data
+    command: "--data-dir /data --api-key=amp-local-dev --enable-cors"
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: amp-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - amp-ollama:/root/.ollama
+    restart: unless-stopped
+
+  amp-api:
+    build:
+      context: ./amp-api
+      dockerfile: Dockerfile
+    container_name: amp-api
+    ports:
+      - "8000:8000"   # MCP server (SSE) — used by opencode agents
+      - "3001:3001"   # REST + SSE API — used by the UI
+    environment:
+      DATABASE_URL: postgres://amp:amp@postgres:5432/amp?sslmode=disable
+      MCP_ADDR: :8000
+      API_ADDR: :3001
+      TYPESENSE_URL: http://typesense:8108
+      TYPESENSE_API_KEY: amp-local-dev
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: nomic-embed-text
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  ui:
+    build:
+      context: ./ui
+      dockerfile: Dockerfile
+    container_name: amp-ui
+    ports:
+      - "5173:80"     # Kanban board — http://localhost:5173
+    depends_on:
+      - amp-api
+    restart: unless-stopped
+
+volumes:
+  amp-pgdata:
+  amp-tsdata:
+  amp-ollama:

@@ -1,0 +1,6 @@
+{
+  "project_id": 2,
+  "project_name": "amp",
+  "project_code": "amp",
+  "amp_api": "http://localhost:8000"
+}
