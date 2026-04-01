@@ -162,6 +162,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context) error {
 		return nil // idempotent
 	}
 
+	prevState := a.task.State // capture before mutation for accurate activity log
 	now := time.Now()
 	a.task.State = domain.TaskStateCompleted
 	a.task.CompletedAt = &now
@@ -172,7 +173,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context) error {
 	}
 
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
-	a.logActivity(a.task.AgentID, "completed", "in_progress", "completed",
+	a.logActivity(a.task.AgentID, "completed", string(prevState), "completed",
 		fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
 	a.log.Info("completed")
 

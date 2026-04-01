@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<odoo>
-    <data>
-        <menuitem id="menu_amp_knowledge" name="Knowledge Base" parent="amp_project.menu_amp_root" sequence="30"/>
-        <menuitem id="menu_amp_knowledge_entries" name="All Entries" parent="menu_amp_knowledge" action="action_amp_knowledge_entry" sequence="10"/>
-    </data>
-</odoo>

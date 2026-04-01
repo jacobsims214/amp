@@ -198,15 +198,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	// ---- Knowledge Base ----
 	mcp.AddTool(tool("amp_kb_write",
-		"Write (create or update) a document in the project knowledge base. "+
-			"Use this to record architectural decisions, how-to guides, discoveries, gotchas. "+
-			"Documents are chunked and semantically indexed automatically.",
+		"Create or UPDATE a document in the project knowledge base. "+
+			"This is a full upsert keyed on path — if a doc at that path already exists, "+
+			"it is completely replaced with the new content. "+
+			"BEFORE writing, always call amp_kb_get to check if a doc exists at that path. "+
+			"If it does, read the existing content and merge your new information into it "+
+			"rather than overwriting with only what you know. "+
+			"Prefer updating an existing doc over creating a new one on the same topic.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md' or 'decisions/001-actor-model.md'."),
+			"path":       str("REQUIRED. Document path e.g. 'architecture/auth.md'. Same path = update existing doc."),
 			"title":      str("REQUIRED. Document title."),
-			"content":    str("REQUIRED. Full document content in markdown."),
-			"tags":       arr("Optional. Tag array, e.g. ['auth','jwt','middleware']. Be specific."),
+			"content":    str("REQUIRED. Full document content in markdown. For updates, include ALL existing content plus your additions — this fully replaces the doc."),
+			"tags":       arr("REQUIRED. Tag array e.g. ['auth','jwt']. For updates, include existing tags plus any new ones."),
 			"author":     str("Optional. Who wrote this (defaults to 'agent')."),
 		}), wrap(ctx, s.kbWrite))
 
@@ -222,7 +226,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.kbSearch))
 
 	mcp.AddTool(tool("amp_kb_get",
-		"Get the full content of a knowledge base document by its path.",
+		"Get the full content of a knowledge base document by its path. "+
+			"Returns a 404-style error if the doc does not exist — use this to check "+
+			"existence before deciding whether to create or update.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),

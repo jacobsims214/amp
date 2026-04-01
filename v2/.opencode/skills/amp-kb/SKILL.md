@@ -5,6 +5,10 @@ description: How to search the AMP knowledge base before starting work, and how 
 
 # AMP Knowledge Base Skill
 
+> This skill is loaded by both `amp-execution` (workers) and `amp-planning` (manager).
+> It defines the canonical rules for KB search and writing. Neither prompt nor any
+> other skill repeats these rules — this is the single source of truth.
+
 The KB is a per-project document store with **hybrid keyword + semantic search**. The
 semantic layer uses `nomic-embed-text` embeddings — it understands meaning, not just
 keywords. "goroutine lifecycle" will find a doc about actors. "authentication system"
@@ -34,10 +38,71 @@ amp_kb_search(project_id=2, query="actor state machine task lifecycle")
 
 ---
 
-## Rule 2: Write when you learn something
+## Rule 2: Create or update — always check first
 
-Write a KB doc when you:
-- Discover how a component actually works (especially if non-obvious)
+Before writing any KB doc, **decide whether to create or update**.
+Prefer updating over creating. Fragmented docs on the same topic hurt search quality —
+a single well-maintained doc on auth is far more useful than four partial ones.
+
+### The decision flow
+
+```
+1. Decide what you want to document (topic, category)
+
+2. Search for existing docs on this topic:
+   amp_kb_search(project_id=ID, query="<topic>")
+   amp_kb_list(project_id=ID, tag="<relevant-tag>")
+
+3. If a relevant doc exists at a known path:
+   amp_kb_get(project_id=ID, path="architecture/auth.md")
+   → Read the full content
+   → Merge: keep everything good, add your new information, fix anything wrong
+   → Write back the complete merged content to the SAME path
+
+4. If no relevant doc exists:
+   → Create a new one at the appropriate path
+```
+
+**Update when:**
+- The topic already has a doc (same path or clearly the same subject)
+- You are adding a new finding to an existing architectural component
+- You discovered something wrong in an existing doc — fix it in place
+- You completed a task that extends something already documented
+
+**Create when:**
+- This is a genuinely new concept, component, or decision with no existing doc
+- The existing docs are in a different category (don't shoehorn unrelated things)
+- The existing doc is already long and focused — a new sub-topic deserves its own doc
+
+### How to merge correctly
+
+When updating, `amp_kb_write` **fully replaces** the document. You must include ALL
+the existing content plus your additions. Do not drop anything from the existing doc.
+
+```
+existing = amp_kb_get(project_id=ID, path="architecture/auth.md")
+
+# Read the full existing content
+# Write a new version that includes:
+#   - Everything from existing.content (unchanged where still correct)
+#   - Your new findings added to the right section
+#   - Any corrections to things that were wrong
+#   - Existing tags PLUS any new ones you need
+
+amp_kb_write(
+  project_id=ID,
+  path="architecture/auth.md",    ← SAME path = update
+  title=existing.title,           ← keep or improve the title
+  content="[full merged content]",
+  tags=existing.tags + ["new-tag"],
+  author="amp-worker"
+)
+```
+
+### Write when you learn something
+
+Write or update a KB doc when you:
+- Discover how a system component actually works (especially if non-obvious)
 - Make an architectural decision with trade-offs
 - Find a gotcha, edge case, or behaviour that surprised you
 - Complete work that future agents will build on

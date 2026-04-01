@@ -1,11 +1,38 @@
 ---
 name: amp-execution
-description: How a worker agent reads its ticket, does the work, posts progress notes, and completes the task
+description: Full protocol for executing an AMP task — reading the ticket, doing the work, logging progress, writing to the KB, and completing
 ---
 
 # AMP Execution Skill
 
-**The ticket is your entire context. Read it first. Everything you need is in it.**
+You have one job: execute the assigned task completely and correctly.
+Your task ID and project ID are in your dispatch prompt.
+
+---
+
+## Step 0 — Read .amp.json
+
+```bash
+cat .amp.json
+```
+
+This gives you `project_id`. Every MCP call uses this value.
+
+---
+
+## Step 0.5 — Search the KB before starting
+
+**This is not optional.** Before reading the ticket, search the KB:
+
+```
+amp_kb_search(project_id=PROJECT_ID, query="<your task name + key terms>")
+```
+
+- Got relevant results → read them with `amp_kb_get` before touching anything
+- Nothing relevant → proceed, but you are expected to document what you discover
+
+See the `amp-kb` skill for full search and writing guidance. Load it now if you
+haven't already: `skill("amp-kb")`
 
 ---
 
@@ -16,105 +43,120 @@ amp_get_task(task_id=YOUR_TASK_ID)
 ```
 
 Read every field:
-- `description` — your complete instructions. Treat this as your prompt.
-- `acceptance_criteria` — the exact conditions you must satisfy to mark this done.
-- `epic_id` / `story_id` — the parent context (you can fetch these if you need more background).
-- `agent_id` — should be your identifier.
+- `description` — your complete instructions
+- `acceptance_criteria` — exactly what done looks like
+- `assigned_to` — should match your agent ID
 
-If the description is missing or unclear, post a comment explaining what is missing
-and stop. Do NOT guess at intent.
+If description is missing or unclear: post a comment explaining what is missing and
+**STOP**. Do not guess at intent.
 
 ---
 
-## Step 2 — Post a starting comment immediately
+## Step 2 — Post a starting comment
 
-Before writing a single line of code or running any command:
+Before touching anything:
 
 ```
 amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
 Starting work.
 
-Plan:
-1. [first concrete step]
-2. [second concrete step]
-3. [etc.]
+KB search result: [what I searched for and what I found / didn't find]
 
-Reading: [any files or systems I need to understand first]
+My understanding: [one sentence]
+
+Plan:
+1. [step]
+2. [step]
 """, author="amp-worker")
 ```
 
-This is your commitment to the ticket log. It tells the manager what you understood
-and what you plan to do — before you do it.
-
 ---
 
-## Step 3 — Work and log as you go
+## Step 3 — Work and log every meaningful step
 
 Post a comment every time you:
-- Read a file and find something relevant
-- Make a decision (explain WHY, not just what)
-- Change a file (name the file and what changed)
+- Find something non-obvious in the codebase
+- Make a decision — explain WHY, not just what
+- Change a file — name it and describe what changed
 - Hit a problem
-- Complete a meaningful sub-step
 
 ```
 amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
-Finding: [what you found]
-File: [path]
-Decision: [what you chose and why]
+Finding: [what you found and where]
+Decision: [what and why]
+Changed: [file — what changed]
 """, author="amp-worker")
 ```
 
-The ticket log is institutional memory. Future agents — and the manager — will
-read it. Write for them.
+---
+
+## Step 4 — Write to the KB
+
+After completing substantive work, write at least one KB doc if you:
+- Discovered how something works (especially if non-obvious)
+- Made an architectural decision with trade-offs
+- Found a gotcha or edge case
+- Completed work future agents will build on
+
+See `amp-kb` skill for exactly how to write docs that embed well for semantic search.
+The critical rule: **write in prose paragraphs, not bullet lists and code blocks**.
+A sparse doc embeds as noise. A rich prose doc surfaces on dozens of related queries.
 
 ---
 
-## Step 4 — If you cannot proceed
+## Step 5 — Cannot proceed
 
-Post a comment and stop immediately:
+If you hit a blocker:
 
 ```
 amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
 CANNOT PROCEED.
 
 Reason: [exact blocker]
-What I tried: [steps attempted]
-What is needed: [precise requirement — specific enough for the manager to act on]
+What I tried: [steps]
+What is needed: [specific requirement]
 """, author="amp-worker")
 ```
 
-Do NOT call `amp_complete_task`. Do NOT make up a workaround without logging it.
+Stop. Do NOT call amp_complete_task.
 
 ---
 
-## Step 5 — Complete
+## Step 6 — Complete
 
-Before calling complete, verify EVERY acceptance criterion from `acceptance_criteria`.
-If you cannot verify one, do not complete — post a blocking comment instead.
-
-Post a completion summary:
+Verify every acceptance criterion. Post a completion summary:
 
 ```
 amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
 Work complete.
 
-Summary:
-- [what was done]
+Summary: [what was done]
 
 Files changed:
-- [path]: [what changed and why]
+- [path]: [what and why]
+
+KB docs written:
+- [path]: [what was documented]
 
 Acceptance criteria:
-- [criterion 1]: VERIFIED — [how you verified it]
-- [criterion 2]: VERIFIED — [how you verified it]
+- [criterion]: VERIFIED — [how]
 """, author="amp-worker")
 ```
 
 Then:
-
 ```
 amp_complete_task(task_id=YOUR_TASK_ID)
 ```
 
-This triggers automatic unblocking of any tasks that were waiting on yours.
+---
+
+## MCP tools
+
+```
+amp_get_task {task_id}
+amp_add_task_comment {task_id, body, author}
+amp_complete_task {task_id}
+amp_get_ticket_history {task_id}
+amp_get_epic / amp_get_story
+amp_kb_search / amp_kb_get / amp_kb_write  ← see amp-kb skill
+```

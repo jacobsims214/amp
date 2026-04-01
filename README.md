@@ -1,302 +1,155 @@
-# AMP - Agentic Management Platform
+# AMP — Agentic Management Platform
 
-AMP bridges OpenCode AI agents with Odoo using a custom project management module with DAG-based workflows.
+AMP is a local-first platform for running fleets of AI agents on software projects.
+Agents plan work, execute tasks, and document findings — coordinated through a custom
+API built on the actor model, with a real-time kanban UI and a semantic knowledge base.
 
-## Core Concepts
+**The primary project is in [`v2/`](./v2/).**
 
-**Static Manager Agent** (`amp-manager`)
-Primary OpenCode agent orchestrating work:
-- Creates Odoo AMP projects when you start OpenCode in a directory
-- Plans work as DAGs of epics/stories/tasks
-- Never executes work - delegates to subagents
-- Tracks context across sessions
-- **Always gets human approval before dispatching**
+---
 
-**Subagent Workers** (`amp-worker`)
-Execute assigned tasks:
-- Read task instructions from Odoo `amp.task` description field
-- Update status via MCP (backlog → ready → in_progress → review → completed)
-- Report blockers (moves to blocked state)
-- Automatically unblock dependents when completing
+## What it is
 
-**Custom AMP Project Module**
-Standalone Odoo 19 module (not extending built-in project):
-- `amp.project` - Root container
-- `amp.epic` - Large feature
-- `amp.story` - User story with dependencies
-- `amp.task` - Work item with DAG support
-- Custom views optimized for agent workflows
-- Real-time dashboard
+AMP gives AI agents (running in [OpenCode](https://opencode.ai)) a structured way to:
 
-**MCP Server**
-FastAPI wrapper around Odoo XML-RPC API:
-- Runs on localhost:8000
-- Uses custom `amp.*` models
-- All operations as your user
+- **Plan** work as epics → stories → tasks with DAG dependencies
+- **Execute** tasks in parallel fleets, with automatic unblocking when deps complete
+- **Document** findings into a searchable knowledge base so agents don't re-discover things
+- **Coordinate** through a single API so the human can monitor everything on a live board
 
-**DAG Workflows**
-Directed Acyclic Graph for task dependencies:
-- Tasks track dependencies via `dependency_ids`
-- `dag_level` computed automatically
-- `is_ready` field indicates when dependencies complete
-- Parallel execution groups identified
+The core idea: a manager agent plans the work and waits for your approval, then
+dispatches worker agents in parallel. Workers run, log progress to their tickets,
+write docs to the KB, and complete. Blocked tasks auto-unblock when their
+dependencies finish. You watch it all happen in real time on the kanban board.
 
-## Quick Start
+---
+
+## Quick start
 
 ```bash
-# 1. Configure Odoo credentials
-cp .env.example .env
-# Edit .env with your Odoo details
-
-# 2. Start MCP server
-make up
-
-# 3. Verify connection
-make status
-
-# 4. OpenCode loads config automatically
+cd v2
+make up          # starts postgres + typesense + ollama + amp-api + ui
+make kb-setup    # pull nomic-embed-text for semantic search (~274MB, run once)
 ```
 
-## Project Structure
+Open `http://localhost:5173` for the board.
+
+Open OpenCode from `v2/` to get the `amp-manager` and `amp-worker` agents configured.
+Or run `make sync-global` once to make them available from any directory.
+
+---
+
+## Architecture
 
 ```
-amp/
-├── opencode.json              # OpenCode config
-├── docker-compose.yml         # MCP container
-├── Makefile                   # Commands
-├── .env                       # Odoo credentials
-├── prompts/                   # Agent prompts
-│   ├── amp-manager.txt
-│   └── amp-worker.txt
-├── .opencode/                 # OpenCode skills
-│   └── planning.md           # Manager planning skill
-├── mcp/                       # MCP server
-│   ├── src/main.py          # AMP API wrapper
-│   └── Dockerfile
-├── skills/                    # Reference skills
-│   ├── odoo-api/
-│   ├── odoo-project/
-│   └── data-structures/dag.md
-└── odoo-modules/             # Odoo custom modules
-    └── amp_project/          # Standalone AMP module
-        ├── models/           # amp.project, amp.epic, etc.
-        ├── views/            # Custom UI
-        └── static/           # CSS/JS
+┌─────────────────────────────────────────────────────────┐
+│  OpenCode (agents)                                       │
+│  amp-manager → plans, dispatches, monitors              │
+│  amp-worker  → executes one task end-to-end             │
+└────────────────────────┬────────────────────────────────┘
+                         │ MCP over HTTP/SSE (:8000)
+┌────────────────────────▼────────────────────────────────┐
+│  amp-api (Go)                                            │
+│                                                          │
+│  Actor hierarchy (protoactor-go):                        │
+│    ProjectActor → EpicActor → StoryActor → TaskActor    │
+│  Each actor owns its state machine, serialises writes,   │
+│  auto-unblocks dependents on completion, fires SSE.      │
+│                                                          │
+│  KB service (Typesense + Ollama):                        │
+│    Hybrid keyword + semantic search on markdown docs     │
+│    nomic-embed-text embeddings at index + query time     │
+└────────┬───────────────┬───────────────┬────────────────┘
+         │               │               │
+    PostgreSQL       Typesense        Ollama
+    (task state)    (KB index)     (embeddings)
+                         │
+┌────────────────────────▼────────────────────────────────┐
+│  UI (React + Vite + Tailwind, :5173)                     │
+│  Kanban  — epic rows → story rows → status columns       │
+│  DAG     — dependency graph, dagre layout, hover trails  │
+│  Report  — activity feed, cycle times, completions       │
+│  KB      — document tree, editor, semantic search        │
+└─────────────────────────────────────────────────────────┘
 ```
 
-## How It Works
+---
 
-1. **Start OpenCode** in directory
-2. **Manager** checks for existing AMP project by code
-3. **Create project** if new: `POST /projects` → `amp.project`
-4. **User requests** work
-5. **Manager plans** using DAG skill:
-   - Create epic: `POST /epics` → `amp.epic`
-   - Create stories: `POST /stories` → `amp.story`
-   - Create tasks: `POST /tasks` → `amp.task` (with HTML instructions)
-   - Set dependencies: task `dependency_ids` field
-6. **Present to human** for approval
-7. **After approval**, dispatch ready tasks:
-   - Get ready tasks: `GET /projects/{id}/ready-tasks`
-   - Dispatch: `POST /tasks/{id}/dispatch`
-8. **Workers execute** and update via MCP
-9. **Auto-unblock** dependents on completion
-10. **Dashboard** shows real-time progress
+## v2/ structure
 
-## AMP Odoo Module
-
-### Models
-
-**amp.project**
-```python
-name, code, description
-state: draft/active/archived
-epic_ids (one2many)
-epic_count, story_count, task_count
-progress_percentage
-last_session
+```
+v2/
+├── amp-api/              Go API — actors, MCP server, REST API, KB
+│   ├── cmd/server/       main.go + 32 integration tests
+│   └── internal/
+│       ├── actor/        ProjectActor EpicActor StoryActor TaskActor
+│       ├── domain/       Task Epic Story KB types and events
+│       ├── repository/   PostgreSQL (plain pgx, no ORM)
+│       ├── mcp/          25 MCP tools over HTTP/SSE
+│       ├── api/          REST endpoints + SSE hub
+│       ├── kb/           Typesense client, chunking, semantic search
+│       └── hub/          SSE event broadcast
+├── ui/                   React + Vite + Tailwind UI
+├── .opencode/
+│   ├── prompts/          amp-manager.txt  amp-worker.txt  (thin — load skills)
+│   └── skills/           amp-planning  amp-execution  amp-kb  amp-mcp
+├── scripts/
+│   └── sync-global-config.sh   Merges v2 config into ~/.config/opencode
+├── opencode.json         Scoped OpenCode config (agents + MCP)
+├── docker-compose.yml    postgres, typesense, ollama, amp-api, ui
+└── Makefile
 ```
 
-**amp.epic**
-```python
-name, project_id
-state: backlog/planning/in_progress/completed/cancelled
-story_ids (one2many)
-dag_json (stored DAG structure)
-```
+---
 
-**amp.story**
-```python
-name, project_id, epic_id
-state: backlog/ready/in_progress/review/completed/blocked
-dependency_ids (m2m - stories this depends on)
-blocked_ids (m2m - stories blocked by this)
-is_ready (computed)
-task_ids (one2many)
-```
-
-**amp.task** (The Instruction)
-```python
-name, project_id, epic_id, story_id
-description (HTML - THIS IS THE AGENT'S INSTRUCTION)
-description_text (computed plaintext)
-acceptance_criteria
-state: backlog/ready/in_progress/review/completed/blocked
-dependency_ids (m2m tasks)
-dag_level (computed topological level)
-dag_critical_path
-is_ready (computed)
-agent_id (char - assigned agent)
-dispatch_time, completion_time
-context_data (JSON)
-```
-
-### Stages
-
-Tasks/Stories flow through:
-1. **Backlog** - Created, not ready
-2. **Ready** - Dependencies complete (is_ready=True)
-3. **In Progress** - Dispatched to agent
-4. **Review** - Submitted for review
-5. **Completed** - Done
-6. **Blocked** - Cannot proceed
-
-### Views
-
-- **Project Kanban** - Visual overview with progress
-- **Epic Form** - With stories list and DAG data
-- **Story Form** - With dependencies and tasks
-- **Task Form** - Full instructions, dependencies, agent assignment
-- **Task Kanban** - Grouped by state for workflow
-- **Dashboard** - Real-time stats and progress
-
-## MCP API Endpoints
-
-### Projects
-```
-POST   /projects
-GET    /projects
-GET    /projects/{id}
-PUT    /projects
-GET    /projects/by-code/{code}
-GET    /projects/{id}/dashboard
-```
-
-### Epics
-```
-POST   /epics
-GET    /epics/{id}
-GET    /projects/{id}/epics
-PUT    /epics/{id}/dag
-```
-
-### Stories
-```
-POST   /stories
-GET    /stories/{id}
-GET    /epics/{id}/stories
-```
-
-### Tasks
-```
-POST   /tasks
-GET    /tasks/{id}
-PUT    /tasks/{id}
-POST   /tasks/{id}/dispatch
-POST   /tasks/{id}/complete
-POST   /tasks/{id}/block
-POST   /tasks/{id}/comment
-GET    /stories/{id}/tasks
-GET    /projects/{id}/tasks
-GET    /projects/{id}/ready-tasks
-```
-
-## DAG Example
-
-```python
-# Dependencies create DAG levels automatically
-
-# Level 0 (no deps)
-task_a = create_task(name="Setup", dag_level=0)
-task_b = create_task(name="Config", dag_level=0)
-
-# Level 1 (depends on level 0)
-task_c = create_task(
-    name="Build",
-    dag_level=1,
-    dependency_ids=[task_a.id, task_b.id]
-)
-
-# Level 2 (depends on level 1)
-task_d = create_task(
-    name="Test",
-    dag_level=2,
-    dependency_ids=[task_c.id]
-)
-
-# Execution order: A, B (parallel) → C → D
-```
-
-## Worker Execution Flow
-
-1. **Dispatched** task moves to `in_progress`
-2. **Worker reads** task via `GET /tasks/{id}`
-3. **Worker executes** based on `description` field
-4. **Updates status**:
-   - Submit for review: `POST /tasks/{id}/comment` + update state
-   - Block: `POST /tasks/{id}/block`
-   - Complete: `POST /tasks/{id}/complete`
-5. **Completion auto-unblocks** dependent tasks
-
-## Commands
+## Make targets
 
 ```bash
-make up      # Start MCP
-make down    # Stop MCP
-make logs    # View logs
-make status  # Check health
-make test    # Test connection
+make up              # start full stack
+make down            # stop everything (including local dev processes)
+make dev             # run api + ui locally against dockerised postgres
+make api-test        # run all 32 integration tests
+make kb-setup        # pull nomic-embed-text into Ollama (first time only)
+make kb-status       # check Typesense health and KB collections
+make sync-global     # merge v2 skills + prompts into ~/.config/opencode
 ```
 
-## Configuration
+---
 
-**opencode.json**
-```json
-{
-  "agent": {
-    "amp-manager": {
-      "mode": "primary",
-      "prompt": "{file:./prompts/amp-manager.txt}"
-    }
-  },
-  "mcp": {
-    "amp-odoo": {
-      "type": "remote",
-      "url": "http://localhost:8000"
-    }
-  }
-}
-```
+## How agents work
 
-**.env**
-```
-ODOO_URL=http://localhost:8069
-ODOO_DB=your_db
-ODOO_USER=admin
-ODOO_PASSWORD=admin
-```
+**Manager** (`amp-manager`) loads `amp-planning` + `amp-kb` skills:
+1. Reads `.amp.json` for `project_id` (creates project if missing)
+2. Searches the KB for relevant prior work
+3. Creates the full epic → story → task hierarchy via MCP
+4. Presents the plan and **stops — waits for your explicit approval**
+5. After approval: calls `amp_dispatch_task` then spawns worker sub-agents in parallel
+6. Monitors, re-dispatches as blocked tasks auto-unblock
 
-## Installation
+**Worker** (`amp-worker`) loads `amp-execution` + `amp-kb` skills:
+1. Searches KB before starting (non-optional)
+2. Reads its ticket — the `description` field is its complete prompt
+3. Posts a starting comment
+4. Does the work, logging every step as ticket comments
+5. Writes to the KB when it discovers something worth keeping
+6. Calls `amp_complete_task` — auto-unblocks dependent tasks
 
-1. Copy `odoo-modules/amp_project` to Odoo addons path
-2. Update `odoo.conf` addons path
-3. Restart Odoo
-4. Install "AMP Project" from Apps menu
-5. Start MCP: `make up`
+---
 
-## Requirements
+## Services
 
-- Odoo 19
-- Docker Desktop
-- OpenCode CLI
-- Python 3.11+
+| Service | Port | Purpose |
+|---------|------|---------|
+| amp-api MCP | 8000 | MCP server — OpenCode agents |
+| amp-api REST | 3001 | REST + SSE API — UI |
+| UI | 5173 | Kanban, DAG, KB, Reports |
+| PostgreSQL | 5432 | Task/project state |
+| Typesense | 8108 | KB document search |
+| Ollama | 11434 | Local embedding model |
+
+---
+
+## Archive
+
+`archive/` contains the original v1 implementation which used Odoo as the backend.
+Kept for reference only. All active development is in `v2/`.

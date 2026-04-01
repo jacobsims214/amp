@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+
+<!-- ── Markdown Widget Template ─────────────────────────────────────────────── -->
+<t t-name="amp_project.MarkdownWidget">
+    <div class="amp-markdown-widget" t-att-class="readonly ? 'readonly' : ''">
+        
+        <!-- Toolbar (only in edit modes) -->
+        <div t-if="!readonly and !isPreviewMode" class="amp-markdown-toolbar">
+            
+            <!-- Mode switcher -->
+            <div class="amp-toolbar-group">
+                <button type="button" 
+                        t-on-click="() => this.onModeEdit()"
+                        t-att-class="isEditMode ? 'amp-btn-toolbar active' : 'amp-btn-toolbar'"
+                        title="Edit Mode">
+                    ✏️
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onModeSplit()"
+                        t-att-class="isSplitMode ? 'amp-btn-toolbar active' : 'amp-btn-toolbar'"
+                        title="Split Mode">
+                    ⚌
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onModePreview()"
+                        t-att-class="isPreviewMode ? 'amp-btn-toolbar active' : 'amp-btn-toolbar'"
+                        title="Preview Mode">
+                    👁
+                </button>
+            </div>
+
+            <!-- Formatting buttons -->
+            <div class="amp-toolbar-group">
+                <button type="button" 
+                        t-on-click="() => this.onBold()"
+                        class="amp-btn-toolbar"
+                        title="Bold (Ctrl+B)">
+                    <strong>B</strong>
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onItalic()"
+                        class="amp-btn-toolbar"
+                        title="Italic (Ctrl+I)">
+                    <em>I</em>
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onCode()"
+                        class="amp-btn-toolbar"
+                        title="Inline Code">
+                    &lt;/&gt;
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onCodeBlock()"
+                        class="amp-btn-toolbar"
+                        title="Code Block">
+                    { }
+                </button>
+            </div>
+
+            <!-- Headers -->
+            <div class="amp-toolbar-group">
+                <button type="button" 
+                        t-on-click="() => this.onHeader1()"
+                        class="amp-btn-toolbar"
+                        title="Header 1">
+                    H1
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onHeader2()"
+                        class="amp-btn-toolbar"
+                        title="Header 2">
+                    H2
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onHeader3()"
+                        class="amp-btn-toolbar"
+                        title="Header 3">
+                    H3
+                </button>
+            </div>
+
+            <!-- Links and Lists -->
+            <div class="amp-toolbar-group">
+                <button type="button" 
+                        t-on-click="() => this.onLink()"
+                        class="amp-btn-toolbar"
+                        title="Link (Ctrl+K)">
+                    🔗
+                </button>
+                <button type="button" 
+                        t-on-click="() => this.onList()"
+                        class="amp-btn-toolbar"
+                        title="List">
+                    • List
+                </button>
+            </div>
+        </div>
+
+        <!-- Content area -->
+        <div class="amp-markdown-content" t-att-class="state.mode">
+            
+            <!-- Edit pane -->
+            <div t-if="!isPreviewMode" class="amp-markdown-edit-pane">
+                <textarea 
+                    t-ref="textarea"
+                    t-att-value="state.value"
+                    t-on-input="(ev) => this._onInput(ev)"
+                    t-att-readonly="readonly"
+                    class="amp-markdown-textarea"
+                    placeholder="Enter markdown content..."/>
+            </div>
+
+            <!-- Preview pane -->
+            <div t-if="!isEditMode" class="amp-markdown-preview-pane">
+                <div t-ref="preview" 
+                     class="amp-markdown-preview"
+                     t-out="state.previewHtml"/>
+            </div>
+        </div>
+
+        <!-- Readonly view (just preview) -->
+        <div t-if="readonly" class="amp-markdown-readonly">
+            <div class="amp-markdown-preview" t-out="state.previewHtml"/>
+        </div>
+
+    </div>
+</t>
+
+</templates>

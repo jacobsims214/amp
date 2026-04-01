@@ -1,0 +1,354 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<odoo>
+    <data>
+        <!-- Enhanced Dashboard Form View (for individual project) -->
+        <record id="view_amp_project_dashboard" model="ir.ui.view">
+            <field name="name">amp.project.dashboard</field>
+            <field name="model">amp.project</field>
+            <field name="arch" type="xml">
+                <form string="AMP Dashboard">
+                    <sheet>
+                        <div class="o_amp_dashboard">
+                            <!-- Breadcrumb Navigation -->
+                            <div class="o_amp_breadcrumb mb-3">
+                                <nav aria-label="breadcrumb">
+                                    <ol class="breadcrumb">
+                                        <li class="breadcrumb-item">
+                                            <a href="#" onclick="window.location.href='/web#action=amp_project.action_amp_live_board'">
+                                                <i class="fa fa-bolt"></i> Live Board
+                                            </a>
+                                        </li>
+                                        <li class="breadcrumb-item">
+                                            <a href="#" onclick="window.location.href='/web#action=amp_project.action_amp_project'">
+                                                <i class="fa fa-folder"></i> Projects
+                                            </a>
+                                        </li>
+                                        <li class="breadcrumb-item active" aria-current="page">
+                                            <field name="name"/> Dashboard
+                                        </li>
+                                    </ol>
+                                </nav>
+                            </div>
+
+                            <div class="d-flex justify-content-between align-items-center mb-4">
+                                <h1 class="mb-0">
+                                    <field name="name"/> Dashboard
+                                    <small class="text-muted">
+                                        <field name="code" readonly="1"/>
+                                    </small>
+                                </h1>
+                                <!-- Quick Navigation -->
+                                <div class="btn-group" role="group">
+                                    <button name="%(action_amp_live_board)d" type="action" class="btn btn-outline-primary btn-sm" title="Open Live Board">
+                                        <i class="fa fa-bolt"></i>
+                                    </button>
+                                    <button name="action_view_epics" type="object" class="btn btn-outline-primary btn-sm" title="View Epics">
+                                        <i class="fa fa-sitemap"></i>
+                                    </button>
+                                    <button name="action_view_knowledge" type="object" class="btn btn-outline-primary btn-sm" title="Knowledge Base">
+                                        <i class="fa fa-book"></i>
+                                    </button>
+                                </div>
+                            </div>
+                            
+                            <!-- Enhanced Stats Row -->
+                            <div class="row mb-4">
+                                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                                    <div class="card text-center h-100 border-primary">
+                                        <div class="card-body">
+                                            <i class="fa fa-sitemap text-primary mb-2" style="font-size: 1.5rem;"></i>
+                                            <h3 class="card-title text-primary"><field name="epic_count"/></h3>
+                                            <p class="card-text small">Epics</p>
+                                            <button name="action_view_epics" type="object" class="btn btn-sm btn-outline-primary">View</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                                    <div class="card text-center h-100 border-info">
+                                        <div class="card-body">
+                                            <i class="fa fa-list-alt text-info mb-2" style="font-size: 1.5rem;"></i>
+                                            <h3 class="card-title text-info"><field name="story_count"/></h3>
+                                            <p class="card-text small">Stories</p>
+                                            <button name="%(action_amp_story)d" type="action" class="btn btn-sm btn-outline-info" context="{'search_default_project_id': id}">View</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                                    <div class="card text-center h-100 border-secondary">
+                                        <div class="card-body">
+                                            <i class="fa fa-tasks text-secondary mb-2" style="font-size: 1.5rem;"></i>
+                                            <h3 class="card-title text-secondary"><field name="task_count"/></h3>
+                                            <p class="card-text small">Total Tasks</p>
+                                            <button name="%(action_amp_task)d" type="action" class="btn btn-sm btn-outline-secondary" context="{'search_default_project_id': id}">View</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                                    <div class="card text-center h-100 border-success">
+                                        <div class="card-body">
+                                            <i class="fa fa-check-circle text-success mb-2" style="font-size: 1.5rem;"></i>
+                                            <h3 class="card-title text-success"><field name="completed_task_count"/></h3>
+                                            <p class="card-text small">Completed</p>
+                                            <button name="%(action_amp_task)d" type="action" class="btn btn-sm btn-outline-success" context="{'search_default_project_id': id, 'search_default_state': 'completed'}">View</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                                    <div class="card text-center h-100 border-warning">
+                                        <div class="card-body">
+                                            <i class="fa fa-exclamation-triangle text-warning mb-2" style="font-size: 1.5rem;"></i>
+                                            <h3 class="card-title text-warning"><field name="blocked_task_count"/></h3>
+                                            <p class="card-text small">Blocked</p>
+                                            <button name="%(action_amp_task)d" type="action" class="btn btn-sm btn-outline-warning" context="{'search_default_project_id': id, 'search_default_state': 'blocked'}">View</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-lg-2 col-md-4 col-6 mb-3">
+                                    <div class="card text-center h-100 border-purple">
+                                        <div class="card-body">
+                                            <i class="fa fa-robot text-purple mb-2" style="font-size: 1.5rem;"></i>
+                                            <h3 class="card-title text-purple"><field name="active_agent_count"/></h3>
+                                            <p class="card-text small">Active Agents</p>
+                                            <small class="text-muted">Working Now</small>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Enhanced Progress Section -->
+                            <div class="row mb-4">
+                                <div class="col-md-8">
+                                    <div class="card h-100">
+                                        <div class="card-header d-flex justify-content-between align-items-center">
+                                            <h5 class="mb-0">Project Progress</h5>
+                                            <span class="badge bg-primary"><field name="progress_percentage"/>% Complete</span>
+                                        </div>
+                                        <div class="card-body">
+                                            <field name="progress_percentage" widget="progressbar" options="{'editable': false}"/>
+                                            <div class="row mt-3">
+                                                <div class="col-4 text-center">
+                                                    <div class="text-success fw-bold"><field name="completed_task_count"/></div>
+                                                    <small class="text-muted">Completed</small>
+                                                </div>
+                                                <div class="col-4 text-center">
+                                                    <div class="text-primary fw-bold"><field name="task_count" readonly="1"/> - <field name="completed_task_count" readonly="1"/> - <field name="blocked_task_count" readonly="1"/></div>
+                                                    <small class="text-muted">In Progress</small>
+                                                </div>
+                                                <div class="col-4 text-center">
+                                                    <div class="text-warning fw-bold"><field name="blocked_task_count"/></div>
+                                                    <small class="text-muted">Blocked</small>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="col-md-4">
+                                    <div class="card h-100">
+                                        <div class="card-header">
+                                            <h5 class="mb-0">Project Status</h5>
+                                        </div>
+                                        <div class="card-body">
+                                            <div class="mb-3">
+                                                <label class="form-label small">State</label>
+                                                <field name="state" widget="badge" decoration-success="state == 'active'" decoration-muted="state == 'archived'" decoration-warning="state == 'draft'"/>
+                                            </div>
+                                            <div class="mb-3">
+                                                <label class="form-label small">Last Activity</label>
+                                                <div><field name="last_session" readonly="1"/></div>
+                                            </div>
+                                            <div>
+                                                <label class="form-label small">Description</label>
+                                                <div class="text-muted small"><field name="description" readonly="1"/></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <!-- Enhanced Quick Actions -->
+                            <div class="row">
+                                <div class="col-12">
+                                    <div class="card">
+                                        <div class="card-header">
+                                            <h5 class="mb-0">Quick Actions</h5>
+                                        </div>
+                                        <div class="card-body">
+                                            <div class="row">
+                                                <div class="col-md-6">
+                                                    <h6 class="text-muted">Navigation</h6>
+                                                    <div class="btn-group-vertical d-grid gap-2 mb-3">
+                                                        <button name="%(action_amp_live_board)d" type="action" class="btn btn-primary">
+                                                            <i class="fa fa-bolt"></i> Open Live Board
+                                                        </button>
+                                                        <button name="action_view_epics" type="object" class="btn btn-outline-primary">
+                                                            <i class="fa fa-sitemap"></i> View All Epics
+                                                        </button>
+                                                        <button name="%(action_amp_story)d" type="action" class="btn btn-outline-info" context="{'search_default_project_id': id}">
+                                                            <i class="fa fa-list-alt"></i> View All Stories
+                                                        </button>
+                                                        <button name="%(action_amp_task)d" type="action" class="btn btn-outline-secondary" context="{'search_default_project_id': id}">
+                                                            <i class="fa fa-tasks"></i> View All Tasks
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                                <div class="col-md-6">
+                                                    <h6 class="text-muted">Management</h6>
+                                                    <div class="btn-group-vertical d-grid gap-2 mb-3">
+                                                        <button name="action_sync_session" type="object" class="btn btn-success">
+                                                            <i class="fa fa-sync"></i> Sync Session
+                                                        </button>
+                                                        <button name="action_view_knowledge" type="object" class="btn btn-outline-warning">
+                                                            <i class="fa fa-book"></i> Knowledge Base
+                                                        </button>
+                                                        <button name="%(action_amp_task)d" type="action" class="btn btn-outline-danger" context="{'search_default_project_id': id, 'search_default_state': 'blocked'}">
+                                                            <i class="fa fa-exclamation-triangle"></i> View Blocked Tasks
+                                                        </button>
+                                                        <button name="edit" type="edit" class="btn btn-outline-dark">
+                                                            <i class="fa fa-edit"></i> Edit Project
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </sheet>
+                </form>
+            </field>
+        </record>
+        
+        <!-- Global Dashboard List View -->
+        <record id="view_amp_global_dashboard" model="ir.ui.view">
+            <field name="name">amp.project.global.dashboard</field>
+            <field name="model">amp.project</field>
+            <field name="arch" type="xml">
+                <kanban class="o_amp_global_dashboard" create="false" edit="false">
+                    <field name="name"/>
+                    <field name="code"/>
+                    <field name="state"/>
+                    <field name="epic_count"/>
+                    <field name="story_count"/>
+                    <field name="task_count"/>
+                    <field name="completed_task_count"/>
+                    <field name="blocked_task_count"/>
+                    <field name="progress_percentage"/>
+                    <field name="active_agent_count"/>
+                    <field name="last_session"/>
+                    <templates>
+                        <t t-name="card">
+                            <div class="oe_kanban_card oe_kanban_global_click o_amp_project_card">
+                                <!-- Header -->
+                                <div class="o_kanban_record_top mb-2">
+                                    <div class="o_kanban_record_headings">
+                                        <strong class="o_kanban_record_title">
+                                            <field name="name"/>
+                                        </strong>
+                                        <div class="text-muted small">
+                                            <field name="code"/>
+                                        </div>
+                                    </div>
+                                    <div class="float-end">
+                                        <field name="state" widget="badge" decoration-success="state == 'active'" decoration-muted="state == 'archived'" decoration-warning="state == 'draft'"/>
+                                    </div>
+                                </div>
+                                
+                                <!-- Progress Bar -->
+                                <div class="mb-3">
+                                    <div class="d-flex justify-content-between align-items-center mb-1">
+                                        <small class="text-muted">Progress</small>
+                                        <small class="fw-bold"><field name="progress_percentage"/>%</small>
+                                    </div>
+                                    <div class="progress" style="height: 8px;">
+                                        <div class="progress-bar bg-gradient" 
+                                             t-attf-style="width: #{record.progress_percentage.value}%; background: linear-gradient(90deg, #7c3aed, #10b981);"></div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Stats Grid -->
+                                <div class="row g-2 mb-3">
+                                    <div class="col-6">
+                                        <div class="text-center p-2 bg-light rounded">
+                                            <div class="fw-bold text-primary"><field name="epic_count"/></div>
+                                            <small class="text-muted">Epics</small>
+                                        </div>
+                                    </div>
+                                    <div class="col-6">
+                                        <div class="text-center p-2 bg-light rounded">
+                                            <div class="fw-bold text-info"><field name="story_count"/></div>
+                                            <small class="text-muted">Stories</small>
+                                        </div>
+                                    </div>
+                                    <div class="col-6">
+                                        <div class="text-center p-2 bg-light rounded">
+                                            <div class="fw-bold text-secondary"><field name="task_count"/></div>
+                                            <small class="text-muted">Tasks</small>
+                                        </div>
+                                    </div>
+                                    <div class="col-6">
+                                        <div class="text-center p-2 bg-light rounded">
+                                            <div class="fw-bold text-success"><field name="completed_task_count"/></div>
+                                            <small class="text-muted">Done</small>
+                                        </div>
+                                    </div>
+                                </div>
+                                
+                                <!-- Status Row -->
+                                <div class="d-flex justify-content-between align-items-center">
+                                    <div>
+                                        <span class="badge bg-warning" t-if="record.blocked_task_count.value > 0">
+                                            <field name="blocked_task_count"/> Blocked
+                                        </span>
+                                        <span class="badge bg-purple" t-if="record.active_agent_count.value > 0">
+                                            <field name="active_agent_count"/> Agents
+                                        </span>
+                                    </div>
+                                    <div class="btn-group btn-group-sm">
+                                        <a type="action" name="%(action_amp_live_board)d" class="btn btn-outline-primary btn-sm" title="Live Board">
+                                            <i class="fa fa-bolt"></i>
+                                        </a>
+                                        <a type="object" name="action_open_dashboard" class="btn btn-outline-secondary btn-sm" title="Dashboard">
+                                            <i class="fa fa-dashboard"></i>
+                                        </a>
+                                    </div>
+                                </div>
+                                
+                                <!-- Last Activity -->
+                                <div class="mt-2 text-muted small" t-if="record.last_session.value">
+                                    Last activity: <field name="last_session"/>
+                                </div>
+                            </div>
+                        </t>
+                    </templates>
+                </kanban>
+            </field>
+        </record>
+
+        <!-- Server Action to open Project Dashboard -->
+        <record id="action_amp_project_dashboard" model="ir.actions.act_window">
+            <field name="name">Project Dashboard</field>
+            <field name="res_model">amp.project</field>
+            <field name="view_mode">form</field>
+            <field name="view_id" ref="view_amp_project_dashboard"/>
+        </record>
+
+        <!-- Server Action for Global Dashboard -->
+        <record id="action_amp_global_dashboard" model="ir.actions.act_window">
+            <field name="name">AMP Dashboard</field>
+            <field name="res_model">amp.project</field>
+            <field name="view_mode">kanban</field>
+            <field name="view_id" ref="view_amp_global_dashboard"/>
+            <field name="domain">[('state', '!=', 'archived')]</field>
+            <field name="help" type="html">
+                <p class="o_view_nocontent_smiling_face">
+                    Welcome to AMP Dashboard
+                </p>
+                <p>
+                    Get an overview of all your projects, their progress, and active agents.
+                    Click on any project card to access its Live Board or detailed dashboard.
+                </p>
+            </field>
+        </record>
+    </data>
+</odoo>

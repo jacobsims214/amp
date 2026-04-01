@@ -220,6 +220,11 @@ clean: dev-stop ## Stop dev processes and remove built artifacts
 	rm -rf $(API_DIR)/bin $(UI_DIR)/dist $(PID_DIR)
 	@echo "Cleaned."
 
+# ---- global config sync ----
+
+sync-global: ## Merge v2 skills, prompts, and opencode.json into ~/.config/opencode (upsert)
+	./scripts/sync-global-config.sh
+
 # ---- combined checks (run before commit) ----
 
 check: api-lint ui-typecheck api-test ## Run lint + typecheck + tests
