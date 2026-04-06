@@ -71,10 +71,16 @@ global_path  = Path(sys.argv[1])
 v2_path      = Path(sys.argv[2])
 prompts_dest = Path(sys.argv[3])
 
+def load_jsonc(path):
+    """Load JSON that may contain trailing commas (JSONC/JSON5 style)."""
+    text = Path(path).read_text()
+    # Remove trailing commas before } or ]
+    text = re.sub(r',(\s*[}\]])', r'\1', text)
+    return json.loads(text)
+
 with open(global_path) as f:
     gcfg = json.load(f)
-with open(v2_path) as f:
-    v2cfg = json.load(f)
+v2cfg = load_jsonc(v2_path)
 
 def rewrite_prompt(val, dest):
     if not isinstance(val, str):
@@ -93,6 +99,11 @@ def rewrite_agent(agent, dest):
 
 gcfg.setdefault('agent', {})
 gcfg.setdefault('mcp', {})
+gcfg.setdefault('provider', {})
+
+for name, cfg in v2cfg.get('provider', {}).items():
+    gcfg['provider'][name] = cfg
+    print(f"  provider: {name}")
 
 for name, cfg in v2cfg.get('agent', {}).items():
     gcfg['agent'][name] = rewrite_agent(cfg, prompts_dest)
