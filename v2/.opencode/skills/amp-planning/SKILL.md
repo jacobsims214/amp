@@ -7,41 +7,15 @@ description: Full protocol for planning, creating the task hierarchy, getting ap
 
 ---
 
-## Step 0 — Read or create .amp.json
+## Before you plan
 
-```bash
-cat .amp.json
-```
+Read `.amp.json` to get the project ID. If it doesn't exist, load `amp-init` first.
 
-**If it exists:** use `project_id` for all MCP calls. Do not create a new project.
-
-**If it doesn't exist:** ask the user for a name and short code, then:
-```
-amp_create_project {name, code, description}
-```
-Write `.amp.json`:
-```json
-{
-  "project_id": <id>,
-  "project_name": "<name>",
-  "project_code": "<code>",
-  "amp_api": "http://localhost:8000"
-}
-```
-Commit this file — everyone working in the directory uses the same project.
-
----
-
-## Step 0.5 — Search the KB before planning
-
-Before creating anything, search the KB for relevant prior work:
-
+Search the KB before creating anything:
 ```
 amp_kb_search(project_id=PROJECT_ID, query="<the user's request>")
 ```
-
-Existing architecture docs and past decisions should inform your plan.
-See `amp-kb` skill for search guidance. Load it: `skill("amp-kb")`
+Existing architecture docs and past decisions should shape your plan. Load `amp-kb` if you need search guidance.
 
 ---
 
@@ -51,143 +25,108 @@ See `amp-kb` skill for search guidance. Load it: `skill("amp-kb")`
 Project → Epic → Story → Task
 ```
 
-Tasks require both `epic_id` AND `story_id`. Stories require `epic_id`.
-The API rejects violations. Create in order:
+Create in order. The API rejects out-of-order creation.
 
 ```
-1. amp_create_epic    {project_id, name, description}
-2. amp_create_story   {project_id, epic_id, name, acceptance_criteria}
-3. amp_create_task    {project_id, epic_id, story_id, name, description,
-                       acceptance_criteria, assigned_to, dependency_ids?}
+amp_create_epic   {project_id, name, description}
+amp_create_story  {project_id, epic_id, name, acceptance_criteria}
+amp_create_task   {project_id, epic_id, story_id, name, description,
+                   acceptance_criteria, assigned_to, dependency_ids?}
 ```
 
 ---
 
-## Task descriptions — the ticket IS the worker's prompt
+## Every task requires these three things — no exceptions
 
-Workers have no other context. Write each description as a complete standalone brief:
+**1. `assigned_to`** — set at creation time, every task, always `"amp-worker"` unless told otherwise. This is how the kanban board shows who owns what. A task without `assigned_to` is invisible to the user during review.
+
+**2. `dependency_ids`** — think about this during creation, not after. For every task you create, ask before submitting it: does this task need anything from another task to exist before it can start? If yes, include those task IDs in `dependency_ids`. The system sets state automatically — deps incomplete → `blocked`, all complete → `backlog`. You never set state directly.
+
+**3. A complete description** — workers have no other context. The ticket is their entire world. Write it as a self-contained brief:
 
 ```
 ## What to do
 [Exact steps. Specific files, commands, interfaces.]
 
 ## Context
-[Why this exists. What decisions were made. What the system looks like now.]
+[Why this exists. What the system looks like. Relevant decisions.]
 
 ## Where to look
-[File paths, module names, key functions]
+[File paths, module names, key functions.]
 
 ## Acceptance criteria
-[Concrete and checkable — same as the acceptance_criteria field]
+[Concrete and checkable — same as the acceptance_criteria field.]
 
 ## Gotchas
-[Non-obvious traps, edge cases, things that have already failed]
+[Non-obvious traps, edge cases, known failures.]
 ```
 
-Thin description = thin results.
+Thin description = thin results. Workers are local LLMs — give them everything they need in the ticket.
 
 ---
 
-## assigned_to — required on every task
+## Dependencies — think cross-boundary
 
-Set `assigned_to` on every task at planning time (e.g. `"amp-worker"`). This shows
-on the kanban board so the user can review and correct assignments before approving.
+`dependency_ids` accepts task IDs from any epic or story. The most common mistake is only thinking about dependencies within the same story. Ask for every task:
 
----
+- Does it call an API another task creates?
+- Does it use middleware, auth, shared utilities another task sets up?
+- Does it integrate two things that each come from different tasks?
+- Does it need a schema, config, or interface another task defines?
 
-## DAG dependencies — including cross-epic and cross-story
-
-`dependency_ids` accepts task IDs from any epic or story.
-After creating all tasks, do a **dependency sweep**:
-
-For each task ask: "Does this need output, infrastructure, or a decision from any
-other task — in any epic or story — before it can start?"
-
-Patterns to look for:
-- Calls an API created in another story → block on that task
-- Uses auth middleware → block on the auth task
-- Integrates two subsystems → block on BOTH
-- Uses shared utilities from another epic → block on that utility task
-
-Signal words: "uses", "calls", "relies on", "needs X to exist", "after X is done"
-
-Call out cross-epic and cross-story deps in the plan presentation:
-```
-Task #8: Wire dashboard to auth  [BLOCKS ON #3 — cross-epic, needs auth middleware]
-```
-
-The actor sets state automatically: deps incomplete → `blocked`, all done → `backlog`.
-You never set state directly.
+If yes to any of these — add the dependency, regardless of which epic or story it's in.
 
 ---
 
-## Plan presentation format
+## Plan presentation — show everything
+
+Present before dispatching. The user needs to see assigned agents and blockers to review meaningfully.
 
 ```
-Here is the plan. Please review and reply "approved" to dispatch, or tell me what to change.
-
 EPIC: [name]
 └── Story: [name]
-    ├── Task #N: [name]  → amp-worker           (no deps — ready immediately)
-    ├── Task #N: [name]  → amp-worker           (no deps — ready immediately)
-    └── Task #N: [name]  → amp-worker  [BLOCKS ON #N, #N — cross-epic]
+    ├── Task #N: [name]  →  amp-worker   (ready)
+    ├── Task #N: [name]  →  amp-worker   (ready)
+    └── Task #N: [name]  →  amp-worker   (blocked by #N, #N)
 
-Phase 1 (dispatch immediately): #N, #N
-Phase 2 (unblocks after phase 1): #N
+Phase 1 — dispatch immediately: #N, #N
+Phase 2 — unblocks when phase 1 completes: #N
 
-Total: X tasks, Y epics
+Total: X tasks across Y epics
 ```
+
+Every task shows: its ID, name, assigned agent, and either `(ready)` or `(blocked by #N, ...)`.
+If a task has no agent or no blocker status shown — fix it before presenting.
 
 ---
 
-## ⛔ STOP HERE — DO NOT DISPATCH YET
+## ⛔ Stop after presenting — do not dispatch
 
-After presenting the plan, **stop and wait**. Output nothing further.
+Wait for explicit approval. Nothing further until the user says so.
 
-You must receive explicit approval before dispatching any workers.
+Approval: "approved", "go ahead", "yes", "do it", or similar.
 
-Approval: "approved", "go ahead", "looks good", "yes", "do it", or similar.
-
-If the user asks for changes → make them → present again → wait again.
-Never dispatch without explicit approval for the current plan.
+Changes requested → update → present again → wait again.
 
 ---
 
-## Dispatch (only after approval)
+## Dispatch — only after approval
 
-For each task in `ready_to_dispatch`, do **both steps** in this exact order:
+For every task in `ready_to_dispatch`, do both steps in this order:
 
-**Step 1 — Call `amp_dispatch_task` for each task** (moves it to `in_progress` on the board):
+**Step 1 — dispatch each task** (marks it in_progress on the board):
 ```
-amp_dispatch_task(task_id={id}, agent_id="amp-worker")
+amp_dispatch_task(task_id=ID, agent_id="amp-worker")
 ```
 
-**Step 2 — Spawn the worker sub-agent** (in a single message for all tasks — runs parallel):
+**Step 2 — spawn workers in a single message** (runs them in parallel):
 ```
 task(prompt="amp-worker. Task ID: {id}. Project ID: {project_id}.", subagent_type="amp-worker")
 task(prompt="amp-worker. Task ID: {id}. Project ID: {project_id}.", subagent_type="amp-worker")
 ```
 
-`amp_dispatch_task` must happen before the worker spawns. This is what makes the task
-show as `in_progress` on the kanban board while the agent is working. Without it, the
-board stays at `backlog` until the worker completes — the user sees no live progress.
+Step 1 must happen before step 2. This is what shows live progress on the board.
 
-Monitor: when workers complete, blocked tasks auto-unblock.
-Call `amp_list_tasks` → dispatch new `ready_to_dispatch` → repeat.
-Done when `ready_to_dispatch=[]` AND `in_progress=[]`.
+After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
 
----
-
-## MCP tool reference
-
-```
-amp_create_project / amp_list_projects / amp_get_project
-amp_create_epic    / amp_list_epics    / amp_get_epic
-amp_create_story   / amp_list_stories  / amp_get_story
-amp_create_task    / amp_list_tasks    / amp_get_task
-amp_update_task    / amp_dispatch_task / amp_complete_task
-amp_block_task     / amp_set_task_state
-amp_add_task_comment / amp_get_ticket_history
-amp_reset_project  / amp_delete_task  / amp_delete_epic
-amp_kb_search      / amp_kb_get       ← see amp-kb skill for full KB reference
-```
+Load `amp-mcp` if you need exact tool argument shapes.
