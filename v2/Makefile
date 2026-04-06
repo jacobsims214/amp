@@ -45,6 +45,11 @@ up: dev-stop ## Start everything (postgres + amp-api + ui) via docker compose
 			sleep 0.3; \
 		fi; \
 	done
+	@# Bundle any certs in certs/ into a single file for containers that can't build from source
+	@if ls certs/*.pem certs/*.crt 2>/dev/null | grep -v bundle.pem | grep -q .; then \
+		cat $$(ls certs/*.pem certs/*.crt 2>/dev/null | grep -v bundle.pem) > certs/bundle.pem; \
+		echo "Built certs/bundle.pem from $$(ls certs/*.pem certs/*.crt 2>/dev/null | grep -v bundle.pem | wc -l | tr -d ' ') cert file(s)."; \
+	fi
 	$(COMPOSE) up -d --remove-orphans
 	@echo ""
 	@echo "  UI         → http://localhost:5173"

@@ -34,12 +34,15 @@ services:
       - "11434:11434"
     volumes:
       - amp-ollama:/root/.ollama
+      - ./certs:/certs:ro
+    environment:
+      SSL_CERT_FILE: /certs/bundle.pem
     restart: unless-stopped
 
   amp-api:
     build:
-      context: ./amp-api
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: amp-api/Dockerfile
     container_name: amp-api
     ports:
       - "8000:8000"   # MCP server (SSE) — used by opencode agents
@@ -59,8 +62,8 @@ services:
 
   ui:
     build:
-      context: ./ui
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ui/Dockerfile
     container_name: amp-ui
     ports:
       - "5173:80"     # Kanban board — http://localhost:5173

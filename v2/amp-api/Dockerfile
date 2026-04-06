@@ -1,8 +1,15 @@
 FROM golang:1.25-alpine AS builder
 WORKDIR /app
-COPY go.mod go.sum ./
+# Install any CA certs dropped into the repo-root certs/ directory.
+# This handles corporate/VPN SSL inspection (e.g. Zscaler).
+# The directory is gitignored — add your .pem/.crt files there locally.
+RUN apk add --no-cache ca-certificates
+COPY certs/ /tmp/certs/
+RUN cat /tmp/certs/*.pem /tmp/certs/*.crt > /usr/local/share/ca-certificates/custom.crt 2>/dev/null || true \
+    && update-ca-certificates
+COPY amp-api/go.mod amp-api/go.sum ./
 RUN go mod download
-COPY . .
+COPY amp-api/ .
 RUN CGO_ENABLED=0 go build -o amp-api ./cmd/server
 
 FROM alpine:3.20

@@ -4,47 +4,47 @@
     "LlamaBarn": {
       "npm": "@ai-sdk/openai-compatible",
       "options": {
-        "baseURL": "http://localhost:2276/v1"
+        "baseURL": "http://localhost:2276/v1",
       },
       "models": {
         "gpt-oss-20b": {},
         "gemma-4-31b-q4": {},
-        "qwen-3.5-medium-35b-a3b-q4": {}
-      }
-    }
+        "qwen-3.5-medium-35b-a3b": {},
+      },
+    },
   },
   "agent": {
     "amp-manager": {
       "mode": "primary",
       "description": "AMP manager — plans work, creates the full project hierarchy, dispatches workers, monitors progress",
       "prompt": "{file:./.opencode/prompts/amp-manager.txt}",
-      "model": "LlamaBarn/qwen-3.5-medium-35b-a3b-q4",
+      "model": "LlamaBarn/qwen-3.5-medium-35b-a3b",
       "temperature": 0.2,
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "webfetch": "allow"
-      }
+        "webfetch": "allow",
+      },
     },
     "amp-worker": {
       "mode": "subagent",
       "hidden": true,
       "description": "AMP worker — executes a single assigned task end-to-end, logs all progress to the ticket via MCP",
       "prompt": "{file:./.opencode/prompts/amp-worker.txt}",
-      "model": "LlamaBarn/gemma-4-31b-q4",
+      "model": "LlamaBarn/qwen-3.5-medium-35b-a3b",
       "temperature": 0.1,
       "permission": {
         "edit": "allow",
         "bash": "allow",
-        "webfetch": "allow"
-      }
-    }
+        "webfetch": "allow",
+      },
+    },
   },
   "mcp": {
     "amp": {
       "type": "remote",
       "url": "http://localhost:8000/sse",
-      "enabled": true
-    }
-  }
+      "enabled": true,
+    },
+  },
 }
