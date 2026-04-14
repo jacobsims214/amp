@@ -139,6 +139,26 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		a.storyStates = make(map[int]domain.StoryState)
 		msg.ReplyCh <- ReplySimple{}
 
+	case *MsgDeleteStory:
+		pid, ok := a.stories[msg.StoryID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{}
+			return
+		}
+		replyCh := make(chan ReplySimple, 1)
+		ctx.Send(pid, &MsgDeleteStory{StoryID: msg.StoryID, ReplyCh: replyCh})
+		<-replyCh
+		ctx.Stop(pid)
+		delete(a.stories, msg.StoryID)
+		delete(a.storyStates, msg.StoryID)
+		// Clean up taskToStory entries for this story's tasks.
+		for taskID, storyID := range a.taskToStory {
+			if storyID == msg.StoryID {
+				delete(a.taskToStory, taskID)
+			}
+		}
+		msg.ReplyCh <- ReplySimple{}
+
 	case *MsgReset:
 		for storyID, pid := range a.stories {
 			replyCh := make(chan ReplySimple, 1)

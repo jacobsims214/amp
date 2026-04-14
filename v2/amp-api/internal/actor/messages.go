@@ -1,6 +1,10 @@
 package actor
 
-import "github.com/simstech/amp-api/internal/domain"
+import (
+	"time"
+
+	"github.com/simstech/amp-api/internal/domain"
+)
 
 // ============================================================
 // External request/reply messages — sent by MCP/REST handlers
@@ -99,6 +103,20 @@ type MsgSetTaskState struct {
 	ReplyCh chan ReplySimple
 }
 
+// MsgSetTaskStartAt updates a task's start_at schedule.
+// If StartAt is nil, clears the schedule.
+type MsgSetTaskStartAt struct {
+	TaskID  int
+	StartAt *time.Time
+	ReplyCh chan ReplySimple
+}
+
+// MsgScheduledUnblock is sent by the timer goroutine to the TaskActor
+// when a scheduled task's start_at time has been reached.
+type MsgScheduledUnblock struct {
+	TaskID int
+}
+
 // ---- Management ----
 
 // MsgReset clears all children — called after amp_reset_project wipes postgres.
@@ -109,6 +127,12 @@ type MsgReset struct {
 // MsgDeleteEpic stops the EpicActor and evicts all its tasks from indexes.
 type MsgDeleteEpic struct {
 	EpicID  int
+	ReplyCh chan ReplySimple
+}
+
+// MsgDeleteStory removes a story and all its tasks from the actor hierarchy.
+type MsgDeleteStory struct {
+	StoryID int
 	ReplyCh chan ReplySimple
 }
 

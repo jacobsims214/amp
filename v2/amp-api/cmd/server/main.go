@@ -23,7 +23,10 @@ import (
 )
 
 //go:embed migrations/001_init.sql
-var migrationSQL string
+var migration001 string
+
+//go:embed migrations/002_task_start_at.sql
+var migration002 string
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
@@ -45,7 +48,8 @@ func main() {
 	defer repo.Close()
 
 	slog.Info("running migrations")
-	if err := repo.Migrate(ctx, migrationSQL); err != nil {
+	allMigrations := migration001 + "\n" + migration002
+	if err := repo.Migrate(ctx, allMigrations); err != nil {
 		slog.Error("migration failed", "err", err)
 		os.Exit(1)
 	}

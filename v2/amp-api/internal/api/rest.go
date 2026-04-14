@@ -3,6 +3,8 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
@@ -20,19 +22,24 @@ import (
 //
 //	GET  /api/projects
 //	POST /api/projects
+//	POST /api/projects/import
 //	GET  /api/projects/:id
 //	GET  /api/projects/:id/epics
 //	GET  /api/projects/:id/tasks
 //	POST /api/projects/:id/tasks
+//	GET  /api/projects/:id/export
 //	GET  /api/epics/:id
 //	GET  /api/epics/:id/stories
 //	GET  /api/stories/:id
 //	GET  /api/tasks/:id
+//	PATCH /api/tasks/:id
+//	DELETE /api/tasks/:id
 //	GET  /api/tasks/:id/comments
 //	POST /api/tasks/:id/comments
 //	GET  /api/tasks/:id/history
 //	POST /api/tasks/:id/dispatch
 //	POST /api/tasks/:id/complete
+//	POST /api/tasks/:id/start_at
 //	GET  /api/events              ← SSE stream
 type RestHandler struct {
 	registry *actor.Registry
@@ -65,7 +72,18 @@ func (h *RestHandler) projects(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"projects": projects})
+		// Check if include_archived query param is set
+		includeArchived := r.URL.Query().Get("include_archived") == "true"
+		if includeArchived {
+			archived, err := h.repo.ListArchivedProjects(r.Context())
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"projects": projects, "archived": archived})
+		} else {
+			jsonOK(w, map[string]interface{}{"projects": projects})
+		}
 	case http.MethodPost:
 		var req domain.CreateProjectRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -91,6 +109,58 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+
+	// Handle /api/projects/import before trying to parse as numeric ID
+	if parts[0] == "import" {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		// Decode the request body as ExportBundle
+		var bundle domain.ExportBundle
+		if err := json.NewDecoder(r.Body).Decode(&bundle); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+
+		// Read optional name and code overrides from query params
+		newCode := r.URL.Query().Get("code")
+		newName := r.URL.Query().Get("name")
+
+		// Call ImportBundle to create the project hierarchy
+		newProject, err := h.repo.ImportBundle(r.Context(), bundle, newCode, newName)
+		if err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+
+		// Spawn the new project's actor via registry.Get — this triggers loadAndSpawnEpics
+		pid, err := h.registry.Get(newProject.ID)
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		_ = pid // Actor is now spawned and loading from DB
+
+		// Re-index all KB docs: for each bundle.KBDocs, call WriteDoc
+		for _, doc := range bundle.KBDocs {
+			// Convert []string tags to []string (already in correct format)
+			_, err := h.kb.WriteDoc(r.Context(), newProject.ID, doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags)
+			if err != nil {
+				// Log but continue — don't fail the entire import if one doc fails
+				slog.Warn("failed to write KB doc during import", "path", doc.Path, "err", err)
+			}
+		}
+
+		// Publish EventProjectCreated to SSE hub
+		h.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
+
+		// Return the new project with 201 status
+		w.WriteHeader(http.StatusCreated)
+		jsonOK(w, newProject)
+		return
+	}
+
 	projectID, err := strconv.Atoi(parts[0])
 	if err != nil {
 		jsonErr(w, errorf("invalid project id"), 400)
@@ -158,6 +228,77 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, map[string]interface{}{"activity": activity, "count": len(activity)})
+		return
+
+	case "export":
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		// Build the export bundle with project/epics/stories/tasks
+		bundle, err := h.repo.BuildExportBundle(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+
+		// Fetch KB docs and add them to the bundle
+		docSummaries, err := h.kb.ListDocs(r.Context(), projectID, "")
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+
+		kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
+		for _, summary := range docSummaries {
+			doc, err := h.kb.GetDoc(r.Context(), projectID, summary.Path)
+			if err != nil {
+				// Log but continue — don't fail the entire export if one doc is missing
+				slog.Warn("failed to fetch KB doc for export", "path", summary.Path, "err", err)
+				continue
+			}
+			kbDocs = append(kbDocs, domain.ExportKBDoc{
+				Path:    doc.Path,
+				Title:   doc.Title,
+				Content: doc.Content,
+				Tags:    doc.Tags,
+				Author:  doc.Author,
+			})
+		}
+		bundle.KBDocs = kbDocs
+
+		// Set Content-Disposition header for file download
+		filename := fmt.Sprintf("amp-export-%s-%s.json", bundle.Project.Code, time.Now().Format("2006-01-02"))
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
+		jsonOK(w, bundle)
+		return
+
+	case "archive":
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		p, err := h.repo.ArchiveProject(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		h.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+		jsonOK(w, p)
+		return
+
+	case "restore":
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		p, err := h.repo.RestoreProject(r.Context(), projectID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		h.hub.Publish(domain.Event{Type: domain.EventProjectRestored, ProjectID: p.ID, Payload: p, At: time.Now()})
+		jsonOK(w, p)
 		return
 
 	case "epics":
@@ -257,12 +398,65 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
-		e, err := h.repo.GetEpic(r.Context(), epicID)
-		if err != nil {
-			jsonErr(w, err, 404)
-			return
+		switch r.Method {
+		case http.MethodGet:
+			e, err := h.repo.GetEpic(r.Context(), epicID)
+			if err != nil {
+				jsonErr(w, err, 404)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"epic": e})
+
+		case http.MethodPatch:
+			var body struct {
+				Name        string `json:"name"`
+				Description string `json:"description"`
+				Priority    string `json:"priority"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			if err := h.repo.UpdateEpic(r.Context(), epicID, body.Name, body.Description, body.Priority); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			updated, err := h.repo.GetEpic(r.Context(), epicID)
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			h.hub.Publish(domain.Event{
+				Type:      domain.EventEpicStateChanged,
+				ProjectID: updated.ProjectID,
+				Payload:   updated,
+				At:        time.Now(),
+			})
+			jsonOK(w, map[string]interface{}{"epic": updated})
+
+		case http.MethodDelete:
+			epic, err := h.repo.GetEpic(r.Context(), epicID)
+			if err != nil {
+				jsonErr(w, err, 404)
+				return
+			}
+			if err := h.repo.DeleteEpic(r.Context(), epicID); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			pid, err := h.registry.Get(epic.ProjectID)
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			replyCh := make(chan actor.ReplySimple, 1)
+			h.registry.System().Root.Send(pid, &actor.MsgDeleteEpic{EpicID: epicID, ReplyCh: replyCh})
+			<-replyCh
+			jsonOK(w, map[string]interface{}{"epic_id": epicID, "deleted": true})
+
+		default:
+			http.Error(w, "method not allowed", 405)
 		}
-		jsonOK(w, map[string]interface{}{"epic": e})
 		return
 	}
 
@@ -325,12 +519,60 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s, err := h.repo.GetStory(r.Context(), storyID)
-	if err != nil {
-		jsonErr(w, err, 404)
-		return
+	switch r.Method {
+	case http.MethodGet:
+		s, err := h.repo.GetStory(r.Context(), storyID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"story": s})
+
+	case http.MethodPatch:
+		var body struct {
+			Name               string `json:"name"`
+			Description        string `json:"description"`
+			AcceptanceCriteria string `json:"acceptance_criteria"`
+			Priority           string `json:"priority"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		if err := h.repo.UpdateStory(r.Context(), storyID, body.Name, body.Description, body.AcceptanceCriteria, body.Priority); err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		updated, err := h.repo.GetStory(r.Context(), storyID)
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"story": updated})
+
+	case http.MethodDelete:
+		story, err := h.repo.GetStory(r.Context(), storyID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		if err := h.repo.DeleteStory(r.Context(), storyID); err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		pid, err := h.registry.Get(story.ProjectID)
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		replyCh := make(chan actor.ReplySimple, 1)
+		h.registry.System().Root.Send(pid, &actor.MsgDeleteStory{StoryID: storyID, ReplyCh: replyCh})
+		<-replyCh
+		jsonOK(w, map[string]interface{}{"story_id": storyID, "deleted": true})
+
+	default:
+		http.Error(w, "method not allowed", 405)
 	}
-	jsonOK(w, map[string]interface{}{"story": s})
 }
 
 // ---- /api/tasks/:id  and sub-routes ----
@@ -359,14 +601,57 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
-		replyCh := make(chan actor.ReplyGetTask, 1)
-		h.registry.System().Root.Send(pid, &actor.MsgGetTask{TaskID: taskID, ReplyCh: replyCh})
-		reply := <-replyCh
-		if reply.Err != nil {
-			jsonErr(w, reply.Err, 404)
-			return
+		switch r.Method {
+		case http.MethodGet:
+			replyCh := make(chan actor.ReplyGetTask, 1)
+			h.registry.System().Root.Send(pid, &actor.MsgGetTask{TaskID: taskID, ReplyCh: replyCh})
+			reply := <-replyCh
+			if reply.Err != nil {
+				jsonErr(w, reply.Err, 404)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"task": reply.Task})
+
+		case http.MethodPatch:
+			var req domain.UpdateTaskRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			req.TaskID = taskID
+			replyCh := make(chan actor.ReplySimple, 1)
+			h.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
+			reply := <-replyCh
+			if reply.Err != nil {
+				jsonErr(w, reply.Err, 400)
+				return
+			}
+			updated, err := h.repo.GetTask(r.Context(), taskID)
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"task": updated})
+
+		case http.MethodDelete:
+			if err := h.repo.DeleteTask(r.Context(), taskID); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			replyCh := make(chan actor.ReplySimple, 1)
+			h.registry.System().Root.Send(pid, &actor.MsgDeleteTask{TaskID: taskID, ReplyCh: replyCh})
+			<-replyCh
+			h.hub.Publish(domain.Event{
+				Type:      domain.EventTaskUpdated,
+				ProjectID: task.ProjectID,
+				Payload:   map[string]interface{}{"task_id": taskID, "deleted": true},
+				At:        time.Now(),
+			})
+			jsonOK(w, map[string]interface{}{"task_id": taskID, "deleted": true})
+
+		default:
+			http.Error(w, "method not allowed", 405)
 		}
-		jsonOK(w, map[string]interface{}{"task": reply.Task})
 		return
 	}
 
@@ -452,6 +737,28 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		default:
 			http.Error(w, "method not allowed", 405)
 		}
+
+	case "start_at":
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			StartAt *time.Time `json:"start_at"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		replyCh := make(chan actor.ReplySimple, 1)
+		h.registry.System().Root.Send(pid, &actor.MsgSetTaskStartAt{
+			TaskID:  taskID,
+			StartAt: body.StartAt,
+			ReplyCh: replyCh,
+		})
+		reply := <-replyCh
+		if reply.Err != nil {
+			jsonErr(w, reply.Err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"task_id": taskID, "start_at": body.StartAt})
 
 	default:
 		http.NotFound(w, r)

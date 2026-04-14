@@ -1,4 +1,4 @@
-import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount } from '../types'
+import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest } from '../types'
 
 const BASE = '/api'
 
@@ -21,10 +21,30 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   return res.json()
 }
 
+async function patch<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `PATCH ${path}: ${res.status}`)
+  }
+  return res.json()
+}
+
+async function del(path: string): Promise<void> {
+  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
+  if (!res.ok) throw new Error(`DELETE ${path}: ${res.status}`)
+}
+
 // Projects
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
+  archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
+  restoreProject: (id: number) => post<Project>(`/projects/${id}/restore`),
 
   // Epics
   listEpics: (projectId: number) =>
@@ -36,10 +56,36 @@ export const api = {
     get<{ stories: Story[] }>(`/epics/${epicId}/stories`).then(r => r.stories ?? []),
   getStory: (id: number) => get<{ story: Story }>(`/stories/${id}`).then(r => r.story),
 
+  // Epic CRUD
+  createEpic: (projectId: number, req: CreateEpicRequest) =>
+    post<Epic>(`/projects/${projectId}/epics`, req),
+  updateEpic: (id: number, req: UpdateEpicRequest) =>
+    patch<{ epic: Epic }>(`/epics/${id}`, req).then(r => r.epic),
+  deleteEpic: (id: number) =>
+    del(`/epics/${id}`),
+
+  // Story CRUD
+  createStory: (epicId: number, req: CreateStoryRequest) =>
+    post<Story>(`/epics/${epicId}/stories`, req),
+  updateStory: (id: number, req: UpdateStoryRequest) =>
+    patch<{ story: Story }>(`/stories/${id}`, req).then(r => r.story),
+  deleteStory: (id: number) =>
+    del(`/stories/${id}`),
+
   // Tasks
   listTasks: (projectId: number) =>
     get<{ tasks: Task[] }>(`/projects/${projectId}/tasks`).then(r => r.tasks ?? []),
   getTask: (id: number) => get<{ task: Task }>(`/tasks/${id}`).then(r => r.task),
+
+  // Task CRUD
+  createTask: (projectId: number, req: CreateTaskRequest) =>
+    post<Task>(`/projects/${projectId}/tasks`, req),
+  updateTask: (id: number, req: UpdateTaskRequest) =>
+    patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),
+  deleteTask: (id: number) =>
+    del(`/tasks/${id}`),
+  setTaskStartAt: (id: number, startAt: string | null) =>
+    post<{ task_id: number; start_at: string | null }>(`/tasks/${id}/start_at`, { start_at: startAt }),
 
   // Comments
   getComments: (taskId: number) =>
@@ -85,4 +131,28 @@ export const api = {
     post(`/tasks/${taskId}/dispatch`, { agent_id: agentId }),
   completeTask: (taskId: number) =>
     post(`/tasks/${taskId}/complete`),
+
+  // Export
+  exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {
+    const res = await fetch(`${BASE}/projects/${projectId}/export`)
+    if (!res.ok) throw new Error(`Export failed: ${res.status}`)
+    
+    // Get filename from Content-Disposition header or construct it
+    const contentDisposition = res.headers.get('content-disposition')
+    let filename = `amp-export-${projectId}-${new Date().toISOString().split('T')[0]}.json`
+    
+    if (contentDisposition) {
+      const match = contentDisposition.match(/filename="?([^"]+)"?/)
+      if (match) filename = match[1]
+    }
+    
+    const blob = await res.blob()
+    return { blob, filename }
+  },
+
+  // Import
+  importProject: async (bundleText: string): Promise<Project> => {
+    const bundle = JSON.parse(bundleText)
+    return post<Project>('/projects/import', bundle)
+  },
 }

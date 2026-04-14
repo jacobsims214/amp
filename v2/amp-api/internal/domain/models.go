@@ -100,6 +100,7 @@ type Task struct {
 	DispatchedAt *time.Time `json:"dispatched_at,omitempty"`
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 	BlockReason  string     `json:"block_reason,omitempty"`
+	StartAt      *time.Time `json:"start_at,omitempty"`
 	CreatedAt    time.Time  `json:"created_at"`
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
@@ -148,15 +149,19 @@ type CreateTaskRequest struct {
 	AssignedTo string `json:"assigned_to,omitempty"`
 	// DependencyIDs: task IDs that must complete before this one runs.
 	// State (backlog vs blocked) is derived by the actor — agent does not set it.
-	DependencyIDs []int `json:"dependency_ids"`
+	DependencyIDs []int      `json:"dependency_ids"`
+	StartAt       *time.Time `json:"start_at,omitempty"`
 }
 
 type UpdateTaskRequest struct {
-	TaskID      int    `json:"task_id"`
-	Name        string `json:"name,omitempty"`
-	Description string `json:"description,omitempty"`
-	AssignedTo  string `json:"assigned_to,omitempty"`
-	AgentID     string `json:"agent_id,omitempty"`
+	TaskID             int        `json:"task_id"`
+	Name               string     `json:"name,omitempty"`
+	Description        string     `json:"description,omitempty"`
+	AcceptanceCriteria string     `json:"acceptance_criteria,omitempty"`
+	AssignedTo         string     `json:"assigned_to,omitempty"`
+	AgentID            string     `json:"agent_id,omitempty"`
+	Priority           string     `json:"priority,omitempty"`
+	StartAt            *time.Time `json:"start_at,omitempty"`
 }
 
 type DispatchTaskRequest struct {
@@ -191,6 +196,8 @@ type EventType string
 
 const (
 	EventProjectCreated    EventType = "project.created"
+	EventProjectArchived   EventType = "project.archived"
+	EventProjectRestored   EventType = "project.restored"
 	EventEpicCreated       EventType = "epic.created"
 	EventEpicStateChanged  EventType = "epic.state_changed"
 	EventStoryCreated      EventType = "story.created"
@@ -209,4 +216,34 @@ type Event struct {
 	ProjectID int         `json:"project_id"`
 	Payload   interface{} `json:"payload"`
 	At        time.Time   `json:"at"`
+}
+
+// ---- Export types ----
+
+// ExportBundle captures everything needed to fully reconstruct a project.
+// It is the source of truth for the import flow and must be self-contained.
+type ExportBundle struct {
+	Version    string        `json:"version"` // "1"
+	ExportedAt time.Time     `json:"exported_at"`
+	Project    Project       `json:"project"`
+	Epics      []Epic        `json:"epics"`
+	Stories    []Story       `json:"stories"`
+	Tasks      []ExportTask  `json:"tasks"`
+	KBDocs     []ExportKBDoc `json:"kb_docs"`
+}
+
+// ExportTask wraps a Task with its dependency IDs for export.
+// DependencyIDs use the ORIGINAL task IDs — the import step will remap them.
+type ExportTask struct {
+	Task
+	DependencyIDs []int `json:"dependency_ids"`
+}
+
+// ExportKBDoc represents a knowledge base document for export.
+type ExportKBDoc struct {
+	Path    string   `json:"path"`
+	Title   string   `json:"title"`
+	Content string   `json:"content"`
+	Tags    []string `json:"tags"`
+	Author  string   `json:"author"`
 }

@@ -1,16 +1,28 @@
 import { useEffect, useState } from 'react'
-import { X, Clock, User, UserCheck, GitBranch, CheckCircle2, AlertCircle, Loader2 } from 'lucide-react'
+import { X, Clock, User, UserCheck, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock } from 'lucide-react'
 import { api } from '../api/client'
 import { StatusBadge } from './StatusBadge'
+import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import type { Task, Comment, ActivityLog } from '../types'
 
 interface Props {
   task: Task | null
   onClose: () => void
+  onRefresh?: () => void
 }
 
 function relativeTime(iso: string) {
   const diff = Date.now() - new Date(iso).getTime()
+  if (diff < 0) {
+    const abs = Math.abs(diff)
+    const mins = Math.floor(abs / 60000)
+    const hrs = Math.floor(mins / 60)
+    const days = Math.floor(hrs / 24)
+    if (days > 0) return `in ${days}d`
+    if (hrs > 0) return `in ${hrs}h`
+    if (mins > 0) return `in ${mins}m`
+    return 'soon'
+  }
   const mins = Math.floor(diff / 60000)
   const hrs = Math.floor(mins / 60)
   const days = Math.floor(hrs / 24)
@@ -29,11 +41,16 @@ const ACTION_ICONS: Record<string, React.ReactNode> = {
   comment:    <span className="w-2 h-2 rounded-full bg-[#8b949e]/50 mt-1.5 flex-shrink-0 border border-[#8b949e]" />,
 }
 
-export function TaskDrawer({ task, onClose }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh }: Props) {
   const [history, setHistory] = useState<ActivityLog[]>([])
   const [comments, setComments] = useState<Comment[]>([])
   const [tab, setTab] = useState<'history' | 'details'>('history')
   const [loading, setLoading] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [editForm, setEditForm] = useState({ name: '', description: '', acceptance_criteria: '', assigned_to: '', priority: '1' })
+  const [editSaving, setEditSaving] = useState(false)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [deleting, setDeleting] = useState(false)
 
   useEffect(() => {
     if (!task) return
@@ -42,6 +59,30 @@ export function TaskDrawer({ task, onClose }: Props) {
       .then(([h, c]) => { setHistory(h); setComments(c) })
       .finally(() => setLoading(false))
   }, [task?.id])
+
+  const handleEditSave = async () => {
+    setEditSaving(true)
+    try {
+      await api.updateTask(task!.id, editForm)
+      setEditing(false)
+      onRefresh?.()
+      onClose()
+    } finally {
+      setEditSaving(false)
+    }
+  }
+
+  const handleDelete = async () => {
+    setDeleting(true)
+    try {
+      await api.deleteTask(task!.id)
+      setShowDeleteConfirm(false)
+      onClose()
+      onRefresh?.()
+    } finally {
+      setDeleting(false)
+    }
+  }
 
   if (!task) return null
 
@@ -52,67 +93,98 @@ export function TaskDrawer({ task, onClose }: Props) {
 
       {/* Drawer */}
       <div className="fixed right-0 top-0 h-full w-[520px] bg-[#161b22] border-l border-[#30363d] z-50 flex flex-col shadow-2xl">
-        {/* Header */}
-        <div className="flex items-start justify-between gap-3 p-5 border-b border-[#30363d]">
-          <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-1.5">
-              <span className="text-xs text-[#8b949e] font-mono">#{task.id}</span>
-              <StatusBadge state={task.state} />
-              {task.priority === '2' && <span className="text-xs text-[#e3b341] font-medium">High</span>}
-              {task.priority === '3' && <span className="text-xs text-[#f85149] font-medium">Critical</span>}
-            </div>
-            <h2 className="text-base font-semibold text-[#e6edf3] leading-snug">{task.name}</h2>
-          </div>
-          <button onClick={onClose} className="p-1.5 hover:bg-[#21262d] rounded-md transition-colors flex-shrink-0">
-            <X size={16} className="text-[#8b949e]" />
-          </button>
-        </div>
+       {/* Header */}
+         <div className="flex items-start justify-between gap-3 p-5 border-b border-[#30363d]">
+           <div className="flex-1 min-w-0">
+             <div className="flex items-center gap-2 mb-1.5">
+               <span className="text-xs text-[#8b949e] font-mono">#{task.id}</span>
+               <StatusBadge state={task.state} />
+               {task.priority === '2' && <span className="text-xs text-[#e3b341] font-medium">High</span>}
+               {task.priority === '3' && <span className="text-xs text-[#f85149] font-medium">Critical</span>}
+             </div>
+             <h2 className="text-base font-semibold text-[#e6edf3] leading-snug">{task.name}</h2>
+           </div>
+           <div className="flex items-center gap-1 flex-shrink-0">
+             <button
+               onClick={() => {
+                 setEditForm({
+                   name: task.name,
+                   description: task.description || '',
+                   acceptance_criteria: task.acceptance_criteria || '',
+                   assigned_to: task.assigned_to || '',
+                   priority: task.priority || '1',
+                 })
+                 setEditing(true)
+               }}
+               className="p-1.5 hover:bg-[#21262d] rounded-md transition-colors"
+               title="Edit task"
+             >
+               <Pencil size={14} className="text-[#8b949e]" />
+             </button>
+             <button
+               onClick={() => setShowDeleteConfirm(true)}
+               className="p-1.5 hover:bg-[#21262d] rounded-md transition-colors"
+               title="Delete task"
+             >
+               <Trash2 size={14} className="text-[#f85149]" />
+             </button>
+             <button onClick={onClose} className="p-1.5 hover:bg-[#21262d] rounded-md transition-colors">
+               <X size={16} className="text-[#8b949e]" />
+             </button>
+           </div>
+         </div>
 
-        {/* Meta strip */}
-        <div className="flex items-center gap-4 px-5 py-2.5 border-b border-[#21262d] bg-[#0d1117]/30 flex-wrap">
-          {/* Planned assignee — shown before dispatch */}
-          {task.assigned_to && !task.agent_id && (
-            <div className="flex items-center gap-1.5 text-xs text-[#388bfd]" title="Planned assignee — set at planning time">
-              <UserCheck size={11} />
-              <span className="font-medium">{task.assigned_to}</span>
-              <span className="text-[#484f58] font-normal">(planned)</span>
-            </div>
-          )}
-          {/* Active agent — shown once dispatched */}
-          {task.agent_id && (
-            <div className="flex items-center gap-1.5 text-xs text-[#3fb950]" title="Currently working this task">
-              <User size={11} />
-              <span className="font-medium">{task.agent_id}</span>
-              {task.assigned_to && task.assigned_to !== task.agent_id && (
-                <span className="text-[#484f58] font-normal">(planned: {task.assigned_to})</span>
-              )}
-            </div>
-          )}
-          {task.dispatched_at && (
-            <div className="flex items-center gap-1.5 text-xs text-[#8b949e]">
-              <Clock size={11} />
-              <span>Started {relativeTime(task.dispatched_at)}</span>
-            </div>
-          )}
-          {task.dependency_ids?.length > 0 && (
-            <div className="flex items-center gap-1.5 text-xs text-[#8b949e]">
-              <GitBranch size={11} />
-              <span>{task.dependency_ids.length} dep{task.dependency_ids.length > 1 ? 's' : ''}</span>
-            </div>
-          )}
-          {task.blocked_by_ids?.length ? (
-            <div className="flex items-center gap-1.5 text-xs text-[#f85149]">
-              <AlertCircle size={11} />
-              <span>Blocked by #{task.blocked_by_ids.join(', #')}</span>
-            </div>
-          ) : null}
-          {task.state === 'completed' && task.completed_at && (
-            <div className="flex items-center gap-1.5 text-xs text-[#3fb950]">
-              <CheckCircle2 size={11} />
-              <span>Done {relativeTime(task.completed_at)}</span>
-            </div>
-          )}
-        </div>
+         {/* Meta strip */}
+         <div className="flex items-center gap-4 px-5 py-2.5 border-b border-[#21262d] bg-[#0d1117]/30 flex-wrap">
+           {/* Planned assignee — shown before dispatch */}
+           {task.assigned_to && !task.agent_id && (
+             <div className="flex items-center gap-1.5 text-xs text-[#388bfd]" title="Planned assignee — set at planning time">
+               <UserCheck size={11} />
+               <span className="font-medium">{task.assigned_to}</span>
+               <span className="text-[#484f58] font-normal">(planned)</span>
+             </div>
+           )}
+           {/* Active agent — shown once dispatched */}
+           {task.agent_id && (
+             <div className="flex items-center gap-1.5 text-xs text-[#3fb950]" title="Currently working this task">
+               <User size={11} />
+               <span className="font-medium">{task.agent_id}</span>
+               {task.assigned_to && task.assigned_to !== task.agent_id && (
+                 <span className="text-[#484f58] font-normal">(planned: {task.assigned_to})</span>
+               )}
+             </div>
+           )}
+           {task.dispatched_at && (
+             <div className="flex items-center gap-1.5 text-xs text-[#8b949e]">
+               <Clock size={11} />
+               <span>Started {relativeTime(task.dispatched_at)}</span>
+             </div>
+           )}
+           {task.start_at && (
+             <div className="flex items-center gap-1.5 text-xs text-[#d29922]" title={new Date(task.start_at).toLocaleString()}>
+               <CalendarClock size={11} />
+               <span>Starts {relativeTime(task.start_at)}</span>
+             </div>
+           )}
+           {task.dependency_ids?.length > 0 && (
+             <div className="flex items-center gap-1.5 text-xs text-[#8b949e]">
+               <GitBranch size={11} />
+               <span>{task.dependency_ids.length} dep{task.dependency_ids.length > 1 ? 's' : ''}</span>
+             </div>
+           )}
+           {task.blocked_by_ids?.length ? (
+             <div className="flex items-center gap-1.5 text-xs text-[#f85149]">
+               <AlertCircle size={11} />
+               <span>Blocked by #{task.blocked_by_ids.join(', #')}</span>
+             </div>
+           ) : null}
+           {task.state === 'completed' && task.completed_at && (
+             <div className="flex items-center gap-1.5 text-xs text-[#3fb950]">
+               <CheckCircle2 size={11} />
+               <span>Done {relativeTime(task.completed_at)}</span>
+             </div>
+           )}
+         </div>
 
         {/* Tabs */}
         <div className="flex border-b border-[#30363d]">
@@ -131,24 +203,92 @@ export function TaskDrawer({ task, onClose }: Props) {
           ))}
         </div>
 
-        {/* Content */}
-        <div className="flex-1 overflow-y-auto p-5">
-          {loading ? (
-            <div className="flex justify-center py-8">
-              <Loader2 size={20} className="text-[#8b949e] animate-spin" />
-            </div>
-          ) : tab === 'details' ? (
-            <DetailsTab task={task} />
-          ) : (
-            <HistoryTab history={history} comments={comments} />
-          )}
-        </div>
-      </div>
-    </>
-  )
-}
+         {/* Content */}
+         <div className="flex-1 overflow-y-auto p-5">
+           {editing ? (
+             <div className="flex-1 overflow-y-auto space-y-4">
+               <div>
+                 <label className="text-xs text-[#8b949e] block mb-1">Name</label>
+                 <input value={editForm.name} onChange={e => setEditForm(f => ({ ...f, name: e.target.value }))}
+                   className="w-full bg-[#0d1117] border border-[#30363d] rounded-md px-3 py-1.5 text-sm text-[#e6edf3] focus:outline-none focus:border-[#58a6ff]" />
+               </div>
+               <div>
+                 <label className="text-xs text-[#8b949e] block mb-1">Description</label>
+                 <textarea value={editForm.description} onChange={e => setEditForm(f => ({ ...f, description: e.target.value }))}
+                   rows={4} className="w-full bg-[#0d1117] border border-[#30363d] rounded-md px-3 py-1.5 text-sm text-[#e6edf3] focus:outline-none focus:border-[#58a6ff] resize-none" />
+               </div>
+               <div>
+                 <label className="text-xs text-[#8b949e] block mb-1">Acceptance Criteria</label>
+                 <textarea value={editForm.acceptance_criteria} onChange={e => setEditForm(f => ({ ...f, acceptance_criteria: e.target.value }))}
+                   rows={3} className="w-full bg-[#0d1117] border border-[#30363d] rounded-md px-3 py-1.5 text-sm text-[#e6edf3] focus:outline-none focus:border-[#58a6ff] resize-none" />
+               </div>
+               <div>
+                 <label className="text-xs text-[#8b949e] block mb-1">Assigned To</label>
+                 <input value={editForm.assigned_to} onChange={e => setEditForm(f => ({ ...f, assigned_to: e.target.value }))}
+                   className="w-full bg-[#0d1117] border border-[#30363d] rounded-md px-3 py-1.5 text-sm text-[#e6edf3] focus:outline-none focus:border-[#58a6ff]" />
+               </div>
+               <div>
+                 <label className="text-xs text-[#8b949e] block mb-1">Priority</label>
+                 <select value={editForm.priority} onChange={e => setEditForm(f => ({ ...f, priority: e.target.value }))}
+                   className="w-full bg-[#0d1117] border border-[#30363d] rounded-md px-3 py-1.5 text-sm text-[#e6edf3] focus:outline-none focus:border-[#58a6ff]">
+                   <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
+                 </select>
+               </div>
+               <div className="flex gap-2 pt-2">
+                 <button onClick={handleEditSave} disabled={editSaving}
+                   className="flex items-center gap-1.5 px-3 py-1.5 bg-[#238636] hover:bg-[#2ea043] disabled:opacity-50 text-white text-xs rounded-md transition-colors">
+                   {editSaving && <Loader2 size={11} className="animate-spin" />}
+                   Save
+                 </button>
+                 <button onClick={() => setEditing(false)}
+                   className="px-3 py-1.5 text-xs text-[#8b949e] hover:text-[#e6edf3] transition-colors">
+                   Cancel
+                 </button>
+               </div>
+             </div>
+           ) : loading ? (
+             <div className="flex justify-center py-8">
+               <Loader2 size={20} className="text-[#8b949e] animate-spin" />
+             </div>
+           ) : tab === 'details' ? (
+             <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} />
+           ) : (
+             <HistoryTab history={history} comments={comments} />
+           )}
+         </div>
+       </div>
 
-function DetailsTab({ task }: { task: Task }) {
+       {showDeleteConfirm && (
+         <ConfirmDeleteModal
+           title={`Delete task #${task!.id}`}
+           description={`"${task!.name}" will be permanently deleted.`}
+           onClose={() => setShowDeleteConfirm(false)}
+           onConfirm={handleDelete}
+           deleting={deleting}
+         />
+       )}
+     </>
+   )
+ }
+
+function DetailsTab({ task, onClose, onRefresh }: { task: Task; onClose: () => void; onRefresh?: () => void }) {
+  const [editingSchedule, setEditingSchedule] = useState(false)
+  const [scheduleValue, setScheduleValue] = useState('')
+  const [savingSchedule, setSavingSchedule] = useState(false)
+
+  const handleSaveSchedule = async () => {
+    setSavingSchedule(true)
+    try {
+      const iso = scheduleValue ? new Date(scheduleValue).toISOString() : null
+      await api.setTaskStartAt(task.id, iso)
+      setEditingSchedule(false)
+      onClose()
+      onRefresh?.()
+    } finally {
+      setSavingSchedule(false)
+    }
+  }
+
   return (
     <div className="space-y-5">
       {task.description && (
@@ -174,6 +314,55 @@ function DetailsTab({ task }: { task: Task }) {
         <MetaItem label="Updated" value={relativeTime(task.updated_at)} />
         {task.dependency_ids?.length > 0 && (
           <MetaItem label="Depends on" value={task.dependency_ids.map(id => `#${id}`).join(', ')} />
+        )}
+      </div>
+
+      {/* Scheduled Start */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-xs font-medium text-[#8b949e] uppercase tracking-wide">Scheduled Start</div>
+          <button onClick={() => { setScheduleValue(task.start_at ? task.start_at.slice(0, 16) : ''); setEditingSchedule(true) }}
+            className="text-xs text-[#58a6ff] hover:text-[#79c0ff] flex items-center gap-1 transition-colors">
+            <Pencil size={10} />
+            {task.start_at ? 'Edit' : 'Set schedule'}
+          </button>
+        </div>
+        {!editingSchedule ? (
+          task.start_at ? (
+            <div className="text-sm text-[#e6edf3] bg-[#0d1117] rounded-lg p-3 border border-[#21262d] flex items-center gap-2">
+              <CalendarClock size={14} className="text-[#d29922] flex-shrink-0" />
+              <div>
+                <div>{new Date(task.start_at).toLocaleString(undefined, { year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
+                <div className="text-xs text-[#8b949e] mt-0.5">{relativeTime(task.start_at)}</div>
+              </div>
+            </div>
+          ) : (
+            <div className="text-sm text-[#484f58] italic">No schedule set</div>
+          )
+        ) : (
+          <div className="bg-[#0d1117] rounded-lg p-3 border border-[#30363d] space-y-3">
+            <div>
+              <label className="text-xs text-[#8b949e] block mb-1">Date & Time (local timezone)</label>
+              <input type="datetime-local" value={scheduleValue} onChange={e => setScheduleValue(e.target.value)}
+                className="w-full bg-[#161b22] border border-[#30363d] rounded-md px-3 py-1.5 text-sm text-[#e6edf3] focus:outline-none focus:border-[#58a6ff]" />
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={handleSaveSchedule} disabled={savingSchedule}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#238636] hover:bg-[#2ea043] text-white text-xs rounded-md disabled:opacity-50 transition-colors">
+                {savingSchedule && <Loader2 size={11} className="animate-spin" />}
+                Save
+              </button>
+              {task.start_at && (
+                <button onClick={async () => { setSavingSchedule(true); try { await api.setTaskStartAt(task.id, null); setEditingSchedule(false); onClose(); onRefresh?.() } finally { setSavingSchedule(false) } }}
+                  disabled={savingSchedule} className="px-3 py-1.5 text-xs text-[#f85149] hover:text-[#ff7b72] transition-colors">
+                  Clear schedule
+                </button>
+              )}
+              <button onClick={() => setEditingSchedule(false)} className="px-3 py-1.5 text-xs text-[#8b949e] hover:text-[#e6edf3] transition-colors">
+                Cancel
+              </button>
+            </div>
+          </div>
         )}
       </div>
     </div>

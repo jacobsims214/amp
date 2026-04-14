@@ -1,4 +1,4 @@
-export type TaskState = 'backlog' | 'in_progress' | 'completed' | 'blocked'
+export type TaskState = 'backlog' | 'in_progress' | 'completed' | 'blocked' | 'scheduled'
 export type Priority = '0' | '1' | '2' | '3'
 
 export interface Project {
@@ -52,6 +52,7 @@ export interface Task {
   dispatched_at?: string
   completed_at?: string
   block_reason?: string
+  start_at?: string       // RFC3339 UTC timestamp for scheduled tasks
   created_at: string
   updated_at: string
 }
@@ -120,6 +121,8 @@ export interface SSEEvent {
   type:
     | 'connected'
     | 'project.created'
+    | 'project.archived'
+    | 'project.restored'
     | 'epic.created'
     | 'epic.state_changed'
     | 'story.created'
@@ -134,4 +137,53 @@ export interface SSEEvent {
   project_id?: number
   payload?: unknown
   at?: string
+}
+
+// ---- CRUD request types ----
+
+export interface CreateEpicRequest {
+  name: string
+  description?: string
+  priority?: string
+}
+
+export interface UpdateEpicRequest {
+  name?: string
+  description?: string
+  priority?: string
+}
+
+export interface CreateStoryRequest {
+  name: string
+  description?: string
+  acceptance_criteria?: string
+  priority?: string
+}
+
+export interface UpdateStoryRequest {
+  name?: string
+  description?: string
+  acceptance_criteria?: string
+  priority?: string
+}
+
+export interface CreateTaskRequest {
+  epic_id: number
+  story_id: number
+  name: string
+  description?: string
+  acceptance_criteria?: string
+  assigned_to?: string
+  priority?: string
+  dependency_ids?: number[]
+  start_at?: string
+}
+
+export interface UpdateTaskRequest {
+  name?: string
+  description?: string
+  acceptance_criteria?: string
+  assigned_to?: string
+  priority?: string
+  start_at?: string | null
 }

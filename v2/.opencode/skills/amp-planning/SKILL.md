@@ -36,6 +36,99 @@ amp_create_task   {project_id, epic_id, story_id, name, description,
 
 ---
 
+## Task sizing — the most important rule
+
+**Every task must be one thing.** If you can describe a task with "and", split it.
+
+A correctly sized task:
+- Touches **one file** or **one concern**
+- Can be described in a single sentence
+- A worker can complete it in one focused session without making judgment calls about scope
+- Has a clear, binary done state — it either passes the acceptance criteria or it doesn't
+
+**Signs a task is too large:**
+- The description has multiple `##` sections covering different files
+- The acceptance criteria has more than 4-5 bullet points
+- It says things like "implement the full X feature" or "add all Y endpoints"
+- A worker would need to make architectural decisions to complete it
+
+**How to split:**
+- One file changed = one task (e.g. "Add UpdateEpic to repo.go" is separate from "Add PATCH /epics/:id to rest.go")
+- One layer = one task (domain model change, then repo change, then REST wiring are three tasks)
+- One component = one task (CrudModal component is separate from wiring it into Board.tsx)
+
+---
+
+## Waves and dependencies — build in phases
+
+Work flows in waves. Each wave unblocks the next. Think in phases before creating tasks:
+
+1. **Foundation** — types, models, interfaces that everything else depends on
+2. **Implementation** — the actual work, split by file/concern, can run in parallel within a wave
+3. **Review** — a dedicated review task that gates the next wave
+4. **Next wave** — only unblocks after review passes
+
+**Every implementation wave must be followed by a review task before the next wave starts.**
+
+The review task blocks the next wave via `dependency_ids`. This is non-negotiable.
+
+```
+Wave 1: #10 (model), #11 (repo)          ← parallel, no deps
+Wave 1 review: #12                        ← blocked by #10, #11
+Wave 2: #13 (REST), #14 (actor)          ← blocked by #12 (review)
+Wave 2 review: #15                        ← blocked by #13, #14
+Wave 3: #16 (frontend types)             ← blocked by #15 (review)
+...
+```
+
+---
+
+## Review tasks — mandatory after every implementation wave
+
+**Any task that produces code, config, migrations, or other artifacts must be followed by a review task.**
+
+The review task:
+- Is blocked by all implementation tasks in that wave
+- Runs `git diff` to see exactly what changed
+- Verifies each acceptance criterion was actually met
+- Runs the build/test command to confirm it passes
+- Posts a comment with findings
+
+**Critically: review tasks can and should create new fix tasks.**
+
+If the reviewer finds issues, it does NOT fail or block itself. Instead it:
+1. Creates small, targeted fix tasks in the backlog (one issue = one task)
+2. Posts a comment listing what was found and what fix tasks were created
+3. Completes itself — the fix tasks are now in the backlog for the next dispatch cycle
+
+This means the manager must check `ready_to_dispatch` after every review completes — there may be new fix tasks waiting.
+
+Review task description template:
+```
+## What to review
+[List every implementation task in this wave with their task IDs]
+
+## What to check
+[Specific things to verify — file names, function signatures, SQL parameter counts, build commands]
+
+## How to verify
+[Exact commands: go build ./..., npm run build, git diff HEAD, etc.]
+
+## If issues found
+Create a new task for each issue found:
+- Use amp_create_task with the same project_id, epic_id, story_id
+- Make it small and targeted — one issue = one task
+- Set dependency_ids if the fix depends on other work
+- Post a comment on THIS review task listing all fix tasks created
+
+## Acceptance criteria
+- All items verified
+- Build/tests pass
+- Either "LGTM" comment posted OR fix tasks created for every issue found
+```
+
+---
+
 ## Every task requires these three things — no exceptions
 
 **1. `assigned_to`** — set at creation time, every task, always `"amp-worker"` unless told otherwise. This is how the kanban board shows who owns what. A task without `assigned_to` is invisible to the user during review.
@@ -73,6 +166,7 @@ Thin description = thin results. Workers are local LLMs — give them everything
 - Does it use middleware, auth, shared utilities another task sets up?
 - Does it integrate two things that each come from different tasks?
 - Does it need a schema, config, or interface another task defines?
+- Does it depend on a review task passing before it should start?
 
 If yes to any of these — add the dependency, regardless of which epic or story it's in.
 
@@ -85,17 +179,21 @@ Present before dispatching. The user needs to see assigned agents and blockers t
 ```
 EPIC: [name]
 └── Story: [name]
-    ├── Task #N: [name]  →  amp-worker   (ready)
-    ├── Task #N: [name]  →  amp-worker   (ready)
-    └── Task #N: [name]  →  amp-worker   (blocked by #N, #N)
+    ├── Task #N: [name]           →  amp-worker   (ready)
+    ├── Task #N: [name]           →  amp-worker   (ready)
+    ├── Task #N: REVIEW wave 1    →  amp-worker   (blocked by #N, #N)
+    ├── Task #N: [name]           →  amp-worker   (blocked by #N review)
+    └── Task #N: REVIEW wave 2    →  amp-worker   (blocked by #N)
 
 Phase 1 — dispatch immediately: #N, #N
-Phase 2 — unblocks when phase 1 completes: #N
+Phase 2 — unblocks when phase 1 review passes: #N, #N
+Phase 3 — unblocks when phase 2 review passes: #N
 
-Total: X tasks across Y epics
+Total: X tasks (Y implementation + Z reviews)
 ```
 
 Every task shows: its ID, name, assigned agent, and either `(ready)` or `(blocked by #N, ...)`.
+Review tasks must be clearly labeled as reviews.
 If a task has no agent or no blocker status shown — fix it before presenting.
 
 ---
@@ -127,6 +225,6 @@ task(prompt="amp-worker. Task ID: {id}. Project ID: {project_id}.", subagent_typ
 
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
-After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Repeat until `ready_to_dispatch` and `in_progress` are both empty.
 
 Load `amp-mcp` if you need exact tool argument shapes.

@@ -77,6 +77,7 @@ export function useBoardData(projectId: number): BoardData {
       case 'task.blocked':
       case 'task.unblocked': {
         // task.unblocked is the new dedicated event type (was task.updated before).
+        // When a scheduled task is unblocked, it transitions from blocked to backlog state.
         const task = event.payload as Task
         setTasks(prev => prev.map(t => t.id === task.id ? { ...t, ...task } : t))
         break

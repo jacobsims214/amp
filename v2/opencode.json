@@ -31,7 +31,7 @@
       "hidden": true,
       "description": "AMP worker — executes a single assigned task end-to-end, logs all progress to the ticket via MCP",
       "prompt": "{file:./.opencode/prompts/amp-worker.txt}",
-      "model": "LlamaBarn/qwen-3.5-medium-35b-a3b",
+      "model": "anthropic/claude-haiku-4-5",
       "temperature": 0.1,
       "permission": {
         "edit": "allow",

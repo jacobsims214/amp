@@ -3,11 +3,13 @@
 // Tool surface (task API only — scoped to what agents actually need):
 //
 //	amp_create_project   amp_list_projects   amp_get_project
+//	amp_archive_project  amp_restore_project
 //	amp_create_epic      amp_list_epics      amp_get_epic
 //	amp_create_story     amp_list_stories    amp_get_story
 //	amp_create_task      amp_list_tasks      amp_get_task
 //	amp_update_task      amp_dispatch_task   amp_complete_task
 //	amp_block_task       amp_add_task_comment
+//	amp_export_project   amp_import_project
 package mcp
 
 import (
@@ -15,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
@@ -60,6 +63,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_get_project", "Get a project by its numeric ID.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.getProject))
 
+	mcp.AddTool(tool("amp_archive_project", "Archive a completed project. Sets state=archived.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.archiveProject))
+
+	mcp.AddTool(tool("amp_restore_project", "Restore an archived project. Sets state=active.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.restoreProject))
+
 	// ---- Epics ----
 	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project.",
 		props{
@@ -96,7 +105,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_create_task",
 		"Create a task. REQUIRED hierarchy: every task must belong to a story which must belong to an epic. "+
 			"Set assigned_to at planning time so the user can review who will work each ticket before dispatch. "+
-			"If dependency_ids are provided, state is set automatically (blocked/backlog). Never set state yourself.",
+			"If dependency_ids are provided, state is set automatically (blocked/backlog). Never set state yourself. "+
+			"Optional start_at schedules the task to be unblocked at a future time.",
 		props{
 			"project_id":          num("REQUIRED. Project ID."),
 			"epic_id":             num("REQUIRED. Epic ID — tasks must belong to an epic."),
@@ -107,10 +117,11 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"priority":            str("Priority: 0=low, 1=normal (default), 2=high, 3=critical."),
 			"assigned_to":         str("REQUIRED. Who should work this task, e.g. 'amp-worker'. Set this at planning time so the user can review and correct before dispatch."),
 			"dependency_ids":      arr("Optional. Task IDs that must complete before this task can run. State is derived automatically — do not set it yourself."),
+			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this task. Task will be held as blocked until this time arrives."),
 		}), wrap(ctx, s.createTask))
 
 	mcp.AddTool(tool("amp_list_tasks",
-		"List tasks for a project. Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way.",
+		"List tasks for a project. Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
@@ -189,12 +200,36 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"reason":  str("Optional. Why this manual override was needed (logged to activity)."),
 		}), wrap(ctx, s.setTaskState))
 
+	mcp.AddTool(tool("amp_set_task_start_at",
+		"Set or clear a task's scheduled start time. If start_at is provided, the task will be blocked until that time. "+
+			"If start_at is omitted or empty, clears any existing schedule.",
+		props{
+			"task_id":  num("REQUIRED. Task ID."),
+			"start_at": str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this task. Omit to clear the schedule."),
+		}), wrap(ctx, s.setTaskStartAt))
+
 	mcp.AddTool(tool("amp_list_project_stories",
 		"List all stories for a project across all epics. Useful for getting a full picture "+
 			"without iterating epics one by one.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.listProjectStories))
+
+	// ---- Export/Import ----
+	mcp.AddTool(tool("amp_export_project",
+		"Export a complete project as JSON. Returns the full ExportBundle with all epics, stories, tasks, and KB documents.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+		}), wrap(ctx, s.exportProject))
+
+	mcp.AddTool(tool("amp_import_project",
+		"Import a project from an ExportBundle JSON string. Creates a new project with all epics, stories, tasks, and KB documents. "+
+			"Optional code and name parameters override the bundle's project identity.",
+		props{
+			"bundle_json": str("REQUIRED. The full JSON from amp_export_project as a string."),
+			"code":        str("Optional. Override the project code from the bundle."),
+			"name":        str("Optional. Override the project name from the bundle."),
+		}), wrap(ctx, s.importProject))
 
 	// ---- Knowledge Base ----
 	mcp.AddTool(tool("amp_kb_write",
@@ -301,9 +336,38 @@ func (s *Server) getProject(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
+func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.repo.ArchiveProject(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	s.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+	return jsonResult(map[string]interface{}{"project": p})
+}
+
+func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	p, err := s.repo.RestoreProject(context.Background(), id)
+	if err != nil {
+		return nil, err
+	}
+	s.hub.Publish(domain.Event{Type: domain.EventProjectRestored, ProjectID: p.ID, Payload: p, At: time.Now()})
+	return jsonResult(map[string]interface{}{"project": p})
+}
+
 func (s *Server) createEpic(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
 		return nil, err
 	}
 	req := domain.CreateEpicRequest{
@@ -353,6 +417,9 @@ func (s *Server) getEpic(_ context.Context, args map[string]interface{}) (*mcpgo
 func (s *Server) createStory(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
 		return nil, err
 	}
 	epicID, err := reqInt(args, "epic_id")
@@ -425,6 +492,9 @@ func (s *Server) createTask(_ context.Context, args map[string]interface{}) (*mc
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+		return nil, err
+	}
 
 	// Enforce hierarchy: epic_id and story_id are both required.
 	epicID, err := reqInt(args, "epic_id")
@@ -464,6 +534,17 @@ func (s *Server) createTask(_ context.Context, args map[string]interface{}) (*mc
 		return nil, fmt.Errorf("epic %d belongs to project %d, not project %d", epicID, epic.ProjectID, projectID)
 	}
 
+	// Parse optional start_at parameter
+	var startAt *time.Time
+	startAtStr := optStr(args, "start_at", "")
+	if startAtStr != "" {
+		t, err := time.Parse(time.RFC3339, startAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid start_at format: %w", err)
+		}
+		startAt = &t
+	}
+
 	req := domain.CreateTaskRequest{
 		ProjectID:          projectID,
 		EpicID:             epicID,
@@ -474,6 +555,7 @@ func (s *Server) createTask(_ context.Context, args map[string]interface{}) (*mc
 		Priority:           optStr(args, "priority", "1"),
 		AssignedTo:         optStr(args, "assigned_to", ""),
 		DependencyIDs:      optIntSlice(args, "dependency_ids"),
+		StartAt:            startAt,
 	}
 
 	replyCh := make(chan ReplyCreateTask, 1)
@@ -512,6 +594,7 @@ func (s *Server) listTasks(_ context.Context, args map[string]interface{}) (*mcp
 	readyToDispatch := make([]domain.Task, 0)
 	inProgress := make([]domain.Task, 0)
 	blocked := make([]domain.Task, 0)
+	scheduled := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
 	for _, t := range reply.Tasks {
 		switch t.State {
@@ -520,7 +603,12 @@ func (s *Server) listTasks(_ context.Context, args map[string]interface{}) (*mcp
 		case domain.TaskStateInProgress:
 			inProgress = append(inProgress, t)
 		case domain.TaskStateBlocked:
-			blocked = append(blocked, t)
+			// Separate scheduled tasks (block_reason starts with "scheduled:") from dependency-blocked tasks
+			if strings.HasPrefix(t.BlockReason, "scheduled:") {
+				scheduled = append(scheduled, t)
+			} else {
+				blocked = append(blocked, t)
+			}
 		case domain.TaskStateCompleted:
 			completed = append(completed, t)
 		}
@@ -529,7 +617,8 @@ func (s *Server) listTasks(_ context.Context, args map[string]interface{}) (*mcp
 	return jsonResult(map[string]interface{}{
 		"ready_to_dispatch": readyToDispatch, // dispatch ALL of these immediately
 		"in_progress":       inProgress,
-		"blocked":           blocked, // each has blocked_by_ids showing what's in the way
+		"blocked":           blocked,   // each has blocked_by_ids showing what's in the way
+		"scheduled":         scheduled, // tasks waiting for their start_at time
 		"completed":         completed,
 		"count":             len(reply.Tasks),
 	})
@@ -570,6 +659,9 @@ func (s *Server) updateTask(_ context.Context, args map[string]interface{}) (*mc
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
 	req := domain.UpdateTaskRequest{
 		TaskID:      taskID,
 		Name:        optStr(args, "name", ""),
@@ -603,6 +695,9 @@ func (s *Server) dispatchTask(_ context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(task.ProjectID)
 	if err != nil {
@@ -623,6 +718,9 @@ func (s *Server) completeTask(_ context.Context, args map[string]interface{}) (*
 	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -646,6 +744,9 @@ func (s *Server) blockTask(_ context.Context, args map[string]interface{}) (*mcp
 	reason := optStr(args, "reason", "")
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
@@ -672,6 +773,9 @@ func (s *Server) addComment(_ context.Context, args map[string]interface{}) (*mc
 	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
 	req := domain.AddCommentRequest{
@@ -740,8 +844,12 @@ func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.repo.GetProject(context.Background(), projectID); err != nil {
+	p, err := s.repo.GetProject(context.Background(), projectID)
+	if err != nil {
 		return nil, fmt.Errorf("project %d not found", projectID)
+	}
+	if p.State == domain.ProjectStateArchived {
+		return nil, fmt.Errorf("⚠️  Project %d (%s) is archived. Restore it first with amp_restore_project before making changes.", p.ID, p.Name)
 	}
 	// 1. Wipe postgres
 	if err := s.repo.ResetProject(context.Background(), projectID); err != nil {
@@ -771,6 +879,9 @@ func (s *Server) deleteTask(_ context.Context, args map[string]interface{}) (*mc
 	if err != nil {
 		return nil, fmt.Errorf("task %d not found", taskID)
 	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
 	// 1. Delete from postgres
 	if err := s.repo.DeleteTask(context.Background(), taskID); err != nil {
 		return nil, fmt.Errorf("delete task: %w", err)
@@ -794,6 +905,9 @@ func (s *Server) deleteEpic(_ context.Context, args map[string]interface{}) (*mc
 	epic, err := s.repo.GetEpic(context.Background(), epicID)
 	if err != nil {
 		return nil, fmt.Errorf("epic %d not found", epicID)
+	}
+	if err := s.checkProjectNotArchived(context.Background(), epic.ProjectID); err != nil {
+		return nil, err
 	}
 	// 1. Delete from postgres (cascades to stories and tasks)
 	if err := s.repo.DeleteEpic(context.Background(), epicID); err != nil {
@@ -829,6 +943,9 @@ func (s *Server) setTaskState(_ context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, fmt.Errorf("task %d not found", taskID)
 	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
 	fromState := string(task.State)
 
 	// Route through actor hierarchy so the TaskActor's in-memory state is updated.
@@ -856,6 +973,54 @@ func (s *Server) setTaskState(_ context.Context, args map[string]interface{}) (*
 	})
 }
 
+func (s *Server) setTaskStartAt(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse optional start_at parameter
+	var startAt *time.Time
+	startAtStr := optStr(args, "start_at", "")
+	if startAtStr != "" {
+		t, err := time.Parse(time.RFC3339, startAtStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid start_at format: %w", err)
+		}
+		startAt = &t
+	}
+
+	// Get task to find project_id for routing
+	task, err := s.repo.GetTask(context.Background(), taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %d not found", taskID)
+	}
+	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
+		return nil, err
+	}
+
+	// Route through actor hierarchy so the TaskActor's in-memory state is updated
+	pid, err := s.registry.Get(task.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	replyCh := make(chan actor.ReplySimple, 1)
+	s.registry.System().Root.Send(pid, &actor.MsgSetTaskStartAt{
+		TaskID:  taskID,
+		StartAt: startAt,
+		ReplyCh: replyCh,
+	})
+	reply := <-replyCh
+	if reply.Err != nil {
+		return nil, reply.Err
+	}
+
+	return jsonResult(map[string]interface{}{
+		"task_id":  taskID,
+		"start_at": startAt,
+	})
+}
+
 func (s *Server) listProjectStories(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
@@ -868,11 +1033,109 @@ func (s *Server) listProjectStories(_ context.Context, args map[string]interface
 	return jsonResult(map[string]interface{}{"stories": stories, "count": len(stories)})
 }
 
+// ---- Export/Import handlers ----
+
+func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+
+	ctx := context.Background()
+
+	// 1. Build the export bundle from the database
+	bundle, err := s.repo.BuildExportBundle(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("build export bundle: %w", err)
+	}
+
+	// 2. Fetch all KB documents for this project
+	docSummaries, err := s.kb.ListDocs(ctx, projectID, "")
+	if err != nil {
+		return nil, fmt.Errorf("list kb docs: %w", err)
+	}
+
+	// 3. Fetch full content for each KB document
+	kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
+	for _, summary := range docSummaries {
+		doc, err := s.kb.GetDoc(ctx, projectID, summary.Path)
+		if err != nil {
+			// Log warning but continue (graceful degradation)
+			slog.Default().Warn("failed to fetch kb doc", "path", summary.Path, "err", err)
+			continue
+		}
+		// Convert kb.Doc to ExportKBDoc
+		exportDoc := domain.ExportKBDoc{
+			Path:    doc.Path,
+			Title:   doc.Title,
+			Content: doc.Content,
+			Tags:    doc.Tags, // kb.Doc.Tags is []string
+			Author:  doc.Author,
+		}
+		kbDocs = append(kbDocs, exportDoc)
+	}
+
+	// 4. Assemble the complete bundle with KB docs
+	bundle.KBDocs = kbDocs
+
+	return jsonResult(bundle)
+}
+
+func (s *Server) importProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	bundleJSON, err := reqStr(args, "bundle_json")
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse the bundle JSON string
+	var bundle domain.ExportBundle
+	if err := json.Unmarshal([]byte(bundleJSON), &bundle); err != nil {
+		return nil, fmt.Errorf("unmarshal bundle json: %w", err)
+	}
+
+	// Get optional code and name overrides
+	newCode := optStr(args, "code", "")
+	newName := optStr(args, "name", "")
+
+	ctx := context.Background()
+
+	// 1. Import the bundle (creates project, epics, stories, tasks)
+	newProject, err := s.repo.ImportBundle(ctx, bundle, newCode, newName)
+	if err != nil {
+		return nil, fmt.Errorf("import bundle: %w", err)
+	}
+
+	// 2. Spawn the ProjectActor for the new project
+	pid, err := s.registry.Get(newProject.ID)
+	if err != nil {
+		return nil, fmt.Errorf("spawn project actor: %w", err)
+	}
+	_ = pid // actor is now registered
+
+	// 3. Re-index KB documents into Typesense
+	for _, kbDoc := range bundle.KBDocs {
+		_, err := s.kb.WriteDoc(ctx, newProject.ID, kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags)
+		if err != nil {
+			// Log warning but continue (graceful degradation)
+			slog.Default().Warn("failed to write kb doc during import", "path", kbDoc.Path, "err", err)
+			continue
+		}
+	}
+
+	// 4. Publish event for real-time UI updates
+	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
+
+	return jsonResult(map[string]interface{}{"project": newProject})
+}
+
 // ---- KB handlers ----
 
 func (s *Server) kbWrite(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
 		return nil, err
 	}
 	path, err := reqStr(args, "path")
@@ -950,6 +1213,9 @@ func (s *Server) kbDelete(_ context.Context, args map[string]interface{}) (*mcpg
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+		return nil, err
+	}
 	path, err := reqStr(args, "path")
 	if err != nil {
 		return nil, err
@@ -977,12 +1243,29 @@ func (s *Server) kbReindex(_ context.Context, args map[string]interface{}) (*mcp
 	if err != nil {
 		return nil, err
 	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+		return nil, err
+	}
 	go func() {
 		if err := s.kb.Reindex(context.Background(), projectID); err != nil {
 			slog.Default().Error("kb reindex failed", "project_id", projectID, "err", err)
 		}
 	}()
 	return jsonResult(map[string]interface{}{"reindex": "started", "project_id": projectID})
+}
+
+// checkProjectNotArchived returns an error if the project is archived.
+// Call this at the start of every mutating MCP tool handler.
+// Read-only tools and lifecycle tools (archive/restore) are exempt.
+func (s *Server) checkProjectNotArchived(ctx context.Context, projectID int) error {
+	p, err := s.repo.GetProject(ctx, projectID)
+	if err != nil {
+		return fmt.Errorf("project %d not found", projectID)
+	}
+	if p.State == domain.ProjectStateArchived {
+		return fmt.Errorf("⚠️  Project %d (%s) is archived. Restore it first with amp_restore_project before making changes.", p.ID, p.Name)
+	}
+	return nil
 }
 
 // ---- Type aliases to avoid cross-package repetition ----

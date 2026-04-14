@@ -231,6 +231,19 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 			}
 		}
 		msg.ReplyCh <- ReplySimple{}
+
+	case *MsgDeleteStory:
+		// Find which epic owns this story by broadcasting.
+		// (We don't have a storyToEpic index at project level — broadcast to all epics.)
+		for _, epicPID := range a.epics {
+			replyCh := make(chan ReplySimple, 1)
+			ctx.Send(epicPID, &MsgDeleteStory{StoryID: msg.StoryID, ReplyCh: replyCh})
+			reply := <-replyCh
+			if reply.Err == nil {
+				break // found and handled
+			}
+		}
+		msg.ReplyCh <- ReplySimple{}
 	}
 }
 

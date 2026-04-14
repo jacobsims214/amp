@@ -1,6 +1,7 @@
 import type { TaskState } from '../types'
 
 const CONFIG: Record<TaskState, { label: string; dot: string; text: string; bg: string }> = {
+  scheduled:   { label: 'Scheduled',   dot: 'bg-[#d29922]', text: 'text-[#d29922]', bg: 'bg-[#d29922]/10' },
   backlog:     { label: 'Backlog',     dot: 'bg-[#8b949e]', text: 'text-[#8b949e]', bg: 'bg-[#8b949e]/10' },
   in_progress: { label: 'In Progress', dot: 'bg-[#58a6ff]', text: 'text-[#58a6ff]', bg: 'bg-[#58a6ff]/10' },
   completed:   { label: 'Done',        dot: 'bg-[#3fb950]', text: 'text-[#3fb950]', bg: 'bg-[#3fb950]/10' },

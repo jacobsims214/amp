@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/asynkron/protoactor-go/actor"
@@ -21,6 +22,7 @@ import (
 //   - Notifies parent StoryActor on dispatch and completion (upward rollup)
 //   - Persists every state change to postgres before updating memory
 //   - Publishes SSE events and activity log entries on every transition
+//   - Manages scheduled task timers (start_at → unblock at scheduled time)
 //
 // The task data is passed at construction via closure — no DB call on startup.
 // The completedDeps set is seeded from the initial dep state provided by StoryActor.
@@ -33,6 +35,9 @@ type TaskActor struct {
 	repo          *repository.Repo
 	hub           *hub.Hub
 	log           *slog.Logger
+	scheduleTimer *time.Timer        // non-nil if task is waiting for start_at
+	selfPID       *actor.PID         // this actor's PID — used to send messages to self
+	actorSystem   *actor.ActorSystem // actor system reference for sending messages from goroutines
 }
 
 // NewTaskActorFromTask constructs a TaskActor from an already-loaded task.
@@ -63,8 +68,25 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 	switch msg := ctx.Message().(type) {
 
 	case *actor.Started:
+		// Store self PID and actor system for timer callback to send messages to self
+		a.selfPID = ctx.Self()
+		a.actorSystem = ctx.ActorSystem()
+
 		// Register with ProjectActor so it can route task-targeted messages.
 		ctx.Send(a.projectPID, &MsgRegisterTask{TaskID: a.task.ID, EpicID: a.task.EpicID})
+
+		// Check if this task has a future start_at time and arm the timer
+		if a.task.StartAt != nil && a.task.StartAt.After(time.Now()) {
+			a.armScheduleTimer()
+			a.task.State = domain.TaskStateBlocked
+			a.task.BlockReason = "scheduled:" + a.task.StartAt.Format(time.RFC3339)
+			a.task.UpdatedAt = time.Now()
+
+			if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBlocked, a.task.BlockReason); err != nil {
+				a.log.Error("failed to persist scheduled block state", "err", err)
+			}
+		}
+
 		a.log.Info("started", "state", a.task.State, "deps", len(a.task.DependencyIDs))
 
 	case *actor.Stopped:
@@ -92,7 +114,16 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
+		// Cancel timer if armed before applying state change
+		if a.scheduleTimer != nil {
+			a.scheduleTimer.Stop()
+			a.scheduleTimer = nil
+		}
 		err := a.handleSetState(msg.State, msg.Reason)
+		msg.ReplyCh <- ReplySimple{Err: err}
+
+	case *MsgSetTaskStartAt:
+		err := a.handleSetTaskStartAt(msg.StartAt)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgAddComment:
@@ -108,7 +139,16 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		a.completedDeps[msg.CompletedTaskID] = true
 		a.checkUnblock(ctx)
 
+	case *MsgScheduledUnblock:
+		// Timer fired — transition task from blocked to backlog
+		a.handleScheduledUnblock(ctx)
+
 	case *MsgDeleteTask:
+		// Cancel timer if armed before stopping
+		if a.scheduleTimer != nil {
+			a.scheduleTimer.Stop()
+			a.scheduleTimer = nil
+		}
 		// Parent is handling DB deletion; we just stop.
 		ctx.Stop(ctx.Self())
 		msg.ReplyCh <- ReplySimple{}
@@ -251,6 +291,51 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string) error 
 	return nil
 }
 
+func (a *TaskActor) handleSetTaskStartAt(startAt *time.Time) error {
+	// Cancel existing timer if armed
+	if a.scheduleTimer != nil {
+		a.scheduleTimer.Stop()
+		a.scheduleTimer = nil
+	}
+
+	// Update in-memory task
+	a.task.StartAt = startAt
+	a.task.UpdatedAt = time.Now()
+
+	// Persist to database
+	if err := a.repo.SetTaskStartAt(context.Background(), a.task.ID, startAt); err != nil {
+		return fmt.Errorf("db set start_at: %w", err)
+	}
+
+	// If new start_at is in the future, arm the timer and block the task
+	if startAt != nil && startAt.After(time.Now()) {
+		a.armScheduleTimer()
+		a.task.State = domain.TaskStateBlocked
+		a.task.BlockReason = "scheduled:" + startAt.Format(time.RFC3339)
+
+		if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBlocked, a.task.BlockReason); err != nil {
+			return fmt.Errorf("db set scheduled block state: %w", err)
+		}
+
+		a.log.Info("scheduled task", "start_at", startAt)
+	} else if startAt == nil {
+		// Clearing the schedule — if task was blocked by schedule, unblock it
+		if a.task.State == domain.TaskStateBlocked && strings.HasPrefix(a.task.BlockReason, "scheduled:") {
+			a.task.State = domain.TaskStateBacklog
+			a.task.BlockReason = ""
+
+			if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+				return fmt.Errorf("db unblock task: %w", err)
+			}
+
+			a.log.Info("cleared schedule, unblocked task")
+		}
+	}
+
+	a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+	return nil
+}
+
 func (a *TaskActor) handleAddComment(req domain.AddCommentRequest) (*domain.Comment, error) {
 	comment, err := a.repo.AddComment(context.Background(), req)
 	if err != nil {
@@ -322,4 +407,71 @@ func (a *TaskActor) logActivity(actorName, action, fromState, toState, detail st
 	}); err != nil {
 		a.log.Error("failed to log activity", "action", action, "err", err)
 	}
+}
+
+// armScheduleTimer sets up a timer to fire at the task's start_at time.
+// The timer callback sends a MsgScheduledUnblock message to self via the actor system.
+func (a *TaskActor) armScheduleTimer() {
+	if a.task.StartAt == nil {
+		return
+	}
+
+	delay := time.Until(*a.task.StartAt)
+	if delay <= 0 {
+		return // already past the time
+	}
+
+	a.scheduleTimer = time.AfterFunc(delay, func() {
+		// Timer fires in a goroutine — must send message to actor via actor system, not call methods directly
+		if a.selfPID != nil && a.actorSystem != nil {
+			a.actorSystem.Root.Send(a.selfPID, &MsgScheduledUnblock{TaskID: a.task.ID})
+		}
+	})
+
+	a.log.Info("scheduled timer armed", "start_at", a.task.StartAt, "delay_seconds", delay.Seconds())
+}
+
+// handleScheduledUnblock is called when the scheduled timer fires.
+// It transitions the task from blocked to backlog and clears the start_at.
+func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
+	// Guard against spurious fires — verify start_at is set and time has passed
+	if a.task.StartAt == nil || a.task.StartAt.After(time.Now()) {
+		a.log.Warn("spurious scheduled unblock", "start_at", a.task.StartAt)
+		return
+	}
+
+	// Only unblock if currently in blocked state
+	if a.task.State != domain.TaskStateBlocked {
+		a.log.Warn("scheduled unblock but task not blocked", "state", a.task.State)
+		return
+	}
+
+	// Transition to backlog
+	a.task.State = domain.TaskStateBacklog
+	a.task.BlockReason = ""
+	a.task.UpdatedAt = time.Now()
+
+	// Persist state change
+	if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+		a.log.Error("failed to persist scheduled unblock state", "err", err)
+		return
+	}
+
+	// Clear start_at in DB — once the schedule fires, it's consumed
+	if err := a.repo.SetTaskStartAt(context.Background(), a.task.ID, nil); err != nil {
+		a.log.Error("failed to clear start_at", "err", err)
+		return
+	}
+
+	// Clear the timer reference
+	a.scheduleTimer = nil
+
+	// Publish SSE event
+	a.publish(domain.EventTaskUnblocked, a.withBlockedBy())
+
+	// Log activity
+	a.logActivity("system", "unblocked", "blocked", "backlog",
+		"Scheduled start time reached")
+
+	a.log.Info("scheduled unblock complete")
 }

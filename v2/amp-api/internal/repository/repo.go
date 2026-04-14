@@ -80,6 +80,52 @@ func (r *Repo) ListProjects(ctx context.Context) ([]domain.Project, error) {
 	return out, rows.Err()
 }
 
+func (r *Repo) ArchiveProject(ctx context.Context, id int) (*domain.Project, error) {
+	p := &domain.Project{}
+	err := r.db.QueryRow(ctx,
+		`UPDATE projects SET state = $1, updated_at = NOW() WHERE id = $2
+		 RETURNING id, name, code, description, state, created_at, updated_at`,
+		domain.ProjectStateArchived, id,
+	).Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.CreatedAt, &p.UpdatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("project %d not found", id)
+	}
+	return p, err
+}
+
+func (r *Repo) RestoreProject(ctx context.Context, id int) (*domain.Project, error) {
+	p := &domain.Project{}
+	err := r.db.QueryRow(ctx,
+		`UPDATE projects SET state = $1, updated_at = NOW() WHERE id = $2
+		 RETURNING id, name, code, description, state, created_at, updated_at`,
+		domain.ProjectStateActive, id,
+	).Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.CreatedAt, &p.UpdatedAt)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("project %d not found", id)
+	}
+	return p, err
+}
+
+func (r *Repo) ListArchivedProjects(ctx context.Context) ([]domain.Project, error) {
+	rows, err := r.db.Query(ctx,
+		`SELECT id, name, code, description, state, created_at, updated_at
+		 FROM projects WHERE state = 'archived' ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]domain.Project, 0)
+	for rows.Next() {
+		var p domain.Project
+		if err := rows.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ---- Epics ----
 
 func (r *Repo) CreateEpic(ctx context.Context, req domain.CreateEpicRequest) (*domain.Epic, error) {
@@ -173,16 +219,16 @@ func (r *Repo) ListStories(ctx context.Context, epicID int) ([]domain.Story, err
 func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*domain.Task, error) {
 	t := &domain.Task{}
 	err := r.db.QueryRow(ctx,
-		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
-		           assigned_to, agent_id, dispatched_at, completed_at, block_reason, created_at, updated_at`,
-		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo,
+		           assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_at, updated_at`,
+		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo, req.StartAt,
 	).Scan(
 		&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID,
 		&t.Name, &t.Description, &t.AcceptanceCriteria,
 		&t.State, &t.Priority,
-		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason,
+		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 	if err != nil {
@@ -207,13 +253,13 @@ func (r *Repo) GetTask(ctx context.Context, id int) (*domain.Task, error) {
 	t := &domain.Task{}
 	err := r.db.QueryRow(ctx,
 		`SELECT id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
-		        assigned_to, agent_id, dispatched_at, completed_at, block_reason, created_at, updated_at
+		        assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_at, updated_at
 		 FROM tasks WHERE id = $1`, id,
 	).Scan(
 		&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID,
 		&t.Name, &t.Description, &t.AcceptanceCriteria,
 		&t.State, &t.Priority,
-		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason,
+		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 	if err == pgx.ErrNoRows {
@@ -228,7 +274,7 @@ func (r *Repo) GetTask(ctx context.Context, id int) (*domain.Task, error) {
 
 func (r *Repo) ListTasks(ctx context.Context, projectID int, state string) ([]domain.Task, error) {
 	query := `SELECT id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
-	                 assigned_to, agent_id, dispatched_at, completed_at, block_reason, created_at, updated_at
+	                 assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_at, updated_at
 	          FROM tasks WHERE project_id = $1`
 	args := []interface{}{projectID}
 	if state != "" {
@@ -250,7 +296,7 @@ func (r *Repo) ListTasks(ctx context.Context, projectID int, state string) ([]do
 			&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID,
 			&t.Name, &t.Description, &t.AcceptanceCriteria,
 			&t.State, &t.Priority,
-			&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason,
+			&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 			&t.CreatedAt, &t.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -278,7 +324,7 @@ func (r *Repo) ListTasks(ctx context.Context, projectID int, state string) ([]do
 func (r *Repo) ListTasksByStory(ctx context.Context, storyID int) ([]domain.Task, error) {
 	rows, err := r.db.Query(ctx,
 		`SELECT id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
-		        assigned_to, agent_id, dispatched_at, completed_at, block_reason, created_at, updated_at
+		        assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_at, updated_at
 		 FROM tasks WHERE story_id = $1 ORDER BY id`, storyID)
 	if err != nil {
 		return nil, err
@@ -291,7 +337,7 @@ func (r *Repo) ListTasksByStory(ctx context.Context, storyID int) ([]domain.Task
 			&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID,
 			&t.Name, &t.Description, &t.AcceptanceCriteria,
 			&t.State, &t.Priority,
-			&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason,
+			&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 			&t.CreatedAt, &t.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -429,17 +475,63 @@ func (r *Repo) SetTaskAgent(ctx context.Context, taskID int, agentID string, dis
 	return err
 }
 
+func (r *Repo) SetTaskStartAt(ctx context.Context, taskID int, startAt *time.Time) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE tasks SET start_at = $1, updated_at = NOW() WHERE id = $2`,
+		startAt, taskID,
+	)
+	return err
+}
+
 func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE tasks SET
+		   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
+		   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
+		   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+		   assigned_to         = CASE WHEN $4 != '' THEN $4 ELSE assigned_to END,
+		   agent_id            = CASE WHEN $5 != '' THEN $5 ELSE agent_id END,
+		   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
+		   start_at            = CASE WHEN $7 IS NOT NULL THEN $7 ELSE start_at END,
+		   updated_at          = NOW()
+		 WHERE id = $8`,
+		req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority, req.StartAt, req.TaskID,
+	)
+	return err
+}
+
+// UpdateEpic updates an epic's mutable fields. Empty string = keep existing value.
+func (r *Repo) UpdateEpic(ctx context.Context, epicID int, name, description, priority string) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE epics SET
 		   name        = CASE WHEN $1 != '' THEN $1 ELSE name END,
 		   description = CASE WHEN $2 != '' THEN $2 ELSE description END,
-		   assigned_to = CASE WHEN $3 != '' THEN $3 ELSE assigned_to END,
-		   agent_id    = CASE WHEN $4 != '' THEN $4 ELSE agent_id END,
+		   priority    = CASE WHEN $3 != '' THEN $3 ELSE priority END,
 		   updated_at  = NOW()
-		 WHERE id = $5`,
-		req.Name, req.Description, req.AssignedTo, req.AgentID, req.TaskID,
+		 WHERE id = $4`,
+		name, description, priority, epicID,
 	)
+	return err
+}
+
+// UpdateStory updates a story's mutable fields. Empty string = keep existing value.
+func (r *Repo) UpdateStory(ctx context.Context, storyID int, name, description, acceptanceCriteria, priority string) error {
+	_, err := r.db.Exec(ctx,
+		`UPDATE stories SET
+		   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
+		   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
+		   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+		   priority            = CASE WHEN $4 != '' THEN $4 ELSE priority END,
+		   updated_at          = NOW()
+		 WHERE id = $5`,
+		name, description, acceptanceCriteria, priority, storyID,
+	)
+	return err
+}
+
+// DeleteStory removes a story. Tasks cascade via FK ON DELETE CASCADE.
+func (r *Repo) DeleteStory(ctx context.Context, storyID int) error {
+	_, err := r.db.Exec(ctx, `DELETE FROM stories WHERE id = $1`, storyID)
 	return err
 }
 
@@ -592,4 +684,178 @@ func (r *Repo) getTaskDepsForProject(ctx context.Context, projectID int) (map[in
 		out[taskID] = append(out[taskID], depID)
 	}
 	return out, rows.Err()
+}
+
+// ---- Export ----
+
+// ImportBundle creates a new project with all epics, stories, and tasks from a bundle.
+// All inserts happen in a single transaction. If any step fails, the entire transaction rolls back.
+// ID remapping is handled: old IDs from the bundle are mapped to new auto-increment IDs.
+// Task dependencies are remapped after all tasks are created.
+// All imported tasks start in 'backlog' state (fresh start, ignoring original state).
+func (r *Repo) ImportBundle(ctx context.Context, bundle domain.ExportBundle, newCode, newName string) (*domain.Project, error) {
+	// Start a transaction
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// Determine project code and name
+	projectCode := newCode
+	projectName := newName
+	if projectCode == "" {
+		projectCode = bundle.Project.Code
+	}
+	if projectName == "" {
+		projectName = bundle.Project.Name
+	}
+
+	// 1. Create the new project
+	newProject := &domain.Project{}
+	err = tx.QueryRow(ctx,
+		`INSERT INTO projects (name, code, description)
+		 VALUES ($1, $2, $3)
+		 RETURNING id, name, code, description, state, created_at, updated_at`,
+		projectName, projectCode, bundle.Project.Description,
+	).Scan(&newProject.ID, &newProject.Name, &newProject.Code, &newProject.Description, &newProject.State, &newProject.CreatedAt, &newProject.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("create project: %w", err)
+	}
+
+	// 2. Create all epics and build oldEpicID → newEpicID map
+	epicIDMap := make(map[int]int)
+	for _, oldEpic := range bundle.Epics {
+		newEpic := &domain.Epic{}
+		err = tx.QueryRow(ctx,
+			`INSERT INTO epics (project_id, name, description, priority)
+			 VALUES ($1, $2, $3, $4)
+			 RETURNING id, project_id, name, description, state, priority, created_at, updated_at`,
+			newProject.ID, oldEpic.Name, oldEpic.Description, oldEpic.Priority,
+		).Scan(&newEpic.ID, &newEpic.ProjectID, &newEpic.Name, &newEpic.Description, &newEpic.State, &newEpic.Priority, &newEpic.CreatedAt, &newEpic.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("create epic: %w", err)
+		}
+		epicIDMap[oldEpic.ID] = newEpic.ID
+	}
+
+	// 3. Create all stories and build oldStoryID → newStoryID map
+	storyIDMap := make(map[int]int)
+	for _, oldStory := range bundle.Stories {
+		// Remap epic_id via the epic map
+		newEpicID := epicIDMap[oldStory.EpicID]
+		newStory := &domain.Story{}
+		err = tx.QueryRow(ctx,
+			`INSERT INTO stories (project_id, epic_id, name, description, acceptance_criteria, priority)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 RETURNING id, project_id, epic_id, name, description, acceptance_criteria, state, priority, created_at, updated_at`,
+			newProject.ID, newEpicID, oldStory.Name, oldStory.Description, oldStory.AcceptanceCriteria, oldStory.Priority,
+		).Scan(&newStory.ID, &newStory.ProjectID, &newStory.EpicID, &newStory.Name, &newStory.Description, &newStory.AcceptanceCriteria, &newStory.State, &newStory.Priority, &newStory.CreatedAt, &newStory.UpdatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("create story: %w", err)
+		}
+		storyIDMap[oldStory.ID] = newStory.ID
+	}
+
+	// 4. Create all tasks and build oldTaskID → newTaskID map
+	taskIDMap := make(map[int]int)
+	for _, oldExportTask := range bundle.Tasks {
+		oldTask := oldExportTask.Task
+		// Remap epic_id and story_id via the maps
+		newEpicID := epicIDMap[oldTask.EpicID]
+		newStoryID := storyIDMap[oldTask.StoryID]
+		// All imported tasks start in 'backlog' state (fresh start)
+		newTask := &domain.Task{}
+		err = tx.QueryRow(ctx,
+			`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 RETURNING id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
+			           assigned_to, agent_id, dispatched_at, completed_at, block_reason, created_at, updated_at`,
+			newProject.ID, newEpicID, newStoryID, oldTask.Name, oldTask.Description, oldTask.AcceptanceCriteria, oldTask.Priority, oldTask.AssignedTo,
+		).Scan(
+			&newTask.ID, &newTask.ProjectID, &newTask.EpicID, &newTask.StoryID,
+			&newTask.Name, &newTask.Description, &newTask.AcceptanceCriteria,
+			&newTask.State, &newTask.Priority,
+			&newTask.AssignedTo, &newTask.AgentID, &newTask.DispatchedAt, &newTask.CompletedAt, &newTask.BlockReason,
+			&newTask.CreatedAt, &newTask.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("create task: %w", err)
+		}
+		taskIDMap[oldTask.ID] = newTask.ID
+	}
+
+	// 5. Insert task dependencies with remapped IDs
+	for _, oldExportTask := range bundle.Tasks {
+		oldTaskID := oldExportTask.Task.ID
+		newTaskID := taskIDMap[oldTaskID]
+		// Remap all dependency IDs
+		for _, oldDepID := range oldExportTask.DependencyIDs {
+			newDepID := taskIDMap[oldDepID]
+			_, err := tx.Exec(ctx,
+				`INSERT INTO task_dependencies (task_id, depends_on) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+				newTaskID, newDepID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("insert dependency %d→%d: %w", newTaskID, newDepID, err)
+			}
+		}
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit transaction: %w", err)
+	}
+
+	return newProject, nil
+}
+
+// BuildExportBundle loads all project data needed for export/import.
+// It returns a self-contained bundle with the project, all epics, stories, and tasks.
+// KB docs are fetched separately by the handler.
+func (r *Repo) BuildExportBundle(ctx context.Context, projectID int) (*domain.ExportBundle, error) {
+	// Load the project record
+	project, err := r.GetProject(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("get project: %w", err)
+	}
+
+	// Load all epics for the project
+	epics, err := r.ListEpics(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list epics: %w", err)
+	}
+
+	// Load all stories for the project
+	stories, err := r.ListStoriesByProject(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list stories: %w", err)
+	}
+
+	// Load all tasks for the project (no state filter)
+	tasks, err := r.ListTasks(ctx, projectID, "")
+	if err != nil {
+		return nil, fmt.Errorf("list tasks: %w", err)
+	}
+
+	// Convert tasks to ExportTask format (DependencyIDs already populated by ListTasks)
+	exportTasks := make([]domain.ExportTask, len(tasks))
+	for i, t := range tasks {
+		exportTasks[i] = domain.ExportTask{
+			Task:          t,
+			DependencyIDs: t.DependencyIDs,
+		}
+	}
+
+	bundle := &domain.ExportBundle{
+		Version:    "1",
+		ExportedAt: time.Now(),
+		Project:    *project,
+		Epics:      epics,
+		Stories:    stories,
+		Tasks:      exportTasks,
+		KBDocs:     []domain.ExportKBDoc{}, // KB docs are fetched separately by the handler
+	}
+
+	return bundle, nil
 }

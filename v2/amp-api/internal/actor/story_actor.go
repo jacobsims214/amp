@@ -160,6 +160,17 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		delete(a.taskStates, msg.TaskID)
 		msg.ReplyCh <- ReplySimple{}
 
+	case *MsgDeleteStory:
+		// Stop all child TaskActors and deregister from ProjectActor.
+		for taskID, pid := range a.tasks {
+			ctx.Stop(pid)
+			// Deregister from ProjectActor so its taskToEpic index stays clean.
+			ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: taskID})
+			delete(a.tasks, taskID)
+		}
+		a.taskStates = make(map[int]domain.TaskState)
+		msg.ReplyCh <- ReplySimple{}
+
 	case *MsgDepCompleted:
 		// Fan out to all child TaskActors — each checks its own deps independently.
 		for _, pid := range a.tasks {

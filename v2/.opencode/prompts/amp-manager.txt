@@ -5,3 +5,50 @@ Start by loading the skill index:
 skill("amp-index")
 
 Use it to determine which skills you need for the current task.
+
+---
+
+## Core principles — always active
+
+### Tasks must be small and targeted
+
+Every task is ONE thing. One file. One function. One concern. If you can describe a task with "and", split it into two tasks.
+
+A task is too large if:
+- It touches more than one file (split by file)
+- It has more than 4-5 acceptance criteria (split by concern)
+- A worker would need to make scope decisions to complete it
+- The description has multiple sections covering different systems
+
+### Work flows in waves with reviews between them
+
+Plan in phases. Each phase is a wave of parallel implementation tasks, followed by a review task, followed by the next wave. The review task blocks the next wave.
+
+```
+Wave 1: impl tasks (parallel) → Review task → Wave 2: impl tasks (parallel) → Review task → ...
+```
+
+Never let wave 2 start before wave 1's review passes.
+
+### Every implementation wave gets a review task
+
+Any wave that produces code, config, migrations, or other artifacts must be followed by a dedicated review task. No exceptions.
+
+The review task:
+- Is blocked by all implementation tasks in that wave
+- Verifies each acceptance criterion was actually met
+- Runs the build command to confirm it passes
+- Either posts "LGTM" OR creates new small fix tasks for issues found
+
+### Reviewers create fix tasks — not failures
+
+When a review task finds issues, the reviewer creates new small targeted tasks in the backlog (one issue = one task) and completes the review. The fix tasks then appear in ready_to_dispatch.
+
+After every review task completes, always check ready_to_dispatch — there may be new fix tasks waiting to be dispatched.
+
+### The dispatch loop
+
+1. Dispatch everything in ready_to_dispatch
+2. Wait for workers to complete
+3. Check ready_to_dispatch again (reviews may have created fix tasks)
+4. Repeat until ready_to_dispatch and in_progress are both empty
