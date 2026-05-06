@@ -42,20 +42,39 @@ amp_create_task   {project_id, epic_id, story_id, name, description,
 
 A correctly sized task:
 - Touches **one file** or **one concern**
-- Can be described in a single sentence
-- A worker can complete it in one focused session without making judgment calls about scope
-- Has a clear, binary done state — it either passes the acceptance criteria or it doesn't
+- Names the exact file and symbol being added or changed
+- Has 3 acceptance criteria or fewer — each binary (true or false, no interpretation)
+- A worker can complete it without making scope decisions
 
-**Signs a task is too large:**
-- The description has multiple `##` sections covering different files
-- The acceptance criteria has more than 4-5 bullet points
-- It says things like "implement the full X feature" or "add all Y endpoints"
-- A worker would need to make architectural decisions to complete it
+**Signs a task is too large — split it:**
+- The description references multiple unrelated files
+- The acceptance criteria has more than 4 bullet points
+- It uses vague scope words: "implement the full X", "add all Y endpoints", "handle Z"
+- A worker would need to decide what to build, not just how to build it
 
 **How to split:**
-- One file changed = one task (e.g. "Add UpdateEpic to repo.go" is separate from "Add PATCH /epics/:id to rest.go")
-- One layer = one task (domain model change, then repo change, then REST wiring are three tasks)
-- One component = one task (CrudModal component is separate from wiring it into Board.tsx)
+- One file changed = one task (`Add UpdateEpic to repo.go` is separate from `Add PATCH /epics/:id to rest.go`)
+- One layer = one task (model, repo, HTTP handler, and frontend component are four tasks)
+- One component = one task (`CrudModal` component is separate from wiring it into `Board.tsx`)
+
+### Description template
+
+```
+## What to do
+[One clear goal. Name the file and symbol. Say what the outcome is, not how to get there.]
+
+## Context
+[Why this exists. What it connects to. Relevant decisions or constraints.]
+
+## Where to look
+[File paths and key symbols the worker needs to start from.]
+
+## Acceptance criteria
+[3 or fewer. Each must be a binary check — it either passes or it doesn't.]
+
+## Gotchas
+[Non-obvious traps, known edge cases, things to watch out for.]
+```
 
 ---
 
@@ -64,68 +83,101 @@ A correctly sized task:
 Work flows in waves. Each wave unblocks the next. Think in phases before creating tasks:
 
 1. **Foundation** — types, models, interfaces that everything else depends on
-2. **Implementation** — the actual work, split by file/concern, can run in parallel within a wave
-3. **Review** — a dedicated review task that gates the next wave
-4. **Next wave** — only unblocks after review passes
-
-**Every implementation wave must be followed by a review task before the next wave starts.**
+2. **Implementation** — the actual work, split by file/concern, runs in parallel within a wave
+3. **Wave check** — verifies the build passes and acceptance criteria are met, gates the next wave
+4. **Next wave** — only unblocks after the wave check passes
+5. **Code review** — at the end of the story, a proper code review of all changes
 
 The review task blocks the next wave via `dependency_ids`. This is non-negotiable.
 
 ```
 Wave 1: #10 (model), #11 (repo)          ← parallel, no deps
-Wave 1 review: #12                        ← blocked by #10, #11
-Wave 2: #13 (REST), #14 (actor)          ← blocked by #12 (review)
-Wave 2 review: #15                        ← blocked by #13, #14
-Wave 3: #16 (frontend types)             ← blocked by #15 (review)
-...
+Wave 1 check: #12                         ← blocked by #10, #11
+Wave 2: #13 (REST), #14 (actor)          ← blocked by #12
+Wave 2 check: #15                         ← blocked by #13, #14
+Code review: #16                          ← blocked by #15 (all story work done)
 ```
 
 ---
 
-## Review tasks — mandatory after every implementation wave
+## Two kinds of review tasks
 
-**Any task that produces code, config, migrations, or other artifacts must be followed by a review task.**
+### 1. Wave check — after every implementation wave
 
-The review task:
-- Is blocked by all implementation tasks in that wave
-- Runs `git diff` to see exactly what changed
-- Verifies each acceptance criterion was actually met
-- Runs the build/test command to confirm it passes
-- Posts a comment with findings
+A wave check is a lightweight verification task. It confirms the build passes and
+every acceptance criterion was actually met. It does NOT do a full code review.
 
-**Critically: review tasks can and should create new fix tasks.**
-
-If the reviewer finds issues, it does NOT fail or block itself. Instead it:
-1. Creates small, targeted fix tasks in the backlog (one issue = one task)
-2. Posts a comment listing what was found and what fix tasks were created
-3. Completes itself — the fix tasks are now in the backlog for the next dispatch cycle
-
-This means the manager must check `ready_to_dispatch` after every review completes — there may be new fix tasks waiting.
-
-Review task description template:
+**Wave check description template:**
 ```
-## What to review
-[List every implementation task in this wave with their task IDs]
+## Tasks in this wave
+[List every implementation task ID and name from this wave]
 
-## What to check
-[Specific things to verify — file names, function signatures, SQL parameter counts, build commands]
+## What to verify
+- [Acceptance criterion from task #N]
+- [Acceptance criterion from task #N]
+- Build passes: [exact command — go build ./... or npm run build]
 
-## How to verify
-[Exact commands: go build ./..., npm run build, git diff HEAD, etc.]
+## How to check
+Run: [build command]
+Run: git diff HEAD~[N] --name-only  (to confirm only expected files changed)
 
 ## If issues found
-Create a new task for each issue found:
-- Use amp_create_task with the same project_id, epic_id, story_id
-- Make it small and targeted — one issue = one task
-- Set dependency_ids if the fix depends on other work
-- Post a comment on THIS review task listing all fix tasks created
+Create a small fix task for each issue (one issue = one task), then complete this check.
 
 ## Acceptance criteria
-- All items verified
-- Build/tests pass
-- Either "LGTM" comment posted OR fix tasks created for every issue found
+- Build passes
+- Each acceptance criterion above is met
+- Either LGTM comment posted OR fix tasks created for every issue
 ```
+
+### 2. Code review — once per story, after all waves complete
+
+Every story that produces code gets **one code review task** at the end, blocked by the
+final wave check. The reviewer loads the `code-reviewer` skill and does a proper
+tiered review (Blocker / Significant / Suggestion) of all changes in the story.
+
+This is the quality gate. Blockers must become fix tasks. The next story or epic wave
+should not start until the code review is clean.
+
+**Code review task name:** `Code Review: [story name]`
+
+**Code review description template:**
+```
+## Story being reviewed
+[Story name and ID]
+
+## Implementation tasks completed
+[List all task IDs and names from this story's implementation waves]
+
+## How to review
+1. Load the code-reviewer skill: skill("code-reviewer")
+2. Run git diff to see all changes: git diff [base-branch]...HEAD
+   Or for specific commits: git diff [first-impl-commit]..HEAD
+3. Apply the tiered checklist from the code-reviewer skill to every changed file
+4. Post findings in the standard format (Overall Verdict, Blockers, Significant, Suggestions)
+
+## Tech stack in this story
+[Go / TypeScript+React / Dockerfile / Terraform — list what applies]
+
+## Files changed in this story
+[List the files the implementation tasks touched, so the reviewer knows where to focus]
+
+## If blockers or significant issues found
+Create a fix task for each one:
+- One issue = one task
+- Assigned to amp-worker
+- Describe the exact file, the exact problem, and the exact fix needed
+- Post a comment on this review listing all fix tasks created
+
+## Acceptance criteria
+- code-reviewer skill loaded and checklist applied
+- Overall verdict posted as a task comment
+- Fix tasks created for every Blocker and Significant finding
+- Suggestions noted but do not block completion
+```
+
+**Reviewers create fix tasks — not failures.** A review task always completes. Issues
+become fix tasks in the backlog. The manager dispatches fix tasks after the review.
 
 ---
 
@@ -135,26 +187,9 @@ Create a new task for each issue found:
 
 **2. `dependency_ids`** — think about this during creation, not after. For every task you create, ask before submitting it: does this task need anything from another task to exist before it can start? If yes, include those task IDs in `dependency_ids`. The system sets state automatically — deps incomplete → `blocked`, all complete → `backlog`. You never set state directly.
 
-**3. A complete description** — workers have no other context. The ticket is their entire world. Write it as a self-contained brief:
+**3. A complete description** — workers have no other context. The ticket is their entire world. Use the description template above. Every ticket needs a clear goal, the right file paths, and binary acceptance criteria.
 
-```
-## What to do
-[Exact steps. Specific files, commands, interfaces.]
-
-## Context
-[Why this exists. What the system looks like. Relevant decisions.]
-
-## Where to look
-[File paths, module names, key functions.]
-
-## Acceptance criteria
-[Concrete and checkable — same as the acceptance_criteria field.]
-
-## Gotchas
-[Non-obvious traps, edge cases, known failures.]
-```
-
-Thin description = thin results. Workers are local LLMs — give them everything they need in the ticket.
+Thin description = thin results. Workers are local LLMs — give them enough context to execute, not so much that you've done the work for them.
 
 ---
 
@@ -179,21 +214,23 @@ Present before dispatching. The user needs to see assigned agents and blockers t
 ```
 EPIC: [name]
 └── Story: [name]
-    ├── Task #N: [name]           →  amp-worker   (ready)
-    ├── Task #N: [name]           →  amp-worker   (ready)
-    ├── Task #N: REVIEW wave 1    →  amp-worker   (blocked by #N, #N)
-    ├── Task #N: [name]           →  amp-worker   (blocked by #N review)
-    └── Task #N: REVIEW wave 2    →  amp-worker   (blocked by #N)
+    ├── Task #N: [name]                    →  amp-worker   (ready)
+    ├── Task #N: [name]                    →  amp-worker   (ready)
+    ├── Task #N: Wave 1 check              →  amp-worker   (blocked by #N, #N)
+    ├── Task #N: [name]                    →  amp-worker   (blocked by #N check)
+    ├── Task #N: [name]                    →  amp-worker   (blocked by #N check)
+    ├── Task #N: Wave 2 check              →  amp-worker   (blocked by #N, #N)
+    └── Task #N: Code Review: [story name] →  amp-worker   (blocked by #N check)
 
 Phase 1 — dispatch immediately: #N, #N
-Phase 2 — unblocks when phase 1 review passes: #N, #N
-Phase 3 — unblocks when phase 2 review passes: #N
+Phase 2 — unblocks when wave 1 check passes: #N, #N
+Phase 3 — unblocks when wave 2 check passes: #N (code review)
 
-Total: X tasks (Y implementation + Z reviews)
+Total: X tasks (Y implementation + Z wave checks + 1 code review per story)
 ```
 
 Every task shows: its ID, name, assigned agent, and either `(ready)` or `(blocked by #N, ...)`.
-Review tasks must be clearly labeled as reviews.
+Wave checks and code reviews must be clearly labeled.
 If a task has no agent or no blocker status shown — fix it before presenting.
 
 ---

@@ -16,16 +16,21 @@ Every task is ONE thing. One file. One function. One concern. If you can describ
 
 A task is too large if:
 - It touches more than one file (split by file)
-- It has more than 4-5 acceptance criteria (split by concern)
+- It has more than 3-4 acceptance criteria (split by concern)
 - A worker would need to make scope decisions to complete it
-- The description has multiple sections covering different systems
+- The description covers multiple systems or layers
+
+A correctly sized task:
+- Names the exact file and symbol being changed or created
+- States clearly what done looks like — no interpretation needed
+- Has acceptance criteria a worker can verify without asking anyone
 
 ### Work flows in waves with reviews between them
 
 Plan in phases. Each phase is a wave of parallel implementation tasks, followed by a review task, followed by the next wave. The review task blocks the next wave.
 
 ```
-Wave 1: impl tasks (parallel) → Review task → Wave 2: impl tasks (parallel) → Review task → ...
+Wave 1: impl tasks (parallel) → Review task → Wave 2: impl tasks (parallel) → ...
 ```
 
 Never let wave 2 start before wave 1's review passes.

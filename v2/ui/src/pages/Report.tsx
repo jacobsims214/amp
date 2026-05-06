@@ -1,11 +1,11 @@
 import { useState, useEffect, useMemo } from 'react'
-import { useParams, Link } from 'react-router-dom'
-import { ArrowLeft, Loader2, CheckCircle2, Clock, Zap, Ban, TrendingUp, Calendar } from 'lucide-react'
+import { useParams } from 'react-router-dom'
+import { Loader2, CheckCircle2, Clock, Zap, Ban, TrendingUp, Calendar } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
+import { ProjectNav } from '../components/ProjectNav'
 import type { ActivityLog } from '../types'
 
-// ---- Date range presets ----
 type Range = '1d' | '7d' | '30d' | 'all'
 
 function rangeToSince(r: Range): string {
@@ -27,9 +27,7 @@ function relativeTime(iso: string) {
 }
 
 function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-  })
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 }
 
 function duration(start: string, end: string): string {
@@ -42,14 +40,29 @@ function duration(start: string, end: string): string {
   return `${mins}m`
 }
 
-const ACTION_COLORS: Record<string, { dot: string; text: string }> = {
-  created:    { dot: 'bg-[#8b949e]',  text: 'text-[#8b949e]' },
-  dispatched: { dot: 'bg-[#58a6ff]',  text: 'text-[#58a6ff]' },
-  completed:  { dot: 'bg-[#3fb950]',  text: 'text-[#3fb950]' },
-  blocked:    { dot: 'bg-[#f85149]',  text: 'text-[#f85149]' },
-  unblocked:  { dot: 'bg-[#e3b341]',  text: 'text-[#e3b341]' },
-  comment:    { dot: 'bg-[#484f58]',  text: 'text-[#484f58]' },
+function formatMs(ms: number): string {
+  const mins = Math.floor(ms / 60000)
+  const hrs = Math.floor(mins / 60)
+  const days = Math.floor(hrs / 24)
+  if (days > 0) return `${days}d ${hrs % 24}h`
+  if (hrs > 0) return `${hrs}h ${mins % 60}m`
+  return `${mins}m`
 }
+
+const ACTION_CONFIG: Record<string, { dot: string; text: string; label: string }> = {
+  created:    { dot: '#7E91A8', text: 'text-[#7E91A8]',  label: 'Created'    },
+  dispatched: { dot: '#818CF8', text: 'text-[#818CF8]',  label: 'Dispatched' },
+  completed:  { dot: '#10B981', text: 'text-[#10B981]',  label: 'Completed'  },
+  blocked:    { dot: '#EF4444', text: 'text-[#F87171]',  label: 'Blocked'    },
+  unblocked:  { dot: '#FBBF24', text: 'text-[#FBBF24]',  label: 'Unblocked'  },
+  comment:    { dot: '#283A57', text: 'text-[#3D5068]',  label: 'Comment'    },
+}
+
+const RANGE_LABELS: Record<Range, string> = {
+  '1d': 'Today', '7d': 'This week', '30d': 'This month', 'all': 'All time',
+}
+
+const ACTION_FILTERS = ['all', 'created', 'dispatched', 'completed', 'blocked', 'comment'] as const
 
 export function Report() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -70,35 +83,25 @@ export function Report() {
       .finally(() => setLoading(false))
   }, [pid, range])
 
-  // ---- Stats ----
   const stats = useMemo(() => {
-    const completed = activity.filter(a => a.action === 'completed')
+    const completed  = activity.filter(a => a.action === 'completed')
     const dispatched = activity.filter(a => a.action === 'dispatched')
-    const blocked = activity.filter(a => a.action === 'blocked')
-    const comments = activity.filter(a => a.action === 'comment')
-
-    // Cycle time: created → completed for tasks that completed in this window
+    const blocked    = activity.filter(a => a.action === 'blocked')
     const cycleTimes: number[] = []
     for (const c of completed) {
       const task = taskById.get(c.task_id)
-      if (task?.created_at && task?.completed_at) {
+      if (task?.created_at && task?.completed_at)
         cycleTimes.push(new Date(task.completed_at).getTime() - new Date(task.created_at).getTime())
-      }
     }
     const avgCycleMs = cycleTimes.length > 0
-      ? cycleTimes.reduce((a, b) => a + b, 0) / cycleTimes.length
-      : null
-
-    return { completed: completed.length, dispatched: dispatched.length, blocked: blocked.length, comments: comments.length, avgCycleMs }
+      ? cycleTimes.reduce((a, b) => a + b, 0) / cycleTimes.length : null
+    return { completed: completed.length, dispatched: dispatched.length, blocked: blocked.length, avgCycleMs }
   }, [activity, taskById])
 
-  // ---- Filtered feed ----
-  const filtered = useMemo(() => {
-    if (actionFilter === 'all') return activity
-    return activity.filter(a => a.action === actionFilter)
-  }, [activity, actionFilter])
+  const filtered = useMemo(() =>
+    actionFilter === 'all' ? activity : activity.filter(a => a.action === actionFilter)
+  , [activity, actionFilter])
 
-  // ---- Completed tasks with full lifecycle ----
   const completedTasks = useMemo(() => {
     return tasks
       .filter(t => t.state === 'completed' && t.completed_at)
@@ -110,170 +113,177 @@ export function Report() {
       .sort((a, b) => new Date(b.completed_at!).getTime() - new Date(a.completed_at!).getTime())
   }, [tasks, range])
 
-  function formatMs(ms: number): string {
-    const mins = Math.floor(ms / 60000)
-    const hrs = Math.floor(mins / 60)
-    const days = Math.floor(hrs / 24)
-    if (days > 0) return `${days}d ${hrs % 24}h avg`
-    if (hrs > 0) return `${hrs}h ${mins % 60}m avg`
-    return `${mins}m avg`
-  }
-
   return (
-    <div className="flex flex-col h-screen bg-[#0d1117] overflow-hidden">
+    <div className="flex flex-col h-screen overflow-hidden" style={{ background: '#08101F' }}>
       {/* Header */}
-      <header className="flex items-center gap-3 px-5 py-3 border-b border-[#21262d] bg-[#161b22] flex-shrink-0">
-        <Link to={`/project/${pid}`} className="flex items-center gap-1.5 text-[#8b949e] hover:text-[#e6edf3] transition-colors">
-          <ArrowLeft size={14} />
-        </Link>
-        <div className="w-px h-4 bg-[#30363d]" />
-        <span className="text-sm font-semibold text-[#e6edf3]">Report</span>
-        <div className="ml-auto flex items-center gap-1 bg-[#0d1117] border border-[#30363d] rounded-md p-1">
-          {(['1d', '7d', '30d', 'all'] as Range[]).map(r => (
-            <button
-              key={r}
-              onClick={() => setRange(r)}
-              className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-                range === r
-                  ? 'bg-[#21262d] text-[#e6edf3]'
-                  : 'text-[#8b949e] hover:text-[#e6edf3]'
-              }`}
-            >
-              {r === 'all' ? 'All time' : r === '1d' ? 'Today' : r === '7d' ? 'This week' : 'This month'}
-            </button>
-          ))}
-        </div>
-      </header>
+      <ProjectNav
+        projectId={pid}
+        currentView="report"
+        rightSlot={
+          <div className="flex items-center gap-1 p-1 rounded-lg"
+            style={{ background: '#08101F', border: '1px solid #1E2C45' }}>
+            {(['1d', '7d', '30d', 'all'] as Range[]).map(r => (
+              <button key={r} onClick={() => setRange(r)}
+                className="px-3 py-1 rounded-md text-xs font-semibold transition-all cursor-pointer"
+                style={range === r
+                  ? { background: '#172540', border: '1px solid #283A57', color: '#DDE6F0' }
+                  : { color: '#3D5068' }}
+                onMouseEnter={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = '#7E91A8' }}
+                onMouseLeave={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = '#3D5068' }}>
+                {RANGE_LABELS[r]}
+              </button>
+            ))}
+          </div>
+        }
+      />
 
       <div className="flex-1 overflow-y-auto">
-        <div className="max-w-5xl mx-auto px-5 py-6 space-y-6">
+        <div className="max-w-5xl mx-auto px-5 py-7 space-y-8">
 
-          {/* ---- Stat cards ---- */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-            <StatCard icon={<CheckCircle2 size={16} className="text-[#3fb950]" />} label="Completed" value={stats.completed} color="text-[#3fb950]" />
-            <StatCard icon={<Zap size={16} className="text-[#58a6ff]" />} label="Dispatched" value={stats.dispatched} color="text-[#58a6ff]" />
-            <StatCard icon={<Ban size={16} className="text-[#f85149]" />} label="Blocked events" value={stats.blocked} color="text-[#f85149]" />
+          {/* ── Stat cards ── */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             <StatCard
-              icon={<TrendingUp size={16} className="text-[#e3b341]" />}
+              icon={<CheckCircle2 size={18}/>}
+              label="Completed" value={stats.completed}
+              accent="#10B981" accentBg="rgba(16,185,129,0.1)" accentBorder="rgba(16,185,129,0.2)"
+            />
+            <StatCard
+              icon={<Zap size={18}/>}
+              label="Dispatched" value={stats.dispatched}
+              accent="#818CF8" accentBg="rgba(99,102,241,0.1)" accentBorder="rgba(99,102,241,0.2)"
+            />
+            <StatCard
+              icon={<Ban size={18}/>}
+              label="Blocked events" value={stats.blocked}
+              accent="#F87171" accentBg="rgba(239,68,68,0.1)" accentBorder="rgba(239,68,68,0.2)"
+            />
+            <StatCard
+              icon={<TrendingUp size={18}/>}
               label="Avg cycle time"
               value={stats.avgCycleMs !== null ? formatMs(stats.avgCycleMs) : '—'}
-              color="text-[#e3b341]"
+              accent="#FBBF24" accentBg="rgba(245,158,11,0.1)" accentBorder="rgba(245,158,11,0.2)"
             />
           </div>
 
-          {/* ---- Completed tasks table ---- */}
+          {/* ── Completed tasks table ── */}
           {completedTasks.length > 0 && (
-            <div>
-              <h2 className="text-sm font-semibold text-[#e6edf3] mb-3 flex items-center gap-2">
-                <CheckCircle2 size={14} className="text-[#3fb950]" />
-                Completed tasks
-                <span className="text-xs text-[#484f58] font-normal">({completedTasks.length})</span>
-              </h2>
-              <div className="rounded-lg border border-[#21262d] overflow-hidden">
+            <section>
+              <SectionHeader icon={<CheckCircle2 size={14} className="text-[#10B981]"/>}
+                label="Completed tasks" count={completedTasks.length} />
+              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid #1E2C45' }}>
                 <table className="w-full text-xs">
                   <thead>
-                    <tr className="border-b border-[#21262d] bg-[#161b22]">
-                      <th className="text-left px-4 py-2.5 text-[#8b949e] font-medium">#</th>
-                      <th className="text-left px-4 py-2.5 text-[#8b949e] font-medium">Task</th>
-                      <th className="text-left px-4 py-2.5 text-[#8b949e] font-medium">Agent</th>
-                      <th className="text-left px-4 py-2.5 text-[#8b949e] font-medium">Created</th>
-                      <th className="text-left px-4 py-2.5 text-[#8b949e] font-medium">Completed</th>
-                      <th className="text-left px-4 py-2.5 text-[#8b949e] font-medium">Cycle time</th>
+                    <tr style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>
+                      {['#', 'Task', 'Agent', 'Completed', 'Cycle time'].map(h => (
+                        <th key={h} className="text-left px-4 py-3 text-[#3D5068] font-bold uppercase tracking-widest text-[10px]">{h}</th>
+                      ))}
                     </tr>
                   </thead>
                   <tbody>
                     {completedTasks.map((task, i) => (
-                      <tr
-                        key={task.id}
-                        className={`border-b border-[#21262d] last:border-0 hover:bg-[#161b22] transition-colors ${i % 2 === 0 ? '' : 'bg-[#0d1117]/50'}`}
+                      <tr key={task.id}
+                        className="transition-colors"
+                        style={{
+                          borderBottom: i < completedTasks.length - 1 ? '1px solid #192238' : 'none',
+                          background: i % 2 === 1 ? 'rgba(13,23,38,0.4)' : 'transparent',
+                        }}
+                        onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#0D1726'}
+                        onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = i % 2 === 1 ? 'rgba(13,23,38,0.4)' : 'transparent'}
                       >
-                        <td className="px-4 py-2.5 text-[#484f58] font-mono">{task.id}</td>
-                        <td className="px-4 py-2.5 text-[#e6edf3] max-w-[240px]">
+                        <td className="px-4 py-2.5 text-[#3D5068] font-mono tabular-nums">{task.id}</td>
+                        <td className="px-4 py-2.5 text-[#DDE6F0] font-medium max-w-[260px]">
                           <span className="truncate block">{task.name}</span>
                         </td>
-                        <td className="px-4 py-2.5 text-[#8b949e] font-mono">{task.agent_id ?? '—'}</td>
-                        <td className="px-4 py-2.5 text-[#8b949e]">{formatDate(task.created_at)}</td>
-                        <td className="px-4 py-2.5 text-[#3fb950]">{formatDate(task.completed_at!)}</td>
-                        <td className="px-4 py-2.5 text-[#e3b341]">
-                          {task.dispatched_at
-                            ? duration(task.dispatched_at, task.completed_at!)
-                            : duration(task.created_at, task.completed_at!)}
+                        <td className="px-4 py-2.5 text-[#7E91A8] font-mono">{task.agent_id ?? '—'}</td>
+                        <td className="px-4 py-2.5 text-[#10B981] tabular-nums">{formatDate(task.completed_at!)}</td>
+                        <td className="px-4 py-2.5 text-[#FBBF24] font-medium tabular-nums">
+                          {task.dispatched_at ? duration(task.dispatched_at, task.completed_at!) : duration(task.created_at, task.completed_at!)}
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
-            </div>
+            </section>
           )}
 
-          {/* ---- Activity feed ---- */}
-          <div>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-semibold text-[#e6edf3] flex items-center gap-2">
-                <Calendar size={14} className="text-[#8b949e]" />
-                Activity feed
-                <span className="text-xs text-[#484f58] font-normal">({filtered.length})</span>
-              </h2>
-              <div className="flex items-center gap-1 bg-[#0d1117] border border-[#30363d] rounded-md p-1">
-                {['all', 'created', 'dispatched', 'completed', 'blocked', 'comment'].map(a => (
-                  <button
-                    key={a}
-                    onClick={() => setActionFilter(a)}
-                    className={`px-2.5 py-1 rounded text-xs font-medium capitalize transition-colors ${
-                      actionFilter === a
-                        ? 'bg-[#21262d] text-[#e6edf3]'
-                        : 'text-[#8b949e] hover:text-[#e6edf3]'
-                    }`}
-                  >
-                    {a}
-                  </button>
-                ))}
+          {/* ── Activity feed ── */}
+          <section>
+            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
+              <SectionHeader icon={<Calendar size={14} className="text-[#7E91A8]"/>}
+                label="Activity feed" count={filtered.length} />
+              {/* Action filter pills */}
+              <div className="flex items-center gap-1 p-1 rounded-lg flex-wrap"
+                style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+                {ACTION_FILTERS.map(a => {
+                  const conf = ACTION_CONFIG[a]
+                  const isActive = actionFilter === a
+                  return (
+                    <button key={a} onClick={() => setActionFilter(a)}
+                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold capitalize transition-all cursor-pointer"
+                      style={{
+                        background: isActive ? '#172540' : 'transparent',
+                        color: isActive ? (conf ? conf.dot : '#DDE6F0') : '#3D5068',
+                        border: isActive ? '1px solid #283A57' : '1px solid transparent',
+                      }}
+                      onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#7E91A8' }}
+                      onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#3D5068' }}>
+                      {a !== 'all' && conf && (
+                        <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: conf.dot }}/>
+                      )}
+                      {a === 'all' ? 'All' : conf?.label ?? a}
+                    </button>
+                  )
+                })}
               </div>
             </div>
 
             {loading ? (
-              <div className="flex justify-center py-8">
-                <Loader2 size={20} className="text-[#58a6ff] animate-spin" />
+              <div className="flex justify-center py-10">
+                <Loader2 size={20} className="text-[#6366F1] animate-spin"/>
               </div>
             ) : filtered.length === 0 ? (
-              <div className="text-center py-8 text-sm text-[#8b949e]">No activity in this period</div>
+              <div className="text-center py-12 rounded-xl" style={{ border: '1px solid #192238' }}>
+                <p className="text-sm text-[#3D5068]">No activity in this period</p>
+              </div>
             ) : (
-              <div className="space-y-px">
-                {filtered.map(entry => {
-                  const c = ACTION_COLORS[entry.action] ?? ACTION_COLORS.comment
+              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid #1E2C45' }}>
+                {filtered.map((entry, i) => {
+                  const conf = ACTION_CONFIG[entry.action] ?? ACTION_CONFIG.comment
                   const task = taskById.get(entry.task_id)
                   return (
-                    <div
-                      key={entry.id}
-                      className="flex items-start gap-3 px-4 py-2.5 rounded-md hover:bg-[#161b22] transition-colors"
+                    <div key={entry.id}
+                      className="flex items-start gap-3 px-4 py-3 transition-colors"
+                      style={{
+                        borderBottom: i < filtered.length - 1 ? '1px solid #192238' : 'none',
+                      }}
+                      onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#0D1726'}
+                      onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                     >
-                      <span className={`w-2 h-2 rounded-full mt-1.5 flex-shrink-0 ${c.dot}`} />
+                      <span className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0"
+                        style={{ background: conf.dot, boxShadow: `0 0 4px ${conf.dot}50` }}/>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-medium text-[#e6edf3]">{entry.actor}</span>
-                          <span className={`text-xs capitalize ${c.text}`}>{entry.action.replace('_', ' ')}</span>
+                          <span className="text-xs font-semibold text-[#DDE6F0]">{entry.actor}</span>
+                          <span className={`text-xs font-medium capitalize ${conf.text}`}>{entry.action.replace('_', ' ')}</span>
                           {task && (
-                            <span className="text-xs text-[#8b949e] truncate">
-                              <span className="text-[#484f58] font-mono">#{task.id}</span>
-                              {' '}
-                              {task.name}
+                            <span className="text-xs text-[#7E91A8] truncate">
+                              <span className="text-[#3D5068] font-mono">#{task.id}</span>
+                              {' '}{task.name}
                             </span>
                           )}
                           {entry.from_state && entry.to_state && entry.action !== 'comment' && (
-                            <span className="text-xs text-[#484f58]">
-                              {entry.from_state} → {entry.to_state}
-                            </span>
+                            <span className="text-xs text-[#3D5068]">{entry.from_state} → {entry.to_state}</span>
                           )}
                         </div>
                         {entry.action === 'comment' && entry.detail && (
-                          <p className="text-xs text-[#8b949e] mt-1 line-clamp-2 leading-relaxed">
+                          <p className="text-xs text-[#7E91A8] mt-1 line-clamp-2 leading-relaxed bg-[#08101F] rounded-lg px-2.5 py-1.5 border border-[#192238] mt-1.5">
                             {entry.detail}
                           </p>
                         )}
                       </div>
-                      <span className="text-xs text-[#484f58] flex-shrink-0 flex items-center gap-1">
-                        <Clock size={10} />
+                      <span className="text-xs text-[#3D5068] flex-shrink-0 flex items-center gap-1 tabular-nums">
+                        <Clock size={9}/>
                         {relativeTime(entry.created_at)}
                       </span>
                     </div>
@@ -281,7 +291,7 @@ export function Report() {
                 })}
               </div>
             )}
-          </div>
+          </section>
 
         </div>
       </div>
@@ -289,19 +299,34 @@ export function Report() {
   )
 }
 
-function StatCard({ icon, label, value, color }: {
-  icon: React.ReactNode
-  label: string
-  value: number | string
-  color: string
+/* ── Stat card ────────────────────────────────────────────────────────────── */
+function StatCard({ icon, label, value, accent, accentBg, accentBorder }: {
+  icon: React.ReactNode; label: string; value: number | string
+  accent: string; accentBg: string; accentBorder: string
 }) {
   return (
-    <div className="bg-[#161b22] border border-[#21262d] rounded-lg p-4">
-      <div className="flex items-center gap-2 mb-2">
-        {icon}
-        <span className="text-xs text-[#8b949e]">{label}</span>
+    <div className="rounded-2xl p-5 transition-all"
+      style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+      <div className="flex items-center justify-between mb-3">
+        <span className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest">{label}</span>
+        <span className="flex-shrink-0 p-2 rounded-xl" style={{ background: accentBg, border: `1px solid ${accentBorder}`, color: accent }}>
+          {icon}
+        </span>
       </div>
-      <div className={`text-2xl font-bold ${color}`}>{value}</div>
+      <div className="text-3xl font-bold tabular-nums" style={{ color: accent, fontVariantNumeric: 'tabular-nums' }}>
+        {value}
+      </div>
     </div>
+  )
+}
+
+/* ── Section header ───────────────────────────────────────────────────────── */
+function SectionHeader({ icon, label, count }: { icon: React.ReactNode; label: string; count: number }) {
+  return (
+    <h2 className="text-sm font-bold text-[#DDE6F0] mb-4 flex items-center gap-2">
+      {icon}
+      {label}
+      <span className="text-xs font-normal text-[#3D5068] tabular-nums">({count})</span>
+    </h2>
   )
 }

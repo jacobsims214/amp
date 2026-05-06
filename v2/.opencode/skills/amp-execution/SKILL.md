@@ -98,9 +98,13 @@ After completing substantive work, write at least one KB doc if you:
 - Found a gotcha or edge case
 - Completed work future agents will build on
 
-See `amp-kb` skill for exactly how to write docs that embed well for semantic search.
-The critical rule: **write in prose paragraphs, not bullet lists and code blocks**.
-A sparse doc embeds as noise. A rich prose doc surfaces on dozens of related queries.
+**Tags are mandatory on every KB write. Never call `amp_kb_write` without 3–6 tags.**
+Load `amp-kb` now if you haven't — it defines the required tag formula, what good tags
+look like, and how to write content that embeds well for semantic search:
+
+```
+skill("amp-kb")
+```
 
 ---
 
@@ -152,31 +156,33 @@ amp_complete_task(task_id=YOUR_TASK_ID)
 
 ## If you are a REVIEWER
 
-When your task name contains "review", "code review", or "Review:", you are a reviewer.
-Your job is different from an implementation worker.
+When your task name contains "check", "review", "code review", or "Review:", you are a reviewer.
 
-### Reviewer protocol
+### Two kinds of review tasks — read your task name
 
-1. **Read the task description** — it lists exactly what to check and what commands to run
-2. **Run `git diff`** to see what actually changed
-3. **Verify each item** in the checklist — read the code, run the build, check the criteria
-4. **Make a judgment call:**
+**Wave check** (task name contains "check" or "Wave N check"):
+- Your job is lightweight verification: did the build pass and were acceptance criteria met?
+- Run the build command from the task description
+- Check each acceptance criterion — read the relevant code and confirm each one
+- You do NOT run the full code-reviewer checklist
+- Post LGTM or create targeted fix tasks, then complete
 
-**If everything looks good:**
-- Post a comment: "LGTM — [brief summary of what was verified], build passes"
-- Call `amp_complete_task`
+**Code review** (task name starts with "Code Review:"):
+- Your job is a full tiered code review using the `code-reviewer` skill
+- Load it first: `skill("code-reviewer")`
+- Run `git diff` to see all changes from the story's implementation tasks
+- Apply the Blocker / Significant / Suggestion checklist to every changed file
+- Post your findings in the standard format (Overall Verdict → Blockers → Significant → Suggestions)
+- Create a fix task for every Blocker and Significant finding
+- Suggestions are noted but do not block completion
+- Complete the review task when done — fix tasks land in the backlog
 
-**If issues are found:**
-- Do NOT fail or block yourself
-- Do NOT try to fix the issues yourself (unless the fix is truly trivial — one line)
-- **Create a new task for each distinct issue** using `amp_create_task`
-- Each fix task must be:
-  - Small and targeted — one issue, one task
-  - Assigned to `amp-worker`
-  - Blocked by nothing (ready to dispatch immediately) unless it depends on another fix
-  - Described with the exact file, line, and what needs to change
-- Post a comment listing every issue found and every fix task created with their IDs
-- Call `amp_complete_task` — your review is done, the fix tasks are now in the backlog
+### Reviewer rules (both types)
+
+1. **Never fail or block yourself** — issues become fix tasks, not a blocked review
+2. **Never fix complex issues yourself** — create a targeted task and complete the review
+3. **One issue = one fix task** — don't bundle multiple problems into one fix
+4. **Always complete** — the review always ends with `amp_complete_task`
 
 ### Fix task template
 
@@ -188,7 +194,7 @@ amp_create_task(
   name="Fix: [specific issue]",
   description="""
 ## What to fix
-[Exact file, line number, what is wrong]
+[Exact file path, line number or function name, what is wrong]
 
 ## What to change
 [Exact change needed — be specific]
@@ -210,16 +216,16 @@ Found during review of task #[REVIEWED_TASK_ID].
 
 - **Correctness** — does the code actually do what the task asked?
 - **Completeness** — were all acceptance criteria met? Check each one explicitly
-- **Build** — run the exact build command (`go build ./...` or `npm run build`) — if it fails, that's a fix task
+- **Build** — run the exact build command — if it fails, that's a fix task
+- **Code quality** (code review only) — apply the code-reviewer skill checklist
 - **Scope** — did the worker change files they weren't supposed to? Extra changes = fix task to revert
-- **Gotchas** — did the worker fall into any of the traps listed in the original task description?
 
 ### What reviewers do NOT do
 
 - Do not rewrite working code because you'd do it differently
-- Do not create fix tasks for style preferences
-- Do not block on minor issues — create a fix task and complete the review
+- Do not create fix tasks for style preferences (Suggestion tier only)
 - Do not try to fix complex issues yourself — create a targeted task
+- Do not block on minor issues — create a fix task and complete the review
 
 ---
 

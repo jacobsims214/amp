@@ -38,7 +38,74 @@ amp_kb_search(project_id=2, query="actor state machine task lifecycle")
 
 ---
 
-## Rule 2: Create or update — always check first
+## Rule 2: Tags are MANDATORY — pick them before you write
+
+**Every `amp_kb_write` call must include 3–6 tags. No exceptions.**
+
+A doc with no tags is invisible to the faceted browser and weakens the keyword layer
+of hybrid search. Tags feed both discovery (browsing) and retrieval (search ranking).
+
+### The 3-part tag formula
+
+Pick at least one tag from each bucket:
+
+```
+1. Category — what kind of doc is this?
+   architecture  decision  how-to  discovery  api  testing  security
+
+2. Technology — what specific tools/languages/frameworks?
+   go  typescript  react  postgres  docker  mcp  sse  tailwind  dagre
+   typesense  ollama  redis  nginx  sqlite  grpc  protobuf
+
+3. Domain — what system component or feature area?
+   auth  tasks  epics  stories  kb  dag  board  agents  workers  planning
+   realtime  migrations  search  embeddings  routing  websocket  actors
+```
+
+### Examples of correct tag sets
+
+| Doc topic | Tags |
+|-----------|------|
+| How JWT auth works | `architecture`, `auth`, `jwt`, `go`, `security` |
+| Why we chose pgvector | `decision`, `pgvector`, `database`, `postgres`, `search` |
+| Actor / task state machine | `architecture`, `actors`, `go`, `tasks`, `concurrency` |
+| DAG layout algorithm | `architecture`, `dag`, `dagre`, `typescript`, `react` |
+| SSE event streaming | `architecture`, `sse`, `go`, `typescript`, `realtime` |
+| Running DB migrations | `how-to`, `migrations`, `postgres`, `database`, `go` |
+| KB write/search contract | `api`, `kb`, `mcp`, `search`, `typesense` |
+
+### Tags to never use — too generic to help
+
+`docs`, `notes`, `important`, `todo`, `misc`, `general`, `info`, `update`, `code`, `stuff`
+
+If you can't think of a specific tag, you're probably writing a doc that's too broad.
+Split it, or use the topic name itself as a tag (e.g. `epic-crud`, `sse-reconnect`).
+
+### Tag placement in the write call
+
+```python
+amp_kb_write(
+  project_id=PROJECT_ID,
+  path="architecture/actors.md",
+  title="Actor Model — Task Lifecycle and State Machine",
+  content="[full prose doc]",
+  tags=["architecture", "actors", "go", "tasks", "concurrency"],  # ← pick 3-6, always
+  author="amp-worker"
+)
+```
+
+When **updating** an existing doc, always preserve the existing tags and add any new
+ones your work introduces:
+
+```python
+existing = amp_kb_get(project_id=ID, path="architecture/actors.md")
+# ... merge content ...
+amp_kb_write(..., tags=existing.tags + ["new-tag-if-needed"])
+```
+
+---
+
+## Rule 3: Create or update — always check first
 
 Before writing any KB doc, **decide whether to create or update**.
 Prefer updating over creating. Fragmented docs on the same topic hurt search quality —
@@ -110,7 +177,7 @@ Write or update a KB doc when you:
 
 ---
 
-## Rule 3: How to write content that embeds well
+## Rule 4: How to write content that embeds well
 
 This is the most important rule. **The embedding model converts your prose into a
 vector. Sparse, code-heavy docs produce weak vectors. Dense, specific prose produces
@@ -255,21 +322,15 @@ feed the keyword layer of hybrid search.]
 | `discoveries/<topic>.md` | Findings from exploration, surprises |
 | `apis/<service>.md` | API shapes, endpoint contracts |
 
----
+## Path naming conventions
 
-## Tag discipline
-
-Tags feed the keyword layer and the faceted browsing UI. Use 3-6 specific tags per doc.
-
-**Good — specific, technical, searchable:**
-`auth`, `jwt`, `actors`, `protoactor`, `dag`, `pgvector`, `typesense`, `ollama`,
-`mcp`, `database`, `migrations`, `docker`, `typescript`, `react`, `sse`, `api`,
-`testing`, `security`, `performance`
-
-**Bad — generic, meaningless for search:**
-`docs`, `notes`, `important`, `todo`, `misc`, `general`, `info`, `update`
-
-Tags should answer: "what would someone type in a search bar to find this?"
+| Category | Path pattern | When to use |
+|----------|-------------|-------------|
+| `architecture/<topic>.md` | How a component works, system design |
+| `decisions/<NNN>-<topic>.md` | Why a decision was made, ADRs |
+| `how-to/<topic>.md` | Step-by-step operational guides |
+| `discoveries/<topic>.md` | Findings from exploration, surprises |
+| `apis/<service>.md` | API shapes, endpoint contracts |
 
 ---
 
