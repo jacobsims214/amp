@@ -5,6 +5,11 @@ description: How to search the AMP knowledge base before starting work, and how 
 
 # AMP Knowledge Base Skill
 
+> **Load this skill late, not early.** This skill is large (~13kb). Workers should
+> search the KB directly with `amp_kb_search` at startup — no skill load needed.
+> Load this skill only when you are in Step 4 and ready to write a KB doc.
+> Loading it at the start of every task wastes context the worker needs for actual work.
+
 > This skill is loaded by both `amp-execution` (workers) and `amp-planning` (manager).
 > It defines the canonical rules for KB search and writing. Neither prompt nor any
 > other skill repeats these rules — this is the single source of truth.

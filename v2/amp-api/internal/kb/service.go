@@ -313,13 +313,14 @@ func (s *Service) ListDocs(ctx context.Context, projectID int, tag string) ([]Do
 // ---- Search ----
 
 // Search performs hybrid keyword+semantic search scoped to a project.
-// Returns up to limit results (default 10). Each result is one chunk.
+// Returns up to limit results (default 3). Each result is one chunk.
+// Excerpts are capped at 120 chars to keep MCP responses small for local LLMs.
 func (s *Service) Search(ctx context.Context, projectID int, query string, tags []string, limit int) ([]SearchResult, error) {
 	if err := s.ensureCollection(ctx, projectID); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
-		limit = 10
+		limit = 3 // small default — agents call this from limited-context models
 	}
 
 	col := collectionName(projectID)
@@ -382,7 +383,7 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 			Path:      doc.Path,
 			Title:     doc.Title,
 			Tags:      doc.Tags,
-			Excerpt:   trimExcerpt(doc.ChunkText, 300),
+			Excerpt:   trimExcerpt(doc.ChunkText, 120),
 			Author:    doc.Author,
 			UpdatedAt: doc.UpdatedAt,
 			Score:     score,

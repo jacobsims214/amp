@@ -251,13 +251,14 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_kb_search",
 		"Search the project knowledge base using hybrid keyword+semantic search. "+
-			"Call this BEFORE starting any task to check what previous agents already documented. "+
-			"Returns the most relevant document chunks with excerpts.",
+			"Returns the most relevant document chunks with short excerpts. "+
+			"Use this when you need to find existing documentation on a specific topic. "+
+			"Default limit is 3 — only increase if initial results are insufficient.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"query":      str("REQUIRED. Natural language search query."),
 			"tags":       arr("Optional. Filter results to docs with these tags."),
-			"limit":      num("Optional. Max results to return (default 10)."),
+			"limit":      num("Optional. Max results to return (default 3, max 10)."),
 		}), wrap(ctx, s.kbSearch))
 
 	mcp.AddTool(tool("amp_kb_get",

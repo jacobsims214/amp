@@ -9,7 +9,8 @@
       "models": {
         "gpt-oss-20b": {},
         "gemma-4-31b-q4": {},
-        "qwen-3.5-medium-35b-a3b": {}
+        "qwen-3.5-medium-35b-a3b": {},
+        "qwen-3.6-35b-a3b": {}
       }
     }
   },
@@ -18,7 +19,7 @@
       "mode": "primary",
       "description": "AMP manager — plans work, creates the full project hierarchy, dispatches workers, monitors progress",
       "prompt": "{file:./.opencode/prompts/amp-manager.txt}",
-      "model": "LlamaBarn/qwen-3.5-medium-35b-a3b",
+      "model": "LlamaBarn/qwen-3.6-35b-a3b",
       "temperature": 0.2,
       "permission": {
         "edit": "allow",
@@ -31,7 +32,7 @@
       "hidden": true,
       "description": "AMP worker — executes a single assigned task end-to-end, logs all progress to the ticket via MCP",
       "prompt": "{file:./.opencode/prompts/amp-worker.txt}",
-      "model": "LlamaBarn/qwen-3.5-medium-35b-a3b",
+      "model": "LlamaBarn/qwen-3.6-35b-a3b",
       "temperature": 0.1,
       "permission": {
         "edit": "allow",

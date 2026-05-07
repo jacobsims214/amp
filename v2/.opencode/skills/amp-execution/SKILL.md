@@ -22,17 +22,18 @@ This gives you `project_id`. Every MCP call uses this value.
 
 ## Step 0.5 — Search the KB before starting
 
-**This is not optional.** Before reading the ticket, search the KB:
+Before reading the ticket, search the KB for relevant context:
 
 ```
-amp_kb_search(project_id=PROJECT_ID, query="<your task name + key terms>")
+amp_kb_search(project_id=PROJECT_ID, query="<task name + key terms>")
 ```
 
 - Got relevant results → read them with `amp_kb_get` before touching anything
-- Nothing relevant → proceed, but you are expected to document what you discover
+- Nothing relevant → proceed
 
-See the `amp-kb` skill for full search and writing guidance. Load it now if you
-haven't already: `skill("amp-kb")`
+**Do not load `skill("amp-kb")` here.** You have the search tool — use it directly.
+Load `skill("amp-kb")` only in Step 4 when you are ready to write a KB doc.
+The skill is large. Loading it now wastes context you need for the actual work.
 
 ---
 
@@ -99,12 +100,14 @@ After completing substantive work, write at least one KB doc if you:
 - Completed work future agents will build on
 
 **Tags are mandatory on every KB write. Never call `amp_kb_write` without 3–6 tags.**
-Load `amp-kb` now if you haven't — it defines the required tag formula, what good tags
-look like, and how to write content that embeds well for semantic search:
 
+Load the KB skill now — only at this step, not before:
 ```
 skill("amp-kb")
 ```
+
+It defines the required tag formula, create-vs-update rules, and how to write content
+that embeds well for semantic search.
 
 ---
 

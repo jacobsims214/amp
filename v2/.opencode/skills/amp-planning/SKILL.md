@@ -57,6 +57,18 @@ A correctly sized task:
 - One layer = one task (model, repo, HTTP handler, and frontend component are four tasks)
 - One component = one task (`CrudModal` component is separate from wiring it into `Board.tsx`)
 
+### Description size limit — hard rule
+
+**Worker descriptions must fit in ~20 lines.** Small models have limited context.
+A description that consumes the worker's context budget before they start is a failed task.
+
+**Never embed in a description:**
+- Full file contents or large YAML/JSON/config blocks → use "see file X, copy and change Y to Z"
+- Long code examples → name the function, describe the change in one sentence
+- Repetition of the acceptance criteria in the description body
+
+If you need more than 20 lines to explain a task — **split the task**.
+
 ### Description template
 
 ```
@@ -64,7 +76,7 @@ A correctly sized task:
 [One clear goal. Name the file and symbol. Say what the outcome is, not how to get there.]
 
 ## Context
-[Why this exists. What it connects to. Relevant decisions or constraints.]
+[Why this exists. What it connects to. 2-3 sentences max.]
 
 ## Where to look
 [File paths and key symbols the worker needs to start from.]
@@ -73,7 +85,7 @@ A correctly sized task:
 [3 or fewer. Each must be a binary check — it either passes or it doesn't.]
 
 ## Gotchas
-[Non-obvious traps, known edge cases, things to watch out for.]
+[Non-obvious traps only. Omit if none.]
 ```
 
 ---
