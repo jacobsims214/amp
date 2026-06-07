@@ -4,8 +4,8 @@
 //
 //	amp_create_project   amp_list_projects   amp_get_project
 //	amp_archive_project  amp_restore_project
-//	amp_create_epic      amp_list_epics      amp_get_epic
-//	amp_create_story     amp_list_stories    amp_get_story
+//	amp_create_epic      amp_list_epics      amp_get_epic      amp_update_epic
+//	amp_create_story     amp_list_stories    amp_get_story     amp_update_story
 //	amp_create_task      amp_list_tasks      amp_get_task
 //	amp_update_task      amp_dispatch_task   amp_complete_task
 //	amp_block_task       amp_add_task_comment
@@ -84,6 +84,14 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_get_epic", "Get an epic by ID.",
 		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.getEpic))
 
+	mcp.AddTool(tool("amp_update_epic", "Update an epic's name, description, or priority.",
+		props{
+			"epic_id":     num("REQUIRED. Epic ID."),
+			"name":        str("New epic name."),
+			"description": str("New epic description."),
+			"priority":    str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+		}), wrap(ctx, s.updateEpic))
+
 	// ---- Stories ----
 	mcp.AddTool(tool("amp_create_story", "Create a story inside an epic.",
 		props{
@@ -100,6 +108,15 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_get_story", "Get a story by ID.",
 		props{"story_id": num("REQUIRED. Story ID.")}), wrap(ctx, s.getStory))
+
+	mcp.AddTool(tool("amp_update_story", "Update a story's name, description, acceptance criteria, or priority.",
+		props{
+			"story_id":            num("REQUIRED. Story ID."),
+			"name":                str("New story name."),
+			"description":         str("New story description."),
+			"acceptance_criteria": str("New acceptance criteria."),
+			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+		}), wrap(ctx, s.updateStory))
 
 	// ---- Tasks (all mutations go through actors) ----
 	mcp.AddTool(tool("amp_create_task",
@@ -681,6 +698,69 @@ func (s *Server) updateTask(_ context.Context, args map[string]interface{}) (*mc
 		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "updated": true})
+}
+
+func (s *Server) updateEpic(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	epicID, err := reqInt(args, "epic_id")
+	if err != nil {
+		return nil, err
+	}
+	epic, err := s.repo.GetEpic(context.Background(), epicID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), epic.ProjectID); err != nil {
+		return nil, err
+	}
+	req := domain.UpdateEpicRequest{
+		EpicID:      epicID,
+		Name:        optStr(args, "name", ""),
+		Description: optStr(args, "description", ""),
+		Priority:    optStr(args, "priority", ""),
+	}
+	replyCh := make(chan ReplySimple, 1)
+	pid, err := s.registry.Get(epic.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	s.registry.System().Root.Send(pid, &actor.MsgUpdateEpic{Req: req, ReplyCh: replyCh})
+	reply := <-replyCh
+	if reply.Err != nil {
+		return nil, reply.Err
+	}
+	return jsonResult(map[string]interface{}{"epic_id": epicID, "updated": true})
+}
+
+func (s *Server) updateStory(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	storyID, err := reqInt(args, "story_id")
+	if err != nil {
+		return nil, err
+	}
+	story, err := s.repo.GetStory(context.Background(), storyID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), story.ProjectID); err != nil {
+		return nil, err
+	}
+	req := domain.UpdateStoryRequest{
+		StoryID:            storyID,
+		Name:               optStr(args, "name", ""),
+		Description:        optStr(args, "description", ""),
+		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
+		Priority:           optStr(args, "priority", ""),
+	}
+	replyCh := make(chan ReplySimple, 1)
+	pid, err := s.registry.Get(story.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	s.registry.System().Root.Send(pid, &actor.MsgUpdateStory{Req: req, ReplyCh: replyCh})
+	reply := <-replyCh
+	if reply.Err != nil {
+		return nil, reply.Err
+	}
+	return jsonResult(map[string]interface{}{"story_id": storyID, "updated": true})
 }
 
 func (s *Server) dispatchTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

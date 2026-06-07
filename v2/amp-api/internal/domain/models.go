@@ -164,6 +164,21 @@ type UpdateTaskRequest struct {
 	StartAt            *time.Time `json:"start_at,omitempty"`
 }
 
+type UpdateEpicRequest struct {
+	EpicID       int    `json:"epic_id"`
+	Name         string `json:"name,omitempty"`
+	Description  string `json:"description,omitempty"`
+	Priority     string `json:"priority,omitempty"`
+}
+
+type UpdateStoryRequest struct {
+	StoryID            int    `json:"story_id"`
+	Name               string `json:"name,omitempty"`
+	Description        string `json:"description,omitempty"`
+	AcceptanceCriteria string `json:"acceptance_criteria,omitempty"`
+	Priority           string `json:"priority,omitempty"`
+}
+
 type DispatchTaskRequest struct {
 	TaskID  int    `json:"task_id"`
 	AgentID string `json:"agent_id"`

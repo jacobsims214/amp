@@ -484,19 +484,26 @@ func (r *Repo) SetTaskStartAt(ctx context.Context, taskID int, startAt *time.Tim
 }
 
 func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) error {
-	_, err := r.db.Exec(ctx,
-		`UPDATE tasks SET
-		   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
-		   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
-		   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
-		   assigned_to         = CASE WHEN $4 != '' THEN $4 ELSE assigned_to END,
-		   agent_id            = CASE WHEN $5 != '' THEN $5 ELSE agent_id END,
-		   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
-		   start_at            = CASE WHEN $7 IS NOT NULL THEN $7 ELSE start_at END,
-		   updated_at          = NOW()
-		 WHERE id = $8`,
-		req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority, req.StartAt, req.TaskID,
-	)
+	query := `UPDATE tasks SET
+	   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
+	   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
+	   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+	   assigned_to         = CASE WHEN $4 != '' THEN $4 ELSE assigned_to END,
+	   agent_id            = CASE WHEN $5 != '' THEN $5 ELSE agent_id END,
+	   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
+	   updated_at          = NOW()`
+
+	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority}
+
+	if req.StartAt != nil {
+		query += `, start_at = $7`
+		args = append(args, req.StartAt)
+	}
+
+	query += ` WHERE id = $` + fmt.Sprint(len(args)+1)
+	args = append(args, req.TaskID)
+
+	_, err := r.db.Exec(ctx, query, args...)
 	return err
 }
 

@@ -171,6 +171,26 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		a.taskStates = make(map[int]domain.TaskState)
 		msg.ReplyCh <- ReplySimple{}
 
+	case *MsgUpdateStory:
+		err := a.repo.UpdateStory(context.Background(), msg.Req.StoryID, msg.Req.Name, msg.Req.Description, msg.Req.AcceptanceCriteria, msg.Req.Priority)
+		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update story: %w", err)}
+			return
+		}
+		if msg.Req.Name != "" {
+			a.story.Name = msg.Req.Name
+		}
+		if msg.Req.Description != "" {
+			a.story.Description = msg.Req.Description
+		}
+		if msg.Req.AcceptanceCriteria != "" {
+			a.story.AcceptanceCriteria = msg.Req.AcceptanceCriteria
+		}
+		if msg.Req.Priority != "" {
+			a.story.Priority = msg.Req.Priority
+		}
+		msg.ReplyCh <- ReplySimple{}
+
 	case *MsgDepCompleted:
 		// Fan out to all child TaskActors — each checks its own deps independently.
 		for _, pid := range a.tasks {

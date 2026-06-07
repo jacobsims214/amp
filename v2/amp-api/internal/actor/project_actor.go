@@ -81,6 +81,16 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		ctx.Send(pid, &MsgGetEpic{EpicID: msg.EpicID, ReplyCh: replyCh})
 		msg.ReplyCh <- <-replyCh
 
+	case *MsgUpdateEpic:
+		pid, ok := a.epics[msg.Req.EpicID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("epic %d not found", msg.Req.EpicID)}
+			return
+		}
+		replyCh := make(chan ReplySimple, 1)
+		ctx.Send(pid, &MsgUpdateEpic{Req: msg.Req, ReplyCh: replyCh})
+		msg.ReplyCh <- <-replyCh
+
 	// ---- Story operations ----
 
 	case *MsgCreateStory:
@@ -97,6 +107,19 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		// Route to the correct epic — need to find which epic owns this story.
 		// We don't have a storyToEpic index, so broadcast and take first reply.
 		a.broadcastToEpics(ctx, msg)
+
+	case *MsgUpdateStory:
+		// Broadcast to all epics — first one that owns the story handles it.
+		for _, epicPID := range a.epics {
+			replyCh := make(chan ReplySimple, 1)
+			ctx.Send(epicPID, &MsgUpdateStory{Req: msg.Req, ReplyCh: replyCh})
+			reply := <-replyCh
+			if reply.Err == nil {
+				msg.ReplyCh <- ReplySimple{}
+				return
+			}
+		}
+		msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("story %d not found", msg.Req.StoryID)}
 
 	// ---- Task operations — route via taskToEpic index ----
 

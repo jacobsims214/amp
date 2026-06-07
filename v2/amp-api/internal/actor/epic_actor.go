@@ -69,6 +69,16 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		ctx.Send(pid, &MsgGetStory{StoryID: msg.StoryID, ReplyCh: replyCh})
 		msg.ReplyCh <- <-replyCh
 
+	case *MsgUpdateStory:
+		pid, ok := a.stories[msg.Req.StoryID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("story %d not found in epic %d", msg.Req.StoryID, a.epic.ID)}
+			return
+		}
+		replyCh := make(chan ReplySimple, 1)
+		ctx.Send(pid, &MsgUpdateStory{Req: msg.Req, ReplyCh: replyCh})
+		msg.ReplyCh <- <-replyCh
+
 	case *MsgListEpicTasks:
 		tasks := a.collectAllTasks(ctx)
 		msg.ReplyCh <- ReplyListTasks{Tasks: tasks}
@@ -137,6 +147,23 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 			delete(a.stories, storyID)
 		}
 		a.storyStates = make(map[int]domain.StoryState)
+		msg.ReplyCh <- ReplySimple{}
+
+	case *MsgUpdateEpic:
+		err := a.repo.UpdateEpic(context.Background(), msg.Req.EpicID, msg.Req.Name, msg.Req.Description, msg.Req.Priority)
+		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update epic: %w", err)}
+			return
+		}
+		if msg.Req.Name != "" {
+			a.epic.Name = msg.Req.Name
+		}
+		if msg.Req.Description != "" {
+			a.epic.Description = msg.Req.Description
+		}
+		if msg.Req.Priority != "" {
+			a.epic.Priority = msg.Req.Priority
+		}
 		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgDeleteStory:

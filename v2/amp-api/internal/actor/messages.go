@@ -29,6 +29,11 @@ type MsgListEpicTasks struct {
 	ReplyCh chan ReplyListTasks
 }
 
+type MsgUpdateEpic struct {
+	Req     domain.UpdateEpicRequest
+	ReplyCh chan ReplySimple
+}
+
 // ---- Story ----
 
 type MsgCreateStory struct {
@@ -44,6 +49,11 @@ type MsgGetStory struct {
 type MsgListStoryTasks struct {
 	StoryID int
 	ReplyCh chan ReplyListTasks
+}
+
+type MsgUpdateStory struct {
+	Req     domain.UpdateStoryRequest
+	ReplyCh chan ReplySimple
 }
 
 // ---- Task ----
