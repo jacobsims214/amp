@@ -2,7 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Plus, Search, FileText, Tag, Trash2, Edit3, Save, X,
-  Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock,
+  Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api/client'
@@ -258,7 +258,7 @@ export function KB() {
         <main className="flex-1 overflow-y-auto">
           {view === 'browse' && <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={openDoc} onNew={() => openEditor(null)} />}
           {view === 'doc' && selectedDoc && (
-            <DocView doc={selectedDoc} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} />
+            <DocView doc={selectedDoc} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} pid={pid} setSelectedDoc={setSelectedDoc} />
           )}
           {view === 'editor' && (
             <EditorView
@@ -409,6 +409,15 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
                 })}
               </div>
             )}
+            {r.annotation_count !== undefined && r.annotation_count > 0 && (
+              <div className="flex items-center gap-1 mt-1 pl-4">
+                <MessageSquare size={10} className="text-[#FBBF24]" />
+                <span className="text-[10px] text-[#3D5068]">
+                  {r.annotation_count} annotation{r.annotation_count !== 1 ? 's' : ''}
+                  {r.latest_annotation && <> — {r.latest_annotation}</>}
+                </span>
+              </div>
+            )}
           </button>
         )
       })}
@@ -516,12 +525,44 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
 }
 
 /* ── Doc viewer ───────────────────────────────────────────────────────────── */
-function DocView({ doc, onEdit, onDelete, onTagClick }: {
+function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
   doc: KBDoc; onEdit: () => void; onDelete: () => void; onTagClick: (tag: string) => void
+  pid: number; setSelectedDoc: (doc: KBDoc | null) => void
 }) {
   const pathParts = doc.path.split('/')
   const rt = readingTime(doc.content)
   const date = doc.updated_at > 0 ? new Date(doc.updated_at * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : null
+  const [annExpanded, setAnnExpanded] = useState(true)
+  const [annText, setAnnText] = useState('')
+  const [annSaving, setAnnSaving] = useState(false)
+
+  const handleAddAnnotation = async () => {
+    if (!annText.trim()) return
+    setAnnSaving(true)
+    try {
+      await api.kbAnnotate(pid, doc.path, annText, 'user')
+      const updatedDoc = await api.kbGet(pid, doc.path)
+      setSelectedDoc(updatedDoc)
+      setAnnText('')
+    } finally {
+      setAnnSaving(false)
+    }
+  }
+
+  const formatDate = (timestamp: number) => {
+    const date = new Date(timestamp * 1000)
+    const now = new Date()
+    const diffMs = now.getTime() - date.getTime()
+    const diffMins = Math.floor(diffMs / 60000)
+    const diffHours = Math.floor(diffMs / 3600000)
+    const diffDays = Math.floor(diffMs / 86400000)
+    
+    if (diffMins < 1) return 'just now'
+    if (diffMins < 60) return `${diffMins}m ago`
+    if (diffHours < 24) return `${diffHours}h ago`
+    if (diffDays < 7) return `${diffDays}d ago`
+    return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  }
 
   return (
     <div className="p-8 max-w-3xl mx-auto">
@@ -624,6 +665,93 @@ function DocView({ doc, onEdit, onDelete, onTagClick }: {
         >
           {doc.content}
         </ReactMarkdown>
+      </div>
+
+      {/* Annotations Panel */}
+      <div className="mt-8 pt-6 border-t border-[#192238]">
+        <button
+          onClick={() => setAnnExpanded(!annExpanded)}
+          className="flex items-center gap-2 text-xs font-semibold text-[#7E91A8] hover:text-[#DDE6F0] transition-colors mb-4"
+        >
+          {annExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <MessageSquare size={12} />
+          Annotations
+          <span className="ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold" style={{ background: 'rgba(99,102,241,0.12)', color: '#818CF8' }}>
+            {doc.annotations?.length ?? 0}
+          </span>
+        </button>
+        
+        {annExpanded && (
+          <div className="space-y-4">
+            {/* Annotation List */}
+            {doc.annotations && doc.annotations.length > 0 ? (
+              <div className="space-y-3">
+                {doc.annotations.map((ann, idx) => (
+                  <div key={idx} className="p-3 rounded-lg text-xs" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid #1E2C45' }}>
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-[#DDE6F0]">{ann.author}</span>
+                        <span className="text-[#3D5068]">{formatDate(ann.created_at)}</span>
+                      </div>
+                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                        ann.is_resolved 
+                          ? 'text-[#10B981]' 
+                          : 'text-[#F59E0B]'
+                      }`} style={{ background: ann.is_resolved ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.12)' }}>
+                        {ann.is_resolved ? 'Resolved' : 'Unresolved'}
+                      </span>
+                    </div>
+                    <p className="text-[#7E91A8] leading-relaxed whitespace-pre-wrap">{ann.text}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center py-6">
+                <p className="text-xs text-[#3D5068]">No annotations yet</p>
+              </div>
+            )}
+
+            {/* Add Annotation Form */}
+            <div className="pt-4 border-t border-[#192238]">
+              <div className="flex items-center gap-2 mb-2">
+                <MessageSquare size={12} className="text-[#6366F1]" />
+                <span className="text-xs font-semibold text-[#DDE6F0]">Add Annotation</span>
+              </div>
+              <div className="space-y-2">
+                <textarea
+                  value={annText}
+                  onChange={(e) => setAnnText(e.target.value)}
+                  placeholder="Add your annotation here..."
+                  className="w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-xs text-[#DDE6F0] placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit] resize-none"
+                  rows={3}
+                />
+                <div className="flex justify-end">
+                  <button
+                    onClick={handleAddAnnotation}
+                    disabled={!annText.trim() || annSaving}
+                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
+                    style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+                    onMouseEnter={(e) => {
+                      if (!annSaving && annText.trim()) {
+                        (e.currentTarget as HTMLElement).style.background = 'rgba(99,102,241,0.2)';
+                        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99,102,241,0.4)';
+                      }
+                    }}
+                    onMouseLeave={(e) => {
+                      if (!annSaving && annText.trim()) {
+                        (e.currentTarget as HTMLElement).style.background = 'rgba(99,102,241,0.12)';
+                        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99,102,241,0.25)';
+                      }
+                    }}
+                  >
+                    {annSaving ? <Loader2 size={12} className="animate-spin" /> : <Plus size={12} />}
+                    {annSaving ? 'Adding...' : 'Add Annotation'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   )

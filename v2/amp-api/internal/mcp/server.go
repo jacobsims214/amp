@@ -272,10 +272,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"Use this when you need to find existing documentation on a specific topic. "+
 			"Default limit is 3 — only increase if initial results are insufficient.",
 		props{
-			"project_id": num("REQUIRED. Project ID."),
-			"query":      str("REQUIRED. Natural language search query."),
-			"tags":       arr("Optional. Filter results to docs with these tags."),
-			"limit":      num("Optional. Max results to return (default 3, max 10)."),
+			"project_id":      num("REQUIRED. Project ID."),
+			"query":           str("REQUIRED. Natural language search query."),
+			"tags":            arr("Optional. Filter results to docs with these tags."),
+			"limit":           num("Optional. Max results to return (default 3, max 10)."),
+			"recency_boost":   num("Optional. Weight for recency in sorting (0 = no recency weight)."),
+			"min_recency_days": num("Optional. Filter out documents older than N days (0 = no filter)."),
 		}), wrap(ctx, s.kbSearch))
 
 	mcp.AddTool(tool("amp_kb_get",
@@ -313,6 +315,22 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.kbReindex))
+
+	mcp.AddTool(tool("amp_kb_annotate",
+		"Append a lightweight annotation to an existing KB doc. Use instead of rewriting for small corrections. "+
+			"Annotations are returned in amp_kb_get and previewed in amp_kb_search results.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
+			"text":       str("REQUIRED. Annotation text — the correction or note."),
+			"author":     str("Optional. Who is annotating (defaults to 'agent')."),
+		}), wrap(ctx, s.kbAnnotate))
+
+	mcp.AddTool(tool("amp_kb_status",
+		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution. Use this to assess KB health before curator maintenance.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+		}), wrap(ctx, s.kbStatus))
 }
 
 // ---- Tool handlers ----
@@ -1252,8 +1270,10 @@ func (s *Server) kbSearch(_ context.Context, args map[string]interface{}) (*mcpg
 	}
 	tags := optStrSlice(args, "tags")
 	limit := optInt(args, "limit", 10)
+	recencyBoost := optFloat(args, "recency_boost", 0)
+	minRecencyDays := optInt(args, "min_recency_days", 0)
 
-	results, err := s.kb.Search(context.Background(), projectID, query, tags, limit)
+	results, err := s.kb.Search(context.Background(), projectID, query, tags, limit, recencyBoost, minRecencyDays)
 	if err != nil {
 		return nil, err
 	}
@@ -1333,6 +1353,43 @@ func (s *Server) kbReindex(_ context.Context, args map[string]interface{}) (*mcp
 		}
 	}()
 	return jsonResult(map[string]interface{}{"reindex": "started", "project_id": projectID})
+}
+
+func (s *Server) kbAnnotate(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+		return nil, err
+	}
+	path, err := reqStr(args, "path")
+	if err != nil {
+		return nil, err
+	}
+	text, err := reqStr(args, "text")
+	if err != nil {
+		return nil, err
+	}
+	author := optStr(args, "author", "agent")
+
+	ann, err := s.kb.AnnotateDoc(context.Background(), projectID, path, text, author)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(ann)
+}
+
+func (s *Server) kbStatus(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	status, err := s.kb.KBStatus(context.Background(), projectID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(status)
 }
 
 // checkProjectNotArchived returns an error if the project is archived.
@@ -1445,6 +1502,18 @@ func optInt(args map[string]interface{}, key string, def int) int {
 			return int(n)
 		case int:
 			return n
+		}
+	}
+	return def
+}
+
+func optFloat(args map[string]interface{}, key string, def float64) float64 {
+	if v, ok := args[key]; ok && v != nil {
+		switch n := v.(type) {
+		case float64:
+			return n
+		case int:
+			return float64(n)
 		}
 	}
 	return def

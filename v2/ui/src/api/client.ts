@@ -1,4 +1,4 @@
-import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest } from '../types'
+import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation, CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest } from '../types'
 
 const BASE = '/api'
 
@@ -125,6 +125,8 @@ export const api = {
     get<{ tags: KBTagCount[] }>(`/kb/tags?project_id=${projectId}`).then(r => r.tags ?? []),
   kbConfig: (projectId: number) =>
     get<{ typesense_url: string; api_key: string; collection: string }>(`/kb/config?project_id=${projectId}`),
+  kbAnnotate: (projectId: number, path: string, text: string, author = 'user') =>
+    post<KBAnnotation>(`/kb/annotate?project_id=${projectId}`, { path, text, author }),
 
   // Actions
   dispatchTask: (taskId: number, agentId = 'amp-worker') =>

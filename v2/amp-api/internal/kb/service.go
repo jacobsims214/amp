@@ -13,6 +13,7 @@ package kb
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -62,16 +63,24 @@ func New(typesenseURL, typesenseKey, ollamaURL, ollamaModel string) *Service {
 // ---- Public domain types ----
 
 type Doc struct {
-	ID         string   `json:"id"` // sha256(project_id:path)
-	ProjectID  int      `json:"project_id"`
-	Path       string   `json:"path"` // e.g. "architecture/auth.md"
-	Title      string   `json:"title"`
-	Content    string   `json:"content"` // full raw markdown
-	Tags       []string `json:"tags"`
-	Author     string   `json:"author"`
-	ChunkIndex int      `json:"chunk_index"` // 0 for the canonical doc record
-	ChunkText  string   `json:"chunk_text"`  // the searchable portion
-	UpdatedAt  int64    `json:"updated_at"`  // unix timestamp
+	ID          string      `json:"id"` // sha256(project_id:path)
+	ProjectID   int         `json:"project_id"`
+	Path        string      `json:"path"` // e.g. "architecture/auth.md"
+	Title       string      `json:"title"`
+	Content     string      `json:"content"` // full raw markdown
+	Tags        []string    `json:"tags"`
+	Author      string      `json:"author"`
+	ChunkIndex  int         `json:"chunk_index"` // 0 for the canonical doc record
+	ChunkText   string      `json:"chunk_text"`  // the searchable portion
+	UpdatedAt   int64       `json:"updated_at"`  // unix timestamp
+	Annotations []Annotation `json:"annotations"`
+}
+
+type Annotation struct {
+	Author      string `json:"author"`
+	Text        string `json:"text"`
+	CreatedAt   int64  `json:"created_at"`
+	IsResolved  bool   `json:"is_resolved"`
 }
 
 type DocSummary struct {
@@ -85,18 +94,31 @@ type DocSummary struct {
 }
 
 type SearchResult struct {
-	Path      string   `json:"path"`
-	Title     string   `json:"title"`
-	Tags      []string `json:"tags"`
-	Excerpt   string   `json:"excerpt"` // best-matching chunk_text, trimmed
-	Author    string   `json:"author"`
-	UpdatedAt int64    `json:"updated_at"`
-	Score     float64  `json:"score"`
+	Path            string   `json:"path"`
+	Title           string   `json:"title"`
+	Tags            []string `json:"tags"`
+	Excerpt         string   `json:"excerpt"` // best-matching chunk_text, trimmed
+	Author          string   `json:"author"`
+	UpdatedAt       int64    `json:"updated_at"`
+	Score           float64  `json:"score"`
+	AnnotationCount int      `json:"annotation_count"`
+	LatestAnnotation string  `json:"latest_annotation"`
+	RecencyLabel    string   `json:"recency_label"`
 }
 
 type TagCount struct {
 	Tag   string `json:"tag"`
 	Count int    `json:"count"`
+}
+
+// StatusInfo holds health metrics for the knowledge base.
+type StatusInfo struct {
+	TotalDocs           int            `json:"total_docs"`
+	StaleDocs           int            `json:"stale_docs"`
+	DocsWithAnnotations int            `json:"docs_with_annotations"`
+	TotalAnnotations    int            `json:"total_annotations"`
+	UnresolvedAnnotations int          `json:"unresolved_annotations"`
+	DocsByTag           map[string]int `json:"docs_by_tag"`
 }
 
 // ---- Collection naming ----
@@ -138,6 +160,8 @@ func (s *Service) ensureCollection(ctx context.Context, projectID int) error {
 			{Name: "content", Type: "string", Index: pointer.False()},
 			// sort by recency
 			{Name: "updated_at", Type: "int64", Sort: pointer.True()},
+			// annotations stored as JSON string on chunk_index=0; not indexed because annotations are returned with doc reads, not searched directly
+			{Name: "annotations", Type: "string", Index: pointer.False()},
 		},
 	}
 
@@ -210,15 +234,17 @@ func (s *Service) WriteDoc(ctx context.Context, projectID int, path, title, cont
 	// Index each chunk via Upsert (create-or-update by id).
 	for i, chunk := range chunks {
 		doc := map[string]interface{}{
-			"id":          docID(projectID, path, i),
-			"project_id":  projectID,
-			"path":        path,
-			"title":       title,
-			"tags":        tags,
-			"author":      author,
-			"chunk_index": i,
-			"chunk_text":  chunk,
-			"updated_at":  now,
+			"id":                docID(projectID, path, i),
+			"project_id":        projectID,
+			"path":              path,
+			"title":             title,
+			"tags":              tags,
+			"author":            author,
+			"chunk_index":       i,
+			"chunk_text":        chunk,
+			"updated_at":        now,
+			"annotation_count":  0,
+			"latest_annotation": "",
 		}
 		// Only store the full content on the first chunk.
 		if i == 0 {
@@ -258,6 +284,57 @@ func (s *Service) GetDoc(ctx context.Context, projectID int, path string) (*Doc,
 		return nil, fmt.Errorf("doc not found: %s/%s: %w", col, path, err)
 	}
 	return mapToDoc(raw), nil
+}
+
+// AnnotateDoc adds an annotation to a document.
+// The upsert only updates the annotations field on chunk_index=0.
+// Typesense will merge the fields.
+func (s *Service) AnnotateDoc(ctx context.Context, projectID int, path, text, author string) (*Annotation, error) {
+	doc, err := s.GetDoc(ctx, projectID, path)
+	if err != nil {
+		return nil, err
+	}
+	ann := &Annotation{
+		Author:     author,
+		Text:       text,
+		CreatedAt:  time.Now().Unix(),
+		IsResolved: false,
+	}
+	doc.Annotations = append(doc.Annotations, *ann)
+
+	col := collectionName(projectID)
+	_, err = s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
+		"id":                doc.ID,
+		"project_id":        doc.ProjectID,
+		"path":              doc.Path,
+		"title":             doc.Title,
+		"content":           doc.Content,
+		"tags":              doc.Tags,
+		"author":            doc.Author,
+		"chunk_index":       0,
+		"chunk_text":        doc.ChunkText,
+		"updated_at":        doc.UpdatedAt,
+		"annotations":       doc.Annotations,
+		"annotation_count":  len(doc.Annotations),
+		"latest_annotation": getLatestAnnotation(doc.Annotations),
+	}, &api.DocumentIndexParameters{})
+	if err != nil {
+		return nil, fmt.Errorf("annotate doc %s: %w", path, err)
+	}
+
+	// Propagate annotation count and latest annotation to all other chunks
+	// so search results from any chunk show annotation data.
+	count := len(doc.Annotations)
+	latest := getLatestAnnotation(doc.Annotations)
+	propFilter := fmt.Sprintf("project_id:=%d && path:=%s && chunk_index:>0", projectID, path)
+	_, _ = s.client.Collection(col).Documents().Update(ctx, map[string]interface{}{
+		"annotation_count":  count,
+		"latest_annotation": latest,
+	}, &api.UpdateDocumentsParams{
+		FilterBy: &propFilter,
+	})
+
+	return ann, nil
 }
 
 // ListDocs returns summaries of all documents (no content).
@@ -310,12 +387,32 @@ func (s *Service) ListDocs(ctx context.Context, projectID int, tag string) ([]Do
 	return out, nil
 }
 
+// computeRecencyLabel returns a human-readable label based on how recent the document is.
+func computeRecencyLabel(t time.Time) string {
+	days := int(time.Since(t).Hours() / 24)
+	switch {
+	case days <= 1:
+		return "today"
+	case days <= 7:
+		return "this week"
+	case days <= 30:
+		return "this month"
+	case days <= 365:
+		months := int(time.Since(t).Hours() / 24 / 30)
+		return fmt.Sprintf("%d months ago", months)
+	default:
+		return "over 1 year"
+	}
+}
+
 // ---- Search ----
 
 // Search performs hybrid keyword+semantic search scoped to a project.
 // Returns up to limit results (default 3). Each result is one chunk.
 // Excerpts are capped at 120 chars to keep MCP responses small for local LLMs.
-func (s *Service) Search(ctx context.Context, projectID int, query string, tags []string, limit int) ([]SearchResult, error) {
+// recencyBoost controls secondary sorting by updated_at (higher = more weight to recency).
+// minRecencyDays filters out documents older than N days (0 = no filter).
+func (s *Service) Search(ctx context.Context, projectID int, query string, tags []string, limit int, recencyBoost float64, minRecencyDays int) ([]SearchResult, error) {
 	if err := s.ensureCollection(ctx, projectID); err != nil {
 		return nil, err
 	}
@@ -328,6 +425,18 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 	filterBy := "chunk_index:>=0" // include all chunks
 	if len(tags) > 0 {
 		filterBy += fmt.Sprintf(" && tags:=[%s]", strings.Join(tags, ","))
+	}
+
+	// Add recency filter if minRecencyDays > 0
+	if minRecencyDays > 0 {
+		cutoff := time.Now().AddDate(0, 0, -minRecencyDays).Unix()
+		filterBy += fmt.Sprintf(" && updated_at:>=%d", cutoff)
+	}
+
+	// Build SortBy - include updated_at:desc as secondary sort when recencyBoost > 0
+	sortBy := "_text_match:desc"
+	if recencyBoost > 0 {
+		sortBy += ",updated_at:desc"
 	}
 
 	hasEmbedding := s.collectionHasEmbedding(ctx, collectionName(projectID))
@@ -354,6 +463,7 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 		Q:             &query,
 		QueryBy:       &queryBy,
 		FilterBy:      pointer.String(filterBy),
+		SortBy:        pointer.String(sortBy),
 		VectorQuery:   vectorQuery,
 		Prefix:        prefix,
 		PerPage:       &limit,
@@ -379,14 +489,36 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 		} else if hit.TextMatch != nil {
 			score = float64(*hit.TextMatch)
 		}
+		// Check stored fields on the chunk document
+		storedCount := 0
+		storedLatest := ""
+		if m, ok := (*hit.Document)["annotation_count"].(float64); ok {
+			storedCount = int(m)
+		}
+		if m, ok := (*hit.Document)["latest_annotation"].(string); ok {
+			storedLatest = m
+		}
+
+		annCount := storedCount
+		if annCount == 0 && len(doc.Annotations) > 0 {
+			annCount = len(doc.Annotations)
+		}
+		annLatest := storedLatest
+		if annLatest == "" {
+			annLatest = getLatestAnnotation(doc.Annotations)
+		}
+
 		out = append(out, SearchResult{
-			Path:      doc.Path,
-			Title:     doc.Title,
-			Tags:      doc.Tags,
-			Excerpt:   trimExcerpt(doc.ChunkText, 120),
-			Author:    doc.Author,
-			UpdatedAt: doc.UpdatedAt,
-			Score:     score,
+			Path:             doc.Path,
+			Title:            doc.Title,
+			Tags:             doc.Tags,
+			Excerpt:          trimExcerpt(doc.ChunkText, 120),
+			Author:           doc.Author,
+			UpdatedAt:        doc.UpdatedAt,
+			Score:            score,
+			AnnotationCount:  annCount,
+			LatestAnnotation: annLatest,
+			RecencyLabel:     computeRecencyLabel(time.Unix(doc.UpdatedAt, 0)),
 		})
 	}
 	return out, nil
@@ -443,6 +575,85 @@ func (s *Service) ListTags(ctx context.Context, projectID int) ([]TagCount, erro
 		}
 	}
 	return out, nil
+}
+
+// KBStatus returns health metrics for the knowledge base.
+// This is an idempotent, read-only operation that provides doc counts,
+// stale doc counts, annotation statistics, and tag distribution.
+func (s *Service) KBStatus(ctx context.Context, projectID int) (*StatusInfo, error) {
+	if err := s.ensureCollection(ctx, projectID); err != nil {
+		return nil, err
+	}
+
+	// List all docs (no tag filter)
+	docs, err := s.ListDocs(ctx, projectID, "")
+	if err != nil {
+		return nil, fmt.Errorf("list docs: %w", err)
+	}
+
+	// Initialize counters
+	totalDocs := len(docs)
+	staleDocs := 0
+	docsWithAnnotations := 0
+	totalAnnotations := 0
+	unresolvedAnnotations := 0
+	docsByTag := make(map[string]int)
+
+	// 90 days in seconds
+	ninetyDaysAgo := time.Now().AddDate(0, 0, -90).Unix()
+
+	// Process each doc
+	for _, summary := range docs {
+		// Get full doc to access annotations
+		fullDoc, err := s.GetDoc(ctx, projectID, summary.Path)
+		if err != nil {
+			s.log.Warn("KBStatus: skip doc", "path", summary.Path, "err", err)
+			continue
+		}
+
+		// Count stale docs (updated_at > 90 days ago)
+		if fullDoc.UpdatedAt < ninetyDaysAgo {
+			staleDocs++
+		}
+
+		// Count docs with annotations
+		if len(fullDoc.Annotations) > 0 {
+			docsWithAnnotations++
+		}
+
+		// Count total and unresolved annotations
+		for _, ann := range fullDoc.Annotations {
+			totalAnnotations++
+			if !ann.IsResolved {
+				unresolvedAnnotations++
+			}
+		}
+
+		// Count docs by tag
+		for _, tag := range fullDoc.Tags {
+			docsByTag[tag]++
+		}
+	}
+
+	// Get tag distribution from ListTags
+	tagCounts, err := s.ListTags(ctx, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("list tags: %w", err)
+	}
+
+	// Update docsByTag with actual counts from ListTags
+	for _, tc := range tagCounts {
+		docsByTag[tc.Tag] = tc.Count
+	}
+
+	return &StatusInfo{
+		TotalDocs:           totalDocs,
+		StaleDocs:           staleDocs,
+		DocsWithAnnotations: docsWithAnnotations,
+		TotalAnnotations:    totalAnnotations,
+		UnresolvedAnnotations: unresolvedAnnotations,
+		DocsByTag:           docsByTag,
+	}, nil
 }
 
 // ---- Delete ----
@@ -598,7 +809,41 @@ func mapToDocFromMap(m map[string]interface{}) *Doc {
 	if doc.Tags == nil {
 		doc.Tags = []string{}
 	}
+	// Deserialize annotations — can be JSON string (new collections with schema field)
+	// or direct slice (existing collections without schema field)
+	if raw, ok := m["annotations"]; ok {
+		switch v := raw.(type) {
+		case string:
+			if err := json.Unmarshal([]byte(v), &doc.Annotations); err == nil {
+				if doc.Annotations == nil {
+					doc.Annotations = []Annotation{}
+				}
+			}
+		case []interface{}:
+			// Direct slice from Typesense — marshal to JSON then unmarshal to typed slice
+			if data, err := json.Marshal(v); err == nil {
+				if err := json.Unmarshal(data, &doc.Annotations); err == nil {
+					if doc.Annotations == nil {
+						doc.Annotations = []Annotation{}
+					}
+				}
+			}
+		}
+	}
 	return doc
+}
+
+// getLatestAnnotation returns the most recent annotation's text (first 80 chars).
+// The annotations slice is expected to be ordered with the most recent at the end.
+func getLatestAnnotation(anns []Annotation) string {
+	if len(anns) == 0 {
+		return ""
+	}
+	latest := anns[len(anns)-1] // last in slice = most recent
+	if len(latest.Text) > 80 {
+		return latest.Text[:80] + "…"
+	}
+	return latest.Text
 }
 
 func trimExcerpt(s string, maxChars int) string {

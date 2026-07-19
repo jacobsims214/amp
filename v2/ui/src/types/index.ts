@@ -79,6 +79,13 @@ export interface ActivityLog {
 
 // ---- KB types ----
 
+export interface KBAnnotation {
+  author: string
+  text: string
+  created_at: number
+  is_resolved: boolean
+}
+
 export interface KBDoc {
   id: string
   project_id: number
@@ -90,6 +97,7 @@ export interface KBDoc {
   chunk_index: number
   chunk_text: string
   updated_at: number
+  annotations?: KBAnnotation[]
 }
 
 export interface KBDocSummary {
@@ -110,6 +118,8 @@ export interface KBSearchResult {
   author: string
   updated_at: number
   score: number
+  annotation_count?: number
+  latest_annotation?: string
 }
 
 export interface KBTagCount {

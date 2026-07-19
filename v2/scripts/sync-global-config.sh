@@ -5,10 +5,10 @@
 # Safe to run repeatedly — it upserts, never clobbers unrelated config.
 #
 # What it does:
-#   1. Copies skills   v2/.opencode/skills/*   → ~/.config/opencode/skills/
-#   2. Copies prompts  v2/.opencode/prompts/*  → ~/.config/opencode/prompts/
-#   3. Merges opencode.json — upserts agent + mcp keys, rewrites prompt
-#      paths to absolute so they work from any directory
+#   1. Copies skills  v2/.opencode/skills/*  → ~/.config/opencode/skills/
+#   2. Copies agents  v2/.opencode/agent/*.md → ~/.config/opencode/agent/
+#   3. Merges opencode.json — upserts provider + mcp keys only (agents are
+#      picked up by the file copy above, not merged into JSON)
 #
 # Usage:
 #   ./scripts/sync-global-config.sh          (from v2/)
@@ -22,7 +22,7 @@ V2_OPENCODE="${V2_DIR}/.opencode"
 V2_JSON="${V2_DIR}/opencode.json"
 GLOBAL_DIR="${HOME}/.config/opencode"
 GLOBAL_JSON="${GLOBAL_DIR}/opencode.json"
-PROMPTS_DEST="${GLOBAL_DIR}/prompts"
+AGENT_DEST="${GLOBAL_DIR}/agent"
 SKILLS_DEST="${GLOBAL_DIR}/skills"
 
 info()    { print -P "%F{blue}→%f $*" }
@@ -50,13 +50,13 @@ for d in "${V2_OPENCODE}/skills"/*/; do
   ok "  skill: ${name}"
 done
 
-# 2. Prompts
-info "Syncing prompts..."
-mkdir -p "${PROMPTS_DEST}"
-for f in "${V2_OPENCODE}/prompts"/*.txt; do
+# 2. Agents
+info "Syncing agents..."
+mkdir -p "${AGENT_DEST}"
+for f in "${V2_OPENCODE}/agent"/*.md; do
   [[ -f "$f" ]] || continue
-  cp "$f" "${PROMPTS_DEST}/"
-  ok "  prompt: ${f:t}"
+  cp "$f" "${AGENT_DEST}/"
+  ok "  agent: ${f:t}"
 done
 
 # 3. Merge JSON — write python to a temp file then run it
@@ -67,9 +67,8 @@ cat > "${TMPPY}" << 'PYEOF'
 import sys, json, re
 from pathlib import Path
 
-global_path  = Path(sys.argv[1])
-v2_path      = Path(sys.argv[2])
-prompts_dest = Path(sys.argv[3])
+global_path = Path(sys.argv[1])
+v2_path     = Path(sys.argv[2])
 
 def load_jsonc(path):
     """Load JSON that may contain trailing commas (JSONC/JSON5 style)."""
@@ -82,32 +81,12 @@ with open(global_path) as f:
     gcfg = json.load(f)
 v2cfg = load_jsonc(v2_path)
 
-def rewrite_prompt(val, dest):
-    if not isinstance(val, str):
-        return val
-    m = re.match(r'^\{file:(.+)\}$', val)
-    if not m:
-        return val
-    filename = Path(m.group(1)).name
-    return '{file:' + str(dest / filename) + '}'
-
-def rewrite_agent(agent, dest):
-    a = dict(agent)
-    if 'prompt' in a:
-        a['prompt'] = rewrite_prompt(a['prompt'], dest)
-    return a
-
-gcfg.setdefault('agent', {})
-gcfg.setdefault('mcp', {})
 gcfg.setdefault('provider', {})
+gcfg.setdefault('mcp', {})
 
 for name, cfg in v2cfg.get('provider', {}).items():
     gcfg['provider'][name] = cfg
     print(f"  provider: {name}")
-
-for name, cfg in v2cfg.get('agent', {}).items():
-    gcfg['agent'][name] = rewrite_agent(cfg, prompts_dest)
-    print(f"  agent: {name}  prompt={gcfg['agent'][name].get('prompt','')}")
 
 for name, cfg in v2cfg.get('mcp', {}).items():
     gcfg['mcp'][name] = cfg
@@ -118,21 +97,21 @@ with open(global_path, 'w') as f:
     f.write('\n')
 PYEOF
 
-info "Merging opencode.json..."
+info "Merging opencode.json (provider + mcp only)..."
 BACKUP="${GLOBAL_JSON}.bak.$(date +%Y%m%d_%H%M%S)"
 cp "${GLOBAL_JSON}" "${BACKUP}"
 ok "  backed up to ${BACKUP:t}"
 
-python3 "${TMPPY}" "${GLOBAL_JSON}" "${V2_JSON}" "${PROMPTS_DEST}"
+python3 "${TMPPY}" "${GLOBAL_JSON}" "${V2_JSON}"
 
 ok "  wrote ${GLOBAL_JSON}"
 
 print ""
 ok "Done."
 print ""
-print "  Skills  : ${SKILLS_DEST}"
-print "  Prompts : ${PROMPTS_DEST}"
-print "  Config  : ${GLOBAL_JSON}"
+print "  Skills : ${SKILLS_DEST}"
+print "  Agents : ${AGENT_DEST}"
+print "  Config : ${GLOBAL_JSON}"
 print ""
 print "Restart opencode from any directory to pick up the changes."
 print "The amp MCP server must be running on localhost:8000."

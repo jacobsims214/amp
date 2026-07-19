@@ -913,7 +913,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, errorf("q query param required"), 400)
 			return
 		}
-		results, err := h.kb.Search(r.Context(), projectID, q, nil, 10)
+		results, err := h.kb.Search(r.Context(), projectID, q, nil, 10, 0, 0)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -927,6 +927,34 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, map[string]interface{}{"tags": tags})
+
+	case "annotate":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Path   string `json:"path"`
+			Text   string `json:"text"`
+			Author string `json:"author"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		if body.Path == "" || body.Text == "" {
+			jsonErr(w, errorf("path and text are required"), 400)
+			return
+		}
+		if body.Author == "" {
+			body.Author = "user"
+		}
+		ann, err := h.kb.AnnotateDoc(r.Context(), projectID, body.Path, body.Text, body.Author)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		jsonOK(w, ann)
 
 	default:
 		http.NotFound(w, r)

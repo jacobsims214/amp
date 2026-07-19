@@ -10,6 +10,21 @@ Do not load skills you don't need. Skills cost context — use them purposefully
 
 ---
 
+## Agents (snapshot — always confirm against your live `task` tool context)
+
+These are the agents currently defined under `.opencode/agent/*.md`. This list is for onboarding
+context only — when actually picking who to dispatch, read the live list from your own `task`
+tool description, since the roster can change after this doc was last updated.
+
+- **amp-manager** (primary) — plans work, builds the board via AMP MCP, dispatches specialist subagents; never edits project code, runs builds, or fetches the web itself
+- **amp-worker-backend** (subagent) — Go, chi/pgx, Docker, Terraform/TFE, backend tests
+- **amp-worker-frontend** (subagent) — React, TypeScript, Tailwind, frontend tests
+- **amp-worker-docs** (subagent) — git commits/PRs, KB writes, markdown docs, config-only edits
+- **amp-reviewer** (subagent) — wave checks and full code reviews, never original implementation
+- **amp-researcher** (subagent) — read-only investigation, dispatched by the manager to answer a question before planning
+
+---
+
 ## Skills
 
 **amp-init**
@@ -22,7 +37,15 @@ Covers: the full planning protocol, task hierarchy, DAG dependencies, dispatch, 
 
 **amp-execution**
 Use when executing an assigned task as a worker agent.
-Covers: reading a ticket, logging progress, writing to the KB, completing a task.
+Covers: reading a ticket, logging progress, writing to the KB, completing a task. Does not cover reviewer protocol — see amp-review for that.
+
+**amp-review**
+Use when your task name contains "check", "review", or "Code Review:".
+Covers: wave check vs full code review distinction, the fix-task template, rules for creating fix tasks instead of failing.
+
+**amp-agent-builder**
+Use when the existing agent/skill roster doesn't fit a new domain, or an existing specialist is underperforming. Manager-only.
+Covers: agent-file frontmatter shape, steps sizing, model-selection heuristic, registering new skills, the restart-required caveat.
 
 **amp-kb**
 Use when you need to search or write to the project knowledge base.
@@ -30,7 +53,7 @@ Covers: search strategy, create vs update rules, writing content that embeds wel
 
 **amp-mcp**
 Use when you need the exact tool names, arguments, or return shapes for AMP MCP calls.
-Covers: full tool reference for projects, epics, stories, tasks, KB, and DAG rules.
+Covers: full tool list by area, task scheduling (start_at), and key argument types.
 
 **code-reviewer**
 Use when reviewing Go, TypeScript/React, Dockerfile, or Terraform code changes.

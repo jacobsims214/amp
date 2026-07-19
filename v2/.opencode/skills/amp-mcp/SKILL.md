@@ -10,123 +10,37 @@ All tools are on the `amp` MCP server (http://localhost:8000/sse).
 **This is the authoritative tool list. Do not call tools that are not listed here.**
 If you need a capability that is not listed, say so — do not invent tool names.
 
----
-
-## Projects
-
-- `amp_create_project` {name, code, description?} → project with id
-- `amp_list_projects` → `{projects: [...]}`
-- `amp_get_project` {project_id} → `{project: {...}}`
-- `amp_reset_project` {project_id} → deletes ALL epics/stories/tasks, keeps project — **destructive**
+**Your tool descriptions already tell you the mechanics** (required args, hierarchy rules,
+state-transition behavior) — you see them every time you call a tool. This doc exists for the
+facts that are NOT obvious from a single tool call: the full tool list, argument types, and the
+one feature with no obvious entry point — scheduling.
 
 ---
 
-## Epics
+## Full tool list by area
 
-- `amp_create_epic` {project_id, name, description?, priority?} → epic with id
-- `amp_list_epics` {project_id} → `{epics: [...]}`
-- `amp_get_epic` {epic_id} → `{epic: {...}}`
-- `amp_delete_epic` {epic_id} → deletes epic + all its stories and tasks (cascades) — **destructive**
-
----
-
-## Stories
-
-- `amp_create_story` {project_id, epic_id, name, description?, acceptance_criteria?, priority?} → story with id
-  - `epic_id` is **REQUIRED** — the API rejects stories without a parent epic
-  - The epic must belong to the same project
-- `amp_list_stories` {epic_id} → `{stories: [...]}`
-- `amp_list_project_stories` {project_id} → `{stories: [...], count: N}` — all stories across all epics
-- `amp_get_story` {story_id} → `{story: {...}}`
+- **Projects**: `amp_create_project`, `amp_list_projects`, `amp_get_project`, `amp_reset_project` (destructive), `amp_export_project`, `amp_import_project`, `amp_archive_project`, `amp_restore_project`
+- **Epics**: `amp_create_epic`, `amp_list_epics`, `amp_get_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
+- **Stories**: `amp_create_story`, `amp_list_stories`, `amp_list_project_stories`, `amp_get_story`, `amp_update_story`
+- **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`
+- **Knowledge base**: `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex` — see `amp-kb` skill for how to use these well
 
 ---
 
-## Tasks
+## Scheduling — the one feature with no obvious entry point
 
-- `amp_create_task` {project_id, epic_id, story_id, name, description, acceptance_criteria, assigned_to, priority?, dependency_ids?} → task with id
-  - `epic_id` is **REQUIRED** — tasks must belong to an epic
-  - `story_id` is **REQUIRED** — tasks must belong to a story
-  - `epic_id` must match the story's epic — the API rejects mismatches
-  - `assigned_to` is **REQUIRED** — set at planning time who should work this task (e.g. "amp-worker")
-  - State is **derived automatically**: no deps → `backlog`, any incomplete dep → `blocked`
-  - Never set state yourself
+Tasks can be held until a future time instead of sitting in the backlog:
 
-- `amp_list_tasks` {project_id, state?} → `{ready_to_dispatch: [...], in_progress: [...], blocked: [...], completed: [...], count: N}`
-  - `ready_to_dispatch` = all tasks in `backlog` state. **Dispatch all of these immediately.**
-  - `blocked[].blocked_by_ids` = exactly which task IDs are still in the way
+- `amp_create_task` accepts an optional `start_at` (ISO 8601 datetime). The task is created
+  `blocked` until that time, then auto-unblocks — same mechanism as a dependency, but time-based
+  instead of task-based.
+- `amp_set_task_start_at` {task_id, start_at?} — set or clear the schedule on an existing task.
+  Omit `start_at` to clear it.
+- `amp_list_tasks` returns a separate `scheduled` bucket for tasks waiting on their start time —
+  distinct from `blocked` (which is waiting on dependencies) and `ready_to_dispatch`.
 
-- `amp_get_task` {task_id} → `{task: {...}}`
-  - Returns: id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority, assigned_to, dependency_ids, blocked_by_ids, agent_id, dispatched_at, completed_at
-
-- `amp_update_task` {task_id, name?, description?, assigned_to?, agent_id?}
-  - Use `assigned_to` to correct a planned assignment before dispatch
-  - Use `agent_id` only at dispatch time (system sets this automatically via amp_dispatch_task)
-
-- `amp_dispatch_task` {task_id, agent_id}
-  - Sets state=in_progress. **Returns error if task is blocked** — includes which dep IDs are incomplete.
-
-- `amp_complete_task` {task_id}
-  - Sets state=completed. **Auto-unblocks** any tasks that were waiting on this one.
-
-- `amp_block_task` {task_id, reason}
-  - Manually blocks a task with a reason.
-
-- `amp_set_task_state` {task_id, state, reason?}
-  - Manager escape hatch: override state directly.
-  - Use when: re-opening a completed task, resetting a crashed in_progress task back to backlog.
-  - Valid states: `backlog`, `in_progress`, `completed`, `blocked`
-  - Logs the override to the task's activity log.
-
-- `amp_delete_task` {task_id} → deletes a single task — use to remove planning mistakes
-
-- `amp_add_task_comment` {task_id, body, author?}
-  - Appends to the ticket log. Permanent. Used by workers to report progress.
-
-- `amp_get_task_comments` {task_id} → `{comments: [...]}`
-
-- `amp_get_ticket_history` {task_id} → `{task: {...}, history: [...], count: N}`
-  - Returns the full activity log in chronological order.
-  - Each entry: actor, action, from_state, to_state, detail, created_at
-  - Actions: `created`, `dispatched`, `completed`, `blocked`, `unblocked`, `state_change`, `comment`
-
----
-
-## Task states
-
-| state | meaning | how it gets there |
-|-------|---------|------------------|
-| `backlog` | Ready to dispatch | created with no deps, or all deps just completed |
-| `in_progress` | Agent working it | `amp_dispatch_task` |
-| `completed` | Done | `amp_complete_task` |
-| `blocked` | Waiting on dependencies | created with `dependency_ids` (auto), or `amp_block_task` |
-
----
-
-## DAG rules
-
-1. Task created with `dependency_ids` → **automatically set to `blocked`**
-2. All dependencies reach `completed` → **automatically moved to `backlog`**
-3. `amp_dispatch_task` on a blocked task → **error listing which dep IDs are incomplete**
-4. `amp_complete_task` → scans all blocked tasks, unblocks any whose deps are now all met
-
-No manual state management needed. The system handles all transitions automatically.
-
----
-
-## Hierarchy enforcement
-
-```
-project_id must exist
-  ↓
-epic must belong to that project
-  ↓
-story must belong to that epic (and project)
-  ↓
-task must reference both epic and story (and they must match)
-```
-
-`dependency_ids` reference task IDs from **any** epic or story — cross-boundary
-dependencies are normal and expected.
+Use this for genuinely time-gated work (e.g. "don't touch this until the migration window
+opens") — not as a substitute for `dependency_ids` when the real gate is another task finishing.
 
 ---
 
@@ -135,4 +49,5 @@ dependencies are normal and expected.
 - `project_id`, `task_id`, `epic_id`, `story_id` — integers
 - `priority` — `"0"`=low, `"1"`=normal (default), `"2"`=high, `"3"`=critical
 - `dependency_ids` — array of integer task IDs (can span epics and stories)
-- `assigned_to` — free text string, e.g. `"amp-worker"` or `"amp-worker-frontend"`
+- `start_at` — ISO 8601 datetime string, e.g. `"2026-08-01T09:00:00Z"`
+- `assigned_to` — free text string matching a live agent name, e.g. `"amp-worker-backend"`

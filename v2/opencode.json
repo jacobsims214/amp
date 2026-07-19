@@ -1,5 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
+  "default_agent": "amp-manager",
   "provider": {
     "LlamaBarn": {
       "npm": "@ai-sdk/openai-compatible",
@@ -14,38 +15,15 @@
       }
     }
   },
-  "agent": {
-    "amp-manager": {
-      "mode": "primary",
-      "description": "AMP manager — plans work, creates the full project hierarchy, dispatches workers, monitors progress",
-      "prompt": "{file:./.opencode/prompts/amp-manager.txt}",
-      "model": "openrouter/anthropic/claude-sonnet-4.6",
-      "temperature": 0.2,
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "webfetch": "allow"
-      }
-    },
-    "amp-worker": {
-      "mode": "subagent",
-      "hidden": true,
-      "description": "AMP worker — executes a single assigned task end-to-end, logs all progress to the ticket via MCP",
-      "prompt": "{file:./.opencode/prompts/amp-worker.txt}",
-      "model": "openrouter/deepseek/deepseek-v4-pro",
-      "temperature": 0.1,
-      "permission": {
-        "edit": "allow",
-        "bash": "allow",
-        "webfetch": "allow"
-      }
-    }
-  },
   "mcp": {
     "amp": {
       "type": "remote",
       "url": "http://localhost:8000/sse",
       "enabled": true
+    },
+    "chrome-devtools": {
+      "type": "local",
+      "command": ["npx", "-y", "chrome-devtools-mcp@latest"]
     }
   }
 }

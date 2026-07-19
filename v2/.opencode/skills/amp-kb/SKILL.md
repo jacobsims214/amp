@@ -43,6 +43,52 @@ amp_kb_search(project_id=2, query="actor state machine task lifecycle")
 
 ---
 
+## Recency Awareness
+
+When using `amp_kb_search`, always check the `updated_at` timestamp on search results to
+assess recency. For time-sensitive information (e.g., architecture decisions, operational
+procedures, API contracts), outdated docs can lead to mistakes.
+
+### Search parameters for recency control
+
+The `amp_kb_search` tool supports two optional parameters:
+
+- `recency_boost` (float, default 1.0): Multiplier that increases the weight of recency
+  in the hybrid search ranking. Higher values prioritize newer documents. Range: 0.0–5.0.
+- `min_recency_days` (int, default 0): Filters results to documents updated within the
+  specified number of days. Use this for time-sensitive queries where stale information
+  is unacceptable.
+
+### RecencyLabel values
+
+Search results include a `recency_label` field with one of these values:
+
+| Label | Meaning |
+|-------|---------|
+| `recent` | Updated within the last 7 days |
+| `month` | Updated within the last 30 days |
+| `quarter` | Updated within the last 90 days |
+| `old` | Updated more than 90 days ago |
+| `unknown` | No `updated_at` timestamp available |
+
+### Recommendation for time-sensitive info
+
+For queries about architecture, deployment, APIs, or procedures that may have changed:
+
+```
+amp_kb_search(
+  project_id=PROJECT_ID,
+  query="database connection pool configuration",
+  min_recency_days=30
+)
+```
+
+Set `min_recency_days=30` as a baseline for time-sensitive topics. Increase to 7 or 14
+for rapidly changing systems, or use `recency_boost=2.0` without a hard filter when you
+want newer docs ranked higher but still allow older context.
+
+---
+
 ## Rule 2: Tags are MANDATORY — pick them before you write
 
 **Every `amp_kb_write` call must include 3–6 tags. No exceptions.**
@@ -110,30 +156,11 @@ amp_kb_write(..., tags=existing.tags + ["new-tag-if-needed"])
 
 ---
 
-## Rule 3: Create or update — always check first
+## Rule 3: Create or update — the decision criteria
 
-Before writing any KB doc, **decide whether to create or update**.
-Prefer updating over creating. Fragmented docs on the same topic hurt search quality —
-a single well-maintained doc on auth is far more useful than four partial ones.
-
-### The decision flow
-
-```
-1. Decide what you want to document (topic, category)
-
-2. Search for existing docs on this topic:
-   amp_kb_search(project_id=ID, query="<topic>")
-   amp_kb_list(project_id=ID, tag="<relevant-tag>")
-
-3. If a relevant doc exists at a known path:
-   amp_kb_get(project_id=ID, path="architecture/auth.md")
-   → Read the full content
-   → Merge: keep everything good, add your new information, fix anything wrong
-   → Write back the complete merged content to the SAME path
-
-4. If no relevant doc exists:
-   → Create a new one at the appropriate path
-```
+Your `amp_kb_write` tool description already tells you to check for an existing doc first and
+prefer updating. What it doesn't tell you is *how to decide* which path applies, and *how to
+merge* without losing content — that's this rule.
 
 **Update when:**
 - The topic already has a doc (same path or clearly the same subject)
@@ -148,25 +175,19 @@ a single well-maintained doc on auth is far more useful than four partial ones.
 
 ### How to merge correctly
 
-When updating, `amp_kb_write` **fully replaces** the document. You must include ALL
-the existing content plus your additions. Do not drop anything from the existing doc.
+`amp_kb_write` **fully replaces** the document at that path. When updating, read the full
+existing content first, then write back everything good from it plus your additions plus any
+corrections — never drop existing content just because you didn't touch that part:
 
 ```
 existing = amp_kb_get(project_id=ID, path="architecture/auth.md")
-
-# Read the full existing content
-# Write a new version that includes:
-#   - Everything from existing.content (unchanged where still correct)
-#   - Your new findings added to the right section
-#   - Any corrections to things that were wrong
-#   - Existing tags PLUS any new ones you need
 
 amp_kb_write(
   project_id=ID,
   path="architecture/auth.md",    ← SAME path = update
   title=existing.title,           ← keep or improve the title
-  content="[full merged content]",
-  tags=existing.tags + ["new-tag"],
+  content="[everything from existing.content, plus your new findings, plus any corrections]",
+  tags=existing.tags + ["new-tag-if-needed"],
   author="amp-worker"
 )
 ```
@@ -184,102 +205,52 @@ Write or update a KB doc when you:
 
 ## Rule 4: How to write content that embeds well
 
-This is the most important rule. **The embedding model converts your prose into a
-vector. Sparse, code-heavy docs produce weak vectors. Dense, specific prose produces
-strong vectors that surface on relevant queries.**
+This is the most important rule. **The embedding model converts your prose into a vector.
+Sparse, code-heavy docs produce weak vectors. Dense, specific prose produces strong vectors that
+surface on relevant queries.**
 
 ### Write in natural language paragraphs, not just bullet lists
 
-The model was trained on prose. It extracts meaning from complete sentences.
+The model was trained on prose — it extracts meaning from complete sentences, not fragments.
 
-**Weak embedding** — the model gets almost nothing to work with:
-```
-# Auth System
-- Uses JWT
-- Tokens expire in 24h  
-- See internal/handler/auth.go
-```
+**Weak:** `- Uses JWT\n- Tokens expire in 24h\n- See internal/handler/auth.go`
 
-**Strong embedding** — the model understands the concept and all its related terms:
-```
-# Auth System
+**Strong:** "The authentication system uses JSON Web Tokens (JWT) with RS256 signing. When a
+user logs in via POST /auth/login, the server validates their credentials, generates a signed
+JWT containing the user ID and roles, and returns it as a bearer token that expires after 24
+hours. RS256 was chosen over HS256 so the public key can be distributed to downstream services
+for verification without sharing the signing secret."
 
-The authentication system uses JSON Web Tokens (JWT) with RS256 signing. When a user
-logs in via POST /auth/login, the server validates their credentials against the users
-table, generates a signed JWT containing the user ID and roles, and returns it as a
-bearer token. The token expires after 24 hours. All protected routes check for a valid
-Authorization: Bearer header via the auth middleware in internal/handler/auth.go.
-
-The decision to use RS256 over HS256 was made so the public key can be distributed to
-downstream services for verification without sharing the signing secret. The private key
-is loaded from the SIGNING_KEY environment variable at startup.
-```
-
-The second version will surface on queries like: "how does login work", "JWT token
-validation", "bearer token auth", "RS256 vs HS256", "protected routes middleware" —
-none of which appear verbatim in the doc.
-
-### Name the concepts explicitly, then explain them
-
-The model connects synonyms when concepts are named clearly. Say the thing, then
-explain it:
-
-```
-The actor model (also called the message-passing concurrency model) is the core
-concurrency primitive in this system. Each actor is a goroutine with a private
-mailbox channel. Actors never share memory — they communicate only by sending
-immutable messages to each other's mailboxes.
-```
-
-This single paragraph will match: "goroutine channels", "concurrency model", "message
-passing", "immutable state", "mailbox pattern", "Go actor pattern" — all by semantic
-proximity, not keyword match.
+The strong version surfaces on "how does login work," "JWT validation," "RS256 vs HS256" — none
+of which appear verbatim. Naming a concept and then explaining it lets the model connect
+synonyms: calling out "the actor model (also called message-passing concurrency)" before
+describing it will match "goroutine channels," "mailbox pattern," and "Go actor pattern" alike.
 
 ### State decisions AND the reasoning behind them
 
-The reasoning is often what future agents are searching for:
-
-```
-We chose pgvector over a dedicated vector database (Qdrant, Weaviate) because:
-1. The project already uses PostgreSQL — no new service to operate
-2. At fewer than 10,000 documents per project, query latency is under 5ms
-3. Migrations and schema changes stay in one place
-
-The tradeoff is that at very large scale (100k+ documents) a dedicated vector DB
-would offer better ANN index performance. This can be reconsidered if needed.
-```
-
-A future agent asking "why not use Qdrant" or "when should we switch vector databases"
-will find this document.
+The reasoning is often what future agents search for. Don't just record "we use pgvector" —
+record why (already run PostgreSQL, sub-5ms latency under 10k docs, one less service to operate)
+and the tradeoff being accepted (a dedicated vector DB would win at 100k+ docs). A future agent
+asking "why not Qdrant" finds this because the reasoning, not just the choice, is written down.
 
 ### Include the specific symbols that will be searched
 
-After the explanatory prose, include the concrete details:
+After the explanatory prose, list concrete references — file paths, function names, type names —
+so the keyword layer of hybrid search can match them too:
 
 ```
 Key files:
 - internal/kb/service.go — KB business logic, WriteDoc, Search
-- internal/kb/service.go:collectionHasEmbedding — checks if semantic search is active
-
 Key types:
 - kb.Service — main KB service, holds Typesense client
-- kb.Doc — full document with content field
-- kb.SearchResult — search hit with excerpt and score
 ```
-
-These exact identifiers (file paths, function names, type names) are still matched by
-the keyword layer of the hybrid search.
 
 ### One concept per document
 
-Documents are chunked at ~500 tokens. If a single doc covers five unrelated topics,
-each chunk will embed as a confused mixture. Write focused documents:
-
-- `architecture/auth.md` — just about authentication
-- `architecture/actors.md` — just about the actor model
-- `decisions/001-pgvector-vs-qdrant.md` — just about that one decision
-
-A focused 300-word doc embeds better than a sprawling 2000-word doc.
+Documents are chunked at ~500 tokens. A doc covering five unrelated topics embeds each chunk as
+a confused mixture. Keep one focused doc per concept — `architecture/auth.md` is just auth,
+`decisions/001-pgvector-vs-qdrant.md` is just that one decision. A focused 300-word doc embeds
+better than a sprawling 2000-word one.
 
 ---
 
@@ -327,27 +298,49 @@ feed the keyword layer of hybrid search.]
 | `discoveries/<topic>.md` | Findings from exploration, surprises |
 | `apis/<service>.md` | API shapes, endpoint contracts |
 
-## Path naming conventions
-
-| Category | Path pattern | When to use |
-|----------|-------------|-------------|
-| `architecture/<topic>.md` | How a component works, system design |
-| `decisions/<NNN>-<topic>.md` | Why a decision was made, ADRs |
-| `how-to/<topic>.md` | Step-by-step operational guides |
-| `discoveries/<topic>.md` | Findings from exploration, surprises |
-| `apis/<service>.md` | API shapes, endpoint contracts |
-
 ---
+
+## Annotations
+
+Use annotations to add context or corrections to existing KB docs without rewriting them entirely.
+
+### When to annotate vs. rewrite
+
+- **Annotate when** you find a small error, outdated detail, or missing context that doesn't change the core meaning of the doc
+- **Rewrite when** the doc is fundamentally wrong or more than 50% incorrect — in that case, update the full document with `amp_kb_write`
+
+### How to annotate
+
+```
+amp_kb_annotate(project_id, path, text, author?)
+```
+
+- `project_id` — project ID
+- `path` — document path (e.g., `architecture/auth.md`)
+- `text` — the annotation content (markdown allowed)
+- `author` — optional, defaults to 'agent'
+
+### What agents see
+
+- Annotations are returned in `amp_kb_get` responses (as `annotations` array)
+- `amp_kb_search` results include `annotation_count` and `latest_annotation` fields
+- Agents see the annotation when reading a doc or browsing search results
+
+### Annotation lifecycle
+
+- Each annotation has an `IsResolved` field (default: `false`)
+- Curators mark annotations as resolved when the information has been integrated into the KB
+- Resolved annotations remain in the record but are marked as completed
 
 ## MCP tool reference
 
 ```
 amp_kb_search {project_id, query, tags?, limit?}
-  → {results: [{path, title, excerpt, tags, score}]}
+  → {results: [{path, title, excerpt, tags, score, annotation_count, latest_annotation}]}
   Use natural language queries. The model understands concepts.
 
 amp_kb_get {project_id, path}
-  → full doc with content field (full markdown)
+  → full doc with content field (full markdown), annotations array
   Read this before touching related code.
 
 amp_kb_write {project_id, path, title, content, tags, author?}
@@ -364,4 +357,7 @@ amp_kb_tags {project_id}
 
 amp_kb_reindex {project_id}
   → re-embeds all docs (use if Ollama model was changed)
+
+amp_kb_annotate {project_id, path, text, author?}
+  → adds an annotation to the document
 ```
