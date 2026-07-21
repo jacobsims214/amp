@@ -245,6 +245,7 @@ func (s *Service) WriteDoc(ctx context.Context, projectID int, path, title, cont
 			"updated_at":        now,
 			"annotation_count":  0,
 			"latest_annotation": "",
+			"annotations":       "[]",
 		}
 		// Only store the full content on the first chunk.
 		if i == 0 {
@@ -303,6 +304,8 @@ func (s *Service) AnnotateDoc(ctx context.Context, projectID int, path, text, au
 	doc.Annotations = append(doc.Annotations, *ann)
 
 	col := collectionName(projectID)
+	// Marshal annotations to JSON string for Typesense schema compliance
+	annJSON, _ := json.Marshal(doc.Annotations)
 	_, err = s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
 		"id":                doc.ID,
 		"project_id":        doc.ProjectID,
@@ -314,7 +317,7 @@ func (s *Service) AnnotateDoc(ctx context.Context, projectID int, path, text, au
 		"chunk_index":       0,
 		"chunk_text":        doc.ChunkText,
 		"updated_at":        doc.UpdatedAt,
-		"annotations":       doc.Annotations,
+		"annotations":       string(annJSON),
 		"annotation_count":  len(doc.Annotations),
 		"latest_annotation": getLatestAnnotation(doc.Annotations),
 	}, &api.DocumentIndexParameters{})

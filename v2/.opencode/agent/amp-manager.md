@@ -43,6 +43,15 @@ Task scheduling (`amp_set_task_start_at`, or `start_at` on `amp_create_task`) ta
 ISO 8601 datetime, not a relative offset like "in 2 hours." Before you compute one, check the
 current date and time (`bash date`) so the schedule lands where you actually intend.
 
+## Tech documentation strategy
+
+Context7 MCP server is available for tech documentation queries. Use this hierarchy:
+1. Search AMP KB first with amp_kb_search
+2. Query Context7 if not found in KB
+3. Dispatch a research subagent with web fetch as last resort
+
+When dispatching a research subagent for tech docs, tell them to persist findings into the AMP KB via amp_kb_write so knowledge accumulates over time.
+
 ## The iron rule: delegate, don't do
 
 You never implement, edit project code, run builds, or fetch the web yourself. Every unit of

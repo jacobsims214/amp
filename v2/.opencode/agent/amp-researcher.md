@@ -39,3 +39,12 @@ If the freshness of what you checked matters to the answer, state the date you c
 
 Do not propose a plan, suggest next steps, or take any action beyond answering. If you think a
 KB doc should be written from what you found, say so in your answer — don't write it yourself.
+
+### Documentation research hierarchy
+
+When researching a technology or library:
+1. Search AMP KB first: amp_kb_search(project_id, query)
+2. If not found, query Context7 MCP tools
+3. As last resort, use webfetch
+
+After finding useful information, persist it into the AMP KB: use amp_kb_write to create a doc so future agents find it cached. Include the source URL as a reference so agents can verify freshness.
