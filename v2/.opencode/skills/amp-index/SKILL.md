@@ -82,3 +82,17 @@ Covers: table-driven tests, testify assertions, interface mocking, RTL query pri
 **tfe-manager**
 Use when creating, configuring, or investigating Terraform Cloud/Enterprise workspaces.
 Covers: workspace lifecycle, variable sets, run types, run investigation, VCS integration.
+
+**github-research**
+Use when researching GitHub repos, searching code/issues/PRs, cross-referencing data, or investigating CI/workflow status across repos. Covers: gh CLI search/view commands, jq/fzf/delta companion tools, gh api REST+GraphQL.
+
+**github-pr-review**
+Use when performing a full in-depth code review on a GitHub PR — fetching diffs, checking CI, posting line-level comments, approving or requesting changes. Covers: gh pr diff/view/checks/review commands, delta diff viewing, review state management.
+
+Base directory for this skill: /Users/jacobsims/.config/opencode/skills/amp-index
+Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.
+Note: file list is sampled.
+
+<skill_files>
+
+</skill_files>

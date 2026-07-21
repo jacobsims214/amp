@@ -332,6 +332,15 @@ amp_kb_annotate(project_id, path, text, author?)
 - Curators mark annotations as resolved when the information has been integrated into the KB
 - Resolved annotations remain in the record but are marked as completed
 
+## Knowledge Discovery
+
+When researching a technology, use this hierarchy:
+1. Search the KB first with amp_kb_search
+2. Query Context7 MCP tools if not found
+3. Web fetch as last resort
+
+After finding useful information from Context7, persist it: write a KB doc with amp_kb_write including the source URL as a reference. This caches the knowledge so future agents find it in the KB instead of querying Context7 again.
+
 ## MCP tool reference
 
 ```

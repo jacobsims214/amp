@@ -48,3 +48,5 @@ above and follow that protocol. If you find a small error or outdated detail in 
 
 Follow `amp-execution`'s steps to the letter: post progress comments as you work, verify every
 acceptance criterion, post a completion summary, then call `amp_complete_task`.
+
+After finding useful tech documentation from Context7 or research, write a KB doc with `amp_kb_write` so the knowledge is cached for future agents. Include the source URL as a reference.
