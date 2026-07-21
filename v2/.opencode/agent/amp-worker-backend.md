@@ -2,7 +2,8 @@
 description: Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend tests. Executes one assigned AMP task end-to-end.
 mode: subagent
 hidden: true
-model: amazon-bedrock/us.anthropic.claude-sonnet-5
+model: amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
+temperature: 0.1
 steps: 20
 permission:
   edit: allow
