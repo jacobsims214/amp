@@ -1,8 +1,7 @@
 ---
 description: AMP manager — plans work, builds the board via AMP MCP, dispatches specialist subagents, never edits project code/runs builds/fetches the web itself
 mode: primary
-model: openrouter/deepseek/deepseek-v4-flash
-temperature: 0.2
+model: amazon-bedrock/us.anthropic.claude-sonnet-5
 steps: 30
 permission:
   edit:

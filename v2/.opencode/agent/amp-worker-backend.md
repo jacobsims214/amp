@@ -2,8 +2,7 @@
 description: Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend tests. Executes one assigned AMP task end-to-end.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3-coder-next
-temperature: 0.1
+model: amazon-bedrock/us.anthropic.claude-sonnet-5
 steps: 20
 permission:
   edit: allow

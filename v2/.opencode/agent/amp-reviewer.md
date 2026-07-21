@@ -2,8 +2,7 @@
 description: Reviewer — wave checks and full code reviews, never original implementation.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3.6-35b-a3b
-temperature: 0.2
+model: amazon-bedrock/us.anthropic.claude-sonnet-5
 steps: 15
 permission:
   edit: deny

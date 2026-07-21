@@ -2,7 +2,7 @@
 description: KB curator — prunes stale docs, merges duplicates, compacts annotations into doc content, reports KB health. Dispatched by the manager for KB maintenance.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3.5-9b
+model: amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
 temperature: 0.2
 steps: 20
 permission:
