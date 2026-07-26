@@ -18,7 +18,7 @@
   "mcp": {
     "amp": {
       "type": "remote",
-      "url": "http://localhost:8000/sse",
+      "url": "https://amp.simstech.cloud/mcp/sse",
       "enabled": true
     },
     "chrome-devtools": {

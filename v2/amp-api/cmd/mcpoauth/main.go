@@ -78,6 +78,10 @@ func main() {
 	mux.HandleFunc("/.well-known/oauth-protected-resource", s.protectedResourceMetadata)
 	// RFC 7591 — dynamic client registration.
 	mux.HandleFunc("/register", s.register)
+	// Thin redirect in front of Dex's real /auth — see authorize() for why
+	// this exists at all instead of pointing authorization_endpoint straight
+	// at Dex.
+	mux.HandleFunc("/authorize", s.authorize)
 
 	addr := envOrDefault("ADDR", ":8091")
 	httpSrv := &http.Server{Addr: addr, Handler: withCORS(mux)}
@@ -98,7 +102,7 @@ func main() {
 func (s *server) authServerMetadata(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{
 		"issuer":                                s.dexURL,
-		"authorization_endpoint":                s.dexURL + "/auth",
+		"authorization_endpoint":                s.selfURL + "/authorize",
 		"token_endpoint":                        s.dexURL + "/token",
 		"jwks_uri":                              s.dexURL + "/keys",
 		"registration_endpoint":                 s.selfURL + "/register",
@@ -109,6 +113,38 @@ func (s *server) authServerMetadata(w http.ResponseWriter, r *http.Request) {
 		"code_challenge_methods_supported":      []string{"S256"},
 		"revocation_endpoint":                   s.dexURL + "/token/revoke",
 	})
+}
+
+// authorize is a pure redirect in front of Dex's real /auth endpoint. It
+// exists for exactly one reason: Dex is an OIDC-only provider and rejects
+// any authorization request that doesn't include the "openid" scope — but
+// the MCP OAuth spec (RFC 8707 resource indicators, not OIDC) doesn't
+// require clients to request "openid" at all, since they only need a
+// resource-scoped access token, not an ID token. Standards-compliant MCP
+// clients (opencode, Claude Code, etc.) therefore omit it, and Dex's /auth
+// would 400 with "Missing required scope(s) [\"openid\"]" if we pointed
+// authorization_endpoint straight at Dex. This handler force-injects
+// "openid" into whatever scope the client requested and 302s to Dex's real
+// endpoint — Dex still does all the actual PKCE/consent/token work, this
+// never touches a code, token, or secret.
+func (s *server) authorize(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+
+	scopes := strings.Fields(q.Get("scope"))
+	hasOpenID := false
+	for _, sc := range scopes {
+		if sc == "openid" {
+			hasOpenID = true
+			break
+		}
+	}
+	if !hasOpenID {
+		scopes = append([]string{"openid"}, scopes...)
+	}
+	q.Set("scope", strings.Join(scopes, " "))
+
+	target := s.dexURL + "/auth?" + q.Encode()
+	http.Redirect(w, r, target, http.StatusFound)
 }
 
 func (s *server) protectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
