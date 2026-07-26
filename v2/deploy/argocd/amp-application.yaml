@@ -26,7 +26,7 @@ spec:
         - values-production.yaml
       parameters:
         - name: global.imageTag
-          value: sha-763788d   # matches the completed build: https://github.com/jacobsims214/amp/actions/runs/30222365164
+          value: sha-6f5380a   # matches the completed build: https://github.com/jacobsims214/amp/actions
   destination:
     server: https://kubernetes.default.svc
     namespace: amp
