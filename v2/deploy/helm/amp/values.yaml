@@ -1,5 +1,5 @@
 ## AMP Helm chart — default values (local docker-desktop profile).
-## For the datacenter cluster, override via -f values-prod.yaml (see
+## For the datacenter cluster, override via -f values-production.yaml (see
 ## docs/deploy-architecture.md for the promotion checklist).
 
 global:
@@ -15,8 +15,14 @@ global:
     letsencrypt:
       email: "ops@example.com"
       dns01:
-        provider: ""        # e.g. "route53", "cloudflare" — wire the matching cert-manager solver block yourself in values-prod.yaml
+        provider: ""        # e.g. "route53", "cloudflare" — wire the matching cert-manager solver block yourself in values-production.yaml
   bootstrapAdminEmails: "admin@amp.local"
+  # Single override point for every amp-{api,ui,authadmin,mcpoauth} image tag
+  # at once — set via ArgoCD's Application `helm.parameters` (see
+  # deploy/argocd/amp-application.yaml) or --set global.imageTag=<tag> for
+  # manual deploys. Per-component *.tag values below still win if set
+  # explicitly (empty string means "defer to this").
+  imageTag: ""
 
 image:
   pullPolicy: IfNotPresent
@@ -90,7 +96,7 @@ envoy:
 typesense:
   image: typesense/typesense
   tag: "30.1"
-  apiKey: amp-local-dev   # override in values-prod.yaml / a Secret for real deployments
+  apiKey: amp-local-dev   # override in values-production.yaml / a Secret for real deployments
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: 500m, memory: 1Gi }

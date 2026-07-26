@@ -1,20 +1,35 @@
 ## AMP Helm chart — datacenter (Talos/Proxmox) production values.
 ##
-## Usage:
+## Deployed via ArgoCD as an Application pointing at this chart directory,
+## matching the existing `simstech-odoo`/`odoo-operator` convention in this
+## cluster — see deploy/argocd/amp-application.yaml for the reference
+## Application manifest (not applied automatically — review before
+## registering it in ArgoCD).
+##
+## Manual/dev-loop usage (bypassing ArgoCD):
 ##   helm upgrade --install amp . -n amp --create-namespace \
-##     -f values-prod.yaml \
-##     --set ampApi.tag=<git-sha> --set ui.tag=<git-sha> \
-##     --set authAdmin.tag=<git-sha> --set mcpOAuth.tag=<git-sha>
+##     -f values-production.yaml \
+##     --set global.imageTag=sha-<shortsha>
 ##
-## Pin every *.tag explicitly per deploy (the GitHub Actions workflow at
-## .github/workflows/build-images.yml tags every image with the short git
-## sha) — don't run prod on the floating "latest" tag long-term.
+## The GitHub Actions workflow (.github/workflows/build-images.yml) tags
+## every build as both `latest` and `sha-<shortsha>` — pin to the sha tag
+## for real deploys, don't run prod on a floating `latest` long-term.
 ##
-## Still needs your input before first deploy (see inline TODOs):
-##   - cnpg.storage.storageClassName / typesense.storage.storageClassName /
-##     ollama.storage.storageClassName — whatever StorageClass your
-##     Talos/Proxmox cluster exposes (Ceph/Rook, Proxmox CSI, Longhorn, etc.)
+## Verified against the live cluster (read-only exploration, nothing changed):
+##   - cert-manager and the CNPG operator are already installed cluster-wide
+##     (namespaces cert-manager, cnpg-system) — this chart does NOT install
+##     either operator, only CRs, so no conflict.
+##   - Storage: NFS-backed `nfs-storage` is the (and only) StorageClass,
+##     already used successfully by several 3-instance CNPG clusters in this
+##     cluster (immich-db, simstech-db, vault-postgres-cluster) — used below.
+##   - Cilium L2Announcement (`service-pool` IP pool, `service-policy`) is
+##     already handing out real routable VLAN IPs to LoadBalancer Services
+##     (argocd-server, immich, cilium-ingress, simstech-odoo-lb, etc.) — same
+##     mechanism Envoy's Service will use here.
+##
+## Still needs your input before first deploy:
 ##   - global.bootstrapAdminEmails — the real first-admin email
+##   - typesense.apiKey — still the local-dev default, see TODO below
 ##   - CNPG backups — deliberately NOT configured yet (see bottom of this
 ##     file). Do not consider this production-ready for real user data until
 ##     that's wired up.
@@ -41,6 +56,11 @@ global:
   # TODO: real first-admin email for this environment.
   bootstrapAdminEmails: "admin@simstech.cloud"
 
+  # Single override point for every amp-* image tag — set this via ArgoCD's
+  # Application `helm.parameters` (see deploy/argocd/amp-application.yaml),
+  # matching how odoo-operator's Application overrides `image.tag`.
+  imageTag: "latest"   # override per release, e.g. sha-763788d
+
 image:
   # Built + pushed by .github/workflows/build-images.yml on every push to
   # main / tag. Namespace matches env.IMAGE_NAMESPACE in that workflow.
@@ -48,28 +68,28 @@ image:
   pullPolicy: IfNotPresent
 
 ampApi:
-  tag: latest   # override per deploy: --set ampApi.tag=<git-sha>
+  tag: ""   # empty = use global.imageTag
   replicas: 2
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
 
 ui:
-  tag: latest
+  tag: ""
   replicas: 2
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }
 
 authAdmin:
-  tag: latest
+  tag: ""
   replicas: 1
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }
 
 mcpOAuth:
-  tag: latest
+  tag: ""
   replicas: 2
   resources:
     requests: { cpu: 50m, memory: 64Mi }
@@ -91,8 +111,9 @@ oauth2Proxy:
 envoy:
   replicas: 2
   service:
-    # Cilium L2Announcement/BGP hands this a real routable IP on your VLAN;
-    # your SSL gateway targets that IP on httpPort.
+    # Cilium L2Announcement hands this a real routable IP on the server VLAN
+    # from the `service-pool` pool — same mechanism argocd-server/immich/etc
+    # already use. Your SSL gateway targets that IP on httpPort.
     type: LoadBalancer
     httpPort: 80
   resources:
@@ -110,7 +131,7 @@ typesense:
     limits: { cpu: "1", memory: 2Gi }
   storage:
     size: 10Gi
-    storageClassName: ""   # TODO: set to your Talos/Proxmox StorageClass
+    storageClassName: nfs-storage
 
 ollama:
   resources:
@@ -118,13 +139,15 @@ ollama:
     limits: { cpu: "4", memory: 4Gi }
   storage:
     size: 10Gi
-    storageClassName: ""   # TODO: set to your Talos/Proxmox StorageClass
+    storageClassName: nfs-storage
 
 cnpg:
-  instances: 3   # HA — CNPG handles leader election + pod anti-affinity automatically
+  instances: 3   # HA — CNPG handles leader election + pod anti-affinity automatically.
+                 # nfs-storage is already proven at 3 instances elsewhere in this
+                 # cluster (immich-db, simstech-db, vault-postgres-cluster).
   storage:
     size: 20Gi
-    storageClassName: ""   # TODO: set to your Talos/Proxmox StorageClass
+    storageClassName: nfs-storage
   # TODO — CNPG backups are NOT configured. Before this touches real data,
   # add something like the following (requires an S3-compatible endpoint —
   # MinIO on Proxmox, real S3, Backblaze B2, etc.) to templates/cnpg-cluster.yaml:

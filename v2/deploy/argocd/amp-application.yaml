@@ -1,0 +1,38 @@
+# Reference ArgoCD Application manifest for AMP, matching this cluster's
+# existing convention (see `simstech-odoo` / `odoo-operator` Applications —
+# repoURL + chart path + named values file + a single `helm.parameters`
+# override for the image tag).
+#
+# NOT applied automatically. Review before registering:
+#   kubectl apply -f deploy/argocd/amp-application.yaml
+#
+# Bump releases by editing `helm.parameters[0].value` below (or via
+# `argocd app set amp -p global.imageTag=sha-<shortsha>`) to the sha tag
+# .github/workflows/build-images.yml just pushed, then let ArgoCD's
+# automated sync (or `argocd app sync amp`) roll it out.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: amp
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/jacobsims214/amp.git
+    targetRevision: main
+    path: v2/deploy/helm/amp
+    helm:
+      valueFiles:
+        - values-production.yaml
+      parameters:
+        - name: global.imageTag
+          value: sha-763788d   # matches the completed build: https://github.com/jacobsims214/amp/actions/runs/30222365164
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: amp
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true

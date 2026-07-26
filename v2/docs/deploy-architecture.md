@@ -75,7 +75,7 @@ table is just for role assignment + activity attribution inside amp-api.
 | Envoy TLS | terminates TLS itself (`https_listener`, cert-manager cert) | plain HTTP only (`http_listener`, no cert mounted) — see `templates/envoy-configmap.yaml` / `envoy.yaml`, both branch on `global.tls.enabled` |
 | Envoy reachability | Docker Desktop's built-in `kindccm` publishes the LoadBalancer Service directly on `localhost:443`/`:80` | Cilium L2Announcement/BGP hands the `LoadBalancer` Service a real routable IP on the server VLAN; the external SSL gateway targets that IP on port 80 |
 | Ollama | in-cluster (CPU) | in-cluster (CPU) — same, no GPU assumed |
-| Storage class | `hostpath`/docker-desktop default | cluster's real StorageClass (values override — not yet filled in, see `values-prod.yaml` TODOs) |
+| Storage class | `hostpath`/docker-desktop default | `nfs-storage` (the cluster's only StorageClass — see below) |
 | Images | built locally with `docker build`, loaded straight into containerd via `ctr images import` (no registry) | built + pushed to GHCR by `.github/workflows/build-images.yml`, pulled by `image.registry: ghcr.io/<owner>/amp` |
 | Ingress reachability | port-forward / Docker Desktop LoadBalancer | LoadBalancer IP on the VLAN, behind the existing Proxmox SSL gateway |
 
@@ -83,10 +83,19 @@ Note on the internal CA: regardless of `global.tls.enabled`, `templates/cert-iss
 
 ## Not yet production-ready
 
-- **CNPG backups are not configured.** `values-prod.yaml` has a commented-out `barmanObjectStore` block as a starting point — needs an S3-compatible endpoint (MinIO on Proxmox, real S3, B2, etc.) before this touches real user data.
-- **StorageClass names are empty placeholders** in `values-prod.yaml` for CNPG/Typesense/Ollama — fill in whatever your Talos/Proxmox cluster actually exposes (Ceph/Rook, Proxmox CSI, Longhorn, etc.).
-- **Typesense's API key is still the local-dev default** (`amp-local-dev`) in `values-prod.yaml` — needs a real generated secret before go-live.
-- **Image tags default to `latest`** in `values-prod.yaml` — pin explicitly per deploy (`--set ampApi.tag=<git-sha>` etc.) rather than running prod on a floating tag long-term. The GitHub Actions workflow tags every build with the short git sha already.
+- **CNPG backups are not configured.** `values-production.yaml` has a commented-out `barmanObjectStore` block as a starting point — needs an S3-compatible endpoint (MinIO on Proxmox, real S3, B2, etc.) before this touches real user data.
+- **Typesense's API key is still the local-dev default** (`amp-local-dev`) in `values-production.yaml` — needs a real generated secret before go-live.
+
+## Deploying to the datacenter cluster (Talos/Proxmox, GitOps via ArgoCD)
+
+Verified by read-only exploration of the live cluster (nothing was changed):
+
+- **cert-manager and the CloudNativePG operator are already installed cluster-wide** (`cert-manager`, `cnpg-system` namespaces) — this chart only ever creates `Issuer`/`Certificate`/`Cluster` CRs, never the operators themselves, so there's no conflict.
+- **Storage**: the cluster's only StorageClass is `nfs-storage` (NFS-backed), already running several healthy 3-instance CNPG clusters (`immich-db`, `simstech-db`, `vault-postgres-cluster`) — `values-production.yaml` uses it directly, no placeholder needed.
+- **Cilium L2Announcement** (`service-pool` IP pool, `service-policy`) already hands real routable VLAN IPs to `LoadBalancer` Services (`argocd-server`, `immich`, `simstech-odoo-lb`, etc.) — Envoy's Service uses the same mechanism, no extra wiring needed.
+- **Deploys go through ArgoCD**, not manual `helm install`, matching the existing `simstech-odoo`/`odoo-operator` Application pattern: `repoURL` + chart `path` + a named `values-production.yaml` + a single `helm.parameters` override for the image tag. See `deploy/argocd/amp-application.yaml` for the reference manifest (deliberately **not applied** — review and `kubectl apply` it yourself when ready).
+- **Image tag bumps**: every `amp-*` component falls back to a single `global.imageTag` value (empty per-component `tag:` fields mean "use it") specifically so a release is just one `helm.parameters` edit — `.github/workflows/build-images.yml` tags every build `sha-<shortsha>` (and `latest` on `main`) in `ghcr.io/jacobsims214/amp/*`.
+
 
 ## Open items / phase 2 (explicitly out of scope for this pass)
 
