@@ -197,3 +197,29 @@ export interface UpdateTaskRequest {
   priority?: string
   start_at?: string | null
 }
+
+// ---- Auth / users ----
+
+export interface Me {
+  subject: string
+  email: string
+  name: string
+  roles: string[]
+  user_id?: number
+}
+
+export interface AmpUser {
+  id: number
+  subject: string
+  email: string
+  display_name: string
+  roles: string[]
+  created_at: string
+  last_seen_at: string
+}
+
+export interface AuthAdminUser {
+  email: string
+  username: string
+}
+

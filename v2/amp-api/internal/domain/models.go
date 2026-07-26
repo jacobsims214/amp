@@ -262,3 +262,23 @@ type ExportKBDoc struct {
 	Tags    []string `json:"tags"`
 	Author  string   `json:"author"`
 }
+
+// ---- Auth / users ----
+
+// User is a JIT-provisioned identity, keyed off the Dex OIDC "sub" claim.
+// Dex remains the source of truth for credentials — this row exists purely
+// so amp-api can attribute activity and assign roles.
+type User struct {
+	ID          int       `json:"id"`
+	Subject     string    `json:"subject"`
+	Email       string    `json:"email"`
+	DisplayName string    `json:"display_name"`
+	Roles       []string  `json:"roles"`
+	CreatedAt   time.Time `json:"created_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
+}
+
+const (
+	RoleAdmin  = "admin"
+	RoleMember = "member"
+)

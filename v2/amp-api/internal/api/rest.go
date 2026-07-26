@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
+	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/kb"
@@ -60,6 +61,96 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
 	mux.Handle("/api/events", h.hub)
+	mux.HandleFunc("/api/me", h.me)
+	mux.HandleFunc("/api/users", h.users)
+	mux.HandleFunc("/api/users/", h.userSub)
+}
+
+// ---- /api/me ----
+// Returns the caller's identity as resolved by the auth middleware.
+// Always 200 — when auth is disabled (local dev) this returns the
+// anonymous "local-dev" identity so the UI doesn't need special-casing.
+func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
+	ident, ok := auth.FromContext(r.Context())
+	if !ok {
+		jsonErr(w, errorf("no identity on request"), 401)
+		return
+	}
+	resp := map[string]interface{}{
+		"subject": ident.Subject,
+		"email":   ident.Email,
+		"name":    ident.Name,
+		"roles":   []string{},
+	}
+	if ident.User != nil {
+		resp["roles"] = ident.User.Roles
+		resp["user_id"] = ident.User.ID
+	}
+	jsonOK(w, resp)
+}
+
+// ---- /api/users (admin only) ----
+
+func (h *RestHandler) users(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		auth.RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
+			users, err := h.repo.ListUsers(r.Context())
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"users": users})
+		})(w, r)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// /api/users/:id/role  { "role": "admin", "grant": true }
+func (h *RestHandler) userSub(w http.ResponseWriter, r *http.Request) {
+	parts := splitPath(r.URL.Path[len("/api/users/"):])
+	if len(parts) < 1 {
+		http.NotFound(w, r)
+		return
+	}
+	userID, err := strconv.Atoi(parts[0])
+	if err != nil {
+		jsonErr(w, errorf("invalid user id"), 400)
+		return
+	}
+
+	if len(parts) == 2 && parts[1] == "role" && r.Method == http.MethodPatch {
+		auth.RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
+			var body struct {
+				Role  string `json:"role"`
+				Grant bool   `json:"grant"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			if err := h.repo.SetUserRole(r.Context(), userID, body.Role, body.Grant); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"user_id": userID, "role": body.Role, "grant": body.Grant})
+		})(w, r)
+		return
+	}
+
+	if len(parts) == 1 && r.Method == http.MethodDelete {
+		auth.RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
+			if err := h.repo.DeleteUser(r.Context(), userID); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"deleted": userID})
+		})(w, r)
+		return
+	}
+
+	http.NotFound(w, r)
 }
 
 // ---- /api/projects ----

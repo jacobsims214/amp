@@ -1,0 +1,85 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: envoy
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "envoy" "Release" .Release) | nindent 4 }}
+spec:
+  replicas: {{ .Values.envoy.replicas }}
+  selector:
+    matchLabels:
+      app: envoy
+  template:
+    metadata:
+      labels:
+        app: envoy
+      annotations:
+        # Force a rollout whenever the config or cert changes.
+        checksum/config: {{ include (print $.Template.BasePath "/envoy-configmap.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: envoy
+          image: {{ .Values.envoy.image }}:{{ .Values.envoy.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["-c", "/etc/envoy/envoy.yaml"]
+          ports:
+            {{- if .Values.global.tls.enabled }}
+            - name: https
+              containerPort: 8443
+            {{- end }}
+            - name: http
+              containerPort: 8080
+            - name: admin
+              containerPort: 9901
+          volumeMounts:
+            - name: config
+              mountPath: /etc/envoy
+            {{- if .Values.global.tls.enabled }}
+            - name: tls
+              mountPath: /etc/envoy-tls
+              readOnly: true
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /ready, port: admin }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.envoy.resources | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: amp-envoy-config
+        {{- if .Values.global.tls.enabled }}
+        - name: tls
+          secret:
+            secretName: amp-envoy-tls
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: envoy
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "envoy" "Release" .Release) | nindent 4 }}
+spec:
+  type: {{ .Values.envoy.service.type }}
+  selector:
+    app: envoy
+  ports:
+    {{- if .Values.global.tls.enabled }}
+    - name: https
+      port: {{ .Values.envoy.service.httpsPort }}
+      targetPort: https
+    - name: http
+      port: {{ .Values.envoy.service.httpPort }}
+      targetPort: http
+    {{- else }}
+    # Plain-HTTP mode: an upstream gateway already terminated TLS. Expose
+    # Envoy's single HTTP listener on httpPort (80 by default) — that's
+    # the port the gateway should target.
+    - name: http
+      port: {{ .Values.envoy.service.httpPort }}
+      targetPort: http
+    {{- end }}

@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "oauth2-proxy" "Release" .Release) | nindent 4 }}
+spec:
+  replicas: {{ .Values.oauth2Proxy.replicas }}
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+    spec:
+      initContainers:
+        - name: wait-for-dex
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z dex {{ .Values.dex.httpPort }}; do echo waiting for dex; sleep 3; done
+      containers:
+        - name: oauth2-proxy
+          image: {{ .Values.oauth2Proxy.image }}:{{ .Values.oauth2Proxy.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url=https://{{ .Values.global.domain }}/dex
+            - --skip-oidc-discovery=true
+            - --login-url=https://{{ .Values.global.domain }}/dex/auth
+            - --redeem-url=http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex/token
+            - --oidc-jwks-url=http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex/keys
+            - --redirect-url=https://{{ .Values.global.domain }}/oauth2/callback
+            - --email-domain=*
+            - --http-address=0.0.0.0:4180
+            - --upstream=static://200
+            - --pass-authorization-header=true
+            - --set-authorization-header=true
+            - --pass-access-token=true
+            - --cookie-name=_amp_oauth2_proxy
+            - --cookie-secure={{ .Values.oauth2Proxy.cookieSecure }}
+            - --cookie-samesite=lax
+            - --skip-provider-button=true
+            - --silence-ping-logging=true
+            - --standard-logging=true
+          env:
+            - name: OAUTH2_PROXY_CLIENT_ID
+              valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-id } }
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-secret } }
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: cookie-secret } }
+          ports:
+            - name: http
+              containerPort: 4180
+          readinessProbe:
+            httpGet: { path: /ping, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.oauth2Proxy.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: oauth2-proxy
+  ports:
+    - name: http
+      port: 4180
+      targetPort: http

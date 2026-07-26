@@ -1,4 +1,4 @@
-import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation, CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest } from '../types'
+import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation, CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest, Me, AmpUser, AuthAdminUser } from '../types'
 
 const BASE = '/api'
 
@@ -157,4 +157,37 @@ export const api = {
     const bundle = JSON.parse(bundleText)
     return post<Project>('/projects/import', bundle)
   },
+
+  // Auth / identity
+  me: () => get<Me>('/me'),
+  listUsers: () => get<{ users: AmpUser[] }>('/users').then(r => r.users),
+  setUserRole: (userId: number, role: string, grant: boolean) =>
+    patch<{ user_id: number }>(`/users/${userId}/role`, { role, grant }),
+  deleteUser: (userId: number) => del(`/users/${userId}`),
+}
+
+// ---- amp-authadmin — Dex credential CRUD (routed via Envoy at /authadmin/*) ----
+const AUTHADMIN_BASE = '/authadmin'
+
+async function authadminReq<T>(path: string, method: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${AUTHADMIN_BASE}${path}`, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `${method} ${path}: ${res.status}`)
+  }
+  return res.json()
+}
+
+export const authAdminApi = {
+  listCredentials: () => authadminReq<{ users: AuthAdminUser[] }>('/users', 'GET').then(r => r.users),
+  createCredential: (email: string, password: string, displayName?: string) =>
+    authadminReq<AuthAdminUser>('/users', 'POST', { email, password, display_name: displayName }),
+  resetPassword: (email: string, password: string) =>
+    authadminReq<{ email: string }>(`/users/${encodeURIComponent(email)}`, 'PATCH', { password }),
+  deleteCredential: (email: string) =>
+    authadminReq<{ email: string }>(`/users/${encodeURIComponent(email)}`, 'DELETE'),
 }

@@ -1,0 +1,38 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ .Values.cnpg.clusterName }}
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "postgres" "Release" .Release) | nindent 4 }}
+spec:
+  instances: {{ .Values.cnpg.instances }}
+  imageName: ghcr.io/cloudnative-pg/postgresql:{{ .Values.cnpg.postgresVersion }}
+  primaryUpdateStrategy: unsupervised
+  storage:
+    size: {{ .Values.cnpg.storage.size }}
+    {{- if .Values.cnpg.storage.storageClassName }}
+    storageClass: {{ .Values.cnpg.storage.storageClassName }}
+    {{- end }}
+  bootstrap:
+    initdb:
+      database: {{ .Values.cnpg.appDatabase }}
+      owner: {{ .Values.cnpg.appOwner }}
+  monitoring:
+    enablePodMonitor: false
+---
+# Dex gets its own database in the same cluster, owned by the same app role —
+# this is a small, single-tenant-trust stack so one role owning two databases
+# is an acceptable simplification. Split this out with its own Role if you
+# need tighter isolation later.
+apiVersion: postgresql.cnpg.io/v1
+kind: Database
+metadata:
+  name: amp-dex-db
+  namespace: {{ .Values.global.namespace }}
+spec:
+  name: dex
+  owner: {{ .Values.cnpg.appOwner }}
+  cluster:
+    name: {{ .Values.cnpg.clusterName }}
+  databaseReclaimPolicy: retain

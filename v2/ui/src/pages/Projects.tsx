@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload } from 'lucide-react'
+import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
+import { useAuth } from '../hooks/useAuth'
 import type { Project, SSEEvent } from '../types'
 
 function relativeTime(iso: string) {
@@ -18,6 +19,7 @@ function relativeTime(iso: string) {
 
 export function Projects() {
   const navigate = useNavigate()
+  const { me, isAdmin } = useAuth()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [archivedProjects, setArchivedProjects] = useState<Project[]>([])
@@ -132,6 +134,21 @@ export function Projects() {
             <span className="text-xs text-[#3D5068]">
               {projects.length} {projects.length !== 1 ? 'projects' : 'project'}
             </span>
+            {isAdmin && (
+              <Link
+                to="/admin/users"
+                title="Manage users"
+                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+              >
+                <ShieldCheck size={13} />
+                Users
+              </Link>
+            )}
+            {me && (
+              <span className="text-xs text-[#3D5068]" title={me.subject}>
+                {me.email}
+              </span>
+            )}
             <button
               onClick={handleImportClick}
               disabled={importing}

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: amp
+description: >-
+  AMP — self-contained Helm chart for the AMP planning/execution stack:
+  Postgres (via CloudNativePG), Dex (OIDC), oauth2-proxy (browser auth),
+  a small MCP OAuth broker (DCR for opencode/Claude Code/etc.), Envoy
+  (TLS + routing + JWT auth), amp-api, the React UI, Typesense, and Ollama.
+type: application
+version: 0.1.0
+appVersion: "2.0.0"

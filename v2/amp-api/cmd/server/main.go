@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,6 +19,7 @@ import (
 	"github.com/rs/cors"
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/api"
+	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
@@ -27,6 +31,13 @@ var migration001 string
 
 //go:embed migrations/002_task_start_at.sql
 var migration002 string
+
+//go:embed migrations/003_users.sql
+var migration003 string
+
+// migrationSQL is the full, concatenated migration set — also used directly
+// by the test suite to spin up a schema.
+var migrationSQL = migration001 + "\n" + migration002 + "\n" + migration003
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
@@ -48,9 +59,25 @@ func main() {
 	defer repo.Close()
 
 	slog.Info("running migrations")
-	allMigrations := migration001 + "\n" + migration002
-	if err := repo.Migrate(ctx, allMigrations); err != nil {
+	if err := repo.Migrate(ctx, migrationSQL); err != nil {
 		slog.Error("migration failed", "err", err)
+		os.Exit(1)
+	}
+
+	// ---- 1b. Auth (OIDC verifier against Dex) ----
+	var audiences []string
+	if a := os.Getenv("OIDC_AUDIENCES"); a != "" {
+		audiences = strings.Split(a, ",")
+	}
+	verifier, err := auth.NewVerifier(ctx, auth.Config{
+		IssuerURL:      os.Getenv("OIDC_ISSUER_URL"),
+		DiscoveryURL:   os.Getenv("OIDC_DISCOVERY_URL"),
+		Audiences:      audiences,
+		BootstrapAdmin: os.Getenv("BOOTSTRAP_ADMIN_EMAILS"),
+		Repo:           repo,
+	})
+	if err != nil {
+		slog.Error("failed to initialize auth verifier", "err", err)
 		os.Exit(1)
 	}
 
@@ -70,15 +97,45 @@ func main() {
 	)
 
 	// ---- 5. MCP server (port 8000) ----
+	// The SSE server binds to an internal-only loopback address; the public
+	// listener in front of it applies the auth middleware, then reverse
+	// proxies through. This lets us add auth without forking mcp-go's
+	// internal mux. baseURL is the externally reachable address the SSE
+	// "endpoint" event advertises to clients — it must stay public-facing
+	// even though the actual bind is internal.
 	mcpSrv := mcpserver.NewMCPServer("amp-api", "2.0.0", mcpserver.WithToolCapabilities(false))
 	mcpHandler := mcp.NewServer(registry, repo, sseHub, kbSvc)
 	mcpHandler.Register(mcpSrv)
 
-	mcpHTTP := mcpserver.NewSSEServer(mcpSrv, fmt.Sprintf("http://localhost%s", mcpAddr))
+	mcpPublicBaseURL := envOrDefault("MCP_PUBLIC_URL", fmt.Sprintf("http://localhost%s", mcpAddr))
+	mcpInternalAddr := "127.0.0.1:18789"
+	mcpHTTP := mcpserver.NewSSEServer(mcpSrv, mcpPublicBaseURL)
 	go func() {
-		slog.Info("MCP server listening", "addr", mcpAddr)
-		if err := mcpHTTP.Start(mcpAddr); err != nil && err != http.ErrServerClosed {
-			slog.Error("MCP server error", "err", err)
+		slog.Info("MCP internal server listening", "addr", mcpInternalAddr)
+		if err := mcpHTTP.Start(mcpInternalAddr); err != nil && err != http.ErrServerClosed {
+			slog.Error("MCP internal server error", "err", err)
+		}
+	}()
+
+	mcpProxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: mcpInternalAddr})
+
+	mcpPublicMux := http.NewServeMux()
+	mcpPublicMux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		authServerURL := envOrDefault("MCP_OAUTH_PUBLIC_URL", "http://localhost:8091")
+		fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q]}`, mcpPublicBaseURL, authServerURL)
+	})
+	mcpPublicMux.Handle("/", verifier.Middleware(mcpProxy))
+	verifier.ResourceMetadataURL = mcpPublicBaseURL + "/.well-known/oauth-protected-resource"
+
+	mcpPublicServer := &http.Server{
+		Addr:    mcpAddr,
+		Handler: mcpPublicMux,
+	}
+	go func() {
+		slog.Info("MCP public server listening (auth-enforced)", "addr", mcpAddr)
+		if err := mcpPublicServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			slog.Error("MCP public server error", "err", err)
 		}
 	}()
 
@@ -87,7 +144,7 @@ func main() {
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
 	restHandler.Register(mux)
 
-	// Health check
+	// Health check (unauthenticated, used by k8s probes)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		fmt.Fprint(w, `{"status":"ok"}`)
@@ -99,9 +156,14 @@ func main() {
 		AllowedHeaders: []string{"Content-Type", "Authorization"},
 	})
 
+	// Auth wraps everything except /health.
+	var apiHandler http.Handler = mux
+	apiHandler = authExceptHealth(verifier, apiHandler)
+	apiHandler = corsMiddleware.Handler(apiHandler)
+
 	apiServer := &http.Server{
 		Addr:    apiAddr,
-		Handler: corsMiddleware.Handler(mux),
+		Handler: apiHandler,
 	}
 
 	go func() {
@@ -126,4 +188,17 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// authExceptHealth applies the auth verifier to every path except /health,
+// which k8s liveness/readiness probes hit unauthenticated.
+func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
+	authed := v.Middleware(next)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		authed.ServeHTTP(w, r)
+	})
 }

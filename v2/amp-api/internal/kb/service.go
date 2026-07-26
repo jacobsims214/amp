@@ -680,16 +680,40 @@ func (s *Service) DeleteProject(ctx context.Context, projectID int) error {
 // Reindex re-triggers embedding generation for all documents by re-upserting them.
 // This is useful when switching embedding models.
 func (s *Service) Reindex(ctx context.Context, projectID int) error {
-	docs, err := s.ListDocs(ctx, projectID, "")
+	col := collectionName(projectID)
+
+	// Snapshot full doc content BEFORE any possible drop+recreate below —
+	// once the collection is dropped there is nothing left to read back.
+	summaries, err := s.ListDocs(ctx, projectID, "")
 	if err != nil {
 		return err
 	}
-	for _, summary := range docs {
+	docs := make([]*Doc, 0, len(summaries))
+	for _, summary := range summaries {
 		full, err := s.GetDoc(ctx, projectID, summary.Path)
 		if err != nil {
 			s.log.Warn("reindex: skip doc", "path", summary.Path, "err", err)
 			continue
 		}
+		docs = append(docs, full)
+	}
+
+	// If the collection was originally created before Ollama was reachable
+	// (e.g. a race at first-write time against the post-install model pull
+	// Job), it's permanently locked into keyword-only mode — Typesense
+	// collections can't gain a field after creation. Detect that and
+	// drop+recreate so ensureCollection picks up the embedding field this
+	// time, now that Ollama is reachable.
+	if s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, col) {
+		s.log.Info("reindex: upgrading collection to semantic search (was keyword-only)", "collection", col)
+		if _, err := s.client.Collection(col).Delete(ctx); err != nil {
+			s.log.Warn("reindex: failed to drop keyword-only collection, continuing with existing schema", "collection", col, "err", err)
+		} else if err := s.ensureCollection(ctx, projectID); err != nil {
+			return fmt.Errorf("recreate collection with embeddings: %w", err)
+		}
+	}
+
+	for _, full := range docs {
 		if _, err := s.WriteDoc(ctx, projectID, full.Path, full.Title, full.Content, full.Author, full.Tags); err != nil {
 			s.log.Warn("reindex: write failed", "path", full.Path, "err", err)
 		}
@@ -713,10 +737,10 @@ func (s *Service) collectionHasEmbedding(ctx context.Context, collectionName str
 }
 
 // ollamaReachable does a quick health check on the Ollama server.
-// Returns false if Ollama is not running — collection is created keyword-only.
-// When Ollama later becomes available, call Reindex to add embeddings.
+// Returns false if Ollama is not running or has no models — collection is created keyword-only.
+// When Ollama later becomes available with models, call Reindex to add embeddings.
 func (s *Service) ollamaReachable(ctx context.Context) bool {
-	reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, s.ollamaURL+"/api/tags", nil)
 	if err != nil {
@@ -726,8 +750,23 @@ func (s *Service) ollamaReachable(ctx context.Context) bool {
 	if err != nil {
 		return false
 	}
-	resp.Body.Close()
-	return resp.StatusCode == http.StatusOK
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+
+	// Check that at least one model is available. Ollama's /api/tags returns
+	// a flat {"models": [{"name": "..."}, ...]} — no nested wrapper.
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false
+	}
+	return len(result.Models) > 0
 }
 
 // SearchAPIKey returns the API key for the UI to search directly.

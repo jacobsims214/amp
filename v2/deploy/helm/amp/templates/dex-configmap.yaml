@@ -1,0 +1,48 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amp-dex-config
+  namespace: {{ .Values.global.namespace }}
+data:
+  config.yaml.tmpl: |
+    issuer: https://{{ .Values.global.domain }}/dex
+
+    storage:
+      type: postgres
+      config:
+        host: {{ .Values.cnpg.clusterName }}-rw.{{ .Values.global.namespace }}.svc.cluster.local
+        port: 5432
+        database: dex
+        user: {{ .Values.cnpg.appOwner }}
+        password: __AMP_DEX_DB_PASSWORD__
+        ssl:
+          mode: require
+
+    web:
+      http: 0.0.0.0:{{ .Values.dex.httpPort }}
+
+    grpc:
+      addr: 0.0.0.0:{{ .Values.dex.grpcPort }}
+      tlsCert: /etc/dex-grpc-tls/tls.crt
+      tlsKey: /etc/dex-grpc-tls/tls.key
+      tlsClientCA: /etc/dex-grpc-tls/ca.crt
+
+    oauth2:
+      skipApprovalScreen: true
+      passwordConnector: local
+      pkce:
+        enforce: true
+        codeChallengeMethodsSupported: ["S256"]
+
+    enablePasswordDB: true
+
+    staticClients:
+      - idEnv: DEX_UI_CLIENT_ID
+        secretEnv: DEX_UI_CLIENT_SECRET
+        redirectURIs:
+          - "https://{{ .Values.global.domain }}/oauth2/callback"
+        name: "AMP UI (oauth2-proxy)"
+    {{- if .Values.global.bootstrapAdminEmails }}
+
+    staticPasswords: []
+    {{- end }}

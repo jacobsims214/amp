@@ -1,0 +1,26 @@
+AMP is deploying to namespace {{ .Values.global.namespace }}.
+
+1. Watch everything come up:
+     kubectl -n {{ .Values.global.namespace }} get pods -w
+
+2. Get to the UI:
+   - docker-desktop: kubectl -n {{ .Values.global.namespace }} port-forward svc/envoy 8443:{{ .Values.envoy.service.httpsPort }}
+     then open https://{{ .Values.global.domain }}:8443  (add "127.0.0.1 {{ .Values.global.domain }}" to /etc/hosts)
+   - datacenter (LoadBalancer/NodePort reachable directly): https://{{ .Values.global.domain }}
+
+3. First login — the bootstrap admin credentials were generated into a Secret:
+     kubectl -n {{ .Values.global.namespace }} get secret amp-bootstrap-admin -o jsonpath='{.data.email}' | base64 -d; echo
+     kubectl -n {{ .Values.global.namespace }} get secret amp-bootstrap-admin -o jsonpath='{.data.password}' | base64 -d; echo
+   Log in with those, then change the password from the Users admin page (/admin/users).
+
+4. Local self-signed CA: your browser and any MCP client will need to trust
+   the generated CA to avoid TLS warnings. Export it with:
+     kubectl -n {{ .Values.global.namespace }} get secret amp-ca-secret -o jsonpath='{.data."tls\.crt"}' | base64 -d > amp-local-ca.crt
+
+5. MCP clients (opencode, Claude Code, etc.) should point at:
+     https://{{ .Values.global.domain }}/mcp
+   They will discover OAuth automatically via the WWW-Authenticate header /
+   RFC 9728 protected-resource metadata — no manual client registration needed.
+
+See docs/deploy-architecture.md in the repo for the full architecture and the
+promotion checklist for the datacenter cluster.

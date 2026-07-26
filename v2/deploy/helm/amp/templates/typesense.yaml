@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: typesense
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "typesense" "Release" .Release) | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels:
+      app: typesense
+  template:
+    metadata:
+      labels:
+        app: typesense
+    spec:
+      containers:
+        - name: typesense
+          image: {{ .Values.typesense.image }}:{{ .Values.typesense.tag }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--data-dir", "/data", "--api-key", "{{ .Values.typesense.apiKey }}", "--enable-cors"]
+          ports:
+            - name: http
+              containerPort: 8108
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.typesense.resources | nindent 12 }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: typesense-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: typesense-data
+  namespace: {{ .Values.global.namespace }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.typesense.storage.storageClassName }}
+  storageClassName: {{ .Values.typesense.storage.storageClassName }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.typesense.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: typesense
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: typesense
+  ports:
+    - name: http
+      port: 8108
+      targetPort: http

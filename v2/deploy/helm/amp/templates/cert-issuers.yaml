@@ -1,0 +1,149 @@
+# ---- Internal CA (always present, independent of public TLS mode) ----
+# Used for service-to-service mTLS inside the cluster (Dex's gRPC admin API)
+# used by amp-authadmin/amp-mcpoauth. This has nothing to do with whether
+# Envoy itself terminates public TLS — e.g. in a deployment where an
+# upstream gateway (Cilium L2/BGP-announced, an external SSL proxy, etc.)
+# already terminates TLS before traffic reaches Envoy, this internal CA is
+# still required and always created.
+#
+# Everything in this chart lives in one namespace, so plain (namespaced)
+# Issuers are used throughout instead of ClusterIssuers — this avoids
+# cert-manager's ClusterIssuer "ca" type needing its secret in cert-manager's
+# cluster-resource-namespace rather than ours.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: amp-selfsigned-bootstrap
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: amp-ca
+  namespace: {{ .Values.global.namespace }}
+spec:
+  isCA: true
+  commonName: amp-internal-ca
+  secretName: amp-ca-secret
+  duration: 8760h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: amp-selfsigned-bootstrap
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: amp-ca-issuer
+  namespace: {{ .Values.global.namespace }}
+spec:
+  ca:
+    secretName: amp-ca-secret
+---
+# Dex's gRPC server certificate (mTLS — only amp-authadmin/amp-mcpoauth
+# should ever be able to call it).
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: amp-dex-grpc-server
+  namespace: {{ .Values.global.namespace }}
+spec:
+  secretName: amp-dex-grpc-server-tls
+  commonName: dex-grpc.{{ .Values.global.namespace }}.svc.cluster.local
+  dnsNames:
+    - dex-grpc.{{ .Values.global.namespace }}.svc.cluster.local
+    - dex-grpc
+  issuerRef:
+    name: amp-ca-issuer
+    kind: Issuer
+  duration: 2160h
+  renewBefore: 360h
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: amp-dex-grpc-client
+  namespace: {{ .Values.global.namespace }}
+spec:
+  secretName: amp-dex-grpc-client-tls
+  commonName: amp-internal-client
+  usages: ["client auth"]
+  issuerRef:
+    name: amp-ca-issuer
+    kind: Issuer
+  duration: 2160h
+  renewBefore: 360h
+---
+{{- if .Values.global.tls.enabled }}
+# ---- Public-facing Envoy TLS (only when Envoy itself terminates TLS) ----
+# Skipped entirely when global.tls.enabled=false, e.g. when an upstream
+# gateway/load balancer already terminates TLS and forwards plain HTTP —
+# see templates/envoy-configmap.yaml / envoy.yaml for the matching listener
+# change.
+{{- if eq .Values.global.tls.issuer "letsencrypt-http01" }}
+# NOTE: Envoy is not an Ingress-controller/Gateway-API target out of the box,
+# so cert-manager's HTTP-01 solver has nowhere to attach its temporary
+# challenge Ingress. Prefer letsencrypt-dns01 in production. If you must use
+# HTTP-01, deploy the Gateway API and point cert-manager's solver at Envoy's
+# Gateway resource, or front Envoy with an Ingress controller for ACME only.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: amp-letsencrypt
+  namespace: {{ .Values.global.namespace }}
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: {{ .Values.global.tls.letsencrypt.email }}
+    privateKeySecretRef:
+      name: amp-letsencrypt-account-key
+    solvers:
+      - http01:
+          ingress:
+            ingressClassName: nginx   # replace with whatever fronts the ACME challenge path
+---
+{{- else if eq .Values.global.tls.issuer "letsencrypt-dns01" }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: amp-letsencrypt
+  namespace: {{ .Values.global.namespace }}
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: {{ .Values.global.tls.letsencrypt.email }}
+    privateKeySecretRef:
+      name: amp-letsencrypt-account-key
+    solvers:
+      - dns01:
+          {{ .Values.global.tls.letsencrypt.dns01.provider }}:
+          {{- /* Fill in the concrete provider block (route53/cloudflare/etc) in values-prod.yaml — this is intentionally a stub. */}}
+---
+{{- end }}
+
+{{- $issuerName := "amp-ca-issuer" }}
+{{- if or (eq .Values.global.tls.issuer "letsencrypt-http01") (eq .Values.global.tls.issuer "letsencrypt-dns01") }}
+{{- $issuerName = "amp-letsencrypt" }}
+{{- end }}
+
+# Envoy's public TLS certificate.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: amp-envoy-tls
+  namespace: {{ .Values.global.namespace }}
+spec:
+  secretName: amp-envoy-tls
+  dnsNames:
+    - {{ .Values.global.domain }}
+  issuerRef:
+    name: {{ $issuerName }}
+    kind: Issuer
+  duration: 2160h
+  renewBefore: 360h
+{{- end }}

@@ -1,0 +1,124 @@
+## AMP Helm chart — default values (local docker-desktop profile).
+## For the datacenter cluster, override via -f values-prod.yaml (see
+## docs/deploy-architecture.md for the promotion checklist).
+
+global:
+  namespace: amp
+  # Public base domain. Locally this can stay "amp.local" (add it to
+  # /etc/hosts pointing at the docker-desktop LB / port-forward address).
+  domain: amp.local
+  # Set true once you have a real DNS name + reachable Envoy for Let's Encrypt.
+  # Locally this is always false (selfsigned CA).
+  tls:
+    enabled: true
+    issuer: selfsigned   # selfsigned | letsencrypt-http01 | letsencrypt-dns01
+    letsencrypt:
+      email: "ops@example.com"
+      dns01:
+        provider: ""        # e.g. "route53", "cloudflare" — wire the matching cert-manager solver block yourself in values-prod.yaml
+  bootstrapAdminEmails: "admin@amp.local"
+
+image:
+  pullPolicy: IfNotPresent
+  registry: ""   # empty = local images built straight into the docker-desktop node, no registry needed
+
+ampApi:
+  image: amp-api
+  tag: local
+  replicas: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+ui:
+  image: amp-ui
+  tag: local
+  replicas: 1
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+authAdmin:
+  image: amp-authadmin
+  tag: local
+  replicas: 1
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+mcpOAuth:
+  image: amp-mcpoauth
+  tag: local
+  replicas: 1
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+dex:
+  image: ghcr.io/dexidp/dex
+  tag: v2.42.0
+  replicas: 1
+  httpPort: 5556
+  grpcPort: 5557
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+oauth2Proxy:
+  image: quay.io/oauth2-proxy/oauth2-proxy
+  tag: v7.7.1
+  replicas: 1
+  clientID: amp-ui
+  # clientSecret is generated into a Secret by templates/secrets.yaml if not overridden
+  cookieSecure: true
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+envoy:
+  image: envoyproxy/envoy
+  tag: v1.31-latest
+  replicas: 1
+  service:
+    type: LoadBalancer   # docker-desktop exposes this on localhost; use NodePort/ClusterIP+external LB in the datacenter
+    httpsPort: 443
+    httpPort: 80          # kept open only for ACME HTTP-01 + local convenience redirect to https
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 128Mi }
+
+typesense:
+  image: typesense/typesense
+  tag: "30.1"
+  apiKey: amp-local-dev   # override in values-prod.yaml / a Secret for real deployments
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: 500m, memory: 1Gi }
+  storage:
+    size: 2Gi
+    storageClassName: ""  # empty = cluster default
+
+ollama:
+  image: ollama/ollama
+  tag: latest
+  model: nomic-embed-text
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "2", memory: 2Gi }
+  storage:
+    size: 5Gi
+    storageClassName: ""
+
+cnpg:
+  clusterName: amp-postgres
+  instances: 1              # bump to 3 for HA in the datacenter
+  storage:
+    size: 5Gi
+    storageClassName: ""
+  appDatabase: amp
+  appOwner: amp
+  postgresVersion: "16"
+
+postInstall:
+  # Pulls the embedding model into Ollama after it's up — replaces `make kb-setup`.
+  pullEmbeddingModel: true

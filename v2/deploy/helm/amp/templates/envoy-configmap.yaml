@@ -1,0 +1,336 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amp-envoy-config
+  namespace: {{ .Values.global.namespace }}
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+    static_resources:
+      listeners:
+      {{- if .Values.global.tls.enabled }}
+        - name: https_listener
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8443 }
+          filter_chains:
+            - transport_socket:
+                name: envoy.transport_sockets.tls
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+                  common_tls_context:
+                    tls_certificates:
+                      - certificate_chain: { filename: "/etc/envoy-tls/tls.crt" }
+                        private_key: { filename: "/etc/envoy-tls/tls.key" }
+              filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: amp_https
+                    stream_idle_timeout: 3600s
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                    route_config:
+                      name: amp_routes
+                      virtual_hosts:
+                        - name: amp
+                          domains: ["*"]
+                          routes:
+                            # ---- Auth surfaces: never gated by ext_authz ----
+                            - match: { prefix: "/dex" }
+                              route: { cluster: dex_http }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/oauth2" }
+                              route: { cluster: oauth2_proxy }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # RFC 8414-strict discovery path fallback (well-known inserted before the AS path).
+                            - match: { path: "/.well-known/oauth-authorization-server/mcp-oauth" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/.well-known/oauth-authorization-server"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/mcp-oauth" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/mcp-oauth/" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # ---- MCP resource server: bearer-token auth handled by amp-api itself, not ext_authz ----
+                            # timeout: 0s disables Envoy's default 15s per-route timeout, which otherwise
+                            # silently kills the long-lived MCP SSE stream and drops the session.
+                            - match: { path: "/mcp" }
+                              route:
+                                cluster: amp_api_mcp
+                                prefix_rewrite: "/"
+                                timeout: 0s
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/mcp/" }
+                              route:
+                                cluster: amp_api_mcp
+                                prefix_rewrite: "/"
+                                timeout: 0s
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # ---- Everything below requires a browser session via oauth2-proxy ----
+                            # The UI's own SSE stream (live board updates) needs the same unbounded
+                            # timeout, matched before the general /api prefix below.
+                            - match: { path: "/api/events" }
+                              route: { cluster: amp_api_rest, timeout: 0s }
+                            - match: { prefix: "/api" }
+                              route: { cluster: amp_api_rest }
+                            - match: { prefix: "/authadmin" }
+                              route: { cluster: amp_authadmin }
+                            - match: { prefix: "/" }
+                              route: { cluster: ui }
+                    http_filters:
+                      - name: envoy.filters.http.ext_authz
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                          transport_api_version: V3
+                          http_service:
+                            server_uri:
+                              uri: http://oauth2-proxy.{{ .Values.global.namespace }}.svc.cluster.local:4180
+                              cluster: oauth2_proxy
+                              timeout: 5s
+                            path_prefix: /oauth2/auth
+                            authorization_request:
+                              allowed_headers:
+                                patterns:
+                                  - exact: cookie
+                                  - exact: authorization
+                            authorization_response:
+                              allowed_upstream_headers:
+                                patterns:
+                                  - exact: authorization
+                                  - exact: x-auth-request-user
+                                  - exact: x-auth-request-email
+                          failure_mode_allow: false
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+        - name: http_listener
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8080 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: amp_http_redirect
+                    route_config:
+                      name: redirect_routes
+                      virtual_hosts:
+                        - name: redirect
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/" }
+                              redirect: { https_redirect: true }
+                    http_filters:
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      {{- else }}
+        # global.tls.enabled=false: an upstream gateway/load balancer (e.g. an
+        # external SSL proxy, Cilium L2/BGP-announced device, etc.) already
+        # terminated TLS before traffic reaches Envoy — plain HTTP only, no
+        # cert-manager Certificate/Secret is mounted or required.
+        - name: http_listener
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8080 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: amp_http
+                    stream_idle_timeout: 3600s
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                    route_config:
+                      name: amp_routes
+                      virtual_hosts:
+                        - name: amp
+                          domains: ["*"]
+                          routes:
+                            # ---- Auth surfaces: never gated by ext_authz ----
+                            - match: { prefix: "/dex" }
+                              route: { cluster: dex_http }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/oauth2" }
+                              route: { cluster: oauth2_proxy }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # RFC 8414-strict discovery path fallback (well-known inserted before the AS path).
+                            - match: { path: "/.well-known/oauth-authorization-server/mcp-oauth" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/.well-known/oauth-authorization-server"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/mcp-oauth" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/mcp-oauth/" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # ---- MCP resource server: bearer-token auth handled by amp-api itself, not ext_authz ----
+                            - match: { path: "/mcp" }
+                              route:
+                                cluster: amp_api_mcp
+                                prefix_rewrite: "/"
+                                timeout: 0s
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/mcp/" }
+                              route:
+                                cluster: amp_api_mcp
+                                prefix_rewrite: "/"
+                                timeout: 0s
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # ---- Everything below requires a browser session via oauth2-proxy ----
+                            - match: { path: "/api/events" }
+                              route: { cluster: amp_api_rest, timeout: 0s }
+                            - match: { prefix: "/api" }
+                              route: { cluster: amp_api_rest }
+                            - match: { prefix: "/authadmin" }
+                              route: { cluster: amp_authadmin }
+                            - match: { prefix: "/" }
+                              route: { cluster: ui }
+                    http_filters:
+                      - name: envoy.filters.http.ext_authz
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                          transport_api_version: V3
+                          http_service:
+                            server_uri:
+                              uri: http://oauth2-proxy.{{ .Values.global.namespace }}.svc.cluster.local:4180
+                              cluster: oauth2_proxy
+                              timeout: 5s
+                            path_prefix: /oauth2/auth
+                            authorization_request:
+                              allowed_headers:
+                                patterns:
+                                  - exact: cookie
+                                  - exact: authorization
+                            authorization_response:
+                              allowed_upstream_headers:
+                                patterns:
+                                  - exact: authorization
+                                  - exact: x-auth-request-user
+                                  - exact: x-auth-request-email
+                          failure_mode_allow: false
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      {{- end }}
+
+      clusters:
+        - name: ui
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: ui
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: ui.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 80 } } }
+        - name: amp_api_rest
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: amp_api_rest
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: amp-api.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 3001 } } }
+        - name: amp_api_mcp
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: amp_api_mcp
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: amp-api.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 8000 } } }
+        - name: amp_authadmin
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: amp_authadmin
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: amp-authadmin.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 8090 } } }
+        - name: mcp_oauth
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: mcp_oauth
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: amp-mcpoauth.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 8091 } } }
+        - name: dex_http
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: dex_http
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: dex.{{ .Values.global.namespace }}.svc.cluster.local, port_value: {{ .Values.dex.httpPort }} } } }
+        - name: oauth2_proxy
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: oauth2_proxy
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: oauth2-proxy.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 4180 } } }

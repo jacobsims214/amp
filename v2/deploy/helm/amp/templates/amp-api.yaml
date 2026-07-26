@@ -1,0 +1,91 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amp-api
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-api" "Release" .Release) | nindent 4 }}
+spec:
+  replicas: {{ .Values.ampApi.replicas }}
+  selector:
+    matchLabels:
+      app: amp-api
+  template:
+    metadata:
+      labels:
+        app: amp-api
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z {{ .Values.cnpg.clusterName }}-rw 5432; do echo waiting for postgres; sleep 3; done
+      containers:
+        - name: amp-api
+          image: {{ include "amp.image" (dict "image" .Values.ampApi.image "tag" .Values.ampApi.tag "root" $) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - name: PGHOST
+              value: "{{ .Values.cnpg.clusterName }}-rw.{{ .Values.global.namespace }}.svc.cluster.local"
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: {{ .Values.cnpg.clusterName }}-app, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: {{ .Values.cnpg.clusterName }}-app, key: password } }
+            - name: DATABASE_URL
+              value: "postgres://$(PGUSER):$(PGPASSWORD)@$(PGHOST):5432/{{ .Values.cnpg.appDatabase }}?sslmode=require"
+            - name: MCP_ADDR
+              value: ":8000"
+            - name: API_ADDR
+              value: ":3001"
+            - name: MCP_PUBLIC_URL
+              value: "https://{{ .Values.global.domain }}/mcp"
+            - name: MCP_OAUTH_PUBLIC_URL
+              value: "https://{{ .Values.global.domain }}/mcp-oauth"
+            - name: TYPESENSE_URL
+              value: "http://typesense.{{ .Values.global.namespace }}.svc.cluster.local:8108"
+            - name: TYPESENSE_API_KEY
+              value: {{ .Values.typesense.apiKey | quote }}
+            - name: OLLAMA_URL
+              value: "http://ollama.{{ .Values.global.namespace }}.svc.cluster.local:11434"
+            - name: OLLAMA_MODEL
+              value: {{ .Values.ollama.model | quote }}
+            - name: OIDC_ISSUER_URL
+              value: "https://{{ .Values.global.domain }}/dex"
+            - name: OIDC_DISCOVERY_URL
+              value: "http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex"
+            - name: BOOTSTRAP_ADMIN_EMAILS
+              value: {{ .Values.global.bootstrapAdminEmails | quote }}
+          ports:
+            - name: mcp
+              containerPort: 8000
+            - name: rest
+              containerPort: 3001
+          readinessProbe:
+            httpGet: { path: /health, port: rest }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: rest }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.ampApi.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amp-api
+  namespace: {{ .Values.global.namespace }}
+spec:
+  selector:
+    app: amp-api
+  ports:
+    - name: mcp
+      port: 8000
+      targetPort: mcp
+    - name: rest
+      port: 3001
+      targetPort: rest

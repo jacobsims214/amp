@@ -1,0 +1,145 @@
+## AMP Helm chart — datacenter (Talos/Proxmox) production values.
+##
+## Usage:
+##   helm upgrade --install amp . -n amp --create-namespace \
+##     -f values-prod.yaml \
+##     --set ampApi.tag=<git-sha> --set ui.tag=<git-sha> \
+##     --set authAdmin.tag=<git-sha> --set mcpOAuth.tag=<git-sha>
+##
+## Pin every *.tag explicitly per deploy (the GitHub Actions workflow at
+## .github/workflows/build-images.yml tags every image with the short git
+## sha) — don't run prod on the floating "latest" tag long-term.
+##
+## Still needs your input before first deploy (see inline TODOs):
+##   - cnpg.storage.storageClassName / typesense.storage.storageClassName /
+##     ollama.storage.storageClassName — whatever StorageClass your
+##     Talos/Proxmox cluster exposes (Ceph/Rook, Proxmox CSI, Longhorn, etc.)
+##   - global.bootstrapAdminEmails — the real first-admin email
+##   - CNPG backups — deliberately NOT configured yet (see bottom of this
+##     file). Do not consider this production-ready for real user data until
+##     that's wired up.
+
+global:
+  namespace: amp
+  domain: amp.simstech.cloud
+
+  # Your Proxmox SSL gateway terminates TLS before traffic reaches the
+  # cluster (Cilium L2Announcement/BGP just gives Envoy's LoadBalancer
+  # Service a routable IP on the VLAN — it doesn't do TLS itself). Envoy
+  # therefore runs plain-HTTP-only here; see docs/deploy-architecture.md for
+  # the full request path. Flip this to true (+ pick an issuer below) if you
+  # ever move to a topology where Envoy itself should terminate TLS (e.g.
+  # SNI passthrough instead of termination at the gateway).
+  tls:
+    enabled: false
+    issuer: letsencrypt-dns01   # only consulted if enabled: true
+    letsencrypt:
+      email: "ops@simstech.cloud"
+      dns01:
+        provider: ""            # fill in the real cert-manager DNS-01 solver block for your DNS provider if/when tls.enabled flips to true
+
+  # TODO: real first-admin email for this environment.
+  bootstrapAdminEmails: "admin@simstech.cloud"
+
+image:
+  # Built + pushed by .github/workflows/build-images.yml on every push to
+  # main / tag. Namespace matches env.IMAGE_NAMESPACE in that workflow.
+  registry: ghcr.io/jacobsims214/amp
+  pullPolicy: IfNotPresent
+
+ampApi:
+  tag: latest   # override per deploy: --set ampApi.tag=<git-sha>
+  replicas: 2
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+ui:
+  tag: latest
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+authAdmin:
+  tag: latest
+  replicas: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+mcpOAuth:
+  tag: latest
+  replicas: 2
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+dex:
+  replicas: 2
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+oauth2Proxy:
+  replicas: 2
+  cookieSecure: true
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+envoy:
+  replicas: 2
+  service:
+    # Cilium L2Announcement/BGP hands this a real routable IP on your VLAN;
+    # your SSL gateway targets that IP on httpPort.
+    type: LoadBalancer
+    httpPort: 80
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+typesense:
+  # TODO: replace with a real generated secret reference before go-live —
+  # this is still the local-dev default. Simplest path: create the Secret
+  # out-of-band and switch templates/typesense.yaml to read from it (not yet
+  # wired — flag if you want this done before first prod deploy).
+  apiKey: amp-local-dev
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
+  storage:
+    size: 10Gi
+    storageClassName: ""   # TODO: set to your Talos/Proxmox StorageClass
+
+ollama:
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "4", memory: 4Gi }
+  storage:
+    size: 10Gi
+    storageClassName: ""   # TODO: set to your Talos/Proxmox StorageClass
+
+cnpg:
+  instances: 3   # HA — CNPG handles leader election + pod anti-affinity automatically
+  storage:
+    size: 20Gi
+    storageClassName: ""   # TODO: set to your Talos/Proxmox StorageClass
+  # TODO — CNPG backups are NOT configured. Before this touches real data,
+  # add something like the following (requires an S3-compatible endpoint —
+  # MinIO on Proxmox, real S3, Backblaze B2, etc.) to templates/cnpg-cluster.yaml:
+  #
+  #   backup:
+  #     barmanObjectStore:
+  #       destinationPath: s3://amp-backups/
+  #       endpointURL: https://minio.simstech.cloud
+  #       s3Credentials:
+  #         accessKeyId: { name: amp-backup-creds, key: ACCESS_KEY_ID }
+  #         secretAccessKey: { name: amp-backup-creds, key: SECRET_ACCESS_KEY }
+  #     scheduledBackups:
+  #       - name: daily-backup
+  #         schedule: "0 0 3 * * *"
+  #         backupOwnerReference: self
+
+postInstall:
+  pullEmbeddingModel: true
