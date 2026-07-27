@@ -56,6 +56,20 @@ global:
   # TODO: real first-admin email for this environment.
   bootstrapAdminEmails: "admin@simstech.cloud"
 
+  # Pinned, pre-generated values — ArgoCD's Helm rendering does not
+  # reliably support the lookup-based "reuse existing Secret value" trick
+  # (verified empirically: consecutive syncs produced different random
+  # values, desyncing Dex from oauth2-proxy until every consumer happened
+  # to restart together). These specific values are already live and
+  # working in the cluster as of 2026-07-27 — do not regenerate without
+  # also restarting dex, oauth2-proxy, amp-valkey, amp-api, and
+  # amp-asynqmon together. See templates/secrets.yaml and
+  # docs/deploy-architecture.md.
+  secretOverrides:
+    oauth2ProxyClientSecret: "upXh5U8e6egfrDKOFwRdRMm0ZKSHgPFM55KZCdys"
+    oauth2ProxyCookieSecret: "l3NAV1WayYMTPp32SNp5IfZ20I0W8xA8"
+    valkeyPassword: "RmyzuBJHK2aSR06jUHMNWvCIoMDxnecy"
+
   # Single override point for every amp-* image tag — set this via ArgoCD's
   # Application `helm.parameters` (see deploy/argocd/amp-application.yaml),
   # matching how odoo-operator's Application overrides `image.tag`.

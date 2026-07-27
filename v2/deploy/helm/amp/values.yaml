@@ -24,6 +24,15 @@ global:
   # explicitly (empty string means "defer to this").
   imageTag: ""
 
+  # Pin real values here (values-production.yaml does) to avoid template-time
+  # randomness racing across ArgoCD syncs — see templates/secrets.yaml.
+  # Left empty for local dev, which always deploys via plain `helm upgrade`
+  # (lookup-based stability works fine there).
+  secretOverrides:
+    oauth2ProxyClientSecret: ""
+    oauth2ProxyCookieSecret: ""
+    valkeyPassword: ""
+
 image:
   pullPolicy: IfNotPresent
   registry: ""   # empty = local images built straight into the docker-desktop node, no registry needed

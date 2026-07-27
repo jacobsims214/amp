@@ -140,6 +140,15 @@ Both are architectural assumptions baked into asynqmon's build (it assumes it ow
 - `oauth2-proxy --cookie-domain=.<domain>` (leading dot) so the session cookie set on login at the main domain is also sent to the subdomain — without this, you'd have to log in twice.
 - The cert-manager `Certificate` for Envoy's public TLS now carries both hostnames as SANs.
 
+## Real incident: secrets rotating out from under running pods on ArgoCD
+
+`templates/secrets.yaml` originally used the standard Helm "stable random secret" trick — `{{- $existing := lookup "v1" "Secret" $ns $secretName }}`, reuse its value if found, else generate fresh. This works reliably with plain `helm upgrade` (verified all through the docker-desktop testing in this doc) because it has live cluster access at template time.
+
+**It does not work reliably through ArgoCD.** Caught live in prod: two consecutive `argocd.argoproj.io/refresh=hard` syncs of the exact same chart/values produced two *different* random `client-secret` values for `amp-oauth2-proxy`. Whichever pods (dex, oauth2-proxy) didn't happen to restart in a given sync kept their old value baked into their env (env vars are read once at container start, not re-read live), while the Secret object itself moved on — so Dex and oauth2-proxy silently desynced, breaking every login with `invalid_client` until every consumer happened to restart together. Same issue for `amp-valkey-users`, desyncing Valkey/amp-api/amp-asynqmon's queue password.
+
+Fix: `global.secretOverrides` in `values-production.yaml` pins the already-live, already-working values directly, so there's no template-time randomness to race at all in that environment. Local dev (`values.yaml`) leaves these empty and keeps the lookup-or-random fallback, which is fine there — local always deploys via plain `helm upgrade`. **If you ever need to actually rotate these values**, you must restart every consumer in the same breath: `dex`, `oauth2-proxy` (for `amp-oauth2-proxy`), and `amp-valkey`, `amp-api`, `amp-asynqmon` (for `amp-valkey-users`) — a partial rotation is exactly the bug this fix exists to prevent.
+
+
 
 
 </content>
