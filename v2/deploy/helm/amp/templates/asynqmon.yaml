@@ -16,9 +16,13 @@ spec:
       labels:
         app: amp-asynqmon
     spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
       initContainers:
         - name: wait-for-postgres
           image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
           command:
             - sh
             - -c
@@ -26,6 +30,8 @@ spec:
               until nc -z {{ .Values.cnpg.clusterName }}-rw 5432; do echo waiting for postgres; sleep 3; done
         - name: wait-for-valkey
           image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
           command:
             - sh
             - -c
@@ -38,6 +44,8 @@ spec:
         - name: asynqmon
           image: {{ .Values.asynqmon.image }}:{{ .Values.asynqmon.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 1000) | nindent 12 }}
           env:
             - name: PORT
               value: "8080"
@@ -50,6 +58,8 @@ spec:
         - name: gate
           image: {{ include "amp.image" (dict "image" .Values.asynqmonGate.image "tag" .Values.asynqmonGate.tag "root" $) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" . | nindent 12 }}
           env:
             - name: PGHOST
               value: "{{ .Values.cnpg.clusterName }}-rw.{{ .Values.global.namespace }}.svc.cluster.local"

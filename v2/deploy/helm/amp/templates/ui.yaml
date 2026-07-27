@@ -15,13 +15,17 @@ spec:
       labels:
         app: ui
     spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
       containers:
         - name: ui
           image: {{ include "amp.image" (dict "image" .Values.ui.image "tag" .Values.ui.tag "root" $) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 101) | nindent 12 }}
           ports:
             - name: http
-              containerPort: 80
+              containerPort: 8080
           readinessProbe:
             httpGet: { path: /, port: http }
             initialDelaySeconds: 3

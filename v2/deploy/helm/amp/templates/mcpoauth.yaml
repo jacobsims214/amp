@@ -15,9 +15,13 @@ spec:
       labels:
         app: amp-mcpoauth
     spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
       initContainers:
         - name: wait-for-dex-grpc
           image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
           command:
             - sh
             - -c
@@ -27,6 +31,8 @@ spec:
         - name: amp-mcpoauth
           image: {{ include "amp.image" (dict "image" .Values.mcpOAuth.image "tag" .Values.mcpOAuth.tag "root" $) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" . | nindent 12 }}
           env:
             - name: ADDR
               value: ":8091"

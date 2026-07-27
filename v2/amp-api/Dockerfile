@@ -13,8 +13,10 @@ COPY amp-api/ .
 RUN CGO_ENABLED=0 go build -o amp-api ./cmd/server
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
+RUN apk add --no-cache ca-certificates && adduser -D -u 1000 amp
 WORKDIR /app
 COPY --from=builder /app/amp-api .
+RUN chown amp:amp /app/amp-api
+USER 1000
 EXPOSE 8000 3001
 CMD ["./amp-api"]

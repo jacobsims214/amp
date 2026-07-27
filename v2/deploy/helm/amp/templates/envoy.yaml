@@ -18,10 +18,14 @@ spec:
         # Force a rollout whenever the config or cert changes.
         checksum/config: {{ include (print $.Template.BasePath "/envoy-configmap.yaml") . | sha256sum }}
     spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
       containers:
         - name: envoy
           image: {{ .Values.envoy.image }}:{{ .Values.envoy.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 1000) | nindent 12 }}
           args: ["-c", "/etc/envoy/envoy.yaml"]
           ports:
             {{- if .Values.global.tls.enabled }}

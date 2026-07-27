@@ -15,9 +15,13 @@ spec:
       labels:
         app: amp-api
     spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
       initContainers:
         - name: wait-for-postgres
           image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
           command:
             - sh
             - -c
@@ -26,6 +30,8 @@ spec:
         {{- if .Values.valkey.enabled }}
         - name: wait-for-valkey
           image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
           command:
             - sh
             - -c
@@ -36,6 +42,8 @@ spec:
         - name: amp-api
           image: {{ include "amp.image" (dict "image" .Values.ampApi.image "tag" .Values.ampApi.tag "root" $) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" . | nindent 12 }}
           env:
             - name: PGHOST
               value: "{{ .Values.cnpg.clusterName }}-rw.{{ .Values.global.namespace }}.svc.cluster.local"

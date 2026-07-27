@@ -15,9 +15,13 @@ spec:
       labels:
         app: dex
     spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
       initContainers:
         - name: render-config
           image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
           command:
             - sh
             - -c
@@ -38,6 +42,8 @@ spec:
         - name: dex
           image: {{ .Values.dex.image }}:{{ .Values.dex.tag }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" . | nindent 12 }}
           command: ["/usr/local/bin/dex", "serve", "/rendered/config.yaml"]
           env:
             - name: DEX_UI_CLIENT_ID
