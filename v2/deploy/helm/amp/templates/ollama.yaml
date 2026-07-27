@@ -16,6 +16,10 @@ spec:
       labels:
         app: ollama
     spec:
+      {{- if .Values.ollama.nodeSelector }}
+      nodeSelector:
+        {{- toYaml .Values.ollama.nodeSelector | nindent 8 }}
+      {{- end }}
       securityContext:
         {{- include "amp.podSecurityContext" (dict "fsGroup" 1000) | nindent 8 }}
       initContainers:
