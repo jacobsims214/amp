@@ -157,12 +157,6 @@ typesense:
     storageClassName: nfs-storage
 
 ollama:
-  # Temporarily pinned to talos-1b7-arm (Proxmox VM 102) to test whether its
-  # x86-64-v3 CPU type (AVX2/FMA exposed to guest) meaningfully speeds up
-  # Ollama's CPU-only embedding inference vs the other nodes still on
-  # x86-64-v2-AES. Remove this pin once the test concludes either way.
-  nodeSelector:
-    kubernetes.io/hostname: talos-1b7-arm
   resources:
     requests: { cpu: 500m, memory: 1Gi }
     limits: { cpu: "4", memory: 4Gi }
