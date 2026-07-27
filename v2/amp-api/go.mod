@@ -8,7 +8,7 @@ require (
 	github.com/dexidp/dex/api/v2 v2.4.0
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.7.2
-	github.com/mark3labs/mcp-go v0.5.0
+	github.com/mark3labs/mcp-go v0.48.0
 	github.com/rs/cors v1.11.1
 	github.com/typesense/typesense-go/v4 v4.0.0-alpha2
 	golang.org/x/crypto v0.54.0
@@ -24,6 +24,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/google/jsonschema-go v0.4.2 // indirect
 	github.com/grafana/regexp v0.0.0-20250905093917-f7b3be9d1853 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
@@ -39,7 +40,9 @@ require (
 	github.com/prometheus/otlptranslator v0.0.2 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
 	github.com/sony/gobreaker v1.0.0 // indirect
+	github.com/spf13/cast v1.7.1 // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
+	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/exporters/prometheus v0.60.0 // indirect

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -97,27 +95,26 @@ func main() {
 	)
 
 	// ---- 5. MCP server (port 8000) ----
-	// The SSE server binds to an internal-only loopback address; the public
-	// listener in front of it applies the auth middleware, then reverse
-	// proxies through. This lets us add auth without forking mcp-go's
-	// internal mux. baseURL is the externally reachable address the SSE
-	// "endpoint" event advertises to clients — it must stay public-facing
-	// even though the actual bind is internal.
+	// Streamable HTTP transport (2025-03-26+ spec) — a single endpoint
+	// handling POST (requests), GET (optional server push), and DELETE
+	// (session teardown), correlated via the Mcp-Session-Id header. This
+	// replaced the older HTTP+SSE transport (separate /sse + /message
+	// endpoints) after real-world testing showed modern clients (opencode,
+	// Claude Code, etc.) default to Streamable HTTP and don't reliably keep
+	// a legacy SSE GET connection open long enough for it to work.
 	mcpSrv := mcpserver.NewMCPServer("amp-api", "2.0.0", mcpserver.WithToolCapabilities(false))
 	mcpHandler := mcp.NewServer(registry, repo, sseHub, kbSvc)
 	mcpHandler.Register(mcpSrv)
 
 	mcpPublicBaseURL := envOrDefault("MCP_PUBLIC_URL", fmt.Sprintf("http://localhost%s", mcpAddr))
-	mcpInternalAddr := "127.0.0.1:18789"
-	mcpHTTP := mcpserver.NewSSEServer(mcpSrv, mcpPublicBaseURL)
-	go func() {
-		slog.Info("MCP internal server listening", "addr", mcpInternalAddr)
-		if err := mcpHTTP.Start(mcpInternalAddr); err != nil && err != http.ErrServerClosed {
-			slog.Error("MCP internal server error", "err", err)
-		}
-	}()
+	streamableSrv := mcpserver.NewStreamableHTTPServer(mcpSrv)
 
-	mcpProxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: "http", Host: mcpInternalAddr})
+	mcpCORS := cors.New(cors.Options{
+		AllowedOrigins: []string{"*"},
+		AllowedMethods: []string{"GET", "POST", "DELETE", "OPTIONS"},
+		AllowedHeaders: []string{"Content-Type", "Authorization", "Mcp-Session-Id"},
+		ExposedHeaders: []string{"Mcp-Session-Id"},
+	})
 
 	mcpPublicMux := http.NewServeMux()
 	mcpPublicMux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
@@ -125,15 +122,15 @@ func main() {
 		authServerURL := envOrDefault("MCP_OAUTH_PUBLIC_URL", "http://localhost:8091")
 		fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q]}`, mcpPublicBaseURL, authServerURL)
 	})
-	mcpPublicMux.Handle("/", verifier.Middleware(mcpProxy))
+	mcpPublicMux.Handle("/", verifier.Middleware(streamableSrv))
 	verifier.ResourceMetadataURL = mcpPublicBaseURL + "/.well-known/oauth-protected-resource"
 
 	mcpPublicServer := &http.Server{
 		Addr:    mcpAddr,
-		Handler: mcpPublicMux,
+		Handler: mcpCORS.Handler(mcpPublicMux),
 	}
 	go func() {
-		slog.Info("MCP public server listening (auth-enforced)", "addr", mcpAddr)
+		slog.Info("MCP public server listening (Streamable HTTP, auth-enforced)", "addr", mcpAddr)
 		if err := mcpPublicServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("MCP public server error", "err", err)
 		}

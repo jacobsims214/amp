@@ -1437,12 +1437,16 @@ func arr(desc string) map[string]interface{} {
 }
 
 func tool(name, desc string, schema props) mcpgo.Tool {
-	return mcpgo.NewTool(name, desc, schema)
+	raw, _ := json.Marshal(map[string]interface{}{
+		"type":       "object",
+		"properties": schema,
+	})
+	return mcpgo.NewToolWithRawSchema(name, desc, raw)
 }
 
 func wrap(baseCtx context.Context, fn func(context.Context, map[string]interface{}) (*mcpgo.CallToolResult, error)) server.ToolHandlerFunc {
-	return func(args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-		return fn(baseCtx, args)
+	return func(_ context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return fn(baseCtx, request.GetArguments())
 	}
 }
 
@@ -1452,7 +1456,7 @@ func jsonResult(v interface{}) (*mcpgo.CallToolResult, error) {
 		return nil, err
 	}
 	return &mcpgo.CallToolResult{
-		Content: []interface{}{mcpgo.TextContent{Type: "text", Text: string(data)}},
+		Content: []mcpgo.Content{mcpgo.TextContent{Type: "text", Text: string(data)}},
 	}, nil
 }
 
