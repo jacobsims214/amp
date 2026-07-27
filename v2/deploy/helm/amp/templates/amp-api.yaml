@@ -23,6 +23,15 @@ spec:
             - -c
             - |
               until nc -z {{ .Values.cnpg.clusterName }}-rw 5432; do echo waiting for postgres; sleep 3; done
+        {{- if .Values.valkey.enabled }}
+        - name: wait-for-valkey
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z amp-valkey 6379; do echo waiting for valkey; sleep 3; done
+        {{- end }}
       containers:
         - name: amp-api
           image: {{ include "amp.image" (dict "image" .Values.ampApi.image "tag" .Values.ampApi.tag "root" $) }}
@@ -58,6 +67,12 @@ spec:
               value: "http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex"
             - name: BOOTSTRAP_ADMIN_EMAILS
               value: {{ .Values.global.bootstrapAdminEmails | quote }}
+            {{- if .Values.valkey.enabled }}
+            - name: REDIS_ADDR
+              value: "amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379"
+            - name: REDIS_PASSWORD
+              valueFrom: { secretKeyRef: { name: amp-valkey-users, key: default } }
+            {{- end }}
           ports:
             - name: mcp
               containerPort: 8000

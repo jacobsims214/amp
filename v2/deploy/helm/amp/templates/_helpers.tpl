@@ -29,3 +29,9 @@ app.kubernetes.io/component: {{ .component }}
 {{ .image }}:{{ $tag }}
 {{- end -}}
 {{- end -}}
+
+{{/* asynqmon's own subdomain — see values.yaml asynqmon.subdomain comment
+     for why it isn't a path prefix under global.domain. */}}
+{{- define "amp.asynqmonDomain" -}}
+{{ .Values.asynqmon.subdomain }}.{{ .Values.global.domain }}
+{{- end -}}

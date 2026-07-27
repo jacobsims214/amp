@@ -22,5 +22,12 @@ AMP is deploying to namespace {{ .Values.global.namespace }}.
    They will discover OAuth automatically via the WWW-Authenticate header /
    RFC 9728 protected-resource metadata — no manual client registration needed.
 
+6. Queue monitoring (asynqmon, admin-only): needs its own DNS record —
+     https://{{ include "amp.asynqmonDomain" . }}
+   pointing at the same place as {{ .Values.global.domain }} (same Envoy
+   LoadBalancer IP / same Cloudflare proxy setup). Locally, add
+   "127.0.0.1 {{ include "amp.asynqmonDomain" . }}" to /etc/hosts alongside
+   the main domain entry.
+
 See docs/deploy-architecture.md in the repo for the full architecture and the
 promotion checklist for the datacenter cluster.

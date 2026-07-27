@@ -141,6 +141,7 @@ spec:
   secretName: amp-envoy-tls
   dnsNames:
     - {{ .Values.global.domain }}
+    - {{ include "amp.asynqmonDomain" . }}
   issuerRef:
     name: {{ $issuerName }}
     kind: Issuer

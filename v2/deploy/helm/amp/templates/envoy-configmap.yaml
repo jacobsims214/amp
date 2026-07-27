@@ -110,6 +110,14 @@ data:
                               route: { cluster: amp_authadmin }
                             - match: { prefix: "/" }
                               route: { cluster: ui }
+                        # asynqmon gets its own subdomain (not a path prefix) because its
+                        # SPA has no basename support and its own "/api" calls would
+                        # collide with amp-api's REST API under the same domain.
+                        - name: asynqmon
+                          domains: ["{{ include "amp.asynqmonDomain" . }}"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route: { cluster: amp_asynqmon }
                     http_filters:
                       - name: envoy.filters.http.ext_authz
                         typed_config:
@@ -249,6 +257,14 @@ data:
                               route: { cluster: amp_authadmin }
                             - match: { prefix: "/" }
                               route: { cluster: ui }
+                        # asynqmon gets its own subdomain (not a path prefix) because its
+                        # SPA has no basename support and its own "/api" calls would
+                        # collide with amp-api's REST API under the same domain.
+                        - name: asynqmon
+                          domains: ["{{ include "amp.asynqmonDomain" . }}"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route: { cluster: amp_asynqmon }
                     http_filters:
                       - name: envoy.filters.http.ext_authz
                         typed_config:
@@ -310,6 +326,14 @@ data:
             endpoints:
               - lb_endpoints:
                   - endpoint: { address: { socket_address: { address: amp-authadmin.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 8090 } } }
+        - name: amp_asynqmon
+          type: STRICT_DNS
+          lb_policy: ROUND_ROBIN
+          load_assignment:
+            cluster_name: amp_asynqmon
+            endpoints:
+              - lb_endpoints:
+                  - endpoint: { address: { socket_address: { address: amp-asynqmon.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 8092 } } }
         - name: mcp_oauth
           type: STRICT_DNS
           lb_policy: ROUND_ROBIN

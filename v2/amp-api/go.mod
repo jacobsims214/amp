@@ -7,6 +7,7 @@ require (
 	github.com/coreos/go-oidc/v3 v3.20.0
 	github.com/dexidp/dex/api/v2 v2.4.0
 	github.com/google/uuid v1.6.0
+	github.com/hibiken/asynq v0.26.0
 	github.com/jackc/pgx/v5 v5.7.2
 	github.com/mark3labs/mcp-go v0.48.0
 	github.com/rs/cors v1.11.1
@@ -20,6 +21,7 @@ require (
 	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
@@ -39,8 +41,10 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/otlptranslator v0.0.2 // indirect
 	github.com/prometheus/procfs v0.17.0 // indirect
+	github.com/redis/go-redis/v9 v9.14.1 // indirect
+	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/sony/gobreaker v1.0.0 // indirect
-	github.com/spf13/cast v1.7.1 // indirect
+	github.com/spf13/cast v1.10.0 // indirect
 	github.com/twmb/murmur3 v1.1.8 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
@@ -56,6 +60,7 @@ require (
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/time v0.14.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251022142026-3a174f9686a8 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )

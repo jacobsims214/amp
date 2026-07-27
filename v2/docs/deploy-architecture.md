@@ -119,5 +119,27 @@ These were all real bugs caught by actually deploying and exercising the stack e
 
 **Known limitation, not yet addressed:** Streamable HTTP is stateful by default — a client's session lives in `amp-api`'s in-memory `sync.Map` on whichever pod handled `initialize`. With `ampApi.replicas: 2` in prod, a subsequent request landing on the *other* pod (via Envoy's `STRICT_DNS`/`ROUND_ROBIN` cluster to the ClusterIP Service) would get `Invalid session ID` again. In practice this hasn't surfaced because HTTP/1.1 keep-alive tends to pin a client's connection to one backend pod for the connection's lifetime, but it's not guaranteed. If this resurfaces under real multi-replica load, the fix is either Envoy ring-hash load balancing keyed on the `Mcp-Session-Id` header, or splitting the MCP listener into its own single-replica Deployment.
 
+## KB indexing queue (Valkey + asynq)
+
+Direct, synchronous writes from `amp-api` to Typesense on every `amp_kb_write`/`amp_kb_delete` call don't scale — a burst of writes from many agents across many projects hits Typesense inline with the request, with no backpressure control. Fixed by adding a queue:
+
+- **Valkey** (`valkey/valkey` chart, standalone mode, ACL auth via a generated `amp-valkey-users` secret) backs an [asynq](https://github.com/hibiken/asynq) task queue.
+- `kb.Service.WriteDoc`/`DeleteDoc` now enqueue a task and return immediately with a deterministically-computed `DocSummary` (the doc ID is `sha256(project_id:path:chunk)`, computable without touching Typesense at all) instead of writing inline. If `REDIS_ADDR` is unset (local `make dev` without Valkey) or the enqueue call itself fails, they fall back to writing synchronously — so this degrades gracefully rather than silently dropping writes.
+- A worker runs **in-process inside `amp-api`** (a background goroutine started in `main.go`, not a separate Deployment) consuming the `kb-index` queue at a bounded concurrency (`KB_INDEX_CONCURRENCY`, default 4) — this is what actually smooths out a write burst into a steady rate instead of hammering Typesense.
+- `AnnotateDoc` intentionally stays synchronous (low-frequency, read-then-write, harder to queue correctly without risking lost updates under concurrent annotation).
+- **asynqmon** (the official monitoring UI) is exposed for visibility — but it has *no built-in authentication*, so it sits behind `amp-asynqmon-gate`, a tiny sidecar (same pattern as `amp-authadmin`) that requires the **admin** role, not just any logged-in session, since queue internals (payloads, retry counts) shouldn't be visible to every member.
+
+### Why asynqmon needs its own subdomain, not a path prefix
+
+First attempt was `https://<domain>/asynqmon` (path-based, matching how `/authadmin` and `/api` work). This **does not work** and was reverted — asynqmon's SPA:
+1. Has no basename/subpath support in its client-side router — clicking any nav item does `history.push("/")`, navigating clean off the `/asynqmon` prefix entirely.
+2. Makes its own internal `/api/queues` calls for live data — which collided with `amp-api`'s own `/api` prefix route, silently sending asynqmon's data requests to the wrong backend.
+
+Both are architectural assumptions baked into asynqmon's build (it assumes it owns 100% of its origin's path space), not something fixable by adjusting Envoy's `prefix_rewrite`. The real fix: asynqmon gets a **dedicated subdomain** (`queues.<domain>` by default, `asynqmon.subdomain` in values) via a second Envoy `virtual_host` matched by `Host` header rather than path — it owns its entire domain's namespace, so neither collision is possible. This needs:
+- A DNS record for `queues.<domain>` pointing at the same place as the main domain (same LoadBalancer IP / same Cloudflare setup).
+- `oauth2-proxy --cookie-domain=.<domain>` (leading dot) so the session cookie set on login at the main domain is also sent to the subdomain — without this, you'd have to log in twice.
+- The cert-manager `Certificate` for Envoy's public TLS now carries both hostnames as SANs.
+
+
 
 </content>

@@ -95,6 +95,15 @@ mcpOAuth:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }
 
+asynqmonGate:
+  tag: ""
+
+valkey:
+  enabled: true
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
 dex:
   replicas: 2
   resources:

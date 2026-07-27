@@ -1,0 +1,19 @@
+FROM golang:1.25-alpine AS builder
+WORKDIR /app
+# Install any CA certs dropped into the repo-root certs/ directory.
+# This handles corporate/VPN SSL inspection (e.g. Zscaler).
+RUN apk add --no-cache ca-certificates
+COPY certs/ /tmp/certs/
+RUN cat /tmp/certs/*.pem /tmp/certs/*.crt > /usr/local/share/ca-certificates/custom.crt 2>/dev/null || true \
+    && update-ca-certificates
+COPY amp-api/go.mod amp-api/go.sum ./
+RUN go mod download
+COPY amp-api/ .
+RUN CGO_ENABLED=0 go build -o asynqmongate ./cmd/asynqmongate
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+WORKDIR /app
+COPY --from=builder /app/asynqmongate .
+EXPOSE 8092
+CMD ["./asynqmongate"]

@@ -4,7 +4,13 @@ description: >-
   AMP — self-contained Helm chart for the AMP planning/execution stack:
   Postgres (via CloudNativePG), Dex (OIDC), oauth2-proxy (browser auth),
   a small MCP OAuth broker (DCR for opencode/Claude Code/etc.), Envoy
-  (TLS + routing + JWT auth), amp-api, the React UI, Typesense, and Ollama.
+  (TLS + routing + JWT auth), amp-api, the React UI, Typesense, Ollama,
+  and Valkey (backs the asynq indexing queue).
 type: application
 version: 0.1.0
 appVersion: "2.0.0"
+dependencies:
+  - name: valkey
+    version: "0.11.0"
+    repository: "https://valkey.io/valkey-helm/"
+    condition: valkey.enabled

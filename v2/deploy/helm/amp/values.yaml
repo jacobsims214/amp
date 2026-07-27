@@ -125,6 +125,47 @@ cnpg:
   appOwner: amp
   postgresVersion: "16"
 
+# Backs the asynq indexing queue — amp-api enqueues KB indexing jobs here
+# instead of writing to Typesense inline, so a burst of writes gets smoothed
+# out at a controlled worker concurrency instead of hammering Typesense
+# directly. Standalone (no replication) is plenty for a queue this size.
+valkey:
+  enabled: true
+  auth:
+    enabled: true
+    usersExistingSecret: amp-valkey-users
+    aclUsers:
+      default:
+        permissions: "~* &* +@all"
+        passwordKey: default
+  dataStorage:
+    enabled: false   # queue data is disposable — a lost job just gets re-enqueued on the next write
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+asynqmon:
+  image: hibiken/asynqmon
+  tag: "0.7.1"
+  # asynqmon's SPA assumes it owns the whole root path space of its origin
+  # (client-side router has no basename support, and it makes its own "/api"
+  # calls that would collide with amp-api's REST API under the same domain)
+  # — so it gets its own subdomain via an Envoy host-based virtual_host,
+  # not a path prefix. Needs a DNS record for
+  # "{{ .subdomain }}.{{ global.domain }}" pointing at the same place as
+  # global.domain (see NOTES.txt).
+  subdomain: "queues"
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+asynqmonGate:
+  image: amp-asynqmon-gate
+  tag: local   # amp-{api,ui,authadmin,mcpoauth,asynqmon-gate} all fall back to global.imageTag when empty
+  resources:
+    requests: { cpu: 25m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
 postInstall:
   # Pulls the embedding model into Ollama after it's up — replaces `make kb-setup`.
   pullEmbeddingModel: true

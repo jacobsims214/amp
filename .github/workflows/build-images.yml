@@ -41,6 +41,8 @@ jobs:
             dockerfile: v2/amp-api/Dockerfile.authadmin
           - component: amp-mcpoauth
             dockerfile: v2/amp-api/Dockerfile.mcpoauth
+          - component: amp-asynqmon-gate
+            dockerfile: v2/amp-api/Dockerfile.asynqmongate
           - component: amp-ui
             dockerfile: v2/ui/Dockerfile
     steps:

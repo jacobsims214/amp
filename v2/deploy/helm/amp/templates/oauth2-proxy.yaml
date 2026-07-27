@@ -35,6 +35,10 @@ spec:
             - --redeem-url=http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex/token
             - --oidc-jwks-url=http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex/keys
             - --redirect-url=https://{{ .Values.global.domain }}/oauth2/callback
+            # Leading dot shares the session cookie with asynqmon's dedicated
+            # subdomain (see amp.asynqmonDomain helper) — without this,
+            # logging in on the main domain wouldn't authenticate you there.
+            - --cookie-domain=.{{ .Values.global.domain }}
             - --email-domain=*
             - --http-address=0.0.0.0:4180
             - --upstream=static://200

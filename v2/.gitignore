@@ -2,3 +2,5 @@
 # Local CA certs for Docker builds — drop your certs in certs/ but never commit them
 certs/*.pem
 certs/*.crt
+deploy/helm/amp/charts/*.tgz
+.gh_cache/

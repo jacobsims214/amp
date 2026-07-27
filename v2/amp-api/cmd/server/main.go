@@ -8,11 +8,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	protoactor "github.com/asynkron/protoactor-go/actor"
+	"github.com/hibiken/asynq"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/rs/cors"
 	"github.com/simstech/amp-api/internal/actor"
@@ -21,6 +23,7 @@ import (
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
+	"github.com/simstech/amp-api/internal/queue"
 	"github.com/simstech/amp-api/internal/repository"
 )
 
@@ -93,6 +96,42 @@ func main() {
 		envOrDefault("OLLAMA_URL", "http://localhost:11434"),
 		envOrDefault("OLLAMA_MODEL", "nomic-embed-text"),
 	)
+
+	// ---- 4b. KB indexing queue (Valkey/Redis via asynq) ----
+	// Optional: if REDIS_ADDR is unset (e.g. local `make dev` without
+	// Valkey running), kbSvc falls back to writing/deleting synchronously —
+	// see internal/kb/service.go. When configured, a burst of KB writes
+	// gets smoothed out at a bounded worker concurrency instead of hitting
+	// Typesense inline with the request.
+	var asynqWorker *asynq.Server
+	if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
+		connOpt := queue.RedisConnOpt(redisAddr, os.Getenv("REDIS_PASSWORD"))
+
+		queueClient := asynq.NewClient(connOpt)
+		defer queueClient.Close()
+		kbSvc.SetQueueClient(queueClient)
+
+		concurrency := 4
+		if c := os.Getenv("KB_INDEX_CONCURRENCY"); c != "" {
+			if n, err := strconv.Atoi(c); err == nil && n > 0 {
+				concurrency = n
+			}
+		}
+		asynqWorker = asynq.NewServer(connOpt, asynq.Config{
+			Concurrency: concurrency,
+			Queues:      map[string]int{queue.QueueName: 1},
+		})
+		mux := asynq.NewServeMux()
+		mux.HandleFunc(queue.TypeKBWriteDoc, kbSvc.HandleWriteDocTask)
+		mux.HandleFunc(queue.TypeKBDeleteDoc, kbSvc.HandleDeleteDocTask)
+		if err := asynqWorker.Start(mux); err != nil {
+			slog.Error("failed to start asynq worker", "err", err)
+			os.Exit(1)
+		}
+		slog.Info("KB indexing queue worker started", "redis_addr", redisAddr, "concurrency", concurrency, "queue", queue.QueueName)
+	} else {
+		slog.Warn("REDIS_ADDR not set — KB writes/deletes will run synchronously (fine for local dev, not recommended under real load)")
+	}
 
 	// ---- 5. MCP server (port 8000) ----
 	// Streamable HTTP transport (2025-03-26+ spec) — a single endpoint
@@ -177,6 +216,9 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = apiServer.Shutdown(shutdownCtx)
+	if asynqWorker != nil {
+		asynqWorker.Shutdown()
+	}
 	system.Shutdown()
 }
 

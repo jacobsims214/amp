@@ -21,9 +21,12 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/hibiken/asynq"
 	"github.com/typesense/typesense-go/v4/typesense"
 	"github.com/typesense/typesense-go/v4/typesense/api"
 	"github.com/typesense/typesense-go/v4/typesense/api/pointer"
+
+	"github.com/simstech/amp-api/internal/queue"
 )
 
 // Service is the KB business logic layer.
@@ -34,6 +37,7 @@ type Service struct {
 	ollamaURL    string
 	ollamaModel  string
 	log          *slog.Logger
+	queueClient  *asynq.Client // nil = write/delete synchronously; set via SetQueueClient
 }
 
 // New creates a KB service connected to Typesense.
@@ -211,6 +215,49 @@ func (s *Service) ensureCollection(ctx context.Context, projectID int) error {
 // The doc is chunked automatically; Typesense generates embeddings via Ollama.
 // On subsequent writes to the same path, all old chunks are deleted and new ones inserted.
 func (s *Service) WriteDoc(ctx context.Context, projectID int, path, title, content, author string, tags []string) (*DocSummary, error) {
+	if tags == nil {
+		tags = []string{}
+	}
+
+	// Deterministic — computed the same way whether we write now or later,
+	// so callers get an immediate, correct summary either way.
+	summary := &DocSummary{
+		ID:        docID(projectID, path, 0),
+		ProjectID: projectID,
+		Path:      path,
+		Title:     title,
+		Tags:      tags,
+		Author:    author,
+		UpdatedAt: time.Now().Unix(),
+	}
+
+	if s.queueClient != nil {
+		payload, err := json.Marshal(queue.WriteDocPayload{
+			ProjectID: projectID, Path: path, Title: title, Content: content, Author: author, Tags: tags,
+		})
+		if err == nil {
+			task := asynq.NewTask(queue.TypeKBWriteDoc, payload)
+			if _, err := s.queueClient.EnqueueContext(ctx, task, asynq.Queue(queue.QueueName)); err == nil {
+				s.log.Info("doc write enqueued", "project_id", projectID, "path", path)
+				return summary, nil
+			} else {
+				s.log.Warn("enqueue failed, writing synchronously instead", "project_id", projectID, "path", path, "err", err)
+			}
+		} else {
+			s.log.Warn("marshal enqueue payload failed, writing synchronously instead", "err", err)
+		}
+	}
+
+	if _, err := s.writeDocNow(ctx, projectID, path, title, content, author, tags); err != nil {
+		return nil, err
+	}
+	return summary, nil
+}
+
+// writeDocNow performs the actual Typesense indexing. Called either
+// directly (no queue configured — local dev without Valkey, or enqueue
+// itself failed) or by the asynq worker via HandleWriteDocTask.
+func (s *Service) writeDocNow(ctx context.Context, projectID int, path, title, content, author string, tags []string) (*DocSummary, error) {
 	if err := s.ensureCollection(ctx, projectID); err != nil {
 		return nil, err
 	}
@@ -663,8 +710,55 @@ func (s *Service) KBStatus(ctx context.Context, projectID int) (*StatusInfo, err
 
 // DeleteDoc removes all chunks for a document path.
 func (s *Service) DeleteDoc(ctx context.Context, projectID int, path string) error {
+	if s.queueClient != nil {
+		payload, err := json.Marshal(queue.DeleteDocPayload{ProjectID: projectID, Path: path})
+		if err == nil {
+			task := asynq.NewTask(queue.TypeKBDeleteDoc, payload)
+			if _, err := s.queueClient.EnqueueContext(ctx, task, asynq.Queue(queue.QueueName)); err == nil {
+				s.log.Info("doc delete enqueued", "project_id", projectID, "path", path)
+				return nil
+			} else {
+				s.log.Warn("enqueue failed, deleting synchronously instead", "project_id", projectID, "path", path, "err", err)
+			}
+		} else {
+			s.log.Warn("marshal enqueue payload failed, deleting synchronously instead", "err", err)
+		}
+	}
+	return s.deleteDocNow(ctx, projectID, path)
+}
+
+// deleteDocNow performs the actual Typesense deletion. Called either
+// directly or by the asynq worker via HandleDeleteDocTask.
+func (s *Service) deleteDocNow(ctx context.Context, projectID int, path string) error {
 	col := collectionName(projectID)
 	return s.deleteByPath(ctx, col, projectID, path)
+}
+
+// ---- Async worker handlers ----
+// Registered with asynq's ServeMux by whichever process runs the worker
+// (currently amp-api itself, in a background goroutine — see main.go).
+
+// SetQueueClient enables queue-backed writes. Call once at startup; nil
+// (the default) means WriteDoc/DeleteDoc always write synchronously.
+func (s *Service) SetQueueClient(c *asynq.Client) {
+	s.queueClient = c
+}
+
+func (s *Service) HandleWriteDocTask(ctx context.Context, t *asynq.Task) error {
+	var p queue.WriteDocPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("unmarshal write_doc payload: %w", err)
+	}
+	_, err := s.writeDocNow(ctx, p.ProjectID, p.Path, p.Title, p.Content, p.Author, p.Tags)
+	return err
+}
+
+func (s *Service) HandleDeleteDocTask(ctx context.Context, t *asynq.Task) error {
+	var p queue.DeleteDocPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("unmarshal delete_doc payload: %w", err)
+	}
+	return s.deleteDocNow(ctx, p.ProjectID, p.Path)
 }
 
 // DeleteProject drops the entire Typesense collection for a project.
