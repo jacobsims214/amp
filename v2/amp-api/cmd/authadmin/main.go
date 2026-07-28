@@ -60,20 +60,26 @@ func main() {
 	// One-shot bootstrap mode: the Helm post-install Job runs this same image
 	// with RUN_MODE=seed-admin to create the very first login (otherwise
 	// there's a chicken-and-egg problem — you need to already be an admin to
-	// use the Users page that creates admins). Runs on every install/upgrade.
+	// use the Users page that creates admins). Runs on every install/upgrade,
+	// but is intentionally a NO-OP once the admin already exists — see below.
 	//
-	// Real incident: the amp-bootstrap-admin Secret's password is generated
-	// with Helm's lookup-based "reuse existing value" trick, which is known
-	// to be unreliable through ArgoCD's rendering (see docs/deploy-architecture.md
-	// and the global.secretOverrides pattern used for other secrets). When the
-	// Secret's value silently regenerated after the very first successful
-	// seed, this job kept hitting AlreadyExists and treating that as "nothing
-	// to do" — Dex's real stored password hash never got updated to match,
-	// permanently locking out the admin login with no self-healing path.
-	// Fixed: on AlreadyExists, force-sync Dex's stored hash to whatever the
-	// current SEED_ADMIN_PASSWORD value is via UpdatePassword, so this job is
-	// now actually idempotent in the way its original comment claimed —
-	// every run converges Dex to match the Secret, not just the first one.
+	// Real incident + correction: the amp-bootstrap-admin Secret's password
+	// used to be generated with Helm's lookup-based "reuse existing value"
+	// trick, which is unreliable through ArgoCD's rendering and was silently
+	// regenerating the Secret's value on every sync (see docs/deploy-architecture.md).
+	// That's now fixed by pinning it via global.secretOverrides.bootstrapAdminPassword
+	// in values-production.yaml, so the Secret itself no longer drifts.
+	//
+	// A first attempt at fixing the resulting lockout made this job force-sync
+	// Dex's password hash to the Secret's value on every run, even when the
+	// admin already existed. That was wrong: it meant any password reset done
+	// later via the Users admin page would get silently overwritten back to
+	// the bootstrap value on the next sync, defeating the entire point of a
+	// password-reset feature. Bootstrapping must stay a genuine one-time
+	// operation — once the admin exists in Dex, this job does nothing further
+	// and whatever password the admin currently has (bootstrap value or a
+	// later reset) is left alone. AlreadyExists really does mean "nothing to
+	// do" now that the Secret itself is stable.
 	if os.Getenv("RUN_MODE") == "seed-admin" {
 		email := strings.ToLower(strings.TrimSpace(os.Getenv("SEED_ADMIN_EMAIL")))
 		password := os.Getenv("SEED_ADMIN_PASSWORD")
@@ -94,19 +100,7 @@ func main() {
 			os.Exit(1)
 		}
 		if resp.AlreadyExists {
-			updateResp, err := dexClient.UpdatePassword(ctx, &dexapi.UpdatePasswordReq{
-				Email:   email,
-				NewHash: hash,
-			})
-			if err != nil {
-				slog.Error("seed admin already exists, force-sync UpdatePassword failed", "err", err)
-				os.Exit(1)
-			}
-			if updateResp.NotFound {
-				slog.Error("seed admin already exists per CreatePassword but UpdatePassword reports not found — inconsistent Dex state", "email", email)
-				os.Exit(1)
-			}
-			slog.Info("seed admin already existed, force-synced password hash to current secret value", "email", email)
+			slog.Info("seed admin already exists, nothing to do (bootstrapping is one-time only — a later password reset via the Users page is intentionally preserved)", "email", email)
 		} else {
 			slog.Info("seed admin created", "email", email)
 		}
