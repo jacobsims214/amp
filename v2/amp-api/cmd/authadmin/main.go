@@ -60,8 +60,20 @@ func main() {
 	// One-shot bootstrap mode: the Helm post-install Job runs this same image
 	// with RUN_MODE=seed-admin to create the very first login (otherwise
 	// there's a chicken-and-egg problem — you need to already be an admin to
-	// use the Users page that creates admins). Idempotent: AlreadyExists is
-	// treated as success.
+	// use the Users page that creates admins). Runs on every install/upgrade.
+	//
+	// Real incident: the amp-bootstrap-admin Secret's password is generated
+	// with Helm's lookup-based "reuse existing value" trick, which is known
+	// to be unreliable through ArgoCD's rendering (see docs/deploy-architecture.md
+	// and the global.secretOverrides pattern used for other secrets). When the
+	// Secret's value silently regenerated after the very first successful
+	// seed, this job kept hitting AlreadyExists and treating that as "nothing
+	// to do" — Dex's real stored password hash never got updated to match,
+	// permanently locking out the admin login with no self-healing path.
+	// Fixed: on AlreadyExists, force-sync Dex's stored hash to whatever the
+	// current SEED_ADMIN_PASSWORD value is via UpdatePassword, so this job is
+	// now actually idempotent in the way its original comment claimed —
+	// every run converges Dex to match the Secret, not just the first one.
 	if os.Getenv("RUN_MODE") == "seed-admin" {
 		email := strings.ToLower(strings.TrimSpace(os.Getenv("SEED_ADMIN_EMAIL")))
 		password := os.Getenv("SEED_ADMIN_PASSWORD")
@@ -82,7 +94,19 @@ func main() {
 			os.Exit(1)
 		}
 		if resp.AlreadyExists {
-			slog.Info("seed admin already exists, nothing to do", "email", email)
+			updateResp, err := dexClient.UpdatePassword(ctx, &dexapi.UpdatePasswordReq{
+				Email:   email,
+				NewHash: hash,
+			})
+			if err != nil {
+				slog.Error("seed admin already exists, force-sync UpdatePassword failed", "err", err)
+				os.Exit(1)
+			}
+			if updateResp.NotFound {
+				slog.Error("seed admin already exists per CreatePassword but UpdatePassword reports not found — inconsistent Dex state", "email", email)
+				os.Exit(1)
+			}
+			slog.Info("seed admin already existed, force-synced password hash to current secret value", "email", email)
 		} else {
 			slog.Info("seed admin created", "email", email)
 		}
