@@ -1,8 +1,24 @@
 {{- $ns := .Values.global.namespace }}
 {{- $secretName := "amp-bootstrap-admin" }}
+{{- $overrides := .Values.global.secretOverrides | default dict }}
 {{- $existing := lookup "v1" "Secret" $ns $secretName }}
 {{- $password := "" }}
-{{- if $existing }}
+{{/*
+  Same lookup-through-ArgoCD unreliability as secrets.yaml (see that file's
+  header comment and docs/deploy-architecture.md) — this Secret's password
+  was regenerating on every ArgoCD sync because the lookup-based
+  "reuse-existing-value" trick doesn't reliably see the live cluster state
+  through ArgoCD's rendering. Combined with the seed-admin job's Dex sync
+  logic, this caused a real incident: repeated password drift between the
+  Secret and what Dex actually had stored, permanently locking out login
+  after any sync that happened to regenerate a new random value. Fixed the
+  same way as the other secrets — pin a real value via
+  global.secretOverrides.bootstrapAdminPassword so there's no template-time
+  randomness to race through ArgoCD at all.
+*/}}
+{{- if $overrides.bootstrapAdminPassword }}
+{{- $password = $overrides.bootstrapAdminPassword }}
+{{- else if $existing }}
 {{- $password = index $existing.data "password" | b64dec }}
 {{- else }}
 {{- $password = randAlphaNum 20 }}

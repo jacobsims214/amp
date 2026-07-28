@@ -69,6 +69,11 @@ global:
     oauth2ProxyClientSecret: "upXh5U8e6egfrDKOFwRdRMm0ZKSHgPFM55KZCdys"
     oauth2ProxyCookieSecret: "l3NAV1WayYMTPp32SNp5IfZ20I0W8xA8"
     valkeyPassword: "RmyzuBJHK2aSR06jUHMNWvCIoMDxnecy"
+    # Pinned 2026-07-28 after discovering the amp-bootstrap-admin Secret's
+    # password was regenerating on every ArgoCD sync (same lookup-through-
+    # ArgoCD unreliability as the other secrets above, just never migrated
+    # to this pattern before) — see discoveries/bootstrap-admin-password-drift.md.
+    bootstrapAdminPassword: "CFvwuybvOIq8dL9eldva"
 
   # Single override point for every amp-* image tag — set this via ArgoCD's
   # Application `helm.parameters` (see deploy/argocd/amp-application.yaml),
