@@ -57,6 +57,18 @@ spec:
             - --skip-provider-button=true
             - --silence-ping-logging=true
             - --standard-logging=true
+            # offline_access makes Dex issue a refresh_token alongside the
+            # access/ID token. Without it there's nothing for cookie-refresh
+            # below to use, and the underlying token silently goes stale
+            # long before the 168h session cookie's own expiry — forcing a
+            # full manual re-login through Dex far more often than the
+            # cookie's stated lifetime implies. See discoveries/oauth2-proxy-token-refresh-gap.md.
+            - --scope=openid email profile offline_access
+            # Proactively refresh the underlying token this often rather
+            # than waiting for it to fail — keeps the session smoothly
+            # alive for the full cookie lifetime with no user-visible
+            # re-login prompts.
+            - --cookie-refresh=1h
           env:
             - name: OAUTH2_PROXY_CLIENT_ID
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-id } }
