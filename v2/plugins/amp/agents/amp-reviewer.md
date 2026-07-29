@@ -4,7 +4,7 @@ description: Reviewer — wave checks and full code reviews, never original impl
 model: sonnet
 color: yellow
 disallowedTools: ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs", "TodoWrite"]
-maxTurns: 15
+maxTurns: 45
 skills: ["amp-review", "code-reviewer"]
 ---
 

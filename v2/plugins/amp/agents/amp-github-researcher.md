@@ -4,7 +4,7 @@ description: GitHub research specialist — uses gh CLI, jq, fzf, delta, bat, gi
 model: sonnet
 color: cyan
 disallowedTools: ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"]
-maxTurns: 20
+maxTurns: 40
 skills: ["github-research", "amp-execution"]
 ---
 

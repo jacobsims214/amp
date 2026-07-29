@@ -4,7 +4,7 @@ description: GitHub PR reviewer — uses gh CLI, jq, delta, git to fetch PR diff
 model: sonnet
 color: yellow
 disallowedTools: ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"]
-maxTurns: 20
+maxTurns: 45
 skills: ["github-pr-review", "amp-execution"]
 ---
 

@@ -4,7 +4,7 @@ description: Frontend specialist — React, TypeScript, Tailwind, frontend tests
 model: sonnet
 color: magenta
 disallowedTools: ["TodoWrite"]
-maxTurns: 20
+maxTurns: 60
 skills: ["amp-execution"]
 ---
 

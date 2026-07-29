@@ -4,7 +4,7 @@ description: Read-only researcher — investigates and reports, never edits file
 model: sonnet
 color: cyan
 disallowedTools: ["Edit", "Write", "NotebookEdit", "TodoWrite"]
-maxTurns: 15
+maxTurns: 40
 ---
 
 # AMP Researcher

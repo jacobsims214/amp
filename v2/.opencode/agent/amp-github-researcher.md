@@ -4,7 +4,7 @@ mode: subagent
 hidden: true
 model: openrouter/qwen/qwen3-coder-next
 temperature: 0.2
-steps: 20
+steps: 40
 permission:
   edit: deny
   bash: allow
