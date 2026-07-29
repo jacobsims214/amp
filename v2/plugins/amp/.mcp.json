@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "amp": {
+      "type": "http",
+      "url": "${AMP_MCP_URL:-https://amp.simstech.cloud/mcp}"
+    },
+    "chrome-devtools": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ]
+    },
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    }
+  }
+}
