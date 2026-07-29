@@ -4,6 +4,9 @@
 # Merges the AMP v2 opencode config into your global ~/.config/opencode config.
 # Safe to run repeatedly — it upserts, never clobbers unrelated config.
 #
+# For Claude Code, use ./scripts/setup-claude-code.sh instead — it installs the
+# same roster as a plugin. See scripts/README.md.
+#
 # What it does:
 #   1. Copies skills  v2/.opencode/skills/*  → ~/.config/opencode/skills/
 #   2. Copies agents  v2/.opencode/agent/*.md → ~/.config/opencode/agent/

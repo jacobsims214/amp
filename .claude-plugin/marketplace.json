@@ -1,0 +1,18 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "amp",
+  "description": "AMP — agent-managed project boards and knowledge base for Claude Code",
+  "owner": {
+    "name": "AMP",
+    "url": "https://amp.simstech.cloud"
+  },
+  "plugins": [
+    {
+      "name": "amp",
+      "description": "A manager/worker/reviewer agent team that plans work onto the AMP board over MCP, dispatches specialists in review-gated waves, and accumulates project knowledge in the AMP knowledge base.",
+      "category": "project-management",
+      "source": "./v2/plugins/amp",
+      "homepage": "https://amp.simstech.cloud"
+    }
+  ]
+}
