@@ -4,7 +4,7 @@ mode: subagent
 hidden: true
 model: openrouter/qwen/qwen3.5-9b
 temperature: 0.2
-steps: 20
+steps: 40
 permission:
   edit: allow
   bash: allow

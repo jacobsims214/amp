@@ -4,7 +4,7 @@ description: Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend 
 model: sonnet
 color: green
 disallowedTools: ["TodoWrite"]
-maxTurns: 20
+maxTurns: 60
 skills: ["amp-execution"]
 ---
 

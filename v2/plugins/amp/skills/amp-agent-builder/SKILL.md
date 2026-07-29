@@ -67,10 +67,20 @@ You are ... (this body becomes the agent's system prompt)
   defined by what it must *not* do — reviewers and researchers should not get `Edit`/`Write`.
   Listing it means listing the `mcp__amp__amp_*` tools the agent needs too, since an allowlist
   excludes everything it doesn't name; load the **amp-mcp** skill for the exact names.
-- There is no `mode`, `hidden`, `steps`, `temperature`, or `permission` field — those were
-  opencode concepts. Claude Code has no per-agent step budget or path-scoped permission globs; if
-  a role needs a path restriction, state it as a rule in the body and back it with a `permissions`
-  entry in `.claude/settings.json`.
+- `maxTurns`: the hard ceiling on how many turns the agent gets before the harness kills it
+  mid-run. **This is enforced, and it is the most common cause of an agent "returning nothing."**
+  It counts *turns*, not tool calls — parallel calls in one turn count once — so an agent that
+  batches its calls stretches much further than one working step by step. When an agent is cut
+  off it dies wherever it happens to be, which is usually right before `amp_complete_task`: the
+  work often landed but the board never records it, and the truncated final text gets surfaced as
+  if it were the result. Budget generously. The `amp-execution` protocol alone spends ~9 turns on
+  ceremony (load skill, get task, kb search, progress comment, kb write, verify, completion
+  comment, complete) before any real work, and discovery in a large repo can eat 15-20 more.
+  In the opencode sources this field is `steps: N`; the build script translates it to `maxTurns`.
+- There is no `mode`, `hidden`, `temperature`, or `permission` field — those were opencode
+  concepts. Claude Code has no path-scoped permission globs; if a role needs a path restriction,
+  state it as a rule in the body and back it with a `permissions` entry in
+  `.claude/settings.json`.
 
 Nested delegation is structurally impossible: subagents cannot dispatch subagents. Don't design a
 role that depends on it.

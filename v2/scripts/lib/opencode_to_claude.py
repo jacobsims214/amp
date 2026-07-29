@@ -37,7 +37,7 @@ from pathlib import Path
 #                                   command that adopts the protocol in-session
 # mode: subagent                    agents/<name>.md
 # hidden: true                      dropped (no equivalent)
-# temperature / steps               dropped (no equivalent)
+# temperature                       dropped (no equivalent)
 # model: openrouter/<vendor>/<m>    model tier — see MODEL_MAP
 # permission: <k>: deny            disallowedTools: [...] — opencode is
 #                                   deny-based, so an allowlist would be the
