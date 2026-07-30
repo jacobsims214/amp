@@ -95,6 +95,27 @@ for name, cfg in v2cfg.get('mcp', {}).items():
     gcfg['mcp'][name] = cfg
     print(f"  mcp:   {name}  url={cfg.get('url','')}")
 
+# Remove stale inline agent definitions that conflict with the file-based
+# agents in ~/.config/opencode/agent/*.md. Agents defined in files take
+# precedence over JSON inline definitions per opencode's own docs (agents
+# defined in both JSON and files get the file's definition, so stale JSON
+# entries can silently shadow the newer file-based ones — see the
+# "AMP v2 → global opencode sync" header comment above).
+#
+# The old setup had amp-manager and amp-worker defined inline in JSON with
+# a completely different model (z-ai/glm-5.2) and permission set
+# (webfetch: allow), which conflicted with the newer file-based agents
+# (amp-manager.md, amp-worker-*.md). Removing them entirely — the file
+# copies in step 2 above are the source of truth for agent definitions.
+removed = []
+for agent_name in list(gcfg.get('agent', {}).keys()):
+    del gcfg['agent'][agent_name]
+    removed.append(agent_name)
+if removed:
+    print(f"  removed stale inline agents: {', '.join(removed)}")
+if not gcfg.get('agent'):
+    del gcfg['agent']
+
 with open(global_path, 'w') as f:
     json.dump(gcfg, f, indent=2)
     f.write('\n')

@@ -99,3 +99,11 @@ Use when performing a full in-depth code review on a GitHub PR — fetching diff
 **ui-ux-pro-max**
 Use when a frontend task needs visual/UX design guidance — color, typography, layout, component patterns, stack-specific conventions.
 Covers: searchable design-pattern database (colors, typography, icons, stacks, UX guidelines) via its own search script.
+
+**aws-sso-auth**
+Use when you need to authenticate with AWS via SSO (aws-sso CLI) and run AWS CLI commands against AWS accounts and services (EKS, S3, CloudWatch, etc.).
+Covers: aws-sso exec authentication flow, credential management, common AWS CLI commands, EKS cluster token, troubleshooting auth issues.
+
+**kubectl-eks**
+Use when you need to interact with Kubernetes clusters (especially EKS) using kubectl — viewing pods, reading logs, exec into containers, restarting deployments, and troubleshooting.
+Covers: context switching, pod management, log retrieval, exec into containers, rollout restart, EKS-specific commands with aws-sso wrapper, AvWare production cluster reference.
