@@ -17,7 +17,11 @@ permission:
     "mkdir -p .opencode/*": allow
     "*": deny
   webfetch: deny
-  task: allow
+  task:
+    "*": deny
+    "amp-*": allow
+    "general": allow
+    "explore": allow
   todowrite: deny
 ---
 
@@ -36,6 +40,9 @@ to you. You do not have `todowrite` either — AMP tickets and comments are the 
 planned and tracked in this system; never reach for a built-in planning tool as a substitute. You
 also cannot dispatch a subagent that goes on to dispatch a further subagent — opencode's
 `subagent_depth` setting structurally prevents nested delegation, so don't try to route around it.
+`task` permissions are restricted to the named `amp-*` specialists plus the built-in `general` and
+`explore` subagents (for ad-hoc investigation that doesn't fit a named specialist's exact scope) —
+other built-ins like `scout` are not invocable via Task from here.
 
 ## Time awareness
 

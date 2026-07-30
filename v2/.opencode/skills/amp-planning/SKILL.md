@@ -152,6 +152,31 @@ the conflict check can't do its job.]
 
 ---
 
+## Research task sizing — the same rule applies to fetch/synthesis, not just code
+
+The "one thing per task" discipline above is usually described in terms of code tickets, but it
+applies just as hard to research dispatches — and it's easier to violate by accident, because a
+research question doesn't have an obvious file/line boundary the way a code change does.
+
+**Never bundle "fetch N sources" + "read M local files" + "write a long synthesized report" into
+one research task.** This was tested empirically and failed identically three times in a row
+across two different models: the worker gathers all the data, says something like "now let me
+write the report," and returns empty — the step/context budget spent gathering data leaves
+nothing for the write-up, and this is not a capability-tier problem, a stronger model failed the
+exact same way.
+
+**Split it instead:**
+- One task per source (or a small batch) that does nothing but fetch and relay raw content —
+  no analysis, no scoring, no opinions, explicitly say so in the ticket so the worker doesn't
+  drift into synthesizing anyway.
+- Do the actual synthesis yourself (the manager), or in a separate task that only reads
+  already-fetched material (never re-fetches), once all the raw material is in hand.
+
+If a research question turns out to need more than 2-3 fetches plus a handful of file reads to
+answer, that's the same signal as an oversized code ticket — split it, don't just hope a bigger
+model powers through it.
+
+
 ## Waves and dependencies — build in phases
 
 Work flows in waves. Each wave unblocks the next. Think in phases before creating tasks:

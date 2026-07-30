@@ -2,7 +2,7 @@
 description: Read-only researcher — investigates and reports, never edits files. Dispatched by the manager to answer a question before planning.
 mode: subagent
 hidden: true
-model: openrouter/deepseek/deepseek-v4-flash
+model: openrouter/moonshotai/kimi-k3
 temperature: 0.2
 steps: 40
 permission:
