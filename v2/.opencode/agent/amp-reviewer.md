@@ -2,7 +2,7 @@
 description: Reviewer — wave checks and full code reviews, never original implementation.
 mode: subagent
 hidden: true
-model: openrouter/deepseek/deepseek-v4-flash
+model: openrouter/moonshotai/kimi-k3
 temperature: 0.2
 steps: 45
 permission:
