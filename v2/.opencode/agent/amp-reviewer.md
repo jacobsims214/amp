@@ -2,7 +2,7 @@
 description: Reviewer — wave checks and full code reviews, never original implementation.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3.6-35b-a3b
+model: openrouter/deepseek/deepseek-v4-flash
 temperature: 0.2
 steps: 45
 permission:

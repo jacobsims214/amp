@@ -2,7 +2,7 @@
 description: GitHub research specialist — uses gh CLI, jq, fzf, delta, bat, git to search repos, cross-reference data, investigate issues/PRs, check CI status. Dispatched by the manager to research GitHub repos before planning.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3-coder-next
+model: openrouter/deepseek/deepseek-v4-flash
 temperature: 0.2
 steps: 40
 permission:

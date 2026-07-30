@@ -2,7 +2,7 @@
 description: Frontend specialist — React, TypeScript, Tailwind, frontend tests. Executes one assigned AMP task end-to-end.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3-coder-next
+model: openrouter/deepseek/deepseek-v4-flash
 temperature: 0.1
 steps: 60
 permission:

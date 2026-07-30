@@ -2,7 +2,7 @@
 description: KB curator — prunes stale docs, merges duplicates, compacts annotations into doc content, reports KB health. Dispatched by the manager for KB maintenance.
 mode: subagent
 hidden: true
-model: openrouter/qwen/qwen3.5-9b
+model: openrouter/deepseek/deepseek-v4-flash
 temperature: 0.2
 steps: 40
 permission:

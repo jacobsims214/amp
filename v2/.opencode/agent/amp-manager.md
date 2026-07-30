@@ -1,7 +1,7 @@
 ---
 description: AMP manager — plans work, builds the board via AMP MCP, dispatches specialist subagents, never edits project code/runs builds/fetches the web itself
 mode: primary
-model: openrouter/deepseek/deepseek-v4-flash
+model: openrouter/moonshotai/kimi-k3
 temperature: 0.2
 steps: 30
 permission:
