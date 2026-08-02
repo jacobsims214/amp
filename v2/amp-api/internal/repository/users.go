@@ -14,6 +14,14 @@ import (
 // Identity/credentials are owned by Dex. This is JIT-provisioned identity +
 // role assignment used inside amp-api for attribution/authorization.
 
+// EmptyEmailClaimError is returned by UpsertUserFromClaims when the OIDC
+// token arrives without an email claim. This is expected for machine clients
+// (MCP OAuth client-credentials/device-code flows) that don't go through a
+// Dex local login and therefore have no email claim. Callers should treat
+// this as a warning, not an error — the request is still valid and should
+// continue without an identity.
+var EmptyEmailClaimError = errors.New("upsert user: empty email claim — skipping provisioning")
+
 // UpsertUserFromClaims JIT-provisions a user row on first (or every) validated
 // request. If this is the very first user ever created, or their email is in
 // bootstrapAdmins, they are granted the admin role automatically.
@@ -39,7 +47,7 @@ import (
 //  continue without an identity rather than failing the request).
 func (r *Repo) UpsertUserFromClaims(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool) (*domain.User, error) {
 	if email == "" {
-		return nil, errors.New("upsert user: empty email claim — skipping provisioning")
+		return nil, EmptyEmailClaimError
 	}
 
 	u := &domain.User{}
