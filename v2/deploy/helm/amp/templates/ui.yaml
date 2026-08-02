@@ -7,6 +7,7 @@ metadata:
     {{- include "amp.componentLabels" (dict "component" "ui" "Release" .Release) | nindent 4 }}
 spec:
   replicas: {{ .Values.ui.replicas }}
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: ui

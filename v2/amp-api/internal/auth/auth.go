@@ -162,7 +162,14 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		if v.repo != nil {
 			u, err := v.repo.UpsertUserFromClaims(r.Context(), claims.Subject, claims.Email, claims.Name, v.bootstrapAdmins)
 			if err != nil {
-				slog.Error("JIT user provisioning failed", "err", err)
+				slog.Error("JIT user provisioning failed",
+					"err", err,
+					"subject", claims.Subject,
+					"email", claims.Email,
+					"remote_addr", r.RemoteAddr,
+					"user_agent", r.UserAgent(),
+					"request_uri", r.RequestURI,
+				)
 			} else {
 				ident.User = u
 			}

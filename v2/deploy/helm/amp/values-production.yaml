@@ -130,7 +130,13 @@ dex:
     limits: { cpu: 500m, memory: 512Mi }
 
 oauth2Proxy:
-  replicas: 2
+  # Single replica: with 2 replicas and no shared session-store locking,
+  # concurrent token refreshes race — one redeems the rotating refresh token,
+  # the other fails with "Refresh token is invalid or has already been
+  # claimed by another client", periodically killing the browser session.
+  # Same multi-replica limitation as amp-api's actor split-brain. See
+  # discoveries/prod-diagnostic-2026-08-02.md.
+  replicas: 1
   cookieSecure: true
   resources:
     requests: { cpu: 50m, memory: 64Mi }

@@ -7,6 +7,7 @@ metadata:
     {{- include "amp.componentLabels" (dict "component" "amp-api" "Release" .Release) | nindent 4 }}
 spec:
   replicas: {{ .Values.ampApi.replicas }}
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: amp-api

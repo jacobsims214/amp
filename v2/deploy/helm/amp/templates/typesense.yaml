@@ -7,6 +7,7 @@ metadata:
     {{- include "amp.componentLabels" (dict "component" "typesense" "Release" .Release) | nindent 4 }}
 spec:
   replicas: 1
+  revisionHistoryLimit: 3
   strategy: { type: Recreate }
   selector:
     matchLabels:

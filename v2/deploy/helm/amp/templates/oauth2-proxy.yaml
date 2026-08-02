@@ -7,6 +7,7 @@ metadata:
     {{- include "amp.componentLabels" (dict "component" "oauth2-proxy" "Release" .Release) | nindent 4 }}
 spec:
   replicas: {{ .Values.oauth2Proxy.replicas }}
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: oauth2-proxy
