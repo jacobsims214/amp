@@ -95,7 +95,7 @@ envoy:
   tag: v1.31-latest
   replicas: 1
   service:
-    type: LoadBalancer   # docker-desktop exposes this on localhost; use NodePort/ClusterIP+external LB in the datacenter
+    type: ClusterIP   # Traefik handles external ingress now
     httpsPort: 443
     httpPort: 80          # kept open only for ACME HTTP-01 + local convenience redirect to https
   resources:
