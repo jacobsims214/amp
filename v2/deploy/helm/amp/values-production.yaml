@@ -145,10 +145,8 @@ oauth2Proxy:
 envoy:
   replicas: 2
   service:
-    # Cilium L2Announcement hands this a real routable IP on the server VLAN
-    # from the `service-pool` pool — same mechanism argocd-server/immich/etc
-    # already use. Your SSL gateway targets that IP on httpPort.
-    type: LoadBalancer
+    # Now behind Traefik — changed to ClusterIP. Traefik routes amp.simstech.cloud -> envoy:80
+    type: ClusterIP
     httpPort: 80
   resources:
     requests: { cpu: 100m, memory: 128Mi }
