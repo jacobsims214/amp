@@ -152,6 +152,31 @@ the conflict check can't do its job.]
 
 ---
 
+## Research task sizing — the same rule applies to fetch/synthesis, not just code
+
+The "one thing per task" discipline above is usually described in terms of code tickets, but it
+applies just as hard to research dispatches — and it's easier to violate by accident, because a
+research question doesn't have an obvious file/line boundary the way a code change does.
+
+**Never bundle "fetch N sources" + "read M local files" + "write a long synthesized report" into
+one research task.** This was tested empirically and failed identically three times in a row
+across two different models: the worker gathers all the data, says something like "now let me
+write the report," and returns empty — the step/context budget spent gathering data leaves
+nothing for the write-up, and this is not a capability-tier problem, a stronger model failed the
+exact same way.
+
+**Split it instead:**
+- One task per source (or a small batch) that does nothing but fetch and relay raw content —
+  no analysis, no scoring, no opinions, explicitly say so in the ticket so the worker doesn't
+  drift into synthesizing anyway.
+- Do the actual synthesis yourself (the manager), or in a separate task that only reads
+  already-fetched material (never re-fetches), once all the raw material is in hand.
+
+If a research question turns out to need more than 2-3 fetches plus a handful of file reads to
+answer, that's the same signal as an oversized code ticket — split it, don't just hope a bigger
+model powers through it.
+
+
 ## Waves and dependencies — build in phases
 
 Work flows in waves. Each wave unblocks the next. Think in phases before creating tasks:
@@ -450,14 +475,35 @@ between them, do not dispatch both in the same wave: either add the missing `dep
 there's time to do so before dispatching), or dispatch one now and hold the other until the first
 completes.
 
-For every task in `ready_to_dispatch`, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
+**Step 0.5 — cap the batch at 5 workers.** Never spawn more than **5 subagents at a time**, no
+matter how many tasks are sitting in `ready_to_dispatch`. This is a hard ceiling, not a target,
+and **nothing enforces it but you.** The host's own concurrent-subagent cap
+(`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`) is left at its default, well above 5 — it is a runaway
+backstop, not this limit. Five is where AMP's workers stop stepping on each other, so keeping to
+it is a discipline you apply at dispatch time, every wave, without being stopped.
+
+Sort `ready_to_dispatch` (highest priority first, then lowest task ID) and take the first 5. The
+rest wait — do not dispatch them, do not mark them `in_progress`. As each worker returns, top the
+batch back up to 5 from whatever is ready by then.
+
+If a spawn ever does come back with `Concurrent subagent limit reached. Do not retry.` — you
+overshot, or something else in the session is holding agents — the task is already marked
+`in_progress` with nobody behind it. Reset it immediately so the board stays honest, then
+re-dispatch it in the next batch:
+```
+amp_set_task_state(task_id=ID, state="backlog", reason="spawn hit concurrent subagent cap — requeued")
+```
+
+For every task **in the current batch of 5 or fewer**, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
 
 **Step 1 — dispatch each task** (marks it in_progress on the board):
 ```
 amp_dispatch_task(task_id=ID, agent_id=<task's assigned_to>)
 ```
+Only call this for tasks you are spawning in this batch. A task sitting `in_progress` with no
+live worker behind it is a failure you cannot see.
 
-**Step 2 — spawn workers in a single message** (runs them in parallel):
+**Step 2 — spawn workers in a single message** (runs them in parallel — at most 5):
 ```
 task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
 task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
@@ -465,7 +511,37 @@ task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's as
 
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
-After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+---
+
+## After dispatch — monitor every bucket, not just completions
+
+Poll `amp_list_tasks` and read all of it. `blocked` is not one thing:
+
+| What you see | What it means | What you do |
+|---|---|---|
+| task in `completed` | worker finished | top the batch back up to 5 from `ready_to_dispatch` |
+| task in `blocked` **with** `blocked_by_ids` | waiting on another task | nothing — it auto-unblocks |
+| task in `blocked` with **no** `blocked_by_ids` and a `block_reason` | **a worker blocked itself — it needs an answer** | resolve it (below) |
+| task in `scheduled` | waiting on its `start_at` | nothing — it auto-unblocks |
+| task in `in_progress`, no new comments for longer than the work plausibly takes | the worker died silently | treat as failure — see "Worker failure" below |
+
+**A worker-blocked task is the escalation channel, and closing it is your job.** A subagent has no
+channel to the user — it cannot ask a question and wait. When it needs a decision it calls
+`amp_block_task` and stops. That block only does something if you go looking for it. Every polling
+cycle, scan the `blocked` bucket for entries with an empty `blocked_by_ids`, and for each one:
+
+1. Read the block reason and the task's comments (`amp_get_task_comments`).
+2. If you can answer it yourself — from the plan, the KB, or a research subagent — post the answer
+   as a comment on the ticket, then requeue it and re-dispatch in the next batch:
+   `amp_set_task_state(task_id=ID, state="backlog", reason="unblocked: <answer summary>")`
+3. If it genuinely needs the user — a credential, a product decision, a tradeoff outside the plan
+   — **stop and surface it in your own response.** Quote the task ID, the block reason, and the
+   exact question. Do not keep polling and hope it clears; it never will.
+
+Never end a polling cycle with an unread worker-block. It is the single most common way a wave
+stalls while everything still looks "in flight."
+
+**After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch`, `in_progress`, and the worker-blocked portion of `blocked` are all empty.
 
 If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 

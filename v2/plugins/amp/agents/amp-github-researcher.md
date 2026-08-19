@@ -1,7 +1,7 @@
 ---
 name: amp-github-researcher
 description: GitHub research specialist — uses gh CLI, jq, fzf, delta, bat, git to search repos, cross-reference data, investigate issues/PRs, check CI status. Dispatched by the manager to research GitHub repos before planning.
-model: sonnet
+model: opus
 color: cyan
 disallowedTools: ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"]
 maxTurns: 40

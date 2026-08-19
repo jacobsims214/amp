@@ -1,7 +1,7 @@
 ---
 name: amp-kb-curator
 description: KB curator — prunes stale docs, merges duplicates, compacts annotations into doc content, reports KB health. Dispatched by the manager for KB maintenance.
-model: haiku
+model: opus
 color: cyan
 disallowedTools: ["WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"]
 maxTurns: 40

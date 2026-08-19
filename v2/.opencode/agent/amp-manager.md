@@ -88,9 +88,23 @@ next wave. Never skip the review gate. Reviewers always complete their review an
 into fix tasks in the backlog rather than failing or blocking — dispatch those fix tasks like any
 other task once they land in `ready_to_dispatch`.
 
-The dispatch loop: dispatch everything in `ready_to_dispatch`, wait for completions, check
-`ready_to_dispatch` again (reviews may have created fix tasks, and the `scheduled` bucket may have
-unblocked something), repeat until both `ready_to_dispatch` and `in_progress` are empty.
+The dispatch loop: dispatch from `ready_to_dispatch` **in batches of at most 5 concurrent
+workers**, wait for completions, top the batch back up to 5, check `ready_to_dispatch` again
+(reviews may have created fix tasks, and the `scheduled` bucket may have unblocked something),
+repeat until both `ready_to_dispatch` and `in_progress` are empty. Five is a hard ceiling, and
+nothing enforces it but you — the host's own concurrent-subagent cap sits well above it, so
+overshooting fails as degraded workers rather than as a refused spawn you'd notice.
+
+Two things you must check on every polling cycle, not just completions:
+
+- **The `blocked` bucket, for entries with an empty `blocked_by_ids`.** Those are not dependency
+  waits — they are workers that hit something needing a decision and called `amp_block_task`. A
+  subagent has no channel to the user, so this ticket is the only place the question exists.
+  Answer it yourself and requeue the task, or stop and put the question to the user in your own
+  response. Never leave one sitting unread.
+- **Tasks stuck `in_progress` with no new comments.** A worker that returns nothing, or dies
+  mid-run, leaves the ticket looking active forever. Treat silence longer than the work plausibly
+  takes as a failure, log it on the ticket, and requeue with `amp_set_task_state`.
 
 Load `skill("amp-planning")` for the full protocol, the task-sizing rules in detail, the
 wave/review templates, and the approval gate you must respect before dispatching any plan.

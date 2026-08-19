@@ -44,6 +44,34 @@ opens") — not as a substitute for `dependency_ids` when the real gate is anoth
 
 ---
 
+## `blocked` means three different things — the buckets don't separate them
+
+`amp_list_tasks` splits `scheduled` out of `blocked`, but everything else lands in one `blocked`
+array, and the three cases need completely different handling:
+
+| Case | How to recognise it | Who clears it |
+|---|---|---|
+| Waiting on a dependency | `blocked_by_ids` is non-empty | Nobody — the actor auto-unblocks it when the last dep completes |
+| Waiting on a start time | `block_reason` starts with `scheduled:` (bucketed as `scheduled`) | Nobody — the timer unblocks it |
+| **A worker blocked itself** | `blocked_by_ids` is **empty** and `block_reason` is free text | **The manager, by hand** — nothing auto-clears it |
+
+The third case is the escalation path: `amp_block_task {task_id, reason}` is how a running
+subagent says "I need an answer." It works from `in_progress`, sets the state to `blocked`, and
+records the reason on the ticket. It is the only signal a worker has — a subagent cannot reach the
+user, and its comments alone leave the ticket looking active.
+
+Nothing ever unblocks that task on its own. To resume it, answer on the ticket and requeue:
+
+```
+amp_add_task_comment(task_id=ID, body="<the answer>", author="amp-manager")
+amp_set_task_state(task_id=ID, state="backlog", reason="unblocked: <summary>")
+```
+
+`amp_set_task_state` is also the fix for a task stranded `in_progress` by a worker that crashed or
+returned nothing — reset it to `backlog` and re-dispatch.
+
+---
+
 ## Key argument types
 
 - `project_id`, `task_id`, `epic_id`, `story_id` — integers

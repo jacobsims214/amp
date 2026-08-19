@@ -22,6 +22,7 @@ Usage: opencode_to_claude.py <v2-dir> <plugin-out-dir>
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import sys
@@ -55,7 +56,13 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 
 PLUGIN_NAME = "amp"
-PLUGIN_VERSION = "2.0.0"
+
+# `claude plugin update` compares the installed version against the marketplace's
+# and does nothing when they match — so a hardcoded version means every rebuild
+# after the first is invisible to anyone who already installed. The patch number
+# is the repo's commit count, which is monotonic and deterministic; the build
+# script passes it in as AMP_PLUGIN_VERSION.
+PLUGIN_VERSION = os.environ.get("AMP_PLUGIN_VERSION", "2.0.0")
 MCP_SERVER_NAME = "amp"
 
 # openrouter model -> Claude Code model tier. Cheap/small models map to haiku,
