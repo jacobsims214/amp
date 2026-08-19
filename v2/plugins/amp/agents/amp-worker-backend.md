@@ -1,7 +1,7 @@
 ---
 name: amp-worker-backend
 description: Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend tests. Executes one assigned AMP task end-to-end.
-model: opus
+model: sonnet
 color: green
 disallowedTools: ["TodoWrite"]
 maxTurns: 60

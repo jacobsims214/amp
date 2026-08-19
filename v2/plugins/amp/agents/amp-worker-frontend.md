@@ -1,7 +1,7 @@
 ---
 name: amp-worker-frontend
 description: Frontend specialist — React, TypeScript, Tailwind, frontend tests. Executes one assigned AMP task end-to-end.
-model: opus
+model: sonnet
 color: magenta
 disallowedTools: ["TodoWrite"]
 maxTurns: 60

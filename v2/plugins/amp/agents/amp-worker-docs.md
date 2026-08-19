@@ -1,7 +1,7 @@
 ---
 name: amp-worker-docs
 description: Docs/ops specialist — git commits/PRs, KB writes, markdown docs, config-only edits. Executes one assigned AMP task end-to-end.
-model: opus
+model: sonnet
 color: green
 disallowedTools: ["TodoWrite"]
 maxTurns: 40

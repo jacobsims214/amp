@@ -21,6 +21,8 @@ create the ticket first, then do the work against it.
 ## Before you plan
 
 Read `.amp.json` to get the project ID. If it doesn't exist, load `amp-init` first.
+Note whether it sets `max_concurrent_workers` — it caps how many workers you may run at
+once at dispatch time (see Step 0.5 under Dispatch). Most projects don't set it.
 
 Search the KB before creating anything:
 ```
@@ -475,26 +477,36 @@ between them, do not dispatch both in the same wave: either add the missing `dep
 there's time to do so before dispatching), or dispatch one now and hold the other until the first
 completes.
 
-**Step 0.5 — cap the batch at 5 workers.** Never spawn more than **5 subagents at a time**, no
-matter how many tasks are sitting in `ready_to_dispatch`. This is a hard ceiling, not a target,
-and **nothing enforces it but you.** The host's own concurrent-subagent cap
-(`CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS`) is left at its default, well above 5 — it is a runaway
-backstop, not this limit. Five is where AMP's workers stop stepping on each other, so keeping to
-it is a discipline you apply at dispatch time, every wave, without being stopped.
+**Step 0.5 — apply the project's worker limit, if it has one.** `.amp.json` may carry an optional
+`max_concurrent_workers` key:
 
-Sort `ready_to_dispatch` (highest priority first, then lowest task ID) and take the first 5. The
-rest wait — do not dispatch them, do not mark them `in_progress`. As each worker returns, top the
-batch back up to 5 from whatever is ready by then.
+```json
+{ "project_id": 2, "project_name": "...", "max_concurrent_workers": 5 }
+```
 
-If a spawn ever does come back with `Concurrent subagent limit reached. Do not retry.` — you
-overshot, or something else in the session is holding agents — the task is already marked
-`in_progress` with nobody behind it. Reset it immediately so the board stays honest, then
-re-dispatch it in the next batch:
+- **Key absent (the default):** no limit. Dispatch everything in `ready_to_dispatch`, as always.
+- **Key present:** never have more than that many workers running at once — count what is already
+  `in_progress`, not just what you are about to spawn.
+
+Some projects need this and most don't. It exists because concurrency limits are a property of a
+team's infrastructure — rate limits, a shared dev database, an AMP server under load — not of AMP
+itself, so the number belongs next to the project it constrains rather than baked into this skill.
+Read the key when you read `.amp.json` for the `project_id`; don't guess at a number nobody set,
+and don't apply a limit that isn't there.
+
+When a limit is set: sort `ready_to_dispatch` (highest priority first, then lowest task ID) and
+take as many as the limit allows. The rest wait — do not dispatch them, do not mark them
+`in_progress`. As each worker returns, top the batch back up from whatever is ready by then.
+
+Independently of that key, a spawn can come back with `Concurrent subagent limit reached. Do not
+retry.` — the host has its own ceiling on concurrent subagents, well above anything AMP would
+normally ask for. The task is already marked `in_progress` with nobody behind it, so reset it and
+re-dispatch in the next batch rather than retrying the spawn:
 ```
 amp_set_task_state(task_id=ID, state="backlog", reason="spawn hit concurrent subagent cap — requeued")
 ```
 
-For every task **in the current batch of 5 or fewer**, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
+For every task **in the batch you are actually spawning now**, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
 
 **Step 1 — dispatch each task** (marks it in_progress on the board):
 ```
@@ -503,7 +515,7 @@ amp_dispatch_task(task_id=ID, agent_id=<task's assigned_to>)
 Only call this for tasks you are spawning in this batch. A task sitting `in_progress` with no
 live worker behind it is a failure you cannot see.
 
-**Step 2 — spawn workers in a single message** (runs them in parallel — at most 5):
+**Step 2 — spawn workers in a single message** (runs them in parallel):
 ```
 task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
 task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
@@ -519,7 +531,7 @@ Poll `amp_list_tasks` and read all of it. `blocked` is not one thing:
 
 | What you see | What it means | What you do |
 |---|---|---|
-| task in `completed` | worker finished | top the batch back up to 5 from `ready_to_dispatch` |
+| task in `completed` | worker finished | top the batch back up from `ready_to_dispatch` |
 | task in `blocked` **with** `blocked_by_ids` | waiting on another task | nothing — it auto-unblocks |
 | task in `blocked` with **no** `blocked_by_ids` and a `block_reason` | **a worker blocked itself — it needs an answer** | resolve it (below) |
 | task in `scheduled` | waiting on its `start_at` | nothing — it auto-unblocks |
