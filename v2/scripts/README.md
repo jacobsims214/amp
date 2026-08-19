@@ -42,6 +42,14 @@ Edit `v2/.opencode/` and rebuild — direct edits to `v2/plugins/amp/` are overw
 conversion lives in `scripts/lib/opencode_to_claude.py`; its `MAPPING NOTES` header is the
 opencode → Claude Code translation table.
 
+**Editing `.opencode/` is not enough on its own.** The plugin is a build artifact and installs
+are snapshot copies under `~/.claude/plugins/cache/`, so a change reaches a machine only after
+`build-claude-plugin.sh` → `setup-claude-code.sh` → restart. A `git pull` alone changes nothing.
+
+The build stamps the plugin version as `2.0.<commit count>` (override with `AMP_PLUGIN_VERSION`).
+That matters: `claude plugin update` compares versions and does nothing when they match, so a
+rebuild that keeps the old version is silently invisible to everyone who already installed.
+
 ### What the conversion does
 
 | opencode | Claude Code |

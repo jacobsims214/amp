@@ -56,8 +56,8 @@ Read every field:
 - `acceptance_criteria` — exactly what done looks like
 - `assigned_to` — should match your agent ID
 
-If description is missing or unclear: post a comment explaining what is missing and
-**STOP**. Do not guess at intent.
+If description is missing or unclear: do not guess at intent — go to Step 5 and block. A
+comment on its own is not enough; the ticket has to change state or nobody finds out.
 
 ---
 
@@ -119,21 +119,46 @@ that embeds well for semantic search.
 
 ---
 
-## Step 5 — Cannot proceed
+## Step 5 — Cannot proceed, or need an answer
 
-If you hit a blocker:
+**You cannot ask a question and wait for a reply.** You have no channel to the user and no
+channel back to the manager while you are running — nobody is reading your output until you
+finish. Ending your turn with a question in it is the same as ending it with silence: the wave
+stalls, the ticket sits `in_progress` forever, and nobody knows why. If you need a decision,
+a credential, a missing file, or a call the ticket doesn't make for you, you **block** — you
+never ask and hope.
 
+Blocking is three actions, all three required, in this order:
+
+**1. Comment the detail on the ticket:**
 ```
 amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
 CANNOT PROCEED.
 
 Reason: [exact blocker]
 What I tried: [steps]
-What is needed: [specific requirement]
+What is needed: [the specific question or requirement — phrase it so it can be answered
+                 without re-reading the whole ticket]
 """, author="amp-worker")
 ```
 
-Stop. Do NOT call amp_complete_task.
+**2. Move the ticket into the blocked state** — this is what the manager actually sees. A comment
+alone does not change the ticket's state, so a commented-but-not-blocked task is indistinguishable
+from one still being worked:
+```
+amp_block_task(task_id=YOUR_TASK_ID, reason="[one line — the question or missing thing]")
+```
+
+**3. End your turn with the report, as plain text** (see Step 7). Start it with `BLOCKED:` so the
+manager sees it without opening the ticket.
+
+Do NOT call `amp_complete_task`. Do not guess at the answer and carry on — a wrong guess costs
+more than a blocked ticket.
+
+**Running out of room counts as a blocker.** If you are burning through your step budget and the
+work is not going to fit, do not keep going until you are cut off mid-tool-call — being cut off
+reports nothing to anybody. Stop while you still have turns left, comment what is done and what
+remains, `amp_block_task` with reason "ran out of steps — [what remains]", and report back.
 
 ---
 
@@ -174,12 +199,49 @@ amp_complete_task(task_id=YOUR_TASK_ID)
 
 ---
 
+## Step 7 — Report back in your final message
+
+**`amp_complete_task` is not the end of the task. Your final message is.**
+
+The last thing you emit is your entire report to the manager — it is the only part of your run the
+manager ever sees directly. If your turn ends on a tool call, or on empty output, the manager gets
+nothing back and has to guess from the board whether you succeeded, died, or are still thinking.
+That guess is where waves stall.
+
+So: after the last tool call, always write a short plain-text summary and end there. No tool call
+after it.
+
+Completed work:
+```
+DONE — task #<id>: <task name>
+
+Changed: <file>: <one line>, <file>: <one line>   (or "no files changed")
+KB: <doc path or "none">
+Criteria: <N>/<N> verified   (name any that were COULD NOT VERIFY, and why)
+```
+
+Blocked work (from Step 5):
+```
+BLOCKED — task #<id>: <task name>
+
+Needs: <the exact question or missing thing>
+Done so far: <one line>
+Ticket state: blocked via amp_block_task
+```
+
+Keep it to a handful of lines — the detail already lives in the ticket comments. What matters is
+that the manager learns three things without opening anything: which task, whether it finished,
+and what it needs next if it didn't.
+
+---
+
 ## MCP tools
 
 ```
 amp_get_task {task_id}
 amp_add_task_comment {task_id, body, author}
 amp_complete_task {task_id}
+amp_block_task {task_id, reason}   ← Step 5; the only way to escalate
 amp_get_ticket_history {task_id}
 amp_get_epic / amp_get_story
 amp_create_task {project_id, epic_id, story_id, name, description, acceptance_criteria, assigned_to}

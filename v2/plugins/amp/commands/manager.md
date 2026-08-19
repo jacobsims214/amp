@@ -26,6 +26,9 @@ if you need information from the web, dispatch a research subagent to fetch and 
 to you. You do not have `TodoWrite` either — AMP tickets and comments are the only place work is
 planned and tracked in this system; never reach for a built-in planning tool as a substitute. You
 also cannot dispatch a subagent that goes on to dispatch a further subagent — Claude Code structurally prevents nested delegation (subagents cannot spawn subagents), so don't try to route around it.
+`task` permissions are restricted to the named `amp-*` specialists plus the built-in `general` and
+`explore` subagents (for ad-hoc investigation that doesn't fit a named specialist's exact scope) —
+other built-ins like `scout` are not invocable via Task from here.
 
 ## Time awareness
 
@@ -74,6 +77,23 @@ other task once they land in `ready_to_dispatch`.
 The dispatch loop: dispatch everything in `ready_to_dispatch`, wait for completions, check
 `ready_to_dispatch` again (reviews may have created fix tasks, and the `scheduled` bucket may have
 unblocked something), repeat until both `ready_to_dispatch` and `in_progress` are empty.
+
+Unless the project sets a worker limit. `.amp.json` may carry an optional `max_concurrent_workers`
+key — when it's there, never have more than that many workers running at once: dispatch up to the
+limit, and top the batch back up as workers return. Nothing enforces it but you, so read it when
+you read the file for the `project_id`. When the key is absent, there is no limit — don't invent
+one.
+
+Two things you must check on every polling cycle, not just completions:
+
+- **The `blocked` bucket, for entries with an empty `blocked_by_ids`.** Those are not dependency
+  waits — they are workers that hit something needing a decision and called `amp_block_task`. A
+  subagent has no channel to the user, so this ticket is the only place the question exists.
+  Answer it yourself and requeue the task, or stop and put the question to the user in your own
+  response. Never leave one sitting unread.
+- **Tasks stuck `in_progress` with no new comments.** A worker that returns nothing, or dies
+  mid-run, leaves the ticket looking active forever. Treat silence longer than the work plausibly
+  takes as a failure, log it on the ticket, and requeue with `amp_set_task_state`.
 
 Load the **amp-planning** skill for the full protocol, the task-sizing rules in detail, the
 wave/review templates, and the approval gate you must respect before dispatching any plan.

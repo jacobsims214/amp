@@ -21,6 +21,8 @@ create the ticket first, then do the work against it.
 ## Before you plan
 
 Read `.amp.json` to get the project ID. If it doesn't exist, load `amp-init` first.
+Note whether it sets `max_concurrent_workers` — it caps how many workers you may run at
+once at dispatch time (see Step 0.5 under Dispatch). Most projects don't set it.
 
 Search the KB before creating anything:
 ```
@@ -475,12 +477,43 @@ between them, do not dispatch both in the same wave: either add the missing `dep
 there's time to do so before dispatching), or dispatch one now and hold the other until the first
 completes.
 
-For every task in `ready_to_dispatch`, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
+**Step 0.5 — apply the project's worker limit, if it has one.** `.amp.json` may carry an optional
+`max_concurrent_workers` key:
+
+```json
+{ "project_id": 2, "project_name": "...", "max_concurrent_workers": 5 }
+```
+
+- **Key absent (the default):** no limit. Dispatch everything in `ready_to_dispatch`, as always.
+- **Key present:** never have more than that many workers running at once — count what is already
+  `in_progress`, not just what you are about to spawn.
+
+Some projects need this and most don't. It exists because concurrency limits are a property of a
+team's infrastructure — rate limits, a shared dev database, an AMP server under load — not of AMP
+itself, so the number belongs next to the project it constrains rather than baked into this skill.
+Read the key when you read `.amp.json` for the `project_id`; don't guess at a number nobody set,
+and don't apply a limit that isn't there.
+
+When a limit is set: sort `ready_to_dispatch` (highest priority first, then lowest task ID) and
+take as many as the limit allows. The rest wait — do not dispatch them, do not mark them
+`in_progress`. As each worker returns, top the batch back up from whatever is ready by then.
+
+Independently of that key, a spawn can come back with `Concurrent subagent limit reached. Do not
+retry.` — the host has its own ceiling on concurrent subagents, well above anything AMP would
+normally ask for. The task is already marked `in_progress` with nobody behind it, so reset it and
+re-dispatch in the next batch rather than retrying the spawn:
+```
+amp_set_task_state(task_id=ID, state="backlog", reason="spawn hit concurrent subagent cap — requeued")
+```
+
+For every task **in the batch you are actually spawning now**, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
 
 **Step 1 — dispatch each task** (marks it in_progress on the board):
 ```
 amp_dispatch_task(task_id=ID, agent_id=<task's assigned_to>)
 ```
+Only call this for tasks you are spawning in this batch. A task sitting `in_progress` with no
+live worker behind it is a failure you cannot see.
 
 **Step 2 — spawn workers in a single message** (runs them in parallel):
 ```
@@ -490,7 +523,37 @@ task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's as
 
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
-After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+---
+
+## After dispatch — monitor every bucket, not just completions
+
+Poll `amp_list_tasks` and read all of it. `blocked` is not one thing:
+
+| What you see | What it means | What you do |
+|---|---|---|
+| task in `completed` | worker finished | top the batch back up from `ready_to_dispatch` |
+| task in `blocked` **with** `blocked_by_ids` | waiting on another task | nothing — it auto-unblocks |
+| task in `blocked` with **no** `blocked_by_ids` and a `block_reason` | **a worker blocked itself — it needs an answer** | resolve it (below) |
+| task in `scheduled` | waiting on its `start_at` | nothing — it auto-unblocks |
+| task in `in_progress`, no new comments for longer than the work plausibly takes | the worker died silently | treat as failure — see "Worker failure" below |
+
+**A worker-blocked task is the escalation channel, and closing it is your job.** A subagent has no
+channel to the user — it cannot ask a question and wait. When it needs a decision it calls
+`amp_block_task` and stops. That block only does something if you go looking for it. Every polling
+cycle, scan the `blocked` bucket for entries with an empty `blocked_by_ids`, and for each one:
+
+1. Read the block reason and the task's comments (`amp_get_task_comments`).
+2. If you can answer it yourself — from the plan, the KB, or a research subagent — post the answer
+   as a comment on the ticket, then requeue it and re-dispatch in the next batch:
+   `amp_set_task_state(task_id=ID, state="backlog", reason="unblocked: <answer summary>")`
+3. If it genuinely needs the user — a credential, a product decision, a tradeoff outside the plan
+   — **stop and surface it in your own response.** Quote the task ID, the block reason, and the
+   exact question. Do not keep polling and hope it clears; it never will.
+
+Never end a polling cycle with an unread worker-block. It is the single most common way a wave
+stalls while everything still looks "in flight."
+
+**After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch`, `in_progress`, and the worker-blocked portion of `blocked` are all empty.
 
 If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 

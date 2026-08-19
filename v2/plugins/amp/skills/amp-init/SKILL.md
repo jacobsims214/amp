@@ -31,6 +31,13 @@ If you don't already have a name and code from the user, infer them from the dir
 
 Write that to `.amp.json` in the current directory. Commit it — everyone working here shares the same project.
 
+One optional key is worth knowing about, though you should not add it unprompted:
+`"max_concurrent_workers": <n>` caps how many workers the manager runs at once in this project.
+Leave it out unless the user asks for a limit — absent means no limit. It's for teams whose
+infrastructure can't take a wide wave: API rate limits, a shared dev database, a loaded AMP
+server. Since that's a property of their environment rather than of the work, it lives here,
+per project, instead of in the manager's own protocol.
+
 ---
 
 ## Understanding the codebase

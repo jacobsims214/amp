@@ -22,6 +22,9 @@ tool description, since the roster can change after this doc was last updated.
 - **amp-worker-docs** (subagent) — git commits/PRs, KB writes, markdown docs, config-only edits
 - **amp-reviewer** (subagent) — wave checks and full code reviews, never original implementation
 - **amp-researcher** (subagent) — read-only investigation, dispatched by the manager to answer a question before planning
+- **amp-kb-curator** (subagent) — prunes stale docs, merges duplicates, compacts annotations, reports KB health
+- **amp-github-researcher** (subagent) — GitHub research via gh CLI, jq, fzf, delta, bat; searches repos/issues/PRs, checks CI
+- **amp-github-reviewer** (subagent) — full in-depth review of one specific GitHub PR, posts line-level comments and an approve/request-changes decision
 
 ---
 
@@ -54,6 +57,10 @@ Covers: search strategy, create vs update rules, writing content that embeds wel
 **amp-mcp**
 Use when you need the exact tool names, arguments, or return shapes for AMP MCP calls.
 Covers: full tool list by area, task scheduling (start_at), and key argument types.
+
+**amp-kb-curator**
+Use for scheduled or requested KB maintenance — pruning stale docs, merging duplicates, compacting annotations. Manager-only dispatch.
+Covers: health assessment via amp_kb_status, staleness threshold, dedup and compaction workflow.
 
 **code-reviewer**
 Use when reviewing Go, TypeScript/React, Dockerfile, or Terraform code changes.
@@ -88,3 +95,15 @@ Use when researching GitHub repos, searching code/issues/PRs, cross-referencing 
 
 **github-pr-review**
 Use when performing a full in-depth code review on a GitHub PR — fetching diffs, checking CI, posting line-level comments, approving or requesting changes. Covers: gh pr diff/view/checks/review commands, delta diff viewing, review state management.
+
+**ui-ux-pro-max**
+Use when a frontend task needs visual/UX design guidance — color, typography, layout, component patterns, stack-specific conventions.
+Covers: searchable design-pattern database (colors, typography, icons, stacks, UX guidelines) via its own search script.
+
+**aws-sso-auth**
+Use when you need to authenticate with AWS via SSO (aws-sso CLI) and run AWS CLI commands against AWS accounts and services (EKS, S3, CloudWatch, etc.).
+Covers: aws-sso exec authentication flow, credential management, common AWS CLI commands, EKS cluster token, troubleshooting auth issues.
+
+**kubectl-eks**
+Use when you need to interact with Kubernetes clusters (especially EKS) using kubectl — viewing pods, reading logs, exec into containers, restarting deployments, and troubleshooting.
+Covers: context switching, pod management, log retrieval, exec into containers, rollout restart, EKS-specific commands with aws-sso wrapper, AvWare production cluster reference.

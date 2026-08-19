@@ -1,7 +1,7 @@
 ---
 name: amp-reviewer
 description: Reviewer — wave checks and full code reviews, never original implementation.
-model: sonnet
+model: inherit
 color: yellow
 disallowedTools: ["Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs", "TodoWrite"]
 maxTurns: 45

@@ -34,6 +34,18 @@ print ""
 command -v python3 &>/dev/null || die "python3 required"
 [[ -f "${CONVERTER}" ]] || die "converter not found: ${CONVERTER}"
 
+# `claude plugin update` is a no-op when the installed version equals the
+# marketplace's, so a fixed version makes every rebuild after the first
+# invisible to anyone who already installed. Derive the patch number from the
+# commit count: monotonic, deterministic, no manual bookkeeping.
+if git -C "${REPO_DIR}" rev-parse --git-dir &>/dev/null; then
+  COMMITS="$(git -C "${REPO_DIR}" rev-list --count HEAD 2>/dev/null || print 0)"
+  export AMP_PLUGIN_VERSION="2.0.${COMMITS}"
+  info "Plugin version: ${AMP_PLUGIN_VERSION} (2.0.<commit count>)"
+else
+  warn "not a git checkout — plugin version stays at the converter default"
+fi
+
 info "Converting agents, skills, and MCP config..."
 python3 "${CONVERTER}" "${V2_DIR}" "${PLUGIN_DIR}"
 
@@ -91,7 +103,6 @@ Edit the opencode sources and rebuild — direct edits here are overwritten.
 EOF
 ok "  README.md"
 
-# Refresh the marketplace manifest version so `claude plugin update` sees changes.
 MARKETPLACE="${REPO_DIR}/.claude-plugin/marketplace.json"
 if [[ -f "${MARKETPLACE}" ]]; then
   ok "  marketplace: ${MARKETPLACE#${REPO_DIR}/}"
