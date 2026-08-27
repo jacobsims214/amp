@@ -2,9 +2,7 @@
 description: Docs/ops specialist — git commits/PRs, KB writes, markdown docs, config-only edits. Executes one assigned AMP task end-to-end.
 mode: subagent
 hidden: true
-model: amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
-temperature: 0.1
-steps: 10
+model: agentic-flywheel/gateway
 permission:
   edit: allow
   bash: allow

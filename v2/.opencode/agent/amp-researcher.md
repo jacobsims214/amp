@@ -2,9 +2,7 @@
 description: Read-only researcher — investigates and reports, never edits files. Dispatched by the manager to answer a question before planning.
 mode: subagent
 hidden: true
-model: amazon-bedrock/us.anthropic.claude-haiku-4-5-20251001-v1:0
-temperature: 0.2
-steps: 15
+model: agentic-flywheel/gateway
 permission:
   edit: deny
   bash: allow

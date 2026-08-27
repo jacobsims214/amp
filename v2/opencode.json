@@ -13,6 +13,39 @@
         "qwen-3.5-medium-35b-a3b": {},
         "qwen-3.6-35b-a3b": {}
       }
+    },
+    "agentic-flywheel": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Agentic Flywheel (Switchyard AI Gateway)",
+      "options": {
+        "baseURL": "https://ai-gateway.rp-tools-nonprod.rvohealth.com/v1",
+        "headers": {
+          "x-api-key": "{env:AGENTIC_FLYWHEEL_API_KEY}"
+        }
+      },
+      "models": {
+        "gateway": {
+          "name": "Switchyard (auto: nemotron/sonnet)",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
+        },
+        "nemotron": {
+          "name": "Nemotron 3.5 Lightning (direct, no classifier)",
+          "limit": {
+            "context": 128000,
+            "output": 8192
+          }
+        },
+        "sonnet": {
+          "name": "Claude Sonnet 5 via Bedrock (direct, no classifier)",
+          "limit": {
+            "context": 200000,
+            "output": 8192
+          }
+        }
+      }
     }
   },
   "mcp": {

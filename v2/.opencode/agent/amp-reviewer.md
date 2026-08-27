@@ -2,8 +2,7 @@
 description: Reviewer — wave checks and full code reviews, never original implementation.
 mode: subagent
 hidden: true
-model: amazon-bedrock/us.anthropic.claude-sonnet-5
-steps: 15
+model: agentic-flywheel/gateway
 permission:
   edit: deny
   bash: allow
