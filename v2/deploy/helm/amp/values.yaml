@@ -37,6 +37,24 @@ image:
   pullPolicy: IfNotPresent
   registry: ""   # empty = local images built straight into the docker-desktop node, no registry needed
 
+# MCP token audience (MCP spec 2026-07-28: an MCP server MUST only accept
+# tokens issued for it). amp-mcpoauth makes Dex mint MCP tokens with
+# aud=<mcpAudience> via Dex cross-client trust; amp-api checks for it on
+# /mcp (and accepts it alongside oauth2Proxy.clientID on /api).
+#
+# audienceMode:
+#   off     — no audience check (pre-2026-07-28 behaviour)
+#   warn    — accept, but log every token enforce would reject. Upgrade-path
+#             default: clients that logged in before this release hold
+#             tokens without the audience until they next re-authorize.
+#   enforce — reject with 401 + WWW-Authenticate, which makes MCP clients
+#             re-run OAuth and come back with an audience-bound token.
+# Flip to enforce once amp-api's logs stop showing
+# "token audience not accepted (audience mode=warn ...)".
+auth:
+  audienceMode: warn
+  mcpAudience: amp-mcp
+
 ampApi:
   image: amp-api
   tag: local

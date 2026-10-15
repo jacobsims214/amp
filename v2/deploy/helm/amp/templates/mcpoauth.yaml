@@ -43,6 +43,8 @@ spec:
               value: "https://{{ .Values.global.domain }}/dex"
             - name: MCP_RESOURCE_URL
               value: "https://{{ .Values.global.domain }}/mcp"
+            - name: MCP_AUDIENCE_CLIENT_ID
+              value: {{ .Values.auth.mcpAudience | quote }}
             - name: DEX_GRPC_ADDR
               value: "dex-grpc.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.grpcPort }}"
             - name: DEX_GRPC_CA_CERT

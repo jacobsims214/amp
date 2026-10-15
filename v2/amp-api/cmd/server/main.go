@@ -15,7 +15,6 @@ import (
 
 	protoactor "github.com/asynkron/protoactor-go/actor"
 	"github.com/hibiken/asynq"
-	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/rs/cors"
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/api"
@@ -134,39 +133,41 @@ func main() {
 	}
 
 	// ---- 5. MCP server (port 8000) ----
-	// Streamable HTTP transport (2025-03-26+ spec) — a single endpoint
-	// handling POST (requests), GET (optional server push), and DELETE
-	// (session teardown), correlated via the Mcp-Session-Id header. This
-	// replaced the older HTTP+SSE transport (separate /sse + /message
-	// endpoints) after real-world testing showed modern clients (opencode,
-	// Claude Code, etc.) default to Streamable HTTP and don't reliably keep
-	// a legacy SSE GET connection open long enough for it to work.
-	mcpSrv := mcpserver.NewMCPServer("amp-api", "2.0.0", mcpserver.WithToolCapabilities(false))
-	mcpHandler := mcp.NewServer(registry, repo, sseHub, kbSvc)
-	mcpHandler.Register(mcpSrv)
+	// Streamable HTTP, dual-era: requests carrying 2026-07-28 per-request
+	// _meta are served statelessly; legacy clients that open with
+	// initialize (2025-11-25 and earlier) keep their Mcp-Session-Id
+	// session exactly as before. See mcp_http.go.
+	mcpSrv := newMCPServer(mcp.NewServer(registry, repo, sseHub, kbSvc))
 
-	mcpPublicBaseURL := envOrDefault("MCP_PUBLIC_URL", fmt.Sprintf("http://localhost%s", mcpAddr))
-	streamableSrv := mcpserver.NewStreamableHTTPServer(mcpSrv)
+	// Token audience (RFC 8707 / MCP 2026-07-28 "token audience binding").
+	// MCP tokens must carry the MCP_AUDIENCE client ID, which the
+	// amp-mcpoauth broker obtains via Dex cross-client trust; the REST API
+	// additionally accepts the UI's oauth2-proxy client. AUDIENCE_MODE
+	// (off|warn|enforce) staggers rollout: warn logs tokens that enforce
+	// would reject so pre-upgrade clients can be watched before enforcing.
+	audienceMode, err := auth.ParseAudienceMode(os.Getenv("AUDIENCE_MODE"))
+	if err != nil {
+		slog.Error("invalid AUDIENCE_MODE", "err", err)
+		os.Exit(1)
+	}
+	mcpAudience := envOrDefault("MCP_AUDIENCE", "amp-mcp")
+	restAudiences := append(splitList(os.Getenv("REST_AUDIENCES")), mcpAudience)
 
-	mcpCORS := cors.New(cors.Options{
-		AllowedOrigins: []string{"*"},
-		AllowedMethods: []string{"GET", "POST", "DELETE", "OPTIONS"},
-		AllowedHeaders: []string{"Content-Type", "Authorization", "Mcp-Session-Id"},
-		ExposedHeaders: []string{"Mcp-Session-Id"},
-	})
-
-	mcpPublicMux := http.NewServeMux()
-	mcpPublicMux.HandleFunc("/.well-known/oauth-protected-resource", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		authServerURL := envOrDefault("MCP_OAUTH_PUBLIC_URL", "http://localhost:8091")
-		fmt.Fprintf(w, `{"resource":%q,"authorization_servers":[%q]}`, mcpPublicBaseURL, authServerURL)
-	})
-	mcpPublicMux.Handle("/", verifier.Middleware(streamableSrv))
-	verifier.ResourceMetadataURL = mcpPublicBaseURL + "/.well-known/oauth-protected-resource"
+	mcpCfg := mcpHTTPConfig{
+		PublicURL:      envOrDefault("MCP_PUBLIC_URL", fmt.Sprintf("http://localhost%s", mcpAddr)),
+		OAuthURL:       envOrDefault("MCP_OAUTH_PUBLIC_URL", "http://localhost:8091"),
+		Scopes:         []string{"openid", "email", "profile"},
+		AllowedOrigins: splitList(os.Getenv("MCP_ALLOWED_ORIGINS")),
+	}
+	mcpVerifier := verifier.WithAudiences("mcp", audienceMode, mcpAudience)
+	mcpVerifier.ResourceMetadataURL = mcpCfg.PublicURL + "/.well-known/oauth-protected-resource"
+	mcpVerifier.Scope = strings.Join(mcpCfg.Scopes, " ")
+	restVerifier := verifier.WithAudiences("rest", audienceMode, restAudiences...)
+	slog.Info("token audience policy", "mode", audienceMode, "mcp", mcpAudience, "rest", restAudiences)
 
 	mcpPublicServer := &http.Server{
 		Addr:    mcpAddr,
-		Handler: mcpCORS.Handler(mcpPublicMux),
+		Handler: newMCPHTTPHandler(mcpSrv, mcpVerifier, mcpCfg),
 	}
 	go func() {
 		slog.Info("MCP public server listening (Streamable HTTP, auth-enforced)", "addr", mcpAddr)
@@ -194,7 +195,7 @@ func main() {
 
 	// Auth wraps everything except /health.
 	var apiHandler http.Handler = mux
-	apiHandler = authExceptHealth(verifier, apiHandler)
+	apiHandler = authExceptHealth(restVerifier, apiHandler)
 	apiHandler = corsMiddleware.Handler(apiHandler)
 
 	apiServer := &http.Server{
