@@ -10,6 +10,14 @@ export interface BoardData {
   loading: boolean
   error: string | null
   refresh: () => void
+  /** Merge an updated entity (e.g. from an assign/owner API response) by id. */
+  applyTask: (task: Task) => void
+  applyEpic: (epic: Epic) => void
+  applyStory: (story: Story) => void
+}
+
+function mergeById<T extends { id: number }>(item: T) {
+  return (prev: T[]) => prev.map(x => x.id === item.id ? { ...x, ...item } : x)
 }
 
 export function useBoardData(projectId: number): BoardData {
@@ -49,10 +57,12 @@ export function useBoardData(projectId: number): BoardData {
         setEpics(prev => prev.find(e => e.id === epic.id) ? prev : [...prev, epic])
         break
       }
-      case 'epic.state_changed': {
-        // Epic state changed (in_progress or completed) — update in place.
+      case 'epic.state_changed':
+      case 'epic.updated': {
+        // Epic state changed (in_progress or completed) or owners/fields
+        // edited — update in place.
         const epic = event.payload as Epic
-        setEpics(prev => prev.map(e => e.id === epic.id ? { ...e, ...epic } : e))
+        setEpics(mergeById(epic))
         break
       }
       case 'story.created': {
@@ -60,10 +70,11 @@ export function useBoardData(projectId: number): BoardData {
         setStories(prev => prev.find(s => s.id === story.id) ? prev : [...prev, story])
         break
       }
-      case 'story.state_changed': {
-        // Story state changed — update in place.
+      case 'story.state_changed':
+      case 'story.updated': {
+        // Story state changed or owners/fields edited — update in place.
         const story = event.payload as Story
-        setStories(prev => prev.map(s => s.id === story.id ? { ...s, ...story } : s))
+        setStories(mergeById(story))
         break
       }
       case 'task.created': {
@@ -75,15 +86,21 @@ export function useBoardData(projectId: number): BoardData {
       case 'task.dispatched':
       case 'task.completed':
       case 'task.blocked':
-      case 'task.unblocked': {
+      case 'task.unblocked':
+      case 'task.assigned': {
         // task.unblocked is the new dedicated event type (was task.updated before).
         // When a scheduled task is unblocked, it transitions from blocked to backlog state.
+        // task.assigned carries the full task with its new owner_user_id.
         const task = event.payload as Task
-        setTasks(prev => prev.map(t => t.id === task.id ? { ...t, ...task } : t))
+        setTasks(mergeById(task))
         break
       }
     }
   }, []))
 
-  return { epics, stories, tasks, loading, error, refresh: load }
+  const applyTask = useCallback((task: Task) => setTasks(mergeById(task)), [])
+  const applyEpic = useCallback((epic: Epic) => setEpics(mergeById(epic)), [])
+  const applyStory = useCallback((story: Story) => setStories(mergeById(story)), [])
+
+  return { epics, stories, tasks, loading, error, refresh: load, applyTask, applyEpic, applyStory }
 }

@@ -7,6 +7,10 @@ export interface Project {
   code: string
   description: string
   state: 'active' | 'archived'
+  org_id?: number | null
+  created_by?: number | null
+  /** any project member may reassign tickets that aren't in progress */
+  open_reassign?: boolean
   created_at: string
   updated_at: string
 }
@@ -18,6 +22,8 @@ export interface Epic {
   description: string
   state: string
   priority: Priority
+  created_by?: number | null
+  owner_ids?: number[]
   created_at: string
   updated_at: string
 }
@@ -31,6 +37,8 @@ export interface Story {
   acceptance_criteria: string
   state: string
   priority: Priority
+  created_by?: number | null
+  owner_ids?: number[]
   created_at: string
   updated_at: string
 }
@@ -47,12 +55,14 @@ export interface Task {
   priority: Priority
   dependency_ids: number[]
   blocked_by_ids?: number[]
-  assigned_to?: string    // set at plan time by manager — who should work this
-  agent_id?: string       // set at dispatch time — who is actually working it
+  assigned_to?: string    // AGENT profile, set at plan time by manager — which agent should work this
+  agent_id?: string       // AGENT, set at dispatch time — which agent is actually working it
   dispatched_at?: string
   completed_at?: string
   block_reason?: string
   start_at?: string       // RFC3339 UTC timestamp for scheduled tasks
+  created_by?: number | null     // AMP user who created the ticket (null for legacy rows)
+  owner_user_id?: number | null  // the one human owner; null = unassigned ("pool")
   created_at: string
   updated_at: string
 }
@@ -144,6 +154,9 @@ export interface SSEEvent {
     | 'task.blocked'
     | 'task.unblocked'
     | 'comment.added'
+    | 'task.assigned'
+    | 'epic.updated'
+    | 'story.updated'
   project_id?: number
   payload?: unknown
   at?: string
@@ -187,6 +200,8 @@ export interface CreateTaskRequest {
   priority?: string
   dependency_ids?: number[]
   start_at?: string
+  /** omit = me; "none" = unassigned; or a project member's email / user id */
+  owner?: string
 }
 
 export interface UpdateTaskRequest {
@@ -206,6 +221,7 @@ export interface Me {
   name: string
   roles: string[]
   user_id?: number
+  orgs?: Org[]
 }
 
 export interface AmpUser {
@@ -223,3 +239,79 @@ export interface AuthAdminUser {
   username: string
 }
 
+
+// ---- Orgs / teams / access ----
+
+export type OrgRole = 'owner' | 'admin' | 'member'
+export type TeamRole = 'lead' | 'member'
+export type ProjectTeamRole = 'owner' | 'member'
+export type ProjectAccess = 'member' | 'lead' | 'owner' | 'org_admin' | 'global_admin'
+
+export interface Org {
+  id: number
+  name: string
+  slug: string
+  created_by: number | null
+  created_at: string
+  /** caller's role in the org; "" when not a member (e.g. a global admin browsing) */
+  my_role?: OrgRole | ''
+}
+
+export interface Team {
+  id: number
+  org_id: number
+  name: string
+  created_by: number | null
+  created_at: string
+}
+
+/** A user's membership in an org (role: OrgRole) or team (role: TeamRole). */
+export interface Member {
+  user_id: number
+  email: string
+  display_name: string
+  role: string
+}
+
+export interface ProjectMember {
+  user_id: number
+  email: string
+  display_name: string
+  access: ProjectAccess
+}
+
+export interface ProjectTeam {
+  project_id: number
+  team_id: number
+  team_name: string
+  role: ProjectTeamRole
+}
+
+export interface Invite {
+  id: number
+  email: string
+  org_id: number
+  org_role: string
+  team_id?: number | null
+  team_role: string
+  invited_by: number | null
+  created_at: string
+  accepted_at?: string | null
+}
+
+/** Result of adding a member by email/id: either added directly or invited. */
+export interface AddMemberResult {
+  invited?: boolean
+  invite?: Invite
+  added?: boolean
+  user_id?: number
+  role?: string
+}
+
+export interface CreateProjectRequest {
+  name: string
+  code: string
+  description?: string
+  org_id?: number
+  team_id?: number
+}

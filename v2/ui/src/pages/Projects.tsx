@@ -1,10 +1,21 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck } from 'lucide-react'
+import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck, Building2, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
-import type { Project, SSEEvent } from '../types'
+import { CrudModal, inputCls, labelCls } from '../components/CrudModal'
+import { ProjectHomeFields, type ProjectHome } from '../components/ProjectHomeFields'
+import type { Org, Project, SSEEvent } from '../types'
+
+const NO_HOME: ProjectHome = { orgId: null, teamId: null }
+
+function homeParams(home: ProjectHome) {
+  return {
+    ...(home.orgId != null ? { org_id: home.orgId } : {}),
+    ...(home.teamId != null ? { team_id: home.teamId } : {}),
+  }
+}
 
 function relativeTime(iso: string) {
   const diff = Date.now() - new Date(iso).getTime()
@@ -33,6 +44,53 @@ export function Projects() {
   const [exportError, setExportError] = useState<string | null>(null)
   const [importing, setImporting] = useState(false)
   const [importError, setImportError] = useState<string | null>(null)
+
+  // Orgs the caller can place projects in (global admins see all).
+  const [orgs, setOrgs] = useState<Org[]>([])
+  const [createOpen, setCreateOpen] = useState(false)
+  const [createForm, setCreateForm] = useState({ name: '', code: '', description: '' })
+  const [createHome, setCreateHome] = useState<ProjectHome>(NO_HOME)
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+  const [importModalOpen, setImportModalOpen] = useState(false)
+  const [importHome, setImportHome] = useState<ProjectHome>(NO_HOME)
+  const importHomeRef = useRef<ProjectHome>(NO_HOME)
+
+  useEffect(() => {
+    api.listOrgs().then(setOrgs).catch(() => setOrgs([]))
+  }, [])
+
+  const defaultHome = (): ProjectHome => ({ orgId: orgs.length > 1 ? orgs[0].id : null, teamId: null })
+
+  const openCreate = () => {
+    setCreateForm({ name: '', code: '', description: '' })
+    setCreateHome(defaultHome())
+    setCreateError(null)
+    setCreateOpen(true)
+  }
+
+  const handleCreate = async () => {
+    if (!createForm.name.trim() || !createForm.code.trim()) {
+      setCreateError('Name and code are required')
+      return
+    }
+    setCreating(true)
+    setCreateError(null)
+    try {
+      const p = await api.createProject({
+        name: createForm.name.trim(),
+        code: createForm.code.trim(),
+        description: createForm.description.trim(),
+        ...homeParams(createHome),
+      })
+      setCreateOpen(false)
+      navigate(`/project/${p.id}`)
+    } catch (err) {
+      setCreateError(err instanceof Error ? err.message : 'Create failed')
+    } finally {
+      setCreating(false)
+    }
+  }
 
   useEffect(() => {
     api.listProjects()
@@ -79,7 +137,22 @@ export function Projects() {
     } finally { setExportingId(null) }
   }
 
-  const handleImportClick = () => fileInputRef.current?.click()
+  // With several orgs to choose from, ask where the import should live first.
+  const handleImportClick = () => {
+    if (orgs.length > 1) {
+      setImportHome(defaultHome())
+      setImportModalOpen(true)
+      return
+    }
+    importHomeRef.current = NO_HOME
+    fileInputRef.current?.click()
+  }
+
+  const handleImportChooseFile = () => {
+    importHomeRef.current = importHome
+    setImportModalOpen(false)
+    fileInputRef.current?.click() // must stay synchronous with the click for the file dialog to open
+  }
 
   const handleFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
@@ -87,7 +160,7 @@ export function Projects() {
     setImporting(true); setImportError(null)
     try {
       const text = await file.text()
-      const newProject = await api.importProject(text)
+      const newProject = await api.importProject(text, homeParams(importHomeRef.current))
       navigate(`/project/${newProject.id}`)
     } catch (err) {
       setImportError(err instanceof Error ? err.message : 'Import failed')
@@ -145,10 +218,27 @@ export function Projects() {
               </Link>
             )}
             {me && (
+              <Link
+                to="/admin/orgs"
+                title="Organizations and teams"
+                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+              >
+                <Building2 size={13} />
+                Orgs
+              </Link>
+            )}
+            {me && (
               <span className="text-xs text-[#3D5068]" title={me.subject}>
                 {me.email}
               </span>
             )}
+            <button
+              onClick={openCreate}
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer bg-[#6366F1] hover:bg-[#4F46E5] text-white"
+            >
+              <Plus size={12} />
+              New project
+            </button>
             <button
               onClick={handleImportClick}
               disabled={importing}
@@ -288,6 +378,30 @@ export function Projects() {
           </div>
         )}
       </main>
+
+      {createOpen && (
+        <CrudModal title="New Project" onClose={() => setCreateOpen(false)} onSave={handleCreate} saving={creating} saveLabel="Create">
+          <div className="space-y-4">
+            <div><label className={labelCls}>Name *</label>
+              <input autoFocus value={createForm.name} onChange={e => setCreateForm(f => ({ ...f, name: e.target.value }))} className={inputCls} placeholder="Project name" /></div>
+            <div><label className={labelCls}>Code *</label>
+              <input value={createForm.code} onChange={e => setCreateForm(f => ({ ...f, code: e.target.value.toUpperCase() }))} className={`${inputCls} font-mono`} placeholder="e.g. AMP" maxLength={12} /></div>
+            <div><label className={labelCls}>Description</label>
+              <textarea value={createForm.description} onChange={e => setCreateForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
+            <ProjectHomeFields orgs={orgs} value={createHome} onChange={setCreateHome} />
+            {createError && <p className="text-xs text-[#F87171]">{createError}</p>}
+          </div>
+        </CrudModal>
+      )}
+
+      {importModalOpen && (
+        <CrudModal title="Import Project" onClose={() => setImportModalOpen(false)} onSave={handleImportChooseFile} saveLabel="Choose file…">
+          <div className="space-y-4">
+            <p className="text-xs text-[#7E91A8]">Choose where the imported project should live, then pick an export bundle (.json).</p>
+            <ProjectHomeFields orgs={orgs} value={importHome} onChange={setImportHome} />
+          </div>
+        </CrudModal>
+      )}
     </div>
   )
 }

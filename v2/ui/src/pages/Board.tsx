@@ -1,16 +1,22 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { RefreshCw, Loader2, Wifi, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus } from 'lucide-react'
+import { RefreshCw, Loader2, Wifi, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
+import { useAuth } from '../hooks/useAuth'
 import { TaskCard } from '../components/TaskCard'
 import { TaskDrawer } from '../components/TaskDrawer'
-import { FilterBar, type FilterState } from '../components/FilterBar'
+import { FilterBar } from '../components/FilterBar'
+import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
 import { CrudModal } from '../components/CrudModal'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { ProjectNav } from '../components/ProjectNav'
+import { OwnerStack } from '../components/OwnerAvatar'
+import { OwnersEditor } from '../components/OwnersEditor'
+import { TeamAccessModal } from '../components/TeamAccessModal'
 import { api } from '../api/client'
-import type { Task, TaskState, Epic, Story } from '../types'
+import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
+import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess } from '../types'
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
@@ -41,23 +47,50 @@ const inputCls =
 
 const labelCls = 'text-xs font-medium text-[#7E91A8] block mb-1.5'
 
+// owner: '' = me (server default), 'none' = unassigned, or a member's user id
+const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '' }
+
 export function Board() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
 
-  const { epics, stories, tasks, loading, error, refresh } = useBoardData(pid)
-  const [selectedTask, setSelectedTask] = useState<Task | null>(null)
-  const [filter, setFilter] = useState<FilterState>({ query: '', state: '', epicId: null })
+  const { epics, stories, tasks, loading, error, refresh, applyTask, applyEpic, applyStory } = useBoardData(pid)
+  const { me } = useAuth()
+  const meId = me?.user_id
+  // Track the selected task by id so the drawer reflects live updates
+  // (assign responses, SSE) instead of a stale snapshot.
+  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(null)
+  const selectedTask = selectedTaskId === null ? null : tasks.find(t => t.id === selectedTaskId) ?? null
+  const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER)
   const [collapsedEpics, setCollapsedEpics] = useState<Set<number>>(new Set())
   const [collapsedStories, setCollapsedStories] = useState<Set<number>>(new Set())
   const [hideCompleted, setHideCompleted] = useState(true)
   const [liveStatus, setLiveStatus] = useState<'connected' | 'disconnected'>('disconnected')
+
+  // Project members: names for owners/creators, the owner filter, and assignment.
+  const [members, setMembers] = useState<ProjectMember[]>([])
+  const [myAccess, setMyAccess] = useState<ProjectAccess | null>(null)
+  const [openReassign, setOpenReassign] = useState(false)
+  const [teamAccessOpen, setTeamAccessOpen] = useState(false)
+  const people = useMemo(() => peopleById(members), [members])
+  const ownersOf = (ids: number[] | undefined): Person[] =>
+    (ids ?? []).map(id => lookupPerson(people, id)!)
+
+  useEffect(() => {
+    api.listProjectMembers(pid)
+      .then(r => { setMembers(r.members); setMyAccess(r.my_access) })
+      .catch(() => { /* names fall back to "User #id"; actions still surface API errors */ })
+    api.getProject(pid)
+      .then(p => setOpenReassign(p.open_reassign ?? false))
+      .catch(() => { /* the server still enforces the rule; this only shapes buttons */ })
+  }, [pid])
 
   // Epic CRUD
   const [epicModal, setEpicModal] = useState<{ mode: 'create' | 'edit'; epic?: Epic } | null>(null)
   const [epicDeleteTarget, setEpicDeleteTarget] = useState<Epic | null>(null)
   const [epicForm, setEpicForm] = useState({ name: '', description: '', priority: '1' })
   const [epicSaving, setEpicSaving] = useState(false)
+  const [epicError, setEpicError] = useState<string | null>(null)
   const [openEpicMenu, setOpenEpicMenu] = useState<number | null>(null)
 
   // Story CRUD
@@ -65,12 +98,18 @@ export function Board() {
   const [storyDeleteTarget, setStoryDeleteTarget] = useState<Story | null>(null)
   const [storyForm, setStoryForm] = useState({ name: '', description: '', acceptance_criteria: '', priority: '1' })
   const [storySaving, setStorySaving] = useState(false)
+  const [storyError, setStoryError] = useState<string | null>(null)
   const [openStoryMenu, setOpenStoryMenu] = useState<number | null>(null)
 
   // Task create
   const [taskCreateModal, setTaskCreateModal] = useState<{ story: Story } | null>(null)
-  const [taskForm, setTaskForm] = useState({ name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1' })
+  const [taskForm, setTaskForm] = useState({ ...EMPTY_TASK_FORM })
   const [taskSaving, setTaskSaving] = useState(false)
+  const [taskError, setTaskError] = useState<string | null>(null)
+
+  // The epic/story being edited, read live from board data so owner changes show immediately.
+  const editingEpic = epicModal?.epic ? epics.find(e => e.id === epicModal.epic!.id) ?? epicModal.epic : null
+  const editingStory = storyModal?.story ? stories.find(s => s.id === storyModal.story!.id) ?? storyModal.story : null
 
   const completedEpicIds = useMemo(() => {
     return new Set(
@@ -99,9 +138,17 @@ export function Board() {
     return () => document.removeEventListener('click', h)
   }, [openStoryMenu])
 
+  // Owner filter hides other people's tickets outright (default: my work);
+  // query/state/epic filters then dim non-matching cards as before.
+  const ownerNarrows = ownerFilterNarrows(filter.owner, meId)
+  const ownerTasks = useMemo(
+    () => ownerNarrows ? tasks.filter(t => taskMatchesOwner(t, filter.owner, meId)) : tasks,
+    [tasks, filter.owner, meId, ownerNarrows],
+  )
+
   const q = filter.query.toLowerCase()
   const filteredTasks = useMemo(() => {
-    return tasks.filter(t => {
+    return ownerTasks.filter(t => {
       const displayState = isScheduledTask(t) ? 'scheduled' : t.state
       if (filter.state && displayState !== filter.state) return false
       if (filter.epicId !== null && t.epic_id !== filter.epicId) return false
@@ -113,10 +160,15 @@ export function Board() {
       }
       return true
     })
-  }, [tasks, filter, q, stories, epics])
+  }, [ownerTasks, filter, q, stories, epics])
 
   const filteredTaskIds = useMemo(() => new Set(filteredTasks.map(t => t.id)), [filteredTasks])
-  const hasFilter = !!(filter.query || filter.state || filter.epicId !== null)
+  const hasFieldFilter = !!(filter.query || filter.state || filter.epicId !== null)
+  const hasFilter = hasFieldFilter || ownerNarrows
+  // In "Mine" view (with no other narrowing), epics/stories I own stay visible
+  // even with no visible tickets, so a freshly created empty epic shows up.
+  const showOwnedEmpty = filter.owner === 'mine' && meId != null && !filter.query && !filter.state
+  const iOwn = (ids: number[] | undefined) => meId != null && !!ids?.includes(meId)
 
   const counts = useMemo(() => ({
     scheduled:   filteredTasks.filter(t => isScheduledTask(t)).length,
@@ -132,46 +184,71 @@ export function Board() {
   const toggleStory = (id: number) =>
     setCollapsedStories(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s })
 
+  const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
+
+  const openEpicModal = (m: { mode: 'create' | 'edit'; epic?: Epic }) => { setEpicError(null); setEpicModal(m) }
+  const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => { setStoryError(null); setStoryModal(m) }
+
   const handleEpicSave = async () => {
     if (!epicForm.name.trim()) return
     setEpicSaving(true)
+    setEpicError(null)
     try {
       if (epicModal?.mode === 'create') await api.createEpic(pid, epicForm)
       else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, epicForm)
       setEpicModal(null); refresh()
+    } catch (e) {
+      setEpicError(errMsg(e, 'Save failed'))
     } finally { setEpicSaving(false) }
   }
 
   const handleEpicDelete = async () => {
     if (!epicDeleteTarget) return
     setEpicSaving(true)
+    setEpicError(null)
     try { await api.deleteEpic(epicDeleteTarget.id); setEpicDeleteTarget(null); refresh() }
+    catch (e) { setEpicError(errMsg(e, 'Delete failed')) }
     finally { setEpicSaving(false) }
   }
 
   const handleStorySave = async () => {
     if (!storyForm.name.trim()) return
     setStorySaving(true)
+    setStoryError(null)
     try {
       if (storyModal?.mode === 'create' && storyModal.epicId) await api.createStory(storyModal.epicId, storyForm)
       else if (storyModal?.story) await api.updateStory(storyModal.story.id, storyForm)
       setStoryModal(null); refresh()
+    } catch (e) {
+      setStoryError(errMsg(e, 'Save failed'))
     } finally { setStorySaving(false) }
   }
 
   const handleStoryDelete = async () => {
     if (!storyDeleteTarget) return
     setStorySaving(true)
+    setStoryError(null)
     try { await api.deleteStory(storyDeleteTarget.id); setStoryDeleteTarget(null); refresh() }
+    catch (e) { setStoryError(errMsg(e, 'Delete failed')) }
     finally { setStorySaving(false) }
   }
 
   const handleTaskCreate = async () => {
     if (!taskForm.name.trim() || !taskCreateModal) return
     setTaskSaving(true)
+    setTaskError(null)
     try {
-      await api.createTask(pid, { epic_id: taskCreateModal.story.epic_id, story_id: taskCreateModal.story.id, ...taskForm })
+      const { owner, ...rest } = taskForm
+      await api.createTask(pid, {
+        epic_id: taskCreateModal.story.epic_id,
+        story_id: taskCreateModal.story.id,
+        ...rest,
+        // '' = me (server default); 'none' = unassigned; else a member's user id
+        ...(owner ? { owner } : {}),
+      })
       setTaskCreateModal(null); refresh()
+    } catch (e) {
+      setTaskError(errMsg(e, 'Create failed'))
     } finally { setTaskSaving(false) }
   }
 
@@ -201,12 +278,22 @@ export function Board() {
           <>
             {/* New Epic */}
             <button
-              onClick={() => { setEpicForm({ name: '', description: '', priority: '1' }); setEpicModal({ mode: 'create' }) }}
+              onClick={() => { setEpicForm({ name: '', description: '', priority: '1' }); openEpicModal({ mode: 'create' }) }}
               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#818CF8] transition-all cursor-pointer active:scale-[0.97]"
               style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)' }}
             >
               <Plus size={12} />
               Epic
+            </button>
+
+            {/* Team access */}
+            <button
+              onClick={() => setTeamAccessOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#7E91A8] hover:text-[#DDE6F0] border border-[#1E2C45] hover:border-[#283A57] transition-all cursor-pointer"
+              title="Teams with access to this project"
+            >
+              <Users size={12} />
+              <span className="hidden sm:inline">Team access</span>
             </button>
 
             {/* Hide/show completed epics */}
@@ -245,7 +332,13 @@ export function Board() {
 
       {/* Filter bar */}
       <div className="px-5 py-3 flex-shrink-0" style={{ borderBottom: '1px solid #192238', background: '#08101F' }}>
-        <FilterBar filter={filter} onChange={setFilter} epicOptions={epics.map(e => ({ id: e.id, name: e.name }))} counts={counts} />
+        <FilterBar
+          filter={filter}
+          onChange={setFilter}
+          epicOptions={epics.map(e => ({ id: e.id, name: e.name }))}
+          memberOptions={members.map(m => ({ id: m.user_id, name: personName(m) + (m.user_id === meId ? ' (me)' : '') }))}
+          counts={counts}
+        />
       </div>
 
       {/* Board scroll area */}
@@ -279,13 +372,22 @@ export function Board() {
 
             {/* Epics */}
             {epics.map(epic => {
-              const epicStories = stories.filter(s => s.epic_id === epic.id)
-              const epicTasks = tasks.filter(t => t.epic_id === epic.id)
+              const allEpicStories = stories.filter(s => s.epic_id === epic.id)
+              const epicTasks = ownerTasks.filter(t => t.epic_id === epic.id)
               const isEpicCollapsed = collapsedEpics.has(epic.id)
               const isDone = completedEpicIds.has(epic.id)
+              const storyVisible = (story: Story) => !hasFilter
+                || ownerTasks.some(t => t.story_id === story.id && filteredTaskIds.has(t.id))
+                || (showOwnedEmpty && iOwn(story.owner_ids))
+              const epicStories = allEpicStories.filter(storyVisible)
+              const epicOwners = ownersOf(epic.owner_ids)
 
-              if (hideCompleted && isDone && !hasFilter) return null
-              if (hasFilter && epicTasks.filter(t => filteredTaskIds.has(t.id)).length === 0) return null
+              if (hideCompleted && isDone && !hasFieldFilter) return null
+              if (hasFilter && !epicTasks.some(t => filteredTaskIds.has(t.id))) {
+                const keepOwned = showOwnedEmpty && (filter.epicId === null || filter.epicId === epic.id)
+                  && (iOwn(epic.owner_ids) || epicStories.length > 0)
+                if (!keepOwned) return null
+              }
 
               return (
                 <div key={epic.id} className="border-b border-[#192238]">
@@ -303,15 +405,18 @@ export function Board() {
                       </span>
                       <div className="min-w-0 flex-1">
                         <div className="text-xs font-bold text-[#DDE6F0] truncate">{epic.name}</div>
-                        <div className="text-xs text-[#3D5068] tabular-nums">
-                          {epicStories.length} stor{epicStories.length !== 1 ? 'ies' : 'y'} · {epicTasks.length} task{epicTasks.length !== 1 ? 's' : ''}
+                        <div className="flex items-center gap-1.5 text-xs text-[#3D5068] tabular-nums">
+                          <span className="truncate">
+                            {epicStories.length} stor{epicStories.length !== 1 ? 'ies' : 'y'} · {epicTasks.length} task{epicTasks.length !== 1 ? 's' : ''}
+                          </span>
+                          <OwnerStack people={epicOwners} max={2} size={14} />
                         </div>
                       </div>
                       <button
                         onClick={e => {
                           e.stopPropagation()
                           setStoryForm({ name: '', description: '', acceptance_criteria: '', priority: '1' })
-                          setStoryModal({ mode: 'create', epicId: epic.id })
+                          openStoryModal({ mode: 'create', epicId: epic.id })
                         }}
                         className="p-1 opacity-0 group-hover:opacity-100 hover:bg-[#172540] rounded-md transition-all cursor-pointer"
                         title="Add story"
@@ -331,12 +436,12 @@ export function Board() {
                             onClick={e => {
                               e.stopPropagation()
                               setEpicForm({ name: epic.name, description: epic.description || '', priority: epic.priority || '1' })
-                              setEpicModal({ mode: 'edit', epic }); setOpenEpicMenu(null)
+                              openEpicModal({ mode: 'edit', epic }); setOpenEpicMenu(null)
                             }}
                             className="w-full text-left px-3 py-1.5 text-xs text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"
                           >Edit</button>
                           <button
-                            onClick={e => { e.stopPropagation(); setEpicDeleteTarget(epic); setOpenEpicMenu(null) }}
+                            onClick={e => { e.stopPropagation(); setEpicError(null); setEpicDeleteTarget(epic); setOpenEpicMenu(null) }}
                             className="w-full text-left px-3 py-1.5 text-xs text-[#F87171] hover:bg-[#EF4444]/10 transition-colors cursor-pointer"
                           >Delete</button>
                         </div>
@@ -362,9 +467,8 @@ export function Board() {
 
                   {/* Stories */}
                   {!isEpicCollapsed && epicStories.map(story => {
-                    const storyTasks = tasks.filter(t => t.story_id === story.id)
+                    const storyTasks = ownerTasks.filter(t => t.story_id === story.id)
                     const isStoryCollapsed = collapsedStories.has(story.id)
-                    if (hasFilter && storyTasks.filter(t => filteredTaskIds.has(t.id)).length === 0) return null
 
                     return (
                       <div key={story.id} className="border-b border-[#192238]/60 last:border-b-0">
@@ -381,12 +485,16 @@ export function Board() {
                             </span>
                             <div className="min-w-0 flex-1">
                               <div className="text-xs font-medium text-[#7E91A8] truncate">{story.name}</div>
-                              <div className="text-xs text-[#3D5068] tabular-nums">{storyTasks.length} task{storyTasks.length !== 1 ? 's' : ''}</div>
+                              <div className="flex items-center gap-1.5 text-xs text-[#3D5068] tabular-nums">
+                                <span className="truncate">{storyTasks.length} task{storyTasks.length !== 1 ? 's' : ''}</span>
+                                <OwnerStack people={ownersOf(story.owner_ids)} max={2} size={14} />
+                              </div>
                             </div>
                             <button
                               onClick={e => {
                                 e.stopPropagation()
-                                setTaskForm({ name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1' })
+                                setTaskForm({ ...EMPTY_TASK_FORM })
+                                setTaskError(null)
                                 setTaskCreateModal({ story })
                               }}
                               className="p-1 opacity-0 group-hover:opacity-100 hover:bg-[#172540] rounded-md transition-all cursor-pointer"
@@ -407,12 +515,12 @@ export function Board() {
                                   onClick={e => {
                                     e.stopPropagation()
                                     setStoryForm({ name: story.name, description: story.description || '', acceptance_criteria: story.acceptance_criteria || '', priority: story.priority || '1' })
-                                    setStoryModal({ mode: 'edit', story }); setOpenStoryMenu(null)
+                                    openStoryModal({ mode: 'edit', story }); setOpenStoryMenu(null)
                                   }}
                                   className="w-full text-left px-3 py-1.5 text-xs text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"
                                 >Edit</button>
                                 <button
-                                  onClick={e => { e.stopPropagation(); setStoryDeleteTarget(story); setOpenStoryMenu(null) }}
+                                  onClick={e => { e.stopPropagation(); setStoryError(null); setStoryDeleteTarget(story); setOpenStoryMenu(null) }}
                                   className="w-full text-left px-3 py-1.5 text-xs text-[#F87171] hover:bg-[#EF4444]/10 transition-colors cursor-pointer"
                                 >Delete</button>
                               </div>
@@ -456,9 +564,10 @@ export function Board() {
                                       <TaskCard
                                         key={task.id}
                                         task={task}
-                                        onClick={() => setSelectedTask(task)}
+                                        onClick={() => setSelectedTaskId(task.id)}
                                         dimmed={hasFilter && !filteredTaskIds.has(task.id)}
                                         isScheduled={col.state === 'scheduled'}
+                                        owner={lookupPerson(people, task.owner_user_id)}
                                       />
                                     ))}
                                     {colTasks.length === 0 && <div className="h-8" />}
@@ -479,7 +588,25 @@ export function Board() {
       </div>
 
       {/* Task drawer */}
-      <TaskDrawer task={selectedTask} onClose={() => setSelectedTask(null)} onRefresh={refresh} />
+      <TaskDrawer
+        task={selectedTask}
+        onClose={() => setSelectedTaskId(null)}
+        onRefresh={refresh}
+        members={members}
+        meId={meId}
+        myAccess={myAccess}
+        openReassign={openReassign}
+        onTaskUpdated={applyTask}
+      />
+
+      {teamAccessOpen && (
+        <TeamAccessModal
+          projectId={pid}
+          myAccess={myAccess}
+          onProjectUpdated={p => setOpenReassign(p.open_reassign ?? false)}
+          onClose={() => setTeamAccessOpen(false)}
+        />
+      )}
 
       {/* Epic CRUD modals */}
       {epicModal && (
@@ -493,6 +620,18 @@ export function Board() {
               <select value={epicForm.priority} onChange={e => setEpicForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
+            {editingEpic && (
+              <div><label className={labelCls}>Owners</label>
+                <OwnersEditor
+                  ownerIds={editingEpic.owner_ids ?? []}
+                  people={people}
+                  members={members}
+                  meId={meId}
+                  onAdd={async id => applyEpic(await api.addEpicOwner(editingEpic.id, id))}
+                  onRemove={async id => applyEpic(await api.removeEpicOwner(editingEpic.id, id))}
+                /></div>
+            )}
+            {epicError && <p className="text-xs text-[#F87171]">{epicError}</p>}
           </div>
         </CrudModal>
       )}
@@ -501,7 +640,7 @@ export function Board() {
         <ConfirmDeleteModal
           title={`Delete "${epicDeleteTarget.name}"`}
           description="This will permanently delete the epic and all its stories and tasks."
-          onClose={() => setEpicDeleteTarget(null)} onConfirm={handleEpicDelete} deleting={epicSaving}
+          onClose={() => setEpicDeleteTarget(null)} onConfirm={handleEpicDelete} deleting={epicSaving} error={epicError}
         />
       )}
 
@@ -518,6 +657,18 @@ export function Board() {
               <select value={storyForm.priority} onChange={e => setStoryForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
+            {editingStory && (
+              <div><label className={labelCls}>Owners</label>
+                <OwnersEditor
+                  ownerIds={editingStory.owner_ids ?? []}
+                  people={people}
+                  members={members}
+                  meId={meId}
+                  onAdd={async id => applyStory(await api.addStoryOwner(editingStory.id, id))}
+                  onRemove={async id => applyStory(await api.removeStoryOwner(editingStory.id, id))}
+                /></div>
+            )}
+            {storyError && <p className="text-xs text-[#F87171]">{storyError}</p>}
           </div>
         </CrudModal>
       )}
@@ -526,7 +677,7 @@ export function Board() {
         <ConfirmDeleteModal
           title={`Delete "${storyDeleteTarget.name}"`}
           description="This will permanently delete the story and all its tasks."
-          onClose={() => setStoryDeleteTarget(null)} onConfirm={handleStoryDelete} deleting={storySaving}
+          onClose={() => setStoryDeleteTarget(null)} onConfirm={handleStoryDelete} deleting={storySaving} error={storyError}
         />
       )}
 
@@ -539,12 +690,21 @@ export function Board() {
               <textarea value={taskForm.description} onChange={e => setTaskForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
             <div><label className={labelCls}>Acceptance Criteria</label>
               <textarea value={taskForm.acceptance_criteria} onChange={e => setTaskForm(f => ({ ...f, acceptance_criteria: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
-            <div><label className={labelCls}>Assigned To</label>
+            <div><label className={labelCls}>Owner</label>
+              <select value={taskForm.owner} onChange={e => setTaskForm(f => ({ ...f, owner: e.target.value }))} className={inputCls}>
+                <option value="">Me</option>
+                <option value="none">Unassigned</option>
+                {members.filter(m => m.user_id !== meId).map(m => (
+                  <option key={m.user_id} value={String(m.user_id)}>{personName(m)}</option>
+                ))}
+              </select></div>
+            <div><label className={labelCls}>Agent</label>
               <input value={taskForm.assigned_to} onChange={e => setTaskForm(f => ({ ...f, assigned_to: e.target.value }))} className={inputCls} placeholder="amp-worker" /></div>
             <div><label className={labelCls}>Priority</label>
               <select value={taskForm.priority} onChange={e => setTaskForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
+            {taskError && <p className="text-xs text-[#F87171]">{taskError}</p>}
           </div>
         </CrudModal>
       )}

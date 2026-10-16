@@ -1,15 +1,15 @@
-import { Search, X, SlidersHorizontal } from 'lucide-react'
+import { Search, X, SlidersHorizontal, UserRound } from 'lucide-react'
+import type { OwnerFilter } from '../lib/people'
+import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
 
-export interface FilterState {
-  query: string
-  state: '' | 'backlog' | 'in_progress' | 'completed' | 'blocked'
-  epicId: number | null
-}
+export type { FilterState }
 
 interface Props {
   filter: FilterState
   onChange: (f: FilterState) => void
   epicOptions: { id: number; name: string }[]
+  /** project members selectable in the owner filter */
+  memberOptions: { id: number; name: string }[]
   counts: { backlog: number; in_progress: number; completed: number; blocked: number; total: number }
 }
 
@@ -21,8 +21,12 @@ const STATE_OPTIONS = [
   { value: 'blocked',     label: 'Blocked',      dot: 'bg-[#EF4444]' },
 ] as const
 
-export function FilterBar({ filter, onChange, epicOptions, counts }: Props) {
-  const hasActiveFilter = filter.query || filter.state || filter.epicId !== null
+function parseOwner(v: string): OwnerFilter {
+  return v === 'mine' || v === 'unassigned' || v === 'everyone' ? v : Number(v)
+}
+
+export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts }: Props) {
+  const hasActiveFilter = filter.query || filter.state || filter.epicId !== null || filter.owner !== DEFAULT_FILTER.owner
 
   return (
     <div className="flex items-center gap-2.5 flex-wrap">
@@ -74,6 +78,28 @@ export function FilterBar({ filter, onChange, epicOptions, counts }: Props) {
         })}
       </div>
 
+      {/* Owner filter */}
+      <div className="relative">
+        <UserRound size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#3D5068] pointer-events-none" />
+        <select
+          value={String(filter.owner)}
+          onChange={e => onChange({ ...filter, owner: parseOwner(e.target.value) })}
+          title="Whose tickets to show"
+          className="bg-[#0D1726] border border-[#1E2C45] rounded-lg pl-8 pr-3 py-2 text-sm text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 appearance-none cursor-pointer transition-all"
+        >
+          <option value="mine">Mine</option>
+          <option value="unassigned">Unassigned</option>
+          <option value="everyone">Everyone</option>
+          {memberOptions.length > 0 && (
+            <optgroup label="Members">
+              {memberOptions.map(m => (
+                <option key={m.id} value={m.id}>{m.name}</option>
+              ))}
+            </optgroup>
+          )}
+        </select>
+      </div>
+
       {/* Epic filter */}
       {epicOptions.length > 0 && (
         <div className="relative">
@@ -94,7 +120,7 @@ export function FilterBar({ filter, onChange, epicOptions, counts }: Props) {
       {/* Clear */}
       {hasActiveFilter && (
         <button
-          onClick={() => onChange({ query: '', state: '', epicId: null })}
+          onClick={() => onChange(DEFAULT_FILTER)}
           className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-[#7E91A8] hover:text-[#DDE6F0] border border-[#1E2C45] hover:border-[#283A57] rounded-lg transition-all cursor-pointer"
         >
           <X size={11} />

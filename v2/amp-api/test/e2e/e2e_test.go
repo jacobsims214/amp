@@ -11,6 +11,9 @@
 //	                    log in, save its tokens to AMP_E2E_STATE
 //	AMP_E2E_PHASE=post  run against the NEW release: old tokens are
 //	                    rejected, re-login and new clients work
+//	AMP_E2E_PHASE=rbac  multi-user: creates a second Dex user (via
+//	                    authadmin), an org, a team, and checks access
+//	                    and ticket ownership end to end. Needs no state.
 //
 // Required env: AMP_E2E_URL (e.g. https://amp.local), AMP_E2E_USER,
 // AMP_E2E_PASSWORD (a Dex local user), AMP_E2E_STATE (a file path).
@@ -194,6 +197,12 @@ var (
 // non-form page is reached (nil returned).
 func (e *env) browse(t *testing.T, browser *http.Client, start string, stop func(*url.URL) bool) *url.URL {
 	t.Helper()
+	return e.browseAs(t, browser, start, stop, e.user, e.password)
+}
+
+// browseAs is browse, signing in to Dex as user.
+func (e *env) browseAs(t *testing.T, browser *http.Client, start string, stop func(*url.URL) bool, user, password string) *url.URL {
+	t.Helper()
 	next, method, form := start, http.MethodGet, url.Values(nil)
 	for hop := 0; hop < 25; hop++ {
 		var req *http.Request
@@ -242,8 +251,8 @@ func (e *env) browse(t *testing.T, browser *http.Client, start string, stop func
 				}
 			}
 			if passwordRE.Match(body) {
-				form.Set("login", e.user)
-				form.Set("password", e.password)
+				form.Set("login", user)
+				form.Set("password", password)
 			} else {
 				form.Set("approval", "approve")
 			}
@@ -270,6 +279,12 @@ func (e *env) browser() *http.Client {
 // Like real MCP clients, it asks for offline_access to get a refresh token.
 func (e *env) login(t *testing.T, as authServer, clientID string) map[string]any {
 	t.Helper()
+	return e.loginAs(t, as, clientID, e.user, e.password)
+}
+
+// loginAs is login, signing in as user.
+func (e *env) loginAs(t *testing.T, as authServer, clientID, user, password string) map[string]any {
+	t.Helper()
 	verifier := randString(t)
 	sum := sha256.Sum256([]byte(verifier))
 	q := url.Values{
@@ -282,9 +297,9 @@ func (e *env) login(t *testing.T, as authServer, clientID string) map[string]any
 		"resource":              {e.base + "/mcp"},
 		"scope":                 {"offline_access"},
 	}
-	cb := e.browse(t, e.browser(), as.authorize+"?"+q.Encode(), func(u *url.URL) bool {
+	cb := e.browseAs(t, e.browser(), as.authorize+"?"+q.Encode(), func(u *url.URL) bool {
 		return strings.HasPrefix(u.String(), redirectURI)
-	})
+	}, user, password)
 	if errMsg := cb.Query().Get("error"); errMsg != "" {
 		t.Fatalf("authorization error: %s %s", errMsg, cb.Query().Get("error_description"))
 	}
@@ -439,6 +454,120 @@ func (e *env) uiAPIMe(t *testing.T) map[string]any {
 	return me
 }
 
+// uiSession is a browser signed in to the UI through oauth2-proxy.
+type uiSession struct {
+	e *env
+	b *http.Client
+}
+
+func (e *env) uiLogin(t *testing.T, user, password string) *uiSession {
+	t.Helper()
+	b := e.browser()
+	e.browseAs(t, b, e.base+"/oauth2/start?rd=/", nil, user, password)
+	return &uiSession{e: e, b: b}
+}
+
+// do calls the REST API (or authadmin) as the signed-in user.
+func (u *uiSession) do(t *testing.T, method, path string, body any) (int, map[string]any) {
+	t.Helper()
+	var rd io.Reader
+	if body != nil {
+		b, _ := json.Marshal(body)
+		rd = strings.NewReader(string(b))
+	}
+	req, _ := http.NewRequest(method, u.e.base+path, rd)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := u.b.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	var out map[string]any
+	_ = json.Unmarshal(raw, &out)
+	if out == nil {
+		out = map[string]any{"_raw": truncate(string(raw), 200)}
+	}
+	return resp.StatusCode, out
+}
+
+func (u *uiSession) must(t *testing.T, code int, method, path string, body any) map[string]any {
+	t.Helper()
+	got, out := u.do(t, method, path, body)
+	if got != code {
+		t.Fatalf("%s %s: %d %v, want %d", method, path, got, out, code)
+	}
+	return out
+}
+
+// tool calls one MCP tool with the real mcp-go client and decodes its JSON
+// result. A tool-level error is returned as err.
+func (e *env) tool(t *testing.T, token, name string, args map[string]any) (map[string]any, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	tr, err := transport.NewStreamableHTTP(e.base+"/mcp",
+		transport.WithHTTPBasicClient(e.http),
+		transport.WithHTTPHeaders(map[string]string{"Authorization": "Bearer " + token}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := mcpclient.NewClient(tr)
+	defer c.Close()
+	if err := c.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	init := mcpgo.InitializeRequest{}
+	init.Params.ClientInfo = mcpgo.Implementation{Name: "amp-e2e", Version: "1"}
+	if _, err := c.Initialize(ctx, init); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+	req := mcpgo.CallToolRequest{}
+	req.Params.Name = name
+	req.Params.Arguments = args
+	res, err := c.CallTool(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	text := res.Content[0].(mcpgo.TextContent).Text
+	if res.IsError {
+		return nil, fmt.Errorf("%s", text)
+	}
+	var out map[string]any
+	if err := json.Unmarshal([]byte(text), &out); err != nil {
+		t.Fatalf("%s result is not JSON: %s", name, truncate(text, 200))
+	}
+	return out, nil
+}
+
+func (e *env) mustTool(t *testing.T, token, name string, args map[string]any) map[string]any {
+	t.Helper()
+	out, err := e.tool(t, token, name, args)
+	if err != nil {
+		t.Fatalf("%s: %v", name, err)
+	}
+	return out
+}
+
+func num(m map[string]any, key string) int {
+	v, _ := m[key].(float64)
+	return int(v)
+}
+
+// listed returns the IDs of every task in an amp_list_tasks result.
+func listed(res map[string]any) []int {
+	var ids []int
+	for _, bucket := range []string{"ready_to_dispatch", "in_progress", "blocked", "scheduled", "completed"} {
+		items, _ := res[bucket].([]any)
+		for _, it := range items {
+			ids = append(ids, num(it.(map[string]any), "id"))
+		}
+	}
+	return ids
+}
+
 func randString(t *testing.T) string {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
@@ -571,6 +700,192 @@ func TestE2E(t *testing.T) {
 			}
 			t.Log("Origin validation ✓")
 		})
+
+	case "rbac":
+		// Multi-user: two real Dex users, an org and team made through the
+		// API, an invite applied on first sign-in, and ticket ownership
+		// enforced across MCP and the UI's REST API.
+		sfx := fmt.Sprint(time.Now().UnixNano())
+		admin := e.uiLogin(t, e.user, e.password)
+		email2, pw2 := "e2e-rbac-"+sfx+"@amp.local", "pw-"+randString(t)[:16]
+		admin.must(t, 200, "POST", "/authadmin/users", map[string]any{"email": email2, "password": pw2, "display_name": "E2E Teammate"})
+		defer admin.do(t, "DELETE", "/authadmin/users/"+url.PathEscape(email2), nil)
+
+		org := admin.must(t, 201, "POST", "/api/orgs", map[string]any{"name": "E2E " + sfx, "slug": "e2e-" + sfx})["org"].(map[string]any)
+		orgID := num(org, "id")
+		team := admin.must(t, 201, "POST", fmt.Sprintf("/api/orgs/%d/teams", orgID), map[string]any{"name": "Builders"})["team"].(map[string]any)
+		teamID := num(team, "id")
+		// The teammate has never signed in: adding them creates an invite.
+		inv := admin.must(t, 201, "POST", fmt.Sprintf("/api/teams/%d/members", teamID), map[string]any{"user": email2})
+		if inv["invited"] != true {
+			t.Fatalf("expected a pending invite, got %v", inv)
+		}
+		t.Log("org, team, and pending invite created via REST ✓")
+
+		adminTok := e.login(t, as, e.register(t, as, "e2e rbac admin"))["access_token"].(string)
+		mateTok := e.loginAs(t, as, e.register(t, as, "e2e rbac teammate"), email2, pw2)["access_token"].(string)
+
+		who := e.mustTool(t, mateTok, "amp_whoami", nil)
+		orgs, _ := who["orgs"].([]any)
+		if len(orgs) != 1 || num(orgs[0].(map[string]any), "id") != orgID {
+			t.Fatalf("teammate's orgs after first sign-in = %v, want the invited org", orgs)
+		}
+		t.Log("invite applied on the teammate's first sign-in ✓")
+
+		// Org/team placement: the admin creates a project owned by the team.
+		proj := e.mustTool(t, adminTok, "amp_create_project", map[string]any{"name": "E2E RBAC " + sfx, "code": "e2e-rbac-" + sfx, "org_id": orgID, "team_id": teamID})
+		pid := num(proj, "id")
+		epic := e.mustTool(t, adminTok, "amp_create_epic", map[string]any{"project_id": pid, "name": "shared epic"})
+		story := e.mustTool(t, adminTok, "amp_create_story", map[string]any{"project_id": pid, "epic_id": num(epic, "id"), "name": "shared story"})
+		mk := func(tok, name, owner string) int {
+			args := map[string]any{"project_id": pid, "epic_id": num(epic, "id"), "story_id": num(story, "id"), "name": name, "description": name, "acceptance_criteria": "done", "assigned_to": "amp-worker"}
+			if owner != "" {
+				args["owner"] = owner
+			}
+			return num(e.mustTool(t, tok, "amp_create_task", args), "id")
+		}
+		pool := mk(adminTok, "pool ticket", "none")
+		adminOwn := mk(adminTok, "admin's ticket", "")
+		handoff := mk(adminTok, "to hand off", "")
+
+		// The teammate only sees projects they're on, and only their own work by default.
+		projects, _ := e.mustTool(t, mateTok, "amp_list_projects", nil)["projects"].([]any)
+		if len(projects) != 1 || num(projects[0].(map[string]any), "id") != pid {
+			t.Fatalf("teammate sees projects %v, want only %d", projects, pid)
+		}
+		if got := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"project_id": pid})); len(got) != 0 {
+			t.Fatalf("teammate's default view %v, want empty", got)
+		}
+		if got := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"project_id": pid, "owner": "unassigned"})); !slices.Equal(got, []int{pool}) {
+			t.Fatalf("unassigned pool %v, want [%d]", got, pool)
+		}
+		t.Log("project visibility and default 'mine' view ✓")
+
+		// Claim from the pool; nobody can take it after that, not even the admin by claiming.
+		e.mustTool(t, mateTok, "amp_claim_task", map[string]any{"task_id": pool})
+		if _, err := e.tool(t, adminTok, "amp_claim_task", map[string]any{"task_id": pool}); err == nil || !strings.Contains(err.Error(), "owned by") {
+			t.Fatalf("admin claim of a taken ticket: %v", err)
+		}
+		// The teammate can't work the admin's ticket...
+		if _, err := e.tool(t, mateTok, "amp_dispatch_task", map[string]any{"task_id": adminOwn, "agent_id": "x"}); err == nil {
+			t.Fatal("teammate dispatched a ticket owned by someone else")
+		}
+		// ...until it's assigned to them.
+		e.mustTool(t, adminTok, "amp_assign_task", map[string]any{"task_id": handoff, "user": email2})
+		mine := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"project_id": pid}))
+		if !slices.Contains(mine, pool) || !slices.Contains(mine, handoff) || slices.Contains(mine, adminOwn) {
+			t.Fatalf("teammate's view after claim + assignment = %v", mine)
+		}
+		e.mustTool(t, mateTok, "amp_dispatch_task", map[string]any{"task_id": handoff, "agent_id": "teammate-agent"})
+		e.mustTool(t, mateTok, "amp_complete_task", map[string]any{"task_id": handoff})
+		t.Log("claim, assign, and owner-only work enforced over MCP ✓")
+
+		// Open reassign (on by default): a plain member can take over the
+		// admin's ticket while nobody is working it, but not once the admin
+		// has started it, and not after a project owner turns it off. The
+		// teammate's team owns the project, so for this check another team
+		// takes ownership and Builders becomes a member team.
+		projTeams := func(args map[string]any) {
+			args["project_id"] = pid
+			e.mustTool(t, adminTok, "amp_manage_project_teams", args)
+		}
+		stewards := e.mustTool(t, adminTok, "amp_manage_teams", map[string]any{"action": "create", "org_id": orgID, "name": "Stewards"})["team"].(map[string]any)
+		projTeams(map[string]any{"action": "link", "team_id": num(stewards, "id"), "role": "owner"})
+		projTeams(map[string]any{"action": "link", "team_id": teamID, "role": "member"})
+		takeover := mk(adminTok, "take me over", "")
+		running := mk(adminTok, "admin is on it", "")
+		e.mustTool(t, adminTok, "amp_dispatch_task", map[string]any{"task_id": running, "agent_id": "admin-agent"})
+		if _, err := e.tool(t, mateTok, "amp_assign_task", map[string]any{"task_id": running, "user": "me"}); err == nil || !strings.Contains(err.Error(), "in progress") {
+			t.Fatalf("teammate took over an in-progress ticket: %v", err)
+		}
+		e.mustTool(t, mateTok, "amp_assign_task", map[string]any{"task_id": takeover, "user": "me"})
+		if _, err := e.tool(t, mateTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": false}); err == nil {
+			t.Fatal("a plain member changed project settings")
+		}
+		e.mustTool(t, adminTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": false})
+		strict := mk(adminTok, "strict now", "")
+		if _, err := e.tool(t, mateTok, "amp_assign_task", map[string]any{"task_id": strict, "user": "me"}); err == nil || !strings.Contains(err.Error(), "owned by") {
+			t.Fatalf("teammate took over a ticket with open reassign off: %v", err)
+		}
+		e.mustTool(t, adminTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": true})
+		projTeams(map[string]any{"action": "link", "team_id": teamID, "role": "owner"})
+		projTeams(map[string]any{"action": "unlink", "team_id": num(stewards, "id")})
+		t.Log("open reassign: members take over idle tickets, not in-progress ones; owners can turn it off ✓")
+
+		// The same rules through the UI's REST API, signed in as the teammate.
+		mate := e.uiLogin(t, email2, pw2)
+		tasks := mate.must(t, 200, "GET", fmt.Sprintf("/api/projects/%d/tasks", pid), nil)["tasks"].([]any)
+		if len(tasks) != 3 {
+			t.Fatalf("teammate's REST default view has %d tasks, want 3 (claimed, handed off, taken over)", len(tasks))
+		}
+		mate.must(t, 403, "POST", fmt.Sprintf("/api/tasks/%d/complete", adminOwn), nil)
+		mate.must(t, 403, "POST", "/api/orgs", map[string]any{"name": "nope"})
+		mate.must(t, 403, "GET", fmt.Sprintf("/api/kb/config?project_id=%d", pid), nil)
+		t.Log("REST enforcement for the teammate's UI session ✓")
+
+		// Platform admin over MCP: the admin's agent adds a second team and
+		// puts the teammate on it; the teammate's agent can't do admin work.
+		team2 := e.mustTool(t, adminTok, "amp_manage_teams", map[string]any{"action": "create", "org_id": orgID, "name": "Reviewers"})["team"].(map[string]any)
+		e.mustTool(t, adminTok, "amp_manage_team_members", map[string]any{"action": "add", "team_id": num(team2, "id"), "user": email2, "role": "lead"})
+		e.mustTool(t, adminTok, "amp_manage_project_teams", map[string]any{"action": "link", "project_id": pid, "team_id": num(team2, "id"), "role": "member"})
+		if _, err := e.tool(t, mateTok, "amp_create_org", map[string]any{"name": "nope"}); err == nil || !strings.Contains(err.Error(), "only global admins") {
+			t.Fatalf("teammate created an org over MCP: %v", err)
+		}
+		if _, err := e.tool(t, mateTok, "amp_manage_org_members", map[string]any{"action": "add", "org_id": orgID, "user": "x@amp.local"}); err == nil {
+			t.Fatal("teammate managed org members over MCP")
+		}
+		members := e.mustTool(t, mateTok, "amp_manage_team_members", map[string]any{"action": "list", "team_id": num(team2, "id")})["members"].([]any)
+		if len(members) != 1 {
+			t.Fatalf("Reviewers members %v", members)
+		}
+		t.Log("platform administration over MCP ✓")
+
+		// Promote the teammate to global admin from the Users page's API. Their
+		// existing MCP token and UI session gain admin powers on the next
+		// request (roles are read per request — no re-login), and lose them
+		// again on demotion.
+		var mateID int
+		for _, u := range admin.must(t, 200, "GET", "/api/users", nil)["users"].([]any) {
+			if um := u.(map[string]any); um["email"] == email2 {
+				mateID = num(um, "id")
+			}
+		}
+		if mateID == 0 {
+			t.Fatal("teammate not in /api/users")
+		}
+		mate.must(t, 403, "GET", "/api/users", nil)
+		admin.must(t, 200, "PATCH", fmt.Sprintf("/api/users/%d/role", mateID), map[string]any{"role": "admin", "grant": true})
+		org2 := e.mustTool(t, mateTok, "amp_create_org", map[string]any{"name": "Made by promoted " + sfx, "slug": "promoted-" + sfx})
+		if org2["org"] == nil {
+			t.Fatalf("promoted teammate couldn't create an org: %v", org2)
+		}
+		allOrgs := e.mustTool(t, mateTok, "amp_list_orgs", nil)["orgs"].([]any)
+		if len(allOrgs) < 3 { // Default, E2E, and the one just made — global admins see every org
+			t.Fatalf("promoted teammate sees %d orgs, want all", len(allOrgs))
+		}
+		mate.must(t, 200, "GET", "/api/users", nil)
+		mate.must(t, 200, "GET", "/authadmin/users", nil)
+		t.Log("promotion to global admin takes effect immediately (MCP + UI) ✓")
+
+		admin.must(t, 200, "PATCH", fmt.Sprintf("/api/users/%d/role", mateID), map[string]any{"role": "admin", "grant": false})
+		if _, err := e.tool(t, mateTok, "amp_create_org", map[string]any{"name": "after demotion"}); err == nil || !strings.Contains(err.Error(), "only global admins") {
+			t.Fatalf("demoted teammate still has admin tools: %v", err)
+		}
+		mate.must(t, 403, "GET", "/api/users", nil)
+		t.Log("demotion takes effect immediately ✓")
+
+		// The last global admin can't remove themselves.
+		var adminID int
+		for _, u := range admin.must(t, 200, "GET", "/api/users", nil)["users"].([]any) {
+			if um := u.(map[string]any); um["email"] == e.user {
+				adminID = num(um, "id")
+			}
+		}
+		if code, out := admin.do(t, "PATCH", fmt.Sprintf("/api/users/%d/role", adminID), map[string]any{"role": "admin", "grant": false}); code == 200 {
+			t.Fatalf("the only global admin revoked their own role: %v", out)
+		} else {
+			t.Logf("revoking the last global admin refused (%d: %v) ✓", code, out["error"])
+		}
 
 	default:
 		t.Fatalf("unknown AMP_E2E_PHASE %q", e.phase)

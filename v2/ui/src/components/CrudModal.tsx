@@ -3,12 +3,14 @@ import { Loader2, X } from 'lucide-react'
 interface CrudModalProps {
   title: string
   onClose: () => void
-  onSave: () => Promise<void>
+  /** omit for a read-only / immediate-action modal: the footer then shows only "Close" */
+  onSave?: () => Promise<void> | void
   saving?: boolean
+  saveLabel?: string
   children: React.ReactNode
 }
 
-export function CrudModal({ title, onClose, onSave, saving = false, children }: CrudModalProps) {
+export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 'Save', children }: CrudModalProps) {
   return (
     <>
       {/* Backdrop */}
@@ -48,16 +50,18 @@ export function CrudModal({ title, onClose, onSave, saving = false, children }: 
               onClick={onClose}
               className="px-4 py-2 text-xs font-medium text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] rounded-lg transition-colors cursor-pointer"
             >
-              Cancel
+              {onSave ? 'Cancel' : 'Close'}
             </button>
-            <button
-              onClick={onSave}
-              disabled={saving}
-              className="flex items-center gap-1.5 px-4 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
-            >
-              {saving && <Loader2 size={11} className="animate-spin" />}
-              Save
-            </button>
+            {onSave && (
+              <button
+                onClick={onSave}
+                disabled={saving}
+                className="flex items-center gap-1.5 px-4 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
+              >
+                {saving && <Loader2 size={11} className="animate-spin" />}
+                {saveLabel}
+              </button>
+            )}
           </div>
         </div>
       </div>

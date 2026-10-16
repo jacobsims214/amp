@@ -10,6 +10,12 @@
 //	amp_update_task      amp_dispatch_task   amp_complete_task
 //	amp_block_task       amp_add_task_comment
 //	amp_export_project   amp_import_project
+//	amp_whoami           amp_list_project_members   amp_claim_task   amp_assign_task
+//	amp_list_orgs        amp_create_org             amp_manage_org_members
+//	amp_manage_teams     amp_manage_team_members    amp_manage_invites
+//	amp_manage_project_teams
+//
+// Every tool runs as the signed-in AMP user and is checked by internal/authz.
 package mcp
 
 import (
@@ -24,10 +30,12 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/simstech/amp-api/internal/actor"
+	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // Server holds references to the actor registry (for task mutations),
@@ -39,10 +47,11 @@ type Server struct {
 	repo     *repository.Repo
 	hub      *hub.Hub
 	kb       *kb.Service
+	svc      *service.Service
 }
 
 func NewServer(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSvc *kb.Service) *Server {
-	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc}
+	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry)}
 }
 
 // Register wires all MCP tools onto the provided MCPServer.
@@ -50,24 +59,113 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	ctx := context.Background()
 
 	// ---- Projects (CRUD via repo, no actor needed) ----
-	mcp.AddTool(tool("amp_create_project", "Create a new AMP project. Returns the created project with its id.",
+	mcp.AddTool(tool("amp_create_project", "Create a new AMP project in one of your orgs, owned by one of your teams. Returns the created project with its id.",
 		props{
 			"name":        str("REQUIRED. Project name."),
 			"code":        str("REQUIRED. Short unique code, e.g. 'my-project'."),
 			"description": str("Optional description."),
-		}), wrap(ctx, s.createProject))
+			"org_id":      num("Optional. Org to create it in; required only if you belong to several (see amp_whoami)."),
+			"team_id":     num("Optional. Team that will own it; required only if you are on several teams in the org."),
+		}), wrap(ctx, s.open(s.createProject)))
 
-	mcp.AddTool(tool("amp_list_projects", "List all active projects.",
-		props{}), wrap(ctx, s.listProjects))
+	mcp.AddTool(tool("amp_whoami",
+		"Who you are acting as in AMP: your user, your orgs and your teams. Tickets you create are yours by default; "+
+			"amp_list_tasks shows your own work unless you pass owner.",
+		props{}), wrap(ctx, s.open(s.whoami)))
+
+	mcp.AddTool(tool("amp_list_project_members",
+		"List the people with access to a project (id, email, access level). Use to find who a ticket can be assigned to.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listProjectMembers)))
+
+	// ---- Platform administration (orgs, teams, members, invites) ----
+	// Same rules as the web UI: only global admins create orgs; org
+	// owners/admins manage members, teams and invites; team leads manage
+	// their own team. Anyone else gets a clear "requires …" error.
+	mcp.AddTool(tool("amp_list_orgs",
+		"List the orgs you belong to (global admins: every org), with your role in each.",
+		props{}), wrap(ctx, s.open(s.listOrgs)))
+
+	mcp.AddTool(tool("amp_create_org",
+		"Create an org. Global admins only. The owner defaults to you; pass an email to make someone else owner "+
+			"(if they have never signed in, they're invited as owner).",
+		props{
+			"name":  str("REQUIRED. Org name."),
+			"slug":  str("Optional. URL-safe id (lowercase, digits, dashes); derived from the name if omitted."),
+			"owner": str("Optional. Email or user id of the first owner."),
+		}), wrap(ctx, s.open(s.createOrg)))
+
+	mcp.AddTool(tool("amp_manage_org_members",
+		"List, add, change the role of, or remove members of an org. Adding an email that has never signed in "+
+			"creates an invite that applies on their first sign-in. Requires org owner/admin (owner role changes: org owners only).",
+		props{
+			"org_id": num("REQUIRED. Org ID."),
+			"action": str("REQUIRED. One of: list, add, set_role, remove."),
+			"user":   str("For add/set_role/remove: email or user id."),
+			"role":   str("For add/set_role: owner, admin, or member (default member)."),
+		}), wrap(ctx, s.open(s.manageOrgMembers)))
+
+	mcp.AddTool(tool("amp_manage_teams",
+		"List, create, rename, or delete teams in an org. Creating/renaming/deleting requires org owner/admin. "+
+			"A team that is a project's only owner team can't be deleted.",
+		props{
+			"action":  str("REQUIRED. One of: list, create, rename, delete."),
+			"org_id":  num("For list/create: org ID."),
+			"team_id": num("For rename/delete: team ID."),
+			"name":    str("For create/rename: team name."),
+		}), wrap(ctx, s.open(s.manageTeams)))
+
+	mcp.AddTool(tool("amp_manage_team_members",
+		"List, add, change the role of, or remove members of a team. Adding someone also adds them to the team's org; "+
+			"an email that has never signed in is invited. Requires the team's lead or an org owner/admin.",
+		props{
+			"team_id": num("REQUIRED. Team ID."),
+			"action":  str("REQUIRED. One of: list, add, set_role, remove."),
+			"user":    str("For add/set_role/remove: email or user id."),
+			"role":    str("For add/set_role: lead or member (default member)."),
+		}), wrap(ctx, s.open(s.manageTeamMembers)))
+
+	mcp.AddTool(tool("amp_manage_invites",
+		"List, create, or revoke pending invites for people who haven't signed in yet. Requires org owner/admin "+
+			"(team leads may invite into their own team).",
+		props{
+			"org_id":    num("REQUIRED. Org ID."),
+			"action":    str("REQUIRED. One of: list, create, revoke."),
+			"email":     str("For create: the person's email."),
+			"org_role":  str("For create: owner, admin, or member (default member)."),
+			"team_id":   num("For create: optional team to join."),
+			"team_role": str("For create: lead or member (default member)."),
+			"invite_id": num("For revoke: invite ID."),
+		}), wrap(ctx, s.open(s.manageInvites)))
+
+	mcp.AddTool(tool("amp_manage_project_teams",
+		"List the teams with access to a project, link a team (of the project's org) as owner or member, or unlink one. "+
+			"Changing links requires project owner access. A project always keeps at least one owner team.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"action":     str("REQUIRED. One of: list, link, unlink."),
+			"team_id":    num("For link/unlink: team ID."),
+			"role":       str("For link: owner or member (default member)."),
+		}), wrap(ctx, s.guard(authz.Member, s.manageProjectTeams)))
+
+	mcp.AddTool(tool("amp_list_projects", "List the active projects you have access to.",
+		props{}), wrap(ctx, s.open(s.listProjects)))
 
 	mcp.AddTool(tool("amp_get_project", "Get a project by its numeric ID.",
-		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.getProject))
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.getProject)))
 
 	mcp.AddTool(tool("amp_archive_project", "Archive a completed project. Sets state=archived.",
-		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.archiveProject))
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Owner, s.archiveProject)))
 
 	mcp.AddTool(tool("amp_restore_project", "Restore an archived project. Sets state=active.",
-		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.restoreProject))
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Owner, s.restoreProject)))
+
+	mcp.AddTool(tool("amp_update_project_settings",
+		"Change a project's settings (project owners only). open_reassign: when true (the default), any project member "+
+			"can reassign or release a ticket that isn't in progress; when false, only its owner, a team lead, or a project owner can.",
+		props{
+			"project_id":    num("REQUIRED. Project ID."),
+			"open_reassign": boolean("REQUIRED. Let any project member reassign tickets that aren't in progress."),
+		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	// ---- Epics ----
 	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project.",
@@ -76,21 +174,23 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":        str("REQUIRED. Epic name."),
 			"description": str("Epic description."),
 			"priority":    str("Priority: 0=low, 1=normal (default), 2=high, 3=critical."),
-		}), wrap(ctx, s.createEpic))
+		}), wrap(ctx, s.guard(authz.Member, s.createEpic)))
 
 	mcp.AddTool(tool("amp_list_epics", "List all epics for a project.",
-		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.listEpics))
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listEpics)))
 
 	mcp.AddTool(tool("amp_get_epic", "Get an epic by ID.",
-		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.getEpic))
+		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.guard(authz.Member, s.getEpic)))
 
-	mcp.AddTool(tool("amp_update_epic", "Update an epic's name, description, or priority.",
+	mcp.AddTool(tool("amp_update_epic", "Update an epic's name, description, priority, or owners. Only its owners or a project owner can change it.",
 		props{
-			"epic_id":     num("REQUIRED. Epic ID."),
-			"name":        str("New epic name."),
-			"description": str("New epic description."),
-			"priority":    str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
-		}), wrap(ctx, s.updateEpic))
+			"epic_id":       num("REQUIRED. Epic ID."),
+			"name":          str("New epic name."),
+			"description":   str("New epic description."),
+			"priority":      str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"add_owners":    strArr("Optional. Users (email, id, or 'me') to add as owners."),
+			"remove_owners": strArr("Optional. Users (email, id, or 'me') to remove as owners."),
+		}), wrap(ctx, s.guard(authz.Member, s.updateEpic)))
 
 	// ---- Stories ----
 	mcp.AddTool(tool("amp_create_story", "Create a story inside an epic.",
@@ -101,22 +201,24 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description":         str("Story description."),
 			"acceptance_criteria": str("Conditions that prove this story is done."),
 			"priority":            str("Priority: 0=low, 1=normal, 2=high, 3=critical."),
-		}), wrap(ctx, s.createStory))
+		}), wrap(ctx, s.guard(authz.Member, s.createStory)))
 
 	mcp.AddTool(tool("amp_list_stories", "List all stories for an epic.",
-		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.listStories))
+		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.guard(authz.Member, s.listStories)))
 
 	mcp.AddTool(tool("amp_get_story", "Get a story by ID.",
-		props{"story_id": num("REQUIRED. Story ID.")}), wrap(ctx, s.getStory))
+		props{"story_id": num("REQUIRED. Story ID.")}), wrap(ctx, s.guard(authz.Member, s.getStory)))
 
-	mcp.AddTool(tool("amp_update_story", "Update a story's name, description, acceptance criteria, or priority.",
+	mcp.AddTool(tool("amp_update_story", "Update a story's name, description, acceptance criteria, priority, or owners. Only its owners or a project owner can change it.",
 		props{
 			"story_id":            num("REQUIRED. Story ID."),
 			"name":                str("New story name."),
 			"description":         str("New story description."),
 			"acceptance_criteria": str("New acceptance criteria."),
 			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
-		}), wrap(ctx, s.updateStory))
+			"add_owners":          strArr("Optional. Users (email, id, or 'me') to add as owners."),
+			"remove_owners":       strArr("Optional. Users (email, id, or 'me') to remove as owners."),
+		}), wrap(ctx, s.guard(authz.Member, s.updateStory)))
 
 	// ---- Tasks (all mutations go through actors) ----
 	mcp.AddTool(tool("amp_create_task",
@@ -135,17 +237,21 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("REQUIRED. Who should work this task, e.g. 'amp-worker'. Set this at planning time so the user can review and correct before dispatch."),
 			"dependency_ids":      arr("Optional. Task IDs that must complete before this task can run. State is derived automatically — do not set it yourself."),
 			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this task. Task will be held as blocked until this time arrives."),
-		}), wrap(ctx, s.createTask))
+			"owner":               str("Optional. The AMP user who owns the ticket: omit for yourself, 'none' to leave it unassigned for anyone on the project to pick up, or a project member's email/id."),
+		}), wrap(ctx, s.guard(authz.Member, s.createTask)))
 
 	mcp.AddTool(tool("amp_list_tasks",
-		"List tasks for a project. Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time.",
+		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
+			"Pass owner='unassigned' to see the pool anyone can pick up, owner='any' for everything, or a user's email/id. "+
+			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
-		}), wrap(ctx, s.listTasks))
+			"owner":      str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
+		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
 	mcp.AddTool(tool("amp_get_task", "Get full task details by ID.",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.getTask))
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.getTask)))
 
 	mcp.AddTool(tool("amp_update_task", "Update task name, description, assigned_to, or agent_id.",
 		props{
@@ -154,37 +260,52 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description": str("New task description."),
 			"assigned_to": str("Who should work this task — can be corrected by the user before dispatch."),
 			"agent_id":    str("Agent identifier — set at dispatch time, not plan time."),
-		}), wrap(ctx, s.updateTask))
+		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
-	mcp.AddTool(tool("amp_dispatch_task", "Dispatch a task to an agent (sets state to in_progress). Fails if task is blocked.",
+	mcp.AddTool(tool("amp_claim_task",
+		"Take ownership of an unassigned ticket so you (and your agents) can work it. Fails if someone else already owns it: "+
+			"claiming never takes a ticket from anyone (to take one over, use amp_assign_task with user='me').",
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.claimTask)))
+
+	mcp.AddTool(tool("amp_assign_task",
+		"Assign a ticket to a project member (it then shows up in their work), or release it with user='none' so anyone can pick it up. "+
+			"You can assign tickets you own or unassigned ones; team leads and project owners can reassign anyone's. "+
+			"In projects with open_reassign on (the default), any project member can also reassign or take over (user='me') "+
+			"someone else's ticket while it isn't in progress.",
+		props{
+			"task_id": num("REQUIRED. Task ID."),
+			"user":    str("REQUIRED. Email or user id of a project member, 'me', or 'none' to unassign."),
+		}), wrap(ctx, s.guard(authz.Member, s.assignTask)))
+
+	mcp.AddTool(tool("amp_dispatch_task", "Dispatch a task to an agent (sets state to in_progress). Fails if task is blocked. An unassigned ticket becomes yours; a ticket owned by someone else can't be dispatched.",
 		props{
 			"task_id":  num("REQUIRED. Task ID."),
 			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
-		}), wrap(ctx, s.dispatchTask))
+		}), wrap(ctx, s.guard(authz.Member, s.dispatchTask)))
 
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it.",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.completeTask))
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 
 	mcp.AddTool(tool("amp_block_task", "Block a task with a reason.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"reason":  str("REQUIRED. Why the task is blocked."),
-		}), wrap(ctx, s.blockTask))
+		}), wrap(ctx, s.guard(authz.Member, s.blockTask)))
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"body":    str("REQUIRED. Comment text."),
 			"author":  str("Optional. Who is posting (defaults to 'agent')."),
-		}), wrap(ctx, s.addComment))
+		}), wrap(ctx, s.guard(authz.Member, s.addComment)))
 
 	mcp.AddTool(tool("amp_get_task_comments", "Get all comments for a task.",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.getComments))
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.getComments)))
 
 	mcp.AddTool(tool("amp_get_ticket_history",
 		"Get the full activity log for a task — every state change, dispatch, completion, comment, and unblock, "+
 			"in chronological order. Use this to understand what has happened on a ticket and who did it.",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.getTicketHistory))
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.getTicketHistory)))
 
 	// ---- Management / cleanup tools ----
 
@@ -193,19 +314,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"Use this when replanning from scratch. DESTRUCTIVE — cannot be undone.",
 		props{
 			"project_id": num("REQUIRED. Project ID to reset."),
-		}), wrap(ctx, s.resetProject))
+		}), wrap(ctx, s.guard(authz.Owner, s.resetProject)))
 
 	mcp.AddTool(tool("amp_delete_task",
 		"Delete a single task. Use this to remove tasks created by mistake during planning.",
 		props{
 			"task_id": num("REQUIRED. Task ID to delete."),
-		}), wrap(ctx, s.deleteTask))
+		}), wrap(ctx, s.guard(authz.Member, s.deleteTask)))
 
 	mcp.AddTool(tool("amp_delete_epic",
 		"Delete an epic and ALL its stories and tasks (cascades). Use with care.",
 		props{
 			"epic_id": num("REQUIRED. Epic ID to delete."),
-		}), wrap(ctx, s.deleteEpic))
+		}), wrap(ctx, s.guard(authz.Member, s.deleteEpic)))
 
 	mcp.AddTool(tool("amp_set_task_state",
 		"Override a task's state directly. Use as a manager escape hatch — e.g. re-open a "+
@@ -215,7 +336,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"task_id": num("REQUIRED. Task ID."),
 			"state":   str("REQUIRED. New state: backlog, in_progress, completed, or blocked."),
 			"reason":  str("Optional. Why this manual override was needed (logged to activity)."),
-		}), wrap(ctx, s.setTaskState))
+		}), wrap(ctx, s.guard(authz.Member, s.setTaskState)))
 
 	mcp.AddTool(tool("amp_set_task_start_at",
 		"Set or clear a task's scheduled start time. If start_at is provided, the task will be blocked until that time. "+
@@ -223,21 +344,21 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{
 			"task_id":  num("REQUIRED. Task ID."),
 			"start_at": str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this task. Omit to clear the schedule."),
-		}), wrap(ctx, s.setTaskStartAt))
+		}), wrap(ctx, s.guard(authz.Member, s.setTaskStartAt)))
 
 	mcp.AddTool(tool("amp_list_project_stories",
 		"List all stories for a project across all epics. Useful for getting a full picture "+
 			"without iterating epics one by one.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.listProjectStories))
+		}), wrap(ctx, s.guard(authz.Member, s.listProjectStories)))
 
 	// ---- Export/Import ----
 	mcp.AddTool(tool("amp_export_project",
 		"Export a complete project as JSON. Returns the full ExportBundle with all epics, stories, tasks, and KB documents.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.exportProject))
+		}), wrap(ctx, s.guard(authz.Member, s.exportProject)))
 
 	mcp.AddTool(tool("amp_import_project",
 		"Import a project from an ExportBundle JSON string. Creates a new project with all epics, stories, tasks, and KB documents. "+
@@ -246,7 +367,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"bundle_json": str("REQUIRED. The full JSON from amp_export_project as a string."),
 			"code":        str("Optional. Override the project code from the bundle."),
 			"name":        str("Optional. Override the project name from the bundle."),
-		}), wrap(ctx, s.importProject))
+			"org_id":      num("Optional. Org to import into (see amp_create_project)."),
+			"team_id":     num("Optional. Team that will own the imported project."),
+		}), wrap(ctx, s.open(s.importProject)))
 
 	// ---- Knowledge Base ----
 	mcp.AddTool(tool("amp_kb_write",
@@ -264,7 +387,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"content":    str("REQUIRED. Full document content in markdown. For updates, include ALL existing content plus your additions — this fully replaces the doc."),
 			"tags":       arr("REQUIRED. Tag array e.g. ['auth','jwt']. For updates, include existing tags plus any new ones."),
 			"author":     str("Optional. Who wrote this (defaults to 'agent')."),
-		}), wrap(ctx, s.kbWrite))
+		}), wrap(ctx, s.guard(authz.Member, s.kbWrite)))
 
 	mcp.AddTool(tool("amp_kb_search",
 		"Search the project knowledge base using hybrid keyword+semantic search. "+
@@ -272,13 +395,13 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"Use this when you need to find existing documentation on a specific topic. "+
 			"Default limit is 3 — only increase if initial results are insufficient.",
 		props{
-			"project_id":      num("REQUIRED. Project ID."),
-			"query":           str("REQUIRED. Natural language search query."),
-			"tags":            arr("Optional. Filter results to docs with these tags."),
-			"limit":           num("Optional. Max results to return (default 3, max 10)."),
-			"recency_boost":   num("Optional. Weight for recency in sorting (0 = no recency weight)."),
+			"project_id":       num("REQUIRED. Project ID."),
+			"query":            str("REQUIRED. Natural language search query."),
+			"tags":             arr("Optional. Filter results to docs with these tags."),
+			"limit":            num("Optional. Max results to return (default 3, max 10)."),
+			"recency_boost":    num("Optional. Weight for recency in sorting (0 = no recency weight)."),
 			"min_recency_days": num("Optional. Filter out documents older than N days (0 = no filter)."),
-		}), wrap(ctx, s.kbSearch))
+		}), wrap(ctx, s.guard(authz.Member, s.kbSearch)))
 
 	mcp.AddTool(tool("amp_kb_get",
 		"Get the full content of a knowledge base document by its path. "+
@@ -287,34 +410,34 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
-		}), wrap(ctx, s.kbGet))
+		}), wrap(ctx, s.guard(authz.Member, s.kbGet)))
 
 	mcp.AddTool(tool("amp_kb_list",
 		"List all documents in the project knowledge base. Optionally filter by tag.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"tag":        str("Optional. Filter to documents with this tag."),
-		}), wrap(ctx, s.kbList))
+		}), wrap(ctx, s.guard(authz.Member, s.kbList)))
 
 	mcp.AddTool(tool("amp_kb_delete",
 		"Delete a document from the knowledge base by its path.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"path":       str("REQUIRED. Document path to delete."),
-		}), wrap(ctx, s.kbDelete))
+		}), wrap(ctx, s.guard(authz.Member, s.kbDelete)))
 
 	mcp.AddTool(tool("amp_kb_tags",
 		"List all tags used in the project knowledge base with document counts.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.kbTags))
+		}), wrap(ctx, s.guard(authz.Member, s.kbTags)))
 
 	mcp.AddTool(tool("amp_kb_reindex",
 		"Re-embed all documents in the project knowledge base. "+
 			"Use after changing the embedding model or if search quality degrades.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.kbReindex))
+		}), wrap(ctx, s.guard(authz.Member, s.kbReindex)))
 
 	mcp.AddTool(tool("amp_kb_annotate",
 		"Append a lightweight annotation to an existing KB doc. Use instead of rewriting for small corrections. "+
@@ -324,18 +447,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
 			"text":       str("REQUIRED. Annotation text — the correction or note."),
 			"author":     str("Optional. Who is annotating (defaults to 'agent')."),
-		}), wrap(ctx, s.kbAnnotate))
+		}), wrap(ctx, s.guard(authz.Member, s.kbAnnotate)))
 
 	mcp.AddTool(tool("amp_kb_status",
 		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution. Use this to assess KB health before curator maintenance.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.kbStatus))
+		}), wrap(ctx, s.guard(authz.Member, s.kbStatus)))
 }
 
 // ---- Tool handlers ----
 
-func (s *Server) createProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) createProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	req := domain.CreateProjectRequest{
 		Name:        optStr(args, "name", ""),
 		Code:        optStr(args, "code", ""),
@@ -344,6 +467,11 @@ func (s *Server) createProject(_ context.Context, args map[string]interface{}) (
 	if req.Name == "" || req.Code == "" {
 		return nil, fmt.Errorf("name and code are required")
 	}
+	home, err := s.svc.ResolveProjectHome(rctx, caller(rctx).p, optIntPtr(args, "org_id"), optIntPtr(args, "team_id"))
+	if err != nil {
+		return nil, err
+	}
+	req.OrgID, req.TeamID, req.CreatedBy = home.OrgID, home.TeamID, home.CreatedBy
 	p, err := s.repo.CreateProject(context.Background(), req)
 	if err != nil {
 		return nil, err
@@ -352,12 +480,88 @@ func (s *Server) createProject(_ context.Context, args map[string]interface{}) (
 	return jsonResult(p)
 }
 
-func (s *Server) listProjects(_ context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	visible, err := s.svc.Authz.VisibleProjects(rctx, caller(rctx).p)
+	if err != nil {
+		return nil, err
+	}
 	projects, err := s.repo.ListProjects(context.Background())
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"projects": projects})
+	out := make([]domain.Project, 0, len(projects))
+	for _, p := range projects {
+		if visible == nil || visible[p.ID] {
+			out = append(out, p)
+		}
+	}
+	return jsonResult(map[string]interface{}{"projects": out})
+}
+
+func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	p := caller(rctx).p
+	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super}
+	if p.HasUser() {
+		orgs, err := s.repo.ListOrgs(rctx, p.UserRef())
+		if err != nil {
+			return nil, err
+		}
+		type orgTeams struct {
+			domain.Org
+			Teams []domain.Member `json:"teams"`
+		}
+		withTeams := make([]orgTeams, 0, len(orgs))
+		for _, o := range orgs {
+			teams, err := s.repo.ListUserTeams(rctx, o.ID, p.UserID)
+			if err != nil {
+				return nil, err
+			}
+			// ListUserTeams packs team id/name into Member's UserID/Email.
+			withTeams = append(withTeams, orgTeams{Org: o, Teams: teams})
+		}
+		out["orgs"] = withTeams
+	}
+	return jsonResult(out)
+}
+
+func (s *Server) listProjectMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	members, err := s.svc.ProjectMembers(rctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"members": members, "your_access": caller(rctx).lvl.String()})
+}
+
+func (s *Server) claimTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	t, err := s.svc.ClaimTask(rctx, caller(rctx).p, taskID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"task": t})
+}
+
+func (s *Server) assignTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	user, err := reqStr(args, "user")
+	if err != nil {
+		return nil, err
+	}
+	t, err := s.svc.AssignTask(rctx, caller(rctx).p, taskID, user)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"task": t})
 }
 
 func (s *Server) getProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -385,6 +589,23 @@ func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) 
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
+func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	on, ok := args["open_reassign"].(bool)
+	if !ok {
+		return nil, fmt.Errorf("open_reassign is required (true or false)")
+	}
+	p, err := s.svc.SetOpenReassign(rctx, caller(rctx).p, id, on)
+	if err != nil {
+		return nil, err
+	}
+	s.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: p.ID, Payload: p, At: time.Now()})
+	return jsonResult(map[string]interface{}{"project": p})
+}
+
 func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
@@ -398,7 +619,7 @@ func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) 
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) createEpic(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) createEpic(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -411,6 +632,7 @@ func (s *Server) createEpic(_ context.Context, args map[string]interface{}) (*mc
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", "1"),
+		CreatedBy:   caller(rctx).p.UserRef(),
 	}
 	// Route through ProjectActor so EpicActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
@@ -450,7 +672,7 @@ func (s *Server) getEpic(_ context.Context, args map[string]interface{}) (*mcpgo
 	return jsonResult(map[string]interface{}{"epic": e})
 }
 
-func (s *Server) createStory(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) createStory(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -484,6 +706,7 @@ func (s *Server) createStory(_ context.Context, args map[string]interface{}) (*m
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", "1"),
+		CreatedBy:          caller(rctx).p.UserRef(),
 	}
 	// Route through ProjectActor → EpicActor so StoryActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
@@ -523,7 +746,7 @@ func (s *Server) getStory(_ context.Context, args map[string]interface{}) (*mcpg
 	return jsonResult(map[string]interface{}{"story": st})
 }
 
-func (s *Server) createTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -592,6 +815,10 @@ func (s *Server) createTask(_ context.Context, args map[string]interface{}) (*mc
 		AssignedTo:         optStr(args, "assigned_to", ""),
 		DependencyIDs:      optIntSlice(args, "dependency_ids"),
 		StartAt:            startAt,
+		CreatedBy:          caller(rctx).p.UserRef(),
+	}
+	if req.OwnerUserID, err = s.svc.ResolveNewTaskOwner(rctx, caller(rctx).p, projectID, optStr(args, "owner", "")); err != nil {
+		return nil, err
 	}
 
 	replyCh := make(chan ReplyCreateTask, 1)
@@ -607,12 +834,17 @@ func (s *Server) createTask(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(reply.Task)
 }
 
-func (s *Server) listTasks(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
 	}
 	state := optStr(args, "state", "")
+	me := caller(rctx).p
+	view, err := s.svc.Authz.ParseTaskView(rctx, me, optStr(args, "owner", ""))
+	if err != nil {
+		return nil, err
+	}
 
 	replyCh := make(chan ReplyListTasks, 1)
 	pid, err := s.registry.Get(projectID)
@@ -632,7 +864,8 @@ func (s *Server) listTasks(_ context.Context, args map[string]interface{}) (*mcp
 	blocked := make([]domain.Task, 0)
 	scheduled := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
-	for _, t := range reply.Tasks {
+	tasks := authz.FilterTasks(reply.Tasks, view, me.UserID)
+	for _, t := range tasks {
 		switch t.State {
 		case domain.TaskStateBacklog:
 			readyToDispatch = append(readyToDispatch, t)
@@ -656,7 +889,8 @@ func (s *Server) listTasks(_ context.Context, args map[string]interface{}) (*mcp
 		"blocked":           blocked,   // each has blocked_by_ids showing what's in the way
 		"scheduled":         scheduled, // tasks waiting for their start_at time
 		"completed":         completed,
-		"count":             len(reply.Tasks),
+		"count":             len(tasks),
+		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
 	})
 }
 
@@ -685,9 +919,12 @@ func (s *Server) getTask(_ context.Context, args map[string]interface{}) (*mcpgo
 	return jsonResult(map[string]interface{}{"task": reply.Task})
 }
 
-func (s *Server) updateTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
 	// Route via repo lookup then actor.
@@ -718,9 +955,12 @@ func (s *Server) updateTask(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"task_id": taskID, "updated": true})
 }
 
-func (s *Server) updateEpic(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	epicID, err := reqInt(args, "epic_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.svc.RequireEditEpic(rctx, caller(rctx).p, epicID); err != nil {
 		return nil, err
 	}
 	epic, err := s.repo.GetEpic(context.Background(), epicID)
@@ -746,12 +986,22 @@ func (s *Server) updateEpic(_ context.Context, args map[string]interface{}) (*mc
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"epic_id": epicID, "updated": true})
+	if err := s.changeOwners(rctx, "epic", epicID, epic.ProjectID, args); err != nil {
+		return nil, err
+	}
+	updated, err := s.repo.GetEpic(rctx, epicID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"epic_id": epicID, "updated": true, "epic": updated})
 }
 
-func (s *Server) updateStory(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	storyID, err := reqInt(args, "story_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.svc.RequireEditStory(rctx, caller(rctx).p, storyID); err != nil {
 		return nil, err
 	}
 	story, err := s.repo.GetStory(context.Background(), storyID)
@@ -778,10 +1028,17 @@ func (s *Server) updateStory(_ context.Context, args map[string]interface{}) (*m
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"story_id": storyID, "updated": true})
+	if err := s.changeOwners(rctx, "story", storyID, story.ProjectID, args); err != nil {
+		return nil, err
+	}
+	updated, err := s.repo.GetStory(rctx, storyID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"story_id": storyID, "updated": true, "story": updated})
 }
 
-func (s *Server) dispatchTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) dispatchTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
 		return nil, err
@@ -797,22 +1054,18 @@ func (s *Server) dispatchTask(_ context.Context, args map[string]interface{}) (*
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
-	replyCh := make(chan ReplySimple, 1)
-	pid, err := s.registry.Get(task.ProjectID)
-	if err != nil {
+	if _, err := s.svc.Dispatch(rctx, caller(rctx).p, task.ID, agentID); err != nil {
 		return nil, err
-	}
-	s.registry.System().Root.Send(pid, &actor.MsgDispatchTask{TaskID: taskID, AgentID: agentID, ReplyCh: replyCh})
-	reply := <-replyCh
-	if reply.Err != nil {
-		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "dispatched_to": agentID})
 }
 
-func (s *Server) completeTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) completeTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
@@ -827,7 +1080,7 @@ func (s *Server) completeTask(_ context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	s.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, ReplyCh: replyCh})
+	s.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
 	reply := <-replyCh
 	if reply.Err != nil {
 		return nil, reply.Err
@@ -835,9 +1088,12 @@ func (s *Server) completeTask(_ context.Context, args map[string]interface{}) (*
 	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed"})
 }
 
-func (s *Server) blockTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
 	reason := optStr(args, "reason", "")
@@ -853,7 +1109,7 @@ func (s *Server) blockTask(_ context.Context, args map[string]interface{}) (*mcp
 	if err != nil {
 		return nil, err
 	}
-	s.registry.System().Root.Send(pid, &actor.MsgBlockTask{TaskID: taskID, Reason: reason, ReplyCh: replyCh})
+	s.registry.System().Root.Send(pid, &actor.MsgBlockTask{TaskID: taskID, Reason: reason, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
 	reply := <-replyCh
 	if reply.Err != nil {
 		return nil, reply.Err
@@ -861,7 +1117,7 @@ func (s *Server) blockTask(_ context.Context, args map[string]interface{}) (*mcp
 	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "blocked"})
 }
 
-func (s *Server) addComment(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
 		return nil, err
@@ -878,9 +1134,10 @@ func (s *Server) addComment(_ context.Context, args map[string]interface{}) (*mc
 		return nil, err
 	}
 	req := domain.AddCommentRequest{
-		TaskID: taskID,
-		Body:   body,
-		Author: optStr(args, "author", "agent"),
+		TaskID:       taskID,
+		Body:         body,
+		Author:       optStr(args, "author", "agent"),
+		AuthorUserID: caller(rctx).p.UserRef(),
 	}
 	replyCh := make(chan ReplyAddComment, 1)
 	pid, err := s.registry.Get(task.ProjectID)
@@ -969,9 +1226,12 @@ func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*
 	})
 }
 
-func (s *Server) deleteTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) deleteTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskDelete); err != nil {
 		return nil, err
 	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
@@ -996,9 +1256,12 @@ func (s *Server) deleteTask(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"task_id": taskID, "deleted": true})
 }
 
-func (s *Server) deleteEpic(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) deleteEpic(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	epicID, err := reqInt(args, "epic_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.svc.RequireEditEpic(rctx, caller(rctx).p, epicID); err != nil {
 		return nil, err
 	}
 	epic, err := s.repo.GetEpic(context.Background(), epicID)
@@ -1023,9 +1286,12 @@ func (s *Server) deleteEpic(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"epic_id": epicID, "deleted": true})
 }
 
-func (s *Server) setTaskState(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) setTaskState(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
 	stateStr := optStr(args, "state", "")
@@ -1057,6 +1323,7 @@ func (s *Server) setTaskState(_ context.Context, args map[string]interface{}) (*
 		TaskID:  taskID,
 		State:   domain.TaskState(stateStr),
 		Reason:  reason,
+		By:      caller(rctx).p.UserRef(),
 		ReplyCh: replyCh,
 	})
 	reply := <-replyCh
@@ -1072,9 +1339,12 @@ func (s *Server) setTaskState(_ context.Context, args map[string]interface{}) (*
 	})
 }
 
-func (s *Server) setTaskStartAt(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) setTaskStartAt(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
+		return nil, err
+	}
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
 
@@ -1180,7 +1450,7 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 	return jsonResult(bundle)
 }
 
-func (s *Server) importProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) importProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	bundleJSON, err := reqStr(args, "bundle_json")
 	if err != nil {
 		return nil, err
@@ -1199,7 +1469,11 @@ func (s *Server) importProject(_ context.Context, args map[string]interface{}) (
 	ctx := context.Background()
 
 	// 1. Import the bundle (creates project, epics, stories, tasks)
-	newProject, err := s.repo.ImportBundle(ctx, bundle, newCode, newName)
+	home, err := s.svc.ResolveProjectHome(rctx, caller(rctx).p, optIntPtr(args, "org_id"), optIntPtr(args, "team_id"))
+	if err != nil {
+		return nil, err
+	}
+	newProject, err := s.repo.ImportBundle(ctx, bundle, newCode, newName, home)
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
 	}
@@ -1392,6 +1666,242 @@ func (s *Server) kbStatus(_ context.Context, args map[string]interface{}) (*mcpg
 	return jsonResult(status)
 }
 
+// ---- Platform administration handlers (rules in internal/service/orgs.go) ----
+
+func action(args map[string]interface{}) string {
+	return strings.ToLower(strings.TrimSpace(optStr(args, "action", "")))
+}
+
+func badAction(a string, valid string) error {
+	return fmt.Errorf("unknown action %q; use one of: %s", a, valid)
+}
+
+func (s *Server) listOrgs(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	orgs, err := s.svc.ListOrgs(rctx, caller(rctx).p)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"orgs": orgs})
+}
+
+func (s *Server) createOrg(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	org, inv, err := s.svc.CreateOrg(rctx, caller(rctx).p, optStr(args, "name", ""), optStr(args, "slug", ""), optStr(args, "owner", ""))
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]interface{}{"org": org}
+	if inv != nil {
+		out["owner_invite"] = inv
+	}
+	return jsonResult(out)
+}
+
+func (s *Server) manageOrgMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	orgID, err := reqInt(args, "org_id")
+	if err != nil {
+		return nil, err
+	}
+	p, user, role := caller(rctx).p, optStr(args, "user", ""), optStr(args, "role", "")
+	switch a := action(args); a {
+	case "list":
+		members, err := s.svc.ListOrgMembers(rctx, p, orgID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"members": members})
+	case "add", "set_role":
+		res, err := s.svc.AddOrgMember(rctx, p, orgID, user, role, a == "add")
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(res)
+	case "remove":
+		uid, err := s.svc.RemoveOrgMember(rctx, p, orgID, user)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"org_id": orgID, "user_id": uid, "removed": true})
+	default:
+		return nil, badAction(a, "list, add, set_role, remove")
+	}
+}
+
+func (s *Server) manageTeams(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	p, name := caller(rctx).p, optStr(args, "name", "")
+	switch a := action(args); a {
+	case "list", "create":
+		orgID, err := reqInt(args, "org_id")
+		if err != nil {
+			return nil, err
+		}
+		if a == "list" {
+			teams, err := s.svc.ListTeams(rctx, p, orgID)
+			if err != nil {
+				return nil, err
+			}
+			return jsonResult(map[string]interface{}{"teams": teams})
+		}
+		team, err := s.svc.CreateTeam(rctx, p, orgID, name)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team": team})
+	case "rename", "delete":
+		teamID, err := reqInt(args, "team_id")
+		if err != nil {
+			return nil, err
+		}
+		if a == "delete" {
+			if err := s.svc.DeleteTeam(rctx, p, teamID); err != nil {
+				return nil, err
+			}
+			return jsonResult(map[string]interface{}{"team_id": teamID, "deleted": true})
+		}
+		team, err := s.svc.RenameTeam(rctx, p, teamID, name)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team": team})
+	default:
+		return nil, badAction(a, "list, create, rename, delete")
+	}
+}
+
+func (s *Server) manageTeamMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	teamID, err := reqInt(args, "team_id")
+	if err != nil {
+		return nil, err
+	}
+	p, user, role := caller(rctx).p, optStr(args, "user", ""), optStr(args, "role", "")
+	switch a := action(args); a {
+	case "list":
+		team, members, err := s.svc.GetTeam(rctx, p, teamID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team": team, "members": members})
+	case "add", "set_role":
+		res, err := s.svc.AddTeamMember(rctx, p, teamID, user, role, a == "add")
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(res)
+	case "remove":
+		uid, err := s.svc.RemoveTeamMember(rctx, p, teamID, user)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team_id": teamID, "user_id": uid, "removed": true})
+	default:
+		return nil, badAction(a, "list, add, set_role, remove")
+	}
+}
+
+func (s *Server) manageInvites(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	orgID, err := reqInt(args, "org_id")
+	if err != nil {
+		return nil, err
+	}
+	p := caller(rctx).p
+	switch a := action(args); a {
+	case "list":
+		invites, err := s.svc.ListInvites(rctx, p, orgID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"invites": invites})
+	case "create":
+		res, err := s.svc.Invite(rctx, p, domain.Invite{
+			Email: optStr(args, "email", ""), OrgID: orgID,
+			OrgRole: optStr(args, "org_role", ""), TeamID: optIntPtr(args, "team_id"), TeamRole: optStr(args, "team_role", ""),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(res)
+	case "revoke":
+		id, err := reqInt(args, "invite_id")
+		if err != nil {
+			return nil, err
+		}
+		if err := s.svc.RevokeInvite(rctx, p, orgID, id); err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"invite_id": id, "revoked": true})
+	default:
+		return nil, badAction(a, "list, create, revoke")
+	}
+}
+
+func (s *Server) manageProjectTeams(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	p := caller(rctx).p
+	var teams []domain.ProjectTeam
+	switch a := action(args); a {
+	case "list":
+		teams, err = s.svc.ListProjectTeams(rctx, p, projectID)
+	case "link", "unlink":
+		teamID, terr := reqInt(args, "team_id")
+		if terr != nil {
+			return nil, terr
+		}
+		if a == "link" {
+			teams, err = s.svc.SetProjectTeam(rctx, p, projectID, teamID, optStr(args, "role", ""))
+		} else {
+			teams, err = s.svc.RemoveProjectTeam(rctx, p, projectID, teamID)
+		}
+	default:
+		return nil, badAction(a, "list, link, unlink")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"project_id": projectID, "teams": teams})
+}
+
+// changeOwners applies add_owners / remove_owners for an epic or story.
+// The caller's edit rights were already checked.
+func (s *Server) changeOwners(rctx context.Context, kind string, id, projectID int, args map[string]interface{}) error {
+	p := caller(rctx).p
+	if add := optStrSlice(args, "add_owners"); len(add) > 0 {
+		ids, err := s.svc.ResolveOwnerRefs(rctx, p, projectID, add)
+		if err != nil {
+			return err
+		}
+		if kind == "epic" {
+			err = s.repo.AddEpicOwners(rctx, id, ids)
+		} else {
+			err = s.repo.AddStoryOwners(rctx, id, ids)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	if remove := optStrSlice(args, "remove_owners"); len(remove) > 0 {
+		ids := make([]int, 0, len(remove))
+		for _, ref := range remove {
+			uid, err := s.svc.Authz.ResolveUser(rctx, p, ref)
+			if err != nil {
+				return err
+			}
+			ids = append(ids, uid)
+		}
+		var err error
+		if kind == "epic" {
+			err = s.repo.RemoveEpicOwners(rctx, id, ids)
+		} else {
+			err = s.repo.RemoveStoryOwners(rctx, id, ids)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // checkProjectNotArchived returns an error if the project is archived.
 // Call this at the start of every mutating MCP tool handler.
 // Read-only tools and lifecycle tools (archive/restore) are exempt.
@@ -1428,6 +1938,18 @@ func num(desc string) map[string]interface{} {
 	return map[string]interface{}{"type": "number", "description": desc}
 }
 
+func boolean(desc string) map[string]interface{} {
+	return map[string]interface{}{"type": "boolean", "description": desc}
+}
+
+func strArr(desc string) map[string]interface{} {
+	return map[string]interface{}{
+		"type":        "array",
+		"description": desc,
+		"items":       map[string]interface{}{"type": "string"},
+	}
+}
+
 func arr(desc string) map[string]interface{} {
 	return map[string]interface{}{
 		"type":        "array",
@@ -1444,10 +1966,114 @@ func tool(name, desc string, schema props) mcpgo.Tool {
 	return mcpgo.NewToolWithRawSchema(name, desc, raw)
 }
 
-func wrap(baseCtx context.Context, fn func(context.Context, map[string]interface{}) (*mcpgo.CallToolResult, error)) server.ToolHandlerFunc {
-	return func(_ context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
-		return fn(baseCtx, request.GetArguments())
+type handlerFunc = func(context.Context, map[string]interface{}) (*mcpgo.CallToolResult, error)
+
+// wrap adapts a handler to mcp-go. The request context is passed through:
+// it carries the caller's identity from the auth middleware, in both the
+// session-based and the stateless protocol eras.
+func wrap(_ context.Context, fn handlerFunc) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		return fn(ctx, request.GetArguments())
 	}
+}
+
+type principalKey struct{}
+
+type callerInfo struct {
+	p   authz.Principal
+	lvl authz.Level // on the tool's project, when it has one
+}
+
+func caller(ctx context.Context) callerInfo {
+	c, _ := ctx.Value(principalKey{}).(callerInfo)
+	return c
+}
+
+// open resolves the caller for tools that aren't scoped to one project.
+func (s *Server) open(fn handlerFunc) handlerFunc {
+	return func(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+		p, err := authz.FromContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return fn(context.WithValue(ctx, principalKey{}, callerInfo{p: p}), args)
+	}
+}
+
+// guard resolves the caller and the project the tool acts on — from
+// project_id, or from the task/epic/story it names — and requires at least
+// min access there. Every project-scoped tool goes through it, so none can
+// reach a project the caller isn't on. A project the caller can't see is
+// reported as not found.
+func (s *Server) guard(min authz.Level, fn handlerFunc) handlerFunc {
+	return func(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+		p, err := authz.FromContext(ctx)
+		if err != nil {
+			return nil, err
+		}
+		projectID, err := s.projectOf(ctx, args)
+		if err != nil {
+			return nil, err
+		}
+		lvl, err := s.svc.Authz.RequireProject(ctx, p, projectID, min)
+		if err != nil {
+			if authz.StatusOf(err, 0) == 404 {
+				// Name only what the caller asked for, not the project it's in.
+				return nil, notFoundFor(args)
+			}
+			return nil, err
+		}
+		return fn(context.WithValue(ctx, principalKey{}, callerInfo{p: p, lvl: lvl}), args)
+	}
+}
+
+func notFoundFor(args map[string]interface{}) error {
+	for _, key := range []string{"project_id", "task_id", "story_id", "epic_id"} {
+		if v, ok := args[key]; ok {
+			return fmt.Errorf("%s %v not found", strings.TrimSuffix(key, "_id"), v)
+		}
+	}
+	return fmt.Errorf("not found")
+}
+
+func (s *Server) projectOf(ctx context.Context, args map[string]interface{}) (int, error) {
+	if _, ok := args["project_id"]; ok {
+		return reqInt(args, "project_id")
+	}
+	if _, ok := args["task_id"]; ok {
+		id, err := reqInt(args, "task_id")
+		if err != nil {
+			return 0, err
+		}
+		t, err := s.repo.GetTask(ctx, id)
+		if err != nil {
+			return 0, fmt.Errorf("task %d not found", id)
+		}
+		return t.ProjectID, nil
+	}
+	if _, ok := args["story_id"]; ok {
+		id, err := reqInt(args, "story_id")
+		if err != nil {
+			return 0, err
+		}
+		st, err := s.repo.GetStory(ctx, id)
+		if err != nil {
+			return 0, fmt.Errorf("story %d not found", id)
+		}
+		return st.ProjectID, nil
+	}
+	if _, ok := args["epic_id"]; ok {
+		id, err := reqInt(args, "epic_id")
+		if err != nil {
+			return 0, err
+		}
+		e, err := s.repo.GetEpic(ctx, id)
+		if err != nil {
+			return 0, fmt.Errorf("epic %d not found", id)
+		}
+		return e.ProjectID, nil
+	}
+	return 0, fmt.Errorf("project_id is required")
 }
 
 func jsonResult(v interface{}) (*mcpgo.CallToolResult, error) {

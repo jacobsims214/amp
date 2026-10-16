@@ -77,18 +77,41 @@ type MsgListTasks struct {
 type MsgDispatchTask struct {
 	TaskID  int
 	AgentID string
-	ReplyCh chan ReplySimple
+	// By is the AMP user dispatching. An unassigned ticket is claimed by
+	// them in the same step; a ticket owned by someone else is refused
+	// unless Override is set (org admins). nil = no ownership rules (local dev).
+	By       *int
+	Override bool
+	ReplyCh  chan ReplySimple
 }
 
 type MsgCompleteTask struct {
 	TaskID  int
+	By      *int // acting user, for the activity log
 	ReplyCh chan ReplySimple
 }
 
 type MsgBlockTask struct {
 	TaskID  int
 	Reason  string
+	By      *int
 	ReplyCh chan ReplySimple
+}
+
+// MsgAssignTask changes a ticket's single owner as a compare-and-set: it is
+// applied only if the current owner still equals ExpectOwner — the owner the
+// caller was authorised against — so two concurrent claims can't both win.
+// NewOwner nil releases the ticket; an in-progress ticket goes back to backlog.
+type MsgAssignTask struct {
+	TaskID      int
+	ExpectOwner *int
+	NewOwner    *int
+	// RequireIdle refuses the change if the ticket is in progress (set when
+	// only the project's open-reassign setting allows it).
+	RequireIdle bool
+	By          *int
+	ByName      string
+	ReplyCh     chan ReplyGetTask
 }
 
 type MsgUpdateTask struct {
@@ -110,6 +133,7 @@ type MsgSetTaskState struct {
 	TaskID  int
 	State   domain.TaskState
 	Reason  string
+	By      *int
 	ReplyCh chan ReplySimple
 }
 

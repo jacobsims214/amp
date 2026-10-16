@@ -14,6 +14,7 @@ export function Users() {
 
   const [ampUsers, setAmpUsers] = useState<AmpUser[]>([])
   const [credentials, setCredentials] = useState<AuthAdminUser[]>([])
+  const [roleError, setRoleError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
 
@@ -91,11 +92,12 @@ export function Users() {
   async function toggleAdmin(u: AmpUser) {
     const grant = !u.roles.includes('admin')
     setBusyEmail(u.email)
+    setRoleError(null)
     try {
       await api.setUserRole(u.id, 'admin', grant)
       reload()
     } catch (e) {
-      alert(e instanceof Error ? e.message : 'Update failed')
+      setRoleError(e instanceof Error ? e.message : 'Update failed')
     } finally {
       setBusyEmail(null)
     }
@@ -172,7 +174,7 @@ export function Users() {
           {createError && <p className="text-xs text-[#F87171] mt-2">{createError}</p>}
           <p className="text-xs text-[#3D5068] mt-2">
             Credentials are stored in Dex, never in amp-api. New users get the <code>member</code> role by default —
-            grant <code>admin</code> below once they've signed in at least once.
+            make them a global admin below once they've signed in at least once (most people don't need it — add them to an org and team instead).
           </p>
         </section>
 
@@ -245,18 +247,24 @@ export function Users() {
 
         {/* Roles table */}
         <section>
-          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">Roles (amp-api)</h2>
+          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">Global admins</h2>
           <p className="text-xs text-[#3D5068] mb-3">
-            Populated the first time each person signs in. Grant <code>admin</code> to let someone manage users themselves.
+            People appear here the first time they sign in. A <strong>global admin</strong> manages the whole platform:
+            logins on this page, creating orgs, and every org, team and project — in the UI and through their agents&apos;
+            MCP admin tools. It takes effect on their next request; no re-login needed. Org and team roles are set per org
+            on the <a href="/admin/orgs" className="text-[#818CF8] hover:underline">Orgs</a> page.
           </p>
+          {roleError && (
+            <p className="text-xs text-[#F87171] mb-3">{roleError}</p>
+          )}
           <div className="rounded-xl border border-[#1E2C45] overflow-hidden">
             <table className="w-full text-sm">
               <thead>
                 <tr className="text-left text-[#3D5068] text-xs" style={{ background: '#0D1726' }}>
                   <th className="px-4 py-2 font-semibold">Email</th>
                   <th className="px-4 py-2 font-semibold">Name</th>
-                  <th className="px-4 py-2 font-semibold">Roles</th>
-                  <th className="px-4 py-2 font-semibold w-32">Actions</th>
+                  <th className="px-4 py-2 font-semibold">Access</th>
+                  <th className="px-4 py-2 font-semibold w-44">Actions</th>
                 </tr>
               </thead>
               <tbody>
@@ -265,23 +273,24 @@ export function Users() {
                     <td className="px-4 py-2 text-[#DDE6F0]">{u.email}</td>
                     <td className="px-4 py-2 text-[#7E91A8]">{u.display_name || '—'}</td>
                     <td className="px-4 py-2">
-                      {u.roles.map(r => (
+                      {u.roles.includes('admin') ? (
                         <span
-                          key={r}
-                          className="text-[10px] font-semibold px-1.5 py-0.5 rounded-md mr-1"
+                          className="text-[10px] font-semibold px-1.5 py-0.5 rounded-md"
                           style={{ background: 'rgba(99,102,241,0.12)', color: '#818CF8', border: '1px solid rgba(99,102,241,0.22)' }}
                         >
-                          {r}
+                          global admin
                         </span>
-                      ))}
+                      ) : (
+                        <span className="text-[10px] text-[#3D5068]">member</span>
+                      )}
                     </td>
                     <td className="px-4 py-2">
                       <button
                         onClick={() => toggleAdmin(u)}
                         disabled={busyEmail === u.email}
-                        className="text-xs font-semibold text-[#818CF8] hover:underline disabled:opacity-50"
+                        className="text-xs font-semibold text-[#818CF8] hover:underline disabled:opacity-50 whitespace-nowrap"
                       >
-                        {u.roles.includes('admin') ? 'Revoke admin' : 'Make admin'}
+                        {u.roles.includes('admin') ? 'Revoke global admin' : 'Make global admin'}
                       </button>
                     </td>
                   </tr>

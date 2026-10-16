@@ -61,7 +61,7 @@ func setupTransport(t *testing.T, o transportOpts) *transportStack {
 		t.Fatalf("connect postgres: %v", err)
 	}
 	t.Cleanup(repo.Close)
-	if err := repo.Migrate(ctx, migrationSQL); err != nil {
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 	system := protoactor.NewActorSystem()
