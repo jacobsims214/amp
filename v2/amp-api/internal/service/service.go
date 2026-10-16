@@ -6,6 +6,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
+	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/repository"
 )
 
@@ -21,10 +23,23 @@ type Service struct {
 	Repo     *repository.Repo
 	Registry *actor.Registry
 	Authz    *authz.Checker
+	KB       *kb.Service // nil when the knowledge base isn't configured
 }
 
-func New(repo *repository.Repo, registry *actor.Registry) *Service {
-	return &Service{Repo: repo, Registry: registry, Authz: authz.NewChecker(repo)}
+func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {
+	return &Service{Repo: repo, Registry: registry, Authz: authz.NewChecker(repo), KB: kbSvc}
+}
+
+// dropKB deletes a team's or org's knowledge base after the team or org
+// itself is gone. A failure leaves an orphaned collection, not a broken
+// request, so it is logged rather than returned.
+func (s *Service) dropKB(sc kb.Scope) {
+	if s.KB == nil {
+		return
+	}
+	if err := s.KB.Drop(context.Background(), sc); err != nil {
+		slog.Default().Warn("dropping knowledge base failed", "kb", sc.String(), "err", err)
+	}
 }
 
 // ---- Projects ----
@@ -324,13 +339,23 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 
 // ---- Epics and stories ----
 
-// SetOpenReassign turns a project's open-reassign setting on or off; it
+// UpdateProject changes a project's name, description, or settings; it
 // needs project owner access. Callers publish project.updated.
-func (s *Service) SetOpenReassign(ctx context.Context, p authz.Principal, projectID int, on bool) (*domain.Project, error) {
+func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
+	if u.Name == nil && u.Description == nil && u.OpenReassign == nil {
+		return nil, authz.BadRequest("nothing to change: pass name, description, or open_reassign")
+	}
+	if u.Name != nil {
+		name := strings.TrimSpace(*u.Name)
+		if name == "" {
+			return nil, authz.BadRequest("a project needs a name")
+		}
+		u.Name = &name
+	}
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
 		return nil, err
 	}
-	return s.Repo.SetProjectOpenReassign(ctx, projectID, on)
+	return s.Repo.UpdateProject(ctx, projectID, u)
 }
 
 // RequireEditEpic loads an epic and checks p may change it.

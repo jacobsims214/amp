@@ -7,6 +7,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/kb"
 )
 
 // Org and team administration, shared by the REST API (/api/orgs, /api/teams)
@@ -168,7 +169,19 @@ func (s *Service) DeleteOrg(ctx context.Context, p authz.Principal, orgID int) e
 	if !p.Super {
 		return authz.Forbidden("only global admins can delete orgs")
 	}
-	return s.Repo.DeleteOrg(ctx, orgID)
+	teams, err := s.Repo.ListTeams(ctx, orgID)
+	if err != nil {
+		return err
+	}
+	if err := s.Repo.DeleteOrg(ctx, orgID); err != nil {
+		return err
+	}
+	// The org's teams went with it; so do its and their knowledge bases.
+	s.dropKB(kb.Org(orgID))
+	for _, t := range teams {
+		s.dropKB(kb.Team(t.ID))
+	}
+	return nil
 }
 
 // ---- Org members ----
@@ -312,7 +325,11 @@ func (s *Service) DeleteTeam(ctx context.Context, p authz.Principal, teamID int)
 	if err := a.requireAdmin(team.OrgID); err != nil {
 		return err
 	}
-	return s.Repo.DeleteTeam(ctx, teamID)
+	if err := s.Repo.DeleteTeam(ctx, teamID); err != nil {
+		return err
+	}
+	s.dropKB(kb.Team(teamID))
+	return nil
 }
 
 // ---- Team members ----

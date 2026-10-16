@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
@@ -67,7 +68,7 @@ type RestHandler struct {
 }
 
 func NewRestHandler(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSvc *kb.Service) *RestHandler {
-	return &RestHandler{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry)}
+	return &RestHandler{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
 }
 
 // principal resolves the caller, writing the error response if it can't.
@@ -328,7 +329,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		// Re-index all KB docs: for each bundle.KBDocs, call WriteDoc
 		for _, doc := range bundle.KBDocs {
 			// Convert []string tags to []string (already in correct format)
-			_, err := h.kb.WriteDoc(r.Context(), newProject.ID, doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags)
+			_, err := h.kb.WriteDoc(r.Context(), kb.Project(newProject.ID), doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags, "")
 			if err != nil {
 				// Log but continue — don't fail the entire import if one doc fails
 				slog.Warn("failed to write KB doc during import", "path", doc.Path, "err", err)
@@ -357,14 +358,12 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	if len(parts) == 1 {
 		if r.Method == http.MethodPatch {
-			var body struct {
-				OpenReassign *bool `json:"open_reassign"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OpenReassign == nil {
-				jsonErr(w, errorf("open_reassign (true or false) is required"), 400)
+			var body domain.ProjectSettings
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				jsonErr(w, errorf("invalid JSON body"), 400)
 				return
 			}
-			p, err := h.svc.SetOpenReassign(r.Context(), pr, projectID, *body.OpenReassign)
+			p, err := h.svc.UpdateProject(r.Context(), pr, projectID, body)
 			if err != nil {
 				fail(w, err, 500)
 				return
@@ -465,7 +464,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Fetch KB docs and add them to the bundle
-		docSummaries, err := h.kb.ListDocs(r.Context(), projectID, "")
+		docSummaries, err := h.kb.ListDocs(r.Context(), kb.Project(projectID), "")
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -473,7 +472,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 		kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
 		for _, summary := range docSummaries {
-			doc, err := h.kb.GetDoc(r.Context(), projectID, summary.Path)
+			doc, err := h.kb.GetDoc(r.Context(), kb.Project(projectID), summary.Path)
 			if err != nil {
 				// Log but continue — don't fail the entire export if one doc is missing
 				slog.Warn("failed to fetch KB doc for export", "path", summary.Path, "err", err)
@@ -1144,13 +1143,19 @@ var _ = context.Background
 // ---- KB routes: /api/kb/* ----
 // Also handles /api/projects/:id/kb/* (routed from projectSub)
 //
-// GET  /api/kb/config?project_id=N        → {typesense_url, api_key, collection}
-// GET  /api/kb/doc?project_id=N&path=P    → full doc
-// POST /api/kb/doc?project_id=N           → write doc (body: {path,title,content,tags,author})
-// DELETE /api/kb/doc?project_id=N&path=P  → delete doc
-// GET  /api/kb/list?project_id=N&tag=T    → list doc summaries
-// GET  /api/kb/search?project_id=N&q=Q   → search results
-// GET  /api/kb/tags?project_id=N          → tag counts
+// Every route names one knowledge base with exactly one of project_id,
+// team_id, or org_id (see docs/kb-scopes-design.md). KB below means that.
+//
+// GET  /api/kb/info?KB                    → the KB's name and what you may do in it
+// GET  /api/kb/sources?project_id=N       → the KBs around a project (its own, its org's, its teams')
+// GET  /api/kb/config?project_id=N        → {typesense_url, api_key, collection} (global admins)
+// GET  /api/kb/doc?KB&path=P              → full doc
+// POST /api/kb/doc?KB                     → write doc (body: {path,title,content,tags,author,reason})
+// DELETE /api/kb/doc?KB&path=P            → delete doc
+// GET  /api/kb/list?KB&tag=T              → list doc summaries
+// GET  /api/kb/search?KB&q=Q              → search results
+// GET  /api/kb/tags?KB                    → tag counts
+// POST /api/kb/annotate?KB                → annotate a doc (body: {path,text})
 func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 	// Parse sub-path: /api/kb/{action}
 	sub := r.URL.Path[len("/api/kb/"):]
@@ -1159,35 +1164,78 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		action = "doc"
 	}
 
-	projectIDStr := r.URL.Query().Get("project_id")
-	if projectIDStr == "" {
-		jsonErr(w, errorf("project_id query param required"), 400)
-		return
-	}
-	projectID, err := strconv.Atoi(projectIDStr)
-	if err != nil {
-		jsonErr(w, errorf("invalid project_id"), 400)
-		return
-	}
 	pr, ok := h.principal(w, r)
 	if !ok {
 		return
 	}
-	if _, ok := h.requireProject(w, r, pr, projectID, authz.Member); !ok {
+	q := r.URL.Query()
+	ref := service.KBRef{Scope: q.Get("scope")}
+	for _, f := range []struct {
+		name string
+		dst  *int
+	}{{"project_id", &ref.ProjectID}, {"team_id", &ref.TeamID}, {"org_id", &ref.OrgID}} {
+		if v := q.Get(f.name); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil || n <= 0 {
+				jsonErr(w, errorf("invalid "+f.name), 400)
+				return
+			}
+			*f.dst = n
+		}
+	}
+	k, err := h.svc.ResolveKB(r.Context(), pr, ref)
+	if err != nil {
+		fail(w, err, 500)
 		return
 	}
-
-	switch action {
-	case "config":
-		// Returns Typesense connection info so a client can search directly.
-		// The key is Typesense's admin key, valid for every project's
-		// collection, so only global admins may have it. (The UI doesn't use
-		// this endpoint; it searches through /api/kb/search.)
+	if action == "doc" && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+		if err := k.RequireWrite(); err != nil {
+			fail(w, err, 403)
+			return
+		}
+	}
+	if action == "info" {
+		jsonOK(w, k)
+		return
+	}
+	if action == "config" {
+		// Typesense's admin key, valid for every KB: global admins only.
+		// (The UI doesn't use this endpoint; it searches through /api/kb/search.)
 		if !pr.Super {
 			fail(w, authz.Forbidden("KB connection details are restricted to global admins"), 403)
 			return
 		}
-		collectionName := "kb_" + projectIDStr
+		if k.Kind != kb.ScopeProject {
+			jsonErr(w, errorf("config is only available for project KBs"), 400)
+			return
+		}
+	}
+	if h.kb == nil {
+		jsonErr(w, errorf("the knowledge base is not configured"), 503)
+		return
+	}
+	sc := k.Scope
+
+	switch action {
+	case "sources":
+		if ref.ProjectID == 0 {
+			jsonErr(w, errorf("project_id is required"), 400)
+			return
+		}
+		sources, err := h.svc.KBSources(r.Context(), pr, ref.ProjectID, func(sc kb.Scope) int {
+			n, _ := h.kb.CountDocs(r.Context(), sc)
+			return n
+		})
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"sources": sources})
+
+	case "config":
+		// Typesense connection info so a client can search directly
+		// (checked above: global admins, project KBs).
+		collectionName := fmt.Sprintf("kb_%d", sc.ID)
 		jsonOK(w, map[string]interface{}{
 			"typesense_url": h.kb.TypesenseURL(),
 			"api_key":       h.kb.SearchAPIKey(),
@@ -1202,7 +1250,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, errorf("path query param required"), 400)
 				return
 			}
-			doc, err := h.kb.GetDoc(r.Context(), projectID, path)
+			doc, err := h.kb.GetDoc(r.Context(), sc, path)
 			if err != nil {
 				jsonErr(w, err, 404)
 				return
@@ -1216,6 +1264,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				Content string   `json:"content"`
 				Tags    []string `json:"tags"`
 				Author  string   `json:"author"`
+				Reason  string   `json:"reason"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				jsonErr(w, err, 400)
@@ -1224,7 +1273,10 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			if body.Author == "" || body.Author == "user" {
 				body.Author = pr.Email
 			}
-			doc, err := h.kb.WriteDoc(r.Context(), projectID, body.Path, body.Title, body.Content, body.Author, body.Tags)
+			if sc.Kind == kb.ScopeProject {
+				body.Reason = ""
+			}
+			doc, err := h.kb.WriteDoc(r.Context(), sc, body.Path, body.Title, body.Content, body.Author, body.Tags, strings.TrimSpace(body.Reason))
 			if err != nil {
 				jsonErr(w, err, 500)
 				return
@@ -1237,7 +1289,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, errorf("path query param required"), 400)
 				return
 			}
-			if err := h.kb.DeleteDoc(r.Context(), projectID, path); err != nil {
+			if err := h.kb.DeleteDoc(r.Context(), sc, path); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
@@ -1249,7 +1301,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 
 	case "list":
 		tag := r.URL.Query().Get("tag")
-		docs, err := h.kb.ListDocs(r.Context(), projectID, tag)
+		docs, err := h.kb.ListDocs(r.Context(), sc, tag)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -1257,12 +1309,11 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"docs": docs, "count": len(docs)})
 
 	case "search":
-		q := r.URL.Query().Get("q")
-		if q == "" {
+		if q.Get("q") == "" {
 			jsonErr(w, errorf("q query param required"), 400)
 			return
 		}
-		results, err := h.kb.Search(r.Context(), projectID, q, nil, 10, 0, 0)
+		results, err := h.kb.Search(r.Context(), sc, q.Get("q"), nil, 10, 0, 0)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -1270,7 +1321,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"results": results, "count": len(results)})
 
 	case "tags":
-		tags, err := h.kb.ListTags(r.Context(), projectID)
+		tags, err := h.kb.ListTags(r.Context(), sc)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
@@ -1295,10 +1346,10 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, errorf("path and text are required"), 400)
 			return
 		}
-		if body.Author == "" {
-			body.Author = "user"
+		if body.Author == "" || body.Author == "user" {
+			body.Author = pr.Email
 		}
-		ann, err := h.kb.AnnotateDoc(r.Context(), projectID, body.Path, body.Text, body.Author)
+		ann, err := h.kb.AnnotateDoc(r.Context(), sc, body.Path, body.Text, body.Author)
 		if err != nil {
 			jsonErr(w, err, 404)
 			return

@@ -57,6 +57,13 @@ type Project struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
+// ProjectSettings is a change to a project's settings; nil fields are kept.
+type ProjectSettings struct {
+	Name         *string `json:"name"`
+	Description  *string `json:"description"`
+	OpenReassign *bool   `json:"open_reassign"`
+}
+
 type Epic struct {
 	ID          int       `json:"id"`
 	ProjectID   int       `json:"project_id"`

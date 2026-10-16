@@ -51,7 +51,7 @@ type Server struct {
 }
 
 func NewServer(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSvc *kb.Service) *Server {
-	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry)}
+	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
 }
 
 // Register wires all MCP tools onto the provided MCPServer.
@@ -160,11 +160,14 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Owner, s.restoreProject)))
 
 	mcp.AddTool(tool("amp_update_project_settings",
-		"Change a project's settings (project owners only). open_reassign: when true (the default), any project member "+
-			"can reassign or release a ticket that isn't in progress; when false, only its owner, a team lead, or a project owner can.",
+		"Change a project's name, description, or settings (project owners only); pass only what changes. "+
+			"open_reassign: when true (the default), any project member can reassign or release a ticket that isn't "+
+			"in progress; when false, only its owner, a team lead, or a project owner can.",
 		props{
 			"project_id":    num("REQUIRED. Project ID."),
-			"open_reassign": boolean("REQUIRED. Let any project member reassign tickets that aren't in progress."),
+			"name":          str("Optional. New project name."),
+			"description":   str("Optional. New project description."),
+			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	// ---- Epics ----
@@ -372,88 +375,112 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.open(s.importProject)))
 
 	// ---- Knowledge Base ----
-	mcp.AddTool(tool("amp_kb_write",
-		"Create or UPDATE a document in the project knowledge base. "+
-			"This is a full upsert keyed on path — if a doc at that path already exists, "+
-			"it is completely replaced with the new content. "+
-			"BEFORE writing, always call amp_kb_get to check if a doc exists at that path. "+
-			"If it does, read the existing content and merge your new information into it "+
-			"rather than overwriting with only what you know. "+
-			"Prefer updating an existing doc over creating a new one on the same topic.",
+	//
+	// Three kinds of KB: each project's (the default), each team's, and each
+	// org's. Every tool takes the same scope arguments; see
+	// docs/kb-scopes-design.md and internal/service/kb.go for the rules.
+	kbArgs := func(extra props) props {
+		p := props{
+			"project_id": num("The project you're working in. Required for the project KB (the default); with scope 'team' or 'org' it selects that project's team or org."),
+			"scope":      str("Optional. Which knowledge base: 'project' (default), 'team', or 'org'. Use 'team'/'org' only for knowledge shared beyond one project; see amp_kb_sources."),
+			"team_id":    num("Optional, scope 'team': which team, when the project has several of yours (or there is no project_id)."),
+			"org_id":     num("Optional, scope 'org' without a project_id: which org."),
+		}
+		for k, v := range extra {
+			p[k] = v
+		}
+		return p
+	}
+
+	mcp.AddTool(tool("amp_kb_sources",
+		"List the knowledge bases around a project: its own KB, its org's KB, and the KB of each team linked to it "+
+			"(owner team first), with document counts and whether you can read and write each. Call this when you start "+
+			"work in a project to know what shared knowledge exists. The project KB is where project knowledge lives; "+
+			"search a team or org KB when your user asks, or when you need something only it would hold (the org's brand "+
+			"and design system, the team's deploy runbook). Teams you aren't on are listed without contents.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-			"path":       str("REQUIRED. Document path e.g. 'architecture/auth.md'. Same path = update existing doc."),
-			"title":      str("REQUIRED. Document title."),
-			"content":    str("REQUIRED. Full document content in markdown. For updates, include ALL existing content plus your additions — this fully replaces the doc."),
-			"tags":       arr("REQUIRED. Tag array e.g. ['auth','jwt']. For updates, include existing tags plus any new ones."),
-			"author":     str("Optional. Who wrote this (defaults to 'agent')."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbWrite)))
+		}), wrap(ctx, s.open(s.kbSources)))
+
+	mcp.AddTool(tool("amp_kb_write",
+		"Create or UPDATE a document in a knowledge base. Writes go to the PROJECT KB unless you pass scope, and that "+
+			"is where almost everything belongs: this project's architecture, decisions, and gotchas. "+
+			"Team KBs (scope 'team') hold what's true for every project a team works on: runbooks, services the team "+
+			"owns, team conventions. Org KBs (scope 'org') hold what's true across the whole org: brand and design "+
+			"system, process, standards, policy. Only write to a team or org KB when your user has decided the "+
+			"knowledge belongs there; never move knowledge there on your own initiative. If you think something "+
+			"belongs there, tell your user why and keep it in the project KB until they decide. Team and org writes "+
+			"need `reason`. Only org owners and admins write to an org KB; anyone else annotates it. "+
+			"This is a full upsert keyed on path — if a doc at that path already exists, it is completely replaced. "+
+			"BEFORE writing, always call amp_kb_get to check if a doc exists at that path. If it does, read the "+
+			"existing content and merge your new information into it rather than overwriting with only what you know. "+
+			"Prefer updating an existing doc over creating a new one on the same topic.",
+		kbArgs(props{
+			"path":    str("REQUIRED. Document path e.g. 'architecture/auth.md'. Same path = update existing doc."),
+			"title":   str("REQUIRED. Document title."),
+			"content": str("REQUIRED. Full document content in markdown. For updates, include ALL existing content plus your additions — this fully replaces the doc."),
+			"tags":    strArr("REQUIRED. Tag array e.g. ['auth','jwt']. For updates, include existing tags plus any new ones."),
+			"author":  str("Optional. Who wrote this (defaults to you)."),
+			"reason": str("Required for scope 'team' or 'org': specifically why this belongs to the whole team or org rather " +
+				"than one project's KB, and that your user decided it (e.g. 'Brand colours apply to every product; asked by jane@ to add to the org KB'). Stored with the doc."),
+		})), wrap(ctx, s.open(s.kbWrite)))
 
 	mcp.AddTool(tool("amp_kb_search",
-		"Search the project knowledge base using hybrid keyword+semantic search. "+
-			"Returns the most relevant document chunks with short excerpts. "+
+		"Search one knowledge base using hybrid keyword+semantic search: the project KB by default, or a team or "+
+			"org KB with scope. Returns the most relevant document chunks with short excerpts. "+
 			"Use this when you need to find existing documentation on a specific topic. "+
 			"Default limit is 3 — only increase if initial results are insufficient.",
-		props{
-			"project_id":       num("REQUIRED. Project ID."),
+		kbArgs(props{
 			"query":            str("REQUIRED. Natural language search query."),
-			"tags":             arr("Optional. Filter results to docs with these tags."),
+			"tags":             strArr("Optional. Filter results to docs with these tags."),
 			"limit":            num("Optional. Max results to return (default 3, max 10)."),
 			"recency_boost":    num("Optional. Weight for recency in sorting (0 = no recency weight)."),
 			"min_recency_days": num("Optional. Filter out documents older than N days (0 = no filter)."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbSearch)))
+		})), wrap(ctx, s.open(s.kbSearch)))
 
 	mcp.AddTool(tool("amp_kb_get",
-		"Get the full content of a knowledge base document by its path. "+
+		"Get the full content of a knowledge base document by its path (project KB unless scope says otherwise). "+
 			"Returns a 404-style error if the doc does not exist — use this to check "+
-			"existence before deciding whether to create or update.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbGet)))
+			"existence before deciding whether to create or update. Team and org docs include the reason they were placed there.",
+		kbArgs(props{
+			"path": str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
+		})), wrap(ctx, s.open(s.kbGet)))
 
 	mcp.AddTool(tool("amp_kb_list",
-		"List all documents in the project knowledge base. Optionally filter by tag.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-			"tag":        str("Optional. Filter to documents with this tag."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbList)))
+		"List all documents in a knowledge base (project KB unless scope says otherwise). Optionally filter by tag.",
+		kbArgs(props{
+			"tag": str("Optional. Filter to documents with this tag."),
+		})), wrap(ctx, s.open(s.kbList)))
 
 	mcp.AddTool(tool("amp_kb_delete",
-		"Delete a document from the knowledge base by its path.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-			"path":       str("REQUIRED. Document path to delete."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbDelete)))
+		"Delete a document from a knowledge base by its path (project KB unless scope says otherwise). "+
+			"Only delete team or org docs when your user asks.",
+		kbArgs(props{
+			"path": str("REQUIRED. Document path to delete."),
+		})), wrap(ctx, s.open(s.kbDelete)))
 
 	mcp.AddTool(tool("amp_kb_tags",
-		"List all tags used in the project knowledge base with document counts.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbTags)))
+		"List all tags used in a knowledge base (project KB unless scope says otherwise) with document counts.",
+		kbArgs(nil)), wrap(ctx, s.open(s.kbTags)))
 
 	mcp.AddTool(tool("amp_kb_reindex",
-		"Re-embed all documents in the project knowledge base. "+
+		"Re-embed all documents in a knowledge base (project KB unless scope says otherwise). "+
 			"Use after changing the embedding model or if search quality degrades.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbReindex)))
+		kbArgs(nil)), wrap(ctx, s.open(s.kbReindex)))
 
 	mcp.AddTool(tool("amp_kb_annotate",
-		"Append a lightweight annotation to an existing KB doc. Use instead of rewriting for small corrections. "+
+		"Append a lightweight annotation to an existing KB doc. Use instead of rewriting for small corrections, and "+
+			"to flag a team or org doc that looks wrong or out of date (anyone who can read a KB can annotate it). "+
 			"Annotations are returned in amp_kb_get and previewed in amp_kb_search results.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-			"path":       str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
-			"text":       str("REQUIRED. Annotation text — the correction or note."),
-			"author":     str("Optional. Who is annotating (defaults to 'agent')."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbAnnotate)))
+		kbArgs(props{
+			"path":   str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
+			"text":   str("REQUIRED. Annotation text — the correction or note."),
+			"author": str("Optional. Who is annotating (defaults to you)."),
+		})), wrap(ctx, s.open(s.kbAnnotate)))
 
 	mcp.AddTool(tool("amp_kb_status",
-		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution. Use this to assess KB health before curator maintenance.",
-		props{
-			"project_id": num("REQUIRED. Project ID."),
-		}), wrap(ctx, s.guard(authz.Member, s.kbStatus)))
+		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution (project KB unless scope says otherwise). Use this to assess KB health before curator maintenance.",
+		kbArgs(nil)), wrap(ctx, s.open(s.kbStatus)))
 }
 
 // ---- Tool handlers ----
@@ -594,11 +621,17 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	if err != nil {
 		return nil, err
 	}
-	on, ok := args["open_reassign"].(bool)
-	if !ok {
-		return nil, fmt.Errorf("open_reassign is required (true or false)")
+	var u domain.ProjectSettings
+	if on, ok := args["open_reassign"].(bool); ok {
+		u.OpenReassign = &on
 	}
-	p, err := s.svc.SetOpenReassign(rctx, caller(rctx).p, id, on)
+	if v, ok := args["name"].(string); ok {
+		u.Name = &v
+	}
+	if v, ok := args["description"].(string); ok {
+		u.Description = &v
+	}
+	p, err := s.svc.UpdateProject(rctx, caller(rctx).p, id, u)
 	if err != nil {
 		return nil, err
 	}
@@ -1419,7 +1452,7 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 	}
 
 	// 2. Fetch all KB documents for this project
-	docSummaries, err := s.kb.ListDocs(ctx, projectID, "")
+	docSummaries, err := s.kb.ListDocs(ctx, kb.Project(projectID), "")
 	if err != nil {
 		return nil, fmt.Errorf("list kb docs: %w", err)
 	}
@@ -1427,7 +1460,7 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 	// 3. Fetch full content for each KB document
 	kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
 	for _, summary := range docSummaries {
-		doc, err := s.kb.GetDoc(ctx, projectID, summary.Path)
+		doc, err := s.kb.GetDoc(ctx, kb.Project(projectID), summary.Path)
 		if err != nil {
 			// Log warning but continue (graceful degradation)
 			slog.Default().Warn("failed to fetch kb doc", "path", summary.Path, "err", err)
@@ -1487,7 +1520,7 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 	// 3. Re-index KB documents into Typesense
 	for _, kbDoc := range bundle.KBDocs {
-		_, err := s.kb.WriteDoc(ctx, newProject.ID, kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags)
+		_, err := s.kb.WriteDoc(ctx, kb.Project(newProject.ID), kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags, "")
 		if err != nil {
 			// Log warning but continue (graceful degradation)
 			slog.Default().Warn("failed to write kb doc during import", "path", kbDoc.Path, "err", err)
@@ -1501,14 +1534,94 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	return jsonResult(map[string]interface{}{"project": newProject})
 }
 
-// ---- KB handlers ----
+// ---- KB handlers (scope rules in internal/service/kb.go) ----
 
-func (s *Server) kbWrite(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+// What a KB tool call does to the KB it names.
+type kbUse int
+
+const (
+	kbRead     kbUse = iota // read or search
+	kbAnnotate              // annotate: anyone who can read
+	kbChange                // write, delete, reindex
+)
+
+// kbOf resolves the knowledge base a KB tool call names and checks the
+// caller may use it that way. Annotations and changes to a project KB also
+// need the project not to be archived.
+func (s *Server) kbOf(ctx context.Context, args map[string]interface{}, use kbUse) (*service.KB, error) {
+	k, err := s.svc.ResolveKB(ctx, caller(ctx).p, service.KBRef{
+		Scope:     optStr(args, "scope", ""),
+		ProjectID: optInt(args, "project_id", 0),
+		TeamID:    optInt(args, "team_id", 0),
+		OrgID:     optInt(args, "org_id", 0),
+	})
+	if err != nil {
+		return nil, err
+	}
+	if use == kbChange {
+		if err := k.RequireWrite(); err != nil {
+			return nil, err
+		}
+	}
+	if use != kbRead && k.Kind == kb.ScopeProject {
+		if err := s.checkProjectNotArchived(ctx, k.ID); err != nil {
+			return nil, err
+		}
+	}
+	return k, nil
+}
+
+// requireKB fails when no knowledge base is configured. Handlers call it
+// after the access and argument checks, so those are reported first.
+func (s *Server) requireKB() error {
+	if s.kb == nil {
+		return fmt.Errorf("the knowledge base is not configured")
+	}
+	return nil
+}
+
+// authorOf is the author recorded for a write or annotation: what the
+// caller passed, or who they are.
+func authorOf(ctx context.Context, args map[string]interface{}) string {
+	if a := strings.TrimSpace(optStr(args, "author", "")); a != "" {
+		return a
+	}
+	if e := caller(ctx).p.Email; e != "" {
+		return e
+	}
+	return "agent"
+}
+
+// minPlacementReason is the shortest reason accepted for a team or org write:
+// enough to force a real sentence, not a token.
+const minPlacementReason = 20
+
+func (s *Server) kbSources(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+	var count func(kb.Scope) int
+	if s.kb != nil {
+		count = func(sc kb.Scope) int {
+			n, _ := s.kb.CountDocs(ctx, sc)
+			return n
+		}
+	}
+	sources, err := s.svc.KBSources(ctx, caller(ctx).p, projectID, count)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{
+		"sources": sources,
+		"note": "The project KB is the default for reading and writing. Use scope 'team' (with team_id if you're on several of " +
+			"these teams) or 'org' on the amp_kb_* tools to reach the others. Write to them only when your user decides the knowledge belongs there.",
+	})
+}
+
+func (s *Server) kbWrite(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
+	if err != nil {
 		return nil, err
 	}
 	path, err := reqStr(args, "path")
@@ -1524,17 +1637,28 @@ func (s *Server) kbWrite(_ context.Context, args map[string]interface{}) (*mcpgo
 		return nil, err
 	}
 	tags := optStrSlice(args, "tags")
-	author := optStr(args, "author", "agent")
+	reason := ""
+	if k.Kind != kb.ScopeProject {
+		reason = strings.TrimSpace(optStr(args, "reason", ""))
+		if len(reason) < minPlacementReason {
+			return nil, fmt.Errorf("writing to the %s %s KB needs a reason: specifically why this belongs to the whole %s rather than one project's KB, "+
+				"and that your user decided it. If your user hasn't decided, write it to the project KB and suggest the move to them instead",
+				k.Name, k.Kind, k.Kind)
+		}
+	}
 
-	doc, err := s.kb.WriteDoc(context.Background(), projectID, path, title, content, author, tags)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	doc, err := s.kb.WriteDoc(ctx, k.Scope, path, title, content, authorOf(ctx, args), tags, reason)
 	if err != nil {
 		return nil, err
 	}
 	return jsonResult(doc)
 }
 
-func (s *Server) kbSearch(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbSearch(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbRead)
 	if err != nil {
 		return nil, err
 	}
@@ -1547,15 +1671,18 @@ func (s *Server) kbSearch(_ context.Context, args map[string]interface{}) (*mcpg
 	recencyBoost := optFloat(args, "recency_boost", 0)
 	minRecencyDays := optInt(args, "min_recency_days", 0)
 
-	results, err := s.kb.Search(context.Background(), projectID, query, tags, limit, recencyBoost, minRecencyDays)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	results, err := s.kb.Search(ctx, k.Scope, query, tags, limit, recencyBoost, minRecencyDays)
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"results": results, "count": len(results)})
+	return jsonResult(map[string]interface{}{"kb": k, "results": results, "count": len(results)})
 }
 
-func (s *Server) kbGet(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbGet(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbRead)
 	if err != nil {
 		return nil, err
 	}
@@ -1563,78 +1690,84 @@ func (s *Server) kbGet(_ context.Context, args map[string]interface{}) (*mcpgo.C
 	if err != nil {
 		return nil, err
 	}
-	doc, err := s.kb.GetDoc(context.Background(), projectID, path)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	doc, err := s.kb.GetDoc(ctx, k.Scope, path)
 	if err != nil {
 		return nil, err
 	}
 	return jsonResult(doc)
 }
 
-func (s *Server) kbList(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbList(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbRead)
 	if err != nil {
 		return nil, err
 	}
-	tag := optStr(args, "tag", "")
-	docs, err := s.kb.ListDocs(context.Background(), projectID, tag)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	docs, err := s.kb.ListDocs(ctx, k.Scope, optStr(args, "tag", ""))
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"docs": docs, "count": len(docs)})
+	return jsonResult(map[string]interface{}{"kb": k, "docs": docs, "count": len(docs)})
 }
 
-func (s *Server) kbDelete(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
 		return nil, err
 	}
 	path, err := reqStr(args, "path")
 	if err != nil {
 		return nil, err
 	}
-	if err := s.kb.DeleteDoc(context.Background(), projectID, path); err != nil {
+	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"deleted": true, "path": path})
+	if err := s.kb.DeleteDoc(ctx, k.Scope, path); err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"deleted": true, "path": path, "kb": k})
 }
 
-func (s *Server) kbTags(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbTags(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbRead)
 	if err != nil {
 		return nil, err
 	}
-	tags, err := s.kb.ListTags(context.Background(), projectID)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	tags, err := s.kb.ListTags(ctx, k.Scope)
 	if err != nil {
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"tags": tags})
 }
 
-func (s *Server) kbReindex(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbReindex(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
 	go func() {
-		if err := s.kb.Reindex(context.Background(), projectID); err != nil {
-			slog.Default().Error("kb reindex failed", "project_id", projectID, "err", err)
+		if err := s.kb.Reindex(context.Background(), k.Scope); err != nil {
+			slog.Default().Error("kb reindex failed", "kb", k.Scope.String(), "err", err)
 		}
 	}()
-	return jsonResult(map[string]interface{}{"reindex": "started", "project_id": projectID})
+	return jsonResult(map[string]interface{}{"reindex": "started", "kb": k})
 }
 
-func (s *Server) kbAnnotate(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbAnnotate(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	// Anyone who can read a KB can annotate it.
+	k, err := s.kbOf(ctx, args, kbAnnotate)
 	if err != nil {
-		return nil, err
-	}
-	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
 		return nil, err
 	}
 	path, err := reqStr(args, "path")
@@ -1645,21 +1778,25 @@ func (s *Server) kbAnnotate(_ context.Context, args map[string]interface{}) (*mc
 	if err != nil {
 		return nil, err
 	}
-	author := optStr(args, "author", "agent")
-
-	ann, err := s.kb.AnnotateDoc(context.Background(), projectID, path, text, author)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	ann, err := s.kb.AnnotateDoc(ctx, k.Scope, path, text, authorOf(ctx, args))
 	if err != nil {
 		return nil, err
 	}
 	return jsonResult(ann)
 }
 
-func (s *Server) kbStatus(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	projectID, err := reqInt(args, "project_id")
+func (s *Server) kbStatus(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbRead)
 	if err != nil {
 		return nil, err
 	}
-	status, err := s.kb.KBStatus(context.Background(), projectID)
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	status, err := s.kb.KBStatus(ctx, k.Scope)
 	if err != nil {
 		return nil, err
 	}
