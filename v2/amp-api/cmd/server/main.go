@@ -142,14 +142,9 @@ func main() {
 	// Token audience (RFC 8707 / MCP 2026-07-28 "token audience binding").
 	// MCP tokens must carry the MCP_AUDIENCE client ID, which the
 	// amp-mcpoauth broker obtains via Dex cross-client trust; the REST API
-	// additionally accepts the UI's oauth2-proxy client. AUDIENCE_MODE
-	// (off|warn|enforce) staggers rollout: warn logs tokens that enforce
-	// would reject so pre-upgrade clients can be watched before enforcing.
-	audienceMode, err := auth.ParseAudienceMode(os.Getenv("AUDIENCE_MODE"))
-	if err != nil {
-		slog.Error("invalid AUDIENCE_MODE", "err", err)
-		os.Exit(1)
-	}
+	// additionally accepts the UI's oauth2-proxy client. Tokens issued
+	// before this check existed lack the audience and get a 401, which
+	// sends MCP clients back through a one-time browser login.
 	mcpAudience := envOrDefault("MCP_AUDIENCE", "amp-mcp")
 	restAudiences := append(splitList(os.Getenv("REST_AUDIENCES")), mcpAudience)
 
@@ -159,11 +154,11 @@ func main() {
 		Scopes:         []string{"openid", "email", "profile"},
 		AllowedOrigins: splitList(os.Getenv("MCP_ALLOWED_ORIGINS")),
 	}
-	mcpVerifier := verifier.WithAudiences("mcp", audienceMode, mcpAudience)
+	mcpVerifier := verifier.WithAudiences("mcp", mcpAudience)
 	mcpVerifier.ResourceMetadataURL = mcpCfg.PublicURL + "/.well-known/oauth-protected-resource"
 	mcpVerifier.Scope = strings.Join(mcpCfg.Scopes, " ")
-	restVerifier := verifier.WithAudiences("rest", audienceMode, restAudiences...)
-	slog.Info("token audience policy", "mode", audienceMode, "mcp", mcpAudience, "rest", restAudiences)
+	restVerifier := verifier.WithAudiences("rest", restAudiences...)
+	slog.Info("token audience policy", "mcp", mcpAudience, "rest", restAudiences)
 
 	mcpPublicServer := &http.Server{
 		Addr:    mcpAddr,

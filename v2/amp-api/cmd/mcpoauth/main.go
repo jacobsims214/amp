@@ -36,6 +36,8 @@ import (
 	dexapi "github.com/dexidp/dex/api/v2"
 	"github.com/google/uuid"
 	"github.com/simstech/amp-api/internal/dexclient"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // dynamicClientPrefix marks client IDs minted by /register.
@@ -151,9 +153,9 @@ func (s *server) authServerMetadata(w http.ResponseWriter, r *http.Request) {
 //     the token's aud, which amp-api checks. Before adding it, the client is
 //     (re-)added to amp-mcp's TrustedPeers — this heals clients registered
 //     before this release, and any TrustedPeers update lost to a concurrent
-//     write on another replica. If trust can't be established, the scope is
-//     left out (Dex would reject the whole request otherwise) and the client
-//     gets a pre-audience token, which amp-api accepts in AUDIENCE_MODE=warn.
+//     write on another replica. If trust can't be established the request
+//     fails with 503: a token without the audience would only be rejected
+//     by amp-api, sending the client round the login loop again.
 func (s *server) authorize(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 
@@ -167,10 +169,13 @@ func (s *server) authorize(w http.ResponseWriter, r *http.Request) {
 	clientID := q.Get("client_id")
 	audScope := s.trust.audienceScope()
 	if clientID != "" && !slices.Contains(scopes, audScope) {
-		if err := s.trustRegisteredClient(r.Context(), clientID); err != nil {
-			slog.Warn("no MCP audience trust for client; authorizing without amp-mcp audience",
-				"client_id", clientID, "err", err)
-		} else {
+		isMCP, err := s.trustRegisteredClient(r.Context(), clientID)
+		switch {
+		case err != nil:
+			slog.Error("could not establish MCP audience trust for client", "client_id", clientID, "err", err)
+			http.Error(w, "AMP sign-in is temporarily unavailable, please retry", http.StatusServiceUnavailable)
+			return
+		case isMCP:
 			scopes = append(scopes, audScope)
 		}
 	}
@@ -187,15 +192,33 @@ func (s *server) authorize(w http.ResponseWriter, r *http.Request) {
 // itself) are not MCP clients. Every client /register has ever created is
 // public — including ones minted by earlier broker versions with Dex-style
 // IDs instead of the "mcp-" prefix — so all of them get upgraded here.
-func (s *server) trustRegisteredClient(ctx context.Context, clientID string) error {
+//
+// isMCP is false for clients that aren't MCP clients (unknown, confidential,
+// or the audience client); those are passed to Dex unchanged, which rejects
+// unknown ones itself. err is set only when an MCP client couldn't be trusted.
+func (s *server) trustRegisteredClient(ctx context.Context, clientID string) (isMCP bool, err error) {
 	got, err := s.dex.GetClient(ctx, &dexapi.GetClientReq{Id: clientID})
+	if isDexNotFound(err) {
+		return false, nil
+	}
 	if err != nil {
-		return fmt.Errorf("client %q not registered in dex: %w", clientID, err)
+		return false, fmt.Errorf("look up client %q in dex: %w", clientID, err)
 	}
 	if !got.GetClient().GetPublic() || clientID == s.trust.audienceID {
-		return fmt.Errorf("client %q is not a public MCP client", clientID)
+		return false, nil
 	}
-	return s.trust.ensureTrusted(ctx, clientID)
+	return true, s.trust.ensureTrusted(ctx, clientID)
+}
+
+// isDexNotFound reports whether err is Dex's "no such client". Dex's gRPC
+// GetClient returns storage.ErrNotFound unwrapped, which reaches us as
+// codes.Unknown with message "not found"; codes.NotFound is accepted too.
+func isDexNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	st := status.Convert(err)
+	return st.Code() == codes.NotFound || (st.Code() == codes.Unknown && st.Message() == "not found")
 }
 
 func (s *server) protectedResourceMetadata(w http.ResponseWriter, r *http.Request) {

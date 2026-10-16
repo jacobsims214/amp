@@ -133,26 +133,20 @@ AMP's MCP endpoint speaks both protocol eras on the same URL (`https://<domain>/
 
 1. On startup `amp-mcpoauth` creates a Dex client `amp-mcp` (`auth.mcpAudience`) through the gRPC API. It is confidential, with a random secret nobody holds and no redirect URIs, so it can't be used to log in; it only exists to be the token audience and to hold `trustedPeers`. It must be a storage client, not a `staticClients` entry, because Dex refuses API updates to static clients.
 2. `/register` adds each new client to `amp-mcp`'s `trustedPeers`.
-3. `/authorize` adds `openid email profile` and `audience:server:client_id:amp-mcp` to the request scope, after re-adding the client to `trustedPeers` (only for public clients that exist in Dex). This heals clients registered before this release, including ones with Dex-style IDs from earlier broker versions. Dex then issues access tokens with `aud: [amp-mcp, <client>]`, `azp: <client>`, and an `email` claim. Before this release MCP tokens carried no email, which is why amp-api logged "JIT user provisioning skipped".
+3. `/authorize` adds `openid email profile` and `audience:server:client_id:amp-mcp` to the request scope, after re-adding the client to `trustedPeers` (only for public clients that exist in Dex). If that fails, `/authorize` returns 503 instead of letting the client get a token amp-api would reject. This heals clients registered before this release, including ones with Dex-style IDs from earlier broker versions. Dex then issues access tokens with `aud: [amp-mcp, <client>]`, `azp: <client>`, and an `email` claim. Before this release MCP tokens carried no email, which is why amp-api logged "JIT user provisioning skipped".
 4. amp-api checks `aud` on `/mcp` for `amp-mcp`, and on `/api` for `oauth2Proxy.clientID` or `amp-mcp`.
 
 Dex's `UpdateClient` replaces `trustedPeers` wholesale, and `amp-mcpoauth` runs more than one replica, so two registrations landing within milliseconds of each other on different pods can drop one entry. `ensureTrusted` re-reads after every write and retries, re-checks a few seconds later, and `/authorize` re-adds on every login. The worst case is one extra login prompt. `cmd/mcpoauth/main_test.go` exercises this with a fake Dex that has Dex's replace semantics. Dex re-checks trust at every token issuance, refreshes included.
 
 Dex does not emit the RFC 9207 `iss` authorization-response parameter, so the broker's metadata advertises `authorization_response_iss_parameter_supported: false`. Advertising `true` would make 2026-07-28 clients reject every login. The metadata `issuer` stays Dex's URL. The official TypeScript SDK (1.32.x) explicitly doesn't compare it to the discovery URL, and the old value is what existing clients already work with.
 
-### Rollout: `auth.audienceMode`
+### Upgrade: everyone signs in once
 
-| mode | behaviour |
-|---|---|
-| `off` | no audience check (pre-migration behaviour) |
-| `warn` (chart default) | accept, but log `token audience not accepted (audience mode=warn ...)` for every token `enforce` would reject |
-| `enforce` | reject with `401` + `WWW-Authenticate: Bearer error="invalid_token", resource_metadata=..., scope=...`, which makes MCP clients re-run OAuth |
-
-Clients that logged in before the upgrade hold tokens and refresh tokens without the `amp-mcp` audience. A refresh keeps the original scopes, so those tokens never gain the audience until the client logs in again through `/authorize`. Ship with `warn`, watch amp-api's logs, and flip `values-production.yaml` to `enforce` once the warn line stops appearing. Under `enforce` a lagging client sees a 401 and recovers with one browser login.
+amp-api rejects any token without the right audience, with `401` + `WWW-Authenticate: Bearer error="invalid_token", resource_metadata=..., scope=...`. Every token issued before this release lacks `amp-mcp`, and refreshing doesn't add it (a refresh keeps the original scopes), so on upgrade every MCP client gets one 401 and goes back through a browser login, after which it has an audience-bound token. UI sessions are unaffected: oauth2-proxy tokens carry `amp-ui`, which `/api` accepts. There is deliberately no grace mode.
 
 ### End-to-end test
 
-`test/e2e` drives a deployed stack exactly like an MCP client: PRM discovery from a 401, DCR, `/authorize` through the broker, Dex's login form, Dex `/token`, then MCP calls in both eras with the real `mcp-go` client, plus a UI login through oauth2-proxy to `/api/me`. It is phased to bracket an upgrade (`AMP_E2E_PHASE=pre` against the old release, then `warn`, then `enforce`); see the file header for env vars. On docker-desktop, port-forward Envoy to 8443 and set `AMP_E2E_DIAL=127.0.0.1:8443` so `https://amp.local` resolves without binding :443.
+`test/e2e` drives a deployed stack exactly like an MCP client: PRM discovery from a 401, DCR, `/authorize` through the broker, Dex's login form, Dex `/token`, then MCP calls in both eras with the real `mcp-go` client, plus a UI login through oauth2-proxy to `/api/me`. It is phased to bracket an upgrade (`AMP_E2E_PHASE=pre` against the old release, then `post` against the new one); see the file header for env vars. On docker-desktop, port-forward Envoy to 8443 and set `AMP_E2E_DIAL=127.0.0.1:8443` so `https://amp.local` resolves without binding :443.
 
 ## securityContext hardening (Kubernetes "restricted" Pod Security Standard)
 

@@ -50,7 +50,6 @@ type transportStack struct {
 
 type transportOpts struct {
 	auth           bool
-	audienceMode   auth.AudienceMode
 	allowedOrigins []string
 }
 
@@ -97,7 +96,7 @@ func setupTransport(t *testing.T, o transportOpts) *transportStack {
 		Scopes:         []string{"openid", "email", "profile"},
 		AllowedOrigins: o.allowedOrigins,
 	}
-	v := base.WithAudiences("mcp", o.audienceMode, "amp-mcp")
+	v := base.WithAudiences("mcp", "amp-mcp")
 	v.ResourceMetadataURL = st.url + "/.well-known/oauth-protected-resource"
 	v.Scope = strings.Join(mcpCfg.Scopes, " ")
 	// Mirror Envoy's routing: /mcp and /mcp/* are forwarded to amp-api's
@@ -427,7 +426,7 @@ func TestTransport_OriginValidation(t *testing.T) {
 }
 
 func TestTransport_Auth(t *testing.T) {
-	st := setupTransport(t, transportOpts{auth: true, audienceMode: auth.AudienceEnforce})
+	st := setupTransport(t, transportOpts{auth: true})
 	good := st.idp.token(t, map[string]any{"aud": []string{"amp-mcp", "mcp-abc"}, "azp": "mcp-abc"})
 	preUpgrade := st.idp.token(t, map[string]any{"aud": "mcp-abc"})
 
@@ -465,7 +464,7 @@ func TestTransport_Auth(t *testing.T) {
 			t.Fatalf("legacy initialize: %d %s", init.status, init.raw)
 		}
 	})
-	t.Run("pre-upgrade token rejected under enforce with re-auth challenge", func(t *testing.T) {
+	t.Run("pre-upgrade token rejected with re-auth challenge", func(t *testing.T) {
 		h := modernHeaders("tools/call", "amp_list_projects")
 		h["Authorization"] = "Bearer " + preUpgrade
 		r := post(t, st.url, h, modernToolCall(1, "amp_list_projects", map[string]any{}))
@@ -473,12 +472,10 @@ func TestTransport_Auth(t *testing.T) {
 			t.Fatalf("%d %q", r.status, r.header.Get("WWW-Authenticate"))
 		}
 	})
-	t.Run("pre-upgrade token allowed under warn", func(t *testing.T) {
-		warn := setupTransport(t, transportOpts{auth: true, audienceMode: auth.AudienceWarn})
-		tok := warn.idp.token(t, map[string]any{"aud": "mcp-abc"})
+	t.Run("token for another client rejected", func(t *testing.T) {
 		h := modernHeaders("tools/call", "amp_list_projects")
-		h["Authorization"] = "Bearer " + tok
-		if r := post(t, warn.url, h, modernToolCall(1, "amp_list_projects", map[string]any{})); r.status != 200 {
+		h["Authorization"] = "Bearer " + st.idp.token(t, map[string]any{"aud": "amp-ui"})
+		if r := post(t, st.url, h, modernToolCall(1, "amp_list_projects", map[string]any{})); r.status != 401 {
 			t.Fatalf("%d %s", r.status, r.raw)
 		}
 	})

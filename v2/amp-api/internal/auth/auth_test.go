@@ -101,7 +101,7 @@ func do(t *testing.T, v *Verifier, authz string) (*httptest.ResponseRecorder, bo
 	return rec, reached
 }
 
-func TestAudienceModes(t *testing.T) {
+func TestAudiences(t *testing.T) {
 	idp := newTestIdP(t)
 	base := idp.verifier(t)
 
@@ -111,23 +111,21 @@ func TestAudienceModes(t *testing.T) {
 
 	cases := []struct {
 		name      string
-		mode      AudienceMode
 		audiences []string
 		token     string
 		wantCode  int
 	}{
-		{"enforce accepts cross-client audience", AudienceEnforce, []string{"amp-mcp"}, mcpToken, 200},
-		{"enforce rejects pre-upgrade token", AudienceEnforce, []string{"amp-mcp"}, legacyToken, 401},
-		{"enforce rejects other client's token", AudienceEnforce, []string{"amp-mcp"}, uiToken, 401},
-		{"warn allows pre-upgrade token", AudienceWarn, []string{"amp-mcp"}, legacyToken, 200},
-		{"off allows anything signed", AudienceOff, []string{"amp-mcp"}, uiToken, 200},
-		{"rest accepts ui audience", AudienceEnforce, []string{"amp-ui", "amp-mcp"}, uiToken, 200},
-		{"rest accepts mcp audience", AudienceEnforce, []string{"amp-ui", "amp-mcp"}, mcpToken, 200},
-		{"no audiences configured forces off", AudienceEnforce, nil, uiToken, 200},
+		{"accepts cross-client audience", []string{"amp-mcp"}, mcpToken, 200},
+		{"rejects pre-upgrade token", []string{"amp-mcp"}, legacyToken, 401},
+		{"rejects other client's token", []string{"amp-mcp"}, uiToken, 401},
+		{"rest accepts ui audience", []string{"amp-ui", "amp-mcp"}, uiToken, 200},
+		{"rest accepts mcp audience", []string{"amp-ui", "amp-mcp"}, mcpToken, 200},
+		{"rest rejects pre-upgrade token", []string{"amp-ui", "amp-mcp"}, legacyToken, 401},
+		{"no audiences configured accepts any", nil, uiToken, 200},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			v := base.WithAudiences("test", tc.mode, tc.audiences...)
+			v := base.WithAudiences("test", tc.audiences...)
 			rec, reached := do(t, v, "Bearer "+tc.token)
 			if reached != (tc.wantCode == 200) || rec.Code != tc.wantCode {
 				t.Fatalf("reached=%v code=%d, want %d (body %s)", reached, rec.Code, tc.wantCode, rec.Body)
@@ -144,7 +142,7 @@ func TestAudienceModes(t *testing.T) {
 func TestWithAudiencesDoesNotMutateBase(t *testing.T) {
 	idp := newTestIdP(t)
 	base := idp.verifier(t)
-	_ = base.WithAudiences("mcp", AudienceEnforce, "amp-mcp")
+	_ = base.WithAudiences("mcp", "amp-mcp")
 	rec, reached := do(t, base, "Bearer "+idp.token(t, map[string]any{"aud": "anything"}))
 	if !reached {
 		t.Fatalf("base verifier started enforcing after WithAudiences: %d %s", rec.Code, rec.Body)
@@ -164,7 +162,7 @@ func TestLegacyOIDCAudiencesStillEnforce(t *testing.T) {
 
 func TestChallenges(t *testing.T) {
 	idp := newTestIdP(t)
-	v := idp.verifier(t).WithAudiences("mcp", AudienceEnforce, "amp-mcp")
+	v := idp.verifier(t).WithAudiences("mcp", "amp-mcp")
 	v.ResourceMetadataURL = "https://amp.example.test/mcp/.well-known/oauth-protected-resource"
 	v.Scope = "openid email profile"
 
@@ -199,16 +197,4 @@ func TestChallenges(t *testing.T) {
 			t.Fatal("token from another issuer accepted")
 		}
 	})
-}
-
-func TestParseAudienceMode(t *testing.T) {
-	for in, want := range map[string]AudienceMode{"": AudienceOff, "off": AudienceOff, "WARN": AudienceWarn, " enforce ": AudienceEnforce} {
-		got, err := ParseAudienceMode(in)
-		if err != nil || got != want {
-			t.Errorf("ParseAudienceMode(%q) = %q, %v; want %q", in, got, err, want)
-		}
-	}
-	if _, err := ParseAudienceMode("strict"); err == nil {
-		t.Error("expected error for unknown mode")
-	}
 }

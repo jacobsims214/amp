@@ -35,36 +35,6 @@ type Identity struct {
 	User    *domain.User // populated after JIT provisioning
 }
 
-// AudienceMode controls how a Verifier treats a token whose "aud" claim
-// doesn't name one of its accepted audiences.
-type AudienceMode string
-
-const (
-	// AudienceOff skips the audience check entirely (pre-2026-07-28
-	// behaviour, and the default when nothing is configured).
-	AudienceOff AudienceMode = "off"
-	// AudienceWarn accepts the token but logs that it would have been
-	// rejected — the upgrade-path mode, so existing deployments can watch
-	// for clients still holding pre-audience tokens before enforcing.
-	AudienceWarn AudienceMode = "warn"
-	// AudienceEnforce rejects the token with a 401 + WWW-Authenticate
-	// challenge, which makes compliant MCP clients re-run OAuth and come
-	// back with a correctly-scoped token.
-	AudienceEnforce AudienceMode = "enforce"
-)
-
-// ParseAudienceMode maps a config string to an AudienceMode. Empty means off.
-func ParseAudienceMode(s string) (AudienceMode, error) {
-	switch m := AudienceMode(strings.ToLower(strings.TrimSpace(s))); m {
-	case "":
-		return AudienceOff, nil
-	case AudienceOff, AudienceWarn, AudienceEnforce:
-		return m, nil
-	default:
-		return "", fmt.Errorf("invalid audience mode %q (want off, warn, or enforce)", s)
-	}
-}
-
 // Verifier validates bearer tokens against Dex's JWKS. Safe for concurrent use.
 type Verifier struct {
 	inner            *oidc.IDTokenVerifier
@@ -72,7 +42,6 @@ type Verifier struct {
 	bootstrapAdmins  map[string]bool
 	enabled          bool
 	allowedAudiences []string
-	audienceMode     AudienceMode
 	label            string // which listener this verifier guards, for logs
 
 	// ResourceMetadataURL, when set, is advertised in the WWW-Authenticate
@@ -131,22 +100,19 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	keySet := oidc.NewRemoteKeySet(ctx, strings.TrimSuffix(discoveryURL, "/")+"/keys")
 	verifier := oidc.NewVerifier(cfg.IssuerURL, keySet, &oidc.Config{SkipClientIDCheck: true})
 
-	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, audienceMode: AudienceOff}
+	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins}
 	if len(cfg.Audiences) > 0 {
-		// Legacy OIDC_AUDIENCES knob: a non-empty list has always meant
-		// "reject anything else", so it keeps enforce semantics.
 		v.allowedAudiences = cfg.Audiences
-		v.audienceMode = AudienceEnforce
 	}
 	return v, nil
 }
 
-// WithAudiences returns a copy of v that checks tokens against the given
-// audiences in the given mode. The copy shares the underlying key set, so
+// WithAudiences returns a copy of v that only accepts tokens whose aud
+// claim names one of audiences. The copy shares the underlying key set, so
 // one Verifier can back several listeners (e.g. MCP and REST) that each
 // accept a different audience. Empty audiences are dropped; with none left
-// the mode is forced to off.
-func (v *Verifier) WithAudiences(label string, mode AudienceMode, audiences ...string) *Verifier {
+// any audience is accepted.
+func (v *Verifier) WithAudiences(label string, audiences ...string) *Verifier {
 	c := *v
 	c.label = label
 	c.allowedAudiences = nil
@@ -154,10 +120,6 @@ func (v *Verifier) WithAudiences(label string, mode AudienceMode, audiences ...s
 		if a = strings.TrimSpace(a); a != "" {
 			c.allowedAudiences = append(c.allowedAudiences, a)
 		}
-	}
-	c.audienceMode = mode
-	if len(c.allowedAudiences) == 0 {
-		c.audienceMode = AudienceOff
 	}
 	return &c
 }
@@ -215,16 +177,13 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 			http.Error(w, `{"error":"malformed claims"}`, http.StatusUnauthorized)
 			return
 		}
-		if v.audienceMode != AudienceOff && !v.verifyAudience(idToken.Audience) {
-			if v.audienceMode == AudienceEnforce {
-				slog.Warn("token rejected: audience not accepted",
-					"listener", v.label, "aud", idToken.Audience, "accepted", v.allowedAudiences, "subject", claims.Subject)
-				v.writeUnauthorized(w, "token audience not valid for this resource")
-				return
-			}
-			slog.Warn("token audience not accepted (audience mode=warn, allowing; would be rejected under enforce)",
-				"listener", v.label, "aud", idToken.Audience, "accepted", v.allowedAudiences, "subject", claims.Subject,
-				"user_agent", r.UserAgent())
+		if !v.verifyAudience(idToken.Audience) {
+			// A 401 with the challenge makes MCP clients re-run OAuth and
+			// come back with a token issued for this resource.
+			slog.Warn("token rejected: audience not accepted",
+				"listener", v.label, "aud", idToken.Audience, "accepted", v.allowedAudiences, "subject", claims.Subject)
+			v.writeUnauthorized(w, "token audience not valid for this resource")
+			return
 		}
 
 		ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name}

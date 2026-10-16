@@ -86,12 +86,6 @@ image:
   registry: ghcr.io/jacobsims214/amp
   pullPolicy: IfNotPresent
 
-# See values.yaml "auth" for the rollout procedure. Stays at warn for the
-# first rollout of the MCP 2026-07-28 migration; flip to enforce once the
-# warn log line goes quiet.
-auth:
-  audienceMode: warn
-
 ampApi:
   tag: ""   # empty = use global.imageTag
   replicas: 1

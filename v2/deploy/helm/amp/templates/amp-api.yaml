@@ -76,8 +76,6 @@ spec:
               value: "http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex"
             - name: BOOTSTRAP_ADMIN_EMAILS
               value: {{ .Values.global.bootstrapAdminEmails | quote }}
-            - name: AUDIENCE_MODE
-              value: {{ .Values.auth.audienceMode | quote }}
             - name: MCP_AUDIENCE
               value: {{ .Values.auth.mcpAudience | quote }}
             - name: REST_AUDIENCES

@@ -21,7 +21,8 @@ import (
 )
 
 // fakeDex models the parts of Dex's gRPC API the broker uses, with Dex's
-// real semantics: GetClient on a missing client is a NotFound error,
+// real semantics: GetClient on a missing client is storage.ErrNotFound
+// passed straight through gRPC (codes.Unknown, "not found"),
 // CreateClient reports AlreadyExists, and UpdateClient *replaces*
 // TrustedPeers wholesale — the property that makes concurrent updates
 // from several broker replicas lossy.
@@ -47,7 +48,7 @@ func (f *fakeDex) GetClient(_ context.Context, in *dexapi.GetClientReq, _ ...grp
 	defer f.mu.Unlock()
 	c, ok := f.clients[in.Id]
 	if !ok {
-		return nil, status.Error(codes.NotFound, "client not found")
+		return nil, status.Error(codes.Unknown, "not found")
 	}
 	return &dexapi.GetClientResp{Client: proto.Clone(c).(*dexapi.Client)}, nil
 }
@@ -250,9 +251,31 @@ func TestAuthorizeHealsPreUpgradeClient(t *testing.T) {
 	}
 }
 
+// If an MCP client can't be added to TrustedPeers, /authorize must fail
+// rather than send it to Dex without the audience scope: the resulting token
+// would be rejected by amp-api and the client would loop through login.
+func TestAuthorizeFailsWithoutTrust(t *testing.T) {
+	dex := newFakeDex()
+	dex.clients["mcp-1"] = &dexapi.Client{Id: "mcp-1", Public: true}
+	dex.clients["amp-mcp"] = &dexapi.Client{Id: "amp-mcp", Secret: "x"}
+	dex.clobberNext = 1000 // every TrustedPeers write is lost
+	_, ts := testServer(dex)
+	defer ts.Close()
+
+	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := c.Get(ts.URL + "/authorize?" + url.Values{"client_id": {"mcp-1"}, "response_type": {"code"}}.Encode())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable || resp.Header.Get("Location") != "" {
+		t.Fatalf("got %d Location=%q, want 503 with no redirect to Dex", resp.StatusCode, resp.Header.Get("Location"))
+	}
+}
+
 // /authorize is unauthenticated: a made-up client_id must not be added to
-// TrustedPeers, and without trust the audience scope is withheld (Dex would
-// otherwise fail the whole request).
+// TrustedPeers, and it gets no audience scope (Dex rejects the unknown
+// client itself).
 func TestAuthorizeUnknownClient(t *testing.T) {
 	dex := newFakeDex()
 	dex.clients["amp-mcp"] = &dexapi.Client{Id: "amp-mcp", Secret: "x"}

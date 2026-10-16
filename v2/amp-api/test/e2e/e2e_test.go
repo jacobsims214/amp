@@ -7,12 +7,10 @@
 //
 // It is phased so it can bracket an upgrade:
 //
-//	AMP_E2E_PHASE=pre      run against the OLD release: register a client,
-//	                       log in, save its tokens to AMP_E2E_STATE
-//	AMP_E2E_PHASE=warn     run against the NEW release with
-//	                       auth.audienceMode=warn
-//	AMP_E2E_PHASE=enforce  run against the NEW release with
-//	                       auth.audienceMode=enforce
+//	AMP_E2E_PHASE=pre   run against the OLD release: register a client,
+//	                    log in, save its tokens to AMP_E2E_STATE
+//	AMP_E2E_PHASE=post  run against the NEW release: old tokens are
+//	                    rejected, re-login and new clients work
 //
 // Required env: AMP_E2E_URL (e.g. https://amp.local), AMP_E2E_USER,
 // AMP_E2E_PASSWORD (a Dex local user), AMP_E2E_STATE (a file path).
@@ -488,27 +486,30 @@ func TestE2E(t *testing.T) {
 		}
 		e.save(t, "pre", state{ClientID: id, AccessToken: tok["access_token"].(string), RefreshToken: str(tok["refresh_token"])})
 
-	case "warn":
+	case "post":
 		pre := e.load(t, "pre")
+		var post state
 
-		t.Run("pre-upgrade token keeps working in both eras", func(t *testing.T) {
-			for _, opts := range [][]mcpclient.ClientOption{nil, {mcpclient.WithProtocolVersion("2025-11-25")}} {
-				ver, err := e.mcpCall(t, pre.AccessToken, opts...)
-				if err != nil {
-					t.Fatalf("pre-upgrade token rejected under warn: %v", err)
-				}
-				t.Logf("pre-upgrade token accepted, protocol %s ✓", ver)
+		t.Run("pre-upgrade token is rejected with a re-auth challenge", func(t *testing.T) {
+			code, h := e.rawModern(t, pre.AccessToken, "")
+			ch := h.Get("WWW-Authenticate")
+			if code != 401 || !strings.Contains(ch, `error="invalid_token"`) || !strings.Contains(ch, "resource_metadata=") {
+				t.Fatalf("got %d %q, want 401 with invalid_token + resource_metadata", code, ch)
 			}
+			if _, err := e.mcpCall(t, pre.AccessToken, mcpclient.WithProtocolVersion("2025-11-25")); err == nil {
+				t.Fatal("pre-upgrade token accepted by a legacy-era client")
+			}
+			t.Logf("401 %s ✓", ch)
 		})
-		t.Run("pre-upgrade refresh token still refreshes", func(t *testing.T) {
+		t.Run("refreshing a pre-upgrade token doesn't get past the check", func(t *testing.T) {
 			tok := e.refresh(t, as, pre.ClientID, pre.RefreshToken)
-			c := decode(t, tok["access_token"].(string))
-			t.Logf("refreshed pre-upgrade token aud=%v (original scopes, so no amp-mcp yet)", c.Aud)
-			if _, err := e.mcpCall(t, tok["access_token"].(string)); err != nil {
-				t.Fatalf("refreshed pre-upgrade token rejected under warn: %v", err)
+			if c := decode(t, tok["access_token"].(string)); slices.Contains(c.Aud, "amp-mcp") {
+				t.Fatalf("refresh unexpectedly added amp-mcp: %v", c.Aud)
 			}
-			pre.RefreshToken = str(tok["refresh_token"])
-			e.save(t, "pre", pre)
+			if _, err := e.mcpCall(t, tok["access_token"].(string)); err == nil {
+				t.Fatal("refreshed pre-upgrade token accepted; clients would never be sent to re-login")
+			}
+			t.Log("refreshed pre-upgrade token rejected, client must log in ✓")
 		})
 		t.Run("new client gets an audience-bound, attributable token", func(t *testing.T) {
 			id := e.register(t, as, "e2e post-upgrade client")
@@ -535,57 +536,33 @@ func TestE2E(t *testing.T) {
 			if rc := decode(t, r["access_token"].(string)); !slices.Contains(rc.Aud, "amp-mcp") {
 				t.Fatalf("refreshed token lost the amp-mcp audience: %v", rc.Aud)
 			}
+			if _, err := e.mcpCall(t, r["access_token"].(string)); err != nil {
+				t.Fatalf("refreshed token rejected: %v", err)
+			}
 			t.Log("refresh keeps the amp-mcp audience ✓")
-			e.save(t, "post", state{ClientID: id, AccessToken: tok["access_token"].(string), RefreshToken: str(r["refresh_token"])})
+			post = state{ClientID: id, AccessToken: tok["access_token"].(string)}
 		})
-		t.Run("pre-upgrade client is healed on its next login", func(t *testing.T) {
+		t.Run("pre-upgrade client recovers by logging in again", func(t *testing.T) {
 			tok := e.login(t, as, pre.ClientID)
 			c := decode(t, tok["access_token"].(string))
 			if !slices.Contains(c.Aud, "amp-mcp") {
 				t.Fatalf("re-login of pre-upgrade client %s still has aud=%v", pre.ClientID, c.Aud)
 			}
+			for _, opts := range [][]mcpclient.ClientOption{nil, {mcpclient.WithProtocolVersion("2025-11-25")}} {
+				if _, err := e.mcpCall(t, tok["access_token"].(string), opts...); err != nil {
+					t.Fatalf("re-authorized pre-upgrade client still rejected: %v", err)
+				}
+			}
 			t.Logf("pre-upgrade client re-login: aud=%v ✓", c.Aud)
-			e.save(t, "healed", state{ClientID: pre.ClientID, AccessToken: tok["access_token"].(string)})
 		})
 		t.Run("UI session (aud=amp-ui) still reaches the REST API", func(t *testing.T) {
 			me := e.uiAPIMe(t)
 			t.Logf("/api/me: %v ✓", me["email"])
 		})
-
-	case "enforce":
-		pre, post, healed := e.load(t, "pre"), e.load(t, "post"), e.load(t, "healed")
-
-		t.Run("pre-upgrade token is rejected with a re-auth challenge", func(t *testing.T) {
-			code, h := e.rawModern(t, pre.AccessToken, "")
-			ch := h.Get("WWW-Authenticate")
-			if code != 401 || !strings.Contains(ch, `error="invalid_token"`) || !strings.Contains(ch, "resource_metadata=") {
-				t.Fatalf("got %d %q, want 401 with invalid_token + resource_metadata", code, ch)
-			}
-			t.Logf("401 %s ✓", ch)
-		})
-		t.Run("audience-bound tokens work in both eras", func(t *testing.T) {
-			for name, tok := range map[string]string{"post": post.AccessToken, "healed": healed.AccessToken} {
-				for _, opts := range [][]mcpclient.ClientOption{nil, {mcpclient.WithProtocolVersion("2025-11-25")}} {
-					ver, err := e.mcpCall(t, tok, opts...)
-					if err != nil {
-						t.Fatalf("%s token rejected under enforce: %v", name, err)
-					}
-					t.Logf("%s token, protocol %s ✓", name, ver)
-				}
-			}
-		})
-		t.Run("pre-upgrade client recovers by logging in again", func(t *testing.T) {
-			tok := e.login(t, as, pre.ClientID)
-			if _, err := e.mcpCall(t, tok["access_token"].(string)); err != nil {
-				t.Fatalf("re-authorized pre-upgrade client still rejected: %v", err)
-			}
-			t.Log("re-login recovers under enforce ✓")
-		})
-		t.Run("UI session still reaches the REST API", func(t *testing.T) {
-			me := e.uiAPIMe(t)
-			t.Logf("/api/me: %v ✓", me["email"])
-		})
 		t.Run("foreign browser Origin is refused", func(t *testing.T) {
+			if post.AccessToken == "" {
+				t.Skip("no post-upgrade token")
+			}
 			if code, _ := e.rawModern(t, post.AccessToken, "https://evil.example"); code != http.StatusForbidden {
 				t.Fatalf("foreign origin: %d, want 403", code)
 			}
