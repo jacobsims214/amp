@@ -4,9 +4,11 @@ import { Archive, BookOpen, Building2, Loader2, Lock, RotateCcw, Save, Users } f
 import { api } from '../api/client'
 import { ProjectNav } from '../components/ProjectNav'
 import { TeamAccessPanel } from '../components/TeamAccessModal'
+import { MetadataEditor } from '../components/MetadataEditor'
+import { metadataPatch } from '../lib/metadata'
 import { inputCls, labelCls } from '../components/CrudModal'
 import { canManageProject } from '../lib/people'
-import type { KBSource, Org, Project, ProjectAccess } from '../types'
+import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
 
 function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
   return (
@@ -36,6 +38,24 @@ export function ProjectSettings() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const canManage = canManageProject(myAccess)
+  // The edited metadata; null until the user changes something.
+  const [meta, setMeta] = useState<{ value: Metadata; error: string | null } | null>(null)
+  const [metaSaving, setMetaSaving] = useState(false)
+  const [metaSaved, setMetaSaved] = useState(false)
+  const metaPatch = project && meta ? metadataPatch(project.metadata, meta.value) : undefined
+
+  const saveMeta = async () => {
+    if (!metaPatch || meta?.error) return
+    setMetaSaving(true); setError(null); setMetaSaved(false)
+    try {
+      setProject(await api.updateProjectSettings(pid, { metadata: metaPatch }))
+      setMetaSaved(true)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Save failed')
+    } finally {
+      setMetaSaving(false)
+    }
+  }
 
   useEffect(() => {
     api.getProject(pid).then(p => {
@@ -117,6 +137,22 @@ export function ProjectSettings() {
                     </div>
                   )}
                 </div>
+              </Section>
+
+              <Section title="Metadata"
+                description="Free-form fields for integrations and reporting, e.g. jira_board, initiative, capitalizable. Every epic, story, and ticket in the project inherits them and can override them.">
+                <MetadataEditor key={project.id} initial={project.metadata} readOnly={!canManage}
+                  onChange={(value, error) => { setMeta({ value, error }); setMetaSaved(false) }} />
+                {canManage && (
+                  <div className="flex items-center gap-3 mt-3">
+                    <button onClick={saveMeta} disabled={!metaPatch || !!meta?.error || metaSaving}
+                      className="flex items-center gap-1.5 px-3 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                      {metaSaving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+                      Save fields
+                    </button>
+                    {metaSaved && !metaPatch && <span className="text-xs text-[#34D399]">Saved</span>}
+                  </div>
+                )}
               </Section>
 
               <Section title="Team access" description="Teams reach the project through these links. Owner teams manage the project; member teams work in it.">

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck, Building2, Plus } from 'lucide-react'
+import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck, Building2, Plus, CalendarDays } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -215,6 +215,16 @@ export function Projects() {
               >
                 <ShieldCheck size={13} />
                 Users
+              </Link>
+            )}
+            {me && (
+              <Link
+                to="/reports"
+                title="End-of-day reports and velocity"
+                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+              >
+                <CalendarDays size={13} />
+                Daily reports
               </Link>
             )}
             {me && (

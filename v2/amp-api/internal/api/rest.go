@@ -118,6 +118,10 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
 	mux.HandleFunc("/api/users/", h.userSub)
+	mux.HandleFunc("/api/day-reports", h.dayReports)
+	mux.HandleFunc("/api/day-reports/", h.dayReports)
+	mux.HandleFunc("/api/velocity", h.velocity)
+	mux.HandleFunc("/api/metadata/", h.metadata)
 }
 
 // ---- /api/me ----
@@ -259,6 +263,11 @@ func (h *RestHandler) projects(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, err, 400)
 			return
 		}
+		var err error
+		if req.Metadata, err = req.Metadata.Clean(); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
 		home, err := h.svc.ResolveProjectHome(r.Context(), pr, req.OrgID, req.TeamID)
 		if err != nil {
 			fail(w, err, 500)
@@ -328,6 +337,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 		// Re-index all KB docs: for each bundle.KBDocs, call WriteDoc
 		for _, doc := range bundle.KBDocs {
+			if h.kb == nil {
+				slog.Warn("knowledge base not configured; skipping the bundle's KB docs", "docs", len(bundle.KBDocs))
+				break
+			}
 			// Convert []string tags to []string (already in correct format)
 			_, err := h.kb.WriteDoc(r.Context(), kb.Project(newProject.ID), doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags, "", doc.Annotations)
 			if err != nil {
@@ -464,10 +477,13 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Fetch KB docs and add them to the bundle
-		docSummaries, err := h.kb.ListDocs(r.Context(), kb.Project(projectID), "")
-		if err != nil {
-			jsonErr(w, err, 500)
-			return
+		// (none when the knowledge base isn't configured)
+		var docSummaries []kb.DocSummary
+		if h.kb != nil {
+			if docSummaries, err = h.kb.ListDocs(r.Context(), kb.Project(projectID), ""); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
 		}
 
 		kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
@@ -547,6 +563,11 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 400)
 				return
 			}
+			var err error
+			if req.Metadata, err = req.Metadata.Clean(); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
 			req.ProjectID = projectID
 			req.CreatedBy = pr.UserRef()
 			// Route through ProjectActor so EpicActor is spawned.
@@ -602,6 +623,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			req := body.CreateTaskRequest
+			if req.Metadata, err = req.Metadata.Clean(); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
 			req.ProjectID = projectID
 			req.CreatedBy = pr.UserRef()
 			if req.OwnerUserID, err = h.svc.ResolveNewTaskOwner(r.Context(), pr, projectID, body.Owner); err != nil {
@@ -678,17 +703,28 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodPatch:
 			var body struct {
-				Name        string `json:"name"`
-				Description string `json:"description"`
-				Priority    string `json:"priority"`
+				Name        string               `json:"name"`
+				Description string               `json:"description"`
+				Priority    string               `json:"priority"`
+				Metadata    domain.MetadataPatch `json:"metadata"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			if _, _, err := body.Metadata.Split(); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}
 			if err := h.repo.UpdateEpic(r.Context(), epicID, body.Name, body.Description, body.Priority); err != nil {
 				jsonErr(w, err, 500)
 				return
+			}
+			if body.Metadata != nil {
+				if _, err := h.repo.MergeMetadata(r.Context(), "epic", epicID, body.Metadata); err != nil {
+					jsonErr(w, err, 500)
+					return
+				}
 			}
 			updated, err := h.repo.GetEpic(r.Context(), epicID)
 			if err != nil {
@@ -736,6 +772,11 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPost:
 			var req domain.CreateStoryRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			var err error
+			if req.Metadata, err = req.Metadata.Clean(); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}
@@ -808,18 +849,29 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodPatch:
 		var body struct {
-			Name               string `json:"name"`
-			Description        string `json:"description"`
-			AcceptanceCriteria string `json:"acceptance_criteria"`
-			Priority           string `json:"priority"`
+			Name               string               `json:"name"`
+			Description        string               `json:"description"`
+			AcceptanceCriteria string               `json:"acceptance_criteria"`
+			Priority           string               `json:"priority"`
+			Metadata           domain.MetadataPatch `json:"metadata"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		if _, _, err := body.Metadata.Split(); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
 		if err := h.repo.UpdateStory(r.Context(), storyID, body.Name, body.Description, body.AcceptanceCriteria, body.Priority); err != nil {
 			jsonErr(w, err, 500)
 			return
+		}
+		if body.Metadata != nil {
+			if _, err := h.repo.MergeMetadata(r.Context(), "story", storyID, body.Metadata); err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
 		}
 		updated, err := h.repo.GetStory(r.Context(), storyID)
 		if err != nil {
@@ -897,6 +949,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		case http.MethodPatch:
 			var req domain.UpdateTaskRequest
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			if _, _, err := req.Metadata.Split(); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}

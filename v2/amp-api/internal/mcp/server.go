@@ -66,6 +66,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description": str("Optional description."),
 			"org_id":      num("Optional. Org to create it in; required only if you belong to several (see amp_whoami)."),
 			"team_id":     num("Optional. Team that will own it; required only if you are on several teams in the org."),
+			"metadata":    obj("Optional. Key/value metadata for integrations and reporting, e.g. {\"jira_board\": \"PLAT\", \"initiative\": \"Q3 growth\", \"capitalizable\": true}. Values: string, number, or boolean. Everything under it inherits it."),
 		}), wrap(ctx, s.open(s.createProject)))
 
 	mcp.AddTool(tool("amp_whoami",
@@ -147,6 +148,60 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"role":       str("For link: owner or member (default member)."),
 		}), wrap(ctx, s.guard(authz.Member, s.manageProjectTeams)))
 
+	mcp.AddTool(tool("amp_find_by_metadata",
+		"Find projects, epics, stories, or tasks by their effective metadata (their own plus what they inherit from "+
+			"their project, epic, and story), across every project you can see. E.g. kind='story', match={\"initiative\": \"Q3 growth\"}, "+
+			"or kind='task', match={\"capitalizable\": true}. Use it to find work to sync to Jira, Odoo, or another tracker.",
+		props{
+			"kind":       str("REQUIRED. project, epic, story, or task."),
+			"match":      obj("REQUIRED. Key/value pairs that must all match, with the same type as stored (\"true\" the string is not true the boolean)."),
+			"project_id": num("Optional. Only this project."),
+			"limit":      num("Optional. Max results (default 50, max 200)."),
+		}), wrap(ctx, s.open(s.findByMetadata)))
+
+	// ---- Daily reports ----
+	mcp.AddTool(tool("amp_day_report",
+		"Build your end-of-day report: use this when your user says 'wrap up today', 'end of day', 'day end report', or "+
+			"asks what they got done. Returns a draft from the day's AMP activity across all their projects — tickets "+
+			"completed, started, created, still in progress, blocked, and others worked on — plus any summary already "+
+			"saved for that day. Nothing is saved: write a short summary with your user, then call amp_save_day_report.",
+		props{
+			"date": str("Optional. The day, YYYY-MM-DD (default: today in tz)."),
+			"tz":   str("Optional. Your IANA time zone, e.g. 'America/New_York' (default UTC). Pass it: it decides where the day starts and ends."),
+		}), wrap(ctx, s.open(s.dayReport)))
+
+	mcp.AddTool(tool("amp_save_day_report",
+		"Save your end-of-day report for a day, with a summary in your user's words (markdown: highlights, blockers, "+
+			"what's next). The ticket lists are re-captured at save time. Saving again for the same day replaces it. "+
+			"People in your orgs can read it (amp_list_day_reports), and the AMP UI has a copy-ready version.",
+		props{
+			"summary": str("REQUIRED. The day's summary in markdown, in your user's voice."),
+			"date":    str("Optional. The day, YYYY-MM-DD (default: today in tz)."),
+			"tz":      str("Optional. Your IANA time zone, e.g. 'America/New_York' (default UTC). Pass it: it decides where the day starts and ends."),
+		}), wrap(ctx, s.open(s.saveDayReport)))
+
+	mcp.AddTool(tool("amp_list_day_reports",
+		"Read saved daily reports — yours or anyone's in your orgs — e.g. for a status update, or to sync the work to "+
+			"Jira, Odoo, or another tracker. Each report has a summary, a copy-ready markdown version, and structured "+
+			"ticket lists (with project, epic, story, and effective metadata such as a jira_key). Tickets in projects "+
+			"you can't see are left out.",
+		props{
+			"user": str("Optional. Whose reports: 'me' (default), an email, or a user id."),
+			"from": str("Optional. First day, YYYY-MM-DD (default: the 7 days ending on 'to')."),
+			"to":   str("Optional. Last day, YYYY-MM-DD (default: today in tz)."),
+			"tz":   str("Optional. IANA time zone for 'today' (default UTC)."),
+		}), wrap(ctx, s.open(s.listDayReports)))
+
+	mcp.AddTool(tool("amp_velocity",
+		"Tickets someone completed per day (by project) over a range: yours or anyone's in your orgs. Every day in "+
+			"the range is listed, zeros included. Only projects you can see are counted.",
+		props{
+			"user": str("Optional. Whose: 'me' (default), an email, or a user id."),
+			"from": str("Optional. First day, YYYY-MM-DD (default: the 7 days ending on 'to')."),
+			"to":   str("Optional. Last day, YYYY-MM-DD (default: today in tz)."),
+			"tz":   str("Optional. IANA time zone that days are counted in (default UTC)."),
+		}), wrap(ctx, s.open(s.velocity)))
+
 	mcp.AddTool(tool("amp_list_projects", "List the active projects you have access to.",
 		props{}), wrap(ctx, s.open(s.listProjects)))
 
@@ -160,7 +215,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Owner, s.restoreProject)))
 
 	mcp.AddTool(tool("amp_update_project_settings",
-		"Change a project's name, description, or settings (project owners only); pass only what changes. "+
+		"Change a project's name, description, metadata, or settings (project owners only); pass only what changes. "+
 			"open_reassign: when true (the default), any project member can reassign or release a ticket that isn't "+
 			"in progress; when false, only its owner, a team lead, or a project owner can.",
 		props{
@@ -168,6 +223,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("Optional. New project name."),
 			"description":   str("Optional. New project description."),
 			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
+			"metadata":      obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	// ---- Epics ----
@@ -177,16 +233,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":        str("REQUIRED. Epic name."),
 			"description": str("Epic description."),
 			"priority":    str("Priority: 0=low, 1=normal (default), 2=high, 3=critical."),
+			"metadata":    obj("Optional. Key/value metadata for integrations and reporting, e.g. {\"jira_board\": \"PLAT\", \"initiative\": \"Q3 growth\", \"capitalizable\": true}. Values: string, number, or boolean. Everything under it inherits it."),
 		}), wrap(ctx, s.guard(authz.Member, s.createEpic)))
 
 	mcp.AddTool(tool("amp_list_epics", "List all epics for a project.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listEpics)))
 
-	mcp.AddTool(tool("amp_get_epic", "Get an epic by ID.",
+	mcp.AddTool(tool("amp_get_epic", "Get an epic by ID, with its effective_metadata (its project's metadata with its own on top).",
 		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.guard(authz.Member, s.getEpic)))
 
-	mcp.AddTool(tool("amp_update_epic", "Update an epic's name, description, priority, or owners. Only its owners or a project owner can change it.",
+	mcp.AddTool(tool("amp_update_epic", "Update an epic's name, description, priority, metadata, or owners. Only its owners or a project owner can change it.",
 		props{
+			"metadata":      obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 			"epic_id":       num("REQUIRED. Epic ID."),
 			"name":          str("New epic name."),
 			"description":   str("New epic description."),
@@ -204,16 +262,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description":         str("Story description."),
 			"acceptance_criteria": str("Conditions that prove this story is done."),
 			"priority":            str("Priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"metadata":            obj("Optional. Key/value metadata for integrations and reporting, e.g. {\"jira_board\": \"PLAT\", \"initiative\": \"Q3 growth\", \"capitalizable\": true}. Values: string, number, or boolean. Everything under it inherits it."),
 		}), wrap(ctx, s.guard(authz.Member, s.createStory)))
 
 	mcp.AddTool(tool("amp_list_stories", "List all stories for an epic.",
 		props{"epic_id": num("REQUIRED. Epic ID.")}), wrap(ctx, s.guard(authz.Member, s.listStories)))
 
-	mcp.AddTool(tool("amp_get_story", "Get a story by ID.",
+	mcp.AddTool(tool("amp_get_story", "Get a story by ID, with its effective_metadata (its project's and epic's metadata with its own on top).",
 		props{"story_id": num("REQUIRED. Story ID.")}), wrap(ctx, s.guard(authz.Member, s.getStory)))
 
-	mcp.AddTool(tool("amp_update_story", "Update a story's name, description, acceptance criteria, priority, or owners. Only its owners or a project owner can change it.",
+	mcp.AddTool(tool("amp_update_story", "Update a story's name, description, acceptance criteria, priority, metadata, or owners. Only its owners or a project owner can change it.",
 		props{
+			"metadata":            obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 			"story_id":            num("REQUIRED. Story ID."),
 			"name":                str("New story name."),
 			"description":         str("New story description."),
@@ -241,6 +301,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"dependency_ids":      arr("Optional. Task IDs that must complete before this task can run. State is derived automatically — do not set it yourself."),
 			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this task. Task will be held as blocked until this time arrives."),
 			"owner":               str("Optional. The AMP user who owns the ticket: omit for yourself, 'none' to leave it unassigned for anyone on the project to pick up, or a project member's email/id."),
+			"metadata":            obj("Optional. Key/value metadata for integrations, e.g. {\"jira_key\": \"PLAT-123\"}. Values: string, number, or boolean. Project, epic, and story metadata is inherited."),
 		}), wrap(ctx, s.guard(authz.Member, s.createTask)))
 
 	mcp.AddTool(tool("amp_list_tasks",
@@ -253,11 +314,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"owner":      str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
 		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
-	mcp.AddTool(tool("amp_get_task", "Get full task details by ID.",
+	mcp.AddTool(tool("amp_get_task", "Get full task details by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top).",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.getTask)))
 
-	mcp.AddTool(tool("amp_update_task", "Update task name, description, assigned_to, or agent_id.",
+	mcp.AddTool(tool("amp_update_task", "Update task name, description, assigned_to, agent_id, or metadata.",
 		props{
+			"metadata":    obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 			"task_id":     num("REQUIRED. Task ID."),
 			"name":        str("New task name."),
 			"description": str("New task description."),
@@ -498,10 +560,15 @@ func (s *Server) Register(mcp *server.MCPServer) {
 // ---- Tool handlers ----
 
 func (s *Server) createProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	meta, err := optNewMetadata(args)
+	if err != nil {
+		return nil, err
+	}
 	req := domain.CreateProjectRequest{
 		Name:        optStr(args, "name", ""),
 		Code:        optStr(args, "code", ""),
 		Description: optStr(args, "description", ""),
+		Metadata:    meta,
 	}
 	if req.Name == "" || req.Code == "" {
 		return nil, fmt.Errorf("name and code are required")
@@ -643,6 +710,9 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	if v, ok := args["description"].(string); ok {
 		u.Description = &v
 	}
+	if u.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
+	}
 	p, err := s.svc.UpdateProject(rctx, caller(rctx).p, id, u)
 	if err != nil {
 		return nil, err
@@ -672,12 +742,17 @@ func (s *Server) createEpic(rctx context.Context, args map[string]interface{}) (
 	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
 		return nil, err
 	}
+	meta, err := optNewMetadata(args)
+	if err != nil {
+		return nil, err
+	}
 	req := domain.CreateEpicRequest{
 		ProjectID:   projectID,
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", "1"),
 		CreatedBy:   caller(rctx).p.UserRef(),
+		Metadata:    meta,
 	}
 	// Route through ProjectActor so EpicActor is spawned and registered.
 	pid, err := s.registry.Get(projectID)
@@ -714,7 +789,11 @@ func (s *Server) getEpic(_ context.Context, args map[string]interface{}) (*mcpgo
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"epic": e})
+	eff, err := s.effectiveMetadata(context.Background(), "epic", e.ID, e.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"epic": e, "effective_metadata": eff})
 }
 
 func (s *Server) createStory(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -744,7 +823,12 @@ func (s *Server) createStory(rctx context.Context, args map[string]interface{}) 
 		return nil, fmt.Errorf("name is required")
 	}
 
+	meta, err := optNewMetadata(args)
+	if err != nil {
+		return nil, err
+	}
 	req := domain.CreateStoryRequest{
+		Metadata:           meta,
 		ProjectID:          projectID,
 		EpicID:             epicID,
 		Name:               name,
@@ -788,7 +872,11 @@ func (s *Server) getStory(_ context.Context, args map[string]interface{}) (*mcpg
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"story": st})
+	eff, err := s.effectiveMetadata(context.Background(), "story", st.ID, st.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"story": st, "effective_metadata": eff})
 }
 
 func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -849,7 +937,12 @@ func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (
 		startAt = &t
 	}
 
+	meta, err := optNewMetadata(args)
+	if err != nil {
+		return nil, err
+	}
 	req := domain.CreateTaskRequest{
+		Metadata:           meta,
 		ProjectID:          projectID,
 		EpicID:             epicID,
 		StoryID:            storyID,
@@ -961,7 +1054,11 @@ func (s *Server) getTask(_ context.Context, args map[string]interface{}) (*mcpgo
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"task": reply.Task})
+	eff, err := s.effectiveMetadata(context.Background(), "task", taskID, reply.Task.Metadata)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"task": reply.Task, "effective_metadata": eff})
 }
 
 func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -986,6 +1083,9 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		Description: optStr(args, "description", ""),
 		AssignedTo:  optStr(args, "assigned_to", ""),
 		AgentID:     optStr(args, "agent_id", ""),
+	}
+	if req.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(task.ProjectID)
@@ -1020,6 +1120,9 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", ""),
+	}
+	if req.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(epic.ProjectID)
@@ -1062,6 +1165,9 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", ""),
+	}
+	if req.Metadata, err = optMetadataPatch(args); err != nil {
+		return nil, err
 	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(story.ProjectID)
@@ -1464,9 +1570,12 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 	}
 
 	// 2. Fetch all KB documents for this project
-	docSummaries, err := s.kb.ListDocs(ctx, kb.Project(projectID), "")
-	if err != nil {
-		return nil, fmt.Errorf("list kb docs: %w", err)
+	// (none when the knowledge base isn't configured)
+	var docSummaries []kb.DocSummary
+	if s.kb != nil {
+		if docSummaries, err = s.kb.ListDocs(ctx, kb.Project(projectID), ""); err != nil {
+			return nil, fmt.Errorf("list kb docs: %w", err)
+		}
 	}
 
 	// 3. Fetch full content for each KB document
@@ -1534,6 +1643,10 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 	// 3. Re-index KB documents into Typesense
 	for _, kbDoc := range bundle.KBDocs {
+		if s.kb == nil {
+			slog.Default().Warn("knowledge base not configured; skipping the bundle's KB docs", "docs", len(bundle.KBDocs))
+			break
+		}
 		_, err := s.kb.WriteDoc(ctx, kb.Project(newProject.ID), kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags, "", kbDoc.Annotations)
 		if err != nil {
 			// Log warning but continue (graceful degradation)
@@ -1546,6 +1659,99 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
 
 	return jsonResult(map[string]interface{}{"project": newProject})
+}
+
+// ---- Metadata ----
+
+// optMetadataPatch reads the "metadata" argument as a change to existing
+// metadata (null removes a key); nil when it's absent.
+func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error) {
+	v, ok := args["metadata"]
+	if !ok || v == nil {
+		return nil, nil
+	}
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("metadata must be an object of key/value pairs")
+	}
+	p := domain.MetadataPatch(m)
+	if _, _, err := p.Split(); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+// optNewMetadata reads the "metadata" argument for a new item.
+func optNewMetadata(args map[string]interface{}) (domain.Metadata, error) {
+	p, err := optMetadataPatch(args)
+	if err != nil || p == nil {
+		return nil, err
+	}
+	return domain.Metadata(p).Clean()
+}
+
+// effectiveMetadata is an item's metadata on top of what it inherits.
+func (s *Server) effectiveMetadata(ctx context.Context, kind string, id int, own domain.Metadata) (domain.Metadata, error) {
+	inherited, err := s.repo.InheritedMetadata(ctx, kind, id)
+	if err != nil {
+		return nil, err
+	}
+	return inherited.Merge(own), nil
+}
+
+func (s *Server) findByMetadata(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	raw, _ := args["match"].(map[string]interface{})
+	found, err := s.svc.FindByMetadata(ctx, caller(ctx).p, optStr(args, "kind", ""), raw, optInt(args, "project_id", 0), optInt(args, "limit", 50))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"results": found, "count": len(found)})
+}
+
+// ---- Daily reports (rules in internal/service/dayreports.go) ----
+
+func (s *Server) dayReport(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	r, err := s.svc.DayReportDraft(ctx, caller(ctx).p, optStr(args, "date", ""), optStr(args, "tz", ""))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{
+		"report": r,
+		"next": "Review this with your user, write a short summary in their voice (highlights, blockers, what's next), " +
+			"then save it with amp_save_day_report (same date and tz). Saving again replaces it.",
+	})
+}
+
+func (s *Server) saveDayReport(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	summary, err := reqStr(args, "summary")
+	if err != nil {
+		return nil, err
+	}
+	r, err := s.svc.SaveDayReport(ctx, caller(ctx).p, optStr(args, "date", ""), optStr(args, "tz", ""), summary)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"report": r})
+}
+
+func (s *Server) listDayReports(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	reports, err := s.svc.DayReports(ctx, caller(ctx).p, optStr(args, "user", ""), optStr(args, "from", ""), optStr(args, "to", ""), optStr(args, "tz", ""))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"reports": reports, "count": len(reports)})
+}
+
+func (s *Server) velocity(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	days, err := s.svc.Velocity(ctx, caller(ctx).p, optStr(args, "user", ""), optStr(args, "from", ""), optStr(args, "to", ""), optStr(args, "tz", ""))
+	if err != nil {
+		return nil, err
+	}
+	total := 0
+	for _, d := range days {
+		total += d.Completed
+	}
+	return jsonResult(map[string]interface{}{"days": days, "total_completed": total})
 }
 
 // ---- KB handlers (scope rules in internal/service/kb.go) ----
@@ -2114,6 +2320,14 @@ func str(desc string) map[string]interface{} {
 
 func num(desc string) map[string]interface{} {
 	return map[string]interface{}{"type": "number", "description": desc}
+}
+
+func obj(desc string) map[string]interface{} {
+	return map[string]interface{}{
+		"type":                 "object",
+		"description":          desc,
+		"additionalProperties": map[string]interface{}{"type": []string{"string", "number", "boolean", "null"}},
+	}
 }
 
 func boolean(desc string) map[string]interface{} {

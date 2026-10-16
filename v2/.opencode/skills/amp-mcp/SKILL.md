@@ -24,8 +24,27 @@ one feature with no obvious entry point — scheduling.
 - **Stories**: `amp_create_story`, `amp_list_stories`, `amp_list_project_stories`, `amp_get_story`, `amp_update_story`
 - **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`, `amp_claim_task`, `amp_assign_task`
 - **People**: `amp_whoami`, `amp_list_project_members`
+- **Daily reports**: `amp_day_report`, `amp_save_day_report`, `amp_list_day_reports`, `amp_velocity` — see the `amp-day-report` skill
+- **Metadata**: `metadata` on the create/update tools for projects, epics, stories, and tasks; `amp_find_by_metadata`
 - **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_create_org`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
 - **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
+
+---
+
+## Metadata — fields for integrations
+
+Projects, epics, stories, and tasks carry free-form key/value `metadata` (values: string,
+number, or boolean), e.g. `jira_board: "PLAT"`, `initiative: "Q3 growth"`,
+`capitalizable: true`, or a ticket's `jira_key: "PLAT-123"`.
+
+- Set it on create (`metadata` object) or change it on update: keys with a value are set,
+  keys set to `null` are removed, others are kept.
+- It's inherited downwards: a ticket's `effective_metadata` (on `amp_get_task`, and in daily
+  reports) is its project's, epic's, and story's fields with its own on top.
+- `amp_find_by_metadata(kind, match)` finds items by effective metadata across the projects you
+  can see. Types matter: `true` the boolean doesn't match `"true"` the string.
+- Keys are free-form, so reuse the names a project already uses (read them first) rather than
+  inventing near-duplicates like `jiraBoard` next to `jira_board`.
 
 ---
 

@@ -1,6 +1,6 @@
 import type {
   Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
-  KBRef, KBInfo, KBSource,
+  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay,
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
@@ -80,7 +80,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; metadata?: Record<string, string | number | boolean | null> }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -195,6 +195,26 @@ export const api = {
   /** index: the annotation's position in doc.annotations (oldest first) */
   kbResolveAnnotation: (ref: KBRef, path: string, index: number, resolved: boolean) =>
     post<KBDoc>(`/kb/resolve?${kbQuery(ref)}`, { path, index, resolved }),
+
+  // Metadata
+  inheritedMetadata: (kind: 'epic' | 'story' | 'task', id: number) =>
+    get<{ inherited: Metadata }>(`/metadata/inherited?kind=${kind}&id=${id}`).then(r => r.inherited ?? {}),
+
+  // Daily reports
+  dayReports: (opts: { user?: string; from?: string; to?: string; tz?: string }) => {
+    const q = new URLSearchParams(Object.entries(opts).filter(([, v]) => v) as [string, string][])
+    return get<{ reports: DayReport[] | null }>(`/day-reports?${q}`).then(r => r.reports ?? [])
+  },
+  dayReportDraft: (date: string, tz: string) =>
+    get<{ report: DayReport }>(`/day-reports/draft?date=${date}&tz=${encodeURIComponent(tz)}`).then(r => r.report),
+  saveDayReport: (date: string, tz: string, summary: string) =>
+    put<{ report: DayReport }>(`/day-reports/${date}?tz=${encodeURIComponent(tz)}`, { summary }).then(r => r.report),
+  reportPeople: () =>
+    get<{ people: Member[] | null }>('/day-reports/people').then(r => r.people ?? []),
+  velocity: (opts: { user?: string; from?: string; to?: string; tz?: string }) => {
+    const q = new URLSearchParams(Object.entries(opts).filter(([, v]) => v) as [string, string][])
+    return get<{ days: VelocityDay[] | null }>(`/velocity?${q}`).then(r => r.days ?? [])
+  },
 
   // Actions
   dispatchTask: (taskId: number, agentId = 'amp-worker') =>

@@ -58,6 +58,10 @@ Covers: search strategy, create vs update rules, writing content that embeds wel
 Use when you need the exact tool names, arguments, or return shapes for AMP MCP calls.
 Covers: full tool list by area, task scheduling (start_at), and key argument types.
 
+**amp-day-report**
+Use when the user wants to wrap up the day ("wrap up today", "end of day report"), wants a status update from someone's daily reports, or wants daily work synced to Jira/Odoo.
+Covers: drafting with amp_day_report, writing the summary with the user, saving, reading others' reports and velocity, mapping report items to other trackers via metadata.
+
 **amp-kb-curator**
 Use for scheduled or requested KB maintenance — pruning stale docs, merging duplicates, compacting annotations. Manager-only dispatch.
 Covers: health assessment via amp_kb_status, staleness threshold, dedup and compaction workflow.

@@ -924,6 +924,34 @@ func TestE2E(t *testing.T) {
 		mate.must(t, 403, "POST", fmt.Sprintf("/api/kb/doc?org_id=%d", orgID), map[string]any{"path": "y.md", "title": "y", "content": "y"})
 		t.Log("team and org knowledge bases: scoped access, reasons, ambiguity refused, project search stays narrow ✓")
 
+		// Metadata and daily reports. The teammate completed "handoff" today.
+		e.mustTool(t, adminTok, "amp_update_project_settings", map[string]any{"project_id": pid, "metadata": map[string]any{"jira_board": "E2E", "capitalizable": true}})
+		got := e.mustTool(t, mateTok, "amp_get_task", map[string]any{"task_id": handoff})
+		if eff, _ := got["effective_metadata"].(map[string]any); eff["jira_board"] != "E2E" {
+			t.Fatalf("ticket's effective metadata = %v", got["effective_metadata"])
+		}
+		e.mustTool(t, mateTok, "amp_update_task", map[string]any{"task_id": handoff, "metadata": map[string]any{"jira_key": "E2E-1"}})
+		if found := e.mustTool(t, mateTok, "amp_find_by_metadata", map[string]any{"kind": "task", "match": map[string]any{"jira_key": "E2E-1", "capitalizable": true}}); num(found, "count") != 1 {
+			t.Fatalf("find by metadata = %v", found)
+		}
+		draft := e.mustTool(t, mateTok, "amp_day_report", map[string]any{"tz": "UTC"})["report"].(map[string]any)
+		completed := draft["data"].(map[string]any)["completed"].([]any)
+		var handedOff map[string]any
+		for _, it := range completed {
+			if m := it.(map[string]any); num(m, "task_id") == handoff {
+				handedOff = m
+			}
+		}
+		if handedOff == nil || handedOff["metadata"].(map[string]any)["jira_key"] != "E2E-1" {
+			t.Fatalf("teammate's day report completed = %v", completed)
+		}
+		e.mustTool(t, mateTok, "amp_save_day_report", map[string]any{"tz": "UTC", "summary": "Shipped the handoff ticket."})
+		reports := admin.must(t, 200, "GET", "/api/day-reports?tz=UTC&user="+url.QueryEscape(email2), nil)["reports"].([]any)
+		if len(reports) != 1 || !strings.Contains(reports[0].(map[string]any)["markdown"].(string), "Shipped the handoff ticket.") {
+			t.Fatalf("admin reading the teammate's reports = %v", reports)
+		}
+		t.Log("metadata inherited and searchable; daily report built, saved, and read by a colleague ✓")
+
 		// Promote the teammate to global admin from the Users page's API. Their
 		// existing MCP token and UI session gain admin powers on the next
 		// request (roles are read per request — no re-login), and lose them

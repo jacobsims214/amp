@@ -158,6 +158,14 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update epic: %w", err)}
 			return
 		}
+		if msg.Req.Metadata != nil {
+			meta, err := a.repo.MergeMetadata(context.Background(), "epic", msg.Req.EpicID, msg.Req.Metadata)
+			if err != nil {
+				msg.ReplyCh <- ReplySimple{Err: err}
+				return
+			}
+			a.epic.Metadata = meta
+		}
 		if msg.Req.Name != "" {
 			a.epic.Name = msg.Req.Name
 		}
