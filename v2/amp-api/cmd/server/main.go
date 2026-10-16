@@ -13,6 +13,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	_ "time/tzdata" // IANA time zones for daily reports, even in minimal images
 
 	protoactor "github.com/asynkron/protoactor-go/actor"
 	"github.com/hibiken/asynq"

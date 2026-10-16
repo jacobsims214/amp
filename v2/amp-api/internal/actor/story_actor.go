@@ -193,6 +193,14 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update story: %w", err)}
 			return
 		}
+		if msg.Req.Metadata != nil {
+			meta, err := a.repo.MergeMetadata(context.Background(), "story", msg.Req.StoryID, msg.Req.Metadata)
+			if err != nil {
+				msg.ReplyCh <- ReplySimple{Err: err}
+				return
+			}
+			a.story.Metadata = meta
+		}
 		if msg.Req.Name != "" {
 			a.story.Name = msg.Req.Name
 		}

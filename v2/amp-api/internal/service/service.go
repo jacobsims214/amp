@@ -342,8 +342,11 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 // UpdateProject changes a project's name, description, or settings; it
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
-	if u.Name == nil && u.Description == nil && u.OpenReassign == nil {
-		return nil, authz.BadRequest("nothing to change: pass name, description, or open_reassign")
+	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.Metadata == nil {
+		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, or metadata")
+	}
+	if _, _, err := u.Metadata.Split(); err != nil {
+		return nil, authz.BadRequest("%s", err.Error())
 	}
 	if u.Name != nil {
 		name := strings.TrimSpace(*u.Name)
@@ -437,4 +440,47 @@ func (s *Service) EventFilter(p authz.Principal) hub.Allow {
 		}
 		return visible[projectID]
 	}
+}
+
+// FindByMetadata finds items of a kind (project, epic, story, task) whose
+// effective metadata matches every key/value given, in one project or in
+// every project p can see.
+func (s *Service) FindByMetadata(ctx context.Context, p authz.Principal, kind string, match map[string]any, projectID, limit int) ([]repository.MetadataMatch, error) {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	if len(match) == 0 {
+		return nil, authz.BadRequest("match is required: an object of key/value pairs")
+	}
+	clean, err := domain.Metadata(match).Clean()
+	if err != nil {
+		return nil, authz.BadRequest("%s", err.Error())
+	}
+	if len(clean) != len(match) {
+		return nil, authz.BadRequest("match values can't be null")
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	var projects []int
+	if projectID > 0 {
+		if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+			return nil, err
+		}
+		projects = []int{projectID}
+	} else {
+		visible, err := s.Authz.VisibleProjects(ctx, p)
+		if err != nil {
+			return nil, err
+		}
+		if visible != nil {
+			projects = make([]int, 0, len(visible))
+			for id := range visible {
+				projects = append(projects, id)
+			}
+		}
+	}
+	found, err := s.Repo.FindByMetadata(ctx, kind, clean, projects, limit)
+	if err != nil && strings.HasPrefix(err.Error(), "kind must be") {
+		return nil, authz.BadRequest("%s", err.Error())
+	}
+	return found, err
 }

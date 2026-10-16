@@ -99,30 +99,30 @@ func (r *Repo) Close() { r.db.Close() }
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, created_at, updated_at`
+const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, metadata, created_at, updated_at`
 
 func scanProject(row rowScanner, p *domain.Project) error {
-	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign, &p.CreatedAt, &p.UpdatedAt)
+	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
 	COALESCE((SELECT array_agg(o.user_id ORDER BY o.user_id) FROM epic_owners o WHERE o.epic_id = e.id), '{}'),
-	e.created_at, e.updated_at`
+	e.metadata, e.created_at, e.updated_at`
 
 func scanEpic(row rowScanner, e *domain.Epic) error {
-	return row.Scan(&e.ID, &e.ProjectID, &e.Name, &e.Description, &e.State, &e.Priority, &e.CreatedBy, &e.OwnerIDs, &e.CreatedAt, &e.UpdatedAt)
+	return row.Scan(&e.ID, &e.ProjectID, &e.Name, &e.Description, &e.State, &e.Priority, &e.CreatedBy, &e.OwnerIDs, &e.Metadata, &e.CreatedAt, &e.UpdatedAt)
 }
 
 const storyCols = `s.id, s.project_id, s.epic_id, s.name, s.description, s.acceptance_criteria, s.state, s.priority, s.created_by,
 	COALESCE((SELECT array_agg(o.user_id ORDER BY o.user_id) FROM story_owners o WHERE o.story_id = s.id), '{}'),
-	s.created_at, s.updated_at`
+	s.metadata, s.created_at, s.updated_at`
 
 func scanStory(row rowScanner, st *domain.Story) error {
-	return row.Scan(&st.ID, &st.ProjectID, &st.EpicID, &st.Name, &st.Description, &st.AcceptanceCriteria, &st.State, &st.Priority, &st.CreatedBy, &st.OwnerIDs, &st.CreatedAt, &st.UpdatedAt)
+	return row.Scan(&st.ID, &st.ProjectID, &st.EpicID, &st.Name, &st.Description, &st.AcceptanceCriteria, &st.State, &st.Priority, &st.CreatedBy, &st.OwnerIDs, &st.Metadata, &st.CreatedAt, &st.UpdatedAt)
 }
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
-	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, created_at, updated_at`
+	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at`
 
 func scanTask(row rowScanner, t *domain.Task) error {
 	return row.Scan(
@@ -130,7 +130,7 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.Name, &t.Description, &t.AcceptanceCriteria,
 		&t.State, &t.Priority,
 		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
-		&t.CreatedBy, &t.OwnerUserID,
+		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
 	)
 }
@@ -160,10 +160,10 @@ func (r *Repo) CreateProject(ctx context.Context, req domain.CreateProjectReques
 	defer tx.Rollback(ctx) //nolint:errcheck
 	p := &domain.Project{}
 	err = scanProject(tx.QueryRow(ctx,
-		`INSERT INTO projects (name, code, description, org_id, created_by)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO projects (name, code, description, org_id, created_by, metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING `+projectCols,
-		req.Name, req.Code, req.Description, req.OrgID, req.CreatedBy,
+		req.Name, req.Code, req.Description, req.OrgID, req.CreatedBy, metaOrEmpty(req.Metadata),
 	), p)
 	if isUniqueViolation(err) {
 		return nil, conflictf("project code %q already exists", req.Code)
@@ -211,15 +211,20 @@ func (r *Repo) SetProjectOpenReassign(ctx context.Context, id int, on bool) (*do
 
 // UpdateProject changes the settings that are set (nil fields are kept).
 func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettings) (*domain.Project, error) {
+	set, remove, err := u.Metadata.Split()
+	if err != nil {
+		return nil, err
+	}
 	p := &domain.Project{}
-	err := scanProject(r.db.QueryRow(ctx,
+	err = scanProject(r.db.QueryRow(ctx,
 		`UPDATE projects SET
 		   name = COALESCE($2, name),
 		   description = COALESCE($3, description),
 		   open_reassign = COALESCE($4, open_reassign),
+		   metadata = (metadata || $5::jsonb) - $6::text[],
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
-		id, u.Name, u.Description, u.OpenReassign,
+		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove),
 	), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
@@ -259,9 +264,9 @@ func (r *Repo) CreateEpic(ctx context.Context, req domain.CreateEpicRequest) (*d
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var id int
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO epics (project_id, name, description, priority, created_by)
-		 VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		req.ProjectID, req.Name, req.Description, req.Priority, req.CreatedBy,
+		`INSERT INTO epics (project_id, name, description, priority, created_by, metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+		req.ProjectID, req.Name, req.Description, req.Priority, req.CreatedBy, metaOrEmpty(req.Metadata),
 	).Scan(&id); err != nil {
 		return nil, err
 	}
@@ -304,9 +309,9 @@ func (r *Repo) CreateStory(ctx context.Context, req domain.CreateStoryRequest) (
 	defer tx.Rollback(ctx) //nolint:errcheck
 	var id int
 	if err := tx.QueryRow(ctx,
-		`INSERT INTO stories (project_id, epic_id, name, description, acceptance_criteria, priority, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-		req.ProjectID, req.EpicID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.CreatedBy,
+		`INSERT INTO stories (project_id, epic_id, name, description, acceptance_criteria, priority, created_by, metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+		req.ProjectID, req.EpicID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.CreatedBy, metaOrEmpty(req.Metadata),
 	).Scan(&id); err != nil {
 		return nil, err
 	}
@@ -343,11 +348,11 @@ func (r *Repo) ListStories(ctx context.Context, epicID int) ([]domain.Story, err
 func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*domain.Task, error) {
 	t := &domain.Task{}
 	err := scanTask(r.db.QueryRow(ctx,
-		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id, metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		 RETURNING `+taskCols,
 		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo, req.StartAt,
-		req.CreatedBy, req.OwnerUserID,
+		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata),
 	), t)
 	if err != nil {
 		return nil, err
@@ -799,10 +804,10 @@ func (r *Repo) ImportBundle(ctx context.Context, bundle domain.ExportBundle, new
 	// 1. Create the new project
 	newProject := &domain.Project{}
 	err = scanProject(tx.QueryRow(ctx,
-		`INSERT INTO projects (name, code, description, org_id, created_by)
-		 VALUES ($1, $2, $3, $4, $5)
+		`INSERT INTO projects (name, code, description, org_id, created_by, metadata)
+		 VALUES ($1, $2, $3, $4, $5, $6)
 		 RETURNING `+projectCols,
-		projectName, projectCode, bundle.Project.Description, home.OrgID, home.CreatedBy,
+		projectName, projectCode, bundle.Project.Description, home.OrgID, home.CreatedBy, importedMeta(bundle.Project.Metadata),
 	), newProject)
 	if isUniqueViolation(err) {
 		return nil, conflictf("project code %q already exists", projectCode)
@@ -821,10 +826,10 @@ func (r *Repo) ImportBundle(ctx context.Context, bundle domain.ExportBundle, new
 	for _, oldEpic := range bundle.Epics {
 		newEpic := &domain.Epic{}
 		err = tx.QueryRow(ctx,
-			`INSERT INTO epics (project_id, name, description, priority, created_by)
-			 VALUES ($1, $2, $3, $4, $5)
+			`INSERT INTO epics (project_id, name, description, priority, created_by, metadata)
+			 VALUES ($1, $2, $3, $4, $5, $6)
 			 RETURNING id, project_id, name, description, state, priority, created_at, updated_at`,
-			newProject.ID, oldEpic.Name, oldEpic.Description, oldEpic.Priority, home.CreatedBy,
+			newProject.ID, oldEpic.Name, oldEpic.Description, oldEpic.Priority, home.CreatedBy, importedMeta(oldEpic.Metadata),
 		).Scan(&newEpic.ID, &newEpic.ProjectID, &newEpic.Name, &newEpic.Description, &newEpic.State, &newEpic.Priority, &newEpic.CreatedAt, &newEpic.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("create epic: %w", err)
@@ -844,10 +849,10 @@ func (r *Repo) ImportBundle(ctx context.Context, bundle domain.ExportBundle, new
 		newEpicID := epicIDMap[oldStory.EpicID]
 		newStory := &domain.Story{}
 		err = tx.QueryRow(ctx,
-			`INSERT INTO stories (project_id, epic_id, name, description, acceptance_criteria, priority, created_by)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`INSERT INTO stories (project_id, epic_id, name, description, acceptance_criteria, priority, created_by, metadata)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 			 RETURNING id, project_id, epic_id, name, description, acceptance_criteria, state, priority, created_at, updated_at`,
-			newProject.ID, newEpicID, oldStory.Name, oldStory.Description, oldStory.AcceptanceCriteria, oldStory.Priority, home.CreatedBy,
+			newProject.ID, newEpicID, oldStory.Name, oldStory.Description, oldStory.AcceptanceCriteria, oldStory.Priority, home.CreatedBy, importedMeta(oldStory.Metadata),
 		).Scan(&newStory.ID, &newStory.ProjectID, &newStory.EpicID, &newStory.Name, &newStory.Description, &newStory.AcceptanceCriteria, &newStory.State, &newStory.Priority, &newStory.CreatedAt, &newStory.UpdatedAt)
 		if err != nil {
 			return nil, fmt.Errorf("create story: %w", err)
@@ -870,11 +875,11 @@ func (r *Repo) ImportBundle(ctx context.Context, bundle domain.ExportBundle, new
 		// All imported tasks start in 'backlog' state (fresh start)
 		newTask := &domain.Task{}
 		err = tx.QueryRow(ctx,
-			`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, created_by)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, created_by, metadata)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			 RETURNING id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 			           assigned_to, agent_id, dispatched_at, completed_at, block_reason, created_at, updated_at`,
-			newProject.ID, newEpicID, newStoryID, oldTask.Name, oldTask.Description, oldTask.AcceptanceCriteria, oldTask.Priority, oldTask.AssignedTo, home.CreatedBy,
+			newProject.ID, newEpicID, newStoryID, oldTask.Name, oldTask.Description, oldTask.AcceptanceCriteria, oldTask.Priority, oldTask.AssignedTo, home.CreatedBy, importedMeta(oldTask.Metadata),
 		).Scan(
 			&newTask.ID, &newTask.ProjectID, &newTask.EpicID, &newTask.StoryID,
 			&newTask.Name, &newTask.Description, &newTask.AcceptanceCriteria,
@@ -961,4 +966,129 @@ func (r *Repo) BuildExportBundle(ctx context.Context, projectID int) (*domain.Ex
 	}
 
 	return bundle, nil
+}
+
+// ---- Metadata ----
+
+// metaOrEmpty stores nil metadata as an empty object.
+func metaOrEmpty(m domain.Metadata) domain.Metadata {
+	if m == nil {
+		return domain.Metadata{}
+	}
+	return m
+}
+
+func removeOrEmpty(keys []string) []string {
+	if keys == nil {
+		return []string{}
+	}
+	return keys
+}
+
+// importedMeta keeps the valid part of metadata from an export bundle; a
+// bundle from an older build has none.
+func importedMeta(m domain.Metadata) domain.Metadata {
+	clean, err := m.Clean()
+	if err != nil {
+		return domain.Metadata{}
+	}
+	return clean
+}
+
+// metadataTables are the tables with a metadata column, by item kind.
+var metadataTables = map[string]string{"project": "projects", "epic": "epics", "story": "stories", "task": "tasks"}
+
+// MergeMetadata applies a patch to an item's metadata (kind: project, epic,
+// story, or task) and returns the result.
+func (r *Repo) MergeMetadata(ctx context.Context, kind string, id int, patch domain.MetadataPatch) (domain.Metadata, error) {
+	table, ok := metadataTables[kind]
+	if !ok {
+		return nil, fmt.Errorf("metadata: unknown item kind %q", kind)
+	}
+	set, remove, err := patch.Split()
+	if err != nil {
+		return nil, err
+	}
+	var out domain.Metadata
+	err = r.db.QueryRow(ctx,
+		`UPDATE `+table+` SET metadata = (metadata || $1::jsonb) - $2::text[], updated_at = NOW()
+		 WHERE id = $3 RETURNING metadata`, set, removeOrEmpty(remove), id).Scan(&out)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("%s %d: %w", kind, id, ErrNotFound)
+	}
+	return out, err
+}
+
+// InheritedMetadata returns what an item inherits: for an epic its
+// project's metadata, for a story the project's and epic's, for a task the
+// project's, epic's, and story's (later wins). A project inherits nothing.
+func (r *Repo) InheritedMetadata(ctx context.Context, kind string, id int) (domain.Metadata, error) {
+	var q string
+	switch kind {
+	case "project":
+		return domain.Metadata{}, nil
+	case "epic":
+		q = `SELECT p.metadata FROM epics e JOIN projects p ON p.id = e.project_id WHERE e.id = $1`
+	case "story":
+		q = `SELECT p.metadata || e.metadata FROM stories s
+		     JOIN epics e ON e.id = s.epic_id JOIN projects p ON p.id = s.project_id WHERE s.id = $1`
+	case "task":
+		q = `SELECT p.metadata || e.metadata || s.metadata FROM tasks t
+		     JOIN stories s ON s.id = t.story_id JOIN epics e ON e.id = t.epic_id
+		     JOIN projects p ON p.id = t.project_id WHERE t.id = $1`
+	default:
+		return nil, fmt.Errorf("metadata: unknown item kind %q", kind)
+	}
+	var out domain.Metadata
+	err := r.db.QueryRow(ctx, q, id).Scan(&out)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("%s %d: %w", kind, id, ErrNotFound)
+	}
+	return out, err
+}
+
+// MetadataMatch is an item found by its effective metadata.
+type MetadataMatch struct {
+	Kind      string          `json:"kind"`
+	ID        int             `json:"id"`
+	ProjectID int             `json:"project_id"`
+	Name      string          `json:"name"`
+	State     string          `json:"state"`
+	Metadata  domain.Metadata `json:"effective_metadata"`
+}
+
+// FindByMetadata returns items of a kind whose effective metadata contains
+// every key/value in match, in the given projects (nil means all), newest
+// first, at most limit.
+func (r *Repo) FindByMetadata(ctx context.Context, kind string, match domain.Metadata, projectIDs []int, limit int) ([]MetadataMatch, error) {
+	var sel string
+	switch kind {
+	case "project":
+		sel = `SELECT 'project', p.id, p.id, p.name, p.state, p.metadata AS eff, p.updated_at FROM projects p`
+	case "epic":
+		sel = `SELECT 'epic', e.id, e.project_id, e.name, e.state, p.metadata || e.metadata AS eff, e.updated_at
+		       FROM epics e JOIN projects p ON p.id = e.project_id`
+	case "story":
+		sel = `SELECT 'story', s.id, s.project_id, s.name, s.state, p.metadata || e.metadata || s.metadata AS eff, s.updated_at
+		       FROM stories s JOIN epics e ON e.id = s.epic_id JOIN projects p ON p.id = s.project_id`
+	case "task":
+		sel = `SELECT 'task', t.id, t.project_id, t.name, t.state, p.metadata || e.metadata || s.metadata || t.metadata AS eff, t.updated_at
+		       FROM tasks t JOIN stories s ON s.id = t.story_id JOIN epics e ON e.id = t.epic_id JOIN projects p ON p.id = t.project_id`
+	default:
+		return nil, fmt.Errorf("kind must be project, epic, story, or task")
+	}
+	q := `SELECT kind, id, project_id, name, state, eff FROM (` + sel + `) x(kind, id, project_id, name, state, eff, updated_at)
+	      WHERE eff @> $1::jsonb AND ($2::int[] IS NULL OR project_id = ANY($2))
+	      ORDER BY updated_at DESC LIMIT $3`
+	var ids any
+	if projectIDs != nil {
+		ids = projectIDs
+	}
+	rows, err := r.db.Query(ctx, q, match, ids, limit)
+	if err != nil {
+		return nil, err
+	}
+	return collect(rows, func(row rowScanner, m *MetadataMatch) error {
+		return row.Scan(&m.Kind, &m.ID, &m.ProjectID, &m.Name, &m.State, &m.Metadata)
+	})
 }

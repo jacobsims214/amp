@@ -52,9 +52,11 @@ type Project struct {
 	CreatedBy *int `json:"created_by"`
 	// OpenReassign lets any project member take or reassign a ticket that
 	// isn't in progress. Otherwise only its owner or a lead can.
-	OpenReassign bool      `json:"open_reassign"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	OpenReassign bool `json:"open_reassign"`
+	// Metadata is free-form key/value data for integrations (see Metadata).
+	Metadata  Metadata  `json:"metadata"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 // ProjectSettings is a change to a project's settings; nil fields are kept.
@@ -62,6 +64,8 @@ type ProjectSettings struct {
 	Name         *string `json:"name"`
 	Description  *string `json:"description"`
 	OpenReassign *bool   `json:"open_reassign"`
+	// Metadata sets keys; null removes one (see MetadataPatch).
+	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
 
 type Epic struct {
@@ -73,8 +77,10 @@ type Epic struct {
 	Priority    string    `json:"priority"`
 	// CreatedBy is the AMP user who created it; nil for rows predating
 	// attribution. OwnerIDs are the users who own this shared grouping.
-	CreatedBy *int      `json:"created_by"`
-	OwnerIDs  []int     `json:"owner_ids"`
+	CreatedBy *int  `json:"created_by"`
+	OwnerIDs  []int `json:"owner_ids"`
+	// Metadata is free-form key/value data for integrations (see Metadata).
+	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
@@ -90,8 +96,10 @@ type Story struct {
 	Priority           string     `json:"priority"`
 	CreatedBy          *int       `json:"created_by"`
 	OwnerIDs           []int      `json:"owner_ids"`
-	CreatedAt          time.Time  `json:"created_at"`
-	UpdatedAt          time.Time  `json:"updated_at"`
+	// Metadata is free-form key/value data for integrations (see Metadata).
+	Metadata  Metadata  `json:"metadata"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Task struct {
@@ -126,9 +134,11 @@ type Task struct {
 	// OwnerUserID is the one AMP user who owns the work; nil = unassigned,
 	// available for anyone on the project (or their agents) to claim.
 	// Distinct from AssignedTo/AgentID, which name the agent profile.
-	OwnerUserID *int      `json:"owner_user_id"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	OwnerUserID *int `json:"owner_user_id"`
+	// Metadata is free-form key/value data for integrations (see Metadata).
+	Metadata  Metadata  `json:"metadata"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Comment struct {
@@ -148,27 +158,30 @@ type CreateProjectRequest struct {
 	Description string `json:"description"`
 	// OrgID and TeamID choose where the project lives and which team owns
 	// it. Both may be omitted when the caller's choice is unambiguous.
-	OrgID     *int `json:"org_id,omitempty"`
-	TeamID    *int `json:"team_id,omitempty"`
-	CreatedBy *int `json:"-"`
+	OrgID     *int     `json:"org_id,omitempty"`
+	TeamID    *int     `json:"team_id,omitempty"`
+	CreatedBy *int     `json:"-"`
+	Metadata  Metadata `json:"metadata,omitempty"`
 }
 
 type CreateEpicRequest struct {
-	ProjectID   int    `json:"project_id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Priority    string `json:"priority"`
-	CreatedBy   *int   `json:"-"` // set server-side from the caller; also made an owner
+	ProjectID   int      `json:"project_id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	Priority    string   `json:"priority"`
+	CreatedBy   *int     `json:"-"` // set server-side from the caller; also made an owner
+	Metadata    Metadata `json:"metadata,omitempty"`
 }
 
 type CreateStoryRequest struct {
-	ProjectID          int    `json:"project_id"`
-	EpicID             int    `json:"epic_id"`
-	Name               string `json:"name"`
-	Description        string `json:"description"`
-	AcceptanceCriteria string `json:"acceptance_criteria"`
-	Priority           string `json:"priority"`
-	CreatedBy          *int   `json:"-"`
+	ProjectID          int      `json:"project_id"`
+	EpicID             int      `json:"epic_id"`
+	Name               string   `json:"name"`
+	Description        string   `json:"description"`
+	AcceptanceCriteria string   `json:"acceptance_criteria"`
+	Priority           string   `json:"priority"`
+	CreatedBy          *int     `json:"-"`
+	Metadata           Metadata `json:"metadata,omitempty"`
 }
 
 type CreateTaskRequest struct {
@@ -188,7 +201,8 @@ type CreateTaskRequest struct {
 	CreatedBy     *int       `json:"-"`
 	// OwnerUserID is resolved server-side: the creator by default, or nil
 	// for an unassigned ticket.
-	OwnerUserID *int `json:"-"`
+	OwnerUserID *int     `json:"-"`
+	Metadata    Metadata `json:"metadata,omitempty"`
 }
 
 type UpdateTaskRequest struct {
@@ -200,6 +214,8 @@ type UpdateTaskRequest struct {
 	AgentID            string     `json:"agent_id,omitempty"`
 	Priority           string     `json:"priority,omitempty"`
 	StartAt            *time.Time `json:"start_at,omitempty"`
+	// Metadata sets keys; null removes one (see MetadataPatch).
+	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
 
 type UpdateEpicRequest struct {
@@ -207,6 +223,8 @@ type UpdateEpicRequest struct {
 	Name        string `json:"name,omitempty"`
 	Description string `json:"description,omitempty"`
 	Priority    string `json:"priority,omitempty"`
+	// Metadata sets keys; null removes one (see MetadataPatch).
+	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
 
 type UpdateStoryRequest struct {
@@ -215,6 +233,8 @@ type UpdateStoryRequest struct {
 	Description        string `json:"description,omitempty"`
 	AcceptanceCriteria string `json:"acceptance_criteria,omitempty"`
 	Priority           string `json:"priority,omitempty"`
+	// Metadata sets keys; null removes one (see MetadataPatch).
+	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
 
 type DispatchTaskRequest struct {

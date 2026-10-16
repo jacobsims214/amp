@@ -287,6 +287,13 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	if err := a.repo.UpdateTask(context.Background(), req); err != nil {
 		return fmt.Errorf("db update: %w", err)
 	}
+	if req.Metadata != nil {
+		meta, err := a.repo.MergeMetadata(context.Background(), "task", a.task.ID, req.Metadata)
+		if err != nil {
+			return err
+		}
+		a.task.Metadata = meta
+	}
 
 	a.publish(domain.EventTaskUpdated, a.withBlockedBy())
 	return nil
