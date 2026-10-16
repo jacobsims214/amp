@@ -82,7 +82,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 			a.task.BlockReason = "scheduled:" + a.task.StartAt.Format(time.RFC3339)
 			a.task.UpdatedAt = time.Now()
 
-			if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBlocked, a.task.BlockReason); err != nil {
+			if err := a.saveState(domain.TaskStateBlocked, a.task.BlockReason); err != nil {
 				a.log.Error("failed to persist scheduled block state", "err", err)
 			}
 		}
@@ -205,7 +205,7 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	a.task.DispatchedAt = &now
 	a.task.UpdatedAt = now
 
-	if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateInProgress, ""); err != nil {
+	if err := a.saveState(domain.TaskStateInProgress, ""); err != nil {
 		return fmt.Errorf("db dispatch: %w", err)
 	}
 	if err := a.repo.SetTaskAgent(context.Background(), a.task.ID, agentID, &now); err != nil {
@@ -233,7 +233,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
 	a.task.CompletedAt = &now
 	a.task.UpdatedAt = now
 
-	if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateCompleted, ""); err != nil {
+	if err := a.saveState(domain.TaskStateCompleted, ""); err != nil {
 		return fmt.Errorf("db complete: %w", err)
 	}
 
@@ -259,7 +259,7 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 	a.task.BlockReason = reason
 	a.task.UpdatedAt = time.Now()
 
-	if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBlocked, reason); err != nil {
+	if err := a.saveState(domain.TaskStateBlocked, reason); err != nil {
 		return fmt.Errorf("db block: %w", err)
 	}
 
@@ -292,12 +292,28 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	return nil
 }
 
+// saveState writes the task's state to the database and keeps the in-memory
+// completion time in step with it (the database stamps completed_at).
+func (a *TaskActor) saveState(state domain.TaskState, blockReason string) error {
+	if err := a.repo.SetTaskState(context.Background(), a.task.ID, state, blockReason); err != nil {
+		return err
+	}
+	switch {
+	case state != domain.TaskStateCompleted:
+		a.task.CompletedAt = nil
+	case a.task.CompletedAt == nil:
+		now := time.Now()
+		a.task.CompletedAt = &now
+	}
+	return nil
+}
+
 func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *int) error {
 	from := string(a.task.State)
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
 
-	if err := a.repo.SetTaskState(context.Background(), a.task.ID, state, reason); err != nil {
+	if err := a.saveState(state, reason); err != nil {
 		return fmt.Errorf("db set state: %w", err)
 	}
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{
@@ -340,7 +356,7 @@ func (a *TaskActor) handleSetTaskStartAt(startAt *time.Time) error {
 		a.task.State = domain.TaskStateBlocked
 		a.task.BlockReason = "scheduled:" + startAt.Format(time.RFC3339)
 
-		if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBlocked, a.task.BlockReason); err != nil {
+		if err := a.saveState(domain.TaskStateBlocked, a.task.BlockReason); err != nil {
 			return fmt.Errorf("db set scheduled block state: %w", err)
 		}
 
@@ -351,7 +367,7 @@ func (a *TaskActor) handleSetTaskStartAt(startAt *time.Time) error {
 			a.task.State = domain.TaskStateBacklog
 			a.task.BlockReason = ""
 
-			if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+			if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
 				return fmt.Errorf("db unblock task: %w", err)
 			}
 
@@ -400,7 +416,7 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		a.task.State = domain.TaskStateBacklog
 		a.task.AgentID = ""
 		a.task.DispatchedAt = nil
-		if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+		if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
 			return nil, fmt.Errorf("db release state: %w", err)
 		}
 		if err := a.repo.SetTaskAgent(context.Background(), a.task.ID, "", nil); err != nil {
@@ -449,7 +465,7 @@ func (a *TaskActor) checkUnblock(ctx actor.Context) {
 	a.task.State = domain.TaskStateBacklog
 	a.task.UpdatedAt = time.Now()
 
-	if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+	if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
 		a.log.Error("failed to persist unblock", "err", err)
 		return
 	}
@@ -547,7 +563,7 @@ func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 	a.task.UpdatedAt = time.Now()
 
 	// Persist state change
-	if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+	if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
 		a.log.Error("failed to persist scheduled unblock state", "err", err)
 		return
 	}
