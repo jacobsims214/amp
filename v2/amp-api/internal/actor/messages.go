@@ -174,6 +174,9 @@ type MsgDeleteStory struct {
 type MsgDeleteTask struct {
 	TaskID  int
 	ReplyCh chan ReplySimple
+	// Detach stops the task's actor for a move rather than a delete: the
+	// task stays in the routing index, which the mover updates itself.
+	Detach bool
 }
 
 // ============================================================
@@ -225,9 +228,64 @@ type MsgRegisterTask struct {
 	EpicID int
 }
 
-// MsgDeregisterTask lets StoryActor inform ProjectActor that a task was deleted.
+// MsgDeregisterTask lets a stopping TaskActor tell ProjectActor to drop it
+// from the routing index. EpicID is the epic it was in: a task that moved
+// to another epic has already been re-registered there, and a late
+// deregistration from its old home must not undo that.
 type MsgDeregisterTask struct {
 	TaskID int
+	EpicID int
+}
+
+// MsgSetTaskDeps replaces a task's dependencies (already validated) and
+// re-derives whether it is waiting on any.
+type MsgSetTaskDeps struct {
+	TaskID        int
+	DependencyIDs []int
+	ReplyCh       chan ReplyGetTask
+}
+
+// MsgReconcileDeps makes a task re-read its dependencies from the database
+// (e.g. after one of them was deleted) and re-derive whether it is waiting.
+type MsgReconcileDeps struct {
+	TaskID  int
+	ReplyCh chan ReplySimple
+}
+
+// MsgMoveTask moves a task to another story (in the same or another epic).
+type MsgMoveTask struct {
+	TaskID     int
+	FromEpicID int
+	ToEpicID   int
+	ToStoryID  int
+	ReplyCh    chan ReplyGetTask
+}
+
+// MsgAdoptTask tells a story (via its epic) to start managing a task that
+// was just moved into it.
+type MsgAdoptTask struct {
+	TaskID  int
+	StoryID int
+	ReplyCh chan ReplyGetTask
+}
+
+// MsgMoveStory moves a story, with its tasks, to another epic.
+type MsgMoveStory struct {
+	StoryID    int
+	FromEpicID int
+	ToEpicID   int
+	ReplyCh    chan ReplySimple
+}
+
+// MsgAdoptStory tells an epic to start managing a story just moved into it.
+type MsgAdoptStory struct {
+	StoryID int
+	ReplyCh chan ReplyAdoptStory
+}
+
+type ReplyAdoptStory struct {
+	TaskIDs []int
+	Err     error
 }
 
 // ============================================================

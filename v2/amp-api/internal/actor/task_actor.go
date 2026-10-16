@@ -29,6 +29,7 @@ import (
 type TaskActor struct {
 	task          domain.Task
 	completedDeps map[int]bool // which of task.DependencyIDs are already done
+	detached      bool         // stopped for a move: don't deregister from routing
 	storyPID      *actor.PID   // parent StoryActor — receives upward notifications
 	projectPID    *actor.PID   // ProjectActor — receives MsgRegisterTask on start
 	projectID     int
@@ -91,7 +92,9 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 
 	case *actor.Stopped:
 		// Deregister from ProjectActor routing index.
-		ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: a.task.ID})
+		if !a.detached {
+			ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: a.task.ID, EpicID: a.task.EpicID})
+		}
 
 	case *MsgGetTask:
 		t := a.withBlockedBy()
@@ -138,6 +141,27 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		comments, err := a.repo.GetComments(context.Background(), a.task.ID)
 		msg.ReplyCh <- ReplyGetComments{Comments: comments, Err: err}
 
+	case *MsgSetTaskDeps:
+		if err := a.repo.ReplaceTaskDependencies(context.Background(), a.task.ID, msg.DependencyIDs); err != nil {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("db set dependencies: %w", err)}
+			return
+		}
+		a.task.DependencyIDs = append([]int(nil), msg.DependencyIDs...)
+		if err := a.reconcileDeps("dependencies changed"); err != nil {
+			msg.ReplyCh <- ReplyGetTask{Err: err}
+			return
+		}
+		t := a.withBlockedBy()
+		msg.ReplyCh <- ReplyGetTask{Task: &t}
+
+	case *MsgReconcileDeps:
+		deps, err := a.repo.TaskDependencies(context.Background(), a.task.ID)
+		if err == nil {
+			a.task.DependencyIDs = deps
+			err = a.reconcileDeps("a dependency was removed")
+		}
+		msg.ReplyCh <- ReplySimple{Err: err}
+
 	case *MsgDepCompleted:
 		// A dependency finished — check if we are now unblocked.
 		a.completedDeps[msg.CompletedTaskID] = true
@@ -153,7 +177,8 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 			a.scheduleTimer.Stop()
 			a.scheduleTimer = nil
 		}
-		// Parent is handling DB deletion; we just stop.
+		// Parent is handling DB deletion (or a move); we just stop.
+		a.detached = msg.Detach
 		ctx.Stop(ctx.Self())
 		msg.ReplyCh <- ReplySimple{}
 	}
@@ -281,6 +306,12 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	}
 	if req.AgentID != "" {
 		a.task.AgentID = req.AgentID
+	}
+	if req.AcceptanceCriteria != "" {
+		a.task.AcceptanceCriteria = req.AcceptanceCriteria
+	}
+	if req.Priority != "" {
+		a.task.Priority = req.Priority
 	}
 	a.task.UpdatedAt = time.Now()
 
@@ -459,8 +490,10 @@ func ownerString(id *int) string {
 
 // checkUnblock is called after every MsgDepCompleted.
 // O(degree) — only checks this task's own dep list.
+// Only a task blocked by its dependencies (no block reason) unblocks this
+// way; one blocked by hand or by its schedule stays blocked.
 func (a *TaskActor) checkUnblock(ctx actor.Context) {
-	if a.task.State != domain.TaskStateBlocked {
+	if a.task.State != domain.TaskStateBlocked || a.task.BlockReason != "" {
 		return
 	}
 	for _, depID := range a.task.DependencyIDs {
@@ -481,6 +514,47 @@ func (a *TaskActor) checkUnblock(ctx actor.Context) {
 	a.logActivity("system", "unblocked", "blocked", "backlog",
 		"All dependencies completed — task moved to backlog")
 	a.log.Info("auto-unblocked")
+}
+
+// reconcileDeps re-reads which of the task's dependencies are complete and
+// moves it between backlog and blocked to match: a ready task that now
+// waits on something becomes blocked, and a task blocked only by its
+// dependencies becomes ready once none are left. Tasks in progress,
+// completed, or blocked for another reason keep their state.
+func (a *TaskActor) reconcileDeps(why string) error {
+	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	if err != nil {
+		return fmt.Errorf("read dependency states: %w", err)
+	}
+	a.completedDeps = done
+	waiting := false
+	for _, d := range a.task.DependencyIDs {
+		if !done[d] {
+			waiting = true
+			break
+		}
+	}
+	a.task.UpdatedAt = time.Now()
+	switch {
+	case waiting && a.task.State == domain.TaskStateBacklog:
+		a.task.State = domain.TaskStateBlocked
+		a.task.BlockReason = ""
+		if err := a.saveState(domain.TaskStateBlocked, ""); err != nil {
+			return fmt.Errorf("db block: %w", err)
+		}
+		a.publish(domain.EventTaskBlocked, a.withBlockedBy())
+		a.logActivity("system", "blocked", "backlog", "blocked", "Waiting on its dependencies ("+why+")")
+	case !waiting && a.task.State == domain.TaskStateBlocked && a.task.BlockReason == "":
+		a.task.State = domain.TaskStateBacklog
+		if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
+			return fmt.Errorf("db unblock: %w", err)
+		}
+		a.publish(domain.EventTaskUnblocked, a.withBlockedBy())
+		a.logActivity("system", "unblocked", "blocked", "backlog", "No dependencies left to wait on ("+why+")")
+	default:
+		a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+	}
+	return nil
 }
 
 // ---- Helpers ----

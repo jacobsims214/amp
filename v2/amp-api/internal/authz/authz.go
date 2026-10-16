@@ -286,6 +286,9 @@ const (
 	TaskAssign                     // give the ticket to someone
 	TaskUnassign                   // release the ticket back to the pool
 	TaskDelete
+	// TaskPlan: change how a ticket fits the plan — its dependencies, or which
+	// story it belongs to.
+	TaskPlan
 )
 
 func ownedBy(t *domain.Task, me int) bool {
@@ -324,6 +327,13 @@ func CheckTask(lvl Level, t *domain.Task, me int, action TaskAction) error {
 		}
 	case TaskUnassign:
 		if mine || unassigned || lvl >= Lead {
+			return nil
+		}
+	case TaskPlan:
+		// Whoever planned it (its creator), its owner, anyone for an
+		// unassigned one, and leads and up for any.
+		createdByMe := t.CreatedBy != nil && me != 0 && *t.CreatedBy == me
+		if mine || unassigned || createdByMe || lvl >= Lead {
 			return nil
 		}
 	case TaskDelete:

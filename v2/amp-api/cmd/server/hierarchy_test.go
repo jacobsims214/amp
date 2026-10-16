@@ -34,21 +34,30 @@ func TestHierarchy_TaskRequiresStory(t *testing.T) {
 	t.Logf("orphan task (no story_id) rejected: %s ✓", errMsg)
 }
 
-// TestHierarchy_TaskRequiresEpic verifies that creating a task without an
-// epic_id is also rejected.
-func TestHierarchy_TaskRequiresEpic(t *testing.T) {
+// TestHierarchy_TaskEpicComesFromItsStory: epic_id is optional on a task —
+// it's the story's — and a wrong one is refused.
+func TestHierarchy_TaskEpicComesFromItsStory(t *testing.T) {
 	s := setupMCP(t)
 
-	errMsg := s.callExpectError(t, "amp_create_task", map[string]interface{}{
+	res := s.call(t, "amp_create_task", map[string]interface{}{
 		"project_id":  float64(s.projectID),
 		"story_id":    float64(s.storyID),
-		"name":        "orphan task",
-		"description": "no epic",
+		"name":        "no epic given",
+		"description": "d",
 	})
-	if !strings.Contains(errMsg, "epic_id") {
-		t.Errorf("expected error mentioning epic_id, got: %s", errMsg)
+	if int(res["epic_id"].(float64)) != s.epicID {
+		t.Fatalf("task's epic = %v, want the story's (%d)", res["epic_id"], s.epicID)
 	}
-	t.Logf("orphan task (no epic_id) rejected: %s ✓", errMsg)
+	other := s.call(t, "amp_create_epic", map[string]interface{}{"project_id": float64(s.projectID), "name": "other epic"})
+	errMsg := s.callExpectError(t, "amp_create_task", map[string]interface{}{
+		"project_id": float64(s.projectID),
+		"epic_id":    other["id"],
+		"story_id":   float64(s.storyID),
+		"name":       "wrong epic",
+	})
+	if !strings.Contains(errMsg, "belongs to epic") {
+		t.Errorf("expected a wrong-epic error, got: %s", errMsg)
+	}
 }
 
 // TestHierarchy_StoryRequiresEpic verifies that creating a story without an

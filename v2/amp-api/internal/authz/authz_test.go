@@ -117,6 +117,14 @@ func TestCheckTask(t *testing.T) {
 		{Member, theirs, TaskUnassign, false},
 		{Lead, theirs, TaskUnassign, true},
 
+		// Plan (dependencies, moving between stories): owner, creator, anyone
+		// for an unassigned ticket, or lead and up.
+		{Member, mine, TaskPlan, true},
+		{Member, theirsICreated, TaskPlan, true},
+		{Member, unassigned, TaskPlan, true},
+		{Member, theirs, TaskPlan, false},
+		{Lead, theirs, TaskPlan, true},
+
 		// Delete: owner, creator, or lead and up.
 		{Member, mine, TaskDelete, true},
 		{Member, theirsICreated, TaskDelete, true},
