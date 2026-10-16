@@ -16,6 +16,13 @@ export interface BoardData {
   applyStory: (story: Story) => void
 }
 
+// The server leaves out empty optional ticket fields (no blockers, no block
+// reason, no schedule), so a ticket update must clear them rather than keep old values
+// when merged.
+function fullTask(task: Task): Task {
+  return { ...task, blocked_by_ids: task.blocked_by_ids ?? [], block_reason: task.block_reason ?? '', start_at: task.start_at }
+}
+
 function mergeById<T extends { id: number }>(item: T) {
   return (prev: T[]) => prev.map(x => x.id === item.id ? { ...x, ...item } : x)
 }
@@ -92,13 +99,13 @@ export function useBoardData(projectId: number): BoardData {
         // When a scheduled task is unblocked, it transitions from blocked to backlog state.
         // task.assigned carries the full task with its new owner_user_id.
         const task = event.payload as Task
-        setTasks(mergeById(task))
+        setTasks(mergeById(fullTask(task)))
         break
       }
     }
   }, []))
 
-  const applyTask = useCallback((task: Task) => setTasks(mergeById(task)), [])
+  const applyTask = useCallback((task: Task) => setTasks(mergeById(fullTask(task))), [])
   const applyEpic = useCallback((epic: Epic) => setEpics(mergeById(epic)), [])
   const applyStory = useCallback((story: Story) => setStories(mergeById(story)), [])
 

@@ -1,6 +1,6 @@
 import type {
   Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
-  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay,
+  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay, PlanReport,
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
@@ -141,8 +141,17 @@ export const api = {
   getTask: (id: number) => get<{ task: Task }>(`/tasks/${id}`).then(r => r.task),
 
   // Task CRUD
+  /** the created task, with warnings about likely planning mistakes (e.g. no dependencies) */
   createTask: (projectId: number, req: CreateTaskRequest) =>
-    post<Task>(`/projects/${projectId}/tasks`, req),
+    post<Task & { warnings?: string[] }>(`/projects/${projectId}/tasks`, req),
+  /** dependency_ids is the complete new list */
+  setTaskDependencies: (id: number, dependencyIds: number[]) =>
+    put<{ task: Task; warnings?: string[] | null }>(`/tasks/${id}/dependencies`, { dependency_ids: dependencyIds }),
+  moveTask: (id: number, storyId: number) =>
+    post<{ task: Task }>(`/tasks/${id}/move`, { story_id: storyId }).then(r => r.task),
+  moveStory: (id: number, epicId: number) =>
+    post<{ story: Story }>(`/stories/${id}/move`, { epic_id: epicId }).then(r => r.story),
+  planCheck: (projectId: number) => get<PlanReport>(`/projects/${projectId}/plan-check`),
   updateTask: (id: number, req: UpdateTaskRequest) =>
     patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),
   deleteTask: (id: number) =>

@@ -4,8 +4,9 @@ import { api } from '../api/client'
 import { StatusBadge } from './StatusBadge'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
-import { canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata } from '../types'
+import { canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story } from '../types'
+import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 
@@ -116,6 +117,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
 
   if (!task) return null
   const canWork = canWorkTask(task, meId, myAccess)
+  // Editing the plan (text, dependencies, story) is wider than working it.
+  const canPlan = canPlanTask(task, meId, myAccess)
 
   return (
     <>
@@ -151,7 +154,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             <h2 className="text-base font-semibold text-[#DDE6F0] leading-snug">{task.name}</h2>
           </div>
           <div className="flex items-center gap-0.5 flex-shrink-0">
-            {canWork && <button
+            {canPlan && <button
               onClick={() => {
                 setEditForm({
                   name: task.name,
@@ -262,7 +265,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-6">
-          {editing && canWork ? (
+          {editing && canPlan ? (
             <div className="space-y-4">
               <div>
                 <label className="text-xs font-medium text-[#7E91A8] block mb-1.5">Name</label>
@@ -309,7 +312,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               <Loader2 size={20} className="text-[#7E91A8] animate-spin" />
             </div>
           ) : tab === 'details' ? (
-            <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} canWork={canWork} />
+            <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
+              onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())} />
           ) : (
             <HistoryTab history={history} comments={comments} />
           )}
@@ -455,6 +459,85 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
   )
 }
 
+// Where a ticket sits in the plan: its story (movable) and the tickets it
+// waits on (editable). Changes apply immediately; the server validates them
+// (no cycles, same project) and moves the ticket between ready and blocked.
+function TaskPlacement({ task, canEdit, onUpdated }: {
+  task: Task; canEdit: boolean; onUpdated: (t: Task) => void
+}) {
+  const [tasks, setTasks] = useState<Task[]>([])
+  const [epics, setEpics] = useState<Epic[]>([])
+  const [stories, setStories] = useState<Story[]>([])
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [warnings, setWarnings] = useState<string[]>([])
+
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([api.listTasks(task.project_id), api.listEpics(task.project_id)])
+      .then(async ([ts, es]) => {
+        const ss = (await Promise.all(es.map(e => api.listStories(e.id)))).flat()
+        if (!cancelled) { setTasks(ts); setEpics(es); setStories(ss) }
+      })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [task.project_id])
+
+  const run = async (fn: () => Promise<{ task: Task; warnings?: string[] | null }>) => {
+    setBusy(true); setError(null); setWarnings([])
+    try {
+      const r = await fn()
+      setWarnings(r.warnings ?? [])
+      // The board takes the updated ticket as-is (a full refresh would
+      // reload the board and close this drawer's tab).
+      onUpdated(r.task)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Update failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const story = stories.find(s => s.id === task.story_id)
+  const waitingOn = new Set(task.blocked_by_ids ?? [])
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest mb-2">Story</div>
+        {canEdit && stories.length > 0 ? (
+          <select value={task.story_id} disabled={busy}
+            onChange={e => {
+              const id = Number(e.target.value)
+              run(async () => ({ task: await api.moveTask(task.id, id) }))
+            }}
+            className="w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] cursor-pointer disabled:opacity-50">
+            {epics.map(e => (
+              <optgroup key={e.id} label={e.name}>
+                {stories.filter(s => s.epic_id === e.id).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+              </optgroup>
+            ))}
+          </select>
+        ) : (
+          <div className="text-sm text-[#DDE6F0]">
+            {epics.find(e => e.id === task.epic_id)?.name ?? 'Epic'} › {story?.name ?? `Story #${task.story_id}`}
+          </div>
+        )}
+      </div>
+      <div>
+        <div className="flex items-center gap-2 mb-2">
+          <div className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest">Depends on</div>
+          {busy && <Loader2 size={11} className="text-[#7E91A8] animate-spin" />}
+          {waitingOn.size > 0 && <span className="text-[11px] text-[#F87171]">waiting on {waitingOn.size}</span>}
+        </div>
+        <DependencyPicker tasks={tasks} selfId={task.id} value={task.dependency_ids ?? []} disabled={!canEdit || busy}
+          onChange={ids => run(() => api.setTaskDependencies(task.id, ids))} />
+        {error && <p className="text-xs text-[#F87171] mt-1.5">{error}</p>}
+        {warnings.map((w, i) => <p key={i} className="text-xs text-[#FBBF24] mt-1.5">{w}</p>)}
+      </div>
+    </div>
+  )
+}
+
 // A ticket's metadata (e.g. its jira_key), with what it inherits from its
 // project, epic, and story.
 function TaskMetadata({ task, canEdit, onSaved }: { task: Task; canEdit: boolean; onSaved?: () => void }) {
@@ -502,7 +585,9 @@ function TaskMetadata({ task, canEdit, onSaved }: { task: Task; canEdit: boolean
   )
 }
 
-function DetailsTab({ task, onClose, onRefresh, canWork }: { task: Task; onClose: () => void; onRefresh?: () => void; canWork: boolean }) {
+function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
+  task: Task; onClose: () => void; onRefresh?: () => void; canWork: boolean; canPlan: boolean; onUpdated: (t: Task) => void
+}) {
   const [editingSchedule, setEditingSchedule] = useState(false)
   const [scheduleValue, setScheduleValue] = useState('')
   const [savingSchedule, setSavingSchedule] = useState(false)
@@ -552,7 +637,9 @@ function DetailsTab({ task, onClose, onRefresh, canWork }: { task: Task; onClose
         )}
       </div>
 
-      <TaskMetadata key={task.id} task={task} canEdit={canWork} onSaved={onRefresh} />
+      <TaskPlacement key={`p-${task.id}`} task={task} canEdit={canPlan} onUpdated={onUpdated} />
+
+      <TaskMetadata key={task.id} task={task} canEdit={canPlan} onSaved={onRefresh} />
 
       {/* Scheduled Start */}
       <div>
