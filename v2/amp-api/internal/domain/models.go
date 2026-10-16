@@ -386,3 +386,16 @@ type Invite struct {
 	CreatedAt  time.Time  `json:"created_at"`
 	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
 }
+
+// HasRole reports whether the user holds a global role.
+func (u *User) HasRole(role string) bool {
+	if u == nil {
+		return false
+	}
+	for _, r := range u.Roles {
+		if r == role {
+			return true
+		}
+	}
+	return false
+}

@@ -243,17 +243,54 @@ func (r *Repo) SetUserRole(ctx context.Context, userID int, role string, grant b
 	if role != domain.RoleAdmin && role != domain.RoleMember {
 		return fmt.Errorf("invalid role %q", role)
 	}
-	var err error
 	if grant {
-		_, err = r.db.Exec(ctx, `INSERT INTO user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, role)
-	} else {
-		_, err = r.db.Exec(ctx, `DELETE FROM user_roles WHERE user_id = $1 AND role = $2`, userID, role)
+		_, err := r.db.Exec(ctx, `INSERT INTO user_roles (user_id, role) VALUES ($1, $2) ON CONFLICT DO NOTHING`, userID, role)
+		return err
 	}
-	return err
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if role == domain.RoleAdmin {
+		// Never leave AMP without a global admin: lock the admin rows so two
+		// concurrent revokes can't both pass the check.
+		rows, err := tx.Query(ctx, `SELECT user_id FROM user_roles WHERE role = 'admin' FOR UPDATE`)
+		if err != nil {
+			return err
+		}
+		var admins []int
+		for rows.Next() {
+			var id int
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			admins = append(admins, id)
+		}
+		rows.Close()
+		if len(admins) == 1 && admins[0] == userID {
+			return conflictf("AMP needs at least one global admin; make someone else a global admin first")
+		}
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM user_roles WHERE user_id = $1 AND role = $2`, userID, role); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // DeleteUser removes a JIT-provisioned user row (does not touch Dex credentials).
+// Deleting the only global admin is refused, like revoking their role.
 func (r *Repo) DeleteUser(ctx context.Context, userID int) error {
+	var lastAdmin bool
+	if err := r.db.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1 AND role = 'admin')
+		   AND (SELECT COUNT(*) FROM user_roles WHERE role = 'admin') = 1`, userID).Scan(&lastAdmin); err != nil {
+		return err
+	}
+	if lastAdmin {
+		return conflictf("this is the only global admin; make someone else a global admin first")
+	}
 	_, err := r.db.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
 	return err
 }

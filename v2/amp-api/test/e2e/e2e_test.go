@@ -808,6 +808,53 @@ func TestE2E(t *testing.T) {
 		}
 		t.Log("platform administration over MCP ✓")
 
+		// Promote the teammate to global admin from the Users page's API. Their
+		// existing MCP token and UI session gain admin powers on the next
+		// request (roles are read per request — no re-login), and lose them
+		// again on demotion.
+		var mateID int
+		for _, u := range admin.must(t, 200, "GET", "/api/users", nil)["users"].([]any) {
+			if um := u.(map[string]any); um["email"] == email2 {
+				mateID = num(um, "id")
+			}
+		}
+		if mateID == 0 {
+			t.Fatal("teammate not in /api/users")
+		}
+		mate.must(t, 403, "GET", "/api/users", nil)
+		admin.must(t, 200, "PATCH", fmt.Sprintf("/api/users/%d/role", mateID), map[string]any{"role": "admin", "grant": true})
+		org2 := e.mustTool(t, mateTok, "amp_create_org", map[string]any{"name": "Made by promoted " + sfx, "slug": "promoted-" + sfx})
+		if org2["org"] == nil {
+			t.Fatalf("promoted teammate couldn't create an org: %v", org2)
+		}
+		allOrgs := e.mustTool(t, mateTok, "amp_list_orgs", nil)["orgs"].([]any)
+		if len(allOrgs) < 3 { // Default, E2E, and the one just made — global admins see every org
+			t.Fatalf("promoted teammate sees %d orgs, want all", len(allOrgs))
+		}
+		mate.must(t, 200, "GET", "/api/users", nil)
+		mate.must(t, 200, "GET", "/authadmin/users", nil)
+		t.Log("promotion to global admin takes effect immediately (MCP + UI) ✓")
+
+		admin.must(t, 200, "PATCH", fmt.Sprintf("/api/users/%d/role", mateID), map[string]any{"role": "admin", "grant": false})
+		if _, err := e.tool(t, mateTok, "amp_create_org", map[string]any{"name": "after demotion"}); err == nil || !strings.Contains(err.Error(), "only global admins") {
+			t.Fatalf("demoted teammate still has admin tools: %v", err)
+		}
+		mate.must(t, 403, "GET", "/api/users", nil)
+		t.Log("demotion takes effect immediately ✓")
+
+		// The last global admin can't remove themselves.
+		var adminID int
+		for _, u := range admin.must(t, 200, "GET", "/api/users", nil)["users"].([]any) {
+			if um := u.(map[string]any); um["email"] == e.user {
+				adminID = num(um, "id")
+			}
+		}
+		if code, out := admin.do(t, "PATCH", fmt.Sprintf("/api/users/%d/role", adminID), map[string]any{"role": "admin", "grant": false}); code == 200 {
+			t.Fatalf("the only global admin revoked their own role: %v", out)
+		} else {
+			t.Logf("revoking the last global admin refused (%d: %v) ✓", code, out["error"])
+		}
+
 	default:
 		t.Fatalf("unknown AMP_E2E_PHASE %q", e.phase)
 	}

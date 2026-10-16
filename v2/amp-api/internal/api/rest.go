@@ -194,7 +194,7 @@ func (h *RestHandler) userSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if err := h.repo.SetUserRole(r.Context(), userID, body.Role, body.Grant); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			jsonOK(w, map[string]interface{}{"user_id": userID, "role": body.Role, "grant": body.Grant})
@@ -205,7 +205,7 @@ func (h *RestHandler) userSub(w http.ResponseWriter, r *http.Request) {
 	if len(parts) == 1 && r.Method == http.MethodDelete {
 		auth.RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
 			if err := h.repo.DeleteUser(r.Context(), userID); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			jsonOK(w, map[string]interface{}{"deleted": userID})

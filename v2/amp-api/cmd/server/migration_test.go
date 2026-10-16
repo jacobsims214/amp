@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -194,5 +195,48 @@ func TestMigration_ConcurrentBoots(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatalf("concurrent migrate: %v", err)
 		}
+	}
+}
+
+// AMP must never end up without a global admin: revoking the role from, or
+// deleting, the only one is refused.
+func TestGlobalAdmin_LastAdminIsProtected(t *testing.T) {
+	ctx := context.Background()
+	repo, err := repository.New(ctx, freshDatabase(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
+		t.Fatal(err)
+	}
+	first, err := repo.UpsertUserFromClaims(ctx, "s-first", "first@x.test", "First", nil) // first user: auto global admin
+	if err != nil || !first.HasRole("admin") {
+		t.Fatalf("first user %+v %v", first, err)
+	}
+	second, err := repo.UpsertUserFromClaims(ctx, "s-second", "second@x.test", "Second", nil)
+	if err != nil || second.HasRole("admin") {
+		t.Fatalf("second user %+v %v", second, err)
+	}
+
+	if err := repo.SetUserRole(ctx, first.ID, "admin", false); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("revoking the only admin: %v, want conflict", err)
+	}
+	if err := repo.DeleteUser(ctx, first.ID); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("deleting the only admin: %v, want conflict", err)
+	}
+	// With a second admin, the first can step down.
+	if err := repo.SetUserRole(ctx, second.ID, "admin", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.SetUserRole(ctx, first.ID, "admin", false); err != nil {
+		t.Fatalf("revoking one of two admins: %v", err)
+	}
+	if err := repo.SetUserRole(ctx, second.ID, "admin", false); !errors.Is(err, repository.ErrConflict) {
+		t.Fatalf("revoking the remaining admin: %v, want conflict", err)
+	}
+	// Non-admin roles are unaffected by the guard.
+	if err := repo.SetUserRole(ctx, first.ID, "member", false); err != nil {
+		t.Fatal(err)
 	}
 }

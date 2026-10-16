@@ -269,6 +269,25 @@ func (s *server) userSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"email": email, "password_reset": true})
 
 	case http.MethodDelete:
+		// Refuse before touching Dex if this is the only global admin:
+		// deleting their login would lock everyone out of administration.
+		if u, err := s.repo.GetUserByEmail(r.Context(), email); err == nil && u.HasRole(domain.RoleAdmin) {
+			users, err := s.repo.ListUsers(r.Context())
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			admins := 0
+			for _, other := range users {
+				if other.HasRole(domain.RoleAdmin) {
+					admins++
+				}
+			}
+			if admins == 1 {
+				jsonErr(w, fmt.Errorf("this is the only global admin; make someone else a global admin first"), 409)
+				return
+			}
+		}
 		resp, err := s.dex.DeletePassword(r.Context(), &dexapi.DeletePasswordReq{Email: email})
 		if err != nil {
 			jsonErr(w, err, 502)
