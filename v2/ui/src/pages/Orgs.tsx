@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
 import {
-  ArrowLeft, Loader2, Building2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check,
+  ArrowLeft, Loader2, Building2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen,
 } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
@@ -261,6 +261,10 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
               <h2 className="text-base font-bold text-[#DDE6F0] truncate">{org.name}</h2>
               <p className="text-xs text-[#3D5068] font-mono">{org.slug}</p>
             </div>
+            <Link to={`/orgs/${org.id}/kb`} title="The org's knowledge base: brand, process, standards"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#818CF8] hover:bg-[#172540] transition-colors">
+              <BookOpen size={12} />Org KB
+            </Link>
             {canManage && (
               <button onClick={() => setRenaming(true)} className="p-1.5 text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] rounded-lg cursor-pointer" title="Rename org">
                 <Pencil size={13} />
@@ -297,7 +301,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {confirmDelete && (
         <ConfirmDeleteModal
           title={`Delete "${org.name}"`}
-          description="This permanently deletes the organization, its teams and memberships."
+          description="This permanently deletes the organization, its teams, memberships, and their knowledge bases."
           onClose={() => setConfirmDelete(false)}
           onConfirm={remove}
           deleting={busy}
@@ -542,6 +546,12 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
           <Users size={13} className="text-[#3D5068] flex-shrink-0" />
           {!renaming && <span className="text-sm text-[#DDE6F0] truncate">{team.name}</span>}
         </button>
+        {!renaming && (
+          <Link to={`/teams/${team.id}/kb`} title="The team's knowledge base (team members only)"
+            className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-[#7E91A8] hover:text-[#818CF8] hover:bg-[#172540] transition-colors">
+            <BookOpen size={12} />KB
+          </Link>
+        )}
         {renaming ? (
           <div className="flex items-center gap-1.5">
             <input autoFocus value={name} onChange={e => setName(e.target.value)} className={`${fieldCls} py-1`} />
@@ -560,7 +570,7 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
       {confirmDelete && (
         <ConfirmDeleteModal
           title={`Delete team "${team.name}"`}
-          description="Projects owned only by this team will lose their owning team."
+          description="This also deletes the team's knowledge base. A team that is a project's only owner team can't be deleted."
           onClose={() => setConfirmDelete(false)}
           onConfirm={remove}
           deleting={busy}

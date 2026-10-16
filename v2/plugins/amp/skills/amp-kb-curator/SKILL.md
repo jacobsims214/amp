@@ -5,7 +5,13 @@ description: KB maintenance workflow — pruning stale docs, merging duplicates,
 
 # AMP KB Curator Skill
 
-The curator maintains KB health. Run these operations in order.
+The curator maintains KB health. Run these operations in order, on one KB at a time: the
+project KB by default, or a team or org KB when your user asks (pass `scope`, plus `team_id`
+or `org_id` if needed, to every call; you need write access there — org KBs are org owners and
+admins only).
+
+Never move docs between KBs on your own. If project docs look true beyond the project, list
+them in your summary with why, and let your user decide whether they go to the team or org KB.
 
 ## Operation 1: Report
 
@@ -39,4 +45,5 @@ For docs with overlapping content:
 
 ## Completion
 
-Always post a summary of what was done (docs pruned, annotations compacted, duplicates merged).
+Always post a summary of what was done (docs pruned, annotations compacted, duplicates merged),
+plus any docs you think belong in a team or org KB, and why.

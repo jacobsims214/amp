@@ -1,5 +1,6 @@
 import type {
   Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
+  KBRef, KBInfo, KBSource,
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
@@ -7,9 +8,18 @@ import type {
 
 const BASE = '/api'
 
+function kbQuery(ref: KBRef): string {
+  if (ref.team_id != null) return `team_id=${ref.team_id}`
+  if (ref.org_id != null) return `org_id=${ref.org_id}`
+  return `project_id=${ref.project_id}`
+}
+
 async function get<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`)
-  if (!res.ok) throw new Error(`GET ${path}: ${res.status}`)
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}))
+    throw new Error(err.error || `GET ${path}: ${res.status}`)
+  }
   return res.json()
 }
 
@@ -70,7 +80,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { open_reassign: boolean }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -164,25 +174,24 @@ export const api = {
     ).then(r => r.activity ?? [])
   },
 
-  // KB
-  kbList: (projectId: number, tag?: string) =>
-    get<{ docs: KBDocSummary[]; count: number }>(`/kb/list?project_id=${projectId}${tag ? '&tag=' + encodeURIComponent(tag) : ''}`).then(r => r.docs ?? []),
-  kbSearch: (projectId: number, query: string, limit = 10) =>
-    get<{ results: KBSearchResult[]; count: number }>(`/kb/search?project_id=${projectId}&q=${encodeURIComponent(query)}&limit=${limit}`).then(r => r.results ?? []),
-  kbGet: (projectId: number, path: string) =>
-    get<KBDoc>(`/kb/doc?project_id=${projectId}&path=${encodeURIComponent(path)}`),
-  kbWrite: (projectId: number, path: string, title: string, content: string, tags: string[], author = 'user') =>
-    post<KBDocSummary>(`/kb/doc?project_id=${projectId}`, { path, title, content, tags, author }),
-  kbDelete: async (projectId: number, path: string) => {
-    const res = await fetch(`${BASE}/kb/doc?project_id=${projectId}&path=${encodeURIComponent(path)}`, { method: 'DELETE' })
-    if (!res.ok) throw new Error(`DELETE kb doc: ${res.status}`)
-  },
-  kbTags: (projectId: number) =>
-    get<{ tags: KBTagCount[] }>(`/kb/tags?project_id=${projectId}`).then(r => r.tags ?? []),
-  kbConfig: (projectId: number) =>
-    get<{ typesense_url: string; api_key: string; collection: string }>(`/kb/config?project_id=${projectId}`),
-  kbAnnotate: (projectId: number, path: string, text: string, author = 'user') =>
-    post<KBAnnotation>(`/kb/annotate?project_id=${projectId}`, { path, text, author }),
+  // KB: every call names one knowledge base (a project's, a team's, or an org's).
+  kbInfo: (ref: KBRef) => get<KBInfo>(`/kb/info?${kbQuery(ref)}`),
+  kbSources: (projectId: number) =>
+    get<{ sources: KBSource[] }>(`/kb/sources?project_id=${projectId}`).then(r => r.sources ?? []),
+  kbList: (ref: KBRef, tag?: string) =>
+    get<{ docs: KBDocSummary[]; count: number }>(`/kb/list?${kbQuery(ref)}${tag ? '&tag=' + encodeURIComponent(tag) : ''}`).then(r => r.docs ?? []),
+  kbSearch: (ref: KBRef, query: string, limit = 10) =>
+    get<{ results: KBSearchResult[]; count: number }>(`/kb/search?${kbQuery(ref)}&q=${encodeURIComponent(query)}&limit=${limit}`).then(r => r.results ?? []),
+  kbGet: (ref: KBRef, path: string) =>
+    get<KBDoc>(`/kb/doc?${kbQuery(ref)}&path=${encodeURIComponent(path)}`),
+  kbWrite: (ref: KBRef, doc: { path: string; title: string; content: string; tags: string[]; reason?: string }) =>
+    post<KBDocSummary>(`/kb/doc?${kbQuery(ref)}`, doc),
+  kbDelete: (ref: KBRef, path: string) =>
+    del(`/kb/doc?${kbQuery(ref)}&path=${encodeURIComponent(path)}`),
+  kbTags: (ref: KBRef) =>
+    get<{ tags: KBTagCount[] }>(`/kb/tags?${kbQuery(ref)}`).then(r => r.tags ?? []),
+  kbAnnotate: (ref: KBRef, path: string, text: string) =>
+    post<KBAnnotation>(`/kb/annotate?${kbQuery(ref)}`, { path, text }),
 
   // Actions
   dispatchTask: (taskId: number, agentId = 'amp-worker') =>

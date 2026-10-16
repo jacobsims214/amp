@@ -840,6 +840,90 @@ func TestE2E(t *testing.T) {
 		}
 		t.Log("platform administration over MCP ✓")
 
+		// Shared knowledge bases. The teammate is now on Builders (owner team)
+		// and Reviewers (member team) of the project, and a plain org member.
+		// Writes are queued, so reads poll until the doc is indexed.
+		eventually := func(what string, f func() error) {
+			t.Helper()
+			deadline := time.Now().Add(60 * time.Second)
+			for {
+				err := f()
+				if err == nil {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: %v", what, err)
+				}
+				time.Sleep(time.Second)
+			}
+		}
+		orgKB := map[string]any{"project_id": pid, "scope": "org"}
+		with := func(base map[string]any, kv ...any) map[string]any {
+			out := map[string]any{}
+			for k, v := range base {
+				out[k] = v
+			}
+			for i := 0; i+1 < len(kv); i += 2 {
+				out[kv[i].(string)] = kv[i+1]
+			}
+			return out
+		}
+		e.mustTool(t, adminTok, "amp_kb_write", with(orgKB, "path", "brand/colours.md", "title", "Brand colours",
+			"content", "Our brand colours are indigo and slate. Use indigo for primary actions.", "tags", []any{"brand", "design-system"},
+			"reason", "Brand colours apply to every product in the org; added by the e2e admin."))
+		sources := e.mustTool(t, mateTok, "amp_kb_sources", map[string]any{"project_id": pid})["sources"].([]any)
+		var orgSrc, builders map[string]any
+		for _, src := range sources {
+			m := src.(map[string]any)
+			if m["scope"] == "org" {
+				orgSrc = m
+			}
+			if m["scope"] == "team" && num(m, "scope_id") == teamID {
+				builders = m
+			}
+		}
+		if orgSrc == nil || orgSrc["can_read"] != true || orgSrc["can_write"] != false || builders == nil || builders["can_write"] != true {
+			t.Fatalf("teammate's KB sources = %v", sources)
+		}
+		eventually("org doc readable by the teammate", func() error {
+			doc, err := e.tool(t, mateTok, "amp_kb_get", with(orgKB, "path", "brand/colours.md"))
+			if err == nil && doc["reason"] == "" {
+				return fmt.Errorf("org doc has no placement reason: %v", doc)
+			}
+			return err
+		})
+		if _, err := e.tool(t, mateTok, "amp_kb_write", with(orgKB, "path", "brand/x.md", "title", "x", "content", "x", "tags", []any{"x"}, "reason", "an org-wide reason that is long enough")); err == nil || !strings.Contains(err.Error(), "only org owners and admins") {
+			t.Fatalf("teammate wrote to the org KB: %v", err)
+		}
+		e.mustTool(t, mateTok, "amp_kb_annotate", with(orgKB, "path", "brand/colours.md", "text", "Slate changed in the v3 palette."))
+		// On two of the project's teams: the agent must say which.
+		teamKB := map[string]any{"project_id": pid, "scope": "team"}
+		if _, err := e.tool(t, mateTok, "amp_kb_list", teamKB); err == nil || !strings.Contains(err.Error(), "several of your teams") {
+			t.Fatalf("ambiguous team KB: %v", err)
+		}
+		teamKB["team_id"] = teamID
+		if _, err := e.tool(t, mateTok, "amp_kb_write", with(teamKB, "path", "how-to/deploy.md", "title", "Deploy", "content", "x", "tags", []any{"x"})); err == nil || !strings.Contains(err.Error(), "needs a reason") {
+			t.Fatalf("team write without a reason: %v", err)
+		}
+		e.mustTool(t, mateTok, "amp_kb_write", with(teamKB, "path", "how-to/deploy.md", "title", "How Builders deploy",
+			"content", "Builders deploy with a blue-green rollout behind the gateway, then run smoke tests.", "tags", []any{"deploy", "runbook"},
+			"reason", "Every Builders project deploys this way; the user asked to keep it in the team KB."))
+		eventually("team doc searchable in the team KB", func() error {
+			res, err := e.tool(t, mateTok, "amp_kb_search", with(teamKB, "query", "blue-green rollout"))
+			if err == nil && num(res, "count") == 0 {
+				return fmt.Errorf("not indexed yet")
+			}
+			return err
+		})
+		if res := e.mustTool(t, mateTok, "amp_kb_search", map[string]any{"project_id": pid, "query": "blue-green rollout"}); num(res, "count") != 0 {
+			t.Fatalf("project KB search returned team docs: %v", res)
+		}
+		if info := mate.must(t, 200, "GET", fmt.Sprintf("/api/kb/info?org_id=%d", orgID), nil); info["can_write"] != false {
+			t.Fatalf("teammate's org KB info = %v", info)
+		}
+		mate.must(t, 403, "POST", fmt.Sprintf("/api/kb/doc?org_id=%d", orgID), map[string]any{"path": "y.md", "title": "y", "content": "y"})
+		t.Log("team and org knowledge bases: scoped access, reasons, ambiguity refused, project search stays narrow ✓")
+
 		// Promote the teammate to global admin from the Users page's API. Their
 		// existing MCP token and UI session gain admin powers on the next
 		// request (roles are read per request — no re-login), and lose them

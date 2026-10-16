@@ -14,11 +14,49 @@ description: How to search the AMP knowledge base before starting work, and how 
 > It defines the canonical rules for KB search and writing. Neither prompt nor any
 > other skill repeats these rules — this is the single source of truth.
 
-The KB is a per-project document store with **hybrid keyword + semantic search**. The
+Each project has a KB: a document store with **hybrid keyword + semantic search**. The
 semantic layer uses `nomic-embed-text` embeddings — it understands meaning, not just
 keywords. "goroutine lifecycle" will find a doc about actors. "authentication system"
 will find a doc about JWT middleware. But only if the doc is written in a way that
 gives the model enough natural language to work with.
+
+---
+
+## Which knowledge base
+
+There are three kinds of KB. **The project KB is the default for everything** — every
+`amp_kb_*` call that passes only `project_id` uses it, and that is where almost all knowledge
+belongs.
+
+| KB | Holds | Who writes |
+|---|---|---|
+| Project (default) | This project's architecture, decisions, gotchas | anyone on the project |
+| Team (`scope: "team"`) | What's true for every project the team works on: runbooks, services the team owns, team conventions | members of the team |
+| Org (`scope: "org"`) | What's true across the whole org: brand and design system, process, standards, policy, glossary | org owners and admins; everyone else annotates |
+
+- **Know where you are.** `amp_kb_sources(project_id)` lists the project's KB, its org's KB,
+  and the KB of each team linked to the project (owner team first), with doc counts and
+  whether you can read and write each. Call it once when you start in a project.
+- **Read narrowly.** Search the project KB. Search a team or org KB when your user asks, or
+  when you need something only it would hold — the brand and design system (org), the
+  team's deploy runbook (team). Don't search all three on every task; it bloats your context.
+- **Write to the project KB.** Put knowledge in a team or org KB **only when your user has
+  decided it belongs there**. Never move or copy knowledge there on your own initiative. If
+  you think something is true beyond this project, say so to your user, with why, and keep
+  it in the project KB until they decide.
+- **A team or org write needs `reason`:** specifically why this belongs to the whole team
+  or org rather than one project, and that your user decided it. It's stored with the doc.
+- **Org KB, not an admin?** Use `amp_kb_annotate` to flag something wrong or out of date.
+- **Several of your teams on the project?** `scope: "team"` is refused with the list; pass
+  `team_id`. Nothing crosses orgs: a team or org outside the project's org is refused.
+
+```
+amp_kb_sources(project_id=2)
+amp_kb_search(project_id=2, scope="org", query="brand colour palette")
+amp_kb_search(project_id=2, scope="team", query="how we deploy to staging")
+amp_kb_write(project_id=2, scope="team", path="how-to/deploy-staging.md", ...,
+             reason="Every Devs project deploys this way; Jane asked to keep it in the team KB")
+```
 
 ---
 
@@ -40,6 +78,8 @@ amp_kb_search(project_id=2, query="actor state machine task lifecycle")
 
 - Relevant result → read with `amp_kb_get` before touching anything
 - No results → proceed, but document what you learn when done
+- These search the project KB. Reach for the team or org KB only as described in
+  "Which knowledge base" above.
 
 ---
 
@@ -343,7 +383,13 @@ After finding useful information from Context7, persist it: write a KB doc with 
 
 ## MCP tool reference
 
+Every tool below also takes `scope` (`project` default, `team`, `org`), `team_id`, and
+`org_id` to name a team or org KB; with only `project_id` it's the project KB.
+
 ```
+amp_kb_sources {project_id}
+  → the project's KB, its org's KB, and its teams' KBs, with can_read / can_write / docs
+
 amp_kb_search {project_id, query, tags?, limit?}
   → {results: [{path, title, excerpt, tags, score, annotation_count, latest_annotation}]}
   Use natural language queries. The model understands concepts.
@@ -352,8 +398,9 @@ amp_kb_get {project_id, path}
   → full doc with content field (full markdown), annotations array
   Read this before touching related code.
 
-amp_kb_write {project_id, path, title, content, tags, author?}
+amp_kb_write {project_id, path, title, content, tags, author?, reason?}
   → writes and re-indexes the doc (embeddings regenerated automatically)
+  reason is required for team and org KBs
 
 amp_kb_list {project_id, tag?}
   → [{path, title, tags, updated_at}] — all docs, no content

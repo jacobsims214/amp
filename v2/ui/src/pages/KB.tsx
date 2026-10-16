@@ -1,13 +1,21 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
-import { useParams } from 'react-router-dom'
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { Link, useParams } from 'react-router-dom'
 import {
   Plus, Search, FileText, Tag, Trash2, Edit3, Save, X,
   Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
+  ArrowLeft, Building2, Users, Lock, Info,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api/client'
 import { ProjectNav } from '../components/ProjectNav'
-import type { KBDoc, KBDocSummary, KBSearchResult, KBTagCount } from '../types'
+import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
+
+// What each kind of KB is for; shown on team and org KB pages and in the editor.
+const SCOPE_PURPOSE: Record<KBScope, string> = {
+  project: "This project's architecture, decisions, and gotchas.",
+  team: 'Knowledge for every project this team works on: runbooks, services the team owns, team conventions.',
+  org: 'Knowledge for the whole org: brand and design system, process, standards, policy.',
+}
 
 type View = 'browse' | 'doc' | 'editor'
 
@@ -35,9 +43,19 @@ const inputCls =
   'w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] ' +
   'placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit]'
 
+// One page for every knowledge base: /project/:projectId/kb, /teams/:teamId/kb, /orgs/:orgId/kb.
 export function KB() {
-  const { projectId } = useParams<{ projectId: string }>()
-  const pid = Number(projectId)
+  const { projectId, teamId, orgId } = useParams<{ projectId?: string; teamId?: string; orgId?: string }>()
+  const pid = projectId ? Number(projectId) : null
+  const kbRef: KBRef = useMemo(
+    () => teamId ? { team_id: Number(teamId) } : orgId ? { org_id: Number(orgId) } : { project_id: Number(projectId) },
+    [projectId, teamId, orgId],
+  )
+  const [info, setInfo] = useState<KBInfo | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const canWrite = info?.can_write ?? false
+  const shared = info != null && info.scope !== 'project'
 
   const [view, setView] = useState<View>('browse')
   const [docs, setDocs] = useState<KBDocSummary[]>([])
@@ -55,22 +73,30 @@ export function KB() {
   const [editTitle, setEditTitle] = useState('')
   const [editContent, setEditContent] = useState('')
   const [editTags, setEditTags] = useState('')
+  const [editReason, setEditReason] = useState('')
   const [saving, setSaving] = useState(false)
   const [editorTab, setEditorTab] = useState<'write' | 'preview'>('write')
+
+  useEffect(() => {
+    setInfo(null); setLoadError(null); setSelectedDoc(null); setView('browse')
+    api.kbInfo(kbRef).then(setInfo).catch(e => setLoadError(e instanceof Error ? e.message : 'Failed to load'))
+  }, [kbRef])
 
   const loadDocs = useCallback(async () => {
     setLoading(true)
     try {
       const [docList, tagList] = await Promise.all([
-        api.kbList(pid, tagFilter ?? undefined),
-        api.kbTags(pid),
+        api.kbList(kbRef, tagFilter ?? undefined),
+        api.kbTags(kbRef),
       ])
       setDocs(docList)
       setTags(tagList)
+    } catch (e) {
+      setLoadError(e instanceof Error ? e.message : 'Failed to load')
     } finally {
       setLoading(false)
     }
-  }, [pid, tagFilter])
+  }, [kbRef, tagFilter])
 
   useEffect(() => { loadDocs() }, [loadDocs])
 
@@ -79,26 +105,32 @@ export function KB() {
     if (!searchQuery.trim()) { setSearchResults([]); return }
     const t = setTimeout(async () => {
       setSearching(true)
-      try { setSearchResults(await api.kbSearch(pid, searchQuery)) }
+      try { setSearchResults(await api.kbSearch(kbRef, searchQuery)) }
+      catch { setSearchResults([]) }
       finally { setSearching(false) }
     }, 300)
     return () => clearTimeout(t)
-  }, [searchQuery, pid])
+  }, [searchQuery, kbRef])
 
   const openDoc = async (path: string) => {
-    const doc = await api.kbGet(pid, path)
-    setSelectedDoc(doc)
-    setView('doc')
-    setSearchQuery('') // close search results
+    setActionError(null)
+    try {
+      setSelectedDoc(await api.kbGet(kbRef, path))
+      setView('doc')
+      setSearchQuery('') // close search results
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Failed to open the document')
+    }
   }
 
   const openEditor = (doc?: KBDoc | null) => {
     if (doc) {
       setEditPath(doc.path); setEditTitle(doc.title)
-      setEditContent(doc.content); setEditTags(doc.tags.join(', '))
+      setEditContent(doc.content); setEditTags(doc.tags.join(', ')); setEditReason(doc.reason ?? '')
     } else {
-      setEditPath(''); setEditTitle(''); setEditContent(''); setEditTags('')
+      setEditPath(''); setEditTitle(''); setEditContent(''); setEditTags(''); setEditReason('')
     }
+    setActionError(null)
     setEditorTab('write')
     setView('editor')
   }
@@ -106,19 +138,56 @@ export function KB() {
   const saveDoc = async () => {
     if (!editPath || !editTitle || !editContent) return
     setSaving(true)
+    setActionError(null)
     try {
       const parsedTags = editTags.split(',').map(t => t.trim()).filter(Boolean)
-      await api.kbWrite(pid, editPath, editTitle, editContent, parsedTags)
+      await api.kbWrite(kbRef, {
+        path: editPath, title: editTitle, content: editContent, tags: parsedTags,
+        reason: shared ? editReason.trim() : undefined,
+      })
       await loadDocs()
-      const doc = await api.kbGet(pid, editPath)
+      const doc = await api.kbGet(kbRef, editPath)
       setSelectedDoc(doc); setView('doc')
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Save failed')
     } finally { setSaving(false) }
   }
 
   const deleteDoc = async (path: string) => {
     if (!confirm(`Delete "${path}"?`)) return
-    await api.kbDelete(pid, path)
-    setSelectedDoc(null); setView('browse'); loadDocs()
+    setActionError(null)
+    try {
+      await api.kbDelete(kbRef, path)
+      setSelectedDoc(null); setView('browse'); loadDocs()
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : 'Delete failed')
+    }
+  }
+
+  const newDocButton = canWrite ? (
+    <button
+      onClick={() => openEditor(null)}
+      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer"
+      style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+    >
+      <Plus size={12} />
+      New Doc
+    </button>
+  ) : info ? (
+    <span className="flex items-center gap-1.5 text-xs text-[#7E91A8]" title={info.scope === 'org' ? 'Only org owners and admins edit the org KB; you can annotate.' : undefined}>
+      <Lock size={11} />Read-only{info.scope === 'org' ? ' · you can annotate' : ''}
+    </span>
+  ) : null
+
+  if (loadError && !info) {
+    return (
+      <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
+        {pid ? <ProjectNav projectId={pid} currentView="kb" /> : <ScopeHeader info={null} />}
+        <div className="flex-1 flex items-center justify-center p-8">
+          <p className="text-sm text-[#F87171] max-w-md text-center">{loadError}</p>
+        </div>
+      </div>
+    )
   }
 
   const tree = buildTree(docs)
@@ -127,20 +196,9 @@ export function KB() {
   return (
     <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
       {/* Header */}
-      <ProjectNav
-        projectId={pid}
-        currentView="kb"
-        rightSlot={
-          <button
-            onClick={() => openEditor(null)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer"
-            style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
-          >
-            <Plus size={12} />
-            New Doc
-          </button>
-        }
-      />
+      {pid
+        ? <ProjectNav projectId={pid} currentView="kb" rightSlot={newDocButton} />
+        : <ScopeHeader info={info} rightSlot={newDocButton} />}
 
       <div className="flex flex-1 overflow-hidden">
         {/* ── Sidebar ────────────────────────────────────────────────── */}
@@ -238,7 +296,7 @@ export function KB() {
               <div className="text-center py-8 px-3">
                 <BookOpen size={20} className="text-[#283A57] mx-auto mb-2" />
                 <p className="text-xs text-[#3D5068]">No docs yet</p>
-                <p className="text-xs text-[#3D5068] mt-0.5">Click "New Doc" to start.</p>
+                {canWrite && <p className="text-xs text-[#3D5068] mt-0.5">Click "New Doc" to start.</p>}
               </div>
             ) : (
               <TreeNode
@@ -252,13 +310,31 @@ export function KB() {
               />
             )}
           </div>
+
+          {pid != null && <OtherKBs projectId={pid} />}
         </aside>
 
         {/* ── Main content ───────────────────────────────────────────── */}
         <main className="flex-1 overflow-y-auto">
-          {view === 'browse' && <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={openDoc} onNew={() => openEditor(null)} />}
+          {actionError && view !== 'editor' && (
+            <p className="mx-6 mt-4 text-xs text-[#F87171]">{actionError}</p>
+          )}
+          {view === 'browse' && (
+            <>
+              {shared && info && (
+                <div className="mx-6 mt-6 flex items-start gap-2.5 rounded-xl px-4 py-3 max-w-4xl"
+                  style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+                  <Info size={13} className="text-[#818CF8] mt-0.5 flex-shrink-0" />
+                  <p className="text-xs text-[#7E91A8] leading-relaxed">
+                    {SCOPE_PURPOSE[info.scope]} Anything specific to one project belongs in that project's KB.
+                  </p>
+                </div>
+              )}
+              <BrowseView docs={docs} loading={loading} tagFilter={tagFilter} onOpen={openDoc} onNew={canWrite ? () => openEditor(null) : undefined} />
+            </>
+          )}
           {view === 'doc' && selectedDoc && (
-            <DocView doc={selectedDoc} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} pid={pid} setSelectedDoc={setSelectedDoc} />
+            <DocView doc={selectedDoc} canWrite={canWrite} onEdit={() => openEditor(selectedDoc)} onDelete={() => deleteDoc(selectedDoc.path)} onTagClick={tag => setTagFilter(tag)} kbRef={kbRef} setSelectedDoc={setSelectedDoc} />
           )}
           {view === 'editor' && (
             <EditorView
@@ -267,9 +343,73 @@ export function KB() {
               onPath={setEditPath} onTitle={setEditTitle} onContent={setEditContent} onTags={setEditTags}
               onTab={setEditorTab} onSave={saveDoc}
               onCancel={() => setView(selectedDoc ? 'doc' : 'browse')}
+              shared={shared ? info : null} reason={editReason} onReason={setEditReason} error={actionError}
             />
           )}
         </main>
+      </div>
+    </div>
+  )
+}
+
+/* ── Team / org KB header ──────────────────────────────────────────────────── */
+function ScopeHeader({ info, rightSlot }: { info: KBInfo | null; rightSlot?: React.ReactNode }) {
+  const Icon = info?.scope === 'org' ? Building2 : Users
+  return (
+    <header className="flex items-center flex-shrink-0 select-none"
+      style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45', height: 48 }}>
+      <Link to="/admin/orgs" title="Organizations"
+        className="flex items-center justify-center w-11 h-full text-[#3D5068] hover:text-[#DDE6F0] transition-colors cursor-pointer flex-shrink-0">
+        <ArrowLeft size={15} />
+      </Link>
+      <div className="w-px h-5 bg-[#1E2C45] flex-shrink-0" />
+      <div className="flex items-center gap-2 px-3 min-w-0">
+        <Icon size={14} className="text-[#818CF8] flex-shrink-0" />
+        <span className="text-sm font-bold text-[#DDE6F0] truncate">{info?.name ?? 'Knowledge base'}</span>
+        {info && (
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-[#7E91A8]">
+            {info.scope === 'org' ? 'Org knowledge base' : 'Team knowledge base'}
+          </span>
+        )}
+      </div>
+      <div className="flex items-center gap-2 px-3 ml-auto flex-shrink-0">{rightSlot}</div>
+    </header>
+  )
+}
+
+/* ── Other knowledge bases around a project ───────────────────────────────── */
+function OtherKBs({ projectId }: { projectId: number }) {
+  const [sources, setSources] = useState<KBSource[]>([])
+  useEffect(() => {
+    api.kbSources(projectId).then(s => setSources(s.filter(x => x.scope !== 'project'))).catch(() => setSources([]))
+  }, [projectId])
+  if (sources.length === 0) return null
+  return (
+    <div className="flex-shrink-0 px-3 py-3" style={{ borderTop: '1px solid #192238' }}>
+      <div className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest mb-2">Shared knowledge</div>
+      <div className="space-y-0.5">
+        {sources.map(s => {
+          const Icon = s.scope === 'org' ? Building2 : Users
+          const label = (
+            <>
+              <Icon size={12} className="flex-shrink-0" />
+              <span className="truncate flex-1">{s.name}</span>
+              {s.scope === 'team' && s.team_role === 'owner' && <span className="text-[10px] text-[#3D5068]">owner</span>}
+              {s.can_read ? <span className="text-[10px] text-[#3D5068]">{s.docs ?? 0}</span> : <Lock size={10} />}
+            </>
+          )
+          return s.can_read ? (
+            <Link key={`${s.scope}-${s.scope_id}`} to={s.scope === 'org' ? `/orgs/${s.scope_id}/kb` : `/teams/${s.scope_id}/kb`}
+              className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors">
+              {label}
+            </Link>
+          ) : (
+            <div key={`${s.scope}-${s.scope_id}`} title="Only members of this team can read its KB"
+              className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D5068]">
+              {label}
+            </div>
+          )
+        })}
       </div>
     </div>
   )
@@ -428,7 +568,7 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
 /* ── Browse view (default landing) ───────────────────────────────────────── */
 function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
   docs: KBDocSummary[]; loading: boolean; tagFilter: string | null
-  onOpen: (path: string) => void; onNew: () => void
+  onOpen: (path: string) => void; onNew?: () => void
 }) {
   if (loading) return (
     <div className="flex justify-center py-20">
@@ -445,14 +585,14 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
       <div className="text-center">
         <p className="text-base font-semibold text-[#DDE6F0]">No documents yet</p>
         <p className="text-sm text-[#7E91A8] mt-2 max-w-xs leading-relaxed">
-          Agents write docs here automatically, or you can create one manually.
+          {onNew ? 'Agents write docs here, or you can create one manually.' : "There's nothing here yet."}
         </p>
-        <button onClick={onNew}
+        {onNew && <button onClick={onNew}
           className="mt-4 flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold mx-auto cursor-pointer transition-all active:scale-[0.97]"
           style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}>
           <Plus size={14} />
           Create first document
-        </button>
+        </button>}
       </div>
     </div>
   )
@@ -525,9 +665,9 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
 }
 
 /* ── Doc viewer ───────────────────────────────────────────────────────────── */
-function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
-  doc: KBDoc; onEdit: () => void; onDelete: () => void; onTagClick: (tag: string) => void
-  pid: number; setSelectedDoc: (doc: KBDoc | null) => void
+function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelectedDoc }: {
+  doc: KBDoc; canWrite: boolean; onEdit: () => void; onDelete: () => void; onTagClick: (tag: string) => void
+  kbRef: KBRef; setSelectedDoc: (doc: KBDoc | null) => void
 }) {
   const pathParts = doc.path.split('/')
   const rt = readingTime(doc.content)
@@ -535,15 +675,19 @@ function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
   const [annExpanded, setAnnExpanded] = useState(true)
   const [annText, setAnnText] = useState('')
   const [annSaving, setAnnSaving] = useState(false)
+  const [annError, setAnnError] = useState<string | null>(null)
 
   const handleAddAnnotation = async () => {
     if (!annText.trim()) return
     setAnnSaving(true)
+    setAnnError(null)
     try {
-      await api.kbAnnotate(pid, doc.path, annText, 'user')
-      const updatedDoc = await api.kbGet(pid, doc.path)
+      await api.kbAnnotate(kbRef, doc.path, annText)
+      const updatedDoc = await api.kbGet(kbRef, doc.path)
       setSelectedDoc(updatedDoc)
       setAnnText('')
+    } catch (e) {
+      setAnnError(e instanceof Error ? e.message : 'Annotation failed')
     } finally {
       setAnnSaving(false)
     }
@@ -589,7 +733,7 @@ function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
             {doc.author && <span className="text-xs text-[#3D5068]">by {doc.author}</span>}
           </div>
         </div>
-        <div className="flex items-center gap-2 flex-shrink-0">
+        {canWrite && <div className="flex items-center gap-2 flex-shrink-0">
           <button onClick={onEdit}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer"
             style={{ border: '1px solid #1E2C45', color: '#7E91A8', background: 'transparent' }}
@@ -604,8 +748,20 @@ function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
             onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}>
             <Trash2 size={12} />
           </button>
-        </div>
+        </div>}
       </div>
+
+      {/* Why a team or org doc lives here */}
+      {doc.reason && (
+        <div className="flex items-start gap-2.5 rounded-xl px-4 py-3 mb-5"
+          style={{ background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.2)' }}>
+          <Info size={13} className="text-[#818CF8] mt-0.5 flex-shrink-0" />
+          <div className="text-xs leading-relaxed">
+            <span className="font-semibold text-[#DDE6F0]">Why it's in the {doc.scope === 'org' ? 'org' : 'team'} KB: </span>
+            <span className="text-[#7E91A8]">{doc.reason}</span>
+          </div>
+        </div>
+      )}
 
       {/* Tags */}
       {doc.tags.length > 0 && (
@@ -725,7 +881,8 @@ function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
                   className="w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-xs text-[#DDE6F0] placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit] resize-none"
                   rows={3}
                 />
-                <div className="flex justify-end">
+                <div className="flex justify-end items-center gap-3">
+                  {annError && <span className="text-xs text-[#F87171]">{annError}</span>}
                   <button
                     onClick={handleAddAnnotation}
                     disabled={!annText.trim() || annSaving}
@@ -758,12 +915,16 @@ function DocView({ doc, onEdit, onDelete, onTagClick, pid, setSelectedDoc }: {
 }
 
 /* ── Editor ───────────────────────────────────────────────────────────────── */
-function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, onContent, onTags, onTab, onSave, onCancel }: {
+function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, onContent, onTags, onTab, onSave, onCancel, shared, reason, onReason, error }: {
   path: string; title: string; content: string; tags: string; saving: boolean
   tab: 'write' | 'preview'
   onPath: (v: string) => void; onTitle: (v: string) => void; onContent: (v: string) => void; onTags: (v: string) => void
   onTab: (t: 'write' | 'preview') => void
   onSave: () => void; onCancel: () => void
+  /** the team or org KB being written to; null for a project KB */
+  shared: KBInfo | null
+  reason: string; onReason: (v: string) => void
+  error: string | null
 }) {
   const canSave = !!path && !!title && !!content && !saving
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -790,6 +951,7 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
           ))}
         </div>
         <div className="flex items-center gap-2">
+          {error && <span className="text-xs text-[#F87171] max-w-md truncate" title={error}>{error}</span>}
           <button onClick={onCancel}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer"
             style={{ border: '1px solid #1E2C45', color: '#7E91A8', background: 'transparent' }}
@@ -825,6 +987,19 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
           <input value={tags} onChange={e => onTags(e.target.value)} placeholder="auth, api, guide"
             className={inputCls} />
         </div>
+        {shared && (
+          <div className="col-span-3">
+            <label className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest block mb-1">
+              Why does this belong in the {shared.scope} KB?
+            </label>
+            <input value={reason} onChange={e => onReason(e.target.value)}
+              placeholder={shared.scope === 'org'
+                ? 'e.g. Brand colours apply to every product in the org'
+                : 'e.g. Every project this team runs deploys this way'}
+              className={inputCls} />
+            <p className="text-[11px] text-[#3D5068] mt-1">{SCOPE_PURPOSE[shared.scope]} Shown with the doc so others know why it's shared.</p>
+          </div>
+        )}
       </div>
 
       {/* Write / Preview pane */}

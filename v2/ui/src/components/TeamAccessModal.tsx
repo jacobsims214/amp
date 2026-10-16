@@ -1,23 +1,37 @@
 import { useEffect, useState } from 'react'
-import { Loader2, Trash2, Users } from 'lucide-react'
+import { Link } from 'react-router-dom'
+import { Loader2, Settings, Trash2, Users } from 'lucide-react'
 import { api } from '../api/client'
 import { CrudModal, inputCls, labelCls } from './CrudModal'
 import { canManageProject } from '../lib/people'
 import type { Project, ProjectAccess, ProjectTeam, ProjectTeamRole, Team } from '../types'
 
-interface Props {
+interface PanelProps {
   projectId: number
   myAccess: ProjectAccess | null
   /** called after a project setting changes */
   onProjectUpdated?: (project: Project) => void
-  onClose: () => void
+}
+
+// The board's quick "Team access" dialog; the same panel is on the project
+// settings page.
+export function TeamAccessModal({ onClose, ...props }: PanelProps & { onClose: () => void }) {
+  return (
+    <CrudModal title="Team access" onClose={onClose}>
+      <TeamAccessPanel {...props} />
+      <Link to={`/project/${props.projectId}/settings`}
+        className="mt-5 inline-flex items-center gap-1.5 text-xs text-[#818CF8] hover:text-[#DDE6F0] transition-colors">
+        <Settings size={12} />All project settings
+      </Link>
+    </CrudModal>
+  )
 }
 
 // Lists the teams linked to a project. Project owners (and org/global
 // admins) can change each team's role, unlink it, or link another team from
 // the project's org, and set who may reassign tickets; everyone else gets a
 // read-only view.
-export function TeamAccessModal({ projectId, myAccess, onProjectUpdated, onClose }: Props) {
+export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: PanelProps) {
   const canManage = canManageProject(myAccess)
   const [teams, setTeams] = useState<ProjectTeam[]>([])
   const [orgTeams, setOrgTeams] = useState<Team[]>([])
@@ -75,7 +89,7 @@ export function TeamAccessModal({ projectId, myAccess, onProjectUpdated, onClose
   const unlinked = orgTeams.filter(t => !teams.some(pt => pt.team_id === t.id))
 
   return (
-    <CrudModal title="Team access" onClose={onClose}>
+    <>
       {loading ? (
         <div className="flex justify-center py-6"><Loader2 size={18} className="text-[#6366F1] animate-spin" /></div>
       ) : (
@@ -169,6 +183,6 @@ export function TeamAccessModal({ projectId, myAccess, onProjectUpdated, onClose
           {error && <p className="text-xs text-[#F87171]">{error}</p>}
         </div>
       )}
-    </CrudModal>
+    </>
   )
 }

@@ -96,9 +96,39 @@ export interface KBAnnotation {
   is_resolved: boolean
 }
 
+/** Names one knowledge base: set exactly one id. */
+export interface KBRef {
+  project_id?: number
+  team_id?: number
+  org_id?: number
+}
+
+export type KBScope = 'project' | 'team' | 'org'
+
+/** A knowledge base and what the viewer may do in it. */
+export interface KBInfo {
+  scope: KBScope
+  scope_id: number
+  name: string
+  /** read, search, annotate */
+  can_read: boolean
+  /** write, delete */
+  can_write: boolean
+}
+
+/** A KB around a project (GET /kb/sources). Teams you're not on have can_read false. */
+export interface KBSource extends KBInfo {
+  team_role?: 'owner' | 'member'
+  docs?: number
+}
+
 export interface KBDoc {
   id: string
   project_id: number
+  scope?: KBScope
+  scope_id?: number
+  /** why a team or org doc was placed there */
+  reason?: string
   path: string
   title: string
   content: string
@@ -113,6 +143,9 @@ export interface KBDoc {
 export interface KBDocSummary {
   id: string
   project_id: number
+  scope?: KBScope
+  scope_id?: number
+  reason?: string
   path: string
   title: string
   tags: string[]
