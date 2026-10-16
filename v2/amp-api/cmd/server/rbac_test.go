@@ -173,7 +173,10 @@ func TestRBAC_ProjectVisibility(t *testing.T) {
 		msg = w.as(id).callExpectError(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(w.s.projectID)})
 		wantErr(t, msg, "not found")
 		msg = w.as(id).callExpectError(t, "amp_get_story", map[string]interface{}{"story_id": float64(w.s.storyID)})
-		wantErr(t, msg, "not found")
+		wantErr(t, msg, "story", "not found")
+		if strings.Contains(msg, "project") {
+			t.Errorf("not-found error leaks the story's project: %q", msg)
+		}
 		msg = w.as(id).callExpectError(t, "amp_kb_list", map[string]interface{}{"project_id": float64(w.s.projectID)})
 		wantErr(t, msg, "not found")
 	}

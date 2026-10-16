@@ -1713,10 +1713,23 @@ func (s *Server) guard(min authz.Level, fn handlerFunc) handlerFunc {
 		}
 		lvl, err := s.svc.Authz.RequireProject(ctx, p, projectID, min)
 		if err != nil {
+			if authz.StatusOf(err, 0) == 404 {
+				// Name only what the caller asked for, not the project it's in.
+				return nil, notFoundFor(args)
+			}
 			return nil, err
 		}
 		return fn(context.WithValue(ctx, principalKey{}, callerInfo{p: p, lvl: lvl}), args)
 	}
+}
+
+func notFoundFor(args map[string]interface{}) error {
+	for _, key := range []string{"project_id", "task_id", "story_id", "epic_id"} {
+		if v, ok := args[key]; ok {
+			return fmt.Errorf("%s %v not found", strings.TrimSuffix(key, "_id"), v)
+		}
+	}
+	return fmt.Errorf("not found")
 }
 
 func (s *Server) projectOf(ctx context.Context, args map[string]interface{}) (int, error) {

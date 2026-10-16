@@ -636,7 +636,8 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, err, 404)
 		return
 	}
-	if _, ok := h.requireProject(w, r, pr, epic.ProjectID, authz.Member); !ok {
+	if _, err := h.svc.Authz.RequireProject(r.Context(), pr, epic.ProjectID, authz.Member); err != nil {
+		jsonErr(w, errorf(fmt.Sprintf("epic %d not found", epicID)), 404)
 		return
 	}
 	// Changing or deleting the epic, or its owners, needs edit rights.
@@ -768,7 +769,8 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, err, 404)
 		return
 	}
-	if _, ok := h.requireProject(w, r, pr, story.ProjectID, authz.Member); !ok {
+	if _, err := h.svc.Authz.RequireProject(r.Context(), pr, story.ProjectID, authz.Member); err != nil {
+		jsonErr(w, errorf(fmt.Sprintf("story %d not found", storyID)), 404)
 		return
 	}
 	if r.Method != http.MethodGet {
