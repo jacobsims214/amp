@@ -94,6 +94,9 @@ export interface KBAnnotation {
   text: string
   created_at: number
   is_resolved: boolean
+  /** who resolved it and when (unix seconds), once worked into the doc */
+  resolved_by?: string
+  resolved_at?: number
 }
 
 /** Names one knowledge base: set exactly one id. */

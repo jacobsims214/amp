@@ -1158,6 +1158,7 @@ var _ = context.Background
 // GET  /api/kb/search?KB&q=Q              → search results
 // GET  /api/kb/tags?KB                    → tag counts
 // POST /api/kb/annotate?KB                → annotate a doc (body: {path,text})
+// POST /api/kb/resolve?KB                 → resolve or reopen an annotation (body: {path,index,resolved})
 func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 	// Parse sub-path: /api/kb/{action}
 	sub := r.URL.Path[len("/api/kb/"):]
@@ -1190,7 +1191,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		fail(w, err, 500)
 		return
 	}
-	if action == "doc" && (r.Method == http.MethodPost || r.Method == http.MethodDelete) {
+	if (action == "doc" && (r.Method == http.MethodPost || r.Method == http.MethodDelete)) || action == "resolve" {
 		if err := k.RequireWrite(); err != nil {
 			fail(w, err, 403)
 			return
@@ -1329,6 +1330,32 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, map[string]interface{}{"tags": tags})
+
+	case "resolve":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		var body struct {
+			Path     string `json:"path"`
+			Index    *int   `json:"index"`
+			Resolved *bool  `json:"resolved"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Path == "" || body.Index == nil {
+			jsonErr(w, errorf("path and index are required"), 400)
+			return
+		}
+		resolved := body.Resolved == nil || *body.Resolved
+		doc, err := h.kb.ResolveAnnotation(r.Context(), sc, body.Path, *body.Index, resolved, pr.Email)
+		if err != nil {
+			status := 400 // index out of range
+			if strings.Contains(err.Error(), "doc not found") {
+				status = 404
+			}
+			jsonErr(w, err, status)
+			return
+		}
+		jsonOK(w, doc)
 
 	case "annotate":
 		if r.Method != http.MethodPost {

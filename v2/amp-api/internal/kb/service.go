@@ -445,11 +445,44 @@ func (s *Service) AnnotateDoc(ctx context.Context, sc Scope, path, text, author 
 		IsResolved: false,
 	}
 	doc.Annotations = append(doc.Annotations, *ann)
+	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
+		return nil, fmt.Errorf("annotate doc %s: %w", path, err)
+	}
+	return ann, nil
+}
 
+// ResolveAnnotation marks a doc's annotation resolved (worked into the doc)
+// or, with resolved false, reopens it. index is the annotation's position in
+// the doc's annotations, oldest first, as amp_kb_get returns them;
+// annotations are only ever appended, so positions don't change.
+func (s *Service) ResolveAnnotation(ctx context.Context, sc Scope, path string, index int, resolved bool, by string) (*Doc, error) {
+	doc, err := s.GetDoc(ctx, sc, path)
+	if err != nil {
+		return nil, err
+	}
+	if index < 0 || index >= len(doc.Annotations) {
+		return nil, fmt.Errorf("%s has %d annotations; index %d is out of range (0-based, oldest first)", path, len(doc.Annotations), index)
+	}
+	a := &doc.Annotations[index]
+	a.IsResolved = resolved
+	if resolved {
+		a.ResolvedBy, a.ResolvedAt = by, time.Now().Unix()
+	} else {
+		a.ResolvedBy, a.ResolvedAt = "", 0
+	}
+	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
+		return nil, fmt.Errorf("resolve annotation on %s: %w", path, err)
+	}
+	return doc, nil
+}
+
+// saveAnnotations stores doc's annotations on its first chunk and the
+// preview fields on every chunk, so search hits from any chunk show them.
+func (s *Service) saveAnnotations(ctx context.Context, sc Scope, doc *Doc) error {
 	col := collectionName(sc)
 	// Marshal annotations to JSON string for Typesense schema compliance
 	annJSON, _ := json.Marshal(doc.Annotations)
-	_, err = s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
+	_, err := s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
 		"id":                doc.ID,
 		"project_id":        doc.ProjectID,
 		"reason":            doc.Reason,
@@ -466,22 +499,21 @@ func (s *Service) AnnotateDoc(ctx context.Context, sc Scope, path, text, author 
 		"latest_annotation": getLatestAnnotation(doc.Annotations),
 	}, &api.DocumentIndexParameters{})
 	if err != nil {
-		return nil, fmt.Errorf("annotate doc %s: %w", path, err)
+		return err
 	}
 
 	// Propagate annotation count and latest annotation to all other chunks
 	// so search results from any chunk show annotation data.
 	count := len(doc.Annotations)
 	latest := getLatestAnnotation(doc.Annotations)
-	propFilter := fmt.Sprintf("path:=%s && chunk_index:>0", quoteFilter(path))
+	propFilter := fmt.Sprintf("path:=%s && chunk_index:>0", quoteFilter(doc.Path))
 	_, _ = s.client.Collection(col).Documents().Update(ctx, map[string]interface{}{
 		"annotation_count":  count,
 		"latest_annotation": latest,
 	}, &api.UpdateDocumentsParams{
 		FilterBy: &propFilter,
 	})
-
-	return ann, nil
+	return nil
 }
 
 // ListDocs returns summaries of all documents (no content).
@@ -1131,17 +1163,17 @@ func mapToDocFromMap(m map[string]interface{}) *Doc {
 	return doc
 }
 
-// getLatestAnnotation returns the most recent annotation's text (first 80 chars).
+// getLatestAnnotation returns the most recent unresolved annotation's text
+// (first 80 characters), the preview search results show. Resolved notes
+// are already worked into the doc, so they aren't previewed.
 // The annotations slice is expected to be ordered with the most recent at the end.
 func getLatestAnnotation(anns []Annotation) string {
-	if len(anns) == 0 {
-		return ""
+	for i := len(anns) - 1; i >= 0; i-- {
+		if !anns[i].IsResolved {
+			return trimExcerpt(anns[i].Text, 80)
+		}
 	}
-	latest := anns[len(anns)-1] // last in slice = most recent
-	if len(latest.Text) > 80 {
-		return latest.Text[:80] + "…"
-	}
-	return latest.Text
+	return ""
 }
 
 func trimExcerpt(s string, maxChars int) string {

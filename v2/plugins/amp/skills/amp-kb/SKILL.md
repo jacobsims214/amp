@@ -368,9 +368,13 @@ amp_kb_annotate(project_id, path, text, author?)
 
 ### Annotation lifecycle
 
-- Each annotation has an `IsResolved` field (default: `false`)
-- Curators mark annotations as resolved when the information has been integrated into the KB
-- Resolved annotations remain in the record but are marked as completed
+- Each annotation has an `is_resolved` field (default: `false`)
+- Once a note's correction is worked into the doc (rewrite it with `amp_kb_write` — rewrites keep
+  the annotations), mark it resolved: `amp_kb_resolve_annotation(path, index)`. `index` is its
+  position in `amp_kb_get`'s `annotations`, 0-based, oldest first. `resolved=false` reopens it.
+- Resolved annotations stay on the doc as a record (with `resolved_by` / `resolved_at`), but search
+  previews (`latest_annotation`) show only unresolved ones
+- Resolving needs write access to the KB; in an org KB that's org owners and admins
 
 ## Knowledge Discovery
 
@@ -416,4 +420,7 @@ amp_kb_reindex {project_id}
 
 amp_kb_annotate {project_id, path, text, author?}
   → adds an annotation to the document
+
+amp_kb_resolve_annotation {project_id, path, index, resolved?}
+  → marks annotation `index` (0-based, oldest first) resolved, or reopens it with resolved=false
 ```

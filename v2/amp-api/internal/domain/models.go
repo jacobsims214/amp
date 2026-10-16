@@ -315,6 +315,9 @@ type KBAnnotation struct {
 	Text       string `json:"text"`
 	CreatedAt  int64  `json:"created_at"`
 	IsResolved bool   `json:"is_resolved"`
+	// Who resolved it and when, once the note has been worked into the doc.
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	ResolvedAt int64  `json:"resolved_at,omitempty"`
 }
 
 // ---- Auth / users ----

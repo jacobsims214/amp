@@ -192,6 +192,9 @@ export const api = {
     get<{ tags: KBTagCount[] }>(`/kb/tags?${kbQuery(ref)}`).then(r => r.tags ?? []),
   kbAnnotate: (ref: KBRef, path: string, text: string) =>
     post<KBAnnotation>(`/kb/annotate?${kbQuery(ref)}`, { path, text }),
+  /** index: the annotation's position in doc.annotations (oldest first) */
+  kbResolveAnnotation: (ref: KBRef, path: string, index: number, resolved: boolean) =>
+    post<KBDoc>(`/kb/resolve?${kbQuery(ref)}`, { path, index, resolved }),
 
   // Actions
   dispatchTask: (taskId: number, agentId = 'amp-worker') =>

@@ -479,6 +479,17 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"author": str("Optional. Who is annotating (defaults to you)."),
 		})), wrap(ctx, s.open(s.kbAnnotate)))
 
+	mcp.AddTool(tool("amp_kb_resolve_annotation",
+		"Mark an annotation on a KB doc resolved, once its correction or note has been worked into the doc "+
+			"(rewrite the doc with amp_kb_write first). Pass resolved=false to reopen one. Resolved annotations stay "+
+			"on the doc as a record, but search previews show only unresolved ones. Needs write access to the KB "+
+			"(for an org KB: org owners and admins).",
+		kbArgs(props{
+			"path":     str("REQUIRED. Document path, e.g. 'architecture/auth.md'."),
+			"index":    num("REQUIRED. The annotation's position in the doc's annotations from amp_kb_get, 0-based, oldest first."),
+			"resolved": boolean("Optional. true (default) to resolve, false to reopen."),
+		})), wrap(ctx, s.open(s.kbResolveAnnotation)))
+
 	mcp.AddTool(tool("amp_kb_status",
 		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution (project KB unless scope says otherwise). Use this to assess KB health before curator maintenance.",
 		kbArgs(nil)), wrap(ctx, s.open(s.kbStatus)))
@@ -1789,6 +1800,33 @@ func (s *Server) kbAnnotate(ctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	return jsonResult(ann)
+}
+
+func (s *Server) kbResolveAnnotation(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
+	if err != nil {
+		return nil, err
+	}
+	path, err := reqStr(args, "path")
+	if err != nil {
+		return nil, err
+	}
+	index, err := reqInt(args, "index")
+	if err != nil {
+		return nil, err
+	}
+	resolved := true
+	if v, ok := args["resolved"].(bool); ok {
+		resolved = v
+	}
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	doc, err := s.kb.ResolveAnnotation(ctx, k.Scope, path, index, resolved, authorOf(ctx, map[string]interface{}{}))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"path": doc.Path, "annotations": doc.Annotations})
 }
 
 func (s *Server) kbStatus(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

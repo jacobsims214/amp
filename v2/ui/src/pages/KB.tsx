@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import {
   Plus, Search, FileText, Tag, Trash2, Edit3, Save, X,
   Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
-  ArrowLeft, Building2, Users, Lock, Info,
+  ArrowLeft, Building2, Users, Lock, Info, CheckCircle2, RotateCcw,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api/client'
@@ -693,6 +693,19 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
     }
   }
 
+  const [resolving, setResolving] = useState<number | null>(null)
+  const setResolved = async (index: number, resolved: boolean) => {
+    setResolving(index)
+    setAnnError(null)
+    try {
+      setSelectedDoc(await api.kbResolveAnnotation(kbRef, doc.path, index, resolved))
+    } catch (e) {
+      setAnnError(e instanceof Error ? e.message : 'Update failed')
+    } finally {
+      setResolving(null)
+    }
+  }
+
   const formatDate = (timestamp: number) => {
     const date = new Date(timestamp * 1000)
     const now = new Date()
@@ -849,15 +862,33 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                         <span className="font-semibold text-[#DDE6F0]">{ann.author}</span>
                         <span className="text-[#3D5068]">{formatDate(ann.created_at)}</span>
                       </div>
-                      <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                        ann.is_resolved 
-                          ? 'text-[#10B981]' 
-                          : 'text-[#F59E0B]'
-                      }`} style={{ background: ann.is_resolved ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.12)' }}>
-                        {ann.is_resolved ? 'Resolved' : 'Unresolved'}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                          ann.is_resolved
+                            ? 'text-[#10B981]'
+                            : 'text-[#F59E0B]'
+                        }`} style={{ background: ann.is_resolved ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.12)' }}>
+                          {ann.is_resolved ? 'Resolved' : 'Unresolved'}
+                        </span>
+                        {canWrite && (
+                          <button
+                            onClick={() => setResolved(idx, !ann.is_resolved)}
+                            disabled={resolving !== null}
+                            title={ann.is_resolved ? 'Reopen this note' : 'Mark resolved once the doc reflects this note'}
+                            className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer disabled:opacity-50"
+                          >
+                            {resolving === idx ? <Loader2 size={10} className="animate-spin" /> : ann.is_resolved ? <RotateCcw size={10} /> : <CheckCircle2 size={10} />}
+                            {ann.is_resolved ? 'Reopen' : 'Resolve'}
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <p className="text-[#7E91A8] leading-relaxed whitespace-pre-wrap">{ann.text}</p>
+                    <p className={`leading-relaxed whitespace-pre-wrap ${ann.is_resolved ? 'text-[#3D5068]' : 'text-[#7E91A8]'}`}>{ann.text}</p>
+                    {ann.is_resolved && ann.resolved_by && (
+                      <p className="text-[10px] text-[#3D5068] mt-1.5">
+                        Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${formatDate(ann.resolved_at)}` : ''}
+                      </p>
+                    )}
                   </div>
                 ))}
               </div>

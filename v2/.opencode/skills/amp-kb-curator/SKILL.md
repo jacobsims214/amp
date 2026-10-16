@@ -31,8 +31,10 @@ For each stale doc (> 90 days without update):
 For docs with unresolved annotations:
 1. Read the full doc and its annotations
 2. Integrate each annotation's correction into the doc content
-3. Rewrite the doc with the corrections applied
-4. Mark annotations as resolved (set IsResolved=true)
+3. Rewrite the doc with the corrections applied (`amp_kb_write` keeps the annotations)
+4. Mark each integrated annotation resolved: `amp_kb_resolve_annotation(path, index)`, where
+   `index` is its position in the doc's `annotations` (0-based, oldest first). Leave any you
+   didn't integrate unresolved.
 
 ## Operation 4: Merge
 
