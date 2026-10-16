@@ -780,9 +780,18 @@ func TestE2E(t *testing.T) {
 		e.mustTool(t, mateTok, "amp_complete_task", map[string]any{"task_id": handoff})
 		t.Log("claim, assign, and owner-only work enforced over MCP ✓")
 
-		// Open reassign (on by default): the teammate, a plain member, can take
-		// over the admin's ticket while nobody is working it, but not once the
-		// admin has started it, and not after a project owner turns it off.
+		// Open reassign (on by default): a plain member can take over the
+		// admin's ticket while nobody is working it, but not once the admin
+		// has started it, and not after a project owner turns it off. The
+		// teammate's team owns the project, so for this check another team
+		// takes ownership and Builders becomes a member team.
+		projTeams := func(args map[string]any) {
+			args["project_id"] = pid
+			e.mustTool(t, adminTok, "amp_manage_project_teams", args)
+		}
+		stewards := e.mustTool(t, adminTok, "amp_manage_teams", map[string]any{"action": "create", "org_id": orgID, "name": "Stewards"})["team"].(map[string]any)
+		projTeams(map[string]any{"action": "link", "team_id": num(stewards, "id"), "role": "owner"})
+		projTeams(map[string]any{"action": "link", "team_id": teamID, "role": "member"})
 		takeover := mk(adminTok, "take me over", "")
 		running := mk(adminTok, "admin is on it", "")
 		e.mustTool(t, adminTok, "amp_dispatch_task", map[string]any{"task_id": running, "agent_id": "admin-agent"})
@@ -799,6 +808,8 @@ func TestE2E(t *testing.T) {
 			t.Fatalf("teammate took over a ticket with open reassign off: %v", err)
 		}
 		e.mustTool(t, adminTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": true})
+		projTeams(map[string]any{"action": "link", "team_id": teamID, "role": "owner"})
+		projTeams(map[string]any{"action": "unlink", "team_id": num(stewards, "id")})
 		t.Log("open reassign: members take over idle tickets, not in-progress ones; owners can turn it off ✓")
 
 		// The same rules through the UI's REST API, signed in as the teammate.
