@@ -9,6 +9,8 @@ import { TaskDrawer } from '../components/TaskDrawer'
 import { FilterBar } from '../components/FilterBar'
 import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
 import { CrudModal } from '../components/CrudModal'
+import { MetadataEditor } from '../components/MetadataEditor'
+import { metadataPatch } from '../lib/metadata'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { ProjectNav } from '../components/ProjectNav'
 import { OwnerStack } from '../components/OwnerAvatar'
@@ -16,7 +18,7 @@ import { OwnersEditor } from '../components/OwnersEditor'
 import { TeamAccessModal } from '../components/TeamAccessModal'
 import { api } from '../api/client'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
-import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess } from '../types'
+import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata } from '../types'
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
@@ -186,16 +188,38 @@ export function Board() {
 
   const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
-  const openEpicModal = (m: { mode: 'create' | 'edit'; epic?: Epic }) => { setEpicError(null); setEpicModal(m) }
-  const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => { setStoryError(null); setStoryModal(m) }
+  // Metadata being edited in the epic / story dialog: what it started as,
+  // the edited value, and what the item inherits (shown read-only).
+  type MetaDraft = { initial?: Metadata; value: Metadata; error: string | null; inherited?: Metadata }
+  const [epicMeta, setEpicMeta] = useState<MetaDraft>({ value: {}, error: null })
+  const [storyMeta, setStoryMeta] = useState<MetaDraft>({ value: {}, error: null })
+  const startMeta = (set: React.Dispatch<React.SetStateAction<MetaDraft>>, own: Metadata | undefined, inherited: Promise<Metadata>) => {
+    set({ initial: own ?? {}, value: own ?? {}, error: null })
+    // Keep any edits already made while the inherited fields load.
+    inherited.then(inh => set(d => ({ ...d, inherited: inh }))).catch(() => {})
+  }
+  const projectMeta = () => api.getProject(pid).then(p => p.metadata ?? {})
+
+  const openEpicModal = (m: { mode: 'create' | 'edit'; epic?: Epic }) => {
+    setEpicError(null); setEpicModal(m)
+    startMeta(setEpicMeta, m.epic?.metadata, m.epic ? api.inheritedMetadata('epic', m.epic.id) : projectMeta())
+  }
+  const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => {
+    setStoryError(null); setStoryModal(m)
+    const parent = m.epicId != null ? epics.find(e => e.id === m.epicId) : undefined
+    startMeta(setStoryMeta, m.story?.metadata, m.story
+      ? api.inheritedMetadata('story', m.story.id)
+      : parent ? api.inheritedMetadata('epic', parent.id).then(inh => ({ ...inh, ...(parent.metadata ?? {}) })) : projectMeta())
+  }
 
   const handleEpicSave = async () => {
     if (!epicForm.name.trim()) return
+    if (epicMeta.error) { setEpicError(epicMeta.error); return }
     setEpicSaving(true)
     setEpicError(null)
     try {
-      if (epicModal?.mode === 'create') await api.createEpic(pid, epicForm)
-      else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, epicForm)
+      if (epicModal?.mode === 'create') await api.createEpic(pid, { ...epicForm, metadata: epicMeta.value })
+      else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, { ...epicForm, metadata: metadataPatch(epicMeta.initial, epicMeta.value) })
       setEpicModal(null); refresh()
     } catch (e) {
       setEpicError(errMsg(e, 'Save failed'))
@@ -213,11 +237,12 @@ export function Board() {
 
   const handleStorySave = async () => {
     if (!storyForm.name.trim()) return
+    if (storyMeta.error) { setStoryError(storyMeta.error); return }
     setStorySaving(true)
     setStoryError(null)
     try {
-      if (storyModal?.mode === 'create' && storyModal.epicId) await api.createStory(storyModal.epicId, storyForm)
-      else if (storyModal?.story) await api.updateStory(storyModal.story.id, storyForm)
+      if (storyModal?.mode === 'create' && storyModal.epicId) await api.createStory(storyModal.epicId, { ...storyForm, metadata: storyMeta.value })
+      else if (storyModal?.story) await api.updateStory(storyModal.story.id, { ...storyForm, metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
       setStoryModal(null); refresh()
     } catch (e) {
       setStoryError(errMsg(e, 'Save failed'))
@@ -631,6 +656,9 @@ export function Board() {
                   onRemove={async id => applyEpic(await api.removeEpicOwner(editingEpic.id, id))}
                 /></div>
             )}
+            <div><label className={labelCls}>Metadata</label>
+              <MetadataEditor key={epicModal.epic?.id ?? 'new'} initial={epicMeta.initial} inherited={epicMeta.inherited}
+                onChange={(value, error) => setEpicMeta(m => ({ ...m, value, error }))} /></div>
             {epicError && <p className="text-xs text-[#F87171]">{epicError}</p>}
           </div>
         </CrudModal>
@@ -668,6 +696,9 @@ export function Board() {
                   onRemove={async id => applyStory(await api.removeStoryOwner(editingStory.id, id))}
                 /></div>
             )}
+            <div><label className={labelCls}>Metadata</label>
+              <MetadataEditor key={storyModal.story?.id ?? `new-${storyModal.epicId}`} initial={storyMeta.initial} inherited={storyMeta.inherited}
+                onChange={(value, error) => setStoryMeta(m => ({ ...m, value, error }))} /></div>
             {storyError && <p className="text-xs text-[#F87171]">{storyError}</p>}
           </div>
         </CrudModal>

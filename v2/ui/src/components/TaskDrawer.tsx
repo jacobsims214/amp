@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus } from 'lucide-react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check } from 'lucide-react'
 import { api } from '../api/client'
 import { StatusBadge } from './StatusBadge'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata } from '../types'
+import { MetadataEditor } from './MetadataEditor'
+import { metadataPatch } from '../lib/metadata'
 
 interface Props {
   task: Task | null
@@ -453,6 +455,53 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
   )
 }
 
+// A ticket's metadata (e.g. its jira_key), with what it inherits from its
+// project, epic, and story.
+function TaskMetadata({ task, canEdit, onSaved }: { task: Task; canEdit: boolean; onSaved?: () => void }) {
+  const [inherited, setInherited] = useState<Metadata | undefined>()
+  const [initial, setInitial] = useState<Metadata>(task.metadata ?? {})
+  const [draft, setDraft] = useState<{ value: Metadata; error: string | null }>({ value: task.metadata ?? {}, error: null })
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const patch = metadataPatch(initial, draft.value)
+
+  useEffect(() => {
+    api.inheritedMetadata('task', task.id).then(setInherited).catch(() => setInherited(undefined))
+  }, [task.id])
+
+  const save = async () => {
+    if (draft.error || !patch) return
+    setSaving(true)
+    setError(null)
+    try {
+      await api.updateTask(task.id, { metadata: patch })
+      setInitial(draft.value)
+      onSaved?.()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Save failed')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div>
+      <div className="flex items-center justify-between mb-2">
+        <div className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest">Metadata</div>
+        {canEdit && patch && (
+          <button onClick={save} disabled={saving || !!draft.error}
+            className="text-xs text-[#818CF8] hover:text-[#6366F1] flex items-center gap-1 transition-colors cursor-pointer disabled:opacity-50">
+            {saving ? <Loader2 size={10} className="animate-spin" /> : <Check size={10} />}Save
+          </button>
+        )}
+      </div>
+      <MetadataEditor initial={task.metadata} inherited={inherited} readOnly={!canEdit}
+        onChange={(value, error) => setDraft({ value, error })} />
+      {error && <p className="text-xs text-[#F87171] mt-1">{error}</p>}
+    </div>
+  )
+}
+
 function DetailsTab({ task, onClose, onRefresh, canWork }: { task: Task; onClose: () => void; onRefresh?: () => void; canWork: boolean }) {
   const [editingSchedule, setEditingSchedule] = useState(false)
   const [scheduleValue, setScheduleValue] = useState('')
@@ -502,6 +551,8 @@ function DetailsTab({ task, onClose, onRefresh, canWork }: { task: Task; onClose
           <MetaItem label="Depends on" value={task.dependency_ids.map(id => `#${id}`).join(', ')} />
         )}
       </div>
+
+      <TaskMetadata key={task.id} task={task} canEdit={canWork} onSaved={onRefresh} />
 
       {/* Scheduled Start */}
       <div>

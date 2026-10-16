@@ -11,6 +11,8 @@ export interface Project {
   created_by?: number | null
   /** any project member may reassign tickets that aren't in progress */
   open_reassign?: boolean
+  /** free-form key/value data for integrations (its own, not inherited) */
+  metadata?: Metadata
   created_at: string
   updated_at: string
 }
@@ -24,6 +26,8 @@ export interface Epic {
   priority: Priority
   created_by?: number | null
   owner_ids?: number[]
+  /** free-form key/value data for integrations (its own, not inherited) */
+  metadata?: Metadata
   created_at: string
   updated_at: string
 }
@@ -39,6 +43,8 @@ export interface Story {
   priority: Priority
   created_by?: number | null
   owner_ids?: number[]
+  /** free-form key/value data for integrations (its own, not inherited) */
+  metadata?: Metadata
   created_at: string
   updated_at: string
 }
@@ -63,6 +69,8 @@ export interface Task {
   start_at?: string       // RFC3339 UTC timestamp for scheduled tasks
   created_by?: number | null     // AMP user who created the ticket (null for legacy rows)
   owner_user_id?: number | null  // the one human owner; null = unassigned ("pool")
+  /** free-form key/value data for integrations (its own, not inherited) */
+  metadata?: Metadata
   created_at: string
   updated_at: string
 }
@@ -85,6 +93,74 @@ export interface ActivityLog {
   to_state?: string
   detail?: string
   created_at: string
+}
+
+// ---- Metadata ----
+
+export type MetadataValue = string | number | boolean
+/** Free-form key/value data on a project, epic, story, or ticket. */
+export type Metadata = Record<string, MetadataValue>
+/** A change to metadata: a value sets a key, null removes it. */
+export type MetadataPatch = Record<string, MetadataValue | null>
+
+// ---- Daily reports ----
+
+export interface DayReportItem {
+  task_id: number
+  ref: string
+  name: string
+  state: string
+  project_id: number
+  project_code: string
+  project_name: string
+  epic_id: number
+  epic_name: string
+  story_id: number
+  story_name: string
+  block_reason?: string
+  completed_at?: string
+  cycle_time_hours?: number
+  metadata: Metadata
+}
+
+export interface DayReportData {
+  completed: DayReportItem[]
+  started: DayReportItem[]
+  created: DayReportItem[]
+  in_progress: DayReportItem[]
+  blocked: DayReportItem[]
+  touched: DayReportItem[]
+  stats: {
+    completed: number
+    started: number
+    created: number
+    in_progress: number
+    blocked: number
+    projects: number
+    avg_cycle_hours?: number
+  }
+  generated_at: string
+}
+
+export interface DayReport {
+  user_id: number
+  user_email: string
+  user_name: string
+  day: string
+  tz: string
+  summary: string
+  data: DayReportData
+  saved: boolean
+  created_at?: string
+  updated_at?: string
+  markdown: string
+  hidden_items?: number
+}
+
+export interface VelocityDay {
+  day: string
+  completed: number
+  by_project: Record<string, number>
 }
 
 // ---- KB types ----
@@ -204,12 +280,14 @@ export interface CreateEpicRequest {
   name: string
   description?: string
   priority?: string
+  metadata?: Metadata
 }
 
 export interface UpdateEpicRequest {
   name?: string
   description?: string
   priority?: string
+  metadata?: MetadataPatch
 }
 
 export interface CreateStoryRequest {
@@ -217,6 +295,7 @@ export interface CreateStoryRequest {
   description?: string
   acceptance_criteria?: string
   priority?: string
+  metadata?: Metadata
 }
 
 export interface UpdateStoryRequest {
@@ -224,6 +303,7 @@ export interface UpdateStoryRequest {
   description?: string
   acceptance_criteria?: string
   priority?: string
+  metadata?: MetadataPatch
 }
 
 export interface CreateTaskRequest {
@@ -238,6 +318,7 @@ export interface CreateTaskRequest {
   start_at?: string
   /** omit = me; "none" = unassigned; or a project member's email / user id */
   owner?: string
+  metadata?: Metadata
 }
 
 export interface UpdateTaskRequest {
@@ -247,6 +328,7 @@ export interface UpdateTaskRequest {
   assigned_to?: string
   priority?: string
   start_at?: string | null
+  metadata?: MetadataPatch
 }
 
 // ---- Auth / users ----
