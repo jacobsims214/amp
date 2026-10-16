@@ -31,7 +31,7 @@ type restAs struct {
 func newRestAs(t *testing.T, w *rbacWorld) *restAs {
 	t.Helper()
 	mux := http.NewServeMux()
-	api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, nil).Register(mux)
+	api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb).Register(mux)
 	ra := &restAs{w: w, ids: map[string]*auth.Identity{
 		"owner": w.owner, "alice": w.alice, "bob": w.bob, "lead": w.lead, "carol": w.carol,
 		"dave": w.dave, "orgadmin": w.orgadmin, "outsider": w.outsider, "root": w.root,

@@ -57,6 +57,13 @@ type Project struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
+// ProjectSettings is a change to a project's settings; nil fields are kept.
+type ProjectSettings struct {
+	Name         *string `json:"name"`
+	Description  *string `json:"description"`
+	OpenReassign *bool   `json:"open_reassign"`
+}
+
 type Epic struct {
 	ID          int       `json:"id"`
 	ProjectID   int       `json:"project_id"`
@@ -294,11 +301,23 @@ type ExportTask struct {
 
 // ExportKBDoc represents a knowledge base document for export.
 type ExportKBDoc struct {
-	Path    string   `json:"path"`
-	Title   string   `json:"title"`
-	Content string   `json:"content"`
-	Tags    []string `json:"tags"`
-	Author  string   `json:"author"`
+	Path        string         `json:"path"`
+	Title       string         `json:"title"`
+	Content     string         `json:"content"`
+	Tags        []string       `json:"tags"`
+	Author      string         `json:"author"`
+	Annotations []KBAnnotation `json:"annotations,omitempty"`
+}
+
+// KBAnnotation is a note left on a KB doc (kb.Annotation).
+type KBAnnotation struct {
+	Author     string `json:"author"`
+	Text       string `json:"text"`
+	CreatedAt  int64  `json:"created_at"`
+	IsResolved bool   `json:"is_resolved"`
+	// Who resolved it and when, once the note has been worked into the doc.
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	ResolvedAt int64  `json:"resolved_at,omitempty"`
 }
 
 // ---- Auth / users ----

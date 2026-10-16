@@ -206,10 +206,20 @@ func (r *Repo) RestoreProject(ctx context.Context, id int) (*domain.Project, err
 
 // SetProjectOpenReassign turns the project's open-reassign setting on or off.
 func (r *Repo) SetProjectOpenReassign(ctx context.Context, id int, on bool) (*domain.Project, error) {
+	return r.UpdateProject(ctx, id, domain.ProjectSettings{OpenReassign: &on})
+}
+
+// UpdateProject changes the settings that are set (nil fields are kept).
+func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettings) (*domain.Project, error) {
 	p := &domain.Project{}
 	err := scanProject(r.db.QueryRow(ctx,
-		`UPDATE projects SET open_reassign = $1, updated_at = NOW() WHERE id = $2 RETURNING `+projectCols,
-		on, id,
+		`UPDATE projects SET
+		   name = COALESCE($2, name),
+		   description = COALESCE($3, description),
+		   open_reassign = COALESCE($4, open_reassign),
+		   updated_at = NOW()
+		 WHERE id = $1 RETURNING `+projectCols,
+		id, u.Name, u.Description, u.OpenReassign,
 	), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)

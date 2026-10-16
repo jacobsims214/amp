@@ -1,16 +1,18 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowLeft, LayoutGrid, BookOpen, GitBranch, BarChart2 } from 'lucide-react'
+import { ArrowLeft, LayoutGrid, BookOpen, GitBranch, BarChart2, Settings } from 'lucide-react'
 import { api } from '../api/client'
 import type { Project } from '../types'
 
-export type ProjectView = 'board' | 'kb' | 'dag' | 'report'
+export type ProjectView = 'board' | 'kb' | 'dag' | 'report' | 'settings'
 
 interface ProjectNavProps {
   projectId: number
   currentView: ProjectView
   /** Page-specific controls rendered on the right side of the nav bar */
   rightSlot?: React.ReactNode
+  /** The project, when the page already has a fresher copy (e.g. after a rename) */
+  project?: Project | null
 }
 
 const TABS: { view: ProjectView; label: string; icon: React.ReactNode; path: (id: number) => string }[] = [
@@ -18,10 +20,12 @@ const TABS: { view: ProjectView; label: string; icon: React.ReactNode; path: (id
   { view: 'kb',     label: 'KB',     icon: <BookOpen   size={13} />, path: id => `/project/${id}/kb` },
   { view: 'dag',    label: 'DAG',    icon: <GitBranch  size={13} />, path: id => `/project/${id}/dag` },
   { view: 'report', label: 'Report', icon: <BarChart2  size={13} />, path: id => `/project/${id}/report` },
+  { view: 'settings', label: 'Settings', icon: <Settings size={13} />, path: id => `/project/${id}/settings` },
 ]
 
-export function ProjectNav({ projectId, currentView, rightSlot }: ProjectNavProps) {
-  const [project, setProject] = useState<Project | null>(null)
+export function ProjectNav({ projectId, currentView, rightSlot, project: given }: ProjectNavProps) {
+  const [loaded, setProject] = useState<Project | null>(null)
+  const project = given ?? loaded
 
   useEffect(() => {
     api.getProject(projectId).then(setProject).catch(() => null)

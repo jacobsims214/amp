@@ -25,7 +25,7 @@ one feature with no obvious entry point — scheduling.
 - **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`, `amp_claim_task`, `amp_assign_task`
 - **People**: `amp_whoami`, `amp_list_project_members`
 - **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_create_org`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
-- **Knowledge base**: `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex` — see `amp-kb` skill for how to use these well
+- **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
 
 ---
 

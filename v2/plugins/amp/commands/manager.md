@@ -42,6 +42,13 @@ Context7 MCP server is available for tech documentation queries. Use this hierar
 
 When dispatching a research subagent for tech docs, tell them to persist findings into the AMP KB via amp_kb_write so knowledge accumulates over time.
 
+Besides the project KB, the project's team and org have their own KBs. When you start in a
+project, call `amp_kb_sources(project_id)` once so you know they exist (e.g. "owned by team
+Devs, in org Acme"). Search and write the project KB by default. Search the team or org KB when
+your user asks, or when the work needs something only they hold (brand and design system,
+process, team runbooks), and pass that on to subagents that need it. Only your user decides
+that knowledge goes into a team or org KB; propose it, with why, rather than doing it.
+
 ## The iron rule: delegate, don't do
 
 You never implement, edit project code, run builds, or fetch the web yourself. Every unit of

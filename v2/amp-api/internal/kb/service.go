@@ -1,7 +1,9 @@
-// Package kb manages the per-project knowledge base backed by Typesense.
+// Package kb manages the knowledge bases backed by Typesense: one per
+// project, plus one per team and one per org for knowledge shared across
+// projects (see docs/kb-scopes-design.md).
 //
 // Architecture:
-//   - One Typesense collection per project: "kb_{project_id}"
+//   - One Typesense collection per KB: "kb_{project_id}", "kb_team_{id}", "kb_org_{id}"
 //   - Documents are chunked (~500 tokens) for precise retrieval
 //   - Typesense auto-embeds via Ollama at index AND query time (no vectors in Go code)
 //   - Hybrid search (keyword + semantic) with rank fusion
@@ -26,6 +28,7 @@ import (
 	"github.com/typesense/typesense-go/v4/typesense/api"
 	"github.com/typesense/typesense-go/v4/typesense/api/pointer"
 
+	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/queue"
 )
 
@@ -67,29 +70,32 @@ func New(typesenseURL, typesenseKey, ollamaURL, ollamaModel string) *Service {
 // ---- Public domain types ----
 
 type Doc struct {
-	ID          string      `json:"id"` // sha256(project_id:path)
-	ProjectID   int         `json:"project_id"`
-	Path        string      `json:"path"` // e.g. "architecture/auth.md"
-	Title       string      `json:"title"`
-	Content     string      `json:"content"` // full raw markdown
-	Tags        []string    `json:"tags"`
-	Author      string      `json:"author"`
-	ChunkIndex  int         `json:"chunk_index"` // 0 for the canonical doc record
-	ChunkText   string      `json:"chunk_text"`  // the searchable portion
-	UpdatedAt   int64       `json:"updated_at"`  // unix timestamp
+	ID        string `json:"id"`         // sha256(project_id:path)
+	ProjectID int    `json:"project_id"` // 0 in team and org KBs
+	Scope     string `json:"scope"`
+	ScopeID   int    `json:"scope_id"`
+	// Reason records why a doc was placed in a team or org KB rather than a
+	// project's.
+	Reason      string       `json:"reason,omitempty"`
+	Path        string       `json:"path"` // e.g. "architecture/auth.md"
+	Title       string       `json:"title"`
+	Content     string       `json:"content"` // full raw markdown
+	Tags        []string     `json:"tags"`
+	Author      string       `json:"author"`
+	ChunkIndex  int          `json:"chunk_index"` // 0 for the canonical doc record
+	ChunkText   string       `json:"chunk_text"`  // the searchable portion
+	UpdatedAt   int64        `json:"updated_at"`  // unix timestamp
 	Annotations []Annotation `json:"annotations"`
 }
 
-type Annotation struct {
-	Author      string `json:"author"`
-	Text        string `json:"text"`
-	CreatedAt   int64  `json:"created_at"`
-	IsResolved  bool   `json:"is_resolved"`
-}
+type Annotation = domain.KBAnnotation
 
 type DocSummary struct {
 	ID        string   `json:"id"`
 	ProjectID int      `json:"project_id"`
+	Scope     string   `json:"scope"`
+	ScopeID   int      `json:"scope_id"`
+	Reason    string   `json:"reason,omitempty"`
 	Path      string   `json:"path"`
 	Title     string   `json:"title"`
 	Tags      []string `json:"tags"`
@@ -98,16 +104,18 @@ type DocSummary struct {
 }
 
 type SearchResult struct {
-	Path            string   `json:"path"`
-	Title           string   `json:"title"`
-	Tags            []string `json:"tags"`
-	Excerpt         string   `json:"excerpt"` // best-matching chunk_text, trimmed
-	Author          string   `json:"author"`
-	UpdatedAt       int64    `json:"updated_at"`
-	Score           float64  `json:"score"`
-	AnnotationCount int      `json:"annotation_count"`
-	LatestAnnotation string  `json:"latest_annotation"`
-	RecencyLabel    string   `json:"recency_label"`
+	Scope            string   `json:"scope"`
+	ScopeID          int      `json:"scope_id"`
+	Path             string   `json:"path"`
+	Title            string   `json:"title"`
+	Tags             []string `json:"tags"`
+	Excerpt          string   `json:"excerpt"` // best-matching chunk_text, trimmed
+	Author           string   `json:"author"`
+	UpdatedAt        int64    `json:"updated_at"`
+	Score            float64  `json:"score"`
+	AnnotationCount  int      `json:"annotation_count"`
+	LatestAnnotation string   `json:"latest_annotation"`
+	RecencyLabel     string   `json:"recency_label"`
 }
 
 type TagCount struct {
@@ -117,22 +125,61 @@ type TagCount struct {
 
 // StatusInfo holds health metrics for the knowledge base.
 type StatusInfo struct {
-	TotalDocs           int            `json:"total_docs"`
-	StaleDocs           int            `json:"stale_docs"`
-	DocsWithAnnotations int            `json:"docs_with_annotations"`
-	TotalAnnotations    int            `json:"total_annotations"`
-	UnresolvedAnnotations int          `json:"unresolved_annotations"`
-	DocsByTag           map[string]int `json:"docs_by_tag"`
+	TotalDocs             int            `json:"total_docs"`
+	StaleDocs             int            `json:"stale_docs"`
+	DocsWithAnnotations   int            `json:"docs_with_annotations"`
+	TotalAnnotations      int            `json:"total_annotations"`
+	UnresolvedAnnotations int            `json:"unresolved_annotations"`
+	DocsByTag             map[string]int `json:"docs_by_tag"`
+}
+
+// ---- Scopes ----
+
+// Scope kinds: which knowledge base a call is about.
+const (
+	ScopeProject = "project"
+	ScopeTeam    = "team"
+	ScopeOrg     = "org"
+)
+
+// Scope names one knowledge base: a project's, a team's, or an org's.
+type Scope struct {
+	Kind string
+	ID   int
+}
+
+func Project(id int) Scope { return Scope{Kind: ScopeProject, ID: id} }
+func Team(id int) Scope    { return Scope{Kind: ScopeTeam, ID: id} }
+func Org(id int) Scope     { return Scope{Kind: ScopeOrg, ID: id} }
+
+func (sc Scope) String() string { return fmt.Sprintf("%s %d", sc.Kind, sc.ID) }
+
+// projectID is the value stored in documents' project_id field: the
+// project for a project KB, 0 for team and org KBs.
+func (sc Scope) projectID() int {
+	if sc.Kind == ScopeProject {
+		return sc.ID
+	}
+	return 0
 }
 
 // ---- Collection naming ----
 
-func collectionName(projectID int) string {
-	return fmt.Sprintf("kb_%d", projectID)
+// collectionName and docID keep the original project naming, so existing
+// project KBs are read and written exactly as before.
+func collectionName(sc Scope) string {
+	if sc.Kind == ScopeProject {
+		return fmt.Sprintf("kb_%d", sc.ID)
+	}
+	return fmt.Sprintf("kb_%s_%d", sc.Kind, sc.ID)
 }
 
-func docID(projectID int, path string, chunkIndex int) string {
-	h := sha256.Sum256([]byte(fmt.Sprintf("%d:%s:%d", projectID, path, chunkIndex)))
+func docID(sc Scope, path string, chunkIndex int) string {
+	key := fmt.Sprintf("%d:%s:%d", sc.ID, path, chunkIndex)
+	if sc.Kind != ScopeProject {
+		key = sc.Kind + ":" + key
+	}
+	h := sha256.Sum256([]byte(key))
 	return fmt.Sprintf("%x", h[:8]) // 16 hex chars, short and stable
 }
 
@@ -140,8 +187,8 @@ func docID(projectID int, path string, chunkIndex int) string {
 
 // ensureCollection creates the Typesense collection for a project if it doesn't exist.
 // Safe to call on every write — checks existence first.
-func (s *Service) ensureCollection(ctx context.Context, projectID int) error {
-	name := collectionName(projectID)
+func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
+	name := collectionName(sc)
 
 	// Check if it already exists.
 	_, err := s.client.Collection(name).Retrieve(ctx)
@@ -205,7 +252,7 @@ func (s *Service) ensureCollection(ctx context.Context, projectID int) error {
 	if err != nil {
 		return fmt.Errorf("create collection %s: %w", name, err)
 	}
-	s.log.Info("created KB collection", "project_id", projectID, "collection", name, "semantic", s.ollamaURL != "")
+	s.log.Info("created KB collection", "kb", sc.String(), "collection", name, "semantic", s.ollamaURL != "")
 	return nil
 }
 
@@ -214,7 +261,13 @@ func (s *Service) ensureCollection(ctx context.Context, projectID int) error {
 // WriteDoc upserts a document into the KB.
 // The doc is chunked automatically; Typesense generates embeddings via Ollama.
 // On subsequent writes to the same path, all old chunks are deleted and new ones inserted.
-func (s *Service) WriteDoc(ctx context.Context, projectID int, path, title, content, author string, tags []string) (*DocSummary, error) {
+//
+// reason says why a doc belongs in a team or org KB; it is stored with the doc.
+//
+// Rewriting a doc keeps its annotations. annotations, when non-empty, are
+// written as the doc's annotations instead (reindex and import carry them
+// over this way); when empty, the existing doc's annotations are kept.
+func (s *Service) WriteDoc(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
 	if tags == nil {
 		tags = []string{}
 	}
@@ -222,8 +275,11 @@ func (s *Service) WriteDoc(ctx context.Context, projectID int, path, title, cont
 	// Deterministic — computed the same way whether we write now or later,
 	// so callers get an immediate, correct summary either way.
 	summary := &DocSummary{
-		ID:        docID(projectID, path, 0),
-		ProjectID: projectID,
+		ID:        docID(sc, path, 0),
+		ProjectID: sc.projectID(),
+		Scope:     sc.Kind,
+		ScopeID:   sc.ID,
+		Reason:    reason,
 		Path:      path,
 		Title:     title,
 		Tags:      tags,
@@ -233,44 +289,75 @@ func (s *Service) WriteDoc(ctx context.Context, projectID int, path, title, cont
 
 	if s.queueClient != nil {
 		payload, err := json.Marshal(queue.WriteDocPayload{
-			ProjectID: projectID, Path: path, Title: title, Content: content, Author: author, Tags: tags,
+			ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID,
+			Path: path, Title: title, Content: content, Author: author, Tags: tags, Reason: reason,
+			Annotations: annotationsJSON(annotations),
 		})
 		if err == nil {
 			task := asynq.NewTask(queue.TypeKBWriteDoc, payload)
 			if _, err := s.queueClient.EnqueueContext(ctx, task, asynq.Queue(queue.QueueName)); err == nil {
-				s.log.Info("doc write enqueued", "project_id", projectID, "path", path)
+				s.log.Info("doc write enqueued", "kb", sc.String(), "path", path)
 				return summary, nil
 			} else {
-				s.log.Warn("enqueue failed, writing synchronously instead", "project_id", projectID, "path", path, "err", err)
+				s.log.Warn("enqueue failed, writing synchronously instead", "kb", sc.String(), "path", path, "err", err)
 			}
 		} else {
 			s.log.Warn("marshal enqueue payload failed, writing synchronously instead", "err", err)
 		}
 	}
 
-	if _, err := s.writeDocNow(ctx, projectID, path, title, content, author, tags); err != nil {
+	if _, err := s.writeDocNow(ctx, sc, path, title, content, author, tags, reason, annotations); err != nil {
 		return nil, err
 	}
 	return summary, nil
 }
 
+// annotationsJSON encodes annotations for a queued write ("" for none).
+func annotationsJSON(anns []Annotation) string {
+	if len(anns) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(anns)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // writeDocNow performs the actual Typesense indexing. Called either
 // directly (no queue configured — local dev without Valkey, or enqueue
 // itself failed) or by the asynq worker via HandleWriteDocTask.
-func (s *Service) writeDocNow(ctx context.Context, projectID int, path, title, content, author string, tags []string) (*DocSummary, error) {
-	if err := s.ensureCollection(ctx, projectID); err != nil {
+func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
+	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
 
-	col := collectionName(projectID)
+	col := collectionName(sc)
 	now := time.Now().Unix()
 
 	if tags == nil {
 		tags = []string{}
 	}
 
+	// A rewrite keeps the doc's annotations: read them before the old
+	// chunks go.
+	if len(annotations) == 0 {
+		if old, err := s.GetDoc(ctx, sc, path); err == nil {
+			annotations = old.Annotations
+		}
+	}
+	annJSON := "[]"
+	if len(annotations) > 0 {
+		b, err := json.Marshal(annotations)
+		if err != nil {
+			return nil, fmt.Errorf("encode annotations of %s: %w", path, err)
+		}
+		annJSON = string(b)
+	}
+	annCount, annLatest := len(annotations), getLatestAnnotation(annotations)
+
 	// Delete existing chunks for this path before inserting new ones.
-	_ = s.deleteByPath(ctx, col, projectID, path)
+	_ = s.deleteByPath(ctx, col, path)
 
 	// Chunk the content.
 	chunks := chunkMarkdown(content, 500) // ~500 tokens per chunk
@@ -281,22 +368,26 @@ func (s *Service) writeDocNow(ctx context.Context, projectID int, path, title, c
 	// Index each chunk via Upsert (create-or-update by id).
 	for i, chunk := range chunks {
 		doc := map[string]interface{}{
-			"id":                docID(projectID, path, i),
-			"project_id":        projectID,
-			"path":              path,
-			"title":             title,
-			"tags":              tags,
-			"author":            author,
-			"chunk_index":       i,
-			"chunk_text":        chunk,
-			"updated_at":        now,
-			"annotation_count":  0,
-			"latest_annotation": "",
+			"id":          docID(sc, path, i),
+			"project_id":  sc.projectID(),
+			"reason":      reason,
+			"path":        path,
+			"title":       title,
+			"tags":        tags,
+			"author":      author,
+			"chunk_index": i,
+			"chunk_text":  chunk,
+			"updated_at":  now,
+			// Every chunk carries the count and latest annotation so any
+			// search hit shows them; the annotations live on chunk 0.
+			"annotation_count":  annCount,
+			"latest_annotation": annLatest,
 			"annotations":       "[]",
 		}
-		// Only store the full content on the first chunk.
+		// Only store the full content and annotations on the first chunk.
 		if i == 0 {
 			doc["content"] = content
+			doc["annotations"] = annJSON
 		} else {
 			doc["content"] = ""
 		}
@@ -307,11 +398,14 @@ func (s *Service) writeDocNow(ctx context.Context, projectID int, path, title, c
 		}
 	}
 
-	s.log.Info("doc written", "project_id", projectID, "path", path, "chunks", len(chunks))
+	s.log.Info("doc written", "kb", sc.String(), "path", path, "chunks", len(chunks))
 
 	return &DocSummary{
-		ID:        docID(projectID, path, 0),
-		ProjectID: projectID,
+		ID:        docID(sc, path, 0),
+		ProjectID: sc.projectID(),
+		Scope:     sc.Kind,
+		ScopeID:   sc.ID,
+		Reason:    reason,
 		Path:      path,
 		Title:     title,
 		Tags:      tags,
@@ -323,22 +417,24 @@ func (s *Service) writeDocNow(ctx context.Context, projectID int, path, title, c
 // ---- Read ----
 
 // GetDoc retrieves a document by path, returning the full content (chunk_index=0).
-func (s *Service) GetDoc(ctx context.Context, projectID int, path string) (*Doc, error) {
-	col := collectionName(projectID)
-	id := docID(projectID, path, 0)
+func (s *Service) GetDoc(ctx context.Context, sc Scope, path string) (*Doc, error) {
+	col := collectionName(sc)
+	id := docID(sc, path, 0)
 
 	raw, err := s.client.Collection(col).Document(id).Retrieve(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("doc not found: %s/%s: %w", col, path, err)
 	}
-	return mapToDoc(raw), nil
+	doc := mapToDoc(raw)
+	doc.Scope, doc.ScopeID = sc.Kind, sc.ID
+	return doc, nil
 }
 
 // AnnotateDoc adds an annotation to a document.
 // The upsert only updates the annotations field on chunk_index=0.
 // Typesense will merge the fields.
-func (s *Service) AnnotateDoc(ctx context.Context, projectID int, path, text, author string) (*Annotation, error) {
-	doc, err := s.GetDoc(ctx, projectID, path)
+func (s *Service) AnnotateDoc(ctx context.Context, sc Scope, path, text, author string) (*Annotation, error) {
+	doc, err := s.GetDoc(ctx, sc, path)
 	if err != nil {
 		return nil, err
 	}
@@ -349,13 +445,47 @@ func (s *Service) AnnotateDoc(ctx context.Context, projectID int, path, text, au
 		IsResolved: false,
 	}
 	doc.Annotations = append(doc.Annotations, *ann)
+	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
+		return nil, fmt.Errorf("annotate doc %s: %w", path, err)
+	}
+	return ann, nil
+}
 
-	col := collectionName(projectID)
+// ResolveAnnotation marks a doc's annotation resolved (worked into the doc)
+// or, with resolved false, reopens it. index is the annotation's position in
+// the doc's annotations, oldest first, as amp_kb_get returns them;
+// annotations are only ever appended, so positions don't change.
+func (s *Service) ResolveAnnotation(ctx context.Context, sc Scope, path string, index int, resolved bool, by string) (*Doc, error) {
+	doc, err := s.GetDoc(ctx, sc, path)
+	if err != nil {
+		return nil, err
+	}
+	if index < 0 || index >= len(doc.Annotations) {
+		return nil, fmt.Errorf("%s has %d annotations; index %d is out of range (0-based, oldest first)", path, len(doc.Annotations), index)
+	}
+	a := &doc.Annotations[index]
+	a.IsResolved = resolved
+	if resolved {
+		a.ResolvedBy, a.ResolvedAt = by, time.Now().Unix()
+	} else {
+		a.ResolvedBy, a.ResolvedAt = "", 0
+	}
+	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
+		return nil, fmt.Errorf("resolve annotation on %s: %w", path, err)
+	}
+	return doc, nil
+}
+
+// saveAnnotations stores doc's annotations on its first chunk and the
+// preview fields on every chunk, so search hits from any chunk show them.
+func (s *Service) saveAnnotations(ctx context.Context, sc Scope, doc *Doc) error {
+	col := collectionName(sc)
 	// Marshal annotations to JSON string for Typesense schema compliance
 	annJSON, _ := json.Marshal(doc.Annotations)
-	_, err = s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
+	_, err := s.client.Collection(col).Documents().Upsert(ctx, map[string]interface{}{
 		"id":                doc.ID,
 		"project_id":        doc.ProjectID,
+		"reason":            doc.Reason,
 		"path":              doc.Path,
 		"title":             doc.Title,
 		"content":           doc.Content,
@@ -369,31 +499,30 @@ func (s *Service) AnnotateDoc(ctx context.Context, projectID int, path, text, au
 		"latest_annotation": getLatestAnnotation(doc.Annotations),
 	}, &api.DocumentIndexParameters{})
 	if err != nil {
-		return nil, fmt.Errorf("annotate doc %s: %w", path, err)
+		return err
 	}
 
 	// Propagate annotation count and latest annotation to all other chunks
 	// so search results from any chunk show annotation data.
 	count := len(doc.Annotations)
 	latest := getLatestAnnotation(doc.Annotations)
-	propFilter := fmt.Sprintf("project_id:=%d && path:=%s && chunk_index:>0", projectID, path)
+	propFilter := fmt.Sprintf("path:=%s && chunk_index:>0", quoteFilter(doc.Path))
 	_, _ = s.client.Collection(col).Documents().Update(ctx, map[string]interface{}{
 		"annotation_count":  count,
 		"latest_annotation": latest,
 	}, &api.UpdateDocumentsParams{
 		FilterBy: &propFilter,
 	})
-
-	return ann, nil
+	return nil
 }
 
 // ListDocs returns summaries of all documents (no content).
 // Optionally filtered by tag.
-func (s *Service) ListDocs(ctx context.Context, projectID int, tag string) ([]DocSummary, error) {
-	if err := s.ensureCollection(ctx, projectID); err != nil {
+func (s *Service) ListDocs(ctx context.Context, sc Scope, tag string) ([]DocSummary, error) {
+	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
-	col := collectionName(projectID)
+	col := collectionName(sc)
 	perPage := 250
 
 	// Only fetch chunk_index=0 (canonical doc records)
@@ -427,6 +556,9 @@ func (s *Service) ListDocs(ctx context.Context, projectID int, tag string) ([]Do
 		out = append(out, DocSummary{
 			ID:        doc.ID,
 			ProjectID: doc.ProjectID,
+			Scope:     sc.Kind,
+			ScopeID:   sc.ID,
+			Reason:    doc.Reason,
 			Path:      doc.Path,
 			Title:     doc.Title,
 			Tags:      doc.Tags,
@@ -462,15 +594,15 @@ func computeRecencyLabel(t time.Time) string {
 // Excerpts are capped at 120 chars to keep MCP responses small for local LLMs.
 // recencyBoost controls secondary sorting by updated_at (higher = more weight to recency).
 // minRecencyDays filters out documents older than N days (0 = no filter).
-func (s *Service) Search(ctx context.Context, projectID int, query string, tags []string, limit int, recencyBoost float64, minRecencyDays int) ([]SearchResult, error) {
-	if err := s.ensureCollection(ctx, projectID); err != nil {
+func (s *Service) Search(ctx context.Context, sc Scope, query string, tags []string, limit int, recencyBoost float64, minRecencyDays int) ([]SearchResult, error) {
+	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
 		limit = 3 // small default — agents call this from limited-context models
 	}
 
-	col := collectionName(projectID)
+	col := collectionName(sc)
 
 	filterBy := "chunk_index:>=0" // include all chunks
 	if len(tags) > 0 {
@@ -489,7 +621,7 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 		sortBy += ",updated_at:desc"
 	}
 
-	hasEmbedding := s.collectionHasEmbedding(ctx, collectionName(projectID))
+	hasEmbedding := s.collectionHasEmbedding(ctx, collectionName(sc))
 
 	// When using a remote embedder (Ollama), include embedding in query_by
 	// and set prefix=false (required for remote embedders).
@@ -559,6 +691,8 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 		}
 
 		out = append(out, SearchResult{
+			Scope:            sc.Kind,
+			ScopeID:          sc.ID,
 			Path:             doc.Path,
 			Title:            doc.Title,
 			Tags:             doc.Tags,
@@ -574,14 +708,38 @@ func (s *Service) Search(ctx context.Context, projectID int, query string, tags 
 	return out, nil
 }
 
+// CountDocs returns how many documents a KB holds, 0 if nothing has ever
+// been written to it. Unlike the other reads it doesn't create the
+// collection.
+func (s *Service) CountDocs(ctx context.Context, sc Scope) (int, error) {
+	q := "*"
+	perPage := 0
+	res, err := s.client.Collection(collectionName(sc)).Documents().Search(ctx, &api.SearchCollectionParams{
+		Q:        &q,
+		QueryBy:  pointer.String("title"),
+		FilterBy: pointer.String("chunk_index:=0"),
+		PerPage:  &perPage,
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("count docs: %w", err)
+	}
+	if res.Found == nil {
+		return 0, nil
+	}
+	return *res.Found, nil
+}
+
 // ---- Tags ----
 
 // ListTags returns all tags in a project's KB with their document counts.
-func (s *Service) ListTags(ctx context.Context, projectID int) ([]TagCount, error) {
-	if err := s.ensureCollection(ctx, projectID); err != nil {
+func (s *Service) ListTags(ctx context.Context, sc Scope) ([]TagCount, error) {
+	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
-	col := collectionName(projectID)
+	col := collectionName(sc)
 
 	q := "*"
 	filterBy := "chunk_index:=0"
@@ -630,13 +788,13 @@ func (s *Service) ListTags(ctx context.Context, projectID int) ([]TagCount, erro
 // KBStatus returns health metrics for the knowledge base.
 // This is an idempotent, read-only operation that provides doc counts,
 // stale doc counts, annotation statistics, and tag distribution.
-func (s *Service) KBStatus(ctx context.Context, projectID int) (*StatusInfo, error) {
-	if err := s.ensureCollection(ctx, projectID); err != nil {
+func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
+	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
 
 	// List all docs (no tag filter)
-	docs, err := s.ListDocs(ctx, projectID, "")
+	docs, err := s.ListDocs(ctx, sc, "")
 	if err != nil {
 		return nil, fmt.Errorf("list docs: %w", err)
 	}
@@ -655,7 +813,7 @@ func (s *Service) KBStatus(ctx context.Context, projectID int) (*StatusInfo, err
 	// Process each doc
 	for _, summary := range docs {
 		// Get full doc to access annotations
-		fullDoc, err := s.GetDoc(ctx, projectID, summary.Path)
+		fullDoc, err := s.GetDoc(ctx, sc, summary.Path)
 		if err != nil {
 			s.log.Warn("KBStatus: skip doc", "path", summary.Path, "err", err)
 			continue
@@ -686,7 +844,7 @@ func (s *Service) KBStatus(ctx context.Context, projectID int) (*StatusInfo, err
 	}
 
 	// Get tag distribution from ListTags
-	tagCounts, err := s.ListTags(ctx, projectID)
+	tagCounts, err := s.ListTags(ctx, sc)
 	if err != nil {
 		return nil, fmt.Errorf("list tags: %w", err)
 	}
@@ -697,41 +855,41 @@ func (s *Service) KBStatus(ctx context.Context, projectID int) (*StatusInfo, err
 	}
 
 	return &StatusInfo{
-		TotalDocs:           totalDocs,
-		StaleDocs:           staleDocs,
-		DocsWithAnnotations: docsWithAnnotations,
-		TotalAnnotations:    totalAnnotations,
+		TotalDocs:             totalDocs,
+		StaleDocs:             staleDocs,
+		DocsWithAnnotations:   docsWithAnnotations,
+		TotalAnnotations:      totalAnnotations,
 		UnresolvedAnnotations: unresolvedAnnotations,
-		DocsByTag:           docsByTag,
+		DocsByTag:             docsByTag,
 	}, nil
 }
 
 // ---- Delete ----
 
 // DeleteDoc removes all chunks for a document path.
-func (s *Service) DeleteDoc(ctx context.Context, projectID int, path string) error {
+func (s *Service) DeleteDoc(ctx context.Context, sc Scope, path string) error {
 	if s.queueClient != nil {
-		payload, err := json.Marshal(queue.DeleteDocPayload{ProjectID: projectID, Path: path})
+		payload, err := json.Marshal(queue.DeleteDocPayload{ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID, Path: path})
 		if err == nil {
 			task := asynq.NewTask(queue.TypeKBDeleteDoc, payload)
 			if _, err := s.queueClient.EnqueueContext(ctx, task, asynq.Queue(queue.QueueName)); err == nil {
-				s.log.Info("doc delete enqueued", "project_id", projectID, "path", path)
+				s.log.Info("doc delete enqueued", "kb", sc.String(), "path", path)
 				return nil
 			} else {
-				s.log.Warn("enqueue failed, deleting synchronously instead", "project_id", projectID, "path", path, "err", err)
+				s.log.Warn("enqueue failed, deleting synchronously instead", "kb", sc.String(), "path", path, "err", err)
 			}
 		} else {
 			s.log.Warn("marshal enqueue payload failed, deleting synchronously instead", "err", err)
 		}
 	}
-	return s.deleteDocNow(ctx, projectID, path)
+	return s.deleteDocNow(ctx, sc, path)
 }
 
 // deleteDocNow performs the actual Typesense deletion. Called either
 // directly or by the asynq worker via HandleDeleteDocTask.
-func (s *Service) deleteDocNow(ctx context.Context, projectID int, path string) error {
-	col := collectionName(projectID)
-	return s.deleteByPath(ctx, col, projectID, path)
+func (s *Service) deleteDocNow(ctx context.Context, sc Scope, path string) error {
+	col := collectionName(sc)
+	return s.deleteByPath(ctx, col, path)
 }
 
 // ---- Async worker handlers ----
@@ -749,7 +907,13 @@ func (s *Service) HandleWriteDocTask(ctx context.Context, t *asynq.Task) error {
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return fmt.Errorf("unmarshal write_doc payload: %w", err)
 	}
-	_, err := s.writeDocNow(ctx, p.ProjectID, p.Path, p.Title, p.Content, p.Author, p.Tags)
+	var anns []Annotation
+	if p.Annotations != "" {
+		if err := json.Unmarshal([]byte(p.Annotations), &anns); err != nil {
+			return fmt.Errorf("unmarshal write_doc annotations: %w", err)
+		}
+	}
+	_, err := s.writeDocNow(ctx, payloadScope(p.Scope, p.ScopeID, p.ProjectID), p.Path, p.Title, p.Content, p.Author, p.Tags, p.Reason, anns)
 	return err
 }
 
@@ -758,12 +922,21 @@ func (s *Service) HandleDeleteDocTask(ctx context.Context, t *asynq.Task) error 
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return fmt.Errorf("unmarshal delete_doc payload: %w", err)
 	}
-	return s.deleteDocNow(ctx, p.ProjectID, p.Path)
+	return s.deleteDocNow(ctx, payloadScope(p.Scope, p.ScopeID, p.ProjectID), p.Path)
 }
 
-// DeleteProject drops the entire Typesense collection for a project.
-func (s *Service) DeleteProject(ctx context.Context, projectID int) error {
-	col := collectionName(projectID)
+// payloadScope reads a queued task's scope. Tasks enqueued before scopes
+// existed carry only a project id.
+func payloadScope(kind string, id, projectID int) Scope {
+	if kind == "" {
+		return Project(projectID)
+	}
+	return Scope{Kind: kind, ID: id}
+}
+
+// Drop deletes a whole knowledge base (e.g. when its team or org is deleted).
+func (s *Service) Drop(ctx context.Context, sc Scope) error {
+	col := collectionName(sc)
 	_, err := s.client.Collection(col).Delete(ctx)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete collection %s: %w", col, err)
@@ -773,18 +946,32 @@ func (s *Service) DeleteProject(ctx context.Context, projectID int) error {
 
 // Reindex re-triggers embedding generation for all documents by re-upserting them.
 // This is useful when switching embedding models.
-func (s *Service) Reindex(ctx context.Context, projectID int) error {
-	col := collectionName(projectID)
+func (s *Service) Reindex(ctx context.Context, sc Scope) error {
+	// If the collection was originally created before Ollama was reachable
+	// (e.g. a race at first-write time against the post-install model pull
+	// Job), it's permanently locked into keyword-only mode — Typesense
+	// collections can't gain a field after creation. Detect that and
+	// rebuild it so ensureCollection picks up the embedding field this
+	// time, now that Ollama is reachable.
+	rebuild := s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, collectionName(sc))
+	return s.reindex(ctx, sc, rebuild)
+}
+
+// reindex re-writes every doc in a KB, first dropping and recreating the
+// collection when rebuild is set. Docs (with their annotations) are read
+// before anything is dropped and written back explicitly.
+func (s *Service) reindex(ctx context.Context, sc Scope, rebuild bool) error {
+	col := collectionName(sc)
 
 	// Snapshot full doc content BEFORE any possible drop+recreate below —
 	// once the collection is dropped there is nothing left to read back.
-	summaries, err := s.ListDocs(ctx, projectID, "")
+	summaries, err := s.ListDocs(ctx, sc, "")
 	if err != nil {
 		return err
 	}
 	docs := make([]*Doc, 0, len(summaries))
 	for _, summary := range summaries {
-		full, err := s.GetDoc(ctx, projectID, summary.Path)
+		full, err := s.GetDoc(ctx, sc, summary.Path)
 		if err != nil {
 			s.log.Warn("reindex: skip doc", "path", summary.Path, "err", err)
 			continue
@@ -792,23 +979,19 @@ func (s *Service) Reindex(ctx context.Context, projectID int) error {
 		docs = append(docs, full)
 	}
 
-	// If the collection was originally created before Ollama was reachable
-	// (e.g. a race at first-write time against the post-install model pull
-	// Job), it's permanently locked into keyword-only mode — Typesense
-	// collections can't gain a field after creation. Detect that and
-	// drop+recreate so ensureCollection picks up the embedding field this
-	// time, now that Ollama is reachable.
-	if s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, col) {
+	if rebuild {
 		s.log.Info("reindex: upgrading collection to semantic search (was keyword-only)", "collection", col)
 		if _, err := s.client.Collection(col).Delete(ctx); err != nil {
 			s.log.Warn("reindex: failed to drop keyword-only collection, continuing with existing schema", "collection", col, "err", err)
-		} else if err := s.ensureCollection(ctx, projectID); err != nil {
+		} else if err := s.ensureCollection(ctx, sc); err != nil {
 			return fmt.Errorf("recreate collection with embeddings: %w", err)
 		}
 	}
 
 	for _, full := range docs {
-		if _, err := s.WriteDoc(ctx, projectID, full.Path, full.Title, full.Content, full.Author, full.Tags); err != nil {
+		// Pass the annotations explicitly: if the collection was just
+		// recreated, there is nothing left to read them back from.
+		if _, err := s.WriteDoc(ctx, sc, full.Path, full.Title, full.Content, full.Author, full.Tags, full.Reason, full.Annotations); err != nil {
 			s.log.Warn("reindex: write failed", "path", full.Path, "err", err)
 		}
 	}
@@ -872,8 +1055,10 @@ func (s *Service) TypesenseURL() string { return s.typesenseURL }
 
 // ---- Internal helpers ----
 
-func (s *Service) deleteByPath(ctx context.Context, col string, projectID int, path string) error {
-	filterBy := fmt.Sprintf("project_id:=%d && path:=%s", projectID, path)
+// deleteByPath removes every chunk of a doc. Each collection holds one KB,
+// so the path alone identifies the doc.
+func (s *Service) deleteByPath(ctx context.Context, col string, path string) error {
+	filterBy := "path:=" + quoteFilter(path)
 	_, err := s.client.Collection(col).Documents().Delete(ctx, &api.DeleteDocumentsParams{
 		FilterBy: &filterBy,
 	})
@@ -881,6 +1066,12 @@ func (s *Service) deleteByPath(ctx context.Context, col string, projectID int, p
 		return fmt.Errorf("delete chunks for %s: %w", path, err)
 	}
 	return nil
+}
+
+// quoteFilter quotes a value for a Typesense filter_by expression, so paths
+// containing spaces, commas, or operators match exactly.
+func quoteFilter(v string) string {
+	return "`" + strings.ReplaceAll(v, "`", "") + "`"
 }
 
 func isNotFound(err error) bool {
@@ -911,6 +1102,9 @@ func mapToDocFromMap(m map[string]interface{}) *Doc {
 	}
 	if v, ok := m["path"].(string); ok {
 		doc.Path = v
+	}
+	if v, ok := m["reason"].(string); ok {
+		doc.Reason = v
 	}
 	if v, ok := m["title"].(string); ok {
 		doc.Title = v
@@ -969,17 +1163,17 @@ func mapToDocFromMap(m map[string]interface{}) *Doc {
 	return doc
 }
 
-// getLatestAnnotation returns the most recent annotation's text (first 80 chars).
+// getLatestAnnotation returns the most recent unresolved annotation's text
+// (first 80 characters), the preview search results show. Resolved notes
+// are already worked into the doc, so they aren't previewed.
 // The annotations slice is expected to be ordered with the most recent at the end.
 func getLatestAnnotation(anns []Annotation) string {
-	if len(anns) == 0 {
-		return ""
+	for i := len(anns) - 1; i >= 0; i-- {
+		if !anns[i].IsResolved {
+			return trimExcerpt(anns[i].Text, 80)
+		}
 	}
-	latest := anns[len(anns)-1] // last in slice = most recent
-	if len(latest.Text) > 80 {
-		return latest.Text[:80] + "…"
-	}
-	return latest.Text
+	return ""
 }
 
 func trimExcerpt(s string, maxChars int) string {

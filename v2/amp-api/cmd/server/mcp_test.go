@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
+	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/repository"
 )
@@ -32,6 +34,7 @@ type mcpStack struct {
 	repo      *repository.Repo
 	reg       *actor.Registry
 	hub       *hub.Hub
+	kb        *kb.Service // nil unless TEST_TYPESENSE_URL is set
 	projectID int
 	epicID    int // default epic for this project (tests can create more)
 	storyID   int // default story under the default epic
@@ -78,7 +81,8 @@ func setupMCP(t *testing.T) *mcpStack {
 
 	// Wire the MCP server — enable tool capabilities (same as production).
 	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false))
-	mcpHandler := mcp.NewServer(reg, repo, sseHub, nil)
+	kbSvc := testKB()
+	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
 	mcpHandler.Register(srv)
 
 	// Create a project scoped to this test.
@@ -106,7 +110,22 @@ func setupMCP(t *testing.T) *mcpStack {
 		t.Fatalf("create default story: %v", err)
 	}
 
-	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
+	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
+}
+
+// testKB connects to the Typesense at TEST_TYPESENSE_URL (keyword search
+// only, no embeddings), or returns nil when it isn't set: KB tools then
+// still check access but report the KB as not configured.
+func testKB() *kb.Service {
+	url := os.Getenv("TEST_TYPESENSE_URL")
+	if url == "" {
+		return nil
+	}
+	key := os.Getenv("TEST_TYPESENSE_KEY")
+	if key == "" {
+		key = "test"
+	}
+	return kb.New(url, key, "", "")
 }
 
 // call invokes an MCP tool by name with args, asserts no JSON-RPC error,
