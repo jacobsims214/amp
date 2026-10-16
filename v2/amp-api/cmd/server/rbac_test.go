@@ -60,10 +60,15 @@ func newRBACWorld(t *testing.T) *rbacWorld {
 		}
 		return &auth.Identity{Subject: u.Subject, Email: u.Email, Name: name, User: u}
 	}
+	// root first: on an empty database the first user is auto-admin, and
+	// the last global admin can't be demoted, so the admin must exist
+	// before anyone else's role is pinned.
+	root := user("root", true)
 	w := &rbacWorld{
+		root:  root,
 		owner: user("owner", false), alice: user("alice", false), bob: user("bob", false),
 		lead: user("lead", false), carol: user("carol", false), dave: user("dave", false),
-		orgadmin: user("orgadmin", false), outsider: user("outsider", false), root: user("root", true),
+		orgadmin: user("orgadmin", false), outsider: user("outsider", false),
 	}
 	must := func(err error) {
 		t.Helper()
