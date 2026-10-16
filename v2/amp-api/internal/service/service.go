@@ -215,12 +215,14 @@ func (s *Service) AssignTask(ctx context.Context, p authz.Principal, taskID int,
 	}
 
 	t, lvl, err := s.LoadTask(ctx, p, taskID, action)
+	requireIdle := false
+	if err != nil && action == authz.TaskClaim {
+		// Taking over someone else's ticket is a reassignment.
+		action = authz.TaskAssign
+		t, lvl, err = s.LoadTask(ctx, p, taskID, action)
+	}
 	if err != nil {
-		if action == authz.TaskClaim && lvl >= authz.Lead {
-			// A lead taking over someone else's ticket is a reassignment.
-			t, _, err = s.LoadTask(ctx, p, taskID, authz.TaskAssign)
-		}
-		if err != nil {
+		if t, requireIdle, err = s.openReassign(ctx, taskID, lvl, action, err); err != nil {
 			return nil, err
 		}
 	}
@@ -230,7 +232,31 @@ func (s *Service) AssignTask(ctx context.Context, p authz.Principal, taskID int,
 		}
 	}
 
-	return s.setOwner(ctx, p, t, newOwner)
+	return s.setOwner(ctx, p, t, newOwner, requireIdle)
+}
+
+// openReassign retries a reassignment the strict rules refused (refusal)
+// under the project's open-reassign setting. When that allows it, the
+// TaskActor must re-check that nobody started the ticket in the meantime.
+func (s *Service) openReassign(ctx context.Context, taskID int, lvl authz.Level, action authz.TaskAction, refusal error) (*domain.Task, bool, error) {
+	if lvl < authz.Member {
+		return nil, false, refusal
+	}
+	t, err := s.Repo.GetTask(ctx, taskID)
+	if err != nil {
+		return nil, false, refusal
+	}
+	proj, err := s.Repo.GetProject(ctx, t.ProjectID)
+	if err != nil || !proj.OpenReassign {
+		return nil, false, refusal
+	}
+	if t.State == domain.TaskStateInProgress {
+		return nil, false, authz.Forbidden("task %d is in progress; only its owner, a team lead, or a project owner can reassign it until it stops", taskID)
+	}
+	if !authz.OpenReassign(lvl, t, action) {
+		return nil, false, refusal
+	}
+	return t, true, nil
 }
 
 // ClaimTask takes an unassigned ticket for p. Unlike AssignTask(…, "me"),
@@ -246,12 +272,12 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 	}
 	if t.OwnerUserID != nil && *t.OwnerUserID != p.UserID {
 		// Even global admins, who pass every check, don't claim taken work.
-		return nil, authz.Forbidden("task %d is owned by user %d; use assign to reassign it", t.ID, *t.OwnerUserID)
+		return nil, authz.Forbidden("task %d is owned by user %d; claiming only takes unassigned tickets, use assign to reassign it", t.ID, *t.OwnerUserID)
 	}
-	return s.setOwner(ctx, p, t, p.UserRef())
+	return s.setOwner(ctx, p, t, p.UserRef(), false)
 }
 
-func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Task, newOwner *int) (*domain.Task, error) {
+func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Task, newOwner *int, requireIdle bool) (*domain.Task, error) {
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, err
@@ -261,6 +287,7 @@ func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Tas
 		TaskID:      t.ID,
 		ExpectOwner: t.OwnerUserID,
 		NewOwner:    newOwner,
+		RequireIdle: requireIdle,
 		By:          p.UserRef(),
 		ByName:      p.Email,
 		ReplyCh:     replyCh,
@@ -296,6 +323,15 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 }
 
 // ---- Epics and stories ----
+
+// SetOpenReassign turns a project's open-reassign setting on or off; it
+// needs project owner access. Callers publish project.updated.
+func (s *Service) SetOpenReassign(ctx context.Context, p authz.Principal, projectID int, on bool) (*domain.Project, error) {
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
+		return nil, err
+	}
+	return s.Repo.SetProjectOpenReassign(ctx, projectID, on)
+}
 
 // RequireEditEpic loads an epic and checks p may change it.
 func (s *Service) RequireEditEpic(ctx context.Context, p authz.Principal, epicID int) (*domain.Epic, error) {

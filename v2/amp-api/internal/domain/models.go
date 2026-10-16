@@ -48,10 +48,13 @@ type Project struct {
 	State       ProjectState `json:"state"`
 	// OrgID is the org the project belongs to. Only that org's teams can be
 	// linked to it. Nil only transiently for rows predating orgs.
-	OrgID     *int      `json:"org_id"`
-	CreatedBy *int      `json:"created_by"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	OrgID     *int `json:"org_id"`
+	CreatedBy *int `json:"created_by"`
+	// OpenReassign lets any project member take or reassign a ticket that
+	// isn't in progress. Otherwise only its owner or a lead can.
+	OpenReassign bool      `json:"open_reassign"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 type Epic struct {
@@ -244,6 +247,7 @@ const (
 	EventProjectCreated    EventType = "project.created"
 	EventProjectArchived   EventType = "project.archived"
 	EventProjectRestored   EventType = "project.restored"
+	EventProjectUpdated    EventType = "project.updated"
 	EventEpicCreated       EventType = "epic.created"
 	EventEpicStateChanged  EventType = "epic.state_changed"
 	EventStoryCreated      EventType = "story.created"

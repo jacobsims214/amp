@@ -30,6 +30,36 @@ func TestLevelFromAccess(t *testing.T) {
 	}
 }
 
+// Open reassign: any project member may reassign or release a ticket that
+// isn't in progress. Claims stay strict, and in-progress tickets stay put.
+func TestOpenReassign(t *testing.T) {
+	backlog := &domain.Task{ID: 1, OwnerUserID: ip(2), State: domain.TaskStateBacklog}
+	blocked := &domain.Task{ID: 2, OwnerUserID: ip(2), State: domain.TaskStateBlocked}
+	running := &domain.Task{ID: 3, OwnerUserID: ip(2), State: domain.TaskStateInProgress}
+	rows := []struct {
+		lvl    Level
+		task   *domain.Task
+		action TaskAction
+		ok     bool
+	}{
+		{Member, backlog, TaskAssign, true},
+		{Member, backlog, TaskUnassign, true},
+		{Member, blocked, TaskAssign, true},
+		{Member, running, TaskAssign, false},
+		{Member, running, TaskUnassign, false},
+		{Member, backlog, TaskClaim, false},
+		{Member, backlog, TaskWork, false},
+		{Member, backlog, TaskDispatch, false},
+		{Member, backlog, TaskDelete, false},
+		{None, backlog, TaskAssign, false},
+	}
+	for _, r := range rows {
+		if got := OpenReassign(r.lvl, r.task, r.action); got != r.ok {
+			t.Errorf("level=%s state=%s action=%d: %v, want %v", r.lvl, r.task.State, r.action, got, r.ok)
+		}
+	}
+}
+
 // The full decision table for ticket actions. me = 1, someone else = 2.
 func TestCheckTask(t *testing.T) {
 	const me = 1

@@ -62,6 +62,16 @@ export function canReassignTask(access: ProjectAccess | null | undefined): boole
   return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.lead
 }
 
+/**
+ * Whether the caller may reassign, release or take over this ticket when it
+ * isn't theirs: leads and up always; any project member too when the project
+ * has open reassign on and nobody is working the ticket.
+ */
+export function canTakeOverTask(task: Task, access: ProjectAccess | null | undefined, openReassign: boolean): boolean {
+  if (canReassignTask(access)) return true
+  return openReassign && !!access && task.state !== 'in_progress'
+}
+
 // ---- Board owner filter ----
 
 /** 'mine' (default) | 'unassigned' | 'everyone' | a project member's user id */

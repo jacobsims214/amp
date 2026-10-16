@@ -3,18 +3,21 @@ import { Loader2, Trash2, Users } from 'lucide-react'
 import { api } from '../api/client'
 import { CrudModal, inputCls, labelCls } from './CrudModal'
 import { canManageProject } from '../lib/people'
-import type { ProjectAccess, ProjectTeam, ProjectTeamRole, Team } from '../types'
+import type { Project, ProjectAccess, ProjectTeam, ProjectTeamRole, Team } from '../types'
 
 interface Props {
   projectId: number
   myAccess: ProjectAccess | null
+  /** called after a project setting changes */
+  onProjectUpdated?: (project: Project) => void
   onClose: () => void
 }
 
 // Lists the teams linked to a project. Project owners (and org/global
 // admins) can change each team's role, unlink it, or link another team from
-// the project's org; everyone else gets a read-only list.
-export function TeamAccessModal({ projectId, myAccess, onClose }: Props) {
+// the project's org, and set who may reassign tickets; everyone else gets a
+// read-only view.
+export function TeamAccessModal({ projectId, myAccess, onProjectUpdated, onClose }: Props) {
   const canManage = canManageProject(myAccess)
   const [teams, setTeams] = useState<ProjectTeam[]>([])
   const [orgTeams, setOrgTeams] = useState<Team[]>([])
@@ -23,6 +26,7 @@ export function TeamAccessModal({ projectId, myAccess, onClose }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [addTeamId, setAddTeamId] = useState('')
   const [addRole, setAddRole] = useState<ProjectTeamRole>('member')
+  const [openReassign, setOpenReassign] = useState(false)
 
   useEffect(() => {
     let cancelled = false
@@ -31,6 +35,7 @@ export function TeamAccessModal({ projectId, myAccess, onClose }: Props) {
         const [linked, project] = await Promise.all([api.listProjectTeams(projectId), api.getProject(projectId)])
         if (cancelled) return
         setTeams(linked)
+        setOpenReassign(project.open_reassign ?? false)
         if (canManage && project.org_id) {
           const all = await api.listOrgTeams(project.org_id)
           if (!cancelled) setOrgTeams(all)
@@ -51,6 +56,20 @@ export function TeamAccessModal({ projectId, myAccess, onClose }: Props) {
     try { setTeams(await fn()) }
     catch (e) { setError(e instanceof Error ? e.message : 'Update failed') }
     finally { setBusy(false) }
+  }
+
+  const toggleOpenReassign = async (on: boolean) => {
+    setBusy(true)
+    setError(null)
+    try {
+      const p = await api.updateProjectSettings(projectId, { open_reassign: on })
+      setOpenReassign(p.open_reassign ?? on)
+      onProjectUpdated?.(p)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Update failed')
+    } finally {
+      setBusy(false)
+    }
   }
 
   const unlinked = orgTeams.filter(t => !teams.some(pt => pt.team_id === t.id))
@@ -124,8 +143,27 @@ export function TeamAccessModal({ projectId, myAccess, onClose }: Props) {
             </div>
           )}
 
+          <div>
+            <label className={labelCls}>Ticket reassignment</label>
+            <label className={`flex items-start gap-3 rounded-xl border border-[#1E2C45] px-4 py-3 ${canManage ? 'cursor-pointer' : ''}`}>
+              <input
+                type="checkbox"
+                checked={openReassign}
+                disabled={!canManage || busy}
+                onChange={e => toggleOpenReassign(e.target.checked)}
+                className="mt-0.5 accent-[#6366F1] cursor-pointer disabled:cursor-default"
+              />
+              <span className="text-xs text-[#7E91A8] leading-relaxed">
+                <span className="block text-sm text-[#DDE6F0] font-medium">Anyone on the project can reassign tickets</span>
+                Members can take over, hand on, or release a ticket that isn't in progress. When off, only
+                its owner, a team lead, or a project owner can. In-progress tickets always stay with their owner
+                unless a lead or project owner steps in.
+              </span>
+            </label>
+          </div>
+
           {!canManage && (
-            <p className="text-xs text-[#3D5068]">Only project owners and org admins can change team access.</p>
+            <p className="text-xs text-[#3D5068]">Only project owners and org admins can change team access or settings.</p>
           )}
           {busy && <Loader2 size={14} className="text-[#7E91A8] animate-spin" />}
           {error && <p className="text-xs text-[#F87171]">{error}</p>}

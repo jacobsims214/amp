@@ -53,11 +53,11 @@ Org membership alone is not project access.
 | See a project and everything in it, comment, read history, use the KB | member |
 | Create epics, stories, tickets | member |
 | Edit or delete an epic or story, or change its owners | one of its owners, or owner level |
-| Archive, restore, reset a project; link and unlink teams | owner |
+| Archive, restore, reset a project; link and unlink teams; change project settings | owner |
 | Work a ticket (edit, complete, block, change state, schedule) | its owner, or anyone if it's unassigned. Leads and project owners reassign rather than work others' tickets; org admins can override |
 | Dispatch | its owner, or anyone if unassigned (dispatch claims it); org admins may dispatch anyone's work |
 | Claim | only an unassigned ticket, at any level. Claiming never takes a ticket from someone |
-| Assign to someone, or release | its owner, or anyone if unassigned; lead and up for any ticket. The new owner must have project access |
+| Assign to someone, or release | its owner, or anyone if unassigned; lead and up for any ticket. With the project's open reassign setting on (the default), any member for a ticket that isn't in progress. The new owner must have project access |
 | Delete a ticket | its owner or creator, or lead and up |
 | Manage org members, teams, invites | org owner/admin. Only org owners grant or remove the owner role |
 | Manage a team's members | org owner/admin, or that team's lead |
@@ -75,6 +75,16 @@ Ownership changes are a compare-and-set in the `TaskActor`: the handler
 authorises against the owner it read, and the actor applies the change only
 if the owner is still the same. Two people claiming the same ticket at once
 can't both win. The loser gets "owner changed … reload and retry".
+
+Open reassign (`projects.open_reassign`, migration 005, on by default) lets
+any project member take over, hand on, or release someone else's ticket
+while it isn't in progress. Project owners turn it off in the project's Team
+access dialog, with `PATCH /api/projects/{id}`, or with
+`amp_update_project_settings`. It never applies to `amp_claim_task`: a claim
+only takes unassigned work, so agents racing for the pool never take each
+other's tickets. Because a ticket can be started between the check and the
+change, the `TaskActor` re-checks that it isn't in progress before applying
+an open reassignment.
 
 ## Default views
 

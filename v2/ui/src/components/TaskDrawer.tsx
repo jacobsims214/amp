@@ -4,7 +4,7 @@ import { api } from '../api/client'
 import { StatusBadge } from './StatusBadge'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
-import { canReassignTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
+import { canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
 import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess } from '../types'
 
 interface Props {
@@ -17,6 +17,8 @@ interface Props {
   meId?: number
   /** caller's project access (my_access); gates working others' tickets */
   myAccess?: ProjectAccess | null
+  /** the project's open-reassign setting */
+  openReassign?: boolean
   /** called with the updated task after claim/assign/release */
   onTaskUpdated?: (task: Task) => void
 }
@@ -55,7 +57,7 @@ const inputCls =
   'w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] placeholder-[#3D5068] ' +
   'focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, onTaskUpdated }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated }: Props) {
   const [history, setHistory] = useState<ActivityLog[]>([])
   const [comments, setComments] = useState<Comment[]>([])
   const [tab, setTab] = useState<'history' | 'details'>('history')
@@ -234,6 +236,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           members={members}
           meId={meId}
           myAccess={myAccess}
+          openReassign={openReassign}
           canWork={canWork}
           onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())}
         />
@@ -325,12 +328,13 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   )
 }
 
-function OwnerSection({ task, people, members, meId, myAccess, canWork, onUpdated }: {
+function OwnerSection({ task, people, members, meId, myAccess, openReassign, canWork, onUpdated }: {
   task: Task
   people: Map<number, Person>
   members: ProjectMember[]
   meId?: number
   myAccess: ProjectAccess | null
+  openReassign: boolean
   canWork: boolean
   onUpdated: (task: Task) => void
 }) {
@@ -340,8 +344,10 @@ function OwnerSection({ task, people, members, meId, myAccess, canWork, onUpdate
   const creator = lookupPerson(people, task.created_by)
   const isMine = meId != null && task.owner_user_id === meId
   const ownedByOther = !!owner && meId != null && !isMine
-  // Taking over / reassigning someone else's ticket needs lead access or above.
-  const canAssign = canWork || canReassignTask(myAccess)
+  // Taking over / reassigning someone else's ticket needs lead access or
+  // above, or the project's open-reassign setting while nobody is working it.
+  const canTakeOver = canTakeOverTask(task, myAccess, openReassign)
+  const canAssign = canWork || canTakeOver
 
   const assign = async (user: string | number) => {
     setBusy(true)
@@ -386,7 +392,7 @@ function OwnerSection({ task, people, members, meId, myAccess, canWork, onUpdate
               Claim
             </button>
           )}
-          {ownedByOther && canReassignTask(myAccess) && (
+          {ownedByOther && canTakeOver && (
             <button
               onClick={() => assign('me')}
               disabled={busy}
@@ -435,7 +441,11 @@ function OwnerSection({ task, people, members, meId, myAccess, canWork, onUpdate
       </div>
       {!canWork && owner && (
         <p className="text-xs text-[#FBBF24]">
-          Owned by {owner.name} — {canReassignTask(myAccess) ? 'reassign it to yourself' : 'ask them or a team lead to reassign it'} to work on it.
+          Owned by {owner.name} — {canTakeOver
+            ? 'reassign it to yourself to work on it.'
+            : openReassign && task.state === 'in_progress'
+              ? "it's in progress, so only they or a team lead can reassign it."
+              : 'ask them or a team lead to reassign it to work on it.'}
         </p>
       )}
       {error && <p className="text-xs text-[#F87171]">{error}</p>}

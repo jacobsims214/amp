@@ -9,6 +9,8 @@ export interface Project {
   state: 'active' | 'archived'
   org_id?: number | null
   created_by?: number | null
+  /** any project member may reassign tickets that aren't in progress */
+  open_reassign?: boolean
   created_at: string
   updated_at: string
 }

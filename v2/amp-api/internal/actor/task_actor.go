@@ -380,6 +380,9 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		return nil, fmt.Errorf("task %d: owner changed to %s while you were acting; reload and retry",
 			a.task.ID, ownerString(a.task.OwnerUserID))
 	}
+	if msg.RequireIdle && a.task.State == domain.TaskStateInProgress {
+		return nil, fmt.Errorf("task %d was started while you were acting; only its owner, a team lead, or a project owner can reassign it now", a.task.ID)
+	}
 	if sameOwner(a.task.OwnerUserID, msg.NewOwner) {
 		t := a.withBlockedBy()
 		return &t, nil // no-op (e.g. claiming a ticket you already own)

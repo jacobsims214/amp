@@ -159,6 +159,14 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_restore_project", "Restore an archived project. Sets state=active.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Owner, s.restoreProject)))
 
+	mcp.AddTool(tool("amp_update_project_settings",
+		"Change a project's settings (project owners only). open_reassign: when true (the default), any project member "+
+			"can reassign or release a ticket that isn't in progress; when false, only its owner, a team lead, or a project owner can.",
+		props{
+			"project_id":    num("REQUIRED. Project ID."),
+			"open_reassign": boolean("REQUIRED. Let any project member reassign tickets that aren't in progress."),
+		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
+
 	// ---- Epics ----
 	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project.",
 		props{
@@ -255,12 +263,15 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
-		"Take ownership of an unassigned ticket so you (and your agents) can work it. Fails if someone else already owns it.",
+		"Take ownership of an unassigned ticket so you (and your agents) can work it. Fails if someone else already owns it: "+
+			"claiming never takes a ticket from anyone (to take one over, use amp_assign_task with user='me').",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.claimTask)))
 
 	mcp.AddTool(tool("amp_assign_task",
 		"Assign a ticket to a project member (it then shows up in their work), or release it with user='none' so anyone can pick it up. "+
-			"You can assign tickets you own or unassigned ones; team leads and project owners can reassign anyone's.",
+			"You can assign tickets you own or unassigned ones; team leads and project owners can reassign anyone's. "+
+			"In projects with open_reassign on (the default), any project member can also reassign or take over (user='me') "+
+			"someone else's ticket while it isn't in progress.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"user":    str("REQUIRED. Email or user id of a project member, 'me', or 'none' to unassign."),
@@ -575,6 +586,23 @@ func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+	return jsonResult(map[string]interface{}{"project": p})
+}
+
+func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	on, ok := args["open_reassign"].(bool)
+	if !ok {
+		return nil, fmt.Errorf("open_reassign is required (true or false)")
+	}
+	p, err := s.svc.SetOpenReassign(rctx, caller(rctx).p, id, on)
+	if err != nil {
+		return nil, err
+	}
+	s.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: p.ID, Payload: p, At: time.Now()})
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
@@ -1908,6 +1936,10 @@ func str(desc string) map[string]interface{} {
 
 func num(desc string) map[string]interface{} {
 	return map[string]interface{}{"type": "number", "description": desc}
+}
+
+func boolean(desc string) map[string]interface{} {
+	return map[string]interface{}{"type": "boolean", "description": desc}
 }
 
 func strArr(desc string) map[string]interface{} {

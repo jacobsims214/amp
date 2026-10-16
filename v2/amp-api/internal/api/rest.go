@@ -356,6 +356,23 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 1 {
+		if r.Method == http.MethodPatch {
+			var body struct {
+				OpenReassign *bool `json:"open_reassign"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OpenReassign == nil {
+				jsonErr(w, errorf("open_reassign (true or false) is required"), 400)
+				return
+			}
+			p, err := h.svc.SetOpenReassign(r.Context(), pr, projectID, *body.OpenReassign)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			h.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: p.ID, Payload: p, At: time.Now()})
+			jsonOK(w, map[string]interface{}{"project": p})
+			return
+		}
 		p, err := h.repo.GetProject(r.Context(), projectID)
 		if err != nil {
 			jsonErr(w, err, 404)

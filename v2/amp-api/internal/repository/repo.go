@@ -99,10 +99,10 @@ func (r *Repo) Close() { r.db.Close() }
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-const projectCols = `id, name, code, description, state, org_id, created_by, created_at, updated_at`
+const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, created_at, updated_at`
 
 func scanProject(row rowScanner, p *domain.Project) error {
-	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.CreatedAt, &p.UpdatedAt)
+	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign, &p.CreatedAt, &p.UpdatedAt)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -202,6 +202,19 @@ func (r *Repo) ArchiveProject(ctx context.Context, id int) (*domain.Project, err
 
 func (r *Repo) RestoreProject(ctx context.Context, id int) (*domain.Project, error) {
 	return r.setProjectState(ctx, id, domain.ProjectStateActive)
+}
+
+// SetProjectOpenReassign turns the project's open-reassign setting on or off.
+func (r *Repo) SetProjectOpenReassign(ctx context.Context, id int, on bool) (*domain.Project, error) {
+	p := &domain.Project{}
+	err := scanProject(r.db.QueryRow(ctx,
+		`UPDATE projects SET open_reassign = $1, updated_at = NOW() WHERE id = $2 RETURNING `+projectCols,
+		on, id,
+	), p)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("project %d not found", id)
+	}
+	return p, err
 }
 
 func (r *Repo) setProjectState(ctx context.Context, id int, state domain.ProjectState) (*domain.Project, error) {

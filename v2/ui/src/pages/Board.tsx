@@ -70,6 +70,7 @@ export function Board() {
   // Project members: names for owners/creators, the owner filter, and assignment.
   const [members, setMembers] = useState<ProjectMember[]>([])
   const [myAccess, setMyAccess] = useState<ProjectAccess | null>(null)
+  const [openReassign, setOpenReassign] = useState(false)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
   const ownersOf = (ids: number[] | undefined): Person[] =>
@@ -79,6 +80,9 @@ export function Board() {
     api.listProjectMembers(pid)
       .then(r => { setMembers(r.members); setMyAccess(r.my_access) })
       .catch(() => { /* names fall back to "User #id"; actions still surface API errors */ })
+    api.getProject(pid)
+      .then(p => setOpenReassign(p.open_reassign ?? false))
+      .catch(() => { /* the server still enforces the rule; this only shapes buttons */ })
   }, [pid])
 
   // Epic CRUD
@@ -591,11 +595,17 @@ export function Board() {
         members={members}
         meId={meId}
         myAccess={myAccess}
+        openReassign={openReassign}
         onTaskUpdated={applyTask}
       />
 
       {teamAccessOpen && (
-        <TeamAccessModal projectId={pid} myAccess={myAccess} onClose={() => setTeamAccessOpen(false)} />
+        <TeamAccessModal
+          projectId={pid}
+          myAccess={myAccess}
+          onProjectUpdated={p => setOpenReassign(p.open_reassign ?? false)}
+          onClose={() => setTeamAccessOpen(false)}
+        />
       )}
 
       {/* Epic CRUD modals */}

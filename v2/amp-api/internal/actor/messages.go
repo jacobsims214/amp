@@ -106,6 +106,9 @@ type MsgAssignTask struct {
 	TaskID      int
 	ExpectOwner *int
 	NewOwner    *int
+	// RequireIdle refuses the change if the ticket is in progress (set when
+	// only the project's open-reassign setting allows it).
+	RequireIdle bool
 	By          *int
 	ByName      string
 	ReplyCh     chan ReplyGetTask

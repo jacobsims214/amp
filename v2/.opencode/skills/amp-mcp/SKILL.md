@@ -19,7 +19,7 @@ one feature with no obvious entry point — scheduling.
 
 ## Full tool list by area
 
-- **Projects**: `amp_create_project`, `amp_list_projects`, `amp_get_project`, `amp_reset_project` (destructive), `amp_export_project`, `amp_import_project`, `amp_archive_project`, `amp_restore_project`
+- **Projects**: `amp_create_project`, `amp_list_projects`, `amp_get_project`, `amp_reset_project` (destructive), `amp_export_project`, `amp_import_project`, `amp_archive_project`, `amp_restore_project`, `amp_update_project_settings` (owners)
 - **Epics**: `amp_create_epic`, `amp_list_epics`, `amp_get_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
 - **Stories**: `amp_create_story`, `amp_list_stories`, `amp_list_project_stories`, `amp_get_story`, `amp_update_story`
 - **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`, `amp_claim_task`, `amp_assign_task`
@@ -56,9 +56,13 @@ agent); `assigned_to`/`agent_id` still name the agent profile that runs it.
   everything, or a teammate's email.
 - Tickets you create are yours. Pass `owner: "none"` to `amp_create_task` to leave one in the pool,
   or a teammate's email to give it to them.
-- `amp_claim_task` takes an unassigned ticket. `amp_dispatch_task` on an unassigned ticket claims
-  it too. A ticket someone else owns can't be dispatched, completed, or edited by you — ask them,
-  or have a lead reassign it with `amp_assign_task` (`user: "none"` releases it).
+- `amp_claim_task` takes an unassigned ticket, and never someone else's. `amp_dispatch_task` on an
+  unassigned ticket claims it too. A ticket someone else owns can't be dispatched, completed, or
+  edited by you.
+- To take one over, `amp_assign_task` with `user: "me"` (`user: "none"` releases it). In projects
+  with `open_reassign` on (the default; see `amp_get_project`), any member can do that while the
+  ticket isn't in progress. Otherwise ask its owner or a team lead. Only take over a teammate's
+  ticket when you've been told to.
 - Epics and stories are shared: put stories and tickets under anyone's. Changing an epic or story
   needs you to be one of its owners (`add_owners` on `amp_update_epic` / `amp_update_story`).
 - A project you aren't on (through one of your teams) is reported as not found.

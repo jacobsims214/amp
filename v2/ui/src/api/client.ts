@@ -70,6 +70,8 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
+  updateProjectSettings: (id: number, settings: { open_reassign: boolean }) =>
+    patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
   restoreProject: (id: number) => post<Project>(`/projects/${id}/restore`),

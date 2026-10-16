@@ -249,6 +249,14 @@ func TestREST_TaskListDefaultsToMine(t *testing.T) {
 	}
 	ra.want(t, 403, "alice", "POST", fmt.Sprintf("/api/tasks/%d/complete", tid), nil)
 	ra.want(t, 400, "alice", "POST", fmt.Sprintf("/api/tasks/%d/assign", tid), map[string]any{"user": ""})
+
+	// Project settings: owners only.
+	proj := fmt.Sprintf("/api/projects/%d", w.s.projectID)
+	ra.want(t, 403, "alice", "PATCH", proj, map[string]any{"open_reassign": false})
+	ra.want(t, 400, "owner", "PATCH", proj, map[string]any{})
+	if p := ra.want(t, 200, "owner", "PATCH", proj, map[string]any{"open_reassign": false})["project"].(map[string]any); p["open_reassign"] != false {
+		t.Fatalf("PATCH project = %v", p)
+	}
 }
 
 func TestREST_KBConfigIsAdminOnly(t *testing.T) {

@@ -338,6 +338,18 @@ func CheckTask(lvl Level, t *domain.Task, me int, action TaskAction) error {
 	return Forbidden("task %d is owned by user %d; only its owner, a team lead, or a project owner can do that", t.ID, *t.OwnerUserID)
 }
 
+// OpenReassign reports whether a project with open reassign turned on lets
+// someone at lvl reassign or release a ticket CheckTask refused: any
+// project member may, as long as nobody is working the ticket. Claiming is
+// not covered: a claim only ever takes unassigned work, so agents racing
+// for the pool never take each other's tickets.
+func OpenReassign(lvl Level, t *domain.Task, action TaskAction) bool {
+	if lvl < Member || t.State == domain.TaskStateInProgress {
+		return false
+	}
+	return action == TaskAssign || action == TaskUnassign
+}
+
 // ---- Task views (what a board or list shows by default) ----
 
 // TaskView selects which tickets a list returns.

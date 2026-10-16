@@ -780,11 +780,32 @@ func TestE2E(t *testing.T) {
 		e.mustTool(t, mateTok, "amp_complete_task", map[string]any{"task_id": handoff})
 		t.Log("claim, assign, and owner-only work enforced over MCP ✓")
 
+		// Open reassign (on by default): the teammate, a plain member, can take
+		// over the admin's ticket while nobody is working it, but not once the
+		// admin has started it, and not after a project owner turns it off.
+		takeover := mk(adminTok, "take me over", "")
+		running := mk(adminTok, "admin is on it", "")
+		e.mustTool(t, adminTok, "amp_dispatch_task", map[string]any{"task_id": running, "agent_id": "admin-agent"})
+		if _, err := e.tool(t, mateTok, "amp_assign_task", map[string]any{"task_id": running, "user": "me"}); err == nil || !strings.Contains(err.Error(), "in progress") {
+			t.Fatalf("teammate took over an in-progress ticket: %v", err)
+		}
+		e.mustTool(t, mateTok, "amp_assign_task", map[string]any{"task_id": takeover, "user": "me"})
+		if _, err := e.tool(t, mateTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": false}); err == nil {
+			t.Fatal("a plain member changed project settings")
+		}
+		e.mustTool(t, adminTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": false})
+		strict := mk(adminTok, "strict now", "")
+		if _, err := e.tool(t, mateTok, "amp_assign_task", map[string]any{"task_id": strict, "user": "me"}); err == nil || !strings.Contains(err.Error(), "owned by") {
+			t.Fatalf("teammate took over a ticket with open reassign off: %v", err)
+		}
+		e.mustTool(t, adminTok, "amp_update_project_settings", map[string]any{"project_id": pid, "open_reassign": true})
+		t.Log("open reassign: members take over idle tickets, not in-progress ones; owners can turn it off ✓")
+
 		// The same rules through the UI's REST API, signed in as the teammate.
 		mate := e.uiLogin(t, email2, pw2)
 		tasks := mate.must(t, 200, "GET", fmt.Sprintf("/api/projects/%d/tasks", pid), nil)["tasks"].([]any)
-		if len(tasks) != 2 {
-			t.Fatalf("teammate's REST default view has %d tasks, want 2", len(tasks))
+		if len(tasks) != 3 {
+			t.Fatalf("teammate's REST default view has %d tasks, want 3 (claimed, handed off, taken over)", len(tasks))
 		}
 		mate.must(t, 403, "POST", fmt.Sprintf("/api/tasks/%d/complete", adminOwn), nil)
 		mate.must(t, 403, "POST", "/api/orgs", map[string]any{"name": "nope"})

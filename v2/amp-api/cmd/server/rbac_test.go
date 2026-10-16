@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 )
@@ -260,6 +261,10 @@ func TestRBAC_LegacyTicketsStayInEveryonesDefaultView(t *testing.T) {
 
 func TestRBAC_ClaimAssignRelease(t *testing.T) {
 	w := newRBACWorld(t)
+	// The strict rules: with open reassign off, only owners and leads hand on tickets.
+	if _, err := w.s.repo.SetProjectOpenReassign(context.Background(), w.s.projectID, false); err != nil {
+		t.Fatal(err)
+	}
 	pool := taskID(t, w.as(w.alice).mkTask(t, "pool", map[string]interface{}{"owner": "none"}))
 
 	// bob claims it; it's now his, and alice can't take it.
@@ -299,6 +304,81 @@ func TestRBAC_ClaimAssignRelease(t *testing.T) {
 	if o := taskOwner(t, w.s, pool); o != nil {
 		t.Fatalf("owner after release = %d", *o)
 	}
+}
+
+// Open reassign (the default): any project member can take over, hand on,
+// or release someone else's ticket while nobody is working it.
+func TestRBAC_OpenReassign(t *testing.T) {
+	w := newRBACWorld(t)
+	ctx := context.Background()
+	proj := w.as(w.alice).call(t, "amp_get_project", map[string]interface{}{"project_id": float64(w.s.projectID)})
+	if on, _ := proj["project"].(map[string]interface{})["open_reassign"].(bool); !on {
+		t.Fatalf("open_reassign should default to on: %v", proj)
+	}
+	tid := taskID(t, w.as(w.alice).mkTask(t, "alice's", nil))
+	assign := func(id *auth.Identity, user string) {
+		t.Helper()
+		w.as(id).call(t, "amp_assign_task", map[string]interface{}{"task_id": float64(tid), "user": user})
+	}
+	owner := func() *int { return taskOwner(t, w.s, tid) }
+
+	// bob (a plain member) takes it over, carol hands it back to alice, bob releases it.
+	assign(w.bob, "me")
+	if o := owner(); o == nil || *o != w.bob.User.ID {
+		t.Fatalf("owner after bob took it = %v", o)
+	}
+	assign(w.carol, w.alice.Email)
+	if o := owner(); o == nil || *o != w.alice.User.ID {
+		t.Fatalf("owner after carol reassigned it = %v", o)
+	}
+	// Claiming still never takes a ticket from anyone.
+	wantErr(t, w.as(w.bob).callExpectError(t, "amp_claim_task", map[string]interface{}{"task_id": float64(tid)}), "owned by", "assign")
+	// Taking it over doesn't let you work someone else's ticket in their name.
+	wantErr(t, w.as(w.bob).callExpectError(t, "amp_complete_task", map[string]interface{}{"task_id": float64(tid)}), "owned by")
+	// Outsiders still can't see it.
+	wantErr(t, w.as(w.dave).callExpectError(t, "amp_assign_task", map[string]interface{}{"task_id": float64(tid), "user": "me"}), "not found")
+
+	// In progress, it stays with whoever is working it; a lead can still step in.
+	w.as(w.alice).call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(tid), "agent_id": "alice-agent"})
+	for _, user := range []string{"me", "none", w.carol.Email} {
+		wantErr(t, w.as(w.bob).callExpectError(t, "amp_assign_task", map[string]interface{}{"task_id": float64(tid), "user": user}), "in progress")
+	}
+	if o := owner(); o == nil || *o != w.alice.User.ID {
+		t.Fatalf("in-progress ticket changed hands: owner = %v", o)
+	}
+	assign(w.lead, w.bob.Email)
+	if o := owner(); o == nil || *o != w.bob.User.ID {
+		t.Fatalf("lead reassignment of an in-progress ticket: owner = %v", o)
+	}
+
+	// The race: the ticket is started after the check but before the change.
+	// The TaskActor re-checks, so the change is refused.
+	idle := taskID(t, w.as(w.alice).mkTask(t, "raced", nil))
+	w.as(w.alice).call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(idle), "agent_id": "a"})
+	pid, err := w.s.reg.Get(w.s.projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replyCh := make(chan actor.ReplyGetTask, 1)
+	w.s.reg.System().Root.Send(pid, &actor.MsgAssignTask{
+		TaskID: idle, ExpectOwner: &w.alice.User.ID, NewOwner: &w.bob.User.ID, RequireIdle: true, ReplyCh: replyCh,
+	})
+	if r := <-replyCh; r.Err == nil || !strings.Contains(r.Err.Error(), "was started") {
+		t.Fatalf("actor accepted an open reassignment of an in-progress ticket: %v", r.Err)
+	}
+
+	// Only project owners change the setting; with it off, members can't take others' tickets.
+	for _, id := range []*auth.Identity{w.alice, w.lead} {
+		wantErr(t, w.as(id).callExpectError(t, "amp_update_project_settings", map[string]interface{}{"project_id": float64(w.s.projectID), "open_reassign": false}), "requires owner access")
+	}
+	w.as(w.owner).call(t, "amp_update_project_settings", map[string]interface{}{"project_id": float64(w.s.projectID), "open_reassign": false})
+	if p, _ := w.s.repo.GetProject(ctx, w.s.projectID); p.OpenReassign {
+		t.Fatal("setting didn't stick")
+	}
+	backlog := taskID(t, w.as(w.alice).mkTask(t, "alice's backlog", nil))
+	wantErr(t, w.as(w.bob).callExpectError(t, "amp_assign_task", map[string]interface{}{"task_id": float64(backlog), "user": "me"}), "owned by")
+	w.as(w.orgadmin).call(t, "amp_update_project_settings", map[string]interface{}{"project_id": float64(w.s.projectID), "open_reassign": true})
+	w.as(w.bob).call(t, "amp_assign_task", map[string]interface{}{"task_id": float64(backlog), "user": "me"})
 }
 
 func TestRBAC_AssigneeMustHaveProjectAccess(t *testing.T) {
