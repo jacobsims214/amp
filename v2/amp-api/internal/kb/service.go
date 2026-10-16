@@ -28,6 +28,7 @@ import (
 	"github.com/typesense/typesense-go/v4/typesense/api"
 	"github.com/typesense/typesense-go/v4/typesense/api/pointer"
 
+	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/queue"
 )
 
@@ -87,12 +88,7 @@ type Doc struct {
 	Annotations []Annotation `json:"annotations"`
 }
 
-type Annotation struct {
-	Author     string `json:"author"`
-	Text       string `json:"text"`
-	CreatedAt  int64  `json:"created_at"`
-	IsResolved bool   `json:"is_resolved"`
-}
+type Annotation = domain.KBAnnotation
 
 type DocSummary struct {
 	ID        string   `json:"id"`
@@ -267,7 +263,11 @@ func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
 // On subsequent writes to the same path, all old chunks are deleted and new ones inserted.
 //
 // reason says why a doc belongs in a team or org KB; it is stored with the doc.
-func (s *Service) WriteDoc(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string) (*DocSummary, error) {
+//
+// Rewriting a doc keeps its annotations. annotations, when non-empty, are
+// written as the doc's annotations instead (reindex and import carry them
+// over this way); when empty, the existing doc's annotations are kept.
+func (s *Service) WriteDoc(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
 	if tags == nil {
 		tags = []string{}
 	}
@@ -291,6 +291,7 @@ func (s *Service) WriteDoc(ctx context.Context, sc Scope, path, title, content, 
 		payload, err := json.Marshal(queue.WriteDocPayload{
 			ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID,
 			Path: path, Title: title, Content: content, Author: author, Tags: tags, Reason: reason,
+			Annotations: annotationsJSON(annotations),
 		})
 		if err == nil {
 			task := asynq.NewTask(queue.TypeKBWriteDoc, payload)
@@ -305,16 +306,28 @@ func (s *Service) WriteDoc(ctx context.Context, sc Scope, path, title, content, 
 		}
 	}
 
-	if _, err := s.writeDocNow(ctx, sc, path, title, content, author, tags, reason); err != nil {
+	if _, err := s.writeDocNow(ctx, sc, path, title, content, author, tags, reason, annotations); err != nil {
 		return nil, err
 	}
 	return summary, nil
 }
 
+// annotationsJSON encodes annotations for a queued write ("" for none).
+func annotationsJSON(anns []Annotation) string {
+	if len(anns) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(anns)
+	if err != nil {
+		return ""
+	}
+	return string(b)
+}
+
 // writeDocNow performs the actual Typesense indexing. Called either
 // directly (no queue configured — local dev without Valkey, or enqueue
 // itself failed) or by the asynq worker via HandleWriteDocTask.
-func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string) (*DocSummary, error) {
+func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
 	if err := s.ensureCollection(ctx, sc); err != nil {
 		return nil, err
 	}
@@ -325,6 +338,23 @@ func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, conten
 	if tags == nil {
 		tags = []string{}
 	}
+
+	// A rewrite keeps the doc's annotations: read them before the old
+	// chunks go.
+	if len(annotations) == 0 {
+		if old, err := s.GetDoc(ctx, sc, path); err == nil {
+			annotations = old.Annotations
+		}
+	}
+	annJSON := "[]"
+	if len(annotations) > 0 {
+		b, err := json.Marshal(annotations)
+		if err != nil {
+			return nil, fmt.Errorf("encode annotations of %s: %w", path, err)
+		}
+		annJSON = string(b)
+	}
+	annCount, annLatest := len(annotations), getLatestAnnotation(annotations)
 
 	// Delete existing chunks for this path before inserting new ones.
 	_ = s.deleteByPath(ctx, col, path)
@@ -338,23 +368,26 @@ func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, conten
 	// Index each chunk via Upsert (create-or-update by id).
 	for i, chunk := range chunks {
 		doc := map[string]interface{}{
-			"id":                docID(sc, path, i),
-			"project_id":        sc.projectID(),
-			"reason":            reason,
-			"path":              path,
-			"title":             title,
-			"tags":              tags,
-			"author":            author,
-			"chunk_index":       i,
-			"chunk_text":        chunk,
-			"updated_at":        now,
-			"annotation_count":  0,
-			"latest_annotation": "",
+			"id":          docID(sc, path, i),
+			"project_id":  sc.projectID(),
+			"reason":      reason,
+			"path":        path,
+			"title":       title,
+			"tags":        tags,
+			"author":      author,
+			"chunk_index": i,
+			"chunk_text":  chunk,
+			"updated_at":  now,
+			// Every chunk carries the count and latest annotation so any
+			// search hit shows them; the annotations live on chunk 0.
+			"annotation_count":  annCount,
+			"latest_annotation": annLatest,
 			"annotations":       "[]",
 		}
-		// Only store the full content on the first chunk.
+		// Only store the full content and annotations on the first chunk.
 		if i == 0 {
 			doc["content"] = content
+			doc["annotations"] = annJSON
 		} else {
 			doc["content"] = ""
 		}
@@ -842,7 +875,13 @@ func (s *Service) HandleWriteDocTask(ctx context.Context, t *asynq.Task) error {
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return fmt.Errorf("unmarshal write_doc payload: %w", err)
 	}
-	_, err := s.writeDocNow(ctx, payloadScope(p.Scope, p.ScopeID, p.ProjectID), p.Path, p.Title, p.Content, p.Author, p.Tags, p.Reason)
+	var anns []Annotation
+	if p.Annotations != "" {
+		if err := json.Unmarshal([]byte(p.Annotations), &anns); err != nil {
+			return fmt.Errorf("unmarshal write_doc annotations: %w", err)
+		}
+	}
+	_, err := s.writeDocNow(ctx, payloadScope(p.Scope, p.ScopeID, p.ProjectID), p.Path, p.Title, p.Content, p.Author, p.Tags, p.Reason, anns)
 	return err
 }
 
@@ -876,6 +915,20 @@ func (s *Service) Drop(ctx context.Context, sc Scope) error {
 // Reindex re-triggers embedding generation for all documents by re-upserting them.
 // This is useful when switching embedding models.
 func (s *Service) Reindex(ctx context.Context, sc Scope) error {
+	// If the collection was originally created before Ollama was reachable
+	// (e.g. a race at first-write time against the post-install model pull
+	// Job), it's permanently locked into keyword-only mode — Typesense
+	// collections can't gain a field after creation. Detect that and
+	// rebuild it so ensureCollection picks up the embedding field this
+	// time, now that Ollama is reachable.
+	rebuild := s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, collectionName(sc))
+	return s.reindex(ctx, sc, rebuild)
+}
+
+// reindex re-writes every doc in a KB, first dropping and recreating the
+// collection when rebuild is set. Docs (with their annotations) are read
+// before anything is dropped and written back explicitly.
+func (s *Service) reindex(ctx context.Context, sc Scope, rebuild bool) error {
 	col := collectionName(sc)
 
 	// Snapshot full doc content BEFORE any possible drop+recreate below —
@@ -894,13 +947,7 @@ func (s *Service) Reindex(ctx context.Context, sc Scope) error {
 		docs = append(docs, full)
 	}
 
-	// If the collection was originally created before Ollama was reachable
-	// (e.g. a race at first-write time against the post-install model pull
-	// Job), it's permanently locked into keyword-only mode — Typesense
-	// collections can't gain a field after creation. Detect that and
-	// drop+recreate so ensureCollection picks up the embedding field this
-	// time, now that Ollama is reachable.
-	if s.ollamaURL != "" && s.ollamaReachable(ctx) && !s.collectionHasEmbedding(ctx, col) {
+	if rebuild {
 		s.log.Info("reindex: upgrading collection to semantic search (was keyword-only)", "collection", col)
 		if _, err := s.client.Collection(col).Delete(ctx); err != nil {
 			s.log.Warn("reindex: failed to drop keyword-only collection, continuing with existing schema", "collection", col, "err", err)
@@ -910,7 +957,9 @@ func (s *Service) Reindex(ctx context.Context, sc Scope) error {
 	}
 
 	for _, full := range docs {
-		if _, err := s.WriteDoc(ctx, sc, full.Path, full.Title, full.Content, full.Author, full.Tags, full.Reason); err != nil {
+		// Pass the annotations explicitly: if the collection was just
+		// recreated, there is nothing left to read them back from.
+		if _, err := s.WriteDoc(ctx, sc, full.Path, full.Title, full.Content, full.Author, full.Tags, full.Reason, full.Annotations); err != nil {
 			s.log.Warn("reindex: write failed", "path", full.Path, "err", err)
 		}
 	}

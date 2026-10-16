@@ -1,9 +1,12 @@
 package kb
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"testing"
+	"time"
 )
 
 // Project KBs keep the names and document ids they had before scopes
@@ -45,5 +48,41 @@ func TestPayloadScope(t *testing.T) {
 	}
 	if got := payloadScope(ScopeTeam, 3, 0); got != Team(3) {
 		t.Errorf("team payload scope = %v", got)
+	}
+}
+
+// A reindex that rebuilds the collection (to add embeddings) drops every
+// doc first; annotations must come back with the docs. Needs Typesense.
+func TestReindexRebuildKeepsAnnotations(t *testing.T) {
+	url := os.Getenv("TEST_TYPESENSE_URL")
+	if url == "" {
+		t.Skip("set TEST_TYPESENSE_URL to run against Typesense")
+	}
+	key := os.Getenv("TEST_TYPESENSE_KEY")
+	if key == "" {
+		key = "test"
+	}
+	s := New(url, key, "", "")
+	ctx := context.Background()
+	sc := Team(int(time.Now().UnixNano() % 1_000_000_000))
+	t.Cleanup(func() { s.Drop(context.Background(), sc) }) //nolint:errcheck
+
+	if _, err := s.WriteDoc(ctx, sc, "a.md", "A", "Alpha doc.", "me", []string{"x"}, "shared by the team", nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"first note", "second note"} {
+		if _, err := s.AnnotateDoc(ctx, sc, "a.md", text, "me"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.reindex(ctx, sc, true); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := s.GetDoc(ctx, sc, "a.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(doc.Annotations) != 2 || doc.Annotations[1].Text != "second note" || doc.Reason != "shared by the team" {
+		t.Fatalf("after a rebuilding reindex: %+v", doc)
 	}
 }

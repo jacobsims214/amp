@@ -411,7 +411,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"knowledge belongs there; never move knowledge there on your own initiative. If you think something "+
 			"belongs there, tell your user why and keep it in the project KB until they decide. Team and org writes "+
 			"need `reason`. Only org owners and admins write to an org KB; anyone else annotates it. "+
-			"This is a full upsert keyed on path — if a doc at that path already exists, it is completely replaced. "+
+			"This is a full upsert keyed on path — if a doc at that path already exists, its title, content, and tags are "+
+			"completely replaced (its annotations are kept). "+
 			"BEFORE writing, always call amp_kb_get to check if a doc exists at that path. If it does, read the "+
 			"existing content and merge your new information into it rather than overwriting with only what you know. "+
 			"Prefer updating an existing doc over creating a new one on the same topic.",
@@ -1473,6 +1474,8 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 			Content: doc.Content,
 			Tags:    doc.Tags, // kb.Doc.Tags is []string
 			Author:  doc.Author,
+			// Annotations travel with the doc.
+			Annotations: doc.Annotations,
 		}
 		kbDocs = append(kbDocs, exportDoc)
 	}
@@ -1520,7 +1523,7 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 	// 3. Re-index KB documents into Typesense
 	for _, kbDoc := range bundle.KBDocs {
-		_, err := s.kb.WriteDoc(ctx, kb.Project(newProject.ID), kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags, "")
+		_, err := s.kb.WriteDoc(ctx, kb.Project(newProject.ID), kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags, "", kbDoc.Annotations)
 		if err != nil {
 			// Log warning but continue (graceful degradation)
 			slog.Default().Warn("failed to write kb doc during import", "path", kbDoc.Path, "err", err)
@@ -1650,7 +1653,7 @@ func (s *Server) kbWrite(ctx context.Context, args map[string]interface{}) (*mcp
 	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	doc, err := s.kb.WriteDoc(ctx, k.Scope, path, title, content, authorOf(ctx, args), tags, reason)
+	doc, err := s.kb.WriteDoc(ctx, k.Scope, path, title, content, authorOf(ctx, args), tags, reason, nil)
 	if err != nil {
 		return nil, err
 	}

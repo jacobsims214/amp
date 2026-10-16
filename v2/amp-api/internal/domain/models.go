@@ -301,11 +301,20 @@ type ExportTask struct {
 
 // ExportKBDoc represents a knowledge base document for export.
 type ExportKBDoc struct {
-	Path    string   `json:"path"`
-	Title   string   `json:"title"`
-	Content string   `json:"content"`
-	Tags    []string `json:"tags"`
-	Author  string   `json:"author"`
+	Path        string         `json:"path"`
+	Title       string         `json:"title"`
+	Content     string         `json:"content"`
+	Tags        []string       `json:"tags"`
+	Author      string         `json:"author"`
+	Annotations []KBAnnotation `json:"annotations,omitempty"`
+}
+
+// KBAnnotation is a note left on a KB doc (kb.Annotation).
+type KBAnnotation struct {
+	Author     string `json:"author"`
+	Text       string `json:"text"`
+	CreatedAt  int64  `json:"created_at"`
+	IsResolved bool   `json:"is_resolved"`
 }
 
 // ---- Auth / users ----

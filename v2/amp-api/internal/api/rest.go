@@ -329,7 +329,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		// Re-index all KB docs: for each bundle.KBDocs, call WriteDoc
 		for _, doc := range bundle.KBDocs {
 			// Convert []string tags to []string (already in correct format)
-			_, err := h.kb.WriteDoc(r.Context(), kb.Project(newProject.ID), doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags, "")
+			_, err := h.kb.WriteDoc(r.Context(), kb.Project(newProject.ID), doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags, "", doc.Annotations)
 			if err != nil {
 				// Log but continue — don't fail the entire import if one doc fails
 				slog.Warn("failed to write KB doc during import", "path", doc.Path, "err", err)
@@ -484,6 +484,8 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				Content: doc.Content,
 				Tags:    doc.Tags,
 				Author:  doc.Author,
+				// Annotations travel with the doc.
+				Annotations: doc.Annotations,
 			})
 		}
 		bundle.KBDocs = kbDocs
@@ -1276,7 +1278,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			if sc.Kind == kb.ScopeProject {
 				body.Reason = ""
 			}
-			doc, err := h.kb.WriteDoc(r.Context(), sc, body.Path, body.Title, body.Content, body.Author, body.Tags, strings.TrimSpace(body.Reason))
+			doc, err := h.kb.WriteDoc(r.Context(), sc, body.Path, body.Title, body.Content, body.Author, body.Tags, strings.TrimSpace(body.Reason), nil)
 			if err != nil {
 				jsonErr(w, err, 500)
 				return

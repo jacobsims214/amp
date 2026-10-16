@@ -23,15 +23,17 @@ const (
 
 // WriteDocPayload mirrors kb.Service.WriteDoc's arguments exactly.
 type WriteDocPayload struct {
-	ProjectID int      `json:"project_id"`
-	Scope     string   `json:"scope,omitempty"` // "" = project (tasks queued before scopes)
-	ScopeID   int      `json:"scope_id,omitempty"`
-	Reason    string   `json:"reason,omitempty"`
-	Path      string   `json:"path"`
-	Title     string   `json:"title"`
-	Content   string   `json:"content"`
-	Author    string   `json:"author"`
-	Tags      []string `json:"tags"`
+	ProjectID int    `json:"project_id"`
+	Scope     string `json:"scope,omitempty"` // "" = project (tasks queued before scopes)
+	ScopeID   int    `json:"scope_id,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+	// Annotations (JSON) to write with the doc; "" keeps the existing doc's.
+	Annotations string   `json:"annotations,omitempty"`
+	Path        string   `json:"path"`
+	Title       string   `json:"title"`
+	Content     string   `json:"content"`
+	Author      string   `json:"author"`
+	Tags        []string `json:"tags"`
 }
 
 // DeleteDocPayload mirrors kb.Service.DeleteDoc's arguments exactly.
