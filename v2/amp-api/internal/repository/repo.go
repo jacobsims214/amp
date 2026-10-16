@@ -166,7 +166,7 @@ func (r *Repo) CreateProject(ctx context.Context, req domain.CreateProjectReques
 		req.Name, req.Code, req.Description, req.OrgID, req.CreatedBy,
 	), p)
 	if isUniqueViolation(err) {
-		return nil, fmt.Errorf("project code %q already exists: %w", req.Code, ErrConflict)
+		return nil, conflictf("project code %q already exists", req.Code)
 	}
 	if err != nil {
 		return nil, err
@@ -777,7 +777,7 @@ func (r *Repo) ImportBundle(ctx context.Context, bundle domain.ExportBundle, new
 		projectName, projectCode, bundle.Project.Description, home.OrgID, home.CreatedBy,
 	), newProject)
 	if isUniqueViolation(err) {
-		return nil, fmt.Errorf("project code %q already exists: %w", projectCode, ErrConflict)
+		return nil, conflictf("project code %q already exists", projectCode)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("create project: %w", err)

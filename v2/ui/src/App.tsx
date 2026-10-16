@@ -5,6 +5,7 @@ import { DAGView } from './pages/DAG'
 import { Report } from './pages/Report'
 import { KB } from './pages/KB'
 import { Users } from './pages/Users'
+import { Orgs } from './pages/Orgs'
 import { AuthProvider } from './contexts/AuthContext'
 
 export default function App() {
@@ -18,6 +19,7 @@ export default function App() {
           <Route path="/project/:projectId/report" element={<Report />} />
           <Route path="/project/:projectId/kb" element={<KB />} />
           <Route path="/admin/users" element={<Users />} />
+          <Route path="/admin/orgs" element={<Orgs />} />
         </Routes>
       </BrowserRouter>
     </AuthProvider>

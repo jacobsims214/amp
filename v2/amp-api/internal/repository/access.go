@@ -22,6 +22,16 @@ var ErrNotFound = errors.New("not found")
 // ErrConflict marks writes rejected by a uniqueness rule or a "last owner" guard.
 var ErrConflict = errors.New("conflict")
 
+// conflictError is a user-facing message that matches ErrConflict.
+type conflictError struct{ msg string }
+
+func (e *conflictError) Error() string        { return e.msg }
+func (e *conflictError) Is(target error) bool { return target == ErrConflict }
+
+func conflictf(format string, a ...any) error {
+	return &conflictError{msg: fmt.Sprintf(format, a...)}
+}
+
 func isUniqueViolation(err error) bool {
 	var pgErr *pgconn.PgError
 	return errors.As(err, &pgErr) && pgErr.Code == "23505"
@@ -153,7 +163,7 @@ func (r *Repo) CreateOrg(ctx context.Context, name, slug string, createdBy, owne
 		`INSERT INTO orgs AS o (name, slug, created_by) VALUES ($1, $2, $3) RETURNING `+orgCols,
 		name, slug, createdBy), o)
 	if isUniqueViolation(err) {
-		return nil, fmt.Errorf("org slug %q already exists: %w", slug, ErrConflict)
+		return nil, conflictf("org slug %q already exists", slug)
 	}
 	if err != nil {
 		return nil, err
@@ -210,7 +220,7 @@ func (r *Repo) DeleteOrg(ctx context.Context, id int) error {
 	_, err := r.db.Exec(ctx, `DELETE FROM orgs WHERE id = $1`, id)
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23503" {
-		return fmt.Errorf("org %d still has projects: %w", id, ErrConflict)
+		return conflictf("this org still has projects; move or delete them first")
 	}
 	return err
 }
@@ -297,7 +307,7 @@ func guardLastOrgOwner(ctx context.Context, tx pgx.Tx, orgID, userID int) error 
 	}
 	rows.Close()
 	if len(owners) == 1 && owners[0] == userID {
-		return fmt.Errorf("user %d is the org's last owner: %w", userID, ErrConflict)
+		return conflictf("an org needs at least one owner; make someone else an owner first")
 	}
 	return nil
 }
@@ -316,7 +326,7 @@ func (r *Repo) CreateTeam(ctx context.Context, orgID int, name string, createdBy
 		`INSERT INTO teams AS t (org_id, name, created_by) VALUES ($1, $2, $3) RETURNING `+teamCols,
 		orgID, name, createdBy), t)
 	if isUniqueViolation(err) {
-		return nil, fmt.Errorf("team %q already exists in this org: %w", name, ErrConflict)
+		return nil, conflictf("team %q already exists in this org", name)
 	}
 	return t, err
 }
@@ -354,7 +364,7 @@ func (r *Repo) ListUserTeams(ctx context.Context, orgID, userID int) ([]domain.M
 func (r *Repo) RenameTeam(ctx context.Context, id int, name string) error {
 	tag, err := r.db.Exec(ctx, `UPDATE teams SET name = $1 WHERE id = $2`, name, id)
 	if isUniqueViolation(err) {
-		return fmt.Errorf("team %q already exists in this org: %w", name, ErrConflict)
+		return conflictf("team %q already exists in this org", name)
 	}
 	if err == nil && tag.RowsAffected() == 0 {
 		return fmt.Errorf("team %d: %w", id, ErrNotFound)
@@ -388,7 +398,7 @@ func (r *Repo) DeleteTeam(ctx context.Context, id int) error {
 	}
 	rows.Close()
 	if len(orphaned) > 0 {
-		return fmt.Errorf("team %d is the only owner team of projects %v; link another owner team first: %w", id, orphaned, ErrConflict)
+		return conflictf("this team is the only owner team of projects %v; give those projects another owner team first", orphaned)
 	}
 	if _, err := tx.Exec(ctx, `DELETE FROM teams WHERE id = $1`, id); err != nil {
 		return err
@@ -473,7 +483,7 @@ func (r *Repo) SetProjectTeam(ctx context.Context, projectID, teamID int, role s
 		return err
 	}
 	if !sameOrg {
-		return fmt.Errorf("team %d is not in project %d's org: %w", teamID, projectID, ErrConflict)
+		return conflictf("that team belongs to a different org than this project")
 	}
 	if role != domain.ProjectTeamOwner {
 		if err := guardLastOwnerTeam(ctx, tx, projectID, teamID); err != nil {
@@ -519,7 +529,7 @@ func guardLastOwnerTeam(ctx context.Context, tx pgx.Tx, projectID, teamID int) e
 	}
 	rows.Close()
 	if len(owners) == 1 && owners[0] == teamID {
-		return fmt.Errorf("team %d is project %d's last owner team: %w", teamID, projectID, ErrConflict)
+		return conflictf("a project needs at least one owner team; make another team an owner first")
 	}
 	return nil
 }

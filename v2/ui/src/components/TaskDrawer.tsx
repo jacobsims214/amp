@@ -1,14 +1,24 @@
-import { useEffect, useState } from 'react'
-import { X, Clock, User, UserCheck, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus } from 'lucide-react'
 import { api } from '../api/client'
 import { StatusBadge } from './StatusBadge'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
-import type { Task, Comment, ActivityLog } from '../types'
+import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
+import { canReassignTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess } from '../types'
 
 interface Props {
   task: Task | null
   onClose: () => void
   onRefresh?: () => void
+  /** project members, for owner names and the assign select */
+  members?: ProjectMember[]
+  /** caller's user id; undefined in local-dev mode */
+  meId?: number
+  /** caller's project access (my_access); gates working others' tickets */
+  myAccess?: ProjectAccess | null
+  /** called with the updated task after claim/assign/release */
+  onTaskUpdated?: (task: Task) => void
 }
 
 function relativeTime(iso: string) {
@@ -45,7 +55,7 @@ const inputCls =
   'w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] placeholder-[#3D5068] ' +
   'focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, onTaskUpdated }: Props) {
   const [history, setHistory] = useState<ActivityLog[]>([])
   const [comments, setComments] = useState<Comment[]>([])
   const [tab, setTab] = useState<'history' | 'details'>('history')
@@ -55,6 +65,9 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
   const [editSaving, setEditSaving] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [editError, setEditError] = useState<string | null>(null)
+  const people = useMemo(() => peopleById(members), [members])
 
   useEffect(() => {
     if (!task) return
@@ -63,15 +76,20 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
     Promise.all([api.getHistory(task.id), api.getComments(task.id)])
       .then(([h, c]) => { setHistory(h); setComments(c) })
       .finally(() => setLoading(false))
-  }, [task?.id])
+    // Reload when ownership or state changes too, so the history shows the
+    // assignment or transition that just happened.
+  }, [task?.id, task?.owner_user_id, task?.state])
 
   const handleEditSave = async () => {
     setEditSaving(true)
+    setEditError(null)
     try {
       await api.updateTask(task!.id, editForm)
       setEditing(false)
       onRefresh?.()
       onClose()
+    } catch (e) {
+      setEditError(e instanceof Error ? e.message : 'Save failed')
     } finally {
       setEditSaving(false)
     }
@@ -79,17 +97,21 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
 
   const handleDelete = async () => {
     setDeleting(true)
+    setDeleteError(null)
     try {
       await api.deleteTask(task!.id)
       setShowDeleteConfirm(false)
       onClose()
       onRefresh?.()
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : 'Delete failed')
     } finally {
       setDeleting(false)
     }
   }
 
   if (!task) return null
+  const canWork = canWorkTask(task, meId, myAccess)
 
   return (
     <>
@@ -125,7 +147,7 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
             <h2 className="text-base font-semibold text-[#DDE6F0] leading-snug">{task.name}</h2>
           </div>
           <div className="flex items-center gap-0.5 flex-shrink-0">
-            <button
+            {canWork && <button
               onClick={() => {
                 setEditForm({
                   name: task.name,
@@ -134,15 +156,16 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
                   assigned_to: task.assigned_to || '',
                   priority: task.priority || '1',
                 })
+                setEditError(null)
                 setEditing(true)
               }}
               className="p-2 hover:bg-[#172540] rounded-lg transition-colors cursor-pointer"
               title="Edit task"
             >
               <Pencil size={13} className="text-[#7E91A8]" />
-            </button>
+            </button>}
             <button
-              onClick={() => setShowDeleteConfirm(true)}
+              onClick={() => { setDeleteError(null); setShowDeleteConfirm(true) }}
               className="p-2 hover:bg-[#EF4444]/10 rounded-lg transition-colors cursor-pointer"
               title="Delete task"
             >
@@ -157,15 +180,17 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
         {/* Meta strip */}
         <div className="flex items-center gap-3 px-6 py-2.5 border-b border-[#192238] bg-[#08101F]/50 flex-wrap">
           {task.assigned_to && !task.agent_id && (
-            <div className="flex items-center gap-1.5 text-xs text-[#818CF8]" title="Planned assignee">
-              <UserCheck size={11} />
+            <div className="flex items-center gap-1.5 text-xs text-[#818CF8]" title="Planned agent">
+              <Bot size={11} />
+              <span className="text-[#3D5068]">Agent</span>
               <span className="font-medium">{task.assigned_to}</span>
               <span className="text-[#3D5068]">(planned)</span>
             </div>
           )}
           {task.agent_id && (
             <div className="flex items-center gap-1.5 text-xs text-[#10B981]" title="Active agent">
-              <User size={11} />
+              <Bot size={11} />
+              <span className="text-[#3D5068]">Agent</span>
               <span className="font-medium">{task.agent_id}</span>
             </div>
           )}
@@ -201,6 +226,18 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
           )}
         </div>
 
+        {/* Owner */}
+        <OwnerSection
+          key={task.id}
+          task={task}
+          people={people}
+          members={members}
+          meId={meId}
+          myAccess={myAccess}
+          canWork={canWork}
+          onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())}
+        />
+
         {/* Tabs */}
         <div className="flex border-b border-[#1E2C45]">
           {(['history', 'details'] as const).map(t => (
@@ -220,7 +257,7 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
 
         {/* Content */}
         <div className="flex-1 overflow-y-auto p-6">
-          {editing ? (
+          {editing && canWork ? (
             <div className="space-y-4">
               <div>
                 <label className="text-xs font-medium text-[#7E91A8] block mb-1.5">Name</label>
@@ -238,9 +275,9 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
                   rows={3} className={`${inputCls} resize-none`} />
               </div>
               <div>
-                <label className="text-xs font-medium text-[#7E91A8] block mb-1.5">Assigned To</label>
+                <label className="text-xs font-medium text-[#7E91A8] block mb-1.5">Agent</label>
                 <input value={editForm.assigned_to} onChange={e => setEditForm(f => ({ ...f, assigned_to: e.target.value }))}
-                  className={inputCls} />
+                  className={inputCls} placeholder="amp-worker" />
               </div>
               <div>
                 <label className="text-xs font-medium text-[#7E91A8] block mb-1.5">Priority</label>
@@ -249,6 +286,7 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
                   <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
                 </select>
               </div>
+              {editError && <p className="text-xs text-[#F87171]">{editError}</p>}
               <div className="flex gap-2 pt-1">
                 <button onClick={handleEditSave} disabled={editSaving}
                   className="flex items-center gap-1.5 px-4 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
@@ -266,7 +304,7 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
               <Loader2 size={20} className="text-[#7E91A8] animate-spin" />
             </div>
           ) : tab === 'details' ? (
-            <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} />
+            <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} canWork={canWork} />
           ) : (
             <HistoryTab history={history} comments={comments} />
           )}
@@ -280,13 +318,132 @@ export function TaskDrawer({ task, onClose, onRefresh }: Props) {
           onClose={() => setShowDeleteConfirm(false)}
           onConfirm={handleDelete}
           deleting={deleting}
+          error={deleteError}
         />
       )}
     </>
   )
 }
 
-function DetailsTab({ task, onClose, onRefresh }: { task: Task; onClose: () => void; onRefresh?: () => void }) {
+function OwnerSection({ task, people, members, meId, myAccess, canWork, onUpdated }: {
+  task: Task
+  people: Map<number, Person>
+  members: ProjectMember[]
+  meId?: number
+  myAccess: ProjectAccess | null
+  canWork: boolean
+  onUpdated: (task: Task) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const owner = lookupPerson(people, task.owner_user_id)
+  const creator = lookupPerson(people, task.created_by)
+  const isMine = meId != null && task.owner_user_id === meId
+  const ownedByOther = !!owner && meId != null && !isMine
+  // Taking over / reassigning someone else's ticket needs lead access or above.
+  const canAssign = canWork || canReassignTask(myAccess)
+
+  const assign = async (user: string | number) => {
+    setBusy(true)
+    setError(null)
+    try {
+      onUpdated(await api.assignTask(task.id, user))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Assignment failed')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const btnCls =
+    'flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ' +
+    'disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97]'
+
+  return (
+    <div className="px-6 py-3 border-b border-[#192238] space-y-2">
+      <div className="flex items-center gap-3 flex-wrap">
+        <span className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest">Owner</span>
+        {owner ? (
+          <div className="flex items-center gap-1.5 min-w-0">
+            <OwnerAvatar person={owner} size={20} />
+            <span className="text-sm text-[#DDE6F0] font-medium truncate" title={owner.email}>{owner.name}</span>
+            {isMine && <span className="text-xs text-[#3D5068]">(you)</span>}
+          </div>
+        ) : (
+          <UnassignedPill />
+        )}
+        <div className="flex items-center gap-1.5 ml-auto">
+          {busy && <Loader2 size={12} className="text-[#7E91A8] animate-spin" />}
+          {!owner && meId != null && (
+            <button
+              onClick={() => assign('me')}
+              disabled={busy}
+              className={btnCls}
+              style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+              title="Take ownership of this ticket"
+            >
+              <Hand size={11} />
+              Claim
+            </button>
+          )}
+          {ownedByOther && canReassignTask(myAccess) && (
+            <button
+              onClick={() => assign('me')}
+              disabled={busy}
+              className={btnCls}
+              style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+              title={`Take this ticket over from ${owner!.name}`}
+            >
+              <Hand size={11} />
+              Reassign to me
+            </button>
+          )}
+          {owner && canAssign && (
+            <button
+              onClick={() => assign('none')}
+              disabled={busy}
+              className={`${btnCls} text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] border border-[#1E2C45]`}
+              title="Release back to the unassigned pool"
+            >
+              <UserMinus size={11} />
+              Unassign
+            </button>
+          )}
+          {members.length > 0 && canAssign && (
+            <select
+              value=""
+              disabled={busy}
+              onChange={e => { if (e.target.value) assign(e.target.value) }}
+              className="bg-[#08101F] border border-[#1E2C45] rounded-lg px-2 py-1 text-xs text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] cursor-pointer disabled:opacity-50"
+              title="Assign to a project member"
+            >
+              <option value="">Assign to…</option>
+              {members.filter(m => m.user_id !== task.owner_user_id).map(m => (
+                <option key={m.user_id} value={m.user_id}>
+                  {personName(m)}{m.user_id === meId ? ' (me)' : ''}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+      </div>
+      <div className="text-xs text-[#3D5068]">
+        Created by{' '}
+        {creator
+          ? <span className="text-[#7E91A8]" title={creator.email}>{creator.name}{task.created_by === meId ? ' (you)' : ''}</span>
+          : <span className="italic">unknown</span>}
+      </div>
+      {!canWork && owner && (
+        <p className="text-xs text-[#FBBF24]">
+          Owned by {owner.name} — {canReassignTask(myAccess) ? 'reassign it to yourself' : 'ask them or a team lead to reassign it'} to work on it.
+        </p>
+      )}
+      {error && <p className="text-xs text-[#F87171]">{error}</p>}
+    </div>
+  )
+}
+
+function DetailsTab({ task, onClose, onRefresh, canWork }: { task: Task; onClose: () => void; onRefresh?: () => void; canWork: boolean }) {
   const [editingSchedule, setEditingSchedule] = useState(false)
   const [scheduleValue, setScheduleValue] = useState('')
   const [savingSchedule, setSavingSchedule] = useState(false)
@@ -340,15 +497,15 @@ function DetailsTab({ task, onClose, onRefresh }: { task: Task; onClose: () => v
       <div>
         <div className="flex items-center justify-between mb-2">
           <div className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest">Scheduled Start</div>
-          <button
+          {canWork && <button
             onClick={() => { setScheduleValue(task.start_at ? task.start_at.slice(0, 16) : ''); setEditingSchedule(true) }}
             className="text-xs text-[#818CF8] hover:text-[#6366F1] flex items-center gap-1 transition-colors cursor-pointer"
           >
             <Pencil size={10} />
             {task.start_at ? 'Edit' : 'Set schedule'}
-          </button>
+          </button>}
         </div>
-        {!editingSchedule ? (
+        {!editingSchedule || !canWork ? (
           task.start_at ? (
             <div className="text-sm text-[#DDE6F0] bg-[#08101F] rounded-xl p-4 border border-[#192238] flex items-center gap-2.5">
               <CalendarClock size={14} className="text-[#FBBF24] flex-shrink-0" />

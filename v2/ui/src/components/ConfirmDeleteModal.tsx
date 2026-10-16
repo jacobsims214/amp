@@ -6,9 +6,11 @@ interface ConfirmDeleteModalProps {
   onClose: () => void
   onConfirm: () => Promise<void>
   deleting?: boolean
+  /** API error from the last attempt, shown inline */
+  error?: string | null
 }
 
-export function ConfirmDeleteModal({ title, description, onClose, onConfirm, deleting = false }: ConfirmDeleteModalProps) {
+export function ConfirmDeleteModal({ title, description, onClose, onConfirm, deleting = false, error = null }: ConfirmDeleteModalProps) {
   return (
     <>
       <div
@@ -39,6 +41,7 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
               <p className="text-xs text-[#F87171] leading-relaxed">{description}</p>
             </div>
             <p className="text-xs text-[#3D5068]">This action cannot be undone.</p>
+            {error && <p className="text-xs text-[#F87171] mt-3">{error}</p>}
           </div>
           {/* Footer */}
           <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-[#1E2C45]">

@@ -1,4 +1,9 @@
-import type { Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation, CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest, Me, AmpUser, AuthAdminUser } from '../types'
+import type {
+  Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
+  CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
+  Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
+  ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
+} from '../types'
 
 const BASE = '/api'
 
@@ -34,15 +39,38 @@ async function patch<T>(path: string, body?: unknown): Promise<T> {
   return res.json()
 }
 
-async function del(path: string): Promise<void> {
-  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
-  if (!res.ok) throw new Error(`DELETE ${path}: ${res.status}`)
+async function put<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: body ? JSON.stringify(body) : undefined,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `PUT ${path}: ${res.status}`)
+  }
+  return res.json()
 }
+
+// del resolves to the parsed JSON body when there is one (several RBAC
+// endpoints return the updated resource), or undefined for empty bodies.
+async function del<T = void>(path: string): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, { method: 'DELETE' })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }))
+    throw new Error(err.error || `DELETE ${path}: ${res.status}`)
+  }
+  return res.json().catch(() => undefined) as Promise<T>
+}
+
+// The API accepts users as an email or numeric id, always sent as a string.
+const userRef = (user: string | number) => String(user)
 
 // Projects
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
+  createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
   restoreProject: (id: number) => post<Project>(`/projects/${id}/restore`),
 
@@ -64,6 +92,11 @@ export const api = {
   deleteEpic: (id: number) =>
     del(`/epics/${id}`),
 
+  addEpicOwner: (id: number, user: string | number) =>
+    post<{ epic: Epic }>(`/epics/${id}/owners`, { user: userRef(user) }).then(r => r.epic),
+  removeEpicOwner: (id: number, userId: number) =>
+    del<{ epic: Epic }>(`/epics/${id}/owners/${userId}`).then(r => r.epic),
+
   // Story CRUD
   createStory: (epicId: number, req: CreateStoryRequest) =>
     post<Story>(`/epics/${epicId}/stories`, req),
@@ -72,9 +105,27 @@ export const api = {
   deleteStory: (id: number) =>
     del(`/stories/${id}`),
 
+  addStoryOwner: (id: number, user: string | number) =>
+    post<{ story: Story }>(`/stories/${id}/owners`, { user: userRef(user) }).then(r => r.story),
+  removeStoryOwner: (id: number, userId: number) =>
+    del<{ story: Story }>(`/stories/${id}/owners/${userId}`).then(r => r.story),
+
+  // Project access
+  listProjectMembers: (projectId: number) =>
+    get<{ members: ProjectMember[] | null; my_access: ProjectAccess }>(`/projects/${projectId}/members`)
+      .then(r => ({ members: r.members ?? [], my_access: r.my_access })),
+  listProjectTeams: (projectId: number) =>
+    get<{ teams: ProjectTeam[] | null }>(`/projects/${projectId}/teams`).then(r => r.teams ?? []),
+  setProjectTeam: (projectId: number, teamId: number, role: ProjectTeamRole) =>
+    put<{ teams: ProjectTeam[] | null }>(`/projects/${projectId}/teams/${teamId}`, { role }).then(r => r.teams ?? []),
+  removeProjectTeam: (projectId: number, teamId: number) =>
+    del<{ teams: ProjectTeam[] | null }>(`/projects/${projectId}/teams/${teamId}`).then(r => r.teams ?? []),
+
   // Tasks
-  listTasks: (projectId: number) =>
-    get<{ tasks: Task[] }>(`/projects/${projectId}/tasks`).then(r => r.tasks ?? []),
+  // owner: 'any' = every ticket in the project (the board filters client-side);
+  // omitted server-side default is "my work" only.
+  listTasks: (projectId: number, owner = 'any') =>
+    get<{ tasks: Task[] }>(`/projects/${projectId}/tasks?owner=${encodeURIComponent(owner)}`).then(r => r.tasks ?? []),
   getTask: (id: number) => get<{ task: Task }>(`/tasks/${id}`).then(r => r.task),
 
   // Task CRUD
@@ -84,6 +135,9 @@ export const api = {
     patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),
   deleteTask: (id: number) =>
     del(`/tasks/${id}`),
+  /** user: member email/id, 'me' to claim, or 'none' to release */
+  assignTask: (id: number, user: string | number) =>
+    post<{ task: Task }>(`/tasks/${id}/assign`, { user: userRef(user) }).then(r => r.task),
   setTaskStartAt: (id: number, startAt: string | null) =>
     post<{ task_id: number; start_at: string | null }>(`/tasks/${id}/start_at`, { start_at: startAt }),
 
@@ -153,9 +207,13 @@ export const api = {
   },
 
   // Import
-  importProject: async (bundleText: string): Promise<Project> => {
+  importProject: async (bundleText: string, home?: { org_id?: number; team_id?: number }): Promise<Project> => {
     const bundle = JSON.parse(bundleText)
-    return post<Project>('/projects/import', bundle)
+    const params = new URLSearchParams()
+    if (home?.org_id) params.set('org_id', String(home.org_id))
+    if (home?.team_id) params.set('team_id', String(home.team_id))
+    const qs = params.toString()
+    return post<Project>(`/projects/import${qs ? '?' + qs : ''}`, bundle)
   },
 
   // Auth / identity
@@ -164,6 +222,41 @@ export const api = {
   setUserRole: (userId: number, role: string, grant: boolean) =>
     patch<{ user_id: number }>(`/users/${userId}/role`, { role, grant }),
   deleteUser: (userId: number) => del(`/users/${userId}`),
+
+  // Orgs
+  listOrgs: () => get<{ orgs: Org[] | null }>('/orgs').then(r => r.orgs ?? []),
+  getOrg: (id: number) => get<{ org: Org }>(`/orgs/${id}`).then(r => r.org),
+  createOrg: (req: { name: string; slug?: string; owner?: string }) =>
+    post<{ org: Org; owner_invite?: Invite }>('/orgs', req),
+  renameOrg: (id: number, name: string) => patch<{ org: Org }>(`/orgs/${id}`, { name }).then(r => r.org),
+  deleteOrg: (id: number) => del(`/orgs/${id}`),
+  listOrgMembers: (orgId: number) =>
+    get<{ members: Member[] | null }>(`/orgs/${orgId}/members`).then(r => r.members ?? []),
+  addOrgMember: (orgId: number, user: string | number, role: OrgRole) =>
+    post<AddMemberResult>(`/orgs/${orgId}/members`, { user: userRef(user), role }),
+  setOrgMemberRole: (orgId: number, userId: number, role: OrgRole) =>
+    put(`/orgs/${orgId}/members/${userId}`, { role }),
+  removeOrgMember: (orgId: number, userId: number) => del(`/orgs/${orgId}/members/${userId}`),
+  listOrgTeams: (orgId: number) =>
+    get<{ teams: Team[] | null }>(`/orgs/${orgId}/teams`).then(r => r.teams ?? []),
+  createTeam: (orgId: number, name: string) =>
+    post<{ team: Team }>(`/orgs/${orgId}/teams`, { name }).then(r => r.team),
+  listOrgInvites: (orgId: number) =>
+    get<{ invites: Invite[] | null }>(`/orgs/${orgId}/invites`).then(r => r.invites ?? []),
+  createInvite: (orgId: number, req: { email: string; org_role?: OrgRole; team_id?: number; team_role?: TeamRole }) =>
+    post<AddMemberResult>(`/orgs/${orgId}/invites`, req),
+  revokeInvite: (orgId: number, inviteId: number) => del(`/orgs/${orgId}/invites/${inviteId}`),
+
+  // Teams
+  getTeam: (id: number) =>
+    get<{ team: Team; members: Member[] | null }>(`/teams/${id}`).then(r => ({ team: r.team, members: r.members ?? [] })),
+  renameTeam: (id: number, name: string) => patch<{ team: Team }>(`/teams/${id}`, { name }).then(r => r.team),
+  deleteTeam: (id: number) => del(`/teams/${id}`),
+  addTeamMember: (teamId: number, user: string | number, role: TeamRole) =>
+    post<AddMemberResult>(`/teams/${teamId}/members`, { user: userRef(user), role }),
+  setTeamMemberRole: (teamId: number, userId: number, role: TeamRole) =>
+    put(`/teams/${teamId}/members/${userId}`, { role }),
+  removeTeamMember: (teamId: number, userId: number) => del(`/teams/${teamId}/members/${userId}`),
 }
 
 // ---- amp-authadmin — Dex credential CRUD (routed via Envoy at /authadmin/*) ----

@@ -1,12 +1,16 @@
-import { User, GitBranch, AlertCircle, UserCheck, Calendar } from 'lucide-react'
+import { Bot, GitBranch, AlertCircle, Calendar } from 'lucide-react'
 import type { Task } from '../types'
+import type { Person } from '../lib/people'
 import { PriorityBadge } from './PriorityBadge'
+import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 
 interface Props {
   task: Task
   onClick: () => void
   dimmed?: boolean
   isScheduled?: boolean
+  /** the ticket's human owner (resolved from owner_user_id); null = unassigned */
+  owner?: Person | null
 }
 
 // Shorten agent names for compact display on cards
@@ -45,7 +49,7 @@ const STATE_ACCENT: Record<string, string> = {
   completed:   'before:bg-[#10B981]',
 }
 
-export function TaskCard({ task, onClick, dimmed = false, isScheduled = false }: Props) {
+export function TaskCard({ task, onClick, dimmed = false, isScheduled = false, owner = null }: Props) {
   const activeAgent = task.agent_id
   const plannedAgent = !activeAgent && task.assigned_to ? task.assigned_to : null
   const scheduledStartAt = isScheduled ? getScheduledStartAt(task) : null
@@ -77,14 +81,25 @@ export function TaskCard({ task, onClick, dimmed = false, isScheduled = false }:
       style={{ padding: '10px 12px 10px 16px' }}
     >
       <div className="flex flex-col gap-2">
-        {/* Planned assignee badge */}
+        {/* Planned agent badge (agent profile, not the human owner) */}
         {plannedAgent && (
           <div
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-dashed border-[#6366F1]/35 bg-[#6366F1]/8 w-fit"
-            title={`Planned for: ${task.assigned_to}`}
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-dashed border-[#6366F1]/35 bg-[#6366F1]/8 w-fit max-w-full"
+            title={`Planned agent: ${task.assigned_to}`}
           >
-            <UserCheck size={10} className="text-[#818CF8] flex-shrink-0" />
-            <span className="text-xs text-[#818CF8] font-medium">{shortAgent(plannedAgent)}</span>
+            <Bot size={10} className="text-[#818CF8] flex-shrink-0" />
+            <span className="text-xs text-[#818CF8] font-medium truncate">{shortAgent(plannedAgent)}</span>
+          </div>
+        )}
+
+        {/* Active agent badge */}
+        {activeAgent && (
+          <div
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-[#10B981]/30 bg-[#10B981]/8 w-fit max-w-full"
+            title={`Agent working: ${activeAgent}`}
+          >
+            <Bot size={10} className="text-[#10B981] flex-shrink-0" />
+            <span className="text-xs text-[#10B981] font-medium truncate">{shortAgent(activeAgent)}</span>
           </div>
         )}
 
@@ -119,12 +134,7 @@ export function TaskCard({ task, onClick, dimmed = false, isScheduled = false }:
                 <GitBranch size={11} />
               </div>
             )}
-            {activeAgent && (
-              <div className="flex items-center gap-1 text-[#10B981]" title={`Working: ${activeAgent}`}>
-                <User size={11} />
-                <span className="text-xs truncate max-w-[64px]">{shortAgent(activeAgent)}</span>
-              </div>
-            )}
+            {owner ? <OwnerAvatar person={owner} title="Owner" /> : <UnassignedPill />}
           </div>
         </div>
       </div>
