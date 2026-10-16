@@ -500,3 +500,74 @@ func TestRBAC_WhoAmI(t *testing.T) {
 		t.Error("dave (org member, no team) listed as a project member")
 	}
 }
+
+// ---- Platform administration over MCP ----
+
+// An admin's agent can run the platform (orgs, teams, members, invites,
+// project access) through MCP, held to the same rules as the UI.
+func TestRBAC_AdminToolsOverMCP(t *testing.T) {
+	w := newRBACWorld(t)
+	sfx := fmt.Sprint(time.Now().UnixNano())
+	newEmail := "newhire-" + sfx + "@rbac.test"
+
+	// Only global admins create orgs.
+	wantErr(t, w.as(w.alice).callExpectError(t, "amp_create_org", map[string]interface{}{"name": "Nope " + sfx}), "only global admins")
+	res := w.as(w.root).call(t, "amp_create_org", map[string]interface{}{"name": "Platform " + sfx, "owner": w.alice.Email})
+	orgID := intField(t, res["org"].(map[string]interface{}), "id")
+	orgs := w.as(w.alice).call(t, "amp_list_orgs", map[string]interface{}{})["orgs"].([]interface{})
+	if !slices.ContainsFunc(orgs, func(o interface{}) bool {
+		m := o.(map[string]interface{})
+		return int(m["id"].(float64)) == orgID && m["my_role"] == "owner"
+	}) {
+		t.Fatalf("alice should own the new org: %v", orgs)
+	}
+
+	// alice, as org owner, builds a team and staffs it.
+	alice := w.as(w.alice)
+	team := alice.call(t, "amp_manage_teams", map[string]interface{}{"action": "create", "org_id": float64(orgID), "name": "Core"})["team"].(map[string]interface{})
+	teamID := float64(intField(t, team, "id"))
+	alice.call(t, "amp_manage_team_members", map[string]interface{}{"action": "add", "team_id": teamID, "user": w.bob.Email, "role": "lead"})
+	inv := alice.call(t, "amp_manage_team_members", map[string]interface{}{"action": "add", "team_id": teamID, "user": newEmail})
+	if inv["invited"] != true {
+		t.Fatalf("unknown email should be invited: %v", inv)
+	}
+	invites := alice.call(t, "amp_manage_invites", map[string]interface{}{"action": "list", "org_id": float64(orgID)})["invites"].([]interface{})
+	if len(invites) != 1 {
+		t.Fatalf("pending invites %v", invites)
+	}
+	alice.call(t, "amp_manage_invites", map[string]interface{}{"action": "revoke", "org_id": float64(orgID), "invite_id": invites[0].(map[string]interface{})["id"]})
+
+	// bob, a team lead, manages his team but not the org.
+	bob := w.as(w.bob)
+	bob.call(t, "amp_manage_team_members", map[string]interface{}{"action": "add", "team_id": teamID, "user": w.dave.Email})
+	wantErr(t, bob.callExpectError(t, "amp_manage_org_members", map[string]interface{}{"action": "add", "org_id": float64(orgID), "user": w.carol.Email}), "requires org owner or admin")
+	wantErr(t, bob.callExpectError(t, "amp_manage_teams", map[string]interface{}{"action": "create", "org_id": float64(orgID), "name": "Rogue"}), "requires org owner or admin")
+	members := alice.call(t, "amp_manage_team_members", map[string]interface{}{"action": "list", "team_id": teamID})["members"].([]interface{})
+	if len(members) != 2 {
+		t.Fatalf("team members %v, want bob and dave", members)
+	}
+
+	// Org roles: alice promotes carol to admin; an admin can't grant owner.
+	alice.call(t, "amp_manage_org_members", map[string]interface{}{"action": "add", "org_id": float64(orgID), "user": w.carol.Email, "role": "admin"})
+	wantErr(t, w.as(w.carol).callExpectError(t, "amp_manage_org_members", map[string]interface{}{"action": "set_role", "org_id": float64(orgID), "user": w.dave.Email, "role": "owner"}), "only org owners")
+	// The last owner can't be removed.
+	wantErr(t, w.as(w.root).callExpectError(t, "amp_manage_org_members", map[string]interface{}{"action": "remove", "org_id": float64(orgID), "user": w.alice.Email}), "at least one owner")
+
+	// Outsiders can't see the org at all.
+	wantErr(t, w.as(w.outsider).callExpectError(t, "amp_manage_org_members", map[string]interface{}{"action": "list", "org_id": float64(orgID)}), "not found")
+	wantErr(t, alice.callExpectError(t, "amp_manage_teams", map[string]interface{}{"action": "explode", "org_id": float64(orgID)}), "unknown action")
+}
+
+func TestRBAC_ProjectTeamsOverMCP(t *testing.T) {
+	w := newRBACWorld(t)
+	pid := float64(w.s.projectID)
+	teams := w.as(w.carol).call(t, "amp_manage_project_teams", map[string]interface{}{"action": "list", "project_id": pid})["teams"].([]interface{})
+	if len(teams) != 3 {
+		t.Fatalf("teams %v", teams)
+	}
+	wantErr(t, w.as(w.alice).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)}), "requires owner access")
+	w.as(w.owner).call(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)})
+	wantErr(t, w.as(w.carol).callExpectError(t, "amp_list_tasks", map[string]interface{}{"project_id": pid}), "not found")
+	wantErr(t, w.as(w.owner).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "link", "project_id": pid, "team_id": float64(w.x.ID)}), "different org")
+	wantErr(t, w.as(w.owner).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.core.ID)}), "at least one owner team")
+}

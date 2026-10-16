@@ -791,6 +791,23 @@ func TestE2E(t *testing.T) {
 		mate.must(t, 403, "GET", fmt.Sprintf("/api/kb/config?project_id=%d", pid), nil)
 		t.Log("REST enforcement for the teammate's UI session ✓")
 
+		// Platform admin over MCP: the admin's agent adds a second team and
+		// puts the teammate on it; the teammate's agent can't do admin work.
+		team2 := e.mustTool(t, adminTok, "amp_manage_teams", map[string]any{"action": "create", "org_id": orgID, "name": "Reviewers"})["team"].(map[string]any)
+		e.mustTool(t, adminTok, "amp_manage_team_members", map[string]any{"action": "add", "team_id": num(team2, "id"), "user": email2, "role": "lead"})
+		e.mustTool(t, adminTok, "amp_manage_project_teams", map[string]any{"action": "link", "project_id": pid, "team_id": num(team2, "id"), "role": "member"})
+		if _, err := e.tool(t, mateTok, "amp_create_org", map[string]any{"name": "nope"}); err == nil || !strings.Contains(err.Error(), "only global admins") {
+			t.Fatalf("teammate created an org over MCP: %v", err)
+		}
+		if _, err := e.tool(t, mateTok, "amp_manage_org_members", map[string]any{"action": "add", "org_id": orgID, "user": "x@amp.local"}); err == nil {
+			t.Fatal("teammate managed org members over MCP")
+		}
+		members := e.mustTool(t, mateTok, "amp_manage_team_members", map[string]any{"action": "list", "team_id": num(team2, "id")})["members"].([]any)
+		if len(members) != 1 {
+			t.Fatalf("Reviewers members %v", members)
+		}
+		t.Log("platform administration over MCP ✓")
+
 	default:
 		t.Fatalf("unknown AMP_E2E_PHASE %q", e.phase)
 	}

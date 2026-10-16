@@ -157,7 +157,15 @@ REST (see `internal/api/orgs.go` and the `RestHandler` doc comment):
 `POST /api/projects` and import take `org_id` and `team_id`, inferred when
 unambiguous.
 
-MCP: new tools `amp_whoami`, `amp_claim_task`, `amp_assign_task`,
+MCP — platform administration (same rules as the UI, so an admin's agent
+can run the platform): `amp_list_orgs`, `amp_create_org`,
+`amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`,
+`amp_manage_invites`, `amp_manage_project_teams`. The `manage_*` tools take
+an `action` (list/add/set_role/remove, list/create/rename/delete, …) rather
+than being split into many small tools. The rules live in
+`internal/service/orgs.go`, shared with the REST handlers.
+
+MCP — work: new tools `amp_whoami`, `amp_claim_task`, `amp_assign_task`,
 `amp_list_project_members`. `amp_create_task` takes `owner`. `amp_list_tasks`
 takes `owner` and defaults to your work. `amp_update_epic`/`amp_update_story`
 take `add_owners`/`remove_owners`. `amp_create_project`/`amp_import_project`

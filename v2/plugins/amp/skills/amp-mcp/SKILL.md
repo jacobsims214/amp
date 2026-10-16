@@ -24,6 +24,7 @@ one feature with no obvious entry point — scheduling.
 - **Stories**: `amp_create_story`, `amp_list_stories`, `amp_list_project_stories`, `amp_get_story`, `amp_update_story`
 - **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`, `amp_claim_task`, `amp_assign_task`
 - **People**: `amp_whoami`, `amp_list_project_members`
+- **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_create_org`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
 - **Knowledge base**: `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex` — see `amp-kb` skill for how to use these well
 
 ---
@@ -63,6 +64,22 @@ agent); `assigned_to`/`agent_id` still name the agent profile that runs it.
 - A project you aren't on (through one of your teams) is reported as not found.
   `amp_whoami` shows your orgs and teams; `amp_create_project` needs `org_id`/`team_id` only if
   you're in several.
+
+---
+
+## Platform administration
+
+If you act for an admin you can run the platform for them. The `amp_manage_*` tools take an
+`action`; check `amp_whoami` / `amp_list_orgs` for the IDs and your role first.
+
+- New org (global admins only): `amp_create_org` {name, owner?}.
+- People: `amp_manage_org_members` {org_id, action: list|add|set_role|remove, user, role}.
+  Adding an email that has never signed in creates an invite; it applies on their first sign-in.
+- Teams: `amp_manage_teams` {action: list|create|rename|delete, org_id or team_id, name};
+  members via `amp_manage_team_members` {team_id, action, user, role: lead|member}.
+- Project access: `amp_manage_project_teams` {project_id, action: list|link|unlink, team_id, role: owner|member}.
+- You get a "requires …" error for anything your user isn't allowed to do — report it, don't retry.
+  Creating login credentials (passwords) is still done on the Users page, not over MCP.
 
 ---
 

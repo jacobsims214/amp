@@ -10,6 +10,12 @@
 //	amp_update_task      amp_dispatch_task   amp_complete_task
 //	amp_block_task       amp_add_task_comment
 //	amp_export_project   amp_import_project
+//	amp_whoami           amp_list_project_members   amp_claim_task   amp_assign_task
+//	amp_list_orgs        amp_create_org             amp_manage_org_members
+//	amp_manage_teams     amp_manage_team_members    amp_manage_invites
+//	amp_manage_project_teams
+//
+// Every tool runs as the signed-in AMP user and is checked by internal/authz.
 package mcp
 
 import (
@@ -70,6 +76,76 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_list_project_members",
 		"List the people with access to a project (id, email, access level). Use to find who a ticket can be assigned to.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listProjectMembers)))
+
+	// ---- Platform administration (orgs, teams, members, invites) ----
+	// Same rules as the web UI: only global admins create orgs; org
+	// owners/admins manage members, teams and invites; team leads manage
+	// their own team. Anyone else gets a clear "requires …" error.
+	mcp.AddTool(tool("amp_list_orgs",
+		"List the orgs you belong to (global admins: every org), with your role in each.",
+		props{}), wrap(ctx, s.open(s.listOrgs)))
+
+	mcp.AddTool(tool("amp_create_org",
+		"Create an org. Global admins only. The owner defaults to you; pass an email to make someone else owner "+
+			"(if they have never signed in, they're invited as owner).",
+		props{
+			"name":  str("REQUIRED. Org name."),
+			"slug":  str("Optional. URL-safe id (lowercase, digits, dashes); derived from the name if omitted."),
+			"owner": str("Optional. Email or user id of the first owner."),
+		}), wrap(ctx, s.open(s.createOrg)))
+
+	mcp.AddTool(tool("amp_manage_org_members",
+		"List, add, change the role of, or remove members of an org. Adding an email that has never signed in "+
+			"creates an invite that applies on their first sign-in. Requires org owner/admin (owner role changes: org owners only).",
+		props{
+			"org_id": num("REQUIRED. Org ID."),
+			"action": str("REQUIRED. One of: list, add, set_role, remove."),
+			"user":   str("For add/set_role/remove: email or user id."),
+			"role":   str("For add/set_role: owner, admin, or member (default member)."),
+		}), wrap(ctx, s.open(s.manageOrgMembers)))
+
+	mcp.AddTool(tool("amp_manage_teams",
+		"List, create, rename, or delete teams in an org. Creating/renaming/deleting requires org owner/admin. "+
+			"A team that is a project's only owner team can't be deleted.",
+		props{
+			"action":  str("REQUIRED. One of: list, create, rename, delete."),
+			"org_id":  num("For list/create: org ID."),
+			"team_id": num("For rename/delete: team ID."),
+			"name":    str("For create/rename: team name."),
+		}), wrap(ctx, s.open(s.manageTeams)))
+
+	mcp.AddTool(tool("amp_manage_team_members",
+		"List, add, change the role of, or remove members of a team. Adding someone also adds them to the team's org; "+
+			"an email that has never signed in is invited. Requires the team's lead or an org owner/admin.",
+		props{
+			"team_id": num("REQUIRED. Team ID."),
+			"action":  str("REQUIRED. One of: list, add, set_role, remove."),
+			"user":    str("For add/set_role/remove: email or user id."),
+			"role":    str("For add/set_role: lead or member (default member)."),
+		}), wrap(ctx, s.open(s.manageTeamMembers)))
+
+	mcp.AddTool(tool("amp_manage_invites",
+		"List, create, or revoke pending invites for people who haven't signed in yet. Requires org owner/admin "+
+			"(team leads may invite into their own team).",
+		props{
+			"org_id":    num("REQUIRED. Org ID."),
+			"action":    str("REQUIRED. One of: list, create, revoke."),
+			"email":     str("For create: the person's email."),
+			"org_role":  str("For create: owner, admin, or member (default member)."),
+			"team_id":   num("For create: optional team to join."),
+			"team_role": str("For create: lead or member (default member)."),
+			"invite_id": num("For revoke: invite ID."),
+		}), wrap(ctx, s.open(s.manageInvites)))
+
+	mcp.AddTool(tool("amp_manage_project_teams",
+		"List the teams with access to a project, link a team (of the project's org) as owner or member, or unlink one. "+
+			"Changing links requires project owner access. A project always keeps at least one owner team.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"action":     str("REQUIRED. One of: list, link, unlink."),
+			"team_id":    num("For link/unlink: team ID."),
+			"role":       str("For link: owner or member (default member)."),
+		}), wrap(ctx, s.guard(authz.Member, s.manageProjectTeams)))
 
 	mcp.AddTool(tool("amp_list_projects", "List the active projects you have access to.",
 		props{}), wrap(ctx, s.open(s.listProjects)))
@@ -1560,6 +1636,202 @@ func (s *Server) kbStatus(_ context.Context, args map[string]interface{}) (*mcpg
 		return nil, err
 	}
 	return jsonResult(status)
+}
+
+// ---- Platform administration handlers (rules in internal/service/orgs.go) ----
+
+func action(args map[string]interface{}) string {
+	return strings.ToLower(strings.TrimSpace(optStr(args, "action", "")))
+}
+
+func badAction(a string, valid string) error {
+	return fmt.Errorf("unknown action %q; use one of: %s", a, valid)
+}
+
+func (s *Server) listOrgs(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	orgs, err := s.svc.ListOrgs(rctx, caller(rctx).p)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"orgs": orgs})
+}
+
+func (s *Server) createOrg(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	org, inv, err := s.svc.CreateOrg(rctx, caller(rctx).p, optStr(args, "name", ""), optStr(args, "slug", ""), optStr(args, "owner", ""))
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]interface{}{"org": org}
+	if inv != nil {
+		out["owner_invite"] = inv
+	}
+	return jsonResult(out)
+}
+
+func (s *Server) manageOrgMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	orgID, err := reqInt(args, "org_id")
+	if err != nil {
+		return nil, err
+	}
+	p, user, role := caller(rctx).p, optStr(args, "user", ""), optStr(args, "role", "")
+	switch a := action(args); a {
+	case "list":
+		members, err := s.svc.ListOrgMembers(rctx, p, orgID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"members": members})
+	case "add", "set_role":
+		res, err := s.svc.AddOrgMember(rctx, p, orgID, user, role, a == "add")
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(res)
+	case "remove":
+		uid, err := s.svc.RemoveOrgMember(rctx, p, orgID, user)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"org_id": orgID, "user_id": uid, "removed": true})
+	default:
+		return nil, badAction(a, "list, add, set_role, remove")
+	}
+}
+
+func (s *Server) manageTeams(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	p, name := caller(rctx).p, optStr(args, "name", "")
+	switch a := action(args); a {
+	case "list", "create":
+		orgID, err := reqInt(args, "org_id")
+		if err != nil {
+			return nil, err
+		}
+		if a == "list" {
+			teams, err := s.svc.ListTeams(rctx, p, orgID)
+			if err != nil {
+				return nil, err
+			}
+			return jsonResult(map[string]interface{}{"teams": teams})
+		}
+		team, err := s.svc.CreateTeam(rctx, p, orgID, name)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team": team})
+	case "rename", "delete":
+		teamID, err := reqInt(args, "team_id")
+		if err != nil {
+			return nil, err
+		}
+		if a == "delete" {
+			if err := s.svc.DeleteTeam(rctx, p, teamID); err != nil {
+				return nil, err
+			}
+			return jsonResult(map[string]interface{}{"team_id": teamID, "deleted": true})
+		}
+		team, err := s.svc.RenameTeam(rctx, p, teamID, name)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team": team})
+	default:
+		return nil, badAction(a, "list, create, rename, delete")
+	}
+}
+
+func (s *Server) manageTeamMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	teamID, err := reqInt(args, "team_id")
+	if err != nil {
+		return nil, err
+	}
+	p, user, role := caller(rctx).p, optStr(args, "user", ""), optStr(args, "role", "")
+	switch a := action(args); a {
+	case "list":
+		team, members, err := s.svc.GetTeam(rctx, p, teamID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team": team, "members": members})
+	case "add", "set_role":
+		res, err := s.svc.AddTeamMember(rctx, p, teamID, user, role, a == "add")
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(res)
+	case "remove":
+		uid, err := s.svc.RemoveTeamMember(rctx, p, teamID, user)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"team_id": teamID, "user_id": uid, "removed": true})
+	default:
+		return nil, badAction(a, "list, add, set_role, remove")
+	}
+}
+
+func (s *Server) manageInvites(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	orgID, err := reqInt(args, "org_id")
+	if err != nil {
+		return nil, err
+	}
+	p := caller(rctx).p
+	switch a := action(args); a {
+	case "list":
+		invites, err := s.svc.ListInvites(rctx, p, orgID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"invites": invites})
+	case "create":
+		res, err := s.svc.Invite(rctx, p, domain.Invite{
+			Email: optStr(args, "email", ""), OrgID: orgID,
+			OrgRole: optStr(args, "org_role", ""), TeamID: optIntPtr(args, "team_id"), TeamRole: optStr(args, "team_role", ""),
+		})
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(res)
+	case "revoke":
+		id, err := reqInt(args, "invite_id")
+		if err != nil {
+			return nil, err
+		}
+		if err := s.svc.RevokeInvite(rctx, p, orgID, id); err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"invite_id": id, "revoked": true})
+	default:
+		return nil, badAction(a, "list, create, revoke")
+	}
+}
+
+func (s *Server) manageProjectTeams(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	p := caller(rctx).p
+	var teams []domain.ProjectTeam
+	switch a := action(args); a {
+	case "list":
+		teams, err = s.svc.ListProjectTeams(rctx, p, projectID)
+	case "link", "unlink":
+		teamID, terr := reqInt(args, "team_id")
+		if terr != nil {
+			return nil, terr
+		}
+		if a == "link" {
+			teams, err = s.svc.SetProjectTeam(rctx, p, projectID, teamID, optStr(args, "role", ""))
+		} else {
+			teams, err = s.svc.RemoveProjectTeam(rctx, p, projectID, teamID)
+		}
+	default:
+		return nil, badAction(a, "list, link, unlink")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"project_id": projectID, "teams": teams})
 }
 
 // changeOwners applies add_owners / remove_owners for an epic or story.
