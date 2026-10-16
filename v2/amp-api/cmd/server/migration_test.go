@@ -85,6 +85,12 @@ func TestMigration_UpgradeFromUnversionedSchema(t *testing.T) {
 	q(`INSERT INTO epics (project_id, name) VALUES ($1, 'e') RETURNING id`, &epic, p1)
 	q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 's') RETURNING id`, &story, p1, epic)
 	q(`INSERT INTO tasks (project_id, epic_id, story_id, name, state, agent_id) VALUES ($1, $2, $3, 't', 'in_progress', 'amp-worker') RETURNING id`, &task, p1, epic, story)
+	// Completed before completed_at was persisted: only the log knows when.
+	var done, doneNoLog int
+	completedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	q(`INSERT INTO tasks (project_id, epic_id, story_id, name, state) VALUES ($1, $2, $3, 'done', 'completed') RETURNING id`, &done, p1, epic, story)
+	db.Exec(ctx, `INSERT INTO activity_log (task_id, project_id, actor, action, created_at) VALUES ($1, $2, 'agent', 'completed', $3)`, done, p1, completedAt) //nolint:errcheck
+	q(`INSERT INTO tasks (project_id, epic_id, story_id, name, state) VALUES ($1, $2, $3, 'done, no log', 'completed') RETURNING id`, &doneNoLog, p1, epic, story)
 
 	repo, err := repository.New(ctx, dsn)
 	if err != nil {
@@ -129,6 +135,13 @@ func TestMigration_UpgradeFromUnversionedSchema(t *testing.T) {
 	}
 	if got.OwnerUserID != nil || got.CreatedBy != nil || got.State != "in_progress" || got.AgentID != "amp-worker" {
 		t.Errorf("legacy task changed by the upgrade: %+v", got)
+	}
+	// Completion times are recovered from the activity log (or the last update).
+	if got, _ := repo.GetTask(ctx, done); got.CompletedAt == nil || !got.CompletedAt.Equal(completedAt) {
+		t.Errorf("backfilled completed_at = %v, want %v", got.CompletedAt, completedAt)
+	}
+	if got, _ := repo.GetTask(ctx, doneNoLog); got.CompletedAt == nil {
+		t.Error("completed task without a log entry got no completed_at")
 	}
 	var orgless int
 	q(`SELECT COUNT(*) FROM projects WHERE org_id IS NULL`, &orgless)

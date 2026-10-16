@@ -518,9 +518,14 @@ func (r *Repo) ListStoriesByProject(ctx context.Context, projectID int) ([]domai
 	return collect(rows, scanStory)
 }
 
+// SetTaskState records a task's state. completed_at is stamped when the
+// task completes (kept if it already was) and cleared when it leaves
+// completed, so reports read it from the database, not actor memory.
 func (r *Repo) SetTaskState(ctx context.Context, taskID int, state domain.TaskState, blockReason string) error {
 	_, err := r.db.Exec(ctx,
-		`UPDATE tasks SET state = $1, block_reason = $2, updated_at = NOW() WHERE id = $3`,
+		`UPDATE tasks SET state = $1, block_reason = $2, updated_at = NOW(),
+		   completed_at = CASE WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW()) END
+		 WHERE id = $3`,
 		state, blockReason, taskID,
 	)
 	return err
