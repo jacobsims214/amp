@@ -260,6 +260,8 @@ func TestRBAC_ClaimAssignRelease(t *testing.T) {
 		t.Fatalf("owner after bob's claim = %v", o)
 	}
 	wantErr(t, w.as(w.alice).callExpectError(t, "amp_claim_task", map[string]interface{}{"task_id": float64(pool)}), "owned by")
+	// Claiming never takes a ticket from someone, even for a global admin.
+	wantErr(t, w.as(w.root).callExpectError(t, "amp_claim_task", map[string]interface{}{"task_id": float64(pool)}), "owned by")
 	wantErr(t, w.as(w.alice).callExpectError(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(pool), "agent_id": "a"}), "owned by")
 	wantErr(t, w.as(w.alice).callExpectError(t, "amp_complete_task", map[string]interface{}{"task_id": float64(pool)}), "owned by")
 	// Others can still read and comment.
@@ -418,6 +420,23 @@ func TestRBAC_ProjectManagementNeedsOwner(t *testing.T) {
 	}
 	w.as(w.owner).call(t, "amp_archive_project", map[string]interface{}{"project_id": float64(w.s.projectID)})
 	w.as(w.orgadmin).call(t, "amp_restore_project", map[string]interface{}{"project_id": float64(w.s.projectID)})
+}
+
+// Leads and project owners reassign; they don't work someone else's ticket
+// under that person's name. Org admins can, as an escape hatch.
+func TestRBAC_OnlyTheOwnerWorksATicket(t *testing.T) {
+	w := newRBACWorld(t)
+	tid := taskID(t, w.as(w.alice).mkTask(t, "alice's", nil))
+	for _, id := range []*auth.Identity{w.bob, w.lead, w.owner} {
+		for _, tool := range []string{"amp_complete_task", "amp_block_task", "amp_update_task"} {
+			msg := w.as(id).callExpectError(t, tool, map[string]interface{}{"task_id": float64(tid), "reason": "x", "name": "x"})
+			wantErr(t, msg, "owned by")
+		}
+	}
+	w.as(w.orgadmin).call(t, "amp_block_task", map[string]interface{}{"task_id": float64(tid), "reason": "org admin override"})
+	// The owner-team member can still take it over explicitly, then work it.
+	w.as(w.owner).call(t, "amp_assign_task", map[string]interface{}{"task_id": float64(tid), "user": "me"})
+	w.as(w.owner).call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(tid)})
 }
 
 func TestRBAC_DeleteTicket(t *testing.T) {

@@ -280,7 +280,7 @@ type TaskAction int
 
 const (
 	TaskRead     TaskAction = iota // view, history, comment — anyone on the project
-	TaskWork                       // update fields, complete, block, change state, schedule
+	TaskWork                       // update fields, complete, block, change state, schedule — owner only
 	TaskDispatch                   // start work; an unassigned ticket is claimed by the dispatcher
 	TaskClaim                      // take an unassigned ticket
 	TaskAssign                     // give the ticket to someone
@@ -306,12 +306,10 @@ func CheckTask(lvl Level, t *domain.Task, me int, action TaskAction) error {
 	switch action {
 	case TaskRead:
 		return nil
-	case TaskWork:
-		if mine || unassigned || lvl >= Lead {
-			return nil
-		}
-	case TaskDispatch:
-		// Only the owner works a ticket. Org admins keep an escape hatch.
+	case TaskWork, TaskDispatch:
+		// Only the owner works a ticket (unassigned ones are open to anyone
+		// on the project). Leads and project owners reassign rather than
+		// act under someone else's name; org admins keep an escape hatch.
 		if mine || unassigned || lvl >= OrgAdmin {
 			return nil
 		}

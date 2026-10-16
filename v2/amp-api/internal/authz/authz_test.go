@@ -53,12 +53,14 @@ func TestCheckTask(t *testing.T) {
 		// Reading and commenting: anyone on the project.
 		{Member, theirs, TaskRead, true},
 
-		// Working a ticket: its owner, anyone for an unassigned one, leads and up for any.
+		// Working a ticket: its owner, or anyone for an unassigned one. Leads and
+		// project owners reassign instead; only org admins override.
 		{Member, mine, TaskWork, true},
 		{Member, unassigned, TaskWork, true},
 		{Member, theirs, TaskWork, false},
-		{Lead, theirs, TaskWork, true},
-		{Owner, theirs, TaskWork, true},
+		{Lead, theirs, TaskWork, false},
+		{Owner, theirs, TaskWork, false},
+		{OrgAdmin, theirs, TaskWork, true},
 
 		// Dispatch: owner or unassigned (claims it); only org admins may dispatch others' work.
 		{Member, unassigned, TaskDispatch, true},

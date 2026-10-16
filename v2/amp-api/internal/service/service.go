@@ -244,6 +244,10 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 	if err != nil {
 		return nil, err
 	}
+	if t.OwnerUserID != nil && *t.OwnerUserID != p.UserID {
+		// Even global admins, who pass every check, don't claim taken work.
+		return nil, authz.Forbidden("task %d is owned by user %d; use assign to reassign it", t.ID, *t.OwnerUserID)
+	}
 	return s.setOwner(ctx, p, t, p.UserRef())
 }
 

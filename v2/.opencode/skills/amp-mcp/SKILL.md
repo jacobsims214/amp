@@ -22,7 +22,8 @@ one feature with no obvious entry point — scheduling.
 - **Projects**: `amp_create_project`, `amp_list_projects`, `amp_get_project`, `amp_reset_project` (destructive), `amp_export_project`, `amp_import_project`, `amp_archive_project`, `amp_restore_project`
 - **Epics**: `amp_create_epic`, `amp_list_epics`, `amp_get_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
 - **Stories**: `amp_create_story`, `amp_list_stories`, `amp_list_project_stories`, `amp_get_story`, `amp_update_story`
-- **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`
+- **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`, `amp_claim_task`, `amp_assign_task`
+- **People**: `amp_whoami`, `amp_list_project_members`
 - **Knowledge base**: `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex` — see `amp-kb` skill for how to use these well
 
 ---
@@ -44,6 +45,27 @@ opens") — not as a substitute for `dependency_ids` when the real gate is anoth
 
 ---
 
+## Ownership — whose work a ticket is
+
+You act as the AMP user who signed you in. Every ticket has at most one owner (a person, not an
+agent); `assigned_to`/`agent_id` still name the agent profile that runs it.
+
+- `amp_list_tasks` shows **your work by default**: tickets you own plus unassigned tickets you
+  created. Pass `owner: "unassigned"` for the pool anyone can pick up, `owner: "any"` for
+  everything, or a teammate's email.
+- Tickets you create are yours. Pass `owner: "none"` to `amp_create_task` to leave one in the pool,
+  or a teammate's email to give it to them.
+- `amp_claim_task` takes an unassigned ticket. `amp_dispatch_task` on an unassigned ticket claims
+  it too. A ticket someone else owns can't be dispatched, completed, or edited by you — ask them,
+  or have a lead reassign it with `amp_assign_task` (`user: "none"` releases it).
+- Epics and stories are shared: put stories and tickets under anyone's. Changing an epic or story
+  needs you to be one of its owners (`add_owners` on `amp_update_epic` / `amp_update_story`).
+- A project you aren't on (through one of your teams) is reported as not found.
+  `amp_whoami` shows your orgs and teams; `amp_create_project` needs `org_id`/`team_id` only if
+  you're in several.
+
+---
+
 ## Key argument types
 
 - `project_id`, `task_id`, `epic_id`, `story_id` — integers
@@ -51,3 +73,4 @@ opens") — not as a substitute for `dependency_ids` when the real gate is anoth
 - `dependency_ids` — array of integer task IDs (can span epics and stories)
 - `start_at` — ISO 8601 datetime string, e.g. `"2026-08-01T09:00:00Z"`
 - `assigned_to` — free text string matching a live agent name, e.g. `"amp-worker-backend"`
+- `owner` / `user` — a person: email, numeric user id, `"me"`, or `"none"`
