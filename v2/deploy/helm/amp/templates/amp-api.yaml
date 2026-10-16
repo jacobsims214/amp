@@ -76,6 +76,12 @@ spec:
               value: "http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex"
             - name: BOOTSTRAP_ADMIN_EMAILS
               value: {{ .Values.global.bootstrapAdminEmails | quote }}
+            - name: MCP_AUDIENCE
+              value: {{ .Values.auth.mcpAudience | quote }}
+            - name: REST_AUDIENCES
+              value: {{ .Values.oauth2Proxy.clientID | quote }}
+            - name: MCP_ALLOWED_ORIGINS
+              value: "https://{{ .Values.global.domain }}"
             {{- if .Values.valkey.enabled }}
             - name: REDIS_ADDR
               value: "amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379"

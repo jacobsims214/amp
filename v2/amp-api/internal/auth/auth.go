@@ -42,11 +42,15 @@ type Verifier struct {
 	bootstrapAdmins  map[string]bool
 	enabled          bool
 	allowedAudiences []string
+	label            string // which listener this verifier guards, for logs
 
 	// ResourceMetadataURL, when set, is advertised in the WWW-Authenticate
 	// header on 401s per RFC 9728 — lets MCP OAuth clients discover the
 	// authorization server without out-of-band configuration.
 	ResourceMetadataURL string
+	// Scope, when set, is advertised as the scope= parameter of the
+	// WWW-Authenticate challenge (MCP 2026-07-28 scope selection strategy).
+	Scope string
 }
 
 // Config controls verifier construction.
@@ -103,7 +107,25 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	return v, nil
 }
 
-// allowedAudiences check — empty allow-list means "accept any audience".
+// WithAudiences returns a copy of v that only accepts tokens whose aud
+// claim names one of audiences. The copy shares the underlying key set, so
+// one Verifier can back several listeners (e.g. MCP and REST) that each
+// accept a different audience. Empty audiences are dropped; with none left
+// any audience is accepted.
+func (v *Verifier) WithAudiences(label string, audiences ...string) *Verifier {
+	c := *v
+	c.label = label
+	c.allowedAudiences = nil
+	for _, a := range audiences {
+		if a = strings.TrimSpace(a); a != "" {
+			c.allowedAudiences = append(c.allowedAudiences, a)
+		}
+	}
+	return &c
+}
+
+// verifyAudience reports whether any of the token's audiences is accepted.
+// An empty allow-list accepts everything.
 func (v *Verifier) verifyAudience(audience []string) bool {
 	if len(v.allowedAudiences) == 0 {
 		return true
@@ -133,7 +155,8 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		authz := r.Header.Get("Authorization")
 		const prefix = "Bearer "
 		if !strings.HasPrefix(authz, prefix) {
-			v.writeUnauthorized(w, "missing bearer token")
+			// RFC 6750 §3.1: no error code when the request carried no credentials.
+			v.writeChallenge(w, "", "missing bearer token")
 			return
 		}
 		rawToken := strings.TrimSpace(strings.TrimPrefix(authz, prefix))
@@ -155,7 +178,11 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 			return
 		}
 		if !v.verifyAudience(idToken.Audience) {
-			http.Error(w, `{"error":"token not valid for this service"}`, http.StatusUnauthorized)
+			// A 401 with the challenge makes MCP clients re-run OAuth and
+			// come back with a token issued for this resource.
+			slog.Warn("token rejected: audience not accepted",
+				"listener", v.label, "aud", idToken.Audience, "accepted", v.allowedAudiences, "subject", claims.Subject)
+			v.writeUnauthorized(w, "token audience not valid for this resource")
 			return
 		}
 
@@ -200,13 +227,30 @@ func FromContext(ctx context.Context) (*Identity, bool) {
 	return ident, ok
 }
 
-// writeUnauthorized writes a 401 with a RFC 9728-style WWW-Authenticate
-// header when ResourceMetadataURL is configured, so MCP OAuth clients can
-// discover the authorization server directly from a failed request.
+// writeUnauthorized writes a 401 for a token that was presented but rejected.
 func (v *Verifier) writeUnauthorized(w http.ResponseWriter, reason string) {
-	challenge := `Bearer error="invalid_token"`
+	v.writeChallenge(w, "invalid_token", reason)
+}
+
+// writeChallenge writes a 401 with an RFC 6750 WWW-Authenticate challenge.
+// errCode is omitted when the request carried no credentials at all
+// (RFC 6750 §3.1). resource_metadata (RFC 9728) and scope (MCP scope
+// selection strategy) let MCP OAuth clients discover the authorization
+// server and what to ask it for directly from the failed request.
+func (v *Verifier) writeChallenge(w http.ResponseWriter, errCode, reason string) {
+	var params []string
+	if errCode != "" {
+		params = append(params, fmt.Sprintf(`error="%s"`, errCode), fmt.Sprintf(`error_description=%q`, reason))
+	}
 	if v.ResourceMetadataURL != "" {
-		challenge += fmt.Sprintf(`, resource_metadata="%s"`, v.ResourceMetadataURL)
+		params = append(params, fmt.Sprintf(`resource_metadata="%s"`, v.ResourceMetadataURL))
+	}
+	if v.Scope != "" {
+		params = append(params, fmt.Sprintf(`scope="%s"`, v.Scope))
+	}
+	challenge := "Bearer"
+	if len(params) > 0 {
+		challenge += " " + strings.Join(params, ", ")
 	}
 	w.Header().Set("WWW-Authenticate", challenge)
 	w.Header().Set("Content-Type", "application/json")

@@ -11,6 +11,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // ---- Orphan prevention ----
@@ -386,19 +387,23 @@ func TestHistory_UnblockAppearsInLog(t *testing.T) {
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(depID)})
 
 	// Read history of the blocked task — should show "created" (blocked) then "unblocked".
-	history := s.call(t, "amp_get_ticket_history", map[string]interface{}{"task_id": float64(blockedID)})
-	entries, _ := history["history"].([]interface{})
-
-	actions := make([]string, 0)
-	for _, e := range entries {
-		entry := e.(map[string]interface{})
-		actions = append(actions, entry["action"].(string))
-	}
-
+	// The unblock fans out through the actor hierarchy after
+	// amp_complete_task returns, so poll briefly rather than read once.
+	var actions []string
 	hasUnblocked := false
-	for _, a := range actions {
-		if a == "unblocked" {
-			hasUnblocked = true
+	for deadline := time.Now().Add(3 * time.Second); !hasUnblocked && time.Now().Before(deadline); {
+		history := s.call(t, "amp_get_ticket_history", map[string]interface{}{"task_id": float64(blockedID)})
+		entries, _ := history["history"].([]interface{})
+		actions = actions[:0]
+		for _, e := range entries {
+			entry := e.(map[string]interface{})
+			actions = append(actions, entry["action"].(string))
+			if entry["action"] == "unblocked" {
+				hasUnblocked = true
+			}
+		}
+		if !hasUnblocked {
+			time.Sleep(25 * time.Millisecond)
 		}
 	}
 	if !hasUnblocked {

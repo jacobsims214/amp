@@ -37,6 +37,13 @@ image:
   pullPolicy: IfNotPresent
   registry: ""   # empty = local images built straight into the docker-desktop node, no registry needed
 
+# MCP token audience (MCP spec 2026-07-28: an MCP server MUST only accept
+# tokens issued for it). amp-mcpoauth makes Dex mint MCP tokens with
+# aud=<mcpAudience> via Dex cross-client trust; amp-api rejects /mcp tokens
+# without it (and accepts it alongside oauth2Proxy.clientID on /api).
+auth:
+  mcpAudience: amp-mcp
+
 ampApi:
   image: amp-api
   tag: local
