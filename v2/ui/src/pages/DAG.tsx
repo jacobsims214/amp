@@ -1,695 +1,472 @@
 /**
- * DAG View — Interactive dependency graph with:
- *   - Draggable nodes
- *   - Canvas pan (drag empty space)
- *   - Wheel zoom
- *   - Click-to-select with persistent full chain highlight
- *   - Bottom info strip for selected task
- *   - Hide-completed toggle
+ * DAG view — how the work depends on itself, built to stay readable on big
+ * projects:
+ *   - Overview first: each story is one node (progress, states, blockers);
+ *     expand a story to see its tickets, grouped in a cluster.
+ *   - Focus: click a ticket to light up what it waits on and what waits on
+ *     it; "Focus chain" shows only that chain, framed to fit.
+ *   - Search jumps to any ticket. Filters match the board (epic, mine,
+ *     hide done).
+ *   - "What changed" highlights tickets that moved today or this week, with
+ *     a list to jump through them.
  */
-import { useMemo, useState, useCallback, useRef, useEffect } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import {
-  Loader2, ZoomIn, ZoomOut, Maximize2, GitBranch,
-  EyeOff, Eye, X, ExternalLink, ArrowRight,
+  Background, Controls, Handle, MiniMap, Position, ReactFlow, ReactFlowProvider, useReactFlow,
+  type Edge, type Node, type NodeProps,
+} from '@xyflow/react'
+import '@xyflow/react/dist/style.css'
+import {
+  ChevronDown, ChevronRight, Clock, Crosshair, ExternalLink, EyeOff, Eye, Layers, Loader2, Search, User, X,
 } from 'lucide-react'
-import * as dagre from '@dagrejs/dagre'
+import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
+import { useAuth } from '../hooks/useAuth'
 import { TaskDrawer } from '../components/TaskDrawer'
-import { StatusBadge } from '../components/StatusBadge'
 import { ProjectNav } from '../components/ProjectNav'
-import type { Task } from '../types'
+import {
+  buildGraph, chainOf, countStates, ticketNodeId, STORY_H, STORY_W, TICKET_H, TICKET_W, type StateCounts,
+} from '../lib/dagModel'
+import type { ActivityLog, Epic, Story, Task } from '../types'
 
-// ─── Dimensions ───────────────────────────────────────────────────────────────
-const NODE_W   = 224
-const NODE_H   = 96
-const RANK_SEP = 140
-const NODE_SEP = 20
-
-// ─── Colour system ────────────────────────────────────────────────────────────
+// ─── Colours ──────────────────────────────────────────────────────────────────
 const STATE_C = {
-  backlog:     { border: '#1E2C45', bg: '#08101F',  text: '#7E91A8', bar: '#283A57' },
-  in_progress: { border: '#4F46E5', bg: '#0A0B22',  text: '#818CF8', bar: '#6366F1' },
-  completed:   { border: '#065F46', bg: '#021A0F',  text: '#10B981', bar: '#059669' },
-  blocked:     { border: '#991B1B', bg: '#180404',  text: '#F87171', bar: '#EF4444' },
+  backlog:     { border: '#283A57', bg: '#0B1424', text: '#7E91A8', bar: '#3D5068', label: 'Backlog' },
+  in_progress: { border: '#4F46E5', bg: '#0C0E2A', text: '#818CF8', bar: '#6366F1', label: 'In progress' },
+  completed:   { border: '#065F46', bg: '#03190F', text: '#10B981', bar: '#059669', label: 'Done' },
+  blocked:     { border: '#991B1B', bg: '#1A0606', text: '#F87171', bar: '#EF4444', label: 'Blocked' },
 } as const
 type SK = keyof typeof STATE_C
 const sc = (s: string) => STATE_C[s as SK] ?? STATE_C.backlog
+const CHANGED = '#F59E0B'
+const EPIC_PALETTE = ['#6366F1', '#10B981', '#F59E0B', '#EF4444', '#A78BFA', '#2DD4BF', '#FB923C', '#34D399']
 
-const EPIC_PALETTE = [
-  '#6366F1','#10B981','#F59E0B','#EF4444','#A78BFA','#2DD4BF','#FB923C','#34D399',
-]
-const epicColor = (i: number) => EPIC_PALETTE[i % EPIC_PALETTE.length]
+/** Expand every story by default on small projects; start collapsed on big ones. */
+const EXPAND_ALL_UP_TO = 40
 
-// ─── Layout ───────────────────────────────────────────────────────────────────
-interface LayoutResult {
-  nodes: Map<number, { x: number; y: number; task: Task }>
-  edges: Array<{
-    from: number; to: number
-    points: Array<{ x: number; y: number }>
-    kind: 'same-story' | 'cross-story' | 'cross-epic'
-    blocked: boolean
-  }>
-  width: number; height: number
+type Changes = 'off' | '1d' | '7d'
+const changesSince = (c: Changes) => {
+  if (c === 'off') return null
+  const d = new Date()
+  if (c === '1d') d.setHours(0, 0, 0, 0)
+  else d.setDate(d.getDate() - 7)
+  return d.toISOString()
 }
 
-function runLayout(tasks: Task[]): LayoutResult {
-  const g = new dagre.graphlib.Graph()
-  g.setGraph({ rankdir:'LR', ranksep:RANK_SEP, nodesep:NODE_SEP, marginx:56, marginy:56, acyclicer:'greedy', ranker:'network-simplex' })
-  g.setDefaultEdgeLabel(() => ({}))
-  for (const t of tasks) g.setNode(String(t.id), { width:NODE_W, height:NODE_H })
-  for (const t of tasks) for (const d of t.dependency_ids ?? []) if (g.hasNode(String(d))) g.setEdge(String(d), String(t.id))
-  dagre.layout(g)
+// ─── Node components ──────────────────────────────────────────────────────────
+type Mark = 'selected' | 'up' | 'down' | 'dim' | null
 
-  const byId = new Map(tasks.map(t => [t.id, t]))
-  const nodes = new Map<number, { x:number; y:number; task:Task }>()
-  for (const id of g.nodes()) {
-    const n = g.node(id); const t = byId.get(Number(id))
-    if (t && n) nodes.set(t.id, { x: n.x, y: n.y, task: t })
-  }
-  const edges: LayoutResult['edges'] = []
-  for (const e of g.edges()) {
-    const ed = g.edge(e), from = byId.get(Number(e.v)), to = byId.get(Number(e.w))
-    if (!from || !to) continue
-    edges.push({
-      from: from.id, to: to.id, points: ed?.points ?? [],
-      kind: from.epic_id !== to.epic_id ? 'cross-epic' : from.story_id !== to.story_id ? 'cross-story' : 'same-story',
-      blocked: to.state === 'blocked' && (to.blocked_by_ids ?? []).includes(from.id),
-    })
-  }
-  const gr = g.graph()
-  return { nodes, edges, width:(gr.width??800)+112, height:(gr.height??600)+112 }
+interface TicketData extends Record<string, unknown> {
+  task: Task; epicColor: string; mark: Mark; changed: boolean; onOpen: (t: Task) => void
+}
+interface StoryData extends Record<string, unknown> {
+  story: Story; epic?: Epic; epicColor: string; tasks: Task[]; counts: StateCounts
+  dim: boolean; changed: number; onExpand: (storyId: number) => void
+}
+interface ClusterData extends Record<string, unknown> {
+  story: Story; epic?: Epic; epicColor: string; counts: StateCounts; onCollapse: (storyId: number) => void
 }
 
-function edgePath(
-  from: {x:number; y:number},
-  to:   {x:number; y:number},
-  points: Array<{x:number; y:number}>,
-): string {
-  const all = [from, ...points, to]
-  if (all.length < 2) return ''
-  let d = `M ${all[0].x} ${all[0].y}`
-  for (let i = 1; i < all.length; i++) {
-    const p0=all[Math.max(0,i-2)], p1=all[i-1], p2=all[i], p3=all[Math.min(all.length-1,i+1)]
-    const cp1x=p1.x+(p2.x-p0.x)/6, cp1y=p1.y+(p2.y-p0.y)/6
-    const cp2x=p2.x-(p3.x-p1.x)/6, cp2y=p2.y-(p3.y-p1.y)/6
-    d += ` C ${cp1x} ${cp1y}, ${cp2x} ${cp2y}, ${p2.x} ${p2.y}`
-  }
-  return d
+const hidden = { opacity: 0, width: 6, height: 6, border: 'none', background: 'transparent' }
+
+const TicketNode = memo(function TicketNode({ data }: NodeProps<Node<TicketData>>) {
+  const { task, epicColor, mark, changed, onOpen } = data
+  const c = sc(task.state)
+  const ring =
+    mark === 'selected' ? '0 0 0 2px #DDE6F0' :
+    mark === 'up' ? '0 0 0 2px #38BDF8' :
+    mark === 'down' ? '0 0 0 2px #A78BFA' :
+    changed ? `0 0 0 2px ${CHANGED}` : undefined
+  return (
+    <div onDoubleClick={() => onOpen(task)}
+      className="rounded-xl overflow-hidden transition-opacity"
+      style={{ width: TICKET_W, height: TICKET_H, background: c.bg, border: `1px solid ${c.border}`, boxShadow: ring, opacity: mark === 'dim' ? 0.25 : 1 }}>
+      <Handle type="target" position={Position.Left} style={hidden} />
+      <div className="h-1" style={{ background: epicColor }} />
+      <div className="px-3 py-2 flex flex-col gap-1 h-[calc(100%-4px)]">
+        <div className="flex items-center gap-1.5 text-[10px] font-semibold">
+          <span className="font-mono text-[#7E91A8]">#{task.id}</span>
+          <span style={{ color: c.text }}>{c.label}</span>
+          {changed && <span className="ml-auto" style={{ color: CHANGED }} title="Changed recently"><Clock size={10} /></span>}
+        </div>
+        <div className="text-xs font-semibold text-[#DDE6F0] leading-snug line-clamp-2">{task.name}</div>
+        {task.state === 'blocked' && task.block_reason && (
+          <div className="text-[10px] text-[#F87171] truncate" title={task.block_reason}>{task.block_reason}</div>
+        )}
+      </div>
+      <Handle type="source" position={Position.Right} style={hidden} />
+    </div>
+  )
+})
+
+function ProgressBar({ counts, total }: { counts: StateCounts; total: number }) {
+  return (
+    <div className="flex h-1.5 rounded-full overflow-hidden bg-[#172540]">
+      {(['completed', 'in_progress', 'blocked', 'backlog'] as const).map(s =>
+        counts[s] ? <div key={s} style={{ width: `${(counts[s] / total) * 100}%`, background: sc(s).bar }} /> : null)}
+    </div>
+  )
 }
 
-// Resolve a node's effective position (dagre base + any user drag override)
-function nodePos(
-  id: number,
-  layoutNodes: LayoutResult['nodes'],
-  overrides: Map<number, {x:number; y:number}>,
-): {x:number; y:number} {
-  const ov = overrides.get(id)
-  const base = layoutNodes.get(id)
-  if (!base) return { x:0, y:0 }
-  return ov ?? { x: base.x, y: base.y }
-}
+const StoryNode = memo(function StoryNode({ data }: NodeProps<Node<StoryData>>) {
+  const { story, epic, epicColor, tasks, counts, dim, changed, onExpand } = data
+  const total = tasks.length
+  return (
+    <div onClick={() => onExpand(story.id)} title="Click to show its tickets"
+      className="rounded-xl overflow-hidden cursor-pointer transition-opacity"
+      style={{ width: STORY_W, height: STORY_H, background: '#0D1726', border: `1px solid ${counts.blocked ? '#7F1D1D' : '#283A57'}`,
+        boxShadow: changed ? `0 0 0 2px ${CHANGED}` : undefined, opacity: dim ? 0.25 : 1 }}>
+      <Handle type="target" position={Position.Left} style={hidden} />
+      <div className="h-1" style={{ background: epicColor }} />
+      <div className="px-3 py-2 space-y-1.5">
+        <div className="flex items-center gap-1.5 text-[10px]">
+          <ChevronRight size={11} className="text-[#7E91A8]" />
+          <span className="text-[#7E91A8] truncate">{epic?.name ?? 'Epic'}</span>
+          {changed > 0 && <span className="ml-auto font-semibold" style={{ color: CHANGED }}>{changed} changed</span>}
+        </div>
+        <div className="text-xs font-semibold text-[#DDE6F0] truncate">{story.name}</div>
+        <ProgressBar counts={counts} total={total} />
+        <div className="flex gap-2 text-[10px] text-[#7E91A8]">
+          <span>{counts.completed}/{total} done</span>
+          {counts.in_progress > 0 && <span style={{ color: STATE_C.in_progress.text }}>{counts.in_progress} running</span>}
+          {counts.blocked > 0 && <span style={{ color: STATE_C.blocked.text }}>{counts.blocked} blocked</span>}
+        </div>
+      </div>
+      <Handle type="source" position={Position.Right} style={hidden} />
+    </div>
+  )
+})
 
-// ─── Component ────────────────────────────────────────────────────────────────
+const ClusterNode = memo(function ClusterNode({ data }: NodeProps<Node<ClusterData>>) {
+  const { story, epic, epicColor, counts, onCollapse } = data
+  const total = counts.backlog + counts.in_progress + counts.blocked + counts.completed
+  return (
+    <div className="w-full h-full rounded-2xl" style={{ background: 'rgba(23,37,64,0.35)', border: `1px dashed ${epicColor}55` }}>
+      <button onClick={() => onCollapse(story.id)} title="Collapse into one node"
+        className="flex items-center gap-1.5 px-2.5 h-5 text-[10px] text-[#7E91A8] hover:text-[#DDE6F0] cursor-pointer max-w-full">
+        <ChevronDown size={11} className="flex-shrink-0" />
+        <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: epicColor }} />
+        <span className="truncate">{epic ? `${epic.name} › ` : ''}<span className="text-[#DDE6F0] font-semibold">{story.name}</span></span>
+        <span className="flex-shrink-0 text-[#3D5068]">{counts.completed}/{total}</span>
+      </button>
+    </div>
+  )
+})
+
+const nodeTypes = { ticket: TicketNode, story: StoryNode, cluster: ClusterNode }
+
+// ─── Page ─────────────────────────────────────────────────────────────────────
 export function DAGView() {
-  const { projectId } = useParams<{ projectId:string }>()
+  return (
+    <ReactFlowProvider>
+      <DAGCanvas />
+    </ReactFlowProvider>
+  )
+}
+
+function DAGCanvas() {
+  const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
-  const { epics, stories, tasks, loading, error } = useBoardData(pid)
+  const { epics, stories, tasks, loading, error, refresh } = useBoardData(pid)
+  const { me } = useAuth()
+  const meId = me?.user_id
+  const flow = useReactFlow()
 
-  // ── filters & display state ────────────────────────────────────────────────
-  const [filterEpicId,  setFilterEpicId]  = useState<number|null>(null)
-  const [hideCompleted, setHideCompleted] = useState(false)
-  const [zoom,          setZoom]          = useState(1)
-  const [pan,           setPan]           = useState({ x: 0, y: 0 })
+  const [epicFilter, setEpicFilter] = useState<number | null>(null)
+  const [hideDone, setHideDone] = useState(false)
+  const [mineOnly, setMineOnly] = useState(false)
+  const [expandedSet, setExpanded] = useState<Set<number> | null>(null) // null: the default for the project's size
+  const [selectedId, setSelectedId] = useState<number | null>(null)
+  const [focusChain, setFocusChain] = useState(false)
+  const [changes, setChanges] = useState<Changes>('off')
+  const [query, setQuery] = useState('')
+  const [drawerTask, setDrawerTask] = useState<Task | null>(null)
 
-  // ── hover / select ─────────────────────────────────────────────────────────
-  const [hoveredId,  setHoveredId]  = useState<number|null>(null)
-  const [selectedId, setSelectedId] = useState<number|null>(null)
-  const [drawerTask, setDrawerTask] = useState<Task|null>(null)
+  const taskById = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks])
+  const epicColor = useMemo(() => {
+    const m = new Map(epics.map((e, i) => [e.id, EPIC_PALETTE[i % EPIC_PALETTE.length]]))
+    return (id: number) => m.get(id) ?? EPIC_PALETTE[0]
+  }, [epics])
 
-  // ── drag state ─────────────────────────────────────────────────────────────
-  // nodeOverrides: user-repositioned nodes
-  const [nodeOverrides, setNodeOverrides] = useState<Map<number, {x:number; y:number}>>(new Map())
-  const draggingNode = useRef<{id:number; startMouseX:number; startMouseY:number; startNodeX:number; startNodeY:number}|null>(null)
-  const panningRef   = useRef<{startMouseX:number; startMouseY:number; startPanX:number; startPanY:number}|null>(null)
-  const dragMoved    = useRef(false)
+  const expanded = useMemo(
+    () => expandedSet ?? new Set(tasks.length <= EXPAND_ALL_UP_TO ? stories.map(s => s.id) : []),
+    [expandedSet, tasks.length, stories],
+  )
 
-  const containerRef = useRef<HTMLDivElement>(null)
-
-  // ── derived maps ───────────────────────────────────────────────────────────
-  const epicIdx   = useMemo(() => new Map(epics.map((e,i)=>[e.id,i])),  [epics])
-  const epicById  = useMemo(() => new Map(epics.map(e=>[e.id,e])),       [epics])
-  const storyById = useMemo(() => new Map(stories.map(s=>[s.id,s])),     [stories])
-  const taskById  = useMemo(() => new Map(tasks.map(t=>[t.id,t])),       [tasks])
-
-  const reverseDeps = useMemo(() => {
-    const m = new Map<number,number[]>()
-    tasks.forEach(t => (t.dependency_ids??[]).forEach(d => {
-      if (!m.has(d)) m.set(d,[])
-      m.get(d)!.push(t.id)
-    }))
-    return m
-  }, [tasks])
-
-  const visibleTasks = useMemo(() => {
-    let r = filterEpicId ? tasks.filter(t=>t.epic_id===filterEpicId) : [...tasks]
-    if (hideCompleted) r = r.filter(t=>t.state!=='completed')
-    return r
-  }, [tasks, filterEpicId, hideCompleted])
-
-  const completedCount = useMemo(() => tasks.filter(t=>t.state==='completed').length, [tasks])
-  const layout         = useMemo(() => runLayout(visibleTasks), [visibleTasks])
-
-  // Reset overrides & pan when layout changes significantly (task list changed)
-  const prevTaskIds = useRef<string>('')
+  // Recent changes (refetched as tickets change while it's on).
+  const [fetched, setActivity] = useState<ActivityLog[]>([])
   useEffect(() => {
-    const ids = visibleTasks.map(t=>t.id).sort().join(',')
-    if (ids !== prevTaskIds.current) {
-      prevTaskIds.current = ids
-      setNodeOverrides(new Map())
-      // centre the graph
-      if (containerRef.current) {
-        const cw = containerRef.current.clientWidth
-        const ch = containerRef.current.clientHeight
-        setPan({ x: Math.max(0, (cw - layout.width)  / 2),
-                 y: Math.max(0, (ch - layout.height) / 2) })
-      }
-    }
-  }, [visibleTasks, layout])
+    const since = changesSince(changes)
+    if (since) api.getProjectActivity(pid, since).then(setActivity).catch(() => setActivity([]))
+  }, [pid, changes, tasks])
+  const activity = useMemo(() => (changes === 'off' ? [] : fetched), [changes, fetched])
+  const changed = useMemo(() => new Set(activity.map(a => a.task_id)), [activity])
 
-  // ── chain computation for hover and select ─────────────────────────────────
-  const computeChain = useCallback((focusId: number) => {
-    const deps = new Set<number>(), dependents = new Set<number>()
-    function up(id:number, vis=new Set<number>()) {
-      if (vis.has(id)) return; vis.add(id)
-      taskById.get(id)?.dependency_ids?.forEach(d => { deps.add(d); up(d, vis) })
-    }
-    function down(id:number, vis=new Set<number>()) {
-      if (vis.has(id)) return; vis.add(id)
-      reverseDeps.get(id)?.forEach(c => { dependents.add(c); down(c, vis) })
-    }
-    up(focusId); down(focusId)
-    return { deps, dependents }
-  }, [taskById, reverseDeps])
+  const chain = useMemo(() => (selectedId != null ? chainOf(selectedId, tasks) : null), [selectedId, tasks])
 
-  const selectedChain = useMemo(() => selectedId !== null ? computeChain(selectedId) : null, [selectedId, computeChain])
-  const hoveredChain  = useMemo(() => hoveredId  !== null && hoveredId !== selectedId ? computeChain(hoveredId)  : null, [hoveredId, selectedId, computeChain])
+  // What's shown: the focused chain, or everything that passes the filters.
+  const visible = useMemo(() => {
+    if (focusChain && selectedId != null && chain) return new Set([selectedId, ...chain.up, ...chain.down])
+    return new Set(tasks.filter(t =>
+      (epicFilter == null || t.epic_id === epicFilter) &&
+      (!hideDone || t.state !== 'completed' || t.id === selectedId) &&
+      (!mineOnly || meId == null || t.owner_user_id === meId),
+    ).map(t => t.id))
+  }, [tasks, focusChain, selectedId, chain, epicFilter, hideDone, mineOnly, meId])
 
-  // ── zoom helpers ───────────────────────────────────────────────────────────
-  const zoomIn    = useCallback(() => setZoom(z=>Math.min(z+0.15,3)),    [])
-  const zoomOut   = useCallback(() => setZoom(z=>Math.max(z-0.15,0.2)),  [])
-  const zoomReset = useCallback(() => {
-    setZoom(1)
-    if (containerRef.current) {
-      const cw = containerRef.current.clientWidth
-      const ch = containerRef.current.clientHeight
-      setPan({ x: Math.max(0,(cw-layout.width)/2), y: Math.max(0,(ch-layout.height)/2) })
-    }
-  }, [layout])
+  const effectiveExpanded = useMemo(() => {
+    if (!focusChain) return expanded
+    return new Set([...visible].map(id => taskById.get(id)?.story_id).filter((x): x is number => x != null))
+  }, [focusChain, expanded, visible, taskById])
 
-  const fitToView = useCallback(() => {
-    if (!containerRef.current) return
-    const cw = containerRef.current.clientWidth
-    const ch = containerRef.current.clientHeight
-    const scaleX = cw  / layout.width
-    const scaleY = ch  / layout.height
-    const newZoom = Math.min(scaleX, scaleY, 1) * 0.9
-    setZoom(newZoom)
-    setPan({ x:(cw - layout.width  * newZoom)/2, y:(ch - layout.height * newZoom)/2 })
-  }, [layout])
-
-  // ── wheel zoom ─────────────────────────────────────────────────────────────
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.preventDefault()
-    const delta = -e.deltaY * 0.001
-    setZoom(z => Math.min(3, Math.max(0.2, z + delta * z)))
-  }, [])
-
-  // ── pointer events ─────────────────────────────────────────────────────────
-  const handleNodeMouseDown = useCallback((e: React.MouseEvent, id: number) => {
-    e.stopPropagation()
-    dragMoved.current = false
-    const pos = nodePos(id, layout.nodes, nodeOverrides)
-    draggingNode.current = {
-      id,
-      startMouseX: e.clientX,
-      startMouseY: e.clientY,
-      startNodeX:  pos.x,
-      startNodeY:  pos.y,
-    }
-  }, [layout.nodes, nodeOverrides])
-
-  const handleCanvasMouseDown = useCallback((e: React.MouseEvent) => {
-    // Only pan on primary button, not on a node
-    if (e.button !== 0) return
-    dragMoved.current = false
-    panningRef.current = {
-      startMouseX: e.clientX,
-      startMouseY: e.clientY,
-      startPanX:   pan.x,
-      startPanY:   pan.y,
-    }
-  }, [pan])
-
-  const handleMouseMove = useCallback((e: React.MouseEvent) => {
-    if (draggingNode.current) {
-      const dx = (e.clientX - draggingNode.current.startMouseX) / zoom
-      const dy = (e.clientY - draggingNode.current.startMouseY) / zoom
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved.current = true
-      const id = draggingNode.current.id
-      setNodeOverrides(prev => {
-        const next = new Map(prev)
-        next.set(id, {
-          x: draggingNode.current!.startNodeX + dx,
-          y: draggingNode.current!.startNodeY + dy,
-        })
-        return next
-      })
-    } else if (panningRef.current) {
-      const dx = e.clientX - panningRef.current.startMouseX
-      const dy = e.clientY - panningRef.current.startMouseY
-      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) dragMoved.current = true
-      setPan({
-        x: panningRef.current.startPanX + dx,
-        y: panningRef.current.startPanY + dy,
-      })
-    }
-  }, [zoom])
-
-  const handleMouseUp = useCallback(() => {
-    draggingNode.current = null
-    panningRef.current   = null
-  }, [])
-
-  const handleNodeClick = useCallback((e: React.MouseEvent, task: Task) => {
-    e.stopPropagation()
-    if (dragMoved.current) return // was a drag, not a click
-    setSelectedId(prev => prev === task.id ? null : task.id)
-  }, [])
-
-  const handleCanvasClick = useCallback(() => {
-    if (!dragMoved.current) setSelectedId(null)
-  }, [])
-
-  // ─── Early returns (ALL hooks above this line) ─────────────────────────────
-  if (loading) return (
-    <div className="flex items-center justify-center h-screen" style={{ background: '#08101F' }}>
-      <Loader2 size={22} className="text-[#6366F1] animate-spin"/>
-    </div>
-  )
-  if (error) return (
-    <div className="flex items-center justify-center h-screen text-[#F87171] text-sm" style={{ background: '#08101F' }}>
-      {error}
-    </div>
+  const model = useMemo(
+    () => buildGraph({ epics, stories, tasks, visible, expanded: effectiveExpanded }),
+    [epics, stories, tasks, visible, effectiveExpanded],
   )
 
-  // ── Edge classification ────────────────────────────────────────────────────
-  const focusId    = selectedId ?? hoveredId
-  const focusChain = selectedChain ?? hoveredChain
-  const { nodes, edges } = layout
-  const bgEdges: typeof edges = [], hlEdges: typeof edges = []
-  for (const edge of edges) {
-    const onChain = focusChain ? (
-      (focusChain.deps.has(edge.from)       && focusChain.deps.has(edge.to))        ||
-      (focusChain.deps.has(edge.from)       && edge.to   === focusId)               ||
-      (edge.from === focusId               && focusChain.dependents.has(edge.to))   ||
-      (focusChain.dependents.has(edge.from) && focusChain.dependents.has(edge.to))  ||
-      (focusChain.deps.has(edge.from)       && focusChain.dependents.has(edge.to))
-    ) : false
-    if (focusChain) { onChain ? hlEdges.push(edge) : bgEdges.push(edge) }
-    else bgEdges.push(edge)
+  const openTicket = useCallback((t: Task) => setDrawerTask(t), [])
+  const expandStory = useCallback((id: number) => setExpanded(prev => {
+    const s = new Set(prev ?? (tasks.length <= EXPAND_ALL_UP_TO ? stories.map(x => x.id) : []))
+    s.add(id)
+    return s
+  }), [tasks.length, stories])
+  const collapseStory = useCallback((id: number) => setExpanded(prev => {
+    const s = new Set(prev ?? (tasks.length <= EXPAND_ALL_UP_TO ? stories.map(x => x.id) : []))
+    s.delete(id)
+    return s
+  }), [tasks.length, stories])
+
+  const markOf = useCallback((id: number): Mark => {
+    if (selectedId == null || !chain) return null
+    if (id === selectedId) return 'selected'
+    if (chain.up.has(id)) return 'up'
+    if (chain.down.has(id)) return 'down'
+    return 'dim'
+  }, [selectedId, chain])
+
+  const nodes: Node[] = useMemo(() => [
+    ...model.clusters.map(c => ({
+      id: c.id, type: 'cluster', position: { x: c.x, y: c.y }, zIndex: -1, selectable: false, draggable: false,
+      width: c.width, height: c.height,
+      data: { story: c.story, epic: c.epic, epicColor: epicColor(c.story.epic_id), counts: countStates(c.tasks), onCollapse: collapseStory } satisfies ClusterData,
+    })),
+    ...model.stories.map(s => ({
+      id: s.id, type: 'story', position: { x: s.x, y: s.y }, draggable: false, width: STORY_W, height: STORY_H,
+      data: {
+        story: s.story, epic: s.epic, epicColor: epicColor(s.story.epic_id), tasks: s.tasks, counts: s.counts,
+        dim: selectedId != null && !s.tasks.some(t => markOf(t.id) !== 'dim'),
+        changed: s.tasks.filter(t => changed.has(t.id)).length, onExpand: expandStory,
+      } satisfies StoryData,
+    })),
+    ...model.tickets.map(t => ({
+      id: t.id, type: 'ticket', position: { x: t.x, y: t.y }, draggable: false, width: TICKET_W, height: TICKET_H,
+      data: { task: t.task, epicColor: epicColor(t.task.epic_id), mark: markOf(t.task.id), changed: changed.has(t.task.id), onOpen: openTicket } satisfies TicketData,
+    })),
+  ], [model, epicColor, selectedId, markOf, changed, expandStory, collapseStory, openTicket])
+
+  const edges: Edge[] = useMemo(() => model.edges.map(e => {
+    const lit = selectedId != null && e.from != null && e.to != null && markOf(e.from) !== 'dim' && markOf(e.to) !== 'dim'
+    const dim = selectedId != null && !lit
+    const stroke = e.blocked ? '#EF4444' : lit ? '#DDE6F0' : e.crossEpic ? '#A78BFA' : '#3D5068'
+    return {
+      id: e.id, source: e.source, target: e.target,
+      label: e.count > 1 ? String(e.count) : undefined,
+      labelStyle: { fill: '#7E91A8', fontSize: 10 }, labelBgStyle: { fill: '#0D1726' },
+      style: { stroke, strokeWidth: lit ? 2 : 1.4, opacity: dim ? 0.15 : 1, strokeDasharray: e.crossEpic ? '6 3' : undefined },
+      animated: e.to != null && taskById.get(e.to)?.state === 'in_progress',
+    }
+  }), [model, selectedId, markOf, taskById])
+
+  // Frame everything when what's shown changes, or the ticket just jumped
+  // to. Every node has a fixed size (below), so this needs no measuring —
+  // just a beat for React Flow to take in the new nodes.
+  const shape = `${[...visible].length}|${[...effectiveExpanded].sort().join(',')}|${focusChain}`
+  const frameTicket = useRef<number | null>(null)
+  const [jumps, setJumps] = useState(0)
+  useEffect(() => {
+    if (!nodes.length) return
+    const t = setTimeout(() => {
+      const id = frameTicket.current
+      frameTicket.current = null
+      if (id != null) flow.fitView({ nodes: [{ id: ticketNodeId(id) }], duration: 400, maxZoom: 1.1, padding: 0.4 })
+      else flow.fitView({ padding: 0.12, duration: 300, maxZoom: 1.2 })
+    }, 50)
+    return () => clearTimeout(t)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shape, jumps])
+
+  const jumpTo = (t: Task) => {
+    setSelectedId(t.id)
+    setQuery('')
+    if (!expanded.has(t.story_id)) expandStory(t.story_id)
+    frameTicket.current = t.id
+    setJumps(n => n + 1)
   }
 
-  const selectedTaskObj = selectedId !== null ? taskById.get(selectedId) : null
-  const isDragging = draggingNode.current !== null || panningRef.current !== null
+  const results = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return []
+    return tasks.filter(t => t.name.toLowerCase().includes(q) || `#${t.id}` === q || String(t.id) === q).slice(0, 8)
+  }, [query, tasks])
+
+  const selected = selectedId != null ? taskById.get(selectedId) : undefined
+  const recent = useMemo(() => {
+    const latest = new Map<number, ActivityLog>()
+    for (const a of activity) {
+      const cur = latest.get(a.task_id)
+      if (!cur || cur.created_at < a.created_at) latest.set(a.task_id, a)
+    }
+    return [...latest.values()].sort((a, b) => b.created_at.localeCompare(a.created_at))
+  }, [activity])
+
+  const pill = (on: boolean) =>
+    `flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ${on ? 'text-[#DDE6F0] bg-[#172540] border border-[#283A57]' : 'text-[#7E91A8] hover:text-[#DDE6F0] border border-transparent'}`
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden" style={{ background: '#08101F' }}>
-      {/* ── Nav bar ── */}
-      <ProjectNav
-        projectId={pid}
-        currentView="dag"
-        rightSlot={
-          <>
-            {/* Legend */}
-            <div className="hidden xl:flex items-center gap-4 text-xs text-[#7E91A8]">
-              <LegendLine stroke="#283A57"  label="Same story"/>
-              <LegendLine stroke="#6366F1"  dash="6 3" label="Cross story"/>
-              <LegendLine stroke="#A78BFA"  dash="9 4" label="Cross epic"/>
-              <LegendLine stroke="#EF4444"  dash="4 3" label="Blocking"/>
-            </div>
+    <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
+      <ProjectNav projectId={pid} currentView="dag" />
 
-            {/* Hide completed */}
-            {completedCount > 0 && (
-              <button
-                onClick={() => setHideCompleted(h=>!h)}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer"
-                style={hideCompleted
-                  ? { background:'rgba(16,185,129,0.1)', border:'1px solid rgba(16,185,129,0.25)', color:'#10B981' }
-                  : { background:'transparent', border:'1px solid #1E2C45', color:'#3D5068' }}
-              >
-                {hideCompleted ? <Eye size={12}/> : <EyeOff size={12}/>}
-                <span>{hideCompleted ? `${completedCount} hidden` : 'Hide done'}</span>
-              </button>
-            )}
-
-            {/* Zoom controls */}
-            <div className="flex items-center gap-0.5 rounded-lg p-1"
-              style={{ background:'#08101F', border:'1px solid #1E2C45' }}>
-              <button onClick={zoomOut}   className="p-1.5 rounded-md text-[#3D5068] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"><ZoomOut   size={12}/></button>
-              <button onClick={zoomReset} className="px-2 py-1 rounded-md text-xs text-[#3D5068] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors font-mono tabular-nums cursor-pointer min-w-[44px] text-center">{Math.round(zoom*100)}%</button>
-              <button onClick={zoomIn}    className="p-1.5 rounded-md text-[#3D5068] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"><ZoomIn    size={12}/></button>
-              <div className="w-px h-4 bg-[#192238] mx-0.5"/>
-              <button onClick={fitToView} className="p-1.5 rounded-md text-[#3D5068] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer" title="Fit to view"><Maximize2 size={12}/></button>
-            </div>
-
-            {/* Epic filter */}
-            {epics.length > 1 && (
-              <select
-                value={filterEpicId??''}
-                onChange={e=>setFilterEpicId(e.target.value?Number(e.target.value):null)}
-                className="rounded-lg px-3 py-1.5 text-xs text-[#DDE6F0] focus:outline-none appearance-none cursor-pointer"
-                style={{ background:'#08101F', border:'1px solid #1E2C45', fontFamily:'inherit' }}
-                onFocus={e=>(e.target.style.borderColor='#6366F1')}
-                onBlur={e=>(e.target.style.borderColor='#1E2C45')}
-              >
-                <option value="">All epics</option>
-                {epics.map(e=><option key={e.id} value={e.id}>{e.name}</option>)}
-              </select>
-            )}
-          </>
-        }
-      />
-
-      {/* ── Epic key bar ── */}
-      {epics.length > 0 && (
-        <div className="flex items-center gap-2 px-5 py-2 flex-shrink-0 overflow-x-auto"
-          style={{ borderBottom:'1px solid #192238', background:'#08101F' }}>
-          <span className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest flex-shrink-0">Epics</span>
-          <div className="w-px h-4 bg-[#192238]"/>
-          {epics.map((e,i)=>{
-            const col=epicColor(i), isActive=filterEpicId===e.id
-            return (
-              <button key={e.id}
-                onClick={()=>setFilterEpicId(filterEpicId===e.id?null:e.id)}
-                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs flex-shrink-0 transition-all cursor-pointer"
-                style={{ opacity:filterEpicId&&!isActive?0.35:1, background:isActive?`${col}18`:'transparent', border:isActive?`1px solid ${col}40`:'1px solid transparent', color:col }}>
-                <span className="w-2 h-2 rounded-full" style={{background:col}}/>
-                {e.name}
-              </button>
-            )
-          })}
-        </div>
-      )}
-
-      {/* ── Canvas ── */}
-      <div
-        ref={containerRef}
-        className="flex-1 relative overflow-hidden select-none"
-        style={{ background:'#08101F', cursor: isDragging ? 'grabbing' : panningRef.current ? 'grab' : 'default' }}
-        onMouseDown={handleCanvasMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-        onClick={handleCanvasClick}
-        onWheel={handleWheel}
-      >
-        {visibleTasks.length === 0 ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
-            <div className="w-14 h-14 rounded-2xl flex items-center justify-center"
-              style={{ background:'#0D1726', border:'1px solid #1E2C45' }}>
-              <GitBranch size={22} className="text-[#283A57]"/>
-            </div>
-            <p className="text-sm text-[#7E91A8]">No tasks to display</p>
-          </div>
-        ) : (
-          <svg
-            width={layout.width * zoom}
-            height={layout.height * zoom}
-            viewBox={`0 0 ${layout.width} ${layout.height}`}
-            style={{ display:'block', transform:`translate(${pan.x}px,${pan.y}px)`, transformOrigin:'0 0', cursor:'inherit' }}
-          >
-            <defs>
-              {([
-                ['arr-grey',   '#283A57'],
-                ['arr-indigo', '#6366F1'],
-                ['arr-purple', '#A78BFA'],
-                ['arr-red',    '#EF4444'],
-                ['arr-gold',   '#FBBF24'],
-                ['arr-lit',    '#818CF8'],
-              ] as const).map(([id,fill])=>(
-                <marker key={id} id={id} markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
-                  <path d="M0,0 L0,8 L8,4 z" fill={fill} opacity="0.9"/>
-                </marker>
+      {/* Toolbar */}
+      <div className="flex items-center gap-2 px-3 py-2 flex-wrap flex-shrink-0" style={{ borderBottom: '1px solid #1E2C45', background: '#0B1322' }}>
+        <div className="relative">
+          <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#3D5068]" />
+          <input value={query} onChange={e => setQuery(e.target.value)} placeholder="Find a ticket…"
+            onKeyDown={e => { if (e.key === 'Enter' && results[0]) jumpTo(results[0]) }}
+            className="w-56 bg-[#08101F] border border-[#1E2C45] rounded-lg pl-7 pr-2 py-1 text-xs text-[#DDE6F0] placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1]" />
+          {results.length > 0 && (
+            <div className="absolute z-20 mt-1 w-80 rounded-xl overflow-hidden shadow-2xl" style={{ background: '#0D1726', border: '1px solid #283A57' }}>
+              {results.map(t => (
+                <button key={t.id} onClick={() => jumpTo(t)}
+                  className="w-full text-left px-3 py-2 text-xs hover:bg-[#172540] flex items-center gap-2 cursor-pointer">
+                  <span className="font-mono text-[#7E91A8]">#{t.id}</span>
+                  <span className="text-[#DDE6F0] truncate flex-1">{t.name}</span>
+                  <span style={{ color: sc(t.state).text }}>{sc(t.state).label}</span>
+                </button>
               ))}
-              {/* Selected node glow */}
-              <filter id="glow-sel" x="-40%" y="-40%" width="180%" height="180%">
-                <feGaussianBlur in="SourceAlpha" stdDeviation="7" result="b"/>
-                <feFlood floodColor="#FBBF24" floodOpacity="0.45" result="c"/>
-                <feComposite in="c" in2="b" operator="in" result="g"/>
-                <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
-              </filter>
-              {/* Dep chain glow */}
-              <filter id="glow-dep" x="-30%" y="-30%" width="160%" height="160%">
-                <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="b"/>
-                <feFlood floodColor="#6366F1" floodOpacity="0.4" result="c"/>
-                <feComposite in="c" in2="b" operator="in" result="g"/>
-                <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
-              </filter>
-              <filter id="glow-dep2" x="-30%" y="-30%" width="160%" height="160%">
-                <feGaussianBlur in="SourceAlpha" stdDeviation="4" result="b"/>
-                <feFlood floodColor="#A78BFA" floodOpacity="0.4" result="c"/>
-                <feComposite in="c" in2="b" operator="in" result="g"/>
-                <feMerge><feMergeNode in="g"/><feMergeNode in="SourceGraphic"/></feMerge>
-              </filter>
-            </defs>
+            </div>
+          )}
+        </div>
 
-            {/* ── Layer 1: dimmed edges ── */}
-            {bgEdges.map(edge => {
-              const fn = nodePos(edge.from, nodes, nodeOverrides)
-              const tn = nodePos(edge.to,   nodes, nodeOverrides)
-              const st = EDGE_STYLE[edge.kind]
-              const stroke  = edge.blocked ? '#EF4444' : st.stroke
-              const opacity = focusChain   ? 0.04      : edge.blocked ? 0.8 : 0.35
-              const marker  = edge.blocked ? 'arr-red' : edge.kind==='cross-epic' ? 'arr-purple' : edge.kind==='cross-story' ? 'arr-indigo' : 'arr-grey'
+        <select value={epicFilter ?? ''} onChange={e => setEpicFilter(e.target.value ? Number(e.target.value) : null)}
+          className="bg-[#08101F] border border-[#1E2C45] rounded-lg px-2 py-1 text-xs text-[#DDE6F0] focus:outline-none cursor-pointer">
+          <option value="">All epics</option>
+          {epics.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+        </select>
+        {meId != null && (
+          <button onClick={() => setMineOnly(v => !v)} className={pill(mineOnly)} title="Only tickets you own">
+            <User size={12} />Mine
+          </button>
+        )}
+        <button onClick={() => setHideDone(v => !v)} className={pill(hideDone)}>
+          {hideDone ? <EyeOff size={12} /> : <Eye size={12} />}Hide done
+        </button>
+
+        <div className="w-px h-5 bg-[#1E2C45] mx-1" />
+        <button onClick={() => setExpanded(new Set(stories.map(s => s.id)))} className={pill(false)} title="Show every ticket">
+          <Layers size={12} />Expand all
+        </button>
+        <button onClick={() => setExpanded(new Set())} className={pill(false)} title="One node per story">
+          Collapse all
+        </button>
+
+        <div className="w-px h-5 bg-[#1E2C45] mx-1" />
+        <span className="text-xs text-[#3D5068]">What changed:</span>
+        {(['off', '1d', '7d'] as const).map(c => (
+          <button key={c} onClick={() => setChanges(c)} className={pill(changes === c)}>
+            {c === 'off' ? 'Off' : c === '1d' ? 'Today' : 'This week'}
+          </button>
+        ))}
+
+        <div className="ml-auto flex items-center gap-3 text-[10px] text-[#3D5068]">
+          <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-[#38BDF8]" />waits on</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-[#A78BFA]" />waited on by</span>
+          <span className="flex items-center gap-1"><span className="w-3 h-0.5 bg-[#EF4444]" />blocking</span>
+        </div>
+      </div>
+
+      <div className="flex flex-1 overflow-hidden">
+        <div className="flex-1 relative">
+          {loading && tasks.length === 0 ? (
+            <div className="flex items-center justify-center h-full"><Loader2 size={20} className="text-[#6366F1] animate-spin" /></div>
+          ) : error ? (
+            <div className="flex items-center justify-center h-full text-sm text-[#F87171]">{error}</div>
+          ) : tasks.length === 0 ? (
+            <div className="flex items-center justify-center h-full text-sm text-[#3D5068]">No tickets yet.</div>
+          ) : (
+            <ReactFlow
+              nodes={nodes} edges={edges} nodeTypes={nodeTypes}
+              colorMode="dark" minZoom={0.05} maxZoom={2} fitView
+              nodesDraggable={false} nodesConnectable={false} elementsSelectable={false}
+              onNodeClick={(_, n) => {
+                if (n.type === 'ticket') {
+                  const id = Number(n.id.slice(1))
+                  setSelectedId(cur => (cur === id ? null : id))
+                }
+              }}
+              onPaneClick={() => { if (!focusChain) setSelectedId(null) }}
+              proOptions={{ hideAttribution: true }}
+              style={{ background: '#08101F' }}
+            >
+              <Background color="#172540" bgColor="#08101F" gap={22} />
+              <Controls showInteractive={false} />
+              <MiniMap pannable zoomable bgColor="#0D1726"
+                style={{ border: '1px solid #1E2C45' }} maskColor="rgba(8,16,31,0.55)"
+                nodeColor={n => n.type === 'ticket' ? sc((n.data as TicketData).task.state).bar : n.type === 'story' ? '#5B6B85' : 'transparent'}
+                nodeStrokeColor={n => n.type === 'cluster' ? '#283A57' : 'transparent'} />
+            </ReactFlow>
+          )}
+
+          {/* Selected ticket */}
+          {selected && chain && (
+            <div className="absolute left-1/2 -translate-x-1/2 bottom-4 flex items-center gap-3 px-4 py-2.5 rounded-xl shadow-2xl"
+              style={{ background: '#0D1726', border: '1px solid #283A57' }}>
+              <span className="font-mono text-xs text-[#7E91A8]">#{selected.id}</span>
+              <span className="text-sm text-[#DDE6F0] font-semibold max-w-[320px] truncate">{selected.name}</span>
+              <span className="text-xs" style={{ color: sc(selected.state).text }}>{sc(selected.state).label}</span>
+              <span className="text-xs text-[#38BDF8]">waits on {chain.up.size}</span>
+              <span className="text-xs text-[#A78BFA]">{chain.down.size} wait on it</span>
+              <button onClick={() => setFocusChain(v => !v)} className={pill(focusChain)} title="Show only this chain">
+                <Crosshair size={12} />Focus chain
+              </button>
+              <button onClick={() => openTicket(selected)} className={pill(false)}>
+                <ExternalLink size={12} />Open
+              </button>
+              <button onClick={() => { setSelectedId(null); setFocusChain(false) }} className="text-[#7E91A8] hover:text-[#DDE6F0] cursor-pointer" title="Clear">
+                <X size={14} />
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* What changed */}
+        {changes !== 'off' && (
+          <aside className="w-72 flex-shrink-0 overflow-y-auto" style={{ borderLeft: '1px solid #1E2C45', background: '#0D1726' }}>
+            <div className="px-4 py-3 text-xs font-semibold text-[#DDE6F0] flex items-center gap-1.5" style={{ borderBottom: '1px solid #192238' }}>
+              <Clock size={12} style={{ color: CHANGED }} />
+              {recent.length} ticket{recent.length === 1 ? '' : 's'} changed {changes === '1d' ? 'today' : 'this week'}
+            </div>
+            {recent.map(a => {
+              const t = taskById.get(a.task_id)
+              if (!t) return null
               return (
-                <path key={`bg-${edge.from}-${edge.to}`}
-                  d={edgePath(fn, tn, edge.points)} fill="none"
-                  stroke={stroke} strokeWidth={st.width}
-                  strokeDasharray={edge.blocked?'4 3':st.dash}
-                  strokeOpacity={opacity} markerEnd={`url(#${marker})`}/>
+                <button key={a.task_id} onClick={() => jumpTo(t)}
+                  className="w-full text-left px-4 py-2.5 hover:bg-[#172540] cursor-pointer" style={{ borderBottom: '1px solid #131D30' }}>
+                  <div className="flex items-center gap-1.5 text-[10px]">
+                    <span className="font-mono text-[#7E91A8]">#{t.id}</span>
+                    <span className="text-[#7E91A8]">{a.action.replace('_', ' ')}{a.to_state ? ` → ${a.to_state.replace('_', ' ')}` : ''}</span>
+                    <span className="ml-auto text-[#3D5068]">{new Date(a.created_at).toLocaleString(undefined, { weekday: changes === '7d' ? 'short' : undefined, hour: 'numeric', minute: '2-digit' })}</span>
+                  </div>
+                  <div className="text-xs text-[#DDE6F0] truncate mt-0.5">{t.name}</div>
+                </button>
               )
             })}
-
-            {/* ── Layer 2: nodes ── */}
-            {Array.from(nodes.entries()).map(([id, {task}]) => {
-              const {x,y} = nodePos(id, nodes, nodeOverrides)
-              const colors    = sc(task.state)
-              const eIdx      = epicIdx.get(task.epic_id) ?? 0
-              const eColor    = epicColor(eIdx)
-              const L = x - NODE_W/2, T = y - NODE_H/2
-
-              const isSelected   = selectedId === task.id
-              const isDep        = focusChain?.deps.has(task.id)
-              const isDependent  = focusChain?.dependents.has(task.id)
-              const isFocusNode  = focusId === task.id
-              const isDimmed     = !!focusChain && !isFocusNode && !isDep && !isDependent
-
-              const borderColor = isSelected  ? '#FBBF24'
-                                : isDep       ? '#818CF8'
-                                : isDependent ? '#A78BFA'
-                                : isFocusNode ? '#FBBF24'
-                                : colors.border
-              const borderW = (isSelected || isDep || isDependent || isFocusNode) ? 2 : 1
-              const filter  = isSelected    ? 'url(#glow-sel)'
-                            : isDep         ? 'url(#glow-dep)'
-                            : isDependent   ? 'url(#glow-dep2)'
-                            : undefined
-
-              return (
-                <g key={id}
-                  opacity={isDimmed ? 0.2 : 1}
-                  style={{ cursor: 'pointer' }}
-                  onMouseDown={e => handleNodeMouseDown(e, id)}
-                  onMouseEnter={() => setHoveredId(id)}
-                  onMouseLeave={() => setHoveredId(null)}
-                  onClick={e => handleNodeClick(e, task)}
-                  filter={filter}
-                >
-                  {/* Card */}
-                  <rect x={L} y={T} width={NODE_W} height={NODE_H} rx={10} fill={colors.bg} stroke={borderColor} strokeWidth={borderW}/>
-                  {/* Epic top strip */}
-                  <rect x={L+1} y={T+1} width={NODE_W-2} height={3} rx={2} fill={eColor} opacity={0.85}/>
-                  {/* State bar */}
-                  <rect x={L} y={T+4} width={4} height={NODE_H-8} rx={2} fill={colors.bar}/>
-                  {/* Task name */}
-                  <foreignObject x={L+14} y={T+10} width={NODE_W-22} height={44}>
-                    <div style={{
-                      fontSize: 12,
-                      fontFamily: "'Plus Jakarta Sans', system-ui, sans-serif",
-                      fontWeight: 600,
-                      color: isSelected || isFocusNode ? '#FFFFFF' : '#DDE6F0',
-                      lineHeight: '16px',
-                      overflow: 'hidden',
-                      display: '-webkit-box',
-                      WebkitLineClamp: 3,
-                      WebkitBoxOrient: 'vertical',
-                    }}>
-                      {task.name}
-                    </div>
-                  </foreignObject>
-                  {/* Divider */}
-                  <line x1={L+8} y1={T+NODE_H-24} x2={L+NODE_W-8} y2={T+NODE_H-24} stroke={colors.border} strokeWidth={0.5} opacity={0.5}/>
-                  {/* Footer */}
-                  <text x={L+14} y={T+NODE_H-9} fontSize={10} fill="#3D5068" fontFamily="monospace">#{task.id}</text>
-                  <text x={L+NODE_W/2} y={T+NODE_H-9} fontSize={10} fill={colors.text} fontFamily="system-ui" textAnchor="middle">{task.state.replace('_',' ')}</text>
-                  <circle cx={L+NODE_W-12} cy={T+NODE_H-14} r={5} fill={eColor} opacity={0.9}>
-                    <title>{epicById.get(task.epic_id)?.name}</title>
-                  </circle>
-                  {/* Selected indicator */}
-                  {isSelected && (
-                    <circle cx={L+NODE_W/2} cy={T-8} r={4} fill="#FBBF24" opacity={0.9}/>
-                  )}
-                  {/* Blocked badge */}
-                  {task.state==='blocked' && (task.blocked_by_ids?.length??0)>0 && (
-                    <g>
-                      <rect x={x-50} y={T-22} width={100} height={18} rx={6} fill="#180404" stroke="#EF4444" strokeWidth={0.75}/>
-                      <text x={x} y={T-9} fontSize={10} fill="#F87171" fontFamily="system-ui" textAnchor="middle">
-                        blocked by {task.blocked_by_ids!.length}
-                      </text>
-                    </g>
-                  )}
-                </g>
-              )
-            })}
-
-            {/* ── Layer 3: highlighted chain edges ── */}
-            {hlEdges.map(edge => {
-              const fn = nodePos(edge.from, nodes, nodeOverrides)
-              const tn = nodePos(edge.to,   nodes, nodeOverrides)
-              const st = EDGE_STYLE[edge.kind]
-              const isFromSel  = edge.from === focusId
-              const isToSel    = edge.to   === focusId
-              const stroke = edge.blocked ? '#EF4444'
-                           : isFromSel || isToSel ? '#FBBF24'
-                           : focusChain?.deps.has(edge.from) ? '#818CF8'
-                           : '#A78BFA'
-              const marker = edge.blocked ? 'arr-red'
-                           : isFromSel || isToSel ? 'arr-gold'
-                           : focusChain?.deps.has(edge.from) ? 'arr-lit'
-                           : 'arr-purple'
-              return (
-                <path key={`hl-${edge.from}-${edge.to}`}
-                  d={edgePath(fn, tn, edge.points)} fill="none"
-                  stroke={stroke} strokeWidth={st.width + 1}
-                  strokeDasharray={edge.blocked?'4 3':st.dash}
-                  strokeOpacity={1} markerEnd={`url(#${marker})`}/>
-              )
-            })}
-
-            {/* ── Layer 4: hover tooltip ── */}
-            {hoveredId !== null && hoveredId !== selectedId && (() => {
-              const pos  = nodePos(hoveredId, nodes, nodeOverrides)
-              const task = nodes.get(hoveredId)?.task
-              if (!task) return null
-              const epic  = epicById.get(task.epic_id)
-              const story = storyById.get(task.story_id)
-              const eColor = epicColor(epicIdx.get(task.epic_id) ?? 0)
-              const L = pos.x - NODE_W/2
-              const T = pos.y - NODE_H/2
-              const ttH = 46
-              return (
-                <g pointerEvents="none">
-                  <rect x={L} y={T+NODE_H+6} width={NODE_W} height={ttH} rx={8} fill="#0D1726" stroke="#1E2C45" strokeWidth={1}/>
-                  <text x={L+12} y={T+NODE_H+22} fontSize={11} fontWeight={600} fill={eColor} fontFamily="system-ui">{epic?.name}</text>
-                  {story && <text x={L+12} y={T+NODE_H+38} fontSize={10} fill="#7E91A8" fontFamily="system-ui">{story.name}</text>}
-                </g>
-              )
-            })()}
-          </svg>
+            {recent.length === 0 && <p className="px-4 py-6 text-xs text-[#3D5068] text-center">Nothing changed.</p>}
+          </aside>
         )}
       </div>
 
-      {/* ── Selected task info strip ── */}
-      {selectedTaskObj && selectedChain && (
-        <div
-          className="flex-shrink-0 flex items-center gap-4 px-5 py-3"
-          style={{ background:'#0D1726', borderTop:'1px solid #1E2C45', minHeight:56 }}
-        >
-          {/* Breadcrumb */}
-          <div className="flex items-center gap-1.5 text-xs min-w-0 flex-1 overflow-hidden">
-            <span className="text-[#3D5068] font-mono tabular-nums flex-shrink-0">#{selectedTaskObj.id}</span>
-            <ArrowRight size={10} className="text-[#283A57] flex-shrink-0"/>
-            <span className="text-[#FBBF24] font-semibold truncate" style={{ maxWidth:120 }}>
-              {epicById.get(selectedTaskObj.epic_id)?.name}
-            </span>
-            <ArrowRight size={10} className="text-[#283A57] flex-shrink-0"/>
-            <span className="text-[#7E91A8] truncate" style={{ maxWidth:140 }}>
-              {storyById.get(selectedTaskObj.story_id)?.name}
-            </span>
-            <ArrowRight size={10} className="text-[#283A57] flex-shrink-0"/>
-            <span className="text-[#DDE6F0] font-semibold truncate">{selectedTaskObj.name}</span>
-          </div>
-
-          {/* Chain legend */}
-          <div className="flex items-center gap-3 flex-shrink-0">
-            {selectedChain.deps.size > 0 && (
-              <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color:'#818CF8' }}>
-                <span className="w-2 h-2 rounded-full bg-[#818CF8]"/>
-                {selectedChain.deps.size} dep{selectedChain.deps.size!==1?'s':''}
-              </span>
-            )}
-            {selectedChain.dependents.size > 0 && (
-              <span className="flex items-center gap-1.5 text-xs font-medium" style={{ color:'#A78BFA' }}>
-                <span className="w-2 h-2 rounded-full bg-[#A78BFA]"/>
-                {selectedChain.dependents.size} dependent{selectedChain.dependents.size!==1?'s':''}
-              </span>
-            )}
-            <StatusBadge state={selectedTaskObj.state}/>
-          </div>
-
-          {/* Actions */}
-          <div className="flex items-center gap-2 flex-shrink-0">
-            <button
-              onClick={() => setDrawerTask(selectedTaskObj)}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all active:scale-[0.97]"
-              style={{ background:'rgba(99,102,241,0.12)', border:'1px solid rgba(99,102,241,0.25)', color:'#818CF8' }}
-            >
-              <ExternalLink size={11}/>
-              Details
-            </button>
-            <button
-              onClick={() => setSelectedId(null)}
-              className="p-1.5 rounded-lg text-[#3D5068] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"
-            >
-              <X size={13}/>
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Task drawer — opened from info strip */}
-      <TaskDrawer task={drawerTask} onClose={() => setDrawerTask(null)}/>
+      <TaskDrawer task={drawerTask} onClose={() => setDrawerTask(null)} onRefresh={refresh} />
     </div>
-  )
-}
-
-// ─── Edge styles ──────────────────────────────────────────────────────────────
-const EDGE_STYLE = {
-  'same-story':  { stroke:'#283A57', dash:undefined, width:1.5 },
-  'cross-story': { stroke:'#6366F1', dash:'6 3',     width:1.5 },
-  'cross-epic':  { stroke:'#A78BFA', dash:'9 4',     width:2   },
-} as const
-
-// ─── Legend line ──────────────────────────────────────────────────────────────
-function LegendLine({ stroke, dash, label }: { stroke:string; dash?:string; label:string }) {
-  return (
-    <span className="flex items-center gap-1.5">
-      <svg width="28" height="10" className="flex-shrink-0">
-        <line x1="2" y1="5" x2="22" y2="5" stroke={stroke} strokeWidth="1.5" strokeDasharray={dash}/>
-        <polygon points="20,2 28,5 20,8" fill={stroke} opacity="0.85"/>
-      </svg>
-      <span>{label}</span>
-    </span>
   )
 }
