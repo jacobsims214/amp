@@ -80,7 +80,7 @@ func newCrashableStack(t *testing.T) *crashableStack {
 	}
 	t.Cleanup(repo.Close)
 
-	if err := repo.Migrate(ctx, migrationSQL); err != nil {
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 

@@ -83,8 +83,18 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			return
 		}
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgDispatchTask{TaskID: msg.TaskID, AgentID: msg.AgentID, ReplyCh: replyCh})
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
+
+	case *MsgAssignTask:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		ctx.Send(pid, msg)
 
 	case *MsgCompleteTask:
 		pid, ok := a.tasks[msg.TaskID]
@@ -93,7 +103,9 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			return
 		}
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgCompleteTask{TaskID: msg.TaskID, ReplyCh: replyCh})
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
 
 	case *MsgBlockTask:
@@ -103,7 +115,9 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			return
 		}
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgBlockTask{TaskID: msg.TaskID, Reason: msg.Reason, ReplyCh: replyCh})
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
 
 	case *MsgUpdateTask:
@@ -123,7 +137,9 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 			return
 		}
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgSetTaskState{TaskID: msg.TaskID, State: msg.State, Reason: msg.Reason, ReplyCh: replyCh})
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
 
 	case *MsgAddComment:
@@ -315,12 +331,13 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 		At:        time.Now(),
 	})
 	_ = a.repo.LogActivity(context.Background(), domain.ActivityLog{
-		TaskID:    task.ID,
-		ProjectID: a.story.ProjectID,
-		Actor:     "system",
-		Action:    "created",
-		ToState:   string(task.State),
-		Detail:    fmt.Sprintf("Task %q created (story=%d epic=%d) — initial state: %s", task.Name, a.story.ID, a.story.EpicID, task.State),
+		TaskID:      task.ID,
+		ProjectID:   a.story.ProjectID,
+		Actor:       "system",
+		Action:      "created",
+		ToState:     string(task.State),
+		ActorUserID: req.CreatedBy,
+		Detail:      fmt.Sprintf("Task %q created (story=%d epic=%d) — initial state: %s", task.Name, a.story.ID, a.story.EpicID, task.State),
 	})
 	a.log.Info("task created", "task_id", task.ID, "state", task.State)
 	return &t, nil

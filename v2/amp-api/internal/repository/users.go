@@ -30,6 +30,7 @@ var EmptyEmailClaimError = errors.New("upsert user: empty email claim — skippi
 //
 //  1. The same OIDC subject arriving with a changed email (normal upsert via
 //     ON CONFLICT (subject) DO UPDATE).
+//
 //  2. A *new* subject arriving with an email that already belongs to an
 //     existing row — this happens when Dex tokens arrive without an email
 //     claim (empty string), or when a user's Dex identity is recreated with a
@@ -40,11 +41,11 @@ var EmptyEmailClaimError = errors.New("upsert user: empty email claim — skippi
 //     forever on every subsequent request (this was a real prod incident —
 //     every request from that client would error with SQLSTATE 23505).
 //
-//  Empty emails are short-circuited entirely: provisioning with an empty
-//  email would either collide with an existing empty-email row (id 9356 was
-//  created this way in prod) or create a meaningless row. We skip provisioning
-//  and return a sentinel error so callers can handle it (e.g., log and
-//  continue without an identity rather than failing the request).
+//     Empty emails are short-circuited entirely: provisioning with an empty
+//     email would either collide with an existing empty-email row (id 9356 was
+//     created this way in prod) or create a meaningless row. We skip provisioning
+//     and return a sentinel error so callers can handle it (e.g., log and
+//     continue without an identity rather than failing the request).
 func (r *Repo) UpsertUserFromClaims(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool) (*domain.User, error) {
 	if email == "" {
 		return nil, EmptyEmailClaimError
@@ -128,6 +129,20 @@ func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, b
 	}
 
 	u.Roles = roles
+
+	// Apply pending org/team invites for this email. The EXISTS probe keeps
+	// the common case (nothing pending) to one cheap indexed read per request.
+	var pending bool
+	if err := r.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM invites WHERE lower(email) = lower($1) AND accepted_at IS NULL)`, email,
+	).Scan(&pending); err != nil {
+		return nil, fmt.Errorf("check invites: %w", err)
+	}
+	if pending {
+		if _, err := r.AcceptInvites(ctx, u.ID, email); err != nil {
+			return nil, fmt.Errorf("accept invites: %w", err)
+		}
+	}
 	return u, nil
 }
 
@@ -170,15 +185,15 @@ func (r *Repo) GetUserBySubject(ctx context.Context, subject string) (*domain.Us
 	return u, nil
 }
 
-// GetUserByEmail fetches a user (with roles) by email.
+// GetUserByEmail fetches a user (with roles) by email, case-insensitively.
 func (r *Repo) GetUserByEmail(ctx context.Context, email string) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
 		`SELECT id, subject, email, display_name, created_at, last_seen_at
-		 FROM users WHERE email = $1`, email,
+		 FROM users WHERE lower(email) = lower(trim($1))`, email,
 	).Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt)
 	if err == pgx.ErrNoRows {
-		return nil, fmt.Errorf("user not found")
+		return nil, fmt.Errorf("user %q not found: %w", email, ErrNotFound)
 	}
 	if err != nil {
 		return nil, err

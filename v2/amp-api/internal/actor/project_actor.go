@@ -166,6 +166,9 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgBlockTask:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
+	case *MsgAssignTask:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
 	case *MsgUpdateTask:
 		a.routeTaskMsg(ctx, msg.Req.TaskID, msg)
 

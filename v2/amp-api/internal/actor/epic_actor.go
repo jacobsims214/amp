@@ -107,6 +107,9 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgCompleteTask:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgAssignTask:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
 	case *MsgBlockTask:
 		a.routeToStory(ctx, msg.TaskID, msg)
 

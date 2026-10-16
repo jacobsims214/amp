@@ -46,8 +46,12 @@ type Project struct {
 	Code        string       `json:"code"`
 	Description string       `json:"description"`
 	State       ProjectState `json:"state"`
-	CreatedAt   time.Time    `json:"created_at"`
-	UpdatedAt   time.Time    `json:"updated_at"`
+	// OrgID is the org the project belongs to. Only that org's teams can be
+	// linked to it. Nil only transiently for rows predating orgs.
+	OrgID     *int      `json:"org_id"`
+	CreatedBy *int      `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Epic struct {
@@ -57,8 +61,12 @@ type Epic struct {
 	Description string    `json:"description"`
 	State       EpicState `json:"state"`
 	Priority    string    `json:"priority"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	// CreatedBy is the AMP user who created it; nil for rows predating
+	// attribution. OwnerIDs are the users who own this shared grouping.
+	CreatedBy *int      `json:"created_by"`
+	OwnerIDs  []int     `json:"owner_ids"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
 
 type Story struct {
@@ -70,6 +78,8 @@ type Story struct {
 	AcceptanceCriteria string     `json:"acceptance_criteria"`
 	State              StoryState `json:"state"`
 	Priority           string     `json:"priority"`
+	CreatedBy          *int       `json:"created_by"`
+	OwnerIDs           []int      `json:"owner_ids"`
 	CreatedAt          time.Time  `json:"created_at"`
 	UpdatedAt          time.Time  `json:"updated_at"`
 }
@@ -101,16 +111,23 @@ type Task struct {
 	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 	BlockReason  string     `json:"block_reason,omitempty"`
 	StartAt      *time.Time `json:"start_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	// CreatedBy is the AMP user who created the ticket (nil for legacy rows).
+	CreatedBy *int `json:"created_by"`
+	// OwnerUserID is the one AMP user who owns the work; nil = unassigned,
+	// available for anyone on the project (or their agents) to claim.
+	// Distinct from AssignedTo/AgentID, which name the agent profile.
+	OwnerUserID *int      `json:"owner_user_id"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type Comment struct {
-	ID        int       `json:"id"`
-	TaskID    int       `json:"task_id"`
-	Body      string    `json:"body"`
-	Author    string    `json:"author"`
-	CreatedAt time.Time `json:"created_at"`
+	ID           int       `json:"id"`
+	TaskID       int       `json:"task_id"`
+	Body         string    `json:"body"`
+	Author       string    `json:"author"`
+	AuthorUserID *int      `json:"author_user_id,omitempty"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // ---- Request types ----
@@ -119,6 +136,11 @@ type CreateProjectRequest struct {
 	Name        string `json:"name"`
 	Code        string `json:"code"`
 	Description string `json:"description"`
+	// OrgID and TeamID choose where the project lives and which team owns
+	// it. Both may be omitted when the caller's choice is unambiguous.
+	OrgID     *int `json:"org_id,omitempty"`
+	TeamID    *int `json:"team_id,omitempty"`
+	CreatedBy *int `json:"-"`
 }
 
 type CreateEpicRequest struct {
@@ -126,6 +148,7 @@ type CreateEpicRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
 	Priority    string `json:"priority"`
+	CreatedBy   *int   `json:"-"` // set server-side from the caller; also made an owner
 }
 
 type CreateStoryRequest struct {
@@ -135,6 +158,7 @@ type CreateStoryRequest struct {
 	Description        string `json:"description"`
 	AcceptanceCriteria string `json:"acceptance_criteria"`
 	Priority           string `json:"priority"`
+	CreatedBy          *int   `json:"-"`
 }
 
 type CreateTaskRequest struct {
@@ -151,6 +175,10 @@ type CreateTaskRequest struct {
 	// State (backlog vs blocked) is derived by the actor — agent does not set it.
 	DependencyIDs []int      `json:"dependency_ids"`
 	StartAt       *time.Time `json:"start_at,omitempty"`
+	CreatedBy     *int       `json:"-"`
+	// OwnerUserID is resolved server-side: the creator by default, or nil
+	// for an unassigned ticket.
+	OwnerUserID *int `json:"-"`
 }
 
 type UpdateTaskRequest struct {
@@ -165,10 +193,10 @@ type UpdateTaskRequest struct {
 }
 
 type UpdateEpicRequest struct {
-	EpicID       int    `json:"epic_id"`
-	Name         string `json:"name,omitempty"`
-	Description  string `json:"description,omitempty"`
-	Priority     string `json:"priority,omitempty"`
+	EpicID      int    `json:"epic_id"`
+	Name        string `json:"name,omitempty"`
+	Description string `json:"description,omitempty"`
+	Priority    string `json:"priority,omitempty"`
 }
 
 type UpdateStoryRequest struct {
@@ -185,24 +213,27 @@ type DispatchTaskRequest struct {
 }
 
 type AddCommentRequest struct {
-	TaskID int    `json:"task_id"`
-	Body   string `json:"body"`
-	Author string `json:"author"`
+	TaskID       int    `json:"task_id"`
+	Body         string `json:"body"`
+	Author       string `json:"author"`
+	AuthorUserID *int   `json:"-"`
 }
 
 // ActivityLog is the immutable audit trail for a task.
 // Every state transition and comment produces an entry.
 // This is what amp_get_ticket_history returns — the full story of a ticket.
 type ActivityLog struct {
-	ID        int       `json:"id"`
-	TaskID    int       `json:"task_id"`
-	ProjectID int       `json:"project_id"`
-	Actor     string    `json:"actor"`  // "manager", "amp-worker", "system", agent ID
-	Action    string    `json:"action"` // "created", "dispatched", "completed", "blocked", "comment", "state_change"
-	FromState string    `json:"from_state,omitempty"`
-	ToState   string    `json:"to_state,omitempty"`
-	Detail    string    `json:"detail,omitempty"` // human-readable summary or comment body
-	CreatedAt time.Time `json:"created_at"`
+	ID        int    `json:"id"`
+	TaskID    int    `json:"task_id"`
+	ProjectID int    `json:"project_id"`
+	Actor     string `json:"actor"`  // "manager", "amp-worker", "system", agent ID
+	Action    string `json:"action"` // "created", "dispatched", "completed", "blocked", "comment", "state_change"
+	FromState string `json:"from_state,omitempty"`
+	ToState   string `json:"to_state,omitempty"`
+	Detail    string `json:"detail,omitempty"` // human-readable summary or comment body
+	// ActorUserID is the AMP user behind the action, when there was one.
+	ActorUserID *int      `json:"actor_user_id,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // ---- Events (broadcast to SSE clients) ----
@@ -224,6 +255,9 @@ const (
 	EventTaskBlocked       EventType = "task.blocked"
 	EventTaskUnblocked     EventType = "task.unblocked"
 	EventCommentAdded      EventType = "comment.added"
+	EventTaskAssigned      EventType = "task.assigned"
+	EventEpicUpdated       EventType = "epic.updated"
+	EventStoryUpdated      EventType = "story.updated"
 )
 
 type Event struct {
@@ -282,3 +316,73 @@ const (
 	RoleAdmin  = "admin"
 	RoleMember = "member"
 )
+
+// ---- Orgs, teams, access ----
+
+const (
+	OrgRoleOwner  = "owner"
+	OrgRoleAdmin  = "admin"
+	OrgRoleMember = "member"
+
+	TeamRoleLead   = "lead"
+	TeamRoleMember = "member"
+
+	ProjectTeamOwner  = "owner"
+	ProjectTeamMember = "member"
+)
+
+type Org struct {
+	ID        int       `json:"id"`
+	Name      string    `json:"name"`
+	Slug      string    `json:"slug"`
+	CreatedBy *int      `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
+	// MyRole is the caller's role in the org ("" when not a member, e.g. a
+	// global admin browsing). Filled by list endpoints only.
+	MyRole string `json:"my_role,omitempty"`
+}
+
+type Team struct {
+	ID        int       `json:"id"`
+	OrgID     int       `json:"org_id"`
+	Name      string    `json:"name"`
+	CreatedBy *int      `json:"created_by"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// Member is a user's membership in an org or team.
+type Member struct {
+	UserID      int    `json:"user_id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
+	Role        string `json:"role"`
+}
+
+// ProjectTeam is a team's link to a project.
+type ProjectTeam struct {
+	ProjectID int    `json:"project_id"`
+	TeamID    int    `json:"team_id"`
+	TeamName  string `json:"team_name"`
+	Role      string `json:"role"`
+}
+
+// ProjectMember is a user with access to a project, and their effective
+// access level there (see authz.Level).
+type ProjectMember struct {
+	UserID      int    `json:"user_id"`
+	Email       string `json:"email"`
+	DisplayName string `json:"display_name"`
+	Access      string `json:"access"`
+}
+
+type Invite struct {
+	ID         int        `json:"id"`
+	Email      string     `json:"email"`
+	OrgID      int        `json:"org_id"`
+	OrgRole    string     `json:"org_role"`
+	TeamID     *int       `json:"team_id,omitempty"`
+	TeamRole   string     `json:"team_role"`
+	InvitedBy  *int       `json:"invited_by"`
+	CreatedAt  time.Time  `json:"created_at"`
+	AcceptedAt *time.Time `json:"accepted_at,omitempty"`
+}

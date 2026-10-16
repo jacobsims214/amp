@@ -19,6 +19,7 @@ import (
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	mcpserver "github.com/mark3labs/mcp-go/server"
 	"github.com/simstech/amp-api/internal/actor"
+	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/mcp"
@@ -29,9 +30,29 @@ import (
 type mcpStack struct {
 	srv       *mcpserver.MCPServer
 	repo      *repository.Repo
+	reg       *actor.Registry
+	hub       *hub.Hub
 	projectID int
 	epicID    int // default epic for this project (tests can create more)
 	storyID   int // default story under the default epic
+	// ident is who tool calls run as; nil means the local-dev user (auth
+	// disabled), which every pre-RBAC test assumes. See as().
+	ident *auth.Identity
+}
+
+// as returns a copy of the stack whose tool calls run as ident.
+func (s *mcpStack) as(ident *auth.Identity) *mcpStack {
+	c := *s
+	c.ident = ident
+	return &c
+}
+
+func (s *mcpStack) callCtx() context.Context {
+	ident := s.ident
+	if ident == nil {
+		ident = &auth.Identity{Subject: "local-dev", LocalDev: true}
+	}
+	return auth.WithIdentity(context.Background(), ident)
 }
 
 // setupMCP boots the full stack and returns an mcpStack scoped to a fresh project.
@@ -45,7 +66,7 @@ func setupMCP(t *testing.T) *mcpStack {
 	}
 	t.Cleanup(repo.Close)
 
-	if err := repo.Migrate(ctx, migrationSQL); err != nil {
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
 
@@ -85,7 +106,7 @@ func setupMCP(t *testing.T) *mcpStack {
 		t.Fatalf("create default story: %v", err)
 	}
 
-	return &mcpStack{srv: srv, repo: repo, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
+	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
 }
 
 // call invokes an MCP tool by name with args, asserts no JSON-RPC error,
@@ -107,7 +128,7 @@ func (s *mcpStack) call(t *testing.T, toolName string, args map[string]interface
 		t.Fatalf("marshal request: %v", err)
 	}
 
-	resp := s.srv.HandleMessage(context.Background(), raw)
+	resp := s.srv.HandleMessage(s.callCtx(), raw)
 
 	// Re-marshal and unmarshal to get a plain map we can inspect.
 	respBytes, err := json.Marshal(resp)
@@ -167,7 +188,7 @@ func (s *mcpStack) callExpectError(t *testing.T, toolName string, args map[strin
 		},
 	}
 	raw, _ := json.Marshal(req)
-	resp := s.srv.HandleMessage(context.Background(), raw)
+	resp := s.srv.HandleMessage(s.callCtx(), raw)
 	respBytes, _ := json.Marshal(resp)
 
 	var rpcResp struct {

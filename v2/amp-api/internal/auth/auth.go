@@ -33,6 +33,9 @@ type Identity struct {
 	Email   string
 	Name    string
 	User    *domain.User // populated after JIT provisioning
+	// LocalDev is set when auth is disabled (no ISSUER_URL): the request is
+	// the anonymous local-dev user, who is treated as a global admin.
+	LocalDev bool
 }
 
 // Verifier validates bearer tokens against Dex's JWKS. Safe for concurrent use.
@@ -146,7 +149,7 @@ func (v *Verifier) verifyAudience(audience []string) bool {
 func (v *Verifier) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !v.enabled {
-			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev"}
+			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev", LocalDev: true}
 			r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
 			next.ServeHTTP(w, r)
 			return
@@ -219,6 +222,12 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// WithIdentity returns ctx carrying ident, as the middleware would. For
+// in-process callers (tests, background jobs) that bypass HTTP.
+func WithIdentity(ctx context.Context, ident *Identity) context.Context {
+	return context.WithValue(ctx, identityCtxKey, ident)
 }
 
 // FromContext retrieves the authenticated Identity, if any.

@@ -2,8 +2,9 @@ package main
 
 import (
 	"context"
-	_ "embed"
+	"embed"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
@@ -26,18 +27,28 @@ import (
 	"github.com/simstech/amp-api/internal/repository"
 )
 
-//go:embed migrations/001_init.sql
-var migration001 string
+//go:embed migrations/*.sql
+var migrationFS embed.FS
 
-//go:embed migrations/002_task_start_at.sql
-var migration002 string
+// migrations is the ordered, versioned migration set (file name without
+// .sql is the version) — also used directly by the test suite.
+var migrations = mustLoadMigrations()
 
-//go:embed migrations/003_users.sql
-var migration003 string
-
-// migrationSQL is the full, concatenated migration set — also used directly
-// by the test suite to spin up a schema.
-var migrationSQL = migration001 + "\n" + migration002 + "\n" + migration003
+func mustLoadMigrations() []repository.Migration {
+	entries, err := fs.ReadDir(migrationFS, "migrations")
+	if err != nil {
+		panic(err)
+	}
+	var out []repository.Migration
+	for _, e := range entries { // ReadDir returns entries sorted by name
+		b, err := fs.ReadFile(migrationFS, "migrations/"+e.Name())
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, repository.Migration{Version: strings.TrimSuffix(e.Name(), ".sql"), SQL: string(b)})
+	}
+	return out
+}
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
@@ -59,7 +70,7 @@ func main() {
 	defer repo.Close()
 
 	slog.Info("running migrations")
-	if err := repo.Migrate(ctx, migrationSQL); err != nil {
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		slog.Error("migration failed", "err", err)
 		os.Exit(1)
 	}

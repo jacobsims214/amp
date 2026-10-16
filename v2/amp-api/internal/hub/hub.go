@@ -40,9 +40,19 @@ func (h *Hub) Publish(evt domain.Event) {
 	}
 }
 
-// ServeHTTP is the SSE endpoint.
+// ServeHTTP is the SSE endpoint with no filtering (every event).
 // GET /api/events
 func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.ServeFiltered(w, r, nil)
+}
+
+// Allow decides whether a connection may see events for a project. It runs
+// on the connection's own goroutine (never inside Publish), so it may block.
+type Allow func(projectID int) bool
+
+// ServeFiltered is ServeHTTP that drops events the connection's user can't
+// see. A nil allow passes everything.
+func (h *Hub) ServeFiltered(w http.ResponseWriter, r *http.Request, allow Allow) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming not supported", http.StatusInternalServerError)
@@ -75,6 +85,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case evt, ok := <-ch:
 			if !ok {
 				return
+			}
+			if allow != nil && !allow(evt.ProjectID) {
+				continue
 			}
 			data, err := json.Marshal(evt)
 			if err != nil {

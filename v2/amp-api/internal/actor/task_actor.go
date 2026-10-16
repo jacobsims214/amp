@@ -98,16 +98,20 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplyGetTask{Task: &t}
 
 	case *MsgDispatchTask:
-		err := a.handleDispatch(msg.AgentID, ctx)
+		err := a.handleDispatch(msg, ctx)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgCompleteTask:
-		err := a.handleComplete(ctx)
+		err := a.handleComplete(ctx, msg.By)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgBlockTask:
-		err := a.handleBlock(msg.Reason)
+		err := a.handleBlock(msg.Reason, msg.By)
 		msg.ReplyCh <- ReplySimple{Err: err}
+
+	case *MsgAssignTask:
+		t, err := a.handleAssign(msg, ctx)
+		msg.ReplyCh <- ReplyGetTask{Task: t, Err: err}
 
 	case *MsgUpdateTask:
 		err := a.handleUpdate(msg.Req)
@@ -119,7 +123,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 			a.scheduleTimer.Stop()
 			a.scheduleTimer = nil
 		}
-		err := a.handleSetState(msg.State, msg.Reason)
+		err := a.handleSetState(msg.State, msg.Reason, msg.By)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskStartAt:
@@ -157,7 +161,20 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 
 // ---- Handlers ----
 
-func (a *TaskActor) handleDispatch(agentID string, ctx actor.Context) error {
+func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) error {
+	agentID := msg.AgentID
+	// Ownership: only the owner works a ticket. Checked here, not just in
+	// the handler, so a claim that lands between the handler's check and
+	// this message can't be overridden.
+	claim := false
+	if msg.By != nil {
+		switch {
+		case a.task.OwnerUserID == nil:
+			claim = true
+		case *a.task.OwnerUserID != *msg.By && !msg.Override:
+			return fmt.Errorf("task %d is owned by user %d; it can only be dispatched by its owner", a.task.ID, *a.task.OwnerUserID)
+		}
+	}
 	if a.task.State == domain.TaskStateBlocked {
 		var incomplete []int
 		for _, depID := range a.task.DependencyIDs {
@@ -175,6 +192,14 @@ func (a *TaskActor) handleDispatch(agentID string, ctx actor.Context) error {
 	}
 
 	now := time.Now()
+	if claim {
+		if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.By); err != nil {
+			return fmt.Errorf("db claim on dispatch: %w", err)
+		}
+		owner := *msg.By
+		a.task.OwnerUserID = &owner
+		a.logActivityBy(agentID, msg.By, "claimed", "", "", fmt.Sprintf("Claimed by user %d on dispatch", owner))
+	}
 	a.task.State = domain.TaskStateInProgress
 	a.task.AgentID = agentID
 	a.task.DispatchedAt = &now
@@ -188,7 +213,7 @@ func (a *TaskActor) handleDispatch(agentID string, ctx actor.Context) error {
 	}
 
 	a.publish(domain.EventTaskDispatched, a.withBlockedBy())
-	a.logActivity(agentID, "dispatched", "backlog", "in_progress",
+	a.logActivityBy(agentID, msg.By, "dispatched", "backlog", "in_progress",
 		fmt.Sprintf("Dispatched to agent %q", agentID))
 	a.log.Info("dispatched", "agent", agentID)
 
@@ -197,7 +222,7 @@ func (a *TaskActor) handleDispatch(agentID string, ctx actor.Context) error {
 	return nil
 }
 
-func (a *TaskActor) handleComplete(ctx actor.Context) error {
+func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
 	if a.task.State == domain.TaskStateCompleted {
 		return nil // idempotent
 	}
@@ -213,7 +238,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context) error {
 	}
 
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
-	a.logActivity(a.task.AgentID, "completed", string(prevState), "completed",
+	a.logActivityBy(a.task.AgentID, by, "completed", string(prevState), "completed",
 		fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
 	a.log.Info("completed")
 
@@ -229,7 +254,7 @@ func (a *TaskActor) handleComplete(ctx actor.Context) error {
 	return nil
 }
 
-func (a *TaskActor) handleBlock(reason string) error {
+func (a *TaskActor) handleBlock(reason string, by *int) error {
 	a.task.State = domain.TaskStateBlocked
 	a.task.BlockReason = reason
 	a.task.UpdatedAt = time.Now()
@@ -239,7 +264,7 @@ func (a *TaskActor) handleBlock(reason string) error {
 	}
 
 	a.publish(domain.EventTaskBlocked, a.withBlockedBy())
-	a.logActivity("system", "blocked", "", "blocked", reason)
+	a.logActivityBy("system", by, "blocked", "", "blocked", reason)
 	a.log.Info("blocked", "reason", reason)
 	return nil
 }
@@ -267,7 +292,7 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	return nil
 }
 
-func (a *TaskActor) handleSetState(state domain.TaskState, reason string) error {
+func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *int) error {
 	from := string(a.task.State)
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
@@ -283,6 +308,8 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string) error 
 		FromState: from,
 		ToState:   string(state),
 		Detail:    reason,
+		// Who overrode the state, when known.
+		ActorUserID: by,
 	}); err != nil {
 		a.log.Error("failed to log state_change activity", "err", err)
 	}
@@ -342,8 +369,66 @@ func (a *TaskActor) handleAddComment(req domain.AddCommentRequest) (*domain.Comm
 		return nil, fmt.Errorf("db add comment: %w", err)
 	}
 	a.publish(domain.EventCommentAdded, comment)
-	a.logActivity(req.Author, "comment", "", "", req.Body)
+	a.logActivityBy(req.Author, req.AuthorUserID, "comment", "", "", req.Body)
 	return comment, nil
+}
+
+// handleAssign applies an ownership change as a compare-and-set against
+// the owner the caller was authorised for.
+func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain.Task, error) {
+	if !sameOwner(a.task.OwnerUserID, msg.ExpectOwner) {
+		return nil, fmt.Errorf("task %d: owner changed to %s while you were acting; reload and retry",
+			a.task.ID, ownerString(a.task.OwnerUserID))
+	}
+	if sameOwner(a.task.OwnerUserID, msg.NewOwner) {
+		t := a.withBlockedBy()
+		return &t, nil // no-op (e.g. claiming a ticket you already own)
+	}
+	if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.NewOwner); err != nil {
+		return nil, fmt.Errorf("db set owner: %w", err)
+	}
+	from := ownerString(a.task.OwnerUserID)
+	a.task.OwnerUserID = msg.NewOwner
+	a.task.UpdatedAt = time.Now()
+
+	detail := fmt.Sprintf("Owner %s → %s", from, ownerString(msg.NewOwner))
+	if msg.NewOwner == nil && a.task.State == domain.TaskStateInProgress {
+		// Released mid-flight: nobody is working it any more.
+		a.task.State = domain.TaskStateBacklog
+		a.task.AgentID = ""
+		a.task.DispatchedAt = nil
+		if err := a.repo.SetTaskState(context.Background(), a.task.ID, domain.TaskStateBacklog, ""); err != nil {
+			return nil, fmt.Errorf("db release state: %w", err)
+		}
+		if err := a.repo.SetTaskAgent(context.Background(), a.task.ID, "", nil); err != nil {
+			return nil, fmt.Errorf("db release agent: %w", err)
+		}
+		detail += " (was in progress; returned to backlog)"
+	}
+
+	action := "assigned"
+	if msg.NewOwner == nil {
+		action = "unassigned"
+	}
+	a.logActivityBy(msg.ByName, msg.By, action, "", "", detail)
+	t := a.withBlockedBy()
+	a.publish(domain.EventTaskAssigned, t)
+	a.log.Info(action, "owner", ownerString(msg.NewOwner))
+	return &t, nil
+}
+
+func sameOwner(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func ownerString(id *int) string {
+	if id == nil {
+		return "unassigned"
+	}
+	return fmt.Sprintf("user %d", *id)
 }
 
 // checkUnblock is called after every MsgDepCompleted.
@@ -396,14 +481,21 @@ func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
 }
 
 func (a *TaskActor) logActivity(actorName, action, fromState, toState, detail string) {
+	a.logActivityBy(actorName, nil, action, fromState, toState, detail)
+}
+
+// logActivityBy appends to the activity log, recording the AMP user behind
+// the action when there is one.
+func (a *TaskActor) logActivityBy(actorName string, by *int, action, fromState, toState, detail string) {
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{
-		TaskID:    a.task.ID,
-		ProjectID: a.projectID,
-		Actor:     actorName,
-		Action:    action,
-		FromState: fromState,
-		ToState:   toState,
-		Detail:    detail,
+		TaskID:      a.task.ID,
+		ProjectID:   a.projectID,
+		Actor:       actorName,
+		Action:      action,
+		FromState:   fromState,
+		ToState:     toState,
+		Detail:      detail,
+		ActorUserID: by,
 	}); err != nil {
 		a.log.Error("failed to log activity", "action", action, "err", err)
 	}
