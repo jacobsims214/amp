@@ -33,18 +33,15 @@ function addedMessage(email: string, r: AddMemberResult) {
 
 function RoleBadge({ role }: { role: string }) {
   return (
-    <span
-      className="text-[10px] font-semibold px-1.5 py-0.5 rounded-md capitalize"
-      style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', color: 'var(--link)', border: '1px solid color-mix(in srgb, var(--link) 22%, transparent)' }}
-    >
+    <span className="font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] border border-line-str text-ink bg-surface">
       {role || 'none'}
     </span>
   )
 }
 
 function Notice({ error, info }: { error?: string | null; info?: string | null }) {
-  if (error) return <p className="text-xs text-danger-ink mt-2">{error}</p>
-  if (info) return <p className="text-xs text-success mt-2">{info}</p>
+  if (error) return <p className="m-0 text-[12.5px] text-danger-ink mt-2">{error}</p>
+  if (info) return <p className="m-0 text-[12.5px] text-success-ink mt-2">{info}</p>
   return null
 }
 
@@ -56,6 +53,7 @@ export function Orgs() {
   const [selectedId, setSelectedId] = useState<number | null>(null)
 
   const [newOrg, setNewOrg] = useState({ name: '', slug: '', owner: '' })
+  const [showNew, setShowNew] = useState(false)
   const [creating, setCreating] = useState(false)
   const [createError, setCreateError] = useState<string | null>(null)
   const [createInfo, setCreateInfo] = useState<string | null>(null)
@@ -112,18 +110,19 @@ export function Orgs() {
   return (
     <div className="min-h-full" style={{ background: 'var(--bg)' }}>
       <PageHeader crumb={isAdmin ? 'Admin' : 'Organization'} title="Teams & orgs"
-        meta="Orgs own projects; teams are how people and agents get access to them." />
+        meta="Orgs own projects; teams are how people and agents get access to them."
+        actions={isAdmin ? <button type="button" className="amp-btn amp-btn-primary" onClick={() => setShowNew(v => !v)} aria-expanded={showNew}><Plus size={12} />New org</button> : undefined} />
 
-      <main className="px-7 py-6 space-y-8 max-w-6xl">
+      <main className="px-7 py-5 grid gap-4">
         {error && (
-          <div className="rounded-xl border border-danger/20 bg-danger/8 px-4 py-3 text-sm text-danger-ink">
+          <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">
             {error}
           </div>
         )}
 
-        {isAdmin && (
-          <section>
-            <h2 className="text-sm font-bold text-ink mb-3">New organization</h2>
+        {isAdmin && showNew && (
+          <section className="amp-panel p-4 grid gap-3">
+            <span className="amp-label">New organization</span>
             <form onSubmit={handleCreate} className="flex flex-wrap items-start gap-2">
               <input
                 required placeholder="Name" value={newOrg.name}
@@ -140,7 +139,7 @@ export function Orgs() {
                 onChange={e => setNewOrg(f => ({ ...f, owner: e.target.value }))}
                 className={`${fieldCls} min-w-[280px]`}
               />
-              <button type="submit" disabled={creating || !newOrg.name.trim()} className={primaryBtnCls} style={{ background: 'var(--primary)' }}>
+              <button type="submit" disabled={creating || !newOrg.name.trim()} className={primaryBtnCls}>
                 {creating ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
                 Create
               </button>
@@ -149,33 +148,31 @@ export function Orgs() {
           </section>
         )}
 
-        <section className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-6">
+        <section className="grid grid-cols-1 md:grid-cols-[240px_minmax(0,1fr)] gap-4 items-start">
           {/* Org list */}
-          <div>
-            <h2 className="text-sm font-bold text-ink mb-3">{isAdmin ? 'All organizations' : 'My organizations'}</h2>
+          <div className="amp-panel">
+            <div className="px-4 py-3 border-b border-line"><span className="amp-label">{isAdmin ? 'All organizations' : 'My organizations'}</span></div>
             {loading ? (
-              <Loader2 size={18} className="text-primary animate-spin" />
+              <div className="p-4"><Loader2 size={16} className="text-ink-3 animate-spin" /></div>
             ) : orgs.length === 0 ? (
-              <p className="text-xs text-ink-3">
+              <p className="m-0 p-4 text-[12.5px] text-ink-2">
                 {isAdmin ? 'No organizations yet.' : "You're not a member of any organization yet."}
               </p>
             ) : (
-              <div className="space-y-1">
+              <div>
                 {orgs.map(o => {
                   const active = o.id === selectedId
                   return (
                     <button
                       key={o.id}
                       onClick={() => setSelectedId(o.id)}
-                      className="w-full text-left px-3 py-2 rounded-lg transition-all cursor-pointer"
-                      style={{
-                        background: active ? 'var(--surface-3)' : 'transparent',
-                        border: active ? '1px solid var(--line-str)' : '1px solid transparent',
-                      }}
+                      aria-current={active ? 'true' : undefined}
+                      className={`w-full text-left px-4 py-2.5 border-b border-line last:border-b-0 cursor-pointer ${active ? 'bg-[color-mix(in_srgb,var(--accent)_6%,var(--surface))]' : 'hover:bg-surface-2'}`}
+                      style={active ? { boxShadow: 'inset 3px 0 0 var(--accent)' } : undefined}
                     >
-                      <div className={`text-sm font-semibold truncate ${active ? 'text-ink' : 'text-ink-2'}`}>{o.name}</div>
+                      <div className="text-[13.5px] font-semibold truncate text-ink">{o.name}</div>
                       <div className="flex items-center gap-1.5 mt-0.5">
-                        <span className="text-[10px] text-ink-3 font-mono truncate">{o.slug}</span>
+                        <span className="amp-num text-[10.5px] text-ink-3 truncate">{o.slug}</span>
                         {o.my_role && <RoleBadge role={o.my_role} />}
                       </div>
                     </button>
@@ -237,50 +234,50 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
   }
 
   return (
-    <div className="rounded-2xl p-5" style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
-      <div className="flex items-center gap-3 mb-4">
+    <div className="amp-panel amp-panel-top">
+      <div className="flex items-center gap-3 px-5 pt-4 pb-3">
         {renaming ? (
           <div className="flex items-center gap-2 flex-1">
             <input autoFocus value={name} onChange={e => setName(e.target.value)} className={`${fieldCls} flex-1`} />
-            <button onClick={rename} disabled={busy || !name.trim()} className="p-1.5 text-success hover:bg-surface-3 rounded-lg cursor-pointer disabled:opacity-50" title="Save">
+            <button onClick={rename} disabled={busy || !name.trim()} className="amp-btn amp-btn-primary amp-btn-sm" title="Save" aria-label="Save name">
               <Check size={14} />
             </button>
-            <button onClick={() => { setRenaming(false); setName(org.name) }} className="p-1.5 text-ink-2 hover:bg-surface-3 rounded-lg cursor-pointer" title="Cancel">
+            <button onClick={() => { setRenaming(false); setName(org.name) }} className="amp-btn amp-btn-ghost amp-btn-sm" title="Cancel" aria-label="Cancel rename">
               <X size={14} />
             </button>
           </div>
         ) : (
           <>
             <div className="min-w-0 flex-1">
-              <h2 className="text-base font-bold text-ink truncate">{org.name}</h2>
-              <p className="text-xs text-ink-3 font-mono">{org.slug}</p>
+              <span className="amp-label">Organization · <span className="amp-num tracking-normal">{org.slug}</span></span>
+              <h2 className="amp-heading m-0 mt-1.5 text-[20px] text-ink truncate">{org.name}</h2>
             </div>
             <Link to={`/orgs/${org.id}/kb`} title="The org's knowledge base: brand, process, standards"
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-link hover:bg-surface-3 transition-colors">
+              className="amp-btn amp-btn-sm">
               <BookOpen size={12} />Org KB
             </Link>
             {canManage && (
-              <button onClick={() => setRenaming(true)} className="p-1.5 text-ink-2 hover:text-ink hover:bg-surface-3 rounded-lg cursor-pointer" title="Rename org">
+              <button onClick={() => setRenaming(true)} className="amp-btn amp-btn-ghost amp-btn-sm" title="Rename org" aria-label="Rename org">
                 <Pencil size={13} />
               </button>
             )}
             {canGrantOwner && (
-              <button onClick={() => { setError(null); setConfirmDelete(true) }} className="p-1.5 text-ink-2 hover:text-danger-ink hover:bg-danger/10 rounded-lg cursor-pointer" title="Delete org">
+              <button onClick={() => { setError(null); setConfirmDelete(true) }} className="amp-btn amp-btn-ghost amp-btn-sm hover:!text-danger-ink" title="Delete org" aria-label="Delete org">
                 <Trash2 size={13} />
               </button>
             )}
           </>
         )}
       </div>
-      {error && !confirmDelete && <p className="text-xs text-danger-ink mb-3">{error}</p>}
+      {error && !confirmDelete && <p className="m-0 px-5 pb-3 text-[12.5px] text-danger-ink">{error}</p>}
 
-      <div className="flex border-b border-line mb-5">
+      <div className="flex border-b border-line px-3">
         {(canManage ? ['members', 'teams', 'invites', 'webhooks', 'audit'] as const : ['members', 'teams', 'invites'] as const).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
-            className={`px-4 py-2.5 text-xs font-semibold capitalize transition-all border-b-2 -mb-px cursor-pointer ${
-              tab === t ? 'border-primary text-link' : 'border-transparent text-ink-2 hover:text-ink'
+            className={`font-label text-[12px] font-semibold uppercase tracking-[0.16em] px-3.5 pt-2.5 pb-2 border-b-2 -mb-px cursor-pointer ${
+              tab === t ? 'border-accent text-ink' : 'border-transparent text-ink-3 hover:text-ink-2'
             }`}
           >
             {t === 'invites' ? 'Pending invites' : t === 'audit' ? 'Audit log' : t}
@@ -288,6 +285,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
         ))}
       </div>
 
+      <div className="p-5">
       {tab === 'members' && <OrgMembers org={org} canManage={canManage} canGrantOwner={canGrantOwner} meId={meId} />}
       {tab === 'teams' && <OrgTeams org={org} canManage={canManage} meId={meId} />}
       {tab === 'invites' && <OrgInvites org={org} canManage={canManage} />}
@@ -300,6 +298,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
         </div>
       )}
       {tab === 'audit' && <AuditLogPanel orgId={org.id} />}
+      </div>
 
       {confirmDelete && (
         <ConfirmDeleteModal
@@ -369,7 +368,7 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
             <option value="admin">Admin</option>
             {canGrantOwner && <option value="owner">Owner</option>}
           </select>
-          <button type="submit" disabled={adding} className={primaryBtnCls} style={{ background: 'var(--primary)' }}>
+          <button type="submit" disabled={adding} className={primaryBtnCls}>
             {adding ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}
             Add
           </button>
@@ -380,14 +379,14 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
       {loading ? (
         <Loader2 size={18} className="text-primary animate-spin mt-3" />
       ) : (
-        <div className="rounded-xl border border-line overflow-hidden mt-3">
+        <div className="border border-line overflow-hidden mt-3">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-ink-3 text-xs" style={{ background: 'var(--bg)' }}>
-                <th className="px-4 py-2 font-semibold">Email</th>
-                <th className="px-4 py-2 font-semibold">Name</th>
-                <th className="px-4 py-2 font-semibold w-32">Role</th>
-                {canManage && <th className="px-4 py-2 font-semibold w-12" />}
+              <tr className="text-left bg-surface-2">
+                <th className="amp-label px-4 py-2.5 border-b border-line">Email</th>
+                <th className="amp-label px-4 py-2.5 border-b border-line">Name</th>
+                <th className="amp-label px-4 py-2.5 border-b border-line w-32">Role</th>
+                {canManage && <th className="amp-label px-4 py-2.5 border-b border-line w-12" />}
               </tr>
             </thead>
             <tbody>
@@ -486,7 +485,7 @@ function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId
       {canManage && (
         <form onSubmit={handleCreate} className="flex items-start gap-2 mb-4">
           <input required placeholder="New team name" value={newName} onChange={e => setNewName(e.target.value)} className={`${fieldCls} flex-1`} />
-          <button type="submit" disabled={creating || !newName.trim()} className={primaryBtnCls} style={{ background: 'var(--primary)' }}>
+          <button type="submit" disabled={creating || !newName.trim()} className={primaryBtnCls}>
             {creating ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
             Create team
           </button>
@@ -497,7 +496,7 @@ function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId
       {loading ? (
         <Loader2 size={18} className="text-primary animate-spin mt-3" />
       ) : (
-        <div className="rounded-xl border border-line overflow-hidden mt-3">
+        <div className="border border-line overflow-hidden mt-3">
           {teams.length === 0 && <div className="px-4 py-6 text-center text-ink-3 text-sm">No teams yet</div>}
           {teams.map((t, i) => (
             <TeamRow
@@ -556,7 +555,7 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
         </button>
         {!renaming && (
           <Link to={`/teams/${team.id}/kb`} title="The team's knowledge base (team members only)"
-            className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-ink-2 hover:text-link hover:bg-surface-3 transition-colors">
+            className="amp-btn amp-btn-ghost amp-btn-sm">
             <BookOpen size={12} />KB
           </Link>
         )}
@@ -731,15 +730,15 @@ function OrgInvites({ org, canManage }: { org: Org; canManage: boolean }) {
       {loading ? (
         <Loader2 size={18} className="text-primary animate-spin mt-3" />
       ) : (
-        <div className="rounded-xl border border-line overflow-hidden mt-3">
+        <div className="border border-line overflow-hidden mt-3">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-ink-3 text-xs" style={{ background: 'var(--bg)' }}>
-                <th className="px-4 py-2 font-semibold">Email</th>
-                <th className="px-4 py-2 font-semibold">Org role</th>
-                <th className="px-4 py-2 font-semibold">Team</th>
-                <th className="px-4 py-2 font-semibold">Sent</th>
-                {canManage && <th className="px-4 py-2 font-semibold w-12" />}
+              <tr className="text-left bg-surface-2">
+                <th className="amp-label px-4 py-2.5 border-b border-line">Email</th>
+                <th className="amp-label px-4 py-2.5 border-b border-line">Org role</th>
+                <th className="amp-label px-4 py-2.5 border-b border-line">Team</th>
+                <th className="amp-label px-4 py-2.5 border-b border-line">Sent</th>
+                {canManage && <th className="amp-label px-4 py-2.5 border-b border-line w-12" />}
               </tr>
             </thead>
             <tbody>

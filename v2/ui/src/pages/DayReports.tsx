@@ -1,8 +1,9 @@
 import { PageHeader } from '../components/ui/PageHeader'
+import { Avatar } from '../components/ui/Avatar'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
-import { Check, ClipboardCopy, Loader2, RefreshCw, Save, User } from 'lucide-react'
+import { Check, ClipboardCopy, Loader2, RefreshCw, Save } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { personName } from '../lib/people'
@@ -24,6 +25,8 @@ const prettyDay = (day: string) =>
   new Date(`${day}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
 
 const card = { background: 'var(--surface)', border: '1px solid var(--line)' }
+const panelHead = 'flex items-center gap-2.5 flex-wrap px-4 py-3 border-b border-line'
+
 
 export function DayReports() {
   const { me } = useAuth()
@@ -50,23 +53,24 @@ export function DayReports() {
       <PageHeader crumb="Overview" title="Day reports" meta={<>What each person and agent did, day by day · times in <span className="amp-num">{TZ}</span></>} />
 
       <div className="flex flex-1 overflow-hidden">
-        <aside className="flex-shrink-0 overflow-y-auto py-3 px-2" style={{ width: 220, borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
-          <div className="amp-label px-2 mb-2">People</div>
+        <aside className="flex-shrink-0 overflow-y-auto bg-surface-2 border-r border-line" style={{ width: 232 }} aria-label="People">
+          <div className="amp-label px-4 pt-4 pb-2">People & agents</div>
           {sorted.map(p => (
             <button key={p.user_id} onClick={() => setWho(p.user_id)}
-              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-left transition-colors cursor-pointer ${
-                p.user_id === who ? 'bg-surface-3 text-ink' : 'text-ink-2 hover:text-ink hover:bg-surface-2'}`}>
-              <User size={12} className="flex-shrink-0" />
+              aria-current={p.user_id === who ? 'true' : undefined}
+              className={`w-full flex items-center gap-2.5 px-4 py-2 text-[13px] text-left cursor-pointer ${
+                p.user_id === who ? 'bg-surface text-ink font-semibold shadow-[inset_3px_0_0_var(--accent),0_0_0_1px_var(--line)]' : 'text-ink-2 hover:text-ink hover:bg-surface-3'}`}>
+              <Avatar name={personName(p)} kind={p.kind ?? (p.email?.endsWith('@agents.amp') ? 'agent' : 'human')} size={20} />
               <span className="truncate flex-1">{personName(p)}</span>
-              {p.user_id === meId && <span className="text-[10px] text-ink-3">you</span>}
+              {p.user_id === meId && <span className="amp-num text-[10.5px] text-ink-3">you</span>}
             </button>
           ))}
-          {sorted.length === 0 && !error && <Loader2 size={14} className="text-primary animate-spin mx-2" />}
+          {sorted.length === 0 && !error && <Loader2 size={14} className="text-ink-3 animate-spin mx-4" />}
         </aside>
 
         <main className="flex-1 overflow-y-auto">
-          <div className="max-w-4xl mx-auto px-4 py-6 space-y-6">
-            {error && <p className="text-xs text-danger-ink">{error}</p>}
+          <div className="max-w-4xl px-7 py-5 grid gap-4">
+            {error && <p className="m-0 amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</p>}
             {selected && (
               <>
                 <Velocity key={`v-${selected.user_id}`} person={selected} />
@@ -88,27 +92,29 @@ function Velocity({ person }: { person: Member }) {
     const to = localDay()
     api.velocity({ user: String(person.user_id), from: addDays(to, -29), to, tz: TZ }).then(setDays).catch(() => setDays([]))
   }, [person.user_id])
-  if (!days) return <div className="rounded-2xl p-5 h-[150px]" style={card} />
+  if (!days) return <div className="h-[150px]" style={card} />
   const max = Math.max(1, ...days.map(d => d.completed))
   const total = days.reduce((n, d) => n + d.completed, 0)
   const weekly = days.slice(-7).reduce((n, d) => n + d.completed, 0)
   return (
-    <section className="rounded-2xl p-5" style={card}>
-      <div className="flex items-baseline gap-4 mb-3">
-        <h2 className="text-sm font-bold text-ink">Completed tickets, last 30 days</h2>
-        <span className="text-xs text-ink-2">{total} total · {weekly} this week · {(total / 30).toFixed(1)}/day</span>
+    <section style={card}>
+      <div className={panelHead}>
+        <span className="amp-label">Velocity</span><h2 className="m-0 text-[14.5px] font-semibold text-ink">Completed tickets, last 30 days</h2>
+        <span className="ml-auto amp-num text-[11px] text-ink-3">{total} total · {weekly} this week · {(total / 30).toFixed(1)}/day</span>
       </div>
+      <div className="px-4 pt-4 pb-3">
       <div className="flex items-end gap-1 h-24">
         {days.map(d => (
           <div key={d.day} className="flex-1 flex flex-col justify-end h-full group relative"
             title={`${prettyDay(d.day)}: ${d.completed}${Object.keys(d.by_project).length ? ' (' + Object.entries(d.by_project).map(([c, n]) => `${c} ${n}`).join(', ') + ')' : ''}`}>
-            <div className="rounded-sm transition-colors"
-              style={{ height: `${(d.completed / max) * 100}%`, minHeight: d.completed ? 3 : 1, background: d.completed ? 'var(--primary)' : 'var(--line)' }} />
+            <div className="transition-colors"
+              style={{ height: `${(d.completed / max) * 100}%`, minHeight: d.completed ? 3 : 1, background: d.completed ? 'var(--ink)' : 'var(--line)' }} />
           </div>
         ))}
       </div>
-      <div className="flex justify-between text-[10px] text-ink-3 mt-1.5">
+      <div className="flex justify-between amp-num text-[10.5px] text-ink-3 mt-1.5">
         <span>{prettyDay(days[0].day)}</span><span>Today</span>
+      </div>
       </div>
     </section>
   )
@@ -147,19 +153,20 @@ function MyDay() {
 
   const dirty = report != null && summary !== report.summary
   return (
-    <section className="rounded-2xl p-5 space-y-4" style={card}>
-      <div className="flex items-center gap-3 flex-wrap">
-        <h2 className="text-sm font-bold text-ink">Your day</h2>
+    <section className="amp-panel-top" style={card}>
+      <div className={panelHead}>
+        <span className="amp-label">Day report</span><h2 className="m-0 text-[14.5px] font-semibold text-ink">Your day</h2>
         <input type="date" value={day} max={localDay()} onChange={e => e.target.value && setDay(e.target.value)}
-          className="bg-bg border border-line rounded-lg px-2 py-1 text-xs text-ink focus:outline-none focus:border-primary" />
+          className="amp-input !w-auto !py-1 !text-[12px]" />
         <button onClick={load} disabled={loading} className="amp-btn amp-btn-ghost" title="Rebuild from the latest activity">
           <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />Refresh
         </button>
-        <span className="text-xs text-ink-3 ml-auto">
+        <span className="amp-num text-[11px] text-ink-3 ml-auto">
           {savedAt ? `Saved ${new Date(savedAt).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}` : 'Not saved yet'}
         </span>
       </div>
-      <p className="text-xs text-ink-2 leading-relaxed">
+      <div className="p-4 grid gap-3">
+      <p className="m-0 text-[12.5px] text-ink-2 leading-relaxed">
         Built from today's AMP activity across your projects. Add a summary in your own words, then save it so your
         team can read it. Or ask your agent to "wrap up today" and it will draft and save this for you.
       </p>
@@ -175,10 +182,11 @@ function MyDay() {
         {error && <span className="text-xs text-danger-ink">{error}</span>}
       </div>
       {loading && !report ? (
-        <Loader2 size={16} className="text-primary animate-spin" />
+        <Loader2 size={16} className="text-ink-3 animate-spin" />
       ) : report ? (
         <ReportBody report={{ ...report, summary }} showSummary={false} />
       ) : null}
+      </div>
     </section>
   )
 }
@@ -198,24 +206,25 @@ function History({ person, isMe }: { person: Member; isMe: boolean }) {
 
   return (
     <section className="space-y-3">
-      <h2 className="text-sm font-bold text-ink">{isMe ? 'Your saved reports' : `${personName(person)}'s reports`}</h2>
+      <div className="flex items-center gap-2.5"><span className="amp-label">History</span><h2 className="m-0 text-[14.5px] font-semibold text-ink">{isMe ? 'Your saved reports' : `${personName(person)}'s reports`}</h2></div>
       {error && <p className="text-xs text-danger-ink">{error}</p>}
       {reports && reports.length === 0 && (
         <p className="text-xs text-ink-3">No saved reports in the last 30 days.</p>
       )}
       {reports?.map(r => (
-        <div key={r.day} className="rounded-2xl" style={card}>
+        <div key={r.day} style={card}>
           <button onClick={() => setOpen(open === r.day ? null : r.day)}
-            className="w-full flex items-center gap-3 px-5 py-3 text-left cursor-pointer">
-            <span className="text-sm font-semibold text-ink">{prettyDay(r.day)}</span>
-            <span className="text-xs text-ink-2">
+            aria-expanded={open === r.day}
+            className="w-full flex items-center gap-3 px-4 py-3 text-left cursor-pointer hover:bg-surface-2">
+            <span className="text-[13.5px] font-semibold text-ink">{prettyDay(r.day)}</span>
+            <span className="amp-num text-[11.5px] text-ink-2">
               {r.data.stats.completed} completed · {r.data.stats.in_progress} in progress{r.data.stats.blocked ? ` · ${r.data.stats.blocked} blocked` : ''}
             </span>
           </button>
-          {open === r.day && <div className="px-5 pb-5"><ReportBody report={r} showSummary /></div>}
+          {open === r.day && <div className="px-4 pb-4 pt-1 border-t border-line"><ReportBody report={r} showSummary /></div>}
         </div>
       ))}
-      {!reports && !error && <Loader2 size={16} className="text-primary animate-spin" />}
+      {!reports && !error && <Loader2 size={16} className="text-ink-3 animate-spin" />}
     </section>
   )
 }
@@ -251,9 +260,9 @@ function ReportBody({ report, showSummary }: { report: DayReport; showSummary: b
           <ReactMarkdown>{report.summary}</ReactMarkdown>
         </div>
       )}
-      <Section title="Completed" items={d.completed} tone="var(--success)" />
-      <Section title="In progress" items={d.in_progress} tone="var(--link)" />
-      <Section title="Blocked" items={d.blocked} tone="var(--danger-ink)" />
+      <Section title="Completed" items={d.completed} tone="var(--st-done)" />
+      <Section title="In progress" items={d.in_progress} tone="var(--st-prog)" />
+      <Section title="Blocked" items={d.blocked} tone="var(--st-flag)" />
       <Section title="Started" items={d.started} tone="var(--ink-2)" />
       <Section title="Created" items={d.created} tone="var(--ink-2)" />
       <Section title="Also worked on" items={d.touched} tone="var(--ink-2)" />
@@ -273,18 +282,18 @@ function Section({ title, items, tone }: { title: string; items: DayReportItem[]
   for (const it of items) byProject.set(it.project_name, [...(byProject.get(it.project_name) ?? []), it])
   return (
     <div>
-      <div className="text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: tone }}>{title} ({items.length})</div>
+      <div className="flex items-center gap-2 mb-2"><i className="inline-block w-2 h-2" style={{ background: tone }} aria-hidden="true" /><span className="font-label text-[11.5px] font-semibold uppercase tracking-[0.14em] text-ink">{title}</span><span className="amp-num text-[11px] text-ink-3">{items.length}</span></div>
       {[...byProject.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([project, list]) => (
         <div key={project} className="mb-2">
-          <div className="text-xs text-ink-2 mb-1">{project}</div>
+          <div className="amp-label mb-1.5">{project}</div>
           <ul className="space-y-1">
             {list.map(it => (
               <li key={it.task_id} className="text-sm text-ink flex items-baseline gap-2">
-                <Link to={`/project/${it.project_id}`} className="font-mono text-xs text-link hover:underline flex-shrink-0">{it.ref}</Link>
+                <Link to={`/project/${it.project_id}?ticket=${it.task_id}`} className="amp-num text-[11.5px] text-ink-2 underline underline-offset-2 hover:text-ink flex-shrink-0">{it.ref}</Link>
                 <span className="min-w-0">
                   {it.name}
                   <span className="text-xs text-ink-3"> — {it.epic_name} › {it.story_name}</span>
-                  {it.block_reason && <span className="text-xs text-danger-ink"> (blocked: {it.block_reason})</span>}
+                  {it.block_reason && !it.block_reason.startsWith('scheduled:') && <span className="text-xs text-danger-ink"> · question: {it.block_reason}</span>}
                 </span>
               </li>
             ))}

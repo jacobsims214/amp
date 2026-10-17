@@ -5,17 +5,19 @@ import { quietBtnCls } from '../lib/adminStyles'
 // Small pieces shared by the admin screens: access, agents and tokens,
 // webhooks, and the audit log.
 
+// Small square tags. Color only where it carries meaning: red for
+// deactivated or destructive, the rest ink on white.
 const tones = {
-  indigo: { background: 'color-mix(in srgb, var(--link) 12%, transparent)', color: 'var(--link)', border: '1px solid color-mix(in srgb, var(--link) 22%, transparent)' },
-  green: { background: 'color-mix(in srgb, var(--success) 12%, transparent)', color: 'var(--success-ink)', border: '1px solid color-mix(in srgb, var(--success) 22%, transparent)' },
-  red: { background: 'color-mix(in srgb, var(--danger) 10%, transparent)', color: 'var(--danger-ink)', border: '1px solid color-mix(in srgb, var(--danger) 22%, transparent)' },
-  amber: { background: 'color-mix(in srgb, var(--warning) 10%, transparent)', color: 'var(--warning-ink)', border: '1px solid color-mix(in srgb, var(--warning) 22%, transparent)' },
-  gray: { background: 'color-mix(in srgb, var(--ink-2) 10%, transparent)', color: 'var(--ink-2)', border: '1px solid color-mix(in srgb, var(--ink-2) 20%, transparent)' },
+  indigo: { background: 'var(--surface)', color: 'var(--ink)', border: '1px solid var(--line-str)' },
+  green: { background: 'var(--surface)', color: 'var(--success-ink)', border: '1px solid var(--success)' },
+  red: { background: 'var(--surface)', color: 'var(--danger-ink)', border: '1px solid var(--danger)' },
+  amber: { background: 'var(--surface)', color: 'var(--warning-ink)', border: '1px solid var(--warning)' },
+  gray: { background: 'var(--surface)', color: 'var(--ink-2)', border: '1px solid var(--line)' },
 }
 
 export function Pill({ tone = 'indigo', title, children }: { tone?: keyof typeof tones; title?: string; children: React.ReactNode }) {
   return (
-    <span title={title} className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded-md whitespace-nowrap" style={tones[tone]}>
+    <span title={title} className="inline-flex items-center gap-1 font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] whitespace-nowrap" style={tones[tone]}>
       {children}
     </span>
   )
@@ -73,28 +75,28 @@ export function SecretReveal({ title, secret, note = "Copy it now: AMP keeps onl
   children?: React.ReactNode
 }) {
   return (
-    <div className="rounded-xl p-4 space-y-3" style={{ background: 'color-mix(in srgb, var(--success) 6%, transparent)', border: '1px solid color-mix(in srgb, var(--success) 25%, transparent)' }}>
+    <div className="p-4 space-y-3 border border-ink bg-surface" style={{ boxShadow: 'inset 3px 0 0 var(--success)' }}>
       <div className="flex items-start gap-2">
         <EyeOff size={14} className="text-success-ink mt-0.5 flex-shrink-0" />
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-semibold text-ink">{title}</p>
-          <p className="text-xs text-ink-2">{note}</p>
+          <p className="m-0 text-[14px] font-semibold text-ink">{title}</p>
+          <p className="m-0 text-[12px] text-ink-2">{note}</p>
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <code className="flex-1 min-w-0 px-3 py-2 rounded-lg text-xs font-mono text-ink break-all" style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
+        <code className="flex-1 min-w-0 px-3 py-2 text-[12px] amp-num text-ink break-all bg-surface-2 border border-line">
           {secret}
         </code>
         <CopyButton text={secret} />
       </div>
       {children}
-      <button type="button" onClick={onDone} className={quietBtnCls}>I've copied it</button>
+      <button type="button" onClick={onDone} className="amp-btn amp-btn-primary amp-btn-sm">I've copied it</button>
     </div>
   )
 }
 
 export function Notice({ error, info }: { error?: string | null; info?: string | null }) {
-  if (error) return <p className="text-xs text-danger-ink mt-2">{error}</p>
-  if (info) return <p className="text-xs text-success-ink mt-2">{info}</p>
+  if (error) return <p className="m-0 text-[12.5px] text-danger-ink mt-2">{error}</p>
+  if (info) return <p className="m-0 text-[12.5px] text-success-ink mt-2">{info}</p>
   return null
 }

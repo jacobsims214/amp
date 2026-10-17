@@ -14,6 +14,7 @@ import { api, authAdminApi } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { Avatar } from '../components/ui/Avatar'
+import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { AmpUser, APIToken, AuthAdminUser } from '../types'
 
 type Filter = 'all' | 'people' | 'agents' | 'off'
@@ -27,20 +28,6 @@ function ago(iso?: string): string {
 }
 
 const name = (u: AmpUser) => u.display_name || u.email.split('@')[0]
-
-/** A button that asks once more before doing something hard to undo. */
-function ConfirmButton({ label, confirmLabel, onConfirm, busy, danger }: {
-  label: string; confirmLabel: string; onConfirm: () => void; busy?: boolean; danger?: boolean
-}) {
-  const [armed, setArmed] = useState(false)
-  if (!armed) return <button type="button" className={`amp-btn amp-btn-sm ${danger ? 'amp-btn-danger' : ''}`} disabled={busy} onClick={() => setArmed(true)}>{label}</button>
-  return (
-    <span className="inline-flex gap-1.5">
-      <button type="button" className="amp-btn amp-btn-sm amp-btn-accent" disabled={busy} onClick={() => { setArmed(false); onConfirm() }}>{confirmLabel}</button>
-      <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={() => setArmed(false)}>Cancel</button>
-    </span>
-  )
-}
 
 export function Users() {
   const { me, loading: authLoading, isAdmin } = useAuth()

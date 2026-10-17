@@ -3,10 +3,11 @@ import { Link, useParams } from 'react-router-dom'
 import {
   Plus, Search, FileText, Tag, Trash2, Edit3, Save, X,
   Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
-  ArrowLeft, Building2, Users, Lock, Info, CheckCircle2, RotateCcw,
+   Building2, Users, Lock, Info, CheckCircle2, RotateCcw,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import { api } from '../api/client'
+import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
 
@@ -19,19 +20,9 @@ const SCOPE_PURPOSE: Record<KBScope, string> = {
 
 type View = 'browse' | 'doc' | 'editor'
 
-// Tag color palette — cycles through a small set of indigo-adjacent hues
-const TAG_COLORS = [
-  { bg: 'color-mix(in srgb, var(--link) 12%, transparent)',  text: 'var(--link)', ring: 'color-mix(in srgb, var(--link) 25%, transparent)' },
-  { bg: 'color-mix(in srgb, var(--success) 12%, transparent)', text: 'var(--success-ink)', ring: 'color-mix(in srgb, var(--success) 25%, transparent)' },
-  { bg: 'color-mix(in srgb, var(--warning) 12%, transparent)', text: 'var(--warning-ink)', ring: 'color-mix(in srgb, var(--warning) 25%, transparent)' },
-  { bg: 'color-mix(in srgb, var(--danger) 12%, transparent)',  text: 'var(--danger-ink)', ring: 'color-mix(in srgb, var(--danger) 25%, transparent)' },
-  { bg: 'color-mix(in srgb, var(--violet) 12%, transparent)', text: 'var(--violet)', ring: 'color-mix(in srgb, var(--violet) 25%, transparent)' },
-  { bg: 'color-mix(in srgb, var(--teal) 12%, transparent)', text: 'var(--teal)', ring: 'color-mix(in srgb, var(--teal) 25%, transparent)' },
-]
-const tagColor = (tag: string) => TAG_COLORS[Math.abs(hashStr(tag)) % TAG_COLORS.length]
-function hashStr(s: string) {
-  let h = 0; for (const c of s) h = (Math.imul(31, h) + c.charCodeAt(0)) | 0; return h
-}
+// Tags are labels, not states: one quiet style for all of them.
+const TAG_STYLE = { bg: 'var(--surface)', text: 'var(--ink-2)', ring: 'var(--line-str)' }
+const tagColor = () => TAG_STYLE
 
 function readingTime(content: string) {
   const words = content.trim().split(/\s+/).length
@@ -39,9 +30,7 @@ function readingTime(content: string) {
   return `${mins} min read`
 }
 
-const inputCls =
-  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink ' +
-  'placeholder-ink-3 focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
+const inputCls = 'amp-input'
 
 // One page for every knowledge base: /project/:projectId/kb, /teams/:teamId/kb, /orgs/:orgId/kb.
 export function KB() {
@@ -250,7 +239,7 @@ export function KB() {
                   }`}
                 >all</button>
                 {tags.slice(0, 12).map(t => {
-                  const tc = tagColor(t.tag)
+                  const tc = tagColor()
                   const isActive = tagFilter === t.tag
                   return (
                     <button
@@ -323,7 +312,7 @@ export function KB() {
               {shared && info && (
                 <div className="mx-6 mt-6 flex items-start gap-2.5 rounded-xl px-4 py-3 max-w-4xl"
                   style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
-                  <Info size={13} className="text-link mt-0.5 flex-shrink-0" />
+                  <Info size={13} className="text-ink-2 mt-0.5 flex-shrink-0" />
                   <p className="text-xs text-ink-2 leading-relaxed">
                     {SCOPE_PURPOSE[info.scope]} Anything specific to one project belongs in that project's KB.
                   </p>
@@ -353,26 +342,12 @@ export function KB() {
 
 /* ── Team / org KB header ──────────────────────────────────────────────────── */
 function ScopeHeader({ info, rightSlot }: { info: KBInfo | null; rightSlot?: React.ReactNode }) {
-  const Icon = info?.scope === 'org' ? Building2 : Users
   return (
-    <header className="flex items-center flex-shrink-0 select-none"
-      style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)', height: 48 }}>
-      <Link to="/admin/orgs" title="Organizations"
-        className="flex items-center justify-center w-11 h-full text-ink-3 hover:text-ink transition-colors cursor-pointer flex-shrink-0">
-        <ArrowLeft size={15} />
-      </Link>
-      <div className="w-px h-5 bg-line flex-shrink-0" />
-      <div className="flex items-center gap-2 px-3 min-w-0">
-        <Icon size={14} className="text-link flex-shrink-0" />
-        <span className="text-sm font-bold text-ink truncate">{info?.name ?? 'Knowledge base'}</span>
-        {info && (
-          <span className="text-[10px] font-semibold uppercase tracking-wide text-ink-2">
-            {info.scope === 'org' ? 'Org knowledge base' : 'Team knowledge base'}
-          </span>
-        )}
-      </div>
-      <div className="flex items-center gap-2 px-3 ml-auto flex-shrink-0">{rightSlot}</div>
-    </header>
+    <PageHeader
+      crumb={<Link to="/admin/orgs" className="hover:text-ink">{info?.scope === 'org' ? 'Org knowledge base' : info?.scope === 'team' ? 'Team knowledge base' : 'Knowledge base'}</Link>}
+      title={info?.name ?? 'Knowledge base'}
+      actions={rightSlot}
+    />
   )
 }
 
@@ -543,7 +518,7 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
             {r.tags.length > 0 && (
               <div className="flex gap-1 mt-1 pl-4 flex-wrap">
                 {r.tags.slice(0, 3).map(t => {
-                  const tc = tagColor(t)
+                  const tc = tagColor()
                   return <span key={t} className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: tc.bg, color: tc.text }}>{t}</span>
                 })}
               </div>
@@ -632,9 +607,8 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
         ;(e.currentTarget as HTMLElement).style.boxShadow = ''
       }}
     >
-      <div className="w-9 h-9 rounded-xl flex-shrink-0 flex items-center justify-center mt-0.5"
-        style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)' }}>
-        <FileText size={15} className="text-link" />
+      <div className="w-9 h-9 flex-shrink-0 flex items-center justify-center mt-0.5 border border-line bg-surface-2">
+        <FileText size={15} className="text-ink-2" />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-start justify-between gap-3">
@@ -647,7 +621,7 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
         {doc.tags.length > 0 && (
           <div className="flex gap-1 mt-2 flex-wrap">
             {doc.tags.map(t => {
-              const tc = tagColor(t)
+              const tc = tagColor()
               return (
                 <span key={t} className="text-xs px-2 py-0.5 rounded-md font-medium"
                   style={{ background: tc.bg, color: tc.text, border: `1px solid ${tc.ring}` }}>
@@ -745,18 +719,10 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
           </div>
         </div>
         {canWrite && <div className="flex items-center gap-2 flex-shrink-0">
-          <button onClick={onEdit}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer"
-            style={{ border: '1px solid var(--line)', color: 'var(--ink-2)', background: 'transparent' }}
-            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = 'var(--ink)'; (e.currentTarget as HTMLElement).style.borderColor = 'var(--line-str)' }}
-            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)'; (e.currentTarget as HTMLElement).style.borderColor = 'var(--line)' }}>
+          <button onClick={onEdit} className="amp-btn amp-btn-sm">
             <Edit3 size={12} />Edit
           </button>
-          <button onClick={onDelete}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer"
-            style={{ border: '1px solid color-mix(in srgb, var(--danger) 20%, transparent)', color: 'var(--danger)', background: 'transparent' }}
-            onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--danger) 8%, transparent)'}
-            onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}>
+          <button onClick={onDelete} className="amp-btn amp-btn-sm amp-btn-danger" aria-label="Delete document" title="Delete document">
             <Trash2 size={12} />
           </button>
         </div>}
@@ -765,8 +731,8 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       {/* Why a team or org doc lives here */}
       {doc.reason && (
         <div className="flex items-start gap-2.5 rounded-xl px-4 py-3 mb-5"
-          style={{ background: 'color-mix(in srgb, var(--link) 6%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)' }}>
-          <Info size={13} className="text-link mt-0.5 flex-shrink-0" />
+          style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: 'inset 3px 0 0 var(--ink)' }}>
+          <Info size={13} className="text-ink-2 mt-0.5 flex-shrink-0" />
           <div className="text-xs leading-relaxed">
             <span className="font-semibold text-ink">Why it's in the {doc.scope === 'org' ? 'org' : 'team'} KB: </span>
             <span className="text-ink-2">{doc.reason}</span>
@@ -778,7 +744,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       {doc.tags.length > 0 && (
         <div className="flex flex-wrap gap-1.5 mb-6">
           {doc.tags.map(tag => {
-            const tc = tagColor(tag)
+            const tc = tagColor()
             return (
               <button key={tag} onClick={() => onTagClick(tag)}
                 className="flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-medium transition-all cursor-pointer"
@@ -797,9 +763,9 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       <div className="prose-amp">
         <ReactMarkdown
           components={{
-            h1: ({children}) => <h1 className="text-xl font-bold text-ink mt-8 mb-3 pb-2 border-b border-line-sub first:mt-0">{children}</h1>,
-            h2: ({children}) => <h2 className="text-base font-bold text-ink mt-6 mb-2">{children}</h2>,
-            h3: ({children}) => <h3 className="text-sm font-bold text-ink mt-4 mb-1.5">{children}</h3>,
+            h1: ({children}) => <h1 className="amp-heading text-[22px] text-ink mt-8 mb-3 pb-2 border-b border-line first:mt-0">{children}</h1>,
+            h2: ({children}) => <h2 className="text-[17px] font-semibold text-ink mt-7 mb-2">{children}</h2>,
+            h3: ({children}) => <h3 className="font-label text-[13px] font-semibold uppercase tracking-[0.12em] text-ink mt-5 mb-1.5">{children}</h3>,
             p: ({children}) => <p className="text-sm text-ink-2 leading-7 mb-4">{children}</p>,
             code: ({children, className}) => {
               const isBlock = className?.includes('language-')
@@ -809,7 +775,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                   <code style={{ color: 'var(--ink)' }}>{children}</code>
                 </pre>
               )
-              return <code className="rounded-md px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--bg)', color: 'var(--link)', border: '1px solid var(--line-sub)' }}>{children}</code>
+              return <code className="rounded-md px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--surface-2)', color: 'var(--ink)', border: '1px solid var(--line-sub)' }}>{children}</code>
             },
             ul: ({children}) => <ul className="text-sm text-ink-2 list-disc list-outside mb-4 space-y-1.5 pl-5">{children}</ul>,
             ol: ({children}) => <ol className="text-sm text-ink-2 list-decimal list-outside mb-4 space-y-1.5 pl-5">{children}</ol>,
@@ -989,7 +955,7 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
           </button>
           <button onClick={onSave} disabled={!canSave}
             className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-            style={{ background: 'var(--primary)', color: '#fff', border: '1px solid var(--primary)' }}
+
             onMouseEnter={e => { if (canSave) (e.currentTarget as HTMLElement).style.background = 'var(--primary)' }}
             onMouseLeave={e => { if (canSave) (e.currentTarget as HTMLElement).style.background = 'var(--primary)' }}>
             {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
@@ -1001,23 +967,23 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
       {/* Meta fields */}
       <div className="px-6 py-4 flex-shrink-0 grid grid-cols-3 gap-3" style={{ borderBottom: '1px solid var(--line-sub)' }}>
         <div className="col-span-1">
-          <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">Path</label>
+          <label className="amp-label block mb-2">Path</label>
           <input value={path} onChange={e => onPath(e.target.value)} placeholder="folder/doc.md"
             className={`${inputCls} font-mono text-xs`} />
         </div>
         <div className="col-span-1">
-          <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">Title</label>
+          <label className="amp-label block mb-2">Title</label>
           <input value={title} onChange={e => onTitle(e.target.value)} placeholder="Document title"
             className={inputCls} />
         </div>
         <div className="col-span-1">
-          <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">Tags</label>
+          <label className="amp-label block mb-2">Tags</label>
           <input value={tags} onChange={e => onTags(e.target.value)} placeholder="auth, api, guide"
             className={inputCls} />
         </div>
         {shared && (
           <div className="col-span-3">
-            <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">
+            <label className="amp-label block mb-2">
               Why does this belong in the {shared.scope} KB?
             </label>
             <input value={reason} onChange={e => onReason(e.target.value)}
@@ -1046,14 +1012,14 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
             {content ? (
               <ReactMarkdown
                 components={{
-                  h1: ({children}) => <h1 className="text-xl font-bold text-ink mt-6 mb-3 pb-2 border-b border-line-sub first:mt-0">{children}</h1>,
-                  h2: ({children}) => <h2 className="text-base font-bold text-ink mt-5 mb-2">{children}</h2>,
-                  h3: ({children}) => <h3 className="text-sm font-bold text-ink mt-4 mb-1.5">{children}</h3>,
+                  h1: ({children}) => <h1 className="amp-heading text-[22px] text-ink mt-6 mb-3 pb-2 border-b border-line first:mt-0">{children}</h1>,
+                  h2: ({children}) => <h2 className="text-[17px] font-semibold text-ink mt-6 mb-2">{children}</h2>,
+                  h3: ({children}) => <h3 className="font-label text-[13px] font-semibold uppercase tracking-[0.12em] text-ink mt-5 mb-1.5">{children}</h3>,
                   p: ({children}) => <p className="text-sm text-ink-2 leading-7 mb-4">{children}</p>,
                   code: ({children, className}) => {
                     const isBlock = className?.includes('language-')
                     if (isBlock) return <pre className="rounded-xl p-4 text-xs overflow-x-auto mb-4 font-mono" style={{ background: 'var(--bg)', border: '1px solid var(--line-sub)' }}><code style={{ color: 'var(--ink)' }}>{children}</code></pre>
-                    return <code className="rounded px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--bg)', color: 'var(--link)' }}>{children}</code>
+                    return <code className="rounded px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--surface-2)', color: 'var(--ink)' }}>{children}</code>
                   },
                   ul: ({children}) => <ul className="text-sm text-ink-2 list-disc list-outside mb-4 space-y-1 pl-5">{children}</ul>,
                   li: ({children}) => <li className="leading-7">{children}</li>,
