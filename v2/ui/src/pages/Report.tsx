@@ -7,10 +7,14 @@
  */
 import { BarChart } from '../components/ui/BarChart'
 import { useEffect, useMemo, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { Download, Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
+import { useProjectPeople } from '../hooks/useProjectPeople'
+import { PeoplePanel } from '../components/PeoplePanel'
+import { peopleRows } from '../lib/standup'
+import { activityActor } from '../lib/people'
 import { ProjectNav } from '../components/ProjectNav'
 import { Panel, Readouts } from '../components/ui/PageHeader'
 import { Avatar } from '../components/ui/Avatar'
@@ -81,6 +85,8 @@ export function Report() {
   const [error, setError] = useState<string | null>(null)
   const [actionFilter, setActionFilter] = useState('all')
   const { tasks } = useBoardData(pid)
+  const { people } = useProjectPeople(pid)
+  const navigate = useNavigate()
   const taskById = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks])
 
   const since = useMemo(() => new Date(now - RANGE_DAYS[range] * 86_400_000).toISOString(), [range, now])
@@ -117,6 +123,8 @@ export function Report() {
     const lines = [
       `# Report · project ${pid} · ${RANGE_LABELS[range]}`, '',
       `${report.completed} done, ${report.dispatched} started, ${report.created} created. Median time to done ${hours(report.median_cycle_hours)}.`, '',
+      '## Standup', '', '| Person | Done | Now | Waiting on them | Ready next |', '|---|---:|---|---|---:|',
+      ...peopleRows(tasks, activity, people, since).map(r => `| ${r.name} | ${r.done.length} | ${r.flying.map(t => `#${t.id} ${t.name}`).join('; ') || '—'} | ${r.questions.map(t => `#${t.id} ${t.block_reason}`).join('; ') || '—'} | ${r.ready} |`), '',
       '## Agents', '', '| Agent | Done | Median |', '|---|---:|---:|',
       ...report.agents.map(a => `| ${a.key} | ${a.completed_in_range} | ${hours(a.median_cycle_hours)} |`), '',
       '## Epics', '', '| Epic | Done | Tickets |', '|---|---:|---:|',
@@ -155,6 +163,9 @@ export function Report() {
             { label: 'Waiting on answers', value: hours(report.flag_hours), sub: `${report.states.flagged} open question${report.states.flagged === 1 ? '' : 's'}`, color: report.states.flagged ? 'var(--danger-ink)' : undefined },
             { label: 'Plan', value: <>{report.states.done}<span className="text-[13px] text-ink-3">/{report.tickets}</span></>, sub: report.tickets ? `${Math.round(report.states.done / report.tickets * 100)}% done` : 'no tickets' },
           ]} />
+
+          <PeoplePanel tasks={tasks} activity={activity} people={people} since={since} rangeLabel={RANGE_LABELS[range]}
+            onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
 
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
             <Panel label="Velocity" title="Done per day" right={<span>{perDay.length} days</span>}>
@@ -234,7 +245,7 @@ export function Report() {
                 {filtered.slice().sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 200).map(a => (
                   <div key={a.id} className="grid grid-cols-[96px_1fr] gap-3 px-4 py-1.5 border-b border-line text-[12.5px]">
                     <span className="amp-num text-[11px] text-ink-3">{new Date(a.created_at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}</span>
-                    <span className="min-w-0 truncate"><b className="font-semibold">{a.actor}</b> {a.action.replace('_', ' ')} <span className="amp-num text-ink-3">#{a.task_id}</span> <span className="text-ink-2">{taskById.get(a.task_id)?.name ?? ''}</span></span>
+                    <span className="min-w-0 truncate"><b className="font-semibold">{activityActor(a, people)}</b> {a.action.replace('_', ' ')} <span className="amp-num text-ink-3">#{a.task_id}</span> <span className="text-ink-2">{taskById.get(a.task_id)?.name ?? ''}</span></span>
                   </div>
                 ))}
               </div>
