@@ -239,7 +239,7 @@ export function FlightPlan() {
             </div>
           </section>
 
-          <div className="grid gap-4 min-w-0">
+          <div className="grid grid-cols-1 gap-4 min-w-0">
             <Panel label="Plan check" title="GO / NO-GO" right={
               <button type="button" onClick={runCheck} disabled={checking} className="amp-btn amp-btn-ghost amp-btn-sm" title="Run the plan check again">
                 {checking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}Check</button>}>

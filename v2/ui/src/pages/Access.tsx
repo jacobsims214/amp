@@ -233,7 +233,7 @@ export function Access() {
               </table>
             </section>
 
-            <div className="grid gap-4 min-w-0">
+            <div className="grid grid-cols-1 gap-4 min-w-0">
               {agent == null ? (
                 <Panel label="Your tokens" title="Tokens that act as you" top>
                   <div className="px-4 py-4 grid gap-3">

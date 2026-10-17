@@ -101,7 +101,7 @@ export function MyWork() {
           ]} />
 
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
-            <div className="grid gap-4 min-w-0">
+            <div className="grid grid-cols-1 gap-4 min-w-0">
               <Panel label="Questions" title={flags.length ? 'Agents waiting on an answer' : 'No questions'} right={<span>blocked with a reason</span>}>
                 {flags.length === 0
                   ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent stops on a question in any project you can see, it shows up here.</p>
@@ -121,6 +121,7 @@ export function MyWork() {
                 {owned.length === 0
                   ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">You don't own any open tickets. Claim one from a project's board, or dispatch one to your agent.</p>
                   : (
+                    <div className="overflow-x-auto">
                     <table className="w-full border-collapse text-[13px]">
                       <thead><tr className="bg-surface-2">
                         {['', 'ID', 'Ticket', 'State', 'Agent', 'Project'].map(h => <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
@@ -134,18 +135,19 @@ export function MyWork() {
                             <td className="px-3 border-b border-line"><StateTag state={displayState(t)} /></td>
                             <td className="px-3 border-b border-line whitespace-nowrap">{t.agent_id
                               ? <span className="inline-flex items-center gap-2"><Avatar name={t.agent_id} kind="agent" size={20} />{t.agent_id}</span>
-                              : <span className="amp-num text-[12px] text-ink-3">{t.assigned_to || '—'}</span>}</td>
+                              : <span className="amp-num text-[12px] text-ink-3 block max-w-[160px] truncate">{t.assigned_to || '—'}</span>}</td>
                             <td className="px-3 border-b border-line amp-num">{t.project_code}</td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
+                    </div>
                   )}
                 {owned.length > 12 && <p className="m-0 px-4 py-2.5 text-[12px] text-ink-3">+{owned.length - 12} more</p>}
               </Panel>
             </div>
 
-            <div className="grid gap-4 min-w-0">
+            <div className="grid grid-cols-1 gap-4 min-w-0">
               <Panel label="My agents" title="On station" right={<Link to="/access" className="underline underline-offset-2 hover:text-ink">manage</Link>}>
                 {agents.length === 0
                   ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No agent accounts yet. <Link to="/access" className="underline">Create one</Link> to give an agent its own identity and token.</p>

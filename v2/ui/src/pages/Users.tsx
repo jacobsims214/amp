@@ -178,7 +178,7 @@ export function Users() {
             )}
           </section>
 
-          <div className="grid gap-4 min-w-0">
+          <div className="grid grid-cols-1 gap-4 min-w-0">
             {!selected ? (
               <Panel label="Selected" title="Nobody selected"><p className="m-0 px-4 py-4 text-[13px] text-ink-2">Pick a person or agent to see their role, sign-in, tokens, and recent changes.</p></Panel>
             ) : <>

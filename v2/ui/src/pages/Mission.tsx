@@ -212,7 +212,7 @@ export function Mission() {
         ]} />
 
         <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1fr)_340px]">
-          <div className="grid gap-3 min-w-0">
+          <div className="grid grid-cols-1 gap-3 min-w-0">
             {open.length === 0 && finished.length === 0 && (
               <div className="amp-panel px-5 py-8 text-center text-[13.5px] text-ink-2">
                 No epics yet. Ask your planner agent to plan this project, or add an epic from the Board view.
@@ -244,7 +244,7 @@ export function Mission() {
             </div>
           </div>
 
-          <div className="grid gap-4 min-w-0">
+          <div className="grid grid-cols-1 gap-4 min-w-0">
             <Panel label="Questions" title={flagged.length ? `${flagged.length} waiting on an answer` : 'None'}
               right={<span>blocked with a reason</span>}>
               {flagged.length === 0
