@@ -702,29 +702,19 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"epic": epic})
 
 		case http.MethodPatch:
-			var body struct {
-				Name        string               `json:"name"`
-				Description string               `json:"description"`
-				Priority    string               `json:"priority"`
-				Metadata    domain.MetadataPatch `json:"metadata"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			var req domain.UpdateEpicRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}
-			if _, _, err := body.Metadata.Split(); err != nil {
+			if _, _, err := req.Metadata.Split(); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}
-			if err := h.repo.UpdateEpic(r.Context(), epicID, body.Name, body.Description, body.Priority); err != nil {
-				jsonErr(w, err, 500)
+			req.EpicID = epicID
+			if err := h.sendUpdate(epic.ProjectID, &actor.MsgUpdateEpic{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
+				jsonErr(w, err, 400)
 				return
-			}
-			if body.Metadata != nil {
-				if _, err := h.repo.MergeMetadata(r.Context(), "epic", epicID, body.Metadata); err != nil {
-					jsonErr(w, err, 500)
-					return
-				}
 			}
 			updated, err := h.repo.GetEpic(r.Context(), epicID)
 			if err != nil {
@@ -857,30 +847,19 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"story": story})
 
 	case http.MethodPatch:
-		var body struct {
-			Name               string               `json:"name"`
-			Description        string               `json:"description"`
-			AcceptanceCriteria string               `json:"acceptance_criteria"`
-			Priority           string               `json:"priority"`
-			Metadata           domain.MetadataPatch `json:"metadata"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		var req domain.UpdateStoryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
-		if _, _, err := body.Metadata.Split(); err != nil {
+		if _, _, err := req.Metadata.Split(); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
-		if err := h.repo.UpdateStory(r.Context(), storyID, body.Name, body.Description, body.AcceptanceCriteria, body.Priority); err != nil {
-			jsonErr(w, err, 500)
+		req.StoryID = storyID
+		if err := h.sendUpdate(story.ProjectID, &actor.MsgUpdateStory{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
+			jsonErr(w, err, 400)
 			return
-		}
-		if body.Metadata != nil {
-			if _, err := h.repo.MergeMetadata(r.Context(), "story", storyID, body.Metadata); err != nil {
-				jsonErr(w, err, 500)
-				return
-			}
 		}
 		updated, err := h.repo.GetStory(r.Context(), storyID)
 		if err != nil {
@@ -900,6 +879,24 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// sendUpdate routes an epic or story edit through the project's actors, so
+// their in-memory copies stay current, and waits for the reply.
+func (h *RestHandler) sendUpdate(projectID int, msg interface{}) error {
+	pid, err := h.registry.Get(projectID)
+	if err != nil {
+		return err
+	}
+	var reply chan actor.ReplySimple
+	switch m := msg.(type) {
+	case *actor.MsgUpdateEpic:
+		reply = m.ReplyCh
+	case *actor.MsgUpdateStory:
+		reply = m.ReplyCh
+	}
+	h.registry.System().Root.Send(pid, msg)
+	return (<-reply).Err
 }
 
 // ---- /api/tasks/:id  and sub-routes ----

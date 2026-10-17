@@ -216,6 +216,8 @@ type UpdateTaskRequest struct {
 	StartAt            *time.Time `json:"start_at,omitempty"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
+	// Clear names fields to blank (see TaskClearable); "" otherwise means keep.
+	Clear []string `json:"clear,omitempty"`
 }
 
 type UpdateEpicRequest struct {
@@ -225,6 +227,8 @@ type UpdateEpicRequest struct {
 	Priority    string `json:"priority,omitempty"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
+	// Clear names fields to blank (see EpicClearable).
+	Clear []string `json:"clear,omitempty"`
 }
 
 type UpdateStoryRequest struct {
@@ -235,6 +239,8 @@ type UpdateStoryRequest struct {
 	Priority           string `json:"priority,omitempty"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
+	// Clear names fields to blank (see StoryClearable).
+	Clear []string `json:"clear,omitempty"`
 }
 
 type DispatchTaskRequest struct {

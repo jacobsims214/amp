@@ -250,6 +250,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("New epic name."),
 			"description":   str("New epic description."),
 			"priority":      str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":         strArr(clearDesc("description")),
 			"add_owners":    strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners": strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateEpic)))
@@ -281,6 +282,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description":         str("New story description."),
 			"acceptance_criteria": str("New acceptance criteria."),
 			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":               strArr(clearDesc("description, acceptance_criteria")),
 			"add_owners":          strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners":       strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateStory)))
@@ -410,6 +412,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
+			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -1300,6 +1303,7 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		Priority:    optStr(args, "priority", ""),
 
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1337,6 +1341,7 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", ""),
+		Clear:       optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1382,6 +1387,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1867,6 +1873,11 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 // optMetadataPatch reads the "metadata" argument as a change to existing
 // metadata (null removes a key); nil when it's absent.
+// clearDesc documents an update tool's clear parameter.
+func clearDesc(fields string) string {
+	return "Optional. Fields to blank (" + fields + "). An empty or omitted field is left unchanged, so name it here to remove its text."
+}
+
 func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error) {
 	v, ok := args["metadata"]
 	if !ok || v == nil {

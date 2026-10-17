@@ -295,21 +295,17 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 }
 
 func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
+	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
+	if err != nil {
+		return err
+	}
 	if req.Name != "" {
 		a.task.Name = req.Name
 	}
-	if req.Description != "" {
-		a.task.Description = req.Description
-	}
-	if req.AssignedTo != "" {
-		a.task.AssignedTo = req.AssignedTo
-	}
-	if req.AgentID != "" {
-		a.task.AgentID = req.AgentID
-	}
-	if req.AcceptanceCriteria != "" {
-		a.task.AcceptanceCriteria = req.AcceptanceCriteria
-	}
+	a.task.Description = clr.Apply("description", req.Description, a.task.Description)
+	a.task.AssignedTo = clr.Apply("assigned_to", req.AssignedTo, a.task.AssignedTo)
+	a.task.AgentID = clr.Apply("agent_id", req.AgentID, a.task.AgentID)
+	a.task.AcceptanceCriteria = clr.Apply("acceptance_criteria", req.AcceptanceCriteria, a.task.AcceptanceCriteria)
 	if req.Priority != "" {
 		a.task.Priority = req.Priority
 	}

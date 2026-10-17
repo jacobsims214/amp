@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -562,20 +563,23 @@ func (r *Repo) SetTaskStartAt(ctx context.Context, taskID int, startAt *time.Tim
 }
 
 func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) error {
+	// Empty = keep; fields named in req.Clear are blanked.
+	clr := func(f string) bool { return slices.Contains(req.Clear, f) }
 	query := `UPDATE tasks SET
 	   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
-	   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
-	   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
-	   assigned_to         = CASE WHEN $4 != '' THEN $4 ELSE assigned_to END,
-	   agent_id            = CASE WHEN $5 != '' THEN $5 ELSE agent_id END,
+	   description         = CASE WHEN $7 THEN '' WHEN $2 != '' THEN $2 ELSE description END,
+	   acceptance_criteria = CASE WHEN $8 THEN '' WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+	   assigned_to         = CASE WHEN $9 THEN '' WHEN $4 != '' THEN $4 ELSE assigned_to END,
+	   agent_id            = CASE WHEN $10 THEN '' WHEN $5 != '' THEN $5 ELSE agent_id END,
 	   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
 	   updated_at          = NOW()`
 
-	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority}
+	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority,
+		clr("description"), clr("acceptance_criteria"), clr("assigned_to"), clr("agent_id")}
 
 	if req.StartAt != nil {
-		query += `, start_at = $7`
 		args = append(args, req.StartAt)
+		query += `, start_at = $` + fmt.Sprint(len(args))
 	}
 
 	query += ` WHERE id = $` + fmt.Sprint(len(args)+1)
@@ -585,31 +589,34 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 	return err
 }
 
-// UpdateEpic updates an epic's mutable fields. Empty string = keep existing value.
-func (r *Repo) UpdateEpic(ctx context.Context, epicID int, name, description, priority string) error {
+// UpdateEpic updates an epic's mutable fields. Empty string = keep existing
+// value; fields named in req.Clear are blanked.
+func (r *Repo) UpdateEpic(ctx context.Context, req domain.UpdateEpicRequest) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE epics SET
 		   name        = CASE WHEN $1 != '' THEN $1 ELSE name END,
-		   description = CASE WHEN $2 != '' THEN $2 ELSE description END,
+		   description = CASE WHEN $5 THEN '' WHEN $2 != '' THEN $2 ELSE description END,
 		   priority    = CASE WHEN $3 != '' THEN $3 ELSE priority END,
 		   updated_at  = NOW()
 		 WHERE id = $4`,
-		name, description, priority, epicID,
+		req.Name, req.Description, req.Priority, req.EpicID, slices.Contains(req.Clear, "description"),
 	)
 	return err
 }
 
-// UpdateStory updates a story's mutable fields. Empty string = keep existing value.
-func (r *Repo) UpdateStory(ctx context.Context, storyID int, name, description, acceptanceCriteria, priority string) error {
+// UpdateStory updates a story's mutable fields. Empty string = keep existing
+// value; fields named in req.Clear are blanked.
+func (r *Repo) UpdateStory(ctx context.Context, req domain.UpdateStoryRequest) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE stories SET
 		   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
-		   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
-		   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+		   description         = CASE WHEN $6 THEN '' WHEN $2 != '' THEN $2 ELSE description END,
+		   acceptance_criteria = CASE WHEN $7 THEN '' WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
 		   priority            = CASE WHEN $4 != '' THEN $4 ELSE priority END,
 		   updated_at          = NOW()
 		 WHERE id = $5`,
-		name, description, acceptanceCriteria, priority, storyID,
+		req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.StoryID,
+		slices.Contains(req.Clear, "description"), slices.Contains(req.Clear, "acceptance_criteria"),
 	)
 	return err
 }
