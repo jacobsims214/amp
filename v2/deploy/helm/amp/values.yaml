@@ -47,6 +47,9 @@ auth:
 ampApi:
   image: amp-api
   tag: local
+  # Any number works: each project runs on one replica and the others pass
+  # its requests there; if a replica dies, the rest take its projects over
+  # within ~10s. 2+ keeps AMP up through a pod or node failure.
   replicas: 1
   # Who becomes an AMP user on first sign-in, e.g. through an SSO connector:
   # comma-separated email domains ("acme.com,acme.io"). Invited emails and
