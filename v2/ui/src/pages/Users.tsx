@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import { ArrowLeft, Loader2, ShieldCheck, UserPlus, Trash2, KeyRound, ShieldOff } from 'lucide-react'
+import { ArrowLeft, Loader2, ShieldCheck, UserPlus, Trash2, KeyRound, ShieldOff, Power } from 'lucide-react'
+import { AccountBadges } from '../components/admin'
+import { AuditLogPanel } from '../components/AuditLogPanel'
 import { api, authAdminApi } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import type { AmpUser, AuthAdminUser } from '../types'
@@ -30,13 +32,14 @@ export function Users() {
 
   const reload = useCallback(() => {
     setLoading(true)
-    Promise.all([api.listUsers(), authAdminApi.listCredentials()])
+    // Loaded separately: one failing (e.g. amp-authadmin down) shouldn't hide the other.
+    Promise.allSettled([api.listUsers(), authAdminApi.listCredentials()])
       .then(([users, creds]) => {
-        setAmpUsers(users)
-        setCredentials(creds)
-        setError(null)
+        if (users.status === 'fulfilled') setAmpUsers(users.value)
+        if (creds.status === 'fulfilled') setCredentials(creds.value)
+        const failed = [users, creds].find(r => r.status === 'rejected') as PromiseRejectedResult | undefined
+        setError(failed ? String(failed.reason?.message ?? failed.reason) : null)
       })
-      .catch(e => setError(e.message))
       .finally(() => setLoading(false))
   }, [])
 
@@ -84,6 +87,21 @@ export function Users() {
       setResetPassword('')
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Reset failed')
+    } finally {
+      setBusyEmail(null)
+    }
+  }
+
+  async function toggleActive(u: AmpUser) {
+    const deactivate = !u.disabled_at
+    if (deactivate && !confirm(`Deactivate ${u.email}? Every request from this account (sign-ins and API tokens) will be refused, and it can't be given work. Its tickets and history stay.`)) return
+    setBusyEmail(u.email)
+    setRoleError(null)
+    try {
+      await (deactivate ? api.deactivateUser(u.id) : api.reactivateUser(u.id))
+      reload()
+    } catch (e) {
+      setRoleError(e instanceof Error ? e.message : 'Update failed')
     } finally {
       setBusyEmail(null)
     }
@@ -247,12 +265,14 @@ export function Users() {
 
         {/* Roles table */}
         <section>
-          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">Global admins</h2>
+          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">People, agents &amp; global admins</h2>
           <p className="text-xs text-[#3D5068] mb-3">
             People appear here the first time they sign in. A <strong>global admin</strong> manages the whole platform:
             logins on this page, creating orgs, and every org, team and project — in the UI and through their agents&apos;
             MCP admin tools. It takes effect on their next request; no re-login needed. Org and team roles are set per org
             on the <a href="/admin/orgs" className="text-[#818CF8] hover:underline">Orgs</a> page.
+            Deactivating an account refuses everything it does (including its API tokens) without deleting its work;
+            agent accounts are created on <a href="/access" className="text-[#818CF8] hover:underline">Agents &amp; tokens</a>.
           </p>
           {roleError && (
             <p className="text-xs text-[#F87171] mb-3">{roleError}</p>
@@ -270,7 +290,9 @@ export function Users() {
               <tbody>
                 {ampUsers.map(u => (
                   <tr key={u.id} className="border-t border-[#1E2C45]">
-                    <td className="px-4 py-2 text-[#DDE6F0]">{u.email}</td>
+                    <td className="px-4 py-2 text-[#DDE6F0]">
+                      <span className="flex items-center gap-1.5 flex-wrap">{u.email}<AccountBadges kind={u.kind} disabled={!!u.disabled_at} /></span>
+                    </td>
                     <td className="px-4 py-2 text-[#7E91A8]">{u.display_name || '—'}</td>
                     <td className="px-4 py-2">
                       {u.roles.includes('admin') ? (
@@ -285,13 +307,27 @@ export function Users() {
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      <button
-                        onClick={() => toggleAdmin(u)}
-                        disabled={busyEmail === u.email}
-                        className="text-xs font-semibold text-[#818CF8] hover:underline disabled:opacity-50 whitespace-nowrap"
-                      >
-                        {u.roles.includes('admin') ? 'Revoke global admin' : 'Make global admin'}
-                      </button>
+                      <div className="flex items-center gap-3">
+                        {u.kind !== 'agent' && (
+                          <button
+                            onClick={() => toggleAdmin(u)}
+                            disabled={busyEmail === u.email}
+                            className="text-xs font-semibold text-[#818CF8] hover:underline disabled:opacity-50 whitespace-nowrap"
+                          >
+                            {u.roles.includes('admin') ? 'Revoke global admin' : 'Make global admin'}
+                          </button>
+                        )}
+                        {u.id !== me?.user_id && (
+                          <button
+                            onClick={() => toggleActive(u)}
+                            disabled={busyEmail === u.email}
+                            title={u.disabled_at ? 'Reactivate' : 'Deactivate'}
+                            className={`flex items-center gap-1 text-xs font-semibold disabled:opacity-50 whitespace-nowrap ${u.disabled_at ? 'text-[#34D399]' : 'text-[#7E91A8] hover:text-[#F87171]'}`}
+                          >
+                            <Power size={12} />{u.disabled_at ? 'Reactivate' : 'Deactivate'}
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -301,6 +337,15 @@ export function Users() {
               </tbody>
             </table>
           </div>
+        </section>
+
+        <section>
+          <h2 className="text-sm font-bold text-[#DDE6F0] mb-1">Audit log</h2>
+          <p className="text-xs text-[#3D5068] mb-3">
+            Every change to access, accounts, API tokens, settings, and webhooks, and every deletion, across all orgs.
+            Org admins see their org's on the Orgs page; project owners see their project's in its settings.
+          </p>
+          <AuditLogPanel />
         </section>
       </main>
     </div>

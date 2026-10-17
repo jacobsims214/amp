@@ -8,6 +8,8 @@ import { MetadataEditor } from '../components/MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { inputCls, labelCls } from '../components/CrudModal'
 import { canManageProject } from '../lib/people'
+import { WebhooksPanel } from '../components/WebhooksPanel'
+import { AuditLogPanel } from '../components/AuditLogPanel'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
 
 function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
@@ -187,6 +189,20 @@ export function ProjectSettings() {
                   })}
                 </div>
               </Section>
+
+              {canManage && (
+                <Section title="Webhooks"
+                  description="Send this project's ticket changes to another service or a Slack channel. Org admins can also add webhooks for every project in the org.">
+                  <WebhooksPanel projectId={pid} canManage={canManage} />
+                </Section>
+              )}
+
+              {canManage && (
+                <Section title="Audit log"
+                  description="Who changed this project's access and settings, and who deleted what. Ticket-level history is on each ticket.">
+                  <AuditLogPanel projectId={pid} />
+                </Section>
+              )}
 
               {canManage && (
                 <Section title={project.state === 'archived' ? 'Restore' : 'Archive'}

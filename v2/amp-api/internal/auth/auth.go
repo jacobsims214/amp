@@ -36,6 +36,9 @@ type Identity struct {
 	// LocalDev is set when auth is disabled (no ISSUER_URL): the request is
 	// the anonymous local-dev user, who is treated as a global admin.
 	LocalDev bool
+	// APIToken is set when the request authenticated with an AMP API token
+	// rather than a Dex-issued token.
+	APIToken bool
 }
 
 // Verifier validates bearer tokens against Dex's JWKS. Safe for concurrent use.
@@ -164,64 +167,119 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		}
 		rawToken := strings.TrimSpace(strings.TrimPrefix(authz, prefix))
 
-		idToken, err := v.inner.Verify(r.Context(), rawToken)
-		if err != nil {
-			slog.Warn("token verification failed", "err", err)
-			v.writeUnauthorized(w, "invalid token")
+		var ident *Identity
+		if IsAPIToken(rawToken) {
+			ident = v.identityFromAPIToken(w, r, rawToken)
+		} else {
+			ident = v.identityFromJWT(w, r, rawToken)
+		}
+		if ident == nil {
+			return // the response has been written
+		}
+		if ident.User != nil && ident.User.DisabledAt != nil {
+			slog.Warn("request refused: account deactivated", "listener", v.label, "user_id", ident.User.ID, "email", ident.User.Email)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `{"error":"this AMP account is deactivated; ask an AMP admin to reactivate it"}`)
 			return
-		}
-
-		var claims struct {
-			Subject string `json:"sub"`
-			Email   string `json:"email"`
-			Name    string `json:"name"`
-		}
-		if err := idToken.Claims(&claims); err != nil {
-			http.Error(w, `{"error":"malformed claims"}`, http.StatusUnauthorized)
-			return
-		}
-		if !v.verifyAudience(idToken.Audience) {
-			// A 401 with the challenge makes MCP clients re-run OAuth and
-			// come back with a token issued for this resource.
-			slog.Warn("token rejected: audience not accepted",
-				"listener", v.label, "aud", idToken.Audience, "accepted", v.allowedAudiences, "subject", claims.Subject)
-			v.writeUnauthorized(w, "token audience not valid for this resource")
-			return
-		}
-
-		ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name}
-		if v.repo != nil {
-			u, err := v.repo.UpsertUserFromClaims(r.Context(), claims.Subject, claims.Email, claims.Name, v.bootstrapAdmins)
-			if err != nil {
-				if errors.Is(err, repository.EmptyEmailClaimError) {
-					// Expected for machine clients (MCP OAuth client-credentials/
-					// device-code flows) that don't go through a Dex local login
-					// and therefore have no email claim. Not an error — the
-					// request is still valid, just no identity to provision.
-					slog.Warn("JIT user provisioning skipped (machine client, no email claim)",
-						"subject", claims.Subject,
-						"remote_addr", r.RemoteAddr,
-						"user_agent", r.UserAgent(),
-						"request_uri", r.RequestURI,
-					)
-				} else {
-					slog.Error("JIT user provisioning failed",
-						"err", err,
-						"subject", claims.Subject,
-						"email", claims.Email,
-						"remote_addr", r.RemoteAddr,
-						"user_agent", r.UserAgent(),
-						"request_uri", r.RequestURI,
-					)
-				}
-			} else {
-				ident.User = u
-			}
 		}
 
 		r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
 		next.ServeHTTP(w, r)
 	})
+}
+
+// identityFromJWT verifies a Dex-issued token and JIT-provisions its user.
+// On failure it writes the response and returns nil.
+func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawToken string) *Identity {
+	if v.inner == nil {
+		v.writeUnauthorized(w, "this endpoint only accepts AMP API tokens")
+		return nil
+	}
+	idToken, err := v.inner.Verify(r.Context(), rawToken)
+	if err != nil {
+		slog.Warn("token verification failed", "err", err)
+		v.writeUnauthorized(w, "invalid token")
+		return nil
+	}
+
+	var claims struct {
+		Subject string `json:"sub"`
+		Email   string `json:"email"`
+		Name    string `json:"name"`
+		// EmailVerified is a pointer so an absent claim (Dex's password
+		// DB omits it on some versions) isn't read as false.
+		EmailVerified *bool `json:"email_verified"`
+	}
+	if err := idToken.Claims(&claims); err != nil {
+		http.Error(w, `{"error":"malformed claims"}`, http.StatusUnauthorized)
+		return nil
+	}
+	if !v.verifyAudience(idToken.Audience) {
+		// A 401 with the challenge makes MCP clients re-run OAuth and
+		// come back with a token issued for this resource.
+		slog.Warn("token rejected: audience not accepted",
+			"listener", v.label, "aud", idToken.Audience, "accepted", v.allowedAudiences, "subject", claims.Subject)
+		v.writeUnauthorized(w, "token audience not valid for this resource")
+		return nil
+	}
+
+	ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name}
+	if v.repo == nil {
+		return ident
+	}
+	if claims.EmailVerified != nil && !*claims.EmailVerified {
+		// An unverified email could be anyone's: never provision or link
+		// an AMP user from it (an SSO connector can pass these through).
+		slog.Warn("JIT user provisioning refused: email not verified", "subject", claims.Subject, "email", claims.Email)
+		return ident
+	}
+	u, err := v.repo.UpsertUserFromClaims(r.Context(), claims.Subject, claims.Email, claims.Name, v.bootstrapAdmins)
+	switch {
+	case errors.Is(err, repository.EmptyEmailClaimError):
+		// Expected for machine clients (MCP OAuth client-credentials/
+		// device-code flows) that don't go through a Dex local login
+		// and therefore have no email claim. Not an error — the
+		// request is still valid, just no identity to provision.
+		slog.Warn("JIT user provisioning skipped (machine client, no email claim)",
+			"subject", claims.Subject,
+			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
+			"request_uri", r.RequestURI,
+		)
+	case errors.Is(err, repository.ErrSignupNotAllowed):
+		slog.Warn("JIT user provisioning refused: email domain not allowed", "subject", claims.Subject, "email", claims.Email)
+	case err != nil:
+		slog.Error("JIT user provisioning failed",
+			"err", err,
+			"subject", claims.Subject,
+			"email", claims.Email,
+			"remote_addr", r.RemoteAddr,
+			"user_agent", r.UserAgent(),
+			"request_uri", r.RequestURI,
+		)
+	default:
+		ident.User = u
+	}
+	return ident
+}
+
+// identityFromAPIToken looks up an AMP API token. On failure it writes the
+// response and returns nil.
+func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, rawToken string) *Identity {
+	if v.repo == nil {
+		v.writeUnauthorized(w, "API tokens are not available")
+		return nil
+	}
+	u, err := v.repo.UserForAPIToken(r.Context(), HashAPIToken(rawToken))
+	if err != nil {
+		if !errors.Is(err, repository.ErrNotFound) {
+			slog.Error("API token lookup failed", "err", err)
+		}
+		v.writeUnauthorized(w, "invalid, expired, or revoked API token")
+		return nil
+	}
+	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true}
 }
 
 // WithIdentity returns ctx carrying ident, as the middleware would. For

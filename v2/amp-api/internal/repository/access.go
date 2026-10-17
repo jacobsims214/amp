@@ -105,9 +105,9 @@ func (r *Repo) ListProjectMembers(ctx context.Context, projectID int) ([]struct 
 		  FROM org_members om JOIN projects p ON p.org_id = om.org_id
 		  WHERE p.id = $1 AND om.role IN ('owner', 'admin')
 		)
-		SELECT u.id, u.email, u.display_name, MAX(a.lvl)
+		SELECT u.id, u.email, u.display_name, MAX(a.lvl), u.kind, u.disabled_at
 		FROM access a JOIN users u ON u.id = a.user_id
-		GROUP BY u.id, u.email, u.display_name
+		GROUP BY u.id, u.email, u.display_name, u.kind, u.disabled_at
 		ORDER BY u.email`, projectID)
 	if err != nil {
 		return nil, err
@@ -122,7 +122,7 @@ func (r *Repo) ListProjectMembers(ctx context.Context, projectID int) ([]struct 
 			User  domain.User
 			Level int
 		}
-		if err := rows.Scan(&m.User.ID, &m.User.Email, &m.User.DisplayName, &m.Level); err != nil {
+		if err := rows.Scan(&m.User.ID, &m.User.Email, &m.User.DisplayName, &m.Level, &m.User.Kind, &m.User.DisabledAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -135,8 +135,8 @@ func (r *Repo) ListProjectMembers(ctx context.Context, projectID int) ([]struct 
 func (r *Repo) GetUserByID(ctx context.Context, id int) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
-		`SELECT id, subject, email, display_name, created_at, last_seen_at FROM users WHERE id = $1`, id,
-	).Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt)
+		`SELECT `+userCols+` FROM users WHERE id = $1`, id,
+	).Scan(userDest(u)...)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("user %d: %w", id, ErrNotFound)
 	}
@@ -236,17 +236,22 @@ func (r *Repo) GetOrgRole(ctx context.Context, orgID, userID int) (string, error
 
 func (r *Repo) ListOrgMembers(ctx context.Context, orgID int) ([]domain.Member, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT u.id, u.email, u.display_name, om.role
+		SELECT u.id, u.email, u.display_name, om.role, u.kind, u.disabled_at IS NOT NULL
 		FROM org_members om JOIN users u ON u.id = om.user_id
 		WHERE om.org_id = $1 ORDER BY u.email`, orgID)
 	if err != nil {
 		return nil, err
 	}
-	return collect(rows, scanMember)
+	return collect(rows, scanUserMember)
 }
 
 func scanMember(row rowScanner, m *domain.Member) error {
 	return row.Scan(&m.UserID, &m.Email, &m.DisplayName, &m.Role)
+}
+
+// scanUserMember also reads the account's kind and whether it's deactivated.
+func scanUserMember(row rowScanner, m *domain.Member) error {
+	return row.Scan(&m.UserID, &m.Email, &m.DisplayName, &m.Role, &m.Kind, &m.Disabled)
 }
 
 // SetOrgMember adds a user to an org or changes their role. Demoting the
@@ -417,13 +422,13 @@ func (r *Repo) GetTeamRole(ctx context.Context, teamID, userID int) (string, err
 
 func (r *Repo) ListTeamMembers(ctx context.Context, teamID int) ([]domain.Member, error) {
 	rows, err := r.db.Query(ctx, `
-		SELECT u.id, u.email, u.display_name, tm.role
+		SELECT u.id, u.email, u.display_name, tm.role, u.kind, u.disabled_at IS NOT NULL
 		FROM team_members tm JOIN users u ON u.id = tm.user_id
 		WHERE tm.team_id = $1 ORDER BY u.email`, teamID)
 	if err != nil {
 		return nil, err
 	}
-	return collect(rows, scanMember)
+	return collect(rows, scanUserMember)
 }
 
 // SetTeamMember adds a user to a team (and to the team's org as a member,

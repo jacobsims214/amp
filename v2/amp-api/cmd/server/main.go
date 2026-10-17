@@ -26,6 +26,8 @@ import (
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/service"
+	"github.com/simstech/amp-api/internal/webhook"
 )
 
 //go:embed migrations/*.sql
@@ -76,6 +78,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Who may become an AMP user by signing in (e.g. through an SSO
+	// connector): emails in these domains, invited emails, and bootstrap
+	// admins. Unset allows anyone who can sign in to Dex.
+	if d := splitList(os.Getenv("SIGNUP_ALLOWED_DOMAINS")); len(d) > 0 {
+		repo.SetSignupDomains(d)
+		slog.Info("sign-ups limited to domains (plus invites and bootstrap admins)", "domains", d)
+	}
+
 	// ---- 1b. Auth (OIDC verifier against Dex) ----
 	var audiences []string
 	if a := os.Getenv("OIDC_AUDIENCES"); a != "" {
@@ -95,6 +105,18 @@ func main() {
 
 	// ---- 2. SSE hub ----
 	sseHub := hub.New()
+
+	// ---- 2b. Webhooks ----
+	// Hub events and audit entries are matched to webhooks and delivered
+	// from a Postgres outbox (internal/webhook). Webhooks can't reach
+	// private networks unless WEBHOOK_ALLOW_PRIVATE_NETWORKS=true.
+	allowPrivate := os.Getenv("WEBHOOK_ALLOW_PRIVATE_NETWORKS") == "true"
+	service.AllowPrivateWebhooks = allowPrivate
+	webhooks := webhook.New(repo, webhook.Options{AllowPrivateNetworks: allowPrivate})
+	sseHub.AddSink(webhooks.Event)
+	service.OnAudit(webhooks.Audit)
+	go webhooks.Run(ctx)
+	slog.Info("webhook dispatcher started", "allow_private_networks", allowPrivate)
 
 	// ---- 3. Actor system ----
 	system := protoactor.NewActorSystem()

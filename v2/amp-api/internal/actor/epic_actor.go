@@ -191,8 +191,12 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgUpdateEpic:
-		err := a.repo.UpdateEpic(context.Background(), msg.Req.EpicID, msg.Req.Name, msg.Req.Description, msg.Req.Priority)
+		clr, err := domain.ParseClears(msg.Req.Clear, domain.EpicClearable)
 		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: err}
+			return
+		}
+		if err := a.repo.UpdateEpic(context.Background(), msg.Req); err != nil {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update epic: %w", err)}
 			return
 		}
@@ -207,9 +211,7 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		if msg.Req.Name != "" {
 			a.epic.Name = msg.Req.Name
 		}
-		if msg.Req.Description != "" {
-			a.epic.Description = msg.Req.Description
-		}
+		a.epic.Description = clr.Apply("description", msg.Req.Description, a.epic.Description)
 		if msg.Req.Priority != "" {
 			a.epic.Priority = msg.Req.Priority
 		}

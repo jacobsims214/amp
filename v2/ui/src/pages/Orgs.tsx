@@ -6,6 +6,9 @@ import {
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
+import { AccountBadges } from '../components/admin'
+import { AuditLogPanel } from '../components/AuditLogPanel'
+import { WebhooksPanel } from '../components/WebhooksPanel'
 import { personName } from '../lib/people'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
 
@@ -211,7 +214,7 @@ export function Orgs() {
 
 /* ─── Org detail ─────────────────────────────────────────────────────────── */
 
-type Tab = 'members' | 'teams' | 'invites'
+type Tab = 'members' | 'teams' | 'invites' | 'webhooks' | 'audit'
 
 function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
   org: Org
@@ -281,7 +284,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {error && !confirmDelete && <p className="text-xs text-[#F87171] mb-3">{error}</p>}
 
       <div className="flex border-b border-[#1E2C45] mb-5">
-        {(['members', 'teams', 'invites'] as const).map(t => (
+        {(canManage ? ['members', 'teams', 'invites', 'webhooks', 'audit'] as const : ['members', 'teams', 'invites'] as const).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -289,7 +292,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
               tab === t ? 'border-[#6366F1] text-[#818CF8]' : 'border-transparent text-[#7E91A8] hover:text-[#DDE6F0]'
             }`}
           >
-            {t === 'invites' ? 'Pending invites' : t}
+            {t === 'invites' ? 'Pending invites' : t === 'audit' ? 'Audit log' : t}
           </button>
         ))}
       </div>
@@ -297,6 +300,15 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {tab === 'members' && <OrgMembers org={org} canManage={canManage} canGrantOwner={canGrantOwner} meId={meId} />}
       {tab === 'teams' && <OrgTeams org={org} canManage={canManage} meId={meId} />}
       {tab === 'invites' && <OrgInvites org={org} canManage={canManage} />}
+      {tab === 'webhooks' && (
+        <div className="space-y-3">
+          <p className="text-xs text-[#7E91A8] leading-relaxed">
+            Org webhooks fire for every project in {org.name}. Pick "Audit log entries" to stream membership, access, and deletion changes to a SIEM or a Slack channel.
+          </p>
+          <WebhooksPanel orgId={org.id} canManage={canManage} />
+        </div>
+      )}
+      {tab === 'audit' && <AuditLogPanel orgId={org.id} />}
 
       {confirmDelete && (
         <ConfirmDeleteModal
@@ -393,7 +405,12 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
                 const editable = canManage && (canGrantOwner || m.role !== 'owner')
                 return (
                   <tr key={m.user_id} className="border-t border-[#1E2C45]">
-                    <td className="px-4 py-2 text-[#DDE6F0]">{m.email}{m.user_id === meId && <span className="text-[#3D5068]"> (you)</span>}</td>
+                    <td className="px-4 py-2 text-[#DDE6F0]">
+                      <span className="flex items-center gap-1.5 flex-wrap">
+                        <span>{m.email}{m.user_id === meId && <span className="text-[#3D5068]"> (you)</span>}</span>
+                        <AccountBadges kind={m.kind} disabled={m.disabled} />
+                      </span>
+                    </td>
                     <td className="px-4 py-2 text-[#7E91A8]">{m.display_name || '—'}</td>
                     <td className="px-4 py-2">
                       {editable ? (
@@ -639,6 +656,7 @@ function TeamMembers({ teamId, canManageOrg, meId }: { teamId: number; canManage
               <div key={m.user_id} className="flex items-center gap-3 py-1">
                 <span className="text-sm text-[#DDE6F0] flex-1 truncate" title={m.email}>
                   {personName(m)} <span className="text-xs text-[#3D5068]">{m.email}{m.user_id === meId ? ' (you)' : ''}</span>
+                  {' '}<AccountBadges kind={m.kind} disabled={m.disabled} />
                 </span>
                 {canManage ? (
                   <>

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck, Building2, Plus, CalendarDays } from 'lucide-react'
+import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck, Building2, Plus, CalendarDays, KeyRound } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -225,6 +225,16 @@ export function Projects() {
               >
                 <CalendarDays size={13} />
                 Daily reports
+              </Link>
+            )}
+            {me?.user_id != null && (
+              <Link
+                to="/access"
+                title="API tokens and agent accounts"
+                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+              >
+                <KeyRound size={13} />
+                Agents &amp; tokens
               </Link>
             )}
             {me && (

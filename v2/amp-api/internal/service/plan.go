@@ -623,14 +623,19 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 // dependencies afterwards.
 
 // DeleteTask deletes a ticket (permission already checked).
-func (s *Service) DeleteTask(ctx context.Context, t *domain.Task) ([]int, error) {
-	return s.deleteTickets(ctx, t.ProjectID, []int{t.ID}, func() error {
+func (s *Service) DeleteTask(ctx context.Context, p authz.Principal, t *domain.Task) ([]int, error) {
+	dependents, err := s.deleteTickets(ctx, t.ProjectID, []int{t.ID}, func() error {
 		return s.Repo.DeleteTask(ctx, t.ID)
 	}, &actor.MsgDeleteTask{TaskID: t.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "task.delete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(t.ID),
+			Summary: fmt.Sprintf("deleted ticket #%d %q", t.ID, t.Name), Details: map[string]any{"story_id": t.StoryID, "state": t.State}})
+	}
+	return dependents, err
 }
 
 // DeleteStory deletes a story and its tickets (permission already checked).
-func (s *Service) DeleteStory(ctx context.Context, st *domain.Story) error {
+func (s *Service) DeleteStory(ctx context.Context, p authz.Principal, st *domain.Story) error {
 	ids, err := s.Repo.TaskIDsInStories(ctx, []int{st.ID})
 	if err != nil {
 		return err
@@ -638,12 +643,16 @@ func (s *Service) DeleteStory(ctx context.Context, st *domain.Story) error {
 	_, err = s.deleteTickets(ctx, st.ProjectID, ids, func() error {
 		return s.Repo.DeleteStory(ctx, st.ID)
 	}, &actor.MsgDeleteStory{StoryID: st.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "story.delete", ProjectID: intRef(st.ProjectID), TargetType: "story", TargetID: idStr(st.ID),
+			Summary: fmt.Sprintf("deleted story %q and its %d tickets", st.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
+	}
 	return err
 }
 
 // DeleteEpic deletes an epic, its stories, and their tickets (permission
 // already checked).
-func (s *Service) DeleteEpic(ctx context.Context, e *domain.Epic) error {
+func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.Epic) error {
 	ids, err := s.Repo.TaskIDsInEpic(ctx, e.ID)
 	if err != nil {
 		return err
@@ -651,6 +660,10 @@ func (s *Service) DeleteEpic(ctx context.Context, e *domain.Epic) error {
 	_, err = s.deleteTickets(ctx, e.ProjectID, ids, func() error {
 		return s.Repo.DeleteEpic(ctx, e.ID)
 	}, &actor.MsgDeleteEpic{EpicID: e.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "epic.delete", ProjectID: intRef(e.ProjectID), TargetType: "epic", TargetID: idStr(e.ID),
+			Summary: fmt.Sprintf("deleted epic %q with its stories and %d tickets", e.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
+	}
 	return err
 }
 

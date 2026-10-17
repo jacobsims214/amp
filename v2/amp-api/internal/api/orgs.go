@@ -91,6 +91,11 @@ func (h *RestHandler) orgSub(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := r.Context()
 
+	if len(parts) == 2 && parts[1] == "webhooks" {
+		h.webhookCollection(w, r, pr, &orgID, nil)
+		return
+	}
+
 	if len(parts) == 1 {
 		switch r.Method {
 		case http.MethodGet:

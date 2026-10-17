@@ -73,6 +73,10 @@ type Principal struct {
 	UserID int // 0 for the local-dev user (auth disabled)
 	Email  string
 	Super  bool // global admin, or local dev
+	// Agent is set for agent accounts (see domain.UserKindAgent).
+	Agent bool
+	// ViaToken is set when the request authenticated with an API token.
+	ViaToken bool
 }
 
 // HasUser reports whether the principal is a real AMP user (not local dev).
@@ -102,9 +106,11 @@ func FromContext(ctx context.Context) (Principal, error) {
 		return Principal{}, Forbidden("this token has no AMP user (missing email claim); sign in again")
 	}
 	return Principal{
-		UserID: ident.User.ID,
-		Email:  ident.User.Email,
-		Super:  ident.HasRole(domain.RoleAdmin),
+		UserID:   ident.User.ID,
+		Email:    ident.User.Email,
+		Super:    ident.HasRole(domain.RoleAdmin) && !ident.User.IsAgent(),
+		Agent:    ident.User.IsAgent(),
+		ViaToken: ident.APIToken,
 	}, nil
 }
 

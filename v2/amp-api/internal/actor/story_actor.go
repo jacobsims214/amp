@@ -215,8 +215,12 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgUpdateStory:
-		err := a.repo.UpdateStory(context.Background(), msg.Req.StoryID, msg.Req.Name, msg.Req.Description, msg.Req.AcceptanceCriteria, msg.Req.Priority)
+		clr, err := domain.ParseClears(msg.Req.Clear, domain.StoryClearable)
 		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: err}
+			return
+		}
+		if err := a.repo.UpdateStory(context.Background(), msg.Req); err != nil {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update story: %w", err)}
 			return
 		}
@@ -231,12 +235,8 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		if msg.Req.Name != "" {
 			a.story.Name = msg.Req.Name
 		}
-		if msg.Req.Description != "" {
-			a.story.Description = msg.Req.Description
-		}
-		if msg.Req.AcceptanceCriteria != "" {
-			a.story.AcceptanceCriteria = msg.Req.AcceptanceCriteria
-		}
+		a.story.Description = clr.Apply("description", msg.Req.Description, a.story.Description)
+		a.story.AcceptanceCriteria = clr.Apply("acceptance_criteria", msg.Req.AcceptanceCriteria, a.story.AcceptanceCriteria)
 		if msg.Req.Priority != "" {
 			a.story.Priority = msg.Req.Priority
 		}

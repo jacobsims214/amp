@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Who you are acting as in AMP: your user, your orgs and your teams. Tickets you create are yours by default; "+
 			"amp_list_tasks shows your own work unless you pass owner.",
 		props{}), wrap(ctx, s.open(s.whoami)))
+
+	mcp.AddTool(tool("amp_audit_log",
+		"Read the audit log: who changed access (org, team, project links, roles, accounts, API tokens), settings, or "+
+			"integrations, and who deleted what. Global admins read everything; org owners/admins pass org_id; "+
+			"project owners pass project_id. Newest first.",
+		props{
+			"org_id":     num("Optional. Entries for this org and its projects."),
+			"project_id": num("Optional. Entries for this project."),
+			"actor_id":   num("Optional. Only changes made by this user id."),
+			"action":     str("Optional. An action (e.g. 'org.member.set') or a prefix ending in '.' (e.g. 'team.')."),
+			"before_id":  num("Optional. Page back: entries older than this id."),
+			"limit":      num("Optional. Default 100, max 500."),
+		}), wrap(ctx, s.open(s.auditLog)))
 
 	mcp.AddTool(tool("amp_list_project_members",
 		"List the people with access to a project (id, email, access level). Use to find who a ticket can be assigned to.",
@@ -250,6 +264,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("New epic name."),
 			"description":   str("New epic description."),
 			"priority":      str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":         strArr(clearDesc("description")),
 			"add_owners":    strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners": strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateEpic)))
@@ -281,6 +296,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description":         str("New story description."),
 			"acceptance_criteria": str("New acceptance criteria."),
 			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":               strArr(clearDesc("description, acceptance_criteria")),
 			"add_owners":          strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners":       strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateStory)))
@@ -410,6 +426,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
+			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -668,6 +685,7 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.create", p.ID, "created project "+p.Name))
 	return jsonResult(p)
 }
 
@@ -691,7 +709,8 @@ func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*
 
 func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	p := caller(rctx).p
-	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super}
+	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super,
+		"account": map[bool]string{true: domain.UserKindAgent, false: domain.UserKindHuman}[p.Agent], "via_api_token": p.ViaToken}
 	if p.HasUser() {
 		orgs, err := s.repo.ListOrgs(rctx, p.UserRef())
 		if err != nil {
@@ -713,6 +732,17 @@ func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.
 		out["orgs"] = withTeams
 	}
 	return jsonResult(out)
+}
+
+func (s *Server) auditLog(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	entries, err := s.svc.Audit(rctx, caller(rctx).p, domain.AuditFilter{
+		OrgID: optInt(args, "org_id", 0), ProjectID: optInt(args, "project_id", 0), ActorUserID: optInt(args, "actor_id", 0),
+		Action: optStr(args, "action", ""), BeforeID: int64(optInt(args, "before_id", 0)), Limit: optInt(args, "limit", 0),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"entries": entries, "count": len(entries)})
 }
 
 func (s *Server) listProjectMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -767,7 +797,7 @@ func (s *Server) getProject(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) archiveProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -777,6 +807,7 @@ func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.archive", p.ID, "archived project "+p.Name))
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
@@ -806,7 +837,7 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) restoreProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -816,6 +847,7 @@ func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectRestored, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.restore", p.ID, "restored project "+p.Name))
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
@@ -1167,7 +1199,7 @@ func (s *Server) deleteStory(rctx context.Context, args map[string]interface{}) 
 	if err := s.checkProjectNotArchived(rctx, story.ProjectID); err != nil {
 		return nil, err
 	}
-	if err := s.svc.DeleteStory(rctx, story); err != nil {
+	if err := s.svc.DeleteStory(rctx, caller(rctx).p, story); err != nil {
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"story_id": storyID, "deleted": true})
@@ -1300,6 +1332,7 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		Priority:    optStr(args, "priority", ""),
 
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1337,6 +1370,7 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", ""),
+		Clear:       optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1382,6 +1416,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1563,7 +1598,7 @@ func (s *Server) getTicketHistory(_ context.Context, args map[string]interface{}
 	})
 }
 
-func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) resetProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -1587,6 +1622,7 @@ func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*
 	replyCh := make(chan actor.ReplySimple, 1)
 	s.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
 	<-replyCh
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 	return jsonResult(map[string]interface{}{
 		"project_id": projectID,
 		"reset":      true,
@@ -1610,7 +1646,7 @@ func (s *Server) deleteTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Tickets that waited on this one are updated (and unblocked if nothing else holds them).
-	dependents, err := s.svc.DeleteTask(rctx, task)
+	dependents, err := s.svc.DeleteTask(rctx, caller(rctx).p, task)
 	if err != nil {
 		return nil, fmt.Errorf("delete task: %w", err)
 	}
@@ -1633,7 +1669,7 @@ func (s *Server) deleteEpic(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Deletes its stories and tickets; tickets elsewhere that waited on them are updated.
-	if err := s.svc.DeleteEpic(rctx, epic); err != nil {
+	if err := s.svc.DeleteEpic(rctx, caller(rctx).p, epic); err != nil {
 		return nil, fmt.Errorf("delete epic: %w", err)
 	}
 	return jsonResult(map[string]interface{}{"epic_id": epicID, "deleted": true})
@@ -1835,6 +1871,7 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
 	}
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.import", newProject.ID, "imported project "+newProject.Name+" from an export"))
 
 	// 2. Spawn the ProjectActor for the new project
 	pid, err := s.registry.Get(newProject.ID)
@@ -1867,6 +1904,16 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 // optMetadataPatch reads the "metadata" argument as a change to existing
 // metadata (null removes a key); nil when it's absent.
+// projectAudit is an audit entry about a whole project.
+func projectAudit(action string, projectID int, summary string) domain.AuditEntry {
+	return domain.AuditEntry{Action: action, ProjectID: &projectID, TargetType: "project", TargetID: strconv.Itoa(projectID), Summary: summary}
+}
+
+// clearDesc documents an update tool's clear parameter.
+func clearDesc(fields string) string {
+	return "Optional. Fields to blank (" + fields + "). An empty or omitted field is left unchanged, so name it here to remove its text."
+}
+
 func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error) {
 	v, ok := args["metadata"]
 	if !ok || v == nil {

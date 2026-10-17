@@ -152,6 +152,7 @@ func (s *Service) ProjectMembers(ctx context.Context, projectID int) ([]domain.P
 		out = append(out, domain.ProjectMember{
 			UserID: m.User.ID, Email: m.User.Email, DisplayName: m.User.DisplayName,
 			Access: authz.LevelFromInt(m.Level).String(),
+			Kind:   m.User.Kind, Disabled: m.User.DisabledAt != nil,
 		})
 	}
 	return out, nil
@@ -160,6 +161,9 @@ func (s *Service) ProjectMembers(ctx context.Context, projectID int) ([]domain.P
 // requireMember fails unless userID can access projectID — the rule for
 // anyone being given work or ownership in a project.
 func (s *Service) requireMember(ctx context.Context, projectID, userID int) error {
+	if u, err := s.Repo.GetUserByID(ctx, userID); err == nil && u.DisabledAt != nil {
+		return authz.BadRequest("user %d (%s) is deactivated and can't be given work", userID, u.Email)
+	}
 	a, err := s.Repo.GetProjectAccess(ctx, userID, projectID)
 	if err != nil {
 		return err
@@ -358,7 +362,13 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
 		return nil, err
 	}
-	return s.Repo.UpdateProject(ctx, projectID, u)
+	proj, err := s.Repo.UpdateProject(ctx, projectID, u)
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+			Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
+				"open_reassign": u.OpenReassign, "metadata": u.Metadata}})
+	}
+	return proj, err
 }
 
 // RequireEditEpic loads an epic and checks p may change it.

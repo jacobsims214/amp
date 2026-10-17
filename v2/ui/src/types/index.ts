@@ -309,6 +309,8 @@ export interface UpdateEpicRequest {
   description?: string
   priority?: string
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 export interface CreateStoryRequest {
@@ -325,6 +327,8 @@ export interface UpdateStoryRequest {
   acceptance_criteria?: string
   priority?: string
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 export interface CreateTaskRequest {
@@ -350,6 +354,8 @@ export interface UpdateTaskRequest {
   priority?: string
   start_at?: string | null
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 // ---- Auth / users ----
@@ -361,6 +367,87 @@ export interface Me {
   roles: string[]
   user_id?: number
   orgs?: Org[]
+  teams?: { id: number; name: string; org_id: number; role: string }[]
+  kind?: UserKind
+  via_token?: boolean
+}
+
+export type UserKind = 'human' | 'agent'
+
+export interface APIToken {
+  id: number
+  user_id: number
+  name: string
+  prefix: string
+  created_by?: number
+  created_at: string
+  expires_at?: string
+  last_used_at?: string
+  revoked_at?: string
+}
+
+/** A token as just created: the only time `token` is shown. */
+export interface NewAPIToken extends APIToken {
+  token: string
+}
+
+export interface AuditEntry {
+  id: number
+  at: string
+  actor_user_id?: number
+  actor_email: string
+  via_token?: boolean
+  org_id?: number
+  project_id?: number
+  action: string
+  target_type?: string
+  target_id?: string
+  summary: string
+  details?: Record<string, unknown>
+}
+
+export type WebhookFormat = 'json' | 'slack'
+
+export interface Webhook {
+  id: number
+  org_id?: number
+  project_id?: number
+  name: string
+  url: string
+  format: WebhookFormat
+  /** Only present right after create or rotate. */
+  secret?: string
+  events: string[]
+  active: boolean
+  created_by?: number
+  created_at: string
+  updated_at: string
+  last_delivery_at?: string
+  last_status?: number
+  last_error?: string
+  consecutive_failures: number
+}
+
+export interface WebhookChange {
+  name?: string
+  url?: string
+  format?: WebhookFormat
+  events?: string[]
+  active?: boolean
+}
+
+export interface WebhookDelivery {
+  id: number
+  webhook_id: number
+  event_type: string
+  body?: string
+  status: 'pending' | 'delivered' | 'failed'
+  attempts: number
+  next_attempt_at: string
+  last_status?: number
+  last_error?: string
+  created_at: string
+  delivered_at?: string
 }
 
 export interface AmpUser {
@@ -371,6 +458,9 @@ export interface AmpUser {
   roles: string[]
   created_at: string
   last_seen_at: string
+  kind: UserKind
+  managed_by?: number
+  disabled_at?: string
 }
 
 export interface AuthAdminUser {
@@ -410,6 +500,8 @@ export interface Member {
   email: string
   display_name: string
   role: string
+  kind?: UserKind
+  disabled?: boolean
 }
 
 export interface ProjectMember {
@@ -417,6 +509,8 @@ export interface ProjectMember {
   email: string
   display_name: string
   access: ProjectAccess
+  kind?: UserKind
+  disabled?: boolean
 }
 
 export interface ProjectTeam {
