@@ -83,7 +83,7 @@ type TaskWithMeta struct {
 func (r *Repo) ProjectTasksWithMeta(ctx context.Context, projectID int) ([]TaskWithMeta, error) {
 	rows, err := r.db.Query(ctx, `
 		SELECT t.id, t.project_id, t.epic_id, t.story_id, t.name, t.state, t.priority, t.agent_id,
-		       t.dispatched_at, t.completed_at, t.block_reason, t.created_at, t.updated_at,
+		       t.dispatched_at, t.completed_at, t.block_reason, t.created_at, t.updated_at, t.owner_user_id,
 		       p.metadata || e.metadata || s.metadata || t.metadata
 		  FROM tasks t
 		  JOIN projects p ON p.id = t.project_id
@@ -100,7 +100,7 @@ func (r *Repo) ProjectTasksWithMeta(ctx context.Context, projectID int) ([]TaskW
 		var x TaskWithMeta
 		t := &x.Task
 		if err := rows.Scan(&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID, &t.Name, &t.State, &t.Priority, &t.AgentID,
-			&t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.CreatedAt, &t.UpdatedAt, &x.Effective); err != nil {
+			&t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.CreatedAt, &t.UpdatedAt, &t.OwnerUserID, &x.Effective); err != nil {
 			return nil, err
 		}
 		out = append(out, x)

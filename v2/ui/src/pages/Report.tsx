@@ -168,7 +168,7 @@ export function Report() {
             { label: 'Median time', value: hours(report.median_cycle_hours), sub: 'dispatch → done' },
             { label: 'Waiting on answers', value: hours(report.flag_hours), sub: `${report.states.flagged} open question${report.states.flagged === 1 ? '' : 's'}`, color: report.states.flagged ? 'var(--danger-ink)' : undefined },
             { label: 'Tokens', value: tokens((report.usage?.input_tokens ?? 0) + (report.usage?.output_tokens ?? 0)),
-              sub: report.usage?.runs ? `${usd(report.usage.cost_usd)} · ${report.usage.runs} runs${report.usage.unreported ? `, ${report.usage.unreported} unreported` : ''}` : 'no runs reported' },
+              sub: report.usage?.runs ? `${usd(report.usage.cost_usd)} · ${report.usage.runs} run${report.usage.runs === 1 ? '' : 's'}${report.usage.unreported ? `, ${report.usage.unreported} without usage` : ''}` : 'no runs reported' },
             { label: 'Plan', value: <>{report.states.done}<span className="text-[13px] text-ink-3">/{report.tickets}</span></>, sub: report.tickets ? `${Math.round(report.states.done / report.tickets * 100)}% done` : 'no tickets' },
           ]} />
 

@@ -53,6 +53,11 @@ func TestRuns_UsageReportsAndTrace(t *testing.T) {
 	if tu := rep["usage"].(map[string]any); tu["input_tokens"] != 41500.0 || tu["runs"] != 3.0 {
 		t.Fatalf("report usage: %v", tu)
 	}
+	// Spend per person: both tickets are root's.
+	people := rep["people"].([]any)
+	if len(people) != 1 || people[0].(map[string]any)["key"] != fmt.Sprint(w.root.User.ID) || people[0].(map[string]any)["usage"] == nil {
+		t.Fatalf("people: %v", people)
+	}
 	if len(rep["usage_by_model"].([]any)) != 2 {
 		t.Fatalf("by model: %v", rep["usage_by_model"])
 	}
