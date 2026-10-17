@@ -88,6 +88,16 @@ func TestRuns_UsageReportsAndTrace(t *testing.T) {
 	if out["count"] != 0.0 {
 		t.Fatalf("outsider traced into a project they can't see: %v", out)
 	}
+	// Finished but not merged: a waits on a person; marking it merged clears it.
+	um := root.call(t, "amp_list_unmerged", map[string]any{"project_id": float64(w.s.projectID)})
+	if um["count"] != 1.0 || int(um["waiting_to_merge"].([]any)[0].(map[string]any)["task_id"].(float64)) != a {
+		t.Fatalf("waiting to merge: %v", um)
+	}
+	ra.want(t, 200, "root", http.MethodPost, fmt.Sprintf("/api/tasks/%d/runs", a), map[string]any{"outcome": "completed", "merged": true, "note": "merged by a person"})
+	if um := ra.want(t, 200, "root", http.MethodGet, fmt.Sprintf("/api/projects/%d/unmerged", w.s.projectID), nil); um["count"] != 0.0 {
+		t.Fatalf("still waiting after merge: %v", um)
+	}
+
 	// Recording a run needs the right to work the ticket.
 	if err := w.s.as(w.outsider).callExpectError(t, "amp_report_run", map[string]any{"task_id": float64(a), "model": "x"}); err == "" {
 		t.Fatal("an outsider recorded a run")

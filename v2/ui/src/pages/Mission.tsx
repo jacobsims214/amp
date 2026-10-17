@@ -24,6 +24,7 @@ import { PriorityMark } from '../components/ui/PriorityMark'
 import { countStates, displayState, QUIET_MS, silentFor, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import { activityActor, lookupPerson } from '../lib/people'
 import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
+import { MergeQueue } from '../components/MergeQueue'
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -311,6 +312,8 @@ export function Mission() {
                   </button>
                 ))}
             </Panel>
+
+            <MergeQueue projectId={pid} tasks={tasks} onOpen={setSelectedId} refreshKey={tasks} />
 
             <Panel label="Activity" title="Latest" right={<span className="inline-flex items-center gap-1.5"><i className="w-1.5 h-1.5 rounded-full bg-success" />live</span>}>
               {activity.length === 0

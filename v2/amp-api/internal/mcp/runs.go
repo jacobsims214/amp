@@ -24,6 +24,7 @@ func runProps() props {
 		"commit":             str("Optional. The commit SHA (full, or at least 7 characters)."),
 		"pr_url":             str("Optional. The pull request URL."),
 		"pushed":             boolean("Optional. Whether the commit is pushed where teammates can get it."),
+		"merged":             boolean("Optional. Whether the work is merged into the main line. Whoever merges (a person, or the agent told to) records merged=true with amp_report_run."),
 		"run_note":           str("Optional. One line about the run, e.g. 'closeout only: implementation was committed by the previous run'."),
 	}
 }
@@ -77,6 +78,7 @@ func runFromArgs(args map[string]interface{}, outcome string) domain.Run {
 		Commit:           strings.TrimSpace(optStr(args, "commit", "")),
 		PRURL:            strings.TrimSpace(optStr(args, "pr_url", "")),
 		Pushed:           optBoolPtr(args, "pushed"),
+		Merged:           optBoolPtr(args, "merged"),
 		Note:             strings.TrimSpace(optStr(args, "run_note", "")),
 	}
 }
@@ -217,4 +219,17 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		"count":             len(tasks),
 		"owner_filter":      ownerMode,
 	})
+}
+
+func (s *Server) listUnmerged(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	runs, err := s.svc.UnmergedWork(rctx, caller(rctx).p, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"waiting_to_merge": runs, "count": len(runs),
+		"note": "Completed tickets whose pushed work no run has reported merged. After merging, record it: amp_report_run(task_id, outcome='completed', merged=true, commit=<merge sha>)."})
 }

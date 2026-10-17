@@ -191,6 +191,9 @@ export const api = {
     if (q.pr) p.set('pr', q.pr)
     return get<{ tickets: TraceHit[] | null }>(`/trace?${p}`).then(r => r.tickets ?? [])
   },
+  unmerged: (projectId: number) =>
+    get<{ waiting_to_merge: Run[] | null }>(`/projects/${projectId}/unmerged`).then(r => r.waiting_to_merge ?? []),
+  recordRun: (taskId: number, run: Partial<Run>) => post<Run>(`/tasks/${taskId}/runs`, run),
   projectTrash: (projectId: number) =>
     get<{ deleted: DeletedTask[] | null }>(`/projects/${projectId}/trash`).then(r => r.deleted ?? []),
   restoreTasks: (projectId: number, taskIds: number[]) =>

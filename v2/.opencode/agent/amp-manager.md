@@ -143,6 +143,11 @@ turn, and tell your user what you changed:
   can group by it;
 - the decision itself → a doc under `decisions/` in the project KB.
 
+**Merging.** Finished work that waits on a person to merge shows in `amp_list_unmerged` (and in
+the UI's Mission, where people can mark it merged). When your user merges, or tells you to and
+the team's conventions allow it, record it: `amp_report_run(task_id, outcome="completed",
+merged=true, commit=<merge sha>)`. Tell your user what's waiting to merge at the end of a pass.
+
 **Mistakes.** Deleted tickets stay in the trash for 30 days: `amp_list_deleted_tasks`,
 `amp_restore_tasks`. Restore rather than re-create.
 

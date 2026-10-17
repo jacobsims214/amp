@@ -632,6 +632,7 @@ export interface Run {
   commit?: string
   pr_url?: string
   pushed?: boolean
+  merged?: boolean
   note?: string
   created_at: string
 }

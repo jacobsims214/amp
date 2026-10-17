@@ -141,3 +141,11 @@ func usageByModel(runs []domain.Run) []UsageRow {
 	})
 	return out
 }
+
+// UnmergedWork is a project's "waiting to merge" queue for its members.
+func (s *Service) UnmergedWork(ctx context.Context, p authz.Principal, projectID int) ([]domain.Run, error) {
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+		return nil, err
+	}
+	return s.Repo.UnmergedWork(ctx, projectID)
+}

@@ -486,6 +486,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"project_id": num("REQUIRED. Project ID."),
 			"task_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "REQUIRED. Ticket IDs to restore."},
 		}), wrap(ctx, s.guard(authz.Member, s.restoreTasks)))
+	mcp.AddTool(tool("amp_list_unmerged", "Completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listUnmerged)))
 	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.taskRuns)))
 	mcp.AddTool(tool("amp_trace",

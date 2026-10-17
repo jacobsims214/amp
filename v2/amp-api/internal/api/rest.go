@@ -552,6 +552,16 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "unmerged":
+		// GET: completed tickets whose pushed work isn't merged yet.
+		runs, err := h.svc.UnmergedWork(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"waiting_to_merge": runs, "count": len(runs)})
+		return
+
 	case "trash":
 		// GET: tickets deleted in the last 30 days. POST trash/restore {task_ids}: bring them back.
 		if len(parts) > 2 && parts[2] == "restore" {
@@ -1228,6 +1238,22 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 
 	switch parts[1] {
 	case "runs":
+		if r.Method == http.MethodPost {
+			// Record a run (e.g. a person marking the work merged).
+			var run domain.Run
+			if err := json.NewDecoder(r.Body).Decode(&run); err != nil {
+				jsonErr(w, err, 400)
+				return
+			}
+			created, err := h.svc.RecordRun(r.Context(), pr, taskID, run)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			h.hub.Publish(domain.Event{Type: domain.EventTaskUpdated, ProjectID: created.ProjectID, Payload: map[string]interface{}{"task_id": taskID, "run": created.ID}, At: time.Now()})
+			jsonOK(w, created)
+			return
+		}
 		runs, err := h.repo.TaskRuns(r.Context(), taskID)
 		if err != nil {
 			jsonErr(w, err, 500)

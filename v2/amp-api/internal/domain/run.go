@@ -29,6 +29,7 @@ type Run struct {
 	Commit           string    `json:"commit,omitempty"`
 	PRURL            string    `json:"pr_url,omitempty"`
 	Pushed           *bool     `json:"pushed,omitempty"`
+	Merged           *bool     `json:"merged,omitempty"` // merged into the main line
 	Note             string    `json:"note,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 }
@@ -37,7 +38,7 @@ type Run struct {
 // callers only record runs that tell us something.
 func (r Run) HasDetail() bool {
 	return r.Model != "" || r.InputTokens != nil || r.OutputTokens != nil || r.CostUSD != nil ||
-		r.Branch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Note != ""
+		r.Branch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != ""
 }
 
 // Usage totals runs' token spend.
