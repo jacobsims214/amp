@@ -34,7 +34,7 @@ func TestDayReports(t *testing.T) {
 		t.Fatal(err)
 	}
 	sfx := time.Now().UnixNano()
-	other, err := repo.CreateProject(ctx, domain.CreateProjectRequest{Name: fmt.Sprintf("Other %d", sfx), Code: fmt.Sprintf("oth%d", sfx%100000), OrgID: &w.other.ID, TeamID: &w.x.ID})
+	other, err := repo.CreateProject(ctx, domain.CreateProjectRequest{Name: fmt.Sprintf("Other %d", sfx), Code: fmt.Sprintf("oth%d", sfx/1000%1000000000), OrgID: &w.other.ID, TeamID: &w.x.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +55,8 @@ func TestDayReports(t *testing.T) {
 	running := mk("build search", acme.projectID, acme.epicID, acme.storyID, nil)
 	stuck := mk("fix flaky test", acme.projectID, acme.epicID, acme.storyID, nil)
 	created := mk("plan billing", acme.projectID, acme.epicID, acme.storyID, nil)
+	// Waiting on a dependency isn't blocked: it just hasn't started.
+	waiting := mk("search UI", acme.projectID, acme.epicID, acme.storyID, map[string]interface{}{"dependency_ids": []interface{}{float64(running)}})
 	elsewhere := mk("other org work", other.ID, oe.ID, os_.ID, nil)
 	bobs := taskID(t, w.as(w.bob).mkTask(t, "bob's ticket", nil))
 
@@ -84,7 +86,7 @@ func TestDayReports(t *testing.T) {
 	check("in_progress", ref(acmeCode, running))
 	check("blocked", ref(acmeCode, stuck))
 	check("started")
-	check("created", ref(acmeCode, created))
+	check("created", ref(acmeCode, created), ref(acmeCode, waiting))
 	check("touched", ref(acmeCode, bobs))
 	if draft["saved"] != false {
 		t.Fatal("a draft isn't saved")
@@ -135,7 +137,7 @@ func TestDayReports(t *testing.T) {
 	}
 	// dave is in Acme but on no project: summary only.
 	daves := readAs(w.dave)
-	if daves["hidden_items"] != float64(6) || daves["summary"] == "" {
+	if daves["hidden_items"] != float64(7) || daves["summary"] == "" {
 		t.Errorf("dave's view: hidden %v, summary %q", daves["hidden_items"], daves["summary"])
 	}
 	// Someone in none of alice's orgs can't read it.

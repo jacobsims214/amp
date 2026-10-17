@@ -13,10 +13,11 @@ import { PageHeader, Panel, Readouts } from '../components/ui/PageHeader'
 import { StateTag } from '../components/ui/StateTag'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { Avatar } from '../components/ui/Avatar'
-import { displayState } from '../lib/ticketState'
+import { displayState, type DisplayState } from '../lib/ticketState'
 import type { DayReport, MyWork as MyWorkData, VelocityDay, WorkTask } from '../types'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
+const NEXT_UP: DisplayState[] = ['prog', 'flag', 'ready', 'wait', 'sched', 'done']
 const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
 
 function ago(iso?: string | null): string {
@@ -62,12 +63,18 @@ export function MyWork() {
     api.dayReportDraft(ymd(to), TZ).then(setDraft).catch(() => {})
   }, [])
 
-  const owned = work?.owned ?? []
+  // What needs me first: running, questions, ready, then waiting and scheduled.
+  const owned = [...(work?.owned ?? [])].sort((a, b) =>
+    NEXT_UP.indexOf(displayState(a)) - NEXT_UP.indexOf(displayState(b)) || Number(b.priority) - Number(a.priority) || a.id - b.id)
   const flags = work?.flags ?? []
   const agents = work?.agents ?? []
   const working = agents.filter(a => a.working.length > 0).length
   const inProgress = owned.filter(t => t.state === 'in_progress').length
   const projectsCount = new Set(owned.map(t => t.project_id)).size
+  // Agents in my harness work under my token, so my in-progress tickets are
+  // theirs; agent accounts (their own identity) are counted on top.
+  const flying = owned.filter(t => t.state === 'in_progress')
+  const accountTickets = agents.reduce((n, a) => n + a.working.length, 0)
 
   return (
     <div className="flex flex-col min-h-full">
@@ -80,7 +87,7 @@ export function MyWork() {
         {work && <>
           <Readouts items={[
             { label: 'My open tickets', value: owned.length, sub: `${inProgress} in progress · ${projectsCount} project${projectsCount === 1 ? '' : 's'}` },
-            { label: 'My agents working', value: <>{working}<span className="text-[13px] text-ink-3">/{agents.length}</span></>, sub: agents.length ? agents.map(a => a.user.display_name || a.user.email).join(', ') : 'none yet', color: 'var(--st-prog)' },
+            { label: 'Agents working', value: flying.length + accountTickets, sub: flying.length + accountTickets ? `on my tickets${agents.length ? ` · ${working}/${agents.length} agent accounts` : ''}` : 'nothing running', color: 'var(--st-prog)' },
             { label: 'Questions', value: flags.length, sub: flags.length ? 'agents waiting on an answer' : 'nothing needs a person', alarm: flags.length > 0 },
             { label: 'Done in 24h', value: work.done_24h + agents.reduce((a, x) => a + x.done_24h, 0), sub: 'by me and my agents' },
           ]} />
@@ -109,7 +116,7 @@ export function MyWork() {
                     <div className="overflow-x-auto">
                     <table className="w-full border-collapse text-[13px]">
                       <thead><tr className="bg-surface-2">
-                        {['', 'ID', 'Ticket', 'State', 'Agent', 'Project'].map(h => <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
+                        {['', 'ID', 'Ticket', 'State', 'Agent', ...(projectsCount > 1 ? ['Project'] : [])].map(h => <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
                       </tr></thead>
                       <tbody>
                         {owned.slice(0, 12).map(t => (
@@ -121,7 +128,7 @@ export function MyWork() {
                             <td className="px-3 border-b border-line whitespace-nowrap">{t.agent_id
                               ? <span className="inline-flex items-center gap-2"><Avatar name={t.agent_id} kind="agent" size={20} />{t.agent_id}</span>
                               : <span className="amp-num text-[12px] text-ink-3 block max-w-[160px] truncate">{t.assigned_to || '—'}</span>}</td>
-                            <td className="px-3 border-b border-line amp-num">{t.project_code}</td>
+                            {projectsCount > 1 && <td className="px-3 border-b border-line amp-num whitespace-nowrap max-w-[140px] truncate" title={t.project_code}>{t.project_code}</td>}
                           </tr>
                         ))}
                       </tbody>
@@ -134,9 +141,17 @@ export function MyWork() {
 
             <div className="grid grid-cols-1 gap-4 min-w-0">
               <Panel label="My agents" title="On station" right={<Link to="/access" className="underline underline-offset-2 hover:text-ink">manage</Link>}>
-                {agents.length === 0
-                  ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No agent accounts yet. <Link to="/access" className="underline">Create one</Link> to give an agent its own identity and token.</p>
-                  : agents.map(a => {
+                {flying.map(t => (
+                  <Link key={t.id} to={ticketLink(t)} className="grid grid-cols-[auto_1fr_auto] gap-x-2.5 gap-y-0.5 items-center px-4 py-2.5 border-t border-line first:border-t-0 hover:bg-surface-2">
+                    <Avatar name={t.agent_id || 'agent'} kind="agent" />
+                    <span className="text-[12.5px] font-semibold text-ink truncate">{t.agent_id || 'agent'}</span>
+                    <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>
+                    <span className="col-start-2 col-span-2 text-[11.5px] text-ink-2 truncate">#{t.id} {t.name}{projectsCount > 1 ? ` · ${t.project_code}` : ''}</span>
+                  </Link>
+                ))}
+                {flying.length === 0 && agents.length === 0 &&
+                  <p className="m-0 px-4 py-4 text-[13px] text-ink-2">Nothing running. When your harness dispatches one of your tickets, its agent shows up here.</p>}
+                {agents.map(a => {
                     const name = a.user.display_name || a.user.email
                     const t = a.working[0]
                     return (

@@ -53,7 +53,15 @@ func (r *Repo) BuildDayReportData(ctx context.Context, userID int, start, end ti
 	if err != nil {
 		return domain.DayReportData{}, err
 	}
-	blocked, err := owned(domain.TaskStateBlocked)
+	// Blocked means stopped on something a person has to sort out: a
+	// question. Tickets waiting on dependencies or a scheduled start aren't
+	// blocked, they just haven't started.
+	rows, err := r.db.Query(ctx, `SELECT id FROM tasks WHERE owner_user_id = $1 AND state = $2
+		AND block_reason <> '' AND block_reason NOT LIKE 'scheduled:%' ORDER BY updated_at`, userID, domain.TaskStateBlocked)
+	if err != nil {
+		return domain.DayReportData{}, err
+	}
+	blocked, err := pgx.CollectRows(rows, pgx.RowTo[int])
 	if err != nil {
 		return domain.DayReportData{}, err
 	}
