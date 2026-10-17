@@ -54,6 +54,11 @@ Context7 MCP server is available for tech documentation queries. Use this hierar
 
 When dispatching a research subagent for tech docs, tell them to persist findings into the AMP KB via amp_kb_write so knowledge accumulates over time.
 
+KB paths follow one set of folders so the Library stays one tree: `architecture/` (how things
+work), `decisions/` (why, one doc per decision), `how-to/` (step by step), `apis/` (contracts),
+`discoveries/` (findings). Search before writing; update a doc on the same subject rather than
+starting a second one.
+
 Besides the project KB, the project's team and org have their own KBs. When you start in a
 project, call `amp_kb_sources(project_id)` once so you know they exist (e.g. "owned by team
 Devs, in org Acme"). Search and write the project KB by default. Search the team or org KB when

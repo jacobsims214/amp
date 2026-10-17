@@ -431,7 +431,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			r.Issues = append(r.Issues, PlanIssue{
 				Kind:    "no_context",
 				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
-				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and architecture/decisions.md (each decision the user made, with why) with amp_kb_write.",
+				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
 			})
 		}
 	}
