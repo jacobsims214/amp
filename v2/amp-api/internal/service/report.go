@@ -54,7 +54,21 @@ type ReportGroup struct {
 	States           StateCounts `json:"states"`
 	CompletedInRange int         `json:"completed_in_range"`
 	MedianHours      *float64    `json:"median_cycle_hours,omitempty"` // dispatch → done, for those finished in range
-	cycles           []float64
+	// Usage is the token spend of runs recorded in range on this group's tickets.
+	Usage  *domain.Usage `json:"usage,omitempty"`
+	cycles []float64
+}
+
+func (g *ReportGroup) addUsage(runs []domain.Run) {
+	if len(runs) == 0 {
+		return
+	}
+	if g.Usage == nil {
+		g.Usage = &domain.Usage{}
+	}
+	for _, r := range runs {
+		g.Usage.Add(r)
+	}
 }
 
 // MetadataKey is a key found on the project's tickets and how many carry it.
@@ -78,6 +92,12 @@ type ProjectReport struct {
 	Keys        []MetadataKey `json:"metadata_keys"`
 	GroupBy     string        `json:"group_by,omitempty"`
 	Breakdown   []ReportGroup `json:"breakdown,omitempty"`
+	// People groups tickets by owner (key: user id, "" for unowned): the work
+	// each person and their agents did.
+	People []ReportGroup `json:"people"`
+	// Usage is the token spend of runs recorded in range, in total and by model.
+	Usage        domain.Usage `json:"usage"`
+	UsageByModel []UsageRow   `json:"usage_by_model"`
 }
 
 func median(xs []float64) *float64 {
@@ -110,10 +130,23 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 	if err != nil {
 		return nil, err
 	}
+	runs, err := s.Repo.ProjectRuns(ctx, projectID, since, until)
+	if err != nil {
+		return nil, err
+	}
+	runsByTask := map[int][]domain.Run{}
+	for _, run := range runs {
+		runsByTask[run.TaskID] = append(runsByTask[run.TaskID], run)
+	}
 	in := func(t *time.Time) bool { return t != nil && !t.Before(since) && t.Before(until) }
 	now := time.Now()
 
-	r := &ProjectReport{Since: since, Until: until, Tickets: len(tasks), Agents: []ReportGroup{}, Epics: []ReportGroup{}, Keys: []MetadataKey{}, GroupBy: groupBy}
+	r := &ProjectReport{Since: since, Until: until, Tickets: len(tasks), Agents: []ReportGroup{}, Epics: []ReportGroup{}, Keys: []MetadataKey{}, GroupBy: groupBy,
+		People: []ReportGroup{}, UsageByModel: usageByModel(runs)}
+	for _, run := range runs {
+		r.Usage.Add(run)
+	}
+	people := map[string]*ReportGroup{}
 	agents := map[string]*ReportGroup{}
 	epicRows := map[int]*ReportGroup{}
 	for _, e := range epics {
@@ -124,6 +157,7 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 	var cycles []float64
 
 	count := func(g *ReportGroup, t domain.Task, cycle float64, done bool) {
+		g.addUsage(runsByTask[t.ID])
 		g.Tickets++
 		g.States.add(t)
 		if done {
@@ -166,6 +200,14 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 		if g := epicRows[t.EpicID]; g != nil {
 			count(g, t, cycle, doneInRange)
 		}
+		owner := ""
+		if t.OwnerUserID != nil {
+			owner = fmt.Sprint(*t.OwnerUserID)
+		}
+		if people[owner] == nil {
+			people[owner] = &ReportGroup{Key: owner}
+		}
+		count(people[owner], t, cycle, doneInRange)
 		for k := range x.Effective {
 			keyCount[k]++
 		}
@@ -201,6 +243,7 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 		return out
 	}
 	r.Agents = finish(agents)
+	r.People = finish(people)
 	if groupBy != "" {
 		r.Breakdown = finish(groups)
 	}

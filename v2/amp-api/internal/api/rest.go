@@ -131,6 +131,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
 	mux.HandleFunc("/api/my-work", h.myWork)
+	mux.HandleFunc("/api/trace", h.trace)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 }
 
@@ -551,6 +552,37 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "trash":
+		// GET: tickets deleted in the last 30 days. POST trash/restore {task_ids}: bring them back.
+		if len(parts) > 2 && parts[2] == "restore" {
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST required", 405)
+				return
+			}
+			var body struct {
+				TaskIDs []int `json:"task_ids"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskIDs) == 0 {
+				jsonErr(w, errorf("task_ids is required"), 400)
+				return
+			}
+			res, err := h.svc.RestoreTasks(r.Context(), pr, projectID, body.TaskIDs)
+			if err != nil {
+				fail(w, err, 500)
+				return
+			}
+			h.hub.Publish(domain.Event{Type: domain.EventTaskUpdated, ProjectID: projectID, Payload: map[string]interface{}{"restored": body.TaskIDs}, At: time.Now()})
+			jsonOK(w, map[string]interface{}{"results": res})
+			return
+		}
+		trash, err := h.svc.DeletedTasks(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"deleted": trash, "count": len(trash)})
+		return
+
 	case "approve-plan":
 		// POST: a person approves the project's plan as it stands now.
 		if r.Method != http.MethodPost {
@@ -1195,6 +1227,18 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "runs":
+		runs, err := h.repo.TaskRuns(r.Context(), taskID)
+		if err != nil {
+			jsonErr(w, err, 500)
+			return
+		}
+		var u domain.Usage
+		for _, run := range runs {
+			u.Add(run)
+		}
+		jsonOK(w, map[string]interface{}{"runs": runs, "usage": u})
+
 	case "history":
 		history, err := h.repo.GetTicketHistory(r.Context(), taskID)
 		if err != nil {
@@ -1388,7 +1432,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 // the ticket is "work" on it.
 func taskActionFor(method, sub string) authz.TaskAction {
 	switch {
-	case method == http.MethodGet, sub == "comments", sub == "history", sub == "assign", sub == "dispatch":
+	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch":
 		return authz.TaskRead
 	case sub == "" && method == http.MethodDelete:
 		return authz.TaskDelete
@@ -1706,4 +1750,20 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// trace: GET /api/trace?commit=…|branch=…|pr=… — the tickets whose recorded
+// runs produced that code, in projects the caller can see.
+func (h *RestHandler) trace(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	hits, err := h.svc.Trace(r.Context(), pr, q.Get("commit"), q.Get("branch"), q.Get("pr"))
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, map[string]interface{}{"tickets": hits, "count": len(hits)})
 }

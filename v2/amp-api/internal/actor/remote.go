@@ -397,7 +397,7 @@ func init() {
 		&MsgBlockTask{}, &MsgAssignTask{}, &MsgUpdateTask{}, &MsgAddComment{}, &MsgGetComments{},
 		&MsgSetTaskState{}, &MsgSetTaskStartAt{}, &MsgReset{}, &MsgDeleteEpic{}, &MsgDeleteStory{},
 		&MsgDeleteTask{}, &MsgSetTaskDeps{}, &MsgReconcileDeps{}, &MsgMoveTask{}, &MsgMoveStory{},
-		&MsgPing{},
+		&MsgRestoreTask{}, &MsgPing{},
 	} {
 		t := reflect.TypeOf(m)
 		wireTypes[t] = t.Elem().Name()

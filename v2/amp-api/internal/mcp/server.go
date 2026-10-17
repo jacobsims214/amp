@@ -421,6 +421,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"project_id": num("REQUIRED. Project ID."),
 			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
 			"owner":      str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
+			"format":     str("Optional: 'compact' for a small overview — buckets as ticket IDs, and every ticket as one line under its epic (id, name, state, owner, what it waits on). Use it to orient; fetch full tickets with amp_get_task."),
 		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
 	mcp.AddTool(tool("amp_get_task", "Get full task details by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top).",
@@ -463,8 +464,38 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
 		}), wrap(ctx, s.guard(authz.Member, s.dispatchTask)))
 
-	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it.",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.completeTask)))
+	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it. "+
+		"Also record the run: the model you used, your token usage if your harness can tell you (opencode: amp_session_usage), "+
+		"and where the work is (branch, commit, PR, pushed). AMP reports token spend and traces code back to tickets from these.",
+		withRunProps(props{"task_id": num("REQUIRED. Task ID.")})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
+	mcp.AddTool(tool("amp_report_run",
+		"Record an agent run on a ticket without changing its state: the model, token usage, and where the work went. "+
+			"Use it for a run that ended some other way (killed, abandoned, handed over), for usage you learn about afterwards "+
+			"(e.g. a manager reporting a subagent's usage from its result), or for a PR opened after completion.",
+		withRunProps(props{
+			"task_id":  num("REQUIRED. Task ID."),
+			"outcome":  str("Optional. completed | blocked | progress (default) | abandoned."),
+			"agent_id": str("Optional. The agent profile that ran (defaults to the ticket's agent)."),
+		})), wrap(ctx, s.guard(authz.Member, s.reportRun)))
+	mcp.AddTool(tool("amp_list_deleted_tasks", "A project's trash: tickets deleted in the last 30 days, which amp_restore_tasks can bring back.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listDeleted)))
+	mcp.AddTool(tool("amp_restore_tasks",
+		"Bring deleted tickets back from the trash with their comments, history, owner, state and dependency links. "+
+			"A project lead, or whoever deleted a ticket, may restore it. The ticket's story must still exist.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"task_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "REQUIRED. Ticket IDs to restore."},
+		}), wrap(ctx, s.guard(authz.Member, s.restoreTasks)))
+	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.taskRuns)))
+	mcp.AddTool(tool("amp_trace",
+		"From code back to the work: find the tickets whose runs produced a commit, a branch, or a PR, across the projects you "+
+			"can see. Then amp_get_ticket_history(task_id) for how it got there (plan, comments, decisions, runs).",
+		props{
+			"commit": str("A commit SHA, or at least its first 7 characters."),
+			"branch": str("A branch name."),
+			"pr_url": str("A pull request URL."),
+		}), wrap(ctx, s.open(s.trace)))
 
 	mcp.AddTool(tool("amp_block_task",
 		"Stop work on a ticket because it needs a person: a question, a decision, missing information, or access you don't have. "+
@@ -472,10 +503,10 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"The ticket leaves in-progress and appears in amp_list_tasks' questions list. When someone answers (in the AMP UI, or with "+
 			"amp_answer_question) the answer is posted on the ticket and it goes back to ready to be dispatched again. "+
 			"Not for waiting on other tickets: that's what dependencies are for.",
-		props{
+		withRunProps(props{
 			"task_id": num("REQUIRED. Task ID."),
 			"reason":  str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
-		}), wrap(ctx, s.guard(authz.Member, s.blockTask)))
+		})), wrap(ctx, s.guard(authz.Member, s.blockTask)))
 	mcp.AddTool(tool("amp_answer_question",
 		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
 			"and the ticket goes back to ready (or to waiting, if it still depends on unfinished tickets), so the next dispatch picks it up "+
@@ -510,7 +541,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Owner, s.resetProject)))
 
 	mcp.AddTool(tool("amp_delete_task",
-		"Delete a single task. Use this to remove tasks created by mistake during planning.",
+		"Delete a single task. Use this to remove tasks created by mistake during planning. Deleted tickets stay in the project trash for 30 days (amp_list_deleted_tasks, amp_restore_tasks).",
 		props{
 			"task_id": num("REQUIRED. Task ID to delete."),
 		}), wrap(ctx, s.guard(authz.Member, s.deleteTask)))
@@ -1337,6 +1368,10 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		}
 	}
 
+	if optStr(args, "format", "") == "compact" {
+		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet)
+	}
+
 	return jsonResult(map[string]interface{}{
 		"ready_to_dispatch": readyToDispatch, // dispatch ALL of these immediately
 		"in_progress":       inProgress,
@@ -1561,7 +1596,13 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed"})
+	out := map[string]interface{}{"task_id": taskID, "state": "completed"}
+	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
+		out["run_error"] = err.Error()
+	} else if run != nil {
+		out["run"] = run
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1596,7 +1637,13 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "blocked"})
+	out := map[string]interface{}{"task_id": taskID, "state": "blocked"}
+	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunBlocked); err != nil {
+		out["run_error"] = err.Error()
+	} else if run != nil {
+		out["run"] = run
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) answerQuestion(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1697,10 +1744,20 @@ func (s *Server) getTicketHistory(_ context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	comments, err := s.repo.GetComments(context.Background(), taskID)
+	if err != nil {
+		return nil, err
+	}
+	runs, err := s.repo.TaskRuns(context.Background(), taskID)
+	if err != nil {
+		return nil, err
+	}
 	return jsonResult(map[string]interface{}{
-		"task":    task,
-		"history": history,
-		"count":   len(history),
+		"task":     task,
+		"history":  history,
+		"count":    len(history),
+		"comments": comments, // the worker's plan, progress, questions and answers
+		"runs":     runs,     // model, tokens, branch, commit, PR per agent run
 	})
 }
 

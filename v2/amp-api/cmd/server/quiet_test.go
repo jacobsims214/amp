@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
 
@@ -45,5 +46,35 @@ func TestMCP_ListTasksReportsQuiet(t *testing.T) {
 	}
 	if _, ok := quiet[live]; ok {
 		t.Fatalf("a ticket with fresh activity is reported quiet: %v", out["quiet"])
+	}
+}
+
+// The compact overview lists every ticket as one line under its epic, with
+// what a waiting ticket waits on, and the buckets as IDs.
+func TestMCP_ListTasksCompact(t *testing.T) {
+	s := setupMCP(t)
+	a := mkIn(t, s, s.storyID, "a")
+	b := mkIn(t, s, s.storyID, "b", a)
+	out := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID), "owner": "any", "format": "compact"})
+	ready := out["ready_to_dispatch"].([]interface{})
+	if len(ready) != 1 || int(ready[0].(float64)) != a {
+		t.Fatalf("ready: %v", out)
+	}
+	var lines []interface{}
+	for _, v := range out["by_epic"].(map[string]interface{}) {
+		lines = append(lines, v.([]interface{})...)
+	}
+	found := false
+	for _, l := range lines {
+		m := l.(map[string]interface{})
+		if int(m["id"].(float64)) == b {
+			found = m["state"] == "waiting" && fmt.Sprint(m["waits_on"]) == fmt.Sprintf("[%d]", a)
+		}
+		if _, heavy := m["description"]; heavy {
+			t.Fatalf("compact lines carry descriptions: %v", m)
+		}
+	}
+	if !found {
+		t.Fatalf("b isn't listed as waiting on a: %v", out["by_epic"])
 	}
 }

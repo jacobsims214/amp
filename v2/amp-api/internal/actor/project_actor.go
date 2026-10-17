@@ -207,6 +207,20 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgMoveTask:
 		msg.ReplyCh <- a.moveTask(ctx, msg)
 
+	case *MsgRestoreTask:
+		epic, ok := a.epics[msg.EpicID]
+		if !ok {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("epic %d not found", msg.EpicID)}
+			return
+		}
+		adopted := make(chan ReplyGetTask, 1)
+		ctx.Send(epic, &MsgAdoptTask{TaskID: msg.TaskID, StoryID: msg.StoryID, ReplyCh: adopted})
+		reply := <-adopted
+		if reply.Err == nil {
+			a.taskToEpic[msg.TaskID] = msg.EpicID
+		}
+		msg.ReplyCh <- reply
+
 	case *MsgMoveStory:
 		msg.ReplyCh <- ReplySimple{Err: a.moveStory(ctx, msg)}
 

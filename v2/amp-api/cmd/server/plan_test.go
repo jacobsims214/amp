@@ -522,3 +522,34 @@ func TestPlan_CheckPlanWantsContext(t *testing.T) {
 		t.Fatal("no_context still reported after writing the overview")
 	}
 }
+
+// A gate that joins different people's work is flagged as a warning: it
+// doesn't make the plan NO-GO, but it says whose work waits on whose.
+func TestPlan_CheckPlanWarnsOnCoupledGate(t *testing.T) {
+	w := newRBACWorld(t)
+	alice, bob := w.s.as(w.alice), w.s.as(w.bob)
+	a := mkIn(t, alice, w.s.storyID, "alice's libs")
+	b := mkIn(t, bob, w.s.storyID, "bob's libs")
+	gate := mkIn(t, alice, w.s.storyID, "foundation check", a, b)
+	mkIn(t, alice, w.s.storyID, "alice's service", gate)
+	mkIn(t, bob, w.s.storyID, "bob's app", gate)
+
+	report := alice.call(t, "amp_check_plan", map[string]interface{}{"project_id": float64(w.s.projectID)})
+	var found map[string]interface{}
+	for _, iss := range report["issues"].([]interface{}) {
+		if m := iss.(map[string]interface{}); m["kind"] == "coupled_gate" {
+			found = m
+		}
+	}
+	if found == nil || found["severity"] != "warn" || !strings.Contains(fmt.Sprint(found["task_ids"]), fmt.Sprint(gate)) {
+		t.Fatalf("no coupled_gate warning for #%d: %v", gate, report["issues"])
+	}
+	for _, iss := range report["issues"].([]interface{}) {
+		if m := iss.(map[string]interface{}); m["severity"] != "warn" {
+			return // another (blocking) issue in this shared world; ok is false for that reason
+		}
+	}
+	if report["ok"] != true {
+		t.Fatalf("a warning alone shouldn't make the plan NO-GO: %v", report)
+	}
+}

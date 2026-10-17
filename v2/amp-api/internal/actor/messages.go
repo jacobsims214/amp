@@ -257,6 +257,15 @@ type MsgReconcileDeps struct {
 	ReplyCh chan ReplySimple
 }
 
+// MsgRestoreTask brings a ticket restored from the trash (already back in
+// the database) into its story's actors.
+type MsgRestoreTask struct {
+	TaskID  int
+	EpicID  int
+	StoryID int
+	ReplyCh chan ReplyGetTask
+}
+
 // MsgMoveTask moves a task to another story (in the same or another epic).
 type MsgMoveTask struct {
 	TaskID     int

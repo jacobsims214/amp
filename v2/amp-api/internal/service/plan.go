@@ -294,7 +294,9 @@ func (s *Service) ReconcileDependents(ctx context.Context, projectID int, depend
 
 // PlanIssue is a likely problem in a project's plan.
 type PlanIssue struct {
-	Kind    string `json:"kind"`
+	Kind string `json:"kind"`
+	// Severity is "warn" for advice that doesn't make the plan NO-GO.
+	Severity string `json:"severity,omitempty"`
 	Message string `json:"message"`
 	TaskIDs []int  `json:"task_ids,omitempty"`
 	Fix     string `json:"fix,omitempty"`
@@ -424,6 +426,52 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		})
 	}
 
+	// A gate that couples different people's work: its dependencies belong to
+	// two or more people, and so do the tickets waiting on it, so each person's
+	// next work waits on everyone's. Often a review that should be split.
+	ownerOf := func(id int) string {
+		if t, ok := byID[id]; ok && t.OwnerUserID != nil {
+			return fmt.Sprint(*t.OwnerUserID)
+		}
+		return ""
+	}
+	waiters := map[int][]int{}
+	for _, t := range tasks {
+		for _, d := range t.DependencyIDs {
+			waiters[d] = append(waiters[d], t.ID)
+		}
+	}
+	var coupled []int
+	var coupledDetail []string
+	for _, t := range tasks {
+		if t.State == domain.TaskStateCompleted || len(t.DependencyIDs) < 2 || len(waiters[t.ID]) < 2 {
+			continue
+		}
+		up, down := map[string]bool{}, map[string]bool{}
+		for _, d := range t.DependencyIDs {
+			if o := ownerOf(d); o != "" {
+				up[o] = true
+			}
+		}
+		for _, w := range waiters[t.ID] {
+			if o := ownerOf(w); o != "" {
+				down[o] = true
+			}
+		}
+		if len(up) >= 2 && len(down) >= 2 {
+			coupled = append(coupled, t.ID)
+			coupledDetail = append(coupledDetail, fmt.Sprintf("#%d (waits on %d people's tickets; %d tickets of %d people wait on it)", t.ID, len(up), len(waiters[t.ID]), len(down)))
+		}
+	}
+	if len(coupled) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "coupled_gate", Severity: "warn", TaskIDs: coupled,
+			Message: "These tickets join different people's work: " + strings.Join(coupledDetail, "; ") +
+				". Everyone's next tickets wait until all of it is done, so one person's delay stalls the others.",
+			Fix: "If the waiting tickets only need part of it, split the gate (e.g. one check per stack or per person) and re-point dependencies with amp_set_task_dependencies.",
+		})
+	}
+
 	// A plan with an empty project KB: the decisions behind it live only in
 	// the planner's session, and the next session or engineer starts blind.
 	if r.OpenTasks > 0 && s.KB != nil {
@@ -444,11 +492,25 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	}
 
 	r.LongestChain = longestChain(tasks)
-	r.OK = len(r.Issues) == 0
+	r.OK = true
+	for _, iss := range r.Issues {
+		if iss.Severity != "warn" {
+			r.OK = false
+		}
+	}
 	r.Summary = fmt.Sprintf("%d tickets (%d open), %d dependencies, %d ready to dispatch now, longest chain %d.",
 		r.Tasks, r.OpenTasks, r.Dependencies, len(r.ReadyNow), r.LongestChain)
-	if r.OK {
+	warns := 0
+	for _, iss := range r.Issues {
+		if iss.Severity == "warn" {
+			warns++
+		}
+	}
+	switch {
+	case r.OK && warns == 0:
 		r.Summary += " No problems found."
+	case r.OK:
+		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
 	}
 	if len(stuck) > 0 {
 		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
@@ -654,7 +716,7 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 
 // DeleteTask deletes a ticket (permission already checked).
 func (s *Service) DeleteTask(ctx context.Context, p authz.Principal, t *domain.Task) ([]int, error) {
-	dependents, err := s.deleteTickets(ctx, t.ProjectID, []int{t.ID}, func() error {
+	dependents, err := s.deleteTickets(ctx, p, t.ProjectID, []int{t.ID}, func() error {
 		return s.Repo.DeleteTask(ctx, t.ID)
 	}, &actor.MsgDeleteTask{TaskID: t.ID})
 	if err == nil {
@@ -670,7 +732,7 @@ func (s *Service) DeleteStory(ctx context.Context, p authz.Principal, st *domain
 	if err != nil {
 		return err
 	}
-	_, err = s.deleteTickets(ctx, st.ProjectID, ids, func() error {
+	_, err = s.deleteTickets(ctx, p, st.ProjectID, ids, func() error {
 		return s.Repo.DeleteStory(ctx, st.ID)
 	}, &actor.MsgDeleteStory{StoryID: st.ID})
 	if err == nil {
@@ -687,7 +749,7 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 	if err != nil {
 		return err
 	}
-	_, err = s.deleteTickets(ctx, e.ProjectID, ids, func() error {
+	_, err = s.deleteTickets(ctx, p, e.ProjectID, ids, func() error {
 		return s.Repo.DeleteEpic(ctx, e.ID)
 	}, &actor.MsgDeleteEpic{EpicID: e.ID})
 	if err == nil {
@@ -700,9 +762,18 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 // deleteTickets runs a delete, evicts the deleted work from the project's
 // actors (msg is a delete message without its reply channel), and updates
 // the tickets that depended on what was deleted. It returns those tickets.
-func (s *Service) deleteTickets(ctx context.Context, projectID int, ids []int, del func() error, msg interface{}) ([]int, error) {
+func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectID int, ids []int, del func() error, msg interface{}) ([]int, error) {
 	dependents, err := s.Repo.Dependents(ctx, ids)
 	if err != nil {
+		return nil, err
+	}
+	// Keep a copy in the trash so the deletion can be undone.
+	var by *int
+	if p.HasUser() {
+		uid := p.UserID
+		by = &uid
+	}
+	if err := s.Repo.TrashTasks(ctx, ids, by); err != nil {
 		return nil, err
 	}
 	if err := del(); err != nil {
