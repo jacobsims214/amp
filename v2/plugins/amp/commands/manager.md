@@ -105,6 +105,11 @@ unblocked something, and answered questions come back as ready), repeat until bo
 `ready_to_dispatch` and `in_progress` are empty. Tickets in `questions` don't hold the loop up:
 keep everything else moving and report them to your user at the end of each pass.
 
+Run at most 4 workers at once, and start the next as one finishes. Wide fan-outs (10+ workers in
+one turn) are where sessions hang, and when they do every ticket in flight is orphaned at once.
+In a shared checkout, give each parallel worker its own `git worktree` so their branches don't
+collide.
+
 Dispatching is two steps in the same turn: `amp_dispatch_task`, then the `Task` tool that runs
 the worker — in the foreground, waiting for it to finish. A background task dies with the session
 that started it, and a headless run (`Claude Code run`, CI) ends the moment you reply. Never mark a ticket dispatched that you aren't about to run — everyone watching AMP
