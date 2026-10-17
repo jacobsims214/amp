@@ -13,6 +13,7 @@ import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { Markdown } from './ui/Markdown'
+import { RunsPanel } from './RunsPanel'
 
 interface Props {
   task: Task | null
@@ -643,6 +644,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
           </div>
         </div>
       )}
+      <RunsPanel taskId={task.id} refreshKey={task.state} />
       <div className="grid grid-cols-2 gap-2.5">
         <MetaItem label="Task ID" value={`#${task.id}`} />
         <MetaItem label="State" value={task.state} />

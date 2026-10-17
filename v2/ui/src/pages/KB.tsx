@@ -125,13 +125,18 @@ export function KB() {
   }
 
   const saveDoc = async () => {
-    if (!editPath || !editTitle || !editContent) return
+    // The title field is the heading: take it from a leading "# Heading" if it was left empty,
+    // and don't keep that heading in the body too.
+    const lead = editContent.match(/^\s*#\s+(.+)\n?/)
+    const title = editTitle.trim() || lead?.[1]?.trim() || ''
+    const content = lead && lead[1].trim() === title ? editContent.slice(lead[0].length).replace(/^\s+/, '') : editContent
+    if (!editPath || !title || !content) return
     setSaving(true)
     setActionError(null)
     try {
       const parsedTags = editTags.split(',').map(t => t.trim()).filter(Boolean)
       await api.kbWrite(kbRef, {
-        path: editPath, title: editTitle, content: editContent, tags: parsedTags,
+        path: editPath, title, content, tags: parsedTags,
         reason: shared ? editReason.trim() : undefined,
       })
       // Writes are queued and land a moment later: show what was saved now,
@@ -140,7 +145,7 @@ export function KB() {
       const savedAt = Math.floor(Date.now() / 1000) - 2
       setSelectedDoc(prev => ({
         ...(prev?.path === path ? prev : { id: '', project_id: 0, author: '', chunk_index: 0, chunk_text: '', annotations: [] }),
-        path, title: editTitle, content: editContent, tags: parsedTags, reason: shared ? editReason.trim() : undefined,
+        path, title, content, tags: parsedTags, reason: shared ? editReason.trim() : undefined,
         updated_at: Math.floor(Date.now() / 1000),
       }))
       setView('doc')
@@ -987,7 +992,7 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
             ref={textareaRef}
             value={content}
             onChange={e => onContent(e.target.value)}
-            placeholder={"# Title\n\nWrite your document in Markdown…"}
+            placeholder={"Write your document in Markdown…\n\nThe title field above is the heading; start with ## sections."}
             className="w-full h-full p-6 text-sm text-ink font-mono resize-none focus:outline-none"
             style={{ background: 'var(--bg)', lineHeight: '1.7', caretColor: 'var(--primary)' }}
           />

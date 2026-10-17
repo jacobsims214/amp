@@ -14,6 +14,7 @@ import { useBoardData } from '../hooks/useBoardData'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { PeoplePanel } from '../components/PeoplePanel'
 import { peopleRows } from '../lib/standup'
+import { tokens, usd } from '../lib/usage'
 import { activityActor } from '../lib/people'
 import { ProjectNav } from '../components/ProjectNav'
 import { Panel, Readouts } from '../components/ui/PageHeader'
@@ -42,7 +43,7 @@ function GroupTable({ rows, first, label }: { rows: ReportGroup[]; first: string
   return (
     <table className="w-full border-collapse text-[13px]">
       <thead><tr className="bg-surface-2">
-        {[first, 'Tickets', 'Done', 'In progress', 'Questions', 'Complete', 'Median time', 'Mix'].map((h, i) => (
+        {[first, 'Tickets', 'Done', 'In progress', 'Questions', 'Complete', 'Median time', 'Tokens', 'Cost', 'Mix'].map((h, i) => (
           <th key={h} className={`amp-label px-3 py-2.5 border-b border-line whitespace-nowrap ${i ? 'text-right' : 'text-left'}`}>{h}</th>))}
       </tr></thead>
       <tbody>
@@ -55,6 +56,8 @@ function GroupTable({ rows, first, label }: { rows: ReportGroup[]; first: string
             <td className="px-3 border-b border-line amp-num text-right" style={g.states.flagged ? { color: 'var(--danger-ink)' } : undefined}>{g.states.flagged}</td>
             <td className="px-3 border-b border-line amp-num text-right">{g.tickets ? Math.round(g.states.done / g.tickets * 100) : 0}%</td>
             <td className="px-3 border-b border-line amp-num text-right">{hours(g.median_cycle_hours)}</td>
+            <td className="px-3 border-b border-line amp-num text-right" title={g.usage ? `${g.usage.input_tokens} in · ${g.usage.output_tokens} out · ${g.usage.runs} runs` : undefined}>{g.usage ? tokens(g.usage.input_tokens + g.usage.output_tokens) : '—'}</td>
+            <td className="px-3 border-b border-line amp-num text-right">{g.usage?.cost_usd ? usd(g.usage.cost_usd) : '—'}</td>
             <td className="px-3 border-b border-line w-[150px]"><StateBar counts={asCounts(g.states)} /></td>
           </tr>
         ))}
@@ -125,12 +128,15 @@ export function Report() {
       `${report.completed} done, ${report.dispatched} started, ${report.created} created. Median time to done ${hours(report.median_cycle_hours)}.`, '',
       '## Standup', '', '| Person | Done | Now | Waiting on them | Ready next |', '|---|---:|---|---|---:|',
       ...peopleRows(tasks, activity, people, since).map(r => `| ${r.name} | ${r.done.length} | ${r.flying.map(t => `#${t.id} ${t.name}`).join('; ') || '—'} | ${r.questions.map(t => `#${t.id} ${t.block_reason}`).join('; ') || '—'} | ${r.ready} |`), '',
+      '## Token spend', '', `${tokens((report.usage?.input_tokens ?? 0) + (report.usage?.output_tokens ?? 0))} tokens, ${usd(report.usage?.cost_usd ?? 0)} over ${report.usage?.runs ?? 0} runs.`, '',
+      '| Model | Runs | Input | Output | Cost |', '|---|---:|---:|---:|---:|',
+      ...(report.usage_by_model ?? []).map(m => `| ${m.model} | ${m.runs} | ${m.input_tokens} | ${m.output_tokens} | ${m.cost_usd.toFixed(4)} |`), '',
       '## Agents', '', '| Agent | Done | Median |', '|---|---:|---:|',
       ...report.agents.map(a => `| ${a.key} | ${a.completed_in_range} | ${hours(a.median_cycle_hours)} |`), '',
       '## Epics', '', '| Epic | Done | Tickets |', '|---|---:|---:|',
       ...report.epics.map(e => `| ${e.label} | ${e.states.done} | ${e.tickets} |`), '',
-      ...(report.breakdown ? [`## By ${report.group_by}`, '', '| Value | Tickets | Done | Questions |', '|---|---:|---:|---:|',
-        ...report.breakdown.map(g => `| ${g.key} | ${g.tickets} | ${g.states.done} | ${g.states.flagged} |`), ''] : []),
+      ...(report.breakdown ? [`## By ${report.group_by}`, '', '| Value | Tickets | Done | Questions | Input tokens | Output tokens | Cost |', '|---|---:|---:|---:|---:|---:|---:|',
+        ...report.breakdown.map(g => `| ${g.key} | ${g.tickets} | ${g.states.done} | ${g.states.flagged} | ${g.usage?.input_tokens ?? 0} | ${g.usage?.output_tokens ?? 0} | ${(g.usage?.cost_usd ?? 0).toFixed(4)} |`), ''] : []),
       '## Completed', '', ...completed.map(t => `- #${t.id} ${t.name}${t.agent_id ? ` (${t.agent_id})` : ''}`),
     ]
     const url = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/markdown' }))
@@ -161,11 +167,38 @@ export function Report() {
             { label: 'Created', value: report.created, sub: 'new tickets' },
             { label: 'Median time', value: hours(report.median_cycle_hours), sub: 'dispatch → done' },
             { label: 'Waiting on answers', value: hours(report.flag_hours), sub: `${report.states.flagged} open question${report.states.flagged === 1 ? '' : 's'}`, color: report.states.flagged ? 'var(--danger-ink)' : undefined },
+            { label: 'Tokens', value: tokens((report.usage?.input_tokens ?? 0) + (report.usage?.output_tokens ?? 0)),
+              sub: report.usage?.runs ? `${usd(report.usage.cost_usd)} · ${report.usage.runs} runs${report.usage.unreported ? `, ${report.usage.unreported} unreported` : ''}` : 'no runs reported' },
             { label: 'Plan', value: <>{report.states.done}<span className="text-[13px] text-ink-3">/{report.tickets}</span></>, sub: report.tickets ? `${Math.round(report.states.done / report.tickets * 100)}% done` : 'no tickets' },
           ]} />
 
           <PeoplePanel tasks={tasks} activity={activity} people={people} since={since} rangeLabel={RANGE_LABELS[range]}
+            usageByPerson={new Map((report.people ?? []).map(g => [g.key, g.usage]))}
             onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
+
+          <Panel label="Spend" title="Tokens by model" right={<span>runs recorded in {RANGE_LABELS[range].toLowerCase()}</span>}>
+            {!report.usage_by_model?.length ? (
+              <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No runs recorded yet. Agents report their model and token usage when they complete or stop a ticket; harnesses that can't tell them their usage still report the model.</p>
+            ) : (
+              <table className="w-full border-collapse text-[13px]">
+                <thead><tr className="bg-surface-2">
+                  {['Model', 'Runs', 'Input', 'Output', 'Cache read', 'Cost'].map((h, i) => <th key={h} className={`amp-label px-3 py-2.5 border-b border-line ${i ? 'text-right' : 'text-left'}`}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {report.usage_by_model.map(m => (
+                    <tr key={m.model}>
+                      <td className="px-3 h-[38px] border-b border-line amp-num">{m.model}</td>
+                      <td className="px-3 border-b border-line amp-num text-right">{m.runs}{m.unreported ? <span className="text-ink-3"> ({m.unreported} no usage)</span> : ''}</td>
+                      <td className="px-3 border-b border-line amp-num text-right">{tokens(m.input_tokens)}</td>
+                      <td className="px-3 border-b border-line amp-num text-right">{tokens(m.output_tokens)}</td>
+                      <td className="px-3 border-b border-line amp-num text-right">{tokens(m.cache_read_tokens)}</td>
+                      <td className="px-3 border-b border-line amp-num text-right">{m.cost_usd ? usd(m.cost_usd) : '—'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </Panel>
 
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
             <Panel label="Velocity" title="Done per day" right={<span>{perDay.length} days</span>}>

@@ -107,6 +107,8 @@ export interface PlanIssue {
   message: string
   task_ids?: number[]
   fix?: string
+  /** 'warn' for advice that doesn't make the plan NO-GO */
+  severity?: 'warn'
 }
 
 export interface PlanReport {
@@ -595,6 +597,63 @@ export interface ReportGroup {
   states: ReportStates
   completed_in_range: number
   median_cycle_hours?: number
+  /** token spend of runs recorded in range on this group's tickets */
+  usage?: Usage
+}
+
+/** Token spend totalled over runs. */
+export interface Usage {
+  runs: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cost_usd: number
+  /** runs that reported no token counts */
+  unreported: number
+  models?: string[]
+}
+
+/** One agent run on a ticket: what it used, and where its work went. */
+export interface Run {
+  id: number
+  task_id: number
+  project_id: number
+  user_id?: number
+  agent_id?: string
+  outcome: 'completed' | 'blocked' | 'progress' | 'abandoned'
+  model?: string
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cost_usd?: number
+  branch?: string
+  commit?: string
+  pr_url?: string
+  pushed?: boolean
+  note?: string
+  created_at: string
+}
+
+/** A ticket a commit, branch, or PR leads back to. */
+export interface TraceHit {
+  ref: string
+  task: Task
+  project: string
+  runs: Run[]
+}
+
+/** A ticket in a project's trash. */
+export interface DeletedTask {
+  task_id: number
+  project_id: number
+  epic_id: number
+  story_id: number
+  name: string
+  deleted_by?: number
+  deleted_at: string
+  story_exists: boolean
 }
 
 export interface ProjectReport {
@@ -612,4 +671,8 @@ export interface ProjectReport {
   metadata_keys: { key: string; coverage: number }[]
   group_by?: string
   breakdown?: ReportGroup[]
+  /** by owner (key: user id, "" unowned) */
+  people?: ReportGroup[]
+  usage?: Usage
+  usage_by_model?: (Usage & { model: string })[]
 }

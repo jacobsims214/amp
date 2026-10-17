@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { Archive, BookOpen, Building2, Loader2, Lock, RotateCcw, Save, Users } from 'lucide-react'
 import { api } from '../api/client'
+import { TrashPanel } from '../components/TrashPanel'
 import { ProjectNav } from '../components/ProjectNav'
 import { TeamAccessPanel } from '../components/TeamAccessModal'
 import { MetadataEditor } from '../components/MetadataEditor'
@@ -103,7 +104,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Metadata', 'Team access', 'Knowledge bases', ...(canManage ? ['Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -212,6 +213,11 @@ export function ProjectSettings() {
                     )
                   })}
                 </div>
+              </Section>
+
+              <Section title="Trash"
+                description="Tickets deleted in the last 30 days. Restoring brings back their text, owner, state, comments, history, and dependency links.">
+                <TrashPanel projectId={pid} />
               </Section>
 
               {canManage && (

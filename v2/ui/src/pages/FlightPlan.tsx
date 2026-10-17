@@ -69,6 +69,7 @@ const ISSUE_TITLE: Record<string, string> = {
   wide_start: 'Start width',
   empty_stories: 'Every story has tickets',
   no_context: 'Context in the KB',
+  coupled_gate: "People's work kept apart",
 }
 
 function Chip({ t, state, crit, lit, sel, dim, onClick }: {
@@ -151,7 +152,7 @@ export function FlightPlan() {
     return (
       <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0">
         <span className="text-[13px] text-ink">{ISSUE_TITLE[kind]}</span>
-        <Verdict ok={!issue} />
+        <Verdict ok={!issue} warn={issue?.severity === 'warn'} />
         <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{issue ? issue.message : okDetail}</span>
         {issue?.task_ids && issue.task_ids.length > 0 && (
           <span className="col-span-2 flex flex-wrap gap-1">
@@ -274,6 +275,7 @@ export function FlightPlan() {
                 {pollRow('wide_start', `${report.ready_now.length} of ${report.open_tasks} open tickets can start now.`)}
                 {pollRow('empty_stories', 'Every story has at least one ticket.')}
                 {pollRow('no_context', 'The project KB explains what this is and why the plan looks like this.')}
+                {pollRow('coupled_gate', "No single ticket makes one person's next work wait on another's.")}
                 <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line">
                   <span className="text-[13px] text-ink">No stuck tickets</span><Verdict ok />
                   <span className="col-span-2 text-[11.5px] text-ink-2">{report.repaired_task_ids?.length
@@ -330,11 +332,13 @@ function Approval({ report, onApprove, approving, error, onFocus }: {
   )
 }
 
-function Verdict({ ok }: { ok: boolean }) {
+function Verdict({ ok, warn }: { ok: boolean; warn?: boolean }) {
+  const style = ok ? { border: '1px solid var(--success)', color: 'var(--success-ink)' }
+    : warn ? { border: '1px solid var(--warning)', color: 'var(--warning-ink)' }
+      : { background: 'var(--st-flag)', color: '#fff' }
   return (
-    <span className="font-label text-[10.5px] font-bold tracking-[0.16em] px-1.5 py-1 self-start leading-none"
-      style={ok ? { border: '1px solid var(--success)', color: 'var(--success-ink)' } : { background: 'var(--st-flag)', color: '#fff' }}>
-      {ok ? 'GO' : 'NO-GO'}
+    <span className="font-label text-[10.5px] font-bold tracking-[0.16em] px-1.5 py-1 self-start leading-none" style={style}>
+      {ok ? 'GO' : warn ? 'WARN' : 'NO-GO'}
     </span>
   )
 }

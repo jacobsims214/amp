@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, KeyRound, LayoutGrid, Settings, ShieldCheck,
+  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, KeyRound, LayoutGrid, Settings, ShieldCheck,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -49,6 +49,9 @@ export function AppShell() {
   }, [location.pathname])
 
   const orgAdmin = (me?.orgs ?? []).some(o => o.my_role === 'owner' || o.my_role === 'admin')
+  // The role people know themselves by: org owner or admin, else member.
+  const orgRole = (me?.orgs ?? []).find(o => o.my_role === 'owner') ?? (me?.orgs ?? []).find(o => o.my_role === 'admin')
+  const orgRoleLabel = orgRole ? `${orgRole.my_role}, ${orgRole.name}` : 'member'
   const current = projects.find(p => String(p.id) === currentId)
   const others = projects.filter(p => String(p.id) !== currentId).slice(0, 8)
 
@@ -69,6 +72,7 @@ export function AppShell() {
           <NavLink to="/projects" className={navCls}><FolderKanban size={14} />Projects
             <span className="ml-auto amp-num text-[11px] text-ink-3">{projects.length || ''}</span></NavLink>
           <NavLink to="/reports" className={navCls}><CalendarDays size={14} />Day reports</NavLink>
+          <NavLink to="/trace" className={navCls}><GitCommitHorizontal size={14} />Trace</NavLink>
           {me?.user_id != null && <NavLink to="/access" className={navCls}><KeyRound size={14} />Agents & tokens</NavLink>}
 
           {current && (
@@ -119,7 +123,7 @@ export function AppShell() {
             <Avatar name={me.name || me.email} kind={me.kind} />
             <div className="min-w-0">
               <div className="text-[13px] text-ink truncate">{me.name || me.email}</div>
-              <div className="amp-num text-[10.5px] text-ink-3 truncate">{isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : 'member'} · {me.email}</div>
+              <div className="amp-num text-[10.5px] text-ink-3 truncate">{isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : orgRoleLabel} · {me.email}</div>
             </div>
           </div>
         )}

@@ -12,6 +12,7 @@ import { DayReports } from './pages/DayReports'
 import { Users } from './pages/Users'
 import { Orgs } from './pages/Orgs'
 import { Access } from './pages/Access'
+import { Trace } from './pages/Trace'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 
@@ -52,6 +53,7 @@ export default function App() {
             <Route path="/admin/users" element={<Users />} />
             <Route path="/admin/orgs" element={<Orgs />} />
             <Route path="/access" element={<Access />} />
+            <Route path="/trace" element={<Trace />} />
             <Route path="/project/:projectId/*" element={<ProjectFallback />} />
             <Route path="*" element={<NotFound />} />
           </Route>

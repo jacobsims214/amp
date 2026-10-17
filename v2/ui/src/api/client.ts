@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery,
+  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask,
 } from '../types'
 
 const BASE = '/api'
@@ -183,6 +183,18 @@ export const api = {
     post<Comment>(`/tasks/${taskId}/comments`, { body, author }),
 
   // History
+  taskRuns: (taskId: number) => get<{ runs: Run[] | null; usage: Usage }>(`/tasks/${taskId}/runs`).then(r => ({ runs: r.runs ?? [], usage: r.usage })),
+  trace: (q: { commit?: string; branch?: string; pr?: string }) => {
+    const p = new URLSearchParams()
+    if (q.commit) p.set('commit', q.commit)
+    if (q.branch) p.set('branch', q.branch)
+    if (q.pr) p.set('pr', q.pr)
+    return get<{ tickets: TraceHit[] | null }>(`/trace?${p}`).then(r => r.tickets ?? [])
+  },
+  projectTrash: (projectId: number) =>
+    get<{ deleted: DeletedTask[] | null }>(`/projects/${projectId}/trash`).then(r => r.deleted ?? []),
+  restoreTasks: (projectId: number, taskIds: number[]) =>
+    post<{ results: { task_id: number; restored: boolean; error?: string }[] }>(`/projects/${projectId}/trash/restore`, { task_ids: taskIds }),
   getHistory: (taskId: number) =>
     get<{ history: ActivityLog[]; count: number }>(`/tasks/${taskId}/history`).then(r => r.history ?? []),
 

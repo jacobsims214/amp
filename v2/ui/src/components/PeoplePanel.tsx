@@ -3,7 +3,8 @@ import { Panel } from './ui/PageHeader'
 import { Avatar } from './ui/Avatar'
 import { peopleRows } from '../lib/standup'
 import type { Person } from '../lib/people'
-import type { ActivityLog, Task } from '../types'
+import type { ActivityLog, Task, Usage } from '../types'
+import { tokens, usd } from '../lib/usage'
 
 function ago(ms: number): string {
   if (!ms) return '—'
@@ -11,8 +12,10 @@ function ago(ms: number): string {
   return m < 60 ? `${m}m ago` : m < 48 * 60 ? `${Math.round(m / 60)}h ago` : `${Math.round(m / 1440)}d ago`
 }
 
-export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen }: {
+export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen, usageByPerson }: {
   tasks: Task[]; activity: ActivityLog[]; people: Map<number, Person>; since: string; rangeLabel: string; onOpen?: (id: number) => void
+  /** token spend per owner (key: user id as a string), from the project report */
+  usageByPerson?: Map<string, Usage | undefined>
 }) {
   const rows = useMemo(() => peopleRows(tasks, activity, people, since), [tasks, activity, people, since])
   const link = (t: Task) => onOpen
@@ -24,7 +27,7 @@ export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen
         <div className="overflow-x-auto">
           <table className="w-full border-collapse text-[13px]">
             <thead><tr className="bg-surface-2">
-              {['Person', 'Done', 'Now', 'Waiting on them', 'Ready next', 'Last activity'].map(h =>
+              {['Person', 'Done', 'Now', 'Waiting on them', 'Ready next', 'Tokens', 'Last activity'].map(h =>
                 <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
             </tr></thead>
             <tbody>
@@ -42,6 +45,10 @@ export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen
                     {r.questions.length ? r.questions.slice(0, 3).map(link) : <span className="text-ink-3">—</span>}
                   </td>
                   <td className="px-3 py-2.5 border-b border-line amp-num whitespace-nowrap">{r.ready}{r.waiting > 0 && <span className="text-ink-3"> · {r.waiting} waiting</span>}</td>
+                  <td className="px-3 py-2.5 border-b border-line amp-num whitespace-nowrap">{(() => {
+                    const u = usageByPerson?.get(r.id == null ? '' : String(r.id))
+                    return u ? <span title={`${u.runs} runs · ${usd(u.cost_usd)}`}>{tokens(u.input_tokens + u.output_tokens)}</span> : <span className="text-ink-3">—</span>
+                  })()}</td>
                   <td className="px-3 py-2.5 border-b border-line amp-num text-ink-3 whitespace-nowrap">{ago(r.lastAt)}</td>
                 </tr>
               ))}

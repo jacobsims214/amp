@@ -9,6 +9,7 @@ const ISSUE_TITLE: Record<string, string> = {
   wide_start: 'Too much can start at once',
   empty_stories: 'Empty stories',
   no_context: 'No project context in the KB',
+  coupled_gate: "One ticket joins different people's work",
 }
 
 // The plan check: AMP runs the dependency graph, so before dispatching it's
