@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	protoactor "github.com/asynkron/protoactor-go/actor"
 
@@ -464,5 +465,30 @@ func TestPlan_ClearFields(t *testing.T) {
 	s.call(t, "amp_update_story", map[string]interface{}{"story_id": float64(s.storyID), "clear": []interface{}{"acceptance_criteria"}})
 	if st, _ := s.repo.GetStory(context.Background(), s.storyID); st.AcceptanceCriteria != "" || st.Name != "default-story" {
 		t.Errorf("story = %+v", st)
+	}
+}
+
+// Bug: amp_set_task_start_at never answered — no actor above the ticket
+// passed the message on — so scheduling an existing ticket hung forever.
+func TestPlan_ScheduleExistingTicket(t *testing.T) {
+	s := setupMCP(t)
+	id := mkIn(t, s, s.storyID, "later")
+	at := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.call(t, "amp_set_task_start_at", map[string]interface{}{"task_id": float64(id), "start_at": at})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("amp_set_task_start_at never answered")
+	}
+	if st := stateOf(t, s, id); st != "blocked" {
+		t.Fatalf("scheduled ticket: %s", st)
+	}
+	s.call(t, "amp_set_task_start_at", map[string]interface{}{"task_id": float64(id)})
+	if st := stateOf(t, s, id); st != "backlog" {
+		t.Fatalf("after clearing the schedule: %s", st)
 	}
 }
