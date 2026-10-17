@@ -211,7 +211,7 @@ export function Report() {
               {report.agents.length === 0 ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No agent has worked a ticket here yet.</p> : (
                 <table className="w-full border-collapse text-[13px]">
                   <thead><tr className="bg-surface-2">
-                    {['Agent', 'Done', '', 'Median', 'Active', 'Questions'].map((h, i) => <th key={i} className={`amp-label px-3 py-2.5 border-b border-line ${i && i !== 2 ? 'text-right' : 'text-left'}`}>{h}</th>)}
+                    {['Agent', 'Done', '', 'Median', 'Active', 'Questions', 'Tokens / done'].map((h, i) => <th key={i} className={`amp-label px-3 py-2.5 border-b border-line ${i && i !== 2 ? 'text-right' : 'text-left'}`}>{h}</th>)}
                   </tr></thead>
                   <tbody>
                     {report.agents.map(a => {
@@ -224,6 +224,8 @@ export function Report() {
                           <td className="px-3 border-b border-line amp-num text-right">{hours(a.median_cycle_hours)}</td>
                           <td className="px-3 border-b border-line amp-num text-right">{a.states.in_progress}</td>
                           <td className="px-3 border-b border-line amp-num text-right" style={a.states.flagged ? { color: 'var(--danger-ink)' } : undefined}>{a.states.flagged}</td>
+                          <td className="px-3 border-b border-line amp-num text-right" title={a.usage ? `${a.usage.runs} runs · ${usd(a.usage.cost_usd)}` : 'no usage reported'}>
+                            {a.usage && a.completed_in_range ? tokens(Math.round((a.usage.input_tokens + a.usage.output_tokens) / a.completed_in_range)) : '—'}</td>
                         </tr>
                       )
                     })}
