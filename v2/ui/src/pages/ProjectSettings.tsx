@@ -13,6 +13,7 @@ import { WebhooksPanel } from '../components/WebhooksPanel'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 const slug = (t: string) => t.toLowerCase().replace(/[^a-z]+/g, '-')
 
@@ -117,7 +118,7 @@ export function ProjectSettings() {
           {error && <p className="m-0 amp-panel px-4 py-3 text-[12.5px] text-danger-ink">{error}</p>}
 
           {!project ? (
-            <div className="flex justify-center py-10"><Loader2 size={18} className="text-primary animate-spin" /></div>
+            <div className="flex justify-center py-10"><BandLoader label="Loading settings" /></div>
           ) : (
             <>
               <Section title="General">

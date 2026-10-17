@@ -25,6 +25,7 @@ import { countStates, displayState, QUIET_MS, silentFor, STATE_LABEL, STATE_VAR,
 import { activityActor, lookupPerson } from '../lib/people'
 import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
 import { MergeQueue } from '../components/MergeQueue'
+import { BandLoader } from '../components/brand/BandLoader'
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -234,7 +235,7 @@ export function Mission() {
   const ownersOf = (ids?: number[]) => (ids ?? []).map(id => lookupPerson(people, id)?.name).filter(Boolean).join(', ')
 
   if (loading && !tasks.length) {
-    return <div className="flex items-center justify-center h-full"><Loader2 size={20} className="animate-spin text-ink-3" /></div>
+    return <div className="flex items-center justify-center h-full"><BandLoader label="Loading mission" /></div>
   }
 
   // Agents are profiles in each person's harness, so count the people they work for.

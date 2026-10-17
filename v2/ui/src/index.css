@@ -194,6 +194,47 @@ body {
 .amp-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
 .amp-panel-top { box-shadow: inset 0 3px 0 var(--ink); }
 
+/* ---- Launch flavor (see components/brand) ----
+   The bands relight bottom to top, like rocket stages. */
+.amp-mark { display: grid; gap: 2px; width: 18px; }
+.amp-mark i { display: block; height: 3px; transform-origin: left center; }
+.amp-mark.amp-ignite i { animation: amp-ignite 360ms cubic-bezier(.2,.8,.2,1) both; }
+.amp-mark.amp-ignite i:nth-child(4) { animation-delay: 0ms; }
+.amp-mark.amp-ignite i:nth-child(3) { animation-delay: 70ms; }
+.amp-mark.amp-ignite i:nth-child(2) { animation-delay: 140ms; }
+.amp-mark.amp-ignite i:nth-child(1) { animation-delay: 210ms; }
+.amp-wordmark.amp-ignite { animation: amp-lock 500ms 120ms cubic-bezier(.2,.8,.2,1) both; }
+@keyframes amp-ignite { from { transform: scaleX(0); filter: brightness(1.8); } to { transform: scaleX(1); filter: none; } }
+@keyframes amp-lock { from { letter-spacing: .42em; opacity: 0; } to { letter-spacing: .16em; opacity: 1; } }
+
+/* Countdown loader: the bands light in launch order, blue to red. */
+.amp-band-loader { display: grid; justify-items: center; gap: 10px; }
+.amp-band-loader-seg { display: flex; gap: 4px; }
+.amp-band-loader-seg i { width: 26px; height: 5px; display: block; background: var(--line-sub); animation: amp-lamp 1.6s infinite steps(1); }
+.amp-band-loader-seg i:nth-child(1) { --lamp: var(--band-4); animation-delay: 0ms; }
+.amp-band-loader-seg i:nth-child(2) { --lamp: var(--band-3); animation-delay: 200ms; }
+.amp-band-loader-seg i:nth-child(3) { --lamp: var(--band-2); animation-delay: 400ms; }
+.amp-band-loader-seg i:nth-child(4) { --lamp: var(--band-1); animation-delay: 600ms; }
+@keyframes amp-lamp { 0% { background: var(--lamp); } 62% { background: var(--line-sub); } }
+.amp-band-loader-cap { font-family: var(--font-data); font-size: 11px; color: var(--ink-3); letter-spacing: .04em; }
+
+/* GO stamp: a passing plan check stamps in and the bands draw under it. */
+.amp-go-stamp { position: relative; animation: amp-stamp 420ms cubic-bezier(.2,1.4,.4,1) both; }
+.amp-go-stamp::after { content: ""; position: absolute; left: -1px; right: -1px; bottom: -5px; height: 2px;
+  background: linear-gradient(90deg, var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%);
+  transform-origin: left; animation: amp-wipe 400ms cubic-bezier(.2,.8,.2,1) both;
+  animation-delay: calc(var(--amp-stamp-delay, 0ms) + 280ms); }
+@keyframes amp-stamp { from { transform: scale(1.7) rotate(-6deg); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes amp-wipe { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+
+/* Launch overlay */
+/* Hold the in-app animations while the launch is up, so they play as it lifts. */
+.amp-launching .amp-ignite, .amp-launching .amp-ignite i, .amp-launching .amp-go-stamp, .amp-launching .amp-go-stamp::after { animation-play-state: paused; }
+.amp-launch { position: fixed; inset: 0; z-index: 100; background: #060A0C; cursor: pointer; transition: opacity 280ms ease; }
+.amp-launch canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+.amp-launch.amp-launch-out { opacity: 0; pointer-events: none; }
+.amp-launch-skip { position: absolute; right: 18px; bottom: 14px; font-family: var(--font-data); font-size: 11px; color: #5E6876; }
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }

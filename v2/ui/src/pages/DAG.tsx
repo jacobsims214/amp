@@ -18,7 +18,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import {
-  ChevronDown, ChevronRight, Clock, Crosshair, ExternalLink, EyeOff, Eye, Layers, Loader2, Search, User, X,
+  ChevronDown, ChevronRight, Clock, Crosshair, ExternalLink, EyeOff, Eye, Layers, Search, User, X,
 } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
@@ -29,6 +29,7 @@ import {
   buildGraph, chainOf, countStates, ticketNodeId, STORY_H, STORY_W, TICKET_H, TICKET_W, type StateCounts,
 } from '../lib/dagModel'
 import type { ActivityLog, Epic, Story, Task } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 // ─── Colours ──────────────────────────────────────────────────────────────────
 const STATE_C = {
@@ -388,7 +389,7 @@ function DAGCanvas() {
       <div className="flex flex-1 overflow-hidden">
         <div className="flex-1 relative">
           {loading && tasks.length === 0 ? (
-            <div className="flex items-center justify-center h-full"><Loader2 size={20} className="text-primary animate-spin" /></div>
+            <div className="flex items-center justify-center h-full"><BandLoader label="Loading the graph" /></div>
           ) : error ? (
             <div className="flex items-center justify-center h-full text-sm text-danger-ink">{error}</div>
           ) : tasks.length === 0 ? (

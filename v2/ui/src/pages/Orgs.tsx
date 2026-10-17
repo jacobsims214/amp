@@ -10,6 +10,7 @@ import { AuditLogPanel } from '../components/AuditLogPanel'
 import { WebhooksPanel } from '../components/WebhooksPanel'
 import { personName } from '../lib/people'
 import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 // Orgs → Teams → Users administration. Controls are hidden or disabled based
 // on the caller's org role (my_role) and global admin status, but the API
@@ -102,7 +103,7 @@ export function Orgs() {
   if (authLoading) {
     return (
       <div className="min-h-full flex items-center justify-center" style={{ background: 'var(--bg)' }}>
-        <Loader2 size={22} className="text-primary animate-spin" />
+        <BandLoader label="Loading teams and orgs" />
       </div>
     )
   }

@@ -8,12 +8,13 @@
  */
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
-import { Building2, Download, Loader2 } from 'lucide-react'
+import { Building2, Download } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { PageHeader, Panel, Readouts } from '../components/ui/PageHeader'
 import { tokens, usd } from '../lib/usage'
 import type { Portfolio as PortfolioData, PortfolioRow, Usage } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 const RANGES = { '7d': 7, '30d': 30, '90d': 90, '365d': 365 } as const
 type Range = keyof typeof RANGES
@@ -104,7 +105,7 @@ export function Portfolio() {
         )}
         {org == null && <div className="amp-panel px-4 py-4 text-[13px] text-ink-2">You're not in an organization yet.</div>}
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {org != null && !pf && !error && <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-3" /></div>}
+        {org != null && !pf && !error && <div className="flex justify-center py-16"><BandLoader label="Loading the portfolio" /></div>}
         {pf && <>
           <Readouts items={[
             { label: 'Projects', value: pf.projects.length, sub: `${pf.total.tickets} tickets` },

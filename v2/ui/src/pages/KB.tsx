@@ -10,6 +10,7 @@ import { api } from '../api/client'
 import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
 import type { KBDoc, KBDocSummary, KBInfo, KBRef, KBScope, KBSearchResult, KBSource, KBTagCount } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 // What each kind of KB is for; shown on team and org KB pages and in the editor.
 const SCOPE_PURPOSE: Record<KBScope, string> = {
@@ -575,7 +576,7 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
 }) {
   if (loading) return (
     <div className="flex justify-center py-20">
-      <Loader2 size={20} className="text-primary animate-spin" />
+      <BandLoader label="Loading the library" />
     </div>
   )
 
