@@ -160,6 +160,31 @@ the conflict check can't do its job.]
 
 ---
 
+## Research task sizing — the same rule applies to fetch/synthesis, not just code
+
+The "one thing per task" discipline above is usually described in terms of code tickets, but it
+applies just as hard to research dispatches — and it's easier to violate by accident, because a
+research question doesn't have an obvious file/line boundary the way a code change does.
+
+**Never bundle "fetch N sources" + "read M local files" + "write a long synthesized report" into
+one research task.** This was tested empirically and failed identically three times in a row
+across two different models: the worker gathers all the data, says something like "now let me
+write the report," and returns empty — the step/context budget spent gathering data leaves
+nothing for the write-up, and this is not a capability-tier problem, a stronger model failed the
+exact same way.
+
+**Split it instead:**
+- One task per source (or a small batch) that does nothing but fetch and relay raw content —
+  no analysis, no scoring, no opinions, explicitly say so in the ticket so the worker doesn't
+  drift into synthesizing anyway.
+- Do the actual synthesis yourself (the manager), or in a separate task that only reads
+  already-fetched material (never re-fetches), once all the raw material is in hand.
+
+If a research question turns out to need more than 2-3 fetches plus a handful of file reads to
+answer, that's the same signal as an oversized code ticket — split it, don't just hope a bigger
+model powers through it.
+
+
 ## Waves and dependencies — build in phases
 
 Work flows in waves. Each wave unblocks the next. Think in phases before creating tasks:
@@ -500,6 +525,11 @@ task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's as
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
 After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+
+A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
+`questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the
+ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
+Questions don't stop the loop: keep dispatching everything else.
 
 If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 
