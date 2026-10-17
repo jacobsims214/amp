@@ -130,6 +130,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
+	mux.HandleFunc("/api/my-work", h.myWork)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 }
 
