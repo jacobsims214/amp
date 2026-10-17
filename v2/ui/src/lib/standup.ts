@@ -11,6 +11,8 @@ export interface PersonRow {
   ready: number
   /** open tickets waiting on dependencies or a scheduled start */
   waiting: number
+  /** other people whose unfinished tickets this person's waiting tickets depend on: owner id → those ticket ids */
+  blockedBy: Map<number | null, number[]>
   lastAt: number
 }
 
@@ -25,7 +27,7 @@ export function peopleRows(tasks: Task[], activity: ActivityLog[], people: Map<n
   const row = (id: number | null) => {
     let r = rows.get(id)
     if (!r) {
-      r = { id, name: id == null ? 'Unowned' : lookupPerson(people, id)!.name, done: [], flying: [], questions: [], ready: 0, waiting: 0, lastAt: 0 }
+      r = { id, name: id == null ? 'Unowned' : lookupPerson(people, id)!.name, done: [], flying: [], questions: [], ready: 0, waiting: 0, blockedBy: new Map(), lastAt: 0 }
       rows.set(id, r)
     }
     return r
@@ -40,6 +42,19 @@ export function peopleRows(tasks: Task[], activity: ActivityLog[], people: Map<n
     else if (st === 'wait' || st === 'sched') row(owner).waiting++
   }
   const ownerOf = new Map(tasks.map(t => [t.id, t.owner_user_id ?? null]))
+  // Who each person is waiting on: the owners of the unfinished tickets their waiting tickets depend on.
+  for (const t of tasks) {
+    if (displayState(t) !== 'wait') continue
+    const me = t.owner_user_id ?? null
+    for (const d of t.blocked_by_ids ?? []) {
+      const other = ownerOf.get(d) ?? null
+      if (other === me) continue
+      const r = row(me)
+      const list = r.blockedBy.get(other) ?? []
+      if (!list.includes(d)) list.push(d)
+      r.blockedBy.set(other, list)
+    }
+  }
   for (const a of activity) {
     const id = a.actor_user_id ?? ownerOf.get(a.task_id) ?? null
     const r = rows.get(id)

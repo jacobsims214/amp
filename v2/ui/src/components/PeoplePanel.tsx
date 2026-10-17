@@ -2,7 +2,7 @@ import { useMemo } from 'react'
 import { Panel } from './ui/PageHeader'
 import { Avatar } from './ui/Avatar'
 import { peopleRows } from '../lib/standup'
-import type { Person } from '../lib/people'
+import { lookupPerson, type Person } from '../lib/people'
 import type { ActivityLog, Task, Usage } from '../types'
 import { tokens, usd } from '../lib/usage'
 
@@ -27,7 +27,7 @@ export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen
         <div className="overflow-x-auto">
           <table className="w-full border-collapse text-[13px]">
             <thead><tr className="bg-surface-2">
-              {['Person', 'Done', 'Now', 'Waiting on them', 'Ready next', 'Tokens', 'Last activity'].map(h =>
+              {['Person', 'Done', 'Now', 'Waiting on them', 'Blocked by', 'Ready next', 'Tokens', 'Last activity'].map(h =>
                 <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
             </tr></thead>
             <tbody>
@@ -43,6 +43,12 @@ export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen
                   </td>
                   <td className="px-3 py-2.5 border-b border-line max-w-[260px]" style={r.questions.length ? { color: 'var(--danger-ink)' } : undefined}>
                     {r.questions.length ? r.questions.slice(0, 3).map(link) : <span className="text-ink-3">—</span>}
+                  </td>
+                  <td className="px-3 py-2.5 border-b border-line max-w-[220px] text-ink-2 text-[12.5px]">
+                    {r.blockedBy.size === 0 ? <span className="text-ink-3">—</span> : [...r.blockedBy.entries()].map(([who, ids]) => (
+                      <span key={who ?? 'none'} className="block truncate" title={ids.map(i => `#${i}`).join(', ')}>
+                        {who == null ? 'Unowned' : lookupPerson(people, who)?.name}: {ids.slice(0, 3).map(i => `#${i}`).join(', ')}{ids.length > 3 ? ` +${ids.length - 3}` : ''}
+                      </span>))}
                   </td>
                   <td className="px-3 py-2.5 border-b border-line amp-num whitespace-nowrap">{r.ready}{r.waiting > 0 && <span className="text-ink-3"> · {r.waiting} waiting</span>}</td>
                   <td className="px-3 py-2.5 border-b border-line amp-num whitespace-nowrap">{(() => {
