@@ -143,6 +143,11 @@ merged=true, commit=<merge sha>)`. Tell your user what's waiting to merge at the
 **Mistakes.** Deleted tickets stay in the trash for 30 days: `amp_list_deleted_tasks`,
 `amp_restore_tasks`. Restore rather than re-create.
 
+**If the AMP tools are missing** (no `amp_*` tools, or they fail to connect), stop and tell your
+user: the harness needs restarting so it reconnects to AMP. Don't work around it through the web
+UI's API, other people's tokens, or AMP's source code — you'd be acting outside your user's
+permissions and the audit trail.
+
 **Starting a session (a new day, or after a crash).** Before anything else:
 1. `amp_list_tasks(format="compact")` and look at `quiet`: tickets in progress with no activity for a while. Their
    worker died with an earlier session. Read their comments to see how far it got, put them back
