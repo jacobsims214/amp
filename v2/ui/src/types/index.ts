@@ -562,7 +562,12 @@ export interface CreateProjectRequest {
 // ---- Home page (GET /my-work) ----
 
 /** A ticket with its project, for views that span projects. */
-export type WorkTask = Task & { project_code: string; project_name: string }
+export type WorkTask = Task & {
+  project_code: string
+  project_name: string
+  /** latest activity on the ticket (state change, comment, dispatch) */
+  last_activity_at?: string
+}
 
 export interface MyAgent {
   user: AmpUser

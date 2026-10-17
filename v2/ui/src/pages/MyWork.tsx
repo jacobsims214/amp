@@ -13,7 +13,7 @@ import { PageHeader, Panel, Readouts } from '../components/ui/PageHeader'
 import { StateTag } from '../components/ui/StateTag'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { Avatar } from '../components/ui/Avatar'
-import { displayState, type DisplayState } from '../lib/ticketState'
+import { displayState, QUIET_MS, silentFor, type DisplayState } from '../lib/ticketState'
 import type { DayReport, MyWork as MyWorkData, VelocityDay, WorkTask } from '../types'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
@@ -75,6 +75,8 @@ export function MyWork() {
   // theirs; agent accounts (their own identity) are counted on top.
   const flying = owned.filter(t => t.state === 'in_progress')
   const accountTickets = agents.reduce((n, a) => n + a.working.length, 0)
+  const silent = (t: WorkTask) => silentFor([t.last_activity_at, t.dispatched_at, t.updated_at])
+  const quiet = flying.filter(t => silent(t) > QUIET_MS).length
 
   return (
     <div className="flex flex-col min-h-full">
@@ -87,7 +89,7 @@ export function MyWork() {
         {work && <>
           <Readouts items={[
             { label: 'My open tickets', value: owned.length, sub: `${inProgress} in progress · ${projectsCount} project${projectsCount === 1 ? '' : 's'}` },
-            { label: 'Agents working', value: flying.length + accountTickets, sub: flying.length + accountTickets ? `on my tickets${agents.length ? ` · ${working}/${agents.length} agent accounts` : ''}` : 'nothing running', color: 'var(--st-prog)' },
+            { label: 'Agents working', value: flying.length + accountTickets, sub: quiet ? `${quiet} quiet · may have stalled` : flying.length + accountTickets ? `on my tickets${agents.length ? ` · ${working}/${agents.length} agent accounts` : ''}` : 'nothing running', color: 'var(--st-prog)', alarm: quiet > 0 },
             { label: 'Questions', value: flags.length, sub: flags.length ? 'agents waiting on an answer' : 'nothing needs a person', alarm: flags.length > 0 },
             { label: 'Done in 24h', value: work.done_24h + agents.reduce((a, x) => a + x.done_24h, 0), sub: 'by me and my agents' },
           ]} />
@@ -145,7 +147,9 @@ export function MyWork() {
                   <Link key={t.id} to={ticketLink(t)} className="grid grid-cols-[auto_1fr_auto] gap-x-2.5 gap-y-0.5 items-center px-4 py-2.5 border-t border-line first:border-t-0 hover:bg-surface-2">
                     <Avatar name={t.agent_id || 'agent'} kind="agent" />
                     <span className="text-[12.5px] font-semibold text-ink truncate">{t.agent_id || 'agent'}</span>
-                    <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>
+                    {silent(t) > QUIET_MS
+                      ? <span className="amp-num text-[11px] text-st-flag" title="No activity on this ticket for a while: the agent may have stalled.">quiet {Math.round(silent(t) / 60_000)}m</span>
+                      : <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>}
                     <span className="col-start-2 col-span-2 text-[11.5px] text-ink-2 truncate">#{t.id} {t.name}{projectsCount > 1 ? ` · ${t.project_code}` : ''}</span>
                   </Link>
                 ))}

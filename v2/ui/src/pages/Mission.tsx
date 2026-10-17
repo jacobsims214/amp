@@ -21,12 +21,9 @@ import { Panel, Readouts } from '../components/ui/PageHeader'
 import { StateBar, StateDot } from '../components/ui/StateTag'
 import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
-import { countStates, displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
+import { countStates, displayState, QUIET_MS, silentFor, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import { activityActor, lookupPerson } from '../lib/people'
 import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
-
-/** An in-progress ticket with no activity for this long may have a stalled agent. */
-const QUIET_MS = 15 * 60_000
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -206,7 +203,7 @@ export function Mission() {
     const t = setInterval(loadActivity, 60_000)
     return () => clearInterval(t)
   }, [loadActivity])
-  const quietFor = (t: Task) => now - Math.max(lastSeen.get(t.id) ?? 0, Date.parse(t.dispatched_at ?? '') || 0, Date.parse(t.updated_at) || 0)
+  const quietFor = (t: Task) => silentFor([lastSeen.get(t.id), t.dispatched_at, t.updated_at], now)
 
   const counts = useMemo(() => countStates(tasks), [tasks])
   const dependents = useMemo(() => {

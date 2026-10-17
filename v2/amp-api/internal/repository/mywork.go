@@ -13,11 +13,15 @@ type WorkTask struct {
 	domain.Task
 	ProjectCode string `json:"project_code"`
 	ProjectName string `json:"project_name"`
+	// LastActivityAt is the ticket's latest activity (state change, comment,
+	// dispatch), so a ticket in progress that has gone silent can be spotted.
+	LastActivityAt *time.Time `json:"last_activity_at,omitempty"`
 }
 
 const workCols = taskCols + `,
 	(SELECT code FROM projects p WHERE p.id = tasks.project_id),
-	(SELECT name FROM projects p WHERE p.id = tasks.project_id)`
+	(SELECT name FROM projects p WHERE p.id = tasks.project_id),
+	(SELECT MAX(created_at) FROM activity_log a WHERE a.task_id = tasks.id)`
 
 const activeProject = `project_id IN (SELECT id FROM projects WHERE state <> 'archived')`
 
@@ -34,7 +38,7 @@ func (r *Repo) workTasks(ctx context.Context, where string, args ...any) ([]Work
 		if err := rows.Scan(
 			&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID, &t.Name, &t.Description, &t.AcceptanceCriteria,
 			&t.State, &t.Priority, &t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
-			&t.CreatedBy, &t.OwnerUserID, &t.Metadata, &t.CreatedAt, &t.UpdatedAt, &w.ProjectCode, &w.ProjectName,
+			&t.CreatedBy, &t.OwnerUserID, &t.Metadata, &t.CreatedAt, &t.UpdatedAt, &w.ProjectCode, &w.ProjectName, &w.LastActivityAt,
 		); err != nil {
 			return nil, err
 		}

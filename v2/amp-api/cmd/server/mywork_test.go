@@ -26,6 +26,10 @@ func TestRest_MyWork(t *testing.T) {
 	if f := out["flags"].([]any)[0].(map[string]any); f["project_code"] == "" || f["project_code"] == nil {
 		t.Fatalf("flag without its project: %v", f)
 	}
+	// Each ticket carries its last activity, so a silent one can be spotted.
+	if f := out["flags"].([]any)[0].(map[string]any); f["last_activity_at"] == nil {
+		t.Fatalf("flag without its last activity: %v", f)
+	}
 
 	// Someone outside the project sees neither.
 	out = ra.want(t, 200, "outsider", http.MethodGet, "/api/my-work", nil)

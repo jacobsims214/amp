@@ -54,3 +54,12 @@ export function countStates(tasks: TaskLike[]): Record<DisplayState, number> {
   for (const t of tasks) c[displayState(t)]++
   return c
 }
+
+/** An in-progress ticket with no activity for this long may have a stalled agent. */
+export const QUIET_MS = 15 * 60_000
+
+/** How long since the latest of these times (an in-progress ticket's signs of life). */
+export function silentFor(times: (string | number | null | undefined)[], now = Date.now()): number {
+  const ms = times.map(t => typeof t === 'number' ? t : t ? Date.parse(t) || 0 : 0)
+  return now - Math.max(0, ...ms)
+}
