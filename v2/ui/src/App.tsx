@@ -16,6 +16,7 @@ import { Trace } from './pages/Trace'
 import { Portfolio } from './pages/Portfolio'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
+import { LaunchSequence } from './components/brand/LaunchSequence'
 
 /** An unknown view under a project lands on its Mission page. */
 function ProjectFallback() {
@@ -36,6 +37,7 @@ function NotFound() {
 export default function App() {
   return (
     <AuthProvider>
+      <LaunchSequence />
       <BrowserRouter>
         <Routes>
           <Route element={<AppShell />}>

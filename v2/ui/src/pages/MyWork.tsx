@@ -5,7 +5,6 @@
  */
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { BarChart } from '../components/ui/BarChart'
@@ -15,6 +14,7 @@ import { PriorityMark } from '../components/ui/PriorityMark'
 import { Avatar } from '../components/ui/Avatar'
 import { displayState, QUIET_MS, silentFor, type DisplayState } from '../lib/ticketState'
 import type { DayReport, MyWork as MyWorkData, VelocityDay, WorkTask } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const NEXT_UP: DisplayState[] = ['prog', 'flag', 'ready', 'wait', 'sched', 'done']
@@ -85,7 +85,7 @@ export function MyWork() {
         actions={<><Link to="/projects" className="amp-btn">All projects</Link><Link to="/reports" className="amp-btn amp-btn-primary">Day report</Link></>} />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {!work && !error && <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-3" /></div>}
+        {!work && !error && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
         {work && <>
           <Readouts items={[
             { label: 'My open tickets', value: owned.length, sub: `${inProgress} in progress · ${projectsCount} project${projectsCount === 1 ? '' : 's'}` },

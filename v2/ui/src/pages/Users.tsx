@@ -8,7 +8,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { Loader2, Search, UserPlus } from 'lucide-react'
+import { Search, UserPlus } from 'lucide-react'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { api, authAdminApi } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
@@ -16,6 +16,7 @@ import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { Avatar } from '../components/ui/Avatar'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { AmpUser, APIToken, AuthAdminUser } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 type Filter = 'all' | 'people' | 'agents' | 'off'
 
@@ -81,7 +82,7 @@ export function Users() {
     finally { setBusy(false) }
   }
 
-  if (authLoading) return <div className="flex items-center justify-center h-full"><Loader2 size={20} className="animate-spin text-ink-3" /></div>
+  if (authLoading) return <div className="flex items-center justify-center h-full"><BandLoader /></div>
   if (!isAdmin) {
     return (
       <div className="flex flex-col min-h-full">
@@ -141,7 +142,7 @@ export function Users() {
                   className="flex-1 bg-transparent outline-none text-[13px] text-ink placeholder:text-ink-3" />
               </label>
             </div>
-            {loading ? <div className="flex justify-center py-10"><Loader2 size={18} className="animate-spin text-ink-3" /></div> : (
+            {loading ? <div className="flex justify-center py-10"><BandLoader label="Loading people and agents" /></div> : (
               <table className="w-full border-collapse text-[13px]">
                 <thead><tr className="bg-surface-2">
                   {['Name', 'Kind', 'Role', 'Sign-in', 'Last active', 'Status'].map(h => <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}

@@ -8,7 +8,7 @@
 import { BarChart } from '../components/ui/BarChart'
 import { useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { Download, Loader2 } from 'lucide-react'
+import { Download } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useProjectPeople } from '../hooks/useProjectPeople'
@@ -23,6 +23,7 @@ import { Avatar } from '../components/ui/Avatar'
 import { StateBar } from '../components/ui/StateTag'
 import type { DisplayState } from '../lib/ticketState'
 import type { ActivityLog, ProjectReport, ReportGroup, ReportStates } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 type Range = '1d' | '7d' | '30d' | 'all'
 const RANGE_LABELS: Record<Range, string> = { '1d': '24h', '7d': '7 days', '30d': '30 days', all: 'All time' }
@@ -160,7 +161,7 @@ export function Report() {
       </>} />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        {!report && !error && <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-3" /></div>}
+        {!report && !error && <div className="flex justify-center py-16"><BandLoader label="Loading reports" /></div>}
         {report && <>
           <Readouts items={[
             { label: 'Done', value: report.completed, sub: `completed in ${RANGE_LABELS[range].toLowerCase()}` },

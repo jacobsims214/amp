@@ -7,6 +7,7 @@ import { useSSE } from '../hooks/useSSE'
 import { CrudModal, inputCls, labelCls } from '../components/CrudModal'
 import { ProjectHomeFields, type ProjectHome } from '../components/ProjectHomeFields'
 import type { Org, Project, SSEEvent } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 const NO_HOME: ProjectHome = { orgId: null, teamId: null }
 
@@ -185,7 +186,7 @@ export function Projects() {
 
         {loading && (
           <div className="flex justify-center py-20">
-            <Loader2 size={22} className="text-primary animate-spin" />
+            <BandLoader label="Loading projects" />
           </div>
         )}
 

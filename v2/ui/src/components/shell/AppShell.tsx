@@ -59,9 +59,9 @@ export function AppShell() {
     <div className="relative flex h-screen overflow-hidden bg-bg">
       <aside className="w-[232px] flex-shrink-0 flex flex-col bg-surface-2 border-r border-line overflow-y-auto" aria-label="Main">
         <NavLink to="/" className="flex items-center gap-2.5 px-4 pt-4 pb-3" aria-label="AMP home">
-          <span className="grid gap-[2px] w-[18px]" aria-hidden="true">
-            <i className="block h-[3px] bg-band-1" /><i className="block h-[3px] bg-band-2" />
-            <i className="block h-[3px] bg-band-3" /><i className="block h-[3px] bg-band-4" />
+          {/* Relights on every page change (keyed by path). */}
+          <span key={location.pathname} className="amp-mark amp-ignite" aria-hidden="true">
+            <i className="bg-band-1" /><i className="bg-band-2" /><i className="bg-band-3" /><i className="bg-band-4" />
           </span>
           <span className="text-[17px] font-bold tracking-[0.16em] text-ink">AMP</span>
         </NavLink>

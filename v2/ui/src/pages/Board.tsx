@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { RefreshCw, Loader2, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
+import { RefreshCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -23,6 +23,7 @@ import { api } from '../api/client'
 import { withClears } from '../lib/clear'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
@@ -290,7 +291,7 @@ export function Board() {
   if (loading) {
     return (
       <div className="flex items-center justify-center h-full" style={{ background: 'var(--bg)' }}>
-        <Loader2 size={22} className="text-primary animate-spin" />
+        <BandLoader label="Loading the board" />
       </div>
     )
   }

@@ -25,6 +25,7 @@ import { StateDot, StateTag } from '../components/ui/StateTag'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import type { PlanIssue, PlanReport, Task } from '../types'
+import { BandLoader } from '../components/brand/BandLoader'
 
 /** Each ticket's stage (dependency depth) and the plan's critical path. */
 function planShape(tasks: Task[]) {
@@ -107,10 +108,12 @@ export function FlightPlan() {
   const [openId, setOpenId] = useState<number | null>(null)
   const [hideDone, setHideDone] = useState(false)
   const [report, setReport] = useState<PlanReport | null>(null)
+  // Bumped on each check, so the GO stamps replay like a fresh poll.
+  const [poll, setPoll] = useState(0)
   const [checking, setChecking] = useState(true)
   const [checkError, setCheckError] = useState<string | null>(null)
 
-  const check = useCallback(() => api.planCheck(pid).then(r => { setReport(r); setCheckError(null) })
+  const check = useCallback(() => api.planCheck(pid).then(r => { setReport(r); setPoll(n => n + 1); setCheckError(null) })
     .catch(e => setCheckError(e instanceof Error ? e.message : 'Plan check failed'))
     .finally(() => setChecking(false)), [pid])
   useEffect(() => { check() }, [check])
@@ -149,12 +152,14 @@ export function FlightPlan() {
   }, [tasks, shape])
 
   const issueByKind = new Map((report?.issues ?? []).map(i => [i.kind, i]))
+  const pollOrder = ['isolated', 'wide_start', 'empty_stories', 'no_context', 'coupled_gate', 'metadata_drift']
   const pollRow = (kind: string, okDetail: string) => {
     const issue: PlanIssue | undefined = issueByKind.get(kind)
+    const stamp = pollOrder.indexOf(kind) * 90
     return (
       <div key={kind} className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line first:border-t-0">
         <span className="text-[13px] text-ink">{ISSUE_TITLE[kind]}</span>
-        <Verdict ok={!issue} warn={issue?.severity === 'warn'} />
+        <Verdict key={`${poll}-${kind}`} ok={!issue} warn={issue?.severity === 'warn'} stampDelay={stamp} />
         <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">{issue ? issue.message : okDetail}</span>
         {issue?.task_ids && issue.task_ids.length > 0 && (
           <span className="col-span-2 flex flex-wrap gap-1">
@@ -170,7 +175,7 @@ export function FlightPlan() {
   }
 
   if (loading && !tasks.length) {
-    return <div className="flex items-center justify-center h-full"><Loader2 size={20} className="animate-spin text-ink-3" /></div>
+    return <div className="flex items-center justify-center h-full"><BandLoader label="Loading the flight plan" /></div>
   }
 
   const openCount = tasks.filter(t => t.state !== 'completed').length
@@ -280,13 +285,13 @@ export function FlightPlan() {
                 {pollRow('coupled_gate', "No single ticket makes one person's next work wait on another's.")}
                 {pollRow('metadata_drift', 'Every epic has the metadata keys the others use, so reports roll it up.')}
                 <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line">
-                  <span className="text-[13px] text-ink">No stuck tickets</span><Verdict ok />
+                  <span className="text-[13px] text-ink">No stuck tickets</span><Verdict key={`${poll}-stuck`} ok stampDelay={pollOrder.length * 90} />
                   <span className="col-span-2 text-[11.5px] text-ink-2">{report.repaired_task_ids?.length
                     ? `Repaired ${report.repaired_task_ids.length} blocked on finished work: #${report.repaired_task_ids.join(', #')}`
                     : 'Nothing is blocked on finished work.'}</span>
                 </div>
                 <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
-                <Approval report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus}
+                <Approval key={poll} report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus}
                   approver={report.plan_approved_by != null ? lookupPerson(people, report.plan_approved_by)?.name : undefined} />
               </>}
             </Panel>
@@ -311,7 +316,7 @@ function Approval({ report, onApprove, approving, error, onFocus, approver }: {
     <div className="grid gap-2.5 px-4 py-3.5 border-t-2 border-ink">
       <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1">
         <span className="text-[13px] font-semibold text-ink">Plan approval</span>
-        <Verdict ok={waiting.length === 0} />
+        <Verdict ok={waiting.length === 0} stampDelay={700} />
         <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">
           {waiting.length === 0
             ? <>Approved{when ? <> {when}</> : null}{approver ? <> by {approver}</> : null}. Nothing new has been planned since.</>
@@ -336,12 +341,14 @@ function Approval({ report, onApprove, approving, error, onFocus, approver }: {
   )
 }
 
-function Verdict({ ok, warn }: { ok: boolean; warn?: boolean }) {
+/** GO / WARN / NO-GO. A GO with stampDelay stamps in after that many ms; the others stay still. */
+function Verdict({ ok, warn, stampDelay }: { ok: boolean; warn?: boolean; stampDelay?: number }) {
   const style = ok ? { border: '1px solid var(--success)', color: 'var(--success-ink)' }
     : warn ? { border: '1px solid var(--warning)', color: 'var(--warning-ink)' }
       : { background: 'var(--st-flag)', color: '#fff' }
   return (
-    <span className="font-label text-[10.5px] font-bold tracking-[0.16em] px-1.5 py-1 self-start leading-none" style={style}>
+    <span className={`font-label text-[10.5px] font-bold tracking-[0.16em] px-1.5 py-1 self-start leading-none${ok && stampDelay != null ? ' amp-go-stamp' : ''}`}
+      style={ok && stampDelay != null ? { ...style, animationDelay: `${stampDelay}ms`, ['--amp-stamp-delay' as string]: `${stampDelay}ms` } : style}>
       {ok ? 'GO' : warn ? 'WARN' : 'NO-GO'}
     </span>
   )
