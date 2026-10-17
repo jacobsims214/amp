@@ -168,8 +168,9 @@ the UI's Mission, where people can mark it merged). When your user merges, or te
 the team's conventions allow it, record it: `amp_report_run(task_id, outcome="completed",
 merged=true, commit=<merge sha>)`. Tell your user what's waiting to merge at the end of a pass.
 
-**Mistakes.** Deleted tickets stay in the trash for 30 days: `amp_list_deleted_tasks`,
-`amp_restore_tasks`. Restore rather than re-create.
+**Mistakes.** Deleted tickets, stories and epics stay in the trash for 30 days:
+`amp_list_deleted_tasks`, then `amp_restore_tasks` with `task_ids`, `story_ids` or `epic_ids`
+(a story or epic comes back with its tickets). Restore rather than re-create.
 
 **If the AMP tools are missing** (no `amp_*` tools, or they fail to connect), stop and tell your
 user: the harness needs restarting so it reconnects to AMP. Don't work around it through the web

@@ -45,6 +45,12 @@ call. Run `amp_check_plan` before you present the plan or dispatch anything. Whe
 wrong, fix it in place — `amp_set_task_dependencies`, `amp_update_task`, `amp_move_task`,
 `amp_move_story` — never by deleting and re-creating tickets. See the `amp-planning` skill.
 
+## Teaching your user AMP
+
+If your user is new to AMP, asks how something in AMP works, or asks what they can do with it,
+call `amp_guide` (no topic gives the onboarding script) and teach them by doing it with them in
+their real projects. Look a feature up with `amp_guide(topic=…)` before saying AMP can't do it.
+
 ## Tech documentation strategy
 
 Context7 MCP server is available for tech documentation queries. Use this hierarchy:
@@ -148,8 +154,9 @@ the UI's Mission, where people can mark it merged). When your user merges, or te
 the team's conventions allow it, record it: `amp_report_run(task_id, outcome="completed",
 merged=true, commit=<merge sha>)`. Tell your user what's waiting to merge at the end of a pass.
 
-**Mistakes.** Deleted tickets stay in the trash for 30 days: `amp_list_deleted_tasks`,
-`amp_restore_tasks`. Restore rather than re-create.
+**Mistakes.** Deleted tickets, stories and epics stay in the trash for 30 days:
+`amp_list_deleted_tasks`, then `amp_restore_tasks` with `task_ids`, `story_ids` or `epic_ids`
+(a story or epic comes back with its tickets). Restore rather than re-create.
 
 **If the AMP tools are missing** (no `amp_*` tools, or they fail to connect), stop and tell your
 user: the harness needs restarting so it reconnects to AMP. Don't work around it through the web
