@@ -99,6 +99,11 @@ Plan:
 
 ## Step 3 — Work and log every meaningful step
 
+Stay inside your ticket's "Files touched". Other tickets — often other people's, in other
+checkouts — own the rest, and the plan's file-conflict check only holds if you do. If the work
+needs a change outside that list, make it only if it's trivial and say so in a comment;
+otherwise ask (Step 5).
+
 Post a comment every time you:
 - Find something non-obvious in the codebase
 - Make a decision — explain WHY, not just what
@@ -191,7 +196,8 @@ programmatically), write "COULD NOT VERIFY: [why]" instead of asserting VERIFIED
 honest and still useful; a false VERIFIED is not.
 
 Commit your work, following the team's conventions from Step 0.5 (branch naming, commit
-format). Then make it reachable: other people's tickets may depend on yours, and a ticket that is
+format). `git status` should show nothing of yours left uncommitted: changes left on disk are
+invisible to everyone else, and the next agent in this checkout can't tell whose they are. Then make it reachable: other people's tickets may depend on yours, and a ticket that is
 done in AMP but whose code exists only in one checkout blocks them without anyone noticing. If the
 conventions say to push (or open a PR), do it; if they say nothing, push the branch you committed
 on. If you can't push (no remote, no access), say so in the completion comment.

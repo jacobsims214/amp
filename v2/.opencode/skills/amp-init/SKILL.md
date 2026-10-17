@@ -23,7 +23,7 @@ How you get there is up to you. The guidance below covers what each step involve
 
 ## Creating the project
 
-If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation. Keep the code short and slug-friendly.
+If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation. The code is the ticket prefix — refs read `CODE-149` everywhere (reports, commits, branches) — so keep it to 2–6 letters, like `NWC` for Northwind Commerce, not the full name.
 
 ```json
 { "project_id": <id>, "project_name": "<name>", "project_code": "<code>", "amp_api": "http://localhost:8000" }

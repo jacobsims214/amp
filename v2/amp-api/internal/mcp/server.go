@@ -63,7 +63,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_create_project", "Create a new AMP project in one of your orgs, owned by one of your teams. Returns the created project with its id.",
 		props{
 			"name":        str("REQUIRED. Project name."),
-			"code":        str("REQUIRED. Short unique code, e.g. 'my-project'."),
+			"code":        str("REQUIRED. Short unique code, used as the ticket prefix (refs read CODE-149): 2-6 letters, e.g. 'NWC' for Northwind Commerce."),
 			"description": str("Optional description."),
 			"org_id":      num("Optional. Org to create it in; required only if you belong to several (see amp_whoami)."),
 			"team_id":     num("Optional. Team that will own it; required only if you are on several teams in the org."),
