@@ -82,6 +82,12 @@ spec:
               value: {{ .Values.oauth2Proxy.clientID | quote }}
             - name: MCP_ALLOWED_ORIGINS
               value: "https://{{ .Values.global.domain }}"
+            {{- with .Values.ampApi.signupAllowedDomains }}
+            - name: SIGNUP_ALLOWED_DOMAINS
+              value: {{ . | quote }}
+            {{- end }}
+            - name: WEBHOOK_ALLOW_PRIVATE_NETWORKS
+              value: {{ .Values.ampApi.webhookAllowPrivateNetworks | default false | quote }}
             {{- if .Values.valkey.enabled }}
             - name: REDIS_ADDR
               value: "amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379"
