@@ -253,9 +253,14 @@ func TestWebhooks_RetriesAndAutoDisable(t *testing.T) {
 	hookID := int(hook["id"].(float64))
 	ra.want(t, 200, "owner", "POST", fmt.Sprintf("/api/webhooks/%d/test", hookID), nil)
 	flaky.wait(t, "retry", func(g []received) bool { return len(g) >= 2 })
-	time.Sleep(50 * time.Millisecond)
-	d := ra.want(t, 200, "owner", "GET", fmt.Sprintf("/api/webhooks/%d/deliveries", hookID), nil)["deliveries"].([]any)[0].(map[string]any)
-	if d["status"] != "delivered" || d["attempts"].(float64) != 2 {
+	// The dispatcher records the outcome after reading the response; wait
+	// for it rather than guessing how long that takes under load.
+	var d map[string]any
+	eventually(t, "the retried delivery to be recorded", func() bool {
+		d = ra.want(t, 200, "owner", "GET", fmt.Sprintf("/api/webhooks/%d/deliveries", hookID), nil)["deliveries"].([]any)[0].(map[string]any)
+		return d["status"] == "delivered"
+	})
+	if d["attempts"].(float64) != 2 {
 		t.Errorf("delivery after a retry = %v", d)
 	}
 
@@ -265,7 +270,10 @@ func TestWebhooks_RetriesAndAutoDisable(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		ra.want(t, 200, "owner", "POST", fmt.Sprintf("/api/webhooks/%d/test", hookID), nil)
 		down.wait(t, "attempts", func(g []received) bool { return len(g) >= 2*(i+1) })
-		time.Sleep(50 * time.Millisecond)
+		eventually(t, "the failed delivery to be recorded", func() bool {
+			got, _ := w.s.repo.GetWebhook(context.Background(), hookID)
+			return got != nil && got.ConsecutiveFailures >= i+1
+		})
 	}
 	got, _ := w.s.repo.GetWebhook(context.Background(), hookID)
 	if got.Active || got.ConsecutiveFailures != 2 || !strings.Contains(got.LastError, "HTTP 500") {
@@ -316,5 +324,17 @@ func TestWebhooks_PrivateNetworksRefused(t *testing.T) {
 	defer rc.mu.Unlock()
 	if len(rc.got) != 0 {
 		t.Errorf("the private receiver got %d requests", len(rc.got))
+	}
+}
+
+// eventually polls cond until it holds or a generous deadline passes.
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
