@@ -132,6 +132,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/velocity", h.velocity)
 	mux.HandleFunc("/api/my-work", h.myWork)
 	mux.HandleFunc("/api/trace", h.trace)
+	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 }
 
@@ -1813,6 +1814,35 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// traceMerged: POST /api/trace/merged {commit|branch|pr, merge_commit?} —
+// CI reports a merge; every ticket whose runs produced that work is marked merged.
+func (h *RestHandler) traceMerged(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST required", 405)
+		return
+	}
+	var body struct {
+		Commit      string `json:"commit"`
+		Branch      string `json:"branch"`
+		PR          string `json:"pr"`
+		MergeCommit string `json:"merge_commit"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		jsonErr(w, err, 400)
+		return
+	}
+	ids, err := h.svc.MarkMerged(r.Context(), pr, body.Commit, body.Branch, body.PR, body.MergeCommit)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, map[string]interface{}{"merged_task_ids": ids, "count": len(ids)})
 }
 
 // trace: GET /api/trace?commit=…|branch=…|pr=… — the tickets whose recorded

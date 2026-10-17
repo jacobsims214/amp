@@ -15,7 +15,13 @@ import (
 // ticket may report on it. The run is tied to the caller (whose token the
 // agent ran under) and defaults to the ticket's agent.
 func (s *Service) RecordRun(ctx context.Context, p authz.Principal, taskID int, run domain.Run) (domain.Run, error) {
-	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
+	// Reporting a merge is a fact about the code, not work on the ticket: anyone
+	// on the project may record it (a reviewer, or CI with its own token).
+	action := authz.TaskWork
+	if run.Merged != nil && *run.Merged && run.InputTokens == nil && run.OutputTokens == nil && run.CostUSD == nil {
+		action = authz.TaskRead
+	}
+	t, _, err := s.LoadTask(ctx, p, taskID, action)
 	if err != nil {
 		return domain.Run{}, err
 	}
@@ -148,4 +154,29 @@ func (s *Service) UnmergedWork(ctx context.Context, p authz.Principal, projectID
 		return nil, err
 	}
 	return s.Repo.UnmergedWork(ctx, projectID)
+}
+
+// MarkMerged records that the work on a branch, PR, or commit is merged, on
+// every ticket whose runs produced it (in projects p can see). It's how CI
+// reports merges: one call after merging, with the merge commit.
+func (s *Service) MarkMerged(ctx context.Context, p authz.Principal, commit, branch, pr, mergeCommit string) ([]int, error) {
+	hits, err := s.Trace(ctx, p, commit, branch, pr)
+	if err != nil {
+		return nil, err
+	}
+	merged := []int{}
+	yes := true
+	for _, h := range hits {
+		last := h.Runs[0]
+		run := domain.Run{Outcome: domain.RunCompleted, Merged: &yes, Branch: last.Branch, PRURL: last.PRURL,
+			Commit: last.Commit, Note: "merged"}
+		if mergeCommit != "" {
+			run.Commit, run.Note = mergeCommit, "merged as "+mergeCommit
+		}
+		if _, err := s.RecordRun(ctx, p, h.Task.ID, run); err != nil {
+			return merged, err
+		}
+		merged = append(merged, h.Task.ID)
+	}
+	return merged, nil
 }

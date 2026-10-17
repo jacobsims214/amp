@@ -98,6 +98,18 @@ func TestRuns_UsageReportsAndTrace(t *testing.T) {
 		t.Fatalf("still waiting after merge: %v", um)
 	}
 
+	// CI reports the merge by branch, with a token that can only read the project.
+	b2 := mkIn(t, root, w.s.storyID, "second feature")
+	root.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(b2), "agent_id": "w"})
+	root.call(t, "amp_complete_task", map[string]any{"task_id": float64(b2), "branch": branch + "-2", "pushed": true})
+	res := ra.want(t, 200, "carol", http.MethodPost, "/api/trace/merged", map[string]any{"branch": branch + "-2", "merge_commit": "fedcba9876543"})
+	if res["count"] != 1.0 {
+		t.Fatalf("CI merge report: %v", res)
+	}
+	if um := ra.want(t, 200, "root", http.MethodGet, fmt.Sprintf("/api/projects/%d/unmerged", w.s.projectID), nil); um["count"] != 0.0 {
+		t.Fatalf("still waiting after CI reported the merge: %v", um)
+	}
+
 	// Recording a run needs the right to work the ticket.
 	if err := w.s.as(w.outsider).callExpectError(t, "amp_report_run", map[string]any{"task_id": float64(a), "model": "x"}); err == "" {
 		t.Fatal("an outsider recorded a run")
