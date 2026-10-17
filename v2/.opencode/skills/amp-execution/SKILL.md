@@ -99,6 +99,10 @@ Plan:
 
 ## Step 3 — Work and log every meaningful step
 
+Work only inside the project directory (a worktree you were given at `.worktrees/<ticket>` is
+inside it). Reading or running anything outside it asks your user for permission, and as a
+subagent you can't see that prompt — you'll wait on it until someone kills the session.
+
 Stay inside your ticket's "Files touched". Other tickets — often other people's, in other
 checkouts — own the rest, and the plan's file-conflict check only holds if you do. If the work
 needs a change outside that list, make it only if it's trivial and say so in a comment;
