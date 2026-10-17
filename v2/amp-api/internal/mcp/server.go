@@ -1259,6 +1259,10 @@ func (s *Server) checkPlan(rctx context.Context, args map[string]interface{}) (*
 	return jsonResult(report)
 }
 
+// QuietAfter is how long an in-progress ticket can go without activity
+// before amp_list_tasks reports it as quiet (the UI uses the same 15 minutes).
+const QuietAfter = 15 * time.Minute
+
 func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
@@ -1312,6 +1316,27 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		}
 	}
 
+	// In progress but silent: usually a worker that died with its session.
+	quiet := make([]map[string]interface{}, 0)
+	if len(inProgress) > 0 {
+		ids := make([]int, len(inProgress))
+		for i, t := range inProgress {
+			ids[i] = t.ID
+		}
+		last, err := s.repo.LastActivity(rctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range inProgress {
+			seen := last[t.ID]
+			if silent := time.Since(seen); !seen.IsZero() && silent > QuietAfter {
+				quiet = append(quiet, map[string]interface{}{
+					"id": t.ID, "name": t.Name, "agent_id": t.AgentID, "silent_minutes": int(silent.Minutes()),
+				})
+			}
+		}
+	}
+
 	return jsonResult(map[string]interface{}{
 		"ready_to_dispatch": readyToDispatch, // dispatch ALL of these immediately
 		"in_progress":       inProgress,
@@ -1319,6 +1344,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"scheduled":         scheduled, // tasks waiting for their start_at time
 		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
+		"quiet":             quiet, // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
 	})

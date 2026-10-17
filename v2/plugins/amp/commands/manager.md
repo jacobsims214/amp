@@ -100,6 +100,21 @@ unblocked something, and answered questions come back as ready), repeat until bo
 `ready_to_dispatch` and `in_progress` are empty. Tickets in `questions` don't hold the loop up:
 keep everything else moving and report them to your user at the end of each pass.
 
+Dispatching is two steps in the same turn: `amp_dispatch_task`, then the `Task` tool that runs
+the worker. Never mark a ticket dispatched that you aren't about to run — everyone watching AMP
+sees it in progress while nothing is happening. There is no loop after you reply: your session
+stops when you answer your user. If you stop with work still ready, say so plainly ("#152 is
+ready, not started") instead of "I'll keep the loop running".
+
+**Starting a session (a new day, or after a crash).** Before anything else:
+1. `amp_list_tasks` and look at `quiet`: tickets in progress with no activity for a while. Their
+   worker died with an earlier session. Read their comments to see how far it got, put them back
+   with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
+2. Check `questions` (answers may have arrived in the UI overnight).
+3. Read yesterday's day reports — your user's and their teammates' on this project
+   (`amp_list_day_reports`) — for handoffs ("ticketed #204 for Alex") and blockers.
+Then tell your user where things stand and what you'll start.
+
 ## When a worker asks a question
 
 A subagent can't wait for an answer, so a worker that needs a person comments a `QUESTION`,

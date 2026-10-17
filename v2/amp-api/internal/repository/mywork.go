@@ -105,3 +105,30 @@ func (r *Repo) ProjectTasksWithMeta(ctx context.Context, projectID int) ([]TaskW
 	}
 	return out, rows.Err()
 }
+
+// LastActivity returns each ticket's latest sign of life: its newest
+// activity-log entry (state changes, dispatches, comments) or its dispatch
+// time, whichever is later.
+func (r *Repo) LastActivity(ctx context.Context, taskIDs []int) (map[int]time.Time, error) {
+	out := map[int]time.Time{}
+	if len(taskIDs) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `SELECT t.id, GREATEST(t.dispatched_at, (SELECT MAX(a.created_at) FROM activity_log a WHERE a.task_id = t.id))
+		FROM tasks t WHERE t.id = ANY($1)`, taskIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int
+		var at *time.Time
+		if err := rows.Scan(&id, &at); err != nil {
+			return nil, err
+		}
+		if at != nil {
+			out[id] = *at
+		}
+	}
+	return out, rows.Err()
+}
