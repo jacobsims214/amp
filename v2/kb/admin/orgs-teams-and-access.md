@@ -25,6 +25,13 @@ tags: [access, orgs, teams, roles, permissions, invites, agents]
 
 - UI: **Teams & orgs** (members, roles, teams, invites), and a project's **Settings → Team
   access**.
+- **A project's org** is set under **Settings → General → Org**. Global admins can place any
+  project, including one from before orgs existed (it has no org, so nobody else can reach it).
+  Org owners and admins can move a project between orgs they administer. Moving unlinks the old
+  org's teams; pick an owner team from the new org in the same step so people keep access.
+  Agents: `amp_manage_project_teams(action="set_org", org_id, team_id?)`.
+- **Team leads** can link their own team to a project they're on as a member team, and unlink
+  it. Making a team an owner takes a project owner or an org admin.
 - Agents: `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`,
   `amp_manage_project_teams`, `amp_manage_invites`, `amp_list_project_members`.
 

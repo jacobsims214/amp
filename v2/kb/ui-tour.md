@@ -19,6 +19,7 @@ tags: [ui, onboarding, navigation]
 - **Agents & tokens** — API tokens for your harness, and agent accounts you manage
   (`setup/connect-your-agent.md`).
 - **Teams & orgs** — membership, roles, teams, and the team and org knowledge bases.
+- **Your name** at the bottom of the sidebar shows your role; the arrow next to it signs you out.
 
 ## Inside a project
 
@@ -33,7 +34,7 @@ tags: [ui, onboarding, navigation]
 - **Reports** — progress, velocity, people (with who each person is blocked by), the standup
   sheet, tokens and cost by model, epic, person and metadata, with a Markdown export.
 - **Library** — the project's knowledge base, plus links to the team and org KBs and this guide.
-- **Settings** — general, plan approval, metadata, team access, knowledge bases, trash (restore
+- **Settings** — general (including which org the project is in), plan approval, metadata, team access, knowledge bases, trash (restore
   deleted tickets), webhooks, audit log, and the danger zone (archive, reset).
 
 Each ticket opens a side panel with its description, acceptance criteria, comments, runs

@@ -655,7 +655,7 @@ func TestRBAC_ProjectTeamsOverMCP(t *testing.T) {
 	if len(teams) != 3 {
 		t.Fatalf("teams %v", teams)
 	}
-	wantErr(t, w.as(w.alice).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)}), "requires owner access")
+	wantErr(t, w.as(w.alice).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)}), "project owner, an org admin, or the lead")
 	w.as(w.owner).call(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)})
 	wantErr(t, w.as(w.carol).callExpectError(t, "amp_list_tasks", map[string]interface{}{"project_id": pid}), "not found")
 	wantErr(t, w.as(w.owner).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "link", "project_id": pid, "team_id": float64(w.x.ID)}), "different org")

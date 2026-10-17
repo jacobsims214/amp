@@ -4,6 +4,7 @@ import { Loader2, Settings, Trash2, Users } from 'lucide-react'
 import { api } from '../api/client'
 import { CrudModal, inputCls, labelCls } from './CrudModal'
 import { canManageProject } from '../lib/people'
+import { useAuth } from '../hooks/useAuth'
 import type { Project, ProjectAccess, ProjectTeam, ProjectTeamRole, Team } from '../types'
 
 interface PanelProps {
@@ -29,10 +30,17 @@ export function TeamAccessModal({ onClose, ...props }: PanelProps & { onClose: (
 
 // Lists the teams linked to a project. Project owners (and org/global
 // admins) can change each team's role, unlink it, or link another team from
-// the project's org, and set who may reassign tickets; everyone else gets a
-// read-only view.
+// the project's org, and set who may reassign tickets. A team's lead can link
+// or unlink their own team as a member team. Everyone else gets a read-only
+// view.
 export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: PanelProps) {
   const canManage = canManageProject(myAccess)
+  const { me } = useAuth()
+  const [orgId, setOrgId] = useState<number | null>(null)
+  // Teams you lead in the project's org: you may link and unlink these as member teams.
+  const ledTeams = (me?.teams ?? []).filter(t => t.role === 'lead' && t.org_id === orgId)
+  const leads = (teamId: number) => ledTeams.some(t => t.id === teamId)
+  const canAdd = canManage || ledTeams.length > 0
   const [teams, setTeams] = useState<ProjectTeam[]>([])
   const [orgTeams, setOrgTeams] = useState<Team[]>([])
   const [loading, setLoading] = useState(true)
@@ -50,6 +58,7 @@ export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: Panel
         if (cancelled) return
         setTeams(linked)
         setOpenReassign(project.open_reassign ?? false)
+        setOrgId(project.org_id ?? null)
         if (canManage && project.org_id) {
           const all = await api.listOrgTeams(project.org_id)
           if (!cancelled) setOrgTeams(all)
@@ -86,7 +95,9 @@ export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: Panel
     }
   }
 
-  const unlinked = orgTeams.filter(t => !teams.some(pt => pt.team_id === t.id))
+  // Owners pick from every team in the org; a lead, from the teams they lead.
+  const addable: { id: number; name: string }[] = canManage ? orgTeams : ledTeams
+  const unlinked = addable.filter(t => !teams.some(pt => pt.team_id === t.id))
 
   return (
     <>
@@ -123,14 +134,29 @@ export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: Panel
                       </button>
                     </>
                   ) : (
-                    <span className="text-xs text-ink-2 capitalize">{t.role}</span>
+                    <>
+                      <span className="text-xs text-ink-2 capitalize">{t.role}</span>
+                      {leads(t.team_id) && t.role === 'member' && (
+                        <button
+                          onClick={() => run(() => api.removeProjectTeam(projectId, t.team_id))}
+                          disabled={busy}
+                          className="p-1 text-ink-2 hover:text-danger-ink transition-colors cursor-pointer disabled:opacity-50"
+                          title="Unlink your team from the project"
+                        >
+                          <Trash2 size={13} />
+                        </button>
+                      )}
+                    </>
                   )}
                 </div>
               ))}
             </div>
           </div>
 
-          {canManage && unlinked.length > 0 && (
+          {orgId == null && (
+            <p className="m-0 text-xs text-ink-2">This project isn't in an org yet, so there are no teams to link. Put it in an org under General first.</p>
+          )}
+          {canAdd && unlinked.length > 0 && (
             <div>
               <label className={labelCls}>Add team</label>
               <div className="flex gap-2">
@@ -138,13 +164,15 @@ export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: Panel
                   <option value="">Select a team…</option>
                   {unlinked.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
                 </select>
-                <select value={addRole} onChange={e => setAddRole(e.target.value as ProjectTeamRole)} className={`${inputCls.replace('w-full', 'w-32')} flex-shrink-0`}>
-                  <option value="member">Member</option>
-                  <option value="owner">Owner</option>
-                </select>
+                {canManage && (
+                  <select value={addRole} onChange={e => setAddRole(e.target.value as ProjectTeamRole)} className={`${inputCls.replace('w-full', 'w-32')} flex-shrink-0`}>
+                    <option value="member">Member</option>
+                    <option value="owner">Owner</option>
+                  </select>
+                )}
                 <button
                   onClick={() => run(async () => {
-                    const r = await api.setProjectTeam(projectId, Number(addTeamId), addRole)
+                    const r = await api.setProjectTeam(projectId, Number(addTeamId), canManage ? addRole : 'member')
                     setAddTeamId('')
                     return r
                   })}

@@ -656,3 +656,50 @@ func (r *Repo) AcceptInvites(ctx context.Context, userID int, email string) (int
 	}
 	return len(pending), tx.Commit(ctx)
 }
+
+// MoveProjectToOrg sets a project's org. Team links to teams outside the new
+// org are removed (teams only reach projects in their own org), and
+// ownerTeamID, when non-zero, is linked as an owner team; it must be in the
+// new org. It returns the removed team links.
+func (r *Repo) MoveProjectToOrg(ctx context.Context, projectID, orgID, ownerTeamID int) ([]domain.ProjectTeam, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if ownerTeamID != 0 {
+		var ok bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM teams WHERE id = $1 AND org_id = $2)`, ownerTeamID, orgID).Scan(&ok); err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, conflictf("the owner team must be a team in the new org")
+		}
+	}
+	rows, err := tx.Query(ctx, `
+		DELETE FROM project_teams pt USING teams t
+		WHERE pt.project_id = $1 AND t.id = pt.team_id AND t.org_id IS DISTINCT FROM $2
+		RETURNING pt.project_id, pt.team_id, t.name, pt.role`, projectID, orgID)
+	if err != nil {
+		return nil, err
+	}
+	removed, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (domain.ProjectTeam, error) {
+		var pt domain.ProjectTeam
+		err := row.Scan(&pt.ProjectID, &pt.TeamID, &pt.TeamName, &pt.Role)
+		return pt, err
+	})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE projects SET org_id = $2, updated_at = NOW() WHERE id = $1`, projectID, orgID); err != nil {
+		return nil, err
+	}
+	if ownerTeamID != 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO project_teams (project_id, team_id, role) VALUES ($1, $2, 'owner')
+			ON CONFLICT (project_id, team_id) DO UPDATE SET role = 'owner'`, projectID, ownerTeamID); err != nil {
+			return nil, err
+		}
+	}
+	return removed, tx.Commit(ctx)
+}

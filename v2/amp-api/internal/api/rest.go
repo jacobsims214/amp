@@ -669,7 +669,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	case "report":
 		// GET ?since=&until= (RFC 3339; default the last 7 days) &group_by=<metadata key>
 		q := r.URL.Query()
-		until, since := time.Now(), time.Now().Add(-7*24*time.Hour)
+		until, since := openUntil(), time.Now().Add(-7*24*time.Hour)
 		if v := q.Get("until"); v != "" {
 			t, err := time.Parse(time.RFC3339, v)
 			if err != nil {
@@ -714,6 +714,28 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	case "teams":
 		h.projectTeams(w, r, pr, projectID, lvl, parts[2:])
+		return
+
+	case "org":
+		// POST {org_id, owner_team_id?}: put the project in an org, or move it.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			OrgID       int `json:"org_id"`
+			OwnerTeamID int `json:"owner_team_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.OrgID <= 0 {
+			jsonErr(w, errorf("org_id is required"), 400)
+			return
+		}
+		proj, removed, err := h.svc.MoveProjectToOrg(r.Context(), pr, projectID, body.OrgID, body.OwnerTeamID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"project": proj, "unlinked": removed})
 		return
 
 	case "webhooks":
@@ -1841,6 +1863,12 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	}
 }
+
+// openUntil is the end of a range that runs "to now". Rows are stamped by
+// the database's clock, which can be a little ahead of this server's, so
+// the open end allows a minute: otherwise work recorded a moment ago can
+// fall outside "now".
+func openUntil() time.Time { return time.Now().Add(time.Minute) }
 
 // traceMerged: POST /api/trace/merged {commit|branch|pr, merge_commit?} —
 // CI reports a merge; every ticket whose runs produced that work is marked merged.
