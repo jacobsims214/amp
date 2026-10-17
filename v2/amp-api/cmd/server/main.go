@@ -7,10 +7,12 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 	_ "time/tzdata" // IANA time zones for daily reports, even in minimal images
@@ -21,6 +23,7 @@ import (
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/api"
 	"github.com/simstech/amp-api/internal/auth"
+	"github.com/simstech/amp-api/internal/cluster"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
@@ -64,7 +67,7 @@ func main() {
 	defer cancel()
 
 	// ---- 1. Database ----
-	slog.Info("connecting to postgres", "dsn", dsn)
+	slog.Info("connecting to postgres", "dsn", redactDSN(dsn))
 	repo, err := repository.New(ctx, dsn)
 	if err != nil {
 		slog.Error("failed to connect to postgres", "err", err)
@@ -121,6 +124,67 @@ func main() {
 	// ---- 3. Actor system ----
 	system := protoactor.NewActorSystem()
 	registry := actor.NewRegistry(system, repo, sseHub)
+
+	// ---- 3b. Replicas ----
+	// Any number of amp-api replicas can run against one database. Each
+	// project's actors run on the replica that owns it; the others pass its
+	// requests there over the internal listener, and live events reach
+	// every replica (internal/cluster). CLUSTER_MODE=off runs every project
+	// here, as before, and is only safe with a single replica.
+	clusterCtx, stopCluster := context.WithCancel(context.Background())
+	defer stopCluster()
+	var node *cluster.Node
+	var internalServer *http.Server
+	if os.Getenv("CLUSTER_MODE") != "off" {
+		internalAddr := envOrDefault("CLUSTER_ADDR", ":3003")
+		advertise := os.Getenv("CLUSTER_ADVERTISE_ADDR")
+		if advertise == "" {
+			host, _ := os.Hostname()
+			advertise = host + internalAddr[strings.LastIndex(internalAddr, ":"):]
+		}
+		node, err = cluster.Join(ctx, repo, cluster.Options{Addr: advertise})
+		if err != nil {
+			slog.Error("failed to join the replica group", "err", err)
+			os.Exit(1)
+		}
+		registry.EnableCluster(node)
+		go node.Run(clusterCtx)
+		go cluster.NewRelay(repo, sseHub, node.ID()).Run(clusterCtx)
+		internalServer = &http.Server{Addr: internalAddr, Handler: registry.InternalHandler()}
+		go func() {
+			slog.Info("replica listener up", "addr", internalAddr, "advertised", advertise, "node", node.ID())
+			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("replica listener error", "err", err)
+				os.Exit(1)
+			}
+		}()
+	} else {
+		slog.Warn("CLUSTER_MODE=off: this replica runs every project; never run more than one like this")
+	}
+
+	// Scheduled tickets unblock from their project's actor, so start the
+	// actors of projects with a ticket coming due (after a restart, or when
+	// a project's replica went away).
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for {
+			ids, err := repo.ProjectsWithDueSchedules(clusterCtx, time.Minute)
+			if err != nil && clusterCtx.Err() == nil {
+				slog.Warn("checking for scheduled tickets failed", "err", err)
+			}
+			for _, id := range ids {
+				if err := registry.Touch(id); err != nil {
+					slog.Warn("starting a project with scheduled tickets failed", "project_id", id, "err", err)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+		}
+	}()
 
 	// ---- 4. KB service (Typesense + Ollama) ----
 	kbSvc := kb.New(
@@ -211,9 +275,24 @@ func main() {
 	restHandler.Register(mux)
 
 	// Health check (unauthenticated, used by k8s probes)
+	var draining atomic.Bool
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
 		fmt.Fprint(w, `{"status":"ok"}`)
+	})
+	// Readiness: not while shutting down, nor while this replica can't
+	// heartbeat (it isn't serving its projects then).
+	mux.HandleFunc("/ready", func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case draining.Load():
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"status":"shutting down"}`)
+		case node != nil && !node.Alive():
+			w.WriteHeader(http.StatusServiceUnavailable)
+			fmt.Fprint(w, `{"status":"no database heartbeat"}`)
+		default:
+			fmt.Fprint(w, `{"status":"ok"}`)
+		}
 	})
 
 	corsMiddleware := cors.New(cors.Options{
@@ -243,13 +322,41 @@ func main() {
 	<-ctx.Done()
 	slog.Info("shutting down")
 
+	// Stop being ready, and give the load balancer time to notice before
+	// refusing connections (SHUTDOWN_DELAY, e.g. "5s" in Kubernetes).
+	draining.Store(true)
+	if d, err := time.ParseDuration(os.Getenv("SHUTDOWN_DELAY")); err == nil && d > 0 {
+		time.Sleep(d)
+	}
+
+	// Finish requests in flight, including ones other replicas passed here;
+	// then stop this replica's actors and hand its projects over at once.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	_ = apiServer.Shutdown(shutdownCtx)
+	_ = mcpPublicServer.Shutdown(shutdownCtx)
+	if internalServer != nil {
+		_ = internalServer.Shutdown(shutdownCtx)
+	}
 	if asynqWorker != nil {
 		asynqWorker.Shutdown()
 	}
+	registry.StopAll()
 	system.Shutdown()
+	if node != nil {
+		if err := node.Leave(context.Background()); err != nil {
+			slog.Warn("could not hand this replica's projects over; others take them over when its heartbeat expires", "err", err)
+		}
+	}
+}
+
+// redactDSN hides the password in a database URL for logging.
+func redactDSN(dsn string) string {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "(unparseable DATABASE_URL)"
+	}
+	return u.Redacted()
 }
 
 func envOrDefault(key, def string) string {
@@ -259,12 +366,12 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-// authExceptHealth applies the auth verifier to every path except /health,
-// which k8s liveness/readiness probes hit unauthenticated.
+// authExceptHealth applies the auth verifier to every path except /health
+// and /ready, which k8s liveness/readiness probes hit unauthenticated.
 func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	authed := v.Middleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
 			next.ServeHTTP(w, r)
 			return
 		}

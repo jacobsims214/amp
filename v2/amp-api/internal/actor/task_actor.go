@@ -86,11 +86,21 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 			if err := a.saveState(domain.TaskStateBlocked, a.task.BlockReason); err != nil {
 				a.log.Error("failed to persist scheduled block state", "err", err)
 			}
+		} else if a.task.StartAt != nil && a.task.State == domain.TaskStateBlocked && strings.HasPrefix(a.task.BlockReason, "scheduled:") {
+			// Its start time passed while no actor was running it (a restart,
+			// or its project moving to another replica): unblock it now.
+			ctx.Send(ctx.Self(), &MsgScheduledUnblock{TaskID: a.task.ID})
 		}
 
 		a.log.Info("started", "state", a.task.State, "deps", len(a.task.DependencyIDs))
 
 	case *actor.Stopped:
+		// A stopped actor's schedule is picked up by whichever actor runs the
+		// ticket next.
+		if a.scheduleTimer != nil {
+			a.scheduleTimer.Stop()
+			a.scheduleTimer = nil
+		}
 		// Deregister from ProjectActor routing index.
 		if !a.detached {
 			ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: a.task.ID, EpicID: a.task.EpicID})
