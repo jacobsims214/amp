@@ -101,7 +101,7 @@ func (h *RestHandler) orgSub(w http.ResponseWriter, r *http.Request) {
 		// GET ?since=&until= (RFC 3339; default the last 30 days) &split_by=<metadata key>:
 		// the org's projects side by side, with token spend split by any metadata key.
 		q := r.URL.Query()
-		until, since := time.Now(), time.Now().Add(-30*24*time.Hour)
+		until, since := openUntil(), time.Now().Add(-30*24*time.Hour)
 		for key, dst := range map[string]*time.Time{"since": &since, "until": &until} {
 			if v := q.Get(key); v != "" {
 				t, err := time.Parse(time.RFC3339, v)

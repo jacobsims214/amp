@@ -17,7 +17,7 @@ func TestRuns_UsageReportsAndTrace(t *testing.T) {
 	root := w.s.as(w.root)
 	// Unique per run: root sees every project in the shared test database.
 	sha := fmt.Sprintf("%016x", time.Now().UnixNano())
-	branch, pr := "checkout-"+sha[:8], "https://git.example/pr/"+sha
+	branch, pr := "checkout-"+sha, "https://git.example/pr/"+sha
 	root.call(t, "amp_update_epic", map[string]any{"epic_id": float64(w.s.epicID), "metadata": map[string]any{"capitalizable": true}})
 	a := mkIn(t, root, w.s.storyID, "build checkout")
 	b := mkIn(t, root, w.s.storyID, "fix flaky test")

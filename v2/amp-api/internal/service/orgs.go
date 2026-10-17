@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -519,8 +520,12 @@ func (s *Service) ListProjectTeams(ctx context.Context, p authz.Principal, proje
 }
 
 // SetProjectTeam links a team (of the project's org) as owner or member.
+// Project owners, org admins and global admins may link any team in any
+// role. A team's lead may link their own team as a member team, on a
+// project they're already on.
 func (s *Service) SetProjectTeam(ctx context.Context, p authz.Principal, projectID, teamID int, role string) ([]domain.ProjectTeam, error) {
-	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
+	lvl, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member)
+	if err != nil {
 		return nil, err
 	}
 	if role == "" {
@@ -528,6 +533,14 @@ func (s *Service) SetProjectTeam(ctx context.Context, p authz.Principal, project
 	}
 	if role != domain.ProjectTeamOwner && role != domain.ProjectTeamMember {
 		return nil, authz.BadRequest("role must be owner or member")
+	}
+	if lvl < authz.Owner {
+		if role == domain.ProjectTeamOwner {
+			return nil, authz.Forbidden("making a team an owner of the project takes a project owner or an org admin")
+		}
+		if err := s.requireLeadOfMemberLink(ctx, p, projectID, teamID); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.Repo.SetProjectTeam(ctx, projectID, teamID, role); err != nil {
 		return nil, err
@@ -537,9 +550,18 @@ func (s *Service) SetProjectTeam(ctx context.Context, p authz.Principal, project
 	return s.Repo.ListProjectTeams(ctx, projectID)
 }
 
+// RemoveProjectTeam unlinks a team. Project owners and admins may unlink any
+// team (but not the last owner team); a team's lead may unlink their own
+// member team.
 func (s *Service) RemoveProjectTeam(ctx context.Context, p authz.Principal, projectID, teamID int) ([]domain.ProjectTeam, error) {
-	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
+	lvl, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member)
+	if err != nil {
 		return nil, err
+	}
+	if lvl < authz.Owner {
+		if err := s.requireLeadOfMemberLink(ctx, p, projectID, teamID); err != nil {
+			return nil, err
+		}
 	}
 	if err := s.Repo.RemoveProjectTeam(ctx, projectID, teamID); err != nil {
 		return nil, err
@@ -547,6 +569,92 @@ func (s *Service) RemoveProjectTeam(ctx context.Context, p authz.Principal, proj
 	s.audit(ctx, p, domain.AuditEntry{Action: "project.team.remove", ProjectID: intRef(projectID), TargetType: "team", TargetID: idStr(teamID),
 		Summary: "unlinked " + s.teamLabel(ctx, teamID) + " from the project"})
 	return s.Repo.ListProjectTeams(ctx, projectID)
+}
+
+// requireLeadOfMemberLink allows a change to a team's link only for that
+// team's lead, and never to an owner-team link.
+func (s *Service) requireLeadOfMemberLink(ctx context.Context, p authz.Principal, projectID, teamID int) error {
+	role, err := s.Repo.GetTeamRole(ctx, teamID, p.UserID)
+	if err != nil {
+		return err
+	}
+	if role != domain.TeamRoleLead {
+		return authz.Forbidden("changing a project's teams takes a project owner, an org admin, or the lead of that team")
+	}
+	links, err := s.Repo.ListProjectTeams(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	for _, l := range links {
+		if l.TeamID == teamID && l.Role == domain.ProjectTeamOwner {
+			return authz.Forbidden("%s is an owner team; changing it takes a project owner or an org admin", l.TeamName)
+		}
+	}
+	return nil
+}
+
+// MoveProjectToOrg puts a project in an org (or moves it to another one).
+// Links to teams outside the new org are removed, and ownerTeamID (a team
+// in the new org, optional) becomes an owner team. Global admins may place
+// any project, including one with no org yet; org owners and admins may
+// move a project between orgs they administer.
+func (s *Service) MoveProjectToOrg(ctx context.Context, p authz.Principal, projectID, orgID, ownerTeamID int) (*domain.Project, []domain.ProjectTeam, error) {
+	proj, err := s.Repo.GetProject(ctx, projectID)
+	if err != nil {
+		return nil, nil, authz.NotFound("project %d not found", projectID)
+	}
+	if !p.Super {
+		if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+			return nil, nil, err
+		}
+		if proj.OrgID == nil {
+			return nil, nil, authz.Forbidden("only a global admin can place a project that isn't in an org yet")
+		}
+		if _, err := s.Authz.RequireOrgAdmin(ctx, p, *proj.OrgID); err != nil {
+			return nil, nil, authz.Forbidden("moving a project out of its org takes an owner or admin of that org")
+		}
+	}
+	if _, err := s.Authz.RequireOrgAdmin(ctx, p, orgID); err != nil {
+		if p.Super {
+			return nil, nil, authz.NotFound("org %d not found", orgID)
+		}
+		return nil, nil, authz.Forbidden("moving a project into an org takes an owner or admin of that org")
+	}
+	if proj.OrgID != nil && *proj.OrgID == orgID && ownerTeamID == 0 {
+		return nil, nil, authz.BadRequest("the project is already in that org")
+	}
+	removed, err := s.Repo.MoveProjectToOrg(ctx, projectID, orgID, ownerTeamID)
+	if err != nil {
+		return nil, nil, err
+	}
+	from := "no org"
+	if proj.OrgID != nil {
+		from = s.orgLabel(ctx, *proj.OrgID)
+	}
+	details := map[string]any{"from_org_id": proj.OrgID, "to_org_id": orgID, "removed_team_ids": teamIDs(removed)}
+	summary := fmt.Sprintf("moved the project from %s to %s", from, s.orgLabel(ctx, orgID))
+	if ownerTeamID != 0 {
+		summary += "; " + s.teamLabel(ctx, ownerTeamID) + " is an owner team"
+		details["owner_team_id"] = ownerTeamID
+	}
+	if len(removed) > 0 {
+		summary += fmt.Sprintf("; unlinked %d team(s) from the old org", len(removed))
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "project.org.set", ProjectID: intRef(projectID), OrgID: intRef(orgID),
+		TargetType: "project", TargetID: idStr(projectID), Summary: summary, Details: details})
+	updated, err := s.Repo.GetProject(ctx, projectID)
+	if err != nil {
+		return nil, nil, err
+	}
+	return updated, removed, nil
+}
+
+func teamIDs(ts []domain.ProjectTeam) []int {
+	out := []int{}
+	for _, t := range ts {
+		out = append(out, t.TeamID)
+	}
+	return out
 }
 
 // Slugify turns a name into an org slug.
@@ -578,6 +686,13 @@ func (s *Service) teamLabel(ctx context.Context, teamID int) string {
 		return "team " + t.Name
 	}
 	return "team " + idStr(teamID)
+}
+
+func (s *Service) orgLabel(ctx context.Context, orgID int) string {
+	if o, err := s.Repo.GetOrg(ctx, orgID); err == nil {
+		return "org " + o.Name
+	}
+	return "org " + idStr(orgID)
 }
 
 func roleChange(previous string) string {

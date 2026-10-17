@@ -5,6 +5,7 @@ import { api } from '../api/client'
 import { TrashPanel } from '../components/TrashPanel'
 import { ProjectNav } from '../components/ProjectNav'
 import { TeamAccessPanel } from '../components/TeamAccessModal'
+import { ProjectOrgPicker } from '../components/ProjectOrgPicker'
 import { MetadataEditor } from '../components/MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { inputCls, labelCls } from '../components/CrudModal'
@@ -134,8 +135,15 @@ export function ProjectSettings() {
                   </div>
                   <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-ink-2">
                     <span>Code <span className="font-mono text-ink">{project.code}</span></span>
-                    {org && <span>Org <span className="text-ink">{org.name}</span></span>}
                     <span>State <span className="text-ink capitalize">{project.state}</span></span>
+                  </div>
+                  <div>
+                    <label className={labelCls}>Org</label>
+                    <ProjectOrgPicker project={project} org={org} onMoved={p => {
+                      setProject(p)
+                      if (p.org_id) api.getOrg(p.org_id).then(setOrg).catch(() => setOrg(null))
+                      api.listProjectMembers(pid).then(r => setMyAccess(r.my_access)).catch(() => setMyAccess(null))
+                    }} />
                   </div>
                   {canManage && (
                     <div className="flex items-center gap-3">
@@ -184,7 +192,7 @@ export function ProjectSettings() {
               </Section>
 
               <Section title="Team access" description="Teams reach the project through these links. Owner teams manage the project; member teams work in it.">
-                <TeamAccessPanel projectId={pid} myAccess={myAccess} onProjectUpdated={setProject} />
+                <TeamAccessPanel key={`${project.org_id ?? 'none'}-${myAccess}`} projectId={pid} myAccess={myAccess} onProjectUpdated={setProject} />
               </Section>
 
               <Section title="Knowledge bases"

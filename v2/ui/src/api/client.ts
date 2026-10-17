@@ -131,6 +131,9 @@ export const api = {
   listProjectMembers: (projectId: number) =>
     get<{ members: ProjectMember[] | null; my_access: ProjectAccess }>(`/projects/${projectId}/members`)
       .then(r => ({ members: r.members ?? [], my_access: r.my_access })),
+  /** Put the project in an org (or move it); links to the old org's teams are removed. */
+  setProjectOrg: (projectId: number, orgId: number, ownerTeamId?: number) =>
+    post<{ project: Project; unlinked: ProjectTeam[] | null }>(`/projects/${projectId}/org`, { org_id: orgId, owner_team_id: ownerTeamId ?? 0 }),
   listProjectTeams: (projectId: number) =>
     get<{ teams: ProjectTeam[] | null }>(`/projects/${projectId}/teams`).then(r => r.teams ?? []),
   setProjectTeam: (projectId: number, teamId: number, role: ProjectTeamRole) =>

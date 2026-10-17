@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, PieChart, LayoutGrid, Settings, ShieldCheck,
+  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, ShieldCheck,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -123,10 +123,17 @@ export function AppShell() {
         {me && (
           <div className="mt-auto flex items-center gap-2.5 px-4 py-3 border-t border-line">
             <Avatar name={me.name || me.email} kind={me.kind} />
-            <div className="min-w-0">
+            <div className="min-w-0 flex-1">
               <div className="text-[13px] text-ink truncate">{me.name || me.email}</div>
               <div className="amp-num text-[10.5px] text-ink-3 truncate">{isAdmin ? 'admin' : me.kind === 'agent' ? 'agent' : orgRoleLabel} · {me.email}</div>
             </div>
+            {/* Signed in through the browser: oauth2-proxy clears the session and sends you to sign in again. */}
+            {me.user_id != null && !me.via_token && (
+              <a href="/oauth2/sign_out?rd=%2F" title="Sign out" aria-label="Sign out"
+                className="shrink-0 p-1.5 text-ink-3 hover:text-ink hover:bg-surface-3 transition-colors">
+                <LogOut size={14} />
+              </a>
+            )}
           </div>
         )}
       </aside>

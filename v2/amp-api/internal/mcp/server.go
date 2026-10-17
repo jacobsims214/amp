@@ -166,13 +166,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.open(s.manageInvites)))
 
 	mcp.AddTool(tool("amp_manage_project_teams",
-		"List the teams with access to a project, link a team (of the project's org) as owner or member, or unlink one. "+
-			"Changing links requires project owner access. A project always keeps at least one owner team.",
+		"List the teams with access to a project, link a team (of the project's org) as owner or member, unlink one, "+
+			"or move the project to another org (set_org). Project owners and org admins change any link; a team's lead may "+
+			"link or unlink their own team as a member team. A project always keeps at least one owner team. "+
+			"set_org: global admins may place any project (including one with no org); org owners/admins may move a "+
+			"project between orgs they administer. Links to teams outside the new org are removed; pass team_id to make "+
+			"a team of the new org an owner team.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-			"action":     str("REQUIRED. One of: list, link, unlink."),
-			"team_id":    num("For link/unlink: team ID."),
+			"action":     str("REQUIRED. One of: list, link, unlink, set_org."),
+			"team_id":    num("For link/unlink: team ID. For set_org (optional): a team of the new org to make an owner team."),
 			"role":       str("For link: owner or member (default member)."),
+			"org_id":     num("For set_org: the org to put the project in."),
 		}), wrap(ctx, s.guard(authz.Member, s.manageProjectTeams)))
 
 	mcp.AddTool(tool("amp_find_by_metadata",
@@ -2692,8 +2697,22 @@ func (s *Server) manageProjectTeams(rctx context.Context, args map[string]interf
 		} else {
 			teams, err = s.svc.RemoveProjectTeam(rctx, p, projectID, teamID)
 		}
+	case "set_org":
+		orgID, oerr := reqInt(args, "org_id")
+		if oerr != nil {
+			return nil, oerr
+		}
+		proj, removed, merr := s.svc.MoveProjectToOrg(rctx, p, projectID, orgID, optInt(args, "team_id", 0))
+		if merr != nil {
+			return nil, merr
+		}
+		teams, err = s.svc.ListProjectTeams(rctx, p, projectID)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"project": proj, "teams": teams, "unlinked": removed})
 	default:
-		return nil, badAction(a, "list, link, unlink")
+		return nil, badAction(a, "list, link, unlink, set_org")
 	}
 	if err != nil {
 		return nil, err
