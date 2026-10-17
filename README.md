@@ -153,3 +153,9 @@ make sync-global     # merge v2 skills + prompts into ~/.config/opencode
 
 `archive/` contains the original v1 implementation which used Odoo as the backend.
 Kept for reference only. All active development is in `v2/`.
+
+---
+
+## License
+
+AMP is open source under the [Apache License 2.0](./LICENSE).
