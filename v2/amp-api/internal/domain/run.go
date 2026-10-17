@@ -50,12 +50,16 @@ type Usage struct {
 	CacheWriteTokens int64    `json:"cache_write_tokens"`
 	CostUSD          float64  `json:"cost_usd"`
 	Unreported       int      `json:"unreported"` // runs with no token counts
+	Abandoned        int      `json:"abandoned"`  // runs that died or were stopped: rework
 	Models           []string `json:"models,omitempty"`
 }
 
 // Add counts one run.
 func (u *Usage) Add(r Run) {
 	u.Runs++
+	if r.Outcome == RunAbandoned {
+		u.Abandoned++
+	}
 	if r.InputTokens == nil && r.OutputTokens == nil {
 		u.Unreported++
 	}

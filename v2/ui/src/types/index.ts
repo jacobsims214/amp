@@ -611,6 +611,8 @@ export interface Usage {
   cost_usd: number
   /** runs that reported no token counts */
   unreported: number
+  /** runs that died or were stopped (rework) */
+  abandoned?: number
   models?: string[]
 }
 

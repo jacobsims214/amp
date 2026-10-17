@@ -53,6 +53,7 @@ func addUsage(dst *domain.Usage, src *domain.Usage) {
 	dst.CacheWriteTokens += src.CacheWriteTokens
 	dst.CostUSD += src.CostUSD
 	dst.Unreported += src.Unreported
+	dst.Abandoned += src.Abandoned
 }
 
 // OrgPortfolio builds the portfolio for orgID: every project in it that p can

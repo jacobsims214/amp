@@ -79,7 +79,7 @@ export function Portfolio() {
             { label: 'Projects', value: pf.projects.length, sub: `${pf.total.tickets} tickets` },
             { label: 'Done', value: pf.total.completed, sub: `in the last ${RANGES[range]} days` },
             { label: 'Questions', value: pf.total.states.flagged, sub: 'waiting on a person', alarm: pf.total.states.flagged > 0 },
-            { label: 'Agent spend', value: usd(pf.total.usage.cost_usd), sub: `${tokens(tk(pf.total.usage))} tokens · ${pf.total.usage.runs} runs` },
+            { label: 'Agent spend', value: usd(pf.total.usage.cost_usd), sub: `${tokens(tk(pf.total.usage))} tokens · ${pf.total.usage.runs} runs${pf.total.usage.abandoned ? ` · ${pf.total.usage.abandoned} abandoned` : ''}` },
             { label: 'Capex', value: usd(pf.total.capex.cost_usd), sub: `${tokens(tk(pf.total.capex))} tokens · ${pf.total.capex_tickets} tickets` },
             { label: 'Opex', value: usd(pf.total.opex.cost_usd), sub: `${tokens(tk(pf.total.opex))} tokens · ${pf.total.opex_tickets} tickets` },
           ]} />
