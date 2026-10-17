@@ -140,6 +140,10 @@ channel: Priya (Product) and Dana (Finance).
   - Provider stream timeouts and a 60-second AMP MCP timeout.
   - The manager gets 60 steps.
 
+After the permission fix, Alex's tickets completed one after another (#161, #210, #159, #154,
+#155), each with a full run record: model, tokens, cost, branch, commit, pushed. The abandoned
+runs before them show the rework, for example 5 abandoned runs on #161.
+
 ## What the round showed
 
 - **Visibility held where it matters to a lead.** Morgan found the stalls (quiet), the merge
@@ -167,5 +171,9 @@ channel: Priya (Product) and Dana (Finance).
    exact.
 4. Restore covers tickets, not deleted stories or epics; restoring a ticket whose story is gone
    is refused.
-5. The demo agents can read files outside their checkout (they found AMP's source). Sandboxing is
+5. Agents can reach the host's Docker: the local-dev-stack worker ran `docker compose up` on the
+   host, and the extra containers added to the load when Docker Desktop's VM crashed mid-run. (It
+   was restarted, and AMP and the sessions recovered with no data lost.) Templates should run
+   dev stacks inside the project's own sandbox or tell agents not to start host services.
+6. The demo agents can read files outside their checkout (they found AMP's source). Sandboxing is
    the harness's job, but the template could ship tighter defaults.
