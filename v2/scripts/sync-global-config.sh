@@ -69,13 +69,13 @@ for f in "${V2_OPENCODE}/plugin"/*.(js|ts)(N); do
   cp "$f" "${GLOBAL_DIR}/plugin/"
   ok "  plugin: ${f:t}"
 done
-python3 - "${GLOBAL_DIR}/package.json" "${V2_OPENCODE}/package.json" <<'PYEOF'
+python3 - "${GLOBAL_DIR}/package.json" <<'PYEOF'
 import json, os, sys
-dst, src = sys.argv[1], sys.argv[2]
+dst = sys.argv[1]
 d = json.load(open(dst)) if os.path.exists(dst) else {}
 deps = d.setdefault("dependencies", {})
-for k, v in json.load(open(src)).get("dependencies", {}).items():
-    deps.setdefault(k, v)
+# What the AMP plugins import (.opencode/package.json is generated and gitignored).
+deps.setdefault("zod", "4.1.8")
 json.dump(d, open(dst, "w"), indent=2)
 PYEOF
 (cd "${GLOBAL_DIR}" && npm install --silent >/dev/null 2>&1) && ok "  plugin dependencies installed" || info "  run npm install in ${GLOBAL_DIR} for plugin dependencies"
