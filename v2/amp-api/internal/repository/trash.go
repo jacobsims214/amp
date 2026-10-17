@@ -147,3 +147,152 @@ func (r *Repo) RestoreTask(ctx context.Context, projectID, taskID int) (*Restore
 	}
 	return &RestoredTask{TaskID: taskID, ProjectID: projectID, EpicID: epicID, StoryID: storyID, Dependents: dependents, MissingDeps: missing}, nil
 }
+
+// ---- Deleted epics and stories ----
+
+// Group kinds in the trash.
+const (
+	GroupEpic  = "epic"
+	GroupStory = "story"
+)
+
+// TrashGroup snapshots an epic (with its stories) or a story before it is
+// deleted: the rows, their owners, and which tickets go with it. The tickets
+// themselves are trashed with TrashTasks.
+func (r *Repo) TrashGroup(ctx context.Context, kind string, id int, taskIDs []int, deletedBy *int) error {
+	var q string
+	switch kind {
+	case GroupEpic:
+		q = `INSERT INTO deleted_groups (kind, item_id, project_id, epic_id, name, snapshot, task_ids, deleted_by)
+		SELECT 'epic', e.id, e.project_id, e.id, e.name,
+		       jsonb_build_object(
+		         'epic', to_jsonb(e.*),
+		         'epic_owners', COALESCE((SELECT jsonb_agg(to_jsonb(o.*)) FROM epic_owners o WHERE o.epic_id = e.id), '[]'::jsonb),
+		         'stories', COALESCE((SELECT jsonb_agg(to_jsonb(s.*) ORDER BY s.id) FROM stories s WHERE s.epic_id = e.id), '[]'::jsonb),
+		         'story_owners', COALESCE((SELECT jsonb_agg(to_jsonb(o.*)) FROM story_owners o JOIN stories s ON s.id = o.story_id WHERE s.epic_id = e.id), '[]'::jsonb)),
+		       $2, $3
+		  FROM epics e WHERE e.id = $1`
+	case GroupStory:
+		q = `INSERT INTO deleted_groups (kind, item_id, project_id, epic_id, name, snapshot, task_ids, deleted_by)
+		SELECT 'story', s.id, s.project_id, s.epic_id, s.name,
+		       jsonb_build_object(
+		         'stories', jsonb_build_array(to_jsonb(s.*)),
+		         'story_owners', COALESCE((SELECT jsonb_agg(to_jsonb(o.*)) FROM story_owners o WHERE o.story_id = s.id), '[]'::jsonb)),
+		       $2, $3
+		  FROM stories s WHERE s.id = $1`
+	default:
+		return fmt.Errorf("trash: unknown kind %q", kind)
+	}
+	if taskIDs == nil {
+		taskIDs = []int{}
+	}
+	_, err := r.db.Exec(ctx, q+`
+		ON CONFLICT (kind, item_id) DO UPDATE SET snapshot = EXCLUDED.snapshot, task_ids = EXCLUDED.task_ids,
+		  deleted_by = EXCLUDED.deleted_by, deleted_at = NOW()`, id, taskIDs, deletedBy)
+	return err
+}
+
+// DeletedGroup is an epic or story in the trash.
+type DeletedGroup struct {
+	Kind      string    `json:"kind"`
+	ID        int       `json:"id"`
+	ProjectID int       `json:"project_id"`
+	EpicID    int       `json:"epic_id"`
+	Name      string    `json:"name"`
+	TaskIDs   []int     `json:"task_ids"`
+	Stories   int       `json:"stories"`
+	DeletedBy *int      `json:"deleted_by,omitempty"`
+	DeletedAt time.Time `json:"deleted_at"`
+	// EpicExists says whether a story can be restored where it was (an
+	// epic can always be restored).
+	EpicExists bool `json:"epic_exists"`
+}
+
+// ListDeletedGroups lists a project's deleted epics and stories, newest
+// first (30 days).
+func (r *Repo) ListDeletedGroups(ctx context.Context, projectID int) ([]DeletedGroup, error) {
+	rows, err := r.db.Query(ctx, `SELECT d.kind, d.item_id, d.project_id, d.epic_id, d.name, d.task_ids,
+		jsonb_array_length(d.snapshot->'stories'), d.deleted_by, d.deleted_at,
+		d.kind = 'epic' OR EXISTS (SELECT 1 FROM epics e WHERE e.id = d.epic_id)
+		FROM deleted_groups d WHERE d.project_id = $1 AND d.deleted_at > NOW() - INTERVAL '30 days'
+		ORDER BY d.deleted_at DESC, d.kind, d.item_id`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (DeletedGroup, error) {
+		var d DeletedGroup
+		err := row.Scan(&d.Kind, &d.ID, &d.ProjectID, &d.EpicID, &d.Name, &d.TaskIDs, &d.Stories, &d.DeletedBy, &d.DeletedAt, &d.EpicExists)
+		return d, err
+	})
+}
+
+// RestoredGroup is what RestoreGroup put back.
+type RestoredGroup struct {
+	Kind     string
+	ID       int
+	EpicID   int
+	StoryIDs []int
+	// TaskIDs are the tickets deleted with it, for the caller to restore.
+	TaskIDs []int
+}
+
+// RestoreGroup puts a trashed epic (with its stories) or story back, with
+// the same IDs and owners. Its tickets are left in the trash for the caller
+// to restore after the actors know about the epic or story.
+func (r *Repo) RestoreGroup(ctx context.Context, projectID int, kind string, id int) (*RestoredGroup, error) {
+	tx, err := r.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	g := &RestoredGroup{Kind: kind, ID: id}
+	var snap []byte
+	err = tx.QueryRow(ctx, `SELECT epic_id, task_ids, snapshot FROM deleted_groups WHERE kind = $1 AND item_id = $2 AND project_id = $3 FOR UPDATE`,
+		kind, id, projectID).Scan(&g.EpicID, &g.TaskIDs, &snap)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("%s %d is not in this project's trash", kind, id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if kind == GroupStory {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM epics WHERE id = $1)`, g.EpicID).Scan(&exists); err != nil {
+			return nil, err
+		}
+		if !exists {
+			return nil, fmt.Errorf("story %d's epic #%d was deleted too; restore the epic first", id, g.EpicID)
+		}
+	}
+	qs := []string{}
+	if kind == GroupEpic {
+		qs = append(qs,
+			`INSERT INTO epics SELECT * FROM jsonb_populate_record(NULL::epics, $1::jsonb->'epic')`,
+			`INSERT INTO epic_owners SELECT * FROM jsonb_populate_recordset(NULL::epic_owners, $1::jsonb->'epic_owners')
+			 WHERE user_id IN (SELECT id FROM users) ON CONFLICT DO NOTHING`)
+	}
+	qs = append(qs,
+		`INSERT INTO stories SELECT * FROM jsonb_populate_recordset(NULL::stories, $1::jsonb->'stories') ON CONFLICT DO NOTHING`,
+		`INSERT INTO story_owners SELECT * FROM jsonb_populate_recordset(NULL::story_owners, $1::jsonb->'story_owners')
+		 WHERE user_id IN (SELECT id FROM users) ON CONFLICT DO NOTHING`)
+	for _, q := range qs {
+		if _, err := tx.Exec(ctx, q, snap); err != nil {
+			return nil, fmt.Errorf("restore %s %d: %w", kind, id, err)
+		}
+	}
+	var s struct {
+		Stories []struct {
+			ID int `json:"id"`
+		} `json:"stories"`
+	}
+	if err := json.Unmarshal(snap, &s); err != nil {
+		return nil, err
+	}
+	for _, st := range s.Stories {
+		g.StoryIDs = append(g.StoryIDs, st.ID)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM deleted_groups WHERE kind = $1 AND item_id = $2`, kind, id); err != nil {
+		return nil, err
+	}
+	return g, tx.Commit(ctx)
+}

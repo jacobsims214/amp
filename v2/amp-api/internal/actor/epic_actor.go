@@ -138,6 +138,20 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgReconcileDeps:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgRestoreStory:
+		if _, ok := a.stories[msg.StoryID]; ok {
+			msg.ReplyCh <- ReplySimple{}
+			return
+		}
+		st, err := a.repo.GetStory(context.Background(), msg.StoryID)
+		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("load restored story %d: %w", msg.StoryID, err)}
+			return
+		}
+		a.stories[st.ID] = a.spawnStoryActor(ctx, *st)
+		a.storyStates[st.ID] = st.State
+		msg.ReplyCh <- ReplySimple{}
+
 	case *MsgAdoptTask:
 		pid, ok := a.stories[msg.StoryID]
 		if !ok {

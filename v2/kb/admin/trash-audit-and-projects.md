@@ -7,12 +7,17 @@ tags: [trash, restore, audit, archive, export, import, webhooks]
 
 ## Trash
 
-Deleted tickets are kept for 30 days with their comments, history, runs and links.
-- UI: **Settings → Trash**: restore one or several.
-- Agents: `amp_list_deleted_tasks`, `amp_restore_tasks`.
-Restore rather than re-create: the history comes back, and tickets restored together are
-re-linked to each other. Restore covers tickets; a ticket whose story was deleted can't be
-restored until the story exists again. The person who deleted a ticket, or a lead, can restore it.
+Deleted tickets, stories and epics are kept for 30 days: tickets with their comments, history,
+runs and links; stories and epics with their tickets (and an epic with its stories and
+metadata), all under their original IDs.
+- UI: **Settings → Trash**. A deleted epic or story is listed once, with the tickets that went
+  with it.
+- Agents: `amp_list_deleted_tasks`, then `amp_restore_tasks` with `task_ids`, `story_ids` and/or
+  `epic_ids`.
+Restore rather than re-create: the history comes back, and restored tickets are re-linked to each
+other and to the rest of the plan. A ticket needs its story and a story its epic; restore them in
+the same call and AMP brings them back in order. The person who deleted something, or a lead,
+can restore it.
 
 ## Audit log
 

@@ -7,8 +7,8 @@
  * Exports CSV with every key.
  */
 import { useEffect, useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { Download, Loader2 } from 'lucide-react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { Building2, Download, Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { PageHeader, Panel, Readouts } from '../components/ui/PageHeader'
@@ -21,6 +21,7 @@ type Range = keyof typeof RANGES
 const tk = (u?: Usage) => (u ? u.input_tokens + u.output_tokens : 0)
 const SPLIT_KEY = 'amp.portfolio.split'
 const COLS_KEY = 'amp.portfolio.columns'
+const ORG_KEY = 'amp.portfolio.org'
 const load = (k: string) => { try { return localStorage.getItem(k) } catch { return null } }
 const save = (k: string, v: string) => { try { localStorage.setItem(k, v) } catch { /* per-viewer preference only */ } }
 
@@ -38,9 +39,13 @@ function csv(pf: PortfolioData): string {
 
 export function Portfolio() {
   const { me } = useAuth()
-  const orgs = me?.orgs ?? []
-  const [orgId, setOrgId] = useState<number | null>(null)
-  const org = orgId ?? orgs[0]?.id ?? null
+  const orgs = useMemo(() => me?.orgs ?? [], [me])
+  // Which org: ?org= (shareable), else the one you last looked at, else your first.
+  const [params, setParams] = useSearchParams()
+  const pick = (id: number | null) => (id != null && orgs.some(o => o.id === id) ? id : null)
+  const org = pick(Number(params.get('org')) || null) ?? pick(Number(load(ORG_KEY)) || null) ?? orgs[0]?.id ?? null
+  const orgName = orgs.find(o => o.id === org)?.name
+  const switchOrg = (id: number) => { save(ORG_KEY, String(id)); setParams(p => { p.set('org', String(id)); return p }, { replace: true }) }
   const [range, setRange] = useState<Range>('30d')
   const [splitBy, setSplitBy] = useState<string>(() => load(SPLIT_KEY) ?? 'capitalizable')
   const [hidden, setHidden] = useState<Set<string>>(() => new Set((load(COLS_KEY) ?? '').split(',').filter(Boolean)))
@@ -68,19 +73,15 @@ export function Portfolio() {
     if (!pf) return
     const url = URL.createObjectURL(new Blob([csv(pf)], { type: 'text/csv' }))
     const a = document.createElement('a')
-    a.href = url; a.download = `amp-portfolio-${org}-${range}.csv`; a.click()
+    a.href = url; a.download = `amp-portfolio-${(orgName ?? String(org)).toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${range}.csv`; a.click()
     URL.revokeObjectURL(url)
   }
 
   return (
     <div className="flex flex-col min-h-full">
-      <PageHeader crumb="Overview" title="Portfolio" meta="Every project in the org: progress, open questions, and agent spend, split by any metadata you track."
+      <PageHeader crumb="Overview · Portfolio" title={orgName ?? 'Portfolio'}
+        meta={`Every project you can see in ${orgName ?? 'your org'}: progress, open questions, and agent spend, split by any metadata you track.`}
         actions={<>
-          {orgs.length > 1 && (
-            <select className="amp-input !w-auto" value={org ?? ''} onChange={e => setOrgId(Number(e.target.value))} aria-label="Organization">
-              {orgs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
-            </select>
-          )}
           <div className="flex border border-line" role="group" aria-label="Range">
             {(Object.keys(RANGES) as Range[]).map(r => (
               <button key={r} type="button" onClick={() => setRange(r)} aria-pressed={range === r}
@@ -90,6 +91,17 @@ export function Portfolio() {
           <button type="button" className="amp-btn" onClick={download} disabled={!pf}><Download size={12} />CSV</button>
         </>} />
       <div className="p-7 pt-5 grid gap-4">
+        {orgs.length > 1 && (
+          <div className="flex items-center gap-2 flex-wrap" role="tablist" aria-label="Organization">
+            <span className="amp-label flex items-center gap-1.5"><Building2 size={12} />Org</span>
+            {orgs.map(o => (
+              <button key={o.id} type="button" role="tab" aria-selected={o.id === org} onClick={() => switchOrg(o.id)}
+                className={`px-2.5 py-1.5 text-[12.5px] border cursor-pointer ${o.id === org ? 'bg-ink text-on-ink border-ink' : 'bg-surface text-ink-2 border-line hover:text-ink'}`}>
+                {o.name}
+              </button>
+            ))}
+          </div>
+        )}
         {org == null && <div className="amp-panel px-4 py-4 text-[13px] text-ink-2">You're not in an organization yet.</div>}
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         {org != null && !pf && !error && <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-3" /></div>}
@@ -133,6 +145,11 @@ export function Portfolio() {
                     <th key={h} className={`amp-label px-3 py-2.5 border-b border-line whitespace-nowrap ${i > cols.length ? 'text-right' : 'text-left'}`}>{h}</th>))}
                 </tr></thead>
                 <tbody>
+                  {pf.projects.length === 0 && (
+                    <tr><td colSpan={6 + cols.length + vals.length} className="px-3 py-6 text-center text-[13px] text-ink-2">
+                      No projects you can see in {orgName ?? 'this org'} yet.
+                    </td></tr>
+                  )}
                   {pf.projects.map(p => (
                     <tr key={p.project_id}>
                       <td className="px-3 h-[38px] border-b border-line"><Link to={`/project/${p.project_id}/report`} className="font-semibold text-ink hover:underline">{p.name}</Link>{p.state === 'archived' && <span className="amp-num text-[11px] text-ink-3"> · archived</span>}</td>

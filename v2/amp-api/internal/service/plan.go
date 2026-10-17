@@ -11,6 +11,7 @@ import (
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/kb"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Planning: creating tickets with their dependencies, changing the
@@ -784,6 +785,9 @@ func (s *Service) DeleteStory(ctx context.Context, p authz.Principal, st *domain
 		return err
 	}
 	_, err = s.deleteTickets(ctx, p, st.ProjectID, ids, func() error {
+		if err := s.Repo.TrashGroup(ctx, repository.GroupStory, st.ID, ids, deleterOf(p)); err != nil {
+			return err
+		}
 		return s.Repo.DeleteStory(ctx, st.ID)
 	}, &actor.MsgDeleteStory{StoryID: st.ID})
 	if err == nil {
@@ -801,6 +805,9 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 		return err
 	}
 	_, err = s.deleteTickets(ctx, p, e.ProjectID, ids, func() error {
+		if err := s.Repo.TrashGroup(ctx, repository.GroupEpic, e.ID, ids, deleterOf(p)); err != nil {
+			return err
+		}
 		return s.Repo.DeleteEpic(ctx, e.ID)
 	}, &actor.MsgDeleteEpic{EpicID: e.ID})
 	if err == nil {
@@ -808,6 +815,15 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 			Summary: fmt.Sprintf("deleted epic %q with its stories and %d tickets", e.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
 	}
 	return err
+}
+
+// deleterOf is who the trash records as deleting something.
+func deleterOf(p authz.Principal) *int {
+	if !p.HasUser() {
+		return nil
+	}
+	uid := p.UserID
+	return &uid
 }
 
 // deleteTickets runs a delete, evicts the deleted work from the project's
@@ -819,12 +835,7 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 		return nil, err
 	}
 	// Keep a copy in the trash so the deletion can be undone.
-	var by *int
-	if p.HasUser() {
-		uid := p.UserID
-		by = &uid
-	}
-	if err := s.Repo.TrashTasks(ctx, ids, by); err != nil {
+	if err := s.Repo.TrashTasks(ctx, ids, deleterOf(p)); err != nil {
 		return nil, err
 	}
 	if err := del(); err != nil {

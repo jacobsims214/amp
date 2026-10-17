@@ -39,7 +39,7 @@ Good tickets:
 
 Fix it in place, never by deleting and re-creating: `amp_set_task_dependencies`,
 `amp_update_task`, `amp_update_epic` / `amp_update_story`, `amp_move_task`, `amp_move_story`.
-Delete only unwanted work; deleted tickets go to the trash and can be restored.
+Delete only unwanted work; deleted tickets, stories and epics go to the trash and can be restored.
 
 ## Approval
 

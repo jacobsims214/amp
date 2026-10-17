@@ -266,6 +266,23 @@ type MsgRestoreTask struct {
 	ReplyCh chan ReplyGetTask
 }
 
+// MsgRestoreEpic brings an epic restored from the trash (already back in
+// the database, with its stories) into the project's actors. Its tickets
+// follow with MsgRestoreTask.
+type MsgRestoreEpic struct {
+	EpicID  int
+	ReplyCh chan ReplySimple
+}
+
+// MsgRestoreStory brings a story restored from the trash (already back in
+// the database) into its epic's actors. Its tickets follow with
+// MsgRestoreTask.
+type MsgRestoreStory struct {
+	EpicID  int
+	StoryID int
+	ReplyCh chan ReplySimple
+}
+
 // MsgMoveTask moves a task to another story (in the same or another epic).
 type MsgMoveTask struct {
 	TaskID     int

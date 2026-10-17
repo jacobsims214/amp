@@ -649,6 +649,34 @@ export interface TraceHit {
   runs: Run[]
 }
 
+/** An epic (with its stories) or a story in a project's trash. */
+export interface DeletedGroup {
+  kind: 'epic' | 'story'
+  id: number
+  project_id: number
+  epic_id: number
+  name: string
+  task_ids: number[]
+  stories: number
+  deleted_by?: number
+  deleted_at: string
+  /** A story can only come back while its epic exists (or comes back with it). */
+  epic_exists: boolean
+}
+
+export interface ProjectTrash {
+  tickets: DeletedTask[]
+  groups: DeletedGroup[]
+}
+
+export interface GroupRestoreResult {
+  kind: 'epic' | 'story'
+  id: number
+  restored: boolean
+  error?: string
+  tickets?: { task_id: number; restored: boolean; error?: string }[]
+}
+
 /** A ticket in a project's trash. */
 export interface DeletedTask {
   task_id: number

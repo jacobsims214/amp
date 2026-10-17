@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -113,6 +114,115 @@ func (s *Service) RestoreTasks(ctx context.Context, p authz.Principal, projectID
 	if len(restored) > 0 {
 		s.audit(ctx, p, domain.AuditEntry{Action: "task.restore", ProjectID: intRef(projectID), TargetType: "task",
 			Summary: fmt.Sprintf("restored %d ticket(s) from the trash: %s", len(restored), joinIDs(restored)), Details: map[string]any{"task_ids": restored}})
+	}
+	return out, nil
+}
+
+// DeletedGroups lists a project's deleted epics and stories for its members.
+func (s *Service) DeletedGroups(ctx context.Context, p authz.Principal, projectID int) ([]repository.DeletedGroup, error) {
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+		return nil, err
+	}
+	return s.Repo.ListDeletedGroups(ctx, projectID)
+}
+
+// GroupRestoreResult is one epic's or story's outcome in a restore.
+type GroupRestoreResult struct {
+	Kind     string `json:"kind"`
+	ID       int    `json:"id"`
+	Restored bool   `json:"restored"`
+	Error    string `json:"error,omitempty"`
+	// Tickets are the outcomes for the tickets deleted with it.
+	Tickets []RestoreResult `json:"tickets,omitempty"`
+}
+
+// RestoreGroups puts deleted epics (with their stories) and stories back,
+// then the tickets that were deleted with them. Epics go first, so a story
+// and its epic can come back in one call. A project lead, or whoever
+// deleted it, may restore it.
+func (s *Service) RestoreGroups(ctx context.Context, p authz.Principal, projectID int, epicIDs, storyIDs []int) ([]GroupRestoreResult, error) {
+	lvl, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member)
+	if err != nil {
+		return nil, err
+	}
+	trash, err := s.Repo.ListDeletedGroups(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	type key struct {
+		kind string
+		id   int
+	}
+	inTrash := map[key]repository.DeletedGroup{}
+	for _, g := range trash {
+		inTrash[key{g.Kind, g.ID}] = g
+	}
+	pid, err := s.Registry.Get(projectID)
+	if err != nil {
+		return nil, err
+	}
+	out := []GroupRestoreResult{}
+	var names []string
+	restore := func(kind string, id int) {
+		res := GroupRestoreResult{Kind: kind, ID: id}
+		defer func() { out = append(out, res) }()
+		d, ok := inTrash[key{kind, id}]
+		if !ok {
+			res.Error = "not in this project's trash"
+			return
+		}
+		if lvl < authz.Lead && !p.Super && (d.DeletedBy == nil || *d.DeletedBy != p.UserID) {
+			res.Error = "only a project lead or whoever deleted it can restore it"
+			return
+		}
+		g, err := s.Repo.RestoreGroup(ctx, projectID, kind, id)
+		if err != nil {
+			res.Error = err.Error()
+			return
+		}
+		replyCh := make(chan actor.ReplySimple, 1)
+		if kind == repository.GroupEpic {
+			s.Registry.System().Root.Send(pid, &actor.MsgRestoreEpic{EpicID: id, ReplyCh: replyCh})
+		} else {
+			s.Registry.System().Root.Send(pid, &actor.MsgRestoreStory{EpicID: g.EpicID, StoryID: id, ReplyCh: replyCh})
+		}
+		if reply := <-replyCh; reply.Err != nil {
+			res.Restored, res.Error = true, "restored, but not loaded: "+reply.Err.Error()
+			return
+		}
+		res.Restored = true
+		names = append(names, fmt.Sprintf("%s %q", kind, d.Name))
+		// Its tickets, as far as they're still in the trash.
+		deleted, err := s.Repo.ListDeletedTasks(ctx, projectID)
+		if err != nil {
+			res.Error = "restored, but its tickets weren't: " + err.Error()
+			return
+		}
+		want := map[int]bool{}
+		for _, t := range g.TaskIDs {
+			want[t] = true
+		}
+		var ids []int
+		for _, t := range deleted {
+			if want[t.TaskID] {
+				ids = append(ids, t.TaskID)
+			}
+		}
+		if len(ids) > 0 {
+			if res.Tickets, err = s.RestoreTasks(ctx, p, projectID, ids); err != nil {
+				res.Error = "restored, but its tickets weren't: " + err.Error()
+			}
+		}
+	}
+	for _, id := range epicIDs {
+		restore(repository.GroupEpic, id)
+	}
+	for _, id := range storyIDs {
+		restore(repository.GroupStory, id)
+	}
+	if len(names) > 0 {
+		s.audit(ctx, p, domain.AuditEntry{Action: "plan.restore", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+			Summary: "restored from the trash: " + strings.Join(names, ", "), Details: map[string]any{"epic_ids": epicIDs, "story_ids": storyIDs}})
 	}
 	return out, nil
 }

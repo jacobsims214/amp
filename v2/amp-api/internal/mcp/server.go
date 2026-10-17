@@ -490,14 +490,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"outcome":  str("Optional. completed | blocked | progress (default) | abandoned."),
 			"agent_id": str("Optional. The agent profile that ran (defaults to the ticket's agent)."),
 		})), wrap(ctx, s.guard(authz.Member, s.reportRun)))
-	mcp.AddTool(tool("amp_list_deleted_tasks", "A project's trash: tickets deleted in the last 30 days, which amp_restore_tasks can bring back.",
+	mcp.AddTool(tool("amp_list_deleted_tasks", "A project's trash: tickets, epics and stories deleted in the last 30 days, which amp_restore_tasks can bring back.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listDeleted)))
 	mcp.AddTool(tool("amp_restore_tasks",
-		"Bring deleted tickets back from the trash with their comments, history, owner, state and dependency links. "+
-			"A project lead, or whoever deleted a ticket, may restore it. The ticket's story must still exist.",
+		"Bring deleted work back from the trash. Tickets come back with their comments, history, owner, state and "+
+			"dependency links; a deleted epic comes back with its stories and their tickets, a deleted story with its "+
+			"tickets, all with their original IDs. A project lead, or whoever deleted it, may restore it. A ticket needs "+
+			"its story and a story its epic: restore those in the same call (epics, then stories, then tickets).",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
-			"task_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "REQUIRED. Ticket IDs to restore."},
+			"task_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Ticket IDs to restore."},
+			"epic_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Deleted epic IDs to restore, with their stories and tickets."},
+			"story_ids":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Deleted story IDs to restore, with their tickets."},
 		}), wrap(ctx, s.guard(authz.Member, s.restoreTasks)))
 	mcp.AddTool(tool("amp_project_day_reports",
 		"The project's standup sheet: everyone on the project and the day report they saved for a day, narrowed to this "+

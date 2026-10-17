@@ -28,6 +28,6 @@ own agents, with scope arriving through Slack). Each lesson is also in the page 
 9. **Put the ticket ref in every commit.** It's what lets anyone trace code back to its story.
 10. **Don't let agents start host services.** A worker's `docker compose up` added load at the
     worst time.
-11. **Restore, don't re-create.** Deleted tickets keep their history in the trash.
+11. **Restore, don't re-create.** Deleted tickets, stories and epics keep their history in the trash.
 12. **Plan for a sick day.** Handovers with a reason on each ticket meant the work carried on, and
     the returning engineer's agent picked up the full story.

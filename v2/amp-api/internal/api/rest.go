@@ -601,26 +601,41 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "trash":
-		// GET: tickets deleted in the last 30 days. POST trash/restore {task_ids}: bring them back.
+		// GET: tickets, epics and stories deleted in the last 30 days.
+		// POST trash/restore {task_ids, epic_ids, story_ids}: bring them back.
 		if len(parts) > 2 && parts[2] == "restore" {
 			if r.Method != http.MethodPost {
 				http.Error(w, "POST required", 405)
 				return
 			}
 			var body struct {
-				TaskIDs []int `json:"task_ids"`
+				TaskIDs  []int `json:"task_ids"`
+				EpicIDs  []int `json:"epic_ids"`
+				StoryIDs []int `json:"story_ids"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskIDs) == 0 {
-				jsonErr(w, errorf("task_ids is required"), 400)
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.TaskIDs)+len(body.EpicIDs)+len(body.StoryIDs) == 0 {
+				jsonErr(w, errorf("task_ids, epic_ids or story_ids is required"), 400)
 				return
 			}
-			res, err := h.svc.RestoreTasks(r.Context(), pr, projectID, body.TaskIDs)
-			if err != nil {
-				fail(w, err, 500)
-				return
+			out := map[string]interface{}{"results": []service.RestoreResult{}}
+			if len(body.EpicIDs)+len(body.StoryIDs) > 0 {
+				groups, err := h.svc.RestoreGroups(r.Context(), pr, projectID, body.EpicIDs, body.StoryIDs)
+				if err != nil {
+					fail(w, err, 500)
+					return
+				}
+				out["groups"] = groups
+			}
+			if len(body.TaskIDs) > 0 {
+				res, err := h.svc.RestoreTasks(r.Context(), pr, projectID, body.TaskIDs)
+				if err != nil {
+					fail(w, err, 500)
+					return
+				}
+				out["results"] = res
 			}
 			h.hub.Publish(domain.Event{Type: domain.EventTaskUpdated, ProjectID: projectID, Payload: map[string]interface{}{"restored": body.TaskIDs}, At: time.Now()})
-			jsonOK(w, map[string]interface{}{"results": res})
+			jsonOK(w, out)
 			return
 		}
 		trash, err := h.svc.DeletedTasks(r.Context(), pr, projectID)
@@ -628,7 +643,12 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			fail(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"deleted": trash, "count": len(trash)})
+		groups, err := h.svc.DeletedGroups(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"deleted": trash, "count": len(trash), "groups": groups})
 		return
 
 	case "approve-plan":

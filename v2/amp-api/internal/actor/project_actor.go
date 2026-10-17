@@ -207,6 +207,30 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgMoveTask:
 		msg.ReplyCh <- a.moveTask(ctx, msg)
 
+	case *MsgRestoreEpic:
+		if _, ok := a.epics[msg.EpicID]; ok {
+			msg.ReplyCh <- ReplySimple{}
+			return
+		}
+		e, err := a.repo.GetEpic(context.Background(), msg.EpicID)
+		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("load restored epic %d: %w", msg.EpicID, err)}
+			return
+		}
+		a.epics[e.ID] = a.spawnEpicActor(ctx, *e)
+		a.epicStates[e.ID] = e.State
+		msg.ReplyCh <- ReplySimple{}
+
+	case *MsgRestoreStory:
+		epic, ok := a.epics[msg.EpicID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("epic %d not found", msg.EpicID)}
+			return
+		}
+		replyCh := make(chan ReplySimple, 1)
+		ctx.Send(epic, &MsgRestoreStory{EpicID: msg.EpicID, StoryID: msg.StoryID, ReplyCh: replyCh})
+		msg.ReplyCh <- <-replyCh
+
 	case *MsgRestoreTask:
 		epic, ok := a.epics[msg.EpicID]
 		if !ok {

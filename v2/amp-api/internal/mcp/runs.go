@@ -146,7 +146,11 @@ func (s *Server) listDeleted(rctx context.Context, args map[string]interface{}) 
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"deleted": trash, "count": len(trash)})
+	groups, err := s.svc.DeletedGroups(rctx, caller(rctx).p, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"deleted": trash, "count": len(trash), "deleted_epics_and_stories": groups})
 }
 
 func (s *Server) restoreTasks(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -155,14 +159,28 @@ func (s *Server) restoreTasks(rctx context.Context, args map[string]interface{})
 		return nil, err
 	}
 	ids := optIntSlice(args, "task_ids")
-	if len(ids) == 0 {
-		return nil, fmt.Errorf("task_ids is required")
+	epics, stories := optIntSlice(args, "epic_ids"), optIntSlice(args, "story_ids")
+	if len(ids) == 0 && len(epics) == 0 && len(stories) == 0 {
+		return nil, fmt.Errorf("pass task_ids, epic_ids or story_ids")
 	}
-	res, err := s.svc.RestoreTasks(rctx, caller(rctx).p, projectID, ids)
-	if err != nil {
-		return nil, err
+	out := map[string]interface{}{}
+	// Epics and stories first, so tickets restored in the same call have
+	// somewhere to go.
+	if len(epics) > 0 || len(stories) > 0 {
+		groups, err := s.svc.RestoreGroups(rctx, caller(rctx).p, projectID, epics, stories)
+		if err != nil {
+			return nil, err
+		}
+		out["groups"] = groups
 	}
-	return jsonResult(map[string]interface{}{"results": res})
+	if len(ids) > 0 {
+		res, err := s.svc.RestoreTasks(rctx, caller(rctx).p, projectID, ids)
+		if err != nil {
+			return nil, err
+		}
+		out["results"] = res
+	}
+	return jsonResult(out)
 }
 
 // compactTasks is amp_list_tasks' small overview: one line per ticket under

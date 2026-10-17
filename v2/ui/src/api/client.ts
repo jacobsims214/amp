@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, Portfolio,
+  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
 } from '../types'
 
 const BASE = '/api'
@@ -203,9 +203,11 @@ export const api = {
     get<{ waiting_to_merge: Run[] | null }>(`/projects/${projectId}/unmerged`).then(r => r.waiting_to_merge ?? []),
   recordRun: (taskId: number, run: Partial<Run>) => post<Run>(`/tasks/${taskId}/runs`, run),
   projectTrash: (projectId: number) =>
-    get<{ deleted: DeletedTask[] | null }>(`/projects/${projectId}/trash`).then(r => r.deleted ?? []),
-  restoreTasks: (projectId: number, taskIds: number[]) =>
-    post<{ results: { task_id: number; restored: boolean; error?: string }[] }>(`/projects/${projectId}/trash/restore`, { task_ids: taskIds }),
+    get<{ deleted: DeletedTask[] | null; groups?: DeletedGroup[] | null }>(`/projects/${projectId}/trash`)
+      .then((r): ProjectTrash => ({ tickets: r.deleted ?? [], groups: r.groups ?? [] })),
+  restoreTasks: (projectId: number, taskIds: number[], groups: { epicIds?: number[]; storyIds?: number[] } = {}) =>
+    post<{ results: { task_id: number; restored: boolean; error?: string }[]; groups?: GroupRestoreResult[] }>(
+      `/projects/${projectId}/trash/restore`, { task_ids: taskIds, epic_ids: groups.epicIds ?? [], story_ids: groups.storyIds ?? [] }),
   getHistory: (taskId: number) =>
     get<{ history: ActivityLog[]; count: number }>(`/tasks/${taskId}/history`).then(r => r.history ?? []),
 
