@@ -707,19 +707,19 @@ func (s *Service) deleteTickets(ctx context.Context, projectID int, ids []int, d
 	return kept, nil
 }
 
-// ---- Answering an agent's flag ----
+// ---- Answering an agent's question ----
 
-// AnswerFlag clears a flag: a ticket an agent blocked with a reason because
-// it needs a person. The answer, if any, is posted as a comment first; then
+// AnswerQuestion answers a question: a ticket an agent blocked with a reason
+// because it needs a person. The answer, if any, is posted as a comment first; then
 // the ticket goes back to ready, or to waiting if it still depends on
 // unfinished work.
-func (s *Service) AnswerFlag(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
+func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
 		return nil, err
 	}
 	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
-		return nil, authz.BadRequest("ticket %d isn't flagged: only a ticket blocked with a reason can be answered", taskID)
+		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
 	}
 	if answer = strings.TrimSpace(answer); answer != "" {
 		added := make(chan actor.ReplyAddComment, 1)

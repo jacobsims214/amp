@@ -403,7 +403,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_list_tasks",
 		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
 			"Pass owner='unassigned' to see the pool anyone can pick up, owner='any' for everything, or a user's email/id. "+
-			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time.",
+			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time. "+
+			"questions lists blocked tickets whose block_reason is a question for a person (they are also in blocked): ask the user, then amp_answer_question.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
@@ -453,11 +454,24 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it.",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 
-	mcp.AddTool(tool("amp_block_task", "Block a task with a reason.",
+	mcp.AddTool(tool("amp_block_task",
+		"Stop work on a ticket because it needs a person: a question, a decision, missing information, or access you don't have. "+
+			"The reason is shown to people in AMP as the question to answer, so write it as one, with the options if there are any. "+
+			"The ticket leaves in-progress and appears in amp_list_tasks' questions list. When someone answers (in the AMP UI, or with "+
+			"amp_answer_question) the answer is posted on the ticket and it goes back to ready to be dispatched again. "+
+			"Not for waiting on other tickets: that's what dependencies are for.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
-			"reason":  str("REQUIRED. Why the task is blocked."),
+			"reason":  str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
 		}), wrap(ctx, s.guard(authz.Member, s.blockTask)))
+	mcp.AddTool(tool("amp_answer_question",
+		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
+			"and the ticket goes back to ready (or to waiting, if it still depends on unfinished tickets), so the next dispatch picks it up "+
+			"with the answer in its comments. Use this when the user answers a worker's question in your chat; people can also answer in the AMP UI.",
+		props{
+			"task_id": num("REQUIRED. Task ID of the ticket with the question."),
+			"answer":  str("REQUIRED. The answer, as the person gave it, with any detail the next worker needs."),
+		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{
@@ -1246,6 +1260,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	inProgress := make([]domain.Task, 0)
 	blocked := make([]domain.Task, 0)
 	scheduled := make([]domain.Task, 0)
+	questions := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
 	tasks := authz.FilterTasks(reply.Tasks, view, me.UserID)
 	for _, t := range tasks {
@@ -1260,6 +1275,9 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 				scheduled = append(scheduled, t)
 			} else {
 				blocked = append(blocked, t)
+				if t.BlockReason != "" {
+					questions = append(questions, t)
+				}
 			}
 		case domain.TaskStateCompleted:
 			completed = append(completed, t)
@@ -1271,6 +1289,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"in_progress":       inProgress,
 		"blocked":           blocked,   // each has blocked_by_ids showing what's in the way
 		"scheduled":         scheduled, // tasks waiting for their start_at time
+		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
@@ -1499,7 +1518,13 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
-	reason := optStr(args, "reason", "")
+	reason, err := reqStr(args, "reason")
+	if err != nil || strings.TrimSpace(reason) == "" {
+		return nil, fmt.Errorf("reason is required: the question or problem a person needs to resolve")
+	}
+	if strings.HasPrefix(reason, "scheduled:") {
+		return nil, fmt.Errorf("reason can't start with \"scheduled:\"; use amp_set_task_start_at to schedule a ticket")
+	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
 		return nil, err
@@ -1518,6 +1543,33 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "blocked"})
+}
+
+func (s *Server) answerQuestion(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	answer, err := reqStr(args, "answer")
+	if err != nil || strings.TrimSpace(answer) == "" {
+		return nil, fmt.Errorf("answer is required")
+	}
+	t, err := s.repo.GetTask(rctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %d not found", taskID)
+	}
+	if err := s.checkProjectNotArchived(rctx, t.ProjectID); err != nil {
+		return nil, err
+	}
+	task, err := s.svc.AnswerQuestion(rctx, caller(rctx).p, taskID, answer)
+	if err != nil {
+		return nil, err
+	}
+	next := "It's ready: dispatch it again and the worker will find the answer in the ticket's comments."
+	if task.State == domain.TaskStateBlocked {
+		next = "It still waits on unfinished dependencies; it becomes ready when they're done."
+	}
+	return jsonResult(map[string]interface{}{"task_id": taskID, "state": task.State, "next": next})
 }
 
 func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

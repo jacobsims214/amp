@@ -1234,7 +1234,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			Answer string `json:"answer"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		t, err := h.svc.AnswerFlag(r.Context(), pr, taskID, body.Answer)
+		t, err := h.svc.AnswerQuestion(r.Context(), pr, taskID, body.Answer)
 		if err != nil {
 			fail(w, err, 400)
 			return

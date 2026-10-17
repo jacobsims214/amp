@@ -19,4 +19,6 @@ Fixing a plan — never delete and re-create tickets to fix them:
 - ticket in the wrong story: amp_move_task; story in the wrong epic: amp_move_story
 - unwanted work: amp_delete_task / amp_delete_story / amp_delete_epic (tickets that depended on it are updated)
 
+QUESTIONS. A subagent can't wait for an answer. If you can't go on without a person (a decision, missing information, access), comment what you found, call amp_block_task with the question as the reason, and stop. The ticket shows as a question in AMP and in amp_list_tasks' questions list. Whoever answers (a person in the AMP UI, or the orchestrator with amp_answer_question) puts the answer on the ticket as a comment and the ticket goes back to ready; the next worker dispatched to it reads the comments first.
+
 Other rules: a ticket's state (backlog/blocked) is derived from its dependencies — don't set it to work around a missing dependency. amp_list_tasks shows your own work unless you pass owner. The project knowledge base (amp_kb_*) holds what agents learned; search it before starting.`
