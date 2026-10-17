@@ -49,7 +49,7 @@ type Usage struct {
 	CacheReadTokens  int64    `json:"cache_read_tokens"`
 	CacheWriteTokens int64    `json:"cache_write_tokens"`
 	CostUSD          float64  `json:"cost_usd"`
-	Unreported       int      `json:"unreported"` // runs with no token counts
+	Unreported       int      `json:"unreported"` // finished runs with no token counts
 	Abandoned        int      `json:"abandoned"`  // runs that died or were stopped: rework
 	Models           []string `json:"models,omitempty"`
 }
@@ -60,7 +60,9 @@ func (u *Usage) Add(r Run) {
 	if r.Outcome == RunAbandoned {
 		u.Abandoned++
 	}
-	if r.InputTokens == nil && r.OutputTokens == nil {
+	// A run that finished its work but reported no tokens leaves a hole in
+	// spend; an abandoned one usually can't report (its agent died).
+	if r.InputTokens == nil && r.OutputTokens == nil && r.Outcome != RunAbandoned {
 		u.Unreported++
 	}
 	if r.InputTokens != nil {
