@@ -237,8 +237,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("Optional. New project name."),
 			"description":   str("Optional. New project description."),
 			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
-			"metadata":      obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
+			"require_plan_approval": boolean("Optional. When true, tickets planned after the plan was last approved can't be dispatched until " +
+				"a person approves the plan again (amp_approve_plan, or Approve plan in AMP)."),
+			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
+
+	mcp.AddTool(tool("amp_approve_plan",
+		"Record that the user approved the project's plan as it stands now, so its tickets may be dispatched. Call it when the "+
+			"user approves your plan in chat (\"approved\", \"go ahead\"), never on your own. People can also approve in AMP's "+
+			"Flight plan. amp_check_plan lists the open tickets planned since the last approval (awaiting_approval); projects with "+
+			"require_plan_approval refuse to dispatch those until the plan is approved.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+		}), wrap(ctx, s.guard(authz.Member, s.approvePlan)))
 
 	// ---- Epics ----
 	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project. Epics and stories group work; what AMP schedules is the "+
@@ -395,7 +406,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_check_plan",
 		"Check a project's plan before dispatching: tickets connected to nothing, too many tickets that can start at once "+
 			"(a sign of missing dependencies), empty stories, and the longest dependency chain. Also repairs tickets stuck "+
-			"blocked on dependencies that are all done. Run it after planning and after changing the plan.",
+			"blocked on dependencies that are all done. Run it after planning and after changing the plan. "+
+			"awaiting_approval lists open tickets planned since the user last approved the plan (see amp_approve_plan).",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.checkPlan)))
@@ -825,6 +837,19 @@ func (s *Server) archiveProject(rctx context.Context, args map[string]interface{
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
+func (s *Server) approvePlan(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	proj, err := s.svc.ApprovePlan(rctx, caller(rctx).p, id)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"project_id": id, "plan_approved_at": proj.PlanApprovedAt,
+		"next": "Approved: dispatch everything in ready_to_dispatch."})
+}
+
 func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
@@ -833,6 +858,9 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	var u domain.ProjectSettings
 	if on, ok := args["open_reassign"].(bool); ok {
 		u.OpenReassign = &on
+	}
+	if on, ok := args["require_plan_approval"].(bool); ok {
+		u.RequirePlanApproval = &on
 	}
 	if v, ok := args["name"].(string); ok {
 		u.Name = &v

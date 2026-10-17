@@ -551,6 +551,21 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "approve-plan":
+		// POST: a person approves the project's plan as it stands now.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		proj, err := h.svc.ApprovePlan(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		h.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
+		jsonOK(w, map[string]interface{}{"project": proj})
+		return
+
 	case "report":
 		// GET ?since=&until= (RFC 3339; default the last 7 days) &group_by=<metadata key>
 		q := r.URL.Query()

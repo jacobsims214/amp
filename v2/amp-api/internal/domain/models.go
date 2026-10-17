@@ -53,10 +53,21 @@ type Project struct {
 	// OpenReassign lets any project member take or reassign a ticket that
 	// isn't in progress. Otherwise only its owner or a lead can.
 	OpenReassign bool `json:"open_reassign"`
+	// Plan approval: when a person last approved the plan, and whether
+	// tickets created after that need a new approval before dispatch.
+	PlanApprovedAt      *time.Time `json:"plan_approved_at,omitempty"`
+	PlanApprovedBy      *int       `json:"plan_approved_by,omitempty"`
+	RequirePlanApproval bool       `json:"require_plan_approval"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// AwaitsApproval reports whether a ticket was planned after the project's
+// plan was last approved (always, if it never was).
+func (p *Project) AwaitsApproval(t *Task) bool {
+	return p.PlanApprovedAt == nil || t.CreatedAt.After(*p.PlanApprovedAt)
 }
 
 // ProjectSettings is a change to a project's settings; nil fields are kept.
@@ -64,6 +75,9 @@ type ProjectSettings struct {
 	Name         *string `json:"name"`
 	Description  *string `json:"description"`
 	OpenReassign *bool   `json:"open_reassign"`
+	// RequirePlanApproval: tickets planned after the last approval can't be
+	// dispatched until someone approves the plan again.
+	RequirePlanApproval *bool `json:"require_plan_approval"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 }

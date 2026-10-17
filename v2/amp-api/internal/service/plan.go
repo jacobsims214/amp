@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -300,15 +301,21 @@ type PlanIssue struct {
 
 // PlanReport summarises a project's dependency graph and what looks wrong.
 type PlanReport struct {
-	OK              bool        `json:"ok"`
-	Tasks           int         `json:"tasks"`
-	OpenTasks       int         `json:"open_tasks"`
-	Dependencies    int         `json:"dependencies"`
-	ReadyNow        []int       `json:"ready_now"`
-	LongestChain    int         `json:"longest_chain"` // tickets on the longest dependency path
-	Issues          []PlanIssue `json:"issues"`
-	RepairedTaskIDs []int       `json:"repaired_task_ids,omitempty"`
-	Summary         string      `json:"summary"`
+	OK bool `json:"ok"`
+	// Plan approval: open tickets planned since the last approval, when
+	// that was, and whether the project requires it before dispatch.
+	AwaitingApproval    []int       `json:"awaiting_approval"`
+	ApprovedAt          *time.Time  `json:"plan_approved_at,omitempty"`
+	ApprovedBy          *int        `json:"plan_approved_by,omitempty"`
+	RequirePlanApproval bool        `json:"require_plan_approval"`
+	Tasks               int         `json:"tasks"`
+	OpenTasks           int         `json:"open_tasks"`
+	Dependencies        int         `json:"dependencies"`
+	ReadyNow            []int       `json:"ready_now"`
+	LongestChain        int         `json:"longest_chain"` // tickets on the longest dependency path
+	Issues              []PlanIssue `json:"issues"`
+	RepairedTaskIDs     []int       `json:"repaired_task_ids,omitempty"`
+	Summary             string      `json:"summary"`
 }
 
 // readyFanoutThreshold: more ready tickets than this, when they're also more
@@ -340,7 +347,17 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if err != nil {
 		return nil, err
 	}
-	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}}
+	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}}
+	proj, err := s.Repo.GetProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	r.ApprovedAt, r.ApprovedBy, r.RequirePlanApproval = proj.PlanApprovedAt, proj.PlanApprovedBy, proj.RequirePlanApproval
+	for i := range tasks {
+		if tasks[i].State != domain.TaskStateCompleted && proj.AwaitsApproval(&tasks[i]) {
+			r.AwaitingApproval = append(r.AwaitingApproval, tasks[i].ID)
+		}
+	}
 	byID := map[int]domain.Task{}
 	dependents := map[int]int{}
 	for _, t := range tasks {
@@ -753,4 +770,25 @@ func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID 
 	}
 	r := <-got
 	return r.Task, r.Err
+}
+
+// ---- Plan approval ----
+
+// ApprovePlan records that a person approved the project's plan as it is
+// now: every ticket planned so far may be dispatched. Team leads and
+// project owners can approve; agents can't (a person approves agents' plans).
+func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
+	if p.Agent {
+		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
+	}
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Lead); err != nil {
+		return nil, err
+	}
+	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef())
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+		Summary: fmt.Sprintf("approved the plan of %s", proj.Name)})
+	return proj, nil
 }

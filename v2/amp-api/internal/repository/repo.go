@@ -102,10 +102,11 @@ func (r *Repo) Close() { r.db.Close() }
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, metadata, created_at, updated_at`
+const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at`
 
 func scanProject(row rowScanner, p *domain.Project) error {
-	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
+	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign,
+		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -225,10 +226,22 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 		   description = COALESCE($3, description),
 		   open_reassign = COALESCE($4, open_reassign),
 		   metadata = (metadata || $5::jsonb) - $6::text[],
+		   require_plan_approval = COALESCE($7, require_plan_approval),
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
-		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove),
+		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval,
 	), p)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("project %d not found", id)
+	}
+	return p, err
+}
+
+// ApprovePlan records that a user approved the project's plan now.
+func (r *Repo) ApprovePlan(ctx context.Context, id int, by *int) (*domain.Project, error) {
+	p := &domain.Project{}
+	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET plan_approved_at = NOW(), plan_approved_by = $2, updated_at = NOW()
+		 WHERE id = $1 RETURNING `+projectCols, id, by), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
 	}

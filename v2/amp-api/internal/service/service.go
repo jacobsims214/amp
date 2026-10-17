@@ -325,6 +325,12 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 	if err != nil {
 		return nil, err
 	}
+	// Plan approval: with the project's setting on, a ticket planned after
+	// the last approval waits for a person to approve the plan.
+	if proj, err := s.Repo.GetProject(ctx, t.ProjectID); err == nil && proj.RequirePlanApproval && proj.AwaitsApproval(t) {
+		return nil, authz.Forbidden("ticket %d was planned after the plan was last approved; this project needs the plan approved "+
+			"before agents start new tickets (amp_approve_plan, or Approve plan in AMP's Flight plan)", taskID)
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, err
@@ -346,8 +352,8 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 // UpdateProject changes a project's name, description, or settings; it
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
-	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.Metadata == nil {
-		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, or metadata")
+	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.Metadata == nil {
+		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, or metadata")
 	}
 	if _, _, err := u.Metadata.Split(); err != nil {
 		return nil, authz.BadRequest("%s", err.Error())
@@ -366,7 +372,7 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	if err == nil {
 		s.audit(ctx, p, domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
-				"open_reassign": u.OpenReassign, "metadata": u.Metadata}})
+				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata}})
 	}
 	return proj, err
 }
