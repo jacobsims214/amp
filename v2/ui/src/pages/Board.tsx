@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { RefreshCw, Loader2, Wifi, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users } from 'lucide-react'
+import { RefreshCw, Loader2, Wifi, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -10,6 +10,8 @@ import { FilterBar } from '../components/FilterBar'
 import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
 import { CrudModal } from '../components/CrudModal'
 import { MetadataEditor } from '../components/MetadataEditor'
+import { DependencyPicker } from '../components/DependencyPicker'
+import { PlanCheckModal } from '../components/PlanCheckModal'
 import { metadataPatch } from '../lib/metadata'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { ProjectNav } from '../components/ProjectNav'
@@ -50,7 +52,7 @@ const inputCls =
 const labelCls = 'text-xs font-medium text-[#7E91A8] block mb-1.5'
 
 // owner: '' = me (server default), 'none' = unassigned, or a member's user id
-const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '' }
+const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[] }
 
 export function Board() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -99,6 +101,9 @@ export function Board() {
   const [storyModal, setStoryModal] = useState<{ mode: 'create' | 'edit'; story?: Story; epicId?: number } | null>(null)
   const [storyDeleteTarget, setStoryDeleteTarget] = useState<Story | null>(null)
   const [storyForm, setStoryForm] = useState({ name: '', description: '', acceptance_criteria: '', priority: '1' })
+  // The epic a story being edited should live in (moving it on save).
+  const [storyEpicId, setStoryEpicId] = useState<number | null>(null)
+  const [planCheckOpen, setPlanCheckOpen] = useState(false)
   const [storySaving, setStorySaving] = useState(false)
   const [storyError, setStoryError] = useState<string | null>(null)
   const [openStoryMenu, setOpenStoryMenu] = useState<number | null>(null)
@@ -205,7 +210,7 @@ export function Board() {
     startMeta(setEpicMeta, m.epic?.metadata, m.epic ? api.inheritedMetadata('epic', m.epic.id) : projectMeta())
   }
   const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => {
-    setStoryError(null); setStoryModal(m)
+    setStoryError(null); setStoryModal(m); setStoryEpicId(m.story?.epic_id ?? null)
     const parent = m.epicId != null ? epics.find(e => e.id === m.epicId) : undefined
     startMeta(setStoryMeta, m.story?.metadata, m.story
       ? api.inheritedMetadata('story', m.story.id)
@@ -242,7 +247,10 @@ export function Board() {
     setStoryError(null)
     try {
       if (storyModal?.mode === 'create' && storyModal.epicId) await api.createStory(storyModal.epicId, { ...storyForm, metadata: storyMeta.value })
-      else if (storyModal?.story) await api.updateStory(storyModal.story.id, { ...storyForm, metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
+      else if (storyModal?.story) {
+        await api.updateStory(storyModal.story.id, { ...storyForm, metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
+        if (storyEpicId != null && storyEpicId !== storyModal.story.epic_id) await api.moveStory(storyModal.story.id, storyEpicId)
+      }
       setStoryModal(null); refresh()
     } catch (e) {
       setStoryError(errMsg(e, 'Save failed'))
@@ -309,6 +317,16 @@ export function Board() {
             >
               <Plus size={12} />
               Epic
+            </button>
+
+            {/* Plan check */}
+            <button
+              onClick={() => setPlanCheckOpen(true)}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#7E91A8] hover:text-[#DDE6F0] border border-[#1E2C45] hover:border-[#283A57] transition-all cursor-pointer"
+              title="Check the plan's dependencies before dispatching"
+            >
+              <ListChecks size={12} />
+              <span className="hidden sm:inline">Check plan</span>
             </button>
 
             {/* Team access */}
@@ -624,6 +642,12 @@ export function Board() {
         onTaskUpdated={applyTask}
       />
 
+      {planCheckOpen && (
+        <PlanCheckModal projectId={pid} tasks={tasks}
+          onOpenTask={id => { setPlanCheckOpen(false); setSelectedTaskId(id) }}
+          onClose={() => { setPlanCheckOpen(false); refresh() }} />
+      )}
+
       {teamAccessOpen && (
         <TeamAccessModal
           projectId={pid}
@@ -681,6 +705,15 @@ export function Board() {
               <textarea value={storyForm.description} onChange={e => setStoryForm(f => ({ ...f, description: e.target.value }))} rows={2} className={`${inputCls} resize-none`} /></div>
             <div><label className={labelCls}>Acceptance Criteria</label>
               <textarea value={storyForm.acceptance_criteria} onChange={e => setStoryForm(f => ({ ...f, acceptance_criteria: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
+            {storyModal.mode === 'edit' && storyEpicId != null && (
+              <div><label className={labelCls}>Epic</label>
+                <select value={storyEpicId} onChange={e => setStoryEpicId(Number(e.target.value))} className={inputCls}>
+                  {epics.map(ep => <option key={ep.id} value={ep.id}>{ep.name}</option>)}
+                </select>
+                {storyEpicId !== storyModal.story?.epic_id && (
+                  <p className="text-[11px] text-[#7E91A8] mt-1">Saving moves the story and its tickets to this epic; dependencies are kept.</p>
+                )}</div>
+            )}
             <div><label className={labelCls}>Priority</label>
               <select value={storyForm.priority} onChange={e => setStoryForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
@@ -735,6 +768,15 @@ export function Board() {
               <select value={taskForm.priority} onChange={e => setTaskForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
+            <div><label className={labelCls}>Depends on</label>
+              <DependencyPicker tasks={tasks} value={taskForm.dependency_ids}
+                onChange={ids => setTaskForm(f => ({ ...f, dependency_ids: ids }))} />
+              {taskForm.dependency_ids.length === 0 && tasks.length > 0 && (
+                <p className="text-[11px] text-[#FBBF24] mt-1.5 leading-relaxed">
+                  With no dependencies this ticket is ready to start right away, in parallel with everything else
+                  that's ready. If it needs another ticket's output, add it here.
+                </p>
+              )}</div>
             {taskError && <p className="text-xs text-[#F87171]">{taskError}</p>}
           </div>
         </CrudModal>

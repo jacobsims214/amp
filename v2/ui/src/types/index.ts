@@ -95,6 +95,27 @@ export interface ActivityLog {
   created_at: string
 }
 
+// ---- Plan check (GET /projects/:id/plan-check) ----
+
+export interface PlanIssue {
+  kind: 'isolated' | 'wide_start' | 'empty_stories' | string
+  message: string
+  task_ids?: number[]
+  fix?: string
+}
+
+export interface PlanReport {
+  ok: boolean
+  tasks: number
+  open_tasks: number
+  dependencies: number
+  ready_now: number[]
+  longest_chain: number
+  issues: PlanIssue[]
+  repaired_task_ids?: number[]
+  summary: string
+}
+
 // ---- Metadata ----
 
 export type MetadataValue = string | number | boolean

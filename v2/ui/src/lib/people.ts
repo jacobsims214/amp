@@ -57,6 +57,17 @@ export function canWorkTask(task: Task, meId: number | undefined, access: Projec
   return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.org_admin
 }
 
+/**
+ * Whether the caller may change how a ticket fits the plan — its text,
+ * dependencies, story, metadata: its owner, its creator, anyone for an
+ * unassigned ticket, and leads and up. (Working it stays owner-only.)
+ */
+export function canPlanTask(task: Task, meId: number | undefined, access: ProjectAccess | null | undefined): boolean {
+  const owner = task.owner_user_id ?? null
+  if (meId == null || owner === null || owner === meId || task.created_by === meId) return true
+  return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.lead
+}
+
 /** Leads, project owners and admins may take over someone else's ticket. */
 export function canReassignTask(access: ProjectAccess | null | undefined): boolean {
   return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.lead
