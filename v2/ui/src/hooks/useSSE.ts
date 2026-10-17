@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useLayoutEffect, useRef } from 'react'
 import type { SSEEvent } from '../types'
 
 export function useSSE(
@@ -6,7 +6,8 @@ export function useSSE(
   onEvent: (event: SSEEvent) => void,
 ) {
   const onEventRef = useRef(onEvent)
-  onEventRef.current = onEvent
+  // Keep the latest handler without reconnecting when it changes.
+  useLayoutEffect(() => { onEventRef.current = onEvent })
 
   useEffect(() => {
     const es = new EventSource('/api/events')

@@ -82,7 +82,7 @@ export function Report() {
   const [range, setRangeState] = useState<Range>('7d')
   // The range ends when it was picked, not at each render.
   const [now, setNow] = useState(Date.now)
-  const setRange = (r: Range) => { setRangeState(r); setNow(Date.now()) }
+  const setRange = (r: Range) => { setRangeState(r); setNow(() => Date.now()) }
   const [groupBy, setGroupBy] = useState<string>('')
   const [report, setReport] = useState<ProjectReport | null>(null)
   const [activity, setActivity] = useState<ActivityLog[]>([])

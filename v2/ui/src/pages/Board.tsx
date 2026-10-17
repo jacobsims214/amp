@@ -189,9 +189,9 @@ export function Board() {
   }), [filteredTasks])
 
   const toggleEpic = (id: number) =>
-    setCollapsedEpics(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s })
+    setCollapsedEpics(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
   const toggleStory = (id: number) =>
-    setCollapsedStories(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s })
+    setCollapsedStories(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
 
   const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
