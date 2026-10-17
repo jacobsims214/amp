@@ -383,7 +383,8 @@ export function Board() {
         {typeof filter.owner === 'number' && (myAccess && myAccess !== 'member' || filter.owner === meId) && (
           <HandoverBar projectId={pid} from={filter.owner}
             fromName={personName(members.find(m => m.user_id === filter.owner) ?? {})}
-            openCount={ownerTasks.filter(t => t.state !== 'completed').length}
+            taskIds={ownerTasks.filter(t => t.state !== 'completed' && filteredTaskIds.has(t.id)).map(t => t.id)}
+            narrowed={hasFieldFilter}
             people={members.map(m => ({ id: m.user_id, name: personName(m) }))} onDone={refresh} />
         )}
         {/* "Mine" is the default; say so when it hides everyone else's work. */}
