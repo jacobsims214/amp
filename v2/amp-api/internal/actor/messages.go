@@ -153,6 +153,11 @@ type MsgScheduledUnblock struct {
 
 // ---- Management ----
 
+// MsgPing asks the project actor to answer once it is running.
+type MsgPing struct {
+	ReplyCh chan ReplySimple
+}
+
 // MsgReset clears all children — called after amp_reset_project wipes postgres.
 type MsgReset struct {
 	ReplyCh chan ReplySimple

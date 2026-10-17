@@ -19,6 +19,15 @@ type Hub struct {
 	mu      sync.RWMutex
 	clients map[string]chan domain.Event
 	sinks   []func(domain.Event)
+	relay   func(domain.Event)
+}
+
+// SetRelay sends every event published here on to the other replicas
+// (internal/cluster). fn runs inside Publish, so it must not block.
+func (h *Hub) SetRelay(fn func(domain.Event)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.relay = fn
 }
 
 // AddSink registers fn to receive every published event (webhooks use
@@ -36,7 +45,8 @@ func New() *Hub {
 	}
 }
 
-// Publish sends an event to all connected SSE clients.
+// Publish sends an event to all connected SSE clients, the sinks, and the
+// other replicas.
 // Non-blocking: drops slow clients rather than stalling actors.
 func (h *Hub) Publish(evt domain.Event) {
 	h.mu.RLock()
@@ -44,6 +54,21 @@ func (h *Hub) Publish(evt domain.Event) {
 	for _, fn := range h.sinks {
 		fn(evt)
 	}
+	if h.relay != nil {
+		h.relay(evt)
+	}
+	h.deliver(evt)
+}
+
+// Deliver sends an event that another replica published to this replica's
+// SSE clients only: that replica already ran the sinks.
+func (h *Hub) Deliver(evt domain.Event) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	h.deliver(evt)
+}
+
+func (h *Hub) deliver(evt domain.Event) {
 	for _, ch := range h.clients {
 		select {
 		case ch <- evt:

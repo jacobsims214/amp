@@ -119,6 +119,9 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskState:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgSetTaskStartAt:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
 	case *MsgAddComment:
 		a.routeToStory(ctx, msg.Req.TaskID, msg)
 

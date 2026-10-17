@@ -168,6 +168,14 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
 
+	case *MsgSetTaskStartAt:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		ctx.Send(pid, msg)
+
 	case *MsgAddComment:
 		pid, ok := a.tasks[msg.Req.TaskID]
 		if !ok {
