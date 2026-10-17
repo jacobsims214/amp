@@ -105,7 +105,8 @@ unblocked something, and answered questions come back as ready), repeat until bo
 `ready_to_dispatch` and `in_progress` are empty. Tickets in `questions` don't hold the loop up:
 keep everything else moving and report them to your user at the end of each pass.
 
-You run your user's tickets only. List what's ready with the default owner filter (yours); others'
+You run your user's tickets only, and only after `amp_dispatch_task` succeeded for that ticket —
+if dispatch is refused (it's someone else's), don't start a worker on it anyway. List what's ready with the default owner filter (yours); others'
 tickets are being run by their own sessions, and AMP refuses to dispatch them anyway. Mention
 them to your user if they matter, but don't offer to start them.
 

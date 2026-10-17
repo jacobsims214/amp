@@ -61,6 +61,11 @@ amp_get_task(task_id=YOUR_TASK_ID)
 amp_get_task_comments(task_id=YOUR_TASK_ID)
 ```
 
+**First, confirm this ticket is yours to work:** its `state` is `in_progress` and its
+`owner_user_id` is your user (`amp_whoami`). If it isn't — it's someone else's, or it was never
+dispatched — stop without touching any files and tell your manager. Another person's session may
+be running it; working it from here edits their files under your name.
+
 Read every field:
 - `description` — your complete instructions
 - `acceptance_criteria` — exactly what done looks like
