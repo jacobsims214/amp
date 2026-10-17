@@ -1194,6 +1194,24 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})
 
+	case "unblock":
+		// POST {answer}: answer an agent's flag (a ticket blocked with a
+		// reason) and put the ticket back to ready.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			Answer string `json:"answer"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		t, err := h.svc.AnswerFlag(r.Context(), pr, taskID, body.Answer)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"task": t})
+
 	case "comments":
 		switch r.Method {
 		case http.MethodGet:

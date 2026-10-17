@@ -706,3 +706,51 @@ func (s *Service) deleteTickets(ctx context.Context, projectID int, ids []int, d
 	}
 	return kept, nil
 }
+
+// ---- Answering an agent's flag ----
+
+// AnswerFlag clears a flag: a ticket an agent blocked with a reason because
+// it needs a person. The answer, if any, is posted as a comment first; then
+// the ticket goes back to ready, or to waiting if it still depends on
+// unfinished work.
+func (s *Service) AnswerFlag(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
+	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
+	if err != nil {
+		return nil, err
+	}
+	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
+		return nil, authz.BadRequest("ticket %d isn't flagged: only a ticket blocked with a reason can be answered", taskID)
+	}
+	if answer = strings.TrimSpace(answer); answer != "" {
+		added := make(chan actor.ReplyAddComment, 1)
+		if err := s.Registry.Send(t.ProjectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
+			TaskID: taskID, Author: p.Email, Body: answer, AuthorUserID: p.UserRef(),
+		}, ReplyCh: added}); err != nil {
+			return nil, err
+		}
+		if r := <-added; r.Err != nil {
+			return nil, r.Err
+		}
+	}
+	set := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: "", By: p.UserRef(), ReplyCh: set}); err != nil {
+		return nil, err
+	}
+	if r := <-set; r.Err != nil {
+		return nil, r.Err
+	}
+	// Back to waiting if a dependency is unfinished.
+	rec := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgReconcileDeps{TaskID: taskID, ReplyCh: rec}); err != nil {
+		return nil, err
+	}
+	if r := <-rec; r.Err != nil {
+		return nil, r.Err
+	}
+	got := make(chan actor.ReplyGetTask, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgGetTask{TaskID: taskID, ReplyCh: got}); err != nil {
+		return nil, err
+	}
+	r := <-got
+	return r.Task, r.Err
+}

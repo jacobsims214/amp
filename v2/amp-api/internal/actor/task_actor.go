@@ -356,8 +356,15 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 	from := string(a.task.State)
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
+	// A block reason only means something while blocked; leaving the old
+	// one on an unblocked ticket would keep showing it as flagged.
+	blockReason := ""
+	if state == domain.TaskStateBlocked {
+		blockReason = reason
+	}
+	a.task.BlockReason = blockReason
 
-	if err := a.saveState(state, reason); err != nil {
+	if err := a.saveState(state, blockReason); err != nil {
 		return fmt.Errorf("db set state: %w", err)
 	}
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{
