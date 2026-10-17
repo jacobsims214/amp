@@ -15,6 +15,10 @@ spec:
     metadata:
       labels:
         app: dex
+      annotations:
+        # Restart Dex when its config or login theme changes.
+        checksum/config: {{ include (print $.Template.BasePath "/dex-configmap.yaml") . | sha256sum }}
+        checksum/theme: {{ include (print $.Template.BasePath "/dex-theme-configmap.yaml") . | sha256sum }}
     spec:
       securityContext:
         {{- include "amp.podSecurityContext" . | nindent 8 }}
@@ -74,6 +78,12 @@ spec:
             - name: dex-grpc-tls
               mountPath: /etc/dex-grpc-tls
               readOnly: true
+            {{- if eq .Values.dex.theme "amp" }}
+            # A new theme directory beside Dex's own light and dark ones.
+            - name: theme
+              mountPath: /srv/dex/web/themes/amp
+              readOnly: true
+            {{- end }}
           readinessProbe:
             httpGet: { path: /dex/healthz, port: http }
             initialDelaySeconds: 3
@@ -93,6 +103,11 @@ spec:
         - name: dex-grpc-tls
           secret:
             secretName: amp-dex-grpc-server-tls
+        {{- if eq .Values.dex.theme "amp" }}
+        - name: theme
+          configMap:
+            name: amp-dex-theme
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

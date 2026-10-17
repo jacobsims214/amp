@@ -21,6 +21,15 @@ data:
     web:
       http: 0.0.0.0:{{ .Values.dex.httpPort }}
 
+    frontend:
+      issuer: AMP
+      theme: {{ .Values.dex.theme }}
+      {{- if eq .Values.dex.theme "amp" }}
+      # Serve from disk (not the copy built into Dex) so the mounted theme is found.
+      dir: /srv/dex/web
+      logoURL: theme/logo.svg
+      {{- end }}
+
     grpc:
       addr: 0.0.0.0:{{ .Values.dex.grpcPort }}
       tlsCert: /etc/dex-grpc-tls/tls.crt

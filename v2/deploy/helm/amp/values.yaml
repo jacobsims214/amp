@@ -94,6 +94,8 @@ dex:
   replicas: 1
   httpPort: 5556
   grpcPort: 5557
+  # Login page look: "amp" (AMP's own, files/dex-theme), or Dex's "light"/"dark".
+  theme: amp
   # SSO: Dex connectors, shown next to the password login. Any Dex connector
   # works (google, github, microsoft, oidc, ldap, saml); see
   # https://dexidp.io/docs/connectors/. Put client secrets in a Secret in the
