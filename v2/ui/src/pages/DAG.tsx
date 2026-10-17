@@ -142,7 +142,7 @@ const ClusterNode = memo(function ClusterNode({ data }: NodeProps<Node<ClusterDa
   const { story, epic, epicColor, counts, onCollapse } = data
   const total = counts.backlog + counts.in_progress + counts.blocked + counts.completed
   return (
-    <div className="w-full h-full rounded-2xl" style={{ background: 'color-mix(in srgb, var(--ink) 35%, transparent)', border: `1px dashed ${epicColor}55` }}>
+    <div className="w-full h-full rounded-2xl" style={{ background: 'var(--surface-2)', border: `1px dashed ${epicColor}55` }}>
       <button onClick={() => onCollapse(story.id)} title="Collapse into one node"
         className="flex items-center gap-1.5 px-2.5 h-5 text-[10px] text-ink-2 hover:text-ink cursor-pointer max-w-full">
         <ChevronDown size={11} className="flex-shrink-0" />
@@ -411,7 +411,7 @@ function DAGCanvas() {
               <Background color="var(--surface-3)" bgColor="var(--bg)" gap={22} />
               <Controls showInteractive={false} />
               <MiniMap pannable zoomable bgColor="var(--surface)"
-                style={{ border: '1px solid var(--line)' }} maskColor="color-mix(in srgb, var(--ink) 28%, transparent)"
+                style={{ border: '1px solid var(--line)' }} maskColor="color-mix(in srgb, var(--ink) 8%, transparent)"
                 nodeColor={n => n.type === 'ticket' ? sc((n.data as TicketData).task.state).bar : n.type === 'story' ? 'var(--ink-3)' : 'transparent'}
                 nodeStrokeColor={n => n.type === 'cluster' ? 'var(--line-str)' : 'transparent'} />
             </ReactFlow>

@@ -475,7 +475,7 @@ export function Board() {
                       </button>
                        {openEpicMenu === epic.id && (
                          <div className="absolute right-1 top-9 z-20 rounded-xl py-1 min-w-[108px]"
-                           style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 32px color-mix(in srgb, var(--ink) 25%, transparent)' }}>
+                           style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent)' }}>
                           <button
                             onClick={e => {
                               e.stopPropagation()
@@ -554,7 +554,7 @@ export function Board() {
                             </button>
                              {openStoryMenu === story.id && (
                                <div className="absolute right-1 top-8 z-20 rounded-xl py-1 min-w-[108px]"
-                                 style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 32px color-mix(in srgb, var(--ink) 25%, transparent)' }}>
+                                 style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent)' }}>
                                 <button
                                   onClick={e => {
                                     e.stopPropagation()
@@ -601,7 +601,7 @@ export function Board() {
                                  <div
                                    key={col.state}
                                    className="flex-1 p-1.5 border-r border-line-sub last:border-r-0"
-                                   style={{ minWidth: TASK_COL, background: 'color-mix(in srgb, var(--ink) 20%, transparent)' }}
+                                   style={{ minWidth: TASK_COL, background: 'var(--surface-2)' }}
                                 >
                                   <div className="space-y-2">
                                     {colTasks.map(task => (

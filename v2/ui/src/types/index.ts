@@ -566,3 +566,35 @@ export interface MyWork {
   agents: MyAgent[]
   done_24h: number
 }
+
+// ---- Project report (GET /projects/:id/report) ----
+
+export interface ReportStates {
+  ready: number; in_progress: number; waiting: number; flagged: number; scheduled: number; done: number
+}
+
+export interface ReportGroup {
+  key: string
+  label?: string
+  tickets: number
+  states: ReportStates
+  completed_in_range: number
+  median_cycle_hours?: number
+}
+
+export interface ProjectReport {
+  since: string
+  until: string
+  tickets: number
+  states: ReportStates
+  completed: number
+  dispatched: number
+  created: number
+  median_cycle_hours?: number
+  flag_hours: number
+  agents: ReportGroup[]
+  epics: ReportGroup[]
+  metadata_keys: { key: string; coverage: number }[]
+  group_by?: string
+  breakdown?: ReportGroup[]
+}

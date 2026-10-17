@@ -15,7 +15,7 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
     <>
       <div
         className="fixed inset-0 z-40"
-        style={{ background: 'color-mix(in srgb, var(--ink) 38%, transparent)', backdropFilter: 'blur(4px)' }}
+        style={{ background: 'var(--scrim)' }}
         onClick={onClose}
       />
       <div className="fixed inset-0 z-50 flex items-center justify-center p-4 pointer-events-none">
@@ -24,7 +24,7 @@ export function ConfirmDeleteModal({ title, description, onClose, onConfirm, del
           style={{
             background: 'var(--surface)',
             border: '1px solid var(--line)',
-            boxShadow: '0 24px 64px color-mix(in srgb, var(--ink) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--danger) 8%, transparent)',
+            boxShadow: '0 12px 32px color-mix(in srgb, var(--ink) 14%, transparent), 0 0 0 1px color-mix(in srgb, var(--danger) 8%, transparent)',
           }}
         >
           {/* Header */}

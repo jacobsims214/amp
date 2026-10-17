@@ -645,7 +645,7 @@ function TeamMembers({ teamId, canManageOrg, meId }: { teamId: number; canManage
   }
 
   return (
-    <div className="px-4 pb-4 pl-10 space-y-3" style={{ background: 'color-mix(in srgb, var(--ink) 20%, transparent)' }}>
+    <div className="px-4 pb-4 pl-10 space-y-3" style={{ background: 'var(--surface-2)' }}>
       {loading ? (
         <Loader2 size={16} className="text-primary animate-spin" />
       ) : (

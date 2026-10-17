@@ -1,332 +1,262 @@
-import { useState, useEffect, useMemo } from 'react'
+/**
+ * Reports — what a project's agents and people got done in a range, in
+ * totals rather than ticket lists: completions per day, each agent, each
+ * epic, and a breakdown by any metadata key (each ticket counted under its
+ * effective, inherited value). The completed tickets and the activity log
+ * are below for detail. Exports to Markdown.
+ */
+import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
-import { Loader2, CheckCircle2, Clock, Zap, Ban, TrendingUp, Calendar } from 'lucide-react'
+import { Download, Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { ProjectNav } from '../components/ProjectNav'
-import type { ActivityLog } from '../types'
+import { Panel, Readouts } from '../components/ui/PageHeader'
+import { Avatar } from '../components/ui/Avatar'
+import { StateBar } from '../components/ui/StateTag'
+import type { DisplayState } from '../lib/ticketState'
+import type { ActivityLog, ProjectReport, ReportGroup, ReportStates } from '../types'
 
 type Range = '1d' | '7d' | '30d' | 'all'
+const RANGE_LABELS: Record<Range, string> = { '1d': '24h', '7d': '7 days', '30d': '30 days', all: 'All time' }
+const RANGE_DAYS: Record<Range, number> = { '1d': 1, '7d': 7, '30d': 30, all: 3650 }
 
-function rangeToSince(r: Range): string {
-  if (r === 'all') return ''
-  const d = new Date()
-  d.setDate(d.getDate() - (r === '1d' ? 1 : r === '7d' ? 7 : 30))
-  return d.toISOString()
+function hours(h?: number | null): string {
+  if (h == null) return '—'
+  if (h < 1) return `${Math.round(h * 60)}m`
+  if (h < 48) return `${h.toFixed(1)}h`
+  return `${(h / 24).toFixed(1)}d`
 }
 
-function relativeTime(iso: string) {
-  const diff = Date.now() - new Date(iso).getTime()
-  const mins = Math.floor(diff / 60000)
-  const hrs = Math.floor(mins / 60)
-  const days = Math.floor(hrs / 24)
-  if (days > 0) return `${days}d ago`
-  if (hrs > 0) return `${hrs}h ago`
-  if (mins > 0) return `${mins}m ago`
-  return 'just now'
+/** A report's counts in the UI's display-state shape. */
+function asCounts(s: ReportStates): Record<DisplayState, number> {
+  return { ready: s.ready, prog: s.in_progress, wait: s.waiting, flag: s.flagged, sched: s.scheduled, done: s.done }
 }
 
-function formatDate(iso: string) {
-  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+function GroupTable({ rows, first, label }: { rows: ReportGroup[]; first: string; label?: (g: ReportGroup) => React.ReactNode }) {
+  return (
+    <table className="w-full border-collapse text-[13px]">
+      <thead><tr className="bg-surface-2">
+        {[first, 'Tickets', 'Done', 'In progress', 'Flagged', 'Complete', 'Median time', 'Mix'].map((h, i) => (
+          <th key={h} className={`amp-label px-3 py-2.5 border-b border-line whitespace-nowrap ${i ? 'text-right' : 'text-left'}`}>{h}</th>))}
+      </tr></thead>
+      <tbody>
+        {rows.map(g => (
+          <tr key={g.key}>
+            <td className="px-3 h-[38px] border-b border-line font-semibold text-ink max-w-[280px] truncate">{label ? label(g) : g.label ?? g.key}</td>
+            <td className="px-3 border-b border-line amp-num text-right">{g.tickets}</td>
+            <td className="px-3 border-b border-line amp-num text-right">{g.states.done}</td>
+            <td className="px-3 border-b border-line amp-num text-right">{g.states.in_progress}</td>
+            <td className="px-3 border-b border-line amp-num text-right" style={g.states.flagged ? { color: 'var(--danger-ink)' } : undefined}>{g.states.flagged}</td>
+            <td className="px-3 border-b border-line amp-num text-right">{g.tickets ? Math.round(g.states.done / g.tickets * 100) : 0}%</td>
+            <td className="px-3 border-b border-line amp-num text-right">{hours(g.median_cycle_hours)}</td>
+            <td className="px-3 border-b border-line w-[150px]"><StateBar counts={asCounts(g.states)} /></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
 }
 
-function duration(start: string, end: string): string {
-  const ms = new Date(end).getTime() - new Date(start).getTime()
-  const mins = Math.floor(ms / 60000)
-  const hrs = Math.floor(mins / 60)
-  const days = Math.floor(hrs / 24)
-  if (days > 0) return `${days}d ${hrs % 24}h`
-  if (hrs > 0) return `${hrs}h ${mins % 60}m`
-  return `${mins}m`
+function DailyChart({ days }: { days: { day: string; n: number }[] }) {
+  const max = Math.max(1, ...days.map(d => d.n))
+  const w = Math.max(6, Math.floor(440 / Math.max(1, days.length)))
+  const labelEvery = Math.ceil(days.length / 8)
+  return (
+    <svg viewBox={`0 0 ${40 + days.length * w} 150`} width="100%" role="img" aria-label="Tickets completed per day">
+      {[0, Math.round(max / 2), max].map(g => {
+        const y = 125 - g / max * 100
+        return <g key={g}><line x1="34" x2={36 + days.length * w} y1={y} y2={y} stroke="var(--line)" />
+          <text x="28" y={y + 3} textAnchor="end" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">{g}</text></g>
+      })}
+      {days.map((d, i) => {
+        const h = d.n / max * 100
+        return (
+          <g key={d.day}>
+            <rect x={38 + i * w} y={125 - h} width={Math.max(3, w - 6)} height={h} fill="var(--ink)"><title>{d.day}: {d.n} done</title></rect>
+            {i % labelEvery === 0 && <text x={38 + i * w + Math.max(3, w - 6) / 2} y="142" textAnchor="middle" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">
+              {new Date(d.day + 'T12:00').toLocaleDateString(undefined, days.length > 8 ? { month: 'short', day: 'numeric' } : { weekday: 'short' })}</text>}
+          </g>
+        )
+      })}
+    </svg>
+  )
 }
-
-function formatMs(ms: number): string {
-  const mins = Math.floor(ms / 60000)
-  const hrs = Math.floor(mins / 60)
-  const days = Math.floor(hrs / 24)
-  if (days > 0) return `${days}d ${hrs % 24}h`
-  if (hrs > 0) return `${hrs}h ${mins % 60}m`
-  return `${mins}m`
-}
-
-const ACTION_CONFIG: Record<string, { dot: string; text: string; label: string }> = {
-  created:    { dot: 'var(--ink-2)', text: 'text-ink-2',  label: 'Created'    },
-  dispatched: { dot: 'var(--link)', text: 'text-link',  label: 'Dispatched' },
-  completed:  { dot: 'var(--success)', text: 'text-success',  label: 'Completed'  },
-  blocked:    { dot: 'var(--danger)', text: 'text-danger-ink',  label: 'Blocked'    },
-  unblocked:  { dot: 'var(--warning-ink)', text: 'text-warning-ink',  label: 'Unblocked'  },
-  comment:    { dot: 'var(--line-str)', text: 'text-ink-3',  label: 'Comment'    },
-}
-
-const RANGE_LABELS: Record<Range, string> = {
-  '1d': 'Today', '7d': 'This week', '30d': 'This month', 'all': 'All time',
-}
-
-const ACTION_FILTERS = ['all', 'created', 'dispatched', 'completed', 'blocked', 'comment'] as const
 
 export function Report() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
-
-  const [range, setRange] = useState<Range>('7d')
+  const [range, setRangeState] = useState<Range>('7d')
+  // The range ends when it was picked, not at each render.
+  const [now, setNow] = useState(Date.now)
+  const setRange = (r: Range) => { setRangeState(r); setNow(Date.now()) }
+  const [groupBy, setGroupBy] = useState<string>('')
+  const [report, setReport] = useState<ProjectReport | null>(null)
   const [activity, setActivity] = useState<ActivityLog[]>([])
-  const [loading, setLoading] = useState(true)
-  const [actionFilter, setActionFilter] = useState<string>('all')
-
+  const [error, setError] = useState<string | null>(null)
+  const [actionFilter, setActionFilter] = useState('all')
   const { tasks } = useBoardData(pid)
   const taskById = useMemo(() => new Map(tasks.map(t => [t.id, t])), [tasks])
 
+  const since = useMemo(() => new Date(now - RANGE_DAYS[range] * 86_400_000).toISOString(), [range, now])
   useEffect(() => {
-    setLoading(true)
-    api.getProjectActivity(pid, rangeToSince(range))
-      .then(setActivity)
-      .finally(() => setLoading(false))
-  }, [pid, range])
-
-  const stats = useMemo(() => {
-    const completed  = activity.filter(a => a.action === 'completed')
-    const dispatched = activity.filter(a => a.action === 'dispatched')
-    const blocked    = activity.filter(a => a.action === 'blocked')
-    const cycleTimes: number[] = []
-    for (const c of completed) {
-      const task = taskById.get(c.task_id)
-      if (task?.created_at && task?.completed_at)
-        cycleTimes.push(new Date(task.completed_at).getTime() - new Date(task.created_at).getTime())
-    }
-    const avgCycleMs = cycleTimes.length > 0
-      ? cycleTimes.reduce((a, b) => a + b, 0) / cycleTimes.length : null
-    return { completed: completed.length, dispatched: dispatched.length, blocked: blocked.length, avgCycleMs }
-  }, [activity, taskById])
-
-  const filtered = useMemo(() =>
-    actionFilter === 'all' ? activity : activity.filter(a => a.action === actionFilter)
-  , [activity, actionFilter])
-
-  const completedTasks = useMemo(() => {
-    return tasks
-      .filter(t => t.state === 'completed' && t.completed_at)
-      .filter(t => {
-        if (range === 'all') return true
-        const since = rangeToSince(range)
-        return since ? new Date(t.completed_at!).getTime() >= new Date(since).getTime() : true
+    api.projectReport(pid, { since, groupBy })
+      .then(r => {
+        setReport(r); setError(null)
+        // Default the breakdown to the best-covered key the first time.
+        if (!groupBy && r.metadata_keys.length) setGroupBy(r.metadata_keys[0].key)
       })
-      .sort((a, b) => new Date(b.completed_at!).getTime() - new Date(a.completed_at!).getTime())
-  }, [tasks, range])
+      .catch(e => setError(e instanceof Error ? e.message : 'Failed to load the report'))
+  }, [pid, since, groupBy])
+  useEffect(() => {
+    api.getProjectActivity(pid, since).then(setActivity).catch(() => {})
+  }, [pid, since])
+
+  const perDay = useMemo(() => {
+    const days = Math.min(RANGE_DAYS[range], 30)
+    const counts = new Map<string, number>()
+    for (let i = days - 1; i >= 0; i--) counts.set(new Date(now - i * 86_400_000).toLocaleDateString('en-CA'), 0)
+    for (const a of activity) if (a.action === 'completed') {
+      const d = new Date(a.created_at).toLocaleDateString('en-CA')
+      if (counts.has(d)) counts.set(d, counts.get(d)! + 1)
+    }
+    return [...counts.entries()].map(([day, n]) => ({ day, n }))
+  }, [activity, range, now])
+
+  const completed = useMemo(() => tasks.filter(t => t.state === 'completed' && t.completed_at && t.completed_at >= since)
+    .sort((a, b) => b.completed_at!.localeCompare(a.completed_at!)), [tasks, since])
+  const filtered = actionFilter === 'all' ? activity : activity.filter(a => a.action === actionFilter)
+
+  const exportMarkdown = () => {
+    if (!report) return
+    const lines = [
+      `# Report · project ${pid} · ${RANGE_LABELS[range]}`, '',
+      `${report.completed} done, ${report.dispatched} started, ${report.created} created. Median time to done ${hours(report.median_cycle_hours)}.`, '',
+      '## Agents', '', '| Agent | Done | Median |', '|---|---:|---:|',
+      ...report.agents.map(a => `| ${a.key} | ${a.completed_in_range} | ${hours(a.median_cycle_hours)} |`), '',
+      '## Epics', '', '| Epic | Done | Tickets |', '|---|---:|---:|',
+      ...report.epics.map(e => `| ${e.label} | ${e.states.done} | ${e.tickets} |`), '',
+      ...(report.breakdown ? [`## By ${report.group_by}`, '', '| Value | Tickets | Done | Flagged |', '|---|---:|---:|---:|',
+        ...report.breakdown.map(g => `| ${g.key} | ${g.tickets} | ${g.states.done} | ${g.states.flagged} |`), ''] : []),
+      '## Completed', '', ...completed.map(t => `- #${t.id} ${t.name}${t.agent_id ? ` (${t.agent_id})` : ''}`),
+    ]
+    const url = URL.createObjectURL(new Blob([lines.join('\n')], { type: 'text/markdown' }))
+    const a = document.createElement('a')
+    a.href = url; a.download = `amp-report-${pid}-${range}.md`; a.click()
+    URL.revokeObjectURL(url)
+  }
 
   return (
-    <div className="flex flex-col h-full overflow-hidden" style={{ background: 'var(--bg)' }}>
-      {/* Header */}
-      <ProjectNav
-        projectId={pid}
-        currentView="report"
-        rightSlot={
-          <div className="flex items-center gap-1 p-1 rounded-lg"
-            style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
-            {(['1d', '7d', '30d', 'all'] as Range[]).map(r => (
-              <button key={r} onClick={() => setRange(r)}
-                className="px-3 py-1 rounded-md text-xs font-semibold transition-all cursor-pointer"
-                style={range === r
-                  ? { background: 'var(--surface-3)', border: '1px solid var(--line-str)', color: 'var(--ink)' }
-                  : { color: 'var(--ink-3)' }}
-                onMouseEnter={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)' }}
-                onMouseLeave={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = 'var(--ink-3)' }}>
-                {RANGE_LABELS[r]}
-              </button>
-            ))}
-          </div>
-        }
-      />
+    <div className="flex flex-col min-h-full">
+      <ProjectNav projectId={pid} currentView="report" rightSlot={<>
+        <div className="flex border border-line" role="group" aria-label="Range">
+          {(Object.keys(RANGE_LABELS) as Range[]).map(r => (
+            <button key={r} type="button" onClick={() => setRange(r)} aria-pressed={range === r}
+              className={`font-label text-[10.5px] font-semibold uppercase tracking-[0.12em] px-2.5 py-2 border-l border-line first:border-l-0 cursor-pointer ${range === r ? 'bg-ink text-on-ink' : 'bg-surface text-ink-2 hover:text-ink'}`}>
+              {RANGE_LABELS[r]}</button>
+          ))}
+        </div>
+        <button type="button" className="amp-btn" onClick={exportMarkdown} disabled={!report}><Download size={12} />Markdown</button>
+      </>} />
+      <div className="p-7 pt-5 grid gap-4">
+        {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
+        {!report && !error && <div className="flex justify-center py-16"><Loader2 size={20} className="animate-spin text-ink-3" /></div>}
+        {report && <>
+          <Readouts items={[
+            { label: 'Done', value: report.completed, sub: `completed in ${RANGE_LABELS[range].toLowerCase()}` },
+            { label: 'Started', value: report.dispatched, sub: 'dispatched', color: 'var(--st-prog)' },
+            { label: 'Created', value: report.created, sub: 'new tickets' },
+            { label: 'Median time', value: hours(report.median_cycle_hours), sub: 'dispatch → done' },
+            { label: 'Flag time', value: hours(report.flag_hours), sub: `${report.states.flagged} open flag${report.states.flagged === 1 ? '' : 's'} waiting`, color: report.states.flagged ? 'var(--danger-ink)' : undefined },
+            { label: 'Plan', value: <>{report.states.done}<span className="text-[13px] text-ink-3">/{report.tickets}</span></>, sub: report.tickets ? `${Math.round(report.states.done / report.tickets * 100)}% done` : 'no tickets' },
+          ]} />
 
-      <div className="flex-1 overflow-y-auto">
-        <div className="max-w-5xl mx-auto px-5 py-7 space-y-8">
-
-          {/* ── Stat cards ── */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            <StatCard
-              icon={<CheckCircle2 size={18}/>}
-              label="Completed" value={stats.completed}
-              accent="var(--success)" accentBg="color-mix(in srgb, var(--success) 10%, transparent)" accentBorder="color-mix(in srgb, var(--success) 20%, transparent)"
-            />
-            <StatCard
-              icon={<Zap size={18}/>}
-              label="Dispatched" value={stats.dispatched}
-              accent="var(--link)" accentBg="color-mix(in srgb, var(--link) 10%, transparent)" accentBorder="color-mix(in srgb, var(--link) 20%, transparent)"
-            />
-            <StatCard
-              icon={<Ban size={18}/>}
-              label="Blocked events" value={stats.blocked}
-              accent="var(--danger-ink)" accentBg="color-mix(in srgb, var(--danger) 10%, transparent)" accentBorder="color-mix(in srgb, var(--danger) 20%, transparent)"
-            />
-            <StatCard
-              icon={<TrendingUp size={18}/>}
-              label="Avg cycle time"
-              value={stats.avgCycleMs !== null ? formatMs(stats.avgCycleMs) : '—'}
-              accent="var(--warning-ink)" accentBg="color-mix(in srgb, var(--warning) 10%, transparent)" accentBorder="color-mix(in srgb, var(--warning) 20%, transparent)"
-            />
-          </div>
-
-          {/* ── Completed tasks table ── */}
-          {completedTasks.length > 0 && (
-            <section>
-              <SectionHeader icon={<CheckCircle2 size={14} className="text-success"/>}
-                label="Completed tasks" count={completedTasks.length} />
-              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--line)' }}>
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
-                      {['#', 'Task', 'Agent', 'Completed', 'Cycle time'].map(h => (
-                        <th key={h} className="text-left px-4 py-3 text-ink-3 font-bold uppercase tracking-widest text-[10px]">{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
+          <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)]">
+            <Panel label="Velocity" title="Done per day" right={<span>{perDay.length} days</span>}>
+              <div className="px-4 py-3"><DailyChart days={perDay} /></div>
+            </Panel>
+            <Panel label="Agents" title="Who did the work" right={<span>by agent id</span>}>
+              {report.agents.length === 0 ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No agent has worked a ticket here yet.</p> : (
+                <table className="w-full border-collapse text-[13px]">
+                  <thead><tr className="bg-surface-2">
+                    {['Agent', 'Done', '', 'Median', 'Active', 'Flagged'].map((h, i) => <th key={i} className={`amp-label px-3 py-2.5 border-b border-line ${i && i !== 2 ? 'text-right' : 'text-left'}`}>{h}</th>)}
+                  </tr></thead>
                   <tbody>
-                    {completedTasks.map((task, i) => (
-                      <tr key={task.id}
-                        className="transition-colors"
-                        style={{
-                          borderBottom: i < completedTasks.length - 1 ? '1px solid var(--line-sub)' : 'none',
-                          background: i % 2 === 1 ? 'color-mix(in srgb, var(--ink) 20%, transparent)' : 'transparent',
-                        }}
-                        onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--surface)'}
-                        onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = i % 2 === 1 ? 'color-mix(in srgb, var(--ink) 20%, transparent)' : 'transparent'}
-                      >
-                        <td className="px-4 py-2.5 text-ink-3 font-mono tabular-nums">{task.id}</td>
-                        <td className="px-4 py-2.5 text-ink font-medium max-w-[260px]">
-                          <span className="truncate block">{task.name}</span>
-                        </td>
-                        <td className="px-4 py-2.5 text-ink-2 font-mono">{task.agent_id ?? '—'}</td>
-                        <td className="px-4 py-2.5 text-success tabular-nums">{formatDate(task.completed_at!)}</td>
-                        <td className="px-4 py-2.5 text-warning-ink font-medium tabular-nums">
-                          {task.dispatched_at ? duration(task.dispatched_at, task.completed_at!) : duration(task.created_at, task.completed_at!)}
-                        </td>
+                    {report.agents.map(a => {
+                      const max = Math.max(1, ...report.agents.map(x => x.completed_in_range))
+                      return (
+                        <tr key={a.key}>
+                          <td className="px-3 h-[38px] border-b border-line"><span className="inline-flex items-center gap-2"><Avatar name={a.key} kind="agent" size={20} />{a.key}</span></td>
+                          <td className="px-3 border-b border-line amp-num text-right">{a.completed_in_range}</td>
+                          <td className="px-3 border-b border-line w-[110px]"><div className="h-[6px] bg-surface-3"><div className="h-full bg-ink" style={{ width: `${a.completed_in_range / max * 100}%` }} /></div></td>
+                          <td className="px-3 border-b border-line amp-num text-right">{hours(a.median_cycle_hours)}</td>
+                          <td className="px-3 border-b border-line amp-num text-right">{a.states.in_progress}</td>
+                          <td className="px-3 border-b border-line amp-num text-right" style={a.states.flagged ? { color: 'var(--danger-ink)' } : undefined}>{a.states.flagged}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
+              )}
+            </Panel>
+          </div>
+
+          <Panel label="Metadata" title={report.group_by ? `By ${report.group_by}` : 'By metadata'}
+            right={<span>effective values: project → epic → story → ticket</span>}>
+            {report.metadata_keys.length === 0 ? (
+              <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No metadata on this project's tickets yet. Add keys like <span className="amp-num">initiative</span> or <span className="amp-num">jira_epic</span> to a project, epic, story, or ticket and they show up here.</p>
+            ) : <>
+              <div className="flex flex-wrap gap-1.5 px-4 py-3 border-b border-line" role="group" aria-label="Metadata key">
+                {report.metadata_keys.map(k => (
+                  <button key={k.key} type="button" onClick={() => setGroupBy(k.key)} aria-pressed={groupBy === k.key}
+                    className={`amp-num text-[11.5px] px-2 py-1.5 border cursor-pointer ${groupBy === k.key ? 'border-ink text-ink shadow-[inset_0_-2px_0_var(--accent)]' : 'border-line text-ink-2 hover:border-line-str'}`}
+                    title={`${Math.round(k.coverage * 100)}% of tickets have it`}>
+                    {k.key} <span className="text-ink-3">{Math.round(k.coverage * 100)}%</span></button>
+                ))}
+              </div>
+              {report.breakdown && <GroupTable rows={report.breakdown} first={report.group_by ?? 'Value'} />}
+            </>}
+          </Panel>
+
+          <Panel label="Epics" title="Progress" right={<span>{report.epics.length} epics</span>}>
+            <GroupTable rows={report.epics} first="Epic" />
+          </Panel>
+
+          <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-2">
+            <Panel label="Completed" title={`${completed.length} tickets`}>
+              <div className="max-h-[420px] overflow-auto">
+                <table className="w-full border-collapse text-[13px]">
+                  <tbody>
+                    {completed.map(t => (
+                      <tr key={t.id}>
+                        <td className="px-3 h-[34px] border-b border-line amp-num text-ink-3 w-[56px]">#{t.id}</td>
+                        <td className="px-3 border-b border-line max-w-[300px] truncate">{t.name}</td>
+                        <td className="px-3 border-b border-line amp-num text-[11.5px] text-ink-2">{t.agent_id || '—'}</td>
+                        <td className="px-3 border-b border-line amp-num text-[11.5px] text-ink-3 text-right whitespace-nowrap">{new Date(t.completed_at!).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}</td>
                       </tr>
                     ))}
+                    {completed.length === 0 && <tr><td className="px-4 py-4 text-ink-2">Nothing completed in this range.</td></tr>}
                   </tbody>
                 </table>
               </div>
-            </section>
-          )}
-
-          {/* ── Activity feed ── */}
-          <section>
-            <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
-              <SectionHeader icon={<Calendar size={14} className="text-ink-2"/>}
-                label="Activity feed" count={filtered.length} />
-              {/* Action filter pills */}
-              <div className="flex items-center gap-1 p-1 rounded-lg flex-wrap"
-                style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
-                {ACTION_FILTERS.map(a => {
-                  const conf = ACTION_CONFIG[a]
-                  const isActive = actionFilter === a
-                  return (
-                    <button key={a} onClick={() => setActionFilter(a)}
-                      className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold capitalize transition-all cursor-pointer"
-                      style={{
-                        background: isActive ? 'var(--surface-3)' : 'transparent',
-                        color: isActive ? (conf ? conf.dot : 'var(--ink)') : 'var(--ink-3)',
-                        border: isActive ? '1px solid var(--line-str)' : '1px solid transparent',
-                      }}
-                      onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)' }}
-                      onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'var(--ink-3)' }}>
-                      {a !== 'all' && conf && (
-                        <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: conf.dot }}/>
-                      )}
-                      {a === 'all' ? 'All' : conf?.label ?? a}
-                    </button>
-                  )
-                })}
+            </Panel>
+            <Panel label="Activity" title={`${activity.length} events`} right={
+              <select value={actionFilter} onChange={e => setActionFilter(e.target.value)} aria-label="Filter activity"
+                className="amp-input !w-auto !py-1 text-[12px]">
+                {['all', 'created', 'dispatched', 'completed', 'blocked', 'unblocked', 'comment', 'state_change'].map(a => <option key={a} value={a}>{a.replace('_', ' ')}</option>)}
+              </select>}>
+              <div className="max-h-[420px] overflow-auto">
+                {filtered.slice().sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 200).map(a => (
+                  <div key={a.id} className="grid grid-cols-[96px_1fr] gap-3 px-4 py-1.5 border-b border-line text-[12.5px]">
+                    <span className="amp-num text-[11px] text-ink-3">{new Date(a.created_at).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}</span>
+                    <span className="min-w-0 truncate"><b className="font-semibold">{a.actor}</b> {a.action.replace('_', ' ')} <span className="amp-num text-ink-3">#{a.task_id}</span> <span className="text-ink-2">{taskById.get(a.task_id)?.name ?? ''}</span></span>
+                  </div>
+                ))}
               </div>
-            </div>
-
-            {loading ? (
-              <div className="flex justify-center py-10">
-                <Loader2 size={20} className="text-primary animate-spin"/>
-              </div>
-            ) : filtered.length === 0 ? (
-              <div className="text-center py-12 rounded-xl" style={{ border: '1px solid var(--line-sub)' }}>
-                <p className="text-sm text-ink-3">No activity in this period</p>
-              </div>
-            ) : (
-              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--line)' }}>
-                {filtered.map((entry, i) => {
-                  const conf = ACTION_CONFIG[entry.action] ?? ACTION_CONFIG.comment
-                  const task = taskById.get(entry.task_id)
-                  return (
-                    <div key={entry.id}
-                      className="flex items-start gap-3 px-4 py-3 transition-colors"
-                      style={{
-                        borderBottom: i < filtered.length - 1 ? '1px solid var(--line-sub)' : 'none',
-                      }}
-                      onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--surface)'}
-                      onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
-                    >
-                      <span className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0"
-                        style={{ background: conf.dot, boxShadow: `0 0 4px ${conf.dot}50` }}/>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-semibold text-ink">{entry.actor}</span>
-                          <span className={`text-xs font-medium capitalize ${conf.text}`}>{entry.action.replace('_', ' ')}</span>
-                          {task && (
-                            <span className="text-xs text-ink-2 truncate">
-                              <span className="text-ink-3 font-mono">#{task.id}</span>
-                              {' '}{task.name}
-                            </span>
-                          )}
-                          {entry.from_state && entry.to_state && entry.action !== 'comment' && (
-                            <span className="text-xs text-ink-3">{entry.from_state} → {entry.to_state}</span>
-                          )}
-                        </div>
-                        {entry.action === 'comment' && entry.detail && (
-                          <p className="text-xs text-ink-2 mt-1 line-clamp-2 leading-relaxed bg-bg rounded-lg px-2.5 py-1.5 border border-line-sub mt-1.5">
-                            {entry.detail}
-                          </p>
-                        )}
-                      </div>
-                      <span className="text-xs text-ink-3 flex-shrink-0 flex items-center gap-1 tabular-nums">
-                        <Clock size={9}/>
-                        {relativeTime(entry.created_at)}
-                      </span>
-                    </div>
-                  )
-                })}
-              </div>
-            )}
-          </section>
-
-        </div>
+            </Panel>
+          </div>
+        </>}
       </div>
     </div>
-  )
-}
-
-/* ── Stat card ────────────────────────────────────────────────────────────── */
-function StatCard({ icon, label, value, accent, accentBg, accentBorder }: {
-  icon: React.ReactNode; label: string; value: number | string
-  accent: string; accentBg: string; accentBorder: string
-}) {
-  return (
-    <div className="rounded-2xl p-5 transition-all"
-      style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
-      <div className="flex items-center justify-between mb-3">
-        <span className="text-xs font-semibold text-ink-3 uppercase tracking-widest">{label}</span>
-        <span className="flex-shrink-0 p-2 rounded-xl" style={{ background: accentBg, border: `1px solid ${accentBorder}`, color: accent }}>
-          {icon}
-        </span>
-      </div>
-      <div className="text-3xl font-bold tabular-nums" style={{ color: accent, fontVariantNumeric: 'tabular-nums' }}>
-        {value}
-      </div>
-    </div>
-  )
-}
-
-/* ── Section header ───────────────────────────────────────────────────────── */
-function SectionHeader({ icon, label, count }: { icon: React.ReactNode; label: string; count: number }) {
-  return (
-    <h2 className="text-sm font-bold text-ink mb-4 flex items-center gap-2">
-      {icon}
-      {label}
-      <span className="text-xs font-normal text-ink-3 tabular-nums">({count})</span>
-    </h2>
   )
 }

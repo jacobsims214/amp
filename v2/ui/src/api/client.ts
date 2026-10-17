@@ -1,6 +1,6 @@
 import type {
   Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
-  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay, PlanReport, MyWork,
+  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay, PlanReport, MyWork, ProjectReport,
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
@@ -155,6 +155,13 @@ export const api = {
     post<{ task: Task }>(`/tasks/${id}/move`, { story_id: storyId }).then(r => r.task),
   moveStory: (id: number, epicId: number) =>
     post<{ story: Story }>(`/stories/${id}/move`, { epic_id: epicId }).then(r => r.story),
+  projectReport: (projectId: number, opts: { since?: string; until?: string; groupBy?: string }) => {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.groupBy) q.set('group_by', opts.groupBy)
+    return get<ProjectReport>(`/projects/${projectId}/report?${q}`)
+  },
   planCheck: (projectId: number) => get<PlanReport>(`/projects/${projectId}/plan-check`),
   updateTask: (id: number, req: UpdateTaskRequest) =>
     patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),

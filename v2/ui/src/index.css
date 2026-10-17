@@ -65,6 +65,16 @@
 
 /* ─── Tailwind: expose the tokens as utilities (bg-surface, text-ink-2, …) ── */
 @theme inline {
+  /* Square corners everywhere; rounded-full (avatars, dots) stays round. */
+  --radius-xs: 1px;
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
+  --radius-2xl: 3px;
+  --radius-3xl: 3px;
+  --radius-4xl: 3px;
+
   --font-sans: var(--font-body);
   --font-mono: var(--font-data);
   --font-label: var(--font-label);

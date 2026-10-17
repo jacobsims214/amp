@@ -16,7 +16,7 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
       {/* Backdrop */}
       <div
         className="fixed inset-0 z-40"
-        style={{ background: 'color-mix(in srgb, var(--ink) 38%, transparent)', backdropFilter: 'blur(4px)' }}
+        style={{ background: 'var(--scrim)' }}
         onClick={onClose}
       />
       {/* Panel */}
@@ -26,7 +26,7 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
           style={{
             background: 'var(--surface)',
             border: '1px solid var(--line)',
-            boxShadow: '0 24px 64px color-mix(in srgb, var(--ink) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--link) 8%, transparent)',
+            boxShadow: '0 12px 32px color-mix(in srgb, var(--ink) 14%, transparent), 0 0 0 1px color-mix(in srgb, var(--link) 8%, transparent)',
             maxHeight: '90vh',
           }}
         >

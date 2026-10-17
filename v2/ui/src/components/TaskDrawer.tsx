@@ -126,7 +126,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
       {/* Backdrop */}
       <div
         className="fixed inset-0 z-40"
-        style={{ background: 'color-mix(in srgb, var(--ink) 30%, transparent)', backdropFilter: 'blur(2px)' }}
+        style={{ background: 'var(--scrim)' }}
         onClick={onClose}
       />
 
@@ -136,7 +136,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         style={{
           background: 'var(--surface)',
           borderLeft: '1px solid var(--line)',
-          boxShadow: '-24px 0 64px color-mix(in srgb, var(--ink) 25%, transparent)',
+          boxShadow: '-12px 0 32px color-mix(in srgb, var(--ink) 10%, transparent)',
         }}
       >
         {/* Header */}
