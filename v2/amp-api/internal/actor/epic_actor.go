@@ -119,6 +119,9 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskState:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgSetTaskStartAt:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
 	case *MsgAddComment:
 		a.routeToStory(ctx, msg.Req.TaskID, msg)
 
@@ -134,6 +137,20 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 
 	case *MsgReconcileDeps:
 		a.routeToStory(ctx, msg.TaskID, msg)
+
+	case *MsgRestoreStory:
+		if _, ok := a.stories[msg.StoryID]; ok {
+			msg.ReplyCh <- ReplySimple{}
+			return
+		}
+		st, err := a.repo.GetStory(context.Background(), msg.StoryID)
+		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("load restored story %d: %w", msg.StoryID, err)}
+			return
+		}
+		a.stories[st.ID] = a.spawnStoryActor(ctx, *st)
+		a.storyStates[st.ID] = st.State
+		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgAdoptTask:
 		pid, ok := a.stories[msg.StoryID]
@@ -191,8 +208,12 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgUpdateEpic:
-		err := a.repo.UpdateEpic(context.Background(), msg.Req.EpicID, msg.Req.Name, msg.Req.Description, msg.Req.Priority)
+		clr, err := domain.ParseClears(msg.Req.Clear, domain.EpicClearable)
 		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: err}
+			return
+		}
+		if err := a.repo.UpdateEpic(context.Background(), msg.Req); err != nil {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update epic: %w", err)}
 			return
 		}
@@ -207,9 +228,7 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		if msg.Req.Name != "" {
 			a.epic.Name = msg.Req.Name
 		}
-		if msg.Req.Description != "" {
-			a.epic.Description = msg.Req.Description
-		}
+		a.epic.Description = clr.Apply("description", msg.Req.Description, a.epic.Description)
 		if msg.Req.Priority != "" {
 			a.epic.Priority = msg.Req.Priority
 		}

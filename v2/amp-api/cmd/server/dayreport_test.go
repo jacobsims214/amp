@@ -34,7 +34,7 @@ func TestDayReports(t *testing.T) {
 		t.Fatal(err)
 	}
 	sfx := time.Now().UnixNano()
-	other, err := repo.CreateProject(ctx, domain.CreateProjectRequest{Name: fmt.Sprintf("Other %d", sfx), Code: fmt.Sprintf("oth%d", sfx%100000), OrgID: &w.other.ID, TeamID: &w.x.ID})
+	other, err := repo.CreateProject(ctx, domain.CreateProjectRequest{Name: fmt.Sprintf("Other %d", sfx), Code: fmt.Sprintf("oth%d", sfx/1000%1000000000), OrgID: &w.other.ID, TeamID: &w.x.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +55,8 @@ func TestDayReports(t *testing.T) {
 	running := mk("build search", acme.projectID, acme.epicID, acme.storyID, nil)
 	stuck := mk("fix flaky test", acme.projectID, acme.epicID, acme.storyID, nil)
 	created := mk("plan billing", acme.projectID, acme.epicID, acme.storyID, nil)
+	// Waiting on a dependency isn't blocked: it just hasn't started.
+	waiting := mk("search UI", acme.projectID, acme.epicID, acme.storyID, map[string]interface{}{"dependency_ids": []interface{}{float64(running)}})
 	elsewhere := mk("other org work", other.ID, oe.ID, os_.ID, nil)
 	bobs := taskID(t, w.as(w.bob).mkTask(t, "bob's ticket", nil))
 
@@ -84,7 +86,7 @@ func TestDayReports(t *testing.T) {
 	check("in_progress", ref(acmeCode, running))
 	check("blocked", ref(acmeCode, stuck))
 	check("started")
-	check("created", ref(acmeCode, created))
+	check("created", ref(acmeCode, created), ref(acmeCode, waiting))
 	check("touched", ref(acmeCode, bobs))
 	if draft["saved"] != false {
 		t.Fatal("a draft isn't saved")
@@ -135,7 +137,7 @@ func TestDayReports(t *testing.T) {
 	}
 	// dave is in Acme but on no project: summary only.
 	daves := readAs(w.dave)
-	if daves["hidden_items"] != float64(6) || daves["summary"] == "" {
+	if daves["hidden_items"] != float64(7) || daves["summary"] == "" {
 		t.Errorf("dave's view: hidden %v, summary %q", daves["hidden_items"], daves["summary"])
 	}
 	// Someone in none of alice's orgs can't read it.
@@ -203,5 +205,38 @@ func TestDayWindow(t *testing.T) {
 		if err != nil || day != c.date || end.Sub(start).Hours() != c.hours || start.UTC().Format(time.RFC3339) != c.startUTC {
 			t.Errorf("%s %s: day %s, %v → %v (%v hours), err %v", c.date, c.tz, day, start.UTC(), end.UTC(), end.Sub(start).Hours(), err)
 		}
+	}
+}
+
+// A project's standup sheet: each person on the project with the report they
+// saved for the day (only this project's tickets), and who hasn't saved one.
+func TestDayReports_ProjectSheet(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	done := mkIn(t, alice, w.s.storyID, "ship it")
+	alice.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(done), "agent_id": "a"})
+	alice.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(done)})
+	alice.call(t, "amp_save_day_report", map[string]interface{}{"summary": "Shipped it.", "tz": "UTC"})
+
+	out := ra.want(t, 200, "lead", http.MethodGet, fmt.Sprintf("/api/projects/%d/day-reports?tz=UTC", w.s.projectID), nil)
+	var aliceRow, bobRow map[string]interface{}
+	for _, r := range out["people"].([]interface{}) {
+		m := r.(map[string]interface{})
+		switch m["email"] {
+		case w.alice.Email:
+			aliceRow = m
+		case w.bob.Email:
+			bobRow = m
+		}
+	}
+	if aliceRow == nil || aliceRow["report"] == nil || aliceRow["report"].(map[string]interface{})["summary"] != "Shipped it." {
+		t.Fatalf("alice's report: %v", out)
+	}
+	if bobRow == nil || bobRow["report"] != nil {
+		t.Fatalf("bob has no report and should be listed without one: %v", out)
+	}
+	if code, _ := ra.do(t, "outsider", http.MethodGet, fmt.Sprintf("/api/projects/%d/day-reports", w.s.projectID), nil); code != 404 && code != 403 {
+		t.Fatalf("outsider read the standup sheet: %d", code)
 	}
 }

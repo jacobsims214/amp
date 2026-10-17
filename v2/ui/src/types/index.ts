@@ -15,6 +15,9 @@ export interface Project {
   metadata?: Metadata
   created_at: string
   updated_at: string
+  plan_approved_at?: string
+  plan_approved_by?: number
+  require_plan_approval?: boolean
 }
 
 export interface Epic {
@@ -92,7 +95,37 @@ export interface ActivityLog {
   from_state?: string
   to_state?: string
   detail?: string
+  /** the AMP user behind the action, when there was one */
+  actor_user_id?: number
   created_at: string
+}
+
+// ---- Plan check (GET /projects/:id/plan-check) ----
+
+export interface PlanIssue {
+  kind: 'isolated' | 'wide_start' | 'empty_stories' | 'no_context' | string
+  message: string
+  task_ids?: number[]
+  fix?: string
+  /** 'warn' for advice that doesn't make the plan NO-GO */
+  severity?: 'warn'
+}
+
+export interface PlanReport {
+  ok: boolean
+  /** open tickets planned since the plan was last approved */
+  awaiting_approval?: number[]
+  plan_approved_at?: string
+  plan_approved_by?: number
+  require_plan_approval?: boolean
+  tasks: number
+  open_tasks: number
+  dependencies: number
+  ready_now: number[]
+  longest_chain: number
+  issues: PlanIssue[]
+  repaired_task_ids?: number[]
+  summary: string
 }
 
 // ---- Metadata ----
@@ -180,9 +213,11 @@ export interface KBRef {
   project_id?: number
   team_id?: number
   org_id?: number
+  /** The AMP guide: read-only docs that ship with AMP. */
+  global?: boolean
 }
 
-export type KBScope = 'project' | 'team' | 'org'
+export type KBScope = 'project' | 'team' | 'org' | 'global'
 
 /** A knowledge base and what the viewer may do in it. */
 export interface KBInfo {
@@ -288,6 +323,8 @@ export interface UpdateEpicRequest {
   description?: string
   priority?: string
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 export interface CreateStoryRequest {
@@ -304,6 +341,8 @@ export interface UpdateStoryRequest {
   acceptance_criteria?: string
   priority?: string
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 export interface CreateTaskRequest {
@@ -329,6 +368,8 @@ export interface UpdateTaskRequest {
   priority?: string
   start_at?: string | null
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 // ---- Auth / users ----
@@ -340,6 +381,87 @@ export interface Me {
   roles: string[]
   user_id?: number
   orgs?: Org[]
+  teams?: { id: number; name: string; org_id: number; role: string }[]
+  kind?: UserKind
+  via_token?: boolean
+}
+
+export type UserKind = 'human' | 'agent'
+
+export interface APIToken {
+  id: number
+  user_id: number
+  name: string
+  prefix: string
+  created_by?: number
+  created_at: string
+  expires_at?: string
+  last_used_at?: string
+  revoked_at?: string
+}
+
+/** A token as just created: the only time `token` is shown. */
+export interface NewAPIToken extends APIToken {
+  token: string
+}
+
+export interface AuditEntry {
+  id: number
+  at: string
+  actor_user_id?: number
+  actor_email: string
+  via_token?: boolean
+  org_id?: number
+  project_id?: number
+  action: string
+  target_type?: string
+  target_id?: string
+  summary: string
+  details?: Record<string, unknown>
+}
+
+export type WebhookFormat = 'json' | 'slack'
+
+export interface Webhook {
+  id: number
+  org_id?: number
+  project_id?: number
+  name: string
+  url: string
+  format: WebhookFormat
+  /** Only present right after create or rotate. */
+  secret?: string
+  events: string[]
+  active: boolean
+  created_by?: number
+  created_at: string
+  updated_at: string
+  last_delivery_at?: string
+  last_status?: number
+  last_error?: string
+  consecutive_failures: number
+}
+
+export interface WebhookChange {
+  name?: string
+  url?: string
+  format?: WebhookFormat
+  events?: string[]
+  active?: boolean
+}
+
+export interface WebhookDelivery {
+  id: number
+  webhook_id: number
+  event_type: string
+  body?: string
+  status: 'pending' | 'delivered' | 'failed'
+  attempts: number
+  next_attempt_at: string
+  last_status?: number
+  last_error?: string
+  created_at: string
+  delivered_at?: string
 }
 
 export interface AmpUser {
@@ -350,6 +472,9 @@ export interface AmpUser {
   roles: string[]
   created_at: string
   last_seen_at: string
+  kind: UserKind
+  managed_by?: number
+  disabled_at?: string
 }
 
 export interface AuthAdminUser {
@@ -389,6 +514,8 @@ export interface Member {
   email: string
   display_name: string
   role: string
+  kind?: UserKind
+  disabled?: boolean
 }
 
 export interface ProjectMember {
@@ -396,6 +523,8 @@ export interface ProjectMember {
   email: string
   display_name: string
   access: ProjectAccess
+  kind?: UserKind
+  disabled?: boolean
 }
 
 export interface ProjectTeam {
@@ -432,4 +561,181 @@ export interface CreateProjectRequest {
   description?: string
   org_id?: number
   team_id?: number
+}
+
+// ---- Home page (GET /my-work) ----
+
+/** A ticket with its project, for views that span projects. */
+export type WorkTask = Task & {
+  project_code: string
+  project_name: string
+  /** latest activity on the ticket (state change, comment, dispatch) */
+  last_activity_at?: string
+}
+
+export interface MyAgent {
+  user: AmpUser
+  working: WorkTask[]
+  done_24h: number
+}
+
+export interface MyWork {
+  owned: WorkTask[]
+  flags: WorkTask[]
+  agents: MyAgent[]
+  done_24h: number
+}
+
+// ---- Project report (GET /projects/:id/report) ----
+
+export interface ReportStates {
+  ready: number; in_progress: number; waiting: number; flagged: number; scheduled: number; done: number
+}
+
+export interface ReportGroup {
+  key: string
+  label?: string
+  tickets: number
+  states: ReportStates
+  completed_in_range: number
+  median_cycle_hours?: number
+  /** token spend of runs recorded in range on this group's tickets */
+  usage?: Usage
+}
+
+/** Token spend totalled over runs. */
+export interface Usage {
+  runs: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  cost_usd: number
+  /** runs that reported no token counts */
+  unreported: number
+  /** runs that died or were stopped (rework) */
+  abandoned?: number
+  models?: string[]
+}
+
+/** One agent run on a ticket: what it used, and where its work went. */
+export interface Run {
+  id: number
+  task_id: number
+  project_id: number
+  user_id?: number
+  agent_id?: string
+  outcome: 'completed' | 'blocked' | 'progress' | 'abandoned'
+  model?: string
+  input_tokens?: number
+  output_tokens?: number
+  cache_read_tokens?: number
+  cache_write_tokens?: number
+  cost_usd?: number
+  branch?: string
+  commit?: string
+  pr_url?: string
+  pushed?: boolean
+  merged?: boolean
+  note?: string
+  created_at: string
+}
+
+/** A ticket a commit, branch, or PR leads back to. */
+export interface TraceHit {
+  ref: string
+  task: Task
+  project: string
+  runs: Run[]
+}
+
+/** An epic (with its stories) or a story in a project's trash. */
+export interface DeletedGroup {
+  kind: 'epic' | 'story'
+  id: number
+  project_id: number
+  epic_id: number
+  name: string
+  task_ids: number[]
+  stories: number
+  deleted_by?: number
+  deleted_at: string
+  /** A story can only come back while its epic exists (or comes back with it). */
+  epic_exists: boolean
+}
+
+export interface ProjectTrash {
+  tickets: DeletedTask[]
+  groups: DeletedGroup[]
+}
+
+export interface GroupRestoreResult {
+  kind: 'epic' | 'story'
+  id: number
+  restored: boolean
+  error?: string
+  tickets?: { task_id: number; restored: boolean; error?: string }[]
+}
+
+/** A ticket in a project's trash. */
+export interface DeletedTask {
+  task_id: number
+  project_id: number
+  epic_id: number
+  story_id: number
+  name: string
+  deleted_by?: number
+  deleted_at: string
+  story_exists: boolean
+}
+
+export interface ProjectReport {
+  since: string
+  until: string
+  tickets: number
+  states: ReportStates
+  completed: number
+  dispatched: number
+  created: number
+  median_cycle_hours?: number
+  flag_hours: number
+  agents: ReportGroup[]
+  epics: ReportGroup[]
+  metadata_keys: { key: string; coverage: number }[]
+  group_by?: string
+  breakdown?: ReportGroup[]
+  /** by owner (key: user id, "" unowned) */
+  people?: ReportGroup[]
+  usage?: Usage
+  usage_by_model?: (Usage & { model: string })[]
+}
+
+/** One project in an org's portfolio. */
+export interface PortfolioRow {
+  project_id: number
+  name: string
+  code: string
+  state: string
+  metadata?: Metadata
+  tickets: number
+  states: ReportStates
+  completed: number
+  usage: Usage
+  /** spend and tickets by value of the split key ("(not set)" for none) */
+  split: Record<string, { tickets: number; usage: Usage }>
+}
+
+export interface Portfolio {
+  org_id: number
+  since: string
+  until: string
+  split_by?: string
+  split_values: string[]
+  /** metadata keys set on projects (columns) */
+  project_keys: string[]
+  /** metadata keys on tickets, with coverage (split candidates) */
+  ticket_keys: { key: string; coverage: number }[]
+  projects: PortfolioRow[]
+  total: PortfolioRow
+  usage_by_model: (Usage & { model: string })[]
 }

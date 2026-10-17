@@ -7,7 +7,8 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://localhost:3001', changeOrigin: true },
+      // AMP_API_TARGET points the dev server at another AMP (default: one on :3001).
+      '/api': { target: process.env.AMP_API_TARGET || 'http://localhost:3001', changeOrigin: true },
     },
   },
 })

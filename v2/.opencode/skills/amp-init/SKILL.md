@@ -23,7 +23,7 @@ How you get there is up to you. The guidance below covers what each step involve
 
 ## Creating the project
 
-If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation. Keep the code short and slug-friendly.
+If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation. The code is the ticket prefix — refs read `CODE-149` everywhere (reports, commits, branches) — so keep it to 2–6 letters, like `NWC` for Northwind Commerce, not the full name.
 
 ```json
 { "project_id": <id>, "project_name": "<name>", "project_code": "<code>", "amp_api": "http://localhost:8000" }
@@ -49,6 +49,8 @@ Before writing the overview, explore enough to describe the project accurately. 
 Write a KB doc at `architecture/project-overview.md`. This doc is the first thing any agent will find when they search the KB. Write it in prose so it embeds well — not bullet lists.
 
 Cover: what the project is, what it does, the tech stack, the structure, the current state, and anything non-obvious about how it's organized.
+
+A new project with an empty repo still gets an overview — write it from what the user told you (goal, users, stack, constraints) and mark what's still undecided. Don't skip it because there's no code to scan; this is the doc every later session starts from.
 
 See `amp-kb` if you need guidance on writing content that embeds well for semantic search.
 

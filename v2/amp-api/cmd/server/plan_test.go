@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	protoactor "github.com/asynkron/protoactor-go/actor"
 
@@ -427,4 +428,159 @@ func TestPlan_ServerInstructions(t *testing.T) {
 			t.Errorf("initialize response lacks %q", want)
 		}
 	}
+}
+
+// Text fields can be blanked on purpose with clear; an empty value still
+// means "keep", so agents sending only what changes don't wipe anything.
+func TestPlan_ClearFields(t *testing.T) {
+	s := setupMCP(t)
+	id := mkIn(t, s, s.storyID, "draft")
+	s.call(t, "amp_update_task", map[string]interface{}{"task_id": float64(id), "assigned_to": "amp-worker", "description": ""})
+	if got := planTask(t, s, id); got["description"] != "d" || got["assigned_to"] != "amp-worker" {
+		t.Fatalf("empty description should keep it: %v", got)
+	}
+	s.call(t, "amp_update_task", map[string]interface{}{"task_id": float64(id),
+		"clear": []interface{}{"description", "acceptance_criteria", "assigned_to"}})
+	got := planTask(t, s, id)
+	for _, f := range []string{"description", "acceptance_criteria"} {
+		if got[f] != "" {
+			t.Errorf("%s = %q after clear, want blank", f, got[f])
+		}
+	}
+	if v, ok := got["assigned_to"]; ok && v != "" {
+		t.Errorf("assigned_to = %q after clear", v)
+	}
+	if row, _ := s.repo.GetTask(context.Background(), id); row.Description != "" || row.AssignedTo != "" || row.Name != "draft" {
+		t.Errorf("stored task = %+v", row)
+	}
+	if msg := s.callExpectError(t, "amp_update_task", map[string]interface{}{"task_id": float64(id), "clear": []interface{}{"name"}}); !strings.Contains(msg, "can't be cleared") {
+		t.Errorf("clearing name: %q", msg)
+	}
+
+	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "description": "ed"})
+	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "clear": []interface{}{"description"}})
+	if e, _ := s.repo.GetEpic(context.Background(), s.epicID); e.Description != "" {
+		t.Errorf("epic description = %q", e.Description)
+	}
+	s.call(t, "amp_update_story", map[string]interface{}{"story_id": float64(s.storyID), "clear": []interface{}{"acceptance_criteria"}})
+	if st, _ := s.repo.GetStory(context.Background(), s.storyID); st.AcceptanceCriteria != "" || st.Name != "default-story" {
+		t.Errorf("story = %+v", st)
+	}
+}
+
+// Bug: amp_set_task_start_at never answered — no actor above the ticket
+// passed the message on — so scheduling an existing ticket hung forever.
+func TestPlan_ScheduleExistingTicket(t *testing.T) {
+	s := setupMCP(t)
+	id := mkIn(t, s, s.storyID, "later")
+	at := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.call(t, "amp_set_task_start_at", map[string]interface{}{"task_id": float64(id), "start_at": at})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("amp_set_task_start_at never answered")
+	}
+	if st := stateOf(t, s, id); st != "blocked" {
+		t.Fatalf("scheduled ticket: %s", st)
+	}
+	s.call(t, "amp_set_task_start_at", map[string]interface{}{"task_id": float64(id)})
+	if st := stateOf(t, s, id); st != "backlog" {
+		t.Fatalf("after clearing the schedule: %s", st)
+	}
+}
+
+// A plan with nothing in the project KB says so: the context behind it
+// would otherwise live only in the session that planned it.
+func TestPlan_CheckPlanWantsContext(t *testing.T) {
+	s := setupMCP(t)
+	if s.kb == nil {
+		t.Skip("TEST_TYPESENSE_URL not set")
+	}
+	a := mkIn(t, s, s.storyID, "a")
+	mkIn(t, s, s.storyID, "b", a)
+	pid := float64(s.projectID)
+
+	hasNoContext := func() bool {
+		report := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": pid})
+		for _, iss := range report["issues"].([]interface{}) {
+			if iss.(map[string]interface{})["kind"] == "no_context" {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasNoContext() {
+		t.Fatal("empty project KB: expected a no_context issue")
+	}
+	s.call(t, "amp_kb_write", map[string]interface{}{"project_id": pid, "path": "architecture/project-overview.md",
+		"title": "Overview", "content": "What this project is and how it's built."})
+	if hasNoContext() {
+		t.Fatal("no_context still reported after writing the overview")
+	}
+}
+
+// A gate that joins different people's work is flagged as a warning: it
+// doesn't make the plan NO-GO, but it says whose work waits on whose.
+func TestPlan_CheckPlanWarnsOnCoupledGate(t *testing.T) {
+	w := newRBACWorld(t)
+	alice, bob := w.s.as(w.alice), w.s.as(w.bob)
+	a := mkIn(t, alice, w.s.storyID, "alice's libs")
+	b := mkIn(t, bob, w.s.storyID, "bob's libs")
+	gate := mkIn(t, alice, w.s.storyID, "foundation check", a, b)
+	mkIn(t, alice, w.s.storyID, "alice's service", gate)
+	mkIn(t, bob, w.s.storyID, "bob's app", gate)
+
+	report := alice.call(t, "amp_check_plan", map[string]interface{}{"project_id": float64(w.s.projectID)})
+	var found map[string]interface{}
+	for _, iss := range report["issues"].([]interface{}) {
+		if m := iss.(map[string]interface{}); m["kind"] == "coupled_gate" {
+			found = m
+		}
+	}
+	if found == nil || found["severity"] != "warn" || !strings.Contains(fmt.Sprint(found["task_ids"]), fmt.Sprint(gate)) {
+		t.Fatalf("no coupled_gate warning for #%d: %v", gate, report["issues"])
+	}
+	for _, iss := range report["issues"].([]interface{}) {
+		if m := iss.(map[string]interface{}); m["severity"] != "warn" {
+			return // another (blocking) issue in this shared world; ok is false for that reason
+		}
+	}
+	if report["ok"] != true {
+		t.Fatalf("a warning alone shouldn't make the plan NO-GO: %v", report)
+	}
+}
+
+// Epics missing metadata their siblings carry (or carrying it under another
+// name) are flagged, since reports group by those keys.
+func TestPlan_CheckPlanWarnsOnMetadataDrift(t *testing.T) {
+	s := setupMCP(t)
+	pid := float64(s.projectID)
+	epic := func(name string, md map[string]interface{}) {
+		s.call(t, "amp_create_epic", map[string]interface{}{"project_id": pid, "name": name, "description": "d", "metadata": md})
+	}
+	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "metadata": map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-1"}})
+	epic("catalog", map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-2"})
+	epic("orders", map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-3"})
+	epic("quotes", map[string]interface{}{"capitalizable": true, "jira_key": "NWC-12"})
+
+	report := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": pid})
+	for _, iss := range report["issues"].([]interface{}) {
+		m := iss.(map[string]interface{})
+		if m["kind"] != "metadata_drift" {
+			continue
+		}
+		msg := m["message"].(string)
+		if m["severity"] != "warn" || !strings.Contains(msg, `"quotes"`) || !strings.Contains(msg, "jira_epic") || !strings.Contains(msg, "jira_key") {
+			t.Fatalf("drift issue: %v", m)
+		}
+		if strings.Contains(msg, `"catalog"`) {
+			t.Fatalf("a complete epic is flagged: %v", msg)
+		}
+		return
+	}
+	t.Fatalf("no metadata_drift issue: %v", report["issues"])
 }

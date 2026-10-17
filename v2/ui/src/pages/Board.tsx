@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { RefreshCw, Loader2, Wifi, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users } from 'lucide-react'
+import { RefreshCw, Loader2, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -8,8 +8,11 @@ import { TaskCard } from '../components/TaskCard'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { FilterBar } from '../components/FilterBar'
 import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
+import { HandoverBar } from '../components/HandoverBar'
 import { CrudModal } from '../components/CrudModal'
 import { MetadataEditor } from '../components/MetadataEditor'
+import { DependencyPicker } from '../components/DependencyPicker'
+import { PlanCheckModal } from '../components/PlanCheckModal'
 import { metadataPatch } from '../lib/metadata'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
 import { ProjectNav } from '../components/ProjectNav'
@@ -17,13 +20,14 @@ import { OwnerStack } from '../components/OwnerAvatar'
 import { OwnersEditor } from '../components/OwnersEditor'
 import { TeamAccessModal } from '../components/TeamAccessModal'
 import { api } from '../api/client'
+import { withClears } from '../lib/clear'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata } from '../types'
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
-const LABEL_COL = 180
-const TASK_COL  = 168
+const LABEL_COL = 240
+const TASK_COL  = 200
 
 const COLUMNS: {
   state: TaskState
@@ -32,11 +36,11 @@ const COLUMNS: {
   countBg: string
   topBorder: string
 }[] = [
-  { state: 'scheduled',   label: 'Scheduled',   color: '#FBBF24', countBg: 'rgba(245,158,11,0.12)',  topBorder: '#F59E0B' },
-  { state: 'backlog',     label: 'Backlog',      color: '#7E91A8', countBg: 'rgba(126,145,168,0.12)', topBorder: '#283A57' },
-  { state: 'in_progress', label: 'In Progress',  color: '#818CF8', countBg: 'rgba(99,102,241,0.15)',  topBorder: '#6366F1' },
-  { state: 'blocked',     label: 'Blocked',      color: '#F87171', countBg: 'rgba(239,68,68,0.12)',   topBorder: '#EF4444' },
-  { state: 'completed',   label: 'Done',         color: '#10B981', countBg: 'rgba(16,185,129,0.12)',  topBorder: '#10B981' },
+  { state: 'scheduled',   label: 'Scheduled',             color: 'var(--st-sched)', countBg: 'transparent', topBorder: 'var(--st-sched)' },
+  { state: 'backlog',     label: 'Ready',                 color: 'var(--st-ready)', countBg: 'transparent', topBorder: 'var(--st-ready)' },
+  { state: 'in_progress', label: 'In progress',           color: 'var(--st-prog)',  countBg: 'transparent', topBorder: 'var(--st-prog)' },
+  { state: 'blocked',     label: 'Waiting & questions',   color: 'var(--st-flag)',  countBg: 'transparent', topBorder: 'var(--st-flag)' },
+  { state: 'completed',   label: 'Done',                  color: 'var(--st-done)',  countBg: 'transparent', topBorder: 'var(--st-done)' },
 ]
 
 function isScheduledTask(task: Task): boolean {
@@ -44,13 +48,13 @@ function isScheduledTask(task: Task): boolean {
 }
 
 const inputCls =
-  'w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] placeholder-[#3D5068] ' +
-  'focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit]'
+  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
+  'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
-const labelCls = 'text-xs font-medium text-[#7E91A8] block mb-1.5'
+const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'
 
 // owner: '' = me (server default), 'none' = unassigned, or a member's user id
-const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '' }
+const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[] }
 
 export function Board() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -99,6 +103,9 @@ export function Board() {
   const [storyModal, setStoryModal] = useState<{ mode: 'create' | 'edit'; story?: Story; epicId?: number } | null>(null)
   const [storyDeleteTarget, setStoryDeleteTarget] = useState<Story | null>(null)
   const [storyForm, setStoryForm] = useState({ name: '', description: '', acceptance_criteria: '', priority: '1' })
+  // The epic a story being edited should live in (moving it on save).
+  const [storyEpicId, setStoryEpicId] = useState<number | null>(null)
+  const [planCheckOpen, setPlanCheckOpen] = useState(false)
   const [storySaving, setStorySaving] = useState(false)
   const [storyError, setStoryError] = useState<string | null>(null)
   const [openStoryMenu, setOpenStoryMenu] = useState<number | null>(null)
@@ -182,9 +189,9 @@ export function Board() {
   }), [filteredTasks])
 
   const toggleEpic = (id: number) =>
-    setCollapsedEpics(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s })
+    setCollapsedEpics(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
   const toggleStory = (id: number) =>
-    setCollapsedStories(prev => { const s = new Set(prev); s.has(id) ? s.delete(id) : s.add(id); return s })
+    setCollapsedStories(prev => { const s = new Set(prev); if (s.has(id)) s.delete(id); else s.add(id); return s })
 
   const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
@@ -205,7 +212,7 @@ export function Board() {
     startMeta(setEpicMeta, m.epic?.metadata, m.epic ? api.inheritedMetadata('epic', m.epic.id) : projectMeta())
   }
   const openStoryModal = (m: { mode: 'create' | 'edit'; story?: Story; epicId?: number }) => {
-    setStoryError(null); setStoryModal(m)
+    setStoryError(null); setStoryModal(m); setStoryEpicId(m.story?.epic_id ?? null)
     const parent = m.epicId != null ? epics.find(e => e.id === m.epicId) : undefined
     startMeta(setStoryMeta, m.story?.metadata, m.story
       ? api.inheritedMetadata('story', m.story.id)
@@ -219,7 +226,7 @@ export function Board() {
     setEpicError(null)
     try {
       if (epicModal?.mode === 'create') await api.createEpic(pid, { ...epicForm, metadata: epicMeta.value })
-      else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, { ...epicForm, metadata: metadataPatch(epicMeta.initial, epicMeta.value) })
+      else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, { ...withClears(epicForm, ['description']), metadata: metadataPatch(epicMeta.initial, epicMeta.value) })
       setEpicModal(null); refresh()
     } catch (e) {
       setEpicError(errMsg(e, 'Save failed'))
@@ -242,7 +249,10 @@ export function Board() {
     setStoryError(null)
     try {
       if (storyModal?.mode === 'create' && storyModal.epicId) await api.createStory(storyModal.epicId, { ...storyForm, metadata: storyMeta.value })
-      else if (storyModal?.story) await api.updateStory(storyModal.story.id, { ...storyForm, metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
+      else if (storyModal?.story) {
+        await api.updateStory(storyModal.story.id, { ...withClears(storyForm, ['description', 'acceptance_criteria']), metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
+        if (storyEpicId != null && storyEpicId !== storyModal.story.epic_id) await api.moveStory(storyModal.story.id, storyEpicId)
+      }
       setStoryModal(null); refresh()
     } catch (e) {
       setStoryError(errMsg(e, 'Save failed'))
@@ -279,22 +289,22 @@ export function Board() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center h-screen" style={{ background: '#08101F' }}>
-        <Loader2 size={22} className="text-[#6366F1] animate-spin" />
+      <div className="flex items-center justify-center h-full" style={{ background: 'var(--bg)' }}>
+        <Loader2 size={22} className="text-primary animate-spin" />
       </div>
     )
   }
 
   if (error) {
     return (
-      <div className="flex items-center justify-center h-screen text-[#F87171] text-sm" style={{ background: '#08101F' }}>
+      <div className="flex items-center justify-center h-full text-danger-ink text-sm" style={{ background: 'var(--bg)' }}>
         {error}
       </div>
     )
   }
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden" style={{ background: '#08101F' }}>
+    <div className="flex flex-col h-full overflow-hidden" style={{ background: 'var(--bg)' }}>
       {/* Top navigation */}
       <ProjectNav
         projectId={pid}
@@ -304,17 +314,26 @@ export function Board() {
             {/* New Epic */}
             <button
               onClick={() => { setEpicForm({ name: '', description: '', priority: '1' }); openEpicModal({ mode: 'create' }) }}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#818CF8] transition-all cursor-pointer active:scale-[0.97]"
-              style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)' }}
+              className="amp-btn amp-btn-primary"
             >
               <Plus size={12} />
               Epic
             </button>
 
+            {/* Plan check */}
+            <button
+              onClick={() => setPlanCheckOpen(true)}
+              className="amp-btn"
+              title="Check the plan's dependencies before dispatching"
+            >
+              <ListChecks size={12} />
+              <span className="hidden sm:inline">Check plan</span>
+            </button>
+
             {/* Team access */}
             <button
               onClick={() => setTeamAccessOpen(true)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#7E91A8] hover:text-[#DDE6F0] border border-[#1E2C45] hover:border-[#283A57] transition-all cursor-pointer"
+              className="amp-btn"
               title="Teams with access to this project"
             >
               <Users size={12} />
@@ -325,11 +344,7 @@ export function Board() {
             {completedEpicIds.size > 0 && (
               <button
                 onClick={() => setHideCompleted(h => !h)}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer"
-                style={hideCompleted
-                  ? { background: 'rgba(16,185,129,0.1)', border: '1px solid rgba(16,185,129,0.25)', color: '#10B981' }
-                  : { background: 'transparent', border: '1px solid #1E2C45', color: '#3D5068' }
-                }
+                className={`amp-btn ${hideCompleted ? 'amp-btn-primary' : ''}`} aria-pressed={hideCompleted}
               >
                 {hideCompleted ? <Eye size={12} /> : <EyeOff size={12} />}
                 <span>{hideCompleted ? `${completedEpicIds.size} hidden` : 'Hide done'}</span>
@@ -337,9 +352,9 @@ export function Board() {
             )}
 
             {/* Live status */}
-            <div className={`flex items-center gap-1.5 text-xs font-medium ${liveStatus === 'connected' ? 'text-[#10B981]' : 'text-[#3D5068]'}`}>
+            <div className={`flex items-center gap-1.5 amp-num text-[11px] ${liveStatus === 'connected' ? 'text-success-ink' : 'text-ink-3'}`}>
               {liveStatus === 'connected'
-                ? <><span className="w-1.5 h-1.5 rounded-full bg-[#10B981]" style={{ boxShadow: '0 0 5px #10B981' }} /><Wifi size={11} /></>
+                ? <span className="w-1.5 h-1.5 bg-success" />
                 : <WifiOff size={11} />
               }
               <span className="hidden sm:inline">{liveStatus === 'connected' ? 'Live' : 'Connecting…'}</span>
@@ -347,7 +362,7 @@ export function Board() {
 
             <button
               onClick={refresh}
-              className="p-1.5 text-[#3D5068] hover:text-[#DDE6F0] transition-colors cursor-pointer rounded-lg hover:bg-[#172540]"
+              className="p-1.5 text-ink-3 hover:text-ink transition-colors cursor-pointer rounded-lg hover:bg-surface-3"
             >
               <RefreshCw size={13} />
             </button>
@@ -356,7 +371,7 @@ export function Board() {
       />
 
       {/* Filter bar */}
-      <div className="px-5 py-3 flex-shrink-0" style={{ borderBottom: '1px solid #192238', background: '#08101F' }}>
+      <div className="px-5 py-3 flex-shrink-0" style={{ borderBottom: '1px solid var(--line-sub)', background: 'var(--bg)' }}>
         <FilterBar
           filter={filter}
           onChange={setFilter}
@@ -364,6 +379,23 @@ export function Board() {
           memberOptions={members.map(m => ({ id: m.user_id, name: personName(m) + (m.user_id === meId ? ' (me)' : '') }))}
           counts={counts}
         />
+        {/* Filtering by one person: a lead can hand their open tickets to someone else. */}
+        {typeof filter.owner === 'number' && (myAccess && myAccess !== 'member' || filter.owner === meId) && (
+          <HandoverBar projectId={pid} from={filter.owner}
+            fromName={personName(members.find(m => m.user_id === filter.owner) ?? {})}
+            taskIds={ownerTasks.filter(t => t.state !== 'completed' && filteredTaskIds.has(t.id)).map(t => t.id)}
+            narrowed={hasFieldFilter}
+            people={members.map(m => ({ id: m.user_id, name: personName(m) }))} onDone={refresh} />
+        )}
+        {/* "Mine" is the default; say so when it hides everyone else's work. */}
+        {ownerNarrows && ownerTasks.length === 0 && tasks.length > 0 && (
+          <div className="mt-2.5 flex items-center gap-3 flex-wrap text-[12.5px] text-ink-2">
+            <span>You don't own any of this project's {tasks.length} tickets.</span>
+            <button type="button" className="amp-btn amp-btn-sm" onClick={() => setFilter(f => ({ ...f, owner: 'everyone' }))}>
+              Show everyone's
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Board scroll area */}
@@ -371,26 +403,20 @@ export function Board() {
         {epics.length === 0 ? (
           <EmptyState />
         ) : (
-          <div className="min-w-max">
+          <div style={{ minWidth: LABEL_COL + COLUMNS.length * TASK_COL }}>
             {/* Column headers — sticky */}
-            <div className="sticky top-0 z-10 flex" style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>
+            <div className="sticky top-0 z-10 flex" style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
               {/* Row label spacer */}
-              <div className="flex-shrink-0 px-3 py-3 border-r border-[#192238]" style={{ width: LABEL_COL }} />
+              <div className="flex-shrink-0 px-3 py-3 border-r border-line-sub" style={{ width: LABEL_COL }} />
               {COLUMNS.map(col => (
                 <div
                   key={col.state}
-                  className="flex-1 px-3 py-3 border-r border-[#192238] last:border-r-0 flex items-center gap-2"
-                  style={{ minWidth: TASK_COL, borderTop: `2px solid ${col.topBorder}22` }}
+                  className="flex-1 px-3 py-3 border-r border-line last:border-r-0 flex items-center gap-2"
+                  style={{ minWidth: TASK_COL, boxShadow: `inset 0 3px 0 ${col.topBorder}` }}
                 >
-                  <span className="text-xs font-bold uppercase tracking-widest" style={{ color: col.color }}>
-                    {col.label}
-                  </span>
-                  <span
-                    className="text-xs px-1.5 py-0.5 rounded-full font-semibold tabular-nums"
-                    style={{ background: col.countBg, color: col.color }}
-                  >
-                    {counts[col.state as keyof typeof counts]}
-                  </span>
+                  <i className="inline-block w-2 h-2" style={{ background: col.color }} aria-hidden="true" />
+                  <span className="font-label text-[11px] font-semibold uppercase tracking-[0.14em] text-ink">{col.label}</span>
+                  <span className="amp-num text-[11px] text-ink-3 ml-auto">{counts[col.state as keyof typeof counts]}</span>
                 </div>
               ))}
             </div>
@@ -415,22 +441,20 @@ export function Board() {
               }
 
               return (
-                <div key={epic.id} className="border-b border-[#192238]">
+                <div key={epic.id} className="border-b border-line-sub">
                   {/* Epic header */}
                   <div
-                    className="flex items-center cursor-pointer group transition-colors"
-                    style={{ borderBottom: '1px solid #192238' }}
+                    className="flex items-center cursor-pointer group transition-colors bg-surface-2 hover:bg-surface-3"
+                    style={{ borderBottom: '1px solid var(--line)' }}
                     onClick={() => toggleEpic(epic.id)}
-                    onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#0D1726'}
-                    onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                   >
-                    <div className="flex-shrink-0 px-3 py-3 border-r border-[#192238] flex items-center gap-2 relative" style={{ width: LABEL_COL }}>
-                      <span className="text-[#283A57] group-hover:text-[#7E91A8] transition-colors">
+                    <div className="flex-shrink-0 px-3 py-3 border-r border-line-sub flex items-center gap-2 relative" style={{ width: LABEL_COL }}>
+                      <span className="text-line-str group-hover:text-ink-2 transition-colors">
                         {isEpicCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <div className="text-xs font-bold text-[#DDE6F0] truncate">{epic.name}</div>
-                        <div className="flex items-center gap-1.5 text-xs text-[#3D5068] tabular-nums">
+                        <div className="flex items-center gap-2"><span className="amp-bands-v h-[12px]" aria-hidden="true" /><span className="font-label text-[12px] font-semibold uppercase tracking-[0.12em] text-ink line-clamp-2 break-words" title={epic.name}>{epic.name}</span></div>
+                        <div className="flex items-center gap-1.5 text-xs text-ink-3 tabular-nums">
                           <span className="truncate">
                             {epicStories.length} stor{epicStories.length !== 1 ? 'ies' : 'y'} · {epicTasks.length} task{epicTasks.length !== 1 ? 's' : ''}
                           </span>
@@ -443,31 +467,32 @@ export function Board() {
                           setStoryForm({ name: '', description: '', acceptance_criteria: '', priority: '1' })
                           openStoryModal({ mode: 'create', epicId: epic.id })
                         }}
-                        className="p-1 opacity-0 group-hover:opacity-100 hover:bg-[#172540] rounded-md transition-all cursor-pointer"
-                        title="Add story"
+                        className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                        title="Add story" aria-label={`Add a story to ${epic.name}`}
                       >
-                        <Plus size={11} className="text-[#7E91A8]" />
+                        <Plus size={11} className="text-ink-2" />
                       </button>
                       <button
                         onClick={e => { e.stopPropagation(); setOpenEpicMenu(openEpicMenu === epic.id ? null : epic.id) }}
-                        className="p-1 opacity-0 group-hover:opacity-100 hover:bg-[#172540] rounded-md transition-all cursor-pointer"
+                        aria-label={`Epic actions: ${epic.name}`} aria-haspopup="menu" aria-expanded={openEpicMenu === epic.id} title="Edit or delete epic"
+                        className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
                       >
-                        <MoreHorizontal size={12} className="text-[#7E91A8]" />
+                        <MoreHorizontal size={12} className="text-ink-2" />
                       </button>
                        {openEpicMenu === epic.id && (
-                         <div className="absolute right-1 top-9 z-20 rounded-xl py-1 min-w-[108px]"
-                           style={{ background: '#0D1726', border: '1px solid #1E2C45', boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }}>
+                         <div className="absolute right-1 top-9 z-20 py-1 min-w-[108px]"
+                           style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent)' }}>
                           <button
                             onClick={e => {
                               e.stopPropagation()
                               setEpicForm({ name: epic.name, description: epic.description || '', priority: epic.priority || '1' })
                               openEpicModal({ mode: 'edit', epic }); setOpenEpicMenu(null)
                             }}
-                            className="w-full text-left px-3 py-1.5 text-xs text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"
+                            className="w-full text-left px-3 py-1.5 text-xs text-ink hover:bg-surface-3 transition-colors cursor-pointer"
                           >Edit</button>
                           <button
                             onClick={e => { e.stopPropagation(); setEpicError(null); setEpicDeleteTarget(epic); setOpenEpicMenu(null) }}
-                            className="w-full text-left px-3 py-1.5 text-xs text-[#F87171] hover:bg-[#EF4444]/10 transition-colors cursor-pointer"
+                            className="w-full text-left px-3 py-1.5 text-xs text-danger-ink hover:bg-danger/10 transition-colors cursor-pointer"
                           >Delete</button>
                         </div>
                       )}
@@ -478,10 +503,9 @@ export function Board() {
                       else if (col.state === 'blocked') n = epicTasks.filter(t => t.state === 'blocked' && !isScheduledTask(t)).length
                       else n = epicTasks.filter(t => t.state === col.state).length
                       return (
-                        <div key={col.state} className="flex-1 px-3 py-3 border-r border-[#192238] last:border-r-0" style={{ minWidth: TASK_COL }}>
+                        <div key={col.state} className="flex-1 px-3 py-3 border-r border-line-sub last:border-r-0" style={{ minWidth: TASK_COL }}>
                           {n > 0 && (
-                            <span className="text-xs px-1.5 py-0.5 rounded-full font-semibold tabular-nums"
-                              style={{ background: col.countBg, color: col.color }}>
+                            <span className="amp-num text-[11.5px]" style={{ color: col.color }}>
                               {n}
                             </span>
                           )}
@@ -496,21 +520,19 @@ export function Board() {
                     const isStoryCollapsed = collapsedStories.has(story.id)
 
                     return (
-                      <div key={story.id} className="border-b border-[#192238]/60 last:border-b-0">
+                      <div key={story.id} className="border-b border-line-sub/60 last:border-b-0">
                         {/* Story header */}
                         <div
-                          className="flex items-center cursor-pointer group transition-colors"
+                          className="flex items-center cursor-pointer group transition-colors bg-surface hover:bg-surface-2 border-b border-line"
                           onClick={() => toggleStory(story.id)}
-                          onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#08101F'}
-                          onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                         >
-                          <div className="flex-shrink-0 px-3 py-2.5 pl-7 border-r border-[#192238] flex items-center gap-2 relative" style={{ width: LABEL_COL }}>
-                            <span className="text-[#1E2C45] group-hover:text-[#283A57] transition-colors">
+                          <div className="flex-shrink-0 px-3 py-2.5 pl-7 border-r border-line-sub flex items-center gap-2 relative" style={{ width: LABEL_COL }}>
+                            <span className="text-line group-hover:text-line-str transition-colors">
                               {isStoryCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
                             </span>
                             <div className="min-w-0 flex-1">
-                              <div className="text-xs font-medium text-[#7E91A8] truncate">{story.name}</div>
-                              <div className="flex items-center gap-1.5 text-xs text-[#3D5068] tabular-nums">
+                              <div className="text-[12.5px] font-medium text-ink line-clamp-2 break-words" title={story.name}>{story.name}</div>
+                              <div className="flex items-center gap-1.5 text-xs text-ink-3 tabular-nums">
                                 <span className="truncate">{storyTasks.length} task{storyTasks.length !== 1 ? 's' : ''}</span>
                                 <OwnerStack people={ownersOf(story.owner_ids)} max={2} size={14} />
                               </div>
@@ -522,31 +544,32 @@ export function Board() {
                                 setTaskError(null)
                                 setTaskCreateModal({ story })
                               }}
-                              className="p-1 opacity-0 group-hover:opacity-100 hover:bg-[#172540] rounded-md transition-all cursor-pointer"
-                              title="Add task"
+                              className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                              title="Add task" aria-label={`Add a task to ${story.name}`}
                             >
-                              <Plus size={11} className="text-[#7E91A8]" />
+                              <Plus size={11} className="text-ink-2" />
                             </button>
                             <button
                               onClick={e => { e.stopPropagation(); setOpenStoryMenu(openStoryMenu === story.id ? null : story.id) }}
-                              className="p-1 opacity-0 group-hover:opacity-100 hover:bg-[#172540] rounded-md transition-all cursor-pointer"
+                              aria-label={`Story actions: ${story.name}`} aria-haspopup="menu" aria-expanded={openStoryMenu === story.id} title="Edit or delete story"
+                              className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
                             >
-                              <MoreHorizontal size={11} className="text-[#7E91A8]" />
+                              <MoreHorizontal size={11} className="text-ink-2" />
                             </button>
                              {openStoryMenu === story.id && (
-                               <div className="absolute right-1 top-8 z-20 rounded-xl py-1 min-w-[108px]"
-                                 style={{ background: '#0D1726', border: '1px solid #1E2C45', boxShadow: '0 8px 32px rgba(0,0,0,0.5)' }}>
+                               <div className="absolute right-1 top-8 z-20 py-1 min-w-[108px]"
+                                 style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent)' }}>
                                 <button
                                   onClick={e => {
                                     e.stopPropagation()
                                     setStoryForm({ name: story.name, description: story.description || '', acceptance_criteria: story.acceptance_criteria || '', priority: story.priority || '1' })
                                     openStoryModal({ mode: 'edit', story }); setOpenStoryMenu(null)
                                   }}
-                                  className="w-full text-left px-3 py-1.5 text-xs text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer"
+                                  className="w-full text-left px-3 py-1.5 text-xs text-ink hover:bg-surface-3 transition-colors cursor-pointer"
                                 >Edit</button>
                                 <button
                                   onClick={e => { e.stopPropagation(); setStoryError(null); setStoryDeleteTarget(story); setOpenStoryMenu(null) }}
-                                  className="w-full text-left px-3 py-1.5 text-xs text-[#F87171] hover:bg-[#EF4444]/10 transition-colors cursor-pointer"
+                                  className="w-full text-left px-3 py-1.5 text-xs text-danger-ink hover:bg-danger/10 transition-colors cursor-pointer"
                                 >Delete</button>
                               </div>
                             )}
@@ -557,10 +580,9 @@ export function Board() {
                             else if (col.state === 'blocked') n = storyTasks.filter(t => t.state === 'blocked' && !isScheduledTask(t)).length
                             else n = storyTasks.filter(t => t.state === col.state).length
                             return (
-                              <div key={col.state} className="flex-1 px-3 py-2.5 border-r border-[#192238] last:border-r-0" style={{ minWidth: TASK_COL }}>
+                              <div key={col.state} className="flex-1 px-3 py-2.5 border-r border-line-sub last:border-r-0" style={{ minWidth: TASK_COL }}>
                                 {n > 0 && (
-                                  <span className="text-xs px-1.5 py-0.5 rounded-full tabular-nums"
-                                    style={{ background: col.countBg, color: col.color }}>
+                                  <span className="amp-num text-[11px]" style={{ color: col.color }}>
                                     {n}
                                   </span>
                                 )}
@@ -572,19 +594,20 @@ export function Board() {
                         {/* Task rows */}
                         {!isStoryCollapsed && (
                           <div className="flex">
-                            <div className="flex-shrink-0 border-r border-[#192238]" style={{ width: LABEL_COL }} />
+                            <div className="flex-shrink-0 border-r border-line-sub" style={{ width: LABEL_COL }} />
                             {COLUMNS.map(col => {
                               let colTasks: Task[] = []
                               if (col.state === 'scheduled') colTasks = storyTasks.filter(t => isScheduledTask(t))
                               else if (col.state === 'blocked') colTasks = storyTasks.filter(t => t.state === 'blocked' && !isScheduledTask(t))
+                                .sort((a, b) => Number(!!b.block_reason) - Number(!!a.block_reason))
                               else colTasks = storyTasks.filter(t => t.state === col.state)
                               return (
                                  <div
                                    key={col.state}
-                                   className="flex-1 p-1.5 border-r border-[#192238] last:border-r-0"
-                                   style={{ minWidth: TASK_COL, background: 'rgba(8,16,31,0.4)' }}
+                                   className="flex-1 p-2 border-r border-line last:border-r-0"
+                                   style={{ minWidth: TASK_COL, background: 'var(--bg)' }}
                                 >
-                                  <div className="space-y-2">
+                                  <div className="space-y-1.5">
                                     {colTasks.map(task => (
                                       <TaskCard
                                         key={task.id}
@@ -624,6 +647,12 @@ export function Board() {
         onTaskUpdated={applyTask}
       />
 
+      {planCheckOpen && (
+        <PlanCheckModal projectId={pid} tasks={tasks}
+          onOpenTask={id => { setPlanCheckOpen(false); setSelectedTaskId(id) }}
+          onClose={() => { setPlanCheckOpen(false); refresh() }} />
+      )}
+
       {teamAccessOpen && (
         <TeamAccessModal
           projectId={pid}
@@ -658,8 +687,9 @@ export function Board() {
             )}
             <div><label className={labelCls}>Metadata</label>
               <MetadataEditor key={epicModal.epic?.id ?? 'new'} initial={epicMeta.initial} inherited={epicMeta.inherited}
+                keySuggestions={[...new Set(epics.flatMap(e => Object.keys(e.metadata ?? {})))].sort()}
                 onChange={(value, error) => setEpicMeta(m => ({ ...m, value, error }))} /></div>
-            {epicError && <p className="text-xs text-[#F87171]">{epicError}</p>}
+            {epicError && <p className="text-xs text-danger-ink">{epicError}</p>}
           </div>
         </CrudModal>
       )}
@@ -681,6 +711,15 @@ export function Board() {
               <textarea value={storyForm.description} onChange={e => setStoryForm(f => ({ ...f, description: e.target.value }))} rows={2} className={`${inputCls} resize-none`} /></div>
             <div><label className={labelCls}>Acceptance Criteria</label>
               <textarea value={storyForm.acceptance_criteria} onChange={e => setStoryForm(f => ({ ...f, acceptance_criteria: e.target.value }))} rows={3} className={`${inputCls} resize-none`} /></div>
+            {storyModal.mode === 'edit' && storyEpicId != null && (
+              <div><label className={labelCls}>Epic</label>
+                <select value={storyEpicId} onChange={e => setStoryEpicId(Number(e.target.value))} className={inputCls}>
+                  {epics.map(ep => <option key={ep.id} value={ep.id}>{ep.name}</option>)}
+                </select>
+                {storyEpicId !== storyModal.story?.epic_id && (
+                  <p className="text-[11px] text-ink-2 mt-1">Saving moves the story and its tickets to this epic; dependencies are kept.</p>
+                )}</div>
+            )}
             <div><label className={labelCls}>Priority</label>
               <select value={storyForm.priority} onChange={e => setStoryForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
@@ -698,8 +737,9 @@ export function Board() {
             )}
             <div><label className={labelCls}>Metadata</label>
               <MetadataEditor key={storyModal.story?.id ?? `new-${storyModal.epicId}`} initial={storyMeta.initial} inherited={storyMeta.inherited}
+                keySuggestions={[...new Set(stories.flatMap(st => Object.keys(st.metadata ?? {})))].sort()}
                 onChange={(value, error) => setStoryMeta(m => ({ ...m, value, error }))} /></div>
-            {storyError && <p className="text-xs text-[#F87171]">{storyError}</p>}
+            {storyError && <p className="text-xs text-danger-ink">{storyError}</p>}
           </div>
         </CrudModal>
       )}
@@ -735,7 +775,16 @@ export function Board() {
               <select value={taskForm.priority} onChange={e => setTaskForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>
               </select></div>
-            {taskError && <p className="text-xs text-[#F87171]">{taskError}</p>}
+            <div><label className={labelCls}>Depends on</label>
+              <DependencyPicker tasks={tasks} value={taskForm.dependency_ids}
+                onChange={ids => setTaskForm(f => ({ ...f, dependency_ids: ids }))} />
+              {taskForm.dependency_ids.length === 0 && tasks.length > 0 && (
+                <p className="text-[11px] text-warning-ink mt-1.5 leading-relaxed">
+                  With no dependencies this ticket is ready to start right away, in parallel with everything else
+                  that's ready. If it needs another ticket's output, add it here.
+                </p>
+              )}</div>
+            {taskError && <p className="text-xs text-danger-ink">{taskError}</p>}
           </div>
         </CrudModal>
       )}
@@ -748,13 +797,13 @@ function EmptyState() {
     <div className="flex flex-col items-center justify-center h-64 gap-4">
       <div
         className="w-14 h-14 rounded-2xl flex items-center justify-center"
-        style={{ background: '#0D1726', border: '1px solid #1E2C45' }}
+        style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}
       >
-        <GitBranch size={22} className="text-[#283A57]" />
+        <GitBranch size={22} className="text-line-str" />
       </div>
       <div className="text-center">
-        <p className="text-sm font-semibold text-[#DDE6F0]">No epics yet</p>
-        <p className="text-xs text-[#7E91A8] mt-1.5 max-w-xs leading-relaxed">
+        <p className="text-sm font-semibold text-ink">No epics yet</p>
+        <p className="text-xs text-ink-2 mt-1.5 max-w-xs leading-relaxed">
           Ask the amp-manager to plan your project — tasks will appear here in real time.
         </p>
       </div>

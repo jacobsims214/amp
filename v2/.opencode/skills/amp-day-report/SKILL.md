@@ -13,8 +13,10 @@ trackers.
 
 ## Wrapping up the user's day
 
-1. **Find their time zone** (e.g. `date +%Z` / the system's IANA zone, like
-   `America/New_York`). It decides where "today" starts and ends. Pass it as `tz` every time.
+1. **Find their time zone** as an IANA name like `America/New_York` (not `EDT`, which
+   `date +%Z` prints): `readlink /etc/localtime | sed 's#.*zoneinfo/##'` on macOS, or
+   `timedatectl show -p Timezone --value` (or `cat /etc/timezone`) on Linux. It decides where
+   "today" starts and ends. Pass it as `tz` every time; without it the report is in UTC.
 2. **Draft:** `amp_day_report(tz=…)` (add `date="YYYY-MM-DD"` for another day). Nothing is
    saved. If a summary was already saved today, it's included — start from it.
 3. **Summarise with the user.** Show them what AMP recorded (counts and the notable tickets),

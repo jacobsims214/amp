@@ -153,6 +153,11 @@ type MsgScheduledUnblock struct {
 
 // ---- Management ----
 
+// MsgPing asks the project actor to answer once it is running.
+type MsgPing struct {
+	ReplyCh chan ReplySimple
+}
+
 // MsgReset clears all children — called after amp_reset_project wipes postgres.
 type MsgReset struct {
 	ReplyCh chan ReplySimple
@@ -249,6 +254,32 @@ type MsgSetTaskDeps struct {
 // (e.g. after one of them was deleted) and re-derive whether it is waiting.
 type MsgReconcileDeps struct {
 	TaskID  int
+	ReplyCh chan ReplySimple
+}
+
+// MsgRestoreTask brings a ticket restored from the trash (already back in
+// the database) into its story's actors.
+type MsgRestoreTask struct {
+	TaskID  int
+	EpicID  int
+	StoryID int
+	ReplyCh chan ReplyGetTask
+}
+
+// MsgRestoreEpic brings an epic restored from the trash (already back in
+// the database, with its stories) into the project's actors. Its tickets
+// follow with MsgRestoreTask.
+type MsgRestoreEpic struct {
+	EpicID  int
+	ReplyCh chan ReplySimple
+}
+
+// MsgRestoreStory brings a story restored from the trash (already back in
+// the database) into its epic's actors. Its tickets follow with
+// MsgRestoreTask.
+type MsgRestoreStory struct {
+	EpicID  int
+	StoryID int
 	ReplyCh chan ReplySimple
 }
 

@@ -23,8 +23,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -62,7 +65,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_create_project", "Create a new AMP project in one of your orgs, owned by one of your teams. Returns the created project with its id.",
 		props{
 			"name":        str("REQUIRED. Project name."),
-			"code":        str("REQUIRED. Short unique code, e.g. 'my-project'."),
+			"code":        str("REQUIRED. Short unique code, used as the ticket prefix (refs read CODE-149): 2-6 letters, e.g. 'NWC' for Northwind Commerce."),
 			"description": str("Optional description."),
 			"org_id":      num("Optional. Org to create it in; required only if you belong to several (see amp_whoami)."),
 			"team_id":     num("Optional. Team that will own it; required only if you are on several teams in the org."),
@@ -73,6 +76,30 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Who you are acting as in AMP: your user, your orgs and your teams. Tickets you create are yours by default; "+
 			"amp_list_tasks shows your own work unless you pass owner.",
 		props{}), wrap(ctx, s.open(s.whoami)))
+
+	mcp.AddTool(tool("amp_guide",
+		"The AMP guide: how to use AMP itself, shipped with AMP and the same for everyone. Call it with no topic when "+
+			"your user is new to AMP, asks how AMP works or what to do next, or wants to be onboarded: it returns the "+
+			"onboarding script (start-here) and the list of guide pages, and you then walk your user through AMP step by "+
+			"step, showing them in their own projects rather than reciting. Call it with a topic (a question, a feature "+
+			"name like 'handover' or 'plan approval', or a page path) to look something up: it returns the best page in "+
+			"full plus other matches. Also call it before telling a user AMP can't do something. Read-only.",
+		props{
+			"topic": str("Optional. A question, feature or page path (e.g. 'how do I hand tickets over', 'traceability', 'running-work.md'). Omit for the onboarding script and the page index."),
+		}), wrap(ctx, s.open(s.guide)))
+
+	mcp.AddTool(tool("amp_audit_log",
+		"Read the audit log: who changed access (org, team, project links, roles, accounts, API tokens), settings, or "+
+			"integrations, and who deleted what. Global admins read everything; org owners/admins pass org_id; "+
+			"project owners pass project_id. Newest first.",
+		props{
+			"org_id":     num("Optional. Entries for this org and its projects."),
+			"project_id": num("Optional. Entries for this project."),
+			"actor_id":   num("Optional. Only changes made by this user id."),
+			"action":     str("Optional. An action (e.g. 'org.member.set') or a prefix ending in '.' (e.g. 'team.')."),
+			"before_id":  num("Optional. Page back: entries older than this id."),
+			"limit":      num("Optional. Default 100, max 500."),
+		}), wrap(ctx, s.open(s.auditLog)))
 
 	mcp.AddTool(tool("amp_list_project_members",
 		"List the people with access to a project (id, email, access level). Use to find who a ticket can be assigned to.",
@@ -223,8 +250,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("Optional. New project name."),
 			"description":   str("Optional. New project description."),
 			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
-			"metadata":      obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
+			"require_plan_approval": boolean("Optional. When true, tickets planned after the plan was last approved can't be dispatched until " +
+				"a person approves the plan again (amp_approve_plan, or Approve plan in AMP)."),
+			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
+
+	mcp.AddTool(tool("amp_approve_plan",
+		"Record that the user approved the project's plan as it stands now, so its tickets may be dispatched. Call it when the "+
+			"user approves your plan in chat (\"approved\", \"go ahead\"), never on your own. People can also approve in AMP's "+
+			"Flight plan. amp_check_plan lists the open tickets planned since the last approval (awaiting_approval); projects with "+
+			"require_plan_approval refuse to dispatch those until the plan is approved.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+		}), wrap(ctx, s.guard(authz.Member, s.approvePlan)))
 
 	// ---- Epics ----
 	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project. Epics and stories group work; what AMP schedules is the "+
@@ -250,6 +288,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("New epic name."),
 			"description":   str("New epic description."),
 			"priority":      str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":         strArr(clearDesc("description")),
 			"add_owners":    strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners": strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateEpic)))
@@ -281,6 +320,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description":         str("New story description."),
 			"acceptance_criteria": str("New acceptance criteria."),
 			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":               strArr(clearDesc("description, acceptance_criteria")),
 			"add_owners":          strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners":       strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateStory)))
@@ -379,7 +419,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_check_plan",
 		"Check a project's plan before dispatching: tickets connected to nothing, too many tickets that can start at once "+
 			"(a sign of missing dependencies), empty stories, and the longest dependency chain. Also repairs tickets stuck "+
-			"blocked on dependencies that are all done. Run it after planning and after changing the plan.",
+			"blocked on dependencies that are all done. Run it after planning and after changing the plan. "+
+			"awaiting_approval lists open tickets planned since the user last approved the plan (see amp_approve_plan).",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.checkPlan)))
@@ -387,11 +428,13 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_list_tasks",
 		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
 			"Pass owner='unassigned' to see the pool anyone can pick up, owner='any' for everything, or a user's email/id. "+
-			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time.",
+			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time. "+
+			"questions lists blocked tickets whose block_reason is a question for a person (they are also in blocked): ask the user, then amp_answer_question.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
 			"owner":      str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
+			"format":     str("Optional: 'compact' for a small overview — buckets as ticket IDs, and every ticket as one line under its epic (id, name, state, owner, what it waits on). Use it to orient; fetch full tickets with amp_get_task."),
 		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
 	mcp.AddTool(tool("amp_get_task", "Get full task details by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top).",
@@ -410,6 +453,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
+			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -433,14 +477,83 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
 		}), wrap(ctx, s.guard(authz.Member, s.dispatchTask)))
 
-	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it.",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.completeTask)))
-
-	mcp.AddTool(tool("amp_block_task", "Block a task with a reason.",
+	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it. "+
+		"Also record the run: the model you used, your token usage if your harness can tell you (opencode: amp_session_usage), "+
+		"and where the work is (branch, commit, PR, pushed). AMP reports token spend and traces code back to tickets from these.",
+		withRunProps(props{"task_id": num("REQUIRED. Task ID.")})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
+	mcp.AddTool(tool("amp_report_run",
+		"Record an agent run on a ticket without changing its state: the model, token usage, and where the work went. "+
+			"Use it for a run that ended some other way (killed, abandoned, handed over), for usage you learn about afterwards "+
+			"(e.g. a manager reporting a subagent's usage from its result), or for a PR opened after completion.",
+		withRunProps(props{
+			"task_id":  num("REQUIRED. Task ID."),
+			"outcome":  str("Optional. completed | blocked | progress (default) | abandoned."),
+			"agent_id": str("Optional. The agent profile that ran (defaults to the ticket's agent)."),
+		})), wrap(ctx, s.guard(authz.Member, s.reportRun)))
+	mcp.AddTool(tool("amp_list_deleted_tasks", "A project's trash: tickets, epics and stories deleted in the last 30 days, which amp_restore_tasks can bring back.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listDeleted)))
+	mcp.AddTool(tool("amp_restore_tasks",
+		"Bring deleted work back from the trash. Tickets come back with their comments, history, owner, state and "+
+			"dependency links; a deleted epic comes back with its stories and their tickets, a deleted story with its "+
+			"tickets, all with their original IDs. A project lead, or whoever deleted it, may restore it. A ticket needs "+
+			"its story and a story its epic: restore those in the same call (epics, then stories, then tickets).",
 		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"task_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Ticket IDs to restore."},
+			"epic_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Deleted epic IDs to restore, with their stories and tickets."},
+			"story_ids":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Deleted story IDs to restore, with their tickets."},
+		}), wrap(ctx, s.guard(authz.Member, s.restoreTasks)))
+	mcp.AddTool(tool("amp_project_day_reports",
+		"The project's standup sheet: everyone on the project and the day report they saved for a day, narrowed to this "+
+			"project's tickets, plus who hasn't saved one. Use it to start the day (yesterday's) or to run a standup.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"date":       str("Optional. YYYY-MM-DD (default today in tz)."),
+			"tz":         str("Optional. IANA time zone, e.g. America/New_York (default UTC)."),
+		}), wrap(ctx, s.guard(authz.Member, s.projectDayReports)))
+	mcp.AddTool(tool("amp_handover_tasks",
+		"Move a person's open tickets in a project to someone else — they're out, leaving, or scope moved between people. "+
+			"Each ticket is reassigned the normal way and gets a comment saying why. In-progress tickets stay unless "+
+			"include_in_progress is set. A project lead may hand over anyone's work; anyone may hand over their own.",
+		props{
+			"project_id":          num("REQUIRED. Project ID."),
+			"from":                str("REQUIRED. Whose tickets: user id or email."),
+			"to":                  str("REQUIRED. Who takes them: user id or email."),
+			"task_ids":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Optional. Only these tickets (default: all of from's open tickets in the project)."},
+			"include_in_progress": boolean("Optional. Also move tickets in progress (their agent works under the old owner)."),
+			"reason":              str("Optional. Why, posted on each ticket, e.g. 'Sam out sick Monday; Harbor demo'."),
+		}), wrap(ctx, s.guard(authz.Member, s.handover)))
+	mcp.AddTool(tool("amp_list_unmerged", "Completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge.",
+		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listUnmerged)))
+	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",
+		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.taskRuns)))
+	mcp.AddTool(tool("amp_trace",
+		"From code back to the work: find the tickets whose runs produced a commit, a branch, or a PR, across the projects you "+
+			"can see. Then amp_get_ticket_history(task_id) for how it got there (plan, comments, decisions, runs).",
+		props{
+			"commit": str("A commit SHA, or at least its first 7 characters."),
+			"branch": str("A branch name."),
+			"pr_url": str("A pull request URL."),
+		}), wrap(ctx, s.open(s.trace)))
+
+	mcp.AddTool(tool("amp_block_task",
+		"Stop work on a ticket because it needs a person: a question, a decision, missing information, or access you don't have. "+
+			"The reason is shown to people in AMP as the question to answer, so write it as one, with the options if there are any. "+
+			"The ticket leaves in-progress and appears in amp_list_tasks' questions list. When someone answers (in the AMP UI, or with "+
+			"amp_answer_question) the answer is posted on the ticket and it goes back to ready to be dispatched again. "+
+			"Not for waiting on other tickets: that's what dependencies are for.",
+		withRunProps(props{
 			"task_id": num("REQUIRED. Task ID."),
-			"reason":  str("REQUIRED. Why the task is blocked."),
-		}), wrap(ctx, s.guard(authz.Member, s.blockTask)))
+			"reason":  str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
+		})), wrap(ctx, s.guard(authz.Member, s.blockTask)))
+	mcp.AddTool(tool("amp_answer_question",
+		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
+			"and the ticket goes back to ready (or to waiting, if it still depends on unfinished tickets), so the next dispatch picks it up "+
+			"with the answer in its comments. Use this when the user answers a worker's question in your chat; people can also answer in the AMP UI.",
+		props{
+			"task_id": num("REQUIRED. Task ID of the ticket with the question."),
+			"answer":  str("REQUIRED. The answer, as the person gave it, with any detail the next worker needs."),
+		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{
@@ -467,7 +580,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Owner, s.resetProject)))
 
 	mcp.AddTool(tool("amp_delete_task",
-		"Delete a single task. Use this to remove tasks created by mistake during planning.",
+		"Delete a single task. Use this to remove tasks created by mistake during planning. Deleted tickets stay in the project trash for 30 days (amp_list_deleted_tasks, amp_restore_tasks).",
 		props{
 			"task_id": num("REQUIRED. Task ID to delete."),
 		}), wrap(ctx, s.guard(authz.Member, s.deleteTask)))
@@ -529,7 +642,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	kbArgs := func(extra props) props {
 		p := props{
 			"project_id": num("The project you're working in. Required for the project KB (the default); with scope 'team' or 'org' it selects that project's team or org."),
-			"scope":      str("Optional. Which knowledge base: 'project' (default), 'team', or 'org'. Use 'team'/'org' only for knowledge shared beyond one project; see amp_kb_sources."),
+			"scope":      str("Optional. Which knowledge base: 'project' (default), 'team', or 'org'. Use 'team'/'org' only for knowledge shared beyond one project; see amp_kb_sources. 'global' is the read-only AMP guide (how to use AMP itself; see amp_guide)."),
 			"team_id":    num("Optional, scope 'team': which team, when the project has several of yours (or there is no project_id)."),
 			"org_id":     num("Optional, scope 'org' without a project_id: which org."),
 		}
@@ -668,6 +781,7 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.create", p.ID, "created project "+p.Name))
 	return jsonResult(p)
 }
 
@@ -691,7 +805,8 @@ func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*
 
 func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	p := caller(rctx).p
-	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super}
+	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super,
+		"account": map[bool]string{true: domain.UserKindAgent, false: domain.UserKindHuman}[p.Agent], "via_api_token": p.ViaToken}
 	if p.HasUser() {
 		orgs, err := s.repo.ListOrgs(rctx, p.UserRef())
 		if err != nil {
@@ -713,6 +828,17 @@ func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.
 		out["orgs"] = withTeams
 	}
 	return jsonResult(out)
+}
+
+func (s *Server) auditLog(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	entries, err := s.svc.Audit(rctx, caller(rctx).p, domain.AuditFilter{
+		OrgID: optInt(args, "org_id", 0), ProjectID: optInt(args, "project_id", 0), ActorUserID: optInt(args, "actor_id", 0),
+		Action: optStr(args, "action", ""), BeforeID: int64(optInt(args, "before_id", 0)), Limit: optInt(args, "limit", 0),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"entries": entries, "count": len(entries)})
 }
 
 func (s *Server) listProjectMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -767,7 +893,7 @@ func (s *Server) getProject(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) archiveProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -777,7 +903,21 @@ func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.archive", p.ID, "archived project "+p.Name))
 	return jsonResult(map[string]interface{}{"project": p})
+}
+
+func (s *Server) approvePlan(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	proj, err := s.svc.ApprovePlan(rctx, caller(rctx).p, id)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"project_id": id, "plan_approved_at": proj.PlanApprovedAt,
+		"next": "Approved: dispatch everything in ready_to_dispatch."})
 }
 
 func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -788,6 +928,9 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	var u domain.ProjectSettings
 	if on, ok := args["open_reassign"].(bool); ok {
 		u.OpenReassign = &on
+	}
+	if on, ok := args["require_plan_approval"].(bool); ok {
+		u.RequirePlanApproval = &on
 	}
 	if v, ok := args["name"].(string); ok {
 		u.Name = &v
@@ -806,7 +949,7 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) restoreProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -816,6 +959,7 @@ func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectRestored, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.restore", p.ID, "restored project "+p.Name))
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
@@ -1167,7 +1311,7 @@ func (s *Server) deleteStory(rctx context.Context, args map[string]interface{}) 
 	if err := s.checkProjectNotArchived(rctx, story.ProjectID); err != nil {
 		return nil, err
 	}
-	if err := s.svc.DeleteStory(rctx, story); err != nil {
+	if err := s.svc.DeleteStory(rctx, caller(rctx).p, story); err != nil {
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"story_id": storyID, "deleted": true})
@@ -1184,6 +1328,10 @@ func (s *Server) checkPlan(rctx context.Context, args map[string]interface{}) (*
 	}
 	return jsonResult(report)
 }
+
+// QuietAfter is how long an in-progress ticket can go without activity
+// before amp_list_tasks reports it as quiet (the UI uses the same 15 minutes).
+const QuietAfter = 15 * time.Minute
 
 func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
@@ -1214,6 +1362,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	inProgress := make([]domain.Task, 0)
 	blocked := make([]domain.Task, 0)
 	scheduled := make([]domain.Task, 0)
+	questions := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
 	tasks := authz.FilterTasks(reply.Tasks, view, me.UserID)
 	for _, t := range tasks {
@@ -1228,10 +1377,38 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 				scheduled = append(scheduled, t)
 			} else {
 				blocked = append(blocked, t)
+				if t.BlockReason != "" {
+					questions = append(questions, t)
+				}
 			}
 		case domain.TaskStateCompleted:
 			completed = append(completed, t)
 		}
+	}
+
+	// In progress but silent: usually a worker that died with its session.
+	quiet := make([]map[string]interface{}, 0)
+	if len(inProgress) > 0 {
+		ids := make([]int, len(inProgress))
+		for i, t := range inProgress {
+			ids[i] = t.ID
+		}
+		last, err := s.repo.LastActivity(rctx, ids)
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range inProgress {
+			seen := last[t.ID]
+			if silent := time.Since(seen); !seen.IsZero() && silent > QuietAfter {
+				quiet = append(quiet, map[string]interface{}{
+					"id": t.ID, "name": t.Name, "agent_id": t.AgentID, "silent_minutes": int(silent.Minutes()),
+				})
+			}
+		}
+	}
+
+	if optStr(args, "format", "") == "compact" {
+		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet)
 	}
 
 	return jsonResult(map[string]interface{}{
@@ -1239,7 +1416,9 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"in_progress":       inProgress,
 		"blocked":           blocked,   // each has blocked_by_ids showing what's in the way
 		"scheduled":         scheduled, // tasks waiting for their start_at time
+		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
+		"quiet":             quiet, // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
 	})
@@ -1300,6 +1479,7 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		Priority:    optStr(args, "priority", ""),
 
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1337,6 +1517,7 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", ""),
+		Clear:       optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1382,6 +1563,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1453,7 +1635,13 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed"})
+	out := map[string]interface{}{"task_id": taskID, "state": "completed"}
+	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
+		out["run_error"] = err.Error()
+	} else if run != nil {
+		out["run"] = run
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1464,7 +1652,13 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
-	reason := optStr(args, "reason", "")
+	reason, err := reqStr(args, "reason")
+	if err != nil || strings.TrimSpace(reason) == "" {
+		return nil, fmt.Errorf("reason is required: the question or problem a person needs to resolve")
+	}
+	if strings.HasPrefix(reason, "scheduled:") {
+		return nil, fmt.Errorf("reason can't start with \"scheduled:\"; use amp_set_task_start_at to schedule a ticket")
+	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
 		return nil, err
@@ -1482,7 +1676,40 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "blocked"})
+	out := map[string]interface{}{"task_id": taskID, "state": "blocked"}
+	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunBlocked); err != nil {
+		out["run_error"] = err.Error()
+	} else if run != nil {
+		out["run"] = run
+	}
+	return jsonResult(out)
+}
+
+func (s *Server) answerQuestion(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	answer, err := reqStr(args, "answer")
+	if err != nil || strings.TrimSpace(answer) == "" {
+		return nil, fmt.Errorf("answer is required")
+	}
+	t, err := s.repo.GetTask(rctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %d not found", taskID)
+	}
+	if err := s.checkProjectNotArchived(rctx, t.ProjectID); err != nil {
+		return nil, err
+	}
+	task, err := s.svc.AnswerQuestion(rctx, caller(rctx).p, taskID, answer)
+	if err != nil {
+		return nil, err
+	}
+	next := "It's ready: dispatch it again and the worker will find the answer in the ticket's comments."
+	if task.State == domain.TaskStateBlocked {
+		next = "It still waits on unfinished dependencies; it becomes ready when they're done."
+	}
+	return jsonResult(map[string]interface{}{"task_id": taskID, "state": task.State, "next": next})
 }
 
 func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1556,14 +1783,24 @@ func (s *Server) getTicketHistory(_ context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, err
 	}
+	comments, err := s.repo.GetComments(context.Background(), taskID)
+	if err != nil {
+		return nil, err
+	}
+	runs, err := s.repo.TaskRuns(context.Background(), taskID)
+	if err != nil {
+		return nil, err
+	}
 	return jsonResult(map[string]interface{}{
-		"task":    task,
-		"history": history,
-		"count":   len(history),
+		"task":     task,
+		"history":  history,
+		"count":    len(history),
+		"comments": comments, // the worker's plan, progress, questions and answers
+		"runs":     runs,     // model, tokens, branch, commit, PR per agent run
 	})
 }
 
-func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) resetProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -1587,6 +1824,7 @@ func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*
 	replyCh := make(chan actor.ReplySimple, 1)
 	s.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
 	<-replyCh
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 	return jsonResult(map[string]interface{}{
 		"project_id": projectID,
 		"reset":      true,
@@ -1610,7 +1848,7 @@ func (s *Server) deleteTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Tickets that waited on this one are updated (and unblocked if nothing else holds them).
-	dependents, err := s.svc.DeleteTask(rctx, task)
+	dependents, err := s.svc.DeleteTask(rctx, caller(rctx).p, task)
 	if err != nil {
 		return nil, fmt.Errorf("delete task: %w", err)
 	}
@@ -1633,7 +1871,7 @@ func (s *Server) deleteEpic(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Deletes its stories and tickets; tickets elsewhere that waited on them are updated.
-	if err := s.svc.DeleteEpic(rctx, epic); err != nil {
+	if err := s.svc.DeleteEpic(rctx, caller(rctx).p, epic); err != nil {
 		return nil, fmt.Errorf("delete epic: %w", err)
 	}
 	return jsonResult(map[string]interface{}{"epic_id": epicID, "deleted": true})
@@ -1835,6 +2073,7 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
 	}
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.import", newProject.ID, "imported project "+newProject.Name+" from an export"))
 
 	// 2. Spawn the ProjectActor for the new project
 	pid, err := s.registry.Get(newProject.ID)
@@ -1867,6 +2106,16 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 // optMetadataPatch reads the "metadata" argument as a change to existing
 // metadata (null removes a key); nil when it's absent.
+// projectAudit is an audit entry about a whole project.
+func projectAudit(action string, projectID int, summary string) domain.AuditEntry {
+	return domain.AuditEntry{Action: action, ProjectID: &projectID, TargetType: "project", TargetID: strconv.Itoa(projectID), Summary: summary}
+}
+
+// clearDesc documents an update tool's clear parameter.
+func clearDesc(fields string) string {
+	return "Optional. Fields to blank (" + fields + "). An empty or omitted field is left unchanged, so name it here to remove its text."
+}
+
 func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error) {
 	v, ok := args["metadata"]
 	if !ok || v == nil {
@@ -1979,6 +2228,10 @@ func (s *Server) kbOf(ctx context.Context, args map[string]interface{}, use kbUs
 	})
 	if err != nil {
 		return nil, err
+	}
+	if use != kbRead && k.Kind == kb.ScopeGlobal {
+		// Annotations would be seen by every org, so the guide takes none.
+		return nil, k.RequireWrite()
 	}
 	if use == kbChange {
 		if err := k.RequireWrite(); err != nil {
@@ -2795,4 +3048,157 @@ func optIntSlice(args map[string]interface{}, key string) []int {
 		}
 	}
 	return out
+}
+
+// guideStart is the guide page amp_guide returns with no topic.
+const guideStart = "start-here.md"
+
+func (s *Server) guide(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	sc := kb.Global()
+	docs, err := s.kb.ListDocs(ctx, sc, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(docs) == 0 {
+		return nil, fmt.Errorf("the AMP guide isn't loaded yet (it syncs in the background after AMP starts); try again shortly")
+	}
+	sort.Slice(docs, func(i, j int) bool { return docs[i].Path < docs[j].Path })
+	pages := make([]map[string]interface{}, 0, len(docs))
+	for _, d := range docs {
+		pages = append(pages, map[string]interface{}{"path": d.Path, "title": d.Title, "tags": d.Tags})
+	}
+	page := func(path string) (map[string]interface{}, error) {
+		doc, err := s.kb.GetDoc(ctx, sc, path)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"path": doc.Path, "title": doc.Title, "content": doc.Content, "pages": pages,
+			"next": "Teach from this page in your own words and show it in your user's real projects. " +
+				"For another page call amp_guide with its path.",
+		}, nil
+	}
+
+	topic := strings.TrimSpace(optStr(args, "topic", ""))
+	match := ""
+	switch {
+	case topic == "":
+		match = guideStart
+	default:
+		for _, d := range docs {
+			if d.Path == topic || d.Path == topic+".md" || strings.EqualFold(d.Title, topic) {
+				match = d.Path
+				break
+			}
+		}
+	}
+	if match != "" {
+		out, err := page(match)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(out)
+	}
+
+	hits, err := s.kb.Search(ctx, sc, topic, nil, 8, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rank every page: first by how many of the topic's words its title and
+	// tags name (so a page about the topic beats one that mentions it, and
+	// start-here mentions everything), then by search order. Pages neither
+	// named nor found are left out.
+	pos := map[string]int{}
+	excerpt := map[string]string{}
+	for i, h := range hits {
+		if _, ok := pos[h.Path]; !ok {
+			pos[h.Path], excerpt[h.Path] = i, h.Excerpt
+		}
+	}
+	words := guideWords(topic)
+	type cand struct {
+		doc   kb.DocSummary
+		score int
+		pos   int
+	}
+	var ranked []cand
+	for _, d := range docs {
+		c := cand{doc: d, score: guideMatch(words, d.Title, d.Tags), pos: len(hits)}
+		if p, ok := pos[d.Path]; ok {
+			c.pos = p
+		}
+		if c.score > 0 || c.pos < len(hits) {
+			ranked = append(ranked, c)
+		}
+	}
+	if len(ranked) == 0 {
+		return jsonResult(map[string]interface{}{
+			"found": false, "pages": pages,
+			"next": "No guide page matches; pick one from pages, or tell your user the guide doesn't cover it rather than guessing how AMP works.",
+		})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		return ranked[i].pos < ranked[j].pos
+	})
+	out, err := page(ranked[0].doc.Path)
+	if err != nil {
+		return nil, err
+	}
+	also := []map[string]string{}
+	for _, c := range ranked[1:] {
+		if len(also) == 3 {
+			break
+		}
+		also = append(also, map[string]string{"path": c.doc.Path, "title": c.doc.Title, "excerpt": excerpt[c.doc.Path]})
+	}
+	out["also"] = also
+	return jsonResult(out)
+}
+
+// guideWords are a topic's content words, lowercased.
+func guideWords(topic string) []string {
+	var out []string
+	for _, w := range strings.FieldsFunc(strings.ToLower(topic), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if len(w) >= 4 && !guideStopWords[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+var guideStopWords = map[string]bool{"what": true, "when": true, "with": true, "does": true, "have": true,
+	"that": true, "this": true, "from": true, "into": true, "about": true, "their": true, "there": true,
+	"should": true, "would": true, "could": true, "seems": true, "someone": true, "something": true}
+
+// guideMatch counts topic words naming the page in its title or tags,
+// matching on a shared stem (the first five letters: "capitalize" and
+// "capitalization", "hand" and "handover").
+func guideMatch(words []string, title string, tags []string) int {
+	names := guideWords(title + " " + strings.Join(tags, " "))
+	n := 0
+	for _, w := range words {
+		for _, name := range names {
+			if strings.HasPrefix(name, stem(w)) || strings.HasPrefix(w, stem(name)) {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+func stem(w string) string {
+	if len(w) > 5 {
+		return w[:5]
+	}
+	return w
 }

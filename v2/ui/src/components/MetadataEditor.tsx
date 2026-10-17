@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useId } from 'react'
 import { Plus, X } from 'lucide-react'
 import { fromRows, toRows, type MetadataRow, type MetadataType } from '../lib/metadata'
 import type { Metadata, MetadataValue } from '../types'
@@ -11,18 +11,21 @@ interface Props {
   readOnly?: boolean
   /** called with the edited metadata, or an error to show instead */
   onChange: (metadata: Metadata, error: string | null) => void
+  /** keys already used nearby (e.g. on sibling epics), offered as you type so names stay consistent */
+  keySuggestions?: string[]
 }
 
 const cellCls =
-  'bg-[#08101F] border border-[#1E2C45] rounded-lg px-2 py-1.5 text-xs text-[#DDE6F0] placeholder-[#3D5068] ' +
-  'focus:outline-none focus:border-[#6366F1] disabled:opacity-60'
+  'bg-bg border border-line rounded-lg px-2 py-1.5 text-xs text-ink placeholder-ink-3 ' +
+  'focus:outline-none focus:border-primary disabled:opacity-60'
 
 const show = (v: MetadataValue) => (typeof v === 'boolean' ? (v ? 'yes' : 'no') : String(v))
 
 // Free-form key/value fields for integrations (e.g. jira_board, initiative,
 // capitalizable). Inherited fields are listed below the item's own; adding
 // the same field here overrides it.
-export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props) {
+export function MetadataEditor({ initial, inherited, readOnly, onChange, keySuggestions }: Props) {
+  const listId = useId()
   const [rows, setRows] = useState<MetadataRow[]>(() => toRows(initial))
   const [error, setError] = useState<string | null>(null)
 
@@ -40,10 +43,12 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
 
   return (
     <div className="space-y-2">
-      {rows.length === 0 && readOnly && <p className="text-xs text-[#3D5068]">No fields.</p>}
+      {keySuggestions?.length ? <datalist id={listId}>{keySuggestions.map(k => <option key={k} value={k} />)}</datalist> : null}
+      {rows.length === 0 && readOnly && <p className="text-xs text-ink-3">No fields.</p>}
       {rows.map((r, i) => (
         <div key={i} className="flex items-center gap-1.5">
           <input value={r.key} disabled={readOnly} onChange={e => setRow(i, { key: e.target.value })}
+            list={keySuggestions?.length ? listId : undefined}
             placeholder="field (e.g. jira_board)" className={`${cellCls} w-36 font-mono`} />
           <select value={r.type} disabled={readOnly}
             onChange={e => {
@@ -66,7 +71,7 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
           )}
           {!readOnly && (
             <button type="button" onClick={() => update(rows.filter((_, j) => j !== i))}
-              className="p-1 text-[#7E91A8] hover:text-[#F87171] cursor-pointer" title="Remove field">
+              className="p-1 text-ink-2 hover:text-danger-ink cursor-pointer" title="Remove field">
               <X size={13} />
             </button>
           )}
@@ -74,16 +79,16 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
       ))}
       {!readOnly && (
         <button type="button" onClick={() => update([...rows, { key: '', type: 'text', value: '' }])}
-          className="flex items-center gap-1 text-xs text-[#818CF8] hover:text-[#DDE6F0] cursor-pointer">
+          className="flex items-center gap-1 text-xs text-link hover:text-ink cursor-pointer">
           <Plus size={12} />Add field
         </button>
       )}
       {inheritedOnly.length > 0 && (
         <div className="pt-1">
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-[#3D5068] mb-1">Inherited</p>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-ink-3 mb-1">Inherited</p>
           <div className="flex flex-wrap gap-1.5">
             {inheritedOnly.map(([k, v]) => (
-              <span key={k} className="text-[11px] px-2 py-0.5 rounded-md text-[#7E91A8]" style={{ background: '#0D1726', border: '1px solid #1E2C45' }}
+              <span key={k} className="text-[11px] px-2 py-0.5 rounded-md text-ink-2" style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}
                 title="Inherited; add the same field above to override it here">
                 <span className="font-mono">{k}</span>: {show(v)}
               </span>
@@ -91,7 +96,7 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
           </div>
         </div>
       )}
-      {error && <p className="text-xs text-[#F87171]">{error}</p>}
+      {error && <p className="text-xs text-danger-ink">{error}</p>}
     </div>
   )
 }

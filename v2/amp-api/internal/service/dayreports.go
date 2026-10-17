@@ -239,3 +239,48 @@ func (s *Service) ReportPeople(ctx context.Context, p authz.Principal) ([]domain
 	}
 	return s.Repo.ReportPeople(ctx, viewer)
 }
+
+// TeamDayReport is one project member's report for a day: their saved
+// report (only this project's tickets), or none yet.
+type TeamDayReport struct {
+	UserID int               `json:"user_id"`
+	Email  string            `json:"email"`
+	Name   string            `json:"name"`
+	Report *domain.DayReport `json:"report,omitempty"`
+}
+
+// ProjectDayReports is a project's standup sheet: every person on the
+// project and the report they saved for the day, narrowed to this project.
+// People who haven't saved one are listed with no report.
+func (s *Service) ProjectDayReports(ctx context.Context, p authz.Principal, projectID int, date, tz string) (string, []TeamDayReport, error) {
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+		return "", nil, err
+	}
+	day, _, _, err := DayWindow(date, tz)
+	if err != nil {
+		return "", nil, err
+	}
+	members, err := s.Repo.ListProjectMembers(ctx, projectID)
+	if err != nil {
+		return "", nil, err
+	}
+	only := map[int]bool{projectID: true}
+	out := []TeamDayReport{}
+	for _, m := range members {
+		if m.User.Kind == domain.UserKindAgent {
+			continue
+		}
+		row := TeamDayReport{UserID: m.User.ID, Email: m.User.Email, Name: m.User.DisplayName}
+		r, err := s.Repo.GetDayReport(ctx, m.User.ID, day)
+		if err != nil {
+			return "", nil, err
+		}
+		if r != nil {
+			r.Data, r.HiddenItems = r.Data.Filter(only)
+			r.Markdown = r.RenderMarkdown()
+			row.Report = r
+		}
+		out = append(out, row)
+	}
+	return day, out, nil
+}

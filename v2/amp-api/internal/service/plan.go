@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/kb"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Planning: creating tickets with their dependencies, changing the
@@ -292,23 +295,31 @@ func (s *Service) ReconcileDependents(ctx context.Context, projectID int, depend
 
 // PlanIssue is a likely problem in a project's plan.
 type PlanIssue struct {
-	Kind    string `json:"kind"`
-	Message string `json:"message"`
-	TaskIDs []int  `json:"task_ids,omitempty"`
-	Fix     string `json:"fix,omitempty"`
+	Kind string `json:"kind"`
+	// Severity is "warn" for advice that doesn't make the plan NO-GO.
+	Severity string `json:"severity,omitempty"`
+	Message  string `json:"message"`
+	TaskIDs  []int  `json:"task_ids,omitempty"`
+	Fix      string `json:"fix,omitempty"`
 }
 
 // PlanReport summarises a project's dependency graph and what looks wrong.
 type PlanReport struct {
-	OK              bool        `json:"ok"`
-	Tasks           int         `json:"tasks"`
-	OpenTasks       int         `json:"open_tasks"`
-	Dependencies    int         `json:"dependencies"`
-	ReadyNow        []int       `json:"ready_now"`
-	LongestChain    int         `json:"longest_chain"` // tickets on the longest dependency path
-	Issues          []PlanIssue `json:"issues"`
-	RepairedTaskIDs []int       `json:"repaired_task_ids,omitempty"`
-	Summary         string      `json:"summary"`
+	OK bool `json:"ok"`
+	// Plan approval: open tickets planned since the last approval, when
+	// that was, and whether the project requires it before dispatch.
+	AwaitingApproval    []int       `json:"awaiting_approval"`
+	ApprovedAt          *time.Time  `json:"plan_approved_at,omitempty"`
+	ApprovedBy          *int        `json:"plan_approved_by,omitempty"`
+	RequirePlanApproval bool        `json:"require_plan_approval"`
+	Tasks               int         `json:"tasks"`
+	OpenTasks           int         `json:"open_tasks"`
+	Dependencies        int         `json:"dependencies"`
+	ReadyNow            []int       `json:"ready_now"`
+	LongestChain        int         `json:"longest_chain"` // tickets on the longest dependency path
+	Issues              []PlanIssue `json:"issues"`
+	RepairedTaskIDs     []int       `json:"repaired_task_ids,omitempty"`
+	Summary             string      `json:"summary"`
 }
 
 // readyFanoutThreshold: more ready tickets than this, when they're also more
@@ -340,7 +351,17 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if err != nil {
 		return nil, err
 	}
-	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}}
+	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}}
+	proj, err := s.Repo.GetProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	r.ApprovedAt, r.ApprovedBy, r.RequirePlanApproval = proj.PlanApprovedAt, proj.PlanApprovedBy, proj.RequirePlanApproval
+	for i := range tasks {
+		if tasks[i].State != domain.TaskStateCompleted && proj.AwaitsApproval(&tasks[i]) {
+			r.AwaitingApproval = append(r.AwaitingApproval, tasks[i].ID)
+		}
+	}
 	byID := map[int]domain.Task{}
 	dependents := map[int]int{}
 	for _, t := range tasks {
@@ -406,6 +427,115 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		})
 	}
 
+	// A gate that couples different people's work: its dependencies belong to
+	// two or more people, and so do the tickets waiting on it, so each person's
+	// next work waits on everyone's. Often a review that should be split.
+	ownerOf := func(id int) string {
+		if t, ok := byID[id]; ok && t.OwnerUserID != nil {
+			return fmt.Sprint(*t.OwnerUserID)
+		}
+		return ""
+	}
+	waiters := map[int][]int{}
+	for _, t := range tasks {
+		for _, d := range t.DependencyIDs {
+			waiters[d] = append(waiters[d], t.ID)
+		}
+	}
+	var coupled []int
+	var coupledDetail []string
+	for _, t := range tasks {
+		if t.State == domain.TaskStateCompleted || len(t.DependencyIDs) < 2 || len(waiters[t.ID]) < 2 {
+			continue
+		}
+		up, down := map[string]bool{}, map[string]bool{}
+		for _, d := range t.DependencyIDs {
+			if o := ownerOf(d); o != "" {
+				up[o] = true
+			}
+		}
+		for _, w := range waiters[t.ID] {
+			if o := ownerOf(w); o != "" {
+				down[o] = true
+			}
+		}
+		if len(up) >= 2 && len(down) >= 2 {
+			coupled = append(coupled, t.ID)
+			coupledDetail = append(coupledDetail, fmt.Sprintf("#%d (waits on %d people's tickets; %d tickets of %d people wait on it)", t.ID, len(up), len(waiters[t.ID]), len(down)))
+		}
+	}
+	if len(coupled) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "coupled_gate", Severity: "warn", TaskIDs: coupled,
+			Message: "These tickets join different people's work: " + strings.Join(coupledDetail, "; ") +
+				". Everyone's next tickets wait until all of it is done, so one person's delay stalls the others.",
+			Fix: "If the waiting tickets only need part of it, split the gate (e.g. one check per stack or per person) and re-point dependencies with amp_set_task_dependencies.",
+		})
+	}
+
+	// Metadata drift: epics missing keys most of their sibling epics carry
+	// (e.g. capitalizable, jira_epic), often under a near-miss name instead.
+	// Reports group by these keys, so a missing or misspelled one silently
+	// drops the epic's work from a finance or Jira rollup.
+	if epics, err := s.Repo.ListEpics(ctx, projectID); err == nil && len(epics) >= 3 {
+		freq := map[string]int{}
+		for _, e := range epics {
+			for k := range e.Metadata {
+				freq[k]++
+			}
+		}
+		expected := map[string]bool{}
+		for k, n := range freq {
+			if n >= 2 && n*10 >= len(epics)*6 { // on at least 60% of epics
+				expected[k] = true
+			}
+		}
+		var drift []string
+		for _, e := range epics {
+			var missing, odd []string
+			for k := range expected {
+				if _, ok := e.Metadata[k]; !ok {
+					missing = append(missing, k)
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			for k := range e.Metadata {
+				if !expected[k] && freq[k] == 1 {
+					odd = append(odd, k)
+				}
+			}
+			sort.Strings(missing)
+			sort.Strings(odd)
+			line := fmt.Sprintf("epic %q (#%d) lacks %s", e.Name, e.ID, strings.Join(missing, ", "))
+			if len(odd) > 0 {
+				line += " but has " + strings.Join(odd, ", ") + " (only this epic uses that)"
+			}
+			drift = append(drift, line)
+		}
+		if len(drift) > 0 {
+			sort.Strings(drift)
+			r.Issues = append(r.Issues, PlanIssue{
+				Kind: "metadata_drift", Severity: "warn",
+				Message: "Epics don't carry the same metadata: " + strings.Join(drift, "; ") + ". Reports group by these keys, so this work drops out of those rollups.",
+				Fix:     "Set the missing keys with amp_update_epic metadata (use the same key names the other epics use), and remove a misspelled key by setting it to null.",
+			})
+		}
+	}
+
+	// A plan with an empty project KB: the decisions behind it live only in
+	// the planner's session, and the next session or engineer starts blind.
+	if r.OpenTasks > 0 && s.KB != nil {
+		if n, err := s.KB.CountDocs(ctx, kb.Project(projectID)); err == nil && n == 0 {
+			r.Issues = append(r.Issues, PlanIssue{
+				Kind:    "no_context",
+				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
+				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
+			})
+		}
+	}
+
 	// Blocked by dependencies that are all done: left stuck by older versions
 	// of AMP. The ticket should be ready; repair it.
 	if len(stuck) > 0 {
@@ -414,11 +544,25 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	}
 
 	r.LongestChain = longestChain(tasks)
-	r.OK = len(r.Issues) == 0
+	r.OK = true
+	for _, iss := range r.Issues {
+		if iss.Severity != "warn" {
+			r.OK = false
+		}
+	}
 	r.Summary = fmt.Sprintf("%d tickets (%d open), %d dependencies, %d ready to dispatch now, longest chain %d.",
 		r.Tasks, r.OpenTasks, r.Dependencies, len(r.ReadyNow), r.LongestChain)
-	if r.OK {
+	warns := 0
+	for _, iss := range r.Issues {
+		if iss.Severity == "warn" {
+			warns++
+		}
+	}
+	switch {
+	case r.OK && warns == 0:
 		r.Summary += " No problems found."
+	case r.OK:
+		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
 	}
 	if len(stuck) > 0 {
 		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
@@ -623,43 +767,75 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 // dependencies afterwards.
 
 // DeleteTask deletes a ticket (permission already checked).
-func (s *Service) DeleteTask(ctx context.Context, t *domain.Task) ([]int, error) {
-	return s.deleteTickets(ctx, t.ProjectID, []int{t.ID}, func() error {
+func (s *Service) DeleteTask(ctx context.Context, p authz.Principal, t *domain.Task) ([]int, error) {
+	dependents, err := s.deleteTickets(ctx, p, t.ProjectID, []int{t.ID}, func() error {
 		return s.Repo.DeleteTask(ctx, t.ID)
 	}, &actor.MsgDeleteTask{TaskID: t.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "task.delete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(t.ID),
+			Summary: fmt.Sprintf("deleted ticket #%d %q", t.ID, t.Name), Details: map[string]any{"story_id": t.StoryID, "state": t.State}})
+	}
+	return dependents, err
 }
 
 // DeleteStory deletes a story and its tickets (permission already checked).
-func (s *Service) DeleteStory(ctx context.Context, st *domain.Story) error {
+func (s *Service) DeleteStory(ctx context.Context, p authz.Principal, st *domain.Story) error {
 	ids, err := s.Repo.TaskIDsInStories(ctx, []int{st.ID})
 	if err != nil {
 		return err
 	}
-	_, err = s.deleteTickets(ctx, st.ProjectID, ids, func() error {
+	_, err = s.deleteTickets(ctx, p, st.ProjectID, ids, func() error {
+		if err := s.Repo.TrashGroup(ctx, repository.GroupStory, st.ID, ids, deleterOf(p)); err != nil {
+			return err
+		}
 		return s.Repo.DeleteStory(ctx, st.ID)
 	}, &actor.MsgDeleteStory{StoryID: st.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "story.delete", ProjectID: intRef(st.ProjectID), TargetType: "story", TargetID: idStr(st.ID),
+			Summary: fmt.Sprintf("deleted story %q and its %d tickets", st.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
+	}
 	return err
 }
 
 // DeleteEpic deletes an epic, its stories, and their tickets (permission
 // already checked).
-func (s *Service) DeleteEpic(ctx context.Context, e *domain.Epic) error {
+func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.Epic) error {
 	ids, err := s.Repo.TaskIDsInEpic(ctx, e.ID)
 	if err != nil {
 		return err
 	}
-	_, err = s.deleteTickets(ctx, e.ProjectID, ids, func() error {
+	_, err = s.deleteTickets(ctx, p, e.ProjectID, ids, func() error {
+		if err := s.Repo.TrashGroup(ctx, repository.GroupEpic, e.ID, ids, deleterOf(p)); err != nil {
+			return err
+		}
 		return s.Repo.DeleteEpic(ctx, e.ID)
 	}, &actor.MsgDeleteEpic{EpicID: e.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "epic.delete", ProjectID: intRef(e.ProjectID), TargetType: "epic", TargetID: idStr(e.ID),
+			Summary: fmt.Sprintf("deleted epic %q with its stories and %d tickets", e.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
+	}
 	return err
+}
+
+// deleterOf is who the trash records as deleting something.
+func deleterOf(p authz.Principal) *int {
+	if !p.HasUser() {
+		return nil
+	}
+	uid := p.UserID
+	return &uid
 }
 
 // deleteTickets runs a delete, evicts the deleted work from the project's
 // actors (msg is a delete message without its reply channel), and updates
 // the tickets that depended on what was deleted. It returns those tickets.
-func (s *Service) deleteTickets(ctx context.Context, projectID int, ids []int, del func() error, msg interface{}) ([]int, error) {
+func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectID int, ids []int, del func() error, msg interface{}) ([]int, error) {
 	dependents, err := s.Repo.Dependents(ctx, ids)
 	if err != nil {
+		return nil, err
+	}
+	// Keep a copy in the trash so the deletion can be undone.
+	if err := s.Repo.TrashTasks(ctx, ids, deleterOf(p)); err != nil {
 		return nil, err
 	}
 	if err := del(); err != nil {
@@ -692,4 +868,75 @@ func (s *Service) deleteTickets(ctx context.Context, projectID int, ids []int, d
 		}
 	}
 	return kept, nil
+}
+
+// ---- Answering an agent's question ----
+
+// AnswerQuestion answers a question: a ticket an agent blocked with a reason
+// because it needs a person. The answer, if any, is posted as a comment first; then
+// the ticket goes back to ready, or to waiting if it still depends on
+// unfinished work.
+func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
+	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
+	if err != nil {
+		return nil, err
+	}
+	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
+		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
+	}
+	if answer = strings.TrimSpace(answer); answer != "" {
+		added := make(chan actor.ReplyAddComment, 1)
+		if err := s.Registry.Send(t.ProjectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
+			TaskID: taskID, Author: p.Email, Body: answer, AuthorUserID: p.UserRef(),
+		}, ReplyCh: added}); err != nil {
+			return nil, err
+		}
+		if r := <-added; r.Err != nil {
+			return nil, r.Err
+		}
+	}
+	set := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: "", By: p.UserRef(), ReplyCh: set}); err != nil {
+		return nil, err
+	}
+	if r := <-set; r.Err != nil {
+		return nil, r.Err
+	}
+	// Back to waiting if a dependency is unfinished.
+	rec := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgReconcileDeps{TaskID: taskID, ReplyCh: rec}); err != nil {
+		return nil, err
+	}
+	if r := <-rec; r.Err != nil {
+		return nil, r.Err
+	}
+	got := make(chan actor.ReplyGetTask, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgGetTask{TaskID: taskID, ReplyCh: got}); err != nil {
+		return nil, err
+	}
+	r := <-got
+	return r.Task, r.Err
+}
+
+// ---- Plan approval ----
+
+// ApprovePlan records that a person approved the project's plan as it is
+// now: every ticket planned so far may be dispatched. Team leads and
+// project owners can approve; agents can't (a person approves agents' plans).
+func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
+	if p.Agent {
+		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
+	}
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+		return nil, err
+	}
+	// Approval is the person saying "go" to the plan their agent drafted: any
+	// person on the project may give it (agent accounts can't, above).
+	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef())
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+		Summary: fmt.Sprintf("approved the plan of %s", proj.Name)})
+	return proj, nil
 }

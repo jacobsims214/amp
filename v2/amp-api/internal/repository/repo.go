@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,8 @@ import (
 // No ORM — just plain SQL. Fast to understand, easy to debug.
 type Repo struct {
 	db *pgxpool.Pool
+	// signupDomains limits first sign-ins (see SetSignupDomains).
+	signupDomains []string
 }
 
 func New(ctx context.Context, dsn string) (*Repo, error) {
@@ -99,10 +102,11 @@ func (r *Repo) Close() { r.db.Close() }
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, metadata, created_at, updated_at`
+const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at`
 
 func scanProject(row rowScanner, p *domain.Project) error {
-	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
+	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign,
+		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -222,10 +226,22 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 		   description = COALESCE($3, description),
 		   open_reassign = COALESCE($4, open_reassign),
 		   metadata = (metadata || $5::jsonb) - $6::text[],
+		   require_plan_approval = COALESCE($7, require_plan_approval),
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
-		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove),
+		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval,
 	), p)
+	if err == pgx.ErrNoRows {
+		return nil, fmt.Errorf("project %d not found", id)
+	}
+	return p, err
+}
+
+// ApprovePlan records that a user approved the project's plan now.
+func (r *Repo) ApprovePlan(ctx context.Context, id int, by *int) (*domain.Project, error) {
+	p := &domain.Project{}
+	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET plan_approved_at = NOW(), plan_approved_by = $2, updated_at = NOW()
+		 WHERE id = $1 RETURNING `+projectCols, id, by), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
 	}
@@ -562,20 +578,23 @@ func (r *Repo) SetTaskStartAt(ctx context.Context, taskID int, startAt *time.Tim
 }
 
 func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) error {
+	// Empty = keep; fields named in req.Clear are blanked.
+	clr := func(f string) bool { return slices.Contains(req.Clear, f) }
 	query := `UPDATE tasks SET
 	   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
-	   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
-	   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
-	   assigned_to         = CASE WHEN $4 != '' THEN $4 ELSE assigned_to END,
-	   agent_id            = CASE WHEN $5 != '' THEN $5 ELSE agent_id END,
+	   description         = CASE WHEN $7 THEN '' WHEN $2 != '' THEN $2 ELSE description END,
+	   acceptance_criteria = CASE WHEN $8 THEN '' WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+	   assigned_to         = CASE WHEN $9 THEN '' WHEN $4 != '' THEN $4 ELSE assigned_to END,
+	   agent_id            = CASE WHEN $10 THEN '' WHEN $5 != '' THEN $5 ELSE agent_id END,
 	   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
 	   updated_at          = NOW()`
 
-	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority}
+	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority,
+		clr("description"), clr("acceptance_criteria"), clr("assigned_to"), clr("agent_id")}
 
 	if req.StartAt != nil {
-		query += `, start_at = $7`
 		args = append(args, req.StartAt)
+		query += `, start_at = $` + fmt.Sprint(len(args))
 	}
 
 	query += ` WHERE id = $` + fmt.Sprint(len(args)+1)
@@ -585,31 +604,34 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 	return err
 }
 
-// UpdateEpic updates an epic's mutable fields. Empty string = keep existing value.
-func (r *Repo) UpdateEpic(ctx context.Context, epicID int, name, description, priority string) error {
+// UpdateEpic updates an epic's mutable fields. Empty string = keep existing
+// value; fields named in req.Clear are blanked.
+func (r *Repo) UpdateEpic(ctx context.Context, req domain.UpdateEpicRequest) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE epics SET
 		   name        = CASE WHEN $1 != '' THEN $1 ELSE name END,
-		   description = CASE WHEN $2 != '' THEN $2 ELSE description END,
+		   description = CASE WHEN $5 THEN '' WHEN $2 != '' THEN $2 ELSE description END,
 		   priority    = CASE WHEN $3 != '' THEN $3 ELSE priority END,
 		   updated_at  = NOW()
 		 WHERE id = $4`,
-		name, description, priority, epicID,
+		req.Name, req.Description, req.Priority, req.EpicID, slices.Contains(req.Clear, "description"),
 	)
 	return err
 }
 
-// UpdateStory updates a story's mutable fields. Empty string = keep existing value.
-func (r *Repo) UpdateStory(ctx context.Context, storyID int, name, description, acceptanceCriteria, priority string) error {
+// UpdateStory updates a story's mutable fields. Empty string = keep existing
+// value; fields named in req.Clear are blanked.
+func (r *Repo) UpdateStory(ctx context.Context, req domain.UpdateStoryRequest) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE stories SET
 		   name                = CASE WHEN $1 != '' THEN $1 ELSE name END,
-		   description         = CASE WHEN $2 != '' THEN $2 ELSE description END,
-		   acceptance_criteria = CASE WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
+		   description         = CASE WHEN $6 THEN '' WHEN $2 != '' THEN $2 ELSE description END,
+		   acceptance_criteria = CASE WHEN $7 THEN '' WHEN $3 != '' THEN $3 ELSE acceptance_criteria END,
 		   priority            = CASE WHEN $4 != '' THEN $4 ELSE priority END,
 		   updated_at          = NOW()
 		 WHERE id = $5`,
-		name, description, acceptanceCriteria, priority, storyID,
+		req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.StoryID,
+		slices.Contains(req.Clear, "description"), slices.Contains(req.Clear, "acceptance_criteria"),
 	)
 	return err
 }

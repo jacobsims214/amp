@@ -1,14 +1,16 @@
 import type {
   Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
-  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay,
+  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay, PlanReport, MyWork, ProjectReport,
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
+  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
 } from '../types'
 
 const BASE = '/api'
 
 function kbQuery(ref: KBRef): string {
+  if (ref.global) return 'scope=global'
   if (ref.team_id != null) return `team_id=${ref.team_id}`
   if (ref.org_id != null) return `org_id=${ref.org_id}`
   return `project_id=${ref.project_id}`
@@ -73,6 +75,9 @@ async function del<T = void>(path: string): Promise<T> {
   return res.json().catch(() => undefined) as Promise<T>
 }
 
+const webhookBase = (scope: { orgId?: number; projectId?: number }) =>
+  scope.orgId ? `/orgs/${scope.orgId}/webhooks` : `/projects/${scope.projectId}/webhooks`
+
 // The API accepts users as an email or numeric id, always sent as a string.
 const userRef = (user: string | number) => String(user)
 
@@ -80,7 +85,7 @@ const userRef = (user: string | number) => String(user)
 export const api = {
   listProjects: () => get<{ projects: Project[] }>('/projects').then(r => r.projects),
   getProject: (id: number) => get<{ project: Project }>(`/projects/${id}`).then(r => r.project),
-  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; metadata?: Record<string, string | number | boolean | null> }) =>
+  updateProjectSettings: (id: number, settings: { name?: string; description?: string; open_reassign?: boolean; require_plan_approval?: boolean; metadata?: Record<string, string | number | boolean | null> }) =>
     patch<{ project: Project }>(`/projects/${id}`, settings).then(r => r.project),
   createProject: (req: CreateProjectRequest) => post<Project>('/projects', req),
   archiveProject: (id: number) => post<Project>(`/projects/${id}/archive`),
@@ -141,8 +146,27 @@ export const api = {
   getTask: (id: number) => get<{ task: Task }>(`/tasks/${id}`).then(r => r.task),
 
   // Task CRUD
+  /** the created task, with warnings about likely planning mistakes (e.g. no dependencies) */
   createTask: (projectId: number, req: CreateTaskRequest) =>
-    post<Task>(`/projects/${projectId}/tasks`, req),
+    post<Task & { warnings?: string[] }>(`/projects/${projectId}/tasks`, req),
+  /** dependency_ids is the complete new list */
+  setTaskDependencies: (id: number, dependencyIds: number[]) =>
+    put<{ task: Task; warnings?: string[] | null }>(`/tasks/${id}/dependencies`, { dependency_ids: dependencyIds }),
+  moveTask: (id: number, storyId: number) =>
+    post<{ task: Task }>(`/tasks/${id}/move`, { story_id: storyId }).then(r => r.task),
+  moveStory: (id: number, epicId: number) =>
+    post<{ story: Story }>(`/stories/${id}/move`, { epic_id: epicId }).then(r => r.story),
+  projectReport: (projectId: number, opts: { since?: string; until?: string; groupBy?: string }) => {
+    const q = new URLSearchParams()
+    if (opts.since) q.set('since', opts.since)
+    if (opts.until) q.set('until', opts.until)
+    if (opts.groupBy) q.set('group_by', opts.groupBy)
+    return get<ProjectReport>(`/projects/${projectId}/report?${q}`)
+  },
+  /** A person approves the project's plan as it stands now. */
+  approvePlan: (projectId: number) =>
+    post<{ project: Project }>(`/projects/${projectId}/approve-plan`).then(r => r.project),
+  planCheck: (projectId: number) => get<PlanReport>(`/projects/${projectId}/plan-check`),
   updateTask: (id: number, req: UpdateTaskRequest) =>
     patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),
   deleteTask: (id: number) =>
@@ -160,6 +184,30 @@ export const api = {
     post<Comment>(`/tasks/${taskId}/comments`, { body, author }),
 
   // History
+  taskRuns: (taskId: number) => get<{ runs: Run[] | null; usage: Usage }>(`/tasks/${taskId}/runs`).then(r => ({ runs: r.runs ?? [], usage: r.usage })),
+  trace: (q: { commit?: string; branch?: string; pr?: string }) => {
+    const p = new URLSearchParams()
+    if (q.commit) p.set('commit', q.commit)
+    if (q.branch) p.set('branch', q.branch)
+    if (q.pr) p.set('pr', q.pr)
+    return get<{ tickets: TraceHit[] | null }>(`/trace?${p}`).then(r => r.tickets ?? [])
+  },
+  projectDayReports: (projectId: number, date: string, tz: string) =>
+    get<{ day: string; people: { user_id: number; email: string; name: string; report?: DayReport }[] }>(
+      `/projects/${projectId}/day-reports?date=${encodeURIComponent(date)}&tz=${encodeURIComponent(tz)}`),
+  portfolio: (orgId: number, since: string, splitBy: string) =>
+    get<Portfolio>(`/orgs/${orgId}/portfolio?since=${encodeURIComponent(since)}&split_by=${encodeURIComponent(splitBy)}`),
+  handover: (projectId: number, body: { from: string; to: string; task_ids?: number[]; include_in_progress?: boolean; reason?: string }) =>
+    post<{ results: { task_id: number; name: string; moved: boolean; error?: string }[] }>(`/projects/${projectId}/handover`, body),
+  unmerged: (projectId: number) =>
+    get<{ waiting_to_merge: Run[] | null }>(`/projects/${projectId}/unmerged`).then(r => r.waiting_to_merge ?? []),
+  recordRun: (taskId: number, run: Partial<Run>) => post<Run>(`/tasks/${taskId}/runs`, run),
+  projectTrash: (projectId: number) =>
+    get<{ deleted: DeletedTask[] | null; groups?: DeletedGroup[] | null }>(`/projects/${projectId}/trash`)
+      .then((r): ProjectTrash => ({ tickets: r.deleted ?? [], groups: r.groups ?? [] })),
+  restoreTasks: (projectId: number, taskIds: number[], groups: { epicIds?: number[]; storyIds?: number[] } = {}) =>
+    post<{ results: { task_id: number; restored: boolean; error?: string }[]; groups?: GroupRestoreResult[] }>(
+      `/projects/${projectId}/trash/restore`, { task_ids: taskIds, epic_ids: groups.epicIds ?? [], story_ids: groups.storyIds ?? [] }),
   getHistory: (taskId: number) =>
     get<{ history: ActivityLog[]; count: number }>(`/tasks/${taskId}/history`).then(r => r.history ?? []),
 
@@ -221,6 +269,10 @@ export const api = {
     post(`/tasks/${taskId}/dispatch`, { agent_id: agentId }),
   completeTask: (taskId: number) =>
     post(`/tasks/${taskId}/complete`),
+  /** Answer an agent's flag (a ticket blocked with a reason): posts the
+   *  answer as a comment and puts the ticket back to ready (or waiting). */
+  answerFlag: (taskId: number, answer: string) =>
+    post<{ task: Task }>(`/tasks/${taskId}/unblock`, { answer }).then(r => r.task),
 
   // Export
   exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {
@@ -256,6 +308,42 @@ export const api = {
   setUserRole: (userId: number, role: string, grant: boolean) =>
     patch<{ user_id: number }>(`/users/${userId}/role`, { role, grant }),
   deleteUser: (userId: number) => del(`/users/${userId}`),
+  deactivateUser: (userId: number) => post<{ user: AmpUser }>(`/users/${userId}/deactivate`).then(r => r.user),
+  reactivateUser: (userId: number) => post<{ user: AmpUser }>(`/users/${userId}/reactivate`).then(r => r.user),
+
+  // Agent accounts and API tokens ("me" is the caller)
+  myWork: () => get<MyWork>('/my-work'),
+  listAgents: () => get<{ agents: AmpUser[] }>('/agents').then(r => r.agents),
+  createAgent: (name: string, teamIds: number[]) =>
+    post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),
+  listTokens: (user: number | 'me') => get<{ tokens: APIToken[] | null }>(`/users/${user}/tokens`).then(r => r.tokens ?? []),
+  createToken: (user: number | 'me', name: string, expiresInDays = 0) =>
+    post<{ token: NewAPIToken }>(`/users/${user}/tokens`, { name, expires_in_days: expiresInDays }).then(r => r.token),
+  revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
+
+  // Audit log: global admins any; org admins pass orgId; project owners projectId
+  audit: (q: { orgId?: number; projectId?: number; actorId?: number; action?: string; before?: number; limit?: number }) => {
+    const p = new URLSearchParams()
+    if (q.orgId) p.set('org_id', String(q.orgId))
+    if (q.projectId) p.set('project_id', String(q.projectId))
+    if (q.actorId) p.set('actor_id', String(q.actorId))
+    if (q.action) p.set('action', q.action)
+    if (q.before) p.set('before', String(q.before))
+    if (q.limit) p.set('limit', String(q.limit))
+    return get<{ entries: AuditEntry[] | null }>(`/audit?${p}`).then(r => r.entries ?? [])
+  },
+
+  // Webhooks
+  listWebhooks: (scope: { orgId?: number; projectId?: number }) =>
+    get<{ webhooks: Webhook[] | null }>(webhookBase(scope)).then(r => r.webhooks ?? []),
+  createWebhook: (scope: { orgId?: number; projectId?: number }, change: WebhookChange) =>
+    post<{ webhook: Webhook }>(webhookBase(scope), change).then(r => r.webhook),
+  updateWebhook: (id: number, change: WebhookChange) => patch<{ webhook: Webhook }>(`/webhooks/${id}`, change).then(r => r.webhook),
+  deleteWebhook: (id: number) => del(`/webhooks/${id}`),
+  rotateWebhookSecret: (id: number) => post<{ webhook: Webhook }>(`/webhooks/${id}/rotate-secret`).then(r => r.webhook),
+  testWebhook: (id: number) => post<{ delivery_id: number }>(`/webhooks/${id}/test`),
+  listDeliveries: (id: number, limit = 30) =>
+    get<{ deliveries: WebhookDelivery[] | null }>(`/webhooks/${id}/deliveries?limit=${limit}`).then(r => r.deliveries ?? []),
 
   // Orgs
   listOrgs: () => get<{ orgs: Org[] | null }>('/orgs').then(r => r.orgs ?? []),

@@ -175,6 +175,9 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskState:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
+	case *MsgSetTaskStartAt:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
 	case *MsgAddComment:
 		a.routeTaskMsg(ctx, msg.Req.TaskID, msg)
 
@@ -203,6 +206,44 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 
 	case *MsgMoveTask:
 		msg.ReplyCh <- a.moveTask(ctx, msg)
+
+	case *MsgRestoreEpic:
+		if _, ok := a.epics[msg.EpicID]; ok {
+			msg.ReplyCh <- ReplySimple{}
+			return
+		}
+		e, err := a.repo.GetEpic(context.Background(), msg.EpicID)
+		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("load restored epic %d: %w", msg.EpicID, err)}
+			return
+		}
+		a.epics[e.ID] = a.spawnEpicActor(ctx, *e)
+		a.epicStates[e.ID] = e.State
+		msg.ReplyCh <- ReplySimple{}
+
+	case *MsgRestoreStory:
+		epic, ok := a.epics[msg.EpicID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("epic %d not found", msg.EpicID)}
+			return
+		}
+		replyCh := make(chan ReplySimple, 1)
+		ctx.Send(epic, &MsgRestoreStory{EpicID: msg.EpicID, StoryID: msg.StoryID, ReplyCh: replyCh})
+		msg.ReplyCh <- <-replyCh
+
+	case *MsgRestoreTask:
+		epic, ok := a.epics[msg.EpicID]
+		if !ok {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("epic %d not found", msg.EpicID)}
+			return
+		}
+		adopted := make(chan ReplyGetTask, 1)
+		ctx.Send(epic, &MsgAdoptTask{TaskID: msg.TaskID, StoryID: msg.StoryID, ReplyCh: adopted})
+		reply := <-adopted
+		if reply.Err == nil {
+			a.taskToEpic[msg.TaskID] = msg.EpicID
+		}
+		msg.ReplyCh <- reply
 
 	case *MsgMoveStory:
 		msg.ReplyCh <- ReplySimple{Err: a.moveStory(ctx, msg)}
@@ -237,6 +278,9 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		a.log.Info("epic completed", "epic_id", msg.EpicID)
 
 	// ---- Management ----
+
+	case *MsgPing:
+		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgReset:
 		for epicID, pid := range a.epics {

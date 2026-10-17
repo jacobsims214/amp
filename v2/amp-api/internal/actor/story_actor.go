@@ -168,6 +168,14 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
 
+	case *MsgSetTaskStartAt:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		ctx.Send(pid, msg)
+
 	case *MsgAddComment:
 		pid, ok := a.tasks[msg.Req.TaskID]
 		if !ok {
@@ -215,8 +223,12 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgUpdateStory:
-		err := a.repo.UpdateStory(context.Background(), msg.Req.StoryID, msg.Req.Name, msg.Req.Description, msg.Req.AcceptanceCriteria, msg.Req.Priority)
+		clr, err := domain.ParseClears(msg.Req.Clear, domain.StoryClearable)
 		if err != nil {
+			msg.ReplyCh <- ReplySimple{Err: err}
+			return
+		}
+		if err := a.repo.UpdateStory(context.Background(), msg.Req); err != nil {
 			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("update story: %w", err)}
 			return
 		}
@@ -231,12 +243,8 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		if msg.Req.Name != "" {
 			a.story.Name = msg.Req.Name
 		}
-		if msg.Req.Description != "" {
-			a.story.Description = msg.Req.Description
-		}
-		if msg.Req.AcceptanceCriteria != "" {
-			a.story.AcceptanceCriteria = msg.Req.AcceptanceCriteria
-		}
+		a.story.Description = clr.Apply("description", msg.Req.Description, a.story.Description)
+		a.story.AcceptanceCriteria = clr.Apply("acceptance_criteria", msg.Req.AcceptanceCriteria, a.story.AcceptanceCriteria)
 		if msg.Req.Priority != "" {
 			a.story.Priority = msg.Req.Priority
 		}
@@ -400,7 +408,7 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 		Action:      "created",
 		ToState:     string(task.State),
 		ActorUserID: req.CreatedBy,
-		Detail:      fmt.Sprintf("Task %q created (story=%d epic=%d) — initial state: %s", task.Name, a.story.ID, a.story.EpicID, task.State),
+		Detail:      fmt.Sprintf("Created in story %q (#%d) as %s.", a.story.Name, a.story.ID, task.State),
 	})
 	a.log.Info("task created", "task_id", task.ID, "state", task.State)
 	return &t, nil

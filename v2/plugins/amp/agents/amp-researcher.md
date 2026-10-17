@@ -1,7 +1,7 @@
 ---
 name: amp-researcher
 description: Read-only researcher — investigates and reports, never edits files. Dispatched by the manager to answer a question before planning.
-model: sonnet
+model: inherit
 color: cyan
 disallowedTools: ["Edit", "Write", "NotebookEdit", "TodoWrite"]
 maxTurns: 40

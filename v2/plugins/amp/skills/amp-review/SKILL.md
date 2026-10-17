@@ -45,6 +45,13 @@ reviewer — not an implementer.
 Pick `assigned_to` for the fix task from whichever specialist's domain matches the issue — check
 the current subagent list via your own tool context, don't reuse a name from an old plan.
 
+**Wire the fix into the plan.** A fix task with no dependencies and nothing depending on it is
+invisible to the plan: nothing waits for it, so the next wave can ship without it, and the plan
+check flags it as unconnected. After creating it, make the next gate wait on it — the next wave
+check or code review that covers this code (or the story's code review) — with
+`amp_set_task_dependencies(task_id=<that gate>, add=[<fix id>])`. If there is no later gate,
+say so in your review comment so the manager adds one.
+
 **Before creating the fix task, check for file conflicts with in-flight work.** Run
 `amp_list_tasks` and look at everything currently `in_progress` or `ready_to_dispatch`. If any of
 those tasks touch the same file your fix will touch, add that task's ID to `dependency_ids` so

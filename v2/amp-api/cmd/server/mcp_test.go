@@ -79,12 +79,6 @@ func setupMCP(t *testing.T) *mcpStack {
 
 	reg := actor.NewRegistry(system, repo, sseHub)
 
-	// Wire the MCP server — enable tool capabilities (same as production).
-	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false))
-	kbSvc := testKB()
-	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
-	mcpHandler.Register(srv)
-
 	// Create a project scoped to this test.
 	ts := time.Now().UnixNano()
 	proj, err := repo.CreateProject(ctx, domain.CreateProjectRequest{
@@ -109,6 +103,18 @@ func setupMCP(t *testing.T) *mcpStack {
 	if err != nil {
 		t.Fatalf("create default story: %v", err)
 	}
+
+	// TEST_CLUSTER=1: run the test through a replica that doesn't own the
+	// project, so every message crosses to the owner (cluster_test.go).
+	if os.Getenv("TEST_CLUSTER") != "" {
+		reg = forwardingRegistry(t, repo, sseHub, proj.ID)
+	}
+
+	// Wire the MCP server — enable tool capabilities (same as production).
+	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false))
+	kbSvc := testKB()
+	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
+	mcpHandler.Register(srv)
 
 	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
 }

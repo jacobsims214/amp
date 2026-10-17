@@ -40,7 +40,7 @@ print ""
 
 [[ -d "${V2_OPENCODE}" ]]      || die ".opencode not found: ${V2_OPENCODE}"
 [[ -f "${V2_JSON}" ]]          || die "opencode.json not found: ${V2_JSON}"
-[[ -d "${GLOBAL_DIR}" ]]       || die "~/.config/opencode not found"
+mkdir -p "${GLOBAL_DIR}"
 command -v python3 &>/dev/null || die "python3 required"
 
 # 1. Skills
@@ -61,6 +61,24 @@ for f in "${V2_OPENCODE}/agent"/*.md; do
   cp "$f" "${AGENT_DEST}/"
   ok "  agent: ${f:t}"
 done
+
+# 2b. Plugins (e.g. amp_session_usage) and the npm packages they import.
+info "Syncing plugins..."
+mkdir -p "${GLOBAL_DIR}/plugin"
+for f in "${V2_OPENCODE}/plugin"/*.(js|ts)(N); do
+  cp "$f" "${GLOBAL_DIR}/plugin/"
+  ok "  plugin: ${f:t}"
+done
+python3 - "${GLOBAL_DIR}/package.json" <<'PYEOF'
+import json, os, sys
+dst = sys.argv[1]
+d = json.load(open(dst)) if os.path.exists(dst) else {}
+deps = d.setdefault("dependencies", {})
+# What the AMP plugins import (.opencode/package.json is generated and gitignored).
+deps.setdefault("zod", "4.1.8")
+json.dump(d, open(dst, "w"), indent=2)
+PYEOF
+(cd "${GLOBAL_DIR}" && npm install --silent >/dev/null 2>&1) && ok "  plugin dependencies installed" || info "  run npm install in ${GLOBAL_DIR} for plugin dependencies"
 
 # 3. Merge JSON — write python to a temp file then run it
 TMPPY="$(mktemp /tmp/amp-merge.XXXXXX.py)"
@@ -114,7 +132,7 @@ for agent_name in list(gcfg.get('agent', {}).keys()):
 if removed:
     print(f"  removed stale inline agents: {', '.join(removed)}")
 if not gcfg.get('agent'):
-    del gcfg['agent']
+    gcfg.pop('agent', None)
 
 with open(global_path, 'w') as f:
     json.dump(gcfg, f, indent=2)
@@ -122,9 +140,15 @@ with open(global_path, 'w') as f:
 PYEOF
 
 info "Merging opencode.json (provider + mcp only)..."
-BACKUP="${GLOBAL_JSON}.bak.$(date +%Y%m%d_%H%M%S)"
-cp "${GLOBAL_JSON}" "${BACKUP}"
-ok "  backed up to ${BACKUP:t}"
+if [[ -f "${GLOBAL_JSON}" ]]; then
+  BACKUP="${GLOBAL_JSON}.bak.$(date +%Y%m%d_%H%M%S)"
+  cp "${GLOBAL_JSON}" "${BACKUP}"
+  ok "  backed up to ${BACKUP:t}"
+else
+  # First run on this machine: start from an empty config to merge into.
+  print '{ "$schema": "https://opencode.ai/config.json" }' > "${GLOBAL_JSON}"
+  ok "  created ${GLOBAL_JSON}"
+fi
 
 python3 "${TMPPY}" "${GLOBAL_JSON}" "${V2_JSON}"
 

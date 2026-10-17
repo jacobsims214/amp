@@ -28,6 +28,10 @@ amp_kb_search(project_id=PROJECT_ID, query="<the user's request>")
 ```
 Existing architecture docs and past decisions should shape your plan. Load `amp-kb` if you need search guidance.
 
+### Record the user's decisions before you create tickets
+
+When you ask the user design questions and they answer (stack, repo layout, auth, tenancy, scope), write the answers to the project KB before building the board — one doc per decision under `decisions/` (e.g. `decisions/001-monorepo.md`): what was decided, why, and the date. Update `architecture/project-overview.md` if the answers change it. Tickets reference these docs instead of repeating them. A decision that only lives in your context is gone at the next session and invisible to the other engineers on the project.
+
 ---
 
 ## The hierarchy — enforced by the API
@@ -159,6 +163,31 @@ the conflict check can't do its job.]
 ```
 
 ---
+
+## Research task sizing — the same rule applies to fetch/synthesis, not just code
+
+The "one thing per task" discipline above is usually described in terms of code tickets, but it
+applies just as hard to research dispatches — and it's easier to violate by accident, because a
+research question doesn't have an obvious file/line boundary the way a code change does.
+
+**Never bundle "fetch N sources" + "read M local files" + "write a long synthesized report" into
+one research task.** This was tested empirically and failed identically three times in a row
+across two different models: the worker gathers all the data, says something like "now let me
+write the report," and returns empty — the step/context budget spent gathering data leaves
+nothing for the write-up, and this is not a capability-tier problem, a stronger model failed the
+exact same way.
+
+**Split it instead:**
+- One task per source (or a small batch) that does nothing but fetch and relay raw content —
+  no analysis, no scoring, no opinions, explicitly say so in the ticket so the worker doesn't
+  drift into synthesizing anyway.
+- Do the actual synthesis yourself (the manager), or in a separate task that only reads
+  already-fetched material (never re-fetches), once all the raw material is in hand.
+
+If a research question turns out to need more than 2-3 fetches plus a handful of file reads to
+answer, that's the same signal as an oversized code ticket — split it, don't just hope a bigger
+model powers through it.
+
 
 ## Waves and dependencies — build in phases
 
@@ -412,6 +441,12 @@ Dependency changes are validated (no cycles, no tickets from other projects) and
 automatically: a ready ticket that gains an unfinished dependency becomes blocked, and a blocked
 one whose dependencies are gone or done becomes ready.
 
+**Shrinking a plan is the same.** When the user asks to trim, cut, or simplify, list what you
+will cut or merge and why, then delete only those tickets (by the ids you listed) and update the
+survivors — merge two tickets by widening one and deleting the other. Never delete a whole plan
+to rebuild it smaller, and never delete by a range of ids: ticket ids are global, not per project,
+so a range can reach tickets that aren't yours to delete.
+
 ---
 
 ## Plan presentation — show everything
@@ -471,6 +506,21 @@ Approval: "approved", "go ahead", "yes", "do it", or similar.
 
 Changes requested → update → present again → wait again.
 
+When the user approves, **record it in AMP before dispatching**:
+
+```
+amp_approve_plan(project_id=PROJECT_ID)
+```
+
+That's the same approval a person gives with "Approve plan" in AMP's Flight plan, and projects with
+`require_plan_approval` on refuse to dispatch tickets planned since the last approval until it's
+recorded. Never call it on your own judgment — only when the user has said yes. The user may also
+approve in the UI instead of in chat: `amp_check_plan`'s `awaiting_approval` is empty once the plan
+is approved, wherever that happened.
+
+Each new planning run (or fix tickets you add) needs approving again when the project requires it:
+if a dispatch is refused because the plan wasn't approved, present what's new and ask.
+
 ---
 
 ## Dispatch — only after approval
@@ -500,6 +550,11 @@ task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's as
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
 After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+
+A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
+`questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the
+ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
+Questions don't stop the loop: keep dispatching everything else.
 
 If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 

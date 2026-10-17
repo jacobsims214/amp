@@ -1,0 +1,15 @@
+{{- if eq .Values.dex.theme "amp" }}
+# AMP's look for the Dex login page, mounted as Dex theme "amp".
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: amp-dex-theme
+  namespace: {{ .Values.global.namespace }}
+data:
+  styles.css: |
+{{ .Files.Get "files/dex-theme/styles.css" | indent 4 }}
+  logo.svg: |
+{{ .Files.Get "files/dex-theme/logo.svg" | indent 4 }}
+binaryData:
+  favicon.png: {{ .Files.Get "files/dex-theme/favicon.png" | b64enc }}
+{{- end }}

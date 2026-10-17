@@ -57,6 +57,17 @@ export function canWorkTask(task: Task, meId: number | undefined, access: Projec
   return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.org_admin
 }
 
+/**
+ * Whether the caller may change how a ticket fits the plan — its text,
+ * dependencies, story, metadata: its owner, its creator, anyone for an
+ * unassigned ticket, and leads and up. (Working it stays owner-only.)
+ */
+export function canPlanTask(task: Task, meId: number | undefined, access: ProjectAccess | null | undefined): boolean {
+  const owner = task.owner_user_id ?? null
+  if (meId == null || owner === null || owner === meId || task.created_by === meId) return true
+  return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.lead
+}
+
 /** Leads, project owners and admins may take over someone else's ticket. */
 export function canReassignTask(access: ProjectAccess | null | undefined): boolean {
   return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.lead
@@ -105,4 +116,25 @@ export function taskMatchesOwner(task: Task, filter: OwnerFilter, meId: number |
     default:
       return owner === filter
   }
+}
+
+/** "claude-build-1" → "C1", "codex-data" → "CD". */
+export function agentInitials(name: string): string {
+  const parts = name.split(/[\s_-]+/).filter(Boolean)
+  if (parts.length === 0) return '?'
+  const last = parts[parts.length - 1]
+  if (parts.length > 1 && /^\d+$/.test(last)) return (parts[0][0] + last).toUpperCase().slice(0, 3)
+  return (parts[0][0] + (parts[1]?.[0] ?? parts[0][1] ?? '')).toUpperCase()
+}
+
+/**
+ * Who to show for an activity entry: the person behind it, with the agent
+ * that acted for them when there was one.
+ */
+export function activityActor(a: { actor: string; actor_user_id?: number }, people: Map<number, Person>): string {
+  if (a.actor_user_id == null) return a.actor
+  const name = lookupPerson(people, a.actor_user_id)!.name
+  if (a.actor === 'system' || a.actor === '') return name
+  // An agent acting for someone: whose agent it is matters more than its profile.
+  return `${name} · ${a.actor}`
 }
