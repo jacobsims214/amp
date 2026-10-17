@@ -161,6 +161,25 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp["orgs"] = orgs
+		// The teams they're on, across their orgs.
+		type myTeam struct {
+			ID    int    `json:"id"`
+			Name  string `json:"name"`
+			OrgID int    `json:"org_id"`
+			Role  string `json:"role"`
+		}
+		teams := []myTeam{}
+		for _, o := range orgs {
+			list, err := h.repo.ListUserTeams(r.Context(), o.ID, uid)
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			for _, t := range list { // ListUserTeams packs team id/name into UserID/Email
+				teams = append(teams, myTeam{ID: t.UserID, Name: t.Email, OrgID: o.ID, Role: t.Role})
+			}
+		}
+		resp["teams"] = teams
 	}
 	if ident.LocalDev {
 		resp["roles"] = []string{domain.RoleAdmin}

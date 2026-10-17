@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check } from 'lucide-react'
 import { api } from '../api/client'
+import { withClears } from '../lib/clear'
 import { StatusBadge } from './StatusBadge'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
@@ -89,7 +90,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     setEditSaving(true)
     setEditError(null)
     try {
-      await api.updateTask(task!.id, editForm)
+      await api.updateTask(task!.id, withClears(editForm, ['description', 'acceptance_criteria', 'assigned_to']))
       setEditing(false)
       onRefresh?.()
       onClose()

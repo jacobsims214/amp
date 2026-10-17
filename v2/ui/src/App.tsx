@@ -8,6 +8,7 @@ import { ProjectSettings } from './pages/ProjectSettings'
 import { DayReports } from './pages/DayReports'
 import { Users } from './pages/Users'
 import { Orgs } from './pages/Orgs'
+import { Access } from './pages/Access'
 import { AuthProvider } from './contexts/AuthContext'
 
 export default function App() {
@@ -26,6 +27,7 @@ export default function App() {
           <Route path="/reports" element={<DayReports />} />
           <Route path="/admin/users" element={<Users />} />
           <Route path="/admin/orgs" element={<Orgs />} />
+          <Route path="/access" element={<Access />} />
         </Routes>
       </BrowserRouter>
     </AuthProvider>

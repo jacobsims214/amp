@@ -4,6 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
+  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery,
 } from '../types'
 
 const BASE = '/api'
@@ -72,6 +73,9 @@ async function del<T = void>(path: string): Promise<T> {
   }
   return res.json().catch(() => undefined) as Promise<T>
 }
+
+const webhookBase = (scope: { orgId?: number; projectId?: number }) =>
+  scope.orgId ? `/orgs/${scope.orgId}/webhooks` : `/projects/${scope.projectId}/webhooks`
 
 // The API accepts users as an email or numeric id, always sent as a string.
 const userRef = (user: string | number) => String(user)
@@ -265,6 +269,41 @@ export const api = {
   setUserRole: (userId: number, role: string, grant: boolean) =>
     patch<{ user_id: number }>(`/users/${userId}/role`, { role, grant }),
   deleteUser: (userId: number) => del(`/users/${userId}`),
+  deactivateUser: (userId: number) => post<{ user: AmpUser }>(`/users/${userId}/deactivate`).then(r => r.user),
+  reactivateUser: (userId: number) => post<{ user: AmpUser }>(`/users/${userId}/reactivate`).then(r => r.user),
+
+  // Agent accounts and API tokens ("me" is the caller)
+  listAgents: () => get<{ agents: AmpUser[] }>('/agents').then(r => r.agents),
+  createAgent: (name: string, teamIds: number[]) =>
+    post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),
+  listTokens: (user: number | 'me') => get<{ tokens: APIToken[] | null }>(`/users/${user}/tokens`).then(r => r.tokens ?? []),
+  createToken: (user: number | 'me', name: string, expiresInDays = 0) =>
+    post<{ token: NewAPIToken }>(`/users/${user}/tokens`, { name, expires_in_days: expiresInDays }).then(r => r.token),
+  revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
+
+  // Audit log: global admins any; org admins pass orgId; project owners projectId
+  audit: (q: { orgId?: number; projectId?: number; actorId?: number; action?: string; before?: number; limit?: number }) => {
+    const p = new URLSearchParams()
+    if (q.orgId) p.set('org_id', String(q.orgId))
+    if (q.projectId) p.set('project_id', String(q.projectId))
+    if (q.actorId) p.set('actor_id', String(q.actorId))
+    if (q.action) p.set('action', q.action)
+    if (q.before) p.set('before', String(q.before))
+    if (q.limit) p.set('limit', String(q.limit))
+    return get<{ entries: AuditEntry[] | null }>(`/audit?${p}`).then(r => r.entries ?? [])
+  },
+
+  // Webhooks
+  listWebhooks: (scope: { orgId?: number; projectId?: number }) =>
+    get<{ webhooks: Webhook[] | null }>(webhookBase(scope)).then(r => r.webhooks ?? []),
+  createWebhook: (scope: { orgId?: number; projectId?: number }, change: WebhookChange) =>
+    post<{ webhook: Webhook }>(webhookBase(scope), change).then(r => r.webhook),
+  updateWebhook: (id: number, change: WebhookChange) => patch<{ webhook: Webhook }>(`/webhooks/${id}`, change).then(r => r.webhook),
+  deleteWebhook: (id: number) => del(`/webhooks/${id}`),
+  rotateWebhookSecret: (id: number) => post<{ webhook: Webhook }>(`/webhooks/${id}/rotate-secret`).then(r => r.webhook),
+  testWebhook: (id: number) => post<{ delivery_id: number }>(`/webhooks/${id}/test`),
+  listDeliveries: (id: number, limit = 30) =>
+    get<{ deliveries: WebhookDelivery[] | null }>(`/webhooks/${id}/deliveries?limit=${limit}`).then(r => r.deliveries ?? []),
 
   // Orgs
   listOrgs: () => get<{ orgs: Org[] | null }>('/orgs').then(r => r.orgs ?? []),

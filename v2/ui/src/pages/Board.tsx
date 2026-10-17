@@ -19,6 +19,7 @@ import { OwnerStack } from '../components/OwnerAvatar'
 import { OwnersEditor } from '../components/OwnersEditor'
 import { TeamAccessModal } from '../components/TeamAccessModal'
 import { api } from '../api/client'
+import { withClears } from '../lib/clear'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata } from '../types'
 
@@ -224,7 +225,7 @@ export function Board() {
     setEpicError(null)
     try {
       if (epicModal?.mode === 'create') await api.createEpic(pid, { ...epicForm, metadata: epicMeta.value })
-      else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, { ...epicForm, metadata: metadataPatch(epicMeta.initial, epicMeta.value) })
+      else if (epicModal?.epic) await api.updateEpic(epicModal.epic.id, { ...withClears(epicForm, ['description']), metadata: metadataPatch(epicMeta.initial, epicMeta.value) })
       setEpicModal(null); refresh()
     } catch (e) {
       setEpicError(errMsg(e, 'Save failed'))
@@ -248,7 +249,7 @@ export function Board() {
     try {
       if (storyModal?.mode === 'create' && storyModal.epicId) await api.createStory(storyModal.epicId, { ...storyForm, metadata: storyMeta.value })
       else if (storyModal?.story) {
-        await api.updateStory(storyModal.story.id, { ...storyForm, metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
+        await api.updateStory(storyModal.story.id, { ...withClears(storyForm, ['description', 'acceptance_criteria']), metadata: metadataPatch(storyMeta.initial, storyMeta.value) })
         if (storyEpicId != null && storyEpicId !== storyModal.story.epic_id) await api.moveStory(storyModal.story.id, storyEpicId)
       }
       setStoryModal(null); refresh()
