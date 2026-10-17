@@ -21,12 +21,12 @@ type View = 'browse' | 'doc' | 'editor'
 
 // Tag color palette — cycles through a small set of indigo-adjacent hues
 const TAG_COLORS = [
-  { bg: 'rgba(99,102,241,0.12)',  text: '#818CF8', ring: 'rgba(99,102,241,0.25)' },
-  { bg: 'rgba(16,185,129,0.12)', text: '#34D399', ring: 'rgba(16,185,129,0.25)' },
-  { bg: 'rgba(245,158,11,0.12)', text: '#FBBF24', ring: 'rgba(245,158,11,0.25)' },
-  { bg: 'rgba(239,68,68,0.12)',  text: '#F87171', ring: 'rgba(239,68,68,0.25)' },
-  { bg: 'rgba(139,92,246,0.12)', text: '#A78BFA', ring: 'rgba(139,92,246,0.25)' },
-  { bg: 'rgba(20,184,166,0.12)', text: '#2DD4BF', ring: 'rgba(20,184,166,0.25)' },
+  { bg: 'color-mix(in srgb, var(--link) 12%, transparent)',  text: 'var(--link)', ring: 'color-mix(in srgb, var(--link) 25%, transparent)' },
+  { bg: 'color-mix(in srgb, var(--success) 12%, transparent)', text: 'var(--success-ink)', ring: 'color-mix(in srgb, var(--success) 25%, transparent)' },
+  { bg: 'color-mix(in srgb, var(--warning) 12%, transparent)', text: 'var(--warning-ink)', ring: 'color-mix(in srgb, var(--warning) 25%, transparent)' },
+  { bg: 'color-mix(in srgb, var(--danger) 12%, transparent)',  text: 'var(--danger-ink)', ring: 'color-mix(in srgb, var(--danger) 25%, transparent)' },
+  { bg: 'color-mix(in srgb, var(--violet) 12%, transparent)', text: 'var(--violet)', ring: 'color-mix(in srgb, var(--violet) 25%, transparent)' },
+  { bg: 'color-mix(in srgb, var(--teal) 12%, transparent)', text: 'var(--teal)', ring: 'color-mix(in srgb, var(--teal) 25%, transparent)' },
 ]
 const tagColor = (tag: string) => TAG_COLORS[Math.abs(hashStr(tag)) % TAG_COLORS.length]
 function hashStr(s: string) {
@@ -40,8 +40,8 @@ function readingTime(content: string) {
 }
 
 const inputCls =
-  'w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] ' +
-  'placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit]'
+  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink ' +
+  'placeholder-ink-3 focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
 // One page for every knowledge base: /project/:projectId/kb, /teams/:teamId/kb, /orgs/:orgId/kb.
 export function KB() {
@@ -168,23 +168,23 @@ export function KB() {
     <button
       onClick={() => openEditor(null)}
       className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer"
-      style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+      style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
     >
       <Plus size={12} />
       New Doc
     </button>
   ) : info ? (
-    <span className="flex items-center gap-1.5 text-xs text-[#7E91A8]" title={info.scope === 'org' ? 'Only org owners and admins edit the org KB; you can annotate.' : undefined}>
+    <span className="flex items-center gap-1.5 text-xs text-ink-2" title={info.scope === 'org' ? 'Only org owners and admins edit the org KB; you can annotate.' : undefined}>
       <Lock size={11} />Read-only{info.scope === 'org' ? ' · you can annotate' : ''}
     </span>
   ) : null
 
   if (loadError && !info) {
     return (
-      <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
+      <div className="flex flex-col h-full" style={{ background: 'var(--bg)' }}>
         {pid ? <ProjectNav projectId={pid} currentView="kb" /> : <ScopeHeader info={null} />}
         <div className="flex-1 flex items-center justify-center p-8">
-          <p className="text-sm text-[#F87171] max-w-md text-center">{loadError}</p>
+          <p className="text-sm text-danger-ink max-w-md text-center">{loadError}</p>
         </div>
       </div>
     )
@@ -194,7 +194,7 @@ export function KB() {
   const isSearching = searchQuery.trim().length > 0
 
   return (
-    <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
+    <div className="flex flex-col h-full" style={{ background: 'var(--bg)' }}>
       {/* Header */}
       {pid
         ? <ProjectNav projectId={pid} currentView="kb" rightSlot={newDocButton} />
@@ -203,12 +203,12 @@ export function KB() {
       <div className="flex flex-1 overflow-hidden">
         {/* ── Sidebar ────────────────────────────────────────────────── */}
         <aside className="flex flex-col flex-shrink-0 overflow-hidden"
-          style={{ width: 248, borderRight: '1px solid #1E2C45', background: '#0D1726' }}>
+          style={{ width: 248, borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
 
           {/* Search */}
           <div className="px-3 pt-3 pb-2 flex-shrink-0">
             <div className="relative">
-              <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#3D5068] pointer-events-none" />
+              <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none" />
               <input
                 type="text"
                 placeholder="Search docs…"
@@ -216,18 +216,18 @@ export function KB() {
                 onChange={e => setSearchQuery(e.target.value)}
                 className="w-full text-xs rounded-lg pl-8 pr-8 py-2 transition-all focus:outline-none"
                 style={{
-                  background: '#08101F',
-                  border: '1px solid #1E2C45',
-                  color: '#DDE6F0',
+                  background: 'var(--bg)',
+                  border: '1px solid var(--line)',
+                  color: 'var(--ink)',
                   fontFamily: 'inherit',
                 }}
-                onFocus={e => (e.target.style.borderColor = '#6366F1')}
-                onBlur={e => (e.target.style.borderColor = '#1E2C45')}
+                onFocus={e => (e.target.style.borderColor = 'var(--primary)')}
+                onBlur={e => (e.target.style.borderColor = 'var(--line)')}
               />
-              {searching && <Loader2 size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#6366F1] animate-spin" />}
+              {searching && <Loader2 size={12} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-primary animate-spin" />}
               {searchQuery && !searching && (
                 <button onClick={() => setSearchQuery('')}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#3D5068] hover:text-[#DDE6F0] cursor-pointer">
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-3 hover:text-ink cursor-pointer">
                   <X size={11} />
                 </button>
               )}
@@ -237,7 +237,7 @@ export function KB() {
           {/* Tags */}
           {tags.length > 0 && !isSearching && (
             <div className="px-3 pb-2 flex-shrink-0">
-              <div className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest mb-2 flex items-center gap-1.5">
+              <div className="text-[10px] font-bold text-ink-3 uppercase tracking-widest mb-2 flex items-center gap-1.5">
                 <Tag size={9} />
                 Tags
               </div>
@@ -246,8 +246,8 @@ export function KB() {
                   onClick={() => setTagFilter(null)}
                   className={`text-xs px-2 py-0.5 rounded-md transition-all cursor-pointer font-medium ${
                     !tagFilter
-                      ? 'bg-[#172540] text-[#DDE6F0]'
-                      : 'text-[#3D5068] hover:text-[#7E91A8]'
+                      ? 'bg-surface-3 text-ink'
+                      : 'text-ink-3 hover:text-ink-2'
                   }`}
                 >all</button>
                 {tags.slice(0, 12).map(t => {
@@ -260,11 +260,11 @@ export function KB() {
                       className="text-xs px-2 py-0.5 rounded-md transition-all cursor-pointer font-medium flex items-center gap-1"
                       style={{
                         background: isActive ? tc.bg : 'transparent',
-                        color: isActive ? tc.text : '#3D5068',
+                        color: isActive ? tc.text : 'var(--ink-3)',
                         border: isActive ? `1px solid ${tc.ring}` : '1px solid transparent',
                       }}
                       onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = tc.text }}
-                      onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#3D5068' }}
+                      onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'var(--ink-3)' }}
                     >
                       {t.tag}
                       <span style={{ opacity: 0.6 }}>{t.count}</span>
@@ -276,7 +276,7 @@ export function KB() {
           )}
 
           {/* Divider */}
-          {!isSearching && <div className="mx-3 border-t border-[#192238] mb-1 flex-shrink-0" />}
+          {!isSearching && <div className="mx-3 border-t border-line-sub mb-1 flex-shrink-0" />}
 
           {/* File tree / search results */}
           <div className="flex-1 overflow-y-auto px-2 py-1">
@@ -290,13 +290,13 @@ export function KB() {
               />
             ) : loading ? (
               <div className="flex justify-center py-6">
-                <Loader2 size={15} className="animate-spin text-[#7E91A8]" />
+                <Loader2 size={15} className="animate-spin text-ink-2" />
               </div>
             ) : docs.length === 0 ? (
               <div className="text-center py-8 px-3">
-                <BookOpen size={20} className="text-[#283A57] mx-auto mb-2" />
-                <p className="text-xs text-[#3D5068]">No docs yet</p>
-                {canWrite && <p className="text-xs text-[#3D5068] mt-0.5">Click "New Doc" to start.</p>}
+                <BookOpen size={20} className="text-line-str mx-auto mb-2" />
+                <p className="text-xs text-ink-3">No docs yet</p>
+                {canWrite && <p className="text-xs text-ink-3 mt-0.5">Click "New Doc" to start.</p>}
               </div>
             ) : (
               <TreeNode
@@ -317,15 +317,15 @@ export function KB() {
         {/* ── Main content ───────────────────────────────────────────── */}
         <main className="flex-1 overflow-y-auto">
           {actionError && view !== 'editor' && (
-            <p className="mx-6 mt-4 text-xs text-[#F87171]">{actionError}</p>
+            <p className="mx-6 mt-4 text-xs text-danger-ink">{actionError}</p>
           )}
           {view === 'browse' && (
             <>
               {shared && info && (
                 <div className="mx-6 mt-6 flex items-start gap-2.5 rounded-xl px-4 py-3 max-w-4xl"
-                  style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
-                  <Info size={13} className="text-[#818CF8] mt-0.5 flex-shrink-0" />
-                  <p className="text-xs text-[#7E91A8] leading-relaxed">
+                  style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
+                  <Info size={13} className="text-link mt-0.5 flex-shrink-0" />
+                  <p className="text-xs text-ink-2 leading-relaxed">
                     {SCOPE_PURPOSE[info.scope]} Anything specific to one project belongs in that project's KB.
                   </p>
                 </div>
@@ -357,17 +357,17 @@ function ScopeHeader({ info, rightSlot }: { info: KBInfo | null; rightSlot?: Rea
   const Icon = info?.scope === 'org' ? Building2 : Users
   return (
     <header className="flex items-center flex-shrink-0 select-none"
-      style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45', height: 48 }}>
+      style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)', height: 48 }}>
       <Link to="/admin/orgs" title="Organizations"
-        className="flex items-center justify-center w-11 h-full text-[#3D5068] hover:text-[#DDE6F0] transition-colors cursor-pointer flex-shrink-0">
+        className="flex items-center justify-center w-11 h-full text-ink-3 hover:text-ink transition-colors cursor-pointer flex-shrink-0">
         <ArrowLeft size={15} />
       </Link>
-      <div className="w-px h-5 bg-[#1E2C45] flex-shrink-0" />
+      <div className="w-px h-5 bg-line flex-shrink-0" />
       <div className="flex items-center gap-2 px-3 min-w-0">
-        <Icon size={14} className="text-[#818CF8] flex-shrink-0" />
-        <span className="text-sm font-bold text-[#DDE6F0] truncate">{info?.name ?? 'Knowledge base'}</span>
+        <Icon size={14} className="text-link flex-shrink-0" />
+        <span className="text-sm font-bold text-ink truncate">{info?.name ?? 'Knowledge base'}</span>
         {info && (
-          <span className="text-[10px] font-semibold uppercase tracking-wide text-[#7E91A8]">
+          <span className="text-[10px] font-semibold uppercase tracking-wide text-ink-2">
             {info.scope === 'org' ? 'Org knowledge base' : 'Team knowledge base'}
           </span>
         )}
@@ -385,8 +385,8 @@ function OtherKBs({ projectId }: { projectId: number }) {
   }, [projectId])
   if (sources.length === 0) return null
   return (
-    <div className="flex-shrink-0 px-3 py-3" style={{ borderTop: '1px solid #192238' }}>
-      <div className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest mb-2">Shared knowledge</div>
+    <div className="flex-shrink-0 px-3 py-3" style={{ borderTop: '1px solid var(--line-sub)' }}>
+      <div className="text-[10px] font-bold text-ink-3 uppercase tracking-widest mb-2">Shared knowledge</div>
       <div className="space-y-0.5">
         {sources.map(s => {
           const Icon = s.scope === 'org' ? Building2 : Users
@@ -394,18 +394,18 @@ function OtherKBs({ projectId }: { projectId: number }) {
             <>
               <Icon size={12} className="flex-shrink-0" />
               <span className="truncate flex-1">{s.name}</span>
-              {s.scope === 'team' && s.team_role === 'owner' && <span className="text-[10px] text-[#3D5068]">owner</span>}
-              {s.can_read ? <span className="text-[10px] text-[#3D5068]">{s.docs ?? 0}</span> : <Lock size={10} />}
+              {s.scope === 'team' && s.team_role === 'owner' && <span className="text-[10px] text-ink-3">owner</span>}
+              {s.can_read ? <span className="text-[10px] text-ink-3">{s.docs ?? 0}</span> : <Lock size={10} />}
             </>
           )
           return s.can_read ? (
             <Link key={`${s.scope}-${s.scope_id}`} to={s.scope === 'org' ? `/orgs/${s.scope_id}/kb` : `/teams/${s.scope_id}/kb`}
-              className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors">
+              className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-ink-2 hover:text-ink hover:bg-surface-3 transition-colors">
               {label}
             </Link>
           ) : (
             <div key={`${s.scope}-${s.scope_id}`} title="Only members of this team can read its KB"
-              className="flex items-center gap-2 px-2 py-1.5 text-xs text-[#3D5068]">
+              className="flex items-center gap-2 px-2 py-1.5 text-xs text-ink-3">
               {label}
             </div>
           )
@@ -455,16 +455,16 @@ function TreeNode({ node, depth, expanded, onToggleDir, onSelectDoc, selectedPat
         <button
           onClick={() => onToggleDir(node.fullPath)}
           className="flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md text-xs transition-colors cursor-pointer"
-          style={{ paddingLeft: `${8 + depth * 14}px`, color: '#7E91A8' }}
-          onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = '#DDE6F0'}
-          onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = '#7E91A8'}
+          style={{ paddingLeft: `${8 + depth * 14}px`, color: 'var(--ink-2)' }}
+          onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = 'var(--ink)'}
+          onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)'}
         >
           {isExpanded
-            ? <><FolderOpen size={12} className="text-[#FBBF24] flex-shrink-0" /><ChevronDown size={10} className="flex-shrink-0" /></>
-            : <><Folder size={12} className="text-[#FBBF24] flex-shrink-0" /><ChevronRight size={10} className="flex-shrink-0" /></>
+            ? <><FolderOpen size={12} className="text-warning-ink flex-shrink-0" /><ChevronDown size={10} className="flex-shrink-0" /></>
+            : <><Folder size={12} className="text-warning-ink flex-shrink-0" /><ChevronRight size={10} className="flex-shrink-0" /></>
           }
           <span className="font-semibold truncate">{node.name}</span>
-          <span className="ml-auto text-[#3D5068] tabular-nums">
+          <span className="ml-auto text-ink-3 tabular-nums">
             {children.length}
           </span>
         </button>
@@ -485,12 +485,12 @@ function TreeNode({ node, depth, expanded, onToggleDir, onSelectDoc, selectedPat
         className="flex items-center gap-1.5 w-full px-2 py-1.5 rounded-md text-xs transition-all cursor-pointer"
         style={{
           paddingLeft: `${8 + depth * 14}px`,
-          background: isSelected ? 'rgba(99,102,241,0.12)' : 'transparent',
-          color: isSelected ? '#818CF8' : '#7E91A8',
-          border: isSelected ? '1px solid rgba(99,102,241,0.2)' : '1px solid transparent',
+          background: isSelected ? 'color-mix(in srgb, var(--link) 12%, transparent)' : 'transparent',
+          color: isSelected ? 'var(--link)' : 'var(--ink-2)',
+          border: isSelected ? '1px solid color-mix(in srgb, var(--link) 20%, transparent)' : '1px solid transparent',
         }}
-        onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.color = '#DDE6F0' }}
-        onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.color = '#7E91A8' }}
+        onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.color = 'var(--ink)' }}
+        onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)' }}
       >
         <FileText size={11} className="flex-shrink-0" />
         <span className="truncate flex-1 text-left">{node.name.replace(/\.md$/, '')}</span>
@@ -512,12 +512,12 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
 }) {
   if (searching) return (
     <div className="flex justify-center py-6">
-      <Loader2 size={14} className="animate-spin text-[#6366F1]" />
+      <Loader2 size={14} className="animate-spin text-primary" />
     </div>
   )
   if (query && results.length === 0) return (
     <div className="text-center py-6">
-      <p className="text-xs text-[#3D5068]">No results for "{query}"</p>
+      <p className="text-xs text-ink-3">No results for "{query}"</p>
     </div>
   )
   return (
@@ -528,18 +528,18 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
           <button key={i} onClick={() => onSelect(r.path)}
             className="w-full text-left px-2 py-2 rounded-lg transition-all cursor-pointer"
             style={{
-              background: isSelected ? 'rgba(99,102,241,0.12)' : 'transparent',
-              border: isSelected ? '1px solid rgba(99,102,241,0.2)' : '1px solid transparent',
+              background: isSelected ? 'color-mix(in srgb, var(--link) 12%, transparent)' : 'transparent',
+              border: isSelected ? '1px solid color-mix(in srgb, var(--link) 20%, transparent)' : '1px solid transparent',
             }}
-            onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'rgba(255,255,255,0.03)' }}
+            onMouseEnter={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--ink) 3%, transparent)' }}
             onMouseLeave={e => { if (!isSelected) (e.currentTarget as HTMLElement).style.background = 'transparent' }}
           >
             <div className="flex items-center gap-1.5 mb-0.5">
-              <FileText size={10} className="text-[#6366F1] flex-shrink-0" />
-              <span className="text-xs font-semibold text-[#DDE6F0] truncate">{r.title}</span>
+              <FileText size={10} className="text-primary flex-shrink-0" />
+              <span className="text-xs font-semibold text-ink truncate">{r.title}</span>
             </div>
             {r.excerpt && (
-              <p className="text-xs text-[#3D5068] leading-relaxed line-clamp-2 pl-4">{r.excerpt}</p>
+              <p className="text-xs text-ink-3 leading-relaxed line-clamp-2 pl-4">{r.excerpt}</p>
             )}
             {r.tags.length > 0 && (
               <div className="flex gap-1 mt-1 pl-4 flex-wrap">
@@ -551,8 +551,8 @@ function SearchResultsList({ query, results, searching, onSelect, selectedPath }
             )}
             {r.annotation_count !== undefined && r.annotation_count > 0 && (
               <div className="flex items-center gap-1 mt-1 pl-4">
-                <MessageSquare size={10} className="text-[#FBBF24]" />
-                <span className="text-[10px] text-[#3D5068]">
+                <MessageSquare size={10} className="text-warning-ink" />
+                <span className="text-[10px] text-ink-3">
                   {r.annotation_count} annotation{r.annotation_count !== 1 ? 's' : ''}
                   {r.latest_annotation && <> — {r.latest_annotation}</>}
                 </span>
@@ -572,24 +572,24 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
 }) {
   if (loading) return (
     <div className="flex justify-center py-20">
-      <Loader2 size={20} className="text-[#6366F1] animate-spin" />
+      <Loader2 size={20} className="text-primary animate-spin" />
     </div>
   )
 
   if (docs.length === 0) return (
     <div className="flex flex-col items-center justify-center h-full py-24 gap-5">
       <div className="w-16 h-16 rounded-2xl flex items-center justify-center"
-        style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
-        <BookOpen size={26} className="text-[#283A57]" />
+        style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
+        <BookOpen size={26} className="text-line-str" />
       </div>
       <div className="text-center">
-        <p className="text-base font-semibold text-[#DDE6F0]">No documents yet</p>
-        <p className="text-sm text-[#7E91A8] mt-2 max-w-xs leading-relaxed">
+        <p className="text-base font-semibold text-ink">No documents yet</p>
+        <p className="text-sm text-ink-2 mt-2 max-w-xs leading-relaxed">
           {onNew ? 'Agents write docs here, or you can create one manually.' : "There's nothing here yet."}
         </p>
         {onNew && <button onClick={onNew}
           className="mt-4 flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold mx-auto cursor-pointer transition-all active:scale-[0.97]"
-          style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}>
+          style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}>
           <Plus size={14} />
           Create first document
         </button>}
@@ -601,10 +601,10 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
     <div className="p-6 max-w-4xl">
       <div className="flex items-center justify-between mb-6">
         <div>
-          <h2 className="text-lg font-bold text-[#DDE6F0]">
+          <h2 className="text-lg font-bold text-ink">
             {tagFilter ? `Tagged "${tagFilter}"` : 'All documents'}
           </h2>
-          <p className="text-sm text-[#3D5068] mt-0.5">{docs.length} doc{docs.length !== 1 ? 's' : ''}</p>
+          <p className="text-sm text-ink-3 mt-0.5">{docs.length} doc{docs.length !== 1 ? 's' : ''}</p>
         </div>
       </div>
       <div className="grid gap-2.5">
@@ -622,30 +622,30 @@ function DocListItem({ doc, onOpen }: { doc: KBDocSummary; onOpen: () => void })
     <div
       onClick={onOpen}
       className="flex items-start gap-4 p-4 rounded-xl cursor-pointer transition-all duration-150 group"
-      style={{ background: '#0D1726', border: '1px solid #1E2C45' }}
+      style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}
       onMouseEnter={e => {
-        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99,102,241,0.3)'
+        (e.currentTarget as HTMLElement).style.borderColor = 'color-mix(in srgb, var(--link) 30%, transparent)'
         ;(e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)'
-        ;(e.currentTarget as HTMLElement).style.boxShadow = '0 4px 16px rgba(0,0,0,0.3)'
+        ;(e.currentTarget as HTMLElement).style.boxShadow = '0 4px 16px color-mix(in srgb, var(--ink) 15%, transparent)'
       }}
       onMouseLeave={e => {
-        (e.currentTarget as HTMLElement).style.borderColor = '#1E2C45'
+        (e.currentTarget as HTMLElement).style.borderColor = 'var(--line)'
         ;(e.currentTarget as HTMLElement).style.transform = ''
         ;(e.currentTarget as HTMLElement).style.boxShadow = ''
       }}
     >
       <div className="w-9 h-9 rounded-xl flex-shrink-0 flex items-center justify-center mt-0.5"
-        style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)' }}>
-        <FileText size={15} className="text-[#818CF8]" />
+        style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)' }}>
+        <FileText size={15} className="text-link" />
       </div>
       <div className="flex-1 min-w-0">
         <div className="flex items-start justify-between gap-3">
-          <h3 className="text-sm font-semibold text-[#DDE6F0] group-hover:text-white transition-colors leading-snug">
+          <h3 className="text-sm font-semibold text-ink group-hover:text-white transition-colors leading-snug">
             {doc.title}
           </h3>
-          <span className="text-[10px] text-[#3D5068] font-mono flex-shrink-0 mt-0.5">{doc.author}</span>
+          <span className="text-[10px] text-ink-3 font-mono flex-shrink-0 mt-0.5">{doc.author}</span>
         </div>
-        <p className="text-xs text-[#3D5068] font-mono mt-0.5 truncate">{doc.path}</p>
+        <p className="text-xs text-ink-3 font-mono mt-0.5 truncate">{doc.path}</p>
         {doc.tags.length > 0 && (
           <div className="flex gap-1 mt-2 flex-wrap">
             {doc.tags.map(t => {
@@ -724,11 +724,11 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
   return (
     <div className="p-8 max-w-3xl mx-auto">
       {/* Breadcrumb */}
-      <div className="flex items-center gap-1.5 text-xs text-[#3D5068] mb-5 flex-wrap">
+      <div className="flex items-center gap-1.5 text-xs text-ink-3 mb-5 flex-wrap">
         {pathParts.map((part, i) => (
           <span key={i} className="flex items-center gap-1.5">
             {i > 0 && <ChevronRight size={10} />}
-            <span className={i === pathParts.length - 1 ? 'text-[#7E91A8]' : ''}>{part}</span>
+            <span className={i === pathParts.length - 1 ? 'text-ink-2' : ''}>{part}</span>
           </span>
         ))}
       </div>
@@ -736,28 +736,28 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       {/* Title + actions */}
       <div className="flex items-start justify-between gap-4 mb-4">
         <div className="flex-1 min-w-0">
-          <h1 className="text-2xl font-bold text-[#DDE6F0] leading-tight mb-3">{doc.title}</h1>
+          <h1 className="text-2xl font-bold text-ink leading-tight mb-3">{doc.title}</h1>
           <div className="flex items-center gap-3 flex-wrap">
-            <span className="text-xs text-[#3D5068] flex items-center gap-1">
+            <span className="text-xs text-ink-3 flex items-center gap-1">
               <Clock size={10} />
               {rt}
             </span>
-            {date && <span className="text-xs text-[#3D5068]">{date}</span>}
-            {doc.author && <span className="text-xs text-[#3D5068]">by {doc.author}</span>}
+            {date && <span className="text-xs text-ink-3">{date}</span>}
+            {doc.author && <span className="text-xs text-ink-3">by {doc.author}</span>}
           </div>
         </div>
         {canWrite && <div className="flex items-center gap-2 flex-shrink-0">
           <button onClick={onEdit}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer"
-            style={{ border: '1px solid #1E2C45', color: '#7E91A8', background: 'transparent' }}
-            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = '#DDE6F0'; (e.currentTarget as HTMLElement).style.borderColor = '#283A57' }}
-            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = '#7E91A8'; (e.currentTarget as HTMLElement).style.borderColor = '#1E2C45' }}>
+            style={{ border: '1px solid var(--line)', color: 'var(--ink-2)', background: 'transparent' }}
+            onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = 'var(--ink)'; (e.currentTarget as HTMLElement).style.borderColor = 'var(--line-str)' }}
+            onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)'; (e.currentTarget as HTMLElement).style.borderColor = 'var(--line)' }}>
             <Edit3 size={12} />Edit
           </button>
           <button onClick={onDelete}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all cursor-pointer"
-            style={{ border: '1px solid rgba(239,68,68,0.2)', color: '#EF4444', background: 'transparent' }}
-            onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'rgba(239,68,68,0.08)'}
+            style={{ border: '1px solid color-mix(in srgb, var(--danger) 20%, transparent)', color: 'var(--danger)', background: 'transparent' }}
+            onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--danger) 8%, transparent)'}
             onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}>
             <Trash2 size={12} />
           </button>
@@ -767,11 +767,11 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       {/* Why a team or org doc lives here */}
       {doc.reason && (
         <div className="flex items-start gap-2.5 rounded-xl px-4 py-3 mb-5"
-          style={{ background: 'rgba(99,102,241,0.06)', border: '1px solid rgba(99,102,241,0.2)' }}>
-          <Info size={13} className="text-[#818CF8] mt-0.5 flex-shrink-0" />
+          style={{ background: 'color-mix(in srgb, var(--link) 6%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)' }}>
+          <Info size={13} className="text-link mt-0.5 flex-shrink-0" />
           <div className="text-xs leading-relaxed">
-            <span className="font-semibold text-[#DDE6F0]">Why it's in the {doc.scope === 'org' ? 'org' : 'team'} KB: </span>
-            <span className="text-[#7E91A8]">{doc.reason}</span>
+            <span className="font-semibold text-ink">Why it's in the {doc.scope === 'org' ? 'org' : 'team'} KB: </span>
+            <span className="text-ink-2">{doc.reason}</span>
           </div>
         </div>
       )}
@@ -793,43 +793,43 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       )}
 
       {/* Divider */}
-      <div className="border-t border-[#192238] mb-6" />
+      <div className="border-t border-line-sub mb-6" />
 
       {/* Markdown content */}
       <div className="prose-amp">
         <ReactMarkdown
           components={{
-            h1: ({children}) => <h1 className="text-xl font-bold text-[#DDE6F0] mt-8 mb-3 pb-2 border-b border-[#192238] first:mt-0">{children}</h1>,
-            h2: ({children}) => <h2 className="text-base font-bold text-[#DDE6F0] mt-6 mb-2">{children}</h2>,
-            h3: ({children}) => <h3 className="text-sm font-bold text-[#DDE6F0] mt-4 mb-1.5">{children}</h3>,
-            p: ({children}) => <p className="text-sm text-[#7E91A8] leading-7 mb-4">{children}</p>,
+            h1: ({children}) => <h1 className="text-xl font-bold text-ink mt-8 mb-3 pb-2 border-b border-line-sub first:mt-0">{children}</h1>,
+            h2: ({children}) => <h2 className="text-base font-bold text-ink mt-6 mb-2">{children}</h2>,
+            h3: ({children}) => <h3 className="text-sm font-bold text-ink mt-4 mb-1.5">{children}</h3>,
+            p: ({children}) => <p className="text-sm text-ink-2 leading-7 mb-4">{children}</p>,
             code: ({children, className}) => {
               const isBlock = className?.includes('language-')
               if (isBlock) return (
                 <pre className="rounded-xl p-4 text-xs leading-relaxed overflow-x-auto mb-4 font-mono"
-                  style={{ background: '#08101F', border: '1px solid #192238' }}>
-                  <code style={{ color: '#DDE6F0' }}>{children}</code>
+                  style={{ background: 'var(--bg)', border: '1px solid var(--line-sub)' }}>
+                  <code style={{ color: 'var(--ink)' }}>{children}</code>
                 </pre>
               )
-              return <code className="rounded-md px-1.5 py-0.5 text-xs font-mono" style={{ background: '#08101F', color: '#818CF8', border: '1px solid #192238' }}>{children}</code>
+              return <code className="rounded-md px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--bg)', color: 'var(--link)', border: '1px solid var(--line-sub)' }}>{children}</code>
             },
-            ul: ({children}) => <ul className="text-sm text-[#7E91A8] list-disc list-outside mb-4 space-y-1.5 pl-5">{children}</ul>,
-            ol: ({children}) => <ol className="text-sm text-[#7E91A8] list-decimal list-outside mb-4 space-y-1.5 pl-5">{children}</ol>,
+            ul: ({children}) => <ul className="text-sm text-ink-2 list-disc list-outside mb-4 space-y-1.5 pl-5">{children}</ul>,
+            ol: ({children}) => <ol className="text-sm text-ink-2 list-decimal list-outside mb-4 space-y-1.5 pl-5">{children}</ol>,
             li: ({children}) => <li className="leading-7">{children}</li>,
             blockquote: ({children}) => (
-              <blockquote className="pl-4 my-4 text-sm italic text-[#7E91A8]"
-                style={{ borderLeft: '3px solid #6366F1' }}>{children}</blockquote>
+              <blockquote className="pl-4 my-4 text-sm italic text-ink-2"
+                style={{ borderLeft: '3px solid var(--primary)' }}>{children}</blockquote>
             ),
-            strong: ({children}) => <strong className="text-[#DDE6F0] font-semibold">{children}</strong>,
-            a: ({children, href}) => <a href={href} className="text-[#818CF8] hover:text-[#6366F1] underline underline-offset-2 transition-colors">{children}</a>,
-            hr: () => <hr className="border-[#192238] my-6" />,
+            strong: ({children}) => <strong className="text-ink font-semibold">{children}</strong>,
+            a: ({children, href}) => <a href={href} className="text-link hover:text-primary underline underline-offset-2 transition-colors">{children}</a>,
+            hr: () => <hr className="border-line-sub my-6" />,
             table: ({children}) => (
               <div className="overflow-x-auto mb-4">
                 <table className="w-full text-sm border-collapse">{children}</table>
               </div>
             ),
-            th: ({children}) => <th className="text-left px-4 py-2.5 text-xs font-semibold text-[#7E91A8] uppercase tracking-wide" style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>{children}</th>,
-            td: ({children}) => <td className="px-4 py-2.5 text-[#7E91A8] text-sm" style={{ borderBottom: '1px solid #192238' }}>{children}</td>,
+            th: ({children}) => <th className="text-left px-4 py-2.5 text-xs font-semibold text-ink-2 uppercase tracking-wide" style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>{children}</th>,
+            td: ({children}) => <td className="px-4 py-2.5 text-ink-2 text-sm" style={{ borderBottom: '1px solid var(--line-sub)' }}>{children}</td>,
           }}
         >
           {doc.content}
@@ -837,15 +837,15 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
       </div>
 
       {/* Annotations Panel */}
-      <div className="mt-8 pt-6 border-t border-[#192238]">
+      <div className="mt-8 pt-6 border-t border-line-sub">
         <button
           onClick={() => setAnnExpanded(!annExpanded)}
-          className="flex items-center gap-2 text-xs font-semibold text-[#7E91A8] hover:text-[#DDE6F0] transition-colors mb-4"
+          className="flex items-center gap-2 text-xs font-semibold text-ink-2 hover:text-ink transition-colors mb-4"
         >
           {annExpanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           <MessageSquare size={12} />
           Annotations
-          <span className="ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold" style={{ background: 'rgba(99,102,241,0.12)', color: '#818CF8' }}>
+          <span className="ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-bold" style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', color: 'var(--link)' }}>
             {doc.annotations?.length ?? 0}
           </span>
         </button>
@@ -856,18 +856,18 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
             {doc.annotations && doc.annotations.length > 0 ? (
               <div className="space-y-3">
                 {doc.annotations.map((ann, idx) => (
-                  <div key={idx} className="p-3 rounded-lg text-xs" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid #1E2C45' }}>
+                  <div key={idx} className="p-3 rounded-lg text-xs" style={{ background: 'color-mix(in srgb, var(--ink) 3%, transparent)', border: '1px solid var(--line)' }}>
                     <div className="flex items-center justify-between mb-2">
                       <div className="flex items-center gap-2">
-                        <span className="font-semibold text-[#DDE6F0]">{ann.author}</span>
-                        <span className="text-[#3D5068]">{formatDate(ann.created_at)}</span>
+                        <span className="font-semibold text-ink">{ann.author}</span>
+                        <span className="text-ink-3">{formatDate(ann.created_at)}</span>
                       </div>
                       <div className="flex items-center gap-2">
                         <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
                           ann.is_resolved
-                            ? 'text-[#10B981]'
-                            : 'text-[#F59E0B]'
-                        }`} style={{ background: ann.is_resolved ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.12)' }}>
+                            ? 'text-success'
+                            : 'text-warning'
+                        }`} style={{ background: ann.is_resolved ? 'color-mix(in srgb, var(--success) 12%, transparent)' : 'color-mix(in srgb, var(--warning) 12%, transparent)' }}>
                           {ann.is_resolved ? 'Resolved' : 'Unresolved'}
                         </span>
                         {canWrite && (
@@ -875,7 +875,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                             onClick={() => setResolved(idx, !ann.is_resolved)}
                             disabled={resolving !== null}
                             title={ann.is_resolved ? 'Reopen this note' : 'Mark resolved once the doc reflects this note'}
-                            className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] transition-colors cursor-pointer disabled:opacity-50"
+                            className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-semibold text-ink-2 hover:text-ink hover:bg-surface-3 transition-colors cursor-pointer disabled:opacity-50"
                           >
                             {resolving === idx ? <Loader2 size={10} className="animate-spin" /> : ann.is_resolved ? <RotateCcw size={10} /> : <CheckCircle2 size={10} />}
                             {ann.is_resolved ? 'Reopen' : 'Resolve'}
@@ -883,9 +883,9 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                         )}
                       </div>
                     </div>
-                    <p className={`leading-relaxed whitespace-pre-wrap ${ann.is_resolved ? 'text-[#3D5068]' : 'text-[#7E91A8]'}`}>{ann.text}</p>
+                    <p className={`leading-relaxed whitespace-pre-wrap ${ann.is_resolved ? 'text-ink-3' : 'text-ink-2'}`}>{ann.text}</p>
                     {ann.is_resolved && ann.resolved_by && (
-                      <p className="text-[10px] text-[#3D5068] mt-1.5">
+                      <p className="text-[10px] text-ink-3 mt-1.5">
                         Resolved by {ann.resolved_by}{ann.resolved_at ? ` · ${formatDate(ann.resolved_at)}` : ''}
                       </p>
                     )}
@@ -894,41 +894,41 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
               </div>
             ) : (
               <div className="text-center py-6">
-                <p className="text-xs text-[#3D5068]">No annotations yet</p>
+                <p className="text-xs text-ink-3">No annotations yet</p>
               </div>
             )}
 
             {/* Add Annotation Form */}
-            <div className="pt-4 border-t border-[#192238]">
+            <div className="pt-4 border-t border-line-sub">
               <div className="flex items-center gap-2 mb-2">
-                <MessageSquare size={12} className="text-[#6366F1]" />
-                <span className="text-xs font-semibold text-[#DDE6F0]">Add Annotation</span>
+                <MessageSquare size={12} className="text-primary" />
+                <span className="text-xs font-semibold text-ink">Add Annotation</span>
               </div>
               <div className="space-y-2">
                 <textarea
                   value={annText}
                   onChange={(e) => setAnnText(e.target.value)}
                   placeholder="Add your annotation here..."
-                  className="w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-xs text-[#DDE6F0] placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all font-[inherit] resize-none"
+                  className="w-full bg-bg border border-line rounded-lg px-3 py-2 text-xs text-ink placeholder-ink-3 focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit] resize-none"
                   rows={3}
                 />
                 <div className="flex justify-end items-center gap-3">
-                  {annError && <span className="text-xs text-[#F87171]">{annError}</span>}
+                  {annError && <span className="text-xs text-danger-ink">{annError}</span>}
                   <button
                     onClick={handleAddAnnotation}
                     disabled={!annText.trim() || annSaving}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                    style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+                    style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
                     onMouseEnter={(e) => {
                       if (!annSaving && annText.trim()) {
-                        (e.currentTarget as HTMLElement).style.background = 'rgba(99,102,241,0.2)';
-                        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99,102,241,0.4)';
+                        (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--link) 20%, transparent)';
+                        (e.currentTarget as HTMLElement).style.borderColor = 'color-mix(in srgb, var(--link) 40%, transparent)';
                       }
                     }}
                     onMouseLeave={(e) => {
                       if (!annSaving && annText.trim()) {
-                        (e.currentTarget as HTMLElement).style.background = 'rgba(99,102,241,0.12)';
-                        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99,102,241,0.25)';
+                        (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--link) 12%, transparent)';
+                        (e.currentTarget as HTMLElement).style.borderColor = 'color-mix(in srgb, var(--link) 25%, transparent)';
                       }
                     }}
                   >
@@ -968,33 +968,33 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
     <div className="flex flex-col h-full">
       {/* Editor header */}
       <div className="flex items-center justify-between px-6 py-3 flex-shrink-0"
-        style={{ borderBottom: '1px solid #1E2C45', background: '#0D1726' }}>
+        style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)' }}>
         <div className="flex items-center gap-1">
           {(['write', 'preview'] as const).map(t => (
             <button key={t} onClick={() => onTab(t)}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer ${
-                tab === t ? 'text-[#DDE6F0]' : 'text-[#3D5068] hover:text-[#7E91A8]'
+                tab === t ? 'text-ink' : 'text-ink-3 hover:text-ink-2'
               }`}
-              style={tab === t ? { background: '#172540', border: '1px solid #283A57' } : {}}>
+              style={tab === t ? { background: 'var(--surface-3)', border: '1px solid var(--line-str)' } : {}}>
               {t === 'write' ? <Code2 size={12} /> : <Eye size={12} />}
               {t === 'write' ? 'Write' : 'Preview'}
             </button>
           ))}
         </div>
         <div className="flex items-center gap-2">
-          {error && <span className="text-xs text-[#F87171] max-w-md truncate" title={error}>{error}</span>}
+          {error && <span className="text-xs text-danger-ink max-w-md truncate" title={error}>{error}</span>}
           <button onClick={onCancel}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors cursor-pointer"
-            style={{ border: '1px solid #1E2C45', color: '#7E91A8', background: 'transparent' }}
-            onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = '#DDE6F0'}
-            onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = '#7E91A8'}>
+            style={{ border: '1px solid var(--line)', color: 'var(--ink-2)', background: 'transparent' }}
+            onMouseEnter={e => (e.currentTarget as HTMLElement).style.color = 'var(--ink)'}
+            onMouseLeave={e => (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)'}>
             <X size={12} />Cancel
           </button>
           <button onClick={onSave} disabled={!canSave}
             className="flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-            style={{ background: '#6366F1', color: '#fff', border: '1px solid #4F46E5' }}
-            onMouseEnter={e => { if (canSave) (e.currentTarget as HTMLElement).style.background = '#4F46E5' }}
-            onMouseLeave={e => { if (canSave) (e.currentTarget as HTMLElement).style.background = '#6366F1' }}>
+            style={{ background: 'var(--primary)', color: '#fff', border: '1px solid var(--primary)' }}
+            onMouseEnter={e => { if (canSave) (e.currentTarget as HTMLElement).style.background = 'var(--primary)' }}
+            onMouseLeave={e => { if (canSave) (e.currentTarget as HTMLElement).style.background = 'var(--primary)' }}>
             {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
             {saving ? 'Saving…' : 'Save doc'}
           </button>
@@ -1002,25 +1002,25 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
       </div>
 
       {/* Meta fields */}
-      <div className="px-6 py-4 flex-shrink-0 grid grid-cols-3 gap-3" style={{ borderBottom: '1px solid #192238' }}>
+      <div className="px-6 py-4 flex-shrink-0 grid grid-cols-3 gap-3" style={{ borderBottom: '1px solid var(--line-sub)' }}>
         <div className="col-span-1">
-          <label className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest block mb-1">Path</label>
+          <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">Path</label>
           <input value={path} onChange={e => onPath(e.target.value)} placeholder="folder/doc.md"
             className={`${inputCls} font-mono text-xs`} />
         </div>
         <div className="col-span-1">
-          <label className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest block mb-1">Title</label>
+          <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">Title</label>
           <input value={title} onChange={e => onTitle(e.target.value)} placeholder="Document title"
             className={inputCls} />
         </div>
         <div className="col-span-1">
-          <label className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest block mb-1">Tags</label>
+          <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">Tags</label>
           <input value={tags} onChange={e => onTags(e.target.value)} placeholder="auth, api, guide"
             className={inputCls} />
         </div>
         {shared && (
           <div className="col-span-3">
-            <label className="text-[10px] font-bold text-[#3D5068] uppercase tracking-widest block mb-1">
+            <label className="text-[10px] font-bold text-ink-3 uppercase tracking-widest block mb-1">
               Why does this belong in the {shared.scope} KB?
             </label>
             <input value={reason} onChange={e => onReason(e.target.value)}
@@ -1028,7 +1028,7 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
                 ? 'e.g. Brand colours apply to every product in the org'
                 : 'e.g. Every project this team runs deploys this way'}
               className={inputCls} />
-            <p className="text-[11px] text-[#3D5068] mt-1">{SCOPE_PURPOSE[shared.scope]} Shown with the doc so others know why it's shared.</p>
+            <p className="text-[11px] text-ink-3 mt-1">{SCOPE_PURPOSE[shared.scope]} Shown with the doc so others know why it's shared.</p>
           </div>
         )}
       </div>
@@ -1041,32 +1041,32 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
             value={content}
             onChange={e => onContent(e.target.value)}
             placeholder={"# Title\n\nWrite your document in Markdown…"}
-            className="w-full h-full p-6 text-sm text-[#DDE6F0] font-mono resize-none focus:outline-none"
-            style={{ background: '#08101F', lineHeight: '1.7', caretColor: '#6366F1' }}
+            className="w-full h-full p-6 text-sm text-ink font-mono resize-none focus:outline-none"
+            style={{ background: 'var(--bg)', lineHeight: '1.7', caretColor: 'var(--primary)' }}
           />
         ) : (
           <div className="p-8 overflow-y-auto h-full max-w-3xl">
             {content ? (
               <ReactMarkdown
                 components={{
-                  h1: ({children}) => <h1 className="text-xl font-bold text-[#DDE6F0] mt-6 mb-3 pb-2 border-b border-[#192238] first:mt-0">{children}</h1>,
-                  h2: ({children}) => <h2 className="text-base font-bold text-[#DDE6F0] mt-5 mb-2">{children}</h2>,
-                  h3: ({children}) => <h3 className="text-sm font-bold text-[#DDE6F0] mt-4 mb-1.5">{children}</h3>,
-                  p: ({children}) => <p className="text-sm text-[#7E91A8] leading-7 mb-4">{children}</p>,
+                  h1: ({children}) => <h1 className="text-xl font-bold text-ink mt-6 mb-3 pb-2 border-b border-line-sub first:mt-0">{children}</h1>,
+                  h2: ({children}) => <h2 className="text-base font-bold text-ink mt-5 mb-2">{children}</h2>,
+                  h3: ({children}) => <h3 className="text-sm font-bold text-ink mt-4 mb-1.5">{children}</h3>,
+                  p: ({children}) => <p className="text-sm text-ink-2 leading-7 mb-4">{children}</p>,
                   code: ({children, className}) => {
                     const isBlock = className?.includes('language-')
-                    if (isBlock) return <pre className="rounded-xl p-4 text-xs overflow-x-auto mb-4 font-mono" style={{ background: '#08101F', border: '1px solid #192238' }}><code style={{ color: '#DDE6F0' }}>{children}</code></pre>
-                    return <code className="rounded px-1.5 py-0.5 text-xs font-mono" style={{ background: '#08101F', color: '#818CF8' }}>{children}</code>
+                    if (isBlock) return <pre className="rounded-xl p-4 text-xs overflow-x-auto mb-4 font-mono" style={{ background: 'var(--bg)', border: '1px solid var(--line-sub)' }}><code style={{ color: 'var(--ink)' }}>{children}</code></pre>
+                    return <code className="rounded px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--bg)', color: 'var(--link)' }}>{children}</code>
                   },
-                  ul: ({children}) => <ul className="text-sm text-[#7E91A8] list-disc list-outside mb-4 space-y-1 pl-5">{children}</ul>,
+                  ul: ({children}) => <ul className="text-sm text-ink-2 list-disc list-outside mb-4 space-y-1 pl-5">{children}</ul>,
                   li: ({children}) => <li className="leading-7">{children}</li>,
-                  strong: ({children}) => <strong className="text-[#DDE6F0] font-semibold">{children}</strong>,
-                  blockquote: ({children}) => <blockquote className="pl-4 my-4 italic text-[#7E91A8]" style={{ borderLeft: '3px solid #6366F1' }}>{children}</blockquote>,
+                  strong: ({children}) => <strong className="text-ink font-semibold">{children}</strong>,
+                  blockquote: ({children}) => <blockquote className="pl-4 my-4 italic text-ink-2" style={{ borderLeft: '3px solid var(--primary)' }}>{children}</blockquote>,
                 }}>
                 {content}
               </ReactMarkdown>
             ) : (
-              <p className="text-sm text-[#3D5068] italic">Nothing to preview yet.</p>
+              <p className="text-sm text-ink-3 italic">Nothing to preview yet.</p>
             )}
           </div>
         )}

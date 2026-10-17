@@ -29,43 +29,43 @@ export function PlanCheckModal({ projectId, tasks, onOpenTask, onClose }: {
 
   const chip = (id: number) => (
     <button key={id} onClick={() => onOpenTask(id)} title={byId.get(id)?.name}
-      className="px-2 py-0.5 rounded-md text-xs text-[#DDE6F0] hover:bg-[#172540] cursor-pointer" style={{ border: '1px solid #1E2C45' }}>
-      <span className="font-mono text-[#7E91A8]">#{id}</span> <span className="truncate">{byId.get(id)?.name ?? ''}</span>
+      className="px-2 py-0.5 rounded-md text-xs text-ink hover:bg-surface-3 cursor-pointer" style={{ border: '1px solid var(--line)' }}>
+      <span className="font-mono text-ink-2">#{id}</span> <span className="truncate">{byId.get(id)?.name ?? ''}</span>
     </button>
   )
 
   return (
     <CrudModal title="Plan check" onClose={onClose}>
       {error ? (
-        <p className="text-xs text-[#F87171]">{error}</p>
+        <p className="text-xs text-danger-ink">{error}</p>
       ) : !report ? (
-        <div className="flex justify-center py-6"><Loader2 size={18} className="text-[#6366F1] animate-spin" /></div>
+        <div className="flex justify-center py-6"><Loader2 size={18} className="text-primary animate-spin" /></div>
       ) : (
         <div className="space-y-4">
           <div className="flex items-start gap-2">
             {report.ok
-              ? <CheckCircle2 size={15} className="text-[#10B981] mt-0.5 flex-shrink-0" />
-              : <AlertTriangle size={15} className="text-[#FBBF24] mt-0.5 flex-shrink-0" />}
-            <p className="text-sm text-[#DDE6F0] leading-relaxed">{report.summary}</p>
+              ? <CheckCircle2 size={15} className="text-success mt-0.5 flex-shrink-0" />
+              : <AlertTriangle size={15} className="text-warning-ink mt-0.5 flex-shrink-0" />}
+            <p className="text-sm text-ink leading-relaxed">{report.summary}</p>
           </div>
           {report.issues.map((iss, i) => (
-            <div key={i} className="rounded-xl p-3 space-y-2" style={{ background: '#08101F', border: '1px solid #1E2C45' }}>
-              <div className="text-xs font-semibold text-[#FBBF24]">{ISSUE_TITLE[iss.kind] ?? iss.kind}</div>
-              <p className="text-xs text-[#7E91A8] leading-relaxed">{iss.message}</p>
+            <div key={i} className="rounded-xl p-3 space-y-2" style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
+              <div className="text-xs font-semibold text-warning-ink">{ISSUE_TITLE[iss.kind] ?? iss.kind}</div>
+              <p className="text-xs text-ink-2 leading-relaxed">{iss.message}</p>
               {iss.task_ids && iss.task_ids.length > 0 && (
                 <div className="flex flex-wrap gap-1.5 max-h-32 overflow-y-auto">{iss.task_ids.map(chip)}</div>
               )}
-              {iss.fix && <p className="text-xs text-[#DDE6F0] leading-relaxed">{iss.fix}</p>}
+              {iss.fix && <p className="text-xs text-ink leading-relaxed">{iss.fix}</p>}
             </div>
           ))}
           {report.repaired_task_ids && report.repaired_task_ids.length > 0 && (
-            <div className="rounded-xl p-3 space-y-2" style={{ background: '#08101F', border: '1px solid #1E2C45' }}>
-              <div className="flex items-center gap-1.5 text-xs font-semibold text-[#10B981]"><Wrench size={12} />Repaired</div>
-              <p className="text-xs text-[#7E91A8]">These were stuck blocked although everything they wait on is done; they're ready now.</p>
+            <div className="rounded-xl p-3 space-y-2" style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
+              <div className="flex items-center gap-1.5 text-xs font-semibold text-success"><Wrench size={12} />Repaired</div>
+              <p className="text-xs text-ink-2">These were stuck blocked although everything they wait on is done; they're ready now.</p>
               <div className="flex flex-wrap gap-1.5">{report.repaired_task_ids.map(chip)}</div>
             </div>
           )}
-          <p className="text-[11px] text-[#3D5068]">
+          <p className="text-[11px] text-ink-3">
             Open a ticket to fix its dependencies or move it; changes apply immediately.
           </p>
         </div>

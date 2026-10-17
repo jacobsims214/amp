@@ -171,26 +171,26 @@ export function Projects() {
   }
 
   return (
-    <div className="min-h-screen" style={{ background: '#08101F' }}>
+    <div className="min-h-full" style={{ background: 'var(--bg)' }}>
       {/* Header */}
-      <header style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>
+      <header style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             {/* Logo mark */}
             <div
               className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0"
               style={{
-                background: 'linear-gradient(135deg, #6366F1 0%, #4338CA 100%)',
-                boxShadow: '0 0 20px rgba(99,102,241,0.35)',
+                background: 'linear-gradient(135deg, var(--primary) 0%, var(--primary) 100%)',
+                boxShadow: '0 0 20px color-mix(in srgb, var(--link) 35%, transparent)',
               }}
             >
               <LayoutDashboard size={14} className="text-white" />
             </div>
             <div className="flex items-center gap-2">
-              <span className="text-base font-bold text-[#DDE6F0] tracking-tight">AMP</span>
+              <span className="text-base font-bold text-ink tracking-tight">AMP</span>
               <span
-                className="text-[10px] font-semibold text-[#6366F1] px-1.5 py-0.5 rounded-md font-mono"
-                style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)' }}
+                className="text-[10px] font-semibold text-primary px-1.5 py-0.5 rounded-md font-mono"
+                style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)' }}
               >
                 v2
               </span>
@@ -198,20 +198,20 @@ export function Projects() {
           </div>
           <div className="flex items-center gap-4">
             {/* Live status */}
-            <div className={`flex items-center gap-1.5 text-xs font-medium ${live ? 'text-[#10B981]' : 'text-[#3D5068]'}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${live ? 'bg-[#10B981]' : 'bg-[#3D5068]'}`}
-                style={live ? { boxShadow: '0 0 6px #10B981' } : undefined} />
+            <div className={`flex items-center gap-1.5 text-xs font-medium ${live ? 'text-success' : 'text-ink-3'}`}>
+              <span className={`w-1.5 h-1.5 rounded-full ${live ? 'bg-success' : 'bg-ink-3'}`}
+                style={live ? { boxShadow: '0 0 6px var(--success)' } : undefined} />
               <Wifi size={11} />
               <span>{live ? 'Live' : 'Connecting…'}</span>
             </div>
-            <span className="text-xs text-[#3D5068]">
+            <span className="text-xs text-ink-3">
               {projects.length} {projects.length !== 1 ? 'projects' : 'project'}
             </span>
             {isAdmin && (
               <Link
                 to="/admin/users"
                 title="Manage users"
-                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
               >
                 <ShieldCheck size={13} />
                 Users
@@ -221,7 +221,7 @@ export function Projects() {
               <Link
                 to="/reports"
                 title="End-of-day reports and velocity"
-                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
               >
                 <CalendarDays size={13} />
                 Daily reports
@@ -231,7 +231,7 @@ export function Projects() {
               <Link
                 to="/access"
                 title="API tokens and agent accounts"
-                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
               >
                 <KeyRound size={13} />
                 Agents &amp; tokens
@@ -241,20 +241,20 @@ export function Projects() {
               <Link
                 to="/admin/orgs"
                 title="Organizations and teams"
-                className="flex items-center gap-1 text-xs font-medium text-[#7E91A8] hover:text-[#818CF8] transition-colors"
+                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
               >
                 <Building2 size={13} />
                 Orgs
               </Link>
             )}
             {me && (
-              <span className="text-xs text-[#3D5068]" title={me.subject}>
+              <span className="text-xs text-ink-3" title={me.subject}>
                 {me.email}
               </span>
             )}
             <button
               onClick={openCreate}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer bg-[#6366F1] hover:bg-[#4F46E5] text-white"
+              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer bg-primary hover:bg-primary text-white"
             >
               <Plus size={12} />
               New project
@@ -263,7 +263,7 @@ export function Projects() {
               onClick={handleImportClick}
               disabled={importing}
               className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ background: 'rgba(99,102,241,0.12)', border: '1px solid rgba(99,102,241,0.25)', color: '#818CF8' }}
+              style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
             >
               {importing ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}
               Import
@@ -276,24 +276,24 @@ export function Projects() {
       <main className="max-w-5xl mx-auto px-6 py-10">
         {/* Page title */}
         <div className="mb-8">
-          <h1 className="text-2xl font-bold text-[#DDE6F0] tracking-tight">Projects</h1>
-          <p className="text-sm text-[#7E91A8] mt-1.5">Select a project to open its board</p>
+          <h1 className="text-2xl font-bold text-ink tracking-tight">Projects</h1>
+          <p className="text-sm text-ink-2 mt-1.5">Select a project to open its board</p>
         </div>
 
         {loading && (
           <div className="flex justify-center py-20">
-            <Loader2 size={22} className="text-[#6366F1] animate-spin" />
+            <Loader2 size={22} className="text-primary animate-spin" />
           </div>
         )}
 
         {error && (
-          <div className="rounded-xl border border-[#EF4444]/20 bg-[#EF4444]/8 px-4 py-3 text-sm text-[#F87171] mb-6">
+          <div className="rounded-xl border border-danger/20 bg-danger/8 px-4 py-3 text-sm text-danger-ink mb-6">
             {error} — is amp-api running on port 3001?
           </div>
         )}
 
         {importError && (
-          <div className="rounded-xl border border-[#EF4444]/20 bg-[#EF4444]/8 px-4 py-3 text-sm text-[#F87171] mb-6">
+          <div className="rounded-xl border border-danger/20 bg-danger/8 px-4 py-3 text-sm text-danger-ink mb-6">
             Import failed: {importError}
           </div>
         )}
@@ -302,17 +302,17 @@ export function Projects() {
           <div className="flex flex-col items-center justify-center py-24 gap-5">
             <div
               className="w-16 h-16 rounded-2xl flex items-center justify-center"
-              style={{ background: '#0D1726', border: '1px solid #1E2C45' }}
+              style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}
             >
-              <Layers size={26} className="text-[#283A57]" />
+              <Layers size={26} className="text-line-str" />
             </div>
             <div className="text-center">
-              <p className="text-base font-semibold text-[#DDE6F0]">No projects yet</p>
-              <p className="text-sm text-[#7E91A8] mt-2 max-w-xs leading-relaxed">
+              <p className="text-base font-semibold text-ink">No projects yet</p>
+              <p className="text-sm text-ink-2 mt-2 max-w-xs leading-relaxed">
                 Ask the{' '}
                 <code
-                  className="text-[#818CF8] font-mono text-xs px-1.5 py-0.5 rounded-md"
-                  style={{ background: 'rgba(99,102,241,0.1)' }}
+                  className="text-link font-mono text-xs px-1.5 py-0.5 rounded-md"
+                  style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)' }}
                 >
                   amp-manager
                 </code>
@@ -353,7 +353,7 @@ export function Projects() {
           <div className="mt-14">
             <button
               onClick={() => setArchivedExpanded(!archivedExpanded)}
-              className="flex items-center gap-2 text-sm font-semibold text-[#DDE6F0] hover:text-white transition-colors mb-5 cursor-pointer"
+              className="flex items-center gap-2 text-sm font-semibold text-ink hover:text-white transition-colors mb-5 cursor-pointer"
             >
               {archivedExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
               Archived ({archivedProjects.length})
@@ -365,14 +365,14 @@ export function Projects() {
                   <div
                     key={p.id}
                     className="rounded-2xl p-5 opacity-60"
-                    style={{ background: '#0D1726', border: '1px solid #1E2C45' }}
+                    style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}
                   >
                     <div className="flex items-center gap-3 mb-3">
                       <ProjectAvatar code={p.code} muted />
-                      <span className="text-xs text-[#3D5068] font-mono">#{p.id}</span>
+                      <span className="text-xs text-ink-3 font-mono">#{p.id}</span>
                     </div>
-                    <h3 className="text-sm font-semibold text-[#DDE6F0] mb-1 leading-snug">{p.name}</h3>
-                    <p className="text-xs text-[#7E91A8] font-mono mb-4">{p.code}</p>
+                    <h3 className="text-sm font-semibold text-ink mb-1 leading-snug">{p.name}</h3>
+                    <p className="text-xs text-ink-2 font-mono mb-4">{p.code}</p>
                     <button
                       onClick={() => {
                         setRestoringId(p.id)
@@ -386,7 +386,7 @@ export function Projects() {
                       }}
                       disabled={restoringId === p.id}
                       className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold transition-all cursor-pointer disabled:opacity-50 active:scale-[0.97]"
-                      style={{ background: '#172540', color: '#818CF8', border: '1px solid #283A57' }}
+                      style={{ background: 'var(--surface-3)', color: 'var(--link)', border: '1px solid var(--line-str)' }}
                     >
                       <RotateCcw size={11} />
                       Restore
@@ -409,7 +409,7 @@ export function Projects() {
             <div><label className={labelCls}>Description</label>
               <textarea value={createForm.description} onChange={e => setCreateForm(f => ({ ...f, description: e.target.value }))} rows={3} className={`${inputCls} resize-none`} placeholder="Optional description" /></div>
             <ProjectHomeFields orgs={orgs} value={createHome} onChange={setCreateHome} />
-            {createError && <p className="text-xs text-[#F87171]">{createError}</p>}
+            {createError && <p className="text-xs text-danger-ink">{createError}</p>}
           </div>
         </CrudModal>
       )}
@@ -417,7 +417,7 @@ export function Projects() {
       {importModalOpen && (
         <CrudModal title="Import Project" onClose={() => setImportModalOpen(false)} onSave={handleImportChooseFile} saveLabel="Choose file…">
           <div className="space-y-4">
-            <p className="text-xs text-[#7E91A8]">Choose where the imported project should live, then pick an export bundle (.json).</p>
+            <p className="text-xs text-ink-2">Choose where the imported project should live, then pick an export bundle (.json).</p>
             <ProjectHomeFields orgs={orgs} value={importHome} onChange={setImportHome} />
           </div>
         </CrudModal>
@@ -432,12 +432,12 @@ function ProjectAvatar({ code, muted = false }: { code: string; muted?: boolean 
     <div
       className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 text-sm font-bold"
       style={muted
-        ? { background: '#111E30', color: '#3D5068', border: '1px solid #192238' }
+        ? { background: 'var(--surface-2)', color: 'var(--ink-3)', border: '1px solid var(--line-sub)' }
         : {
-            background: 'linear-gradient(135deg, rgba(99,102,241,0.2) 0%, rgba(67,56,202,0.3) 100%)',
-            color: '#818CF8',
-            border: '1px solid rgba(99,102,241,0.25)',
-            boxShadow: '0 0 14px rgba(99,102,241,0.12)',
+            background: 'linear-gradient(135deg, color-mix(in srgb, var(--link) 20%, transparent) 0%, color-mix(in srgb, var(--link) 30%, transparent) 100%)',
+            color: 'var(--link)',
+            border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)',
+            boxShadow: '0 0 14px color-mix(in srgb, var(--link) 12%, transparent)',
           }
       }
     >
@@ -461,15 +461,15 @@ function ProjectCard({ project: p, onExport, exporting, exportError, onArchive, 
     <div
       className="group rounded-2xl p-5 transition-all duration-200 hover:-translate-y-0.5 cursor-pointer"
       style={{
-        background: '#0D1726',
-        border: '1px solid #1E2C45',
+        background: 'var(--surface)',
+        border: '1px solid var(--line)',
       }}
       onMouseEnter={e => {
-        (e.currentTarget as HTMLElement).style.borderColor = 'rgba(99,102,241,0.3)'
-        ;(e.currentTarget as HTMLElement).style.boxShadow = '0 8px 32px rgba(0,0,0,0.35), 0 0 0 1px rgba(99,102,241,0.1)'
+        (e.currentTarget as HTMLElement).style.borderColor = 'color-mix(in srgb, var(--link) 30%, transparent)'
+        ;(e.currentTarget as HTMLElement).style.boxShadow = '0 8px 32px color-mix(in srgb, var(--ink) 18%, transparent), 0 0 0 1px color-mix(in srgb, var(--link) 10%, transparent)'
       }}
       onMouseLeave={e => {
-        (e.currentTarget as HTMLElement).style.borderColor = '#1E2C45'
+        (e.currentTarget as HTMLElement).style.borderColor = 'var(--line)'
         ;(e.currentTarget as HTMLElement).style.boxShadow = 'none'
       }}
     >
@@ -477,14 +477,14 @@ function ProjectCard({ project: p, onExport, exporting, exportError, onArchive, 
       <div className="flex items-start justify-between gap-3 mb-4">
         <Link to={`/project/${p.id}`} className="flex items-center gap-3 flex-1 min-w-0">
           <ProjectAvatar code={p.code} />
-          <span className="text-xs text-[#3D5068] font-mono">#{p.id}</span>
+          <span className="text-xs text-ink-3 font-mono">#{p.id}</span>
         </Link>
         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
           <button
             onClick={(e) => onExport(e, p.id)}
             disabled={exporting}
             className="p-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
-            style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.2)', color: '#818CF8' }}
+            style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)', color: 'var(--link)' }}
             title="Export project"
           >
             {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
@@ -492,7 +492,7 @@ function ProjectCard({ project: p, onExport, exporting, exportError, onArchive, 
           <button
             onClick={onArchive}
             disabled={archiving}
-            className="p-1.5 rounded-lg text-[#7E91A8] hover:text-[#EF4444] hover:bg-[#EF4444]/10 transition-colors cursor-pointer disabled:opacity-50"
+            className="p-1.5 rounded-lg text-ink-2 hover:text-danger hover:bg-danger/10 transition-colors cursor-pointer disabled:opacity-50"
             title="Archive project"
           >
             <Archive size={13} />
@@ -501,21 +501,21 @@ function ProjectCard({ project: p, onExport, exporting, exportError, onArchive, 
       </div>
 
       <Link to={`/project/${p.id}`} className="block">
-        <h3 className="text-sm font-bold text-[#DDE6F0] group-hover:text-white transition-colors mb-1 leading-snug">
+        <h3 className="text-sm font-bold text-ink group-hover:text-white transition-colors mb-1 leading-snug">
           {p.name}
         </h3>
-        <p className="text-xs text-[#3D5068] font-mono mb-3">{p.code}</p>
+        <p className="text-xs text-ink-3 font-mono mb-3">{p.code}</p>
         {p.description && (
-          <p className="text-xs text-[#7E91A8] mb-4 line-clamp-2 leading-relaxed">{p.description}</p>
+          <p className="text-xs text-ink-2 mb-4 line-clamp-2 leading-relaxed">{p.description}</p>
         )}
-        <div className="flex items-center gap-1.5 text-xs text-[#3D5068]">
+        <div className="flex items-center gap-1.5 text-xs text-ink-3">
           <Clock size={10} />
           <span>Updated {relativeTime(p.updated_at)}</span>
         </div>
       </Link>
 
       {exportError && (
-        <div className="mt-3 text-xs text-[#F87171] bg-[#EF4444]/8 border border-[#EF4444]/20 rounded-lg px-3 py-2">
+        <div className="mt-3 text-xs text-danger-ink bg-danger/8 border border-danger/20 rounded-lg px-3 py-2">
           {exportError}
         </div>
       )}

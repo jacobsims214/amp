@@ -42,11 +42,11 @@ function formatScheduledStart(isoString: string): string {
 
 // Left-border accent color per column state
 const STATE_ACCENT: Record<string, string> = {
-  scheduled:   'before:bg-[#F59E0B]',
-  backlog:     'before:bg-[#283A57]',
-  in_progress: 'before:bg-[#6366F1]',
-  blocked:     'before:bg-[#EF4444]',
-  completed:   'before:bg-[#10B981]',
+  scheduled:   'before:bg-warning',
+  backlog:     'before:bg-line-str',
+  in_progress: 'before:bg-primary',
+  blocked:     'before:bg-danger',
+  completed:   'before:bg-success',
 }
 
 export function TaskCard({ task, onClick, dimmed = false, isScheduled = false, owner = null }: Props) {
@@ -71,10 +71,10 @@ export function TaskCard({ task, onClick, dimmed = false, isScheduled = false, o
         before:absolute before:left-0 before:top-2 before:bottom-2 before:w-0.5 before:rounded-full
         ${accentClass}
         ${isScheduled
-          ? 'bg-[#120E00] border-[#F59E0B]/20 hover:border-[#F59E0B]/40'
-          : 'bg-[#111E30] border-[#1E2C45] hover:border-[#6366F1]/35'
+          ? 'bg-surface-2 border-warning/20 hover:border-warning/40'
+          : 'bg-surface-2 border-line hover:border-primary/35'
         }
-        hover:bg-[#172540] hover:shadow-lg hover:shadow-black/30 hover:-translate-y-px
+        hover:bg-surface-3 hover:shadow-lg hover:shadow-black/30 hover:-translate-y-px
         active:scale-[0.99] active:translate-y-0
         ${dimmed ? 'opacity-35' : ''}
       `}
@@ -84,33 +84,33 @@ export function TaskCard({ task, onClick, dimmed = false, isScheduled = false, o
         {/* Planned agent badge (agent profile, not the human owner) */}
         {plannedAgent && (
           <div
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-dashed border-[#6366F1]/35 bg-[#6366F1]/8 w-fit max-w-full"
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-dashed border-primary/35 bg-primary/8 w-fit max-w-full"
             title={`Planned agent: ${task.assigned_to}`}
           >
-            <Bot size={10} className="text-[#818CF8] flex-shrink-0" />
-            <span className="text-xs text-[#818CF8] font-medium truncate">{shortAgent(plannedAgent)}</span>
+            <Bot size={10} className="text-link flex-shrink-0" />
+            <span className="text-xs text-link font-medium truncate">{shortAgent(plannedAgent)}</span>
           </div>
         )}
 
         {/* Active agent badge */}
         {activeAgent && (
           <div
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-[#10B981]/30 bg-[#10B981]/8 w-fit max-w-full"
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-success/30 bg-success/8 w-fit max-w-full"
             title={`Agent working: ${activeAgent}`}
           >
-            <Bot size={10} className="text-[#10B981] flex-shrink-0" />
-            <span className="text-xs text-[#10B981] font-medium truncate">{shortAgent(activeAgent)}</span>
+            <Bot size={10} className="text-success flex-shrink-0" />
+            <span className="text-xs text-success font-medium truncate">{shortAgent(activeAgent)}</span>
           </div>
         )}
 
         {/* Name */}
-        <p className="text-sm font-medium text-[#DDE6F0] leading-snug line-clamp-2 group-hover:text-white transition-colors">
+        <p className="text-sm font-medium text-ink leading-snug line-clamp-2 group-hover:text-white transition-colors">
           {task.name}
         </p>
 
         {/* Scheduled start */}
         {scheduledStartAt && (
-          <div className="flex items-center gap-1.5 text-xs text-[#FBBF24]">
+          <div className="flex items-center gap-1.5 text-xs text-warning-ink">
             <Calendar size={11} className="flex-shrink-0" />
             <span>Starts {formatScheduledStart(scheduledStartAt)}</span>
           </div>
@@ -119,18 +119,18 @@ export function TaskCard({ task, onClick, dimmed = false, isScheduled = false, o
         {/* Footer row */}
         <div className="flex items-center justify-between gap-2 mt-0.5">
           <div className="flex items-center gap-2">
-            <span className="text-xs text-[#3D5068] font-mono tabular-nums">#{task.id}</span>
+            <span className="text-xs text-ink-3 font-mono tabular-nums">#{task.id}</span>
             <PriorityBadge priority={task.priority} />
           </div>
           <div className="flex items-center gap-2">
             {task.blocked_by_ids && task.blocked_by_ids.length > 0 && (
-              <div className="flex items-center gap-1 text-[#F87171]" title={`Blocked by #${task.blocked_by_ids.join(', #')}`}>
+              <div className="flex items-center gap-1 text-danger-ink" title={`Blocked by #${task.blocked_by_ids.join(', #')}`}>
                 <AlertCircle size={11} />
                 <span className="text-xs">{task.blocked_by_ids.length}</span>
               </div>
             )}
             {task.dependency_ids?.length > 0 && !(task.blocked_by_ids?.length) && (
-              <div className="flex items-center gap-1 text-[#3D5068]" title="Has dependencies">
+              <div className="flex items-center gap-1 text-ink-3" title="Has dependencies">
                 <GitBranch size={11} />
               </div>
             )}

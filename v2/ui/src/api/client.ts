@@ -234,6 +234,10 @@ export const api = {
     post(`/tasks/${taskId}/dispatch`, { agent_id: agentId }),
   completeTask: (taskId: number) =>
     post(`/tasks/${taskId}/complete`),
+  /** Answer an agent's flag (a ticket blocked with a reason): posts the
+   *  answer as a comment and puts the ticket back to ready (or waiting). */
+  answerFlag: (taskId: number, answer: string) =>
+    post<{ task: Task }>(`/tasks/${taskId}/unblock`, { answer }).then(r => r.task),
 
   // Export
   exportProject: async (projectId: number): Promise<{ blob: Blob; filename: string }> => {

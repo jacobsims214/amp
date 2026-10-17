@@ -34,14 +34,14 @@ export function OwnersEditor({ ownerIds, people, members, meId, onAdd, onRemove 
   return (
     <div className="space-y-2">
       <div className="flex flex-wrap gap-1.5">
-        {ownerIds.length === 0 && <span className="text-xs text-[#3D5068] italic">No owners</span>}
+        {ownerIds.length === 0 && <span className="text-xs text-ink-3 italic">No owners</span>}
         {ownerIds.map(id => {
           const p = lookupPerson(people, id)!
           return (
             <span
               key={id}
-              className="flex items-center gap-1.5 pl-1 pr-1.5 py-0.5 rounded-full text-xs text-[#DDE6F0]"
-              style={{ background: '#111E30', border: '1px solid #1E2C45' }}
+              className="flex items-center gap-1.5 pl-1 pr-1.5 py-0.5 rounded-full text-xs text-ink"
+              style={{ background: 'var(--surface-2)', border: '1px solid var(--line)' }}
               title={p.email}
             >
               <OwnerAvatar person={p} size={18} />
@@ -50,7 +50,7 @@ export function OwnersEditor({ ownerIds, people, members, meId, onAdd, onRemove 
                 type="button"
                 onClick={() => run(() => onRemove(id))}
                 disabled={busy}
-                className="p-0.5 rounded-full text-[#3D5068] hover:text-[#F87171] hover:bg-[#EF4444]/10 transition-colors cursor-pointer disabled:opacity-50"
+                className="p-0.5 rounded-full text-ink-3 hover:text-danger-ink hover:bg-danger/10 transition-colors cursor-pointer disabled:opacity-50"
                 title={`Remove ${p.name}`}
               >
                 <X size={10} />
@@ -58,14 +58,14 @@ export function OwnersEditor({ ownerIds, people, members, meId, onAdd, onRemove 
             </span>
           )
         })}
-        {busy && <Loader2 size={12} className="text-[#7E91A8] animate-spin self-center" />}
+        {busy && <Loader2 size={12} className="text-ink-2 animate-spin self-center" />}
       </div>
       {candidates.length > 0 && (
         <select
           value=""
           disabled={busy}
           onChange={e => { const id = Number(e.target.value); if (id) run(() => onAdd(id)) }}
-          className="w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all cursor-pointer disabled:opacity-50"
+          className="w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all cursor-pointer disabled:opacity-50"
         >
           <option value="">Add owner…</option>
           {candidates.map(m => (
@@ -73,7 +73,7 @@ export function OwnersEditor({ ownerIds, people, members, meId, onAdd, onRemove 
           ))}
         </select>
       )}
-      {error && <p className="text-xs text-[#F87171]">{error}</p>}
+      {error && <p className="text-xs text-danger-ink">{error}</p>}
     </div>
   )
 }

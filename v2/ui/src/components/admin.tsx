@@ -6,11 +6,11 @@ import { quietBtnCls } from '../lib/adminStyles'
 // webhooks, and the audit log.
 
 const tones = {
-  indigo: { background: 'rgba(99,102,241,0.12)', color: '#818CF8', border: '1px solid rgba(99,102,241,0.22)' },
-  green: { background: 'rgba(16,185,129,0.12)', color: '#34D399', border: '1px solid rgba(16,185,129,0.22)' },
-  red: { background: 'rgba(239,68,68,0.10)', color: '#F87171', border: '1px solid rgba(239,68,68,0.22)' },
-  amber: { background: 'rgba(245,158,11,0.10)', color: '#FBBF24', border: '1px solid rgba(245,158,11,0.22)' },
-  gray: { background: 'rgba(126,145,168,0.10)', color: '#7E91A8', border: '1px solid rgba(126,145,168,0.20)' },
+  indigo: { background: 'color-mix(in srgb, var(--link) 12%, transparent)', color: 'var(--link)', border: '1px solid color-mix(in srgb, var(--link) 22%, transparent)' },
+  green: { background: 'color-mix(in srgb, var(--success) 12%, transparent)', color: 'var(--success-ink)', border: '1px solid color-mix(in srgb, var(--success) 22%, transparent)' },
+  red: { background: 'color-mix(in srgb, var(--danger) 10%, transparent)', color: 'var(--danger-ink)', border: '1px solid color-mix(in srgb, var(--danger) 22%, transparent)' },
+  amber: { background: 'color-mix(in srgb, var(--warning) 10%, transparent)', color: 'var(--warning-ink)', border: '1px solid color-mix(in srgb, var(--warning) 22%, transparent)' },
+  gray: { background: 'color-mix(in srgb, var(--ink-2) 10%, transparent)', color: 'var(--ink-2)', border: '1px solid color-mix(in srgb, var(--ink-2) 20%, transparent)' },
 }
 
 export function Pill({ tone = 'indigo', title, children }: { tone?: keyof typeof tones; title?: string; children: React.ReactNode }) {
@@ -33,7 +33,7 @@ export function AccountBadges({ kind, disabled }: { kind?: string; disabled?: bo
 
 /** "3m ago", "2h ago", "Oct 14" — with the full time on hover. */
 export function When({ at }: { at?: string }) {
-  if (!at) return <span className="text-[#3D5068]">never</span>
+  if (!at) return <span className="text-ink-3">never</span>
   return <RelativeTime at={at} />
 }
 
@@ -56,7 +56,7 @@ export function CopyButton({ text, label = 'Copy' }: { text: string; label?: str
   return (
     <button type="button" className={quietBtnCls}
       onClick={() => { navigator.clipboard?.writeText(text).then(() => { setCopied(true); setTimeout(() => setCopied(false), 1500) }) }}>
-      {copied ? <Check size={12} className="text-[#34D399]" /> : <Copy size={12} />}{copied ? 'Copied' : label}
+      {copied ? <Check size={12} className="text-success-ink" /> : <Copy size={12} />}{copied ? 'Copied' : label}
     </button>
   )
 }
@@ -73,16 +73,16 @@ export function SecretReveal({ title, secret, note = "Copy it now: AMP keeps onl
   children?: React.ReactNode
 }) {
   return (
-    <div className="rounded-xl p-4 space-y-3" style={{ background: 'rgba(16,185,129,0.06)', border: '1px solid rgba(16,185,129,0.25)' }}>
+    <div className="rounded-xl p-4 space-y-3" style={{ background: 'color-mix(in srgb, var(--success) 6%, transparent)', border: '1px solid color-mix(in srgb, var(--success) 25%, transparent)' }}>
       <div className="flex items-start gap-2">
-        <EyeOff size={14} className="text-[#34D399] mt-0.5 flex-shrink-0" />
+        <EyeOff size={14} className="text-success-ink mt-0.5 flex-shrink-0" />
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-semibold text-[#DDE6F0]">{title}</p>
-          <p className="text-xs text-[#7E91A8]">{note}</p>
+          <p className="text-sm font-semibold text-ink">{title}</p>
+          <p className="text-xs text-ink-2">{note}</p>
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <code className="flex-1 min-w-0 px-3 py-2 rounded-lg text-xs font-mono text-[#DDE6F0] break-all" style={{ background: '#08101F', border: '1px solid #1E2C45' }}>
+        <code className="flex-1 min-w-0 px-3 py-2 rounded-lg text-xs font-mono text-ink break-all" style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
           {secret}
         </code>
         <CopyButton text={secret} />
@@ -94,7 +94,7 @@ export function SecretReveal({ title, secret, note = "Copy it now: AMP keeps onl
 }
 
 export function Notice({ error, info }: { error?: string | null; info?: string | null }) {
-  if (error) return <p className="text-xs text-[#F87171] mt-2">{error}</p>
-  if (info) return <p className="text-xs text-[#34D399] mt-2">{info}</p>
+  if (error) return <p className="text-xs text-danger-ink mt-2">{error}</p>
+  if (info) return <p className="text-xs text-success-ink mt-2">{info}</p>
   return null
 }

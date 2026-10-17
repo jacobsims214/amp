@@ -56,7 +56,7 @@ function WebhookForm({ initial, submitLabel, onSubmit, onCancel }: {
   }
 
   return (
-    <form onSubmit={submit} className="space-y-3 rounded-xl p-4" style={{ background: '#08101F', border: '1px solid #1E2C45' }}>
+    <form onSubmit={submit} className="space-y-3 rounded-xl p-4" style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
       <div className="grid grid-cols-1 sm:grid-cols-[1fr_2fr] gap-3">
         <div>
           <label className={labelCls}>Name</label>
@@ -75,15 +75,15 @@ function WebhookForm({ initial, submitLabel, onSubmit, onCancel }: {
         </select>
       </div>
       <div>
-        <label className={labelCls}>Events {events.length === 0 && <span className="text-[#3D5068] font-normal">(none picked: every ticket and project event)</span>}</label>
+        <label className={labelCls}>Events {events.length === 0 && <span className="text-ink-3 font-normal">(none picked: every ticket and project event)</span>}</label>
         <div className="flex flex-wrap gap-1.5">
           {EVENT_CHOICES.map(c => {
             const on = events.includes(c.value)
             return (
               <button type="button" key={c.value} onClick={() => toggle(c.value)}
                 className="px-2 py-1 rounded-lg text-[11px] font-medium cursor-pointer transition-colors"
-                style={on ? { background: 'rgba(99,102,241,0.18)', color: '#C7D2FE', border: '1px solid rgba(99,102,241,0.45)' }
-                  : { color: '#7E91A8', border: '1px solid #1E2C45' }}>
+                style={on ? { background: 'color-mix(in srgb, var(--link) 18%, transparent)', color: 'var(--link)', border: '1px solid color-mix(in srgb, var(--link) 45%, transparent)' }
+                  : { color: 'var(--ink-2)', border: '1px solid var(--line)' }}>
                 {c.label}
               </button>
             )
@@ -111,20 +111,20 @@ function Deliveries({ webhookId }: { webhookId: number }) {
     const t = setInterval(load, 4000)
     return () => { live = false; clearInterval(t) }
   }, [webhookId])
-  if (error) return <p className="text-xs text-[#F87171]">{error}</p>
-  if (!list) return <Loader2 size={13} className="text-[#6366F1] animate-spin" />
-  if (list.length === 0) return <p className="text-xs text-[#3D5068]">No deliveries yet. Send a test to try it.</p>
+  if (error) return <p className="text-xs text-danger-ink">{error}</p>
+  if (!list) return <Loader2 size={13} className="text-primary animate-spin" />
+  if (list.length === 0) return <p className="text-xs text-ink-3">No deliveries yet. Send a test to try it.</p>
   return (
     <ul className="space-y-1">
       {list.map(d => (
         <li key={d.id} className="flex items-center gap-2 text-xs">
           <Pill tone={d.status === 'delivered' ? 'green' : d.status === 'failed' ? 'red' : 'amber'}>{d.status}</Pill>
-          <span className="font-mono text-[#DDE6F0]">{d.event_type}</span>
-          <span className="text-[#3D5068]"><When at={d.created_at} /></span>
-          <span className="text-[#3D5068]">{d.attempts} attempt{d.attempts === 1 ? '' : 's'}</span>
-          {d.last_status != null && <span className="text-[#7E91A8]">HTTP {d.last_status}</span>}
-          {d.last_error && <span className="text-[#F87171] truncate" title={d.last_error}>{d.last_error}</span>}
-          {d.status === 'pending' && d.attempts > 0 && <span className="text-[#7E91A8]">retry <When at={d.next_attempt_at} /></span>}
+          <span className="font-mono text-ink">{d.event_type}</span>
+          <span className="text-ink-3"><When at={d.created_at} /></span>
+          <span className="text-ink-3">{d.attempts} attempt{d.attempts === 1 ? '' : 's'}</span>
+          {d.last_status != null && <span className="text-ink-2">HTTP {d.last_status}</span>}
+          {d.last_error && <span className="text-danger-ink truncate" title={d.last_error}>{d.last_error}</span>}
+          {d.status === 'pending' && d.attempts > 0 && <span className="text-ink-2">retry <When at={d.next_attempt_at} /></span>}
         </li>
       ))}
     </ul>
@@ -151,20 +151,20 @@ function WebhookRow({ hook, canManage, onChanged, onSecret }: {
   return (
     <li className="px-4 py-3 space-y-2">
       <div className="flex items-center gap-2">
-        <button onClick={() => setOpen(o => !o)} className="text-[#3D5068] hover:text-[#DDE6F0] cursor-pointer" aria-label="Show deliveries">
+        <button onClick={() => setOpen(o => !o)} className="text-ink-3 hover:text-ink cursor-pointer" aria-label="Show deliveries">
           {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </button>
-        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${!hook.active ? 'bg-[#3D5068]' : failing ? 'bg-[#F59E0B]' : 'bg-[#10B981]'}`} />
+        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${!hook.active ? 'bg-ink-3' : failing ? 'bg-warning' : 'bg-success'}`} />
         <div className="flex-1 min-w-0">
-          <p className="text-sm text-[#DDE6F0] truncate">{hook.name || hook.url}</p>
-          <p className="text-[11px] text-[#3D5068] truncate">
+          <p className="text-sm text-ink truncate">{hook.name || hook.url}</p>
+          <p className="text-[11px] text-ink-3 truncate">
             {hook.name && <span className="font-mono">{hook.url} · </span>}
             {hook.format === 'slack' ? 'Slack' : 'JSON'} · {describeEvents(hook.events)}
           </p>
         </div>
         {!hook.active && <Pill tone="gray">off</Pill>}
         {failing && <Pill tone="amber" title={hook.last_error}>{hook.consecutive_failures} failed</Pill>}
-        {hook.last_delivery_at && <span className="text-[11px] text-[#3D5068] hidden sm:inline">last <When at={hook.last_delivery_at} /></span>}
+        {hook.last_delivery_at && <span className="text-[11px] text-ink-3 hidden sm:inline">last <When at={hook.last_delivery_at} /></span>}
       </div>
       {canManage && (
         <div className="flex flex-wrap items-center gap-1 pl-6">
@@ -211,35 +211,35 @@ export function WebhooksPanel({ orgId, projectId, canManage }: Scope & { canMana
   useEffect(() => { if (canManage) load() }, [canManage, load])
 
   if (!canManage) {
-    return <p className="text-xs text-[#3D5068]">{orgId ? 'Org owners and admins' : 'Project owners'} manage webhooks.</p>
+    return <p className="text-xs text-ink-3">{orgId ? 'Org owners and admins' : 'Project owners'} manage webhooks.</p>
   }
   const replace = (id: number) => (h: Webhook | null) =>
     setHooks(list => h ? (list ?? []).map(x => x.id === id ? h : x) : (list ?? []).filter(x => x.id !== id))
 
   return (
     <div className="space-y-3">
-      {error && <p className="text-xs text-[#F87171]">{error}</p>}
+      {error && <p className="text-xs text-danger-ink">{error}</p>}
       {secret?.secret && (
         <SecretReveal title={`Signing secret for ${secret.name || secret.url}`} secret={secret.secret} onDone={() => setSecret(null)}
           note="Copy it now: it's only shown when the webhook is created or its secret rotated.">
           {secret.format === 'json' ? (
-            <p className="text-xs text-[#7E91A8] leading-relaxed">
-              Each POST has <code className="text-[#DDE6F0]">X-AMP-Signature: t=&lt;unix&gt;,v1=&lt;hex&gt;</code>, where v1 is
-              HMAC-SHA256 of <code className="text-[#DDE6F0]">&lt;t&gt;.&lt;body&gt;</code> with this secret. Reject old t values to stop replays.
+            <p className="text-xs text-ink-2 leading-relaxed">
+              Each POST has <code className="text-ink">X-AMP-Signature: t=&lt;unix&gt;,v1=&lt;hex&gt;</code>, where v1 is
+              HMAC-SHA256 of <code className="text-ink">&lt;t&gt;.&lt;body&gt;</code> with this secret. Reject old t values to stop replays.
             </p>
           ) : (
-            <p className="text-xs text-[#7E91A8]">Slack doesn't check signatures; keep this in case you switch the format to JSON.</p>
+            <p className="text-xs text-ink-2">Slack doesn't check signatures; keep this in case you switch the format to JSON.</p>
           )}
         </SecretReveal>
       )}
       {hooks == null ? (
-        <Loader2 size={16} className="text-[#6366F1] animate-spin" />
+        <Loader2 size={16} className="text-primary animate-spin" />
       ) : hooks.length > 0 ? (
-        <ul className="rounded-xl border border-[#1E2C45] divide-y divide-[#1E2C45]">
+        <ul className="rounded-xl border border-line divide-y divide-line">
           {hooks.map(h => <WebhookRow key={h.id} hook={h} canManage={canManage} onChanged={replace(h.id)} onSecret={w => { replace(h.id)(w); setSecret(w) }} />)}
         </ul>
       ) : !creating && (
-        <p className="text-xs text-[#3D5068]">No webhooks yet.</p>
+        <p className="text-xs text-ink-3">No webhooks yet.</p>
       )}
       {creating ? (
         <WebhookForm initial={{ format: 'json', events: [] }} submitLabel="Add webhook" onCancel={() => setCreating(false)}
@@ -250,7 +250,7 @@ export function WebhooksPanel({ orgId, projectId, canManage }: Scope & { canMana
       ) : (
         <button onClick={() => setCreating(true)} className={quietBtnCls}><Plus size={12} />Add webhook</button>
       )}
-      {hooks && hooks.length > 0 && <p className="text-[11px] text-[#3D5068]">Failed deliveries are retried for a few hours. After 20 deliveries in a row fail, a webhook turns itself off.</p>}
+      {hooks && hooks.length > 0 && <p className="text-[11px] text-ink-3">Failed deliveries are retried for a few hours. After 20 deliveries in a row fail, a webhook turns itself off.</p>}
     </div>
   )
 }

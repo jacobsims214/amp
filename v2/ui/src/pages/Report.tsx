@@ -50,12 +50,12 @@ function formatMs(ms: number): string {
 }
 
 const ACTION_CONFIG: Record<string, { dot: string; text: string; label: string }> = {
-  created:    { dot: '#7E91A8', text: 'text-[#7E91A8]',  label: 'Created'    },
-  dispatched: { dot: '#818CF8', text: 'text-[#818CF8]',  label: 'Dispatched' },
-  completed:  { dot: '#10B981', text: 'text-[#10B981]',  label: 'Completed'  },
-  blocked:    { dot: '#EF4444', text: 'text-[#F87171]',  label: 'Blocked'    },
-  unblocked:  { dot: '#FBBF24', text: 'text-[#FBBF24]',  label: 'Unblocked'  },
-  comment:    { dot: '#283A57', text: 'text-[#3D5068]',  label: 'Comment'    },
+  created:    { dot: 'var(--ink-2)', text: 'text-ink-2',  label: 'Created'    },
+  dispatched: { dot: 'var(--link)', text: 'text-link',  label: 'Dispatched' },
+  completed:  { dot: 'var(--success)', text: 'text-success',  label: 'Completed'  },
+  blocked:    { dot: 'var(--danger)', text: 'text-danger-ink',  label: 'Blocked'    },
+  unblocked:  { dot: 'var(--warning-ink)', text: 'text-warning-ink',  label: 'Unblocked'  },
+  comment:    { dot: 'var(--line-str)', text: 'text-ink-3',  label: 'Comment'    },
 }
 
 const RANGE_LABELS: Record<Range, string> = {
@@ -114,22 +114,22 @@ export function Report() {
   }, [tasks, range])
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden" style={{ background: '#08101F' }}>
+    <div className="flex flex-col h-full overflow-hidden" style={{ background: 'var(--bg)' }}>
       {/* Header */}
       <ProjectNav
         projectId={pid}
         currentView="report"
         rightSlot={
           <div className="flex items-center gap-1 p-1 rounded-lg"
-            style={{ background: '#08101F', border: '1px solid #1E2C45' }}>
+            style={{ background: 'var(--bg)', border: '1px solid var(--line)' }}>
             {(['1d', '7d', '30d', 'all'] as Range[]).map(r => (
               <button key={r} onClick={() => setRange(r)}
                 className="px-3 py-1 rounded-md text-xs font-semibold transition-all cursor-pointer"
                 style={range === r
-                  ? { background: '#172540', border: '1px solid #283A57', color: '#DDE6F0' }
-                  : { color: '#3D5068' }}
-                onMouseEnter={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = '#7E91A8' }}
-                onMouseLeave={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = '#3D5068' }}>
+                  ? { background: 'var(--surface-3)', border: '1px solid var(--line-str)', color: 'var(--ink)' }
+                  : { color: 'var(--ink-3)' }}
+                onMouseEnter={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)' }}
+                onMouseLeave={e => { if (range !== r) (e.currentTarget as HTMLElement).style.color = 'var(--ink-3)' }}>
                 {RANGE_LABELS[r]}
               </button>
             ))}
@@ -145,37 +145,37 @@ export function Report() {
             <StatCard
               icon={<CheckCircle2 size={18}/>}
               label="Completed" value={stats.completed}
-              accent="#10B981" accentBg="rgba(16,185,129,0.1)" accentBorder="rgba(16,185,129,0.2)"
+              accent="var(--success)" accentBg="color-mix(in srgb, var(--success) 10%, transparent)" accentBorder="color-mix(in srgb, var(--success) 20%, transparent)"
             />
             <StatCard
               icon={<Zap size={18}/>}
               label="Dispatched" value={stats.dispatched}
-              accent="#818CF8" accentBg="rgba(99,102,241,0.1)" accentBorder="rgba(99,102,241,0.2)"
+              accent="var(--link)" accentBg="color-mix(in srgb, var(--link) 10%, transparent)" accentBorder="color-mix(in srgb, var(--link) 20%, transparent)"
             />
             <StatCard
               icon={<Ban size={18}/>}
               label="Blocked events" value={stats.blocked}
-              accent="#F87171" accentBg="rgba(239,68,68,0.1)" accentBorder="rgba(239,68,68,0.2)"
+              accent="var(--danger-ink)" accentBg="color-mix(in srgb, var(--danger) 10%, transparent)" accentBorder="color-mix(in srgb, var(--danger) 20%, transparent)"
             />
             <StatCard
               icon={<TrendingUp size={18}/>}
               label="Avg cycle time"
               value={stats.avgCycleMs !== null ? formatMs(stats.avgCycleMs) : '—'}
-              accent="#FBBF24" accentBg="rgba(245,158,11,0.1)" accentBorder="rgba(245,158,11,0.2)"
+              accent="var(--warning-ink)" accentBg="color-mix(in srgb, var(--warning) 10%, transparent)" accentBorder="color-mix(in srgb, var(--warning) 20%, transparent)"
             />
           </div>
 
           {/* ── Completed tasks table ── */}
           {completedTasks.length > 0 && (
             <section>
-              <SectionHeader icon={<CheckCircle2 size={14} className="text-[#10B981]"/>}
+              <SectionHeader icon={<CheckCircle2 size={14} className="text-success"/>}
                 label="Completed tasks" count={completedTasks.length} />
-              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid #1E2C45' }}>
+              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--line)' }}>
                 <table className="w-full text-xs">
                   <thead>
-                    <tr style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>
+                    <tr style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
                       {['#', 'Task', 'Agent', 'Completed', 'Cycle time'].map(h => (
-                        <th key={h} className="text-left px-4 py-3 text-[#3D5068] font-bold uppercase tracking-widest text-[10px]">{h}</th>
+                        <th key={h} className="text-left px-4 py-3 text-ink-3 font-bold uppercase tracking-widest text-[10px]">{h}</th>
                       ))}
                     </tr>
                   </thead>
@@ -184,19 +184,19 @@ export function Report() {
                       <tr key={task.id}
                         className="transition-colors"
                         style={{
-                          borderBottom: i < completedTasks.length - 1 ? '1px solid #192238' : 'none',
-                          background: i % 2 === 1 ? 'rgba(13,23,38,0.4)' : 'transparent',
+                          borderBottom: i < completedTasks.length - 1 ? '1px solid var(--line-sub)' : 'none',
+                          background: i % 2 === 1 ? 'color-mix(in srgb, var(--ink) 20%, transparent)' : 'transparent',
                         }}
-                        onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#0D1726'}
-                        onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = i % 2 === 1 ? 'rgba(13,23,38,0.4)' : 'transparent'}
+                        onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--surface)'}
+                        onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = i % 2 === 1 ? 'color-mix(in srgb, var(--ink) 20%, transparent)' : 'transparent'}
                       >
-                        <td className="px-4 py-2.5 text-[#3D5068] font-mono tabular-nums">{task.id}</td>
-                        <td className="px-4 py-2.5 text-[#DDE6F0] font-medium max-w-[260px]">
+                        <td className="px-4 py-2.5 text-ink-3 font-mono tabular-nums">{task.id}</td>
+                        <td className="px-4 py-2.5 text-ink font-medium max-w-[260px]">
                           <span className="truncate block">{task.name}</span>
                         </td>
-                        <td className="px-4 py-2.5 text-[#7E91A8] font-mono">{task.agent_id ?? '—'}</td>
-                        <td className="px-4 py-2.5 text-[#10B981] tabular-nums">{formatDate(task.completed_at!)}</td>
-                        <td className="px-4 py-2.5 text-[#FBBF24] font-medium tabular-nums">
+                        <td className="px-4 py-2.5 text-ink-2 font-mono">{task.agent_id ?? '—'}</td>
+                        <td className="px-4 py-2.5 text-success tabular-nums">{formatDate(task.completed_at!)}</td>
+                        <td className="px-4 py-2.5 text-warning-ink font-medium tabular-nums">
                           {task.dispatched_at ? duration(task.dispatched_at, task.completed_at!) : duration(task.created_at, task.completed_at!)}
                         </td>
                       </tr>
@@ -210,11 +210,11 @@ export function Report() {
           {/* ── Activity feed ── */}
           <section>
             <div className="flex items-center justify-between mb-4 flex-wrap gap-3">
-              <SectionHeader icon={<Calendar size={14} className="text-[#7E91A8]"/>}
+              <SectionHeader icon={<Calendar size={14} className="text-ink-2"/>}
                 label="Activity feed" count={filtered.length} />
               {/* Action filter pills */}
               <div className="flex items-center gap-1 p-1 rounded-lg flex-wrap"
-                style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+                style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
                 {ACTION_FILTERS.map(a => {
                   const conf = ACTION_CONFIG[a]
                   const isActive = actionFilter === a
@@ -222,12 +222,12 @@ export function Report() {
                     <button key={a} onClick={() => setActionFilter(a)}
                       className="flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold capitalize transition-all cursor-pointer"
                       style={{
-                        background: isActive ? '#172540' : 'transparent',
-                        color: isActive ? (conf ? conf.dot : '#DDE6F0') : '#3D5068',
-                        border: isActive ? '1px solid #283A57' : '1px solid transparent',
+                        background: isActive ? 'var(--surface-3)' : 'transparent',
+                        color: isActive ? (conf ? conf.dot : 'var(--ink)') : 'var(--ink-3)',
+                        border: isActive ? '1px solid var(--line-str)' : '1px solid transparent',
                       }}
-                      onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#7E91A8' }}
-                      onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = '#3D5068' }}>
+                      onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'var(--ink-2)' }}
+                      onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = 'var(--ink-3)' }}>
                       {a !== 'all' && conf && (
                         <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: conf.dot }}/>
                       )}
@@ -240,14 +240,14 @@ export function Report() {
 
             {loading ? (
               <div className="flex justify-center py-10">
-                <Loader2 size={20} className="text-[#6366F1] animate-spin"/>
+                <Loader2 size={20} className="text-primary animate-spin"/>
               </div>
             ) : filtered.length === 0 ? (
-              <div className="text-center py-12 rounded-xl" style={{ border: '1px solid #192238' }}>
-                <p className="text-sm text-[#3D5068]">No activity in this period</p>
+              <div className="text-center py-12 rounded-xl" style={{ border: '1px solid var(--line-sub)' }}>
+                <p className="text-sm text-ink-3">No activity in this period</p>
               </div>
             ) : (
-              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid #1E2C45' }}>
+              <div className="rounded-xl overflow-hidden" style={{ border: '1px solid var(--line)' }}>
                 {filtered.map((entry, i) => {
                   const conf = ACTION_CONFIG[entry.action] ?? ACTION_CONFIG.comment
                   const task = taskById.get(entry.task_id)
@@ -255,34 +255,34 @@ export function Report() {
                     <div key={entry.id}
                       className="flex items-start gap-3 px-4 py-3 transition-colors"
                       style={{
-                        borderBottom: i < filtered.length - 1 ? '1px solid #192238' : 'none',
+                        borderBottom: i < filtered.length - 1 ? '1px solid var(--line-sub)' : 'none',
                       }}
-                      onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#0D1726'}
+                      onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--surface)'}
                       onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                     >
                       <span className="w-2 h-2 rounded-full mt-1.5 flex-shrink-0"
                         style={{ background: conf.dot, boxShadow: `0 0 4px ${conf.dot}50` }}/>
                       <div className="flex-1 min-w-0">
                         <div className="flex items-center gap-2 flex-wrap">
-                          <span className="text-xs font-semibold text-[#DDE6F0]">{entry.actor}</span>
+                          <span className="text-xs font-semibold text-ink">{entry.actor}</span>
                           <span className={`text-xs font-medium capitalize ${conf.text}`}>{entry.action.replace('_', ' ')}</span>
                           {task && (
-                            <span className="text-xs text-[#7E91A8] truncate">
-                              <span className="text-[#3D5068] font-mono">#{task.id}</span>
+                            <span className="text-xs text-ink-2 truncate">
+                              <span className="text-ink-3 font-mono">#{task.id}</span>
                               {' '}{task.name}
                             </span>
                           )}
                           {entry.from_state && entry.to_state && entry.action !== 'comment' && (
-                            <span className="text-xs text-[#3D5068]">{entry.from_state} → {entry.to_state}</span>
+                            <span className="text-xs text-ink-3">{entry.from_state} → {entry.to_state}</span>
                           )}
                         </div>
                         {entry.action === 'comment' && entry.detail && (
-                          <p className="text-xs text-[#7E91A8] mt-1 line-clamp-2 leading-relaxed bg-[#08101F] rounded-lg px-2.5 py-1.5 border border-[#192238] mt-1.5">
+                          <p className="text-xs text-ink-2 mt-1 line-clamp-2 leading-relaxed bg-bg rounded-lg px-2.5 py-1.5 border border-line-sub mt-1.5">
                             {entry.detail}
                           </p>
                         )}
                       </div>
-                      <span className="text-xs text-[#3D5068] flex-shrink-0 flex items-center gap-1 tabular-nums">
+                      <span className="text-xs text-ink-3 flex-shrink-0 flex items-center gap-1 tabular-nums">
                         <Clock size={9}/>
                         {relativeTime(entry.created_at)}
                       </span>
@@ -306,9 +306,9 @@ function StatCard({ icon, label, value, accent, accentBg, accentBorder }: {
 }) {
   return (
     <div className="rounded-2xl p-5 transition-all"
-      style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+      style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
       <div className="flex items-center justify-between mb-3">
-        <span className="text-xs font-semibold text-[#3D5068] uppercase tracking-widest">{label}</span>
+        <span className="text-xs font-semibold text-ink-3 uppercase tracking-widest">{label}</span>
         <span className="flex-shrink-0 p-2 rounded-xl" style={{ background: accentBg, border: `1px solid ${accentBorder}`, color: accent }}>
           {icon}
         </span>
@@ -323,10 +323,10 @@ function StatCard({ icon, label, value, accent, accentBg, accentBorder }: {
 /* ── Section header ───────────────────────────────────────────────────────── */
 function SectionHeader({ icon, label, count }: { icon: React.ReactNode; label: string; count: number }) {
   return (
-    <h2 className="text-sm font-bold text-[#DDE6F0] mb-4 flex items-center gap-2">
+    <h2 className="text-sm font-bold text-ink mb-4 flex items-center gap-2">
       {icon}
       {label}
-      <span className="text-xs font-normal text-[#3D5068] tabular-nums">({count})</span>
+      <span className="text-xs font-normal text-ink-3 tabular-nums">({count})</span>
     </h2>
   )
 }

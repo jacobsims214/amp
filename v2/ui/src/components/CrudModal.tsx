@@ -16,7 +16,7 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
       {/* Backdrop */}
       <div
         className="fixed inset-0 z-40"
-        style={{ background: 'rgba(4, 8, 18, 0.75)', backdropFilter: 'blur(4px)' }}
+        style={{ background: 'color-mix(in srgb, var(--ink) 38%, transparent)', backdropFilter: 'blur(4px)' }}
         onClick={onClose}
       />
       {/* Panel */}
@@ -24,20 +24,20 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
         <div
           className="w-full max-w-lg pointer-events-auto flex flex-col rounded-2xl shadow-2xl"
           style={{
-            background: '#0D1726',
-            border: '1px solid #1E2C45',
-            boxShadow: '0 24px 64px rgba(0,0,0,0.6), 0 0 0 1px rgba(99,102,241,0.08)',
+            background: 'var(--surface)',
+            border: '1px solid var(--line)',
+            boxShadow: '0 24px 64px color-mix(in srgb, var(--ink) 30%, transparent), 0 0 0 1px color-mix(in srgb, var(--link) 8%, transparent)',
             maxHeight: '90vh',
           }}
         >
           {/* Header */}
-          <div className="flex items-center justify-between px-6 py-4 border-b border-[#1E2C45]">
-            <h2 className="text-sm font-semibold text-[#DDE6F0] tracking-tight">{title}</h2>
+          <div className="flex items-center justify-between px-6 py-4 border-b border-line">
+            <h2 className="text-sm font-semibold text-ink tracking-tight">{title}</h2>
             <button
               onClick={onClose}
-              className="p-1.5 rounded-lg hover:bg-[#172540] transition-colors cursor-pointer"
+              className="p-1.5 rounded-lg hover:bg-surface-3 transition-colors cursor-pointer"
             >
-              <X size={14} className="text-[#7E91A8]" />
+              <X size={14} className="text-ink-2" />
             </button>
           </div>
           {/* Body */}
@@ -45,10 +45,10 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
             {children}
           </div>
           {/* Footer */}
-          <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-[#1E2C45]">
+          <div className="flex items-center justify-end gap-2 px-6 py-4 border-t border-line">
             <button
               onClick={onClose}
-              className="px-4 py-2 text-xs font-medium text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] rounded-lg transition-colors cursor-pointer"
+              className="px-4 py-2 text-xs font-medium text-ink-2 hover:text-ink hover:bg-surface-3 rounded-lg transition-colors cursor-pointer"
             >
               {onSave ? 'Cancel' : 'Close'}
             </button>
@@ -56,7 +56,7 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
               <button
                 onClick={onSave}
                 disabled={saving}
-                className="flex items-center gap-1.5 px-4 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
+                className="flex items-center gap-1.5 px-4 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
               >
                 {saving && <Loader2 size={11} className="animate-spin" />}
                 {saveLabel}
@@ -71,7 +71,7 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
 
 /* ─── Shared form field styles ────────────────────────────────────────────── */
 export const inputCls =
-  'w-full bg-[#08101F] border border-[#1E2C45] rounded-lg px-3 py-2 text-sm text-[#DDE6F0] placeholder-[#3D5068] ' +
-  'focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all'
+  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
+  'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all'
 
-export const labelCls = 'text-xs font-medium text-[#7E91A8] block mb-1.5'
+export const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'

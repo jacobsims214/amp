@@ -17,12 +17,12 @@ import type { AddMemberResult, Invite, Member, Org, OrgRole, Team, TeamRole } fr
 // stays authoritative: every action surfaces its error inline.
 
 const fieldCls =
-  'px-3 py-2 rounded-lg text-sm bg-[#0D1726] border border-[#1E2C45] text-[#DDE6F0] placeholder-[#3D5068] outline-none focus:border-[#6366F1]'
+  'px-3 py-2 rounded-lg text-sm bg-surface border border-line text-ink placeholder-ink-3 outline-none focus:border-primary'
 const smallSelectCls =
-  'bg-[#08101F] border border-[#1E2C45] rounded-lg px-2 py-1 text-xs text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed'
+  'bg-bg border border-line rounded-lg px-2 py-1 text-xs text-ink focus:outline-none focus:border-primary cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed'
 const primaryBtnCls =
   'flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50 cursor-pointer'
-const iconBtnCls = 'text-[#7E91A8] hover:text-[#F87171] disabled:opacity-50 cursor-pointer transition-colors'
+const iconBtnCls = 'text-ink-2 hover:text-danger-ink disabled:opacity-50 cursor-pointer transition-colors'
 
 const errMsg = (e: unknown, fallback: string) => e instanceof Error ? e.message : fallback
 
@@ -36,7 +36,7 @@ function RoleBadge({ role }: { role: string }) {
   return (
     <span
       className="text-[10px] font-semibold px-1.5 py-0.5 rounded-md capitalize"
-      style={{ background: 'rgba(99,102,241,0.12)', color: '#818CF8', border: '1px solid rgba(99,102,241,0.22)' }}
+      style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', color: 'var(--link)', border: '1px solid color-mix(in srgb, var(--link) 22%, transparent)' }}
     >
       {role || 'none'}
     </span>
@@ -44,8 +44,8 @@ function RoleBadge({ role }: { role: string }) {
 }
 
 function Notice({ error, info }: { error?: string | null; info?: string | null }) {
-  if (error) return <p className="text-xs text-[#F87171] mt-2">{error}</p>
-  if (info) return <p className="text-xs text-[#10B981] mt-2">{info}</p>
+  if (error) return <p className="text-xs text-danger-ink mt-2">{error}</p>
+  if (info) return <p className="text-xs text-success mt-2">{info}</p>
   return null
 }
 
@@ -104,35 +104,35 @@ export function Orgs() {
 
   if (authLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: '#08101F' }}>
-        <Loader2 size={22} className="text-[#6366F1] animate-spin" />
+      <div className="min-h-full flex items-center justify-center" style={{ background: 'var(--bg)' }}>
+        <Loader2 size={22} className="text-primary animate-spin" />
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen" style={{ background: '#08101F' }}>
-      <header style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>
+    <div className="min-h-full" style={{ background: 'var(--bg)' }}>
+      <header style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
         <div className="max-w-5xl mx-auto px-6 py-4 flex items-center gap-3">
-          <Link to="/" className="text-[#3D5068] hover:text-[#DDE6F0] transition-colors">
+          <Link to="/" className="text-ink-3 hover:text-ink transition-colors">
             <ArrowLeft size={16} />
           </Link>
-          <Building2 size={16} className="text-[#818CF8]" />
-          <h1 className="text-base font-bold text-[#DDE6F0]">Organizations &amp; Teams</h1>
-          {me && <span className="text-xs text-[#3D5068] ml-auto">{me.email}</span>}
+          <Building2 size={16} className="text-link" />
+          <h1 className="text-base font-bold text-ink">Organizations &amp; Teams</h1>
+          {me && <span className="text-xs text-ink-3 ml-auto">{me.email}</span>}
         </div>
       </header>
 
       <main className="max-w-5xl mx-auto px-6 py-10 space-y-10">
         {error && (
-          <div className="rounded-xl border border-[#EF4444]/20 bg-[#EF4444]/8 px-4 py-3 text-sm text-[#F87171]">
+          <div className="rounded-xl border border-danger/20 bg-danger/8 px-4 py-3 text-sm text-danger-ink">
             {error}
           </div>
         )}
 
         {isAdmin && (
           <section>
-            <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">New organization</h2>
+            <h2 className="text-sm font-bold text-ink mb-3">New organization</h2>
             <form onSubmit={handleCreate} className="flex flex-wrap items-start gap-2">
               <input
                 required placeholder="Name" value={newOrg.name}
@@ -149,7 +149,7 @@ export function Orgs() {
                 onChange={e => setNewOrg(f => ({ ...f, owner: e.target.value }))}
                 className={`${fieldCls} min-w-[280px]`}
               />
-              <button type="submit" disabled={creating || !newOrg.name.trim()} className={primaryBtnCls} style={{ background: '#6366F1' }}>
+              <button type="submit" disabled={creating || !newOrg.name.trim()} className={primaryBtnCls} style={{ background: 'var(--primary)' }}>
                 {creating ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
                 Create
               </button>
@@ -161,11 +161,11 @@ export function Orgs() {
         <section className="grid grid-cols-1 md:grid-cols-[220px_1fr] gap-6">
           {/* Org list */}
           <div>
-            <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">{isAdmin ? 'All organizations' : 'My organizations'}</h2>
+            <h2 className="text-sm font-bold text-ink mb-3">{isAdmin ? 'All organizations' : 'My organizations'}</h2>
             {loading ? (
-              <Loader2 size={18} className="text-[#6366F1] animate-spin" />
+              <Loader2 size={18} className="text-primary animate-spin" />
             ) : orgs.length === 0 ? (
-              <p className="text-xs text-[#3D5068]">
+              <p className="text-xs text-ink-3">
                 {isAdmin ? 'No organizations yet.' : "You're not a member of any organization yet."}
               </p>
             ) : (
@@ -178,13 +178,13 @@ export function Orgs() {
                       onClick={() => setSelectedId(o.id)}
                       className="w-full text-left px-3 py-2 rounded-lg transition-all cursor-pointer"
                       style={{
-                        background: active ? '#172540' : 'transparent',
-                        border: active ? '1px solid #283A57' : '1px solid transparent',
+                        background: active ? 'var(--surface-3)' : 'transparent',
+                        border: active ? '1px solid var(--line-str)' : '1px solid transparent',
                       }}
                     >
-                      <div className={`text-sm font-semibold truncate ${active ? 'text-[#DDE6F0]' : 'text-[#7E91A8]'}`}>{o.name}</div>
+                      <div className={`text-sm font-semibold truncate ${active ? 'text-ink' : 'text-ink-2'}`}>{o.name}</div>
                       <div className="flex items-center gap-1.5 mt-0.5">
-                        <span className="text-[10px] text-[#3D5068] font-mono truncate">{o.slug}</span>
+                        <span className="text-[10px] text-ink-3 font-mono truncate">{o.slug}</span>
                         {o.my_role && <RoleBadge role={o.my_role} />}
                       </div>
                     </button>
@@ -246,50 +246,50 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
   }
 
   return (
-    <div className="rounded-2xl p-5" style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+    <div className="rounded-2xl p-5" style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
       <div className="flex items-center gap-3 mb-4">
         {renaming ? (
           <div className="flex items-center gap-2 flex-1">
             <input autoFocus value={name} onChange={e => setName(e.target.value)} className={`${fieldCls} flex-1`} />
-            <button onClick={rename} disabled={busy || !name.trim()} className="p-1.5 text-[#10B981] hover:bg-[#172540] rounded-lg cursor-pointer disabled:opacity-50" title="Save">
+            <button onClick={rename} disabled={busy || !name.trim()} className="p-1.5 text-success hover:bg-surface-3 rounded-lg cursor-pointer disabled:opacity-50" title="Save">
               <Check size={14} />
             </button>
-            <button onClick={() => { setRenaming(false); setName(org.name) }} className="p-1.5 text-[#7E91A8] hover:bg-[#172540] rounded-lg cursor-pointer" title="Cancel">
+            <button onClick={() => { setRenaming(false); setName(org.name) }} className="p-1.5 text-ink-2 hover:bg-surface-3 rounded-lg cursor-pointer" title="Cancel">
               <X size={14} />
             </button>
           </div>
         ) : (
           <>
             <div className="min-w-0 flex-1">
-              <h2 className="text-base font-bold text-[#DDE6F0] truncate">{org.name}</h2>
-              <p className="text-xs text-[#3D5068] font-mono">{org.slug}</p>
+              <h2 className="text-base font-bold text-ink truncate">{org.name}</h2>
+              <p className="text-xs text-ink-3 font-mono">{org.slug}</p>
             </div>
             <Link to={`/orgs/${org.id}/kb`} title="The org's knowledge base: brand, process, standards"
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-[#818CF8] hover:bg-[#172540] transition-colors">
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-link hover:bg-surface-3 transition-colors">
               <BookOpen size={12} />Org KB
             </Link>
             {canManage && (
-              <button onClick={() => setRenaming(true)} className="p-1.5 text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#172540] rounded-lg cursor-pointer" title="Rename org">
+              <button onClick={() => setRenaming(true)} className="p-1.5 text-ink-2 hover:text-ink hover:bg-surface-3 rounded-lg cursor-pointer" title="Rename org">
                 <Pencil size={13} />
               </button>
             )}
             {canGrantOwner && (
-              <button onClick={() => { setError(null); setConfirmDelete(true) }} className="p-1.5 text-[#7E91A8] hover:text-[#F87171] hover:bg-[#EF4444]/10 rounded-lg cursor-pointer" title="Delete org">
+              <button onClick={() => { setError(null); setConfirmDelete(true) }} className="p-1.5 text-ink-2 hover:text-danger-ink hover:bg-danger/10 rounded-lg cursor-pointer" title="Delete org">
                 <Trash2 size={13} />
               </button>
             )}
           </>
         )}
       </div>
-      {error && !confirmDelete && <p className="text-xs text-[#F87171] mb-3">{error}</p>}
+      {error && !confirmDelete && <p className="text-xs text-danger-ink mb-3">{error}</p>}
 
-      <div className="flex border-b border-[#1E2C45] mb-5">
+      <div className="flex border-b border-line mb-5">
         {(canManage ? ['members', 'teams', 'invites', 'webhooks', 'audit'] as const : ['members', 'teams', 'invites'] as const).map(t => (
           <button
             key={t}
             onClick={() => setTab(t)}
             className={`px-4 py-2.5 text-xs font-semibold capitalize transition-all border-b-2 -mb-px cursor-pointer ${
-              tab === t ? 'border-[#6366F1] text-[#818CF8]' : 'border-transparent text-[#7E91A8] hover:text-[#DDE6F0]'
+              tab === t ? 'border-primary text-link' : 'border-transparent text-ink-2 hover:text-ink'
             }`}
           >
             {t === 'invites' ? 'Pending invites' : t === 'audit' ? 'Audit log' : t}
@@ -302,7 +302,7 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {tab === 'invites' && <OrgInvites org={org} canManage={canManage} />}
       {tab === 'webhooks' && (
         <div className="space-y-3">
-          <p className="text-xs text-[#7E91A8] leading-relaxed">
+          <p className="text-xs text-ink-2 leading-relaxed">
             Org webhooks fire for every project in {org.name}. Pick "Audit log entries" to stream membership, access, and deletion changes to a SIEM or a Slack channel.
           </p>
           <WebhooksPanel orgId={org.id} canManage={canManage} />
@@ -378,7 +378,7 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
             <option value="admin">Admin</option>
             {canGrantOwner && <option value="owner">Owner</option>}
           </select>
-          <button type="submit" disabled={adding} className={primaryBtnCls} style={{ background: '#6366F1' }}>
+          <button type="submit" disabled={adding} className={primaryBtnCls} style={{ background: 'var(--primary)' }}>
             {adding ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}
             Add
           </button>
@@ -387,12 +387,12 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
       <Notice error={error} info={info} />
 
       {loading ? (
-        <Loader2 size={18} className="text-[#6366F1] animate-spin mt-3" />
+        <Loader2 size={18} className="text-primary animate-spin mt-3" />
       ) : (
-        <div className="rounded-xl border border-[#1E2C45] overflow-hidden mt-3">
+        <div className="rounded-xl border border-line overflow-hidden mt-3">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-[#3D5068] text-xs" style={{ background: '#08101F' }}>
+              <tr className="text-left text-ink-3 text-xs" style={{ background: 'var(--bg)' }}>
                 <th className="px-4 py-2 font-semibold">Email</th>
                 <th className="px-4 py-2 font-semibold">Name</th>
                 <th className="px-4 py-2 font-semibold w-32">Role</th>
@@ -404,14 +404,14 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
                 // Only owners may grant or take away the owner role.
                 const editable = canManage && (canGrantOwner || m.role !== 'owner')
                 return (
-                  <tr key={m.user_id} className="border-t border-[#1E2C45]">
-                    <td className="px-4 py-2 text-[#DDE6F0]">
+                  <tr key={m.user_id} className="border-t border-line">
+                    <td className="px-4 py-2 text-ink">
                       <span className="flex items-center gap-1.5 flex-wrap">
-                        <span>{m.email}{m.user_id === meId && <span className="text-[#3D5068]"> (you)</span>}</span>
+                        <span>{m.email}{m.user_id === meId && <span className="text-ink-3"> (you)</span>}</span>
                         <AccountBadges kind={m.kind} disabled={m.disabled} />
                       </span>
                     </td>
-                    <td className="px-4 py-2 text-[#7E91A8]">{m.display_name || '—'}</td>
+                    <td className="px-4 py-2 text-ink-2">{m.display_name || '—'}</td>
                     <td className="px-4 py-2">
                       {editable ? (
                         <select
@@ -446,7 +446,7 @@ function OrgMembers({ org, canManage, canGrantOwner, meId }: { org: Org; canMana
                 )
               })}
               {members.length === 0 && (
-                <tr><td colSpan={4} className="px-4 py-6 text-center text-[#3D5068] text-sm">No members</td></tr>
+                <tr><td colSpan={4} className="px-4 py-6 text-center text-ink-3 text-sm">No members</td></tr>
               )}
             </tbody>
           </table>
@@ -495,7 +495,7 @@ function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId
       {canManage && (
         <form onSubmit={handleCreate} className="flex items-start gap-2 mb-4">
           <input required placeholder="New team name" value={newName} onChange={e => setNewName(e.target.value)} className={`${fieldCls} flex-1`} />
-          <button type="submit" disabled={creating || !newName.trim()} className={primaryBtnCls} style={{ background: '#6366F1' }}>
+          <button type="submit" disabled={creating || !newName.trim()} className={primaryBtnCls} style={{ background: 'var(--primary)' }}>
             {creating ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
             Create team
           </button>
@@ -504,10 +504,10 @@ function OrgTeams({ org, canManage, meId }: { org: Org; canManage: boolean; meId
       <Notice error={error} />
 
       {loading ? (
-        <Loader2 size={18} className="text-[#6366F1] animate-spin mt-3" />
+        <Loader2 size={18} className="text-primary animate-spin mt-3" />
       ) : (
-        <div className="rounded-xl border border-[#1E2C45] overflow-hidden mt-3">
-          {teams.length === 0 && <div className="px-4 py-6 text-center text-[#3D5068] text-sm">No teams yet</div>}
+        <div className="rounded-xl border border-line overflow-hidden mt-3">
+          {teams.length === 0 && <div className="px-4 py-6 text-center text-ink-3 text-sm">No teams yet</div>}
           {teams.map((t, i) => (
             <TeamRow
               key={t.id}
@@ -556,33 +556,33 @@ function TeamRow({ team, first, canManageOrg, meId, expanded, onToggle, onChange
   }
 
   return (
-    <div className={first ? '' : 'border-t border-[#1E2C45]'}>
+    <div className={first ? '' : 'border-t border-line'}>
       <div className="flex items-center gap-2 px-4 py-2.5">
         <button onClick={onToggle} className="flex items-center gap-2 flex-1 min-w-0 text-left cursor-pointer">
-          <span className="text-[#3D5068]">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
-          <Users size={13} className="text-[#3D5068] flex-shrink-0" />
-          {!renaming && <span className="text-sm text-[#DDE6F0] truncate">{team.name}</span>}
+          <span className="text-ink-3">{expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}</span>
+          <Users size={13} className="text-ink-3 flex-shrink-0" />
+          {!renaming && <span className="text-sm text-ink truncate">{team.name}</span>}
         </button>
         {!renaming && (
           <Link to={`/teams/${team.id}/kb`} title="The team's knowledge base (team members only)"
-            className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-[#7E91A8] hover:text-[#818CF8] hover:bg-[#172540] transition-colors">
+            className="flex items-center gap-1 px-2 py-1 rounded-lg text-xs text-ink-2 hover:text-link hover:bg-surface-3 transition-colors">
             <BookOpen size={12} />KB
           </Link>
         )}
         {renaming ? (
           <div className="flex items-center gap-1.5">
             <input autoFocus value={name} onChange={e => setName(e.target.value)} className={`${fieldCls} py-1`} />
-            <button onClick={rename} disabled={busy || !name.trim()} className="p-1 text-[#10B981] cursor-pointer disabled:opacity-50" title="Save"><Check size={13} /></button>
-            <button onClick={() => { setRenaming(false); setName(team.name) }} className="p-1 text-[#7E91A8] cursor-pointer" title="Cancel"><X size={13} /></button>
+            <button onClick={rename} disabled={busy || !name.trim()} className="p-1 text-success cursor-pointer disabled:opacity-50" title="Save"><Check size={13} /></button>
+            <button onClick={() => { setRenaming(false); setName(team.name) }} className="p-1 text-ink-2 cursor-pointer" title="Cancel"><X size={13} /></button>
           </div>
         ) : canManageOrg && (
           <>
-            <button onClick={() => setRenaming(true)} className="p-1 text-[#7E91A8] hover:text-[#DDE6F0] cursor-pointer" title="Rename team"><Pencil size={12} /></button>
+            <button onClick={() => setRenaming(true)} className="p-1 text-ink-2 hover:text-ink cursor-pointer" title="Rename team"><Pencil size={12} /></button>
             <button onClick={() => { setError(null); setConfirmDelete(true) }} className={`p-1 ${iconBtnCls}`} title="Delete team"><Trash2 size={13} /></button>
           </>
         )}
       </div>
-      {error && !confirmDelete && <p className="text-xs text-[#F87171] px-4 pb-2">{error}</p>}
+      {error && !confirmDelete && <p className="text-xs text-danger-ink px-4 pb-2">{error}</p>}
       {expanded && <TeamMembers teamId={team.id} canManageOrg={canManageOrg} meId={meId} />}
       {confirmDelete && (
         <ConfirmDeleteModal
@@ -645,17 +645,17 @@ function TeamMembers({ teamId, canManageOrg, meId }: { teamId: number; canManage
   }
 
   return (
-    <div className="px-4 pb-4 pl-10 space-y-3" style={{ background: 'rgba(8,16,31,0.4)' }}>
+    <div className="px-4 pb-4 pl-10 space-y-3" style={{ background: 'color-mix(in srgb, var(--ink) 20%, transparent)' }}>
       {loading ? (
-        <Loader2 size={16} className="text-[#6366F1] animate-spin" />
+        <Loader2 size={16} className="text-primary animate-spin" />
       ) : (
         <>
           <div className="space-y-1 pt-2">
-            {members.length === 0 && <p className="text-xs text-[#3D5068]">No members</p>}
+            {members.length === 0 && <p className="text-xs text-ink-3">No members</p>}
             {members.map(m => (
               <div key={m.user_id} className="flex items-center gap-3 py-1">
-                <span className="text-sm text-[#DDE6F0] flex-1 truncate" title={m.email}>
-                  {personName(m)} <span className="text-xs text-[#3D5068]">{m.email}{m.user_id === meId ? ' (you)' : ''}</span>
+                <span className="text-sm text-ink flex-1 truncate" title={m.email}>
+                  {personName(m)} <span className="text-xs text-ink-3">{m.email}{m.user_id === meId ? ' (you)' : ''}</span>
                   {' '}<AccountBadges kind={m.kind} disabled={m.disabled} />
                 </span>
                 {canManage ? (
@@ -691,7 +691,7 @@ function TeamMembers({ teamId, canManageOrg, meId }: { teamId: number; canManage
                 <option value="member">Member</option>
                 <option value="lead">Lead</option>
               </select>
-              <button type="submit" disabled={adding} className={`${primaryBtnCls} py-1.5`} style={{ background: '#6366F1' }}>
+              <button type="submit" disabled={adding} className={`${primaryBtnCls} py-1.5`} style={{ background: 'var(--primary)' }}>
                 {adding ? <Loader2 size={13} className="animate-spin" /> : <UserPlus size={13} />}
                 Add
               </button>
@@ -733,17 +733,17 @@ function OrgInvites({ org, canManage }: { org: Org; canManage: boolean }) {
 
   return (
     <div>
-      <p className="text-xs text-[#3D5068] mb-3">
+      <p className="text-xs text-ink-3 mb-3">
         Invites are created when you add someone by an email that hasn't signed in yet. They're accepted automatically on first sign-in.
       </p>
       <Notice error={error} />
       {loading ? (
-        <Loader2 size={18} className="text-[#6366F1] animate-spin mt-3" />
+        <Loader2 size={18} className="text-primary animate-spin mt-3" />
       ) : (
-        <div className="rounded-xl border border-[#1E2C45] overflow-hidden mt-3">
+        <div className="rounded-xl border border-line overflow-hidden mt-3">
           <table className="w-full text-sm">
             <thead>
-              <tr className="text-left text-[#3D5068] text-xs" style={{ background: '#08101F' }}>
+              <tr className="text-left text-ink-3 text-xs" style={{ background: 'var(--bg)' }}>
                 <th className="px-4 py-2 font-semibold">Email</th>
                 <th className="px-4 py-2 font-semibold">Org role</th>
                 <th className="px-4 py-2 font-semibold">Team</th>
@@ -753,15 +753,15 @@ function OrgInvites({ org, canManage }: { org: Org; canManage: boolean }) {
             </thead>
             <tbody>
               {invites.map(inv => (
-                <tr key={inv.id} className="border-t border-[#1E2C45]">
-                  <td className="px-4 py-2 text-[#DDE6F0]">
-                    <span className="flex items-center gap-1.5"><Mail size={12} className="text-[#3D5068]" />{inv.email}</span>
+                <tr key={inv.id} className="border-t border-line">
+                  <td className="px-4 py-2 text-ink">
+                    <span className="flex items-center gap-1.5"><Mail size={12} className="text-ink-3" />{inv.email}</span>
                   </td>
                   <td className="px-4 py-2"><RoleBadge role={inv.org_role} /></td>
-                  <td className="px-4 py-2 text-[#7E91A8] text-xs">
-                    {teamName(inv.team_id) ? <>{teamName(inv.team_id)} <span className="text-[#3D5068]">({inv.team_role})</span></> : '—'}
+                  <td className="px-4 py-2 text-ink-2 text-xs">
+                    {teamName(inv.team_id) ? <>{teamName(inv.team_id)} <span className="text-ink-3">({inv.team_role})</span></> : '—'}
                   </td>
-                  <td className="px-4 py-2 text-[#3D5068] text-xs">{new Date(inv.created_at).toLocaleDateString()}</td>
+                  <td className="px-4 py-2 text-ink-3 text-xs">{new Date(inv.created_at).toLocaleDateString()}</td>
                   {canManage && (
                     <td className="px-4 py-2">
                       <button onClick={() => revoke(inv.id)} disabled={busyId === inv.id} title="Revoke invite" className={iconBtnCls}>
@@ -772,7 +772,7 @@ function OrgInvites({ org, canManage }: { org: Org; canManage: boolean }) {
                 </tr>
               ))}
               {invites.length === 0 && (
-                <tr><td colSpan={5} className="px-4 py-6 text-center text-[#3D5068] text-sm">No pending invites</td></tr>
+                <tr><td colSpan={5} className="px-4 py-6 text-center text-ink-3 text-sm">No pending invites</td></tr>
               )}
             </tbody>
           </table>

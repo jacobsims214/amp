@@ -14,9 +14,9 @@ import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
 
 function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
   return (
-    <section className="rounded-2xl p-5" style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
-      <h2 className="text-sm font-bold text-[#DDE6F0]">{title}</h2>
-      {description && <p className="text-xs text-[#7E91A8] mt-1 mb-4 leading-relaxed">{description}</p>}
+    <section className="rounded-2xl p-5" style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
+      <h2 className="text-sm font-bold text-ink">{title}</h2>
+      {description && <p className="text-xs text-ink-2 mt-1 mb-4 leading-relaxed">{description}</p>}
       {!description && <div className="mb-4" />}
       {children}
     </section>
@@ -94,22 +94,22 @@ export function ProjectSettings() {
   }
 
   return (
-    <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
+    <div className="flex flex-col h-full" style={{ background: 'var(--bg)' }}>
       <ProjectNav projectId={pid} currentView="settings" project={project} />
       <div className="flex-1 overflow-y-auto">
         <div className="max-w-2xl mx-auto px-4 py-8 space-y-5">
           <div>
-            <h1 className="text-xl font-bold text-[#DDE6F0] tracking-tight">Project settings</h1>
+            <h1 className="text-xl font-bold text-ink tracking-tight">Project settings</h1>
             {!canManage && myAccess && (
-              <p className="text-xs text-[#7E91A8] mt-1 flex items-center gap-1.5">
+              <p className="text-xs text-ink-2 mt-1 flex items-center gap-1.5">
                 <Lock size={11} />Only project owners and org admins can change these settings.
               </p>
             )}
           </div>
-          {error && <p className="text-xs text-[#F87171]">{error}</p>}
+          {error && <p className="text-xs text-danger-ink">{error}</p>}
 
           {!project ? (
-            <div className="flex justify-center py-10"><Loader2 size={18} className="text-[#6366F1] animate-spin" /></div>
+            <div className="flex justify-center py-10"><Loader2 size={18} className="text-primary animate-spin" /></div>
           ) : (
             <>
               <Section title="General">
@@ -123,19 +123,19 @@ export function ProjectSettings() {
                     <textarea value={description} onChange={e => { setDescription(e.target.value); setSaved(false) }} disabled={!canManage} rows={3}
                       className={`${inputCls} resize-none`} />
                   </div>
-                  <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-[#7E91A8]">
-                    <span>Code <span className="font-mono text-[#DDE6F0]">{project.code}</span></span>
-                    {org && <span>Org <span className="text-[#DDE6F0]">{org.name}</span></span>}
-                    <span>State <span className="text-[#DDE6F0] capitalize">{project.state}</span></span>
+                  <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-ink-2">
+                    <span>Code <span className="font-mono text-ink">{project.code}</span></span>
+                    {org && <span>Org <span className="text-ink">{org.name}</span></span>}
+                    <span>State <span className="text-ink capitalize">{project.state}</span></span>
                   </div>
                   {canManage && (
                     <div className="flex items-center gap-3">
                       <button onClick={save} disabled={!dirty || saving || !name.trim()}
-                        className="flex items-center gap-1.5 px-3 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                        className="flex items-center gap-1.5 px-3 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
                         {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
                         Save
                       </button>
-                      {saved && !dirty && <span className="text-xs text-[#34D399]">Saved</span>}
+                      {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
                     </div>
                   )}
                 </div>
@@ -148,11 +148,11 @@ export function ProjectSettings() {
                 {canManage && (
                   <div className="flex items-center gap-3 mt-3">
                     <button onClick={saveMeta} disabled={!metaPatch || !!meta?.error || metaSaving}
-                      className="flex items-center gap-1.5 px-3 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                      className="flex items-center gap-1.5 px-3 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
                       {metaSaving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
                       Save fields
                     </button>
-                    {metaSaved && !metaPatch && <span className="text-xs text-[#34D399]">Saved</span>}
+                    {metaSaved && !metaPatch && <span className="text-xs text-success-ink">Saved</span>}
                   </div>
                 )}
               </Section>
@@ -170,19 +170,19 @@ export function ProjectSettings() {
                     const kind = s.scope === 'project' ? 'Project KB' : s.scope === 'org' ? 'Org KB' : `Team KB · ${s.team_role ?? 'member'} team`
                     const body = (
                       <>
-                        <Icon size={14} className="flex-shrink-0 text-[#818CF8]" />
+                        <Icon size={14} className="flex-shrink-0 text-link" />
                         <span className="flex-1 min-w-0">
-                          <span className="block text-sm text-[#DDE6F0] truncate">{s.scope === 'project' ? project.name : s.name}</span>
-                          <span className="block text-[11px] text-[#3D5068]">{kind}</span>
+                          <span className="block text-sm text-ink truncate">{s.scope === 'project' ? project.name : s.name}</span>
+                          <span className="block text-[11px] text-ink-3">{kind}</span>
                         </span>
                         {s.can_read
-                          ? <span className="text-xs text-[#7E91A8]">{s.docs ?? 0} doc{s.docs === 1 ? '' : 's'}</span>
-                          : <span className="flex items-center gap-1 text-[11px] text-[#3D5068]"><Lock size={10} />team members only</span>}
+                          ? <span className="text-xs text-ink-2">{s.docs ?? 0} doc{s.docs === 1 ? '' : 's'}</span>
+                          : <span className="flex items-center gap-1 text-[11px] text-ink-3"><Lock size={10} />team members only</span>}
                       </>
                     )
                     return s.can_read ? (
                       <Link key={`${s.scope}-${s.scope_id}`} to={to}
-                        className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[#172540] transition-colors">{body}</Link>
+                        className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-surface-3 transition-colors">{body}</Link>
                     ) : (
                       <div key={`${s.scope}-${s.scope_id}`} className="flex items-center gap-3 px-3 py-2.5 opacity-70">{body}</div>
                     )
@@ -212,13 +212,13 @@ export function ProjectSettings() {
                   {project.state === 'archived' ? (
                     <button onClick={() => setArchived(false)}
                       className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold cursor-pointer transition-all"
-                      style={{ border: '1px solid #283A57', color: '#DDE6F0' }}>
+                      style={{ border: '1px solid var(--line-str)', color: 'var(--ink)' }}>
                       <RotateCcw size={12} />Restore project
                     </button>
                   ) : (
                     <button onClick={() => setArchived(true)}
                       className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold cursor-pointer transition-all"
-                      style={{ border: '1px solid rgba(239,68,68,0.3)', color: '#F87171' }}>
+                      style={{ border: '1px solid color-mix(in srgb, var(--danger) 30%, transparent)', color: 'var(--danger-ink)' }}>
                       <Archive size={12} />Archive project
                     </button>
                   )}

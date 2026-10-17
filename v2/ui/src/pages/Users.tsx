@@ -123,74 +123,74 @@ export function Users() {
 
   if (authLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center" style={{ background: '#08101F' }}>
-        <Loader2 size={22} className="text-[#6366F1] animate-spin" />
+      <div className="min-h-full flex items-center justify-center" style={{ background: 'var(--bg)' }}>
+        <Loader2 size={22} className="text-primary animate-spin" />
       </div>
     )
   }
 
   if (!isAdmin) {
     return (
-      <div className="min-h-screen flex flex-col items-center justify-center gap-3" style={{ background: '#08101F' }}>
-        <ShieldOff size={28} className="text-[#3D5068]" />
-        <p className="text-sm text-[#7E91A8]">
+      <div className="min-h-full flex flex-col items-center justify-center gap-3" style={{ background: 'var(--bg)' }}>
+        <ShieldOff size={28} className="text-ink-3" />
+        <p className="text-sm text-ink-2">
           {me ? 'Your account does not have admin access.' : 'Sign in required.'}
         </p>
-        <Link to="/" className="text-xs text-[#818CF8] hover:underline">← Back to projects</Link>
+        <Link to="/" className="text-xs text-link hover:underline">← Back to projects</Link>
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen" style={{ background: '#08101F' }}>
-      <header style={{ background: '#0D1726', borderBottom: '1px solid #1E2C45' }}>
+    <div className="min-h-full" style={{ background: 'var(--bg)' }}>
+      <header style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
         <div className="max-w-4xl mx-auto px-6 py-4 flex items-center gap-3">
-          <Link to="/" className="text-[#3D5068] hover:text-[#DDE6F0] transition-colors">
+          <Link to="/" className="text-ink-3 hover:text-ink transition-colors">
             <ArrowLeft size={16} />
           </Link>
-          <ShieldCheck size={16} className="text-[#818CF8]" />
-          <h1 className="text-base font-bold text-[#DDE6F0]">Users &amp; Access</h1>
+          <ShieldCheck size={16} className="text-link" />
+          <h1 className="text-base font-bold text-ink">Users &amp; Access</h1>
         </div>
       </header>
 
       <main className="max-w-4xl mx-auto px-6 py-10 space-y-10">
         {error && (
-          <div className="rounded-xl border border-[#EF4444]/20 bg-[#EF4444]/8 px-4 py-3 text-sm text-[#F87171]">
+          <div className="rounded-xl border border-danger/20 bg-danger/8 px-4 py-3 text-sm text-danger-ink">
             {error}
           </div>
         )}
 
         {/* Create new login */}
         <section>
-          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">Add a user</h2>
+          <h2 className="text-sm font-bold text-ink mb-3">Add a user</h2>
           <form onSubmit={handleCreate} className="flex flex-wrap items-start gap-2">
             <input
               type="email" required placeholder="email@example.com" value={newEmail}
               onChange={e => setNewEmail(e.target.value)}
-              className="px-3 py-2 rounded-lg text-sm bg-[#0D1726] border border-[#1E2C45] text-[#DDE6F0] placeholder-[#3D5068] outline-none focus:border-[#6366F1]"
+              className="px-3 py-2 rounded-lg text-sm bg-surface border border-line text-ink placeholder-ink-3 outline-none focus:border-primary"
             />
             <input
               type="text" placeholder="Display name (optional)" value={newName}
               onChange={e => setNewName(e.target.value)}
-              className="px-3 py-2 rounded-lg text-sm bg-[#0D1726] border border-[#1E2C45] text-[#DDE6F0] placeholder-[#3D5068] outline-none focus:border-[#6366F1]"
+              className="px-3 py-2 rounded-lg text-sm bg-surface border border-line text-ink placeholder-ink-3 outline-none focus:border-primary"
             />
             <input
               type="password" required placeholder="Temporary password (min 8 chars)" value={newPassword}
               onChange={e => setNewPassword(e.target.value)}
               minLength={8}
-              className="px-3 py-2 rounded-lg text-sm bg-[#0D1726] border border-[#1E2C45] text-[#DDE6F0] placeholder-[#3D5068] outline-none focus:border-[#6366F1]"
+              className="px-3 py-2 rounded-lg text-sm bg-surface border border-line text-ink placeholder-ink-3 outline-none focus:border-primary"
             />
             <button
               type="submit" disabled={creating}
               className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-semibold text-white disabled:opacity-50"
-              style={{ background: '#6366F1' }}
+              style={{ background: 'var(--primary)' }}
             >
               {creating ? <Loader2 size={14} className="animate-spin" /> : <UserPlus size={14} />}
               Create
             </button>
           </form>
-          {createError && <p className="text-xs text-[#F87171] mt-2">{createError}</p>}
-          <p className="text-xs text-[#3D5068] mt-2">
+          {createError && <p className="text-xs text-danger-ink mt-2">{createError}</p>}
+          <p className="text-xs text-ink-3 mt-2">
             Credentials are stored in Dex, never in amp-api. New users get the <code>member</code> role by default —
             make them a global admin below once they've signed in at least once (most people don't need it — add them to an org and team instead).
           </p>
@@ -198,14 +198,14 @@ export function Users() {
 
         {/* Credentials table */}
         <section>
-          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">Login credentials (Dex)</h2>
+          <h2 className="text-sm font-bold text-ink mb-3">Login credentials (Dex)</h2>
           {loading ? (
-            <Loader2 size={18} className="text-[#6366F1] animate-spin" />
+            <Loader2 size={18} className="text-primary animate-spin" />
           ) : (
-            <div className="rounded-xl border border-[#1E2C45] overflow-hidden">
+            <div className="rounded-xl border border-line overflow-hidden">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="text-left text-[#3D5068] text-xs" style={{ background: '#0D1726' }}>
+                  <tr className="text-left text-ink-3 text-xs" style={{ background: 'var(--surface)' }}>
                     <th className="px-4 py-2 font-semibold">Email</th>
                     <th className="px-4 py-2 font-semibold">Username</th>
                     <th className="px-4 py-2 font-semibold w-40">Actions</th>
@@ -213,15 +213,15 @@ export function Users() {
                 </thead>
                 <tbody>
                   {credentials.map(c => (
-                    <tr key={c.email} className="border-t border-[#1E2C45]">
-                      <td className="px-4 py-2 text-[#DDE6F0]">{c.email}</td>
-                      <td className="px-4 py-2 text-[#7E91A8]">{c.username}</td>
+                    <tr key={c.email} className="border-t border-line">
+                      <td className="px-4 py-2 text-ink">{c.email}</td>
+                      <td className="px-4 py-2 text-ink-2">{c.username}</td>
                       <td className="px-4 py-2">
                         <div className="flex items-center gap-2">
                           <button
                             onClick={() => { setResetTarget(c.email); setResetPassword('') }}
                             title="Reset password"
-                            className="text-[#7E91A8] hover:text-[#818CF8]"
+                            className="text-ink-2 hover:text-link"
                           >
                             <KeyRound size={14} />
                           </button>
@@ -229,7 +229,7 @@ export function Users() {
                             onClick={() => handleDelete(c.email)}
                             disabled={busyEmail === c.email}
                             title="Remove login"
-                            className="text-[#7E91A8] hover:text-[#F87171] disabled:opacity-50"
+                            className="text-ink-2 hover:text-danger-ink disabled:opacity-50"
                           >
                             <Trash2 size={14} />
                           </button>
@@ -238,7 +238,7 @@ export function Users() {
                     </tr>
                   ))}
                   {credentials.length === 0 && (
-                    <tr><td colSpan={3} className="px-4 py-6 text-center text-[#3D5068] text-sm">No credentials yet</td></tr>
+                    <tr><td colSpan={3} className="px-4 py-6 text-center text-ink-3 text-sm">No credentials yet</td></tr>
                   )}
                 </tbody>
               </table>
@@ -247,16 +247,16 @@ export function Users() {
 
           {resetTarget && (
             <form onSubmit={handleResetSubmit} className="mt-3 flex items-center gap-2">
-              <span className="text-xs text-[#7E91A8]">Reset password for {resetTarget}:</span>
+              <span className="text-xs text-ink-2">Reset password for {resetTarget}:</span>
               <input
                 type="password" required minLength={8} placeholder="New password" value={resetPassword}
                 onChange={e => setResetPassword(e.target.value)}
-                className="px-3 py-1.5 rounded-lg text-sm bg-[#0D1726] border border-[#1E2C45] text-[#DDE6F0] outline-none focus:border-[#6366F1]"
+                className="px-3 py-1.5 rounded-lg text-sm bg-surface border border-line text-ink outline-none focus:border-primary"
               />
-              <button type="submit" className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white" style={{ background: '#6366F1' }}>
+              <button type="submit" className="px-3 py-1.5 rounded-lg text-xs font-semibold text-white" style={{ background: 'var(--primary)' }}>
                 Save
               </button>
-              <button type="button" onClick={() => setResetTarget(null)} className="text-xs text-[#3D5068] hover:text-[#7E91A8]">
+              <button type="button" onClick={() => setResetTarget(null)} className="text-xs text-ink-3 hover:text-ink-2">
                 Cancel
               </button>
             </form>
@@ -265,22 +265,22 @@ export function Users() {
 
         {/* Roles table */}
         <section>
-          <h2 className="text-sm font-bold text-[#DDE6F0] mb-3">People, agents &amp; global admins</h2>
-          <p className="text-xs text-[#3D5068] mb-3">
+          <h2 className="text-sm font-bold text-ink mb-3">People, agents &amp; global admins</h2>
+          <p className="text-xs text-ink-3 mb-3">
             People appear here the first time they sign in. A <strong>global admin</strong> manages the whole platform:
             logins on this page, creating orgs, and every org, team and project — in the UI and through their agents&apos;
             MCP admin tools. It takes effect on their next request; no re-login needed. Org and team roles are set per org
-            on the <a href="/admin/orgs" className="text-[#818CF8] hover:underline">Orgs</a> page.
+            on the <a href="/admin/orgs" className="text-link hover:underline">Orgs</a> page.
             Deactivating an account refuses everything it does (including its API tokens) without deleting its work;
-            agent accounts are created on <a href="/access" className="text-[#818CF8] hover:underline">Agents &amp; tokens</a>.
+            agent accounts are created on <a href="/access" className="text-link hover:underline">Agents &amp; tokens</a>.
           </p>
           {roleError && (
-            <p className="text-xs text-[#F87171] mb-3">{roleError}</p>
+            <p className="text-xs text-danger-ink mb-3">{roleError}</p>
           )}
-          <div className="rounded-xl border border-[#1E2C45] overflow-hidden">
+          <div className="rounded-xl border border-line overflow-hidden">
             <table className="w-full text-sm">
               <thead>
-                <tr className="text-left text-[#3D5068] text-xs" style={{ background: '#0D1726' }}>
+                <tr className="text-left text-ink-3 text-xs" style={{ background: 'var(--surface)' }}>
                   <th className="px-4 py-2 font-semibold">Email</th>
                   <th className="px-4 py-2 font-semibold">Name</th>
                   <th className="px-4 py-2 font-semibold">Access</th>
@@ -289,21 +289,21 @@ export function Users() {
               </thead>
               <tbody>
                 {ampUsers.map(u => (
-                  <tr key={u.id} className="border-t border-[#1E2C45]">
-                    <td className="px-4 py-2 text-[#DDE6F0]">
+                  <tr key={u.id} className="border-t border-line">
+                    <td className="px-4 py-2 text-ink">
                       <span className="flex items-center gap-1.5 flex-wrap">{u.email}<AccountBadges kind={u.kind} disabled={!!u.disabled_at} /></span>
                     </td>
-                    <td className="px-4 py-2 text-[#7E91A8]">{u.display_name || '—'}</td>
+                    <td className="px-4 py-2 text-ink-2">{u.display_name || '—'}</td>
                     <td className="px-4 py-2">
                       {u.roles.includes('admin') ? (
                         <span
                           className="text-[10px] font-semibold px-1.5 py-0.5 rounded-md"
-                          style={{ background: 'rgba(99,102,241,0.12)', color: '#818CF8', border: '1px solid rgba(99,102,241,0.22)' }}
+                          style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', color: 'var(--link)', border: '1px solid color-mix(in srgb, var(--link) 22%, transparent)' }}
                         >
                           global admin
                         </span>
                       ) : (
-                        <span className="text-[10px] text-[#3D5068]">member</span>
+                        <span className="text-[10px] text-ink-3">member</span>
                       )}
                     </td>
                     <td className="px-4 py-2">
@@ -312,7 +312,7 @@ export function Users() {
                           <button
                             onClick={() => toggleAdmin(u)}
                             disabled={busyEmail === u.email}
-                            className="text-xs font-semibold text-[#818CF8] hover:underline disabled:opacity-50 whitespace-nowrap"
+                            className="text-xs font-semibold text-link hover:underline disabled:opacity-50 whitespace-nowrap"
                           >
                             {u.roles.includes('admin') ? 'Revoke global admin' : 'Make global admin'}
                           </button>
@@ -322,7 +322,7 @@ export function Users() {
                             onClick={() => toggleActive(u)}
                             disabled={busyEmail === u.email}
                             title={u.disabled_at ? 'Reactivate' : 'Deactivate'}
-                            className={`flex items-center gap-1 text-xs font-semibold disabled:opacity-50 whitespace-nowrap ${u.disabled_at ? 'text-[#34D399]' : 'text-[#7E91A8] hover:text-[#F87171]'}`}
+                            className={`flex items-center gap-1 text-xs font-semibold disabled:opacity-50 whitespace-nowrap ${u.disabled_at ? 'text-success-ink' : 'text-ink-2 hover:text-danger-ink'}`}
                           >
                             <Power size={12} />{u.disabled_at ? 'Reactivate' : 'Deactivate'}
                           </button>
@@ -332,7 +332,7 @@ export function Users() {
                   </tr>
                 ))}
                 {ampUsers.length === 0 && (
-                  <tr><td colSpan={4} className="px-4 py-6 text-center text-[#3D5068] text-sm">No one has signed in yet</td></tr>
+                  <tr><td colSpan={4} className="px-4 py-6 text-center text-ink-3 text-sm">No one has signed in yet</td></tr>
                 )}
               </tbody>
             </table>
@@ -340,8 +340,8 @@ export function Users() {
         </section>
 
         <section>
-          <h2 className="text-sm font-bold text-[#DDE6F0] mb-1">Audit log</h2>
-          <p className="text-xs text-[#3D5068] mb-3">
+          <h2 className="text-sm font-bold text-ink mb-1">Audit log</h2>
+          <p className="text-xs text-ink-3 mb-3">
             Every change to access, accounts, API tokens, settings, and webhooks, and every deletion, across all orgs.
             Org admins see their org's on the Orgs page; project owners see their project's in its settings.
           </p>
