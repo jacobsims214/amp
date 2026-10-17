@@ -48,6 +48,9 @@ func (k *KB) RequireWrite() error {
 	if k.CanWrite {
 		return nil
 	}
+	if k.Kind == kb.ScopeGlobal {
+		return authz.Forbidden("the AMP guide is read-only: it ships with AMP from the kb/ folder of the AMP repo, so change it there")
+	}
 	if k.Kind == kb.ScopeOrg {
 		return authz.Forbidden("only org owners and admins can change the %s org KB; annotate the doc instead (amp_kb_annotate)", k.Name)
 	}
@@ -60,6 +63,10 @@ func (k *KB) RequireWrite() error {
 // project's org.
 func (s *Service) ResolveKB(ctx context.Context, p authz.Principal, ref KBRef) (*KB, error) {
 	kind := strings.ToLower(strings.TrimSpace(ref.Scope))
+	if kind == kb.ScopeGlobal {
+		// The AMP guide: the same for every user, holds nothing org-specific.
+		return newKB(kb.Global(), "AMP guide", true, false), nil
+	}
 	if kind == "" {
 		switch {
 		case ref.ProjectID > 0:
@@ -95,7 +102,7 @@ func (s *Service) ResolveKB(ctx context.Context, p authz.Principal, ref KBRef) (
 	case kb.ScopeTeam:
 		return s.resolveTeamKB(ctx, p, proj, ref.TeamID)
 	}
-	return nil, authz.BadRequest("scope must be project, team, or org")
+	return nil, authz.BadRequest("scope must be project, team, org, or global")
 }
 
 func (s *Service) resolveOrgKB(ctx context.Context, p authz.Principal, proj *domain.Project, orgID int) (*KB, error) {
@@ -308,5 +315,6 @@ func (s *Service) KBSources(ctx context.Context, p authz.Principal, projectID in
 			out = append(out, withDocs(*team, l.Role))
 		}
 	}
+	out = append(out, withDocs(*newKB(kb.Global(), "AMP guide", true, false), ""))
 	return out, nil
 }

@@ -10,6 +10,7 @@ import type {
 const BASE = '/api'
 
 function kbQuery(ref: KBRef): string {
+  if (ref.global) return 'scope=global'
   if (ref.team_id != null) return `team_id=${ref.team_id}`
   if (ref.org_id != null) return `org_id=${ref.org_id}`
   return `project_id=${ref.project_id}`

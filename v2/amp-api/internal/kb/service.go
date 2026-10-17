@@ -140,6 +140,9 @@ const (
 	ScopeProject = "project"
 	ScopeTeam    = "team"
 	ScopeOrg     = "org"
+	// ScopeGlobal is the AMP guide: docs shipped with AMP itself (v2/kb in
+	// the repo), readable by everyone and written only by the startup sync.
+	ScopeGlobal = "global"
 )
 
 // Scope names one knowledge base: a project's, a team's, or an org's.
@@ -151,6 +154,7 @@ type Scope struct {
 func Project(id int) Scope { return Scope{Kind: ScopeProject, ID: id} }
 func Team(id int) Scope    { return Scope{Kind: ScopeTeam, ID: id} }
 func Org(id int) Scope     { return Scope{Kind: ScopeOrg, ID: id} }
+func Global() Scope        { return Scope{Kind: ScopeGlobal} }
 
 func (sc Scope) String() string { return fmt.Sprintf("%s %d", sc.Kind, sc.ID) }
 

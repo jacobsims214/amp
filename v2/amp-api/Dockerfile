@@ -16,6 +16,8 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates && adduser -D -u 1000 amp
 WORKDIR /app
 COPY --from=builder /app/amp-api .
+# The AMP guide (global KB), synced into Typesense on startup.
+COPY kb/ /app/kb/
 RUN chown amp:amp /app/amp-api
 USER 1000
 EXPOSE 8000 3001

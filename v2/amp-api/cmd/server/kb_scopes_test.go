@@ -123,6 +123,7 @@ func TestKB_Sources(t *testing.T) {
 		{"team", "Core", "owner", false, false}, // the owner team first; alice isn't on it
 		{"team", "Devs", "member", true, true},
 		{"team", "Ops", "member", false, false},
+		{"global", "AMP guide", "", true, false}, // the AMP guide, for everyone
 	}
 	if len(got) != len(want) {
 		t.Fatalf("sources = %+v", got)

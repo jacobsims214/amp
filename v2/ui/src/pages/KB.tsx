@@ -3,7 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import {
   Plus, Search, FileText, Tag, Trash2, Edit3, Save, X,
   Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
-   Building2, Users, Lock, Info, CheckCircle2, RotateCcw,
+   Building2, Users, Lock, Info, CheckCircle2, RotateCcw, GraduationCap,
 } from 'lucide-react'
 import { Markdown } from '../components/ui/Markdown'
 import { api } from '../api/client'
@@ -16,6 +16,7 @@ const SCOPE_PURPOSE: Record<KBScope, string> = {
   project: "This project's architecture, decisions, and gotchas.",
   team: 'Knowledge for every project this team works on: runbooks, services the team owns, team conventions.',
   org: 'Knowledge for the whole org: brand and design system, process, standards, policy.',
+  global: 'How to use AMP, shipped with AMP and the same for everyone. Ask your agent to walk you through it: it reads this guide with amp_guide.',
 }
 
 type View = 'browse' | 'doc' | 'editor'
@@ -32,12 +33,14 @@ function readingTime(content: string) {
 
 const inputCls = 'amp-input'
 
-// One page for every knowledge base: /project/:projectId/kb, /teams/:teamId/kb, /orgs/:orgId/kb.
+// One page for every knowledge base: /project/:projectId/kb, /teams/:teamId/kb, /orgs/:orgId/kb,
+// and /guide (the AMP guide).
 export function KB() {
   const { projectId, teamId, orgId } = useParams<{ projectId?: string; teamId?: string; orgId?: string }>()
   const pid = projectId ? Number(projectId) : null
   const kbRef: KBRef = useMemo(
-    () => teamId ? { team_id: Number(teamId) } : orgId ? { org_id: Number(orgId) } : { project_id: Number(projectId) },
+    () => teamId ? { team_id: Number(teamId) } : orgId ? { org_id: Number(orgId) }
+      : projectId ? { project_id: Number(projectId) } : { global: true },
     [projectId, teamId, orgId],
   )
   const [info, setInfo] = useState<KBInfo | null>(null)
@@ -188,7 +191,7 @@ export function KB() {
     </button>
   ) : info ? (
     <span className="flex items-center gap-1.5 text-xs text-ink-2" title={info.scope === 'org' ? 'Only org owners and admins edit the org KB; you can annotate.' : undefined}>
-      <Lock size={11} />Read-only{info.scope === 'org' ? ' · you can annotate' : ''}
+      <Lock size={11} />Read-only{info.scope === 'org' ? ' · you can annotate' : info.scope === 'global' ? ' · changes go through the AMP repo' : ''}
     </span>
   ) : null
 
@@ -316,7 +319,7 @@ export function KB() {
                 node={tree} depth={0}
                 expanded={expandedDirs}
                 onToggleDir={(dir) => setExpandedDirs(prev => {
-                  const s = new Set(prev); s.has(dir) ? s.delete(dir) : s.add(dir); return s
+                  const s = new Set(prev); if (s.has(dir)) s.delete(dir); else s.add(dir); return s
                 })}
                 onSelectDoc={openDoc}
                 selectedPath={selectedDoc?.path}
@@ -339,7 +342,7 @@ export function KB() {
                   style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
                   <Info size={13} className="text-ink-2 mt-0.5 flex-shrink-0" />
                   <p className="text-xs text-ink-2 leading-relaxed">
-                    {SCOPE_PURPOSE[info.scope]} Anything specific to one project belongs in that project's KB.
+                    {SCOPE_PURPOSE[info.scope]}{info.scope !== 'global' && " Anything specific to one project belongs in that project's KB."}
                   </p>
                 </div>
               )}
@@ -369,7 +372,8 @@ export function KB() {
 function ScopeHeader({ info, rightSlot }: { info: KBInfo | null; rightSlot?: React.ReactNode }) {
   return (
     <PageHeader
-      crumb={<Link to="/admin/orgs" className="hover:text-ink">{info?.scope === 'org' ? 'Org knowledge base' : info?.scope === 'team' ? 'Team knowledge base' : 'Knowledge base'}</Link>}
+      crumb={info?.scope === 'global' ? <span>Shipped with AMP</span>
+        : <Link to="/admin/orgs" className="hover:text-ink">{info?.scope === 'org' ? 'Org knowledge base' : info?.scope === 'team' ? 'Team knowledge base' : 'Knowledge base'}</Link>}
       title={info?.name ?? 'Knowledge base'}
       actions={rightSlot}
     />
@@ -388,7 +392,7 @@ function OtherKBs({ projectId }: { projectId: number }) {
       <div className="text-[10px] font-bold text-ink-3 uppercase tracking-widest mb-2">Shared knowledge</div>
       <div className="space-y-0.5">
         {sources.map(s => {
-          const Icon = s.scope === 'org' ? Building2 : Users
+          const Icon = s.scope === 'org' ? Building2 : s.scope === 'global' ? GraduationCap : Users
           const label = (
             <>
               <Icon size={12} className="flex-shrink-0" />
@@ -398,7 +402,7 @@ function OtherKBs({ projectId }: { projectId: number }) {
             </>
           )
           return s.can_read ? (
-            <Link key={`${s.scope}-${s.scope_id}`} to={s.scope === 'org' ? `/orgs/${s.scope_id}/kb` : `/teams/${s.scope_id}/kb`}
+            <Link key={`${s.scope}-${s.scope_id}`} to={s.scope === 'org' ? `/orgs/${s.scope_id}/kb` : s.scope === 'global' ? '/guide' : `/teams/${s.scope_id}/kb`}
               className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-ink-2 hover:text-ink hover:bg-surface-3 transition-colors">
               {label}
             </Link>
@@ -789,8 +793,8 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
         <Markdown>{doc.content}</Markdown>
       </div>
 
-      {/* Annotations Panel */}
-      <div className="mt-8 pt-6 border-t border-line-sub">
+      {/* Annotations Panel (none on the AMP guide: it changes through the repo) */}
+      {!kbRef.global && <div className="mt-8 pt-6 border-t border-line-sub">
         <button
           onClick={() => setAnnExpanded(!annExpanded)}
           className="flex items-center gap-2 text-xs font-semibold text-ink-2 hover:text-ink transition-colors mb-4"
@@ -892,7 +896,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
             </div>
           </div>
         )}
-      </div>
+      </div>}
     </div>
   )
 }

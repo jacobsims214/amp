@@ -230,6 +230,14 @@ func main() {
 		slog.Warn("REDIS_ADDR not set — KB writes/deletes will run synchronously (fine for local dev, not recommended under real load)")
 	}
 
+	// ---- 4c. AMP guide (the global KB) ----
+	// The image ships the repo's kb/ folder; every replica syncs it into the
+	// global KB in the background (idempotent upserts), so a new image
+	// brings its guide with it. See internal/kb/global.go.
+	if os.Getenv("AMP_GLOBAL_KB_SYNC") != "off" {
+		go kbSvc.SyncGlobalWithRetry(ctx, envOrDefault("AMP_GLOBAL_KB_DIR", "/app/kb"))
+	}
+
 	// ---- 5. MCP server (port 8000) ----
 	// Streamable HTTP, dual-era: requests carrying 2026-07-28 per-request
 	// _meta are served statelessly; legacy clients that open with

@@ -1623,6 +1623,12 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if k.Kind == kb.ScopeGlobal && r.Method != http.MethodGet {
+		// The AMP guide changes only through the repo, and an annotation
+		// on it would be visible to every org.
+		fail(w, k.RequireWrite(), 403)
+		return
+	}
 	if action == "info" {
 		jsonOK(w, k)
 		return

@@ -59,6 +59,12 @@ call. Run `amp_check_plan` before you present the plan or dispatch anything. Whe
 wrong, fix it in place — `amp_set_task_dependencies`, `amp_update_task`, `amp_move_task`,
 `amp_move_story` — never by deleting and re-creating tickets. See the `amp-planning` skill.
 
+## Teaching your user AMP
+
+If your user is new to AMP, asks how something in AMP works, or asks what they can do with it,
+call `amp_guide` (no topic gives the onboarding script) and teach them by doing it with them in
+their real projects. Look a feature up with `amp_guide(topic=…)` before saying AMP can't do it.
+
 ## Tech documentation strategy
 
 Context7 MCP server is available for tech documentation queries. Use this hierarchy:

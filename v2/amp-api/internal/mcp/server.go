@@ -23,9 +23,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -74,6 +76,17 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Who you are acting as in AMP: your user, your orgs and your teams. Tickets you create are yours by default; "+
 			"amp_list_tasks shows your own work unless you pass owner.",
 		props{}), wrap(ctx, s.open(s.whoami)))
+
+	mcp.AddTool(tool("amp_guide",
+		"The AMP guide: how to use AMP itself, shipped with AMP and the same for everyone. Call it with no topic when "+
+			"your user is new to AMP, asks how AMP works or what to do next, or wants to be onboarded: it returns the "+
+			"onboarding script (start-here) and the list of guide pages, and you then walk your user through AMP step by "+
+			"step, showing them in their own projects rather than reciting. Call it with a topic (a question, a feature "+
+			"name like 'handover' or 'plan approval', or a page path) to look something up: it returns the best page in "+
+			"full plus other matches. Also call it before telling a user AMP can't do something. Read-only.",
+		props{
+			"topic": str("Optional. A question, feature or page path (e.g. 'how do I hand tickets over', 'traceability', 'running-work.md'). Omit for the onboarding script and the page index."),
+		}), wrap(ctx, s.open(s.guide)))
 
 	mcp.AddTool(tool("amp_audit_log",
 		"Read the audit log: who changed access (org, team, project links, roles, accounts, API tokens), settings, or "+
@@ -625,7 +638,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	kbArgs := func(extra props) props {
 		p := props{
 			"project_id": num("The project you're working in. Required for the project KB (the default); with scope 'team' or 'org' it selects that project's team or org."),
-			"scope":      str("Optional. Which knowledge base: 'project' (default), 'team', or 'org'. Use 'team'/'org' only for knowledge shared beyond one project; see amp_kb_sources."),
+			"scope":      str("Optional. Which knowledge base: 'project' (default), 'team', or 'org'. Use 'team'/'org' only for knowledge shared beyond one project; see amp_kb_sources. 'global' is the read-only AMP guide (how to use AMP itself; see amp_guide)."),
 			"team_id":    num("Optional, scope 'team': which team, when the project has several of yours (or there is no project_id)."),
 			"org_id":     num("Optional, scope 'org' without a project_id: which org."),
 		}
@@ -2212,6 +2225,10 @@ func (s *Server) kbOf(ctx context.Context, args map[string]interface{}, use kbUs
 	if err != nil {
 		return nil, err
 	}
+	if use != kbRead && k.Kind == kb.ScopeGlobal {
+		// Annotations would be seen by every org, so the guide takes none.
+		return nil, k.RequireWrite()
+	}
 	if use == kbChange {
 		if err := k.RequireWrite(); err != nil {
 			return nil, err
@@ -3027,4 +3044,157 @@ func optIntSlice(args map[string]interface{}, key string) []int {
 		}
 	}
 	return out
+}
+
+// guideStart is the guide page amp_guide returns with no topic.
+const guideStart = "start-here.md"
+
+func (s *Server) guide(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	sc := kb.Global()
+	docs, err := s.kb.ListDocs(ctx, sc, "")
+	if err != nil {
+		return nil, err
+	}
+	if len(docs) == 0 {
+		return nil, fmt.Errorf("the AMP guide isn't loaded yet (it syncs in the background after AMP starts); try again shortly")
+	}
+	sort.Slice(docs, func(i, j int) bool { return docs[i].Path < docs[j].Path })
+	pages := make([]map[string]interface{}, 0, len(docs))
+	for _, d := range docs {
+		pages = append(pages, map[string]interface{}{"path": d.Path, "title": d.Title, "tags": d.Tags})
+	}
+	page := func(path string) (map[string]interface{}, error) {
+		doc, err := s.kb.GetDoc(ctx, sc, path)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"path": doc.Path, "title": doc.Title, "content": doc.Content, "pages": pages,
+			"next": "Teach from this page in your own words and show it in your user's real projects. " +
+				"For another page call amp_guide with its path.",
+		}, nil
+	}
+
+	topic := strings.TrimSpace(optStr(args, "topic", ""))
+	match := ""
+	switch {
+	case topic == "":
+		match = guideStart
+	default:
+		for _, d := range docs {
+			if d.Path == topic || d.Path == topic+".md" || strings.EqualFold(d.Title, topic) {
+				match = d.Path
+				break
+			}
+		}
+	}
+	if match != "" {
+		out, err := page(match)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(out)
+	}
+
+	hits, err := s.kb.Search(ctx, sc, topic, nil, 8, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Rank every page: first by how many of the topic's words its title and
+	// tags name (so a page about the topic beats one that mentions it, and
+	// start-here mentions everything), then by search order. Pages neither
+	// named nor found are left out.
+	pos := map[string]int{}
+	excerpt := map[string]string{}
+	for i, h := range hits {
+		if _, ok := pos[h.Path]; !ok {
+			pos[h.Path], excerpt[h.Path] = i, h.Excerpt
+		}
+	}
+	words := guideWords(topic)
+	type cand struct {
+		doc   kb.DocSummary
+		score int
+		pos   int
+	}
+	var ranked []cand
+	for _, d := range docs {
+		c := cand{doc: d, score: guideMatch(words, d.Title, d.Tags), pos: len(hits)}
+		if p, ok := pos[d.Path]; ok {
+			c.pos = p
+		}
+		if c.score > 0 || c.pos < len(hits) {
+			ranked = append(ranked, c)
+		}
+	}
+	if len(ranked) == 0 {
+		return jsonResult(map[string]interface{}{
+			"found": false, "pages": pages,
+			"next": "No guide page matches; pick one from pages, or tell your user the guide doesn't cover it rather than guessing how AMP works.",
+		})
+	}
+	sort.SliceStable(ranked, func(i, j int) bool {
+		if ranked[i].score != ranked[j].score {
+			return ranked[i].score > ranked[j].score
+		}
+		return ranked[i].pos < ranked[j].pos
+	})
+	out, err := page(ranked[0].doc.Path)
+	if err != nil {
+		return nil, err
+	}
+	also := []map[string]string{}
+	for _, c := range ranked[1:] {
+		if len(also) == 3 {
+			break
+		}
+		also = append(also, map[string]string{"path": c.doc.Path, "title": c.doc.Title, "excerpt": excerpt[c.doc.Path]})
+	}
+	out["also"] = also
+	return jsonResult(out)
+}
+
+// guideWords are a topic's content words, lowercased.
+func guideWords(topic string) []string {
+	var out []string
+	for _, w := range strings.FieldsFunc(strings.ToLower(topic), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if len(w) >= 4 && !guideStopWords[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+var guideStopWords = map[string]bool{"what": true, "when": true, "with": true, "does": true, "have": true,
+	"that": true, "this": true, "from": true, "into": true, "about": true, "their": true, "there": true,
+	"should": true, "would": true, "could": true, "seems": true, "someone": true, "something": true}
+
+// guideMatch counts topic words naming the page in its title or tags,
+// matching on a shared stem (the first five letters: "capitalize" and
+// "capitalization", "hand" and "handover").
+func guideMatch(words []string, title string, tags []string) int {
+	names := guideWords(title + " " + strings.Join(tags, " "))
+	n := 0
+	for _, w := range words {
+		for _, name := range names {
+			if strings.HasPrefix(name, stem(w)) || strings.HasPrefix(w, stem(name)) {
+				n++
+				break
+			}
+		}
+	}
+	return n
+}
+
+func stem(w string) string {
+	if len(w) > 5 {
+		return w[:5]
+	}
+	return w
 }

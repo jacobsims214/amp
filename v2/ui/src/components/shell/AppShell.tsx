@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, KeyRound, PieChart, LayoutGrid, Settings, ShieldCheck,
+  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, PieChart, LayoutGrid, Settings, ShieldCheck,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -73,6 +73,7 @@ export function AppShell() {
             <span className="ml-auto amp-num text-[11px] text-ink-3">{projects.length || ''}</span></NavLink>
           <NavLink to="/reports" className={navCls}><CalendarDays size={14} />Day reports</NavLink>
           <NavLink to="/trace" className={navCls}><GitCommitHorizontal size={14} />Trace</NavLink>
+          <NavLink to="/guide" className={navCls}><GraduationCap size={14} />AMP guide</NavLink>
           {(me?.orgs?.length ?? 0) > 0 && <NavLink to="/portfolio" className={navCls}><PieChart size={14} />Portfolio</NavLink>}
           {me?.user_id != null && <NavLink to="/access" className={navCls}><KeyRound size={14} />Agents & tokens</NavLink>}
 

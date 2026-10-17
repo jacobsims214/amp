@@ -41,10 +41,10 @@ type PortfolioRow struct {
 
 // Portfolio is an org's projects (the ones the viewer can see) over a range.
 type Portfolio struct {
-	OrgID   int            `json:"org_id"`
-	Since   time.Time      `json:"since"`
-	Until   time.Time      `json:"until"`
-	SplitBy string         `json:"split_by,omitempty"`
+	OrgID   int       `json:"org_id"`
+	Since   time.Time `json:"since"`
+	Until   time.Time `json:"until"`
+	SplitBy string    `json:"split_by,omitempty"`
 	// SplitValues are the split key's values seen, most spend first.
 	SplitValues []string `json:"split_values"`
 	// ProjectKeys are metadata keys set on the projects (for columns);

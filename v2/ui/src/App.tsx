@@ -54,6 +54,7 @@ export default function App() {
             <Route path="/admin/users" element={<Users />} />
             <Route path="/admin/orgs" element={<Orgs />} />
             <Route path="/access" element={<Access />} />
+            <Route path="/guide" element={<KB />} />
             <Route path="/trace" element={<Trace />} />
             <Route path="/portfolio" element={<Portfolio />} />
             <Route path="/project/:projectId/*" element={<ProjectFallback />} />

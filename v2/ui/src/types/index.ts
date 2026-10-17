@@ -213,9 +213,11 @@ export interface KBRef {
   project_id?: number
   team_id?: number
   org_id?: number
+  /** The AMP guide: read-only docs that ship with AMP. */
+  global?: boolean
 }
 
-export type KBScope = 'project' | 'team' | 'org'
+export type KBScope = 'project' | 'team' | 'org' | 'global'
 
 /** A knowledge base and what the viewer may do in it. */
 export interface KBInfo {
