@@ -916,8 +916,21 @@ func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID 
 	if p.Agent {
 		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
 	}
-	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Lead); err != nil {
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
 		return nil, err
+	}
+	// Approval is a check by someone accountable for the work, not by whoever
+	// planned it: a lead of a team on the project, or an org owner or admin.
+	// (Every member of an owner team manages the project, so project level
+	// alone would let engineers approve their own plans.)
+	if !p.Super {
+		a, err := s.Repo.GetProjectAccess(ctx, p.UserID, projectID)
+		if err != nil {
+			return nil, err
+		}
+		if !a.Lead && a.OrgRole != domain.OrgRoleOwner && a.OrgRole != domain.OrgRoleAdmin {
+			return nil, authz.Forbidden("approving a plan takes a team lead on this project or an org owner/admin; ask your lead to approve it in Flight plan")
+		}
 	}
 	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef())
 	if err != nil {

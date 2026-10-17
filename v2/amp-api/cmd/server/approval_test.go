@@ -42,9 +42,17 @@ func TestPlanApproval(t *testing.T) {
 	root.call(t, "amp_approve_plan", map[string]any{"project_id": float64(w.s.projectID)})
 	root.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(c), "agent_id": "w"})
 
-	// Plain members can't approve; leads and owners can.
-	if code, _ := ra.do(t, "bob", http.MethodPost, fmt.Sprintf("/api/projects/%d/approve-plan", w.s.projectID), nil); code != 403 && code != 404 {
-		t.Fatalf("a member approved: %d", code)
+	// Approval is a lead's or an org admin's call. Plain members can't, and
+	// neither can members of the owner team (who manage the project but
+	// would otherwise approve their own plans).
+	path := fmt.Sprintf("/api/projects/%d/approve-plan", w.s.projectID)
+	for _, who := range []string{"bob", "owner"} {
+		if code, _ := ra.do(t, who, http.MethodPost, path, nil); code != 403 && code != 404 {
+			t.Fatalf("%s approved: %d", who, code)
+		}
+	}
+	for _, who := range []string{"lead", "orgadmin"} {
+		ra.want(t, 200, who, http.MethodPost, path, nil)
 	}
 }
 

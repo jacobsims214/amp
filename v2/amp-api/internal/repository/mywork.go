@@ -55,10 +55,12 @@ func (r *Repo) OpenTasksOwnedBy(ctx context.Context, userIDs []int, limit int) (
 }
 
 // FlaggedTasks lists tickets an agent blocked with a reason (not a schedule),
-// longest-waiting first.
-func (r *Repo) FlaggedTasks(ctx context.Context, limit int) ([]WorkTask, error) {
+// longest-waiting first, in the given projects (nil: every project). The
+// projects filter in SQL so the limit applies to what the caller can see.
+func (r *Repo) FlaggedTasks(ctx context.Context, projectIDs []int, limit int) ([]WorkTask, error) {
 	return r.workTasks(ctx, `state = 'blocked' AND block_reason <> '' AND block_reason NOT LIKE 'scheduled:%'
-		ORDER BY updated_at ASC LIMIT $1`, limit)
+		AND ($2::int[] IS NULL OR project_id = ANY($2))
+		ORDER BY updated_at ASC LIMIT $1`, limit, projectIDs)
 }
 
 // AgentWork lists what the named agents (by agent_id, or by the user that

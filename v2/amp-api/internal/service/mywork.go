@@ -50,7 +50,14 @@ func (s *Service) MyWork(ctx context.Context, p authz.Principal) (*MyWork, error
 		return nil, err
 	}
 	w.Owned = keep(w.Owned)
-	if w.Flags, err = s.Repo.FlaggedTasks(ctx, 100); err != nil {
+	var visibleIDs []int
+	if visible != nil {
+		visibleIDs = []int{}
+		for id := range visible {
+			visibleIDs = append(visibleIDs, id)
+		}
+	}
+	if w.Flags, err = s.Repo.FlaggedTasks(ctx, visibleIDs, 100); err != nil {
 		return nil, err
 	}
 	w.Flags = keep(w.Flags)
