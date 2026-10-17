@@ -6,9 +6,9 @@
  * station waits for /api/me, so the launch ends when the app is ready
  * (never more than a few seconds later).
  *
- * - Full (3.6 s): arriving from the sign-in redirect, or the first visit in
+ * - Full (6.6 s): arriving from the sign-in redirect, or the first visit in
  *   12 hours. Everything else that loads the app (a refresh, a new tab) gets
- *   the short version (1 s). Moving between pages never replays it.
+ *   the short version (2 s). Moving between pages never replays it.
  * - Any click or key skips it. With reduced motion, the logo just fades in.
  * - `?launch=full` or `?launch=short` forces a version (for demos).
  */
@@ -19,8 +19,15 @@ const BANDS = ['#D9482B', '#EB8A2E', '#EBC34B', '#2C66B8']
 const INK = '#E8ECF2', INK2 = '#9AA4B2', INK3 = '#5E6876', CRT = '#060A0C'
 const STATIONS = ['PLAN CHECK', 'AGENTS', 'KNOWLEDGE BASE', 'TELEMETRY']
 
-const DUR = { full: 3600, short: 1000, reduced: 700 } as const
-const goAt = (i: number) => 800 + i * 420 + 280 // full version
+const DUR = { full: 6600, short: 2000, reduced: 700 } as const
+// Full version: each station is typed, then answers GO a beat later.
+const stationAt = (i: number) => 1800 + i * 800
+const goAt = (i: number) => stationAt(i) + 600
+const ALL_GO = goAt(3) + 500 // "ALL STATIONS GO"
+const WORDMARK = ALL_GO + 200 // wordmark letters, over 600 ms
+// Short version
+const SHORT_GO = (i: number) => 200 + i * 250
+const SHORT_ALL = SHORT_GO(3) + 200
 const HOLD = goAt(3) // the last station waits for the app
 const HOLD_CAP = 4000
 const LAST_KEY = 'amp.launch.last'
@@ -100,28 +107,29 @@ function draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, mo
   const type = (txt: string, at: number, speed: number) => (full ? txt.slice(0, Math.max(0, Math.floor((t - at) / speed))) : txt)
 
   let y = narrow ? h * 0.16 : h * 0.5 - lh * 3.6
-  mono(ctx, type('AMP FLIGHT DIRECTOR', 0, 18), left, y, px, INK, 600)
+  mono(ctx, type('AMP FLIGHT DIRECTOR', 0, 40), left, y, px, INK, 600)
   y += lh
-  mono(ctx, type('LAUNCH STATUS CHECK', 360, 18), left, y, px * 0.85, INK3)
+  mono(ctx, type('LAUNCH STATUS CHECK', 900, 35), left, y, px * 0.85, INK3)
   y += lh * 1.35
   const bands = [0, 0, 0, 0]
   STATIONS.forEach((st, i) => {
-    const at = full ? 800 + i * 420 : 0
-    const go = full ? goAt(i) : i * 110
+    const at = full ? stationAt(i) : 0
+    const go = full ? goAt(i) : SHORT_GO(i)
     const label = (st + ' ').padEnd(17, '.')
-    mono(ctx, type(label, at, 12), left, y, px * 0.9, INK2)
+    mono(ctx, type(label, at, 22), left, y, px * 0.9, INK2)
     const g = seg(t, go, go + 120)
     if (g > 0) mono(ctx, 'GO', left + ctx.measureText(label).width + px * 0.6, y, px * 0.9, rgba(BANDS[i], g), 600)
     bands[i] = eOut(seg(t, go, go + 260))
     y += lh
   })
-  const all = seg(t, full ? 2550 : 500, (full ? 2550 : 500) + 150)
+  const allAt = full ? ALL_GO : SHORT_ALL
+  const all = seg(t, allAt, allAt + 150)
   if (all > 0) mono(ctx, 'ALL STATIONS GO', left, y + lh * 0.4, px * 0.9, rgba(INK, all), 600)
   if (Math.floor(now / 420) % 2 === 0) {
     ctx.fillStyle = rgba(INK, 0.8)
     ctx.fillRect(left, y + lh * 1.05, px * 0.55, px * 0.12)
   }
-  logo(ctx, logoX, logoY, s, bands, full ? seg(t, 2700, 3200) * 3 : 3, full ? 1 : eOut(seg(t, 550, 950)))
+  logo(ctx, logoX, logoY, s, bands, full ? seg(t, WORDMARK, WORDMARK + 600) * 3 : 3, full ? 1 : eOut(seg(t, SHORT_ALL, SHORT_ALL + 500)))
 
   // CRT scanlines and vignette
   ctx.fillStyle = 'rgba(0,0,0,0.22)'
