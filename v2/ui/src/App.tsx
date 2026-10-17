@@ -1,7 +1,9 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { Projects } from './pages/Projects'
+import { MyWork } from './pages/MyWork'
 import { Board } from './pages/Board'
 import { Mission } from './pages/Mission'
+import { FlightPlan } from './pages/FlightPlan'
 import { DAGView } from './pages/DAG'
 import { Report } from './pages/Report'
 import { KB } from './pages/KB'
@@ -19,9 +21,11 @@ export default function App() {
       <BrowserRouter>
         <Routes>
           <Route element={<AppShell />}>
-            <Route path="/" element={<Projects />} />
+            <Route path="/" element={<MyWork />} />
+            <Route path="/projects" element={<Projects />} />
             <Route path="/project/:projectId" element={<Mission />} />
             <Route path="/project/:projectId/board" element={<Board />} />
+            <Route path="/project/:projectId/plan" element={<FlightPlan />} />
             <Route path="/project/:projectId/dag" element={<DAGView />} />
             <Route path="/project/:projectId/report" element={<Report />} />
             <Route path="/project/:projectId/kb" element={<KB />} />

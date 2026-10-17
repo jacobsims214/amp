@@ -1,6 +1,6 @@
 import type {
   Project, Epic, Story, Task, Comment, ActivityLog, KBDoc, KBDocSummary, KBSearchResult, KBTagCount, KBAnnotation,
-  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay, PlanReport,
+  KBRef, KBInfo, KBSource, Metadata, DayReport, VelocityDay, PlanReport, MyWork,
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
@@ -277,6 +277,7 @@ export const api = {
   reactivateUser: (userId: number) => post<{ user: AmpUser }>(`/users/${userId}/reactivate`).then(r => r.user),
 
   // Agent accounts and API tokens ("me" is the caller)
+  myWork: () => get<MyWork>('/my-work'),
   listAgents: () => get<{ agents: AmpUser[] }>('/agents').then(r => r.agents),
   createAgent: (name: string, teamIds: number[]) =>
     post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),

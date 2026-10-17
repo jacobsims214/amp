@@ -1,4 +1,4 @@
-import { initials } from '../../lib/people'
+import { agentInitials, initials } from '../../lib/people'
 import type { UserKind } from '../../types'
 
 // People are black circles; agents are outlined hexagons, so who did
@@ -23,13 +23,4 @@ export function Avatar({ name, kind, size = 22, title }: { name: string; kind?: 
       {initials(name)}
     </span>
   )
-}
-
-/** "claude-build-1" → "C1", "codex-data" → "CD". */
-export function agentInitials(name: string): string {
-  const parts = name.split(/[\s_-]+/).filter(Boolean)
-  if (parts.length === 0) return '?'
-  const last = parts[parts.length - 1]
-  if (parts.length > 1 && /^\d+$/.test(last)) return (parts[0][0] + last).toUpperCase().slice(0, 3)
-  return (parts[0][0] + (parts[1]?.[0] ?? parts[0][1] ?? '')).toUpperCase()
 }

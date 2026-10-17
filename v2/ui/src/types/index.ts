@@ -548,3 +548,21 @@ export interface CreateProjectRequest {
   org_id?: number
   team_id?: number
 }
+
+// ---- Home page (GET /my-work) ----
+
+/** A ticket with its project, for views that span projects. */
+export type WorkTask = Task & { project_code: string; project_name: string }
+
+export interface MyAgent {
+  user: AmpUser
+  working: WorkTask[]
+  done_24h: number
+}
+
+export interface MyWork {
+  owned: WorkTask[]
+  flags: WorkTask[]
+  agents: MyAgent[]
+  done_24h: number
+}

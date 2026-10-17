@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Radar, Building2, CalendarDays, FolderKanban, GitBranch, KeyRound, LayoutGrid, Settings, ShieldCheck,
+  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, KeyRound, LayoutGrid, Settings, ShieldCheck,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -15,7 +15,8 @@ import { Avatar } from '../ui/Avatar'
 const PROJECT_VIEWS: { to: (id: string) => string; label: string; icon: React.ReactNode; end?: boolean }[] = [
   { to: id => `/project/${id}`, label: 'Mission', icon: <Radar size={14} />, end: true },
   { to: id => `/project/${id}/board`, label: 'Board', icon: <LayoutGrid size={14} /> },
-  { to: id => `/project/${id}/dag`, label: 'Flight plan', icon: <GitBranch size={14} /> },
+  { to: id => `/project/${id}/plan`, label: 'Flight plan', icon: <Rows3 size={14} /> },
+  { to: id => `/project/${id}/dag`, label: 'Graph', icon: <GitBranch size={14} /> },
   { to: id => `/project/${id}/report`, label: 'Reports', icon: <Activity size={14} /> },
   { to: id => `/project/${id}/kb`, label: 'Library', icon: <BookOpen size={14} /> },
   { to: id => `/project/${id}/settings`, label: 'Settings', icon: <Settings size={14} /> },
@@ -64,7 +65,8 @@ export function AppShell() {
 
         <nav className="flex flex-col px-2 pb-4">
           <Group>Overview</Group>
-          <NavLink to="/" end className={navCls}><FolderKanban size={14} />Projects
+          <NavLink to="/" end className={navCls}><Home size={14} />My work</NavLink>
+          <NavLink to="/projects" className={navCls}><FolderKanban size={14} />Projects
             <span className="ml-auto amp-num text-[11px] text-ink-3">{projects.length || ''}</span></NavLink>
           <NavLink to="/reports" className={navCls}><CalendarDays size={14} />Day reports</NavLink>
           {me?.user_id != null && <NavLink to="/access" className={navCls}><KeyRound size={14} />Agents & tokens</NavLink>}

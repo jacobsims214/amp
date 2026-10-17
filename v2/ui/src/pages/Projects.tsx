@@ -1,9 +1,9 @@
+import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Loader2, LayoutDashboard, Clock, Layers, Wifi, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, ShieldCheck, Building2, Plus, CalendarDays, KeyRound } from 'lucide-react'
+import { Loader2, Clock, Layers, Archive, RotateCcw, ChevronDown, ChevronUp, Download, Upload, Plus } from 'lucide-react'
 import { api } from '../api/client'
 import { useSSE } from '../hooks/useSSE'
-import { useAuth } from '../hooks/useAuth'
 import { CrudModal, inputCls, labelCls } from '../components/CrudModal'
 import { ProjectHomeFields, type ProjectHome } from '../components/ProjectHomeFields'
 import type { Org, Project, SSEEvent } from '../types'
@@ -30,7 +30,6 @@ function relativeTime(iso: string) {
 
 export function Projects() {
   const navigate = useNavigate()
-  const { me, isAdmin } = useAuth()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [projects, setProjects] = useState<Project[]>([])
   const [archivedProjects, setArchivedProjects] = useState<Project[]>([])
@@ -172,113 +171,17 @@ export function Projects() {
 
   return (
     <div className="min-h-full" style={{ background: 'var(--bg)' }}>
-      {/* Header */}
-      <header style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
-        <div className="max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            {/* Logo mark */}
-            <div
-              className="w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0"
-              style={{
-                background: 'linear-gradient(135deg, var(--primary) 0%, var(--primary) 100%)',
-                boxShadow: '0 0 20px color-mix(in srgb, var(--link) 35%, transparent)',
-              }}
-            >
-              <LayoutDashboard size={14} className="text-white" />
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="text-base font-bold text-ink tracking-tight">AMP</span>
-              <span
-                className="text-[10px] font-semibold text-primary px-1.5 py-0.5 rounded-md font-mono"
-                style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)' }}
-              >
-                v2
-              </span>
-            </div>
-          </div>
-          <div className="flex items-center gap-4">
-            {/* Live status */}
-            <div className={`flex items-center gap-1.5 text-xs font-medium ${live ? 'text-success' : 'text-ink-3'}`}>
-              <span className={`w-1.5 h-1.5 rounded-full ${live ? 'bg-success' : 'bg-ink-3'}`}
-                style={live ? { boxShadow: '0 0 6px var(--success)' } : undefined} />
-              <Wifi size={11} />
-              <span>{live ? 'Live' : 'Connecting…'}</span>
-            </div>
-            <span className="text-xs text-ink-3">
-              {projects.length} {projects.length !== 1 ? 'projects' : 'project'}
-            </span>
-            {isAdmin && (
-              <Link
-                to="/admin/users"
-                title="Manage users"
-                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
-              >
-                <ShieldCheck size={13} />
-                Users
-              </Link>
-            )}
-            {me && (
-              <Link
-                to="/reports"
-                title="End-of-day reports and velocity"
-                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
-              >
-                <CalendarDays size={13} />
-                Daily reports
-              </Link>
-            )}
-            {me?.user_id != null && (
-              <Link
-                to="/access"
-                title="API tokens and agent accounts"
-                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
-              >
-                <KeyRound size={13} />
-                Agents &amp; tokens
-              </Link>
-            )}
-            {me && (
-              <Link
-                to="/admin/orgs"
-                title="Organizations and teams"
-                className="flex items-center gap-1 text-xs font-medium text-ink-2 hover:text-link transition-colors"
-              >
-                <Building2 size={13} />
-                Orgs
-              </Link>
-            )}
-            {me && (
-              <span className="text-xs text-ink-3" title={me.subject}>
-                {me.email}
-              </span>
-            )}
-            <button
-              onClick={openCreate}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer bg-primary hover:bg-primary text-white"
-            >
-              <Plus size={12} />
-              New project
-            </button>
-            <button
-              onClick={handleImportClick}
-              disabled={importing}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-              style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
-            >
-              {importing ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}
-              Import
-            </button>
-            <input ref={fileInputRef} type="file" accept=".json" onChange={handleFileSelected} className="hidden" aria-label="Import project file" />
-          </div>
-        </div>
-      </header>
+      <PageHeader crumb="Overview" title="Projects"
+        meta={<>{projects.length} {projects.length === 1 ? 'project' : 'projects'} you can see · <span className={live ? 'text-success-ink' : 'text-ink-3'}>{live ? 'live' : 'connecting…'}</span></>}
+        actions={<>
+          <button onClick={handleImportClick} disabled={importing} className="amp-btn">
+            {importing ? <Loader2 size={12} className="animate-spin" /> : <Upload size={12} />}Import
+          </button>
+          <button onClick={openCreate} className="amp-btn amp-btn-primary"><Plus size={12} />New project</button>
+          <input ref={fileInputRef} type="file" accept=".json" onChange={handleFileSelected} className="hidden" aria-label="Import project file" />
+        </>} />
 
-      <main className="max-w-5xl mx-auto px-6 py-10">
-        {/* Page title */}
-        <div className="mb-8">
-          <h1 className="text-2xl font-bold text-ink tracking-tight">Projects</h1>
-          <p className="text-sm text-ink-2 mt-1.5">Select a project to open its board</p>
-        </div>
+      <main className="px-7 py-5">
 
         {loading && (
           <div className="flex justify-center py-20">
@@ -458,67 +361,27 @@ interface ProjectCardProps {
 
 function ProjectCard({ project: p, onExport, exporting, exportError, onArchive, archiving }: ProjectCardProps) {
   return (
-    <div
-      className="group rounded-2xl p-5 transition-all duration-200 hover:-translate-y-0.5 cursor-pointer"
-      style={{
-        background: 'var(--surface)',
-        border: '1px solid var(--line)',
-      }}
-      onMouseEnter={e => {
-        (e.currentTarget as HTMLElement).style.borderColor = 'color-mix(in srgb, var(--link) 30%, transparent)'
-        ;(e.currentTarget as HTMLElement).style.boxShadow = '0 8px 32px color-mix(in srgb, var(--ink) 18%, transparent), 0 0 0 1px color-mix(in srgb, var(--link) 10%, transparent)'
-      }}
-      onMouseLeave={e => {
-        (e.currentTarget as HTMLElement).style.borderColor = 'var(--line)'
-        ;(e.currentTarget as HTMLElement).style.boxShadow = 'none'
-      }}
-    >
-      {/* Top row */}
-      <div className="flex items-start justify-between gap-3 mb-4">
-        <Link to={`/project/${p.id}`} className="flex items-center gap-3 flex-1 min-w-0">
-          <ProjectAvatar code={p.code} />
-          <span className="text-xs text-ink-3 font-mono">#{p.id}</span>
+    <div className="group amp-panel amp-panel-top flex flex-col hover:border-line-str transition-colors">
+      <div className="flex items-start gap-3 px-4 pt-4">
+        <span className="amp-bands-v h-[34px]" aria-hidden="true" />
+        <Link to={`/project/${p.id}`} className="flex-1 min-w-0">
+          <span className="amp-label">Project · <span className="amp-num tracking-normal">{p.code}</span></span>
+          <h3 className="amp-heading text-[16px] leading-tight text-ink mt-1.5 mb-0 group-hover:underline underline-offset-2">{p.name}</h3>
         </Link>
-        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button
-            onClick={(e) => onExport(e, p.id)}
-            disabled={exporting}
-            className="p-1.5 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
-            style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)', color: 'var(--link)' }}
-            title="Export project"
-          >
+        <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+          <button onClick={(e) => onExport(e, p.id)} disabled={exporting} className="amp-btn amp-btn-ghost amp-btn-sm" title="Export project" aria-label="Export project">
             {exporting ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />}
           </button>
-          <button
-            onClick={onArchive}
-            disabled={archiving}
-            className="p-1.5 rounded-lg text-ink-2 hover:text-danger hover:bg-danger/10 transition-colors cursor-pointer disabled:opacity-50"
-            title="Archive project"
-          >
+          <button onClick={onArchive} disabled={archiving} className="amp-btn amp-btn-ghost amp-btn-sm" title="Archive project" aria-label="Archive project">
             <Archive size={13} />
           </button>
         </div>
       </div>
-
-      <Link to={`/project/${p.id}`} className="block">
-        <h3 className="text-sm font-bold text-ink group-hover:text-white transition-colors mb-1 leading-snug">
-          {p.name}
-        </h3>
-        <p className="text-xs text-ink-3 font-mono mb-3">{p.code}</p>
-        {p.description && (
-          <p className="text-xs text-ink-2 mb-4 line-clamp-2 leading-relaxed">{p.description}</p>
-        )}
-        <div className="flex items-center gap-1.5 text-xs text-ink-3">
-          <Clock size={10} />
-          <span>Updated {relativeTime(p.updated_at)}</span>
-        </div>
+      <Link to={`/project/${p.id}`} className="block px-4 pb-4 pt-3 flex-1">
+        {p.description && <p className="text-[13px] text-ink-2 mb-3 line-clamp-2 leading-relaxed">{p.description}</p>}
+        <span className="amp-num text-[11px] text-ink-3 inline-flex items-center gap-1.5"><Clock size={10} />updated {relativeTime(p.updated_at)}</span>
       </Link>
-
-      {exportError && (
-        <div className="mt-3 text-xs text-danger-ink bg-danger/8 border border-danger/20 rounded-lg px-3 py-2">
-          {exportError}
-        </div>
-      )}
+      {exportError && <div className="mx-4 mb-4 text-[12px] text-danger-ink border border-danger px-3 py-2">{exportError}</div>}
     </div>
   )
 }
