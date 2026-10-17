@@ -496,6 +496,21 @@ Approval: "approved", "go ahead", "yes", "do it", or similar.
 
 Changes requested → update → present again → wait again.
 
+When the user approves, **record it in AMP before dispatching**:
+
+```
+amp_approve_plan(project_id=PROJECT_ID)
+```
+
+That's the same approval a person gives with "Approve plan" in AMP's Flight plan, and projects with
+`require_plan_approval` on refuse to dispatch tickets planned since the last approval until it's
+recorded. Never call it on your own judgment — only when the user has said yes. The user may also
+approve in the UI instead of in chat: `amp_check_plan`'s `awaiting_approval` is empty once the plan
+is approved, wherever that happened.
+
+Each new planning run (or fix tickets you add) needs approving again when the project requires it:
+if a dispatch is refused because the plan wasn't approved, present what's new and ask.
+
 ---
 
 ## Dispatch — only after approval
