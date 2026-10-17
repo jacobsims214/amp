@@ -35,6 +35,13 @@ data:
         codeChallengeMethodsSupported: ["S256"]
 
     enablePasswordDB: true
+    {{- with .Values.dex.connectors }}
+
+    # SSO connectors from values (dex.connectors). Dex lists them next to
+    # the password login; $NAME values come from dex.connectorSecret.
+    connectors:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
 
     staticClients:
       - idEnv: DEX_UI_CLIENT_ID

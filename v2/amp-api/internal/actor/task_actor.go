@@ -86,11 +86,21 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 			if err := a.saveState(domain.TaskStateBlocked, a.task.BlockReason); err != nil {
 				a.log.Error("failed to persist scheduled block state", "err", err)
 			}
+		} else if a.task.StartAt != nil && a.task.State == domain.TaskStateBlocked && strings.HasPrefix(a.task.BlockReason, "scheduled:") {
+			// Its start time passed while no actor was running it (a restart,
+			// or its project moving to another replica): unblock it now.
+			ctx.Send(ctx.Self(), &MsgScheduledUnblock{TaskID: a.task.ID})
 		}
 
 		a.log.Info("started", "state", a.task.State, "deps", len(a.task.DependencyIDs))
 
 	case *actor.Stopped:
+		// A stopped actor's schedule is picked up by whichever actor runs the
+		// ticket next.
+		if a.scheduleTimer != nil {
+			a.scheduleTimer.Stop()
+			a.scheduleTimer = nil
+		}
 		// Deregister from ProjectActor routing index.
 		if !a.detached {
 			ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: a.task.ID, EpicID: a.task.EpicID})
@@ -295,21 +305,17 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 }
 
 func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
+	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
+	if err != nil {
+		return err
+	}
 	if req.Name != "" {
 		a.task.Name = req.Name
 	}
-	if req.Description != "" {
-		a.task.Description = req.Description
-	}
-	if req.AssignedTo != "" {
-		a.task.AssignedTo = req.AssignedTo
-	}
-	if req.AgentID != "" {
-		a.task.AgentID = req.AgentID
-	}
-	if req.AcceptanceCriteria != "" {
-		a.task.AcceptanceCriteria = req.AcceptanceCriteria
-	}
+	a.task.Description = clr.Apply("description", req.Description, a.task.Description)
+	a.task.AssignedTo = clr.Apply("assigned_to", req.AssignedTo, a.task.AssignedTo)
+	a.task.AgentID = clr.Apply("agent_id", req.AgentID, a.task.AgentID)
+	a.task.AcceptanceCriteria = clr.Apply("acceptance_criteria", req.AcceptanceCriteria, a.task.AcceptanceCriteria)
 	if req.Priority != "" {
 		a.task.Priority = req.Priority
 	}
@@ -350,8 +356,15 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 	from := string(a.task.State)
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
+	// A block reason only means something while blocked; leaving the old
+	// one on an unblocked ticket would keep showing it as flagged.
+	blockReason := ""
+	if state == domain.TaskStateBlocked {
+		blockReason = reason
+	}
+	a.task.BlockReason = blockReason
 
-	if err := a.saveState(state, reason); err != nil {
+	if err := a.saveState(state, blockReason); err != nil {
 		return fmt.Errorf("db set state: %w", err)
 	}
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{

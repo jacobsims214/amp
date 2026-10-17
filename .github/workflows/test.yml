@@ -60,3 +60,5 @@ jobs:
         run: go vet ./... && go vet -tags e2e ./test/e2e/
       - name: go test (race)
         run: go test -race -count=1 ./...
+      - name: go test across replicas (every MCP test through a forwarding replica)
+        run: TEST_CLUSTER=1 go test -race -count=1 ./cmd/server

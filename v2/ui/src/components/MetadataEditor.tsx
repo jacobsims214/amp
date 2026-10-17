@@ -14,8 +14,8 @@ interface Props {
 }
 
 const cellCls =
-  'bg-[#08101F] border border-[#1E2C45] rounded-lg px-2 py-1.5 text-xs text-[#DDE6F0] placeholder-[#3D5068] ' +
-  'focus:outline-none focus:border-[#6366F1] disabled:opacity-60'
+  'bg-bg border border-line rounded-lg px-2 py-1.5 text-xs text-ink placeholder-ink-3 ' +
+  'focus:outline-none focus:border-primary disabled:opacity-60'
 
 const show = (v: MetadataValue) => (typeof v === 'boolean' ? (v ? 'yes' : 'no') : String(v))
 
@@ -40,7 +40,7 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
 
   return (
     <div className="space-y-2">
-      {rows.length === 0 && readOnly && <p className="text-xs text-[#3D5068]">No fields.</p>}
+      {rows.length === 0 && readOnly && <p className="text-xs text-ink-3">No fields.</p>}
       {rows.map((r, i) => (
         <div key={i} className="flex items-center gap-1.5">
           <input value={r.key} disabled={readOnly} onChange={e => setRow(i, { key: e.target.value })}
@@ -66,7 +66,7 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
           )}
           {!readOnly && (
             <button type="button" onClick={() => update(rows.filter((_, j) => j !== i))}
-              className="p-1 text-[#7E91A8] hover:text-[#F87171] cursor-pointer" title="Remove field">
+              className="p-1 text-ink-2 hover:text-danger-ink cursor-pointer" title="Remove field">
               <X size={13} />
             </button>
           )}
@@ -74,16 +74,16 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
       ))}
       {!readOnly && (
         <button type="button" onClick={() => update([...rows, { key: '', type: 'text', value: '' }])}
-          className="flex items-center gap-1 text-xs text-[#818CF8] hover:text-[#DDE6F0] cursor-pointer">
+          className="flex items-center gap-1 text-xs text-link hover:text-ink cursor-pointer">
           <Plus size={12} />Add field
         </button>
       )}
       {inheritedOnly.length > 0 && (
         <div className="pt-1">
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-[#3D5068] mb-1">Inherited</p>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-ink-3 mb-1">Inherited</p>
           <div className="flex flex-wrap gap-1.5">
             {inheritedOnly.map(([k, v]) => (
-              <span key={k} className="text-[11px] px-2 py-0.5 rounded-md text-[#7E91A8]" style={{ background: '#0D1726', border: '1px solid #1E2C45' }}
+              <span key={k} className="text-[11px] px-2 py-0.5 rounded-md text-ink-2" style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}
                 title="Inherited; add the same field above to override it here">
                 <span className="font-mono">{k}</span>: {show(v)}
               </span>
@@ -91,7 +91,7 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
           </div>
         </div>
       )}
-      {error && <p className="text-xs text-[#F87171]">{error}</p>}
+      {error && <p className="text-xs text-danger-ink">{error}</p>}
     </div>
   )
 }

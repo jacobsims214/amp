@@ -47,7 +47,19 @@ auth:
 ampApi:
   image: amp-api
   tag: local
+  # Any number works: each project runs on one replica and the others pass
+  # its requests there; if a replica dies, the rest take its projects over
+  # within ~10s. 2+ keeps AMP up through a pod or node failure.
   replicas: 1
+  # Who becomes an AMP user on first sign-in, e.g. through an SSO connector:
+  # comma-separated email domains ("acme.com,acme.io"). Invited emails and
+  # bootstrap admins always can; existing users are unaffected. Empty: anyone
+  # who can sign in to Dex.
+  signupAllowedDomains: ""
+  # Let webhooks reach private, loopback, and in-cluster addresses (e.g. an
+  # n8n on your LAN). Off: a project owner's webhook URL can't be used to
+  # reach services inside the cluster.
+  webhookAllowPrivateNetworks: false
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
@@ -82,6 +94,25 @@ dex:
   replicas: 1
   httpPort: 5556
   grpcPort: 5557
+  # SSO: Dex connectors, shown next to the password login. Any Dex connector
+  # works (google, github, microsoft, oidc, ldap, saml); see
+  # https://dexidp.io/docs/connectors/. Put client secrets in a Secret in the
+  # amp namespace, name it in connectorSecret, and reference its keys as
+  # $KEY. People who sign in this way become AMP users by their (verified)
+  # email; limit that with ampApi.signupAllowedDomains. Example:
+  #
+  #   connectors:
+  #     - type: google
+  #       id: google
+  #       name: Google
+  #       config:
+  #         clientID: $GOOGLE_CLIENT_ID
+  #         clientSecret: $GOOGLE_CLIENT_SECRET
+  #         redirectURI: https://amp.example.com/dex/callback
+  #         hostedDomains: [example.com]
+  #   connectorSecret: amp-dex-connectors   # keys GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
+  connectors: []
+  connectorSecret: ""
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }

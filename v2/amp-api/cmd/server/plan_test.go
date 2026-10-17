@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	protoactor "github.com/asynkron/protoactor-go/actor"
 
@@ -426,5 +427,68 @@ func TestPlan_ServerInstructions(t *testing.T) {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("initialize response lacks %q", want)
 		}
+	}
+}
+
+// Text fields can be blanked on purpose with clear; an empty value still
+// means "keep", so agents sending only what changes don't wipe anything.
+func TestPlan_ClearFields(t *testing.T) {
+	s := setupMCP(t)
+	id := mkIn(t, s, s.storyID, "draft")
+	s.call(t, "amp_update_task", map[string]interface{}{"task_id": float64(id), "assigned_to": "amp-worker", "description": ""})
+	if got := planTask(t, s, id); got["description"] != "d" || got["assigned_to"] != "amp-worker" {
+		t.Fatalf("empty description should keep it: %v", got)
+	}
+	s.call(t, "amp_update_task", map[string]interface{}{"task_id": float64(id),
+		"clear": []interface{}{"description", "acceptance_criteria", "assigned_to"}})
+	got := planTask(t, s, id)
+	for _, f := range []string{"description", "acceptance_criteria"} {
+		if got[f] != "" {
+			t.Errorf("%s = %q after clear, want blank", f, got[f])
+		}
+	}
+	if v, ok := got["assigned_to"]; ok && v != "" {
+		t.Errorf("assigned_to = %q after clear", v)
+	}
+	if row, _ := s.repo.GetTask(context.Background(), id); row.Description != "" || row.AssignedTo != "" || row.Name != "draft" {
+		t.Errorf("stored task = %+v", row)
+	}
+	if msg := s.callExpectError(t, "amp_update_task", map[string]interface{}{"task_id": float64(id), "clear": []interface{}{"name"}}); !strings.Contains(msg, "can't be cleared") {
+		t.Errorf("clearing name: %q", msg)
+	}
+
+	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "description": "ed"})
+	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "clear": []interface{}{"description"}})
+	if e, _ := s.repo.GetEpic(context.Background(), s.epicID); e.Description != "" {
+		t.Errorf("epic description = %q", e.Description)
+	}
+	s.call(t, "amp_update_story", map[string]interface{}{"story_id": float64(s.storyID), "clear": []interface{}{"acceptance_criteria"}})
+	if st, _ := s.repo.GetStory(context.Background(), s.storyID); st.AcceptanceCriteria != "" || st.Name != "default-story" {
+		t.Errorf("story = %+v", st)
+	}
+}
+
+// Bug: amp_set_task_start_at never answered — no actor above the ticket
+// passed the message on — so scheduling an existing ticket hung forever.
+func TestPlan_ScheduleExistingTicket(t *testing.T) {
+	s := setupMCP(t)
+	id := mkIn(t, s, s.storyID, "later")
+	at := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.call(t, "amp_set_task_start_at", map[string]interface{}{"task_id": float64(id), "start_at": at})
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("amp_set_task_start_at never answered")
+	}
+	if st := stateOf(t, s, id); st != "blocked" {
+		t.Fatalf("scheduled ticket: %s", st)
+	}
+	s.call(t, "amp_set_task_start_at", map[string]interface{}{"task_id": float64(id)})
+	if st := stateOf(t, s, id); st != "backlog" {
+		t.Fatalf("after clearing the schedule: %s", st)
 	}
 }

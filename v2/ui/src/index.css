@@ -1,118 +1,199 @@
 @import "tailwindcss";
 
-/* ─── Design Tokens ──────────────────────────────────────────────────────── */
+/* ─── AMP design tokens · theme "Stripe" ─────────────────────────────────────
+   White first, black ink, square edges. Color is spent on ticket state and on
+   action; the four bands (red, orange, yellow, blue) are the signature. Every
+   color in the app comes from here, so a theme is a change to this file. */
 :root {
-  /* Backgrounds */
-  --bg:           #08101F;
-  --surface-1:    #0D1726;
-  --surface-2:    #111E30;
-  --surface-3:    #172540;
+  /* Grounds */
+  --bg:          #F2F2F0;   /* app ground */
+  --surface:     #FFFFFF;   /* panels, cards, the header */
+  --surface-2:   #FAFAF9;   /* sidebar, table heads, raised rows */
+  --surface-3:   #EFEFEC;   /* hover, selected, sunken inputs */
+  --scrim:       rgba(22, 24, 27, 0.32);
 
-  /* Borders */
-  --border-sub:   #192238;
-  --border:       #1E2C45;
-  --border-str:   #283A57;
+  /* Rules */
+  --line-sub:    #E9E9E6;
+  --line:        #DCDDDA;
+  --line-str:    #C3C5C1;
 
-  /* Text */
-  --text-1:       #DDE6F0;
-  --text-2:       #7E91A8;
-  --text-3:       #3D5068;
+  /* Ink */
+  --ink:         #16181B;
+  --ink-2:       #50555C;
+  --ink-3:       #8E939A;
+  --on-ink:      #FFFFFF;   /* text on black buttons */
 
-  /* Accent — Indigo */
-  --accent:       #6366F1;
-  --accent-lt:    #818CF8;
-  --accent-dim:   #4338CA;
+  /* Action */
+  --primary:     #16181B;   /* primary buttons, focus */
+  --accent:      #D9482B;   /* selected marks, flags, alarm */
+  --link:        #2C66B8;   /* links, info, selection tints */
+
+  /* Signature bands */
+  --band-1:      #D9482B;
+  --band-2:      #EB8A2E;
+  --band-3:      #EBC34B;
+  --band-4:      #2C66B8;
+
+  /* Ticket states */
+  --st-ready:    #16181B;
+  --st-prog:     #2C66B8;
+  --st-wait:     #8E939A;
+  --st-flag:     #D9482B;
+  --st-sched:    #7A5BB5;
+  --st-done:     #16181B;
 
   /* Semantic */
-  --success:      #10B981;
-  --success-dk:   #059669;
-  --warning:      #F59E0B;
-  --warning-lt:   #FBBF24;
-  --danger:       #EF4444;
-  --danger-dk:    #DC2626;
+  --danger:      #D9482B;
+  --danger-ink:  #B23A20;
+  --success:     #2F7D4E;
+  --success-ink: #2A6E45;
+  --warning:     #D08A1C;
+  --warning-ink: #9A5E0A;
+  --violet:      #7A5BB5;
+  --teal:        #1F8A7E;
+  --pink:        #C2457E;
+  --orange:      #EB8A2E;
+
+  /* Type */
+  --font-body:   "Barlow", ui-sans-serif, system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-label:  "Barlow Condensed", "Arial Narrow", "Barlow", sans-serif;
+  --font-data:   "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  --radius:      2px;
+  color-scheme: light;
 }
 
-/* ─── Tailwind v4 theme extension ─────────────────────────────────────────── */
-@theme {
-  --font-sans: 'Plus Jakarta Sans', ui-sans-serif, system-ui, sans-serif;
+/* ─── Tailwind: expose the tokens as utilities (bg-surface, text-ink-2, …) ── */
+@theme inline {
+  /* Square corners everywhere; rounded-full (avatars, dots) stays round. */
+  --radius-xs: 1px;
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-xl: 2px;
+  --radius-2xl: 3px;
+  --radius-3xl: 3px;
+  --radius-4xl: 3px;
+
+  --font-sans: var(--font-body);
+  --font-mono: var(--font-data);
+  --font-label: var(--font-label);
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-line-sub: var(--line-sub);
+  --color-line: var(--line);
+  --color-line-str: var(--line-str);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-on-ink: var(--on-ink);
+  --color-primary: var(--primary);
+  --color-accent: var(--accent);
+  --color-link: var(--link);
+  --color-band-1: var(--band-1);
+  --color-band-2: var(--band-2);
+  --color-band-3: var(--band-3);
+  --color-band-4: var(--band-4);
+  --color-st-ready: var(--st-ready);
+  --color-st-prog: var(--st-prog);
+  --color-st-wait: var(--st-wait);
+  --color-st-flag: var(--st-flag);
+  --color-st-sched: var(--st-sched);
+  --color-st-done: var(--st-done);
+  --color-danger: var(--danger);
+  --color-danger-ink: var(--danger-ink);
+  --color-success: var(--success);
+  --color-success-ink: var(--success-ink);
+  --color-warning: var(--warning);
+  --color-warning-ink: var(--warning-ink);
+  --color-violet: var(--violet);
+  --color-teal: var(--teal);
+  --color-pink: var(--pink);
+  --color-orange: var(--orange);
 }
 
-/* ─── Base reset ─────────────────────────────────────────────────────────── */
+/* ─── Base ──────────────────────────────────────────────────────────────── */
 *, *::before, *::after { box-sizing: border-box; }
 
+html, body { background: var(--bg); }
 body {
   margin: 0;
-  background: var(--bg);
-  color: var(--text-1);
-  font-family: 'Plus Jakarta Sans', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  color: var(--ink);
+  font-family: var(--font-body);
   font-size: 14px;
   font-weight: 400;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+#root { width: 100%; min-height: 100vh; }
+::selection { background: color-mix(in srgb, var(--link) 22%, transparent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-#root {
-  width: 100%;
-  min-height: 100vh;
-}
-
-/* ─── Scrollbar ──────────────────────────────────────────────────────────── */
-::-webkit-scrollbar          { width: 5px; height: 5px; }
+/* ─── Scrollbar ─────────────────────────────────────────────────────────── */
+::-webkit-scrollbar          { width: 8px; height: 8px; }
 ::-webkit-scrollbar-track    { background: transparent; }
-::-webkit-scrollbar-thumb    { background: var(--border-str); border-radius: 4px; }
-::-webkit-scrollbar-thumb:hover { background: #3a5070; }
+::-webkit-scrollbar-thumb    { background: var(--line); border-radius: 0; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--line-str); }
 
-/* ─── Form inputs — baseline dark styling ────────────────────────────────── */
-.amp-input {
-  width: 100%;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 7px 12px;
-  font-size: 13px;
-  font-family: inherit;
-  color: var(--text-1);
-  transition: border-color 150ms, box-shadow 150ms;
-  outline: none;
+/* ─── Shared pieces of the Stripe look ─────────────────────────────────────
+   Labels: condensed, uppercase, tracked. Numbers: mono, tabular. */
+.amp-label {
+  font-family: var(--font-label);
+  font-weight: 600;
+  font-size: 10.5px;
+  line-height: 1;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--ink-3);
 }
-.amp-input::placeholder { color: var(--text-3); }
-.amp-input:focus {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+.amp-num { font-family: var(--font-data); font-variant-numeric: tabular-nums; }
+.amp-heading {
+  font-family: var(--font-body);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
 }
+/* The four bands, as a small vertical or horizontal marker. */
+.amp-bands-v { width: 5px; align-self: stretch; flex-shrink: 0;
+  background: linear-gradient(var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%); }
+.amp-bands-h { height: 4px;
+  background: linear-gradient(90deg, var(--band-1) 0 25%, var(--band-2) 25% 50%, var(--band-3) 50% 75%, var(--band-4) 75%); }
 
-/* ─── Button base ────────────────────────────────────────────────────────── */
+/* Buttons: black primary, outlined secondary, condensed caps. */
 .amp-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 14px;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 500;
-  font-family: inherit;
-  cursor: pointer;
-  transition: all 150ms;
-  border: 1px solid transparent;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  font-family: var(--font-label); font-weight: 600; font-size: 11.5px; line-height: 1;
+  letter-spacing: 0.14em; text-transform: uppercase; white-space: nowrap;
+  padding: 9px 13px; border-radius: var(--radius);
+  border: 1px solid var(--ink); background: var(--surface); color: var(--ink);
+  cursor: pointer; transition: background 120ms, color 120ms, border-color 120ms;
 }
-.amp-btn:active { transform: scale(0.97); }
+.amp-btn:hover { background: var(--surface-3); }
+.amp-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.amp-btn-primary { background: var(--primary); color: var(--on-ink); border-color: var(--primary); }
+.amp-btn-primary:hover { background: #2C2F33; }
+.amp-btn-accent { background: var(--accent); color: #fff; border-color: var(--accent); }
+.amp-btn-accent:hover { background: var(--danger-ink); }
+.amp-btn-danger { color: var(--danger-ink); border-color: var(--danger); }
+.amp-btn-danger:hover { background: color-mix(in srgb, var(--danger) 8%, var(--surface)); }
+.amp-btn-ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
+.amp-btn-ghost:hover { color: var(--ink); background: var(--surface-3); }
+.amp-btn-sm { padding: 6px 9px; font-size: 10.5px; }
 
-.amp-btn-primary {
-  background: var(--accent);
-  color: #fff;
-  border-color: var(--accent);
+.amp-input {
+  width: 100%; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius);
+  padding: 7px 10px; font: inherit; font-size: 13px; color: var(--ink); outline: none;
+  transition: border-color 120ms, box-shadow 120ms;
 }
-.amp-btn-primary:hover { background: var(--accent-dim); border-color: var(--accent-dim); }
+.amp-input::placeholder { color: var(--ink-3); }
+.amp-input:focus { border-color: var(--ink); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ink) 8%, transparent); }
 
-.amp-btn-danger {
-  background: var(--danger);
-  color: #fff;
-  border-color: var(--danger);
-}
-.amp-btn-danger:hover { background: var(--danger-dk); border-color: var(--danger-dk); }
+.amp-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+.amp-panel-top { box-shadow: inset 0 3px 0 var(--ink); }
 
-.amp-btn-ghost {
-  background: transparent;
-  color: var(--text-2);
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
-.amp-btn-ghost:hover { color: var(--text-1); background: var(--surface-3); }

@@ -91,6 +91,11 @@ func (h *RestHandler) requireProject(w http.ResponseWriter, r *http.Request, p a
 	return lvl, true
 }
 
+// projectAudit is an audit entry about a whole project.
+func projectAudit(action string, projectID int, summary string) domain.AuditEntry {
+	return domain.AuditEntry{Action: action, ProjectID: &projectID, TargetType: "project", TargetID: strconv.Itoa(projectID), Summary: summary}
+}
+
 // fail writes err with the status authz assigns it, or fallback.
 func fail(w http.ResponseWriter, err error, fallback int) {
 	jsonErr(w, err, authz.StatusOf(err, fallback))
@@ -118,9 +123,14 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/me", h.me)
 	mux.HandleFunc("/api/users", h.users)
 	mux.HandleFunc("/api/users/", h.userSub)
+	mux.HandleFunc("/api/tokens/", h.tokenSub)
+	mux.HandleFunc("/api/agents", h.agents)
+	mux.HandleFunc("/api/audit", h.audit)
+	mux.HandleFunc("/api/webhooks/", h.webhookSub)
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
+	mux.HandleFunc("/api/my-work", h.myWork)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 }
 
@@ -143,6 +153,8 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 	if ident.User != nil {
 		resp["roles"] = ident.User.Roles
 		resp["user_id"] = ident.User.ID
+		resp["kind"] = ident.User.Kind
+		resp["via_token"] = ident.APIToken
 		uid := ident.User.ID
 		orgs, err := h.repo.ListOrgs(r.Context(), &uid)
 		if err != nil {
@@ -150,6 +162,25 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp["orgs"] = orgs
+		// The teams they're on, across their orgs.
+		type myTeam struct {
+			ID    int    `json:"id"`
+			Name  string `json:"name"`
+			OrgID int    `json:"org_id"`
+			Role  string `json:"role"`
+		}
+		teams := []myTeam{}
+		for _, o := range orgs {
+			list, err := h.repo.ListUserTeams(r.Context(), o.ID, uid)
+			if err != nil {
+				jsonErr(w, err, 500)
+				return
+			}
+			for _, t := range list { // ListUserTeams packs team id/name into UserID/Email
+				teams = append(teams, myTeam{ID: t.UserID, Name: t.Email, OrgID: o.ID, Role: t.Role})
+			}
+		}
+		resp["teams"] = teams
 	}
 	if ident.LocalDev {
 		resp["roles"] = []string{domain.RoleAdmin}
@@ -175,50 +206,173 @@ func (h *RestHandler) users(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// /api/users/:id/role  { "role": "admin", "grant": true }
+// /api/users/:id/role         PATCH  { "role": "admin", "grant": true }   (global admins)
+// /api/users/:id              DELETE                                    (global admins)
+// /api/users/:id/deactivate   POST   (global admins; managers for their agents)
+// /api/users/:id/reactivate   POST
+// /api/users/:id/tokens       GET, POST { name, expires_in_days }  (:id may be "me")
 func (h *RestHandler) userSub(w http.ResponseWriter, r *http.Request) {
 	parts := splitPath(r.URL.Path[len("/api/users/"):])
 	if len(parts) < 1 {
 		http.NotFound(w, r)
 		return
 	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
 	userID, err := strconv.Atoi(parts[0])
+	if parts[0] == "me" {
+		userID, err = pr.UserID, nil
+		if !pr.HasUser() {
+			err = errorf(`"me" needs a signed-in AMP user`)
+		}
+	}
 	if err != nil {
 		jsonErr(w, errorf("invalid user id"), 400)
 		return
 	}
-
-	if len(parts) == 2 && parts[1] == "role" && r.Method == http.MethodPatch {
-		auth.RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
-			var body struct {
-				Role  string `json:"role"`
-				Grant bool   `json:"grant"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				jsonErr(w, err, 400)
-				return
-			}
-			if err := h.repo.SetUserRole(r.Context(), userID, body.Role, body.Grant); err != nil {
-				fail(w, err, 500)
-				return
-			}
-			jsonOK(w, map[string]interface{}{"user_id": userID, "role": body.Role, "grant": body.Grant})
-		})(w, r)
-		return
+	sub := ""
+	if len(parts) > 1 {
+		sub = parts[1]
 	}
 
-	if len(parts) == 1 && r.Method == http.MethodDelete {
-		auth.RequireRole(domain.RoleAdmin, func(w http.ResponseWriter, r *http.Request) {
-			if err := h.repo.DeleteUser(r.Context(), userID); err != nil {
-				fail(w, err, 500)
-				return
-			}
-			jsonOK(w, map[string]interface{}{"deleted": userID})
-		})(w, r)
+	switch {
+	case sub == "role" && r.Method == http.MethodPatch:
+		var body struct {
+			Role  string `json:"role"`
+			Grant bool   `json:"grant"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		if err := h.svc.SetUserRole(r.Context(), pr, userID, body.Role, body.Grant); err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"user_id": userID, "role": body.Role, "grant": body.Grant})
+
+	case sub == "" && r.Method == http.MethodDelete:
+		if err := h.svc.DeleteUser(r.Context(), pr, userID); err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"deleted": userID})
+
+	case (sub == "deactivate" || sub == "reactivate") && r.Method == http.MethodPost:
+		u, err := h.svc.SetUserDisabled(r.Context(), pr, userID, sub == "deactivate")
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"user": u})
+
+	case sub == "tokens" && r.Method == http.MethodGet:
+		tokens, err := h.svc.ListTokens(r.Context(), pr, userID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"tokens": tokens})
+
+	case sub == "tokens" && r.Method == http.MethodPost:
+		var body struct {
+			Name          string `json:"name"`
+			ExpiresInDays int    `json:"expires_in_days"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		tok, err := h.svc.CreateToken(r.Context(), pr, userID, body.Name, body.ExpiresInDays)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"token": tok})
+
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+// /api/tokens/:id  DELETE revokes a token.
+func (h *RestHandler) tokenSub(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
 		return
 	}
+	id, err := strconv.Atoi(strings.Trim(r.URL.Path[len("/api/tokens/"):], "/"))
+	if err != nil || r.Method != http.MethodDelete {
+		http.NotFound(w, r)
+		return
+	}
+	if err := h.svc.RevokeToken(r.Context(), pr, id); err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, map[string]interface{}{"token_id": id, "revoked": true})
+}
 
-	http.NotFound(w, r)
+// /api/agents  GET lists your agent accounts (global admins: all);
+// POST { name, team_ids } creates one you manage.
+func (h *RestHandler) agents(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		agents, err := h.svc.ListAgents(r.Context(), pr)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"agents": agents})
+	case http.MethodPost:
+		var body struct {
+			Name    string `json:"name"`
+			TeamIDs []int  `json:"team_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		u, err := h.svc.CreateAgent(r.Context(), pr, body.Name, body.TeamIDs)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"agent": u})
+	default:
+		http.Error(w, "method not allowed", 405)
+	}
+}
+
+// /api/audit?org_id=&project_id=&actor_id=&action=&before=&limit=
+// Global admins read everything; org owners/admins their org; project
+// owners their project.
+func (h *RestHandler) audit(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	num := func(k string) int {
+		n, _ := strconv.Atoi(q.Get(k))
+		return n
+	}
+	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+	entries, err := h.svc.Audit(r.Context(), pr, domain.AuditFilter{
+		OrgID: num("org_id"), ProjectID: num("project_id"), ActorUserID: num("actor_id"),
+		Action: q.Get("action"), BeforeID: before, Limit: num("limit"),
+	})
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, map[string]interface{}{"entries": entries})
 }
 
 // ---- /api/projects ----
@@ -280,6 +434,7 @@ func (h *RestHandler) projects(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: p.ID, Payload: p, At: time.Now()})
+		h.svc.Record(r.Context(), pr, projectAudit("project.create", p.ID, "created project "+p.Name))
 		jsonOK(w, p)
 	default:
 		http.Error(w, "method not allowed", 405)
@@ -326,6 +481,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			fail(w, err, 400)
 			return
 		}
+		h.svc.Record(r.Context(), pr, projectAudit("project.import", newProject.ID, "imported project "+newProject.Name+" from an export"))
 
 		// Spawn the new project's actor via registry.Get — this triggers loadAndSpawnEpics
 		pid, err := h.registry.Get(newProject.ID)
@@ -395,6 +551,49 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "approve-plan":
+		// POST: a person approves the project's plan as it stands now.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		proj, err := h.svc.ApprovePlan(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		h.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
+		jsonOK(w, map[string]interface{}{"project": proj})
+		return
+
+	case "report":
+		// GET ?since=&until= (RFC 3339; default the last 7 days) &group_by=<metadata key>
+		q := r.URL.Query()
+		until, since := time.Now(), time.Now().Add(-7*24*time.Hour)
+		if v := q.Get("until"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				jsonErr(w, fmt.Errorf("until: %w", err), 400)
+				return
+			}
+			until = t
+		}
+		if v := q.Get("since"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				jsonErr(w, fmt.Errorf("since: %w", err), 400)
+				return
+			}
+			since = t
+		}
+		report, err := h.svc.ProjectReport(r.Context(), pr, projectID, since, until, q.Get("group_by"))
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, report)
+		return
+
 	case "plan-check":
 		report, err := h.svc.CheckPlan(r.Context(), pr, projectID)
 		if err != nil {
@@ -415,6 +614,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	case "teams":
 		h.projectTeams(w, r, pr, projectID, lvl, parts[2:])
+		return
+
+	case "webhooks":
+		h.webhookCollection(w, r, pr, nil, &projectID)
 		return
 
 	case "reset":
@@ -440,6 +643,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		replyCh := make(chan actor.ReplySimple, 1)
 		h.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
 		<-replyCh
+		h.svc.Record(r.Context(), pr, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 		jsonOK(w, map[string]interface{}{"project_id": projectID, "reset": true})
 		return
 
@@ -536,6 +740,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+		h.svc.Record(r.Context(), pr, projectAudit("project.archive", p.ID, "archived project "+p.Name))
 		jsonOK(w, p)
 		return
 
@@ -554,6 +759,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		h.hub.Publish(domain.Event{Type: domain.EventProjectRestored, ProjectID: p.ID, Payload: p, At: time.Now()})
+		h.svc.Record(r.Context(), pr, projectAudit("project.restore", p.ID, "restored project "+p.Name))
 		jsonOK(w, p)
 		return
 
@@ -702,29 +908,19 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"epic": epic})
 
 		case http.MethodPatch:
-			var body struct {
-				Name        string               `json:"name"`
-				Description string               `json:"description"`
-				Priority    string               `json:"priority"`
-				Metadata    domain.MetadataPatch `json:"metadata"`
-			}
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			var req domain.UpdateEpicRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}
-			if _, _, err := body.Metadata.Split(); err != nil {
+			if _, _, err := req.Metadata.Split(); err != nil {
 				jsonErr(w, err, 400)
 				return
 			}
-			if err := h.repo.UpdateEpic(r.Context(), epicID, body.Name, body.Description, body.Priority); err != nil {
-				jsonErr(w, err, 500)
+			req.EpicID = epicID
+			if err := h.sendUpdate(epic.ProjectID, &actor.MsgUpdateEpic{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
+				jsonErr(w, err, 400)
 				return
-			}
-			if body.Metadata != nil {
-				if _, err := h.repo.MergeMetadata(r.Context(), "epic", epicID, body.Metadata); err != nil {
-					jsonErr(w, err, 500)
-					return
-				}
 			}
 			updated, err := h.repo.GetEpic(r.Context(), epicID)
 			if err != nil {
@@ -740,7 +936,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"epic": updated})
 
 		case http.MethodDelete:
-			if err := h.svc.DeleteEpic(r.Context(), epic); err != nil {
+			if err := h.svc.DeleteEpic(r.Context(), pr, epic); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
@@ -857,30 +1053,19 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"story": story})
 
 	case http.MethodPatch:
-		var body struct {
-			Name               string               `json:"name"`
-			Description        string               `json:"description"`
-			AcceptanceCriteria string               `json:"acceptance_criteria"`
-			Priority           string               `json:"priority"`
-			Metadata           domain.MetadataPatch `json:"metadata"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		var req domain.UpdateStoryRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
-		if _, _, err := body.Metadata.Split(); err != nil {
+		if _, _, err := req.Metadata.Split(); err != nil {
 			jsonErr(w, err, 400)
 			return
 		}
-		if err := h.repo.UpdateStory(r.Context(), storyID, body.Name, body.Description, body.AcceptanceCriteria, body.Priority); err != nil {
-			jsonErr(w, err, 500)
+		req.StoryID = storyID
+		if err := h.sendUpdate(story.ProjectID, &actor.MsgUpdateStory{Req: req, ReplyCh: make(chan actor.ReplySimple, 1)}); err != nil {
+			jsonErr(w, err, 400)
 			return
-		}
-		if body.Metadata != nil {
-			if _, err := h.repo.MergeMetadata(r.Context(), "story", storyID, body.Metadata); err != nil {
-				jsonErr(w, err, 500)
-				return
-			}
 		}
 		updated, err := h.repo.GetStory(r.Context(), storyID)
 		if err != nil {
@@ -891,7 +1076,7 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"story": updated})
 
 	case http.MethodDelete:
-		if err := h.svc.DeleteStory(r.Context(), story); err != nil {
+		if err := h.svc.DeleteStory(r.Context(), pr, story); err != nil {
 			jsonErr(w, err, 500)
 			return
 		}
@@ -900,6 +1085,24 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+// sendUpdate routes an epic or story edit through the project's actors, so
+// their in-memory copies stay current, and waits for the reply.
+func (h *RestHandler) sendUpdate(projectID int, msg interface{}) error {
+	pid, err := h.registry.Get(projectID)
+	if err != nil {
+		return err
+	}
+	var reply chan actor.ReplySimple
+	switch m := msg.(type) {
+	case *actor.MsgUpdateEpic:
+		reply = m.ReplyCh
+	case *actor.MsgUpdateStory:
+		reply = m.ReplyCh
+	}
+	h.registry.System().Root.Send(pid, msg)
+	return (<-reply).Err
 }
 
 // ---- /api/tasks/:id  and sub-routes ----
@@ -973,7 +1176,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"task": updated})
 
 		case http.MethodDelete:
-			if _, err := h.svc.DeleteTask(r.Context(), task); err != nil {
+			if _, err := h.svc.DeleteTask(r.Context(), pr, task); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
@@ -1034,6 +1237,24 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})
+
+	case "unblock":
+		// POST {answer}: answer an agent's flag (a ticket blocked with a
+		// reason) and put the ticket back to ready.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			Answer string `json:"answer"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		t, err := h.svc.AnswerQuestion(r.Context(), pr, taskID, body.Answer)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"task": t})
 
 	case "comments":
 		switch r.Method {

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
@@ -73,6 +74,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Who you are acting as in AMP: your user, your orgs and your teams. Tickets you create are yours by default; "+
 			"amp_list_tasks shows your own work unless you pass owner.",
 		props{}), wrap(ctx, s.open(s.whoami)))
+
+	mcp.AddTool(tool("amp_audit_log",
+		"Read the audit log: who changed access (org, team, project links, roles, accounts, API tokens), settings, or "+
+			"integrations, and who deleted what. Global admins read everything; org owners/admins pass org_id; "+
+			"project owners pass project_id. Newest first.",
+		props{
+			"org_id":     num("Optional. Entries for this org and its projects."),
+			"project_id": num("Optional. Entries for this project."),
+			"actor_id":   num("Optional. Only changes made by this user id."),
+			"action":     str("Optional. An action (e.g. 'org.member.set') or a prefix ending in '.' (e.g. 'team.')."),
+			"before_id":  num("Optional. Page back: entries older than this id."),
+			"limit":      num("Optional. Default 100, max 500."),
+		}), wrap(ctx, s.open(s.auditLog)))
 
 	mcp.AddTool(tool("amp_list_project_members",
 		"List the people with access to a project (id, email, access level). Use to find who a ticket can be assigned to.",
@@ -223,8 +237,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("Optional. New project name."),
 			"description":   str("Optional. New project description."),
 			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
-			"metadata":      obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
+			"require_plan_approval": boolean("Optional. When true, tickets planned after the plan was last approved can't be dispatched until " +
+				"a person approves the plan again (amp_approve_plan, or Approve plan in AMP)."),
+			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
+
+	mcp.AddTool(tool("amp_approve_plan",
+		"Record that the user approved the project's plan as it stands now, so its tickets may be dispatched. Call it when the "+
+			"user approves your plan in chat (\"approved\", \"go ahead\"), never on your own. People can also approve in AMP's "+
+			"Flight plan. amp_check_plan lists the open tickets planned since the last approval (awaiting_approval); projects with "+
+			"require_plan_approval refuse to dispatch those until the plan is approved.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+		}), wrap(ctx, s.guard(authz.Member, s.approvePlan)))
 
 	// ---- Epics ----
 	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project. Epics and stories group work; what AMP schedules is the "+
@@ -250,6 +275,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("New epic name."),
 			"description":   str("New epic description."),
 			"priority":      str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":         strArr(clearDesc("description")),
 			"add_owners":    strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners": strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateEpic)))
@@ -281,6 +307,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"description":         str("New story description."),
 			"acceptance_criteria": str("New acceptance criteria."),
 			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"clear":               strArr(clearDesc("description, acceptance_criteria")),
 			"add_owners":          strArr("Optional. Users (email, id, or 'me') to add as owners."),
 			"remove_owners":       strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateStory)))
@@ -379,7 +406,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_check_plan",
 		"Check a project's plan before dispatching: tickets connected to nothing, too many tickets that can start at once "+
 			"(a sign of missing dependencies), empty stories, and the longest dependency chain. Also repairs tickets stuck "+
-			"blocked on dependencies that are all done. Run it after planning and after changing the plan.",
+			"blocked on dependencies that are all done. Run it after planning and after changing the plan. "+
+			"awaiting_approval lists open tickets planned since the user last approved the plan (see amp_approve_plan).",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.checkPlan)))
@@ -387,7 +415,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_list_tasks",
 		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
 			"Pass owner='unassigned' to see the pool anyone can pick up, owner='any' for everything, or a user's email/id. "+
-			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time.",
+			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time. "+
+			"questions lists blocked tickets whose block_reason is a question for a person (they are also in blocked): ask the user, then amp_answer_question.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
@@ -410,6 +439,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
+			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -436,11 +466,24 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it.",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 
-	mcp.AddTool(tool("amp_block_task", "Block a task with a reason.",
+	mcp.AddTool(tool("amp_block_task",
+		"Stop work on a ticket because it needs a person: a question, a decision, missing information, or access you don't have. "+
+			"The reason is shown to people in AMP as the question to answer, so write it as one, with the options if there are any. "+
+			"The ticket leaves in-progress and appears in amp_list_tasks' questions list. When someone answers (in the AMP UI, or with "+
+			"amp_answer_question) the answer is posted on the ticket and it goes back to ready to be dispatched again. "+
+			"Not for waiting on other tickets: that's what dependencies are for.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
-			"reason":  str("REQUIRED. Why the task is blocked."),
+			"reason":  str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
 		}), wrap(ctx, s.guard(authz.Member, s.blockTask)))
+	mcp.AddTool(tool("amp_answer_question",
+		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
+			"and the ticket goes back to ready (or to waiting, if it still depends on unfinished tickets), so the next dispatch picks it up "+
+			"with the answer in its comments. Use this when the user answers a worker's question in your chat; people can also answer in the AMP UI.",
+		props{
+			"task_id": num("REQUIRED. Task ID of the ticket with the question."),
+			"answer":  str("REQUIRED. The answer, as the person gave it, with any detail the next worker needs."),
+		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{
@@ -668,6 +711,7 @@ func (s *Server) createProject(rctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.create", p.ID, "created project "+p.Name))
 	return jsonResult(p)
 }
 
@@ -691,7 +735,8 @@ func (s *Server) listProjects(rctx context.Context, _ map[string]interface{}) (*
 
 func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	p := caller(rctx).p
-	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super}
+	out := map[string]interface{}{"user_id": p.UserID, "email": p.Email, "global_admin": p.Super,
+		"account": map[bool]string{true: domain.UserKindAgent, false: domain.UserKindHuman}[p.Agent], "via_api_token": p.ViaToken}
 	if p.HasUser() {
 		orgs, err := s.repo.ListOrgs(rctx, p.UserRef())
 		if err != nil {
@@ -713,6 +758,17 @@ func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.
 		out["orgs"] = withTeams
 	}
 	return jsonResult(out)
+}
+
+func (s *Server) auditLog(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	entries, err := s.svc.Audit(rctx, caller(rctx).p, domain.AuditFilter{
+		OrgID: optInt(args, "org_id", 0), ProjectID: optInt(args, "project_id", 0), ActorUserID: optInt(args, "actor_id", 0),
+		Action: optStr(args, "action", ""), BeforeID: int64(optInt(args, "before_id", 0)), Limit: optInt(args, "limit", 0),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"entries": entries, "count": len(entries)})
 }
 
 func (s *Server) listProjectMembers(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -767,7 +823,7 @@ func (s *Server) getProject(_ context.Context, args map[string]interface{}) (*mc
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) archiveProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -777,7 +833,21 @@ func (s *Server) archiveProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectArchived, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.archive", p.ID, "archived project "+p.Name))
 	return jsonResult(map[string]interface{}{"project": p})
+}
+
+func (s *Server) approvePlan(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	id, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	proj, err := s.svc.ApprovePlan(rctx, caller(rctx).p, id)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"project_id": id, "plan_approved_at": proj.PlanApprovedAt,
+		"next": "Approved: dispatch everything in ready_to_dispatch."})
 }
 
 func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -788,6 +858,9 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	var u domain.ProjectSettings
 	if on, ok := args["open_reassign"].(bool); ok {
 		u.OpenReassign = &on
+	}
+	if on, ok := args["require_plan_approval"].(bool); ok {
+		u.RequirePlanApproval = &on
 	}
 	if v, ok := args["name"].(string); ok {
 		u.Name = &v
@@ -806,7 +879,7 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
-func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) restoreProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	id, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -816,6 +889,7 @@ func (s *Server) restoreProject(_ context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventProjectRestored, ProjectID: p.ID, Payload: p, At: time.Now()})
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.restore", p.ID, "restored project "+p.Name))
 	return jsonResult(map[string]interface{}{"project": p})
 }
 
@@ -1167,7 +1241,7 @@ func (s *Server) deleteStory(rctx context.Context, args map[string]interface{}) 
 	if err := s.checkProjectNotArchived(rctx, story.ProjectID); err != nil {
 		return nil, err
 	}
-	if err := s.svc.DeleteStory(rctx, story); err != nil {
+	if err := s.svc.DeleteStory(rctx, caller(rctx).p, story); err != nil {
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"story_id": storyID, "deleted": true})
@@ -1214,6 +1288,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	inProgress := make([]domain.Task, 0)
 	blocked := make([]domain.Task, 0)
 	scheduled := make([]domain.Task, 0)
+	questions := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
 	tasks := authz.FilterTasks(reply.Tasks, view, me.UserID)
 	for _, t := range tasks {
@@ -1228,6 +1303,9 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 				scheduled = append(scheduled, t)
 			} else {
 				blocked = append(blocked, t)
+				if t.BlockReason != "" {
+					questions = append(questions, t)
+				}
 			}
 		case domain.TaskStateCompleted:
 			completed = append(completed, t)
@@ -1239,6 +1317,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"in_progress":       inProgress,
 		"blocked":           blocked,   // each has blocked_by_ids showing what's in the way
 		"scheduled":         scheduled, // tasks waiting for their start_at time
+		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
@@ -1300,6 +1379,7 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		Priority:    optStr(args, "priority", ""),
 
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1337,6 +1417,7 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		Name:        optStr(args, "name", ""),
 		Description: optStr(args, "description", ""),
 		Priority:    optStr(args, "priority", ""),
+		Clear:       optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1382,6 +1463,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", ""),
+		Clear:              optStrSlice(args, "clear"),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1464,7 +1546,13 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
 		return nil, err
 	}
-	reason := optStr(args, "reason", "")
+	reason, err := reqStr(args, "reason")
+	if err != nil || strings.TrimSpace(reason) == "" {
+		return nil, fmt.Errorf("reason is required: the question or problem a person needs to resolve")
+	}
+	if strings.HasPrefix(reason, "scheduled:") {
+		return nil, fmt.Errorf("reason can't start with \"scheduled:\"; use amp_set_task_start_at to schedule a ticket")
+	}
 	task, err := s.repo.GetTask(context.Background(), taskID)
 	if err != nil {
 		return nil, err
@@ -1483,6 +1571,33 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "state": "blocked"})
+}
+
+func (s *Server) answerQuestion(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	answer, err := reqStr(args, "answer")
+	if err != nil || strings.TrimSpace(answer) == "" {
+		return nil, fmt.Errorf("answer is required")
+	}
+	t, err := s.repo.GetTask(rctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %d not found", taskID)
+	}
+	if err := s.checkProjectNotArchived(rctx, t.ProjectID); err != nil {
+		return nil, err
+	}
+	task, err := s.svc.AnswerQuestion(rctx, caller(rctx).p, taskID, answer)
+	if err != nil {
+		return nil, err
+	}
+	next := "It's ready: dispatch it again and the worker will find the answer in the ticket's comments."
+	if task.State == domain.TaskStateBlocked {
+		next = "It still waits on unfinished dependencies; it becomes ready when they're done."
+	}
+	return jsonResult(map[string]interface{}{"task_id": taskID, "state": task.State, "next": next})
 }
 
 func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1563,7 +1678,7 @@ func (s *Server) getTicketHistory(_ context.Context, args map[string]interface{}
 	})
 }
 
-func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) resetProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -1587,6 +1702,7 @@ func (s *Server) resetProject(_ context.Context, args map[string]interface{}) (*
 	replyCh := make(chan actor.ReplySimple, 1)
 	s.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
 	<-replyCh
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 	return jsonResult(map[string]interface{}{
 		"project_id": projectID,
 		"reset":      true,
@@ -1610,7 +1726,7 @@ func (s *Server) deleteTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Tickets that waited on this one are updated (and unblocked if nothing else holds them).
-	dependents, err := s.svc.DeleteTask(rctx, task)
+	dependents, err := s.svc.DeleteTask(rctx, caller(rctx).p, task)
 	if err != nil {
 		return nil, fmt.Errorf("delete task: %w", err)
 	}
@@ -1633,7 +1749,7 @@ func (s *Server) deleteEpic(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Deletes its stories and tickets; tickets elsewhere that waited on them are updated.
-	if err := s.svc.DeleteEpic(rctx, epic); err != nil {
+	if err := s.svc.DeleteEpic(rctx, caller(rctx).p, epic); err != nil {
 		return nil, fmt.Errorf("delete epic: %w", err)
 	}
 	return jsonResult(map[string]interface{}{"epic_id": epicID, "deleted": true})
@@ -1835,6 +1951,7 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	if err != nil {
 		return nil, fmt.Errorf("import bundle: %w", err)
 	}
+	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.import", newProject.ID, "imported project "+newProject.Name+" from an export"))
 
 	// 2. Spawn the ProjectActor for the new project
 	pid, err := s.registry.Get(newProject.ID)
@@ -1867,6 +1984,16 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 
 // optMetadataPatch reads the "metadata" argument as a change to existing
 // metadata (null removes a key); nil when it's absent.
+// projectAudit is an audit entry about a whole project.
+func projectAudit(action string, projectID int, summary string) domain.AuditEntry {
+	return domain.AuditEntry{Action: action, ProjectID: &projectID, TargetType: "project", TargetID: strconv.Itoa(projectID), Summary: summary}
+}
+
+// clearDesc documents an update tool's clear parameter.
+func clearDesc(fields string) string {
+	return "Optional. Fields to blank (" + fields + "). An empty or omitted field is left unchanged, so name it here to remove its text."
+}
+
 func optMetadataPatch(args map[string]interface{}) (domain.MetadataPatch, error) {
 	v, ok := args["metadata"]
 	if !ok || v == nil {

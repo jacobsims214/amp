@@ -1,7 +1,9 @@
-import { Bot, GitBranch, AlertCircle, Calendar } from 'lucide-react'
+import { Calendar, GitBranch } from 'lucide-react'
 import type { Task } from '../types'
 import type { Person } from '../lib/people'
-import { PriorityBadge } from './PriorityBadge'
+import { displayState, STATE_LABEL, STATE_VAR } from '../lib/ticketState'
+import { PriorityMark } from './ui/PriorityMark'
+import { Avatar } from './ui/Avatar'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 
 interface Props {
@@ -13,131 +15,62 @@ interface Props {
   owner?: Person | null
 }
 
-// Shorten agent names for compact display on cards
-function shortAgent(s: string) {
-  return s.replace('amp-worker-', '').replace('amp-worker', 'worker').slice(0, 18)
+function formatStart(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
 }
 
-// Extract start_at datetime from block_reason
-function getScheduledStartAt(task: Task): string | null {
-  if (!task.block_reason?.startsWith('scheduled:')) return null
-  return task.block_reason.replace('scheduled:', '')
-}
-
-// Format scheduled start datetime
-function formatScheduledStart(isoString: string): string {
-  try {
-    const date = new Date(isoString)
-    return date.toLocaleString('en-US', {
-      month: 'short',
-      day: 'numeric',
-      hour: 'numeric',
-      minute: '2-digit',
-      hour12: true,
-    })
-  } catch {
-    return 'Invalid date'
-  }
-}
-
-// Left-border accent color per column state
-const STATE_ACCENT: Record<string, string> = {
-  scheduled:   'before:bg-[#F59E0B]',
-  backlog:     'before:bg-[#283A57]',
-  in_progress: 'before:bg-[#6366F1]',
-  blocked:     'before:bg-[#EF4444]',
-  completed:   'before:bg-[#10B981]',
-}
-
-export function TaskCard({ task, onClick, dimmed = false, isScheduled = false, owner = null }: Props) {
-  const activeAgent = task.agent_id
-  const plannedAgent = !activeAgent && task.assigned_to ? task.assigned_to : null
-  const scheduledStartAt = isScheduled ? getScheduledStartAt(task) : null
-
-  // Determine logical state for accent bar
-  const logicalState = isScheduled ? 'scheduled'
-    : task.state === 'in_progress' ? 'in_progress'
-    : task.state === 'blocked' ? 'blocked'
-    : task.state === 'completed' ? 'completed'
-    : 'backlog'
-
-  const accentClass = STATE_ACCENT[logicalState] ?? STATE_ACCENT.backlog
+/** A ticket on the board: white, square, a state-colored left edge, its ID
+ *  and priority, the agent on it (or the planned profile), and its owner.
+ *  A question shows the question itself. */
+export function TaskCard({ task, onClick, dimmed = false, owner = null }: Props) {
+  const state = displayState(task)
+  const startAt = state === 'sched' ? (task.start_at ?? task.block_reason?.replace('scheduled:', '')) : null
+  const waitingOn = task.blocked_by_ids?.length ?? 0
 
   return (
-    <div
+    <button
+      type="button"
       onClick={onClick}
-      className={`
-        group relative cursor-pointer rounded-xl border transition-all duration-200
-        before:absolute before:left-0 before:top-2 before:bottom-2 before:w-0.5 before:rounded-full
-        ${accentClass}
-        ${isScheduled
-          ? 'bg-[#120E00] border-[#F59E0B]/20 hover:border-[#F59E0B]/40'
-          : 'bg-[#111E30] border-[#1E2C45] hover:border-[#6366F1]/35'
-        }
-        hover:bg-[#172540] hover:shadow-lg hover:shadow-black/30 hover:-translate-y-px
-        active:scale-[0.99] active:translate-y-0
-        ${dimmed ? 'opacity-35' : ''}
-      `}
-      style={{ padding: '10px 12px 10px 16px' }}
+      aria-label={`Ticket ${task.id}: ${task.name}, ${STATE_LABEL[state]}`}
+      className={`w-full text-left bg-surface border border-line hover:border-ink cursor-pointer transition-colors grid gap-1.5 ${dimmed ? 'opacity-35' : ''}`}
+      style={{ padding: '8px 10px 9px 12px', boxShadow: `inset 3px 0 0 ${STATE_VAR[state]}`, borderRadius: 'var(--radius)' }}
     >
-      <div className="flex flex-col gap-2">
-        {/* Planned agent badge (agent profile, not the human owner) */}
-        {plannedAgent && (
-          <div
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-dashed border-[#6366F1]/35 bg-[#6366F1]/8 w-fit max-w-full"
-            title={`Planned agent: ${task.assigned_to}`}
-          >
-            <Bot size={10} className="text-[#818CF8] flex-shrink-0" />
-            <span className="text-xs text-[#818CF8] font-medium truncate">{shortAgent(plannedAgent)}</span>
-          </div>
+      <span className="flex items-center gap-2">
+        <span className="amp-num text-[11px] text-ink-3">#{task.id}</span>
+        <PriorityMark priority={task.priority} />
+        {state === 'flag' && (
+          <span className="ml-auto font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] bg-st-flag text-white">Question</span>
         )}
+      </span>
 
-        {/* Active agent badge */}
-        {activeAgent && (
-          <div
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-md border border-[#10B981]/30 bg-[#10B981]/8 w-fit max-w-full"
-            title={`Agent working: ${activeAgent}`}
-          >
-            <Bot size={10} className="text-[#10B981] flex-shrink-0" />
-            <span className="text-xs text-[#10B981] font-medium truncate">{shortAgent(activeAgent)}</span>
-          </div>
-        )}
+      <span className="text-[13px] font-medium text-ink leading-snug line-clamp-2">{task.name}</span>
 
-        {/* Name */}
-        <p className="text-sm font-medium text-[#DDE6F0] leading-snug line-clamp-2 group-hover:text-white transition-colors">
-          {task.name}
-        </p>
+      {state === 'flag' && task.block_reason && (
+        <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{task.block_reason}</span>
+      )}
+      {startAt && (
+        <span className="flex items-center gap-1.5 text-[11.5px] text-violet"><Calendar size={11} className="flex-shrink-0" />Starts {formatStart(startAt)}</span>
+      )}
 
-        {/* Scheduled start */}
-        {scheduledStartAt && (
-          <div className="flex items-center gap-1.5 text-xs text-[#FBBF24]">
-            <Calendar size={11} className="flex-shrink-0" />
-            <span>Starts {formatScheduledStart(scheduledStartAt)}</span>
-          </div>
-        )}
-
-        {/* Footer row */}
-        <div className="flex items-center justify-between gap-2 mt-0.5">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-[#3D5068] font-mono tabular-nums">#{task.id}</span>
-            <PriorityBadge priority={task.priority} />
-          </div>
-          <div className="flex items-center gap-2">
-            {task.blocked_by_ids && task.blocked_by_ids.length > 0 && (
-              <div className="flex items-center gap-1 text-[#F87171]" title={`Blocked by #${task.blocked_by_ids.join(', #')}`}>
-                <AlertCircle size={11} />
-                <span className="text-xs">{task.blocked_by_ids.length}</span>
-              </div>
-            )}
-            {task.dependency_ids?.length > 0 && !(task.blocked_by_ids?.length) && (
-              <div className="flex items-center gap-1 text-[#3D5068]" title="Has dependencies">
-                <GitBranch size={11} />
-              </div>
-            )}
-            {owner ? <OwnerAvatar person={owner} title="Owner" /> : <UnassignedPill />}
-          </div>
-        </div>
-      </div>
-    </div>
+      <span className="flex items-center gap-2 min-w-0 pt-0.5">
+        {task.agent_id ? (
+          <span className="inline-flex items-center gap-1.5 min-w-0" title={`Agent working: ${task.agent_id}`}>
+            <Avatar name={task.agent_id} kind="agent" size={18} />
+            <span className="amp-num text-[11px] text-ink-2 truncate">{task.agent_id}</span>
+          </span>
+        ) : task.assigned_to ? (
+          <span className="amp-num text-[11px] text-ink-3 truncate" title={`Planned agent profile: ${task.assigned_to}`}>{task.assigned_to}</span>
+        ) : <span />}
+        <span className="ml-auto flex items-center gap-2 flex-shrink-0">
+          {waitingOn > 0 && (
+            <span className="inline-flex items-center gap-1 amp-num text-[11px] text-ink-3" title={`Waiting on #${task.blocked_by_ids!.join(', #')}`}>
+              <GitBranch size={11} />{waitingOn}
+            </span>
+          )}
+          {owner ? <OwnerAvatar person={owner} title="Owner" /> : <UnassignedPill />}
+        </span>
+      </span>
+    </button>
   )
 }

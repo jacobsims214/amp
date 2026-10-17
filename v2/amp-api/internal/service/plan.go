@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -300,15 +301,21 @@ type PlanIssue struct {
 
 // PlanReport summarises a project's dependency graph and what looks wrong.
 type PlanReport struct {
-	OK              bool        `json:"ok"`
-	Tasks           int         `json:"tasks"`
-	OpenTasks       int         `json:"open_tasks"`
-	Dependencies    int         `json:"dependencies"`
-	ReadyNow        []int       `json:"ready_now"`
-	LongestChain    int         `json:"longest_chain"` // tickets on the longest dependency path
-	Issues          []PlanIssue `json:"issues"`
-	RepairedTaskIDs []int       `json:"repaired_task_ids,omitempty"`
-	Summary         string      `json:"summary"`
+	OK bool `json:"ok"`
+	// Plan approval: open tickets planned since the last approval, when
+	// that was, and whether the project requires it before dispatch.
+	AwaitingApproval    []int       `json:"awaiting_approval"`
+	ApprovedAt          *time.Time  `json:"plan_approved_at,omitempty"`
+	ApprovedBy          *int        `json:"plan_approved_by,omitempty"`
+	RequirePlanApproval bool        `json:"require_plan_approval"`
+	Tasks               int         `json:"tasks"`
+	OpenTasks           int         `json:"open_tasks"`
+	Dependencies        int         `json:"dependencies"`
+	ReadyNow            []int       `json:"ready_now"`
+	LongestChain        int         `json:"longest_chain"` // tickets on the longest dependency path
+	Issues              []PlanIssue `json:"issues"`
+	RepairedTaskIDs     []int       `json:"repaired_task_ids,omitempty"`
+	Summary             string      `json:"summary"`
 }
 
 // readyFanoutThreshold: more ready tickets than this, when they're also more
@@ -340,7 +347,17 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if err != nil {
 		return nil, err
 	}
-	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}}
+	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}}
+	proj, err := s.Repo.GetProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	r.ApprovedAt, r.ApprovedBy, r.RequirePlanApproval = proj.PlanApprovedAt, proj.PlanApprovedBy, proj.RequirePlanApproval
+	for i := range tasks {
+		if tasks[i].State != domain.TaskStateCompleted && proj.AwaitsApproval(&tasks[i]) {
+			r.AwaitingApproval = append(r.AwaitingApproval, tasks[i].ID)
+		}
+	}
 	byID := map[int]domain.Task{}
 	dependents := map[int]int{}
 	for _, t := range tasks {
@@ -623,14 +640,19 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 // dependencies afterwards.
 
 // DeleteTask deletes a ticket (permission already checked).
-func (s *Service) DeleteTask(ctx context.Context, t *domain.Task) ([]int, error) {
-	return s.deleteTickets(ctx, t.ProjectID, []int{t.ID}, func() error {
+func (s *Service) DeleteTask(ctx context.Context, p authz.Principal, t *domain.Task) ([]int, error) {
+	dependents, err := s.deleteTickets(ctx, t.ProjectID, []int{t.ID}, func() error {
 		return s.Repo.DeleteTask(ctx, t.ID)
 	}, &actor.MsgDeleteTask{TaskID: t.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "task.delete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(t.ID),
+			Summary: fmt.Sprintf("deleted ticket #%d %q", t.ID, t.Name), Details: map[string]any{"story_id": t.StoryID, "state": t.State}})
+	}
+	return dependents, err
 }
 
 // DeleteStory deletes a story and its tickets (permission already checked).
-func (s *Service) DeleteStory(ctx context.Context, st *domain.Story) error {
+func (s *Service) DeleteStory(ctx context.Context, p authz.Principal, st *domain.Story) error {
 	ids, err := s.Repo.TaskIDsInStories(ctx, []int{st.ID})
 	if err != nil {
 		return err
@@ -638,12 +660,16 @@ func (s *Service) DeleteStory(ctx context.Context, st *domain.Story) error {
 	_, err = s.deleteTickets(ctx, st.ProjectID, ids, func() error {
 		return s.Repo.DeleteStory(ctx, st.ID)
 	}, &actor.MsgDeleteStory{StoryID: st.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "story.delete", ProjectID: intRef(st.ProjectID), TargetType: "story", TargetID: idStr(st.ID),
+			Summary: fmt.Sprintf("deleted story %q and its %d tickets", st.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
+	}
 	return err
 }
 
 // DeleteEpic deletes an epic, its stories, and their tickets (permission
 // already checked).
-func (s *Service) DeleteEpic(ctx context.Context, e *domain.Epic) error {
+func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.Epic) error {
 	ids, err := s.Repo.TaskIDsInEpic(ctx, e.ID)
 	if err != nil {
 		return err
@@ -651,6 +677,10 @@ func (s *Service) DeleteEpic(ctx context.Context, e *domain.Epic) error {
 	_, err = s.deleteTickets(ctx, e.ProjectID, ids, func() error {
 		return s.Repo.DeleteEpic(ctx, e.ID)
 	}, &actor.MsgDeleteEpic{EpicID: e.ID})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "epic.delete", ProjectID: intRef(e.ProjectID), TargetType: "epic", TargetID: idStr(e.ID),
+			Summary: fmt.Sprintf("deleted epic %q with its stories and %d tickets", e.Name, len(ids)), Details: map[string]any{"task_ids": ids}})
+	}
 	return err
 }
 
@@ -692,4 +722,73 @@ func (s *Service) deleteTickets(ctx context.Context, projectID int, ids []int, d
 		}
 	}
 	return kept, nil
+}
+
+// ---- Answering an agent's question ----
+
+// AnswerQuestion answers a question: a ticket an agent blocked with a reason
+// because it needs a person. The answer, if any, is posted as a comment first; then
+// the ticket goes back to ready, or to waiting if it still depends on
+// unfinished work.
+func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID int, answer string) (*domain.Task, error) {
+	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
+	if err != nil {
+		return nil, err
+	}
+	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
+		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
+	}
+	if answer = strings.TrimSpace(answer); answer != "" {
+		added := make(chan actor.ReplyAddComment, 1)
+		if err := s.Registry.Send(t.ProjectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
+			TaskID: taskID, Author: p.Email, Body: answer, AuthorUserID: p.UserRef(),
+		}, ReplyCh: added}); err != nil {
+			return nil, err
+		}
+		if r := <-added; r.Err != nil {
+			return nil, r.Err
+		}
+	}
+	set := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: "", By: p.UserRef(), ReplyCh: set}); err != nil {
+		return nil, err
+	}
+	if r := <-set; r.Err != nil {
+		return nil, r.Err
+	}
+	// Back to waiting if a dependency is unfinished.
+	rec := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgReconcileDeps{TaskID: taskID, ReplyCh: rec}); err != nil {
+		return nil, err
+	}
+	if r := <-rec; r.Err != nil {
+		return nil, r.Err
+	}
+	got := make(chan actor.ReplyGetTask, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgGetTask{TaskID: taskID, ReplyCh: got}); err != nil {
+		return nil, err
+	}
+	r := <-got
+	return r.Task, r.Err
+}
+
+// ---- Plan approval ----
+
+// ApprovePlan records that a person approved the project's plan as it is
+// now: every ticket planned so far may be dispatched. Team leads and
+// project owners can approve; agents can't (a person approves agents' plans).
+func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
+	if p.Agent {
+		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
+	}
+	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Lead); err != nil {
+		return nil, err
+	}
+	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef())
+	if err != nil {
+		return nil, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+		Summary: fmt.Sprintf("approved the plan of %s", proj.Name)})
+	return proj, nil
 }

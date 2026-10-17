@@ -15,10 +15,10 @@ interface Props {
 
 const STATE_OPTIONS = [
   { value: '', label: 'All' },
-  { value: 'backlog',     label: 'Backlog',      dot: 'bg-[#7E91A8]' },
-  { value: 'in_progress', label: 'In Progress',  dot: 'bg-[#818CF8]' },
-  { value: 'completed',   label: 'Done',         dot: 'bg-[#10B981]' },
-  { value: 'blocked',     label: 'Blocked',      dot: 'bg-[#EF4444]' },
+  { value: 'backlog',     label: 'Ready',        dot: 'bg-st-ready' },
+  { value: 'in_progress', label: 'In progress',  dot: 'bg-st-prog' },
+  { value: 'completed',   label: 'Done',         dot: 'bg-st-done' },
+  { value: 'blocked',     label: 'Waiting & questions', dot: 'bg-st-flag' },
 ] as const
 
 function parseOwner(v: string): OwnerFilter {
@@ -32,18 +32,18 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
     <div className="flex items-center gap-2.5 flex-wrap">
       {/* Search */}
       <div className="relative flex-1 min-w-[200px]">
-        <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#3D5068] pointer-events-none" />
+        <Search size={13} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none" />
         <input
           type="text"
           placeholder="Search tasks, epics, stories…"
           value={filter.query}
           onChange={e => onChange({ ...filter, query: e.target.value })}
-          className="w-full bg-[#0D1726] border border-[#1E2C45] rounded-lg pl-9 pr-8 py-2 text-sm text-[#DDE6F0] placeholder-[#3D5068] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 transition-all"
+          className="w-full bg-surface border border-line  pl-9 pr-8 py-2 text-sm text-ink placeholder-ink-3 focus:outline-none focus:border-ink transition-all"
         />
         {filter.query && (
           <button
             onClick={() => onChange({ ...filter, query: '' })}
-            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#3D5068] hover:text-[#DDE6F0] transition-colors cursor-pointer"
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 text-ink-3 hover:text-ink transition-colors cursor-pointer"
           >
             <X size={12} />
           </button>
@@ -51,25 +51,25 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
       </div>
 
       {/* State filter pills */}
-      <div className="flex items-center gap-1 p-1 rounded-lg" style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
+      <div className="flex items-center gap-1 p-1 " style={{ background: 'var(--surface)', border: '1px solid var(--line)' }}>
         {STATE_OPTIONS.map(opt => {
           const isActive = filter.state === opt.value
           return (
             <button
               key={opt.value}
               onClick={() => onChange({ ...filter, state: opt.value as FilterState['state'] })}
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-md text-xs font-medium transition-all cursor-pointer ${
+              className={`flex items-center gap-1.5 px-3 py-1  text-xs font-medium transition-all cursor-pointer ${
                 isActive
-                  ? 'bg-[#172540] text-[#DDE6F0] shadow-sm'
-                  : 'text-[#7E91A8] hover:text-[#DDE6F0] hover:bg-[#111E30]'
+                  ? 'bg-ink text-on-ink'
+                  : 'text-ink-2 hover:text-ink hover:bg-surface-2'
               }`}
             >
               {'dot' in opt && (
-                <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${opt.dot} ${isActive ? 'opacity-100' : 'opacity-60'}`} />
+                <span className={`w-2 h-2 flex-shrink-0 ${opt.dot} ${isActive ? 'opacity-100' : 'opacity-60'}`} />
               )}
               {opt.label}
               {opt.value && (
-                <span className={`tabular-nums ${isActive ? 'text-[#7E91A8]' : 'text-[#3D5068]'}`}>
+                <span className={`tabular-nums ${isActive ? 'text-ink-2' : 'text-ink-3'}`}>
                   {counts[opt.value as keyof typeof counts]}
                 </span>
               )}
@@ -80,12 +80,12 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
 
       {/* Owner filter */}
       <div className="relative">
-        <UserRound size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#3D5068] pointer-events-none" />
+        <UserRound size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none" />
         <select
           value={String(filter.owner)}
           onChange={e => onChange({ ...filter, owner: parseOwner(e.target.value) })}
           title="Whose tickets to show"
-          className="bg-[#0D1726] border border-[#1E2C45] rounded-lg pl-8 pr-3 py-2 text-sm text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 appearance-none cursor-pointer transition-all"
+          className="bg-surface border border-line  pl-8 pr-3 py-2 text-sm text-ink focus:outline-none focus:border-ink appearance-none cursor-pointer transition-all"
         >
           <option value="mine">Mine</option>
           <option value="unassigned">Unassigned</option>
@@ -103,11 +103,11 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
       {/* Epic filter */}
       {epicOptions.length > 0 && (
         <div className="relative">
-          <SlidersHorizontal size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#3D5068] pointer-events-none" />
+          <SlidersHorizontal size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none" />
           <select
             value={filter.epicId ?? ''}
             onChange={e => onChange({ ...filter, epicId: e.target.value ? Number(e.target.value) : null })}
-            className="bg-[#0D1726] border border-[#1E2C45] rounded-lg pl-8 pr-3 py-2 text-sm text-[#DDE6F0] focus:outline-none focus:border-[#6366F1] focus:ring-2 focus:ring-[#6366F1]/20 appearance-none cursor-pointer transition-all"
+            className="bg-surface border border-line  pl-8 pr-3 py-2 text-sm text-ink focus:outline-none focus:border-ink appearance-none cursor-pointer transition-all"
           >
             <option value="">All epics</option>
             {epicOptions.map(e => (
@@ -121,7 +121,7 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
       {hasActiveFilter && (
         <button
           onClick={() => onChange(DEFAULT_FILTER)}
-          className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-[#7E91A8] hover:text-[#DDE6F0] border border-[#1E2C45] hover:border-[#283A57] rounded-lg transition-all cursor-pointer"
+          className="flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-ink-2 hover:text-ink border border-line hover:border-line-str  transition-all cursor-pointer"
         >
           <X size={11} />
           Clear
@@ -129,7 +129,7 @@ export function FilterBar({ filter, onChange, epicOptions, memberOptions, counts
       )}
 
       {/* Total */}
-      <span className="text-xs text-[#3D5068] ml-auto tabular-nums">
+      <span className="text-xs text-ink-3 ml-auto tabular-nums">
         {counts.total} task{counts.total !== 1 ? 's' : ''}
       </span>
     </div>

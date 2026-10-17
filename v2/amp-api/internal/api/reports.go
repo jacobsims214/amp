@@ -81,6 +81,21 @@ func (h *RestHandler) velocity(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{"days": days})
 }
 
+// myWork is the home page: my open tickets, flags in projects I can see,
+// and my agents. GET /api/my-work
+func (h *RestHandler) myWork(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	work, err := h.svc.MyWork(r.Context(), pr)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, work)
+}
+
 func (h *RestHandler) metadata(w http.ResponseWriter, r *http.Request) {
 	pr, ok := h.principal(w, r)
 	if !ok {

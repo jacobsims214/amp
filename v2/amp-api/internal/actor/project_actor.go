@@ -175,6 +175,9 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskState:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
+	case *MsgSetTaskStartAt:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
 	case *MsgAddComment:
 		a.routeTaskMsg(ctx, msg.Req.TaskID, msg)
 
@@ -237,6 +240,9 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		a.log.Info("epic completed", "epic_id", msg.EpicID)
 
 	// ---- Management ----
+
+	case *MsgPing:
+		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgReset:
 		for epicID, pid := range a.epics {

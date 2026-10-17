@@ -15,6 +15,9 @@ export interface Project {
   metadata?: Metadata
   created_at: string
   updated_at: string
+  plan_approved_at?: string
+  plan_approved_by?: number
+  require_plan_approval?: boolean
 }
 
 export interface Epic {
@@ -93,6 +96,32 @@ export interface ActivityLog {
   to_state?: string
   detail?: string
   created_at: string
+}
+
+// ---- Plan check (GET /projects/:id/plan-check) ----
+
+export interface PlanIssue {
+  kind: 'isolated' | 'wide_start' | 'empty_stories' | string
+  message: string
+  task_ids?: number[]
+  fix?: string
+}
+
+export interface PlanReport {
+  ok: boolean
+  /** open tickets planned since the plan was last approved */
+  awaiting_approval?: number[]
+  plan_approved_at?: string
+  plan_approved_by?: number
+  require_plan_approval?: boolean
+  tasks: number
+  open_tasks: number
+  dependencies: number
+  ready_now: number[]
+  longest_chain: number
+  issues: PlanIssue[]
+  repaired_task_ids?: number[]
+  summary: string
 }
 
 // ---- Metadata ----
@@ -288,6 +317,8 @@ export interface UpdateEpicRequest {
   description?: string
   priority?: string
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 export interface CreateStoryRequest {
@@ -304,6 +335,8 @@ export interface UpdateStoryRequest {
   acceptance_criteria?: string
   priority?: string
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 export interface CreateTaskRequest {
@@ -329,6 +362,8 @@ export interface UpdateTaskRequest {
   priority?: string
   start_at?: string | null
   metadata?: MetadataPatch
+  /** Fields to blank; an empty value otherwise means "keep". */
+  clear?: string[]
 }
 
 // ---- Auth / users ----
@@ -340,6 +375,87 @@ export interface Me {
   roles: string[]
   user_id?: number
   orgs?: Org[]
+  teams?: { id: number; name: string; org_id: number; role: string }[]
+  kind?: UserKind
+  via_token?: boolean
+}
+
+export type UserKind = 'human' | 'agent'
+
+export interface APIToken {
+  id: number
+  user_id: number
+  name: string
+  prefix: string
+  created_by?: number
+  created_at: string
+  expires_at?: string
+  last_used_at?: string
+  revoked_at?: string
+}
+
+/** A token as just created: the only time `token` is shown. */
+export interface NewAPIToken extends APIToken {
+  token: string
+}
+
+export interface AuditEntry {
+  id: number
+  at: string
+  actor_user_id?: number
+  actor_email: string
+  via_token?: boolean
+  org_id?: number
+  project_id?: number
+  action: string
+  target_type?: string
+  target_id?: string
+  summary: string
+  details?: Record<string, unknown>
+}
+
+export type WebhookFormat = 'json' | 'slack'
+
+export interface Webhook {
+  id: number
+  org_id?: number
+  project_id?: number
+  name: string
+  url: string
+  format: WebhookFormat
+  /** Only present right after create or rotate. */
+  secret?: string
+  events: string[]
+  active: boolean
+  created_by?: number
+  created_at: string
+  updated_at: string
+  last_delivery_at?: string
+  last_status?: number
+  last_error?: string
+  consecutive_failures: number
+}
+
+export interface WebhookChange {
+  name?: string
+  url?: string
+  format?: WebhookFormat
+  events?: string[]
+  active?: boolean
+}
+
+export interface WebhookDelivery {
+  id: number
+  webhook_id: number
+  event_type: string
+  body?: string
+  status: 'pending' | 'delivered' | 'failed'
+  attempts: number
+  next_attempt_at: string
+  last_status?: number
+  last_error?: string
+  created_at: string
+  delivered_at?: string
 }
 
 export interface AmpUser {
@@ -350,6 +466,9 @@ export interface AmpUser {
   roles: string[]
   created_at: string
   last_seen_at: string
+  kind: UserKind
+  managed_by?: number
+  disabled_at?: string
 }
 
 export interface AuthAdminUser {
@@ -389,6 +508,8 @@ export interface Member {
   email: string
   display_name: string
   role: string
+  kind?: UserKind
+  disabled?: boolean
 }
 
 export interface ProjectMember {
@@ -396,6 +517,8 @@ export interface ProjectMember {
   email: string
   display_name: string
   access: ProjectAccess
+  kind?: UserKind
+  disabled?: boolean
 }
 
 export interface ProjectTeam {
@@ -432,4 +555,54 @@ export interface CreateProjectRequest {
   description?: string
   org_id?: number
   team_id?: number
+}
+
+// ---- Home page (GET /my-work) ----
+
+/** A ticket with its project, for views that span projects. */
+export type WorkTask = Task & { project_code: string; project_name: string }
+
+export interface MyAgent {
+  user: AmpUser
+  working: WorkTask[]
+  done_24h: number
+}
+
+export interface MyWork {
+  owned: WorkTask[]
+  flags: WorkTask[]
+  agents: MyAgent[]
+  done_24h: number
+}
+
+// ---- Project report (GET /projects/:id/report) ----
+
+export interface ReportStates {
+  ready: number; in_progress: number; waiting: number; flagged: number; scheduled: number; done: number
+}
+
+export interface ReportGroup {
+  key: string
+  label?: string
+  tickets: number
+  states: ReportStates
+  completed_in_range: number
+  median_cycle_hours?: number
+}
+
+export interface ProjectReport {
+  since: string
+  until: string
+  tickets: number
+  states: ReportStates
+  completed: number
+  dispatched: number
+  created: number
+  median_cycle_hours?: number
+  flag_hours: number
+  agents: ReportGroup[]
+  epics: ReportGroup[]
+  metadata_keys: { key: string; coverage: number }[]
+  group_by?: string
+  breakdown?: ReportGroup[]
 }

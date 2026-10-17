@@ -136,12 +136,18 @@ func (s *Service) CreateOrg(ctx context.Context, p authz.Principal, name, slug, 
 		return nil, nil, err
 	}
 	if inviteOwner == "" {
+		s.audit(ctx, p, domain.AuditEntry{Action: "org.create", OrgID: intRef(org.ID), TargetType: "org", TargetID: idStr(org.ID),
+			Summary: "created org " + org.Name, Details: map[string]any{"owner_id": ownerID}})
 		return org, nil, nil
 	}
 	inv, err := s.Repo.CreateInvite(ctx, domain.Invite{
 		Email: strings.ToLower(strings.TrimSpace(inviteOwner)), OrgID: org.ID,
 		OrgRole: domain.OrgRoleOwner, TeamRole: domain.TeamRoleMember, InvitedBy: p.UserRef(),
 	})
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "org.create", OrgID: intRef(org.ID), TargetType: "org", TargetID: idStr(org.ID),
+			Summary: "created org " + org.Name + ", owner invited: " + inv.Email})
+	}
 	return org, inv, err
 }
 
@@ -159,6 +165,8 @@ func (s *Service) RenameOrg(ctx context.Context, p authz.Principal, orgID int, n
 	if err := s.Repo.RenameOrg(ctx, orgID, strings.TrimSpace(name)); err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "org.rename", OrgID: intRef(orgID), TargetType: "org", TargetID: idStr(orgID),
+		Summary: "renamed org to " + strings.TrimSpace(name)})
 	return s.Repo.GetOrg(ctx, orgID)
 }
 
@@ -176,6 +184,8 @@ func (s *Service) DeleteOrg(ctx context.Context, p authz.Principal, orgID int) e
 	if err := s.Repo.DeleteOrg(ctx, orgID); err != nil {
 		return err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "org.delete", OrgID: intRef(orgID), TargetType: "org", TargetID: idStr(orgID),
+		Summary: "deleted the org and its teams", Details: map[string]any{"teams": len(teams)}})
 	// The org's teams went with it; so do its and their knowledge bases.
 	s.dropKB(kb.Org(orgID))
 	for _, t := range teams {
@@ -230,6 +240,8 @@ func (s *Service) AddOrgMember(ctx context.Context, p authz.Principal, orgID int
 	if err := s.Repo.SetOrgMember(ctx, orgID, userID, role); err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "org.member.set", OrgID: intRef(orgID), TargetType: "user", TargetID: idStr(userID),
+		Summary: "set " + s.userLabel(ctx, userID) + " to org " + role + roleChange(current), Details: map[string]any{"role": role, "previous": current}})
 	return &MemberResult{Added: true, UserID: userID, Role: role}, nil
 }
 
@@ -252,7 +264,12 @@ func (s *Service) RemoveOrgMember(ctx context.Context, p authz.Principal, orgID 
 	if current == domain.OrgRoleOwner && !a.owner {
 		return 0, authz.Forbidden("only org owners can remove an owner")
 	}
-	return userID, s.Repo.RemoveOrgMember(ctx, orgID, userID)
+	if err := s.Repo.RemoveOrgMember(ctx, orgID, userID); err != nil {
+		return 0, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "org.member.remove", OrgID: intRef(orgID), TargetType: "user", TargetID: idStr(userID),
+		Summary: "removed " + s.userLabel(ctx, userID) + " from the org (was " + current + ")", Details: map[string]any{"previous": current}})
+	return userID, nil
 }
 
 // ---- Teams ----
@@ -275,7 +292,12 @@ func (s *Service) CreateTeam(ctx context.Context, p authz.Principal, orgID int, 
 	if strings.TrimSpace(name) == "" {
 		return nil, authz.BadRequest("name is required")
 	}
-	return s.Repo.CreateTeam(ctx, orgID, strings.TrimSpace(name), p.UserRef())
+	team, err := s.Repo.CreateTeam(ctx, orgID, strings.TrimSpace(name), p.UserRef())
+	if err == nil {
+		s.audit(ctx, p, domain.AuditEntry{Action: "team.create", OrgID: intRef(orgID), TargetType: "team", TargetID: idStr(team.ID),
+			Summary: "created team " + team.Name})
+	}
+	return team, err
 }
 
 // loadTeam fetches a team the caller can see (any member of its org).
@@ -314,6 +336,8 @@ func (s *Service) RenameTeam(ctx context.Context, p authz.Principal, teamID int,
 	if err := s.Repo.RenameTeam(ctx, teamID, strings.TrimSpace(name)); err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "team.rename", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
+		Summary: "renamed team " + team.Name + " to " + strings.TrimSpace(name)})
 	return s.Repo.GetTeam(ctx, teamID)
 }
 
@@ -328,6 +352,8 @@ func (s *Service) DeleteTeam(ctx context.Context, p authz.Principal, teamID int)
 	if err := s.Repo.DeleteTeam(ctx, teamID); err != nil {
 		return err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "team.delete", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
+		Summary: "deleted team " + team.Name})
 	s.dropKB(kb.Team(teamID))
 	return nil
 }
@@ -361,6 +387,8 @@ func (s *Service) AddTeamMember(ctx context.Context, p authz.Principal, teamID i
 	if err := s.Repo.SetTeamMember(ctx, teamID, userID, role); err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "team.member.set", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
+		Summary: "set " + s.userLabel(ctx, userID) + " to " + role + " of team " + team.Name, Details: map[string]any{"user_id": userID, "role": role}})
 	return &MemberResult{Added: true, UserID: userID, Role: role}, nil
 }
 
@@ -376,7 +404,12 @@ func (s *Service) RemoveTeamMember(ctx context.Context, p authz.Principal, teamI
 	if err != nil {
 		return 0, err
 	}
-	return userID, s.Repo.RemoveTeamMember(ctx, teamID, userID)
+	if err := s.Repo.RemoveTeamMember(ctx, teamID, userID); err != nil {
+		return 0, err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "team.member.remove", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
+		Summary: "removed " + s.userLabel(ctx, userID) + " from team " + team.Name, Details: map[string]any{"user_id": userID}})
+	return userID, nil
 }
 
 // ---- Invites ----
@@ -445,6 +478,8 @@ func (s *Service) invite(ctx context.Context, p authz.Principal, inv domain.Invi
 	if err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "invite.create", OrgID: intRef(inv.OrgID), TargetType: "invite", TargetID: idStr(created.ID),
+		Summary: "invited " + inv.Email + " as org " + inv.OrgRole, Details: map[string]any{"team_id": inv.TeamID, "team_role": inv.TeamRole}})
 	if u, err := s.Repo.GetUserByEmail(ctx, inv.Email); err == nil {
 		if _, err := s.Repo.AcceptInvites(ctx, u.ID, u.Email); err != nil {
 			return nil, err
@@ -466,7 +501,12 @@ func (s *Service) RevokeInvite(ctx context.Context, p authz.Principal, orgID, in
 	if err != nil || inv.OrgID != orgID {
 		return authz.NotFound("invite %d not found", inviteID)
 	}
-	return s.Repo.DeleteInvite(ctx, inviteID)
+	if err := s.Repo.DeleteInvite(ctx, inviteID); err != nil {
+		return err
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "invite.revoke", OrgID: intRef(orgID), TargetType: "invite", TargetID: idStr(inviteID),
+		Summary: "revoked the invite for " + inv.Email})
+	return nil
 }
 
 // ---- Project ↔ team links ----
@@ -492,6 +532,8 @@ func (s *Service) SetProjectTeam(ctx context.Context, p authz.Principal, project
 	if err := s.Repo.SetProjectTeam(ctx, projectID, teamID, role); err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "project.team.set", ProjectID: intRef(projectID), TargetType: "team", TargetID: idStr(teamID),
+		Summary: "linked " + s.teamLabel(ctx, teamID) + " to the project as " + role, Details: map[string]any{"role": role}})
 	return s.Repo.ListProjectTeams(ctx, projectID)
 }
 
@@ -502,6 +544,8 @@ func (s *Service) RemoveProjectTeam(ctx context.Context, p authz.Principal, proj
 	if err := s.Repo.RemoveProjectTeam(ctx, projectID, teamID); err != nil {
 		return nil, err
 	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "project.team.remove", ProjectID: intRef(projectID), TargetType: "team", TargetID: idStr(teamID),
+		Summary: "unlinked " + s.teamLabel(ctx, teamID) + " from the project"})
 	return s.Repo.ListProjectTeams(ctx, projectID)
 }
 
@@ -519,4 +563,26 @@ func Slugify(name string) string {
 		}
 	}
 	return strings.TrimSuffix(b.String(), "-")
+}
+
+// userLabel names a user in audit summaries.
+func (s *Service) userLabel(ctx context.Context, userID int) string {
+	if u, err := s.Repo.GetUserByID(ctx, userID); err == nil {
+		return u.Email
+	}
+	return "user " + idStr(userID)
+}
+
+func (s *Service) teamLabel(ctx context.Context, teamID int) string {
+	if t, err := s.Repo.GetTeam(ctx, teamID); err == nil {
+		return "team " + t.Name
+	}
+	return "team " + idStr(teamID)
+}
+
+func roleChange(previous string) string {
+	if previous == "" {
+		return " (added)"
+	}
+	return " (was " + previous + ")"
 }

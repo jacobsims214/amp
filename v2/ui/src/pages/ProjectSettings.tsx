@@ -8,15 +8,22 @@ import { MetadataEditor } from '../components/MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
 import { inputCls, labelCls } from '../components/CrudModal'
 import { canManageProject } from '../lib/people'
+import { WebhooksPanel } from '../components/WebhooksPanel'
+import { AuditLogPanel } from '../components/AuditLogPanel'
+import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
 
-function Section({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
+const slug = (t: string) => t.toLowerCase().replace(/[^a-z]+/g, '-')
+
+/** One settings section: a square panel with a title, what it's for, and its controls. */
+function Section({ title, description, danger, children }: { title: string; description?: string; danger?: boolean; children: React.ReactNode }) {
   return (
-    <section className="rounded-2xl p-5" style={{ background: '#0D1726', border: '1px solid #1E2C45' }}>
-      <h2 className="text-sm font-bold text-[#DDE6F0]">{title}</h2>
-      {description && <p className="text-xs text-[#7E91A8] mt-1 mb-4 leading-relaxed">{description}</p>}
-      {!description && <div className="mb-4" />}
-      {children}
+    <section id={slug(title)} className={`bg-surface border scroll-mt-6 ${danger ? 'border-danger' : 'border-line'}`}>
+      <div className="px-5 pt-4 pb-3 border-b border-line">
+        <h2 className="m-0 text-[15px] font-semibold" style={{ color: danger ? 'var(--danger-ink)' : 'var(--ink)' }}>{title}</h2>
+        {description && <p className="m-0 mt-1 text-[12.5px] text-ink-2 leading-relaxed max-w-[68ch]">{description}</p>}
+      </div>
+      <div className="px-5 py-4">{children}</div>
     </section>
   )
 }
@@ -82,7 +89,6 @@ export function ProjectSettings() {
   }
 
   const setArchived = async (archive: boolean) => {
-    if (archive && !window.confirm('Archive this project? It will be hidden from the active list.')) return
     setError(null)
     try {
       setProject(archive ? await api.archiveProject(pid) : await api.restoreProject(pid))
@@ -92,22 +98,25 @@ export function ProjectSettings() {
   }
 
   return (
-    <div className="flex flex-col h-screen" style={{ background: '#08101F' }}>
+    <div className="flex flex-col h-full" style={{ background: 'var(--bg)' }}>
       <ProjectNav projectId={pid} currentView="settings" project={project} />
-      <div className="flex-1 overflow-y-auto">
-        <div className="max-w-2xl mx-auto px-4 py-8 space-y-5">
-          <div>
-            <h1 className="text-xl font-bold text-[#DDE6F0] tracking-tight">Project settings</h1>
-            {!canManage && myAccess && (
-              <p className="text-xs text-[#7E91A8] mt-1 flex items-center gap-1.5">
-                <Lock size={11} />Only project owners and org admins can change these settings.
-              </p>
-            )}
-          </div>
-          {error && <p className="text-xs text-[#F87171]">{error}</p>}
+      <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
+        <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
+          <span className="amp-label px-2.5 pb-2">Settings</span>
+          {['General', 'Plan approval', 'Metadata', 'Team access', 'Knowledge bases', ...(canManage ? ['Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+            <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
+          ))}
+        </nav>
+        <div className="grid gap-4 max-w-3xl min-w-0">
+          {!canManage && myAccess && (
+            <p className="m-0 amp-panel px-4 py-3 text-[12.5px] text-ink-2 flex items-center gap-1.5">
+              <Lock size={12} />Only project owners and org admins can change these settings.
+            </p>
+          )}
+          {error && <p className="m-0 amp-panel px-4 py-3 text-[12.5px] text-danger-ink">{error}</p>}
 
           {!project ? (
-            <div className="flex justify-center py-10"><Loader2 size={18} className="text-[#6366F1] animate-spin" /></div>
+            <div className="flex justify-center py-10"><Loader2 size={18} className="text-primary animate-spin" /></div>
           ) : (
             <>
               <Section title="General">
@@ -121,22 +130,39 @@ export function ProjectSettings() {
                     <textarea value={description} onChange={e => { setDescription(e.target.value); setSaved(false) }} disabled={!canManage} rows={3}
                       className={`${inputCls} resize-none`} />
                   </div>
-                  <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-[#7E91A8]">
-                    <span>Code <span className="font-mono text-[#DDE6F0]">{project.code}</span></span>
-                    {org && <span>Org <span className="text-[#DDE6F0]">{org.name}</span></span>}
-                    <span>State <span className="text-[#DDE6F0] capitalize">{project.state}</span></span>
+                  <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-ink-2">
+                    <span>Code <span className="font-mono text-ink">{project.code}</span></span>
+                    {org && <span>Org <span className="text-ink">{org.name}</span></span>}
+                    <span>State <span className="text-ink capitalize">{project.state}</span></span>
                   </div>
                   {canManage && (
                     <div className="flex items-center gap-3">
                       <button onClick={save} disabled={!dirty || saving || !name.trim()}
-                        className="flex items-center gap-1.5 px-3 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                        className="amp-btn amp-btn-primary">
                         {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
                         Save
                       </button>
-                      {saved && !dirty && <span className="text-xs text-[#34D399]">Saved</span>}
+                      {saved && !dirty && <span className="text-xs text-success-ink">Saved</span>}
                     </div>
                   )}
                 </div>
+              </Section>
+
+              <Section title="Plan approval"
+                description="Agents plan; a person approves before they start. With this on, tickets planned after the last approval can't be dispatched until someone approves the plan in Flight plan (or tells the orchestrator, which records it with amp_approve_plan).">
+                <label className="flex items-center gap-3 text-[13px] text-ink cursor-pointer select-none">
+                  <input type="checkbox" className="w-4 h-4 accent-[var(--ink)]" disabled={!canManage}
+                    checked={!!project.require_plan_approval}
+                    onChange={async e => {
+                      const on = e.target.checked
+                      try { setProject(await api.updateProjectSettings(pid, { require_plan_approval: on })) }
+                      catch (err) { setError(err instanceof Error ? err.message : 'Could not change the setting') }
+                    }} />
+                  Require approval before agents start new tickets
+                </label>
+                <p className="m-0 mt-2 text-[12px] text-ink-2">{project.plan_approved_at
+                  ? <>Last approved <span className="amp-num">{new Date(project.plan_approved_at).toLocaleString()}</span>.</>
+                  : 'The plan has never been approved.'}</p>
               </Section>
 
               <Section title="Metadata"
@@ -146,11 +172,11 @@ export function ProjectSettings() {
                 {canManage && (
                   <div className="flex items-center gap-3 mt-3">
                     <button onClick={saveMeta} disabled={!metaPatch || !!meta?.error || metaSaving}
-                      className="flex items-center gap-1.5 px-3 py-2 bg-[#6366F1] hover:bg-[#4F46E5] disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                      className="amp-btn amp-btn-primary">
                       {metaSaving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
                       Save fields
                     </button>
-                    {metaSaved && !metaPatch && <span className="text-xs text-[#34D399]">Saved</span>}
+                    {metaSaved && !metaPatch && <span className="text-xs text-success-ink">Saved</span>}
                   </div>
                 )}
               </Section>
@@ -168,19 +194,19 @@ export function ProjectSettings() {
                     const kind = s.scope === 'project' ? 'Project KB' : s.scope === 'org' ? 'Org KB' : `Team KB · ${s.team_role ?? 'member'} team`
                     const body = (
                       <>
-                        <Icon size={14} className="flex-shrink-0 text-[#818CF8]" />
+                        <Icon size={14} className="flex-shrink-0 text-ink-2" />
                         <span className="flex-1 min-w-0">
-                          <span className="block text-sm text-[#DDE6F0] truncate">{s.scope === 'project' ? project.name : s.name}</span>
-                          <span className="block text-[11px] text-[#3D5068]">{kind}</span>
+                          <span className="block text-sm text-ink truncate">{s.scope === 'project' ? project.name : s.name}</span>
+                          <span className="block text-[11px] text-ink-3">{kind}</span>
                         </span>
                         {s.can_read
-                          ? <span className="text-xs text-[#7E91A8]">{s.docs ?? 0} doc{s.docs === 1 ? '' : 's'}</span>
-                          : <span className="flex items-center gap-1 text-[11px] text-[#3D5068]"><Lock size={10} />team members only</span>}
+                          ? <span className="text-xs text-ink-2">{s.docs ?? 0} doc{s.docs === 1 ? '' : 's'}</span>
+                          : <span className="flex items-center gap-1 text-[11px] text-ink-3"><Lock size={10} />team members only</span>}
                       </>
                     )
                     return s.can_read ? (
                       <Link key={`${s.scope}-${s.scope_id}`} to={to}
-                        className="flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-[#172540] transition-colors">{body}</Link>
+                        className="flex items-center gap-3 px-3 py-2.5 border border-line hover:border-ink transition-colors">{body}</Link>
                     ) : (
                       <div key={`${s.scope}-${s.scope_id}`} className="flex items-center gap-3 px-3 py-2.5 opacity-70">{body}</div>
                     )
@@ -189,23 +215,27 @@ export function ProjectSettings() {
               </Section>
 
               {canManage && (
-                <Section title={project.state === 'archived' ? 'Restore' : 'Archive'}
+                <Section title="Webhooks"
+                  description="Send this project's ticket changes to another service or a Slack channel. Org admins can also add webhooks for every project in the org.">
+                  <WebhooksPanel projectId={pid} canManage={canManage} />
+                </Section>
+              )}
+
+              {canManage && (
+                <Section title="Audit log"
+                  description="Who changed this project's access and settings, and who deleted what. Ticket-level history is on each ticket.">
+                  <AuditLogPanel projectId={pid} />
+                </Section>
+              )}
+
+              {canManage && (
+                <Section title="Danger zone" danger
                   description={project.state === 'archived'
-                    ? 'This project is archived: hidden from the active list and read-only for agents.'
-                    : 'Archiving hides the project from the active list. Nothing is deleted, and you can restore it.'}>
-                  {project.state === 'archived' ? (
-                    <button onClick={() => setArchived(false)}
-                      className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold cursor-pointer transition-all"
-                      style={{ border: '1px solid #283A57', color: '#DDE6F0' }}>
-                      <RotateCcw size={12} />Restore project
-                    </button>
-                  ) : (
-                    <button onClick={() => setArchived(true)}
-                      className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold cursor-pointer transition-all"
-                      style={{ border: '1px solid rgba(239,68,68,0.3)', color: '#F87171' }}>
-                      <Archive size={12} />Archive project
-                    </button>
-                  )}
+                    ? 'This project is archived: hidden from the active list and read-only for agents. Restoring brings it back as it was.'
+                    : 'Archiving hides the project from the active list and stops agents changing it. Nothing is deleted, and you can restore it.'}>
+                  {project.state === 'archived'
+                    ? <button type="button" onClick={() => setArchived(false)} className="amp-btn amp-btn-sm"><RotateCcw size={12} />Restore project</button>
+                    : <ConfirmButton label="Archive project" confirmLabel="Archive it" danger icon={<Archive size={12} />} onConfirm={() => setArchived(true)} />}
                 </Section>
               )}
             </>

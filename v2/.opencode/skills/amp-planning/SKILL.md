@@ -496,6 +496,21 @@ Approval: "approved", "go ahead", "yes", "do it", or similar.
 
 Changes requested → update → present again → wait again.
 
+When the user approves, **record it in AMP before dispatching**:
+
+```
+amp_approve_plan(project_id=PROJECT_ID)
+```
+
+That's the same approval a person gives with "Approve plan" in AMP's Flight plan, and projects with
+`require_plan_approval` on refuse to dispatch tickets planned since the last approval until it's
+recorded. Never call it on your own judgment — only when the user has said yes. The user may also
+approve in the UI instead of in chat: `amp_check_plan`'s `awaiting_approval` is empty once the plan
+is approved, wherever that happened.
+
+Each new planning run (or fix tickets you add) needs approving again when the project requires it:
+if a dispatch is refused because the plan wasn't approved, present what's new and ask.
+
 ---
 
 ## Dispatch — only after approval
@@ -525,6 +540,11 @@ task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's as
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
 After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+
+A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
+`questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the
+ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
+Questions don't stop the loop: keep dispatching everything else.
 
 If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 

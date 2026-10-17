@@ -45,10 +45,11 @@ The skill is large. Loading it now wastes context you need for the actual work.
 
 ---
 
-## Step 1 — Read your ticket
+## Step 1 — Read your ticket and its comments
 
 ```
 amp_get_task(task_id=YOUR_TASK_ID)
+amp_get_task_comments(task_id=YOUR_TASK_ID)
 ```
 
 Read every field:
@@ -56,8 +57,14 @@ Read every field:
 - `acceptance_criteria` — exactly what done looks like
 - `assigned_to` — should match your agent ID
 
-If description is missing or unclear: post a comment explaining what is missing and
-**STOP**. Do not guess at intent.
+Then read **every comment**. You may not be the first worker on this ticket: an earlier worker
+may have asked a question (a `QUESTION` comment) and stopped, and a person or the orchestrator
+answered it in a later comment. **An answer on the ticket is binding** — it overrides the
+description where they differ. Start from what the earlier worker found and decided; don't redo
+it or ask the same question again.
+
+If the description is missing or unclear and the comments don't settle it, don't guess at
+intent: ask (Step 5).
 
 ---
 
@@ -119,21 +126,48 @@ that embeds well for semantic search.
 
 ---
 
-## Step 5 — Cannot proceed
+## Step 5 — Cannot proceed: ask, then stop
 
-If you hit a blocker:
+You can't wait for an answer: when you stop, your run ends and the orchestrator gets your final
+message. So a question goes on the ticket, where a person (in the AMP UI) or the orchestrator (in
+its chat with the user) can answer it, and the next worker picks it up from there.
+
+First decide which kind of stop this is:
+
+- **You can decide it yourself.** A reasonable call within the ticket's scope (a name, an
+  approach, an edge case the criteria don't cover) is not a question. Make it, record it as a
+  `Decision:` comment with your reasoning, and carry on.
+- **You need another ticket's output** (a schema, an API, a fix that doesn't exist yet). That's a
+  missing dependency, not a question for a person. Comment what's missing and which ticket should
+  provide it, don't block, and say so in your final message so the orchestrator adds the
+  dependency and re-dispatches.
+- **You need a person**: a decision only they can make, information you can't find, access or a
+  credential you don't have, or requirements that contradict each other. Ask:
 
 ```
 amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
-CANNOT PROCEED.
+QUESTION: [the question, in one sentence]
 
-Reason: [exact blocker]
-What I tried: [steps]
-What is needed: [specific requirement]
+Context: [what you found that raised it — files, errors, constraints]
+Options: [the choices you see, with the trade-off of each]
+Recommendation: [what you'd do and why, if you have a view]
+Done so far: [what's already in place, so the next worker doesn't redo it]
 """, author="amp-worker")
+
+amp_block_task(task_id=YOUR_TASK_ID, reason="[the question in one line, with the options]")
 ```
 
-Stop. Do NOT call amp_complete_task.
+The `reason` is what people see in AMP as the question to answer, so make it stand on its own:
+"Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month."
+— not "blocked" or "see comments".
+
+Then **stop**. Do NOT call `amp_complete_task`. End your final message with:
+
+```
+QUESTION on task YOUR_TASK_ID: [the question]
+```
+
+so the orchestrator can put it to the user straight away.
 
 ---
 
@@ -178,7 +212,9 @@ amp_complete_task(task_id=YOUR_TASK_ID)
 
 ```
 amp_get_task {task_id}
+amp_get_task_comments {task_id}       ← read before starting; answers to questions are here
 amp_add_task_comment {task_id, body, author}
+amp_block_task {task_id, reason}      ← only to ask a person a question (Step 5)
 amp_complete_task {task_id}
 amp_get_ticket_history {task_id}
 amp_get_epic / amp_get_story
