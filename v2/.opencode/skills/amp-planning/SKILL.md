@@ -41,9 +41,17 @@ Create in order. The API rejects out-of-order creation.
 ```
 amp_create_epic   {project_id, name, description}
 amp_create_story  {project_id, epic_id, name, acceptance_criteria}
-amp_create_task   {project_id, epic_id, story_id, name, description,
-                   acceptance_criteria, assigned_to, dependency_ids?}
+amp_create_tasks  {project_id, tasks: [{ref, story_id, name, description,
+                   acceptance_criteria, assigned_to, depends_on: [ref | task id]}]}
+amp_create_task   {project_id, story_id, name, description,
+                   acceptance_criteria, assigned_to, dependency_ids}
 ```
+
+**The dependency graph is what AMP runs.** Every ticket whose dependencies are done is
+dispatchable, in parallel with every other such ticket. A ticket created without dependencies is
+ready immediately — if it needs another ticket's output, it starts too early and fails. Prefer
+`amp_create_tasks`: it creates a whole story's (or feature's) tickets and wires their
+dependencies in one call, with refs for tickets that don't have IDs yet.
 
 ---
 
@@ -402,6 +410,32 @@ Thin description = thin results. Workers are local LLMs — give them enough con
   must depend on A.
 
 If yes to any of these — add the dependency, regardless of which epic or story it's in.
+
+### Check the plan before presenting it
+
+Run `amp_check_plan(project_id)` after creating the tickets and before presenting the plan or
+dispatching anything. It reports tickets connected to nothing (`isolated`), too much work that
+can start at once (`wide_start` — usually missing dependencies), and empty stories. Fix what it
+finds, then run it again. A warning on `amp_create_task` / `amp_create_tasks` about missing
+dependencies means the same thing: decide now, not after dispatch.
+
+### Fix the plan in place — never delete and re-create
+
+Every part of a plan can be corrected where it is. Re-creating tickets loses their history and
+comments and breaks other tickets' dependencies on them.
+
+| Mistake | Fix |
+|---|---|
+| Missing or wrong dependency | `amp_set_task_dependencies {task_id, add?, remove?}` or `{task_id, dependency_ids}` for the full list |
+| Wrong name, description, acceptance criteria, priority, assignee | `amp_update_task` |
+| Ticket in the wrong story or epic | `amp_move_task {task_id, story_id}` |
+| Story in the wrong epic | `amp_move_story {story_id, epic_id}` |
+| Epic or story text | `amp_update_epic`, `amp_update_story` |
+| Work that shouldn't exist | `amp_delete_task` / `amp_delete_story` / `amp_delete_epic` — tickets that depended on it are updated |
+
+Dependency changes are validated (no cycles, no tickets from other projects) and state follows
+automatically: a ready ticket that gains an unfinished dependency becomes blocked, and a blocked
+one whose dependencies are gone or done becomes ready.
 
 ---
 

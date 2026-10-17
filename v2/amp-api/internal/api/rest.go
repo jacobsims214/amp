@@ -395,6 +395,15 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "plan-check":
+		report, err := h.svc.CheckPlan(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, report)
+		return
+
 	case "members":
 		members, err := h.svc.ProjectMembers(r.Context(), projectID)
 		if err != nil {
@@ -628,24 +637,15 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			req.ProjectID = projectID
-			req.CreatedBy = pr.UserRef()
-			if req.OwnerUserID, err = h.svc.ResolveNewTaskOwner(r.Context(), pr, projectID, body.Owner); err != nil {
-				fail(w, err, 400)
-				return
-			}
-			replyCh := make(chan actor.ReplyCreateTask, 1)
-			pid, err := h.registry.Get(projectID)
+			task, warnings, err := h.svc.CreateTask(r.Context(), pr, req, body.Owner)
 			if err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
-			h.registry.System().Root.Send(pid, &actor.MsgCreateTask{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
-			if reply.Err != nil {
-				jsonErr(w, reply.Err, 500)
-				return
-			}
-			jsonOK(w, reply.Task)
+			jsonOK(w, struct {
+				*domain.Task
+				Warnings []string `json:"warnings,omitempty"`
+			}{task, warnings})
 
 		default:
 			http.Error(w, "method not allowed", 405)
@@ -740,18 +740,10 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"epic": updated})
 
 		case http.MethodDelete:
-			if err := h.repo.DeleteEpic(r.Context(), epicID); err != nil {
+			if err := h.svc.DeleteEpic(r.Context(), epic); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
-			pid, err := h.registry.Get(epic.ProjectID)
-			if err != nil {
-				jsonErr(w, err, 500)
-				return
-			}
-			replyCh := make(chan actor.ReplySimple, 1)
-			h.registry.System().Root.Send(pid, &actor.MsgDeleteEpic{EpicID: epicID, ReplyCh: replyCh})
-			<-replyCh
 			jsonOK(w, map[string]interface{}{"epic_id": epicID, "deleted": true})
 
 		default:
@@ -842,6 +834,23 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		h.groupingOwners(w, r, pr, "story", storyID, story.ProjectID, parts[2:])
 		return
 	}
+	if len(parts) == 2 && parts[1] == "move" && r.Method == http.MethodPost {
+		// POST {epic_id}: put the story, with its tickets, in another epic.
+		var body struct {
+			EpicID int `json:"epic_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		moved, err := h.svc.MoveStory(r.Context(), pr, storyID, body.EpicID)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"story": moved})
+		return
+	}
 
 	switch r.Method {
 	case http.MethodGet:
@@ -882,18 +891,10 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"story": updated})
 
 	case http.MethodDelete:
-		if err := h.repo.DeleteStory(r.Context(), storyID); err != nil {
+		if err := h.svc.DeleteStory(r.Context(), story); err != nil {
 			jsonErr(w, err, 500)
 			return
 		}
-		pid, err := h.registry.Get(story.ProjectID)
-		if err != nil {
-			jsonErr(w, err, 500)
-			return
-		}
-		replyCh := make(chan actor.ReplySimple, 1)
-		h.registry.System().Root.Send(pid, &actor.MsgDeleteStory{StoryID: storyID, ReplyCh: replyCh})
-		<-replyCh
 		jsonOK(w, map[string]interface{}{"story_id": storyID, "deleted": true})
 
 	default:
@@ -972,13 +973,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"task": updated})
 
 		case http.MethodDelete:
-			if err := h.repo.DeleteTask(r.Context(), taskID); err != nil {
+			if _, err := h.svc.DeleteTask(r.Context(), task); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
-			replyCh := make(chan actor.ReplySimple, 1)
-			h.registry.System().Root.Send(pid, &actor.MsgDeleteTask{TaskID: taskID, ReplyCh: replyCh})
-			<-replyCh
 			h.hub.Publish(domain.Event{
 				Type:      domain.EventTaskUpdated,
 				ProjectID: task.ProjectID,
@@ -1077,6 +1075,46 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", 405)
 		}
 
+	case "dependencies":
+		// PUT {dependency_ids: [...]}: the ticket's complete new list.
+		if r.Method != http.MethodPut {
+			http.Error(w, "PUT required", 405)
+			return
+		}
+		var body struct {
+			DependencyIDs []int `json:"dependency_ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		updated, warnings, err := h.svc.SetTaskDependencies(r.Context(), pr, taskID, body.DependencyIDs)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"task": updated, "warnings": warnings})
+
+	case "move":
+		// POST {story_id}: put the ticket in another story.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			StoryID int `json:"story_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			jsonErr(w, err, 400)
+			return
+		}
+		updated, err := h.svc.MoveTask(r.Context(), pr, taskID, body.StoryID)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"task": updated})
+
 	case "assign":
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
@@ -1133,6 +1171,9 @@ func taskActionFor(method, sub string) authz.TaskAction {
 		return authz.TaskRead
 	case sub == "" && method == http.MethodDelete:
 		return authz.TaskDelete
+	case sub == "dependencies", sub == "move", sub == "" && method == http.MethodPatch:
+		// Planning: the ticket's text, dependencies, or story.
+		return authz.TaskPlan
 	}
 	return authz.TaskWork
 }

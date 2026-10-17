@@ -191,7 +191,21 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 		a.taskToEpic[msg.TaskID] = msg.EpicID
 
 	case *MsgDeregisterTask:
-		delete(a.taskToEpic, msg.TaskID)
+		if msg.EpicID == 0 || a.taskToEpic[msg.TaskID] == msg.EpicID {
+			delete(a.taskToEpic, msg.TaskID)
+		}
+
+	case *MsgSetTaskDeps:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
+	case *MsgReconcileDeps:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
+	case *MsgMoveTask:
+		msg.ReplyCh <- a.moveTask(ctx, msg)
+
+	case *MsgMoveStory:
+		msg.ReplyCh <- ReplySimple{Err: a.moveStory(ctx, msg)}
 
 	// ---- Upward notifications from children — drive dep fan-out ----
 
@@ -261,13 +275,11 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgDeleteStory:
 		// Find which epic owns this story by broadcasting.
 		// (We don't have a storyToEpic index at project level — broadcast to all epics.)
+		// Epics without it reply without doing anything, so ask them all.
 		for _, epicPID := range a.epics {
 			replyCh := make(chan ReplySimple, 1)
 			ctx.Send(epicPID, &MsgDeleteStory{StoryID: msg.StoryID, ReplyCh: replyCh})
-			reply := <-replyCh
-			if reply.Err == nil {
-				break // found and handled
-			}
+			<-replyCh
 		}
 		msg.ReplyCh <- ReplySimple{}
 	}
@@ -327,6 +339,52 @@ func (a *ProjectActor) handleCreateEpic(ctx actor.Context, req domain.CreateEpic
 	})
 	a.log.Info("epic created", "epic_id", epic.ID)
 	return epic, nil
+}
+
+// moveTask moves a task to another story: its old story stops its actor,
+// the database records the new home, and the new story spawns it again.
+func (a *ProjectActor) moveTask(ctx actor.Context, msg *MsgMoveTask) ReplyGetTask {
+	from, ok := a.epics[msg.FromEpicID]
+	to, ok2 := a.epics[msg.ToEpicID]
+	if !ok || !ok2 {
+		return ReplyGetTask{Err: fmt.Errorf("epic %d or %d not found", msg.FromEpicID, msg.ToEpicID)}
+	}
+	detached := make(chan ReplySimple, 1)
+	ctx.Send(from, &MsgDeleteTask{TaskID: msg.TaskID, Detach: true, ReplyCh: detached})
+	<-detached
+	delete(a.taskToEpic, msg.TaskID)
+	if err := a.repo.MoveTask(context.Background(), msg.TaskID, msg.ToEpicID, msg.ToStoryID); err != nil {
+		return ReplyGetTask{Err: fmt.Errorf("db move task: %w", err)}
+	}
+	adopted := make(chan ReplyGetTask, 1)
+	ctx.Send(to, &MsgAdoptTask{TaskID: msg.TaskID, StoryID: msg.ToStoryID, ReplyCh: adopted})
+	reply := <-adopted
+	if reply.Err == nil {
+		a.taskToEpic[msg.TaskID] = msg.ToEpicID
+	}
+	return reply
+}
+
+// moveStory moves a story and its tasks to another epic, the same way.
+func (a *ProjectActor) moveStory(ctx actor.Context, msg *MsgMoveStory) error {
+	from, ok := a.epics[msg.FromEpicID]
+	to, ok2 := a.epics[msg.ToEpicID]
+	if !ok || !ok2 {
+		return fmt.Errorf("epic %d or %d not found", msg.FromEpicID, msg.ToEpicID)
+	}
+	detached := make(chan ReplySimple, 1)
+	ctx.Send(from, &MsgDeleteStory{StoryID: msg.StoryID, ReplyCh: detached})
+	<-detached
+	if err := a.repo.MoveStory(context.Background(), msg.StoryID, msg.ToEpicID); err != nil {
+		return fmt.Errorf("db move story: %w", err)
+	}
+	adopted := make(chan ReplyAdoptStory, 1)
+	ctx.Send(to, &MsgAdoptStory{StoryID: msg.StoryID, ReplyCh: adopted})
+	reply := <-adopted
+	for _, id := range reply.TaskIDs {
+		a.taskToEpic[id] = msg.ToEpicID
+	}
+	return reply.Err
 }
 
 // routeTaskMsg routes a task-targeted message to the correct EpicActor.

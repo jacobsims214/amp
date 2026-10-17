@@ -120,6 +120,32 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		ctx.Send(pid, &fwd)
 		msg.ReplyCh <- <-replyCh
 
+	case *MsgSetTaskDeps:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		replyCh := make(chan ReplyGetTask, 1)
+		fwd := *msg
+		fwd.ReplyCh = replyCh
+		ctx.Send(pid, &fwd)
+		msg.ReplyCh <- <-replyCh
+
+	case *MsgReconcileDeps:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplySimple{}
+			return
+		}
+		replyCh := make(chan ReplySimple, 1)
+		ctx.Send(pid, &MsgReconcileDeps{TaskID: msg.TaskID, ReplyCh: replyCh})
+		msg.ReplyCh <- <-replyCh
+
+	case *MsgAdoptTask:
+		t, err := a.adoptTask(ctx, msg.TaskID)
+		msg.ReplyCh <- ReplyGetTask{Task: t, Err: err}
+
 	case *MsgUpdateTask:
 		pid, ok := a.tasks[msg.Req.TaskID]
 		if !ok {
@@ -170,10 +196,11 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		}
 		// Ask TaskActor to stop itself (it will deregister from ProjectActor).
 		replyCh := make(chan ReplySimple, 1)
-		ctx.Send(pid, &MsgDeleteTask{TaskID: msg.TaskID, ReplyCh: replyCh})
+		ctx.Send(pid, &MsgDeleteTask{TaskID: msg.TaskID, Detach: msg.Detach, ReplyCh: replyCh})
 		<-replyCh
 		delete(a.tasks, msg.TaskID)
 		delete(a.taskStates, msg.TaskID)
+		a.rollupState(ctx)
 		msg.ReplyCh <- ReplySimple{}
 
 	case *MsgDeleteStory:
@@ -181,7 +208,7 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		for taskID, pid := range a.tasks {
 			ctx.Stop(pid)
 			// Deregister from ProjectActor so its taskToEpic index stays clean.
-			ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: taskID})
+			ctx.Send(a.projectPID, &MsgDeregisterTask{TaskID: taskID, EpicID: a.story.EpicID})
 			delete(a.tasks, taskID)
 		}
 		a.taskStates = make(map[int]domain.TaskState)
@@ -251,12 +278,16 @@ func (a *StoryActor) loadAndSpawnTasks(ctx actor.Context) {
 		return
 	}
 
-	// Build the set of completed task IDs for seeding each TaskActor's completedDeps.
-	completedSet := make(map[int]bool)
+	// Which of these tasks' dependencies are already complete — anywhere in
+	// the project, not just in this story.
+	var allDeps []int
 	for _, t := range tasks {
-		if t.State == domain.TaskStateCompleted {
-			completedSet[t.ID] = true
-		}
+		allDeps = append(allDeps, t.DependencyIDs...)
+	}
+	completedSet, err := a.repo.CompletedAmong(context.Background(), allDeps)
+	if err != nil {
+		a.log.Error("failed to load dependency states", "err", err)
+		completedSet = map[int]bool{}
 	}
 
 	for _, t := range tasks {
@@ -272,6 +303,31 @@ func (a *StoryActor) loadAndSpawnTasks(ctx actor.Context) {
 		a.taskStates[t.ID] = t.State
 	}
 	a.log.Info("loaded tasks", "count", len(tasks))
+}
+
+// adoptTask starts managing a task just moved into this story: load it,
+// work out which of its dependencies are done, and spawn its actor.
+func (a *StoryActor) adoptTask(ctx actor.Context, taskID int) (*domain.Task, error) {
+	t, err := a.repo.GetTask(context.Background(), taskID)
+	if err != nil {
+		return nil, fmt.Errorf("load moved task %d: %w", taskID, err)
+	}
+	if t.DependencyIDs, err = a.repo.TaskDependencies(context.Background(), taskID); err != nil {
+		return nil, err
+	}
+	done, err := a.repo.CompletedAmong(context.Background(), t.DependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	a.tasks[t.ID] = a.spawnTaskActor(ctx, *t, done)
+	a.taskStates[t.ID] = t.State
+	for _, d := range t.DependencyIDs {
+		if !done[d] {
+			t.BlockedByIDs = append(t.BlockedByIDs, d)
+		}
+	}
+	a.rollupState(ctx)
+	return t, nil
 }
 
 func (a *StoryActor) spawnTaskActor(ctx actor.Context, t domain.Task, completedDeps map[int]bool) *actor.PID {
@@ -295,12 +351,11 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 		return nil, fmt.Errorf("db create task: %w", err)
 	}
 
-	// Derive initial state from deps — check which deps are already completed.
-	completedDeps := make(map[int]bool)
-	for _, depID := range req.DependencyIDs {
-		if s, ok := a.taskStates[depID]; ok && s == domain.TaskStateCompleted {
-			completedDeps[depID] = true
-		}
+	// Derive initial state from deps — which are already completed, wherever
+	// they are in the project.
+	completedDeps, err := a.repo.CompletedAmong(context.Background(), req.DependencyIDs)
+	if err != nil {
+		return nil, fmt.Errorf("db dependency states: %w", err)
 	}
 	hasIncomplete := false
 	for _, depID := range req.DependencyIDs {

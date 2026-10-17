@@ -227,7 +227,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	// ---- Epics ----
-	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project.",
+	mcp.AddTool(tool("amp_create_epic", "Create an epic inside a project. Epics and stories group work; what AMP schedules is the "+
+		"dependency graph between tickets, so plan which tickets depend on which before creating them (see amp_create_tasks).",
 		props{
 			"project_id":  num("REQUIRED. Project ID."),
 			"name":        str("REQUIRED. Epic name."),
@@ -254,7 +255,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.updateEpic)))
 
 	// ---- Stories ----
-	mcp.AddTool(tool("amp_create_story", "Create a story inside an epic.",
+	mcp.AddTool(tool("amp_create_story", "Create a story inside an epic. A story's tickets usually depend on each other, and often on "+
+		"tickets in other stories (an API before the UI that calls it): wire those dependencies when you create the tickets.",
 		props{
 			"project_id":          num("REQUIRED. Project ID."),
 			"epic_id":             num("REQUIRED. Epic ID."),
@@ -283,26 +285,104 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"remove_owners":       strArr("Optional. Users (email, id, or 'me') to remove as owners."),
 		}), wrap(ctx, s.guard(authz.Member, s.updateStory)))
 
+	mcp.AddTool(tool("amp_move_story",
+		"Move a story, with all its tickets, to another epic of the project. Dependencies and states are kept.",
+		props{
+			"story_id": num("REQUIRED. The story to move."),
+			"epic_id":  num("REQUIRED. The epic to move it into."),
+		}), wrap(ctx, s.guard(authz.Member, s.moveStory)))
+
+	mcp.AddTool(tool("amp_delete_story",
+		"Delete a story and all its tickets. Tickets elsewhere that depended on them are updated (and unblocked if "+
+			"nothing else holds them). Prefer amp_move_task / amp_move_story to fix structure.",
+		props{
+			"story_id": num("REQUIRED. Story ID."),
+		}), wrap(ctx, s.guard(authz.Member, s.deleteStory)))
+
 	// ---- Tasks (all mutations go through actors) ----
 	mcp.AddTool(tool("amp_create_task",
-		"Create a task. REQUIRED hierarchy: every task must belong to a story which must belong to an epic. "+
-			"Set assigned_to at planning time so the user can review who will work each ticket before dispatch. "+
-			"If dependency_ids are provided, state is set automatically (blocked/backlog). Never set state yourself. "+
-			"Optional start_at schedules the task to be unblocked at a future time.",
+		"Create one ticket in a story. DEPENDENCIES ARE CRITICAL: AMP dispatches every ticket whose dependencies are done, "+
+			"in parallel. A ticket created without dependency_ids is ready immediately, so if it needs another ticket's "+
+			"output (a schema, an API, a design, a fix) it will start too early and fail. Before creating a ticket, decide "+
+			"what it waits on and pass those ticket IDs in dependency_ids. To create several related tickets, prefer "+
+			"amp_create_tasks, which wires dependencies between new tickets in one call. Fix mistakes with "+
+			"amp_set_task_dependencies, amp_update_task, and amp_move_task — never by deleting and re-creating tickets. "+
+			"State (blocked/backlog) is derived from dependencies; never set it yourself. Optional start_at schedules the ticket.",
 		props{
 			"project_id":          num("REQUIRED. Project ID."),
-			"epic_id":             num("REQUIRED. Epic ID — tasks must belong to an epic."),
-			"story_id":            num("REQUIRED. Story ID — tasks must belong to a story."),
-			"name":                str("REQUIRED. Task name."),
+			"story_id":            num("REQUIRED. Story ID — every ticket belongs to a story."),
+			"epic_id":             num("Optional. The story's epic (checked if given; otherwise taken from the story)."),
+			"name":                str("REQUIRED. Ticket name."),
 			"description":         str("REQUIRED. Full instructions for the worker agent."),
-			"acceptance_criteria": str("REQUIRED. Specific verifiable conditions that prove the task is done."),
+			"acceptance_criteria": str("REQUIRED. Specific verifiable conditions that prove the ticket is done."),
+			"dependency_ids":      arr("The ticket IDs this ticket needs finished first. Leave empty ONLY if it truly needs nothing — it will be dispatchable immediately."),
 			"priority":            str("Priority: 0=low, 1=normal (default), 2=high, 3=critical."),
-			"assigned_to":         str("REQUIRED. Who should work this task, e.g. 'amp-worker'. Set this at planning time so the user can review and correct before dispatch."),
-			"dependency_ids":      arr("Optional. Task IDs that must complete before this task can run. State is derived automatically — do not set it yourself."),
-			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this task. Task will be held as blocked until this time arrives."),
+			"assigned_to":         str("REQUIRED. Who should work this ticket, e.g. 'amp-worker'. Set at planning time so the user can review before dispatch."),
+			"start_at":            str("Optional. ISO 8601 datetime (e.g. '2026-04-14T09:00:00Z') to schedule this ticket. It is held as blocked until then."),
 			"owner":               str("Optional. The AMP user who owns the ticket: omit for yourself, 'none' to leave it unassigned for anyone on the project to pick up, or a project member's email/id."),
 			"metadata":            obj("Optional. Key/value metadata for integrations, e.g. {\"jira_key\": \"PLAT-123\"}. Values: string, number, or boolean. Project, epic, and story metadata is inherited."),
 		}), wrap(ctx, s.guard(authz.Member, s.createTask)))
+
+	mcp.AddTool(tool("amp_create_tasks",
+		"Create several tickets AND the dependencies between them in one call — the recommended way to plan a story or "+
+			"feature. Give each ticket a short `ref` (e.g. 'schema', 'api', 'ui'); `depends_on` lists refs of other tickets in "+
+			"this batch, or IDs of existing tickets. Everything is checked first (unknown refs, other projects, cycles); then "+
+			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
+			"anything are reported, since they can all start at once.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"tasks": map[string]interface{}{
+				"type":        "array",
+				"description": "REQUIRED. The tickets to create.",
+				"items": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"ref":                 str("REQUIRED. A short name for this ticket in the batch."),
+						"story_id":            num("REQUIRED. The story it belongs to."),
+						"name":                str("REQUIRED. Ticket name."),
+						"description":         str("REQUIRED. Full instructions for the worker agent."),
+						"acceptance_criteria": str("REQUIRED. Verifiable conditions that prove it's done."),
+						"depends_on": map[string]interface{}{
+							"type":        "array",
+							"description": "Refs of tickets in this batch, or IDs of existing tickets, that must finish first.",
+							"items":       map[string]interface{}{"type": []string{"string", "number"}},
+						},
+						"assigned_to": str("Who should work it, e.g. 'amp-worker'."),
+						"priority":    str("0=low, 1=normal (default), 2=high, 3=critical."),
+						"owner":       str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
+						"metadata":    obj("Optional key/value metadata."),
+					},
+					"required": []string{"ref", "story_id", "name"},
+				},
+			},
+		}), wrap(ctx, s.guard(authz.Member, s.createTasks)))
+
+	mcp.AddTool(tool("amp_set_task_dependencies",
+		"Change which tickets a ticket waits on — fix a missing or wrong dependency without re-creating anything. "+
+			"Either pass dependency_ids (the complete new list; [] removes all), or add and/or remove. Cycles, unknown "+
+			"tickets, and other projects' tickets are refused. A ready ticket that now waits on unfinished work becomes "+
+			"blocked; a ticket blocked only by its dependencies becomes ready when none are left.",
+		props{
+			"task_id":        num("REQUIRED. The ticket whose dependencies change."),
+			"dependency_ids": arr("Optional. The complete list of ticket IDs it depends on (replaces the current list)."),
+			"add":            arr("Optional. Ticket IDs to add as dependencies."),
+			"remove":         arr("Optional. Ticket IDs to stop depending on."),
+		}), wrap(ctx, s.guard(authz.Member, s.setTaskDependencies)))
+
+	mcp.AddTool(tool("amp_move_task",
+		"Move a ticket to another story (in any epic of the project). Its dependencies, owner, comments, and state are kept.",
+		props{
+			"task_id":  num("REQUIRED. The ticket to move."),
+			"story_id": num("REQUIRED. The story to move it into."),
+		}), wrap(ctx, s.guard(authz.Member, s.moveTask)))
+
+	mcp.AddTool(tool("amp_check_plan",
+		"Check a project's plan before dispatching: tickets connected to nothing, too many tickets that can start at once "+
+			"(a sign of missing dependencies), empty stories, and the longest dependency chain. Also repairs tickets stuck "+
+			"blocked on dependencies that are all done. Run it after planning and after changing the plan.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+		}), wrap(ctx, s.guard(authz.Member, s.checkPlan)))
 
 	mcp.AddTool(tool("amp_list_tasks",
 		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
@@ -317,14 +397,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_get_task", "Get full task details by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top).",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.getTask)))
 
-	mcp.AddTool(tool("amp_update_task", "Update task name, description, assigned_to, agent_id, or metadata.",
+	mcp.AddTool(tool("amp_update_task",
+		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, or metadata — pass "+
+			"only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
+			"amp_move_task; to schedule it, amp_set_task_start_at. Its creator, its owner, and team leads can change it.",
 		props{
-			"metadata":    obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
-			"task_id":     num("REQUIRED. Task ID."),
-			"name":        str("New task name."),
-			"description": str("New task description."),
-			"assigned_to": str("Who should work this task — can be corrected by the user before dispatch."),
-			"agent_id":    str("Agent identifier — set at dispatch time, not plan time."),
+			"task_id":             num("REQUIRED. Task ID."),
+			"name":                str("New ticket name."),
+			"description":         str("New description."),
+			"acceptance_criteria": str("New acceptance criteria."),
+			"priority":            str("New priority: 0=low, 1=normal, 2=high, 3=critical."),
+			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
+			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
+			"metadata":            obj(patchMetadataDesc),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
@@ -884,92 +969,220 @@ func (s *Server) createTask(rctx context.Context, args map[string]interface{}) (
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkProjectNotArchived(context.Background(), projectID); err != nil {
+	if err := s.checkProjectNotArchived(rctx, projectID); err != nil {
 		return nil, err
-	}
-
-	// Enforce hierarchy: epic_id and story_id are both required.
-	epicID, err := reqInt(args, "epic_id")
-	if err != nil {
-		return nil, fmt.Errorf("epic_id is required: every task must belong to an epic")
 	}
 	storyID, err := reqInt(args, "story_id")
 	if err != nil {
 		return nil, fmt.Errorf("story_id is required: every task must belong to a story")
 	}
-
-	name := optStr(args, "name", "")
-	if name == "" {
-		return nil, fmt.Errorf("name is required")
-	}
-
-	// Cross-reference validation: verify story belongs to this epic and project.
-	// This prevents tasks from being mis-parented across projects or epics.
-	ctx := context.Background()
-	story, err := s.repo.GetStory(ctx, storyID)
-	if err != nil {
-		return nil, fmt.Errorf("story_id %d not found", storyID)
-	}
-	if story.ProjectID != projectID {
-		return nil, fmt.Errorf("story %d belongs to project %d, not project %d", storyID, story.ProjectID, projectID)
-	}
-	if story.EpicID != epicID {
-		return nil, fmt.Errorf("story %d belongs to epic %d, not epic %d — epic_id must match the story's epic", storyID, story.EpicID, epicID)
-	}
-
-	// Verify epic also belongs to this project.
-	epic, err := s.repo.GetEpic(ctx, epicID)
-	if err != nil {
-		return nil, fmt.Errorf("epic_id %d not found", epicID)
-	}
-	if epic.ProjectID != projectID {
-		return nil, fmt.Errorf("epic %d belongs to project %d, not project %d", epicID, epic.ProjectID, projectID)
-	}
-
-	// Parse optional start_at parameter
 	var startAt *time.Time
-	startAtStr := optStr(args, "start_at", "")
-	if startAtStr != "" {
-		t, err := time.Parse(time.RFC3339, startAtStr)
+	if v := optStr(args, "start_at", ""); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
 			return nil, fmt.Errorf("invalid start_at format: %w", err)
 		}
 		startAt = &t
 	}
-
 	meta, err := optNewMetadata(args)
 	if err != nil {
 		return nil, err
 	}
-	req := domain.CreateTaskRequest{
-		Metadata:           meta,
+	task, warnings, err := s.svc.CreateTask(rctx, caller(rctx).p, domain.CreateTaskRequest{
 		ProjectID:          projectID,
-		EpicID:             epicID,
+		EpicID:             optInt(args, "epic_id", 0),
 		StoryID:            storyID,
-		Name:               name,
+		Name:               optStr(args, "name", ""),
 		Description:        optStr(args, "description", ""),
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Priority:           optStr(args, "priority", "1"),
 		AssignedTo:         optStr(args, "assigned_to", ""),
 		DependencyIDs:      optIntSlice(args, "dependency_ids"),
 		StartAt:            startAt,
-		CreatedBy:          caller(rctx).p.UserRef(),
-	}
-	if req.OwnerUserID, err = s.svc.ResolveNewTaskOwner(rctx, caller(rctx).p, projectID, optStr(args, "owner", "")); err != nil {
-		return nil, err
-	}
-
-	replyCh := make(chan ReplyCreateTask, 1)
-	pid, err := s.registry.Get(projectID)
+		Metadata:           meta,
+	}, optStr(args, "owner", ""))
 	if err != nil {
 		return nil, err
 	}
-	s.registry.System().Root.Send(pid, &actor.MsgCreateTask{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
-	if reply.Err != nil {
-		return nil, reply.Err
+	return taskWithWarnings(task, warnings)
+}
+
+// taskWithWarnings returns a task as before, with any planning warnings
+// alongside its fields.
+func taskWithWarnings(t *domain.Task, warnings []string) (*mcpgo.CallToolResult, error) {
+	raw, err := json.Marshal(t)
+	if err != nil {
+		return nil, err
 	}
-	return jsonResult(reply.Task)
+	var out map[string]interface{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, err
+	}
+	if len(warnings) > 0 {
+		out["warnings"] = warnings
+	}
+	return jsonResult(out)
+}
+
+func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(rctx, projectID); err != nil {
+		return nil, err
+	}
+	raw, ok := args["tasks"].([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("tasks is required: an array of tickets")
+	}
+	specs := make([]service.TaskSpec, 0, len(raw))
+	for i, r := range raw {
+		m, ok := r.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("tasks[%d] must be an object", i)
+		}
+		meta, err := optNewMetadata(m)
+		if err != nil {
+			return nil, fmt.Errorf("tasks[%d]: %w", i, err)
+		}
+		var deps []string
+		if list, ok := m["depends_on"].([]interface{}); ok {
+			for _, d := range list {
+				switch v := d.(type) {
+				case string:
+					deps = append(deps, v)
+				case float64:
+					deps = append(deps, fmt.Sprintf("%d", int(v)))
+				default:
+					return nil, fmt.Errorf("tasks[%d].depends_on: use refs (strings) or ticket ids (numbers)", i)
+				}
+			}
+		}
+		specs = append(specs, service.TaskSpec{
+			Ref: optStr(m, "ref", ""), StoryID: optInt(m, "story_id", 0), Name: optStr(m, "name", ""),
+			Description: optStr(m, "description", ""), AcceptanceCriteria: optStr(m, "acceptance_criteria", ""),
+			Priority: optStr(m, "priority", "1"), AssignedTo: optStr(m, "assigned_to", ""), Owner: optStr(m, "owner", ""),
+			DependsOn: deps, Metadata: meta,
+		})
+	}
+	created, warnings, err := s.svc.CreateTasks(rctx, caller(rctx).p, projectID, specs)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]interface{}{"created": created, "count": len(created)}
+	if len(warnings) > 0 {
+		out["warnings"] = warnings
+	}
+	return jsonResult(out)
+}
+
+func (s *Server) setTaskDependencies(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	t, err := s.repo.GetTask(rctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %d not found", taskID)
+	}
+	if err := s.checkProjectNotArchived(rctx, t.ProjectID); err != nil {
+		return nil, err
+	}
+	_, replace := args["dependency_ids"]
+	add, remove := optIntSlice(args, "add"), optIntSlice(args, "remove")
+	var task *domain.Task
+	var warnings []string
+	switch {
+	case replace && (len(add) > 0 || len(remove) > 0):
+		return nil, fmt.Errorf("pass either dependency_ids (the full list) or add/remove, not both")
+	case replace:
+		task, warnings, err = s.svc.SetTaskDependencies(rctx, caller(rctx).p, taskID, optIntSlice(args, "dependency_ids"))
+	case len(add) > 0 || len(remove) > 0:
+		task, warnings, err = s.svc.EditDependencies(rctx, caller(rctx).p, taskID, add, remove)
+	default:
+		return nil, fmt.Errorf("pass dependency_ids (the full list, [] for none), or add and/or remove")
+	}
+	if err != nil {
+		return nil, err
+	}
+	return taskWithWarnings(task, warnings)
+}
+
+func (s *Server) moveTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	storyID, err := reqInt(args, "story_id")
+	if err != nil {
+		return nil, err
+	}
+	t, err := s.repo.GetTask(rctx, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("task %d not found", taskID)
+	}
+	if err := s.checkProjectNotArchived(rctx, t.ProjectID); err != nil {
+		return nil, err
+	}
+	task, err := s.svc.MoveTask(rctx, caller(rctx).p, taskID, storyID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"task": task})
+}
+
+func (s *Server) moveStory(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	storyID, err := reqInt(args, "story_id")
+	if err != nil {
+		return nil, err
+	}
+	epicID, err := reqInt(args, "epic_id")
+	if err != nil {
+		return nil, err
+	}
+	st, err := s.repo.GetStory(rctx, storyID)
+	if err != nil {
+		return nil, fmt.Errorf("story %d not found", storyID)
+	}
+	if err := s.checkProjectNotArchived(rctx, st.ProjectID); err != nil {
+		return nil, err
+	}
+	story, err := s.svc.MoveStory(rctx, caller(rctx).p, storyID, epicID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"story": story})
+}
+
+func (s *Server) deleteStory(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	storyID, err := reqInt(args, "story_id")
+	if err != nil {
+		return nil, err
+	}
+	story, err := s.svc.RequireEditStory(rctx, caller(rctx).p, storyID)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.checkProjectNotArchived(rctx, story.ProjectID); err != nil {
+		return nil, err
+	}
+	if err := s.svc.DeleteStory(rctx, story); err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"story_id": storyID, "deleted": true})
+}
+
+func (s *Server) checkPlan(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	report, err := s.svc.CheckPlan(rctx, caller(rctx).p, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(report)
 }
 
 func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1066,7 +1279,8 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 	if err != nil {
 		return nil, err
 	}
-	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskWork); err != nil {
+	// Changing a ticket's text is planning: its creator, owner, and leads may.
+	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskPlan); err != nil {
 		return nil, err
 	}
 	// Route via repo lookup then actor.
@@ -1083,6 +1297,9 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		Description: optStr(args, "description", ""),
 		AssignedTo:  optStr(args, "assigned_to", ""),
 		AgentID:     optStr(args, "agent_id", ""),
+		Priority:    optStr(args, "priority", ""),
+
+		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1392,19 +1609,12 @@ func (s *Server) deleteTask(rctx context.Context, args map[string]interface{}) (
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
-	// 1. Delete from postgres
-	if err := s.repo.DeleteTask(context.Background(), taskID); err != nil {
+	// Tickets that waited on this one are updated (and unblocked if nothing else holds them).
+	dependents, err := s.svc.DeleteTask(rctx, task)
+	if err != nil {
 		return nil, fmt.Errorf("delete task: %w", err)
 	}
-	// 2. Evict from actor snapshot
-	pid, err := s.registry.Get(task.ProjectID)
-	if err != nil {
-		return nil, err
-	}
-	replyCh := make(chan actor.ReplySimple, 1)
-	s.registry.System().Root.Send(pid, &actor.MsgDeleteTask{TaskID: taskID, ReplyCh: replyCh})
-	<-replyCh
-	return jsonResult(map[string]interface{}{"task_id": taskID, "deleted": true})
+	return jsonResult(map[string]interface{}{"task_id": taskID, "deleted": true, "updated_dependents": dependents})
 }
 
 func (s *Server) deleteEpic(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1422,18 +1632,10 @@ func (s *Server) deleteEpic(rctx context.Context, args map[string]interface{}) (
 	if err := s.checkProjectNotArchived(context.Background(), epic.ProjectID); err != nil {
 		return nil, err
 	}
-	// 1. Delete from postgres (cascades to stories and tasks)
-	if err := s.repo.DeleteEpic(context.Background(), epicID); err != nil {
+	// Deletes its stories and tickets; tickets elsewhere that waited on them are updated.
+	if err := s.svc.DeleteEpic(rctx, epic); err != nil {
 		return nil, fmt.Errorf("delete epic: %w", err)
 	}
-	// 2. Evict all tasks for this epic from actor snapshot
-	pid, err := s.registry.Get(epic.ProjectID)
-	if err != nil {
-		return nil, err
-	}
-	replyCh := make(chan actor.ReplySimple, 1)
-	s.registry.System().Root.Send(pid, &actor.MsgDeleteEpic{EpicID: epicID, ReplyCh: replyCh})
-	<-replyCh
 	return jsonResult(map[string]interface{}{"epic_id": epicID, "deleted": true})
 }
 
@@ -2321,6 +2523,8 @@ func str(desc string) map[string]interface{} {
 func num(desc string) map[string]interface{} {
 	return map[string]interface{}{"type": "number", "description": desc}
 }
+
+const patchMetadataDesc = "Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."
 
 func obj(desc string) map[string]interface{} {
 	return map[string]interface{}{

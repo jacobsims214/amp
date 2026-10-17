@@ -516,11 +516,16 @@ func TestRBAC_OnlyTheOwnerWorksATicket(t *testing.T) {
 	w := newRBACWorld(t)
 	tid := taskID(t, w.as(w.alice).mkTask(t, "alice's", nil))
 	for _, id := range []*auth.Identity{w.bob, w.lead, w.owner} {
-		for _, tool := range []string{"amp_complete_task", "amp_block_task", "amp_update_task"} {
+		for _, tool := range []string{"amp_complete_task", "amp_block_task"} {
 			msg := w.as(id).callExpectError(t, tool, map[string]interface{}{"task_id": float64(tid), "reason": "x", "name": "x"})
 			wantErr(t, msg, "owned by")
 		}
 	}
+	// Fixing the plan is different: the ticket's creator, its owner, and leads
+	// can edit its text and dependencies; other members can't.
+	wantErr(t, w.as(w.bob).callExpectError(t, "amp_update_task", map[string]interface{}{"task_id": float64(tid), "name": "x"}), "owned by")
+	wantErr(t, w.as(w.bob).callExpectError(t, "amp_set_task_dependencies", map[string]interface{}{"task_id": float64(tid), "dependency_ids": []interface{}{}}), "owned by")
+	w.as(w.lead).call(t, "amp_update_task", map[string]interface{}{"task_id": float64(tid), "description": "clarified by the lead"})
 	w.as(w.orgadmin).call(t, "amp_block_task", map[string]interface{}{"task_id": float64(tid), "reason": "org admin override"})
 	// The owner-team member can still take it over explicitly, then work it.
 	w.as(w.owner).call(t, "amp_assign_task", map[string]interface{}{"task_id": float64(tid), "user": "me"})

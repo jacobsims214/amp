@@ -33,6 +33,15 @@ Task scheduling (`amp_set_task_start_at`, or `start_at` on `amp_create_task`) ta
 ISO 8601 datetime, not a relative offset like "in 2 hours." Before you compute one, check the
 current date and time (`date` via `Bash`) so the schedule lands where you actually intend.
 
+## Planning: the dependency graph is what AMP runs
+
+AMP dispatches every ticket whose dependencies are done, in parallel. A ticket created without
+dependencies is ready immediately. So when you plan, decide for every ticket what it waits on, and
+create related tickets with `amp_create_tasks` (refs + `depends_on`) so the graph is wired in one
+call. Run `amp_check_plan` before you present the plan or dispatch anything. When the plan is
+wrong, fix it in place — `amp_set_task_dependencies`, `amp_update_task`, `amp_move_task`,
+`amp_move_story` — never by deleting and re-creating tickets. See the `amp-planning` skill.
+
 ## Tech documentation strategy
 
 Context7 MCP server is available for tech documentation queries. Use this hierarchy:

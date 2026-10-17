@@ -129,6 +129,44 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 		a.routeToStory(ctx, msg.TaskID, msg)
 		delete(a.taskToStory, msg.TaskID)
 
+	case *MsgSetTaskDeps:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
+	case *MsgReconcileDeps:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
+	case *MsgAdoptTask:
+		pid, ok := a.stories[msg.StoryID]
+		if !ok {
+			msg.ReplyCh <- ReplyGetTask{Err: fmt.Errorf("story %d not found in epic %d", msg.StoryID, a.epic.ID)}
+			return
+		}
+		replyCh := make(chan ReplyGetTask, 1)
+		ctx.Send(pid, &MsgAdoptTask{TaskID: msg.TaskID, StoryID: msg.StoryID, ReplyCh: replyCh})
+		reply := <-replyCh
+		if reply.Err == nil {
+			a.taskToStory[msg.TaskID] = msg.StoryID
+		}
+		msg.ReplyCh <- reply
+
+	case *MsgAdoptStory:
+		s, err := a.repo.GetStory(context.Background(), msg.StoryID)
+		if err != nil {
+			msg.ReplyCh <- ReplyAdoptStory{Err: fmt.Errorf("load moved story %d: %w", msg.StoryID, err)}
+			return
+		}
+		ids, err := a.repo.TaskIDsInStories(context.Background(), []int{s.ID})
+		if err != nil {
+			msg.ReplyCh <- ReplyAdoptStory{Err: err}
+			return
+		}
+		a.stories[s.ID] = a.spawnStoryActor(ctx, *s) // loads its tasks as it starts
+		a.storyStates[s.ID] = s.State
+		for _, id := range ids {
+			a.taskToStory[id] = s.ID
+		}
+		msg.ReplyCh <- ReplyAdoptStory{TaskIDs: ids}
+
 	case *MsgDepCompleted:
 		// Fan out to all child StoryActors.
 		for _, pid := range a.stories {

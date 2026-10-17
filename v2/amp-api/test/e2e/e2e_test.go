@@ -952,6 +952,34 @@ func TestE2E(t *testing.T) {
 		}
 		t.Log("metadata inherited and searchable; daily report built, saved, and read by a colleague ✓")
 
+		// Planning: a batch with its dependency graph, fixed in place, checked.
+		batch := e.mustTool(t, adminTok, "amp_create_tasks", map[string]any{"project_id": pid, "tasks": []any{
+			map[string]any{"ref": "schema", "story_id": num(story, "id"), "name": "e2e schema", "description": "d", "acceptance_criteria": "a"},
+			map[string]any{"ref": "api", "story_id": num(story, "id"), "name": "e2e api", "description": "d", "acceptance_criteria": "a", "depends_on": []any{"schema"}},
+			map[string]any{"ref": "ui", "story_id": num(story, "id"), "name": "e2e ui", "description": "d", "acceptance_criteria": "a"},
+		}})
+		ref := map[string]int{}
+		for _, c := range batch["created"].([]any) {
+			ref[c.(map[string]any)["ref"].(string)] = num(c.(map[string]any), "id")
+		}
+		if !strings.Contains(fmt.Sprint(batch["warnings"]), "ui") {
+			t.Fatalf("batch should warn about the unconnected ticket: %v", batch)
+		}
+		fixed := e.mustTool(t, adminTok, "amp_set_task_dependencies", map[string]any{"task_id": ref["ui"], "add": []any{ref["api"]}})
+		if fixed["state"] != "blocked" {
+			t.Fatalf("ui after depending on api = %v", fixed["state"])
+		}
+		otherStory := e.mustTool(t, adminTok, "amp_create_story", map[string]any{"project_id": pid, "epic_id": num(epic, "id"), "name": "e2e frontend"})
+		e.mustTool(t, adminTok, "amp_move_task", map[string]any{"task_id": ref["ui"], "story_id": num(otherStory, "id")})
+		e.mustTool(t, adminTok, "amp_update_task", map[string]any{"task_id": ref["ui"], "acceptance_criteria": "renders the API's data"})
+		if got := e.mustTool(t, adminTok, "amp_get_task", map[string]any{"task_id": ref["ui"]})["task"].(map[string]any); got["acceptance_criteria"] != "renders the API's data" || num(got, "story_id") != num(otherStory, "id") {
+			t.Fatalf("ui after update and move = %v", got)
+		}
+		if plan := e.mustTool(t, adminTok, "amp_check_plan", map[string]any{"project_id": pid}); plan["summary"] == nil {
+			t.Fatalf("check plan = %v", plan)
+		}
+		t.Log("planning: batch with dependencies, warning, dependency fix, move, edit, plan check ✓")
+
 		// Promote the teammate to global admin from the Users page's API. Their
 		// existing MCP token and UI session gain admin powers on the next
 		// request (roles are read per request — no re-login), and lose them
