@@ -115,7 +115,8 @@ unblocked something, and answered questions come back as ready), repeat until bo
 keep everything else moving and report them to your user at the end of each pass.
 
 Dispatching is two steps in the same turn: `amp_dispatch_task`, then the `task` tool that runs
-the worker. Never mark a ticket dispatched that you aren't about to run — everyone watching AMP
+the worker — in the foreground, waiting for it to finish. A background task dies with the session
+that started it, and a headless run (`opencode run`, CI) ends the moment you reply. Never mark a ticket dispatched that you aren't about to run — everyone watching AMP
 sees it in progress while nothing is happening. There is no loop after you reply: your session
 stops when you answer your user. If you stop with work still ready, say so plainly ("#152 is
 ready, not started") instead of "I'll keep the loop running".
