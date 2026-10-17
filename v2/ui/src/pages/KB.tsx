@@ -134,9 +134,29 @@ export function KB() {
         path: editPath, title: editTitle, content: editContent, tags: parsedTags,
         reason: shared ? editReason.trim() : undefined,
       })
-      await loadDocs()
-      const doc = await api.kbGet(kbRef, editPath)
-      setSelectedDoc(doc); setView('doc')
+      // Writes are queued and land a moment later: show what was saved now,
+      // then swap in the stored doc (and refresh the list) once it's there.
+      const path = editPath
+      const savedAt = Math.floor(Date.now() / 1000) - 2
+      setSelectedDoc(prev => ({
+        ...(prev?.path === path ? prev : { id: '', project_id: 0, author: '', chunk_index: 0, chunk_text: '', annotations: [] }),
+        path, title: editTitle, content: editContent, tags: parsedTags, reason: shared ? editReason.trim() : undefined,
+        updated_at: Math.floor(Date.now() / 1000),
+      }))
+      setView('doc')
+      void (async () => {
+        for (let i = 0; i < 10; i++) {
+          await new Promise(r => setTimeout(r, 800))
+          try {
+            const doc = await api.kbGet(kbRef, path)
+            if (doc.updated_at >= savedAt || i === 9) {
+              setSelectedDoc(cur => cur?.path === path ? doc : cur)
+              break
+            }
+          } catch { /* not written yet */ }
+        }
+        loadDocs()
+      })()
     } catch (e) {
       setActionError(e instanceof Error ? e.message : 'Save failed')
     } finally { setSaving(false) }
