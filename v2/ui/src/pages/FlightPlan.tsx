@@ -17,6 +17,7 @@ import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
+import { lookupPerson } from '../lib/people'
 import { ProjectNav } from '../components/ProjectNav'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
@@ -100,7 +101,7 @@ export function FlightPlan() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
-  const { members, myAccess, openReassign } = useProjectPeople(pid)
+  const { members, myAccess, openReassign, people } = useProjectPeople(pid)
   const { me } = useAuth()
   const [focus, setFocus] = useState<number | null>(null)
   const [openId, setOpenId] = useState<number | null>(null)
@@ -285,7 +286,8 @@ export function FlightPlan() {
                     : 'Nothing is blocked on finished work.'}</span>
                 </div>
                 <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
-                <Approval report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus} />
+                <Approval report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus}
+                  approver={report.plan_approved_by != null ? lookupPerson(people, report.plan_approved_by)?.name : undefined} />
               </>}
             </Panel>
 
@@ -300,8 +302,8 @@ export function FlightPlan() {
 }
 
 /** Plan approval: what's new since the last approval, and the button. */
-function Approval({ report, onApprove, approving, error, onFocus }: {
-  report: PlanReport; onApprove: () => void; approving: boolean; error: string | null; onFocus: (id: number) => void
+function Approval({ report, onApprove, approving, error, onFocus, approver }: {
+  report: PlanReport; onApprove: () => void; approving: boolean; error: string | null; onFocus: (id: number) => void; approver?: string
 }) {
   const waiting = report.awaiting_approval ?? []
   const when = report.plan_approved_at ? new Date(report.plan_approved_at).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null
@@ -312,8 +314,8 @@ function Approval({ report, onApprove, approving, error, onFocus }: {
         <Verdict ok={waiting.length === 0} />
         <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">
           {waiting.length === 0
-            ? <>Approved{when ? <> {when}</> : null}. Nothing new has been planned since.</>
-            : <>{waiting.length} open ticket{waiting.length === 1 ? '' : 's'} planned {when ? <>since the last approval ({when})</> : 'and never approved'}.{' '}
+            ? <>Approved{when ? <> {when}</> : null}{approver ? <> by {approver}</> : null}. Nothing new has been planned since.</>
+            : <>{waiting.length} open ticket{waiting.length === 1 ? '' : 's'} planned {when ? <>since the last approval ({when}{approver ? `, ${approver}` : ''})</> : 'and never approved'}.{' '}
                 {report.require_plan_approval ? 'Agents can\'t start them until the plan is approved.' : 'This project doesn\'t require approval, so agents can already start them.'}</>}
         </span>
         {waiting.length > 0 && (
