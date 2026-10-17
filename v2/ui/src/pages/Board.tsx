@@ -467,14 +467,15 @@ export function Board() {
                           setStoryForm({ name: '', description: '', acceptance_criteria: '', priority: '1' })
                           openStoryModal({ mode: 'create', epicId: epic.id })
                         }}
-                        className="p-1 opacity-0 group-hover:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
-                        title="Add story"
+                        className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                        title="Add story" aria-label={`Add a story to ${epic.name}`}
                       >
                         <Plus size={11} className="text-ink-2" />
                       </button>
                       <button
                         onClick={e => { e.stopPropagation(); setOpenEpicMenu(openEpicMenu === epic.id ? null : epic.id) }}
-                        className="p-1 opacity-0 group-hover:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                        aria-label={`Epic actions: ${epic.name}`} aria-haspopup="menu" aria-expanded={openEpicMenu === epic.id} title="Edit or delete epic"
+                        className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
                       >
                         <MoreHorizontal size={12} className="text-ink-2" />
                       </button>
@@ -543,14 +544,15 @@ export function Board() {
                                 setTaskError(null)
                                 setTaskCreateModal({ story })
                               }}
-                              className="p-1 opacity-0 group-hover:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
-                              title="Add task"
+                              className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                              title="Add task" aria-label={`Add a task to ${story.name}`}
                             >
                               <Plus size={11} className="text-ink-2" />
                             </button>
                             <button
                               onClick={e => { e.stopPropagation(); setOpenStoryMenu(openStoryMenu === story.id ? null : story.id) }}
-                              className="p-1 opacity-0 group-hover:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
+                              aria-label={`Story actions: ${story.name}`} aria-haspopup="menu" aria-expanded={openStoryMenu === story.id} title="Edit or delete story"
+                              className="p-1 opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-surface-3 rounded-md transition-all cursor-pointer"
                             >
                               <MoreHorizontal size={11} className="text-ink-2" />
                             </button>
