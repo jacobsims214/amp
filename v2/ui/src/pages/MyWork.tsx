@@ -8,6 +8,7 @@ import { Link, useNavigate } from 'react-router-dom'
 import { Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
+import { BarChart } from '../components/ui/BarChart'
 import { PageHeader, Panel, Readouts } from '../components/ui/PageHeader'
 import { StateTag } from '../components/ui/StateTag'
 import { PriorityMark } from '../components/ui/PriorityMark'
@@ -38,22 +39,12 @@ function ticketLink(t: WorkTask) {
 }
 
 function Velocity({ days }: { days: VelocityDay[] }) {
-  const max = Math.max(1, ...days.map(d => d.completed))
-  const label = (d: VelocityDay) => new Date(d.day + 'T12:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
-  // HTML bars rather than a scaled SVG, so the labels stay at text size at any width.
-  return (
-    <div role="img" aria-label="Tickets you completed per day" className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 amp-num text-[10.5px] text-ink-3">
-      <div className="flex flex-col justify-between items-end h-24"><span>{max}</span><span>0</span></div>
-      <div className="flex items-end gap-1 h-24 border-b border-line">
-        {days.map((d, i) => (
-          <div key={d.day} title={`${d.day}: ${d.completed} completed`} className="flex-1 min-w-0"
-            style={{ height: `${d.completed / max * 100}%`, background: i === days.length - 1 ? 'var(--accent)' : 'var(--ink)' }} />
-        ))}
-      </div>
-      <span />
-      {days.length > 0 && <div className="flex justify-between mt-1"><span>{label(days[0])}</span><span>today</span></div>}
-    </div>
-  )
+  const short = (d: string) => new Date(d + 'T12:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+  return <BarChart ariaLabel="Tickets you completed per day" bars={days.map((d, i) => {
+    const today = i === days.length - 1
+    return { key: d.day, value: d.completed, title: `${d.day}: ${d.completed} completed`, highlight: today,
+      label: today ? 'today' : i === 0 ? short(d.day) : '' }
+  })} />
 }
 
 export function MyWork() {

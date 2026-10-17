@@ -5,6 +5,7 @@
  * effective, inherited value). The completed tickets and the activity log
  * are below for detail. Exports to Markdown.
  */
+import { BarChart } from '../components/ui/BarChart'
 import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { Download, Loader2 } from 'lucide-react'
@@ -59,28 +60,12 @@ function GroupTable({ rows, first, label }: { rows: ReportGroup[]; first: string
 }
 
 function DailyChart({ days }: { days: { day: string; n: number }[] }) {
-  const max = Math.max(1, ...days.map(d => d.n))
-  const w = Math.max(6, Math.floor(440 / Math.max(1, days.length)))
   const labelEvery = Math.ceil(days.length / 8)
-  return (
-    <svg viewBox={`0 0 ${40 + days.length * w} 150`} width="100%" role="img" aria-label="Tickets completed per day">
-      {[0, Math.round(max / 2), max].map(g => {
-        const y = 125 - g / max * 100
-        return <g key={g}><line x1="34" x2={36 + days.length * w} y1={y} y2={y} stroke="var(--line)" />
-          <text x="28" y={y + 3} textAnchor="end" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">{g}</text></g>
-      })}
-      {days.map((d, i) => {
-        const h = d.n / max * 100
-        return (
-          <g key={d.day}>
-            <rect x={38 + i * w} y={125 - h} width={Math.max(3, w - 6)} height={h} fill="var(--ink)"><title>{d.day}: {d.n} done</title></rect>
-            {i % labelEvery === 0 && <text x={38 + i * w + Math.max(3, w - 6) / 2} y="142" textAnchor="middle" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">
-              {new Date(d.day + 'T12:00').toLocaleDateString(undefined, days.length > 8 ? { month: 'short', day: 'numeric' } : { weekday: 'short' })}</text>}
-          </g>
-        )
-      })}
-    </svg>
-  )
+  const fmt: Intl.DateTimeFormatOptions = days.length > 8 ? { month: 'short', day: 'numeric' } : { weekday: 'short' }
+  return <BarChart ariaLabel="Tickets completed per day" bars={days.map((d, i) => ({
+    key: d.day, value: d.n, title: `${d.day}: ${d.n} done`,
+    label: i % labelEvery === 0 ? new Date(d.day + 'T12:00').toLocaleDateString(undefined, fmt) : '',
+  }))} />
 }
 
 export function Report() {
