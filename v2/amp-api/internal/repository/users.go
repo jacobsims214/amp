@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -21,6 +23,48 @@ import (
 // this as a warning, not an error — the request is still valid and should
 // continue without an identity.
 var EmptyEmailClaimError = errors.New("upsert user: empty email claim — skipping provisioning")
+
+// ErrSignupNotAllowed is returned by UpsertUserFromClaims for a first
+// sign-in from an email outside the allowed signup domains (see
+// SetSignupDomains) with no pending invite.
+var ErrSignupNotAllowed = errors.New("upsert user: email domain not allowed to sign up")
+
+// SetSignupDomains limits who can become an AMP user by signing in: a new
+// user's email must be in one of these domains, or have a pending invite,
+// or be a bootstrap admin. Existing users are unaffected. Empty allows
+// everyone (the default). Call before serving requests.
+func (r *Repo) SetSignupDomains(domains []string) {
+	r.signupDomains = nil
+	for _, d := range domains {
+		if d = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(d), "@")); d != "" {
+			r.signupDomains = append(r.signupDomains, d)
+		}
+	}
+}
+
+// signupAllowed reports whether a first sign-in from email may create a user.
+func (r *Repo) signupAllowed(ctx context.Context, email string, bootstrapAdmins map[string]bool) (bool, error) {
+	if len(r.signupDomains) == 0 || bootstrapAdmins[strings.ToLower(email)] {
+		return true, nil
+	}
+	at := strings.LastIndex(email, "@")
+	if at >= 0 && slices.Contains(r.signupDomains, strings.ToLower(email[at+1:])) {
+		return true, nil
+	}
+	var invited bool
+	err := r.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower($1))
+		     OR EXISTS (SELECT 1 FROM invites WHERE lower(email) = lower($1) AND accepted_at IS NULL)`, email,
+	).Scan(&invited)
+	return invited, err
+}
+
+// userCols and userDest read a users row (unqualified columns).
+const userCols = `id, subject, email, display_name, created_at, last_seen_at, kind, managed_by, disabled_at`
+
+func userDest(u *domain.User) []any {
+	return []any{&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt, &u.Kind, &u.ManagedBy, &u.DisabledAt}
+}
 
 // UpsertUserFromClaims JIT-provisions a user row on first (or every) validated
 // request. If this is the very first user ever created, or their email is in
@@ -50,6 +94,17 @@ func (r *Repo) UpsertUserFromClaims(ctx context.Context, subject, email, display
 	if email == "" {
 		return nil, EmptyEmailClaimError
 	}
+	if len(r.signupDomains) > 0 {
+		if _, err := r.GetUserBySubject(ctx, subject); err != nil {
+			ok, err := r.signupAllowed(ctx, email, bootstrapAdmins)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				return nil, ErrSignupNotAllowed
+			}
+		}
+	}
 
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
@@ -59,9 +114,9 @@ func (r *Repo) UpsertUserFromClaims(ctx context.Context, subject, email, display
 		   email = EXCLUDED.email,
 		   display_name = CASE WHEN EXCLUDED.display_name != '' THEN EXCLUDED.display_name ELSE users.display_name END,
 		   last_seen_at = NOW()
-		 RETURNING id, subject, email, display_name, created_at, last_seen_at`,
+		 RETURNING `+userCols,
 		subject, email, displayName,
-	).Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt)
+	).Scan(userDest(u)...)
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "users_email_key" {
@@ -87,10 +142,14 @@ func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, di
 		 SET subject = $1,
 		     display_name = CASE WHEN $3 != '' THEN $3 ELSE display_name END,
 		     last_seen_at = NOW()
-		 WHERE email = $2
-		 RETURNING id, subject, email, display_name, created_at, last_seen_at`,
+		 WHERE email = $2 AND kind = 'human'
+		 RETURNING `+userCols,
 		subject, email, displayName,
-	).Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt)
+	).Scan(userDest(u)...)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The email belongs to an agent account: a sign-in never takes one over.
+		return nil, fmt.Errorf("update existing user by email: %s belongs to an agent account", email)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("update existing user by email: %w", err)
 	}
@@ -168,9 +227,8 @@ func (r *Repo) getUserRoles(ctx context.Context, userID int) ([]string, error) {
 func (r *Repo) GetUserBySubject(ctx context.Context, subject string) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
-		`SELECT id, subject, email, display_name, created_at, last_seen_at
-		 FROM users WHERE subject = $1`, subject,
-	).Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt)
+		`SELECT `+userCols+` FROM users WHERE subject = $1`, subject,
+	).Scan(userDest(u)...)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("user not found")
 	}
@@ -189,9 +247,8 @@ func (r *Repo) GetUserBySubject(ctx context.Context, subject string) (*domain.Us
 func (r *Repo) GetUserByEmail(ctx context.Context, email string) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
-		`SELECT id, subject, email, display_name, created_at, last_seen_at
-		 FROM users WHERE lower(email) = lower(trim($1))`, email,
-	).Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt)
+		`SELECT `+userCols+` FROM users WHERE lower(email) = lower(trim($1))`, email,
+	).Scan(userDest(u)...)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("user %q not found: %w", email, ErrNotFound)
 	}
@@ -209,8 +266,7 @@ func (r *Repo) GetUserByEmail(ctx context.Context, email string) (*domain.User, 
 // ListUsers returns every provisioned user with their roles, newest first.
 func (r *Repo) ListUsers(ctx context.Context) ([]domain.User, error) {
 	rows, err := r.db.Query(ctx,
-		`SELECT id, subject, email, display_name, created_at, last_seen_at
-		 FROM users ORDER BY created_at DESC`)
+		`SELECT `+userCols+` FROM users ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -219,7 +275,7 @@ func (r *Repo) ListUsers(ctx context.Context) ([]domain.User, error) {
 	out := make([]domain.User, 0)
 	for rows.Next() {
 		var u domain.User
-		if err := rows.Scan(&u.ID, &u.Subject, &u.Email, &u.DisplayName, &u.CreatedAt, &u.LastSeenAt); err != nil {
+		if err := rows.Scan(userDest(&u)...); err != nil {
 			return nil, err
 		}
 		out = append(out, u)

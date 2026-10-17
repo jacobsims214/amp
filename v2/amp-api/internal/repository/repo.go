@@ -15,6 +15,8 @@ import (
 // No ORM — just plain SQL. Fast to understand, easy to debug.
 type Repo struct {
 	db *pgxpool.Pool
+	// signupDomains limits first sign-ins (see SetSignupDomains).
+	signupDomains []string
 }
 
 func New(ctx context.Context, dsn string) (*Repo, error) {

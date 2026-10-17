@@ -76,6 +76,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Who may become an AMP user by signing in (e.g. through an SSO
+	// connector): emails in these domains, invited emails, and bootstrap
+	// admins. Unset allows anyone who can sign in to Dex.
+	if d := splitList(os.Getenv("SIGNUP_ALLOWED_DOMAINS")); len(d) > 0 {
+		repo.SetSignupDomains(d)
+		slog.Info("sign-ups limited to domains (plus invites and bootstrap admins)", "domains", d)
+	}
+
 	// ---- 1b. Auth (OIDC verifier against Dex) ----
 	var audiences []string
 	if a := os.Getenv("OIDC_AUDIENCES"); a != "" {

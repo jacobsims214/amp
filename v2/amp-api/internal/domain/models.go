@@ -359,6 +359,64 @@ type User struct {
 	Roles       []string  `json:"roles"`
 	CreatedAt   time.Time `json:"created_at"`
 	LastSeenAt  time.Time `json:"last_seen_at"`
+	// Kind is UserKindHuman (signs in through Dex) or UserKindAgent (an
+	// account for an autonomous agent, which uses API tokens).
+	Kind string `json:"kind"`
+	// ManagedBy is the person responsible for an agent account.
+	ManagedBy *int `json:"managed_by,omitempty"`
+	// DisabledAt is set while the account is deactivated: every request
+	// it makes is refused, and its work and history stay as they are.
+	DisabledAt *time.Time `json:"disabled_at,omitempty"`
+}
+
+// AuditEntry is one row of the audit log: a change to access, settings,
+// or a deletion, and who made it.
+type AuditEntry struct {
+	ID          int64          `json:"id"`
+	At          time.Time      `json:"at"`
+	ActorUserID *int           `json:"actor_user_id,omitempty"`
+	ActorEmail  string         `json:"actor_email"`
+	ViaToken    bool           `json:"via_token,omitempty"` // made with an API token
+	OrgID       *int           `json:"org_id,omitempty"`
+	ProjectID   *int           `json:"project_id,omitempty"`
+	Action      string         `json:"action"` // e.g. "org.member.set", "task.delete"
+	TargetType  string         `json:"target_type,omitempty"`
+	TargetID    string         `json:"target_id,omitempty"`
+	Summary     string         `json:"summary"`
+	Details     map[string]any `json:"details,omitempty"`
+}
+
+// AuditFilter selects audit entries; zero fields don't filter.
+type AuditFilter struct {
+	OrgID       int // entries for the org or any of its projects
+	ProjectID   int
+	ActorUserID int
+	Action      string // exact action, or a prefix ending in "." (e.g. "org.")
+	BeforeID    int64  // page backwards from here
+	Limit       int
+}
+
+// IsAgent reports whether u is an agent account.
+func (u *User) IsAgent() bool { return u != nil && u.Kind == UserKindAgent }
+
+const (
+	UserKindHuman = "human"
+	UserKindAgent = "agent"
+)
+
+// APIToken is a long-lived credential for MCP (and API) access, for agent
+// accounts and for people running headless agents. Only a hash is stored;
+// the token itself is shown once, when it is created.
+type APIToken struct {
+	ID         int        `json:"id"`
+	UserID     int        `json:"user_id"`
+	Name       string     `json:"name"`
+	Prefix     string     `json:"prefix"` // first characters, to recognise it
+	CreatedBy  *int       `json:"created_by,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+	LastUsedAt *time.Time `json:"last_used_at,omitempty"`
+	RevokedAt  *time.Time `json:"revoked_at,omitempty"`
 }
 
 const (
@@ -405,6 +463,8 @@ type Member struct {
 	Email       string `json:"email"`
 	DisplayName string `json:"display_name"`
 	Role        string `json:"role"`
+	Kind        string `json:"kind,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
 }
 
 // ProjectTeam is a team's link to a project.
@@ -422,6 +482,8 @@ type ProjectMember struct {
 	Email       string `json:"email"`
 	DisplayName string `json:"display_name"`
 	Access      string `json:"access"`
+	Kind        string `json:"kind,omitempty"`
+	Disabled    bool   `json:"disabled,omitempty"`
 }
 
 type Invite struct {
