@@ -25,6 +25,9 @@ import { countStates, displayState, STATE_LABEL, STATE_VAR, type DisplayState } 
 import { activityActor, lookupPerson } from '../lib/people'
 import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
 
+/** An in-progress ticket with no activity for this long may have a stalled agent. */
+const QUIET_MS = 15 * 60_000
+
 function ago(iso?: string | null): string {
   if (!iso) return ''
   const ms = Date.now() - new Date(iso).getTime()
@@ -170,6 +173,10 @@ export function Mission() {
   }
   const [showDone, setShowDone] = useState(false)
   const [activity, setActivity] = useState<FeedItem[]>([])
+  // Last sign of life per ticket (any activity), and a clock that moves on
+  // its own, so a dispatched ticket that has gone silent shows as quiet.
+  const [lastSeen, setLastSeen] = useState<Map<number, number>>(new Map())
+  const [now, setNow] = useState(Date.now)
   const selected = selectedId == null ? null : tasks.find(t => t.id === selectedId) ?? null
 
   // Latest activity; refreshed shortly after tickets change.
@@ -180,15 +187,26 @@ export function Mission() {
     Promise.all([
       api.getProjectActivity(pid, since),
       api.audit({ projectId: pid, limit: 200 }).catch(() => [] as AuditEntry[]),
-    ]).then(([a, audit]) => setActivity(
-      [...a.map(fromActivity), ...audit.filter(e => e.at >= since).map(fromAudit)]
-        .sort((x, y) => y.at.localeCompare(x.at)).reduce(collapseRuns, []).slice(0, 14)))
+    ]).then(([a, audit]) => {
+      const seen = new Map<number, number>()
+      for (const e of a) seen.set(e.task_id, Math.max(seen.get(e.task_id) ?? 0, Date.parse(e.created_at)))
+      setLastSeen(seen)
+      setNow(Date.now())
+      setActivity([...a.map(fromActivity), ...audit.filter(e => e.at >= since).map(fromAudit)]
+        .sort((x, y) => y.at.localeCompare(x.at)).reduce(collapseRuns, []).slice(0, 14))
+    })
       .catch(() => {})
   }, [pid])
   useEffect(() => {
     const t = setTimeout(loadActivity, 600)
     return () => clearTimeout(t)
   }, [tasks, loadActivity])
+  // Agents' comments don't change tickets, so poll for them once a minute.
+  useEffect(() => {
+    const t = setInterval(loadActivity, 60_000)
+    return () => clearInterval(t)
+  }, [loadActivity])
+  const quietFor = (t: Task) => now - Math.max(lastSeen.get(t.id) ?? 0, Date.parse(t.dispatched_at ?? '') || 0, Date.parse(t.updated_at) || 0)
 
   const counts = useMemo(() => countStates(tasks), [tasks])
   const dependents = useMemo(() => {
@@ -222,6 +240,7 @@ export function Mission() {
   }
 
   // Agents are profiles in each person's harness, so count the people they work for.
+  const quiet = flying.filter(t => quietFor(t) > QUIET_MS).length
   const drivers = new Set(flying.map(t => t.owner_user_id).filter(id => id != null)).size
   return (
     <div className="flex flex-col min-h-full">
@@ -229,7 +248,7 @@ export function Mission() {
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         <Readouts items={[
-          { label: 'In progress', value: counts.prog, sub: flying.length ? `agents for ${drivers} ${drivers === 1 ? 'person' : 'people'}` : 'nothing running', color: 'var(--st-prog)' },
+          { label: 'In progress', value: counts.prog, sub: quiet ? `${quiet} quiet · may have stalled` : flying.length ? `agents for ${drivers} ${drivers === 1 ? 'person' : 'people'}` : 'nothing running', alarm: quiet > 0, color: 'var(--st-prog)' },
           { label: 'Ready', value: counts.ready, sub: 'can dispatch now' },
           { label: 'Waiting', value: counts.wait, sub: 'on dependencies', color: 'var(--ink-3)' },
           { label: 'Questions', value: counts.flag, sub: counts.flag ? 'agents waiting on an answer' : 'nothing needs you', alarm: counts.flag > 0 },
@@ -288,7 +307,9 @@ export function Mission() {
                     <Avatar name={t.agent_id || '?'} kind="agent" />
                     <span className="text-[12.5px] text-ink truncate"><b className="font-semibold">{lookupPerson(people, t.owner_user_id)?.name ?? 'Unowned'}</b>
                       <span className="amp-num text-[11px] text-ink-3"> · {t.agent_id || 'agent'}</span></span>
-                    <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>
+                    {quietFor(t) > QUIET_MS
+                      ? <span className="amp-num text-[11px] text-st-flag" title="No activity on this ticket for a while: the agent may have stalled.">quiet {Math.round(quietFor(t) / 60_000)}m</span>
+                      : <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>}
                     <span className="col-start-2 col-span-2 text-[11.5px] text-ink-2 truncate">#{t.id} {t.name}</span>
                   </button>
                 ))}
