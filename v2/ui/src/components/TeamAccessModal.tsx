@@ -149,7 +149,7 @@ export function TeamAccessPanel({ projectId, myAccess, onProjectUpdated }: Panel
                     return r
                   })}
                   disabled={busy || !addTeamId}
-                  className="px-3 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer flex-shrink-0"
+                  className="amp-btn amp-btn-primary flex-shrink-0"
                 >
                   Add
                 </button>

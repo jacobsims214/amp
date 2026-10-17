@@ -167,8 +167,7 @@ export function KB() {
   const newDocButton = canWrite ? (
     <button
       onClick={() => openEditor(null)}
-      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer"
-      style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
+      className="amp-btn"
     >
       <Plus size={12} />
       New Doc
@@ -588,8 +587,7 @@ function BrowseView({ docs, loading, tagFilter, onOpen, onNew }: {
           {onNew ? 'Agents write docs here, or you can create one manually.' : "There's nothing here yet."}
         </p>
         {onNew && <button onClick={onNew}
-          className="mt-4 flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold mx-auto cursor-pointer transition-all active:scale-[0.97]"
-          style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}>
+          className="amp-btn mt-4">
           <Plus size={14} />
           Create first document
         </button>}
@@ -917,8 +915,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
                   <button
                     onClick={handleAddAnnotation}
                     disabled={!annText.trim() || annSaving}
-                    className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all active:scale-[0.97] cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
-                    style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
+                    className="amp-btn"
                     onMouseEnter={(e) => {
                       if (!annSaving && annText.trim()) {
                         (e.currentTarget as HTMLElement).style.background = 'color-mix(in srgb, var(--link) 20%, transparent)';

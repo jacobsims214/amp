@@ -24,9 +24,6 @@ const prettyDay = (day: string) =>
   new Date(`${day}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
 
 const card = { background: 'var(--surface)', border: '1px solid var(--line)' }
-const btnCls =
-  'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all cursor-pointer active:scale-[0.97] ' +
-  'disabled:opacity-50 disabled:cursor-not-allowed'
 
 export function DayReports() {
   const { me } = useAuth()
@@ -155,7 +152,7 @@ function MyDay() {
         <h2 className="text-sm font-bold text-ink">Your day</h2>
         <input type="date" value={day} max={localDay()} onChange={e => e.target.value && setDay(e.target.value)}
           className="bg-bg border border-line rounded-lg px-2 py-1 text-xs text-ink focus:outline-none focus:border-primary" />
-        <button onClick={load} disabled={loading} className={`${btnCls} text-ink-2 hover:text-ink`} title="Rebuild from the latest activity">
+        <button onClick={load} disabled={loading} className="amp-btn amp-btn-ghost" title="Rebuild from the latest activity">
           <RefreshCw size={12} className={loading ? 'animate-spin' : ''} />Refresh
         </button>
         <span className="text-xs text-ink-3 ml-auto">
@@ -168,10 +165,10 @@ function MyDay() {
       </p>
       <textarea value={summary} onChange={e => setSummary(e.target.value)} rows={5}
         placeholder="Highlights, blockers, and what's next…"
-        className="w-full bg-bg border border-line rounded-xl px-3 py-2.5 text-sm text-ink placeholder-ink-3 focus:outline-none focus:border-primary resize-y" />
+        className="amp-input resize-y" />
       <div className="flex items-center gap-2">
         <button onClick={save} disabled={saving || loading}
-          className={`${btnCls} bg-primary hover:bg-primary text-white`}>
+          className="amp-btn amp-btn-primary">
           {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
           {report?.saved ? (dirty ? 'Save changes' : 'Save again') : 'Save report'}
         </button>
@@ -241,7 +238,7 @@ function ReportBody({ report, showSummary }: { report: DayReport; showSummary: b
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-2">
-        <button onClick={copy} className={`${btnCls} text-link`} style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)' }}>
+        <button onClick={copy} className="amp-btn">
           {copied ? <Check size={12} /> : <ClipboardCopy size={12} />}{copied ? 'Copied' : 'Copy as markdown'}
         </button>
         <span className="text-xs text-ink-3">

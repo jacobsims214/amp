@@ -131,7 +131,7 @@ export function ProjectSettings() {
                   {canManage && (
                     <div className="flex items-center gap-3">
                       <button onClick={save} disabled={!dirty || saving || !name.trim()}
-                        className="flex items-center gap-1.5 px-3 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                        className="amp-btn amp-btn-primary">
                         {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
                         Save
                       </button>
@@ -141,6 +141,23 @@ export function ProjectSettings() {
                 </div>
               </Section>
 
+              <Section title="Plan approval"
+                description="Agents plan; a person approves before they start. With this on, tickets planned after the last approval can't be dispatched until someone approves the plan in Flight plan (or tells the orchestrator, which records it with amp_approve_plan).">
+                <label className="flex items-center gap-3 text-[13px] text-ink cursor-pointer select-none">
+                  <input type="checkbox" className="w-4 h-4 accent-[var(--ink)]" disabled={!canManage}
+                    checked={!!project.require_plan_approval}
+                    onChange={async e => {
+                      const on = e.target.checked
+                      try { setProject(await api.updateProjectSettings(pid, { require_plan_approval: on })) }
+                      catch (err) { setError(err instanceof Error ? err.message : 'Could not change the setting') }
+                    }} />
+                  Require approval before agents start new tickets
+                </label>
+                <p className="m-0 mt-2 text-[12px] text-ink-2">{project.plan_approved_at
+                  ? <>Last approved <span className="amp-num">{new Date(project.plan_approved_at).toLocaleString()}</span>.</>
+                  : 'The plan has never been approved.'}</p>
+              </Section>
+
               <Section title="Metadata"
                 description="Free-form fields for integrations and reporting, e.g. jira_board, initiative, capitalizable. Every epic, story, and ticket in the project inherits them and can override them.">
                 <MetadataEditor key={project.id} initial={project.metadata} readOnly={!canManage}
@@ -148,7 +165,7 @@ export function ProjectSettings() {
                 {canManage && (
                   <div className="flex items-center gap-3 mt-3">
                     <button onClick={saveMeta} disabled={!metaPatch || !!meta?.error || metaSaving}
-                      className="flex items-center gap-1.5 px-3 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                      className="amp-btn amp-btn-primary">
                       {metaSaving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
                       Save fields
                     </button>

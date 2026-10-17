@@ -301,7 +301,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               {editError && <p className="text-xs text-danger-ink">{editError}</p>}
               <div className="flex gap-2 pt-1">
                 <button onClick={handleEditSave} disabled={editSaving}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-primary hover:bg-primary disabled:opacity-50 text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer">
+                  className="amp-btn amp-btn-primary">
                   {editSaving && <Loader2 size={11} className="animate-spin" />}
                   Save changes
                 </button>
@@ -371,9 +371,6 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
     }
   }
 
-  const btnCls =
-    'flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-semibold transition-all cursor-pointer ' +
-    'disabled:opacity-50 disabled:cursor-not-allowed active:scale-[0.97]'
 
   return (
     <div className="px-6 py-3 border-b border-line-sub space-y-2">
@@ -394,8 +391,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
             <button
               onClick={() => assign('me')}
               disabled={busy}
-              className={btnCls}
-              style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
+              className="amp-btn amp-btn-primary amp-btn-sm"
               title="Take ownership of this ticket"
             >
               <Hand size={11} />
@@ -406,8 +402,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
             <button
               onClick={() => assign('me')}
               disabled={busy}
-              className={btnCls}
-              style={{ background: 'color-mix(in srgb, var(--link) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 25%, transparent)', color: 'var(--link)' }}
+              className="amp-btn amp-btn-primary amp-btn-sm"
               title={`Take this ticket over from ${owner!.name}`}
             >
               <Hand size={11} />
@@ -418,7 +413,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
             <button
               onClick={() => assign('none')}
               disabled={busy}
-              className={`${btnCls} text-ink-2 hover:text-ink hover:bg-surface-3 border border-line`}
+              className="amp-btn amp-btn-sm"
               title="Release back to the unassigned pool"
             >
               <UserMinus size={11} />
@@ -678,7 +673,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
             </div>
             <div className="flex items-center gap-2">
               <button onClick={handleSaveSchedule} disabled={savingSchedule}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-primary hover:bg-primary text-white text-xs font-semibold rounded-lg disabled:opacity-50 transition-all active:scale-[0.97] cursor-pointer">
+                className="amp-btn amp-btn-primary">
                 {savingSchedule && <Loader2 size={11} className="animate-spin" />}
                 Save
               </button>

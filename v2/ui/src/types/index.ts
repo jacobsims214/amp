@@ -15,6 +15,9 @@ export interface Project {
   metadata?: Metadata
   created_at: string
   updated_at: string
+  plan_approved_at?: string
+  plan_approved_by?: number
+  require_plan_approval?: boolean
 }
 
 export interface Epic {
@@ -106,6 +109,11 @@ export interface PlanIssue {
 
 export interface PlanReport {
   ok: boolean
+  /** open tickets planned since the plan was last approved */
+  awaiting_approval?: number[]
+  plan_approved_at?: string
+  plan_approved_by?: number
+  require_plan_approval?: boolean
   tasks: number
   open_tasks: number
   dependencies: number

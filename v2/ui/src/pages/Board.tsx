@@ -1,6 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
 import { useParams } from 'react-router-dom'
-import { RefreshCw, Loader2, Wifi, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
+import { RefreshCw, Loader2, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
 import { useAuth } from '../hooks/useAuth'
@@ -26,7 +26,7 @@ import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metada
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
 const LABEL_COL = 180
-const TASK_COL  = 168
+const TASK_COL  = 200
 
 const COLUMNS: {
   state: TaskState
@@ -35,11 +35,11 @@ const COLUMNS: {
   countBg: string
   topBorder: string
 }[] = [
-  { state: 'scheduled',   label: 'Scheduled',   color: 'var(--warning-ink)', countBg: 'color-mix(in srgb, var(--warning) 12%, transparent)',  topBorder: 'var(--warning)' },
-  { state: 'backlog',     label: 'Backlog',      color: 'var(--ink-2)', countBg: 'color-mix(in srgb, var(--ink-2) 12%, transparent)', topBorder: 'var(--line-str)' },
-  { state: 'in_progress', label: 'In Progress',  color: 'var(--link)', countBg: 'color-mix(in srgb, var(--link) 15%, transparent)',  topBorder: 'var(--primary)' },
-  { state: 'blocked',     label: 'Blocked',      color: 'var(--danger-ink)', countBg: 'color-mix(in srgb, var(--danger) 12%, transparent)',   topBorder: 'var(--danger)' },
-  { state: 'completed',   label: 'Done',         color: 'var(--success)', countBg: 'color-mix(in srgb, var(--success) 12%, transparent)',  topBorder: 'var(--success)' },
+  { state: 'scheduled',   label: 'Scheduled',             color: 'var(--st-sched)', countBg: 'transparent', topBorder: 'var(--st-sched)' },
+  { state: 'backlog',     label: 'Ready',                 color: 'var(--st-ready)', countBg: 'transparent', topBorder: 'var(--st-ready)' },
+  { state: 'in_progress', label: 'In progress',           color: 'var(--st-prog)',  countBg: 'transparent', topBorder: 'var(--st-prog)' },
+  { state: 'blocked',     label: 'Waiting & questions',   color: 'var(--st-flag)',  countBg: 'transparent', topBorder: 'var(--st-flag)' },
+  { state: 'completed',   label: 'Done',                  color: 'var(--st-done)',  countBg: 'transparent', topBorder: 'var(--st-done)' },
 ]
 
 function isScheduledTask(task: Task): boolean {
@@ -313,8 +313,7 @@ export function Board() {
             {/* New Epic */}
             <button
               onClick={() => { setEpicForm({ name: '', description: '', priority: '1' }); openEpicModal({ mode: 'create' }) }}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-link transition-all cursor-pointer active:scale-[0.97]"
-              style={{ background: 'color-mix(in srgb, var(--link) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--link) 20%, transparent)' }}
+              className="amp-btn amp-btn-primary"
             >
               <Plus size={12} />
               Epic
@@ -323,7 +322,7 @@ export function Board() {
             {/* Plan check */}
             <button
               onClick={() => setPlanCheckOpen(true)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-ink-2 hover:text-ink border border-line hover:border-line-str transition-all cursor-pointer"
+              className="amp-btn"
               title="Check the plan's dependencies before dispatching"
             >
               <ListChecks size={12} />
@@ -333,7 +332,7 @@ export function Board() {
             {/* Team access */}
             <button
               onClick={() => setTeamAccessOpen(true)}
-              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold text-ink-2 hover:text-ink border border-line hover:border-line-str transition-all cursor-pointer"
+              className="amp-btn"
               title="Teams with access to this project"
             >
               <Users size={12} />
@@ -344,11 +343,7 @@ export function Board() {
             {completedEpicIds.size > 0 && (
               <button
                 onClick={() => setHideCompleted(h => !h)}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-all cursor-pointer"
-                style={hideCompleted
-                  ? { background: 'color-mix(in srgb, var(--success) 10%, transparent)', border: '1px solid color-mix(in srgb, var(--success) 25%, transparent)', color: 'var(--success)' }
-                  : { background: 'transparent', border: '1px solid var(--line)', color: 'var(--ink-3)' }
-                }
+                className={`amp-btn ${hideCompleted ? 'amp-btn-primary' : ''}`} aria-pressed={hideCompleted}
               >
                 {hideCompleted ? <Eye size={12} /> : <EyeOff size={12} />}
                 <span>{hideCompleted ? `${completedEpicIds.size} hidden` : 'Hide done'}</span>
@@ -356,9 +351,9 @@ export function Board() {
             )}
 
             {/* Live status */}
-            <div className={`flex items-center gap-1.5 text-xs font-medium ${liveStatus === 'connected' ? 'text-success' : 'text-ink-3'}`}>
+            <div className={`flex items-center gap-1.5 amp-num text-[11px] ${liveStatus === 'connected' ? 'text-success-ink' : 'text-ink-3'}`}>
               {liveStatus === 'connected'
-                ? <><span className="w-1.5 h-1.5 rounded-full bg-success" style={{ boxShadow: '0 0 5px var(--success)' }} /><Wifi size={11} /></>
+                ? <span className="w-1.5 h-1.5 bg-success" />
                 : <WifiOff size={11} />
               }
               <span className="hidden sm:inline">{liveStatus === 'connected' ? 'Live' : 'Connecting…'}</span>
@@ -390,7 +385,7 @@ export function Board() {
         {epics.length === 0 ? (
           <EmptyState />
         ) : (
-          <div className="min-w-max">
+          <div style={{ minWidth: LABEL_COL + COLUMNS.length * TASK_COL }}>
             {/* Column headers — sticky */}
             <div className="sticky top-0 z-10 flex" style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
               {/* Row label spacer */}
@@ -398,18 +393,12 @@ export function Board() {
               {COLUMNS.map(col => (
                 <div
                   key={col.state}
-                  className="flex-1 px-3 py-3 border-r border-line-sub last:border-r-0 flex items-center gap-2"
-                  style={{ minWidth: TASK_COL, borderTop: `2px solid ${col.topBorder}22` }}
+                  className="flex-1 px-3 py-3 border-r border-line last:border-r-0 flex items-center gap-2"
+                  style={{ minWidth: TASK_COL, boxShadow: `inset 0 3px 0 ${col.topBorder}` }}
                 >
-                  <span className="text-xs font-bold uppercase tracking-widest" style={{ color: col.color }}>
-                    {col.label}
-                  </span>
-                  <span
-                    className="text-xs px-1.5 py-0.5 rounded-full font-semibold tabular-nums"
-                    style={{ background: col.countBg, color: col.color }}
-                  >
-                    {counts[col.state as keyof typeof counts]}
-                  </span>
+                  <i className="inline-block w-2 h-2" style={{ background: col.color }} aria-hidden="true" />
+                  <span className="font-label text-[11px] font-semibold uppercase tracking-[0.14em] text-ink">{col.label}</span>
+                  <span className="amp-num text-[11px] text-ink-3 ml-auto">{counts[col.state as keyof typeof counts]}</span>
                 </div>
               ))}
             </div>
@@ -437,18 +426,16 @@ export function Board() {
                 <div key={epic.id} className="border-b border-line-sub">
                   {/* Epic header */}
                   <div
-                    className="flex items-center cursor-pointer group transition-colors"
-                    style={{ borderBottom: '1px solid var(--line-sub)' }}
+                    className="flex items-center cursor-pointer group transition-colors bg-surface-2 hover:bg-surface-3"
+                    style={{ borderBottom: '1px solid var(--line)' }}
                     onClick={() => toggleEpic(epic.id)}
-                    onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--surface)'}
-                    onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                   >
                     <div className="flex-shrink-0 px-3 py-3 border-r border-line-sub flex items-center gap-2 relative" style={{ width: LABEL_COL }}>
                       <span className="text-line-str group-hover:text-ink-2 transition-colors">
                         {isEpicCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <div className="text-xs font-bold text-ink truncate">{epic.name}</div>
+                        <div className="flex items-center gap-2"><span className="amp-bands-v h-[12px]" aria-hidden="true" /><span className="font-label text-[12px] font-semibold uppercase tracking-[0.12em] text-ink truncate">{epic.name}</span></div>
                         <div className="flex items-center gap-1.5 text-xs text-ink-3 tabular-nums">
                           <span className="truncate">
                             {epicStories.length} stor{epicStories.length !== 1 ? 'ies' : 'y'} · {epicTasks.length} task{epicTasks.length !== 1 ? 's' : ''}
@@ -474,7 +461,7 @@ export function Board() {
                         <MoreHorizontal size={12} className="text-ink-2" />
                       </button>
                        {openEpicMenu === epic.id && (
-                         <div className="absolute right-1 top-9 z-20 rounded-xl py-1 min-w-[108px]"
+                         <div className="absolute right-1 top-9 z-20 py-1 min-w-[108px]"
                            style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent)' }}>
                           <button
                             onClick={e => {
@@ -499,8 +486,7 @@ export function Board() {
                       return (
                         <div key={col.state} className="flex-1 px-3 py-3 border-r border-line-sub last:border-r-0" style={{ minWidth: TASK_COL }}>
                           {n > 0 && (
-                            <span className="text-xs px-1.5 py-0.5 rounded-full font-semibold tabular-nums"
-                              style={{ background: col.countBg, color: col.color }}>
+                            <span className="amp-num text-[11.5px]" style={{ color: col.color }}>
                               {n}
                             </span>
                           )}
@@ -518,17 +504,15 @@ export function Board() {
                       <div key={story.id} className="border-b border-line-sub/60 last:border-b-0">
                         {/* Story header */}
                         <div
-                          className="flex items-center cursor-pointer group transition-colors"
+                          className="flex items-center cursor-pointer group transition-colors bg-surface hover:bg-surface-2 border-b border-line"
                           onClick={() => toggleStory(story.id)}
-                          onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = 'var(--bg)'}
-                          onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
                         >
                           <div className="flex-shrink-0 px-3 py-2.5 pl-7 border-r border-line-sub flex items-center gap-2 relative" style={{ width: LABEL_COL }}>
                             <span className="text-line group-hover:text-line-str transition-colors">
                               {isStoryCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
                             </span>
                             <div className="min-w-0 flex-1">
-                              <div className="text-xs font-medium text-ink-2 truncate">{story.name}</div>
+                              <div className="text-[12.5px] font-medium text-ink truncate">{story.name}</div>
                               <div className="flex items-center gap-1.5 text-xs text-ink-3 tabular-nums">
                                 <span className="truncate">{storyTasks.length} task{storyTasks.length !== 1 ? 's' : ''}</span>
                                 <OwnerStack people={ownersOf(story.owner_ids)} max={2} size={14} />
@@ -553,7 +537,7 @@ export function Board() {
                               <MoreHorizontal size={11} className="text-ink-2" />
                             </button>
                              {openStoryMenu === story.id && (
-                               <div className="absolute right-1 top-8 z-20 rounded-xl py-1 min-w-[108px]"
+                               <div className="absolute right-1 top-8 z-20 py-1 min-w-[108px]"
                                  style={{ background: 'var(--surface)', border: '1px solid var(--line)', boxShadow: '0 8px 24px color-mix(in srgb, var(--ink) 10%, transparent)' }}>
                                 <button
                                   onClick={e => {
@@ -578,8 +562,7 @@ export function Board() {
                             return (
                               <div key={col.state} className="flex-1 px-3 py-2.5 border-r border-line-sub last:border-r-0" style={{ minWidth: TASK_COL }}>
                                 {n > 0 && (
-                                  <span className="text-xs px-1.5 py-0.5 rounded-full tabular-nums"
-                                    style={{ background: col.countBg, color: col.color }}>
+                                  <span className="amp-num text-[11px]" style={{ color: col.color }}>
                                     {n}
                                   </span>
                                 )}
@@ -596,14 +579,15 @@ export function Board() {
                               let colTasks: Task[] = []
                               if (col.state === 'scheduled') colTasks = storyTasks.filter(t => isScheduledTask(t))
                               else if (col.state === 'blocked') colTasks = storyTasks.filter(t => t.state === 'blocked' && !isScheduledTask(t))
+                                .sort((a, b) => Number(!!b.block_reason) - Number(!!a.block_reason))
                               else colTasks = storyTasks.filter(t => t.state === col.state)
                               return (
                                  <div
                                    key={col.state}
-                                   className="flex-1 p-1.5 border-r border-line-sub last:border-r-0"
-                                   style={{ minWidth: TASK_COL, background: 'var(--surface-2)' }}
+                                   className="flex-1 p-2 border-r border-line last:border-r-0"
+                                   style={{ minWidth: TASK_COL, background: 'var(--bg)' }}
                                 >
-                                  <div className="space-y-2">
+                                  <div className="space-y-1.5">
                                     {colTasks.map(task => (
                                       <TaskCard
                                         key={task.id}

@@ -56,7 +56,7 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
               <button
                 onClick={onSave}
                 disabled={saving}
-                className="flex items-center gap-1.5 px-4 py-2 bg-primary hover:bg-primary disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold rounded-lg transition-all active:scale-[0.97] cursor-pointer"
+                className="amp-btn amp-btn-primary"
               >
                 {saving && <Loader2 size={11} className="animate-spin" />}
                 {saveLabel}
@@ -70,8 +70,6 @@ export function CrudModal({ title, onClose, onSave, saving = false, saveLabel = 
 }
 
 /* ─── Shared form field styles ────────────────────────────────────────────── */
-export const inputCls =
-  'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
-  'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all'
+export const inputCls = 'amp-input'
 
-export const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'
+export const labelCls = 'amp-label block mb-2'
