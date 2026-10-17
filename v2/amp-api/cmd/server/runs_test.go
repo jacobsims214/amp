@@ -131,7 +131,7 @@ func TestPortfolio_OrgSpendCapex(t *testing.T) {
 		root.call(t, "amp_complete_task", map[string]any{"task_id": float64(id), "model": "m", "input_tokens": n, "output_tokens": n, "cost_usd": n / 1000})
 	}
 	orgID := w.org.ID
-	pf := ra.want(t, 200, "orgadmin", http.MethodGet, fmt.Sprintf("/api/orgs/%d/portfolio", orgID), nil)
+	pf := ra.want(t, 200, "orgadmin", http.MethodGet, fmt.Sprintf("/api/orgs/%d/portfolio?split_by=capitalizable", orgID), nil)
 	var row map[string]any
 	for _, p := range pf["projects"].([]any) {
 		if m := p.(map[string]any); int(m["project_id"].(float64)) == w.s.projectID {
@@ -141,8 +141,14 @@ func TestPortfolio_OrgSpendCapex(t *testing.T) {
 	if row == nil {
 		t.Fatalf("project missing from the portfolio: %v", pf)
 	}
-	if row["capex"].(map[string]any)["input_tokens"] != 1000.0 || row["opex"].(map[string]any)["input_tokens"] != 10.0 {
-		t.Fatalf("capex/opex split: %v / %v", row["capex"], row["opex"])
+	split := row["split"].(map[string]any)
+	if split["true"].(map[string]any)["usage"].(map[string]any)["input_tokens"] != 1000.0 ||
+		split["false"].(map[string]any)["usage"].(map[string]any)["input_tokens"] != 10.0 {
+		t.Fatalf("split by capitalizable: %v", split)
+	}
+	keys := fmt.Sprint(pf["ticket_keys"])
+	if !strings.Contains(keys, "capitalizable") {
+		t.Fatalf("ticket keys offered for splitting: %v", keys)
 	}
 	if code, _ := ra.do(t, "outsider", http.MethodGet, fmt.Sprintf("/api/orgs/%d/portfolio", orgID), nil); code != 404 && code != 403 {
 		t.Fatalf("outsider read the portfolio: %d", code)

@@ -691,18 +691,20 @@ export interface PortfolioRow {
   states: ReportStates
   completed: number
   usage: Usage
-  capex: Usage
-  opex: Usage
-  unclassified: Usage
-  capex_tickets: number
-  opex_tickets: number
-  unclassified_tickets: number
+  /** spend and tickets by value of the split key ("(not set)" for none) */
+  split: Record<string, { tickets: number; usage: Usage }>
 }
 
 export interface Portfolio {
   org_id: number
   since: string
   until: string
+  split_by?: string
+  split_values: string[]
+  /** metadata keys set on projects (columns) */
+  project_keys: string[]
+  /** metadata keys on tickets, with coverage (split candidates) */
+  ticket_keys: { key: string; coverage: number }[]
   projects: PortfolioRow[]
   total: PortfolioRow
   usage_by_model: (Usage & { model: string })[]

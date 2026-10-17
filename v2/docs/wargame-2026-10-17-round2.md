@@ -79,8 +79,10 @@ channel: Priya (Product) and Dana (Finance).
   - tokens per completed ticket by agent profile;
   - abandoned-run (rework) counts;
   - all of it in the Markdown export.
-- **Portfolio** (`/api/orgs/{id}/portfolio`): every project in the org with progress, questions,
-  spend split capex/opex/unclassified, Jira board and cost centre, by model, with a CSV export.
+- **Portfolio** (`/api/orgs/{id}/portfolio`): every project in the org with progress, questions
+  and spend, by model, with a CSV export. Tracker-agnostic: the columns are whatever metadata the
+  projects carry (jira_board, linear_team, ado_area_path, cost_center…), and spend splits by any
+  ticket metadata key the viewer picks (capitalizable, cost_type…).
   It warns when runs reported no usage, since spend is then a floor.
 
 **Traceability**
@@ -98,8 +100,9 @@ channel: Priya (Product) and Dana (Finance).
 - **Handover:** `amp_handover_tasks` and the Board's "Hand over …" move someone's open tickets
   (respecting the Board's filters) with the reason posted on each. Leads may hand over anyone's
   work; anyone may hand over their own.
-- **Plan approval** takes a team lead on the project or an org owner/admin. Flight plan shows who
-  approved.
+- **Plan approval** is the engineer's "go" on the plan their agent drafted: any person on the
+  project may approve (agents can't). Flight plan shows who approved. (Briefly restricted to
+  leads during this round; that was a mistake and is reverted.)
 - **Plan check warnings** (WARN, not NO-GO):
   - `coupled_gate`: one ticket joins different people's work.
   - `metadata_drift`: an epic lacks keys its siblings carry, naming the near-miss key it has

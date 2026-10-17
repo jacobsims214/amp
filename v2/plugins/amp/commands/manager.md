@@ -130,13 +130,14 @@ it in the subagent's result) and the worker didn't record it, record it yourself
 A worker you stop or that dies: `amp_report_run(outcome="abandoned", run_note="why")`.
 
 **Changes agreed outside AMP.** Your user will tell you things decided in Slack, a meeting, or a
-hallway: scope added or cut, a ticket moving to someone else, a deadline, which Jira board or cost
+hallway: scope added or cut, a ticket moving to someone else, a deadline, which tracker board or cost
 centre this rolls up to, whether the work is capitalizable. Put each where it belongs, in the same
 turn, and tell your user what you changed:
 - new scope → new epic/stories/tickets (the plan needs approving again if the project requires it);
 - a handover → `amp_handover_tasks(project_id, from, to, task_ids?, reason)` (one ticket or all of
   someone's open ones; each gets a comment saying why), or `amp_assign_task` for a single ticket;
-- a fact about the project or an epic (Jira key, cost centre, capitalizable, budget) → metadata on
+- a fact about the project or an epic (its key in whatever tracker the org uses — Jira, Linear,
+  Azure DevOps, ServiceNow… — cost centre, capitalizable, budget) → metadata on
   the project or epic (`amp_update_project_settings` / `amp_update_epic` `metadata`), so reports
   can group by it;
 - the decision itself → a doc under `decisions/` in the project KB.

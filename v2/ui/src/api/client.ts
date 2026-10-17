@@ -194,7 +194,8 @@ export const api = {
   projectDayReports: (projectId: number, date: string, tz: string) =>
     get<{ day: string; people: { user_id: number; email: string; name: string; report?: DayReport }[] }>(
       `/projects/${projectId}/day-reports?date=${encodeURIComponent(date)}&tz=${encodeURIComponent(tz)}`),
-  portfolio: (orgId: number, since: string) => get<Portfolio>(`/orgs/${orgId}/portfolio?since=${encodeURIComponent(since)}`),
+  portfolio: (orgId: number, since: string, splitBy: string) =>
+    get<Portfolio>(`/orgs/${orgId}/portfolio?since=${encodeURIComponent(since)}&split_by=${encodeURIComponent(splitBy)}`),
   handover: (projectId: number, body: { from: string; to: string; task_ids?: number[]; include_in_progress?: boolean; reason?: string }) =>
     post<{ results: { task_id: number; name: string; moved: boolean; error?: string }[] }>(`/projects/${projectId}/handover`, body),
   unmerged: (projectId: number) =>

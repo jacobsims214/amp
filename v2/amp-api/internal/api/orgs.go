@@ -98,8 +98,8 @@ func (h *RestHandler) orgSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(parts) == 2 && parts[1] == "portfolio" {
-		// GET ?since=&until= (RFC 3339; default the last 30 days): the org's
-		// projects side by side, with token spend split capex/opex.
+		// GET ?since=&until= (RFC 3339; default the last 30 days) &split_by=<metadata key>:
+		// the org's projects side by side, with token spend split by any metadata key.
 		q := r.URL.Query()
 		until, since := time.Now(), time.Now().Add(-30*24*time.Hour)
 		for key, dst := range map[string]*time.Time{"since": &since, "until": &until} {
@@ -112,7 +112,7 @@ func (h *RestHandler) orgSub(w http.ResponseWriter, r *http.Request) {
 				*dst = t
 			}
 		}
-		pf, err := h.svc.OrgPortfolio(ctx, pr, orgID, since, until)
+		pf, err := h.svc.OrgPortfolio(ctx, pr, orgID, since, until, q.Get("split_by"))
 		if err != nil {
 			fail(w, err, 404)
 			return
