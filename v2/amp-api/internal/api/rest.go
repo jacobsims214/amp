@@ -563,6 +563,32 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"day": day, "people": rows})
 		return
 
+	case "handover":
+		// POST {from, to, task_ids?, include_in_progress?, reason?}: move someone's open tickets to someone else.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			From              string `json:"from"`
+			To                string `json:"to"`
+			TaskIDs           []int  `json:"task_ids"`
+			IncludeInProgress bool   `json:"include_in_progress"`
+			Reason            string `json:"reason"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.From == "" || body.To == "" {
+			jsonErr(w, errorf("from and to are required (user id or email)"), 400)
+			return
+		}
+		res, err := h.svc.Handover(r.Context(), pr, projectID, body.From, body.To, body.TaskIDs, body.IncludeInProgress, body.Reason)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		h.hub.Publish(domain.Event{Type: domain.EventTaskUpdated, ProjectID: projectID, Payload: map[string]interface{}{"handover": true}, At: time.Now()})
+		jsonOK(w, map[string]interface{}{"results": res})
+		return
+
 	case "unmerged":
 		// GET: completed tickets whose pushed work isn't merged yet.
 		runs, err := h.svc.UnmergedWork(r.Context(), pr, projectID)

@@ -8,6 +8,7 @@ import { TaskCard } from '../components/TaskCard'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { FilterBar } from '../components/FilterBar'
 import { DEFAULT_FILTER, type FilterState } from '../lib/boardFilter'
+import { HandoverBar } from '../components/HandoverBar'
 import { CrudModal } from '../components/CrudModal'
 import { MetadataEditor } from '../components/MetadataEditor'
 import { DependencyPicker } from '../components/DependencyPicker'
@@ -378,6 +379,13 @@ export function Board() {
           memberOptions={members.map(m => ({ id: m.user_id, name: personName(m) + (m.user_id === meId ? ' (me)' : '') }))}
           counts={counts}
         />
+        {/* Filtering by one person: a lead can hand their open tickets to someone else. */}
+        {typeof filter.owner === 'number' && (myAccess && myAccess !== 'member' || filter.owner === meId) && (
+          <HandoverBar projectId={pid} from={filter.owner}
+            fromName={personName(members.find(m => m.user_id === filter.owner) ?? {})}
+            openCount={ownerTasks.filter(t => t.state !== 'completed').length}
+            people={members.map(m => ({ id: m.user_id, name: personName(m) }))} onDone={refresh} />
+        )}
         {/* "Mine" is the default; say so when it hides everyone else's work. */}
         {ownerNarrows && ownerTasks.length === 0 && tasks.length > 0 && (
           <div className="mt-2.5 flex items-center gap-3 flex-wrap text-[12.5px] text-ink-2">

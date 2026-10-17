@@ -251,3 +251,20 @@ func (s *Server) projectDayReports(rctx context.Context, args map[string]interfa
 	}
 	return jsonResult(map[string]interface{}{"day": day, "people": rows, "no_report_yet": missing})
 }
+
+func (s *Server) handover(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	from, to := optStr(args, "from", ""), optStr(args, "to", "")
+	if from == "" || to == "" {
+		return nil, fmt.Errorf("from and to are required (user id or email)")
+	}
+	inProg, _ := args["include_in_progress"].(bool)
+	res, err := s.svc.Handover(rctx, caller(rctx).p, projectID, from, to, optIntSlice(args, "task_ids"), inProg, optStr(args, "reason", ""))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"results": res})
+}

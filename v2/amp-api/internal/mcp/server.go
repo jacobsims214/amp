@@ -494,6 +494,18 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"date":       str("Optional. YYYY-MM-DD (default today in tz)."),
 			"tz":         str("Optional. IANA time zone, e.g. America/New_York (default UTC)."),
 		}), wrap(ctx, s.guard(authz.Member, s.projectDayReports)))
+	mcp.AddTool(tool("amp_handover_tasks",
+		"Move a person's open tickets in a project to someone else — they're out, leaving, or scope moved between people. "+
+			"Each ticket is reassigned the normal way and gets a comment saying why. In-progress tickets stay unless "+
+			"include_in_progress is set. A project lead may hand over anyone's work; anyone may hand over their own.",
+		props{
+			"project_id":          num("REQUIRED. Project ID."),
+			"from":                str("REQUIRED. Whose tickets: user id or email."),
+			"to":                  str("REQUIRED. Who takes them: user id or email."),
+			"task_ids":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "Optional. Only these tickets (default: all of from's open tickets in the project)."},
+			"include_in_progress": boolean("Optional. Also move tickets in progress (their agent works under the old owner)."),
+			"reason":              str("Optional. Why, posted on each ticket, e.g. 'Sam out sick Monday; Harbor demo'."),
+		}), wrap(ctx, s.guard(authz.Member, s.handover)))
 	mcp.AddTool(tool("amp_list_unmerged", "Completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listUnmerged)))
 	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",

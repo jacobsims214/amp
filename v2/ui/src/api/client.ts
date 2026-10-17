@@ -195,6 +195,8 @@ export const api = {
     get<{ day: string; people: { user_id: number; email: string; name: string; report?: DayReport }[] }>(
       `/projects/${projectId}/day-reports?date=${encodeURIComponent(date)}&tz=${encodeURIComponent(tz)}`),
   portfolio: (orgId: number, since: string) => get<Portfolio>(`/orgs/${orgId}/portfolio?since=${encodeURIComponent(since)}`),
+  handover: (projectId: number, body: { from: string; to: string; task_ids?: number[]; include_in_progress?: boolean; reason?: string }) =>
+    post<{ results: { task_id: number; name: string; moved: boolean; error?: string }[] }>(`/projects/${projectId}/handover`, body),
   unmerged: (projectId: number) =>
     get<{ waiting_to_merge: Run[] | null }>(`/projects/${projectId}/unmerged`).then(r => r.waiting_to_merge ?? []),
   recordRun: (taskId: number, run: Partial<Run>) => post<Run>(`/tasks/${taskId}/runs`, run),
