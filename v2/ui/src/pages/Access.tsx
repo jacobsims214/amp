@@ -1,6 +1,6 @@
+import { PageHeader } from '../components/ui/PageHeader'
 import { useCallback, useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { ArrowLeft, Bot, KeyRound, Loader2, Plus, Power, Trash2 } from 'lucide-react'
+import { Bot, KeyRound, Loader2, Plus, Power, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import type { AmpUser, APIToken, NewAPIToken } from '../types'
@@ -183,14 +183,9 @@ export function Access() {
 
   return (
     <div className="min-h-full" style={{ background: 'var(--bg)' }}>
-      <header style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
-        <div className="max-w-3xl mx-auto px-4 sm:px-6 py-4 flex items-center gap-3">
-          <Link to="/" className="text-ink-3 hover:text-ink transition-colors"><ArrowLeft size={16} /></Link>
-          <KeyRound size={16} className="text-link" />
-          <h1 className="text-base font-bold text-ink">Agents &amp; API tokens</h1>
-        </div>
-      </header>
-      <main className="max-w-3xl mx-auto px-4 sm:px-6 py-8 space-y-5">
+      <PageHeader crumb="Overview" title="Agents & tokens"
+        meta="Give each agent its own account and token, or a token that works as you." />
+      <main className="max-w-4xl px-7 py-6 space-y-5">
         {authLoading ? <Loader2 size={18} className="text-primary animate-spin" /> : !me?.user_id ? (
           <p className="text-sm text-ink-2">Sign in to manage tokens and agent accounts.</p>
         ) : (

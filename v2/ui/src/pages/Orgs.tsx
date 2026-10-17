@@ -1,8 +1,7 @@
+import { PageHeader } from '../components/ui/PageHeader'
 import { useState, useEffect, useCallback } from 'react'
 import { Link } from 'react-router-dom'
-import {
-  ArrowLeft, Loader2, Building2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen,
-} from 'lucide-react'
+import { Loader2, Plus, Trash2, Pencil, UserPlus, Users, Mail, ChevronDown, ChevronRight, X, Check, BookOpen } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { ConfirmDeleteModal } from '../components/ConfirmDeleteModal'
@@ -112,18 +111,10 @@ export function Orgs() {
 
   return (
     <div className="min-h-full" style={{ background: 'var(--bg)' }}>
-      <header style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>
-        <div className="max-w-5xl mx-auto px-6 py-4 flex items-center gap-3">
-          <Link to="/" className="text-ink-3 hover:text-ink transition-colors">
-            <ArrowLeft size={16} />
-          </Link>
-          <Building2 size={16} className="text-link" />
-          <h1 className="text-base font-bold text-ink">Organizations &amp; Teams</h1>
-          {me && <span className="text-xs text-ink-3 ml-auto">{me.email}</span>}
-        </div>
-      </header>
+      <PageHeader crumb={isAdmin ? 'Admin' : 'Organization'} title="Teams & orgs"
+        meta="Orgs own projects; teams are how people and agents get access to them." />
 
-      <main className="max-w-5xl mx-auto px-6 py-10 space-y-10">
+      <main className="px-7 py-6 space-y-8 max-w-6xl">
         {error && (
           <div className="rounded-xl border border-danger/20 bg-danger/8 px-4 py-3 text-sm text-danger-ink">
             {error}

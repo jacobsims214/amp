@@ -1,9 +1,8 @@
+import { PageHeader } from '../components/ui/PageHeader'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
-import {
-  ArrowLeft, CalendarDays, Check, ClipboardCopy, Loader2, RefreshCw, Save, User,
-} from 'lucide-react'
+import { Check, ClipboardCopy, Loader2, RefreshCw, Save, User } from 'lucide-react'
 import { api } from '../api/client'
 import { useAuth } from '../hooks/useAuth'
 import { personName } from '../lib/people'
@@ -51,21 +50,11 @@ export function DayReports() {
 
   return (
     <div className="flex flex-col h-full" style={{ background: 'var(--bg)' }}>
-      <header className="flex items-center flex-shrink-0" style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)', height: 48 }}>
-        <Link to="/" className="flex items-center justify-center w-11 h-full text-ink-3 hover:text-ink transition-colors" title="All projects">
-          <ArrowLeft size={15} />
-        </Link>
-        <div className="w-px h-5 bg-line" />
-        <div className="flex items-center gap-2 px-3">
-          <CalendarDays size={14} className="text-link" />
-          <span className="text-sm font-bold text-ink">Daily reports</span>
-        </div>
-        <span className="ml-auto px-4 text-xs text-ink-3">Times in {TZ}</span>
-      </header>
+      <PageHeader crumb="Overview" title="Day reports" meta={<>What each person and agent did, day by day · times in <span className="amp-num">{TZ}</span></>} />
 
       <div className="flex flex-1 overflow-hidden">
         <aside className="flex-shrink-0 overflow-y-auto py-3 px-2" style={{ width: 220, borderRight: '1px solid var(--line)', background: 'var(--surface)' }}>
-          <div className="text-[10px] font-bold text-ink-3 uppercase tracking-widest px-2 mb-2">People</div>
+          <div className="amp-label px-2 mb-2">People</div>
           {sorted.map(p => (
             <button key={p.user_id} onClick={() => setWho(p.user_id)}
               className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-left transition-colors cursor-pointer ${
