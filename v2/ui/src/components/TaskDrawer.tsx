@@ -3,6 +3,8 @@ import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, T
 import { api } from '../api/client'
 import { withClears } from '../lib/clear'
 import { StatusBadge } from './StatusBadge'
+import { PriorityMark } from './ui/PriorityMark'
+import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
@@ -140,19 +142,14 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         }}
       >
         {/* Header */}
-        <div className="flex items-start justify-between gap-3 px-6 py-5 border-b border-line">
+        <div className="flex items-start justify-between gap-3 px-6 pt-5 pb-4 border-b border-line" style={{ boxShadow: 'inset 0 3px 0 var(--ink)' }}>
           <div className="flex-1 min-w-0">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs text-ink-3 font-mono tabular-nums">#{task.id}</span>
+            <div className="flex items-center gap-2.5 mb-2.5 flex-wrap">
+              <span className="amp-num text-[13px] text-ink-3">#{task.id}</span>
               <StatusBadge state={task.state} blockReason={task.block_reason} />
-              {task.priority === '2' && (
-                <span className="text-xs text-warning-ink font-semibold bg-warning/10 px-2 py-0.5 rounded-full ring-1 ring-warning/20">High</span>
-              )}
-              {task.priority === '3' && (
-                <span className="text-xs text-danger-ink font-semibold bg-danger/10 px-2 py-0.5 rounded-full ring-1 ring-danger/20">Critical</span>
-              )}
+              <PriorityMark priority={task.priority} showLabel={task.priority === '2' || task.priority === '3'} />
             </div>
-            <h2 className="text-base font-semibold text-ink leading-snug">{task.name}</h2>
+            <h2 className="text-[17px] font-semibold text-ink leading-snug m-0">{task.name}</h2>
           </div>
           <div className="flex items-center gap-0.5 flex-shrink-0">
             {canPlan && <button
@@ -167,26 +164,26 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                 setEditError(null)
                 setEditing(true)
               }}
-              className="p-2 hover:bg-surface-3 rounded-lg transition-colors cursor-pointer"
-              title="Edit task"
+              className="amp-btn amp-btn-ghost amp-btn-sm"
+              title="Edit task" aria-label="Edit task"
             >
               <Pencil size={13} className="text-ink-2" />
             </button>}
             <button
               onClick={() => { setDeleteError(null); setShowDeleteConfirm(true) }}
-              className="p-2 hover:bg-danger/10 rounded-lg transition-colors cursor-pointer"
-              title="Delete task"
+              className="amp-btn amp-btn-ghost amp-btn-sm"
+              title="Delete task" aria-label="Delete task"
             >
               <Trash2 size={13} className="text-danger/70 hover:text-danger" />
             </button>
-            <button onClick={onClose} className="p-2 hover:bg-surface-3 rounded-lg transition-colors cursor-pointer">
+            <button onClick={onClose} className="amp-btn amp-btn-ghost amp-btn-sm" aria-label="Close">
               <X size={15} className="text-ink-2" />
             </button>
           </div>
         </div>
 
         {/* Meta strip */}
-        <div className="flex items-center gap-3 px-6 py-2.5 border-b border-line-sub bg-bg/50 flex-wrap">
+        <div className="flex items-center gap-3 px-6 py-2.5 border-b border-line bg-surface-2 flex-wrap amp-num">
           {task.assigned_to && !task.agent_id && (
             <div className="flex items-center gap-1.5 text-xs text-link" title="Planned agent">
               <Bot size={11} />
@@ -233,6 +230,12 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             </div>
           )}
         </div>
+
+        {/* An agent's flag: its question, answered in place */}
+        {displayState(task) === 'flag' && (
+          <FlagAnswer key={`flag-${task.id}`} task={task} canWork={canWork}
+            onAnswered={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.(); api.getComments(t.id).then(setComments).catch(() => {}) }} />
+        )}
 
         {/* Owner */}
         <OwnerSection
@@ -759,6 +762,36 @@ function MetaItem({ label, value }: { label: string; value: string }) {
     <div className="bg-bg rounded-xl p-3 border border-line-sub">
       <div className="text-xs text-ink-3 font-medium mb-0.5">{label}</div>
       <div className="text-sm text-ink font-semibold truncate">{value}</div>
+    </div>
+  )
+}
+
+/** An agent's flag (a ticket blocked with a reason) and the box to answer it. */
+function FlagAnswer({ task, canWork, onAnswered }: { task: Task; canWork: boolean; onAnswered: (t: Task) => void }) {
+  const [answer, setAnswer] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = async (text: string) => {
+    setBusy(true); setError(null)
+    try { onAnswered(await api.answerFlag(task.id, text)); setAnswer('') }
+    catch (e) { setError(e instanceof Error ? e.message : 'Could not answer') }
+    finally { setBusy(false) }
+  }
+  return (
+    <div className="px-6 py-4 border-b border-line grid gap-2.5" style={{ background: 'color-mix(in srgb, var(--st-flag) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--st-flag)' }}>
+      <span className="amp-label" style={{ color: 'var(--danger-ink)' }}>{task.agent_id || 'An agent'} needs a person</span>
+      <p className="m-0 text-[14px] leading-relaxed text-ink">{task.block_reason}</p>
+      {canWork ? <>
+        <label htmlFor={`flag-answer-${task.id}`} className="sr-only">Your answer</label>
+        <textarea id={`flag-answer-${task.id}`} className="amp-input min-h-[70px] resize-y" value={answer} onChange={e => setAnswer(e.target.value)}
+          placeholder="Answer the agent. It's posted as a comment and the ticket goes back to ready." />
+        {error && <span className="text-[12px] text-danger-ink">{error}</span>}
+        <div className="flex gap-2">
+          <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy || !answer.trim()} onClick={() => submit(answer)}>
+            {busy && <Loader2 size={11} className="animate-spin" />}Answer and unblock</button>
+          <button type="button" className="amp-btn amp-btn-sm" disabled={busy} onClick={() => submit('')} title="Unblock without a comment">Unblock only</button>
+        </div>
+      </> : <span className="text-[12px] text-ink-2">Only people who can work this ticket can answer it.</span>}
     </div>
   )
 }
