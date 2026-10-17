@@ -23,7 +23,7 @@ import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { countStates, displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import { lookupPerson } from '../lib/people'
-import type { ActivityLog, Epic, Story, Task } from '../types'
+import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -136,6 +136,25 @@ const ACTION_COLOR: Record<string, string> = {
   completed: 'var(--st-done)', dispatched: 'var(--st-prog)', blocked: 'var(--st-flag)', unblocked: 'var(--ink-2)', claimed: 'var(--st-prog)',
 }
 
+/** One line in the activity feed: a ticket event or a plan-level change. */
+interface FeedItem { key: string; at: string; actor: string; action: string; taskId?: number; summary?: string; target?: string; count?: number }
+const fromActivity = (a: ActivityLog): FeedItem => ({ key: `a${a.id}`, at: a.created_at, actor: a.actor, action: a.action, taskId: a.task_id })
+const fromAudit = (e: AuditEntry): FeedItem => ({ key: `u${e.id}`, at: e.at, actor: e.actor_email.split('@')[0], action: e.action, summary: e.summary, target: e.target_type })
+
+/** Folds a run of the same plan-level change ("deleted ticket" ×87) into one line. */
+function collapseRuns(out: FeedItem[], it: FeedItem): FeedItem[] {
+  const prev = out[out.length - 1]
+  if (it.taskId == null && prev && prev.taskId == null && prev.actor === it.actor && prev.action === it.action) {
+    const n = (prev.count ?? 1) + 1
+    const verb = it.action.split('.').pop() ?? it.action
+    const noun = it.target === 'task' ? 'tickets' : it.target === 'story' ? 'stories' : `${it.target ?? 'item'}s`
+    out[out.length - 1] = { ...prev, count: n, summary: verb.endsWith('e') ? `${verb}d ${n} ${noun}` : `${it.action} ×${n}` }
+    return out
+  }
+  out.push(it)
+  return out
+}
+
 export function Mission() {
   const { projectId } = useParams<{ projectId: string }>()
   const pid = Number(projectId)
@@ -150,13 +169,20 @@ export function Mission() {
     if (params.has('ticket')) { params.delete('ticket'); setParams(params, { replace: true }) }
   }
   const [showDone, setShowDone] = useState(false)
-  const [activity, setActivity] = useState<ActivityLog[]>([])
+  const [activity, setActivity] = useState<FeedItem[]>([])
   const selected = selectedId == null ? null : tasks.find(t => t.id === selectedId) ?? null
 
   // Latest activity; refreshed shortly after tickets change.
   const loadActivity = useCallback(() => {
-    api.getProjectActivity(pid, new Date(Date.now() - 3 * 86_400_000).toISOString())
-      .then(a => setActivity([...a].sort((x, y) => y.created_at.localeCompare(x.created_at)).slice(0, 14)))
+    const since = new Date(Date.now() - 3 * 86_400_000).toISOString()
+    // Ticket activity plus plan-level changes (deletes, approvals, settings) from
+    // the audit log, which only leads can read — others just get ticket activity.
+    Promise.all([
+      api.getProjectActivity(pid, since),
+      api.audit({ projectId: pid, limit: 200 }).catch(() => [] as AuditEntry[]),
+    ]).then(([a, audit]) => setActivity(
+      [...a.map(fromActivity), ...audit.filter(e => e.at >= since).map(fromAudit)]
+        .sort((x, y) => y.at.localeCompare(x.at)).reduce(collapseRuns, []).slice(0, 14)))
       .catch(() => {})
   }, [pid])
   useEffect(() => {
@@ -270,12 +296,14 @@ export function Mission() {
               {activity.length === 0
                 ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No activity in the last three days.</p>
                 : activity.map(a => (
-                  <div key={a.id} className="grid grid-cols-[52px_1fr] gap-2.5 px-4 py-1.5 border-t border-line first:border-t-0 text-[12.5px]">
-                    <span className="amp-num text-[11px] text-ink-3 pt-px">{clock(a.created_at)}</span>
+                  <div key={a.key} className="grid grid-cols-[52px_1fr] gap-2.5 px-4 py-1.5 border-t border-line first:border-t-0 text-[12.5px]">
+                    <span className="amp-num text-[11px] text-ink-3 pt-px">{clock(a.at)}</span>
                     <span className="min-w-0">
                       <b className="font-semibold text-ink">{a.actor}</b>{' '}
-                      <span className="font-semibold" style={{ color: ACTION_COLOR[a.action] ?? 'var(--ink-2)' }}>{a.action.replace('_', ' ')}</span>{' '}
-                      <button type="button" className="amp-num underline underline-offset-2 text-ink-2 hover:text-ink cursor-pointer" onClick={() => setSelectedId(a.task_id)}>#{a.task_id}</button>
+                      {a.taskId != null
+                        ? <><span className="font-semibold" style={{ color: ACTION_COLOR[a.action] ?? 'var(--ink-2)' }}>{a.action.replace('_', ' ')}</span>{' '}
+                          <button type="button" className="amp-num underline underline-offset-2 text-ink-2 hover:text-ink cursor-pointer" onClick={() => setSelectedId(a.taskId!)}>#{a.taskId}</button></>
+                        : <span className="text-ink-2">{a.summary}</span>}
                     </span>
                   </div>
                 ))}

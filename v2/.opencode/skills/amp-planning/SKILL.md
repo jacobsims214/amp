@@ -441,6 +441,12 @@ Dependency changes are validated (no cycles, no tickets from other projects) and
 automatically: a ready ticket that gains an unfinished dependency becomes blocked, and a blocked
 one whose dependencies are gone or done becomes ready.
 
+**Shrinking a plan is the same.** When the user asks to trim, cut, or simplify, list what you
+will cut or merge and why, then delete only those tickets (by the ids you listed) and update the
+survivors — merge two tickets by widening one and deleting the other. Never delete a whole plan
+to rebuild it smaller, and never delete by a range of ids: ticket ids are global, not per project,
+so a range can reach tickets that aren't yours to delete.
+
 ---
 
 ## Plan presentation — show everything
