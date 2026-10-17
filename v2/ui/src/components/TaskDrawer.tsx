@@ -89,6 +89,16 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     // assignment or transition that just happened.
   }, [task?.id, task?.owner_user_id, task?.state])
 
+  // Escape closes the drawer, unless a confirm dialog or an edit is open.
+  useEffect(() => {
+    if (!task) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !editing && !showDeleteConfirm) onClose()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [task, editing, showDeleteConfirm, onClose])
+
   // A ticket nobody has started opens on what it asks for; one in flight or
   // done opens on what happened.
   useEffect(() => {
