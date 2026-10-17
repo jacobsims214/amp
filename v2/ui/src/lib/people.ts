@@ -128,10 +128,13 @@ export function agentInitials(name: string): string {
 }
 
 /**
- * Who to show for an activity entry: the agent that acted, or the person
- * when the entry is the system acting for them (e.g. a ticket being created).
+ * Who to show for an activity entry: the person behind it, with the agent
+ * that acted for them when there was one.
  */
 export function activityActor(a: { actor: string; actor_user_id?: number }, people: Map<number, Person>): string {
-  if ((a.actor === 'system' || a.actor === '') && a.actor_user_id != null) return lookupPerson(people, a.actor_user_id)!.name
-  return a.actor
+  if (a.actor_user_id == null) return a.actor
+  const name = lookupPerson(people, a.actor_user_id)!.name
+  if (a.actor === 'system' || a.actor === '') return name
+  // An agent acting for someone: whose agent it is matters more than its profile.
+  return `${name} · ${a.actor}`
 }

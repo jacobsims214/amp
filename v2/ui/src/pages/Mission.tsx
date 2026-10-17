@@ -221,14 +221,15 @@ export function Mission() {
     return <div className="flex items-center justify-center h-full"><Loader2 size={20} className="animate-spin text-ink-3" /></div>
   }
 
-  const agents = new Set(flying.map(t => t.agent_id).filter(Boolean)).size
+  // Agents are profiles in each person's harness, so count the people they work for.
+  const drivers = new Set(flying.map(t => t.owner_user_id).filter(id => id != null)).size
   return (
     <div className="flex flex-col min-h-full">
       <ProjectNav projectId={pid} currentView="mission" />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         <Readouts items={[
-          { label: 'In progress', value: counts.prog, sub: `${agents} agent${agents === 1 ? '' : 's'} working`, color: 'var(--st-prog)' },
+          { label: 'In progress', value: counts.prog, sub: flying.length ? `agents for ${drivers} ${drivers === 1 ? 'person' : 'people'}` : 'nothing running', color: 'var(--st-prog)' },
           { label: 'Ready', value: counts.ready, sub: 'can dispatch now' },
           { label: 'Waiting', value: counts.wait, sub: 'on dependencies', color: 'var(--ink-3)' },
           { label: 'Questions', value: counts.flag, sub: counts.flag ? 'agents waiting on an answer' : 'nothing needs you', alarm: counts.flag > 0 },
@@ -285,7 +286,8 @@ export function Mission() {
                   <button key={t.id} type="button" onClick={() => setSelectedId(t.id)}
                     className="w-full grid grid-cols-[auto_1fr_auto] gap-x-2.5 gap-y-0.5 items-center px-4 py-2.5 border-t border-line first:border-t-0 text-left hover:bg-surface-2 cursor-pointer">
                     <Avatar name={t.agent_id || '?'} kind="agent" />
-                    <span className="text-[12.5px] font-semibold text-ink truncate">{t.agent_id || 'agent'}</span>
+                    <span className="text-[12.5px] text-ink truncate"><b className="font-semibold">{lookupPerson(people, t.owner_user_id)?.name ?? 'Unowned'}</b>
+                      <span className="amp-num text-[11px] text-ink-3"> · {t.agent_id || 'agent'}</span></span>
                     <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>
                     <span className="col-start-2 col-span-2 text-[11.5px] text-ink-2 truncate">#{t.id} {t.name}</span>
                   </button>
