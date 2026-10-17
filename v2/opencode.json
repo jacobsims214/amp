@@ -25,7 +25,8 @@
     "amp": {
       "type": "remote",
       "url": "https://amp.simstech.cloud/mcp",
-      "enabled": true
+      "enabled": true,
+      "timeout": 60000
     },
     "chrome-devtools": {
       "type": "local",
