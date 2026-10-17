@@ -196,7 +196,8 @@ programmatically), write "COULD NOT VERIFY: [why]" instead of asserting VERIFIED
 honest and still useful; a false VERIFIED is not.
 
 Commit your work, following the team's conventions from Step 0.5 (branch naming, commit
-format). `git status` should show nothing of yours left uncommitted: changes left on disk are
+format). Put the ticket ref (e.g. `NWC-149`) in the commit message, so `git log` leads back to AMP
+just as AMP leads to the commit. `git status` should show nothing of yours left uncommitted: changes left on disk are
 invisible to everyone else, and the next agent in this checkout can't tell whose they are. Then make it reachable: other people's tickets may depend on yours, and a ticket that is
 done in AMP but whose code exists only in one checkout blocks them without anyone noticing. If the
 conventions say to push (or open a PR), do it; if they say nothing, push the branch you committed
@@ -224,10 +225,21 @@ Acceptance criteria:
 """, author="amp-worker")
 ```
 
-Then:
+Then complete it **with the run record** — what you used and where the work is. AMP reports and
+capitalizes token spend from these numbers, and traces code back to tickets from the git fields:
+
 ```
-amp_complete_task(task_id=YOUR_TASK_ID)
+amp_session_usage()          ← if your harness has it (opencode with the AMP plugin): your model,
+                               tokens and cost for this session. Pass them straight through.
+amp_complete_task(task_id=YOUR_TASK_ID,
+  model="<the model you ran on>",
+  input_tokens=…, output_tokens=…, cache_read_tokens=…, cost_usd=…,   ← only numbers your harness gave you
+  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>")
 ```
+
+Report what you know and leave the rest out — never estimate token counts. If your harness can't
+tell you your usage, still report the model and the git fields. The same fields go on
+`amp_block_task` when you stop on a question.
 
 ---
 
@@ -237,8 +249,10 @@ amp_complete_task(task_id=YOUR_TASK_ID)
 amp_get_task {task_id}
 amp_get_task_comments {task_id}       ← read before starting; answers to questions are here
 amp_add_task_comment {task_id, body, author}
-amp_block_task {task_id, reason}      ← only to ask a person a question (Step 5)
-amp_complete_task {task_id}
+amp_block_task {task_id, reason, …run fields}   ← only to ask a person a question (Step 5)
+amp_complete_task {task_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?}
+amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
+amp_session_usage {}                  ← opencode plugin: your own model/tokens/cost
 amp_get_ticket_history {task_id}
 amp_get_epic / amp_get_story
 amp_create_task {project_id, epic_id, story_id, name, description, acceptance_criteria, assigned_to}

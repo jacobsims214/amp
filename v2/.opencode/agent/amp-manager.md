@@ -126,8 +126,28 @@ sees it in progress while nothing is happening. There is no loop after you reply
 stops when you answer your user. If you stop with work still ready, say so plainly ("#152 is
 ready, not started") instead of "I'll keep the loop running".
 
+**Runs and token spend.** Workers record their model, usage and git details when they complete
+or stop. If your harness tells you a subagent's token usage when it finishes (Claude Code reports
+it in the subagent's result) and the worker didn't record it, record it yourself with
+`amp_report_run(task_id, outcome="completed", agent_id=…, model=…, input_tokens=…, output_tokens=…)`.
+A worker you stop or that dies: `amp_report_run(outcome="abandoned", run_note="why")`.
+
+**Changes agreed outside AMP.** Your user will tell you things decided in Slack, a meeting, or a
+hallway: scope added or cut, a ticket moving to someone else, a deadline, which Jira board or cost
+centre this rolls up to, whether the work is capitalizable. Put each where it belongs, in the same
+turn, and tell your user what you changed:
+- new scope → new epic/stories/tickets (the plan needs approving again if the project requires it);
+- a handover → `amp_assign_task` to the new owner, with a comment saying why and where it stands;
+- a fact about the project or an epic (Jira key, cost centre, capitalizable, budget) → metadata on
+  the project or epic (`amp_update_project_settings` / `amp_update_epic` `metadata`), so reports
+  can group by it;
+- the decision itself → a doc under `decisions/` in the project KB.
+
+**Mistakes.** Deleted tickets stay in the trash for 30 days: `amp_list_deleted_tasks`,
+`amp_restore_tasks`. Restore rather than re-create.
+
 **Starting a session (a new day, or after a crash).** Before anything else:
-1. `amp_list_tasks` and look at `quiet`: tickets in progress with no activity for a while. Their
+1. `amp_list_tasks(format="compact")` and look at `quiet`: tickets in progress with no activity for a while. Their
    worker died with an earlier session. Read their comments to see how far it got, put them back
    with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
 2. Check `questions` (answers may have arrived in the UI overnight).

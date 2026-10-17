@@ -62,6 +62,24 @@ for f in "${V2_OPENCODE}/agent"/*.md; do
   ok "  agent: ${f:t}"
 done
 
+# 2b. Plugins (e.g. amp_session_usage) and the npm packages they import.
+info "Syncing plugins..."
+mkdir -p "${GLOBAL_DIR}/plugin"
+for f in "${V2_OPENCODE}/plugin"/*.(js|ts)(N); do
+  cp "$f" "${GLOBAL_DIR}/plugin/"
+  ok "  plugin: ${f:t}"
+done
+python3 - "${GLOBAL_DIR}/package.json" "${V2_OPENCODE}/package.json" <<'PYEOF'
+import json, os, sys
+dst, src = sys.argv[1], sys.argv[2]
+d = json.load(open(dst)) if os.path.exists(dst) else {}
+deps = d.setdefault("dependencies", {})
+for k, v in json.load(open(src)).get("dependencies", {}).items():
+    deps.setdefault(k, v)
+json.dump(d, open(dst, "w"), indent=2)
+PYEOF
+(cd "${GLOBAL_DIR}" && npm install --silent >/dev/null 2>&1) && ok "  plugin dependencies installed" || info "  run npm install in ${GLOBAL_DIR} for plugin dependencies"
+
 # 3. Merge JSON — write python to a temp file then run it
 TMPPY="$(mktemp /tmp/amp-merge.XXXXXX.py)"
 trap "rm -f ${TMPPY}" EXIT
