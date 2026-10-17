@@ -35,6 +35,15 @@ amp_kb_search(project_id=PROJECT_ID, query="<task name + key terms>")
 - Got relevant results → read them with `amp_kb_get` before touching anything
 - Nothing relevant → proceed
 
+Then search the team KB once for how this team works — branches, commits, pushing, review,
+secrets. Team conventions live there, not in the project KB:
+
+```
+amp_kb_search(project_id=PROJECT_ID, scope="team", query="conventions branches commits review")
+```
+
+Follow what you find. They override the defaults in this skill.
+
 After searching, check the `updated_at` of each result. If the most relevant result is more than 30 days old, search again with `recency_boost=0.5` or `min_recency_days=30`.
 
 If nothing recent exists, note the staleness in your starting comment so the reviewer knows the info may be outdated.
@@ -181,6 +190,12 @@ undetected. If you cannot actually verify something (no build command applies, n
 programmatically), write "COULD NOT VERIFY: [why]" instead of asserting VERIFIED anyway — that's
 honest and still useful; a false VERIFIED is not.
 
+Commit your work, following the team's conventions from Step 0.5 (branch naming, commit
+format). Then make it reachable: other people's tickets may depend on yours, and a ticket that is
+done in AMP but whose code exists only in one checkout blocks them without anyone noticing. If the
+conventions say to push (or open a PR), do it; if they say nothing, push the branch you committed
+on. If you can't push (no remote, no access), say so in the completion comment.
+
 Post a completion summary:
 
 ```
@@ -188,6 +203,8 @@ amp_add_task_comment(task_id=YOUR_TASK_ID, body="""
 Work complete.
 
 Summary: [what was done]
+
+Where it is: [branch] @ [commit sha] — [pushed to origin / PR #N / NOT pushed: why]
 
 Files changed:
 - [path]: [what and why]
