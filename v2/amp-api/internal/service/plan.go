@@ -10,6 +10,7 @@ import (
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/kb"
 )
 
 // Planning: creating tickets with their dependencies, changing the
@@ -421,6 +422,18 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			Message: "Stories with no tickets: " + strings.Join(empty, ", "),
 			Fix:     "Add their tickets, move tickets into them (amp_move_task), or delete them (amp_delete_story).",
 		})
+	}
+
+	// A plan with an empty project KB: the decisions behind it live only in
+	// the planner's session, and the next session or engineer starts blind.
+	if r.OpenTasks > 0 && s.KB != nil {
+		if n, err := s.KB.CountDocs(ctx, kb.Project(projectID)); err == nil && n == 0 {
+			r.Issues = append(r.Issues, PlanIssue{
+				Kind:    "no_context",
+				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
+				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and architecture/decisions.md (each decision the user made, with why) with amp_kb_write.",
+			})
+		}
 	}
 
 	// Blocked by dependencies that are all done: left stuck by older versions

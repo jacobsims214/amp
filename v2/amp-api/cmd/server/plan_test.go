@@ -492,3 +492,33 @@ func TestPlan_ScheduleExistingTicket(t *testing.T) {
 		t.Fatalf("after clearing the schedule: %s", st)
 	}
 }
+
+// A plan with nothing in the project KB says so: the context behind it
+// would otherwise live only in the session that planned it.
+func TestPlan_CheckPlanWantsContext(t *testing.T) {
+	s := setupMCP(t)
+	if s.kb == nil {
+		t.Skip("TEST_TYPESENSE_URL not set")
+	}
+	a := mkIn(t, s, s.storyID, "a")
+	mkIn(t, s, s.storyID, "b", a)
+	pid := float64(s.projectID)
+
+	hasNoContext := func() bool {
+		report := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": pid})
+		for _, iss := range report["issues"].([]interface{}) {
+			if iss.(map[string]interface{})["kind"] == "no_context" {
+				return true
+			}
+		}
+		return false
+	}
+	if !hasNoContext() {
+		t.Fatal("empty project KB: expected a no_context issue")
+	}
+	s.call(t, "amp_kb_write", map[string]interface{}{"project_id": pid, "path": "architecture/project-overview.md",
+		"title": "Overview", "content": "What this project is and how it's built."})
+	if hasNoContext() {
+		t.Fatal("no_context still reported after writing the overview")
+	}
+}

@@ -101,7 +101,7 @@ export interface ActivityLog {
 // ---- Plan check (GET /projects/:id/plan-check) ----
 
 export interface PlanIssue {
-  kind: 'isolated' | 'wide_start' | 'empty_stories' | string
+  kind: 'isolated' | 'wide_start' | 'empty_stories' | 'no_context' | string
   message: string
   task_ids?: number[]
   fix?: string

@@ -68,6 +68,7 @@ const ISSUE_TITLE: Record<string, string> = {
   isolated: 'Every ticket wired in',
   wide_start: 'Start width',
   empty_stories: 'Every story has tickets',
+  no_context: 'Context in the KB',
 }
 
 function Chip({ t, state, crit, lit, sel, dim, onClick }: {
@@ -248,6 +249,7 @@ export function FlightPlan() {
                 {pollRow('isolated', 'Every open ticket depends on something or has something depending on it.')}
                 {pollRow('wide_start', `${report.ready_now.length} of ${report.open_tasks} open tickets can start now.`)}
                 {pollRow('empty_stories', 'Every story has at least one ticket.')}
+                {pollRow('no_context', 'The project KB explains what this is and why the plan looks like this.')}
                 <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line">
                   <span className="text-[13px] text-ink">No stuck tickets</span><Verdict ok />
                   <span className="col-span-2 text-[11.5px] text-ink-2">{report.repaired_task_ids?.length

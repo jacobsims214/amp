@@ -8,6 +8,7 @@ const ISSUE_TITLE: Record<string, string> = {
   isolated: 'Not connected to anything',
   wide_start: 'Too much can start at once',
   empty_stories: 'Empty stories',
+  no_context: 'No project context in the KB',
 }
 
 // The plan check: AMP runs the dependency graph, so before dispatching it's
