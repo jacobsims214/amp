@@ -22,7 +22,7 @@ import { StateBar, StateDot } from '../components/ui/StateTag'
 import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { countStates, displayState, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
-import { lookupPerson } from '../lib/people'
+import { activityActor, lookupPerson } from '../lib/people'
 import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
 
 function ago(iso?: string | null): string {
@@ -137,8 +137,8 @@ const ACTION_COLOR: Record<string, string> = {
 }
 
 /** One line in the activity feed: a ticket event or a plan-level change. */
-interface FeedItem { key: string; at: string; actor: string; action: string; taskId?: number; summary?: string; target?: string; count?: number }
-const fromActivity = (a: ActivityLog): FeedItem => ({ key: `a${a.id}`, at: a.created_at, actor: a.actor, action: a.action, taskId: a.task_id })
+interface FeedItem { key: string; at: string; actor: string; actorUserId?: number; action: string; taskId?: number; summary?: string; target?: string; count?: number }
+const fromActivity = (a: ActivityLog): FeedItem => ({ key: `a${a.id}`, at: a.created_at, actor: a.actor, actorUserId: a.actor_user_id, action: a.action, taskId: a.task_id })
 const fromAudit = (e: AuditEntry): FeedItem => ({ key: `u${e.id}`, at: e.at, actor: e.actor_email.split('@')[0], action: e.action, summary: e.summary, target: e.target_type })
 
 /** Folds a run of the same plan-level change ("deleted ticket" ×87) into one line. */
@@ -299,7 +299,7 @@ export function Mission() {
                   <div key={a.key} className="grid grid-cols-[52px_1fr] gap-2.5 px-4 py-1.5 border-t border-line first:border-t-0 text-[12.5px]">
                     <span className="amp-num text-[11px] text-ink-3 pt-px">{clock(a.at)}</span>
                     <span className="min-w-0">
-                      <b className="font-semibold text-ink">{a.actor}</b>{' '}
+                      <b className="font-semibold text-ink">{activityActor({ actor: a.actor, actor_user_id: a.actorUserId }, people)}</b>{' '}
                       {a.taskId != null
                         ? <><span className="font-semibold" style={{ color: ACTION_COLOR[a.action] ?? 'var(--ink-2)' }}>{a.action.replace('_', ' ')}</span>{' '}
                           <button type="button" className="amp-num underline underline-offset-2 text-ink-2 hover:text-ink cursor-pointer" onClick={() => setSelectedId(a.taskId!)}>#{a.taskId}</button></>

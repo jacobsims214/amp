@@ -241,27 +241,8 @@ export function FlightPlan() {
           </section>
 
           <div className="grid grid-cols-1 gap-4 min-w-0">
-            <Panel label="Plan check" title="GO / NO-GO" right={
-              <button type="button" onClick={runCheck} disabled={checking} className="amp-btn amp-btn-ghost amp-btn-sm" title="Run the plan check again">
-                {checking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}Check</button>}>
-              {checkError && <p className="m-0 px-4 py-3 text-[12.5px] text-danger-ink">{checkError}</p>}
-              {report && <>
-                {pollRow('isolated', 'Every open ticket depends on something or has something depending on it.')}
-                {pollRow('wide_start', `${report.ready_now.length} of ${report.open_tasks} open tickets can start now.`)}
-                {pollRow('empty_stories', 'Every story has at least one ticket.')}
-                {pollRow('no_context', 'The project KB explains what this is and why the plan looks like this.')}
-                <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line">
-                  <span className="text-[13px] text-ink">No stuck tickets</span><Verdict ok />
-                  <span className="col-span-2 text-[11.5px] text-ink-2">{report.repaired_task_ids?.length
-                    ? `Repaired ${report.repaired_task_ids.length} blocked on finished work: #${report.repaired_task_ids.join(', #')}`
-                    : 'Nothing is blocked on finished work.'}</span>
-                </div>
-                <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
-                <Approval report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus} />
-              </>}
-            </Panel>
-
-            <Panel label="Selected" title={focused ? `#${focused.id} · stage ${(shape.depth.get(focused.id) ?? 0) + 1} of ${shape.stages}` : 'Nothing selected'}>
+            {/* Below xl the side column sits under the plan, so a selection docks to the corner instead. */}
+            <Panel className={focused ? 'max-xl:fixed max-xl:bottom-4 max-xl:right-4 max-xl:z-30 max-xl:w-[min(380px,calc(100vw-32px))] max-xl:shadow-[0_8px_24px_rgba(0,0,0,0.16)]' : 'max-xl:hidden'} label="Selected" title={focused ? `#${focused.id} · stage ${(shape.depth.get(focused.id) ?? 0) + 1} of ${shape.stages}` : 'Nothing selected'}>
               {focused ? (
                 <div className="grid gap-3 px-4 py-3">
                   <span className="text-[14px] font-semibold text-ink leading-snug">{focused.name}</span>
@@ -284,6 +265,26 @@ export function FlightPlan() {
                 </div>
               ) : <p className="m-0 px-4 py-3 text-[13px] text-ink-2">Click a ticket to see where it sits in the plan.</p>}
             </Panel>
+            <Panel label="Plan check" title="GO / NO-GO" right={
+              <button type="button" onClick={runCheck} disabled={checking} className="amp-btn amp-btn-ghost amp-btn-sm" title="Run the plan check again">
+                {checking ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}Check</button>}>
+              {checkError && <p className="m-0 px-4 py-3 text-[12.5px] text-danger-ink">{checkError}</p>}
+              {report && <>
+                {pollRow('isolated', 'Every open ticket depends on something or has something depending on it.')}
+                {pollRow('wide_start', `${report.ready_now.length} of ${report.open_tasks} open tickets can start now.`)}
+                {pollRow('empty_stories', 'Every story has at least one ticket.')}
+                {pollRow('no_context', 'The project KB explains what this is and why the plan looks like this.')}
+                <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1 px-4 py-2.5 border-t border-line">
+                  <span className="text-[13px] text-ink">No stuck tickets</span><Verdict ok />
+                  <span className="col-span-2 text-[11.5px] text-ink-2">{report.repaired_task_ids?.length
+                    ? `Repaired ${report.repaired_task_ids.length} blocked on finished work: #${report.repaired_task_ids.join(', #')}`
+                    : 'Nothing is blocked on finished work.'}</span>
+                </div>
+                <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
+                <Approval report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus} />
+              </>}
+            </Panel>
+
           </div>
         </div>
       </div>

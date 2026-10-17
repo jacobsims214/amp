@@ -7,11 +7,12 @@ import { PriorityMark } from './ui/PriorityMark'
 import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
-import { canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
+import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
 import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
+import { Markdown } from './ui/Markdown'
 
 interface Props {
   task: Task | null
@@ -66,7 +67,7 @@ const inputCls =
 export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated }: Props) {
   const [history, setHistory] = useState<ActivityLog[]>([])
   const [comments, setComments] = useState<Comment[]>([])
-  const [tab, setTab] = useState<'history' | 'details'>('history')
+  const [tab, setTab] = useState<'history' | 'details'>('details')
   const [loading, setLoading] = useState(false)
   const [editing, setEditing] = useState(false)
   const [editForm, setEditForm] = useState({ name: '', description: '', acceptance_criteria: '', assigned_to: '', priority: '1' })
@@ -87,6 +88,12 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     // Reload when ownership or state changes too, so the history shows the
     // assignment or transition that just happened.
   }, [task?.id, task?.owner_user_id, task?.state])
+
+  // A ticket nobody has started opens on what it asks for; one in flight or
+  // done opens on what happened.
+  useEffect(() => {
+    if (task) setTab(task.state === 'backlog' ? 'details' : 'history')
+  }, [task?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleEditSave = async () => {
     setEditSaving(true)
@@ -319,7 +326,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             <DetailsTab task={task} onClose={onClose} onRefresh={onRefresh} canWork={canWork} canPlan={canPlan}
               onUpdated={t => (onTaskUpdated ? onTaskUpdated(t) : onRefresh?.())} />
           ) : (
-            <HistoryTab history={history} comments={comments} />
+            <HistoryTab history={history} comments={comments} people={people} />
           )}
         </div>
       </div>
@@ -612,17 +619,17 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
     <div className="space-y-5">
       {task.description && (
         <div>
-          <div className="text-xs font-semibold text-ink-3 uppercase tracking-widest mb-2">Description</div>
-          <div className="text-sm text-ink whitespace-pre-wrap leading-relaxed bg-bg rounded-xl p-4 border border-line-sub">
-            {task.description}
+          <div className="amp-label mb-2">Description</div>
+          <div className="bg-surface-2 p-4 border border-line">
+            <Markdown size="compact">{task.description}</Markdown>
           </div>
         </div>
       )}
       {task.acceptance_criteria && (
         <div>
-          <div className="text-xs font-semibold text-ink-3 uppercase tracking-widest mb-2">Acceptance Criteria</div>
-          <div className="text-sm text-ink whitespace-pre-wrap leading-relaxed bg-bg rounded-xl p-4 border border-line-sub">
-            {task.acceptance_criteria}
+          <div className="amp-label mb-2">Acceptance criteria</div>
+          <div className="bg-surface-2 p-4 border border-line">
+            <Markdown size="compact">{task.acceptance_criteria}</Markdown>
           </div>
         </div>
       )}
@@ -702,7 +709,7 @@ function DetailsTab({ task, onClose, onRefresh, canWork, canPlan, onUpdated }: {
   )
 }
 
-function HistoryTab({ history, comments }: { history: ActivityLog[]; comments: Comment[] }) {
+function HistoryTab({ history, comments, people }: { history: ActivityLog[]; comments: Comment[]; people: Map<number, Person> }) {
   if (history.length === 0 && comments.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-12 gap-2">
@@ -726,7 +733,7 @@ function HistoryTab({ history, comments }: { history: ActivityLog[]; comments: C
           </div>
           <div className="pb-5 flex-1 min-w-0">
             <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-              <span className="text-xs font-semibold text-ink">{entry.actor}</span>
+              <span className="text-xs font-semibold text-ink">{activityActor(entry, people)}</span>
               <span className="text-ink-3 text-xs">·</span>
               <span className="text-xs text-ink-2 capitalize">{entry.action.replace('_', ' ')}</span>
               {entry.from_state && entry.to_state && (

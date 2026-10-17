@@ -408,7 +408,7 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 		Action:      "created",
 		ToState:     string(task.State),
 		ActorUserID: req.CreatedBy,
-		Detail:      fmt.Sprintf("Task %q created (story=%d epic=%d) — initial state: %s", task.Name, a.story.ID, a.story.EpicID, task.State),
+		Detail:      fmt.Sprintf("Created in story %q (#%d) as %s.", a.story.Name, a.story.ID, task.State),
 	})
 	a.log.Info("task created", "task_id", task.ID, "state", task.State)
 	return &t, nil

@@ -5,7 +5,7 @@ import {
   Loader2, ChevronRight, ChevronDown, BookOpen, Eye, Code2, FolderOpen, Folder, Clock, MessageSquare,
    Building2, Users, Lock, Info, CheckCircle2, RotateCcw,
 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
+import { Markdown } from '../components/ui/Markdown'
 import { api } from '../api/client'
 import { PageHeader } from '../components/ui/PageHeader'
 import { ProjectNav } from '../components/ProjectNav'
@@ -761,43 +761,7 @@ function DocView({ doc, canWrite, onEdit, onDelete, onTagClick, kbRef, setSelect
 
       {/* Markdown content */}
       <div className="prose-amp">
-        <ReactMarkdown
-          components={{
-            h1: ({children}) => <h1 className="amp-heading text-[22px] text-ink mt-8 mb-3 pb-2 border-b border-line first:mt-0">{children}</h1>,
-            h2: ({children}) => <h2 className="text-[17px] font-semibold text-ink mt-7 mb-2">{children}</h2>,
-            h3: ({children}) => <h3 className="font-label text-[13px] font-semibold uppercase tracking-[0.12em] text-ink mt-5 mb-1.5">{children}</h3>,
-            p: ({children}) => <p className="text-sm text-ink-2 leading-7 mb-4">{children}</p>,
-            code: ({children, className}) => {
-              const isBlock = className?.includes('language-')
-              if (isBlock) return (
-                <pre className="rounded-xl p-4 text-xs leading-relaxed overflow-x-auto mb-4 font-mono"
-                  style={{ background: 'var(--bg)', border: '1px solid var(--line-sub)' }}>
-                  <code style={{ color: 'var(--ink)' }}>{children}</code>
-                </pre>
-              )
-              return <code className="rounded-md px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--surface-2)', color: 'var(--ink)', border: '1px solid var(--line-sub)' }}>{children}</code>
-            },
-            ul: ({children}) => <ul className="text-sm text-ink-2 list-disc list-outside mb-4 space-y-1.5 pl-5">{children}</ul>,
-            ol: ({children}) => <ol className="text-sm text-ink-2 list-decimal list-outside mb-4 space-y-1.5 pl-5">{children}</ol>,
-            li: ({children}) => <li className="leading-7">{children}</li>,
-            blockquote: ({children}) => (
-              <blockquote className="pl-4 my-4 text-sm italic text-ink-2"
-                style={{ borderLeft: '3px solid var(--primary)' }}>{children}</blockquote>
-            ),
-            strong: ({children}) => <strong className="text-ink font-semibold">{children}</strong>,
-            a: ({children, href}) => <a href={href} className="text-link hover:text-primary underline underline-offset-2 transition-colors">{children}</a>,
-            hr: () => <hr className="border-line-sub my-6" />,
-            table: ({children}) => (
-              <div className="overflow-x-auto mb-4">
-                <table className="w-full text-sm border-collapse">{children}</table>
-              </div>
-            ),
-            th: ({children}) => <th className="text-left px-4 py-2.5 text-xs font-semibold text-ink-2 uppercase tracking-wide" style={{ background: 'var(--surface)', borderBottom: '1px solid var(--line)' }}>{children}</th>,
-            td: ({children}) => <td className="px-4 py-2.5 text-ink-2 text-sm" style={{ borderBottom: '1px solid var(--line-sub)' }}>{children}</td>,
-          }}
-        >
-          {doc.content}
-        </ReactMarkdown>
+        <Markdown>{doc.content}</Markdown>
       </div>
 
       {/* Annotations Panel */}
@@ -1010,24 +974,7 @@ function EditorView({ path, title, content, tags, saving, tab, onPath, onTitle, 
         ) : (
           <div className="p-8 overflow-y-auto h-full max-w-3xl">
             {content ? (
-              <ReactMarkdown
-                components={{
-                  h1: ({children}) => <h1 className="amp-heading text-[22px] text-ink mt-6 mb-3 pb-2 border-b border-line first:mt-0">{children}</h1>,
-                  h2: ({children}) => <h2 className="text-[17px] font-semibold text-ink mt-6 mb-2">{children}</h2>,
-                  h3: ({children}) => <h3 className="font-label text-[13px] font-semibold uppercase tracking-[0.12em] text-ink mt-5 mb-1.5">{children}</h3>,
-                  p: ({children}) => <p className="text-sm text-ink-2 leading-7 mb-4">{children}</p>,
-                  code: ({children, className}) => {
-                    const isBlock = className?.includes('language-')
-                    if (isBlock) return <pre className="rounded-xl p-4 text-xs overflow-x-auto mb-4 font-mono" style={{ background: 'var(--bg)', border: '1px solid var(--line-sub)' }}><code style={{ color: 'var(--ink)' }}>{children}</code></pre>
-                    return <code className="rounded px-1.5 py-0.5 text-xs font-mono" style={{ background: 'var(--surface-2)', color: 'var(--ink)' }}>{children}</code>
-                  },
-                  ul: ({children}) => <ul className="text-sm text-ink-2 list-disc list-outside mb-4 space-y-1 pl-5">{children}</ul>,
-                  li: ({children}) => <li className="leading-7">{children}</li>,
-                  strong: ({children}) => <strong className="text-ink font-semibold">{children}</strong>,
-                  blockquote: ({children}) => <blockquote className="pl-4 my-4 italic text-ink-2" style={{ borderLeft: '3px solid var(--primary)' }}>{children}</blockquote>,
-                }}>
-                {content}
-              </ReactMarkdown>
+              <Markdown>{content}</Markdown>
             ) : (
               <p className="text-sm text-ink-3 italic">Nothing to preview yet.</p>
             )}

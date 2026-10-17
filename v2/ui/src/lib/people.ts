@@ -126,3 +126,12 @@ export function agentInitials(name: string): string {
   if (parts.length > 1 && /^\d+$/.test(last)) return (parts[0][0] + last).toUpperCase().slice(0, 3)
   return (parts[0][0] + (parts[1]?.[0] ?? parts[0][1] ?? '')).toUpperCase()
 }
+
+/**
+ * Who to show for an activity entry: the agent that acted, or the person
+ * when the entry is the system acting for them (e.g. a ticket being created).
+ */
+export function activityActor(a: { actor: string; actor_user_id?: number }, people: Map<number, Person>): string {
+  if ((a.actor === 'system' || a.actor === '') && a.actor_user_id != null) return lookupPerson(people, a.actor_user_id)!.name
+  return a.actor
+}

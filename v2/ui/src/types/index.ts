@@ -95,6 +95,8 @@ export interface ActivityLog {
   from_state?: string
   to_state?: string
   detail?: string
+  /** the AMP user behind the action, when there was one */
+  actor_user_id?: number
   created_at: string
 }
 
