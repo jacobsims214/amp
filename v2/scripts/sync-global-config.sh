@@ -40,7 +40,7 @@ print ""
 
 [[ -d "${V2_OPENCODE}" ]]      || die ".opencode not found: ${V2_OPENCODE}"
 [[ -f "${V2_JSON}" ]]          || die "opencode.json not found: ${V2_JSON}"
-[[ -d "${GLOBAL_DIR}" ]]       || die "~/.config/opencode not found"
+mkdir -p "${GLOBAL_DIR}"
 command -v python3 &>/dev/null || die "python3 required"
 
 # 1. Skills
@@ -114,7 +114,7 @@ for agent_name in list(gcfg.get('agent', {}).keys()):
 if removed:
     print(f"  removed stale inline agents: {', '.join(removed)}")
 if not gcfg.get('agent'):
-    del gcfg['agent']
+    gcfg.pop('agent', None)
 
 with open(global_path, 'w') as f:
     json.dump(gcfg, f, indent=2)
@@ -122,9 +122,15 @@ with open(global_path, 'w') as f:
 PYEOF
 
 info "Merging opencode.json (provider + mcp only)..."
-BACKUP="${GLOBAL_JSON}.bak.$(date +%Y%m%d_%H%M%S)"
-cp "${GLOBAL_JSON}" "${BACKUP}"
-ok "  backed up to ${BACKUP:t}"
+if [[ -f "${GLOBAL_JSON}" ]]; then
+  BACKUP="${GLOBAL_JSON}.bak.$(date +%Y%m%d_%H%M%S)"
+  cp "${GLOBAL_JSON}" "${BACKUP}"
+  ok "  backed up to ${BACKUP:t}"
+else
+  # First run on this machine: start from an empty config to merge into.
+  print '{ "$schema": "https://opencode.ai/config.json" }' > "${GLOBAL_JSON}"
+  ok "  created ${GLOBAL_JSON}"
+fi
 
 python3 "${TMPPY}" "${GLOBAL_JSON}" "${V2_JSON}"
 
