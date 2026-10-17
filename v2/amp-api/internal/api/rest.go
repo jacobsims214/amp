@@ -126,6 +126,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tokens/", h.tokenSub)
 	mux.HandleFunc("/api/agents", h.agents)
 	mux.HandleFunc("/api/audit", h.audit)
+	mux.HandleFunc("/api/webhooks/", h.webhookSub)
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
@@ -550,6 +551,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	case "teams":
 		h.projectTeams(w, r, pr, projectID, lvl, parts[2:])
+		return
+
+	case "webhooks":
+		h.webhookCollection(w, r, pr, nil, &projectID)
 		return
 
 	case "reset":

@@ -18,6 +18,16 @@ import (
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[string]chan domain.Event
+	sinks   []func(domain.Event)
+}
+
+// AddSink registers fn to receive every published event (webhooks use
+// this). fn runs inside Publish, on the publishing actor, so it must not
+// block.
+func (h *Hub) AddSink(fn func(domain.Event)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sinks = append(h.sinks, fn)
 }
 
 func New() *Hub {
@@ -31,6 +41,9 @@ func New() *Hub {
 func (h *Hub) Publish(evt domain.Event) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
+	for _, fn := range h.sinks {
+		fn(evt)
+	}
 	for _, ch := range h.clients {
 		select {
 		case ch <- evt:

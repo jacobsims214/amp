@@ -297,6 +297,15 @@ const (
 	EventStoryUpdated      EventType = "story.updated"
 )
 
+// AllEventTypes lists every event the hub publishes.
+var AllEventTypes = []EventType{
+	EventProjectCreated, EventProjectArchived, EventProjectRestored, EventProjectUpdated,
+	EventEpicCreated, EventEpicStateChanged, EventEpicUpdated,
+	EventStoryCreated, EventStoryStateChanged, EventStoryUpdated,
+	EventTaskCreated, EventTaskUpdated, EventTaskDispatched, EventTaskCompleted,
+	EventTaskBlocked, EventTaskUnblocked, EventTaskAssigned, EventCommentAdded,
+}
+
 type Event struct {
 	Type      EventType   `json:"type"`
 	ProjectID int         `json:"project_id"`

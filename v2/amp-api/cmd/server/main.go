@@ -26,6 +26,8 @@ import (
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/service"
+	"github.com/simstech/amp-api/internal/webhook"
 )
 
 //go:embed migrations/*.sql
@@ -103,6 +105,18 @@ func main() {
 
 	// ---- 2. SSE hub ----
 	sseHub := hub.New()
+
+	// ---- 2b. Webhooks ----
+	// Hub events and audit entries are matched to webhooks and delivered
+	// from a Postgres outbox (internal/webhook). Webhooks can't reach
+	// private networks unless WEBHOOK_ALLOW_PRIVATE_NETWORKS=true.
+	allowPrivate := os.Getenv("WEBHOOK_ALLOW_PRIVATE_NETWORKS") == "true"
+	service.AllowPrivateWebhooks = allowPrivate
+	webhooks := webhook.New(repo, webhook.Options{AllowPrivateNetworks: allowPrivate})
+	sseHub.AddSink(webhooks.Event)
+	service.OnAudit(webhooks.Audit)
+	go webhooks.Run(ctx)
+	slog.Info("webhook dispatcher started", "allow_private_networks", allowPrivate)
 
 	// ---- 3. Actor system ----
 	system := protoactor.NewActorSystem()

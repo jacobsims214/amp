@@ -16,15 +16,24 @@ import (
 
 var (
 	auditMu    sync.RWMutex
-	auditSinks []func(domain.AuditEntry)
+	auditSinks = map[int]func(domain.AuditEntry){}
+	auditNext  int
 )
 
 // OnAudit registers fn to receive every audit entry after it is stored
-// (webhooks use this). fn must not block.
-func OnAudit(fn func(domain.AuditEntry)) {
+// (webhooks use this), and returns a function that unregisters it. fn must
+// not block.
+func OnAudit(fn func(domain.AuditEntry)) (unregister func()) {
 	auditMu.Lock()
 	defer auditMu.Unlock()
-	auditSinks = append(auditSinks, fn)
+	auditNext++
+	id := auditNext
+	auditSinks[id] = fn
+	return func() {
+		auditMu.Lock()
+		defer auditMu.Unlock()
+		delete(auditSinks, id)
+	}
 }
 
 // audit records an entry made by p. Recording is best effort: the change
