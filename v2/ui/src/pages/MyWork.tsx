@@ -39,26 +39,20 @@ function ticketLink(t: WorkTask) {
 
 function Velocity({ days }: { days: VelocityDay[] }) {
   const max = Math.max(1, ...days.map(d => d.completed))
-  const w = Math.max(8, Math.floor(400 / Math.max(1, days.length)))
+  const label = (d: VelocityDay) => new Date(d.day + 'T12:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+  // HTML bars rather than a scaled SVG, so the labels stay at text size at any width.
   return (
-    <svg viewBox={`0 0 ${34 + days.length * w} 124`} width="100%" role="img" aria-label="Tickets you completed per day">
-      <line x1="26" x2={26 + days.length * w} y1="100" y2="100" stroke="var(--line)" />
-      <text x="22" y="24" textAnchor="end" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">{max}</text>
-      <text x="22" y="103" textAnchor="end" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">0</text>
-      {days.map((d, i) => {
-        const h = d.completed / max * 80
-        const today = i === days.length - 1
-        return (
-          <g key={d.day}>
-            <rect x={30 + i * w} y={100 - h} width={Math.max(4, w - 8)} height={h} fill={today ? 'var(--accent)' : 'var(--ink)'}>
-              <title>{d.day}: {d.completed} completed</title>
-            </rect>
-            {(i === 0 || today) && <text x={30 + i * w + Math.max(4, w - 8) / 2} y="116" textAnchor="middle" fontSize="10" fill="var(--ink-3)" fontFamily="var(--font-data)">
-              {today ? 'today' : new Date(d.day + 'T12:00').toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</text>}
-          </g>
-        )
-      })}
-    </svg>
+    <div role="img" aria-label="Tickets you completed per day" className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 amp-num text-[10.5px] text-ink-3">
+      <div className="flex flex-col justify-between items-end h-24"><span>{max}</span><span>0</span></div>
+      <div className="flex items-end gap-1 h-24 border-b border-line">
+        {days.map((d, i) => (
+          <div key={d.day} title={`${d.day}: ${d.completed} completed`} className="flex-1 min-w-0"
+            style={{ height: `${d.completed / max * 100}%`, background: i === days.length - 1 ? 'var(--accent)' : 'var(--ink)' }} />
+        ))}
+      </div>
+      <span />
+      {days.length > 0 && <div className="flex justify-between mt-1"><span>{label(days[0])}</span><span>today</span></div>}
+    </div>
   )
 }
 

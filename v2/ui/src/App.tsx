@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useParams } from 'react-router-dom'
 import { Projects } from './pages/Projects'
 import { MyWork } from './pages/MyWork'
 import { Board } from './pages/Board'
@@ -14,6 +14,22 @@ import { Orgs } from './pages/Orgs'
 import { Access } from './pages/Access'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
+
+/** An unknown view under a project lands on its Mission page. */
+function ProjectFallback() {
+  const { projectId } = useParams()
+  return <Navigate to={`/project/${projectId}`} replace />
+}
+
+function NotFound() {
+  return (
+    <div className="px-7 py-10">
+      <span className="amp-label">404</span>
+      <h1 className="amp-heading m-0 mt-2 text-[22px] text-ink">Nothing here</h1>
+      <p className="text-[13px] text-ink-2 mt-2">That page doesn't exist. <a href="/" className="underline">Go to My work</a>.</p>
+    </div>
+  )
+}
 
 export default function App() {
   return (
@@ -36,6 +52,8 @@ export default function App() {
             <Route path="/admin/users" element={<Users />} />
             <Route path="/admin/orgs" element={<Orgs />} />
             <Route path="/access" element={<Access />} />
+            <Route path="/project/:projectId/*" element={<ProjectFallback />} />
+            <Route path="*" element={<NotFound />} />
           </Route>
         </Routes>
       </BrowserRouter>

@@ -25,7 +25,7 @@ import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metada
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
-const LABEL_COL = 180
+const LABEL_COL = 240
 const TASK_COL  = 200
 
 const COLUMNS: {
@@ -378,6 +378,15 @@ export function Board() {
           memberOptions={members.map(m => ({ id: m.user_id, name: personName(m) + (m.user_id === meId ? ' (me)' : '') }))}
           counts={counts}
         />
+        {/* "Mine" is the default; say so when it hides everyone else's work. */}
+        {ownerNarrows && ownerTasks.length === 0 && tasks.length > 0 && (
+          <div className="mt-2.5 flex items-center gap-3 flex-wrap text-[12.5px] text-ink-2">
+            <span>You don't own any of this project's {tasks.length} tickets.</span>
+            <button type="button" className="amp-btn amp-btn-sm" onClick={() => setFilter(f => ({ ...f, owner: 'everyone' }))}>
+              Show everyone's
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Board scroll area */}
@@ -435,7 +444,7 @@ export function Board() {
                         {isEpicCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
                       </span>
                       <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2"><span className="amp-bands-v h-[12px]" aria-hidden="true" /><span className="font-label text-[12px] font-semibold uppercase tracking-[0.12em] text-ink truncate">{epic.name}</span></div>
+                        <div className="flex items-center gap-2"><span className="amp-bands-v h-[12px]" aria-hidden="true" /><span className="font-label text-[12px] font-semibold uppercase tracking-[0.12em] text-ink line-clamp-2 break-words" title={epic.name}>{epic.name}</span></div>
                         <div className="flex items-center gap-1.5 text-xs text-ink-3 tabular-nums">
                           <span className="truncate">
                             {epicStories.length} stor{epicStories.length !== 1 ? 'ies' : 'y'} · {epicTasks.length} task{epicTasks.length !== 1 ? 's' : ''}
@@ -512,7 +521,7 @@ export function Board() {
                               {isStoryCollapsed ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
                             </span>
                             <div className="min-w-0 flex-1">
-                              <div className="text-[12.5px] font-medium text-ink truncate">{story.name}</div>
+                              <div className="text-[12.5px] font-medium text-ink line-clamp-2 break-words" title={story.name}>{story.name}</div>
                               <div className="flex items-center gap-1.5 text-xs text-ink-3 tabular-nums">
                                 <span className="truncate">{storyTasks.length} task{storyTasks.length !== 1 ? 's' : ''}</span>
                                 <OwnerStack people={ownersOf(story.owner_ids)} max={2} size={14} />

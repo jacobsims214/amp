@@ -53,7 +53,7 @@ export function AppShell() {
   const others = projects.filter(p => String(p.id) !== currentId).slice(0, 8)
 
   return (
-    <div className="flex h-screen overflow-hidden bg-bg">
+    <div className="relative flex h-screen overflow-hidden bg-bg">
       <aside className="w-[232px] flex-shrink-0 flex flex-col bg-surface-2 border-r border-line overflow-y-auto" aria-label="Main">
         <NavLink to="/" className="flex items-center gap-2.5 px-4 pt-4 pb-3" aria-label="AMP home">
           <span className="grid gap-[2px] w-[18px]" aria-hidden="true">
@@ -76,7 +76,7 @@ export function AppShell() {
               <Group>Project</Group>
               <div className="flex items-center gap-2 px-2.5 pb-1.5">
                 <span className="text-[13.5px] font-semibold text-ink truncate" title={current.name}>{current.name}</span>
-                <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto">{current.code}</span>
+                {current.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto shrink-0">{current.code}</span>}
               </div>
               {PROJECT_VIEWS.map(v => (
                 <NavLink key={v.label} to={v.to(currentId!)} end={v.end} className={p => `${navCls(p)} pl-5`}>
@@ -92,7 +92,8 @@ export function AppShell() {
               {others.map(p => (
                 <NavLink key={p.id} to={`/project/${p.id}`} className={navCls} title={p.name}>
                   <span className="truncate">{p.name}</span>
-                  <span className="amp-num text-[10.5px] text-ink-3 ml-auto">{p.code}</span>
+                  {/* Long slugs crowd the name out of a narrow sidebar; only short codes earn the space. */}
+                  {p.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 ml-auto shrink-0">{p.code}</span>}
                 </NavLink>
               ))}
             </>
@@ -124,7 +125,7 @@ export function AppShell() {
         )}
       </aside>
 
-      <main className="flex-1 min-w-0 h-full overflow-auto">
+      <main className="relative flex-1 min-w-0 h-full overflow-auto">
         <Outlet />
       </main>
     </div>
