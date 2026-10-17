@@ -159,3 +159,6 @@ Kept for reference only. All active development is in `v2/`.
 ## License
 
 AMP is open source under the [Apache License 2.0](./LICENSE).
+
+Contributions are welcome: see [CONTRIBUTING.md](./CONTRIBUTING.md). Contributors sign the
+[Contributor License Agreement](./CLA.md) once, by commenting on their first pull request.
