@@ -297,9 +297,9 @@ type PlanIssue struct {
 	Kind string `json:"kind"`
 	// Severity is "warn" for advice that doesn't make the plan NO-GO.
 	Severity string `json:"severity,omitempty"`
-	Message string `json:"message"`
-	TaskIDs []int  `json:"task_ids,omitempty"`
-	Fix     string `json:"fix,omitempty"`
+	Message  string `json:"message"`
+	TaskIDs  []int  `json:"task_ids,omitempty"`
+	Fix      string `json:"fix,omitempty"`
 }
 
 // PlanReport summarises a project's dependency graph and what looks wrong.
