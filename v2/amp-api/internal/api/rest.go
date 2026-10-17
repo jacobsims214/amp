@@ -551,6 +551,34 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "report":
+		// GET ?since=&until= (RFC 3339; default the last 7 days) &group_by=<metadata key>
+		q := r.URL.Query()
+		until, since := time.Now(), time.Now().Add(-7*24*time.Hour)
+		if v := q.Get("until"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				jsonErr(w, fmt.Errorf("until: %w", err), 400)
+				return
+			}
+			until = t
+		}
+		if v := q.Get("since"); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				jsonErr(w, fmt.Errorf("since: %w", err), 400)
+				return
+			}
+			since = t
+		}
+		report, err := h.svc.ProjectReport(r.Context(), pr, projectID, since, until, q.Get("group_by"))
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, report)
+		return
+
 	case "plan-check":
 		report, err := h.svc.CheckPlan(r.Context(), pr, projectID)
 		if err != nil {
