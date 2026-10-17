@@ -109,8 +109,40 @@ into fix tasks in the backlog rather than failing or blocking — dispatch those
 other task once they land in `ready_to_dispatch`.
 
 The dispatch loop: dispatch everything in `ready_to_dispatch`, wait for completions, check
-`ready_to_dispatch` again (reviews may have created fix tasks, and the `scheduled` bucket may have
-unblocked something), repeat until both `ready_to_dispatch` and `in_progress` are empty.
+`ready_to_dispatch` again (reviews may have created fix tasks, the `scheduled` bucket may have
+unblocked something, and answered questions come back as ready), repeat until both
+`ready_to_dispatch` and `in_progress` are empty. Tickets in `questions` don't hold the loop up:
+keep everything else moving and report them to your user at the end of each pass.
+
+## When a worker asks a question
+
+A subagent can't wait for an answer, so a worker that needs a person comments a `QUESTION`,
+blocks its ticket with `amp_block_task` (the question is the block reason), and stops. Its final
+message to you ends with `QUESTION on task <id>: …`, and the ticket shows up in the `questions`
+list of `amp_list_tasks` (and as a question in the AMP UI, where people may answer it too).
+
+1. **Don't answer it yourself** unless the ticket, its comments, or your user's instructions in
+   this session already settle it — then answer with `amp_answer_question`, quoting where the
+   answer came from. Never invent a decision on your user's behalf.
+2. **Ask your user**, in plain words: the question, the options, the worker's recommendation,
+   and the ticket ID. If several questions are open, ask them together.
+3. **Keep going meanwhile.** Dispatch everything else that's ready; one question shouldn't stall
+   the plan. Tickets that depend on the questioned one simply wait.
+4. **Record the answer** the moment your user gives it:
+   `amp_answer_question(task_id=ID, answer="<their answer, with any detail the worker needs>")`.
+   That posts it on the ticket and puts the ticket back to ready. Don't use `amp_set_task_state`
+   or a plain comment for this — `amp_answer_question` is the one path the UI uses too.
+5. **Re-dispatch** it from `ready_to_dispatch` on your next pass like any other ticket. The new
+   worker reads the comments first, finds the answer, and continues from what the last worker
+   left.
+
+Your user may answer in the AMP UI instead of to you. Then there's nothing to record: the ticket
+just appears in `ready_to_dispatch` with the answer in its comments. At the start of a session,
+check `questions` too — some may have arrived while no one was running the loop.
+
+A worker that stops for a *missing dependency* (it needs another ticket's output) isn't asking a
+question: add the dependency with `amp_set_task_dependencies` and it will be re-dispatched when
+that work is done.
 
 Load `skill("amp-planning")` for the full protocol, the task-sizing rules in detail, the
 wave/review templates, and the approval gate you must respect before dispatching any plan.

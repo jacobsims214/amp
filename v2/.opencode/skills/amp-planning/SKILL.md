@@ -526,6 +526,11 @@ Step 1 must happen before step 2. This is what shows live progress on the board.
 
 After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
 
+A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
+`questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the
+ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
+Questions don't stop the loop: keep dispatching everything else.
+
 If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 
 Load `amp-mcp` if you need exact tool argument shapes.
