@@ -231,7 +231,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           )}
         </div>
 
-        {/* An agent's flag: its question, answered in place */}
+        {/* An agent's question, answered in place */}
         {displayState(task) === 'flag' && (
           <FlagAnswer key={`flag-${task.id}`} task={task} canWork={canWork}
             onAnswered={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.(); api.getComments(t.id).then(setComments).catch(() => {}) }} />
@@ -766,7 +766,7 @@ function MetaItem({ label, value }: { label: string; value: string }) {
   )
 }
 
-/** An agent's flag (a ticket blocked with a reason) and the box to answer it. */
+/** An agent's question (a ticket blocked with a reason) and the box to answer it. */
 function FlagAnswer({ task, canWork, onAnswered }: { task: Task; canWork: boolean; onAnswered: (t: Task) => void }) {
   const [answer, setAnswer] = useState('')
   const [busy, setBusy] = useState(false)
@@ -779,7 +779,7 @@ function FlagAnswer({ task, canWork, onAnswered }: { task: Task; canWork: boolea
   }
   return (
     <div className="px-6 py-4 border-b border-line grid gap-2.5" style={{ background: 'color-mix(in srgb, var(--st-flag) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--st-flag)' }}>
-      <span className="amp-label" style={{ color: 'var(--danger-ink)' }}>{task.agent_id || 'An agent'} needs a person</span>
+      <span className="amp-label" style={{ color: 'var(--danger-ink)' }}>{task.agent_id || 'An agent'} asked</span>
       <p className="m-0 text-[14px] leading-relaxed text-ink">{task.block_reason}</p>
       {canWork ? <>
         <label htmlFor={`flag-answer-${task.id}`} className="sr-only">Your answer</label>

@@ -205,7 +205,7 @@ export function Mission() {
           { label: 'In progress', value: counts.prog, sub: `${agents} agent${agents === 1 ? '' : 's'} working`, color: 'var(--st-prog)' },
           { label: 'Ready', value: counts.ready, sub: 'can dispatch now' },
           { label: 'Waiting', value: counts.wait, sub: 'on dependencies', color: 'var(--ink-3)' },
-          { label: 'Flagged', value: counts.flag, sub: counts.flag ? 'agents need a person' : 'nothing needs you', alarm: counts.flag > 0 },
+          { label: 'Questions', value: counts.flag, sub: counts.flag ? 'agents waiting on an answer' : 'nothing needs you', alarm: counts.flag > 0 },
           { label: 'Scheduled', value: counts.sched, sub: nextStart ? `next ${new Date(nextStart).toLocaleString(undefined, { weekday: 'short', hour: '2-digit', minute: '2-digit' })}` : 'none', color: 'var(--st-sched)' },
           { label: 'Done', value: <>{counts.done}<span className="text-[13px] text-ink-3">/{tasks.length}</span></>,
             sub: tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
@@ -245,10 +245,10 @@ export function Mission() {
           </div>
 
           <div className="grid gap-4 min-w-0">
-            <Panel label="Flags" title={flagged.length ? `${flagged.length} agent${flagged.length === 1 ? '' : 's'} waiting` : 'None'}
+            <Panel label="Questions" title={flagged.length ? `${flagged.length} waiting on an answer` : 'None'}
               right={<span>blocked with a reason</span>}>
               {flagged.length === 0
-                ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent blocks a ticket with a question, it shows up here for someone to answer.</p>
+                ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent stops on a question, it shows up here. Answer it here, or have your orchestrator answer it with amp_answer_question.</p>
                 : flagged.map(t => <FlagCard key={t.id} task={t} blocks={dependents.get(t.id) ?? 0} onOpen={() => setSelectedId(t.id)} onAnswered={applyTask} />)}
             </Panel>
 

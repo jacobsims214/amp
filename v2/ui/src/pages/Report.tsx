@@ -37,7 +37,7 @@ function GroupTable({ rows, first, label }: { rows: ReportGroup[]; first: string
   return (
     <table className="w-full border-collapse text-[13px]">
       <thead><tr className="bg-surface-2">
-        {[first, 'Tickets', 'Done', 'In progress', 'Flagged', 'Complete', 'Median time', 'Mix'].map((h, i) => (
+        {[first, 'Tickets', 'Done', 'In progress', 'Questions', 'Complete', 'Median time', 'Mix'].map((h, i) => (
           <th key={h} className={`amp-label px-3 py-2.5 border-b border-line whitespace-nowrap ${i ? 'text-right' : 'text-left'}`}>{h}</th>))}
       </tr></thead>
       <tbody>
@@ -136,7 +136,7 @@ export function Report() {
       ...report.agents.map(a => `| ${a.key} | ${a.completed_in_range} | ${hours(a.median_cycle_hours)} |`), '',
       '## Epics', '', '| Epic | Done | Tickets |', '|---|---:|---:|',
       ...report.epics.map(e => `| ${e.label} | ${e.states.done} | ${e.tickets} |`), '',
-      ...(report.breakdown ? [`## By ${report.group_by}`, '', '| Value | Tickets | Done | Flagged |', '|---|---:|---:|---:|',
+      ...(report.breakdown ? [`## By ${report.group_by}`, '', '| Value | Tickets | Done | Questions |', '|---|---:|---:|---:|',
         ...report.breakdown.map(g => `| ${g.key} | ${g.tickets} | ${g.states.done} | ${g.states.flagged} |`), ''] : []),
       '## Completed', '', ...completed.map(t => `- #${t.id} ${t.name}${t.agent_id ? ` (${t.agent_id})` : ''}`),
     ]
@@ -167,7 +167,7 @@ export function Report() {
             { label: 'Started', value: report.dispatched, sub: 'dispatched', color: 'var(--st-prog)' },
             { label: 'Created', value: report.created, sub: 'new tickets' },
             { label: 'Median time', value: hours(report.median_cycle_hours), sub: 'dispatch → done' },
-            { label: 'Flag time', value: hours(report.flag_hours), sub: `${report.states.flagged} open flag${report.states.flagged === 1 ? '' : 's'} waiting`, color: report.states.flagged ? 'var(--danger-ink)' : undefined },
+            { label: 'Waiting on answers', value: hours(report.flag_hours), sub: `${report.states.flagged} open question${report.states.flagged === 1 ? '' : 's'}`, color: report.states.flagged ? 'var(--danger-ink)' : undefined },
             { label: 'Plan', value: <>{report.states.done}<span className="text-[13px] text-ink-3">/{report.tickets}</span></>, sub: report.tickets ? `${Math.round(report.states.done / report.tickets * 100)}% done` : 'no tickets' },
           ]} />
 
@@ -179,7 +179,7 @@ export function Report() {
               {report.agents.length === 0 ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">No agent has worked a ticket here yet.</p> : (
                 <table className="w-full border-collapse text-[13px]">
                   <thead><tr className="bg-surface-2">
-                    {['Agent', 'Done', '', 'Median', 'Active', 'Flagged'].map((h, i) => <th key={i} className={`amp-label px-3 py-2.5 border-b border-line ${i && i !== 2 ? 'text-right' : 'text-left'}`}>{h}</th>)}
+                    {['Agent', 'Done', '', 'Median', 'Active', 'Questions'].map((h, i) => <th key={i} className={`amp-label px-3 py-2.5 border-b border-line ${i && i !== 2 ? 'text-right' : 'text-left'}`}>{h}</th>)}
                   </tr></thead>
                   <tbody>
                     {report.agents.map(a => {

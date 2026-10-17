@@ -1,5 +1,5 @@
 /**
- * My work — where you land. In order: what needs a person (agent flags in
+ * My work — where you land. In order: what needs a person (agents' questions in
  * projects you can see), what you own, what your agents are doing, and how
  * your days have gone.
  */
@@ -96,15 +96,15 @@ export function MyWork() {
           <Readouts items={[
             { label: 'My open tickets', value: owned.length, sub: `${inProgress} in progress · ${projectsCount} project${projectsCount === 1 ? '' : 's'}` },
             { label: 'My agents working', value: <>{working}<span className="text-[13px] text-ink-3">/{agents.length}</span></>, sub: agents.length ? agents.map(a => a.user.display_name || a.user.email).join(', ') : 'none yet', color: 'var(--st-prog)' },
-            { label: 'Flags', value: flags.length, sub: flags.length ? 'agents waiting on a person' : 'nothing needs a person', alarm: flags.length > 0 },
+            { label: 'Questions', value: flags.length, sub: flags.length ? 'agents waiting on an answer' : 'nothing needs a person', alarm: flags.length > 0 },
             { label: 'Done in 24h', value: work.done_24h + agents.reduce((a, x) => a + x.done_24h, 0), sub: 'by me and my agents' },
           ]} />
 
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
             <div className="grid gap-4 min-w-0">
-              <Panel label="Flags" title={flags.length ? 'Agents waiting on a person' : 'No flags'} right={<span>blocked with a reason</span>}>
+              <Panel label="Questions" title={flags.length ? 'Agents waiting on an answer' : 'No questions'} right={<span>blocked with a reason</span>}>
                 {flags.length === 0
-                  ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent blocks a ticket with a question in any project you can see, it shows up here.</p>
+                  ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent stops on a question in any project you can see, it shows up here.</p>
                   : flags.slice(0, 8).map(t => (
                     <div key={t.id} className="grid grid-cols-[22px_1fr_auto] gap-x-3 gap-y-1 px-4 py-3 border-t border-line first:border-t-0">
                       <span className="row-span-2 w-[22px] h-[20px] bg-st-flag text-white grid place-items-center text-[11px] font-bold pt-1"

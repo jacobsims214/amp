@@ -5,7 +5,7 @@ import type { Task } from '../types'
 //   ready      backlog with nothing left to wait on
 //   prog       in progress
 //   wait       blocked by unfinished dependencies (block_reason empty) — no one needs to act
-//   flag       blocked with a reason (an agent called amp_block_task) — needs a person
+//   flag       a question: blocked with a reason (an agent called amp_block_task) — needs a person
 //   sched      blocked until start_at (block_reason "scheduled:…")
 //   done       completed
 export type DisplayState = 'ready' | 'prog' | 'wait' | 'flag' | 'sched' | 'done'
@@ -13,14 +13,14 @@ export type DisplayState = 'ready' | 'prog' | 'wait' | 'flag' | 'sched' | 'done'
 export const DISPLAY_STATES: DisplayState[] = ['done', 'prog', 'flag', 'sched', 'ready', 'wait']
 
 export const STATE_LABEL: Record<DisplayState, string> = {
-  ready: 'Ready', prog: 'In progress', wait: 'Waiting', flag: 'Flagged', sched: 'Scheduled', done: 'Done',
+  ready: 'Ready', prog: 'In progress', wait: 'Waiting', flag: 'Question', sched: 'Scheduled', done: 'Done',
 }
 
 export const STATE_HINT: Record<DisplayState, string> = {
   ready: 'Nothing to wait on; can be dispatched now',
   prog: 'An agent or person is working it',
   wait: 'Waiting on unfinished dependencies; unblocks by itself',
-  flag: 'Blocked with a reason: someone needs to act',
+  flag: 'An agent asked a question and stopped; answer it to put the ticket back to ready',
   sched: 'Waiting for its start time',
   done: 'Completed',
 }
