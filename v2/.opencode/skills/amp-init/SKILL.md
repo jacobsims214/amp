@@ -50,6 +50,8 @@ Write a KB doc at `architecture/project-overview.md`. This doc is the first thin
 
 Cover: what the project is, what it does, the tech stack, the structure, the current state, and anything non-obvious about how it's organized.
 
+A new project with an empty repo still gets an overview — write it from what the user told you (goal, users, stack, constraints) and mark what's still undecided. Don't skip it because there's no code to scan; this is the doc every later session starts from.
+
 See `amp-kb` if you need guidance on writing content that embeds well for semantic search.
 
 ---

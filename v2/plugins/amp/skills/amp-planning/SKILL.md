@@ -28,6 +28,10 @@ amp_kb_search(project_id=PROJECT_ID, query="<the user's request>")
 ```
 Existing architecture docs and past decisions should shape your plan. Load `amp-kb` if you need search guidance.
 
+### Record the user's decisions before you create tickets
+
+When you ask the user design questions and they answer (stack, repo layout, auth, tenancy, scope), write the answers to the project KB before building the board — `architecture/decisions.md`, one short paragraph per decision with the reason and the date, appended to rather than rewritten. Update `architecture/project-overview.md` if the answers change it. Tickets reference these docs instead of repeating them. A decision that only lives in your context is gone at the next session and invisible to the other engineers on the project.
+
 ---
 
 ## The hierarchy — enforced by the API
