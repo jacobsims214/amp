@@ -207,3 +207,36 @@ func TestDayWindow(t *testing.T) {
 		}
 	}
 }
+
+// A project's standup sheet: each person on the project with the report they
+// saved for the day (only this project's tickets), and who hasn't saved one.
+func TestDayReports_ProjectSheet(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	alice := w.s.as(w.alice)
+	done := mkIn(t, alice, w.s.storyID, "ship it")
+	alice.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(done), "agent_id": "a"})
+	alice.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(done)})
+	alice.call(t, "amp_save_day_report", map[string]interface{}{"summary": "Shipped it.", "tz": "UTC"})
+
+	out := ra.want(t, 200, "lead", http.MethodGet, fmt.Sprintf("/api/projects/%d/day-reports?tz=UTC", w.s.projectID), nil)
+	var aliceRow, bobRow map[string]interface{}
+	for _, r := range out["people"].([]interface{}) {
+		m := r.(map[string]interface{})
+		switch m["email"] {
+		case w.alice.Email:
+			aliceRow = m
+		case w.bob.Email:
+			bobRow = m
+		}
+	}
+	if aliceRow == nil || aliceRow["report"] == nil || aliceRow["report"].(map[string]interface{})["summary"] != "Shipped it." {
+		t.Fatalf("alice's report: %v", out)
+	}
+	if bobRow == nil || bobRow["report"] != nil {
+		t.Fatalf("bob has no report and should be listed without one: %v", out)
+	}
+	if code, _ := ra.do(t, "outsider", http.MethodGet, fmt.Sprintf("/api/projects/%d/day-reports", w.s.projectID), nil); code != 404 && code != 403 {
+		t.Fatalf("outsider read the standup sheet: %d", code)
+	}
+}

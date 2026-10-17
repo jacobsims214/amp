@@ -486,6 +486,14 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"project_id": num("REQUIRED. Project ID."),
 			"task_ids":   map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "number"}, "description": "REQUIRED. Ticket IDs to restore."},
 		}), wrap(ctx, s.guard(authz.Member, s.restoreTasks)))
+	mcp.AddTool(tool("amp_project_day_reports",
+		"The project's standup sheet: everyone on the project and the day report they saved for a day, narrowed to this "+
+			"project's tickets, plus who hasn't saved one. Use it to start the day (yesterday's) or to run a standup.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"date":       str("Optional. YYYY-MM-DD (default today in tz)."),
+			"tz":         str("Optional. IANA time zone, e.g. America/New_York (default UTC)."),
+		}), wrap(ctx, s.guard(authz.Member, s.projectDayReports)))
 	mcp.AddTool(tool("amp_list_unmerged", "Completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listUnmerged)))
 	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",

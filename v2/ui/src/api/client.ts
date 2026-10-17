@@ -191,6 +191,9 @@ export const api = {
     if (q.pr) p.set('pr', q.pr)
     return get<{ tickets: TraceHit[] | null }>(`/trace?${p}`).then(r => r.tickets ?? [])
   },
+  projectDayReports: (projectId: number, date: string, tz: string) =>
+    get<{ day: string; people: { user_id: number; email: string; name: string; report?: DayReport }[] }>(
+      `/projects/${projectId}/day-reports?date=${encodeURIComponent(date)}&tz=${encodeURIComponent(tz)}`),
   unmerged: (projectId: number) =>
     get<{ waiting_to_merge: Run[] | null }>(`/projects/${projectId}/unmerged`).then(r => r.waiting_to_merge ?? []),
   recordRun: (taskId: number, run: Partial<Run>) => post<Run>(`/tasks/${taskId}/runs`, run),

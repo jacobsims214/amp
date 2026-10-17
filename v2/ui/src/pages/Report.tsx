@@ -13,6 +13,7 @@ import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { PeoplePanel } from '../components/PeoplePanel'
+import { StandupSheet } from '../components/StandupSheet'
 import { peopleRows } from '../lib/standup'
 import { tokens, usd } from '../lib/usage'
 import { activityActor } from '../lib/people'
@@ -175,6 +176,8 @@ export function Report() {
           <PeoplePanel tasks={tasks} activity={activity} people={people} since={since} rangeLabel={RANGE_LABELS[range]}
             usageByPerson={new Map((report.people ?? []).map(g => [g.key, g.usage]))}
             onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
+
+          <StandupSheet projectId={pid} />
 
           <Panel label="Spend" title="Tokens by model" right={<span>runs recorded in {RANGE_LABELS[range].toLowerCase()}</span>}>
             {!report.usage_by_model?.length ? (

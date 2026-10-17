@@ -552,6 +552,17 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "day-reports":
+		// GET ?date=YYYY-MM-DD&tz=…: everyone on the project and the report
+		// they saved for the day, narrowed to this project (the standup sheet).
+		day, rows, err := h.svc.ProjectDayReports(r.Context(), pr, projectID, r.URL.Query().Get("date"), r.URL.Query().Get("tz"))
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"day": day, "people": rows})
+		return
+
 	case "unmerged":
 		// GET: completed tickets whose pushed work isn't merged yet.
 		runs, err := h.svc.UnmergedWork(r.Context(), pr, projectID)

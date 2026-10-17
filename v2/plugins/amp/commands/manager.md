@@ -142,8 +142,9 @@ merged=true, commit=<merge sha>)`. Tell your user what's waiting to merge at the
    worker died with an earlier session. Read their comments to see how far it got, put them back
    with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
 2. Check `questions` (answers may have arrived in the UI overnight).
-3. Read yesterday's day reports — your user's and their teammates' on this project
-   (`amp_list_day_reports`) — for handoffs ("ticketed #204 for Alex") and blockers.
+3. Read yesterday's day reports for the project — `amp_project_day_reports(project_id,
+   date=<yesterday>, tz=…)` gives everyone's in one call — for handoffs ("ticketed #204 for
+   Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a person.
 Then tell your user where things stand and what you'll start.
 
 ## When a worker asks a question

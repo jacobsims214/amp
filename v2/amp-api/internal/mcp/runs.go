@@ -233,3 +233,21 @@ func (s *Server) listUnmerged(rctx context.Context, args map[string]interface{})
 	return jsonResult(map[string]interface{}{"waiting_to_merge": runs, "count": len(runs),
 		"note": "Completed tickets whose pushed work no run has reported merged. After merging, record it: amp_report_run(task_id, outcome='completed', merged=true, commit=<merge sha>)."})
 }
+
+func (s *Server) projectDayReports(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	day, rows, err := s.svc.ProjectDayReports(rctx, caller(rctx).p, projectID, optStr(args, "date", ""), optStr(args, "tz", ""))
+	if err != nil {
+		return nil, err
+	}
+	missing := []string{}
+	for _, r := range rows {
+		if r.Report == nil {
+			missing = append(missing, r.Email)
+		}
+	}
+	return jsonResult(map[string]interface{}{"day": day, "people": rows, "no_report_yet": missing})
+}
