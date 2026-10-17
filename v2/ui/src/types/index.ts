@@ -677,3 +677,31 @@ export interface ProjectReport {
   usage?: Usage
   usage_by_model?: (Usage & { model: string })[]
 }
+
+/** One project in an org's portfolio. */
+export interface PortfolioRow {
+  project_id: number
+  name: string
+  code: string
+  state: string
+  metadata?: Metadata
+  tickets: number
+  states: ReportStates
+  completed: number
+  usage: Usage
+  capex: Usage
+  opex: Usage
+  unclassified: Usage
+  capex_tickets: number
+  opex_tickets: number
+  unclassified_tickets: number
+}
+
+export interface Portfolio {
+  org_id: number
+  since: string
+  until: string
+  projects: PortfolioRow[]
+  total: PortfolioRow
+  usage_by_model: (Usage & { model: string })[]
+}

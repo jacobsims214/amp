@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask,
+  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, Portfolio,
 } from '../types'
 
 const BASE = '/api'
@@ -194,6 +194,7 @@ export const api = {
   projectDayReports: (projectId: number, date: string, tz: string) =>
     get<{ day: string; people: { user_id: number; email: string; name: string; report?: DayReport }[] }>(
       `/projects/${projectId}/day-reports?date=${encodeURIComponent(date)}&tz=${encodeURIComponent(tz)}`),
+  portfolio: (orgId: number, since: string) => get<Portfolio>(`/orgs/${orgId}/portfolio?since=${encodeURIComponent(since)}`),
   unmerged: (projectId: number) =>
     get<{ waiting_to_merge: Run[] | null }>(`/projects/${projectId}/unmerged`).then(r => r.waiting_to_merge ?? []),
   recordRun: (taskId: number, run: Partial<Run>) => post<Run>(`/tasks/${taskId}/runs`, run),

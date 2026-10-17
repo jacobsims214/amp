@@ -103,3 +103,36 @@ func TestRuns_UsageReportsAndTrace(t *testing.T) {
 		t.Fatal("an outsider recorded a run")
 	}
 }
+
+// An org's portfolio puts its projects side by side with spend split by the
+// capitalizable metadata; people outside the org can't read it.
+func TestPortfolio_OrgSpendCapex(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	root := w.s.as(w.root)
+	root.call(t, "amp_update_epic", map[string]any{"epic_id": float64(w.s.epicID), "metadata": map[string]any{"capitalizable": true}})
+	a := mkIn(t, root, w.s.storyID, "feature")
+	b := mkIn(t, root, w.s.storyID, "ops chore")
+	root.call(t, "amp_update_task", map[string]any{"task_id": float64(b), "metadata": map[string]any{"capitalizable": false}})
+	for id, n := range map[int]float64{a: 1000, b: 10} {
+		root.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(id), "agent_id": "w"})
+		root.call(t, "amp_complete_task", map[string]any{"task_id": float64(id), "model": "m", "input_tokens": n, "output_tokens": n, "cost_usd": n / 1000})
+	}
+	orgID := w.org.ID
+	pf := ra.want(t, 200, "orgadmin", http.MethodGet, fmt.Sprintf("/api/orgs/%d/portfolio", orgID), nil)
+	var row map[string]any
+	for _, p := range pf["projects"].([]any) {
+		if m := p.(map[string]any); int(m["project_id"].(float64)) == w.s.projectID {
+			row = m
+		}
+	}
+	if row == nil {
+		t.Fatalf("project missing from the portfolio: %v", pf)
+	}
+	if row["capex"].(map[string]any)["input_tokens"] != 1000.0 || row["opex"].(map[string]any)["input_tokens"] != 10.0 {
+		t.Fatalf("capex/opex split: %v / %v", row["capex"], row["opex"])
+	}
+	if code, _ := ra.do(t, "outsider", http.MethodGet, fmt.Sprintf("/api/orgs/%d/portfolio", orgID), nil); code != 404 && code != 403 {
+		t.Fatalf("outsider read the portfolio: %d", code)
+	}
+}

@@ -13,6 +13,7 @@ import { Users } from './pages/Users'
 import { Orgs } from './pages/Orgs'
 import { Access } from './pages/Access'
 import { Trace } from './pages/Trace'
+import { Portfolio } from './pages/Portfolio'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 
@@ -54,6 +55,7 @@ export default function App() {
             <Route path="/admin/orgs" element={<Orgs />} />
             <Route path="/access" element={<Access />} />
             <Route path="/trace" element={<Trace />} />
+            <Route path="/portfolio" element={<Portfolio />} />
             <Route path="/project/:projectId/*" element={<ProjectFallback />} />
             <Route path="*" element={<NotFound />} />
           </Route>
