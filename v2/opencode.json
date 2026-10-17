@@ -13,6 +13,12 @@
         "qwen-3.5-medium-35b-a3b": {},
         "qwen-3.6-35b-a3b": {}
       }
+    },
+    "openrouter": {
+      "options": {
+        "chunkTimeout": 120000,
+        "headerTimeout": 60000
+      }
     }
   },
   "mcp": {
@@ -23,7 +29,11 @@
     },
     "chrome-devtools": {
       "type": "local",
-      "command": ["npx", "-y", "chrome-devtools-mcp@latest"]
+      "command": [
+        "npx",
+        "-y",
+        "chrome-devtools-mcp@latest"
+      ]
     },
     "context7": {
       "type": "remote",
