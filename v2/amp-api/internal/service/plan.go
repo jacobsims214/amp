@@ -472,6 +472,57 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		})
 	}
 
+	// Metadata drift: epics missing keys most of their sibling epics carry
+	// (e.g. capitalizable, jira_epic), often under a near-miss name instead.
+	// Reports group by these keys, so a missing or misspelled one silently
+	// drops the epic's work from a finance or Jira rollup.
+	if epics, err := s.Repo.ListEpics(ctx, projectID); err == nil && len(epics) >= 3 {
+		freq := map[string]int{}
+		for _, e := range epics {
+			for k := range e.Metadata {
+				freq[k]++
+			}
+		}
+		expected := map[string]bool{}
+		for k, n := range freq {
+			if n >= 2 && n*10 >= len(epics)*6 { // on at least 60% of epics
+				expected[k] = true
+			}
+		}
+		var drift []string
+		for _, e := range epics {
+			var missing, odd []string
+			for k := range expected {
+				if _, ok := e.Metadata[k]; !ok {
+					missing = append(missing, k)
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			for k := range e.Metadata {
+				if !expected[k] && freq[k] == 1 {
+					odd = append(odd, k)
+				}
+			}
+			sort.Strings(missing)
+			sort.Strings(odd)
+			line := fmt.Sprintf("epic %q (#%d) lacks %s", e.Name, e.ID, strings.Join(missing, ", "))
+			if len(odd) > 0 {
+				line += " but has " + strings.Join(odd, ", ") + " (only this epic uses that)"
+			}
+			drift = append(drift, line)
+		}
+		if len(drift) > 0 {
+			sort.Strings(drift)
+			r.Issues = append(r.Issues, PlanIssue{
+				Kind: "metadata_drift", Severity: "warn",
+				Message: "Epics don't carry the same metadata: " + strings.Join(drift, "; ") + ". Reports group by these keys, so this work drops out of those rollups.",
+				Fix:     "Set the missing keys with amp_update_epic metadata (use the same key names the other epics use), and remove a misspelled key by setting it to null.",
+			})
+		}
+	}
+
 	// A plan with an empty project KB: the decisions behind it live only in
 	// the planner's session, and the next session or engineer starts blind.
 	if r.OpenTasks > 0 && s.KB != nil {

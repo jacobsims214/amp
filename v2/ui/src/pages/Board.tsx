@@ -676,6 +676,7 @@ export function Board() {
             )}
             <div><label className={labelCls}>Metadata</label>
               <MetadataEditor key={epicModal.epic?.id ?? 'new'} initial={epicMeta.initial} inherited={epicMeta.inherited}
+                keySuggestions={[...new Set(epics.flatMap(e => Object.keys(e.metadata ?? {})))].sort()}
                 onChange={(value, error) => setEpicMeta(m => ({ ...m, value, error }))} /></div>
             {epicError && <p className="text-xs text-danger-ink">{epicError}</p>}
           </div>
@@ -725,6 +726,7 @@ export function Board() {
             )}
             <div><label className={labelCls}>Metadata</label>
               <MetadataEditor key={storyModal.story?.id ?? `new-${storyModal.epicId}`} initial={storyMeta.initial} inherited={storyMeta.inherited}
+                keySuggestions={[...new Set(stories.flatMap(st => Object.keys(st.metadata ?? {})))].sort()}
                 onChange={(value, error) => setStoryMeta(m => ({ ...m, value, error }))} /></div>
             {storyError && <p className="text-xs text-danger-ink">{storyError}</p>}
           </div>

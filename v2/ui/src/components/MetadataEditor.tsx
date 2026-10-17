@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useId } from 'react'
 import { Plus, X } from 'lucide-react'
 import { fromRows, toRows, type MetadataRow, type MetadataType } from '../lib/metadata'
 import type { Metadata, MetadataValue } from '../types'
@@ -11,6 +11,8 @@ interface Props {
   readOnly?: boolean
   /** called with the edited metadata, or an error to show instead */
   onChange: (metadata: Metadata, error: string | null) => void
+  /** keys already used nearby (e.g. on sibling epics), offered as you type so names stay consistent */
+  keySuggestions?: string[]
 }
 
 const cellCls =
@@ -22,7 +24,8 @@ const show = (v: MetadataValue) => (typeof v === 'boolean' ? (v ? 'yes' : 'no') 
 // Free-form key/value fields for integrations (e.g. jira_board, initiative,
 // capitalizable). Inherited fields are listed below the item's own; adding
 // the same field here overrides it.
-export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props) {
+export function MetadataEditor({ initial, inherited, readOnly, onChange, keySuggestions }: Props) {
+  const listId = useId()
   const [rows, setRows] = useState<MetadataRow[]>(() => toRows(initial))
   const [error, setError] = useState<string | null>(null)
 
@@ -40,10 +43,12 @@ export function MetadataEditor({ initial, inherited, readOnly, onChange }: Props
 
   return (
     <div className="space-y-2">
+      {keySuggestions?.length ? <datalist id={listId}>{keySuggestions.map(k => <option key={k} value={k} />)}</datalist> : null}
       {rows.length === 0 && readOnly && <p className="text-xs text-ink-3">No fields.</p>}
       {rows.map((r, i) => (
         <div key={i} className="flex items-center gap-1.5">
           <input value={r.key} disabled={readOnly} onChange={e => setRow(i, { key: e.target.value })}
+            list={keySuggestions?.length ? listId : undefined}
             placeholder="field (e.g. jira_board)" className={`${cellCls} w-36 font-mono`} />
           <select value={r.type} disabled={readOnly}
             onChange={e => {

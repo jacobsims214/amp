@@ -553,3 +553,34 @@ func TestPlan_CheckPlanWarnsOnCoupledGate(t *testing.T) {
 		t.Fatalf("a warning alone shouldn't make the plan NO-GO: %v", report)
 	}
 }
+
+// Epics missing metadata their siblings carry (or carrying it under another
+// name) are flagged, since reports group by those keys.
+func TestPlan_CheckPlanWarnsOnMetadataDrift(t *testing.T) {
+	s := setupMCP(t)
+	pid := float64(s.projectID)
+	epic := func(name string, md map[string]interface{}) {
+		s.call(t, "amp_create_epic", map[string]interface{}{"project_id": pid, "name": name, "description": "d", "metadata": md})
+	}
+	s.call(t, "amp_update_epic", map[string]interface{}{"epic_id": float64(s.epicID), "metadata": map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-1"}})
+	epic("catalog", map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-2"})
+	epic("orders", map[string]interface{}{"capitalizable": true, "jira_epic": "NWC-3"})
+	epic("quotes", map[string]interface{}{"capitalizable": true, "jira_key": "NWC-12"})
+
+	report := s.call(t, "amp_check_plan", map[string]interface{}{"project_id": pid})
+	for _, iss := range report["issues"].([]interface{}) {
+		m := iss.(map[string]interface{})
+		if m["kind"] != "metadata_drift" {
+			continue
+		}
+		msg := m["message"].(string)
+		if m["severity"] != "warn" || !strings.Contains(msg, `"quotes"`) || !strings.Contains(msg, "jira_epic") || !strings.Contains(msg, "jira_key") {
+			t.Fatalf("drift issue: %v", m)
+		}
+		if strings.Contains(msg, `"catalog"`) {
+			t.Fatalf("a complete epic is flagged: %v", msg)
+		}
+		return
+	}
+	t.Fatalf("no metadata_drift issue: %v", report["issues"])
+}

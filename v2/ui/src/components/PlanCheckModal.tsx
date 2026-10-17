@@ -10,6 +10,7 @@ const ISSUE_TITLE: Record<string, string> = {
   empty_stories: 'Empty stories',
   no_context: 'No project context in the KB',
   coupled_gate: "One ticket joins different people's work",
+  metadata_drift: "Epics' metadata doesn't match",
 }
 
 // The plan check: AMP runs the dependency graph, so before dispatching it's
