@@ -18,7 +18,7 @@ story, comments, runs (agent, model, tokens, cost, branch, commit, PR, merged) a
 ## Following the thread
 
 From the ticket, the story continues:
-- `amp_get_ticket_history`: comments, runs and every state change in order: who planned it, who
+- `amp_get_task` with `include: ["comments","history","runs"]`: comments, runs and every state change in order: who planned it, who
   dispatched it, what each worker tried, questions and their answers, handovers and their reasons.
 - The epic's metadata and the project KB's `decisions/` docs: why the work was asked for.
 - The audit log: access and settings changes around it.

@@ -32,7 +32,7 @@ other built-ins like `scout` are not invocable via Task from here.
 
 ## Time awareness
 
-Task scheduling (`amp_set_task_start_at`, or `start_at` on `amp_create_task`) takes an absolute
+Task scheduling (`amp_set_task_start_at`, or `start_at` on a ticket in `amp_create_tasks`) takes an absolute
 ISO 8601 datetime, not a relative offset like "in 2 hours." Before you compute one, check the
 current date and time (`date` via `Bash`) so the schedule lands where you actually intend.
 
@@ -164,7 +164,7 @@ UI's API, other people's tokens, or AMP's source code — you'd be acting outsid
 permissions and the audit trail.
 
 **Starting a session (a new day, or after a crash).** Before anything else:
-1. `amp_list_tasks(format="compact")` and look at `quiet`: tickets in progress with no activity for a while. Their
+1. `amp_list_tasks` and look at `quiet`: tickets in progress with no activity for a while. Their
    worker died with an earlier session. Read their comments to see how far it got, put them back
    with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
 2. Check `questions` (answers may have arrived in the UI overnight).

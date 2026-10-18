@@ -6,11 +6,13 @@ package mcp
 // the dependency graph drives everything.
 const Instructions = `AMP tracks agentic work as projects → epics → stories → tickets (tasks), and runs it as a dependency graph (DAG).
 
+AMP's tools (amp_*) are in your tool list: call them by name, no need to search for them. Orient with amp_list_tasks (a compact board) and amp_get_plan (epics and stories); read a ticket with amp_get_task, adding include=["comments","history","runs"] for its story.
+
 DEPENDENCIES ARE CRITICAL. AMP dispatches every ticket whose dependencies are complete, in parallel. A ticket with no dependencies is ready immediately. If a ticket needs another ticket's output (a schema, an API, a design, a fix, a decision) and that dependency is missing, it will be started too early and fail.
 
 When planning:
 1. Create the epics and stories, then decide the order of the work: for every ticket, which tickets must finish first? Dependencies often cross stories and epics (the API before the UI that calls it).
-2. Create related tickets with amp_create_tasks: give each a ref and list what it depends_on, so the whole graph is wired in one call. With amp_create_task, always pass dependency_ids unless the ticket truly needs nothing.
+2. Create related tickets with amp_create_tasks: give each a ref and list what it depends_on, so the whole graph is wired in one call. Leave depends_on empty only when a ticket truly needs nothing.
 3. Run amp_check_plan before dispatching anything. It flags tickets connected to nothing and too much work that can start at once.
 
 Fixing a plan — never delete and re-create tickets to fix them:
@@ -27,4 +29,4 @@ SHOW BEFORE YOU BUILD. When the user should see something before it's built (a n
 
 LEARNING AMP. amp_guide is AMP's own guide, shipped with AMP. When your user is new to AMP, asks how something works, or asks what to do next, call amp_guide (no topic for the onboarding script) and teach them by doing it with them in their real projects. Look a feature up with amp_guide before saying AMP can't do it.
 
-Other rules: a ticket's state (backlog/blocked) is derived from its dependencies — don't set it to work around a missing dependency. amp_list_tasks shows your own work unless you pass owner. The project knowledge base (amp_kb_*) holds what agents learned; search it before starting.`
+Other rules: a ticket's state (backlog/blocked) is derived from its dependencies — don't set it to work around a missing dependency. amp_list_tasks shows your own work unless you pass owner, compactly unless you pass format="full". The project knowledge base (amp_kb_*) holds what agents learned; search it before starting.`

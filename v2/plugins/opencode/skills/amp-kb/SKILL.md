@@ -412,11 +412,8 @@ amp_kb_list {project_id, tag?}
 amp_kb_delete {project_id, path}
   → removes doc and all its chunks from the index
 
-amp_kb_tags {project_id}
-  → [{tag, count}] — browse what's in the KB
-
-amp_kb_reindex {project_id}
-  → re-embeds all docs (use if Ollama model was changed)
+amp_kb_status {project_id}
+  → stale docs, open annotations, tag counts — browse what's in the KB
 
 amp_kb_annotate {project_id, path, text, author?}
   → adds an annotation to the document

@@ -213,6 +213,7 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		Name    string `json:"name"`
 		State   string `json:"state"`
 		Owner   *int   `json:"owner_user_id,omitempty"`
+		Agent   string `json:"assigned_to,omitempty"` // the agent profile that runs it
 		WaitsOn []int  `json:"waits_on,omitempty"`
 	}
 	type question struct {
@@ -232,7 +233,7 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		if st == "completed" && !withDone {
 			continue
 		}
-		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID}
+		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID, Agent: t.AssignedTo}
 		if st == "waiting" {
 			l.WaitsOn = t.BlockedByIDs
 		}

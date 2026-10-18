@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
@@ -87,7 +88,7 @@ func TestCatalog_EveryToolStillCallable(t *testing.T) {
 func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 	w := newRBACWorld(t)
 	hidden := []string{"amp_get_ticket_history", "amp_get_task_comments", "amp_get_task_runs", "amp_create_task",
-		"amp_claim_task", "amp_list_stories", "amp_list_project_stories", "amp_get_epic", "amp_get_story",
+		"amp_list_stories", "amp_list_project_stories", "amp_get_epic", "amp_get_story",
 		"amp_archive_project", "amp_restore_project", "amp_reset_project", "amp_export_project", "amp_import_project",
 		"amp_create_org", "amp_kb_tags", "amp_kb_reindex"}
 	admin := []string{"amp_manage_invites", "amp_manage_org_members", "amp_manage_teams", "amp_audit_log"}
@@ -382,5 +383,25 @@ func TestCatalog_ListTasksCompactByDefault(t *testing.T) {
 	}
 	if msg := s.callExpectError(t, "amp_list_tasks", map[string]any{"project_id": float64(s.projectID), "format": "xml"}); !strings.Contains(msg, "full") {
 		t.Errorf("bad format: %q", msg)
+	}
+}
+
+// amp_create_tasks schedules like amp_create_task did, so the batch tool
+// covers everything the single one could do.
+func TestCatalog_CreateTasksStartAt(t *testing.T) {
+	s := setupMCP(t)
+	out := s.call(t, "amp_create_tasks", map[string]any{"project_id": float64(s.projectID), "tasks": []any{
+		map[string]any{"ref": "later", "story_id": float64(s.storyID), "name": "later", "description": "d", "acceptance_criteria": "a",
+			"start_at": time.Now().Add(48 * time.Hour).UTC().Format(time.RFC3339)},
+	}})
+	if c := out["created"].([]any); len(c) != 1 {
+		t.Fatalf("created: %v", out)
+	}
+	if list := s.call(t, "amp_list_tasks", map[string]any{"project_id": float64(s.projectID)}); list["scheduled"] != float64(1) {
+		t.Errorf("scheduled: %v", list["scheduled"])
+	}
+	if msg := s.callExpectError(t, "amp_create_tasks", map[string]any{"project_id": float64(s.projectID), "tasks": []any{
+		map[string]any{"ref": "x", "story_id": float64(s.storyID), "name": "x", "start_at": "tomorrow"}}}); !strings.Contains(msg, "start_at") {
+		t.Errorf("bad start_at: %q", msg)
 	}
 }

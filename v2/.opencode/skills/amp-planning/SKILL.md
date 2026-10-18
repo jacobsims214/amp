@@ -46,9 +46,8 @@ Create in order. The API rejects out-of-order creation.
 amp_create_epic   {project_id, name, description}
 amp_create_story  {project_id, epic_id, name, acceptance_criteria}
 amp_create_tasks  {project_id, tasks: [{ref, story_id, name, description,
-                   acceptance_criteria, assigned_to, depends_on: [ref | task id]}]}
-amp_create_task   {project_id, story_id, name, description,
-                   acceptance_criteria, assigned_to, dependency_ids}
+                   acceptance_criteria, assigned_to, depends_on: [ref | task id],
+                   start_at?, owner?}]}
 ```
 
 **The dependency graph is what AMP runs.** Every ticket whose dependencies are done is
@@ -449,7 +448,7 @@ If yes to any of these — add the dependency, regardless of which epic or story
 Run `amp_check_plan(project_id)` after creating the tickets and before presenting the plan or
 dispatching anything. It reports tickets connected to nothing (`isolated`), too much work that
 can start at once (`wide_start` — usually missing dependencies), and empty stories. Fix what it
-finds, then run it again. A warning on `amp_create_task` / `amp_create_tasks` about missing
+finds, then run it again. A warning on `amp_create_tasks` about missing
 dependencies means the same thing: decide now, not after dispatch.
 
 ### Fix the plan in place — never delete and re-create
@@ -558,7 +557,8 @@ if a dispatch is refused because the plan wasn't approved, present what's new an
 anything, look at everything currently in `ready_to_dispatch` (this includes fix tasks a reviewer
 may have created since the plan was approved — they were not covered by the original check).
 Build the file_path -> task_ids map again for this batch and cross-check it against anything
-still `in_progress`. If two tasks about to go out together share a file with no dependency edge
+still `in_progress` (`amp_list_tasks` with `format: "full"` gives every ticket's description in
+one call; the default compact board lists IDs, names and `assigned_to`). If two tasks about to go out together share a file with no dependency edge
 between them, do not dispatch both in the same wave: either add the missing `dependency_ids` (if
 there's time to do so before dispatching), or dispatch one now and hold the other until the first
 completes.
@@ -585,7 +585,7 @@ A worker that needs a person blocks its ticket with the question and stops; the 
 ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
 Questions don't stop the loop: keep dispatching everything else.
 
-If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_task` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
+If work is genuinely time-gated (not blocked on another task, just not due yet), use `start_at` on `amp_create_tasks` or `amp_set_task_start_at` instead of dependencies — those tasks show up in a separate `scheduled` bucket and unblock automatically when their time arrives. Load `amp-mcp` for the exact shape.
 
 Load `amp-mcp` if you need exact tool argument shapes.
 

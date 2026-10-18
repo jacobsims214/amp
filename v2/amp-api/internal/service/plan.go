@@ -618,6 +618,7 @@ type TaskSpec struct {
 	AssignedTo         string
 	Owner              string
 	DependsOn          []string
+	StartAt            *time.Time
 	Metadata           domain.Metadata
 }
 
@@ -728,7 +729,7 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		t, _, err := s.CreateTask(ctx, p, domain.CreateTaskRequest{
 			ProjectID: projectID, StoryID: sp.StoryID, Name: sp.Name, Description: sp.Description,
 			AcceptanceCriteria: sp.AcceptanceCriteria, Priority: sp.Priority, AssignedTo: sp.AssignedTo,
-			DependencyIDs: deps, Metadata: sp.Metadata,
+			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: sp.Metadata,
 		}, sp.Owner)
 		if err != nil {
 			var made []string

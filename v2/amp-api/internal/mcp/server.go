@@ -369,7 +369,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.createTask)))
 
 	mcp.AddTool(tool("amp_create_tasks",
-		"Create several tickets AND the dependencies between them in one call — the recommended way to plan a story or "+
+		"Create tickets (tasks), one or many, AND the dependencies between them in one call — the way to plan a story or "+
 			"feature. Give each ticket a short `ref` (e.g. 'schema', 'api', 'ui'); `depends_on` lists refs of other tickets in "+
 			"this batch, or IDs of existing tickets. Everything is checked first (unknown refs, other projects, cycles); then "+
 			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
@@ -395,6 +395,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 						"assigned_to": str("Who should work it, e.g. 'amp-worker'."),
 						"priority":    str("0=low, 1=normal (default), 2=high, 3=critical."),
 						"owner":       str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
+						"start_at":    str("Optional. ISO 8601 datetime to schedule it; it's held until then."),
 						"metadata":    obj("Optional key/value metadata."),
 					},
 					"required": []string{"ref", "story_id", "name"},
@@ -439,7 +440,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"project_id":        num("REQUIRED. Project ID."),
 			"state":             str("Optional state filter: backlog, in_progress, completed, blocked."),
 			"owner":             str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
-			"format":            str("Optional. 'compact' (default): ready_to_dispatch and in_progress as ticket IDs, questions with their text, and each open ticket as one line under its epic (id, name, state, owner, what it waits on); read a ticket with amp_get_task. 'full': every ticket's full record in state buckets."),
+			"format":            str("Optional. 'compact' (default): ready_to_dispatch and in_progress as ticket IDs, questions with their text, and each open ticket as one line under its epic (id, name, state, owner, assigned_to, what it waits on); read a ticket with amp_get_task. 'full': every ticket's full record in state buckets."),
 			"include_completed": boolean("Optional. Compact format: also list completed tickets under their epics (they're counted either way)."),
 		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
@@ -1225,11 +1226,19 @@ func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) 
 				}
 			}
 		}
+		var startAt *time.Time
+		if v := optStr(m, "start_at", ""); v != "" {
+			t, err := time.Parse(time.RFC3339, v)
+			if err != nil {
+				return nil, fmt.Errorf("tasks[%d].start_at: %w", i, err)
+			}
+			startAt = &t
+		}
 		specs = append(specs, service.TaskSpec{
 			Ref: optStr(m, "ref", ""), StoryID: optInt(m, "story_id", 0), Name: optStr(m, "name", ""),
 			Description: optStr(m, "description", ""), AcceptanceCriteria: optStr(m, "acceptance_criteria", ""),
 			Priority: optStr(m, "priority", "1"), AssignedTo: optStr(m, "assigned_to", ""), Owner: optStr(m, "owner", ""),
-			DependsOn: deps, Metadata: meta,
+			DependsOn: deps, StartAt: startAt, Metadata: meta,
 		})
 	}
 	created, warnings, err := s.svc.CreateTasks(rctx, caller(rctx).p, projectID, specs)

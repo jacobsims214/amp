@@ -57,8 +57,7 @@ The skill is large. Loading it now wastes context you need for the actual work.
 ## Step 1 — Read your ticket and its comments
 
 ```
-amp_get_task(task_id=YOUR_TASK_ID)
-amp_get_task_comments(task_id=YOUR_TASK_ID)
+amp_get_task(task_id=YOUR_TASK_ID, include=["comments"])
 ```
 
 **First, confirm this ticket is yours to work:** its `state` is `in_progress` and its
@@ -272,15 +271,14 @@ tell you your usage, still report the model and the git fields. The same fields 
 ## MCP tools
 
 ```
-amp_get_task {task_id}
-amp_get_task_comments {task_id}       ← read before starting; answers to questions are here
+amp_get_task {task_id, include: ["comments"]}   ← read before starting; answers to questions are in the comments
 amp_add_task_comment {task_id, body, author}
 amp_block_task {task_id, reason, …run fields}   ← only to ask a person a question (Step 5)
 amp_complete_task {task_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
 amp_session_usage {}                  ← opencode plugin: your own model/tokens/cost
-amp_get_ticket_history {task_id}
-amp_get_epic / amp_get_story
-amp_create_task {project_id, epic_id, story_id, name, description, acceptance_criteria, assigned_to}
+amp_get_task {task_id, include: ["history","runs"]}   ← what happened before you
+amp_get_plan {project_id, epic_id?}
+amp_create_tasks {project_id, tasks: [{ref, story_id, name, description, acceptance_criteria, assigned_to, depends_on}]}
 amp_kb_search / amp_kb_get / amp_kb_write  ← see amp-kb skill
 ```
