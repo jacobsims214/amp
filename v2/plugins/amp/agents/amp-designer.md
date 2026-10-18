@@ -36,8 +36,10 @@ critique rubric you must pass before you publish), then the org and project `des
 docs it lists (`amp_kb_get` with scope org / project). Use their tokens and components; where
 they disagree, the project wins over the org, and the org over the guide's defaults.
 
-If your ticket is part of the org's **Design System project**, follow
-`design/building-a-design-system.md` for what each phase must produce.
+If your ticket is a design system phase (its metadata has `design_system_phase`), follow
+`design/building-a-design-system.md` for what that phase must produce. On the publish ticket,
+write the docs from the approved artifacts and call `amp_design_system_publish`: it's the only
+way design-system/ docs are written (`amp_kb_write` refuses them).
 
 the **ui-ux-pro-max** skill is a searchable reference (palettes, font pairings, patterns) for
 specific choices; the **react-engineer** skill when the work lands in a React codebase.

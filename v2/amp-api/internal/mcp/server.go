@@ -2311,6 +2311,10 @@ func (s *Server) kbWrite(ctx context.Context, args map[string]interface{}) (*mcp
 	if err != nil {
 		return nil, err
 	}
+	if strings.HasPrefix(strings.TrimPrefix(path, "/"), domain.DesignSystemPrefix) {
+		return nil, fmt.Errorf("design-system/ docs are only written by publishing a design system version (amp_design_system_publish), " +
+			"so they always come from phases a person approved; to change them, start a new version with amp_design_system_start")
+	}
 	title, err := reqStr(args, "title")
 	if err != nil {
 		return nil, err
@@ -2406,6 +2410,10 @@ func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mc
 	path, err := reqStr(args, "path")
 	if err != nil {
 		return nil, err
+	}
+	if strings.HasPrefix(strings.TrimPrefix(path, "/"), domain.DesignSystemPrefix) {
+		return nil, fmt.Errorf("design-system/ docs are only written by publishing a design system version (amp_design_system_publish), " +
+			"so they always come from phases a person approved; to change them, start a new version with amp_design_system_start")
 	}
 	if err := s.requireKB(); err != nil {
 		return nil, err

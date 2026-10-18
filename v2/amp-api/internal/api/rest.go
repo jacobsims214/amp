@@ -1758,6 +1758,10 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			if sc.Kind == kb.ScopeProject {
 				body.Reason = ""
 			}
+			if designSystemDoc(body.Path) {
+				jsonErr(w, errDesignSystemDoc, 409)
+				return
+			}
 			doc, err := h.kb.WriteDoc(r.Context(), sc, body.Path, body.Title, body.Content, body.Author, body.Tags, strings.TrimSpace(body.Reason), nil)
 			if err != nil {
 				jsonErr(w, err, 500)
@@ -1769,6 +1773,10 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Query().Get("path")
 			if path == "" {
 				jsonErr(w, errorf("path query param required"), 400)
+				return
+			}
+			if designSystemDoc(path) {
+				jsonErr(w, errDesignSystemDoc, 409)
 				return
 			}
 			if err := h.kb.DeleteDoc(r.Context(), sc, path); err != nil {
@@ -1918,4 +1926,12 @@ func (h *RestHandler) trace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]interface{}{"tickets": hits, "count": len(hits)})
+}
+
+// Design system docs are only written by publishing a version, so they always
+// come from phases a person approved.
+var errDesignSystemDoc = errorf("design-system/ docs are written only by publishing a design system version (its project's publish step); start a new version to change them")
+
+func designSystemDoc(path string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(path, "/"), domain.DesignSystemPrefix)
 }

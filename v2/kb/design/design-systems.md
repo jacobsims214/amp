@@ -11,8 +11,13 @@ every harness reads the same thing.
 | Layer | Where | What it holds | Who writes it |
 |---|---|---|---|
 | **Craft** | AMP's guide (`design/*`) | How to do UI/UX well: process, rules, critique | Ships with AMP |
-| **Org design system** | Org KB, `design-system/*` | The org's brand, tokens, components, patterns, voice | Org owners and admins (from the org's Design System project) |
-| **Project design system** | Project KB, `design-system/*` | Only what this product adds or changes | The project's team |
+| **Org design system** | Org KB, `design-system/*` | The org's brand, tokens, components, patterns, voice | Published from the org's Design System project (owners and admins) |
+| **Project design system** | Project KB, `design-system/*` | Only what this product adds or changes | Published from the project itself |
+
+Both are built the same way, with AMP's design system process (`amp_design_system_start`, then
+`amp_design_system_publish`; see `design/building-a-design-system.md`). Nobody writes
+`design-system/` docs by hand: they're published from approved artifacts, versioned, with a
+changelog.
 | **The work** | Artifacts and code | Mockups, screens, assets | Agents, reviewed by people |
 
 **The more specific layer wins.** Project over org, org over the guide's defaults. A project

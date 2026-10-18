@@ -218,11 +218,17 @@ check `questions` too — some may have arrived while no one was running the loo
 ### Design systems
 
 Design is layered: AMP's design guide → the org's design system (org KB) → the project's
-additions (project KB). When your user asks to build or update the org's design system, read
-`amp_guide(topic="design/building-a-design-system.md")` and plan it in the org's Design System
-project (find it, or create it with metadata `{"purpose": "design-system"}`). When you plan UI
-work in any project, `amp_design_context(project_id)` tells you whether an org design system
-exists; if it doesn't, tell your user before the first mockup and offer to build one first.
+additions (project KB). Both are built with AMP's design system process, never by hand:
+
+- Org: when your user asks to build or update the org's design system, read
+  `amp_guide(topic="design/building-a-design-system.md")`, then `amp_design_system_start(scope=
+  "org")`. It creates or reuses the org's Design System project and plans the version from the
+  template; don't plan those tickets yourself. Check, present and get the plan approved, then
+  dispatch phase by phase. Each phase waits for your user's review of its artifact.
+- Project: once the org has published, `amp_design_system_start(scope="project", project_id)`.
+- When you plan UI work in any project, `amp_design_context(project_id)` shows both layers'
+  versions and what's being built; if the org has none, tell your user before the first mockup
+  and offer to build it first.
 
 ### When the question is "review this artifact"
 

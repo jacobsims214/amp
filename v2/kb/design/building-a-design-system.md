@@ -10,26 +10,31 @@ artifact and review has a home you can come back to. Its output is the `design-s
 the org KB (`design/design-systems.md`). Managers: use this playbook when your user asks to build
 or update the org's design system.
 
-## The project
+## The process (built into AMP)
 
-- One per org: **"<Org> Design System"**, in the org, owned by the team responsible for brand or
-  design (or the user's team). Project metadata `{"purpose": "design-system"}`.
-- Look for it before creating one (`amp_list_projects`, `amp_find_by_metadata` purpose =
-  design-system). Updating the system later means new tickets in this same project.
-- Read the project's KB and the org KB's `design-system/` first: on an update, the current
-  system is the starting point.
+The process is the same for every org and every project, and AMP enforces it:
 
-## The plan
+- **`amp_design_system_start`** with `scope: "org"` (org owners and admins) finds or creates the
+  org's **Design System** project (metadata `purpose: design-system`) and opens the next version
+  as an epic of phase tickets from AMP's template, chained by dependencies and assigned to the
+  designer. Run it again and you get the version already being built, never a duplicate.
+- Each phase ends in an **artifact the user approves** (`working/artifacts.md`).
+- **`amp_design_system_publish`** is the only way `design-system/` docs are written. It refuses
+  until every phase has an approved artifact, and for the org only an owner or admin can run
+  it. It stamps the README with the version, the layer, the source project, links to the
+  approved artifacts and the changelog, and keeps those artifacts.
+- Direct writes to `design-system/` (`amp_kb_write`, the KB editor) are refused.
 
-One epic, a story per phase. Each phase ends with an artifact the user approves, and the next
-phase depends on it (design tickets, `working/artifacts.md`). The designer specialist does the
-design tickets; a researcher can do the audit.
+As a manager: run `amp_design_system_start`, run `amp_check_plan`, present the plan, get it
+approved, then dispatch each ready phase ticket to the designer. Every phase stops for the
+user's review; record their verdict, re-dispatch, and move on when it's approved.
+
+## The phases (org)
 
 1. **Audit.** Inventory what exists: screenshots of each product's key screens, the colors,
    fonts, spacing and radii actually used (from the CSS/Tailwind config), the components in use,
-   and the inconsistencies. Artifact: an audit (markdown, plus an HTML contact sheet of the
-   screenshots and swatches). Ask the user for brand assets (logo, brand colors, fonts) and
-   products they admire.
+   and the inconsistencies. Artifact: an audit (markdown, or an HTML contact sheet). Ask the
+   user for brand assets (logo, brand colors, fonts) and products they admire.
 2. **Direction.** Two or three distinct style tiles in one HTML artifact with a switcher: type
    pairing, palette, a button, an input, a card, a table row, and one real screen from the org's
    products in that style. The user picks one (or mixes) and says why.
@@ -42,24 +47,24 @@ design tickets; a researcher can do the audit.
    card, table, tabs, navigation (sidebar and top bar), dialog, toast, tooltip, empty state,
    skeleton. Artifact: a component gallery (HTML) using only the tokens.
 5. **Patterns and voice.** The org's decisions for page layouts, forms, settings, tables,
-   empty/loading/error states, destructive actions, and copy tone, each with a short example
-   screen. Artifact: markdown plus an HTML example page.
-6. **Publish.** A ticket owned by an org owner or admin (only they can write the org KB): write
-   `design-system/README.md`, `design-system/tokens.md`, `design-system/components.md`, `design-system/patterns.md`, `design-system/voice.md` to the org
-   KB from the approved artifacts (`amp_kb_write` with scope org and a reason), with the version
-   and changelog in the README. Ask the user to **keep** the approved artifacts (they're the
-   visual reference; `amp_keep_artifact` when they say so). Optionally, follow-up tickets in
-   product projects to adopt the tokens in code.
+   empty/loading/error states, destructive actions, and copy tone, each with a short example.
+6. **Publish.** The org owner's or admin's ticket: write `design-system/README.md`,
+   `design-system/tokens.md`, `design-system/components.md`, `design-system/patterns.md` and
+   `design-system/voice.md` from the approved artifacts (`amp_get_artifact` with the approved
+   version) and call `amp_design_system_publish` with a one-line changelog.
 
 ## Updating it
 
-New tickets in the Design System project: what changes and why, an artifact showing the change
-(before/after), approval, then update the org KB docs, bump the version in the README, and add a
-changelog line. Product projects pick it up the next time anyone calls `amp_design_context`.
+Run `amp_design_system_start` again: it opens the next version in the same Design System
+project, with the current docs as the starting point. Skip what doesn't change by saying so in
+that phase's artifact (approval still applies). Publishing bumps the version and the changelog;
+every project picks it up the next time anyone calls `amp_design_context`.
 
 ## A project's own layer
 
-When a product needs something the org system doesn't have, that's a design ticket in the
-product's project: a mockup of the addition, approval, then a `design-system/` doc in the
-project KB recording only the difference. If it turns out to be useful elsewhere, propose moving
-it into the org system (a ticket in the Design System project).
+Once the org has published, a product project builds its layer with
+`amp_design_system_start` `scope: "project"`: three tickets in that project (the delta from the
+org system, the additions and overrides as an artifact, publish), each approved, then
+`amp_design_system_publish` writes the project KB's `design-system/` docs with only the
+differences. If an addition turns out to be useful elsewhere, propose it for the org's next
+version.
