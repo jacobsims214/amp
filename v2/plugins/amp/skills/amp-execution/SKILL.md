@@ -129,6 +129,13 @@ Changed: [file — what changed]
 
 ---
 
+### Keep it moving
+
+Every turn costs time. Progress comments are short: a few lines on what you're doing and
+why, not your whole plan (the starting comment stays under ~150 words). Make related changes
+to a file in one edit, or rewrite the section, instead of many one-line edits. Batch
+independent tool calls in the same turn.
+
 ### Never wait on something that can't finish
 
 Nobody is watching a subagent's tool calls: a call that never returns stalls the ticket until a
