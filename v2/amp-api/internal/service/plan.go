@@ -881,6 +881,12 @@ func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID 
 	if err != nil {
 		return nil, err
 	}
+	return s.answer(ctx, p, t, answer)
+}
+
+// answer posts answer on t (already checked) and sends it back to ready.
+func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task, answer string) (*domain.Task, error) {
+	taskID := t.ID
 	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
 		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
 	}

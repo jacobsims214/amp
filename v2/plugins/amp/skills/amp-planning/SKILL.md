@@ -211,6 +211,35 @@ Code review: #16                          ← blocked by #15 (all story work don
 
 ---
 
+## Show before you build — design tickets
+
+When the user should see something before it's coded, the first wave is a **design ticket**,
+and the build depends on it. Plan one for: a new screen, page or flow; a visual redesign; a
+landing or marketing page; anything where "what should it look like?" has more than one good
+answer; and diagrams or documents the user has to agree with before work starts (an
+architecture sketch, an API shape, a data model).
+
+- Name it `Mockup: <what>` (or `Diagram:` / `Draft:`), owned by your user, for the designer
+  specialist (images: the media specialist). Acceptance criteria: an artifact published with
+  `amp_publish_artifact` covering the states that matter (empty, loading, error, filled; desktop
+  and phone), and approved by the user.
+- Every build ticket that implements it depends on it, so nothing gets built against an
+  unapproved design. Say in each build ticket's description: "Build to the approved artifact on
+  #<design ticket>."
+- The designer publishes, blocks the ticket asking for review, and stops. Tell the user the
+  artifact's link. They review in AMP, or tell you in chat and you record it with
+  `amp_review_artifact`. Then dispatch the design ticket again: the designer revises (a new
+  version) or, once approved, completes it, which unblocks the build.
+- Skip it for changes with one obvious answer (a bug fix, a field added to an existing form) or
+  when the user says to go straight to code.
+
+```
+Wave 0: #20 Mockup: settings page (designer)   ← user approves the artifact
+Wave 1: #21 (API), #22 (UI, builds to #20)     ← blocked by #20
+```
+
+---
+
 ## File conflict check — non-negotiable
 
 Two subagents editing the same file at the same time is a lost-write hazard — one agent's

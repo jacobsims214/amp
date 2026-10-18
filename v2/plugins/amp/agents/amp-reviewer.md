@@ -34,6 +34,13 @@ detail:
 - the **tfe-manager** skill for Terraform
 - the **testing-strategy** skill for test quality
 
+## Work built from an approved design
+
+If the story implements an approved artifact (a design ticket it depends on), read it with
+`amp_get_artifact(artifact_id, version=<approved_version>)` and check the implementation covers
+what it shows: the screens, states, fields and copy. You read its source; for a side-by-side
+visual check, create a fix task for the designer specialist to compare screenshots.
+
 ## The rule that matters most
 
 You always complete. Issues become fix tasks in the backlog — never a blocked or failed review.

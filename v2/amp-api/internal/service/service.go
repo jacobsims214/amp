@@ -24,6 +24,12 @@ type Service struct {
 	Registry *actor.Registry
 	Authz    *authz.Checker
 	KB       *kb.Service // nil when the knowledge base isn't configured
+	// AppURL is AMP's public address (https://amp.example.com), for links to
+	// pages in the UI. Empty when unknown: links are then left out.
+	AppURL string
+	// ArtifactRetention is how long an artifact lives after its last version
+	// unless someone keeps it (0: the default, 45 days).
+	ArtifactRetention time.Duration
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {

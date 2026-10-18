@@ -560,6 +560,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"answer":  str("REQUIRED. The answer, as the person gave it, with any detail the next worker needs."),
 		}), wrap(ctx, s.guard(authz.Member, s.answerQuestion)))
 
+	s.registerArtifacts(mcp)
+	s.registerDesign(mcp)
+
 	mcp.AddTool(tool("amp_add_task_comment", "Post a comment to a task's log. Used by agents to report progress.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),

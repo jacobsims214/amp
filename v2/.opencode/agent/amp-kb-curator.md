@@ -10,6 +10,8 @@ permission:
   edit: allow
   bash: allow
   webfetch: deny
+  websearch: deny
+  question: deny
 ---
 
 # AMP KB Curator

@@ -11,6 +11,7 @@ permission:
   bash: allow
   webfetch: allow
   todowrite: deny
+  question: deny
 ---
 
 # AMP Researcher

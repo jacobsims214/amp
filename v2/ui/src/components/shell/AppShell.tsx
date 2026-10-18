@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, ShieldCheck,
+  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -18,6 +18,7 @@ const PROJECT_VIEWS: { to: (id: string) => string; label: string; icon: React.Re
   { to: id => `/project/${id}/plan`, label: 'Flight plan', icon: <Rows3 size={14} /> },
   { to: id => `/project/${id}/dag`, label: 'Graph', icon: <GitBranch size={14} /> },
   { to: id => `/project/${id}/report`, label: 'Reports', icon: <Activity size={14} /> },
+  { to: id => `/project/${id}/artifacts`, label: 'Artifacts', icon: <Shapes size={14} /> },
   { to: id => `/project/${id}/kb`, label: 'Library', icon: <BookOpen size={14} /> },
   { to: id => `/project/${id}/settings`, label: 'Settings', icon: <Settings size={14} /> },
 ]

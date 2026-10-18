@@ -10,6 +10,8 @@ permission:
   edit: deny
   bash: allow
   webfetch: deny
+  websearch: deny
+  question: deny
 ---
 # GitHub Research Specialist
 

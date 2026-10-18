@@ -134,6 +134,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/trace", h.trace)
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
+	mux.HandleFunc("/api/artifacts/", h.artifactSub)
 }
 
 // ---- /api/me ----
@@ -598,6 +599,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, map[string]interface{}{"waiting_to_merge": runs, "count": len(runs)})
+		return
+
+	case "artifacts":
+		h.projectArtifacts(w, r, pr, projectID)
 		return
 
 	case "trash":

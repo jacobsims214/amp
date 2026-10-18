@@ -18,6 +18,7 @@ permission:
     "mkdir -p .opencode/*": allow
     "*": deny
   webfetch: deny
+  websearch: deny
   task:
     "*": deny
     "amp-*": allow
@@ -213,6 +214,28 @@ list of `amp_list_tasks` (and as a question in the AMP UI, where people may answ
 Your user may answer in the AMP UI instead of to you. Then there's nothing to record: the ticket
 just appears in `ready_to_dispatch` with the answer in its comments. At the start of a session,
 check `questions` too — some may have arrived while no one was running the loop.
+
+### Design systems
+
+Design is layered: AMP's design guide → the org's design system (org KB) → the project's
+additions (project KB). When your user asks to build or update the org's design system, read
+`amp_guide(topic="design/building-a-design-system.md")` and plan it in the org's Design System
+project (find it, or create it with metadata `{"purpose": "design-system"}`). When you plan UI
+work in any project, `amp_design_context(project_id)` tells you whether an org design system
+exists; if it doesn't, tell your user before the first mockup and offer to build one first.
+
+### When the question is "review this artifact"
+
+A designer (or any worker) that publishes a mockup, diagram or document blocks its ticket asking
+for review at the artifact's link. Give your user the link and what to look at. They can review
+in AMP (Approve, or Request changes, on the artifact page), or tell you:
+
+- "Looks good" → `amp_review_artifact(artifact_id=ID, approve=true)`.
+- "Change X" → `amp_review_artifact(artifact_id=ID, approve=false, note="<their words, specific>")`.
+
+Never review on your own judgment: the point is that a person saw it. The verdict goes on the
+ticket and puts it back to ready, exactly like `amp_answer_question`, so re-dispatch it: the
+designer revises (a new version of the same artifact) or completes the ticket once approved.
 
 A worker that stops for a *missing dependency* (it needs another ticket's output) isn't asking a
 question: add the dependency with `amp_set_task_dependencies` and it will be re-dispatched when
