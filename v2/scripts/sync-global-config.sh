@@ -10,7 +10,7 @@
 # What it does:
 #   1. Copies skills  v2/.opencode/skills/*  → ~/.config/opencode/skills/
 #   2. Copies agents  v2/.opencode/agent/*.md → ~/.config/opencode/agent/
-#   3. Merges opencode.json — upserts provider + mcp keys only (agents are
+#   3. Merges opencode.json — upserts provider, providers (per model) and mcp (agents are
 #      picked up by the file copy above, not merged into JSON)
 #
 # Usage:
@@ -108,6 +108,19 @@ gcfg.setdefault('mcp', {})
 for name, cfg in v2cfg.get('provider', {}).items():
     gcfg['provider'][name] = cfg
     print(f"  provider: {name}")
+
+# opencode 2 'providers': upsert per model, so models you added yourself to the
+# same provider (e.g. other OpenRouter models) are kept.
+for name, cfg in v2cfg.get('providers', {}).items():
+    dst = gcfg.setdefault('providers', {}).setdefault(name, {})
+    for key, val in cfg.items():
+        if key == 'models':
+            dst.setdefault('models', {}).update(val)
+        elif isinstance(val, dict) and isinstance(dst.get(key), dict):
+            dst[key].update(val)
+        else:
+            dst[key] = val
+    print(f"  providers: {name}  models={', '.join(cfg.get('models', {}))}")
 
 for name, cfg in v2cfg.get('mcp', {}).items():
     gcfg['mcp'][name] = cfg

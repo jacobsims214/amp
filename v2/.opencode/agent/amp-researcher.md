@@ -2,7 +2,8 @@
 description: Read-only researcher — investigates and reports, never edits files. Dispatched by the manager to answer a question before planning.
 mode: subagent
 hidden: true
-model: openrouter/moonshotai/kimi-k3
+model: openrouter/xiaomi/mimo-v2.6-pro
+variant: on
 temperature: 0.2
 steps: 40
 permission:

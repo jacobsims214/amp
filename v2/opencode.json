@@ -1,6 +1,264 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "default_agent": "amp-manager",
+  "providers": {
+    "openrouter": {
+      "settings": {
+        "chunkTimeout": 120000,
+        "headerTimeout": 60000
+      },
+      "models": {
+        "deepseek/deepseek-v4.1-flash-1017": {
+          "name": "DeepSeek V4.1 Flash (1017)",
+          "family": "deepseek-flash",
+          "releaseDate": "2026-10-17",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image"
+            ],
+            "output": [
+              "text"
+            ],
+            "reasoning": {
+              "supported": true,
+              "effort": [
+                "none",
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.15,
+            "output": 0.6,
+            "cache": {
+              "read": 0.003
+            }
+          },
+          "variants": [
+            {
+              "id": "off",
+              "body": {
+                "reasoning": {
+                  "effort": "none"
+                }
+              }
+            },
+            {
+              "id": "low",
+              "body": {
+                "reasoning": {
+                  "effort": "low"
+                }
+              }
+            },
+            {
+              "id": "high",
+              "body": {
+                "reasoning": {
+                  "effort": "high"
+                }
+              }
+            },
+            {
+              "id": "max",
+              "body": {
+                "reasoning": {
+                  "effort": "max"
+                }
+              }
+            }
+          ]
+        },
+        "z-ai/glm-5.3": {
+          "name": "GLM-5.3",
+          "family": "glm",
+          "releaseDate": "2026-08-18",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ],
+            "reasoning": {
+              "supported": true,
+              "effort": [
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.079,
+            "output": 1.8,
+            "cache": {
+              "read": 0.078
+            }
+          },
+          "variants": [
+            {
+              "id": "low",
+              "body": {
+                "reasoning": {
+                  "effort": "low"
+                }
+              }
+            },
+            {
+              "id": "high",
+              "body": {
+                "reasoning": {
+                  "effort": "high"
+                }
+              }
+            },
+            {
+              "id": "max",
+              "body": {
+                "reasoning": {
+                  "effort": "max"
+                }
+              }
+            }
+          ]
+        },
+        "xiaomi/mimo-v2.6-pro": {
+          "name": "MiMo-V2.6-Pro",
+          "family": "mimo",
+          "releaseDate": "2026-09-21",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image",
+              "video",
+              "audio"
+            ],
+            "output": [
+              "text"
+            ],
+            "reasoning": {
+              "supported": true,
+              "toggle": true
+            }
+          },
+          "limit": {
+            "context": 1050000,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.435,
+            "output": 0.87,
+            "cache": {
+              "read": 0.0036
+            }
+          },
+          "variants": [
+            {
+              "id": "off",
+              "body": {
+                "reasoning": {
+                  "enabled": false
+                }
+              }
+            },
+            {
+              "id": "on",
+              "body": {
+                "reasoning": {
+                  "enabled": true
+                }
+              }
+            }
+          ]
+        },
+        "moonshotai/kimi-k3": {
+          "name": "Kimi K3",
+          "family": "kimi-k3",
+          "releaseDate": "2026-07-16",
+          "capabilities": {
+            "tools": true,
+            "input": [
+              "text",
+              "image",
+              "video"
+            ],
+            "output": [
+              "text"
+            ],
+            "reasoning": {
+              "supported": true,
+              "effort": [
+                "none",
+                "low",
+                "high",
+                "max"
+              ]
+            }
+          },
+          "limit": {
+            "context": 1048576,
+            "output": 131072
+          },
+          "cost": {
+            "input": 0.304,
+            "output": 11.936,
+            "cache": {
+              "read": 0.21
+            }
+          },
+          "variants": [
+            {
+              "id": "off",
+              "body": {
+                "reasoning": {
+                  "effort": "none"
+                }
+              }
+            },
+            {
+              "id": "low",
+              "body": {
+                "reasoning": {
+                  "effort": "low"
+                }
+              }
+            },
+            {
+              "id": "high",
+              "body": {
+                "reasoning": {
+                  "effort": "high"
+                }
+              }
+            },
+            {
+              "id": "max",
+              "body": {
+                "reasoning": {
+                  "effort": "max"
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
   "provider": {
     "LlamaBarn": {
       "npm": "@ai-sdk/openai-compatible",
@@ -12,12 +270,6 @@
         "gemma-4-31b-q4": {},
         "qwen-3.5-medium-35b-a3b": {},
         "qwen-3.6-35b-a3b": {}
-      }
-    },
-    "openrouter": {
-      "options": {
-        "chunkTimeout": 120000,
-        "headerTimeout": 60000
       }
     }
   },

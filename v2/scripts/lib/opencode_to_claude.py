@@ -39,6 +39,7 @@ from pathlib import Path
 # hidden: true                      dropped (no equivalent)
 # temperature                       dropped (no equivalent)
 # model: openrouter/<vendor>/<m>    model tier — see MODEL_MAP
+# variant                           dropped (thinking level is opencode-only)
 # permission: <k>: deny            disallowedTools: [...] — opencode is
 #                                   deny-based, so an allowlist would be the
 #                                   wrong shape (and would strip Skill and the
@@ -58,14 +59,12 @@ PLUGIN_NAME = "amp"
 PLUGIN_VERSION = "2.0.0"
 MCP_SERVER_NAME = "amp"
 
-# openrouter model -> Claude Code model tier. Cheap/small models map to haiku,
-# coding models to sonnet, the planner to opus.
-MODEL_MAP = {
-    "openrouter/deepseek/deepseek-v4-flash": "opus",
-    "openrouter/qwen/qwen3-coder-next": "sonnet",
-    "openrouter/qwen/qwen3.6-35b-a3b": "sonnet",
-    "openrouter/qwen/qwen3.5-9b": "haiku",
-}
+# openrouter model -> Claude Code model tier. Empty: every Claude Code agent
+# inherits the session's model. The opencode roster picks open-weight models by
+# price and benchmark (docs/opencode-models.md); that choice says nothing about
+# which Claude tier fits, so don't derive one from it. Add an entry only to pin
+# a specific agent's tier on purpose.
+MODEL_MAP: dict[str, str] = {}
 DEFAULT_MODEL = "inherit"
 
 COLOR_MAP = {
@@ -78,6 +77,8 @@ COLOR_MAP = {
     "amp-worker-backend": "green",
     "amp-worker-frontend": "magenta",
     "amp-worker-docs": "green",
+    "amp-designer": "magenta",
+    "amp-media": "cyan",
 }
 
 # Claude Code tools blocked by each opencode `permission: <key>: deny`.

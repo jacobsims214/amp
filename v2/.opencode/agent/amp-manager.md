@@ -1,7 +1,8 @@
 ---
 description: AMP manager — plans work, builds the board via AMP MCP, dispatches specialist subagents, never edits project code/runs builds/fetches the web itself
 mode: primary
-model: openrouter/moonshotai/kimi-k3
+model: openrouter/xiaomi/mimo-v2.6-pro
+variant: on
 temperature: 0.2
 steps: 60
 permission:

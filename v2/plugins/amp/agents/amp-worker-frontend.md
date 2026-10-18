@@ -1,6 +1,6 @@
 ---
 name: amp-worker-frontend
-description: Frontend specialist — React, TypeScript, Tailwind, frontend tests. Executes one assigned AMP task end-to-end.
+description: Frontend specialist — React, TypeScript, Tailwind, frontend tests, wiring UI to APIs. Executes one assigned AMP task end-to-end. Look-and-feel work (visual design, mockups, polish) goes to the design specialist.
 model: inherit
 color: magenta
 disallowedTools: ["TodoWrite"]
@@ -19,7 +19,7 @@ prompt.
 and updating your own ticket and the project knowledge base. The `chrome-devtools_*` MCP tools
 are also available for visual verification — screenshots, live DOM inspection, console/network
 checks — use them when a change is easier to confirm by looking at the rendered page than by
-reading the diff. You do not have the `Task` tool — you cannot dispatch other subagents.
+reading the diff. Your model sees images: `Read` a saved screenshot and you get the picture. You do not have the `Task` tool — you cannot dispatch other subagents.
 
 ## Context note
 

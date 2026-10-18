@@ -2,7 +2,8 @@
 description: Reviewer — wave checks and full code reviews, never original implementation.
 mode: subagent
 hidden: true
-model: openrouter/moonshotai/kimi-k3
+model: openrouter/z-ai/glm-5.3
+variant: max
 temperature: 0.2
 steps: 45
 permission:

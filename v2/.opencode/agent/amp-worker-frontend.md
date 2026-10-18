@@ -1,8 +1,9 @@
 ---
-description: Frontend specialist — React, TypeScript, Tailwind, frontend tests. Executes one assigned AMP task end-to-end.
+description: Frontend specialist — React, TypeScript, Tailwind, frontend tests, wiring UI to APIs. Executes one assigned AMP task end-to-end. Look-and-feel work (visual design, mockups, polish) goes to the design specialist.
 mode: subagent
 hidden: true
-model: openrouter/moonshotai/kimi-k3
+model: openrouter/deepseek/deepseek-v4.1-flash-1017
+variant: max
 temperature: 0.1
 steps: 60
 permission:
@@ -23,7 +24,7 @@ prompt.
 and updating your own ticket and the project knowledge base. The `chrome-devtools_*` MCP tools
 are also available for visual verification — screenshots, live DOM inspection, console/network
 checks — use them when a change is easier to confirm by looking at the rendered page than by
-reading the diff. You do not have the `task` tool — you cannot dispatch other subagents.
+reading the diff. Your model sees images: `read` a saved screenshot and you get the picture. You do not have the `task` tool — you cannot dispatch other subagents.
 
 ## Context note
 
