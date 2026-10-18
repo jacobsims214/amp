@@ -433,17 +433,31 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_list_tasks",
 		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
 			"Pass owner='unassigned' to see the pool anyone can pick up, owner='any' for everything, or a user's email/id. "+
-			"Response includes a ready_to_dispatch array (state=backlog) — dispatch everything in it. Blocked tasks include blocked_by_ids showing exactly which task IDs are in the way. Scheduled tasks are in a separate bucket waiting for their start_at time. "+
-			"questions lists blocked tickets whose block_reason is a question for a person (they are also in blocked): ask the user, then amp_answer_question.",
+			"ready_to_dispatch (state=backlog): dispatch everything in it. Waiting tickets show what they wait on; scheduled ones wait for their start_at time. "+
+			"questions are blocked tickets with a question for a person: ask the user, then amp_answer_question.",
 		props{
-			"project_id": num("REQUIRED. Project ID."),
-			"state":      str("Optional state filter: backlog, in_progress, completed, blocked."),
-			"owner":      str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
-			"format":     str("Optional: 'compact' for a small overview — buckets as ticket IDs, and every ticket as one line under its epic (id, name, state, owner, what it waits on). Use it to orient; fetch full tickets with amp_get_task."),
+			"project_id":        num("REQUIRED. Project ID."),
+			"state":             str("Optional state filter: backlog, in_progress, completed, blocked."),
+			"owner":             str("Optional: 'mine' (default), 'unassigned', 'any', or a user's email/id."),
+			"format":            str("Optional. 'compact' (default): ready_to_dispatch and in_progress as ticket IDs, questions with their text, and each open ticket as one line under its epic (id, name, state, owner, what it waits on); read a ticket with amp_get_task. 'full': every ticket's full record in state buckets."),
+			"include_completed": boolean("Optional. Compact format: also list completed tickets under their epics (they're counted either way)."),
 		}), wrap(ctx, s.guard(authz.Member, s.listTasks)))
 
-	mcp.AddTool(tool("amp_get_task", "Get full task details by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top).",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.getTask)))
+	mcp.AddTool(tool("amp_get_task", "Read a ticket (task) by ID, with its effective_metadata (its project's, epic's, and story's metadata with its own on top). "+
+		"Add include for its comments (plan, progress, questions, answers), history (state changes, dispatches, who did what) and runs (model, tokens, branch, commit, PR).",
+		props{
+			"task_id": num("REQUIRED. Task ID."),
+			"include": strArr("Optional. Any of 'comments', 'history', 'runs'."),
+			"limit":   num("Optional. With include: the most recent N comments and history entries (default 30; 0 for all)."),
+		}), wrap(ctx, s.guard(authz.Member, s.getTask)))
+
+	mcp.AddTool(tool("amp_get_plan",
+		"A project's plan as a tree: its epics, each with its stories and their ticket counts by state. "+
+			"Pass epic_id for one epic. Read tickets with amp_list_tasks or amp_get_task.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"epic_id":    num("Optional. Only this epic."),
+		}), wrap(ctx, s.guard(authz.Member, s.getPlan)))
 
 	mcp.AddTool(tool("amp_update_task",
 		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, or metadata — pass "+
@@ -476,7 +490,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"user":    str("REQUIRED. Email or user id of a project member, 'me', or 'none' to unassign."),
 		}), wrap(ctx, s.guard(authz.Member, s.assignTask)))
 
-	mcp.AddTool(tool("amp_dispatch_task", "Dispatch a task to an agent (sets state to in_progress). Fails if task is blocked. An unassigned ticket becomes yours; a ticket owned by someone else can't be dispatched.",
+	mcp.AddTool(tool("amp_dispatch_task", "Start work on a ticket (task): dispatch it to an agent (sets state to in_progress). Fails if task is blocked. An unassigned ticket becomes yours; a ticket owned by someone else can't be dispatched.",
 		props{
 			"task_id":  num("REQUIRED. Task ID."),
 			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
@@ -534,7 +548,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.taskRuns)))
 	mcp.AddTool(tool("amp_trace",
 		"From code back to the work: find the tickets whose runs produced a commit, a branch, or a PR, across the projects you "+
-			"can see. Then amp_get_ticket_history(task_id) for how it got there (plan, comments, decisions, runs).",
+			"can see. Then amp_get_task(task_id, include=[comments,history,runs]) for how it got there (plan, comments, decisions, runs).",
 		props{
 			"commit": str("A commit SHA, or at least its first 7 characters."),
 			"branch": str("A branch name."),
@@ -1415,8 +1429,13 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		}
 	}
 
-	if optStr(args, "format", "") == "compact" {
-		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet)
+	switch optStr(args, "format", "compact") {
+	case "full":
+	case "compact":
+		withDone, _ := args["include_completed"].(bool)
+		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, withDone)
+	default:
+		return nil, fmt.Errorf("format: use 'compact' (default) or 'full'")
 	}
 
 	return jsonResult(map[string]interface{}{
@@ -1458,7 +1477,45 @@ func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcp
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"task": reply.Task, "effective_metadata": eff})
+	out := map[string]interface{}{"task": reply.Task, "effective_metadata": eff}
+	limit := optInt(args, "limit", 30)
+	for _, inc := range optStrSlice(args, "include") {
+		switch inc {
+		case "comments":
+			c, err := s.repo.GetComments(ctx, taskID)
+			if err != nil {
+				return nil, err
+			}
+			out["comments"], out["comments_total"] = lastN(c, limit), len(c)
+		case "history":
+			h, err := s.repo.GetTicketHistory(ctx, taskID)
+			if err != nil {
+				return nil, err
+			}
+			out["history"], out["history_total"] = lastN(h, limit), len(h)
+		case "runs":
+			runs, err := s.repo.TaskRuns(ctx, taskID)
+			if err != nil {
+				return nil, err
+			}
+			var u domain.Usage
+			for _, r := range runs {
+				u.Add(r)
+			}
+			out["runs"], out["usage"] = runs, u
+		default:
+			return nil, fmt.Errorf("include: unknown %q (use comments, history, runs)", inc)
+		}
+	}
+	return jsonResult(out)
+}
+
+// lastN keeps the most recent n of a chronological list (all when n <= 0).
+func lastN[T any](xs []T, n int) []T {
+	if n > 0 && len(xs) > n {
+		return xs[len(xs)-n:]
+	}
+	return xs
 }
 
 func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -2858,7 +2915,7 @@ func tool(name, desc string, schema props) mcpgo.Tool {
 		obj["required"] = required
 	}
 	raw, _ := json.Marshal(obj)
-	return mcpgo.NewToolWithRawSchema(name, desc, raw)
+	return presentTool(mcpgo.NewToolWithRawSchema(name, desc, raw))
 }
 
 type handlerFunc = func(context.Context, map[string]interface{}) (*mcpgo.CallToolResult, error)
@@ -3248,4 +3305,82 @@ func stem(w string) string {
 		return w[:5]
 	}
 	return w
+}
+
+// getPlan is a project's plan as one tree: epics → stories, each with its
+// ticket counts by state. It replaces walking list_epics / list_stories.
+func (s *Server) getPlan(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	onlyEpic := optInt(args, "epic_id", 0)
+	epics, err := s.repo.ListEpics(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	stories, err := s.repo.ListStoriesByProject(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	tasks, err := s.repo.ListTasks(ctx, projectID, "")
+	if err != nil {
+		return nil, err
+	}
+	counts := map[int]map[domain.TaskState]int{} // story → state → n
+	epicCounts := map[int]map[domain.TaskState]int{}
+	bump := func(m map[int]map[domain.TaskState]int, id int, st domain.TaskState) {
+		if m[id] == nil {
+			m[id] = map[domain.TaskState]int{}
+		}
+		m[id][st]++
+	}
+	for _, t := range tasks {
+		bump(counts, t.StoryID, t.State)
+		bump(epicCounts, t.EpicID, t.State)
+	}
+	type storyNode struct {
+		ID       int                      `json:"id"`
+		Name     string                   `json:"name"`
+		State    domain.StoryState        `json:"state"`
+		OwnerIDs []int                    `json:"owner_ids,omitempty"`
+		Tickets  map[domain.TaskState]int `json:"tickets"`
+	}
+	type epicNode struct {
+		ID          int                      `json:"id"`
+		Name        string                   `json:"name"`
+		Description string                   `json:"description,omitempty"`
+		State       domain.EpicState         `json:"state"`
+		Priority    string                   `json:"priority,omitempty"`
+		OwnerIDs    []int                    `json:"owner_ids,omitempty"`
+		Metadata    domain.Metadata          `json:"metadata,omitempty"`
+		Tickets     map[domain.TaskState]int `json:"tickets"`
+		Stories     []storyNode              `json:"stories"`
+	}
+	byEpic := map[int][]storyNode{}
+	for _, st := range stories {
+		byEpic[st.EpicID] = append(byEpic[st.EpicID], storyNode{st.ID, st.Name, st.State, st.OwnerIDs, orEmpty(counts[st.ID])})
+	}
+	out := []epicNode{}
+	for _, e := range epics {
+		if onlyEpic != 0 && e.ID != onlyEpic {
+			continue
+		}
+		desc := e.Description
+		if r := []rune(desc); onlyEpic == 0 && len(r) > 200 {
+			desc = string(r[:200]) + "…"
+		}
+		out = append(out, epicNode{e.ID, e.Name, desc, e.State, e.Priority, e.OwnerIDs, e.Metadata, orEmpty(epicCounts[e.ID]), append([]storyNode{}, byEpic[e.ID]...)})
+	}
+	if onlyEpic != 0 && len(out) == 0 {
+		return nil, fmt.Errorf("epic %d isn't in project %d", onlyEpic, projectID)
+	}
+	return jsonResult(map[string]interface{}{"project_id": projectID, "epics": out, "tickets": len(tasks)})
+}
+
+func orEmpty(m map[domain.TaskState]int) map[domain.TaskState]int {
+	if m == nil {
+		return map[domain.TaskState]int{}
+	}
+	return m
 }

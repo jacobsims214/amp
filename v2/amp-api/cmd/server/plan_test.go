@@ -55,7 +55,7 @@ func newStory(t *testing.T, s *mcpStack, name string) (epicID, storyID int) {
 // listedTaskIDs is every ticket amp_list_tasks returns, across its buckets.
 func listedTaskIDs(t *testing.T, s *mcpStack) []int {
 	t.Helper()
-	res := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID), "owner": "any"})
+	res := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID), "owner": "any"})
 	var out []int
 	for _, bucket := range []string{"ready_to_dispatch", "in_progress", "blocked", "scheduled", "completed"} {
 		list, _ := res[bucket].([]interface{})

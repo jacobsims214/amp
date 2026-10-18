@@ -62,7 +62,7 @@ func (s *Server) registerArtifacts(mcp *server.MCPServer) {
 		}), wrap(ctx, s.open(s.keepArtifact)))
 
 	mcp.AddTool(tool("amp_list_artifacts",
-		"List a project's artifacts (mockups, diagrams, images, documents), or one ticket's: title, kind, review status "+
+		"List a project's artifacts (designs, diagrams, images, documents), or one ticket's: title, kind, review status "+
 			"(in_review, approved, changes_requested), latest and approved version, and url.",
 		props{
 			"project_id": num("The project. Either project_id or task_id is required."),
@@ -72,7 +72,7 @@ func (s *Server) registerArtifacts(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_get_artifact",
 		"Get an artifact: its details, versions and review status, and the content of one version (the latest by default; "+
 			"images come back as images you can see). Use it to build what a person approved (approved_version), or to compare "+
-			"what you built with the mockup. Review feedback is in the ticket's comments.",
+			"what you built with the design. Review feedback is in the ticket's comments.",
 		props{
 			"artifact_id":     num("REQUIRED. Artifact ID."),
 			"version":         num("Optional. Which version; default the latest. Use approved_version to get what was approved."),

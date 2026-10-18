@@ -44,12 +44,13 @@ type mcpHTTPConfig struct {
 // (2025-11-25 and earlier) and the stateless 2026-07-28 protocol; mcp-go
 // picks the era per request.
 func newMCPServer(h *mcp.Server) *mcpserver.MCPServer {
-	srv := mcpserver.NewMCPServer("amp-api", "2.0.0",
+	opts := append([]mcpserver.ServerOption{
 		mcpserver.WithToolCapabilities(false),
 		mcpserver.WithInstructions(mcp.Instructions),
-		mcpserver.WithToolHandlerMiddleware(mcp.Middleware()),
-		mcpserver.WithMethodCacheHints(mcpgo.MethodToolsList, toolsListCacheTTLMs, mcpgo.CacheScopePublic),
-	)
+		// The tool list depends on who's asking (admin and person-only tools).
+		mcpserver.WithMethodCacheHints(mcpgo.MethodToolsList, toolsListCacheTTLMs, mcpgo.CacheScopePrivate),
+	}, h.ServerOptions()...)
+	srv := mcpserver.NewMCPServer("amp-api", "2.0.0", opts...)
 	h.Register(srv)
 	return srv
 }

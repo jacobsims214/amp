@@ -112,9 +112,9 @@ func setupMCP(t *testing.T) *mcpStack {
 	}
 
 	// Wire the MCP server — enable tool capabilities (same as production).
-	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false), mcpserver.WithToolHandlerMiddleware(mcp.Middleware()))
 	kbSvc := testKB()
 	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
+	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", append([]mcpserver.ServerOption{mcpserver.WithToolCapabilities(false)}, mcpHandler.ServerOptions()...)...)
 	mcpHandler.Register(srv)
 
 	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
@@ -420,7 +420,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 
 	// ---- Phase 2: Manager calls amp_list_tasks, sees what to dispatch ----
 
-	list := s.call(t, "amp_list_tasks", map[string]interface{}{
+	list := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 
@@ -473,7 +473,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 	})
 
 	// Task 3 should still be blocked — task 2 not done yet.
-	list2 := s.call(t, "amp_list_tasks", map[string]interface{}{
+	list2 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 	if sliceLen(t, list2, "ready_to_dispatch") != 0 {
@@ -502,7 +502,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 	})
 
 	// Task 3 must now be in ready_to_dispatch — actor auto-unblocked it.
-	list3 := s.call(t, "amp_list_tasks", map[string]interface{}{
+	list3 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 	ready3 := sliceIDs(t, list3, "ready_to_dispatch")
@@ -531,7 +531,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 
 	// ---- Phase 8: Final state check — everything done ----
 
-	finalList := s.call(t, "amp_list_tasks", map[string]interface{}{
+	finalList := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 
@@ -584,11 +584,11 @@ func TestMCP_DiamondDAGThroughMCP(t *testing.T) {
 		s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id)})
 	}
 	listReady := func() []int {
-		r := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		r := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		return sliceIDs(t, r, "ready_to_dispatch")
 	}
 	listBlocked := func() []map[string]interface{} {
-		r := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		r := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		raw, _ := r["blocked"].([]interface{})
 		out := make([]map[string]interface{}, len(raw))
 		for i, item := range raw {

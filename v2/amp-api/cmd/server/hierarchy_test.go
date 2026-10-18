@@ -190,7 +190,7 @@ func TestHierarchy_FullHierarchyViaMCP(t *testing.T) {
 	t.Logf("task %d: project=%d epic=%d story=%d ✓", taskID, s.projectID, s.epicID, s.storyID)
 
 	// List tasks under the project — should include our task.
-	list := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+	list := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 	if sliceLen(t, list, "ready_to_dispatch") != 1 {
 		t.Errorf("want 1 task in ready_to_dispatch, got %d", sliceLen(t, list, "ready_to_dispatch"))
 	}

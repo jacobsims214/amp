@@ -753,10 +753,10 @@ func TestE2E(t *testing.T) {
 		if len(projects) != 1 || num(projects[0].(map[string]any), "id") != pid {
 			t.Fatalf("teammate sees projects %v, want only %d", projects, pid)
 		}
-		if got := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"project_id": pid})); len(got) != 0 {
+		if got := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"format": "full", "project_id": pid})); len(got) != 0 {
 			t.Fatalf("teammate's default view %v, want empty", got)
 		}
-		if got := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"project_id": pid, "owner": "unassigned"})); !slices.Equal(got, []int{pool}) {
+		if got := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"format": "full", "project_id": pid, "owner": "unassigned"})); !slices.Equal(got, []int{pool}) {
 			t.Fatalf("unassigned pool %v, want [%d]", got, pool)
 		}
 		t.Log("project visibility and default 'mine' view ✓")
@@ -772,7 +772,7 @@ func TestE2E(t *testing.T) {
 		}
 		// ...until it's assigned to them.
 		e.mustTool(t, adminTok, "amp_assign_task", map[string]any{"task_id": handoff, "user": email2})
-		mine := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"project_id": pid}))
+		mine := listed(e.mustTool(t, mateTok, "amp_list_tasks", map[string]any{"format": "full", "project_id": pid}))
 		if !slices.Contains(mine, pool) || !slices.Contains(mine, handoff) || slices.Contains(mine, adminOwn) {
 			t.Fatalf("teammate's view after claim + assignment = %v", mine)
 		}
