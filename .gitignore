@@ -1,0 +1,4 @@
+
+# opencode plugin runtime dependencies (installed by scripts/setup-opencode.sh)
+v2/plugins/opencode/node_modules/
+v2/plugins/opencode/package-lock.json

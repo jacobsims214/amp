@@ -2838,10 +2838,26 @@ func arr(desc string) map[string]interface{} {
 }
 
 func tool(name, desc string, schema props) mcpgo.Tool {
-	raw, _ := json.Marshal(map[string]interface{}{
+	obj := map[string]interface{}{
 		"type":       "object",
 		"properties": schema,
-	})
+	}
+	// Parameters documented as "REQUIRED." are required in the schema too:
+	// models calling tools directly go by the schema, not the prose.
+	// ("REQUIRED for …" / "REQUIRED when …" are conditional and stay optional.)
+	var required []string
+	for k, v := range schema {
+		if m, ok := v.(map[string]interface{}); ok {
+			if d, _ := m["description"].(string); strings.HasPrefix(d, "REQUIRED.") {
+				required = append(required, k)
+			}
+		}
+	}
+	if len(required) > 0 {
+		sort.Strings(required)
+		obj["required"] = required
+	}
+	raw, _ := json.Marshal(obj)
 	return mcpgo.NewToolWithRawSchema(name, desc, raw)
 }
 
@@ -2952,7 +2968,8 @@ func (s *Server) projectOf(ctx context.Context, args map[string]interface{}) (in
 		}
 		return e.ProjectID, nil
 	}
-	return 0, fmt.Errorf("project_id is required")
+	// Say what's missing in the caller's terms: most tools take a ticket.
+	return 0, fmt.Errorf("missing which ticket or project this is for: pass task_id (or project_id, story_id or epic_id, as the tool's REQUIRED parameters say)")
 }
 
 func jsonResult(v interface{}) (*mcpgo.CallToolResult, error) {

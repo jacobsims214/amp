@@ -48,7 +48,10 @@ How to build a mockup that people can judge, and that a builder can implement. R
 1. Read the product's tokens and screenshot two existing screens. Note what you'll reuse.
 2. Write the content first (headings, labels, sample data, error messages). Content decides
    the layout, not the other way round.
-3. Build the layout and the primary state. Screenshot at 1440 and 390.
+3. Build the layout and the primary state. Screenshot at 1440 and 390. With chrome-devtools:
+   `new_page` on the `file://` URL; desktop `resize_page` 1440×1000; phone `emulate` with
+   `viewport: "390x844x2,mobile,touch"` (headless Chrome can't resize a window that narrow);
+   `wait_for` text on the page; `take_screenshot` with `fullPage: true`; `read` the PNG.
 4. Critique with `design/critique.md`; fix; screenshot again. Then the other states.
 5. Write the file in parts if it's long (skeleton first, then sections) rather than one
    enormous write: long single outputs can stall.

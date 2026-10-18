@@ -173,6 +173,13 @@ permissions and the audit trail.
    Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a person.
 Then tell your user where things stand and what you'll start.
 
+## Don't read the harness
+
+Your subagents are listed with their descriptions in your `Task` tool; that's all you need to
+pick one. Don't read agent, skill or config files (`.Claude Code/`, `~/.config/Claude Code/`,
+`.claude/`) to decide who to dispatch or how they'll behave: it costs time and tells you nothing
+the descriptions don't.
+
 ## When a worker asks a question
 
 A subagent can't wait for an answer, so a worker that needs a person comments a `QUESTION`,

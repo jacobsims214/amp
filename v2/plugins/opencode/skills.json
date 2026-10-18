@@ -1,0 +1,163 @@
+[
+ {
+  "id": "amp-agent-builder",
+  "name": "amp-agent-builder",
+  "description": "Manager-only skill for creating or updating opencode subagents and skills when the existing roster doesn't fit a new domain. Use when a task needs a specialist that doesn't exist yet, or an existing specialist/skill is underperforming.",
+  "path": "skills/amp-agent-builder/SKILL.md",
+  "contentFile": "skills/amp-agent-builder/SKILL.body.md"
+ },
+ {
+  "id": "amp-day-report",
+  "name": "amp-day-report",
+  "description": "End-of-day wrap-up in AMP \u2014 use when the user says \"wrap up today\", \"end of day\", \"day end report\", \"what did I get done\", or asks for a status update or someone else's daily report, or wants to sync daily work to Jira/Odoo",
+  "path": "skills/amp-day-report/SKILL.md",
+  "contentFile": "skills/amp-day-report/SKILL.body.md"
+ },
+ {
+  "id": "amp-execution",
+  "name": "amp-execution",
+  "description": "Full protocol for executing an AMP task \u2014 reading the ticket, doing the work, logging progress, writing to the KB, and completing",
+  "path": "skills/amp-execution/SKILL.md",
+  "contentFile": "skills/amp-execution/SKILL.body.md"
+ },
+ {
+  "id": "amp-image-gen",
+  "name": "amp-image-gen",
+  "description": "Generate or edit raster images (illustrations, hero art, icons, textures, photo edits) through OpenRouter and save them to files. Use when a ticket needs an image that can't reasonably be drawn as SVG or CSS.",
+  "path": "skills/amp-image-gen/SKILL.md",
+  "contentFile": "skills/amp-image-gen/SKILL.body.md"
+ },
+ {
+  "id": "amp-index",
+  "name": "amp-index",
+  "description": "Skill index for AMP agents \u2014 load this first to understand what skills are available and when to use them",
+  "path": "skills/amp-index/SKILL.md",
+  "contentFile": "skills/amp-index/SKILL.body.md"
+ },
+ {
+  "id": "amp-init",
+  "name": "amp-init",
+  "description": "Initialize a new AMP project \u2014 create the project, scan the codebase, seed the knowledge base with a project overview",
+  "path": "skills/amp-init/SKILL.md",
+  "contentFile": "skills/amp-init/SKILL.body.md"
+ },
+ {
+  "id": "amp-kb",
+  "name": "amp-kb",
+  "description": "How to search the AMP knowledge base before starting work, and how to write documents that embed well for semantic search",
+  "path": "skills/amp-kb/SKILL.md",
+  "contentFile": "skills/amp-kb/SKILL.body.md"
+ },
+ {
+  "id": "amp-kb-curator",
+  "name": "amp-kb-curator",
+  "description": "KB maintenance workflow \u2014 pruning stale docs, merging duplicates, compacting annotations into doc content, and reporting KB health",
+  "path": "skills/amp-kb-curator/SKILL.md",
+  "contentFile": "skills/amp-kb-curator/SKILL.body.md"
+ },
+ {
+  "id": "amp-mcp",
+  "name": "amp-mcp",
+  "description": "Complete reference for all amp MCP tools \u2014 exact names, required arguments, and what each returns",
+  "path": "skills/amp-mcp/SKILL.md",
+  "contentFile": "skills/amp-mcp/SKILL.body.md"
+ },
+ {
+  "id": "amp-planning",
+  "name": "amp-planning",
+  "description": "Full protocol for planning, creating the task hierarchy, getting approval, and dispatching workers \u2014 including the hard approval gate",
+  "path": "skills/amp-planning/SKILL.md",
+  "contentFile": "skills/amp-planning/SKILL.body.md"
+ },
+ {
+  "id": "amp-review",
+  "name": "amp-review",
+  "description": "Reviewer protocol for AMP \u2014 wave checks and full code reviews, the fix-task template, and rules for creating fix tasks instead of failing. Use when your task name contains \"check\", \"review\", or \"Code Review:\".",
+  "path": "skills/amp-review/SKILL.md",
+  "contentFile": "skills/amp-review/SKILL.body.md"
+ },
+ {
+  "id": "aws-sso-auth",
+  "name": "aws-sso-auth",
+  "description": "Use when you need to authenticate with AWS via SSO and run AWS CLI commands against AWS accounts and services (EKS, S3, CloudWatch, IAM, etc.). Covers aws-sso exec authentication flow, credential management, common AWS CLI commands, EKS cluster token, and troubleshooting auth issues.",
+  "path": "skills/aws-sso-auth/SKILL.md",
+  "contentFile": "skills/aws-sso-auth/SKILL.body.md"
+ },
+ {
+  "id": "code-reviewer",
+  "name": "code-reviewer",
+  "description": "Tiered code review framework with Blocker, Significant, Suggestion, and Skip tiers. Use when reviewing Go, TypeScript/React, Dockerfile, or Terraform code changes.",
+  "path": "skills/code-reviewer/SKILL.md",
+  "contentFile": "skills/code-reviewer/SKILL.body.md"
+ },
+ {
+  "id": "docker-engineering",
+  "name": "docker-engineering",
+  "description": "Use when writing Dockerfiles, docker-compose configs, or troubleshooting container builds \u2014 covers multi-stage builds, layer caching, security hardening, health checks, and corporate CA certificate injection.",
+  "path": "skills/docker-engineering/SKILL.md",
+  "contentFile": "skills/docker-engineering/SKILL.body.md"
+ },
+ {
+  "id": "git-workflow",
+  "name": "git-workflow",
+  "description": "Use when making commits, naming branches, or opening pull requests \u2014 covers conventional commit format, branch prefixes, PR hygiene, and force-push safety rules.",
+  "path": "skills/git-workflow/SKILL.md",
+  "contentFile": "skills/git-workflow/SKILL.body.md"
+ },
+ {
+  "id": "github-pr-review",
+  "name": "github-pr-review",
+  "description": "GitHub PR review workflow using gh CLI, jq, delta, git \u2014 fetching PR diffs, checking CI, line-level review comments, approving or requesting changes. Load when dispatched to review a PR.",
+  "path": "skills/github-pr-review/SKILL.md",
+  "contentFile": "skills/github-pr-review/SKILL.body.md"
+ },
+ {
+  "id": "github-research",
+  "name": "github-research",
+  "description": "GitHub research workflow using gh CLI, jq, fzf, delta, bat, git \u2014 searching repos, code, issues, PRs, cross-referencing data, checking CI. Load when dispatched for GitHub research.",
+  "path": "skills/github-research/SKILL.md",
+  "contentFile": "skills/github-research/SKILL.body.md"
+ },
+ {
+  "id": "go-engineer",
+  "name": "go-engineer",
+  "description": "Go 1.22+ patterns for error handling, pgx/v5, HTTP handlers, chi routing, concurrency, and testing. Use when writing or reviewing Go backend code.",
+  "path": "skills/go-engineer/SKILL.md",
+  "contentFile": "skills/go-engineer/SKILL.body.md"
+ },
+ {
+  "id": "kubectl-eks",
+  "name": "kubectl-eks",
+  "description": "Use when you need to interact with Kubernetes clusters (especially EKS) using kubectl \u2014 viewing pods, reading logs, exec into containers, restarting deployments, and troubleshooting. Covers context switching, pod management, log retrieval, exec into containers, rollout restart, EKS-specific commands with aws-sso wrapper, and common debugging patterns.",
+  "path": "skills/kubectl-eks/SKILL.md",
+  "contentFile": "skills/kubectl-eks/SKILL.body.md"
+ },
+ {
+  "id": "react-engineer",
+  "name": "react-engineer",
+  "description": "React 18+TypeScript+Vite patterns for Zustand, TanStack Query, Tailwind, TypeScript, and async UX. Use when writing or reviewing React frontend code.",
+  "path": "skills/react-engineer/SKILL.md",
+  "contentFile": "skills/react-engineer/SKILL.body.md"
+ },
+ {
+  "id": "testing-strategy",
+  "name": "testing-strategy",
+  "description": "Use when writing or reviewing tests in Go or React/TypeScript \u2014 covers table-driven tests, testify assertions, interface mocking, RTL query priority, MSW v2 handlers, and what not to test.",
+  "path": "skills/testing-strategy/SKILL.md",
+  "contentFile": "skills/testing-strategy/SKILL.body.md"
+ },
+ {
+  "id": "tfe-manager",
+  "name": "tfe-manager",
+  "description": "Use when creating, configuring, or investigating Terraform Cloud/Enterprise workspaces \u2014 covers workspace lifecycle, variable sets, run types, run investigation, and VCS integration.",
+  "path": "skills/tfe-manager/SKILL.md",
+  "contentFile": "skills/tfe-manager/SKILL.body.md"
+ },
+ {
+  "id": "ui-ux-pro-max",
+  "name": "ui-ux-pro-max",
+  "description": "UI/UX design intelligence with searchable database",
+  "path": "skills/ui-ux-pro-max/SKILL.md",
+  "contentFile": "skills/ui-ux-pro-max/SKILL.body.md"
+ }
+]

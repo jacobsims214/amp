@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -665,4 +666,40 @@ func TestMCP_DiamondDAGThroughMCP(t *testing.T) {
 		t.Errorf("final: want 0 ready, got %v", finalReady)
 	}
 	t.Logf("diamond DAG complete — all tasks done ✓")
+}
+
+// Parameters documented "REQUIRED." are required in the tool schema, so
+// models calling tools directly (not reading the prose) don't drop them;
+// conditional ones ("REQUIRED for a new artifact") stay optional.
+func TestToolSchemasDeclareRequired(t *testing.T) {
+	s := setupMCP(t)
+	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	b, _ := json.Marshal(s.srv.HandleMessage(s.callCtx(), raw))
+	var resp struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				InputSchema struct {
+					Required []string `json:"required"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(b, &resp); err != nil {
+		t.Fatal(err)
+	}
+	req := map[string][]string{}
+	for _, tl := range resp.Result.Tools {
+		req[tl.Name] = tl.InputSchema.Required
+	}
+	if got := req["amp_add_task_comment"]; len(got) != 2 || got[0] != "body" || got[1] != "task_id" {
+		t.Errorf("amp_add_task_comment required = %v, want [body task_id]", got)
+	}
+	if got := req["amp_publish_artifact"]; len(got) != 0 {
+		t.Errorf("amp_publish_artifact required = %v, want none (title/kind are only for a new artifact)", got)
+	}
+	msg := s.callExpectError(t, "amp_add_task_comment", map[string]any{"body": "x"})
+	if !strings.Contains(msg, "task_id") {
+		t.Errorf("missing task_id error: %q", msg)
+	}
 }

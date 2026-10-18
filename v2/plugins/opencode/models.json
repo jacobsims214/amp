@@ -1,0 +1,164 @@
+{
+ "deepseek/deepseek-v4.1-flash-1017": {
+  "capabilities": {
+   "tools": true,
+   "input": [
+    "text",
+    "image"
+   ],
+   "output": [
+    "text"
+   ]
+  },
+  "variants": [
+   {
+    "id": "off",
+    "body": {
+     "reasoning": {
+      "effort": "none"
+     }
+    }
+   },
+   {
+    "id": "low",
+    "body": {
+     "reasoning": {
+      "effort": "low"
+     }
+    }
+   },
+   {
+    "id": "high",
+    "body": {
+     "reasoning": {
+      "effort": "high"
+     }
+    }
+   },
+   {
+    "id": "max",
+    "body": {
+     "reasoning": {
+      "effort": "max"
+     }
+    }
+   }
+  ]
+ },
+ "z-ai/glm-5.3": {
+  "capabilities": {
+   "tools": true,
+   "input": [
+    "text"
+   ],
+   "output": [
+    "text"
+   ]
+  },
+  "variants": [
+   {
+    "id": "low",
+    "body": {
+     "reasoning": {
+      "effort": "low"
+     }
+    }
+   },
+   {
+    "id": "high",
+    "body": {
+     "reasoning": {
+      "effort": "high"
+     }
+    }
+   },
+   {
+    "id": "max",
+    "body": {
+     "reasoning": {
+      "effort": "max"
+     }
+    }
+   }
+  ]
+ },
+ "xiaomi/mimo-v2.6-pro": {
+  "capabilities": {
+   "tools": true,
+   "input": [
+    "text",
+    "image",
+    "video",
+    "audio"
+   ],
+   "output": [
+    "text"
+   ]
+  },
+  "variants": [
+   {
+    "id": "off",
+    "body": {
+     "reasoning": {
+      "enabled": false
+     }
+    }
+   },
+   {
+    "id": "on",
+    "body": {
+     "reasoning": {
+      "enabled": true
+     }
+    }
+   }
+  ]
+ },
+ "moonshotai/kimi-k3": {
+  "capabilities": {
+   "tools": true,
+   "input": [
+    "text",
+    "image",
+    "video"
+   ],
+   "output": [
+    "text"
+   ]
+  },
+  "variants": [
+   {
+    "id": "off",
+    "body": {
+     "reasoning": {
+      "effort": "none"
+     }
+    }
+   },
+   {
+    "id": "low",
+    "body": {
+     "reasoning": {
+      "effort": "low"
+     }
+    }
+   },
+   {
+    "id": "high",
+    "body": {
+     "reasoning": {
+      "effort": "high"
+     }
+    }
+   },
+   {
+    "id": "max",
+    "body": {
+     "reasoning": {
+      "effort": "max"
+     }
+    }
+   }
+  ]
+ }
+}

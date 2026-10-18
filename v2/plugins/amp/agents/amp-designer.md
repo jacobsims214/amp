@@ -54,7 +54,12 @@ Follow the loop in `design/start-here.md`:
    config), components, and screenshots of two existing pages. Match it unless the ticket says
    to change it.
 3. Build every state (`design/ux-patterns.md`), desktop and phone. Write long files in parts.
-4. Look at it: screenshot at 1440 and 390 px in each state (chrome-devtools can open the file).
+4. Look at it: screenshot at 1440 and 390 px in each state, with chrome-devtools:
+   `new_page` (url `file://…`), then desktop `resize_page` width 1440 height 1000; phone
+   `emulate` with `viewport: "390x844x2,mobile,touch"` (headless Chrome won't `resize_page`
+   below ~500 px; `emulate` with `viewport` omitted clears it); `wait_for` some text on the
+   page; `take_screenshot` with `fullPage: true`; `Read` the PNG to see it. Switch mockup states
+   with `evaluate_script` clicking the state buttons. Never an open-ended `await`.
    Critique it with `design/critique.md`, fix, and repeat at least twice. Post the critique
    findings you fixed in a progress comment.
 5. Publish it for review (below). People never have to run anything to see your work.

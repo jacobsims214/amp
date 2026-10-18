@@ -53,6 +53,22 @@ data:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
+                            # RFC 9728 protected-resource metadata at the well-known paths clients
+                            # probe (with and without the resource path): served by the broker.
+                            - match: { path: "/.well-known/oauth-protected-resource/mcp" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/.well-known/oauth-protected-resource"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/.well-known/oauth-protected-resource" }
+                              route: { cluster: mcp_oauth }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
                             # RFC 8414-strict discovery path fallback (well-known inserted before the AS path).
                             - match: { path: "/.well-known/oauth-authorization-server/mcp-oauth" }
                               route:
@@ -233,6 +249,22 @@ data:
                                   disabled: true
                             - match: { prefix: "/oauth2" }
                               route: { cluster: oauth2_proxy }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # RFC 9728 protected-resource metadata at the well-known paths clients
+                            # probe (with and without the resource path): served by the broker.
+                            - match: { path: "/.well-known/oauth-protected-resource/mcp" }
+                              route:
+                                cluster: mcp_oauth
+                                prefix_rewrite: "/.well-known/oauth-protected-resource"
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/.well-known/oauth-protected-resource" }
+                              route: { cluster: mcp_oauth }
                               typed_per_filter_config:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute

@@ -129,6 +129,16 @@ Changed: [file — what changed]
 
 ---
 
+### Never wait on something that can't finish
+
+Nobody is watching a subagent's tool calls: a call that never returns stalls the ticket until a
+person notices. Every wait must be bounded. In code (Claude Code's `execute`, scripts, tests),
+never `await` a promise that might not resolve (`await new Promise(r => {})` hangs forever);
+wait for a condition with a limit instead (chrome-devtools `wait_for`, or
+`await new Promise(r => setTimeout(r, 1000))`), and give long commands a timeout (`timeout 300
+<cmd>`). If something takes more than a few minutes, stop it, comment what happened, and try a
+different way.
+
 ## Step 4 — Write to the KB
 
 After completing substantive work, write at least one KB doc if you:

@@ -399,3 +399,26 @@ func TestMetadata(t *testing.T) {
 		t.Fatalf("PRM: %v", prm)
 	}
 }
+
+// RFC 8414 §3.3: strict MCP clients (opencode 2, newer SDKs) reject
+// metadata whose issuer isn't the authorization server they discovered.
+// The protected resource names this broker, so the issuer must be the broker.
+func TestMetadataIssuerIsTheBroker(t *testing.T) {
+	s, ts := testServer(newFakeDex())
+	defer ts.Close()
+	var as, pr map[string]any
+	for path, out := range map[string]*map[string]any{"/.well-known/oauth-authorization-server": &as, "/.well-known/oauth-protected-resource": &pr} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewDecoder(resp.Body).Decode(out)
+		resp.Body.Close()
+	}
+	if as["issuer"] != s.selfURL {
+		t.Fatalf("issuer = %v, want %s", as["issuer"], s.selfURL)
+	}
+	if servers, _ := pr["authorization_servers"].([]any); len(servers) != 1 || servers[0] != as["issuer"] {
+		t.Fatalf("protected resource names %v, metadata issuer is %v", pr["authorization_servers"], as["issuer"])
+	}
+}
