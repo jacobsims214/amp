@@ -5,7 +5,7 @@ hidden: true
 model: openrouter/moonshotai/kimi-k3
 variant: high
 temperature: 0.4
-steps: 60
+steps: 1000
 permission:
   edit: allow
   bash: allow

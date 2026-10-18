@@ -4,7 +4,7 @@ description: Frontend specialist — React, TypeScript, Tailwind, frontend tests
 model: inherit
 color: magenta
 disallowedTools: ["TodoWrite"]
-maxTurns: 60
+maxTurns: 1000
 skills: ["amp-execution"]
 ---
 

@@ -112,6 +112,13 @@ func (s *Service) PublishArtifact(ctx context.Context, p authz.Principal, req Pu
 		if err != nil {
 			return nil, err
 		}
+		// A design system phase has one artifact; further rounds are versions
+		// of it, so the approval the publish step checks is unambiguous.
+		if phase, _ := t.Metadata["design_system_phase"].(string); phase != "" && existing == nil {
+			if arts, err := s.Repo.ListArtifacts(ctx, t.ProjectID, req.TaskID); err == nil && len(arts) > 0 {
+				return nil, authz.BadRequest("ticket %d (design system phase %q) already has artifact #%d: publish a new version of it with artifact_id=%d", t.ID, phase, arts[0].ID, arts[0].ID)
+			}
+		}
 		if req.ProjectID != 0 && req.ProjectID != t.ProjectID {
 			return nil, authz.BadRequest("ticket %d is in project %d, not %d", t.ID, t.ProjectID, req.ProjectID)
 		}

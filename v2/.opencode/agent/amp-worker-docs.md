@@ -5,7 +5,7 @@ hidden: true
 model: openrouter/deepseek/deepseek-v4.1-flash-1017
 variant: high
 temperature: 0.1
-steps: 25
+steps: 1000
 permission:
   edit: allow
   bash: allow

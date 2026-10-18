@@ -4,7 +4,7 @@ description: Design specialist — UI/UX design, visual polish, mockups and prot
 model: inherit
 color: magenta
 disallowedTools: ["TodoWrite"]
-maxTurns: 60
+maxTurns: 1000
 skills: ["amp-execution"]
 ---
 

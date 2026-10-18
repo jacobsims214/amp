@@ -112,6 +112,11 @@ func (s *Server) publishArtifact(ctx context.Context, args map[string]interface{
 	}
 	s.hub.Publish(domain.Event{Type: domain.EventArtifactUpdated, ProjectID: a.ProjectID, Payload: a, At: a.UpdatedAt})
 	next := "Published. To get it reviewed, block the ticket with amp_block_task, asking the person to review it"
+	if req.ArtifactID == 0 && a.TaskID != nil {
+		if others, err := s.repo.ListArtifacts(ctx, a.ProjectID, a.TaskID); err == nil && len(others) > 1 {
+			next = fmt.Sprintf("Published as a NEW artifact, but ticket %d already had %d other(s): if this revises one of them, publish it as a new version of that one (artifact_id) next time. ", *a.TaskID, len(others)-1) + next
+		}
+	}
 	if a.URL != "" {
 		next += " at " + a.URL
 	}

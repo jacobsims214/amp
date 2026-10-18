@@ -4,7 +4,7 @@ description: Media specialist — analyzes images, screenshots, scanned document
 model: inherit
 color: cyan
 disallowedTools: ["TodoWrite"]
-maxTurns: 40
+maxTurns: 1000
 skills: ["amp-execution"]
 ---
 

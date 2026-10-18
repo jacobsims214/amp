@@ -4,7 +4,7 @@ mode: primary
 model: openrouter/xiaomi/mimo-v2.6-pro
 variant: on
 temperature: 0.2
-steps: 60
+steps: 1000
 permission:
   edit:
     ".opencode/**": allow

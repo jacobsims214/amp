@@ -79,10 +79,16 @@ func TestDesignSystem_Process(t *testing.T) {
 	for _, ph := range []string{"audit", "direction", "tokens", "components"} {
 		arts = append(arts, approve(admin, "orgadmin", tickets[ph], ph))
 	}
+	// A phase has one artifact: another round is a new version of it.
+	wantErr(t, admin.callExpectError(t, "amp_publish_artifact", map[string]any{"task_id": float64(tickets["audit"]), "title": "audit again",
+		"kind": "markdown", "content": "# again"}), "new version")
 	// Patterns has an artifact, but it isn't approved: still refused, and it says which.
-	admin.call(t, "amp_publish_artifact", map[string]any{"task_id": float64(tickets["patterns"]), "title": "patterns", "kind": "markdown", "content": "# p"})
+	pa := admin.call(t, "amp_publish_artifact", map[string]any{"task_id": float64(tickets["patterns"]), "title": "patterns", "kind": "markdown", "content": "# p"})
+	paID := intField(t, pa["artifact"].(map[string]any), "id")
 	wantErr(t, admin.callExpectError(t, "amp_design_system_publish", map[string]any{"project_id": float64(dsProject), "docs": docs, "changelog": "v1"}), "patterns")
-	arts = append(arts, approve(admin, "orgadmin", tickets["patterns"], "patterns v2"))
+	admin.call(t, "amp_publish_artifact", map[string]any{"artifact_id": float64(paID), "content": "# p v2", "note": "second round"})
+	ra.want(t, 200, "orgadmin", http.MethodPost, fmt.Sprintf("/api/artifacts/%d/review", paID), map[string]any{"approve": true})
+	arts = append(arts, paID)
 
 	// Docs are checked; then it publishes.
 	wantErr(t, admin.callExpectError(t, "amp_design_system_publish", map[string]any{"project_id": float64(dsProject),

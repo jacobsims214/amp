@@ -5,7 +5,7 @@ hidden: true
 model: openrouter/z-ai/glm-5.3
 variant: max
 temperature: 0.2
-steps: 45
+steps: 1000
 permission:
   edit: deny
   bash: allow

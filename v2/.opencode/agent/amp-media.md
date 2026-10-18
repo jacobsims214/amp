@@ -5,7 +5,7 @@ hidden: true
 model: openrouter/xiaomi/mimo-v2.6-pro
 variant: on
 temperature: 0.3
-steps: 40
+steps: 1000
 permission:
   edit: allow
   bash: allow

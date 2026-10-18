@@ -4,7 +4,7 @@ description: Docs/ops specialist — git commits/PRs, KB writes, markdown docs, 
 model: inherit
 color: green
 disallowedTools: ["TodoWrite"]
-maxTurns: 25
+maxTurns: 1000
 skills: ["amp-execution"]
 ---
 
