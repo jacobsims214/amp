@@ -142,7 +142,7 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 	}
 	replyCh := make(chan actor.ReplyCreateTask, 1)
 	s.Registry.System().Root.Send(pid, &actor.MsgCreateTask{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, nil, reply.Err
 	}
@@ -180,7 +180,7 @@ func (s *Service) SetTaskDependencies(ctx context.Context, p authz.Principal, ta
 	}
 	replyCh := make(chan actor.ReplyGetTask, 1)
 	s.Registry.System().Root.Send(pid, &actor.MsgSetTaskDeps{TaskID: taskID, DependencyIDs: deps, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, nil, reply.Err
 	}
@@ -239,7 +239,7 @@ func (s *Service) MoveTask(ctx context.Context, p authz.Principal, taskID, story
 	}
 	replyCh := make(chan actor.ReplyGetTask, 1)
 	s.Registry.System().Root.Send(pid, &actor.MsgMoveTask{TaskID: taskID, FromEpicID: t.EpicID, ToEpicID: story.EpicID, ToStoryID: story.ID, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	return reply.Task, reply.Err
 }
 
@@ -262,7 +262,7 @@ func (s *Service) MoveStory(ctx context.Context, p authz.Principal, storyID, epi
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
 	s.Registry.System().Root.Send(pid, &actor.MsgMoveStory{StoryID: storyID, FromEpicID: story.EpicID, ToEpicID: epicID, ReplyCh: replyCh})
-	if reply := <-replyCh; reply.Err != nil {
+	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, reply.Err
 	}
 	return s.Repo.GetStory(ctx, storyID)
@@ -287,7 +287,7 @@ func (s *Service) ReconcileDependents(ctx context.Context, projectID int, depend
 		}
 		replyCh := make(chan actor.ReplySimple, 1)
 		s.Registry.System().Root.Send(pid, &actor.MsgReconcileDeps{TaskID: id, ReplyCh: replyCh})
-		<-replyCh
+		actor.Await(ctx, replyCh)
 	}
 }
 
@@ -342,7 +342,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	}
 	listCh := make(chan actor.ReplyListTasks, 1)
 	s.Registry.System().Root.Send(pid, &actor.MsgListTasks{ProjectID: projectID, ReplyCh: listCh})
-	listed := <-listCh
+	listed := actor.Await(ctx, listCh)
 	if listed.Err != nil {
 		return nil, listed.Err
 	}
@@ -855,7 +855,7 @@ func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectI
 		m.ReplyCh = replyCh
 	}
 	s.Registry.System().Root.Send(pid, msg)
-	<-replyCh
+	actor.Await(ctx, replyCh)
 	s.ReconcileDependents(ctx, projectID, dependents, ids)
 	var kept []int
 	gone := map[int]bool{}
@@ -897,7 +897,7 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 		}, ReplyCh: added}); err != nil {
 			return nil, err
 		}
-		if r := <-added; r.Err != nil {
+		if r := actor.Await(ctx, added); r.Err != nil {
 			return nil, r.Err
 		}
 	}
@@ -905,7 +905,7 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: "", By: p.UserRef(), ReplyCh: set}); err != nil {
 		return nil, err
 	}
-	if r := <-set; r.Err != nil {
+	if r := actor.Await(ctx, set); r.Err != nil {
 		return nil, r.Err
 	}
 	// Back to waiting if a dependency is unfinished.
@@ -913,14 +913,14 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgReconcileDeps{TaskID: taskID, ReplyCh: rec}); err != nil {
 		return nil, err
 	}
-	if r := <-rec; r.Err != nil {
+	if r := actor.Await(ctx, rec); r.Err != nil {
 		return nil, r.Err
 	}
 	got := make(chan actor.ReplyGetTask, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgGetTask{TaskID: taskID, ReplyCh: got}); err != nil {
 		return nil, err
 	}
-	r := <-got
+	r := actor.Await(ctx, got)
 	return r.Task, r.Err
 }
 

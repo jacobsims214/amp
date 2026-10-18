@@ -47,6 +47,7 @@ func newMCPServer(h *mcp.Server) *mcpserver.MCPServer {
 	srv := mcpserver.NewMCPServer("amp-api", "2.0.0",
 		mcpserver.WithToolCapabilities(false),
 		mcpserver.WithInstructions(mcp.Instructions),
+		mcpserver.WithToolHandlerMiddleware(mcp.Middleware()),
 		mcpserver.WithMethodCacheHints(mcpgo.MethodToolsList, toolsListCacheTTLMs, mcpgo.CacheScopePublic),
 	)
 	h.Register(srv)

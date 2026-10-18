@@ -317,7 +317,7 @@ func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Tas
 		ByName:      p.Email,
 		ReplyCh:     replyCh,
 	})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
 	}
@@ -347,7 +347,7 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 		By: p.UserRef(), Override: lvl >= authz.OrgAdmin,
 		ReplyCh: replyCh,
 	})
-	if reply := <-replyCh; reply.Err != nil {
+	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, reply.Err
 	}
 	return t, nil

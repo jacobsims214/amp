@@ -164,7 +164,9 @@ func (s *Service) comment(projectID, taskID int, p authz.Principal, body string)
 	if err := s.Registry.Send(projectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
 		TaskID: taskID, Author: p.Email, Body: body, AuthorUserID: p.UserRef(),
 	}, ReplyCh: reply}); err == nil {
-		<-reply
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		actor.Await(ctx, reply)
 	}
 }
 

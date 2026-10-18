@@ -69,7 +69,7 @@ func (s *Service) RestoreTasks(ctx context.Context, p authz.Principal, projectID
 		}
 		replyCh := make(chan actor.ReplyGetTask, 1)
 		s.Registry.System().Root.Send(pid, &actor.MsgRestoreTask{TaskID: id, EpicID: r.EpicID, StoryID: r.StoryID, ReplyCh: replyCh})
-		if reply := <-replyCh; reply.Err != nil {
+		if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 			out = append(out, RestoreResult{TaskID: id, Restored: true, Error: "restored, but not loaded: " + reply.Err.Error()})
 			continue
 		}
@@ -109,7 +109,7 @@ func (s *Service) RestoreTasks(ctx context.Context, p authz.Principal, projectID
 		}
 		replyCh := make(chan actor.ReplyGetTask, 1)
 		s.Registry.System().Root.Send(pid, &actor.MsgSetTaskDeps{TaskID: dep, DependencyIDs: next, ReplyCh: replyCh})
-		<-replyCh
+		actor.Await(ctx, replyCh)
 	}
 	if len(restored) > 0 {
 		s.audit(ctx, p, domain.AuditEntry{Action: "task.restore", ProjectID: intRef(projectID), TargetType: "task",
@@ -186,7 +186,7 @@ func (s *Service) RestoreGroups(ctx context.Context, p authz.Principal, projectI
 		} else {
 			s.Registry.System().Root.Send(pid, &actor.MsgRestoreStory{EpicID: g.EpicID, StoryID: id, ReplyCh: replyCh})
 		}
-		if reply := <-replyCh; reply.Err != nil {
+		if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 			res.Restored, res.Error = true, "restored, but not loaded: "+reply.Err.Error()
 			return
 		}

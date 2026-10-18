@@ -112,7 +112,7 @@ func setupMCP(t *testing.T) *mcpStack {
 	}
 
 	// Wire the MCP server — enable tool capabilities (same as production).
-	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false))
+	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false), mcpserver.WithToolHandlerMiddleware(mcp.Middleware()))
 	kbSvc := testKB()
 	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
 	mcpHandler.Register(srv)

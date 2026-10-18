@@ -229,7 +229,7 @@ func (s *Service) openDesignSystemVersion(ctx context.Context, p authz.Principal
 		Name: fmt.Sprintf("%s v%d", label, res.Version), Description: desc, Priority: "1", CreatedBy: p.UserRef(), Metadata: meta}, ReplyCh: epicReply}); err != nil {
 		return nil, err
 	}
-	er := <-epicReply
+	er := actor.Await(ctx, epicReply)
 	if er.Err != nil {
 		return nil, er.Err
 	}
@@ -242,7 +242,7 @@ func (s *Service) openDesignSystemVersion(ctx context.Context, p authz.Principal
 				Name: ph.Story, Priority: "1", CreatedBy: p.UserRef()}, ReplyCh: sr}); err != nil {
 				return nil, err
 			}
-			r := <-sr
+			r := actor.Await(ctx, sr)
 			if r.Err != nil {
 				return nil, r.Err
 			}

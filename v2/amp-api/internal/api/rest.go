@@ -769,7 +769,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		}
 		replyCh := make(chan actor.ReplySimple, 1)
 		h.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
-		<-replyCh
+		actor.Await(r.Context(), replyCh)
 		h.svc.Record(r.Context(), pr, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 		jsonOK(w, map[string]interface{}{"project_id": projectID, "reset": true})
 		return
@@ -920,7 +920,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			}
 			replyCh := make(chan actor.ReplyCreateEpic, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgCreateEpic{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -946,7 +946,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.registry.System().Root.Send(pid, &actor.MsgListTasks{ProjectID: projectID, State: state, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1106,7 +1106,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			}
 			replyCh := make(chan actor.ReplyCreateStory, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgCreateStory{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1229,7 +1229,9 @@ func (h *RestHandler) sendUpdate(projectID int, msg interface{}) error {
 		reply = m.ReplyCh
 	}
 	h.registry.System().Root.Send(pid, msg)
-	return (<-reply).Err
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return actor.Await(ctx, reply).Err
 }
 
 // ---- /api/tasks/:id  and sub-routes ----
@@ -1270,7 +1272,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			replyCh := make(chan actor.ReplyGetTask, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgGetTask{TaskID: taskID, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 404)
 				return
@@ -1290,7 +1292,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			req.TaskID = taskID
 			replyCh := make(chan actor.ReplySimple, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 400)
 				return
@@ -1386,7 +1388,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		replyCh := make(chan actor.ReplySimple, 1)
 		h.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: pr.UserRef(), ReplyCh: replyCh})
-		reply := <-replyCh
+		reply := actor.Await(r.Context(), replyCh)
 		if reply.Err != nil {
 			jsonErr(w, reply.Err, 400)
 			return
@@ -1416,7 +1418,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			replyCh := make(chan actor.ReplyGetComments, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgGetComments{TaskID: taskID, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1440,7 +1442,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			}
 			replyCh := make(chan actor.ReplyAddComment, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgAddComment{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1525,7 +1527,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			StartAt: body.StartAt,
 			ReplyCh: replyCh,
 		})
-		reply := <-replyCh
+		reply := actor.Await(r.Context(), replyCh)
 		if reply.Err != nil {
 			jsonErr(w, reply.Err, 400)
 			return

@@ -998,7 +998,7 @@ func (s *Server) createEpic(rctx context.Context, args map[string]interface{}) (
 	}
 	replyCh := make(chan actor.ReplyCreateEpic, 1)
 	s.registry.System().Root.Send(pid, &actor.MsgCreateEpic{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1081,7 +1081,7 @@ func (s *Server) createStory(rctx context.Context, args map[string]interface{}) 
 	}
 	replyCh := make(chan actor.ReplyCreateStory, 1)
 	s.registry.System().Root.Send(pid, &actor.MsgCreateStory{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1359,7 +1359,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgListTasks{ProjectID: projectID, State: state, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1432,7 +1432,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	})
 }
 
-func (s *Server) getTask(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) getTask(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
 		return nil, err
@@ -1450,7 +1450,7 @@ func (s *Server) getTask(_ context.Context, args map[string]interface{}) (*mcpgo
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgGetTask{TaskID: taskID, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1498,7 +1498,7 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1536,7 +1536,7 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgUpdateEpic{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1582,7 +1582,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgUpdateStory{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1639,7 +1639,7 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1680,7 +1680,7 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgBlockTask{TaskID: taskID, Reason: reason, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1748,14 +1748,14 @@ func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgAddComment{Req: req, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "comment_added": true})
 }
 
-func (s *Server) getComments(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) getComments(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
 		return nil, err
@@ -1770,7 +1770,7 @@ func (s *Server) getComments(_ context.Context, args map[string]interface{}) (*m
 		return nil, err
 	}
 	s.registry.System().Root.Send(pid, &actor.MsgGetComments{TaskID: taskID, ReplyCh: replyCh})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1831,7 +1831,7 @@ func (s *Server) resetProject(rctx context.Context, args map[string]interface{})
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
 	s.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
-	<-replyCh
+	actor.Await(rctx, replyCh)
 	s.svc.Record(rctx, caller(rctx).p, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 	return jsonResult(map[string]interface{}{
 		"project_id": projectID,
@@ -1925,7 +1925,7 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 		By:      caller(rctx).p.UserRef(),
 		ReplyCh: replyCh,
 	})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
@@ -1978,7 +1978,7 @@ func (s *Server) setTaskStartAt(rctx context.Context, args map[string]interface{
 		StartAt: startAt,
 		ReplyCh: replyCh,
 	})
-	reply := <-replyCh
+	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
