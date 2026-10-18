@@ -181,6 +181,7 @@ func (s *Server) getArtifact(ctx context.Context, args map[string]interface{}) (
 	if err != nil {
 		return nil, err
 	}
+	s.svc.RecordArtifactView(ctx, caller(ctx).p, a, v.Version, "mcp")
 	out["version"] = v.Version
 	ct := strings.SplitN(v.ContentType, ";", 2)[0]
 	switch {

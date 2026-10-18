@@ -318,6 +318,7 @@ func main() {
 
 	// Auth wraps everything except /health.
 	var apiHandler http.Handler = mux
+	apiHandler = api.RejectCrossSiteWrites(apiHandler)
 	apiHandler = authExceptHealth(restVerifier, apiHandler)
 	apiHandler = corsMiddleware.Handler(apiHandler)
 

@@ -127,6 +127,11 @@ func (s *Service) PublishArtifact(ctx context.Context, p authz.Principal, req Pu
 		return nil, err
 	}
 
+	if existing != nil {
+		if n, err := s.Repo.CountArtifactVersions(ctx, existing.ID); err == nil && n >= domain.MaxArtifactVersions {
+			return nil, authz.BadRequest("artifact %d has %d versions, the most one artifact keeps; publish a new artifact", existing.ID, n)
+		}
+	}
 	var a *domain.Artifact
 	if existing != nil {
 		a, err = s.Repo.AddArtifactVersion(ctx, existing.ID, req.Title, req.Content, contentType, req.Note, p.UserRef(), s.artifactExpiry())
@@ -342,6 +347,8 @@ func (s *Service) PurgeExpiredArtifacts(ctx context.Context) (int, error) {
 	amp := authz.Principal{Email: "AMP"}
 	for _, g := range gone {
 		slog.Info("artifact expired", "artifact_id", g.ID, "project_id", g.ProjectID, "title", g.Title)
+		s.audit(ctx, amp, domain.AuditEntry{Action: "artifact.expire", ProjectID: intRef(g.ProjectID), TargetType: "artifact",
+			TargetID: idStr(g.ID), Summary: fmt.Sprintf("deleted %q: it expired and nobody kept it", g.Title)})
 		if g.TaskID != nil {
 			s.comment(g.ProjectID, *g.TaskID, amp, fmt.Sprintf("Artifact #%d %q expired and was deleted: nobody chose to keep it.", g.ID, g.Title))
 		}
@@ -365,4 +372,53 @@ func (s *Service) RunArtifactPurge(ctx context.Context, interval time.Duration) 
 		case <-t.C:
 		}
 	}
+}
+
+// ---- Views and activity ----
+
+// artifactViewWindow de-duplicates views: one entry per person, artifact and
+// version in this window, however often they reload.
+const artifactViewWindow = 30 * time.Minute
+
+// RecordArtifactView audits that p looked at an artifact version (via is
+// "viewer", "open" or "mcp"). Failures are logged, never the caller's problem.
+func (s *Service) RecordArtifactView(ctx context.Context, p authz.Principal, a *domain.Artifact, version int, via string) {
+	if version == 0 {
+		version = a.CurrentVersion
+	}
+	target := fmt.Sprintf("%d", a.ID)
+	seen, err := s.Repo.RecentAudit(ctx, "artifact.view", "artifact", target, p.UserRef(), p.Email, time.Now().Add(-artifactViewWindow))
+	if err != nil {
+		slog.Warn("artifact view audit", "err", err)
+		return
+	}
+	if seen {
+		return
+	}
+	s.audit(ctx, p, domain.AuditEntry{Action: "artifact.view", ProjectID: intRef(a.ProjectID), TargetType: "artifact", TargetID: target,
+		Summary: fmt.Sprintf("viewed %q v%d", a.Title, version), Details: map[string]any{"version": version, "via": via}})
+}
+
+// ArtifactActivity is the audit trail of one artifact (published, reviewed,
+// kept, viewed, expired). Its creator, its ticket's owner, and project leads
+// and above may read it; other members can see the artifact, not who looked.
+func (s *Service) ArtifactActivity(ctx context.Context, p authz.Principal, id int) ([]domain.AuditEntry, error) {
+	a, _, err := s.GetArtifact(ctx, p, id)
+	if err != nil {
+		return nil, err
+	}
+	lvl, err := s.Authz.ProjectLevel(ctx, p, a.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	allowed := lvl >= authz.Lead || (a.CreatedBy != nil && p.UserID != 0 && *a.CreatedBy == p.UserID)
+	if !allowed && a.TaskID != nil {
+		if t, err := s.Repo.GetTask(ctx, *a.TaskID); err == nil && t.OwnerUserID != nil && *t.OwnerUserID == p.UserID && p.UserID != 0 {
+			allowed = true
+		}
+	}
+	if !allowed {
+		return nil, authz.Forbidden("only the artifact's creator, its ticket's owner, and project leads and owners can see its activity")
+	}
+	return s.Repo.TargetAudit(ctx, "artifact", fmt.Sprintf("%d", id), 200)
 }

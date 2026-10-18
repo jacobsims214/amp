@@ -23,6 +23,9 @@ const (
 // MaxArtifactBytes caps one version's content.
 const MaxArtifactBytes = 10 << 20
 
+// MaxArtifactVersions caps how many versions one artifact keeps.
+const MaxArtifactVersions = 100
+
 // DefaultArtifactRetentionDays is how long an artifact lives after its last
 // version unless someone keeps it.
 const DefaultArtifactRetentionDays = 45

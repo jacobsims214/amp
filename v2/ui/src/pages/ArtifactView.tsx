@@ -7,7 +7,7 @@ import { PageHeader } from '../components/ui/PageHeader'
 import { Markdown } from '../components/ui/Markdown'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
 import { KIND_LABEL, expiresIn } from '../lib/artifacts'
-import type { Artifact, ArtifactVersion, Comment, Task } from '../types'
+import type { Artifact, ArtifactVersion, AuditEntry, Comment, Task } from '../types'
 
 const VIEWPORTS = [
   { id: 'desktop', label: 'Desktop', width: '100%', Icon: Monitor },
@@ -101,9 +101,44 @@ export function ArtifactView() {
               <span>{selected.created_by_email || 'Someone'} · {when(selected.created_at)} · {size(selected.size_bytes)} · {KIND_LABEL[artifact.kind]}</span>
             </div>
           )}
+          <ActivityPanel artifactId={artifact.id} updatedAt={artifact.updated_at} />
           {artifact.task_id != null && <TicketThread projectId={artifact.project_id} taskId={artifact.task_id} />}
         </aside>
       </div>
+    </div>
+  )
+}
+
+const ACTIVITY_LABEL: Record<string, string> = {
+  'artifact.publish': 'published', 'artifact.view': 'viewed', 'artifact.approve': 'approved',
+  'artifact.request_changes': 'requested changes', 'artifact.keep': 'kept it', 'artifact.unkeep': 'stopped keeping it',
+}
+
+/** The audit trail: who published, reviewed, kept and viewed it, and when.
+ *  Only its creator, its ticket's owner and project leads see this; for
+ *  everyone else the panel isn't shown. */
+function ActivityPanel({ artifactId, updatedAt }: { artifactId: number; updatedAt: string }) {
+  const [entries, setEntries] = useState<AuditEntry[] | null>(null)
+  useEffect(() => {
+    api.artifactActivity(artifactId).then(setEntries).catch(() => setEntries(null))
+  }, [artifactId, updatedAt])
+  if (!entries) return null
+  return (
+    <div className="px-5 py-4 border-t border-line grid gap-2">
+      <span className="amp-label">Activity</span>
+      <ol className="m-0 p-0 list-none grid gap-1.5 text-[12px] text-ink-2">
+        {entries.slice(0, 15).map(e => {
+          const d = e.details as { version?: number; via?: string } | undefined
+          return (
+            <li key={e.id}>
+              <span className="text-ink">{e.actor_email || 'AMP'}</span> {ACTIVITY_LABEL[e.action] ?? e.action.replace('artifact.', '')}
+              {d?.version ? <> v{d.version}</> : null}
+              {e.action === 'artifact.view' && d?.via === 'mcp' ? <> (agent)</> : null}
+              <span className="text-ink-3"> · {when(e.at)}</span>
+            </li>
+          )
+        })}
+      </ol>
     </div>
   )
 }

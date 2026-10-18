@@ -308,3 +308,16 @@ func TestArtifacts_Retention(t *testing.T) {
 		t.Fatalf("unkept: %v", un)
 	}
 }
+
+func newSvc(w *rbacWorld) *service.Service { return service.New(w.s.repo, w.s.reg, w.s.kb) }
+
+func expireNow(t *testing.T, w *rbacWorld, id int) error {
+	t.Helper()
+	db, err := pgx.Connect(context.Background(), os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		return err
+	}
+	defer db.Close(context.Background())
+	_, err = db.Exec(context.Background(), `UPDATE artifacts SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1`, id)
+	return err
+}

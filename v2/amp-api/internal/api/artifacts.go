@@ -30,7 +30,7 @@ func (h *RestHandler) RunArtifactPurge(ctx context.Context, interval time.Durati
 // sandbox (without allow-same-origin) gives the document an opaque origin:
 // its scripts run, but it can't read AMP's cookies or storage, or call AMP's
 // API as the viewer — opened in the viewer's iframe or on its own.
-const artifactSandbox = "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads"
+const artifactSandbox = "sandbox allow-scripts allow-forms allow-popups allow-modals"
 
 // publishArtifactBody is a publish over REST: text in content, or binary in
 // content_base64.
@@ -93,6 +93,7 @@ func (h *RestHandler) projectArtifacts(w http.ResponseWriter, r *http.Request, p
 //
 //	GET  :id                 the artifact and its versions
 //	GET  :id/content         the content (?version=N, default the latest), sandboxed
+//	GET  :id/activity        who published, reviewed, kept and viewed it (creator, ticket owner, leads)
 //	POST :id/versions        publish a new version {content | content_base64, note, title}
 //	POST :id/review          a person's verdict {approve: bool, note, version}
 //	POST :id/keep            {keep: bool}: keep it (never expires), or let it expire again
@@ -141,7 +142,17 @@ func (h *RestHandler) artifactSub(w http.ResponseWriter, r *http.Request) {
 			fail(w, err, 404)
 			return
 		}
+		// Opening the artifact page is a view (the viewer then loads the content).
+		h.svc.RecordArtifactView(r.Context(), p, a, 0, "viewer")
 		jsonOK(w, map[string]interface{}{"artifact": a, "versions": versions})
+
+	case sub == "activity" && r.Method == http.MethodGet:
+		entries, err := h.svc.ArtifactActivity(r.Context(), p, id)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"activity": entries})
 
 	case sub == "content" && r.Method == http.MethodGet:
 		version, _ := strconv.Atoi(r.URL.Query().Get("version"))
@@ -149,6 +160,10 @@ func (h *RestHandler) artifactSub(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			fail(w, err, 404)
 			return
+		}
+		// Opened on its own (a top-level page, not the viewer's frame or a thumbnail).
+		if r.Header.Get("Sec-Fetch-Dest") == "document" {
+			h.svc.RecordArtifactView(r.Context(), p, a, v.Version, "open")
 		}
 		writeArtifactContent(w, a, v, version > 0)
 
@@ -268,4 +283,24 @@ func artifactFilename(a *domain.Artifact, v *domain.ArtifactVersion) string {
 
 func (h *RestHandler) publishArtifactEvent(a *domain.Artifact) {
 	h.hub.Publish(domain.Event{Type: domain.EventArtifactUpdated, ProjectID: a.ProjectID, Payload: a, At: time.Now()})
+}
+
+// RejectCrossSiteWrites refuses state-changing requests a browser marks as
+// cross-site, or that come from an opaque origin (Origin: null), which is
+// what a sandboxed artifact's scripts and forms send. The session cookie is
+// SameSite=Lax, which already keeps it off those requests; this holds even if
+// that setting or a browser's default changes. API clients without a browser
+// (agents, CLIs) send neither header and are unaffected.
+func RejectCrossSiteWrites(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet, http.MethodHead, http.MethodOptions:
+		default:
+			if r.Header.Get("Origin") == "null" || r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				jsonErr(w, errorf("cross-site requests can't change anything in AMP"), http.StatusForbidden)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
