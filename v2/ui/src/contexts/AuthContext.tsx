@@ -1,5 +1,4 @@
 import { type ReactNode, useEffect, useState } from 'react'
-import { api } from '../api/client'
 import type { Me } from '../types'
 import { AuthContext } from './auth-context'
 
@@ -14,8 +13,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    api.me()
-      .then(setMe)
+    // Behind Envoy, "/" and the app's files are public (so signed-out
+    // visitors can reach the home page); the API isn't. A signed-out request
+    // to it is redirected to sign-in, which we see as an opaque redirect.
+    fetch('/api/me', { redirect: 'manual', headers: { Accept: 'application/json' } })
+      .then(async res => {
+        if (res.type === 'opaqueredirect' || res.status === 401) {
+          const here = window.location.pathname + window.location.search
+          window.location.replace(here === '/' ? '/home/' : `/oauth2/start?rd=${encodeURIComponent(here)}`)
+          return
+        }
+        if (!res.ok) throw new Error(`Failed to load identity (${res.status})`)
+        setMe(await res.json())
+      })
       .catch(e => setError(e instanceof Error ? e.message : 'Failed to load identity'))
       .finally(() => setLoading(false))
   }, [])

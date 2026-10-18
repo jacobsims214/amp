@@ -99,6 +99,39 @@ data:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
+                            # ---- Public: the home page, and what the app needs to load and check
+                            # its session. Signed out at "/", the app sends you to /home/; every
+                            # other path still goes through oauth2-proxy to sign in.
+                            - match: { path: "/home" }
+                              redirect: { path_redirect: "/home/" }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/home/" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/assets/" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/favicon.svg" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
                             # ---- Everything below requires a browser session via oauth2-proxy ----
                             # The UI's own SSE stream (live board updates) needs the same unbounded
                             # timeout, matched before the general /api prefix below.
@@ -244,6 +277,39 @@ data:
                                 cluster: amp_api_mcp
                                 prefix_rewrite: "/"
                                 timeout: 0s
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            # ---- Public: the home page, and what the app needs to load and check
+                            # its session. Signed out at "/", the app sends you to /home/; every
+                            # other path still goes through oauth2-proxy to sign in.
+                            - match: { path: "/home" }
+                              redirect: { path_redirect: "/home/" }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/home/" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { prefix: "/assets/" }
+                              route: { cluster: ui }
+                              typed_per_filter_config:
+                                envoy.filters.http.ext_authz:
+                                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+                                  disabled: true
+                            - match: { path: "/favicon.svg" }
+                              route: { cluster: ui }
                               typed_per_filter_config:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute

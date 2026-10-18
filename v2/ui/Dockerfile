@@ -22,6 +22,7 @@ COPY --from=builder /app/dist /usr/share/nginx/html
 RUN echo 'server { \
   listen 8080; \
   root /usr/share/nginx/html; \
+  absolute_redirect off; \
   location / { try_files $uri $uri/ /index.html; } \
   location /api/ { proxy_pass http://amp-api:3001; proxy_http_version 1.1; \
     proxy_set_header Connection ""; proxy_buffering off; } \

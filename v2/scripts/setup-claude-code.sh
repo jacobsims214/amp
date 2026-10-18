@@ -10,7 +10,7 @@
 #
 # Usage:
 #   ./scripts/setup-claude-code.sh                (from v2/)
-#   ./scripts/setup-claude-code.sh --from-github  install from coulterac/amp
+#   ./scripts/setup-claude-code.sh --from-github  install from jacobsims214/amp
 #   AMP_MCP_URL=http://localhost:8000/mcp ./scripts/setup-claude-code.sh
 #
 # To undo: claude plugin uninstall amp && claude plugin marketplace remove amp
@@ -22,7 +22,7 @@ V2_DIR="${SCRIPT_DIR:h}"
 REPO_DIR="${V2_DIR:h}"
 PLUGIN_DIR="${V2_DIR}/plugins/amp"
 MARKETPLACE_NAME="amp"
-GITHUB_REPO="coulterac/amp"
+GITHUB_REPO="jacobsims214/amp"
 
 SOURCE="${REPO_DIR}"
 FROM_GITHUB=0
