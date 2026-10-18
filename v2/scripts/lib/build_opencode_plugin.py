@@ -52,9 +52,12 @@ def model_ref(fm, raw):
 def main(v2, out):
     v2, out = Path(v2), Path(out)
     cfg = json.loads((v2 / "opencode.json").read_text())
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    # Start clean, but keep installed runtime dependencies.
+    out.mkdir(parents=True, exist_ok=True)
+    for child in out.iterdir():
+        if child.name in ("node_modules", "package-lock.json"):
+            continue
+        shutil.rmtree(child) if child.is_dir() else child.unlink()
 
     agents = []
     for f in sorted((v2 / ".opencode/agent").glob("*.md")):

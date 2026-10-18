@@ -14,6 +14,13 @@
   "contentFile": "skills/amp-day-report/SKILL.body.md"
  },
  {
+  "id": "amp-design-tools",
+  "name": "amp-design-tools",
+  "description": "Fast tools for design work. Screenshot every state of a mockup in one call (capture.mjs), and publish a file as an AMP artifact without re-typing it (publish_file.py). Use them instead of screenshotting state by state with chrome-devtools, and instead of pasting a whole file into amp_publish_artifact.",
+  "path": "skills/amp-design-tools/SKILL.md",
+  "contentFile": "skills/amp-design-tools/SKILL.body.md"
+ },
+ {
   "id": "amp-execution",
   "name": "amp-execution",
   "description": "Full protocol for executing an AMP task \u2014 reading the ticket, doing the work, logging progress, writing to the KB, and completing",

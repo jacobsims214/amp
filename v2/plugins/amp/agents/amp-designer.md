@@ -54,19 +54,18 @@ Follow the loop in `design/start-here.md`:
    config), components, and screenshots of two existing pages. Match it unless the ticket says
    to change it.
 3. Build every state (`design/ux-patterns.md`), desktop and phone. Write long files in parts.
-4. Look at it: screenshot at 1440 and 390 px in each state, with chrome-devtools:
-   `new_page` (url `file://…`), then desktop `resize_page` width 1440 height 1000; phone
-   `emulate` with `viewport: "390x844x2,mobile,touch"` (headless Chrome won't `resize_page`
-   below ~500 px; `emulate` with `viewport` omitted clears it); `wait_for` some text on the
-   page; `take_screenshot` with `fullPage: true`; `Read` the PNG to see it. Switch mockup states
-   with `evaluate_script` clicking the state buttons. Never an open-ended `await`.
-   Critique it with `design/critique.md`, fix, and repeat at least twice. Post the critique
-   findings you fixed in a progress comment.
+4. Look at it. Screenshot every state at 1440 and 390 px in ONE call with
+   the **amp-design-tools** skill's `capture.mjs` (seconds, not minutes of chrome-devtools calls),
+   then `Read` the PNGs. Your mockup's switcher buttons must use `data-setstate` /
+   `data-settheme` so it finds them. Critique with `design/critique.md`, fix, capture again;
+   at least twice. Use chrome-devtools only for interaction checks the screenshots can't show.
 5. Publish it for review (below). People never have to run anything to see your work.
 
 ## Publishing for review
 
-What you make for people to look at goes into AMP as an **artifact**, not just a file on disk:
+What you make for people to look at goes into AMP as an **artifact**, not just a file on disk.
+Publish the file itself, don't paste it: in Claude Code, `amp_publish_artifact_file(path, task_id,
+title)`; elsewhere `amp-design-tools`' `publish_file.py`; only if neither works,
 `amp_publish_artifact(task_id=<your ticket>, title=..., kind=..., content=...)`. AMP versions it
 and shows it sandboxed to everyone on the project, whatever harness they use.
 

@@ -17,7 +17,9 @@ How to build a mockup that people can judge, and that a builder can implement. R
 - **Looks finished**: real copy, realistic data, real states. People react to what they see; a
   rough mockup gets rough feedback.
 - **Covers the states** with a small switcher bar at the top (Filled, Empty, Errors, Loading,
-  …) so reviewers can flip through without you publishing several files.
+  …) so reviewers can flip through without you publishing several files. Its buttons carry
+  `data-setstate="filled"` (and `data-settheme="light"` for theme toggles): that's how
+  screenshot tools find every state.
 - **Responsive**: reviewers switch Desktop / Tablet / Phone in AMP. It must hold up at 390 px.
 - **Interactive where it matters**: tabs switch, toggles toggle, a dialog opens. Not a full app.
 
@@ -48,15 +50,16 @@ How to build a mockup that people can judge, and that a builder can implement. R
 1. Read the product's tokens and screenshot two existing screens. Note what you'll reuse.
 2. Write the content first (headings, labels, sample data, error messages). Content decides
    the layout, not the other way round.
-3. Build the layout and the primary state. Screenshot at 1440 and 390. With chrome-devtools:
-   `new_page` on the `file://` URL; desktop `resize_page` 1440×1000; phone `emulate` with
-   `viewport: "390x844x2,mobile,touch"` (headless Chrome can't resize a window that narrow);
-   `wait_for` text on the page; `take_screenshot` with `fullPage: true`; `read` the PNG.
+3. Build the layout and the primary state. Screenshot every state at 1440 and 390 in one call
+   with the `amp-design-tools` skill's `capture.mjs`, then read the images. (By hand with
+   chrome-devtools: phone is `emulate` with `viewport: "390x844x2,mobile,touch"`; headless
+   Chrome can't resize a window that narrow.)
 4. Critique with `design/critique.md`; fix; screenshot again. Then the other states.
 5. Write the file in parts if it's long (skeleton first, then sections) rather than one
    enormous write: long single outputs can stall.
-6. Publish: `amp_publish_artifact(task_id, title, kind="html", content, note)`. The note says
-   what's in it and how to use the state switcher.
+6. Publish the file (opencode: `amp_publish_artifact_file`; elsewhere `publish_file.py` from
+   `amp-design-tools`; else `amp_publish_artifact` with the content). The note says what's in
+   it and how to use the state switcher.
 7. Ask for review with `amp_block_task`: the url and one or two concrete decisions.
 8. New version for each round of feedback (`artifact_id`), note says what changed.
 
