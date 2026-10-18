@@ -23,7 +23,7 @@ Registers this checkout as a plugin marketplace and installs the `amp` plugin (a
 Anyone who just wants to use AMP without cloning can skip the script entirely:
 
 ```
-/plugin marketplace add coulterac/amp
+/plugin marketplace add jacobsims214/amp
 /plugin install amp@amp
 ```
 

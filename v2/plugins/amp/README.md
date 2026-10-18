@@ -7,7 +7,7 @@ in the AMP knowledge base.
 ## Install
 
 ```
-/plugin marketplace add coulterac/amp
+/plugin marketplace add jacobsims214/amp
 /plugin install amp@amp
 ```
 
