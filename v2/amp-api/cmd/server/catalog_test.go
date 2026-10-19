@@ -90,7 +90,7 @@ func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 	hidden := []string{"amp_get_ticket_history", "amp_get_task_comments", "amp_get_task_runs", "amp_create_task",
 		"amp_list_stories", "amp_list_project_stories", "amp_get_epic", "amp_get_story",
 		"amp_archive_project", "amp_restore_project", "amp_reset_project", "amp_export_project", "amp_import_project",
-		"amp_create_org", "amp_kb_tags", "amp_kb_reindex"}
+		"amp_create_org", "amp_kb_tags"}
 	admin := []string{"amp_manage_invites", "amp_manage_org_members", "amp_manage_teams", "amp_audit_log"}
 	person := []string{"amp_approve_plan", "amp_review_artifact", "amp_keep_artifact"}
 
@@ -124,7 +124,9 @@ func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 				t.Errorf("%s: %s listed=%v, want %v", c.who, n, got[n], c.persons)
 			}
 		}
-		for _, n := range []string{"amp_get_task", "amp_get_plan", "amp_list_tasks", "amp_dispatch_task", "amp_create_tasks", "amp_manage_team_members"} {
+		// amp_kb_reindex is listed for everyone, agents included: it checks
+		// write access to the KB it names when called.
+		for _, n := range []string{"amp_get_task", "amp_get_plan", "amp_list_tasks", "amp_dispatch_task", "amp_create_tasks", "amp_manage_team_members", "amp_kb_reindex"} {
 			if !got[n] {
 				t.Errorf("%s: %s not listed", c.who, n)
 			}
@@ -258,6 +260,7 @@ func TestCatalog_SearchFindsTheRightTool(t *testing.T) {
 		{"approve plan", "amp_approve_plan"}, {"check plan", "amp_check_plan"},
 		{"amp task get list dispatch", "amp_get_task"}, {"reassign ticket", "amp_assign_task"},
 		{"design context", "amp_design_context"}, {"how do I use amp", "amp_guide"},
+		{"reindex kb", "amp_kb_reindex"}, {"rebuild search index", "amp_kb_reindex"},
 		{"list epics", "amp_list_epics"}, {"list stories", "amp_get_plan|amp_list_epics"}, {"see the plan", "amp_get_plan"},
 	}
 	// Queries whose words are in other tools' names, which opencode scores

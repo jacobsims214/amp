@@ -64,6 +64,12 @@ func TestKB_ScopeAccess(t *testing.T) {
 	kbAllowed(t, w.as(w.orgadmin), "amp_kb_write", doc(map[string]interface{}{"scope": "org", "org_id": float64(w.org.ID)}, "reason", goodReason))
 	wantErr(t, w.as(w.outsider).callExpectError(t, "amp_kb_list", map[string]interface{}{"scope": "org", "org_id": float64(w.org.ID)}), "not found")
 
+	// Reindex needs write access to the KB it names, like amp_kb_write.
+	kbAllowed(t, w.as(w.alice), "amp_kb_reindex", inProject)
+	wantErr(t, w.as(w.alice).callExpectError(t, "amp_kb_reindex", org), "only org owners and admins")
+	kbAllowed(t, w.as(w.orgadmin), "amp_kb_reindex", map[string]interface{}{"scope": "org", "org_id": float64(w.org.ID)})
+	wantErr(t, w.as(w.outsider).callExpectError(t, "amp_kb_reindex", inProject), "not found")
+
 	// Team KB: "the team" for a project is the one of its teams you're on.
 	kbAllowed(t, w.as(w.alice), "amp_kb_write", doc(team, "reason", goodReason))
 	kbAllowed(t, w.as(w.carol), "amp_kb_list", team) // Ops
