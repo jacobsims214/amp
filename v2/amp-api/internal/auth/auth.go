@@ -1,13 +1,13 @@
 // Package auth validates OIDC access/ID tokens issued by Dex, for both the
-// REST/SSE API and the MCP endpoint. Envoy also validates these tokens at
-// the edge (jwt_authn filter) — this middleware is defense in depth per the
-// deployment architecture (docs/deploy-architecture.md): amp-api never
-// trusts the edge blindly.
+// REST/SSE API and the MCP endpoint. Envoy does not validate JWTs (there is no
+// jwt_authn filter): browser routes are gated by ext_authz/oauth2-proxy, and
+// this middleware is what actually verifies bearer tokens — amp-api never
+// trusts the edge blindly (see v2/docs/deploy-architecture.md).
 //
-// Auth is optional at the process level: if ISSUER_URL is unset, NewVerifier
-// returns a verifier in "disabled" mode so that plain `make dev`/docker-compose
-// workflows keep working without a Dex instance. Kubernetes deployments always
-// set ISSUER_URL.
+// Auth is optional at the process level: if OIDC_ISSUER_URL is unset,
+// NewVerifier returns a verifier in "disabled" mode so that plain `make
+// dev`/docker-compose workflows keep working without a Dex instance.
+// Kubernetes deployments always set OIDC_ISSUER_URL.
 package auth
 
 import (
@@ -33,7 +33,7 @@ type Identity struct {
 	Email   string
 	Name    string
 	User    *domain.User // populated after JIT provisioning
-	// LocalDev is set when auth is disabled (no ISSUER_URL): the request is
+	// LocalDev is set when auth is disabled (no OIDC_ISSUER_URL): the request is
 	// the anonymous local-dev user, who is treated as a global admin.
 	LocalDev bool
 	// APIToken is set when the request authenticated with an AMP API token
@@ -88,7 +88,7 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	}
 
 	if cfg.IssuerURL == "" {
-		slog.Warn("auth disabled: ISSUER_URL not set — all requests treated as anonymous local-dev user")
+		slog.Warn("auth disabled: OIDC_ISSUER_URL not set — all requests treated as anonymous local-dev user")
 		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins}, nil
 	}
 
