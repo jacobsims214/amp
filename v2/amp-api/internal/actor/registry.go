@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/asynkron/protoactor-go/actor"
+	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/repository"
 )
@@ -99,6 +100,17 @@ func (r *Registry) Touch(projectID int) error {
 		return err
 	}
 	return (<-reply).Err
+}
+
+// Publish sends an event to the UI's live stream (and webhooks and the other
+// replicas) through the hub the project actors use. Service methods that
+// change something outside an actor publish here, so every entry point (REST,
+// MCP) gets the same event.
+func (r *Registry) Publish(evt domain.Event) {
+	if r == nil || r.hub == nil {
+		return
+	}
+	r.hub.Publish(evt)
 }
 
 // Send delivers a message to the project actor and returns immediately.

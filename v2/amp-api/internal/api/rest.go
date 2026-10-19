@@ -663,12 +663,12 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "POST required", 405)
 			return
 		}
+		// ApprovePlan publishes project.updated itself (MCP approves too).
 		proj, err := h.svc.ApprovePlan(r.Context(), pr, projectID)
 		if err != nil {
 			fail(w, err, 500)
 			return
 		}
-		h.hub.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
 		jsonOK(w, map[string]interface{}{"project": proj})
 		return
 
