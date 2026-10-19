@@ -235,9 +235,20 @@ func (s *Server) designContext(ctx context.Context, args map[string]interface{})
 	if len(project.Docs) > 0 {
 		next = append(next, "Then this project's additions: amp_kb_get (project scope) for each path under project.docs. They override the org's.")
 	} else {
-		next = append(next, "This project has no design-system/ docs of its own: it uses the org's as is. If your work needs a "+
-			"project-specific decision (a product accent, a component the org doesn't have), propose it to your user and record "+
-			"it in the project KB under design-system/ once agreed.")
+		// design-system/ docs are written only by amp_design_system_publish (amp_kb_write refuses the path), so
+		// point at the supported routes: the project layer once the org has published, decisions/ until then.
+		msg := "This project has no design-system/ docs of its own: it uses the org's as is. If your work needs a " +
+			"project-specific decision (a product accent, a component the org doesn't have), propose it to your user first. "
+		if orgErr == nil && len(org.Docs) > 0 {
+			msg += "Once agreed, a lasting one belongs in the project's design system layer, built with amp_design_system_start " +
+				"scope \"project\" (amp_guide topic \"design/building-a-design-system.md\"); a one-off decision can go in the " +
+				"project KB under decisions/ with amp_kb_write. "
+		} else {
+			msg += "Until the org publishes its design system (a project layer can only be built on top of it, with " +
+				"amp_design_system_start scope \"project\"), record an agreed one-off decision in the project KB under decisions/ " +
+				"with amp_kb_write. "
+		}
+		next = append(next, msg+"Don't write under design-system/ yourself: those docs are written only by publishing a design system version.")
 	}
 	out["next"] = next
 	return jsonResult(out)
