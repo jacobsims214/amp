@@ -42,6 +42,7 @@ import (
 //	POST /api/tasks/:id/comments
 //	GET  /api/tasks/:id/history
 //	POST /api/tasks/:id/dispatch
+//	POST /api/tasks/:id/start      (a person starts their human ticket)
 //	POST /api/tasks/:id/complete
 //	POST /api/tasks/:id/start_at
 //	GET  /api/events              ← SSE stream (only events for projects you can see)
@@ -1381,9 +1382,39 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "dispatched_to": body.AgentID})
 
+	case "start":
+		// POST: a person starts their own human ticket.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		t, err := h.svc.StartHumanTask(r.Context(), pr, taskID)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]interface{}{"task": t})
+
 	case "complete":
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
+			return
+		}
+		if task.IsHuman() {
+			// A person finishing their human ticket: {note, pr_url, hours_worked}, all optional.
+			var done service.HumanDone
+			if r.ContentLength != 0 {
+				if err := json.NewDecoder(r.Body).Decode(&done); err != nil {
+					jsonErr(w, err, 400)
+					return
+				}
+			}
+			t, run, err := h.svc.CompleteHumanTask(r.Context(), pr, taskID, done, false)
+			if err != nil {
+				fail(w, err, 400)
+				return
+			}
+			jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed", "task": t, "run": run})
 			return
 		}
 		replyCh := make(chan actor.ReplySimple, 1)

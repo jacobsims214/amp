@@ -149,11 +149,24 @@ type Task struct {
 	// available for anyone on the project (or their agents) to claim.
 	// Distinct from AssignedTo/AgentID, which name the agent profile.
 	OwnerUserID *int `json:"owner_user_id"`
+	// Performer is who does the work: "agent" (dispatched to an agent) or
+	// "human" (its owner does it and tracks it in AMP). A human ticket sits
+	// in the dependency graph like any other: what depends on it waits for
+	// the person.
+	Performer string `json:"performer"`
+	// HumanReason says why a person does it (see HumanReasons).
+	HumanReason string `json:"human_reason,omitempty"`
+	// ReadyAt is when the ticket last became ready (backlog): ready → started
+	// is time spent waiting for someone to pick it up.
+	ReadyAt *time.Time `json:"ready_at,omitempty"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// IsHuman reports whether a person, not an agent, does this ticket.
+func (t *Task) IsHuman() bool { return t.Performer == PerformerHuman }
 
 type Comment struct {
 	ID           int       `json:"id"`
@@ -217,6 +230,9 @@ type CreateTaskRequest struct {
 	// for an unassigned ticket.
 	OwnerUserID *int     `json:"-"`
 	Metadata    Metadata `json:"metadata,omitempty"`
+	// Performer: "agent" (default) or "human"; HumanReason with "human".
+	Performer   string `json:"performer,omitempty"`
+	HumanReason string `json:"human_reason,omitempty"`
 }
 
 type UpdateTaskRequest struct {
@@ -228,6 +244,10 @@ type UpdateTaskRequest struct {
 	AgentID            string     `json:"agent_id,omitempty"`
 	Priority           string     `json:"priority,omitempty"`
 	StartAt            *time.Time `json:"start_at,omitempty"`
+	// Performer switches who does it ("agent" or "human"); not while it's in
+	// progress. HumanReason: why a person does it.
+	Performer   string `json:"performer,omitempty"`
+	HumanReason string `json:"human_reason,omitempty"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 	// Clear names fields to blank (see TaskClearable); "" otherwise means keep.

@@ -38,7 +38,8 @@ func (r *Repo) workTasks(ctx context.Context, where string, args ...any) ([]Work
 		if err := rows.Scan(
 			&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID, &t.Name, &t.Description, &t.AcceptanceCriteria,
 			&t.State, &t.Priority, &t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
-			&t.CreatedBy, &t.OwnerUserID, &t.Metadata, &t.CreatedAt, &t.UpdatedAt, &w.ProjectCode, &w.ProjectName, &w.LastActivityAt,
+			&t.CreatedBy, &t.OwnerUserID, &t.Metadata, &t.CreatedAt, &t.UpdatedAt,
+			&t.Performer, &t.HumanReason, &t.ReadyAt, &w.ProjectCode, &w.ProjectName, &w.LastActivityAt,
 		); err != nil {
 			return nil, err
 		}
@@ -84,7 +85,9 @@ func (r *Repo) ProjectTasksWithMeta(ctx context.Context, projectID int) ([]TaskW
 	rows, err := r.db.Query(ctx, `
 		SELECT t.id, t.project_id, t.epic_id, t.story_id, t.name, t.state, t.priority, t.agent_id,
 		       t.dispatched_at, t.completed_at, t.block_reason, t.created_at, t.updated_at, t.owner_user_id,
-		       p.metadata || e.metadata || s.metadata || t.metadata
+		       p.metadata || e.metadata || s.metadata || t.metadata,
+		       t.performer, t.human_reason, t.ready_at,
+		       COALESCE((SELECT array_agg(d.depends_on ORDER BY d.depends_on) FROM task_dependencies d WHERE d.task_id = t.id), '{}')
 		  FROM tasks t
 		  JOIN projects p ON p.id = t.project_id
 		  JOIN epics e ON e.id = t.epic_id
@@ -100,7 +103,8 @@ func (r *Repo) ProjectTasksWithMeta(ctx context.Context, projectID int) ([]TaskW
 		var x TaskWithMeta
 		t := &x.Task
 		if err := rows.Scan(&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID, &t.Name, &t.State, &t.Priority, &t.AgentID,
-			&t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.CreatedAt, &t.UpdatedAt, &t.OwnerUserID, &x.Effective); err != nil {
+			&t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.CreatedAt, &t.UpdatedAt, &t.OwnerUserID, &x.Effective,
+			&t.Performer, &t.HumanReason, &t.ReadyAt, &t.DependencyIDs); err != nil {
 			return nil, err
 		}
 		out = append(out, x)

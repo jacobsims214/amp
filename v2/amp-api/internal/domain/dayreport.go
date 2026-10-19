@@ -47,6 +47,8 @@ type DayReportStats struct {
 	Blocked       int      `json:"blocked"`
 	Projects      int      `json:"projects"`
 	AvgCycleHours *float64 `json:"avg_cycle_hours,omitempty"` // created → completed, for completed tickets
+	// HumanCompleted counts the completed tickets people did themselves.
+	HumanCompleted int `json:"human_completed,omitempty"`
 }
 
 // DayReportItem is a ticket in a report, with where it lives and its
@@ -67,6 +69,8 @@ type DayReportItem struct {
 	CompletedAt    *time.Time `json:"completed_at,omitempty"`
 	CycleTimeHours *float64   `json:"cycle_time_hours,omitempty"`
 	Metadata       Metadata   `json:"metadata"`
+	// HumanReason is set when a person, not an agent, does the ticket.
+	HumanReason string `json:"human_reason,omitempty"`
 }
 
 // ID is the item's task id.
@@ -115,6 +119,9 @@ func (d DayReportData) ComputeStats() DayReportStats {
 		}
 	}
 	for _, it := range d.Completed {
+		if it.HumanReason != "" {
+			s.HumanCompleted++
+		}
 		if it.CycleTimeHours != nil {
 			hours = append(hours, *it.CycleTimeHours)
 		}
@@ -163,6 +170,9 @@ func (r DayReport) RenderMarkdown() string {
 			fmt.Fprintf(&b, "\n**%s**\n", g.name)
 			for _, it := range g.items {
 				line := fmt.Sprintf("- %s %s", it.Ref, it.Name)
+				if it.HumanReason != "" {
+					line += " (human: " + it.HumanReason + ")"
+				}
 				if where := strings.Trim(it.EpicName+" › "+it.StoryName, " ›"); where != "" {
 					line += " — " + where
 				}

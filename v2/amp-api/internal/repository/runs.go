@@ -8,23 +8,23 @@ import (
 )
 
 const runCols = `id, task_id, project_id, user_id, agent_id, outcome, model, input_tokens, output_tokens,
-	cache_read_tokens, cache_write_tokens, cost_usd::float8, branch, commit_sha, pr_url, pushed, merged, note, created_at`
+	cache_read_tokens, cache_write_tokens, cost_usd::float8, branch, commit_sha, pr_url, pushed, merged, note, created_at, hours_worked::float8`
 
 func scanRun(row pgx.Row) (domain.Run, error) {
 	var r domain.Run
 	err := row.Scan(&r.ID, &r.TaskID, &r.ProjectID, &r.UserID, &r.AgentID, &r.Outcome, &r.Model, &r.InputTokens,
 		&r.OutputTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.CostUSD, &r.Branch, &r.Commit, &r.PRURL,
-		&r.Pushed, &r.Merged, &r.Note, &r.CreatedAt)
+		&r.Pushed, &r.Merged, &r.Note, &r.CreatedAt, &r.HoursWorked)
 	return r, err
 }
 
 // AddRun records one agent run on a ticket.
 func (r *Repo) AddRun(ctx context.Context, run domain.Run) (domain.Run, error) {
 	return scanRun(r.db.QueryRow(ctx, `INSERT INTO task_runs (task_id, project_id, user_id, agent_id, outcome, model,
-		input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, branch, commit_sha, pr_url, pushed, merged, note)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING `+runCols,
+		input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, branch, commit_sha, pr_url, pushed, merged, note, hours_worked)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING `+runCols,
 		run.TaskID, run.ProjectID, run.UserID, run.AgentID, run.Outcome, run.Model, run.InputTokens, run.OutputTokens,
-		run.CacheReadTokens, run.CacheWriteTokens, run.CostUSD, run.Branch, run.Commit, run.PRURL, run.Pushed, run.Merged, run.Note))
+		run.CacheReadTokens, run.CacheWriteTokens, run.CostUSD, run.Branch, run.Commit, run.PRURL, run.Pushed, run.Merged, run.Note, run.HoursWorked))
 }
 
 func (r *Repo) queryRuns(ctx context.Context, q string, args ...any) ([]domain.Run, error) {

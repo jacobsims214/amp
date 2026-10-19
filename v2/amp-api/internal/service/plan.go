@@ -131,8 +131,14 @@ func (s *Service) CreateTask(ctx context.Context, p authz.Principal, req domain.
 	if req.DependencyIDs, err = s.ValidateDependencies(ctx, req.ProjectID, 0, req.DependencyIDs); err != nil {
 		return nil, nil, err
 	}
+	if req.Performer, req.HumanReason, err = domain.NormalizePerformer(req.Performer, req.HumanReason); err != nil {
+		return nil, nil, authz.BadRequest("%v", err)
+	}
 	if req.OwnerUserID, err = s.ResolveNewTaskOwner(ctx, p, req.ProjectID, ownerRef); err != nil {
 		return nil, nil, err
+	}
+	if req.Performer == domain.PerformerHuman && req.OwnerUserID == nil && p.UserID != 0 {
+		return nil, nil, authz.BadRequest(HumanNeedsOwner)
 	}
 	req.CreatedBy = p.UserRef()
 
@@ -318,8 +324,20 @@ type PlanReport struct {
 	ReadyNow            []int       `json:"ready_now"`
 	LongestChain        int         `json:"longest_chain"` // tickets on the longest dependency path
 	Issues              []PlanIssue `json:"issues"`
-	RepairedTaskIDs     []int       `json:"repaired_task_ids,omitempty"`
-	Summary             string      `json:"summary"`
+	// HumanGates are the open tickets people do, and how much open work
+	// waits on each: where the plan puts a person in the loop.
+	HumanGates      []HumanGate `json:"human_gates"`
+	RepairedTaskIDs []int       `json:"repaired_task_ids,omitempty"`
+	Summary         string      `json:"summary"`
+}
+
+// HumanGate is an open human ticket in the plan.
+type HumanGate struct {
+	ID        int    `json:"id"`
+	Name      string `json:"name"`
+	Reason    string `json:"reason"`
+	Owner     *int   `json:"owner_user_id"`
+	HoldingUp int    `json:"holding_up"` // open tickets downstream of it
 }
 
 // readyFanoutThreshold: more ready tickets than this, when they're also more
@@ -351,7 +369,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if err != nil {
 		return nil, err
 	}
-	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}}
+	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}, HumanGates: []HumanGate{}}
 	proj, err := s.Repo.GetProject(ctx, projectID)
 	if err != nil {
 		return nil, err
@@ -424,6 +442,47 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			Kind:    "empty_stories",
 			Message: "Stories with no tickets: " + strings.Join(empty, ", "),
 			Fix:     "Add their tickets, move tickets into them (amp_move_task), or delete them (amp_delete_story).",
+		})
+	}
+
+	// People in the loop: every open human ticket needs someone to do it,
+	// and the plan should say how much agent work waits on each.
+	down := map[int][]int{}
+	for _, t := range tasks {
+		for _, d := range t.DependencyIDs {
+			down[d] = append(down[d], t.ID)
+		}
+	}
+	var ownerless []int
+	for _, t := range tasks {
+		if !t.IsHuman() || t.State == domain.TaskStateCompleted {
+			continue
+		}
+		if t.OwnerUserID == nil {
+			ownerless = append(ownerless, t.ID)
+		}
+		seen := map[int]bool{}
+		queue := append([]int(nil), down[t.ID]...)
+		n := 0
+		for len(queue) > 0 {
+			id := queue[0]
+			queue = queue[1:]
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			if byID[id].State != domain.TaskStateCompleted {
+				n++
+			}
+			queue = append(queue, down[id]...)
+		}
+		r.HumanGates = append(r.HumanGates, HumanGate{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: t.OwnerUserID, HoldingUp: n})
+	}
+	if len(ownerless) > 0 {
+		r.Issues = append(r.Issues, PlanIssue{
+			Kind: "human_without_owner", TaskIDs: ownerless,
+			Message: fmt.Sprintf("%d human ticket(s) have no owner, so nobody will do them and everything after them waits: %s.", len(ownerless), joinIDs(ownerless)),
+			Fix:     "Assign each to the person who does it (amp_assign_task), or make it agent work (amp_update_task performer='agent').",
 		})
 	}
 
@@ -564,6 +623,9 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	case r.OK:
 		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
 	}
+	if n := len(r.HumanGates); n > 0 {
+		r.Summary += fmt.Sprintf(" %d step(s) are done by people (human_gates); the work after them waits for them.", n)
+	}
 	if len(stuck) > 0 {
 		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
 	}
@@ -620,7 +682,12 @@ type TaskSpec struct {
 	DependsOn          []string
 	StartAt            *time.Time
 	Metadata           domain.Metadata
+	Performer          string
+	HumanReason        string
 }
+
+// HumanNeedsOwner refuses a human ticket nobody would do.
+const HumanNeedsOwner = "a human ticket needs an owner: the person who does it (owner: their email, or leave it out for yourself)"
 
 // CreatedTask maps a batch ref to the ticket created for it.
 type CreatedTask struct {
@@ -653,6 +720,14 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 		}
 		byRef[ref] = i
 		specs[i].Ref = ref
+		perf, reason, err := domain.NormalizePerformer(sp.Performer, sp.HumanReason)
+		if err != nil {
+			return nil, nil, authz.BadRequest("%q: %v", ref, err)
+		}
+		if o := strings.ToLower(strings.TrimSpace(sp.Owner)); perf == domain.PerformerHuman && (o == "none" || o == "unassigned") {
+			return nil, nil, authz.BadRequest("%q: %s", ref, HumanNeedsOwner)
+		}
+		specs[i].Performer, specs[i].HumanReason = perf, reason
 	}
 
 	// Resolve dependencies: batch refs, or existing ticket ids.
@@ -730,6 +805,7 @@ func (s *Service) CreateTasks(ctx context.Context, p authz.Principal, projectID 
 			ProjectID: projectID, StoryID: sp.StoryID, Name: sp.Name, Description: sp.Description,
 			AcceptanceCriteria: sp.AcceptanceCriteria, Priority: sp.Priority, AssignedTo: sp.AssignedTo,
 			DependencyIDs: deps, StartAt: sp.StartAt, Metadata: sp.Metadata,
+			Performer: sp.Performer, HumanReason: sp.HumanReason,
 		}, sp.Owner)
 		if err != nil {
 			var made []string

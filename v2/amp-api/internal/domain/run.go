@@ -32,13 +32,15 @@ type Run struct {
 	Merged           *bool     `json:"merged,omitempty"` // merged into the main line
 	Note             string    `json:"note,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
+	// HoursWorked is what a person reports spending on a human ticket.
+	HoursWorked *float64 `json:"hours_worked,omitempty"`
 }
 
 // HasDetail reports whether a run carries anything beyond its outcome, so
 // callers only record runs that tell us something.
 func (r Run) HasDetail() bool {
 	return r.Model != "" || r.InputTokens != nil || r.OutputTokens != nil || r.CostUSD != nil ||
-		r.Branch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != ""
+		r.Branch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != "" || r.HoursWorked != nil
 }
 
 // Usage totals runs' token spend.
@@ -49,13 +51,19 @@ type Usage struct {
 	CacheReadTokens  int64    `json:"cache_read_tokens"`
 	CacheWriteTokens int64    `json:"cache_write_tokens"`
 	CostUSD          float64  `json:"cost_usd"`
-	Unreported       int      `json:"unreported"` // finished runs with no token counts
-	Abandoned        int      `json:"abandoned"`  // runs that died or were stopped: rework
+	Unreported       int      `json:"unreported"`           // finished runs with no token counts
+	Abandoned        int      `json:"abandoned"`            // runs that died or were stopped: rework
+	HumanRuns        int      `json:"human_runs,omitempty"` // people's work on human tickets, not counted above
 	Models           []string `json:"models,omitempty"`
 }
 
 // Add counts one run.
 func (u *Usage) Add(r Run) {
+	// A person's work on a human ticket isn't agent spend.
+	if r.AgentID == HumanAgentID {
+		u.HumanRuns++
+		return
+	}
 	u.Runs++
 	if r.Outcome == RunAbandoned {
 		u.Abandoned++

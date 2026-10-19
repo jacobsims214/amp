@@ -126,7 +126,7 @@ func (r *Repo) dayReportItems(ctx context.Context, ids map[int]bool) (map[int]do
 	}
 	rows, err := r.db.Query(ctx, `
 		SELECT t.id, t.name, t.state, t.project_id, p.code, p.name, t.epic_id, e.name, t.story_id, s.name,
-		       t.block_reason, t.completed_at, t.created_at, p.metadata || e.metadata || s.metadata || t.metadata
+		       t.block_reason, t.completed_at, t.created_at, p.metadata || e.metadata || s.metadata || t.metadata, t.human_reason
 		FROM tasks t
 		JOIN projects p ON p.id = t.project_id
 		JOIN epics e ON e.id = t.epic_id
@@ -140,7 +140,7 @@ func (r *Repo) dayReportItems(ctx context.Context, ids map[int]bool) (map[int]do
 		var it domain.DayReportItem
 		var createdAt time.Time
 		if err := rows.Scan(&it.TaskID, &it.Name, &it.State, &it.ProjectID, &it.ProjectCode, &it.ProjectName,
-			&it.EpicID, &it.EpicName, &it.StoryID, &it.StoryName, &it.BlockReason, &it.CompletedAt, &createdAt, &it.Metadata); err != nil {
+			&it.EpicID, &it.EpicName, &it.StoryID, &it.StoryName, &it.BlockReason, &it.CompletedAt, &createdAt, &it.Metadata, &it.HumanReason); err != nil {
 			return nil, err
 		}
 		it.Ref = domain.TaskRef(it.ProjectCode, it.TaskID)

@@ -100,7 +100,7 @@ func (r *Repo) RestoreTask(ctx context.Context, projectID, taskID int) (*Restore
 		return nil, fmt.Errorf("ticket %d's story #%d was deleted too; recreate the story first", taskID, storyID)
 	}
 	for _, q := range []string{
-		`INSERT INTO tasks SELECT * FROM jsonb_populate_record(NULL::tasks, $1::jsonb->'task')`,
+		`INSERT INTO tasks SELECT * FROM jsonb_populate_record(NULL::tasks, '{"performer": "agent", "human_reason": ""}'::jsonb || ($1::jsonb->'task'))`,
 		`INSERT INTO comments SELECT * FROM jsonb_populate_recordset(NULL::comments, $1::jsonb->'comments') ON CONFLICT DO NOTHING`,
 		`INSERT INTO activity_log SELECT * FROM jsonb_populate_recordset(NULL::activity_log, $1::jsonb->'activity') ON CONFLICT DO NOTHING`,
 	} {
