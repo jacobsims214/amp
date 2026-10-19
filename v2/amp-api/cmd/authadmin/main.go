@@ -6,6 +6,12 @@
 // bearer token (every path but /health), and each /authadmin/users route is
 // wrapped in auth.RequireRole(domain.RoleAdmin, ...), which returns 403 to
 // anyone who isn't a global admin.
+//
+// Every successful password create, reset and delete writes one entry to
+// AMP's audit log (user.password.create, user.password.reset,
+// user.password.delete, so the UI's "Accounts" filter shows them) through
+// the same writer amp-api uses (service.Service.Record). Entries name the
+// actor and the target account; they never carry the password or its hash.
 package main
 
 import (
@@ -23,15 +29,29 @@ import (
 	dexapi "github.com/dexidp/dex/api/v2"
 	"github.com/google/uuid"
 	"github.com/simstech/amp-api/internal/auth"
+	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/dexclient"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/service"
 	"golang.org/x/crypto/bcrypt"
 )
 
+// userStore is the slice of *repository.Repo authadmin uses.
+type userStore interface {
+	GetUserByEmail(ctx context.Context, email string) (*domain.User, error)
+	ListUsers(ctx context.Context) ([]domain.User, error)
+	DeleteUser(ctx context.Context, userID int) error
+}
+
+// auditFunc records an audit entry made by p; in production it is
+// (*service.Service).Record, the writer amp-api uses.
+type auditFunc func(ctx context.Context, p authz.Principal, e domain.AuditEntry)
+
 type server struct {
-	dex  dexapi.DexClient
-	repo *repository.Repo
+	dex   dexapi.DexClient
+	repo  userStore
+	audit auditFunc
 }
 
 func main() {
@@ -120,7 +140,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	s := &server{dex: dexClient, repo: repo}
+	// Only Service.Repo is needed to write audit entries. No OnAudit sinks
+	// (webhooks) are registered here: account-level entries have no org or
+	// project, so amp-api would never deliver them to a webhook either.
+	auditSvc := &service.Service{Repo: repo}
+	s := &server{dex: dexClient, repo: repo, audit: auditSvc.Record}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -221,6 +245,8 @@ func (s *server) listOrCreateUser(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, fmt.Errorf("user already exists"), 409)
 			return
 		}
+		s.recordPassword(r, "user.password.create", body.Email, nil, "created a password login for ",
+			map[string]any{"username": username})
 		jsonOK(w, map[string]interface{}{"email": body.Email, "username": username})
 
 	default:
@@ -268,6 +294,7 @@ func (s *server) userSub(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, fmt.Errorf("user not found"), 404)
 			return
 		}
+		s.recordPassword(r, "user.password.reset", email, nil, "reset the password of ", nil)
 		jsonOK(w, map[string]interface{}{"email": email, "password_reset": true})
 
 	case http.MethodDelete:
@@ -299,14 +326,53 @@ func (s *server) userSub(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, fmt.Errorf("user not found"), 404)
 			return
 		}
+		// Look the AMP account up before deleting it, so the audit entry
+		// still names its id.
+		var target *domain.User
+		deleted := false
 		if u, err := s.repo.GetUserByEmail(r.Context(), email); err == nil {
-			_ = s.repo.DeleteUser(r.Context(), u.ID)
+			target = u
+			deleted = s.repo.DeleteUser(r.Context(), u.ID) == nil
 		}
+		s.recordPassword(r, "user.password.delete", email, target, "deleted the password login of ",
+			map[string]any{"amp_user_deleted": deleted})
 		jsonOK(w, map[string]interface{}{"email": email, "deleted": true})
 
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+// recordPassword writes one audit entry for a password change to email's
+// login, made by the request's caller. target is the AMP account when the
+// caller already has it; otherwise it is looked up by email, and an account
+// that has never signed in (so has no AMP user yet) is recorded with an
+// empty target_id. details must never hold the password or its hash.
+func (s *server) recordPassword(r *http.Request, action, email string, target *domain.User, verb string, details map[string]any) {
+	if s.audit == nil {
+		return
+	}
+	ctx := r.Context()
+	p, err := authz.FromContext(ctx)
+	if err != nil {
+		// RequireRole already admitted the caller, so this shouldn't happen;
+		// still record the change rather than lose it.
+		slog.Warn("audit: no principal for authadmin request", "action", action, "err", err)
+	}
+	if target == nil {
+		if u, err := s.repo.GetUserByEmail(ctx, email); err == nil {
+			target = u
+		}
+	}
+	d := map[string]any{"email": email}
+	for k, v := range details {
+		d[k] = v
+	}
+	e := domain.AuditEntry{Action: action, TargetType: "user", Summary: verb + email, Details: d}
+	if target != nil {
+		e.TargetID = fmt.Sprint(target.ID)
+	}
+	s.audit(ctx, p, e)
 }
 
 func jsonOK(w http.ResponseWriter, v interface{}) {
