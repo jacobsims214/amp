@@ -9,6 +9,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // ---- Project reports ----
@@ -98,7 +99,57 @@ type ProjectReport struct {
 	// Usage is the token spend of runs recorded in range, in total and by model.
 	Usage        domain.Usage `json:"usage"`
 	UsageByModel []UsageRow   `json:"usage_by_model"`
+	// Work splits the work between agents and people (see WorkReport).
+	Work WorkReport `json:"work"`
 }
+
+// PerformerStats summarises the tickets one kind of performer does.
+//   - wait: ready → started, time spent waiting for someone to pick it up
+//   - cycle: started → done
+//   - hours worked: what people reported spending (human tickets only)
+type PerformerStats struct {
+	Tickets          int      `json:"tickets"`
+	Open             int      `json:"open"`
+	CompletedInRange int      `json:"completed_in_range"`
+	MedianWaitHours  *float64 `json:"median_wait_hours,omitempty"`
+	MedianCycleHours *float64 `json:"median_cycle_hours,omitempty"`
+	HoursWorked      float64  `json:"hours_worked,omitempty"`
+	waits, cycles    []float64
+}
+
+// ReasonRow is human work grouped by why a person does it.
+type ReasonRow struct {
+	Reason string `json:"reason"`
+	PerformerStats
+}
+
+// HumanTicketRow is one human ticket and what it cost the plan in time.
+type HumanTicketRow struct {
+	ID           int      `json:"id"`
+	Name         string   `json:"name"`
+	Reason       string   `json:"reason"`
+	Owner        *int     `json:"owner_user_id"`
+	State        string   `json:"state"`
+	WaitHours    *float64 `json:"wait_hours,omitempty"`   // ready → started (or → now)
+	CycleHours   *float64 `json:"cycle_hours,omitempty"`  // started → done (or → now)
+	HoursWorked  *float64 `json:"hours_worked,omitempty"` // as reported
+	ElapsedHours float64  `json:"elapsed_hours"`          // ready → done (or → now)
+	HoldingUp    int      `json:"holding_up"`             // open tickets downstream now
+	Downstream   int      `json:"downstream"`             // all tickets downstream
+}
+
+// WorkReport is the agent/human split: how much each does, how long it
+// waits and takes, why people do what they do, and the human tickets that
+// held the plan up longest (open, or finished in range).
+type WorkReport struct {
+	Agent    PerformerStats   `json:"agent"`
+	Human    PerformerStats   `json:"human"`
+	ByReason []ReasonRow      `json:"human_by_reason"`
+	Slowest  []HumanTicketRow `json:"slowest_human_tickets"`
+}
+
+// humanSlowestLimit caps the slowest human tickets listed.
+const humanSlowestLimit = 10
 
 func median(xs []float64) *float64 {
 	if len(xs) == 0 {
@@ -189,7 +240,7 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 		if t.State == domain.TaskStateBlocked && t.BlockReason != "" && !strings.HasPrefix(t.BlockReason, "scheduled:") {
 			r.FlagHours += now.Sub(t.UpdatedAt).Hours()
 		}
-		if t.AgentID != "" {
+		if t.AgentID != "" && !t.IsHuman() {
 			g := agents[t.AgentID]
 			if g == nil {
 				g = &ReportGroup{Key: t.AgentID}
@@ -225,6 +276,7 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 		}
 	}
 	r.MedianHours = median(cycles)
+	r.Work = workReport(tasks, runsByTask, in, now)
 	finish := func(m map[string]*ReportGroup) []ReportGroup {
 		out := make([]ReportGroup, 0, len(m))
 		for _, g := range m {
@@ -262,4 +314,142 @@ func (s *Service) ProjectReport(ctx context.Context, p authz.Principal, projectI
 		return r.Keys[i].Key < r.Keys[j].Key
 	})
 	return r, nil
+}
+
+// workReport splits a project's tickets between agents and people.
+func workReport(tasks []repository.TaskWithMeta, runsByTask map[int][]domain.Run, in func(*time.Time) bool, now time.Time) WorkReport {
+	w := WorkReport{ByReason: []ReasonRow{}, Slowest: []HumanTicketRow{}}
+	byID := map[int]domain.Task{}
+	down := map[int][]int{}
+	for _, x := range tasks {
+		byID[x.Task.ID] = x.Task
+		for _, d := range x.Task.DependencyIDs {
+			down[d] = append(down[d], x.Task.ID)
+		}
+	}
+	downstream := func(id int) (open, all int) {
+		seen := map[int]bool{}
+		queue := append([]int(nil), down[id]...)
+		for len(queue) > 0 {
+			n := queue[0]
+			queue = queue[1:]
+			if seen[n] {
+				continue
+			}
+			seen[n] = true
+			all++
+			if byID[n].State != domain.TaskStateCompleted {
+				open++
+			}
+			queue = append(queue, down[n]...)
+		}
+		return
+	}
+	reasons := map[string]*ReasonRow{}
+	hours := func(from, to *time.Time) *float64 {
+		if from == nil || to == nil || to.Before(*from) {
+			return nil
+		}
+		h := to.Sub(*from).Hours()
+		return &h
+	}
+	for _, x := range tasks {
+		t := x.Task
+		st := &w.Agent
+		if t.IsHuman() {
+			st = &w.Human
+		}
+		st.Tickets++
+		done := t.State == domain.TaskStateCompleted
+		if !done {
+			st.Open++
+		}
+		var worked *float64
+		for _, run := range runsByTask[t.ID] {
+			if run.HoursWorked != nil {
+				v := *run.HoursWorked
+				if worked != nil {
+					v += *worked
+				}
+				worked = &v
+			}
+		}
+		if worked != nil {
+			st.HoursWorked += *worked
+		}
+		wait := hours(t.ReadyAt, t.DispatchedAt)
+		if in(t.DispatchedAt) && wait != nil {
+			st.waits = append(st.waits, *wait)
+		}
+		doneInRange := done && in(t.CompletedAt)
+		cycle := hours(t.DispatchedAt, t.CompletedAt)
+		if doneInRange {
+			st.CompletedInRange++
+			if cycle != nil {
+				st.cycles = append(st.cycles, *cycle)
+			}
+		}
+		if !t.IsHuman() {
+			continue
+		}
+		rr := reasons[t.HumanReason]
+		if rr == nil {
+			rr = &ReasonRow{Reason: t.HumanReason}
+			reasons[t.HumanReason] = rr
+		}
+		rr.Tickets++
+		if !done {
+			rr.Open++
+		}
+		if doneInRange {
+			rr.CompletedInRange++
+			if cycle != nil {
+				rr.cycles = append(rr.cycles, *cycle)
+			}
+		}
+		if worked != nil {
+			rr.HoursWorked += *worked
+		}
+		if done && !doneInRange {
+			continue // only open human tickets, and those finished in range, are listed
+		}
+		end := &now
+		if done {
+			end = t.CompletedAt
+		}
+		start := t.ReadyAt
+		if start == nil {
+			start = &t.CreatedAt
+		}
+		row := HumanTicketRow{ID: t.ID, Name: t.Name, Reason: t.HumanReason, Owner: t.OwnerUserID, State: string(t.State), HoursWorked: worked}
+		if t.DispatchedAt != nil {
+			row.WaitHours = hours(start, t.DispatchedAt)
+			row.CycleHours = hours(t.DispatchedAt, end)
+		} else {
+			row.WaitHours = hours(start, end)
+		}
+		if e := hours(start, end); e != nil {
+			row.ElapsedHours = *e
+		}
+		row.HoldingUp, row.Downstream = downstream(t.ID)
+		w.Slowest = append(w.Slowest, row)
+	}
+	for _, st := range []*PerformerStats{&w.Agent, &w.Human} {
+		st.MedianWaitHours, st.MedianCycleHours = median(st.waits), median(st.cycles)
+	}
+	for _, rr := range reasons {
+		rr.MedianCycleHours = median(rr.cycles)
+		w.ByReason = append(w.ByReason, *rr)
+	}
+	sort.Slice(w.ByReason, func(i, j int) bool {
+		if w.ByReason[i].Tickets != w.ByReason[j].Tickets {
+			return w.ByReason[i].Tickets > w.ByReason[j].Tickets
+		}
+		return w.ByReason[i].Reason < w.ByReason[j].Reason
+	})
+	sort.Slice(w.Slowest, func(i, j int) bool { return w.Slowest[i].ElapsedHours > w.Slowest[j].ElapsedHours })
+	if len(w.Slowest) > humanSlowestLimit {
+		w.Slowest = w.Slowest[:humanSlowestLimit]
+	}
+	return w
 }

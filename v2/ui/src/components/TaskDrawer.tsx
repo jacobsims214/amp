@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check } from 'lucide-react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play } from 'lucide-react'
+import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
 import { api } from '../api/client'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
@@ -9,7 +10,7 @@ import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story, HumanReason } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
@@ -56,6 +57,7 @@ function relativeTime(iso: string) {
 const ACTION_DOT: Record<string, string> = {
   created:    'bg-ink-2',
   dispatched: 'bg-link',
+  started:    'bg-link',
   completed:  'bg-success',
   blocked:    'bg-danger',
   unblocked:  'bg-warning-ink',
@@ -72,7 +74,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
   const [tab, setTab] = useState<'history' | 'details'>('details')
   const [loading, setLoading] = useState(false)
   const [editing, setEditing] = useState(false)
-  const [editForm, setEditForm] = useState({ name: '', description: '', acceptance_criteria: '', assigned_to: '', priority: '1' })
+  const [editForm, setEditForm] = useState({ name: '', description: '', acceptance_criteria: '', assigned_to: '', priority: '1',
+    performer: 'agent' as 'agent' | 'human', human_reason: 'other' as HumanReason })
   const [editSaving, setEditSaving] = useState(false)
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -111,7 +114,14 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
     setEditSaving(true)
     setEditError(null)
     try {
-      await api.updateTask(task!.id, withClears(editForm, ['description', 'acceptance_criteria', 'assigned_to']))
+      const { performer, human_reason, ...text } = editForm
+      const changes: Record<string, unknown> = withClears(text, ['description', 'acceptance_criteria', 'assigned_to'])
+      // Who does it: only sent when it changed, so a ticket in progress can still be edited.
+      if (performer !== (task!.performer ?? 'agent') || (performer === 'human' && human_reason !== task!.human_reason)) {
+        changes.performer = performer
+        if (performer === 'human') changes.human_reason = human_reason
+      }
+      await api.updateTask(task!.id, changes)
       setEditing(false)
       onRefresh?.()
       onClose()
@@ -179,6 +189,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                   acceptance_criteria: task.acceptance_criteria || '',
                   assigned_to: task.assigned_to || '',
                   priority: task.priority || '1',
+                  performer: task.performer ?? 'agent',
+                  human_reason: task.human_reason ?? 'other',
                 })
                 setEditError(null)
                 setEditing(true)
@@ -203,7 +215,15 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
 
         {/* Meta strip */}
         <div className="flex items-center gap-3 px-6 py-2.5 border-b border-line bg-surface-2 flex-wrap amp-num">
-          {task.assigned_to && !task.agent_id && (
+          {isHuman(task) && (
+            <div className="flex items-center gap-1.5 text-xs text-ink" title={reasonHint(task.human_reason)}>
+              <UserRound size={11} />
+              <span className="text-ink-3">Done by</span>
+              <span className="font-medium">a person</span>
+              <span className="text-ink-3">· {reasonLabel(task.human_reason).toLowerCase()}</span>
+            </div>
+          )}
+          {!isHuman(task) && task.assigned_to && !task.agent_id && (
             <div className="flex items-center gap-1.5 text-xs text-link" title="Planned agent">
               <Bot size={11} />
               <span className="text-ink-3">Agent</span>
@@ -211,7 +231,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               <span className="text-ink-3">(planned)</span>
             </div>
           )}
-          {task.agent_id && (
+          {task.agent_id && !isHuman(task) && (
             <div className="flex items-center gap-1.5 text-xs text-success" title="Active agent">
               <Bot size={11} />
               <span className="text-ink-3">Agent</span>
@@ -254,6 +274,12 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
         {displayState(task) === 'flag' && (
           <FlagAnswer key={`flag-${task.id}`} task={task} canWork={canWork}
             onAnswered={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.(); api.getComments(t.id).then(setComments).catch(() => {}) }} />
+        )}
+
+        {/* A person's own ticket: they start and finish it here */}
+        {isHuman(task) && task.state !== 'completed' && displayState(task) !== 'flag' && (
+          <HumanWork key={`human-${task.id}`} task={task} meId={meId} people={people}
+            onChanged={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() }} />
         )}
 
         {/* Mockups, diagrams and documents published to this ticket */}
@@ -309,10 +335,29 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
                   rows={3} className={`${inputCls} resize-none`} />
               </div>
               <div>
-                <label className="text-xs font-medium text-ink-2 block mb-1.5">Agent</label>
-                <input value={editForm.assigned_to} onChange={e => setEditForm(f => ({ ...f, assigned_to: e.target.value }))}
-                  className={inputCls} placeholder="amp-worker" />
+                <label htmlFor="edit-performer" className="text-xs font-medium text-ink-2 block mb-1.5">Done by</label>
+                <select id="edit-performer" value={editForm.performer} disabled={task.state === 'in_progress'}
+                  onChange={e => setEditForm(f => ({ ...f, performer: e.target.value as 'agent' | 'human' }))} className={inputCls}>
+                  <option value="agent">An agent</option>
+                  <option value="human">A person: its owner does it in AMP</option>
+                </select>
+                {task.state === 'in_progress' && <p className="text-[11.5px] text-ink-3 mt-1">Finish or stop the work before changing who does it.</p>}
               </div>
+              {editForm.performer === 'human' ? (
+                <div>
+                  <label htmlFor="edit-reason" className="text-xs font-medium text-ink-2 block mb-1.5">Why a person</label>
+                  <select id="edit-reason" value={editForm.human_reason}
+                    onChange={e => setEditForm(f => ({ ...f, human_reason: e.target.value as HumanReason }))} className={inputCls}>
+                    {HUMAN_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}: {r.hint.toLowerCase()}</option>)}
+                  </select>
+                </div>
+              ) : (
+                <div>
+                  <label className="text-xs font-medium text-ink-2 block mb-1.5">Agent</label>
+                  <input value={editForm.assigned_to} onChange={e => setEditForm(f => ({ ...f, assigned_to: e.target.value }))}
+                    className={inputCls} placeholder="amp-worker" />
+                </div>
+              )}
               <div>
                 <label className="text-xs font-medium text-ink-2 block mb-1.5">Priority</label>
                 <select value={editForm.priority} onChange={e => setEditForm(f => ({ ...f, priority: e.target.value }))}
@@ -810,6 +855,84 @@ function FlagAnswer({ task, canWork, onAnswered }: { task: Task; canWork: boolea
           <button type="button" className="amp-btn amp-btn-sm" disabled={busy} onClick={() => submit('')} title="Unblock without a comment">Unblock only</button>
         </div>
       </> : <span className="text-[12px] text-ink-2">Only people who can work this ticket can answer it.</span>}
+    </div>
+  )
+}
+
+/** A human ticket's panel: what kind of human work it is, who does it, and
+ *  for its owner, Start and Mark done (with a note, a link and the hours they
+ *  spent, which reports compare with how long it waited). */
+function HumanWork({ task, meId, people, onChanged }: {
+  task: Task; meId?: number; people: Map<number, Person>; onChanged: (t: Task) => void
+}) {
+  const [finishing, setFinishing] = useState(false)
+  const [note, setNote] = useState('')
+  const [link, setLink] = useState('')
+  const [hours, setHours] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const owner = task.owner_user_id != null ? lookupPerson(people, task.owner_user_id) : null
+  // Its owner does it; an unassigned one is claimed by whoever starts it. Local dev has no ownership.
+  const mine = meId === undefined || task.owner_user_id == null || task.owner_user_id === meId
+  const waiting = task.state === 'blocked'
+  const run = async (fn: () => Promise<Task>) => {
+    setBusy(true); setError(null)
+    try { onChanged(await fn()); setFinishing(false) }
+    catch (e) { setError(e instanceof Error ? e.message : 'That did not work') }
+    finally { setBusy(false) }
+  }
+  const hoursNum = hours.trim() === '' ? undefined : Number(hours)
+  const hoursBad = hoursNum !== undefined && (Number.isNaN(hoursNum) || hoursNum < 0 || hoursNum > 1000)
+  return (
+    <div className="px-6 py-4 border-b border-line grid gap-2.5" style={{ background: 'var(--surface-2)', boxShadow: 'inset 3px 0 0 var(--ink)' }}>
+      <span className="amp-label flex items-center gap-1.5"><UserRound size={12} />
+        {owner ? `${owner.name} does this` : 'A person does this'} · {reasonLabel(task.human_reason)}</span>
+      <p className="m-0 text-[13px] leading-relaxed text-ink-2">
+        {reasonHint(task.human_reason)}. Agents never pick it up; the work that depends on it starts when it's marked done.
+      </p>
+      {waiting ? (
+        <span className="text-[12.5px] text-ink-2">Waiting on #{(task.blocked_by_ids ?? task.dependency_ids).join(', #')} before it can start.</span>
+      ) : !mine ? (
+        <span className="text-[12.5px] text-ink-2">Only {owner ? owner.name : 'its owner'} starts and finishes it.</span>
+      ) : finishing ? (
+        <div className="grid gap-2">
+          <label htmlFor={`done-note-${task.id}`} className="text-xs font-medium text-ink-2">What happened (optional)</label>
+          <textarea id={`done-note-${task.id}`} className="amp-input min-h-[60px] resize-y" value={note} onChange={e => setNote(e.target.value)}
+            placeholder="Merged after one round of changes" />
+          <div className="grid grid-cols-[1fr_120px] gap-2">
+            <div className="grid gap-1">
+              <label htmlFor={`done-link-${task.id}`} className="text-xs font-medium text-ink-2">Link (optional)</label>
+              <input id={`done-link-${task.id}`} className="amp-input" value={link} onChange={e => setLink(e.target.value)} placeholder="PR, doc, or ticket URL" />
+            </div>
+            <div className="grid gap-1">
+              <label htmlFor={`done-hours-${task.id}`} className="text-xs font-medium text-ink-2">Hours spent</label>
+              <input id={`done-hours-${task.id}`} className="amp-input" inputMode="decimal" value={hours} onChange={e => setHours(e.target.value)} placeholder="1.5" />
+            </div>
+          </div>
+          <span className="text-[11.5px] text-ink-3">Hours spent is the work itself, not the waiting. Reports compare the two.</span>
+          {hoursBad && <span className="text-[12px] text-danger-ink">Hours must be a number from 0 to 1000.</span>}
+          {error && <span className="text-[12px] text-danger-ink">{error}</span>}
+          <div className="flex gap-2">
+            <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy || hoursBad}
+              onClick={() => run(() => api.completeHumanTask(task.id, { note: note.trim() || undefined, pr_url: link.trim() || undefined, hours_worked: hoursNum }))}>
+              {busy ? <Loader2 size={11} className="animate-spin" /> : <Check size={12} />}Mark done</button>
+            <button type="button" className="amp-btn amp-btn-sm" disabled={busy} onClick={() => setFinishing(false)}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex gap-2 flex-wrap items-center">
+          {task.state === 'backlog' && (
+            <button type="button" className="amp-btn amp-btn-accent amp-btn-sm" disabled={busy} onClick={() => run(() => api.startHumanTask(task.id))}>
+              {busy ? <Loader2 size={11} className="animate-spin" /> : <Play size={12} />}Start</button>
+          )}
+          <button type="button" className={`amp-btn amp-btn-sm ${task.state === 'in_progress' ? 'amp-btn-accent' : ''}`} disabled={busy} onClick={() => setFinishing(true)}>
+            <Check size={12} />Mark done…</button>
+          {task.state === 'in_progress' && task.dispatched_at && (
+            <span className="text-[12px] text-ink-3">Started {relativeTime(task.dispatched_at)}</span>
+          )}
+          {error && <span className="text-[12px] text-danger-ink w-full">{error}</span>}
+        </div>
+      )}
     </div>
   )
 }

@@ -12,7 +12,7 @@ import (
 
 // Fields each kind of update can clear. Names and priorities can't be blank.
 var (
-	TaskClearable  = []string{"description", "acceptance_criteria", "assigned_to", "agent_id"}
+	TaskClearable  = []string{"description", "acceptance_criteria", "assigned_to", "agent_id", "human_reason"}
 	EpicClearable  = []string{"description"}
 	StoryClearable = []string{"description", "acceptance_criteria"}
 )

@@ -112,6 +112,7 @@ var toolCatalog = map[string]toolInfo{
 	"amp_list_day_reports":    {title: "List day reports", keywords: "read saved day reports, status update", readOnly: true},
 	"amp_project_day_reports": {title: "Project standup", keywords: "standup sheet for a project, who did what today", readOnly: true},
 	"amp_velocity":            {title: "Velocity", keywords: "tickets completed per day", readOnly: true},
+	"amp_human_impact":        {title: "Human impact", keywords: "people vs agents, cycle time, what people did, bottlenecks waiting on people", readOnly: true},
 
 	// Knowledge base
 	"amp_kb_search":             {title: "Search knowledge base", keywords: "find docs, search the KB, prior work, notes", readOnly: true},
@@ -209,4 +210,13 @@ func (s *Server) ServerOptions() []server.ServerOption {
 		server.WithToolHandlerMiddleware(Middleware()),
 		server.WithHooks(hooks),
 	}
+}
+
+// humanReasonList renders the human reasons for tool descriptions.
+func humanReasonList() string {
+	parts := make([]string, 0, len(domain.HumanReasons))
+	for _, r := range domain.HumanReasons {
+		parts = append(parts, "'"+r+"' ("+domain.HumanReasonText[r]+")")
+	}
+	return "One of " + strings.Join(parts, ", ")
 }

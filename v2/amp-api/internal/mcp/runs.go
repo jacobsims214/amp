@@ -186,7 +186,7 @@ func (s *Server) restoreTasks(rctx context.Context, args map[string]interface{})
 // compactTasks is amp_list_tasks' default, small overview: one line per open
 // ticket under its epic (completed ones only when asked), the buckets as
 // IDs, and the questions with their text.
-func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, withDone bool) (*mcpgo.CallToolResult, error) {
+func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, people []PersonWait, withDone bool) (*mcpgo.CallToolResult, error) {
 	epics, err := s.repo.ListEpics(rctx, projectID)
 	if err != nil {
 		return nil, err
@@ -214,6 +214,7 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		State   string `json:"state"`
 		Owner   *int   `json:"owner_user_id,omitempty"`
 		Agent   string `json:"assigned_to,omitempty"` // the agent profile that runs it
+		Human   string `json:"human,omitempty"`       // a person does it: why
 		WaitsOn []int  `json:"waits_on,omitempty"`
 	}
 	type question struct {
@@ -226,14 +227,19 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 	buckets := map[string][]int{"ready": {}, "in_progress": {}, "question": {}, "waiting": {}, "scheduled": {}, "completed": {}}
 	for _, t := range tasks {
 		st := state(t)
-		buckets[st] = append(buckets[st], t.ID)
+		if !t.IsHuman() || (st != "ready" && st != "in_progress") {
+			buckets[st] = append(buckets[st], t.ID) // a person's to do is in waiting_on_people instead
+		}
 		if st == "question" {
 			questions = append(questions, question{t.ID, t.Name, t.BlockReason})
 		}
 		if st == "completed" && !withDone {
 			continue
 		}
-		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID, Agent: t.AssignedTo}
+		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID, Agent: t.AssignedTo, Human: t.HumanReason}
+		if t.IsHuman() {
+			l.Agent = ""
+		}
 		if st == "waiting" {
 			l.WaitsOn = t.BlockedByIDs
 		}
@@ -247,6 +253,7 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		"scheduled":         len(buckets["scheduled"]),
 		"completed":         len(buckets["completed"]),
 		"quiet":             quiet,
+		"waiting_on_people": people, // never dispatch these: tell your user who the work is waiting on
 		"by_epic":           byEpic,
 		"count":             len(tasks),
 		"owner_filter":      ownerMode,

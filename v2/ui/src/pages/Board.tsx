@@ -22,7 +22,8 @@ import { TeamAccessModal } from '../components/TeamAccessModal'
 import { api } from '../api/client'
 import { withClears } from '../lib/clear'
 import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOwner, type Person } from '../lib/people'
-import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata } from '../types'
+import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
+import { HUMAN_REASONS } from '../lib/human'
 import { BandLoader } from '../components/brand/BandLoader'
 
 // Label column width and task column min-width are tuned for responsiveness.
@@ -55,7 +56,8 @@ const inputCls =
 const labelCls = 'text-xs font-medium text-ink-2 block mb-1.5'
 
 // owner: '' = me (server default), 'none' = unassigned, or a member's user id
-const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[] }
+const EMPTY_TASK_FORM = { name: '', description: '', acceptance_criteria: '', assigned_to: 'amp-worker', priority: '1', owner: '', dependency_ids: [] as number[],
+  performer: 'agent' as 'agent' | 'human', human_reason: 'review' as HumanReason }
 
 export function Board() {
   const { projectId } = useParams<{ projectId: string }>()
@@ -276,11 +278,12 @@ export function Board() {
     setTaskSaving(true)
     setTaskError(null)
     try {
-      const { owner, ...rest } = taskForm
+      const { owner, performer, human_reason, assigned_to, ...rest } = taskForm
       await api.createTask(pid, {
         epic_id: taskCreateModal.story.epic_id,
         story_id: taskCreateModal.story.id,
         ...rest,
+        ...(performer === 'human' ? { performer, human_reason } : { assigned_to }),
         // '' = me (server default); 'none' = unassigned; else a member's user id
         ...(owner ? { owner } : {}),
       })
@@ -772,8 +775,22 @@ export function Board() {
                   <option key={m.user_id} value={String(m.user_id)}>{personName(m)}</option>
                 ))}
               </select></div>
-            <div><label className={labelCls}>Agent</label>
-              <input value={taskForm.assigned_to} onChange={e => setTaskForm(f => ({ ...f, assigned_to: e.target.value }))} className={inputCls} placeholder="amp-worker" /></div>
+            <div><label htmlFor="new-performer" className={labelCls}>Done by</label>
+              <select id="new-performer" value={taskForm.performer} onChange={e => setTaskForm(f => ({ ...f, performer: e.target.value as 'agent' | 'human' }))} className={inputCls}>
+                <option value="agent">An agent</option>
+                <option value="human">A person: the owner does it in AMP</option>
+              </select></div>
+            {taskForm.performer === 'human' ? (
+              <div><label htmlFor="new-reason" className={labelCls}>Why a person</label>
+                <select id="new-reason" value={taskForm.human_reason} onChange={e => setTaskForm(f => ({ ...f, human_reason: e.target.value as HumanReason }))} className={inputCls}>
+                  {HUMAN_REASONS.map(r => <option key={r.value} value={r.value}>{r.label}: {r.hint.toLowerCase()}</option>)}
+                </select>
+                {taskForm.owner === 'none' && <p className="text-[11.5px] text-danger-ink mt-1">A person's ticket needs an owner: the person who does it.</p>}
+              </div>
+            ) : (
+              <div><label className={labelCls}>Agent</label>
+                <input value={taskForm.assigned_to} onChange={e => setTaskForm(f => ({ ...f, assigned_to: e.target.value }))} className={inputCls} placeholder="amp-worker" /></div>
+            )}
             <div><label className={labelCls}>Priority</label>
               <select value={taskForm.priority} onChange={e => setTaskForm(f => ({ ...f, priority: e.target.value }))} className={inputCls}>
                 <option value="0">Low</option><option value="1">Normal</option><option value="2">High</option><option value="3">Critical</option>

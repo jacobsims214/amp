@@ -210,6 +210,16 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 			return fmt.Errorf("task %d is owned by user %d; it can only be dispatched by its owner", a.task.ID, *a.task.OwnerUserID)
 		}
 	}
+	switch {
+	case a.task.IsHuman() && !msg.Human:
+		return fmt.Errorf("task %d is human work (%s): %s, not an agent. They start and finish it in AMP; "+
+			"once it's done, the tickets that depend on it are ready", a.task.ID, a.task.HumanReason, a.ownerPhrase())
+	case !a.task.IsHuman() && msg.Human:
+		return fmt.Errorf("task %d is agent work; switch it to a person (performer \"human\") before starting it yourself", a.task.ID)
+	}
+	if msg.Human {
+		agentID = domain.HumanAgentID
+	}
 	if a.task.State == domain.TaskStateBlocked {
 		var incomplete []int
 		for _, depID := range a.task.DependencyIDs {
@@ -248,8 +258,12 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	}
 
 	a.publish(domain.EventTaskDispatched, a.withBlockedBy())
-	a.logActivityBy(agentID, msg.By, "dispatched", "backlog", "in_progress",
-		fmt.Sprintf("Dispatched to agent %q", agentID))
+	if msg.Human {
+		a.logActivityBy(agentID, msg.By, "started", "backlog", "in_progress", "Started by its owner (human work)")
+	} else {
+		a.logActivityBy(agentID, msg.By, "dispatched", "backlog", "in_progress",
+			fmt.Sprintf("Dispatched to agent %q", agentID))
+	}
 	a.log.Info("dispatched", "agent", agentID)
 
 	// Notify parent StoryActor so it can roll up to in_progress.
@@ -273,8 +287,12 @@ func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
 	}
 
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
-	a.logActivityBy(a.task.AgentID, by, "completed", string(prevState), "completed",
-		fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
+	if a.task.IsHuman() {
+		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", "Done by its owner (human work)")
+	} else {
+		a.logActivityBy(a.task.AgentID, by, "completed", string(prevState), "completed",
+			fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
+	}
 	a.log.Info("completed")
 
 	// Synchronously ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks.
@@ -287,6 +305,14 @@ func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
 	// Then notify parent StoryActor for state rollup (async is fine for rollup).
 	ctx.Send(a.storyPID, &MsgTaskCompleted{TaskID: a.task.ID})
 	return nil
+}
+
+// ownerPhrase names who does a human ticket, for refusals.
+func (a *TaskActor) ownerPhrase() string {
+	if a.task.OwnerUserID == nil {
+		return "it has no owner yet; assign the person who does it"
+	}
+	return fmt.Sprintf("its owner (user %d) does it", *a.task.OwnerUserID)
 }
 
 func (a *TaskActor) handleBlock(reason string, by *int) error {
@@ -319,10 +345,41 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	if req.Priority != "" {
 		a.task.Priority = req.Priority
 	}
+	// Who does it: switching is refused mid-work, so an agent's run or a
+	// person's work isn't cut off by the change.
+	prevPerformer := a.task.Performer
+	if req.Performer != "" || req.HumanReason != "" {
+		performer := req.Performer
+		if performer == "" {
+			performer = a.task.Performer
+		}
+		p, reason, err := domain.NormalizePerformer(performer, req.HumanReason)
+		if err != nil {
+			return err
+		}
+		if p != a.task.Performer && a.task.State == domain.TaskStateInProgress {
+			return fmt.Errorf("task %d is in progress; finish or stop it before changing who does it", a.task.ID)
+		}
+		if p == domain.PerformerHuman && req.HumanReason == "" && a.task.HumanReason != "" {
+			reason = a.task.HumanReason // keep the reason it had
+		}
+		req.Performer, req.HumanReason = p, reason
+		a.task.Performer, a.task.HumanReason = p, reason
+	} else if clr["human_reason"] && a.task.IsHuman() {
+		return fmt.Errorf("a human ticket keeps a reason; set human_reason instead of clearing it")
+	}
 	a.task.UpdatedAt = time.Now()
 
 	if err := a.repo.UpdateTask(context.Background(), req); err != nil {
 		return fmt.Errorf("db update: %w", err)
+	}
+	if prevPerformer != a.task.Performer {
+		who := map[string]string{domain.PerformerAgent: "an agent", domain.PerformerHuman: "a person"}
+		detail := fmt.Sprintf("Now done by %s (was %s)", who[a.task.Performer], who[prevPerformer])
+		if a.task.IsHuman() {
+			detail += ": " + a.task.HumanReason
+		}
+		a.logActivity("system", "performer_changed", "", "", detail)
 	}
 	if req.Metadata != nil {
 		meta, err := a.repo.MergeMetadata(context.Background(), "task", a.task.ID, req.Metadata)

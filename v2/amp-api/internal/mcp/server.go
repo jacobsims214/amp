@@ -234,6 +234,16 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"tz":   str("Optional. IANA time zone that days are counted in (default UTC)."),
 		}), wrap(ctx, s.open(s.velocity)))
 
+	mcp.AddTool(tool("amp_human_impact",
+		"How a project's tickets split between agents and people over a range: counts, how long each waited to be "+
+			"picked up and took once begun, hours people reported, human tickets by reason, and the human tickets that "+
+			"held the plan up longest (with how many tickets waited on them). For questions like 'what is the human impact', "+
+			"'what slowed us down', or 'what could agents take over'.",
+		props{
+			"project_id": num("REQUIRED. Project ID."),
+			"days":       num("Optional. How many days back (default 30)."),
+		}), wrap(ctx, s.guard(authz.Member, s.humanImpact)))
+
 	mcp.AddTool(tool("amp_list_projects", "List the active projects you have access to.",
 		props{}), wrap(ctx, s.open(s.listProjects)))
 
@@ -373,7 +383,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"feature. Give each ticket a short `ref` (e.g. 'schema', 'api', 'ui'); `depends_on` lists refs of other tickets in "+
 			"this batch, or IDs of existing tickets. Everything is checked first (unknown refs, other projects, cycles); then "+
 			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
-			"anything are reported, since they can all start at once.",
+			"anything are reported, since they can all start at once. A step only a person can do (review and merge a PR, "+
+			"a sign-off, prod access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
+			"owner as the person, wired into depends_on, so the agent tickets after it wait for them.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"tasks": map[string]interface{}{
@@ -392,11 +404,13 @@ func (s *Server) Register(mcp *server.MCPServer) {
 							"description": "Refs of tickets in this batch, or IDs of existing tickets, that must finish first.",
 							"items":       map[string]interface{}{"type": []string{"string", "number"}},
 						},
-						"assigned_to": str("Who should work it, e.g. 'amp-worker'."),
-						"priority":    str("0=low, 1=normal (default), 2=high, 3=critical."),
-						"owner":       str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
-						"start_at":    str("Optional. ISO 8601 datetime to schedule it; it's held until then."),
-						"metadata":    obj("Optional key/value metadata."),
+						"assigned_to":  str("Who should work it, e.g. 'amp-worker'."),
+						"priority":     str("0=low, 1=normal (default), 2=high, 3=critical."),
+						"owner":        str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
+						"start_at":     str("Optional. ISO 8601 datetime to schedule it; it's held until then."),
+						"metadata":     obj("Optional key/value metadata."),
+						"performer":    str("Optional. 'agent' (default: dispatched to an agent) or 'human': its owner does it and marks it done in AMP; agents never dispatch it."),
+						"human_reason": str("With performer 'human': why a person does it. " + humanReasonList() + "."),
 					},
 					"required": []string{"ref", "story_id", "name"},
 				},
@@ -461,8 +475,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.getPlan)))
 
 	mcp.AddTool(tool("amp_update_task",
-		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, or metadata — pass "+
-			"only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
+		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, metadata, or who does "+
+			"it (performer: hand it to a person, or a person's ticket to agents) — pass only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
 			"amp_move_task; to schedule it, amp_set_task_start_at. Its creator, its owner, and team leads can change it.",
 		props{
 			"task_id":             num("REQUIRED. Task ID."),
@@ -473,6 +487,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
+			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress."),
+			"human_reason":        str("Why a person does it. " + humanReasonList() + "."),
 			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
@@ -491,7 +507,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"user":    str("REQUIRED. Email or user id of a project member, 'me', or 'none' to unassign."),
 		}), wrap(ctx, s.guard(authz.Member, s.assignTask)))
 
-	mcp.AddTool(tool("amp_dispatch_task", "Start work on a ticket (task): dispatch it to an agent (sets state to in_progress). Fails if task is blocked. An unassigned ticket becomes yours; a ticket owned by someone else can't be dispatched.",
+	mcp.AddTool(tool("amp_dispatch_task", "Start work on a ticket (task): dispatch it to an agent (sets state to in_progress). Fails if task is blocked. An unassigned ticket becomes yours; a ticket owned by someone else can't be dispatched. Human tickets (performer 'human') are never dispatched: their owner does them.",
 		props{
 			"task_id":  num("REQUIRED. Task ID."),
 			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
@@ -499,8 +515,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it. "+
 		"Also record the run: the model you used, your token usage if your harness can tell you (opencode: amp_session_usage), "+
-		"and where the work is (branch, commit, PR, pushed). AMP reports token spend and traces code back to tickets from these.",
-		withRunProps(props{"task_id": num("REQUIRED. Task ID.")})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
+		"and where the work is (branch, commit, PR, pushed). AMP reports token spend and traces code back to tickets from these. "+
+		"For your person's own human ticket, only when they tell you they've done it: pass note, pr_url and hours_worked if they say.",
+		withRunProps(props{
+			"task_id":      num("REQUIRED. Task ID."),
+			"hours_worked": num("Human tickets: the hours the person says they spent on it."),
+		})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 	mcp.AddTool(tool("amp_report_run",
 		"Record an agent run on a ticket without changing its state: the model, token usage, and where the work went. "+
 			"Use it for a run that ended some other way (killed, abandoned, handed over), for usage you learn about afterwards "+
@@ -1239,6 +1259,7 @@ func (s *Server) createTasks(rctx context.Context, args map[string]interface{}) 
 			Description: optStr(m, "description", ""), AcceptanceCriteria: optStr(m, "acceptance_criteria", ""),
 			Priority: optStr(m, "priority", "1"), AssignedTo: optStr(m, "assigned_to", ""), Owner: optStr(m, "owner", ""),
 			DependsOn: deps, StartAt: startAt, Metadata: meta,
+			Performer: optStr(m, "performer", ""), HumanReason: optStr(m, "human_reason", ""),
 		})
 	}
 	created, warnings, err := s.svc.CreateTasks(rctx, caller(rctx).p, projectID, specs)
@@ -1396,7 +1417,15 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	questions := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
 	tasks := authz.FilterTasks(reply.Tasks, view, me.UserID)
+	people, err := s.waitingOnPeople(rctx, projectID, reply.Tasks, tasks)
+	if err != nil {
+		return nil, err
+	}
 	for _, t := range tasks {
+		switch {
+		case t.IsHuman() && (t.State == domain.TaskStateBacklog || t.State == domain.TaskStateInProgress):
+			continue // a person's to do: listed in waiting_on_people, never dispatched
+		}
 		switch t.State {
 		case domain.TaskStateBacklog:
 			readyToDispatch = append(readyToDispatch, t)
@@ -1418,6 +1447,8 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	}
 
 	// In progress but silent: usually a worker that died with its session.
+	// In progress but silent: usually a worker that died with its session.
+	// Human tickets aren't in inProgress: people have days, see HumanStaleAfter.
 	quiet := make([]map[string]interface{}, 0)
 	if len(inProgress) > 0 {
 		ids := make([]int, len(inProgress))
@@ -1442,7 +1473,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	case "full":
 	case "compact":
 		withDone, _ := args["include_completed"].(bool)
-		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, withDone)
+		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, people, withDone)
 	default:
 		return nil, fmt.Errorf("format: use 'compact' (default) or 'full'")
 	}
@@ -1454,7 +1485,8 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"scheduled":         scheduled, // tasks waiting for their start_at time
 		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
-		"quiet":             quiet, // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
+		"quiet":             quiet,  // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
+		"waiting_on_people": people, // human tickets a person can do now, and how much agent work waits on each; never dispatch these
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
 	})
@@ -1554,6 +1586,8 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 
 		AcceptanceCriteria: optStr(args, "acceptance_criteria", ""),
 		Clear:              optStrSlice(args, "clear"),
+		Performer:          optStr(args, "performer", ""),
+		HumanReason:        optStr(args, "human_reason", ""),
 	}
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
@@ -1698,6 +1732,17 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 	}
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
+	}
+	if task.IsHuman() {
+		done := service.HumanDone{Note: optStr(args, "note", ""), PRURL: optStr(args, "pr_url", "")}
+		if h, ok := args["hours_worked"].(float64); ok {
+			done.HoursWorked = &h
+		}
+		_, run, err := s.svc.CompleteHumanTask(rctx, caller(rctx).p, taskID, done, true)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed", "human_work": true, "run": run})
 	}
 	replyCh := make(chan ReplySimple, 1)
 	pid, err := s.registry.Get(task.ProjectID)
@@ -2265,6 +2310,26 @@ func (s *Server) listDayReports(ctx context.Context, args map[string]interface{}
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"reports": reports, "count": len(reports)})
+}
+
+func (s *Server) humanImpact(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	projectID, err := reqInt(args, "project_id")
+	if err != nil {
+		return nil, err
+	}
+	days := optInt(args, "days", 30)
+	if days < 1 || days > 366 {
+		return nil, fmt.Errorf("days must be between 1 and 366")
+	}
+	until := time.Now()
+	rep, err := s.svc.ProjectReport(ctx, caller(ctx).p, projectID, until.AddDate(0, 0, -days), until, "")
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{
+		"since": rep.Since, "until": rep.Until, "work": rep.Work,
+		"note": "wait = ready → started; cycle = started → done; hours_worked is what people reported. holding_up counts open tickets downstream of a human ticket now.",
+	})
 }
 
 func (s *Server) velocity(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

@@ -82,7 +82,11 @@ type MsgDispatchTask struct {
 	// unless Override is set (org admins). nil = no ownership rules (local dev).
 	By       *int
 	Override bool
-	ReplyCh  chan ReplySimple
+	// Human is set when a person starts their own human ticket (the UI's
+	// Start). Agents never start human tickets, and people don't start
+	// agent tickets this way.
+	Human   bool
+	ReplyCh chan ReplySimple
 }
 
 type MsgCompleteTask struct {

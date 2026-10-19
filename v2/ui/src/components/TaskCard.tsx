@@ -1,4 +1,5 @@
-import { Calendar, GitBranch } from 'lucide-react'
+import { Calendar, GitBranch, UserRound } from 'lucide-react'
+import { isHuman, reasonLabel } from '../lib/human'
 import type { Task } from '../types'
 import type { Person } from '../lib/people'
 import { displayState, STATE_LABEL, STATE_VAR } from '../lib/ticketState'
@@ -21,7 +22,8 @@ function formatStart(iso: string): string {
 }
 
 /** A ticket on the board: white, square, a state-colored left edge, its ID
- *  and priority, the agent on it (or the planned profile), and its owner.
+ *  and priority, the agent on it (or the planned profile, or a Person tag for
+ *  a ticket its owner does), and its owner.
  *  A question shows the question itself. */
 export function TaskCard({ task, onClick, dimmed = false, owner = null }: Props) {
   const state = displayState(task)
@@ -54,7 +56,12 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null }: Props)
       )}
 
       <span className="flex items-center gap-2 min-w-0 pt-0.5">
-        {task.agent_id ? (
+        {isHuman(task) ? (
+          <span className="inline-flex items-center gap-1 font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] border border-ink text-ink"
+            title={`A person does this (${reasonLabel(task.human_reason).toLowerCase()}); agents never pick it up`}>
+            <UserRound size={11} />Person · {reasonLabel(task.human_reason)}
+          </span>
+        ) : task.agent_id ? (
           <span className="inline-flex items-center gap-1.5 min-w-0" title={`Agent working: ${task.agent_id}`}>
             <Avatar name={task.agent_id} kind="agent" size={18} />
             <span className="amp-num text-[11px] text-ink-2 truncate">{task.agent_id}</span>

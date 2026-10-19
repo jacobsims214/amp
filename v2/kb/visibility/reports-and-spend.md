@@ -24,6 +24,12 @@ as missing usage.
   `capitalizable` splits spend into capex and opex;
 - tokens per completed ticket by agent profile, and abandoned-run (rework) counts;
 - **People** with done / in progress / questions / blocked by;
+- **People in the loop**:
+  - agents vs people: how long work waited to start and took once started, and the hours people
+    reported;
+  - human work by reason;
+  - the human tickets that held the plan up longest. See `working/human-work.md`. Agents get the
+    same numbers with `amp_human_impact`.
 - the **standup sheet**;
 - **Export** to Markdown.
 

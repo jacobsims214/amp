@@ -126,7 +126,8 @@ func scanStory(row rowScanner, st *domain.Story) error {
 }
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
-	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at`
+	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
+	performer, human_reason, ready_at`
 
 func scanTask(row rowScanner, t *domain.Task) error {
 	return row.Scan(
@@ -136,6 +137,7 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
+		&t.Performer, &t.HumanReason, &t.ReadyAt,
 	)
 }
 
@@ -364,11 +366,12 @@ func (r *Repo) ListStories(ctx context.Context, epicID int) ([]domain.Story, err
 func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*domain.Task, error) {
 	t := &domain.Task{}
 	err := scanTask(r.db.QueryRow(ctx,
-		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id, metadata)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id, metadata,
+		                    performer, human_reason, ready_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
 		 RETURNING `+taskCols,
 		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo, req.StartAt,
-		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata),
+		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata), performerOrAgent(req.Performer), req.HumanReason,
 	), t)
 	if err != nil {
 		return nil, err
@@ -545,11 +548,19 @@ func (r *Repo) ListStoriesByProject(ctx context.Context, projectID int) ([]domai
 func (r *Repo) SetTaskState(ctx context.Context, taskID int, state domain.TaskState, blockReason string) error {
 	_, err := r.db.Exec(ctx,
 		`UPDATE tasks SET state = $1, block_reason = $2, updated_at = NOW(),
-		   completed_at = CASE WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW()) END
+		   completed_at = CASE WHEN $1 = 'completed' THEN COALESCE(completed_at, NOW()) END,
+		   ready_at = CASE WHEN $1 = 'backlog' AND state <> 'backlog' THEN NOW() ELSE ready_at END
 		 WHERE id = $3`,
 		state, blockReason, taskID,
 	)
 	return err
+}
+
+func performerOrAgent(p string) string {
+	if p == "" {
+		return domain.PerformerAgent
+	}
+	return p
 }
 
 func (r *Repo) SetTaskAgent(ctx context.Context, taskID int, agentID string, dispatchedAt *time.Time) error {
@@ -595,6 +606,13 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 	if req.StartAt != nil {
 		args = append(args, req.StartAt)
 		query += `, start_at = $` + fmt.Sprint(len(args))
+	}
+	if req.Performer != "" {
+		args = append(args, req.Performer, req.HumanReason)
+		query += fmt.Sprintf(`, performer = $%d, human_reason = $%d`, len(args)-1, len(args))
+	} else if req.HumanReason != "" || clr("human_reason") {
+		args = append(args, req.HumanReason)
+		query += fmt.Sprintf(`, human_reason = $%d`, len(args))
 	}
 
 	query += ` WHERE id = $` + fmt.Sprint(len(args)+1)

@@ -16,6 +16,8 @@ import { displayState, QUIET_MS, silentFor, type DisplayState } from '../lib/tic
 import type { DayReport, MyWork as MyWorkData, VelocityDay, WorkTask } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
 import { ExpiringArtifacts } from '../components/artifacts/ExpiringArtifacts'
+import { UserRound } from 'lucide-react'
+import { isHuman, reasonLabel } from '../lib/human'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const NEXT_UP: DisplayState[] = ['prog', 'flag', 'ready', 'wait', 'sched', 'done']
@@ -74,7 +76,9 @@ export function MyWork() {
   const projectsCount = new Set(owned.map(t => t.project_id)).size
   // Agents in my harness work under my token, so my in-progress tickets are
   // theirs; agent accounts (their own identity) are counted on top.
-  const flying = owned.filter(t => t.state === 'in_progress')
+  const flying = owned.filter(t => t.state === 'in_progress' && !isHuman(t))
+  // Tickets I do myself, never dispatched to an agent: ready or started first.
+  const mine = owned.filter(t => isHuman(t) && t.state !== 'completed')
   const accountTickets = agents.reduce((n, a) => n + a.working.length, 0)
   const silent = (t: WorkTask) => silentFor([t.last_activity_at, t.dispatched_at, t.updated_at])
   const quiet = flying.filter(t => silent(t) > QUIET_MS).length
@@ -89,7 +93,7 @@ export function MyWork() {
         {!work && !error && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
         {work && <>
           <Readouts items={[
-            { label: 'My open tickets', value: owned.length, sub: `${inProgress} in progress · ${projectsCount} project${projectsCount === 1 ? '' : 's'}` },
+            { label: 'My open tickets', value: owned.length, sub: `${inProgress} in progress · ${mine.length ? `${mine.length} to do myself · ` : ''}${projectsCount} project${projectsCount === 1 ? '' : 's'}` },
             { label: 'Agents working', value: flying.length + accountTickets, sub: quiet ? `${quiet} quiet · may have stalled` : flying.length + accountTickets ? `on my tickets${agents.length ? ` · ${working}/${agents.length} agent accounts` : ''}` : 'nothing running', color: 'var(--st-prog)', alarm: quiet > 0 },
             { label: 'Questions', value: flags.length, sub: flags.length ? 'agents waiting on an answer' : 'nothing needs a person', alarm: flags.length > 0 },
             { label: 'Done in 24h', value: work.done_24h + agents.reduce((a, x) => a + x.done_24h, 0), sub: 'by me and my agents' },
@@ -113,6 +117,25 @@ export function MyWork() {
                 {flags.length > 8 && <p className="m-0 px-4 py-2.5 border-t border-line text-[12px] text-ink-3">+{flags.length - 8} more</p>}
               </Panel>
 
+              {mine.length > 0 && (
+                <Panel label="To do myself" title="Work only a person can do" right={<span>agents wait on these</span>}>
+                  {mine.slice(0, 8).map(t => {
+                    const st = displayState(t)
+                    return (
+                      <div key={t.id} className="grid grid-cols-[22px_1fr_auto] gap-x-3 gap-y-1 px-4 py-3 border-t border-line first:border-t-0">
+                        <UserRound size={18} className="row-span-2 text-ink mt-0.5" aria-hidden="true" />
+                        <Link to={ticketLink(t)} className="text-[13px] leading-snug text-ink hover:underline">{t.name}</Link>
+                        <Link to={ticketLink(t)} className={`amp-btn amp-btn-sm row-span-2 self-start ${st === 'ready' || st === 'prog' ? 'amp-btn-accent' : ''}`}>
+                          {st === 'ready' ? 'Start' : st === 'prog' ? 'Mark done' : 'Open'}</Link>
+                        <span className="amp-num text-[11px] text-ink-3">#{t.id} · {t.project_code} · {reasonLabel(t.human_reason).toLowerCase()} ·{' '}
+                          {st === 'prog' ? `started ${ago(t.dispatched_at)} ago` : st === 'ready' ? `ready for ${ago(t.ready_at ?? t.updated_at)}` : st === 'wait' ? 'waiting on other tickets' : st}</span>
+                      </div>
+                    )
+                  })}
+                  {mine.length > 8 && <p className="m-0 px-4 py-2.5 border-t border-line text-[12px] text-ink-3">+{mine.length - 8} more</p>}
+                </Panel>
+              )}
+
               <Panel label="Mine" title="Tickets I own" right={<span>{owned.length} open</span>}>
                 {owned.length === 0
                   ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">You don't own any open tickets. Claim one from a project's board, or dispatch one to your agent.</p>
@@ -120,7 +143,7 @@ export function MyWork() {
                     <div className="overflow-x-auto">
                     <table className="w-full border-collapse text-[13px]">
                       <thead><tr className="bg-surface-2">
-                        {['', 'ID', 'Ticket', 'State', 'Agent', ...(projectsCount > 1 ? ['Project'] : [])].map(h => <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
+                        {['', 'ID', 'Ticket', 'State', 'Done by', ...(projectsCount > 1 ? ['Project'] : [])].map(h => <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
                       </tr></thead>
                       <tbody>
                         {owned.slice(0, 12).map(t => (
@@ -129,7 +152,9 @@ export function MyWork() {
                             <td className="px-3 border-b border-line amp-num text-ink-3">#{t.id}</td>
                             <td className="px-3 border-b border-line max-w-[320px] truncate"><Link to={ticketLink(t)} className="text-ink hover:underline" onClick={e => e.stopPropagation()}>{t.name}</Link></td>
                             <td className="px-3 border-b border-line"><StateTag state={displayState(t)} /></td>
-                            <td className="px-3 border-b border-line whitespace-nowrap">{t.agent_id
+                            <td className="px-3 border-b border-line whitespace-nowrap">{isHuman(t)
+                              ? <span className="inline-flex items-center gap-1.5 text-ink-2"><UserRound size={14} />Me · {reasonLabel(t.human_reason).toLowerCase()}</span>
+                              : t.agent_id
                               ? <span className="inline-flex items-center gap-2"><Avatar name={t.agent_id} kind="agent" size={20} />{t.agent_id}</span>
                               : <span className="amp-num text-[12px] text-ink-3 block max-w-[160px] truncate">{t.assigned_to || '—'}</span>}</td>
                             {projectsCount > 1 && <td className="px-3 border-b border-line amp-num whitespace-nowrap max-w-[140px] truncate" title={t.project_code}>{t.project_code}</td>}

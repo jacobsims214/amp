@@ -14,6 +14,8 @@ import { useBoardData } from '../hooks/useBoardData'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { PeoplePanel } from '../components/PeoplePanel'
 import { StandupSheet } from '../components/StandupSheet'
+import { HumanWorkPanel } from '../components/HumanWorkPanel'
+import { reasonLabel } from '../lib/human'
 import { peopleRows } from '../lib/standup'
 import { tokens, usd } from '../lib/usage'
 import { activityActor } from '../lib/people'
@@ -135,6 +137,10 @@ export function Report() {
       ...(report.usage_by_model ?? []).map(m => `| ${m.model} | ${m.runs} | ${m.input_tokens} | ${m.output_tokens} | ${m.cost_usd.toFixed(4)} |`), '',
       '## Agents', '', '| Agent | Done | Median |', '|---|---:|---:|',
       ...report.agents.map(a => `| ${a.key} | ${a.completed_in_range} | ${hours(a.median_cycle_hours)} |`), '',
+      ...(report.work && report.work.human.tickets ? ['## People in the loop', '',
+        `${report.work.human.tickets} of ${report.work.agent.tickets + report.work.human.tickets} tickets are done by people. Median wait before starting: agents ${hours(report.work.agent.median_wait_hours)}, people ${hours(report.work.human.median_wait_hours)}. Median time once started: agents ${hours(report.work.agent.median_cycle_hours)}, people ${hours(report.work.human.median_cycle_hours)}.`, '',
+        '| Human ticket | Why | Waited | Took | Reported | Open tickets held up |', '|---|---|---:|---:|---:|---:|',
+        ...report.work.slowest_human_tickets.map(t => `| #${t.id} ${t.name} | ${reasonLabel(t.reason)} | ${hours(t.wait_hours)} | ${hours(t.cycle_hours)} | ${hours(t.hours_worked)} | ${t.holding_up} |`), ''] : []),
       '## Epics', '', '| Epic | Done | Tickets |', '|---|---:|---:|',
       ...report.epics.map(e => `| ${e.label} | ${e.states.done} | ${e.tickets} |`), '',
       ...(report.breakdown ? [`## By ${report.group_by}`, '', '| Value | Tickets | Done | Questions | Input tokens | Output tokens | Cost |', '|---|---:|---:|---:|---:|---:|---:|',
@@ -179,6 +185,9 @@ export function Report() {
             onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
 
           <StandupSheet projectId={pid} />
+
+          <HumanWorkPanel work={report.work} people={people} rangeLabel={RANGE_LABELS[range]}
+            onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
 
           <Panel label="Spend" title="Tokens by model" right={<span>runs recorded in {RANGE_LABELS[range].toLowerCase()}</span>}>
             {!report.usage_by_model?.length ? (
