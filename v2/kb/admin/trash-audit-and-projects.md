@@ -32,5 +32,7 @@ completions into Slack or update another tracker.
 ## Project lifecycle
 
 - **Archive** a finished project (read-only; `amp_archive_project`, owners), and restore it later.
-- **Export / import** a project's plan as JSON (`amp_export_project`, `amp_import_project`).
+- **Export / import** a project's plan as JSON (`amp_export_project`, `amp_import_project`). This copies one
+  project under new IDs. To move or back up a whole AMP, see
+  `operations/migrating-to-a-new-cluster.md` and `operations/backup-and-disaster-recovery.md`.
 - **Reset** clears a project's work (danger zone; owners only).
