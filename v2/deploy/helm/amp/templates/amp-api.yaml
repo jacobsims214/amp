@@ -89,7 +89,11 @@ spec:
             - name: TYPESENSE_URL
               value: "http://typesense.{{ .Values.global.namespace }}.svc.cluster.local:8108"
             - name: TYPESENSE_API_KEY
+              {{- if .Values.typesense.existingSecret }}
+              valueFrom: { secretKeyRef: { name: {{ .Values.typesense.existingSecret }}, key: {{ .Values.typesense.existingSecretKey | default "api-key" }} } }
+              {{- else }}
               value: {{ .Values.typesense.apiKey | quote }}
+              {{- end }}
             - name: OLLAMA_URL
               value: "http://ollama.{{ .Values.global.namespace }}.svc.cluster.local:11434"
             - name: OLLAMA_MODEL
