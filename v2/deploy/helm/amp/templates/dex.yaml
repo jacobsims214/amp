@@ -65,8 +65,14 @@ spec:
             - name: DEX_UI_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
+                  {{- if .Values.oauth2Proxy.existingSecret }}
+                  # Same Secret/key oauth2-proxy uses, so the two always match.
+                  name: {{ .Values.oauth2Proxy.existingSecret }}
+                  key: {{ .Values.oauth2Proxy.existingSecretClientSecretKey | default "client-secret" }}
+                  {{- else }}
                   name: amp-oauth2-proxy
                   key: client-secret
+                  {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.dex.httpPort }}

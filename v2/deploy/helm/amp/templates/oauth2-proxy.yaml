@@ -73,10 +73,17 @@ spec:
           env:
             - name: OAUTH2_PROXY_CLIENT_ID
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-id } }
+            {{- with .Values.oauth2Proxy.existingSecret }}
+            - name: OAUTH2_PROXY_CLIENT_SECRET
+              valueFrom: { secretKeyRef: { name: {{ . }}, key: {{ $.Values.oauth2Proxy.existingSecretClientSecretKey | default "client-secret" }} } }
+            - name: OAUTH2_PROXY_COOKIE_SECRET
+              valueFrom: { secretKeyRef: { name: {{ . }}, key: {{ $.Values.oauth2Proxy.existingSecretCookieSecretKey | default "cookie-secret" }} } }
+            {{- else }}
             - name: OAUTH2_PROXY_CLIENT_SECRET
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: client-secret } }
             - name: OAUTH2_PROXY_COOKIE_SECRET
               valueFrom: { secretKeyRef: { name: amp-oauth2-proxy, key: cookie-secret } }
+            {{- end }}
           ports:
             - name: http
               containerPort: 4180

@@ -125,6 +125,14 @@ oauth2Proxy:
   replicas: 1
   clientID: amp-ui
   # clientSecret is generated into a Secret by templates/secrets.yaml if not overridden
+  # Name of an existing Secret holding the client secret and cookie secret.
+  # When set, oauth2-proxy AND Dex (its static client) read both from it, and
+  # global.secretOverrides.oauth2Proxy* / the generated values are not used;
+  # the chart-made amp-oauth2-proxy Secret then only carries client-id.
+  # When empty, the old behaviour (templates/secrets.yaml) is unchanged.
+  existingSecret: ""
+  existingSecretClientSecretKey: client-secret   # key inside existingSecret
+  existingSecretCookieSecretKey: cookie-secret   # key inside existingSecret
   cookieSecure: true
   resources:
     requests: { cpu: 25m, memory: 32Mi }
