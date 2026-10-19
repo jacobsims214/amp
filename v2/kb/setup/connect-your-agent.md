@@ -30,9 +30,12 @@ self-hosted server set `AMP_MCP_URL`.
 
 **opencode**
 
-From the AMP repo, `v2/scripts/sync-global-config.sh` (or `make sync-global`) copies the agents,
-skills and the `amp-usage` plugin into `~/.config/opencode` and merges the `amp` MCP server into
-`opencode.json`. Then add your token to the server's headers.
+From the AMP repo, run `v2/scripts/setup-opencode.sh`. It adds the AMP opencode plugin (agents,
+skills, MCP servers and model settings) as one `plugins` entry in your global
+`~/.config/opencode/opencode.json` and touches nothing else in it. For a self-hosted server pass
+`--url https://<your-amp>/mcp` (default `$AMP_MCP_URL`); pass `--token <token>`, or omit it to
+sign in with OAuth. `--inherit-models` runs every agent on your own default model. If you used
+the old `sync-global-config.sh`, rerun with `--clean` to remove the files it copied.
 
 **Anything else** that speaks MCP: point it at `https://<your-amp>/mcp` with
 `Authorization: Bearer <token>`.
