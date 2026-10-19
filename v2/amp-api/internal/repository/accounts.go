@@ -56,32 +56,49 @@ func (r *Repo) ListAgentUsers(ctx context.Context, managedBy *int) ([]domain.Use
 
 // SetUserDisabled deactivates or reactivates an account. Deactivating the
 // last active global admin is refused.
-func (r *Repo) SetUserDisabled(ctx context.Context, userID int, disabled bool) error {
-	if !disabled {
-		_, err := r.db.Exec(ctx, `UPDATE users SET disabled_at = NULL WHERE id = $1`, userID)
-		return err
-	}
+//
+// Either way, the account's live API tokens are revoked in the same
+// transaction and returned, so the caller can audit each one. Deactivating
+// revokes them so that reactivating doesn't bring them back. Reactivating
+// revokes any that are still live: those belong to accounts deactivated
+// before deactivation revoked tokens (tokens can't be minted for a
+// deactivated account), and this is the moment they would start working
+// again. No migration is needed for those accounts.
+func (r *Repo) SetUserDisabled(ctx context.Context, userID int, disabled bool) ([]domain.APIToken, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	var others int
-	var admin bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1 AND role = 'admin'),
-		       (SELECT COUNT(*) FROM user_roles ur JOIN users u ON u.id = ur.user_id
-		         WHERE ur.role = 'admin' AND u.disabled_at IS NULL AND u.id <> $1)`, userID,
-	).Scan(&admin, &others); err != nil {
-		return err
+	if disabled {
+		var others int
+		var admin bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1 AND role = 'admin'),
+			       (SELECT COUNT(*) FROM user_roles ur JOIN users u ON u.id = ur.user_id
+			         WHERE ur.role = 'admin' AND u.disabled_at IS NULL AND u.id <> $1)`, userID,
+		).Scan(&admin, &others); err != nil {
+			return nil, err
+		}
+		if admin && others == 0 {
+			return nil, conflictf("this is the only active global admin; make someone else a global admin first")
+		}
+		if _, err := tx.Exec(ctx, `UPDATE users SET disabled_at = COALESCE(disabled_at, NOW()) WHERE id = $1`, userID); err != nil {
+			return nil, err
+		}
+	} else if _, err := tx.Exec(ctx, `UPDATE users SET disabled_at = NULL WHERE id = $1`, userID); err != nil {
+		return nil, err
 	}
-	if admin && others == 0 {
-		return conflictf("this is the only active global admin; make someone else a global admin first")
+	rows, err := tx.Query(ctx, `UPDATE api_tokens SET revoked_at = NOW()
+		WHERE user_id = $1 AND revoked_at IS NULL RETURNING `+tokenCols, userID)
+	if err != nil {
+		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE users SET disabled_at = COALESCE(disabled_at, NOW()) WHERE id = $1`, userID); err != nil {
-		return err
+	revoked, err := collect(rows, scanToken)
+	if err != nil {
+		return nil, err
 	}
-	return tx.Commit(ctx)
+	return revoked, tx.Commit(ctx)
 }
 
 const tokenCols = `id, user_id, name, prefix, created_by, created_at, expires_at, last_used_at, revoked_at`
@@ -122,22 +139,30 @@ func (r *Repo) RevokeAPIToken(ctx context.Context, id int) error {
 	return err
 }
 
-// UserForAPIToken returns the account a live token belongs to (deactivated
-// accounts included; the caller refuses those), and notes the token's use.
-// A revoked, expired, or unknown token is ErrNotFound.
+// UserForAPIToken returns the account a live token belongs to, and notes
+// the token's use. A revoked, expired, or unknown token is ErrNotFound.
+//
+// A deactivated account is returned for any of its tokens, live or not, and
+// its use isn't noted: the caller refuses it with "account deactivated",
+// which says more than "revoked token" would (deactivation revokes the
+// account's tokens, so otherwise that's all its agents would ever see).
 func (r *Repo) UserForAPIToken(ctx context.Context, hash string) (*domain.User, error) {
 	var tokenID int
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx, `
 		SELECT t.id, `+prefixed("u", userCols)+`
 		FROM api_tokens t JOIN users u ON u.id = t.user_id
-		WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())`, hash,
+		WHERE t.token_hash = $1 AND (u.disabled_at IS NOT NULL
+		      OR (t.revoked_at IS NULL AND (t.expires_at IS NULL OR t.expires_at > NOW())))`, hash,
 	).Scan(append([]any{&tokenID}, userDest(u)...)...)
 	if err == pgx.ErrNoRows {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
+	}
+	if u.DisabledAt != nil {
+		return u, nil
 	}
 	// At most one write a minute per token, however busy the agent is.
 	if _, err := r.db.Exec(ctx, `UPDATE api_tokens SET last_used_at = NOW()
