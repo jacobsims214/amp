@@ -1,0 +1,199 @@
+## AMP Helm chart — EKS / Red-Platform `rp-tools-nonprod` (nonprod) values.
+##
+## ADDITIVE overlay for the rp-tools-nonprod EKS cluster, registered through
+## the cluster's ArgoCD gitops pattern (rvo-redplatform/eks-rp-tools-nonprod-crds,
+## ns `argocd`, destination.name `rp-tools-nonprod`, applied by hand, manual sync).
+## It is applied on top of the base `values.yaml` and mirrors the exact key
+## schema of `values-production.yaml` (the Talos/datacenter reference) — only the
+## values that differ for EKS/nonprod are set here. Do NOT edit values.yaml or
+## values-production.yaml to make this work; this file is the single overlay.
+##
+## Served at amp.rp-tools-nonprod.rvohealth.com via ambient Istio (Gateway API
+## HTTPRoute), TLS terminated at the edge (ALB/NLB) so pods receive plain HTTP.
+## Images on ghcr.io/jacobsims214/amp are public — no imagePullSecret is needed.
+##
+## Manual/dev-loop usage (bypassing ArgoCD):
+##   helm upgrade --install amp . -n amp --create-namespace \
+##     -f values-eks-tools-nonprod.yaml
+##
+## ⚠⚠⚠  CRITICAL — PIN THE PLACEHOLDERS BELOW BEFORE FIRST APPLY  ⚠⚠⚠
+## The four global.secretOverrides values and global.bootstrapAdminEmails are
+## placeholders. They MUST be replaced with real, pre-generated values (or
+## pre-created Secrets) before the first ArgoCD sync. ArgoCD's Helm rendering
+## does not reliably support the lookup-based "reuse existing Secret value"
+## trick — consecutive syncs have produced different random values, desyncing
+## Dex from oauth2-proxy/valkey until every consumer happened to restart
+## together (see templates/secrets.yaml and docs/deploy-architecture.md). A
+## literal placeholder string is stable across syncs but is NOT a real secret,
+## so it is left loud to force replacement. Do NOT rely on template-time random
+## generation here, and do NOT regenerate these without also restarting dex,
+## oauth2-proxy, amp-valkey, amp-api, and the bootstrap-admin job together.
+
+global:
+  namespace: amp
+  # Public base domain. Drives the Dex issuer, the oauth2-proxy cookie/redirect
+  # URLs, and MCP_PUBLIC_URL — it MUST equal the exposed host.
+  domain: amp.rp-tools-nonprod.rvohealth.com
+
+  # ALB/NLB terminates TLS at the edge; Envoy and every pod run plain HTTP.
+  # tls.enabled is false so cert-manager issues nothing; the issuer/letsencrypt
+  # block below is therefore INERT (only consulted if enabled flips to true).
+  tls:
+    enabled: false
+    issuer: letsencrypt-dns01   # only consulted if enabled: true
+    letsencrypt:
+      email: "ops@rvohealth.com"
+      dns01:
+        provider: ""            # inert while tls.enabled: false
+
+  # TODO PIN BEFORE APPLY: the real first-admin email for this environment.
+  # Consumed by Dex (dex-configmap.yaml) and surfaced to amp-api / authadmin /
+  # asynqmon. Left as a placeholder so it cannot be mistaken for a real value.
+  bootstrapAdminEmails: "TODO-PIN-BEFORE-APPLY"
+
+  # TODO PIN BEFORE APPLY — see the critical banner at the top of this file.
+  # These are stable, obvious placeholders (NOT real secrets). Pin real,
+  # pre-generated values before the first ArgoCD sync, or ArgoCD will desync
+  # Dex from oauth2-proxy/valkey and the bootstrap-admin job.
+  secretOverrides:
+    oauth2ProxyClientSecret: "TODO-PIN-BEFORE-APPLY-oauth2ProxyClientSecret"
+    oauth2ProxyCookieSecret: "TODO-PIN-BEFORE-APPLY-oauth2ProxyCookieSecret"
+    valkeyPassword: "TODO-PIN-BEFORE-APPLY-valkeyPassword"
+    bootstrapAdminPassword: "TODO-PIN-BEFORE-APPLY-bootstrapAdminPassword"
+
+  # Single override point for every amp-* image tag. Set per release, e.g.
+  # sha-<shortsha>. The build-images workflow tags every build as both
+  # `latest` and `sha-<shortsha>` — for a real/nonprod deploy prefer the sha
+  # tag over a floating `latest` (see deploy/argocd/amp-application.yaml).
+  imageTag: "latest"
+
+image:
+  # Public ghcr images — no imagePullSecret is required (no secret is created or
+  # referenced anywhere in this chart).
+  registry: ghcr.io/jacobsims214/amp
+  pullPolicy: IfNotPresent
+
+ampApi:
+  tag: ""   # empty = use global.imageTag
+  replicas: 1
+  resources:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+
+ui:
+  tag: ""
+  replicas: 1   # nonprod: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+authAdmin:
+  tag: ""
+  replicas: 1   # nonprod: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+mcpOAuth:
+  tag: ""
+  replicas: 1   # nonprod: 1
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+asynqmonGate:
+  tag: ""
+
+valkey:
+  enabled: true
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+dex:
+  replicas: 1   # nonprod: 1
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 512Mi }
+
+oauth2Proxy:
+  # Single replica: with 2 replicas and no shared session-store locking,
+  # concurrent token refreshes race (one redeems the rotating refresh token,
+  # the other fails "Refresh token is invalid or has already been claimed by
+  # another client"), periodically killing the browser session.
+  replicas: 1
+  # Browser traffic is HTTPS at the edge (ALB terminates TLS) -> Secure cookie.
+  cookieSecure: true
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 300m, memory: 256Mi }
+
+envoy:
+  replicas: 1   # nonprod: 1
+  service:
+    # ClusterIP: fronted by the ambient-mesh HTTPRoute, not an external LB.
+    # The HTTPRoute backend points at this service on port 80 (see below).
+    type: ClusterIP
+    httpPort: 80
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+
+typesense:
+  # NOTE: this is still the local-dev default — replace with a real generated
+  # value (and switch templates/typesense.yaml to read it from a Secret)
+  # before this touches real data. Mirrors values-production.yaml's TODO.
+  apiKey: amp-local-dev
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    limits: { cpu: "1", memory: 2Gi }
+  storage:
+    size: 10Gi
+    storageClassName: gp3   # EKS default EBS SC (nfs-storage is Talos-only)
+
+ollama:
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { cpu: "4", memory: 4Gi }
+  storage:
+    size: 10Gi
+    storageClassName: gp3   # EKS default EBS SC (nfs-storage is Talos-only)
+
+cnpg:
+  instances: 1   # nonprod: single-instance CNPG (HA not needed here).
+  storage:
+    size: 20Gi
+    storageClassName: gp3   # EKS default EBS SC (nfs-storage is Talos-only)
+
+postInstall:
+  pullEmbeddingModel: true
+
+## -------------------------------------------------------------------------
+## AMBIENT-MESH NAMESPACE + INGRESS (Gateway API HTTPRoute)
+##
+## ⚠ INERT UNTIL TASK #271: these keys (namespace.*, ingress.httpRoute.*)
+## are NOT yet consumed by the chart templates — the ambient-mesh namespace
+## labeling and the HTTPRoute template support are added in task #271.
+## Helm ignores these unconsumed keys for now, so they are harmless but do
+## nothing yet. Re-verify the exact key names against the templates once
+## task #271 lands. (Spec: architect #269 / task #270 comment.)
+## -------------------------------------------------------------------------
+
+namespace:
+  enabled: true
+  labels:
+    istio.io/dataplane-mode: ambient
+    istio.io/rev: rapid
+
+ingress:
+  httpRoute:
+    enabled: true
+    hostnames:
+      - amp.rp-tools-nonprod.rvohealth.com
+      - queues.amp.rp-tools-nonprod.rvohealth.com
+    parentRefs:
+      - name: rp-ingress
+        namespace: istio-ingress
+    backend:
+      name: envoy
+      port: 80
