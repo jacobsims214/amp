@@ -172,13 +172,24 @@ func TestScheduledDeps_DependencyDoneFirstWaitsForStartAt(t *testing.T) {
 }
 
 // The start time passed while no actor ran the project (a restart or a
-// replica takeover). When the project's actors start again, the ticket must
-// still wait on its unfinished dependency.
+// replica takeover). When the project's actors start again, they must release
+// the expired schedule (block_reason and start_at cleared), keep the ticket
+// blocked on its unfinished dependency, and move it to backlog once that
+// dependency completes. A ticket left on "scheduled:..." would never move.
 func TestScheduledDeps_StartAtPassedWhileDownWithUnfinishedDependency(t *testing.T) {
 	s := setupMCP(t)
 	ctx := context.Background()
 	dep := mkIn(t, s, s.storyID, "build API")
 	id := mkIn(t, s, s.storyID, "build UI", dep)
+
+	// The process goes down: stop the original project actors. Otherwise two
+	// live actor systems would own the project, and the original one (whose
+	// in-memory ticket was never schedule-blocked) could release the ticket on
+	// the dependency's completion by itself, which would hide a restart that
+	// never ran the release. Everything below goes through the fresh registry
+	// and the database only; s.call would respawn the original actors.
+	s.reg.StopAll()
+	time.Sleep(200 * time.Millisecond) // Root.Stop is asynchronous
 
 	// What the database holds after a schedule that came due while down.
 	past := time.Now().Add(-time.Minute)
@@ -196,11 +207,43 @@ func TestScheduledDeps_StartAtPassedWhileDownWithUnfinishedDependency(t *testing
 	if err := reg.Touch(s.projectID); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(500 * time.Millisecond)
 
-	if st := dbState(t, s.repo, id); st != "blocked" {
-		t.Fatalf("restart after start_at with dependency %d unfinished: ticket is %q, want blocked", dep, st)
+	// On start, the expired schedule is released: no "scheduled:" reason and
+	// no start_at left, but still blocked on the unfinished dependency.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		stored, err := s.repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.BlockReason == "" && stored.StartAt == nil {
+			if stored.State != domain.TaskStateBlocked {
+				t.Fatalf("restart after start_at with dependency %d unfinished: ticket is %q, want blocked", dep, stored.State)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("restart never released the expired schedule: state %q, block_reason %q, start_at %v",
+				stored.State, stored.BlockReason, stored.StartAt)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
+
+	// Completing the dependency through the restarted actors hands the ticket
+	// on to backlog: the release left it where checkUnblock picks it up.
+	reply := make(chan actor.ReplySimple, 1)
+	if err := reg.Send(s.projectID, &actor.MsgCompleteTask{TaskID: dep, ReplyCh: reply}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-reply:
+		if r.Err != nil {
+			t.Fatal(r.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("MsgCompleteTask never answered")
+	}
+	waitState(t, s, id, "backlog")
 }
 
 // Clearing a ticket's schedule must not release it past its dependencies.
