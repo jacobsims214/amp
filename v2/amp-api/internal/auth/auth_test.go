@@ -149,17 +149,6 @@ func TestWithAudiencesDoesNotMutateBase(t *testing.T) {
 	}
 }
 
-func TestLegacyOIDCAudiencesStillEnforce(t *testing.T) {
-	idp := newTestIdP(t)
-	v, err := NewVerifier(context.Background(), Config{IssuerURL: testIssuer, DiscoveryURL: idp.server.URL, Audiences: []string{"amp-ui"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, reached := do(t, v, "Bearer "+idp.token(t, map[string]any{"aud": "other"})); reached {
-		t.Fatal("OIDC_AUDIENCES allow-list no longer enforced")
-	}
-}
-
 func TestChallenges(t *testing.T) {
 	idp := newTestIdP(t)
 	v := idp.verifier(t).WithAudiences("mcp", "amp-mcp")

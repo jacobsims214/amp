@@ -67,11 +67,7 @@ type Config struct {
 	// while IssuerURL remains the externally-issued "iss" claim value tokens
 	// carry. Avoids amp-api depending on its own public DNS name/TLS trust
 	// just to talk to Dex over the loopback network. Defaults to IssuerURL.
-	DiscoveryURL string
-	// Audiences accepted on top of the issuer's own client IDs (e.g. the MCP
-	// broker's client_id and oauth2-proxy's client_id both issue tokens users
-	// will present to amp-api).
-	Audiences      []string
+	DiscoveryURL   string
 	BootstrapAdmin string // comma-separated emails granted admin on first sight
 	Repo           *repository.Repo
 }
@@ -107,9 +103,6 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	verifier := oidc.NewVerifier(cfg.IssuerURL, keySet, &oidc.Config{SkipClientIDCheck: true})
 
 	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins}
-	if len(cfg.Audiences) > 0 {
-		v.allowedAudiences = cfg.Audiences
-	}
 	return v, nil
 }
 
