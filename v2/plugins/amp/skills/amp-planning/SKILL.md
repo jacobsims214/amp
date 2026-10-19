@@ -650,6 +650,9 @@ After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked ta
 - If it's your user's own, they can Start and Mark done in AMP. Or they tell you it's done and
   you record it: `amp_complete_task(task_id, note, pr_url, hours_worked)`. Only on their word, and
   ask how many hours it took if they don't say. A stale one is worth a nudge to its owner.
+- A teammate's human ticket is theirs to mark done, not yours, even when your user tells you it's
+  finished. Re-read the board (it's usually done already). If it's still open, say it's waiting on
+  them.
 
 A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
 `questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the

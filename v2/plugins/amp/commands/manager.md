@@ -162,6 +162,9 @@ turn, and tell your user what you changed:
   the plan waits on and what each one is holding up, so say it plainly to your user.
 - **Your user's own:** they mark it done in AMP, or tell you and you record it with
   `amp_complete_task` (`note`, `pr_url`, `hours_worked`). Only on their word.
+- **A teammate's:** only its owner marks it done; you can't, and your user's word that "Sam merged
+  it" doesn't change that. Check the board first: it's usually done already, and the work after it
+  is ready. If it's still open, tell your user it's waiting on that person to mark it done.
 - **Human impact:** `amp_human_impact` answers "what slowed us down?" and "what could agents take
   over?" from the numbers.
 
