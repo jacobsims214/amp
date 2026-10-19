@@ -137,6 +137,22 @@ func (s *Server) trace(rctx context.Context, args map[string]interface{}) (*mcpg
 	})
 }
 
+// reportMerged is the MCP form of POST /api/trace/merged: CI reports a
+// merge with an amp_ token (tokens reach /mcp, not /api, through Envoy).
+// Same rule as the REST endpoint: read access to the project is enough.
+func (s *Server) reportMerged(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	pr := optStr(args, "pr_url", "")
+	if pr == "" {
+		pr = optStr(args, "pr", "") // the REST endpoint's name for it
+	}
+	ids, err := s.svc.MarkMerged(rctx, caller(rctx).p, optStr(args, "commit", ""), optStr(args, "branch", ""), pr,
+		strings.TrimSpace(optStr(args, "merge_commit", "")))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"merged_task_ids": ids, "count": len(ids)})
+}
+
 func (s *Server) listDeleted(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {

@@ -575,6 +575,16 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"branch": str("A branch name."),
 			"pr_url": str("A pull request URL."),
 		}), wrap(ctx, s.open(s.trace)))
+	mcp.AddTool(tool("amp_report_merged",
+		"Record that code is merged: every ticket whose runs produced the commit, branch or PR gets a run marked merged, "+
+			"across the projects you can see. One call after merging, made by CI (an amp_ token that can read the project is "+
+			"enough) or by a person. Give merge_commit to record the merge SHA. Returns the ticket IDs it marked.",
+		props{
+			"commit":       str("The commit SHA the work was recorded with, or at least its first 7 characters."),
+			"branch":       str("The branch that was merged."),
+			"pr_url":       str("The pull request URL that was merged."),
+			"merge_commit": str("Optional. The merge commit SHA on the main line."),
+		}), wrap(ctx, s.open(s.reportMerged)))
 
 	mcp.AddTool(tool("amp_block_task",
 		"Stop work on a ticket because it needs a person: a question, a decision, missing information, or access you don't have. "+

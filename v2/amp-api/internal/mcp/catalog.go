@@ -103,6 +103,7 @@ var toolCatalog = map[string]toolInfo{
 	"amp_set_task_start_at":  {title: "Schedule ticket", keywords: "schedule a ticket to start later", idempotent: true},
 	"amp_list_unmerged":      {title: "List unmerged work", keywords: "done tickets whose PR or branch isn't merged", readOnly: true},
 	"amp_trace":              {title: "Trace code to tickets", keywords: "which ticket made this commit, branch or PR", readOnly: true},
+	"amp_report_merged":      {title: "Report merged", keywords: "CI merge report, mark a branch, PR or commit merged, record the merge commit"},
 	"amp_list_deleted_tasks": {title: "List trash", keywords: "deleted tickets, epics and stories", readOnly: true},
 	"amp_restore_tasks":      {title: "Restore from trash", keywords: "undelete tickets, epics or stories"},
 
