@@ -5,3 +5,4 @@ v2/plugins/opencode/package-lock.json
 
 # Local Go build output of v2/amp-api (anchored so cmd/server/ is not matched)
 /v2/amp-api/server
+/v2/amp-api/bin/
