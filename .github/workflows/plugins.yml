@@ -1,0 +1,66 @@
+name: Check plugins are current
+
+# v2/plugins/ is generated from v2/.opencode/ and v2/opencode.json by the build
+# scripts, and the output is committed so users can install without building.
+# A source change committed without a rebuild ships stale plugins. This job
+# rebuilds both plugins and fails if the committed tree differs, printing the
+# diff. To fix a failure, run (in this order — the opencode build reads the
+# Claude plugin's version):
+#
+#   v2/scripts/build-claude-plugin.sh && v2/scripts/build-opencode-plugin.sh
+#
+# and commit v2/plugins/.
+
+on:
+  pull_request:
+    paths:
+      - "v2/.opencode/**"
+      - "v2/opencode.json"
+      - "v2/scripts/build-claude-plugin.sh"
+      - "v2/scripts/build-opencode-plugin.sh"
+      - "v2/scripts/lib/**"
+      - "v2/plugins/**"
+      - ".github/workflows/plugins.yml"
+  push:
+    branches: [main]
+    paths:
+      - "v2/.opencode/**"
+      - "v2/opencode.json"
+      - "v2/scripts/build-claude-plugin.sh"
+      - "v2/scripts/build-opencode-plugin.sh"
+      - "v2/scripts/lib/**"
+      - "v2/plugins/**"
+      - ".github/workflows/plugins.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  plugins-current:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install build deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+          python -m pip install --quiet pyyaml
+      - name: build Claude Code plugin
+        run: v2/scripts/build-claude-plugin.sh
+      - name: build opencode plugin
+        run: v2/scripts/build-opencode-plugin.sh
+      - name: committed plugins match their source
+        run: |
+          # git status catches added, removed and modified files; git diff
+          # alone would miss files the build creates that were never committed.
+          if [ -n "$(git status --porcelain -- v2/plugins)" ]; then
+            echo "::error::v2/plugins is out of date with its source. Run v2/scripts/build-claude-plugin.sh then v2/scripts/build-opencode-plugin.sh and commit v2/plugins/."
+            git status --short -- v2/plugins
+            git add -N -- v2/plugins
+            git --no-pager diff --stat -- v2/plugins
+            git --no-pager diff -- v2/plugins
+            exit 1
+          fi
+          echo "v2/plugins matches its source."
