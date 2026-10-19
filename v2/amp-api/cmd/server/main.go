@@ -288,6 +288,9 @@ func main() {
 	restHandler.Register(mux)
 	// Artifacts nobody kept are deleted after the retention period.
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
+	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
+	// are deleted. Idempotent, so every replica can run it.
+	go service.New(repo, registry, kbSvc).RunTrashPurge(context.Background(), time.Hour)
 
 	// Health check (unauthenticated, used by k8s probes)
 	var draining atomic.Bool

@@ -9,6 +9,27 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// TrashRetention is how long deleted work stays in the trash: the list and
+// restore queries only see rows younger than this, and PurgeTrash deletes
+// the rest. A Postgres interval literal.
+const TrashRetention = "30 days"
+
+// PurgeTrash deletes trash rows (deleted tickets, epics and stories) older
+// than TrashRetention, and returns how many it deleted. It is a plain
+// DELETE ... WHERE deleted_at < cutoff, so several replicas running it at
+// once is safe: whichever gets a row deletes it, the others skip it.
+func (r *Repo) PurgeTrash(ctx context.Context) (int64, error) {
+	var n int64
+	for _, table := range []string{"deleted_tasks", "deleted_groups"} {
+		tag, err := r.db.Exec(ctx, `DELETE FROM `+table+` WHERE deleted_at < NOW() - INTERVAL '`+TrashRetention+`'`)
+		if err != nil {
+			return n, fmt.Errorf("purge %s: %w", table, err)
+		}
+		n += tag.RowsAffected()
+	}
+	return n, nil
+}
+
 // TrashTasks snapshots tickets into deleted_tasks before they are deleted:
 // the row, comments, activity, and dependency links in both directions.
 func (r *Repo) TrashTasks(ctx context.Context, ids []int, deletedBy *int) error {
@@ -48,7 +69,7 @@ type DeletedTask struct {
 func (r *Repo) ListDeletedTasks(ctx context.Context, projectID int) ([]DeletedTask, error) {
 	rows, err := r.db.Query(ctx, `SELECT d.task_id, d.project_id, d.epic_id, d.story_id, d.name, d.deleted_by, d.deleted_at,
 		EXISTS (SELECT 1 FROM stories s WHERE s.id = d.story_id)
-		FROM deleted_tasks d WHERE d.project_id = $1 AND d.deleted_at > NOW() - INTERVAL '30 days'
+		FROM deleted_tasks d WHERE d.project_id = $1 AND d.deleted_at > NOW() - INTERVAL '`+TrashRetention+`'
 		ORDER BY d.deleted_at DESC, d.task_id`, projectID)
 	if err != nil {
 		return nil, err
@@ -214,7 +235,7 @@ func (r *Repo) ListDeletedGroups(ctx context.Context, projectID int) ([]DeletedG
 	rows, err := r.db.Query(ctx, `SELECT d.kind, d.item_id, d.project_id, d.epic_id, d.name, d.task_ids,
 		jsonb_array_length(d.snapshot->'stories'), d.deleted_by, d.deleted_at,
 		d.kind = 'epic' OR EXISTS (SELECT 1 FROM epics e WHERE e.id = d.epic_id)
-		FROM deleted_groups d WHERE d.project_id = $1 AND d.deleted_at > NOW() - INTERVAL '30 days'
+		FROM deleted_groups d WHERE d.project_id = $1 AND d.deleted_at > NOW() - INTERVAL '`+TrashRetention+`'
 		ORDER BY d.deleted_at DESC, d.kind, d.item_id`, projectID)
 	if err != nil {
 		return nil, err
