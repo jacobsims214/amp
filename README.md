@@ -95,9 +95,11 @@ v2/scripts/setup-claude-code.sh               # from a checkout
 export AMP_MCP_URL=https://<your-amp>/mcp     # point it at your server
 ```
 
-**opencode**: `make sync-global` (from `v2/`) copies the agents, skills and the `amp-usage`
-plugin into `~/.config/opencode` and merges the `amp` MCP server into `opencode.json`. Add your
-token to the server's headers.
+**opencode**: `v2/scripts/setup-opencode.sh` installs the AMP opencode plugin from this
+checkout and adds it to the `plugins` list in `~/.config/opencode/opencode.json`. The plugin
+brings the agents, skills, MCP servers and model settings. Pass `--url https://<your-amp>/mcp`
+for your server and `--token <token>`, or leave the token out to sign in with OAuth. If you
+copied AMP's agents into `~/.config/opencode` the old way, add `--clean` to remove those copies.
 
 **Anything else**: point it at `https://<your-amp>/mcp` with `Authorization: Bearer <token>`.
 
@@ -187,11 +189,11 @@ make dev           # api + ui as local processes against dockerised postgres
 make api-test      # API integration tests (needs postgres)
 make check         # go vet + UI typecheck + tests
 make ui-dev        # Vite dev server, proxies /api to :3001
-make sync-global   # install agents/skills into ~/.config/opencode
 ```
 
 The Claude Code plugin in `v2/plugins/amp/` is generated from `v2/.opencode/`. Edit the
-sources and run `v2/scripts/build-claude-plugin.sh`.
+sources and run `v2/scripts/build-claude-plugin.sh`. To use the agents in opencode, run
+`v2/scripts/setup-opencode.sh` once; it installs the opencode plugin from `v2/plugins/opencode/`.
 
 ---
 
