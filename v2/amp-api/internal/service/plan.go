@@ -1004,8 +1004,10 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 // ---- Plan approval ----
 
 // ApprovePlan records that a person approved the project's plan as it is
-// now: every ticket planned so far may be dispatched. Team leads and
-// project owners can approve; agents can't (a person approves agents' plans).
+// now: every ticket planned so far may be dispatched. Any person with at
+// least member access to the project (on one of its teams, or an org or
+// global admin) can approve, not only team leads and project owners; agent
+// accounts can't (a person approves agents' plans).
 func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
 	if p.Agent {
 		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
