@@ -104,18 +104,28 @@ type DocSummary struct {
 }
 
 type SearchResult struct {
-	Scope            string   `json:"scope"`
-	ScopeID          int      `json:"scope_id"`
-	Path             string   `json:"path"`
-	Title            string   `json:"title"`
-	Tags             []string `json:"tags"`
-	Excerpt          string   `json:"excerpt"` // best-matching chunk_text, trimmed
-	Author           string   `json:"author"`
-	UpdatedAt        int64    `json:"updated_at"`
-	Score            float64  `json:"score"`
-	AnnotationCount  int      `json:"annotation_count"`
-	LatestAnnotation string   `json:"latest_annotation"`
-	RecencyLabel     string   `json:"recency_label"`
+	Scope     string   `json:"scope"`
+	ScopeID   int      `json:"scope_id"`
+	Path      string   `json:"path"`
+	Title     string   `json:"title"`
+	Tags      []string `json:"tags"`
+	Excerpt   string   `json:"excerpt"` // best-matching chunk_text, trimmed
+	Author    string   `json:"author"`
+	UpdatedAt int64    `json:"updated_at"`
+	// Score is the hit's relevance in [0,1], highest first. On a hybrid
+	// search it is Typesense's rank-fusion score (the value results are
+	// ordered by); on a keyword-only collection it is the reciprocal of the
+	// hit's rank. It is never the raw text_match.
+	Score float64 `json:"score"`
+	// VectorScore is the semantic similarity (1 - vector distance, clamped
+	// to [0,1]) when the hit came back from the vector half of a hybrid
+	// search; absent otherwise.
+	VectorScore *float64 `json:"vector_score,omitempty"`
+	// KeywordMatch is true when the hit matched the query's keywords.
+	KeywordMatch     bool   `json:"keyword_match,omitempty"`
+	AnnotationCount  int    `json:"annotation_count"`
+	LatestAnnotation string `json:"latest_annotation"`
+	RecencyLabel     string `json:"recency_label"`
 }
 
 type TagCount struct {
@@ -663,18 +673,19 @@ func (s *Service) Search(ctx context.Context, sc Scope, query string, tags []str
 	if results.Hits == nil {
 		return out, nil
 	}
-	for _, hit := range *results.Hits {
+	prevScore := 1.0
+	for rank, hit := range *results.Hits {
 		if hit.Document == nil {
 			continue
 		}
 		doc := mapToDoc(hit.Document)
-		score := 0.0
-		if hit.VectorDistance != nil {
-			// Convert distance to similarity: lower distance = higher score
-			score = float64(1.0 - *hit.VectorDistance)
-		} else if hit.TextMatch != nil {
-			score = float64(*hit.TextMatch)
+		hs := scoreHit(hit, rank)
+		// Typesense's order is authoritative: never let a row outscore the
+		// one above it, even if a fallback score would say otherwise.
+		if hs.score > prevScore {
+			hs.score = prevScore
 		}
+		prevScore = hs.score
 		// Check stored fields on the chunk document
 		storedCount := 0
 		storedLatest := ""
@@ -703,13 +714,60 @@ func (s *Service) Search(ctx context.Context, sc Scope, query string, tags []str
 			Excerpt:          trimExcerpt(doc.ChunkText, 120),
 			Author:           doc.Author,
 			UpdatedAt:        doc.UpdatedAt,
-			Score:            score,
+			Score:            hs.score,
+			VectorScore:      hs.vector,
+			KeywordMatch:     hs.keyword,
 			AnnotationCount:  annCount,
 			LatestAnnotation: annLatest,
 			RecencyLabel:     computeRecencyLabel(time.Unix(doc.UpdatedAt, 0)),
 		})
 	}
 	return out, nil
+}
+
+// hitScore is a search hit's relevance as reported to callers.
+type hitScore struct {
+	score   float64  // overall relevance in [0,1]
+	vector  *float64 // semantic similarity in [0,1], nil if no vector distance
+	keyword bool     // matched on keywords
+}
+
+// scoreHit maps a Typesense hit to a 0-1 relevance score. rank is the hit's
+// 0-based position in the results, which Typesense has already ordered.
+//
+// Typesense orders hybrid results by rank_fusion_score (keyword rank and
+// vector rank fused, weights summing to 1), so that is the score when
+// present. Without it (a keyword-only collection) the raw text_match is a
+// packed ~1e18 integer, not a similarity, so the score is derived from rank
+// instead: 1/(rank+1), the same reciprocal-rank form fusion uses. A hit with
+// only a vector distance falls back to its clamped similarity.
+func scoreHit(hit api.SearchResultHit, rank int) hitScore {
+	var hs hitScore
+	if hit.VectorDistance != nil {
+		v := clamp01(1.0 - float64(*hit.VectorDistance))
+		hs.vector = &v
+	}
+	hs.keyword = hit.TextMatch != nil && *hit.TextMatch > 0
+
+	switch {
+	case hit.HybridSearchInfo != nil && hit.HybridSearchInfo.RankFusionScore != nil:
+		hs.score = clamp01(float64(*hit.HybridSearchInfo.RankFusionScore))
+	case hs.keyword || hs.vector == nil:
+		hs.score = 1.0 / float64(rank+1)
+	default:
+		hs.score = *hs.vector
+	}
+	return hs
+}
+
+func clamp01(f float64) float64 {
+	if f < 0 {
+		return 0
+	}
+	if f > 1 {
+		return 1
+	}
+	return f
 }
 
 // CountDocs returns how many documents a KB holds, 0 if nothing has ever
