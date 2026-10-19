@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/domain"
 )
@@ -79,4 +80,43 @@ func (r *Repo) ListAudit(ctx context.Context, f domain.AuditFilter) ([]domain.Au
 		}
 		return json.Unmarshal(details, &e.Details)
 	})
+}
+
+// RecentAudit reports whether actor (by user id, or email when there's no
+// user) recorded action on target since `since`: for de-duplicating views.
+func (r *Repo) RecentAudit(ctx context.Context, action, targetType, targetID string, actorUserID *int, actorEmail string, since time.Time) (bool, error) {
+	var ok bool
+	err := r.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM audit_log WHERE action = $1 AND target_type = $2 AND target_id = $3
+		AND ((actor_user_id IS NOT NULL AND actor_user_id = $4) OR ($4::int IS NULL AND actor_email = $5)) AND at > $6)`,
+		action, targetType, targetID, actorUserID, actorEmail, since).Scan(&ok)
+	return ok, err
+}
+
+// TargetAudit lists the audit entries about one target, newest first.
+func (r *Repo) TargetAudit(ctx context.Context, targetType, targetID string, limit int) ([]domain.AuditEntry, error) {
+	rows, err := r.db.Query(ctx, `SELECT id, at, actor_user_id, actor_email, via_token, org_id, project_id, action, target_type, target_id, summary, details
+		FROM audit_log WHERE target_type = $1 AND target_id = $2 ORDER BY at DESC, id DESC LIMIT $3`, targetType, targetID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.AuditEntry{}
+	for rows.Next() {
+		var e domain.AuditEntry
+		var details []byte
+		if err := rows.Scan(&e.ID, &e.At, &e.ActorUserID, &e.ActorEmail, &e.ViaToken, &e.OrgID, &e.ProjectID,
+			&e.Action, &e.TargetType, &e.TargetID, &e.Summary, &details); err != nil {
+			return nil, err
+		}
+		_ = json.Unmarshal(details, &e.Details)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// CountArtifactVersions is how many versions an artifact has.
+func (r *Repo) CountArtifactVersions(ctx context.Context, id int) (int, error) {
+	var n int
+	err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM artifact_versions WHERE artifact_id = $1`, id).Scan(&n)
+	return n, err
 }

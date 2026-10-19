@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -111,9 +112,9 @@ func setupMCP(t *testing.T) *mcpStack {
 	}
 
 	// Wire the MCP server — enable tool capabilities (same as production).
-	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", mcpserver.WithToolCapabilities(false))
 	kbSvc := testKB()
 	mcpHandler := mcp.NewServer(reg, repo, sseHub, kbSvc)
+	srv := mcpserver.NewMCPServer("amp-api-test", "2.0.0", append([]mcpserver.ServerOption{mcpserver.WithToolCapabilities(false)}, mcpHandler.ServerOptions()...)...)
 	mcpHandler.Register(srv)
 
 	return &mcpStack{srv: srv, repo: repo, reg: reg, hub: sseHub, kb: kbSvc, projectID: proj.ID, epicID: epic.ID, storyID: story.ID}
@@ -419,7 +420,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 
 	// ---- Phase 2: Manager calls amp_list_tasks, sees what to dispatch ----
 
-	list := s.call(t, "amp_list_tasks", map[string]interface{}{
+	list := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 
@@ -472,7 +473,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 	})
 
 	// Task 3 should still be blocked — task 2 not done yet.
-	list2 := s.call(t, "amp_list_tasks", map[string]interface{}{
+	list2 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 	if sliceLen(t, list2, "ready_to_dispatch") != 0 {
@@ -501,7 +502,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 	})
 
 	// Task 3 must now be in ready_to_dispatch — actor auto-unblocked it.
-	list3 := s.call(t, "amp_list_tasks", map[string]interface{}{
+	list3 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 	ready3 := sliceIDs(t, list3, "ready_to_dispatch")
@@ -530,7 +531,7 @@ func TestMCP_FullManagerLoop(t *testing.T) {
 
 	// ---- Phase 8: Final state check — everything done ----
 
-	finalList := s.call(t, "amp_list_tasks", map[string]interface{}{
+	finalList := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(s.projectID),
 	})
 
@@ -583,11 +584,11 @@ func TestMCP_DiamondDAGThroughMCP(t *testing.T) {
 		s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id)})
 	}
 	listReady := func() []int {
-		r := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		r := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		return sliceIDs(t, r, "ready_to_dispatch")
 	}
 	listBlocked := func() []map[string]interface{} {
-		r := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		r := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		raw, _ := r["blocked"].([]interface{})
 		out := make([]map[string]interface{}, len(raw))
 		for i, item := range raw {
@@ -665,4 +666,40 @@ func TestMCP_DiamondDAGThroughMCP(t *testing.T) {
 		t.Errorf("final: want 0 ready, got %v", finalReady)
 	}
 	t.Logf("diamond DAG complete — all tasks done ✓")
+}
+
+// Parameters documented "REQUIRED." are required in the tool schema, so
+// models calling tools directly (not reading the prose) don't drop them;
+// conditional ones ("REQUIRED for a new artifact") stay optional.
+func TestToolSchemasDeclareRequired(t *testing.T) {
+	s := setupMCP(t)
+	raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+	b, _ := json.Marshal(s.srv.HandleMessage(s.callCtx(), raw))
+	var resp struct {
+		Result struct {
+			Tools []struct {
+				Name        string `json:"name"`
+				InputSchema struct {
+					Required []string `json:"required"`
+				} `json:"inputSchema"`
+			} `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(b, &resp); err != nil {
+		t.Fatal(err)
+	}
+	req := map[string][]string{}
+	for _, tl := range resp.Result.Tools {
+		req[tl.Name] = tl.InputSchema.Required
+	}
+	if got := req["amp_add_task_comment"]; len(got) != 2 || got[0] != "body" || got[1] != "task_id" {
+		t.Errorf("amp_add_task_comment required = %v, want [body task_id]", got)
+	}
+	if got := req["amp_publish_artifact"]; len(got) != 0 {
+		t.Errorf("amp_publish_artifact required = %v, want none (title/kind are only for a new artifact)", got)
+	}
+	msg := s.callExpectError(t, "amp_add_task_comment", map[string]any{"body": "x"})
+	if !strings.Contains(msg, "task_id") {
+		t.Errorf("missing task_id error: %q", msg)
+	}
 }

@@ -243,7 +243,10 @@ func main() {
 	// _meta are served statelessly; legacy clients that open with
 	// initialize (2025-11-25 and earlier) keep their Mcp-Session-Id
 	// session exactly as before. See mcp_http.go.
-	mcpSrv := newMCPServer(mcp.NewServer(registry, repo, sseHub, kbSvc))
+	mcpTools := mcp.NewServer(registry, repo, sseHub, kbSvc)
+	mcpTools.SetAppURL(appPublicURL())
+	mcpTools.SetArtifactRetention(artifactRetention())
+	mcpSrv := newMCPServer(mcpTools)
 
 	// Token audience (RFC 8707 / MCP 2026-07-28 "token audience binding").
 	// MCP tokens must carry the MCP_AUDIENCE client ID, which the
@@ -280,7 +283,11 @@ func main() {
 	// ---- 6. REST + SSE API (port 3001) ----
 	mux := http.NewServeMux()
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
+	restHandler.SetAppURL(appPublicURL())
+	restHandler.SetArtifactRetention(artifactRetention())
 	restHandler.Register(mux)
+	// Artifacts nobody kept are deleted after the retention period.
+	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
 
 	// Health check (unauthenticated, used by k8s probes)
 	var draining atomic.Bool
@@ -311,6 +318,7 @@ func main() {
 
 	// Auth wraps everything except /health.
 	var apiHandler http.Handler = mux
+	apiHandler = api.RejectCrossSiteWrites(apiHandler)
 	apiHandler = authExceptHealth(restVerifier, apiHandler)
 	apiHandler = corsMiddleware.Handler(apiHandler)
 
@@ -385,4 +393,26 @@ func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 		}
 		authed.ServeHTTP(w, r)
 	})
+}
+
+// appPublicURL is AMP's public address, for links to pages in the UI:
+// APP_PUBLIC_URL, or MCP_PUBLIC_URL without its /mcp path. Empty when
+// neither is set (local dev), and links are left out.
+func appPublicURL() string {
+	if u := os.Getenv("APP_PUBLIC_URL"); u != "" {
+		return strings.TrimSuffix(u, "/")
+	}
+	if u := os.Getenv("MCP_PUBLIC_URL"); u != "" {
+		return strings.TrimSuffix(strings.TrimSuffix(u, "/"), "/mcp")
+	}
+	return ""
+}
+
+// artifactRetention is how long an artifact lives after its last version
+// unless someone keeps it: ARTIFACT_RETENTION_DAYS, default 45.
+func artifactRetention() time.Duration {
+	if d, err := strconv.Atoi(os.Getenv("ARTIFACT_RETENTION_DAYS")); err == nil && d > 0 {
+		return time.Duration(d) * 24 * time.Hour
+	}
+	return 0 // the service default
 }

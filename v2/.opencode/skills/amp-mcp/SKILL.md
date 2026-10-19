@@ -19,16 +19,17 @@ one feature with no obvious entry point — scheduling.
 
 ## Full tool list by area
 
-- **Projects**: `amp_create_project`, `amp_list_projects`, `amp_get_project`, `amp_reset_project` (destructive), `amp_export_project`, `amp_import_project`, `amp_archive_project`, `amp_restore_project`, `amp_update_project_settings` (owners)
-- **Epics**: `amp_create_epic`, `amp_list_epics`, `amp_get_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
-- **Stories**: `amp_create_story`, `amp_list_stories`, `amp_list_project_stories`, `amp_get_story`, `amp_update_story`, `amp_move_story`, `amp_delete_story`
+- **Projects**: `amp_create_project`, `amp_list_projects`, `amp_get_project`, `amp_update_project_settings` (owners). Rare project admin (archive, restore, reset, export, import) is in the AMP UI.
+- **The plan**: `amp_get_plan` (epics → stories with ticket counts, one call), `amp_list_epics`
+- **Epics**: `amp_create_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
+- **Stories**: `amp_create_story`, `amp_update_story`, `amp_move_story`, `amp_delete_story`
 - **Planning**: `amp_create_tasks` (several tickets and their dependencies in one call), `amp_set_task_dependencies`, `amp_move_task`, `amp_check_plan` — see the `amp-planning` skill. Dependencies drive dispatch: never leave them out, and never delete and re-create tickets to fix them
-- **Tasks**: `amp_create_task`, `amp_list_tasks`, `amp_get_task`, `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_get_task_comments`, `amp_get_ticket_history`, `amp_claim_task`, `amp_assign_task`
+- **Tasks**: `amp_create_tasks`, `amp_list_tasks` (compact board; `format: "full"` for full records), `amp_get_task` (`include: ["comments","history","runs"]` for its comments, activity and runs), `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_claim_task`, `amp_assign_task`
 - **People**: `amp_whoami`, `amp_list_project_members`
 - **Daily reports**: `amp_day_report`, `amp_save_day_report`, `amp_list_day_reports`, `amp_velocity` — see the `amp-day-report` skill
 - **Metadata**: `metadata` on the create/update tools for projects, epics, stories, and tasks; `amp_find_by_metadata`
-- **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_create_org`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
-- **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_tags`, `amp_kb_reindex`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
+- **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
+- **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
 
 ---
 
@@ -53,16 +54,16 @@ number, or boolean), e.g. `jira_board: "PLAT"`, `initiative: "Q3 growth"`,
 
 Tasks can be held until a future time instead of sitting in the backlog:
 
-- `amp_create_task` accepts an optional `start_at` (ISO 8601 datetime). The task is created
+- `amp_create_tasks` accepts an optional `start_at` (ISO 8601 datetime) per ticket. The task is created
   `blocked` until that time, then auto-unblocks — same mechanism as a dependency, but time-based
   instead of task-based.
 - `amp_set_task_start_at` {task_id, start_at?} — set or clear the schedule on an existing task.
   Omit `start_at` to clear it.
-- `amp_list_tasks` returns a separate `scheduled` bucket for tasks waiting on their start time —
-  distinct from `blocked` (which is waiting on dependencies) and `ready_to_dispatch`.
+- `amp_list_tasks` counts tasks waiting on their start time as `scheduled` — distinct from
+  waiting on dependencies and from `ready_to_dispatch`.
 
 Use this for genuinely time-gated work (e.g. "don't touch this until the migration window
-opens") — not as a substitute for `dependency_ids` when the real gate is another task finishing.
+opens") — not as a substitute for `depends_on` when the real gate is another task finishing.
 
 ---
 
@@ -73,12 +74,11 @@ A subagent can't wait for an answer, so a question lives on the ticket:
 - `amp_block_task` {task_id, reason} — the worker's way to stop and ask. `reason` is required and
   is the question people see in AMP ("Avalara or Stripe Tax? …"). Not for waiting on other
   tickets — that's a dependency.
-- `amp_list_tasks` returns a `questions` list: blocked tickets whose reason is a question (they
-  are also in `blocked`, for older clients).
+- `amp_list_tasks` returns a `questions` list: each blocked ticket with its question.
 - `amp_answer_question` {task_id, answer} — the orchestrator's way to record the user's answer:
   it's posted as a comment and the ticket goes back to ready (or to waiting, if it still depends
   on unfinished tickets). People answering in the AMP UI do exactly the same.
-- The next worker dispatched to the ticket reads `amp_get_task_comments` first and finds the answer.
+- The next worker dispatched to the ticket reads its comments first (`amp_get_task` with `include: ["comments"]`) and finds the answer.
 
 ---
 
@@ -90,7 +90,7 @@ agent); `assigned_to`/`agent_id` still name the agent profile that runs it.
 - `amp_list_tasks` shows **your work by default**: tickets you own plus unassigned tickets you
   created. Pass `owner: "unassigned"` for the pool anyone can pick up, `owner: "any"` for
   everything, or a teammate's email.
-- Tickets you create are yours. Pass `owner: "none"` to `amp_create_task` to leave one in the pool,
+- Tickets you create are yours. Pass `owner: "none"` on a ticket in `amp_create_tasks` to leave it in the pool,
   or a teammate's email to give it to them.
 - `amp_claim_task` takes an unassigned ticket, and never someone else's. `amp_dispatch_task` on an
   unassigned ticket claims it too. A ticket someone else owns can't be dispatched, completed, or
@@ -127,7 +127,7 @@ If you act for an admin you can run the platform for them. The `amp_manage_*` to
 
 - `project_id`, `task_id`, `epic_id`, `story_id` — integers
 - `priority` — `"0"`=low, `"1"`=normal (default), `"2"`=high, `"3"`=critical
-- `dependency_ids` — array of integer task IDs (can span epics and stories)
+- `depends_on` (in `amp_create_tasks`) — refs of tickets in the batch or existing ticket IDs (can span epics and stories)
 - `start_at` — ISO 8601 datetime string, e.g. `"2026-08-01T09:00:00Z"`
 - `assigned_to` — free text string matching a live agent name, e.g. `"amp-worker-backend"`
 - `owner` / `user` — a person: email, numeric user id, `"me"`, or `"none"`

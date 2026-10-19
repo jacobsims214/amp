@@ -64,5 +64,11 @@ Learned the hard way in team trials (see `field-notes.md`):
 ## 4. The agents
 
 The AMP template ships a **manager** (plans, dispatches, never implements), **workers** by
-domain (backend, frontend, docs), **reviewers**, **researchers** and a **KB curator**, plus skills
-for planning, execution, review, day reports and the KB. The manager is the one you talk to.
+domain (backend, frontend, docs), a **designer** (visual design, mockups, standalone pages and
+diagrams), a **media** specialist (reads images, video and audio; makes images), **reviewers**,
+**researchers** and a **KB curator**, plus skills for planning, execution, review, day reports,
+image generation and the KB. The manager is the one you talk to.
+
+In opencode each agent runs on an OpenRouter model chosen for it, open-weight first, with its
+input types and thinking level set in `opencode.json`; `v2/docs/opencode-models.md` in the AMP
+repo has the table and the reasons. In Claude Code the agents use your session's model.

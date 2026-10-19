@@ -8,7 +8,7 @@ tags: [day-report, standup, start-of-day, session, routine]
 ## Starting a session
 
 A new day or a restart after a crash. Before anything new, the manager:
-1. `amp_list_tasks(format="compact")`: looks at `quiet` (in progress, no activity: the worker
+1. `amp_list_tasks`: looks at `quiet` (in progress, no activity: the worker
    died with an earlier session), reads their comments, records abandoned runs, puts them back to
    backlog and re-dispatches them.
 2. Checks `questions`: answers may have come in through the UI overnight.

@@ -121,7 +121,11 @@ func (s *server) handler() http.Handler {
 
 func (s *server) authServerMetadata(w http.ResponseWriter, r *http.Request) {
 	jsonOK(w, map[string]interface{}{
-		"issuer":                                s.dexURL,
+		// RFC 8414 §3.3: the issuer must be the URL the metadata was
+		// discovered from (this broker), or strict clients reject it
+		// ("issuer mismatch"). Tokens are still Dex's, validated against
+		// Dex's JWKS; MCP clients treat them as opaque.
+		"issuer":                                s.selfURL,
 		"authorization_endpoint":                s.selfURL + "/authorize",
 		"token_endpoint":                        s.dexURL + "/token",
 		"jwks_uri":                              s.dexURL + "/keys",

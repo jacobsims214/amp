@@ -46,5 +46,5 @@ Your column and split choices are remembered in your browser.
 3. Reports in the project for the per-epic and per-model detail.
 4. Give the number with its caveat: how many runs reported no usage.
 
-Agents can answer this too: `amp_get_task_runs`, `amp_get_ticket_history`, and the project
+Agents can answer this too: `amp_get_task` with `include: ["runs","history"]`, and the project
 report, and they should state the same caveat.

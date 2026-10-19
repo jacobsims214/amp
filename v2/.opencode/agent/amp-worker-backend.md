@@ -2,14 +2,16 @@
 description: Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend tests. Executes one assigned AMP task end-to-end.
 mode: subagent
 hidden: true
-model: openrouter/moonshotai/kimi-k3
+model: openrouter/deepseek/deepseek-v4.1-flash-1017
+variant: max
 temperature: 0.1
-steps: 60
+steps: 1000
 permission:
   edit: allow
   bash: allow
   webfetch: allow
   todowrite: deny
+  question: deny
 ---
 
 # AMP Backend Specialist

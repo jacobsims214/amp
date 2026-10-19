@@ -62,7 +62,7 @@ func TestMCP_QuestionRoundTrip(t *testing.T) {
 	}
 	s.call(t, "amp_block_task", map[string]any{"task_id": float64(id), "reason": "Avalara or Stripe Tax?"})
 
-	list := s.call(t, "amp_list_tasks", map[string]any{"project_id": float64(s.projectID), "owner": "any"})
+	list := s.call(t, "amp_list_tasks", map[string]any{"format": "full", "project_id": float64(s.projectID), "owner": "any"})
 	inList := func(bucket string) bool {
 		for _, x := range list[bucket].([]any) {
 			if int(x.(map[string]any)["id"].(float64)) == id {
@@ -79,7 +79,7 @@ func TestMCP_QuestionRoundTrip(t *testing.T) {
 	if out["state"] != "backlog" {
 		t.Fatalf("after the answer: %v", out)
 	}
-	list = s.call(t, "amp_list_tasks", map[string]any{"project_id": float64(s.projectID), "owner": "any"})
+	list = s.call(t, "amp_list_tasks", map[string]any{"format": "full", "project_id": float64(s.projectID), "owner": "any"})
 	if !inList("ready_to_dispatch") || inList("questions") {
 		t.Fatalf("answered ticket not ready: %v", list["questions"])
 	}

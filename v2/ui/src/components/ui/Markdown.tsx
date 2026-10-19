@@ -1,4 +1,5 @@
 import ReactMarkdown, { type Components } from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 /**
  * Markdown in the house style: KB documents ('doc') and ticket text
@@ -31,5 +32,5 @@ export function Markdown({ children, size = 'doc' }: { children: string; size?: 
     th: ({ children }) => <th className="amp-label text-left px-3 py-2 bg-surface-2 border-b border-line">{children}</th>,
     td: ({ children }) => <td className="px-3 py-2 text-ink-2 text-sm border-b border-line">{children}</td>,
   }
-  return <div className="min-w-0 break-words"><ReactMarkdown components={components}>{children}</ReactMarkdown></div>
+  return <div className="min-w-0 break-words"><ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>{children}</ReactMarkdown></div>
 }

@@ -115,10 +115,10 @@ func TestIsolation_TasksDoNotCrossProjects(t *testing.T) {
 		beta.mkTask(t, fmt.Sprintf("beta-task-%d", i), nil)
 	}
 
-	alphaList := alpha.call(t, "amp_list_tasks", map[string]interface{}{
+	alphaList := alpha.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(alpha.projectID),
 	})
-	betaList := beta.call(t, "amp_list_tasks", map[string]interface{}{
+	betaList := beta.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(beta.projectID),
 	})
 
@@ -174,7 +174,7 @@ func TestIsolation_CompletingInAlphaDoesNotUnblockBeta(t *testing.T) {
 	t.Logf("alpha task %d completed", alphaID)
 
 	// beta-B must still be blocked.
-	betaList := beta.call(t, "amp_list_tasks", map[string]interface{}{
+	betaList := beta.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(beta.projectID),
 	})
 	if sliceLen(t, betaList, "blocked") != 1 {
@@ -196,7 +196,7 @@ func TestIsolation_CompletingInAlphaDoesNotUnblockBeta(t *testing.T) {
 		"task_id": float64(betaAID),
 	})
 
-	betaList2 := beta.call(t, "amp_list_tasks", map[string]interface{}{
+	betaList2 := beta.call(t, "amp_list_tasks", map[string]interface{}{"format": "full",
 		"project_id": float64(beta.projectID),
 	})
 	if sliceLen(t, betaList2, "ready_to_dispatch") != 1 {
@@ -247,7 +247,7 @@ func TestIsolation_ConcurrentProjectsConcurrentAgents(t *testing.T) {
 		log("created A=%d B=%d C=%d", idA, idB, idC)
 
 		// Verify initial list.
-		list0 := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		list0 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		if sliceLen(t, list0, "ready_to_dispatch") != 2 {
 			t.Errorf("[%s] initial: want 2 ready, got %d", name, sliceLen(t, list0, "ready_to_dispatch"))
 		}
@@ -272,7 +272,7 @@ func TestIsolation_ConcurrentProjectsConcurrentAgents(t *testing.T) {
 		log("A completed")
 
 		// C must still be blocked — B not done yet.
-		list1 := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		list1 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		if sliceLen(t, list1, "blocked") != 1 {
 			t.Errorf("[%s] after A: C should still be blocked, got blocked=%d",
 				name, sliceLen(t, list1, "blocked"))
@@ -298,7 +298,7 @@ func TestIsolation_ConcurrentProjectsConcurrentAgents(t *testing.T) {
 		log("B completed")
 
 		// C must now be in ready_to_dispatch — actor auto-unblocked it.
-		list2 := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		list2 := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		ready2 := sliceIDs(t, list2, "ready_to_dispatch")
 		if len(ready2) != 1 || ready2[0] != idC {
 			t.Errorf("[%s] after B: want ready=[C=%d], got %v", name, idC, ready2)
@@ -318,7 +318,7 @@ func TestIsolation_ConcurrentProjectsConcurrentAgents(t *testing.T) {
 		log("C completed")
 
 		// Final state: all 3 done, nothing ready, nothing blocked.
-		final := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+		final := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 		if sliceLen(t, final, "ready_to_dispatch") != 0 {
 			t.Errorf("[%s] final: want 0 ready, got %d", name, sliceLen(t, final, "ready_to_dispatch"))
 		}
@@ -350,8 +350,8 @@ func TestIsolation_ConcurrentProjectsConcurrentAgents(t *testing.T) {
 	wg.Wait()
 
 	// Cross-check: alpha's list must never contain beta's tasks and vice versa.
-	alphaFinal := alpha.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(alpha.projectID)})
-	betaFinal := beta.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(beta.projectID)})
+	alphaFinal := alpha.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(alpha.projectID)})
+	betaFinal := beta.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(beta.projectID)})
 
 	alphaTotal := sliceLen(t, alphaFinal, "completed")
 	betaTotal := sliceLen(t, betaFinal, "completed")

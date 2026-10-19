@@ -14,6 +14,8 @@ import { Orgs } from './pages/Orgs'
 import { Access } from './pages/Access'
 import { Trace } from './pages/Trace'
 import { Portfolio } from './pages/Portfolio'
+import { Artifacts } from './pages/Artifacts'
+import { ArtifactView } from './pages/ArtifactView'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 import { LaunchSequence } from './components/brand/LaunchSequence'
@@ -49,6 +51,8 @@ export default function App() {
             <Route path="/project/:projectId/dag" element={<DAGView />} />
             <Route path="/project/:projectId/report" element={<Report />} />
             <Route path="/project/:projectId/kb" element={<KB />} />
+            <Route path="/project/:projectId/artifacts" element={<Artifacts />} />
+            <Route path="/artifacts/:artifactId" element={<ArtifactView />} />
             <Route path="/project/:projectId/settings" element={<ProjectSettings />} />
             <Route path="/teams/:teamId/kb" element={<KB />} />
             <Route path="/orgs/:orgId/kb" element={<KB />} />

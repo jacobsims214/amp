@@ -309,6 +309,7 @@ const (
 	EventTaskAssigned      EventType = "task.assigned"
 	EventEpicUpdated       EventType = "epic.updated"
 	EventStoryUpdated      EventType = "story.updated"
+	EventArtifactUpdated   EventType = "artifact.updated"
 )
 
 // AllEventTypes lists every event the hub publishes.
@@ -318,6 +319,7 @@ var AllEventTypes = []EventType{
 	EventStoryCreated, EventStoryStateChanged, EventStoryUpdated,
 	EventTaskCreated, EventTaskUpdated, EventTaskDispatched, EventTaskCompleted,
 	EventTaskBlocked, EventTaskUnblocked, EventTaskAssigned, EventCommentAdded,
+	EventArtifactUpdated,
 }
 
 type Event struct {

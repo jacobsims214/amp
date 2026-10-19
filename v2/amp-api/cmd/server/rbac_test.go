@@ -134,7 +134,7 @@ func taskOwner(t *testing.T, s *mcpStack, id int) *int {
 
 func listedIDs(t *testing.T, s *mcpStack, owner string) []int {
 	t.Helper()
-	args := map[string]interface{}{"project_id": float64(s.projectID)}
+	args := map[string]interface{}{"project_id": float64(s.projectID), "format": "full"}
 	if owner != "" {
 		args["owner"] = owner
 	}
@@ -176,7 +176,7 @@ func TestRBAC_ProjectVisibility(t *testing.T) {
 		// ...and every project-scoped tool reports it as not found.
 		msg := w.as(id).callExpectError(t, "amp_get_project", map[string]interface{}{"project_id": float64(w.s.projectID)})
 		wantErr(t, msg, "not found")
-		msg = w.as(id).callExpectError(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(w.s.projectID)})
+		msg = w.as(id).callExpectError(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(w.s.projectID)})
 		wantErr(t, msg, "not found")
 		msg = w.as(id).callExpectError(t, "amp_get_story", map[string]interface{}{"story_id": float64(w.s.storyID)})
 		wantErr(t, msg, "story", "not found")
@@ -657,7 +657,7 @@ func TestRBAC_ProjectTeamsOverMCP(t *testing.T) {
 	}
 	wantErr(t, w.as(w.alice).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)}), "project owner, an org admin, or the lead")
 	w.as(w.owner).call(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.ops.ID)})
-	wantErr(t, w.as(w.carol).callExpectError(t, "amp_list_tasks", map[string]interface{}{"project_id": pid}), "not found")
+	wantErr(t, w.as(w.carol).callExpectError(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": pid}), "not found")
 	wantErr(t, w.as(w.owner).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "link", "project_id": pid, "team_id": float64(w.x.ID)}), "different org")
 	wantErr(t, w.as(w.owner).callExpectError(t, "amp_manage_project_teams", map[string]interface{}{"action": "unlink", "project_id": pid, "team_id": float64(w.core.ID)}), "at least one owner team")
 }

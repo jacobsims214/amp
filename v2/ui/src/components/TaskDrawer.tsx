@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check } from 'lucide-react'
 import { api } from '../api/client'
+import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
 import { StatusBadge } from './StatusBadge'
 import { PriorityMark } from './ui/PriorityMark'
@@ -254,6 +255,9 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           <FlagAnswer key={`flag-${task.id}`} task={task} canWork={canWork}
             onAnswered={t => { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.(); api.getComments(t.id).then(setComments).catch(() => {}) }} />
         )}
+
+        {/* Mockups, diagrams and documents published to this ticket */}
+        <TicketArtifacts projectId={task.project_id} taskId={task.id} />
 
         {/* Owner */}
         <OwnerSection

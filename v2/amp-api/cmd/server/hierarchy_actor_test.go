@@ -141,7 +141,7 @@ func TestHierarchyActor_CrossStoryDepUnblocksCorrectly(t *testing.T) {
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id1)})
 
 	// Task 2 should now be backlog.
-	list := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID)})
+	list := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID)})
 	readyIDs := sliceIDs(t, list, "ready_to_dispatch")
 
 	found := false
@@ -222,7 +222,7 @@ func TestHierarchyActor_CrossEpicDepUnblocksCorrectly(t *testing.T) {
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(idA)})
 
 	// Epic B's task should now be in ready_to_dispatch.
-	list := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(proj.ID)})
+	list := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(proj.ID)})
 	readyIDs := sliceIDs(t, list, "ready_to_dispatch")
 
 	found := false

@@ -4,7 +4,7 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
 } from '../types'
 
 const BASE = '/api'
@@ -179,6 +179,21 @@ export const api = {
     post<{ task: Task }>(`/tasks/${id}/assign`, { user: userRef(user) }).then(r => r.task),
   setTaskStartAt: (id: number, startAt: string | null) =>
     post<{ task_id: number; start_at: string | null }>(`/tasks/${id}/start_at`, { start_at: startAt }),
+
+  // Artifacts
+  listArtifacts: (projectId: number, taskId?: number) =>
+    get<{ artifacts: Artifact[] }>(`/projects/${projectId}/artifacts${taskId != null ? `?task_id=${taskId}` : ''}`).then(r => r.artifacts ?? []),
+  getArtifact: (id: number) => get<{ artifact: Artifact; versions: ArtifactVersion[] }>(`/artifacts/${id}`),
+  reviewArtifact: (id: number, review: { approve: boolean; note?: string; version?: number }) =>
+    post<{ artifact: Artifact }>(`/artifacts/${id}/review`, review).then(r => r.artifact),
+  /** Who published, reviewed, kept and viewed it. Throws for people who may not see it. */
+  artifactActivity: (id: number) => get<{ activity: AuditEntry[] }>(`/artifacts/${id}/activity`).then(r => r.activity ?? []),
+  keepArtifact: (id: number, keep: boolean) => post<{ artifact: Artifact }>(`/artifacts/${id}/keep`, { keep }).then(r => r.artifact),
+  letArtifactExpire: (id: number) => post<{ artifact: Artifact }>(`/artifacts/${id}/let-expire`).then(r => r.artifact),
+  /** My artifacts (made by me, or on my tickets) that expire within `days` and that nobody kept. */
+  expiringArtifacts: (days = 14) => get<{ artifacts: Artifact[] }>(`/artifacts/expiring?days=${days}`).then(r => r.artifacts ?? []),
+  /** Where a version's content is served (sandboxed). */
+  artifactContentUrl: (id: number, version?: number) => `${BASE}/artifacts/${id}/content${version ? `?version=${version}` : ''}`,
 
   // Comments
   getComments: (taskId: number) =>

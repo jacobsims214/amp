@@ -41,7 +41,7 @@ subagent result in Claude Code) or are left out.
 
 Each attempt at a ticket is a run, kept even if the ticket is later deleted. Outcomes:
 `completed`, `blocked`, `abandoned` (a worker that died or was stopped; the manager records it
-with `amp_report_run(outcome="abandoned", run_note=…)`). `amp_get_task_runs` lists them; the
+with `amp_report_run(outcome="abandoned", run_note=…)`). `amp_get_task(task_id, include=["runs"])` lists them; the
 ticket panel shows them. Abandoned runs show rework and don't count as missing usage.
 
 ## Quiet tickets

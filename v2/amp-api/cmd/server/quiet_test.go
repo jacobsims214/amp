@@ -35,7 +35,7 @@ func TestMCP_ListTasksReportsQuiet(t *testing.T) {
 		}
 	}
 
-	out := s.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(s.projectID), "owner": "any"})
+	out := s.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(s.projectID), "owner": "any"})
 	quiet := map[int]float64{}
 	for _, q := range out["quiet"].([]interface{}) {
 		m := q.(map[string]interface{})
