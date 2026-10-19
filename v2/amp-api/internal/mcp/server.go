@@ -21,6 +21,7 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -54,6 +55,10 @@ type Server struct {
 }
 
 func NewServer(registry *actor.Registry, repo *repository.Repo, h *hub.Hub, kbSvc *kb.Service) *Server {
+	if kbSvc != nil && repo != nil {
+		// One reindex per KB across every replica, not just this one.
+		kbSvc.SetReindexLock(repo.TryNamedLock)
+	}
 	return &Server{registry: registry, repo: repo, hub: h, kb: kbSvc, svc: service.New(repo, registry, kbSvc)}
 }
 
@@ -2611,11 +2616,14 @@ func (s *Server) kbReindex(ctx context.Context, args map[string]interface{}) (*m
 	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	go func() {
-		if err := s.kb.Reindex(context.Background(), k.Scope); err != nil {
-			slog.Default().Error("kb reindex failed", "kb", k.Scope.String(), "err", err)
+	// Single-flight per KB: a second call while one runs (here or on another
+	// replica) starts nothing, since overlapping runs can lose docs.
+	if err := s.kb.StartReindex(ctx, k.Scope); err != nil {
+		if errors.Is(err, kb.ErrReindexRunning) {
+			return jsonResult(map[string]interface{}{"reindex": "already running", "kb": k})
 		}
-	}()
+		return nil, err
+	}
 	return jsonResult(map[string]interface{}{"reindex": "started", "kb": k})
 }
 

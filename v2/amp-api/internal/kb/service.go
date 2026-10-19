@@ -16,10 +16,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -41,7 +43,23 @@ type Service struct {
 	ollamaModel  string
 	log          *slog.Logger
 	queueClient  *asynq.Client // nil = write/delete synchronously; set via SetQueueClient
+
+	// Reindex is single-flight per KB: reindexing marks the collections
+	// being reindexed in this process, and reindexLock (optional, set via
+	// SetReindexLock) holds a lock shared by every replica.
+	reindexMu   sync.Mutex
+	reindexing  map[string]bool
+	reindexLock ReindexLocker
 }
+
+// ErrReindexRunning is returned when a reindex of the same KB is already
+// running, in this process or (with a ReindexLocker) on another replica.
+var ErrReindexRunning = errors.New("a reindex of this knowledge base is already running")
+
+// ReindexLocker takes a lock named key that every replica shares (e.g. a
+// Postgres advisory lock) without waiting. ok is false when someone else
+// holds it; release frees it and is only set when ok is true.
+type ReindexLocker func(ctx context.Context, key string) (release func(), ok bool, err error)
 
 // New creates a KB service connected to Typesense.
 // ollamaURL e.g. "http://ollama:11434" — used for auto-embedding.
@@ -1006,9 +1024,83 @@ func (s *Service) Drop(ctx context.Context, sc Scope) error {
 	return nil
 }
 
+// SetReindexLock makes reindexing single-flight across replicas too, not
+// just within this process. Call once at startup.
+func (s *Service) SetReindexLock(l ReindexLocker) {
+	s.reindexMu.Lock()
+	defer s.reindexMu.Unlock()
+	s.reindexLock = l
+}
+
+// beginReindex claims the right to reindex sc, or returns
+// ErrReindexRunning. Two overlapping runs on one KB can lose docs: on the
+// rebuild path the second snapshots after the first dropped the collection,
+// then drops the collection the first is writing into.
+func (s *Service) beginReindex(ctx context.Context, sc Scope) (release func(), err error) {
+	col := collectionName(sc)
+	s.reindexMu.Lock()
+	if s.reindexing[col] {
+		s.reindexMu.Unlock()
+		return nil, ErrReindexRunning
+	}
+	if s.reindexing == nil {
+		s.reindexing = map[string]bool{}
+	}
+	s.reindexing[col] = true
+	locker := s.reindexLock
+	s.reindexMu.Unlock()
+
+	done := func() {
+		s.reindexMu.Lock()
+		delete(s.reindexing, col)
+		s.reindexMu.Unlock()
+	}
+	if locker == nil {
+		return done, nil
+	}
+	unlock, ok, err := locker(ctx, "kb_reindex:"+col)
+	if err != nil {
+		done()
+		return nil, fmt.Errorf("reindex lock for %s: %w", col, err)
+	}
+	if !ok {
+		done()
+		return nil, ErrReindexRunning
+	}
+	return func() { unlock(); done() }, nil
+}
+
+// StartReindex starts a reindex of sc in the background and returns at
+// once, or returns ErrReindexRunning without starting one. The run outlives
+// ctx; failures are logged.
+func (s *Service) StartReindex(ctx context.Context, sc Scope) error {
+	release, err := s.beginReindex(ctx, sc)
+	if err != nil {
+		return err
+	}
+	go func() {
+		defer release()
+		if err := s.runReindex(context.Background(), sc); err != nil {
+			s.log.Error("kb reindex failed", "kb", sc.String(), "err", err)
+		}
+	}()
+	return nil
+}
+
 // Reindex re-triggers embedding generation for all documents by re-upserting them.
-// This is useful when switching embedding models.
+// This is useful when switching embedding models. It returns
+// ErrReindexRunning, without doing anything, if the KB is already being
+// reindexed.
 func (s *Service) Reindex(ctx context.Context, sc Scope) error {
+	release, err := s.beginReindex(ctx, sc)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return s.runReindex(ctx, sc)
+}
+
+func (s *Service) runReindex(ctx context.Context, sc Scope) error {
 	// If the collection was originally created before Ollama was reachable
 	// (e.g. a race at first-write time against the post-install model pull
 	// Job), it's permanently locked into keyword-only mode — Typesense

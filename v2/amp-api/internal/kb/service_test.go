@@ -3,8 +3,10 @@ package kb
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -186,4 +188,105 @@ func TestScoreHitKeywordOnlyMonotonic(t *testing.T) {
 		}
 		prev = got
 	}
+}
+
+// Reindex is single-flight per KB: while one runs, another of the same KB
+// starts nothing (two overlapping runs can lose docs), but other KBs can
+// still be reindexed. Needs no Typesense: it exercises the guard only.
+func TestReindexSingleFlight(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("in process", func(t *testing.T) {
+		s := New("http://127.0.0.1:1", "k", "", "")
+		release, err := s.beginReindex(ctx, Project(1))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.beginReindex(ctx, Project(1)); !errors.Is(err, ErrReindexRunning) {
+			t.Fatalf("second reindex of the same KB: err = %v, want ErrReindexRunning", err)
+		}
+		if err := s.StartReindex(ctx, Project(1)); !errors.Is(err, ErrReindexRunning) {
+			t.Fatalf("StartReindex while one runs: err = %v, want ErrReindexRunning", err)
+		}
+		if err := s.Reindex(ctx, Project(1)); !errors.Is(err, ErrReindexRunning) {
+			t.Fatalf("Reindex while one runs: err = %v, want ErrReindexRunning", err)
+		}
+		// Different KBs, including a team KB with the same number, are free.
+		for _, sc := range []Scope{Project(2), Team(1), Org(1)} {
+			other, err := s.beginReindex(ctx, sc)
+			if err != nil {
+				t.Fatalf("reindex %s while project 1 runs: %v", sc, err)
+			}
+			defer other()
+		}
+		release()
+		again, err := s.beginReindex(ctx, Project(1))
+		if err != nil {
+			t.Fatalf("reindex after the first finished: %v", err)
+		}
+		again()
+	})
+
+	t.Run("across replicas", func(t *testing.T) {
+		// A shared lock standing in for the Postgres advisory lock: two
+		// services (replicas) share it.
+		var mu sync.Mutex
+		held := map[string]bool{}
+		var keys []string
+		lock := func(_ context.Context, key string) (func(), bool, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			keys = append(keys, key)
+			if held[key] {
+				return nil, false, nil
+			}
+			held[key] = true
+			return func() { mu.Lock(); delete(held, key); mu.Unlock() }, true, nil
+		}
+		a, b := New("http://127.0.0.1:1", "k", "", ""), New("http://127.0.0.1:1", "k", "", "")
+		a.SetReindexLock(lock)
+		b.SetReindexLock(lock)
+
+		release, err := a.beginReindex(ctx, Team(3))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := b.beginReindex(ctx, Team(3)); !errors.Is(err, ErrReindexRunning) {
+			t.Fatalf("other replica, same KB: err = %v, want ErrReindexRunning", err)
+		}
+		// Refused by the shared lock, b must not stay marked as reindexing.
+		if len(b.reindexing) != 0 {
+			t.Fatalf("refused reindex left b marked busy: %v", b.reindexing)
+		}
+		otherKB, err := b.beginReindex(ctx, Team(4))
+		if err != nil {
+			t.Fatalf("other replica, other KB: %v", err)
+		}
+		otherKB()
+		release()
+		if len(held) != 0 {
+			t.Fatalf("locks still held after release: %v", held)
+		}
+		if again, err := b.beginReindex(ctx, Team(3)); err != nil {
+			t.Fatalf("other replica after release: %v", err)
+		} else {
+			again()
+		}
+		if keys[0] != "kb_reindex:kb_team_3" {
+			t.Fatalf("lock key = %q", keys[0])
+		}
+	})
+
+	t.Run("lock error starts nothing", func(t *testing.T) {
+		s := New("http://127.0.0.1:1", "k", "", "")
+		s.SetReindexLock(func(context.Context, string) (func(), bool, error) {
+			return nil, false, errors.New("db down")
+		})
+		if err := s.StartReindex(ctx, Project(9)); err == nil || errors.Is(err, ErrReindexRunning) {
+			t.Fatalf("err = %v, want the lock error", err)
+		}
+		if len(s.reindexing) != 0 {
+			t.Fatalf("failed lock left the KB marked busy: %v", s.reindexing)
+		}
+	})
 }
