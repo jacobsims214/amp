@@ -5,7 +5,7 @@ AMP's agent roster lives once, in `v2/.opencode/`, and is published to two hosts
 | Host | Script | What it does |
 |---|---|---|
 | Claude Code | `setup-claude-code.sh` | Installs the `amp` plugin from this repo |
-| opencode | `sync-global-config.sh` | Copies agents/skills into `~/.config/opencode` and merges `opencode.json` |
+| opencode | `setup-opencode.sh` | Installs the AMP opencode plugin from this repo and registers it in `~/.config/opencode/opencode.json` |
 
 ## Claude Code
 
@@ -28,6 +28,29 @@ Anyone who just wants to use AMP without cloning can skip the script entirely:
 ```
 
 Point at a self-hosted AMP server with `export AMP_MCP_URL=http://localhost:8000/mcp`.
+
+## opencode
+
+```
+./scripts/setup-opencode.sh [--url https://amp.example.com/mcp] [--token <AMP token>] [--inherit-models] [--clean]
+```
+
+Installs the plugin's runtime dependencies in `v2/plugins/opencode/` (building it first with
+`build-opencode-plugin.sh` if needed) and adds one `plugins` entry pointing at it to your global
+`~/.config/opencode/opencode.json`. Nothing else in that config is touched; remove the entry to
+uninstall. The plugin brings the agents, skills, MCP servers and OpenRouter model settings with
+it. Start opencode afterwards and the manager is your default agent.
+
+- `--url` points at a self-hosted AMP server (default `$AMP_MCP_URL`, else the hosted AMP).
+- `--token` passes an AMP API token; omit it to sign in with OAuth.
+- `--inherit-models` runs every agent on your own default model instead of the one AMP picked.
+- `--clean` removes agent, skill and plugin files that the old `sync-global-config.sh` copied
+  into `~/.config/opencode`.
+
+`sync-global-config.sh` (also run by `make sync-global`) is the old way to set this up, and
+`setup-opencode.sh` replaces it. It copied agents and skills into `~/.config/opencode` and merged
+`opencode.json`. Don't use it alongside the plugin: its copies override the plugin's versions.
+If you ran it before, rerun `setup-opencode.sh` with `--clean`.
 
 ## Rebuilding the plugin
 
