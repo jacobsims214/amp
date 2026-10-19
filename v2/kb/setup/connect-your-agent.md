@@ -53,10 +53,10 @@ Learned the hard way in team trials (see `field-notes.md`):
   trigger.
 - **Generous MCP and model timeouts.** In opencode: `mcp.amp.timeout` 60000, and for a provider
   `options.chunkTimeout` (e.g. 120000) and `options.headerTimeout` (e.g. 60000).
-- **Let agents report their usage.** opencode: the `amp-usage` plugin gives workers an
-  `amp_session_usage` tool (model, tokens, cost) to put in their run record. Claude Code: the
-  manager reads a subagent's token usage from its result and records it. Without this, spend
-  reports are a floor.
+- **Let agents report their usage.** opencode: the AMP opencode plugin (installed by
+  `setup-opencode.sh`) gives workers an `amp_session_usage` tool (model, tokens, cost) to put
+  in their run record. Claude Code: the manager reads a subagent's token usage from its result
+  and records it. Without this, spend reports are a floor.
 - **Restart after AMP restarts.** If the `amp_*` tools vanish or fail to connect, restart the
   harness so it reconnects. Agents should stop and say so rather than work around it.
 - **Sandbox credentials.** Workers don't need your cloud, cluster or GitHub admin credentials to
