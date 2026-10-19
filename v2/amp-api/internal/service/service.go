@@ -331,11 +331,9 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 	if err != nil {
 		return nil, err
 	}
-	// Plan approval: with the project's setting on, a ticket planned after
-	// the last approval waits for a person to approve the plan.
-	if proj, err := s.Repo.GetProject(ctx, t.ProjectID); err == nil && proj.RequirePlanApproval && proj.AwaitsApproval(t) {
-		return nil, authz.Forbidden("ticket %d was planned after the plan was last approved; this project needs the plan approved "+
-			"before agents start new tickets (amp_approve_plan, or Approve plan in AMP's Flight plan)", taskID)
+	proj, err := s.Repo.GetProject(ctx, t.ProjectID)
+	if err := planApprovalGate(proj, err, t); err != nil {
+		return nil, err
 	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
@@ -351,6 +349,28 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 		return nil, reply.Err
 	}
 	return t, nil
+}
+
+// planApprovalGate decides whether t may be dispatched as far as plan
+// approval goes: with the project's setting on, a ticket planned after the
+// last approval waits for a person to approve the plan. It fails closed: if
+// the project couldn't be loaded (lookupErr), we can't tell whether the gate
+// applies, so the dispatch is refused with a retryable 503 rather than let
+// through unchecked.
+func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task) error {
+	if lookupErr != nil || proj == nil {
+		reason := "project not found"
+		if lookupErr != nil {
+			reason = lookupErr.Error()
+		}
+		return &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d not dispatched: couldn't load project %d to check plan approval (%s); "+
+			"nothing was started, try the dispatch again", t.ID, t.ProjectID, reason)}
+	}
+	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
+		return authz.Forbidden("ticket %d was planned after the plan was last approved; this project needs the plan approved "+
+			"before agents start new tickets (amp_approve_plan, or Approve plan in AMP's Flight plan)", t.ID)
+	}
+	return nil
 }
 
 // ---- Epics and stories ----
