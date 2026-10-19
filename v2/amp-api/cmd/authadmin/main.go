@@ -1,9 +1,11 @@
 // Command authadmin is a tiny admin-only HTTP service for managing AMP user
 // credentials in Dex (the "add and manage users" surface backing the UI's
 // Users page). It wraps Dex's gRPC password API — credentials always live in
-// Dex, never here. Only reachable via Envoy on a route gated on the `admin`
-// JWT role claim; it also re-validates the token itself for defense in
-// depth, matching amp-api's posture.
+// Dex, never here. Envoy routes /authadmin here without any role check, so
+// the admin gate lives in this process: requireAuthExceptHealth verifies the
+// bearer token (every path but /health), and each /authadmin/users route is
+// wrapped in auth.RequireRole(domain.RoleAdmin, ...), which returns 403 to
+// anyone who isn't a global admin.
 package main
 
 import (
