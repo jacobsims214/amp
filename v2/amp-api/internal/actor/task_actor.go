@@ -76,8 +76,11 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		// Register with ProjectActor so it can route task-targeted messages.
 		ctx.Send(a.projectPID, &MsgRegisterTask{TaskID: a.task.ID, EpicID: a.task.EpicID})
 
-		// Check if this task has a future start_at time and arm the timer
-		if a.task.StartAt != nil && a.task.StartAt.After(time.Now()) {
+		// A task still waiting to start with a future start_at re-arms its
+		// timer and is held by its schedule. Any other task keeps its state:
+		// a stale start_at must not pull a completed or in-progress task (or
+		// one blocked on a question) back to "scheduled".
+		if a.task.StartAt != nil && a.task.StartAt.After(time.Now()) && a.waitingToStart() {
 			a.armScheduleTimer()
 			a.task.State = domain.TaskStateBlocked
 			a.task.BlockReason = "scheduled:" + a.task.StartAt.Format(time.RFC3339)
@@ -689,6 +692,20 @@ func (a *TaskActor) armScheduleTimer() {
 	})
 
 	a.log.Info("scheduled timer armed", "start_at", a.task.StartAt, "delay_seconds", delay.Seconds())
+}
+
+// waitingToStart reports whether the task has not started yet and nothing but
+// its schedule or its dependencies holds it: backlog, or blocked by its
+// schedule or on its dependencies (empty block reason). A task blocked for any
+// other reason (a question, a hand block) keeps that reason.
+func (a *TaskActor) waitingToStart() bool {
+	switch a.task.State {
+	case domain.TaskStateBacklog:
+		return true
+	case domain.TaskStateBlocked:
+		return a.task.BlockReason == "" || strings.HasPrefix(a.task.BlockReason, "scheduled:")
+	}
+	return false
 }
 
 // handleScheduledUnblock is called when the scheduled timer fires, and on

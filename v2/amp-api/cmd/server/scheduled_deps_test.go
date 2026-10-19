@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -262,4 +263,103 @@ func TestScheduledDeps_ClearingScheduleKeepsDependencyBlock(t *testing.T) {
 
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(dep)})
 	waitState(t, s, id, "backlog")
+}
+
+// AMP-1873: on start, a task actor re-arms a future start_at. It must do that
+// only for a ticket still waiting to start (backlog, or blocked by its
+// schedule or on its dependencies). A completed or in-progress ticket, or one
+// blocked on a question, keeps its state and block reason even though its
+// start_at is still in the future.
+func TestScheduledDeps_RestartLeavesStartedTicketsAlone(t *testing.T) {
+	s := setupMCP(t)
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+	scheduled := "scheduled:" + future.Format(time.RFC3339)
+
+	cases := []struct {
+		name       string
+		state      domain.TaskState
+		reason     string
+		wantState  domain.TaskState
+		wantReason string
+	}{
+		{"completed", domain.TaskStateCompleted, "", domain.TaskStateCompleted, ""},
+		{"in progress", domain.TaskStateInProgress, "", domain.TaskStateInProgress, ""},
+		{"blocked on a question", domain.TaskStateBlocked, "Avalara or Stripe?", domain.TaskStateBlocked, "Avalara or Stripe?"},
+		// Backward compatible: tickets waiting to start still re-arm.
+		{"backlog", domain.TaskStateBacklog, "", domain.TaskStateBlocked, scheduled},
+		{"scheduled", domain.TaskStateBlocked, scheduled, domain.TaskStateBlocked, scheduled},
+	}
+	ids := make([]int, len(cases))
+	for i, c := range cases {
+		ids[i] = mkIn(t, s, s.storyID, c.name)
+	}
+
+	// The process goes down (see the restart test above for why the original
+	// actors are stopped), and the database holds a future start_at on each.
+	s.reg.StopAll()
+	time.Sleep(200 * time.Millisecond) // Root.Stop is asynchronous
+	for i, c := range cases {
+		if err := s.repo.SetTaskStartAt(ctx, ids[i], &future); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.repo.SetTaskState(ctx, ids[i], c.state, c.reason); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	system := protoactor.NewActorSystem()
+	t.Cleanup(system.Shutdown)
+	reg := actor.NewRegistry(system, s.repo, hub.New())
+	if err := reg.Touch(s.projectID); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, c := range cases {
+		// A reply from the task's actor means its Started handler has run.
+		reply := make(chan actor.ReplyGetTask, 1)
+		var got *domain.Task
+		deadline := time.Now().Add(5 * time.Second)
+		for got == nil {
+			if err := reg.Send(s.projectID, &actor.MsgGetTask{TaskID: ids[i], ReplyCh: reply}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case r := <-reply:
+				if r.Err == nil && r.Task != nil {
+					got = r.Task
+				}
+			case <-time.After(time.Second):
+			}
+			if got == nil && time.Now().After(deadline) {
+				t.Fatalf("%s: restarted actor never answered MsgGetTask", c.name)
+			}
+			if got == nil {
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+		// The re-armed reason is rebuilt from the stored start_at, whose time
+		// zone may differ from ours: match "scheduled:" reasons by prefix.
+		reasonOK := func(r string) bool {
+			if strings.HasPrefix(c.wantReason, "scheduled:") {
+				return strings.HasPrefix(r, "scheduled:")
+			}
+			return r == c.wantReason
+		}
+		if got.State != c.wantState || !reasonOK(got.BlockReason) {
+			t.Errorf("%s after restart (actor): state %q, block_reason %q; want %q, %q",
+				c.name, got.State, got.BlockReason, c.wantState, c.wantReason)
+		}
+		stored, err := s.repo.GetTask(ctx, ids[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.State != c.wantState || !reasonOK(stored.BlockReason) {
+			t.Errorf("%s after restart (db): state %q, block_reason %q; want %q, %q",
+				c.name, stored.State, stored.BlockReason, c.wantState, c.wantReason)
+		}
+		if stored.StartAt == nil {
+			t.Errorf("%s after restart: start_at cleared, want it kept", c.name)
+		}
+	}
 }
