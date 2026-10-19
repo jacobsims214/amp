@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
@@ -12,6 +14,25 @@ import (
 )
 
 // ---- Trash: deleted tickets can be restored for 30 days ----
+
+// RunTrashPurge deletes trash rows past retention every interval (and once
+// at start) until ctx is done. Safe on every replica at once.
+func (s *Service) RunTrashPurge(ctx context.Context, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		if n, err := s.Repo.PurgeTrash(ctx); err != nil {
+			slog.Warn("trash purge failed", "err", err)
+		} else if n > 0 {
+			slog.Info("trash purge", "deleted", n)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
 
 // DeletedTasks lists a project's trash for its members.
 func (s *Service) DeletedTasks(ctx context.Context, p authz.Principal, projectID int) ([]repository.DeletedTask, error) {
