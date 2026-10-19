@@ -470,16 +470,14 @@ func (a *TaskActor) handleSetTaskStartAt(startAt *time.Time) error {
 
 		a.log.Info("scheduled task", "start_at", startAt)
 	} else if startAt == nil {
-		// Clearing the schedule — if task was blocked by schedule, unblock it
+		// Clearing the schedule — a task blocked only by its schedule is
+		// released, unless it still waits on its dependencies.
 		if a.task.State == domain.TaskStateBlocked && strings.HasPrefix(a.task.BlockReason, "scheduled:") {
-			a.task.State = domain.TaskStateBacklog
-			a.task.BlockReason = ""
-
-			if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
+			if err := a.releaseFromSchedule("Schedule cleared"); err != nil {
 				return fmt.Errorf("db unblock task: %w", err)
 			}
-
-			a.log.Info("cleared schedule, unblocked task")
+			a.log.Info("cleared schedule, released task from its schedule", "state", a.task.State)
+			return nil
 		}
 	}
 
@@ -693,8 +691,12 @@ func (a *TaskActor) armScheduleTimer() {
 	a.log.Info("scheduled timer armed", "start_at", a.task.StartAt, "delay_seconds", delay.Seconds())
 }
 
-// handleScheduledUnblock is called when the scheduled timer fires.
-// It transitions the task from blocked to backlog and clears the start_at.
+// handleScheduledUnblock is called when the scheduled timer fires, and on
+// actor start when the start time passed while no actor was running the task.
+// It consumes the schedule (clears start_at) and releases the task from it:
+// to backlog when every dependency is complete, otherwise it stays blocked on
+// its dependencies (empty block reason) so checkUnblock releases it when the
+// last one completes.
 func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 	// Guard against spurious fires — verify start_at is set and time has passed
 	if a.task.StartAt == nil || a.task.StartAt.After(time.Now()) {
@@ -702,19 +704,14 @@ func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 		return
 	}
 
-	// Only unblock if currently in blocked state
-	if a.task.State != domain.TaskStateBlocked {
-		a.log.Warn("scheduled unblock but task not blocked", "state", a.task.State)
+	// Only release a task its schedule is still holding: one blocked by hand
+	// (or already moved on) keeps its state.
+	if a.task.State != domain.TaskStateBlocked || !strings.HasPrefix(a.task.BlockReason, "scheduled:") {
+		a.log.Warn("scheduled unblock but task not blocked by its schedule", "state", a.task.State, "reason", a.task.BlockReason)
 		return
 	}
 
-	// Transition to backlog
-	a.task.State = domain.TaskStateBacklog
-	a.task.BlockReason = ""
-	a.task.UpdatedAt = time.Now()
-
-	// Persist state change
-	if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
+	if err := a.releaseFromSchedule("Scheduled start time reached"); err != nil {
 		a.log.Error("failed to persist scheduled unblock state", "err", err)
 		return
 	}
@@ -724,16 +721,51 @@ func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 		a.log.Error("failed to clear start_at", "err", err)
 		return
 	}
+	a.task.StartAt = nil
 
 	// Clear the timer reference
 	a.scheduleTimer = nil
 
-	// Publish SSE event
+	a.log.Info("scheduled unblock complete", "state", a.task.State)
+}
+
+// releaseFromSchedule lifts the schedule's hold on a task blocked by it. The
+// dependency states are re-read from the database (the in-memory set may be
+// stale after a restart or replica move). If every dependency is complete the
+// task moves to backlog; otherwise it stays blocked with an empty block
+// reason — "waiting on its dependencies" — which checkUnblock/reconcileDeps
+// release once the last dependency completes. Publishes and logs the change.
+func (a *TaskActor) releaseFromSchedule(why string) error {
+	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	if err != nil {
+		return fmt.Errorf("read dependency states: %w", err)
+	}
+	a.completedDeps = done
+	waiting := 0
+	for _, d := range a.task.DependencyIDs {
+		if !done[d] {
+			waiting++
+		}
+	}
+
+	a.task.BlockReason = ""
+	a.task.UpdatedAt = time.Now()
+	if waiting > 0 {
+		a.task.State = domain.TaskStateBlocked
+		if err := a.saveState(domain.TaskStateBlocked, ""); err != nil {
+			return err
+		}
+		a.publish(domain.EventTaskBlocked, a.withBlockedBy())
+		a.logActivity("system", "blocked", "blocked", "blocked",
+			fmt.Sprintf("%s — still waiting on its dependencies (%d unfinished)", why, waiting))
+		return nil
+	}
+
+	a.task.State = domain.TaskStateBacklog
+	if err := a.saveState(domain.TaskStateBacklog, ""); err != nil {
+		return err
+	}
 	a.publish(domain.EventTaskUnblocked, a.withBlockedBy())
-
-	// Log activity
-	a.logActivity("system", "unblocked", "blocked", "backlog",
-		"Scheduled start time reached")
-
-	a.log.Info("scheduled unblock complete")
+	a.logActivity("system", "unblocked", "blocked", "backlog", why)
+	return nil
 }
