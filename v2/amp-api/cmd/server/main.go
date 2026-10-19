@@ -90,14 +90,15 @@ func main() {
 	}
 
 	// ---- 1b. Auth (OIDC verifier against Dex) ----
-	var audiences []string
-	if a := os.Getenv("OIDC_AUDIENCES"); a != "" {
-		audiences = strings.Split(a, ",")
+	// OIDC_AUDIENCES used to set an allow-list on this base verifier, but
+	// every listener derives its own via WithAudiences (MCP_AUDIENCE,
+	// REST_AUDIENCES below), so it never had an effect. It's no longer read.
+	if os.Getenv("OIDC_AUDIENCES") != "" {
+		slog.Warn("OIDC_AUDIENCES is deprecated and ignored; token audiences come from MCP_AUDIENCE and REST_AUDIENCES")
 	}
 	verifier, err := auth.NewVerifier(ctx, auth.Config{
 		IssuerURL:      os.Getenv("OIDC_ISSUER_URL"),
 		DiscoveryURL:   os.Getenv("OIDC_DISCOVERY_URL"),
-		Audiences:      audiences,
 		BootstrapAdmin: os.Getenv("BOOTSTRAP_ADMIN_EMAILS"),
 		Repo:           repo,
 	})
