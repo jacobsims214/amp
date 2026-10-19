@@ -6,7 +6,7 @@ package mcp
 // the dependency graph drives everything.
 const Instructions = `AMP tracks agentic work as projects → epics → stories → tickets (tasks), and runs it as a dependency graph (DAG).
 
-AMP's tools (amp_*) are in your tool list: call them by name, no need to search for them. Orient with amp_list_tasks (a compact board) and amp_get_plan (epics and stories); read a ticket with amp_get_task, adding include=["comments","history","runs"] for its story.
+AMP's tools (amp_*) are in your tool list: call them by name, no need to search for them. Some harnesses prefix them with the server name (in opencode: amp_amp_list_tasks). Orient with amp_list_tasks (a compact board) and amp_get_plan (epics and stories); read a ticket with amp_get_task, adding include=["comments","history","runs"] for its story.
 
 DEPENDENCIES ARE CRITICAL. AMP dispatches every ticket whose dependencies are complete, in parallel. A ticket with no dependencies is ready immediately. If a ticket needs another ticket's output (a schema, an API, a design, a fix, a decision) and that dependency is missing, it will be started too early and fail.
 
