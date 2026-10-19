@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"testing"
+
+	"github.com/simstech/amp-api/internal/authz"
+	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // Plan approval: tickets planned since the last approval are listed by the
@@ -61,4 +67,60 @@ func containsID(v any, id int) bool {
 		}
 	}
 	return false
+}
+
+// Approving publishes project.updated (what the UI's live stream refreshes
+// the Flight plan page on) whichever way the person approves: the service
+// itself publishes it, so REST and MCP can't drift apart (AMP #1897).
+func TestApprovePlanPublishesProjectUpdated(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	var mu sync.Mutex
+	var got []domain.Event
+	w.s.hub.AddSink(func(e domain.Event) {
+		if e.Type == domain.EventProjectUpdated && e.ProjectID == w.s.projectID {
+			mu.Lock()
+			got = append(got, e)
+			mu.Unlock()
+		}
+	})
+	// expectOne checks exactly one project.updated arrived since the last
+	// check, carrying the approved project.
+	expectOne := func(how string) {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("approve via %s: %d project.updated events, want 1", how, len(got))
+		}
+		p, ok := got[0].Payload.(*domain.Project)
+		if !ok || p.ID != w.s.projectID || p.PlanApprovedAt == nil {
+			t.Fatalf("approve via %s: payload %#v", how, got[0].Payload)
+		}
+		got = nil
+	}
+
+	svc := service.New(w.s.repo, w.s.reg, w.s.kb)
+	person := authz.Principal{UserID: w.bob.User.ID, Email: w.bob.User.Email}
+	if _, err := svc.ApprovePlan(context.Background(), person, w.s.projectID); err != nil {
+		t.Fatalf("service approve: %v", err)
+	}
+	expectOne("service")
+
+	w.s.as(w.root).call(t, "amp_approve_plan", map[string]any{"project_id": float64(w.s.projectID)})
+	expectOne("MCP")
+
+	ra.want(t, 200, "root", http.MethodPost, fmt.Sprintf("/api/projects/%d/approve-plan", w.s.projectID), nil)
+	expectOne("REST")
+
+	// A refused approval publishes nothing.
+	agent := authz.Principal{UserID: w.alice.User.ID, Email: "bot@agents.amp", Agent: true}
+	if _, err := svc.ApprovePlan(context.Background(), agent, w.s.projectID); authz.StatusOf(err, 0) != 403 {
+		t.Fatalf("agent approve: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("refused approval published %d events", len(got))
+	}
 }

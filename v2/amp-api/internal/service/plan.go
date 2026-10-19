@@ -1023,5 +1023,8 @@ func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID 
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 		Summary: fmt.Sprintf("approved the plan of %s", proj.Name)})
+	// Published here, not by the REST or MCP handler, so every way of
+	// approving refreshes open Flight plan pages the same way.
+	s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
 	return proj, nil
 }
