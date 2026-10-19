@@ -146,6 +146,11 @@ typesense:
   image: typesense/typesense
   tag: "30.1"
   apiKey: amp-local-dev   # override in values-production.yaml / a Secret for real deployments
+  # Name of an existing Secret holding the API key. When set, both Typesense
+  # and amp-api read the key from it and apiKey above is ignored; when empty,
+  # apiKey is used as a plain value (the old behaviour).
+  existingSecret: ""
+  existingSecretKey: api-key   # key inside existingSecret
   resources:
     requests: { cpu: 100m, memory: 256Mi }
     limits: { cpu: 500m, memory: 1Gi }

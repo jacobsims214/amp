@@ -34,7 +34,16 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- include "amp.containerSecurityContext" (dict "runAsUser" 1000) | nindent 12 }}
+          {{- if .Values.typesense.existingSecret }}
+          # The key comes from a Secret; Kubernetes expands $(TYPESENSE_API_KEY)
+          # in args from the env var below, so it never lands in the pod spec.
+          env:
+            - name: TYPESENSE_API_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.typesense.existingSecret }}, key: {{ .Values.typesense.existingSecretKey | default "api-key" }} } }
+          args: ["--data-dir", "/data", "--api-key", "$(TYPESENSE_API_KEY)", "--enable-cors"]
+          {{- else }}
           args: ["--data-dir", "/data", "--api-key", "{{ .Values.typesense.apiKey }}", "--enable-cors"]
+          {{- end }}
           ports:
             - name: http
               containerPort: 8108
