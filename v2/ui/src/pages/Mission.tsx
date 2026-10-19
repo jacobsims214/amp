@@ -25,6 +25,7 @@ import { countStates, displayState, QUIET_MS, silentFor, STATE_LABEL, STATE_VAR,
 import { activityActor, lookupPerson } from '../lib/people'
 import type { ActivityLog, AuditEntry, Epic, Story, Task } from '../types'
 import { MergeQueue } from '../components/MergeQueue'
+import { isHuman, reasonLabel } from '../lib/human'
 import { BandLoader } from '../components/brand/BandLoader'
 
 function ago(iso?: string | null): string {
@@ -239,15 +240,22 @@ export function Mission() {
   }
 
   // Agents are profiles in each person's harness, so count the people they work for.
-  const quiet = flying.filter(t => quietFor(t) > QUIET_MS).length
-  const drivers = new Set(flying.map(t => t.owner_user_id).filter(id => id != null)).size
+  // People doing their own (human) tickets aren't agents, and are never quiet.
+  const agentsFlying = flying.filter(t => !isHuman(t))
+  const peopleWorking = flying.length - agentsFlying.length
+  const quiet = agentsFlying.filter(t => quietFor(t) > QUIET_MS).length
+  const drivers = new Set(agentsFlying.map(t => t.owner_user_id).filter(id => id != null)).size
+  const runningSub = [
+    agentsFlying.length ? `agents for ${drivers} ${drivers === 1 ? 'person' : 'people'}` : '',
+    peopleWorking ? `${peopleWorking} by people` : '',
+  ].filter(Boolean).join(' · ') || 'nothing running'
   return (
     <div className="flex flex-col min-h-full">
       <ProjectNav projectId={pid} currentView="mission" />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         <Readouts items={[
-          { label: 'In progress', value: counts.prog, sub: quiet ? `${quiet} quiet · may have stalled` : flying.length ? `agents for ${drivers} ${drivers === 1 ? 'person' : 'people'}` : 'nothing running', alarm: quiet > 0, color: 'var(--st-prog)' },
+          { label: 'In progress', value: counts.prog, sub: quiet ? `${quiet} quiet · may have stalled` : runningSub, alarm: quiet > 0, color: 'var(--st-prog)' },
           { label: 'Ready', value: counts.ready, sub: 'can dispatch now' },
           { label: 'Waiting', value: counts.wait, sub: 'on dependencies', color: 'var(--ink-3)' },
           { label: 'Questions', value: counts.flag, sub: counts.flag ? 'agents waiting on an answer' : 'nothing needs you', alarm: counts.flag > 0 },
@@ -303,10 +311,12 @@ export function Mission() {
                 : flying.map(t => (
                   <button key={t.id} type="button" onClick={() => setSelectedId(t.id)}
                     className="w-full grid grid-cols-[auto_1fr_auto] gap-x-2.5 gap-y-0.5 items-center px-4 py-2.5 border-t border-line first:border-t-0 text-left hover:bg-surface-2 cursor-pointer">
-                    <Avatar name={t.agent_id || '?'} kind="agent" />
+                    {isHuman(t)
+                      ? <Avatar name={lookupPerson(people, t.owner_user_id)?.name ?? '?'} kind="human" />
+                      : <Avatar name={t.agent_id || '?'} kind="agent" />}
                     <span className="text-[12.5px] text-ink truncate"><b className="font-semibold">{lookupPerson(people, t.owner_user_id)?.name ?? 'Unowned'}</b>
-                      <span className="amp-num text-[11px] text-ink-3"> · {t.agent_id || 'agent'}</span></span>
-                    {quietFor(t) > QUIET_MS
+                      <span className="amp-num text-[11px] text-ink-3"> · {isHuman(t) ? `themselves · ${reasonLabel(t.human_reason).toLowerCase()}` : t.agent_id || 'agent'}</span></span>
+                    {!isHuman(t) && quietFor(t) > QUIET_MS
                       ? <span className="amp-num text-[11px] text-st-flag" title="No activity on this ticket for a while: the agent may have stalled.">quiet {Math.round(quietFor(t) / 60_000)}m</span>
                       : <span className="amp-num text-[11px] text-ink-3">{ago(t.dispatched_at)}</span>}
                     <span className="col-start-2 col-span-2 text-[11.5px] text-ink-2 truncate">#{t.id} {t.name}</span>
