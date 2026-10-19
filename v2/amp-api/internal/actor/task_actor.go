@@ -454,6 +454,15 @@ func (a *TaskActor) handleSetTaskStartAt(startAt *time.Time) error {
 		return fmt.Errorf("task %d is %s: a start time can only be set on a ticket that hasn't started (backlog or blocked)",
 			a.task.ID, a.task.State)
 	}
+	// A ticket blocked for a reason other than its schedule or dependencies (a
+	// question, a hand block) isn't waiting to start: scheduling it would
+	// replace that reason with "scheduled:..." and lose the question. Refuse,
+	// as restart does by leaving it alone (waitingToStart); once the question
+	// is answered the ticket can be scheduled.
+	if startAt != nil && a.task.State == domain.TaskStateBlocked && !a.waitingToStart() {
+		return fmt.Errorf("task %d is blocked (%q): answer or unblock it first, then set its start time",
+			a.task.ID, a.task.BlockReason)
+	}
 
 	// Cancel existing timer if armed
 	if a.scheduleTimer != nil {
