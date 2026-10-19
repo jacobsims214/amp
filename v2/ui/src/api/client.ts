@@ -287,6 +287,12 @@ export const api = {
     post(`/tasks/${taskId}/dispatch`, { agent_id: agentId }),
   completeTask: (taskId: number) =>
     post(`/tasks/${taskId}/complete`),
+  /** A person starts their own human ticket. */
+  startHumanTask: (taskId: number) =>
+    post<{ task: Task }>(`/tasks/${taskId}/start`).then(r => r.task),
+  /** A person marks their human ticket done, with what they want on the record. */
+  completeHumanTask: (taskId: number, done: { note?: string; pr_url?: string; hours_worked?: number }) =>
+    post<{ task: Task }>(`/tasks/${taskId}/complete`, done).then(r => r.task),
   /** Answer an agent's flag (a ticket blocked with a reason): posts the
    *  answer as a comment and puts the ticket back to ready (or waiting). */
   answerFlag: (taskId: number, answer: string) =>

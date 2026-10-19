@@ -72,11 +72,19 @@ export interface Task {
   start_at?: string       // RFC3339 UTC timestamp for scheduled tasks
   created_by?: number | null     // AMP user who created the ticket (null for legacy rows)
   owner_user_id?: number | null  // the one human owner; null = unassigned ("pool")
+  /** who does the work: an agent (dispatched), or a person (its owner, in AMP) */
+  performer?: 'agent' | 'human'
+  /** why a person does it (see HUMAN_REASONS) */
+  human_reason?: HumanReason
+  /** when it last became ready: ready → started is time waiting to be picked up */
+  ready_at?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
   created_at: string
   updated_at: string
 }
+
+export type HumanReason = 'review' | 'approval' | 'access' | 'judgment' | 'external' | 'physical' | 'other'
 
 export interface Comment {
   id: number
@@ -359,6 +367,8 @@ export interface CreateTaskRequest {
   /** omit = me; "none" = unassigned; or a project member's email / user id */
   owner?: string
   metadata?: Metadata
+  performer?: 'agent' | 'human'
+  human_reason?: HumanReason
 }
 
 export interface UpdateTaskRequest {
@@ -639,6 +649,8 @@ export interface Run {
   pushed?: boolean
   merged?: boolean
   note?: string
+  /** a person's reported time on a human ticket */
+  hours_worked?: number
   created_at: string
 }
 
@@ -709,6 +721,39 @@ export interface ProjectReport {
   people?: ReportGroup[]
   usage?: Usage
   usage_by_model?: (Usage & { model: string })[]
+  /** how the work splits between agents and people */
+  work?: WorkReport
+}
+
+/** One kind of performer's tickets: wait = ready → started, cycle = started → done. */
+export interface PerformerStats {
+  tickets: number
+  open: number
+  completed_in_range: number
+  median_wait_hours?: number
+  median_cycle_hours?: number
+  hours_worked?: number
+}
+
+export interface HumanTicketRow {
+  id: number
+  name: string
+  reason: HumanReason
+  owner_user_id: number | null
+  state: TaskState
+  wait_hours?: number
+  cycle_hours?: number
+  hours_worked?: number
+  elapsed_hours: number
+  holding_up: number
+  downstream: number
+}
+
+export interface WorkReport {
+  agent: PerformerStats
+  human: PerformerStats
+  human_by_reason: (PerformerStats & { reason: HumanReason })[]
+  slowest_human_tickets: HumanTicketRow[]
 }
 
 /** One project in an org's portfolio. */
