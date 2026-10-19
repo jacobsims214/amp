@@ -363,3 +363,92 @@ func TestScheduledDeps_RestartLeavesStartedTicketsAlone(t *testing.T) {
 		}
 	}
 }
+
+// Setting a future start_at on a ticket that has already started (in
+// progress or completed) is refused and leaves it as it was: state, block
+// reason and start_at. A backlog ticket is still scheduled as before.
+func TestScheduledDeps_SetStartAtRefusedOnStartedTickets(t *testing.T) {
+	s := setupMCP(t)
+	ctx := context.Background()
+	future := time.Now().Add(time.Hour)
+
+	setState := func(id int, state domain.TaskState) {
+		t.Helper()
+		reply := make(chan actor.ReplySimple, 1)
+		if err := s.reg.Send(s.projectID, &actor.MsgSetTaskState{TaskID: id, State: state, ReplyCh: reply}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case r := <-reply:
+			if r.Err != nil {
+				t.Fatal(r.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("MsgSetTaskState never answered")
+		}
+	}
+
+	for _, state := range []domain.TaskState{domain.TaskStateInProgress, domain.TaskStateCompleted} {
+		t.Run(string(state), func(t *testing.T) {
+			id := mkIn(t, s, s.storyID, "started "+string(state))
+			setState(id, state)
+
+			reply := make(chan actor.ReplySimple, 1)
+			if err := s.reg.Send(s.projectID, &actor.MsgSetTaskStartAt{TaskID: id, StartAt: &future, ReplyCh: reply}); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			select {
+			case r := <-reply:
+				err = r.Err
+			case <-time.After(5 * time.Second):
+				t.Fatal("MsgSetTaskStartAt never answered")
+			}
+			if err == nil || !strings.Contains(err.Error(), "hasn't started") {
+				t.Fatalf("set start_at on %s ticket: err %v, want a refusal", state, err)
+			}
+
+			// The actor's view is unchanged...
+			got := make(chan actor.ReplyGetTask, 1)
+			if err := s.reg.Send(s.projectID, &actor.MsgGetTask{TaskID: id, ReplyCh: got}); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case r := <-got:
+				if r.Err != nil {
+					t.Fatal(r.Err)
+				}
+				if r.Task.State != state || r.Task.BlockReason != "" || r.Task.StartAt != nil {
+					t.Errorf("actor: state %q, block_reason %q, start_at %v; want %q, \"\", nil",
+						r.Task.State, r.Task.BlockReason, r.Task.StartAt, state)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("MsgGetTask never answered")
+			}
+			// ...and so is the database.
+			stored, err := s.repo.GetTask(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.State != state || stored.BlockReason != "" || stored.StartAt != nil {
+				t.Errorf("db: state %q, block_reason %q, start_at %v; want %q, \"\", nil",
+					stored.State, stored.BlockReason, stored.StartAt, state)
+			}
+
+			// Clearing a schedule is still allowed.
+			scheduleAt(t, s, id, nil)
+		})
+	}
+
+	// Backward compatible: a backlog ticket is scheduled exactly as before.
+	id := mkIn(t, s, s.storyID, "not started")
+	scheduleAt(t, s, id, &future)
+	waitState(t, s, id, string(domain.TaskStateBlocked))
+	stored, err := s.repo.GetTask(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(stored.BlockReason, "scheduled:") || stored.StartAt == nil {
+		t.Errorf("backlog ticket: block_reason %q, start_at %v; want scheduled", stored.BlockReason, stored.StartAt)
+	}
+}
