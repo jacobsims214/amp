@@ -63,7 +63,8 @@ func (r *Repo) ListAgentUsers(ctx context.Context, managedBy *int) ([]domain.Use
 // revokes any that are still live: those belong to accounts deactivated
 // before deactivation revoked tokens (tokens can't be minted for a
 // deactivated account), and this is the moment they would start working
-// again. No migration is needed for those accounts.
+// again. No migration is needed for those accounts. Reactivating an
+// account that is already active changes nothing and revokes nothing.
 func (r *Repo) SetUserDisabled(ctx context.Context, userID int, disabled bool) ([]domain.APIToken, error) {
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
@@ -86,8 +87,17 @@ func (r *Repo) SetUserDisabled(ctx context.Context, userID int, disabled bool) (
 		if _, err := tx.Exec(ctx, `UPDATE users SET disabled_at = COALESCE(disabled_at, NOW()) WHERE id = $1`, userID); err != nil {
 			return nil, err
 		}
-	} else if _, err := tx.Exec(ctx, `UPDATE users SET disabled_at = NULL WHERE id = $1`, userID); err != nil {
-		return nil, err
+	} else {
+		// Only an account that was actually deactivated gets its legacy
+		// tokens swept: reactivating an active account (a double-click, a
+		// retry, an idempotent script) must leave its live tokens alone.
+		tag, err := tx.Exec(ctx, `UPDATE users SET disabled_at = NULL WHERE id = $1 AND disabled_at IS NOT NULL`, userID)
+		if err != nil {
+			return nil, err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil, tx.Commit(ctx)
+		}
 	}
 	rows, err := tx.Query(ctx, `UPDATE api_tokens SET revoked_at = NOW()
 		WHERE user_id = $1 AND revoked_at IS NULL RETURNING `+tokenCols, userID)
