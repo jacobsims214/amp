@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -216,8 +217,10 @@ func (s *Service) ListArtifacts(ctx context.Context, p authz.Principal, projectI
 // review: like plan approval, it's a person's call. On a ticket, the reviewer
 // is someone who can plan it (its owner or creator, or a lead or project
 // owner); without one, any member.
-// If the ticket is blocked on a question (the agent asking for review), the
-// verdict answers it, so the ticket goes back to ready for the next dispatch.
+// If the ticket is blocked waiting on this artifact's review (see
+// awaitsArtifactReview), the verdict answers it, so the ticket goes back to
+// ready for the next dispatch. Blocked on anything else, the ticket stays
+// blocked and the verdict is only noted on it.
 func (s *Service) ReviewArtifact(ctx context.Context, p authz.Principal, id, version int, approve bool, note string) (*domain.Artifact, error) {
 	if p.Agent {
 		return nil, authz.Forbidden("agent accounts can't review artifacts; a person approves or asks for changes")
@@ -260,7 +263,7 @@ func (s *Service) ReviewArtifact(ctx context.Context, p authz.Principal, id, ver
 		if note != "" {
 			body += "\n\n" + note
 		}
-		if task.State == domain.TaskStateBlocked && task.BlockReason != "" && !strings.HasPrefix(task.BlockReason, "scheduled:") {
+		if task.State == domain.TaskStateBlocked && awaitsArtifactReview(task.BlockReason, a.ID) {
 			if _, err := s.answer(ctx, p, task, body); err != nil {
 				return a, err
 			}
@@ -269,6 +272,21 @@ func (s *Service) ReviewArtifact(ctx context.Context, p authz.Principal, id, ver
 		}
 	}
 	return a, nil
+}
+
+// awaitsArtifactReview reports whether a block reason is the request to review
+// artifact id, so that a verdict on it answers the ticket's question. Agents
+// ask for review with the artifact's url ({AppURL}/artifacts/{id}, which the
+// publish result, the designer agent and the guide all tell them to include),
+// or, with no public url configured, by number ("Review artifact #12"). A
+// ticket blocked on anything else (another question, another artifact, a
+// scheduled hold) isn't waiting on this verdict.
+func awaitsArtifactReview(reason string, id int) bool {
+	if reason == "" || strings.HasPrefix(reason, "scheduled:") {
+		return false
+	}
+	re := regexp.MustCompile(fmt.Sprintf(`(?i)(?:/artifacts/|\bartifacts?\s*#?\s*)%d(?:\D|$)`, id))
+	return re.MatchString(reason)
 }
 
 // ---- Retention ----
