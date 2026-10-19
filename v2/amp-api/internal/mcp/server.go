@@ -2485,7 +2485,7 @@ func (s *Server) kbSearch(ctx context.Context, args map[string]interface{}) (*mc
 		return nil, err
 	}
 	tags := optStrSlice(args, "tags")
-	limit := optInt(args, "limit", 10)
+	limit := kbSearchLimit(args)
 	recencyBoost := optFloat(args, "recency_boost", 0)
 	minRecencyDays := optInt(args, "min_recency_days", 0)
 
@@ -2497,6 +2497,26 @@ func (s *Server) kbSearch(ctx context.Context, args map[string]interface{}) (*mc
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"kb": k, "results": results, "count": len(results)})
+}
+
+// kbSearchDefaultLimit and kbSearchMaxLimit are amp_kb_search's documented
+// contract ("default 3, max 10"). The REST search the UI uses has its own limit.
+const (
+	kbSearchDefaultLimit = 3
+	kbSearchMaxLimit     = 10
+)
+
+// kbSearchLimit reads amp_kb_search's limit: the default when absent or not
+// positive, clamped to the max otherwise.
+func kbSearchLimit(args map[string]interface{}) int {
+	limit := optInt(args, "limit", kbSearchDefaultLimit)
+	if limit <= 0 {
+		return kbSearchDefaultLimit
+	}
+	if limit > kbSearchMaxLimit {
+		return kbSearchMaxLimit
+	}
+	return limit
 }
 
 func (s *Server) kbGet(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
