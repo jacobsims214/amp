@@ -126,7 +126,7 @@ var toolCatalog = map[string]toolInfo{
 	"amp_kb_status":             {title: "KB health", keywords: "stale docs, annotations, tag counts", readOnly: true},
 	"amp_kb_sources":            {title: "List KBs for a project", keywords: "which knowledge bases: project, team, org", readOnly: true},
 	"amp_kb_tags":               {title: "KB tags", readOnly: true, listing: hiddenAlias},
-	"amp_kb_reindex":            {title: "Reindex KB", listing: hiddenAlias},
+	"amp_kb_reindex":            {title: "Reindex KB", keywords: "rebuild or re-embed a KB, search scores look huge or wrong, results look keyword-only, a doc is missing from search", idempotent: true},
 
 	// Artifacts and design
 	"amp_publish_artifact":      {title: "Publish artifact", keywords: "publish or upload a mockup, prototype, diagram, image, PDF or document for review"},

@@ -778,8 +778,11 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		kbArgs(nil)), wrap(ctx, s.open(s.kbTags)))
 
 	mcp.AddTool(tool("amp_kb_reindex",
-		"Re-embed all documents in a knowledge base (project KB unless scope says otherwise). "+
-			"Use after changing the embedding model or if search quality degrades.",
+		"Rebuild a knowledge base's search index: re-embed every document (project KB unless scope says otherwise). "+
+			"Use it when search looks broken: scores far above 1, results that match only on keywords, or a doc "+
+			"amp_kb_get can read that amp_kb_search never finds; also after the embedding model changes. "+
+			"It runs in the background and returns at once; search again in a minute. Documents aren't changed. "+
+			"Needs write access to that KB, the same as amp_kb_write (for an org KB: org owners and admins).",
 		kbArgs(nil)), wrap(ctx, s.open(s.kbReindex)))
 
 	mcp.AddTool(tool("amp_kb_annotate",
