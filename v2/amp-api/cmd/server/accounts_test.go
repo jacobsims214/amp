@@ -166,7 +166,7 @@ func TestAccounts_AgentAccountsAndTokens(t *testing.T) {
 }
 
 // A deactivated account is refused everywhere and can't be given work;
-// reactivating restores it. Managers deactivate their agents, global
+// reactivating restores it (but not its revoked tokens). Managers deactivate their agents, global
 // admins anyone but themselves.
 func TestAccounts_Deactivation(t *testing.T) {
 	w := newRBACWorld(t)
@@ -196,8 +196,12 @@ func TestAccounts_Deactivation(t *testing.T) {
 	ra.want(t, 400, "alice", "POST", fmt.Sprintf("/api/users/%d/tokens", agentID), map[string]any{"name": "x"})
 
 	ra.want(t, 200, "alice", "POST", fmt.Sprintf("/api/users/%d/reactivate", agentID), nil)
-	if code, _ := bearerDo(t, srv, agentTok, "GET", "/api/me", nil); code != 200 {
-		t.Errorf("reactivated agent: %d", code)
+	// Its old token was revoked with the deactivation; it needs a new one.
+	if code, _ := bearerDo(t, srv, agentTok, "GET", "/api/me", nil); code != 401 {
+		t.Errorf("reactivated agent's old token: %d, want 401", code)
+	}
+	if code, _ := bearerDo(t, srv, mintToken(t, ra, "alice", fmt.Sprint(agentID)), "GET", "/api/me", nil); code != 200 {
+		t.Errorf("reactivated agent's new token: %d", code)
 	}
 	ra.want(t, 200, "lead", "POST", fmt.Sprintf("/api/tasks/%d/assign", tid), map[string]any{"user": fmt.Sprint(agentID)})
 
@@ -220,6 +224,106 @@ func TestAccounts_Deactivation(t *testing.T) {
 				t.Errorf("agent in team list: %v", m)
 			}
 		}
+	}
+}
+
+// Deactivating an account revokes its API tokens, and audits each like a
+// normal revoke, so reactivating it doesn't bring them back. Tokens left
+// live on an account deactivated before that (minted before this change)
+// are revoked when it is reactivated.
+func TestAccounts_DeactivationRevokesTokens(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	srv := bearerServer(t, w)
+	ctx := context.Background()
+
+	agentID := num(t, ra.want(t, 200, "alice", "POST", "/api/agents", map[string]any{"name": "Revoked", "team_ids": []int{w.devs.ID}}), "agent", "id")
+	tokA := mintToken(t, ra, "alice", fmt.Sprint(agentID))
+	tokB := mintToken(t, ra, "alice", fmt.Sprint(agentID))
+	// One already revoked by hand: deactivation must not re-revoke or re-audit it.
+	before, _ := w.s.repo.ListAPITokens(ctx, agentID)
+	if len(before) != 2 {
+		t.Fatalf("tokens = %+v", before)
+	}
+	handRevoked := before[0].ID
+	ra.want(t, 200, "alice", "DELETE", fmt.Sprintf("/api/tokens/%d", handRevoked), nil)
+	firstRevokedAt := func() time.Time {
+		toks, _ := w.s.repo.ListAPITokens(ctx, agentID)
+		for _, tk := range toks {
+			if tk.ID == handRevoked {
+				return *tk.RevokedAt
+			}
+		}
+		t.Fatal("hand-revoked token missing")
+		return time.Time{}
+	}()
+
+	// tokenRevokes returns the token ids of token.revoke entries for the agent.
+	tokenRevokes := func() map[int]int {
+		out := ra.want(t, 200, "root", "GET", "/api/audit?action=token.revoke&limit=500", nil)
+		got := map[int]int{}
+		for _, e := range out["entries"].([]any) {
+			e := e.(map[string]any)
+			if e["target_id"] == fmt.Sprint(agentID) {
+				got[num(t, e, "details", "token_id")]++
+			}
+		}
+		return got
+	}
+
+	ra.want(t, 200, "alice", "POST", fmt.Sprintf("/api/users/%d/deactivate", agentID), nil)
+	after, _ := w.s.repo.ListAPITokens(ctx, agentID)
+	for _, tk := range after {
+		if tk.RevokedAt == nil {
+			t.Errorf("token %d not revoked by deactivation", tk.ID)
+		}
+		if tk.ID == handRevoked && !tk.RevokedAt.Equal(firstRevokedAt) {
+			t.Errorf("hand-revoked token's revoked_at moved: %v -> %v", firstRevokedAt, tk.RevokedAt)
+		}
+	}
+	revokes := tokenRevokes()
+	for _, tk := range after {
+		if revokes[tk.ID] != 1 {
+			t.Errorf("token %d has %d token.revoke entries, want 1: %v", tk.ID, revokes[tk.ID], revokes)
+		}
+	}
+	// The deactivation's entries carry who did it and why.
+	out := ra.want(t, 200, "root", "GET", "/api/audit?action=token.revoke&limit=1", nil)
+	e := out["entries"].([]any)[0].(map[string]any)
+	if num(t, e, "actor_user_id") != w.alice.User.ID || e["details"].(map[string]any)["reason"] != "user.deactivate" {
+		t.Errorf("deactivation revoke entry = %v", e)
+	}
+
+	ra.want(t, 200, "alice", "POST", fmt.Sprintf("/api/users/%d/reactivate", agentID), nil)
+	for _, tok := range []string{tokA, tokB} {
+		if code, _ := bearerDo(t, srv, tok, "GET", "/api/me", nil); code != 401 {
+			t.Errorf("old token after reactivation: %d, want 401", code)
+		}
+	}
+	// Reactivating found nothing left to revoke.
+	if got := tokenRevokes(); len(got) != len(revokes) {
+		t.Errorf("reactivation audited revokes again: %v", got)
+	}
+
+	// An account deactivated before this change still has live tokens; a
+	// token stored straight into the repo while it is deactivated stands in
+	// for one. Reactivating revokes it rather than reviving it.
+	ra.want(t, 200, "alice", "POST", fmt.Sprintf("/api/users/%d/deactivate", agentID), nil)
+	raw, hash, prefix, _ := auth.NewAPIToken()
+	legacy, err := w.s.repo.CreateAPIToken(ctx, agentID, "legacy", hash, prefix, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ra.want(t, 200, "alice", "POST", fmt.Sprintf("/api/users/%d/reactivate", agentID), nil)
+	if code, _ := bearerDo(t, srv, raw, "GET", "/api/me", nil); code != 401 {
+		t.Errorf("legacy token after reactivation: %d, want 401", code)
+	}
+	if got := tokenRevokes(); got[legacy.ID] != 1 {
+		t.Errorf("legacy token revoke not audited: %v", got)
+	}
+	out = ra.want(t, 200, "root", "GET", "/api/audit?action=token.revoke&limit=1", nil)
+	if e := out["entries"].([]any)[0].(map[string]any); e["details"].(map[string]any)["reason"] != "user.reactivate" {
+		t.Errorf("reactivation revoke entry = %v", e)
 	}
 }
 
