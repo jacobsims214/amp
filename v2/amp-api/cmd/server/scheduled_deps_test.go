@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -53,6 +54,57 @@ func waitState(t *testing.T, s *mcpStack, id int, want string) {
 	}
 }
 
+// releaseEvents records the task.blocked / task.unblocked events published
+// for one ticket from now on — what the UI's SSE stream receives.
+type releaseEvents struct {
+	mu   sync.Mutex
+	evts []domain.Task
+}
+
+func watchRelease(s *mcpStack, id int) *releaseEvents {
+	r := &releaseEvents{}
+	s.hub.AddSink(func(e domain.Event) {
+		if e.Type != domain.EventTaskBlocked && e.Type != domain.EventTaskUnblocked {
+			return
+		}
+		if t, ok := e.Payload.(domain.Task); ok && t.ID == id {
+			r.mu.Lock()
+			r.evts = append(r.evts, t)
+			r.mu.Unlock()
+		}
+	})
+	return r
+}
+
+// assertScheduleConsumed checks the fired schedule is gone everywhere: the
+// release event carried no start_at (the UI applies the payload as-is, so a
+// stale one shows "Starts N min ago" on a released ticket), and neither the
+// actor nor the database still holds one.
+func assertScheduleConsumed(t *testing.T, s *mcpStack, id int, r *releaseEvents) {
+	t.Helper()
+	r.mu.Lock()
+	evts := append([]domain.Task(nil), r.evts...)
+	r.mu.Unlock()
+	if len(evts) == 0 {
+		t.Fatalf("ticket %d: no task.blocked/task.unblocked event when its schedule fired", id)
+	}
+	for _, e := range evts {
+		if e.StartAt != nil {
+			t.Fatalf("ticket %d: release event carries start_at %v, want none", id, *e.StartAt)
+		}
+	}
+	if v, ok := planTask(t, s, id)["start_at"]; ok && v != nil {
+		t.Fatalf("ticket %d: actor still reports start_at %v after the schedule fired", id, v)
+	}
+	stored, err := s.repo.GetTask(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.StartAt != nil {
+		t.Fatalf("ticket %d: database still holds start_at %v", id, *stored.StartAt)
+	}
+}
+
 // The start time arrives while a dependency is still unfinished: the ticket
 // stays blocked (on its dependencies, no longer on its schedule), and is
 // released only when the dependency completes.
@@ -69,9 +121,11 @@ func TestScheduledDeps_StartAtFiresWithUnfinishedDependencyStaysBlocked(t *testi
 	if st := stateOf(t, s, id); st != "blocked" {
 		t.Fatalf("scheduled ticket: %s", st)
 	}
+	release := watchRelease(s, id)
 
 	// Let the timer fire.
 	time.Sleep(time.Until(at) + 500*time.Millisecond)
+	assertScheduleConsumed(t, s, id, release)
 
 	task := planTask(t, s, id)
 	if st := task["state"].(string); st != "blocked" {
@@ -107,11 +161,14 @@ func TestScheduledDeps_DependencyDoneFirstWaitsForStartAt(t *testing.T) {
 	if st := stateOf(t, s, id); st != "blocked" {
 		t.Fatalf("dependency done but start_at still ahead: ticket is %q, want blocked", st)
 	}
+	release := watchRelease(s, id)
 
 	waitState(t, s, id, "backlog")
 	if time.Now().Before(at) {
 		t.Fatal("released before its start time")
 	}
+	time.Sleep(200 * time.Millisecond) // the actor clears start_at in the DB just after the state
+	assertScheduleConsumed(t, s, id, release)
 }
 
 // The start time passed while no actor ran the project (a restart or a

@@ -711,17 +711,24 @@ func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 		return
 	}
 
+	// The schedule is consumed. Clear start_at in memory before the release so
+	// the task.blocked/task.unblocked event it publishes carries start_at nil
+	// (the UI applies event payloads directly). The DB keeps its order: state
+	// first, then start_at — clearing start_at first would strand the task if
+	// the state save failed, since Started only re-sends MsgScheduledUnblock
+	// while start_at is set.
+	prevStartAt := a.task.StartAt
+	a.task.StartAt = nil
 	if err := a.releaseFromSchedule("Scheduled start time reached"); err != nil {
+		a.task.StartAt = prevStartAt
 		a.log.Error("failed to persist scheduled unblock state", "err", err)
 		return
 	}
 
-	// Clear start_at in DB — once the schedule fires, it's consumed
 	if err := a.repo.SetTaskStartAt(context.Background(), a.task.ID, nil); err != nil {
 		a.log.Error("failed to clear start_at", "err", err)
 		return
 	}
-	a.task.StartAt = nil
 
 	// Clear the timer reference
 	a.scheduleTimer = nil
