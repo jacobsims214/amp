@@ -440,6 +440,71 @@ func TestScheduledDeps_SetStartAtRefusedOnStartedTickets(t *testing.T) {
 		})
 	}
 
+	// A ticket blocked on a question keeps its question: setting a start time
+	// is refused and the ticket is left as it was (AMP #1915).
+	t.Run("blocked on a question", func(t *testing.T) {
+		const question = "Avalara or Stripe Tax?"
+		id := mkIn(t, s, s.storyID, "question-blocked")
+		reply := make(chan actor.ReplySimple, 1)
+		if err := s.reg.Send(s.projectID, &actor.MsgSetTaskState{TaskID: id, State: domain.TaskStateBlocked, Reason: question, ReplyCh: reply}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case r := <-reply:
+			if r.Err != nil {
+				t.Fatal(r.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("MsgSetTaskState never answered")
+		}
+
+		reply = make(chan actor.ReplySimple, 1)
+		if err := s.reg.Send(s.projectID, &actor.MsgSetTaskStartAt{TaskID: id, StartAt: &future, ReplyCh: reply}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case r := <-reply:
+			if r.Err == nil || !strings.Contains(r.Err.Error(), "answer or unblock it first") {
+				t.Fatalf("set start_at on question-blocked ticket: err %v, want a refusal", r.Err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("MsgSetTaskStartAt never answered")
+		}
+
+		got := make(chan actor.ReplyGetTask, 1)
+		if err := s.reg.Send(s.projectID, &actor.MsgGetTask{TaskID: id, ReplyCh: got}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case r := <-got:
+			if r.Err != nil {
+				t.Fatal(r.Err)
+			}
+			if r.Task.State != domain.TaskStateBlocked || r.Task.BlockReason != question || r.Task.StartAt != nil {
+				t.Errorf("actor: state %q, block_reason %q, start_at %v; want blocked, %q, nil",
+					r.Task.State, r.Task.BlockReason, r.Task.StartAt, question)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("MsgGetTask never answered")
+		}
+		stored, err := s.repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stored.State != domain.TaskStateBlocked || stored.BlockReason != question || stored.StartAt != nil {
+			t.Errorf("db: state %q, block_reason %q, start_at %v; want blocked, %q, nil",
+				stored.State, stored.BlockReason, stored.StartAt, question)
+		}
+
+		// Clearing a schedule is still allowed and leaves the question alone.
+		scheduleAt(t, s, id, nil)
+		if stored, err := s.repo.GetTask(ctx, id); err != nil {
+			t.Fatal(err)
+		} else if stored.BlockReason != question {
+			t.Errorf("after clearing: block_reason %q, want %q", stored.BlockReason, question)
+		}
+	})
+
 	// Backward compatible: a backlog ticket is scheduled exactly as before.
 	id := mkIn(t, s, s.storyID, "not started")
 	scheduleAt(t, s, id, &future)
