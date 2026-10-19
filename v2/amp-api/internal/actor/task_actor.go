@@ -446,6 +446,15 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 }
 
 func (a *TaskActor) handleSetTaskStartAt(startAt *time.Time) error {
+	// A schedule says when a ticket may start, so it applies only to tickets
+	// that haven't started. Scheduling one already in progress or completed
+	// would block it again; refuse and leave it untouched. Clearing (nil) is
+	// still allowed, so a stale start_at can be removed.
+	if startAt != nil && (a.task.State == domain.TaskStateInProgress || a.task.State == domain.TaskStateCompleted) {
+		return fmt.Errorf("task %d is %s: a start time can only be set on a ticket that hasn't started (backlog or blocked)",
+			a.task.ID, a.task.State)
+	}
+
 	// Cancel existing timer if armed
 	if a.scheduleTimer != nil {
 		a.scheduleTimer.Stop()
