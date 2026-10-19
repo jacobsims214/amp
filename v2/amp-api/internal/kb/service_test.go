@@ -7,6 +7,8 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/typesense/typesense-go/v4/typesense/api"
 )
 
 // Project KBs keep the names and document ids they had before scopes
@@ -84,5 +86,104 @@ func TestReindexRebuildKeepsAnnotations(t *testing.T) {
 	}
 	if len(doc.Annotations) != 2 || doc.Annotations[1].Text != "second note" || doc.Reason != "shared by the team" {
 		t.Fatalf("after a rebuilding reindex: %+v", doc)
+	}
+}
+
+// Search's score must be a 0-1 relevance that follows Typesense's order, never
+// the raw ~1e18 text_match (#1077).
+func TestScoreHit(t *testing.T) {
+	f32 := func(f float32) *float32 { return &f }
+	i64 := func(i int64) *int64 { return &i }
+	fused := func(f float32) *api.SearchResultHitHybridSearchInfo {
+		return &api.SearchResultHitHybridSearchInfo{RankFusionScore: &f}
+	}
+
+	tests := []struct {
+		name        string
+		hit         api.SearchResultHit
+		rank        int
+		wantScore   float64
+		wantVector  float64 // -1 means nil
+		wantKeyword bool
+	}{
+		{
+			name:        "hybrid hit with both components uses the fusion score",
+			hit:         api.SearchResultHit{TextMatch: i64(3465581326462093425), VectorDistance: f32(0.414), HybridSearchInfo: fused(0.75)},
+			wantScore:   0.75,
+			wantVector:  0.586,
+			wantKeyword: true,
+		},
+		{
+			name:        "hybrid keyword-only hit no longer leaks text_match",
+			hit:         api.SearchResultHit{TextMatch: i64(3465581326462093425), HybridSearchInfo: fused(0.70)},
+			wantScore:   0.70,
+			wantVector:  -1,
+			wantKeyword: true,
+		},
+		{
+			name:       "hybrid vector-only hit uses the fusion score, not the similarity",
+			hit:        api.SearchResultHit{TextMatch: i64(0), VectorDistance: f32(0.325), HybridSearchInfo: fused(0.30)},
+			rank:       1,
+			wantScore:  0.30,
+			wantVector: 0.675,
+		},
+		{
+			name:        "keyword-only collection scores by reciprocal rank",
+			hit:         api.SearchResultHit{TextMatch: i64(4620772360776059000)},
+			rank:        2,
+			wantScore:   1.0 / 3,
+			wantVector:  -1,
+			wantKeyword: true,
+		},
+		{
+			name:       "vector-only hit without fusion info uses its similarity",
+			hit:        api.SearchResultHit{VectorDistance: f32(0.4)},
+			wantScore:  0.6,
+			wantVector: 0.6,
+		},
+		{
+			name:       "similarity is clamped to 0 for cosine distance above 1",
+			hit:        api.SearchResultHit{VectorDistance: f32(1.3)},
+			wantScore:  0,
+			wantVector: 0,
+		},
+	}
+	const eps = 1e-6
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := scoreHit(tt.hit, tt.rank)
+			if got.score < tt.wantScore-eps || got.score > tt.wantScore+eps {
+				t.Errorf("score = %v, want %v", got.score, tt.wantScore)
+			}
+			if got.score < 0 || got.score > 1 {
+				t.Errorf("score %v outside [0,1]", got.score)
+			}
+			switch {
+			case tt.wantVector < 0 && got.vector != nil:
+				t.Errorf("vector = %v, want nil", *got.vector)
+			case tt.wantVector >= 0 && got.vector == nil:
+				t.Errorf("vector = nil, want %v", tt.wantVector)
+			case tt.wantVector >= 0 && (*got.vector < tt.wantVector-eps || *got.vector > tt.wantVector+eps):
+				t.Errorf("vector = %v, want %v", *got.vector, tt.wantVector)
+			}
+			if got.keyword != tt.wantKeyword {
+				t.Errorf("keyword = %v, want %v", got.keyword, tt.wantKeyword)
+			}
+		})
+	}
+}
+
+// A keyword-only result page scores 1, 1/2, 1/3, ...: never above 1 and
+// non-increasing in result order.
+func TestScoreHitKeywordOnlyMonotonic(t *testing.T) {
+	tm := []int64{4620772360776059000, 3465581326462093425, 2886860116362004500, 2886860116362004500}
+	prev := 1.0
+	for rank, v := range tm {
+		v := v
+		got := scoreHit(api.SearchResultHit{TextMatch: &v}, rank).score
+		if got > 1 || got > prev {
+			t.Fatalf("rank %d: score %v (prev %v) not within (0,1] and non-increasing", rank, got, prev)
+		}
+		prev = got
 	}
 }
