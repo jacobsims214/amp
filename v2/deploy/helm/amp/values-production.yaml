@@ -134,7 +134,9 @@ oauth2Proxy:
   # concurrent token refreshes race — one redeems the rotating refresh token,
   # the other fails with "Refresh token is invalid or has already been
   # claimed by another client", periodically killing the browser session.
-  # Same multi-replica limitation as amp-api's actor split-brain. See
+  # This limitation is oauth2-proxy's own: amp-api no longer has one (since
+  # cluster mode, any number of amp-api replicas is safe and its single
+  # replica is a choice; see architecture/clustering.md). See
   # discoveries/prod-diagnostic-2026-08-02.md.
   replicas: 1
   cookieSecure: true
