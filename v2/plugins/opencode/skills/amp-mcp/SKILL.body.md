@@ -21,6 +21,7 @@ one feature with no obvious entry point — scheduling.
 - **Planning**: `amp_create_tasks` (several tickets and their dependencies in one call), `amp_set_task_dependencies`, `amp_move_task`, `amp_check_plan` — see the `amp-planning` skill. Dependencies drive dispatch: never leave them out, and never delete and re-create tickets to fix them
 - **Tasks**: `amp_create_tasks`, `amp_list_tasks` (compact board; `format: "full"` for full records), `amp_get_task` (`include: ["comments","history","runs"]` for its comments, activity and runs), `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_claim_task`, `amp_assign_task`
 - **People**: `amp_whoami`, `amp_list_project_members`
+- **Human tickets**: `performer: "human"` + `human_reason` on `amp_create_tasks` / `amp_update_task`; `waiting_on_people` in `amp_list_tasks`; `human_gates` in `amp_check_plan`; `amp_human_impact` (agents vs people, what held the plan up)
 - **Daily reports**: `amp_day_report`, `amp_save_day_report`, `amp_list_day_reports`, `amp_velocity` — see the `amp-day-report` skill
 - **Metadata**: `metadata` on the create/update tools for projects, epics, stories, and tasks; `amp_find_by_metadata`
 - **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
@@ -74,6 +75,33 @@ A subagent can't wait for an answer, so a question lives on the ticket:
   it's posted as a comment and the ticket goes back to ready (or to waiting, if it still depends
   on unfinished tickets). People answering in the AMP UI do exactly the same.
 - The next worker dispatched to the ticket reads its comments first (`amp_get_task` with `include: ["comments"]`) and finds the answer.
+
+---
+
+## Human tickets — a person in the loop
+
+A ticket is done by an agent (the default) or by a person: `performer: "human"`, with
+`human_reason` one of `review`, `approval`, `access`, `judgment`, `external`, `physical`, `other`,
+and its `owner` the person who does it (required). It sits in the dependency graph like any other
+ticket, so whatever `depends_on` it waits for the person.
+
+- **Never dispatched.** `amp_dispatch_task` refuses it. Its owner clicks Start and Mark done in
+  AMP. It isn't in `ready_to_dispatch` or `in_progress`, and it's never `quiet`.
+- **`amp_list_tasks` → `waiting_on_people`**: the human tickets a person can do now that matter to
+  you. Each has `owner` (email), `reason`, `state` (ready | in_progress), `waiting_hours`,
+  `holding_up` (open ticket IDs downstream) and `stale` (48h with no activity).
+- **Recording one done for your own user, on their word**: `amp_complete_task(task_id, note,
+  pr_url, hours_worked)`. It's recorded as their work, noted as entered by their agent. Agent
+  accounts can't.
+- **Switching who does it**: `amp_update_task(task_id, performer, human_reason)`. Not while it's
+  in progress; the change is on the ticket's history.
+- **`amp_check_plan` → `human_gates`**: each open human ticket and how many open tickets wait on
+  it. A human ticket with no owner is a NO-GO issue.
+- **`amp_human_impact(project_id, days?)`**:
+  - agents vs people: tickets, median wait (ready → started), median time once started, hours
+    people reported;
+  - human work by reason;
+  - the human tickets that held the plan up longest.
 
 ---
 

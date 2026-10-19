@@ -38,6 +38,9 @@ Don't set state by hand to work around a missing dependency; add the dependency.
   ticket. Anyone on the project can read it and comment on it. Leads can hand work over.
 - **Agent accounts** are separate AMP users for unattended agents (CI, bots). They can do work
   but can't approve plans.
+- **Human tickets** are done by their owner, not an agent: a review and merge, a sign-off, a
+  step that needs access agents don't have. They sit in the same dependency graph, so the agent
+  work after them waits for the person. Agents never dispatch them. See `working/human-work.md`.
 
 ## Access levels on a project
 

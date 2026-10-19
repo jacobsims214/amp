@@ -13,7 +13,11 @@ Your manager repeats:
    the foreground** and wait for it. Both in the same turn.
 3. When workers finish, check again: reviews may have created fix tickets, answers may have put
    questions back to ready, scheduled tickets may have come due.
-4. Stop when nothing is ready or in progress. Report questions and work waiting to merge.
+4. Stop when nothing is ready or in progress. Report questions, work waiting to merge, and
+   `waiting_on_people`: the human tickets the plan is waiting on, and whose they are.
+
+Human tickets are never dispatched or listed as ready: a person does them in AMP. See
+`working/human-work.md`.
 
 Rules that keep this healthy:
 - **Only your own tickets, and only after dispatch succeeds.** If AMP refuses the dispatch (it's

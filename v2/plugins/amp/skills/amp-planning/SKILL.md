@@ -239,6 +239,63 @@ Wave 1: #21 (API), #22 (UI, builds to #20)     ← blocked by #20
 
 ---
 
+## People in the loop — human tickets
+
+Some steps only a person can do. Plan each one as a **human ticket**: a ticket in the same graph,
+owned by the person who does it, that agents never dispatch. The agent work that needs it
+`depends_on` it, so it waits for the person and starts the moment they mark it done in AMP. The
+chain of work stays unbroken, and the board shows exactly who the plan is waiting on.
+
+**Put a person in the loop when the step needs**:
+
+| Reason (`human_reason`) | Examples |
+|---|---|
+| `review` | A person reviews and merges the PR (the team requires human review, or it's a protected branch) |
+| `approval` | Sign-off on a prod release, a spend, a security or legal change, a customer-facing launch |
+| `access` | Access agents don't have: a prod console, a vendor dashboard, rotating a secret, a paid account |
+| `judgment` | A decision known at plan time that only a person can make: which vendor, pricing, a trade-off |
+| `external` | Someone outside the team: a customer's sign-off, a vendor's reply, another team's change |
+| `physical` | Offline work: hardware, a site visit, a phone call, a signature |
+
+**Not a human ticket**:
+- **A question that comes up mid-work.** A worker blocks its own ticket with the question
+  (`amp_block_task`), and you answer it. Human tickets are steps you can see at plan time.
+- **Approving a mockup.** That's the design ticket's artifact review.
+- **Approving the plan.** That's `amp_approve_plan`.
+- **Anything an agent can do with the tools it has.** Don't hand agents' work to people. If an
+  agent could do it but lacks a tool or access, say so in the plan; that gap is worth knowing.
+
+**How to plan one**:
+- In `amp_create_tasks`, set `performer: "human"` and `human_reason`, and make `owner` the person
+  who does it (their email).
+  - It's your user's by default. Ask if it's not obvious whose it is: a human ticket with no
+    owner is a NO-GO in `amp_check_plan`, because nobody would ever do it.
+  - A teammate's human ticket shows up in their My Work, under "To do myself".
+- **One person, one action, a clear done.**
+  - Name it for the action: `Review and merge: quotes API PR`, `Approve: prod release 2.4`,
+    `Rotate: Stripe live key`.
+  - Acceptance criteria say what done means for a person: "PR merged to main", "release
+    approved in the change log".
+  - The description says what they need: the PR link or branch, what to check, where to do it.
+- **Wire it both ways:**
+  - it `depends_on` the agent work it needs (the PR exists before anyone reviews it);
+  - the agent work after it `depends_on` it (deploy after the merge).
+
+  A human ticket with nothing waiting on it is usually a step you should have wired in.
+- **Leave out `assigned_to`.** No agent runs it.
+
+```
+Wave 1:  #30 Build quotes API              → amp-worker-backend   (ready)
+Gate:    #31 Review and merge: quotes PR   → person: sam@acme.com (review)   (blocked by #30)
+Wave 2:  #32 Deploy quotes to staging      → amp-worker-backend   (blocked by #31)
+```
+
+`amp_check_plan` lists every human ticket under `human_gates`, with how many open tickets wait on
+each. When one gate holds up most of the plan, say so when you present it. The user may want to
+book that person's time, or move the step later.
+
+---
+
 ## File conflict check — non-negotiable
 
 Two subagents editing the same file at the same time is a lost-write hazard — one agent's
@@ -502,7 +559,9 @@ Total: X tasks (Y implementation + Z wave checks + 1 code review per story)
 ```
 
 Every task shows: its ID, name, assigned agent, and either `(ready)` or `(blocked by #N, ...)`.
-Wave checks and code reviews must be clearly labeled.
+Wave checks and code reviews must be clearly labeled. A human ticket shows the person and why in
+place of an agent (`→ person: sam@acme.com (review)`), and the phases name who the plan waits on:
+"Phase 2 — unblocks when Sam merges #31".
 If a task has no agent or no blocker status shown — fix it before presenting.
 
 **After the task tree, state the result of the file conflict check explicitly** — don't leave it
@@ -579,6 +638,18 @@ task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's as
 Step 1 must happen before step 2. This is what shows live progress on the board.
 
 After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+
+**Human tickets are never dispatched.** They aren't in `ready_to_dispatch`.
+- `waiting_on_people` lists the ones a person can do now, and for each:
+  - who owns it;
+  - how long it has waited;
+  - what it is `holding_up`;
+  - whether it's `stale` (no activity for two days).
+- Tell your user plainly: "Waiting on Sam to review and merge #31; nothing else can start until
+  then." Keep dispatching everything that doesn't wait on it.
+- If it's your user's own, they can Start and Mark done in AMP. Or they tell you it's done and
+  you record it: `amp_complete_task(task_id, note, pr_url, hours_worked)`. Only on their word, and
+  ask how many hours it took if they don't say. A stale one is worth a nudge to its owner.
 
 A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
 `questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the

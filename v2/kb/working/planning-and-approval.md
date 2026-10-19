@@ -21,6 +21,9 @@ Good tickets:
   depends on. Reviewers turn problems into fix tickets wired into the next gate.
 - **Owned by the right person.** Planning for a teammate is fine (with `owner`), but only their
   agent will run it.
+- **People in the loop where a person has to act.** A step only a person can do (review and
+  merge, a sign-off, access agents don't have) is a human ticket. The work after it waits for
+  that person. See `working/human-work.md`.
 
 ## The plan check
 
@@ -28,12 +31,15 @@ Good tickets:
 - **NO-GO** for real problems: tickets connected to nothing (`isolated`), too much work that can
   start at once (`wide_start`), stories with no tickets (`empty_stories`), and an empty project
   KB (`no_context`: the decisions behind the plan live only in the planning session, so write an
-  overview and a `decisions/` doc per decision).
+  overview and a `decisions/` doc per decision), and a human ticket with no owner
+  (`human_without_owner`).
 - **WARN** for things worth a look:
   - `coupled_gate`: one ticket joins different people's work, so neither can finish alone.
   - `metadata_drift`: an epic is missing metadata keys its siblings carry (often a near-miss
     key like `jira_key` where the others say `jira_epic`).
 - **GO** otherwise.
+
+It also lists `human_gates`: each open human ticket and how many tickets wait on it.
 
 ## Fixing a plan
 

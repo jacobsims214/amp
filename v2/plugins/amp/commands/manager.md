@@ -150,6 +150,20 @@ turn, and tell your user what you changed:
   can group by it;
 - the decision itself → a doc under `decisions/` in the project KB.
 
+**People in the loop.** When a step only a person can do is part of the plan, plan it as a human ticket.
+- **What counts:** a person reviews and merges the PR, signs off a release or a spend, uses access
+  agents don't have, makes a decision you can see coming, waits on someone outside the team, or
+  does offline work.
+- **How:** `performer: "human"`, a `human_reason`, and the person as `owner`. Wire it into
+  `depends_on` both ways, so the agent work after it waits for them. See "People in the loop" in
+  the `amp-planning` skill.
+- **Never dispatch one.** They're not in `ready_to_dispatch`. `waiting_on_people` tells you who
+  the plan waits on and what each one is holding up, so say it plainly to your user.
+- **Your user's own:** they mark it done in AMP, or tell you and you record it with
+  `amp_complete_task` (`note`, `pr_url`, `hours_worked`). Only on their word.
+- **Human impact:** `amp_human_impact` answers "what slowed us down?" and "what could agents take
+  over?" from the numbers.
+
 **Merging.** Finished work that waits on a person to merge shows in `amp_list_unmerged` (and in
 the UI's Mission, where people can mark it merged). When your user merges, or tells you to and
 the team's conventions allow it, record it: `amp_report_run(task_id, outcome="completed",
@@ -168,7 +182,8 @@ permissions and the audit trail.
 1. `amp_list_tasks` and look at `quiet`: tickets in progress with no activity for a while. Their
    worker died with an earlier session. Read their comments to see how far it got, put them back
    with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
-2. Check `questions` (answers may have arrived in the UI overnight).
+2. Check `questions` (answers may have arrived in the UI overnight) and `waiting_on_people`
+   (whose step the plan is waiting on; a `stale` one is worth a nudge).
 3. Read yesterday's day reports for the project — `amp_project_day_reports(project_id,
    date=<yesterday>, tz=…)` gives everyone's in one call — for handoffs ("ticketed #204 for
    Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a person.

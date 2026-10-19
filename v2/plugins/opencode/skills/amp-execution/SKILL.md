@@ -180,6 +180,11 @@ First decide which kind of stop this is:
   missing dependency, not a question for a person. Comment what's missing and which ticket should
   provide it, don't block, and say so in your final message so the orchestrator adds the
   dependency and re-dispatches.
+- **The next step is a person's job, not a question** (merging your PR, a prod deploy only they
+  can run, a sign-off). Don't do it, and don't pretend it's done. Finish your part and complete
+  your ticket, and say in your completion comment what the person has to do next. The plan
+  usually has a human ticket for that step (a ticket done by a person, which agents never
+  dispatch). If it doesn't, say so in your final message so the orchestrator adds one.
 - **You need a person**: a decision only they can make, information you can't find, access or a
   credential you don't have, or requirements that contradict each other. Ask:
 
