@@ -985,7 +985,32 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 	if r := actor.Await(ctx, set); r.Err != nil {
 		return nil, r.Err
 	}
-	// Back to waiting if a dependency is unfinished.
+	// A ticket scheduled before it got its question is held by its schedule
+	// again: the set to backlog above stopped its timer, and a future start_at
+	// must not let it be dispatched early (nor a restart re-schedule it later,
+	// so the live board and the board after a restart agree). Read start_at
+	// from the actor, not the copy loaded before the call. A start time that
+	// has passed leaves it to backlog or its dependencies, as before.
+	cur := make(chan actor.ReplyGetTask, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgGetTask{TaskID: taskID, ReplyCh: cur}); err != nil {
+		return nil, err
+	}
+	c := actor.Await(ctx, cur)
+	if c.Err != nil {
+		return nil, c.Err
+	}
+	if c.Task != nil && c.Task.StartAt != nil && c.Task.StartAt.After(time.Now()) {
+		at := *c.Task.StartAt
+		sched := make(chan actor.ReplySimple, 1)
+		if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskStartAt{TaskID: taskID, StartAt: &at, ReplyCh: sched}); err != nil {
+			return nil, err
+		}
+		if r := actor.Await(ctx, sched); r.Err != nil {
+			return nil, r.Err
+		}
+	}
+	// Back to waiting if a dependency is unfinished. A ticket held by its
+	// schedule is left alone here; its release checks dependencies when it fires.
 	rec := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgReconcileDeps{TaskID: taskID, ReplyCh: rec}); err != nil {
 		return nil, err

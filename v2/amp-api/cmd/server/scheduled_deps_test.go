@@ -517,3 +517,104 @@ func TestScheduledDeps_SetStartAtRefusedOnStartedTickets(t *testing.T) {
 		t.Errorf("backlog ticket: block_reason %q, start_at %v; want scheduled", stored.BlockReason, stored.StartAt)
 	}
 }
+
+// A scheduled ticket that gets a question keeps its schedule once the question
+// is answered (AMP #1936): answering puts it back on its schedule (blocked
+// "scheduled:...", timer armed, start_at unchanged) instead of making it ready
+// before its start time, and the timer releases it as usual. Without a
+// start_at, or with one already past, answering makes it ready as before.
+func TestScheduledDeps_AnswerKeepsFutureSchedule(t *testing.T) {
+	s := setupMCP(t)
+	ctx := context.Background()
+
+	stored := func(id int) *domain.Task {
+		t.Helper()
+		task, err := s.repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return task
+	}
+	askAndAnswer := func(id int) map[string]interface{} {
+		t.Helper()
+		s.call(t, "amp_block_task", map[string]interface{}{"task_id": float64(id), "reason": "Avalara or Stripe Tax?"})
+		if got := stored(id); got.State != domain.TaskStateBlocked || got.BlockReason != "Avalara or Stripe Tax?" {
+			t.Fatalf("after the question: state %q, block_reason %q", got.State, got.BlockReason)
+		}
+		return s.call(t, "amp_answer_question", map[string]interface{}{"task_id": float64(id), "answer": "Stripe Tax."})
+	}
+
+	t.Run("future start_at", func(t *testing.T) {
+		id := mkIn(t, s, s.storyID, "scheduled, then asked")
+		at := time.Now().Add(2 * time.Second).Truncate(time.Microsecond)
+		scheduleAt(t, s, id, &at)
+
+		out := askAndAnswer(id)
+		if out["state"] != "blocked" {
+			t.Fatalf("answered before its start time: state %v, want blocked (on its schedule)", out["state"])
+		}
+		got := stored(id)
+		if got.State != domain.TaskStateBlocked || got.BlockReason != "scheduled:"+at.Format(time.RFC3339) {
+			t.Fatalf("db: state %q, block_reason %q; want blocked scheduled:%s", got.State, got.BlockReason, at.Format(time.RFC3339))
+		}
+		if got.StartAt == nil || !got.StartAt.Equal(at) {
+			t.Fatalf("db: start_at %v, want %v unchanged", got.StartAt, at)
+		}
+		// Not dispatchable before its start time.
+		s.callExpectError(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(id), "agent_id": "agent"})
+
+		// The re-armed timer releases it.
+		release := watchRelease(s, id)
+		time.Sleep(time.Until(at) + 500*time.Millisecond)
+		waitState(t, s, id, string(domain.TaskStateBacklog))
+		assertScheduleConsumed(t, s, id, release)
+	})
+
+	t.Run("future start_at with an unfinished dependency", func(t *testing.T) {
+		dep := mkIn(t, s, s.storyID, "dependency")
+		id := mkIn(t, s, s.storyID, "scheduled with a dependency, then asked", dep)
+		at := time.Now().Add(2 * time.Second)
+		scheduleAt(t, s, id, &at)
+
+		askAndAnswer(id)
+		if got := stored(id); got.State != domain.TaskStateBlocked || !strings.HasPrefix(got.BlockReason, "scheduled:") {
+			t.Fatalf("answered before its start time: state %q, block_reason %q; want blocked scheduled:...", got.State, got.BlockReason)
+		}
+		release := watchRelease(s, id)
+		time.Sleep(time.Until(at) + 500*time.Millisecond)
+		assertScheduleConsumed(t, s, id, release)
+		// Released from its schedule but still waiting on its dependency.
+		if got := stored(id); got.State != domain.TaskStateBlocked || got.BlockReason != "" {
+			t.Fatalf("after start_at with dependency unfinished: state %q, block_reason %q; want blocked, \"\"", got.State, got.BlockReason)
+		}
+		s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(dep)})
+		waitState(t, s, id, string(domain.TaskStateBacklog))
+	})
+
+	t.Run("no start_at", func(t *testing.T) {
+		id := mkIn(t, s, s.storyID, "asked, never scheduled")
+		if out := askAndAnswer(id); out["state"] != "backlog" {
+			t.Fatalf("after the answer: %v, want backlog", out["state"])
+		}
+		if got := stored(id); got.State != domain.TaskStateBacklog || got.BlockReason != "" || got.StartAt != nil {
+			t.Fatalf("db: state %q, block_reason %q, start_at %v; want backlog, \"\", nil", got.State, got.BlockReason, got.StartAt)
+		}
+	})
+
+	t.Run("past start_at", func(t *testing.T) {
+		id := mkIn(t, s, s.storyID, "start_at passed while asked")
+		// Its timer fires while the question holds it: the release is
+		// refused (not held by its schedule), so start_at stays, now past.
+		at := time.Now().Add(500 * time.Millisecond)
+		scheduleAt(t, s, id, &at)
+		s.call(t, "amp_block_task", map[string]interface{}{"task_id": float64(id), "reason": "Avalara or Stripe Tax?"})
+		time.Sleep(time.Until(at) + 300*time.Millisecond)
+		out := s.call(t, "amp_answer_question", map[string]interface{}{"task_id": float64(id), "answer": "Stripe Tax."})
+		if out["state"] != "backlog" {
+			t.Fatalf("answered after its start time: %v, want backlog", out["state"])
+		}
+		if got := stored(id); got.State != domain.TaskStateBacklog || got.BlockReason != "" {
+			t.Fatalf("db: state %q, block_reason %q; want backlog, \"\"", got.State, got.BlockReason)
+		}
+	})
+}
