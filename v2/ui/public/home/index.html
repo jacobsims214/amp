@@ -174,6 +174,35 @@ section { padding-block: 96px; }
 .chip { text-decoration: none; color: var(--ink); }
 a.chip:hover { border-color: var(--ink); }
 
+/* ---- Artifacts ---- */
+.viewer { border: 1px solid var(--line); background: var(--bg); }
+.viewer .vbar { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.viewer .vbar .t { font: 600 14px var(--font-body); }
+.seg { display: inline-flex; border: 1px solid var(--line); }
+.seg span { font: 500 11px/1 var(--font-data); padding: 6px 9px; color: var(--ink-3); }
+.seg span + span { border-left: 1px solid var(--line); }
+.seg span.on { background: var(--ink); color: #fff; }
+.status { font: 600 11px/1 var(--font-label); letter-spacing: .14em; text-transform: uppercase; color: var(--band-2); }
+.viewer .stage { padding: 22px; background: repeating-linear-gradient(45deg, var(--surface) 0 8px, var(--bg) 8px 16px); }
+.viewer .stage svg { display: block; width: 100%; max-width: 440px; height: auto; margin: 0 auto; box-shadow: 0 0 0 1px var(--line); }
+.viewer .vfoot { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 12px 14px; border-top: 1px solid var(--line); }
+.viewer .vfoot small { display: block; font: 500 12px/1.6 var(--font-data); color: var(--ink-2); }
+.viewer .vfoot .acts { display: flex; gap: 8px; flex-wrap: wrap; }
+.viewer .vfoot .btn { padding: 10px 12px; font-size: 11px; cursor: default; }
+
+/* ---- Install ---- */
+.installs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin-top: 48px; }
+.inst { display: grid; gap: 16px; align-content: start; min-width: 0; }
+.inst h3 { font: 700 24px/1 var(--font-label); text-transform: uppercase; letter-spacing: .03em; margin: 0; display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+.inst h3 small { font: 500 12px var(--font-data); color: var(--ink-3); letter-spacing: 0; text-transform: none; }
+.inst p { margin: 0; color: var(--ink-2); font-size: 15px; }
+.inst ol { margin: 0; padding-left: 20px; color: var(--ink-2); font-size: 15px; display: grid; gap: 6px; }
+.inst code, .note code { font: 500 13px var(--font-data); background: var(--surface); border: 1px solid var(--line); padding: 1px 5px; color: var(--ink); overflow-wrap: anywhere; }
+.inst .panel { background: var(--void); border-color: var(--void-line); min-width: 0; }
+.inst .panel .ph { background: var(--void-2); border-color: var(--void-line); }
+.note { border-left: 3px solid var(--band-3); padding: 2px 0 2px 14px; color: var(--ink-2); font-size: 15px; margin: 40px 0 0; max-width: 80ch; }
+.note .mono { overflow-wrap: anywhere; }
+
 /* ---- Launch ---- */
 .launch { background: var(--void); color: var(--star); position: relative; overflow: hidden; }
 .launch .wrap { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; align-items: center; }
@@ -197,7 +226,8 @@ footer a { color: var(--star-2); text-decoration: none; }
   .phases { grid-template-columns: minmax(0, 1fr); }
   .phase { border-right: 0; border-bottom: 1px solid var(--void-line); padding: 18px 0 18px !important; }
   .phase .lamp { left: 0 !important; }
-  .crew-grid { grid-template-columns: minmax(0, 1fr); }
+  .crew-grid, .installs { grid-template-columns: minmax(0, 1fr); }
+  .viewer .vfoot { grid-template-columns: minmax(0, 1fr); }
   .cell { border-right: 0; border-bottom: 1px solid var(--line); }
   .cell:last-child { border-bottom: 0; }
   .board { grid-template-columns: minmax(0, 1fr); }
@@ -222,7 +252,8 @@ footer a { color: var(--star-2); text-decoration: none; }
     <nav class="nav-links" aria-label="Sections">
       <a href="#harness">Any harness</a>
       <a href="#loop">The loop</a>
-      <a href="#crew">Crew</a>
+      <a href="#artifacts">Artifacts</a>
+      <a href="#install">Install</a>
       <a href="#telemetry">Telemetry</a>
       <a href="#self-host">Self-host</a>
       <a href="https://github.com/jacobsims214/amp">GitHub</a>
@@ -262,6 +293,7 @@ footer a { color: var(--star-2); text-decoration: none; }
         <div class="chips" aria-label="Harnesses">
           <span class="chip">Claude Code</span><span class="chip">opencode</span><span class="chip">any MCP client</span><span class="chip">CI bots</span>
         </div>
+        <div><a class="btn solid ink" href="#install">Install the plugin</a></div>
       </div>
       <div class="dock" aria-hidden="true">
         <svg viewBox="0 0 560 360">
@@ -358,6 +390,63 @@ footer a { color: var(--star-2); text-decoration: none; }
     </div>
   </section>
 
+  <section id="artifacts" aria-labelledby="art-title" style="border-top:1px solid var(--line)">
+    <div class="wrap split">
+      <div class="head">
+        <span class="label">Artifacts</span>
+        <h2 id="art-title">See it before it's built</h2>
+        <p class="lede">When work needs a person's eyes first, an agent publishes it to AMP: an interactive mockup, a diagram, an image or a document. It asks for your review on its ticket and stops. Approve or request changes in AMP, or just tell your agent. The verdict lands on the ticket, and the build tickets fly against the version you approved.</p>
+        <div class="chips" aria-label="What agents can publish">
+          <span class="chip">HTML mockups</span><span class="chip">SVG diagrams</span><span class="chip">images</span><span class="chip">PDFs &amp; docs</span>
+        </div>
+        <div class="list">
+          <div><span class="label">A person decides</span><p>Only people approve. An agent can publish and revise, but never sign off on its own work.</p></div>
+          <div><span class="label">Versions</span><p>Every revision is a new version of the same artifact, previewed at phone, tablet and desktop widths beside its ticket's thread.</p></div>
+          <div><span class="label">Design systems</span><p>Your org's design system, and each product's additions, are built the same way: phase by phase, each approved before it's published to the knowledge base for every agent to follow.</p></div>
+          <div><span class="label">Safe to open</span><p>Artifacts run in a sandbox that can't reach your AMP session. Every view is audited, and unkept artifacts expire after 45 days.</p></div>
+        </div>
+      </div>
+      <div class="viewer" aria-label="Example artifact under review">
+        <div class="vbar">
+          <span class="t">Quote request form <span class="mono" style="color:var(--ink-3);font-size:12px">v3</span></span>
+          <span class="seg" aria-hidden="true"><span>Phone</span><span class="on">Tablet</span><span>Desktop</span></span>
+          <span class="status">In review</span>
+        </div>
+        <div class="stage" aria-hidden="true">
+          <svg viewBox="0 0 440 290">
+            <rect width="440" height="290" fill="#fff"/>
+            <rect width="440" height="38" fill="#16181B"/>
+            <rect x="18" y="14" width="56" height="10" fill="#E8ECF2"/>
+            <rect x="330" y="13" width="92" height="12" fill="#2C66B8"/>
+            <rect x="18" y="58" width="180" height="14" fill="#16181B"/>
+            <rect x="18" y="80" width="250" height="8" fill="#DCDDDA"/>
+            <g fill="#F6F6F4" stroke="#DCDDDA">
+              <rect x="18" y="104" width="250" height="34"/><rect x="18" y="148" width="250" height="34"/><rect x="18" y="192" width="120" height="34"/><rect x="148" y="192" width="120" height="34"/>
+            </g>
+            <g fill="#8E939A"><rect x="28" y="117" width="90" height="8"/><rect x="28" y="161" width="130" height="8"/><rect x="28" y="205" width="60" height="8"/><rect x="158" y="205" width="70" height="8"/></g>
+            <rect x="18" y="240" width="130" height="32" fill="#16181B"/><rect x="40" y="252" width="86" height="8" fill="#fff"/>
+            <rect x="290" y="104" width="132" height="168" fill="#F6F6F4" stroke="#DCDDDA"/>
+            <rect x="304" y="118" width="70" height="10" fill="#16181B"/>
+            <g fill="#DCDDDA"><rect x="304" y="140" width="104" height="7"/><rect x="304" y="156" width="88" height="7"/><rect x="304" y="172" width="96" height="7"/></g>
+            <rect x="304" y="196" width="104" height="2" fill="#16181B"/>
+            <rect x="304" y="210" width="50" height="12" fill="#EB8A2E"/>
+            <circle cx="268" cy="121" r="11" fill="#D9482B"/><text x="268" y="125.5" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="11" font-weight="600" fill="#fff">1</text>
+          </svg>
+        </div>
+        <div class="vfoot">
+          <div>
+            <small><b>#214</b> <span class="q">question</span> · review the quote form, v3</small>
+            <small>Sam on v2: tax ID before company name</small>
+          </div>
+          <div class="acts" aria-hidden="true">
+            <span class="btn">Request changes</span>
+            <span class="btn solid ink">Approve</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
   <section id="telemetry" aria-labelledby="tele-title" style="background:var(--surface);border-block:1px solid var(--line)">
     <div class="wrap tele">
       <div class="head">
@@ -426,6 +515,53 @@ footer a { color: var(--star-2); text-decoration: none; }
     </div>
   </section>
 
+  <section id="install" aria-labelledby="install-title" style="border-top:1px solid var(--line)">
+    <div class="wrap">
+      <div class="head">
+        <span class="label">Install the plugin</span>
+        <h2 id="install-title">Dock your harness in two minutes</h2>
+        <p class="lede">AMP ships a plugin for Claude Code and one for opencode. Each brings the whole crew: the manager agent and its worker, designer, reviewer and research specialists, AMP's skills, and the AMP, library-docs and browser MCP servers, connected to your AMP.</p>
+      </div>
+      <div class="installs">
+        <div class="inst">
+          <h3>Claude Code <small>plugin marketplace</small></h3>
+          <div class="panel">
+            <div class="ph"><span class="label" style="color:var(--star-3)">Install · Claude Code</span><button type="button" class="copy" data-copy="install-claude">Copy</button></div>
+<pre class="code" id="install-claude"><span class="c"># 1. Point the plugin at your AMP (add this to your shell profile)</span>
+export AMP_MCP_URL=<span class="amp-url">https://&lt;your-amp&gt;/mcp</span>
+
+<span class="c"># 2. Add AMP's marketplace and install the plugin</span>
+claude plugin marketplace add jacobsims214/amp
+claude plugin install amp@amp</pre>
+          </div>
+          <ol>
+            <li>Start Claude Code, open <code>/mcp</code> and sign in to <code>amp</code> with your AMP account.</li>
+            <li>Run <code>/amp:manager onboard me</code>. Your session becomes the manager and walks you through AMP in your own projects.</li>
+          </ol>
+          <p>Already in Claude Code? <code>/plugin marketplace add jacobsims214/amp</code>, then <code>/plugin install amp@amp</code>, does the same.</p>
+        </div>
+        <div class="inst">
+          <h3>opencode <small>opencode 2 plugin</small></h3>
+          <div class="panel">
+            <div class="ph"><span class="label" style="color:var(--star-3)">Install · opencode</span><button type="button" class="copy" data-copy="install-opencode">Copy</button></div>
+<pre class="code" id="install-opencode"><span class="c"># 1. Get the plugin</span>
+git clone https://github.com/jacobsims214/amp
+cd amp/v2
+
+<span class="c"># 2. Add it to your global opencode config</span>
+./scripts/setup-opencode.sh --url <span class="amp-url">https://&lt;your-amp&gt;/mcp</span></pre>
+          </div>
+          <ol>
+            <li>Sign in once with <code>opencode mcp auth amp</code>, or add <code>--token</code> with an API token from Agents &amp; tokens.</li>
+            <li>Start <code>opencode</code>. The manager is your default agent: ask it to onboard you.</li>
+          </ol>
+          <p>Each agent runs on the OpenRouter model AMP picked for its role. Add <code>--inherit-models</code> to run them all on your own default model.</p>
+        </div>
+      </div>
+      <p class="note">Another MCP client? Connect it to <span class="mono amp-url">https://&lt;your-amp&gt;/mcp</span> with OAuth, or with an API token from Agents &amp; tokens. AMP's built-in guide teaches any agent the rest.</p>
+    </div>
+  </section>
+
   <section id="open-source" aria-labelledby="oss-title">
     <div class="wrap split">
       <div class="head">
@@ -441,7 +577,7 @@ footer a { color: var(--star-2); text-decoration: none; }
       </div>
       <div class="list" style="border-top:1px solid var(--line)">
         <div><span class="label">API</span><p>Go, with one actor per project, epic, story and ticket, so the dependency graph unblocks itself. Runs as any number of replicas.</p></div>
-        <div><span class="label">MCP</span><p>Streamable HTTP with OAuth or API tokens. Claude Code gets a plugin; opencode gets a config sync; everything else speaks MCP.</p></div>
+        <div><span class="label">MCP</span><p>Streamable HTTP with OAuth or API tokens. Claude Code and opencode each get a plugin; everything else speaks MCP.</p></div>
         <div><span class="label">Knowledge</span><p>Typesense hybrid search over markdown knowledge bases, with local embeddings.</p></div>
         <div><span class="label">Identity</span><p>Dex for sign-in (local users or your SSO), oauth2-proxy for the browser, Envoy at the edge.</p></div>
       </div>
@@ -456,14 +592,14 @@ footer a { color: var(--star-2); text-decoration: none; }
         <p class="lede">There's no hosted AMP yet. Every AMP is self-hosted from one Helm chart that brings the whole stack: Postgres, sign-in, the API, the UI, search and the indexing queue. Images are published to GitHub's registry.</p>
         <div class="list">
           <div><span class="label">You need</span><p>A Kubernetes cluster with <b>cert-manager</b> and the <b>CloudNativePG</b> operator, a DNS name for AMP, and Helm.</p></div>
-          <div><span class="label">Then</span><p>Sign in as the bootstrap admin, create an org and a team, make an API token under Agents &amp; tokens, and connect your agent.</p></div>
+          <div><span class="label">Then</span><p>Sign in as the bootstrap admin, create an org and a team, then <a href="#install">install the plugin</a> for your harness.</p></div>
           <div><span class="label">Read more</span><p><a href="https://github.com/jacobsims214/amp/blob/main/v2/docs/deploy-architecture.md">Deploy architecture</a> · <a href="https://github.com/jacobsims214/amp/blob/main/v2/scripts/README.md">Connecting Claude Code and opencode</a></p></div>
         </div>
       </div>
       <div class="panel" style="background:var(--void);border-color:var(--void-line)">
         <div class="ph" style="background:var(--void-2);border-color:var(--void-line)">
           <span class="label" style="color:var(--star-3)">Deploy · helm</span>
-          <button type="button" class="copy" id="copy-install">Copy</button>
+          <button type="button" class="copy" data-copy="install">Copy</button>
         </div>
 <pre class="code" id="install"><span class="c"># 1. Get the chart</span>
 git clone https://github.com/jacobsims214/amp
@@ -478,9 +614,7 @@ cp values-production.yaml my-values.yaml
 <span class="c"># 3. Launch</span>
 helm install amp . -n amp --create-namespace -f my-values.yaml
 
-<span class="c"># 4. Connect your agent (Claude Code shown)</span>
-claude mcp add --transport http amp https://&lt;your-domain&gt;/mcp \
-  --header "Authorization: Bearer &lt;token&gt;"</pre>
+<span class="c"># 4. Sign in, then install the plugin for your harness (see Install)</span></pre>
       </div>
     </div>
   </section>
@@ -490,7 +624,7 @@ claude mcp add --transport http amp https://&lt;your-domain&gt;/mcp \
       <div class="head" style="display:grid;gap:18px">
         <span class="label" style="color:var(--star-3)">Ready for launch</span>
         <h2 id="launch-title">Your crew is waiting on station</h2>
-        <p class="lede" style="color:var(--star-2)">Sign in, connect your agent with one line from Agents &amp; tokens, and fly your first mission. Ask your agent to onboard you: it reads AMP's built-in guide and walks you through it.</p>
+        <p class="lede" style="color:var(--star-2)">Sign in, install the plugin for your harness, and fly your first mission. Ask your agent to onboard you: it reads AMP's built-in guide and walks you through it.</p>
         <div class="ctas">
           <a class="btn solid" href="/oauth2/start?rd=%2F">Sign in</a>
           <a class="btn" href="#self-host">Launch your own</a>
@@ -546,14 +680,21 @@ claude mcp add --transport http amp https://&lt;your-domain&gt;/mcp \
   size(); addEventListener('resize', size);
   if (reduce) draw(0); else (function loop(t) { draw(t); requestAnimationFrame(loop); })(0);
 
-  // Copy the install steps (comments stripped).
-  const copyBtn = document.getElementById('copy-install');
-  copyBtn.addEventListener('click', async () => {
-    const text = document.getElementById('install').innerText.split('\n').filter(l => !l.startsWith('#')).join('\n').trim();
-    try { await navigator.clipboard.writeText(text); copyBtn.textContent = 'Copied'; }
-    catch { const r = document.createRange(); r.selectNodeContents(document.getElementById('install')); getSelection().removeAllRanges(); getSelection().addRange(r); copyBtn.textContent = 'Selected'; }
-    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1800);
-  });
+  // Served from an AMP, the install commands name that AMP's MCP endpoint.
+  if (/^https?:$/.test(location.protocol)) {
+    for (const el of document.querySelectorAll('.amp-url')) el.textContent = location.origin + '/mcp';
+  }
+
+  // Copy buttons copy their code block, comments stripped.
+  for (const btn of document.querySelectorAll('.copy')) {
+    const pre = document.getElementById(btn.dataset.copy);
+    btn.addEventListener('click', async () => {
+      const text = pre.innerText.split('\n').filter(l => !l.startsWith('#')).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+      try { await navigator.clipboard.writeText(text); btn.textContent = 'Copied'; }
+      catch { const r = document.createRange(); r.selectNodeContents(pre); getSelection().removeAllRanges(); getSelection().addRange(r); btn.textContent = 'Selected'; }
+      setTimeout(() => { btn.textContent = 'Copy'; }, 1800);
+    });
+  }
 
   // Sample run record: tokens tick up once, like live telemetry.
   if (!reduce) {
