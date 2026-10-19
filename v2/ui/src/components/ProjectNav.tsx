@@ -3,7 +3,7 @@ import { api } from '../api/client'
 import type { Project } from '../types'
 import { PageHeader } from './ui/PageHeader'
 
-export type ProjectView = 'mission' | 'board' | 'plan' | 'kb' | 'dag' | 'report' | 'settings'
+export type ProjectView = 'mission' | 'board' | 'plan' | 'kb' | 'dag' | 'report' | 'artifacts' | 'settings'
 
 interface ProjectNavProps {
   projectId: number
@@ -20,6 +20,7 @@ const TABS: { view: ProjectView; label: string; path: (id: number) => string }[]
   { view: 'plan',     label: 'Flight plan', path: id => `/project/${id}/plan` },
   { view: 'dag',      label: 'Graph',       path: id => `/project/${id}/dag` },
   { view: 'report',   label: 'Reports',     path: id => `/project/${id}/report` },
+  { view: 'artifacts', label: 'Artifacts',  path: id => `/project/${id}/artifacts` },
   { view: 'kb',       label: 'Library',     path: id => `/project/${id}/kb` },
   { view: 'settings', label: 'Settings',    path: id => `/project/${id}/settings` },
 ]

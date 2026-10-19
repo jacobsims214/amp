@@ -133,7 +133,7 @@ func (s *Server) trace(rctx context.Context, args map[string]interface{}) (*mcpg
 	return jsonResult(map[string]interface{}{
 		"tickets": hits,
 		"count":   len(hits),
-		"next":    "amp_get_ticket_history(task_id) gives each ticket's full story: plan, comments, state changes, runs.",
+		"next":    "amp_get_task(task_id, include=[comments,history,runs]) gives each ticket's full story: plan, comments, state changes, runs.",
 	})
 }
 
@@ -183,9 +183,10 @@ func (s *Server) restoreTasks(rctx context.Context, args map[string]interface{})
 	return jsonResult(out)
 }
 
-// compactTasks is amp_list_tasks' small overview: one line per ticket under
-// its epic, and the buckets as IDs.
-func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}) (*mcpgo.CallToolResult, error) {
+// compactTasks is amp_list_tasks' default, small overview: one line per open
+// ticket under its epic (completed ones only when asked), the buckets as
+// IDs, and the questions with their text.
+func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, withDone bool) (*mcpgo.CallToolResult, error) {
 	epics, err := s.repo.ListEpics(rctx, projectID)
 	if err != nil {
 		return nil, err
@@ -212,14 +213,27 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		Name    string `json:"name"`
 		State   string `json:"state"`
 		Owner   *int   `json:"owner_user_id,omitempty"`
+		Agent   string `json:"assigned_to,omitempty"` // the agent profile that runs it
 		WaitsOn []int  `json:"waits_on,omitempty"`
 	}
+	type question struct {
+		ID       int    `json:"id"`
+		Name     string `json:"name"`
+		Question string `json:"question"`
+	}
 	byEpic := map[string][]line{}
+	questions := []question{}
 	buckets := map[string][]int{"ready": {}, "in_progress": {}, "question": {}, "waiting": {}, "scheduled": {}, "completed": {}}
 	for _, t := range tasks {
 		st := state(t)
 		buckets[st] = append(buckets[st], t.ID)
-		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID}
+		if st == "question" {
+			questions = append(questions, question{t.ID, t.Name, t.BlockReason})
+		}
+		if st == "completed" && !withDone {
+			continue
+		}
+		l := line{ID: t.ID, Name: t.Name, State: st, Owner: t.OwnerUserID, Agent: t.AssignedTo}
 		if st == "waiting" {
 			l.WaitsOn = t.BlockedByIDs
 		}
@@ -228,7 +242,7 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 	return jsonResult(map[string]interface{}{
 		"ready_to_dispatch": buckets["ready"],
 		"in_progress":       buckets["in_progress"],
-		"questions":         buckets["question"],
+		"questions":         questions, // answer with amp_answer_question after asking the user
 		"waiting":           len(buckets["waiting"]),
 		"scheduled":         len(buckets["scheduled"]),
 		"completed":         len(buckets["completed"]),

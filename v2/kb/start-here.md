@@ -33,7 +33,7 @@ Call `amp_whoami`, then `amp_list_projects`. Ask (briefly) what they want out of
 ## Step 1: the map (5 minutes)
 
 Explain the shape using *their* data, not an abstract example. Open one of their projects with
-`amp_get_project` and `amp_list_tasks(project_id, format="compact")` and say what you see:
+`amp_get_project` and `amp_list_tasks(project_id)` and say what you see:
 - **Project → epics → stories → tickets.** A ticket is one small unit of work for one agent.
 - **Dependencies.** AMP runs every ticket whose dependencies are done, in parallel. The graph is
   the plan. (`concepts.md`)

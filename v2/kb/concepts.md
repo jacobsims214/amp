@@ -49,7 +49,7 @@ From least to most: **Member** (on a linked team), **Lead** (lead of a linked te
 
 Everything that happens to a ticket is kept: comments, state changes, who dispatched it, every
 **run** (agent, model, tokens, cost, branch, commit, PR, pushed, merged, outcome) and its plan
-context. `amp_get_ticket_history` returns all of it in one call. That record is what makes
+context. `amp_get_task` with `include: ["comments","history","runs"]` returns all of it in one call. That record is what makes
 standups, spend reports and traceability work without anyone writing status updates.
 
 ## Metadata

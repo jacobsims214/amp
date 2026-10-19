@@ -54,3 +54,6 @@ again.
 
 A ticket can wait for a time: `start_at` on create, or `amp_set_task_start_at` (an absolute
 ISO 8601 time). Until then it sits in `scheduled`.
+
+For anything you should see before it is built (a new screen, a redesign, a diagram), the plan
+starts with a design ticket and the build depends on it: see `working/artifacts.md`.

@@ -5,12 +5,14 @@ hidden: true
 model: openrouter/z-ai/glm-5.3
 variant: max
 temperature: 0.2
-steps: 45
+steps: 1000
 permission:
   edit: deny
   bash: allow
   webfetch: deny
+  websearch: deny
   todowrite: deny
+  question: deny
 ---
 
 # AMP Reviewer
@@ -38,6 +40,13 @@ detail:
 - `skill("docker-engineering")` for Dockerfiles/compose
 - `skill("tfe-manager")` for Terraform
 - `skill("testing-strategy")` for test quality
+
+## Work built from an approved design
+
+If the story implements an approved artifact (a design ticket it depends on), read it with
+`amp_get_artifact(artifact_id, version=<approved_version>)` and check the implementation covers
+what it shows: the screens, states, fields and copy. You read its source; for a side-by-side
+visual check, create a fix task for the designer specialist to compare screenshots.
 
 ## The rule that matters most
 

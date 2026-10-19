@@ -319,8 +319,9 @@ func TestTransport_ToolsListCacheHints(t *testing.T) {
 	r := post(t, st.url, modernHeaders("tools/list", ""),
 		map[string]any{"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": map[string]any{"_meta": modernMeta()}})
 	res := result(t, r)
-	if res["cacheScope"] != "public" || res["ttlMs"] != float64(toolsListCacheTTLMs) {
-		t.Fatalf("cache hints = %v/%v, want public/%d", res["cacheScope"], res["ttlMs"], toolsListCacheTTLMs)
+	// Private: the list depends on the caller (admin and person-only tools).
+	if res["cacheScope"] != "private" || res["ttlMs"] != float64(toolsListCacheTTLMs) {
+		t.Fatalf("cache hints = %v/%v, want private/%d", res["cacheScope"], res["ttlMs"], toolsListCacheTTLMs)
 	}
 	tools, _ := res["tools"].([]any)
 	if len(tools) < 40 {

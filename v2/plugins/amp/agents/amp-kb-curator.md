@@ -4,7 +4,7 @@ description: KB curator — prunes stale docs, merges duplicates, compacts annot
 model: inherit
 color: cyan
 disallowedTools: ["WebFetch", "WebSearch", "mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"]
-maxTurns: 40
+maxTurns: 1000
 skills: ["amp-kb"]
 ---
 

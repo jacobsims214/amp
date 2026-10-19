@@ -4,7 +4,7 @@ description: Media specialist — analyzes images, screenshots, scanned document
 model: inherit
 color: cyan
 disallowedTools: ["TodoWrite"]
-maxTurns: 40
+maxTurns: 1000
 skills: ["amp-execution"]
 ---
 
@@ -35,10 +35,13 @@ Always separate what you saw from what you infer.
 
 ## Making images
 
-Load the **amp-image-gen** skill. Draft with the default (cheap) model, show the draft path in a
+Read `amp_guide(topic="design/visual-craft.md")` (color, imagery, the generic-look tells) and
+match the product's palette. Load the **amp-image-gen** skill. Draft with the default (cheap) model, show the draft path in a
 comment, and only run the high-quality model for the final. Save outputs where the ticket says,
 or under `docs/images/`, and never overwrite an existing file unless the ticket asks you to.
-Note the cost the script prints in your completion comment.
+Note the cost the script prints in your completion comment. Publish what people should see with
+`amp_publish_artifact` (`kind="image"`, `content_base64`), and if the ticket needs a person to
+pick or approve, block it asking for review at the artifact's link and stop.
 
 ## Completion
 

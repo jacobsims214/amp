@@ -304,6 +304,7 @@ export interface SSEEvent {
     | 'task.assigned'
     | 'epic.updated'
     | 'story.updated'
+    | 'artifact.updated'
   project_id?: number
   payload?: unknown
   at?: string
@@ -738,4 +739,48 @@ export interface Portfolio {
   projects: PortfolioRow[]
   total: PortfolioRow
   usage_by_model: (Usage & { model: string })[]
+}
+
+// ---- Artifacts: mockups, diagrams, images and documents agents publish for review ----
+
+export type ArtifactKind = 'html' | 'svg' | 'image' | 'markdown' | 'pdf' | 'text'
+export type ArtifactStatus = 'in_review' | 'approved' | 'changes_requested'
+
+export interface Artifact {
+  id: number
+  project_id: number
+  task_id: number | null
+  task_ref?: string
+  task_name?: string
+  title: string
+  kind: ArtifactKind
+  status: ArtifactStatus
+  current_version: number
+  approved_version: number | null
+  reviewed_by: number | null
+  reviewed_by_email?: string
+  reviewed_at: string | null
+  created_by: number | null
+  created_by_email?: string
+  created_at: string
+  updated_at: string
+  /** Kept by a person: never expires. Otherwise deleted at expires_at. */
+  keep: boolean
+  kept_by: number | null
+  kept_at: string | null
+  expires_at: string | null
+  expiry_dismissed_at: string | null
+  url?: string
+}
+
+export interface ArtifactVersion {
+  artifact_id: number
+  version: number
+  content_type: string
+  size_bytes: number
+  sha256: string
+  note: string
+  created_by: number | null
+  created_by_email?: string
+  created_at: string
 }

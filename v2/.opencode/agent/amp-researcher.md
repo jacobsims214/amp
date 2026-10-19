@@ -5,12 +5,13 @@ hidden: true
 model: openrouter/xiaomi/mimo-v2.6-pro
 variant: on
 temperature: 0.2
-steps: 40
+steps: 1000
 permission:
   edit: deny
   bash: allow
   webfetch: allow
   todowrite: deny
+  question: deny
 ---
 
 # AMP Researcher

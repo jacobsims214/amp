@@ -81,7 +81,7 @@ func (s *Service) Handover(ctx context.Context, p authz.Principal, projectID int
 		if err := s.Registry.Send(projectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
 			TaskID: t.ID, Author: p.Email, Body: body, AuthorUserID: p.UserRef(),
 		}, ReplyCh: added}); err == nil {
-			<-added
+			actor.Await(ctx, added)
 		}
 		res.Moved = true
 		moved = append(moved, t.ID)

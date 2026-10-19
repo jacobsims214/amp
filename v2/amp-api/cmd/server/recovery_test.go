@@ -160,7 +160,7 @@ func TestRecovery_AllStatesRestore(t *testing.T) {
 	pre.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id3)})
 
 	// Verify pre-crash state (sanity check).
-	preList := pre.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	preList := pre.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	t.Logf("pre-crash state: ready=%d in_progress=%d blocked=%d completed=%d",
 		sliceLen(t, preList, "ready_to_dispatch"),
 		sliceLen(t, preList, "in_progress"),
@@ -188,7 +188,7 @@ func TestRecovery_AllStatesRestore(t *testing.T) {
 
 	// The new actor will load state from postgres on first message.
 	// Send amp_list_tasks — this triggers *actor.Started which loads from DB.
-	postList := post.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	postList := post.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 
 	t.Logf("post-restart state: ready=%d in_progress=%d blocked=%d completed=%d",
 		sliceLen(t, postList, "ready_to_dispatch"),
@@ -263,7 +263,7 @@ func TestRecovery_WorkCanContinueAfterRestart(t *testing.T) {
 	post := cs.restart(t)
 
 	// Verify restored state: B=in_progress, C=blocked.
-	postList := post.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	postList := post.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	if sliceLen(t, postList, "in_progress") != 1 {
 		t.Fatalf("post-restart: B should be in_progress")
 	}
@@ -282,7 +282,7 @@ func TestRecovery_WorkCanContinueAfterRestart(t *testing.T) {
 	post.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(idB)})
 
 	// C must auto-unblock.
-	postList2 := post.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	postList2 := post.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	readyIDs := sliceIDs(t, postList2, "ready_to_dispatch")
 	if len(readyIDs) != 1 || readyIDs[0] != idC {
 		t.Fatalf("after B completes: C should be ready_to_dispatch, got %v", readyIDs)
@@ -293,7 +293,7 @@ func TestRecovery_WorkCanContinueAfterRestart(t *testing.T) {
 	post.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(idC), "agent_id": "worker"})
 	post.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(idC)})
 
-	final := post.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	final := post.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	if sliceLen(t, final, "completed") != 3 {
 		t.Errorf("final: want 3 completed, got %d", sliceLen(t, final, "completed"))
 	}
@@ -317,7 +317,7 @@ func TestRecovery_DoubleRestart(t *testing.T) {
 	cs.crash(t)
 	post1 := cs.restart(t)
 
-	list1 := post1.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	list1 := post1.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	if sliceLen(t, list1, "in_progress") != 1 {
 		t.Fatalf("after first restart: task should be in_progress")
 	}
@@ -340,7 +340,7 @@ func TestRecovery_DoubleRestart(t *testing.T) {
 
 	post2 := cs.restart(t) // cs.repo still alive; new actor system again
 
-	list2 := post2.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	list2 := post2.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	if sliceLen(t, list2, "in_progress") != 1 {
 		t.Fatalf("after second restart: task should still be in_progress")
 	}
@@ -349,7 +349,7 @@ func TestRecovery_DoubleRestart(t *testing.T) {
 	// Complete and verify.
 	post2.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(taskID)})
 
-	finalList := post2.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	finalList := post2.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	if sliceLen(t, finalList, "completed") != 1 {
 		t.Errorf("after complete: want 1 completed, got %d", sliceLen(t, finalList, "completed"))
 	}
@@ -387,7 +387,7 @@ func TestRecovery_BlockedByIdsCorrectAfterRestart(t *testing.T) {
 	pre.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(idA)})
 
 	// Verify pre-crash: C blocked by [B] only (A done).
-	preList := pre.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	preList := pre.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	preBl := preList["blocked"].([]interface{})
 	preC := preBl[0].(map[string]interface{})
 	preBby := sliceIDs(t, preC, "blocked_by_ids")
@@ -404,7 +404,7 @@ func TestRecovery_BlockedByIdsCorrectAfterRestart(t *testing.T) {
 
 	// blocked_by_ids must be recomputed correctly:
 	// A is completed in DB → incompleteDepIDs excludes it → blocked_by=[B only]
-	postList := post.call(t, "amp_list_tasks", map[string]interface{}{"project_id": float64(cs.projectID)})
+	postList := post.call(t, "amp_list_tasks", map[string]interface{}{"format": "full", "project_id": float64(cs.projectID)})
 	postBl, _ := postList["blocked"].([]interface{})
 	if len(postBl) == 0 {
 		t.Fatalf("post-restart: C should still be blocked")

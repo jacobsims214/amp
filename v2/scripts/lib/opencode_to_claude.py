@@ -418,8 +418,12 @@ def convert_mcp(opencode_json: Path) -> dict:
     """opencode `mcp` block -> Claude Code `.mcp.json`."""
     cfg = json.loads(re.sub(r",(\s*[}\]])", r"\1", opencode_json.read_text()))
     servers: dict = {}
-    for name, entry in cfg.get("mcp", {}).items():
-        if entry.get("enabled") is False:
+    mcp = cfg.get("mcp", {})
+    # opencode 2 nests servers under "servers" (with a shared "timeout");
+    # older configs list them directly.
+    entries = mcp.get("servers", {k: v for k, v in mcp.items() if k != "timeout"})
+    for name, entry in entries.items():
+        if entry.get("enabled") is False or entry.get("disabled"):
             continue
         if entry.get("type") == "remote" or "url" in entry:
             url = entry["url"]

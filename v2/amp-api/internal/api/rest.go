@@ -134,6 +134,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/trace", h.trace)
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
+	mux.HandleFunc("/api/artifacts/", h.artifactSub)
 }
 
 // ---- /api/me ----
@@ -600,6 +601,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"waiting_to_merge": runs, "count": len(runs)})
 		return
 
+	case "artifacts":
+		h.projectArtifacts(w, r, pr, projectID)
+		return
+
 	case "trash":
 		// GET: tickets, epics and stories deleted in the last 30 days.
 		// POST trash/restore {task_ids, epic_ids, story_ids}: bring them back.
@@ -764,7 +769,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		}
 		replyCh := make(chan actor.ReplySimple, 1)
 		h.registry.System().Root.Send(pid, &actor.MsgReset{ReplyCh: replyCh})
-		<-replyCh
+		actor.Await(r.Context(), replyCh)
 		h.svc.Record(r.Context(), pr, projectAudit("project.reset", projectID, "reset the project: deleted all its epics, stories, and tickets"))
 		jsonOK(w, map[string]interface{}{"project_id": projectID, "reset": true})
 		return
@@ -915,7 +920,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			}
 			replyCh := make(chan actor.ReplyCreateEpic, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgCreateEpic{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -941,7 +946,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.registry.System().Root.Send(pid, &actor.MsgListTasks{ProjectID: projectID, State: state, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1101,7 +1106,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 			}
 			replyCh := make(chan actor.ReplyCreateStory, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgCreateStory{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1224,7 +1229,9 @@ func (h *RestHandler) sendUpdate(projectID int, msg interface{}) error {
 		reply = m.ReplyCh
 	}
 	h.registry.System().Root.Send(pid, msg)
-	return (<-reply).Err
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	return actor.Await(ctx, reply).Err
 }
 
 // ---- /api/tasks/:id  and sub-routes ----
@@ -1265,7 +1272,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			replyCh := make(chan actor.ReplyGetTask, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgGetTask{TaskID: taskID, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 404)
 				return
@@ -1285,7 +1292,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			req.TaskID = taskID
 			replyCh := make(chan actor.ReplySimple, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 400)
 				return
@@ -1381,7 +1388,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		replyCh := make(chan actor.ReplySimple, 1)
 		h.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: pr.UserRef(), ReplyCh: replyCh})
-		reply := <-replyCh
+		reply := actor.Await(r.Context(), replyCh)
 		if reply.Err != nil {
 			jsonErr(w, reply.Err, 400)
 			return
@@ -1411,7 +1418,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			replyCh := make(chan actor.ReplyGetComments, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgGetComments{TaskID: taskID, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1435,7 +1442,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			}
 			replyCh := make(chan actor.ReplyAddComment, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgAddComment{Req: req, ReplyCh: replyCh})
-			reply := <-replyCh
+			reply := actor.Await(r.Context(), replyCh)
 			if reply.Err != nil {
 				jsonErr(w, reply.Err, 500)
 				return
@@ -1520,7 +1527,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			StartAt: body.StartAt,
 			ReplyCh: replyCh,
 		})
-		reply := <-replyCh
+		reply := actor.Await(r.Context(), replyCh)
 		if reply.Err != nil {
 			jsonErr(w, reply.Err, 400)
 			return
@@ -1753,6 +1760,10 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			if sc.Kind == kb.ScopeProject {
 				body.Reason = ""
 			}
+			if designSystemDoc(body.Path) {
+				jsonErr(w, errDesignSystemDoc, 409)
+				return
+			}
 			doc, err := h.kb.WriteDoc(r.Context(), sc, body.Path, body.Title, body.Content, body.Author, body.Tags, strings.TrimSpace(body.Reason), nil)
 			if err != nil {
 				jsonErr(w, err, 500)
@@ -1764,6 +1775,10 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 			path := r.URL.Query().Get("path")
 			if path == "" {
 				jsonErr(w, errorf("path query param required"), 400)
+				return
+			}
+			if designSystemDoc(path) {
+				jsonErr(w, errDesignSystemDoc, 409)
 				return
 			}
 			if err := h.kb.DeleteDoc(r.Context(), sc, path); err != nil {
@@ -1913,4 +1928,12 @@ func (h *RestHandler) trace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]interface{}{"tickets": hits, "count": len(hits)})
+}
+
+// Design system docs are only written by publishing a version, so they always
+// come from phases a person approved.
+var errDesignSystemDoc = errorf("design-system/ docs are written only by publishing a design system version (its project's publish step); start a new version to change them")
+
+func designSystemDoc(path string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(path, "/"), domain.DesignSystemPrefix)
 }

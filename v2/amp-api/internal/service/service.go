@@ -24,6 +24,12 @@ type Service struct {
 	Registry *actor.Registry
 	Authz    *authz.Checker
 	KB       *kb.Service // nil when the knowledge base isn't configured
+	// AppURL is AMP's public address (https://amp.example.com), for links to
+	// pages in the UI. Empty when unknown: links are then left out.
+	AppURL string
+	// ArtifactRetention is how long an artifact lives after its last version
+	// unless someone keeps it (0: the default, 45 days).
+	ArtifactRetention time.Duration
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {
@@ -311,7 +317,7 @@ func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Tas
 		ByName:      p.Email,
 		ReplyCh:     replyCh,
 	})
-	reply := <-replyCh
+	reply := actor.Await(ctx, replyCh)
 	if reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
 	}
@@ -341,7 +347,7 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 		By: p.UserRef(), Override: lvl >= authz.OrgAdmin,
 		ReplyCh: replyCh,
 	})
-	if reply := <-replyCh; reply.Err != nil {
+	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, reply.Err
 	}
 	return t, nil

@@ -4,7 +4,7 @@ description: Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend 
 model: inherit
 color: green
 disallowedTools: ["TodoWrite"]
-maxTurns: 60
+maxTurns: 1000
 skills: ["amp-execution"]
 ---
 

@@ -54,16 +54,15 @@ say so in your review comment so the manager adds one.
 
 **Before creating the fix task, check for file conflicts with in-flight work.** Run
 `amp_list_tasks` and look at everything currently `in_progress` or `ready_to_dispatch`. If any of
-those tasks touch the same file your fix will touch, add that task's ID to `dependency_ids` so
+those tasks touch the same file your fix will touch, add that task's ID to the fix's `depends_on` so
 your fix can't start until it completes — two agents editing the same file at once is a
-lost-write hazard, and `dependency_ids` is the only real way to prevent it. See the "File conflict
+lost-write hazard, and a dependency is the only real way to prevent it. See the "File conflict
 check" section in `amp-planning` for the full algorithm; this is the same rule applied to one
 new task instead of a whole plan.
 
 ```
-amp_create_task(
-  project_id=PROJECT_ID,
-  epic_id=SAME_EPIC_ID,
+amp_create_tasks(project_id=PROJECT_ID, tasks=[{
+  ref="fix",
   story_id=SAME_STORY_ID,
   name="Fix: [specific issue]",
   description="""
@@ -86,8 +85,8 @@ Found during review of task #[REVIEWED_TASK_ID].
 """,
   acceptance_criteria="[specific criterion]",
   assigned_to="[domain-matched specialist name]",
-  dependency_ids=[/* any in-flight task IDs that touch the same file, per the check above */]
-)
+  depends_on=[/* any in-flight task IDs that touch the same file, per the check above */]
+}])
 ```
 
 ---
@@ -115,7 +114,7 @@ Found during review of task #[REVIEWED_TASK_ID].
 amp_get_task {task_id}
 amp_add_task_comment {task_id, body, author}
 amp_complete_task {task_id}
-amp_get_ticket_history {task_id}
-amp_get_epic / amp_get_story
-amp_create_task {project_id, epic_id, story_id, name, description, acceptance_criteria, assigned_to}
+amp_get_task {task_id, include: ["comments","history","runs"]}   ← the ticket's whole story
+amp_get_plan {project_id, epic_id?}
+amp_create_tasks {project_id, tasks: [{ref, story_id, name, description, acceptance_criteria, assigned_to, depends_on}]}
 ```

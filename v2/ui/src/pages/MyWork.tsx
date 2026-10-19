@@ -15,6 +15,7 @@ import { Avatar } from '../components/ui/Avatar'
 import { displayState, QUIET_MS, silentFor, type DisplayState } from '../lib/ticketState'
 import type { DayReport, MyWork as MyWorkData, VelocityDay, WorkTask } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { ExpiringArtifacts } from '../components/artifacts/ExpiringArtifacts'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const NEXT_UP: DisplayState[] = ['prog', 'flag', 'ready', 'wait', 'sched', 'done']
@@ -96,6 +97,7 @@ export function MyWork() {
 
           <div className="grid gap-4 items-start grid-cols-1 xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
             <div className="grid grid-cols-1 gap-4 min-w-0">
+              <ExpiringArtifacts />
               <Panel label="Questions" title={flags.length ? 'Agents waiting on an answer' : 'No questions'} right={<span>blocked with a reason</span>}>
                 {flags.length === 0
                   ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">When an agent stops on a question in any project you can see, it shows up here.</p>
