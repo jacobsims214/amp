@@ -6,7 +6,8 @@ pattern and served at `amp.rp-tools-nonprod.rvohealth.com` over the shared
 ambient-Istio Gateway.
 
 This is a **values/template refinement + one ArgoCD `Application` manifest** —
-no new operators are installed by the chart, and images are already public. The
+the only cluster-scoped footprint is the cert-manager operator the chart
+self-provisions (see §0), and images are already public. The
 flow is: prepare the cluster → refine the chart (already done, on the
 `rvoh/eks-tools-nonprod` branch) → apply the `Application` **by hand** → **Sync**
 in the ArgoCD UI → point DNS → smoke-test.
@@ -24,7 +25,7 @@ in the ArgoCD UI → point DNS → smoke-test.
 
 ---
 
-## 0. ⚠ PENDING DECISION — cert-manager (BLOCKER, resolve before first sync)
+## 0. cert-manager — RESOLVED (the chart self-provisions it)
 
 The chart **unconditionally** emits cert-manager `Issuer`/`Certificate` CRs via
 `templates/cert-issuers.yaml`. It is **not gated** by `global.tls.enabled`:
@@ -37,23 +38,39 @@ The chart **unconditionally** emits cert-manager `Issuer`/`Certificate` CRs via
 This internal CA + Dex gRPC mTLS is required **even though `global.tls.enabled:
 false`** on this overlay (the edge ALB/NLB terminates public TLS, so Envoy and
 every pod run plain HTTP — the *public* Envoy certs are inert, but the *internal*
-ones are not). **The `rp-tools-nonprod` cluster currently has no cert-manager
-installed**, so these CRs would be created with no controller to reconcile them,
-and the Dex gRPC mTLS mounts would have no backing Secret.
+ones are not). The `rp-tools-nonprod` cluster never had cert-manager, so rather
+than request a platform-team install, the chart **self-provisions** it.
 
-**This must be resolved before the first ArgoCD sync. One of:**
+**Resolved — not a prerequisite for Sync.** The overlay
+`values-eks-tools-nonprod.yaml` turns cert-manager **on**:
 
-- **Decision A (recommended):** the platform team **installs cert-manager on
-  `rp-tools-nonprod`** (into its own `cert-manager` namespace, the chart only
-  creates namespaced `Issuer`/`Certificate` CRs in `amp/`, never the operator)
-  **before** step 3. This is the path the runbook assumes.
-- **Decision B:** adapt the chart so it does **not** depend on cert-manager
-  (guard the `cert-issuers.yaml` templates and provision the Dex gRPC mTLS
-  certs another way). Requires a chart change on this branch.
+```yaml
+certmanager:
+  enabled: true         # emit the amp-namespaced Issuer(s)/Certificate(s)
+  installOperator: true # also install the cluster-scoped operator + CRDs
+```
 
-> **Status: PENDING DECISION.** Whichever is chosen, reflect it here and in
-> `values-eks-tools-nonprod.yaml` once confirmed. Until Decision A lands (or
-> Decision B is merged), the smoke-test cert checks in §6 will fail.
+So the `amp` release installs the **cluster-scoped cert-manager operator + CRDs**
+(Namespace `cert-manager`, plus the controller/cainjector/webhook Deployments and
+RBAC, from `templates/cert-manager-operator.yaml`) **and** emits the
+**`amp`-namespaced `Issuer`/`Certificate`** CRs. The operator lives in its own
+`cert-manager` namespace; only the Issuer/Certificate layer is namespaced to
+`amp`. **No separate platform-team cert-manager install is required** — the amp
+release is self-contained, so §0 is no longer a precondition for Sync.
+
+> **Cluster-scoped operator, owned by amp.** The operator is inherently
+> cluster-scoped (that is cert-manager's architecture — it must observe Issuer/
+> Certificate resources cluster-wide), and because the amp release installs it,
+> the operator + CRDs are **owned by the amp release**. For this **nonprod,
+> self-contained deploy that is acceptable.** Caveat: if the platform later
+> installs its **own** cert-manager on the cluster, there will be **resource
+> drift** (operator + CRD ownership collision). Not a blocker now — flag it if
+> it ever happens.
+
+> **ArgoCD manifest.** Because the release creates cluster-scoped resources, the
+> ArgoCD `Application` (`nonprod/argocd-apps/amp.yaml`) sets
+> `syncOptions: [CreateNamespace=true, --allow-extra-resources]` so the operator
+> + CRDs can be applied in `cert-manager`, outside the `amp` namespace.
 
 ---
 
@@ -65,16 +82,18 @@ and the Dex gRPC mTLS mounts would have no backing Secret.
    aws sso login --profile tools-nonprod
    ```
    Re-run it whenever `kubectl`/`aws` start returning expired-credential errors.
+   (Re-authed to confirm the items below are live.)
 2. **Confirm the `gp3` StorageClass exists** on the target cluster. The overlay
    pins `gp3` for `typesense`/`ollama`/`cnpg` (the base chart's `nfs-storage` is
    Talos-only and does not exist here):
    ```bash
    kubectl --context rp-tools-ue1 get sc
    ```
-   Expect a `gp3` row. (The cluster's default EBS StorageClass is `gp3`.)
-3. **Resolve the cert-manager prerequisite** in §0 before proceeding. If
-   Decision A, confirm cert-manager is running on `rp-tools-nonprod`; if
-   Decision B, confirm the chart change is merged on `rvoh/eks-tools-nonprod`.
+   Expect a `gp3` row. (The cluster's default EBS StorageClass is `gp3`.) **This
+   is confirmed live on `rp-tools-nonprod`.**
+3. **cert-manager is self-provisioned** (§0) — no separate platform install, so
+   there is nothing here to gate Sync on. Confirm the operator + Issuers come up
+   in the §6 smoke-test.
 4. **Pin the secret placeholders** in §5 **before** the first sync. Do not skip
    this — ArgoCD will desync Dex from oauth2-proxy/valkey otherwise.
 
@@ -177,7 +196,8 @@ What that `Application` (`nonprod/argocd-apps/amp.yaml`) does:
   `destination.namespace: amp`, `CreateNamespace=true`.
 
 Then **Sync in the ArgoCD UI** (or `argocd app sync amp`). Do this **only after**
-the §0 cert-manager decision is resolved and the §5 placeholders are pinned.
+the §5 placeholders are pinned (cert-manager comes up as part of the same release,
+see §0).
 
 ---
 
@@ -256,8 +276,10 @@ Run after Sync reports healthy and the §4 DNS CNAME is live.
       protected-resource metadata (an unauthenticated probe), **not**
       "connection refused" — that confirms the MCP path is wired through Envoy's
       jwt_authn filter.
-- [ ] **Dex gRPC mTLS (only if cert-manager is present, §0)**
+- [ ] **cert-manager operator + Dex gRPC mTLS**
+      `kubectl --context rp-tools-ue1 get ns cert-manager` → present with the
+      `cert-manager`/`cainjector`/`webhook` pods `Running`;
       `kubectl --context rp-tools-ue1 -n amp get cert amp-dex-grpc-server
       amp-dex-grpc-client amp-ca` → `READY`/issued; `dex` pod serves gRPC
-      (consumers' `wait-for-dex-grpc` init succeeded). Skip if the cluster has no
-      cert-manager yet (blocker, not a smoke failure).
+      (consumers' `wait-for-dex-grpc` init succeeded). The operator is self-
+      provisioned by the release (§0), so it should be live after Sync.
