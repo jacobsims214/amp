@@ -36,9 +36,12 @@ func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Se
 	return &Service{Repo: repo, Registry: registry, Authz: authz.NewChecker(repo), KB: kbSvc}
 }
 
-// dropKB deletes a team's or org's knowledge base after the team or org
-// itself is gone. A failure leaves an orphaned collection, not a broken
-// request, so it is logged rather than returned.
+// dropKB removes a team's or org's knowledge base after the team or org
+// itself is gone. Its docs go to the trash in Postgres (restorable with
+// kb.Service.RestoreKB, purged after 30 days) and only then is the search
+// collection dropped. A failure leaves an orphaned collection or live docs
+// of a deleted owner, not a lost doc or a broken request, so it is logged
+// rather than returned.
 func (s *Service) dropKB(sc kb.Scope) {
 	if s.KB == nil {
 		return

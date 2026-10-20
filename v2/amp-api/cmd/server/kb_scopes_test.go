@@ -8,6 +8,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/kb"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Shared knowledge bases (docs/kb-scopes-design.md), against the rbacWorld:
@@ -217,6 +218,32 @@ func TestKB_ScopesKeepDocumentsApart(t *testing.T) {
 	w.as(w.orgadmin).call(t, "amp_manage_teams", map[string]interface{}{"action": "delete", "team_id": float64(w.devs.ID)})
 	if n, _ := w.s.kb.CountDocs(ctx, kb.Team(w.devs.ID)); n != 0 {
 		t.Fatalf("Devs KB still has %d docs after the team was deleted", n)
+	}
+	// ...into the trash: the docs stay in Postgres, soft-deleted, for 30
+	// days, and the KB can be restored from there.
+	devsKB := repository.KBScope{Kind: "team", ID: w.devs.ID}
+	if trashed, err := w.s.repo.ListTrashedKBPaths(ctx, devsKB, "kb-drop"); err != nil || len(trashed) != 1 || trashed[0] != "team/deploy-runbook.md" {
+		t.Fatalf("Devs KB trash after the team was deleted = %v, %v", trashed, err)
+	}
+	if n, err := w.s.kb.RestoreKB(ctx, kb.Team(w.devs.ID), "root"); err != nil || n != 1 {
+		t.Fatalf("RestoreKB = %d, %v", n, err)
+	}
+	if hits, err := w.s.kb.Search(ctx, kb.Team(w.devs.ID), "blue-green", nil, 10, 0, 0); err != nil || len(hits) != 1 {
+		t.Fatalf("search of the restored Devs KB = %v, %v", hits, err)
+	}
+	w.s.kb.Drop(ctx, kb.Team(w.devs.ID)) //nolint:errcheck // clean up the restored index
+
+	// Archiving a project is not deleting it: its KB stays live (not in the
+	// trash, so the purge never takes it) and searchable after a restore.
+	w.as(w.root).call(t, "amp_archive_project", project)
+	if _, err := w.s.repo.GetKBDocument(ctx, repository.KBScope{Kind: "project", ID: w.s.projectID}, "project/notes.md"); err != nil {
+		t.Fatalf("project KB doc after archive: %v", err)
+	}
+	w.as(w.root).call(t, "amp_restore_project", project)
+	// (as root: alice reached the project through the deleted Devs team)
+	res = w.as(w.root).call(t, "amp_kb_search", map[string]interface{}{"project_id": pid, "query": "payments"})
+	if res["count"].(float64) != 1 {
+		t.Fatalf("project search after archive and restore = %v", res)
 	}
 }
 

@@ -321,3 +321,31 @@ func (r *Repo) RestoreGroup(ctx context.Context, projectID int, kind string, id 
 	}
 	return g, tx.Commit(ctx)
 }
+
+// ListTrashedKBPaths returns the paths of a KB's docs that are in the trash
+// and were deleted by `by`, deleted less than TrashRetention ago (the purge
+// removes older ones). kb.Service.Drop records "kb-drop", so restoring a
+// dropped KB brings back only what the drop deleted, not docs deleted one
+// by one before it.
+func (r *Repo) ListTrashedKBPaths(ctx context.Context, scope KBScope, by string) ([]string, error) {
+	if err := scope.validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, `SELECT path FROM kb_documents
+		WHERE scope_kind = $1 AND scope_id = $2 AND deleted_by = $3
+		  AND deleted_at IS NOT NULL AND deleted_at > NOW() - INTERVAL '`+TrashRetention+`'
+		ORDER BY path`, scope.Kind, scope.ID, by)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}

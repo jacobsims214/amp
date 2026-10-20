@@ -187,7 +187,8 @@ func (s *Service) DeleteOrg(ctx context.Context, p authz.Principal, orgID int) e
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "org.delete", OrgID: intRef(orgID), TargetType: "org", TargetID: idStr(orgID),
 		Summary: "deleted the org and its teams", Details: map[string]any{"teams": len(teams)}})
-	// The org's teams went with it; so do its and their knowledge bases.
+	// The org's teams went with it; their and its knowledge bases go to
+	// the trash (kept 30 days in Postgres, then purged).
 	s.dropKB(kb.Org(orgID))
 	for _, t := range teams {
 		s.dropKB(kb.Team(t.ID))

@@ -1272,17 +1272,109 @@ func payloadScope(kind string, id, projectID int) Scope {
 	return Scope{Kind: kind, ID: id}
 }
 
+// dropDeletedBy is the deleted_by Drop records on the docs it moves to the
+// trash, so RestoreKB brings back exactly those (not docs deleted one by
+// one before).
+const dropDeletedBy = "kb-drop"
+
+// dropLockWait bounds how long a Drop that found a reindex of the same KB
+// running waits, in the background, to drop the search collections.
+// dropLockPoll is how often it retries. Variables so tests can shorten them.
+var (
+	dropLockWait = 30 * time.Minute
+	dropLockPoll = 500 * time.Millisecond
+)
+
 // Drop deletes a whole knowledge base (e.g. when its team or org is deleted).
 // A stored KB's docs go to the trash (soft-deleted, purged after 30 days,
-// restorable until then) before its search collection is dropped; if that
-// fails, the collection is kept.
+// restorable until then with RestoreKB) before its search collection is
+// dropped; if that fails, the collection is kept.
+//
+// Dropping the collections takes the KB's reindex lock, so a reindex can't
+// swap a new build and alias in after them. If a reindex holds the lock,
+// Drop returns once the docs are in the trash and drops the collections in
+// the background when the reindex ends (waiting at most dropLockWait). The
+// reindex can't bring the docs back meanwhile: it builds from live rows
+// only, and its catch-up removes the trashed paths.
 func (s *Service) Drop(ctx context.Context, sc Scope) error {
 	if s.stored(sc) {
 		if err := s.trashStored(ctx, sc); err != nil {
 			return fmt.Errorf("move the docs of %s to the trash: %w", sc, err)
 		}
 	}
+	release, err := s.beginReindex(ctx, sc)
+	if errors.Is(err, ErrReindexRunning) {
+		s.log.Info("drop: a reindex is running; its collections are dropped when it ends", "kb", sc.String())
+		go s.dropWhenFree(sc)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer release()
 	return s.dropCollections(ctx, collectionName(sc))
+}
+
+// dropWhenFree waits for a running reindex of sc to end, then drops sc's
+// collections. Giving up (after dropLockWait) leaves an orphaned index of a
+// KB whose docs are already in the trash, so it is only logged.
+func (s *Service) dropWhenFree(sc Scope) {
+	ctx, cancel := context.WithTimeout(context.Background(), dropLockWait)
+	defer cancel()
+	for {
+		release, err := s.beginReindex(ctx, sc)
+		if err == nil {
+			err = s.dropCollections(ctx, collectionName(sc))
+			release()
+			if err != nil {
+				s.log.Warn("drop after reindex failed; the collections are left", "kb", sc.String(), "err", err)
+			} else {
+				s.log.Info("dropped the collections after the reindex ended", "kb", sc.String())
+			}
+			return
+		}
+		if !errors.Is(err, ErrReindexRunning) {
+			s.log.Warn("drop after reindex: could not take the reindex lock; the collections are left", "kb", sc.String(), "err", err)
+			return
+		}
+		select {
+		case <-ctx.Done():
+			s.log.Warn("drop: the reindex did not end in time; the collections are left", "kb", sc.String(), "waited", dropLockWait)
+			return
+		case <-time.After(dropLockPoll):
+		}
+	}
+}
+
+// RestoreKB brings back a dropped KB (its team, org or project was deleted
+// and is being restored): every doc Drop moved to the trash that is still
+// there (not purged after 30 days) is restored, with its content and
+// annotations, and re-indexed, which recreates the search collection. Docs
+// deleted one by one before the drop stay in the trash. It returns how many
+// docs it restored. by is who restored them.
+func (s *Service) RestoreKB(ctx context.Context, sc Scope, by string) (int, error) {
+	if !s.stored(sc) {
+		return 0, fmt.Errorf("restore %s: deleted docs of the %s KB are not kept", sc, sc.Kind)
+	}
+	rs := storeScope(sc)
+	paths, err := s.store.ListTrashedKBPaths(ctx, rs, dropDeletedBy)
+	if err != nil {
+		return 0, fmt.Errorf("list the dropped docs of %s: %w", sc, err)
+	}
+	n := 0
+	for _, p := range paths {
+		_, err := s.store.RestoreKBDocument(ctx, rs, p, by)
+		if errors.Is(err, repository.ErrNotFound) {
+			continue // restored or purged since the listing
+		}
+		if err != nil {
+			return n, fmt.Errorf("restore %s: %w", p, err)
+		}
+		n++
+		s.index(ctx, sc, p)
+	}
+	s.log.Info("KB restored from the trash", "kb", sc.String(), "docs", n, "by", by)
+	return n, nil
 }
 
 // trashStored soft-deletes every live doc of a stored KB. Until its backfill
@@ -1313,7 +1405,7 @@ func (s *Service) trashStored(ctx context.Context, sc Scope) error {
 		return err
 	}
 	for _, p := range paths {
-		if err := s.store.DeleteKBDocument(ctx, rs, p, "kb-drop"); err != nil && !errors.Is(err, repository.ErrNotFound) {
+		if err := s.store.DeleteKBDocument(ctx, rs, p, dropDeletedBy); err != nil && !errors.Is(err, repository.ErrNotFound) {
 			return err
 		}
 	}
@@ -1528,6 +1620,7 @@ type Store interface {
 	IsKBBackfillComplete(ctx context.Context, scope repository.KBScope) (bool, error)
 	DeleteKBDocument(ctx context.Context, scope repository.KBScope, path, by string) error
 	RestoreKBDocument(ctx context.Context, scope repository.KBScope, path, by string) (*repository.KBDocument, error)
+	ListTrashedKBPaths(ctx context.Context, scope repository.KBScope, by string) ([]string, error)
 }
 
 var _ Store = (*repository.Repo)(nil)
