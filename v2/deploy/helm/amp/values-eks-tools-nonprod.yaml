@@ -57,9 +57,9 @@ global:
   # Dex from oauth2-proxy/valkey and the bootstrap-admin job.
   secretOverrides:
     oauth2ProxyClientSecret: "TODO-PIN-BEFORE-APPLY-oauth2ProxyClientSecret"
-    oauth2ProxyCookieSecret: "TODO-PIN-BEFORE-APPLY-oauth2ProxyCookieSecret"
-    valkeyPassword: "TODO-PIN-BEFORE-APPLY-valkeyPassword"
-    bootstrapAdminPassword: "TODO-PIN-BEFORE-APPLY-bootstrapAdminPassword"
+    oauth2ProxyCookieSecret: "05b64cb0cf0b47ead70ab1abe1e078d7419d311b509c2db7f40a808864431c54"
+    valkeyPassword: "c45ea74c0930e66dc184b535203c5d85dcd7cf6838ad67d4a1d7a3fbfa1c07f1"
+    bootstrapAdminPassword: "1522d0c23f0af88acb3d1de482ff1cd388eda896f698eb841f7d568c0fea5ebb"
 
   # Single override point for every amp-* image tag. Set per release, e.g.
   # sha-<shortsha>. The build-images workflow tags every build as both
