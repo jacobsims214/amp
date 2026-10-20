@@ -172,7 +172,6 @@ namespace:
   enabled: true
   labels:
     istio.io/dataplane-mode: ambient
-    istio.io/rev: rapid
 
 ingress:
   httpRoute:

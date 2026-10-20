@@ -235,7 +235,8 @@ namespace:
   labels:
     istio.io/dataplane-mode: ambient
     # Optional: pin the exact ambient mesh revision. Leave absent to let the
-    # ambient control plane choose; the nonprod overlay sets istio.io/rev: rapid.
+    # ambient control plane choose. (Ambient namespaces on rp-tools-nonprod
+    # carry no rev label — the overlay sets only istio.io/dataplane-mode.)
     # istio.io/rev: rapid
 
 ingress:
