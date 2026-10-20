@@ -47,10 +47,10 @@ it. Start opencode afterwards and the manager is your default agent.
 - `--clean` removes agent, skill and plugin files that the old `sync-global-config.sh` copied
   into `~/.config/opencode`.
 
-`sync-global-config.sh` (also run by `make sync-global`) is the old way to set this up, and
-`setup-opencode.sh` replaces it. It copied agents and skills into `~/.config/opencode` and merged
-`opencode.json`. Don't use it alongside the plugin: its copies override the plugin's versions.
-If you ran it before, rerun `setup-opencode.sh` with `--clean`.
+The old `sync-global-config.sh` script (and its `make sync-global` target) has been removed;
+`setup-opencode.sh` replaced it. It used to copy agents and skills into `~/.config/opencode` and
+merge `opencode.json`, and those copies override the plugin's versions. If you ever ran it, rerun
+`setup-opencode.sh` with `--clean`.
 
 ## Rebuilding the plugin
 
