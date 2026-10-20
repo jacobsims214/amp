@@ -2587,7 +2587,7 @@ func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mc
 	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	if err := s.kb.DeleteDoc(ctx, k.Scope, path); err != nil {
+	if err := s.kb.DeleteDoc(ctx, k.Scope, path, authorOf(ctx, nil)); err != nil {
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"deleted": true, "path": path, "kb": k})

@@ -1812,7 +1812,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, errDesignSystemDoc, 409)
 				return
 			}
-			if err := h.kb.DeleteDoc(r.Context(), sc, path); err != nil {
+			if err := h.kb.DeleteDoc(r.Context(), sc, path, pr.Email); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}

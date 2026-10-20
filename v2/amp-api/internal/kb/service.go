@@ -937,8 +937,20 @@ func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
 
 // ---- Delete ----
 
-// DeleteDoc removes all chunks for a document path.
-func (s *Service) DeleteDoc(ctx context.Context, sc Scope, path string) error {
+// DeleteDoc removes a doc. For a stored KB (project, team, org) it
+// soft-deletes the Postgres row first, so the doc stays in the 30-day trash
+// (RestoreDoc brings it back; PurgeTrash removes it for good), and then
+// removes it from the search index. by is who deleted it. Deleting a doc
+// that has no live row is not an error. The global KB, and a service with
+// no store, delete from the index only, as before.
+func (s *Service) DeleteDoc(ctx context.Context, sc Scope, path, by string) error {
+	if s.stored(sc) {
+		if err := s.softDeleteStored(ctx, sc, path, by); err != nil {
+			return err
+		}
+		s.index(ctx, sc, path)
+		return nil
+	}
 	if s.queueClient != nil {
 		payload, err := json.Marshal(queue.DeleteDocPayload{ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID, Path: path})
 		if err == nil {
@@ -954,6 +966,48 @@ func (s *Service) DeleteDoc(ctx context.Context, sc Scope, path string) error {
 		}
 	}
 	return s.deleteDocNow(ctx, sc, path)
+}
+
+// softDeleteStored soft-deletes path's Postgres row. A doc that so far
+// exists only in the index is copied into Postgres first (adoptIndexed), so
+// it is deleted into the trash rather than dropped. A path with no live row
+// is a no-op: the caller still clears the index.
+func (s *Service) softDeleteStored(ctx context.Context, sc Scope, path, by string) error {
+	if err := s.adoptIndexed(ctx, sc, path); err != nil {
+		return err
+	}
+	err := s.store.DeleteKBDocument(ctx, storeScope(sc), path, by)
+	if errors.Is(err, repository.ErrNotFound) {
+		s.log.Info("delete: no live doc in postgres", "kb", sc.String(), "path", path)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("delete %s: %w", path, err)
+	}
+	s.log.Info("doc moved to the trash", "kb", sc.String(), "path", path, "by", by)
+	return nil
+}
+
+// RestoreDoc brings back a soft-deleted doc of a stored KB, with the content,
+// title, tags and annotations it had when it was deleted, and makes it
+// searchable again. It fails if the path has no deleted row (never deleted,
+// already restored, or purged after 30 days in the trash). by is who
+// restored it.
+func (s *Service) RestoreDoc(ctx context.Context, sc Scope, path, by string) (*Doc, error) {
+	if !s.stored(sc) {
+		return nil, fmt.Errorf("restore %s: deleted docs of the %s KB are not kept", path, sc.Kind)
+	}
+	d, err := s.store.RestoreKBDocument(ctx, storeScope(sc), path, by)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("no deleted doc %s in %s (never deleted, already restored, or purged after %s): %w",
+			path, sc, repository.TrashRetention, err)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("restore %s: %w", path, err)
+	}
+	s.log.Info("doc restored from the trash", "kb", sc.String(), "path", path, "by", by)
+	s.index(ctx, sc, path)
+	return docFromRow(sc, d), nil
 }
 
 // deleteDocNow performs the actual Typesense deletion. Called either
@@ -1011,7 +1065,17 @@ func (s *Service) HandleDeleteDocTask(ctx context.Context, t *asynq.Task) error 
 	if err := json.Unmarshal(t.Payload(), &p); err != nil {
 		return fmt.Errorf("unmarshal delete_doc payload: %w", err)
 	}
-	return s.deleteDocNow(ctx, payloadScope(p.Scope, p.ScopeID, p.ProjectID), p.Path)
+	sc := payloadScope(p.Scope, p.ScopeID, p.ProjectID)
+	if s.stored(sc) {
+		// Queued by a pre-upgrade amp-api: delete into the trash too, or the
+		// still-live row would put the doc back in the index on its next
+		// annotation or reindex.
+		if err := s.softDeleteStored(ctx, sc, p.Path, "kb-legacy-delete"); err != nil {
+			return err
+		}
+		return s.indexFromStore(ctx, sc, p.Path)
+	}
+	return s.deleteDocNow(ctx, sc, p.Path)
 }
 
 // payloadScope reads a queued task's scope. Tasks enqueued before scopes
@@ -1237,6 +1301,8 @@ type Store interface {
 	CountKBDocuments(ctx context.Context, scope repository.KBScope) (int, error)
 	StreamKBDocuments(ctx context.Context, scope repository.KBScope, fn func(repository.KBDocument) error) error
 	IsKBBackfillComplete(ctx context.Context, scope repository.KBScope) (bool, error)
+	DeleteKBDocument(ctx context.Context, scope repository.KBScope, path, by string) error
+	RestoreKBDocument(ctx context.Context, scope repository.KBScope, path, by string) (*repository.KBDocument, error)
 }
 
 var _ Store = (*repository.Repo)(nil)

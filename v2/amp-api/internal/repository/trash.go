@@ -14,13 +14,17 @@ import (
 // the rest. A Postgres interval literal.
 const TrashRetention = "30 days"
 
-// PurgeTrash deletes trash rows (deleted tickets, epics and stories) older
-// than TrashRetention, and returns how many it deleted. It is a plain
-// DELETE ... WHERE deleted_at < cutoff, so several replicas running it at
-// once is safe: whichever gets a row deletes it, the others skip it.
+// PurgeTrash deletes trash rows older than TrashRetention, and returns how
+// many it deleted: deleted tickets, epics and stories, and soft-deleted KB
+// docs (kb_documents rows with deleted_at set; their kb_document_versions
+// go with them by ON DELETE CASCADE). This is the only place a KB doc is
+// ever removed from Postgres. It is a plain DELETE ... WHERE deleted_at <
+// cutoff, so several replicas running it at once is safe: whichever gets a
+// row deletes it, the others skip it. A doc revived or restored before the
+// purge has deleted_at NULL again and is never matched.
 func (r *Repo) PurgeTrash(ctx context.Context) (int64, error) {
 	var n int64
-	for _, table := range []string{"deleted_tasks", "deleted_groups"} {
+	for _, table := range []string{"deleted_tasks", "deleted_groups", "kb_documents"} {
 		tag, err := r.db.Exec(ctx, `DELETE FROM `+table+` WHERE deleted_at < NOW() - INTERVAL '`+TrashRetention+`'`)
 		if err != nil {
 			return n, fmt.Errorf("purge %s: %w", table, err)
