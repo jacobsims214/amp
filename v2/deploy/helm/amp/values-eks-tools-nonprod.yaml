@@ -129,7 +129,7 @@ dex:
       config:
         clientID: $COGNITO_CLIENT_ID
         clientSecret: $COGNITO_CLIENT_SECRET
-        issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_hdqpj7ijp
+        issuer: https://cognito-idp.us-east-1.amazonaws.com/us-east-1_hdQpJ7iJp
         redirectURI: https://amp.rp-tools-nonprod.rvohealth.com/dex/callback
         scopes:
           - openid
