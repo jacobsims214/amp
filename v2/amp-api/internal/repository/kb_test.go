@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/simstech/amp-api/internal/domain"
 )
 
@@ -499,6 +501,145 @@ func TestKBConcurrentAnnotationsAllLand(t *testing.T) {
 	}
 	if d.Version != doc.Version {
 		t.Errorf("version moved to %d", d.Version)
+	}
+}
+
+// TestKBConcurrentCreateSamePath races writers creating the same new path.
+// All but one of them find no row, then lose the INSERT ... ON CONFLICT DO
+// NOTHING and fall back to re-locking the winner's row and updating it. None
+// may fail, and every write must land as its own version on one row.
+//
+// Left to the scheduler the first writer usually commits before the rest
+// reach their SELECT, so the fallback is hit only now and then. To make it
+// certain, a gate transaction on its own connection holds kb_documents in
+// SHARE mode: each writer's SELECT ... FOR UPDATE (ROW SHARE) gets past it,
+// but its INSERT (ROW EXCLUSIVE) waits. Once every writer that has a pool
+// connection is waiting there, the gate rolls back and they all insert at
+// once: one wins and the others take the fallback.
+func TestKBConcurrentCreateSamePath(t *testing.T) {
+	r := kbTestRepo(t)
+	ctx := context.Background()
+	scope := newScope(KBScopeProject)
+	const path = "contended.md"
+
+	gateConn, err := pgx.Connect(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("connect gate: %v", err)
+	}
+	defer gateConn.Close(ctx)
+	gate, err := gateConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gate.Rollback(ctx)
+	if _, err := gate.Exec(ctx, `LOCK TABLE kb_documents IN SHARE MODE`); err != nil {
+		t.Fatalf("lock kb_documents: %v", err)
+	}
+	// Poll from a third connection, outside any transaction: inside one,
+	// pg_stat_activity is a snapshot taken once and never changes.
+	pollConn, err := pgx.Connect(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatalf("connect poller: %v", err)
+	}
+	defer pollConn.Close(ctx)
+
+	const n = 16
+	var wg sync.WaitGroup
+	type result struct {
+		doc     *KBDocument
+		changed bool
+		err     error
+	}
+	results := make(chan result, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d, changed, err := r.UpsertKBDocument(ctx, scope, KBDocWrite{
+				Path: path, Title: "Contended", Content: fmt.Sprintf("content from writer %d", i), By: fmt.Sprintf("w%d", i),
+			})
+			results <- result{d, changed, err}
+		}()
+	}
+
+	// Wait until every writer holding a pool connection is blocked on its
+	// INSERT; the rest are waiting for a connection and run after the gate.
+	queued := min(n, int(r.db.Config().MaxConns))
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var waiting int
+		if err := pollConn.QueryRow(ctx, `SELECT COUNT(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock'
+			AND query LIKE 'INSERT INTO kb_documents %'`).Scan(&waiting); err != nil {
+			t.Fatalf("count waiting writers: %v", err)
+		}
+		if waiting >= queued {
+			break
+		}
+		if time.Now().After(deadline) {
+			gate.Rollback(ctx)
+			wg.Wait()
+			t.Fatalf("only %d of %d writers reached the INSERT before the deadline", waiting, queued)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := gate.Rollback(ctx); err != nil {
+		t.Fatalf("release gate: %v", err)
+	}
+	wg.Wait()
+	close(results)
+
+	var got []int
+	for res := range results {
+		if res.err != nil {
+			t.Fatalf("concurrent create: %v", res.err)
+		}
+		if !res.changed {
+			t.Errorf("a write with new content reported no change (version %d)", res.doc.Version)
+		}
+		got = append(got, res.doc.Version)
+	}
+	sort.Ints(got)
+	for i, v := range got {
+		if v != i+1 {
+			t.Fatalf("returned versions %v, want each of 1..%d exactly once", got, n)
+		}
+	}
+
+	var rowCount int
+	if err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM kb_documents WHERE scope_kind = $1 AND scope_id = $2 AND path = $3`,
+		scope.Kind, scope.ID, path).Scan(&rowCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("got %d kb_documents rows for %s, want 1", rowCount, path)
+	}
+
+	d, err := r.GetKBDocument(ctx, scope, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions := kbVersions(t, r, d.ID)
+	if d.Version != len(versions) || d.Version != n {
+		t.Fatalf("doc version %d, %d version rows, want both %d", d.Version, len(versions), n)
+	}
+	for i, v := range versions {
+		want := fmt.Sprintf("%d:update", i+1)
+		if i == 0 {
+			want = "1:create"
+		}
+		if v != want {
+			t.Fatalf("version rows %v, want 1:create then 2..%d:update", versions, n)
+		}
+	}
+
+	var latest string
+	if err := r.db.QueryRow(ctx, `SELECT content FROM kb_document_versions WHERE document_id = $1 ORDER BY version DESC LIMIT 1`,
+		d.ID).Scan(&latest); err != nil {
+		t.Fatal(err)
+	}
+	if d.Content != latest {
+		t.Errorf("stored content %q, latest version row has %q", d.Content, latest)
 	}
 }
 
