@@ -524,6 +524,26 @@ func (r *Repo) IsKBBackfillComplete(ctx context.Context, scope KBScope) (bool, e
 	return done, err
 }
 
+// ListBackfilledKBScopes lists every KB whose backfill has completed, the
+// KBs whose docs are all in Postgres (the reconciler works only on those).
+func (r *Repo) ListBackfilledKBScopes(ctx context.Context) ([]KBScope, error) {
+	rows, err := r.db.Query(ctx, `SELECT scope_kind, scope_id FROM kb_backfills
+		WHERE completed_at IS NOT NULL ORDER BY scope_kind, scope_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KBScope
+	for rows.Next() {
+		var sc KBScope
+		if err := rows.Scan(&sc.Kind, &sc.ID); err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
 // GetKBBackfill loads a KB's backfill state; ErrNotFound if it never started.
 func (r *Repo) GetKBBackfill(ctx context.Context, scope KBScope) (*KBBackfill, error) {
 	if err := scope.validate(); err != nil {

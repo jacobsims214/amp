@@ -66,6 +66,10 @@ type Service struct {
 	// stored KB's reindex: "built", "verified" (just before the swap) and
 	// "swapped".
 	reindexHook func(ctx context.Context, stage string)
+
+	// reconcileOnly, when set (tests only), limits ReconcileAll to the KBs
+	// it returns true for.
+	reconcileOnly func(Scope) bool
 }
 
 // ErrReindexRunning is returned when a reindex of the same KB is already
@@ -1621,6 +1625,7 @@ type Store interface {
 	DeleteKBDocument(ctx context.Context, scope repository.KBScope, path, by string) error
 	RestoreKBDocument(ctx context.Context, scope repository.KBScope, path, by string) (*repository.KBDocument, error)
 	ListTrashedKBPaths(ctx context.Context, scope repository.KBScope, by string) ([]string, error)
+	ListBackfilledKBScopes(ctx context.Context) ([]repository.KBScope, error)
 }
 
 var _ Store = (*repository.Repo)(nil)
@@ -2227,12 +2232,16 @@ type indexedDoc struct {
 	tags                                 []string
 	annotations                          []Annotation
 	updatedAt                            int64
+	// version is the Postgres row's version, stored on each chunk (not in
+	// the schema, so Typesense keeps it without indexing it) for the
+	// reconciler to spot a stale entry. 0 = unknown (not written).
+	version int
 }
 
 func indexedFromRow(d *repository.KBDocument) indexedDoc {
 	return indexedDoc{
 		path: d.Path, title: d.Title, content: d.Content, author: d.Author, reason: d.Reason,
-		tags: d.Tags, annotations: d.Annotations, updatedAt: d.UpdatedAt.Unix(),
+		tags: d.Tags, annotations: d.Annotations, updatedAt: d.UpdatedAt.Unix(), version: d.Version,
 	}
 }
 
@@ -2285,6 +2294,9 @@ func (s *Service) indexChunksInto(ctx context.Context, sc Scope, col string, d i
 			"latest_annotation": annLatest,
 			"annotations":       "[]",
 			"content":           "",
+		}
+		if d.version > 0 {
+			doc[indexedVersionField] = d.version
 		}
 		// Only the first chunk stores the full content and annotations.
 		if i == 0 {

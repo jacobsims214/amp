@@ -235,6 +235,22 @@ func main() {
 		slog.Warn("REDIS_ADDR not set — KB writes/deletes will run synchronously (fine for local dev, not recommended under real load)")
 	}
 
+	// ---- 4b'. KB reconciler ----
+	// Re-indexes docs that are in Postgres but missing or stale in the
+	// search index (e.g. written while Typesense was down), and removes
+	// index entries of deleted docs. It never writes Postgres. Runs at
+	// startup and every KB_RECONCILE_INTERVAL (default 15m; "off" or 0
+	// disables); the advisory lock lets only one replica run a pass.
+	if interval := kbReconcileInterval(); interval > 0 {
+		// The per-KB reindex lock must be cross-replica before the first
+		// pass (mcp.NewServer sets the same lock later; setting it twice is
+		// harmless).
+		kbSvc.SetReindexLock(repo.TryNamedLock)
+		go kbSvc.RunReconciler(ctx, interval, repo.TryNamedLock)
+	} else {
+		slog.Info("KB reconciler disabled (KB_RECONCILE_INTERVAL)")
+	}
+
 	// ---- 4c. AMP guide (the global KB) ----
 	// The image ships the repo's kb/ folder; every replica syncs it into the
 	// global KB in the background (idempotent upserts), so a new image
@@ -423,4 +439,25 @@ func artifactRetention() time.Duration {
 		return time.Duration(d) * 24 * time.Hour
 	}
 	return 0 // the service default
+}
+
+// kbReconcileInterval is how often the KB reconciler runs, from
+// KB_RECONCILE_INTERVAL (a Go duration, e.g. "10m"). Unset means 15
+// minutes; "off", "0" or a non-positive duration disables it. An
+// unparseable value falls back to the default.
+func kbReconcileInterval() time.Duration {
+	const def = 15 * time.Minute
+	v := strings.TrimSpace(os.Getenv("KB_RECONCILE_INTERVAL"))
+	switch v {
+	case "":
+		return def
+	case "off", "0":
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("bad KB_RECONCILE_INTERVAL; using the default", "value", v, "default", def.String())
+		return def
+	}
+	return d
 }
