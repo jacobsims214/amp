@@ -146,7 +146,7 @@ oauth2Proxy:
   cookieSecure: true
   # Cognito sometimes issues `email_verified: false`; accept those logins here
   # rather than erroring on a 500.
-  skipEmailVerified: true
+  insecureOidcAllowUnverifiedEmail: true
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }

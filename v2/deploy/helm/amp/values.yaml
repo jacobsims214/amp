@@ -129,7 +129,7 @@ oauth2Proxy:
   # When false (default), oauth2-proxy rejects logins whose Cognito `email_verified`
   # is false — a Cognito 500. Flip to true on clusters that should accept
   # unverified emails.
-  skipEmailVerified: false
+  insecureOidcAllowUnverifiedEmail: false
   resources:
     requests: { cpu: 25m, memory: 32Mi }
     limits: { cpu: 200m, memory: 128Mi }

@@ -54,7 +54,7 @@ spec:
             - --pass-access-token=true
             - --cookie-name=_amp_oauth2_proxy
             - --cookie-secure={{ .Values.oauth2Proxy.cookieSecure }}
-            - --skip-email-verified={{ .Values.oauth2Proxy.skipEmailVerified }}
+            - --insecure-oidc-allow-unverified-email={{ .Values.oauth2Proxy.insecureOidcAllowUnverifiedEmail }}
             - --cookie-samesite=lax
             - --skip-provider-button=true
             - --silence-ping-logging=true
