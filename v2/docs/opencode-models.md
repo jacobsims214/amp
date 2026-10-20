@@ -80,8 +80,10 @@ Tested against a local capture of the requests opencode sends, then with real ca
    `cost` and `variants`, then point the agent at it.
 3. Check: `opencode debug agents` shows the model and variant; a one-line
    `opencode run -m openrouter/<model>#<variant> "Reply OK"` proves the ID works.
-4. `make sync-global` to install, `scripts/build-claude-plugin.sh` to regenerate the Claude Code
-   plugin (Claude Code agents inherit the session model; the opencode model isn't carried over).
+4. `scripts/build-opencode-plugin.sh` to regenerate the opencode plugin (run
+   `scripts/setup-opencode.sh` once if it isn't installed yet), and `scripts/build-claude-plugin.sh`
+   to regenerate the Claude Code plugin (Claude Code agents inherit the session model; the
+   opencode model isn't carried over).
 
 ## Sources
 
