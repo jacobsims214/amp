@@ -172,4 +172,6 @@ func TestKB_ImportOldFormatExport(t *testing.T) {
 	}
 }
 
-func kbStoreScope(sc kb.Scope) repository.KBScope { return repository.KBScope{Kind: sc.Kind, ID: sc.ID} }
+func kbStoreScope(sc kb.Scope) repository.KBScope {
+	return repository.KBScope{Kind: sc.Kind, ID: sc.ID}
+}
