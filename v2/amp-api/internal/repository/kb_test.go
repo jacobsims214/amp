@@ -277,12 +277,20 @@ func TestKBSoftDeleteAndRestore(t *testing.T) {
 		t.Errorf("annotate deleted doc: err = %v, want ErrNotFound", err)
 	}
 
+	time.Sleep(2 * time.Millisecond) // a restore stamped with NOW() would differ
 	restored, err := r.RestoreKBDocument(ctx, scope, "gone.md", "dave")
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	if restored.DeletedAt != nil || restored.Version != 3 || restored.Content != "g" {
 		t.Errorf("restored = %+v", restored)
+	}
+	// Restoring is not a content change: updated_at keeps its pre-delete value.
+	if !restored.UpdatedAt.Equal(gone.UpdatedAt) {
+		t.Errorf("restore moved updated_at %v -> %v", gone.UpdatedAt, restored.UpdatedAt)
+	}
+	if got, err := r.GetKBDocument(ctx, scope, "gone.md"); err != nil || !got.UpdatedAt.Equal(gone.UpdatedAt) {
+		t.Errorf("stored updated_at after restore = %v (%v), want %v", got, err, gone.UpdatedAt)
 	}
 	if n, p := live(); n != 2 || !slices.Equal(p, []string{"gone.md", "keep.md"}) {
 		t.Errorf("after restore: n=%d paths=%v", n, p)

@@ -321,7 +321,8 @@ func (r *Repo) DeleteKBDocument(ctx context.Context, scope KBScope, path, by str
 }
 
 // RestoreKBDocument brings back a soft-deleted doc and records a 'restore'
-// version. A doc that is missing or not deleted is ErrNotFound.
+// version. It keeps the doc's updated_at: restoring is not a content change.
+// A doc that is missing or not deleted is ErrNotFound.
 func (r *Repo) RestoreKBDocument(ctx context.Context, scope KBScope, path, by string) (*KBDocument, error) {
 	if err := scope.validate(); err != nil {
 		return nil, err
@@ -338,12 +339,19 @@ func (r *Repo) RestoreKBDocument(ctx context.Context, scope KBScope, path, by st
 	if d.DeletedAt == nil {
 		return nil, fmt.Errorf("deleted kb doc %s in %s: %w", path, scope, ErrNotFound)
 	}
+	// Restoring is not a content change, so updated_at keeps the value it had
+	// before the delete; a restored doc must not look fresh to recency
+	// scoring. The version row records when the restore happened.
 	restored := &KBDocument{}
 	if err := scanKBDocument(tx.QueryRow(ctx, `UPDATE kb_documents SET deleted_at = NULL, deleted_by = NULL,
-		version = version + 1, updated_at = NOW() WHERE id = $1 RETURNING `+kbDocCols, d.ID), restored); err != nil {
+		version = version + 1 WHERE id = $1 RETURNING `+kbDocCols, d.ID), restored); err != nil {
 		return nil, err
 	}
-	if err := insertKBVersion(ctx, tx, restored, kbChangeRestore, by, restored.UpdatedAt); err != nil {
+	var at time.Time
+	if err := tx.QueryRow(ctx, `SELECT NOW()`).Scan(&at); err != nil {
+		return nil, err
+	}
+	if err := insertKBVersion(ctx, tx, restored, kbChangeRestore, by, at); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
