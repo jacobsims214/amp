@@ -70,6 +70,10 @@ type Service struct {
 	// reconcileOnly, when set (tests only), limits ReconcileAll to the KBs
 	// it returns true for.
 	reconcileOnly func(Scope) bool
+
+	// backfillOnly, when set (tests only), limits BackfillAll to the KBs
+	// it returns true for.
+	backfillOnly func(Scope) bool
 }
 
 // ErrReindexRunning is returned when a reindex of the same KB is already
@@ -516,7 +520,7 @@ func (s *Service) GetDoc(ctx context.Context, sc Scope, path string) (*Doc, erro
 // index entry for one is stale (its removal failed or hasn't run yet).
 func (s *Service) storedRead(ctx context.Context, sc Scope) (done bool, deleted map[string]bool, err error) {
 	rs := storeScope(sc)
-	if done, err = s.store.IsKBBackfillComplete(ctx, rs); err != nil || done {
+	if done, err = s.backfillDone(ctx, sc); err != nil || done {
 		return done, nil, err
 	}
 	paths, err := s.store.ListDeletedKBPaths(ctx, rs)
@@ -1386,7 +1390,7 @@ func (s *Service) RestoreKB(ctx context.Context, sc Scope, by string) (int, erro
 // dropping the collection afterwards loses none of them.
 func (s *Service) trashStored(ctx context.Context, sc Scope) error {
 	rs := storeScope(sc)
-	done, err := s.store.IsKBBackfillComplete(ctx, rs)
+	done, err := s.backfillDone(ctx, sc)
 	if err != nil {
 		return err
 	}
@@ -1626,6 +1630,9 @@ type Store interface {
 	RestoreKBDocument(ctx context.Context, scope repository.KBScope, path, by string) (*repository.KBDocument, error)
 	ListTrashedKBPaths(ctx context.Context, scope repository.KBScope, by string) ([]string, error)
 	ListBackfilledKBScopes(ctx context.Context) ([]repository.KBScope, error)
+	StartKBBackfill(ctx context.Context, scope repository.KBScope) error
+	CompleteKBBackfill(ctx context.Context, scope repository.KBScope, docCount int) error
+	FailKBBackfill(ctx context.Context, scope repository.KBScope, msg string) error
 }
 
 var _ Store = (*repository.Repo)(nil)
@@ -1692,7 +1699,7 @@ func (s *Service) updateStoredAnnotations(ctx context.Context, sc Scope, path st
 // skips any path with a row, live or deleted.
 func (s *Service) adoptIndexed(ctx context.Context, sc Scope, path string) error {
 	rs := storeScope(sc)
-	done, err := s.store.IsKBBackfillComplete(ctx, rs)
+	done, err := s.backfillDone(ctx, sc)
 	if err != nil {
 		return fmt.Errorf("check the backfill of %s: %w", sc, err)
 	}
@@ -1869,13 +1876,20 @@ func (s *Service) drainLegacyWrite(ctx context.Context, sc Scope, p queue.WriteD
 // runs after the swap and so writes into the new collection.
 
 // reindexFromStore rebuilds a stored KB's search collection from Postgres,
-// keeping each doc's own updated_at. Until the KB's backfill completes, docs
-// only the index has are copied into Postgres first; then, if the index
-// still holds any doc Postgres has no row for, it refuses
-// (ErrReindexRefused) and changes nothing. A failure or cancel before the
+// keeping each doc's own updated_at. It refuses (ErrReindexRefused, nothing
+// changed) until the KB's backfill has completed (ErrBackfillPending), and
+// when the index holds any doc Postgres has no row for. A failure or cancel before the
 // swap drops only the new collection; the old one keeps serving, unchanged.
 func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
 	base := collectionName(sc)
+	done, err := s.backfillDone(ctx, sc)
+	if err != nil {
+		return fmt.Errorf("reindex: check the backfill of %s: %w", sc, err)
+	}
+	if !done {
+		s.log.Warn("reindex refused: the KB's backfill has not completed; nothing was changed", "kb", sc.String())
+		return fmt.Errorf("%w: %w: %s (it runs at startup; a failed one retries on the next)", ErrReindexRefused, ErrBackfillPending, sc)
+	}
 	if err := s.checkStoreCoversIndex(ctx, sc); err != nil {
 		return err
 	}
@@ -1949,26 +1963,15 @@ func (s *Service) runHook(ctx context.Context, stage string) {
 }
 
 // checkStoreCoversIndex makes sure a collection built from Postgres would
-// hold every doc the current index has. Until the KB's backfill completes,
-// index-only docs are copied into Postgres first (insert-if-missing). Then
-// every indexed path must have a Postgres row: a live one, or a deleted one
-// (the index entry is stale, and the new collection rightly leaves it out).
+// hold every doc the current index has (the caller has checked that the
+// KB's backfill completed): every indexed path must have a Postgres row, a
+// live one or a deleted one (the index entry is stale, and the new
+// collection rightly leaves it out).
 func (s *Service) checkStoreCoversIndex(ctx context.Context, sc Scope) error {
 	rs := storeScope(sc)
-	done, err := s.store.IsKBBackfillComplete(ctx, rs)
-	if err != nil {
-		return err
-	}
 	indexed, err := s.listIndexed(ctx, sc, "")
 	if err != nil {
 		return err
-	}
-	if !done {
-		for _, d := range indexed {
-			if err := s.adoptIndexed(ctx, sc, d.Path); err != nil {
-				return fmt.Errorf("reindex: %w", err)
-			}
-		}
 	}
 	live := map[string]bool{}
 	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
@@ -1993,7 +1996,7 @@ func (s *Service) checkStoreCoversIndex(ctx context.Context, sc Scope) error {
 	}
 	if len(missing) > 0 {
 		s.log.Error("reindex refused: the index holds docs postgres has no row for; nothing was changed",
-			"kb", sc.String(), "stored", len(live), "indexed", len(indexed), "missing", len(missing), "backfill_complete", done)
+			"kb", sc.String(), "stored", len(live), "indexed", len(indexed), "missing", len(missing))
 		return fmt.Errorf("%w: %s has %d live docs in postgres and %d in the index; %d indexed docs have no postgres row (first: %s)",
 			ErrReindexRefused, sc, len(live), len(indexed), len(missing), missing[0])
 	}

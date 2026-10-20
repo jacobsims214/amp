@@ -222,10 +222,13 @@ func TestListIndexedPaginates(t *testing.T) {
 func TestDropTrashesStoredDocs(t *testing.T) {
 	s, repo, sc := storedService(t)
 	ctx := context.Background()
-	if _, err := s.WriteDoc(ctx, sc, "kept.md", "Kept", "in postgres", "me", nil, "", nil); err != nil {
+	// The index-only doc predates the first Postgres write, as in a KB that
+	// existed before the store (a KB with no collection at its first write is
+	// marked backfilled, #1994).
+	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "old.md", title: "Old", content: "index only", updatedAt: 1_700_000_000}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "old.md", title: "Old", content: "index only", updatedAt: 1_700_000_000}); err != nil {
+	if _, err := s.WriteDoc(ctx, sc, "kept.md", "Kept", "in postgres", "me", nil, "", nil); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := s.CountDocs(ctx, sc); n != 2 {

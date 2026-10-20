@@ -86,6 +86,12 @@ func TestImportDocLeavesExistingDocs(t *testing.T) {
 	ctx := context.Background()
 	rs := storeScope(sc)
 
+	// A pre-existing KB: its collection (with an index-only doc) is there
+	// before the first Postgres write. (A KB with no collection at its first
+	// write is marked backfilled, #1994.)
+	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "indexed.md", title: "Indexed", content: "index body", updatedAt: 1_700_000_000}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.WriteDoc(ctx, sc, "live.md", "Live", "live body", "me", nil, "", nil); err != nil {
 		t.Fatal(err)
 	}
@@ -93,9 +99,6 @@ func TestImportDocLeavesExistingDocs(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := s.DeleteDoc(ctx, sc, "deleted.md", "me"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "indexed.md", title: "Indexed", content: "index body", updatedAt: 1_700_000_000}); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"live.md", "deleted.md", "indexed.md"} {

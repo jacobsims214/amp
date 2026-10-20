@@ -544,6 +544,29 @@ func (r *Repo) ListBackfilledKBScopes(ctx context.Context) ([]KBScope, error) {
 	return out, rows.Err()
 }
 
+// ListKBOwnerScopes lists every KB Postgres knows an owner for: each project
+// (archived ones included), team and org. The backfill uses it to mark KBs
+// that have no search collection at all as complete.
+func (r *Repo) ListKBOwnerScopes(ctx context.Context) ([]KBScope, error) {
+	rows, err := r.db.Query(ctx, `SELECT 'project', id FROM projects
+		UNION ALL SELECT 'team', id FROM teams
+		UNION ALL SELECT 'org', id FROM orgs
+		ORDER BY 1, 2`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []KBScope
+	for rows.Next() {
+		var sc KBScope
+		if err := rows.Scan(&sc.Kind, &sc.ID); err != nil {
+			return nil, err
+		}
+		out = append(out, sc)
+	}
+	return out, rows.Err()
+}
+
 // GetKBBackfill loads a KB's backfill state; ErrNotFound if it never started.
 func (r *Repo) GetKBBackfill(ctx context.Context, scope KBScope) (*KBBackfill, error) {
 	if err := scope.validate(); err != nil {
