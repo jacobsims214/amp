@@ -1837,13 +1837,27 @@ func (s *Service) adoptIndexed(ctx context.Context, sc Scope, path string) error
 	} else if !errors.Is(err, repository.ErrNotFound) {
 		return err
 	}
+	if _, _, err := s.copyIndexed(ctx, sc, path, "kb-adopt-on-write"); err != nil {
+		// Writing now could drop the indexed copy's annotations for good.
+		return fmt.Errorf("copy the indexed %s into postgres before its first Postgres write (this KB is not backfilled yet): %w", path, err)
+	}
+	return nil
+}
+
+// copyIndexed copies path's index entry (chunk 0: content, title, tags,
+// author, reason, annotations and updated_at) into Postgres with
+// InsertKBDocumentIfMissing, recorded as by. A path that has any row, live
+// or soft-deleted, is left exactly as it is (inserted false), so it never
+// overwrites a row or revives a deleted doc. found is false (and err nil)
+// when the index has no entry for path. Any other index error is returned,
+// never treated as "nothing to copy". adoptIndexed and the reconciler use it.
+func (s *Service) copyIndexed(ctx context.Context, sc Scope, path, by string) (inserted, found bool, err error) {
 	old, err := s.getIndexed(ctx, sc, path)
 	if err != nil {
 		if isNotFound(err) {
-			return nil
+			return false, false, nil
 		}
-		// Writing now could drop the indexed copy's annotations for good.
-		return fmt.Errorf("read the indexed copy of %s before its first Postgres write (this KB is not backfilled yet): %w", path, err)
+		return false, false, fmt.Errorf("read the index entry: %w", err)
 	}
 	row := repository.KBDocument{
 		Path: path, Title: old.Title, Tags: old.Tags, Author: old.Author, Reason: old.Reason,
@@ -1852,10 +1866,11 @@ func (s *Service) adoptIndexed(ctx context.Context, sc Scope, path string) error
 	if old.UpdatedAt > 0 {
 		row.UpdatedAt = time.Unix(old.UpdatedAt, 0)
 	}
-	if _, err := s.store.InsertKBDocumentIfMissing(ctx, rs, row, "kb-adopt-on-write"); err != nil {
-		return fmt.Errorf("copy the indexed %s into postgres: %w", path, err)
+	inserted, err = s.store.InsertKBDocumentIfMissing(ctx, storeScope(sc), row, by)
+	if err != nil {
+		return false, true, fmt.Errorf("insert into postgres: %w", err)
 	}
-	return nil
+	return inserted, true, nil
 }
 
 // index brings path's search entry in line with its Postgres row: through

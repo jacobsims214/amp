@@ -81,9 +81,11 @@ func TestKBStatusStoredAndIndexedCounts(t *testing.T) {
 	if _, err := s.ReconcileKB(ctx, sc); err != nil {
 		t.Fatal(err)
 	}
-	// The reconciler indexes the missing doc and keeps the index-only entry.
-	if st = mustStatus(t, s, sc); intOf(st.StoredDocs) != fmt.Sprint(n) || intOf(st.IndexedDocs) != fmt.Sprint(n+1) {
-		t.Fatalf("after reconcile: stored %s, indexed %s; want %d and %d", intOf(st.StoredDocs), intOf(st.IndexedDocs), n, n+1)
+	// The reconciler indexes the missing doc and copies the index-only entry
+	// (no kb_version, dated after the backfill: an old pod's write) into
+	// Postgres (#2024), so both counts are n+1.
+	if st = mustStatus(t, s, sc); intOf(st.StoredDocs) != fmt.Sprint(n+1) || intOf(st.IndexedDocs) != fmt.Sprint(n+1) {
+		t.Fatalf("after reconcile: stored %s, indexed %s; want %d of each", intOf(st.StoredDocs), intOf(st.IndexedDocs), n+1)
 	}
 }
 

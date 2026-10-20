@@ -2,61 +2,81 @@ package kb
 
 // Tests for the reconciler (#1993). They need Postgres and Typesense; see
 // store_test.go for the environment. Every reconcile here runs on a
-// service whose store refuses writes, so each test also proves the
-// reconciler never modifies Postgres.
+// service whose store refuses every write except InsertKBDocumentIfMissing
+// (adopting an index-only doc, #2024), so each test also proves the
+// reconciler never updates or deletes a Postgres row.
 
 import (
 	"context"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
 )
 
-// readOnlyStore is a Store that fails the test on any write.
-type readOnlyStore struct {
+// insertOnlyStore is a Store that fails the test on any write other than
+// InsertKBDocumentIfMissing, which it passes through and counts.
+type insertOnlyStore struct {
 	Store
-	t      *testing.T
-	writes atomic.Int32
+	t       *testing.T
+	writes  atomic.Int32 // refused writes
+	inserts atomic.Int32 // InsertKBDocumentIfMissing calls that inserted
 }
 
-func (r *readOnlyStore) wrote(name string) error {
+func (r *insertOnlyStore) wrote(name string) error {
 	r.writes.Add(1)
 	r.t.Errorf("reconciler wrote postgres: %s", name)
 	return fmt.Errorf("read-only store: %s refused", name)
 }
 
-func (r *readOnlyStore) UpsertKBDocument(context.Context, repository.KBScope, repository.KBDocWrite) (*repository.KBDocument, bool, error) {
+func (r *insertOnlyStore) UpsertKBDocument(context.Context, repository.KBScope, repository.KBDocWrite) (*repository.KBDocument, bool, error) {
 	return nil, false, r.wrote("UpsertKBDocument")
 }
 
-func (r *readOnlyStore) UpdateKBAnnotations(context.Context, repository.KBScope, string,
+func (r *insertOnlyStore) UpdateKBAnnotations(context.Context, repository.KBScope, string,
 	func([]domain.KBAnnotation) ([]domain.KBAnnotation, error)) (*repository.KBDocument, error) {
 	return nil, r.wrote("UpdateKBAnnotations")
 }
 
-func (r *readOnlyStore) InsertKBDocumentIfMissing(context.Context, repository.KBScope, repository.KBDocument, string) (bool, error) {
-	return false, r.wrote("InsertKBDocumentIfMissing")
+// InsertKBDocumentIfMissing is the one write the reconciler may make: it
+// never changes an existing row, live or deleted.
+func (r *insertOnlyStore) InsertKBDocumentIfMissing(ctx context.Context, sc repository.KBScope, d repository.KBDocument, by string) (bool, error) {
+	ok, err := r.Store.InsertKBDocumentIfMissing(ctx, sc, d, by)
+	if ok {
+		r.inserts.Add(1)
+	}
+	return ok, err
 }
 
-func (r *readOnlyStore) DeleteKBDocument(context.Context, repository.KBScope, string, string) error {
+func (r *insertOnlyStore) DeleteKBDocument(context.Context, repository.KBScope, string, string) error {
 	return r.wrote("DeleteKBDocument")
 }
 
-func (r *readOnlyStore) RestoreKBDocument(context.Context, repository.KBScope, string, string) (*repository.KBDocument, error) {
+func (r *insertOnlyStore) RestoreKBDocument(context.Context, repository.KBScope, string, string) (*repository.KBDocument, error) {
 	return nil, r.wrote("RestoreKBDocument")
 }
 
 // reconciler returns a service on the test Typesense whose store is repo
-// behind readOnlyStore.
+// behind insertOnlyStore.
 func reconciler(t *testing.T, repo *repository.Repo) *Service {
+	t.Helper()
+	r, _ := reconcilerStore(t, repo)
+	return r
+}
+
+// reconcilerStore is reconciler, also returning its store to count inserts.
+func reconcilerStore(t *testing.T, repo *repository.Repo) (*Service, *insertOnlyStore) {
 	t.Helper()
 	url, key := typesenseEnv(t)
 	r := New(url, key, "", "")
-	r.SetStore(&readOnlyStore{Store: repo, t: t})
-	return r
+	st := &insertOnlyStore{Store: repo, t: t}
+	r.SetStore(st)
+	return r, st
 }
 
 // backfilledKB is storedService with the KB's backfill marked complete.
@@ -200,6 +220,7 @@ func TestReconcileRemovesDeletedDocs(t *testing.T) {
 	if err := repo.DeleteKBDocument(ctx, storeScope(sc), "gone.md", "me"); err != nil {
 		t.Fatal(err)
 	}
+	// updated_at 0: older than the backfill, so it is not adopted.
 	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "orphan.md", title: "orphan", content: "no row"}); err != nil {
 		t.Fatal(err)
 	}
@@ -208,7 +229,7 @@ func TestReconcileRemovesDeletedDocs(t *testing.T) {
 	}
 
 	st := mustReconcile(t, reconciler(t, repo), sc)
-	if st.Removed != 1 || st.IndexOnly != 1 || st.Missing != 0 || st.Stale != 0 || st.Failed != 0 {
+	if st.Removed != 1 || st.IndexOnly != 1 || st.Adopted != 0 || st.Missing != 0 || st.Stale != 0 || st.Failed != 0 {
 		t.Fatalf("stats = %+v, want 1 removed, 1 index-only", st)
 	}
 	if n := chunkCount(t, s, sc, "gone.md"); n != 0 {
@@ -328,6 +349,208 @@ func TestIndexStateCurrent(t *testing.T) {
 	} {
 		if got := tc.ix.current(row); got != tc.want {
 			t.Errorf("%s: current = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// oldPodWrite indexes d straight into Typesense the way a pre-Postgres pod
+// does during a rolling deploy: no Postgres row, and no kb_version.
+func oldPodWrite(t *testing.T, s *Service, sc Scope, d indexedDoc) {
+	t.Helper()
+	d.version = 0
+	if _, err := s.indexChunks(context.Background(), sc, d); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// indexedVersion is the kb_version on path's chunk 0 (0 when absent).
+func indexedVersion(t *testing.T, s *Service, sc Scope, path string) int {
+	t.Helper()
+	m, err := s.client.Collection(collectionName(sc)).Document(docID(sc, path, 0)).Retrieve(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, _ := m[indexedVersionField].(float64)
+	return int(v)
+}
+
+// A doc an old pod wrote straight to Typesense after the KB's backfill (the
+// rolling-deploy gap of #1994) is copied into Postgres by one reconcile,
+// with its original updated_at, content and annotations, and re-indexed
+// from the new row. Nothing else in Postgres changes.
+func TestReconcileAdoptsIndexOnlyDoc(t *testing.T) {
+	s, repo, sc := backfilledKB(t)
+	ctx := context.Background()
+	if _, err := s.WriteDoc(ctx, sc, "keep.md", "Keep", "a stored doc", "me", nil, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	before := rowsSnapshot(t, sc)
+
+	updated := time.Now().Add(-30 * time.Second).Unix()
+	anns := []Annotation{
+		{Author: "ann@x", Text: "first note", CreatedAt: updated - 10},
+		{Author: "bob@x", Text: "resolved note", CreatedAt: updated - 5, IsResolved: true},
+	}
+	// Long enough for several chunks: the copy must take chunk 0's full content.
+	content := "# Old pod\n\n" + strings.Repeat("wombatfeather paragraph text for chunking. ", 400)
+	oldPodWrite(t, s, sc, indexedDoc{
+		path: "oldpod.md", title: "Old pod doc", content: content, author: "old@x", reason: "written mid-deploy",
+		tags: []string{"deploy", "kb"}, annotations: anns, updatedAt: updated,
+	})
+	if chunkCount(t, s, sc, "oldpod.md") < 2 {
+		t.Fatal("setup: want a multi-chunk doc")
+	}
+
+	r, store := reconcilerStore(t, repo)
+	st := mustReconcile(t, r, sc)
+	if st.Adopted != 1 || st.IndexOnly != 0 || st.Failed != 0 || st.Fixed() != 0 {
+		t.Fatalf("stats = %+v, want 1 adopted and nothing else", st)
+	}
+	if n := store.inserts.Load(); n != 1 {
+		t.Errorf("inserts = %d, want 1", n)
+	}
+
+	row := mustRow(t, repo, sc, "oldpod.md")
+	if row.UpdatedAt.Unix() != updated || row.CreatedAt.Unix() != updated {
+		t.Errorf("row dates = created %v updated %v, want both %d", row.CreatedAt.Unix(), row.UpdatedAt.Unix(), updated)
+	}
+	if row.Content != content || row.Title != "Old pod doc" || row.Author != "old@x" || row.Reason != "written mid-deploy" {
+		t.Errorf("row = %q/%q/%q, content match %v", row.Title, row.Author, row.Reason, row.Content == content)
+	}
+	if !reflect.DeepEqual(row.Tags, []string{"deploy", "kb"}) {
+		t.Errorf("row tags = %v", row.Tags)
+	}
+	if !reflect.DeepEqual(row.Annotations, anns) {
+		t.Errorf("row annotations = %+v, want %+v", row.Annotations, anns)
+	}
+	if row.Version != 1 {
+		t.Errorf("row version = %d, want 1", row.Version)
+	}
+	var by, change string
+	if err := rawDB(t).QueryRow(ctx, `SELECT v.changed_by, v.change FROM kb_document_versions v
+		JOIN kb_documents d ON d.id = v.document_id
+		WHERE d.scope_kind = $1 AND d.scope_id = $2 AND d.path = 'oldpod.md'`, sc.Kind, sc.ID).Scan(&by, &change); err != nil {
+		t.Fatal(err)
+	}
+	if by != reconcileAdoptBy || change != "backfill" {
+		t.Errorf("version row = %s/%s, want %s/backfill", by, change, reconcileAdoptBy)
+	}
+
+	// Re-indexed from the row: the entry now carries the row's version and
+	// the doc is still searchable with its original date.
+	if v := indexedVersion(t, s, sc, "oldpod.md"); v != 1 {
+		t.Errorf("indexed kb_version = %d, want 1", v)
+	}
+	if d, err := s.getIndexed(ctx, sc, "oldpod.md"); err != nil || d.UpdatedAt != updated || len(d.Annotations) != 2 {
+		t.Errorf("indexed copy = %+v (err %v), want updated_at %d and 2 annotations", d, err, updated)
+	}
+	if got := searchPaths(t, s, sc, "wombatfeather"); !contains(got, "oldpod.md") {
+		t.Errorf("adopted doc not searchable: %v", got)
+	}
+
+	// The other row is untouched; only the adopted row was added.
+	after := rowsSnapshot(t, sc)
+	if len(after) != len(before)+1 || fmt.Sprint(after[:len(before)]) != fmt.Sprint(before) {
+		t.Errorf("postgres rows changed:\nbefore %v\nafter  %v", before, after)
+	}
+
+	// A second pass finds nothing to do.
+	if st := mustReconcile(t, r, sc); st.Adopted != 0 || st.Fixed() != 0 || st.IndexOnly != 0 || st.Live != 2 {
+		t.Errorf("second pass = %+v, want nothing to do", st)
+	}
+	if n := store.inserts.Load(); n != 1 {
+		t.Errorf("inserts after the second pass = %d, want still 1", n)
+	}
+}
+
+// An old pod's write to a path whose row is soft-deleted does not revive
+// it: the entry is removed as before and the row stays deleted, unchanged.
+func TestReconcileDoesNotReviveDeletedPath(t *testing.T) {
+	s, repo, sc := backfilledKB(t)
+	ctx := context.Background()
+	if _, err := s.WriteDoc(ctx, sc, "gone.md", "Gone", "deleted doc", "me", nil, "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteDoc(ctx, sc, "gone.md", "me"); err != nil {
+		t.Fatal(err)
+	}
+	oldPodWrite(t, s, sc, indexedDoc{path: "gone.md", title: "Gone again", content: "old pod rewrite",
+		author: "old@x", updatedAt: time.Now().Unix()})
+	before := rowsSnapshot(t, sc)
+
+	r, store := reconcilerStore(t, repo)
+	st := mustReconcile(t, r, sc)
+	if st.Removed != 1 || st.Adopted != 0 || st.IndexOnly != 0 || st.Failed != 0 {
+		t.Fatalf("stats = %+v, want 1 removed and nothing adopted", st)
+	}
+	if n := store.inserts.Load(); n != 0 {
+		t.Errorf("inserts = %d, want 0", n)
+	}
+	if n := chunkCount(t, s, sc, "gone.md"); n != 0 {
+		t.Errorf("deleted path still has %d index entries", n)
+	}
+	if after := rowsSnapshot(t, sc); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Errorf("postgres changed:\nbefore %v\nafter  %v", before, after)
+	}
+
+	// copyIndexed itself refuses the path too (a row appeared between the
+	// reconciler's listing and its copy).
+	oldPodWrite(t, s, sc, indexedDoc{path: "gone.md", title: "Gone again", content: "x", updatedAt: time.Now().Unix()})
+	inserted, found, err := r.copyIndexed(ctx, sc, "gone.md", reconcileAdoptBy)
+	if err != nil || !found || inserted {
+		t.Errorf("copyIndexed over a deleted row = inserted %v found %v err %v, want found and not inserted", inserted, found, err)
+	}
+	if deleted, exists := deletedRow(t, rawDB(t), sc, "gone.md"); !deleted || !exists {
+		t.Errorf("gone.md row: deleted=%v exists=%v, want still soft-deleted", deleted, exists)
+	}
+}
+
+// Index-only entries that are not an old pod's post-backfill write stay in
+// place: one with a kb_version (it was indexed from a row that is gone now)
+// and one dated before the backfill started.
+func TestReconcileLeavesOtherIndexOnlyEntries(t *testing.T) {
+	s, repo, sc := backfilledKB(t)
+	ctx := context.Background()
+	now := time.Now().Unix()
+	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "purged.md", title: "p", content: "had a row", updatedAt: now, version: 3}); err != nil {
+		t.Fatal(err)
+	}
+	oldPodWrite(t, s, sc, indexedDoc{path: "ancient.md", title: "a", content: "before the backfill", updatedAt: now - 86400})
+
+	r, store := reconcilerStore(t, repo)
+	st := mustReconcile(t, r, sc)
+	if st.IndexOnly != 2 || st.Adopted != 0 || st.Failed != 0 {
+		t.Fatalf("stats = %+v, want 2 index-only, none adopted", st)
+	}
+	if n := store.inserts.Load(); n != 0 {
+		t.Errorf("inserts = %d, want 0", n)
+	}
+	for _, p := range []string{"purged.md", "ancient.md"} {
+		if chunkCount(t, s, sc, p) == 0 {
+			t.Errorf("%s removed from the index", p)
+		}
+		if _, exists := deletedRow(t, rawDB(t), sc, p); exists {
+			t.Errorf("%s got a postgres row", p)
+		}
+	}
+}
+
+func TestAdoptable(t *testing.T) {
+	started := time.Unix(1_000_000, 0)
+	slack := int64(adoptClockSlack / time.Second)
+	for _, tc := range []struct {
+		name string
+		ix   indexState
+		want bool
+	}{
+		{"after the backfill, no version", indexState{updatedAt: 1_000_100}, true},
+		{"within the clock slack", indexState{updatedAt: 1_000_000 - slack}, true},
+		{"before the slack", indexState{updatedAt: 1_000_000 - slack - 1}, false},
+		{"has a version", indexState{updatedAt: 1_000_100, version: 2}, false},
+		{"no updated_at", indexState{}, false},
+	} {
+		if got := adoptable(tc.ix, started); got != tc.want {
+			t.Errorf("%s: adoptable = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }
