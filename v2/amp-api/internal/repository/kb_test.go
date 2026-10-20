@@ -137,25 +137,35 @@ func TestKBUpsertVersions(t *testing.T) {
 		edit        func(w *KBDocWrite)
 		wantChanged bool
 		wantVersion int
+		wantTouched bool // updated_at moves forward; otherwise it must stay put
 	}{
-		{"identical write is a no-op", func(w *KBDocWrite) {}, false, 1},
-		{"author only: row written, no version", func(w *KBDocWrite) { w.Author = "bob" }, true, 1},
-		{"reason only: row written, no version", func(w *KBDocWrite) { w.Reason = "shared" }, true, 1},
-		{"content change", func(w *KBDocWrite) { w.Content = "v2" }, true, 2},
-		{"title change", func(w *KBDocWrite) { w.Title = "Overview 2" }, true, 3},
-		{"tags change", func(w *KBDocWrite) { w.Tags = []string{"a", "c"} }, true, 4},
-		{"tag order counts as a change", func(w *KBDocWrite) { w.Tags = []string{"c", "a"} }, true, 5},
-		{"nil tags vs empty tags", func(w *KBDocWrite) { w.Tags = nil }, true, 6},
-		{"empty tags again is a no-op", func(w *KBDocWrite) { w.Tags = []string{} }, false, 6},
+		{"identical write is a no-op", func(w *KBDocWrite) {}, false, 1, false},
+		{"author only: row written, no version", func(w *KBDocWrite) { w.Author = "bob" }, true, 1, false},
+		{"reason only: row written, no version", func(w *KBDocWrite) { w.Reason = "shared" }, true, 1, false},
+		{"content change", func(w *KBDocWrite) { w.Content = "v2" }, true, 2, true},
+		{"title change", func(w *KBDocWrite) { w.Title = "Overview 2" }, true, 3, true},
+		{"tags change", func(w *KBDocWrite) { w.Tags = []string{"a", "c"} }, true, 4, true},
+		{"tag order counts as a change", func(w *KBDocWrite) { w.Tags = []string{"c", "a"} }, true, 5, true},
+		{"nil tags vs empty tags", func(w *KBDocWrite) { w.Tags = nil }, true, 6, true},
+		{"empty tags again is a no-op", func(w *KBDocWrite) { w.Tags = []string{} }, false, 6, false},
 	}
 	w := base
+	prev := created.UpdatedAt
 	for _, st := range steps {
 		st.edit(&w)
+		time.Sleep(2 * time.Millisecond) // NOW() must be able to differ from prev
 		d, changed := mustUpsert(t, r, scope, w)
 		if changed != st.wantChanged || d.Version != st.wantVersion {
 			t.Errorf("%s: changed=%v version=%d, want changed=%v version=%d",
 				st.name, changed, d.Version, st.wantChanged, st.wantVersion)
 		}
+		if st.wantTouched && !d.UpdatedAt.After(prev) {
+			t.Errorf("%s: updated_at = %v, want after %v", st.name, d.UpdatedAt, prev)
+		}
+		if !st.wantTouched && !d.UpdatedAt.Equal(prev) {
+			t.Errorf("%s: updated_at moved %v -> %v", st.name, prev, d.UpdatedAt)
+		}
+		prev = d.UpdatedAt
 	}
 
 	got, err := r.GetKBDocument(context.Background(), scope, base.Path)
@@ -285,9 +295,13 @@ func TestKBSoftDeleteAndRestore(t *testing.T) {
 	if err := r.DeleteKBDocument(ctx, scope, "gone.md", "carol"); err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(2 * time.Millisecond)
 	revived, changed := mustUpsert(t, r, scope, KBDocWrite{Path: "gone.md", Content: "g", By: "erin"})
 	if !changed || revived.ID != gone.ID || revived.DeletedAt != nil || revived.Version != 5 {
 		t.Errorf("revive: changed=%v doc=%+v", changed, revived)
+	}
+	if !revived.UpdatedAt.After(restored.UpdatedAt) {
+		t.Errorf("revive kept updated_at %v, want after %v", revived.UpdatedAt, restored.UpdatedAt)
 	}
 	if v := kbVersions(t, r, gone.ID); !slices.Equal(v, []string{"1:create", "2:delete", "3:restore", "4:delete", "5:create"}) {
 		t.Errorf("versions after revive = %v", v)
