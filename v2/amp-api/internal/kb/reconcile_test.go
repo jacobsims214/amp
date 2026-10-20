@@ -4,12 +4,16 @@ package kb
 // store_test.go for the environment. Every reconcile here runs on a
 // service whose store refuses every write except InsertKBDocumentIfMissing
 // (adopting an index-only doc, #2024), so each test also proves the
-// reconciler never updates or deletes a Postgres row.
+// reconciler never updates or deletes a Postgres row. The one exception is
+// copying an old pod's edit of a live row into it (#2027): only the tests of
+// that case set allowEdits, which lets UpsertKBDocument and
+// UpdateKBAnnotations through and counts them.
 
 import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,12 +24,17 @@ import (
 )
 
 // insertOnlyStore is a Store that fails the test on any write other than
-// InsertKBDocumentIfMissing, which it passes through and counts.
+// InsertKBDocumentIfMissing, which it passes through and counts. With
+// allowEdits it also passes UpsertKBDocument and UpdateKBAnnotations through
+// (counted), for the old-pod-edit tests only.
 type insertOnlyStore struct {
 	Store
-	t       *testing.T
-	writes  atomic.Int32 // refused writes
-	inserts atomic.Int32 // InsertKBDocumentIfMissing calls that inserted
+	t          *testing.T
+	allowEdits bool
+	writes     atomic.Int32 // refused writes
+	inserts    atomic.Int32 // InsertKBDocumentIfMissing calls that inserted
+	upserts    atomic.Int32 // UpsertKBDocument calls (allowEdits)
+	annUpdates atomic.Int32 // UpdateKBAnnotations calls (allowEdits)
 }
 
 func (r *insertOnlyStore) wrote(name string) error {
@@ -34,13 +43,24 @@ func (r *insertOnlyStore) wrote(name string) error {
 	return fmt.Errorf("read-only store: %s refused", name)
 }
 
-func (r *insertOnlyStore) UpsertKBDocument(context.Context, repository.KBScope, repository.KBDocWrite) (*repository.KBDocument, bool, error) {
-	return nil, false, r.wrote("UpsertKBDocument")
+func (r *insertOnlyStore) UpsertKBDocument(ctx context.Context, sc repository.KBScope, w repository.KBDocWrite) (*repository.KBDocument, bool, error) {
+	if !r.allowEdits {
+		return nil, false, r.wrote("UpsertKBDocument")
+	}
+	r.upserts.Add(1)
+	if w.By != reconcileEditBy {
+		r.t.Errorf("UpsertKBDocument by %q, want %q", w.By, reconcileEditBy)
+	}
+	return r.Store.UpsertKBDocument(ctx, sc, w)
 }
 
-func (r *insertOnlyStore) UpdateKBAnnotations(context.Context, repository.KBScope, string,
-	func([]domain.KBAnnotation) ([]domain.KBAnnotation, error)) (*repository.KBDocument, error) {
-	return nil, r.wrote("UpdateKBAnnotations")
+func (r *insertOnlyStore) UpdateKBAnnotations(ctx context.Context, sc repository.KBScope, path string,
+	fn func([]domain.KBAnnotation) ([]domain.KBAnnotation, error)) (*repository.KBDocument, error) {
+	if !r.allowEdits {
+		return nil, r.wrote("UpdateKBAnnotations")
+	}
+	r.annUpdates.Add(1)
+	return r.Store.UpdateKBAnnotations(ctx, sc, path, fn)
 }
 
 // InsertKBDocumentIfMissing is the one write the reconciler may make: it
@@ -551,6 +571,239 @@ func TestAdoptable(t *testing.T) {
 	} {
 		if got := adoptable(tc.ix, started); got != tc.want {
 			t.Errorf("%s: adoptable = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// versionRows is path's kb_document_versions as version|change|changed_by|content.
+func versionRows(t *testing.T, sc Scope, path string) []string {
+	t.Helper()
+	rows, err := rawDB(t).Query(context.Background(), `SELECT v.version, v.change, v.changed_by, v.content
+		FROM kb_document_versions v JOIN kb_documents d ON d.id = v.document_id
+		WHERE d.scope_kind = $1 AND d.scope_id = $2 AND d.path = $3 ORDER BY v.version`, sc.Kind, sc.ID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var v int
+		var change, by, content string
+		if err := rows.Scan(&v, &change, &by, &content); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, fmt.Sprintf("%d|%s|%s|%s", v, change, by, content))
+	}
+	return out
+}
+
+// annotatedDoc writes path through s with one annotation, resolved, and
+// returns its row.
+func annotatedDoc(t *testing.T, s *Service, repo *repository.Repo, sc Scope, path, content string) *repository.KBDocument {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := s.WriteDoc(ctx, sc, path, "Doc", content, "me", []string{"a"}, "why", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AnnotateDoc(ctx, sc, path, "first note", "ann@x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ResolveAnnotation(ctx, sc, path, 0, true, "res@x"); err != nil {
+		t.Fatal(err)
+	}
+	return mustRow(t, repo, sc, path)
+}
+
+// An old pod (rolling deploy, or the old image after a rollback) edits a
+// doc that has a live row and adds an annotation: its entry has new content,
+// a newer updated_at and no kb_version. The reconciler copies the edit into
+// the row (the previous content stays in kb_document_versions), merges the
+// annotations, and re-indexes from the row instead of overwriting the edit.
+func TestReconcileAdoptsOldPodEdit(t *testing.T) {
+	s, repo, sc := backfilledKB(t)
+	ctx := context.Background()
+	row := annotatedDoc(t, s, repo, sc, "doc.md", "original content")
+	if row.Version != 1 || len(row.Annotations) != 1 || !row.Annotations[0].IsResolved {
+		t.Fatalf("setup row = v%d %+v", row.Version, row.Annotations)
+	}
+	other := annotatedDoc(t, s, repo, sc, "other.md", "untouched")
+
+	// The old pod read the doc from Typesense (it saw the note unresolved
+	// if its read predates the resolve), added a note and rewrote it.
+	seen := row.Annotations[0]
+	seen.IsResolved, seen.ResolvedBy, seen.ResolvedAt = false, "", 0
+	added := Annotation{Author: "old@x", Text: "note from the old pod", CreatedAt: row.UpdatedAt.Unix() + 1}
+	newer := row.UpdatedAt.Unix() + 2
+	oldPodWrite(t, s, sc, indexedDoc{path: "doc.md", title: "Doc v2", content: "koalaquill edited by an old pod",
+		author: "old@x", reason: "why", tags: []string{"a", "b"}, annotations: []Annotation{seen, added}, updatedAt: newer})
+
+	r, store := reconcilerStore(t, repo)
+	store.allowEdits = true
+	st := mustReconcile(t, r, sc)
+	if st.AdoptedEdits != 1 || st.Stale != 0 || st.Missing != 0 || st.Adopted != 0 || st.Failed != 0 {
+		t.Fatalf("stats = %+v, want 1 adopted edit and nothing else", st)
+	}
+	if u, a := store.upserts.Load(), store.annUpdates.Load(); u != 1 || a != 1 {
+		t.Errorf("upserts = %d, annotation updates = %d, want 1 and 1", u, a)
+	}
+
+	got := mustRow(t, repo, sc, "doc.md")
+	if got.Content != "koalaquill edited by an old pod" || got.Title != "Doc v2" || got.Author != "old@x" ||
+		!reflect.DeepEqual(got.Tags, []string{"a", "b"}) || got.Version != 2 {
+		t.Errorf("row = v%d %q %q %q %v, want the old pod's edit at v2", got.Version, got.Title, got.Author, got.Content, got.Tags)
+	}
+	wantAnns := []Annotation{row.Annotations[0], added} // the row's resolved state kept
+	if !reflect.DeepEqual(got.Annotations, wantAnns) {
+		t.Errorf("row annotations = %+v, want %+v", got.Annotations, wantAnns)
+	}
+	vers := versionRows(t, sc, "doc.md")
+	if len(vers) != 2 || vers[0] != "1|create|me|original content" ||
+		vers[1] != "2|update|"+reconcileEditBy+"|koalaquill edited by an old pod" {
+		t.Errorf("versions = %q, want the original at v1 and the edit at v2 by %s", vers, reconcileEditBy)
+	}
+	if o := mustRow(t, repo, sc, "other.md"); !reflect.DeepEqual(o, other) {
+		t.Errorf("other row changed: %+v", o)
+	}
+
+	// The entry is re-indexed from the row: kb_version, the new content,
+	// both annotations.
+	if v := indexedVersion(t, s, sc, "doc.md"); v != 2 {
+		t.Errorf("indexed kb_version = %d, want 2", v)
+	}
+	d, err := s.getIndexed(ctx, sc, "doc.md")
+	if err != nil || d.Content != got.Content || !reflect.DeepEqual(d.Annotations, wantAnns) || d.UpdatedAt != got.UpdatedAt.Unix() {
+		t.Errorf("indexed copy = %+v (err %v)", d, err)
+	}
+
+	// A second pass is a no-op.
+	before := rowsSnapshot(t, sc)
+	if st := mustReconcile(t, r, sc); st.AdoptedEdits != 0 || st.Fixed() != 0 || st.Failed != 0 {
+		t.Errorf("second pass = %+v, want nothing to do", st)
+	}
+	if u, a := store.upserts.Load(), store.annUpdates.Load(); u != 1 || a != 1 {
+		t.Errorf("after the second pass upserts = %d, annotation updates = %d, want still 1 and 1", u, a)
+	}
+	if after := rowsSnapshot(t, sc); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Errorf("second pass changed postgres:\nbefore %v\nafter  %v", before, after)
+	}
+}
+
+// Old code's annotate keeps the doc's updated_at, so an old pod's new
+// annotation leaves an entry dated the same second as its row. The note is
+// merged into the row; the content and version are left alone.
+func TestReconcileAdoptsOldPodAnnotation(t *testing.T) {
+	s, repo, sc := backfilledKB(t)
+	row := annotatedDoc(t, s, repo, sc, "doc.md", "content")
+	added := Annotation{Author: "old@x", Text: "annotated on the old image", CreatedAt: row.UpdatedAt.Unix() + 60}
+	oldPodWrite(t, s, sc, indexedDoc{path: "doc.md", title: row.Title, content: row.Content, author: row.Author,
+		reason: row.Reason, tags: row.Tags, annotations: append(slices.Clone(row.Annotations), added), updatedAt: row.UpdatedAt.Unix()})
+
+	r, store := reconcilerStore(t, repo)
+	store.allowEdits = true
+	st := mustReconcile(t, r, sc)
+	if st.AdoptedEdits != 1 || st.Stale != 0 || st.Failed != 0 {
+		t.Fatalf("stats = %+v, want 1 adopted edit", st)
+	}
+	if u, a := store.upserts.Load(), store.annUpdates.Load(); u != 0 || a != 1 {
+		t.Errorf("upserts = %d, annotation updates = %d, want 0 and 1", u, a)
+	}
+	got := mustRow(t, repo, sc, "doc.md")
+	if want := append(slices.Clone(row.Annotations), added); !reflect.DeepEqual(got.Annotations, want) {
+		t.Errorf("row annotations = %+v, want %+v", got.Annotations, want)
+	}
+	if got.Version != row.Version || !got.UpdatedAt.Equal(row.UpdatedAt) || got.Content != row.Content {
+		t.Errorf("row changed beyond its annotations: v%d %v", got.Version, got.UpdatedAt)
+	}
+	if v := indexedVersion(t, s, sc, "doc.md"); v != row.Version {
+		t.Errorf("indexed kb_version = %d, want %d", v, row.Version)
+	}
+	if st := mustReconcile(t, r, sc); st.AdoptedEdits != 0 || st.Fixed() != 0 {
+		t.Errorf("second pass = %+v, want nothing to do", st)
+	}
+	if a := store.annUpdates.Load(); a != 1 {
+		t.Errorf("annotation updates after the second pass = %d, want 1", a)
+	}
+}
+
+// Stale entries that are not an old pod's later edit are re-indexed from
+// the row and Postgres is not written (allowEdits is off, so any write fails
+// the test): one with no kb_version dated before its row (an index job
+// failed after a new-pod write), and one with a kb_version.
+func TestReconcileStaleEntriesNotOldPodEdits(t *testing.T) {
+	s, repo, sc := backfilledKB(t)
+	ctx := context.Background()
+	older := annotatedDoc(t, s, repo, sc, "older.md", "row content")
+	versioned := annotatedDoc(t, s, repo, sc, "versioned.md", "row content")
+	extra := Annotation{Author: "x@x", Text: "only in the entry", CreatedAt: 5}
+	oldPodWrite(t, s, sc, indexedDoc{path: "older.md", title: "Old title", content: "older entry content",
+		annotations: []Annotation{extra}, updatedAt: older.UpdatedAt.Unix() - 100})
+	if _, err := s.indexChunks(ctx, sc, indexedDoc{path: "versioned.md", title: "Other", content: "versioned entry content",
+		annotations: []Annotation{extra}, updatedAt: versioned.UpdatedAt.Unix() + 100, version: versioned.Version}); err != nil {
+		t.Fatal(err)
+	}
+	before := rowsSnapshot(t, sc)
+
+	r, store := reconcilerStore(t, repo)
+	st := mustReconcile(t, r, sc)
+	if st.Stale != 2 || st.AdoptedEdits != 0 || st.Failed != 0 {
+		t.Fatalf("stats = %+v, want 2 stale, no adopted edits", st)
+	}
+	if n := store.writes.Load(); n != 0 {
+		t.Errorf("%d refused writes", n)
+	}
+	if after := rowsSnapshot(t, sc); fmt.Sprint(after) != fmt.Sprint(before) {
+		t.Errorf("postgres changed:\nbefore %v\nafter  %v", before, after)
+	}
+	for _, row := range []*repository.KBDocument{older, versioned} {
+		d, err := s.getIndexed(ctx, sc, row.Path)
+		if err != nil || d.Content != row.Content || d.Title != row.Title || !reflect.DeepEqual(d.Annotations, row.Annotations) {
+			t.Errorf("%s indexed as %+v (err %v), want the row", row.Path, d, err)
+		}
+		if v := indexedVersion(t, s, sc, row.Path); v != row.Version {
+			t.Errorf("%s kb_version = %d, want %d", row.Path, v, row.Version)
+		}
+	}
+	if st := mustReconcile(t, r, sc); st.Fixed() != 0 || st.AdoptedEdits != 0 {
+		t.Errorf("second pass = %+v, want nothing to do", st)
+	}
+}
+
+func TestOldPodEdit(t *testing.T) {
+	row := indexState{key: "k", version: 2, updatedAt: 100}
+	for _, tc := range []struct {
+		name string
+		ix   indexState
+		want bool
+	}{
+		{"newer, no version", indexState{updatedAt: 101}, true},
+		{"same second, no version", indexState{updatedAt: 100}, true},
+		{"older, no version", indexState{updatedAt: 99}, false},
+		{"newer, has a version", indexState{updatedAt: 101, version: 2}, false},
+	} {
+		if got := oldPodEdit(tc.ix, row); got != tc.want {
+			t.Errorf("%s: oldPodEdit = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestMergeAnnotations(t *testing.T) {
+	a := Annotation{Author: "a", Text: "one", CreatedAt: 10, IsResolved: true, ResolvedBy: "r", ResolvedAt: 20}
+	aOpen := Annotation{Author: "a", Text: "one", CreatedAt: 10}
+	b := Annotation{Author: "b", Text: "two", CreatedAt: 5}
+	c := Annotation{Author: "c", Text: "three", CreatedAt: 30}
+	for _, tc := range []struct {
+		name       string
+		row, entry []Annotation
+		want       []Annotation
+	}{
+		{"row's resolved state wins", []Annotation{a}, []Annotation{aOpen}, []Annotation{a}},
+		{"union, oldest first", []Annotation{a, c}, []Annotation{aOpen, b}, []Annotation{b, a, c}},
+		{"nothing in the entry keeps the row", []Annotation{a}, nil, []Annotation{a}},
+		{"empty row", nil, []Annotation{c}, []Annotation{c}},
+		{"both empty", nil, nil, []Annotation{}},
+	} {
+		if got := mergeAnnotations(tc.row, tc.entry); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%s: %+v, want %+v", tc.name, got, tc.want)
 		}
 	}
 }

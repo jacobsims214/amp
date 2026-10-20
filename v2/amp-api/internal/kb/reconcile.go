@@ -6,10 +6,16 @@ package kb
 // down, a queue job lost), the doc is saved but missing or stale in search
 // until something re-indexes it. The reconciler is that something.
 //
-// It writes Typesense, and writes Postgres only to insert a row that is
-// missing (never an update or a delete):
+// It writes Typesense. It writes Postgres only to keep a change that exists
+// nowhere else, and never deletes a row:
 //   - a live row that the index lacks, or holds an older copy of, is
 //     re-indexed from the row (indexFromStore);
+//   - an entry an old (pre-Postgres) pod edited or annotated after the row
+//     was written (no kb_version, updated_at newer than the row's, or equal
+//     with annotations the row lacks; see oldPodEdit) is copied into the row
+//     first (UpsertKBDocument, so the previous content stays in
+//     kb_document_versions, and a union of the annotations), then
+//     re-indexed from it. This covers a rolling deploy and a rollback (#2027);
 //   - an index entry whose row is soft-deleted is removed;
 //   - an index entry with no row at all, written by an old pod during a
 //     rolling deploy (see adoptable), is copied into Postgres insert-only
@@ -26,10 +32,12 @@ package kb
 // one replica reconciles at a time.
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/typesense/typesense-go/v4/typesense/api"
@@ -50,6 +58,10 @@ const reconcileLockKey = "kb_reconcile"
 // copies in from an index-only entry.
 const reconcileAdoptBy = "kb-reconcile-adopt"
 
+// reconcileEditBy is the changed_by recorded when the reconciler copies an
+// old pod's edit of an existing doc into its row.
+const reconcileEditBy = "kb-reconcile-old-pod-edit"
+
 // adoptClockSlack allows for clock skew between the pod that wrote an
 // index-only entry (its updated_at is that pod's clock) and Postgres (the
 // backfill's started_at is NOW() there).
@@ -69,7 +81,11 @@ type ReconcileStats struct {
 	// IndexOnly counts index entries with no Postgres row at all that were
 	// not adopted (see adoptable). They are left in place and logged.
 	IndexOnly int
-	Failed    int // fixes that failed; retried by the next pass
+	// AdoptedEdits counts live rows that an old pod had edited or annotated
+	// in the index only: the edit was copied into the row (and the entry
+	// re-indexed from it) instead of being overwritten.
+	AdoptedEdits int
+	Failed       int // fixes that failed; retried by the next pass
 	// Skipped says why the KB was not reconciled ("" = it was).
 	Skipped string
 }
@@ -82,7 +98,7 @@ func (st ReconcileStats) Fixed() int { return st.Missing + st.Stale + st.Removed
 type indexState struct {
 	key       string // see stateKey
 	version   int    // 0 when the entry predates indexedVersionField
-	updatedAt int64  // unix seconds; set for index entries only
+	updatedAt int64  // unix seconds
 }
 
 // stateKey is everything an index entry carries about its row apart from
@@ -100,8 +116,9 @@ func stateKey(title, author, reason string, tags []string, anns []Annotation, up
 
 func rowState(d *repository.KBDocument) indexState {
 	return indexState{
-		key:     stateKey(d.Title, d.Author, d.Reason, d.Tags, d.Annotations, d.UpdatedAt.Unix()),
-		version: d.Version,
+		key:       stateKey(d.Title, d.Author, d.Reason, d.Tags, d.Annotations, d.UpdatedAt.Unix()),
+		version:   d.Version,
+		updatedAt: d.UpdatedAt.Unix(),
 	}
 }
 
@@ -125,7 +142,7 @@ func (s *Service) ReconcileAll(ctx context.Context) ([]ReconcileStats, error) {
 		return nil, fmt.Errorf("list backfilled KBs: %w", err)
 	}
 	out := make([]ReconcileStats, 0, len(scopes))
-	var fixed, adopted, failed, skipped int
+	var fixed, adopted, edits, failed, skipped int
 	for _, rs := range scopes {
 		if err := ctx.Err(); err != nil {
 			return out, err
@@ -141,13 +158,14 @@ func (s *Service) ReconcileAll(ctx context.Context) ([]ReconcileStats, error) {
 		}
 		fixed += st.Fixed()
 		adopted += st.Adopted
+		edits += st.AdoptedEdits
 		failed += st.Failed
 		if st.Skipped != "" {
 			skipped++
 		}
 		out = append(out, st)
 	}
-	s.log.Info("kb reconcile pass done", "kbs", len(scopes), "fixed", fixed, "adopted", adopted, "failed", failed, "skipped", skipped)
+	s.log.Info("kb reconcile pass done", "kbs", len(scopes), "fixed", fixed, "adopted", adopted, "adopted_edits", edits, "failed", failed, "skipped", skipped)
 	return out, nil
 }
 
@@ -196,14 +214,35 @@ func (s *Service) ReconcileKB(ctx context.Context, sc Scope) (ReconcileStats, er
 	}
 	st.Indexed = len(indexed)
 
-	var toIndex []string
+	var toIndex, edited []string
 	for path, want := range live {
 		ix, ok := indexed[path]
 		switch {
 		case !ok:
 			st.Missing++
 			toIndex = append(toIndex, path)
+		case !ix.current(want) && oldPodEdit(ix, want):
+			edited = append(edited, path)
 		case !ix.current(want):
+			st.Stale++
+			toIndex = append(toIndex, path)
+		}
+	}
+	for _, path := range edited {
+		if err := ctx.Err(); err != nil {
+			return st, err
+		}
+		switch adopted, err := s.adoptEdit(ctx, sc, path); {
+		case err != nil:
+			// Leave the entry alone: re-indexing it from the row would
+			// overwrite the edit this pass failed to save.
+			st.Failed++
+			s.log.Warn("kb reconcile: could not copy an old pod's edit into postgres; the next pass retries",
+				"kb", sc.String(), "path", path, "err", err)
+		case adopted:
+			st.AdoptedEdits++
+			toIndex = append(toIndex, path)
+		default:
 			st.Stale++
 			toIndex = append(toIndex, path)
 		}
@@ -254,10 +293,10 @@ func (s *Service) ReconcileKB(ctx context.Context, sc Scope) (ReconcileStats, er
 			s.log.Warn("kb reconcile: re-index failed", "kb", sc.String(), "path", path, "err", err)
 		}
 	}
-	if st.Fixed() > 0 || st.Adopted > 0 || st.Failed > 0 || st.IndexOnly > 0 {
+	if st.Fixed() > 0 || st.Adopted > 0 || st.AdoptedEdits > 0 || st.Failed > 0 || st.IndexOnly > 0 {
 		s.log.Info("kb reconciled", "kb", sc.String(), "live", st.Live, "indexed", st.Indexed,
 			"missing", st.Missing, "stale", st.Stale, "removed", st.Removed,
-			"adopted", st.Adopted, "index_only", st.IndexOnly, "failed", st.Failed)
+			"adopted", st.Adopted, "adopted_edits", st.AdoptedEdits, "index_only", st.IndexOnly, "failed", st.Failed)
 	}
 	return st, nil
 }
@@ -313,6 +352,112 @@ func (s *Service) adoptOrphans(ctx context.Context, sc Scope, orphans []string, 
 			"kb", sc.String(), "count", len(left), "first", left[0])
 	}
 	return again, nil
+}
+
+// oldPodEdit reports whether a stale index entry of a live row may hold an
+// edit or annotation that only an old (pre-Postgres) pod made, which
+// re-indexing from the row would destroy. New pods always index from the row
+// with its own updated_at and stamp kb_version, and backfilled entries carry
+// their row's updated_at, so an entry with no kb_version dated after its row
+// can only come from old code: a write (old WriteDoc dates it now) during a
+// rolling deploy or after a rollback. Old code's annotate keeps the doc's
+// updated_at, so an entry dated the same second as its row may hold new
+// annotations too; adoptEdit decides that by comparing them. An entry older
+// than its row is the normal stale case (an index job failed after a new
+// write) and is re-indexed from the row.
+func oldPodEdit(ix, row indexState) bool {
+	return ix.version == 0 && ix.updatedAt >= row.updatedAt
+}
+
+// adoptEdit copies an old pod's index-only edit of path into its live row:
+// the entry's content, title, tags, author and reason when the entry is
+// newer than the row (UpsertKBDocument, so the row's previous content stays
+// in kb_document_versions), and any annotations the entry has that the row
+// lacks (UpdateKBAnnotations, see mergeAnnotations). Both the row and the
+// entry are re-read, so a change since the listing is judged as it is now; a
+// new-pod write racing this one wins (ExpectVersion), and the entry is then
+// re-indexed from it. It reports whether anything was copied; false means
+// the entry is just stale and the caller re-indexes it from the row.
+func (s *Service) adoptEdit(ctx context.Context, sc Scope, path string) (bool, error) {
+	rs := storeScope(sc)
+	row, err := s.store.GetKBDocument(ctx, rs, path)
+	if errors.Is(err, repository.ErrNotFound) {
+		return false, nil // deleted since the listing: re-indexing removes the entry
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the row: %w", err)
+	}
+	entry, err := s.getIndexed(ctx, sc, path)
+	if isNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the index entry: %w", err)
+	}
+	rowUpdated := row.UpdatedAt.Unix()
+	if entry.UpdatedAt < rowUpdated {
+		return false, nil // the row moved on since the listing
+	}
+	var wrote bool
+	if entry.UpdatedAt > rowUpdated {
+		_, changed, err := s.store.UpsertKBDocument(ctx, rs, repository.KBDocWrite{
+			Path: path, Title: entry.Title, Tags: entry.Tags, Author: entry.Author, Reason: entry.Reason,
+			Content: entry.Content, By: reconcileEditBy, ExpectVersion: row.Version,
+		})
+		if errors.Is(err, repository.ErrConflict) {
+			return false, nil // a new write landed since the read; it wins
+		}
+		if err != nil {
+			return false, fmt.Errorf("save the edit: %w", err)
+		}
+		wrote = changed
+	}
+	added := 0
+	if len(mergeAnnotations(row.Annotations, entry.Annotations)) > len(kbAnnotationsOrEmpty(row.Annotations)) {
+		if _, err := s.store.UpdateKBAnnotations(ctx, rs, path, func(cur []Annotation) ([]Annotation, error) {
+			next := mergeAnnotations(cur, entry.Annotations)
+			added = len(next) - len(cur)
+			return next, nil
+		}); err != nil {
+			return false, fmt.Errorf("merge the annotations: %w", err)
+		}
+	}
+	if !wrote && added == 0 {
+		return false, nil
+	}
+	s.log.Info("kb reconcile: copied an old pod's edit into postgres instead of overwriting it",
+		"kb", sc.String(), "path", path, "entry_updated_at", entry.UpdatedAt, "row_updated_at", rowUpdated,
+		"content_saved", wrote, "annotations_added", added, "changed_by", reconcileEditBy)
+	return true, nil
+}
+
+// mergeAnnotations is the union of a row's annotations and an index entry's.
+// Annotations have no id, so one is identified by author, created_at and
+// text. The row's copy wins where both have it (its resolved state is kept),
+// none of the row's is removed, and the result stays oldest first.
+func mergeAnnotations(row, entry []Annotation) []Annotation {
+	type annKey struct {
+		author, text string
+		at           int64
+	}
+	out := slices.Clone(kbAnnotationsOrEmpty(row))
+	seen := make(map[annKey]bool, len(out))
+	for _, a := range out {
+		seen[annKey{a.Author, a.Text, a.CreatedAt}] = true
+	}
+	added := false
+	for _, a := range entry {
+		k := annKey{a.Author, a.Text, a.CreatedAt}
+		if !seen[k] {
+			seen[k] = true
+			out = append(out, a)
+			added = true
+		}
+	}
+	if added {
+		slices.SortStableFunc(out, func(a, b Annotation) int { return cmp.Compare(a.CreatedAt, b.CreatedAt) })
+	}
+	return out
 }
 
 // adoptable reports whether an index entry with no Postgres row is one the
