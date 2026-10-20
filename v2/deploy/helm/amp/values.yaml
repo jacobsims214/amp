@@ -126,6 +126,10 @@ oauth2Proxy:
   clientID: amp-ui
   # clientSecret is generated into a Secret by templates/secrets.yaml if not overridden
   cookieSecure: true
+  # When false (default), oauth2-proxy rejects logins whose Cognito `email_verified`
+  # is false — a Cognito 500. Flip to true on clusters that should accept
+  # unverified emails.
+  skipEmailVerified: false
   resources:
     requests: { cpu: 25m, memory: 32Mi }
     limits: { cpu: 200m, memory: 128Mi }
