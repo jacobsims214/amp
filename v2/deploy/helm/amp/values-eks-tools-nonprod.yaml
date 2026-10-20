@@ -197,3 +197,23 @@ ingress:
     backend:
       name: envoy
       port: 80
+
+## -------------------------------------------------------------------------
+## CERT-MANAGER (self-provisioning on this cluster)
+##
+## Flip ON so this overlay self-provisions cert-manager rather than relying on a
+## cluster-wide install (unlike values-production.yaml, which assumes a
+## pre-existing cluster-wide cert-manager). `installOperator` adds the
+## cluster-scoped operator (Namespace cert-manager, controller/cainjector/webhook
+## Deployments + RBAC and the cert-manager.io CRDs); `enabled` adds the
+## amp-namespaced internal CA + Dex-gRPC mTLS Issuer(s)/Certificate(s) from
+## templates/cert-issuers.yaml. global.tls.enabled stays false, so no public
+## Let's Encrypt cert is issued — only the internal mTLS layer is created.
+## (Cluster-scoped resources => the ArgoCD Application must add --allow-extra-
+## resources; see #273.)
+## -------------------------------------------------------------------------
+certmanager:
+  # Emit the amp-namespaced internal CA + Dex-gRPC mTLS Issuer(s)/Certificate(s).
+  enabled: true
+  # Also self-provision the cert-manager operator + CRDs (cluster-scoped).
+  installOperator: true
