@@ -189,6 +189,60 @@ type StatusInfo struct {
 	TotalAnnotations      int            `json:"total_annotations"`
 	UnresolvedAnnotations int            `json:"unresolved_annotations"`
 	DocsByTag             map[string]int `json:"docs_by_tag"`
+
+	// StoredDocs is the number of live Postgres rows (kb_documents), the
+	// source of truth for project, team and org KBs. Absent for the global
+	// KB and a service with no store, which keep docs in the index only
+	// (Note says so).
+	StoredDocs *int `json:"stored_docs,omitempty"`
+	// IndexedDocs is the number of docs (chunk-0 records) in the search
+	// index, counted by Typesense itself, so it is exact beyond one page.
+	// Absent when the index can't be reached; IndexError says why.
+	IndexedDocs *int   `json:"indexed_docs,omitempty"`
+	IndexError  string `json:"index_error,omitempty"`
+	// Backfill is the KB's one-time copy from Typesense into Postgres
+	// (kb_backfills). Absent where StoredDocs is.
+	Backfill *BackfillState `json:"backfill,omitempty"`
+	Note     string         `json:"note,omitempty"`
+}
+
+// Backfill states reported by KBStatus.
+const (
+	BackfillComplete   = "complete"    // completed_at is set: Postgres holds every doc
+	BackfillFailed     = "failed"      // the last attempt failed; the next startup retries
+	BackfillStarted    = "started"     // begun, not finished (running now, or the pod stopped)
+	BackfillNotStarted = "not_started" // no kb_backfills row yet
+)
+
+// BackfillState is a KB's backfill record, as KBStatus reports it. Times
+// are unix seconds, 0 (omitted) when unset.
+type BackfillState struct {
+	Status      string `json:"status"`
+	StartedAt   int64  `json:"started_at,omitempty"`
+	CompletedAt int64  `json:"completed_at,omitempty"`
+	DocCount    int    `json:"doc_count"`
+	LastError   string `json:"last_error,omitempty"`
+}
+
+// backfillStateOf turns a kb_backfills row (nil = none) into a BackfillState.
+func backfillStateOf(b *repository.KBBackfill) *BackfillState {
+	if b == nil {
+		return &BackfillState{Status: BackfillNotStarted}
+	}
+	st := &BackfillState{DocCount: b.DocCount, LastError: b.LastError}
+	if !b.StartedAt.IsZero() {
+		st.StartedAt = b.StartedAt.Unix()
+	}
+	switch {
+	case b.CompletedAt != nil:
+		st.Status = BackfillComplete
+		st.CompletedAt = b.CompletedAt.Unix()
+	case b.LastError != "":
+		st.Status = BackfillFailed
+	default:
+		st.Status = BackfillStarted
+	}
+	return st
 }
 
 // ---- Scopes ----
@@ -1067,6 +1121,10 @@ func (s *Service) ListTags(ctx context.Context, sc Scope) ([]TagCount, error) {
 // This is an idempotent, read-only operation that provides doc counts,
 // stale doc counts, annotation statistics, and tag distribution. A stored KB
 // counts from the same docs ListDocs returns; the global KB from the index.
+// It also reports durability: stored_docs (live Postgres rows), indexed_docs
+// (the index's own chunk-0 count) and the KB's backfill state. For a
+// backfilled KB in sync, stored_docs == indexed_docs; the reconciler closes
+// a gap on its next pass.
 func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
 	var docs []*Doc
 	if s.stored(sc) {
@@ -1112,9 +1170,20 @@ func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
 			st.DocsByTag[tag]++
 		}
 	}
+	s.indexedStatus(ctx, sc, st)
 	if s.stored(sc) {
+		// docs above came from storedRead, which marks a KB with no
+		// collection complete, so the backfill state is read after it.
+		if err := s.storedStatus(ctx, sc, st); err != nil {
+			return nil, err
+		}
 		// Counted from every doc above; the index's tag facets stop at 100.
 		return st, nil
+	}
+	if sc.Kind == ScopeGlobal {
+		st.Note = "stored_docs and backfill are not reported: the global KB (the AMP guide) is synced from the repo into the search index only, with no Postgres copy."
+	} else {
+		st.Note = "stored_docs and backfill are not reported: this server has no Postgres KB store, so the search index is the only copy."
 	}
 
 	// Get tag distribution from ListTags
@@ -1126,6 +1195,34 @@ func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
 		st.DocsByTag[tc.Tag] = tc.Count
 	}
 	return st, nil
+}
+
+// indexedStatus sets st.IndexedDocs from the index, or st.IndexError when
+// it can't be counted. Status stays readable while Typesense is down: a
+// stored KB's other numbers come from Postgres.
+func (s *Service) indexedStatus(ctx context.Context, sc Scope, st *StatusInfo) {
+	n, err := s.countIndexed(ctx, sc)
+	if err != nil {
+		st.IndexError = err.Error()
+		return
+	}
+	st.IndexedDocs = &n
+}
+
+// storedStatus sets st.StoredDocs (live Postgres rows) and st.Backfill.
+func (s *Service) storedStatus(ctx context.Context, sc Scope, st *StatusInfo) error {
+	rs := storeScope(sc)
+	n, err := s.store.CountKBDocuments(ctx, rs)
+	if err != nil {
+		return fmt.Errorf("count stored docs: %w", err)
+	}
+	st.StoredDocs = &n
+	b, err := s.store.GetKBBackfill(ctx, rs)
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return fmt.Errorf("backfill state: %w", err)
+	}
+	st.Backfill = backfillStateOf(b)
+	return nil
 }
 
 // ---- Delete ----
@@ -1633,6 +1730,7 @@ type Store interface {
 	StartKBBackfill(ctx context.Context, scope repository.KBScope) error
 	CompleteKBBackfill(ctx context.Context, scope repository.KBScope, docCount int) error
 	FailKBBackfill(ctx context.Context, scope repository.KBScope, msg string) error
+	GetKBBackfill(ctx context.Context, scope repository.KBScope) (*repository.KBBackfill, error)
 }
 
 var _ Store = (*repository.Repo)(nil)

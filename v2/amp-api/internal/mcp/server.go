@@ -812,7 +812,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		})), wrap(ctx, s.open(s.kbResolveAnnotation)))
 
 	mcp.AddTool(tool("amp_kb_status",
-		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution (project KB unless scope says otherwise). Use this to assess KB health before curator maintenance.",
+		"Get KB health metrics (project KB unless scope says otherwise): total_docs, stale_docs, docs_with_annotations, "+
+			"total_annotations, unresolved_annotations and docs_by_tag. Also durability: stored_docs (live docs in Postgres, "+
+			"the source of truth), indexed_docs (docs in the search index; index_error instead if it can't be reached) and "+
+			"backfill {status: complete|failed|started|not_started, started_at, completed_at, doc_count, last_error}. "+
+			"stored_docs equal to indexed_docs means search covers every doc. The global KB has no Postgres copy, so "+
+			"stored_docs and backfill are absent there (note says why). Use this to assess KB health before curator maintenance.",
 		kbArgs(nil)), wrap(ctx, s.open(s.kbStatus)))
 }
 
