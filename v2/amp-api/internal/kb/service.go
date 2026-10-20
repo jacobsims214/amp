@@ -1300,6 +1300,33 @@ func (s *Service) RestoreDoc(ctx context.Context, sc Scope, path, by string) (*D
 	return docFromRow(sc, d), nil
 }
 
+// DeletedDoc is a doc in a KB's trash, restorable with RestoreDoc.
+type DeletedDoc struct {
+	Path      string   `json:"path"`
+	Title     string   `json:"title"`
+	Tags      []string `json:"tags"`
+	DeletedAt int64    `json:"deleted_at"` // unix seconds
+	DeletedBy string   `json:"deleted_by"`
+}
+
+// ListDeletedDocs lists a stored KB's docs in the trash that RestoreDoc can
+// still bring back (deleted less than 30 days ago), most recently deleted
+// first. The global KB keeps no deleted docs, so it is an error.
+func (s *Service) ListDeletedDocs(ctx context.Context, sc Scope) ([]DeletedDoc, error) {
+	if !s.stored(sc) {
+		return nil, fmt.Errorf("deleted docs of the %s KB are not kept", sc.Kind)
+	}
+	rows, err := s.store.ListDeletedKBDocuments(ctx, storeScope(sc))
+	if err != nil {
+		return nil, fmt.Errorf("list the deleted docs of %s: %w", sc, err)
+	}
+	out := make([]DeletedDoc, 0, len(rows))
+	for _, d := range rows {
+		out = append(out, DeletedDoc{Path: d.Path, Title: d.Title, Tags: d.Tags, DeletedAt: d.DeletedAt.Unix(), DeletedBy: d.DeletedBy})
+	}
+	return out, nil
+}
+
 // deleteDocNow performs the actual Typesense deletion. Called either
 // directly or by the asynq worker via HandleDeleteDocTask.
 func (s *Service) deleteDocNow(ctx context.Context, sc Scope, path string) error {
@@ -1721,6 +1748,7 @@ type Store interface {
 	CountKBDocuments(ctx context.Context, scope repository.KBScope) (int, error)
 	ListKBDocuments(ctx context.Context, scope repository.KBScope, limit, offset int) ([]repository.KBDocument, error)
 	ListDeletedKBPaths(ctx context.Context, scope repository.KBScope) ([]string, error)
+	ListDeletedKBDocuments(ctx context.Context, scope repository.KBScope) ([]repository.KBDeletedDoc, error)
 	StreamKBDocuments(ctx context.Context, scope repository.KBScope, fn func(repository.KBDocument) error) error
 	IsKBBackfillComplete(ctx context.Context, scope repository.KBScope) (bool, error)
 	DeleteKBDocument(ctx context.Context, scope repository.KBScope, path, by string) error

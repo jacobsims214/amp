@@ -778,6 +778,20 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"path": str("REQUIRED. Document path to delete."),
 		})), wrap(ctx, s.open(s.kbDelete)))
 
+	mcp.AddTool(tool("amp_kb_list_deleted",
+		"List a knowledge base's deleted documents that can still be restored (project KB unless scope says otherwise): "+
+			"docs deleted in the last 30 days, with path, title, deleted_at and deleted_by, most recently deleted first. "+
+			"Restore one with amp_kb_restore. Needs write access to that KB, the same as amp_kb_delete.",
+		kbArgs(nil)), wrap(ctx, s.open(s.kbListDeleted)))
+
+	mcp.AddTool(tool("amp_kb_restore",
+		"Bring a knowledge base document back from the KB trash by its path (project KB unless scope says otherwise), with "+
+			"the content, title, tags and annotations it had; it is readable and searchable again. Works for docs removed in the "+
+			"last 30 days; list the KB trash first to find the path. Needs write access to that KB, the same as amp_kb_delete.",
+		kbArgs(props{
+			"path": str("REQUIRED. Path of the document in the trash, e.g. 'architecture/auth.md'."),
+		})), wrap(ctx, s.open(s.kbRestore)))
+
 	mcp.AddTool(tool("amp_kb_tags",
 		"List all tags used in a knowledge base (project KB unless scope says otherwise) with document counts.",
 		kbArgs(nil)), wrap(ctx, s.open(s.kbTags)))
@@ -2577,6 +2591,44 @@ func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mc
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"deleted": true, "path": path, "kb": k})
+}
+
+func (s *Server) kbListDeleted(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	docs, err := s.kb.ListDeletedDocs(ctx, k.Scope)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"kb": k, "docs": docs, "count": len(docs)})
+}
+
+func (s *Server) kbRestore(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
+	if err != nil {
+		return nil, err
+	}
+	path, err := reqStr(args, "path")
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(strings.TrimPrefix(path, "/"), domain.DesignSystemPrefix) {
+		return nil, fmt.Errorf("design-system/ docs are only written by publishing a design system version (amp_design_system_publish), " +
+			"so they always come from phases a person approved; to change them, start a new version with amp_design_system_start")
+	}
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	doc, err := s.kb.RestoreDoc(ctx, k.Scope, path, authorOf(ctx, nil))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"restored": true, "kb": k, "doc": doc})
 }
 
 func (s *Server) kbTags(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

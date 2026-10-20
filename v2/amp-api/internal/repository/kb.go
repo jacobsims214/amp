@@ -291,6 +291,46 @@ func (r *Repo) ListDeletedKBPaths(ctx context.Context, scope KBScope) ([]string,
 	return out, rows.Err()
 }
 
+// KBDeletedDoc is a doc in a KB's trash: what a trash listing shows.
+type KBDeletedDoc struct {
+	Path      string
+	Title     string
+	Tags      []string
+	DeletedAt time.Time
+	DeletedBy string
+}
+
+// ListDeletedKBDocuments lists a KB's docs in the trash that can still be
+// restored (deleted less than TrashRetention ago; the purge removes older
+// ones), most recently deleted first. It includes docs a whole-KB drop
+// trashed (deleted_by "kb-drop").
+func (r *Repo) ListDeletedKBDocuments(ctx context.Context, scope KBScope) ([]KBDeletedDoc, error) {
+	if err := scope.validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, `SELECT path, title, tags, deleted_at, COALESCE(deleted_by, '')
+		FROM kb_documents
+		WHERE scope_kind = $1 AND scope_id = $2
+		  AND deleted_at IS NOT NULL AND deleted_at > NOW() - INTERVAL '`+TrashRetention+`'
+		ORDER BY deleted_at DESC, path`, scope.Kind, scope.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []KBDeletedDoc{}
+	for rows.Next() {
+		var d KBDeletedDoc
+		if err := rows.Scan(&d.Path, &d.Title, &d.Tags, &d.DeletedAt, &d.DeletedBy); err != nil {
+			return nil, err
+		}
+		if d.Tags == nil {
+			d.Tags = []string{}
+		}
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
 // DeleteKBDocument soft-deletes a live doc and records a 'delete' version.
 // A doc that is missing or already deleted is ErrNotFound.
 func (r *Repo) DeleteKBDocument(ctx context.Context, scope KBScope, path, by string) error {

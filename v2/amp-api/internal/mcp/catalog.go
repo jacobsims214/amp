@@ -121,6 +121,8 @@ var toolCatalog = map[string]toolInfo{
 	"amp_kb_list":               {title: "List KB docs", keywords: "list knowledge base documents", readOnly: true},
 	"amp_kb_write":              {title: "Write KB doc", keywords: "create or update a knowledge base document, save a finding", idempotent: true},
 	"amp_kb_delete":             {title: "Delete KB doc", destructive: true},
+	"amp_kb_list_deleted":       {title: "List deleted KB docs", keywords: "KB trash, deleted knowledge base documents, recover a doc deleted by mistake", readOnly: true},
+	"amp_kb_restore":            {title: "Restore KB doc", keywords: "undelete a knowledge base document from the KB trash"},
 	"amp_kb_annotate":           {title: "Annotate KB doc", keywords: "add a correction or note to a doc"},
 	"amp_kb_resolve_annotation": {title: "Resolve KB annotation", idempotent: true},
 	"amp_kb_status":             {title: "KB health", keywords: "stale docs, annotations, tag counts, stored vs indexed docs, backfill", readOnly: true},

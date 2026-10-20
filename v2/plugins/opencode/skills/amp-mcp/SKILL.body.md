@@ -28,8 +28,9 @@ one feature with no obvious entry point — scheduling.
 - **Daily reports**: `amp_day_report`, `amp_save_day_report`, `amp_list_day_reports`, `amp_velocity` — see the `amp-day-report` skill
 - **Metadata**: `metadata` on the create/update tools for projects, epics, stories, and tasks; `amp_find_by_metadata`
 - **Platform admin** (org owners/admins, team leads, global admins): `amp_list_orgs`, `amp_manage_org_members`, `amp_manage_teams`, `amp_manage_team_members`, `amp_manage_invites`, `amp_manage_project_teams`
-- **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status`, `amp_kb_reindex` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
+- **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_list_deleted`, `amp_kb_restore`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status`, `amp_kb_reindex` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
 - **`amp_kb_reindex`**: rebuilds a KB's search index by re-embedding every document. Use it when search looks broken: scores far above 1, results that match only on keywords, or a doc that `amp_kb_get` reads but `amp_kb_search` never finds. It runs in the background and returns at once (search again in a minute), doesn't change documents, and needs write access to that KB, like `amp_kb_write`
+- **`amp_kb_list_deleted` / `amp_kb_restore`**: a deleted KB doc stays in the KB's trash for 30 days. `amp_kb_list_deleted` lists them (path, title, deleted_at, deleted_by); `amp_kb_restore` brings one back by path with its content, tags and annotations, readable and searchable again. Both need write access to that KB, like `amp_kb_delete`, and refuse the global KB
 
 ---
 
