@@ -1,0 +1,22 @@
+# Ambient-mesh Namespace.
+#
+# Emitted ONLY when namespace.enabled is true (values.yaml default: false), so
+# the base chart renders no extra resource and stays portable across any
+# cluster / ingress setup. When enabled, the Namespace carries the istio.io
+# ambient labels from namespace.labels (the mandatory
+# istio.io/dataplane-mode: ambient label, plus the optional istio.io/rev pin).
+# The EKS / rp-tools-nonprod overlay (values-eks-tools-nonprod.yaml) flips this
+# ON and supplies those labels.
+#
+# NOTE: this creates no Gateway / VirtualService / DestinationRule — the
+# ambient mesh already provides a shared Gateway (see ingress.httpRoute).
+{{- if .Values.namespace.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.global.namespace }}
+  {{- if .Values.namespace.labels }}
+  labels:
+    {{- toYaml .Values.namespace.labels | nindent 4 }}
+  {{- end }}
+{{- end }}

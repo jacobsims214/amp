@@ -218,3 +218,69 @@ asynqmonGate:
 postInstall:
   # Pulls the embedding model into Ollama after it's up — replaces `make kb-setup`.
   pullEmbeddingModel: true
+
+## -------------------------------------------------------------------------
+## AMBIENT-MESH NAMESPACE + INGRESS (Gateway API HTTPRoute)
+##
+## Both gates are OFF by default so the base chart renders NOTHING new here —
+## the chart stays portable across any cluster/ingress (Talos, docker-desktop,
+## etc.). The EKS / rp-tools-nonprod overlay (values-eks-tools-nonprod.yaml)
+## flips these ON and supplies the concrete istio.io labels, hostnames,
+## parentRefs, and backend. The shared ambient Gateway (rp-ingress) already
+## exists, so these templates create NO Gateway/VirtualService/DestinationRule.
+## -------------------------------------------------------------------------
+namespace:
+  # When true, emit a Namespace labelled for the Istio ambient mesh.
+  enabled: false
+  labels:
+    istio.io/dataplane-mode: ambient
+    # Optional: pin the exact ambient mesh revision. Leave absent to let the
+    # ambient control plane choose; the nonprod overlay sets istio.io/rev: rapid.
+    # istio.io/rev: rapid
+
+ingress:
+  httpRoute:
+    # When true, emit a single Gateway API HTTPRoute (named "amp") pointing at
+    # the shared ambient Gateway. Off by default — nothing is rendered.
+    enabled: false
+    # Hostnames the HTTPRoute binds to. Renders cleanly even when empty
+    # (the field is omitted). Default is the nonprod host; the overlay overrides.
+    hostnames:
+      - amp.rp-tools-nonprod.rvohealth.com
+    # The shared ambient Gateway to attach to (GatewayObjectReference list).
+    parentRefs:
+      - name: rp-ingress
+        namespace: istio-ingress
+    # Where the route sends traffic: the in-cluster Envoy Service on its HTTP
+    # port (envoy:80 once TLS is terminated at the edge).
+    backend:
+      name: envoy
+      port: 80
+
+## -------------------------------------------------------------------------
+## CERT-MANAGER (self-provisioning, scoped to amp's own namespace)
+##
+## Both gates are OFF by default so the base chart renders NOTHING cert-manager
+## related — the chart stays portable across any cluster (Talos, docker-desktop,
+## etc.) that may or may not already run cert-manager. The EKS / rp-tools-nonprod
+## overlay (values-eks-tools-nonprod.yaml) flips these ON.
+##
+## certmanager.enabled
+##   Emit the amp-namespaced internal CA + the Dex-gRPC mTLS Issuer(s)/
+##   Certificate(s) from templates/cert-issuers.yaml (scoped to global.namespace,
+##   i.e. amp). global.tls.enabled stays false: ALB/NLB terminates PUBLIC TLS,
+##   so no public Let's Encrypt cert is issued.
+## certmanager.installOperator
+##   ALSO self-provision the cert-manager operator + CRDs
+##   (templates/cert-manager-operator.yaml). These are inherently CLUSTER-SCOPED
+##   (Namespace cert-manager, the controller Deployment/RBAC, and the CRDs), so
+##   the ArgoCD Application that applies this chart must add --allow-extra-
+##   resources to its syncOptions (see #273). NOTE: the operator is owned by the
+##   amp release — if the platform later installs its own cert-manager this is
+##   drift (acceptable for a self-contained nonprod deploy).
+## -------------------------------------------------------------------------
+certmanager:
+  # Emit the amp-namespaced internal CA + Dex-gRPC mTLS Issuer(s)/Certificate(s).
+  enabled: false
+  # Also self-provision the cert-manager operator + CRDs (cluster-scoped).
+  installOperator: false

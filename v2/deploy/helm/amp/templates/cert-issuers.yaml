@@ -1,4 +1,7 @@
-# ---- Internal CA (always present, independent of public TLS mode) ----
+{{- if .Values.certmanager.enabled }}
+# ---- Internal CA + Dex-gRPC mTLS (only when certmanager.enabled) ----
+# Emitted ONLY when certmanager.enabled is true (values.yaml default: false),
+# so the base chart renders no internal-CA resources and stays portable.
 # Used for service-to-service mTLS inside the cluster (Dex's gRPC admin API)
 # used by amp-authadmin/amp-mcpoauth. This has nothing to do with whether
 # Envoy itself terminates public TLS — e.g. in a deployment where an
@@ -79,6 +82,8 @@ spec:
   duration: 2160h
   renewBefore: 360h
 ---
+{{- end }}
+
 {{- if .Values.global.tls.enabled }}
 # ---- Public-facing Envoy TLS (only when Envoy itself terminates TLS) ----
 # Skipped entirely when global.tls.enabled=false, e.g. when an upstream

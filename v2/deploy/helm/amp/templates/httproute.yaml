@@ -1,0 +1,38 @@
+# Gateway-API HTTPRoute (Istio ambient mesh).
+#
+# Emitted ONLY when ingress.httpRoute.enabled is true (values.yaml default:
+# false), so the base chart renders no extra resource and stays portable.
+# When enabled it creates a single HTTPRoute named "amp" in global.namespace
+# that attaches to the SHARED ambient Gateway (rp-ingress) via parentRefs.
+#
+# Hard constraints: NO Gateway, NO VirtualService, NO DestinationRule are
+# created here — the shared Gateway already exists and TLS is terminated at the
+# edge. DNS is managed at the edge, so external-dns is explicitly inert on the
+# HTTPRoute. The EKS / rp-tools-nonprod overlay flips enabled: true and supplies
+# the concrete hostnames, parentRefs, and backend (values-eks-tools-nonprod.yaml).
+{{- if .Values.ingress.httpRoute.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: amp
+  namespace: {{ .Values.global.namespace }}
+  annotations:
+    # external-dns is kept inert: DNS is managed at the gateway/edge (ALB/NLB
+    # terminates TLS). This annotation stops external-dns from creating records
+    # for the HTTPRoute.
+    external-dns.alpha.kubernetes.io/ignore: "true"
+spec:
+  {{- if .Values.ingress.httpRoute.hostnames }}
+  hostnames:
+    {{- toYaml .Values.ingress.httpRoute.hostnames | nindent 4 }}
+  {{- end }}
+  parentRefs:
+    {{- toYaml .Values.ingress.httpRoute.parentRefs | nindent 4 }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        {{- toYaml (list (dict "name" .Values.ingress.httpRoute.backend.name "port" .Values.ingress.httpRoute.backend.port)) | nindent 8 }}
+{{- end }}
