@@ -420,4 +420,9 @@ amp_kb_annotate {project_id, path, text, author?}
 
 amp_kb_resolve_annotation {project_id, path, index, resolved?}
   → marks annotation `index` (0-based, oldest first) resolved, or reopens it with resolved=false
+
+amp_kb_reindex {project_id}
+  → re-embeds every doc in the background (needs KB write access); search again in a minute
+  Use when search looks broken: scores far above 1, keyword-only matches, or a doc
+  amp_kb_get reads but amp_kb_search never finds
 ```
