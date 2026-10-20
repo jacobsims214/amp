@@ -194,6 +194,9 @@ func main() {
 		envOrDefault("OLLAMA_URL", "http://localhost:11434"),
 		envOrDefault("OLLAMA_MODEL", "nomic-embed-text"),
 	)
+	// Postgres is the source of truth for project, team and org KB docs;
+	// Typesense is their search index (decisions/kb-postgres-source-of-truth.md).
+	kbSvc.SetStore(repo)
 
 	// ---- 4b. KB indexing queue (Valkey/Redis via asynq) ----
 	// Optional: if REDIS_ADDR is unset (e.g. local `make dev` without
@@ -222,6 +225,7 @@ func main() {
 		mux := asynq.NewServeMux()
 		mux.HandleFunc(queue.TypeKBWriteDoc, kbSvc.HandleWriteDocTask)
 		mux.HandleFunc(queue.TypeKBDeleteDoc, kbSvc.HandleDeleteDocTask)
+		mux.HandleFunc(queue.TypeKBIndexDoc, kbSvc.HandleIndexDocTask)
 		if err := asynqWorker.Start(mux); err != nil {
 			slog.Error("failed to start asynq worker", "err", err)
 			os.Exit(1)

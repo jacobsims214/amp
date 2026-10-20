@@ -133,7 +133,8 @@ func insertKBVersion(ctx context.Context, tx pgx.Tx, d *KBDocument, change, by s
 // content, title or tags change, and only those writes move updated_at. A
 // change to only author or reason updates the row without a version and
 // keeps updated_at, so metadata touches don't make an old doc look new; an
-// identical write changes nothing. changed reports whether the row was
+// identical write changes nothing. Reviving a deleted doc clears its
+// annotations: they were notes on the deleted doc, not on the new one. changed reports whether the row was
 // written at all.
 func (r *Repo) UpsertKBDocument(ctx context.Context, scope KBScope, w KBDocWrite) (doc *KBDocument, changed bool, err error) {
 	if err := scope.validate(); err != nil {
@@ -192,8 +193,9 @@ func (r *Repo) UpsertKBDocument(ctx context.Context, scope KBScope, w KBDocWrite
 	updated := &KBDocument{}
 	if err := scanKBDocument(tx.QueryRow(ctx, `UPDATE kb_documents SET title = $2, tags = $3, author = $4, reason = $5,
 		content = $6, version = $7, updated_at = CASE WHEN $8 THEN NOW() ELSE updated_at END,
+		annotations = CASE WHEN $9 THEN '[]'::jsonb ELSE annotations END,
 		deleted_at = NULL, deleted_by = NULL
-		WHERE id = $1 RETURNING `+kbDocCols, d.ID, w.Title, tags, w.Author, w.Reason, w.Content, next, versioned), updated); err != nil {
+		WHERE id = $1 RETURNING `+kbDocCols, d.ID, w.Title, tags, w.Author, w.Reason, w.Content, next, versioned, revive), updated); err != nil {
 		return nil, false, err
 	}
 	if versioned {

@@ -32,6 +32,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/queue"
+	"github.com/simstech/amp-api/internal/repository"
 )
 
 // Service is the KB business logic layer.
@@ -43,6 +44,12 @@ type Service struct {
 	ollamaModel  string
 	log          *slog.Logger
 	queueClient  *asynq.Client // nil = write/delete synchronously; set via SetQueueClient
+
+	// store holds project, team and org docs in Postgres, the source of
+	// truth (decisions/kb-postgres-source-of-truth.md); Typesense is only
+	// their search index. nil (tools and tests without Postgres) keeps the
+	// old Typesense-only behaviour. The global KB never uses it.
+	store Store
 
 	// Reindex is single-flight per KB: reindexing marks the collections
 	// being reindexed in this process, and reindexLock (optional, set via
@@ -291,8 +298,14 @@ func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
 // ---- Write ----
 
 // WriteDoc upserts a document into the KB.
+// For project, team and org KBs with a store set, the doc is committed to
+// Postgres first and then indexed from the committed row (queued, or now
+// without a queue); an indexing failure after the commit is logged and the
+// saved doc is still returned. The global KB (and a service with no store)
+// is written to Typesense only.
 // The doc is chunked automatically; Typesense generates embeddings via Ollama.
-// On subsequent writes to the same path, all old chunks are deleted and new ones inserted.
+// A rewrite upserts the new chunks, then deletes chunks the new version no
+// longer has.
 //
 // reason says why a doc belongs in a team or org KB; it is stored with the doc.
 //
@@ -302,6 +315,9 @@ func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
 func (s *Service) WriteDoc(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
 	if tags == nil {
 		tags = []string{}
+	}
+	if s.stored(sc) {
+		return s.writeStored(ctx, sc, path, title, content, author, tags, reason, annotations)
 	}
 
 	// Deterministic — computed the same way whether we write now or later,
@@ -360,77 +376,31 @@ func annotationsJSON(anns []Annotation) string {
 // directly (no queue configured — local dev without Valkey, or enqueue
 // itself failed) or by the asynq worker via HandleWriteDocTask.
 func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
-	if err := s.ensureCollection(ctx, sc); err != nil {
-		return nil, err
-	}
-
-	col := collectionName(sc)
 	now := time.Now().Unix()
-
 	if tags == nil {
 		tags = []string{}
 	}
 
-	// A rewrite keeps the doc's annotations: read them before the old
-	// chunks go.
+	// A rewrite keeps the doc's annotations. Only a doc that isn't there
+	// has none: any other read error stops the write rather than dropping
+	// them.
 	if len(annotations) == 0 {
-		if old, err := s.GetDoc(ctx, sc, path); err == nil {
+		old, err := s.GetDoc(ctx, sc, path)
+		switch {
+		case err == nil:
 			annotations = old.Annotations
+		case !isNotFound(err):
+			return nil, fmt.Errorf("read annotations of %s before rewriting it: %w", path, err)
 		}
 	}
-	annJSON := "[]"
-	if len(annotations) > 0 {
-		b, err := json.Marshal(annotations)
-		if err != nil {
-			return nil, fmt.Errorf("encode annotations of %s: %w", path, err)
-		}
-		annJSON = string(b)
+	chunks, err := s.indexChunks(ctx, sc, indexedDoc{
+		path: path, title: title, content: content, author: author, tags: tags, reason: reason,
+		annotations: annotations, updatedAt: now,
+	})
+	if err != nil {
+		return nil, err
 	}
-	annCount, annLatest := len(annotations), getLatestAnnotation(annotations)
-
-	// Delete existing chunks for this path before inserting new ones.
-	_ = s.deleteByPath(ctx, col, path)
-
-	// Chunk the content.
-	chunks := chunkMarkdown(content, 500) // ~500 tokens per chunk
-	if len(chunks) == 0 {
-		chunks = []string{content}
-	}
-
-	// Index each chunk via Upsert (create-or-update by id).
-	for i, chunk := range chunks {
-		doc := map[string]interface{}{
-			"id":          docID(sc, path, i),
-			"project_id":  sc.projectID(),
-			"reason":      reason,
-			"path":        path,
-			"title":       title,
-			"tags":        tags,
-			"author":      author,
-			"chunk_index": i,
-			"chunk_text":  chunk,
-			"updated_at":  now,
-			// Every chunk carries the count and latest annotation so any
-			// search hit shows them; the annotations live on chunk 0.
-			"annotation_count":  annCount,
-			"latest_annotation": annLatest,
-			"annotations":       "[]",
-		}
-		// Only store the full content and annotations on the first chunk.
-		if i == 0 {
-			doc["content"] = content
-			doc["annotations"] = annJSON
-		} else {
-			doc["content"] = ""
-		}
-
-		_, err := s.client.Collection(col).Documents().Upsert(ctx, doc, &api.DocumentIndexParameters{})
-		if err != nil {
-			return nil, fmt.Errorf("index chunk %d of %s: %w", i, path, err)
-		}
-	}
-
-	s.log.Info("doc written", "kb", sc.String(), "path", path, "chunks", len(chunks))
+	s.log.Info("doc written", "kb", sc.String(), "path", path, "chunks", chunks)
 
 	return &DocSummary{
 		ID:        docID(sc, path, 0),
@@ -466,15 +436,23 @@ func (s *Service) GetDoc(ctx context.Context, sc Scope, path string) (*Doc, erro
 // The upsert only updates the annotations field on chunk_index=0.
 // Typesense will merge the fields.
 func (s *Service) AnnotateDoc(ctx context.Context, sc Scope, path, text, author string) (*Annotation, error) {
-	doc, err := s.GetDoc(ctx, sc, path)
-	if err != nil {
-		return nil, err
-	}
 	ann := &Annotation{
 		Author:     author,
 		Text:       text,
 		CreatedAt:  time.Now().Unix(),
 		IsResolved: false,
+	}
+	if s.stored(sc) {
+		if _, err := s.updateStoredAnnotations(ctx, sc, path, func(anns []Annotation) ([]Annotation, error) {
+			return append(anns, *ann), nil
+		}); err != nil {
+			return nil, err
+		}
+		return ann, nil
+	}
+	doc, err := s.GetDoc(ctx, sc, path)
+	if err != nil {
+		return nil, err
 	}
 	doc.Annotations = append(doc.Annotations, *ann)
 	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
@@ -488,24 +466,37 @@ func (s *Service) AnnotateDoc(ctx context.Context, sc Scope, path, text, author 
 // the doc's annotations, oldest first, as amp_kb_get returns them;
 // annotations are only ever appended, so positions don't change.
 func (s *Service) ResolveAnnotation(ctx context.Context, sc Scope, path string, index int, resolved bool, by string) (*Doc, error) {
+	if s.stored(sc) {
+		return s.updateStoredAnnotations(ctx, sc, path, func(anns []Annotation) ([]Annotation, error) {
+			return anns, resolveAt(anns, path, index, resolved, by)
+		})
+	}
 	doc, err := s.GetDoc(ctx, sc, path)
 	if err != nil {
 		return nil, err
 	}
-	if index < 0 || index >= len(doc.Annotations) {
-		return nil, fmt.Errorf("%s has %d annotations; index %d is out of range (0-based, oldest first)", path, len(doc.Annotations), index)
+	if err := resolveAt(doc.Annotations, path, index, resolved, by); err != nil {
+		return nil, err
 	}
-	a := &doc.Annotations[index]
+	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
+		return nil, fmt.Errorf("resolve annotation on %s: %w", path, err)
+	}
+	return doc, nil
+}
+
+// resolveAt marks anns[index] resolved by by, or reopens it.
+func resolveAt(anns []Annotation, path string, index int, resolved bool, by string) error {
+	if index < 0 || index >= len(anns) {
+		return fmt.Errorf("%s has %d annotations; index %d is out of range (0-based, oldest first)", path, len(anns), index)
+	}
+	a := &anns[index]
 	a.IsResolved = resolved
 	if resolved {
 		a.ResolvedBy, a.ResolvedAt = by, time.Now().Unix()
 	} else {
 		a.ResolvedBy, a.ResolvedAt = "", 0
 	}
-	if err := s.saveAnnotations(ctx, sc, doc); err != nil {
-		return nil, fmt.Errorf("resolve annotation on %s: %w", path, err)
-	}
-	return doc, nil
+	return nil
 }
 
 // saveAnnotations stores doc's annotations on its first chunk and the
@@ -993,8 +984,26 @@ func (s *Service) HandleWriteDocTask(ctx context.Context, t *asynq.Task) error {
 			return fmt.Errorf("unmarshal write_doc annotations: %w", err)
 		}
 	}
-	_, err := s.writeDocNow(ctx, payloadScope(p.Scope, p.ScopeID, p.ProjectID), p.Path, p.Title, p.Content, p.Author, p.Tags, p.Reason, anns)
+	sc := payloadScope(p.Scope, p.ScopeID, p.ProjectID)
+	if s.stored(sc) {
+		return s.drainLegacyWrite(ctx, sc, p, anns)
+	}
+	_, err := s.writeDocNow(ctx, sc, p.Path, p.Title, p.Content, p.Author, p.Tags, p.Reason, anns)
 	return err
+}
+
+// HandleIndexDocTask runs a kb:index_doc job: it indexes the doc's current
+// Postgres row, or removes the doc from the index if the row is gone.
+func (s *Service) HandleIndexDocTask(ctx context.Context, t *asynq.Task) error {
+	var p queue.IndexDocPayload
+	if err := json.Unmarshal(t.Payload(), &p); err != nil {
+		return fmt.Errorf("unmarshal index_doc payload: %w", err)
+	}
+	sc := payloadScope(p.Scope, p.ScopeID, p.ProjectID)
+	if !s.stored(sc) {
+		return fmt.Errorf("index_doc for %s: this KB is not stored in Postgres", sc)
+	}
+	return s.indexFromStore(ctx, sc, p.Path)
 }
 
 func (s *Service) HandleDeleteDocTask(ctx context.Context, t *asynq.Task) error {
@@ -1115,6 +1124,9 @@ func (s *Service) runReindex(ctx context.Context, sc Scope) error {
 // collection when rebuild is set. Docs (with their annotations) are read
 // before anything is dropped and written back explicitly.
 func (s *Service) reindex(ctx context.Context, sc Scope, rebuild bool) error {
+	if s.stored(sc) {
+		return s.reindexFromStore(ctx, sc, rebuild)
+	}
 	col := collectionName(sc)
 
 	// Snapshot full doc content BEFORE any possible drop+recreate below —
@@ -1206,6 +1218,411 @@ func (s *Service) SearchAPIKey() string { return s.typesenseKey }
 
 // TypesenseURL returns the Typesense URL for the frontend direct search.
 func (s *Service) TypesenseURL() string { return s.typesenseURL }
+
+// ---- Postgres store (source of truth) ----
+//
+// For project, team and org KBs with a store set, every write and every
+// annotation change commits to Postgres first; Typesense is updated after
+// the commit, from the committed row. An indexing failure after the commit
+// is logged and never loses the doc: the row is already saved, and the next
+// index job, reindex or reconcile brings the index back in line.
+
+// Store is the Postgres store of KB docs. *repository.Repo implements it.
+type Store interface {
+	UpsertKBDocument(ctx context.Context, scope repository.KBScope, w repository.KBDocWrite) (*repository.KBDocument, bool, error)
+	GetKBDocument(ctx context.Context, scope repository.KBScope, path string) (*repository.KBDocument, error)
+	UpdateKBAnnotations(ctx context.Context, scope repository.KBScope, path string,
+		fn func([]domain.KBAnnotation) ([]domain.KBAnnotation, error)) (*repository.KBDocument, error)
+	InsertKBDocumentIfMissing(ctx context.Context, scope repository.KBScope, d repository.KBDocument, by string) (bool, error)
+	CountKBDocuments(ctx context.Context, scope repository.KBScope) (int, error)
+	StreamKBDocuments(ctx context.Context, scope repository.KBScope, fn func(repository.KBDocument) error) error
+	IsKBBackfillComplete(ctx context.Context, scope repository.KBScope) (bool, error)
+}
+
+var _ Store = (*repository.Repo)(nil)
+
+// SetStore makes Postgres the source of truth for project, team and org
+// KBs. Call once at startup, before serving.
+func (s *Service) SetStore(st Store) { s.store = st }
+
+// stored reports whether sc's docs live in Postgres. The global KB (the AMP
+// guide) never does: it is synced from the repo's kb/ folder.
+func (s *Service) stored(sc Scope) bool {
+	return s.store != nil && sc.Kind != ScopeGlobal
+}
+
+func storeScope(sc Scope) repository.KBScope { return repository.KBScope{Kind: sc.Kind, ID: sc.ID} }
+
+// writeStored is WriteDoc for a stored KB: commit to Postgres, then index.
+func (s *Service) writeStored(ctx context.Context, sc Scope, path, title, content, author string, tags []string, reason string, annotations []Annotation) (*DocSummary, error) {
+	if err := s.adoptIndexed(ctx, sc, path); err != nil {
+		return nil, err
+	}
+	rs := storeScope(sc)
+	d, _, err := s.store.UpsertKBDocument(ctx, rs, repository.KBDocWrite{
+		Path: path, Title: title, Tags: tags, Author: author, Reason: reason, Content: content, By: author,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("save %s: %w", path, err)
+	}
+	if len(annotations) > 0 {
+		if d, err = s.store.UpdateKBAnnotations(ctx, rs, path, func([]domain.KBAnnotation) ([]domain.KBAnnotation, error) {
+			return annotations, nil
+		}); err != nil {
+			return nil, fmt.Errorf("save annotations of %s: %w", path, err)
+		}
+	}
+	s.index(ctx, sc, path)
+	return summaryFromRow(sc, d), nil
+}
+
+// updateStoredAnnotations changes a stored doc's annotations under its row
+// lock (fn gets the current list and returns the new one), then indexes it.
+func (s *Service) updateStoredAnnotations(ctx context.Context, sc Scope, path string, fn func([]Annotation) ([]Annotation, error)) (*Doc, error) {
+	if err := s.adoptIndexed(ctx, sc, path); err != nil {
+		return nil, err
+	}
+	d, err := s.store.UpdateKBAnnotations(ctx, storeScope(sc), path, fn)
+	if errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("doc not found: %s/%s: %w", collectionName(sc), path, err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	s.index(ctx, sc, path)
+	return docFromRow(sc, d), nil
+}
+
+// adoptIndexed copies a doc that so far exists only in the Typesense index
+// into Postgres (insert-if-missing, keeping its annotations and updated_at)
+// before its first Postgres write or annotation. It does nothing once the
+// KB's backfill has completed, or when Postgres has a row for the path.
+// Without it, the first write to such a doc would start its row without the
+// annotations the index holds, and the backfill would then skip the path as
+// already present. A doc deleted in Postgres stays deleted: insert-if-missing
+// skips any path with a row, live or deleted.
+func (s *Service) adoptIndexed(ctx context.Context, sc Scope, path string) error {
+	rs := storeScope(sc)
+	done, err := s.store.IsKBBackfillComplete(ctx, rs)
+	if err != nil {
+		return fmt.Errorf("check the backfill of %s: %w", sc, err)
+	}
+	if done {
+		return nil
+	}
+	if _, err := s.store.GetKBDocument(ctx, rs, path); err == nil {
+		return nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return err
+	}
+	old, err := s.GetDoc(ctx, sc, path)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		// Writing now could drop the indexed copy's annotations for good.
+		return fmt.Errorf("read the indexed copy of %s before its first Postgres write (this KB is not backfilled yet): %w", path, err)
+	}
+	row := repository.KBDocument{
+		Path: path, Title: old.Title, Tags: old.Tags, Author: old.Author, Reason: old.Reason,
+		Content: old.Content, Annotations: old.Annotations,
+	}
+	if old.UpdatedAt > 0 {
+		row.UpdatedAt = time.Unix(old.UpdatedAt, 0)
+	}
+	if _, err := s.store.InsertKBDocumentIfMissing(ctx, rs, row, "kb-adopt-on-write"); err != nil {
+		return fmt.Errorf("copy the indexed %s into postgres: %w", path, err)
+	}
+	return nil
+}
+
+// index brings path's search entry in line with its Postgres row: through
+// the queue when there is one, else now. It never fails the caller, whose
+// change is already committed; a failure is logged, and the doc is
+// re-indexed by the next write, reindex or reconcile.
+func (s *Service) index(ctx context.Context, sc Scope, path string) {
+	if s.queueClient != nil {
+		payload, err := json.Marshal(queue.IndexDocPayload{ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID, Path: path})
+		if err == nil {
+			task := asynq.NewTask(queue.TypeKBIndexDoc, payload)
+			if _, err = s.queueClient.EnqueueContext(ctx, task, asynq.Queue(queue.QueueName)); err == nil {
+				return
+			}
+		}
+		s.log.Warn("enqueue index job failed, indexing synchronously instead", "kb", sc.String(), "path", path, "err", err)
+	}
+	if err := s.indexFromStore(ctx, sc, path); err != nil {
+		s.log.Error("doc saved in postgres but not indexed; search misses it until it is re-indexed",
+			"kb", sc.String(), "path", path, "err", err)
+	}
+}
+
+// indexFromStore indexes path's current Postgres row, or removes path from
+// the index when it has no live row (deleted or purged). Jobs carry only the
+// path, so one applied late or out of order still indexes the latest row.
+// If the row changes while it is being indexed (another job may have
+// indexed the newer row first and then been overwritten by this one), it
+// indexes again until what it indexed is still current.
+func (s *Service) indexFromStore(ctx context.Context, sc Scope, path string) error {
+	rs := storeScope(sc)
+	d, err := s.store.GetKBDocument(ctx, rs, path)
+	if errors.Is(err, repository.ErrNotFound) {
+		// Never drop an indexed doc Postgres hasn't got yet.
+		if err := s.adoptIndexed(ctx, sc, path); err != nil {
+			return err
+		}
+		d, err = s.store.GetKBDocument(ctx, rs, path)
+	}
+	for attempt := 1; ; attempt++ {
+		if errors.Is(err, repository.ErrNotFound) {
+			if err := s.deleteByPath(ctx, collectionName(sc), path); err != nil {
+				return err
+			}
+			s.log.Info("doc removed from the index", "kb", sc.String(), "path", path)
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("load %s to index it: %w", path, err)
+		}
+		chunks, ierr := s.indexChunks(ctx, sc, indexedFromRow(d))
+		if ierr != nil {
+			return ierr
+		}
+		indexed := d
+		d, err = s.store.GetKBDocument(ctx, rs, path)
+		if err == nil && sameIndexed(indexed, d) {
+			s.log.Info("doc indexed", "kb", sc.String(), "path", path, "version", d.Version, "chunks", chunks)
+			return nil
+		}
+		if attempt == 5 {
+			return fmt.Errorf("%s kept changing while it was being indexed", path)
+		}
+	}
+}
+
+// sameIndexed reports whether a and b index identically.
+func sameIndexed(a, b *repository.KBDocument) bool {
+	if a.Version != b.Version || a.Author != b.Author || a.Reason != b.Reason || !a.UpdatedAt.Equal(b.UpdatedAt) {
+		return false
+	}
+	ja, _ := json.Marshal(kbAnnotationsOrEmpty(a.Annotations))
+	jb, _ := json.Marshal(kbAnnotationsOrEmpty(b.Annotations))
+	return string(ja) == string(jb)
+}
+
+func kbAnnotationsOrEmpty(a []Annotation) []Annotation {
+	if a == nil {
+		return []Annotation{}
+	}
+	return a
+}
+
+// drainLegacyWrite runs a kb:write_doc task for a stored KB. Only an older
+// amp-api enqueues those (before the store existed, or during the rolling
+// deploy that introduced it), and its payload may be the only copy of that
+// write, so it is saved to Postgres first and then indexed from there.
+func (s *Service) drainLegacyWrite(ctx context.Context, sc Scope, p queue.WriteDocPayload, anns []Annotation) error {
+	rs := storeScope(sc)
+	if err := s.adoptIndexed(ctx, sc, p.Path); err != nil {
+		return err
+	}
+	_, err := s.store.GetKBDocument(ctx, rs, p.Path)
+	switch {
+	case err == nil:
+		// Apply it like any write. If a newer write already landed, the one
+		// this overwrites stays in the version history. The payload's
+		// annotations (an old reindex or import's snapshot) are not applied
+		// over the row's current ones.
+		if _, _, err := s.store.UpsertKBDocument(ctx, rs, repository.KBDocWrite{
+			Path: p.Path, Title: p.Title, Tags: p.Tags, Author: p.Author, Reason: p.Reason, Content: p.Content, By: p.Author,
+		}); err != nil {
+			return fmt.Errorf("save queued write of %s: %w", p.Path, err)
+		}
+	case errors.Is(err, repository.ErrNotFound):
+		// No live row: insert it unless the path has a deleted row (it was
+		// deleted after this write was queued, so it stays deleted).
+		if _, err := s.store.InsertKBDocumentIfMissing(ctx, rs, repository.KBDocument{
+			Path: p.Path, Title: p.Title, Tags: p.Tags, Author: p.Author, Reason: p.Reason, Content: p.Content, Annotations: anns,
+		}, p.Author); err != nil {
+			return fmt.Errorf("save queued write of %s: %w", p.Path, err)
+		}
+	default:
+		return err
+	}
+	return s.indexFromStore(ctx, sc, p.Path)
+}
+
+// reindexFromStore re-indexes every live doc of a stored KB from Postgres,
+// keeping each doc's own updated_at. Until the KB's backfill has completed,
+// the docs the index lists are first copied into Postgres
+// (insert-if-missing), and a rebuild is refused while Postgres holds fewer
+// docs than the index: dropping the collection would delete the only copy
+// of the rest. (#1990 replaces the drop with build-then-swap.)
+func (s *Service) reindexFromStore(ctx context.Context, sc Scope, rebuild bool) error {
+	rs := storeScope(sc)
+	col := collectionName(sc)
+	done, err := s.store.IsKBBackfillComplete(ctx, rs)
+	if err != nil {
+		return err
+	}
+	if !done {
+		summaries, err := s.ListDocs(ctx, sc, "")
+		if err != nil {
+			return err
+		}
+		for _, sum := range summaries {
+			if err := s.adoptIndexed(ctx, sc, sum.Path); err != nil {
+				return fmt.Errorf("reindex: %w", err)
+			}
+		}
+	}
+	if rebuild {
+		indexed, err := s.CountDocs(ctx, sc)
+		if err != nil {
+			return err
+		}
+		stored, err := s.store.CountKBDocuments(ctx, rs)
+		if err != nil {
+			return err
+		}
+		if stored < indexed {
+			s.log.Error("reindex: not rebuilding the collection: postgres holds fewer docs than the index, so dropping it would lose the rest; re-indexing in place",
+				"collection", col, "stored", stored, "indexed", indexed)
+		} else {
+			s.log.Info("reindex: upgrading collection to semantic search (was keyword-only)", "collection", col)
+			if _, err := s.client.Collection(col).Delete(ctx); err != nil {
+				s.log.Warn("reindex: failed to drop keyword-only collection, continuing with existing schema", "collection", col, "err", err)
+			} else if err := s.ensureCollection(ctx, sc); err != nil {
+				return fmt.Errorf("recreate collection with embeddings: %w", err)
+			}
+		}
+	}
+	var paths []string
+	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
+		paths = append(paths, d.Path)
+		return nil
+	}); err != nil {
+		return err
+	}
+	failed := 0
+	for _, p := range paths {
+		if err := s.indexFromStore(ctx, sc, p); err != nil {
+			failed++
+			s.log.Warn("reindex: index failed", "kb", sc.String(), "path", p, "err", err)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("reindex %s: %d of %d docs failed to index", sc, failed, len(paths))
+	}
+	return nil
+}
+
+// indexedDoc is what the search index holds for one doc.
+type indexedDoc struct {
+	path, title, content, author, reason string
+	tags                                 []string
+	annotations                          []Annotation
+	updatedAt                            int64
+}
+
+func indexedFromRow(d *repository.KBDocument) indexedDoc {
+	return indexedDoc{
+		path: d.Path, title: d.Title, content: d.Content, author: d.Author, reason: d.Reason,
+		tags: d.Tags, annotations: d.Annotations, updatedAt: d.UpdatedAt.Unix(),
+	}
+}
+
+// indexChunks writes a doc into its KB's collection, ~500 tokens per chunk.
+// It upserts the new chunks first and only then deletes chunks past the new
+// last one, so a failure part way leaves the doc searchable (some chunks
+// old, some new; the next index run fixes it), never missing.
+func (s *Service) indexChunks(ctx context.Context, sc Scope, d indexedDoc) (int, error) {
+	if err := s.ensureCollection(ctx, sc); err != nil {
+		return 0, err
+	}
+	col := collectionName(sc)
+	tags := d.tags
+	if tags == nil {
+		tags = []string{}
+	}
+	annJSON := "[]"
+	if len(d.annotations) > 0 {
+		b, err := json.Marshal(d.annotations)
+		if err != nil {
+			return 0, fmt.Errorf("encode annotations of %s: %w", d.path, err)
+		}
+		annJSON = string(b)
+	}
+	annCount, annLatest := len(d.annotations), getLatestAnnotation(d.annotations)
+
+	chunks := chunkMarkdown(d.content, 500) // ~500 tokens per chunk
+	if len(chunks) == 0 {
+		chunks = []string{d.content}
+	}
+	for i, chunk := range chunks {
+		doc := map[string]interface{}{
+			"id":          docID(sc, d.path, i),
+			"project_id":  sc.projectID(),
+			"reason":      d.reason,
+			"path":        d.path,
+			"title":       d.title,
+			"tags":        tags,
+			"author":      d.author,
+			"chunk_index": i,
+			"chunk_text":  chunk,
+			"updated_at":  d.updatedAt,
+			// Every chunk carries the count and latest annotation so any
+			// search hit shows them; the annotations live on chunk 0.
+			"annotation_count":  annCount,
+			"latest_annotation": annLatest,
+			"annotations":       "[]",
+			"content":           "",
+		}
+		// Only the first chunk stores the full content and annotations.
+		if i == 0 {
+			doc["content"] = d.content
+			doc["annotations"] = annJSON
+		}
+		if _, err := s.client.Collection(col).Documents().Upsert(ctx, doc, &api.DocumentIndexParameters{}); err != nil {
+			return 0, fmt.Errorf("index chunk %d of %s: %w", i, d.path, err)
+		}
+	}
+	// Only now remove the chunks an older, longer version left behind.
+	stale := fmt.Sprintf("path:=%s && chunk_index:>=%d", quoteFilter(d.path), len(chunks))
+	if _, err := s.client.Collection(col).Documents().Delete(ctx, &api.DeleteDocumentsParams{FilterBy: &stale}); err != nil && !isNotFound(err) {
+		return len(chunks), fmt.Errorf("delete stale chunks of %s: %w", d.path, err)
+	}
+	return len(chunks), nil
+}
+
+// docFromRow is a stored doc in the shape GetDoc returns.
+func docFromRow(sc Scope, d *repository.KBDocument) *Doc {
+	tags := d.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+	chunkText := d.Content
+	if chunks := chunkMarkdown(d.Content, 500); len(chunks) > 0 {
+		chunkText = chunks[0]
+	}
+	return &Doc{
+		ID: docID(sc, d.Path, 0), ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID,
+		Reason: d.Reason, Path: d.Path, Title: d.Title, Content: d.Content, Tags: tags, Author: d.Author,
+		ChunkText: chunkText, UpdatedAt: d.UpdatedAt.Unix(), Annotations: kbAnnotationsOrEmpty(d.Annotations),
+	}
+}
+
+// summaryFromRow is a stored doc in the shape WriteDoc returns.
+func summaryFromRow(sc Scope, d *repository.KBDocument) *DocSummary {
+	tags := d.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+	return &DocSummary{
+		ID: docID(sc, d.Path, 0), ProjectID: sc.projectID(), Scope: sc.Kind, ScopeID: sc.ID,
+		Reason: d.Reason, Path: d.Path, Title: d.Title, Tags: tags, Author: d.Author, UpdatedAt: d.UpdatedAt.Unix(),
+	}
+}
 
 // ---- Internal helpers ----
 
