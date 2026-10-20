@@ -2,7 +2,7 @@ name: Test amp-api
 
 # Runs vet + the full amp-api test suite (unit, MCP transport over real HTTP
 # in both protocol eras, OAuth broker, and the Postgres- and Typesense-backed
-# integration tests) on every PR and on main. The e2e suite in test/e2e needs a deployed
+# integration tests; Valkey for the queued KB write path) on every PR and on main. The e2e suite in test/e2e needs a deployed
 # stack and is run manually — see v2/docs/deploy-architecture.md.
 
 on:
@@ -41,6 +41,16 @@ jobs:
           TYPESENSE_API_KEY: test
           TYPESENSE_DATA_DIR: /tmp
         ports: ["8108:8108"]
+      # Valkey backs the asynq queue the KB write path uses when REDIS_ADDR
+      # is set; tests read TEST_REDIS_ADDR to exercise the queued path.
+      valkey:
+        image: valkey/valkey:8-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     defaults:
       run:
         working-directory: v2/amp-api
@@ -48,6 +58,7 @@ jobs:
       TEST_DATABASE_URL: postgres://amp:amp@localhost:5432/amp_test?sslmode=disable
       TEST_TYPESENSE_URL: http://localhost:8108
       TEST_TYPESENSE_KEY: test
+      TEST_REDIS_ADDR: localhost:6379
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
