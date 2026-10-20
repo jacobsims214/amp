@@ -240,6 +240,21 @@ func TestAccounts_DeactivationRevokesTokens(t *testing.T) {
 	agentID := num(t, ra.want(t, 200, "alice", "POST", "/api/agents", map[string]any{"name": "Revoked", "team_ids": []int{w.devs.ID}}), "agent", "id")
 	tokA := mintToken(t, ra, "alice", fmt.Sprint(agentID))
 	tokB := mintToken(t, ra, "alice", fmt.Sprint(agentID))
+
+	// Reactivating an account that is already active (a double-click, a
+	// retry) leaves its tokens live and audits no revokes.
+	ra.want(t, 200, "alice", "POST", fmt.Sprintf("/api/users/%d/reactivate", agentID), nil)
+	for _, tok := range []string{tokA, tokB} {
+		if code, _ := bearerDo(t, srv, tok, "GET", "/api/me", nil); code != 200 {
+			t.Errorf("token after reactivating an active account: %d, want 200", code)
+		}
+	}
+	for _, e := range ra.want(t, 200, "root", "GET", "/api/audit?action=token.revoke&limit=500", nil)["entries"].([]any) {
+		if e.(map[string]any)["target_id"] == fmt.Sprint(agentID) {
+			t.Errorf("reactivating an active account audited a revoke: %v", e)
+		}
+	}
+
 	// One already revoked by hand: deactivation must not re-revoke or re-audit it.
 	before, _ := w.s.repo.ListAPITokens(ctx, agentID)
 	if len(before) != 2 {
