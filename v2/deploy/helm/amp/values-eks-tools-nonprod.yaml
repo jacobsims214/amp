@@ -135,7 +135,6 @@ dex:
           - openid
           - email
           - profile
-          - groups
 
 oauth2Proxy:
   # Single replica: with 2 replicas and no shared session-store locking,
