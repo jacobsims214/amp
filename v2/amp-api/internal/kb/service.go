@@ -727,6 +727,54 @@ func (s *Service) ListDocs(ctx context.Context, sc Scope, tag string) ([]DocSumm
 	if err != nil {
 		return nil, err
 	}
+	return summarize(sc, docs), nil
+}
+
+// ListDocsPage returns one page of ListDocs: at most limit docs (limit <= 0
+// means all of them) starting at offset, newest first, and total, the number
+// of docs the whole listing has (only those with the tag, if one is given).
+// A stored KB whose backfill is complete, listed without a tag, pages in SQL;
+// every other listing is built whole and sliced.
+func (s *Service) ListDocsPage(ctx context.Context, sc Scope, tag string, limit, offset int) ([]DocSummary, int, error) {
+	offset = max(offset, 0)
+	if s.stored(sc) && tag == "" && limit > 0 {
+		done, _, err := s.storedRead(ctx, sc)
+		if err != nil {
+			return nil, 0, err
+		}
+		if done {
+			total, err := s.store.CountKBDocuments(ctx, storeScope(sc))
+			if err != nil {
+				return nil, 0, fmt.Errorf("count docs: %w", err)
+			}
+			rows, err := s.store.ListKBDocuments(ctx, storeScope(sc), limit, offset)
+			if err != nil {
+				return nil, 0, fmt.Errorf("list docs: %w", err)
+			}
+			out := make([]DocSummary, 0, len(rows))
+			for i := range rows {
+				out = append(out, *summaryFromRow(sc, &rows[i]))
+			}
+			return out, total, nil
+		}
+	}
+	all, err := s.ListDocs(ctx, sc, tag)
+	if err != nil {
+		return nil, 0, err
+	}
+	total := len(all)
+	if offset >= total {
+		return []DocSummary{}, total, nil
+	}
+	end := total
+	if limit > 0 && offset+limit < total {
+		end = offset + limit
+	}
+	return all[offset:end], total, nil
+}
+
+// summarize turns docs into their listing summaries (no content).
+func summarize(sc Scope, docs []*Doc) []DocSummary {
 	out := make([]DocSummary, 0, len(docs))
 	for _, d := range docs {
 		out = append(out, DocSummary{
@@ -734,7 +782,7 @@ func (s *Service) ListDocs(ctx context.Context, sc Scope, tag string) ([]DocSumm
 			Path: d.Path, Title: d.Title, Tags: d.Tags, Author: d.Author, UpdatedAt: d.UpdatedAt,
 		})
 	}
-	return out, nil
+	return out
 }
 
 // listStored lists a stored KB's live docs with their annotations, most

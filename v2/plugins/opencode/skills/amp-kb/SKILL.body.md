@@ -401,8 +401,9 @@ amp_kb_write {project_id, path, title, content, tags, author?, reason?}
   → writes and re-indexes the doc (embeddings regenerated automatically)
   reason is required for team and org KBs
 
-amp_kb_list {project_id, tag?}
-  → [{path, title, tags, updated_at}] — all docs, no content
+amp_kb_list {project_id, tag?, limit?, offset?}
+  → {docs: [{path, title, tags, updated_at}], count, total, next_offset?} — newest first, no content
+  One page: 250 by default (limit up to 1000). If next_offset is present, pass it as offset for the next page.
 
 amp_kb_delete {project_id, path}
   → removes doc and all its chunks from the index

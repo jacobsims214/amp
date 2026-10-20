@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"reflect"
 	"testing"
 
 	"github.com/simstech/amp-api/internal/repository"
@@ -56,6 +57,16 @@ func TestStoredReadsComeFromPostgres(t *testing.T) {
 	}
 	if docs[1].Reason != "why" || docs[1].ScopeID != sc.ID || docs[1].ID != docID(sc, "a.md", 0) {
 		t.Errorf("summary = %+v", docs[1])
+	}
+	// A page of a backfilled KB comes from SQL, in the same order (#2028).
+	for _, tt := range []struct {
+		limit, offset, n int
+		first            string
+	}{{1, 0, 1, "b.md"}, {1, 1, 1, "a.md"}, {5, 0, 2, "b.md"}, {5, 2, 0, ""}, {0, 1, 1, "a.md"}} {
+		page, total, err := s.ListDocsPage(ctx, sc, "", tt.limit, tt.offset)
+		if err != nil || total != 2 || len(page) != tt.n || (tt.n > 0 && (page[0].Path != tt.first || !reflect.DeepEqual(page[0], docs[tt.offset]))) {
+			t.Errorf("ListDocsPage(%d, %d) = %+v, total %d, %v", tt.limit, tt.offset, page, total, err)
+		}
 	}
 	if tagged, err := s.ListDocs(ctx, sc, "a.md"); err != nil || len(tagged) != 1 || tagged[0].Path != "a.md" {
 		t.Errorf("ListDocs(tag) = %+v, %v", tagged, err)
@@ -158,6 +169,14 @@ func TestStoredReadsBeforeBackfill(t *testing.T) {
 	}
 	if n, err := s.CountDocs(ctx, sc); err != nil || n != indexOnly+1 {
 		t.Errorf("CountDocs = %d, %v; want %d", n, err, indexOnly+1)
+	}
+	// Before the backfill a page is sliced from the merged listing (#2028).
+	if page, total, err := s.ListDocsPage(ctx, sc, "", 250, 250); err != nil || total != indexOnly+1 ||
+		len(page) != indexOnly+1-250 || page[0].Path != docs[250].Path {
+		t.Errorf("ListDocsPage(250, 250) = %d docs, total %d, %v", len(page), total, err)
+	}
+	if page, total, err := s.ListDocsPage(ctx, sc, "even", 100, 0); err != nil || total != indexOnly/2 || len(page) != 100 {
+		t.Errorf("ListDocsPage(even) = %d docs, total %d, %v", len(page), total, err)
 	}
 	if st, err := s.KBStatus(ctx, sc); err != nil || st.TotalDocs != indexOnly+1 || st.DocsByTag["old"] != indexOnly {
 		t.Errorf("KBStatus = %+v, %v", st, err)

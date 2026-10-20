@@ -1640,7 +1640,7 @@ var _ = context.Background
 // GET  /api/kb/doc?KB&path=P              → full doc
 // POST /api/kb/doc?KB                     → write doc (body: {path,title,content,tags,author,reason})
 // DELETE /api/kb/doc?KB&path=P            → delete doc
-// GET  /api/kb/list?KB&tag=T              → list doc summaries
+// GET  /api/kb/list?KB&tag=T&limit=L&offset=O → list doc summaries (all unless limit is given)
 // GET  /api/kb/search?KB&q=Q              → search results
 // GET  /api/kb/tags?KB                    → tag counts
 // POST /api/kb/annotate?KB                → annotate a doc (body: {path,text})
@@ -1803,13 +1803,21 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case "list":
+		// The UI's KB page builds its tree from every doc, so with no limit
+		// REST lists the whole KB; limit and offset page it like amp_kb_list.
 		tag := r.URL.Query().Get("tag")
-		docs, err := h.kb.ListDocs(r.Context(), sc, tag)
+		limit, _ := strconv.Atoi(q.Get("limit"))
+		offset, _ := strconv.Atoi(q.Get("offset"))
+		docs, total, err := h.kb.ListDocsPage(r.Context(), sc, tag, limit, offset)
 		if err != nil {
 			jsonErr(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"docs": docs, "count": len(docs)})
+		out := map[string]interface{}{"docs": docs, "count": len(docs), "total": total}
+		if next := max(offset, 0) + len(docs); len(docs) > 0 && next < total {
+			out["next_offset"] = next
+		}
+		jsonOK(w, out)
 
 	case "search":
 		if q.Get("q") == "" {

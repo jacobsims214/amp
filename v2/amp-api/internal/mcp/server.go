@@ -766,9 +766,13 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		})), wrap(ctx, s.open(s.kbGet)))
 
 	mcp.AddTool(tool("amp_kb_list",
-		"List all documents in a knowledge base (project KB unless scope says otherwise). Optionally filter by tag.",
+		"List the documents in a knowledge base (project KB unless scope says otherwise), most recently updated first, "+
+			"without content. Optionally filter by tag. Returns one page: the newest 250 by default. total is how many docs "+
+			"the listing has (with the tag, if given); next_offset is present when more remain: pass it as offset for the next page.",
 		kbArgs(props{
-			"tag": str("Optional. Filter to documents with this tag."),
+			"tag":    str("Optional. Filter to documents with this tag."),
+			"limit":  num(fmt.Sprintf("Optional. Docs per page (default %d, max %d).", kbListDefault, kbListMax)),
+			"offset": num("Optional. How many docs to skip (default 0): the next_offset of the previous page."),
 		})), wrap(ctx, s.open(s.kbList)))
 
 	mcp.AddTool(tool("amp_kb_delete",
@@ -2564,12 +2568,30 @@ func (s *Server) kbList(ctx context.Context, args map[string]interface{}) (*mcpg
 	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	docs, err := s.kb.ListDocs(ctx, k.Scope, optStr(args, "tag", ""))
+	limit := optInt(args, "limit", kbListDefault)
+	if limit <= 0 {
+		limit = kbListDefault
+	}
+	limit = min(limit, kbListMax)
+	offset := max(optInt(args, "offset", 0), 0)
+	docs, total, err := s.kb.ListDocsPage(ctx, k.Scope, optStr(args, "tag", ""), limit, offset)
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"kb": k, "docs": docs, "count": len(docs)})
+	out := map[string]interface{}{"kb": k, "docs": docs, "count": len(docs), "total": total}
+	if next := offset + len(docs); len(docs) > 0 && next < total {
+		out["next_offset"] = next
+	}
+	return jsonResult(out)
 }
+
+// amp_kb_list's page size: the default is the cap it had before KB reads
+// moved to Postgres (#1989); a whole big KB in one tool result is too large
+// for an agent's context.
+const (
+	kbListDefault = 250
+	kbListMax     = 1000
+)
 
 func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	k, err := s.kbOf(ctx, args, kbChange)
