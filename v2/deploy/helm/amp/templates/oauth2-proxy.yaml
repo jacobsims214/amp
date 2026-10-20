@@ -45,7 +45,7 @@ spec:
             # Leading dot shares the session cookie with asynqmon's dedicated
             # subdomain (see amp.asynqmonDomain helper) — without this,
             # logging in on the main domain wouldn't authenticate you there.
-            - --cookie-domain=.{{ .Values.global.domain }}
+            - --cookie-domain={{ .Values.global.domain }}
             - --email-domain=*
             - --http-address=0.0.0.0:4180
             - --upstream=static://200
