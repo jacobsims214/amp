@@ -3,7 +3,9 @@
 // projects (see docs/kb-scopes-design.md).
 //
 // Architecture:
-//   - One Typesense collection per KB: "kb_{project_id}", "kb_team_{id}", "kb_org_{id}"
+//   - One Typesense collection per KB, reached by its name: "kb_{project_id}", "kb_team_{id}", "kb_org_{id}".
+//     After its first reindex a stored KB's name is an alias of a versioned
+//     collection ("kb_5_v<n>"), swapped to a new build on each reindex.
 //   - Documents are chunked (~500 tokens) for precise retrieval
 //   - Typesense auto-embeds via Ollama at index AND query time (no vectors in Go code)
 //   - Hybrid search (keyword + semantic) with rank fusion
@@ -59,11 +61,22 @@ type Service struct {
 	reindexMu   sync.Mutex
 	reindexing  map[string]bool
 	reindexLock ReindexLocker
+
+	// reindexHook, when set (tests only), is called at each stage of a
+	// stored KB's reindex: "built", "verified" (just before the swap) and
+	// "swapped".
+	reindexHook func(ctx context.Context, stage string)
 }
 
 // ErrReindexRunning is returned when a reindex of the same KB is already
 // running, in this process or (with a ReindexLocker) on another replica.
 var ErrReindexRunning = errors.New("a reindex of this knowledge base is already running")
+
+// ErrReindexRefused is returned when a reindex of a stored KB would drop
+// docs: the index holds docs Postgres has no row for, so a collection built
+// from Postgres would lack them and swapping it in would lose their only
+// copy. Nothing is changed.
+var ErrReindexRefused = errors.New("reindex refused: the search index holds docs that Postgres has not got")
 
 // ReindexLocker takes a lock named key that every replica shares (e.g. a
 // Postgres advisory lock) without waiting. ok is false when someone else
@@ -226,18 +239,61 @@ func docID(sc Scope, path string, chunkIndex int) string {
 
 // ---- Collection bootstrap ----
 
-// ensureCollection creates the Typesense collection for a project if it doesn't exist.
-// Safe to call on every write — checks existence first.
+// ensureCollection creates the Typesense collection for a KB if its name
+// resolves to nothing: neither a collection nor an alias (a reindexed stored
+// KB is reached through an alias, see "Collections and the alias"). Safe to
+// call on every write: it checks first, and only a 404 creates one, so a
+// transient error never creates a collection that would shadow the alias.
 func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
 	name := collectionName(sc)
 
-	// Check if it already exists.
 	_, err := s.client.Collection(name).Retrieve(ctx)
 	if err == nil {
-		return nil // already exists
+		return nil // already exists (a collection, or the alias's target)
+	}
+	if !isNotFound(err) {
+		return fmt.Errorf("check collection %s: %w", name, err)
 	}
 
-	// Build the schema.
+	_, err = s.client.Collections().Create(ctx, s.collectionSchema(ctx, name))
+	if err != nil {
+		if strings.Contains(err.Error(), "already exists") {
+			return nil // created concurrently
+		}
+		return fmt.Errorf("create collection %s: %w", name, err)
+	}
+	s.log.Info("created KB collection", "kb", sc.String(), "collection", name, "semantic", s.ollamaURL != "")
+	s.unshadowAlias(ctx, name)
+	return nil
+}
+
+// unshadowAlias handles a collection just created under a KB's base name
+// while an alias of that name appeared (a reindex swapped one in between
+// the 404 and the create). Typesense lets a collection and an alias share a
+// name, and the collection wins every lookup, so it would hide the reindexed
+// collection. If the alias's target exists, the new collection goes (it holds
+// at most docs whose rows are in Postgres); if the alias dangles, the alias
+// goes and the new collection serves.
+func (s *Service) unshadowAlias(ctx context.Context, name string) {
+	a, err := s.client.Alias(name).Retrieve(ctx)
+	if err != nil {
+		return // no alias (the normal case)
+	}
+	if _, err := s.client.Collection(a.CollectionName).Retrieve(ctx); err == nil {
+		if _, err := s.client.Collection(name).Delete(ctx); err != nil && !isNotFound(err) {
+			s.log.Error("a collection shadows the KB's alias and could not be removed", "collection", name, "alias_target", a.CollectionName, "err", err)
+		} else {
+			s.log.Warn("removed a collection that shadowed the KB's alias", "collection", name, "alias_target", a.CollectionName)
+		}
+		return
+	}
+	if _, err := s.client.Alias(name).Delete(ctx); err != nil && !isNotFound(err) {
+		s.log.Warn("could not remove a dangling KB alias", "alias", name, "err", err)
+	}
+}
+
+// collectionSchema is the schema of a KB collection named name.
+func (s *Service) collectionSchema(ctx context.Context, name string) *api.CollectionSchema {
 	schema := &api.CollectionSchema{
 		Name: name,
 		Fields: []api.Field{
@@ -288,13 +344,7 @@ func (s *Service) ensureCollection(ctx context.Context, sc Scope) error {
 	} else if s.ollamaURL != "" {
 		s.log.Warn("Ollama not reachable — creating collection with keyword search only. Run 'make kb-setup' to enable semantic search.", "url", s.ollamaURL)
 	}
-
-	_, err = s.client.Collections().Create(ctx, schema)
-	if err != nil {
-		return fmt.Errorf("create collection %s: %w", name, err)
-	}
-	s.log.Info("created KB collection", "kb", sc.String(), "collection", name, "semantic", s.ollamaURL != "")
-	return nil
+	return schema
 }
 
 // ---- Write ----
@@ -1232,12 +1282,7 @@ func (s *Service) Drop(ctx context.Context, sc Scope) error {
 			return fmt.Errorf("move the docs of %s to the trash: %w", sc, err)
 		}
 	}
-	col := collectionName(sc)
-	_, err := s.client.Collection(col).Delete(ctx)
-	if err != nil && !isNotFound(err) {
-		return fmt.Errorf("delete collection %s: %w", col, err)
-	}
-	return nil
+	return s.dropCollections(ctx, collectionName(sc))
 }
 
 // trashStored soft-deletes every live doc of a stored KB. Until its backfill
@@ -1367,7 +1412,7 @@ func (s *Service) runReindex(ctx context.Context, sc Scope) error {
 // before anything is dropped and written back explicitly.
 func (s *Service) reindex(ctx context.Context, sc Scope, rebuild bool) error {
 	if s.stored(sc) {
-		return s.reindexFromStore(ctx, sc, rebuild)
+		return s.reindexFromStore(ctx, sc)
 	}
 	col := collectionName(sc)
 
@@ -1389,7 +1434,7 @@ func (s *Service) reindex(ctx context.Context, sc Scope, rebuild bool) error {
 
 	if rebuild {
 		s.log.Info("reindex: upgrading collection to semantic search (was keyword-only)", "collection", col)
-		if _, err := s.client.Collection(col).Delete(ctx); err != nil {
+		if err := s.dropCollections(ctx, col); err != nil {
 			s.log.Warn("reindex: failed to drop keyword-only collection, continuing with existing schema", "collection", col, "err", err)
 		} else if err := s.ensureCollection(ctx, sc); err != nil {
 			return fmt.Errorf("recreate collection with embeddings: %w", err)
@@ -1698,69 +1743,389 @@ func (s *Service) drainLegacyWrite(ctx context.Context, sc Scope, p queue.WriteD
 	return s.indexFromStore(ctx, sc, p.Path)
 }
 
-// reindexFromStore re-indexes every live doc of a stored KB from Postgres,
-// keeping each doc's own updated_at. Until the KB's backfill has completed,
-// the docs the index lists are first copied into Postgres
-// (insert-if-missing), and a rebuild is refused while Postgres holds fewer
-// docs than the index: dropping the collection would delete the only copy
-// of the rest. (#1990 replaces the drop with build-then-swap.)
-func (s *Service) reindexFromStore(ctx context.Context, sc Scope, rebuild bool) error {
+// ---- Reindex: build a new collection, then swap the alias (#1990) ----
+//
+// A stored KB's search collection is reached by its base name
+// (collectionName, e.g. "kb_5"). A reindex never deletes the only copy of
+// anything: it builds a new, versioned collection ("kb_5_v<unix nanos>")
+// from Postgres, verifies it, points an alias named after the base at it,
+// and only then drops the collection that served before. Every other path
+// (search, writes, index jobs, reads of the index, status, Drop) keeps using
+// the base name, which Typesense resolves through the alias.
+//
+// A KB that has never been reindexed this way is served by a real collection
+// with the base name, and Typesense can't create an alias with the name of a
+// collection. The first reindex therefore deletes that collection and then
+// creates the alias. Between the two the name resolves to nothing for a
+// moment (searches and index writes fail and are retried, or caught up
+// below), but no doc exists only in memory: every doc is in Postgres, which
+// was checked to cover the index, and in the verified new collection.
+//
+// Writes during a reindex: a change committed after the build read its row
+// is indexed by its own index job into whatever the base name resolved to,
+// which before the swap is the old collection. So the reindex catches up
+// twice: before the swap (and before verifying the count) and again after
+// it, re-indexing every doc whose row changed since it was indexed into the
+// new collection and removing docs that are no longer live. A change
+// committed after the second catch-up read is indexed by its own job, which
+// runs after the swap and so writes into the new collection.
+
+// reindexFromStore rebuilds a stored KB's search collection from Postgres,
+// keeping each doc's own updated_at. Until the KB's backfill completes, docs
+// only the index has are copied into Postgres first; then, if the index
+// still holds any doc Postgres has no row for, it refuses
+// (ErrReindexRefused) and changes nothing. A failure or cancel before the
+// swap drops only the new collection; the old one keeps serving, unchanged.
+func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
+	base := collectionName(sc)
+	if err := s.checkStoreCoversIndex(ctx, sc); err != nil {
+		return err
+	}
+	kc, err := s.kbCollections(ctx, base)
+	if err != nil {
+		return err
+	}
+	// Builds left by an interrupted reindex were never swapped in: only the
+	// alias target serves. (The caller holds the reindex lock, so none of
+	// them is being built now.)
+	for _, b := range kc.builds {
+		if b != kc.alias {
+			s.dropCollection(ctx, b)
+		}
+	}
+
+	newCol := fmt.Sprintf("%s_v%d", base, time.Now().UnixNano())
+	if _, err := s.client.Collections().Create(ctx, s.collectionSchema(ctx, newCol)); err != nil {
+		return fmt.Errorf("reindex: create collection %s: %w", newCol, err)
+	}
+	keepNew := false
+	defer func() {
+		if !keepNew {
+			s.dropCollection(context.WithoutCancel(ctx), newCol)
+		}
+	}()
+
+	// path -> fingerprint of the row indexed into newCol.
+	indexed := map[string]string{}
+	if _, err := s.syncCollection(ctx, sc, newCol, indexed); err != nil {
+		return fmt.Errorf("reindex: build %s: %w", newCol, err)
+	}
+	s.runHook(ctx, "built")
+	if err := s.verifyBuild(ctx, sc, newCol, indexed); err != nil {
+		return fmt.Errorf("reindex: verify %s: %w", newCol, err)
+	}
+	s.runHook(ctx, "verified")
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("reindex cancelled before the swap; %s still serves: %w", base, err)
+	}
+
+	// From here on, finish even if ctx is cancelled: stopping half way
+	// through the first migration would leave the base name resolving to
+	// nothing.
+	swapCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	keepNew, err = s.swapAlias(swapCtx, kc, newCol)
+	if err != nil {
+		return fmt.Errorf("reindex: swap %s to %s: %w", base, newCol, err)
+	}
+	keepNew = true
+	s.log.Info("reindex: alias swapped", "kb", sc.String(), "alias", base, "collection", newCol, "docs", len(indexed),
+		"old_collection", kc.alias, "migrated_from_collection", kc.real)
+	s.runHook(swapCtx, "swapped")
+
+	// Catch up on changes whose index jobs wrote into the old collection.
+	_, syncErr := s.syncCollection(swapCtx, sc, newCol, indexed)
+	if kc.alias != "" && kc.alias != newCol {
+		s.dropCollection(swapCtx, kc.alias)
+	}
+	if syncErr != nil {
+		return fmt.Errorf("reindex: catch up after the swap (the reconciler or the next write fixes the rest): %w", syncErr)
+	}
+	return nil
+}
+
+func (s *Service) runHook(ctx context.Context, stage string) {
+	if s.reindexHook != nil {
+		s.reindexHook(ctx, stage)
+	}
+}
+
+// checkStoreCoversIndex makes sure a collection built from Postgres would
+// hold every doc the current index has. Until the KB's backfill completes,
+// index-only docs are copied into Postgres first (insert-if-missing). Then
+// every indexed path must have a Postgres row: a live one, or a deleted one
+// (the index entry is stale, and the new collection rightly leaves it out).
+func (s *Service) checkStoreCoversIndex(ctx context.Context, sc Scope) error {
 	rs := storeScope(sc)
-	col := collectionName(sc)
 	done, err := s.store.IsKBBackfillComplete(ctx, rs)
 	if err != nil {
 		return err
 	}
+	indexed, err := s.listIndexed(ctx, sc, "")
+	if err != nil {
+		return err
+	}
 	if !done {
-		summaries, err := s.listIndexed(ctx, sc, "")
-		if err != nil {
-			return err
-		}
-		for _, sum := range summaries {
-			if err := s.adoptIndexed(ctx, sc, sum.Path); err != nil {
+		for _, d := range indexed {
+			if err := s.adoptIndexed(ctx, sc, d.Path); err != nil {
 				return fmt.Errorf("reindex: %w", err)
 			}
 		}
 	}
-	if rebuild {
-		indexed, err := s.countIndexed(ctx, sc)
-		if err != nil {
-			return err
-		}
-		stored, err := s.store.CountKBDocuments(ctx, rs)
-		if err != nil {
-			return err
-		}
-		if stored < indexed {
-			s.log.Error("reindex: not rebuilding the collection: postgres holds fewer docs than the index, so dropping it would lose the rest; re-indexing in place",
-				"collection", col, "stored", stored, "indexed", indexed)
-		} else {
-			s.log.Info("reindex: upgrading collection to semantic search (was keyword-only)", "collection", col)
-			if _, err := s.client.Collection(col).Delete(ctx); err != nil {
-				s.log.Warn("reindex: failed to drop keyword-only collection, continuing with existing schema", "collection", col, "err", err)
-			} else if err := s.ensureCollection(ctx, sc); err != nil {
-				return fmt.Errorf("recreate collection with embeddings: %w", err)
-			}
-		}
-	}
-	var paths []string
+	live := map[string]bool{}
 	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
-		paths = append(paths, d.Path)
+		live[d.Path] = true
 		return nil
 	}); err != nil {
 		return err
 	}
-	failed := 0
-	for _, p := range paths {
-		if err := s.indexFromStore(ctx, sc, p); err != nil {
-			failed++
-			s.log.Warn("reindex: index failed", "kb", sc.String(), "path", p, "err", err)
+	deletedPaths, err := s.store.ListDeletedKBPaths(ctx, rs)
+	if err != nil {
+		return err
+	}
+	deleted := make(map[string]bool, len(deletedPaths))
+	for _, p := range deletedPaths {
+		deleted[p] = true
+	}
+	var missing []string
+	for _, d := range indexed {
+		if !live[d.Path] && !deleted[d.Path] {
+			missing = append(missing, d.Path)
 		}
 	}
-	if failed > 0 {
-		return fmt.Errorf("reindex %s: %d of %d docs failed to index", sc, failed, len(paths))
+	if len(missing) > 0 {
+		s.log.Error("reindex refused: the index holds docs postgres has no row for; nothing was changed",
+			"kb", sc.String(), "stored", len(live), "indexed", len(indexed), "missing", len(missing), "backfill_complete", done)
+		return fmt.Errorf("%w: %s has %d live docs in postgres and %d in the index; %d indexed docs have no postgres row (first: %s)",
+			ErrReindexRefused, sc, len(live), len(indexed), len(missing), missing[0])
 	}
 	return nil
+}
+
+// rowFingerprint changes whenever what a row indexes as changes.
+func rowFingerprint(d *repository.KBDocument) string {
+	anns, _ := json.Marshal(kbAnnotationsOrEmpty(d.Annotations))
+	tags, _ := json.Marshal(d.Tags)
+	return fmt.Sprintf("%d|%d|%q|%q|%q|%s|%s", d.Version, d.UpdatedAt.UnixNano(), d.Title, d.Author, d.Reason, tags, anns)
+}
+
+// syncCollection brings col in line with the KB's live Postgres rows:
+// indexes every row whose fingerprint differs from indexed[path] (all of
+// them when indexed is empty), and removes the paths in indexed that are no
+// longer live. indexed is updated to what col now holds. It returns how many
+// docs it changed.
+func (s *Service) syncCollection(ctx context.Context, sc Scope, col string, indexed map[string]string) (int, error) {
+	rs := storeScope(sc)
+	live := map[string]string{}
+	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
+		live[d.Path] = rowFingerprint(&d)
+		return nil
+	}); err != nil {
+		return 0, err
+	}
+	changed, failed := 0, 0
+	var firstErr error
+	fail := func(path string, err error) {
+		failed++
+		if firstErr == nil {
+			firstErr = err
+		}
+		s.log.Warn("reindex: index failed", "kb", sc.String(), "collection", col, "path", path, "err", err)
+	}
+	for path, fp := range live {
+		if err := ctx.Err(); err != nil {
+			return changed, err
+		}
+		if indexed[path] == fp {
+			continue
+		}
+		d, err := s.store.GetKBDocument(ctx, rs, path)
+		if errors.Is(err, repository.ErrNotFound) {
+			live[path] = "" // deleted since the listing: removed below
+			continue
+		}
+		if err != nil {
+			fail(path, err)
+			continue
+		}
+		if _, err := s.indexChunksInto(ctx, sc, col, indexedFromRow(d)); err != nil {
+			fail(path, err)
+			delete(indexed, path) // unknown state: retried by the next pass
+			continue
+		}
+		indexed[path] = rowFingerprint(d)
+		changed++
+	}
+	for path := range indexed {
+		if fp, ok := live[path]; ok && fp != "" {
+			continue
+		}
+		if err := s.deleteByPath(ctx, col, path); err != nil {
+			fail(path, err)
+			continue
+		}
+		delete(indexed, path)
+		changed++
+	}
+	if failed > 0 {
+		return changed, fmt.Errorf("%d docs failed to index into %s: %w", failed, col, firstErr)
+	}
+	return changed, nil
+}
+
+// verifyBuild catches up on writes made while col was being built and
+// checks that col holds exactly the docs it was given. Typesense indexes
+// each upsert before answering, so the count matches at once unless a write
+// or delete raced the count; it retries a few times for that.
+func (s *Service) verifyBuild(ctx context.Context, sc Scope, col string, indexed map[string]string) error {
+	var got int
+	for attempt := 1; attempt <= 5; attempt++ {
+		if _, err := s.syncCollection(ctx, sc, col, indexed); err != nil {
+			return err
+		}
+		n, err := s.countIn(ctx, col)
+		if err != nil {
+			return err
+		}
+		if n == len(indexed) {
+			return nil
+		}
+		got = n
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	return fmt.Errorf("%s holds %d docs, want %d", col, got, len(indexed))
+}
+
+// swapAlias points the alias kc.base at newCol. On the first migration (a
+// real collection holds the base name) it deletes that collection first.
+// keepNew reports whether newCol must be kept even though err is set: the
+// old collection is already gone, so newCol is the only search index left.
+func (s *Service) swapAlias(ctx context.Context, kc kbCollections, newCol string) (keepNew bool, err error) {
+	for attempt := 1; ; attempt++ {
+		_, err := s.client.Aliases().Upsert(ctx, kc.base, &api.CollectionAliasSchema{CollectionName: newCol})
+		if err == nil {
+			break
+		}
+		// Typesense refuses an alias with a collection's name. If that's
+		// why, delete the collection: its docs are all in Postgres (checked
+		// before the build) and in the verified newCol. On a retry it is one
+		// an index write recreated in the moment the name resolved to
+		// nothing; the catch-up after the swap re-indexes its docs.
+		c, gerr := s.client.Collection(kc.base).Retrieve(ctx)
+		if gerr != nil || c.Name != kc.base || attempt > 5 {
+			return keepNew, err
+		}
+		if _, derr := s.client.Collection(kc.base).Delete(ctx); derr != nil && !isNotFound(derr) {
+			return keepNew, fmt.Errorf("delete collection %s to make way for its alias: %w", kc.base, derr)
+		}
+		keepNew = true
+		s.log.Info("reindex: dropped the KB's original collection to replace it with an alias", "collection", kc.base, "new", newCol)
+	}
+	// A collection created under the base name since the alias went in
+	// would shadow it (ensureCollection also guards against this).
+	if c, err := s.client.Collection(kc.base).Retrieve(ctx); err == nil && c.Name == kc.base {
+		s.unshadowAlias(ctx, kc.base)
+	}
+	return true, nil
+}
+
+// kbCollections is what a KB's base name maps to in Typesense.
+type kbCollections struct {
+	base   string
+	alias  string   // the alias's target collection; "" without an alias
+	real   bool     // a real collection is named base (not yet migrated to an alias)
+	builds []string // collections built by reindexes (base_v<n>), the alias target among them
+}
+
+func (s *Service) kbCollections(ctx context.Context, base string) (kbCollections, error) {
+	kc := kbCollections{base: base}
+	a, err := s.client.Alias(base).Retrieve(ctx)
+	switch {
+	case err == nil:
+		kc.alias = a.CollectionName
+	case !isNotFound(err):
+		return kc, fmt.Errorf("read alias %s: %w", base, err)
+	}
+	cols, err := s.client.Collections().Retrieve(ctx, &api.GetCollectionsParams{ExcludeFields: pointer.String("fields")})
+	if err != nil {
+		return kc, fmt.Errorf("list collections: %w", err)
+	}
+	for _, c := range cols {
+		switch {
+		case c.Name == base:
+			kc.real = true
+		case isBuildOf(base, c.Name):
+			kc.builds = append(kc.builds, c.Name)
+		}
+	}
+	return kc, nil
+}
+
+// isBuildOf reports whether name is a collection a reindex built for base.
+func isBuildOf(base, name string) bool {
+	rest, ok := strings.CutPrefix(name, base+"_v")
+	if !ok || rest == "" {
+		return false
+	}
+	for _, r := range rest {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// dropCollections deletes everything a KB's base name maps to: the alias,
+// its target, a real collection of that name, and leftover builds.
+func (s *Service) dropCollections(ctx context.Context, base string) error {
+	kc, err := s.kbCollections(ctx, base)
+	if err != nil {
+		return err
+	}
+	if kc.alias != "" {
+		// The alias first: deleting a collection by the alias's name would
+		// delete its target and leave the alias dangling.
+		if _, err := s.client.Alias(base).Delete(ctx); err != nil && !isNotFound(err) {
+			return fmt.Errorf("delete alias %s: %w", base, err)
+		}
+	}
+	if kc.real {
+		if _, err := s.client.Collection(base).Delete(ctx); err != nil && !isNotFound(err) {
+			return fmt.Errorf("delete collection %s: %w", base, err)
+		}
+	}
+	for _, b := range kc.builds {
+		if _, err := s.client.Collection(b).Delete(ctx); err != nil && !isNotFound(err) {
+			return fmt.Errorf("delete collection %s: %w", b, err)
+		}
+	}
+	return nil
+}
+
+// dropCollection deletes one collection by its own name, logging a failure.
+func (s *Service) dropCollection(ctx context.Context, name string) {
+	if _, err := s.client.Collection(name).Delete(ctx); err != nil && !isNotFound(err) {
+		s.log.Warn("could not drop collection; a later reindex retries", "collection", name, "err", err)
+	}
+}
+
+// countIn counts the docs (chunk 0 records) in collection col.
+func (s *Service) countIn(ctx context.Context, col string) (int, error) {
+	q, perPage := "*", 0
+	res, err := s.client.Collection(col).Documents().Search(ctx, &api.SearchCollectionParams{
+		Q: &q, QueryBy: pointer.String("title"), FilterBy: pointer.String("chunk_index:=0"), PerPage: &perPage,
+	})
+	if err != nil {
+		return 0, err
+	}
+	if res.Found == nil {
+		return 0, nil
+	}
+	return *res.Found, nil
 }
 
 // indexedDoc is what the search index holds for one doc.
@@ -1786,7 +2151,11 @@ func (s *Service) indexChunks(ctx context.Context, sc Scope, d indexedDoc) (int,
 	if err := s.ensureCollection(ctx, sc); err != nil {
 		return 0, err
 	}
-	col := collectionName(sc)
+	return s.indexChunksInto(ctx, sc, collectionName(sc), d)
+}
+
+// indexChunksInto is indexChunks into the collection (or alias) col.
+func (s *Service) indexChunksInto(ctx context.Context, sc Scope, col string, d indexedDoc) (int, error) {
 	tags := d.tags
 	if tags == nil {
 		tags = []string{}
