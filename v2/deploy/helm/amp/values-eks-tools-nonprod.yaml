@@ -168,17 +168,6 @@ cnpg:
 postInstall:
   pullEmbeddingModel: true
 
-## -------------------------------------------------------------------------
-## AMBIENT-MESH NAMESPACE + INGRESS (Gateway API HTTPRoute)
-##
-## ⚠ INERT UNTIL TASK #271: these keys (namespace.*, ingress.httpRoute.*)
-## are NOT yet consumed by the chart templates — the ambient-mesh namespace
-## labeling and the HTTPRoute template support are added in task #271.
-## Helm ignores these unconsumed keys for now, so they are harmless but do
-## nothing yet. Re-verify the exact key names against the templates once
-## task #271 lands. (Spec: architect #269 / task #270 comment.)
-## -------------------------------------------------------------------------
-
 namespace:
   enabled: true
   labels:

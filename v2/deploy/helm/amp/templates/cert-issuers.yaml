@@ -131,12 +131,19 @@ spec:
 ---
 {{- end }}
 
+{{- $isLetsencrypt := or (eq .Values.global.tls.issuer "letsencrypt-http01") (eq .Values.global.tls.issuer "letsencrypt-dns01") }}
 {{- $issuerName := "amp-ca-issuer" }}
-{{- if or (eq .Values.global.tls.issuer "letsencrypt-http01") (eq .Values.global.tls.issuer "letsencrypt-dns01") }}
+{{- if $isLetsencrypt }}
 {{- $issuerName = "amp-letsencrypt" }}
 {{- end }}
 
-# Envoy's public TLS certificate.
+# Envoy's public TLS certificate. Coupled to its issuer's gate: the default
+# amp-ca-issuer it references only exists when certmanager.enabled (the CA
+# block above), and the amp-letsencrypt ACME issuer only when its solver
+# block above was emitted. Without one of those this Certificate would have a
+# dangling issuerRef, so bare defaults (tls.enabled=true but neither issuer
+# present) render no public cert and stay self-consistent.
+{{- if or .Values.certmanager.enabled $isLetsencrypt }}
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -152,4 +159,5 @@ spec:
     kind: Issuer
   duration: 2160h
   renewBefore: 360h
+{{- end }}
 {{- end }}
