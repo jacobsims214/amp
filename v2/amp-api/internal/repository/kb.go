@@ -268,6 +268,29 @@ func (r *Repo) CountKBDocuments(ctx context.Context, scope KBScope) (int, error)
 	return n, err
 }
 
+// ListDeletedKBPaths lists the paths of a KB's soft-deleted docs (in the
+// trash, not yet purged) that have no live row.
+func (r *Repo) ListDeletedKBPaths(ctx context.Context, scope KBScope) ([]string, error) {
+	if err := scope.validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, `SELECT path FROM kb_documents
+		WHERE scope_kind = $1 AND scope_id = $2 AND deleted_at IS NOT NULL ORDER BY path`, scope.Kind, scope.ID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // DeleteKBDocument soft-deletes a live doc and records a 'delete' version.
 // A doc that is missing or already deleted is ErrNotFound.
 func (r *Repo) DeleteKBDocument(ctx context.Context, scope KBScope, path, by string) error {

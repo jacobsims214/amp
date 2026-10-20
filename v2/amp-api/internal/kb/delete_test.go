@@ -131,7 +131,7 @@ func TestStoredDeleteAndRestore(t *testing.T) {
 	if !contains(searchPaths(t, s, sc, "zanzibarquokka"), "gone.md") {
 		t.Error("restored doc not searchable")
 	}
-	idx, err := s.GetDoc(ctx, sc, "gone.md")
+	idx, err := s.getIndexed(ctx, sc, "gone.md")
 	if err != nil || len(idx.Annotations) != 1 || idx.Content != before.Content {
 		t.Errorf("restored index doc = %+v, %v", idx, err)
 	}

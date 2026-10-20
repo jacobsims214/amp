@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -419,7 +421,63 @@ func (s *Service) writeDocNow(ctx context.Context, sc Scope, path, title, conten
 // ---- Read ----
 
 // GetDoc retrieves a document by path, returning the full content (chunk_index=0).
+// A stored KB (project, team, org) reads Postgres, so a doc reads back right
+// after it is written; until the KB's backfill completes, a doc only the
+// index has yet is read from the index (see storedRead). The global KB reads
+// the index.
 func (s *Service) GetDoc(ctx context.Context, sc Scope, path string) (*Doc, error) {
+	if !s.stored(sc) {
+		return s.getIndexed(ctx, sc, path)
+	}
+	rs := storeScope(sc)
+	d, err := s.store.GetKBDocument(ctx, rs, path)
+	if err == nil {
+		return docFromRow(sc, d), nil
+	}
+	if !errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("read %s/%s: %w", collectionName(sc), path, err)
+	}
+	notFound := fmt.Errorf("doc not found: %s/%s: %w", collectionName(sc), path, err)
+	done, deleted, err := s.storedRead(ctx, sc)
+	if err != nil {
+		return nil, err
+	}
+	if done || deleted[path] {
+		return nil, notFound
+	}
+	doc, err := s.getIndexed(ctx, sc, path)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, notFound
+		}
+		return nil, err
+	}
+	return doc, nil
+}
+
+// storedRead tells a read of a stored KB whether Postgres alone answers it
+// (the KB's backfill has completed). Until then, docs written before the
+// Postgres store existed may be only in the index, and a read merges them
+// in, skipping the paths in deleted: those were deleted in Postgres, and an
+// index entry for one is stale (its removal failed or hasn't run yet).
+func (s *Service) storedRead(ctx context.Context, sc Scope) (done bool, deleted map[string]bool, err error) {
+	rs := storeScope(sc)
+	if done, err = s.store.IsKBBackfillComplete(ctx, rs); err != nil || done {
+		return done, nil, err
+	}
+	paths, err := s.store.ListDeletedKBPaths(ctx, rs)
+	if err != nil {
+		return false, nil, err
+	}
+	deleted = make(map[string]bool, len(paths))
+	for _, p := range paths {
+		deleted[p] = true
+	}
+	return false, deleted, nil
+}
+
+// getIndexed reads a doc's canonical record (chunk 0) from the index.
+func (s *Service) getIndexed(ctx context.Context, sc Scope, path string) (*Doc, error) {
 	col := collectionName(sc)
 	id := docID(sc, path, 0)
 
@@ -539,57 +597,128 @@ func (s *Service) saveAnnotations(ctx context.Context, sc Scope, doc *Doc) error
 	return nil
 }
 
-// ListDocs returns summaries of all documents (no content).
-// Optionally filtered by tag.
+// ListDocs returns summaries of all documents (no content), most recently
+// updated first. Optionally filtered by tag. A stored KB lists Postgres
+// (merged with index-only docs until its backfill completes); the global KB
+// lists the index.
 func (s *Service) ListDocs(ctx context.Context, sc Scope, tag string) ([]DocSummary, error) {
-	if err := s.ensureCollection(ctx, sc); err != nil {
+	var docs []*Doc
+	var err error
+	if s.stored(sc) {
+		docs, err = s.listStored(ctx, sc, tag)
+	} else {
+		if err := s.ensureCollection(ctx, sc); err != nil {
+			return nil, err
+		}
+		docs, err = s.listIndexed(ctx, sc, tag)
+	}
+	if err != nil {
 		return nil, err
 	}
-	col := collectionName(sc)
-	perPage := 250
-
-	// Only fetch chunk_index=0 (canonical doc records)
-	filterBy := "chunk_index:=0"
-	if tag != "" {
-		filterBy += fmt.Sprintf(" && tags:=%s", tag)
-	}
-
-	q := "*"
-	results, err := s.client.Collection(col).Documents().Search(ctx, &api.SearchCollectionParams{
-		Q:             &q,
-		QueryBy:       pointer.String("title"),
-		FilterBy:      pointer.String(filterBy),
-		SortBy:        pointer.String("updated_at:desc"),
-		PerPage:       &perPage,
-		ExcludeFields: pointer.String("content,embedding,chunk_text"),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list docs: %w", err)
-	}
-
-	out := make([]DocSummary, 0)
-	if results.Hits == nil {
-		return out, nil
-	}
-	for _, hit := range *results.Hits {
-		if hit.Document == nil {
-			continue
-		}
-		doc := mapToDoc(hit.Document)
+	out := make([]DocSummary, 0, len(docs))
+	for _, d := range docs {
 		out = append(out, DocSummary{
-			ID:        doc.ID,
-			ProjectID: doc.ProjectID,
-			Scope:     sc.Kind,
-			ScopeID:   sc.ID,
-			Reason:    doc.Reason,
-			Path:      doc.Path,
-			Title:     doc.Title,
-			Tags:      doc.Tags,
-			Author:    doc.Author,
-			UpdatedAt: doc.UpdatedAt,
+			ID: d.ID, ProjectID: d.ProjectID, Scope: sc.Kind, ScopeID: sc.ID, Reason: d.Reason,
+			Path: d.Path, Title: d.Title, Tags: d.Tags, Author: d.Author, UpdatedAt: d.UpdatedAt,
 		})
 	}
 	return out, nil
+}
+
+// listStored lists a stored KB's live docs with their annotations, most
+// recently updated first. Before the backfill completes, docs only the index
+// has are merged in (Postgres wins for a path both have).
+func (s *Service) listStored(ctx context.Context, sc Scope, tag string) ([]*Doc, error) {
+	rows, err := s.store.ListKBDocuments(ctx, storeScope(sc), 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list docs: %w", err)
+	}
+	out := make([]*Doc, 0, len(rows))
+	have := make(map[string]bool, len(rows))
+	for i := range rows {
+		have[rows[i].Path] = true
+		if tag != "" && !slices.Contains(rows[i].Tags, tag) {
+			continue
+		}
+		d := docFromRow(sc, &rows[i])
+		d.Content, d.ChunkText = "", "" // a listing carries no content, as from the index
+		out = append(out, d)
+	}
+	done, deleted, err := s.storedRead(ctx, sc)
+	if err != nil {
+		return nil, err
+	}
+	if done {
+		return out, nil
+	}
+	indexed, err := s.listIndexed(ctx, sc, tag)
+	if err != nil {
+		return nil, err
+	}
+	merged := false
+	for _, d := range indexed {
+		if have[d.Path] || deleted[d.Path] {
+			continue
+		}
+		out = append(out, d)
+		merged = true
+	}
+	if merged {
+		sort.SliceStable(out, func(i, j int) bool { return out[i].UpdatedAt > out[j].UpdatedAt })
+	}
+	return out, nil
+}
+
+// listIndexed lists the docs the index holds (chunk 0 of each, with
+// annotations but without content), most recently updated first, page by
+// page so a KB of any size is listed whole. A collection that doesn't exist
+// yet lists empty.
+func (s *Service) listIndexed(ctx context.Context, sc Scope, tag string) ([]*Doc, error) {
+	col := collectionName(sc)
+	const perPage = 250
+	filterBy := "chunk_index:=0"
+	if tag != "" {
+		filterBy += " && tags:=" + quoteFilter(tag)
+	}
+	out := make([]*Doc, 0)
+	seen := map[string]bool{}
+	for page := 1; ; page++ {
+		q, pp, pg := "*", perPage, page
+		results, err := s.client.Collection(col).Documents().Search(ctx, &api.SearchCollectionParams{
+			Q:             &q,
+			QueryBy:       pointer.String("title"),
+			FilterBy:      pointer.String(filterBy),
+			SortBy:        pointer.String("updated_at:desc"),
+			PerPage:       &pp,
+			Page:          &pg,
+			ExcludeFields: pointer.String("content,embedding,chunk_text"),
+		})
+		if err != nil {
+			if isNotFound(err) {
+				return out, nil
+			}
+			return nil, fmt.Errorf("list docs: %w", err)
+		}
+		if results.Hits == nil {
+			return out, nil
+		}
+		for _, hit := range *results.Hits {
+			if hit.Document == nil {
+				continue
+			}
+			doc := mapToDoc(hit.Document)
+			// A write between pages can shift a doc onto the next page.
+			if seen[doc.Path] {
+				continue
+			}
+			seen[doc.Path] = true
+			doc.Scope, doc.ScopeID = sc.Kind, sc.ID
+			out = append(out, doc)
+		}
+		if len(*results.Hits) < perPage {
+			return out, nil
+		}
+	}
 }
 
 // computeRecencyLabel returns a human-readable label based on how recent the document is.
@@ -781,8 +910,28 @@ func clamp01(f float64) float64 {
 
 // CountDocs returns how many documents a KB holds, 0 if nothing has ever
 // been written to it. Unlike the other reads it doesn't create the
-// collection.
+// collection. A stored KB counts its live Postgres rows (plus index-only
+// docs until its backfill completes).
 func (s *Service) CountDocs(ctx context.Context, sc Scope) (int, error) {
+	if !s.stored(sc) {
+		return s.countIndexed(ctx, sc)
+	}
+	done, _, err := s.storedRead(ctx, sc)
+	if err != nil {
+		return 0, err
+	}
+	if done {
+		return s.store.CountKBDocuments(ctx, storeScope(sc))
+	}
+	docs, err := s.listStored(ctx, sc, "")
+	if err != nil {
+		return 0, err
+	}
+	return len(docs), nil
+}
+
+// countIndexed counts the docs the index holds.
+func (s *Service) countIndexed(ctx context.Context, sc Scope) (int, error) {
 	q := "*"
 	perPage := 0
 	res, err := s.client.Collection(collectionName(sc)).Documents().Search(ctx, &api.SearchCollectionParams{
@@ -858,60 +1007,56 @@ func (s *Service) ListTags(ctx context.Context, sc Scope) ([]TagCount, error) {
 
 // KBStatus returns health metrics for the knowledge base.
 // This is an idempotent, read-only operation that provides doc counts,
-// stale doc counts, annotation statistics, and tag distribution.
+// stale doc counts, annotation statistics, and tag distribution. A stored KB
+// counts from the same docs ListDocs returns; the global KB from the index.
 func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
-	if err := s.ensureCollection(ctx, sc); err != nil {
-		return nil, err
-	}
-
-	// List all docs (no tag filter)
-	docs, err := s.ListDocs(ctx, sc, "")
-	if err != nil {
-		return nil, fmt.Errorf("list docs: %w", err)
-	}
-
-	// Initialize counters
-	totalDocs := len(docs)
-	staleDocs := 0
-	docsWithAnnotations := 0
-	totalAnnotations := 0
-	unresolvedAnnotations := 0
-	docsByTag := make(map[string]int)
-
-	// 90 days in seconds
-	ninetyDaysAgo := time.Now().AddDate(0, 0, -90).Unix()
-
-	// Process each doc
-	for _, summary := range docs {
-		// Get full doc to access annotations
-		fullDoc, err := s.GetDoc(ctx, sc, summary.Path)
+	var docs []*Doc
+	if s.stored(sc) {
+		var err error
+		if docs, err = s.listStored(ctx, sc, ""); err != nil {
+			return nil, fmt.Errorf("list docs: %w", err)
+		}
+	} else {
+		if err := s.ensureCollection(ctx, sc); err != nil {
+			return nil, err
+		}
+		summaries, err := s.ListDocs(ctx, sc, "")
 		if err != nil {
-			s.log.Warn("KBStatus: skip doc", "path", summary.Path, "err", err)
-			continue
+			return nil, fmt.Errorf("list docs: %w", err)
 		}
-
-		// Count stale docs (updated_at > 90 days ago)
-		if fullDoc.UpdatedAt < ninetyDaysAgo {
-			staleDocs++
+		for _, summary := range summaries {
+			// Get full doc to access annotations
+			fullDoc, err := s.GetDoc(ctx, sc, summary.Path)
+			if err != nil {
+				s.log.Warn("KBStatus: skip doc", "path", summary.Path, "err", err)
+				continue
+			}
+			docs = append(docs, fullDoc)
 		}
+	}
 
-		// Count docs with annotations
-		if len(fullDoc.Annotations) > 0 {
-			docsWithAnnotations++
+	st := &StatusInfo{TotalDocs: len(docs), DocsByTag: make(map[string]int)}
+	ninetyDaysAgo := time.Now().AddDate(0, 0, -90).Unix()
+	for _, d := range docs {
+		if d.UpdatedAt < ninetyDaysAgo {
+			st.StaleDocs++
 		}
-
-		// Count total and unresolved annotations
-		for _, ann := range fullDoc.Annotations {
-			totalAnnotations++
+		if len(d.Annotations) > 0 {
+			st.DocsWithAnnotations++
+		}
+		for _, ann := range d.Annotations {
+			st.TotalAnnotations++
 			if !ann.IsResolved {
-				unresolvedAnnotations++
+				st.UnresolvedAnnotations++
 			}
 		}
-
-		// Count docs by tag
-		for _, tag := range fullDoc.Tags {
-			docsByTag[tag]++
+		for _, tag := range d.Tags {
+			st.DocsByTag[tag]++
 		}
+	}
+	if s.stored(sc) {
+		// Counted from every doc above; the index's tag facets stop at 100.
+		return st, nil
 	}
 
 	// Get tag distribution from ListTags
@@ -919,20 +1064,10 @@ func (s *Service) KBStatus(ctx context.Context, sc Scope) (*StatusInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list tags: %w", err)
 	}
-
-	// Update docsByTag with actual counts from ListTags
 	for _, tc := range tagCounts {
-		docsByTag[tc.Tag] = tc.Count
+		st.DocsByTag[tc.Tag] = tc.Count
 	}
-
-	return &StatusInfo{
-		TotalDocs:             totalDocs,
-		StaleDocs:             staleDocs,
-		DocsWithAnnotations:   docsWithAnnotations,
-		TotalAnnotations:      totalAnnotations,
-		UnresolvedAnnotations: unresolvedAnnotations,
-		DocsByTag:             docsByTag,
-	}, nil
+	return st, nil
 }
 
 // ---- Delete ----
@@ -1088,11 +1223,54 @@ func payloadScope(kind string, id, projectID int) Scope {
 }
 
 // Drop deletes a whole knowledge base (e.g. when its team or org is deleted).
+// A stored KB's docs go to the trash (soft-deleted, purged after 30 days,
+// restorable until then) before its search collection is dropped; if that
+// fails, the collection is kept.
 func (s *Service) Drop(ctx context.Context, sc Scope) error {
+	if s.stored(sc) {
+		if err := s.trashStored(ctx, sc); err != nil {
+			return fmt.Errorf("move the docs of %s to the trash: %w", sc, err)
+		}
+	}
 	col := collectionName(sc)
 	_, err := s.client.Collection(col).Delete(ctx)
 	if err != nil && !isNotFound(err) {
 		return fmt.Errorf("delete collection %s: %w", col, err)
+	}
+	return nil
+}
+
+// trashStored soft-deletes every live doc of a stored KB. Until its backfill
+// completes, docs only the index has are first copied into Postgres, so
+// dropping the collection afterwards loses none of them.
+func (s *Service) trashStored(ctx context.Context, sc Scope) error {
+	rs := storeScope(sc)
+	done, err := s.store.IsKBBackfillComplete(ctx, rs)
+	if err != nil {
+		return err
+	}
+	if !done {
+		indexed, err := s.listIndexed(ctx, sc, "")
+		if err != nil {
+			return err
+		}
+		for _, d := range indexed {
+			if err := s.adoptIndexed(ctx, sc, d.Path); err != nil {
+				return err
+			}
+		}
+	}
+	var paths []string
+	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
+		paths = append(paths, d.Path)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if err := s.store.DeleteKBDocument(ctx, rs, p, "kb-drop"); err != nil && !errors.Is(err, repository.ErrNotFound) {
+			return err
+		}
 	}
 	return nil
 }
@@ -1299,6 +1477,8 @@ type Store interface {
 		fn func([]domain.KBAnnotation) ([]domain.KBAnnotation, error)) (*repository.KBDocument, error)
 	InsertKBDocumentIfMissing(ctx context.Context, scope repository.KBScope, d repository.KBDocument, by string) (bool, error)
 	CountKBDocuments(ctx context.Context, scope repository.KBScope) (int, error)
+	ListKBDocuments(ctx context.Context, scope repository.KBScope, limit, offset int) ([]repository.KBDocument, error)
+	ListDeletedKBPaths(ctx context.Context, scope repository.KBScope) ([]string, error)
 	StreamKBDocuments(ctx context.Context, scope repository.KBScope, fn func(repository.KBDocument) error) error
 	IsKBBackfillComplete(ctx context.Context, scope repository.KBScope) (bool, error)
 	DeleteKBDocument(ctx context.Context, scope repository.KBScope, path, by string) error
@@ -1381,7 +1561,7 @@ func (s *Service) adoptIndexed(ctx context.Context, sc Scope, path string) error
 	} else if !errors.Is(err, repository.ErrNotFound) {
 		return err
 	}
-	old, err := s.GetDoc(ctx, sc, path)
+	old, err := s.getIndexed(ctx, sc, path)
 	if err != nil {
 		if isNotFound(err) {
 			return nil
@@ -1532,7 +1712,7 @@ func (s *Service) reindexFromStore(ctx context.Context, sc Scope, rebuild bool) 
 		return err
 	}
 	if !done {
-		summaries, err := s.ListDocs(ctx, sc, "")
+		summaries, err := s.listIndexed(ctx, sc, "")
 		if err != nil {
 			return err
 		}
@@ -1543,7 +1723,7 @@ func (s *Service) reindexFromStore(ctx context.Context, sc Scope, rebuild bool) 
 		}
 	}
 	if rebuild {
-		indexed, err := s.CountDocs(ctx, sc)
+		indexed, err := s.countIndexed(ctx, sc)
 		if err != nil {
 			return err
 		}

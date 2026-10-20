@@ -181,7 +181,7 @@ func TestStoredRewriteReplacesChunks(t *testing.T) {
 	if _, err := s.WriteDoc(ctx, sc, "c.md", "C", longDoc(3, "beta"), "me", nil, "", nil); err != nil {
 		t.Fatal(err)
 	}
-	doc, err := s.GetDoc(ctx, sc, "c.md")
+	doc, err := s.getIndexed(ctx, sc, "c.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,7 +219,7 @@ func TestIndexJobReadsCurrentRow(t *testing.T) {
 	if err := s.HandleIndexDocTask(ctx, indexTask(t, sc, "j.md")); err != nil {
 		t.Fatal(err)
 	}
-	doc, err := s.GetDoc(ctx, sc, "j.md")
+	doc, err := s.getIndexed(ctx, sc, "j.md")
 	if err != nil || doc.Content != "version two" {
 		t.Fatalf("after index job: %+v, %v", doc, err)
 	}
@@ -230,7 +230,7 @@ func TestIndexJobReadsCurrentRow(t *testing.T) {
 	if err := s.HandleIndexDocTask(ctx, indexTask(t, sc, "j.md")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.GetDoc(ctx, sc, "j.md"); err == nil {
+	if _, err := s.getIndexed(ctx, sc, "j.md"); err == nil {
 		t.Error("a deleted row is still in the index")
 	}
 }
@@ -277,7 +277,7 @@ func TestStoredConcurrentAnnotations(t *testing.T) {
 	if !row.UpdatedAt.Equal(before.UpdatedAt) || row.Version != before.Version {
 		t.Errorf("annotations moved updated_at %v -> %v or version %d -> %d", before.UpdatedAt, row.UpdatedAt, before.Version, row.Version)
 	}
-	doc, err := s.GetDoc(ctx, sc, "a.md")
+	doc, err := s.getIndexed(ctx, sc, "a.md")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -313,7 +313,7 @@ func TestStoredReviveClearsAnnotations(t *testing.T) {
 	if row := mustRow(t, repo, sc, "r.md"); len(row.Annotations) != 0 || row.Content != "second life" {
 		t.Errorf("revived row = %+v, want no annotations", row)
 	}
-	doc, err := s.GetDoc(ctx, sc, "r.md")
+	doc, err := s.getIndexed(ctx, sc, "r.md")
 	if err != nil || len(doc.Annotations) != 0 {
 		t.Errorf("revived index doc = %+v, %v", doc, err)
 	}
@@ -371,7 +371,7 @@ func TestLegacyWriteTaskIsSaved(t *testing.T) {
 	if row := mustRow(t, repo, sc, "q.md"); row.Content != "queued before the upgrade" {
 		t.Errorf("postgres row = %+v", row)
 	}
-	doc, err := s.GetDoc(ctx, sc, "q.md")
+	doc, err := s.getIndexed(ctx, sc, "q.md")
 	if err != nil || doc.Content != "queued before the upgrade" {
 		t.Errorf("index doc = %+v, %v", doc, err)
 	}
@@ -404,7 +404,7 @@ func TestStoredReindexKeepsUpdatedAt(t *testing.T) {
 	if err := s.reindex(ctx, sc, true); err != nil {
 		t.Fatal(err)
 	}
-	doc, err := s.GetDoc(ctx, sc, "d.md")
+	doc, err := s.getIndexed(ctx, sc, "d.md")
 	if err != nil {
 		t.Fatal(err)
 	}
