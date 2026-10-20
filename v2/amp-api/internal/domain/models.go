@@ -378,6 +378,12 @@ type ExportKBDoc struct {
 	Tags        []string       `json:"tags"`
 	Author      string         `json:"author"`
 	Annotations []KBAnnotation `json:"annotations,omitempty"`
+	// Reason, CreatedAt and UpdatedAt (unix seconds) were added with the
+	// Postgres KB store. Exports made before then lack them; an import treats
+	// a zero date as "now".
+	Reason    string `json:"reason,omitempty"`
+	CreatedAt int64  `json:"created_at,omitempty"`
+	UpdatedAt int64  `json:"updated_at,omitempty"`
 }
 
 // KBAnnotation is a note left on a KB doc (kb.Annotation).

@@ -2146,38 +2146,17 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 		return nil, fmt.Errorf("build export bundle: %w", err)
 	}
 
-	// 2. Fetch all KB documents for this project
-	// (none when the knowledge base isn't configured)
-	var docSummaries []kb.DocSummary
+	// 2. Every live KB doc, with annotations and original dates (Postgres
+	// for a stored KB; none when the knowledge base isn't configured). A
+	// failed read fails the export rather than leave docs out of it.
+	kbDocs := []domain.ExportKBDoc{}
 	if s.kb != nil {
-		if docSummaries, err = s.kb.ListDocs(ctx, kb.Project(projectID), ""); err != nil {
-			return nil, fmt.Errorf("list kb docs: %w", err)
+		if kbDocs, err = s.kb.ExportDocs(ctx, kb.Project(projectID)); err != nil {
+			return nil, fmt.Errorf("export kb docs: %w", err)
 		}
 	}
 
-	// 3. Fetch full content for each KB document
-	kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
-	for _, summary := range docSummaries {
-		doc, err := s.kb.GetDoc(ctx, kb.Project(projectID), summary.Path)
-		if err != nil {
-			// Log warning but continue (graceful degradation)
-			slog.Default().Warn("failed to fetch kb doc", "path", summary.Path, "err", err)
-			continue
-		}
-		// Convert kb.Doc to ExportKBDoc
-		exportDoc := domain.ExportKBDoc{
-			Path:    doc.Path,
-			Title:   doc.Title,
-			Content: doc.Content,
-			Tags:    doc.Tags, // kb.Doc.Tags is []string
-			Author:  doc.Author,
-			// Annotations travel with the doc.
-			Annotations: doc.Annotations,
-		}
-		kbDocs = append(kbDocs, exportDoc)
-	}
-
-	// 4. Assemble the complete bundle with KB docs
+	// 3. Assemble the complete bundle with KB docs
 	bundle.KBDocs = kbDocs
 
 	return jsonResult(bundle)
@@ -2219,24 +2198,26 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	}
 	_ = pid // actor is now registered
 
-	// 3. Re-index KB documents into Typesense
+	// 3. Recreate the KB docs, keeping their annotations and dates.
+	imported, failed := 0, []string{}
 	for _, kbDoc := range bundle.KBDocs {
 		if s.kb == nil {
 			slog.Default().Warn("knowledge base not configured; skipping the bundle's KB docs", "docs", len(bundle.KBDocs))
 			break
 		}
-		_, err := s.kb.WriteDoc(ctx, kb.Project(newProject.ID), kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags, "", kbDoc.Annotations)
-		if err != nil {
-			// Log warning but continue (graceful degradation)
-			slog.Default().Warn("failed to write kb doc during import", "path", kbDoc.Path, "err", err)
+		if err := s.kb.ImportDoc(ctx, kb.Project(newProject.ID), kbDoc); err != nil {
+			// Log and carry on: the project itself is already imported.
+			slog.Default().Warn("failed to import kb doc", "path", kbDoc.Path, "err", err)
+			failed = append(failed, kbDoc.Path)
 			continue
 		}
+		imported++
 	}
 
 	// 4. Publish event for real-time UI updates
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
 
-	return jsonResult(map[string]interface{}{"project": newProject})
+	return jsonResult(map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed})
 }
 
 // ---- Metadata ----

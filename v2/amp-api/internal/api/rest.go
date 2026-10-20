@@ -495,17 +495,15 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = pid // Actor is now spawned and loading from DB
 
-		// Re-index all KB docs: for each bundle.KBDocs, call WriteDoc
+		// Recreate the KB docs, keeping their annotations and dates.
 		for _, doc := range bundle.KBDocs {
 			if h.kb == nil {
 				slog.Warn("knowledge base not configured; skipping the bundle's KB docs", "docs", len(bundle.KBDocs))
 				break
 			}
-			// Convert []string tags to []string (already in correct format)
-			_, err := h.kb.WriteDoc(r.Context(), kb.Project(newProject.ID), doc.Path, doc.Title, doc.Content, doc.Author, doc.Tags, "", doc.Annotations)
-			if err != nil {
+			if err := h.kb.ImportDoc(r.Context(), kb.Project(newProject.ID), doc); err != nil {
 				// Log but continue — don't fail the entire import if one doc fails
-				slog.Warn("failed to write KB doc during import", "path", doc.Path, "err", err)
+				slog.Warn("failed to import KB doc", "path", doc.Path, "err", err)
 			}
 		}
 
@@ -817,33 +815,15 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Fetch KB docs and add them to the bundle
-		// (none when the knowledge base isn't configured)
-		var docSummaries []kb.DocSummary
+		// Every live KB doc, with annotations and original dates (none when
+		// the knowledge base isn't configured). A failed read fails the export
+		// rather than leave docs out of it.
+		kbDocs := []domain.ExportKBDoc{}
 		if h.kb != nil {
-			if docSummaries, err = h.kb.ListDocs(r.Context(), kb.Project(projectID), ""); err != nil {
+			if kbDocs, err = h.kb.ExportDocs(r.Context(), kb.Project(projectID)); err != nil {
 				jsonErr(w, err, 500)
 				return
 			}
-		}
-
-		kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
-		for _, summary := range docSummaries {
-			doc, err := h.kb.GetDoc(r.Context(), kb.Project(projectID), summary.Path)
-			if err != nil {
-				// Log but continue — don't fail the entire export if one doc is missing
-				slog.Warn("failed to fetch KB doc for export", "path", summary.Path, "err", err)
-				continue
-			}
-			kbDocs = append(kbDocs, domain.ExportKBDoc{
-				Path:    doc.Path,
-				Title:   doc.Title,
-				Content: doc.Content,
-				Tags:    doc.Tags,
-				Author:  doc.Author,
-				// Annotations travel with the doc.
-				Annotations: doc.Annotations,
-			})
 		}
 		bundle.KBDocs = kbDocs
 
