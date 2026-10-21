@@ -766,9 +766,13 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		})), wrap(ctx, s.open(s.kbGet)))
 
 	mcp.AddTool(tool("amp_kb_list",
-		"List all documents in a knowledge base (project KB unless scope says otherwise). Optionally filter by tag.",
+		"List the documents in a knowledge base (project KB unless scope says otherwise), most recently updated first, "+
+			"without content. Optionally filter by tag. Returns one page: the newest 250 by default. total is how many docs "+
+			"the listing has (with the tag, if given); next_offset is present when more remain: pass it as offset for the next page.",
 		kbArgs(props{
-			"tag": str("Optional. Filter to documents with this tag."),
+			"tag":    str("Optional. Filter to documents with this tag."),
+			"limit":  num(fmt.Sprintf("Optional. Docs per page (default %d, max %d).", kbListDefault, kbListMax)),
+			"offset": num("Optional. How many docs to skip (default 0): the next_offset of the previous page."),
 		})), wrap(ctx, s.open(s.kbList)))
 
 	mcp.AddTool(tool("amp_kb_delete",
@@ -777,6 +781,20 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		kbArgs(props{
 			"path": str("REQUIRED. Document path to delete."),
 		})), wrap(ctx, s.open(s.kbDelete)))
+
+	mcp.AddTool(tool("amp_kb_list_deleted",
+		"List a knowledge base's deleted documents that can still be restored (project KB unless scope says otherwise): "+
+			"docs deleted in the last 30 days, with path, title, deleted_at and deleted_by, most recently deleted first. "+
+			"Restore one with amp_kb_restore. Needs write access to that KB, the same as amp_kb_delete.",
+		kbArgs(nil)), wrap(ctx, s.open(s.kbListDeleted)))
+
+	mcp.AddTool(tool("amp_kb_restore",
+		"Bring a knowledge base document back from the KB trash by its path (project KB unless scope says otherwise), with "+
+			"the content, title, tags and annotations it had; it is readable and searchable again. Works for docs removed in the "+
+			"last 30 days; list the KB trash first to find the path. Needs write access to that KB, the same as amp_kb_delete.",
+		kbArgs(props{
+			"path": str("REQUIRED. Path of the document in the trash, e.g. 'architecture/auth.md'."),
+		})), wrap(ctx, s.open(s.kbRestore)))
 
 	mcp.AddTool(tool("amp_kb_tags",
 		"List all tags used in a knowledge base (project KB unless scope says otherwise) with document counts.",
@@ -812,7 +830,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		})), wrap(ctx, s.open(s.kbResolveAnnotation)))
 
 	mcp.AddTool(tool("amp_kb_status",
-		"Get KB health metrics: doc counts, stale docs, annotation stats, and tag distribution (project KB unless scope says otherwise). Use this to assess KB health before curator maintenance.",
+		"Get KB health metrics (project KB unless scope says otherwise): total_docs, stale_docs, docs_with_annotations, "+
+			"total_annotations, unresolved_annotations and docs_by_tag. Also durability: stored_docs (live docs in Postgres, "+
+			"the source of truth), indexed_docs (docs in the search index; index_error instead if it can't be reached) and "+
+			"backfill {status: complete|failed|started|not_started, started_at, completed_at, doc_count, last_error}. "+
+			"stored_docs equal to indexed_docs means search covers every doc. The global KB has no Postgres copy, so "+
+			"stored_docs and backfill are absent there (note says why). Use this to assess KB health before curator maintenance.",
 		kbArgs(nil)), wrap(ctx, s.open(s.kbStatus)))
 }
 
@@ -2146,38 +2169,17 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 		return nil, fmt.Errorf("build export bundle: %w", err)
 	}
 
-	// 2. Fetch all KB documents for this project
-	// (none when the knowledge base isn't configured)
-	var docSummaries []kb.DocSummary
+	// 2. Every live KB doc, with annotations and original dates (Postgres
+	// for a stored KB; none when the knowledge base isn't configured). A
+	// failed read fails the export rather than leave docs out of it.
+	kbDocs := []domain.ExportKBDoc{}
 	if s.kb != nil {
-		if docSummaries, err = s.kb.ListDocs(ctx, kb.Project(projectID), ""); err != nil {
-			return nil, fmt.Errorf("list kb docs: %w", err)
+		if kbDocs, err = s.kb.ExportDocs(ctx, kb.Project(projectID)); err != nil {
+			return nil, fmt.Errorf("export kb docs: %w", err)
 		}
 	}
 
-	// 3. Fetch full content for each KB document
-	kbDocs := make([]domain.ExportKBDoc, 0, len(docSummaries))
-	for _, summary := range docSummaries {
-		doc, err := s.kb.GetDoc(ctx, kb.Project(projectID), summary.Path)
-		if err != nil {
-			// Log warning but continue (graceful degradation)
-			slog.Default().Warn("failed to fetch kb doc", "path", summary.Path, "err", err)
-			continue
-		}
-		// Convert kb.Doc to ExportKBDoc
-		exportDoc := domain.ExportKBDoc{
-			Path:    doc.Path,
-			Title:   doc.Title,
-			Content: doc.Content,
-			Tags:    doc.Tags, // kb.Doc.Tags is []string
-			Author:  doc.Author,
-			// Annotations travel with the doc.
-			Annotations: doc.Annotations,
-		}
-		kbDocs = append(kbDocs, exportDoc)
-	}
-
-	// 4. Assemble the complete bundle with KB docs
+	// 3. Assemble the complete bundle with KB docs
 	bundle.KBDocs = kbDocs
 
 	return jsonResult(bundle)
@@ -2219,24 +2221,26 @@ func (s *Server) importProject(rctx context.Context, args map[string]interface{}
 	}
 	_ = pid // actor is now registered
 
-	// 3. Re-index KB documents into Typesense
+	// 3. Recreate the KB docs, keeping their annotations and dates.
+	imported, failed := 0, []string{}
 	for _, kbDoc := range bundle.KBDocs {
 		if s.kb == nil {
 			slog.Default().Warn("knowledge base not configured; skipping the bundle's KB docs", "docs", len(bundle.KBDocs))
 			break
 		}
-		_, err := s.kb.WriteDoc(ctx, kb.Project(newProject.ID), kbDoc.Path, kbDoc.Title, kbDoc.Content, kbDoc.Author, kbDoc.Tags, "", kbDoc.Annotations)
-		if err != nil {
-			// Log warning but continue (graceful degradation)
-			slog.Default().Warn("failed to write kb doc during import", "path", kbDoc.Path, "err", err)
+		if err := s.kb.ImportDoc(ctx, kb.Project(newProject.ID), kbDoc); err != nil {
+			// Log and carry on: the project itself is already imported.
+			slog.Default().Warn("failed to import kb doc", "path", kbDoc.Path, "err", err)
+			failed = append(failed, kbDoc.Path)
 			continue
 		}
+		imported++
 	}
 
 	// 4. Publish event for real-time UI updates
 	s.hub.Publish(domain.Event{Type: domain.EventProjectCreated, ProjectID: newProject.ID, Payload: newProject, At: time.Now()})
 
-	return jsonResult(map[string]interface{}{"project": newProject})
+	return jsonResult(map[string]interface{}{"project": newProject, "kb_docs_imported": imported, "kb_docs_failed": failed})
 }
 
 // ---- Metadata ----
@@ -2564,12 +2568,30 @@ func (s *Server) kbList(ctx context.Context, args map[string]interface{}) (*mcpg
 	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	docs, err := s.kb.ListDocs(ctx, k.Scope, optStr(args, "tag", ""))
+	limit := optInt(args, "limit", kbListDefault)
+	if limit <= 0 {
+		limit = kbListDefault
+	}
+	limit = min(limit, kbListMax)
+	offset := max(optInt(args, "offset", 0), 0)
+	docs, total, err := s.kb.ListDocsPage(ctx, k.Scope, optStr(args, "tag", ""), limit, offset)
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"kb": k, "docs": docs, "count": len(docs)})
+	out := map[string]interface{}{"kb": k, "docs": docs, "count": len(docs), "total": total}
+	if next := offset + len(docs); len(docs) > 0 && next < total {
+		out["next_offset"] = next
+	}
+	return jsonResult(out)
 }
+
+// amp_kb_list's page size: the default is the cap it had before KB reads
+// moved to Postgres (#1989); a whole big KB in one tool result is too large
+// for an agent's context.
+const (
+	kbListDefault = 250
+	kbListMax     = 1000
+)
 
 func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	k, err := s.kbOf(ctx, args, kbChange)
@@ -2587,10 +2609,48 @@ func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mc
 	if err := s.requireKB(); err != nil {
 		return nil, err
 	}
-	if err := s.kb.DeleteDoc(ctx, k.Scope, path); err != nil {
+	if err := s.kb.DeleteDoc(ctx, k.Scope, path, authorOf(ctx, nil)); err != nil {
 		return nil, err
 	}
 	return jsonResult(map[string]interface{}{"deleted": true, "path": path, "kb": k})
+}
+
+func (s *Server) kbListDeleted(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	docs, err := s.kb.ListDeletedDocs(ctx, k.Scope)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"kb": k, "docs": docs, "count": len(docs)})
+}
+
+func (s *Server) kbRestore(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	k, err := s.kbOf(ctx, args, kbChange)
+	if err != nil {
+		return nil, err
+	}
+	path, err := reqStr(args, "path")
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(strings.TrimPrefix(path, "/"), domain.DesignSystemPrefix) {
+		return nil, fmt.Errorf("design-system/ docs are only written by publishing a design system version (amp_design_system_publish), " +
+			"so they always come from phases a person approved; to change them, start a new version with amp_design_system_start")
+	}
+	if err := s.requireKB(); err != nil {
+		return nil, err
+	}
+	doc, err := s.kb.RestoreDoc(ctx, k.Scope, path, authorOf(ctx, nil))
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"restored": true, "kb": k, "doc": doc})
 }
 
 func (s *Server) kbTags(ctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

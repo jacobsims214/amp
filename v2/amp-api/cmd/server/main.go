@@ -194,6 +194,9 @@ func main() {
 		envOrDefault("OLLAMA_URL", "http://localhost:11434"),
 		envOrDefault("OLLAMA_MODEL", "nomic-embed-text"),
 	)
+	// Postgres is the source of truth for project, team and org KB docs;
+	// Typesense is their search index (decisions/kb-postgres-source-of-truth.md).
+	kbSvc.SetStore(repo)
 
 	// ---- 4b. KB indexing queue (Valkey/Redis via asynq) ----
 	// Optional: if REDIS_ADDR is unset (e.g. local `make dev` without
@@ -222,6 +225,7 @@ func main() {
 		mux := asynq.NewServeMux()
 		mux.HandleFunc(queue.TypeKBWriteDoc, kbSvc.HandleWriteDocTask)
 		mux.HandleFunc(queue.TypeKBDeleteDoc, kbSvc.HandleDeleteDocTask)
+		mux.HandleFunc(queue.TypeKBIndexDoc, kbSvc.HandleIndexDocTask)
 		if err := asynqWorker.Start(mux); err != nil {
 			slog.Error("failed to start asynq worker", "err", err)
 			os.Exit(1)
@@ -230,6 +234,41 @@ func main() {
 	} else {
 		slog.Warn("REDIS_ADDR not set — KB writes/deletes will run synchronously (fine for local dev, not recommended under real load)")
 	}
+
+	// ---- 4b'. KB backfill, then the reconciler ----
+	// The per-KB reindex lock must be cross-replica before the backfill and
+	// the first reconcile pass (mcp.NewServer sets the same lock later;
+	// setting it twice is harmless).
+	kbSvc.SetReindexLock(repo.TryNamedLock)
+	//
+	// The backfill copies every doc the Typesense index holds for a
+	// project, team or org KB (archived projects and KBs whose owner is gone
+	// included) into Postgres, insert-only, and marks each KB complete once
+	// the copy is verified; reads, reindex and the reconciler wait for that.
+	// A failed KB stays incomplete and the next startup retries it. One
+	// replica runs it (advisory lock); it runs in the background and never
+	// blocks startup. KB_BACKFILL=off skips it.
+	//
+	// The reconciler re-indexes docs that are in Postgres but missing or
+	// stale in the search index (e.g. written while Typesense was down), and
+	// removes index entries of deleted docs. It never writes Postgres. It
+	// starts once the backfill run ends, then runs every
+	// KB_RECONCILE_INTERVAL (default 15m; "off" or 0 disables); the advisory
+	// lock lets only one replica run a pass.
+	reconcileEvery := kbReconcileInterval()
+	if reconcileEvery <= 0 {
+		slog.Info("KB reconciler disabled (KB_RECONCILE_INTERVAL)")
+	}
+	go func() {
+		if os.Getenv("KB_BACKFILL") != "off" {
+			kbSvc.RunBackfill(ctx, repo.ListKBOwnerScopes, repo.TryNamedLock)
+		} else {
+			slog.Warn("KB backfill disabled (KB_BACKFILL=off): KBs not yet backfilled stay incomplete")
+		}
+		if reconcileEvery > 0 {
+			kbSvc.RunReconciler(ctx, reconcileEvery, repo.TryNamedLock)
+		}
+	}()
 
 	// ---- 4c. AMP guide (the global KB) ----
 	// The image ships the repo's kb/ folder; every replica syncs it into the
@@ -419,4 +458,25 @@ func artifactRetention() time.Duration {
 		return time.Duration(d) * 24 * time.Hour
 	}
 	return 0 // the service default
+}
+
+// kbReconcileInterval is how often the KB reconciler runs, from
+// KB_RECONCILE_INTERVAL (a Go duration, e.g. "10m"). Unset means 15
+// minutes; "off", "0" or a non-positive duration disables it. An
+// unparseable value falls back to the default.
+func kbReconcileInterval() time.Duration {
+	const def = 15 * time.Minute
+	v := strings.TrimSpace(os.Getenv("KB_RECONCILE_INTERVAL"))
+	switch v {
+	case "":
+		return def
+	case "off", "0":
+		return 0
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		slog.Warn("bad KB_RECONCILE_INTERVAL; using the default", "value", v, "default", def.String())
+		return def
+	}
+	return d
 }

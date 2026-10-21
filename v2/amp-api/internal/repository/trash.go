@@ -14,13 +14,17 @@ import (
 // the rest. A Postgres interval literal.
 const TrashRetention = "30 days"
 
-// PurgeTrash deletes trash rows (deleted tickets, epics and stories) older
-// than TrashRetention, and returns how many it deleted. It is a plain
-// DELETE ... WHERE deleted_at < cutoff, so several replicas running it at
-// once is safe: whichever gets a row deletes it, the others skip it.
+// PurgeTrash deletes trash rows older than TrashRetention, and returns how
+// many it deleted: deleted tickets, epics and stories, and soft-deleted KB
+// docs (kb_documents rows with deleted_at set; their kb_document_versions
+// go with them by ON DELETE CASCADE). This is the only place a KB doc is
+// ever removed from Postgres. It is a plain DELETE ... WHERE deleted_at <
+// cutoff, so several replicas running it at once is safe: whichever gets a
+// row deletes it, the others skip it. A doc revived or restored before the
+// purge has deleted_at NULL again and is never matched.
 func (r *Repo) PurgeTrash(ctx context.Context) (int64, error) {
 	var n int64
-	for _, table := range []string{"deleted_tasks", "deleted_groups"} {
+	for _, table := range []string{"deleted_tasks", "deleted_groups", "kb_documents"} {
 		tag, err := r.db.Exec(ctx, `DELETE FROM `+table+` WHERE deleted_at < NOW() - INTERVAL '`+TrashRetention+`'`)
 		if err != nil {
 			return n, fmt.Errorf("purge %s: %w", table, err)
@@ -316,4 +320,32 @@ func (r *Repo) RestoreGroup(ctx context.Context, projectID int, kind string, id 
 		return nil, err
 	}
 	return g, tx.Commit(ctx)
+}
+
+// ListTrashedKBPaths returns the paths of a KB's docs that are in the trash
+// and were deleted by `by`, deleted less than TrashRetention ago (the purge
+// removes older ones). kb.Service.Drop records "kb-drop", so restoring a
+// dropped KB brings back only what the drop deleted, not docs deleted one
+// by one before it.
+func (r *Repo) ListTrashedKBPaths(ctx context.Context, scope KBScope, by string) ([]string, error) {
+	if err := scope.validate(); err != nil {
+		return nil, err
+	}
+	rows, err := r.db.Query(ctx, `SELECT path FROM kb_documents
+		WHERE scope_kind = $1 AND scope_id = $2 AND deleted_by = $3
+		  AND deleted_at IS NOT NULL AND deleted_at > NOW() - INTERVAL '`+TrashRetention+`'
+		ORDER BY path`, scope.Kind, scope.ID, by)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
