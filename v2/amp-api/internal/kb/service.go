@@ -1307,11 +1307,12 @@ func (s *Service) DeleteDoc(ctx context.Context, sc Scope, path, by string) erro
 }
 
 // softDeleteStored soft-deletes path's Postgres row. A doc that so far
-// exists only in the index is copied into Postgres first (adoptIndexed), so
-// it is deleted into the trash rather than dropped. A path with no live row
-// is a no-op: the caller still clears the index.
+// exists only in the index (before the backfill, or an old pod's write
+// during a rolling deploy after it) is copied into Postgres first
+// (adoptForDelete), so it is deleted into the trash rather than dropped. A
+// path with no live row is a no-op: the caller still clears the index.
 func (s *Service) softDeleteStored(ctx context.Context, sc Scope, path, by string) error {
-	if err := s.adoptIndexed(ctx, sc, path); err != nil {
+	if err := s.adoptForDelete(ctx, sc, path); err != nil {
 		return err
 	}
 	err := s.store.DeleteKBDocument(ctx, storeScope(sc), path, by)
@@ -1323,6 +1324,34 @@ func (s *Service) softDeleteStored(ctx context.Context, sc Scope, path, by strin
 		return fmt.Errorf("delete %s: %w", path, err)
 	}
 	s.log.Info("doc moved to the trash", "kb", sc.String(), "path", path, "by", by)
+	return nil
+}
+
+// deleteAdoptBy is the changed_by recorded when a delete copies an
+// index-only doc into Postgres so it can go to the trash.
+const deleteAdoptBy = "kb-adopt-on-delete"
+
+// adoptForDelete copies path's index entry into Postgres when the path has
+// no live row, whatever the KB's backfill state, so the delete that follows
+// moves it to the trash. Without it, on a backfilled KB an index-only doc
+// (an old pod's write the reconciler hasn't adopted yet, or an entry it
+// leaves index-only) would be removed from the index with no copy kept.
+// The copy is insert-only (copyIndexed), so a path with a soft-deleted row
+// is left deleted and never revived. If the index can't be read, the
+// delete fails rather than risk dropping the only copy.
+func (s *Service) adoptForDelete(ctx context.Context, sc Scope, path string) error {
+	if _, err := s.store.GetKBDocument(ctx, storeScope(sc), path); err == nil {
+		return nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return fmt.Errorf("delete %s: %w", path, err)
+	}
+	inserted, _, err := s.copyIndexed(ctx, sc, path, deleteAdoptBy)
+	if err != nil {
+		return fmt.Errorf("delete %s: copy its index entry into postgres first (the index may hold its only copy): %w", path, err)
+	}
+	if inserted {
+		s.log.Info("delete: copied an index-only doc into postgres so it goes to the trash", "kb", sc.String(), "path", path)
+	}
 	return nil
 }
 
@@ -1557,25 +1586,15 @@ func (s *Service) RestoreKB(ctx context.Context, sc Scope, by string) (int, erro
 	return n, nil
 }
 
-// trashStored soft-deletes every live doc of a stored KB. Until its backfill
-// completes, docs only the index has are first copied into Postgres, so
-// dropping the collection afterwards loses none of them.
+// trashStored soft-deletes every live doc of a stored KB. Docs only the
+// index has (before the backfill, or an old pod's write after it) are first
+// copied into Postgres (adoptIndexOnly), so dropping the collection
+// afterwards loses none of them. Any error returns before anything is
+// trashed, and Drop then drops nothing.
 func (s *Service) trashStored(ctx context.Context, sc Scope) error {
 	rs := storeScope(sc)
-	done, err := s.backfillDone(ctx, sc)
-	if err != nil {
+	if _, err := s.adoptIndexOnly(ctx, sc); err != nil {
 		return err
-	}
-	if !done {
-		indexed, err := s.listIndexed(ctx, sc, "")
-		if err != nil {
-			return err
-		}
-		for _, d := range indexed {
-			if err := s.adoptIndexed(ctx, sc, d.Path); err != nil {
-				return err
-			}
-		}
 	}
 	var paths []string
 	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
@@ -1590,6 +1609,75 @@ func (s *Service) trashStored(ctx context.Context, sc Scope) error {
 		}
 	}
 	return nil
+}
+
+// dropAdoptBy is the changed_by recorded when Drop copies an index-only doc
+// into Postgres before trashing the KB.
+const dropAdoptBy = "kb-drop-adopt"
+
+// adoptIndexOnly copies into Postgres every doc in sc's index that has no
+// row, live or deleted, whatever the backfill state. It reads the index
+// through the export endpoint (exportChunk0 on the base name's real
+// collection and the alias target, as the backfill does), which streams
+// every record, so a write moving the updated_at ordering can't make it skip
+// a doc the way paged listing could. A path in both collections is copied
+// from its newest version. Inserts are insert-only: a path with any row is
+// left exactly as it is. It returns how many docs it copied; an export or
+// insert error is returned as is.
+func (s *Service) adoptIndexOnly(ctx context.Context, sc Scope) (int, error) {
+	rs := storeScope(sc)
+	sources, _, err := s.backfillSources(ctx, sc)
+	if err != nil {
+		return 0, fmt.Errorf("find the index collections of %s: %w", sc, err)
+	}
+	newest := map[string]*Doc{}
+	for _, col := range sources {
+		docs, err := s.exportChunk0(ctx, col)
+		if err != nil {
+			return 0, fmt.Errorf("export %s: %w", col, err)
+		}
+		for _, d := range docs {
+			if p, ok := newest[d.Path]; !ok || d.UpdatedAt > p.UpdatedAt {
+				newest[d.Path] = d
+			}
+		}
+	}
+	if len(newest) == 0 {
+		return 0, nil
+	}
+	have := map[string]bool{}
+	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
+		have[d.Path] = true
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("list the rows of %s: %w", sc, err)
+	}
+	deleted, err := s.store.ListDeletedKBPaths(ctx, rs)
+	if err != nil {
+		return 0, fmt.Errorf("list the deleted rows of %s: %w", sc, err)
+	}
+	for _, p := range deleted {
+		have[p] = true
+	}
+	paths := make([]string, 0, len(newest))
+	for p := range newest {
+		if !have[p] {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	n := 0
+	for _, p := range paths {
+		ok, err := s.insertIndexedDoc(ctx, sc, newest[p], dropAdoptBy)
+		if err != nil {
+			return n, fmt.Errorf("copy the index-only %s: %w", p, err)
+		}
+		if ok {
+			n++
+			s.log.Info("drop: copied an index-only doc into postgres so it goes to the trash", "kb", sc.String(), "path", p)
+		}
+	}
+	return n, nil
 }
 
 // SetReindexLock makes reindexing single-flight across replicas too, not
@@ -1907,18 +1995,31 @@ func (s *Service) copyIndexed(ctx context.Context, sc Scope, path, by string) (i
 		}
 		return false, false, fmt.Errorf("read the index entry: %w", err)
 	}
-	row := repository.KBDocument{
-		Path: path, Title: old.Title, Tags: old.Tags, Author: old.Author, Reason: old.Reason,
-		Content: old.Content, Annotations: old.Annotations,
+	old.Path = path
+	inserted, err = s.insertIndexedDoc(ctx, sc, old, by)
+	if err != nil {
+		return false, true, err
 	}
-	if old.UpdatedAt > 0 {
-		row.UpdatedAt = time.Unix(old.UpdatedAt, 0)
+	return inserted, true, nil
+}
+
+// insertIndexedDoc copies an index entry already read (chunk 0: content,
+// title, tags, author, reason, annotations and updated_at) into Postgres
+// with InsertKBDocumentIfMissing, recorded as by. A path with any row, live
+// or soft-deleted, is left exactly as it is (inserted false).
+func (s *Service) insertIndexedDoc(ctx context.Context, sc Scope, d *Doc, by string) (inserted bool, err error) {
+	row := repository.KBDocument{
+		Path: d.Path, Title: d.Title, Tags: d.Tags, Author: d.Author, Reason: d.Reason,
+		Content: d.Content, Annotations: d.Annotations,
+	}
+	if d.UpdatedAt > 0 {
+		row.UpdatedAt = time.Unix(d.UpdatedAt, 0)
 	}
 	inserted, err = s.store.InsertKBDocumentIfMissing(ctx, storeScope(sc), row, by)
 	if err != nil {
-		return false, true, fmt.Errorf("insert into postgres: %w", err)
+		return false, fmt.Errorf("insert %s into postgres: %w", d.Path, err)
 	}
-	return inserted, true, nil
+	return inserted, nil
 }
 
 // index brings path's search entry in line with its Postgres row: through
@@ -1943,7 +2044,10 @@ func (s *Service) index(ctx context.Context, sc Scope, path string) {
 }
 
 // indexFromStore indexes path's current Postgres row, or removes path from
-// the index when it has no live row (deleted or purged). Jobs carry only the
+// the index when it has no live row (deleted or purged). It is never what
+// removes a doc's only copy: before the backfill it adopts an index-only
+// doc first, and after it every delete path (DeleteDoc, the legacy delete
+// task, Drop) copies an index-only doc into Postgres before it gets here. Jobs carry only the
 // path, so one applied late or out of order still indexes the latest row.
 // If the row changes while it is being indexed (another job may have
 // indexed the newer row first and then been overwritten by this one), it
@@ -2067,8 +2171,20 @@ func (s *Service) drainLegacyWrite(ctx context.Context, sc Scope, p queue.WriteD
 // reindexFromStore rebuilds a stored KB's search collection from Postgres,
 // keeping each doc's own updated_at. It refuses (ErrReindexRefused, nothing
 // changed) until the KB's backfill has completed (ErrBackfillPending), and
-// when the index holds any doc Postgres has no row for. A failure or cancel before the
-// swap drops only the new collection; the old one keeps serving, unchanged.
+// when the index holds a doc Postgres has no row for that it can't adopt.
+// A failure or cancel before the swap drops only the new collection; the
+// old one keeps serving, unchanged.
+//
+// The build reads Postgres only, and the swap deletes the old collection,
+// so an old (pre-Postgres) pod's index-only work there would be lost: its
+// edit or annotation of a live doc, or a new doc (a rolling deploy, or a
+// rollback to the old image). adoptOldPodWrites copies that work into
+// Postgres, reading the old collections through export, three times: before
+// the build; right before the swap (an old pod may have written during the
+// build, and on the first migration the swap deletes the real collection);
+// and, when an alias is being moved, on the old alias target after the swap,
+// before it is dropped (no write reaches it once the alias has moved). The
+// catch-up after the swap indexes what it copied into the new collection.
 func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
 	base := collectionName(sc)
 	done, err := s.backfillDone(ctx, sc)
@@ -2079,20 +2195,25 @@ func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
 		s.log.Warn("reindex refused: the KB's backfill has not completed; nothing was changed", "kb", sc.String())
 		return fmt.Errorf("%w: %w: %s (it runs at startup; a failed one retries on the next)", ErrReindexRefused, ErrBackfillPending, sc)
 	}
-	if err := s.checkStoreCoversIndex(ctx, sc); err != nil {
-		return err
-	}
-	kc, err := s.kbCollections(ctx, base)
+	sources, kc, err := s.backfillSources(ctx, sc)
 	if err != nil {
+		return fmt.Errorf("reindex: find the collections of %s: %w", sc, err)
+	}
+	if err := s.coverOldIndex(ctx, sc, sources, "before the build"); err != nil {
 		return err
 	}
 	// Builds left by an interrupted reindex were never swapped in: only the
 	// alias target serves. (The caller holds the reindex lock, so none of
-	// them is being built now.)
+	// them is being built now.) One may be an old alias target a reindex
+	// kept because adopting from it failed, so adopt from it first.
 	for _, b := range kc.builds {
-		if b != kc.alias {
-			s.dropCollection(ctx, b)
+		if b == kc.alias {
+			continue
 		}
+		if _, _, err := s.adoptOldPodWrites(ctx, sc, []string{b}, false); err != nil {
+			return fmt.Errorf("%w: copy old pods' writes from the leftover %s into postgres: %w", ErrReindexRefused, b, err)
+		}
+		s.dropCollection(ctx, b)
 	}
 
 	newCol := fmt.Sprintf("%s_v%d", base, time.Now().UnixNano())
@@ -2119,6 +2240,10 @@ func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("reindex cancelled before the swap; %s still serves: %w", base, err)
 	}
+	// An old pod may have written into the old collection during the build.
+	if err := s.coverOldIndex(ctx, sc, sources, "before the swap"); err != nil {
+		return err
+	}
 
 	// From here on, finish even if ctx is cancelled: stopping half way
 	// through the first migration would leave the base name resolving to
@@ -2134,10 +2259,23 @@ func (s *Service) reindexFromStore(ctx context.Context, sc Scope) error {
 		"old_collection", kc.alias, "migrated_from_collection", kc.real)
 	s.runHook(swapCtx, "swapped")
 
-	// Catch up on changes whose index jobs wrote into the old collection.
+	// The old alias target gets no more writes; copy what old pods wrote
+	// into it since the last check before dropping it.
+	checkOld := kc.alias != "" && kc.alias != newCol && slices.Contains(sources, kc.alias)
+	var adoptErr error
+	if checkOld {
+		adoptErr = s.coverOldIndex(swapCtx, sc, []string{kc.alias}, "after the swap")
+	}
+	// Catch up on changes whose index jobs wrote into the old collection,
+	// and on what the adoption copied into Postgres.
 	_, syncErr := s.syncCollection(swapCtx, sc, newCol, indexed)
-	if kc.alias != "" && kc.alias != newCol {
+	if kc.alias != "" && kc.alias != newCol && adoptErr == nil {
 		s.dropCollection(swapCtx, kc.alias)
+	}
+	if adoptErr != nil {
+		s.log.Error("reindex: kept the old collection: it may hold an old pod's write postgres lacks; the next reindex adopts from it before dropping it",
+			"kb", sc.String(), "collection", kc.alias, "err", adoptErr)
+		return fmt.Errorf("reindex: swapped to %s, but kept %s: %w", newCol, kc.alias, adoptErr)
 	}
 	if syncErr != nil {
 		return fmt.Errorf("reindex: catch up after the swap (the reconciler or the next write fixes the rest): %w", syncErr)
@@ -2151,43 +2289,28 @@ func (s *Service) runHook(ctx context.Context, stage string) {
 	}
 }
 
-// checkStoreCoversIndex makes sure a collection built from Postgres would
-// hold every doc the current index has (the caller has checked that the
-// KB's backfill completed): every indexed path must have a Postgres row, a
-// live one or a deleted one (the index entry is stale, and the new
-// collection rightly leaves it out).
-func (s *Service) checkStoreCoversIndex(ctx context.Context, sc Scope) error {
-	rs := storeScope(sc)
-	indexed, err := s.listIndexed(ctx, sc, "")
+// coverOldIndex makes sure a collection built from Postgres holds every doc,
+// edit and annotation in cols (the old collections the swap deletes) before
+// they go: it copies old pods' index-only work into Postgres
+// (adoptOldPodWrites, through export) and refuses (ErrReindexRefused) if an
+// indexed path is left with no row, live or deleted. A deleted row's entry
+// is stale, and the new collection rightly leaves it out. when says where in
+// the reindex this runs, for the log and error.
+func (s *Service) coverOldIndex(ctx context.Context, sc Scope, cols []string, when string) error {
+	st, missing, err := s.adoptOldPodWrites(ctx, sc, cols, true)
 	if err != nil {
-		return err
+		s.log.Error("reindex refused: could not copy old pods' index-only writes into postgres", "kb", sc.String(), "when", when, "err", err)
+		return fmt.Errorf("%w: %s, %s: copy old pods' index-only writes into postgres: %w", ErrReindexRefused, sc, when, err)
 	}
-	live := map[string]bool{}
-	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
-		live[d.Path] = true
-		return nil
-	}); err != nil {
-		return err
-	}
-	deletedPaths, err := s.store.ListDeletedKBPaths(ctx, rs)
-	if err != nil {
-		return err
-	}
-	deleted := make(map[string]bool, len(deletedPaths))
-	for _, p := range deletedPaths {
-		deleted[p] = true
-	}
-	var missing []string
-	for _, d := range indexed {
-		if !live[d.Path] && !deleted[d.Path] {
-			missing = append(missing, d.Path)
-		}
+	if st.Adopted > 0 || st.AdoptedEdits > 0 {
+		s.log.Info("reindex: copied old pods' index-only writes into postgres", "kb", sc.String(), "when", when,
+			"adopted", st.Adopted, "adopted_edits", st.AdoptedEdits)
 	}
 	if len(missing) > 0 {
-		s.log.Error("reindex refused: the index holds docs postgres has no row for; nothing was changed",
-			"kb", sc.String(), "stored", len(live), "indexed", len(indexed), "missing", len(missing))
-		return fmt.Errorf("%w: %s has %d live docs in postgres and %d in the index; %d indexed docs have no postgres row (first: %s)",
-			ErrReindexRefused, sc, len(live), len(indexed), len(missing), missing[0])
+		s.log.Error("reindex refused: the index holds docs postgres has no row for; the old collection is kept",
+			"kb", sc.String(), "when", when, "stored", st.Live, "indexed", st.Indexed, "missing", len(missing))
+		return fmt.Errorf("%w: %s has %d live docs in postgres and %d in the index; %d indexed docs have no postgres row and were not written by an old pod after the backfill (first: %s)",
+			ErrReindexRefused, sc, st.Live, st.Indexed, len(missing), missing[0])
 	}
 	return nil
 }

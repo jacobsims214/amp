@@ -21,7 +21,12 @@ package kb
 // Reads, reindex and the reconciler depend on completion, so a KB with no
 // search collection at all (a new project, team or org, or one whose index
 // is gone) has nothing to copy and is marked complete with 0 docs, both here
-// and lazily the first time the service touches it (backfillDone).
+// and lazily the first time the service touches it (backfillDone). That is
+// only done while Typesense reports itself healthy (GET /health ok): one
+// still loading after a restart can list no collections for a while, and
+// completing then would hide every doc it holds. A KB completed with 0 docs
+// stays re-checkable: each run copies it again, insert-only, if it has a
+// collection or alias by then (recheckEmptyKB).
 
 import (
 	"context"
@@ -67,6 +72,15 @@ var ErrBackfillPending = errors.New("the KB's backfill from its search index has
 // copied (its chunk-0 count moved); the copy is retried.
 var errBackfillUnstable = errors.New("the collection changed during the backfill")
 
+// errTypesenseUnhealthy means Typesense's GET /health did not answer ok (it
+// is down, or still loading its data after a restart). A KB is never marked
+// complete with nothing copied while it says so: an empty collection list
+// may only mean the collections have not loaded yet.
+var errTypesenseUnhealthy = errors.New("typesense is not healthy (GET /health not ok)")
+
+// typesenseHealthTimeout bounds one health check.
+var typesenseHealthTimeout = 5 * time.Second
+
 // KBOwnerLister lists the KBs Postgres knows an owner for (every project,
 // archived ones included, team and org): repository.Repo.ListKBOwnerScopes.
 type KBOwnerLister func(ctx context.Context) ([]repository.KBScope, error)
@@ -86,6 +100,13 @@ type BackfillStats struct {
 	Docs        int // distinct paths found across the collections (doc_count)
 	Inserted    int
 	Present     int
+	// FromStore counts, on a re-check of a KB completed with 0 docs, the
+	// paths whose entry carries kb_version: it was indexed from a Postgres
+	// row, so it is not copied (a path with no row now was purged).
+	FromStore int
+	// Rechecked is set when this was a re-check of a KB already completed
+	// with 0 docs (recheckEmptyKB), not its first backfill.
+	Rechecked bool
 	// Skipped says why nothing was done ("" = the KB was backfilled now).
 	Skipped string
 }
@@ -118,9 +139,10 @@ func (s *Service) RunBackfill(ctx context.Context, owners KBOwnerLister, lock Re
 // BackfillAll backfills every KB that has a collection in Typesense (found
 // by listing Typesense itself, so archived projects and KBs whose owner is
 // gone are included) and marks the KBs owners lists that have no collection
-// at all complete. A KB that fails is recorded failed and logged, and the
-// run carries on. The error is only for failing to list Typesense, or ctx
-// ending.
+// at all complete (only while Typesense is healthy). A KB found in Typesense
+// that was completed earlier with 0 docs is re-checked (recheckEmptyKB). A
+// KB that fails is recorded failed and logged, and the run carries on. The
+// error is only for failing to list Typesense, or ctx ending.
 func (s *Service) BackfillAll(ctx context.Context, owners KBOwnerLister) ([]BackfillStats, error) {
 	if s.store == nil {
 		return nil, nil
@@ -130,8 +152,10 @@ func (s *Service) BackfillAll(ctx context.Context, owners KBOwnerLister) ([]Back
 		return nil, fmt.Errorf("list typesense collections: %w", err)
 	}
 	all := map[Scope]bool{}
+	inTypesense := map[Scope]bool{}
 	for _, sc := range found {
 		all[sc] = true
+		inTypesense[sc] = true
 	}
 	if owners != nil {
 		rs, err := owners(ctx)
@@ -159,17 +183,21 @@ func (s *Service) BackfillAll(ctx context.Context, owners KBOwnerLister) ([]Back
 	})
 
 	out := make([]BackfillStats, 0, len(scopes))
-	var done, failed, skipped, inserted int
+	var done, failed, skipped, rechecked, inserted int
 	for _, sc := range scopes {
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
-		st, err := s.BackfillKB(ctx, sc)
+		// Only a KB with something in Typesense can need its 0-doc
+		// completion re-checked; the rest are skipped without asking.
+		st, err := s.backfillKB0(ctx, sc, inTypesense[sc])
 		switch {
 		case err != nil:
 			failed++
 		case st.Skipped != "":
 			skipped++
+		case st.Rechecked:
+			rechecked++
 		default:
 			done++
 		}
@@ -177,24 +205,36 @@ func (s *Service) BackfillAll(ctx context.Context, owners KBOwnerLister) ([]Back
 		out = append(out, st)
 	}
 	s.log.Info("kb backfill run done", "kbs", len(scopes), "completed", done, "failed", failed,
-		"already_complete", skipped, "docs_inserted", inserted)
+		"already_complete", skipped, "rechecked_empty", rechecked, "docs_inserted", inserted)
 	return out, nil
 }
 
 // BackfillKB copies one KB's indexed docs into Postgres and records it
 // complete, or records it failed and returns the error. A KB already
-// complete is left alone (Skipped set).
+// complete is left alone (Skipped set), unless it was completed with 0 docs:
+// that is re-checked (recheckEmptyKB).
 func (s *Service) BackfillKB(ctx context.Context, sc Scope) (BackfillStats, error) {
+	return s.backfillKB0(ctx, sc, true)
+}
+
+// backfillKB0 is BackfillKB; recheck says whether a KB completed with 0
+// docs is re-checked (BackfillAll passes false for KBs it found nothing of
+// in Typesense, which have nothing to re-check).
+func (s *Service) backfillKB0(ctx context.Context, sc Scope, recheck bool) (BackfillStats, error) {
 	st := BackfillStats{Scope: sc}
 	if !s.stored(sc) {
 		return st, fmt.Errorf("backfill %s: not a stored KB", sc)
 	}
 	rs := storeScope(sc)
-	done, err := s.store.IsKBBackfillComplete(ctx, rs)
-	if err != nil {
+	b, err := s.store.GetKBBackfill(ctx, rs)
+	switch {
+	case errors.Is(err, repository.ErrNotFound):
+		// never started
+	case err != nil:
 		return st, fmt.Errorf("backfill %s: check completion: %w", sc, err)
-	}
-	if done {
+	case b.CompletedAt != nil && b.DocCount == 0 && recheck:
+		return s.recheckEmptyKB(ctx, sc)
+	case b.CompletedAt != nil:
 		st.Skipped = "already complete"
 		return st, nil
 	}
@@ -224,19 +264,21 @@ func (s *Service) backfillKB(ctx context.Context, sc Scope) (BackfillStats, erro
 	if err := s.store.StartKBBackfill(ctx, rs); err != nil {
 		return st, fmt.Errorf("record the start: %w", err)
 	}
-	for attempt := 1; ; attempt++ {
-		st, err = s.backfillOnce(ctx, sc)
-		if err == nil {
-			break
-		}
-		if !errors.Is(err, errBackfillUnstable) || attempt >= backfillAttempts {
+	// Ask before listing: a Typesense still loading can list no
+	// collections, and the KB would be completed with nothing copied.
+	if err := s.typesenseHealthy(ctx); err != nil {
+		return st, err
+	}
+	st, err = s.backfillCopy(ctx, sc, false)
+	if err != nil {
+		return st, err
+	}
+	if len(st.Collections) == 0 {
+		// Nothing listed: confirm Typesense was healthy throughout, so an
+		// instance that went down or started reloading mid-way doesn't
+		// complete the KB empty.
+		if err := s.typesenseHealthy(ctx); err != nil {
 			return st, err
-		}
-		s.log.Info("kb backfill: the collection changed during the copy; trying again", "kb", sc.String(), "attempt", attempt, "err", err)
-		select {
-		case <-ctx.Done():
-			return st, ctx.Err()
-		case <-time.After(backfillRetryWait):
 		}
 	}
 	if err := s.store.CompleteKBBackfill(ctx, rs, st.Docs); err != nil {
@@ -248,6 +290,85 @@ func (s *Service) backfillKB(ctx context.Context, sc Scope) (BackfillStats, erro
 		s.log.Info("kb backfill complete", "kb", sc.String(), "docs", st.Docs, "inserted", st.Inserted, "already_present", st.Present)
 	}
 	return st, nil
+}
+
+// backfillCopy runs backfillOnce, again while the collection changes under
+// it (errBackfillUnstable), up to backfillAttempts times.
+func (s *Service) backfillCopy(ctx context.Context, sc Scope, recheck bool) (BackfillStats, error) {
+	for attempt := 1; ; attempt++ {
+		st, err := s.backfillOnce(ctx, sc, recheck)
+		if err == nil {
+			return st, nil
+		}
+		if !errors.Is(err, errBackfillUnstable) || attempt >= backfillAttempts {
+			return st, err
+		}
+		s.log.Info("kb backfill: the collection changed during the copy; trying again", "kb", sc.String(), "attempt", attempt, "err", err)
+		select {
+		case <-ctx.Done():
+			return st, ctx.Err()
+		case <-time.After(backfillRetryWait):
+		}
+	}
+}
+
+// recheckEmptyKB re-runs the insert-only copy for a KB already completed
+// with 0 docs, in case it was completed while its collection could not be
+// seen (Typesense still loading, TYPESENSE_URL pointing at the wrong
+// instance, a collection briefly unreadable) and the index still holds its
+// only copy of some docs. Entries that carry kb_version are not copied: they
+// were indexed from a Postgres row, so a path with no row now was purged and
+// must not come back. Inserts are insert-only (InsertKBDocumentIfMissing),
+// so a path with any row is left exactly as it is.
+//
+// started_at and the failure state are left alone: the KB stays complete
+// whatever happens, and a failed re-check is logged and returned (the next
+// run tries again). When something was found, completion is recorded again
+// with the number of distinct paths in the index, so the KB is not
+// re-checked after that; a KB that still has nothing indexed is Skipped.
+func (s *Service) recheckEmptyKB(ctx context.Context, sc Scope) (BackfillStats, error) {
+	st := BackfillStats{Scope: sc, Rechecked: true}
+	release, err := s.waitReindexLock(ctx, sc)
+	if err != nil {
+		return st, fmt.Errorf("re-check %s: %w", sc, err)
+	}
+	defer release()
+	st, err = s.backfillCopy(ctx, sc, true)
+	st.Rechecked = true
+	if err != nil {
+		s.log.Warn("kb backfill: re-check of a KB completed with 0 docs failed; it stays complete and the next run retries",
+			"kb", sc.String(), "err", err)
+		return st, fmt.Errorf("re-check %s: %w", sc, err)
+	}
+	if st.Docs == 0 {
+		st.Skipped = "already complete"
+		return st, nil
+	}
+	if err := s.store.CompleteKBBackfill(ctx, storeScope(sc), st.Docs); err != nil {
+		return st, fmt.Errorf("re-check %s: record completion: %w", sc, err)
+	}
+	if st.Inserted > 0 {
+		s.log.Warn("kb backfill: a KB completed with 0 docs had docs only in its search index; copied them into postgres",
+			"kb", sc.String(), "docs", st.Docs, "inserted", st.Inserted, "already_present", st.Present, "indexed_from_postgres", st.FromStore)
+	} else {
+		s.log.Info("kb backfill: re-checked a KB completed with 0 docs; nothing was missing from postgres",
+			"kb", sc.String(), "docs", st.Docs, "already_present", st.Present, "indexed_from_postgres", st.FromStore)
+	}
+	return st, nil
+}
+
+// typesenseHealthy returns nil when Typesense's GET /health answers ok, and
+// errTypesenseUnhealthy (wrapping the cause) when it does not or can't be
+// reached.
+func (s *Service) typesenseHealthy(ctx context.Context) error {
+	ok, err := s.client.Health(ctx, typesenseHealthTimeout)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errTypesenseUnhealthy, err)
+	}
+	if !ok {
+		return errTypesenseUnhealthy
+	}
+	return nil
 }
 
 // waitReindexLock takes sc's reindex lock, waiting while a Drop or a
@@ -304,8 +425,10 @@ func (s *Service) backfillSources(ctx context.Context, sc Scope) (sources []stri
 }
 
 // backfillOnce exports each source collection, inserts every doc Postgres
-// has no row for, and checks the result.
-func (s *Service) backfillOnce(ctx context.Context, sc Scope) (BackfillStats, error) {
+// has no row for, and checks the result. With recheck (recheckEmptyKB), a
+// path whose newest entry carries kb_version is counted in FromStore and
+// neither copied nor required to have a row.
+func (s *Service) backfillOnce(ctx context.Context, sc Scope, recheck bool) (BackfillStats, error) {
 	st := BackfillStats{Scope: sc}
 	rs := storeScope(sc)
 	sources, _, err := s.backfillSources(ctx, sc)
@@ -313,14 +436,15 @@ func (s *Service) backfillOnce(ctx context.Context, sc Scope) (BackfillStats, er
 		return st, err
 	}
 	type pick struct {
-		doc *Doc
-		src int
+		doc     *Doc
+		version int
+		src     int
 	}
 	merged := map[string]pick{}
 	counts := make([]int, len(sources))
 	for i, col := range sources {
 		cs := BackfillCollectionStats{Collection: col}
-		docs, err := s.exportChunk0(ctx, col)
+		docs, versions, err := s.exportChunk0Versions(ctx, col)
 		if err != nil {
 			return st, fmt.Errorf("export %s: %w", col, err)
 		}
@@ -339,18 +463,22 @@ func (s *Service) backfillOnce(ctx context.Context, sc Scope) (BackfillStats, er
 		counts[i] = n
 		cs.Found = n
 		st.Collections = append(st.Collections, cs)
-		for _, d := range docs {
+		for j, d := range docs {
 			// A path in two collections (a collection shadowing the alias)
 			// is copied from its newest version.
 			if p, ok := merged[d.Path]; !ok || d.UpdatedAt > p.doc.UpdatedAt {
-				merged[d.Path] = pick{doc: d, src: i}
+				merged[d.Path] = pick{doc: d, version: versions[j], src: i}
 			}
 		}
 	}
 	st.Docs = len(merged)
 
 	paths := make([]string, 0, len(merged))
-	for p := range merged {
+	for p, m := range merged {
+		if recheck && m.version != 0 {
+			st.FromStore++
+			continue
+		}
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
@@ -404,8 +532,9 @@ func (s *Service) backfillOnce(ctx context.Context, sc Scope) (BackfillStats, er
 	if len(missing) > 0 {
 		return st, fmt.Errorf("verify: %d of %d exported docs have no postgres row (first: %s)", len(missing), len(paths), missing[0])
 	}
-	if st.Inserted+st.Present != st.Docs {
-		return st, fmt.Errorf("verify: inserted %d + already present %d != %d docs found", st.Inserted, st.Present, st.Docs)
+	if st.Inserted+st.Present+st.FromStore != st.Docs {
+		return st, fmt.Errorf("verify: inserted %d + already present %d + indexed from postgres %d != %d docs found",
+			st.Inserted, st.Present, st.FromStore, st.Docs)
 	}
 	// ... and nothing was added to the index while it was being copied.
 	for i, col := range sources {
@@ -424,29 +553,39 @@ func (s *Service) backfillOnce(ctx context.Context, sc Scope) (BackfillStats, er
 // content and annotations) of collection col through Typesense's export
 // endpoint, which streams the whole collection with no page cap.
 func (s *Service) exportChunk0(ctx context.Context, col string) ([]*Doc, error) {
+	docs, _, err := s.exportChunk0Versions(ctx, col)
+	return docs, err
+}
+
+// exportChunk0Versions is exportChunk0, also returning each record's
+// kb_version (0 when it has none: written before it existed, or by old code).
+func (s *Service) exportChunk0Versions(ctx context.Context, col string) ([]*Doc, []int, error) {
 	body, err := s.client.Collection(col).Documents().Export(ctx, &api.ExportDocumentsParams{
 		FilterBy:      pointer.String("chunk_index:=0"),
 		ExcludeFields: pointer.String("embedding"),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer body.Close()
 	dec := json.NewDecoder(body)
 	var out []*Doc
+	var versions []int
 	for {
 		var m map[string]interface{}
 		if err := dec.Decode(&m); err != nil {
 			if errors.Is(err, io.EOF) {
-				return out, nil
+				return out, versions, nil
 			}
-			return nil, fmt.Errorf("decode export line %d: %w", len(out)+1, err)
+			return nil, nil, fmt.Errorf("decode export line %d: %w", len(out)+1, err)
 		}
 		d, err := backfillDoc(m)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
+		v, _ := m[indexedVersionField].(float64)
 		out = append(out, d)
+		versions = append(versions, int(v))
 	}
 }
 
@@ -555,12 +694,18 @@ func (s *Service) discoverKBScopes(ctx context.Context) ([]Scope, error) {
 // backfillDone reports whether sc's backfill has completed. A KB that is not
 // complete but has no search collection at all (a new project, team or org)
 // has nothing to copy, so it is marked complete here, the first time the
-// service touches it. If Typesense can't be asked, it answers not complete.
+// service touches it. That needs Typesense healthy (GET /health ok) before
+// it is asked: one still loading may not list a collection it has. If
+// Typesense is not healthy or can't be asked, it answers not complete.
 func (s *Service) backfillDone(ctx context.Context, sc Scope) (bool, error) {
 	rs := storeScope(sc)
 	done, err := s.store.IsKBBackfillComplete(ctx, rs)
 	if err != nil || done {
 		return done, err
+	}
+	if err := s.typesenseHealthy(ctx); err != nil {
+		s.log.Info("kb backfill: not marking a KB with no collection complete; typesense is not healthy", "kb", sc.String(), "err", err)
+		return false, nil
 	}
 	kc, err := s.kbCollections(ctx, collectionName(sc))
 	if err != nil || kc.real || kc.alias != "" {
