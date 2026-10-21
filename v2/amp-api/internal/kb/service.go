@@ -1307,11 +1307,12 @@ func (s *Service) DeleteDoc(ctx context.Context, sc Scope, path, by string) erro
 }
 
 // softDeleteStored soft-deletes path's Postgres row. A doc that so far
-// exists only in the index is copied into Postgres first (adoptIndexed), so
-// it is deleted into the trash rather than dropped. A path with no live row
-// is a no-op: the caller still clears the index.
+// exists only in the index (before the backfill, or an old pod's write
+// during a rolling deploy after it) is copied into Postgres first
+// (adoptForDelete), so it is deleted into the trash rather than dropped. A
+// path with no live row is a no-op: the caller still clears the index.
 func (s *Service) softDeleteStored(ctx context.Context, sc Scope, path, by string) error {
-	if err := s.adoptIndexed(ctx, sc, path); err != nil {
+	if err := s.adoptForDelete(ctx, sc, path); err != nil {
 		return err
 	}
 	err := s.store.DeleteKBDocument(ctx, storeScope(sc), path, by)
@@ -1323,6 +1324,34 @@ func (s *Service) softDeleteStored(ctx context.Context, sc Scope, path, by strin
 		return fmt.Errorf("delete %s: %w", path, err)
 	}
 	s.log.Info("doc moved to the trash", "kb", sc.String(), "path", path, "by", by)
+	return nil
+}
+
+// deleteAdoptBy is the changed_by recorded when a delete copies an
+// index-only doc into Postgres so it can go to the trash.
+const deleteAdoptBy = "kb-adopt-on-delete"
+
+// adoptForDelete copies path's index entry into Postgres when the path has
+// no live row, whatever the KB's backfill state, so the delete that follows
+// moves it to the trash. Without it, on a backfilled KB an index-only doc
+// (an old pod's write the reconciler hasn't adopted yet, or an entry it
+// leaves index-only) would be removed from the index with no copy kept.
+// The copy is insert-only (copyIndexed), so a path with a soft-deleted row
+// is left deleted and never revived. If the index can't be read, the
+// delete fails rather than risk dropping the only copy.
+func (s *Service) adoptForDelete(ctx context.Context, sc Scope, path string) error {
+	if _, err := s.store.GetKBDocument(ctx, storeScope(sc), path); err == nil {
+		return nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return fmt.Errorf("delete %s: %w", path, err)
+	}
+	inserted, _, err := s.copyIndexed(ctx, sc, path, deleteAdoptBy)
+	if err != nil {
+		return fmt.Errorf("delete %s: copy its index entry into postgres first (the index may hold its only copy): %w", path, err)
+	}
+	if inserted {
+		s.log.Info("delete: copied an index-only doc into postgres so it goes to the trash", "kb", sc.String(), "path", path)
+	}
 	return nil
 }
 
@@ -1557,25 +1586,15 @@ func (s *Service) RestoreKB(ctx context.Context, sc Scope, by string) (int, erro
 	return n, nil
 }
 
-// trashStored soft-deletes every live doc of a stored KB. Until its backfill
-// completes, docs only the index has are first copied into Postgres, so
-// dropping the collection afterwards loses none of them.
+// trashStored soft-deletes every live doc of a stored KB. Docs only the
+// index has (before the backfill, or an old pod's write after it) are first
+// copied into Postgres (adoptIndexOnly), so dropping the collection
+// afterwards loses none of them. Any error returns before anything is
+// trashed, and Drop then drops nothing.
 func (s *Service) trashStored(ctx context.Context, sc Scope) error {
 	rs := storeScope(sc)
-	done, err := s.backfillDone(ctx, sc)
-	if err != nil {
+	if _, err := s.adoptIndexOnly(ctx, sc); err != nil {
 		return err
-	}
-	if !done {
-		indexed, err := s.listIndexed(ctx, sc, "")
-		if err != nil {
-			return err
-		}
-		for _, d := range indexed {
-			if err := s.adoptIndexed(ctx, sc, d.Path); err != nil {
-				return err
-			}
-		}
 	}
 	var paths []string
 	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
@@ -1590,6 +1609,83 @@ func (s *Service) trashStored(ctx context.Context, sc Scope) error {
 		}
 	}
 	return nil
+}
+
+// dropAdoptBy is the changed_by recorded when Drop copies an index-only doc
+// into Postgres before trashing the KB.
+const dropAdoptBy = "kb-drop-adopt"
+
+// adoptIndexOnly copies into Postgres every doc in sc's index that has no
+// row, live or deleted, whatever the backfill state. It reads the index
+// through the export endpoint (exportChunk0 on the base name's real
+// collection and the alias target, as the backfill does), which streams
+// every record, so a write moving the updated_at ordering can't make it skip
+// a doc the way paged listing could. A path in both collections is copied
+// from its newest version. Inserts are insert-only: a path with any row is
+// left exactly as it is. It returns how many docs it copied; an export or
+// insert error is returned as is.
+func (s *Service) adoptIndexOnly(ctx context.Context, sc Scope) (int, error) {
+	rs := storeScope(sc)
+	sources, _, err := s.backfillSources(ctx, sc)
+	if err != nil {
+		return 0, fmt.Errorf("find the index collections of %s: %w", sc, err)
+	}
+	newest := map[string]*Doc{}
+	for _, col := range sources {
+		docs, err := s.exportChunk0(ctx, col)
+		if err != nil {
+			return 0, fmt.Errorf("export %s: %w", col, err)
+		}
+		for _, d := range docs {
+			if p, ok := newest[d.Path]; !ok || d.UpdatedAt > p.UpdatedAt {
+				newest[d.Path] = d
+			}
+		}
+	}
+	if len(newest) == 0 {
+		return 0, nil
+	}
+	have := map[string]bool{}
+	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
+		have[d.Path] = true
+		return nil
+	}); err != nil {
+		return 0, fmt.Errorf("list the rows of %s: %w", sc, err)
+	}
+	deleted, err := s.store.ListDeletedKBPaths(ctx, rs)
+	if err != nil {
+		return 0, fmt.Errorf("list the deleted rows of %s: %w", sc, err)
+	}
+	for _, p := range deleted {
+		have[p] = true
+	}
+	paths := make([]string, 0, len(newest))
+	for p := range newest {
+		if !have[p] {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	n := 0
+	for _, p := range paths {
+		d := newest[p]
+		row := repository.KBDocument{
+			Path: d.Path, Title: d.Title, Tags: d.Tags, Author: d.Author, Reason: d.Reason,
+			Content: d.Content, Annotations: d.Annotations,
+		}
+		if d.UpdatedAt > 0 {
+			row.UpdatedAt = time.Unix(d.UpdatedAt, 0)
+		}
+		ok, err := s.store.InsertKBDocumentIfMissing(ctx, rs, row, dropAdoptBy)
+		if err != nil {
+			return n, fmt.Errorf("copy the index-only %s into postgres: %w", p, err)
+		}
+		if ok {
+			n++
+			s.log.Info("drop: copied an index-only doc into postgres so it goes to the trash", "kb", sc.String(), "path", p)
+		}
+	}
+	return n, nil
 }
 
 // SetReindexLock makes reindexing single-flight across replicas too, not
@@ -1943,7 +2039,10 @@ func (s *Service) index(ctx context.Context, sc Scope, path string) {
 }
 
 // indexFromStore indexes path's current Postgres row, or removes path from
-// the index when it has no live row (deleted or purged). Jobs carry only the
+// the index when it has no live row (deleted or purged). It is never what
+// removes a doc's only copy: before the backfill it adopts an index-only
+// doc first, and after it every delete path (DeleteDoc, the legacy delete
+// task, Drop) copies an index-only doc into Postgres before it gets here. Jobs carry only the
 // path, so one applied late or out of order still indexes the latest row.
 // If the row changes while it is being indexed (another job may have
 // indexed the newer row first and then been overwritten by this one), it
