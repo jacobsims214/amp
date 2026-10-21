@@ -13,9 +13,9 @@ package kb
 //   - an entry an old (pre-Postgres) pod edited or annotated after the row
 //     was written (no kb_version, updated_at newer than the row's, or equal
 //     with annotations the row lacks; see oldPodEdit) is copied into the row
-//     first (UpsertKBDocument, so the previous content stays in
-//     kb_document_versions, and a union of the annotations), then
-//     re-indexed from it. This covers a rolling deploy and a rollback (#2027);
+//     first (a union of the annotations, then UpsertKBDocument, so the
+//     previous content stays in kb_document_versions), then re-indexed
+//     from it. This covers a rolling deploy and a rollback (#2027);
 //   - an index entry whose row is soft-deleted is removed;
 //   - an index entry with no row at all, written by an old pod during a
 //     rolling deploy (see adoptable), is copied into Postgres insert-only
@@ -370,10 +370,13 @@ func oldPodEdit(ix, row indexState) bool {
 }
 
 // adoptEdit copies an old pod's index-only edit of path into its live row:
-// the entry's content, title, tags, author and reason when the entry is
-// newer than the row (UpsertKBDocument, so the row's previous content stays
-// in kb_document_versions), and any annotations the entry has that the row
-// lacks (UpdateKBAnnotations, see mergeAnnotations). Both the row and the
+// first any annotations the entry has that the row lacks
+// (UpdateKBAnnotations, see mergeAnnotations), then the entry's content,
+// title, tags, author and reason when the entry is newer than the row
+// (UpsertKBDocument, so the row's previous content stays in
+// kb_document_versions). In that order a failure between the two leaves the
+// entry still newer than the row, so the next pass retries it instead of
+// re-indexing over it (see adoptEditEntry). Both the row and the
 // entry are re-read, so a change since the listing is judged as it is now; a
 // new-pod write racing this one wins (ExpectVersion), and the entry is then
 // re-indexed from it. It reports whether anything was copied; false means
@@ -408,20 +411,14 @@ func (s *Service) adoptEditEntry(ctx context.Context, sc Scope, entry *Doc, by s
 	if entry.UpdatedAt < rowUpdated {
 		return false, nil // the row moved on since the listing
 	}
-	var wrote bool
-	if entry.UpdatedAt > rowUpdated {
-		_, changed, err := s.store.UpsertKBDocument(ctx, rs, repository.KBDocWrite{
-			Path: path, Title: entry.Title, Tags: entry.Tags, Author: entry.Author, Reason: entry.Reason,
-			Content: entry.Content, By: by, ExpectVersion: row.Version,
-		})
-		if errors.Is(err, repository.ErrConflict) {
-			return false, nil // a new write landed since the read; it wins
-		}
-		if err != nil {
-			return false, fmt.Errorf("save the edit: %w", err)
-		}
-		wrote = changed
-	}
+	// Annotations first, content second. Merging annotations moves neither
+	// the row's version nor its updated_at, so if the content upsert then
+	// fails (a DB error, ctx cancelled at shutdown) the entry is still newer
+	// than the row, still an oldPodEdit, and the next pass retries the
+	// content; the annotations are already safe. The other order would let
+	// a committed upsert (updated_at = NOW()) make the entry look merely
+	// stale, and the retry would re-index it from the row over annotations
+	// that only it held (PR #67 review S4).
 	added := 0
 	if len(mergeAnnotations(row.Annotations, entry.Annotations)) > len(kbAnnotationsOrEmpty(row.Annotations)) {
 		if _, err := s.store.UpdateKBAnnotations(ctx, rs, path, func(cur []Annotation) ([]Annotation, error) {
@@ -429,7 +426,26 @@ func (s *Service) adoptEditEntry(ctx context.Context, sc Scope, entry *Doc, by s
 			added = len(next) - len(cur)
 			return next, nil
 		}); err != nil {
+			if errors.Is(err, repository.ErrNotFound) {
+				return false, nil // deleted since the read: re-indexing removes the entry
+			}
 			return false, fmt.Errorf("merge the annotations: %w", err)
+		}
+	}
+	var wrote bool
+	if entry.UpdatedAt > rowUpdated {
+		_, changed, err := s.store.UpsertKBDocument(ctx, rs, repository.KBDocWrite{
+			Path: path, Title: entry.Title, Tags: entry.Tags, Author: entry.Author, Reason: entry.Reason,
+			Content: entry.Content, By: by, ExpectVersion: row.Version,
+		})
+		switch {
+		case errors.Is(err, repository.ErrConflict):
+			// A new write landed since the read; it wins. Annotations
+			// merged above stay (UpsertKBDocument keeps a live row's).
+		case err != nil:
+			return false, fmt.Errorf("save the edit (annotations already merged: %d): %w", added, err)
+		default:
+			wrote = changed
 		}
 	}
 	if !wrote && added == 0 {
