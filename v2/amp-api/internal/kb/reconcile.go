@@ -379,20 +379,30 @@ func oldPodEdit(ix, row indexState) bool {
 // re-indexed from it. It reports whether anything was copied; false means
 // the entry is just stale and the caller re-indexes it from the row.
 func (s *Service) adoptEdit(ctx context.Context, sc Scope, path string) (bool, error) {
-	rs := storeScope(sc)
-	row, err := s.store.GetKBDocument(ctx, rs, path)
-	if errors.Is(err, repository.ErrNotFound) {
-		return false, nil // deleted since the listing: re-indexing removes the entry
-	}
-	if err != nil {
-		return false, fmt.Errorf("read the row: %w", err)
-	}
 	entry, err := s.getIndexed(ctx, sc, path)
 	if isNotFound(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("read the index entry: %w", err)
+	}
+	entry.Path = path
+	return s.adoptEditEntry(ctx, sc, entry, reconcileEditBy)
+}
+
+// adoptEditEntry is adoptEdit for an index entry the caller has already
+// read (a reindex reads it through export, from a collection the base name
+// may no longer point at). The row is re-read here; the edit is recorded as
+// changed by by.
+func (s *Service) adoptEditEntry(ctx context.Context, sc Scope, entry *Doc, by string) (bool, error) {
+	rs := storeScope(sc)
+	path := entry.Path
+	row, err := s.store.GetKBDocument(ctx, rs, path)
+	if errors.Is(err, repository.ErrNotFound) {
+		return false, nil // deleted since the listing: re-indexing removes the entry
+	}
+	if err != nil {
+		return false, fmt.Errorf("read the row: %w", err)
 	}
 	rowUpdated := row.UpdatedAt.Unix()
 	if entry.UpdatedAt < rowUpdated {
@@ -402,7 +412,7 @@ func (s *Service) adoptEdit(ctx context.Context, sc Scope, path string) (bool, e
 	if entry.UpdatedAt > rowUpdated {
 		_, changed, err := s.store.UpsertKBDocument(ctx, rs, repository.KBDocWrite{
 			Path: path, Title: entry.Title, Tags: entry.Tags, Author: entry.Author, Reason: entry.Reason,
-			Content: entry.Content, By: reconcileEditBy, ExpectVersion: row.Version,
+			Content: entry.Content, By: by, ExpectVersion: row.Version,
 		})
 		if errors.Is(err, repository.ErrConflict) {
 			return false, nil // a new write landed since the read; it wins
@@ -425,9 +435,9 @@ func (s *Service) adoptEdit(ctx context.Context, sc Scope, path string) (bool, e
 	if !wrote && added == 0 {
 		return false, nil
 	}
-	s.log.Info("kb reconcile: copied an old pod's edit into postgres instead of overwriting it",
+	s.log.Info("kb: copied an old pod's edit into postgres instead of overwriting it",
 		"kb", sc.String(), "path", path, "entry_updated_at", entry.UpdatedAt, "row_updated_at", rowUpdated,
-		"content_saved", wrote, "annotations_added", added, "changed_by", reconcileEditBy)
+		"content_saved", wrote, "annotations_added", added, "changed_by", by)
 	return true, nil
 }
 
@@ -561,4 +571,148 @@ func (s *Service) reconcilePass(ctx context.Context, lock ReindexLocker) {
 	if _, err := s.ReconcileAll(ctx); err != nil && ctx.Err() == nil {
 		s.log.Warn("kb reconcile pass failed", "err", err)
 	}
+}
+
+// reindexAdoptBy and reindexEditBy are the changed_by recorded when a
+// reindex copies an old pod's index-only doc, or its edit of a live doc,
+// into Postgres before an old collection is deleted.
+const (
+	reindexAdoptBy = "kb-reindex-adopt"
+	reindexEditBy  = "kb-reindex-old-pod-edit"
+)
+
+// adoptOldPodWrites is the reconciler's adoption, run by a reindex (which
+// holds sc's reindex lock) on collections it is about to delete: every
+// index-only change an old (pre-Postgres) pod made in them is copied into
+// Postgres first, so a build from Postgres keeps it. It reads each
+// collection through the export endpoint, which streams every record, so a
+// write reordering the collection can't make it skip one (paged search
+// could). Per path, the newest entry across cols is judged:
+//   - a live row whose entry is an old pod's edit or annotation (oldPodEdit)
+//     gets it through adoptEditEntry (UpsertKBDocument and an annotation
+//     union, so nothing of the row is lost);
+//   - a path with no row at all whose entry is adoptable is copied in
+//     insert-only (insertIndexedDoc);
+//   - a soft-deleted row's entry is stale and left out of the build.
+//
+// It returns the paths it could not account for: entries with no row that
+// are not adoptable (only collected when strict; the caller then refuses to
+// delete those collections). Every entry is judged before anything is
+// written, so when strict finds such a path nothing is copied: a refused
+// reindex leaves Postgres as it was. A Postgres or export error is returned
+// as is; what was copied before it stays (insert-only or versioned, so
+// harmless).
+func (s *Service) adoptOldPodWrites(ctx context.Context, sc Scope, cols []string, strict bool) (st ReconcileStats, unadopted []string, err error) {
+	st.Scope = sc
+	if len(cols) == 0 {
+		return st, nil, nil
+	}
+	rs := storeScope(sc)
+	type entry struct {
+		d *Doc
+		v int
+	}
+	newest := map[string]entry{}
+	for _, col := range cols {
+		docs, versions, err := s.exportChunk0Versions(ctx, col)
+		if err != nil {
+			return st, nil, fmt.Errorf("export %s: %w", col, err)
+		}
+		for i, d := range docs {
+			if e, ok := newest[d.Path]; !ok || d.UpdatedAt > e.d.UpdatedAt {
+				newest[d.Path] = entry{d, versions[i]}
+			}
+		}
+	}
+	st.Indexed = len(newest)
+	if len(newest) == 0 {
+		return st, nil, nil
+	}
+	live := map[string]indexState{}
+	if err := s.store.StreamKBDocuments(ctx, rs, func(d repository.KBDocument) error {
+		live[d.Path] = rowState(&d)
+		return nil
+	}); err != nil {
+		return st, nil, fmt.Errorf("list postgres rows: %w", err)
+	}
+	st.Live = len(live)
+	deletedPaths, err := s.store.ListDeletedKBPaths(ctx, rs)
+	if err != nil {
+		return st, nil, fmt.Errorf("list deleted rows: %w", err)
+	}
+	deleted := make(map[string]bool, len(deletedPaths))
+	for _, p := range deletedPaths {
+		deleted[p] = true
+	}
+	paths := make([]string, 0, len(newest))
+	for p := range newest {
+		paths = append(paths, p)
+	}
+	slices.Sort(paths)
+
+	// Judge every entry first, so a refusal (strict, something left
+	// unadopted) writes nothing to Postgres.
+	var edits, orphans []string
+	var backfillStarted *time.Time
+	for _, p := range paths {
+		e := newest[p]
+		d := e.d
+		ix := indexState{key: stateKey(d.Title, d.Author, d.Reason, d.Tags, d.Annotations, d.UpdatedAt), version: e.v, updatedAt: d.UpdatedAt}
+		if want, ok := live[p]; ok {
+			if !ix.current(want) && oldPodEdit(ix, want) {
+				edits = append(edits, p)
+			}
+			continue
+		}
+		if deleted[p] {
+			continue
+		}
+		if backfillStarted == nil {
+			b, err := s.store.GetKBBackfill(ctx, rs)
+			if err != nil {
+				return st, nil, fmt.Errorf("read the backfill record: %w", err)
+			}
+			backfillStarted = &b.StartedAt
+		}
+		if adoptable(ix, *backfillStarted) {
+			orphans = append(orphans, p)
+			continue
+		}
+		st.IndexOnly++
+		if strict {
+			unadopted = append(unadopted, p)
+		}
+	}
+	if len(unadopted) > 0 {
+		return st, unadopted, nil
+	}
+	for _, p := range edits {
+		if err := ctx.Err(); err != nil {
+			return st, nil, err
+		}
+		adopted, err := s.adoptEditEntry(ctx, sc, newest[p].d, reindexEditBy)
+		if err != nil {
+			return st, nil, fmt.Errorf("copy an old pod's edit of %s into postgres: %w", p, err)
+		}
+		if adopted {
+			st.AdoptedEdits++
+		}
+	}
+	for _, p := range orphans {
+		if err := ctx.Err(); err != nil {
+			return st, nil, err
+		}
+		d := newest[p].d
+		inserted, err := s.insertIndexedDoc(ctx, sc, d, reindexAdoptBy)
+		if err != nil {
+			return st, nil, fmt.Errorf("copy the index-only %s: %w", p, err)
+		}
+		if inserted {
+			st.Adopted++
+			s.log.Info("kb reindex: copied an old pod's index-only doc into postgres before deleting its collection",
+				"kb", sc.String(), "path", p, "updated_at", d.UpdatedAt, "changed_by", reindexAdoptBy)
+		}
+		// Not inserted: a row appeared since the listing, so the build has it.
+	}
+	return st, unadopted, nil
 }
