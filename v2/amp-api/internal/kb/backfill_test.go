@@ -160,7 +160,7 @@ func TestBackfillCopiesLargeKBExactly(t *testing.T) {
 		t.Fatalf("second run = %+v, %v", stats, err)
 	}
 	// Even forcing the copy again inserts nothing and changes no row.
-	again, err := s.backfillOnce(ctx, sc)
+	again, err := s.backfillOnce(ctx, sc, false)
 	if err != nil || again.Inserted != 0 || again.Present != n {
 		t.Fatalf("forced re-copy = %+v, %v", again, err)
 	}
