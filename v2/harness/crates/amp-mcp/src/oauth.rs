@@ -27,8 +27,9 @@ use tokio::{
 };
 
 use crate::{
-    AmpMcpClient, Auth, ClientOptions, CredentialBackend, McpError, credentials::credential_key,
-    http::build_http_client,
+    AmpMcpClient, Auth, ClientOptions, CredentialBackend, McpError,
+    credentials::credential_key,
+    http::{DEFAULT_OAUTH_REQUEST_TIMEOUT, build_http_client, build_oauth_http_client},
 };
 
 /// How long `login` waits for the browser to come back to the loopback listener.
@@ -47,6 +48,9 @@ pub struct LoginOptions {
     pub client_name: String,
     /// Upper bound on waiting for the browser.
     pub timeout: Duration,
+    /// Upper bound on each HTTP request of the flow (the 401 probe, discovery, client
+    /// registration, token exchange).
+    pub request_timeout: Duration,
 }
 
 impl LoginOptions {
@@ -57,6 +61,7 @@ impl LoginOptions {
             backend,
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             timeout: DEFAULT_LOGIN_TIMEOUT,
+            request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
         }
     }
 
@@ -67,6 +72,11 @@ impl LoginOptions {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = timeout;
         self
     }
 }
@@ -103,7 +113,7 @@ where
     //    lets us in without credentials (compose: auth off) needs no login.
     let probe = ClientOptions::new(options.url.clone())
         .with_protocol(crate::ProtocolMode::Auto)
-        .with_connect_timeout(Duration::from_secs(30));
+        .with_connect_timeout(options.request_timeout);
     let probe = ClientOptions {
         ca_file: options.ca_file.clone(),
         ..probe
@@ -132,7 +142,12 @@ where
 
     // 3. Discovery + dynamic client registration + the PKCE authorization URL.
     let store = options.backend.store_for(&options.url);
-    let mut manager = new_manager(&options.url, options.ca_file.as_deref()).await?;
+    let mut manager = new_manager(
+        &options.url,
+        options.ca_file.as_deref(),
+        options.request_timeout,
+    )
+    .await?;
     manager.set_credential_store(store.clone());
     let resolution = manager
         .resolve_metadata_from_challenge(challenge.as_deref())
@@ -227,13 +242,29 @@ pub async fn connect(
     }
 
     let http = build_http_client(options.ca_file.as_deref())?;
-    let mut manager = new_manager(&options.url, options.ca_file.as_deref()).await?;
-    manager.set_credential_store(store);
     // Loads the client id and re-discovers the authorization server; a login made against a
-    // different issuer is dropped (rmcp clears it), which means logging in again.
-    if !manager.initialize_from_store().await.map_err(oauth_error)? {
-        return Err(McpError::AuthRequired { challenge: None });
-    }
+    // different issuer is dropped (rmcp clears it), which means logging in again. This runs before
+    // the MCP handshake, so it gets its own bound (the same connect timeout); each OAuth request
+    // is also bounded by the manager's client.
+    let prepare = async {
+        let mut manager = new_manager(
+            &options.url,
+            options.ca_file.as_deref(),
+            DEFAULT_OAUTH_REQUEST_TIMEOUT,
+        )
+        .await?;
+        manager.set_credential_store(store);
+        if !manager.initialize_from_store().await.map_err(oauth_error)? {
+            return Err(McpError::AuthRequired { challenge: None });
+        }
+        Ok(manager)
+    };
+    let manager = tokio::time::timeout(options.connect_timeout, prepare)
+        .await
+        .map_err(|_| McpError::Timeout {
+            operation: format!("OAuth discovery for {}", options.url),
+            after: options.connect_timeout,
+        })??;
     let auth = format!("oauth ({})", backend.describe());
     let mut client =
         AmpMcpClient::connect_with_http_client(options, AuthClient::new(http, manager)).await?;
@@ -244,11 +275,13 @@ pub async fn connect(
 async fn new_manager(
     url: &str,
     ca_file: Option<&std::path::Path>,
+    request_timeout: Duration,
 ) -> Result<AuthorizationManager, McpError> {
     let mut manager = AuthorizationManager::new(url).await.map_err(oauth_error)?;
-    // Same TLS roots (incl. --ca-file) and same-origin-only redirects as the MCP transport.
+    // Same TLS roots (incl. --ca-file) and same-origin-only redirects as the MCP transport, plus
+    // request and connect timeouts (rmcp's default OAuth client has them; ours must too).
     manager
-        .with_client(build_http_client(ca_file)?)
+        .with_client(build_oauth_http_client(ca_file, request_timeout)?)
         .map_err(oauth_error)?;
     Ok(manager)
 }
