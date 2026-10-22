@@ -8,10 +8,12 @@
 //! 3. pi's **status slot** (the retry countdown);
 //! 4. the **AMP panel slot** ([`crate::overlay`]): what `/amp`, `/ticket`, `/workers`,
 //!    `/questions`, `/plan` and `/project` show, docked above the editor while open;
-//! 5. the **editor** (pi's, with the working spinner in its top border while a run is going);
-//! 6. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
+//! 5. the **`/` menu** ([`crate::slash`]): the commands matching what is typed after `/`;
+//! 6. the **editor** (pi's, with the working spinner in its top border while a run is going, and
+//!    the dim placeholder [`PLACEHOLDER`] while it is empty);
+//! 7. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
 //!    approval, board counts, artifacts in review, run reported);
-//! 7. pi's two-line **footer**, unchanged (cwd/branch/session; usage and model • thinking).
+//! 8. pi's two-line **footer**, unchanged (cwd/branch/session; usage and model • thinking).
 //!
 //! Nothing here touches a terminal: [`ChatView::render_frame`] lays the screen out at any size,
 //! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
@@ -34,14 +36,18 @@ use amp_core::events::{stop_reason_str, tool_result_text};
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::overlay::Panel;
+use crate::slash::CommandMenu;
 use crate::transcript::{AssistantBlock, Block, ThinkingDisplay, ToolBlock, UserBlock, WrapText};
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
-    Component, Container, Editor, EditorOptions, EditorStyle, Focusable, FooterComponent,
-    Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack, WorkingState,
-    strip_ansi, theme,
+    CURSOR_MARKER, Component, Container, Editor, EditorOptions, EditorStyle, Focusable,
+    FooterComponent, Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack,
+    WorkingState, strip_ansi, theme,
 };
+
+/// The dim hint in the empty editor (#2182).
+pub const PLACEHOLDER: &str = "/ for commands";
 
 /// What the footer shows about the session. The footer's own setters take these.
 #[derive(Debug, Clone, Default)]
@@ -72,6 +78,8 @@ pub struct ChatView {
     chrome: Chrome,
     /// The AMP command panel (M3-4), above the editor while open.
     panel: Panel,
+    /// The `/` completion menu (#2182), right above the editor while a command is being typed.
+    menu: CommandMenu,
     root: Arc<dyn Component>,
     /// The assistant message being streamed, if any.
     assistant: Option<Arc<AssistantBlock>>,
@@ -111,8 +119,11 @@ impl ChatView {
             Arc::new(Keybindings::new()),
         ));
         editor.set_focused(true);
+        let menu = CommandMenu::new(editor.clone());
+        let menu_slot = Arc::new(Container::new());
+        menu_slot.add_child(Arc::new(menu.clone()));
         let editor_slot = Arc::new(Container::new());
-        editor_slot.add_child(editor.clone());
+        editor_slot.add_child(Arc::new(EditorView(editor.clone())));
         let amp_status = Arc::new(Container::new());
         amp_status.add_child(chrome.status_line());
         let footer = Arc::new(FooterComponent::new());
@@ -129,6 +140,7 @@ impl ChatView {
             ),
             StackChild::Entry(StackEntry::new(status.clone())),
             StackChild::Entry(StackEntry::new(panel_slot).shrink(1)),
+            StackChild::Entry(StackEntry::new(menu_slot).shrink(1)),
             StackChild::Entry(StackEntry::new(editor_slot).shrink(0).min_size(3)),
             StackChild::Entry(StackEntry::new(amp_status.clone()).shrink(0)),
             StackChild::Entry(StackEntry::new(footer.clone())),
@@ -142,6 +154,7 @@ impl ChatView {
             footer,
             chrome,
             panel,
+            menu,
             root: Arc::new(root),
             assistant: None,
             tools: HashMap::new(),
@@ -188,6 +201,11 @@ impl ChatView {
     /// The AMP command panel (`/questions`, `/workers`, ...): open, close, read its selection.
     pub fn panel(&self) -> &Panel {
         &self.panel
+    }
+
+    /// The `/` completion menu above the editor.
+    pub fn menu(&self) -> &CommandMenu {
+        &self.menu
     }
 
     /// Adds a component to the transcript (the ticket marker).
@@ -450,6 +468,45 @@ impl ChatView {
             .iter()
             .map(|l| strip_ansi(l).trim_end().to_owned())
             .collect()
+    }
+}
+
+/// pi's editor with [`PLACEHOLDER`] drawn dim after the cursor while it is empty.
+///
+/// rpi-tui 0.8.0's own `EditorOptions::placeholder` can't be used: its cursor marker is inserted
+/// inside the placeholder's `ESC[2m` (`insert_cursor_marker` ends an escape at `[`), so a real
+/// terminal would print `2m/ for commands`, undimmed. Here the editor renders as usual and the
+/// placeholder replaces the blank cells right after the cursor marker.
+struct EditorView(Arc<Editor>);
+
+impl Component for EditorView {
+    fn render(&self, width: usize) -> Vec<String> {
+        let mut lines = self.0.render(width);
+        if !self.0.get_text().is_empty() {
+            return lines;
+        }
+        let want = rpi_tui::visible_width(PLACEHOLDER);
+        for line in &mut lines {
+            let Some(at) = line.find(CURSOR_MARKER) else {
+                continue;
+            };
+            let after = at + CURSOR_MARKER.len();
+            let blanks = line[after..].bytes().take_while(|b| *b == b' ').count();
+            if blanks >= want {
+                let dim = theme().colors.dim.fg(PLACEHOLDER);
+                line.replace_range(after..after + want, &dim);
+            }
+            break;
+        }
+        lines
+    }
+
+    fn invalidate(&self) {
+        self.0.invalidate();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

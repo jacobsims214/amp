@@ -29,6 +29,9 @@
 //! - [`transcript`] and [`wrap`] (#2176): the transcript's components, word-wrapped (rpi-tui
 //!   0.8.0's own break lines mid-word).
 //!
+//! - [`slash`] (#2182): the slash commands' one table, the `/` completion menu above the editor,
+//!   and `/help` as a grouped two-column list.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
@@ -36,6 +39,7 @@ pub mod amp_render;
 pub mod chrome;
 pub mod overlay;
 pub mod shell;
+pub mod slash;
 pub mod terminal;
 pub mod theme;
 pub mod transcript;
@@ -45,12 +49,13 @@ pub mod wrap;
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
 pub use shell::{
-    ConnectFuture, ConnectReply, ESC_HINT, ESC_HINT_FOR, HELP, ModelChoice, Notifier, Opener,
+    ConnectFuture, ConnectReply, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener,
     ProviderConnect, RunDone, STOPPED, ServerControl, ServerSwitched, Shell, ShellInfo, Submit,
 };
+pub use slash::{COMMANDS, CommandMenu, CommandSpec, Group, HelpBlock, KEYS, MenuKey};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use transcript::ThinkingDisplay;
-pub use view::{ChatView, FooterInfo};
+pub use view::{ChatView, FooterInfo, PLACEHOLDER};
 
 /// Installs `theme` for every rpi-tui component (`global_theme_manager().set`, which also
 /// invalidates cached renders) and as the current [`theme::palette`]. Call it before building

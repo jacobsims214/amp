@@ -238,9 +238,20 @@ async fn numbered_lists_in_thinking_hang_under_their_text() {
 async fn help_wraps_at_words() {
     for size in SIZES {
         let screen = snapshot("wrap-help", json!([]), size, &["/help"]).await;
-        check(&screen, &[amp_tui::HELP], size.0);
+        let help: Vec<String> = amp_tui::COMMANDS
+            .iter()
+            .map(|c| format!("{} {}", c.usage(), c.about))
+            .chain(
+                amp_tui::KEYS
+                    .iter()
+                    .map(|(k, about)| format!("{k} {about}")),
+            )
+            .collect();
+        let help: Vec<&str> = help.iter().map(String::as_str).collect();
+        check(&screen, &help, size.0);
         assert!(
-            screen.iter().any(|r| r.contains("keys: Enter send")),
+            screen.iter().any(|r| r.trim() == "Keys")
+                && screen.iter().any(|r| r.contains("Enter run")),
             "{screen:?}"
         );
     }
