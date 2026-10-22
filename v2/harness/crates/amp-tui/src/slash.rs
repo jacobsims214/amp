@@ -177,8 +177,18 @@ pub const KEYS: &[(&str, &str)] = &[
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
     ("Esc", "stop the reply, or close a panel or the menu"),
     ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
-    ("Ctrl+D", "quit (with an empty editor)"),
+    (
+        "Ctrl+D",
+        "quit (with an empty editor, at the latest output)",
+    ),
     ("Ctrl+T", "show or hide the last thinking"),
+    ("PgUp/PgDn", "scroll the transcript a page"),
+    ("Ctrl+U/D", "scroll half a page (with an empty editor)"),
+    ("End", "jump to the latest output (with an empty editor)"),
+    (
+        "Fn/⌥-drag",
+        "select text: Fn in Terminal.app, Option in iTerm2",
+    ),
 ];
 
 /// The command named `name` (or one of its aliases).

@@ -490,6 +490,18 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T expands (or collapses
   again) the last thinking section.
+- Scrolling the transcript (#2185): the mouse wheel; PageUp/PageDown a page; with an empty editor,
+  Ctrl+U/Ctrl+D half a page and End back to the latest output (Ctrl+End jumps from anywhere; with
+  text in the editor these keys stay the editor's). Ctrl+D at the latest output still quits, but not
+  within a second of scrolling with it, so holding it stops at the bottom. While you are scrolled up
+  and output arrives below, a `↓ new output · End` pill shows on the transcript's last row; End or a
+  click on it jumps down and follows the stream again. Sending a prompt also jumps to the end.
+- Selecting text: the chat turns mouse reporting on (for the wheel), so a plain click-drag goes to
+  the chat instead of the terminal. Hold **Fn** while dragging in Terminal.app, or **Option (⌥)** in
+  iTerm2 (checked on macOS with both: Option-drag does not select in Terminal.app, nor Fn-drag in
+  iTerm2). To get plain click-drag selection back, turn mouse reporting off with `[tui] mouse =
+  false` (or `AMP_HARNESS_MOUSE=off`); the wheel then no longer scrolls the transcript (Terminal.app
+  may send it as ↑↓ instead), and PageUp/PageDown do.
 - Thinking (#2177) is collapsed by default: one dim line per section, `Thinking · 18s ▸`, which
   shows the model's latest sentence while it thinks and stops its timer when the answer starts.
   Expanded (Ctrl+T, or `show_thinking = "full"`), it is plain dim text behind a `│` gutter, with no
@@ -508,6 +520,7 @@ with square borders and AMP's ticket-state, epic and brand colours.
 | theme    | `--theme` | `AMP_HARNESS_THEME`         | `theme`               | `auto`      |
 | colours  | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
 | thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
+| mouse    | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
 
 - `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
   background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
@@ -517,6 +530,9 @@ with square borders and AMP's ticket-state, epic and brand colours.
 - `show_thinking`: `collapsed` (one `Thinking · Ns ▸` line per section; Ctrl+T expands the last
   one), `full` (every section expanded as plain dim text) or `hidden` (none shown; Ctrl+T still
   shows the last one).
+- `mouse`: `true` (the wheel scrolls the transcript; select with Fn-drag in Terminal.app,
+  Option-drag in iTerm2) or `false` (no mouse reporting: plain click-drag selects). The env var
+  takes `on`/`off`.
 
 ### Header and status line (M3-3)
 

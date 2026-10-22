@@ -20,6 +20,7 @@ use super::{AmpTheme, ThemeError, relative_luminance};
 pub const ENV_THEME: &str = "AMP_HARNESS_THEME";
 pub const ENV_COLOR: &str = "AMP_HARNESS_COLOR";
 pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
+pub const ENV_MOUSE: &str = "AMP_HARNESS_MOUSE";
 
 /// Dark or light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +107,8 @@ struct TuiTable {
     theme: Option<String>,
     color: Option<String>,
     show_thinking: Option<String>,
+    /// `true`/`false` (or `"on"`/`"off"`), #2185.
+    mouse: Option<toml::Value>,
 }
 
 /// How the chat shows thinking (#2177): `AMP_HARNESS_SHOW_THINKING`, then config.toml `[tui]
@@ -134,6 +137,45 @@ pub fn resolve_show_thinking(
             crate::ThinkingDisplay::parse(&v).map_err(|e| ThemeError(format!("{from}: {e}")))
         }
         None => Ok(crate::ThinkingDisplay::default()),
+    }
+}
+
+/// Whether the chat turns on mouse reporting (#2185): `AMP_HARNESS_MOUSE`, then config.toml
+/// `[tui] mouse`, then on. On, the wheel scrolls the transcript and the "↓ new output" pill is
+/// clickable, and the terminal's click-drag selection needs a modifier (Fn in Terminal.app,
+/// Option in iTerm2). Off, plain click-drag selects and PageUp/PageDown scroll. Values: `on`,
+/// `off`, `true`, `false` (TOML booleans too).
+pub fn resolve_mouse(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<bool, ThemeError> {
+    if let Some(v) = env(ENV_MOUSE).filter(|v| !v.trim().is_empty()) {
+        return parse_on_off(&v).map_err(|e| ThemeError(format!("{ENV_MOUSE}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.mouse {
+        None => Ok(true),
+        Some(toml::Value::Boolean(on)) => Ok(on),
+        Some(toml::Value::String(v)) => {
+            parse_on_off(&v).map_err(|e| ThemeError(format!("[tui] mouse: {e}")))
+        }
+        Some(other) => Err(ThemeError(format!(
+            "[tui] mouse: unknown value `{other}`: use true or false"
+        ))),
+    }
+}
+
+fn parse_on_off(v: &str) -> Result<bool, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => Err(format!("unknown value `{other}`: use on or off")),
     }
 }
 
@@ -428,6 +470,24 @@ mod tests {
         assert!(e.0.contains(ENV_COLOR), "{e}");
         let e = ThemeSettings::resolve(Some("neon"), &none, None).unwrap_err();
         assert!(e.0.contains("--theme"), "{e}");
+    }
+
+    #[test]
+    fn mouse_from_env_then_config_then_on() {
+        let none = env_of(&[]);
+        assert!(resolve_mouse(&none, None).unwrap());
+        assert!(resolve_mouse(&none, Some("[tui]\ntheme = \"dark\"\n")).unwrap());
+        assert!(!resolve_mouse(&none, Some("[tui]\nmouse = false\n")).unwrap());
+        assert!(!resolve_mouse(&none, Some("[tui]\nmouse = \"off\"\n")).unwrap());
+        assert!(resolve_mouse(&none, Some("[tui]\nmouse = true\n")).unwrap());
+        let off = env_of(&[(ENV_MOUSE, "off")]);
+        assert!(!resolve_mouse(&off, Some("[tui]\nmouse = true\n")).unwrap());
+        let on = env_of(&[(ENV_MOUSE, "ON")]);
+        assert!(resolve_mouse(&on, Some("[tui]\nmouse = false\n")).unwrap());
+        let e = resolve_mouse(&none, Some("[tui]\nmouse = 3\n")).unwrap_err();
+        assert!(e.0.contains("[tui] mouse"), "{}", e.0);
+        let e = resolve_mouse(&env_of(&[(ENV_MOUSE, "maybe")]), None).unwrap_err();
+        assert!(e.0.contains(ENV_MOUSE), "{}", e.0);
     }
 
     #[test]

@@ -9,6 +9,13 @@
 //! quit", and a second Ctrl+C within 1.5 s quits ([`Shell::ctrl_c`]). Ctrl-D on the empty editor,
 //! `/quit`, SIGINT, SIGTERM and SIGHUP quit at once.
 //!
+//! Scrolling (#2185): the wheel, PageUp/PageDown, Ctrl+U/Ctrl+D and End move the transcript
+//! ([`Shell::scroll_key`], [`Shell::ctrl_d`]); while it is scrolled up and output arrives, rpi-tui's
+//! jump-to-end indicator shows [`crate::NEW_OUTPUT`] (clicking it jumps to the end). Mouse
+//! reporting is on unless [`Shell::mouse_capture`] is off (`[tui] mouse = false`), so the
+//! terminal's own click-drag selection needs a modifier while it is on: Fn-drag in Terminal.app,
+//! Option-drag in iTerm2 (see the README).
+//!
 //! Quitting with a prompt or workers still running goes through [`Shell::quit`]: the workers are
 //! cancelled and the screen says it is waiting for their run reports (bounded; a second Ctrl-C or
 //! signal skips the wait). Tickets still unreported when the TUI exits are printed to stderr.
@@ -24,10 +31,11 @@ use std::{
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
 use rpi_agent::AgentEvent;
-use rpi_tui::{ProcessTerminal, TUI, TuiAltScreen, TuiStopOptions};
+use rpi_tui::{ProcessTerminal, TUI, Terminal, TerminalInfo, TuiAltScreen, TuiStopOptions};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::shell::{CtrlC, QuitOutcome, RunDone, Shell, Submit};
+use crate::scroll::WHEEL_LINES;
+use crate::shell::{CtrlC, CtrlD, QuitOutcome, RunDone, Shell, Submit};
 
 /// Escape sequences that undo everything the TUI turns on: mouse tracking, bracketed paste,
 /// the kitty keyboard protocol, a hidden cursor and the alternate screen.
@@ -82,6 +90,83 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// The process terminal, with mouse reporting kept off when `mouse` is false (`[tui] mouse`):
+/// rpi-tui turns it on whenever it enters the alternate screen or raw mode.
+struct MouseGate {
+    inner: ProcessTerminal,
+    mouse: bool,
+}
+
+impl Terminal for MouseGate {
+    fn info(&self) -> TerminalInfo {
+        let mut info = self.inner.info();
+        info.supports_mouse &= self.mouse;
+        info
+    }
+    fn write(&self, data: &str) {
+        self.inner.write(data)
+    }
+    fn hide_cursor(&self) {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&self) {
+        self.inner.show_cursor()
+    }
+    fn move_cursor(&self, row: usize, col: usize) {
+        self.inner.move_cursor(row, col)
+    }
+    fn clear_screen(&self) {
+        self.inner.clear_screen()
+    }
+    fn set_title(&self, title: &str) {
+        self.inner.set_title(title)
+    }
+    fn enable_mouse(&self) {
+        if self.mouse {
+            self.inner.enable_mouse()
+        } else {
+            self.inner.disable_mouse()
+        }
+    }
+    fn disable_mouse(&self) {
+        self.inner.disable_mouse()
+    }
+    fn enter_raw_mode(&self) {
+        self.inner.enter_raw_mode();
+        if !self.mouse {
+            self.inner.disable_mouse();
+        }
+    }
+    fn exit_raw_mode(&self) {
+        self.inner.exit_raw_mode()
+    }
+    fn refresh_size(&self) {
+        self.inner.refresh_size()
+    }
+    fn start(
+        &self,
+        on_input: Box<dyn Fn(rpi_tui::terminal::InputEvent) + Send + Sync>,
+        on_resize: Box<dyn Fn() + Send + Sync>,
+    ) {
+        self.inner.start(on_input, on_resize);
+        if !self.mouse {
+            self.inner.disable_mouse();
+        }
+    }
+    fn stop(&self) {
+        self.inner.stop()
+    }
+    fn is_tty(&self) -> bool {
+        self.inner.is_tty()
+    }
+    fn set_progress(&self, active: bool) {
+        self.inner.set_progress(active)
+    }
+    fn flush(&self) {
+        self.inner.flush()
+    }
+}
+
 fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(ch)
 }
@@ -94,10 +179,16 @@ pub async fn run(
 ) -> Result<(), String> {
     install_panic_hook();
     let tui = Arc::new(TuiAltScreen::new(
-        Box::new(ProcessTerminal::new()),
+        Box::new(MouseGate {
+            inner: ProcessTerminal::new(),
+            mouse: shell.mouse_capture(),
+        }),
         false,
         None,
     ));
+    // "↓ new output" while the transcript is scrolled up and output arrives (#2185).
+    let scroll = shell.view().scroll().clone();
+    tui.set_scroll_to_end_indicator(Some(Arc::new(move || scroll.pill_label())));
     tui.set_title(&format!("amp-harness · {}", shell.info().role));
     tui.set_layout_root(Some(shell.view().root()));
     tui.set_focus(Some(shell.view().editor().clone()));
@@ -223,8 +314,8 @@ async fn event_loop(
                             continue;
                         }
                         match mouse.kind {
-                            MouseEventKind::ScrollUp => tui.scroll_by(-3),
-                            MouseEventKind::ScrollDown => tui.scroll_by(3),
+                            MouseEventKind::ScrollUp => shell.view().scroll().scroll_by(-WHEEL_LINES),
+                            MouseEventKind::ScrollDown => shell.view().scroll().scroll_by(WHEEL_LINES),
                             _ => {}
                         }
                         tui.request_render(false);
@@ -245,9 +336,9 @@ async fn event_loop(
                                 break;
                             }
                         } else if is_ctrl(&key, 'd') && editor_empty {
-                            if shell.is_running() {
-                                shell.abort().await;
-                            } else {
+                            // Half a page down while scrolled up; at the latest output it stops
+                            // the reply or quits, as before (#2185).
+                            if shell.ctrl_d(Instant::now()).await == CtrlD::Quit {
                                 break;
                             }
                         } else if is_ctrl(&key, 't') {

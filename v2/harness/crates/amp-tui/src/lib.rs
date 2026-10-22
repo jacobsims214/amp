@@ -32,12 +32,16 @@
 //! - [`slash`] (#2182): the slash commands' one table, the `/` completion menu above the editor,
 //!   and `/help` as a grouped two-column list.
 //!
+//! - [`scroll`] (#2185): PageUp/PageDown, Ctrl+U/Ctrl+D and End scroll the transcript, and the
+//!   "↓ new output" pill shows while it is scrolled up and output arrives below.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
 pub mod amp_render;
 pub mod chrome;
 pub mod overlay;
+pub mod scroll;
 pub mod shell;
 pub mod slash;
 pub mod terminal;
@@ -48,10 +52,11 @@ pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
+pub use scroll::{NEW_OUTPUT, TranscriptScroll};
 pub use shell::{
-    ConnectFuture, ConnectReply, CtrlC, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener,
-    ProviderConnect, QUIT_HINT, QUIT_HINT_FOR, RunDone, STOPPED, ServerControl, ServerSwitched,
-    Shell, ShellInfo, Submit,
+    CTRL_D_SETTLE, ConnectFuture, ConnectReply, CtrlC, CtrlD, ESC_HINT, ESC_HINT_FOR, ModelChoice,
+    Notifier, Opener, ProviderConnect, QUIT_HINT, QUIT_HINT_FOR, RunDone, STOPPED, ServerControl,
+    ServerSwitched, Shell, ShellInfo, Submit,
 };
 pub use slash::{COMMANDS, CommandMenu, CommandSpec, Group, HelpBlock, KEYS, MenuKey};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
