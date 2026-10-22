@@ -2073,16 +2073,22 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 
 	// Through the service, which keeps agents from moving work forward by
 	// hand (see Service.SetTaskState), then the actor hierarchy.
-	if _, err := s.svc.SetTaskState(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason); err != nil {
+	updated, err := s.svc.SetTaskState(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason)
+	if err != nil {
 		return nil, err
 	}
-
-	return jsonResult(map[string]interface{}{
+	out := map[string]interface{}{
 		"task_id":    taskID,
 		"from_state": fromState,
-		"to_state":   stateStr,
+		"to_state":   string(updated.State),
 		"reason":     reason,
-	})
+	}
+	if string(updated.State) != stateStr {
+		// Moved back while a dependency is open: it waits on it.
+		out["note"] = fmt.Sprintf("ticket %d waits on incomplete dependencies (of %v), so it's %s rather than %s; it becomes ready when they complete",
+			taskID, updated.DependencyIDs, updated.State, stateStr)
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) setTaskStartAt(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

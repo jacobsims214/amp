@@ -101,15 +101,52 @@ func (s *Service) checkAgentCompletion(ctx context.Context, p authz.Principal, t
 			"Dispatch it first (amp_dispatch_task, once the plan is approved: %s), or a person completes it in the AMP web UI: %s.",
 			t.ID, t.State, s.PlanURL(t.ProjectID), s.TaskURL(t.ProjectID, t.ID))}
 	}
+	if err := s.openDepsGate(ctx, t, "completed"); err != nil {
+		return err
+	}
 	return s.approvalGate(ctx, p, t, "completed")
 }
 
-// sendComplete completes t in its actor. requireStarted makes the actor
-// re-check, atomically, that the ticket is still in progress.
-func (s *Service) sendComplete(ctx context.Context, p authz.Principal, t *domain.Task, requireStarted bool) error {
+// openDepsGate refuses (409) moving t forward off the web UI while any of
+// its dependencies is incomplete, naming each one; a person's ticket comes
+// with the link where they finish it. The task actor re-checks atomically
+// (MsgCompleteTask/MsgSetTaskState RequireDeps; dispatch always).
+func (s *Service) openDepsGate(ctx context.Context, t *domain.Task, doing string) error {
+	if len(t.DependencyIDs) == 0 {
+		return nil
+	}
+	done, err := s.Repo.CompletedAmong(ctx, t.DependencyIDs)
+	if err != nil {
+		return &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't check its dependencies (%v); nothing changed, try again", t.ID, err)}
+	}
+	var waits []string
+	for _, d := range t.DependencyIDs {
+		if done[d] {
+			continue
+		}
+		w := fmt.Sprintf("ticket %d", d)
+		if dep, err := s.Repo.GetTask(ctx, d); err == nil {
+			w = fmt.Sprintf("ticket %d %q (%s)", d, dep.Name, dep.State)
+			if dep.IsHuman() {
+				w += fmt.Sprintf(", a person's ticket: they finish it in the AMP web UI (%s)", s.TaskURL(dep.ProjectID, d))
+			}
+		}
+		waits = append(waits, w)
+	}
+	if len(waits) == 0 {
+		return nil
+	}
+	return &authz.Error{Status: 409, Msg: fmt.Sprintf("ticket %d can't be %s: it waits on %s. It becomes ready by itself once "+
+		"its dependencies are complete; no state change gets it there sooner.", t.ID, doing, strings.Join(waits, "; "))}
+}
+
+// sendComplete completes t in its actor. offUI makes the actor re-check,
+// atomically, that the ticket is still in progress and that its
+// dependencies are complete.
+func (s *Service) sendComplete(ctx context.Context, p authz.Principal, t *domain.Task, offUI bool) error {
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgCompleteTask{
-		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: requireStarted, ReplyCh: replyCh,
+		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI, ReplyCh: replyCh,
 	}); err != nil {
 		return err
 	}
@@ -123,8 +160,10 @@ func (s *Service) sendComplete(ctx context.Context, p authz.Principal, t *domain
 // the web UI may set any state. Off the UI, work only moves forward the
 // normal way: in_progress is refused (dispatch it), completed follows
 // CompleteTask's rules, a question isn't cleared by a state change (answer
-// it), and a person's ticket isn't marked done. Moving work back (to
-// backlog from in progress or completed, or to blocked) is always allowed.
+// it), a person's ticket isn't marked done, and a ticket waiting on an
+// incomplete dependency isn't made ready (backlog) or done. Moving work back
+// (to backlog from in progress or completed, or to blocked) is always
+// allowed; with a dependency open it lands blocked on it.
 func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID int, state domain.TaskState, reason string) (*domain.Task, error) {
 	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
 	if err != nil {
@@ -148,6 +187,16 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 					"in the AMP web UI (%s), or relay their answer with amp_answer_question.", taskID, t.BlockReason, s.TaskURL(t.ProjectID, taskID))
 			}
 		}
+		// A ticket waiting on its dependencies isn't made ready by hand:
+		// it becomes ready when the last one completes (dispatch checks
+		// again regardless). Moving work back from in progress or
+		// completed stays allowed; the actor leaves it blocked on its
+		// dependencies rather than ready.
+		if state == domain.TaskStateBacklog && t.State != domain.TaskStateInProgress && t.State != domain.TaskStateCompleted {
+			if err := s.openDepsGate(ctx, t, "made ready (backlog)"); err != nil {
+				return nil, err
+			}
+		}
 		switch state {
 		case domain.TaskStateInProgress:
 			if t.State != domain.TaskStateInProgress {
@@ -166,12 +215,17 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{
-		TaskID: taskID, State: state, Reason: reason, By: p.UserRef(), ByName: p.Label(), RequireStarted: requireStarted, ReplyCh: replyCh,
+		TaskID: taskID, State: state, Reason: reason, By: p.UserRef(), ByName: p.Label(),
+		RequireStarted: requireStarted, RequireDeps: !p.InUI(), ReplyCh: replyCh,
 	}); err != nil {
 		return nil, err
 	}
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	// The actor may have kept it blocked on its dependencies.
+	if cur, err := s.Repo.GetTask(ctx, taskID); err == nil {
+		return cur, nil
 	}
 	t.State = state
 	return t, nil
