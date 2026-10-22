@@ -99,7 +99,11 @@ type MsgCompleteTask struct {
 	// completed): agents complete only work that was dispatched. Checked in
 	// the actor so a state change racing the caller's check can't slip by.
 	RequireStarted bool
-	ReplyCh        chan ReplySimple
+	// RequireDeps refuses while any dependency is incomplete (re-read from
+	// the database), so a dependency added or reopened after dispatch still
+	// holds an agent's completion. Set off the web UI.
+	RequireDeps bool
+	ReplyCh     chan ReplySimple
 }
 
 type MsgBlockTask struct {
@@ -154,7 +158,13 @@ type MsgSetTaskState struct {
 	// RequireStarted refuses unless the ticket is in progress (see
 	// MsgCompleteTask).
 	RequireStarted bool
-	ReplyCh        chan ReplySimple
+	// RequireDeps (set off the web UI) keeps a ticket with an incomplete
+	// dependency from being made ready or done by hand: to completed or
+	// in_progress it's refused; to backlog it's refused from backlog or
+	// blocked, and work moved back from in progress or completed lands
+	// blocked on its dependencies instead.
+	RequireDeps bool
+	ReplyCh     chan ReplySimple
 }
 
 // MsgSetTaskStartAt updates a task's start_at schedule.

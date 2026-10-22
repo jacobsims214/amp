@@ -140,12 +140,24 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 				a.task.ID, a.task.State, msg.State)}
 			return
 		}
+		state := msg.State
+		if msg.RequireDeps {
+			var err error
+			if state, err = a.holdForDeps(msg.State); err != nil {
+				msg.ReplyCh <- ReplySimple{Err: err}
+				return
+			}
+		}
 		// Cancel timer if armed before applying state change
 		if a.scheduleTimer != nil {
 			a.scheduleTimer.Stop()
 			a.scheduleTimer = nil
 		}
-		err := a.handleSetState(msg.State, msg.Reason, msg.By, msg.ByName)
+		reason := msg.Reason
+		if state != msg.State {
+			reason = "" // blocked on its dependencies: no reason of its own
+		}
+		err := a.handleSetState(state, reason, msg.By, msg.ByName)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskStartAt:
@@ -229,20 +241,26 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	if msg.Human {
 		agentID = domain.HumanAgentID
 	}
-	if a.task.State == domain.TaskStateBlocked {
-		var incomplete []int
-		for _, depID := range a.task.DependencyIDs {
-			if !a.completedDeps[depID] {
-				incomplete = append(incomplete, depID)
-			}
-		}
-		return fmt.Errorf("task %d is blocked — waiting on task IDs: %v", a.task.ID, incomplete)
-	}
 	if a.task.State == domain.TaskStateInProgress {
 		return fmt.Errorf("task %d is already in_progress (agent: %s)", a.task.ID, a.task.AgentID)
 	}
 	if a.task.State == domain.TaskStateCompleted {
 		return fmt.Errorf("task %d is already completed", a.task.ID)
+	}
+	// Work never starts while a dependency is incomplete, whatever the
+	// ticket's state says: a ticket can reach backlog without its
+	// dependencies done (a state override, a dependency reopened after it
+	// completed), and the state alone would let it through. The states are
+	// re-read here, in the actor, so the check is atomic with the dispatch.
+	open, err := a.openDeps()
+	if err != nil {
+		return fmt.Errorf("task %d: couldn't check its dependencies (%v); nothing was started, try again", a.task.ID, err)
+	}
+	if len(open) > 0 {
+		return fmt.Errorf("task %d is blocked — waiting on task IDs: %v (its dependencies aren't complete, so it can't start)", a.task.ID, open)
+	}
+	if a.task.State == domain.TaskStateBlocked {
+		return fmt.Errorf("task %d is blocked (%s); it can't start until it's unblocked", a.task.ID, a.task.BlockReason)
 	}
 
 	now := time.Now()
@@ -288,6 +306,11 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) erro
 	if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
 		return fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first",
 			a.task.ID, a.task.State)
+	}
+	if msg.RequireDeps {
+		if err := a.refuseOpenDeps("completed"); err != nil {
+			return err
+		}
 	}
 
 	prevState := a.task.State // capture before mutation for accurate activity log
@@ -683,6 +706,68 @@ func (a *TaskActor) reconcileDeps(why string) error {
 }
 
 // ---- Helpers ----
+
+// openDeps re-reads which of the task's dependencies are complete (the
+// in-memory set can be stale: a dependency moved back from completed sends
+// no message) and returns the incomplete ones.
+func (a *TaskActor) openDeps() ([]int, error) {
+	if len(a.task.DependencyIDs) == 0 {
+		return nil, nil
+	}
+	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	a.completedDeps = done
+	var open []int
+	for _, d := range a.task.DependencyIDs {
+		if !done[d] {
+			open = append(open, d)
+		}
+	}
+	return open, nil
+}
+
+// refuseOpenDeps returns an error naming the incomplete dependencies, if any.
+func (a *TaskActor) refuseOpenDeps(doing string) error {
+	open, err := a.openDeps()
+	if err != nil {
+		return fmt.Errorf("task %d: couldn't check its dependencies (%v); nothing changed, try again", a.task.ID, err)
+	}
+	if len(open) > 0 {
+		return fmt.Errorf("task %d can't be %s off the web UI: it's waiting on task IDs: %v, which aren't complete", a.task.ID, doing, open)
+	}
+	return nil
+}
+
+// holdForDeps applies MsgSetTaskState.RequireDeps: the state to store
+// instead of want, or a refusal. Only a ticket whose dependencies are all
+// complete is made ready (backlog), started or done by hand off the UI.
+func (a *TaskActor) holdForDeps(want domain.TaskState) (domain.TaskState, error) {
+	switch want {
+	case domain.TaskStateBacklog, domain.TaskStateInProgress, domain.TaskStateCompleted:
+	default:
+		return want, nil
+	}
+	if want == domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted {
+		return want, nil
+	}
+	if want == domain.TaskStateBacklog && (a.task.State == domain.TaskStateInProgress || a.task.State == domain.TaskStateCompleted) {
+		// Moving work back stays allowed; with a dependency open it waits
+		// on it (blocked, no reason) rather than showing as ready.
+		open, err := a.openDeps()
+		if err != nil {
+			return want, fmt.Errorf("task %d: couldn't check its dependencies (%v); nothing changed, try again", a.task.ID, err)
+		}
+		if len(open) > 0 {
+			return domain.TaskStateBlocked, nil
+		}
+		return want, nil
+	}
+	doing := map[domain.TaskState]string{domain.TaskStateBacklog: "made ready (backlog)",
+		domain.TaskStateInProgress: "set in progress", domain.TaskStateCompleted: "completed"}[want]
+	return want, a.refuseOpenDeps(doing)
+}
 
 // withBlockedBy returns a copy of the task with BlockedByIDs computed from completedDeps.
 func (a *TaskActor) withBlockedBy() domain.Task {
