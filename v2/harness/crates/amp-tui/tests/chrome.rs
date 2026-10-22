@@ -20,7 +20,7 @@ use amp_core::{
 };
 use amp_tui::{
     AmpTheme, ChatView, Chrome, ChromeData, ColorDepth, ReportState, Variant,
-    chrome::{clean, link, plain, render_header, render_status, sample, shorten},
+    chrome::{MIN_GAP, clean, link, plain, render_header, render_status, sample, shorten},
     install_theme,
     theme::palette,
 };
@@ -135,6 +135,63 @@ fn every_width_fits() {
             assert_eq!(out.len(), if ticket { 3 } else { 2 });
             for l in &out {
                 assert!(visible_width(l) <= width, "{width}: {}", visible(l));
+            }
+        }
+    }
+}
+
+/// `data` shaped like the live board the #2109 review saw at 80 columns: two questions, two
+/// workers running elsewhere, eight tickets awaiting plan approval, and the current ticket #67
+/// unreported.
+fn live_like() -> ChromeData {
+    let mut meta = sample::meta(true);
+    let ticket = meta.ticket.value.as_mut().unwrap();
+    ticket.id = 67;
+    meta.ticket_id = Some(67);
+    let board = meta.board.value.as_mut().unwrap();
+    board.in_progress = 2;
+    board.in_progress_tickets.truncate(2);
+    board.in_progress_tickets[0].id = 67;
+    board.in_progress_tickets[1].id = 68;
+    meta.plan.value.as_mut().unwrap().awaiting_approval = (100..108).collect();
+    ChromeData::new(meta)
+}
+
+/// The blank cells before the right-aligned item that starts with `marker`, if it is drawn after
+/// a left group.
+fn gap_before(line: &str, marker: &str) -> Option<usize> {
+    let at = line.find(marker)?;
+    let left = &line[..at];
+    let trimmed = left.trim_end_matches(' ');
+    (!trimmed.is_empty()).then(|| left.len() - trimmed.len())
+}
+
+#[test]
+fn right_items_keep_a_three_cell_gap() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    // The review's case: at 80 columns `unreported #67` sat one cell after the plan chip. With
+    // a 3-cell gap it no longer fits there, so it is dropped by rank and the plan chip stays.
+    let status = |w| plain(&render_status(&live_like(), &palette(), w)[0]);
+    assert_eq!(
+        status(80),
+        "■  2 QUESTIONS  │ workers 2 ■ running │ plan: 8 awaiting approval"
+    );
+    // Two cells wider, it fits with exactly the minimum gap.
+    let wider = status(82);
+    assert!(wider.ends_with("approval   unreported #67"), "{wider}");
+    assert_eq!(gap_before(&wider, "unreported #67"), Some(MIN_GAP));
+    assert!(gap_before(&status(81), "unreported").is_none());
+
+    let markers = ["●", "▌", "unreported #", "reported ✓ #", "report failed #"];
+    for data in [sample::data(true), sample::data(false), live_like()] {
+        for width in 10..=220 {
+            for (i, l) in lines(&data, width).iter().enumerate() {
+                let l = plain(l);
+                for marker in markers {
+                    if let Some(g) = gap_before(&l, marker) {
+                        assert!(g >= MIN_GAP, "{width} line {i}: {l:?}");
+                    }
+                }
             }
         }
     }
