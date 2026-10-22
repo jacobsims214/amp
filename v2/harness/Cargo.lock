@@ -95,14 +95,18 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "rcgen",
  "rmcp",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",
  "serde",
  "serde_json",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
+ "x509-parser",
 ]
 
 [[package]]

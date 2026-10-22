@@ -28,7 +28,8 @@ use amp_mcp::{
 };
 use clap::{Args, Parser, Subcommand};
 
-/// Harness version plus the exact upstream versions it was built against (D11).
+/// Harness version, the exact upstream versions it was built against, and the commit of the
+/// embedded agent/skill assets (D11).
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nrpi-ai ",
@@ -43,6 +44,8 @@ const LONG_VERSION: &str = concat!(
     env!("AMP_PIN_RPI_TUI"),
     "\nrmcp ",
     env!("AMP_PIN_RMCP"),
+    "\nassets ",
+    env!("AMP_ASSETS_COMMIT"),
 );
 
 #[derive(Parser)]
@@ -69,8 +72,9 @@ enum Command {
     Login(LoginArgs),
     /// Forget the stored login for an AMP server.
     Logout(ServerArgs),
-    /// Check the connection to AMP: server, protocol, auth, tools, who you are, the project.
-    Doctor(JsonArgs),
+    /// Check this machine end to end: AMP connection, CA trust, login, tool contract, project,
+    /// provider keys, the models each role pins, and versions. Failing checks say how to fix them.
+    Doctor(doctor::DoctorArgs),
     /// Show who AMP thinks you are.
     Whoami(JsonArgs),
     /// List and read tickets.
@@ -140,7 +144,7 @@ async fn main() -> ExitCode {
         }
         Some(Command::Login(args)) => login(args).await.map_err(Into::into),
         Some(Command::Logout(args)) => logout(args).await.map_err(Into::into),
-        Some(Command::Doctor(args)) => doctor::run(args.conn, args.json).await,
+        Some(Command::Doctor(args)) => doctor::run(args).await,
         Some(Command::Whoami(args)) => whoami::run(args.conn, args.json).await,
         Some(Command::Tickets(command)) => tickets::run(command).await,
         Some(Command::Run(args)) => run::run(args).await,
