@@ -421,3 +421,135 @@ async fn show_thinking_hidden_in_config_shows_none_until_ctrl_t() {
     assert_eq!(thinking_headers(&screen).len(), 1, "{text}");
     assert!(text.contains("silly and repetitive"), "{text}");
 }
+
+/// #2180: a 4-column ticket table, like the board answer in the review (finding 5).
+const TICKETS: &str = "Board:\n\n\
+| # | Ticket | State | Owner |\n\
+|--:|---|---|---|\n\
+| 2176 | Transcript text breaks mid-word everywhere | done | amp-worker-backend |\n\
+| 2177 | Thinking display: collapse by default with a live timer | done | amp-worker-backend |\n\
+| 2180 | Render markdown tables correctly (box glyphs, padding, width fallback) | in progress | amp-worker-backend |\n\
+| 2183 | Compact tool lines | ready | amp-worker-frontend |";
+
+/// Too many columns for 80: every header word alone needs more than the row.
+const WIDE: &str = "Plan:\n\n\
+| Identifier | Description | Assignee | Dependencies | Acceptance | Priority | Estimate | Reviewer |\n\
+|---|---|---|---|---|---|---|---|\n\
+| T-1 | Parse tables | backend | none | snapshot tests | P2 | 2h | reviewer |\n\
+| T-2 | Wrap cells | backend | T-1 | joints align | P2 | 1h | reviewer |";
+
+/// The table's rows (top rule to bottom rule).
+fn table_rows(screen: &[String]) -> &[String] {
+    let top = screen
+        .iter()
+        .position(|r| r.trim_start().starts_with('┌'))
+        .unwrap_or_else(|| panic!("no table\n{}", screen.join("\n")));
+    let bottom = screen
+        .iter()
+        .position(|r| r.trim_start().starts_with('└'))
+        .unwrap_or_else(|| panic!("no table bottom\n{}", screen.join("\n")));
+    &screen[top..=bottom]
+}
+
+/// Column (in chars) of every box glyph that joins columns or closes a row.
+fn joints(row: &str) -> Vec<usize> {
+    row.trim_end()
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| "┌┬┐├┼┤└┴┘│".contains(*c))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn assert_box_table(table: &[String], width: usize) {
+    let text = table.join("\n");
+    let top = joints(&table[0]);
+    assert!(top.len() == 5, "4 columns: {text}");
+    for row in table {
+        assert_eq!(joints(row), top, "joints don't meet:\n{text}");
+        assert!(!row.contains('|'), "ASCII | in a box table:\n{text}");
+        assert!(row.trim_end().chars().count() <= width, "{text}");
+    }
+    // A rule under the header only: top, header, rule, body..., bottom.
+    let rules = table.iter().filter(|r| r.contains('┼')).count();
+    assert_eq!(rules, 1, "rules between body rows:\n{text}");
+    // One space of padding each side of every cell.
+    for row in table.iter().filter(|r| r.contains('│')) {
+        let cells: Vec<&str> = row.trim().trim_matches('│').split('│').collect();
+        for cell in cells {
+            assert!(
+                cell.starts_with(' ') && cell.ends_with(' '),
+                "unpadded cell {cell:?}:\n{text}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn tables_draw_with_box_glyphs_aligned_at_both_sizes() {
+    for size in SIZES {
+        let screen = snapshot("table", json!([{ "text": TICKETS }]), size, &["board?"]).await;
+        if std::env::var_os("WRAP_SCREENS").is_some() {
+            eprintln!("{}\n", screen.join("\n"));
+        }
+        let table = table_rows(&screen);
+        assert_box_table(table, size.0);
+        let text = table.join("\n");
+        assert!(
+            !screen.iter().any(|r| r.contains('|')),
+            "{}",
+            screen.join("\n")
+        );
+        if size.0 == 127 {
+            // Natural widths: one row per ticket, the title whole.
+            assert_eq!(table.len(), 4 + 4, "{text}");
+            assert!(text.contains(
+                "Render markdown tables correctly (box glyphs, padding, width fallback)"
+            ));
+        } else {
+            // The title column shrinks and its cells wrap at words; the rest keep their width.
+            assert!(table.len() > 8, "{text}");
+            assert!(text.contains("amp-worker-frontend"), "{text}");
+            let words: Vec<&str> = table
+                .iter()
+                .flat_map(|r| r.split(['│', ' ']))
+                .filter(|w| !w.is_empty())
+                .collect();
+            for w in ["mid-word", "everywhere", "Render", "fallback)"] {
+                assert!(words.contains(&w), "{w} split:\n{text}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_table_too_wide_for_the_row_falls_back_to_records() {
+    for size in SIZES {
+        let screen = snapshot("table-wide", json!([{ "text": WIDE }]), size, &["plan?"]).await;
+        if std::env::var_os("WRAP_SCREENS").is_some() {
+            eprintln!("{}\n", screen.join("\n"));
+        }
+        let text = screen.join("\n");
+        assert!(!screen.iter().any(|r| r.contains('|')), "{text}");
+        if size.0 == 127 {
+            let table = table_rows(&screen);
+            let top = joints(&table[0]);
+            assert_eq!(top.len(), 9, "{text}");
+            for row in table {
+                assert_eq!(joints(row), top, "{text}");
+            }
+        } else {
+            assert!(!text.contains('┌') && !text.contains('┼'), "{text}");
+            let records = rows_from(&screen, "• Identifier: T-1");
+            assert!(records[1].trim() == "Description: Parse tables", "{text}");
+            assert!(
+                screen.iter().any(|r| r.contains("• Identifier: T-2")),
+                "{text}"
+            );
+            assert!(
+                screen.iter().any(|r| r.trim() == "Reviewer: reviewer"),
+                "{text}"
+            );
+        }
+    }
+}
