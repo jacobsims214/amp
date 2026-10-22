@@ -187,6 +187,11 @@
   "permissions": [
    {
     "action": "edit",
+    "resource": "*",
+    "effect": "deny"
+   },
+   {
+    "action": "edit",
     "resource": ".opencode/**",
     "effect": "allow"
    },
@@ -196,7 +201,7 @@
     "effect": "allow"
    },
    {
-    "action": "edit",
+    "action": "shell",
     "resource": "*",
     "effect": "deny"
    },
@@ -224,11 +229,6 @@
     "action": "shell",
     "resource": "mkdir -p .opencode/*",
     "effect": "allow"
-   },
-   {
-    "action": "shell",
-    "resource": "*",
-    "effect": "deny"
    },
    {
     "action": "webfetch",

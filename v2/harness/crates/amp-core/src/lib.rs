@@ -16,11 +16,19 @@
 //! - [`providers`]: live rpi providers from that config: keys (env, then keychain), the stall
 //!   guard (header / stream-idle timeouts), and the faux provider for tests.
 //!
+//! M2-2 (#2093):
+//! - [`roles`]: the role registry (prompt, preloaded skills, model key, policy) built from the assets.
+//! - [`policy`]: each role's opencode `permission` rules, enforced in an rpi before-tool hook; a
+//!   denied call is a tool error the model sees, nothing ever prompts, and children get neither
+//!   the question tool nor the dispatch tool.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod assets;
 pub mod models;
+pub mod policy;
 pub mod project;
 pub mod providers;
+pub mod roles;
 pub mod tickets;
 pub mod tools;
