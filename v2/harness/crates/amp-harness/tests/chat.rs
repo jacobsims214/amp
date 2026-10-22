@@ -86,7 +86,8 @@ async fn the_chat_talks_to_the_manager() {
     assert!(screen.contains("project #2"), "{screen}");
     assert!(screen.contains(amp.url.as_str()), "{screen}");
     assert!(screen.contains("faux/faux-1 • thinking"), "{screen}");
-    assert!(screen.contains("session "), "{screen}");
+    // The session path wraps onto its own row when it is longer than the rest of the line (#2176).
+    assert!(screen.contains("· session"), "{screen}");
 
     // Transcript: both prompts, the AMP tool call, both replies.
     for text in [

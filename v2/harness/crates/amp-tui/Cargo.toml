@@ -21,6 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "signal"] }
+# Column widths for word wrapping (#2176). The same version rpi-tui measures text with.
+unicode-width = "=0.1.14"
 
 # select(2) on the tty for the OSC 11 background query (#2155): poll(2) is POLLNVAL on macOS
 # /dev/tty. "term" is for openpty in its pty tests.
