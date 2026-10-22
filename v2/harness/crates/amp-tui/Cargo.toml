@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 amp-core.workspace = true
+# login's guarded browser opener (/open).
+amp-mcp.workspace = true
 rpi-ai.workspace = true
 rpi-agent.workspace = true
 rpi-harness.workspace = true

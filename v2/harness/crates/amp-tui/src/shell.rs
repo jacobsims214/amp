@@ -8,18 +8,57 @@
 //!
 //! Every prompt is `prompt_text` on the same harness, so the conversation carries on between
 //! prompts. A run is spawned as its own task so the screen keeps updating while it streams.
+//!
+//! **AMP commands (M3-4, #2108).** `/amp`, `/ticket [id|none]`, `/workers`, `/questions`, `/plan`,
+//! `/project [id]` open a panel above the editor ([`crate::overlay`]) drawn from the metadata
+//! poller's snapshot; `/open [id]` opens the current (or given) ticket in the browser. `/ticket`
+//! and `/project` switch the poller ([`MetaHandle::set_ticket`] / [`MetaHandle::set_project`]).
+//! Their AMP calls (`amp_get_plan`, `amp_answer_question`) go through [`MetaHandle::call`] on the
+//! poller's connection, never through the model, in spawned tasks whose results
+//! [`Shell::poll`] applies, so the screen never waits on AMP.
+//!
+//! Answering a question is a write: Enter on a question in `/questions` asks for the answer in
+//! the editor, the panel then shows exactly what will be sent, and only `y` / Enter sends it.
+//!
+//! The transcript gets a marker line whenever the current ticket changes (switched, claimed, or
+//! its state moved), and the footer's session name becomes `manager · #2108`.
 
 use std::{sync::Arc, time::Duration};
 
 use amp_core::events::{RunEvent, Totals};
 use amp_core::meta::MetaHandle;
 use amp_core::models::thinking_name;
+use amp_core::tickets::Status;
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
 use rpi_ai::{Model, ThinkingLevel};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome, RunResult};
+use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+use crate::amp_render;
+use crate::overlay::{self, PanelKind, PanelState, Stage, Target};
 use crate::view::{ChatView, FooterInfo};
+
+/// Opens a URL in the browser (default: login's guarded opener; tests record instead).
+pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// How long a command's read (`/plan`) may take.
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long `amp_answer_question` may take.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A command's AMP call that finished (applied by [`Shell::poll`]).
+enum ShellMsg {
+    Plan {
+        project_id: i64,
+        result: Result<Value, String>,
+    },
+    Answered {
+        ticket: i64,
+        result: Result<Value, String>,
+    },
+}
 
 /// A finished `prompt_text` call (`Err` also covers a run task that panicked).
 pub type RunDone = Result<RunResult, String>;
@@ -42,14 +81,19 @@ pub struct ShellInfo {
 }
 
 impl ShellInfo {
-    fn footer(&self) -> FooterInfo {
+    /// The footer; with a current ticket its session name reads `manager · #2108`.
+    fn footer(&self, ticket: Option<i64>) -> FooterInfo {
+        let role = short_role(&self.role);
         FooterInfo {
             model: self.model_id.clone(),
             thinking: thinking_name(self.thinking).to_owned(),
             context_window: self.context_window,
             cwd: self.cwd.clone(),
             git_branch: self.git_branch.clone(),
-            session_name: Some(short_role(&self.role).to_owned()),
+            session_name: Some(match ticket {
+                Some(id) => format!("{role} · #{id}"),
+                None => role.to_owned(),
+            }),
         }
     }
 
@@ -72,8 +116,9 @@ pub enum Submit {
     Quit,
 }
 
-pub const HELP: &str = "commands: /model [provider/model]  /usage  /help  /quit\n\
-keys: Enter send · Shift+Enter new line · Esc abort the run · Ctrl+C abort, clear, or quit";
+pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id]\n\
+commands: /model [provider/model]  /usage  /help  /quit\n\
+keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit";
 
 pub struct Shell {
     view: ChatView,
@@ -86,6 +131,15 @@ pub struct Shell {
     done_tx: UnboundedSender<RunDone>,
     /// The AMP metadata poller (#2104), if the caller started one.
     meta: Option<MetaHandle>,
+    opener: Opener,
+    msgs_tx: UnboundedSender<ShellMsg>,
+    msgs_rx: UnboundedReceiver<ShellMsg>,
+    /// Command calls still running.
+    in_flight: usize,
+    /// The snapshot revision last looked at, and the ticket (id, state) last marked.
+    seen_revision: u64,
+    marked: Option<(i64, Option<Status>)>,
+    footer_ticket: Option<i64>,
 }
 
 impl Shell {
@@ -96,8 +150,9 @@ impl Shell {
         models: Vec<ModelChoice>,
     ) -> (Self, UnboundedReceiver<RunDone>) {
         let (done_tx, done_rx) = unbounded_channel();
+        let (msgs_tx, msgs_rx) = unbounded_channel();
         let view = ChatView::new();
-        view.set_footer(&info.footer());
+        view.set_footer(&info.footer(None));
         view.add_banner(&info.banner);
         (
             Self {
@@ -110,6 +165,13 @@ impl Shell {
                 running: false,
                 done_tx,
                 meta: None,
+                opener: Arc::new(|url: &str| amp_mcp::oauth::open_browser(url)),
+                msgs_tx,
+                msgs_rx,
+                in_flight: 0,
+                seen_revision: 0,
+                marked: None,
+                footer_ticket: None,
             },
             done_rx,
         )
@@ -145,6 +207,11 @@ impl Shell {
         self.meta.as_ref()
     }
 
+    /// Replaces the browser opener (tests record the URL instead of opening it).
+    pub fn set_opener(&mut self, opener: Opener) {
+        self.opener = opener;
+    }
+
     pub fn handle_event(&mut self, event: &AgentEvent) {
         if let Some(e) = RunEvent::from_agent(event) {
             self.totals.observe(&e);
@@ -159,6 +226,31 @@ impl Shell {
     pub async fn submit(&mut self, text: &str) -> Submit {
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            return Submit::Continue;
+        }
+        // Typing an answer to a question (`/questions`, Enter on one): the submission is the
+        // answer, shown for confirmation; nothing is sent yet.
+        if !trimmed.starts_with('/')
+            && let Some(PanelState {
+                stage: Stage::Answer { ticket, question },
+                ..
+            }) = self.view.panel().state()
+        {
+            let answer = clean_answer(text);
+            if answer.is_empty() {
+                self.view
+                    .panel()
+                    .update(|s| s.note = Some(("the answer is empty".to_owned(), true)));
+            } else {
+                self.view.panel().update(|s| {
+                    s.stage = Stage::Confirm {
+                        ticket,
+                        question,
+                        answer,
+                    };
+                    s.note = None;
+                });
+            }
             return Submit::Continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
@@ -234,12 +326,384 @@ impl Shell {
             "model" if arg.is_empty() => self.view.add_notice(&self.model_text()),
             "model" => self.switch_model(arg).await,
             "abort" => self.abort().await,
+            "amp" => self.open_panel("amp", PanelKind::Amp),
+            "workers" => self.open_panel("workers", PanelKind::Workers),
+            "questions" => self.open_panel("questions", PanelKind::Questions),
+            "ticket" => self.ticket_command(arg),
+            "project" => self.project_command(arg),
+            "plan" => self.plan_command(),
+            "open" => self.open_command(arg),
+            "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
                 .view
                 .add_notice(&format!("unknown command: /{other} (try /help)")),
         }
         Submit::Continue
+    }
+
+    /// The metadata poller, or a notice that the chat has none (`--snapshot`, no AMP).
+    fn need_meta(&self, command: &str) -> Option<MetaHandle> {
+        if self.meta.is_none() {
+            self.view.add_notice(&format!(
+                "/{command}: no AMP metadata in this session (the metadata poller is not running)"
+            ));
+        }
+        self.meta.clone()
+    }
+
+    fn open_panel(&mut self, command: &str, kind: PanelKind) {
+        if self.need_meta(command).is_some() {
+            self.view.panel().open(PanelState::new(kind));
+        }
+    }
+
+    /// `/ticket` shows the current ticket; `/ticket 2108` makes #2108 current; `/ticket none`
+    /// clears it.
+    fn ticket_command(&mut self, arg: &str) {
+        let Some(meta) = self.need_meta("ticket") else {
+            return;
+        };
+        match arg {
+            "" => {}
+            "none" | "clear" | "-" => {
+                meta.set_ticket(None);
+                self.view.panel().close();
+                self.view.add_notice("no current ticket");
+                return;
+            }
+            _ => match parse_id(arg) {
+                Some(id) => meta.set_ticket(Some(id)),
+                None => {
+                    self.view.add_error(&format!(
+                        "/ticket: `{}` is not a ticket id (try /ticket 2108, or /ticket none)",
+                        crate::chrome::clean(arg)
+                    ));
+                    return;
+                }
+            },
+        }
+        self.view.panel().open(PanelState::new(PanelKind::Ticket));
+    }
+
+    /// `/project` shows the project; `/project 2` switches the header and board to project 2.
+    fn project_command(&mut self, arg: &str) {
+        let Some(meta) = self.need_meta("project") else {
+            return;
+        };
+        if !arg.is_empty() {
+            match parse_id(arg) {
+                Some(id) => meta.set_project(Some(id)),
+                None => {
+                    self.view.add_error(&format!(
+                        "/project: `{}` is not a project id (try /project 2)",
+                        crate::chrome::clean(arg)
+                    ));
+                    return;
+                }
+            }
+        }
+        self.view.panel().open(PanelState::new(PanelKind::Project));
+    }
+
+    /// `/plan`: plan approval from the snapshot, and the plan tree from `amp_get_plan` (read on
+    /// the poller's connection, in the background).
+    fn plan_command(&mut self) {
+        let Some(meta) = self.need_meta("plan") else {
+            return;
+        };
+        let mut state = PanelState::new(PanelKind::Plan);
+        if let Some(project_id) = meta.snapshot().project_id {
+            let tx = self.msgs_tx.clone();
+            self.in_flight += 1;
+            tokio::spawn(async move {
+                let result = meta
+                    .call(
+                        "amp_get_plan",
+                        json!({"project_id": project_id}),
+                        READ_TIMEOUT,
+                    )
+                    .await;
+                let _ = tx.send(ShellMsg::Plan { project_id, result });
+            });
+        } else {
+            state.plan = Some(Err("no project".to_owned()));
+        }
+        self.view.panel().open(state);
+    }
+
+    /// `/open` opens the current ticket (or `/open 2108`, or the project's Mission page without a
+    /// ticket) in the browser. Only http(s) URLs from the instance's URL helpers are opened.
+    fn open_command(&mut self, arg: &str) {
+        let Some(meta) = self.need_meta("open") else {
+            return;
+        };
+        let m = meta.snapshot();
+        let ticket = if arg.is_empty() {
+            m.ticket_id
+        } else {
+            match parse_id(arg) {
+                Some(id) => Some(id),
+                None => {
+                    self.view.add_error(&format!(
+                        "/open: `{}` is not a ticket id",
+                        crate::chrome::clean(arg)
+                    ));
+                    return;
+                }
+            }
+        };
+        let Some(inst) = &m.instance else {
+            self.view
+                .add_error("/open: not connected to AMP yet (no instance to link to)");
+            return;
+        };
+        let url = match (ticket, m.project_id) {
+            (Some(id), Some(pid)) => inst.ticket_url(pid, id),
+            (None, Some(pid)) => inst.project_url(pid),
+            (Some(_), None) => {
+                self.view.add_error(
+                    "/open: no project, so no board to open the ticket on (/project <id>)",
+                );
+                return;
+            }
+            (None, None) => inst.web_base.clone(),
+        };
+        self.open_url(&url);
+    }
+
+    fn open_url(&mut self, url: &str) {
+        if !overlay::openable(url) {
+            self.view
+                .add_error("/open: not a plain http(s) URL; refusing to open it");
+            return;
+        }
+        match (self.opener)(url) {
+            Ok(()) => self.view.add_notice(&format!("opened {url}")),
+            Err(e) => self.view.add_error(&format!("/open {url}: {e}")),
+        }
+    }
+
+    /// A key while a panel is open. Returns true when the panel used it (the editor must not).
+    /// Esc closes the panel (or backs out of an answer). With an empty editor, ↑/↓ select,
+    /// Enter acts on the selection (answers a question; otherwise opens it) and `o` opens it.
+    /// While an answer waits for confirmation, `y`/Enter sends it and `n`/Esc cancels; other keys
+    /// are swallowed.
+    pub fn panel_key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
+        let panel = self.view.panel().clone();
+        let Some(state) = panel.state() else {
+            return false;
+        };
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return false;
+        }
+        match state.stage {
+            Stage::Answer { .. } => {
+                if key.code == KeyCode::Esc {
+                    panel.update(|s| {
+                        s.stage = Stage::Browse;
+                        s.note = Some(("not sent".to_owned(), false));
+                    });
+                    return true;
+                }
+                false
+            }
+            Stage::Confirm { ticket, answer, .. } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                        self.send_answer(ticket, answer)
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        panel.update(|s| {
+                            s.stage = Stage::Browse;
+                            s.note = Some(("not sent".to_owned(), false));
+                        });
+                    }
+                    _ => {}
+                }
+                true
+            }
+            Stage::Sending { .. } => true,
+            Stage::Browse => {
+                if key.code == KeyCode::Esc {
+                    panel.close();
+                    return true;
+                }
+                if !editor_empty {
+                    return false;
+                }
+                match key.code {
+                    KeyCode::Up => panel.move_selection(-1),
+                    KeyCode::Down => panel.move_selection(1),
+                    KeyCode::PageUp => panel.move_selection(-5),
+                    KeyCode::PageDown => panel.move_selection(5),
+                    KeyCode::Enter => match panel.selected() {
+                        Some(Target::Ticket {
+                            id,
+                            question: Some(question),
+                        }) if state.kind == PanelKind::Questions => {
+                            panel.update(|s| {
+                                s.stage = Stage::Answer {
+                                    ticket: id,
+                                    question,
+                                };
+                                s.note = None;
+                            });
+                        }
+                        Some(target) => self.open_target(&target),
+                        None => {}
+                    },
+                    KeyCode::Char('o') => {
+                        if let Some(target) = panel.selected() {
+                            self.open_target(&target);
+                        }
+                    }
+                    _ => return false,
+                }
+                true
+            }
+        }
+    }
+
+    /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
+    /// `enter`, `esc`, `up`, `down`, or one character.
+    pub fn press(&mut self, name: &str) -> Result<bool, String> {
+        let code = match name {
+            "enter" => KeyCode::Enter,
+            "esc" => KeyCode::Esc,
+            "up" => KeyCode::Up,
+            "down" => KeyCode::Down,
+            c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap_or(' ')),
+            other => {
+                return Err(format!(
+                    "key `{other}`: not a key (enter, esc, up, down, or one character)"
+                ));
+            }
+        };
+        Ok(self.panel_key(&KeyEvent::new(code, KeyModifiers::NONE), true))
+    }
+
+    fn open_target(&mut self, target: &Target) {
+        let Some(meta) = &self.meta else { return };
+        match overlay::target_url(&meta.snapshot(), target) {
+            Some(url) => self.open_url(&url),
+            None => self
+                .view
+                .add_error("/open: no AMP instance or project to link to yet"),
+        }
+    }
+
+    /// Sends a confirmed answer with `amp_answer_question` on the poller's connection.
+    fn send_answer(&mut self, ticket: i64, answer: String) {
+        let Some(meta) = self.meta.clone() else {
+            return;
+        };
+        self.view.panel().update(|s| {
+            s.stage = Stage::Sending { ticket };
+            s.note = None;
+        });
+        let tx = self.msgs_tx.clone();
+        self.in_flight += 1;
+        tokio::spawn(async move {
+            let result = meta
+                .call(
+                    "amp_answer_question",
+                    json!({"task_id": ticket, "answer": answer}),
+                    WRITE_TIMEOUT,
+                )
+                .await;
+            let _ = tx.send(ShellMsg::Answered { ticket, result });
+        });
+    }
+
+    /// Applies finished command calls and follows the metadata (the ticket marker, the footer).
+    /// Returns whether anything changed. The terminal loop calls it on its tick.
+    pub fn poll(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(msg) = self.msgs_rx.try_recv() {
+            self.in_flight = self.in_flight.saturating_sub(1);
+            changed = true;
+            match msg {
+                ShellMsg::Plan { project_id, result } => {
+                    let current = self.meta.as_ref().and_then(|m| m.snapshot().project_id);
+                    if current == Some(project_id) {
+                        self.view.panel().update(|s| {
+                            if s.kind == PanelKind::Plan {
+                                s.plan = Some(result);
+                            }
+                        });
+                    }
+                }
+                ShellMsg::Answered { ticket, result } => match result {
+                    Ok(_) => {
+                        self.view.panel().update(|s| {
+                            s.stage = Stage::Browse;
+                            s.note = Some((format!("answered #{ticket}"), false));
+                        });
+                        self.view
+                            .add_notice(&format!("answered #{ticket} (amp_answer_question)"));
+                    }
+                    Err(e) => {
+                        let e = crate::chrome::clean(&e);
+                        self.view.panel().update(|s| {
+                            s.stage = Stage::Browse;
+                            s.note = Some((format!("not answered: {e}"), true));
+                        });
+                        self.view
+                            .add_error(&format!("answer to #{ticket} failed: {e}"));
+                    }
+                },
+            }
+        }
+        changed | self.sync_meta()
+    }
+
+    /// Waits (at most `timeout`) until every command call has finished, applying them. The
+    /// headless driver's counterpart of the terminal tick.
+    pub async fn settle(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.poll();
+            if self.in_flight == 0 {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("AMP command calls still running after {timeout:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Draws the ticket marker when the current ticket or its state changed, and keeps the
+    /// footer's `#ticket` in step.
+    fn sync_meta(&mut self) -> bool {
+        let Some(meta) = &self.meta else {
+            return false;
+        };
+        let m = meta.snapshot();
+        if m.revision == self.seen_revision {
+            return false;
+        }
+        self.seen_revision = m.revision;
+        let mut changed = false;
+        if m.ticket_id != self.footer_ticket {
+            self.footer_ticket = m.ticket_id;
+            self.view.set_footer(&self.info.footer(self.footer_ticket));
+            changed = true;
+        }
+        // Wait for a new ticket to load (or fail) before marking it.
+        if let Some(key) = amp_render::marker_for(&m)
+            && key != self.marked
+        {
+            self.marked = key;
+            self.view
+                .add_to_transcript(amp_render::marker_component(&m));
+            changed = true;
+        }
+        changed
     }
 
     fn usage_text(&self) -> String {
@@ -324,7 +788,7 @@ impl Shell {
         self.info.model_id = model_id.to_owned();
         self.info.thinking = thinking;
         self.info.context_window = choice.model.context_window;
-        self.view.set_footer(&self.info.footer());
+        self.view.set_footer(&self.info.footer(self.footer_ticket));
         self.view.add_notice(&format!(
             "model: {} • thinking {} (this session only)",
             self.info.model_ref(),
@@ -364,6 +828,26 @@ impl Shell {
     }
 }
 
+/// `2108` or `#2108`.
+fn parse_id(arg: &str) -> Option<i64> {
+    arg.trim()
+        .trim_start_matches('#')
+        .parse()
+        .ok()
+        .filter(|id: &i64| *id > 0)
+}
+
+/// The answer as it will be sent: each line cleaned of control characters (so what the panel
+/// shows is exactly what is sent), blank lines at the ends dropped.
+fn clean_answer(text: &str) -> String {
+    text.lines()
+        .map(crate::chrome::clean)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_owned()
+}
+
 /// `amp-manager` -> `manager`, `amp:amp-worker-backend` -> `worker-backend`.
 pub fn short_role(role: &str) -> &str {
     let role = role.rsplit(':').next().unwrap_or(role);
@@ -372,7 +856,19 @@ pub fn short_role(role: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::short_role;
+    use super::{clean_answer, parse_id, short_role};
+
+    #[test]
+    fn ids_and_answers() {
+        assert_eq!(parse_id("2108"), Some(2108));
+        assert_eq!(parse_id("#2108"), Some(2108));
+        assert_eq!(parse_id("0"), None);
+        assert_eq!(parse_id("x"), None);
+        assert_eq!(
+            clean_answer("  dark\x1b[31m  please \n\nok\n"),
+            "dark[31m please\n\nok"
+        );
+    }
 
     #[test]
     fn short_role_drops_the_prefixes() {

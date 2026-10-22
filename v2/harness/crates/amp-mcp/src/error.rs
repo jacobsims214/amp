@@ -77,6 +77,13 @@ impl McpError {
         matches!(self, Self::AuthRequired { .. })
     }
 
+    /// True when the server answered the request with a JSON-RPC error: AMP's tools return one
+    /// for an unknown ticket, bad arguments or a failed handler. The call failed, but the
+    /// connection is fine, so it does not count against [`crate::Health`].
+    pub fn is_server_error(&self) -> bool {
+        matches!(self, Self::Service { source, .. } if matches!(**source, ServiceError::McpError(_)))
+    }
+
     pub(crate) fn from_init(url: &str, error: ClientInitializeError) -> Self {
         if error.is_authorization_required() {
             return Self::AuthRequired {
