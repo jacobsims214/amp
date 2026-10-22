@@ -2,6 +2,7 @@ package actor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -130,7 +131,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplyGetTask{Task: t, Err: err}
 
 	case *MsgUpdateTask:
-		err := a.handleUpdate(msg.Req)
+		err := a.handleUpdate(msg.Req, msg.KeepHuman)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
@@ -351,10 +352,18 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 	return nil
 }
 
-func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
+func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string) error {
 	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
 	if err != nil {
 		return err
+	}
+	// A person's ticket becomes agent work only by that choice in the web UI;
+	// otherwise an agent could flip it, dispatch it and complete it. Checked
+	// before anything changes, so a refusal leaves the ticket as it was.
+	if keepHuman != "" && a.task.IsHuman() && req.Performer != "" {
+		if p, _, err := domain.NormalizePerformer(req.Performer, ""); err == nil && p == domain.PerformerAgent {
+			return errors.New(keepHuman)
+		}
 	}
 	if req.Name != "" {
 		a.task.Name = req.Name

@@ -177,3 +177,33 @@ func (s *Service) checkRunOutcome(p authz.Principal, t *domain.Task, outcome str
 	}
 	return nil
 }
+
+// UpdateTask applies an edit to t (amp_update_task, REST PATCH
+// /api/tasks/{id}); the caller has loaded t with the access the edit needs.
+// Off the web UI, a person's ticket can't be switched to agent work: an agent
+// could otherwise flip it, dispatch it and complete it, which is marking the
+// person's ticket done without them. Agent work may become a person's ticket
+// from anywhere. The task actor re-checks atomically, and a refusal leaves
+// the ticket unchanged. Other actor errors come back as 400.
+func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.Task, req domain.UpdateTaskRequest) error {
+	req.TaskID = t.ID
+	keepHuman := ""
+	if !p.InUI() {
+		refusal := authz.UIOnly(fmt.Sprintf("Switching ticket %d (a person's ticket) to agent work", t.ID), s.TaskURL(t.ProjectID, t.ID))
+		if t.IsHuman() && strings.EqualFold(strings.TrimSpace(req.Performer), domain.PerformerAgent) {
+			return refusal
+		}
+		keepHuman = refusal.Error()
+	}
+	replyCh := make(chan actor.ReplySimple, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgUpdateTask{Req: req, KeepHuman: keepHuman, ReplyCh: replyCh}); err != nil {
+		return err
+	}
+	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
+		if keepHuman != "" && reply.Err.Error() == keepHuman {
+			return &authz.Error{Status: 403, Msg: keepHuman}
+		}
+		return &authz.Error{Status: 400, Msg: reply.Err.Error()}
+	}
+	return nil
+}
