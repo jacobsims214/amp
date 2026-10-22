@@ -53,6 +53,8 @@ enum ShellMsg {
     Plan {
         project_id: i64,
         result: Result<Value, String>,
+        /// The blocked tickets that split the plan's `blocked` counts (`None` when the plan failed).
+        blocked: Option<Result<Value, String>>,
     },
     Answered {
         ticket: i64,
@@ -407,7 +409,9 @@ impl Shell {
     }
 
     /// `/plan`: plan approval from the snapshot, and the plan tree from `amp_get_plan` (read on
-    /// the poller's connection, in the background).
+    /// the poller's connection, in the background). The plan counts stored states only, so the
+    /// blocked tickets are read too (`amp_list_tasks(owner=any, state=blocked, format=full)`), to
+    /// show questions, scheduled and waiting tickets apart like the web UI.
     fn plan_command(&mut self) {
         let Some(meta) = self.need_meta("plan") else {
             return;
@@ -424,7 +428,22 @@ impl Shell {
                         READ_TIMEOUT,
                     )
                     .await;
-                let _ = tx.send(ShellMsg::Plan { project_id, result });
+                let blocked = match &result {
+                    Ok(_) => Some(
+                        meta.call(
+                            "amp_list_tasks",
+                            json!({"project_id": project_id, "owner": "any", "state": "blocked", "format": "full"}),
+                            READ_TIMEOUT,
+                        )
+                        .await,
+                    ),
+                    Err(_) => None,
+                };
+                let _ = tx.send(ShellMsg::Plan {
+                    project_id,
+                    result,
+                    blocked,
+                });
             });
         } else {
             state.plan = Some(Err("no project".to_owned()));
@@ -627,12 +646,17 @@ impl Shell {
             self.in_flight = self.in_flight.saturating_sub(1);
             changed = true;
             match msg {
-                ShellMsg::Plan { project_id, result } => {
+                ShellMsg::Plan {
+                    project_id,
+                    result,
+                    blocked,
+                } => {
                     let current = self.meta.as_ref().and_then(|m| m.snapshot().project_id);
                     if current == Some(project_id) {
                         self.view.panel().update(|s| {
                             if s.kind == PanelKind::Plan {
                                 s.plan = Some(result);
+                                s.plan_blocked = blocked;
                             }
                         });
                     }

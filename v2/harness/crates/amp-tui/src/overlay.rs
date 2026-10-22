@@ -21,6 +21,7 @@
 
 use std::{
     any::Any,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
@@ -97,6 +98,9 @@ pub struct PanelState {
     pub stage: Stage,
     /// `/plan`'s `amp_get_plan` result (`None` while it loads).
     pub plan: Option<Result<Value, String>>,
+    /// `/plan`'s blocked tickets (`amp_list_tasks(owner=any, state=blocked, format=full)`), which
+    /// split the plan's stored `blocked` counts into Question, Scheduled and Waiting.
+    pub plan_blocked: Option<Result<Value, String>>,
     /// A one-line note at the bottom (`answered #2107`, an error).
     pub note: Option<(String, bool)>,
 }
@@ -108,6 +112,7 @@ impl PanelState {
             selected: 0,
             stage: Stage::Browse,
             plan: None,
+            plan_blocked: None,
             note: None,
         }
     }
@@ -858,34 +863,94 @@ fn name_of_question(data: &ChromeData, id: i64) -> String {
         .unwrap_or_default()
 }
 
-/// `■ 2 In progress · 3 open · 1 blocked · ■ 10 Done` from `amp_get_plan`'s per-state counts
-/// (AMP's stored states: open = backlog, blocked = a question or waiting).
-fn plan_counts(p: &AmpPalette, tickets: &Value) -> String {
+/// How many of a plan node's blocked tickets are questions or scheduled (the rest wait).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BlockedSplit {
+    pub question: i64,
+    pub scheduled: i64,
+}
+
+/// [`BlockedSplit`]s per story and per epic.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PlanSplit {
+    pub stories: HashMap<i64, BlockedSplit>,
+    pub epics: HashMap<i64, BlockedSplit>,
+}
+
+/// Splits blocked tickets the way the web UI's `displayState` does ([`Status::of`]): a
+/// `scheduled:` reason is Scheduled, any other reason is a Question, no reason is Waiting.
+/// `list` is `amp_list_tasks(format=full)`; its `blocked` and `scheduled` buckets hold every
+/// blocked ticket. `None` when it isn't that shape.
+pub fn blocked_split(list: &Value) -> Option<PlanSplit> {
+    let buckets = [
+        list.get("blocked")?.as_array()?,
+        list.get("scheduled")?.as_array()?,
+    ];
+    let mut seen = HashSet::new();
+    let mut split = PlanSplit::default();
+    for t in buckets.into_iter().flatten() {
+        let Some(id) = t["id"].as_i64() else { continue };
+        if !seen.insert(id) {
+            continue;
+        }
+        let status = Status::of(
+            t["state"].as_str().unwrap_or("blocked"),
+            t["block_reason"].as_str(),
+        );
+        for (map, key) in [
+            (&mut split.stories, t["story_id"].as_i64()),
+            (&mut split.epics, t["epic_id"].as_i64()),
+        ] {
+            let Some(key) = key else { continue };
+            let e = map.entry(key).or_default();
+            match status {
+                Status::Question => e.question += 1,
+                Status::Scheduled => e.scheduled += 1,
+                _ => {}
+            }
+        }
+    }
+    Some(split)
+}
+
+/// A plan node's counts in the six display states, in the status line's order (In progress,
+/// Ready, Question, Scheduled, Waiting, Done), zeros left out. `tickets` is `amp_get_plan`'s
+/// per-stored-state counts: backlog is Ready, and blocked is split by `split` (all Waiting
+/// without it).
+pub fn plan_states(tickets: &Value, split: Option<BlockedSplit>) -> Vec<(Status, i64)> {
+    let n = |k: &str| tickets[k].as_i64().unwrap_or(0).max(0);
+    let blocked = n("blocked");
+    let sp = split.unwrap_or_default();
+    let question = sp.question.clamp(0, blocked);
+    let scheduled = sp.scheduled.clamp(0, blocked - question);
+    [
+        (Status::InProgress, n("in_progress")),
+        (Status::Ready, n("backlog")),
+        (Status::Question, question),
+        (Status::Scheduled, n("scheduled") + scheduled),
+        (Status::Waiting, blocked - question - scheduled),
+        (Status::Done, n("completed")),
+    ]
+    .into_iter()
+    .filter(|(_, k)| *k > 0)
+    .collect()
+}
+
+/// `■ 2 In progress · □ 3 Ready · ■ 1 Question · ■ 10 Done`: [`plan_states`] with the palette's
+/// state marks and the web UI's words.
+fn plan_counts(p: &AmpPalette, tickets: &Value, split: Option<BlockedSplit>) -> String {
     let c = colors();
-    let n = |k: &str| tickets[k].as_i64().unwrap_or(0);
-    let mut parts = Vec::new();
-    let prog = p.state(Status::InProgress);
-    if n("in_progress") > 0 {
-        parts.push(format!(
-            "{} {}",
-            prog.mark.fg("■"),
-            prog.text.fg(&format!("{} In progress", n("in_progress")))
-        ));
-    }
-    if n("backlog") > 0 {
-        parts.push(c.muted.fg(&format!("{} open", n("backlog"))));
-    }
-    if n("blocked") > 0 {
-        parts.push(c.warning.fg(&format!("{} blocked", n("blocked"))));
-    }
-    if n("completed") > 0 {
-        let done = p.state(Status::Done);
-        parts.push(format!(
-            "{} {}",
-            done.mark.fg("■"),
-            done.text.fg(&format!("{} Done", n("completed")))
-        ));
-    }
+    let parts: Vec<String> = plan_states(tickets, split)
+        .into_iter()
+        .map(|(status, k)| {
+            let s = p.state(status);
+            format!(
+                "{} {}",
+                s.mark.fg(&s.glyph),
+                s.text.fg(&format!("{k} {}", s.label))
+            )
+        })
+        .collect();
     if parts.is_empty() {
         c.dim.fg("no tickets")
     } else {
@@ -946,6 +1011,18 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
         )])),
         Some(Err(e)) => rows.push(Row::new(vec![flex(&format!("amp_get_plan: {e}"), c.error)])),
         Some(Ok(v)) => {
+            let split = match &state.plan_blocked {
+                Some(Ok(list)) => blocked_split(list).ok_or_else(|| "not a full list".to_owned()),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err("not read".to_owned()),
+            };
+            let of = |map: fn(&PlanSplit) -> &HashMap<i64, BlockedSplit>, id: &Value| {
+                split.as_ref().ok().map(|s| {
+                    id.as_i64()
+                        .and_then(|id| map(s).get(&id).copied())
+                        .unwrap_or_default()
+                })
+            };
             let epics = v["epics"].as_array().cloned().unwrap_or_default();
             if epics.is_empty() {
                 rows.push(Row::new(vec![flex("no epics yet", c.dim)]));
@@ -954,7 +1031,11 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
                 let mut row = Row::new(vec![
                     fixed(p.epic(i).fg("▌")),
                     flex(epic["name"].as_str().unwrap_or("?"), c.text),
-                    fixed(plan_counts(p, &epic["tickets"])),
+                    fixed(plan_counts(
+                        p,
+                        &epic["tickets"],
+                        of(|s| &s.epics, &epic["id"]),
+                    )),
                 ]);
                 if let Some(t) = &page {
                     row = row.target(t.clone());
@@ -964,11 +1045,23 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
                     rows.push(
                         Row::new(vec![
                             flex(story["name"].as_str().unwrap_or("?"), c.muted),
-                            fixed(plan_counts(p, &story["tickets"])),
+                            fixed(plan_counts(
+                                p,
+                                &story["tickets"],
+                                of(|s| &s.stories, &story["id"]),
+                            )),
                         ])
                         .indent(2),
                     );
                 }
+            }
+            // The split is a second read; without it, questions and scheduled tickets count as
+            // Waiting, and the panel says so.
+            if let Err(e) = &split {
+                rows.push(Row::new(vec![flex(
+                    &format!("Question and Scheduled counted as Waiting (amp_list_tasks: {e})"),
+                    c.dim,
+                )]));
             }
         }
     }
@@ -1194,6 +1287,62 @@ mod tests {
         assert_eq!(wrap_plain("one two three", 7), vec!["one two", "three"]);
         assert_eq!(wrap_plain("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
         assert_eq!(wrap_plain("a\x1b[31mb", 10), vec!["a[31mb"]);
+    }
+
+    #[test]
+    fn plan_counts_split_blocked_like_the_web() {
+        use serde_json::json;
+        // amp_list_tasks(format=full): a question, a waiting and a scheduled ticket in story 393.
+        let list = json!({
+            "blocked": [
+                {"id": 1, "epic_id": 161, "story_id": 393, "state": "blocked", "block_reason": "Dark or light?"},
+                {"id": 2, "epic_id": 161, "story_id": 393, "state": "blocked"}
+            ],
+            "scheduled": [
+                {"id": 3, "epic_id": 161, "story_id": 393, "state": "blocked", "block_reason": "scheduled: 2026-11-01"}
+            ],
+            "questions": [{"id": 1, "epic_id": 161, "story_id": 393, "state": "blocked", "block_reason": "Dark or light?"}]
+        });
+        let split = blocked_split(&list).expect("full list");
+        let story = split.stories[&393];
+        assert_eq!(
+            story,
+            BlockedSplit {
+                question: 1,
+                scheduled: 1
+            }
+        );
+        assert_eq!(split.epics[&161], story);
+        let tickets = json!({"in_progress": 1, "backlog": 2, "blocked": 3, "completed": 4});
+        assert_eq!(
+            plan_states(&tickets, Some(story)),
+            vec![
+                (Status::InProgress, 1),
+                (Status::Ready, 2),
+                (Status::Question, 1),
+                (Status::Scheduled, 1),
+                (Status::Waiting, 1),
+                (Status::Done, 4),
+            ]
+        );
+        // Without the split every blocked ticket waits; zeros are left out.
+        assert_eq!(
+            plan_states(&json!({"blocked": 3}), None),
+            vec![(Status::Waiting, 3)]
+        );
+        // A split larger than the plan's count (two reads, a moment apart) never goes negative.
+        assert_eq!(
+            plan_states(
+                &json!({"blocked": 1}),
+                Some(BlockedSplit {
+                    question: 2,
+                    scheduled: 2
+                })
+            ),
+            vec![(Status::Question, 1)]
+        );
+        // The compact list (no buckets of tickets) is not a split.
+        assert_eq!(blocked_split(&json!({"waiting": 1, "scheduled": 1})), None);
     }
 
     #[test]
