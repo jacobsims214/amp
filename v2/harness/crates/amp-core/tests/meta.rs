@@ -314,6 +314,7 @@ fn fast(board_ms: u64) -> Intervals {
         call_timeout: Duration::from_secs(5),
         slow_after: Duration::from_secs(2),
         reconnect: Duration::from_millis(200),
+        call_queue_grace: Duration::from_secs(30),
     }
 }
 
@@ -812,6 +813,113 @@ async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_
         m.count("amp_list_tasks") > boards
     })
     .await;
+}
+
+/// #2160: a slash command's write that the caller already reported as failed (no answer in
+/// time, because the poller was stuck in a refresh against a hung AMP) is never sent afterwards.
+/// Otherwise `/questions` says "not answered", the user answers again, and both answers land.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_the_caller_gave_up_on_is_never_sent() {
+    let server = serve(Mock::new(default_board())).await;
+    let mock = &server.mock;
+    // AMP hangs: the poller's first call (amp_whoami) waits out its 1 s timeout.
+    mock.delay_ms.store(1_500, Ordering::SeqCst);
+    let mut iv = fast(3_600_000);
+    iv.call_timeout = Duration::from_secs(1);
+    iv.call_queue_grace = Duration::from_millis(100);
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(2104),
+            intervals: iv,
+            connector: None,
+            web_url: None,
+        },
+    );
+    wait_calls(mock, "the stalled refresh", |m| m.count("amp_whoami") == 1).await;
+
+    // The caller's bound is 100 ms + 100 ms grace, well inside the stalled amp_whoami.
+    let started = tokio::time::Instant::now();
+    let err = meta
+        .call(
+            "amp_answer_question",
+            json!({"task_id": 2107, "answer": "Dark"}),
+            Duration::from_millis(100),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("no answer within"), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(900), "{err}");
+
+    // AMP recovers; the poller gets past the queue and loads everything (the stopped pass's
+    // topics included), and the answer the caller gave up on was dropped, not sent.
+    mock.delay_ms.store(0, Ordering::SeqCst);
+    meta.refresh(amp_core::meta::Topics::BOARD);
+    wait_for(&meta, "everything loaded after AMP recovers", loaded).await;
+    // A later call still goes through, so the queue itself is fine.
+    meta.call(
+        "amp_get_plan",
+        json!({"project_id": 2}),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        mock.count("amp_answer_question"),
+        0,
+        "a write the caller reported as failed was sent: {:?}",
+        mock.calls.lock().unwrap()
+    );
+}
+
+/// #2160: a refresh pass stops at the first transport/timeout failure instead of waiting out
+/// every remaining call's timeout; the topics it skipped run in the next pass. An error AMP
+/// answered (JSON-RPC error) does not stop the pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refresh_stops_at_the_first_timeout_but_not_at_an_amp_error() {
+    let server = serve(Mock::new(default_board())).await;
+    let mock = &server.mock;
+    mock.delay_ms.store(1_000, Ordering::SeqCst);
+    let mut iv = fast(3_600_000);
+    iv.call_timeout = Duration::from_millis(300);
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(2104),
+            intervals: iv,
+            connector: None,
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "degraded", |m| {
+        matches!(m.health.connection, Connection::Degraded { .. })
+    })
+    .await;
+    // Longer than the rest of the pass would have taken to start its next calls.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        *mock.calls.lock().unwrap(),
+        vec![("amp_whoami".to_owned(), json!({}))],
+        "only the first call of the pass"
+    );
+
+    // The next pass (asked for the board only) also runs the skipped topics.
+    mock.delay_ms.store(0, Ordering::SeqCst);
+    meta.refresh(amp_core::meta::Topics::BOARD);
+    wait_for(&meta, "everything loaded in the next pass", loaded).await;
+
+    // Errors AMP answers with don't stop a pass: every topic is still asked for.
+    mock.fail.store(true, Ordering::SeqCst);
+    let artifacts = mock.count("amp_list_artifacts");
+    meta.refresh(amp_core::meta::Topics::ALL);
+    wait_calls(mock, "the whole pass despite AMP errors", |m| {
+        m.count("amp_list_artifacts") > artifacts
+    })
+    .await;
+    assert_eq!(meta.snapshot().health.connection, Connection::Ok);
 }
 
 #[tokio::test(flavor = "multi_thread")]
