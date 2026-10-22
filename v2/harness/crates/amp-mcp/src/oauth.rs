@@ -166,6 +166,9 @@ where
         .await
         .map_err(|(_, e)| oauth_error(e))?;
     let authorization_url = session.get_authorization_url().to_owned();
+    // The URL comes from the server's `authorization_endpoint` metadata, which rmcp only parses:
+    // never let a malicious server make us launch `file://` or a custom scheme handler.
+    check_authorization_url(&authorization_url).map_err(McpError::OAuth)?;
     let expected_state = query_param(&authorization_url, "state")
         .ok_or_else(|| McpError::OAuth("authorization URL has no state parameter".to_owned()))?;
 
@@ -319,6 +322,38 @@ fn query_param(url: &str, name: &str) -> Option<String> {
         .map(|(_, v)| v.into_owned())
 }
 
+/// An authorization URL we are willing to open in the browser: `https`, or `http` to a loopback
+/// host (127.0.0.0/8, ::1, localhost), which a local or test authorization server uses. The error
+/// names only the scheme and host, never the query (it carries the PKCE challenge and state).
+fn check_authorization_url(url: &str) -> Result<(), String> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|_| "authorization endpoint is not a valid URL; refusing to open it".to_owned())?;
+    match parsed.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_host(&parsed) => Ok(()),
+        "http" => Err(format!(
+            "authorization endpoint http://{}… is plain http to a non-loopback host; refusing to open it",
+            parsed.host_str().unwrap_or_default()
+        )),
+        scheme => Err(format!(
+            "authorization endpoint {scheme}://… is not http(s); refusing to open it"
+        )),
+    }
+}
+
+fn is_loopback_host(url: &reqwest::Url) -> bool {
+    // `host_str` is already lowercased; an IPv6 host comes bracketed.
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 const MAX_REQUEST_HEAD: usize = 16 * 1024;
 const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -431,8 +466,17 @@ async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
 }
 
 /// Opens `url` in the user's browser. Errors are for the caller to print; the URL is printed
-/// anyway, so a failed open only means the user copies it.
+/// anyway, so a failed open only means the user copies it. Only `http`/`https` URLs are opened:
+/// anything else (`file://`, a custom scheme handler) is refused before a process is spawned.
 pub fn open_browser(url: &str) -> Result<(), String> {
+    let scheme = reqwest::Url::parse(url)
+        .map(|u| u.scheme().to_owned())
+        .map_err(|_| "not a valid URL; refusing to open it".to_owned())?;
+    if scheme != "http" && scheme != "https" {
+        return Err(format!(
+            "{scheme}:// URLs are not http(s); refusing to open it"
+        ));
+    }
     #[cfg(target_os = "macos")]
     let mut command = std::process::Command::new("open");
     #[cfg(target_os = "windows")]
@@ -452,5 +496,56 @@ pub fn open_browser(url: &str) -> Result<(), String> {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(format!("browser opener exited with {status}")),
         Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn authorization_url_must_be_https_or_loopback_http() {
+        for ok in [
+            "https://auth.example.com/authorize?state=s",
+            "http://127.0.0.1:8080/authorize",
+            "http://127.0.0.2/authorize",
+            "http://[::1]:9000/authorize",
+            "http://localhost/authorize",
+            "http://LOCALHOST:1/authorize",
+        ] {
+            assert!(check_authorization_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "file:///etc/passwd",
+            "amp-evil://run?cmd=x",
+            "javascript:alert(1)",
+            "http://auth.example.com/authorize",
+            "http://localhost.evil.com/authorize",
+            "not a url",
+        ] {
+            let err = check_authorization_url(bad).expect_err(bad);
+            assert!(err.contains("refusing to open it"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn rejection_never_echoes_the_query() {
+        let err =
+            check_authorization_url("file:///x?state=SECRETSTATE&code_challenge=CC").unwrap_err();
+        assert!(!err.contains("SECRETSTATE") && !err.contains("CC"), "{err}");
+    }
+
+    #[test]
+    fn open_browser_refuses_non_http_urls_without_spawning() {
+        // These return before a Command is built, so no opener process is ever launched.
+        for bad in [
+            "file:///etc/passwd",
+            "amp-evil://run",
+            "smb://host/share",
+            "not a url",
+        ] {
+            let err = open_browser(bad).expect_err(bad);
+            assert!(err.contains("refusing to open it"), "{bad}: {err}");
+        }
     }
 }
