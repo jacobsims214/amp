@@ -8,11 +8,12 @@
 //!   argument deltas, per-message starts) is dropped; text deltas, finished assistant messages
 //!   (with usage), tool starts/ends and retries are kept.
 //! - [`Totals`] sums usage over assistant messages and counts turns and tool calls (D8's
-//!   accounting starts here).
+//!   accounting starts here). [`TotalsEmitter`] keeps a session's live totals (the manager's
+//!   `amp_session_usage`) and passes every event on.
 //!
 //! The JSON is a contract for scripts: fields may be added, never renamed or removed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage, AgentToolResult, TextContentOrImage};
 use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, Content, StopReason, Usage};
@@ -46,6 +47,48 @@ impl AgentEmitter for ChannelEmitter {
 
     fn try_emit(&self, event: AgentEvent) {
         let _ = self.tx.send(event);
+    }
+}
+
+/// Updates a session's live [`Totals`] synchronously with every event (so a tool that reads them
+/// sees the message that called it), then passes the event on to `inner`.
+pub struct TotalsEmitter {
+    totals: Arc<Mutex<Totals>>,
+    inner: Option<Arc<dyn AgentEmitter>>,
+}
+
+impl TotalsEmitter {
+    pub fn new(totals: Arc<Mutex<Totals>>, inner: Option<Arc<dyn AgentEmitter>>) -> Self {
+        Self { totals, inner }
+    }
+
+    pub fn into_emitter(self) -> Arc<dyn AgentEmitter> {
+        Arc::new(self)
+    }
+
+    fn observe(&self, event: &AgentEvent) {
+        if let Some(e) = RunEvent::from_agent(event)
+            && let Ok(mut t) = self.totals.lock()
+        {
+            t.observe(&e);
+        }
+    }
+}
+
+impl AgentEmitter for TotalsEmitter {
+    fn emit(&self, event: AgentEvent) -> futures_core_box::BoxFuture {
+        self.observe(&event);
+        match &self.inner {
+            Some(inner) => inner.emit(event),
+            None => Box::pin(std::future::ready(())),
+        }
+    }
+
+    fn try_emit(&self, event: AgentEvent) {
+        self.observe(&event);
+        if let Some(inner) = &self.inner {
+            inner.try_emit(event);
+        }
     }
 }
 
