@@ -11,7 +11,7 @@ use std::{
 };
 
 use common::{MockAmp, Output, spawn, workdir};
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 /// A key-shaped value that must never show up in output or files.
@@ -373,6 +373,32 @@ async fn the_chat_first_run_links_a_new_project_and_suggests_seeding_it() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(out.stderr.trim().is_empty(), "{}", out.stderr);
     assert!(!out.stdout.contains("Set up this new project"));
+}
+
+#[tokio::test]
+async fn a_taken_project_code_is_asked_again() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("setup-code-taken", None);
+    // n, a name, a code an archived project already has, then a free one.
+    let args = ["init", "--url", &amp.url, "--json"];
+    let mut run = Run::new(&dir, &args);
+    run.stdin = Some("n\nNew Thing\nold\nNT\n");
+    let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("project code \"OLD\" already exists"),
+        "{}",
+        out.stderr
+    );
+    let codes: Vec<Value> = amp
+        .mock
+        .calls_to("amp_create_project")
+        .iter()
+        .map(|c| c["code"].clone())
+        .collect();
+    assert_eq!(codes, vec![json!("OLD"), json!("NT")]);
+    assert_eq!(out.json()["project"]["created"], true);
+    assert_eq!(marker(&dir)["project_id"], 77);
 }
 
 #[tokio::test]

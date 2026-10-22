@@ -39,6 +39,23 @@
 #          (AMP_HARNESS_KEYCHAIN_TRACE). `connect --list` must report the key's source and
 #          `disconnect openrouter` must remove the item (#2163). The item is deleted on exit.
 #
+# M4-5 (#2118, smoke v4) follows the human-only-approval server (epic 162): the compose and cluster
+# legs create all three dispatchable tickets up front and approve the plan once, as the person (the
+# compose leg POSTs /api/projects/P/approve-plan on AMP_SMOKE_REST_URL, which counts as the web UI on
+# an auth-off compose; the cluster leg tries amp_approve_plan, which only older servers allow, and
+# otherwise waits AMP_SMOKE_APPROVE_WAIT seconds for a person to approve at the printed link); an
+# agent dispatches a ticket before completing it; and on compose a person's (human) ticket is refused
+# over MCP and marked done through REST. Two new legs, both against the compose server:
+# firstrun  A brand-new HOME (under target/), no config: the chat's first run with scripted answers
+#           (AMP_HARNESS_PROMPTS=stdin: server as host:port, n, name, code) must save the server and
+#           web UI, create a project, write .amp.json at the git root and prefill the editor; a second
+#           start asks nothing; then `init --yes --url --project N --json` in another new HOME links a
+#           second folder and `doctor --json` there (no env) is ok. The project is archived on exit.
+# install   Packs the binary under test with scripts/package.sh (or AMP_SMOKE_ARCHIVE, a real release
+#           archive), installs it with install.sh --archive into a prefix under target/ (HOME and the
+#           login shell under target/ too), installs it again over itself, and runs the installed
+#           binary's --version and doctor --json against compose.
+#
 # Exits non-zero on any failure. Cleanup runs on every exit path (trap), including failures.
 # The harness runs with HOME/XDG_CONFIG_HOME under target/ and AMP_CREDENTIAL_STORE=file, so your
 # real keychain and config.toml are never read or written.
@@ -50,16 +67,26 @@ BIN="${AMP_HARNESS_BIN:-$HARNESS_DIR/target/debug/amp-harness}"
 COMPOSE_URL="${AMP_MCP_URL:-http://localhost:8000/mcp}"
 CLUSTER_URL="${AMP_SMOKE_CLUSTER_URL:-https://amp.local/mcp}"
 PROTOCOLS="${AMP_SMOKE_PROTOCOLS:-auto 2025-11-25}"
-LEGS="${AMP_SMOKE_LEGS:-compose cluster}"
+LEGS="${AMP_SMOKE_LEGS:-compose firstrun install cluster}"
 COMPOSE_EMAIL="${AMP_SMOKE_COMPOSE_EMAIL:-local-dev@amp.local}"
 # Compose serves the web UI on its own port (amp-ui, :5173), not on the MCP origin.
 COMPOSE_WEB_URL="${AMP_SMOKE_WEB_URL:-http://localhost:5173}"
+# Compose's REST listener: auth off, so a call here is the person in the web UI (plan approval,
+# marking a person's ticket done). Never used for the cluster leg.
+REST_URL="${AMP_SMOKE_REST_URL:-http://localhost:3001}"
+# Cluster leg: how long to wait for a person to approve the plan when the server refuses agents.
+APPROVE_WAIT="${AMP_SMOKE_APPROVE_WAIT:-0}"
+# install leg: a release archive to install instead of packing the binary under test.
+INSTALL_ARCHIVE="${AMP_SMOKE_ARCHIVE:-}"
 
 # Keep the cluster credentials aside and out of the environment, so no other leg ever sends them.
 CLUSTER_TOKEN="${AMP_TOKEN:-}"
 CLUSTER_CA="${AMP_CA_FILE:-}"
 unset AMP_TOKEN AMP_CA_FILE AMP_MCP_URL AMP_MCP_PROTOCOL AMP_WEB_URL
 
+# fd 3 is the real stdout: the exit trap can run inside a `call ... >/dev/null` (die exits from
+# there), and its cleanup and result lines must still be seen.
+exec 3>&1
 log() { printf 'smoke: %s\n' "$*"; }
 die() {
   printf 'smoke: FAIL: %s\n' "$*" >&2
@@ -79,6 +106,9 @@ log "version ok ($(head -1 <<<"$out"))"
 # The keychain leg needs the real HOME: the macOS login keychain lives there.
 REAL_HOME="$HOME"
 KC_SERVICE=""
+# A made-up provider key for the firstrun and install legs: never valid, never sent anywhere (the
+# chat only builds its session), and it must not end up in any file or output.
+DUMMY_KEY="sk-or-v1-smoke-not-a-key-$$"
 
 # --- isolation ------------------------------------------------------------------------------------
 mkdir -p "$HARNESS_DIR/target"
@@ -111,8 +141,10 @@ git init -q -b main . && printf 'smoke repo\n' >README.md && git add README.md &
 
 # --- per-leg state + cleanup ----------------------------------------------------------------------
 LEG="" LEG_URL="" LEG_PROTO="" LEG_TOKEN="" LEG_CA="" LEG_WEB=""
-P_ID="" P_NAME="" EPIC_ID="" STORY_ID="" TASK_IDS=() LEG_WEB_BASE=""
+P_ID="" P_NAME="" EPIC_ID="" STORY_ID="" TASK_IDS=() LEG_WEB_BASE="" LEG_REST=""
 RESULTS=()
+# Projects the firstrun leg created through the harness itself; archived on exit.
+EXTRA_PROJECTS=()
 
 # h ARGS...: run the harness against the current leg. Connection settings go through the
 # environment (AMP_MCP_URL, AMP_MCP_PROTOCOL, AMP_TOKEN, AMP_CA_FILE, AMP_WEB_URL), never argv.
@@ -142,7 +174,10 @@ cleanup_leg() {
   [[ -n "$P_ID" ]] || return 0
   local failed=0 id
   for id in "${TASK_IDS[@]+"${TASK_IDS[@]}"}"; do
-    h mcp call amp_delete_task "{\"task_id\":$id}" >/dev/null 2>&1 || { failed=1; echo "smoke: cleanup: could not delete ticket $id" >&2; }
+    # An open person's ticket can only be deleted by the person (REST on compose), not over MCP.
+    h mcp call amp_delete_task "{\"task_id\":$id}" >/dev/null 2>&1 ||
+      { [[ -n "$LEG_REST" ]] && curl -fsS -m 10 -X DELETE "$LEG_REST/api/tasks/$id" >/dev/null 2>&1; } ||
+      { failed=1; echo "smoke: cleanup: could not delete ticket $id" >&2; }
   done
   if [[ -n "$STORY_ID" ]]; then
     h mcp call amp_delete_story "{\"story_id\":$STORY_ID}" >/dev/null 2>&1 || { failed=1; echo "smoke: cleanup: could not delete story $STORY_ID" >&2; }
@@ -166,7 +201,17 @@ cleanup_leg() {
 on_exit() {
   local rc=$?
   trap - EXIT
+  exec 1>&3
   cleanup_leg || rc=1
+  local p
+  for p in "${EXTRA_PROJECTS[@]+"${EXTRA_PROJECTS[@]}"}"; do
+    if AMP_MCP_URL="$COMPOSE_URL" "$BIN" mcp call amp_archive_project "{\"project_id\":$p}" >/dev/null 2>&1; then
+      log "cleanup ok: first-run project $p archived"
+    else
+      rc=1
+      echo "smoke: cleanup: could not archive first-run project $p" >&2
+    fi
+  done
   if [[ -n "$KC_SERVICE" ]]; then
     security delete-generic-password -s "$KC_SERVICE" -a provider:openrouter >/dev/null 2>&1 || true
   fi
@@ -180,13 +225,82 @@ on_exit() {
 trap on_exit EXIT
 trap 'exit 130' INT TERM
 
+# --- plan approval and a person's ticket (M4-5, smoke v4) ----------------------------------------
+# approve_plan: the person approves the leg's plan. Compose: POST approve-plan on the REST listener
+# (the web UI's route) with as_of = the newest planned_at among the open tickets, sent verbatim
+# (#2192; a server without as_of ignores it). Cluster: amp_approve_plan, which only servers from
+# before human-only approval accept; otherwise a person must approve at the printed link within
+# AMP_SMOKE_APPROVE_WAIT seconds.
+approve_plan() {
+  local out as_of
+  if [[ -n "$LEG_REST" ]]; then
+    out="$(curl -fsS -m 10 "$LEG_REST/api/projects/$P_ID/tasks?owner=any")" ||
+      die "[$LEG] approve: could not list the project's tickets on $LEG_REST"
+    # Newest planned_at, compared on a fixed-width key (Go trims trailing zeros of the fraction).
+    as_of="$(jq -r 'def key: sub("Z$"; "") | split(".") | .[0] + "." + (((.[1] // "") + "000000")[0:6]);
+        [.tasks[]? | select(.state != "completed") | .planned_at // empty] | max_by(key) // empty' <<<"$out")"
+    [[ -n "$as_of" ]] || die "[$LEG] approve: no planned_at on the open tickets"
+    out="$(curl -sS -m 10 -w '\n%{http_code}' -X POST -H 'Content-Type: application/json' \
+      -d "$(jq -nc --arg a "$as_of" '{as_of: $a}')" "$LEG_REST/api/projects/$P_ID/approve-plan")" ||
+      die "[$LEG] approve: POST approve-plan failed"
+    [[ "$(tail -n 1 <<<"$out")" == 200 ]] || {
+      printf '%s\n' "$out" >&2
+      die "[$LEG] approve: POST approve-plan did not answer 200"
+    }
+    out="$(sed '$d' <<<"$out")"
+    expect "$out" '.project.plan_approved_at != null and ((.awaiting_approval // []) == [])' \
+      "approve-plan left tickets awaiting approval"
+    log "[$LEG] plan approved as the person (REST approve-plan, as_of $as_of)"
+    return 0
+  fi
+  if h mcp call amp_approve_plan "{\"project_id\":$P_ID}" >/dev/null 2>"$WORK/err"; then
+    log "[$LEG] plan approved over MCP (a server from before human-only approval)"
+    return 0
+  fi
+  local url waited=0
+  url="$(grep -Eo '(https?://[^ "]+)?/project/[0-9]+/plan' "$WORK/err" | head -n 1 || true)"
+  [[ "$url" == /* ]] && url="$LEG_WEB_BASE$url"
+  ((APPROVE_WAIT > 0)) ||
+    die "[$LEG] plan approval needs a person: approve ${url:-the plan of project $P_ID} in the web UI, or set AMP_SMOKE_APPROVE_WAIT=SECS and approve while the smoke waits"
+  log "[$LEG] waiting up to ${APPROVE_WAIT}s for a person to approve ${url:-project $P_ID} in the web UI"
+  until out="$(call amp_check_plan "{\"project_id\":$P_ID}")" && jq -e '(.awaiting_approval // []) == []' >/dev/null <<<"$out"; do
+    ((waited < APPROVE_WAIT)) || die "[$LEG] the plan was not approved within ${APPROVE_WAIT}s"
+    sleep 5
+    waited=$((waited + 5))
+  done
+  log "[$LEG] plan approved by a person"
+}
+
+# human_cases: a person's ticket can't be marked done over MCP (the refusal names the web UI); the
+# person marks it done through REST. Compose only (needs the REST listener as the UI).
+human_cases() {
+  local th out rc=0
+  out="$(call amp_create_tasks "$(jq -nc --argjson p "$P_ID" --argjson s "$STORY_ID" '{project_id:$p, tasks:[
+      {ref:"person", story_id:$s, name:"smoke person ticket", description:"Throwaway; a person signs it off.", acceptance_criteria:"None.", performer:"human"}]}')")"
+  th="$(jq -r '.created[]? | select(.ref == "person") | .id' <<<"$out")"
+  [[ "$th" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_tasks: no id for the person's ticket"
+  TASK_IDS+=("$th")
+  h mcp call amp_complete_task "{\"task_id\":$th}" >/dev/null 2>"$WORK/err" || rc=$?
+  ((rc == 1)) || die "[$LEG] person's ticket: amp_complete_task over MCP was not refused (exit $rc)"
+  grep -q "web UI" "$WORK/err" || {
+    cat "$WORK/err" >&2
+    die "[$LEG] person's ticket: the MCP refusal does not point to the web UI"
+  }
+  out="$(curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d '{"note":"signed off by the smoke test"}' \
+    "$LEG_REST/api/tasks/$th/complete")" || die "[$LEG] person's ticket: REST complete failed"
+  out="$(runs_of "$th")"
+  expect "$out" '.task.state == "completed"' "person's ticket: not completed after the REST call"
+  log "[$LEG] person's ticket ok: #$th refused over MCP, marked done through REST"
+}
+
 # --- dispatch, abandoned run, policy deny (M2-8) -----------------------------------------------
 # runs_of TASK: the ticket with its comments and runs.
 runs_of() { call amp_get_task "{\"task_id\":$1,\"include\":[\"comments\",\"runs\"]}"; }
 
-# dispatch_cases TICKET: needs .amp.json for the leg's project. TICKET must be ready.
+# dispatch_cases TICKET THIRD: needs .amp.json for the leg's project and an approved plan. TICKET
+# must be ready; THIRD depends on it.
 dispatch_cases() {
-  local t2="$1" t3 out report
+  local t2="$1" t3="$2" out report
 
   # 1. The manager (faux `boss`) first tries a bash command its policy denies, then dispatches
   #    worker-backend on TICKET with amp_run_ticket. The worker (faux `wf`, its own model, in its
@@ -240,11 +354,7 @@ dispatch_cases() {
 
   # 2. Abandoned run: the worker's script runs out after one step, so it ends as `error` without
   #    closing its ticket, and the harness reports an abandoned run with a note.
-  out="$(call amp_create_tasks "$(jq -nc --argjson p "$P_ID" --argjson s "$STORY_ID" '{project_id:$p, tasks:[
-      {ref:"third", story_id:$s, name:"smoke ticket three", description:"Throwaway; its worker gives up.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend"}]}')")"
-  t3="$(jq -r '.created[]? | select(.ref == "third") | .id' <<<"$out")"
-  [[ "$t3" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_tasks: no id for ticket three"
-  TASK_IDS+=("$t3")
+  #    Ticket three was created and approved with the plan; ticket two's completion made it ready.
   jq -nc --argjson t "$t3" '{
     boss: [
       {tool_calls: [{name: "amp_run_ticket", arguments: {task_id: $t, agent_id: "amp:amp-worker-backend"}}]},
@@ -372,8 +482,9 @@ chrome_cases() {
 
 # --- one leg --------------------------------------------------------------------------------------
 # run_leg NAME URL PROTOCOL TOKEN CA EXPECT_EMAIL ('' = any) WEB_URL ('' = the MCP URL's origin)
+#         REST_URL ('' = none: the plan is approved over MCP or by a person, no person's-ticket case)
 run_leg() {
-  LEG="$1/$3" LEG_URL="$2" LEG_PROTO="$3" LEG_TOKEN="$4" LEG_CA="$5" LEG_WEB="$7"
+  LEG="$1/$3" LEG_URL="$2" LEG_PROTO="$3" LEG_TOKEN="$4" LEG_CA="$5" LEG_WEB="$7" LEG_REST="$8"
   LEG_WEB_BASE="${LEG_WEB:-$(sed -E 's#^([a-z]+://[^/?#]+).*#\1#' <<<"$LEG_URL")}"
   local want_email="$6" out rc
   log "== leg $LEG: $LEG_URL"
@@ -423,26 +534,43 @@ run_leg() {
   [[ "$STORY_ID" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_story returned no id"
   out="$(call amp_create_tasks "$(jq -nc --argjson p "$P_ID" --argjson s "$STORY_ID" '{project_id:$p, tasks:[
       {ref:"first",  story_id:$s, name:"smoke ticket one", description:"Throwaway.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend"},
-      {ref:"second", story_id:$s, name:"smoke ticket two", description:"Throwaway.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend", depends_on:["first"]}]}')")"
-  local t1 t2
+      {ref:"second", story_id:$s, name:"smoke ticket two", description:"Throwaway.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend", depends_on:["first"]},
+      {ref:"third",  story_id:$s, name:"smoke ticket three", description:"Throwaway; its worker gives up.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend", depends_on:["second"]}]}')")"
+  local t1 t2 t3
   # Record every created id first, so cleanup deletes them even if a check below fails.
   read -r -a TASK_IDS <<<"$(jq -r '[.created[]?.id] | map(tostring) | join(" ")' <<<"$out")"
   t1="$(jq -r '.created[]? | select(.ref == "first") | .id' <<<"$out")"
   t2="$(jq -r '.created[]? | select(.ref == "second") | .id' <<<"$out")"
-  [[ "$t1" =~ ^[0-9]+$ && "$t2" =~ ^[0-9]+$ ]] || {
+  t3="$(jq -r '.created[]? | select(.ref == "third") | .id' <<<"$out")"
+  [[ "$t1" =~ ^[0-9]+$ && "$t2" =~ ^[0-9]+$ && "$t3" =~ ^[0-9]+$ ]] || {
     printf '%s\n' "$out" >&2
     die "[$LEG] amp_create_tasks: could not read the ticket ids"
   }
   call amp_add_task_comment "{\"task_id\":$t1,\"body\":\"smoke comment $stamp\",\"author\":\"smoke\"}" >/dev/null
-  log "[$LEG] created project $P_ID ($code), epic $EPIC_ID, story $STORY_ID, tickets $t1 $t2"
+  log "[$LEG] created project $P_ID ($code), epic $EPIC_ID, story $STORY_ID, tickets $t1 $t2 $t3"
 
-  # tickets list: both open tickets, the second waiting on the first.
+  # Human-only approval (#2167): agents can't start work on an unapproved plan.
+  rc=0
+  h mcp call amp_dispatch_task "{\"task_id\":$t1,\"agent_id\":\"amp:amp-worker-backend\"}" >/dev/null 2>"$WORK/err" || rc=$?
+  if ((rc == 0)); then
+    log "[$LEG] note: the server dispatched before the plan was approved (approval not required here)"
+    call amp_set_task_state "{\"task_id\":$t1,\"to_state\":\"backlog\"}" >/dev/null
+  else
+    grep -q "/project/$P_ID/plan" "$WORK/err" || {
+      cat "$WORK/err" >&2
+      die "[$LEG] dispatch before approval: the refusal has no link to the plan"
+    }
+  fi
+  approve_plan
+
+  # tickets list: the open tickets, each waiting on the one before.
   out="$(h tickets list --project "$P_ID" --owner any --json)" || die "[$LEG] tickets list failed"
-  jq -e --argjson p "$P_ID" --argjson a "$t1" --argjson b "$t2" '
-      .project_id == $p and .count == 2 and
-      ([.tickets[].id] | sort) == ([$a, $b] | sort) and
+  jq -e --argjson p "$P_ID" --argjson a "$t1" --argjson b "$t2" --argjson c "$t3" '
+      .project_id == $p and .count == 3 and
+      ([.tickets[].id] | sort) == ([$a, $b, $c] | sort) and
       (.tickets[] | select(.id == $a) | .status == "ready" and .name == "smoke ticket one") and
-      (.tickets[] | select(.id == $b) | .status == "waiting" and .blocked_by_ids == [$a])' >/dev/null <<<"$out" || {
+      (.tickets[] | select(.id == $b) | .status == "waiting" and .blocked_by_ids == [$a]) and
+      (.tickets[] | select(.id == $c) | .status == "waiting" and .blocked_by_ids == [$b])' >/dev/null <<<"$out" || {
     printf '%s\n' "$out" >&2
     die "[$LEG] tickets list: unexpected rows"
   }
@@ -456,18 +584,32 @@ run_leg() {
     die "[$LEG] tickets get: unexpected ticket"
   }
 
-  # Finish ticket one: the default list hides done tickets, --state all shows them, and the
-  # project comes from .amp.json when --project is left out.
-  call amp_complete_task "{\"task_id\":$t1}" >/dev/null
+  # Finish ticket one as an agent does: dispatch, then complete (an undispatched ticket is refused).
+  # The default list hides done tickets, --state all shows them, and the project comes from
+  # .amp.json when --project is left out.
+  rc=0
+  h mcp call amp_complete_task "{\"task_id\":$t1}" >/dev/null 2>"$WORK/err" || rc=$?
+  if ((rc == 0)); then
+    log "[$LEG] note: the server completed an undispatched ticket (a server from before #2167)"
+  else
+    grep -q "never dispatched" "$WORK/err" || {
+      cat "$WORK/err" >&2
+      die "[$LEG] complete before dispatch: expected a 'never dispatched' refusal"
+    }
+    call amp_dispatch_task "{\"task_id\":$t1,\"agent_id\":\"amp:amp-worker-backend\"}" >/dev/null
+    call amp_complete_task "{\"task_id\":$t1}" >/dev/null
+  fi
   printf '{"project_id": %s, "project_name": "harness smoke"}\n' "$P_ID" >.amp.json
   out="$(h tickets list --owner any --json)" || die "[$LEG] tickets list (from .amp.json) failed"
-  jq -e --argjson p "$P_ID" --argjson b "$t2" '
-      .project_id == $p and .count == 1 and .tickets[0].id == $b and .tickets[0].status == "ready"' >/dev/null <<<"$out" || {
+  jq -e --argjson p "$P_ID" --argjson b "$t2" --argjson c "$t3" '
+      .project_id == $p and .count == 2 and
+      (.tickets[] | select(.id == $b) | .status == "ready") and
+      (.tickets[] | select(.id == $c) | .status == "waiting")' >/dev/null <<<"$out" || {
     printf '%s\n' "$out" >&2
-    die "[$LEG] tickets list after completing ticket one: expected only ticket two, now ready"
+    die "[$LEG] tickets list after completing ticket one: expected ticket two ready and three waiting"
   }
   out="$(h tickets list --owner any --state all --json)" || die "[$LEG] tickets list --state all failed"
-  jq -e --argjson a "$t1" '.count == 2 and (.tickets[] | select(.id == $a) | .status == "done")' >/dev/null <<<"$out" || {
+  jq -e --argjson a "$t1" '.count == 3 and (.tickets[] | select(.id == $a) | .status == "done")' >/dev/null <<<"$out" || {
     printf '%s\n' "$out" >&2
     die "[$LEG] tickets list --state all: expected ticket one as done"
   }
@@ -491,7 +633,8 @@ run_leg() {
   }
   log "[$LEG] run -p ok: the manager called amp_get_task on the faux model"
 
-  dispatch_cases "$t2"
+  dispatch_cases "$t2" "$t3"
+  if [[ -n "$LEG_REST" ]]; then human_cases; fi
   chrome_cases "$stamp"
 
   # A tool error exits 1 with the message on stderr.
@@ -503,6 +646,183 @@ run_leg() {
   rm -f .amp.json
   cleanup_leg || die "[$LEG] cleanup failed"
   RESULTS+=("PASS $LEG ($proto_seen)")
+  LEG_REST=""
+}
+
+# --- first run and init (M4-5, smoke v4) -----------------------------------------------------------
+# fresh NAME: a new, empty HOME for a first-time user, under target/ (never the real one).
+fresh_env() {
+  local root="$WORK/$1"
+  mkdir -p "$root/home"
+  FRESH=(env -u AMP_MCP_URL -u AMP_MCP_PROTOCOL -u AMP_WEB_URL -u AMP_HARNESS_PROMPTS
+    HOME="$root/home" XDG_CONFIG_HOME="$root/home/.config" XDG_STATE_HOME="$root/home/.local/state"
+    AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$WORK" OPENROUTER_API_KEY="$DUMMY_KEY")
+}
+
+# no_secret DIR FILES...: the dummy provider key is in none of these files nor anywhere under DIR.
+no_secret() {
+  local dir="$1"
+  shift
+  if grep -rqF "$DUMMY_KEY" "$dir" "$@" 2>/dev/null; then
+    die "[$LEG] the provider key was written to disk or printed ($(grep -rlF "$DUMMY_KEY" "$dir" "$@" | head -n 3 | tr '\n' ' '))"
+  fi
+}
+
+firstrun_leg() {
+  LEG="firstrun"
+  log "== leg firstrun: a new HOME, no config, against $COMPOSE_URL"
+  local root="$WORK/fr1" repo out err cfg pid name stamp server code
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  # Project codes are unique across AMP, archived projects included.
+  code="SF$(LC_ALL=C tr -dc '[:upper:]' </dev/urandom | head -c 4 || true)"
+  name="harness-smoke first run $stamp"
+  fresh_env fr1
+  repo="$root/repo"
+  mkdir -p "$repo/sub"
+  git -C "$repo" init -q -b main . || die "[$LEG] could not make the first-run git repo"
+  # Answer the server the way a person types it: host:port for a local http://host:port/mcp.
+  server="$COMPOSE_URL"
+  if [[ "$COMPOSE_URL" =~ ^http://(localhost|127\.0\.0\.1)(:[0-9]+)?/mcp$ ]]; then
+    server="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  fi
+
+  # 1. The chat's first run, from a subfolder: server, then n (new project), name, code.
+  out="$(cd "$repo/sub" && printf '%s\nn\n%s\n%s\n' "$server" "$name" "$code" |
+    "${FRESH[@]}" AMP_HARNESS_PROMPTS=stdin "$BIN" --snapshot 120x30 --no-session 2>"$root/err")" || {
+    cat "$root/err" >&2
+    die "[$LEG] the chat's first run failed"
+  }
+  err="$(cat "$root/err")"
+  pid="$(jq -r '.project_id // empty' "$repo/.amp.json" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || {
+    printf '%s\n' "$err" >&2
+    die "[$LEG] no .amp.json with a project_id at the git root ($repo)"
+  }
+  EXTRA_PROJECTS+=("$pid")
+  [[ ! -e "$repo/sub/.amp.json" ]] || die "[$LEG] .amp.json was written in the subfolder, not at the git root"
+  for want in "AMP server [" "Saved the server $COMPOSE_URL" "as $COMPOSE_EMAIL" "Created #$pid $name ($code)"; do
+    grep -qF "$want" <<<"$err" || {
+      printf '%s\n' "$err" >&2
+      die "[$LEG] first run: expected '$want'"
+    }
+  done
+  { grep -qF "project #$pid $name" <<<"$out" && grep -qF "Set up this new project" <<<"$out"; } || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] first run: the chat does not show project #$pid with the set-up prompt in the editor"
+  }
+  cfg="$root/home/.config/amp-harness/config.toml"
+  grep -qF "url = \"$COMPOSE_URL\"" "$cfg" || die "[$LEG] config.toml has no url = \"$COMPOSE_URL\""
+  if grep -qF "web_url = \"$COMPOSE_WEB_URL\"" "$cfg"; then
+    log "[$LEG] first run saved web_url $COMPOSE_WEB_URL (probed)"
+  else
+    log "[$LEG] WARN: first run saved no web_url $COMPOSE_WEB_URL (is the UI up?)"
+  fi
+  jq -e --argjson p "$pid" '.project_id == $p and (.amp_api | type == "string")' "$repo/.amp.json" >/dev/null ||
+    die "[$LEG] .amp.json is not as expected: $(cat "$repo/.amp.json")"
+  no_secret "$root/home" "$repo/.amp.json" <(printf '%s\n%s\n' "$out" "$err")
+  log "[$LEG] chat first run ok: saved the server, created #$pid ($name), .amp.json at the git root, editor prefilled"
+
+  # 2. Second start: everything is set up, nothing is asked, no set-up prompt.
+  out="$(cd "$repo" && "${FRESH[@]}" AMP_HARNESS_PROMPTS=stdin "$BIN" --snapshot 120x30 --no-session </dev/null 2>"$root/err")" || {
+    cat "$root/err" >&2
+    die "[$LEG] second start failed"
+  }
+  [[ ! -s "$root/err" ]] || {
+    cat "$root/err" >&2
+    die "[$LEG] second start asked or said something on stderr"
+  }
+  { grep -qF "project #$pid" <<<"$out" && ! grep -qF "Set up this new project" <<<"$out"; } ||
+    die "[$LEG] second start: expected project #$pid and no set-up prompt"
+  log "[$LEG] second start ok: nothing asked"
+
+  # 3. The non-interactive path: init --yes with flags in another new HOME and folder, then doctor
+  #    there with no environment (config.toml and .amp.json only).
+  fresh_env fr2
+  root="$WORK/fr2"
+  mkdir -p "$root/repo"
+  out="$(cd "$root/repo" && "${FRESH[@]}" "$BIN" init --yes --url "$COMPOSE_URL" --project "$pid" --json </dev/null 2>"$root/err")" || {
+    cat "$root/err" >&2
+    die "[$LEG] init --yes failed"
+  }
+  jq -e --arg u "$COMPOSE_URL" --arg e "$COMPOSE_EMAIL" --argjson p "$pid" '
+      .server == $u and .user == $e and .auth == "none" and .project.id == $p and .project.created == false
+      and (.providers.openrouter | test("env"; "i"))' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] init --yes --json: unexpected summary"
+  }
+  jq -e --argjson p "$pid" '.project_id == $p' "$root/repo/.amp.json" >/dev/null || die "[$LEG] init wrote no .amp.json for #$pid"
+  out="$(cd "$root/repo" && "${FRESH[@]}" "$BIN" doctor --json </dev/null)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] doctor after init failed"
+  }
+  jq -e --argjson p "$pid" '.ok and .connection.connected and .tools.missing_contract == []
+      and .project.found and .project.id == $p' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] doctor after init: expected ok, connected, project #$pid"
+  }
+  no_secret "$root/home" "$root/repo/.amp.json"
+  log "[$LEG] init --yes ok: linked another folder to #$pid; doctor ok from config.toml and .amp.json"
+  RESULTS+=("PASS firstrun (chat first run, second start, init --yes, doctor)")
+}
+
+# --- install from the local archive (M4-5, smoke v4) ------------------------------------------------
+install_leg() {
+  LEG="install"
+  local root="$WORK/install" archive out prefix ver
+  mkdir -p "$root/home" "$root/dist"
+  prefix="$root/bin"
+  if [[ -n "$INSTALL_ARCHIVE" ]]; then
+    archive="$INSTALL_ARCHIVE"
+    [[ -r "$archive" && -r "$archive.sha256" ]] || die "[$LEG] AMP_SMOKE_ARCHIVE $archive (or its .sha256) is not readable"
+  else
+    # The target triple from uname, so packing never runs rustc (rustup could fetch a toolchain).
+    local target
+    case "$(uname -s)/$(uname -m)" in
+      Darwin/arm64) target=aarch64-apple-darwin ;;
+      Darwin/x86_64) target=x86_64-apple-darwin ;;
+      Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+      Linux/aarch64 | Linux/arm64) target=aarch64-unknown-linux-gnu ;;
+      *) die "[$LEG] no release target for $(uname -s)/$(uname -m)" ;;
+    esac
+    archive="$("$HARNESS_DIR/scripts/package.sh" --bin "$BIN" --target "$target" --out "$root/dist" | tail -n 1)" ||
+      die "[$LEG] package.sh failed"
+  fi
+  log "== leg install: $(basename "$archive") into $prefix"
+  # i ARGS...: install.sh with HOME, TMPDIR and the login shell under target/.
+  i() {
+    env HOME="$root/home" TMPDIR="$root" SHELL=/bin/sh "$HARNESS_DIR/install.sh" --archive "$archive" --prefix "$prefix" </dev/null
+  }
+  out="$(i 2>&1)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] install.sh --archive failed"
+  }
+  [[ -x "$prefix/amp-harness" ]] || die "[$LEG] no executable $prefix/amp-harness"
+  grep -qF "$prefix" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] install.sh did not tell how to put $prefix on PATH"
+  }
+  out="$(i 2>&1)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] reinstalling over the installed binary failed"
+  }
+  ver="$("$prefix/amp-harness" --version)" || die "[$LEG] the installed binary's --version failed"
+  if [[ -z "$INSTALL_ARCHIVE" && "$ver" != "$("$BIN" --version)" ]]; then
+    die "[$LEG] the installed --version differs from the binary under test"
+  fi
+  # The installed binary's doctor against compose, as a new user with only an env key.
+  out="$(cd "$root" && env -u AMP_HARNESS_PROMPTS HOME="$root/home" XDG_CONFIG_HOME="$root/home/.config" \
+    XDG_STATE_HOME="$root/home/.local/state" AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$root" \
+    AMP_MCP_URL="$COMPOSE_URL" OPENROUTER_API_KEY="$DUMMY_KEY" "$prefix/amp-harness" doctor --json </dev/null)" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] the installed binary's doctor failed"
+  }
+  jq -e '.ok and .connection.connected and .tools.missing_contract == [] and .connection.instructions == true' \
+    >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] the installed binary's doctor is not ok"
+  }
+  log "[$LEG] install ok: $(head -n 1 <<<"$ver") installed twice into the prefix; doctor ok against $COMPOSE_URL"
+  RESULTS+=("PASS install ($(basename "$archive"))")
 }
 
 # --- keychain only (#2165) -------------------------------------------------------------------------
@@ -583,14 +903,16 @@ for leg in $LEGS; do
   case "$leg" in
     keychain) keychain_leg ;;
     compose)
-      for proto in $PROTOCOLS; do run_leg compose "$COMPOSE_URL" "$proto" "" "" "$COMPOSE_EMAIL" "$COMPOSE_WEB_URL"; done ;;
+      for proto in $PROTOCOLS; do run_leg compose "$COMPOSE_URL" "$proto" "" "" "$COMPOSE_EMAIL" "$COMPOSE_WEB_URL" "$REST_URL"; done ;;
+    firstrun) firstrun_leg ;;
+    install) install_leg ;;
     cluster)
       if [[ -z "$CLUSTER_TOKEN" || -z "$CLUSTER_CA" ]]; then
         RESULTS+=("SKIP cluster (set AMP_TOKEN and AMP_CA_FILE to run it against $CLUSTER_URL)")
         continue
       fi
       [[ -r "$CLUSTER_CA" ]] || die "AMP_CA_FILE $CLUSTER_CA is not readable"
-      for proto in $PROTOCOLS; do run_leg cluster "$CLUSTER_URL" "$proto" "$CLUSTER_TOKEN" "$CLUSTER_CA" "" ""; done ;;
+      for proto in $PROTOCOLS; do run_leg cluster "$CLUSTER_URL" "$proto" "$CLUSTER_TOKEN" "$CLUSTER_CA" "" "" ""; done ;;
     *) die "unknown leg '$leg' in AMP_SMOKE_LEGS" ;;
   esac
 done

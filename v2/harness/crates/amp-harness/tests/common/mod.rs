@@ -294,6 +294,10 @@ impl ServerHandler for MockAmp {
             ]})),
             "amp_list_orgs" => ok_json(json!({"orgs": [{"id": 1, "name": "Default"}]})),
             "amp_create_project" => match (args["name"].as_str(), args["code"].as_str()) {
+                // Codes are unique, archived projects included (OLD is archived).
+                (Some(_), Some(code @ ("AV" | "OLD"))) => {
+                    tool_error(&format!("project code \"{code}\" already exists"))
+                }
                 (Some(name), Some(code)) if !name.is_empty() && !code.is_empty() => ok_json(
                     json!({"id": 77, "name": name, "code": code, "state": "active", "org_id": 1}),
                 ),
