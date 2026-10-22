@@ -222,23 +222,41 @@ pub async fn spawn(server: TestServer) -> Running {
 }
 
 /// A server that answers every request with 401 while `unauthorized` is set: a login whose tokens
-/// can no longer be used. `requests` counts every HTTP request it gets.
+/// can no longer be used. `requests` counts every HTTP request it gets, `rejected` every 401.
+///
+/// `release` gates the 401s (#2194): the k-th 401 (1-based) is held until `release` is at least
+/// k, so a test can make calls fail together, or answer some of them only after a reconnect. It
+/// starts at `usize::MAX` (no gate), and a held 401 is answered anyway after 10 s so nothing hangs.
 pub struct Switchable {
     pub running: Running,
     pub unauthorized: Arc<std::sync::atomic::AtomicBool>,
     pub requests: Arc<AtomicUsize>,
+    pub rejected: Arc<AtomicUsize>,
+    pub release: Arc<tokio::sync::watch::Sender<usize>>,
 }
 
 pub async fn spawn_switchable(server: TestServer) -> Switchable {
     let unauthorized = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let requests = Arc::new(AtomicUsize::new(0));
+    let rejected = Arc::new(AtomicUsize::new(0));
+    let release = Arc::new(tokio::sync::watch::Sender::new(usize::MAX));
     let counters = server.counters.clone();
-    let (flag, seen) = (unauthorized.clone(), requests.clone());
+    let (flag, seen, refused, gate) = (
+        unauthorized.clone(),
+        requests.clone(),
+        rejected.clone(),
+        release.clone(),
+    );
     let app = router(server, None).layer(middleware::from_fn(move |req: Request, next: Next| {
-        let (flag, seen) = (flag.clone(), seen.clone());
+        let (flag, seen, refused, gate) =
+            (flag.clone(), seen.clone(), refused.clone(), gate.clone());
         async move {
             seen.fetch_add(1, Ordering::SeqCst);
             if flag.load(Ordering::SeqCst) {
+                let k = refused.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut open = gate.subscribe();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(10), open.wait_for(|n| *n >= k)).await;
                 let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
                 response.headers_mut().insert(
                     header::WWW_AUTHENTICATE,
@@ -262,6 +280,8 @@ pub async fn spawn_switchable(server: TestServer) -> Switchable {
         },
         unauthorized,
         requests,
+        rejected,
+        release,
     }
 }
 
