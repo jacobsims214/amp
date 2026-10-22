@@ -135,6 +135,7 @@ dependencies = [
  "amp-core",
  "amp-mcp",
  "crossterm",
+ "nix",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",

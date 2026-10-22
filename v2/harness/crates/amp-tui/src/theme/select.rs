@@ -227,27 +227,21 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Asks the terminal (`/dev/tty`) for its background colour, waiting at most `timeout`. Call it
-/// before the TUI takes the terminal. `None` when there is no terminal, it doesn't answer, or
-/// the answer has no OSC 11 colour.
+/// Asks the terminal (`/dev/tty`) for its background colour. Call it before the TUI takes the
+/// terminal. `None` when there is no terminal, it doesn't answer, or the answer has no OSC 11
+/// colour.
 ///
-/// The reader thread stops at the DA1 answer. A terminal that answers nothing at all leaves it
-/// blocked on `/dev/tty` until the next input byte, which it then swallows; such terminals are
-/// rare, and `--theme dark|light` skips the query.
+/// `timeout` bounds the wait for the answer to start; once part of it has arrived, the rest
+/// (up to the DA1 answer, which every terminal sends) gets [`REPLY_DRAIN`] more. The answer is
+/// read on the calling thread with `select(2)`, one byte at a time, so when this returns nothing
+/// is left reading the terminal and no byte after the DA1 answer (type-ahead) has been taken.
 #[cfg(unix)]
 pub fn query_background(timeout: Duration) -> Option<(u8, u8, u8)> {
-    use std::{
-        io::{Read, Write},
-        sync::mpsc,
-        time::Instant,
-    };
-
-    let mut tty = std::fs::OpenOptions::new()
+    let tty = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
         .ok()?;
-    let mut reader = tty.try_clone().ok()?;
 
     struct Raw(bool);
     impl Drop for Raw {
@@ -263,34 +257,68 @@ pub fn query_background(timeout: Duration) -> Option<(u8, u8, u8)> {
     }
     let _raw = Raw(!was_raw);
 
-    tty.write_all(BACKGROUND_QUERY.as_bytes()).ok()?;
-    tty.flush().ok()?;
+    let reply = exchange(&tty, timeout, REPLY_DRAIN)?;
+    parse_background_reply(&reply)
+}
 
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let mut seen = Vec::new();
-        let mut buf = [0u8; 256];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            seen.extend_from_slice(&buf[..n]);
-            if tx.send(buf[..n].to_vec()).is_err() || reply_complete(&seen) {
-                break;
-            }
-        }
-    });
+/// How long [`query_background`] keeps reading once part of the answer has arrived, so a slow
+/// link's late bytes are taken here rather than reaching the TUI as key presses.
+pub const REPLY_DRAIN: Duration = Duration::from_millis(500);
 
-    let deadline = Instant::now() + timeout;
+/// Writes [`BACKGROUND_QUERY`] to `tty` (already in raw mode) and reads the answer up to the end
+/// of the DA1 reply. Gives up after `first` if nothing arrives, or after `first + drain` if the
+/// answer is incomplete. Reads byte by byte so nothing past the DA1 reply is consumed.
+#[cfg(unix)]
+pub(crate) fn exchange(tty: &std::fs::File, first: Duration, drain: Duration) -> Option<Vec<u8>> {
+    use std::{
+        io::{ErrorKind, Read, Write},
+        os::fd::AsFd,
+        time::Instant,
+    };
+
+    use nix::{
+        errno::Errno,
+        sys::{
+            select::{FdSet, select},
+            time::{TimeVal, TimeValLike},
+        },
+    };
+
+    let mut w = tty;
+    w.write_all(BACKGROUND_QUERY.as_bytes()).ok()?;
+    w.flush().ok()?;
+
+    let start = Instant::now();
     let mut reply = Vec::new();
+    let mut r = tty;
     while !reply_complete(&reply) {
-        let left = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(left) {
-            Ok(chunk) => reply.extend_from_slice(&chunk),
+        let bound = if reply.is_empty() {
+            first
+        } else {
+            first + drain
+        };
+        let left = bound.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            break;
+        }
+        // select(2), not poll(2): macOS poll reports POLLNVAL for /dev/tty.
+        let mut fds = FdSet::new();
+        fds.insert(tty.as_fd());
+        let mut tv = TimeVal::microseconds(i64::try_from(left.as_micros()).unwrap_or(i64::MAX));
+        match select(None, &mut fds, None, None, &mut tv) {
+            Ok(0) => continue, // the loop re-checks the bound
+            Ok(_) => {}
+            Err(Errno::EINTR) => continue,
             Err(_) => break,
         }
+        let mut byte = [0u8; 1];
+        match r.read(&mut byte) {
+            Ok(1) => reply.push(byte[0]),
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            _ => break, // end of file or an error
+        }
     }
-    parse_background_reply(&reply)
+    Some(reply)
 }
 
 /// No terminal query off unix.
@@ -439,5 +467,192 @@ mod tests {
         // Partial answers.
         assert!(!reply_complete(b"\x1b]11;rgb:ff/ff/ff\x07\x1b[?6"));
         assert_eq!(parse_background_reply(b"\x1b]11;rgb:ff/ff"), None);
+    }
+}
+
+/// [`exchange`] against a fake terminal on a pty (#2155). Every wait is bounded: `exchange` by
+/// its own bounds, the fake terminal by its script, and the follow-up reads by `select`.
+#[cfg(all(test, unix))]
+mod pty_tests {
+    use std::{
+        fs::File,
+        io::{Read, Write},
+        os::fd::AsFd,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    use nix::{
+        pty::openpty,
+        sys::{
+            select::{FdSet, select},
+            termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr},
+            time::{TimeVal, TimeValLike},
+        },
+    };
+
+    use super::*;
+
+    const OSC11_REPLY: &[u8] = b"\x1b]11;rgb:ffff/ffff/ffff\x1b\\";
+    const DA1_REPLY: &[u8] = b"\x1b[?62;22c";
+
+    /// A raw-mode pty pair: (master = the fake terminal, slave = the tty `exchange` talks to).
+    fn pty() -> (File, File) {
+        let pair = openpty(None, None).expect("openpty");
+        let mut t = tcgetattr(&pair.slave).unwrap();
+        cfmakeraw(&mut t);
+        tcsetattr(&pair.slave, SetArg::TCSANOW, &t).unwrap();
+        (File::from(pair.master), File::from(pair.slave))
+    }
+
+    /// Plays `script` (delay from start, bytes) on the terminal side, in a thread that ends by
+    /// itself once the script is done.
+    fn terminal(master: &File, script: Vec<(u64, &'static [u8])>) -> thread::JoinHandle<()> {
+        let mut master = master.try_clone().unwrap();
+        let start = Instant::now();
+        thread::spawn(move || {
+            for (at, bytes) in script {
+                let at = Duration::from_millis(at);
+                thread::sleep(at.saturating_sub(start.elapsed()));
+                master.write_all(bytes).unwrap();
+            }
+        })
+    }
+
+    /// Everything readable on `tty` within `wait` of the last byte.
+    fn pending(tty: &File, wait: Duration) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut r = tty;
+        loop {
+            let mut fds = FdSet::new();
+            fds.insert(tty.as_fd());
+            let mut tv = TimeVal::milliseconds(wait.as_millis() as i64);
+            if !matches!(select(None, &mut fds, None, None, &mut tv), Ok(n) if n > 0) {
+                return out;
+            }
+            let mut buf = [0u8; 256];
+            match r.read(&mut buf) {
+                Ok(n) if n > 0 => out.extend_from_slice(&buf[..n]),
+                _ => return out,
+            }
+        }
+    }
+
+    /// Writes a key press on the terminal side and returns what the next reader of the tty sees.
+    fn next_reader_sees(master: &File, slave: &File) -> Vec<u8> {
+        let mut m = master;
+        m.write_all(b"x").unwrap();
+        pending(slave, Duration::from_millis(300))
+    }
+
+    fn concat(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    const FIRST: Duration = Duration::from_millis(300);
+    const DRAIN: Duration = Duration::from_millis(700);
+
+    #[test]
+    fn osc11_and_da1_are_read_and_parsed() {
+        let (master, slave) = pty();
+        let reply = concat(&[OSC11_REPLY, DA1_REPLY]);
+        let reply: &'static [u8] = Box::leak(reply.into_boxed_slice());
+        let term = terminal(&master, vec![(20, reply)]);
+        let started = Instant::now();
+        let got = exchange(&slave, FIRST, DRAIN).unwrap();
+        assert!(
+            started.elapsed() < FIRST,
+            "returns at the DA1 reply, not the bound"
+        );
+        term.join().unwrap();
+        assert_eq!(got, reply);
+        assert_eq!(parse_background_reply(&got), Some((255, 255, 255)));
+        assert_eq!(next_reader_sees(&master, &slave), b"x");
+    }
+
+    #[test]
+    fn type_ahead_after_da1_is_left_for_the_tui() {
+        let (master, slave) = pty();
+        let term = terminal(
+            &master,
+            vec![(20, b"\x1b]11;rgb:0000/0000/0000\x07\x1b[?1;2ck")],
+        );
+        let got = exchange(&slave, FIRST, DRAIN).unwrap();
+        term.join().unwrap();
+        assert!(got.ends_with(b"c"));
+        assert_eq!(parse_background_reply(&got), Some((0, 0, 0)));
+        assert_eq!(next_reader_sees(&master, &slave), b"kx");
+    }
+
+    #[test]
+    fn da1_only_ends_the_exchange() {
+        let (master, slave) = pty();
+        let term = terminal(&master, vec![(20, DA1_REPLY)]);
+        let started = Instant::now();
+        let got = exchange(&slave, FIRST, DRAIN).unwrap();
+        assert!(started.elapsed() < FIRST);
+        term.join().unwrap();
+        assert_eq!(got, DA1_REPLY);
+        assert_eq!(parse_background_reply(&got), None);
+        assert_eq!(next_reader_sees(&master, &slave), b"x");
+    }
+
+    #[test]
+    fn no_answer_gives_up_at_the_first_bound_and_swallows_nothing() {
+        let (master, slave) = pty();
+        let started = Instant::now();
+        let got = exchange(&slave, FIRST, DRAIN).unwrap();
+        let took = started.elapsed();
+        assert!(got.is_empty());
+        assert!(took >= FIRST && took < FIRST + DRAIN, "took {took:?}");
+        // The query went out to the terminal.
+        assert_eq!(
+            pending(&master, Duration::from_millis(100)),
+            BACKGROUND_QUERY.as_bytes()
+        );
+        // Nothing is left reading the tty: the next key press reaches the next reader.
+        assert_eq!(next_reader_sees(&master, &slave), b"x");
+    }
+
+    #[test]
+    fn a_reply_finishing_past_the_first_bound_is_drained() {
+        let (master, slave) = pty();
+        // Starts inside the first bound, finishes (DA1) after it but inside the drain.
+        let term = terminal(
+            &master,
+            vec![
+                (100, &OSC11_REPLY[..8]),
+                (500, &OSC11_REPLY[8..]),
+                (550, DA1_REPLY),
+            ],
+        );
+        let started = Instant::now();
+        let got = exchange(&slave, FIRST, DRAIN).unwrap();
+        let took = started.elapsed();
+        term.join().unwrap();
+        assert!(
+            took >= Duration::from_millis(550) && took < FIRST + DRAIN,
+            "took {took:?}"
+        );
+        assert!(reply_complete(&got));
+        assert_eq!(parse_background_reply(&got), Some((255, 255, 255)));
+        // No reply byte reaches the TUI.
+        assert_eq!(next_reader_sees(&master, &slave), b"x");
+    }
+
+    #[test]
+    fn an_incomplete_reply_stops_at_the_drain_bound() {
+        let (master, slave) = pty();
+        let term = terminal(&master, vec![(50, &OSC11_REPLY[..8])]);
+        let started = Instant::now();
+        let got = exchange(&slave, FIRST, DRAIN).unwrap();
+        let took = started.elapsed();
+        term.join().unwrap();
+        assert_eq!(got, &OSC11_REPLY[..8]);
+        assert!(
+            took >= FIRST + DRAIN && took < FIRST + DRAIN + Duration::from_millis(500),
+            "took {took:?}"
+        );
+        assert_eq!(next_reader_sees(&master, &slave), b"x");
     }
 }
