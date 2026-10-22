@@ -389,7 +389,7 @@ async fn the_chat_switches_servers_without_a_restart() {
         "-amp_kb_write".to_owned(),
         "saved as the active server in".to_owned(),
         "project #2 (.amp.json) stays selected".to_owned(),
-        "✓ AMP · whoami".to_owned(),
+        "✓ whoami".to_owned(),
         "Done.".to_owned(),
     ] {
         assert!(screen.contains(&want), "missing {want:?} in\n{screen}");

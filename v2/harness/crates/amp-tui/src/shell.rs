@@ -406,6 +406,12 @@ impl Shell {
         self.view.toggle_thinking().is_some()
     }
 
+    /// Ctrl+O: shows or hides every tool call's arguments and result (#2183, pi's
+    /// `app.tools.expand`). Returns whether they are now shown.
+    pub fn toggle_tools(&mut self) -> bool {
+        self.view.toggle_tools()
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -1301,7 +1307,8 @@ impl Shell {
     }
 
     /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
-    /// `enter`, `esc`, `up`, `down`, or one character. `ctrl+t` toggles the last thinking.
+    /// `enter`, `esc`, `up`, `down`, or one character. `ctrl+t` toggles the last thinking,
+    /// `ctrl+o` the tool calls' details.
     pub fn press(&mut self, name: &str) -> Result<bool, String> {
         if let Some(text) = name.strip_prefix("paste:") {
             self.paste(text);
@@ -1309,6 +1316,10 @@ impl Shell {
         }
         if name.eq_ignore_ascii_case("ctrl+t") {
             return Ok(self.toggle_thinking());
+        }
+        if name.eq_ignore_ascii_case("ctrl+o") {
+            self.toggle_tools();
+            return Ok(true);
         }
         let code = match name {
             "enter" => KeyCode::Enter,

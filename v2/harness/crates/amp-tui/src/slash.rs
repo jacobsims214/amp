@@ -182,6 +182,7 @@ pub const KEYS: &[(&str, &str)] = &[
         "quit (with an empty editor, at the latest output)",
     ),
     ("Ctrl+T", "show or hide the last thinking"),
+    ("Ctrl+O", "show or hide tool call details"),
     ("PgUp/PgDn", "scroll the transcript a page"),
     ("Ctrl+U/D", "scroll half a page (with an empty editor)"),
     ("End", "jump to the latest output (with an empty editor)"),

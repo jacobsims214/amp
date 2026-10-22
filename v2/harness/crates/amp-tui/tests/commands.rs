@@ -566,7 +566,27 @@ async fn amp_tool_calls_are_titled_with_their_ticket() {
     rig.say("finish it").await;
     let screen = rig.screen();
     assert!(
-        screen.contains("✗ AMP · complete_task #2078 all done"),
+        screen.contains("✗ complete_task #2078 all done"),
+        "{screen}"
+    );
+    // #2183: one line per call, and the two calls in a row share one block (no blank between).
+    let rows: Vec<&str> = screen.lines().collect();
+    let at = rows
+        .iter()
+        .position(|r| r.contains("✗ complete_task #2078"))
+        .unwrap();
+    assert!(
+        rows[at + 1..]
+            .iter()
+            .take(6)
+            .any(|r| r.starts_with(" ✗ read README.md")),
+        "{screen}"
+    );
+    assert!(
+        rows[at + 1..]
+            .iter()
+            .take_while(|r| !r.contains("read README.md"))
+            .all(|r| !r.trim().is_empty()),
         "{screen}"
     );
     assert!(!screen.contains("amp_complete_task {"), "{screen}");
@@ -594,6 +614,17 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
     ));
     let screen = rig.screen();
     assert!(screen.contains("⏸ Waiting for your approval"), "{screen}");
+    // #2183: the notice stays right under the refused call's line and its error, prominent.
+    let rows: Vec<&str> = screen.lines().collect();
+    let call = rows
+        .iter()
+        .position(|r| r.starts_with(" ✗ dispatch_task"))
+        .expect(&screen);
+    let notice = rows
+        .iter()
+        .position(|r| r.contains("⏸ Waiting for your approval"))
+        .unwrap();
+    assert!(notice > call && notice - call <= 7, "{screen}");
     assert!(
         screen.contains(
             "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"

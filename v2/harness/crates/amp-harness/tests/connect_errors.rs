@@ -313,7 +313,7 @@ async fn the_offline_chat_connects_when_amp_comes_up() {
         format!("The server at {addr} did not answer as AMP (it answered HTTP 503, not MCP)."),
         "keeps retrying".to_owned(),
         format!("Connected to AMP at {addr}: the manager has its"),
-        "✓ AMP · whoami".to_owned(),
+        "✓ whoami".to_owned(),
         "Done.".to_owned(),
     ] {
         assert!(screen.contains(&want), "missing {want:?} in\n{screen}");

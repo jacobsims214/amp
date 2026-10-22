@@ -18,7 +18,8 @@
 //! config.toml `[tui] theme`, else `auto` (the terminal's background via OSC 11; dark in
 //! `--snapshot`). Colour depth: `AMP_HARNESS_COLOR`, `[tui] color`, else `COLORTERM`. Thinking
 //! (#2177): `AMP_HARNESS_SHOW_THINKING`, `[tui] show_thinking` (collapsed|full|hidden), else
-//! collapsed; Ctrl+T (`--input key:ctrl+t`) expands the last one. Mouse reporting (#2185):
+//! collapsed; Ctrl+T (`--input key:ctrl+t`) expands the last one. Ctrl+O (`--input key:ctrl+o`)
+//! shows every tool call's arguments and result (#2183). Mouse reporting (#2185):
 //! `AMP_HARNESS_MOUSE`, `[tui] mouse` (true|false), else on; off gives the terminal's plain
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
 //!
