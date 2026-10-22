@@ -42,7 +42,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use amp_mcp::AmpMcpClient;
+use amp_mcp::{AmpMcpClient, ServerSession};
 use rpi_agent::{AgentEmitter, BeforeToolCall};
 use rpi_harness::{
     agent_harness::AgentHarness,
@@ -516,17 +516,8 @@ impl Runtime {
         let session = self.mcp.session();
         let mut append = Vec::new();
 
-        if let Some(text) = session
-            .instructions
-            .as_deref()
-            .filter(|t| !t.trim().is_empty())
-        {
-            append.push(format!(
-                "<amp_server_instructions server=\"{} {}\">\n{}\n</amp_server_instructions>",
-                session.server_name.as_deref().unwrap_or("amp"),
-                session.server_version.as_deref().unwrap_or(""),
-                text.trim()
-            ));
+        if let Some(block) = server_instructions_block(&session) {
+            append.push(block);
         }
         append.push(amp_context(
             input.role,
@@ -562,6 +553,134 @@ impl Runtime {
     fn mcp_url(&self) -> String {
         self.mcp.session().url.clone()
     }
+
+    /// After [`Runtime::mcp`] was pointed at another AMP server (`/server`, #2164): gives
+    /// `harness` the new server's AMP tools in place of `old_tools` (the AMP tool names before
+    /// the switch), filtered by `policy` as [`Runtime::build`] does, and rewrites the server
+    /// details in its system prompt ([`retarget_system_prompt`]). Both apply from the next run;
+    /// the transcript stays. Built-in and extra tools (`amp_run_ticket`, `amp_session_usage`) are
+    /// kept as they are.
+    pub async fn retarget(
+        &self,
+        harness: &AgentHarness,
+        policy: &ToolPolicy,
+        old_tools: &BTreeSet<String>,
+    ) -> Result<Retargeted, AgentError> {
+        let new = filter_harness_tools(policy, mcp_tools::amp_tools(&self.mcp).await?);
+        let new_names: BTreeSet<String> =
+            new.iter().map(|t| t.tool.schema().name.clone()).collect();
+        let current = harness
+            .get_tools()
+            .await
+            .map_err(|e| AgentError::Harness(e.to_string()))?;
+        let mut tools: Vec<HarnessTool> = current
+            .into_iter()
+            .filter(|t| !old_tools.contains(&t.tool.schema().name))
+            .collect();
+        tools.extend(new);
+        let names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+        harness
+            .set_tools(tools, Some(names.clone()))
+            .await
+            .map_err(|e| AgentError::Harness(e.to_string()))?;
+        if let Some(prompt) = harness
+            .get_system_prompt()
+            .await
+            .map_err(|e| AgentError::Harness(e.to_string()))?
+        {
+            let prompt = retarget_system_prompt(&prompt, &self.mcp.session());
+            harness
+                .set_system_prompt(Some(prompt))
+                .await
+                .map_err(|e| AgentError::Harness(e.to_string()))?;
+        }
+        Ok(Retargeted {
+            added: new_names.difference(old_tools).cloned().collect(),
+            removed: old_tools.difference(&new_names).cloned().collect(),
+            amp_tools: new_names.len(),
+            tool_names: names,
+        })
+    }
+}
+
+/// What [`Runtime::retarget`] changed.
+#[derive(Debug, Clone, Default)]
+pub struct Retargeted {
+    /// AMP tools the new server has and the old one did not (after the policy).
+    pub added: Vec<String>,
+    /// AMP tools that are gone.
+    pub removed: Vec<String>,
+    /// How many AMP tools the session has now.
+    pub amp_tools: usize,
+    /// Every tool name the session has now.
+    pub tool_names: Vec<String>,
+}
+
+/// `<amp_server_instructions server="amp 1.2">…</amp_server_instructions>` for `session`, or
+/// `None` when the server gave no instructions.
+fn server_instructions_block(session: &ServerSession) -> Option<String> {
+    let text = session
+        .instructions
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())?;
+    Some(format!(
+        "<amp_server_instructions server=\"{} {}\">\n{}\n</amp_server_instructions>",
+        session.server_name.as_deref().unwrap_or("amp"),
+        session.server_version.as_deref().unwrap_or(""),
+        text.trim()
+    ))
+}
+
+const INSTRUCTIONS_OPEN: &str = "<amp_server_instructions";
+const INSTRUCTIONS_CLOSE: &str = "</amp_server_instructions>";
+const CONTEXT_OPEN: &str = "<amp_context>";
+
+/// A system prompt built by [`Runtime::system_prompt`] for one server, rewritten for `session`'s:
+/// its `<amp_server_instructions>` block is replaced (added before `<amp_context>`, or removed),
+/// and the `amp_server:` line in `<amp_context>` names the new URL. Everything else is kept.
+pub fn retarget_system_prompt(prompt: &str, session: &ServerSession) -> String {
+    let block = server_instructions_block(session);
+    let mut out = prompt.to_owned();
+    // The block as Runtime::system_prompt writes it: the first one, before <amp_context>.
+    let context_at = out.find(CONTEXT_OPEN);
+    let existing = out.find(INSTRUCTIONS_OPEN).and_then(|start| {
+        let end = out[start..].find(INSTRUCTIONS_CLOSE)? + start + INSTRUCTIONS_CLOSE.len();
+        context_at.is_none_or(|c| end <= c).then_some((start, end))
+    });
+    match (existing, block) {
+        (Some((start, end)), Some(block)) => out.replace_range(start..end, &block),
+        (Some((start, end)), None) => {
+            // Drop the blank line that separated it from what follows.
+            let end = if out[end..].starts_with("\n\n") {
+                end + 2
+            } else {
+                end
+            };
+            out.replace_range(start..end, "");
+        }
+        (None, Some(block)) => {
+            if let Some(at) = context_at {
+                out.insert_str(at, &format!("{block}\n\n"));
+            }
+        }
+        (None, None) => {}
+    }
+    if let Some(start) = out.find(CONTEXT_OPEN) {
+        let end = out[start..]
+            .find("</amp_context>")
+            .map_or(out.len(), |i| start + i);
+        if let Some(i) = out[start..end].find("\namp_server: ") {
+            let line_start = start + i + 1;
+            let line_end = out[line_start..]
+                .find('\n')
+                .map_or(out.len(), |j| line_start + j);
+            out.replace_range(
+                line_start..line_end,
+                &format!("amp_server: {}", session.url),
+            );
+        }
+    }
+    out
 }
 
 /// What [`Runtime::system_prompt`] needs.
@@ -743,6 +862,49 @@ pub async fn jsonl_session(dir: &Path, cwd: &Path) -> Result<(Session, PathBuf),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn session(url: &str, instructions: Option<&str>) -> ServerSession {
+        ServerSession {
+            url: url.to_owned(),
+            mode: amp_mcp::ProtocolMode::Auto,
+            protocol_version: amp_mcp::rmcp::model::ProtocolVersion::V_2025_11_25,
+            era: amp_mcp::Era::Legacy,
+            fell_back: false,
+            server_name: Some("amp".to_owned()),
+            server_version: Some("2".to_owned()),
+            instructions: instructions.map(str::to_owned),
+            auth: "none".to_owned(),
+        }
+    }
+
+    /// #2164: `/server` rewrites the server details and keeps everything else.
+    #[test]
+    fn retargeting_the_system_prompt_swaps_only_the_server_details() {
+        let old = session("http://old:1/mcp", Some("old rules"));
+        let block = server_instructions_block(&old).unwrap();
+        let prompt = format!(
+            "ROLE\n\n{block}\n\n<amp_context>\nrole: amp-manager\namp_server: http://old:1/mcp\nproject_id: 2\n</amp_context>\n\nTAIL"
+        );
+        let new = retarget_system_prompt(&prompt, &session("https://new/mcp", Some("new rules")));
+        assert!(
+            new.contains("new rules") && !new.contains("old rules"),
+            "{new}"
+        );
+        assert!(
+            new.contains("\namp_server: https://new/mcp\nproject_id: 2\n"),
+            "{new}"
+        );
+        assert!(new.starts_with("ROLE\n\n<amp_server_instructions") && new.ends_with("TAIL"));
+
+        // No instructions on the new server: the block goes, with its blank line.
+        let none = retarget_system_prompt(&prompt, &session("https://new/mcp", None));
+        assert!(!none.contains("amp_server_instructions"), "{none}");
+        assert!(none.starts_with("ROLE\n\n<amp_context>"), "{none}");
+
+        // And back: the block is added before <amp_context>.
+        let back = retarget_system_prompt(&none, &old);
+        assert_eq!(back, prompt);
+    }
 
     #[test]
     fn secrets_are_amp_token_and_every_provider_key_env() {

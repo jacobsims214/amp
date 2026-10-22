@@ -18,6 +18,10 @@
 //! config.toml `[tui] theme`, else `auto` (the terminal's background via OSC 11; dark in
 //! `--snapshot`). Colour depth: `AMP_HARNESS_COLOR`, `[tui] color`, else `COLORTERM`.
 //!
+//! `/server` (#2164) gets a [`crate::server_cmd::Switcher`]: it lists the saved servers and moves
+//! the session (its AMP connection, the model's AMP tools and prompt, the metadata poller) to
+//! another one without a restart.
+//!
 //! The shell gets the session's worker supervisor: quitting while `amp_run_ticket` runs cancels
 //! the workers and waits (bounded) until their abandoned runs are reported ([`Shell::quit`]).
 
@@ -186,6 +190,19 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);
+    // `/server` (#2164): list the saved servers and switch this session to another one.
+    shell.set_server_control(Arc::new(
+        crate::server_cmd::Switcher::new(
+            args.conn.clone(),
+            args.conn.settings()?,
+            Arc::clone(&session.rt),
+            Arc::clone(&session.agent.harness),
+            Arc::clone(&session.agent.policy),
+            project_id,
+            args.snapshot.is_none() || args.meta,
+        )
+        .await,
+    ));
     let mut events = session.events;
 
     let Some((width, height)) = args.snapshot else {
@@ -227,6 +244,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             }
             shell
                 .drive_until_idle(&mut events, &mut done, SNAPSHOT_RUN_TIMEOUT)
+                .await
+                .map_err(CliError::new)?;
+            // Commands that finish in the background (`/server`) land before the next input.
+            shell
+                .settle(SNAPSHOT_RUN_TIMEOUT)
                 .await
                 .map_err(CliError::new)?;
         }
@@ -279,13 +301,17 @@ fn load_theme(args: &ChatArgs) -> Result<AmpTheme, CliError> {
 /// header or status line and the model's calls are the only AMP calls; `debug render-chrome
 /// --live` is the render check with live metadata.
 fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, CliError> {
-    let settings = conn.settings()?;
+    Ok(start_meta_with(conn.settings()?, project_id))
+}
+
+/// [`start_meta`] for given settings (`/server` starts one for the new server, #2164).
+pub(crate) fn start_meta_with(settings: amp_mcp::Settings, project_id: Option<i64>) -> MetaHandle {
     let web_url = settings.web_url.clone();
     let connector: Connector = Arc::new(move || {
         let settings = settings.clone();
         Box::pin(async move { crate::conn::connect(&settings).await })
     });
-    Ok(MetaPoller::spawn(
+    MetaPoller::spawn(
         None,
         MetaOptions {
             project_id,
@@ -293,7 +319,7 @@ fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, Cl
             web_url,
             ..MetaOptions::default()
         },
-    ))
+    )
 }
 
 fn shell_info(s: &session::Session) -> ShellInfo {

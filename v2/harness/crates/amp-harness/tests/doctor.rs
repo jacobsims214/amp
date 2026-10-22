@@ -203,7 +203,13 @@ async fn ca_untrusted_then_trusted_with_the_ca_file() {
     // The human output prints the fix under the failing check.
     let out = run(&dir, &server.url, &["doctor", "--offline"], &[OR_KEY]).await;
     assert!(out.stdout.contains("[FAIL] ca "), "{}", out.stdout);
-    assert!(out.stdout.contains("fix: pass --ca-file"), "{}", out.stdout);
+    // #2164: the fix saves the CA with the server instead of a flag on every command.
+    assert!(
+        out.stdout
+            .contains("fix: save the server's CA with it: `amp-harness server set"),
+        "{}",
+        out.stdout
+    );
 
     // Pass: with the CA file (flag, then env).
     let ca = ca_path.to_str().unwrap();

@@ -18,7 +18,10 @@
 //! render nothing until [`ChatView::chrome`] has a metadata source.
 //!
 //! `amp_*` tool calls are titled `AMP · complete_task #2078` with a compact result
-//! ([`crate::amp_render`]); other tools keep pi's own rendering.
+//! ([`crate::amp_render`]).
+//!
+//! The transcript's entries are [`crate::transcript`]'s components, which look like pi's but
+//! word-wrap (#2176): rpi-tui 0.8.0's own components break lines mid-word.
 
 use std::{
     collections::HashMap,
@@ -29,14 +32,14 @@ use std::{
 use amp_core::events::{stop_reason_str, tool_result_text};
 
 use crate::amp_render;
-use crate::chrome::Chrome;
+use crate::chrome::{Chrome, clean, shorten};
 use crate::overlay::Panel;
+use crate::transcript::{AssistantBlock, Block, ToolBlock, UserBlock, WrapText};
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
-    AssistantBlock, AssistantMessageComponent, Component, Container, Editor, EditorOptions,
-    EditorStyle, Focusable, FooterComponent, Keybindings, ScrollView, StackChild, StackEntry,
-    StatusIndicator, Text, ToolExecutionComponent, UserMessageComponent, VStack, WorkingState,
+    Component, Container, Editor, EditorOptions, EditorStyle, Focusable, FooterComponent,
+    Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack, WorkingState,
     strip_ansi, theme,
 };
 
@@ -71,9 +74,9 @@ pub struct ChatView {
     panel: Panel,
     root: Arc<dyn Component>,
     /// The assistant message being streamed, if any.
-    assistant: Option<Arc<AssistantMessageComponent>>,
+    assistant: Option<Arc<AssistantBlock>>,
     /// Running tool calls by id.
-    tools: HashMap<String, Arc<ToolExecutionComponent>>,
+    tools: HashMap<String, Arc<ToolBlock>>,
     /// The retry indicator in the status slot, if one is shown.
     retry: Option<Arc<StatusIndicator>>,
 }
@@ -201,26 +204,25 @@ impl ChatView {
             });
         }
         self.transcript
-            .add_child(Arc::new(Text::new(text.join("\n"), 1, 1)));
+            .add_child(Arc::new(WrapText::new(text.join("\n"), 1, 1)));
     }
 
     pub fn add_user(&self, text: &str) {
-        self.transcript
-            .add_child(Arc::new(UserMessageComponent::new(text)));
+        self.transcript.add_child(Arc::new(UserBlock::new(text)));
     }
 
     /// A dim one-off line in the transcript (command output, run outcome).
     pub fn add_notice(&self, text: &str) {
         let colors = theme().colors;
         self.transcript
-            .add_child(Arc::new(Text::new(colors.dim.fg(text), 1, 1)));
+            .add_child(Arc::new(WrapText::new(colors.dim.fg(text), 1, 1)));
     }
 
     /// An error line in the transcript.
     pub fn add_error(&self, text: &str) {
         let colors = theme().colors;
         self.transcript
-            .add_child(Arc::new(Text::new(colors.error.fg(text), 1, 1)));
+            .add_child(Arc::new(WrapText::new(colors.error.fg(text), 1, 1)));
     }
 
     /// Shows or hides pi's working spinner in the editor's top border.
@@ -270,7 +272,6 @@ impl ChatView {
             } => {
                 let component = self.current_assistant();
                 component.update_blocks(&blocks(m));
-                component.set_streaming(false);
                 if matches!(m.stop_reason, StopReason::Error | StopReason::Aborted) {
                     let error = m.error_message.as_deref().unwrap_or(match m.stop_reason {
                         StopReason::Aborted => "aborted",
@@ -329,9 +330,7 @@ impl ChatView {
             }
             AgentEvent::AgentEnd { .. } => {
                 self.clear_retry();
-                if let Some(c) = self.assistant.take() {
-                    c.set_streaming(false);
-                }
+                self.assistant = None;
             }
             _ => {}
         }
@@ -362,15 +361,14 @@ impl ChatView {
         }
     }
 
-    fn start_assistant(&mut self) -> Arc<AssistantMessageComponent> {
-        let component = Arc::new(AssistantMessageComponent::default());
-        component.set_streaming(true);
+    fn start_assistant(&mut self) -> Arc<AssistantBlock> {
+        let component = Arc::new(AssistantBlock::new());
         self.transcript.add_child(component.clone());
         self.assistant = Some(component.clone());
         component
     }
 
-    fn current_assistant(&mut self) -> Arc<AssistantMessageComponent> {
+    fn current_assistant(&mut self) -> Arc<AssistantBlock> {
         match &self.assistant {
             Some(c) => Arc::clone(c),
             None => self.start_assistant(),
@@ -391,33 +389,35 @@ impl ChatView {
     }
 }
 
-/// A tool block: pi's for most tools; `AMP · complete_task #2078` plus a short argument summary
-/// for `amp_*` tools.
-fn new_tool(name: &str, args: &serde_json::Value) -> Arc<ToolExecutionComponent> {
+/// A tool block: `AMP · complete_task #2078` plus a short argument summary for `amp_*` tools;
+/// the tool's name and its main argument (path, pattern, command, ...) for others.
+fn new_tool(name: &str, args: &serde_json::Value) -> Arc<ToolBlock> {
     if amp_render::is_amp_tool(name) {
-        let c = ToolExecutionComponent::new(
-            amp_render::SUMMARY_TOOL,
-            &amp_render::tool_args_summary(args),
-        );
-        c.set_display_title(amp_render::tool_title(name, args));
-        Arc::new(c)
+        Arc::new(ToolBlock::new(
+            amp_render::tool_title(name, args),
+            amp_render::tool_summary(args),
+        ))
     } else {
-        let args = if args.is_null() {
-            "{}".to_owned()
-        } else {
-            args.to_string()
-        };
-        Arc::new(ToolExecutionComponent::new(name, &args))
+        Arc::new(ToolBlock::new(name, tool_summary(args)))
     }
 }
 
+/// A non-AMP tool's header summary: its main argument, on one line.
+fn tool_summary(args: &serde_json::Value) -> String {
+    const KEYS: &[&str] = &["path", "pattern", "command", "url", "query", "file_path"];
+    KEYS.iter()
+        .find_map(|k| args[*k].as_str().filter(|s| !s.trim().is_empty()))
+        .map(|s| shorten(&clean(s.lines().next().unwrap_or("")), 120))
+        .unwrap_or_default()
+}
+
 /// The visible blocks of an assistant message (tool calls render as their own components).
-fn blocks(m: &AssistantMessage) -> Vec<AssistantBlock> {
+fn blocks(m: &AssistantMessage) -> Vec<Block> {
     m.content
         .iter()
         .filter_map(|c| match c {
-            Content::Text(t) => Some(AssistantBlock::Text(t.text.clone())),
-            Content::Thinking(t) => Some(AssistantBlock::Thinking(t.thinking.clone())),
+            Content::Text(t) => Some(Block::Text(t.text.clone())),
+            Content::Thinking(t) => Some(Block::Thinking(t.thinking.clone())),
             _ => None,
         })
         .collect()

@@ -10,6 +10,7 @@
 //! - M4-1: `init` and the first run of the chat (server, login, project, provider key).
 //! - #2163: `connect [provider]` / `connect --list` / `disconnect <provider>`: model provider keys
 //!   and custom providers without shell commands (the chat's `/connect` does the same).
+//! - #2164: `server` / `server set <url>` / `server use <name>` and the chat's `/server`.
 
 mod chat;
 mod config_cmd;
@@ -19,6 +20,7 @@ mod debug;
 mod doctor;
 mod mcp_cmd;
 mod run;
+mod server_cmd;
 mod session;
 mod setup;
 mod tickets;
@@ -94,6 +96,9 @@ enum Command {
     Connect(connect::ConnectArgs),
     /// Remove a provider's key from the OS keychain (and a custom provider from config.toml).
     Disconnect(connect::DisconnectArgs),
+    /// Show, save and switch AMP servers (`server`, `server set <url>`, `server use <name>`),
+    /// without editing config.toml by hand.
+    Server(server_cmd::ServerArgs),
     /// Set up this machine and folder: AMP server, login, project (.amp.json), provider key.
     /// Asks for whatever the flags leave open when run in a terminal; `--yes` never asks.
     Init(setup::InitArgs),
@@ -164,6 +169,7 @@ async fn main() -> ExitCode {
         Some(Command::Connect(args)) => connect::run(args).await,
         Some(Command::Disconnect(args)) => connect::disconnect(args).await,
         Some(Command::Init(args)) => setup::init(args).await,
+        Some(Command::Server(args)) => server_cmd::run(args).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
         Some(Command::Debug(command)) => debug::run(command).await,
         None => chat::run(cli.chat).await,

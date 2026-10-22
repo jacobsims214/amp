@@ -3,10 +3,8 @@
 //! marker drawn when the current ticket changes (§2 items 4 and 12 of
 //! `research/harness-tui-theme-and-metadata.md`).
 //!
-//! **No link inside pi's tool block.** rpi-tui 0.8.0 wraps the tool header with
-//! `wrap_text_with_ansi`, which ends an escape sequence at `]`, so an OSC 8 hyperlink would leak
-//! its URL into the title as text. The tool title is plain; the ticket link is in the header, the
-//! inline marker and the command panels.
+//! The tool title is plain text; the ticket link is in the header, the inline marker and the
+//! command panels. The block itself is [`crate::transcript::ToolBlock`] (word-wrapped, #2176).
 
 use std::{any::Any, sync::Arc};
 
@@ -15,7 +13,7 @@ use amp_core::{
     tickets::Status,
 };
 use rpi_tui::{Component, visible_width};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::{
     chrome::{clean, link, shorten},
@@ -71,32 +69,20 @@ pub fn tool_title(name: &str, args: &Value) -> String {
     clean(&title)
 }
 
-/// The tool name the block is built with so pi's header shows [`tool_args_summary`]: pi
-/// summarises `ls` by its `path` argument, unquoted (an unknown tool's first field would keep its
-/// JSON quotes). Only the summary depends on the name; the title is [`tool_title`].
-pub const SUMMARY_TOOL: &str = "ls";
-
-/// What follows the title in the block header: the call's most telling argument, cleaned and
-/// short. Returned as the `{"path": ...}` JSON that pi's header summarises for
-/// [`SUMMARY_TOOL`], or `{}` for none.
-pub fn tool_args_summary(args: &Value) -> String {
+/// What follows the title in the block header: the call's most telling argument, on one line,
+/// cleaned and short (empty for none).
+pub fn tool_summary(args: &Value) -> String {
     const KEYS: &[&str] = &[
         "query", "path", "name", "title", "state", "reason", "answer", "body", "note",
     ];
-    let pick = KEYS.iter().find_map(|k| match &args[*k] {
-        Value::String(s) if !s.trim().is_empty() => Some(s.lines().next().unwrap_or("").to_owned()),
-        _ => None,
-    });
-    match pick {
-        Some(s) => {
-            // pi's summary parser does not handle escapes: no quotes or backslashes.
-            let s = shorten(&clean(&s), 72).replace(['"', '\\'], "'");
-            let mut map = Map::new();
-            map.insert("path".to_owned(), Value::String(s));
-            Value::Object(map).to_string()
-        }
-        None => "{}".to_owned(),
-    }
+    KEYS.iter()
+        .find_map(|k| match &args[*k] {
+            Value::String(s) if !s.trim().is_empty() => {
+                Some(shorten(&clean(s.lines().next().unwrap_or("")), 72))
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 /// Keys [`result_text`] never lists: the ticket's inherited metadata is noise in a one-line summary.
@@ -308,11 +294,12 @@ mod tests {
     }
 
     #[test]
-    fn the_summary_is_safe_for_pis_header() {
-        assert_eq!(tool_args_summary(&json!({"task_id": 1})), "{}");
-        let s = tool_args_summary(&json!({"body": "line \"one\"\x1b[31m\nline two"}));
-        let v: Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["path"], "line 'one'[31m");
+    fn the_summary_is_one_clean_line() {
+        assert_eq!(tool_summary(&json!({"task_id": 1})), "");
+        assert_eq!(
+            tool_summary(&json!({"body": "line \"one\"\x1b[31m\nline two"})),
+            "line \"one\"[31m"
+        );
     }
 
     #[test]

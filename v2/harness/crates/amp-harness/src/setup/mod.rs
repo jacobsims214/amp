@@ -53,7 +53,7 @@ use clap::Args;
 use serde::Serialize;
 use serde_json::{Value, json};
 
-pub use config_file::ConfigFile;
+pub use config_file::{Change, ConfigFile};
 use ui::Ui;
 
 use crate::conn::{self, CliError, ConnArgs};
@@ -551,7 +551,7 @@ pub fn origin_of(url: &str) -> String {
     }
 }
 
-fn host_of(url: &str) -> String {
+pub(crate) fn host_of(url: &str) -> String {
     origin_of(url)
         .split_once("://")
         .map(|(_, h)| h.to_owned())
@@ -560,7 +560,7 @@ fn host_of(url: &str) -> String {
 
 /// Where the web UI is, as far as a probe can tell.
 #[derive(Debug, PartialEq, Eq)]
-enum WebGuess {
+pub(crate) enum WebGuess {
     /// The MCP URL's origin serves it: nothing to save.
     Same,
     Found(String),
@@ -587,7 +587,7 @@ async fn looks_like_ui(url: &str, ca_file: Option<&Path>) -> bool {
             .is_some_and(|v| v.contains("text/html"))
 }
 
-async fn guess_web_url(mcp_url: &str, ca_file: Option<&Path>) -> WebGuess {
+pub(crate) async fn guess_web_url(mcp_url: &str, ca_file: Option<&Path>) -> WebGuess {
     let origin = origin_of(mcp_url);
     if looks_like_ui(&format!("{origin}/"), ca_file).await {
         return WebGuess::Same;

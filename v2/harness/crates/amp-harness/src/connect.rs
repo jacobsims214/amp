@@ -1283,7 +1283,7 @@ pub async fn disconnect(args: DisconnectArgs) -> Result<(), CliError> {
     let cfg = setup::load_models(&config, None)?;
     let id = args.provider.trim().to_owned();
     let provider = cfg.providers.get(&id);
-    let text = config.text().unwrap_or_default();
+    let text = config.text().ok().flatten().unwrap_or_default();
     let user_defined = ModelsFile::parse(&text, "config.toml")
         .ok()
         .is_some_and(|f| f.providers.contains_key(&id))
