@@ -29,7 +29,7 @@
 //!
 //! | tool | permission | subject |
 //! |---|---|---|
-//! | `bash`, `powershell` | `bash` | each command of the script, split on `&&` `\|\|` `;` `\|` `&` and newlines |
+//! | `bash`, `powershell` | `bash` | each command of the script, split on `&&` `\|\|` `;` `\|` `&` and newlines, comments dropped |
 //! | `edit`, `write` | `edit` | the path relative to the worktree root (paths outside it also need `external_directory`) |
 //! | [`DISPATCH_TOOL`] | `task` | the agent id without AMP's `amp:` prefix |
 //! | `webfetch` | `webfetch` | the URL |
@@ -42,6 +42,11 @@
 //! (`$(…)`, backticks, `<(…)`, `>(…)`) and output redirection to a file are denied outright. An
 //! allowlist like `"git status*": allow` would otherwise pass `git status $(rm -rf x)` or
 //! `ls > file`. Redirecting to `/dev/null` and duplicating a descriptor (`2>&1`) are fine.
+//!
+//! A script the lexer can't split with certainty is denied too ([`ShellScan::unparseable`]: an
+//! unbalanced quote, `$'…'`, or a newline left inside a command). A quote read differently from
+//! bash would hide whole commands inside one that matches an allow rule, so the harness fails
+//! closed.
 //!
 //! rpi-tools has no `webfetch`, `websearch`, `todowrite` or `question` tool, so those rules only
 //! matter if a later ticket adds such a tool.
@@ -279,20 +284,47 @@ fn glob(input: &[char], pattern: &[char]) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellScan {
     /// Each simple command, trimmed, in order (pipes, lists and background jobs split apart).
+    /// Comments are dropped.
     pub commands: Vec<String>,
     /// `$(…)`, a backtick, `<(…)` or `>(…)` outside single quotes.
     pub substitution: bool,
-    /// Output redirected to a file (not `/dev/null`, not a descriptor duplication).
+    /// Output redirected to a file (not `/dev/null`, not a descriptor duplication), or a file
+    /// opened read-write with `<>` (which creates it).
     pub writes_file: bool,
+    /// The lexer can't be sure it split the script the way bash will: a quote is still open at
+    /// the end, the script uses ANSI-C quoting (`$'…'`), or a command still contains a newline
+    /// after splitting (a quoted newline, or a here-document body). A restricted policy denies
+    /// these rather than guess, because a quote the lexer reads differently from bash can hide
+    /// whole commands inside what looks like one allowed command.
+    pub unparseable: bool,
 }
 
-/// Split a script on `&&`, `||`, `;`, `|`, `&` and newlines outside quotes. This is a lexer, not a
-/// shell parser: it errs towards more, smaller commands and flags anything it can't see through.
+/// Split a script on `&&`, `||`, `;`, `|`, `&` and newlines outside quotes, dropping comments. This
+/// is a lexer, not a shell parser: it errs towards more, smaller commands and flags anything it
+/// can't see through (see [`ShellScan::unparseable`]).
+///
+/// What it follows, as bash does:
+/// - `'…'` is literal; `"…"` is literal except that `\` escapes the next character;
+/// - `$'…'` (ANSI-C quoting) is literal except that `\` escapes the next character, `\'`
+///   included;
+/// - outside single quotes a `\` escapes the next character, and `\` + newline is a line
+///   continuation (both are removed);
+/// - an unquoted `#` at the start of a word (start of input, or after a blank or one of
+///   `; & | ( ) < >` or a newline) starts a comment that runs to the end of the line.
 pub fn scan_shell(script: &str) -> ShellScan {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        AnsiC,
+    }
     let chars: Vec<char> = script.chars().collect();
     let mut scan = ShellScan::default();
     let mut current = String::new();
-    let (mut single, mut double) = (false, false);
+    let mut quote = Quote::None;
+    // True when the next unquoted character begins a new word (so `#` would start a comment).
+    let mut word_start = true;
     let mut i = 0;
     let flush = |current: &mut String, scan: &mut ShellScan| {
         let cmd = current.trim();
@@ -304,32 +336,83 @@ pub fn scan_shell(script: &str) -> ShellScan {
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
-        if single {
-            if c == '\'' {
-                single = false;
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+                current.push(c);
+                i += 1;
+                continue;
             }
-            current.push(c);
-            i += 1;
-            continue;
+            Quote::AnsiC => {
+                match c {
+                    '\\' => {
+                        current.push(c);
+                        if let Some(n) = next {
+                            current.push(n);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    '\'' => quote = Quote::None,
+                    _ => {}
+                }
+                current.push(c);
+                i += 1;
+                continue;
+            }
+            Quote::Double | Quote::None => {}
         }
-        match c {
-            '\\' => {
+        if c == '\\' {
+            // A line continuation disappears; any other escaped character is kept as is.
+            if next != Some('\n') {
                 current.push(c);
                 if let Some(n) = next {
                     current.push(n);
                 }
+                word_start = false;
+            }
+            i += 2;
+            continue;
+        }
+        if quote == Quote::None && c == '#' && word_start {
+            // A comment: skip to the newline, which still splits.
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '\'' if quote == Quote::None => quote = Quote::Single,
+            '$' if quote == Quote::None && next == Some('\'') => {
+                quote = Quote::AnsiC;
+                scan.unparseable = true;
+                current.push_str("$'");
+                word_start = false;
                 i += 2;
                 continue;
             }
-            '\'' if !double => single = true,
-            '"' => double = !double,
+            '"' => {
+                quote = if quote == Quote::Double {
+                    Quote::None
+                } else {
+                    Quote::Double
+                }
+            }
             '`' => scan.substitution = true,
             '$' if next == Some('(') => scan.substitution = true,
-            '<' | '>' if next == Some('(') && !double => scan.substitution = true,
-            '>' if !double && redirect_writes_file(&chars, i) => scan.writes_file = true,
+            '<' | '>' if next == Some('(') && quote == Quote::None => scan.substitution = true,
+            '<' if quote == Quote::None && next == Some('>') => scan.writes_file = true,
+            '>' if quote == Quote::None
+                && chars.get(i.wrapping_sub(1)) != Some(&'<')
+                && redirect_writes_file(&chars, i) =>
+            {
+                scan.writes_file = true
+            }
             _ => {}
         }
-        if !double {
+        if quote == Quote::None {
             let prev = if i > 0 { Some(chars[i - 1]) } else { None };
             let split = match c {
                 ';' | '\n' => Some(1),
@@ -341,14 +424,24 @@ pub fn scan_shell(script: &str) -> ShellScan {
             };
             if let Some(len) = split {
                 flush(&mut current, &mut scan);
+                word_start = true;
                 i += len;
                 continue;
             }
+            word_start = c.is_whitespace() || matches!(c, '&' | '|' | '(' | ')' | '<' | '>');
+        } else {
+            word_start = false;
         }
         current.push(c);
         i += 1;
     }
+    if quote != Quote::None {
+        scan.unparseable = true;
+    }
     flush(&mut current, &mut scan);
+    if scan.commands.iter().any(|c| c.contains('\n')) {
+        scan.unparseable = true;
+    }
     scan
 }
 
@@ -406,6 +499,9 @@ pub enum DenialReason {
     Substitution,
     /// Output redirection to a file under a restricted bash policy.
     Redirect,
+    /// A script the lexer can't split with certainty, under a restricted bash policy
+    /// ([`ShellScan::unparseable`]).
+    Unparseable,
     /// The call is missing the argument the policy checks (e.g. no `command`).
     BadArguments,
 }
@@ -438,6 +534,15 @@ impl fmt::Display for Denial {
                 f,
                 "{who}: redirecting output to a file is not allowed under this role's bash \
                  rules: `{}`. {tail}",
+                self.subject
+            ),
+            DenialReason::Unparseable => write!(
+                f,
+                "{who}: the harness can't split this script into commands with certainty, so \
+                 it is not allowed under this role's bash rules: `{}`. It denies unbalanced \
+                 quotes, ANSI-C quoting ($'...'), and newlines inside quotes or \
+                 here-documents. Write each command plainly, one per line or joined with && \
+                 or ;. {tail}",
                 self.subject
             ),
             DenialReason::BadArguments => write!(
@@ -574,6 +679,10 @@ impl ToolPolicy {
                 let script = str_arg(args, &["command"]).ok_or_else(missing)?;
                 let scan = scan_shell(script);
                 if !self.policy.allows_everything("bash") {
+                    // First: when the split itself is in doubt, the other flags are too.
+                    if scan.unparseable {
+                        return Err(deny(script.to_string(), DenialReason::Unparseable));
+                    }
                     if scan.substitution {
                         return Err(deny(script.to_string(), DenialReason::Substitution));
                     }
@@ -846,6 +955,140 @@ mod tests {
         );
         assert!(!scan_shell("ls > /dev/null 2>&1").writes_file);
         assert!(!scan_shell("echo 'a > b'").writes_file);
+    }
+
+    /// The review #2101 bypasses: `$'…'` and `#` comments used to desync the lexer from bash, so
+    /// a whole script read as one `ls …` command while bash ran `rm -rf x` too.
+    #[test]
+    fn shell_scan_follows_ansi_c_quotes_and_comments() {
+        let s = scan_shell("ls $'\\'';rm -rf x #'");
+        assert_eq!(s.commands, vec!["ls $'\\''", "rm -rf x"]);
+        assert!(s.unparseable, "$'...' is always flagged");
+        let s = scan_shell("ls #'\nrm -rf x\n#'");
+        assert_eq!(s.commands, vec!["ls", "rm -rf x"]);
+        assert!(!s.unparseable, "a comment is understood, not guessed at");
+
+        // Comments start only at a word start, and only outside quotes.
+        assert_eq!(scan_shell("ls -la # list it").commands, vec!["ls -la"]);
+        assert_eq!(scan_shell("# just a note").commands, Vec::<String>::new());
+        assert_eq!(scan_shell("ls a#b").commands, vec!["ls a#b"]);
+        assert_eq!(scan_shell("echo $#").commands, vec!["echo $#"]);
+        assert_eq!(scan_shell("echo '#' x").commands, vec!["echo '#' x"]);
+        assert_eq!(scan_shell("echo \"#\" x").commands, vec!["echo \"#\" x"]);
+        assert_eq!(scan_shell("echo \\# x").commands, vec!["echo \\# x"]);
+        assert_eq!(scan_shell("ls;#x\nls -a").commands, vec!["ls", "ls -a"]);
+        assert_eq!(scan_shell("ls|#x\nwc").commands, vec!["ls", "wc"]);
+        // A line continuation is removed, as bash does.
+        assert_eq!(scan_shell("ls \\\n-la").commands, vec!["ls -la"]);
+
+        // Anything the lexer can't be sure of is flagged.
+        assert!(scan_shell("ls 'abc").unparseable, "unclosed single quote");
+        assert!(scan_shell("ls \"abc").unparseable, "unclosed double quote");
+        assert!(scan_shell("ls $'abc").unparseable, "unclosed ANSI-C quote");
+        assert!(
+            scan_shell("ls \"a\nb\"").unparseable,
+            "newline inside quotes"
+        );
+        assert!(
+            scan_shell("cat <<EOF\n'\nEOF\nrm -rf x\n'").unparseable,
+            "a here-document quote that swallows real commands"
+        );
+        assert!(!scan_shell("git status && git log --oneline").unparseable);
+        assert!(
+            !scan_shell("echo $\"x\"").unparseable,
+            "$\"...\" is a plain string"
+        );
+
+        // `<>` opens a file read-write and creates it.
+        assert!(scan_shell("ls <> x").writes_file);
+        assert!(scan_shell("ls 3<>x").writes_file);
+        assert!(!scan_shell("ls < x").writes_file);
+    }
+
+    /// Cross-check the lexer against real bash: `bash -xc` traces every simple command it runs,
+    /// one `+ ` line each, so for scripts made only of `echo`/`true` the counts must agree. This
+    /// includes both #2101 bypasses, rewritten so the hidden command is a harmless `echo`.
+    #[test]
+    fn shell_scan_agrees_with_real_bash() {
+        let Ok(probe) = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("true")
+            .output()
+        else {
+            eprintln!("bash not found; skipping");
+            return;
+        };
+        assert!(probe.status.success());
+        for script in [
+            "echo $'\\'';echo PWNED #'",
+            "echo $'\\'' && echo PWNED #'",
+            "echo $'\\'' | echo PWNED #'",
+            "echo #'\necho PWNED\n#'",
+            "echo #'\necho a && echo PWNED\n#'",
+            "echo #'\necho a | echo PWNED\n#'",
+            "echo a;#x\necho b",
+            "echo a|#x\ncat",
+            "echo a&#x\necho b",
+            "(echo c)#x\necho d",
+            "echo a#b; echo c",
+            "echo '#' \"#\" \\# x # y",
+            "echo \\\n#x; echo b",
+            "echo 'a;b' \"c && d\" | cat && true",
+            "echo $'a\\tb'; echo c",
+        ] {
+            let out = std::process::Command::new("bash")
+                .arg("-xc")
+                .arg(script)
+                .output()
+                .unwrap();
+            let traced = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter(|l| l.starts_with('+'))
+                .count();
+            let scan = scan_shell(script);
+            assert_eq!(
+                scan.commands.len(),
+                traced,
+                "{script:?}: lexer {:?} vs bash trace {:?}",
+                scan.commands,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if String::from_utf8_lossy(&out.stdout).contains("PWNED") {
+                assert!(
+                    scan.commands.iter().any(|c| c == "echo PWNED"),
+                    "{script:?}: bash ran `echo PWNED` but the lexer saw {:?}",
+                    scan.commands
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restricted_bash_denies_what_the_lexer_cannot_split() {
+        let p = Policy::parse(Some(&json!({"bash": {"*": "deny", "ls *": "allow"}}))).unwrap();
+        let tp = ToolPolicy::new("amp-manager", false, p, "/repo/wt");
+        let bash = |cmd: &str| tp.check("bash", &json!({ "command": cmd }));
+        assert_eq!(
+            bash("ls $'\\'';rm -rf x #'").unwrap_err().reason,
+            DenialReason::Unparseable
+        );
+        assert_eq!(
+            bash("ls $'a'").unwrap_err().reason,
+            DenialReason::Unparseable
+        );
+        assert_eq!(
+            bash("ls #'\nrm -rf x\n#'").unwrap_err().reason,
+            DenialReason::Deny,
+            "the comment is dropped, so `rm -rf x` is checked on its own"
+        );
+        assert_eq!(bash("ls 'x").unwrap_err().reason, DenialReason::Unparseable);
+        assert_eq!(bash("ls <> x").unwrap_err().reason, DenialReason::Redirect);
+        assert!(bash("ls -la # list").is_ok());
+        let text = bash("ls $'x'").unwrap_err().to_string();
+        assert!(text.contains("can't split this script"), "{text}");
+        // An unrestricted policy runs whatever bash would.
+        let tp = ToolPolicy::new("amp-x", true, Policy::default(), "/repo/wt");
+        assert!(tp.check("bash", &json!({"command": "ls $'x'"})).is_ok());
     }
 
     #[test]

@@ -172,9 +172,33 @@ fn manager_policy() {
         "git log `id`",
         "git log > notes.txt",
         "lsof -i",
+        // #2101: `$'...'` and `#` comments used to make the lexer read each of these as one
+        // `ls ...` command while bash also ran `rm -rf x`.
+        "ls $'\\'';rm -rf x #'",
+        "ls $'\\'' && rm -rf x #'",
+        "ls $'\\'' | rm -rf x #'",
+        "ls #'\nrm -rf x\n#'",
+        "ls #'\nls && rm -rf x\n#'",
+        "ls #'\nls | rm -rf x\n#'",
+        "git status \"\nrm -rf x\n\"",
+        "ls 'unclosed",
+        "ls <> created-file",
     ] {
         assert!(!bash(&p, denied), "manager must not run: {denied}");
     }
+    for ok in [
+        "ls -la",
+        "git status && git log --oneline",
+        "ls -la # what's here",
+    ] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+    assert_eq!(
+        p.check("bash", &json!({"command": "ls $'\\'';rm -rf x #'"}))
+            .unwrap_err()
+            .reason,
+        DenialReason::Unparseable
+    );
     let d = p
         .check("bash", &json!({"command": "cargo build"}))
         .unwrap_err();
