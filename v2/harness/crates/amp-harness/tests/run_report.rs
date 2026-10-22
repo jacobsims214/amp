@@ -369,7 +369,10 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
     assert_eq!(run["agent_id"], "amp:amp-worker-backend");
     assert_eq!(run["model"], "wf/wf-1");
     let note = run["run_note"].as_str().unwrap();
-    assert!(note.starts_with("abandoned: error: "), "{note}");
+    assert!(
+        note.starts_with("abandoned: error: ") && !note.starts_with("abandoned: error: error"),
+        "{note}"
+    );
     assert!(!note.contains('\n'), "{note}");
     assert_eq!(num(&run["input_tokens"]), r.usage.input_tokens);
     assert_eq!(num(&run["output_tokens"]), r.usage.output_tokens);

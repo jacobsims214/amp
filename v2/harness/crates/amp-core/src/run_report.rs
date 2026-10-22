@@ -189,11 +189,19 @@ pub fn fill_missing(args: &Value, fields: &Map<String, Value>) -> Option<Value> 
 
 /// `"abandoned: <outcome>[: <error>]"` on one line, cut to [`NOTE_MAX_CHARS`].
 pub fn abandoned_note(report: &WorkerReport) -> String {
-    let mut note = format!("{ABANDONED}: {}", report.outcome.as_str());
+    let outcome = report.outcome.as_str();
+    let mut note = format!("{ABANDONED}: {outcome}");
+    // rpi's run errors often start with the outcome itself ("error: No more faux responses
+    // queued"); don't say it twice ("abandoned: error: error: ...").
     if let Some(err) = report
         .error
         .as_deref()
         .map(str::trim)
+        .map(|e| {
+            e.strip_prefix(outcome)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map_or(e, str::trim_start)
+        })
         .filter(|e| !e.is_empty())
     {
         note.push_str(": ");
@@ -499,6 +507,18 @@ mod tests {
                 Some("provider_error:\n  No more faux responses queued")
             )),
             "abandoned: error: provider_error: No more faux responses queued"
+        );
+        // What a real run reports (seen against compose AMP in #2099): no doubled outcome.
+        assert_eq!(
+            abandoned_note(&report(
+                WorkerOutcome::Error,
+                Some("error: No more faux responses queued")
+            )),
+            "abandoned: error: No more faux responses queued"
+        );
+        assert_eq!(
+            abandoned_note(&report(WorkerOutcome::Error, Some("error:"))),
+            "abandoned: error"
         );
         let long = "x".repeat(1000);
         let note = abandoned_note(&report(WorkerOutcome::Timeout, Some(&long)));

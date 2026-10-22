@@ -225,7 +225,13 @@ make -C v2/harness clean      # delete target/ (do this before removing a worktr
 `scripts/smoke.sh` runs the built binary against a real AMP and exits non-zero on any failure. Each
 leg runs `doctor --json` and `whoami --json`. It then creates a throwaway project (epic, story, two
 dependent tickets, a comment) with `mcp call` and reads it back with `tickets list|get` and with
-`run -p` (the manager on a scripted faux model calling `amp_get_task`). Finally it
+`run -p` (the manager on a scripted faux model calling `amp_get_task`). Then it runs the dispatch
+cases (M2-8): the manager (faux `boss`) dispatches worker-backend (faux `wf`) with `amp_run_ticket`
+in a worktree of a throwaway git repo under `target/`; the worker comments and completes with only
+`task_id`, and the ticket's run must carry `wf/wf-1` and tokens > 0. A second worker's script runs
+out, which must leave one abandoned run with a note `abandoned: error: ...`. Calls the role policy
+denies (the manager's bash, the worker writing outside its worktree) must come back as visible tool
+errors and never run. Cost is not asserted: the faux provider always reports 0. Finally it
 deletes the tickets, story and epic and archives the project. AMP has no hard project delete, so the
 leg checks that the project is gone from `amp_list_projects`. Cleanup runs from an exit trap, so it
 also happens when a check fails. The harness runs with HOME under `target/` and
