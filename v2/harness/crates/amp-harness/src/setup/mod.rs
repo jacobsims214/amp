@@ -1084,6 +1084,43 @@ fn profile_of(cfg: &ModelsConfig) -> (String, String) {
     }
 }
 
+/// [`SystemKeys`] with a per-run cache: each provider's keychain entry is read at most once, and a
+/// key stored by this run is remembered instead of read back. On macOS every keychain read by a
+/// binary the item doesn't trust can raise an "allow access" dialog, so setup must not re-read.
+struct CachedKeys {
+    inner: SystemKeys,
+    cache: std::sync::Mutex<std::collections::BTreeMap<String, Option<Option<String>>>>,
+}
+
+impl CachedKeys {
+    fn new() -> Self {
+        Self {
+            inner: SystemKeys::from_env(),
+            cache: Default::default(),
+        }
+    }
+
+    /// A key this run stored in the keychain.
+    fn remember(&self, provider: &str, key: &str) {
+        if let Ok(mut c) = self.cache.lock() {
+            c.insert(provider.to_owned(), Some(Some(key.to_owned())));
+        }
+    }
+}
+
+impl KeyLookup for CachedKeys {
+    fn env(&self, var: &str) -> Option<String> {
+        self.inner.env(var)
+    }
+
+    fn keychain(&self, provider: &str) -> Option<Option<String>> {
+        let mut c = self.cache.lock().ok()?;
+        c.entry(provider.to_owned())
+            .or_insert_with(|| self.inner.keychain(provider))
+            .clone()
+    }
+}
+
 /// The providers the config's roles use that need a key and have none.
 fn missing_keys(cfg: &ModelsConfig, keys: &dyn KeyLookup) -> Vec<String> {
     cfg.providers_in_use()
@@ -1169,7 +1206,11 @@ async fn check_key(p: &ProviderConfig, key: &str) -> KeyCheck {
 }
 
 /// Reads a key hidden, checks it, stores it in the keychain. `false` if the person skipped it.
-async fn prompt_key(ui: &mut dyn Ui, p: &ProviderConfig) -> Result<bool, CliError> {
+async fn prompt_key(
+    ui: &mut dyn Ui,
+    p: &ProviderConfig,
+    keys: &CachedKeys,
+) -> Result<bool, CliError> {
     let name = provider_name(&p.id);
     for _ in 0..3 {
         let key = ui.secret(&format!("{name} API key, Enter to skip"))?;
@@ -1189,6 +1230,7 @@ async fn prompt_key(ui: &mut dyn Ui, p: &ProviderConfig) -> Result<bool, CliErro
             )),
         }
         store_key(&p.id, &key).map_err(|e| CliError::new(format!("store the {name} key: {e}")))?;
+        keys.remember(&p.id, &key);
         ui.say(&format!(
             "  Stored in the OS keychain (service {}, account {}).",
             amp_mcp::keychain_service(),
@@ -1205,7 +1247,7 @@ async fn models_step(
     config: &ConfigFile,
     summary: &mut Summary,
 ) -> Result<(), CliError> {
-    let keys = SystemKeys::from_env();
+    let keys = CachedKeys::new();
 
     // --profile: check it exists, then save it.
     if let Some(profile) = &plan.profile {
@@ -1242,6 +1284,7 @@ async fn models_step(
                 provider_name(&provider.id)
             ))
         })?;
+        keys.remember(&provider.id, key.trim());
         ui.say(&format!(
             "Stored the {} key from {var} in the OS keychain.",
             provider_name(&provider.id)
@@ -1351,7 +1394,7 @@ async fn models_step(
             let c = load_models(config, Some(name))?;
             for id in missing_keys(&c, &keys) {
                 if let Some(p) = c.providers.get(&id)
-                    && !prompt_key(ui, p).await?
+                    && !prompt_key(ui, p, &keys).await?
                 {
                     break;
                 }
