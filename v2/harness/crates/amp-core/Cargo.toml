@@ -1,0 +1,18 @@
+[package]
+name = "amp-core"
+description = "AMP harness core: rpi glue, config, roles, tool policy, worker supervisor (D1)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+amp-mcp.workspace = true
+rpi-ai.workspace = true
+rpi-agent.workspace = true
+rpi-tools.workspace = true
+rpi-harness.workspace = true
+
+[lints]
+workspace = true

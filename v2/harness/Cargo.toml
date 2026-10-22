@@ -1,0 +1,55 @@
+# AMP harness workspace. Architecture: project 2 KB decisions/amp-harness-architecture.md (D1).
+#
+# Dependency order is one-way (D1):
+#   amp-mcp      (rmcp only, no rpi)  <-  amp-core (rpi glue)  <-  amp-tui  <-  amp-harness (binary)
+# so the MCP/OAuth code builds and tests without rpi.
+#
+# Upstream pins are EXACT (D11). Bumping rpi-* or rmcp is its own ticket, gated on the smoke test.
+[workspace]
+resolver = "3"
+members = [
+    "crates/amp-mcp",
+    "crates/amp-core",
+    "crates/amp-tui",
+    "crates/amp-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "Apache-2.0"
+repository = "https://github.com/jacobsims214/amp"
+publish = false
+
+[workspace.dependencies]
+# Internal crates.
+amp-mcp = { path = "crates/amp-mcp" }
+amp-core = { path = "crates/amp-core" }
+amp-tui = { path = "crates/amp-tui" }
+
+# pi-rust core crates: exact pins (D1, D11).
+rpi-ai = "=0.8.0"
+rpi-agent = "=0.8.0"
+rpi-tools = "=0.8.0"
+rpi-harness = "=0.8.0"
+rpi-tui = "=0.8.0"
+
+# MCP client: exact pin (D2, D3). Streamable HTTP over reqwest with rustls, OAuth (`auth`).
+# Default features (server, macros) are off; tests that need an in-process server add them as dev-deps.
+rmcp = { version = "=3.6.0", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "auth",
+    "reqwest",
+] }
+
+clap = { version = "4.6", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
