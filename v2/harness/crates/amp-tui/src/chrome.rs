@@ -430,6 +430,10 @@ fn side_width(style: &Style, segs: &[Seg]) -> usize {
         .sum()
 }
 
+/// The fewest blank cells between the left group and a right-aligned item, so the two never read
+/// as one phrase (#2148). When they don't fit with this gap, `fit` drops segments by rank.
+pub const MIN_GAP: usize = 3;
+
 fn line_width(style: &Style, left: &[Seg], right: &[Seg]) -> usize {
     let (l, r) = (side_width(style, left), side_width(style, right));
     if right.is_empty() {
@@ -437,7 +441,7 @@ fn line_width(style: &Style, left: &[Seg], right: &[Seg]) -> usize {
     } else if left.is_empty() {
         r
     } else {
-        l + 1 + r
+        l + MIN_GAP + r
     }
 }
 
@@ -485,7 +489,12 @@ fn fit(style: &Style, mut left: Vec<Seg>, mut right: Vec<Seg>, width: usize) -> 
     let used = line_width(style, &left, &right);
     if used > width {
         // Only unbreakable segments are left and they still don't fit: plain text, cut.
-        let plain = rpi_tui::strip_ansi(&format!("{} {}", join(style, &left), join(style, &right)));
+        let gap = " ".repeat(MIN_GAP);
+        let plain = rpi_tui::strip_ansi(&format!(
+            "{}{gap}{}",
+            join(style, &left),
+            join(style, &right)
+        ));
         return shorten(plain.trim(), width);
     }
     let l = join(style, &left);
@@ -665,7 +674,7 @@ fn ticket_line(style: &Style, data: &ChromeData, p: &AmpPalette, id: i64, width:
         let label_w = visible_width(label);
         width
             .saturating_sub(fixed)
-            .saturating_sub(if label_w > 0 { label_w + 2 } else { 0 })
+            .saturating_sub(if label_w > 0 { label_w + MIN_GAP } else { 0 })
     };
     // The longest label that leaves the whole name, else one that leaves it MIN_NAME_CELLS, else
     // no label.
