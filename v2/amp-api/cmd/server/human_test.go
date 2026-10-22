@@ -250,9 +250,10 @@ func TestHuman_SwitchingAndRules(t *testing.T) {
 		t.Fatalf("ownerless human ticket not flagged: %v", plan["issues"])
 	}
 
-	// Trash keeps who does it.
+	// Trash keeps who does it. An open human ticket is deleted in the web UI
+	// (#2190: off the UI that would remove the person's gate).
 	alice.call(t, "amp_assign_task", map[string]any{"task_id": float64(call), "user": "me"})
-	w.s.as(w.lead).call(t, "amp_delete_task", map[string]any{"task_id": float64(call)})
+	newRestAs(t, w).want(t, 200, "lead", http.MethodDelete, fmt.Sprintf("/api/tasks/%d", call), nil)
 	w.s.as(w.lead).call(t, "amp_restore_tasks", map[string]any{"project_id": float64(w.s.projectID), "task_ids": []any{float64(call)}})
 	if tk := humanTask(t, alice, call); tk["performer"] != "human" || tk["human_reason"] != "external" {
 		t.Fatalf("restored: %v", tk)
