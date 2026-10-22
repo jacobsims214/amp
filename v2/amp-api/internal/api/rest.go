@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -656,18 +657,29 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "approve-plan":
-		// POST: a person approves the project's plan as it stands now.
+		// POST: a person approves the project's plan. Optional body
+		// {"as_of": RFC 3339, the newest planned_at the person saw}: only
+		// tickets planned at or before it are approved, newer ones keep
+		// awaiting (listed in awaiting_approval). No body (or no as_of)
+		// approves the plan as it stands now.
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
 			return
 		}
-		// ApprovePlan publishes project.updated itself (MCP approves too).
-		proj, err := h.svc.ApprovePlan(r.Context(), pr, projectID)
+		var body struct {
+			AsOf *time.Time `json:"as_of"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			jsonErr(w, fmt.Errorf("approve-plan body: as_of must be an RFC 3339 timestamp: %w", err), 400)
+			return
+		}
+		// ApprovePlanAsOf publishes project.updated itself.
+		proj, awaiting, err := h.svc.ApprovePlanAsOf(r.Context(), pr, projectID, body.AsOf)
 		if err != nil {
 			fail(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"project": proj})
+		jsonOK(w, map[string]interface{}{"project": proj, "awaiting_approval": awaiting})
 		return
 
 	case "report":

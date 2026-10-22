@@ -126,9 +126,10 @@ func (r *Repo) RestoreTask(ctx context.Context, projectID, taskID int) (*Restore
 	}
 	for _, q := range []string{
 		// A restored ticket is planned again (planned_at = now): an approval
-		// given while it was in the trash doesn't cover it.
+		// given while it was in the trash doesn't cover it. clock_timestamp(),
+		// not the transaction's start (see UpdateTaskPlanned).
 		`INSERT INTO tasks SELECT * FROM jsonb_populate_record(NULL::tasks, '{"performer": "agent", "human_reason": ""}'::jsonb || ($1::jsonb->'task')
-			|| jsonb_build_object('planned_at', NOW()))`,
+			|| jsonb_build_object('planned_at', clock_timestamp()))`,
 		`INSERT INTO comments SELECT * FROM jsonb_populate_recordset(NULL::comments, $1::jsonb->'comments') ON CONFLICT DO NOTHING`,
 		`INSERT INTO activity_log SELECT * FROM jsonb_populate_recordset(NULL::activity_log, $1::jsonb->'activity') ON CONFLICT DO NOTHING`,
 	} {

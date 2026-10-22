@@ -239,15 +239,45 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 	return p, err
 }
 
-// ApprovePlan records that a user approved the project's plan now.
-func (r *Repo) ApprovePlan(ctx context.Context, id int, by *int) (*domain.Project, error) {
+// ApprovePlan records that a user approved the project's plan.
+//
+// asOf nil approves everything planned up to now: plan_approved_at is
+// clock_timestamp() (the statement's wall clock, not the transaction's
+// start, the same clock planned_at is written with).
+//
+// asOf set approves only what the person saw: plan_approved_at becomes
+// asOf (the newest planned_at on the page they approved from), so a ticket
+// created or re-planned after it still awaits approval. It never moves
+// into the future (capped at clock_timestamp()) and never moves back (an
+// older asOf than the current approval keeps the current approval, so a
+// stale page can't un-approve tickets someone else already approved).
+func (r *Repo) ApprovePlan(ctx context.Context, id int, by *int, asOf *time.Time) (*domain.Project, error) {
 	p := &domain.Project{}
-	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET plan_approved_at = NOW(), plan_approved_by = $2, updated_at = NOW()
-		 WHERE id = $1 RETURNING `+projectCols, id, by), p)
+	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET
+		   plan_approved_at = CASE WHEN $3::timestamptz IS NULL THEN clock_timestamp()
+		                           ELSE GREATEST(plan_approved_at, LEAST($3::timestamptz, clock_timestamp())) END,
+		   plan_approved_by = $2, updated_at = NOW()
+		 WHERE id = $1 RETURNING `+projectCols, id, by, asOf), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
 	}
 	return p, err
+}
+
+// TasksAwaitingApproval lists the project's open (not completed) tickets
+// planned after approvedAt (all open tickets when approvedAt is nil), by id.
+func (r *Repo) TasksAwaitingApproval(ctx context.Context, projectID int, approvedAt *time.Time) ([]int, error) {
+	rows, err := r.db.Query(ctx, `SELECT id FROM tasks
+		WHERE project_id = $1 AND state <> 'completed' AND ($2::timestamptz IS NULL OR planned_at > $2::timestamptz)
+		ORDER BY id`, projectID, approvedAt)
+	if err != nil {
+		return nil, err
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[int])
+	if ids == nil {
+		ids = []int{}
+	}
+	return ids, err
 }
 
 func (r *Repo) setProjectState(ctx context.Context, id int, state domain.ProjectState) (*domain.Project, error) {
@@ -367,8 +397,8 @@ func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*d
 	t := &domain.Task{}
 	err := scanTask(r.db.QueryRow(ctx,
 		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id, metadata,
-		                    performer, human_reason, ready_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+		                    performer, human_reason, ready_at, planned_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), clock_timestamp())
 		 RETURNING `+taskCols,
 		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo, req.StartAt,
 		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata), performerOrAgent(req.Performer), req.HumanReason,
@@ -609,11 +639,13 @@ func (r *Repo) UpdateTaskPlanned(ctx context.Context, req domain.UpdateTaskReque
 	   updated_at          = NOW()`
 	// A change to what the ticket is (name, description, acceptance
 	// criteria) re-plans it: the last plan approval no longer covers it.
+	// clock_timestamp(), not NOW(): NOW() is the transaction's start, which a
+	// long transaction could hold from before an approval it commits after.
 	query += `,
 	   planned_at = CASE WHEN ($1 != '' AND $1 IS DISTINCT FROM name)
 	                       OR ($7 AND description != '') OR ($2 != '' AND $2 IS DISTINCT FROM description)
 	                       OR ($8 AND acceptance_criteria != '') OR ($3 != '' AND $3 IS DISTINCT FROM acceptance_criteria)
-	                     THEN NOW() ELSE planned_at END`
+	                     THEN clock_timestamp() ELSE planned_at END`
 
 	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority,
 		clr("description"), clr("acceptance_criteria"), clr("assigned_to"), clr("agent_id")}
