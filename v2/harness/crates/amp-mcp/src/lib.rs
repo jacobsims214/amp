@@ -7,19 +7,29 @@
 //!   keeps the [`Catalog`] from `tools/list` under the server's cache hint; runs every call under a
 //!   120 s timeout; tracks [`Health`].
 //!
-//! M1-3 adds OAuth and the credential store. This crate must never depend on rpi (D1).
+//! - [`oauth`]: browser login (`login`/`logout`) and [`oauth::connect`], which picks `AMP_TOKEN`,
+//!   else a stored OAuth login (refreshed as needed), else no credentials (D3).
+//! - [`CredentialBackend`]: logins in the OS keychain keyed by server URL, or a 0600 file.
+//!
+//! This crate must never depend on rpi (D1).
 
 mod catalog;
 mod client;
+mod credentials;
 mod error;
 mod health;
 mod http;
+pub mod oauth;
 mod protocol;
 mod settings;
 
 pub use catalog::{Catalog, MAX_CATALOG_TTL, TtlSource};
 pub use client::{
     AmpMcpClient, ClientOptions, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, ServerSession,
+};
+pub use credentials::{
+    AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,
+    KEYCHAIN_SERVICE, credential_key, keychain_available,
 };
 pub use error::McpError;
 pub use health::Health;

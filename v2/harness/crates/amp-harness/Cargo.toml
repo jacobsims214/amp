@@ -16,6 +16,7 @@ amp-core.workspace = true
 amp-mcp.workspace = true
 amp-tui.workspace = true
 clap.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

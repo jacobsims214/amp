@@ -46,6 +46,13 @@ rmcp = { version = "=3.6.0", default-features = false, features = [
 
 clap = { version = "4.6", features = ["derive"] }
 
+# OAuth credential store (D3): OS keychain via keyring 4.x (macOS Keychain, Windows Credential Manager,
+# Secret Service on Linux), with a 0600 file fallback. rmcp's CredentialStore trait is #[async_trait].
+keyring = "4.2"
+async-trait = "0.1"
+# For the TokenResponse trait on rmcp's token type (rmcp does not re-export oauth2). Same version rmcp uses.
+oauth2 = { version = "5.0", default-features = false }
+
 # Shared runtime/util crates (amp-mcp and up).
 # reqwest must stay on rmcp's major (0.13) so our reqwest::Client is the type rmcp's transport takes.
 # rmcp's `reqwest` feature already turns on reqwest's rustls backend; features unify.
@@ -57,8 +64,10 @@ tokio = { version = "1", features = ["sync", "time"] }
 toml = "1"
 tracing = "0.1"
 
-# Test-only (in-process MCP servers, TLS fixtures).
+# Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
 axum = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
 rcgen = "0.14"
 time = "0.3"
 tokio-rustls = "0.26"
