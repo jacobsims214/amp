@@ -1270,12 +1270,9 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 400)
 				return
 			}
-			req.TaskID = taskID
-			replyCh := make(chan actor.ReplySimple, 1)
-			h.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-			reply := actor.Await(r.Context(), replyCh)
-			if reply.Err != nil {
-				jsonErr(w, reply.Err, 400)
+			// Off the web UI, a person's ticket isn't switched to agent work.
+			if err := h.svc.UpdateTask(r.Context(), pr, task, req); err != nil {
+				fail(w, err, 400)
 				return
 			}
 			updated, err := h.repo.GetTask(r.Context(), taskID)

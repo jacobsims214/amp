@@ -126,8 +126,12 @@ type MsgAssignTask struct {
 }
 
 type MsgUpdateTask struct {
-	Req     domain.UpdateTaskRequest
-	ReplyCh chan ReplySimple
+	Req domain.UpdateTaskRequest
+	// KeepHuman, when set, refuses (with this message) switching a person's
+	// ticket to agent work. The task actor checks it atomically with the
+	// update; a string so it survives remote encoding.
+	KeepHuman string
+	ReplyCh   chan ReplySimple
 }
 
 type MsgAddComment struct {

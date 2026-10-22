@@ -482,7 +482,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_update_task",
 		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, metadata, or who does "+
-			"it (performer: hand it to a person, or a person's ticket to agents) — pass only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
+			"it (performer: hand it to a person; turning a person's ticket into agent work is done by a person in the AMP web UI, "+
+			"and is refused here with the ticket's link) — pass only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
 			"amp_move_task; to schedule it, amp_set_task_start_at. Its creator, its owner, and team leads can change it.",
 		props{
 			"task_id":             num("REQUIRED. Task ID."),
@@ -493,7 +494,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
-			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress."),
+			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress. 'human' -> 'agent' only in the AMP web UI."),
 			"human_reason":        str("Why a person does it. " + humanReasonList() + "."),
 			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
@@ -1625,11 +1626,8 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Changing a ticket's text is planning: its creator, owner, and leads may.
-	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskPlan); err != nil {
-		return nil, err
-	}
-	// Route via repo lookup then actor.
-	task, err := s.repo.GetTask(context.Background(), taskID)
+	p := caller(rctx).p
+	task, _, err := s.svc.LoadTask(rctx, p, taskID, authz.TaskPlan)
 	if err != nil {
 		return nil, err
 	}
@@ -1652,15 +1650,9 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
 	}
-	replyCh := make(chan ReplySimple, 1)
-	pid, err := s.registry.Get(task.ProjectID)
-	if err != nil {
+	// A person's ticket isn't switched to agent work off the web UI.
+	if err := s.svc.UpdateTask(rctx, p, task, req); err != nil {
 		return nil, err
-	}
-	s.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-	reply := actor.Await(rctx, replyCh)
-	if reply.Err != nil {
-		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "updated": true})
 }

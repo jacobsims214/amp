@@ -212,8 +212,9 @@ func TestHuman_SwitchingAndRules(t *testing.T) {
 	if msg := alice.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(id), "human_reason": "vibes"}); !strings.Contains(msg, "human_reason must be one of") {
 		t.Fatalf("bad reason: %q", msg)
 	}
-	// Back to agents, then started by one: no switching mid-work.
-	alice.call(t, "amp_update_task", map[string]any{"task_id": float64(id), "performer": "agent"})
+	// Back to agents (a person, in the web UI: see TestHumanTicketsBecomeAgentWorkOnlyInTheUI),
+	// then started by one: no switching mid-work.
+	newRestAs(t, w).want(t, 200, "alice", http.MethodPatch, fmt.Sprintf("/api/tasks/%d", id), map[string]any{"performer": "agent"})
 	if tk := humanTask(t, alice, id); tk["performer"] != "agent" || tk["human_reason"] != nil {
 		t.Fatalf("back to agent: %v", tk)
 	}

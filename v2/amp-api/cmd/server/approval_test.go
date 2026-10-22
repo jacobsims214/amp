@@ -356,3 +356,52 @@ func TestApprovePlanPublishesProjectUpdated(t *testing.T) {
 		t.Fatalf("refused approvals published %d events", n)
 	}
 }
+
+// A person's ticket becomes agent work only in the web UI. Otherwise an agent
+// could flip it to agent work, dispatch it and complete it: the person's
+// merge or sign-off marked done without them (PR #77 review, ticket #2189).
+// Agent work may still become a person's ticket from anywhere.
+func TestHumanTicketsBecomeAgentWorkOnlyInTheUI(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	bob := w.s.as(w.bob)
+	_, review, _ := humanChain(t, w)
+	link := fmt.Sprintf("/project/%d/board?task=%d", w.s.projectID, review)
+	path := fmt.Sprintf("/api/tasks/%d", review)
+	stillHuman := func(when string) {
+		t.Helper()
+		tk := humanTask(t, bob, review)
+		if tk["performer"] != "human" || tk["human_reason"] != "review" || tk["name"] != "Review and merge the quotes PR" {
+			t.Fatalf("%s: ticket changed: %v", when, tk)
+		}
+	}
+
+	// The person's own agent, over MCP: refused with the ticket link, nothing
+	// changes (not even the other fields in the same call).
+	wantErr(t, bob.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(review), "performer": "agent", "name": "renamed"}),
+		"web UI", link)
+	stillHuman("MCP")
+	// Case and spacing don't get around it.
+	wantErr(t, bob.callExpectError(t, "amp_update_task", map[string]any{"task_id": float64(review), "performer": " Agent "}), "web UI")
+	stillHuman("MCP, mixed case")
+	// REST off the UI (API token, a non-UI Dex token): 403 with the link.
+	for _, ch := range []string{auth.ChannelToken, auth.ChannelRESTOther} {
+		code, out := ra.doVia(t, ch, "bob", http.MethodPatch, path, map[string]any{"performer": "agent"})
+		if code != 403 || !strings.Contains(fmt.Sprint(out), link) {
+			t.Fatalf("REST %s switching a human ticket to agent: %d %v, want 403 with %s", ch, code, out, link)
+		}
+		stillHuman("REST " + ch)
+	}
+	// Other edits to a person's ticket still work over MCP.
+	bob.call(t, "amp_update_task", map[string]any{"task_id": float64(review), "description": "Merge once CI is green", "human_reason": "review"})
+	stillHuman("MCP edit")
+
+	// The person, in the web UI, may hand it to agents.
+	out := ra.want(t, 200, "bob", http.MethodPatch, path, map[string]any{"performer": "agent"})
+	if tk := out["task"].(map[string]any); tk["performer"] != "agent" {
+		t.Fatalf("UI switch to agent: %v", tk)
+	}
+	// And agent work may become a person's ticket over MCP.
+	bob.call(t, "amp_update_task", map[string]any{"task_id": float64(review), "performer": "human", "human_reason": "review"})
+	stillHuman("back to human over MCP")
+}
