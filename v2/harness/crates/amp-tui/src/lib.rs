@@ -23,8 +23,8 @@
 //!
 //! - [`overlay`] and [`amp_render`] (M3-4 #2108): the AMP slash commands' panels (`/amp`,
 //!   `/ticket`, `/workers`, `/questions`, `/plan`, `/project`; `/open` opens the browser), `amp_*`
-//!   tool calls titled `AMP · complete_task #2078`, and the transcript marker when the current
-//!   ticket changes.
+//!   tool calls titled `complete_task #2078` with a one-line human summary (#2183), and the
+//!   transcript marker when the current ticket changes.
 //!
 //! - [`transcript`] and [`wrap`] (#2176): the transcript's components, word-wrapped (rpi-tui
 //!   0.8.0's own break lines mid-word).

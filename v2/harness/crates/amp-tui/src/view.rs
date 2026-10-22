@@ -19,8 +19,9 @@
 //! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
 //! render nothing until [`ChatView::chrome`] has a metadata source.
 //!
-//! `amp_*` tool calls are titled `AMP · complete_task #2078` with a compact result
-//! ([`crate::amp_render`]).
+//! Tool calls are one line each (#2183): `✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms`,
+//! `amp_*` ones titled and summarised by [`crate::amp_render`]. Consecutive calls share one
+//! [`ToolGroup`]; Ctrl+O shows every call's arguments and result ([`ChatView::toggle_tools`]).
 //!
 //! The transcript's entries are [`crate::transcript`]'s components, which look like pi's but
 //! word-wrap (#2176): rpi-tui 0.8.0's own components break lines mid-word.
@@ -37,7 +38,9 @@ use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::overlay::Panel;
 use crate::slash::CommandMenu;
-use crate::transcript::{AssistantBlock, Block, ThinkingDisplay, ToolBlock, UserBlock, WrapText};
+use crate::transcript::{
+    AssistantBlock, Block, ThinkingDisplay, ToolBlock, ToolDisplay, ToolGroup, UserBlock, WrapText,
+};
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
@@ -85,6 +88,10 @@ pub struct ChatView {
     assistant: Option<Arc<AssistantBlock>>,
     /// Running tool calls by id.
     tools: HashMap<String, Arc<ToolBlock>>,
+    /// The tool group the next call joins, while nothing visible has followed it (#2183).
+    group: Mutex<Option<OpenGroup>>,
+    /// Collapsed or expanded tool calls (Ctrl+O), shared by every call.
+    tool_display: Arc<ToolDisplay>,
     /// The retry indicator in the status slot, if one is shown.
     retry: Option<Arc<StatusIndicator>>,
     /// How thinking shows (`[tui] show_thinking`, #2177).
@@ -165,6 +172,8 @@ impl ChatView {
             root: Arc::new(root),
             assistant: None,
             tools: HashMap::new(),
+            group: Mutex::new(None),
+            tool_display: Arc::new(ToolDisplay::default()),
             retry: None,
             show_thinking: ThinkingDisplay::default(),
             last_thinking: None,
@@ -186,6 +195,50 @@ impl ChatView {
     /// else whether it is now expanded.
     pub fn toggle_thinking(&self) -> Option<bool> {
         self.last_thinking.as_ref()?.toggle_thinking()
+    }
+
+    /// Expands or collapses every tool call's details (Ctrl+O, #2183); returns whether they are
+    /// now expanded.
+    pub fn toggle_tools(&self) -> bool {
+        let expanded = self.tool_display.toggle();
+        self.transcript.invalidate();
+        expanded
+    }
+
+    /// Whether tool calls show their details.
+    pub fn tools_expanded(&self) -> bool {
+        self.tool_display.is_expanded()
+    }
+
+    /// Something visible went into the transcript: the next tool call starts a new group, below
+    /// it.
+    fn end_group(&self) {
+        *self.group.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// The group a new call joins: the open one if every assistant message since it shows
+    /// nothing (a message that only called tools, or hidden thinking), else a new one.
+    fn tool_group(&self) -> Arc<ToolGroup> {
+        let mut open = self.group.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(g) = open.as_ref()
+            && g.after.iter().all(|a| a.render(200).is_empty())
+        {
+            return Arc::clone(&g.group);
+        }
+        let group = Arc::new(ToolGroup::new(Arc::clone(&self.tool_display)));
+        self.transcript.add_child(group.clone());
+        *open = Some(OpenGroup {
+            group: Arc::clone(&group),
+            after: Vec::new(),
+        });
+        group
+    }
+
+    /// Adds a tool call to the transcript, in the open group.
+    fn add_tool(&self, name: &str, args: &serde_json::Value) -> Arc<ToolBlock> {
+        let call = new_tool(name, args, Arc::clone(&self.tool_display));
+        self.tool_group().push(Arc::clone(&call));
+        call
     }
 
     /// The layout root to hand to the TUI.
@@ -218,6 +271,7 @@ impl ChatView {
 
     /// Adds a component to the transcript (the ticket marker).
     pub fn add_to_transcript(&self, component: Arc<dyn Component>) {
+        self.end_group();
         self.transcript.add_child(component);
     }
 
@@ -245,6 +299,7 @@ impl ChatView {
         if lines.is_empty() {
             return;
         }
+        self.end_group();
         let colors = theme().colors;
         let mut text = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
@@ -259,11 +314,13 @@ impl ChatView {
     }
 
     pub fn add_user(&self, text: &str) {
+        self.end_group();
         self.transcript.add_child(Arc::new(UserBlock::new(text)));
     }
 
     /// A dim one-off line in the transcript (command output, run outcome).
     pub fn add_notice(&self, text: &str) {
+        self.end_group();
         let colors = theme().colors;
         self.transcript
             .add_child(Arc::new(WrapText::new(colors.dim.fg(text), 1, 1)));
@@ -271,6 +328,7 @@ impl ChatView {
 
     /// An error line in the transcript.
     pub fn add_error(&self, text: &str) {
+        self.end_group();
         let colors = theme().colors;
         self.transcript
             .add_child(Arc::new(WrapText::new(colors.error.fg(text), 1, 1)));
@@ -381,9 +439,8 @@ impl ChatView {
                 tool_name,
                 args,
             } => {
-                let component = new_tool(tool_name, args);
+                let component = self.add_tool(tool_name, args);
                 component.set_running();
-                self.transcript.add_child(component.clone());
                 self.tools.insert(tool_call_id.clone(), component);
             }
             AgentEvent::ToolExecutionEnd {
@@ -394,17 +451,19 @@ impl ChatView {
             } => {
                 let component = match self.tools.remove(tool_call_id) {
                     Some(c) => c,
-                    None => {
-                        let c = new_tool(tool_name, &serde_json::Value::Null);
-                        self.transcript.add_child(c.clone());
-                        c
-                    }
+                    None => self.add_tool(tool_name, &serde_json::Value::Null),
                 };
                 let text = tool_result_text(result);
                 if amp_render::is_amp_tool(tool_name) {
-                    component.set_result(&amp_render::result_text(&text, *is_error), *is_error);
+                    let summary = amp_render::result_summary(tool_name, &text, *is_error);
+                    let detail = if *is_error {
+                        amp_render::error_text(&text).to_owned()
+                    } else {
+                        pretty_json(&text)
+                    };
+                    component.set_result(&summary, &detail, *is_error);
                 } else {
-                    component.set_result(&text, *is_error);
+                    component.set_result(&output_summary(&text), &text, *is_error);
                 }
             }
             AgentEvent::RetryScheduled {
@@ -465,6 +524,17 @@ impl ChatView {
     fn start_assistant(&mut self) -> Arc<AssistantBlock> {
         let component = Arc::new(AssistantBlock::with_thinking(self.show_thinking));
         self.transcript.add_child(component.clone());
+        // It goes below the open tool group; if it shows anything, the next call starts a new
+        // group under it.
+        if let Some(g) = self
+            .group
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            component.set_gap_above();
+            g.after.push(Arc::clone(&component));
+        }
         self.assistant = Some(component.clone());
         component
     }
@@ -535,16 +605,51 @@ impl Component for EditorView {
     }
 }
 
-/// A tool block: `AMP · complete_task #2078` plus a short argument summary for `amp_*` tools;
-/// the tool's name and its main argument (path, pattern, command, ...) for others.
-fn new_tool(name: &str, args: &serde_json::Value) -> Arc<ToolBlock> {
-    if amp_render::is_amp_tool(name) {
-        Arc::new(ToolBlock::new(
+/// The open tool group and the assistant messages added after it.
+struct OpenGroup {
+    group: Arc<ToolGroup>,
+    after: Vec<Arc<AssistantBlock>>,
+}
+
+/// A tool line: `complete_task #2078` plus a short argument summary for `amp_*` tools; the
+/// tool's name and its main argument (path, pattern, command, ...) for others.
+fn new_tool(name: &str, args: &serde_json::Value, display: Arc<ToolDisplay>) -> Arc<ToolBlock> {
+    let call = if amp_render::is_amp_tool(name) {
+        ToolBlock::with_display(
             amp_render::tool_title(name, args),
             amp_render::tool_summary(args),
-        ))
+            display,
+        )
     } else {
-        Arc::new(ToolBlock::new(name, tool_summary(args)))
+        ToolBlock::with_display(name, tool_summary(args), display)
+    };
+    if args.as_object().is_some_and(|o| !o.is_empty()) {
+        call.set_args_detail(clean(&args.to_string()));
+    }
+    Arc::new(call)
+}
+
+/// An AMP result for the expanded view: its JSON pretty-printed, or the text as is.
+fn pretty_json(text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(text.trim())
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| text.to_owned())
+}
+
+/// A non-AMP tool's result in one line: a short single line as is, else its line count
+/// (`120 lines`); empty output says `no output`.
+fn output_summary(text: &str) -> String {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    match lines.as_slice() {
+        [] => "no output".to_owned(),
+        [one] if one.trim().is_empty() => "no output".to_owned(),
+        [one] if rpi_tui::visible_width(one.trim()) <= 60 => clean(one),
+        _ => format!(
+            "{} line{}",
+            lines.len(),
+            if lines.len() == 1 { "" } else { "s" }
+        ),
     }
 }
 

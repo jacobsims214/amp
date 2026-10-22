@@ -93,9 +93,8 @@ async fn the_chat_talks_to_the_manager() {
     for text in [
         "who am I?",
         "Checking who you are.",
-        // M3-4 (#2108): AMP tools are titled the web UI's way, with a compact result.
-        "✓ AMP · whoami",
-        "email: local-dev@example.com",
+        // M3-4 (#2108): AMP tools are titled the web UI's way; #2183: one line, a human summary.
+        "✓ whoami · local-dev@example.com · 1 org",
         "You are local-dev.",
         "are you still there?",
         "Still here, same conversation.",

@@ -489,7 +489,13 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T expands (or collapses
-  again) the last thinking section.
+  again) the last thinking section; Ctrl+O shows (or hides) every tool call's arguments and result.
+- Tool calls (#2183) are one line each: `✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms`.
+  AMP calls get a sentence for what they did (the contract tools, `kb_search` and `create_tasks`;
+  any other falls back to the result's `key: value` list), durations under a second are in ms,
+  and consecutive calls share one block (more than five fold their earliest successful ones into
+  `✓ 4 calls · get_task ×3, list_tasks`). Only running and failed calls keep the tinted surface,
+  and a failed call shows its error under it.
 - Thinking (#2177) is collapsed by default: one dim line per section, `Thinking · 18s ▸`, which
   shows the model's latest sentence while it thinks and stops its timer when the answer starts.
   Expanded (Ctrl+T, or `show_thinking = "full"`), it is plain dim text behind a `│` gutter, with no

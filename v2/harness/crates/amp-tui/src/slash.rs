@@ -179,6 +179,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
     ("Ctrl+D", "quit (with an empty editor)"),
     ("Ctrl+T", "show or hide the last thinking"),
+    ("Ctrl+O", "show or hide tool call details"),
 ];
 
 /// The command named `name` (or one of its aliases).

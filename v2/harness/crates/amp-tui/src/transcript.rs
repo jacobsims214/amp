@@ -16,8 +16,9 @@
 //! - [`ThinkingBlock`]: a thinking section, collapsed to one live `Thinking · 18s ▸` line by
 //!   default (#2177); expanded, plain dim text behind a `│` gutter ([`ThinkingDisplay`]).
 //! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers.
-//! - [`ToolBlock`]: a tool call on pi's tool panel (status glyph, title, summary, elapsed,
-//!   result preview), with the header and result word-wrapped.
+//! - [`ToolBlock`]: a tool call on one line (status glyph, title, argument, the result's
+//!   summary, `12 ms`), its details under it when expanded (Ctrl+O, [`ToolDisplay`]); a failed
+//!   call shows its error. [`ToolGroup`] holds consecutive calls as one block (#2183).
 
 use std::{
     any::Any,
@@ -34,7 +35,7 @@ use rpi_tui::{
 };
 
 use crate::table;
-use crate::wrap::{open_sgr as open_style, plain, reflow_row, wrap};
+use crate::wrap::{open_sgr as open_style, plain, reflow_row};
 
 /// The width prose is rendered at before it is word-wrapped: wide enough that rpi never wraps.
 const UNBOUNDED: usize = 1 << 20;
@@ -655,6 +656,8 @@ pub struct AssistantBlock {
     /// One per thinking section, kept across rebuilds (they hold its timer and expansion).
     thinking: Mutex<Vec<Arc<ThinkingBlock>>>,
     finished: AtomicBool,
+    /// It follows a tool group: a blank row above it when it shows anything (#2183).
+    gap_above: AtomicBool,
 }
 
 impl Default for AssistantBlock {
@@ -678,6 +681,7 @@ impl AssistantBlock {
             display,
             thinking: Mutex::new(Vec::new()),
             finished: AtomicBool::new(false),
+            gap_above: AtomicBool::new(false),
         }
     }
 
@@ -689,6 +693,12 @@ impl AssistantBlock {
             *b = blocks.to_vec();
         }
         self.rebuild(blocks);
+    }
+
+    /// It comes right after a tool group: a blank row separates them when it shows anything
+    /// (the group itself ends at its last call, #2183).
+    pub fn set_gap_above(&self) {
+        self.gap_above.store(true, Ordering::Relaxed);
     }
 
     /// The message is complete: its thinking stops its timers.
@@ -801,7 +811,13 @@ impl AssistantBlock {
 
 impl Component for AssistantBlock {
     fn render(&self, width: usize) -> Vec<String> {
-        self.content.render(width)
+        let mut rows = self.content.render(width);
+        if self.gap_above.load(Ordering::Relaxed)
+            && rows.first().is_some_and(|r| !r.trim().is_empty())
+        {
+            rows.insert(0, String::new());
+        }
+        rows
     }
 
     fn invalidate(&self) {
@@ -884,39 +900,102 @@ pub enum ToolState {
     Failed,
 }
 
-/// Result rows shown under a tool's header (pi's collapsed preview).
+/// Result rows shown under an expanded call (pi's preview).
 const RESULT_PREVIEW_LINES: usize = 12;
+/// Error rows shown under a failed call while collapsed.
+const ERROR_PREVIEW_LINES: usize = 4;
+/// A group longer than this folds its earliest successful calls into one line.
+const GROUP_FOLD_AFTER: usize = 5;
+/// The calls a folded group still shows one by one, at its end.
+const GROUP_KEEP_LAST: usize = 3;
+
+/// How tool calls show, shared by every call in the transcript: one line each (the default), or
+/// with their arguments and result (Ctrl+O, pi's `app.tools.expand`).
+#[derive(Debug, Default)]
+pub struct ToolDisplay {
+    expanded: AtomicBool,
+}
+
+impl ToolDisplay {
+    pub fn is_expanded(&self) -> bool {
+        self.expanded.load(Ordering::Relaxed)
+    }
+
+    /// Flips expanded/collapsed; returns whether calls are now expanded.
+    pub fn toggle(&self) -> bool {
+        !self.expanded.fetch_xor(true, Ordering::Relaxed)
+    }
+}
 
 struct ToolInner {
     title: String,
-    summary: String,
+    /// The call's most telling argument (one line), shown muted after the title.
+    args: String,
+    /// The call's whole arguments (compact JSON), shown when expanded.
+    args_detail: String,
     state: ToolState,
     started: Option<Instant>,
     finished: Option<Instant>,
-    result: Option<String>,
+    /// What the result says, in one line (`3 tickets: 1 ready, 1 waiting`).
+    summary: String,
+    /// The result itself: the error's text, or what the expanded view shows.
+    detail: Option<String>,
 }
 
-/// A tool call on pi's tool panel: `✓ title summary 1.2s ▸` and up to 12 result rows behind a
-/// `│` gutter, on the status-tinted background, word-wrapped.
+/// A tool call's rendered rows, for (width, theme revision, expanded).
+type ToolRows = (usize, u64, bool, Vec<String>);
+
+/// One tool call, on one line (#2183):
+///
+/// ```text
+///  ✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms
+///  ● get_task #67 · 2s                                  (running: on the pending surface)
+///  ✗ complete_task #2078                                (failed: on the error surface,
+///    │ the plan was last approved before #2078 …         with the error under it)
+/// ```
+///
+/// Expanded ([`ToolDisplay`], Ctrl+O), the arguments and up to 12 result rows follow behind a
+/// `│` gutter, word-wrapped. Calls in a row share one [`ToolGroup`].
 pub struct ToolBlock {
     inner: Mutex<ToolInner>,
-    cache: Cache,
+    display: Arc<ToolDisplay>,
+    cache: Mutex<Option<ToolRows>>,
 }
 
 impl ToolBlock {
-    /// `title` is shown bold; `summary` is the call's most telling argument (one line).
-    pub fn new(title: impl Into<String>, summary: impl Into<String>) -> Self {
+    /// `title` is shown bold; `args` is the call's most telling argument (one line).
+    pub fn new(title: impl Into<String>, args: impl Into<String>) -> Self {
+        Self::with_display(title, args, Arc::new(ToolDisplay::default()))
+    }
+
+    /// A call that expands and collapses with `display` (the transcript's, shared).
+    pub fn with_display(
+        title: impl Into<String>,
+        args: impl Into<String>,
+        display: Arc<ToolDisplay>,
+    ) -> Self {
         Self {
             inner: Mutex::new(ToolInner {
                 title: title.into(),
-                summary: summary.into(),
+                args: args.into(),
+                args_detail: String::new(),
                 state: ToolState::Pending,
                 started: None,
                 finished: None,
-                result: None,
+                summary: String::new(),
+                detail: None,
             }),
-            cache: Cache::default(),
+            display,
+            cache: Mutex::new(None),
         }
+    }
+
+    /// The whole arguments, shown when expanded.
+    pub fn set_args_detail(&self, detail: impl Into<String>) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.args_detail = detail.into();
+        }
+        self.clear_cache();
     }
 
     pub fn set_running(&self) {
@@ -924,12 +1003,15 @@ impl ToolBlock {
             i.state = ToolState::Running;
             i.started = Some(Instant::now());
         }
-        self.cache.clear();
+        self.clear_cache();
     }
 
-    pub fn set_result(&self, result: &str, is_error: bool) {
+    /// The call ended: `summary` goes on its line, `detail` (the result, or the error) under it
+    /// when expanded, and always for an error.
+    pub fn set_result(&self, summary: &str, detail: &str, is_error: bool) {
         if let Ok(mut i) = self.inner.lock() {
-            i.result = Some(result.to_owned());
+            i.summary = summary.to_owned();
+            i.detail = Some(detail.to_owned());
             i.state = if is_error {
                 ToolState::Failed
             } else {
@@ -937,7 +1019,7 @@ impl ToolBlock {
             };
             i.finished = Some(Instant::now());
         }
-        self.cache.clear();
+        self.clear_cache();
     }
 
     pub fn state(&self) -> ToolState {
@@ -947,101 +1029,211 @@ impl ToolBlock {
             .unwrap_or(ToolState::Pending)
     }
 
-    fn render_panel(&self, width: usize) -> Vec<String> {
+    /// The tool's name (the title's first word): what a folded group counts.
+    fn kind(&self) -> String {
+        self.inner
+            .lock()
+            .map(|i| i.title.split_whitespace().next().unwrap_or("").to_owned())
+            .unwrap_or_default()
+    }
+
+    /// How long the call took, once it has ended.
+    fn took(&self) -> Option<Duration> {
+        let i = self.inner.lock().ok()?;
+        Some(i.finished?.duration_since(i.started?))
+    }
+
+    fn clear_cache(&self) {
+        if let Ok(mut c) = self.cache.lock() {
+            *c = None;
+        }
+    }
+
+    /// The call's rows: its line, then its error or (expanded) its details.
+    pub fn rows(&self, width: usize) -> Vec<String> {
+        let expanded = self.display.is_expanded();
+        // A running call's timer changes every frame; a finished one is fixed.
+        if self.state() == ToolState::Running {
+            return self.render_rows(width, expanded);
+        }
+        let revision = theme_revision();
+        if let Ok(c) = self.cache.lock()
+            && let Some((w, r, e, rows)) = c.as_ref()
+            && (*w, *r, *e) == (width, revision, expanded)
+        {
+            return rows.clone();
+        }
+        let rows = self.render_rows(width, expanded);
+        if let Ok(mut c) = self.cache.lock() {
+            *c = Some((width, revision, expanded, rows.clone()));
+        }
+        rows
+    }
+
+    fn render_rows(&self, width: usize, expanded: bool) -> Vec<String> {
         let Ok(inner) = self.inner.lock() else {
             return Vec::new();
         };
-        let t = theme();
-        let colors = t.colors;
+        let colors = theme().colors;
         let width = width.max(1);
         let (icon, icon_color, bg) = match inner.state {
-            ToolState::Pending => ("●", colors.muted, colors.tool_pending_bg),
-            ToolState::Running => ("●", colors.accent, colors.tool_pending_bg),
-            ToolState::Completed => ("✓", colors.success, colors.tool_success_bg),
-            ToolState::Failed => ("✗", colors.error, colors.tool_error_bg),
+            ToolState::Pending => ("●", colors.muted, Some(colors.tool_pending_bg)),
+            ToolState::Running => ("●", colors.accent, Some(colors.tool_pending_bg)),
+            ToolState::Completed => ("✓", colors.success, None),
+            ToolState::Failed => ("✗", colors.error, Some(colors.tool_error_bg)),
         };
-        // pi's ToolPanel insets.
-        let padding_x = t.spacing.tool_panel_padding_x.min((width - 1) / 2);
-        let content_width = width - padding_x * 2;
-        let pad = " ".repeat(padding_x);
-        let line = |content: &str| {
-            let content = truncate_to_width(content, content_width, "");
-            apply_background_to_line(&format!("{pad}{content}"), width, |s| bg.bg(s))
+        // The surface colour only where it means something: running and failed calls.
+        let paint = |content: &str| {
+            let content = truncate_to_width(content, width, "");
+            match bg {
+                Some(bg) => apply_background_to_line(&content, width, |s| bg.bg(s)),
+                None => content,
+            }
         };
-
-        // pi's top spacer, then the panel's own vertical padding.
-        let mut lines = vec![String::new()];
-        lines.extend(std::iter::repeat_n(
-            line(""),
-            t.spacing.tool_panel_padding_y,
-        ));
 
         let elapsed = match (inner.state, inner.started, inner.finished) {
-            (ToolState::Running, Some(s), _) => format_elapsed(s.elapsed()),
+            (ToolState::Running, Some(s), _) => running_elapsed(s.elapsed()),
             (ToolState::Completed | ToolState::Failed, Some(s), Some(f)) => {
                 format_elapsed(f.duration_since(s))
             }
             _ => String::new(),
         };
-        let mut head = vec![colors.tool_title.fg(&bold(&inner.title))];
-        if !inner.summary.is_empty() {
-            head.push(colors.tool_output.fg(&inner.summary));
-        }
-        if !elapsed.is_empty() {
-            head.push(colors.muted.fg(&elapsed));
-        }
-        head.push(colors.muted.fg("▸"));
-        // Continuation rows of a long header hang under the title, after the status glyph.
-        let glyph = icon_color.fg(icon);
-        // (A panel too narrow for the hang truncates its rows, as pi's does.)
-        let hang = 2.min(content_width.saturating_sub(1));
-        for (i, row) in wrap(&head.join(" "), content_width - hang)
-            .iter()
-            .enumerate()
-        {
-            let row = if i == 0 {
-                format!("{glyph} {row}")
-            } else {
-                format!("{}{row}", " ".repeat(hang))
-            };
-            lines.push(line(&row));
-        }
+        let summary = match inner.state {
+            // A failed call's error is under it, whole.
+            ToolState::Completed => inner.summary.as_str(),
+            _ => "",
+        };
+        let mut rows = vec![paint(&tool_line(
+            &ToolLine {
+                glyph: &icon_color.fg(icon),
+                title: &inner.title,
+                args: &inner.args,
+                summary,
+                elapsed: &elapsed,
+            },
+            width,
+        ))];
 
-        if let Some(result) = &inner.result {
-            let gutter = content_width > 2;
-            let body_width = content_width - if gutter { 2 } else { 0 };
-            let rows: Vec<String> = result
+        // Rows behind a `│` gutter under the line, indented to the title.
+        let gutter_rows = |text: &str, limit: usize, style: &dyn Fn(&str) -> String| {
+            let indent = 3.min(width.saturating_sub(1));
+            let body_width = width.saturating_sub(indent + 2).max(1);
+            let all: Vec<String> = text
                 .replace("\r\n", "\n")
                 .replace('\r', "\n")
                 .split('\n')
                 .flat_map(|l| wrap_lines(&plain(l), "", body_width))
                 .collect();
-            for row in rows.iter().take(RESULT_PREVIEW_LINES) {
-                let row = if gutter {
-                    format!("{} {}", colors.dim.fg("│"), colors.tool_output.fg(row))
-                } else {
-                    colors.tool_output.fg(row)
-                };
-                lines.push(line(&row));
-            }
-            let hidden = rows.len().saturating_sub(RESULT_PREVIEW_LINES);
+            let mut out: Vec<String> = all
+                .iter()
+                .take(limit)
+                .map(|row| {
+                    format!(
+                        "{}{} {}",
+                        " ".repeat(indent),
+                        colors.dim.fg("│"),
+                        style(row)
+                    )
+                })
+                .collect();
+            let hidden = all.len().saturating_sub(limit);
             if hidden > 0 {
-                let hint = format!("… {hidden} more line{}", if hidden == 1 { "" } else { "s" });
-                lines.push(line(&colors.muted.fg(&hint)));
+                let hint = format!(
+                    "… {hidden} more line{}{}",
+                    if hidden == 1 { "" } else { "s" },
+                    if expanded { "" } else { " (Ctrl+O)" }
+                );
+                out.push(format!("{}{}", " ".repeat(indent), colors.muted.fg(&hint)));
+            }
+            out
+        };
+        let output = |s: &str| colors.tool_output.fg(s);
+        let error = |s: &str| colors.error.fg(s);
+        if expanded && !inner.args_detail.is_empty() {
+            for row in gutter_rows(&inner.args_detail, 4, &|s| colors.muted.fg(s)) {
+                rows.push(paint(&row));
             }
         }
-        lines.extend(std::iter::repeat_n(
-            line(""),
-            t.spacing.tool_panel_padding_y,
-        ));
-        lines
+        match (&inner.detail, inner.state, expanded) {
+            (Some(detail), ToolState::Failed, _) => {
+                let limit = if expanded {
+                    RESULT_PREVIEW_LINES
+                } else {
+                    ERROR_PREVIEW_LINES
+                };
+                for row in gutter_rows(detail, limit, &error) {
+                    rows.push(paint(&row));
+                }
+            }
+            (Some(detail), _, true) if !detail.trim().is_empty() => {
+                for row in gutter_rows(detail, RESULT_PREVIEW_LINES, &output) {
+                    rows.push(paint(&row));
+                }
+            }
+            _ => {}
+        }
+        rows
     }
 }
 
-/// pi's elapsed format: `0.4s`, `12.0s`, `1m5s`.
-fn format_elapsed(d: Duration) -> String {
+/// The parts of a tool line, plain text but for the glyph.
+struct ToolLine<'a> {
+    glyph: &'a str,
+    title: &'a str,
+    args: &'a str,
+    summary: &'a str,
+    elapsed: &'a str,
+}
+
+/// ` ✓ title args · summary · 12 ms`, fitted to `width`: the arguments give way first (down to
+/// a third of the room), then the summary; the title and the duration stay whole when they can.
+fn tool_line(l: &ToolLine, width: usize) -> String {
+    let colors = theme().colors;
+    let w = rpi_tui::visible_width;
+    // ` ✓ ` + title.
+    let title = crate::chrome::shorten(l.title, width.saturating_sub(3).max(1));
+    let mut room = width.saturating_sub(3 + w(&title));
+    let elapsed = if !l.elapsed.is_empty() && room >= 3 + w(l.elapsed) {
+        room -= 3 + w(l.elapsed);
+        l.elapsed
+    } else {
+        ""
+    };
+    let arg_need = if l.args.is_empty() { 0 } else { 1 + w(l.args) };
+    let sum_need = if l.summary.is_empty() {
+        0
+    } else {
+        3 + w(l.summary)
+    };
+    let (arg_room, sum_room) = if arg_need + sum_need <= room {
+        (arg_need, sum_need)
+    } else {
+        let arg_cap = arg_need.min(room / 3);
+        let sum_room = room.saturating_sub(arg_cap).min(sum_need);
+        (room - sum_room, sum_room)
+    };
+    let mut line = format!(" {} {}", l.glyph, colors.tool_title.fg(&bold(&title)));
+    if arg_room > 2 {
+        let args = crate::chrome::shorten(l.args, arg_room - 1);
+        line.push_str(&format!(" {}", colors.muted.fg(&args)));
+    }
+    let sep = colors.dim.fg(" · ");
+    if sum_room > 4 {
+        let summary = crate::chrome::shorten(l.summary, sum_room - 3);
+        line.push_str(&format!("{sep}{}", colors.tool_output.fg(&summary)));
+    }
+    if !elapsed.is_empty() {
+        line.push_str(&format!("{sep}{}", colors.dim.fg(elapsed)));
+    }
+    line
+}
+
+/// A finished call's duration: `12 ms` under a second (#2183), then `1.2s`, `1m5s`.
+pub fn format_elapsed(d: Duration) -> String {
     let secs = d.as_secs_f64();
-    if secs < 60.0 {
+    if secs < 1.0 {
+        format!("{} ms", d.as_millis())
+    } else if secs < 60.0 {
         format!("{secs:.1}s")
     } else {
         format!(
@@ -1052,17 +1244,139 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
+/// A running call's timer: nothing for the first second (most AMP calls are done by then), then
+/// whole seconds.
+fn running_elapsed(d: Duration) -> String {
+    match d.as_secs() {
+        0 => String::new(),
+        s if s < 60 => format!("{s}s"),
+        s => format!("{}m{}s", s / 60, s % 60),
+    }
+}
+
 impl Component for ToolBlock {
+    /// A call on its own: a blank row, then its rows (in the transcript, calls sit in a
+    /// [`ToolGroup`]).
     fn render(&self, width: usize) -> Vec<String> {
-        // A running call's timer changes every frame; a finished one is fixed.
-        if self.state() == ToolState::Running {
-            return self.render_panel(width);
-        }
-        self.cache.get_or(width, || self.render_panel(width))
+        let mut rows = vec![String::new()];
+        rows.extend(self.rows(width));
+        rows
     }
 
     fn invalidate(&self) {
-        self.cache.clear();
+        self.clear_cache();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Consecutive tool calls as one block (#2183): a blank row, then one line per call. A group
+/// longer than [`GROUP_FOLD_AFTER`] calls folds its earliest successful ones into one line
+/// (`✓ 4 calls · get_task ×3, list_tasks · 140 ms`) unless calls are expanded; failed and running
+/// calls are never folded.
+pub struct ToolGroup {
+    calls: Mutex<Vec<Arc<ToolBlock>>>,
+    display: Arc<ToolDisplay>,
+}
+
+impl ToolGroup {
+    pub fn new(display: Arc<ToolDisplay>) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            display,
+        }
+    }
+
+    pub fn push(&self, call: Arc<ToolBlock>) {
+        if let Ok(mut c) = self.calls.lock() {
+            c.push(call);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.calls.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The folded calls' line: `✓ 4 calls · get_task ×3, list_tasks · 140 ms`.
+    fn folded_line(calls: &[&Arc<ToolBlock>], width: usize) -> String {
+        let mut kinds: Vec<(String, usize)> = Vec::new();
+        let mut took = Duration::ZERO;
+        for call in calls {
+            let kind = call.kind();
+            match kinds.iter_mut().find(|(k, _)| *k == kind) {
+                Some((_, n)) => *n += 1,
+                None => kinds.push((kind, 1)),
+            }
+            took += call.took().unwrap_or_default();
+        }
+        let names: Vec<String> = kinds
+            .iter()
+            .map(|(k, n)| {
+                if *n > 1 {
+                    format!("{k} ×{n}")
+                } else {
+                    k.clone()
+                }
+            })
+            .collect();
+        let colors = theme().colors;
+        tool_line(
+            &ToolLine {
+                glyph: &colors.success.fg("✓"),
+                title: &format!("{} calls", calls.len()),
+                args: "",
+                summary: &names.join(", "),
+                elapsed: &format_elapsed(took),
+            },
+            width,
+        )
+    }
+}
+
+impl Component for ToolGroup {
+    fn render(&self, width: usize) -> Vec<String> {
+        let Ok(calls) = self.calls.lock() else {
+            return Vec::new();
+        };
+        if calls.is_empty() {
+            return Vec::new();
+        }
+        let mut rows = vec![String::new()];
+        let fold_before = if !self.display.is_expanded() && calls.len() > GROUP_FOLD_AFTER {
+            calls.len() - GROUP_KEEP_LAST
+        } else {
+            0
+        };
+        let folded: Vec<&Arc<ToolBlock>> = calls[..fold_before]
+            .iter()
+            .filter(|c| c.state() == ToolState::Completed)
+            .collect();
+        let mut folded_drawn = false;
+        for (i, call) in calls.iter().enumerate() {
+            if i < fold_before && call.state() == ToolState::Completed && folded.len() > 1 {
+                if !folded_drawn {
+                    rows.push(Self::folded_line(&folded, width));
+                    folded_drawn = true;
+                }
+                continue;
+            }
+            rows.extend(call.rows(width));
+        }
+        rows
+    }
+
+    fn invalidate(&self) {
+        if let Ok(calls) = self.calls.lock() {
+            for call in calls.iter() {
+                call.invalidate();
+            }
+        }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1162,61 +1476,181 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn tool_blocks_wrap_their_header_and_result_at_words() {
-        let block = ToolBlock::new(
-            "AMP · kb_search",
-            "how the harness wraps transcript text in narrow terminals",
-        );
-        block.set_result(
-            "query: how the harness wraps transcript text · results: 3 items · top: architecture/amp-harness-chat-tui.md",
-            false,
-        );
-        let rows = plain_rows(&block.render(50));
-        // pi's top spacer and the panel's own padding (1 row in the default theme).
-        assert_eq!(rows[0], "");
-        let body: Vec<&str> = rows
-            .iter()
-            .map(String::as_str)
-            .filter(|r| !r.is_empty())
-            .collect();
-        assert!(
-            body[0].starts_with("  ✓ AMP · kb_search how the harness"),
-            "{body:?}"
-        );
-        for row in &body {
-            assert!(visible_width_of(row) <= 50, "{row:?}");
-        }
-        // Header continuations hang under the title; result rows keep the gutter.
-        assert!(
-            body[1].starts_with("    ") && !body[1].starts_with("     "),
-            "{body:?}"
-        );
-        let result: Vec<&&str> = body.iter().filter(|r| r.starts_with("  │ ")).collect();
-        assert!(result.len() >= 3, "{body:?}");
-        assert!(result.iter().all(|r| !r.starts_with("  │  ")), "{body:?}");
-        let joined: Vec<String> = result.iter().map(|r| r[6..].to_owned()).collect();
-        assert_eq!(
-            joined.join(" "),
-            "query: how the harness wraps transcript text · results: 3 items · top: architecture/amp-harness-chat-tui.md"
-        );
-    }
-
     fn visible_width_of(s: &str) -> usize {
         rpi_tui::visible_width(s)
     }
 
+    /// A finished call (its timer set by hand, so the duration is known).
+    fn finished(title: &str, args: &str, summary: &str, ms: u64) -> Arc<ToolBlock> {
+        let block = ToolBlock::new(title, args);
+        block.set_result(summary, "{\"ok\": true}", false);
+        if let Ok(mut i) = block.inner.lock() {
+            let end = Instant::now();
+            i.started = Some(end - Duration::from_millis(ms));
+            i.finished = Some(end);
+        }
+        Arc::new(block)
+    }
+
     #[test]
-    fn long_tool_results_show_a_preview() {
-        let block = ToolBlock::new("read", "src/lib.rs");
+    fn a_tool_call_is_one_line_with_its_summary_and_ms() {
+        let block = finished("list_tasks", "", "3 tickets: 1 ready, 1 waiting", 12);
+        let rows = plain_rows(&block.render(80));
+        assert_eq!(
+            rows,
+            vec!["", " ✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms"]
+        );
+        // A completed call has no surface colour; nothing else is styled as a background.
+        let styled = block.rows(80).join("");
+        assert!(!styled.contains("\x1b[48"), "{styled:?}");
+    }
+
+    #[test]
+    fn a_narrow_line_shortens_the_argument_then_the_summary() {
+        let block = finished(
+            "kb_search",
+            "how the harness wraps transcript text in narrow terminals",
+            "3 results: architecture/amp-harness-transcript-wrapping.md",
+            40,
+        );
+        for width in [30, 50, 80, 120] {
+            let rows = plain_rows(&block.rows(width));
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert!(visible_width_of(&rows[0]) <= width, "{width}: {rows:?}");
+            assert!(rows[0].starts_with(" ✓ kb_search"), "{rows:?}");
+            assert!(rows[0].ends_with("· 40 ms"), "{width}: {rows:?}");
+        }
+        let at50 = &plain_rows(&block.rows(50))[0];
+        assert!(at50.contains("· 3 results"), "{at50:?}");
+        assert!(at50.contains('…'), "{at50:?}");
+    }
+
+    #[test]
+    fn durations_under_a_second_are_ms() {
+        assert_eq!(format_elapsed(Duration::from_millis(0)), "0 ms");
+        assert_eq!(format_elapsed(Duration::from_millis(12)), "12 ms");
+        assert_eq!(format_elapsed(Duration::from_millis(999)), "999 ms");
+        assert_eq!(format_elapsed(Duration::from_millis(1200)), "1.2s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m5s");
+        // A running call shows no timer for its first second.
+        assert_eq!(running_elapsed(Duration::from_millis(400)), "");
+        assert_eq!(running_elapsed(Duration::from_millis(2400)), "2s");
+    }
+
+    #[test]
+    fn running_and_failed_calls_keep_the_surface_and_errors_show() {
+        let running = ToolBlock::new("get_task #67", "");
+        running.set_running();
+        let rows = running.rows(60);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("\x1b[48"), "{rows:?}");
+        assert!(plain(&rows[0]).starts_with(" ● get_task #67"), "{rows:?}");
+
+        let failed = ToolBlock::new("complete_task #2078", "all done");
+        failed.set_result(
+            "the plan was last approved before #2078",
+            "the plan was last approved before #2078 was planned\nApprove it in AMP",
+            true,
+        );
+        let rows = failed.rows(60);
+        assert!(rows.iter().all(|r| r.contains("\x1b[48")), "{rows:?}");
+        let rows = plain_rows(&rows);
+        assert!(
+            rows[0].starts_with(" ✗ complete_task #2078 all done"),
+            "{rows:?}"
+        );
+        assert!(
+            rows[1].starts_with("   │ the plan was last approved"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("Approve it in AMP")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn expanded_calls_show_their_arguments_and_result() {
+        let display = Arc::new(ToolDisplay::default());
+        let block = ToolBlock::with_display("read", "src/lib.rs", Arc::clone(&display));
+        block.set_args_detail("{\"path\":\"src/lib.rs\"}");
         let text: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
-        block.set_result(&text.join("\n"), false);
-        let rows = plain_rows(&block.render(60));
+        block.set_result("20 lines", &text.join("\n"), false);
+        assert_eq!(plain_rows(&block.rows(60)).len(), 1);
+        assert!(display.toggle());
+        let rows = plain_rows(&block.rows(60));
+        assert!(
+            rows[1].starts_with("   │ {\"path\":\"src/lib.rs\"}"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.ends_with("│ line 12")), "{rows:?}");
+        assert!(!rows.iter().any(|r| r.contains("line 13")), "{rows:?}");
         assert!(
             rows.iter().any(|r| r.trim() == "… 8 more lines"),
             "{rows:?}"
         );
-        assert!(!rows.iter().any(|r| r.contains("line 13")), "{rows:?}");
+        for row in &rows {
+            assert!(visible_width_of(row) <= 60, "{row:?}");
+        }
+        assert!(!display.toggle());
+        assert_eq!(plain_rows(&block.rows(60)).len(), 1);
+    }
+
+    #[test]
+    fn three_calls_in_a_group_take_four_rows() {
+        let group = ToolGroup::new(Arc::new(ToolDisplay::default()));
+        group.push(finished(
+            "list_tasks",
+            "",
+            "3 tickets: 1 ready, 1 waiting",
+            12,
+        ));
+        group.push(finished("get_plan", "", "1 epic, 2 stories, 3 tickets", 8));
+        group.push(finished("get_task #67", "", "Card form · in progress", 5));
+        let rows = plain_rows(&group.render(80));
+        assert_eq!(
+            rows,
+            vec![
+                "",
+                " ✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms",
+                " ✓ get_plan · 1 epic, 2 stories, 3 tickets · 8 ms",
+                " ✓ get_task #67 · Card form · in progress · 5 ms",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_group_folds_its_earliest_successful_calls() {
+        let display = Arc::new(ToolDisplay::default());
+        let group = ToolGroup::new(Arc::clone(&display));
+        for i in 0..4 {
+            group.push(finished(&format!("get_task #{i}"), "", "x", 10));
+        }
+        let failed = ToolBlock::new("get_task #99", "");
+        failed.set_result("no such ticket", "task 99 not found", true);
+        group.push(Arc::new(failed));
+        group.push(finished("list_tasks", "", "no tickets", 10));
+        group.push(finished("get_plan", "", "no epics", 10));
+        group.push(finished("check_plan", "", "plan OK", 10));
+        let rows = plain_rows(&group.render(80));
+        assert_eq!(rows[1], " ✓ 4 calls · get_task ×4 · 40 ms", "{rows:?}");
+        // The failed call is never folded; the last three are shown one by one.
+        assert!(rows[2].starts_with(" ✗ get_task #99"), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("task 99 not found")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().rev().take(3).all(|r| r.starts_with(" ✓ ")),
+            "{rows:?}"
+        );
+        // Expanded, every call is shown.
+        display.toggle();
+        let rows = plain_rows(&group.render(80));
+        assert!(
+            rows.iter().any(|r| r.starts_with(" ✓ get_task #0")),
+            "{rows:?}"
+        );
     }
 
     // #2177: thinking.

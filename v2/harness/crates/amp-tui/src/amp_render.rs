@@ -1,5 +1,6 @@
 //! AMP in the transcript (M3-4, #2108): `amp_*` tool calls titled the way the web UI names
-//! things (`AMP · complete_task #2078`) with a compact result instead of raw JSON, and the inline
+//! things (`complete_task #2078`) with a one-line human summary of the result (#2183,
+//! [`result_summary`]: `3 tickets: 1 ready, 1 waiting`) instead of raw JSON, and the inline
 //! marker drawn when the current ticket changes (§2 items 4 and 12 of
 //! `research/harness-tui-theme-and-metadata.md`).
 //!
@@ -56,10 +57,11 @@ fn ticket_refs(args: &Value) -> String {
     out.join(" ")
 }
 
-/// The tool block's title: `AMP · complete_task #2078`. Plain text (see the module docs).
+/// The tool line's title: `complete_task #2078` (#2183: one line per call, no `AMP ·` prefix).
+/// Plain text (see the module docs).
 pub fn tool_title(name: &str, args: &Value) -> String {
     let refs = ticket_refs(args);
-    let mut title = format!("AMP · {}", short_tool(name));
+    let mut title = short_tool(name).to_owned();
     if !refs.is_empty() {
         title.push(' ');
         title.push_str(&refs);
@@ -145,6 +147,313 @@ pub fn result_text(raw: &str, is_error: bool) -> String {
     } else {
         parts.join(" · ")
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Human summaries (#2183)
+// ------------------------------------------------------------------------------------------------
+
+/// `1 ticket`, `3 tickets`.
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// A bucket's size: a list's length or a number.
+fn size(v: &Value) -> usize {
+    match v {
+        Value::Array(a) => a.len(),
+        Value::Number(n) => n.as_u64().unwrap_or(0) as usize,
+        _ => 0,
+    }
+}
+
+/// `in progress`, `question`, `done`: a ticket's state in the web UI's words.
+fn state_word(task: &Value) -> Option<String> {
+    let state = task["state"].as_str()?;
+    let reason = task["block_reason"].as_str().filter(|r| !r.is_empty());
+    Some(Status::of(state, reason).label().to_lowercase())
+}
+
+/// `N tickets: 1 ready, 2 in progress, ...` from an `amp_list_tasks` result (compact or full).
+fn list_tasks_summary(v: &Value) -> Option<String> {
+    let total = v["count"].as_u64()? as usize;
+    if total == 0 {
+        return Some("no tickets".to_owned());
+    }
+    let questions = size(&v["questions"]);
+    // Full format: `blocked` holds the questions too; compact: `waiting` is a number.
+    let waiting = match &v["blocked"] {
+        Value::Array(a) => a.len().saturating_sub(questions),
+        _ => size(&v["waiting"]),
+    };
+    let buckets = [
+        (size(&v["ready_to_dispatch"]), "ready"),
+        (size(&v["in_progress"]), "in progress"),
+        (questions, "question"),
+        (waiting, "waiting"),
+        (size(&v["scheduled"]), "scheduled"),
+        (size(&v["completed"]), "done"),
+    ];
+    let parts: Vec<String> = buckets
+        .iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, word)| match (*word, *n) {
+            ("question", n) => count(n, "question", "questions"),
+            (w, n) => format!("{n} {w}"),
+        })
+        .collect();
+    let mut out = count(total, "ticket", "tickets");
+    let people = size(&v["waiting_on_people"]);
+    if !parts.is_empty() {
+        out.push_str(": ");
+        out.push_str(&parts.join(", "));
+    }
+    if people > 0 {
+        out.push_str(&format!(" · {people} for people"));
+    }
+    Some(out)
+}
+
+/// `2 epics, 5 stories, 14 tickets`, or one epic by name.
+fn get_plan_summary(v: &Value) -> Option<String> {
+    let epics = v["epics"].as_array()?;
+    let stories: usize = epics.iter().map(|e| size(&e["stories"])).sum();
+    let tickets = v["tickets"].as_u64().unwrap_or(0) as usize;
+    let tail = format!(
+        "{}, {}",
+        count(stories, "story", "stories"),
+        count(tickets, "ticket", "tickets")
+    );
+    Some(match epics.as_slice() {
+        [one] if one["name"].is_string() => {
+            format!("{}: {tail}", shorten(&clean(one["name"].as_str()?), 40))
+        }
+        _ => format!("{}, {tail}", count(epics.len(), "epic", "epics")),
+    })
+}
+
+/// `Card form · in progress · 3 comments` (the title already names `#67`).
+fn get_task_summary(v: &Value) -> Option<String> {
+    let task = &v["task"];
+    let name = task["name"].as_str()?;
+    let mut parts = vec![shorten(&clean(name), 60)];
+    if let Some(state) = state_word(task) {
+        parts.push(state);
+    }
+    if let Some(n) = v["comments_total"].as_u64().filter(|n| *n > 0) {
+        parts.push(count(n as usize, "comment", "comments"));
+    }
+    Some(parts.join(" · "))
+}
+
+/// `3 results: architecture/auth.md, ...` (each document once).
+fn kb_search_summary(v: &Value) -> Option<String> {
+    let results = v["results"].as_array()?;
+    if results.is_empty() {
+        return Some("no results".to_owned());
+    }
+    let mut paths: Vec<&str> = Vec::new();
+    for r in results {
+        if let Some(p) = r["path"].as_str()
+            && !paths.contains(&p)
+        {
+            paths.push(p);
+        }
+    }
+    let mut out = count(results.len(), "result", "results");
+    if !paths.is_empty() {
+        out.push_str(": ");
+        out.push_str(&clean(&paths.join(", ")));
+    }
+    Some(out)
+}
+
+/// `created 2 tickets: #141 #142`.
+fn create_tasks_summary(v: &Value) -> Option<String> {
+    let created = v["created"].as_array()?;
+    let ids: Vec<String> = created
+        .iter()
+        .filter_map(|t| id_of(&t["id"]))
+        .map(|id| format!("#{id}"))
+        .collect();
+    let mut out = format!("created {}", count(created.len(), "ticket", "tickets"));
+    if !ids.is_empty() {
+        let shown: Vec<&str> = ids.iter().take(6).map(String::as_str).collect();
+        out.push_str(&format!(": {}", shown.join(" ")));
+        if ids.len() > 6 {
+            out.push_str(&format!(" +{}", ids.len() - 6));
+        }
+    }
+    if let Some(n) = v["warnings"].as_array().map(Vec::len).filter(|n| *n > 0) {
+        out.push_str(&format!(" · {}", count(n, "warning", "warnings")));
+    }
+    Some(out)
+}
+
+/// `plan OK · 3 ready now · 2 awaiting approval`, or `2 issues · ...`.
+fn check_plan_summary(v: &Value) -> Option<String> {
+    let ok = v["ok"].as_bool()?;
+    let issues = size(&v["issues"]);
+    let mut parts = vec![if ok && issues == 0 {
+        "plan OK".to_owned()
+    } else if ok {
+        format!("plan OK, {}", count(issues, "note", "notes"))
+    } else {
+        format!("NO-GO: {}", count(issues, "issue", "issues"))
+    }];
+    let ready = size(&v["ready_now"]);
+    if ready > 0 {
+        parts.push(format!("{ready} ready now"));
+    }
+    let awaiting = size(&v["awaiting_approval"]);
+    if awaiting > 0 {
+        parts.push(format!("{awaiting} awaiting approval"));
+    }
+    Some(parts.join(" · "))
+}
+
+/// `3 artifacts: 2 approved, 1 in review`.
+fn list_artifacts_summary(v: &Value) -> Option<String> {
+    let list = v["artifacts"].as_array()?;
+    if list.is_empty() {
+        return Some("no artifacts".to_owned());
+    }
+    let mut by_status: Vec<(String, usize)> = Vec::new();
+    for a in list {
+        let status = a["status"].as_str().unwrap_or("").replace('_', " ");
+        match by_status.iter_mut().find(|(s, _)| *s == status) {
+            Some((_, n)) => *n += 1,
+            None => by_status.push((status, 1)),
+        }
+    }
+    let mut out = count(list.len(), "artifact", "artifacts");
+    let parts: Vec<String> = by_status
+        .iter()
+        .filter(|(s, _)| !s.is_empty())
+        .map(|(s, n)| format!("{n} {}", clean(s)))
+        .collect();
+    if !parts.is_empty() {
+        out.push_str(": ");
+        out.push_str(&parts.join(", "));
+    }
+    Some(out)
+}
+
+/// `#2 Name (CODE)`: a project record.
+fn project_text(p: &Value) -> Option<String> {
+    let name = clean(p["name"].as_str()?);
+    let mut out = match id_of(&p["id"]) {
+        Some(id) => format!("#{id} {}", shorten(&name, 48)),
+        None => shorten(&name, 48),
+    };
+    if let Some(code) = p["code"].as_str().filter(|c| !c.is_empty()) {
+        out.push_str(&format!(" ({})", clean(code)));
+    }
+    Some(out)
+}
+
+/// One line saying what an AMP tool call did, in words (#2183): `3 tickets: 1 ready, 1 waiting`,
+/// `Card form · in progress`, `created 2 tickets: #141 #142`. The 15 contract tools
+/// ([`amp_core::tools::CONTRACT_TOOLS`]) plus `kb_search` and `create_tasks` have their own;
+/// any other tool (or a result that isn't the expected shape) falls back to [`result_text`]'s
+/// `key: value` list. An error is its message's first line, without the transport's prefix.
+pub fn result_summary(name: &str, raw: &str, is_error: bool) -> String {
+    if is_error {
+        return error_line(raw);
+    }
+    let fallback = || first_line(&result_text(raw, false));
+    let Ok(v) = serde_json::from_str::<Value>(raw.trim()) else {
+        return fallback();
+    };
+    if !v.is_object() {
+        return fallback();
+    }
+    let say = |s: &str| Some(s.to_owned());
+    let summary = match short_tool(name) {
+        "list_tasks" => list_tasks_summary(&v),
+        "get_plan" => get_plan_summary(&v),
+        "get_task" => get_task_summary(&v),
+        "kb_search" => kb_search_summary(&v),
+        "create_tasks" => create_tasks_summary(&v),
+        "check_plan" => check_plan_summary(&v),
+        "list_artifacts" => list_artifacts_summary(&v),
+        "whoami" => v["email"].as_str().map(|email| {
+            let mut out = clean(email);
+            if let Some(n) = v["orgs"].as_array().map(Vec::len).filter(|n| *n > 0) {
+                out.push_str(&format!(" · {}", count(n, "org", "orgs")));
+            }
+            if v["global_admin"].as_bool() == Some(true) {
+                out.push_str(" · admin");
+            }
+            out
+        }),
+        "get_project" => {
+            project_text(&v["project"]).map(|p| match v["project"]["state"].as_str() {
+                Some(s) if !s.is_empty() => format!("{p} · {}", clean(s)),
+                _ => p,
+            })
+        }
+        "list_projects" => v["projects"]
+            .as_array()
+            .map(|p| count(p.len(), "project", "projects")),
+        "create_project" => project_text(&v).map(|p| format!("created {p}")),
+        "dispatch_task" => match v["dispatched_to"].as_str().filter(|a| !a.is_empty()) {
+            Some(agent) => Some(format!("dispatched to {}", clean(agent))),
+            None => say("dispatched"),
+        },
+        "complete_task" => {
+            let mut out = "done".to_owned();
+            if v["run"].is_object() {
+                out.push_str(" · run recorded");
+            } else if let Some(e) = v["run_error"].as_str() {
+                out.push_str(&format!(" · run not recorded: {}", clean(e)));
+            }
+            Some(out)
+        }
+        "block_task" => say("blocked: the question is on the ticket"),
+        "report_run" => Some(match v["outcome"].as_str().filter(|o| !o.is_empty()) {
+            Some(o) => format!("run recorded: {}", clean(o)),
+            None => "run recorded".to_owned(),
+        }),
+        "answer_question" => Some(match v["state"].as_str() {
+            Some("backlog") => "answered · ready to dispatch".to_owned(),
+            Some("blocked") => "answered · still waits on dependencies".to_owned(),
+            _ => "answered".to_owned(),
+        }),
+        "kb_write" => v["path"].as_str().map(|p| format!("wrote {}", clean(p))),
+        _ => None,
+    };
+    summary.unwrap_or_else(fallback)
+}
+
+/// The first non-empty line of `text`, cleaned.
+fn first_line(text: &str) -> String {
+    clean(text.lines().find(|l| !l.trim().is_empty()).unwrap_or(""))
+}
+
+/// An error's message without the transport's wrapping (`tool error: amp_x: tools/call amp_x:
+/// Mcp error: -32603: ` before AMP's own sentence).
+pub fn error_text(raw: &str) -> &str {
+    let mut text = raw.trim();
+    if let Some(at) = text.find("Mcp error: ") {
+        text = &text[at + "Mcp error: ".len()..];
+        // The JSON-RPC code, `-32603: `.
+        if let Some((code, rest)) = text.split_once(": ")
+            && !code.is_empty()
+            && code
+                .trim_start_matches('-')
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        {
+            text = rest;
+        }
+    }
+    text
+}
+
+/// [`error_text`]'s first line, cleaned.
+pub fn error_line(raw: &str) -> String {
+    first_line(error_text(raw))
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -404,21 +713,21 @@ mod tests {
     fn titles_name_the_tool_and_its_tickets() {
         assert_eq!(
             tool_title("amp_complete_task", &json!({"task_id": 2078})),
-            "AMP · complete_task #2078"
+            "complete_task #2078"
         );
         assert_eq!(
             tool_title("amp_amp_get_task", &json!({"task_id": "#5"})),
-            "AMP · get_task #5"
+            "get_task #5"
         );
         assert_eq!(
             tool_title("amp_handover_tasks", &json!({"task_ids": [1, 2, 3, 4, 5]})),
-            "AMP · handover_tasks #1 #2 #3 +2"
+            "handover_tasks #1 #2 #3 +2"
         );
         assert_eq!(
             tool_title("amp_create_tasks", &json!({"tasks": [{}, {}]})),
-            "AMP · create_tasks 2 tickets"
+            "create_tasks 2 tickets"
         );
-        assert_eq!(tool_title("amp_whoami", &json!({})), "AMP · whoami");
+        assert_eq!(tool_title("amp_whoami", &json!({})), "whoami");
     }
 
     #[test]
@@ -460,5 +769,181 @@ mod tests {
         let text = result_text(with_comments, false);
         assert_eq!(text, "task: #67 Card form · comments_total: 0");
         assert!(!text.contains("effective_metadata") && !text.contains("comments:"));
+    }
+    #[test]
+    fn list_tasks_reads_as_a_sentence() {
+        // The compact board from the review (#2175 finding 8).
+        let compact = r#"{"ready_to_dispatch":[141],"in_progress":[],"questions":[],"waiting":1,"scheduled":0,"completed":1,"quiet":[],"waiting_on_people":[],"by_epic":{"Repo hygiene":[{"id":141,"name":"x","state":"ready"}]},"count":3,"owner_filter":"mine"}"#;
+        assert_eq!(
+            result_summary("amp_list_tasks", compact, false),
+            "3 tickets: 1 ready, 1 waiting, 1 done"
+        );
+        // format=full: blocked holds the questions too.
+        let full = r#"{"ready_to_dispatch":[],"in_progress":[{"id":1}],"blocked":[{"id":2},{"id":3}],"scheduled":[{"id":4}],"questions":[{"id":2}],"completed":[],"waiting_on_people":[{"id":9}],"count":5,"owner_filter":"any"}"#;
+        assert_eq!(
+            result_summary("amp_amp_list_tasks", full, false),
+            "5 tickets: 1 in progress, 1 question, 1 waiting, 1 scheduled · 1 for people"
+        );
+        assert_eq!(
+            result_summary(
+                "amp_list_tasks",
+                r#"{"count":0,"owner_filter":"mine"}"#,
+                false
+            ),
+            "no tickets"
+        );
+    }
+
+    #[test]
+    fn get_plan_get_task_kb_search_and_create_tasks_read_as_sentences() {
+        let plan = r#"{"project_id":2,"tickets":14,"epics":[{"id":1,"name":"A","stories":[{"id":1},{"id":2}]},{"id":2,"name":"B","stories":[{"id":3}]}]}"#;
+        assert_eq!(
+            result_summary("amp_get_plan", plan, false),
+            "2 epics, 3 stories, 14 tickets"
+        );
+        let one = r#"{"project_id":2,"tickets":1,"epics":[{"id":1,"name":"Harness M4","stories":[{"id":1}]}]}"#;
+        assert_eq!(
+            result_summary("amp_get_plan", one, false),
+            "Harness M4: 1 story, 1 ticket"
+        );
+
+        let task = r#"{"comments":[{}],"comments_total":4,"effective_metadata":{},"task":{"id":67,"name":"Card form","state":"blocked","block_reason":"Stripe or Adyen?"}}"#;
+        assert_eq!(
+            result_summary("amp_get_task", task, false),
+            "Card form · question · 4 comments"
+        );
+        let done =
+            r#"{"effective_metadata":{},"task":{"id":67,"name":"Card form","state":"completed"}}"#;
+        assert_eq!(
+            result_summary("amp_get_task", done, false),
+            "Card form · done"
+        );
+
+        let kb = r#"{"kb":{"scope":"project"},"count":3,"results":[{"path":"a/x.md"},{"path":"a/x.md"},{"path":"b/y.md"}]}"#;
+        assert_eq!(
+            result_summary("amp_kb_search", kb, false),
+            "3 results: a/x.md, b/y.md"
+        );
+        assert_eq!(
+            result_summary("amp_kb_search", r#"{"count":0,"results":[]}"#, false),
+            "no results"
+        );
+
+        let created = r#"{"count":2,"created":[{"ref":"a","id":141,"state":"backlog"},{"ref":"b","id":142,"state":"blocked"}],"warnings":["x"]}"#;
+        assert_eq!(
+            result_summary("amp_create_tasks", created, false),
+            "created 2 tickets: #141 #142 · 1 warning"
+        );
+    }
+
+    #[test]
+    fn the_other_contract_tools_have_summaries() {
+        let cases = [
+            (
+                "amp_whoami",
+                r#"{"user_id":7,"email":"dev@example.com","account":"human","orgs":[{},{}],"global_admin":true}"#,
+                "dev@example.com · 2 orgs · admin",
+            ),
+            (
+                "amp_get_project",
+                r#"{"project":{"id":2,"name":"AMP","code":"AMP-V2","state":"active"}}"#,
+                "#2 AMP (AMP-V2) · active",
+            ),
+            (
+                "amp_list_projects",
+                r#"{"projects":[{},{},{}]}"#,
+                "3 projects",
+            ),
+            (
+                "amp_create_project",
+                r#"{"id":45,"name":"Play","code":"PLAY"}"#,
+                "created #45 Play (PLAY)",
+            ),
+            (
+                "amp_check_plan",
+                r#"{"ok":true,"issues":[],"ready_now":[1,2],"awaiting_approval":[1,2,3],"summary":"…"}"#,
+                "plan OK · 2 ready now · 3 awaiting approval",
+            ),
+            (
+                "amp_check_plan",
+                r#"{"ok":false,"issues":[{},{}],"ready_now":[],"awaiting_approval":[]}"#,
+                "NO-GO: 2 issues",
+            ),
+            (
+                "amp_dispatch_task",
+                r#"{"task_id":5,"dispatched_to":"amp:amp-worker-backend"}"#,
+                "dispatched to amp:amp-worker-backend",
+            ),
+            (
+                "amp_complete_task",
+                r#"{"task_id":5,"state":"completed","run":{"id":1}}"#,
+                "done · run recorded",
+            ),
+            (
+                "amp_complete_task",
+                r#"{"task_id":5,"state":"completed"}"#,
+                "done",
+            ),
+            (
+                "amp_block_task",
+                r#"{"task_id":5,"state":"blocked"}"#,
+                "blocked: the question is on the ticket",
+            ),
+            (
+                "amp_report_run",
+                r#"{"id":3,"task_id":5,"outcome":"completed"}"#,
+                "run recorded: completed",
+            ),
+            (
+                "amp_answer_question",
+                r#"{"task_id":5,"state":"backlog","next":"…"}"#,
+                "answered · ready to dispatch",
+            ),
+            (
+                "amp_list_artifacts",
+                r#"{"artifacts":[{"status":"approved"},{"status":"in_review"},{"status":"approved"}],"count":3}"#,
+                "3 artifacts: 2 approved, 1 in review",
+            ),
+            (
+                "amp_kb_write",
+                r#"{"path":"architecture/x.md","title":"X"}"#,
+                "wrote architecture/x.md",
+            ),
+        ];
+        for (tool, raw, want) in cases {
+            assert_eq!(result_summary(tool, raw, false), want, "{tool}");
+        }
+        // Every contract tool has its own summary, not the raw keys.
+        for tool in amp_core::tools::CONTRACT_TOOLS {
+            assert!(
+                cases.iter().any(|(t, _, _)| t == tool)
+                    || ["amp_list_tasks", "amp_get_plan", "amp_get_task"].contains(tool),
+                "{tool} has no summary test"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_tools_and_shapes_fall_back_to_keys_and_errors_lose_the_transport() {
+        assert_eq!(
+            result_summary("amp_velocity", r#"{"done":3,"per_day":1.5}"#, false),
+            "done: 3 · per_day: 1.5"
+        );
+        // A contract tool whose result isn't the expected shape.
+        assert_eq!(result_summary("amp_get_task", r#"{"x":1}"#, false), "x: 1");
+        assert_eq!(
+            result_summary("amp_get_task", "not json", false),
+            "not json"
+        );
+        assert_eq!(
+            result_summary(
+                "amp_dispatch_task",
+                "tool error: amp_dispatch_task: tools/call amp_dispatch_task: Mcp error: -32603: task 9 not found\nmore",
+                true
+            ),
+            "task 9 not found"
+        );
+        assert_eq!(error_line("line one\nline two"), "line one");
+        assert_eq!(error_text("Mcp error: -32603: no"), "no");
     }
 }

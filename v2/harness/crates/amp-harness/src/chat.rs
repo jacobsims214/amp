@@ -18,7 +18,8 @@
 //! config.toml `[tui] theme`, else `auto` (the terminal's background via OSC 11; dark in
 //! `--snapshot`). Colour depth: `AMP_HARNESS_COLOR`, `[tui] color`, else `COLORTERM`. Thinking
 //! (#2177): `AMP_HARNESS_SHOW_THINKING`, `[tui] show_thinking` (collapsed|full|hidden), else
-//! collapsed; Ctrl+T (`--input key:ctrl+t`) expands the last one.
+//! collapsed; Ctrl+T (`--input key:ctrl+t`) expands the last one. Ctrl+O (`--input key:ctrl+o`)
+//! shows every tool call's arguments and result (#2183).
 //!
 //! `/server` (#2164) gets a [`crate::server_cmd::Switcher`]: it lists the saved servers and moves
 //! the session (its AMP connection, the model's AMP tools and prompt, the metadata poller) to
