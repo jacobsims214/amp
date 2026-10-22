@@ -88,14 +88,17 @@ dependencies = [
  "amp-core",
  "amp-mcp",
  "amp-tui",
+ "async-trait",
  "axum",
  "clap",
  "rmcp",
  "rpi-agent",
+ "rpi-ai",
  "rpi-harness",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

@@ -242,6 +242,15 @@ impl ServerHandler for MockAmp {
                 }
                 _ => tool_error("task not found"),
             },
+            // M2-5: ticket 4040 belongs to someone else, like AMP's refusal.
+            "amp_dispatch_task" => match args["task_id"].as_i64() {
+                Some(4040) => tool_error("task 4040 is owned by someone else"),
+                Some(id) => ok_json(json!({"task_id": id, "dispatched_to": args["agent_id"]})),
+                None => tool_error("task_id is required"),
+            },
+            "amp_complete_task" | "amp_block_task" => {
+                ok_json(json!({"task_id": args["task_id"], "ok": true}))
+            }
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "plain text, not JSON",

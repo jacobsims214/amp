@@ -14,6 +14,11 @@
 //! - `--print-system-prompt` builds the session and prints the system prompt as the model would
 //!   receive it, without calling a model.
 //!
+//! The manager gets `amp_run_ticket` (M2-5): workers run in-process under an
+//! `amp_core::supervisor::Supervisor`, limited by config.toml `[workers]` and the
+//! `AMP_HARNESS_MAX_WORKERS` / `AMP_HARNESS_WORKER_TIMEOUT_SECS` / `AMP_HARNESS_WORKER_MAX_TURNS`
+//! variables. Ctrl-C aborts the manager and cancels its workers.
+//!
 //! The faux provider (`api = "faux"` in config.toml) plus `AMP_HARNESS_FAUX_SCRIPT` runs it
 //! offline and deterministically.
 
@@ -29,6 +34,7 @@ use amp_core::{
     models::thinking_name,
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::SystemKeys,
+    supervisor::{ManagerContext, Supervisor, SupervisorConfig},
 };
 use clap::Args;
 use rpi_harness::agent_harness::{AgentLane, HarnessRunOutcome};
@@ -182,30 +188,47 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let client = Arc::new(conn::connect(&settings).await?);
     let env = |k: &str| std::env::var(k).ok();
     let keys = SystemKeys::from_env();
-    let rt = Runtime::load(
-        Arc::clone(&client),
-        RuntimeOptions {
-            repo_root,
-            models: None,
-            keys: &keys,
-            env: &env,
-            state_dir: None,
-        },
-    )
-    .map_err(|e| CliError::new(e.to_string()))?;
+    let rt = Arc::new(
+        Runtime::load(
+            Arc::clone(&client),
+            RuntimeOptions {
+                repo_root,
+                models: None,
+                keys: &keys,
+                env: &env,
+                state_dir: None,
+            },
+        )
+        .map_err(|e| CliError::new(e.to_string()))?,
+    );
 
     let role_name = args
         .role
         .clone()
         .unwrap_or_else(|| rt.roles.manager().id.clone());
-    let role_id = rt
+    let role = rt
         .role(&role_name)
-        .map_err(|e| CliError::usage(e.to_string()))?
-        .id
-        .clone();
+        .map_err(|e| CliError::usage(e.to_string()))?;
+    let role_id = role.id.clone();
+    // A primary role (the manager) runs workers through amp_run_ticket (D7).
+    let supervisor = if role.primary {
+        let config = SupervisorConfig::load(&env, None).map_err(CliError::new)?;
+        Some(Supervisor::new(
+            Arc::clone(&rt),
+            ManagerContext {
+                role: role_id.clone(),
+                cwd: cwd.clone(),
+                project: project.clone(),
+            },
+            config,
+        ))
+    } else {
+        None
+    };
     let (emitter, mut rx) = ChannelEmitter::new();
     let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());
     spec.project = project.clone();
+    spec.extra_tools = supervisor.iter().map(|s| s.tool()).collect();
     spec.emitter = Some(emitter.into_emitter());
     spec.session = if args.no_session || args.print_system_prompt {
         SessionKind::Memory
@@ -253,6 +276,9 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             _ = tokio::signal::ctrl_c(), if !aborted_by_user => {
                 aborted_by_user = true;
                 eprintln!("amp-harness: aborting the run (Ctrl-C)");
+                if let Some(sup) = &supervisor {
+                    sup.cancel_all();
+                }
                 let _ = harness.abort().await;
             }
             r = &mut run => break r,
