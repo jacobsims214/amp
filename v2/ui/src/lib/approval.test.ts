@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ago, awaitingApproval, isRelayed, planPath, plannedAt, relayedFor } from './approval'
+import { ago, awaitingApproval, changedSinceNotice, compareInstants, isRelayed, newestPlannedAt, planPath, plannedAt, relayedFor } from './approval'
 import type { Task } from '../types'
 
 const task = (id: number, over: Partial<Task> = {}): Task => ({
@@ -37,6 +37,40 @@ describe('awaitingApproval', () => {
 
   it('is nothing until the project has loaded', () => {
     expect(awaitingApproval([task(1)], null)).toEqual([])
+  })
+})
+
+describe('plan times (as_of, #2192)', () => {
+  it('ignores a zero planned_at and falls back to created_at', () => {
+    expect(plannedAt(task(1, { planned_at: '0001-01-01T00:00:00Z' }))).toBe('2026-10-20T10:00:00Z')
+  })
+
+  it('compares to the microsecond, across fraction lengths and offsets', () => {
+    expect(compareInstants('2026-10-22T21:40:12.345678Z', '2026-10-22T21:40:12.345Z')).toBeGreaterThan(0)
+    expect(compareInstants('2026-10-22T21:40:12Z', '2026-10-22T21:40:12.5Z')).toBeLessThan(0)
+    expect(compareInstants('2026-10-22T21:40:12.1Z', '2026-10-22T21:40:12.100000Z')).toBe(0)
+    expect(compareInstants('2026-10-22T23:40:12.000001+02:00', '2026-10-22T21:40:12Z')).toBeGreaterThan(0)
+  })
+
+  it('newestPlannedAt is the newest shown plan time, verbatim (no Date round trip)', () => {
+    const ts = [
+      task(1, { planned_at: '2026-10-22T21:40:12.345678Z' }),
+      task(2, { planned_at: '2026-10-22T21:40:12.345Z' }),
+      task(3, { planned_at: '2026-10-22T21:40:11.999999Z' }),
+    ]
+    expect(newestPlannedAt(ts)).toBe('2026-10-22T21:40:12.345678Z')
+    expect(newestPlannedAt([])).toBeUndefined()
+  })
+
+  it('keeps a ticket awaiting when it was planned microseconds after the approval', () => {
+    const t = task(4, { planned_at: '2026-10-22T21:40:12.345679Z' })
+    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T21:40:12.345678Z' })).toHaveLength(1)
+    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T21:40:12.345679Z' })).toHaveLength(0)
+  })
+
+  it('tells the person how many came in after the page loaded', () => {
+    expect(changedSinceNotice(1)).toContain('1 ticket was added or changed since this page loaded')
+    expect(changedSinceNotice(3)).toContain('3 tickets were added or changed')
   })
 })
 

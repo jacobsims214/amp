@@ -385,7 +385,8 @@ export function Board() {
       {awaiting.length > 0 && (
         <div className="px-5 pt-3 flex-shrink-0">
           <PlanApprovalBanner variant="compact" projectId={pid} project={approval.project} awaiting={awaiting} people={people}
-            onApprove={() => { approval.approve() }} approving={approval.approving} error={approval.error} onOpen={setSelectedTaskId} />
+            onApprove={asOf => { approval.approve(asOf).then(r => { if (r.changed) refresh() }) }}
+            approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setSelectedTaskId} />
         </div>
       )}
 

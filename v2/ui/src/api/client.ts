@@ -33,7 +33,7 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `POST ${path}: ${res.status}`)
+    throw Object.assign(new Error(err.error || `POST ${path}: ${res.status}`), { status: res.status })
   }
   return res.json()
 }
@@ -167,8 +167,15 @@ export const api = {
     return get<ProjectReport>(`/projects/${projectId}/report?${q}`)
   },
   /** A person approves the project's plan as it stands now. */
-  approvePlan: (projectId: number) =>
-    post<{ project: Project }>(`/projects/${projectId}/approve-plan`).then(r => r.project),
+  /**
+   * Approve the plan as the person saw it. asOf is the newest planned_at among
+   * the tickets shown, verbatim from the API (#2192): tickets planned after it
+   * stay awaiting and come back in awaitingApproval. Without asOf (nothing
+   * shown, or an older server, which ignores the body) everything is approved.
+   */
+  approvePlan: (projectId: number, asOf?: string) =>
+    post<{ project: Project; awaiting_approval?: number[] }>(`/projects/${projectId}/approve-plan`, asOf ? { as_of: asOf } : undefined)
+      .then(r => ({ project: r.project, awaitingApproval: r.awaiting_approval ?? [] })),
   planCheck: (projectId: number) => get<PlanReport>(`/projects/${projectId}/plan-check`),
   updateTask: (id: number, req: UpdateTaskRequest) =>
     patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),
