@@ -621,7 +621,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"body":    str("REQUIRED. Comment text."),
-			"author":  str("Optional. Who is posting (defaults to 'agent')."),
+			"author":  str("Optional. Who is posting (defaults to 'agent'): your agent name. A person's email is recorded as '<email> (relayed by agent)'; to pass on a person's answer to a question, use amp_answer_question."),
 		}), wrap(ctx, s.guard(authz.Member, s.addComment)))
 
 	mcp.AddTool(tool("amp_get_task_comments", "Get all comments for a task.",
@@ -1898,7 +1898,7 @@ func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (
 	req := domain.AddCommentRequest{
 		TaskID:       taskID,
 		Body:         body,
-		Author:       optStr(args, "author", "agent"),
+		Author:       s.svc.CommentAuthor(rctx, caller(rctx).p, optStr(args, "author", "agent")),
 		AuthorUserID: caller(rctx).p.UserRef(),
 	}
 	replyCh := make(chan ReplyAddComment, 1)
