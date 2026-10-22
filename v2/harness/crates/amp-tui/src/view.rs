@@ -79,6 +79,9 @@ pub struct ChatView {
     tools: HashMap<String, Arc<ToolBlock>>,
     /// The retry indicator in the status slot, if one is shown.
     retry: Option<Arc<StatusIndicator>>,
+    /// The person asked the run to stop: its aborted (or failed) reply keeps what it streamed
+    /// and shows no error, since the shell says "Stopped." once (#2181).
+    stopping: bool,
 }
 
 impl Default for ChatView {
@@ -139,6 +142,7 @@ impl ChatView {
             assistant: None,
             tools: HashMap::new(),
             retry: None,
+            stopping: false,
         }
     }
 
@@ -241,6 +245,33 @@ impl ChatView {
         self.footer.set_status("");
     }
 
+    /// The text next to the working spinner ("Working…", or a short hint), keeping the spinner's
+    /// frame and elapsed time. Does nothing when no run is going.
+    pub fn set_working_message(&self, message: &str) {
+        if let Some(mut working) = self.editor.working()
+            && working.message != message
+        {
+            working.message = message.to_owned();
+            self.editor.set_working(Some(working));
+        }
+    }
+
+    /// The text next to the working spinner, if a run is going.
+    pub fn working_message(&self) -> Option<String> {
+        self.editor.working().map(|w| w.message)
+    }
+
+    /// The person asked the running reply to stop (see [`Self::stopping`]); cleared when the
+    /// run has finished.
+    pub fn set_stopping(&mut self, stopping: bool) {
+        self.stopping = stopping;
+    }
+
+    /// Whether the person asked the running reply to stop.
+    pub fn stopping(&self) -> bool {
+        self.stopping
+    }
+
     /// Ticks the retry countdown; returns whether one is shown.
     pub fn tick(&self) -> bool {
         match &self.retry {
@@ -272,7 +303,11 @@ impl ChatView {
             } => {
                 let component = self.current_assistant();
                 component.update_blocks(&blocks(m));
-                if matches!(m.stop_reason, StopReason::Error | StopReason::Aborted) {
+                // A reply the person stopped keeps what it streamed, with no error line: the
+                // shell adds one dim "Stopped." when the run ends (#2181).
+                let stopped = matches!(m.stop_reason, StopReason::Aborted)
+                    || (self.stopping && matches!(m.stop_reason, StopReason::Error));
+                if !stopped && matches!(m.stop_reason, StopReason::Error | StopReason::Aborted) {
                     let error = m.error_message.as_deref().unwrap_or(match m.stop_reason {
                         StopReason::Aborted => "aborted",
                         _ => "the model returned an error",
