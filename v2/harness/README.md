@@ -3,7 +3,8 @@
 AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) with an MCP client on
 `rmcp`. Design and build plan: AMP project 2 KB, `decisions/amp-harness-architecture.md`.
 
-Status: **M1-1 scaffold.** The workspace builds and `amp-harness --version` works; nothing else yet.
+Status: **M1-2.** The workspace builds and `amp-harness --version` works. `amp-mcp` connects to AMP
+(both MCP protocol eras), lists tools and calls them; the CLI does not use it yet (M1-4).
 
 ## Layout (D1)
 
@@ -22,6 +23,37 @@ scripts/smoke.sh      smoke test (grows per milestone)
 
 Dependencies only point one way: `amp-mcp <- amp-core <- amp-tui <- amp-harness`. Keep rpi out of
 `amp-mcp` so the MCP and OAuth code can be tested on its own.
+
+## Connecting to AMP (`amp-mcp`, D2/D4)
+
+| setting  | flag          | env                | `~/.config/amp-harness/config.toml` | default                          |
+|----------|---------------|--------------------|-------------------------------------|----------------------------------|
+| URL      | `--url`       | `AMP_MCP_URL`      | `[server] url`                      | `https://amp.simstech.cloud/mcp` |
+| extra CA | `--ca-file`   | `AMP_CA_FILE`      | `[server] ca_file`                  | none (system roots)              |
+| protocol | `--protocol`  | `AMP_MCP_PROTOCOL` | `[server] protocol`                 | `auto`                           |
+| token    | `--token-env` | `AMP_TOKEN`        | never                               | none                             |
+
+Flags beat env, env beats the file (`$XDG_CONFIG_HOME` is honoured). A relative `ca_file` is relative
+to the config file. `.amp.json` is a project marker only; its `amp_api` is not read.
+
+```toml
+[server]
+url = "https://amp.local:8443/mcp"
+ca_file = "amp-local-ca.crt"
+protocol = "auto"            # auto | 2026-07-28 | 2025-11-25
+```
+
+- `auto` speaks the stateless 2026-07-28 protocol (`server/discover`) and falls back to the legacy
+  `initialize` handshake at 2025-11-25 when the server is older. Forced modes are for compatibility
+  tests.
+- `AMP_TOKEN` (an `amp_…` token) is sent as `Authorization: Bearer`. It is held in memory only and
+  redacted from `Debug`. OAuth lands in M1-3.
+- Server instructions come from `server/discover` (or `initialize`). `tools/list` is cached for as
+  long as the server's `ttlMs` hint allows (AMP: 5 min, private). Every call has a 120 s timeout,
+  and a timeout is returned as an error.
+
+Tests run rmcp's own Streamable HTTP server in-process (`crates/amp-mcp/tests/`), in both eras, plus
+an HTTPS server signed by a throwaway CA for `--ca-file`.
 
 ## Dev loop
 

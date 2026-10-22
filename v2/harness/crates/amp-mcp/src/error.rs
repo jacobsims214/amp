@@ -1,0 +1,121 @@
+//! Errors from the AMP MCP client.
+
+use std::{path::PathBuf, time::Duration};
+
+use rmcp::{service::ClientInitializeError, service::ServiceError};
+
+/// Everything that can go wrong talking to AMP over MCP.
+///
+/// The model-facing adapter (M2) turns any `Err` from [`crate::AmpMcpClient::call_tool`] into a tool
+/// error the model can see; nothing here ever waits for a human.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum McpError {
+    /// Settings could not be resolved (bad URL, unreadable config file, bad protocol name, ...).
+    #[error("config: {0}")]
+    Config(String),
+
+    /// The extra root certificate file (`--ca-file` / `AMP_CA_FILE`) could not be used.
+    #[error("CA file {path}: {reason}")]
+    CaFile { path: PathBuf, reason: String },
+
+    /// The HTTP client could not be built.
+    #[error("http client: {0}")]
+    Http(String),
+
+    /// The server answered 401/403. `challenge` is its `WWW-Authenticate` header when it sent one;
+    /// the OAuth flow (M1-3) starts from it.
+    #[error("AMP authorization required (log in, or set AMP_TOKEN)")]
+    AuthRequired { challenge: Option<String> },
+
+    /// The MCP lifecycle (discover and/or initialize) failed.
+    #[error("connect to {url}: {source}")]
+    Connect {
+        url: String,
+        #[source]
+        source: Box<ClientInitializeError>,
+    },
+
+    /// Connecting took longer than the connect timeout.
+    #[error("connect to {url}: no answer within {after:?}")]
+    ConnectTimeout { url: String, after: Duration },
+
+    /// A request did not finish within its timeout. The request was cancelled.
+    #[error("{operation} timed out after {after:?}")]
+    Timeout { operation: String, after: Duration },
+
+    /// A request failed after the connection was established.
+    #[error("{operation}: {source}")]
+    Service {
+        operation: String,
+        #[source]
+        source: Box<ServiceError>,
+    },
+
+    /// The connection is closed; reconnect.
+    #[error("MCP connection is closed")]
+    Closed,
+}
+
+impl McpError {
+    /// True for a per-call (or connect) timeout.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout { .. } | Self::ConnectTimeout { .. })
+    }
+
+    /// True when the server rejected our credentials (or we sent none).
+    pub fn is_auth_required(&self) -> bool {
+        matches!(self, Self::AuthRequired { .. })
+    }
+
+    pub(crate) fn from_init(url: &str, error: ClientInitializeError) -> Self {
+        if error.is_authorization_required() {
+            return Self::AuthRequired {
+                challenge: error.auth_challenge().map(str::to_owned),
+            };
+        }
+        Self::Connect {
+            url: url.to_owned(),
+            source: Box::new(error),
+        }
+    }
+
+    pub(crate) fn from_service(operation: &str, error: ServiceError) -> Self {
+        if let Some(challenge) = auth_challenge_in_chain(&error) {
+            return Self::AuthRequired { challenge };
+        }
+        if matches!(error, ServiceError::TransportClosed) {
+            return Self::Closed;
+        }
+        Self::Service {
+            operation: operation.to_owned(),
+            source: Box::new(error),
+        }
+    }
+}
+
+/// Walks an error's source chain for the transport's 401/403 errors.
+/// `Some(None)` = authorization required without a challenge header.
+fn auth_challenge_in_chain(error: &(dyn std::error::Error + 'static)) -> Option<Option<String>> {
+    use rmcp::transport::{
+        auth::AuthError,
+        streamable_http_client::{AuthRequiredError, InsufficientScopeError},
+    };
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if let Some(auth) = e.downcast_ref::<AuthRequiredError>() {
+            return Some(Some(auth.www_authenticate_header.clone()));
+        }
+        if let Some(scope) = e.downcast_ref::<InsufficientScopeError>() {
+            return Some(Some(scope.www_authenticate_header.clone()));
+        }
+        if matches!(
+            e.downcast_ref::<AuthError>(),
+            Some(AuthError::AuthorizationRequired)
+        ) {
+            return Some(None);
+        }
+        current = e.source();
+    }
+    None
+}
