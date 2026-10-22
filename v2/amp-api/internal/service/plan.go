@@ -1110,22 +1110,43 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 // a person in the web UI can: never an agent, over MCP or with a token,
 // and never a manager on the strength of something said in chat.
 func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
+	proj, _, err := s.ApprovePlanAsOf(ctx, p, projectID, nil)
+	return proj, err
+}
+
+// ApprovePlanAsOf is ApprovePlan covering only what the person saw. asOf is
+// the newest planned_at on the page they approved from: tickets planned
+// after it (created, restored or re-scoped since the page loaded) are not
+// approved and keep awaiting approval; plan_approved_at becomes asOf (see
+// Repo.ApprovePlan for the caps). asOf nil approves everything planned up
+// to now, as ApprovePlan always did. It also returns the open tickets that
+// still await approval afterwards (empty when the approval covered them all).
+func (s *Service) ApprovePlanAsOf(ctx context.Context, p authz.Principal, projectID int, asOf *time.Time) (*domain.Project, []int, error) {
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := authz.RequireUI(p, "Plan approval", s.PlanURL(projectID)); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// Approval is the person saying "go" to the plan their agent drafted: any
 	// person on the project may give it (agent accounts can't, above).
-	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef())
+	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef(), asOf)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	awaiting, err := s.Repo.TasksAwaitingApproval(ctx, projectID, proj.PlanApprovedAt)
+	if err != nil {
+		return nil, nil, err
+	}
+	details := map[string]any{"channel": p.Channel}
+	if asOf != nil {
+		details["as_of"] = asOf.UTC().Format(time.RFC3339Nano)
+		details["still_awaiting"] = awaiting
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
-		Summary: fmt.Sprintf("approved the plan of %s", proj.Name), Details: map[string]any{"channel": p.Channel}})
+		Summary: fmt.Sprintf("approved the plan of %s", proj.Name), Details: details})
 	// Published here, not by the REST or MCP handler, so every way of
 	// approving refreshes open Flight plan pages the same way.
 	s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
-	return proj, nil
+	return proj, awaiting, nil
 }
