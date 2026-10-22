@@ -46,6 +46,11 @@ rmcp = { version = "=3.6.0", default-features = false, features = [
 
 clap = { version = "4.6", features = ["derive"] }
 
+# Embedded agent/skill assets (D5): v2/harness/assets, generated from v2/.opencode.
+include_dir = "0.7"
+# Agent/skill frontmatter. Same exact version rpi-harness pins, so there is one copy.
+yaml_serde = "=0.10.2"
+
 # OAuth credential store (D3): OS keychain via keyring 4.x (macOS Keychain, Windows Credential Manager,
 # Secret Service on Linux), with a 0600 file fallback. rmcp's CredentialStore trait is #[async_trait].
 keyring = "4.2"
