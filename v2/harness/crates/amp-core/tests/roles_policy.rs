@@ -183,6 +183,18 @@ fn manager_policy() {
         "git status \"\nrm -rf x\n\"",
         "ls 'unclosed",
         "ls <> created-file",
+        // #2140: git's `--output` writes the command's output to any path, so an allowed
+        // `git log` could write e.g. ~/.zshrc with fully controlled content.
+        "git log --output=x",
+        "git diff --output x",
+        "git log -1 --format='alias ls=rm%n' --output=~/.zshrc",
+        "git show --output=x",
+        "git log --outp=x",
+        "git log '--output'=x",
+        "git log --format=x --output-directory d",
+        "git log -o x",
+        "git log ${X:---output=x}",
+        "git log {--output=x,}",
     ] {
         assert!(!bash(&p, denied), "manager must not run: {denied}");
     }
@@ -204,6 +216,28 @@ fn manager_policy() {
         .unwrap_err();
     assert_eq!(d.reason, DenialReason::Deny);
     assert_eq!(d.rule.as_ref().unwrap().pattern, "*");
+    for ok in [
+        "git diff --stat",
+        "git log --format='--output=x' -1",
+        "git log -- --output",
+        "git log HEAD@{1} -1",
+    ] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+    let d = p
+        .check(
+            "bash",
+            &json!({"command": "git log -1 --format=x --output=~/.zshrc"}),
+        )
+        .unwrap_err();
+    assert_eq!(d.reason, DenialReason::Redirect);
+    assert!(d.to_string().contains("--output"), "{d}");
+    assert_eq!(
+        p.check("bash", &json!({"command": "git log {--output=x,}"}))
+            .unwrap_err()
+            .reason,
+        DenialReason::Unparseable
+    );
     assert_eq!(
         p.check("bash", &json!({"command": "git log > x"}))
             .unwrap_err()

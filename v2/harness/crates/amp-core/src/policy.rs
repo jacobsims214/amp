@@ -41,10 +41,15 @@
 //! Under a restricted bash policy (any bash rule that isn't `allow`), command substitution
 //! (`$(…)`, backticks, `<(…)`, `>(…)`) and output redirection to a file are denied outright. An
 //! allowlist like `"git status*": allow` would otherwise pass `git status $(rm -rf x)` or
-//! `ls > file`. Redirecting to `/dev/null` and duplicating a descriptor (`2>&1`) are fine.
+//! `ls > file`. Redirecting to `/dev/null` and duplicating a descriptor (`2>&1`) are fine. An
+//! option that writes output to a file counts as a redirect: `--output[=…]` (and its
+//! abbreviations and `--output-…` variants) for any command, and `-o…` after `git`
+//! ([`writes_via_option`]), since `"git log*": allow` would otherwise pass
+//! `git log -1 --format=… --output=~/.zshrc`.
 //!
 //! A script the lexer can't split with certainty is denied too ([`ShellScan::unparseable`]: an
-//! unbalanced quote, `$'…'`, or a newline left inside a command). A quote read differently from
+//! unbalanced quote, `$'…'`, a newline left inside a command, or `${X:-…}` / brace expansion, which
+//! could turn into an option the harness can't see). A quote read differently from
 //! bash would hide whole commands inside one that matches an allow rule, so the harness fails
 //! closed.
 //!
@@ -293,10 +298,16 @@ pub struct ShellScan {
     pub writes_file: bool,
     /// The lexer can't be sure it split the script the way bash will: a quote is still open at
     /// the end, the script uses ANSI-C quoting (`$'…'`), or a command still contains a newline
-    /// after splitting (a quoted newline, or a here-document body). A restricted policy denies
+    /// after splitting (a quoted newline, or a here-document body), or a word uses `${…}` with an
+    /// operator or brace expansion (`{a,b}`, `{a..b}`), which can expand to an option such as
+    /// `--output` that the harness never sees ([`shell_words`]). A restricted policy denies
     /// these rather than guess, because a quote the lexer reads differently from bash can hide
     /// whole commands inside what looks like one allowed command.
     pub unparseable: bool,
+    /// A command passes an option that writes its output to a file: `--output[=…]` (git's diff
+    /// option, and any abbreviation or `--output-…` variant of it, for any command), or `-o…`
+    /// after a `git` word (`git format-patch -o <dir>`). See [`writes_via_option`].
+    pub output_option: bool,
 }
 
 /// Split a script on `&&`, `||`, `;`, `|`, `&` and newlines outside quotes, dropping comments. This
@@ -442,7 +453,152 @@ pub fn scan_shell(script: &str) -> ShellScan {
     if scan.commands.iter().any(|c| c.contains('\n')) {
         scan.unparseable = true;
     }
+    for cmd in &scan.commands {
+        let (words, uncertain) = shell_words(cmd);
+        scan.unparseable |= uncertain;
+        scan.output_option |= writes_via_option(&words);
+    }
     scan
+}
+
+/// Split one command into words the way bash would before expansion, with quotes and escapes
+/// removed. The flag is true when bash would expand a word into text the lexer can't see:
+/// `${…}` with an operator (`${X:---output=f}`; a plain `${NAME}` is fine) or brace expansion (`{--output=f,}`,
+/// `{a..b}`). `$(…)` and backticks are [`ShellScan::substitution`]; `$'…'` is already
+/// unparseable, and is treated here like `'…'`.
+fn shell_words(cmd: &str) -> (Vec<String>, bool) {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut uncertain = false;
+    // Unquoted `{` not yet closed, for spotting brace expansion.
+    let mut braces = 0usize;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\\' => {
+                if let Some(n) = next {
+                    word.push(n);
+                }
+                in_word = true;
+                i += 2;
+                continue;
+            }
+            '\'' => {
+                // `'…'`, or the body of `$'…'` (where `\` escapes the next character).
+                let ansi = word.ends_with('$') && i > 0 && chars[i - 1] == '$';
+                if ansi {
+                    word.pop();
+                }
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if ansi && chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    word.push(chars[i]);
+                    i += 1;
+                }
+                in_word = true;
+                i += 1;
+                continue;
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    } else if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+                        uncertain |= plain_param_end(&chars, i).is_none();
+                    }
+                    word.push(chars[i]);
+                    i += 1;
+                }
+                in_word = true;
+                i += 1;
+                continue;
+            }
+            '$' if next == Some('{') => match plain_param_end(&chars, i) {
+                Some(end) => {
+                    // `${NAME}` is just `$NAME`: no braces to expand.
+                    word.extend(&chars[i..=end]);
+                    in_word = true;
+                    i = end + 1;
+                    continue;
+                }
+                None => uncertain = true,
+            },
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            ',' if braces > 0 => uncertain = true,
+            '.' if braces > 0 && next == Some('.') => uncertain = true,
+            _ => {}
+        }
+        if c.is_whitespace() {
+            if in_word {
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+            braces = 0;
+        } else {
+            word.push(c);
+            in_word = true;
+        }
+        i += 1;
+    }
+    if in_word {
+        words.push(word);
+    }
+    (words, uncertain)
+}
+
+/// `chars[at..]` starts with `${`. The index of the closing `}` when the expansion is a plain
+/// `${NAME}` (or `${1}`), which expands to a variable's value and nothing else; `None` for any
+/// operator (`${X:-…}`, `${X/a/b}`, `${!X}`, …), whose result the lexer can't know.
+fn plain_param_end(chars: &[char], at: usize) -> Option<usize> {
+    let start = at + 2;
+    let len = chars[start.min(chars.len())..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+        .count();
+    let end = start + len;
+    (len > 0 && chars.get(end) == Some(&'}')).then_some(end)
+}
+
+/// True when a command's words (from [`shell_words`]) include an option that makes the command
+/// write its output to a file, which a restricted bash policy denies like a `>` redirect:
+/// - for any command, `--output` / `--output=…` (git log/diff/show/format-patch), an
+///   abbreviation of it (`--outp=…`, which some git versions accept), or a longer option that
+///   starts with it (`--output-directory`; this also catches the harmless
+///   `--output-indicator-*`);
+/// - after a `git` word, `-o` / `-o<dir>` (`git format-patch -o <dir>`). Elsewhere `-o` means
+///   other things (`ls -o`), so it is left to the allow rules.
+///
+/// git's revision parser (log, show, diff) does not bundle short options, so `-po` is not
+/// checked. `--ext-diff` / `--textconv` only run a diff driver set in git config, which a
+/// restricted role cannot change, so they are not denied.
+pub fn writes_via_option(words: &[String]) -> bool {
+    let mut after_git = false;
+    for w in words {
+        if w == "--" {
+            // The end of options: what follows is paths (`git log -- --output` is a file).
+            break;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or_default();
+            if !name.is_empty() && ("output".starts_with(name) || name.starts_with("output")) {
+                return true;
+            }
+        } else if after_git && w.starts_with("-o") {
+            return true;
+        }
+        if w == "git" || w.ends_with("/git") {
+            after_git = true;
+        }
+    }
+    false
 }
 
 /// `chars[at]` is `>`. True unless the target is a descriptor (`>&2`, `2>&1`, `>&-`) or
@@ -497,7 +653,9 @@ pub enum DenialReason {
     ChildDispatch,
     /// Command substitution under a restricted bash policy.
     Substitution,
-    /// Output redirection to a file under a restricted bash policy.
+    /// Output written to a file under a restricted bash policy: a redirect
+    /// ([`ShellScan::writes_file`]) or an option such as `--output`
+    /// ([`ShellScan::output_option`]).
     Redirect,
     /// A script the lexer can't split with certainty, under a restricted bash policy
     /// ([`ShellScan::unparseable`]).
@@ -532,17 +690,18 @@ impl fmt::Display for Denial {
             ),
             DenialReason::Redirect => write!(
                 f,
-                "{who}: redirecting output to a file is not allowed under this role's bash \
-                 rules: `{}`. {tail}",
+                "{who}: writing output to a file (a `>` redirect, or an option such as \
+                 `--output` or `git ... -o`) is not allowed under this role's bash rules: \
+                 `{}`. {tail}",
                 self.subject
             ),
             DenialReason::Unparseable => write!(
                 f,
                 "{who}: the harness can't split this script into commands with certainty, so \
                  it is not allowed under this role's bash rules: `{}`. It denies unbalanced \
-                 quotes, ANSI-C quoting ($'...'), and newlines inside quotes or \
-                 here-documents. Write each command plainly, one per line or joined with && \
-                 or ;. {tail}",
+                 quotes, ANSI-C quoting ($'...'), newlines inside quotes or \
+                 here-documents, and ${{X:-...}} or {{a,b}} expansion. Write each command \
+                 plainly, one per line or joined with && or ;. {tail}",
                 self.subject
             ),
             DenialReason::BadArguments => write!(
@@ -686,7 +845,7 @@ impl ToolPolicy {
                     if scan.substitution {
                         return Err(deny(script.to_string(), DenialReason::Substitution));
                     }
-                    if scan.writes_file {
+                    if scan.writes_file || scan.output_option {
                         return Err(deny(script.to_string(), DenialReason::Redirect));
                     }
                 }
@@ -955,6 +1114,71 @@ mod tests {
         );
         assert!(!scan_shell("ls > /dev/null 2>&1").writes_file);
         assert!(!scan_shell("echo 'a > b'").writes_file);
+    }
+
+    fn words(cmd: &str) -> Vec<String> {
+        shell_words(cmd).0
+    }
+
+    #[test]
+    fn shell_words_unquote_like_bash() {
+        assert_eq!(
+            words("git log  -1 --oneline"),
+            ["git", "log", "-1", "--oneline"]
+        );
+        assert_eq!(words("git log '--out'put=x"), ["git", "log", "--output=x"]);
+        assert_eq!(
+            words("git log \"--output\"=x"),
+            ["git", "log", "--output=x"]
+        );
+        assert_eq!(words("git log --out\\put=x"), ["git", "log", "--output=x"]);
+        assert_eq!(words("git log $'--output'=x"), ["git", "log", "--output=x"]);
+        assert_eq!(words("echo 'a b' \"c d\""), ["echo", "a b", "c d"]);
+        assert!(!shell_words("git log HEAD@{1} --format='%h {a,b}'").1);
+        assert!(!shell_words("ls $HOME").1);
+        assert!(!shell_words("ls \"/${HOME}\" /${A_1}x").1);
+        for expands in [
+            "git log ${X:---output=f}",
+            "git log \"${X:---output=f}\"",
+            "git log {--output=f,}",
+            "git log --o{u,}tput=f",
+            "ls {a..c}",
+        ] {
+            assert!(shell_words(expands).1, "{expands}");
+        }
+    }
+
+    #[test]
+    fn output_options_count_as_writing_a_file() {
+        for writes in [
+            "git log --output=x",
+            "git diff --output x",
+            "git log -1 --format='%n' --output=~/.zshrc",
+            "git show --outp=x",
+            "git log --o=x",
+            "git format-patch --output-directory d",
+            "git format-patch -o d",
+            "git format-patch -od",
+            "/usr/bin/git log -o x",
+            "git log '--output'=x",
+            "git log --out\\put=x",
+            "anything --output=x",
+            "ls && git diff --output=x",
+        ] {
+            assert!(scan_shell(writes).output_option, "{writes}");
+        }
+        for reads in [
+            "git log --oneline -5",
+            "git diff HEAD~1 --stat",
+            "git show HEAD",
+            "git log --format='--output=x'",
+            "git log -- --output",
+            "ls -o",
+            "git status --porcelain",
+            "git log --ours",
+        ] {
+            assert!(!scan_shell(reads).output_option, "{reads}");
+        }
     }
 
     /// The review #2101 bypasses: `$'…'` and `#` comments used to desync the lexer from bash, so
