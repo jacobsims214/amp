@@ -607,17 +607,17 @@ fn ticket_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
         };
         rows.push(Row::new(vec![label(word), flex(reason, color)]));
     }
+    // AMP's own fields; one left empty is left out rather than shown as "-" (#2187).
+    let mut fields = vec![format!("state {}", t.state)];
+    if let Some(a) = t.assigned_to.as_deref().filter(|a| !a.is_empty()) {
+        fields.push(format!("assigned {a}"));
+    }
+    if let Some(d) = t.dispatched_at.as_deref().filter(|d| !d.is_empty()) {
+        fields.push(format!("dispatched {d}"));
+    }
     rows.push(Row::new(vec![
         label("AMP     "),
-        flex(
-            &format!(
-                "state {} · assigned {} · dispatched {}",
-                t.state,
-                t.assigned_to.as_deref().unwrap_or("-"),
-                t.dispatched_at.as_deref().unwrap_or("-")
-            ),
-            c.muted,
-        ),
+        flex(&fields.join(" · "), c.muted),
     ]));
     let report = match data.reports.get(&id) {
         Some(ReportState::Reported) => Some(c.success.fg("this session reported its run ✓")),
@@ -723,9 +723,12 @@ fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
             ),
         };
         let u = &w.totals.usage;
+        let model = match w.model.as_deref().filter(|m| !m.is_empty()) {
+            Some(m) => format!("{m} · "),
+            None => String::new(),
+        };
         let detail = format!(
-            "{} · {} · ↑{} ↓{} ${:.2}",
-            w.model.as_deref().unwrap_or("-"),
+            "{model}{} · ↑{} ↓{} ${:.2}",
             elapsed(w.since),
             tokens(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens),
             tokens(u.output_tokens),

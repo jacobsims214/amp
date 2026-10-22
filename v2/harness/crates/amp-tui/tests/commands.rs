@@ -258,6 +258,64 @@ async fn ticket_shows_and_switches_the_current_ticket() {
     assert_fits(&rig);
 }
 
+/// UX review #2175 finding 12 (#2187): a current ticket that completes stops being current (no
+/// "■ Done #id" pinned under the header for the rest of the session), and the /ticket panel
+/// leaves empty fields out instead of printing "-".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_done_ticket_stops_being_current() {
+    let mut rig = rig(vec![], true).await;
+    rig.settle().await;
+    assert_eq!(rig.meta.snapshot().ticket_id, Some(2106));
+    assert!(rig.screen().contains("manager · #2106"), "{}", rig.screen());
+
+    // The ticket completes mid-session (a poll finds it done, no assignee or dispatch time).
+    rig.meta.stub_update(|m| {
+        let t = m.ticket.value.as_mut().unwrap();
+        t.state = "completed".into();
+        t.status = amp_core::tickets::Status::Done;
+        t.assigned_to = None;
+        t.dispatched_at = None;
+    });
+    rig.settle().await;
+    assert_eq!(rig.meta.snapshot().ticket_id, None, "cleared on completion");
+    let screen = rig.screen();
+    assert!(
+        screen.contains("── ■ Done #2106 M3-3 Header and AMP status line ──"),
+        "the Done marker says what happened\n{screen}"
+    );
+    assert!(
+        !screen.contains("no current ticket"),
+        "no second marker\n{screen}"
+    );
+    assert!(
+        !screen.contains("#2106\n") && !screen.contains("· #2106"),
+        "{screen}"
+    );
+
+    // `/ticket 2106` on the done ticket: it stays current while its panel is open, the AMP row
+    // has no "-" placeholders, and it goes when the panel closes.
+    rig.say("/ticket 2106").await;
+    assert_eq!(rig.meta.snapshot().ticket_id, Some(2106));
+    let screen = rig.screen();
+    assert!(screen.contains("› ■ Done #2106"), "{screen}");
+    let amp_row = screen
+        .lines()
+        .find(|l| l.contains("AMP      state completed"))
+        .unwrap_or_else(|| panic!("AMP row\n{screen}"));
+    assert!(!amp_row.contains(" -"), "{amp_row}");
+    assert!(
+        !amp_row.contains("assigned") && !amp_row.contains("dispatched"),
+        "{amp_row}"
+    );
+    assert!(rig.press(KeyCode::Esc).await);
+    assert_eq!(
+        rig.meta.snapshot().ticket_id,
+        None,
+        "cleared once the panel closed"
+    );
+    assert_fits(&rig);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn workers_lists_local_and_remote_workers() {
     let mut rig = rig(vec![], true).await;
