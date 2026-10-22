@@ -28,22 +28,25 @@ export OPENROUTER_API_KEY=...       # the shipped roles run on OpenRouter models
 amp-harness config show --check
 
 # 3a. Against compose (auth off; on the dev Mac amp-api is published on :18000, see Smoke test).
-export AMP_MCP_URL=http://localhost:18000/mcp
+amp-harness server set localhost:18000 --name local   # checks it, finds the UI on :5173, saves it
 amp-harness doctor
 amp-harness                          # chat with the manager; /help lists the commands
 
 # 3b. Or against the docker-desktop cluster (OAuth, self-signed CA).
 kubectl --context docker-desktop -n amp get secret amp-ca-secret \
   -o jsonpath='{.data.tls\.crt}' | base64 -d > amp-local-ca.crt
-amp-harness login  --url https://amp.local/mcp --ca-file amp-local-ca.crt
-amp-harness doctor --url https://amp.local/mcp --ca-file amp-local-ca.crt
-amp-harness        --url https://amp.local/mcp --ca-file amp-local-ca.crt
+amp-harness server set amp.local --name cluster --ca-file amp-local-ca.crt   # offers the login
+amp-harness doctor
+
+# Switch any time; each server keeps its own login.
+amp-harness server                   # the server in effect, where each setting comes from, the saved ones
+amp-harness server use local
 ```
 
 Run it from a directory with an `.amp.json` (its `project_id` is the default project), or tell the
 manager which project to use. `amp-harness run -p "What is on the board?"` does the same without
-the TUI. To drop the flags, put `url` and `ca_file` under `[server]` in
-`~/.config/amp-harness/config.toml`.
+the TUI. In the chat, `/server` lists the saved servers and `/server <name>` switches to one without
+a restart. `--url` / `AMP_MCP_URL` still work for one command or one shell.
 
 ## Layout (D1)
 
@@ -96,6 +99,60 @@ protocol = "auto"            # auto | 2026-07-28 | 2025-11-25
 
 Tests run rmcp's own Streamable HTTP server in-process (`crates/amp-mcp/tests/`), in both eras, plus
 an HTTPS server signed by a throwaway CA for `--ca-file`.
+
+### Saved servers: `amp-harness server` and `/server` (#2164)
+
+Nobody has to edit config.toml or export `AMP_MCP_URL` to point the harness at an AMP:
+
+```sh
+amp-harness server [--json]                      # the server in effect: URL, web UI, CA file, protocol, auth,
+                                                 # each with its source (flag / env / config / default), and the saved servers
+amp-harness server set <url> [--name N] [--web-url U] [--ca-file PEM] [--protocol P] [--yes] [--json]
+amp-harness server use <name> [--yes] [--json]   # make a saved server the active one
+amp-harness server remove <name>
+```
+
+- `set` takes `host`, `host:port` or a full URL, like the first run (`localhost` gets http, anything
+  else https, `/mcp` is added when there is no path). It connects first (discovery, then
+  `amp_whoami`): a server that does not answer is never saved; one that answers 401 is saved and,
+  in a terminal, offers the browser login right away (`--yes` never asks: it prints the `login` to
+  run). A refused `AMP_TOKEN` is reported by its variable, never its value.
+- The web UI address is found, not asked for: nothing is saved when the server's own origin serves
+  the UI; docker compose's UI on `:5173` is found by a probe. Only an address no probe finds is
+  asked for (`--web-url` answers it up front).
+- The name defaults to `hosted` (hosted AMP), `local` (localhost) or the host's first label. Running
+  `set` again for a saved URL keeps its CA file, protocol and web UI unless given.
+- `use` switches without checking first, but says when the server does not answer and offers the
+  login it needs. Logins are kept per server URL, so every saved server keeps its own.
+- `AMP_MCP_URL` and `--url` still win over the saved server; `server` and `set` say so when one is set.
+- In the chat, `/server` lists the saved servers (the current one marked) and `/server <name>` (or
+  `/server <address>`, which also saves it) switches the session without a restart: it connects to
+  the new server first (a failure leaves everything as it was), then moves the session's AMP
+  connection, gives the model the new server's AMP tools and server details in its system prompt
+  (from the next reply; the transcript stays), and starts a new metadata poller for the header and
+  the AMP commands. It is refused while a reply or a worker is running. The new server is saved as
+  the active one, so the next start uses it too.
+
+In config.toml, `[server]` is still the server in effect (so every command, and older builds, read
+it), with `name` naming the saved server it came from; saved servers are `[servers.<name>]` tables
+with the same keys. Every write keeps your comments and other settings (it is refused unless the
+file parses to exactly what it was plus the change), backs the old file up to `config.toml.bak`, and
+never holds a secret. A `[server]` you wrote by hand is kept as a saved server when another one
+becomes active.
+
+```toml
+[server]                     # the server in effect (written by `server set` / `server use`)
+name = "local"
+url = "http://localhost:18000/mcp"
+web_url = "http://localhost:5173"
+
+[servers.local]
+url = "http://localhost:18000/mcp"
+web_url = "http://localhost:5173"
+
+[servers.hosted]
+url = "https://amp.simstech.cloud/mcp"
+```
 
 ### Logging in (OAuth, D3)
 
@@ -346,7 +403,8 @@ JSONL session under `~/.local/state/amp-harness/sessions/<role>/` unless `--no-s
 terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
 
 - Commands: `/model` lists the current model and every model whose provider has a key;
-  `/model provider/model` switches this session's model. `/usage` prints the session's tokens and
+  `/model provider/model` switches this session's model. `/server` lists the saved AMP servers and
+  `/server <name|address>` switches the session to one without a restart (see Saved servers). `/usage` prints the session's tokens and
   cost, `/help`, `/abort`, `/quit` (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits.
