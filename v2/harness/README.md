@@ -488,7 +488,13 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   servers). `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/quit` (also
   `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
-  else clears the editor, else quits; Ctrl-D on an empty editor quits.
+  else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T expands (or collapses
+  again) the last thinking section.
+- Thinking (#2177) is collapsed by default: one dim line per section, `Thinking · 18s ▸`, which
+  shows the model's latest sentence while it thinks and stops its timer when the answer starts.
+  Expanded (Ctrl+T, or `show_thinking = "full"`), it is plain dim text behind a `│` gutter, with no
+  markdown styling, so it never reads like the answer. The session file always keeps the full
+  thinking.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
 
@@ -497,16 +503,20 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
 The chat uses the AMP theme: `amp-dark` or `amp-light` (provisional simstech tokens v1, #1815),
 with square borders and AMP's ticket-state, epic and brand colours.
 
-| setting | flag      | env                 | `config.toml` `[tui]` | default |
-|---------|-----------|---------------------|-----------------------|---------|
-| theme   | `--theme` | `AMP_HARNESS_THEME` | `theme`               | `auto`  |
-| colours | -         | `AMP_HARNESS_COLOR` | `color`               | `auto`  |
+| setting  | flag      | env                         | `config.toml` `[tui]` | default     |
+|----------|-----------|-----------------------------|-----------------------|-------------|
+| theme    | `--theme` | `AMP_HARNESS_THEME`         | `theme`               | `auto`      |
+| colours  | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
+| thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
 
 - `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
   background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
   file (same JSON format as `crates/amp-tui/themes/amp-dark.json`).
 - `color`: `auto` uses 24-bit colour when `COLORTERM` is `truecolor`/`24bit`, else the 256-colour
   fallbacks. `truecolor` or `256` forces one.
+- `show_thinking`: `collapsed` (one `Thinking · Ns ▸` line per section; Ctrl+T expands the last
+  one), `full` (every section expanded as plain dim text) or `hidden` (none shown; Ctrl+T still
+  shows the last one).
 
 ### Header and status line (M3-3)
 

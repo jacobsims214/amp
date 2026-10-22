@@ -34,7 +34,7 @@ use amp_core::events::{stop_reason_str, tool_result_text};
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::overlay::Panel;
-use crate::transcript::{AssistantBlock, Block, ToolBlock, UserBlock, WrapText};
+use crate::transcript::{AssistantBlock, Block, ThinkingDisplay, ToolBlock, UserBlock, WrapText};
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
@@ -79,6 +79,10 @@ pub struct ChatView {
     tools: HashMap<String, Arc<ToolBlock>>,
     /// The retry indicator in the status slot, if one is shown.
     retry: Option<Arc<StatusIndicator>>,
+    /// How thinking shows (`[tui] show_thinking`, #2177).
+    show_thinking: ThinkingDisplay,
+    /// The last assistant message with thinking: what Ctrl+T expands.
+    last_thinking: Option<Arc<AssistantBlock>>,
 }
 
 impl Default for ChatView {
@@ -139,7 +143,24 @@ impl ChatView {
             assistant: None,
             tools: HashMap::new(),
             retry: None,
+            show_thinking: ThinkingDisplay::default(),
+            last_thinking: None,
         }
+    }
+
+    /// How new assistant messages show their thinking (#2177).
+    pub fn set_show_thinking(&mut self, display: ThinkingDisplay) {
+        self.show_thinking = display;
+    }
+
+    pub fn show_thinking(&self) -> ThinkingDisplay {
+        self.show_thinking
+    }
+
+    /// Expands or collapses the last thinking section (Ctrl+T). `None` when there is none yet,
+    /// else whether it is now expanded.
+    pub fn toggle_thinking(&self) -> Option<bool> {
+        self.last_thinking.as_ref()?.toggle_thinking()
     }
 
     /// The layout root to hand to the TUI.
@@ -261,17 +282,18 @@ impl ChatView {
             } => {
                 self.clear_retry();
                 let component = self.start_assistant();
-                component.update_blocks(&blocks(m));
+                self.update_assistant(&component, &blocks(m));
             }
             AgentEvent::MessageUpdate { message, .. } => {
                 let component = self.current_assistant();
-                component.update_blocks(&blocks(message));
+                self.update_assistant(&component, &blocks(message));
             }
             AgentEvent::MessageEnd {
                 message: AgentMessage::Assistant(m),
             } => {
                 let component = self.current_assistant();
-                component.update_blocks(&blocks(m));
+                component.finish();
+                self.update_assistant(&component, &blocks(m));
                 if matches!(m.stop_reason, StopReason::Error | StopReason::Aborted) {
                     let error = m.error_message.as_deref().unwrap_or(match m.stop_reason {
                         StopReason::Aborted => "aborted",
@@ -361,8 +383,15 @@ impl ChatView {
         }
     }
 
+    fn update_assistant(&mut self, component: &Arc<AssistantBlock>, blocks: &[Block]) {
+        component.update_blocks(blocks);
+        if component.has_thinking() {
+            self.last_thinking = Some(Arc::clone(component));
+        }
+    }
+
     fn start_assistant(&mut self) -> Arc<AssistantBlock> {
-        let component = Arc::new(AssistantBlock::new());
+        let component = Arc::new(AssistantBlock::with_thinking(self.show_thinking));
         self.transcript.add_child(component.clone());
         self.assistant = Some(component.clone());
         component

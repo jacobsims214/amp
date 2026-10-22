@@ -241,6 +241,9 @@ async fn event_loop(
                             } else {
                                 break;
                             }
+                        } else if is_ctrl(&key, 't') {
+                            // Expand or collapse the last thinking (#2177).
+                            shell.toggle_thinking();
                         } else if shell.panel_key(&key, editor_empty) {
                             // An open AMP panel took it (select, answer, open, close).
                         } else if key.code == KeyCode::Esc && shell.is_running() {

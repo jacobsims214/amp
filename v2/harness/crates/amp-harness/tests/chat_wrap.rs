@@ -43,18 +43,38 @@ const URL: &str = "https://amp.simstech.cloud/project/45/board?task=132&view=tim
 
 const SIZES: [(usize, usize); 2] = [(80, 24), (127, 46)];
 
-fn setup(name: &str, script: Value) -> std::path::PathBuf {
+fn setup(name: &str, script: Value, extra_config: &str) -> std::path::PathBuf {
     let dir = workdir(name, Some(2));
     let config = dir.join("home/.config/amp-harness");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.toml"), FAUX_CONFIG).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!("{FAUX_CONFIG}{extra_config}"),
+    )
+    .unwrap();
     std::fs::write(dir.join("script.json"), script.to_string()).unwrap();
     dir
 }
 
 async fn snapshot(name: &str, script: Value, size: (usize, usize), inputs: &[&str]) -> Vec<String> {
+    snapshot_env(name, script, size, inputs, &[], "").await
+}
+
+/// [`snapshot`] with more environment (`AMP_HARNESS_SHOW_THINKING`).
+async fn snapshot_env(
+    name: &str,
+    script: Value,
+    size: (usize, usize),
+    inputs: &[&str],
+    env: &[(&str, &str)],
+    extra_config: &str,
+) -> Vec<String> {
     let amp = spawn(MockAmp::new(), None).await;
-    let dir = setup(&format!("{name}-{}x{}", size.0, size.1), script);
+    let dir = setup(
+        &format!("{name}-{}x{}", size.0, size.1),
+        script,
+        extra_config,
+    );
     let script_path = dir.join("script.json");
     let state = dir.join("home/.local/state");
     let geometry = format!("{}x{}", size.0, size.1);
@@ -62,16 +82,12 @@ async fn snapshot(name: &str, script: Value, size: (usize, usize), inputs: &[&st
     for input in inputs {
         args.extend(["--input", input]);
     }
-    let out: Output = run(
-        &dir,
-        &amp.url,
-        &args,
-        &[
-            ("AMP_HARNESS_FAUX_SCRIPT", script_path.to_str().unwrap()),
-            ("XDG_STATE_HOME", state.to_str().unwrap()),
-        ],
-    )
-    .await;
+    let mut vars = vec![
+        ("AMP_HARNESS_FAUX_SCRIPT", script_path.to_str().unwrap()),
+        ("XDG_STATE_HOME", state.to_str().unwrap()),
+    ];
+    vars.extend_from_slice(env);
+    let out: Output = run(&dir, &amp.url, &args, &vars).await;
     assert_eq!(
         out.code, 0,
         "stderr: {}\nstdout: {}",
@@ -162,11 +178,37 @@ async fn a_long_answer_with_a_list_wraps_at_words() {
     }
 }
 
+/// Thinking shown in full (#2177: collapsed by default): plain rows behind ` │ `, gutter removed
+/// so the wrap checks see the text at the transcript's padding.
+async fn full_thinking(
+    name: &str,
+    script: Value,
+    size: (usize, usize),
+    input: &str,
+) -> Vec<String> {
+    let screen = snapshot_env(
+        name,
+        script,
+        size,
+        &[input],
+        &[("AMP_HARNESS_SHOW_THINKING", "full")],
+        "",
+    )
+    .await;
+    screen
+        .iter()
+        .map(|r| match r.strip_prefix(" │") {
+            Some(rest) => format!(" {}", rest.strip_prefix(' ').unwrap_or(rest)),
+            None => r.clone(),
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn thinking_wraps_at_words() {
     for size in SIZES {
         let script = json!([{ "thinking": THINKING, "text": "Done." }]);
-        let screen = snapshot("wrap-thinking", script, size, &["explain waves"]).await;
+        let screen = full_thinking("wrap-thinking", script, size, "explain waves").await;
         check(&screen, &[THINKING], size.0);
         assert!(
             screen.iter().any(|r| r.contains("silly and repetitive.")),
@@ -179,13 +221,14 @@ async fn thinking_wraps_at_words() {
 async fn numbered_lists_in_thinking_hang_under_their_text() {
     for size in SIZES {
         let script = json!([{ "thinking": THINKING_STEPS, "text": "Planned." }]);
-        let screen = snapshot("wrap-steps", script, size, &["plan it"]).await;
+        let screen = full_thinking("wrap-steps", script, size, "plan it").await;
         check(&screen, &[THINKING_STEPS], size.0);
-        // pad 1 + "  3. ": continuations start at column 6.
+        // Plain text (no markdown list styling): pad 1 + "3. " (the gutter is stripped), so
+        // continuations start at column 4.
         let item = rows_from(&screen, "3. Create epic?");
-        assert!(item[0].starts_with("   3. Create epic?"), "{item:?}");
+        assert!(item[0].starts_with(" 3. Create epic?"), "{item:?}");
         assert!(
-            item[1].starts_with("      ") && !item[1].starts_with("       "),
+            item[1].starts_with("    ") && !item[1].starts_with("     "),
             "{item:?}"
         );
     }
@@ -216,4 +259,154 @@ async fn a_token_wider_than_the_row_still_breaks() {
         assert!(joined.starts_with(URL), "{rows:?}");
         assert!(screen.iter().any(|r| r.trim() == "Open"), "{screen:?}");
     }
+}
+
+// #2177: thinking is collapsed by default.
+
+/// Rows that show a thinking header: `Thinking · 3s ▸` (or `Thinking ▸` without a duration).
+fn thinking_headers(screen: &[String]) -> Vec<&String> {
+    screen
+        .iter()
+        .filter(|r| {
+            r.starts_with(" Thinking ·")
+                || r.starts_with(" Thinking ▸")
+                || r.starts_with(" Thinking ▾")
+        })
+        .collect()
+}
+
+/// Session files under the snapshot's state dir, read whole.
+fn session_text(name: &str, size: (usize, usize)) -> String {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("amp-harness-cli")
+        .join(format!("{name}-{}x{}", size.0, size.1))
+        .join("home/.local/state/amp-harness/sessions");
+    let mut text = String::new();
+    let mut stack = vec![dir];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                text.push_str(&std::fs::read_to_string(&path).unwrap_or_default());
+            }
+        }
+    }
+    text
+}
+
+#[tokio::test]
+async fn thinking_shows_one_line_per_turn_by_default() {
+    for size in SIZES {
+        let script = json!([
+            { "thinking": THINKING, "text": "Done." },
+            { "thinking": THINKING_STEPS, "text": "Planned." }
+        ]);
+        let screen = snapshot(
+            "think-collapsed",
+            script,
+            size,
+            &["explain waves", "plan it"],
+        )
+        .await;
+        let text = screen.join("\n");
+        let headers = thinking_headers(&screen);
+        assert_eq!(headers.len(), 2, "one thinking line per turn:\n{text}");
+        for h in &headers {
+            // Collapsed once the answer started: the duration and ▸, no sentence after it.
+            assert!(h.trim_end().ends_with('▸'), "{h:?}\n{text}");
+        }
+        for phrase in ["silly and repetitive", "The user is asking", "Create epic?"] {
+            assert!(!text.contains(phrase), "{phrase:?} shown:\n{text}");
+        }
+        assert!(screen.iter().any(|r| r == " Done."), "{text}");
+        assert!(screen.iter().any(|r| r == " Planned."), "{text}");
+    }
+    // The session file keeps the whole thinking.
+    let session = session_text("think-collapsed", SIZES[0]);
+    assert!(session.contains("silly and repetitive"), "{session}");
+    assert!(session.contains("I need an epic."), "{session}");
+}
+
+#[tokio::test]
+async fn ctrl_t_expands_the_last_thinking() {
+    let size = SIZES[1];
+    let script = json!([
+        { "thinking": THINKING, "text": "Done." },
+        { "thinking": THINKING_STEPS, "text": "Planned." }
+    ]);
+    let screen = snapshot(
+        "think-expand",
+        script.clone(),
+        size,
+        &["explain waves", "plan it", "key:ctrl+t"],
+    )
+    .await;
+    let text = screen.join("\n");
+    let headers = thinking_headers(&screen);
+    assert_eq!(headers.len(), 2, "{text}");
+    assert!(
+        headers[0].trim_end().ends_with('▸'),
+        "the first stays collapsed:\n{text}"
+    );
+    assert!(
+        headers[1].trim_end().ends_with('▾'),
+        "the last is expanded:\n{text}"
+    );
+    assert!(!text.contains("silly and repetitive"), "{text}");
+    // Plain rows behind the gutter, not a markdown list.
+    let item = rows_from(&screen, "3. Create epic?");
+    assert!(item[0].starts_with(" │ 3. Create epic?"), "{item:?}");
+    assert!(screen.iter().any(|r| r == " │ Steps:"), "{text}");
+
+    // Pressed again, it collapses.
+    let screen = snapshot(
+        "think-expand-twice",
+        script,
+        size,
+        &["explain waves", "plan it", "key:ctrl+t", "key:ctrl+t"],
+    )
+    .await;
+    let text = screen.join("\n");
+    assert!(!text.contains("Create epic?"), "{text}");
+    assert!(
+        thinking_headers(&screen)
+            .iter()
+            .all(|h| h.trim_end().ends_with('▸')),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn show_thinking_hidden_in_config_shows_none_until_ctrl_t() {
+    let size = SIZES[0];
+    let hidden = "\n[tui]\nshow_thinking = \"hidden\"\n";
+    let script = json!([{ "thinking": THINKING, "text": "Done." }]);
+    let screen = snapshot_env(
+        "think-hidden",
+        script.clone(),
+        size,
+        &["explain waves"],
+        &[],
+        hidden,
+    )
+    .await;
+    let text = screen.join("\n");
+    assert!(thinking_headers(&screen).is_empty(), "{text}");
+    assert!(!text.contains("Thinking"), "{text}");
+    assert!(screen.iter().any(|r| r == " Done."), "{text}");
+
+    let screen = snapshot_env(
+        "think-hidden-shown",
+        script,
+        size,
+        &["explain waves", "key:ctrl+t"],
+        &[],
+        hidden,
+    )
+    .await;
+    let text = screen.join("\n");
+    assert_eq!(thinking_headers(&screen).len(), 1, "{text}");
+    assert!(text.contains("silly and repetitive"), "{text}");
 }
