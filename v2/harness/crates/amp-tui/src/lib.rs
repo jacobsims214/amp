@@ -49,6 +49,7 @@ pub use shell::{
     ProviderConnect, RunDone, STOPPED, ServerControl, ServerSwitched, Shell, ShellInfo, Submit,
 };
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
+pub use transcript::ThinkingDisplay;
 pub use view::{ChatView, FooterInfo};
 
 /// Installs `theme` for every rpi-tui component (`global_theme_manager().set`, which also
