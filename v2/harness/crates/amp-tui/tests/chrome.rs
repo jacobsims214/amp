@@ -20,7 +20,9 @@ use amp_core::{
 };
 use amp_tui::{
     AmpTheme, ChatView, Chrome, ChromeData, ColorDepth, ReportState, Variant,
-    chrome::{MIN_GAP, clean, link, plain, render_header, render_status, sample, shorten},
+    chrome::{
+        MIN_GAP, MIN_NAME_CELLS, clean, link, plain, render_header, render_status, sample, shorten,
+    },
     install_theme,
     theme::palette,
 };
@@ -128,8 +130,11 @@ fn plain_layout_at_80_and_160() {
 #[test]
 fn every_width_fits() {
     let _guard = themed(Variant::Light, ColorDepth::Ansi256);
-    for ticket in [true, false] {
-        let data = sample::data(ticket);
+    for (data, ticket) in [
+        (sample::data(true), true),
+        (sample::data(false), false),
+        (long_name(), true),
+    ] {
         for width in 10..=220 {
             let out = lines(&data, width);
             assert_eq!(out.len(), if ticket { 3 } else { 2 });
@@ -195,6 +200,58 @@ fn right_items_keep_a_three_cell_gap() {
             }
         }
     }
+}
+
+/// The #2109 review's case: a 63-character ticket name.
+fn long_name() -> ChromeData {
+    let mut meta = sample::meta(true);
+    meta.ticket.value.as_mut().unwrap().name =
+        "Card form: inline validation for expiry date, CVC and postcode.".to_owned();
+    ChromeData::new(meta)
+}
+
+/// Header line 2 as plain text, with the name's cells and the label.
+fn line_two(data: &ChromeData, width: usize) -> (String, usize, Option<String>) {
+    let l = plain(&render_header(data, &palette(), width)[1]);
+    let (left, label) = match l.find('▌') {
+        Some(at) => (l[..at].trim_end().to_owned(), Some(l[at..].to_owned())),
+        None => (l.trim_end().to_owned(), None),
+    };
+    let name = left.split_once("#2106 ").map_or("", |(_, n)| n);
+    let name = visible_width(name);
+    (l, name, label)
+}
+
+#[test]
+fn line_two_keeps_the_name_before_the_story() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let data = long_name();
+    // 100 columns: the epic stays and the name keeps at least 40 cells.
+    let (l, name, label) = line_two(&data, 100);
+    assert_eq!(label.as_deref(), Some("▌ AMP Harness"), "{l}");
+    assert!(name >= 40, "{l}");
+    // 80 columns: the name keeps at least 40 cells; never Epic › Story beside a cut name.
+    let (l, name, label) = line_two(&data, 80);
+    assert!(name >= 40, "{l}");
+    assert!(label.as_deref().is_none_or(|x| x == "▌ AMP Harness"), "{l}");
+    // Every width: the story only beside the whole name, the epic only beside MIN_NAME_CELLS.
+    for width in 10..=220 {
+        let (l, name, label) = line_two(&data, width);
+        assert!(visible_width(&l) <= width, "{width}: {l}");
+        match label.as_deref() {
+            Some("▌ AMP Harness › M3 theme + metadata") => assert_eq!(name, 63, "{width}: {l}"),
+            Some("▌ AMP Harness") => assert!(name >= MIN_NAME_CELLS, "{width}: {l}"),
+            Some(other) => panic!("{width}: unexpected label {other:?}"),
+            None => {}
+        }
+    }
+    // Wide enough for everything: the whole name and Epic › Story.
+    let (l, name, label) = line_two(&data, 140);
+    assert_eq!(name, 63, "{l}");
+    assert_eq!(
+        label.as_deref(),
+        Some("▌ AMP Harness › M3 theme + metadata")
+    );
 }
 
 #[test]
