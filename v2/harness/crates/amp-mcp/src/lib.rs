@@ -33,7 +33,10 @@ pub use credentials::{
 };
 pub use error::McpError;
 pub use health::Health;
-pub use http::{build_http_client, load_ca_file};
+pub use http::{
+    DEFAULT_OAUTH_REQUEST_TIMEOUT, OAUTH_CONNECT_TIMEOUT, build_http_client,
+    build_oauth_http_client, load_ca_file,
+};
 pub use protocol::{Era, ProtocolMode};
 pub use settings::{
     Auth, DEFAULT_MCP_URL, ENV_CA_FILE, ENV_MCP_URL, ENV_PROTOCOL, ENV_TOKEN, FileConfig,

@@ -61,6 +61,8 @@ struct AsState {
     seq: AtomicUsize,
     /// What the client asked for in the authorization request.
     last_scope: Mutex<Option<String>>,
+    /// The RFC 8414 metadata endpoint accepts the request and never answers (a stalled AS).
+    stall_metadata: AtomicBool,
 }
 
 struct PendingCode {
@@ -193,6 +195,9 @@ async fn protected_resource(State(state): State<Arc<AsState>>) -> Json<serde_jso
 }
 
 async fn authorization_server(State(state): State<Arc<AsState>>) -> Json<serde_json::Value> {
+    if state.stall_metadata.load(Ordering::SeqCst) {
+        std::future::pending::<()>().await;
+    }
     // Shaped like AMP's amp-mcpoauth metadata (v2/amp-api/cmd/mcpoauth/main.go).
     Json(serde_json::json!({
         "issuer": state.base,
@@ -698,6 +703,64 @@ async fn login_times_out_when_the_browser_never_returns() {
         matches!(&err, McpError::OAuth(m) if m.contains("no answer")),
         "{err:?}"
     );
+}
+
+/// How long a stalled-AS test may take before we call it a hang.
+const HANG: Duration = Duration::from_secs(10);
+
+#[tokio::test]
+async fn connect_with_a_login_fails_fast_when_the_as_metadata_stalls() {
+    let mock = spawn_mock_as(3600).await;
+    let backend = file_backend("stalled-connect");
+    login(&mock, &backend).await.expect("login");
+    mock.state.stall_metadata.store(true, Ordering::SeqCst);
+
+    let bound = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        HANG,
+        oauth::connect(options(&mock.url).with_connect_timeout(bound), &backend),
+    )
+    .await
+    .expect("oauth::connect hung on a stalled authorization server");
+    let Err(err) = result else {
+        panic!("a stalled AS cannot connect")
+    };
+    assert!(err.is_timeout(), "{err:?}");
+    assert!(
+        started.elapsed() < bound * 4,
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_no_token_values(&err.to_string());
+}
+
+#[tokio::test]
+async fn login_fails_fast_when_the_as_metadata_stalls() {
+    let mock = spawn_mock_as(3600).await;
+    mock.state.stall_metadata.store(true, Ordering::SeqCst);
+    let backend = file_backend("stalled-login");
+
+    let bound = Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(
+        HANG,
+        oauth::login(
+            LoginOptions::new(&mock.url, backend.clone()).with_request_timeout(bound),
+            |_prompt: &LoginPrompt| panic!("no browser when discovery stalls"),
+        ),
+    )
+    .await
+    .expect("login hung on a stalled authorization server");
+    let err = result.expect_err("a stalled AS cannot log in");
+    assert!(matches!(err, McpError::OAuth(_)), "{err:?}");
+    assert!(
+        started.elapsed() < bound * 4,
+        "took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(mock.state.registrations.load(Ordering::SeqCst), 0);
+    assert!(!oauth::has_login(&mock.url, &backend).await.unwrap());
 }
 
 #[tokio::test]
