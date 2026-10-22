@@ -137,8 +137,75 @@ async fn login_required_heals_through_the_reconnector_within_the_interval() {
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
+/// Waits (at most 10 s) until `done` holds.
+async fn wait_until(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Eight calls on the client, all at once.
+fn eight_calls(
+    client: &Arc<AmpMcpClient>,
+) -> Vec<tokio::task::JoinHandle<Result<rmcp::model::CallToolResult, McpError>>> {
+    (0..8)
+        .map(|_| {
+            let client = client.clone();
+            tokio::spawn(async move { client.call_tool("amp_whoami", None).await })
+        })
+        .collect()
+}
+
+/// Calls that fail together share one reconnect. The old server holds its 401s until all eight
+/// calls have arrived, so they really fail together (no scheduling luck), and the reconnect is
+/// slowed so the others are still waiting on it when it lands. Without the single flight this
+/// makes several attempts, or (rate-limited) leaves calls with "login required".
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_failures_share_one_reconnect() {
+    let (old, new) = pair().await;
+    let client = Arc::new(connect(&old.running.url).await);
+    let (logged_in, attempts) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let inner = reconnector(&old.running.url, &new.running.url, &logged_in, &attempts);
+    client.set_reconnector(Some(Arc::new(move || {
+        let attempt = inner();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            attempt.await
+        })
+    })));
+    old.release.send_replace(0);
+    old.unauthorized.store(true, Ordering::SeqCst);
+
+    let calls = eight_calls(&client);
+    wait_until("all eight calls are rejected", || {
+        old.rejected.load(Ordering::SeqCst) == 8
+    })
+    .await;
+    old.release.send_replace(usize::MAX);
+    for call in calls {
+        call.await.unwrap().expect("every call heals");
+    }
+    assert_eq!(attempts.load(Ordering::SeqCst), 1, "single flight");
+    assert_eq!(client.generation(), 1);
+    assert_eq!(
+        old.rejected.load(Ordering::SeqCst),
+        8,
+        "none sent twice to old"
+    );
+    assert_eq!(new.running.counters.call_tool.load(Ordering::SeqCst), 8);
+}
+
+/// #2194: a "login required" still on its way back when another caller's reconnect swaps the
+/// connection must heal too, not fail as Replaced: the automatic reconnect lets the old
+/// connection's calls finish instead of cancelling them. The old server holds all eight 401s,
+/// answers one, and answers the other seven only once its reconnect has swapped the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejection_landing_after_the_reconnect_still_heals() {
     let (old, new) = pair().await;
     let client = Arc::new(connect(&old.running.url).await);
     let (logged_in, attempts) = (
@@ -151,20 +218,27 @@ async fn concurrent_failures_share_one_reconnect() {
         &logged_in,
         &attempts,
     )));
+    old.release.send_replace(0);
     old.unauthorized.store(true, Ordering::SeqCst);
 
-    let calls: Vec<_> = (0..8)
-        .map(|_| {
-            let client = client.clone();
-            tokio::spawn(async move { client.call_tool("amp_whoami", None).await })
-        })
-        .collect();
+    let calls = eight_calls(&client);
+    wait_until("all eight calls are rejected", || {
+        old.rejected.load(Ordering::SeqCst) == 8
+    })
+    .await;
+    old.release.send_replace(1);
+    wait_until("the first rejection reconnected", || {
+        client.generation() == 1
+    })
+    .await;
+    old.release.send_replace(usize::MAX);
     for call in calls {
         call.await.unwrap().expect("every call heals");
     }
     assert_eq!(attempts.load(Ordering::SeqCst), 1, "single flight");
     assert_eq!(client.generation(), 1);
     assert_eq!(new.running.counters.call_tool.load(Ordering::SeqCst), 8);
+    assert_eq!(client.health(), Health::Connected);
 }
 
 #[tokio::test(flavor = "multi_thread")]
