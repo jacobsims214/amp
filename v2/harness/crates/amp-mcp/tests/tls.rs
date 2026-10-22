@@ -154,6 +154,10 @@ async fn private_ca_is_trusted_only_with_the_ca_file() {
         .await
         .expect_err("an untrusted certificate must fail");
     assert!(matches!(err, McpError::Connect { .. }), "{err:?}");
+    // The message names the TLS cause, which rmcp's own message hides behind non-`#[source]`
+    // fields (#2086: the cluster's EKU rejection only showed up once this was printed).
+    let msg = err.to_string();
+    assert!(msg.contains("certificate"), "{msg}");
 
     // With it, in both eras.
     for mode in [ProtocolMode::Auto, ProtocolMode::Legacy] {

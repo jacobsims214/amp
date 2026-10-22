@@ -3,8 +3,9 @@
 AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) with an MCP client on
 `rmcp`. Design and build plan: AMP project 2 KB, `decisions/amp-harness-architecture.md`.
 
-Status: **M1-4.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login),
+Status: **M1-5.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login),
 and the CLI has `login`, `logout`, `doctor`, `whoami`, `tickets list|get` and the hidden `mcp call`.
+`make smoke` runs them against a real local AMP.
 
 ## Layout (D1)
 
@@ -124,6 +125,28 @@ make -C v2/harness smoke      # build + scripts/smoke.sh
 make -C v2/harness version    # amp-harness --version: harness version + rpi/rmcp pins
 make -C v2/harness clean      # delete target/ (do this before removing a worktree)
 ```
+
+### Smoke test (`make smoke`)
+
+`scripts/smoke.sh` runs the built binary against a real AMP and exits non-zero on any failure. Each
+leg runs `doctor --json` and `whoami --json`. It then creates a throwaway project (epic, story, two
+dependent tickets, a comment) with `mcp call` and reads it back with `tickets list|get`. Finally it
+deletes the tickets, story and epic and archives the project. AMP has no hard project delete, so the
+leg checks that the project is gone from `amp_list_projects`. Cleanup runs from an exit trap, so it
+also happens when a check fails. The harness runs with HOME under `target/` and
+`AMP_CREDENTIAL_STORE=file`, so your keychain and config.toml are never touched.
+
+| env | default | |
+|---|---|---|
+| `AMP_MCP_URL` | `http://localhost:8000/mcp` | compose leg (`cd v2 && make up`; auth off, expects `local-dev@amp.local`) |
+| `AMP_SMOKE_PROTOCOLS` | `auto 2025-11-25` | one run per mode. `auto` must land on the stateless 2026-07-28 era |
+| `AMP_TOKEN` + `AMP_CA_FILE` | unset, so the cluster leg is skipped | cluster leg: an `amp_` token from the UI and `amp-local-ca.crt`. The token is only sent to this leg |
+| `AMP_SMOKE_CLUSTER_URL` | `https://amp.local/mcp` | envoy on 443, not `:8443` (RFC 9728 resource match) |
+| `AMP_SMOKE_LEGS` | `compose cluster` | |
+
+On the dev Mac, the docker-desktop cluster's LoadBalancer can hold host :8000. In that case, publish
+compose's amp-api on another port and pass e.g. `AMP_MCP_URL=http://localhost:18000/mcp`. Don't run
+`make up`: it kills whatever holds :8000, which there is Docker Desktop itself.
 
 CI: the `harness` job in `.github/workflows/harness.yml` runs fmt, clippy `-D warnings` and the tests
 on any push or PR that touches `v2/harness/**`.
