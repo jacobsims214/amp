@@ -64,6 +64,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::amp_render::{self, ApprovalNotice};
 use crate::overlay::{self, PanelKind, PanelState, Stage, Target};
+use crate::slash::MenuKey;
 use crate::view::{ChatView, FooterInfo};
 
 /// Opens a URL in the browser (default: login's guarded opener; tests record instead).
@@ -254,11 +255,6 @@ pub enum Submit {
     Continue,
     Quit,
 }
-
-pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id|plan]\n\
-server: /server (list)  /server <name|address> (switch AMP server)\n\
-commands: /model [provider/model]  /connect [provider]  /usage  /help  /quit\n\
-keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit";
 
 pub struct Shell {
     view: ChatView,
@@ -747,9 +743,11 @@ impl Shell {
         }
     }
 
-    /// A key the editor doesn't get first: an open AMP panel's keys ([`Shell::panel_key`]),
-    /// then Esc during a run, which stops the reply. Returns true when it was used; otherwise the
-    /// caller gives it to the editor.
+    /// A key the editor doesn't get first: the `/` menu's keys ([`crate::slash::CommandMenu`]),
+    /// then an open AMP panel's keys ([`Shell::panel_key`]), then Esc during a run, which stops
+    /// the reply. Returns true when it was used; otherwise the caller gives it to the editor
+    /// (Enter on the menu puts the chosen command in the editor and returns false, so the editor
+    /// submits it).
     ///
     /// Esc that closes a panel during a run doesn't stop it: the spinner line says
     /// [`ESC_HINT`] for [`ESC_HINT_FOR`], and the next Esc stops the reply (#2181).
@@ -758,6 +756,22 @@ impl Shell {
             && !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let confirming = matches!(
+            self.view.panel().state().map(|s| s.stage),
+            Some(Stage::Confirm { .. } | Stage::Sending { .. })
+        );
+        if !confirming {
+            match self.view.menu().key(key) {
+                MenuKey::Pass => {}
+                MenuKey::Run => return false,
+                MenuKey::Used => {
+                    if is_esc && self.running {
+                        self.show_esc_hint();
+                    }
+                    return true;
+                }
+            }
+        }
         let panel_open = self.view.panel().is_open();
         if self.panel_key(key, editor_empty) {
             if is_esc && self.running && panel_open && !self.view.panel().is_open() {
@@ -798,7 +812,9 @@ impl Shell {
     async fn command(&mut self, name: &str, arg: &str) -> Submit {
         match name {
             "quit" | "exit" | "q" => return Submit::Quit,
-            "help" | "?" => self.view.add_notice(HELP),
+            "help" | "?" => self
+                .view
+                .add_to_transcript(Arc::new(crate::slash::HelpBlock::new())),
             "usage" => self.view.add_notice(&self.usage_text()),
             "model" if arg.is_empty() => self.view.add_notice(&self.model_text()),
             "model" => self.switch_model(arg).await,

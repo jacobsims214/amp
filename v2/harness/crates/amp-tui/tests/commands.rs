@@ -543,10 +543,10 @@ async fn without_metadata_the_commands_say_so() {
     assert!(!rig.shell.view().panel().is_open());
     assert!(rig.opened().is_empty());
     rig.say("/help").await;
-    assert!(
-        rig.screen()
-            .contains("/questions  /plan  /project [id]  /open [id|plan]")
-    );
+    let screen = rig.screen();
+    for usage in ["/questions", "/plan", "/project [id]", "/open [id|plan]"] {
+        assert!(screen.contains(usage), "{usage}\n{screen}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
