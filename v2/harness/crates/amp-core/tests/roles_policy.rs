@@ -304,6 +304,150 @@ fn manager_policy() {
     assert!(allowed(&p, "amp_create_tasks", json!({})));
 }
 
+/// #2145 (review of PR #74): the manager's bash allows are word-bounded (`git diff *`, not
+/// `git diff*`). `git diff*` also matched `git difftool`, whose `-x/--extcmd` and `-t/--tool` run
+/// any command, so one allowed-looking command was unrestricted bash. The lexer can't see it:
+/// there is no substitution, redirect or `--output`.
+#[test]
+fn manager_bash_allows_stop_at_the_word() {
+    let p = policy("amp-manager");
+    for denied in [
+        "git difftool",
+        "git difftool HEAD~1",
+        "git difftool -x 'sh -c id'",
+        "git difftool -x sh",
+        "git difftool --extcmd=sh",
+        "git difftool --extcmd 'rm -rf x'",
+        "git difftool -t vimdiff",
+        "git difftool --tool=x HEAD",
+        "git difftool -y --tool x",
+        "git difftool --dir-diff",
+        // Other git commands and binaries that the old prefix rules matched.
+        "git diff-tree HEAD",
+        "git diff-index HEAD",
+        "git diff-files",
+        "git statusx",
+        "git status-foo",
+        "git logx",
+        "git log-foo",
+        "lsof -i",
+        "lsblk",
+    ] {
+        let d = p
+            .check("bash", &json!({ "command": denied }))
+            .expect_err(denied);
+        assert_eq!(d.reason, DenialReason::Deny, "{denied}");
+    }
+    // The backstop rule decides difftool.
+    let d = p
+        .check("bash", &json!({"command": "git difftool -x sh"}))
+        .unwrap_err();
+    assert_eq!(d.rule.as_ref().unwrap().pattern, "git difftool*");
+    // Bare and argumented forms stay allowed: a trailing ` *` also matches the bare command.
+    for ok in [
+        "git status",
+        "git status --short",
+        "git diff",
+        "git diff HEAD~1 --stat",
+        "git diff --stat",
+        "git log",
+        "git log --oneline -5",
+        "ls",
+        "ls -la v2",
+    ] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+    // Found in the same audit: bash splits an unquoted `$IFS` (or any unquoted variable) at run
+    // time, and a glob can expand to a file named `--output=…`, so both could hide `--output`
+    // from the lexer.
+    for denied in [
+        "git log -1 $IFS--output=x",
+        "git log -1 x${IFS}--output=x",
+        "git diff HEAD $IFS--output=x",
+        "git diff *",
+        "git log -1 [-]-output=x",
+    ] {
+        let d = p
+            .check("bash", &json!({ "command": denied }))
+            .expect_err(denied);
+        assert_eq!(d.reason, DenialReason::Unparseable, "{denied}");
+    }
+    for ok in ["git diff -- '*.rs'", "git log -1 \"$X\"", "ls *.md"] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+}
+
+/// The same rules as opencode evaluates them: opencode has no shell lexer, so its manager's
+/// bash rules (v2/plugins/opencode/agents.json, generated from the same source) must stop
+/// difftool, redirects, `--output` and mkdir outside `.opencode/` on their own. Matching is
+/// `policy::wildcard_match` with last match wins, which copies opencode's `Wildcard.match` and
+/// `Permission.evaluate` (`findLast`).
+#[test]
+fn opencode_manager_bash_rules_hold_without_the_lexer() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plugins/opencode/agents.json");
+    let agents: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let manager = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "amp-manager")
+        .expect("amp-manager in agents.json");
+    let mut bash = serde_json::Map::new();
+    for rule in manager["permissions"].as_array().unwrap() {
+        if rule["action"] == "shell" {
+            let pattern = rule["resource"].as_str().unwrap().to_string();
+            // A later rule for the same pattern replaces it; none repeat today.
+            assert!(!bash.contains_key(&pattern), "repeated pattern {pattern}");
+            bash.insert(pattern, rule["effect"].clone());
+        }
+    }
+    let rules = Policy::parse(Some(&json!({ "bash": bash }))).unwrap();
+    let allows = |cmd: &str| rules.evaluate("bash", cmd).allows();
+    for ok in [
+        "git status",
+        "git status --short",
+        "git diff",
+        "git diff HEAD~1 --stat",
+        "git log",
+        "git log --oneline -5",
+        "ls",
+        "ls -la v2",
+        "mkdir -p .opencode/agent",
+        "mkdir -p .opencode/skills/new-skill",
+    ] {
+        assert!(allows(ok), "opencode manager should run: {ok}");
+    }
+    for denied in [
+        "git difftool",
+        "git difftool -x 'sh -c id'",
+        "git difftool --extcmd=sh",
+        "git difftool -t vim",
+        "git difftool --tool=x HEAD",
+        "git diff-tree HEAD",
+        "git statusx",
+        "git logx",
+        "lsof -i",
+        // opencode matches a command's whole source text, redirect included.
+        "git diff > x",
+        "git diff>~/.zshrc",
+        "git log 2>&1 >x",
+        "git log --output=x",
+        "git log --outp=x",
+        "git diff --output x",
+        // `.opencode/*` crosses spaces, `/` and `..`, so it needs these denies.
+        "mkdir -p .opencode/x /etc/y",
+        "mkdir -p .opencode/../../x",
+        "mkdir -p .opencode/x$IFS/etc/y",
+        "mkdir -p .opencode/x${IFS}/etc/y",
+        "mkdir -p .opencode/x\t/etc/y",
+        "mkdir -p .opencode/x>~/.zshrc",
+        "mkdir /etc/x",
+        "rm -rf x",
+    ] {
+        assert!(!allows(denied), "opencode manager must not run: {denied}");
+    }
+}
+
 // ------------------------------------------------------------------------------------------------
 // The workers.
 // ------------------------------------------------------------------------------------------------

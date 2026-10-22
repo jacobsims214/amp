@@ -472,9 +472,17 @@ pub fn scan_shell(script: &str) -> ShellScan {
 
 /// Split one command into words the way bash would before expansion, with quotes and escapes
 /// removed. The flag is true when bash would expand a word into text the lexer can't see:
-/// `${…}` with an operator (`${X:---output=f}`; a plain `${NAME}` is fine) or brace expansion (`{--output=f,}`,
-/// `{a..b}`). `$(…)` and backticks are [`ShellScan::substitution`]; `$'…'` is already
-/// unparseable, and is treated here like `'…'`.
+/// - `${…}` with an operator (`${X:---output=f}`), quoted or not;
+/// - an unquoted parameter (`$X`, `${X}`, `$@`, …): bash splits its value on `$IFS` and globs it,
+///   so `$IFS--output=f` becomes the word `--output=f` (#2145). Inside double quotes a plain
+///   `"$X"` / `"${X}"` is one word and stays allowed;
+/// - brace expansion (`{--output=f,}`, `{a..b}`);
+/// - after a `git` word, a word with an unquoted glob character (`*`, `?`, `[`): it can expand
+///   to a file named like an option, such as `--output=.git/hooks/pre-commit` (#2145). Quote
+///   git pathspecs (`-- '*.rs'`); git expands them itself.
+///
+/// `$(…)` and backticks are [`ShellScan::substitution`]; `$'…'` is already unparseable, and is
+/// treated here like `'…'`.
 fn shell_words(cmd: &str) -> (Vec<String>, bool) {
     let chars: Vec<char> = cmd.chars().collect();
     let mut words = Vec::new();
@@ -483,6 +491,9 @@ fn shell_words(cmd: &str) -> (Vec<String>, bool) {
     let mut uncertain = false;
     // Unquoted `{` not yet closed, for spotting brace expansion.
     let mut braces = 0usize;
+    // A git word has been seen, and the current word has an unquoted glob character.
+    let mut after_git = false;
+    let mut glob_word = false;
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -529,16 +540,13 @@ fn shell_words(cmd: &str) -> (Vec<String>, bool) {
                 i += 1;
                 continue;
             }
-            '$' if next == Some('{') => match plain_param_end(&chars, i) {
-                Some(end) => {
-                    // `${NAME}` is just `$NAME`: no braces to expand.
-                    word.extend(&chars[i..=end]);
-                    in_word = true;
-                    i = end + 1;
-                    continue;
-                }
-                None => uncertain = true,
-            },
+            // Unquoted, the value is split on `$IFS` and globbed.
+            '$' if next.is_some_and(|n| {
+                n == '{' || n == '_' || n.is_ascii_alphanumeric() || "@*#?$!-".contains(n)
+            }) =>
+            {
+                uncertain = true
+            }
             '{' => braces += 1,
             '}' => braces = braces.saturating_sub(1),
             ',' if braces > 0 => uncertain = true,
@@ -547,20 +555,33 @@ fn shell_words(cmd: &str) -> (Vec<String>, bool) {
         }
         if c.is_whitespace() {
             if in_word {
+                after_git |= is_git(&word);
+                uncertain |= after_git && glob_word;
                 words.push(std::mem::take(&mut word));
                 in_word = false;
             }
             braces = 0;
+            glob_word = false;
         } else {
+            if matches!(c, '*' | '?' | '[') {
+                glob_word = true;
+            }
             word.push(c);
             in_word = true;
         }
         i += 1;
     }
     if in_word {
+        after_git |= is_git(&word);
+        uncertain |= after_git && glob_word;
         words.push(word);
     }
     (words, uncertain)
+}
+
+/// `git` or a path to it (`/usr/bin/git`).
+fn is_git(word: &str) -> bool {
+    word == "git" || word.ends_with("/git")
 }
 
 /// `chars[at..]` starts with `${`. The index of the closing `}` when the expansion is a plain
@@ -1309,9 +1330,21 @@ mod tests {
         assert_eq!(words("git log $'--output'=x"), ["git", "log", "--output=x"]);
         assert_eq!(words("echo 'a b' \"c d\""), ["echo", "a b", "c d"]);
         assert!(!shell_words("git log HEAD@{1} --format='%h {a,b}'").1);
-        assert!(!shell_words("ls $HOME").1);
-        assert!(!shell_words("ls \"/${HOME}\" /${A_1}x").1);
+        assert!(!shell_words("ls \"$HOME\" \"/${HOME}\" \"/${A_1}x\"").1);
+        assert!(!shell_words("ls $ x$").1);
+        assert!(!shell_words("ls *.md src/*").1);
+        assert!(!shell_words("git log -1 -- 'src/*' \\*.rs \"[ab]\"").1);
         for expands in [
+            "ls $HOME",
+            "ls /${A_1}x",
+            "git log -1 $IFS--output=f",
+            "git log -1 x${IFS}--output=f",
+            "git log $@",
+            "git diff *",
+            "git log -1 src/*",
+            "git diff '-'-output*",
+            "git diff HEAD ?-output=f",
+            "/usr/bin/git log [-]-output=f",
             "git log ${X:---output=f}",
             "git log \"${X:---output=f}\"",
             "git log {--output=f,}",
