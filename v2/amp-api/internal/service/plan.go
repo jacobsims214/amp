@@ -180,6 +180,9 @@ func (s *Service) SetTaskDependencies(ctx context.Context, p authz.Principal, ta
 	if deps, err = s.ValidateDependencies(ctx, t.ProjectID, taskID, deps); err != nil {
 		return nil, nil, err
 	}
+	if err := s.guardDroppedHumanGates(ctx, p, t, deps); err != nil {
+		return nil, nil, err
+	}
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, nil, err
@@ -196,6 +199,38 @@ func (s *Service) SetTaskDependencies(ctx context.Context, p authz.Principal, ta
 			taskID, strings.ReplaceAll(string(reply.Task.State), "_", " "), joinIDs(reply.Task.BlockedByIDs)))
 	}
 	return reply.Task, warnings, nil
+}
+
+// guardDroppedHumanGates refuses, off the web UI, a dependency change that
+// drops an open human ticket from t's dependencies: that would let the work
+// after a person's gate go ahead without the person. Adding dependencies,
+// and dropping agent or completed tickets, stays allowed.
+func (s *Service) guardDroppedHumanGates(ctx context.Context, p authz.Principal, t *domain.Task, next []int) error {
+	if p.InUI() {
+		return nil
+	}
+	current, err := s.Repo.TaskDependencies(ctx, t.ID)
+	if err != nil {
+		return err
+	}
+	keep := map[int]bool{}
+	for _, d := range next {
+		keep[d] = true
+	}
+	for _, d := range current {
+		if keep[d] {
+			continue
+		}
+		dep, err := s.Repo.GetTask(ctx, d)
+		if err != nil {
+			continue // already gone: nothing left to gate on
+		}
+		if dep.IsHuman() && dep.State != domain.TaskStateCompleted {
+			return authz.UIOnly(fmt.Sprintf("Removing ticket %d's dependency on ticket %d (a person's open ticket)", t.ID, d),
+				s.TaskURL(t.ProjectID, d))
+		}
+	}
+	return nil
 }
 
 // EditDependencies adds and removes dependencies of a ticket.
@@ -900,6 +935,25 @@ func (s *Service) DeleteEpic(ctx context.Context, p authz.Principal, e *domain.E
 	return err
 }
 
+// guardDeletedHumanGates refuses, off the web UI, deleting an open human
+// ticket (directly, or with its story or epic): that would remove a person's
+// gate without the person. Completed human tickets can still be deleted.
+func (s *Service) guardDeletedHumanGates(ctx context.Context, p authz.Principal, projectID int, ids []int) error {
+	if p.InUI() {
+		return nil
+	}
+	for _, id := range ids {
+		t, err := s.Repo.GetTask(ctx, id)
+		if err != nil {
+			return err
+		}
+		if t.IsHuman() && t.State != domain.TaskStateCompleted {
+			return authz.UIOnly(fmt.Sprintf("Deleting ticket %d (a person's open ticket)", id), s.TaskURL(projectID, id))
+		}
+	}
+	return nil
+}
+
 // deleterOf is who the trash records as deleting something.
 func deleterOf(p authz.Principal) *int {
 	if !p.HasUser() {
@@ -913,6 +967,9 @@ func deleterOf(p authz.Principal) *int {
 // actors (msg is a delete message without its reply channel), and updates
 // the tickets that depended on what was deleted. It returns those tickets.
 func (s *Service) deleteTickets(ctx context.Context, p authz.Principal, projectID int, ids []int, del func() error, msg interface{}) ([]int, error) {
+	if err := s.guardDeletedHumanGates(ctx, p, projectID, ids); err != nil {
+		return nil, err
+	}
 	dependents, err := s.Repo.Dependents(ctx, ids)
 	if err != nil {
 		return nil, err

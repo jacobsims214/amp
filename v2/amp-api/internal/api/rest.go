@@ -1045,7 +1045,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodDelete:
 			if err := h.svc.DeleteEpic(r.Context(), pr, epic); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			jsonOK(w, map[string]interface{}{"epic_id": epicID, "deleted": true})
@@ -1185,7 +1185,7 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		if err := h.svc.DeleteStory(r.Context(), pr, story); err != nil {
-			jsonErr(w, err, 500)
+			fail(w, err, 500)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"story_id": storyID, "deleted": true})
@@ -1284,7 +1284,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodDelete:
 			if _, err := h.svc.DeleteTask(r.Context(), pr, task); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			h.hub.Publish(domain.Event{
