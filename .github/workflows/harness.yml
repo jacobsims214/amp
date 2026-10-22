@@ -43,5 +43,4 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked
-      - name: smoke
-        run: cargo build --locked -p amp-harness && ./scripts/smoke.sh
+      # No smoke step: scripts/smoke.sh needs a live AMP. It joins CI in M5-2 (compose stack in the job, three protocol modes).
