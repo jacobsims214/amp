@@ -37,10 +37,27 @@ use std::{
 pub const ENV_KEYCHAIN_PROMPTS: &str = "AMP_HARNESS_KEYCHAIN_PROMPTS";
 /// Test hook: a file that gets one line per real keychain call.
 pub const ENV_KEYCHAIN_TRACE: &str = "AMP_HARNESS_KEYCHAIN_TRACE";
-/// What to tell a person whose keychain item cannot be read. One place, so `connect` (#2163) can
-/// take it over.
-pub const KEYCHAIN_REPAIR_HINT: &str = "run `amp-harness init` in a terminal to store it again through amp-harness, or set the \
-     key in the environment instead";
+/// What to tell a person whose keychain item cannot be read (one place for every message).
+pub const KEYCHAIN_REPAIR_HINT: &str = "run `amp-harness connect` in a terminal to store it again through amp-harness, or \
+     set the key in the environment instead";
+
+/// [`KEYCHAIN_REPAIR_HINT`] for one item: a provider key (`provider:<id>[:header:<name>]`) is
+/// stored again with `amp-harness connect <id>`; anything else is the AMP login (`amp-harness
+/// login`).
+pub fn repair_hint(account: &str) -> String {
+    match account.strip_prefix("provider:") {
+        Some(rest) => {
+            let id = rest.split(':').next().unwrap_or(rest);
+            format!(
+                "run `amp-harness connect {id}` in a terminal to store it again through \
+                 amp-harness, or set the key in the environment instead"
+            )
+        }
+        None => {
+            "run `amp-harness login` in a terminal to log in again through amp-harness".to_owned()
+        }
+    }
+}
 
 /// Why a keychain call failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,6 +411,7 @@ fn platform_code(e: &keyring::Error) -> Option<i32> {
 
 fn classify(op: &str, service: &str, account: &str, e: keyring::Error) -> KeychainError {
     let item = format!("keychain item `{account}` (service {service})");
+    let hint = repair_hint(account);
     let code = platform_code(&e);
     let needs_approval = |code: i32| {
         KeychainError::new(
@@ -402,7 +420,7 @@ fn classify(op: &str, service: &str, account: &str, e: keyring::Error) -> Keycha
                 "macOS would have to ask before amp-harness can {op} {item} (it was made by \
                  another program, such as `security add-generic-password`, or by an earlier \
                  amp-harness build), and this run cannot show the dialog. Not asking \
-                 (OSStatus {code}): {KEYCHAIN_REPAIR_HINT}"
+                 (OSStatus {code}): {hint}"
             ),
         )
     };
@@ -419,7 +437,7 @@ fn classify(op: &str, service: &str, account: &str, e: keyring::Error) -> Keycha
                 format!(
                     "access to {item} was denied (OSStatus {code}: Deny was clicked, or the item \
                      was made by another program such as `security add-generic-password`). Not \
-                     asking again in this run: {KEYCHAIN_REPAIR_HINT}"
+                     asking again in this run: {hint}"
                 ),
             );
         }
@@ -439,7 +457,7 @@ fn classify(op: &str, service: &str, account: &str, e: keyring::Error) -> Keycha
         // These carry the stored bytes: never format them.
         keyring::Error::BadEncoding(_) | keyring::Error::BadDataFormat(..) => KeychainError::new(
             KeychainErrorKind::Other,
-            format!("{item} does not hold readable text: {KEYCHAIN_REPAIR_HINT}"),
+            format!("{item} does not hold readable text: {hint}"),
         ),
         other => KeychainError::new(
             KeychainErrorKind::Other,
@@ -590,7 +608,23 @@ mod tests {
             keyring::Error::BadEncoding(b"sk-or-secret".to_vec()),
         );
         assert!(!e.message.contains("sk-or-secret"), "{}", e.message);
-        assert!(e.message.contains("amp-harness init"), "{}", e.message);
+        assert!(
+            e.message.contains("amp-harness connect openrouter"),
+            "{}",
+            e.message
+        );
+        // The OAuth login item is repaired by logging in again.
+        let e = classify(
+            "read",
+            "amp-harness",
+            "https://amp.example/mcp",
+            keyring::Error::BadEncoding(b"tok".to_vec()),
+        );
+        assert!(e.message.contains("amp-harness login"), "{}", e.message);
+        assert_eq!(
+            repair_hint("provider:gw:header:x-api-key"),
+            repair_hint("provider:gw")
+        );
         let e = classify(
             "read",
             "amp-harness",

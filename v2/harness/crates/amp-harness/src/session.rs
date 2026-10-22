@@ -140,7 +140,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         if text.contains("no key") {
             // The first run asks for a key in a terminal; say how to get there from here.
             CliError::new(format!(
-                "{text}\nStore a key with `amp-harness init` (it asks, hidden, and keeps it in the OS keychain)."
+                "{text}\nStore a key with `amp-harness connect` (it asks, hidden, checks it and keeps it in \
+                 the OS keychain)."
             ))
         } else {
             CliError::new(text)

@@ -10,7 +10,8 @@
 //! The integration tests use it, and so can screenshots and M3's render checks (`--ansi` keeps
 //! the colours). `--meta` also starts the AMP metadata poller (header, status line and the AMP
 //! slash commands, M3-4), and `--input key:<enter|esc|up|down|y|n|o>` presses a key on an open
-//! AMP panel (Enter on a question, then `key:y` to confirm the answer). In `--snapshot` nothing
+//! AMP panel (Enter on a question, then `key:y` to confirm the answer). `--input key:paste:<text>`
+//! pastes (into `/connect`'s hidden key entry when one is open; tests only). In `--snapshot` nothing
 //! opens a browser: `/open` says which URL it would open.
 //!
 //! The AMP theme (M3-1) is installed before the shell is built: `--theme`, `AMP_HARNESS_THEME`,
@@ -29,9 +30,9 @@ use std::{
 };
 
 use amp_core::{
-    agent::Runtime,
     meta::{Connector, MetaHandle, MetaOptions, MetaPoller},
-    models::thinking_name,
+    models::{ModelsConfig, thinking_name},
+    providers::ProviderSet,
 };
 use amp_tui::{AmpTheme, ModelChoice, Shell, ShellInfo, Submit, ThemeSettings};
 use clap::Args;
@@ -167,13 +168,21 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     })
     .await?;
     let info = shell_info(&session);
-    let models = model_choices(&session.rt);
+    let models = model_choices(
+        &session.rt.current_models(),
+        &session.rt.current_providers(),
+    );
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
     // A suggested first prompt (new project: seed the KB; new user: the AMP guide). Nothing is
     // sent until the person presses Enter.
     if let Some(text) = outcome.and_then(|o| o.prefill) {
         shell.view().editor().set_text(&text);
     }
+    // /connect: store a provider key (hidden) and use it without a restart (#2163).
+    shell.set_connect(crate::connect::ChatConnect::new(
+        Arc::clone(&session.rt),
+        setup::config_path(&args.conn)?,
+    ));
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);
@@ -223,6 +232,12 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         }
         if let Some(meta) = &meta {
             settle_meta(&mut shell, meta).await?;
+        } else {
+            // A command's background job (`/connect`) finishes before the next input.
+            shell
+                .settle(SNAPSHOT_RUN_TIMEOUT)
+                .await
+                .map_err(CliError::new)?;
         }
     }
     let lines = if args.ansi {
@@ -323,10 +338,10 @@ fn shell_info(s: &session::Session) -> ShellInfo {
 }
 
 /// Every model of every provider that has a key (or needs none): what `/model` can switch to.
-fn model_choices(rt: &Runtime) -> Vec<ModelChoice> {
+pub(crate) fn model_choices(models: &ModelsConfig, providers: &ProviderSet) -> Vec<ModelChoice> {
     let mut out = Vec::new();
-    for (provider_id, provider) in &rt.models.providers {
-        if rt.providers.get(provider_id).is_err() {
+    for (provider_id, provider) in &models.providers {
+        if providers.get(provider_id).is_err() {
             continue;
         }
         for (model_id, model) in &provider.models {

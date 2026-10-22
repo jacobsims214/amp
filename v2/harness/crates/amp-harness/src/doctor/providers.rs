@@ -287,25 +287,25 @@ fn key_fix(provider: &str, source: &KeySource, where_: &str) -> String {
     match source {
         // The message already says what to do (#2165).
         KeySource::KeychainFailed(why) => why.clone(),
+        // #2163: connect asks for the key hidden, checks it and keeps it in the keychain. The
+        // environment variable stays the CI/headless path.
         KeySource::Missing {
             env: Some(var),
             keychain_checked: true,
-        } => {
-            // #2113: init asks for the key hidden and keeps it in the keychain.
-            format!(
-                "export {var}=<your {provider} key>, or run `amp-harness init` to store it in the \
-                 keychain (asked hidden)"
-            )
-        }
+        } => format!(
+            "run `amp-harness connect {provider}` (asks for the key hidden, checks it and keeps it \
+             in the OS keychain); for CI/headless set {var} instead"
+        ),
         KeySource::Missing {
             env: Some(var),
             keychain_checked: false,
         } => format!(
-            "export {var}=<your {provider} key> (the keychain is not read while \
-             AMP_CREDENTIAL_STORE=file)"
+            "set {var} in the environment (the keychain is not read while \
+             AMP_CREDENTIAL_STORE=file, so `amp-harness connect` can't store it)"
         ),
         _ => format!(
-            "add key_env = \"<ENV VAR>\" to [providers.{provider}] in {where_} and export it"
+            "run `amp-harness connect {provider}`, or add key_env = \"<ENV VAR>\" to \
+             [providers.{provider}] in {where_} and set it"
         ),
     }
 }
@@ -352,8 +352,8 @@ mod tests {
                 .fix
                 .as_deref()
                 .unwrap()
-                .starts_with("export ANTHROPIC_API_KEY="),
-            "{anthropic:?}"
+                .starts_with("set ANTHROPIC_API_KEY in the environment"),
+            "the keychain is off in this test: {anthropic:?}"
         );
         assert_eq!(find(&out, "models:anthropic").status, CheckStatus::Skip);
         assert_eq!(report.providers.len(), 2);
@@ -362,6 +362,27 @@ mod tests {
         let c = config("[roles.manager]\nmodel = \"anthropic/claude-opus-5-5\"\n");
         let (_, out) = check(Ok(c), None, &keys, true).await;
         assert_eq!(find(&out, "key:anthropic").status, CheckStatus::Fail);
+    }
+
+    #[test]
+    fn a_missing_key_fix_names_connect() {
+        let source = KeySource::Missing {
+            env: Some("OPENROUTER_API_KEY".into()),
+            keychain_checked: true,
+        };
+        let fix = key_fix("openrouter", &source, "config.toml");
+        assert!(
+            fix.starts_with("run `amp-harness connect openrouter`"),
+            "{fix}"
+        );
+        assert!(
+            fix.contains("OPENROUTER_API_KEY"),
+            "the headless path stays: {fix}"
+        );
+        assert!(
+            !fix.contains("export ") && !fix.contains("security "),
+            "{fix}"
+        );
     }
 
     #[tokio::test]

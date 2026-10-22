@@ -8,10 +8,13 @@
 //! - M3-3: hidden `debug render-chrome` prints the chat's AMP header and status line.
 //!
 //! - M4-1: `init` and the first run of the chat (server, login, project, provider key).
+//! - #2163: `connect [provider]` / `connect --list` / `disconnect <provider>`: model provider keys
+//!   and custom providers without shell commands (the chat's `/connect` does the same).
 
 mod chat;
 mod config_cmd;
 mod conn;
+mod connect;
 mod debug;
 mod doctor;
 mod mcp_cmd;
@@ -86,6 +89,11 @@ enum Command {
     /// Providers, models and the model each role runs on.
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+    /// Add a model provider: its key (asked hidden, checked, kept in the OS keychain) or a custom
+    /// OpenAI-compatible endpoint. `connect --list` shows every provider and where its key comes from.
+    Connect(connect::ConnectArgs),
+    /// Remove a provider's key from the OS keychain (and a custom provider from config.toml).
+    Disconnect(connect::DisconnectArgs),
     /// Set up this machine and folder: AMP server, login, project (.amp.json), provider key.
     /// Asks for whatever the flags leave open when run in a terminal; `--yes` never asks.
     Init(setup::InitArgs),
@@ -153,6 +161,8 @@ async fn main() -> ExitCode {
         Some(Command::Tickets(command)) => tickets::run(command).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
+        Some(Command::Connect(args)) => connect::run(args).await,
+        Some(Command::Disconnect(args)) => connect::disconnect(args).await,
         Some(Command::Init(args)) => setup::init(args).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
         Some(Command::Debug(command)) => debug::run(command).await,

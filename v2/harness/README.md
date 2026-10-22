@@ -7,8 +7,8 @@ Status: **M2.** `amp-mcp` connects to AMP (both MCP protocol eras, static token 
 `amp-harness` with no subcommand is a chat with the manager, which plans on the board and dispatches
 specialist workers itself (`amp_run_ticket`); every worker's run, tokens and commit are reported to
 its ticket automatically. The CLI also has `login`, `logout`, `doctor`, `whoami`, `tickets list|get`,
-`config show`, `run -p` (a headless agent run) and the hidden `mcp call`. `make smoke` runs them
-against a real local AMP.
+`config show`, `connect`/`disconnect` (model provider keys), `run -p` (a headless agent run) and the
+hidden `mcp call`. `make smoke` runs them against a real local AMP.
 
 ## Try it
 
@@ -18,11 +18,10 @@ From the repo root of a worktree on `/Volumes/external-data` (see the Rust disk 
 make -C v2/harness build
 alias amp-harness="$PWD/v2/harness/target/debug/amp-harness"
 
-# 1. A provider key, from the environment or the keychain (never a config file).
-export OPENROUTER_API_KEY=...       # the shipped roles run on OpenRouter models
-# or: export ANTHROPIC_API_KEY=... and AMP_HARNESS_PROFILE=anthropic (Anthropic-only profile)
-# or keep it in the OS keychain: `amp-harness init` asks for it (hidden) and stores it.
-# Never create the item with `security add-generic-password`: see "Keychain on macOS" below.
+# 1. A model provider key: asked hidden, checked with the provider, kept in the OS keychain.
+amp-harness connect                 # pick OpenRouter (the shipped roles), Anthropic, OpenAI or custom
+amp-harness connect --list          # every provider and where its key comes from (never the key)
+# CI/headless: set OPENROUTER_API_KEY (or ANTHROPIC_API_KEY) in the environment instead.
 
 # 2. Every role resolves to a provider/model that has a key, and the model ids exist.
 amp-harness config show --check
@@ -149,7 +148,7 @@ Every keychain call goes through `amp_mcp::keychain_{get,set,delete}`:
   without a dialog) and adds a new one, so this binary is the item's creator and is trusted to read
   it. An item made by Apple's `security` tool has partition `apple-tool:`; every read by
   amp-harness then raises a dialog and "Always Allow" does not stick. Updating it in place would
-  keep that ACL. Store keys with `amp-harness init` instead.
+  keep that ACL. Store keys with `amp-harness connect` instead.
 - **No dialog nobody can answer.** When stdin is not a terminal (agents, scripts, CI) keychain
   dialogs are turned off for each call, so an item that would need approval fails at once with one
   message naming the item and what to run, instead of blocking. `AMP_HARNESS_KEYCHAIN_PROMPTS=never`
@@ -157,12 +156,17 @@ Every keychain call goes through `amp_mcp::keychain_{get,set,delete}`:
 - **After a rebuild or an update** an unsigned (ad-hoc signed) binary has a new code hash, so the
   first read of each item by the new build asks once; "Always Allow" then holds for that build.
   Stable code signing (M5) removes that prompt.
+- A provider item that can't be read says to run `amp-harness connect <provider>`; the OAuth
+  login item says `amp-harness login`.
 - `AMP_HARNESS_KEYCHAIN_TRACE=<file>` appends one line per real keychain call (operation, service,
   account, outcome, pid; never a secret).
 
 `crates/amp-harness/tests/keychain.rs` (opt-in: `AMP_TEST_KEYCHAIN=1`, macOS) stores a key with
 `init` and reads it in new processes with dialogs off, counting calls per process, and checks that
-an item made by `security` fails fast with one message and is then replaced by `init`. The smoke
+an item made by `security` fails fast with one message and is then replaced by `init`. Its #2163
+cases store keys with `connect --key-stdin` (a mock provider checks them), remove them with
+`disconnect`, keep a custom provider's secret header in the keychain, and prove that the chat's
+`/connect` makes the running chat use a provider that had no key when it started. The smoke
 test's `keychain` leg (`AMP_SMOKE_LEGS=keychain`, macOS, needs the compose server) does the same
 with the built or installed binary (`AMP_HARNESS_BIN`). Both use throwaway services, never yours.
 
@@ -192,6 +196,54 @@ amp-harness mcp tools [--json]                                                # 
   arguments exit 2.
 - `--json` output is a contract for scripts: fields are added, never renamed or removed. The full
   shapes are pinned in `crates/amp-harness/tests/cli.rs` against a mock AMP (`tests/common`).
+
+## Connecting model providers (#2163)
+
+```sh
+amp-harness connect [PROVIDER]                 # in a terminal: picker, hidden key, check, keychain
+amp-harness connect --list [--json]            # providers, key yes/no and its source, roles using it
+amp-harness disconnect PROVIDER [--keep-config] [--json]
+echo "$KEY" | amp-harness connect openrouter --key-stdin [--use] [--json]       # scripts
+amp-harness connect my-llm --base-url http://localhost:11434/v1 [--api openai-completions] \
+  [--name "My LLM"] [--model ID]... [--header NAME=VALUE]... [--key-stdin] [--use [--role-model ID]]
+```
+
+- **Built in:** OpenRouter and Anthropic (shipped) and OpenAI (written to config.toml on first
+  connect, with the models the API lists). **Custom:** any OpenAI-compatible endpoint (vLLM, Ollama,
+  LM Studio, LiteLLM, a gateway) or an Anthropic Messages one: id, display name, base URL, API
+  style, extra headers and model ids (listed by the endpoint, or `--model`). An empty key makes a
+  keyless endpoint (`auth = "none"`).
+- The key is read hidden (nothing is echoed) or from stdin with `--key-stdin`; never pass it as an
+  argument. It is checked with a call that spends no tokens (Anthropic `GET /v1/models`, OpenRouter
+  `GET /key`, others `GET /models`): a rejected key is asked again in a terminal and stores nothing
+  in a script. It is stored only in the OS keychain (service `amp-harness`, account
+  `provider:<id>`). With no keychain (`AMP_CREDENTIAL_STORE=file`, headless Linux) `connect` says to
+  set the provider's variable instead; provider keys have no file fallback.
+- Custom headers whose name or value looks secret (Authorization, *key*, *token*, `Bearer …`) go to
+  the keychain (`provider:<id>:header:<name>`) and only their names to the file
+  (`secret_headers = ["X-Api-Key"]`); `--header` refuses them, since arguments are visible to other
+  processes.
+- config.toml is the person's file: `connect` cuts out only `[providers.<id>]` (and its
+  sub-tables), appends the new table, checks the result loads, and keeps the previous file as
+  `config.toml.bak`. `disconnect` removes the key (and secret header values) and only a table that
+  `connect` added (marked `# Added by amp-harness connect.`), never one written by hand, and not
+  while roles still run on it.
+- After connecting, `connect` offers to point the roles at the provider (`--use` does it without
+  asking): Anthropic → the `anthropic` profile, OpenRouter → the default roster, anything else →
+  `inherit` with one model for every role. It then prints each role's provider/model like
+  `config show`.
+- In the chat, `/connect` lists the providers (and picks up keys stored from another terminal) and
+  `/connect PROVIDER` (or `/connect ID BASE_URL [API]` for a custom endpoint) asks for the key: it
+  is typed or pasted into a hidden buffer, never the editor, the transcript, its history or the
+  session file. The chat uses the new key at once: its providers are rebuilt and handed to the
+  running agent, and `/model` lists the new provider's models. Workers started later use them too.
+- **No Claude subscription login.** Anthropic allows Claude Free/Pro/Max subscription logins
+  (OAuth) only in its own products (Claude.ai, Claude Code, Claude Desktop, Cowork) and blocks them
+  in third-party tools, so amp-harness offers only an Anthropic **API key** from
+  console.anthropic.com. rpi-ai 0.8.0 has no subscription path (its Anthropic provider sends
+  `x-api-key` only), and `connect`, `init` and `/connect` refuse a subscription token
+  (`sk-ant-oat…`) with that explanation.
+- Environment variables stay supported and take precedence: they are the CI/headless path.
 
 ## Providers and models (M2-3)
 
@@ -235,8 +287,9 @@ context_window = 262144
 - When a layer changes a role's `model`, the lower layers' `extra_body` is dropped; `thinking`
   carries over unless that layer sets it.
 - Keys come from the provider's `key_env` (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`), then the
-  keychain (service `amp-harness`, account `provider:<id>`; skipped with
-  `AMP_CREDENTIAL_STORE=file`). Never from config files.
+  keychain (service `amp-harness`, account `provider:<id>`, stored by `amp-harness connect`;
+  skipped with `AMP_CREDENTIAL_STORE=file`). Never from config files. A provider's `name` is its
+  display name; `secret_headers` lists headers whose values come from the keychain.
 - `header_timeout_secs` (first streamed event) and `stream_idle_timeout_secs` (gap between events)
   cancel a stalled request and end the turn with an error; `request_timeout_secs` bounds the whole
   request.
@@ -346,7 +399,8 @@ JSONL session under `~/.local/state/amp-harness/sessions/<role>/` unless `--no-s
 terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
 
 - Commands: `/model` lists the current model and every model whose provider has a key;
-  `/model provider/model` switches this session's model. `/usage` prints the session's tokens and
+  `/model provider/model` switches this session's model. `/connect [provider]` lists providers or
+  stores a key without leaving the chat (see Connecting model providers). `/usage` prints the session's tokens and
   cost, `/help`, `/abort`, `/quit` (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits.

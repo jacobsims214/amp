@@ -34,7 +34,7 @@
 //! gets a suggested first prompt in the editor (seed the KB with amp-init / the `amp_guide`
 //! onboarding), sent only when they press Enter.
 
-mod config_file;
+pub(crate) mod config_file;
 pub mod ui;
 
 use std::{
@@ -311,7 +311,7 @@ fn env_var(key: &str) -> Option<String> {
 }
 
 /// The config.toml setup reads and writes: `--config`, else the default path.
-fn config_path(conn: &ConnArgs) -> Result<PathBuf, CliError> {
+pub(crate) fn config_path(conn: &ConnArgs) -> Result<PathBuf, CliError> {
     conn.config
         .clone()
         .or_else(|| amp_mcp::default_config_path(&|k| std::env::var(k).ok()))
@@ -1066,7 +1066,10 @@ async fn create_project(
 // Models and provider keys
 // ---------------------------------------------------------------------------------------------
 
-fn load_models(config: &ConfigFile, profile: Option<&str>) -> Result<ModelsConfig, CliError> {
+pub(crate) fn load_models(
+    config: &ConfigFile,
+    profile: Option<&str>,
+) -> Result<ModelsConfig, CliError> {
     let env = |k: &str| {
         if k == ENV_PROFILE && profile.is_some() {
             return profile.map(str::to_owned);
@@ -1077,7 +1080,7 @@ fn load_models(config: &ConfigFile, profile: Option<&str>) -> Result<ModelsConfi
         .map_err(|e| CliError::new(format!("models: {e}")))
 }
 
-fn profile_of(cfg: &ModelsConfig) -> (String, String) {
+pub(crate) fn profile_of(cfg: &ModelsConfig) -> (String, String) {
     match &cfg.selection {
         Selection::Profile { name, source } => (name.clone(), source.clone()),
         Selection::Inherit { source, .. } => ("inherit".to_owned(), source.clone()),
@@ -1085,7 +1088,7 @@ fn profile_of(cfg: &ModelsConfig) -> (String, String) {
 }
 
 /// The providers the config's roles use that need a key and have none.
-fn missing_keys(cfg: &ModelsConfig, keys: &dyn KeyLookup) -> Vec<String> {
+pub(crate) fn missing_keys(cfg: &ModelsConfig, keys: &dyn KeyLookup) -> Vec<String> {
     cfg.providers_in_use()
         .into_iter()
         .filter(|id| {
@@ -1096,7 +1099,7 @@ fn missing_keys(cfg: &ModelsConfig, keys: &dyn KeyLookup) -> Vec<String> {
         .collect()
 }
 
-fn provider_name(id: &str) -> String {
+pub(crate) fn provider_name(id: &str) -> String {
     match id {
         "openrouter" => "OpenRouter".to_owned(),
         "anthropic" => "Anthropic".to_owned(),
@@ -1105,8 +1108,13 @@ fn provider_name(id: &str) -> String {
     }
 }
 
+/// The provider's display name: the config's `name`, else [`provider_name`].
+pub(crate) fn display_name(p: &ProviderConfig) -> String {
+    p.name.clone().unwrap_or_else(|| provider_name(&p.id))
+}
+
 /// Whether provider keys can be stored here (the OS keychain only).
-fn keychain_for_keys() -> Result<String, String> {
+pub(crate) fn keychain_for_keys() -> Result<String, String> {
     if std::env::var(amp_mcp::ENV_CREDENTIAL_STORE)
         .is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
     {
@@ -1120,7 +1128,7 @@ fn keychain_for_keys() -> Result<String, String> {
     Ok(service)
 }
 
-fn store_key(provider: &str, key: &str) -> Result<(), String> {
+pub(crate) fn store_key(provider: &str, key: &str) -> Result<(), String> {
     let service = keychain_for_keys()?;
     // Created by this binary (macOS: a fresh item, so this build is its trusted creator), and
     // cached, so it is never read back in this run.
@@ -1128,32 +1136,52 @@ fn store_key(provider: &str, key: &str) -> Result<(), String> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum KeyCheck {
+pub(crate) enum KeyCheck {
     Ok,
     Rejected(u16),
     Unknown(String),
 }
 
 /// Asks the provider whether the key works, without spending tokens: Anthropic's model list,
-/// OpenRouter's key endpoint, an OpenAI-compatible model list.
-async fn check_key(p: &ProviderConfig, key: &str) -> KeyCheck {
+/// OpenRouter's key endpoint, an OpenAI-compatible model list. `extra` headers (a custom
+/// provider's, secret ones included) go on the request; an empty `key` sends none.
+pub(crate) async fn check_key(
+    p: &ProviderConfig,
+    key: &str,
+    extra: &std::collections::BTreeMap<String, String>,
+) -> KeyCheck {
     let Ok(http) = amp_mcp::build_http_client(None) else {
         return KeyCheck::Unknown("no HTTP client".to_owned());
     };
     let base = p.base_url.trim_end_matches('/');
-    let req = match p.api {
-        ProviderApi::AnthropicMessages => http
-            .get(format!("{base}/v1/models?limit=1"))
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01"),
-        ProviderApi::OpenaiCompletions
-            if p.id == "openrouter" || base.contains("openrouter.ai") =>
-        {
-            http.get(format!("{base}/key")).bearer_auth(key)
+    let mut req = match p.api {
+        ProviderApi::AnthropicMessages => {
+            let r = http
+                .get(format!("{base}/v1/models?limit=1"))
+                .header("anthropic-version", "2023-06-01");
+            if key.is_empty() {
+                r
+            } else {
+                r.header("x-api-key", key)
+            }
         }
-        ProviderApi::OpenaiCompletions => http.get(format!("{base}/models")).bearer_auth(key),
+        ProviderApi::OpenaiCompletions => {
+            let r = if p.id == "openrouter" || base.contains("openrouter.ai") {
+                http.get(format!("{base}/key"))
+            } else {
+                http.get(format!("{base}/models"))
+            };
+            if key.is_empty() {
+                r
+            } else {
+                r.bearer_auth(key)
+            }
+        }
         _ => return KeyCheck::Ok,
     };
+    for (name, value) in p.headers.iter().chain(extra.iter()) {
+        req = req.header(name.as_str(), value.as_str());
+    }
     match tokio::time::timeout(KEY_CHECK_TIMEOUT, req.timeout(KEY_CHECK_TIMEOUT).send()).await {
         Ok(Ok(resp)) => {
             let status = resp.status().as_u16();
@@ -1172,11 +1200,18 @@ async fn check_key(p: &ProviderConfig, key: &str) -> KeyCheck {
 async fn prompt_key(ui: &mut dyn Ui, p: &ProviderConfig) -> Result<bool, CliError> {
     let name = provider_name(&p.id);
     for _ in 0..3 {
-        let key = ui.secret(&format!("{name} API key, Enter to skip"))?;
+        let key = ui.secret(&format!(
+            "{}, Enter to skip",
+            crate::connect::key_prompt(&p.id, &name)
+        ))?;
         if key.is_empty() {
             return Ok(false);
         }
-        match check_key(p, &key).await {
+        if let Err(why) = crate::connect::refuse_subscription_token(&p.id, &key) {
+            ui.say(&format!("  {why}"));
+            continue;
+        }
+        match check_key(p, &key, &Default::default()).await {
             KeyCheck::Ok => ui.say(&format!("  {name} accepted the key.")),
             KeyCheck::Rejected(status) => {
                 ui.say(&format!(
@@ -1332,7 +1367,14 @@ async fn models_step(
         ui.say("The agents need a model provider key. It is stored in your OS keychain, never in a file.");
         let chosen = if options.len() > 1 {
             for (i, (_, need, text)) in options.iter().enumerate() {
-                let who: Vec<String> = need.iter().map(|p| provider_name(p)).collect();
+                // "Anthropic API key (console.anthropic.com)": never a Claude subscription (#2163).
+                let who: Vec<String> = need
+                    .iter()
+                    .map(|p| match p.as_str() {
+                        "anthropic" => crate::connect::key_prompt(p, "Anthropic"),
+                        other => provider_name(other),
+                    })
+                    .collect();
                 ui.say(&format!("  {}) {} — {text}", i + 1, who.join(" + ")));
             }
             loop {
@@ -1386,8 +1428,9 @@ async fn models_step(
             .filter_map(|id| cfg.providers.get(id))
             .map(|p| match &p.key_env {
                 Some(var) => format!(
-                    "{} ({var}, or `amp-harness init` to store it)",
-                    provider_name(&p.id)
+                    "{} (`amp-harness connect {}`, or {var} for CI/headless)",
+                    provider_name(&p.id),
+                    p.id
                 ),
                 None => provider_name(&p.id),
             })
@@ -1395,7 +1438,7 @@ async fn models_step(
         let message = format!("no model provider key: {}", how.join(", "));
         if plan.mode == Mode::FirstRun {
             return Err(CliError::new(format!(
-                "the chat needs a key. Set one with `amp-harness init`, or export it: {}",
+                "the chat needs a model provider key: {}",
                 how.join(", ")
             )));
         }

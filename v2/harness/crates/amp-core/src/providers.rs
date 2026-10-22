@@ -44,6 +44,15 @@ pub fn keychain_account(provider: &str) -> String {
     format!("{KEYCHAIN_ACCOUNT_PREFIX}{provider}")
 }
 
+/// The keychain account a provider's secret header value is stored under
+/// (`provider:<id>:header:<name, lowercase>`; header names are case-insensitive).
+pub fn header_account(provider: &str, header: &str) -> String {
+    format!(
+        "{KEYCHAIN_ACCOUNT_PREFIX}{provider}:header:{}",
+        header.trim().to_ascii_lowercase()
+    )
+}
+
 /// A provider key. `Debug` and `Display` are redacted.
 #[derive(Clone)]
 pub struct Secret(String);
@@ -98,7 +107,7 @@ impl fmt::Display for KeySource {
                     None => f.write_str("no key_env")?,
                 }
                 if *keychain_checked {
-                    f.write_str(" or store it in the keychain")?;
+                    f.write_str(", or store it with `amp-harness connect`")?;
                 } else {
                     f.write_str("; keychain off")?;
                 }
@@ -152,6 +161,11 @@ impl fmt::Debug for KeychainKey {
 pub trait KeyLookup: Send + Sync {
     fn env(&self, var: &str) -> Option<String>;
     fn keychain(&self, provider: &str) -> KeychainKey;
+    /// The value of a provider's secret header (`secret_headers`), from the keychain.
+    fn secret_header(&self, provider: &str, header: &str) -> KeychainKey {
+        let _ = (provider, header);
+        KeychainKey::Off
+    }
 }
 
 /// Process environment + the OS keychain (unless `AMP_CREDENTIAL_STORE=file`).
@@ -197,6 +211,18 @@ impl KeyLookup for SystemKeys {
             Err(e) => KeychainKey::Failed(e.message),
         }
     }
+
+    fn secret_header(&self, provider: &str, header: &str) -> KeychainKey {
+        let Some(service) = self.keychain_service.as_deref() else {
+            return KeychainKey::Off;
+        };
+        match amp_mcp::keychain_get(service, &header_account(provider, header)) {
+            Ok(Some(value)) => KeychainKey::Found(value),
+            Ok(None) => KeychainKey::NotFound,
+            Err(e) if e.kind == amp_mcp::KeychainErrorKind::Unavailable => KeychainKey::NotFound,
+            Err(e) => KeychainKey::Failed(e.message),
+        }
+    }
 }
 
 /// A fixed set of env values and keychain entries (tests).
@@ -220,6 +246,49 @@ impl KeyLookup for StaticKeys {
                 .map_or(KeychainKey::NotFound, KeychainKey::Found),
         }
     }
+
+    /// Entries keyed `<provider>:header:<name, lowercase>`.
+    fn secret_header(&self, provider: &str, header: &str) -> KeychainKey {
+        let account = header_account(provider, header);
+        let short = account
+            .strip_prefix(KEYCHAIN_ACCOUNT_PREFIX)
+            .unwrap_or(&account);
+        match &self.keychain {
+            None => KeychainKey::Off,
+            Some(k) => k
+                .get(short)
+                .cloned()
+                .map_or(KeychainKey::NotFound, KeychainKey::Found),
+        }
+    }
+}
+
+/// The values of a provider's secret headers, or why one is missing (never a value).
+pub fn resolve_secret_headers(
+    provider: &ProviderConfig,
+    keys: &dyn KeyLookup,
+) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for name in &provider.secret_headers {
+        match keys.secret_header(&provider.id, name) {
+            KeychainKey::Found(value) if !value.trim().is_empty() => {
+                out.insert(name.clone(), value.trim().to_owned());
+            }
+            KeychainKey::Failed(why) => return Err(format!("header {name}: keychain: {why}")),
+            KeychainKey::Off => {
+                return Err(format!(
+                    "header {name} is kept in the OS keychain, which is off here"
+                ));
+            }
+            _ => {
+                return Err(format!(
+                    "no value for header {name} (run `amp-harness connect {}`)",
+                    provider.id
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Find a provider's key: `key_env`, then the keychain.
@@ -282,15 +351,22 @@ impl ProviderSet {
                     .insert(provider.id.clone(), format!("no key: {source}"));
                 continue;
             }
+            let extra = match resolve_secret_headers(provider, keys) {
+                Ok(extra) => extra,
+                Err(why) => {
+                    set.unavailable.insert(provider.id.clone(), why);
+                    continue;
+                }
+            };
             match build_inner(provider, key) {
                 Ok((inner, faux)) => {
                     if let Some(script) = faux {
                         set.faux.insert(provider.id.clone(), script);
                     }
-                    set.providers.insert(
-                        provider.id.clone(),
-                        Arc::new(ConfiguredProvider::new(provider, inner)),
-                    );
+                    let mut configured = ConfiguredProvider::new(provider, inner);
+                    configured.extra_headers = extra;
+                    set.providers
+                        .insert(provider.id.clone(), Arc::new(configured));
                 }
                 Err(e) => {
                     set.unavailable.insert(provider.id.clone(), e);
@@ -298,6 +374,21 @@ impl ProviderSet {
             }
         }
         set
+    }
+
+    /// The same providers rebuilt from `config` with the keys as they are now (after `amp-harness
+    /// connect` stored one, or a new provider was added). Faux providers are kept as they are, so
+    /// their scripts survive.
+    pub fn rebuild(&self, config: &ModelsConfig, keys: &dyn KeyLookup) -> Self {
+        let mut next = Self::build(config, keys);
+        for (id, script) in &self.faux {
+            if let Some(p) = self.providers.get(id) {
+                next.providers.insert(id.clone(), Arc::clone(p));
+                next.faux.insert(id.clone(), script.clone());
+                next.unavailable.remove(id);
+            }
+        }
+        next
     }
 
     /// The provider registry for `AgentHarnessOptions::models`.
@@ -382,6 +473,9 @@ fn build_inner(provider: &ProviderConfig, key: Option<Secret>) -> Result<Inner, 
 pub struct ConfiguredProvider {
     id: String,
     inner: Arc<dyn Provider>,
+    /// Secret header values (`secret_headers`, from the keychain), added to every request.
+    /// Never logged or shown.
+    extra_headers: BTreeMap<String, String>,
     models: Vec<Model>,
     timeouts: Timeouts,
     max_retries: Option<u32>,
@@ -392,6 +486,7 @@ impl ConfiguredProvider {
         Self {
             id: config.id.clone(),
             inner,
+            extra_headers: BTreeMap::new(),
             models: config.models.values().cloned().collect(),
             timeouts: config.timeouts,
             max_retries: config.max_retries,
@@ -427,6 +522,12 @@ impl Provider for ConfiguredProvider {
             opts.max_retries = self.max_retries;
         }
         // Our own child token, so a stall cancels this request without cancelling the caller.
+        if !self.extra_headers.is_empty() {
+            let headers = opts.headers.get_or_insert_with(Default::default);
+            for (name, value) in &self.extra_headers {
+                headers.insert(name.clone(), value.clone());
+            }
+        }
         let cancel = opts.signal.child_token();
         opts.signal = cancel.clone();
         let inner = self.inner.stream_simple(model, ctx, &opts).await;
@@ -568,6 +669,7 @@ pub async fn live_model_ids(
         return Ok(provider.models.keys().cloned().collect());
     }
     let (key, source) = resolve_key(provider, keys);
+    let secret_headers = resolve_secret_headers(provider, keys)?;
     let http = rpi_ai::http::client_builder_for(&provider.base_url, None, None)?
         .timeout(Duration::from_secs(30))
         .build()
@@ -585,12 +687,14 @@ pub async fn live_model_ids(
                     url.push_str("&after_id=");
                     url.push_str(after);
                 }
-                let page = get_json!(
-                    http.get(&url)
-                        .header("x-api-key", key.expose())
-                        .header("anthropic-version", "2023-06-01")
-                )
-                .await?;
+                let mut request = http
+                    .get(&url)
+                    .header("x-api-key", key.expose())
+                    .header("anthropic-version", "2023-06-01");
+                for (name, value) in provider.headers.iter().chain(secret_headers.iter()) {
+                    request = request.header(name.as_str(), value.as_str());
+                }
+                let page = get_json!(request).await?;
                 collect_ids(&page, &mut ids);
                 let more = page["has_more"].as_bool().unwrap_or(false);
                 match page["last_id"].as_str() {
@@ -601,6 +705,9 @@ pub async fn live_model_ids(
         }
         ProviderApi::OpenaiCompletions => {
             let mut request = http.get(format!("{}/models", provider.base_url));
+            for (name, value) in provider.headers.iter().chain(secret_headers.iter()) {
+                request = request.header(name.as_str(), value.as_str());
+            }
             if let Some(key) = &key {
                 request = request.bearer_auth(key.expose());
             }
@@ -630,6 +737,73 @@ mod tests {
         let user = ModelsFile::parse(user, "test").unwrap();
         ModelsConfig::from_files(ModelsFile::defaults(), Some(user), "config test", &|_| None)
             .unwrap()
+    }
+
+    #[test]
+    fn secret_headers_come_from_the_keychain_or_the_provider_is_unavailable() {
+        let c = config(
+            "[providers.gw]\nname = \"Gateway\"\napi = \"openai-completions\"\n\
+             base_url = \"http://gw.invalid/v1\"\nauth = \"none\"\n\
+             headers = { \"X-Title\" = \"AMP\" }\nsecret_headers = [\"X-Api-Key\"]\n\
+             [providers.gw.models.\"m\"]\n",
+        );
+        let gw = &c.providers["gw"];
+        assert_eq!(gw.name.as_deref(), Some("Gateway"));
+        assert_eq!(gw.headers["X-Title"], "AMP");
+        assert_eq!(gw.secret_headers, ["X-Api-Key"]);
+        assert_eq!(
+            header_account("gw", "X-Api-Key"),
+            "provider:gw:header:x-api-key"
+        );
+
+        // No value stored: unavailable, with the way to fix it (and never a value).
+        let none = StaticKeys {
+            keychain: Some(BTreeMap::new()),
+            ..StaticKeys::default()
+        };
+        let set = ProviderSet::build(&c, &none);
+        let why = set.unavailable()["gw"].clone();
+        assert!(why.contains("amp-harness connect gw"), "{why}");
+        // The keychain off: says so.
+        let set = ProviderSet::build(&c, &StaticKeys::default());
+        assert!(set.unavailable()["gw"].contains("keychain"), "{set:?}");
+
+        // Stored: available; the value is never in Debug.
+        let keys = StaticKeys {
+            keychain: Some(BTreeMap::from([(
+                "gw:header:x-api-key".to_owned(),
+                "HDR-TOPSECRET".to_owned(),
+            )])),
+            ..StaticKeys::default()
+        };
+        assert_eq!(
+            resolve_secret_headers(gw, &keys).unwrap()["X-Api-Key"],
+            "HDR-TOPSECRET"
+        );
+        let set = ProviderSet::build(&c, &keys);
+        assert!(set.get("gw").is_ok(), "{set:?}");
+        assert!(!format!("{set:?}").contains("TOPSECRET"));
+    }
+
+    #[test]
+    fn rebuild_keeps_faux_scripts_and_picks_up_new_keys() {
+        let c = config(TWO_FAUX);
+        let set = ProviderSet::build(&c, &StaticKeys::default());
+        assert!(set.get("openrouter").is_err());
+        let script = set.faux_script("alpha").unwrap().clone();
+        let keys = StaticKeys {
+            env: BTreeMap::from([("OPENROUTER_API_KEY".to_owned(), "sk-or-x".to_owned())]),
+            keychain: None,
+        };
+        let next = set.rebuild(&c, &keys);
+        assert!(next.get("openrouter").is_ok());
+        // The same faux provider (and script) as before.
+        assert!(Arc::ptr_eq(
+            &(set.get("alpha").unwrap()),
+            &(next.get("alpha").unwrap())
+        ));
+        script.set_responses(vec![]);
+        assert_eq!(next.faux_script("alpha").unwrap().pending_count(), 0);
     }
 
     /// Two faux providers (offline) for two roles.

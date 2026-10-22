@@ -462,7 +462,7 @@ async fn provider_keys_and_pinned_models() {
     let v = out.json();
     assert_eq!(status(&v, "key:mock"), "fail");
     assert!(
-        fix(&v, "key:mock").starts_with("export MOCK_KEY=<your mock key>"),
+        fix(&v, "key:mock").starts_with("set MOCK_KEY in the environment"),
         "{v}"
     );
     assert_eq!(status(&v, "models:mock"), "skip");
@@ -508,7 +508,7 @@ async fn unreachable_catalog_warns_and_other_providers_key_warns() {
         "{v}"
     );
     assert!(
-        fix(&v, "key:anthropic").starts_with("export ANTHROPIC_API_KEY="),
+        fix(&v, "key:anthropic").starts_with("set ANTHROPIC_API_KEY in the environment"),
         "{v}"
     );
 

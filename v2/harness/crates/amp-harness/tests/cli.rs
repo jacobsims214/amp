@@ -675,7 +675,7 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
         v["checks"][10]["fix"]
             .as_str()
             .unwrap()
-            .starts_with("export OPENROUTER_API_KEY="),
+            .starts_with("set OPENROUTER_API_KEY in the environment"),
         "{}",
         v["checks"][10]
     );

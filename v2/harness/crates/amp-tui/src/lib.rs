@@ -39,7 +39,10 @@ pub mod view;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
-pub use shell::{HELP, ModelChoice, Opener, RunDone, Shell, ShellInfo, Submit};
+pub use shell::{
+    ConnectFuture, ConnectReply, HELP, ModelChoice, Opener, ProviderConnect, RunDone, Shell,
+    ShellInfo, Submit,
+};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use view::{ChatView, FooterInfo};
 

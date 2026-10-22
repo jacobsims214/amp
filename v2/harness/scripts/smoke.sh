@@ -36,7 +36,8 @@
 #          `run -p` (faux manager, compose server) each run in a new process with keychain dialogs
 #          turned off (AMP_HARNESS_KEYCHAIN_PROMPTS=never: a read that needs approval fails instead of
 #          prompting), must find the key, and must read each keychain item at most once
-#          (AMP_HARNESS_KEYCHAIN_TRACE). The item is deleted on exit.
+#          (AMP_HARNESS_KEYCHAIN_TRACE). `connect --list` must report the key's source and
+#          `disconnect openrouter` must remove the item (#2163). The item is deleted on exit.
 #
 # Exits non-zero on any failure. Cleanup runs on every exit path (trap), including failures.
 # The harness runs with HOME/XDG_CONFIG_HOME under target/ and AMP_CREDENTIAL_STORE=file, so your
@@ -563,6 +564,18 @@ keychain_leg() {
     die "[keychain] run -p failed"
   }
   kc_check "run -p"
+
+  # #2163: connect --list reports the key's source (never the key); disconnect removes the item.
+  rm -f "$trace"
+  KARGS=(connect --list --json)
+  out="$(k)" || die "[keychain] connect --list failed"
+  expect "$out" 'map(select(.id == "openrouter"))[0].key == "keychain"' \
+    "connect --list does not show the OpenRouter key in the keychain"
+  grep -q "sk-or-v1-smoke-dummy" <<<"$out" && die "[keychain] connect --list printed the key"
+  KARGS=(disconnect openrouter --json)
+  out="$(k)" || die "[keychain] disconnect failed"
+  expect "$out" '.key_removed == true' "disconnect did not remove the OpenRouter key"
+  log "[keychain] connect --list and disconnect ok"
   RESULTS+=("PASS keychain")
 }
 
