@@ -27,7 +27,8 @@
 //! the editor, the panel then shows exactly what will be sent, and only `y` / Enter sends it.
 //!
 //! The transcript gets a marker line whenever the current ticket changes (switched, claimed, or
-//! its state moved), and the footer's session name becomes `manager · #2108`.
+//! its state moved), and the footer's session name becomes `manager · #2108`. A current ticket
+//! that is done stops being current once the /ticket panel isn't showing it (#2187).
 //!
 //! **`/connect` (#2163).** `/connect` lists the model providers and their keys (and picks up keys
 //! stored in another terminal); `/connect <provider>` (or `/connect <id> <base-url> [api]` for a
@@ -317,6 +318,8 @@ pub struct Shell {
     seen_revision: u64,
     marked: Option<(i64, Option<Status>)>,
     footer_ticket: Option<i64>,
+    /// The completed ticket this shell last stopped tracking (so it asks the poller once).
+    cleared_done: Option<i64>,
     /// The manager's worker supervisor, so quitting can cancel and wait for its workers.
     supervisor: Option<Arc<Supervisor>>,
     /// `/connect`'s harness side, if the caller gave one.
@@ -368,6 +371,7 @@ impl Shell {
                 seen_revision: 0,
                 marked: None,
                 footer_ticket: None,
+                cleared_done: None,
                 supervisor: None,
                 connect: None,
                 secret: None,
@@ -1452,7 +1456,44 @@ impl Shell {
                 },
             }
         }
-        changed | self.sync_meta()
+        // The Done marker first (sync_meta), then let the finished ticket go.
+        let synced = self.sync_meta();
+        changed | synced | self.clear_done_ticket()
+    }
+
+    /// A current ticket stops being current once it is done (UX review #2175 finding 12,
+    /// #2187), so a "■ Done #id" line doesn't stay pinned under the header for the rest of the
+    /// session. It goes once its snapshot says Done and the /ticket panel isn't showing it: a
+    /// ticket completed mid-session goes straight away; one picked with `/ticket <id>` that was
+    /// already done stays while its panel is open and goes when the panel closes. The Done
+    /// marker in the transcript has already said so, so no "no current ticket" marker follows.
+    fn clear_done_ticket(&mut self) -> bool {
+        let Some(meta) = &self.meta else {
+            return false;
+        };
+        let m = meta.snapshot();
+        let Some(id) = m.ticket_id else {
+            self.cleared_done = None;
+            return false;
+        };
+        let done = m
+            .ticket
+            .get()
+            .is_some_and(|t| t.id == id && t.status == Status::Done);
+        let shown = self
+            .view
+            .panel()
+            .state()
+            .is_some_and(|s| s.kind == PanelKind::Ticket);
+        if !done || shown || self.cleared_done == Some(id) {
+            return false;
+        }
+        self.cleared_done = Some(id);
+        meta.set_ticket(None);
+        if self.marked == Some((id, Some(Status::Done))) {
+            self.marked = None;
+        }
+        true
     }
 
     /// Waits (at most `timeout`) until every command call has finished, applying them. The

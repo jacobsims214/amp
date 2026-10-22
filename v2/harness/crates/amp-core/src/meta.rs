@@ -877,6 +877,8 @@ struct Inner {
     started: Mutex<HashMap<String, (String, Value)>>,
     /// [`MetaHandle::stub`] only: the calls it answered.
     stub_calls: Option<CallLog>,
+    /// [`MetaHandle::stub`] only: its snapshot's sender, for [`MetaHandle::stub_update`].
+    stub_meta: Option<Arc<watch::Sender<Arc<AmpMeta>>>>,
 }
 
 /// The calls a [`MetaHandle::stub`] answered: (tool, arguments).
@@ -955,6 +957,8 @@ impl MetaHandle {
     /// also recorded in [`Self::stub_calls`]. Must be called inside a tokio runtime.
     pub fn stub(meta: AmpMeta, responder: StubResponder) -> Self {
         let (tx, rx) = watch::channel(Arc::new(meta));
+        let tx = Arc::new(tx);
+        let stub_meta = Arc::clone(&tx);
         let (commands, mut command_rx) = unbounded_channel::<Command>();
         let calls: CallLog = Arc::default();
         let recorded = Arc::clone(&calls);
@@ -985,7 +989,20 @@ impl MetaHandle {
             meta: rx,
             started: Mutex::new(HashMap::new()),
             stub_calls: Some(calls),
+            stub_meta: Some(stub_meta),
         }))
+    }
+
+    /// [`Self::stub`] only: changes the snapshot (bumping its revision), as a poll that found a
+    /// change would. Does nothing on a real poller's handle.
+    pub fn stub_update(&self, f: impl FnOnce(&mut AmpMeta)) {
+        if let Some(tx) = &self.0.stub_meta {
+            tx.send_modify(|arc| {
+                let m = Arc::make_mut(arc);
+                f(m);
+                m.revision += 1;
+            });
+        }
     }
 
     /// The calls a [`Self::stub`] handle answered, in order (empty for a real poller).
@@ -1158,6 +1175,7 @@ impl MetaPoller {
             meta: rx,
             started: Mutex::new(HashMap::new()),
             stub_calls: None,
+            stub_meta: None,
         }))
     }
 
