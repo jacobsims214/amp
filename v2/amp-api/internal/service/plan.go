@@ -314,16 +314,19 @@ type PlanReport struct {
 	OK bool `json:"ok"`
 	// Plan approval: open tickets planned since the last approval, when
 	// that was, and whether the project requires it before dispatch.
-	AwaitingApproval    []int       `json:"awaiting_approval"`
-	ApprovedAt          *time.Time  `json:"plan_approved_at,omitempty"`
-	ApprovedBy          *int        `json:"plan_approved_by,omitempty"`
-	RequirePlanApproval bool        `json:"require_plan_approval"`
-	Tasks               int         `json:"tasks"`
-	OpenTasks           int         `json:"open_tasks"`
-	Dependencies        int         `json:"dependencies"`
-	ReadyNow            []int       `json:"ready_now"`
-	LongestChain        int         `json:"longest_chain"` // tickets on the longest dependency path
-	Issues              []PlanIssue `json:"issues"`
+	AwaitingApproval    []int      `json:"awaiting_approval"`
+	ApprovedAt          *time.Time `json:"plan_approved_at,omitempty"`
+	ApprovedBy          *int       `json:"plan_approved_by,omitempty"`
+	RequirePlanApproval bool       `json:"require_plan_approval"`
+	// ApproveURL, when tickets await approval, is the Flight plan page where
+	// a person approves them (agents can't).
+	ApproveURL   string      `json:"approve_url,omitempty"`
+	Tasks        int         `json:"tasks"`
+	OpenTasks    int         `json:"open_tasks"`
+	Dependencies int         `json:"dependencies"`
+	ReadyNow     []int       `json:"ready_now"`
+	LongestChain int         `json:"longest_chain"` // tickets on the longest dependency path
+	Issues       []PlanIssue `json:"issues"`
 	// HumanGates are the open tickets people do, and how much open work
 	// waits on each: where the plan puts a person in the loop.
 	HumanGates      []HumanGate `json:"human_gates"`
@@ -379,6 +382,9 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		if tasks[i].State != domain.TaskStateCompleted && proj.AwaitsApproval(&tasks[i]) {
 			r.AwaitingApproval = append(r.AwaitingApproval, tasks[i].ID)
 		}
+	}
+	if len(r.AwaitingApproval) > 0 {
+		r.ApproveURL = s.PlanURL(projectID)
 	}
 	byID := map[int]domain.Task{}
 	dependents := map[int]int{}
@@ -961,16 +967,28 @@ func (s *Service) AnswerQuestion(ctx context.Context, p authz.Principal, taskID 
 	return s.answer(ctx, p, t, answer)
 }
 
+// answerAttribution is how an answer is recorded: by the person in the web
+// UI, or "relayed by agent" when it came over MCP or a token (a manager
+// passing on what its person said), so nobody mistakes it for the person's
+// own click.
+func answerAttribution(p authz.Principal) (author, detail string) {
+	if p.InUI() {
+		return p.Email, "Question answered by " + p.Label() + " in the AMP web UI"
+	}
+	return p.Label() + " (relayed by agent)", "Question answered for " + p.Label() + ", relayed by agent (" + p.Channel + ")"
+}
+
 // answer posts answer on t (already checked) and sends it back to ready.
 func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task, answer string) (*domain.Task, error) {
 	taskID := t.ID
 	if t.State != domain.TaskStateBlocked || t.BlockReason == "" || strings.HasPrefix(t.BlockReason, "scheduled:") {
 		return nil, authz.BadRequest("ticket %d has no open question: only a ticket blocked with a reason (amp_block_task) can be answered", taskID)
 	}
+	author, detail := answerAttribution(p)
 	if answer = strings.TrimSpace(answer); answer != "" {
 		added := make(chan actor.ReplyAddComment, 1)
 		if err := s.Registry.Send(t.ProjectID, &actor.MsgAddComment{Req: domain.AddCommentRequest{
-			TaskID: taskID, Author: p.Email, Body: answer, AuthorUserID: p.UserRef(),
+			TaskID: taskID, Author: author, Body: answer, AuthorUserID: p.UserRef(),
 		}, ReplyCh: added}); err != nil {
 			return nil, err
 		}
@@ -979,7 +997,7 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 		}
 	}
 	set := make(chan actor.ReplySimple, 1)
-	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: "", By: p.UserRef(), ReplyCh: set}); err != nil {
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{TaskID: taskID, State: domain.TaskStateBacklog, Reason: detail, By: p.UserRef(), ByName: author, ReplyCh: set}); err != nil {
 		return nil, err
 	}
 	if r := actor.Await(ctx, set); r.Err != nil {
@@ -1031,13 +1049,14 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 // ApprovePlan records that a person approved the project's plan as it is
 // now: every ticket planned so far may be dispatched. Any person with at
 // least member access to the project (on one of its teams, or an org or
-// global admin) can approve, not only team leads and project owners; agent
-// accounts can't (a person approves agents' plans).
+// global admin) can approve, not only team leads and project owners. Only
+// a person in the web UI can: never an agent, over MCP or with a token,
+// and never a manager on the strength of something said in chat.
 func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
-	if p.Agent {
-		return nil, authz.Forbidden("agent accounts can't approve plans; a person approves (in AMP, or by telling the orchestrator)")
-	}
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
+		return nil, err
+	}
+	if err := authz.RequireUI(p, "Plan approval", s.PlanURL(projectID)); err != nil {
 		return nil, err
 	}
 	// Approval is the person saying "go" to the plan their agent drafted: any
@@ -1047,7 +1066,7 @@ func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID 
 		return nil, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
-		Summary: fmt.Sprintf("approved the plan of %s", proj.Name)})
+		Summary: fmt.Sprintf("approved the plan of %s", proj.Name), Details: map[string]any{"channel": p.Channel}})
 	// Published here, not by the REST or MCP handler, so every way of
 	// approving refreshes open Flight plan pages the same way.
 	s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})

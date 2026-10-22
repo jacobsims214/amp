@@ -39,7 +39,7 @@ func (r *Repo) workTasks(ctx context.Context, where string, args ...any) ([]Work
 			&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID, &t.Name, &t.Description, &t.AcceptanceCriteria,
 			&t.State, &t.Priority, &t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 			&t.CreatedBy, &t.OwnerUserID, &t.Metadata, &t.CreatedAt, &t.UpdatedAt,
-			&t.Performer, &t.HumanReason, &t.ReadyAt, &w.ProjectCode, &w.ProjectName, &w.LastActivityAt,
+			&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &w.ProjectCode, &w.ProjectName, &w.LastActivityAt,
 		); err != nil {
 			return nil, err
 		}

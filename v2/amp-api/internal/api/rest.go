@@ -1397,11 +1397,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed", "task": t, "run": run})
 			return
 		}
-		replyCh := make(chan actor.ReplySimple, 1)
-		h.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: pr.UserRef(), ReplyCh: replyCh})
-		reply := actor.Await(r.Context(), replyCh)
-		if reply.Err != nil {
-			jsonErr(w, reply.Err, 400)
+		// A person in the web UI completes any ticket they can work; other
+		// callers (API tokens, MCP-audience tokens) only dispatched work.
+		if _, err := h.svc.CompleteTask(r.Context(), pr, taskID); err != nil {
+			fail(w, err, 400)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})

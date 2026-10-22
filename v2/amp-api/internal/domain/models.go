@@ -65,9 +65,11 @@ type Project struct {
 }
 
 // AwaitsApproval reports whether a ticket was planned after the project's
-// plan was last approved (always, if it never was).
+// plan was last approved (always, if it never was). A ticket is planned
+// when it's created, restored from the trash, or its name, description, or
+// acceptance criteria change (Task.PlannedAt).
 func (p *Project) AwaitsApproval(t *Task) bool {
-	return p.PlanApprovedAt == nil || t.CreatedAt.After(*p.PlanApprovedAt)
+	return p.PlanApprovedAt == nil || t.Planned().After(*p.PlanApprovedAt)
 }
 
 // ProjectSettings is a change to a project's settings; nil fields are kept.
@@ -163,6 +165,21 @@ type Task struct {
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// PlannedAt is when the ticket's scope was last set: its creation, its
+	// restore from the trash, or the last change to its name, description,
+	// or acceptance criteria. A plan approval covers tickets planned before
+	// it (Project.AwaitsApproval); comments and dependency changes don't
+	// move it.
+	PlannedAt time.Time `json:"planned_at"`
+}
+
+// Planned is when the ticket was last planned (PlannedAt, or CreatedAt for
+// a value built without it).
+func (t *Task) Planned() time.Time {
+	if t.PlannedAt.IsZero() {
+		return t.CreatedAt
+	}
+	return t.PlannedAt
 }
 
 // IsHuman reports whether a person, not an agent, does this ticket.

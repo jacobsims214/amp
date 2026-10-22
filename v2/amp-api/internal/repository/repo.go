@@ -127,7 +127,7 @@ func scanStory(row rowScanner, st *domain.Story) error {
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
-	performer, human_reason, ready_at`
+	performer, human_reason, ready_at, planned_at`
 
 func scanTask(row rowScanner, t *domain.Task) error {
 	return row.Scan(
@@ -137,7 +137,7 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
-		&t.Performer, &t.HumanReason, &t.ReadyAt,
+		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt,
 	)
 }
 
@@ -589,6 +589,14 @@ func (r *Repo) SetTaskStartAt(ctx context.Context, taskID int, startAt *time.Tim
 }
 
 func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) error {
+	_, err := r.UpdateTaskPlanned(ctx, req)
+	return err
+}
+
+// UpdateTaskPlanned is UpdateTask returning the ticket's planned_at after
+// the change (moved to now when its name, description, or acceptance
+// criteria changed).
+func (r *Repo) UpdateTaskPlanned(ctx context.Context, req domain.UpdateTaskRequest) (time.Time, error) {
 	// Empty = keep; fields named in req.Clear are blanked.
 	clr := func(f string) bool { return slices.Contains(req.Clear, f) }
 	query := `UPDATE tasks SET
@@ -599,6 +607,13 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 	   agent_id            = CASE WHEN $10 THEN '' WHEN $5 != '' THEN $5 ELSE agent_id END,
 	   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
 	   updated_at          = NOW()`
+	// A change to what the ticket is (name, description, acceptance
+	// criteria) re-plans it: the last plan approval no longer covers it.
+	query += `,
+	   planned_at = CASE WHEN ($1 != '' AND $1 IS DISTINCT FROM name)
+	                       OR ($7 AND description != '') OR ($2 != '' AND $2 IS DISTINCT FROM description)
+	                       OR ($8 AND acceptance_criteria != '') OR ($3 != '' AND $3 IS DISTINCT FROM acceptance_criteria)
+	                     THEN NOW() ELSE planned_at END`
 
 	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority,
 		clr("description"), clr("acceptance_criteria"), clr("assigned_to"), clr("agent_id")}
@@ -615,11 +630,15 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 		query += fmt.Sprintf(`, human_reason = $%d`, len(args))
 	}
 
-	query += ` WHERE id = $` + fmt.Sprint(len(args)+1)
+	query += ` WHERE id = $` + fmt.Sprint(len(args)+1) + ` RETURNING planned_at`
 	args = append(args, req.TaskID)
 
-	_, err := r.db.Exec(ctx, query, args...)
-	return err
+	var planned time.Time
+	err := r.db.QueryRow(ctx, query, args...).Scan(&planned)
+	if err == pgx.ErrNoRows {
+		return planned, fmt.Errorf("task %d not found", req.TaskID)
+	}
+	return planned, err
 }
 
 // UpdateEpic updates an epic's mutable fields. Empty string = keep existing

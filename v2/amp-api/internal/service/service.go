@@ -335,7 +335,7 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 		return nil, err
 	}
 	proj, err := s.Repo.GetProject(ctx, t.ProjectID)
-	if err := planApprovalGate(proj, err, t); err != nil {
+	if err := planApprovalGate(proj, err, t, s.PlanURL(t.ProjectID)); err != nil {
 		return nil, err
 	}
 	pid, err := s.Registry.Get(t.ProjectID)
@@ -360,7 +360,7 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 // the project couldn't be loaded (lookupErr), we can't tell whether the gate
 // applies, so the dispatch is refused with a retryable 503 rather than let
 // through unchecked.
-func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task) error {
+func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, planURL string) error {
 	if lookupErr != nil || proj == nil {
 		reason := "project not found"
 		if lookupErr != nil {
@@ -371,7 +371,8 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task) err
 	}
 	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
 		return authz.Forbidden("ticket %d was planned after the plan was last approved; this project needs the plan approved "+
-			"before agents start new tickets (amp_approve_plan, or Approve plan in AMP's Flight plan)", t.ID)
+			"before agents start new tickets. A person approves it in the AMP web UI (Approve plan): %s. "+
+			"Agents can't approve: stop and ask your person to approve it there.", t.ID, planURL)
 	}
 	return nil
 }
@@ -397,11 +398,18 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
 		return nil, err
 	}
+	// Turning plan approval off lets agents start work nobody approved, so
+	// only a person in the web UI can. Turning it on is fine from anywhere.
+	if u.RequirePlanApproval != nil && !*u.RequirePlanApproval {
+		if err := authz.RequireUI(p, "Turning plan approval off", s.SettingsURL(projectID)); err != nil {
+			return nil, err
+		}
+	}
 	proj, err := s.Repo.UpdateProject(ctx, projectID, u)
 	if err == nil {
 		s.audit(ctx, p, domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
-				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata}})
+				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata, "channel": p.Channel}})
 	}
 	return proj, err
 }

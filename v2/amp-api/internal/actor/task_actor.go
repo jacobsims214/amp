@@ -118,7 +118,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgCompleteTask:
-		err := a.handleComplete(ctx, msg.By)
+		err := a.handleComplete(ctx, msg)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgBlockTask:
@@ -134,12 +134,17 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
+		if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d is %s, not in progress: it wasn't dispatched, so it can't be set to %s off the web UI",
+				a.task.ID, a.task.State, msg.State)}
+			return
+		}
 		// Cancel timer if armed before applying state change
 		if a.scheduleTimer != nil {
 			a.scheduleTimer.Stop()
 			a.scheduleTimer = nil
 		}
-		err := a.handleSetState(msg.State, msg.Reason, msg.By)
+		err := a.handleSetState(msg.State, msg.Reason, msg.By, msg.ByName)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskStartAt:
@@ -274,9 +279,14 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	return nil
 }
 
-func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
+func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) error {
+	by := msg.By
 	if a.task.State == domain.TaskStateCompleted {
 		return nil // idempotent
+	}
+	if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
+		return fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first",
+			a.task.ID, a.task.State)
 	}
 
 	prevState := a.task.State // capture before mutation for accurate activity log
@@ -292,9 +302,17 @@ func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
 	if a.task.IsHuman() {
 		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", "Done by its owner (human work)")
-	} else {
+	} else if a.task.AgentID != "" {
 		a.logActivityBy(a.task.AgentID, by, "completed", string(prevState), "completed",
 			fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
+	} else {
+		// Never dispatched, so no agent to name: name the caller, never "".
+		who := msg.ByName
+		if who == "" {
+			who = "agent (no dispatch)"
+		}
+		a.logActivityBy(who, by, "completed", string(prevState), "completed",
+			fmt.Sprintf("Task completed by %s without a dispatch", who))
 	}
 	a.log.Info("completed")
 
@@ -373,9 +391,15 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	}
 	a.task.UpdatedAt = time.Now()
 
-	if err := a.repo.UpdateTask(context.Background(), req); err != nil {
+	planned, err := a.repo.UpdateTaskPlanned(context.Background(), req)
+	if err != nil {
 		return fmt.Errorf("db update: %w", err)
 	}
+	// A change to what the ticket is (name, description, acceptance
+	// criteria) re-plans it, so the last plan approval no longer covers it.
+	// The database decides (Repo.UpdateTaskPlanned), on the same clock as
+	// plan_approved_at.
+	a.task.PlannedAt = planned
 	if prevPerformer != a.task.Performer {
 		who := map[string]string{domain.PerformerAgent: "an agent", domain.PerformerHuman: "a person"}
 		detail := fmt.Sprintf("Now done by %s (was %s)", who[a.task.Performer], who[prevPerformer])
@@ -412,7 +436,10 @@ func (a *TaskActor) saveState(state domain.TaskState, blockReason string) error 
 	return nil
 }
 
-func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *int) error {
+func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *int, byName string) error {
+	if byName == "" {
+		byName = "manager"
+	}
 	from := string(a.task.State)
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
@@ -430,7 +457,7 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{
 		TaskID:    a.task.ID,
 		ProjectID: a.projectID,
-		Actor:     "manager",
+		Actor:     byName,
 		Action:    "state_change",
 		FromState: from,
 		ToState:   string(state),

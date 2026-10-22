@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
 )
 
@@ -251,5 +252,93 @@ func TestGlobalAdmin_LastAdminIsProtected(t *testing.T) {
 	// Non-admin roles are unaffected by the guard.
 	if err := repo.SetUserRole(ctx, first.ID, "member", false); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Migration 023 turns plan approval on for every project. Projects that
+// didn't require it get today's plan recorded as approved, with an audit
+// row, so their boards don't freeze; projects that already required it keep
+// whatever awaits approval. Every ticket gets planned_at = created_at.
+func TestMigration_023TurnsPlanApprovalOn(t *testing.T) {
+	ctx := context.Background()
+	dsn := freshDatabase(t)
+	repo, err := repository.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	var before, after []repository.Migration
+	for _, m := range migrations {
+		if m.Version < "023" {
+			before = append(before, m)
+		} else {
+			after = append(after, m)
+		}
+	}
+	if len(after) == 0 {
+		t.Fatal("no migration 023")
+	}
+	if err := repo.RunMigrations(ctx, before); err != nil {
+		t.Fatalf("migrate to 022: %v", err)
+	}
+	db, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	q := func(sql string, dest *int, args ...any) {
+		t.Helper()
+		if err := db.QueryRow(ctx, sql, args...).Scan(dest); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	// off: approval off (the old default), with a ready ticket.
+	// gated: approval on, approved yesterday, with a ticket planned since.
+	var off, gated, epic, story, offTask, gatedTask int
+	q(`INSERT INTO projects (name, code) VALUES ('off', 'off') RETURNING id`, &off)
+	q(`INSERT INTO projects (name, code, require_plan_approval, plan_approved_at) VALUES ('gated', 'gated', TRUE, NOW() - INTERVAL '1 day') RETURNING id`, &gated)
+	q(`INSERT INTO epics (project_id, name) VALUES ($1, 'e') RETURNING id`, &epic, off)
+	q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 's') RETURNING id`, &story, off, epic)
+	q(`INSERT INTO tasks (project_id, epic_id, story_id, name, created_at) VALUES ($1, $2, $3, 'ready', NOW() - INTERVAL '2 hours') RETURNING id`, &offTask, off, epic, story)
+	var gEpic, gStory int
+	q(`INSERT INTO epics (project_id, name) VALUES ($1, 'e') RETURNING id`, &gEpic, gated)
+	q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 's') RETURNING id`, &gStory, gated, gEpic)
+	q(`INSERT INTO tasks (project_id, epic_id, story_id, name, created_at) VALUES ($1, $2, $3, 'awaiting', NOW() - INTERVAL '1 hour') RETURNING id`, &gatedTask, gated, gEpic, gStory)
+
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
+		t.Fatalf("migrate 023: %v", err)
+	}
+
+	for _, pid := range []int{off, gated} {
+		p, err := repo.GetProject(ctx, pid)
+		if err != nil || !p.RequirePlanApproval {
+			t.Fatalf("project %d after 023: %+v %v", pid, p, err)
+		}
+	}
+	pOff, _ := repo.GetProject(ctx, off)
+	tOff, _ := repo.GetTask(ctx, offTask)
+	if pOff.PlanApprovedAt == nil || pOff.AwaitsApproval(tOff) || pOff.PlanApprovedBy != nil {
+		t.Fatalf("grandfathered project: approved %v by %v, ticket awaits=%v", pOff.PlanApprovedAt, pOff.PlanApprovedBy, pOff.AwaitsApproval(tOff))
+	}
+	if !tOff.PlannedAt.Equal(tOff.CreatedAt) {
+		t.Fatalf("planned_at %v, created_at %v", tOff.PlannedAt, tOff.CreatedAt)
+	}
+	pGated, _ := repo.GetProject(ctx, gated)
+	tGated, _ := repo.GetTask(ctx, gatedTask)
+	if !pGated.AwaitsApproval(tGated) {
+		t.Fatal("migration approved a ticket that was waiting for a person")
+	}
+	entries, err := repo.ListAudit(ctx, domain.AuditFilter{Action: "plan.approve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].ProjectID == nil || *entries[0].ProjectID != off || entries[0].ActorEmail != "migration 023" ||
+		entries[0].Details["grandfathered"] != true {
+		t.Fatalf("audit rows: %+v", entries)
+	}
+	// New projects default to on, and new tickets get planned_at.
+	var def bool
+	if err := db.QueryRow(ctx, `INSERT INTO projects (name, code) VALUES ('new', 'new') RETURNING require_plan_approval`).Scan(&def); err != nil || !def {
+		t.Fatalf("new project default: %v %v", def, err)
 	}
 }

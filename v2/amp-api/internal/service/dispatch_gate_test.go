@@ -36,7 +36,7 @@ func TestPlanApprovalGate(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			err := planApprovalGate(tc.proj, tc.lookupErr, tc.task)
+			err := planApprovalGate(tc.proj, tc.lookupErr, tc.task, "/project/1/plan")
 			if tc.wantStatus == 0 {
 				if err != nil {
 					t.Fatalf("want allowed, got %v", err)

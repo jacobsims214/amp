@@ -171,6 +171,7 @@ func TestHierarchyActor_CrossEpicDepUnblocksCorrectly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create project: %v", err)
 	}
+	planApprovalOff(t, shared.repo, proj.ID)
 
 	s := &mcpStack{srv: shared.srv, repo: shared.repo, projectID: proj.ID}
 

@@ -85,7 +85,7 @@ func TestPlan_DependencyOnCompletedTicketInAnotherStory(t *testing.T) {
 	s := setupMCP(t)
 	_, otherStory := newStory(t, s, "API")
 	api := mkIn(t, s, otherStory, "build API")
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(api)})
+	s.finish(t, api)
 
 	ui := mkIn(t, s, s.storyID, "build UI", api)
 	if st := stateOf(t, s, ui); st != "backlog" || len(blockedBy(t, s, ui)) != 0 {
@@ -127,7 +127,7 @@ func TestPlan_SetDependencies(t *testing.T) {
 		t.Fatalf("after adding a dependency: %s, blocked by %v", st, blockedBy(t, s, bid))
 	}
 	// Finishing it unblocks the ticket as usual.
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(a)})
+	s.finish(t, a)
 	if st := stateOf(t, s, bid); st != "backlog" {
 		t.Fatalf("after its dependency finished: %s", st)
 	}
@@ -219,7 +219,7 @@ func TestPlan_ManualBlockOutlivesDependencies(t *testing.T) {
 	a := mkIn(t, s, s.storyID, "a")
 	b := mkIn(t, s, s.storyID, "b", a)
 	s.call(t, "amp_block_task", map[string]interface{}{"task_id": float64(b), "reason": "waiting on API keys"})
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(a)})
+	s.finish(t, a)
 	got := planTask(t, s, b)
 	if got["state"] != "blocked" || got["block_reason"] != "waiting on API keys" {
 		t.Fatalf("hand-blocked ticket after its dependency finished: %v %v", got["state"], got["block_reason"])
@@ -239,7 +239,7 @@ func TestPlan_MoveTicketsAndStories(t *testing.T) {
 		t.Fatalf("moved ticket = %v", moved)
 	}
 	s.call(t, "amp_update_task", map[string]interface{}{"task_id": float64(b), "name": "b, renamed after the move"})
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(a)})
+	s.finish(t, a)
 	if st := stateOf(t, s, b); st != "backlog" {
 		t.Fatalf("moved ticket didn't unblock when its dependency finished: %s", st)
 	}
@@ -269,7 +269,7 @@ func TestPlan_MoveTicketsAndStories(t *testing.T) {
 			t.Fatalf("ticket %d's epic after moving its story = %v", id, p["epic_id"])
 		}
 	}
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(c)})
+	s.finish(t, c)
 	if st := stateOf(t, s, d); st != "backlog" {
 		t.Fatalf("ticket in a moved story didn't unblock: %s", st)
 	}
@@ -352,7 +352,7 @@ func TestPlan_CheckPlan(t *testing.T) {
 
 	// Simulate a ticket stuck blocked on finished work (as the old bugs left them).
 	stuck := mkIn(t, s, s.storyID, "stuck", a)
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(a)})
+	s.finish(t, a)
 	if err := s.repo.SetTaskState(context.Background(), stuck, domain.TaskStateBlocked, ""); err != nil {
 		t.Fatal(err)
 	}

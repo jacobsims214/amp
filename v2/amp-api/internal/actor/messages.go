@@ -90,9 +90,16 @@ type MsgDispatchTask struct {
 }
 
 type MsgCompleteTask struct {
-	TaskID  int
-	By      *int // acting user, for the activity log
-	ReplyCh chan ReplySimple
+	TaskID int
+	By     *int // acting user, for the activity log
+	// ByName names the caller in the activity log (an email, or "local-dev")
+	// when the ticket has no agent to name.
+	ByName string
+	// RequireStarted refuses unless the ticket is in progress (or already
+	// completed): agents complete only work that was dispatched. Checked in
+	// the actor so a state change racing the caller's check can't slip by.
+	RequireStarted bool
+	ReplyCh        chan ReplySimple
 }
 
 type MsgBlockTask struct {
@@ -134,11 +141,16 @@ type MsgGetComments struct {
 }
 
 type MsgSetTaskState struct {
-	TaskID  int
-	State   domain.TaskState
-	Reason  string
-	By      *int
-	ReplyCh chan ReplySimple
+	TaskID int
+	State  domain.TaskState
+	Reason string
+	By     *int
+	// ByName names who changed it in the activity log (default "manager").
+	ByName string
+	// RequireStarted refuses unless the ticket is in progress (see
+	// MsgCompleteTask).
+	RequireStarted bool
+	ReplyCh        chan ReplySimple
 }
 
 // MsgSetTaskStartAt updates a task's start_at schedule.

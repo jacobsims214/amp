@@ -77,6 +77,40 @@ type Principal struct {
 	Agent bool
 	// ViaToken is set when the request authenticated with an API token.
 	ViaToken bool
+	// Channel is how the request reached AMP: auth.ChannelUI for a person in
+	// the web UI, otherwise mcp, token, rest-other, or empty (in-process).
+	// See RequireUI.
+	Channel string
+}
+
+// InUI reports whether p is a person acting in AMP's web UI: the only
+// caller that may approve a plan, approve an artifact, turn plan approval
+// off, or mark a person's own ticket done. Agent accounts never are.
+func (p Principal) InUI() bool { return p.Channel == auth.ChannelUI && !p.Agent }
+
+// Label names the caller for history rows and audit details: its email,
+// or "local-dev" when auth is off.
+func (p Principal) Label() string {
+	if p.Email != "" {
+		return p.Email
+	}
+	return "local-dev"
+}
+
+// RequireUI refuses unless p is a person in the web UI (InUI). what says
+// what was refused ("Plan approval"), link is the page where the person
+// does it; the message tells an agent to stop and ask its person.
+func RequireUI(p Principal, what, link string) error {
+	if p.InUI() {
+		return nil
+	}
+	return UIOnly(what, link)
+}
+
+// UIOnly is RequireUI's refusal: what is done by a person in the web UI, at link.
+func UIOnly(what, link string) error {
+	return Forbidden("%s is done by a person in the AMP web UI, not by an agent or over MCP: %s. "+
+		"Stop and ask your person to do it there.", what, link)
 }
 
 // HasUser reports whether the principal is a real AMP user (not local dev).
@@ -100,7 +134,7 @@ func FromContext(ctx context.Context) (Principal, error) {
 		return Principal{}, &Error{Status: 401, Msg: "not authenticated"}
 	}
 	if ident.LocalDev {
-		return Principal{Super: true, Email: ident.Email}, nil
+		return Principal{Super: true, Email: ident.Email, Channel: ident.Channel}, nil
 	}
 	if ident.User == nil {
 		return Principal{}, Forbidden("this token has no AMP user (missing email claim); sign in again")
@@ -111,6 +145,7 @@ func FromContext(ctx context.Context) (Principal, error) {
 		Super:    ident.HasRole(domain.RoleAdmin) && !ident.User.IsAgent(),
 		Agent:    ident.User.IsAgent(),
 		ViaToken: ident.APIToken,
+		Channel:  ident.Channel,
 	}, nil
 }
 

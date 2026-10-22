@@ -42,6 +42,16 @@ func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEn
 	e.ActorUserID = p.UserRef()
 	e.ActorEmail = p.Email
 	e.ViaToken = p.ViaToken
+	// How the change arrived (ui, mcp, token): approvals are only valid
+	// from the web UI, and the log shows which channel each one used.
+	if p.Channel != "" {
+		if e.Details == nil {
+			e.Details = map[string]any{}
+		}
+		if _, set := e.Details["channel"]; !set {
+			e.Details["channel"] = p.Channel
+		}
+	}
 	if e.ProjectID != nil && e.OrgID == nil {
 		if proj, err := s.Repo.GetProject(ctx, *e.ProjectID); err == nil {
 			e.OrgID = proj.OrgID

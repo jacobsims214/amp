@@ -43,6 +43,11 @@ image:
 # without it (and accepts it alongside oauth2Proxy.clientID on /api).
 auth:
   mcpAudience: amp-mcp
+  # The web UI's Dex client (UI_CLIENT_ID). Only REST requests with a token
+  # issued to it count as a person in the web UI: the one channel that can
+  # approve a plan or an artifact, turn plan approval off, or mark a person's
+  # ticket done. Empty: oauth2Proxy.clientID, which is that client.
+  uiClientID: ""
 
 ampApi:
   image: amp-api
