@@ -114,7 +114,8 @@ fn plain_layout_at_80_and_160() {
     assert!(wide[1].ends_with("▌ AMP Harness › M3 theme + metadata"));
     assert!(wide[2].contains("│ ■ 3 In progress · □ 5 Ready · ■ 1 Scheduled"));
     assert!(wide[2].ends_with("unreported #2106"));
-    // Narrow: the protocol, the story and the board counts go first; the name stays whole.
+    // Narrow: the protocol, the story and the board counts go first; the name stays whole. The
+    // plan chip (#2171: the person's next step) outranks the workers count.
     let narrow = at(80);
     assert!(narrow[0].ends_with("● connected"), "{}", narrow[0]);
     assert_eq!(
@@ -123,7 +124,10 @@ fn plain_layout_at_80_and_160() {
     );
     assert_eq!(
         narrow[2],
-        "■  2 QUESTIONS  │ workers 3 ■ running · 1 queued │ plan: 2 awaiting approval"
+        "■  2 QUESTIONS  │ plan: 2 waiting for your approval"
+    );
+    assert!(
+        wide[2].contains("│ workers 3 ■ running · 1 queued │ plan: 2 waiting for your approval │")
     );
 }
 
@@ -179,13 +183,13 @@ fn right_items_keep_a_three_cell_gap() {
     let status = |w| plain(&render_status(&live_like(), &palette(), w)[0]);
     assert_eq!(
         status(80),
-        "■  2 QUESTIONS  │ workers 2 ■ running │ plan: 8 awaiting approval"
+        "■  2 QUESTIONS  │ workers 2 ■ running │ plan: 8 waiting for your approval"
     );
-    // Two cells wider, it fits with exactly the minimum gap.
-    let wider = status(82);
+    // At 90 (73 cells + the 3-cell gap + 14), it fits with exactly the minimum gap.
+    let wider = status(90);
     assert!(wider.ends_with("approval   unreported #67"), "{wider}");
     assert_eq!(gap_before(&wider, "unreported #67"), Some(MIN_GAP));
-    assert!(gap_before(&status(81), "unreported").is_none());
+    assert!(gap_before(&status(89), "unreported").is_none());
 
     let markers = ["●", "▌", "unreported #", "reported ✓ #", "report failed #"];
     for data in [sample::data(true), sample::data(false), live_like()] {
@@ -381,7 +385,7 @@ fn stale_items_are_dimmed_and_loading_is_shown() {
     let out = plain(&render_status(&ChromeData::new(meta), &palette(), 120)[0]);
     assert_eq!(
         out,
-        "workers 0 │ plan: 2 awaiting approval │ no open tickets"
+        "workers 0 │ plan: 2 waiting for your approval │ no open tickets"
     );
 
     let meta = AmpMeta::default();

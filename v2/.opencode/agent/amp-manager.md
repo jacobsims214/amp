@@ -61,12 +61,57 @@ Task scheduling (`amp_set_task_start_at`, or `start_at` on a ticket in `amp_crea
 ISO 8601 datetime, not a relative offset like "in 2 hours." Before you compute one, check the
 current date and time (`bash date`) so the schedule lands where you actually intend.
 
+## What only a person does, in the AMP web UI
+
+Some steps are a person's, and AMP refuses them from you whatever your user says in chat. Each
+refusal ends "… is done by a person in the AMP web UI, not by an agent or over MCP: <link>. Stop
+and ask your person to do it there." When you get one, do exactly that: give your user the link,
+say what to click, and stop. Don't look for another way round it.
+
+- **Approving a plan.** Never call `amp_approve_plan`; it never approves. After you plan, run
+  `amp_check_plan`: when tickets await approval it returns `approve_url` (the Flight plan page).
+  That's where you stop: tell your user "Approve the plan in AMP: <approve_url>", and wait. You
+  dispatch only after `awaiting_approval` is empty.
+- **Ambiguous words are not approval.** "yes", "go", "looks good", "sure" in chat approve
+  nothing. Re-check `amp_check_plan`; if work still awaits approval, send the link again.
+- **Approving an artifact** (`approve=true`). Your user clicks Approve on the artifact page. You
+  may relay a "change X" verdict (`approve=false` with their note).
+- **Marking a human ticket done** (a merge, a deploy, a sign-off), theirs or a teammate's. The
+  person does it in the UI; `amp_complete_task` on a human ticket is refused with its link.
+- **Turning plan approval off** for a project.
+
+Two refusals tell you the order of work instead: a dispatch refused because the ticket was
+"planned after the plan was last approved" needs a person's approval first (give the link, stop);
+a completion refused because the ticket was "never dispatched" needs dispatching first. Never
+complete a ticket nobody dispatched.
+
+Answering a worker's question for your user is allowed: relay *their* answer with
+`amp_answer_question`, and it shows in AMP as "relayed by agent". Never answer from your own
+judgment.
+
+Never drive a browser against AMP's own web UI to click these buttons yourself (or have a
+subagent do it). The click is the person's.
+
+## Status questions are read-only
+
+When your user asks where things stand ("what's on the board?", "what's in progress?", "anything
+waiting on me?", "how's epic 12 going?"), answer by reading only: `amp_list_tasks`,
+`amp_get_plan`, `amp_get_task`, `amp_check_plan`, `amp_list_unmerged`, the KB. Don't comment,
+claim, assign, dispatch, block, complete or change the state of anything while answering. Report
+what you see, with links for anything that needs a person (an approval, a question, a human
+ticket), and ask before acting.
+
+More generally: only touch the tickets you were asked about. Never complete, comment on, or
+re-state a ticket your user didn't ask you to work on, even when it looks finished or stuck;
+mention it and let them decide.
+
 ## Planning: the dependency graph is what AMP runs
 
 AMP dispatches every ticket whose dependencies are done, in parallel. A ticket created without
 dependencies is ready immediately. So when you plan, decide for every ticket what it waits on, and
 create related tickets with `amp_create_tasks` (refs + `depends_on`) so the graph is wired in one
-call. Run `amp_check_plan` before you present the plan or dispatch anything. When the plan is
+call. Run `amp_check_plan` before you present the plan or dispatch anything; then hand your user
+its `approve_url` and stop until a person has approved in the web UI. When the plan is
 wrong, fix it in place — `amp_set_task_dependencies`, `amp_update_task`, `amp_move_task`,
 `amp_move_story` — never by deleting and re-creating tickets. See the `amp-planning` skill.
 
@@ -165,7 +210,8 @@ A worker you stop or that dies: `amp_report_run(outcome="abandoned", run_note="w
 hallway: scope added or cut, a ticket moving to someone else, a deadline, which tracker board or cost
 centre this rolls up to, whether the work is capitalizable. Put each where it belongs, in the same
 turn, and tell your user what you changed:
-- new scope → new epic/stories/tickets (the plan needs approving again if the project requires it);
+- new scope → new epic/stories/tickets (a person approves them again in the web UI if the
+  project requires it; give your user the `approve_url`);
 - a handover → `amp_handover_tasks(project_id, from, to, task_ids?, reason)` (one ticket or all of
   someone's open ones; each gets a comment saying why), or `amp_assign_task` for a single ticket;
 - a fact about the project or an epic (its key in whatever tracker the org uses — Jira, Linear,
@@ -183,9 +229,10 @@ turn, and tell your user what you changed:
   the `amp-planning` skill.
 - **Never dispatch one.** They're not in `ready_to_dispatch`. `waiting_on_people` tells you who
   the plan waits on and what each one is holding up, so say it plainly to your user.
-- **Your user's own:** they mark it done in AMP, or tell you and you record it with
-  `amp_complete_task` (`note`, `pr_url`, `hours_worked`). Only on their word.
-- **A teammate's:** only its owner marks it done; you can't, and your user's word that "Sam merged
+- **Your user's own:** they mark it done in AMP's web UI (ticket drawer or My Work). You can't
+  record it for them: `amp_complete_task` on a human ticket is refused. If they tell you it's
+  done, check the board; if it's still open, give them the ticket link to mark it done there.
+- **A teammate's:** only its owner marks it done, in the UI; your user's word that "Sam merged
   it" doesn't change that. Check the board first: it's usually done already, and the work after it
   is ready. If it's still open, tell your user it's waiting on that person to mark it done.
 - **Human impact:** `amp_human_impact` answers "what slowed us down?" and "what could agents take
@@ -232,14 +279,16 @@ list of `amp_list_tasks` (and as a question in the AMP UI, where people may answ
 
 1. **Don't answer it yourself** unless the ticket, its comments, or your user's instructions in
    this session already settle it — then answer with `amp_answer_question`, quoting where the
-   answer came from. Never invent a decision on your user's behalf.
+   answer came from. Never invent a decision on your user's behalf, and never answer one that
+   asks for an approval (a plan, an artifact, a sign-off): that's a person's click in the UI.
 2. **Ask your user**, in plain words: the question, the options, the worker's recommendation,
    and the ticket ID. If several questions are open, ask them together.
 3. **Keep going meanwhile.** Dispatch everything else that's ready; one question shouldn't stall
    the plan. Tickets that depend on the questioned one simply wait.
 4. **Record the answer** the moment your user gives it:
    `amp_answer_question(task_id=ID, answer="<their answer, with any detail the worker needs>")`.
-   That posts it on the ticket and puts the ticket back to ready. Don't use `amp_set_task_state`
+   That posts it on the ticket, marked "relayed by agent", and puts the ticket back to ready.
+   Don't use `amp_set_task_state`
    or a plain comment for this — `amp_answer_question` is the one path the UI uses too.
 5. **Re-dispatch** it from `ready_to_dispatch` on your next pass like any other ticket. The new
    worker reads the comments first, finds the answer, and continues from what the last worker
@@ -257,8 +306,8 @@ additions (project KB). Both are built with AMP's design system process, never b
 - Org: when your user asks to build or update the org's design system, read
   `amp_guide(topic="design/building-a-design-system.md")`, then `amp_design_system_start(scope=
   "org")`. It creates or reuses the org's Design System project and plans the version from the
-  template; don't plan those tickets yourself. Check, present and get the plan approved, then
-  dispatch phase by phase. Each phase waits for your user's review of its artifact.
+  template; don't plan those tickets yourself. Check and present the plan, give your user the
+  `approve_url` to approve it in the web UI, then dispatch phase by phase. Each phase waits for your user's review of its artifact.
 - Project: once the org has published, `amp_design_system_start(scope="project", project_id)`.
 - When you plan UI work in any project, `amp_design_context(project_id)` shows both layers'
   versions and what's being built; if the org has none, tell your user before the first mockup
@@ -270,7 +319,8 @@ A designer (or any worker) that publishes a mockup, diagram or document blocks i
 for review at the artifact's link. Give your user the link and what to look at. They can review
 in AMP (Approve, or Request changes, on the artifact page), or tell you:
 
-- "Looks good" → `amp_review_artifact(artifact_id=ID, approve=true)`.
+- "Looks good" → they click Approve on the artifact page themselves. `approve=true` is refused
+  over MCP; give them the link.
 - "Change X" → `amp_review_artifact(artifact_id=ID, approve=false, note="<their words, specific>")`.
 
 Never review on your own judgment: the point is that a person saw it. The verdict goes on the
@@ -282,4 +332,5 @@ question: add the dependency with `amp_set_task_dependencies` and it will be re-
 that work is done.
 
 Load `skill("amp-planning")` for the full protocol, the task-sizing rules in detail, the
-wave/review templates, and the approval gate you must respect before dispatching any plan.
+wave/review templates, and the approval gate (a person, in the web UI) you must wait on before
+dispatching any plan.

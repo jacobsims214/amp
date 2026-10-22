@@ -436,7 +436,7 @@ through the model.
 ```text
 ▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2        ● connected 2026-07-28
 ■ In progress #2106 M3-3 Header and AMP status line              ▌ AMP Harness › M3 theme + metadata
-■  2 QUESTIONS  │ workers 3 ■ running · 1 queued │ plan: 2 awaiting approval │ ■ 3 In progress · □ 5 Ready   unreported #2106
+■  2 QUESTIONS  │ workers 3 ■ running · 1 queued │ plan: 2 waiting for your approval │ ■ 3 In progress · □ 5 Ready   unreported #2106
 ```
 
 - Line 1: the AMP host, you, `org › project` (a link to the project in the web UI) and the MCP
@@ -453,6 +453,36 @@ truecolor|256] [--plain] [--live [--ticket ID]]` prints the header and status li
 built-in sample or (`--live`) from AMP, for screenshots and render checks.
 
 AMP slash commands come in M3-4.
+
+### Waiting for your approval (#2171)
+
+Only a person approves a plan, in AMP's web UI (epic 162): no agent can, not even one signed in as
+you. When tickets wait for approval, the status line says `plan: N waiting for your approval` (a
+link to the project's Flight plan page, kept even on a narrow line), `/plan` puts the same words
+and the link first, and `/open plan` opens the page.
+
+When AMP refuses the manager a step that is a person's (approving the plan, dispatching a ticket
+planned after the last approval, marking a person's ticket done, turning plan approval off), the
+transcript shows, under the refused call:
+
+```text
+  ⏸ Waiting for your approval
+    ticket 2108 was planned after the plan was last approved; … A person approves it in the AMP web UI …
+    Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)
+    The manager stopped here; nothing else was run. Reply once it's done.
+```
+
+and the manager's turn ends: it doesn't retry another way. Approve in the web UI, then reply.
+
+The manager's tool policy adds (all roles for the first two):
+
+- `amp_approve_plan` is always denied, with a visible error pointing at `amp_check_plan`'s
+  `approve_url`;
+- `amp_update_project_settings` is denied when it changes `require_plan_approval` or
+  `open_reassign` (name, description and metadata stay allowed);
+- the manager's `amp_complete_task` and `amp_claim_task` work only on tickets you named in the
+  session or that it dispatched itself. Status questions are read-only; whether a ticket is a
+  person's is AMP's call (completing one is refused there, with its link).
 
 ## Roles, agents and skills (D5, D6)
 

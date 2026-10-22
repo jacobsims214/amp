@@ -81,6 +81,25 @@ use tokio_util::sync::CancellationToken;
 pub const DISPATCH_TOOL: &str = "amp_run_ticket";
 /// The interactive question tool. Children never get it.
 pub const QUESTION_TOOL: &str = "question";
+/// No role approves a plan (#2171, epic 162): a person does, in the AMP web UI (the server refuses
+/// it too). The tool stays in the list so a call shows its denial instead of "no such tool".
+pub const APPROVE_PLAN_TOOL: &str = "amp_approve_plan";
+/// Project settings: no role changes the [`PERSON_ONLY_SETTINGS`] with it. Its name, description
+/// and metadata (the tracker key, cost centre… the manager prompt records) stay allowed.
+pub const PROJECT_SETTINGS_TOOL: &str = "amp_update_project_settings";
+/// The settings a person changes in the web UI (`require_plan_approval`: turning it off is refused
+/// by the server; `open_reassign`: who may take tickets over).
+pub const PERSON_ONLY_SETTINGS: &[&str] = &["require_plan_approval", "open_reassign"];
+
+/// Whether a call is a person's step no role takes ([`APPROVE_PLAN_TOOL`], or
+/// [`PROJECT_SETTINGS_TOOL`] with one of the [`PERSON_ONLY_SETTINGS`]).
+pub fn person_only(tool: &str, args: &Value) -> bool {
+    tool == APPROVE_PLAN_TOOL
+        || (tool == PROJECT_SETTINGS_TOOL
+            && PERSON_ONLY_SETTINGS
+                .iter()
+                .any(|k| args.get(*k).is_some_and(|v| !v.is_null())))
+}
 
 /// What a rule does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -681,6 +700,8 @@ pub enum DenialReason {
     ChildQuestion,
     /// Children never get the dispatch tool.
     ChildDispatch,
+    /// No role approves a plan or changes the person-only project settings ([`person_only`]).
+    PersonOnly,
     /// Command substitution under a restricted bash policy.
     Substitution,
     /// Output written to a file under a restricted bash policy: a redirect
@@ -711,6 +732,15 @@ impl fmt::Display for Denial {
                 f,
                 "{who}: workers cannot dispatch other agents (`{}`). Only the manager does.",
                 self.tool
+            ),
+            DenialReason::PersonOnly => write!(
+                f,
+                "{who}: `{}` {} is a person's step, in the AMP web UI (approving the plan, \
+                 plan approval and reassignment settings); no agent takes it. For approval, run \
+                 amp_check_plan: give your user its approve_url, say \"Approve the plan in \
+                 AMP\", and stop until awaiting_approval is empty. For a setting, tell your user \
+                 what to change in the project's settings.",
+                self.tool, self.subject
             ),
             DenialReason::Substitution => write!(
                 f,
@@ -861,6 +891,19 @@ impl ToolPolicy {
         if self.child && tool == DISPATCH_TOOL {
             let agent = str_arg(args, &["agent_id"]).unwrap_or("*").to_string();
             return Err(deny(agent, DenialReason::ChildDispatch));
+        }
+        if person_only(tool, args) {
+            let subject = if tool == APPROVE_PLAN_TOOL {
+                "(plan approval)".to_owned()
+            } else {
+                let keys: Vec<&str> = PERSON_ONLY_SETTINGS
+                    .iter()
+                    .copied()
+                    .filter(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+                    .collect();
+                format!("({})", keys.join(", "))
+            };
+            return Err(deny(subject, DenialReason::PersonOnly));
         }
         let missing = || deny(String::new(), DenialReason::BadArguments);
         Ok(match tool {

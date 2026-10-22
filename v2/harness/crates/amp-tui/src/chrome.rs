@@ -6,7 +6,7 @@
 //! ▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2      ● connected 2026-07-28
 //! ■ In progress #2106 M3-3 Header and AMP status line                    ▌ AMP Harness › M3
 //! ...transcript, editor...
-//! ■  2 QUESTIONS  │ workers 2 ■ running · 1 queued │ plan: 2 awaiting approval │ ■ 3 In progress · □ 5 Ready   reported ✓ #2106
+//! ■  2 QUESTIONS  │ workers 2 ■ running · 1 queued │ plan: 2 waiting for your approval │ ■ 3 In progress · □ 5 Ready   reported ✓ #2106
 //! ```
 //!
 //! - **Header line 1:** the brand bands, the AMP host, the user, `org › project` (an OSC 8 link
@@ -16,7 +16,8 @@
 //!   the board with the ticket's drawer open), the name, and `▌ Epic › Story` in the epic's cat
 //!   colour.
 //! - **Status line:** the red questions chip, workers (local from the supervisor, remote from the
-//!   board's in-progress tickets), plan approval, the board counts in the web UI's words, the
+//!   board's in-progress tickets), plan approval ("waiting for your approval", a link to the
+//!   Flight plan page), the board counts in the web UI's words, the
 //!   current ticket's artifacts in review, and, right-aligned, whether this session reported its
 //!   run to AMP.
 //!
@@ -742,12 +743,19 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         && let Some(plan) = meta.plan.get()
         && !plan.awaiting_approval.is_empty()
     {
-        let text = format!("plan: {} awaiting approval", plan.awaiting_approval.len());
-        left.push(Seg::new(
-            style.paint(c.warning, &text, stale(&meta.plan)),
-            Lead::Bar,
-            4,
-        ));
+        // #2171: the plan waits on the person at the keyboard; the chip links to the Flight plan
+        // page where they approve it (`/open plan` opens it too). Their next step outranks the
+        // workers count when the line is narrow (only the questions chip stays longer).
+        let text = format!(
+            "plan: {} waiting for your approval",
+            plan.awaiting_approval.len()
+        );
+        let painted = style.paint(c.warning, &text, stale(&meta.plan));
+        let text = match (&meta.instance, meta.project_id) {
+            (Some(inst), Some(pid)) => link(&inst.plan_url(pid), &painted),
+            _ => painted,
+        };
+        left.push(Seg::new(text, Lead::Bar, 2));
     }
 
     // Artifacts of the current ticket in review.
@@ -1047,6 +1055,7 @@ pub mod sample {
                 require_plan_approval: true,
                 awaiting_approval: vec![2108, 2109],
                 plan_approved_at: None,
+                approve_url: Some("https://amp.simstech.cloud/project/2/plan".into()),
             }),
             artifacts: ok(Vec::new()),
         }

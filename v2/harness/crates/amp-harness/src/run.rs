@@ -100,6 +100,19 @@ fn preview(text: &str, max: usize) -> String {
     format!("{cut}...")
 }
 
+/// The text-mode line for a refusal that needs a person in the AMP web UI (#2171).
+fn refusal_line(r: &amp_core::approval::Refusal) -> String {
+    use amp_core::approval::RefusalKind;
+    let what = match r.kind {
+        RefusalKind::PlanApproval => "waiting for your approval: approve the plan in AMP",
+        RefusalKind::PersonInUi => "waiting for you in the AMP web UI",
+    };
+    match &r.link {
+        Some(link) => format!("[{what}] {link} (the manager stopped here)"),
+        None => format!("[{what}] (the manager stopped here)"),
+    }
+}
+
 /// Prints one event in text mode. Returns whether it printed assistant text to stdout.
 fn print_text_event(event: &RunEvent) -> bool {
     match event {
@@ -117,7 +130,13 @@ fn print_text_event(event: &RunEvent) -> bool {
             is_error: true,
             text,
             ..
-        } => eprintln!("[tool error] {name}: {}", preview(text, 400)),
+        } => {
+            eprintln!("[tool error] {name}: {}", preview(text, 400));
+            // #2171: a step only a person takes; the manager's turn ended on it.
+            if let Some(r) = amp_core::approval::refusal(text) {
+                eprintln!("{}", refusal_line(&r));
+            }
+        }
         RunEvent::Retry {
             attempt,
             max_retries,
@@ -298,11 +317,26 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use super::preview;
+    use super::{preview, refusal_line};
 
     #[test]
     fn previews_are_one_line_and_bounded() {
         assert_eq!(preview("a\n  b", 10), "a b");
         assert_eq!(preview("abcdefghijkl", 5), "abcde...");
+    }
+
+    #[test]
+    fn refusals_say_who_acts_and_where() {
+        let r = amp_core::approval::refusal(
+            "tool error: amp_dispatch_task: ticket 143 was planned after the plan was last \
+             approved; ... A person approves it in the AMP web UI (Approve plan): /project/50/plan. \
+             Agents can't approve.",
+        )
+        .unwrap();
+        assert_eq!(
+            refusal_line(&r),
+            "[waiting for your approval: approve the plan in AMP] /project/50/plan (the manager \
+             stopped here)"
+        );
     }
 }
