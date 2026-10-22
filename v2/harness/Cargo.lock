@@ -69,6 +69,8 @@ dependencies = [
  "rpi-ai",
  "rpi-harness",
  "rpi-tools",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -78,7 +80,11 @@ dependencies = [
  "amp-core",
  "amp-mcp",
  "amp-tui",
+ "axum",
  "clap",
+ "rmcp",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

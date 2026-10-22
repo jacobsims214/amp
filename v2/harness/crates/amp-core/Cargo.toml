@@ -13,6 +13,8 @@ rpi-ai.workspace = true
 rpi-agent.workspace = true
 rpi-tools.workspace = true
 rpi-harness.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
