@@ -168,17 +168,19 @@ fn keychain_name() -> &'static str {
 }
 
 /// Whether the OS keychain can be used: the platform store initialises and a lookup of a probe
-/// entry answers (found or not found). Headless Linux without a Secret Service fails here.
+/// entry answers (found or not found). Headless Linux without a Secret Service fails here. The probe
+/// is read at most once per process ([`crate::keychain_get`]).
 pub fn keychain_available(service: &str) -> Result<(), String> {
     if let Err(e) = keyring::Entry::store_status() {
         return Err(e.to_string());
     }
-    let entry = keyring::Entry::new(service, "amp-harness-probe").map_err(|e| e.to_string())?;
-    match entry.get_password() {
-        Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.to_string()),
-    }
+    crate::keychain_get(service, KEYCHAIN_PROBE_ACCOUNT)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
+
+/// The account [`keychain_available`] looks up (never stored).
+const KEYCHAIN_PROBE_ACCOUNT: &str = "amp-harness-probe";
 
 /// One server's login in a [`CredentialBackend`]. Implements rmcp's [`CredentialStore`], so the
 /// OAuth state machine loads, saves (after login and every refresh) and clears through it.
@@ -216,13 +218,10 @@ impl AmpCredentialStore {
 
     fn load_sync(&self) -> Result<Option<StoredCredentials>, McpError> {
         match &self.backend {
-            CredentialBackend::Keychain { service } => {
-                match keychain_entry(service, &self.key)?.get_password() {
-                    Ok(json) => parse_entry(&json).map(Some),
-                    Err(keyring::Error::NoEntry) => Ok(None),
-                    Err(e) => Err(store_error("keychain read", e)),
-                }
-            }
+            CredentialBackend::Keychain { service } => crate::keychain_get(service, &self.key)
+                .map_err(store_error)?
+                .map(|json| parse_entry(&json))
+                .transpose(),
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
                 Ok(read_file(path)?.servers.remove(&self.key))
@@ -235,9 +234,7 @@ impl AmpCredentialStore {
             CredentialBackend::Keychain { service } => {
                 let json = serde_json::to_string(credentials)
                     .map_err(|e| McpError::CredentialStore(format!("encode credentials: {e}")))?;
-                keychain_entry(service, &self.key)?
-                    .set_password(&json)
-                    .map_err(|e| store_error("keychain write", e))
+                crate::keychain_set(service, &self.key, &json).map_err(store_error)
             }
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
@@ -251,11 +248,7 @@ impl AmpCredentialStore {
     fn clear_sync(&self) -> Result<bool, McpError> {
         match &self.backend {
             CredentialBackend::Keychain { service } => {
-                match keychain_entry(service, &self.key)?.delete_credential() {
-                    Ok(()) => Ok(true),
-                    Err(keyring::Error::NoEntry) => Ok(false),
-                    Err(e) => Err(store_error("keychain delete", e)),
-                }
+                crate::keychain_delete(service, &self.key).map_err(store_error)
             }
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
@@ -299,7 +292,14 @@ impl CredentialStore for AmpCredentialStore {
                 .or_default()
                 .clone()
         };
-        Ok(Some(CredentialRefreshGuard::new(lock.lock_owned().await)))
+        let guard = lock.lock_owned().await;
+        // rmcp loads the login again right after this, to refresh it. Read the keychain afresh
+        // for that one load: another process (a second harness) may have rotated the refresh
+        // token since this process cached it. Once per refresh, not per request (#2165).
+        if let CredentialBackend::Keychain { service } = &self.backend {
+            crate::keychain_forget(service, &self.key);
+        }
+        Ok(Some(CredentialRefreshGuard::new(guard)))
     }
 }
 
@@ -310,12 +310,8 @@ fn auth_store_error(e: McpError) -> AuthError {
     AuthError::CredentialStoreError(e.to_string())
 }
 
-fn store_error(operation: &str, e: keyring::Error) -> McpError {
-    McpError::CredentialStore(format!("{operation}: {e}"))
-}
-
-fn keychain_entry(service: &str, key: &str) -> Result<keyring::Entry, McpError> {
-    keyring::Entry::new(service, key).map_err(|e| store_error("keychain", e))
+fn store_error(e: crate::KeychainError) -> McpError {
+    McpError::CredentialStore(e.message)
 }
 
 fn parse_entry(json: &str) -> Result<StoredCredentials, McpError> {

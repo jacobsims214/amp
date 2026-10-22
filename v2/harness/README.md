@@ -21,8 +21,8 @@ alias amp-harness="$PWD/v2/harness/target/debug/amp-harness"
 # 1. A provider key, from the environment or the keychain (never a config file).
 export OPENROUTER_API_KEY=...       # the shipped roles run on OpenRouter models
 # or: export ANTHROPIC_API_KEY=... and AMP_HARNESS_PROFILE=anthropic (Anthropic-only profile)
-# or keep it in the macOS keychain (prompts for the key):
-#   security add-generic-password -s amp-harness -a provider:openrouter -w
+# or keep it in the OS keychain: `amp-harness init` asks for it (hidden) and stores it.
+# Never create the item with `security add-generic-password`: see "Keychain on macOS" below.
 
 # 2. Every role resolves to a provider/model that has a key, and the model ids exist.
 amp-harness config show --check
@@ -128,6 +128,37 @@ Tests (`crates/amp-mcp/tests/oauth.rs`) run a mock authorization server (protect
 metadata, DCR, PKCE S256 check, rotating refresh tokens, `invalid_grant`) with a scripted browser.
 The keychain test uses a per-run service `amp-harness-test-<pid>`, deletes its entry, and skips
 where no keychain answers (Linux CI) or when `AMP_TEST_SKIP_KEYCHAIN` is set.
+
+## Keychain on macOS (#2165)
+
+Every keychain call goes through `amp_mcp::keychain_{get,set,delete}`:
+
+- **One read per item per process.** The first lookup of a (service, account) asks the keychain;
+  the answer is cached for the life of the process: the secret, "not there", or the error. Our own
+  writes and deletes update the cache. A whole `run -p` reads each item once (the OAuth login for
+  the server URL, `provider:anthropic`, `provider:openrouter`). The one deliberate re-read: just
+  before an OAuth refresh, so a refresh token another harness process rotated is picked up.
+- **The harness creates its own items.** On macOS a write deletes any existing item (falling back
+  to `/usr/bin/security delete-generic-password`, which can delete items made by other programs
+  without a dialog) and adds a new one, so this binary is the item's creator and is trusted to read
+  it. An item made by Apple's `security` tool has partition `apple-tool:`; every read by
+  amp-harness then raises a dialog and "Always Allow" does not stick. Updating it in place would
+  keep that ACL. Store keys with `amp-harness init` instead.
+- **No dialog nobody can answer.** When stdin is not a terminal (agents, scripts, CI) keychain
+  dialogs are turned off for each call, so an item that would need approval fails at once with one
+  message naming the item and what to run, instead of blocking. `AMP_HARNESS_KEYCHAIN_PROMPTS=never`
+  forces that; `allow` always lets the dialog show.
+- **After a rebuild or an update** an unsigned (ad-hoc signed) binary has a new code hash, so the
+  first read of each item by the new build asks once; "Always Allow" then holds for that build.
+  Stable code signing (M5) removes that prompt.
+- `AMP_HARNESS_KEYCHAIN_TRACE=<file>` appends one line per real keychain call (operation, service,
+  account, outcome, pid; never a secret).
+
+`crates/amp-harness/tests/keychain.rs` (opt-in: `AMP_TEST_KEYCHAIN=1`, macOS) stores a key with
+`init` and reads it in new processes with dialogs off, counting calls per process, and checks that
+an item made by `security` fails fast with one message and is then replaced by `init`. The smoke
+test's `keychain` leg (`AMP_SMOKE_LEGS=keychain`, macOS, needs the compose server) does the same
+with the built or installed binary (`AMP_HARNESS_BIN`). Both use throwaway services, never yours.
 
 ## Commands (M1-4)
 
@@ -472,6 +503,7 @@ also happens when a check fails. The harness runs with HOME under `target/` and
 |---|---|---|
 | `AMP_MCP_URL` | `http://localhost:8000/mcp` | compose leg (`cd v2 && make up`; auth off, expects `local-dev@amp.local`) |
 | `AMP_SMOKE_PROTOCOLS` | `auto 2025-11-25` | one run per mode. `auto` must land on the stateless 2026-07-28 era |
+| `AMP_SMOKE_LEGS` | `compose cluster` | add `keychain` (macOS) for the keychain-only leg: no key in the environment, real login keychain under a throwaway service, dialogs off, each item read at most once per process |
 | `AMP_TOKEN` + `AMP_CA_FILE` | unset, so the cluster leg is skipped | cluster leg: an `amp_` token from the UI and `amp-local-ca.crt`. The token is only sent to this leg |
 | `AMP_SMOKE_CLUSTER_URL` | `https://amp.local/mcp` | envoy on 443, not `:8443` (RFC 9728 resource match) |
 | `AMP_SMOKE_LEGS` | `compose cluster` | |

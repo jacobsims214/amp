@@ -61,6 +61,9 @@ yaml_serde = "=0.10.2"
 # OAuth credential store (D3): OS keychain via keyring 4.x (macOS Keychain, Windows Credential Manager,
 # Secret Service on Linux), with a 0600 file fallback. rmcp's CredentialStore trait is #[async_trait].
 keyring = "4.2"
+# macOS only: turn keychain dialogs off when nobody can answer them, and read Security status codes
+# (#2165). The same version keyring's apple-native store already uses, so there is one copy.
+security-framework = "3.7"
 async-trait = "0.1"
 # For the TokenResponse trait on rmcp's token type (rmcp does not re-export oauth2). Same version rmcp uses.
 oauth2 = { version = "5.0", default-features = false }

@@ -26,7 +26,6 @@ thiserror.workspace = true
 include_dir.workspace = true
 yaml_serde.workspace = true
 async-trait.workspace = true
-keyring.workspace = true
 # process: `git worktree` for workers (supervisor). macros: the metadata poller's select!.
 tokio = { workspace = true, features = ["rt", "time", "process", "macros"] }
 tokio-util.workspace = true

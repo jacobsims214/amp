@@ -179,10 +179,16 @@ pub async fn check(
             };
             Finding::new(
                 status,
-                format!(
-                    "no API key, so these roles cannot run: {}",
-                    roles.join(", ")
-                ),
+                match &source {
+                    KeySource::KeychainFailed(_) => format!(
+                        "the keychain did not give the API key, so these roles cannot run: {}",
+                        roles.join(", ")
+                    ),
+                    _ => format!(
+                        "no API key, so these roles cannot run: {}",
+                        roles.join(", ")
+                    ),
+                },
             )
             .fix(key_fix(&id, &source, &where_))
         };
@@ -279,6 +285,8 @@ fn models_finding(
 
 fn key_fix(provider: &str, source: &KeySource, where_: &str) -> String {
     match source {
+        // The message already says what to do (#2165).
+        KeySource::KeychainFailed(why) => why.clone(),
         KeySource::Missing {
             env: Some(var),
             keychain_checked: true,
