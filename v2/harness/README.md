@@ -216,6 +216,41 @@ flags ids that are missing. It exits 1 if a role does not resolve or a checked i
 `config show --config PATH` reads that file. The chat and `run` always read `[models]`, `[roles]`,
 `[providers]` and `[workers]` from the default config.toml; their `--config` only changes `[server]`.
 
+### Secrets never reach an agent's bash (#2142)
+
+Every session's `bash` (manager and workers) gets the harness's environment minus its own secrets:
+`AMP_TOKEN`, the variable named by `--token-env`, and every provider's `key_env` in the loaded
+models config (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, ...). A worker that runs `env` while
+debugging would otherwise put them in its transcript, the provider request and possibly an AMP
+comment or commit. Everything else is passed through unchanged. To hand a named secret to bash on
+purpose (off by default), list it in config.toml:
+
+```toml
+[secrets]
+pass_to_bash = ["OPENROUTER_API_KEY"]
+```
+
+### Bash never waits on a person (#2143)
+
+Every `bash` call has a default timeout of 600 s, used when the model passes no `timeout` (a
+model-supplied one still wins). Set it in config.toml, or override it with
+`AMP_HARNESS_BASH_TIMEOUT_SECS`; `0` turns the default off:
+
+```toml
+[tools]
+bash_timeout_secs = 600
+```
+
+Bash children also get a non-interactive environment: `GIT_EDITOR`/`EDITOR`/`VISUAL`/
+`GIT_SEQUENCE_EDITOR=true` (so `git commit` without `-m` aborts on the empty message),
+`GIT_TERMINAL_PROMPT=0`, `GCM_INTERACTIVE=never`, `SSH_ASKPASS_REQUIRE=never`,
+`DEBIAN_FRONTEND=noninteractive`, `npm_config_yes=true`, and, only when unset,
+`GIT_SSH_COMMAND="ssh -o BatchMode=yes"` and `CI=1`. `GIT_ASKPASS` and `SSH_ASKPASS` are removed.
+rpi closes stdin and starts each command in its own process group, but it has no `pre_exec` hook
+for `setsid`. Under a terminal, a program that reads `/dev/tty` is therefore stopped (SIGTTIN)
+until the timeout kills it. With no controlling terminal (CI, supervised workers), the open fails
+at once.
+
 ## Headless runs (M2-4)
 
 ```sh

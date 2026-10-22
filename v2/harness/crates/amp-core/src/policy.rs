@@ -29,7 +29,7 @@
 //!
 //! | tool | permission | subject |
 //! |---|---|---|
-//! | `bash`, `powershell` | `bash` | each command of the script, split on `&&` `\|\|` `;` `\|` `&` and newlines |
+//! | `bash`, `powershell` | `bash` | each command of the script, split on `&&` `\|\|` `;` `\|` `&` and newlines, comments dropped |
 //! | `edit`, `write` | `edit` | the path relative to the worktree root (paths outside it also need `external_directory`) |
 //! | [`DISPATCH_TOOL`] | `task` | the agent id without AMP's `amp:` prefix |
 //! | `webfetch` | `webfetch` | the URL |
@@ -41,13 +41,32 @@
 //! Under a restricted bash policy (any bash rule that isn't `allow`), command substitution
 //! (`$(…)`, backticks, `<(…)`, `>(…)`) and output redirection to a file are denied outright. An
 //! allowlist like `"git status*": allow` would otherwise pass `git status $(rm -rf x)` or
-//! `ls > file`. Redirecting to `/dev/null` and duplicating a descriptor (`2>&1`) are fine.
+//! `ls > file`. Redirecting to `/dev/null` and duplicating a descriptor (`2>&1`) are fine. An
+//! option that writes output to a file counts as a redirect: `--output[=…]` (and its
+//! abbreviations and `--output-…` variants) for any command, and `-o…` after `git`
+//! ([`writes_via_option`]), since `"git log*": allow` would otherwise pass
+//! `git log -1 --format=… --output=~/.zshrc`.
+//!
+//! A script the lexer can't split with certainty is denied too ([`ShellScan::unparseable`]: an
+//! unbalanced quote, `$'…'`, a newline left inside a command, or `${X:-…}` / brace expansion, which
+//! could turn into an option the harness can't see). A quote read differently from
+//! bash would hide whole commands inside one that matches an allow rule, so the harness fails
+//! closed.
+//!
+//! Paths are resolved the way rpi-tools resolves them before it touches the disk
+//! ([`resolve_tool_path`], [`resolve_read_tool_path`]): a leading `@` is stripped, unicode spaces
+//! become ASCII spaces, `~` and `~/` expand to the home directory, `file://` URLs become paths,
+//! and `.`/`..` collapse. Then symlinks are followed ([`resolve_symlinks`]) and the result is
+//! compared with the worktree root with its own symlinks resolved. So `~/.ssh/x`, `@../x` and a
+//! link inside the worktree that points outside it all count as outside, and the globs see the
+//! path of the file that would really be written.
 //!
 //! rpi-tools has no `webfetch`, `websearch`, `todowrite` or `question` tool, so those rules only
 //! matter if a later ticket adds such a tool.
 
 use std::{
-    fmt,
+    ffi::OsString,
+    fmt, fs,
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -279,20 +298,53 @@ fn glob(input: &[char], pattern: &[char]) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ShellScan {
     /// Each simple command, trimmed, in order (pipes, lists and background jobs split apart).
+    /// Comments are dropped.
     pub commands: Vec<String>,
     /// `$(…)`, a backtick, `<(…)` or `>(…)` outside single quotes.
     pub substitution: bool,
-    /// Output redirected to a file (not `/dev/null`, not a descriptor duplication).
+    /// Output redirected to a file (not `/dev/null`, not a descriptor duplication), or a file
+    /// opened read-write with `<>` (which creates it).
     pub writes_file: bool,
+    /// The lexer can't be sure it split the script the way bash will: a quote is still open at
+    /// the end, the script uses ANSI-C quoting (`$'…'`), or a command still contains a newline
+    /// after splitting (a quoted newline, or a here-document body), or a word uses `${…}` with an
+    /// operator or brace expansion (`{a,b}`, `{a..b}`), which can expand to an option such as
+    /// `--output` that the harness never sees ([`shell_words`]). A restricted policy denies
+    /// these rather than guess, because a quote the lexer reads differently from bash can hide
+    /// whole commands inside what looks like one allowed command.
+    pub unparseable: bool,
+    /// A command passes an option that writes its output to a file: `--output[=…]` (git's diff
+    /// option, and any abbreviation or `--output-…` variant of it, for any command), or `-o…`
+    /// after a `git` word (`git format-patch -o <dir>`). See [`writes_via_option`].
+    pub output_option: bool,
 }
 
-/// Split a script on `&&`, `||`, `;`, `|`, `&` and newlines outside quotes. This is a lexer, not a
-/// shell parser: it errs towards more, smaller commands and flags anything it can't see through.
+/// Split a script on `&&`, `||`, `;`, `|`, `&` and newlines outside quotes, dropping comments. This
+/// is a lexer, not a shell parser: it errs towards more, smaller commands and flags anything it
+/// can't see through (see [`ShellScan::unparseable`]).
+///
+/// What it follows, as bash does:
+/// - `'…'` is literal; `"…"` is literal except that `\` escapes the next character;
+/// - `$'…'` (ANSI-C quoting) is literal except that `\` escapes the next character, `\'`
+///   included;
+/// - outside single quotes a `\` escapes the next character, and `\` + newline is a line
+///   continuation (both are removed);
+/// - an unquoted `#` at the start of a word (start of input, or after a blank or one of
+///   `; & | ( ) < >` or a newline) starts a comment that runs to the end of the line.
 pub fn scan_shell(script: &str) -> ShellScan {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Quote {
+        None,
+        Single,
+        Double,
+        AnsiC,
+    }
     let chars: Vec<char> = script.chars().collect();
     let mut scan = ShellScan::default();
     let mut current = String::new();
-    let (mut single, mut double) = (false, false);
+    let mut quote = Quote::None;
+    // True when the next unquoted character begins a new word (so `#` would start a comment).
+    let mut word_start = true;
     let mut i = 0;
     let flush = |current: &mut String, scan: &mut ShellScan| {
         let cmd = current.trim();
@@ -304,32 +356,83 @@ pub fn scan_shell(script: &str) -> ShellScan {
     while i < chars.len() {
         let c = chars[i];
         let next = chars.get(i + 1).copied();
-        if single {
-            if c == '\'' {
-                single = false;
+        match quote {
+            Quote::Single => {
+                if c == '\'' {
+                    quote = Quote::None;
+                }
+                current.push(c);
+                i += 1;
+                continue;
             }
-            current.push(c);
-            i += 1;
-            continue;
+            Quote::AnsiC => {
+                match c {
+                    '\\' => {
+                        current.push(c);
+                        if let Some(n) = next {
+                            current.push(n);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    '\'' => quote = Quote::None,
+                    _ => {}
+                }
+                current.push(c);
+                i += 1;
+                continue;
+            }
+            Quote::Double | Quote::None => {}
         }
-        match c {
-            '\\' => {
+        if c == '\\' {
+            // A line continuation disappears; any other escaped character is kept as is.
+            if next != Some('\n') {
                 current.push(c);
                 if let Some(n) = next {
                     current.push(n);
                 }
+                word_start = false;
+            }
+            i += 2;
+            continue;
+        }
+        if quote == Quote::None && c == '#' && word_start {
+            // A comment: skip to the newline, which still splits.
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        match c {
+            '\'' if quote == Quote::None => quote = Quote::Single,
+            '$' if quote == Quote::None && next == Some('\'') => {
+                quote = Quote::AnsiC;
+                scan.unparseable = true;
+                current.push_str("$'");
+                word_start = false;
                 i += 2;
                 continue;
             }
-            '\'' if !double => single = true,
-            '"' => double = !double,
+            '"' => {
+                quote = if quote == Quote::Double {
+                    Quote::None
+                } else {
+                    Quote::Double
+                }
+            }
             '`' => scan.substitution = true,
             '$' if next == Some('(') => scan.substitution = true,
-            '<' | '>' if next == Some('(') && !double => scan.substitution = true,
-            '>' if !double && redirect_writes_file(&chars, i) => scan.writes_file = true,
+            '<' | '>' if next == Some('(') && quote == Quote::None => scan.substitution = true,
+            '<' if quote == Quote::None && next == Some('>') => scan.writes_file = true,
+            '>' if quote == Quote::None
+                && chars.get(i.wrapping_sub(1)) != Some(&'<')
+                && redirect_writes_file(&chars, i) =>
+            {
+                scan.writes_file = true
+            }
             _ => {}
         }
-        if !double {
+        if quote == Quote::None {
             let prev = if i > 0 { Some(chars[i - 1]) } else { None };
             let split = match c {
                 ';' | '\n' => Some(1),
@@ -341,15 +444,191 @@ pub fn scan_shell(script: &str) -> ShellScan {
             };
             if let Some(len) = split {
                 flush(&mut current, &mut scan);
+                word_start = true;
                 i += len;
                 continue;
             }
+            word_start = c.is_whitespace() || matches!(c, '&' | '|' | '(' | ')' | '<' | '>');
+        } else {
+            word_start = false;
         }
         current.push(c);
         i += 1;
     }
+    if quote != Quote::None {
+        scan.unparseable = true;
+    }
     flush(&mut current, &mut scan);
+    if scan.commands.iter().any(|c| c.contains('\n')) {
+        scan.unparseable = true;
+    }
+    for cmd in &scan.commands {
+        let (words, uncertain) = shell_words(cmd);
+        scan.unparseable |= uncertain;
+        scan.output_option |= writes_via_option(&words);
+    }
     scan
+}
+
+/// Split one command into words the way bash would before expansion, with quotes and escapes
+/// removed. The flag is true when bash would expand a word into text the lexer can't see:
+/// - `${…}` with an operator (`${X:---output=f}`), quoted or not;
+/// - an unquoted parameter (`$X`, `${X}`, `$@`, …): bash splits its value on `$IFS` and globs it,
+///   so `$IFS--output=f` becomes the word `--output=f` (#2145). Inside double quotes a plain
+///   `"$X"` / `"${X}"` is one word and stays allowed;
+/// - brace expansion (`{--output=f,}`, `{a..b}`);
+/// - after a `git` word, a word with an unquoted glob character (`*`, `?`, `[`): it can expand
+///   to a file named like an option, such as `--output=.git/hooks/pre-commit` (#2145). Quote
+///   git pathspecs (`-- '*.rs'`); git expands them itself.
+///
+/// `$(…)` and backticks are [`ShellScan::substitution`]; `$'…'` is already unparseable, and is
+/// treated here like `'…'`.
+fn shell_words(cmd: &str) -> (Vec<String>, bool) {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut uncertain = false;
+    // Unquoted `{` not yet closed, for spotting brace expansion.
+    let mut braces = 0usize;
+    // A git word has been seen, and the current word has an unquoted glob character.
+    let mut after_git = false;
+    let mut glob_word = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '\\' => {
+                if let Some(n) = next {
+                    word.push(n);
+                }
+                in_word = true;
+                i += 2;
+                continue;
+            }
+            '\'' => {
+                // `'…'`, or the body of `$'…'` (where `\` escapes the next character).
+                let ansi = word.ends_with('$') && i > 0 && chars[i - 1] == '$';
+                if ansi {
+                    word.pop();
+                }
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    if ansi && chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    }
+                    word.push(chars[i]);
+                    i += 1;
+                }
+                in_word = true;
+                i += 1;
+                continue;
+            }
+            '"' => {
+                i += 1;
+                while i < chars.len() && chars[i] != '"' {
+                    if chars[i] == '\\' && i + 1 < chars.len() {
+                        i += 1;
+                    } else if chars[i] == '$' && chars.get(i + 1) == Some(&'{') {
+                        uncertain |= plain_param_end(&chars, i).is_none();
+                    }
+                    word.push(chars[i]);
+                    i += 1;
+                }
+                in_word = true;
+                i += 1;
+                continue;
+            }
+            // Unquoted, the value is split on `$IFS` and globbed.
+            '$' if next.is_some_and(|n| {
+                n == '{' || n == '_' || n.is_ascii_alphanumeric() || "@*#?$!-".contains(n)
+            }) =>
+            {
+                uncertain = true
+            }
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            ',' if braces > 0 => uncertain = true,
+            '.' if braces > 0 && next == Some('.') => uncertain = true,
+            _ => {}
+        }
+        if c.is_whitespace() {
+            if in_word {
+                after_git |= is_git(&word);
+                uncertain |= after_git && glob_word;
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+            braces = 0;
+            glob_word = false;
+        } else {
+            if matches!(c, '*' | '?' | '[') {
+                glob_word = true;
+            }
+            word.push(c);
+            in_word = true;
+        }
+        i += 1;
+    }
+    if in_word {
+        after_git |= is_git(&word);
+        uncertain |= after_git && glob_word;
+        words.push(word);
+    }
+    (words, uncertain)
+}
+
+/// `git` or a path to it (`/usr/bin/git`).
+fn is_git(word: &str) -> bool {
+    word == "git" || word.ends_with("/git")
+}
+
+/// `chars[at..]` starts with `${`. The index of the closing `}` when the expansion is a plain
+/// `${NAME}` (or `${1}`), which expands to a variable's value and nothing else; `None` for any
+/// operator (`${X:-…}`, `${X/a/b}`, `${!X}`, …), whose result the lexer can't know.
+fn plain_param_end(chars: &[char], at: usize) -> Option<usize> {
+    let start = at + 2;
+    let len = chars[start.min(chars.len())..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+        .count();
+    let end = start + len;
+    (len > 0 && chars.get(end) == Some(&'}')).then_some(end)
+}
+
+/// True when a command's words (from [`shell_words`]) include an option that makes the command
+/// write its output to a file, which a restricted bash policy denies like a `>` redirect:
+/// - for any command, `--output` / `--output=…` (git log/diff/show/format-patch), an
+///   abbreviation of it (`--outp=…`, which some git versions accept), or a longer option that
+///   starts with it (`--output-directory`; this also catches the harmless
+///   `--output-indicator-*`);
+/// - after a `git` word, `-o` / `-o<dir>` (`git format-patch -o <dir>`). Elsewhere `-o` means
+///   other things (`ls -o`), so it is left to the allow rules.
+///
+/// git's revision parser (log, show, diff) does not bundle short options, so `-po` is not
+/// checked. `--ext-diff` / `--textconv` only run a diff driver set in git config, which a
+/// restricted role cannot change, so they are not denied.
+pub fn writes_via_option(words: &[String]) -> bool {
+    let mut after_git = false;
+    for w in words {
+        if w == "--" {
+            // The end of options: what follows is paths (`git log -- --output` is a file).
+            break;
+        }
+        if let Some(long) = w.strip_prefix("--") {
+            let name = long.split('=').next().unwrap_or_default();
+            if !name.is_empty() && ("output".starts_with(name) || name.starts_with("output")) {
+                return true;
+            }
+        } else if after_git && w.starts_with("-o") {
+            return true;
+        }
+        if w == "git" || w.ends_with("/git") {
+            after_git = true;
+        }
+    }
+    false
 }
 
 /// `chars[at]` is `>`. True unless the target is a descriptor (`>&2`, `2>&1`, `>&-`) or
@@ -404,8 +683,13 @@ pub enum DenialReason {
     ChildDispatch,
     /// Command substitution under a restricted bash policy.
     Substitution,
-    /// Output redirection to a file under a restricted bash policy.
+    /// Output written to a file under a restricted bash policy: a redirect
+    /// ([`ShellScan::writes_file`]) or an option such as `--output`
+    /// ([`ShellScan::output_option`]).
     Redirect,
+    /// A script the lexer can't split with certainty, under a restricted bash policy
+    /// ([`ShellScan::unparseable`]).
+    Unparseable,
     /// The call is missing the argument the policy checks (e.g. no `command`).
     BadArguments,
 }
@@ -436,8 +720,18 @@ impl fmt::Display for Denial {
             ),
             DenialReason::Redirect => write!(
                 f,
-                "{who}: redirecting output to a file is not allowed under this role's bash \
-                 rules: `{}`. {tail}",
+                "{who}: writing output to a file (a `>` redirect, or an option such as \
+                 `--output` or `git ... -o`) is not allowed under this role's bash rules: \
+                 `{}`. {tail}",
+                self.subject
+            ),
+            DenialReason::Unparseable => write!(
+                f,
+                "{who}: the harness can't split this script into commands with certainty, so \
+                 it is not allowed under this role's bash rules: `{}`. It denies unbalanced \
+                 quotes, ANSI-C quoting ($'...'), newlines inside quotes or \
+                 here-documents, and ${{X:-...}} or {{a,b}} expansion. Write each command \
+                 plainly, one per line or joined with && or ;. {tail}",
                 self.subject
             ),
             DenialReason::BadArguments => write!(
@@ -574,10 +868,14 @@ impl ToolPolicy {
                 let script = str_arg(args, &["command"]).ok_or_else(missing)?;
                 let scan = scan_shell(script);
                 if !self.policy.allows_everything("bash") {
+                    // First: when the split itself is in doubt, the other flags are too.
+                    if scan.unparseable {
+                        return Err(deny(script.to_string(), DenialReason::Unparseable));
+                    }
                     if scan.substitution {
                         return Err(deny(script.to_string(), DenialReason::Substitution));
                     }
-                    if scan.writes_file {
+                    if scan.writes_file || scan.output_option {
                         return Err(deny(script.to_string(), DenialReason::Redirect));
                     }
                 }
@@ -592,7 +890,7 @@ impl ToolPolicy {
             }
             "edit" | "write" => {
                 let raw = str_arg(args, &["path", "file_path", "filePath"]).ok_or_else(missing)?;
-                let (inside, rel) = self.relative_path(raw);
+                let (inside, rel) = self.classify(&resolve_tool_path(&self.root, raw));
                 let mut checks = Vec::new();
                 if !inside {
                     checks.push(Check::new("external_directory", rel.clone()));
@@ -615,7 +913,7 @@ impl ToolPolicy {
             )],
             "read" | "grep" | "find" | "ls" => {
                 let subject = str_arg(args, &["path", "file_path"])
-                    .map(|p| self.relative_path(p).1)
+                    .map(|p| self.classify(&resolve_read_tool_path(&self.root, p)).1)
                     .unwrap_or_else(|| "*".into());
                 vec![Check::new(permission, subject)]
             }
@@ -679,18 +977,17 @@ impl ToolPolicy {
         )
     }
 
-    /// `(inside root, path relative to root or absolute if outside)`.
-    fn relative_path(&self, raw: &str) -> (bool, String) {
-        let path = Path::new(raw);
-        let abs = if path.is_absolute() {
-            lexical_normalize(path)
-        } else {
-            lexical_normalize(&self.root.join(path))
-        };
-        match abs.strip_prefix(&self.root) {
+    /// `(inside root, path relative to root or absolute if outside)` for a path the tool has
+    /// already resolved ([`resolve_tool_path`]). Symlinks are followed on both sides, so a link
+    /// that leaves the root is outside and the subject names the file that would be touched.
+    fn classify(&self, abs: &Path) -> (bool, String) {
+        let real = resolve_symlinks(abs);
+        // Resolved per call: the worktree may be created after the policy.
+        let root = resolve_symlinks(&self.root);
+        match real.strip_prefix(&root) {
             Ok(rel) if rel.as_os_str().is_empty() => (true, ".".into()),
             Ok(rel) => (true, rel.to_string_lossy().replace('\\', "/")),
-            Err(_) => (false, abs.to_string_lossy().replace('\\', "/")),
+            Err(_) => (false, real.to_string_lossy().replace('\\', "/")),
         }
     }
 }
@@ -734,6 +1031,172 @@ fn lexical_normalize(path: &Path) -> PathBuf {
             }
             other => out.push(other.as_os_str()),
         }
+    }
+    out
+}
+
+/// Where rpi-tools 0.8.0's `write` and `edit` tools put `raw` when their cwd is `cwd`, before any
+/// symlink is followed: `rpi_tools::resolve_tool_path` on an `OsExecutionEnv`. That is
+/// `normalize_tool_path` (unicode spaces to ASCII, one leading `@` stripped), then
+/// `OsExecutionEnv::resolve_path`: `~` and `~/` expand to `dirs::home_dir()` (empty if unknown,
+/// and no `~user`), a `file://` URL becomes its path, a relative path is joined to `cwd`, and `.`
+/// and `..` collapse (`..` at `/` stays at `/`). Kept in step with rpi by
+/// `tests/roles_policy.rs::policy_resolves_paths_exactly_like_rpi_tools`.
+pub fn resolve_tool_path(cwd: &Path, raw: &str) -> PathBuf {
+    let mut p = rpi_tools::normalize_tool_path(raw);
+    if p == "~" {
+        p = home_dir_string();
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        p = format!("{}/{}", home_dir_string(), rest);
+    } else if cfg!(windows)
+        && let Some(rest) = p.strip_prefix("~\\")
+    {
+        p = format!("{}\\{}", home_dir_string(), rest);
+    }
+    if p.starts_with("file://")
+        && let Some(local) = file_url_to_path(&p)
+    {
+        p = local;
+    }
+    let pb = PathBuf::from(&p);
+    if pb.is_absolute() {
+        rpi_normalize(&pb)
+    } else {
+        rpi_normalize(&cwd.join(pb))
+    }
+}
+
+/// Where rpi-tools 0.8.0's `read`, `grep`, `find` and `ls` tools look for `raw`
+/// (`rpi_tools::resolve_read_tool_path`): [`resolve_tool_path`], then the first of its typographic
+/// variants that exists (`lstat`): itself, a narrow no-break space before `AM.`/`PM.`, NFD, `'` as
+/// `’`, and NFD with `’`. None exists: the resolved path.
+pub fn resolve_read_tool_path(cwd: &Path, raw: &str) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization;
+    let resolved = resolve_tool_path(cwd, raw).to_string_lossy().into_owned();
+    let nfd: String = resolved.nfd().collect();
+    let variants = [
+        resolved.clone(),
+        replace_am_pm_space(&resolved),
+        nfd.clone(),
+        resolved.replace('\'', "\u{2019}"),
+        nfd.replace('\'', "\u{2019}"),
+    ];
+    variants
+        .iter()
+        .find(|v| fs::symlink_metadata(v).is_ok())
+        .map_or_else(|| PathBuf::from(&resolved), PathBuf::from)
+}
+
+/// The path the OS would really open for the absolute, normalized `path`: the longest ancestor
+/// that exists is canonicalized (every symlink in it followed), and the missing rest is put back.
+/// A dangling symlink just past that ancestor is followed too, because writing through it creates
+/// its target. `..` in a dangling link's target is collapsed lexically.
+pub fn resolve_symlinks(path: &Path) -> PathBuf {
+    // The kernel's own limit on links followed in one lookup (Linux and macOS: 40 and 32).
+    const MAX_LINKS: usize = 40;
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        let mut base = path.clone();
+        let mut tail: Vec<OsString> = Vec::new();
+        let mut real = loop {
+            if let Ok(real) = fs::canonicalize(&base) {
+                break real;
+            }
+            match (base.file_name().map(|n| n.to_os_string()), base.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name);
+                    base = parent.to_path_buf();
+                }
+                _ => return path,
+            }
+        };
+        let Some(first) = tail.pop() else {
+            return real;
+        };
+        let next = real.join(&first);
+        if let Ok(target) = fs::read_link(&next) {
+            let mut followed = real.join(target);
+            followed.extend(tail.iter().rev());
+            path = lexical_normalize(&followed);
+            continue;
+        }
+        real.push(first);
+        real.extend(tail.iter().rev());
+        return real;
+    }
+    // A link loop: the tool fails with ELOOP, so any subject will do.
+    path
+}
+
+fn home_dir_string() -> String {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// rpi-tools' `normalize_absolute`: drops `.`, and `..` pops (a no-op at the root).
+fn rpi_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// rpi-tools' `file_url_to_path`: `file:///abs` → `/abs`, `file:///C:/x` → `C:/x`,
+/// `file://rest` → `rest`. No percent-decoding.
+fn file_url_to_path(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    if let Some(drive_rest) = rest.strip_prefix('/') {
+        if drive_rest.len() >= 2 && drive_rest.as_bytes()[1] == b':' {
+            return Some(drive_rest.to_string());
+        }
+        return Some(format!("/{drive_rest}"));
+    }
+    Some(rest.to_string())
+}
+
+/// rpi-tools' `replace_am_pm_space`: ` AM.`/` PM.` (ASCII, any case) get a narrow no-break space.
+fn replace_am_pm_space(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 < bytes.len() && bytes[i] == b' ' {
+            let a = bytes[i + 1].to_ascii_lowercase();
+            let m = bytes[i + 2].to_ascii_lowercase();
+            if (a == b'a' || a == b'p') && m == b'm' && bytes[i + 3] == b'.' {
+                out.push('\u{202F}');
+                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 2] as char);
+                out.push('.');
+                i += 4;
+                continue;
+            }
+        }
+        let first = bytes[i];
+        let len = if first < 0x80 {
+            1
+        } else if first >> 5 == 0b110 {
+            2
+        } else if first >> 4 == 0b1110 {
+            3
+        } else if first >> 3 == 0b11110 {
+            4
+        } else {
+            1
+        };
+        let end = (i + len).min(bytes.len());
+        if let Ok(slice) = std::str::from_utf8(&bytes[i..end]) {
+            out.push_str(slice);
+        }
+        i = end;
     }
     out
 }
@@ -848,6 +1311,217 @@ mod tests {
         assert!(!scan_shell("echo 'a > b'").writes_file);
     }
 
+    fn words(cmd: &str) -> Vec<String> {
+        shell_words(cmd).0
+    }
+
+    #[test]
+    fn shell_words_unquote_like_bash() {
+        assert_eq!(
+            words("git log  -1 --oneline"),
+            ["git", "log", "-1", "--oneline"]
+        );
+        assert_eq!(words("git log '--out'put=x"), ["git", "log", "--output=x"]);
+        assert_eq!(
+            words("git log \"--output\"=x"),
+            ["git", "log", "--output=x"]
+        );
+        assert_eq!(words("git log --out\\put=x"), ["git", "log", "--output=x"]);
+        assert_eq!(words("git log $'--output'=x"), ["git", "log", "--output=x"]);
+        assert_eq!(words("echo 'a b' \"c d\""), ["echo", "a b", "c d"]);
+        assert!(!shell_words("git log HEAD@{1} --format='%h {a,b}'").1);
+        assert!(!shell_words("ls \"$HOME\" \"/${HOME}\" \"/${A_1}x\"").1);
+        assert!(!shell_words("ls $ x$").1);
+        assert!(!shell_words("ls *.md src/*").1);
+        assert!(!shell_words("git log -1 -- 'src/*' \\*.rs \"[ab]\"").1);
+        for expands in [
+            "ls $HOME",
+            "ls /${A_1}x",
+            "git log -1 $IFS--output=f",
+            "git log -1 x${IFS}--output=f",
+            "git log $@",
+            "git diff *",
+            "git log -1 src/*",
+            "git diff '-'-output*",
+            "git diff HEAD ?-output=f",
+            "/usr/bin/git log [-]-output=f",
+            "git log ${X:---output=f}",
+            "git log \"${X:---output=f}\"",
+            "git log {--output=f,}",
+            "git log --o{u,}tput=f",
+            "ls {a..c}",
+        ] {
+            assert!(shell_words(expands).1, "{expands}");
+        }
+    }
+
+    #[test]
+    fn output_options_count_as_writing_a_file() {
+        for writes in [
+            "git log --output=x",
+            "git diff --output x",
+            "git log -1 --format='%n' --output=~/.zshrc",
+            "git show --outp=x",
+            "git log --o=x",
+            "git format-patch --output-directory d",
+            "git format-patch -o d",
+            "git format-patch -od",
+            "/usr/bin/git log -o x",
+            "git log '--output'=x",
+            "git log --out\\put=x",
+            "anything --output=x",
+            "ls && git diff --output=x",
+        ] {
+            assert!(scan_shell(writes).output_option, "{writes}");
+        }
+        for reads in [
+            "git log --oneline -5",
+            "git diff HEAD~1 --stat",
+            "git show HEAD",
+            "git log --format='--output=x'",
+            "git log -- --output",
+            "ls -o",
+            "git status --porcelain",
+            "git log --ours",
+        ] {
+            assert!(!scan_shell(reads).output_option, "{reads}");
+        }
+    }
+
+    /// The review #2101 bypasses: `$'…'` and `#` comments used to desync the lexer from bash, so
+    /// a whole script read as one `ls …` command while bash ran `rm -rf x` too.
+    #[test]
+    fn shell_scan_follows_ansi_c_quotes_and_comments() {
+        let s = scan_shell("ls $'\\'';rm -rf x #'");
+        assert_eq!(s.commands, vec!["ls $'\\''", "rm -rf x"]);
+        assert!(s.unparseable, "$'...' is always flagged");
+        let s = scan_shell("ls #'\nrm -rf x\n#'");
+        assert_eq!(s.commands, vec!["ls", "rm -rf x"]);
+        assert!(!s.unparseable, "a comment is understood, not guessed at");
+
+        // Comments start only at a word start, and only outside quotes.
+        assert_eq!(scan_shell("ls -la # list it").commands, vec!["ls -la"]);
+        assert_eq!(scan_shell("# just a note").commands, Vec::<String>::new());
+        assert_eq!(scan_shell("ls a#b").commands, vec!["ls a#b"]);
+        assert_eq!(scan_shell("echo $#").commands, vec!["echo $#"]);
+        assert_eq!(scan_shell("echo '#' x").commands, vec!["echo '#' x"]);
+        assert_eq!(scan_shell("echo \"#\" x").commands, vec!["echo \"#\" x"]);
+        assert_eq!(scan_shell("echo \\# x").commands, vec!["echo \\# x"]);
+        assert_eq!(scan_shell("ls;#x\nls -a").commands, vec!["ls", "ls -a"]);
+        assert_eq!(scan_shell("ls|#x\nwc").commands, vec!["ls", "wc"]);
+        // A line continuation is removed, as bash does.
+        assert_eq!(scan_shell("ls \\\n-la").commands, vec!["ls -la"]);
+
+        // Anything the lexer can't be sure of is flagged.
+        assert!(scan_shell("ls 'abc").unparseable, "unclosed single quote");
+        assert!(scan_shell("ls \"abc").unparseable, "unclosed double quote");
+        assert!(scan_shell("ls $'abc").unparseable, "unclosed ANSI-C quote");
+        assert!(
+            scan_shell("ls \"a\nb\"").unparseable,
+            "newline inside quotes"
+        );
+        assert!(
+            scan_shell("cat <<EOF\n'\nEOF\nrm -rf x\n'").unparseable,
+            "a here-document quote that swallows real commands"
+        );
+        assert!(!scan_shell("git status && git log --oneline").unparseable);
+        assert!(
+            !scan_shell("echo $\"x\"").unparseable,
+            "$\"...\" is a plain string"
+        );
+
+        // `<>` opens a file read-write and creates it.
+        assert!(scan_shell("ls <> x").writes_file);
+        assert!(scan_shell("ls 3<>x").writes_file);
+        assert!(!scan_shell("ls < x").writes_file);
+    }
+
+    /// Cross-check the lexer against real bash: `bash -xc` traces every simple command it runs,
+    /// one `+ ` line each, so for scripts made only of `echo`/`true` the counts must agree. This
+    /// includes both #2101 bypasses, rewritten so the hidden command is a harmless `echo`.
+    #[test]
+    fn shell_scan_agrees_with_real_bash() {
+        let Ok(probe) = std::process::Command::new("bash")
+            .arg("-c")
+            .arg("true")
+            .output()
+        else {
+            eprintln!("bash not found; skipping");
+            return;
+        };
+        assert!(probe.status.success());
+        for script in [
+            "echo $'\\'';echo PWNED #'",
+            "echo $'\\'' && echo PWNED #'",
+            "echo $'\\'' | echo PWNED #'",
+            "echo #'\necho PWNED\n#'",
+            "echo #'\necho a && echo PWNED\n#'",
+            "echo #'\necho a | echo PWNED\n#'",
+            "echo a;#x\necho b",
+            "echo a|#x\ncat",
+            "echo a&#x\necho b",
+            "(echo c)#x\necho d",
+            "echo a#b; echo c",
+            "echo '#' \"#\" \\# x # y",
+            "echo \\\n#x; echo b",
+            "echo 'a;b' \"c && d\" | cat && true",
+            "echo $'a\\tb'; echo c",
+        ] {
+            let out = std::process::Command::new("bash")
+                .arg("-xc")
+                .arg(script)
+                .output()
+                .unwrap();
+            let traced = String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .filter(|l| l.starts_with('+'))
+                .count();
+            let scan = scan_shell(script);
+            assert_eq!(
+                scan.commands.len(),
+                traced,
+                "{script:?}: lexer {:?} vs bash trace {:?}",
+                scan.commands,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if String::from_utf8_lossy(&out.stdout).contains("PWNED") {
+                assert!(
+                    scan.commands.iter().any(|c| c == "echo PWNED"),
+                    "{script:?}: bash ran `echo PWNED` but the lexer saw {:?}",
+                    scan.commands
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn restricted_bash_denies_what_the_lexer_cannot_split() {
+        let p = Policy::parse(Some(&json!({"bash": {"*": "deny", "ls *": "allow"}}))).unwrap();
+        let tp = ToolPolicy::new("amp-manager", false, p, "/repo/wt");
+        let bash = |cmd: &str| tp.check("bash", &json!({ "command": cmd }));
+        assert_eq!(
+            bash("ls $'\\'';rm -rf x #'").unwrap_err().reason,
+            DenialReason::Unparseable
+        );
+        assert_eq!(
+            bash("ls $'a'").unwrap_err().reason,
+            DenialReason::Unparseable
+        );
+        assert_eq!(
+            bash("ls #'\nrm -rf x\n#'").unwrap_err().reason,
+            DenialReason::Deny,
+            "the comment is dropped, so `rm -rf x` is checked on its own"
+        );
+        assert_eq!(bash("ls 'x").unwrap_err().reason, DenialReason::Unparseable);
+        assert_eq!(bash("ls <> x").unwrap_err().reason, DenialReason::Redirect);
+        assert!(bash("ls -la # list").is_ok());
+        let text = bash("ls $'x'").unwrap_err().to_string();
+        assert!(text.contains("can't split this script"), "{text}");
+        // An unrestricted policy runs whatever bash would.
+        let tp = ToolPolicy::new("amp-x", true, Policy::default(), "/repo/wt");
+        assert!(tp.check("bash", &json!({"command": "ls $'x'"})).is_ok());
+    }
+
     #[test]
     fn canonical_ids() {
         assert_eq!(
@@ -873,11 +1547,12 @@ mod tests {
             tp.check("edit", &json!({"path": "docs/../src/a.rs"}))
                 .is_err()
         );
+        // (A directory that doesn't exist: on macOS `/etc` is a link to `/private/etc`.)
         let d = tp
-            .check("write", &json!({"path": "../../etc/passwd"}))
+            .check("write", &json!({"path": "../../amp-no-such-dir/passwd"}))
             .unwrap_err();
         assert_eq!(d.permission, "external_directory");
-        assert_eq!(d.subject, "/etc/passwd");
+        assert_eq!(d.subject, "/amp-no-such-dir/passwd");
         assert_eq!(d.reason, DenialReason::Ask);
         assert_eq!(
             tp.check("write", &json!({})).unwrap_err().reason,

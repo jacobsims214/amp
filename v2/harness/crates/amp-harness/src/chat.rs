@@ -16,6 +16,9 @@
 //! The AMP theme (M3-1) is installed before the shell is built: `--theme`, `AMP_HARNESS_THEME`,
 //! config.toml `[tui] theme`, else `auto` (the terminal's background via OSC 11; dark in
 //! `--snapshot`). Colour depth: `AMP_HARNESS_COLOR`, `[tui] color`, else `COLORTERM`.
+//!
+//! The shell gets the session's worker supervisor: quitting while `amp_run_ticket` runs cancels
+//! the workers and waits (bounded) until their abandoned runs are reported ([`Shell::quit`]).
 
 use std::{
     io::IsTerminal,
@@ -154,6 +157,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let info = shell_info(&session);
     let models = model_choices(&session.rt);
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
+    shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);
     let mut events = session.events;
 

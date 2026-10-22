@@ -12,7 +12,10 @@ use std::{
 use amp_core::{
     assets::{Assets, OverrideDirs},
     models::{ModelsConfig, ModelsFile},
-    policy::{DISPATCH_TOOL, DenialReason, QUESTION_TOOL, ToolPolicy},
+    policy::{
+        DISPATCH_TOOL, DenialReason, Policy, QUESTION_TOOL, ToolPolicy, resolve_read_tool_path,
+        resolve_symlinks, resolve_tool_path,
+    },
     roles::{RoleError, RoleRegistry},
 };
 use rpi_agent::{AgentContext, AgentMessage, AgentTool, AgentToolResult, ToolResultPartial};
@@ -172,14 +175,72 @@ fn manager_policy() {
         "git log `id`",
         "git log > notes.txt",
         "lsof -i",
+        // #2101: `$'...'` and `#` comments used to make the lexer read each of these as one
+        // `ls ...` command while bash also ran `rm -rf x`.
+        "ls $'\\'';rm -rf x #'",
+        "ls $'\\'' && rm -rf x #'",
+        "ls $'\\'' | rm -rf x #'",
+        "ls #'\nrm -rf x\n#'",
+        "ls #'\nls && rm -rf x\n#'",
+        "ls #'\nls | rm -rf x\n#'",
+        "git status \"\nrm -rf x\n\"",
+        "ls 'unclosed",
+        "ls <> created-file",
+        // #2140: git's `--output` writes the command's output to any path, so an allowed
+        // `git log` could write e.g. ~/.zshrc with fully controlled content.
+        "git log --output=x",
+        "git diff --output x",
+        "git log -1 --format='alias ls=rm%n' --output=~/.zshrc",
+        "git show --output=x",
+        "git log --outp=x",
+        "git log '--output'=x",
+        "git log --format=x --output-directory d",
+        "git log -o x",
+        "git log ${X:---output=x}",
+        "git log {--output=x,}",
     ] {
         assert!(!bash(&p, denied), "manager must not run: {denied}");
     }
+    for ok in [
+        "ls -la",
+        "git status && git log --oneline",
+        "ls -la # what's here",
+    ] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+    assert_eq!(
+        p.check("bash", &json!({"command": "ls $'\\'';rm -rf x #'"}))
+            .unwrap_err()
+            .reason,
+        DenialReason::Unparseable
+    );
     let d = p
         .check("bash", &json!({"command": "cargo build"}))
         .unwrap_err();
     assert_eq!(d.reason, DenialReason::Deny);
     assert_eq!(d.rule.as_ref().unwrap().pattern, "*");
+    for ok in [
+        "git diff --stat",
+        "git log --format='--output=x' -1",
+        "git log -- --output",
+        "git log HEAD@{1} -1",
+    ] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+    let d = p
+        .check(
+            "bash",
+            &json!({"command": "git log -1 --format=x --output=~/.zshrc"}),
+        )
+        .unwrap_err();
+    assert_eq!(d.reason, DenialReason::Redirect);
+    assert!(d.to_string().contains("--output"), "{d}");
+    assert_eq!(
+        p.check("bash", &json!({"command": "git log {--output=x,}"}))
+            .unwrap_err()
+            .reason,
+        DenialReason::Unparseable
+    );
     assert_eq!(
         p.check("bash", &json!({"command": "git log > x"}))
             .unwrap_err()
@@ -241,6 +302,150 @@ fn manager_policy() {
     assert!(allowed(&p, "grep", json!({"pattern": "x"})));
     assert!(allowed(&p, "amp_kb_write", json!({})));
     assert!(allowed(&p, "amp_create_tasks", json!({})));
+}
+
+/// #2145 (review of PR #74): the manager's bash allows are word-bounded (`git diff *`, not
+/// `git diff*`). `git diff*` also matched `git difftool`, whose `-x/--extcmd` and `-t/--tool` run
+/// any command, so one allowed-looking command was unrestricted bash. The lexer can't see it:
+/// there is no substitution, redirect or `--output`.
+#[test]
+fn manager_bash_allows_stop_at_the_word() {
+    let p = policy("amp-manager");
+    for denied in [
+        "git difftool",
+        "git difftool HEAD~1",
+        "git difftool -x 'sh -c id'",
+        "git difftool -x sh",
+        "git difftool --extcmd=sh",
+        "git difftool --extcmd 'rm -rf x'",
+        "git difftool -t vimdiff",
+        "git difftool --tool=x HEAD",
+        "git difftool -y --tool x",
+        "git difftool --dir-diff",
+        // Other git commands and binaries that the old prefix rules matched.
+        "git diff-tree HEAD",
+        "git diff-index HEAD",
+        "git diff-files",
+        "git statusx",
+        "git status-foo",
+        "git logx",
+        "git log-foo",
+        "lsof -i",
+        "lsblk",
+    ] {
+        let d = p
+            .check("bash", &json!({ "command": denied }))
+            .expect_err(denied);
+        assert_eq!(d.reason, DenialReason::Deny, "{denied}");
+    }
+    // The backstop rule decides difftool.
+    let d = p
+        .check("bash", &json!({"command": "git difftool -x sh"}))
+        .unwrap_err();
+    assert_eq!(d.rule.as_ref().unwrap().pattern, "git difftool*");
+    // Bare and argumented forms stay allowed: a trailing ` *` also matches the bare command.
+    for ok in [
+        "git status",
+        "git status --short",
+        "git diff",
+        "git diff HEAD~1 --stat",
+        "git diff --stat",
+        "git log",
+        "git log --oneline -5",
+        "ls",
+        "ls -la v2",
+    ] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+    // Found in the same audit: bash splits an unquoted `$IFS` (or any unquoted variable) at run
+    // time, and a glob can expand to a file named `--output=…`, so both could hide `--output`
+    // from the lexer.
+    for denied in [
+        "git log -1 $IFS--output=x",
+        "git log -1 x${IFS}--output=x",
+        "git diff HEAD $IFS--output=x",
+        "git diff *",
+        "git log -1 [-]-output=x",
+    ] {
+        let d = p
+            .check("bash", &json!({ "command": denied }))
+            .expect_err(denied);
+        assert_eq!(d.reason, DenialReason::Unparseable, "{denied}");
+    }
+    for ok in ["git diff -- '*.rs'", "git log -1 \"$X\"", "ls *.md"] {
+        assert!(bash(&p, ok), "manager should run: {ok}");
+    }
+}
+
+/// The same rules as opencode evaluates them: opencode has no shell lexer, so its manager's
+/// bash rules (v2/plugins/opencode/agents.json, generated from the same source) must stop
+/// difftool, redirects, `--output` and mkdir outside `.opencode/` on their own. Matching is
+/// `policy::wildcard_match` with last match wins, which copies opencode's `Wildcard.match` and
+/// `Permission.evaluate` (`findLast`).
+#[test]
+fn opencode_manager_bash_rules_hold_without_the_lexer() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../plugins/opencode/agents.json");
+    let agents: Value = serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    let manager = agents
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == "amp-manager")
+        .expect("amp-manager in agents.json");
+    let mut bash = serde_json::Map::new();
+    for rule in manager["permissions"].as_array().unwrap() {
+        if rule["action"] == "shell" {
+            let pattern = rule["resource"].as_str().unwrap().to_string();
+            // A later rule for the same pattern replaces it; none repeat today.
+            assert!(!bash.contains_key(&pattern), "repeated pattern {pattern}");
+            bash.insert(pattern, rule["effect"].clone());
+        }
+    }
+    let rules = Policy::parse(Some(&json!({ "bash": bash }))).unwrap();
+    let allows = |cmd: &str| rules.evaluate("bash", cmd).allows();
+    for ok in [
+        "git status",
+        "git status --short",
+        "git diff",
+        "git diff HEAD~1 --stat",
+        "git log",
+        "git log --oneline -5",
+        "ls",
+        "ls -la v2",
+        "mkdir -p .opencode/agent",
+        "mkdir -p .opencode/skills/new-skill",
+    ] {
+        assert!(allows(ok), "opencode manager should run: {ok}");
+    }
+    for denied in [
+        "git difftool",
+        "git difftool -x 'sh -c id'",
+        "git difftool --extcmd=sh",
+        "git difftool -t vim",
+        "git difftool --tool=x HEAD",
+        "git diff-tree HEAD",
+        "git statusx",
+        "git logx",
+        "lsof -i",
+        // opencode matches a command's whole source text, redirect included.
+        "git diff > x",
+        "git diff>~/.zshrc",
+        "git log 2>&1 >x",
+        "git log --output=x",
+        "git log --outp=x",
+        "git diff --output x",
+        // `.opencode/*` crosses spaces, `/` and `..`, so it needs these denies.
+        "mkdir -p .opencode/x /etc/y",
+        "mkdir -p .opencode/../../x",
+        "mkdir -p .opencode/x$IFS/etc/y",
+        "mkdir -p .opencode/x${IFS}/etc/y",
+        "mkdir -p .opencode/x\t/etc/y",
+        "mkdir -p .opencode/x>~/.zshrc",
+        "mkdir /etc/x",
+        "rm -rf x",
+    ] {
+        assert!(!allows(denied), "opencode manager must not run: {denied}");
+    }
 }
 
 // ------------------------------------------------------------------------------------------------
@@ -764,4 +969,273 @@ fn filter_tools_drops_what_a_role_can_never_use() {
         names(&policy("amp-reviewer")),
         ["read", "bash", "amp_get_task"]
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// Path resolution (#2141): the policy must judge the file rpi's tools will really touch.
+// ------------------------------------------------------------------------------------------------
+
+/// A fresh directory under this crate's target dir (never /tmp: RUST DISK RULE, and on macOS /tmp
+/// is itself a symlink).
+fn path_scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("paths")
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn home() -> PathBuf {
+    resolve_symlinks(&dirs::home_dir().expect("a home dir"))
+}
+
+/// The policy's resolution is a copy of rpi-tools' (whose resolver is private to its env), so
+/// compare the two on every rule: `@`, unicode spaces, `~`, `file://`, `..`, and the read tools'
+/// typographic variants.
+#[tokio::test]
+async fn policy_resolves_paths_exactly_like_rpi_tools() {
+    let root = path_scratch("rpi-equivalence").join("wt");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    // Files only the read tools' variant lookup finds.
+    fs::write(root.join("docs/log 2\u{202F}PM.txt"), "").unwrap();
+    fs::write(root.join("docs/it\u{2019}s.md"), "").unwrap();
+    fs::write(root.join("docs/cafe\u{0301}.md"), "").unwrap();
+    let env = rpi_tools::OsExecutionEnv::with_cwd(root.clone());
+    let edit_paths = [
+        "src/a.rs",
+        "./src/../src/a.rs",
+        "@src/a.rs",
+        "@@src/a.rs",
+        "@../../x",
+        "~",
+        "~/",
+        "~/.ssh/authorized_keys",
+        "~/../.opencode/x",
+        "~root/x",
+        "x/~/y",
+        "file:///etc/hosts",
+        "file://docs/a.md",
+        "file:///C:/x",
+        "@file:///etc/hosts",
+        "~/file:///x",
+        "a\u{00A0}b\u{3000}c.txt",
+        "\u{2003}@x",
+        "/abs/../../../x",
+        "../../../../../../../../../../../../../../x",
+        "",
+        ".",
+    ];
+    for raw in edit_paths {
+        let rpi = rpi_tools::resolve_tool_path(&env, raw, None).await.unwrap();
+        assert_eq!(
+            resolve_tool_path(&root, raw),
+            PathBuf::from(rpi),
+            "edit path {raw:?}"
+        );
+    }
+    let read_paths = [
+        "docs/log 2 PM.txt",
+        "docs/log 2 pm.txt",
+        "docs/it's.md",
+        "docs/caf\u{00E9}.md",
+        "@docs/it's.md",
+        "docs/missing it's 2 AM.txt",
+        "~/x",
+    ];
+    for raw in edit_paths.iter().chain(read_paths.iter()) {
+        let rpi = rpi_tools::resolve_read_tool_path(&env, raw, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_read_tool_path(&root, raw),
+            PathBuf::from(rpi),
+            "read path {raw:?}"
+        );
+    }
+}
+
+fn edit_policy(root: &Path) -> ToolPolicy {
+    // Like the manager's own-config rule: everything denied but `.opencode/**`.
+    let p = Policy::parse(Some(&json!({
+        "edit": {"*": "deny", ".opencode/**": "allow"},
+        "read": {"*": "deny", "docs/**": "allow", ".opencode/**": "allow"},
+    })))
+    .unwrap();
+    ToolPolicy::new("amp-x", true, p, root)
+}
+
+fn edit_subject(p: &ToolPolicy, raw: &str) -> Result<(), (String, String)> {
+    p.check("write", &json!({"path": raw, "content": "x"}))
+        .map_err(|d| (d.permission.clone(), d.subject.clone()))
+}
+
+#[test]
+fn tilde_at_and_file_urls_are_classified_where_rpi_writes() {
+    let base = path_scratch("tilde-at-file");
+    let root = base.join("wt");
+    fs::create_dir_all(root.join(".opencode")).unwrap();
+    let p = edit_policy(&root);
+    let real_root = resolve_symlinks(&root);
+    let real_base = resolve_symlinks(&base);
+    let external = |subject: PathBuf| {
+        Err((
+            "external_directory".to_string(),
+            subject.display().to_string(),
+        ))
+    };
+
+    // Inside, allowed: plain, `@`-prefixed, unicode space-free, and as a file:// URL.
+    assert_eq!(edit_subject(&p, ".opencode/x"), Ok(()));
+    assert_eq!(edit_subject(&p, "@.opencode/x"), Ok(()));
+    let url = format!("file://{}/.opencode/x", root.display());
+    assert_eq!(edit_subject(&p, &url), Ok(()));
+    assert_eq!(edit_subject(&p, &format!("@{url}")), Ok(()));
+    // `~` and `file:` used to be read as directory names inside the root.
+    assert_eq!(
+        edit_subject(&p, "~/.opencode/x"),
+        external(home().join(".opencode/x"))
+    );
+    assert_eq!(
+        edit_subject(&p, "~/.ssh/authorized_keys"),
+        external(home().join(".ssh/authorized_keys"))
+    );
+    // Used to collapse to `.opencode/x` and pass the allow rule.
+    let above_home = resolve_symlinks(&home().join("..")).join(".opencode/x");
+    assert_eq!(edit_subject(&p, "~/../.opencode/x"), external(above_home));
+    assert_eq!(
+        edit_subject(&p, "file:///.opencode/x"),
+        external(PathBuf::from("/.opencode/x"))
+    );
+    // `@..` climbs out of the worktree, so the `.opencode/x` of a sibling is outside.
+    assert_eq!(
+        edit_subject(&p, "@../other/.opencode/x"),
+        external(real_base.join("other/.opencode/x"))
+    );
+    // `@../wt/...` comes back in.
+    assert_eq!(edit_subject(&p, "@../wt/.opencode/x"), Ok(()));
+    // Inside but denied: the subject is relative to the root.
+    assert_eq!(
+        edit_subject(&p, "@src/a.rs"),
+        Err(("edit".into(), "src/a.rs".into()))
+    );
+    // A worker with `edit: allow` still needs external_directory for `~/`.
+    let worker = registry()
+        .get("amp-worker-backend")
+        .unwrap()
+        .tool_policy(&real_root);
+    let d = worker
+        .check(
+            "write",
+            &json!({"path": "~/.ssh/authorized_keys", "content": ""}),
+        )
+        .unwrap_err();
+    assert_eq!(d.permission, "external_directory");
+    assert_eq!(d.reason, DenialReason::Ask);
+    assert!(
+        worker
+            .check("write", &json!({"path": "@src/a.rs", "content": ""}))
+            .is_ok()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_are_followed_before_the_rules_see_the_path() {
+    use std::os::unix::fs::symlink;
+
+    let base = path_scratch("symlinks");
+    let root = base.join("wt");
+    let outside = base.join("outside");
+    fs::create_dir_all(root.join(".opencode")).unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "s").unwrap();
+    let real_outside = resolve_symlinks(&outside);
+    // A directory link that leaves the worktree.
+    symlink(&outside, root.join(".opencode/escape")).unwrap();
+    // A file link and a dangling link (writing through it creates its target) out of it.
+    symlink(outside.join("secret.txt"), root.join(".opencode/file.md")).unwrap();
+    symlink(outside.join("new.md"), root.join(".opencode/dangling.md")).unwrap();
+    // A relative dangling link whose target is under a directory that doesn't exist yet.
+    symlink("../../outside/deep/new.md", root.join(".opencode/rel.md")).unwrap();
+    // Links that stay inside: the rules see the real path.
+    symlink(root.join(".opencode"), root.join("alias")).unwrap();
+    symlink("../src", root.join(".opencode/to-src")).unwrap();
+    // The worktree itself reached through a link.
+    let root_link = base.join("wt-link");
+    symlink(&root, &root_link).unwrap();
+    // A link loop.
+    symlink("loop-b", root.join(".opencode/loop-a")).unwrap();
+    symlink("loop-a", root.join(".opencode/loop-b")).unwrap();
+
+    let p = edit_policy(&root);
+    let external = |subject: PathBuf| {
+        Err((
+            "external_directory".to_string(),
+            subject.display().to_string(),
+        ))
+    };
+    assert_eq!(
+        edit_subject(&p, ".opencode/escape/x"),
+        external(real_outside.join("x"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/escape/a/b/c"),
+        external(real_outside.join("a/b/c"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/file.md"),
+        external(real_outside.join("secret.txt"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/dangling.md"),
+        external(real_outside.join("new.md"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/rel.md"),
+        external(real_outside.join("deep/new.md"))
+    );
+    // `..` is collapsed before the link is seen, as rpi does: this is `.opencode/x`.
+    assert_eq!(edit_subject(&p, ".opencode/escape/../x"), Ok(()));
+    // Inside links: `alias/x` is really `.opencode/x`; `.opencode/to-src/a.rs` is `src/a.rs`.
+    assert_eq!(edit_subject(&p, "alias/x"), Ok(()));
+    assert_eq!(
+        edit_subject(&p, ".opencode/to-src/a.rs"),
+        Err(("edit".into(), "src/a.rs".into()))
+    );
+    // A loop ends (the tool itself fails with ELOOP, so the verdict doesn't matter).
+    let _ = edit_subject(&p, ".opencode/loop-a");
+    // A policy bound to the linked root sees the same inside paths.
+    let via_link = edit_policy(&root_link);
+    assert_eq!(edit_subject(&via_link, ".opencode/x"), Ok(()));
+    assert_eq!(
+        edit_subject(&via_link, ".opencode/escape/x"),
+        external(real_outside.join("x"))
+    );
+
+    // Reads use the same resolution: a link out of an allowed directory is not allowed.
+    let read = |raw: &str| p.check("read", &json!({ "path": raw }));
+    assert!(read("docs/a.md").is_ok());
+    assert!(read("@docs/a.md").is_ok());
+    assert!(read("alias/x").is_ok());
+    let d = read(".opencode/escape/secret.txt").unwrap_err();
+    assert_eq!(d.permission, "read");
+    assert_eq!(
+        d.subject,
+        real_outside.join("secret.txt").display().to_string()
+    );
+    assert!(read(".opencode/file.md").is_err());
+    assert!(read("~/.opencode/x").is_err());
+    for tool in ["grep", "find", "ls"] {
+        let checks = p
+            .checks(tool, &json!({"path": ".opencode/escape"}))
+            .unwrap();
+        assert_eq!(checks.len(), 1, "{tool}");
+        assert_eq!(
+            checks[0].subject,
+            real_outside.display().to_string(),
+            "{tool}"
+        );
+    }
 }

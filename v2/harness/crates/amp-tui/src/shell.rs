@@ -22,12 +22,18 @@
 //!
 //! The transcript gets a marker line whenever the current ticket changes (switched, claimed, or
 //! its state moved), and the footer's session name becomes `manager · #2108`.
+//!
+//! Quitting ([`Shell::quit`]) never drops a worker's run report (D8): with workers live it cancels
+//! them, aborts the prompt and waits, bounded by [`Shell::quit_bound`], until each worker has
+//! stopped and its `amp_report_run` has returned. Without workers it waits [`ABORT_GRACE`] for the
+//! aborted prompt so its session file is complete.
 
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use amp_core::events::{RunEvent, Totals};
 use amp_core::meta::MetaHandle;
 use amp_core::models::thinking_name;
+use amp_core::supervisor::Supervisor;
 use amp_core::tickets::Status;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
@@ -111,6 +117,26 @@ pub struct ModelChoice {
     pub model: Model,
 }
 
+/// How long quitting waits for an aborted prompt with no live workers (its session file).
+pub const ABORT_GRACE: Duration = Duration::from_secs(3);
+
+/// On top of the supervisor's `abort_grace`: the run report's own timeout (`amp_report_run`, 30 s
+/// in amp-core's run_report) plus a margin. With the default 10 s grace, quitting waits 45 s.
+pub const REPORT_ALLOWANCE: Duration = Duration::from_secs(35);
+
+/// How [`Shell::quit`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitOutcome {
+    /// Nothing was running.
+    Idle,
+    /// The prompt ended and every worker stopped and was reported.
+    Settled,
+    /// The caller skipped the wait (a second Ctrl-C).
+    Skipped,
+    /// The bound passed first.
+    TimedOut,
+}
+
 /// What the caller does after a submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submit {
@@ -142,6 +168,8 @@ pub struct Shell {
     seen_revision: u64,
     marked: Option<(i64, Option<Status>)>,
     footer_ticket: Option<i64>,
+    /// The manager's worker supervisor, so quitting can cancel and wait for its workers.
+    supervisor: Option<Arc<Supervisor>>,
 }
 
 impl Shell {
@@ -174,6 +202,7 @@ impl Shell {
                 seen_revision: 0,
                 marked: None,
                 footer_ticket: None,
+                supervisor: None,
             },
             done_rx,
         )
@@ -189,6 +218,109 @@ impl Shell {
 
     pub fn is_running(&self) -> bool {
         self.running
+    }
+
+    /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
+    pub fn set_supervisor(&mut self, supervisor: Option<Arc<Supervisor>>) {
+        self.supervisor = supervisor;
+    }
+
+    /// Tickets with a live (queued, running or reporting) worker.
+    pub fn live_tickets(&self) -> Vec<i64> {
+        self.supervisor
+            .as_ref()
+            .map(|s| s.workers().iter().map(|w| w.task_id).collect())
+            .unwrap_or_default()
+    }
+
+    /// How long [`Shell::quit`] waits once workers are live: the supervisor's abort grace plus
+    /// [`REPORT_ALLOWANCE`].
+    pub fn quit_bound(&self) -> Duration {
+        self.supervisor
+            .as_ref()
+            .map_or(ABORT_GRACE, |s| s.config().abort_grace + REPORT_ALLOWANCE)
+    }
+
+    fn settled(&self) -> bool {
+        !self.running && self.live_tickets().is_empty()
+    }
+
+    /// Winds the session down before the process exits. With workers live: cancel them all,
+    /// abort the prompt, say so, and wait (up to [`Shell::quit_bound`]) until the prompt has ended
+    /// and every worker has stopped and been reported. Otherwise a running prompt is aborted and
+    /// gets [`ABORT_GRACE`]. `skip` ends the wait early (a second Ctrl-C); `repaint` runs after
+    /// each change and on a 120 ms tick so the caller can redraw.
+    pub async fn quit<S, R>(
+        &mut self,
+        events: &mut UnboundedReceiver<AgentEvent>,
+        done: &mut UnboundedReceiver<RunDone>,
+        skip: S,
+        mut repaint: R,
+    ) -> QuitOutcome
+    where
+        S: Future<Output = ()>,
+        R: FnMut(&Self),
+    {
+        if self.settled() {
+            return QuitOutcome::Idle;
+        }
+        let start = tokio::time::Instant::now();
+        let mut deadline = start + ABORT_GRACE;
+        let mut waiting_for_workers = false;
+        if self.running
+            && let Some(sup) = &self.supervisor
+        {
+            // The manager may be starting a worker right now: nothing new may start.
+            sup.cancel_all();
+        }
+        self.abort().await;
+        tokio::pin!(skip);
+        let mut ticker = tokio::time::interval(Duration::from_millis(120));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            let live = self.live_tickets().len();
+            if live > 0 && !waiting_for_workers {
+                waiting_for_workers = true;
+                deadline = start + self.quit_bound();
+                if let Some(sup) = &self.supervisor {
+                    sup.cancel_all();
+                }
+                self.view.add_notice(&format!(
+                    "stopping {live} worker{} and reporting {} runs… (Ctrl+C again to quit now)",
+                    if live == 1 { "" } else { "s" },
+                    if live == 1 { "its" } else { "their" },
+                ));
+            }
+            if self.settled() {
+                while let Ok(event) = events.try_recv() {
+                    self.handle_event(&event);
+                }
+                repaint(self);
+                return QuitOutcome::Settled;
+            }
+            repaint(self);
+            tokio::select! {
+                biased;
+                Some(event) = events.recv() => self.handle_event(&event),
+                Some(result) = done.recv() => {
+                    while let Ok(event) = events.try_recv() {
+                        self.handle_event(&event);
+                    }
+                    self.finish_run(result);
+                }
+                () = &mut skip => {
+                    self.view.add_notice("quitting without waiting");
+                    repaint(self);
+                    return QuitOutcome::Skipped;
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    self.view.add_notice("gave up waiting");
+                    repaint(self);
+                    return QuitOutcome::TimedOut;
+                }
+                _ = ticker.tick() => {}
+            }
+        }
     }
 
     /// Usage and counts over every run of this session.

@@ -7,6 +7,10 @@
 //! a panic hook does the same before the panic message prints. Ctrl-C in raw mode is a key, not
 //! a signal: it aborts a running prompt, else clears the editor, else quits. SIGINT, SIGTERM and
 //! SIGHUP quit cleanly too.
+//!
+//! Quitting with a prompt or workers still running goes through [`Shell::quit`]: the workers are
+//! cancelled and the screen says it is waiting for their run reports (bounded; a second Ctrl-C or
+//! signal skips the wait). Tickets still unreported when the TUI exits are printed to stderr.
 
 use std::{
     io::Write,
@@ -22,10 +26,7 @@ use rpi_agent::AgentEvent;
 use rpi_tui::{ProcessTerminal, TUI, TuiAltScreen, TuiStopOptions};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::shell::{RunDone, Shell, Submit};
-
-/// How long quitting waits for an aborted run to wind down (so its session file is complete).
-const ABORT_GRACE: Duration = Duration::from_secs(3);
+use crate::shell::{QuitOutcome, RunDone, Shell, Submit};
 
 /// Escape sequences that undo everything the TUI turns on: mouse tracking, bracketed paste,
 /// the kitty keyboard protocol, a hidden cursor and the alternate screen.
@@ -137,6 +138,7 @@ pub async fn run(
     };
 
     tui.request_render(true);
+    let mut signals = Signals::new();
     let outcome = event_loop(
         &mut shell,
         &tui,
@@ -144,22 +146,44 @@ pub async fn run(
         &mut done,
         &mut input_rx,
         &mut submit_rx,
+        &mut signals,
     )
     .await;
 
-    // Quitting mid-run: abort it and give it a moment to settle.
-    if shell.is_running() {
-        shell.abort().await;
-        if let Ok(Some(result)) = tokio::time::timeout(ABORT_GRACE, done.recv()).await {
-            while let Ok(event) = events.try_recv() {
-                shell.handle_event(&event);
+    // Quitting mid-run: cancel the workers, abort the prompt, and wait (bounded) for the workers'
+    // run reports. Ctrl-C or another signal skips the wait.
+    let skip = async {
+        loop {
+            tokio::select! {
+                input = input_rx.recv() => match input {
+                    Some(Event::Key(key)) if key.kind != KeyEventKind::Release && is_ctrl(&key, 'c') => break,
+                    Some(_) => {}
+                    None => std::future::pending::<()>().await,
+                },
+                () = signals.recv() => break,
             }
-            shell.finish_run(result);
         }
-    }
+    };
+    let quit = shell
+        .quit(&mut events, &mut done, skip, |_| {
+            tui.ensure_size();
+            tui.request_render(false);
+        })
+        .await;
+    let unreported = match quit {
+        QuitOutcome::Skipped | QuitOutcome::TimedOut => shell.live_tickets(),
+        QuitOutcome::Idle | QuitOutcome::Settled => Vec::new(),
+    };
     stop_reader.store(true, Ordering::Relaxed);
     let _ = reader.await;
     guard.stop();
+    if !unreported.is_empty() {
+        let ids: Vec<String> = unreported.iter().map(|id| format!("#{id}")).collect();
+        eprintln!(
+            "amp-harness: quit before the run of {} was reported to AMP",
+            ids.join(", ")
+        );
+    }
     outcome
 }
 
@@ -170,10 +194,10 @@ async fn event_loop(
     done: &mut UnboundedReceiver<RunDone>,
     input_rx: &mut UnboundedReceiver<Event>,
     submit_rx: &mut UnboundedReceiver<String>,
+    signals: &mut Signals,
 ) -> Result<(), String> {
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut signals = Signals::new();
     // The AMP header and status line repaint when the metadata, workers or reports change.
     let mut chrome_seen = shell.view().chrome().fingerprint();
     loop {
