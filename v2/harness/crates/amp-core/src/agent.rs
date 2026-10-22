@@ -113,8 +113,13 @@ pub fn state_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
 pub struct Runtime {
     pub assets: Assets,
     pub roles: RoleRegistry,
+    /// The models config and providers as loaded. After [`Runtime::reload_models`] (a provider
+    /// connected in the chat, #2163) sessions use [`Runtime::current_models`] /
+    /// [`Runtime::current_providers`] instead.
     pub models: ModelsConfig,
     pub providers: ProviderSet,
+    /// What [`Runtime::reload_models`] put in place, if anything.
+    reloaded: std::sync::RwLock<Option<(ModelsConfig, ProviderSet)>>,
     /// Every skill, written to disk so the model can read them (and their scripts) by path.
     pub skills: Vec<Skill>,
     pub mcp: Arc<AmpMcpClient>,
@@ -342,6 +347,7 @@ impl Runtime {
             roles,
             models,
             providers,
+            reloaded: std::sync::RwLock::new(None),
             skills,
             mcp,
             state_dir,
@@ -367,6 +373,33 @@ impl Runtime {
         self
     }
 
+    /// The models config sessions are built with now.
+    pub fn current_models(&self) -> ModelsConfig {
+        match &*self.reloaded.read().unwrap_or_else(|e| e.into_inner()) {
+            Some((models, _)) => models.clone(),
+            None => self.models.clone(),
+        }
+    }
+
+    /// The providers sessions are built with now.
+    pub fn current_providers(&self) -> ProviderSet {
+        match &*self.reloaded.read().unwrap_or_else(|e| e.into_inner()) {
+            Some((_, providers)) => providers.clone(),
+            None => self.providers.clone(),
+        }
+    }
+
+    /// Puts `models` in place with providers rebuilt from the keys as they are now (a key just
+    /// stored, a provider just added). Sessions built from now on (workers) use them; a running
+    /// harness takes the returned set with `AgentHarness::set_models`. Faux providers keep their
+    /// scripts.
+    pub fn reload_models(&self, models: ModelsConfig, keys: &dyn KeyLookup) -> ProviderSet {
+        let providers = self.current_providers().rebuild(&models, keys);
+        *self.reloaded.write().unwrap_or_else(|e| e.into_inner()) =
+            Some((models, providers.clone()));
+        providers
+    }
+
     pub fn role(&self, name: &str) -> Result<&Role, AgentError> {
         self.roles
             .get(name)
@@ -376,9 +409,11 @@ impl Runtime {
     /// Builds one session.
     pub async fn build(&self, spec: AgentSpec) -> Result<BuiltAgent, AgentError> {
         let role = self.role(&spec.role)?.clone();
-        let resolved = self.models.resolve_role(&role.model_role)?;
+        let models = self.current_models();
+        let providers = self.current_providers();
+        let resolved = models.resolve_role(&role.model_role)?;
         // Fail early with the key the role needs ("no key: set OPENROUTER_API_KEY ...").
-        self.providers.for_role(&resolved)?;
+        providers.for_role(&resolved)?;
 
         let cwd = spec.cwd.clone();
         let env = Arc::new(OsExecutionEnv::with_cwd(cwd.clone()));
@@ -441,7 +476,7 @@ impl Runtime {
                 skills: Some(self.skills.clone()),
             },
             session,
-            models: self.providers.all(),
+            models: providers.all(),
             agent_emitter: spec.emitter,
             // The manager (#2171): the approval guard before the policy (once AMP refused a step
             // that needs a person, every further call ends the turn, denied or not); a refusal

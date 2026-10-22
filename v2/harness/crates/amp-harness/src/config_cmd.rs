@@ -280,6 +280,11 @@ fn print_human(r: &Report) {
     }
 
     println!("\nRoles:");
+    print_roles(r);
+}
+
+/// The ROLE / PROVIDER/MODEL / THINKING / READY / SOURCE table (`config show`, `connect`).
+pub fn print_roles(r: &Report) {
     let width = r
         .roles
         .iter()

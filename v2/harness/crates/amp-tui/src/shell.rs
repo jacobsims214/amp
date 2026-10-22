@@ -29,6 +29,15 @@
 //! The transcript gets a marker line whenever the current ticket changes (switched, claimed, or
 //! its state moved), and the footer's session name becomes `manager · #2108`.
 //!
+//! **`/connect` (#2163).** `/connect` lists the model providers and their keys (and picks up keys
+//! stored in another terminal); `/connect <provider>` (or `/connect <id> <base-url> [api]` for a
+//! custom endpoint) asks for the key. The key is read by the shell itself, not the editor: keys
+//! and pastes go to a hidden buffer ([`Shell::secret_key`], [`Shell::paste`]) that is never drawn,
+//! never added to the transcript, the editor's history or the session file. Enter hands it to the
+//! harness's [`ProviderConnect`], which checks it with the provider, stores it in the OS keychain
+//! and rebuilds the providers; the running harness takes them with `set_models`, so the chat uses
+//! the new key without a restart.
+//!
 //! Quitting ([`Shell::quit`]) never drops a worker's run report (D8): with workers live it cancels
 //! them, aborts the prompt and waits, bounded by [`Shell::quit_bound`], until each worker has
 //! stopped and its `amp_report_run` has returned. Without workers it waits [`ABORT_GRACE`] for the
@@ -91,7 +100,39 @@ enum ShellMsg {
         ticket: i64,
         result: Result<Value, String>,
     },
+    /// `/connect` finished; the new providers are already on the harness.
+    Connected {
+        result: Result<String, String>,
+        models: Option<Vec<ModelChoice>>,
+    },
     Server(Result<ServerSwitched, String>),
+}
+
+/// What `/connect` did: a message for the transcript (never a secret), and the providers and
+/// models the chat has now.
+pub struct ConnectReply {
+    pub text: String,
+    pub providers: Vec<Arc<dyn rpi_ai::Provider>>,
+    pub models: Vec<ModelChoice>,
+}
+
+pub type ConnectFuture = Pin<Box<dyn Future<Output = Result<ConnectReply, String>> + Send>>;
+
+/// The harness side of `/connect`: lists, checks and stores provider keys (amp-harness).
+pub trait ProviderConnect: Send + Sync {
+    /// `/connect`: the providers and where their keys come from (never a key). Also picks up
+    /// keys and providers added elsewhere since the chat started.
+    fn list(&self) -> ConnectFuture;
+    /// `/connect <args>`: checks the arguments and returns what to ask for ("OpenRouter API key").
+    fn prepare(&self, args: &str) -> Result<String, String>;
+    /// Checks `key` with the provider, stores it, and rebuilds the providers.
+    fn connect(&self, args: &str, key: String) -> ConnectFuture;
+}
+
+/// A key being typed for `/connect` (never drawn).
+struct SecretEntry {
+    args: String,
+    buf: String,
 }
 
 /// A finished `prompt_text` call (`Err` also covers a run task that panicked).
@@ -172,7 +213,7 @@ pub enum Submit {
 
 pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id|plan]\n\
 server: /server (list)  /server <name|address> (switch AMP server)\n\
-commands: /model [provider/model]  /usage  /help  /quit\n\
+commands: /model [provider/model]  /connect [provider]  /usage  /help  /quit\n\
 keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit";
 
 pub struct Shell {
@@ -197,6 +238,10 @@ pub struct Shell {
     footer_ticket: Option<i64>,
     /// The manager's worker supervisor, so quitting can cancel and wait for its workers.
     supervisor: Option<Arc<Supervisor>>,
+    /// `/connect`'s harness side, if the caller gave one.
+    connect: Option<Arc<dyn ProviderConnect>>,
+    /// A key being typed for `/connect`.
+    secret: Option<SecretEntry>,
     /// `/server` (#2164), if the caller gave one.
     server: Option<Arc<dyn ServerControl>>,
     /// A `/server` switch is running.
@@ -234,6 +279,8 @@ impl Shell {
                 marked: None,
                 footer_ticket: None,
                 supervisor: None,
+                connect: None,
+                secret: None,
                 server: None,
                 switching: false,
             },
@@ -256,6 +303,133 @@ impl Shell {
     /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
     pub fn set_supervisor(&mut self, supervisor: Option<Arc<Supervisor>>) {
         self.supervisor = supervisor;
+    }
+
+    /// Gives the shell `/connect` (amp-harness: keychain, provider checks, config).
+    pub fn set_connect(&mut self, connect: Arc<dyn ProviderConnect>) {
+        self.connect = Some(connect);
+    }
+
+    /// The models `/model` can switch to.
+    pub fn models(&self) -> &[ModelChoice] {
+        &self.models
+    }
+
+    /// Whether a `/connect` key is being typed (keys and pastes go to it, not the editor).
+    pub fn secret_active(&self) -> bool {
+        self.secret.is_some()
+    }
+
+    /// A key while a `/connect` key is being typed. Returns true when it was used. Enter sends
+    /// the key; Esc or Ctrl-C cancels; Backspace and Ctrl-U edit. Nothing is ever drawn.
+    pub fn secret_key(&mut self, key: &KeyEvent) -> bool {
+        let Some(entry) = self.secret.as_mut() else {
+            return false;
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Enter => {
+                let entry = self.secret.take().expect("checked above");
+                self.send_secret(entry);
+            }
+            KeyCode::Esc => self.cancel_secret(),
+            KeyCode::Char('c') | KeyCode::Char('d') if ctrl => self.cancel_secret(),
+            KeyCode::Char('u') if ctrl => entry.buf.clear(),
+            KeyCode::Backspace => {
+                entry.buf.pop();
+            }
+            KeyCode::Char(c) if !ctrl => entry.buf.push(c),
+            _ => {}
+        }
+        true
+    }
+
+    /// Pasted text: into the `/connect` key when one is being typed, else the editor.
+    pub fn paste(&mut self, text: &str) {
+        match self.secret.as_mut() {
+            Some(entry) => entry.buf.push_str(text.trim_end_matches(['\r', '\n'])),
+            None => self.view.editor().handle_paste(text),
+        }
+    }
+
+    fn cancel_secret(&mut self) {
+        if self.secret.take().is_some() {
+            self.view
+                .add_notice("/connect cancelled: nothing was stored");
+        }
+    }
+
+    fn send_secret(&mut self, entry: SecretEntry) {
+        let key = entry.buf.trim().to_owned();
+        if key.is_empty() {
+            self.view
+                .add_notice("/connect cancelled: no key was entered");
+            return;
+        }
+        let Some(connect) = self.connect.clone() else {
+            return;
+        };
+        self.view.add_notice("checking the key with the provider…");
+        let job = connect.connect(&entry.args, key);
+        self.spawn_connect(job);
+    }
+
+    /// Runs a `/connect` job; on success the harness takes the new providers before the result
+    /// is applied ([`Shell::poll`]).
+    fn spawn_connect(&mut self, job: ConnectFuture) {
+        let harness = Arc::clone(&self.harness);
+        let tx = self.msgs_tx.clone();
+        self.in_flight += 1;
+        tokio::spawn(async move {
+            let msg = match job.await {
+                Ok(reply) => match harness.set_models(reply.providers).await {
+                    Ok(()) => ShellMsg::Connected {
+                        result: Ok(reply.text),
+                        models: Some(reply.models),
+                    },
+                    Err(e) => ShellMsg::Connected {
+                        result: Err(format!("the chat could not take the new providers: {e}")),
+                        models: None,
+                    },
+                },
+                Err(e) => ShellMsg::Connected {
+                    result: Err(e),
+                    models: None,
+                },
+            };
+            let _ = tx.send(msg);
+        });
+    }
+
+    /// `/connect` lists the providers; `/connect <provider>` asks for its key (hidden).
+    fn connect_command(&mut self, arg: &str) {
+        let Some(connect) = self.connect.clone() else {
+            self.view.add_notice(
+                "/connect: not available here; run `amp-harness connect` in a terminal",
+            );
+            return;
+        };
+        if arg.is_empty() {
+            let job = connect.list();
+            self.spawn_connect(job);
+            return;
+        }
+        match connect.prepare(arg) {
+            Ok(prompt) => {
+                self.view.panel().close();
+                self.secret = Some(SecretEntry {
+                    args: arg.to_owned(),
+                    buf: String::new(),
+                });
+                self.view.add_notice(&format!(
+                    "{prompt}: paste or type it now and press Enter. It is not shown, and it is \
+                     never written to the transcript or the session file. Esc cancels."
+                ));
+            }
+            Err(e) => self
+                .view
+                .add_error(&format!("/connect: {}", crate::chrome::clean(&e))),
+        }
     }
 
     /// Gives the shell `/server` (#2164).
@@ -519,6 +693,7 @@ impl Shell {
             "usage" => self.view.add_notice(&self.usage_text()),
             "model" if arg.is_empty() => self.view.add_notice(&self.model_text()),
             "model" => self.switch_model(arg).await,
+            "connect" => self.connect_command(arg),
             "abort" => self.abort().await,
             "amp" => self.open_panel("amp", PanelKind::Amp),
             "workers" => self.open_panel("workers", PanelKind::Workers),
@@ -848,6 +1023,10 @@ impl Shell {
     /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
     /// `enter`, `esc`, `up`, `down`, or one character.
     pub fn press(&mut self, name: &str) -> Result<bool, String> {
+        if let Some(text) = name.strip_prefix("paste:") {
+            self.paste(text);
+            return Ok(true);
+        }
         let code = match name {
             "enter" => KeyCode::Enter,
             "esc" => KeyCode::Esc,
@@ -860,7 +1039,11 @@ impl Shell {
                 ));
             }
         };
-        Ok(self.panel_key(&KeyEvent::new(code, KeyModifiers::NONE), true))
+        let key = KeyEvent::new(code, KeyModifiers::NONE);
+        if self.secret_key(&key) {
+            return Ok(true);
+        }
+        Ok(self.panel_key(&key, true))
     }
 
     fn open_target(&mut self, target: &Target) {
@@ -917,6 +1100,17 @@ impl Shell {
                                 s.plan_blocked = blocked;
                             }
                         });
+                    }
+                }
+                ShellMsg::Connected { result, models } => {
+                    if let Some(models) = models {
+                        self.models = models;
+                    }
+                    match result {
+                        Ok(text) => self.view.add_notice(&text),
+                        Err(e) => self
+                            .view
+                            .add_error(&format!("/connect: {}", crate::chrome::clean(&e))),
                     }
                 }
                 ShellMsg::Server(result) => {

@@ -42,7 +42,7 @@ pub use http::{
 pub use keychain::{
     ENV_KEYCHAIN_PROMPTS, ENV_KEYCHAIN_TRACE, KEYCHAIN_REPAIR_HINT, KeychainError,
     KeychainErrorKind, keychain_delete, keychain_forget, keychain_get, keychain_prompts_allowed,
-    keychain_reads, keychain_set,
+    keychain_reads, keychain_set, repair_hint,
 };
 pub use protocol::{Era, ProtocolMode};
 pub use settings::{

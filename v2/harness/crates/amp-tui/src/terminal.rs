@@ -231,7 +231,9 @@ async fn event_loop(
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let editor = shell.view().editor().clone();
                         let editor_empty = editor.get_text().is_empty();
-                        if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor_empty) {
+                        if shell.secret_key(&key) {
+                            // A `/connect` key is being typed: it never reaches the editor.
+                        } else if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor_empty) {
                             if shell.is_running() {
                                 shell.abort().await;
                             } else if !editor.get_text().is_empty() {
@@ -249,7 +251,8 @@ async fn event_loop(
                         tui.request_render(false);
                     }
                     Event::Paste(text) => {
-                        shell.view().editor().handle_paste(&text);
+                        // Into the hidden `/connect` key when one is being typed.
+                        shell.paste(&text);
                         tui.request_render(false);
                     }
                     _ => {}

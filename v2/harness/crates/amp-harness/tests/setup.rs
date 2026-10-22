@@ -388,16 +388,20 @@ async fn the_chat_without_a_key_says_how_to_store_one() {
         .go()
         .await;
     assert_eq!(out.code, 1, "stdout: {}", out.stdout);
-    assert!(out.stderr.contains("amp-harness init"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("amp-harness connect openrouter"),
+        "{}",
+        out.stderr
+    );
     assert!(out.stderr.contains("OPENROUTER_API_KEY"), "{}", out.stderr);
 
-    // Without setup (no terminal, no script): the session error names init too.
+    // Without setup (no terminal, no script): the session error names connect too.
     let out = Run::new(&dir, &["--snapshot", "100x20", "--no-session"])
         .env("AMP_MCP_URL", amp.url.clone())
         .go()
         .await;
     assert_eq!(out.code, 1);
-    assert!(out.stderr.contains("amp-harness init"), "{}", out.stderr);
+    assert!(out.stderr.contains("amp-harness connect"), "{}", out.stderr);
 }
 
 /// Deletes the test keychain service's provider entry (macOS `security`, which never prompts for

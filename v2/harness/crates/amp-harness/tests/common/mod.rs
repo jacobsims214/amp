@@ -3,6 +3,8 @@
 //! with an isolated HOME, a file credential store and no AMP_* variables leaking in.
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+pub mod provider;
+
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},

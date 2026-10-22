@@ -100,6 +100,8 @@ pub struct ModelsSection {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSpec {
+    /// Display name (`amp-harness connect --list`, the chat). Default: the id.
+    pub name: Option<String>,
     /// `anthropic-messages`, `openai-completions` or `faux` (scripted, offline; tests and smoke).
     pub api: Option<String>,
     pub base_url: Option<String>,
@@ -109,6 +111,9 @@ pub struct ProviderSpec {
     pub auth: Option<String>,
     /// Extra HTTP headers on every request.
     pub headers: Option<BTreeMap<String, String>>,
+    /// Headers whose values are secrets: kept in the OS keychain (account
+    /// `provider:<id>:header:<name>`, written by `amp-harness connect`), never in a file.
+    pub secret_headers: Option<Vec<String>>,
     pub connect_timeout_secs: Option<u64>,
     /// Time to the first streamed event. 0 turns it off.
     pub header_timeout_secs: Option<u64>,
@@ -220,11 +225,13 @@ fn over_table(base: &mut Option<toml::Table>, top: Option<toml::Table>) {
 }
 
 fn merge_provider(base: &mut ProviderSpec, top: ProviderSpec) {
+    over(&mut base.name, top.name);
     over(&mut base.api, top.api);
     over(&mut base.base_url, top.base_url);
     over(&mut base.key_env, top.key_env);
     over(&mut base.auth, top.auth);
     over_map(&mut base.headers, top.headers);
+    over(&mut base.secret_headers, top.secret_headers);
     over(&mut base.connect_timeout_secs, top.connect_timeout_secs);
     over(&mut base.header_timeout_secs, top.header_timeout_secs);
     over(
@@ -305,7 +312,7 @@ pub enum ProviderApi {
 }
 
 impl ProviderApi {
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "anthropic-messages" | "anthropic" => Some(Self::AnthropicMessages),
             "openai-completions" | "openai-compatible" => Some(Self::OpenaiCompletions),
@@ -347,11 +354,17 @@ fn secs(value: Option<u64>) -> Option<Duration> {
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub id: String,
+    /// Display name, if the config gives one.
+    pub name: Option<String>,
     pub api: ProviderApi,
     pub base_url: String,
     pub key_env: Option<String>,
     /// False for `auth = "none"` and faux.
     pub needs_key: bool,
+    /// Provider-level headers (already merged into every model's headers).
+    pub headers: BTreeMap<String, String>,
+    /// Header names whose values come from the keychain (see [`ProviderSpec::secret_headers`]).
+    pub secret_headers: Vec<String>,
     pub timeouts: Timeouts,
     pub max_retries: Option<u32>,
     /// By model id; each `Model` has `provider = id`, the provider's base URL and headers.
@@ -724,10 +737,19 @@ fn build_provider(id: &str, spec: ProviderSpec) -> Result<ProviderConfig, Models
     }
     Ok(ProviderConfig {
         id: id.to_owned(),
+        name: spec.name.filter(|n| !n.trim().is_empty()),
         api,
         base_url,
         key_env: spec.key_env.filter(|s| !s.trim().is_empty()),
         needs_key,
+        headers,
+        secret_headers: spec
+            .secret_headers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect(),
         timeouts: Timeouts {
             connect: secs(spec.connect_timeout_secs),
             header: secs(spec.header_timeout_secs),
