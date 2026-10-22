@@ -95,7 +95,15 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
         .iter()
         .map(|t| t.as_str().unwrap())
         .collect();
-    for name in ["amp_whoami", "amp_get_task", "amp_kb_write", "read", "bash"] {
+    // M2-5: the manager gets the native dispatch tool.
+    for name in [
+        "amp_whoami",
+        "amp_get_task",
+        "amp_kb_write",
+        "read",
+        "bash",
+        "amp_run_ticket",
+    ] {
         assert!(tools.contains(&name), "{name} missing from {tools:?}");
     }
     // The manager never gets edit/write (its policy denies them outright), and no tool is

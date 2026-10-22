@@ -1,6 +1,11 @@
 //! Building one agent session the way every interactive or headless command does (M2-4, M2-7):
 //! resolve the working directory and `.amp.json`, connect to AMP, load the [`Runtime`], and
 //! build the role's harness with a [`ChannelEmitter`] so the caller sees its events.
+//!
+//! A primary role (the manager) also gets a worker [`Supervisor`] and its `amp_run_ticket` tool
+//! (D7, M2-5), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
+//! `AMP_HARNESS_WORKER_TIMEOUT_SECS` / `AMP_HARNESS_WORKER_MAX_TURNS`. Aborting the manager's run
+//! cancels the workers its tool calls started; [`Supervisor::cancel_all`] cancels every worker.
 
 use std::{
     path::{Path, PathBuf},
@@ -12,6 +17,7 @@ use amp_core::{
     events::ChannelEmitter,
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::SystemKeys,
+    supervisor::{ManagerContext, Supervisor, SupervisorConfig},
 };
 use rpi_agent::AgentEvent;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -29,11 +35,13 @@ pub struct SessionRequest<'a> {
 }
 
 pub struct Session {
-    pub rt: Runtime,
+    pub rt: Arc<Runtime>,
     pub agent: BuiltAgent,
     pub events: UnboundedReceiver<AgentEvent>,
     pub project: Option<ProjectMarker>,
     pub cwd: PathBuf,
+    /// The manager's worker supervisor (`None` for a worker role).
+    pub supervisor: Option<Arc<Supervisor>>,
 }
 
 pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
@@ -57,30 +65,46 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     let client = Arc::new(conn::connect(&settings).await?);
     let env = |k: &str| std::env::var(k).ok();
     let keys = SystemKeys::from_env();
-    let rt = Runtime::load(
-        Arc::clone(&client),
-        RuntimeOptions {
-            repo_root,
-            models: None,
-            keys: &keys,
-            env: &env,
-            state_dir: None,
-        },
-    )
-    .map_err(|e| CliError::new(e.to_string()))?;
+    let rt = Arc::new(
+        Runtime::load(
+            Arc::clone(&client),
+            RuntimeOptions {
+                repo_root,
+                models: None,
+                keys: &keys,
+                env: &env,
+                state_dir: None,
+            },
+        )
+        .map_err(|e| CliError::new(e.to_string()))?,
+    );
 
     let role_name = req
         .role
         .map(str::to_owned)
         .unwrap_or_else(|| rt.roles.manager().id.clone());
-    let role_id = rt
+    let role = rt
         .role(&role_name)
-        .map_err(|e| CliError::usage(e.to_string()))?
-        .id
-        .clone();
+        .map_err(|e| CliError::usage(e.to_string()))?;
+    let role_id = role.id.clone();
+    let supervisor = if role.primary {
+        let config = SupervisorConfig::load(&env, None).map_err(CliError::new)?;
+        Some(Supervisor::new(
+            Arc::clone(&rt),
+            ManagerContext {
+                role: role_id.clone(),
+                cwd: cwd.clone(),
+                project: project.clone(),
+            },
+            config,
+        ))
+    } else {
+        None
+    };
     let (emitter, events) = ChannelEmitter::new();
     let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());
     spec.project = project.clone();
+    spec.extra_tools = supervisor.iter().map(|s| s.tool()).collect();
     spec.emitter = Some(emitter.into_emitter());
     spec.session = if req.memory {
         SessionKind::Memory
@@ -99,5 +123,6 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         events,
         project,
         cwd,
+        supervisor,
     })
 }

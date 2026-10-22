@@ -24,7 +24,8 @@ include_dir.workspace = true
 yaml_serde.workspace = true
 async-trait.workspace = true
 keyring.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+# process: `git worktree` for workers (supervisor).
+tokio = { workspace = true, features = ["rt", "time", "process"] }
 tokio-util.workspace = true
 toml.workspace = true
 

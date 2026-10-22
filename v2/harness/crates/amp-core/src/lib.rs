@@ -31,6 +31,12 @@
 //! - [`events`]: rpi agent events as `run --json` events, the channel emitter and usage totals.
 //! - [`faux`]: faux-provider scripts from a JSON file (`AMP_HARNESS_FAUX_SCRIPT`).
 //!
+//! M2-5 (#2096):
+//! - [`supervisor`]: the worker supervisor behind the manager's `amp_run_ticket` (D7): dispatch in
+//!   AMP, a git worktree per ticket, an independent harness per worker on its own model, a cap on
+//!   parallel workers, a wall-clock timeout, a turn budget and cancellation, ending in a
+//!   [`supervisor::WorkerReport`] with a [`supervisor::WorkerOutcome`].
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -43,5 +49,6 @@ pub mod policy;
 pub mod project;
 pub mod providers;
 pub mod roles;
+pub mod supervisor;
 pub mod tickets;
 pub mod tools;

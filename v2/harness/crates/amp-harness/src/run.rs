@@ -14,6 +14,9 @@
 //! - `--print-system-prompt` builds the session and prints the system prompt as the model would
 //!   receive it, without calling a model.
 //!
+//! The manager gets `amp_run_ticket` (M2-5, see [`crate::session`]); Ctrl-C aborts the manager
+//! and cancels its workers.
+//!
 //! The faux provider (`api = "faux"` in config.toml) plus `AMP_HARNESS_FAUX_SCRIPT` runs it
 //! offline and deterministically.
 
@@ -169,6 +172,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         agent,
         events: mut rx,
         project,
+        supervisor,
         ..
     } = session::build(session::SessionRequest {
         conn: &args.conn,
@@ -212,6 +216,9 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             _ = tokio::signal::ctrl_c(), if !aborted_by_user => {
                 aborted_by_user = true;
                 eprintln!("amp-harness: aborting the run (Ctrl-C)");
+                if let Some(sup) = &supervisor {
+                    sup.cancel_all();
+                }
                 let _ = harness.abort().await;
             }
             r = &mut run => break r,
