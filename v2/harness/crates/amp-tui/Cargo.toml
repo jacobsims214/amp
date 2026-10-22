@@ -22,6 +22,11 @@ serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "signal"] }
 
+# select(2) on the tty for the OSC 11 background query (#2155): poll(2) is POLLNVAL on macOS
+# /dev/tty. "term" is for openpty in its pty tests.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["poll", "term"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

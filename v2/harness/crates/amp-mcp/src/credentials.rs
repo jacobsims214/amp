@@ -30,6 +30,19 @@ use crate::McpError;
 
 /// The keychain service every real login is stored under.
 pub const KEYCHAIN_SERVICE: &str = "amp-harness";
+/// Test hook: store everything under this keychain service instead of [`KEYCHAIN_SERVICE`], so a
+/// test can use the real keychain without touching the user's entries.
+pub const ENV_KEYCHAIN_SERVICE: &str = "AMP_HARNESS_KEYCHAIN_SERVICE";
+
+/// The keychain service in use: `AMP_HARNESS_KEYCHAIN_SERVICE` (tests), else [`KEYCHAIN_SERVICE`].
+pub fn keychain_service() -> String {
+    std::env::var(ENV_KEYCHAIN_SERVICE)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| KEYCHAIN_SERVICE.to_owned())
+}
+
 /// Picks the backend: `keychain`, `file` or `auto` (default).
 pub const ENV_CREDENTIAL_STORE: &str = "AMP_CREDENTIAL_STORE";
 /// The file fallback's name inside the `amp-harness` config dir.
@@ -75,8 +88,9 @@ impl CredentialBackend {
 
     /// Resolves against the real environment and keychain.
     pub fn resolve() -> Result<Self, McpError> {
-        Self::resolve_with(&|key| std::env::var(key).ok(), &|| {
-            keychain_available(KEYCHAIN_SERVICE)
+        let service = keychain_service();
+        Self::resolve_with_service(&|key| std::env::var(key).ok(), &service, &|| {
+            keychain_available(&service)
         })
     }
 
@@ -84,6 +98,15 @@ impl CredentialBackend {
     /// keychain works; `auto` falls back to the file when it doesn't.
     pub fn resolve_with(
         env: &dyn Fn(&str) -> Option<String>,
+        keychain_check: &dyn Fn() -> Result<(), String>,
+    ) -> Result<Self, McpError> {
+        Self::resolve_with_service(env, KEYCHAIN_SERVICE, keychain_check)
+    }
+
+    /// [`Self::resolve_with`] with the keychain service to use.
+    pub fn resolve_with_service(
+        env: &dyn Fn(&str) -> Option<String>,
+        service: &str,
         keychain_check: &dyn Fn() -> Result<(), String>,
     ) -> Result<Self, McpError> {
         let file = || {
@@ -98,10 +121,10 @@ impl CredentialBackend {
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| "auto".to_owned());
         match choice.as_str() {
-            "keychain" => Ok(Self::keychain(KEYCHAIN_SERVICE)),
+            "keychain" => Ok(Self::keychain(service)),
             "file" => file(),
             "auto" => match keychain_check() {
-                Ok(()) => Ok(Self::keychain(KEYCHAIN_SERVICE)),
+                Ok(()) => Ok(Self::keychain(service)),
                 Err(reason) => {
                     tracing::debug!(%reason, "no usable keychain; using the credentials file");
                     file()

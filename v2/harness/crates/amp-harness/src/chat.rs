@@ -38,13 +38,13 @@ use clap::Args;
 
 use crate::{
     conn::{CliError, ConnArgs},
-    session,
+    session, setup,
 };
 
 /// How long `--snapshot` waits for one prompt's run.
 const SNAPSHOT_RUN_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long `--theme auto` waits for the terminal to report its background colour.
-const BACKGROUND_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long `--theme auto` waits for the terminal to start answering its background query (#2155).
+const BACKGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Args, Debug, Default)]
 pub struct ChatArgs {
@@ -64,6 +64,9 @@ pub struct ChatArgs {
     /// (default: AMP_HARNESS_THEME, then config.toml [tui] theme, then auto).
     #[arg(long, value_name = "auto|dark|light|FILE")]
     theme: Option<String>,
+    /// Skip the first-run questions (server, login, project, provider key) and start the chat as is.
+    #[arg(long)]
+    no_setup: bool,
     /// Debug: no terminal; submit each --input, then print the screen at COLSxROWS as text.
     #[arg(long, hide = true, value_name = "COLSxROWS", value_parser = parse_size)]
     snapshot: Option<(usize, usize)>,
@@ -147,6 +150,15 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let theme = load_theme(&args)?;
     amp_tui::install_theme(&theme);
 
+    // First run (D12): ask for whatever is missing before connecting for real. In --snapshot only
+    // with scripted answers (AMP_HARNESS_PROMPTS=stdin), so render checks never stop on a question.
+    let scripted = std::env::var(setup::ui::ENV_PROMPTS).is_ok_and(|v| v.trim() == "stdin");
+    let outcome = if !args.no_setup && (args.snapshot.is_none() || scripted) {
+        setup::first_run(&args.conn, args.cwd.as_deref()).await?
+    } else {
+        None
+    };
+
     let session = session::build(session::SessionRequest {
         conn: &args.conn,
         role: args.role.as_deref(),
@@ -157,6 +169,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let info = shell_info(&session);
     let models = model_choices(&session.rt);
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    // A suggested first prompt (new project: seed the KB; new user: the AMP guide). Nothing is
+    // sent until the person presses Enter.
+    if let Some(text) = outcome.and_then(|o| o.prefill) {
+        shell.view().editor().set_text(&text);
+    }
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);

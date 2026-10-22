@@ -7,7 +7,7 @@
 //! - M2-7: no subcommand opens the chat TUI with the manager (`amp_tui`).
 //! - M3-3: hidden `debug render-chrome` prints the chat's AMP header and status line.
 //!
-//! Later milestones add init.
+//! - M4-1: `init` and the first run of the chat (server, login, project, provider key).
 
 mod chat;
 mod config_cmd;
@@ -17,6 +17,7 @@ mod doctor;
 mod mcp_cmd;
 mod run;
 mod session;
+mod setup;
 mod tickets;
 mod whoami;
 
@@ -85,6 +86,9 @@ enum Command {
     /// Providers, models and the model each role runs on.
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+    /// Set up this machine and folder: AMP server, login, project (.amp.json), provider key.
+    /// Asks for whatever the flags leave open when run in a terminal; `--yes` never asks.
+    Init(setup::InitArgs),
     /// Debug: call AMP tools directly.
     #[command(subcommand, hide = true)]
     Mcp(mcp_cmd::McpCommand),
@@ -149,6 +153,7 @@ async fn main() -> ExitCode {
         Some(Command::Tickets(command)) => tickets::run(command).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
+        Some(Command::Init(args)) => setup::init(args).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
         Some(Command::Debug(command)) => debug::run(command).await,
         None => chat::run(cli.chat).await,
@@ -166,25 +171,11 @@ async fn main() -> ExitCode {
 
 async fn login(args: LoginArgs) -> Result<(), McpError> {
     let settings = args.server.settings()?;
-    let backend = CredentialBackend::resolve()?;
-    let options = LoginOptions::new(settings.url.clone(), backend)
-        .with_ca_file(settings.ca_file.clone())
-        .with_timeout(Duration::from_secs(args.timeout));
-    eprintln!("Logging in to {} ...", settings.url);
-    let no_browser = args.no_browser;
-    let outcome = oauth::login(options, |prompt: &LoginPrompt| {
-        eprintln!(
-            "Waiting for the browser on {} (Ctrl-C to cancel).",
-            prompt.redirect_uri
-        );
-        let opened = !no_browser && oauth::open_browser(&prompt.authorization_url).is_ok();
-        if opened {
-            eprintln!("Opened your browser. If nothing happened, open this URL:");
-        } else {
-            eprintln!("Open this URL in a browser to log in:");
-        }
-        eprintln!("\n  {}\n", prompt.authorization_url);
-    })
+    let outcome = browser_login(
+        &settings,
+        args.no_browser,
+        Duration::from_secs(args.timeout),
+    )
     .await?;
 
     println!("Logged in to {}", outcome.key);
@@ -205,6 +196,34 @@ async fn login(args: LoginArgs) -> Result<(), McpError> {
         eprintln!("note: {env} is set and takes precedence over this login until it is unset.");
     }
     Ok(())
+}
+
+/// The browser OAuth login (D3) for `settings.url`, with the waiting messages on stderr. Used by
+/// `login`, the first run and `init`.
+pub(crate) async fn browser_login(
+    settings: &Settings,
+    no_browser: bool,
+    timeout: Duration,
+) -> Result<oauth::LoginOutcome, McpError> {
+    let backend = CredentialBackend::resolve()?;
+    let options = LoginOptions::new(settings.url.clone(), backend)
+        .with_ca_file(settings.ca_file.clone())
+        .with_timeout(timeout);
+    eprintln!("Logging in to {} ...", settings.url);
+    oauth::login(options, |prompt: &LoginPrompt| {
+        eprintln!(
+            "Waiting for the browser on {} (Ctrl-C to cancel).",
+            prompt.redirect_uri
+        );
+        let opened = !no_browser && oauth::open_browser(&prompt.authorization_url).is_ok();
+        if opened {
+            eprintln!("Opened your browser. If nothing happened, open this URL:");
+        } else {
+            eprintln!("Open this URL in a browser to log in:");
+        }
+        eprintln!("\n  {}\n", prompt.authorization_url);
+    })
+    .await
 }
 
 async fn logout(args: ServerArgs) -> Result<(), McpError> {

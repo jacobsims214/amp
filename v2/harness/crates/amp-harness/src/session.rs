@@ -134,10 +134,17 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
             dir: rt.state_dir.join("sessions").join(&role_id),
         }
     };
-    let agent = rt
-        .build(spec)
-        .await
-        .map_err(|e| CliError::new(e.to_string()))?;
+    let agent = rt.build(spec).await.map_err(|e| {
+        let text = e.to_string();
+        if text.contains("no key") {
+            // The first run asks for a key in a terminal; say how to get there from here.
+            CliError::new(format!(
+                "{text}\nStore a key with `amp-harness init` (it asks, hidden, and keeps it in the OS keychain)."
+            ))
+        } else {
+            CliError::new(text)
+        }
+    })?;
     Ok(Session {
         rt,
         agent,

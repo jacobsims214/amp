@@ -283,16 +283,11 @@ fn key_fix(provider: &str, source: &KeySource, where_: &str) -> String {
             env: Some(var),
             keychain_checked: true,
         } => {
-            let keychain = if cfg!(target_os = "macos") {
-                format!(
-                    ", or keep it in the keychain: security add-generic-password -s {} -a {} -w",
-                    amp_mcp::KEYCHAIN_SERVICE,
-                    amp_core::providers::keychain_account(provider)
-                )
-            } else {
-                String::new()
-            };
-            format!("export {var}=<your {provider} key>{keychain}")
+            // #2113: init asks for the key hidden and keeps it in the keychain.
+            format!(
+                "export {var}=<your {provider} key>, or run `amp-harness init` to store it in the \
+                 keychain (asked hidden)"
+            )
         }
         KeySource::Missing {
             env: Some(var),

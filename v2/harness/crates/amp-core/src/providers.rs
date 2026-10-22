@@ -140,7 +140,7 @@ impl SystemKeys {
             .map(|v| v.trim().eq_ignore_ascii_case("file"))
             .unwrap_or(false);
         Self {
-            keychain_service: (!file_only).then(|| amp_mcp::KEYCHAIN_SERVICE.to_owned()),
+            keychain_service: (!file_only).then(amp_mcp::keychain_service),
         }
     }
 

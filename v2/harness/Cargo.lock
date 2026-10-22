@@ -95,6 +95,8 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "crossterm",
+ "keyring",
  "rcgen",
  "rmcp",
  "rpi-agent",
@@ -106,6 +108,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tokio-util",
+ "toml",
  "x509-parser",
 ]
 
@@ -139,6 +142,7 @@ dependencies = [
  "amp-core",
  "amp-mcp",
  "crossterm",
+ "nix",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",
