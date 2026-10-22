@@ -126,7 +126,11 @@ export function FlightPlan() {
   const runCheck = () => { setChecking(true); check() }
   const approval = usePlanApproval(pid)
   const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
-  const approve = async () => { if (await approval.approve()) check() }
+  const approve = async (asOf?: string) => {
+    const r = await approval.approve(asOf)
+    if (r.changed) refresh()
+    if (r.ok || r.changed) check()
+  }
   // The link agents are given lands here; bring the approval into view once it's drawn.
   const approvalShown = !!approval.project && !(loading && !tasks.length)
   useEffect(() => {
@@ -196,7 +200,7 @@ export function FlightPlan() {
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         <PlanApprovalBanner projectId={pid} project={approval.project} awaiting={awaiting} people={people}
-          onApprove={approve} approving={approval.approving} error={approval.error} onOpen={setOpenId} />
+          onApprove={approve} approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setOpenId} />
         <Readouts items={[
           { label: 'Tickets', value: tasks.length, sub: `${openCount} open` },
           { label: 'Epics · stories', value: <>{epics.length}<span className="text-[14px] text-ink-3"> · {stories.length}</span></>, sub: 'in this plan' },

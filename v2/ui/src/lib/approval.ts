@@ -7,9 +7,51 @@
  */
 import type { Project, Task } from '../types'
 
-/** When a ticket was last planned: planned_at (#2167), or created_at on an older server. */
+/** Go's zero time ("0001-01-01T00:00:00Z"): what an unset time.Time encodes as. Not a real plan time. */
+export function isZeroTime(iso: string | null | undefined): boolean {
+  return !iso || iso.startsWith('0001-01-01')
+}
+
+/** When a ticket was last planned: planned_at (#2167), or created_at on an older server (or a zero planned_at). */
 export function plannedAt(t: Pick<Task, 'created_at'> & { planned_at?: string }): string {
-  return t.planned_at || t.created_at
+  return t.planned_at && !isZeroTime(t.planned_at) ? t.planned_at : t.created_at
+}
+
+/**
+ * An RFC 3339 time as [whole seconds since the epoch, nanoseconds], so two
+ * times compare exactly. The server sends microseconds; Date.parse keeps only
+ * milliseconds, which would make two different plan times look equal.
+ */
+function instant(iso: string): [number, number] | null {
+  const m = /^(.*T\d{2}:\d{2}:\d{2})(?:[.,](\d+))?(Z|[+-]\d{2}:?\d{2})$/i.exec(iso.trim())
+  if (m) {
+    const ms = Date.parse(m[1] + m[3])
+    if (!Number.isNaN(ms)) return [Math.floor(ms / 1000), Number((m[2] ?? '').padEnd(9, '0').slice(0, 9))]
+  }
+  const ms = Date.parse(iso)
+  return Number.isNaN(ms) ? null : [Math.floor(ms / 1000), (((ms % 1000) + 1000) % 1000) * 1e6]
+}
+
+/** Negative, zero or positive as a is before, at or after b, to the nanosecond. Unparseable times sort first. */
+export function compareInstants(a: string, b: string): number {
+  const x = instant(a), y = instant(b)
+  if (!x || !y) return (x ? 1 : 0) - (y ? 1 : 0)
+  return x[0] - y[0] || x[1] - y[1]
+}
+
+/**
+ * The newest plan time among the tickets the person was shown, exactly as the
+ * API sent it: the as_of an approval covers (#2192). Never round-trip it
+ * through Date, which would drop the microseconds and leave that newest ticket
+ * still waiting. Undefined when nothing is shown.
+ */
+export function newestPlannedAt(tasks: Array<Pick<Task, 'created_at'> & { planned_at?: string }>): string | undefined {
+  let newest: string | undefined
+  for (const t of tasks) {
+    const at = plannedAt(t)
+    if (at && (newest === undefined || compareInstants(at, newest) > 0)) newest = at
+  }
+  return newest
 }
 
 /**
@@ -19,11 +61,16 @@ export function plannedAt(t: Pick<Task, 'created_at'> & { planned_at?: string })
  */
 export function awaitingApproval(tasks: Task[], project: Pick<Project, 'plan_approved_at'> | null | undefined): Task[] {
   if (!project) return []
-  const approved = project.plan_approved_at ? Date.parse(project.plan_approved_at) : null
+  const approved = project.plan_approved_at && !isZeroTime(project.plan_approved_at) ? project.plan_approved_at : null
   return tasks
     .filter(t => t.state !== 'completed')
-    .filter(t => approved == null || Date.parse(plannedAt(t)) > approved)
-    .sort((a, b) => Date.parse(plannedAt(a)) - Date.parse(plannedAt(b)) || a.id - b.id)
+    .filter(t => approved == null || compareInstants(plannedAt(t), approved) > 0)
+    .sort((a, b) => compareInstants(plannedAt(a), plannedAt(b)) || a.id - b.id)
+}
+
+/** What the person hears when their approval didn't cover everything: tickets came in after the page loaded. */
+export function changedSinceNotice(n: number): string {
+  return `Your approval covered the tickets you saw. ${n} ticket${n === 1 ? ' was' : 's were'} added or changed since this page loaded, so ${n === 1 ? 'it still waits' : 'they still wait'} for your approval. The list is refreshed: review ${n === 1 ? 'it' : 'them'} and approve again.`
 }
 
 /** The marker the server appends when a manager passes on its person's answer over MCP. */

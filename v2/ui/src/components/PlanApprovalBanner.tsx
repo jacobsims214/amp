@@ -8,7 +8,7 @@
  */
 import { Link } from 'react-router-dom'
 import { ArrowRight, Bot, Check, Loader2, ShieldCheck, UserRound } from 'lucide-react'
-import { ago, formatWhen, planPath, plannedAt } from '../lib/approval'
+import { ago, formatWhen, newestPlannedAt, planPath, plannedAt } from '../lib/approval'
 import { lookupPerson, type Person } from '../lib/people'
 import type { Project, Task } from '../types'
 
@@ -18,13 +18,17 @@ export interface PlanApprovalBannerProps {
   /** open tickets planned since the last approval (awaitingApproval) */
   awaiting: Task[]
   people: Map<number, Person>
-  onApprove: () => void
+  /** asOf: the newest planned_at among the tickets this banner shows, verbatim (#2192) */
+  onApprove: (asOf: string | undefined) => void
   approving: boolean
   error: string | null
+  /** the approval covered less than what waits now (tickets came in after the page loaded) */
+  notice?: string | null
   /** open a ticket (the drawer); without it ticket ids link to the board */
   onOpen?: (id: number) => void
   /** full: Flight plan (every ticket, and a quiet "approved" line when nothing waits).
-   *  compact: the board (a few tickets, a link to the Flight plan, nothing when nothing waits). */
+   *  compact: the board (a few tickets, a link to the Flight plan, nothing when nothing waits).
+   *  Compact offers Approve only when it lists every waiting ticket: a person approves what they've seen. */
   variant?: 'full' | 'compact'
   /** for tests: what "now" is */
   now?: number
@@ -45,7 +49,7 @@ export function LastApproved({ project, people }: { project: Project; people: Ma
   return <>Last approved <span className="amp-num">{when}</span>{who ? <> by <span className="text-ink">{who}</span></> : null}.</>
 }
 
-export function PlanApprovalBanner({ projectId, project, awaiting, people, onApprove, approving, error, onOpen, variant = 'full', now }: PlanApprovalBannerProps) {
+export function PlanApprovalBanner({ projectId, project, awaiting, people, onApprove, approving, error, notice, onOpen, variant = 'full', now }: PlanApprovalBannerProps) {
   if (!project) return null
   const compact = variant === 'compact'
   const required = project.require_plan_approval !== false
@@ -64,6 +68,10 @@ export function PlanApprovalBanner({ projectId, project, awaiting, people, onApp
 
   const n = awaiting.length
   const rows = compact ? awaiting.slice(0, COMPACT_ROWS) : awaiting
+  // Approving covers exactly the tickets shown here (as_of = the newest of them),
+  // so the board's short list can't approve tickets it doesn't show.
+  const canApprove = rows.length === n
+  const asOf = newestPlannedAt(rows)
   const ticketLink = (id: number) => `/project/${projectId}/board?task=${id}`
   return (
     <section id="approve" aria-label="Plan approval" className="amp-panel"
@@ -83,12 +91,17 @@ export function PlanApprovalBanner({ projectId, project, awaiting, people, onApp
         </div>
         <div className="flex items-center gap-2 flex-wrap">
           {compact && (
-            <Link to={`${planPath(projectId)}#approve`} className="amp-btn amp-btn-sm">Review in Flight plan<ArrowRight size={12} /></Link>
+            <Link to={`${planPath(projectId)}#approve`} className={canApprove ? 'amp-btn amp-btn-sm' : 'amp-btn amp-btn-accent'}>
+              Review{canApprove ? '' : ` all ${n}`} in Flight plan<ArrowRight size={12} />
+            </Link>
           )}
-          <button type="button" className="amp-btn amp-btn-accent" disabled={approving} onClick={onApprove}>
-            {approving ? <Loader2 size={12} className="animate-spin" /> : <Check size={13} />}Approve plan
-          </button>
+          {canApprove && (
+            <button type="button" className="amp-btn amp-btn-accent" disabled={approving} onClick={() => onApprove(asOf)}>
+              {approving ? <Loader2 size={12} className="animate-spin" /> : <Check size={13} />}Approve plan
+            </button>
+          )}
         </div>
+        {notice && <p role="status" className="m-0 w-full text-[12.5px] text-warning-ink">{notice}</p>}
         {error && <p role="alert" className="m-0 w-full text-[12.5px] text-danger-ink">{error}</p>}
       </div>
 
@@ -116,7 +129,7 @@ export function PlanApprovalBanner({ projectId, project, awaiting, people, onApp
         })}
         {compact && n > COMPACT_ROWS && (
           <li className="px-4 py-2 text-[12px] text-ink-3">
-            and {n - COMPACT_ROWS} more · <Link to={`${planPath(projectId)}#approve`} className="text-ink underline underline-offset-2">see them all in Flight plan</Link>
+            and {n - COMPACT_ROWS} more · <Link to={`${planPath(projectId)}#approve`} className="text-ink underline underline-offset-2">see them all and approve in Flight plan</Link>
           </li>
         )}
       </ul>
