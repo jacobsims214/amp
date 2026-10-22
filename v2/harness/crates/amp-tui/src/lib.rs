@@ -15,15 +15,22 @@
 //!   borders) + [`theme::AmpPalette`] (ticket states, epic colours, brand bands); `amp-dark` and
 //!   `amp-light` embedded, truecolor or 256 colours, dark/light from config or OSC 11.
 //!
-//! M3 hooks: [`view::ChatView::header_slot`] and [`view::ChatView::amp_status_slot`] are empty
-//! containers for the AMP header and status line. [`install_theme`] installs the AMP theme; call
-//! it before the shell is built. Components read [`theme::palette`] for AMP colours.
+//! - [`chrome`]: the AMP header (brand bands, instance/user, org › project, MCP health; the current
+//!   ticket) and the AMP status line (questions, workers, plan approval, board counts, run
+//!   reported), M3-3 #2106. They sit in [`view::ChatView::header_slot`] and
+//!   [`view::ChatView::amp_status_slot`] and show [`view::ChatView::chrome`]'s inputs (the
+//!   metadata poller's snapshot); without a metadata source they render nothing.
+//!
+//! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
+//! [`theme::palette`] for AMP colours.
 
+pub mod chrome;
 pub mod shell;
 pub mod terminal;
 pub mod theme;
 pub mod view;
 
+pub use chrome::{Chrome, ChromeData, ReportState};
 pub use shell::{HELP, ModelChoice, RunDone, Shell, ShellInfo, Submit};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use view::{ChatView, FooterInfo};

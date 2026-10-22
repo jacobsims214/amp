@@ -174,6 +174,8 @@ async fn event_loop(
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut signals = Signals::new();
+    // The AMP header and status line repaint when the metadata, workers or reports change.
+    let mut chrome_seen = shell.view().chrome().fingerprint();
     loop {
         tokio::select! {
             Some(event) = events.recv() => {
@@ -238,7 +240,10 @@ async fn event_loop(
             _ = ticker.tick() => {
                 tui.ensure_size();
                 let retrying = shell.view().tick();
-                if shell.is_running() || retrying {
+                let chrome = shell.view().chrome().fingerprint();
+                let chrome_changed = chrome != chrome_seen;
+                chrome_seen = chrome;
+                if shell.is_running() || retrying || chrome_changed {
                     tui.request_render(false);
                 }
             }

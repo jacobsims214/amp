@@ -134,7 +134,9 @@ impl Shell {
 
     /// Attaches the AMP metadata poller: from now on every `amp_*` tool call that ends without
     /// error refreshes what it touched ([`MetaHandle::observe`]).
+    /// The header and status line show its snapshot.
     pub fn set_meta(&mut self, meta: MetaHandle) {
+        self.view.chrome().set_meta(meta.clone());
         self.meta = Some(meta);
     }
 

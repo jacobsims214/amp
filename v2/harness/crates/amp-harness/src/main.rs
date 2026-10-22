@@ -5,12 +5,14 @@
 //! - M2-3: `config show` (providers and the provider/model each role resolves to).
 //! - M2-4: `run -p "..." [--json]`: a headless agent run (the manager by default).
 //! - M2-7: no subcommand opens the chat TUI with the manager (`amp_tui`).
+//! - M3-3: hidden `debug render-chrome` prints the chat's AMP header and status line.
 //!
 //! Later milestones add init.
 
 mod chat;
 mod config_cmd;
 mod conn;
+mod debug;
 mod doctor;
 mod mcp_cmd;
 mod run;
@@ -82,6 +84,9 @@ enum Command {
     /// Debug: call AMP tools directly.
     #[command(subcommand, hide = true)]
     Mcp(mcp_cmd::McpCommand),
+    /// Debug: render checks (`render-chrome`).
+    #[command(subcommand, hide = true)]
+    Debug(debug::DebugCommand),
 }
 
 #[derive(Args)]
@@ -141,6 +146,7 @@ async fn main() -> ExitCode {
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
+        Some(Command::Debug(command)) => debug::run(command).await,
         None => chat::run(cli.chat).await,
     };
     match result {

@@ -294,7 +294,32 @@ with square borders and AMP's ticket-state, epic and brand colours.
 - `color`: `auto` uses 24-bit colour when `COLORTERM` is `truecolor`/`24bit`, else the 256-colour
   fallbacks. `truecolor` or `256` forces one.
 
-The header, status line and AMP slash commands come in M3.
+### Header and status line (M3-3)
+
+Above the transcript, a two-line AMP header; between the editor and pi's footer, one AMP status
+line. The harness fetches what they show on its own AMP connection (the metadata poller), never
+through the model.
+
+```text
+▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2        ● connected 2026-07-28
+■ In progress #2106 M3-3 Header and AMP status line              ▌ AMP Harness › M3 theme + metadata
+■  2 QUESTIONS  │ workers 3 ■ running · 1 queued │ plan: 2 awaiting approval │ ■ 3 In progress · □ 5 Ready   unreported #2106
+```
+
+- Line 1: the AMP host, you, `org › project` (a link to the project in the web UI) and the MCP
+  connection (green connected, amber connecting/slow/degraded, red disconnected/re-login needed).
+- Line 2, while a ticket is current: its state in the web UI's words and colours, `#id` (a link
+  to the board with the ticket open), its name and `Epic › Story` in the epic's colour.
+- Status line: tickets waiting on a person's answer, workers (here and elsewhere), plan approval,
+  the board counts, the ticket's artifacts in review, and whether this session reported its run.
+  When the terminal is narrow, the board counts go first.
+
+Links are OSC 8 hyperlinks (Cmd/Ctrl-click in most terminals). Text from AMP is shown with control
+characters removed. `amp-harness debug render-chrome --width 100 [--theme dark|light] [--color
+truecolor|256] [--plain] [--live [--ticket ID]]` prints the header and status line alone, from a
+built-in sample or (`--live`) from AMP, for screenshots and render checks.
+
+AMP slash commands come in M3-4.
 
 ## Roles, agents and skills (D5, D6)
 
