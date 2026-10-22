@@ -246,6 +246,26 @@ pub const ESC_HINT: &str = "Esc again to stop the reply";
 /// How long [`ESC_HINT`] stays next to the spinner.
 pub const ESC_HINT_FOR: Duration = Duration::from_secs(2);
 
+/// What the empty editor says after a first Ctrl+C there: a second one within
+/// [`QUIT_HINT_FOR`] quits (#2184).
+pub const QUIT_HINT: &str = "Press Ctrl+C again to quit";
+
+/// How long a second Ctrl+C on the empty editor still quits.
+pub const QUIT_HINT_FOR: Duration = Duration::from_millis(1500);
+
+/// What Ctrl+C did ([`Shell::ctrl_c`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlC {
+    /// A run was going: it was asked to stop.
+    Stopped,
+    /// The editor had text: it was cleared.
+    Cleared,
+    /// The editor was empty: it now says [`QUIT_HINT`] for [`QUIT_HINT_FOR`].
+    Hint,
+    /// A second Ctrl+C on the empty editor within [`QUIT_HINT_FOR`]: quit.
+    Quit,
+}
+
 /// The spinner's own message while a run is going.
 const WORKING: &str = "Working…";
 
@@ -288,6 +308,8 @@ pub struct Shell {
     switching: bool,
     /// Until when the spinner line shows [`ESC_HINT`].
     esc_hint_until: Option<Instant>,
+    /// Until when a second Ctrl+C on the empty editor quits ([`QUIT_HINT`]).
+    quit_hint_until: Option<Instant>,
 }
 
 impl Shell {
@@ -326,6 +348,7 @@ impl Shell {
                 server: None,
                 switching: false,
                 esc_hint_until: None,
+                quit_hint_until: None,
             },
             done_rx,
         )
@@ -807,16 +830,52 @@ impl Shell {
         }
     }
 
-    /// Puts the spinner line back to "Working…" once [`ESC_HINT`] has been shown for
-    /// [`ESC_HINT_FOR`] at `now`. Returns true when it changed. [`Shell::poll`] calls it.
-    pub fn expire_hints(&mut self, now: Instant) -> bool {
-        match self.esc_hint_until {
-            Some(until) if now >= until => {
-                self.clear_esc_hint();
-                true
-            }
-            _ => false,
+    /// Ctrl+C at `now` (#2184): stops a running reply, else clears a non-empty editor, else
+    /// shows [`QUIT_HINT`] in the empty editor; a second Ctrl+C there within [`QUIT_HINT_FOR`]
+    /// returns [`CtrlC::Quit`]. `/quit`, Ctrl+D and signals still quit at once, and Ctrl+C
+    /// during the "stopping N workers" wait skips it ([`Shell::quit`]).
+    pub async fn ctrl_c(&mut self, now: Instant) -> CtrlC {
+        if self.running {
+            self.clear_quit_hint();
+            self.abort().await;
+            return CtrlC::Stopped;
         }
+        if !self.view.editor().get_text().is_empty() {
+            self.clear_quit_hint();
+            self.view.editor().clear();
+            return CtrlC::Cleared;
+        }
+        if self.quit_hint_until.is_some_and(|until| now < until) {
+            self.clear_quit_hint();
+            return CtrlC::Quit;
+        }
+        self.quit_hint_until = Some(now + QUIT_HINT_FOR);
+        self.view.set_editor_hint(Some(QUIT_HINT));
+        CtrlC::Hint
+    }
+
+    /// Takes [`QUIT_HINT`] away: the next Ctrl+C on the empty editor only hints again. The
+    /// terminal loop calls it for every other key, so the window is two Ctrl+Cs in a row.
+    pub fn clear_quit_hint(&mut self) {
+        if self.quit_hint_until.take().is_some() {
+            self.view.set_editor_hint(None);
+        }
+    }
+
+    /// Puts the spinner line back to "Working…" once [`ESC_HINT`] has been shown for
+    /// [`ESC_HINT_FOR`] at `now`, and the empty editor back to its placeholder once
+    /// [`QUIT_HINT_FOR`] has passed. Returns true when either changed. [`Shell::poll`] calls it.
+    pub fn expire_hints(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        if self.esc_hint_until.is_some_and(|until| now >= until) {
+            self.clear_esc_hint();
+            changed = true;
+        }
+        if self.quit_hint_until.is_some_and(|until| now >= until) {
+            self.clear_quit_hint();
+            changed = true;
+        }
+        changed
     }
 
     async fn command(&mut self, name: &str, arg: &str) -> Submit {
