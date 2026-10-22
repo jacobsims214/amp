@@ -190,6 +190,16 @@ impl Connection {
     }
 }
 
+/// What [`AmpMcpClient::adopt`] does with the connection it replaces.
+#[derive(Clone, Copy)]
+enum Retire {
+    /// An explicit [`AmpMcpClient::reconnect`] / [`AmpMcpClient::replace`]: cut off its calls now.
+    Cancel,
+    /// The automatic reconnect after a "login required": let its calls finish (their 401s), so
+    /// callers that failed together all heal on the new connection.
+    Drop,
+}
+
 /// The automatic reconnect: off until [`AmpMcpClient::set_reconnector`].
 struct ReconnectConfig {
     connector: Option<Reconnector>,
@@ -203,8 +213,10 @@ struct ReconnectConfig {
 /// [`DEFAULT_RECONNECT_INTERVAL`], and on success retries on the new connection (a 401 means the
 /// call never ran). Everyone holding the `Arc` (the model's tools, run reporting, the supervisor)
 /// then uses the new connection. [`Self::replace`] and [`Self::reconnect`] do the same swap on
-/// demand, e.g. to switch servers. A call still running on the old connection fails at once with
-/// [`McpError::Replaced`]; it is never retried, since it may have run.
+/// demand, e.g. to switch servers; a call still running on the old connection then fails at once
+/// with [`McpError::Replaced`] and is never retried, since it may have run. The automatic
+/// reconnect instead lets calls on the old connection finish, so calls that hit the same dead
+/// login together all heal on the new one (#2194).
 pub struct AmpMcpClient {
     conn: RwLock<Arc<Connection>>,
     call_timeout: Duration,
@@ -504,17 +516,17 @@ impl AmpMcpClient {
         let mut last = self.last_attempt.lock().await;
         *last = Some(Instant::now());
         let client = run_connector(&connector).await?;
-        self.adopt(client);
+        self.adopt(client, Retire::Cancel);
         Ok(())
     }
 
     /// Replaces the connection with `client`'s (made elsewhere, e.g. for another server). The
     /// timeouts, health watchers and reconnector stay this client's; `client`'s are dropped.
     pub fn replace(&self, client: AmpMcpClient) {
-        self.adopt(client);
+        self.adopt(client, Retire::Cancel);
     }
 
-    fn adopt(&self, client: AmpMcpClient) {
+    fn adopt(&self, client: AmpMcpClient, retire: Retire) {
         let new = client
             .conn
             .into_inner()
@@ -530,9 +542,16 @@ impl AmpMcpClient {
             url = %self.session().url,
             "AMP MCP connection replaced"
         );
-        // Calls still running on the old connection fail now (TransportClosed) instead of waiting
-        // out their timeout; the service ends when the last of them lets go of it.
-        old.cancel();
+        match retire {
+            // Calls still running on the old connection fail now (TransportClosed, reported as
+            // Replaced) instead of waiting out their timeout.
+            Retire::Cancel => old.cancel(),
+            // The old connection's login is dead, so what still runs on it is (almost always) a
+            // 401 on its way back. Let it arrive: that caller then sees a newer connection and
+            // sends again there, instead of failing as Replaced (#2194). The service ends when
+            // the last of them lets go of it (rmcp cancels a RunningService on drop).
+            Retire::Drop => drop(old),
+        }
     }
 
     /// After `failed` could not be used (login required, or closed before a request was sent):
@@ -559,7 +578,7 @@ impl AmpMcpClient {
         *last = Some(Instant::now());
         match run_connector(&connector).await {
             Ok(client) => {
-                self.adopt(client);
+                self.adopt(client, Retire::Drop);
                 true
             }
             Err(e) => {
