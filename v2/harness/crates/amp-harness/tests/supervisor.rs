@@ -178,7 +178,7 @@ struct Recorder {
 
 #[async_trait::async_trait]
 impl WorkerHooks for Recorder {
-    async fn on_finish(&self, worker: &WorkerInfo, report: &WorkerReport) {
+    async fn on_finish(&self, worker: &WorkerInfo, report: &mut WorkerReport) {
         self.finished
             .lock()
             .unwrap()

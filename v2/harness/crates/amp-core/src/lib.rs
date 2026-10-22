@@ -37,6 +37,12 @@
 //!   parallel workers, a wall-clock timeout, a turn budget and cancellation, ending in a
 //!   [`supervisor::WorkerReport`] with a [`supervisor::WorkerOutcome`].
 //!
+//! M2-6 (#2098):
+//! - [`run_report`]: automatic run reporting (D8). [`run_report::RunReporter`] fills the model,
+//!   tokens, cost and git fields a worker left out of `amp_complete_task` / `amp_block_task`, and
+//!   reports a worker that ended without closing its ticket with `amp_report_run` ("abandoned:
+//!   <reason>"); [`run_report::SessionUsageTool`] is the native `amp_session_usage`.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -49,6 +55,7 @@ pub mod policy;
 pub mod project;
 pub mod providers;
 pub mod roles;
+pub mod run_report;
 pub mod supervisor;
 pub mod tickets;
 pub mod tools;

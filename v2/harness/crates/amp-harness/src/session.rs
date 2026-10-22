@@ -6,18 +6,24 @@
 //! (D7, M2-5), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
 //! `AMP_HARNESS_WORKER_TIMEOUT_SECS` / `AMP_HARNESS_WORKER_MAX_TURNS`. Aborting the manager's run
 //! cancels the workers its tool calls started; [`Supervisor::cancel_all`] cancels every worker.
+//!
+//! Run reporting (D8, M2-6): the supervisor runs with a [`RunReporter`], so every worker's
+//! `amp_complete_task` / `amp_block_task` carries its model, tokens, cost and git fields, and a
+//! worker that ends without closing its ticket is reported with `amp_report_run`. Every session
+//! also has the native `amp_session_usage` tool over its own live [`Totals`].
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use amp_core::{
     agent::{AgentSpec, BuiltAgent, Runtime, RuntimeOptions, SessionKind},
-    events::ChannelEmitter,
+    events::{ChannelEmitter, Totals, TotalsEmitter},
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::SystemKeys,
-    supervisor::{ManagerContext, Supervisor, SupervisorConfig},
+    run_report::{RunReporter, SessionUsageTool},
+    supervisor::{ManagerContext, Supervisor, SupervisorConfig, WorkerHooks},
 };
 use rpi_agent::AgentEvent;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -89,7 +95,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     let role_id = role.id.clone();
     let supervisor = if role.primary {
         let config = SupervisorConfig::load(&env, None).map_err(CliError::new)?;
-        Some(Supervisor::new(
+        Some(Supervisor::with_hooks(
             Arc::clone(&rt),
             ManagerContext {
                 role: role_id.clone(),
@@ -97,15 +103,28 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
                 project: project.clone(),
             },
             config,
+            Some(RunReporter::new(Arc::clone(&client)) as Arc<dyn WorkerHooks>),
         ))
     } else {
         None
     };
     let (emitter, events) = ChannelEmitter::new();
+    let totals = Arc::new(Mutex::new(Totals::default()));
+    let model = rt
+        .models
+        .resolve_role(&role.model_role)
+        .map(|r| r.model_ref())
+        .unwrap_or_default();
     let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());
     spec.project = project.clone();
     spec.extra_tools = supervisor.iter().map(|s| s.tool()).collect();
-    spec.emitter = Some(emitter.into_emitter());
+    spec.extra_tools.push(SessionUsageTool::harness_tool(
+        model,
+        Arc::clone(&totals),
+        false,
+    ));
+    spec.emitter =
+        Some(TotalsEmitter::new(Arc::clone(&totals), Some(emitter.into_emitter())).into_emitter());
     spec.session = if req.memory {
         SessionKind::Memory
     } else {

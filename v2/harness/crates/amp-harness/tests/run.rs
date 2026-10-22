@@ -386,3 +386,48 @@ async fn a_role_without_a_provider_key_says_which_key_to_set() {
     assert!(out.stderr.contains("OPENROUTER_API_KEY"), "{}", out.stderr);
     assert!(amp.mock.calls_to("amp_whoami").is_empty());
 }
+
+/// M2-6 (#2098): every session has the native `amp_session_usage` over its own live usage.
+#[tokio::test]
+async fn the_manager_has_a_native_amp_session_usage_tool() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup(
+        "run-session-usage",
+        json!([
+            {"text": "Checking my usage.", "tool_calls": [{"name": "amp_session_usage", "id": "u-1"}]},
+            {"text": "Usage: {{last_tool_result}}"}
+        ]),
+    );
+    let out = harness(&dir, &amp.url, &["run", "-p", "usage?", "--json"]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let events = json_lines(&out);
+    let tools = &events[0]["tools"];
+    assert!(
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "amp_session_usage"),
+        "{tools}"
+    );
+    let ends = of_type(&events, "tool_end");
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0]["is_error"], false, "{}", ends[0]);
+    let usage: Value = serde_json::from_str(ends[0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(usage["model"], "faux/faux-1");
+    // It already counts the message that called it.
+    assert!(usage["input_tokens"].as_i64().unwrap() > 0, "{usage}");
+    assert!(usage["output_tokens"].as_i64().unwrap() > 0, "{usage}");
+    assert!(
+        usage["cost_usd"].is_null(),
+        "no pricing configured: {usage}"
+    );
+    assert_eq!(usage["turns"], 1);
+    assert_eq!(usage["tool_calls"], 1);
+    assert!(
+        usage.get("note").is_none(),
+        "the manager fills its own fields"
+    );
+    // It is native: AMP never saw the call.
+    assert!(amp.mock.calls_to("amp_session_usage").is_empty());
+}

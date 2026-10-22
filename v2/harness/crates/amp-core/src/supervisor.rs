@@ -24,8 +24,9 @@
 //!    cancels its in-flight tools.
 //!
 //! Every call that got as far as step 3 ends in a [`WorkerReport`] with a [`WorkerOutcome`], the
-//! worker's usage [`Totals`] and where its work is, which is what M2-6's run reporting needs
-//! ([`WorkerHooks`]). Errors before step 3 are tool errors for the manager and touch nothing in AMP.
+//! worker's usage [`Totals`] and where its work is. Run reporting ([`crate::run_report`], M2-6)
+//! reports it to AMP through [`WorkerHooks`]. Errors before step 3 are tool errors for the
+//! manager and touch nothing in AMP.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -299,19 +300,27 @@ pub struct WorkerReport {
     pub totals: Totals,
 }
 
-/// M2-6's seam: run reporting plugs in here.
+/// The supervisor's extension points; run reporting ([`crate::run_report::RunReporter`], M2-6)
+/// plugs in here.
 #[async_trait::async_trait]
 pub trait WorkerHooks: Send + Sync {
     /// A before-tool hook for this worker. It runs after the role's policy allowed a call
-    /// ([`AgentSpec::before_tool_call`]); M2-6 fills run fields into `amp_complete_task` /
-    /// `amp_block_task` here.
+    /// ([`AgentSpec::before_tool_call`]); run reporting fills run fields into
+    /// `amp_complete_task` / `amp_block_task` here.
     fn before_tool_call(&self, _worker: &WorkerInfo) -> Option<BeforeToolCall> {
         None
     }
 
-    /// Every dispatched worker ends here exactly once, whatever the outcome. M2-6 calls
-    /// `amp_report_run` here when `!report.outcome.closed_ticket()`.
-    async fn on_finish(&self, _worker: &WorkerInfo, _report: &WorkerReport) {}
+    /// Extra tools for this worker (run reporting: `amp_session_usage`). The role's policy
+    /// filters them like any other tool.
+    fn extra_tools(&self, _worker: &WorkerInfo) -> Vec<HarnessTool> {
+        Vec::new()
+    }
+
+    /// Every dispatched worker ends here exactly once, whatever the outcome, before the report
+    /// goes back to the manager. Run reporting calls `amp_report_run` here when
+    /// `!report.outcome.closed_ticket()` and adds a note to the report.
+    async fn on_finish(&self, _worker: &WorkerInfo, _report: &mut WorkerReport) {}
 }
 
 /// Why `amp_run_ticket` refused or failed before a worker was dispatched.
@@ -678,7 +687,10 @@ impl Supervisor {
         spec.emitter = Some(Arc::new(WorkerEmitter {
             watch: Arc::clone(&watch),
         }));
-        spec.before_tool_call = self.hooks.as_ref().and_then(|h| h.before_tool_call(&info));
+        if let Some(hooks) = &self.hooks {
+            spec.before_tool_call = hooks.before_tool_call(&info);
+            spec.extra_tools.extend(hooks.extra_tools(&info));
+        }
         let built = match self.rt.build(spec).await {
             Ok(b) => b,
             Err(e) => {
@@ -789,7 +801,7 @@ impl Supervisor {
         finish: Finish,
     ) -> WorkerReport {
         let totals = info.totals.lock().unwrap().clone();
-        let report = WorkerReport {
+        let mut report = WorkerReport {
             task_id: info.task_id,
             agent_id: info.agent_id.clone(),
             role: info.role.clone(),
@@ -810,7 +822,7 @@ impl Supervisor {
             totals,
         };
         if let Some(hooks) = &self.hooks {
-            hooks.on_finish(info, &report).await;
+            hooks.on_finish(info, &mut report).await;
         }
         report
     }
@@ -1003,7 +1015,8 @@ impl WorkerWatch {
     }
 }
 
-fn task_id_arg(args: &Value) -> Option<i64> {
+/// A tool call's `task_id` argument: a number, or a string such as `"#12"`.
+pub(crate) fn task_id_arg(args: &Value) -> Option<i64> {
     match &args["task_id"] {
         Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
         Value::String(s) => s.trim().trim_start_matches('#').parse().ok(),

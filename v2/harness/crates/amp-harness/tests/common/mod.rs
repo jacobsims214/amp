@@ -251,6 +251,12 @@ impl ServerHandler for MockAmp {
             "amp_complete_task" | "amp_block_task" => {
                 ok_json(json!({"task_id": args["task_id"], "ok": true}))
             }
+            // M2-6: ticket 4041's runs are refused, like AMP refusing a run it can't record.
+            "amp_report_run" => match args["task_id"].as_i64() {
+                Some(4041) => tool_error("task 4041 not found"),
+                Some(id) => ok_json(json!({"task_id": id, "outcome": args["outcome"]})),
+                None => tool_error("task_id is required"),
+            },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "plain text, not JSON",
