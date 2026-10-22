@@ -54,6 +54,7 @@ pub use shell::{
 };
 pub use slash::{COMMANDS, CommandMenu, CommandSpec, Group, HelpBlock, KEYS, MenuKey};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
+pub use transcript::ThinkingDisplay;
 pub use view::{ChatView, FooterInfo, PLACEHOLDER};
 
 /// Installs `theme` for every rpi-tui component (`global_theme_manager().set`, which also

@@ -19,6 +19,7 @@ use super::{AmpTheme, ThemeError, relative_luminance};
 
 pub const ENV_THEME: &str = "AMP_HARNESS_THEME";
 pub const ENV_COLOR: &str = "AMP_HARNESS_COLOR";
+pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
 
 /// Dark or light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +105,36 @@ struct ConfigFile {
 struct TuiTable {
     theme: Option<String>,
     color: Option<String>,
+    show_thinking: Option<String>,
+}
+
+/// How the chat shows thinking (#2177): `AMP_HARNESS_SHOW_THINKING`, then config.toml `[tui]
+/// show_thinking`, then `collapsed`. Values: `collapsed`, `full`, `hidden`.
+pub fn resolve_show_thinking(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<crate::ThinkingDisplay, ThemeError> {
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match env(ENV_SHOW_THINKING)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| (v, ENV_SHOW_THINKING))
+        .or_else(|| {
+            table
+                .show_thinking
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| (v, "[tui] show_thinking"))
+        }) {
+        Some((v, from)) => {
+            crate::ThinkingDisplay::parse(&v).map_err(|e| ThemeError(format!("{from}: {e}")))
+        }
+        None => Ok(crate::ThinkingDisplay::default()),
+    }
 }
 
 /// The resolved theme settings, before the terminal is asked anything.
@@ -397,6 +428,31 @@ mod tests {
         assert!(e.0.contains(ENV_COLOR), "{e}");
         let e = ThemeSettings::resolve(Some("neon"), &none, None).unwrap_err();
         assert!(e.0.contains("--theme"), "{e}");
+    }
+
+    #[test]
+    fn show_thinking_from_env_then_config_then_collapsed() {
+        use crate::ThinkingDisplay;
+        let none = env_of(&[]);
+        assert_eq!(
+            resolve_show_thinking(&none, None).unwrap(),
+            ThinkingDisplay::Collapsed
+        );
+        let config = "[tui]\ntheme = \"dark\"\nshow_thinking = \"full\"\n";
+        assert_eq!(
+            resolve_show_thinking(&none, Some(config)).unwrap(),
+            ThinkingDisplay::Full
+        );
+        // The theme settings accept the key too.
+        assert!(ThemeSettings::resolve(None, &none, Some(config)).is_ok());
+        let env = env_of(&[(ENV_SHOW_THINKING, "Hidden")]);
+        assert_eq!(
+            resolve_show_thinking(&env, Some(config)).unwrap(),
+            ThinkingDisplay::Hidden
+        );
+        let e =
+            resolve_show_thinking(&none, Some("[tui]\nshow_thinking = \"some\"\n")).unwrap_err();
+        assert!(e.0.contains("[tui] show_thinking"), "{}", e.0);
     }
 
     #[test]

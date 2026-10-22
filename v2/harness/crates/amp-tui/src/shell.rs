@@ -339,6 +339,16 @@ impl Shell {
         &self.info
     }
 
+    /// How the transcript shows thinking (`[tui] show_thinking`, #2177).
+    pub fn set_show_thinking(&mut self, display: crate::ThinkingDisplay) {
+        self.view.set_show_thinking(display);
+    }
+
+    /// Ctrl+T: expands or collapses the last thinking section. Returns whether there was one.
+    pub fn toggle_thinking(&mut self) -> bool {
+        self.view.toggle_thinking().is_some()
+    }
+
     pub fn is_running(&self) -> bool {
         self.running
     }
@@ -1146,11 +1156,14 @@ impl Shell {
     }
 
     /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
-    /// `enter`, `esc`, `up`, `down`, or one character.
+    /// `enter`, `esc`, `up`, `down`, or one character. `ctrl+t` toggles the last thinking.
     pub fn press(&mut self, name: &str) -> Result<bool, String> {
         if let Some(text) = name.strip_prefix("paste:") {
             self.paste(text);
             return Ok(true);
+        }
+        if name.eq_ignore_ascii_case("ctrl+t") {
+            return Ok(self.toggle_thinking());
         }
         let code = match name {
             "enter" => KeyCode::Enter,

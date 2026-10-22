@@ -241,6 +241,9 @@ async fn event_loop(
                             } else {
                                 break;
                             }
+                        } else if is_ctrl(&key, 't') {
+                            // Expand or collapse the last thinking (#2177).
+                            shell.toggle_thinking();
                         } else if shell.key(&key, editor_empty).await {
                             // An open AMP panel took it (select, answer, open, close), or Esc
                             // stopped the run (Esc that closes a panel mid-run only hints).
