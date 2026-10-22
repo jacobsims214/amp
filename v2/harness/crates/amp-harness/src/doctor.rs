@@ -1,18 +1,31 @@
-//! `amp-harness doctor [--json]`: can this machine use AMP, and how is it connected?
+//! `amp-harness doctor [--json] [--offline]`: can this machine use AMP, and what is wrong if not?
 //!
-//! Checks, in order (later ones are skipped when an earlier one makes them impossible):
-//! `config` (settings resolve), `credentials` (where logins live; D3 warns on the file fallback),
-//! `connect` (reachability + negotiated protocol), `tools` (tools/list), `contract` (D11 tools
-//! present), `whoami`, `project` (`.amp.json`, then `amp_get_project`).
+//! Checks, in order (later AMP checks are skipped when an earlier one makes them impossible):
+//! - `config`: connection settings resolve.
+//! - `credentials`: where logins live; D3 warns on the 0600 file fallback.
+//! - `ca`: TLS trust: the CA file (readable, PEM, in date), and why a certificate was rejected.
+//! - `connect`: reachability + negotiated protocol.
+//! - `versions`: harness, rpi/rmcp pins, embedded asset commit, negotiated MCP protocol (D11).
+//! - `tools` (tools/list), `contract` (D11 tools present), `whoami`, `project` (`.amp.json`, then
+//!   `amp_get_project`).
+//! - `roles`, `key:<provider>`, `models:<provider>`: see [`providers`]. These run even when AMP is
+//!   unreachable.
 //!
-//! Never prints a secret: auth is described by its source (`static token (env AMP_TOKEN)`,
-//! `oauth (macOS Keychain ...)`), never by its value. Exit code 1 when any check fails.
+//! Every warn/fail carries a `fix`: the exact thing to run or change. Never prints a secret: auth
+//! and provider keys are described by their source (`static token (env AMP_TOKEN)`, `env
+//! OPENROUTER_API_KEY`), never by value. Exit code 1 when any check fails; warnings don't count.
+
+mod ca;
+mod providers;
 
 use amp_core::{
+    models::ModelsConfig,
     project::ProjectMarker,
+    providers::SystemKeys,
     tools::{call_json, missing_contract_tools},
 };
-use amp_mcp::{Auth, CredentialBackend, Settings, oauth};
+use amp_mcp::{Auth, CredentialBackend, McpError, Settings, oauth};
+use clap::Args;
 use serde::Serialize;
 use serde_json::json;
 
@@ -20,6 +33,18 @@ use crate::{
     conn::{CliError, ConnArgs, connect, print_json},
     whoami,
 };
+
+#[derive(Args)]
+pub struct DoctorArgs {
+    #[command(flatten)]
+    pub conn: ConnArgs,
+    /// Print JSON.
+    #[arg(long)]
+    pub json: bool,
+    /// Don't ask the model providers for their catalogs (no network besides AMP).
+    #[arg(long)]
+    pub offline: bool,
+}
 
 /// `doctor --json`. Add fields, never rename or remove them.
 #[derive(Debug, Serialize)]
@@ -33,7 +58,73 @@ pub struct Report {
     pub tools: Option<ToolsReport>,
     pub whoami: Option<WhoamiReport>,
     pub project: Option<ProjectReport>,
+    /// TLS trust (`ca` check).
+    pub ca: Option<ca::CaReport>,
+    /// Harness, pins, assets and the negotiated protocol (`versions` check, D11).
+    pub versions: VersionsReport,
+    /// Roles, provider keys and pinned models (`roles`, `key:*`, `models:*` checks).
+    pub models: providers::ModelsReport,
     pub checks: Vec<Check>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VersionsReport {
+    pub harness: &'static str,
+    pub rpi_ai: &'static str,
+    pub rpi_agent: &'static str,
+    pub rpi_tools: &'static str,
+    pub rpi_harness: &'static str,
+    pub rpi_tui: &'static str,
+    pub rmcp: &'static str,
+    /// The commit that last changed the embedded agent/skill assets (`-dirty`, or `unknown`).
+    pub assets_commit: &'static str,
+    /// The assets manifest's hash of the `.opencode` sources they were generated from.
+    pub assets_source_sha256: Option<String>,
+    /// The MCP protocol negotiated with AMP (`null` when not connected).
+    pub mcp_protocol: Option<String>,
+}
+
+impl VersionsReport {
+    fn new() -> Self {
+        Self {
+            harness: env!("CARGO_PKG_VERSION"),
+            rpi_ai: env!("AMP_PIN_RPI_AI"),
+            rpi_agent: env!("AMP_PIN_RPI_AGENT"),
+            rpi_tools: env!("AMP_PIN_RPI_TOOLS"),
+            rpi_harness: env!("AMP_PIN_RPI_HARNESS"),
+            rpi_tui: env!("AMP_PIN_RPI_TUI"),
+            rmcp: env!("AMP_PIN_RMCP"),
+            assets_commit: env!("AMP_ASSETS_COMMIT"),
+            assets_source_sha256: amp_core::assets::Assets::embedded()
+                .ok()
+                .map(|a| a.manifest().source_sha256.clone()),
+            mcp_protocol: None,
+        }
+    }
+
+    fn summary(&self) -> String {
+        let rpi = [
+            self.rpi_agent,
+            self.rpi_tools,
+            self.rpi_harness,
+            self.rpi_tui,
+        ];
+        let rpi = if rpi.iter().all(|v| *v == self.rpi_ai) {
+            format!("rpi {}", self.rpi_ai)
+        } else {
+            format!(
+                "rpi-ai {} rpi-agent {} rpi-tools {} rpi-harness {} rpi-tui {}",
+                self.rpi_ai, self.rpi_agent, self.rpi_tools, self.rpi_harness, self.rpi_tui
+            )
+        };
+        format!(
+            "harness {}, {rpi}, rmcp {}, assets {}, MCP {}",
+            self.harness,
+            self.rmcp,
+            self.assets_commit,
+            self.mcp_protocol.as_deref().unwrap_or("not connected")
+        )
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -112,33 +203,68 @@ pub enum CheckStatus {
 
 #[derive(Debug, Serialize)]
 pub struct Check {
-    /// One of: config, credentials, connect, tools, contract, whoami, project.
-    pub name: &'static str,
+    /// One of: config, credentials, ca, connect, versions, tools, contract, whoami, project, roles,
+    /// `key:<provider>`, `models:<provider>`.
+    pub name: String,
     pub status: CheckStatus,
     pub detail: String,
+    /// For warn/fail: what to run or change to fix it.
+    pub fix: Option<String>,
+}
+
+/// A check's outcome before it is named.
+#[derive(Debug, Clone)]
+pub struct Finding {
+    pub status: CheckStatus,
+    pub detail: String,
+    pub fix: Option<String>,
+}
+
+impl Finding {
+    pub fn new(status: CheckStatus, detail: impl Into<String>) -> Self {
+        Self {
+            status,
+            detail: detail.into(),
+            fix: None,
+        }
+    }
+
+    pub fn fix(mut self, fix: impl Into<String>) -> Self {
+        self.fix = Some(fix.into());
+        self
+    }
 }
 
 struct Checks(Vec<Check>);
 
 impl Checks {
-    fn add(&mut self, name: &'static str, status: CheckStatus, detail: impl Into<String>) {
+    fn add(&mut self, name: &str, status: CheckStatus, detail: impl Into<String>) {
+        self.push(name, Finding::new(status, detail));
+    }
+
+    fn fail(&mut self, name: &str, detail: impl Into<String>, fix: impl Into<String>) {
+        self.push(name, Finding::new(CheckStatus::Fail, detail).fix(fix));
+    }
+
+    fn push(&mut self, name: &str, finding: Finding) {
         self.0.push(Check {
-            name,
-            status,
-            detail: detail.into(),
+            name: name.to_owned(),
+            status: finding.status,
+            detail: finding.detail,
+            fix: finding.fix,
         });
     }
 
-    fn skip(&mut self, names: &[&'static str], why: &str) {
+    fn skip(&mut self, names: &[&str], why: &str) {
         for name in names {
             self.add(name, CheckStatus::Skip, why);
         }
     }
 }
 
-pub async fn run(conn: ConnArgs, json: bool) -> Result<(), CliError> {
-    let report = diagnose(&conn).await;
-    if json {
+pub async fn run(args: DoctorArgs) -> Result<(), CliError> {
+    let report = diagnose(&args.conn, args.offline).await;
+    if args.json {
         print_json(&report)?;
     } else {
         print_human(&report);
@@ -162,88 +288,127 @@ fn server_report(s: &Settings) -> ServerReport {
     }
 }
 
-async fn diagnose(conn: &ConnArgs) -> Report {
+/// What the AMP half of the checks found (the report fields it fills).
+#[derive(Default)]
+struct AmpFindings {
+    settings: Option<Settings>,
+    auth: AuthReport,
+    connection: ConnectionReport,
+    tools: Option<ToolsReport>,
+    whoami: Option<WhoamiReport>,
+    project: Option<ProjectReport>,
+    ca: Option<ca::CaReport>,
+}
+
+async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
     let mut checks = Checks(Vec::new());
-    let mut auth = AuthReport::default();
-    let mut connection = ConnectionReport::default();
-    let mut tools = None;
-    let mut whoami_report = None;
-    let mut project = None;
-    let after_connect = ["tools", "contract", "whoami", "project"];
+    let mut versions = VersionsReport::new();
+    let amp = amp_checks(conn, &mut checks, &mut versions).await;
+
+    // The model side needs no AMP connection: a brand-new machine sees both halves at once.
+    let env = |k: &str| std::env::var(k).ok();
+    let config_path = conn
+        .config
+        .clone()
+        .or_else(|| amp_mcp::default_config_path(&env))
+        .map(|p| p.display().to_string());
+    let models_config =
+        ModelsConfig::load_with_env(&env, conn.config.clone()).map_err(|e| e.to_string());
+    let (models, findings) =
+        providers::check(models_config, config_path, &SystemKeys::from_env(), offline).await;
+    for (name, finding) in findings {
+        checks.push(&name, finding);
+    }
+
+    Report {
+        ok: checks.0.iter().all(|c| c.status != CheckStatus::Fail),
+        harness_version: env!("CARGO_PKG_VERSION"),
+        server: amp.settings.as_ref().map(server_report),
+        auth: amp.auth,
+        connection: amp.connection,
+        tools: amp.tools,
+        whoami: amp.whoami,
+        project: amp.project,
+        ca: amp.ca,
+        versions,
+        models,
+        checks: checks.0,
+    }
+}
+
+const AFTER_CONNECT: [&str; 4] = ["tools", "contract", "whoami", "project"];
+
+async fn amp_checks(
+    conn: &ConnArgs,
+    checks: &mut Checks,
+    versions: &mut VersionsReport,
+) -> AmpFindings {
+    let mut found = AmpFindings::default();
 
     let settings = match conn.settings() {
         Ok(s) => {
             checks.add("config", CheckStatus::Ok, format!("server {}", s.url));
-            Some(s)
+            s
         }
         Err(e) => {
-            checks.add("config", CheckStatus::Fail, e.to_string());
-            None
+            checks.fail(
+                "config",
+                e.to_string(),
+                "fix the setting the error names: --url / AMP_MCP_URL, --ca-file / AMP_CA_FILE, \
+                 --protocol / AMP_MCP_PROTOCOL, or [server] in ~/.config/amp-harness/config.toml",
+            );
+            checks.skip(&["credentials", "ca", "connect"], "no settings");
+            checks.push(
+                "versions",
+                Finding::new(CheckStatus::Ok, versions.summary()),
+            );
+            checks.skip(&AFTER_CONNECT, "no settings");
+            return found;
         }
-    };
-    let Some(settings) = settings else {
-        checks.skip(&["credentials", "connect"], "no settings");
-        checks.skip(&after_connect, "no settings");
-        return finish(None, auth, connection, tools, None, None, checks);
     };
 
-    // Credentials: a static token wins and is never stored; otherwise the store holds logins.
-    match &settings.auth {
-        Auth::Static { env, .. } => {
-            auth.method = Some(settings.auth.describe());
-            checks.add(
-                "credentials",
-                CheckStatus::Ok,
-                format!("static token from {env} (not stored)"),
-            );
-        }
-        Auth::None => match CredentialBackend::resolve() {
-            Ok(backend) => {
-                auth.credential_store = Some(backend.describe());
-                let stored = oauth::has_login(&settings.url, &backend).await;
-                auth.stored_login = stored.as_ref().ok().copied();
-                let (status, detail) = match (&stored, backend.is_keychain()) {
-                    (Err(e), _) => (CheckStatus::Warn, format!("cannot read logins: {e}")),
-                    (Ok(_), false) => (
-                        CheckStatus::Warn,
-                        format!(
-                            "no OS keychain; logins are kept in {} (mode 0600)",
-                            backend.describe()
-                        ),
-                    ),
-                    (Ok(true), true) => (
-                        CheckStatus::Ok,
-                        format!("login stored in {}", backend.describe()),
-                    ),
-                    (Ok(false), true) => (
-                        CheckStatus::Ok,
-                        format!("no login stored in {}", backend.describe()),
-                    ),
-                };
-                checks.add("credentials", status, detail);
-            }
-            Err(e) => checks.add("credentials", CheckStatus::Warn, e.to_string()),
-        },
-    }
+    credentials_check(&settings, checks, &mut found.auth).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (ca_report, ca_file_finding) = ca::check_file(&settings, now);
+    found.ca = Some(ca_report);
 
     let client = match connect(&settings).await {
-        Ok(client) => client,
+        Ok(client) => {
+            checks.push("ca", ca_file_finding);
+            client
+        }
         Err(e) => {
-            connection.reachable = e.is_auth_required();
-            connection.error = Some(e.to_string());
-            let detail = if e.is_auth_required() {
-                format!("{} answered, but needs a login: {e}", settings.url)
-            } else {
-                e.to_string()
+            found.connection.reachable = e.is_auth_required();
+            found.connection.error = Some(e.to_string());
+            let tls = ca::classify_tls(&e.to_string(), &settings);
+            let ca_broken = tls.is_some() || ca_file_finding.status == CheckStatus::Fail;
+            if let (Some(t), Some(report)) = (&tls, found.ca.as_mut()) {
+                report.tls_error = Some(t.detail.clone());
+            }
+            // A broken CA file (unreadable, expired) is the more specific diagnosis.
+            let ca_finding = match tls {
+                Some(t) if ca_file_finding.status != CheckStatus::Fail => t,
+                _ => ca_file_finding,
             };
-            checks.add("connect", CheckStatus::Fail, detail);
-            checks.skip(&after_connect, "not connected");
-            return finish(Some(&settings), auth, connection, tools, None, None, checks);
+            checks.push("ca", ca_finding);
+            let (detail, fix) = connect_failure(&e, &settings, ca_broken);
+            checks.fail("connect", detail, fix);
+            checks.push(
+                "versions",
+                Finding::new(CheckStatus::Ok, versions.summary()),
+            );
+            checks.skip(&AFTER_CONNECT, "not connected");
+            found.settings = Some(settings);
+            return found;
         }
     };
 
     let session = client.session().clone();
-    auth.method = Some(session.auth.clone());
+    found.auth.method = Some(session.auth.clone());
+    let connection = &mut found.connection;
     connection.reachable = true;
     connection.connected = true;
     connection.protocol_version = Some(session.protocol_version.to_string());
@@ -272,6 +437,11 @@ async fn diagnose(conn: &ConnArgs) -> Report {
         ));
     }
     checks.add("connect", CheckStatus::Ok, detail.trim_end().to_owned());
+    versions.mcp_protocol = Some(session.protocol_version.to_string());
+    checks.push(
+        "versions",
+        Finding::new(CheckStatus::Ok, versions.summary()),
+    );
 
     match client.catalog().await {
         Ok(catalog) => {
@@ -287,19 +457,32 @@ async fn diagnose(conn: &ConnArgs) -> Report {
                     ),
                 );
             } else {
-                checks.add(
+                checks.fail(
                     "contract",
-                    CheckStatus::Fail,
                     format!("missing: {}", missing.join(", ")),
+                    format!(
+                        "this AMP server ({}) lacks tools amp-harness {} needs: upgrade the AMP \
+                         server, or use an amp-harness release that matches it",
+                        session
+                            .server_version
+                            .as_deref()
+                            .unwrap_or("unknown version"),
+                        env!("CARGO_PKG_VERSION")
+                    ),
                 );
             }
-            tools = Some(ToolsReport {
+            found.tools = Some(ToolsReport {
                 count: catalog.len(),
                 missing_contract: missing,
             });
         }
         Err(e) => {
-            checks.add("tools", CheckStatus::Fail, e.to_string());
+            checks.fail(
+                "tools",
+                e.to_string(),
+                "run `amp-harness doctor` again; if it keeps failing, AMP's MCP server is \
+                 unhealthy (check its logs)",
+            );
             checks.skip(&["contract"], "no tool list");
         }
     }
@@ -307,13 +490,13 @@ async fn diagnose(conn: &ConnArgs) -> Report {
     match whoami::fetch(&client).await {
         Ok(me) => {
             checks.add("whoami", CheckStatus::Ok, me.short());
-            whoami_report = Some(WhoamiReport {
+            found.whoami = Some(WhoamiReport {
                 user_id: me.user_id,
                 email: me.email,
                 account: me.account,
             });
         }
-        Err(e) => checks.add("whoami", CheckStatus::Fail, e.to_string()),
+        Err(e) => checks.fail("whoami", e.to_string(), login_fix(&settings)),
     }
 
     match ProjectMarker::find_from_cwd() {
@@ -322,7 +505,12 @@ async fn diagnose(conn: &ConnArgs) -> Report {
             CheckStatus::Skip,
             "no .amp.json here (not a project checkout)",
         ),
-        Err(e) => checks.add("project", CheckStatus::Fail, format!(".amp.json: {e}")),
+        Err(e) => checks.fail(
+            "project",
+            format!(".amp.json: {e}"),
+            "make .amp.json valid JSON with a numeric \"project_id\" (the id in the AMP web UI's \
+             project URL)",
+        ),
         Ok(Some(marker)) => {
             let fetched = call_json(
                 &client,
@@ -330,7 +518,7 @@ async fn diagnose(conn: &ConnArgs) -> Report {
                 json!({"project_id": marker.project_id}),
             )
             .await;
-            let (found, name) = match &fetched {
+            let (ok, name) = match &fetched {
                 Ok(v) => (
                     true,
                     v.pointer("/project/name")
@@ -350,53 +538,147 @@ async fn diagnose(conn: &ConnArgs) -> Report {
                         marker.path.display()
                     ),
                 ),
-                Err(e) => checks.add(
+                Err(e) => checks.fail(
                     "project",
-                    CheckStatus::Fail,
                     format!("#{} from {}: {e}", marker.project_id, marker.path.display()),
+                    format!(
+                        "check you can open project #{} in the AMP web UI as {}; if it is the \
+                         wrong project, fix \"project_id\" in {}",
+                        marker.project_id,
+                        found
+                            .whoami
+                            .as_ref()
+                            .and_then(|w| w.email.as_deref())
+                            .unwrap_or("this user"),
+                        marker.path.display()
+                    ),
                 ),
             }
-            project = Some(ProjectReport {
+            found.project = Some(ProjectReport {
                 marker: marker.path.display().to_string(),
                 id: marker.project_id,
                 name,
                 marker_name: marker.project_name.clone(),
-                found,
+                found: ok,
             });
         }
     }
     client.close().await;
-    finish(
-        Some(&settings),
-        auth,
-        connection,
-        tools,
-        whoami_report,
-        project,
-        checks,
-    )
+    found.settings = Some(settings);
+    found
 }
 
-fn finish(
-    settings: Option<&Settings>,
-    auth: AuthReport,
-    connection: ConnectionReport,
-    tools: Option<ToolsReport>,
-    whoami: Option<WhoamiReport>,
-    project: Option<ProjectReport>,
-    checks: Checks,
-) -> Report {
-    Report {
-        ok: checks.0.iter().all(|c| c.status != CheckStatus::Fail),
-        harness_version: env!("CARGO_PKG_VERSION"),
-        server: settings.map(server_report),
-        auth,
-        connection,
-        tools,
-        whoami,
-        project,
-        checks: checks.0,
+/// D3: a static token wins and is never stored; otherwise the store holds logins (warn on the file).
+async fn credentials_check(settings: &Settings, checks: &mut Checks, auth: &mut AuthReport) {
+    match &settings.auth {
+        Auth::Static { env, .. } => {
+            auth.method = Some(settings.auth.describe());
+            checks.add(
+                "credentials",
+                CheckStatus::Ok,
+                format!("static token from {env} (not stored)"),
+            );
+        }
+        Auth::None => match CredentialBackend::resolve() {
+            Ok(backend) => {
+                auth.credential_store = Some(backend.describe());
+                let stored = oauth::has_login(&settings.url, &backend).await;
+                auth.stored_login = stored.as_ref().ok().copied();
+                let finding = match (&stored, backend.is_keychain()) {
+                    (Err(e), _) => Finding::new(
+                        CheckStatus::Warn,
+                        format!("cannot read logins: {e}"),
+                    )
+                    .fix(format!(
+                        "run `amp-harness logout --url {0}` and then `amp-harness login --url {0}`",
+                        settings.url
+                    )),
+                    (Ok(_), false) => Finding::new(
+                        CheckStatus::Warn,
+                        format!(
+                            "no OS keychain; logins are kept in {} (mode 0600)",
+                            backend.describe()
+                        ),
+                    )
+                    .fix(file_store_fix()),
+                    (Ok(true), true) => Finding::new(
+                        CheckStatus::Ok,
+                        format!("login stored in {}", backend.describe()),
+                    ),
+                    (Ok(false), true) => Finding::new(
+                        CheckStatus::Ok,
+                        format!("no login stored in {}", backend.describe()),
+                    ),
+                };
+                checks.push("credentials", finding);
+            }
+            Err(e) => checks.push(
+                "credentials",
+                Finding::new(CheckStatus::Warn, e.to_string())
+                    .fix("set HOME (or XDG_CONFIG_HOME), or use AMP_TOKEN"),
+            ),
+        },
     }
+}
+
+fn file_store_fix() -> String {
+    let forced = std::env::var(amp_mcp::ENV_CREDENTIAL_STORE)
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"));
+    if forced {
+        format!(
+            "unset {} to keep logins in the OS keychain instead",
+            amp_mcp::ENV_CREDENTIAL_STORE
+        )
+    } else if cfg!(target_os = "linux") {
+        format!(
+            "start a Secret Service keyring (e.g. gnome-keyring-daemon) and log in again; to keep \
+             the file on purpose, set {}=file",
+            amp_mcp::ENV_CREDENTIAL_STORE
+        )
+    } else {
+        "unlock the OS keychain and run `amp-harness login` again".to_owned()
+    }
+}
+
+fn login_fix(settings: &Settings) -> String {
+    match &settings.auth {
+        Auth::Static { env, .. } => format!(
+            "{env} was not accepted: create a new token in the AMP web UI and export {env}=<token>, \
+             or unset {env} and run `amp-harness login --url {}`",
+            settings.url
+        ),
+        Auth::None => format!(
+            "run `amp-harness login --url {}` (or export AMP_TOKEN=<token from the AMP web UI>)",
+            settings.url
+        ),
+    }
+}
+
+/// `connect`'s detail and fix for a failed connection.
+fn connect_failure(e: &McpError, settings: &Settings, ca_broken: bool) -> (String, String) {
+    if e.is_auth_required() {
+        return (
+            format!("{} answered, but needs a login: {e}", settings.url),
+            login_fix(settings),
+        );
+    }
+    if ca_broken || matches!(e, McpError::CaFile { .. }) {
+        return (
+            e.to_string(),
+            "fix the `ca` check above, then run `amp-harness doctor` again".to_owned(),
+        );
+    }
+    let fix = if matches!(e, McpError::Config(_)) {
+        "fix the server URL: --url, AMP_MCP_URL or [server] url in config.toml".to_owned()
+    } else {
+        format!(
+            "is AMP running at {} (from {})? For local compose run `cd v2 && make up` (MCP at \
+             http://localhost:8000/mcp); otherwise pass --url or export AMP_MCP_URL=<your AMP's \
+             /mcp URL>",
+            settings.url, settings.url_source
+        )
+    };
+    (e.to_string(), fix)
 }
 
 fn print_human(r: &Report) {
@@ -415,6 +697,13 @@ fn print_human(r: &Report) {
         println!("  auth:     {method}");
     }
     println!();
+    let width = r
+        .checks
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(11);
     for c in &r.checks {
         let mark = match c.status {
             CheckStatus::Ok => "ok  ",
@@ -422,17 +711,34 @@ fn print_human(r: &Report) {
             CheckStatus::Fail => "FAIL",
             CheckStatus::Skip => "skip",
         };
-        println!("  [{mark}] {:<11} {}", c.name, c.detail);
+        println!("  [{mark}] {:<width$} {}", c.name, c.detail);
+        if let Some(fix) = &c.fix
+            && matches!(c.status, CheckStatus::Warn | CheckStatus::Fail)
+        {
+            println!("         {:<width$} fix: {fix}", "");
+        }
     }
     println!();
     if r.ok {
-        println!("All checks passed.");
+        let warned = r
+            .checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Warn)
+            .count();
+        if warned == 0 {
+            println!("All checks passed.");
+        } else {
+            println!(
+                "No failures ({warned} warning{}).",
+                if warned == 1 { "" } else { "s" }
+            );
+        }
     } else {
         let failed: Vec<&str> = r
             .checks
             .iter()
             .filter(|c| c.status == CheckStatus::Fail)
-            .map(|c| c.name)
+            .map(|c| c.name.as_str())
             .collect();
         println!("Failed: {}", failed.join(", "));
         if r.connection.reachable && !r.connection.connected {
