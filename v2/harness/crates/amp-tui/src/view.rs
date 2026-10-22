@@ -1,17 +1,19 @@
 //! The chat screen: pi's components laid out as D10 describes, updated from rpi agent events.
 //!
 //! Top to bottom:
-//! 1. **header slot** (empty until M3: brand bands, instance/user, org › project, MCP health,
-//!    current ticket);
+//! 1. **header slot**: the AMP header ([`crate::chrome`]: brand bands, instance/user,
+//!    org › project, MCP health; the current ticket);
 //! 2. the **transcript** in a primary scroll view (banner, user messages, assistant messages,
 //!    tool calls, notices), built from rpi-tui's own components so it reads like pi;
 //! 3. pi's **status slot** (the retry countdown);
 //! 4. the **editor** (pi's, with the working spinner in its top border while a run is going);
-//! 5. **AMP status line slot** (empty until M3: workers, questions, plan approval, board counts);
+//! 5. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
+//!    approval, board counts, artifacts in review, run reported);
 //! 6. pi's two-line **footer**, unchanged (cwd/branch/session; usage and model • thinking).
 //!
 //! Nothing here touches a terminal: [`ChatView::render_frame`] lays the screen out at any size,
-//! which is what the render tests (and `amp-harness --snapshot`) use.
+//! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
+//! render nothing until [`ChatView::chrome`] has a metadata source.
 
 use std::{
     collections::HashMap,
@@ -20,6 +22,8 @@ use std::{
 };
 
 use amp_core::events::{stop_reason_str, tool_result_text};
+
+use crate::chrome::Chrome;
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
@@ -54,6 +58,8 @@ pub struct ChatView {
     editor: Arc<Editor>,
     amp_status: Arc<Container>,
     footer: Arc<FooterComponent>,
+    /// The AMP header and status line's inputs (M3-3).
+    chrome: Chrome,
     root: Arc<dyn Component>,
     /// The assistant message being streamed, if any.
     assistant: Option<Arc<AssistantMessageComponent>>,
@@ -71,7 +77,9 @@ impl Default for ChatView {
 
 impl ChatView {
     pub fn new() -> Self {
+        let chrome = Chrome::new();
         let header = Arc::new(Container::new());
+        header.add_child(chrome.header());
         let transcript = Arc::new(Container::new());
         let scroll = Arc::new(ScrollView::primary(transcript.clone()));
         let status = Arc::new(Container::new());
@@ -84,6 +92,7 @@ impl ChatView {
         let editor_slot = Arc::new(Container::new());
         editor_slot.add_child(editor.clone());
         let amp_status = Arc::new(Container::new());
+        amp_status.add_child(chrome.status_line());
         let footer = Arc::new(FooterComponent::new());
         footer.set_hints("Enter send · Shift+Enter new line · Esc abort · Ctrl+C quit · /help");
 
@@ -108,6 +117,7 @@ impl ChatView {
             editor,
             amp_status,
             footer,
+            chrome,
             root: Arc::new(root),
             assistant: None,
             tools: HashMap::new(),
@@ -128,12 +138,17 @@ impl ChatView {
         &self.footer
     }
 
-    /// M3 slot: the AMP header (2 lines) goes in here. Empty containers render no lines.
+    /// The AMP header and status line's inputs: give it a metadata source to show them.
+    pub fn chrome(&self) -> &Chrome {
+        &self.chrome
+    }
+
+    /// The header slot: the AMP header (2 lines, the second only while a ticket is current).
     pub fn header_slot(&self) -> &Arc<Container> {
         &self.header
     }
 
-    /// M3 slot: the one-line AMP status line, between the editor and pi's footer.
+    /// The one-line AMP status line slot, between the editor and pi's footer.
     pub fn amp_status_slot(&self) -> &Arc<Container> {
         &self.amp_status
     }
@@ -213,6 +228,7 @@ impl ChatView {
 
     /// Applies one rpi agent event to the transcript and footer.
     pub fn apply(&mut self, event: &AgentEvent) {
+        self.chrome.observe(event);
         match event {
             AgentEvent::MessageStart {
                 message: AgentMessage::Assistant(m),

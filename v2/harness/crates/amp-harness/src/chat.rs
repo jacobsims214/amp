@@ -116,6 +116,12 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
 
     let Some((width, height)) = args.snapshot else {
         shell.set_meta(start_meta(&args.conn, project_id)?);
+        if let Some(sup) = session.supervisor.clone() {
+            shell
+                .view()
+                .chrome()
+                .set_workers(Arc::new(move || sup.workers()));
+        }
         return amp_tui::terminal::run(shell, events, done)
             .await
             .map_err(CliError::new);
@@ -164,8 +170,9 @@ fn load_theme(args: &ChatArgs) -> Result<AmpTheme, CliError> {
 
 /// Starts the AMP metadata poller (#2104) on its own MCP connection, made in the background with
 /// the same settings as the session's (so the TUI opens at once, and reconnects are possible).
-/// Its calls never go through the model. `--snapshot` does not start it yet (M3-3 decides how
-/// render checks wait for it).
+/// Its calls never go through the model. `--snapshot` does not start it, so its screen has no AMP
+/// header or status line and the model's calls are the only AMP calls; `debug render-chrome
+/// --live` is the render check with live metadata.
 fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, CliError> {
     let settings = conn.settings()?;
     let connector: Connector = Arc::new(move || {
