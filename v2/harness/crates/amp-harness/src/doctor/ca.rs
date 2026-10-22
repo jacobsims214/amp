@@ -162,16 +162,22 @@ pub fn classify_tls(error: &str, settings: &Settings) -> Option<Finding> {
                 "{host}'s certificate is not signed by the CA in {}",
                 path.display()
             ),
-            "export the CA that signed the server's current certificate and point --ca-file / \
-             AMP_CA_FILE at it"
-                .to_owned(),
+            format!(
+                "export the CA that signed the server's current certificate and save it: \
+                 `amp-harness server set {} --ca-file <PEM>` (or point --ca-file / AMP_CA_FILE \
+                 at it)",
+                settings.url
+            ),
         )
     } else {
         (
             format!("{host}'s certificate is not signed by a CA this machine trusts"),
-            "pass --ca-file <the server's CA, PEM> or set AMP_CA_FILE (docker-desktop cluster: \
-             amp-local-ca.crt, see the KB how-to/local-dev-setup.md)"
-                .to_owned(),
+            format!(
+                "save the server's CA with it: `amp-harness server set {} --ca-file <the server's \
+                 CA, PEM>` (or pass --ca-file / set AMP_CA_FILE; docker-desktop cluster: \
+                 amp-local-ca.crt, see the KB how-to/local-dev-setup.md)",
+                settings.url
+            ),
         )
     };
     Some(Finding::new(CheckStatus::Fail, detail).fix(fix))

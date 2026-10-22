@@ -17,6 +17,12 @@
 //! poller's connection, never through the model, in spawned tasks whose results
 //! [`Shell::poll`] applies, so the screen never waits on AMP.
 //!
+//! **`/server` (#2164).** `/server` lists the current AMP server and the saved ones; `/server
+//! <name|address>` switches the session to it without a restart, through the binary's
+//! [`ServerControl`]: the session's AMP connection, the model's AMP tools and system prompt, and
+//! the metadata poller (a new one replaces the old) all move to the new server. It is refused while
+//! a reply or a worker is running, since their calls would be cut off.
+//!
 //! Answering a question is a write: Enter on a question in `/questions` asks for the answer in
 //! the editor, the panel then shows exactly what will be sent, and only `y` / Enter sends it.
 //!
@@ -28,7 +34,7 @@
 //! stopped and its `amp_report_run` has returned. Without workers it waits [`ABORT_GRACE`] for the
 //! aborted prompt so its session file is complete.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 
 use amp_core::events::{RunEvent, Totals};
 use amp_core::meta::MetaHandle;
@@ -49,6 +55,25 @@ use crate::view::{ChatView, FooterInfo};
 /// Opens a URL in the browser (default: login's guarded opener; tests record instead).
 pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
+/// What `/server` lists and switches to (#2164). The binary implements it over config.toml and
+/// the session's AMP connection; the shell only calls it.
+pub trait ServerControl: Send + Sync {
+    /// The current server and the saved ones, as notice text.
+    fn describe(&self) -> String;
+    /// Switches the session to `target`: a saved server's name, or a server address.
+    fn switch(
+        self: Arc<Self>,
+        target: String,
+    ) -> Pin<Box<dyn Future<Output = Result<ServerSwitched, String>> + Send>>;
+}
+
+/// A finished switch: what to tell the person, and the new server's metadata poller (which
+/// replaces the old one in the header and the AMP commands).
+pub struct ServerSwitched {
+    pub notice: String,
+    pub meta: Option<MetaHandle>,
+}
+
 /// How long a command's read (`/plan`) may take.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long `amp_answer_question` may take.
@@ -66,6 +91,7 @@ enum ShellMsg {
         ticket: i64,
         result: Result<Value, String>,
     },
+    Server(Result<ServerSwitched, String>),
 }
 
 /// A finished `prompt_text` call (`Err` also covers a run task that panicked).
@@ -145,6 +171,7 @@ pub enum Submit {
 }
 
 pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id]\n\
+server: /server (list)  /server <name|address> (switch AMP server)\n\
 commands: /model [provider/model]  /usage  /help  /quit\n\
 keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit";
 
@@ -170,6 +197,10 @@ pub struct Shell {
     footer_ticket: Option<i64>,
     /// The manager's worker supervisor, so quitting can cancel and wait for its workers.
     supervisor: Option<Arc<Supervisor>>,
+    /// `/server` (#2164), if the caller gave one.
+    server: Option<Arc<dyn ServerControl>>,
+    /// A `/server` switch is running.
+    switching: bool,
 }
 
 impl Shell {
@@ -203,6 +234,8 @@ impl Shell {
                 marked: None,
                 footer_ticket: None,
                 supervisor: None,
+                server: None,
+                switching: false,
             },
             done_rx,
         )
@@ -223,6 +256,11 @@ impl Shell {
     /// Gives the shell the session's worker supervisor (the manager's; `None` for a worker role).
     pub fn set_supervisor(&mut self, supervisor: Option<Arc<Supervisor>>) {
         self.supervisor = supervisor;
+    }
+
+    /// Gives the shell `/server` (#2164).
+    pub fn set_server_control(&mut self, control: Arc<dyn ServerControl>) {
+        self.server = Some(control);
     }
 
     /// Tickets with a live (queued, running or reporting) worker.
@@ -399,6 +437,11 @@ impl Shell {
                 .add_notice("still working: wait for the reply, or press Esc to abort it");
             return Submit::Continue;
         }
+        if self.switching {
+            self.view
+                .add_notice("switching AMP servers: send it again once the switch is done");
+            return Submit::Continue;
+        }
         self.view.add_user(trimmed);
         self.start_run(trimmed.to_owned());
         Submit::Continue
@@ -467,6 +510,7 @@ impl Shell {
             "project" => self.project_command(arg),
             "plan" => self.plan_command(),
             "open" => self.open_command(arg),
+            "server" => self.server_command(arg),
             "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
@@ -538,6 +582,55 @@ impl Shell {
             }
         }
         self.view.panel().open(PanelState::new(PanelKind::Project));
+    }
+
+    /// `/server` lists the servers; `/server <name|address>` switches to one (#2164), in the
+    /// background, refused while a reply or a worker runs.
+    fn server_command(&mut self, arg: &str) {
+        let Some(control) = self.server.clone() else {
+            self.view
+                .add_notice("/server: not available in this session (no AMP connection to switch)");
+            return;
+        };
+        if arg.is_empty() {
+            self.view.add_notice(&control.describe());
+            return;
+        }
+        if self.switching {
+            self.view
+                .add_notice("/server: already switching; wait for it to finish");
+            return;
+        }
+        if self.running {
+            self.view.add_notice(
+                "/server: wait for the reply (or press Esc to abort it), then switch: its AMP calls \
+                 would be cut off",
+            );
+            return;
+        }
+        let live = self.live_tickets().len();
+        if live > 0 {
+            self.view.add_notice(&format!(
+                "/server: {live} worker{} still running on this server (/workers); switch once {} done",
+                if live == 1 { " is" } else { "s are" },
+                if live == 1 { "it is" } else { "they are" },
+            ));
+            return;
+        }
+        self.switching = true;
+        self.in_flight += 1;
+        self.view
+            .add_notice(&format!("switching to {}…", crate::chrome::clean(arg)));
+        let tx = self.msgs_tx.clone();
+        let target = arg.to_owned();
+        tokio::spawn(async move {
+            // Its own task, so a panic in the switch still ends `switching`.
+            let result = match tokio::spawn(control.switch(target)).await {
+                Ok(result) => result,
+                Err(e) => Err(format!("the switch crashed: {e}")),
+            };
+            let _ = tx.send(ShellMsg::Server(result));
+        });
     }
 
     /// `/plan`: plan approval from the snapshot, and the plan tree from `amp_get_plan` (read on
@@ -791,6 +884,18 @@ impl Shell {
                                 s.plan_blocked = blocked;
                             }
                         });
+                    }
+                }
+                ShellMsg::Server(result) => {
+                    self.switching = false;
+                    match result {
+                        Ok(switched) => {
+                            if let Some(meta) = switched.meta {
+                                self.set_meta(meta);
+                            }
+                            self.view.add_notice(&switched.notice);
+                        }
+                        Err(e) => self.view.add_error(&format!("/server: {e}")),
                     }
                 }
                 ShellMsg::Answered { ticket, result } => match result {

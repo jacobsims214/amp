@@ -667,8 +667,9 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
         ]
     );
     let fix = v["checks"][3]["fix"].as_str().unwrap();
+    // #2164: AMP_MCP_URL named the server: unset it, or switch with `amp-harness server`.
     assert!(
-        fix.contains("--url") && fix.contains("AMP_MCP_URL"),
+        fix.contains("unset AMP_MCP_URL") && fix.contains("amp-harness server set"),
         "{fix}"
     );
     assert!(

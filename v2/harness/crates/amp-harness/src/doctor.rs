@@ -354,8 +354,9 @@ async fn amp_checks(
             checks.fail(
                 "config",
                 e.to_string(),
-                "fix the setting the error names: --url / AMP_MCP_URL, --ca-file / AMP_CA_FILE, \
-                 --protocol / AMP_MCP_PROTOCOL, or [server] in ~/.config/amp-harness/config.toml",
+                "fix the setting the error names (--url / AMP_MCP_URL, --ca-file / AMP_CA_FILE, \
+                 --protocol / AMP_MCP_PROTOCOL); for the saved server run `amp-harness server` to \
+                 see where each setting comes from and `amp-harness server set <url>` to replace it",
             );
             checks.skip(&["credentials", "ca", "connect"], "no settings");
             checks.push(
@@ -669,12 +670,22 @@ fn connect_failure(e: &McpError, settings: &Settings, ca_broken: bool) -> (Strin
         );
     }
     let fix = if matches!(e, McpError::Config(_)) {
-        "fix the server URL: --url, AMP_MCP_URL or [server] url in config.toml".to_owned()
+        "fix the server URL: `amp-harness server set <url>` checks and saves it (or pass --url / \
+         AMP_MCP_URL for one command)"
+            .to_owned()
     } else {
+        let switch = match &settings.url_source {
+            amp_mcp::Source::Env(var) => format!(
+                "unset {var} (it overrides the saved server), or switch with `amp-harness server \
+                 use <name>` / `amp-harness server set <your AMP's address>`"
+            ),
+            _ => "otherwise switch to your AMP with `amp-harness server set <its address>` (or \
+                  `amp-harness server use <name>` for a saved one)"
+                .to_owned(),
+        };
         format!(
             "is AMP running at {} (from {})? For local compose run `cd v2 && make up` (MCP at \
-             http://localhost:8000/mcp); otherwise pass --url or export AMP_MCP_URL=<your AMP's \
-             /mcp URL>",
+             http://localhost:8000/mcp); {switch}",
             settings.url, settings.url_source
         )
     };

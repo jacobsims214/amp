@@ -8,6 +8,7 @@
 //! - M3-3: hidden `debug render-chrome` prints the chat's AMP header and status line.
 //!
 //! - M4-1: `init` and the first run of the chat (server, login, project, provider key).
+//! - #2164: `server` / `server set <url>` / `server use <name>` and the chat's `/server`.
 
 mod chat;
 mod config_cmd;
@@ -16,6 +17,7 @@ mod debug;
 mod doctor;
 mod mcp_cmd;
 mod run;
+mod server_cmd;
 mod session;
 mod setup;
 mod tickets;
@@ -86,6 +88,9 @@ enum Command {
     /// Providers, models and the model each role runs on.
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+    /// Show, save and switch AMP servers (`server`, `server set <url>`, `server use <name>`),
+    /// without editing config.toml by hand.
+    Server(server_cmd::ServerArgs),
     /// Set up this machine and folder: AMP server, login, project (.amp.json), provider key.
     /// Asks for whatever the flags leave open when run in a terminal; `--yes` never asks.
     Init(setup::InitArgs),
@@ -154,6 +159,7 @@ async fn main() -> ExitCode {
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
         Some(Command::Init(args)) => setup::init(args).await,
+        Some(Command::Server(args)) => server_cmd::run(args).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
         Some(Command::Debug(command)) => debug::run(command).await,
         None => chat::run(cli.chat).await,
