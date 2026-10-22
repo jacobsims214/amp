@@ -10,7 +10,8 @@ build = "build.rs"
 
 [dependencies]
 amp-mcp.workspace = true
-rpi-ai.workspace = true
+# `providers`: rpi's HTTP providers (Anthropic Messages, OpenAI Chat Completions); off by default.
+rpi-ai = { workspace = true, features = ["providers"] }
 rpi-agent.workspace = true
 rpi-tools.workspace = true
 rpi-harness.workspace = true
@@ -19,6 +20,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 include_dir.workspace = true
 yaml_serde.workspace = true
+async-trait.workspace = true
+keyring.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tokio-util.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

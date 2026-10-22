@@ -1,0 +1,224 @@
+# AMP harness: shipped providers, models and per-role model assignments (D9, ticket #2091).
+#
+# Embedded in the binary (amp-core `models::DEFAULTS_TOML`). Users override any part of it in
+# ~/.config/amp-harness/config.toml with the same tables; `amp-harness config show` prints the result.
+#
+# - [providers.<id>]                 an API endpoint. Several providers are active at once.
+# - [providers.<id>.models."<model>"] a model that provider serves (limits, prices, thinking map).
+# - [roles.<role>]                   the model each agent role runs on, as "provider/model".
+#                                    These mirror v2/.opencode/agent/*.md (model + variant).
+# - [profiles.<name>.roles.<role>]   an alternative set of assignments, picked with
+#                                    [models] profile = "<name>" in config.toml.
+#
+# There is no default provider: every role names its own provider/model. Keys never live in this
+# file. They come from the provider's key_env variable first, then the OS keychain
+# (service "amp-harness", account "provider:<id>").
+#
+# Thinking levels (rpi): off, minimal, low, medium, high, xhigh, max. A model's thinking_map turns a
+# level into the provider's value (Anthropic effort, OpenAI-compatible reasoning_effort). A level
+# listed in unsupported_thinking is never sent; a level the model lacks is clamped down.
+#
+# Model ids and prices checked 2026-10-22: OpenRouter live (GET https://openrouter.ai/api/v1/models);
+# Anthropic from the Anthropic API model table (no key here for a live check;
+# `amp-harness config show --check` does it when ANTHROPIC_API_KEY is set).
+
+# ---------------------------------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------------------------------
+
+[providers.anthropic]
+api = "anthropic-messages"
+base_url = "https://api.anthropic.com"
+key_env = "ANTHROPIC_API_KEY"
+connect_timeout_secs = 30
+# Time to the first streamed event (covers rpi's retries of 429/5xx too).
+header_timeout_secs = 180
+# Longest gap between streamed events. Opus at high effort can think quietly for a while.
+stream_idle_timeout_secs = 300
+request_timeout_secs = 3600
+max_retries = 3
+
+# Current Opus: adaptive thinking only. Sending thinking:disabled is a 400, so `off` is
+# unsupported; the model then thinks at its own default effort.
+[providers.anthropic.models."claude-opus-5-5"]
+name = "Claude Opus 5.5"
+reasoning = true
+context_window = 1000000
+max_tokens = 128000
+input = ["text", "image"]
+cost = { input = 4.0, output = 20.0, cache_read = 0.2, cache_write = 5.0 }
+thinking_map = { xhigh = "xhigh", max = "max" }
+unsupported_thinking = ["off"]
+compat = { force_adaptive_thinking = true, supports_temperature = false, supports_strict_tools = true }
+
+# Current Sonnet: same rules (thinking:disabled is a 400).
+[providers.anthropic.models."claude-sonnet-5-5"]
+name = "Claude Sonnet 5.5"
+reasoning = true
+context_window = 1000000
+max_tokens = 128000
+input = ["text", "image"]
+cost = { input = 2.0, output = 10.0, cache_read = 0.2, cache_write = 2.5 }
+thinking_map = { xhigh = "xhigh", max = "max" }
+unsupported_thinking = ["off"]
+compat = { force_adaptive_thinking = true, supports_temperature = false, supports_strict_tools = true }
+
+# In rpi's built-in Anthropic catalog; listed so roles can pick it.
+[providers.anthropic.models."claude-haiku-4-5"]
+
+[providers.openrouter]
+api = "openai-completions"
+base_url = "https://openrouter.ai/api/v1"
+key_env = "OPENROUTER_API_KEY"
+headers = { "X-Title" = "AMP Harness", "HTTP-Referer" = "https://github.com/jacobsims214/amp" }
+connect_timeout_secs = 30
+# Mirrors opencode.json (headerTimeout 60 s, chunkTimeout 120 s): DeepSeek stalls mid-stream.
+header_timeout_secs = 60
+stream_idle_timeout_secs = 120
+request_timeout_secs = 3600
+max_retries = 3
+
+# max_tokens 32768 mirrors opencode.json's output limit for these models.
+[providers.openrouter.models."xiaomi/mimo-v2.6-pro"]
+name = "MiMo-V2.6-Pro"
+reasoning = true
+context_window = 1050000
+max_tokens = 32768
+input = ["text", "image"]
+cost = { input = 0.435, output = 0.87, cache_read = 0.0036 }
+# MiMo takes reasoning on/off, not an effort (OpenRouter lists no reasoning_effort for it).
+# The roles send opencode's variant body ("on") as extra_body.
+compat = { supports_reasoning_effort = false }
+
+[providers.openrouter.models."deepseek/deepseek-v4.1-flash-1017"]
+name = "DeepSeek V4.1 Flash (1017)"
+reasoning = true
+context_window = 1048576
+max_tokens = 32768
+input = ["text", "image"]
+cost = { input = 0.15, output = 0.6, cache_read = 0.003 }
+thinking_map = { off = "none", minimal = "low", low = "low", medium = "high", high = "high", max = "max" }
+# DeepSeek bills the chain of thought inside max_tokens; reserve room for the answer.
+compat = { reasoning_counts_toward_max_tokens = true }
+
+[providers.openrouter.models."z-ai/glm-5.3"]
+name = "GLM-5.3"
+reasoning = true
+context_window = 1048576
+max_tokens = 32768
+input = ["text"]
+cost = { input = 0.7, output = 2.2, cache_read = 0.13 }
+thinking_map = { minimal = "low", low = "low", medium = "high", high = "high", max = "max" }
+unsupported_thinking = ["off"]
+
+[providers.openrouter.models."moonshotai/kimi-k3"]
+name = "Kimi K3"
+reasoning = true
+context_window = 1048576
+max_tokens = 32768
+input = ["text", "image"]
+cost = { input = 0.239, output = 11.936, cache_read = 0.21 }
+thinking_map = { off = "none", minimal = "low", low = "low", medium = "high", high = "high", max = "max" }
+
+# ---------------------------------------------------------------------------------------------------
+# Roles: the opencode roster (v2/.opencode/agent/amp-<role>.md `model` + `variant`).
+# ---------------------------------------------------------------------------------------------------
+
+[roles.manager]
+model = "openrouter/xiaomi/mimo-v2.6-pro"
+thinking = "high"
+extra_body = { reasoning = { enabled = true } }
+
+[roles.researcher]
+model = "openrouter/xiaomi/mimo-v2.6-pro"
+thinking = "high"
+extra_body = { reasoning = { enabled = true } }
+
+[roles.media]
+model = "openrouter/xiaomi/mimo-v2.6-pro"
+thinking = "high"
+extra_body = { reasoning = { enabled = true } }
+
+[roles.worker-backend]
+model = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+thinking = "max"
+
+[roles.worker-frontend]
+model = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+thinking = "max"
+
+[roles.worker-docs]
+model = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+thinking = "high"
+
+[roles.github-researcher]
+model = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+thinking = "high"
+
+[roles.kb-curator]
+model = "openrouter/deepseek/deepseek-v4.1-flash-1017"
+thinking = "high"
+
+[roles.reviewer]
+model = "openrouter/z-ai/glm-5.3"
+thinking = "max"
+
+[roles.github-reviewer]
+model = "openrouter/z-ai/glm-5.3"
+thinking = "max"
+
+[roles.designer]
+model = "openrouter/moonshotai/kimi-k3"
+thinking = "high"
+
+# ---------------------------------------------------------------------------------------------------
+# Profile "anthropic": for users with only an Anthropic key. Manager and reviewers on Opus,
+# workers on Sonnet (D9).
+# ---------------------------------------------------------------------------------------------------
+
+[profiles.anthropic]
+description = "Anthropic only: Opus for the manager and reviewers, Sonnet for the other workers"
+
+[profiles.anthropic.roles.manager]
+model = "anthropic/claude-opus-5-5"
+thinking = "high"
+
+[profiles.anthropic.roles.reviewer]
+model = "anthropic/claude-opus-5-5"
+thinking = "high"
+
+[profiles.anthropic.roles.github-reviewer]
+model = "anthropic/claude-opus-5-5"
+thinking = "high"
+
+[profiles.anthropic.roles.worker-backend]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "high"
+
+[profiles.anthropic.roles.worker-frontend]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "high"
+
+[profiles.anthropic.roles.designer]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "high"
+
+[profiles.anthropic.roles.worker-docs]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "medium"
+
+[profiles.anthropic.roles.researcher]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "medium"
+
+[profiles.anthropic.roles.media]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "medium"
+
+[profiles.anthropic.roles.github-researcher]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "medium"
+
+[profiles.anthropic.roles.kb-curator]
+model = "anthropic/claude-sonnet-5-5"
+thinking = "medium"

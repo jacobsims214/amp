@@ -2,9 +2,11 @@
 //!
 //! - M1-3: `login` / `logout` (OAuth with the keychain credential store, D3).
 //! - M1-4: `doctor`, `whoami`, `tickets list|get` (each with `--json`) and the hidden `mcp call`.
+//! - M2-3: `config show` (providers and the provider/model each role resolves to).
 //!
 //! Later milestones add the TUI (default), init and run.
 
+mod config_cmd;
 mod conn;
 mod doctor;
 mod mcp_cmd;
@@ -63,6 +65,9 @@ enum Command {
     /// List and read tickets.
     #[command(subcommand)]
     Tickets(tickets::TicketsCommand),
+    /// Providers, models and the model each role runs on.
+    #[command(subcommand)]
+    Config(config_cmd::ConfigCommand),
     /// Debug: call AMP tools directly.
     #[command(subcommand, hide = true)]
     Mcp(mcp_cmd::McpCommand),
@@ -122,6 +127,7 @@ async fn main() -> ExitCode {
         Some(Command::Doctor(args)) => doctor::run(args.conn, args.json).await,
         Some(Command::Whoami(args)) => whoami::run(args.conn, args.json).await,
         Some(Command::Tickets(command)) => tickets::run(command).await,
+        Some(Command::Config(command)) => config_cmd::run(command).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
         None => {
             eprintln!(
