@@ -47,6 +47,7 @@ const TOOLS: &[&str] = &[
     "amp_get_plan",
     "amp_check_plan",
     "amp_list_artifacts",
+    "amp_answer_question",
 ];
 
 /// What the mock answers; tests change it while the poller runs.
@@ -201,6 +202,10 @@ impl ServerHandler for Mock {
                     "count": 38, "owner_filter": "any"
                 }))
             }
+            "amp_get_task" if args["task_id"] == 99_999 => {
+                Err(ErrorData::invalid_params("task 99999 not found", None))
+            }
+            "amp_answer_question" => ok(json!({"ok": true, "task_id": args["task_id"]})),
             "amp_get_task" => {
                 let id = args["task_id"].as_i64().unwrap_or(0);
                 let state = if id == 2104 {
@@ -563,6 +568,7 @@ async fn health_follows_failures_slowness_and_auth() {
     let mut iv = fast(3_600_000);
     iv.idle_ping = Duration::from_millis(100);
     iv.slow_after = Duration::from_millis(150);
+    iv.call_timeout = Duration::from_millis(500);
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
@@ -574,7 +580,29 @@ async fn health_follows_failures_slowness_and_auth() {
     wait_calls(mock, "idle pings", |m| m.count("amp_whoami") >= 3).await;
     assert_eq!(mock.count("amp_list_tasks"), 0);
 
+    // #2108: AMP answering with an error (a JSON-RPC error here) is the item's error, not the
+    // connection's: the user item goes stale and the health stays connected.
     mock.fail.store(true, Ordering::SeqCst);
+    let m = wait_for(&meta, "a stale user", |m| m.user.error.is_some()).await;
+    assert!(m.user.get().is_some(), "the last good value is kept");
+    assert_eq!(m.health.connection, Connection::Ok);
+    let calls = mock.count("amp_whoami");
+    wait_calls(mock, "more failing pings", |m| {
+        m.count("amp_whoami") >= calls + 2
+    })
+    .await;
+    let m = meta.snapshot();
+    assert_eq!(m.health.connection, Connection::Ok, "still connected");
+    assert!(
+        m.health
+            .last_ok
+            .is_some_and(|at| at >= m.health.last_call.unwrap())
+    );
+    mock.fail.store(false, Ordering::SeqCst);
+    wait_for(&meta, "a fresh user", |m| m.user.error.is_none()).await;
+
+    // No answer in time (a transport-level failure) degrades the connection.
+    mock.delay_ms.store(800, Ordering::SeqCst);
     let m = wait_for(&meta, "degraded", |m| {
         matches!(m.health.connection, Connection::Degraded { .. })
     })
@@ -583,7 +611,7 @@ async fn health_follows_failures_slowness_and_auth() {
     assert!(m.user.get().is_some(), "the last good value is kept");
     assert!(m.user.error.is_some());
 
-    mock.fail.store(false, Ordering::SeqCst);
+    mock.delay_ms.store(0, Ordering::SeqCst);
     wait_for(&meta, "recovered", |m| {
         m.health.connection == Connection::Ok
     })
@@ -607,6 +635,109 @@ async fn health_follows_failures_slowness_and_auth() {
         m.health.connection == Connection::Ok
     })
     .await;
+}
+
+/// #2108: a ticket that doesn't exist is that item's error (the header shows it unavailable); the
+/// connection stays healthy. Slash commands' own calls run on the poller's connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_the_poller() {
+    let server = serve(Mock::new(default_board())).await;
+    let mock = &server.mock;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(99_999),
+            intervals: fast(3_600_000),
+            connector: None,
+        },
+    );
+    let m = wait_for(&meta, "the missing ticket's error", |m| {
+        m.ticket.error.is_some() && m.board.get().is_some()
+    })
+    .await;
+    assert!(m.ticket.get().is_none());
+    assert!(
+        m.ticket.error.as_deref().unwrap().contains("not found"),
+        "{:?}",
+        m.ticket.error
+    );
+    assert_eq!(m.health.connection, Connection::Ok);
+    assert_eq!(m.health.connection.level(), HealthLevel::Ok);
+
+    // A read through the poller: answered, nothing refreshed.
+    let boards = mock.count("amp_list_tasks");
+    let plan = meta
+        .call(
+            "amp_get_plan",
+            json!({"project_id": 2}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan["epics"][1]["name"], "AMP Harness");
+    // A failed call: its error comes back, the connection stays healthy.
+    let err = meta
+        .call(
+            "amp_get_task",
+            json!({"task_id": 99_999}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("not found"), "{err}");
+    assert_eq!(meta.snapshot().health.connection, Connection::Ok);
+    // A write: answered, then the board it touched is refetched.
+    let answered = meta
+        .call(
+            "amp_answer_question",
+            json!({"task_id": 2107, "answer": "Dark"}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answered["ok"], true);
+    assert_eq!(
+        mock.args_of("amp_answer_question"),
+        vec![json!({"task_id": 2107, "answer": "Dark"})]
+    );
+    wait_calls(mock, "the board refetched after the answer", |m| {
+        m.count("amp_list_tasks") > boards
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stub_handle_answers_without_amp() {
+    let meta = MetaHandle::stub(
+        AmpMeta::default(),
+        Arc::new(|tool, args| match tool {
+            "amp_get_plan" => Ok(json!({"epics": [], "project_id": args["project_id"]})),
+            other => Err(format!("{other}: no")),
+        }),
+    );
+    meta.set_project(Some(5));
+    meta.set_ticket(Some(7));
+    let m = wait_for(&meta, "the ids", |m| {
+        m.project_id == Some(5) && m.ticket_id == Some(7)
+    })
+    .await;
+    assert!(m.revision >= 2);
+    let plan = meta
+        .call(
+            "amp_get_plan",
+            json!({"project_id": 5}),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan["project_id"], 5);
+    assert!(
+        meta.call("amp_x", json!({}), Duration::from_secs(1))
+            .await
+            .is_err()
+    );
+    assert_eq!(meta.stub_calls().len(), 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -726,5 +857,17 @@ async fn live_amp_when_asked() {
             b.questions.len()
         );
     }
+    assert_eq!(m.health.connection.level(), HealthLevel::Ok);
+
+    // #2108: a ticket that doesn't exist is that item's error; the connection stays healthy.
+    meta.set_ticket(Some(999_999_999));
+    let m = wait_for(&meta, "the missing ticket's error", |m| {
+        m.ticket_id == Some(999_999_999) && m.ticket.error.is_some()
+    })
+    .await;
+    println!(
+        "missing ticket: {:?} · health {}",
+        m.ticket.error, m.health.connection
+    );
     assert_eq!(m.health.connection.level(), HealthLevel::Ok);
 }

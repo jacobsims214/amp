@@ -206,7 +206,8 @@ async fn event_loop(
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let editor = shell.view().editor().clone();
-                        if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor.get_text().is_empty()) {
+                        let editor_empty = editor.get_text().is_empty();
+                        if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor_empty) {
                             if shell.is_running() {
                                 shell.abort().await;
                             } else if !editor.get_text().is_empty() {
@@ -214,6 +215,8 @@ async fn event_loop(
                             } else {
                                 break;
                             }
+                        } else if shell.panel_key(&key, editor_empty) {
+                            // An open AMP panel took it (select, answer, open, close).
                         } else if key.code == KeyCode::Esc && shell.is_running() {
                             shell.abort().await;
                         } else {
@@ -240,10 +243,12 @@ async fn event_loop(
             _ = ticker.tick() => {
                 tui.ensure_size();
                 let retrying = shell.view().tick();
+                // Finished AMP command calls, the ticket marker and the footer's #ticket.
+                let amp_changed = shell.poll();
                 let chrome = shell.view().chrome().fingerprint();
                 let chrome_changed = chrome != chrome_seen;
                 chrome_seen = chrome;
-                if shell.is_running() || retrying || chrome_changed {
+                if shell.is_running() || retrying || chrome_changed || amp_changed {
                     tui.request_render(false);
                 }
             }

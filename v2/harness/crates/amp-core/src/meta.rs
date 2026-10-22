@@ -27,6 +27,16 @@
 //! The current ticket is whatever [`MetaHandle::set_ticket`] or the last `amp_claim_task` names.
 //! Dispatching or running a ticket for a worker (`amp_dispatch_task`, `amp_run_ticket`) does not
 //! change it: those tickets are workers' (the supervisor's `/workers` view), not this session's.
+//!
+//! **Health vs. item errors (#2108).** Only transport, timeout and auth failures change
+//! [`MetaHealth::connection`]. When AMP answers a call with an error (a tool `isError` result, or
+//! a JSON-RPC error such as "task 99999 not found"), the connection stays healthy and only that
+//! item records the error ([`Fetched::error`]: it keeps its last value, shown stale, or shows as
+//! unavailable).
+//!
+//! The slash commands' own calls (`/plan`'s `amp_get_plan`, `/questions`' `amp_answer_question`)
+//! go through [`MetaHandle::call`], on the poller's connection; a successful write refreshes what
+//! it touched like a model's call does. [`MetaHandle::stub`] is a handle without AMP, for tests.
 
 use std::{
     collections::HashMap,
@@ -43,7 +53,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
-    watch,
+    oneshot, watch,
 };
 
 use crate::tickets::Status;
@@ -833,14 +843,35 @@ enum Command {
     Refresh(Topics),
     SetProject(Option<i64>),
     SetTicket(Option<i64>),
+    Call(Call),
 }
+
+/// A tool call asked for by the TUI (a slash command), run on the poller's connection.
+struct Call {
+    tool: String,
+    args: Value,
+    timeout: Duration,
+    reply: oneshot::Sender<Result<Value, String>>,
+}
+
+/// Answers [`MetaHandle::stub`]'s calls: `(tool, arguments) -> result`.
+pub type StubResponder = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Send + Sync>;
 
 struct Inner {
     commands: UnboundedSender<Command>,
     meta: watch::Receiver<Arc<AmpMeta>>,
     /// `amp_*` tool calls in flight: call id → (name, arguments), from `ToolExecutionStart`.
     started: Mutex<HashMap<String, (String, Value)>>,
+    /// [`MetaHandle::stub`] only: the calls it answered.
+    stub_calls: Option<CallLog>,
 }
+
+/// The calls a [`MetaHandle::stub`] answered: (tool, arguments).
+type CallLog = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// How long [`MetaHandle::call`] waits beyond its own timeout for the poller to get to the call
+/// (it may be in the middle of a refresh, whose calls have their own 10 s timeouts).
+pub const CALL_QUEUE_GRACE: Duration = Duration::from_secs(30);
 
 /// The TUI's side of the poller. Clone it freely; the poller stops when the last clone drops.
 #[derive(Clone)]
@@ -878,6 +909,79 @@ impl MetaHandle {
     /// Switches the current ticket (`/ticket`, a claim): clears its items and refetches them.
     pub fn set_ticket(&self, ticket_id: Option<i64>) {
         let _ = self.0.commands.send(Command::SetTicket(ticket_id));
+    }
+
+    /// Calls an AMP tool on the poller's own connection (a slash command's read or write; never
+    /// the model's). `timeout` bounds the call itself; the whole wait, including a refresh the
+    /// poller may be in the middle of, is bounded by `timeout` + [`CALL_QUEUE_GRACE`]. When a
+    /// write succeeds, what it touched is refetched ([`topics_for_tool`]).
+    pub async fn call(&self, tool: &str, args: Value, timeout: Duration) -> Result<Value, String> {
+        let (reply, answer) = oneshot::channel();
+        self.0
+            .commands
+            .send(Command::Call(Call {
+                tool: tool.to_owned(),
+                args,
+                timeout,
+                reply,
+            }))
+            .map_err(|_| "the AMP metadata poller has stopped".to_owned())?;
+        match tokio::time::timeout(timeout + CALL_QUEUE_GRACE, answer).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err("the AMP metadata poller has stopped".to_owned()),
+            Err(_) => Err(format!(
+                "{tool}: no answer within {:?}",
+                timeout + CALL_QUEUE_GRACE
+            )),
+        }
+    }
+
+    /// A handle on a fixed snapshot with no AMP connection, for tests and render checks.
+    /// [`Self::set_project`] / [`Self::set_ticket`] change the snapshot's ids (keeping the other
+    /// items), [`Self::call`] is answered by `responder`, and refreshes do nothing. Every call is
+    /// also recorded in [`Self::stub_calls`]. Must be called inside a tokio runtime.
+    pub fn stub(meta: AmpMeta, responder: StubResponder) -> Self {
+        let (tx, rx) = watch::channel(Arc::new(meta));
+        let (commands, mut command_rx) = unbounded_channel::<Command>();
+        let calls: CallLog = Arc::default();
+        let recorded = Arc::clone(&calls);
+        tokio::spawn(async move {
+            while let Some(cmd) = command_rx.recv().await {
+                let bump = |f: &dyn Fn(&mut AmpMeta)| {
+                    tx.send_modify(|arc| {
+                        let m = Arc::make_mut(arc);
+                        f(m);
+                        m.revision += 1;
+                    })
+                };
+                match cmd {
+                    Command::Refresh(_) => {}
+                    Command::SetProject(id) => bump(&|m| m.project_id = id),
+                    Command::SetTicket(id) => bump(&|m| m.ticket_id = id),
+                    Command::Call(c) => {
+                        if let Ok(mut log) = recorded.lock() {
+                            log.push((c.tool.clone(), c.args.clone()));
+                        }
+                        let _ = c.reply.send(responder(&c.tool, &c.args));
+                    }
+                }
+            }
+        });
+        Self(Arc::new(Inner {
+            commands,
+            meta: rx,
+            started: Mutex::new(HashMap::new()),
+            stub_calls: Some(calls),
+        }))
+    }
+
+    /// The calls a [`Self::stub`] handle answered, in order (empty for a real poller).
+    pub fn stub_calls(&self) -> Vec<(String, Value)> {
+        self.0
+            .stub_calls
+            .as_ref()
+            .and_then(|c| c.lock().ok().map(|c| c.clone()))
+            .unwrap_or_default()
     }
 
     /// Reports a finished tool call by name and arguments. Errors change nothing, so pass only
@@ -946,6 +1050,8 @@ pub struct MetaPoller {
     /// `amp_get_plan` cache: (project id, epics as (id, name, stories as (id, name))).
     tree: Option<(i64, Vec<EpicNode>)>,
     next_reconnect: Option<Instant>,
+    /// Slash-command calls waiting to run ([`MetaHandle::call`]).
+    calls: Vec<Call>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1006,12 +1112,14 @@ impl MetaPoller {
             schedule: Schedule::default(),
             tree: None,
             next_reconnect: None,
+            calls: Vec::new(),
         };
         tokio::spawn(poller.run(command_rx));
         MetaHandle(Arc::new(Inner {
             commands,
             meta: rx,
             started: Mutex::new(HashMap::new()),
+            stub_calls: None,
         }))
     }
 
@@ -1033,6 +1141,7 @@ impl MetaPoller {
             if self.ensure_client().await {
                 pending |= Topics::ALL;
             }
+            pending |= self.run_calls().await;
             if self.client.is_some() {
                 let now = Instant::now();
                 pending |= self
@@ -1059,7 +1168,7 @@ impl MetaPoller {
                     (Some(_), None) => now,
                     (None, _) => now + Duration::from_secs(24 * 3600),
                 }
-            } else if !pending.is_empty() {
+            } else if !pending.is_empty() || !self.calls.is_empty() {
                 continue;
             } else {
                 let mut wake = self
@@ -1083,6 +1192,10 @@ impl MetaPoller {
     fn apply(&mut self, cmd: Command) -> Topics {
         match cmd {
             Command::Refresh(t) => t,
+            Command::Call(call) => {
+                self.calls.push(call);
+                Topics::NONE
+            }
             Command::SetProject(id) => {
                 if self.meta().project_id == id {
                     return Topics::NONE;
@@ -1157,8 +1270,40 @@ impl MetaPoller {
         }
     }
 
+    /// Runs the queued slash-command calls. Without a client they fail at once (rather than wait
+    /// for a reconnect). Returns what successful writes touched.
+    async fn run_calls(&mut self) -> Topics {
+        let mut touched = Topics::NONE;
+        for c in std::mem::take(&mut self.calls) {
+            let open = self.client.as_ref().is_some_and(|c| !c.is_closed());
+            let result = if open {
+                self.call_with(&c.tool, c.args.clone(), c.timeout).await
+            } else {
+                Err(format!("{}: not connected to AMP", c.tool))
+            };
+            if result.is_ok() {
+                touched |= topics_for_tool(&c.tool, &c.args, self.meta().ticket_id);
+            }
+            let _ = c.reply.send(result);
+        }
+        touched
+    }
+
     /// One AMP call on the poller's client: JSON out, health in.
     async fn call(&mut self, tool: &str, args: Value) -> Result<Value, String> {
+        let timeout = self.iv.call_timeout;
+        self.call_with(tool, args, timeout).await
+    }
+
+    /// [`Self::call`] with its own timeout. The connection's health follows transport, timeout
+    /// and auth failures only: an error AMP answered with (`isError`, or a JSON-RPC error such
+    /// as an unknown ticket) is the caller's item error, not the connection's.
+    async fn call_with(
+        &mut self,
+        tool: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let Some(client) = self.client.clone() else {
             return Err("not connected".to_owned());
         };
@@ -1168,13 +1313,15 @@ impl MetaPoller {
         };
         let started = Instant::now();
         let result = client
-            .call_tool_with_timeout(tool, arguments, self.iv.call_timeout)
+            .call_tool_with_timeout(tool, arguments, timeout)
             .await;
         let latency = started.elapsed();
         let now = Instant::now();
         self.schedule.called(now);
         let connection = Connection::after_call(client.health(), latency, self.iv.slow_after);
-        let answered = result.is_ok();
+        let answered = result
+            .as_ref()
+            .map_or_else(McpError::is_server_error, |_| true);
         self.update(|m| {
             m.health.connection = connection;
             m.health.latency = Some(latency);

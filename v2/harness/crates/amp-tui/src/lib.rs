@@ -21,17 +21,25 @@
 //!   [`view::ChatView::amp_status_slot`] and show [`view::ChatView::chrome`]'s inputs (the
 //!   metadata poller's snapshot); without a metadata source they render nothing.
 //!
+//! - [`overlay`] and [`amp_render`] (M3-4 #2108): the AMP slash commands' panels (`/amp`,
+//!   `/ticket`, `/workers`, `/questions`, `/plan`, `/project`; `/open` opens the browser), `amp_*`
+//!   tool calls titled `AMP · complete_task #2078`, and the transcript marker when the current
+//!   ticket changes.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
+pub mod amp_render;
 pub mod chrome;
+pub mod overlay;
 pub mod shell;
 pub mod terminal;
 pub mod theme;
 pub mod view;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
-pub use shell::{HELP, ModelChoice, RunDone, Shell, ShellInfo, Submit};
+pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
+pub use shell::{HELP, ModelChoice, Opener, RunDone, Shell, ShellInfo, Submit};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use view::{ChatView, FooterInfo};
 

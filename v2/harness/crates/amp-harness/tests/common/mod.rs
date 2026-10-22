@@ -280,6 +280,11 @@ impl ServerHandler for MockAmp {
                 {"id": 161, "name": "AMP Harness", "stories": [{"id": 391, "name": "M1 CLI"}]}
             ]})),
             "amp_list_artifacts" => ok_json(json!({"artifacts": []})),
+            // M3-4: /questions answers through the metadata poller's connection.
+            "amp_answer_question" => match args["task_id"].as_i64() {
+                Some(2084) => ok_json(json!({"task_id": 2084, "state": "backlog", "ok": true})),
+                _ => tool_error("task is not blocked with a question"),
+            },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "plain text, not JSON",

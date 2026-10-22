@@ -92,7 +92,9 @@ async fn the_chat_talks_to_the_manager() {
     for text in [
         "who am I?",
         "Checking who you are.",
-        "amp_whoami",
+        // M3-4 (#2108): AMP tools are titled the web UI's way, with a compact result.
+        "✓ AMP · whoami",
+        "email: local-dev@example.com",
         "You are local-dev.",
         "are you still there?",
         "Still here, same conversation.",
@@ -227,4 +229,73 @@ async fn the_chat_uses_the_amp_theme() {
         out.stderr
     );
     assert_eq!(amp.mock.calls_to("amp_whoami").len(), calls);
+}
+
+/// M3-4 (#2108): with `--meta` the snapshot runs the metadata poller, so the AMP commands work
+/// against the mock: `/ticket` switches the current ticket (header, marker, footer), `/questions`
+/// answers a question only after `key:y` confirms it, `/workers`, `/plan`, `/open`.
+#[tokio::test]
+async fn amp_commands_with_the_metadata_poller() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("chat-amp-commands", json!([]));
+    let out = harness(
+        &dir,
+        &amp.url,
+        &[
+            "--snapshot",
+            "160x60",
+            "--meta",
+            "--input",
+            "/ticket 2085",
+            "--input",
+            "/questions",
+            "--input",
+            "key:enter",
+            "--input",
+            "Keychain, with a file fallback.",
+            "--input",
+            "key:y",
+            "--input",
+            "/open",
+            "--input",
+            "/workers",
+        ],
+    )
+    .await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+    let screen = &out.stdout;
+    for want in [
+        // The header and the current ticket.
+        "AMP v2 #2",
+        "■ In progress #2085 M1-4 CLI",
+        // The marker when the ticket became current, and the footer's #ticket.
+        "── ■ In progress #2085 M1-4 CLI ──",
+        // (the long test cwd leaves only the start of it at this width)
+        "• manager · #",
+        // The answer went out after the confirmation, through the poller's connection.
+        "answered #2084 (amp_answer_question)",
+        // /open names the ticket's board drawer (no browser from a snapshot).
+        "/open http://127.0.0.1:",
+        "/project/2/board?task=2085: --snapshot does not open a browser",
+        // /workers: the board's in-progress ticket, run elsewhere.
+        "AMP · workers",
+        "■ elsewhere #2085 M1-4 CLI worker-backend",
+    ] {
+        assert!(screen.contains(want), "missing {want:?} in\n{screen}");
+    }
+    assert_eq!(
+        amp.mock.calls_to("amp_answer_question"),
+        vec![json!({"task_id": 2084, "answer": "Keychain, with a file fallback."})]
+    );
+    // The model was never asked anything: no prompt, no model calls through AMP's tools.
+    assert!(
+        amp.mock
+            .calls_to("amp_get_task")
+            .iter()
+            .all(|a| a["task_id"] == 2085)
+    );
 }

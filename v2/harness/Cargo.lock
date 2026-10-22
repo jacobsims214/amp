@@ -131,6 +131,7 @@ name = "amp-tui"
 version = "0.1.0"
 dependencies = [
  "amp-core",
+ "amp-mcp",
  "crossterm",
  "rpi-agent",
  "rpi-ai",
