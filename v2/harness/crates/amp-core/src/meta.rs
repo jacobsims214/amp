@@ -1056,6 +1056,9 @@ pub struct MetaPoller {
     /// `amp_get_plan` cache: (project id, epics as (id, name, stories as (id, name))).
     tree: Option<(i64, Vec<EpicNode>)>,
     next_reconnect: Option<Instant>,
+    /// The last call on the client failed with 401/403 and none has been answered since; cleared
+    /// by an answered call or a new client (#2156).
+    auth_required: bool,
     /// Slash-command calls waiting to run ([`MetaHandle::call`]).
     calls: Vec<Call>,
 }
@@ -1121,6 +1124,7 @@ impl MetaPoller {
             schedule: Schedule::default(),
             tree: None,
             next_reconnect: None,
+            auth_required: false,
             calls: Vec::new(),
         };
         tokio::spawn(poller.run(command_rx));
@@ -1151,7 +1155,10 @@ impl MetaPoller {
                 pending |= Topics::ALL;
             }
             pending |= self.run_calls().await;
-            if self.client.is_some() {
+            // While re-login is needed and a reconnect is possible, the old client is not polled:
+            // the reconnect attempt (every `intervals.reconnect`) is the only probe (#2156).
+            let auth_wait = self.auth_wait();
+            if self.client.is_some() && !auth_wait {
                 let now = Instant::now();
                 pending |= self
                     .schedule
@@ -1177,6 +1184,9 @@ impl MetaPoller {
                     (Some(_), None) => now,
                     (None, _) => now + Duration::from_secs(24 * 3600),
                 }
+            } else if auth_wait {
+                // Pending topics wait for the reconnect, which refetches everything anyway.
+                self.next_reconnect.unwrap_or(now)
             } else if !pending.is_empty() || !self.calls.is_empty() {
                 continue;
             } else {
@@ -1232,14 +1242,31 @@ impl MetaPoller {
         }
     }
 
-    /// Makes sure there is an open client, connecting or reconnecting with the connector when
-    /// it is time to. Returns true when a new client was connected (refetch everything).
+    /// True when the open client needs a re-login and the connector can replace it (#2156).
+    ///
+    /// `amp-harness login` registers a new OAuth client (DCR) each time. The open client's
+    /// rmcp `AuthorizationManager` reloads the stored tokens on each request, so it may work
+    /// again right after a login, but it keeps the old client id and refuses to refresh the new
+    /// client's tokens ("stored credentials belong to a different client"). Only a fresh connect
+    /// (`initialize_from_store`) picks up the new client id, so the poller reconnects instead.
+    ///
+    /// It is the poller's own flag rather than the snapshot's `Connection`: after a 401 the rmcp
+    /// transport may briefly read as closed, which would flip the snapshot to Down and back.
+    fn auth_wait(&self) -> bool {
+        self.auth_required && self.connector.is_some() && self.client.is_some()
+    }
+
+    /// Makes sure there is an open, usable client, connecting or reconnecting with the connector
+    /// when it is time to: when there is no client, when it is closed, or when it needs a
+    /// re-login ([`Self::auth_wait`]). Returns true when a new client was connected (refetch
+    /// everything).
     async fn ensure_client(&mut self) -> bool {
         let closed = self.client.as_ref().is_none_or(|c| c.is_closed());
-        if !closed {
+        let auth_wait = self.auth_wait();
+        if !closed && !auth_wait {
             return false;
         }
-        if let Some(client) = &self.client {
+        if !auth_wait && let Some(client) = &self.client {
             let reason = match client.health() {
                 Health::Disconnected { reason } => reason,
                 _ => "connection closed".to_owned(),
@@ -1259,12 +1286,16 @@ impl MetaPoller {
                 let instance = Instance::of(&client, self.web_url.as_deref());
                 self.client = Some(Arc::new(client));
                 self.next_reconnect = None;
+                self.auth_required = false;
                 self.update(|m| {
                     m.instance = Some(instance);
                     m.health.connection = Connection::Ok;
                 });
                 true
             }
+            // The open client stays (slash commands may still use it) and so does its
+            // AuthRequired: a failed attempt, for whatever reason, does not change what it says.
+            Err(_) if auth_wait => false,
             Err(e) => {
                 let connection = if e.is_auth_required() {
                     Connection::AuthRequired
@@ -1331,6 +1362,11 @@ impl MetaPoller {
         let answered = result
             .as_ref()
             .map_or_else(McpError::is_server_error, |_| true);
+        if answered {
+            self.auth_required = false;
+        } else if connection == Connection::AuthRequired {
+            self.auth_required = true;
+        }
         self.update(|m| {
             m.health.connection = connection;
             m.health.latency = Some(latency);

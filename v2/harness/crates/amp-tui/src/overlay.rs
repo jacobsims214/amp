@@ -520,7 +520,7 @@ fn amp_rows(data: &ChromeData) -> Vec<Row> {
     rows.push(project_line(m));
     match &m.health.connection {
         Connection::AuthRequired => rows.push(Row::new(vec![flex(
-            "re-login needed: run `amp-harness login` in another terminal (or set AMP_TOKEN), then reopen the chat",
+            "re-login needed: run `amp-harness login` in another terminal; the header reconnects within 15 s (with AMP_TOKEN, set a new one and restart the chat)",
             c.warning,
         )])),
         Connection::Down { .. } => rows.push(Row::new(vec![flex(
