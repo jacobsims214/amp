@@ -9,8 +9,9 @@
 //! - [`WrapMarkdown`]: rpi's own `Markdown` renders the text, but prose is rendered at an
 //!   unbounded width (rpi's markdown is line-based, so each source line becomes one row) and then
 //!   word-wrapped here, with list continuations under the item's text and quote borders
-//!   repeated. Fenced code, tables and rules are width-dependent and keep rpi's rendering at the
-//!   real width (a long code line still wraps, so it stays copyable).
+//!   repeated. Fenced code and rules are width-dependent and keep rpi's rendering at the real
+//!   width (a long code line still wraps, so it stays copyable). Tables are drawn by
+//!   [`crate::table`] (#2180): box glyphs, padded cells, wrapped to fit or listed per row.
 //! - [`AssistantBlock`]: an assistant message's text and thinking blocks, and its error line.
 //! - [`ThinkingBlock`]: a thinking section, collapsed to one live `Thinking · 18s ▸` line by
 //!   default (#2177); expanded, plain dim text behind a `│` gutter ([`ThinkingDisplay`]).
@@ -32,6 +33,7 @@ use rpi_tui::{
     theme_revision, truncate_to_width,
 };
 
+use crate::table;
 use crate::wrap::{open_sgr as open_style, plain, reflow_row, wrap};
 
 /// The width prose is rendered at before it is word-wrapped: wide enough that rpi never wraps.
@@ -160,13 +162,71 @@ impl WrapMarkdown {
     }
 
     fn markdown(&self, text: String) -> Markdown {
-        let md = Markdown::new(text, self.padding_x, 0);
+        self.markdown_padded(text, self.padding_x)
+    }
+
+    fn markdown_padded(&self, text: String, padding_x: usize) -> Markdown {
+        let md = Markdown::new(text, padding_x, 0);
         match self.style {
             MarkdownStyle::Plain => md,
             MarkdownStyle::Thinking => {
                 md.with_base_style(format!("\x1b[3m{}", theme().colors.thinking_text.to_fg()))
             }
         }
+    }
+}
+
+impl WrapMarkdown {
+    /// A table, drawn by [`crate::table`] at rpi's content width (the width less the padding on
+    /// both sides), cells' inline markdown rendered by rpi.
+    fn table(&self, src: &str, width: usize) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let Some(t) = table::parse(&lines) else {
+            return self.markdown(src.to_owned()).render(width);
+        };
+        let colors = theme().colors;
+        let border = |s: &str| colors.border_muted.fg(s);
+        let header = |s: &str| bold(s);
+        let inline = |cell: &str| {
+            self.markdown_padded(inline_only(cell), 0)
+                .render(UNBOUNDED)
+                .iter()
+                .map(|r| r.trim_end().to_owned())
+                .filter(|r| !plain(r).trim().is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let margin = " ".repeat(self.padding_x);
+        let style = table::Style {
+            margin: &margin,
+            border: &border,
+            header: &header,
+        };
+        table::render(&t, width.saturating_sub(self.padding_x), &style, &inline)
+    }
+}
+
+/// Escapes what would make a cell's text render as a block (a heading, list item, quote, rule
+/// or fence) rather than inline text.
+fn inline_only(cell: &str) -> String {
+    let t = cell.trim();
+    let hashes = t.bytes().take_while(|&b| b == b'#').count();
+    let digits = t.bytes().take_while(u8::is_ascii_digit).count();
+    let block = (hashes > 0 && t[hashes..].starts_with(' '))
+        || ["> ", "- ", "* ", "+ ", "```", "~~~", "---", "***", "___"]
+            .iter()
+            .any(|m| t.starts_with(m))
+        || t == "-"
+        || t == ">";
+    if block {
+        format!("\\{t}")
+    } else if digits > 0
+        && matches!(t.as_bytes().get(digits), Some(b'.' | b')'))
+        && matches!(t.as_bytes().get(digits + 1), None | Some(b' '))
+    {
+        format!("{}\\{}", &t[..digits], &t[digits..])
+    } else {
+        t.to_owned()
     }
 }
 
@@ -185,6 +245,7 @@ impl Component for WrapMarkdown {
                         }
                     }
                     Segment::Block(s) => lines.extend(self.markdown(s).render(width)),
+                    Segment::Table(s) => lines.extend(self.table(&s, width)),
                 }
             }
             lines
@@ -204,8 +265,10 @@ impl Component for WrapMarkdown {
 #[derive(Debug, PartialEq)]
 enum Segment {
     Prose(String),
-    /// A fenced code block (or Mermaid diagram), a table or a rule.
+    /// A fenced code block (or Mermaid diagram) or a rule.
     Block(String),
+    /// A GFM table (#2180).
+    Table(String),
 }
 
 /// The fence character of a ```` ``` ```` / `~~~` fence line (rpi's `fence_info`).
@@ -245,21 +308,50 @@ fn is_rule(line: &str) -> bool {
         && !["- ", "* ", "+ "].iter().any(|m| c.starts_with(m))
 }
 
-/// Splits markdown source into prose and width-dependent blocks, the way rpi's renderer walks it.
+/// Where a table starts at `lines[i]`: rpi's `| a | b |` form, or GFM's pipe-optional form when
+/// the separator has as many columns as the header.
+fn table_start(lines: &[&str], i: usize) -> bool {
+    let (line, Some(next)) = (lines[i], lines.get(i + 1)) else {
+        return false;
+    };
+    (is_table_row(line) && is_table_separator(next))
+        || (table::has_pipe(line)
+            && table::is_separator(next)
+            && table::split_cells(line).len() == table::split_cells(next).len())
+}
+
+/// A table body row: rpi's `| … |`, or any line with a cell-separating pipe that starts no
+/// other block.
+fn table_body(line: &str) -> bool {
+    is_table_row(line)
+        || (!line.trim().is_empty()
+            && fence(line).is_none()
+            && !is_rule(line)
+            && table::has_pipe(line))
+}
+
+/// Splits markdown source into prose, tables and width-dependent blocks, the way rpi's renderer
+/// walks it.
 fn segments(text: &str) -> Vec<Segment> {
+    #[derive(PartialEq)]
+    enum Kind {
+        Prose,
+        Block,
+        Table,
+    }
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<Segment> = Vec::new();
-    let mut push = |block: bool, chunk: &[&str]| {
+    let mut push = |kind: Kind, chunk: &[&str]| {
         let chunk = chunk.join("\n");
-        match (out.last_mut(), block) {
-            (Some(Segment::Prose(s)), false) | (Some(Segment::Block(s)), true) => {
+        match (out.last_mut(), &kind) {
+            (Some(Segment::Prose(s)), Kind::Prose) | (Some(Segment::Block(s)), Kind::Block) => {
                 s.push('\n');
                 s.push_str(&chunk);
             }
-            _ => out.push(if block {
-                Segment::Block(chunk)
-            } else {
-                Segment::Prose(chunk)
+            _ => out.push(match kind {
+                Kind::Prose => Segment::Prose(chunk),
+                Kind::Block => Segment::Block(chunk),
+                Kind::Table => Segment::Table(chunk),
             }),
         }
     };
@@ -275,19 +367,19 @@ fn segments(text: &str) -> Vec<Segment> {
                     break;
                 }
             }
-            push(true, &lines[start..i]);
-        } else if is_table_row(line) && lines.get(i + 1).is_some_and(|l| is_table_separator(l)) {
+            push(Kind::Block, &lines[start..i]);
+        } else if table_start(&lines, i) {
             i += 2;
-            while i < lines.len() && is_table_row(lines[i]) {
+            while i < lines.len() && table_body(lines[i]) {
                 i += 1;
             }
-            push(true, &lines[start..i]);
+            push(Kind::Table, &lines[start..i]);
         } else if is_rule(line) {
             i += 1;
-            push(true, &lines[start..i]);
+            push(Kind::Block, &lines[start..i]);
         } else {
             i += 1;
-            push(false, &lines[start..i]);
+            push(Kind::Prose, &lines[start..i]);
         }
     }
     if out.is_empty() {
@@ -991,10 +1083,66 @@ mod tests {
                 Segment::Prose("intro".into()),
                 Segment::Block("```rust\nlet a = 1;\n```".into()),
                 Segment::Prose("middle".into()),
-                Segment::Block("| a | b |\n|---|---|\n| 1 | 2 |\n---".into()),
+                Segment::Table("| a | b |\n|---|---|\n| 1 | 2 |".into()),
+                Segment::Block("---".into()),
                 Segment::Prose("- item\nend".into()),
             ]
         );
+    }
+
+    #[test]
+    fn segments_find_pipe_optional_tables_and_end_them_at_a_blank_line() {
+        let src =
+            "a | b\n--- | ---\n1 | 2\n| 3 | 4 |\n\nafter | pipe\n| x | y |\n|---|---|\n| z | w |";
+        assert_eq!(
+            segments(src),
+            vec![
+                Segment::Table("a | b\n--- | ---\n1 | 2\n| 3 | 4 |".into()),
+                Segment::Prose("\nafter | pipe".into()),
+                Segment::Table("| x | y |\n|---|---|\n| z | w |".into()),
+            ]
+        );
+        // A one-column separator without pipes is a setext heading or a rule, not a table.
+        assert_eq!(segments("a\n---").len(), 2);
+    }
+
+    #[test]
+    fn markdown_tables_use_box_glyphs_padding_and_a_header_rule_only() {
+        let md = WrapMarkdown::new(
+            "| # | Ticket | State |\n|--:|---|---|\n| 1 | **Say hello** | `done` |\n| 22 | Plan | ready |",
+            1,
+            MarkdownStyle::Plain,
+        );
+        let rows = plain_rows(&md.render(80));
+        assert_eq!(
+            rows,
+            vec![
+                " ┌────┬───────────┬────────┐",
+                " │  # │ Ticket    │ State  │",
+                " ├────┼───────────┼────────┤",
+                " │  1 │ Say hello │  done  │",
+                " │ 22 │ Plan      │ ready  │",
+                " └────┴───────────┴────────┘",
+            ]
+        );
+    }
+
+    #[test]
+    fn table_cells_that_look_like_blocks_stay_inline() {
+        for cell in ["# 1", "- a", "1. x", "> q", "---"] {
+            assert_eq!(
+                inline_only(cell).chars().filter(|&c| c == '\\').count(),
+                1,
+                "{cell}"
+            );
+        }
+        let md = WrapMarkdown::new(
+            "| a | b |\n|---|---|\n| # 1 | - x |",
+            1,
+            MarkdownStyle::Plain,
+        );
+        let rows = plain_rows(&md.render(80));
+        assert_eq!(rows[3], " │ # 1 │ - x │", "{rows:#?}");
     }
 
     #[test]

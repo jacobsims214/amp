@@ -40,6 +40,7 @@ pub mod chrome;
 pub mod overlay;
 pub mod shell;
 pub mod slash;
+pub mod table;
 pub mod terminal;
 pub mod theme;
 pub mod transcript;
