@@ -63,6 +63,8 @@ struct AsState {
     last_scope: Mutex<Option<String>>,
     /// The RFC 8414 metadata endpoint accepts the request and never answers (a stalled AS).
     stall_metadata: AtomicBool,
+    /// Advertise this `authorization_endpoint` instead of our own `/authorize` (a hostile AS).
+    authorization_endpoint: Mutex<Option<String>>,
 }
 
 struct PendingCode {
@@ -201,7 +203,12 @@ async fn authorization_server(State(state): State<Arc<AsState>>) -> Json<serde_j
     // Shaped like AMP's amp-mcpoauth metadata (v2/amp-api/cmd/mcpoauth/main.go).
     Json(serde_json::json!({
         "issuer": state.base,
-        "authorization_endpoint": format!("{}/authorize", state.base),
+        "authorization_endpoint": state
+            .authorization_endpoint
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| format!("{}/authorize", state.base)),
         "token_endpoint": format!("{}/token", state.base),
         "registration_endpoint": format!("{}/register", state.base),
         "response_types_supported": ["code"],
@@ -761,6 +768,58 @@ async fn login_fails_fast_when_the_as_metadata_stalls() {
     );
     assert_eq!(mock.state.registrations.load(Ordering::SeqCst), 0);
     assert!(!oauth::has_login(&mock.url, &backend).await.unwrap());
+}
+
+#[tokio::test]
+async fn login_refuses_a_non_http_authorization_endpoint() {
+    for endpoint in ["file:///etc/passwd", "amp-evil://authorize"] {
+        let mock = spawn_mock_as(3600).await;
+        *mock.state.authorization_endpoint.lock().unwrap() = Some(endpoint.to_owned());
+        let backend = file_backend("hostile-endpoint");
+        let prompted = Arc::new(AtomicBool::new(false));
+        let seen = prompted.clone();
+        let err = oauth::login(
+            LoginOptions::new(&mock.url, backend.clone()).with_timeout(Duration::from_secs(5)),
+            move |_prompt: &LoginPrompt| seen.store(true, Ordering::SeqCst),
+        )
+        .await
+        .expect_err(endpoint);
+        assert!(
+            matches!(&err, McpError::OAuth(m) if m.contains("is not http(s); refusing to open it")),
+            "{endpoint}: {err:?}"
+        );
+        assert!(
+            !prompted.load(Ordering::SeqCst),
+            "{endpoint}: the prompt (browser) must never be called"
+        );
+        assert!(!oauth::has_login(&mock.url, &backend).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn login_refuses_plain_http_to_a_remote_authorization_endpoint() {
+    let mock = spawn_mock_as(3600).await;
+    *mock.state.authorization_endpoint.lock().unwrap() =
+        Some("http://auth.example.com/authorize".to_owned());
+    let backend = file_backend("plain-http-endpoint");
+    let err = oauth::login(
+        LoginOptions::new(&mock.url, backend.clone()).with_timeout(Duration::from_secs(5)),
+        |_prompt: &LoginPrompt| panic!("no browser for a plain-http remote endpoint"),
+    )
+    .await
+    .expect_err("plain http remote");
+    assert!(
+        matches!(&err, McpError::OAuth(m) if m.contains("refusing to open it")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn open_browser_refuses_file_and_custom_scheme_urls() {
+    for url in ["file:///etc/passwd", "amp-evil://authorize"] {
+        let err = oauth::open_browser(url).expect_err(url);
+        assert!(err.contains("refusing to open it"), "{url}: {err}");
+    }
 }
 
 #[tokio::test]
