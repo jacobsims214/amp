@@ -70,10 +70,13 @@ Dependencies only point one way: `amp-mcp <- amp-core <- amp-tui <- amp-harness`
 | URL      | `--url`       | `AMP_MCP_URL`      | `[server] url`                      | `https://amp.simstech.cloud/mcp` |
 | extra CA | `--ca-file`   | `AMP_CA_FILE`      | `[server] ca_file`                  | none (system roots)              |
 | protocol | `--protocol`  | `AMP_MCP_PROTOCOL` | `[server] protocol`                 | `auto`                           |
+| web UI   |               | `AMP_WEB_URL`      | `[server] web_url`                  | the MCP URL's origin             |
 | token    | `--token-env` | `AMP_TOKEN`        | never                               | none                             |
 
 Flags beat env, env beats the file (`$XDG_CONFIG_HOME` is honoured). A relative `ca_file` is relative
-to the config file. `.amp.json` is a project marker only; its `amp_api` is not read.
+to the config file. `.amp.json` is a project marker only; its `amp_api` is not read. The web UI
+setting only changes links (`/open`, the header's host): set it when the UI is not served from the
+MCP origin, as on docker compose (`AMP_WEB_URL=http://localhost:5173`).
 
 ```toml
 [server]
@@ -420,7 +423,11 @@ in a worktree of a throwaway git repo under `target/`; the worker comments and c
 `task_id`, and the ticket's run must carry `wf/wf-1` and tokens > 0. A second worker's script runs
 out, which must leave one abandoned run with a note `abandoned: error: ...`. Calls the role policy
 denies (the manager's bash, the worker writing outside its worktree) must come back as visible tool
-errors and never run. Cost is not asserted: the faux provider always reports 0. Finally it
+errors and never run. Cost is not asserted: the faux provider always reports 0. Smoke v3 (M3-6)
+adds a ticket with a question: `debug render-chrome --live` must show the project's name and `#id`
+and the same status counts as `amp_list_tasks`, before and after the question is answered through
+the chat's `/questions` panel (`--snapshot --meta`, Enter, the answer, `y`; the ticket must leave the
+Question state with the answer as a comment), and `/open` must print the ticket's web UI URL. Finally it
 deletes the tickets, story and epic and archives the project. AMP has no hard project delete, so the
 leg checks that the project is gone from `amp_list_projects`. Cleanup runs from an exit trap, so it
 also happens when a check fails. The harness runs with HOME under `target/` and
@@ -433,6 +440,7 @@ also happens when a check fails. The harness runs with HOME under `target/` and
 | `AMP_TOKEN` + `AMP_CA_FILE` | unset, so the cluster leg is skipped | cluster leg: an `amp_` token from the UI and `amp-local-ca.crt`. The token is only sent to this leg |
 | `AMP_SMOKE_CLUSTER_URL` | `https://amp.local/mcp` | envoy on 443, not `:8443` (RFC 9728 resource match) |
 | `AMP_SMOKE_LEGS` | `compose cluster` | |
+| `AMP_SMOKE_WEB_URL` | `http://localhost:5173` | compose leg's web UI, passed as `AMP_WEB_URL`; `/open` must print it. The cluster leg uses the MCP origin. An unreachable UI is only a WARN |
 
 On the dev Mac, the docker-desktop cluster's LoadBalancer can hold host :8000. In that case, publish
 compose's amp-api on another port and pass e.g. `AMP_MCP_URL=http://localhost:18000/mcp`. Don't run

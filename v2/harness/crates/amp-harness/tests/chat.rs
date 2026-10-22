@@ -299,3 +299,59 @@ async fn amp_commands_with_the_metadata_poller() {
             .all(|a| a["task_id"] == 2085)
     );
 }
+
+/// M3-6 (#2110): docker compose serves the web UI on another port than MCP, so `AMP_WEB_URL`
+/// moves `/open` (and the header's host) to it; the MCP connection is unchanged.
+#[tokio::test]
+async fn open_uses_the_web_url_setting() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("chat-open-web-url", json!([]));
+    let script = dir.join("script.json");
+    let state = dir.join("home/.local/state");
+    let out = run(
+        &dir,
+        &amp.url,
+        &[
+            "--snapshot",
+            "160x40",
+            "--meta",
+            "--input",
+            "/ticket 2085",
+            "--input",
+            "/open",
+        ],
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("AMP_WEB_URL", "http://localhost:5173/"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+    let want =
+        "/open http://localhost:5173/project/2/board?task=2085: --snapshot does not open a browser";
+    assert!(
+        out.stdout.contains(want),
+        "missing {want:?} in\n{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("localhost:5173 · "), "{}", out.stdout);
+
+    // A web URL that is not http(s) is a settings error, before anything connects.
+    let out = run(
+        &dir,
+        &amp.url,
+        &["--snapshot", "100x30"],
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("AMP_WEB_URL", "file:///etc/passwd"),
+        ],
+    )
+    .await;
+    assert_ne!(out.code, 0, "stdout: {}", out.stdout);
+    assert!(out.stderr.contains("AMP_WEB_URL"), "{}", out.stderr);
+}

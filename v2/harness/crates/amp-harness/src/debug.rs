@@ -138,6 +138,7 @@ async fn live_meta(args: &RenderChromeArgs) -> Result<(AmpMeta, bool), CliError>
         MetaOptions {
             project_id,
             ticket_id: args.ticket,
+            web_url: settings.web_url.clone(),
             ..MetaOptions::default()
         },
     );
