@@ -362,6 +362,9 @@ pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> 
         .env_remove("AMP_TOKEN")
         .env_remove("AMP_CA_FILE")
         .env_remove("AMP_MCP_PROTOCOL")
+        .env_remove("AMP_HARNESS_PROFILE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
         .env_remove("RUST_LOG");
     for (k, v) in env {
         cmd.env(k, v);

@@ -115,6 +115,54 @@ amp-harness mcp tools [--json]                                                # 
 - `--json` output is a contract for scripts: fields are added, never renamed or removed. The full
   shapes are pinned in `crates/amp-harness/tests/cli.rs` against a mock AMP (`tests/common`).
 
+## Providers and models (M2-3)
+
+Like opencode, several providers are active at once and every role (agent) picks its own
+`provider/model` and thinking level. There is no default provider. The shipped defaults are
+`crates/amp-core/models.toml` (embedded): the `anthropic` and `openrouter` providers, their models,
+`[roles.*]` mirroring `v2/.opencode/agent/*.md` (a unit test reads those files and fails on drift),
+and an Anthropic-only `[profiles.anthropic]`. Override any of it in
+`~/.config/amp-harness/config.toml` (same file as `[server]`):
+
+```toml
+[models]
+profile = "opencode"          # default | "anthropic" | "inherit" | a [profiles.<name>] of yours
+# inherit = "anthropic/claude-sonnet-5-5"   # with profile = "inherit": every role uses this
+# inherit_thinking = "medium"
+
+[roles.reviewer]              # one role on another provider; the rest keep theirs
+model = "anthropic/claude-opus-5-5"
+thinking = "high"             # off minimal low medium high xhigh max
+
+[providers.openrouter]        # field-by-field over the shipped provider
+stream_idle_timeout_secs = 180
+
+[providers.llamabarn]         # a provider of your own
+api = "openai-completions"    # anthropic-messages | openai-completions | faux
+base_url = "http://localhost:2276/v1"
+auth = "none"
+[providers.llamabarn.models."qwen-3.6-35b-a3b"]
+context_window = 262144
+```
+
+- A role resolves from the defaults' `[roles.<role>]`, then the selected profile (or the inherit
+  model), then your `[roles.<role>]`. `AMP_HARNESS_PROFILE` overrides `[models] profile`.
+- Keys come from the provider's `key_env` (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`), then the
+  keychain (service `amp-harness`, account `provider:<id>`; skipped with
+  `AMP_CREDENTIAL_STORE=file`). Never from config files.
+- `header_timeout_secs` (first streamed event) and `stream_idle_timeout_secs` (gap between events)
+  cancel a stalled request and end the turn with an error; `request_timeout_secs` bounds the whole
+  request.
+
+```sh
+amp-harness config show [--json] [--check] [--config PATH]
+```
+
+It prints each provider (api, URL, where its key comes from, never the key, and its timeouts) and
+each role's provider/model, thinking level, readiness and the layer that set it. `--check` asks each
+provider in use for its live model list (OpenRouter's is public; Anthropic's needs the key) and
+flags ids that are missing. It exits 1 if a role does not resolve or a checked id is missing.
+
 ## Dev loop
 
 ```sh

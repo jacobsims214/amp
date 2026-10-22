@@ -62,6 +62,8 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time"] }
 toml = "1"
+# rpi-ai's CancellationToken type (amp-core's provider stall guard).
+tokio-util = "0.7"
 tracing = "0.1"
 
 # Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
