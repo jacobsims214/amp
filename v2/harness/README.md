@@ -313,6 +313,11 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   cost, `/help`, `/abort`, `/quit` (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits.
+- AMP panels (`/amp`, `/ticket`, `/workers`, `/questions`, `/plan`, `/project`) open docked above the
+  editor and focused: with an empty editor, ↑↓ select a row and Enter acts on it (answers a
+  question, otherwise opens it in the browser). Typing, a paste or a sent prompt hands the keys back
+  to the editor (↑ recalls history again) and the panel stays docked; printable keys always reach
+  the editor. Tab, with an empty editor, switches between the panel and the editor. Esc closes it.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
 

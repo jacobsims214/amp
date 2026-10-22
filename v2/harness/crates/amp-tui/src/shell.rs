@@ -146,7 +146,8 @@ pub enum Submit {
 
 pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id]\n\
 commands: /model [provider/model]  /usage  /help  /quit\n\
-keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit";
+keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit\n\
+panels: open focused (↑↓ select, Enter act on the row) · typing goes to the editor and unfocuses · Tab switches";
 
 pub struct Shell {
     view: ChatView,
@@ -394,6 +395,8 @@ impl Shell {
             };
             return self.command(name, arg).await;
         }
+        // A prompt hands the keys back to the editor; a docked panel stays, unfocused.
+        self.view.panel().update(|s| s.focused = false);
         if self.running {
             self.view
                 .add_notice("still working: wait for the reply, or press Esc to abort it");
@@ -635,11 +638,39 @@ impl Shell {
         }
     }
 
+    /// Routes a key (not Ctrl+C / Ctrl+D, which the terminal loop handles) to an open panel or
+    /// the editor. Returns false only for an Esc that no panel took while a prompt runs: the
+    /// caller aborts the run with it.
+    pub fn key(&mut self, key: KeyEvent) -> bool {
+        let editor = self.view.editor().clone();
+        if self.panel_key(&key, editor.get_text().is_empty()) {
+            return true;
+        }
+        if key.code == KeyCode::Esc && self.running {
+            return false;
+        }
+        editor.handle_key(key);
+        true
+    }
+
+    /// A paste goes to the editor and hands the keys back to it.
+    pub fn paste(&mut self, text: &str) {
+        self.unfocus_panel();
+        self.view.editor().handle_paste(text);
+    }
+
+    fn unfocus_panel(&self) {
+        self.view.panel().update(|s| s.focused = false);
+    }
+
     /// A key while a panel is open. Returns true when the panel used it (the editor must not).
-    /// Esc closes the panel (or backs out of an answer). With an empty editor, ↑/↓ select,
-    /// Enter acts on the selection (answers a question; otherwise opens it) and `o` opens it.
-    /// While an answer waits for confirmation, `y`/Enter sends it and `n`/Esc cancels; other keys
-    /// are swallowed.
+    ///
+    /// Esc closes the panel (or backs out of an answer). A printable key always goes to the
+    /// editor, and unfocuses the panel (#2161: typing "ok…" must never open a browser). While
+    /// the panel is focused and the editor empty, ↑/↓/PgUp/PgDn select and Enter acts on the
+    /// selection (answers a question; otherwise opens it). Tab, with an empty editor, switches
+    /// focus between the panel and the editor. While an answer waits for confirmation,
+    /// `y`/Enter sends it and `n`/Esc cancels; other keys are swallowed.
     pub fn panel_key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         let panel = self.view.panel().clone();
         let Some(state) = panel.state() else {
@@ -656,6 +687,7 @@ impl Shell {
                 if key.code == KeyCode::Esc {
                     panel.update(|s| {
                         s.stage = Stage::Browse;
+                        s.focused = true;
                         s.note = Some(("not sent".to_owned(), false));
                     });
                     return true;
@@ -670,6 +702,7 @@ impl Shell {
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         panel.update(|s| {
                             s.stage = Stage::Browse;
+                            s.focused = true;
                             s.note = Some(("not sent".to_owned(), false));
                         });
                     }
@@ -683,7 +716,18 @@ impl Shell {
                     panel.close();
                     return true;
                 }
-                if !editor_empty {
+                if key.code == KeyCode::Tab && editor_empty {
+                    panel.update(|s| s.focused = !s.focused);
+                    return true;
+                }
+                // Typing: the key is the editor's, and so are the keys after it.
+                if matches!(key.code, KeyCode::Char(_)) || !editor_empty {
+                    if state.focused {
+                        self.unfocus_panel();
+                    }
+                    return false;
+                }
+                if !state.focused {
                     return false;
                 }
                 match key.code {
@@ -707,11 +751,6 @@ impl Shell {
                         Some(target) => self.open_target(&target),
                         None => {}
                     },
-                    KeyCode::Char('o') => {
-                        if let Some(target) = panel.selected() {
-                            self.open_target(&target);
-                        }
-                    }
                     _ => return false,
                 }
                 true
@@ -720,17 +759,18 @@ impl Shell {
     }
 
     /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
-    /// `enter`, `esc`, `up`, `down`, or one character.
+    /// `enter`, `esc`, `up`, `down`, `tab`, or one character.
     pub fn press(&mut self, name: &str) -> Result<bool, String> {
         let code = match name {
             "enter" => KeyCode::Enter,
             "esc" => KeyCode::Esc,
+            "tab" => KeyCode::Tab,
             "up" => KeyCode::Up,
             "down" => KeyCode::Down,
             c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap_or(' ')),
             other => {
                 return Err(format!(
-                    "key `{other}`: not a key (enter, esc, up, down, or one character)"
+                    "key `{other}`: not a key (enter, esc, up, down, tab, or one character)"
                 ));
             }
         };
@@ -797,6 +837,7 @@ impl Shell {
                     Ok(_) => {
                         self.view.panel().update(|s| {
                             s.stage = Stage::Browse;
+                            s.focused = true;
                             s.note = Some((format!("answered #{ticket}"), false));
                         });
                         self.view
@@ -806,6 +847,7 @@ impl Shell {
                         let e = crate::chrome::clean(&e);
                         self.view.panel().update(|s| {
                             s.stage = Stage::Browse;
+                            s.focused = true;
                             s.note = Some((format!("not answered: {e}"), true));
                         });
                         self.view

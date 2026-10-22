@@ -9,7 +9,7 @@
 //! and slash commands), waits for each run to finish, and prints the final screen as plain text.
 //! The integration tests use it, and so can screenshots and M3's render checks (`--ansi` keeps
 //! the colours). `--meta` also starts the AMP metadata poller (header, status line and the AMP
-//! slash commands, M3-4), and `--input key:<enter|esc|up|down|y|n|o>` presses a key on an open
+//! slash commands, M3-4), and `--input key:<enter|esc|up|down|tab|y|n>` presses a key on an open
 //! AMP panel (Enter on a question, then `key:y` to confirm the answer). In `--snapshot` nothing
 //! opens a browser: `/open` says which URL it would open.
 //!
