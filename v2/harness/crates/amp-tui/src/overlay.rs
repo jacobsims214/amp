@@ -36,7 +36,6 @@ use serde_json::Value;
 
 use crate::{
     chrome::{self, Chrome, ChromeData, ReportState, clean, link, shorten},
-    shell::short_role,
     theme::{AmpPalette, palette},
 };
 
@@ -710,23 +709,21 @@ fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
         } else {
             Status::InProgress
         };
+        // The web word first (palette mark), then what the local worker is doing.
         let phase = match (status, w.phase) {
             (Status::Question, _) => p.state_mark(Status::Question),
-            (_, WorkerPhase::Queued) => format!(
-                "{} {}",
-                p.state(Status::Ready).mark.fg("□"),
-                c.muted.fg("queued ")
-            ),
+            (_, WorkerPhase::Queued) => {
+                format!("{} {}", p.state_mark(Status::Ready), c.muted.fg("queued"))
+            }
             _ => format!(
                 "{} {}",
-                p.state(Status::InProgress).mark.fg("■"),
+                p.state_mark(Status::InProgress),
                 p.state(Status::InProgress).text.fg("running")
             ),
         };
         let u = &w.totals.usage;
         let detail = format!(
-            "{} · {} · {} · ↑{} ↓{} ${:.2}",
-            short_role(&w.agent_id),
+            "{} · {} · ↑{} ↓{} ${:.2}",
             w.model.as_deref().unwrap_or("-"),
             elapsed(w.since),
             tokens(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens),
@@ -738,10 +735,17 @@ fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
                 fixed(phase),
                 fixed(ticket_id(m, w.task_id)),
                 flex(&name_of(w.task_id), c.text),
-                fixed(c.dim.fg(&clean(&detail))),
+                fixed(format!(
+                    "{} {} {}",
+                    c.dim.fg("·"),
+                    c.muted.fg(&clean(&w.agent_id)),
+                    c.dim.fg("· local")
+                )),
             ])
             .target(ticket_target(w.task_id)),
         );
+        // The run's detail on its own line, so the row keeps the web's shape at any width.
+        rows.push(Row::new(vec![flex(&clean(&detail), c.dim)]).indent(2));
     }
     let local: Vec<i64> = data.workers.iter().map(|w| w.task_id).collect();
     for t in board
@@ -750,21 +754,19 @@ fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
         .iter()
         .filter(|t| !local.contains(&t.id))
     {
-        let who = t
-            .assigned_to
-            .as_deref()
-            .map(short_role)
-            .unwrap_or("someone");
+        // The assignee exactly as AMP stores it (the web UI shows it unmodified).
+        let who = t.assigned_to.as_deref().unwrap_or("unassigned");
         rows.push(
             Row::new(vec![
-                fixed(format!(
-                    "{} {}",
-                    p.state(Status::InProgress).mark.fg("■"),
-                    c.muted.fg("elsewhere")
-                )),
+                fixed(p.state_mark(Status::InProgress)),
                 fixed(ticket_id(m, t.id)),
                 flex(&t.name, c.text),
-                fixed(c.dim.fg(&clean(who))),
+                fixed(format!(
+                    "{} {} {}",
+                    c.dim.fg("·"),
+                    c.muted.fg(&clean(who)),
+                    c.dim.fg("· elsewhere")
+                )),
             ])
             .target(ticket_target(t.id)),
         );

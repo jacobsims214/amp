@@ -263,21 +263,49 @@ async fn workers_lists_local_and_remote_workers() {
     rig.say("/workers").await;
     let screen = rig.screen();
     assert!(screen.contains("AMP · workers"), "{screen}");
+    // Every row leads with the palette state mark (the web word), then #id name, the
+    // assignee exactly as AMP stores it, and where it runs.
     assert!(
         screen.contains(
-            "› ■ running #2105 M3-5 Inline ticket chips worker-backend · claude-opus-5-5"
+            "› ■ In progress running #2105 M3-5 Inline ticket chips · amp:amp-worker-backend · local"
         ),
         "{screen}"
     );
-    assert!(screen.contains("□ queued  #2111"), "{screen}");
     assert!(
-        screen.contains("■ elsewhere #2104 M3-2 AMP metadata poller worker-backend"),
+        screen.contains("    claude-opus-5-5 · "),
+        "the run's detail below it\n{screen}"
+    );
+    assert!(
+        screen.contains("□ Ready queued #2111 · amp:amp-worker-backend · local"),
         "{screen}"
     );
-    assert!(screen.contains("■ elsewhere #2106"), "{screen}");
     assert!(
-        !screen.contains("elsewhere #2105"),
-        "a local worker is not listed twice"
+        screen.contains(
+            "■ In progress #2104 M3-2 AMP metadata poller · amp:amp-worker-backend · elsewhere"
+        ),
+        "{screen}"
+    );
+    assert!(screen.contains("■ In progress #2106"), "{screen}");
+    assert!(
+        screen.lines().filter(|l| l.contains("#2105")).count() == 1,
+        "a local worker is not listed twice\n{screen}"
+    );
+    assert!(
+        !screen.contains(" worker-backend"),
+        "assignee unmodified\n{screen}"
+    );
+    // The location is dim; the assignee is not.
+    let c = rpi_tui::theme().colors;
+    let frame = rig.shell.view().render_frame(W, H).join("\n");
+    let local_row = frame
+        .lines()
+        .find(|l| l.contains("#2105"))
+        .unwrap_or_default();
+    assert!(local_row.contains(&c.dim.fg("· local")), "{local_row:?}");
+    assert!(frame.contains(&c.dim.fg("· elsewhere")), "{frame:?}");
+    assert!(
+        frame.contains(&c.muted.fg("amp:amp-worker-backend")),
+        "{frame:?}"
     );
     // ↓ then o: the second worker's ticket.
     rig.press(KeyCode::Down).await;
