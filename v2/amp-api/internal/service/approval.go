@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/actor"
@@ -129,8 +130,24 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	if err != nil {
 		return nil, err
 	}
+	// "scheduled:" is the reason the scheduler writes; a ticket is scheduled
+	// with amp_set_task_start_at, never by setting the reason by hand (that
+	// would also hide a question as a schedule).
+	if state == domain.TaskStateBlocked && strings.HasPrefix(strings.TrimSpace(reason), "scheduled:") {
+		return nil, authz.BadRequest("ticket %d: a block reason can't start with \"scheduled:\"; schedule a ticket with amp_set_task_start_at", taskID)
+	}
 	requireStarted := false
 	if !p.InUI() {
+		// A ticket waiting on a person's answer keeps its question until it's
+		// answered: off the UI, no state change may replace or clear it, so
+		// the answer always leaves a "relayed by agent" record.
+		if hasOpenQuestion(t) && (state != domain.TaskStateBlocked || reason != t.BlockReason) {
+			switch state {
+			case domain.TaskStateBacklog, domain.TaskStateBlocked:
+				return nil, authz.Forbidden("ticket %d is waiting on a question (%q); a state change doesn't answer or replace it. A person answers it "+
+					"in the AMP web UI (%s), or relay their answer with amp_answer_question.", taskID, t.BlockReason, s.TaskURL(t.ProjectID, taskID))
+			}
+		}
 		switch state {
 		case domain.TaskStateInProgress:
 			if t.State != domain.TaskStateInProgress {
@@ -145,11 +162,6 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 				return nil, err
 			}
 			requireStarted = t.State != domain.TaskStateCompleted
-		case domain.TaskStateBacklog:
-			if t.State == domain.TaskStateBlocked && t.BlockReason != "" && !strings.HasPrefix(t.BlockReason, "scheduled:") {
-				return nil, authz.Forbidden("ticket %d is waiting on a question (%q); a state change doesn't answer it. A person answers it "+
-					"in the AMP web UI (%s), or relay their answer with amp_answer_question.", taskID, t.BlockReason, s.TaskURL(t.ProjectID, taskID))
-			}
 		}
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
@@ -163,6 +175,43 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	}
 	t.State = state
 	return t, nil
+}
+
+// hasOpenQuestion reports whether t is blocked on a question for a person
+// (a reason that isn't the scheduler's "scheduled:").
+func hasOpenQuestion(t *domain.Task) bool {
+	return t.State == domain.TaskStateBlocked && t.BlockReason != "" && !strings.HasPrefix(t.BlockReason, "scheduled:")
+}
+
+// relayedSuffix marks a comment or history actor an agent posted for a
+// person; the web UI badges it ("relayed by agent").
+const relayedSuffix = " (relayed by agent)"
+
+// CommentAuthor is the author recorded for a comment p posts as author
+// (amp_add_task_comment). In the web UI it's kept as given. Off the UI,
+// author stays free text for agent names, but an author that is a person's
+// email (the caller's own, or any person's account) is recorded as
+// "<email> (relayed by agent)": workers treat answers on a ticket as
+// binding, so an agent can't post words as if the person typed them.
+func (s *Service) CommentAuthor(ctx context.Context, p authz.Principal, author string) string {
+	a := strings.TrimSpace(author)
+	if p.InUI() || !strings.Contains(a, "@") || strings.HasSuffix(a, strings.TrimSpace(relayedSuffix)) {
+		return author
+	}
+	addr, err := mail.ParseAddress(a)
+	if err != nil {
+		return author
+	}
+	email := addr.Address
+	if p.Email != "" && strings.EqualFold(email, p.Email) {
+		return email + relayedSuffix
+	}
+	if s.Repo != nil {
+		if u, err := s.Repo.GetUserByEmail(ctx, email); err == nil && !u.IsAgent() {
+			return u.Email + relayedSuffix
+		}
+	}
+	return author
 }
 
 // checkRunOutcome refuses a non-UI "completed" run on a ticket that was

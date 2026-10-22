@@ -1447,6 +1447,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			if req.Author == "" || req.Author == "user" {
 				req.Author = pr.Email
 			}
+			req.Author = h.svc.CommentAuthor(r.Context(), pr, req.Author)
 			replyCh := make(chan actor.ReplyAddComment, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgAddComment{Req: req, ReplyCh: replyCh})
 			reply := actor.Await(r.Context(), replyCh)
