@@ -16,7 +16,9 @@ rpi-agent.workspace = true
 rpi-tools.workspace = true
 rpi-harness.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# preserve_order: permission rules are evaluated in file order (last match wins). It is also on
+# through schemars' feature unification today; this makes it explicit.
+serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
 include_dir.workspace = true
 yaml_serde.workspace = true

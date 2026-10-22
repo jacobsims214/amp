@@ -9,11 +9,11 @@ permission:
   edit:
     "*": deny
   bash:
+    "*": deny
     "git status*": allow
     "git diff*": allow
     "git log*": allow
     "ls *": allow
-    "*": deny
   webfetch: deny
   websearch: deny
   task:
