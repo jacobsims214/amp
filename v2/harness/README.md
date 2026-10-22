@@ -707,14 +707,40 @@ leg checks that the project is gone from `amp_list_projects`. Cleanup runs from 
 also happens when a check fails. The harness runs with HOME under `target/` and
 `AMP_CREDENTIAL_STORE=file`, so your keychain and config.toml are never touched.
 
+Smoke v4 (M4-5) follows human-only plan approval. Each leg creates its three dispatchable tickets up
+front, checks that dispatching before approval is refused with the plan link, and approves the plan
+once as the person: on compose with `POST /api/projects/P/approve-plan` on the REST listener
+(`AMP_SMOKE_REST_URL`; auth off, so it counts as the web UI), sending `as_of` = the newest
+`planned_at` of the open tickets. The cluster leg tries `amp_approve_plan`, which only servers from
+before human-only approval accept, and otherwise fails with the Flight plan link, or waits
+`AMP_SMOKE_APPROVE_WAIT` seconds for a person to approve there. Ticket one is dispatched before it is
+completed (completing it undispatched must be refused as "never dispatched"). On compose a person's
+ticket must be refused over MCP and is marked done with `POST /api/tasks/T/complete`. Two more legs
+run against the compose server:
+
+- `firstrun`: a brand-new HOME under `target/`. The chat's first run with scripted answers
+  (`AMP_HARNESS_PROMPTS=stdin`: the server as `host:port`, `n`, a name, a code), started in a
+  subfolder, must save the server and web UI to config.toml, create the project, write `.amp.json`
+  at the git root and prefill the editor; a second start asks nothing. Then
+  `init --yes --url … --project N --json` in another new HOME links a second folder, and
+  `doctor --json` there, with no environment, must be ok. The project is archived on exit. A made-up
+  provider key comes from the environment and must not appear in any file or output.
+- `install`: packs the binary under test with `scripts/package.sh --bin` (or installs
+  `AMP_SMOKE_ARCHIVE`, e.g. a `make dist` archive), installs it with `install.sh --archive` into a
+  prefix under `target/` (HOME and the login shell under `target/` too, so `~/.local/bin` and your
+  dotfiles are never touched), installs again over itself, then runs the installed binary's
+  `--version` and `doctor --json` against compose.
+
 | env | default | |
 |---|---|---|
 | `AMP_MCP_URL` | `http://localhost:8000/mcp` | compose leg (`cd v2 && make up`; auth off, expects `local-dev@amp.local`) |
 | `AMP_SMOKE_PROTOCOLS` | `auto 2025-11-25` | one run per mode. `auto` must land on the stateless 2026-07-28 era |
-| `AMP_SMOKE_LEGS` | `compose cluster` | add `keychain` (macOS) for the keychain-only leg: no key in the environment, real login keychain under a throwaway service, dialogs off, each item read at most once per process |
+| `AMP_SMOKE_LEGS` | `compose firstrun install cluster` | add `keychain` (macOS) for the keychain-only leg: no key in the environment, real login keychain under a throwaway service, dialogs off, each item read at most once per process |
 | `AMP_TOKEN` + `AMP_CA_FILE` | unset, so the cluster leg is skipped | cluster leg: an `amp_` token from the UI and `amp-local-ca.crt`. The token is only sent to this leg |
 | `AMP_SMOKE_CLUSTER_URL` | `https://amp.local/mcp` | envoy on 443, not `:8443` (RFC 9728 resource match) |
-| `AMP_SMOKE_LEGS` | `compose cluster` | |
+| `AMP_SMOKE_REST_URL` | `http://localhost:3001` | compose's REST listener: plan approval and marking a person's ticket done, as the person |
+| `AMP_SMOKE_APPROVE_WAIT` | `0` | cluster leg: seconds to wait for a person to approve the plan at the printed link when the server refuses agents (0 = fail at once) |
+| `AMP_SMOKE_ARCHIVE` | unset | install leg: a release archive (with its `.sha256`) to install instead of packing the binary under test |
 | `AMP_SMOKE_WEB_URL` | `http://localhost:5173` | compose leg's web UI, passed as `AMP_WEB_URL`; `/open` must print it. The cluster leg uses the MCP origin. An unreachable UI is only a WARN |
 
 On the dev Mac, the docker-desktop cluster's LoadBalancer can hold host :8000. In that case, publish

@@ -1003,10 +1003,8 @@ async fn create_interactive(
             break n.trim().to_owned();
         }
     };
-    let code = ui.ask(
-        "Short code, the ticket prefix (2-6 letters)",
-        Some(&derive_code(&name)),
-    )?;
+    let code_prompt = "Short code, the ticket prefix (2-6 letters)";
+    let mut code = ui.ask(code_prompt, Some(&derive_code(&name)))?;
     let orgs_v = call_json(client, "amp_list_orgs", json!({})).await.ok();
     let orgs: Vec<(i64, String)> = orgs_v
         .as_ref()
@@ -1045,6 +1043,12 @@ async fn create_interactive(
     loop {
         match create_project(client, &name, Some(code.clone()), org, team).await {
             Ok(p) => return Ok(p),
+            // Codes are unique across AMP, archived projects included: ask for another one
+            // instead of ending the first run.
+            Err(e) if e.message.contains("code") && e.message.contains("already exists") => {
+                ui.say(&format!("  {}", e.message));
+                code = ui.ask(code_prompt, None)?;
+            }
             Err(e) if team.is_none() && e.message.contains("team") => {
                 ui.say(&format!("  {}", e.message));
                 let t = ui.ask("Team id that should own it (see the AMP web UI)", None)?;
