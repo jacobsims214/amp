@@ -3,9 +3,47 @@
 AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) with an MCP client on
 `rmcp`. Design and build plan: AMP project 2 KB, `decisions/amp-harness-architecture.md`.
 
-Status: **M2-4.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login),
-and the CLI has `login`, `logout`, `doctor`, `whoami`, `tickets list|get`, `config show`, `run -p`
-(a headless agent run) and the hidden `mcp call`. `make smoke` runs them against a real local AMP.
+Status: **M2.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login).
+`amp-harness` with no subcommand is a chat with the manager, which plans on the board and dispatches
+specialist workers itself (`amp_run_ticket`); every worker's run, tokens and commit are reported to
+its ticket automatically. The CLI also has `login`, `logout`, `doctor`, `whoami`, `tickets list|get`,
+`config show`, `run -p` (a headless agent run) and the hidden `mcp call`. `make smoke` runs them
+against a real local AMP.
+
+## Try it
+
+From the repo root of a worktree on `/Volumes/external-data` (see the Rust disk rule below):
+
+```sh
+make -C v2/harness build
+alias amp-harness="$PWD/v2/harness/target/debug/amp-harness"
+
+# 1. A provider key, from the environment or the keychain (never a config file).
+export OPENROUTER_API_KEY=...       # the shipped roles run on OpenRouter models
+# or: export ANTHROPIC_API_KEY=... and AMP_HARNESS_PROFILE=anthropic (Anthropic-only profile)
+# or keep it in the macOS keychain (prompts for the key):
+#   security add-generic-password -s amp-harness -a provider:openrouter -w
+
+# 2. Every role resolves to a provider/model that has a key, and the model ids exist.
+amp-harness config show --check
+
+# 3a. Against compose (auth off; on the dev Mac amp-api is published on :18000, see Smoke test).
+export AMP_MCP_URL=http://localhost:18000/mcp
+amp-harness doctor
+amp-harness                          # chat with the manager; /help lists the commands
+
+# 3b. Or against the docker-desktop cluster (OAuth, self-signed CA).
+kubectl --context docker-desktop -n amp get secret amp-ca-secret \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > amp-local-ca.crt
+amp-harness login  --url https://amp.local/mcp --ca-file amp-local-ca.crt
+amp-harness doctor --url https://amp.local/mcp --ca-file amp-local-ca.crt
+amp-harness        --url https://amp.local/mcp --ca-file amp-local-ca.crt
+```
+
+Run it from a directory with an `.amp.json` (its `project_id` is the default project), or tell the
+manager which project to use. `amp-harness run -p "What is on the board?"` does the same without
+the TUI. To drop the flags, put `url` and `ca_file` under `[server]` in
+`~/.config/amp-harness/config.toml`.
 
 ## Layout (D1)
 
@@ -145,8 +183,17 @@ auth = "none"
 context_window = 262144
 ```
 
+- A role's key is its agent id without `amp-`: `manager`, `worker-backend`, `worker-frontend`,
+  `worker-docs`, `reviewer`, `github-reviewer`, `researcher`, `github-researcher`, `kb-curator`,
+  `designer`, `media`, plus any agent you add (see Roles below).
 - A role resolves from the defaults' `[roles.<role>]`, then the selected profile (or the inherit
-  model), then your `[roles.<role>]`. `AMP_HARNESS_PROFILE` overrides `[models] profile`.
+  model), then your `[roles.<role>]`. `AMP_HARNESS_PROFILE` overrides `[models] profile`. Profiles:
+  `opencode` (the shipped `[roles.*]`: the manager, researchers and media on OpenRouter's
+  `xiaomi/mimo-v2.6-pro`, workers on `deepseek/deepseek-v4.1-flash-1017`, reviewers on `z-ai/glm-5.3`,
+  the designer on `moonshotai/kimi-k3`), `anthropic` (Opus for the manager and reviewers, Sonnet for
+  the other workers) and `inherit` (one `[models] inherit` model for every role).
+- When a layer changes a role's `model`, the lower layers' `extra_body` is dropped; `thinking`
+  carries over unless that layer sets it.
 - Keys come from the provider's `key_env` (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`), then the
   keychain (service `amp-harness`, account `provider:<id>`; skipped with
   `AMP_CREDENTIAL_STORE=file`). Never from config files.
@@ -162,6 +209,9 @@ It prints each provider (api, URL, where its key comes from, never the key, and 
 each role's provider/model, thinking level, readiness and the layer that set it. `--check` asks each
 provider in use for its live model list (OpenRouter's is public; Anthropic's needs the key) and
 flags ids that are missing. It exits 1 if a role does not resolve or a checked id is missing.
+
+`config show --config PATH` reads that file. The chat and `run` always read `[models]`, `[roles]`,
+`[providers]` and `[workers]` from the default config.toml; their `--config` only changes `[server]`.
 
 ## Headless runs (M2-4)
 
@@ -208,6 +258,105 @@ AMP_HARNESS_FAUX_SCRIPT=script.json amp-harness run -p "who am I?" --json
 Each step is one model response: `text`, `tool_calls` (`[{name, arguments, id?}]`) and `thinking`.
 `{{last_tool_result}}` and `{{system_prompt}}` in `text` are filled from what the model was sent.
 The file can also map provider ids to steps. A script that runs out fails the run instead of hanging.
+
+## Chat (M2-7)
+
+```sh
+amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--url URL] [--ca-file PEM] [--protocol P] [--config PATH] [--token-env VAR]
+```
+
+With no subcommand, `amp-harness` opens a full-screen chat with the manager (or `--role`), built
+exactly as `run -p` builds it, so the conversation carries on across prompts. The transcript is a
+JSONL session under `~/.local/state/amp-harness/sessions/<role>/` unless `--no-session`. It needs a
+terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
+
+- Commands: `/model` lists the current model and every model whose provider has a key;
+  `/model provider/model` switches this session's model. `/usage` prints the session's tokens and
+  cost, `/help`, `/abort`, `/quit` (also `/exit`, `/q`).
+- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
+  else clears the editor, else quits; Ctrl-D on an empty editor quits.
+- The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
+  (and any workers it started) and waits briefly so the session file is complete.
+
+This is the plain M2 shell (rpi-tui's default theme). The AMP theme, header, status line and AMP
+slash commands come in M3.
+
+## Roles, agents and skills (D5, D6)
+
+The roster and skills are generated from `v2/.opencode` into `v2/harness/assets/` by
+`v2/scripts/build-harness-assets.sh` (`make -C v2/harness assets`; `assets-check` fails on drift)
+and embedded in the binary. Each agent file `agents/amp-<id>.md` is one role: its markdown body is
+the system prompt, its frontmatter `permission` block is the tool policy, and a `skills:` list (else
+a built-in table) names the skills preloaded into its prompt in full. The manager preloads
+`amp-index` and `amp-planning`, workers `amp-execution`, reviewers `amp-review` plus their review
+skill. Every other skill is listed with its path, for the agent to read when it needs it.
+
+You can override or add agents and skills from disk. Later layers win:
+
+1. embedded: `v2/harness/assets/{agents,skills}`;
+2. user: `~/.config/amp-harness/{agents,skills}/` (`$XDG_CONFIG_HOME` honoured);
+3. repo: `<dir with .amp.json>/.amp/harness/{agents,skills}/`.
+
+An agent override (`agents/amp-manager.md`) replaces the whole agent. Skills override per file:
+`skills/amp-kb/SKILL.md` replaces only that file, and the skill keeps its other embedded files. Files
+that don't exist in the embedded set add new agents or skills. Names are lowercase letters, digits
+and hyphens. A malformed override is an error naming the file, never skipped silently. A new agent
+needs a `[roles.<id without amp->]` model in config.toml.
+
+Tool policy uses opencode's `permission` semantics, enforced by the harness before each tool call:
+the last matching rule wins, `ask` is treated as `deny` (nothing ever prompts), and a denied call
+comes back to the model as a tool error ("Denied by the amp-<role> tool policy"). Workers can never
+call `question` or dispatch other agents. Under a restricted bash policy, command substitution and
+redirection to a file are denied too.
+
+## Dispatching workers (M2-5)
+
+A primary role (the manager) gets the native tool `amp_run_ticket(task_id, agent_id, instructions?,
+worktree?, branch?, base?)`. It runs one specialist on one ticket in the foreground of the tool
+call and returns the worker's final message, outcome, usage and where its work is:
+
+1. The agent must be in the roster and allowed by the manager's `task` policy; otherwise nothing
+   happens in AMP.
+2. It waits for a worker slot, then calls `amp_dispatch_task` (AMP refusing it ends the call).
+3. Roles that edit files run in a git worktree `<repo>/.worktrees/<ticket>` on branch
+   `amp-<ticket>` off `HEAD` (reused if it exists; `worktree`, `branch` and `base` override this).
+   Read-only roles run in the manager's directory. `.worktrees/` is added to the repo's
+   `info/exclude` if nothing ignores it yet.
+4. The worker is its own agent session: its role's model and thinking, its prompt plus the ticket,
+   worktree and branch, tools bound to its directory, and a JSONL session under
+   `~/.local/state/amp-harness/sessions/<ticket>/`.
+5. It runs until it stops, hits the timeout or the turn budget, or is cancelled (the manager's run
+   was aborted). Ending a worker early aborts its in-flight tools.
+
+Limits, in `~/.config/amp-harness/config.toml` or the environment (env wins):
+
+```toml
+[workers]
+max_parallel = 4          # AMP_HARNESS_MAX_WORKERS: workers at once; extra calls wait for a slot
+timeout_minutes = 60      # AMP_HARNESS_WORKER_TIMEOUT_SECS (seconds): wall clock per worker
+max_turns = 400           # AMP_HARNESS_WORKER_MAX_TURNS: model turns per worker; 0 = no limit
+```
+
+Unknown keys and non-positive `max_parallel` or timeouts are errors.
+
+## Run reporting (M2-6)
+
+AMP reports token spend per ticket and traces code to tickets from the run fields on
+`amp_complete_task` / `amp_block_task`. Models forget them or can't know them, so the harness fills
+them in for every worker it dispatches:
+
+- When a worker completes or blocks **its own ticket**, the harness fills `model`, `input_tokens`,
+  `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `branch`, `commit` and
+  `pushed`, but only the fields the model left out. Usage is the worker's live totals; git comes from
+  its worktree.
+- A worker that ends without closing its ticket (error, timeout, cancel, turn budget, or it just
+  stopped) is reported with `amp_report_run`, outcome `abandoned` and a note
+  `abandoned: <reason>`, with the same usage and git fields, so the board shows the run and its
+  tokens.
+- Only numbers the provider reported are sent: no token fields without usage, and no `cost_usd` when
+  the cost is 0 (a model without prices in models.toml, or the faux provider).
+- Every session also has a native `amp_session_usage` tool (the session's model, tokens and cost so
+  far), so the amp-execution skill's completion step works unchanged.
 
 ## Dev loop
 
