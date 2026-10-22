@@ -382,6 +382,7 @@ async fn loads_every_item_on_start_and_polls_on_the_intervals() {
             ticket_id: Some(2104),
             intervals: fast(150),
             connector: None,
+            web_url: None,
         },
     );
     let m = wait_for(&meta, "every item", loaded).await;
@@ -446,6 +447,7 @@ async fn polls_only_what_applies() {
             ticket_id: Some(2104),
             intervals: fast(100),
             connector: None,
+            web_url: None,
         },
     );
     let m = wait_for(&meta, "the start-up load", |m| {
@@ -476,6 +478,7 @@ async fn amp_tool_calls_refresh_at_once() {
             // Nothing is due again for an hour: every later call comes from a tool trigger.
             intervals: fast(3_600_000),
             connector: None,
+            web_url: None,
         },
     );
     wait_for(&meta, "every item", loaded).await;
@@ -650,6 +653,7 @@ async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_
             ticket_id: Some(99_999),
             intervals: fast(3_600_000),
             connector: None,
+            web_url: None,
         },
     );
     let m = wait_for(&meta, "the missing ticket's error", |m| {
@@ -768,6 +772,7 @@ async fn connects_in_the_background_and_retries() {
             project_id: Some(2),
             intervals: fast(3_600_000),
             connector: Some(connector),
+            web_url: None,
             ..MetaOptions::default()
         },
     );

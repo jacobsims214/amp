@@ -279,7 +279,8 @@ impl<T> Fetched<T> {
 pub struct Instance {
     /// The MCP endpoint (`https://amp.simstech.cloud/mcp`).
     pub mcp_url: String,
-    /// The web UI origin (`https://amp.simstech.cloud`): the MCP URL without its path.
+    /// The web UI origin (`https://amp.simstech.cloud`): the configured web URL's origin, else the
+    /// MCP URL without its path.
     pub web_base: String,
     /// The negotiated MCP protocol version (`2026-07-28`).
     pub protocol: String,
@@ -290,11 +291,12 @@ pub struct Instance {
 }
 
 impl Instance {
-    fn of(client: &AmpMcpClient) -> Self {
+    /// `web_url` overrides the web UI origin (compose serves the UI on another port than MCP).
+    fn of(client: &AmpMcpClient, web_url: Option<&str>) -> Self {
         let s = client.session();
         Self {
             mcp_url: s.url.clone(),
-            web_base: web_base(&s.url),
+            web_base: web_base(web_url.unwrap_or(&s.url)),
             protocol: s.protocol_version.to_string(),
             server_name: s.server_name.clone(),
             server_version: s.server_version.clone(),
@@ -837,6 +839,9 @@ pub struct MetaOptions {
     pub intervals: Intervals,
     /// Connects (or reconnects) the poller's own client. Without one, a closed client stays down.
     pub connector: Option<Connector>,
+    /// The web UI origin for links (`AMP_WEB_URL`, `[server] web_url`). `None`: the MCP URL's
+    /// origin, which is right when the UI and MCP share a host (hosted AMP, the cluster).
+    pub web_url: Option<String>,
 }
 
 enum Command {
@@ -1045,6 +1050,7 @@ pub struct MetaPoller {
     tx: watch::Sender<Arc<AmpMeta>>,
     client: Option<Arc<AmpMcpClient>>,
     connector: Option<Connector>,
+    web_url: Option<String>,
     iv: Intervals,
     schedule: Schedule,
     /// `amp_get_plan` cache: (project id, epics as (id, name, stories as (id, name))).
@@ -1099,7 +1105,9 @@ impl MetaPoller {
         let meta = AmpMeta {
             project_id: options.project_id,
             ticket_id: options.ticket_id,
-            instance: client.as_deref().map(Instance::of),
+            instance: client
+                .as_deref()
+                .map(|c| Instance::of(c, options.web_url.as_deref())),
             ..AmpMeta::default()
         };
         let (tx, rx) = watch::channel(Arc::new(meta));
@@ -1108,6 +1116,7 @@ impl MetaPoller {
             tx,
             client,
             connector: options.connector,
+            web_url: options.web_url,
             iv: options.intervals,
             schedule: Schedule::default(),
             tree: None,
@@ -1247,7 +1256,7 @@ impl MetaPoller {
         self.next_reconnect = Some(now + self.iv.reconnect);
         match connector().await {
             Ok(client) => {
-                let instance = Instance::of(&client);
+                let instance = Instance::of(&client, self.web_url.as_deref());
                 self.client = Some(Arc::new(client));
                 self.next_reconnect = None;
                 self.update(|m| {

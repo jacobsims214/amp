@@ -243,6 +243,7 @@ fn load_theme(args: &ChatArgs) -> Result<AmpTheme, CliError> {
 /// --live` is the render check with live metadata.
 fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, CliError> {
     let settings = conn.settings()?;
+    let web_url = settings.web_url.clone();
     let connector: Connector = Arc::new(move || {
         let settings = settings.clone();
         Box::pin(async move { crate::conn::connect(&settings).await })
@@ -252,6 +253,7 @@ fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, Cl
         MetaOptions {
             project_id,
             connector: Some(connector),
+            web_url,
             ..MetaOptions::default()
         },
     ))
