@@ -43,7 +43,12 @@
 //! stopped and its `amp_report_run` has returned. Without workers it waits [`ABORT_GRACE`] for the
 //! aborted prompt so its session file is complete.
 
-use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use amp_core::events::{RunEvent, Totals};
 use amp_core::meta::MetaHandle;
@@ -231,6 +236,18 @@ pub enum QuitOutcome {
     TimedOut,
 }
 
+/// The transcript line a run the person stopped ends with: dim, no error colour (#2181).
+pub const STOPPED: &str = "Stopped.";
+
+/// What the spinner line says, for [`ESC_HINT_FOR`], after Esc closed a panel during a run.
+pub const ESC_HINT: &str = "Esc again to stop the reply";
+
+/// How long [`ESC_HINT`] stays next to the spinner.
+pub const ESC_HINT_FOR: Duration = Duration::from_secs(2);
+
+/// The spinner's own message while a run is going.
+const WORKING: &str = "Working…";
+
 /// What the caller does after a submission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Submit {
@@ -273,6 +290,8 @@ pub struct Shell {
     server: Option<Arc<dyn ServerControl>>,
     /// A `/server` switch is running.
     switching: bool,
+    /// Until when the spinner line shows [`ESC_HINT`].
+    esc_hint_until: Option<Instant>,
 }
 
 impl Shell {
@@ -310,6 +329,7 @@ impl Shell {
                 secret: None,
                 server: None,
                 switching: false,
+                esc_hint_until: None,
             },
             done_rx,
         )
@@ -698,12 +718,14 @@ impl Shell {
         });
     }
 
-    /// Asks the running prompt to stop; it then finishes as aborted.
+    /// Asks the running prompt to stop; it then finishes as aborted, and the transcript says
+    /// "Stopped." once, below whatever the reply had streamed ([`Shell::finish_run`]).
     pub async fn abort(&mut self) {
         if !self.running {
             return;
         }
-        self.view.add_notice("aborting…");
+        self.view.set_stopping(true);
+        self.clear_esc_hint();
         if let Err(e) = self.harness.abort().await {
             self.view.add_error(&format!("abort: {e}"));
         }
@@ -712,11 +734,17 @@ impl Shell {
     /// Records a finished run. Drain the agent events first: they were all sent before it ended.
     pub fn finish_run(&mut self, result: RunDone) {
         self.running = false;
+        self.esc_hint_until = None;
         self.view.set_working(false);
+        let stopping = self.view.stopping();
+        self.view.set_stopping(false);
         match result {
             Ok(r) => match r.outcome {
                 HarnessRunOutcome::Completed { .. } => {}
-                HarnessRunOutcome::Aborted { .. } => self.view.add_notice("aborted"),
+                HarnessRunOutcome::Aborted { .. } => self.view.add_notice(STOPPED),
+                // The provider may report a stopped request as an error ("Request was
+                // aborted"): the person asked for it, so it is not one.
+                HarnessRunOutcome::Failed { .. } if stopping => self.view.add_notice(STOPPED),
                 HarnessRunOutcome::Failed { error, .. } => self
                     .view
                     .add_error(&format!("run failed: {}: {}", error.code, error.message)),
@@ -724,7 +752,56 @@ impl Shell {
                     .view
                     .add_notice("the provider deferred its response (run suspended)"),
             },
+            Err(_) if stopping => self.view.add_notice(STOPPED),
             Err(e) => self.view.add_error(&format!("run failed: {e}")),
+        }
+    }
+
+    /// A key the editor doesn't get first: an open AMP panel's keys ([`Shell::panel_key`]),
+    /// then Esc during a run, which stops the reply. Returns true when it was used; otherwise the
+    /// caller gives it to the editor.
+    ///
+    /// Esc that closes a panel during a run doesn't stop it: the spinner line says
+    /// [`ESC_HINT`] for [`ESC_HINT_FOR`], and the next Esc stops the reply (#2181).
+    pub async fn key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
+        let is_esc = key.code == KeyCode::Esc
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        let panel_open = self.view.panel().is_open();
+        if self.panel_key(key, editor_empty) {
+            if is_esc && self.running && panel_open && !self.view.panel().is_open() {
+                self.show_esc_hint();
+            }
+            return true;
+        }
+        if is_esc && self.running {
+            self.abort().await;
+            return true;
+        }
+        false
+    }
+
+    fn show_esc_hint(&mut self) {
+        self.esc_hint_until = Some(Instant::now() + ESC_HINT_FOR);
+        self.view.set_working_message(ESC_HINT);
+    }
+
+    fn clear_esc_hint(&mut self) {
+        if self.esc_hint_until.take().is_some() {
+            self.view.set_working_message(WORKING);
+        }
+    }
+
+    /// Puts the spinner line back to "Working…" once [`ESC_HINT`] has been shown for
+    /// [`ESC_HINT_FOR`] at `now`. Returns true when it changed. [`Shell::poll`] calls it.
+    pub fn expire_hints(&mut self, now: Instant) -> bool {
+        match self.esc_hint_until {
+            Some(until) if now >= until => {
+                self.clear_esc_hint();
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1127,7 +1204,7 @@ impl Shell {
     /// Applies finished command calls and follows the metadata (the ticket marker, the footer).
     /// Returns whether anything changed. The terminal loop calls it on its tick.
     pub fn poll(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.expire_hints(Instant::now());
         while let Ok(msg) = self.msgs_rx.try_recv() {
             changed = true;
             if let ShellMsg::Notice { text, error } = &msg {

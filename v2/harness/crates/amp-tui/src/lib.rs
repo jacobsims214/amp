@@ -45,8 +45,8 @@ pub mod wrap;
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
 pub use shell::{
-    ConnectFuture, ConnectReply, HELP, ModelChoice, Notifier, Opener, ProviderConnect, RunDone,
-    ServerControl, ServerSwitched, Shell, ShellInfo, Submit,
+    ConnectFuture, ConnectReply, ESC_HINT, ESC_HINT_FOR, HELP, ModelChoice, Notifier, Opener,
+    ProviderConnect, RunDone, STOPPED, ServerControl, ServerSwitched, Shell, ShellInfo, Submit,
 };
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use transcript::ThinkingDisplay;
