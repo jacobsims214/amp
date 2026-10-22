@@ -106,10 +106,12 @@ async fn the_chat_talks_to_the_manager() {
         "You are local-dev.",
         "are you still there?",
         "Still here, same conversation.",
-        "usage this session: 2 prompt(s), 3 turn(s), 1 tool call(s) (0 failed)",
+        "usage this session: 2 prompts, 3 turns, 1 tool call",
     ] {
         assert!(screen.contains(text), "missing {text:?} in\n{screen}");
     }
+    // #2188: proper plurals, no `(s)`.
+    assert!(!screen.contains("(s)"), "{screen}");
     assert_eq!(amp.mock.calls_to("amp_whoami"), vec![json!({})]);
 
     // The footer, two rows at 220 columns: cwd • role, then `ctx N%` … model • thinking.
@@ -139,7 +141,9 @@ async fn model_switches_and_quit_in_the_chat() {
             "--input",
             "/model",
             "--input",
-            "/model faux/faux-2",
+            "key:down",
+            "--input",
+            "key:enter",
             "--input",
             "/quit",
             "--input",
@@ -153,10 +157,8 @@ async fn model_switches_and_quit_in_the_chat() {
         out.stderr, out.stdout
     );
     let screen = &out.stdout;
-    assert!(
-        screen.contains("available: faux/faux-1, faux/faux-2"),
-        "{screen}"
-    );
+    // #2188: /model is a picker; ↓ Enter picks faux-2, and the panel closes.
+    assert!(!screen.contains("── model"), "{screen}");
     assert!(screen.contains("model: faux/faux-2"), "{screen}");
     assert!(screen.contains("session in memory"), "{screen}");
     assert!(!screen.contains("never sent"), "{screen}");

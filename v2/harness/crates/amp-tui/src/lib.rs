@@ -56,7 +56,7 @@ pub mod view;
 pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
-pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
+pub use overlay::{ModelRow, Panel, PanelKind, PanelState, Stage, Target};
 pub use scroll::{NEW_OUTPUT, TranscriptScroll};
 pub use shell::{
     CTRL_D_SETTLE, ConnectFuture, ConnectReply, CtrlC, CtrlD, ESC_HINT, ESC_HINT_FOR, ModelChoice,

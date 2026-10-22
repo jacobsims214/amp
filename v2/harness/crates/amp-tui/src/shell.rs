@@ -64,7 +64,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::amp_render::{self, ApprovalNotice};
-use crate::overlay::{self, PanelKind, PanelState, Stage, Target};
+use crate::overlay::{self, ModelRow, PanelKind, PanelState, Stage, Target};
 use crate::slash::MenuKey;
 use crate::view::{ChatView, FooterInfo};
 
@@ -305,6 +305,9 @@ pub struct Shell {
     models: Vec<ModelChoice>,
     totals: Totals,
     prompts: u32,
+    /// A model chosen in the `/model` picker, switched to by [`Shell::key`] / [`Shell::press`]
+    /// (switching is async; the panel keys are not).
+    pending_model: Option<String>,
     running: bool,
     done_tx: UnboundedSender<RunDone>,
     /// The AMP metadata poller (#2104), if the caller started one.
@@ -361,6 +364,7 @@ impl Shell {
                 models,
                 totals: Totals::default(),
                 prompts: 0,
+                pending_model: None,
                 running: false,
                 done_tx,
                 meta: None,
@@ -857,6 +861,7 @@ impl Shell {
             if is_esc && self.running && panel_open && !self.view.panel().is_open() {
                 self.show_esc_hint();
             }
+            self.switch_pending_model().await;
             return true;
         }
         if self.scroll_key(key, editor_empty) {
@@ -984,7 +989,7 @@ impl Shell {
                 .view
                 .add_to_transcript(Arc::new(crate::slash::HelpBlock::new())),
             "usage" => self.view.add_notice(&self.usage_text()),
-            "model" if arg.is_empty() => self.view.add_notice(&self.model_text()),
+            "model" if arg.is_empty() => self.model_picker(),
             "model" => self.switch_model(arg).await,
             "connect" => self.connect_command(arg),
             "abort" => self.abort().await,
@@ -1298,6 +1303,10 @@ impl Shell {
                                 s.note = None;
                             });
                         }
+                        Some(Target::Model(reference)) => {
+                            panel.close();
+                            self.pending_model = Some(reference);
+                        }
                         Some(target) => self.open_target(&target),
                         None => {}
                     },
@@ -1316,7 +1325,7 @@ impl Shell {
     /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
     /// `enter`, `esc`, `up`, `down`, or one character. `ctrl+t` toggles the last thinking,
     /// `ctrl+o` the tool calls' details.
-    pub fn press(&mut self, name: &str) -> Result<bool, String> {
+    pub async fn press(&mut self, name: &str) -> Result<bool, String> {
         if let Some(text) = name.strip_prefix("paste:") {
             self.paste(text);
             return Ok(true);
@@ -1344,10 +1353,15 @@ impl Shell {
         if self.secret_key(&key) {
             return Ok(true);
         }
-        Ok(self.panel_key(&key, true))
+        let used = self.panel_key(&key, true);
+        self.switch_pending_model().await;
+        Ok(used)
     }
 
     fn open_target(&mut self, target: &Target) {
+        if matches!(target, Target::Model(_)) {
+            return;
+        }
         let Some(meta) = &self.meta else { return };
         match overlay::target_url(&meta.snapshot(), target) {
             Some(url) => self.open_url(&url),
@@ -1544,16 +1558,20 @@ impl Shell {
     fn usage_text(&self) -> String {
         let t = &self.totals;
         let u = &t.usage;
+        let failed = if t.tool_errors > 0 {
+            format!(" ({} failed)", t.tool_errors)
+        } else {
+            String::new()
+        };
         format!(
-            "usage this session: {} prompt(s), {} turn(s), {} tool call(s) ({} failed)\n\
+            "usage this session: {}, {}, {}{failed}\n\
              tokens: input {} · output {} · cache read {} · cache write {} · cost ${:.4}\n\
              {}\n\
              model: {} • thinking {}\n\
              session: {}",
-            self.prompts,
-            t.turns,
-            t.tool_calls,
-            t.tool_errors,
+            count(self.prompts as u64, "prompt", "prompts"),
+            count(t.turns as u64, "turn", "turns"),
+            count(t.tool_calls as u64, "tool call", "tool calls"),
             u.input_tokens,
             u.output_tokens,
             u.cache_read_tokens,
@@ -1587,6 +1605,44 @@ impl Shell {
         text
     }
 
+    /// `/model` with no argument: the picker panel over the models this chat can switch to,
+    /// the current one selected (#2188). With none to pick from, the model line as a notice.
+    fn model_picker(&mut self) {
+        if self.models.is_empty() {
+            self.view.add_notice(&self.model_text());
+            return;
+        }
+        let current = self.info.model_ref();
+        let rows = self
+            .models
+            .iter()
+            .map(|m| ModelRow {
+                reference: m.reference.clone(),
+                current: m.reference == current,
+                context_window: m.model.context_window,
+                reasoning: m.model.reasoning,
+            })
+            .collect();
+        let mut state = PanelState::models(rows);
+        state.note = Some((
+            format!(
+                "now {} • thinking {} (role {})",
+                current,
+                thinking_name(self.info.thinking),
+                short_role(&self.info.role)
+            ),
+            false,
+        ));
+        self.view.panel().open(state);
+    }
+
+    /// Switches to the model chosen in the picker, if one was.
+    async fn switch_pending_model(&mut self) {
+        if let Some(reference) = self.pending_model.take() {
+            self.switch_model(&reference).await;
+        }
+    }
+
     fn model_text(&self) -> String {
         let mut text = format!(
             "model: {} • thinking {} (role {})",
@@ -1594,17 +1650,8 @@ impl Shell {
             thinking_name(self.info.thinking),
             short_role(&self.info.role),
         );
-        if !self.models.is_empty() {
-            text.push_str("\navailable: ");
-            text.push_str(
-                &self
-                    .models
-                    .iter()
-                    .map(|m| m.reference.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            text.push_str("\nswitch with /model provider/model");
+        if self.models.is_empty() {
+            text.push_str("\nno other models: add a provider with /connect");
         }
         text
     }
@@ -1622,7 +1669,7 @@ impl Shell {
             .cloned()
         else {
             self.view.add_error(&format!(
-                "unknown model `{reference}` (/model lists the available ones)"
+                "unknown model `{reference}` (/model picks from the available ones)"
             ));
             return;
         };
@@ -1712,6 +1759,11 @@ fn clean_answer(text: &str) -> String {
 pub fn short_role(role: &str) -> &str {
     let role = role.rsplit(':').next().unwrap_or(role);
     role.strip_prefix("amp-").unwrap_or(role)
+}
+
+/// `1 prompt`, `3 prompts`.
+fn count(n: u64, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 #[cfg(test)]

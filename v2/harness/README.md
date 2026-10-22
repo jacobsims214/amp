@@ -319,7 +319,7 @@ amp-harness connect my-llm --base-url http://localhost:11434/v1 [--api openai-co
   `/connect PROVIDER` (or `/connect ID BASE_URL [API]` for a custom endpoint) asks for the key: it
   is typed or pasted into a hidden buffer, never the editor, the transcript, its history or the
   session file. The chat uses the new key at once: its providers are rebuilt and handed to the
-  running agent, and `/model` lists the new provider's models. Workers started later use them too.
+  running agent, and `/model` offers the new provider's models. Workers started later use them too.
 - **No Claude subscription login.** Anthropic allows Claude Free/Pro/Max subscription logins
   (OAuth) only in its own products (Claude.ai, Claude Code, Claude Desktop, Cowork) and blocks them
   in third-party tools, so amp-harness offers only an Anthropic **API key** from
@@ -481,8 +481,9 @@ exactly as `run -p` builds it, so the conversation carries on across prompts. Th
 JSONL session under `~/.local/state/amp-harness/sessions/<role>/` unless `--no-session`. It needs a
 terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
 
-- Commands: `/model` lists the current model and every model whose provider has a key;
-  `/model provider/model` switches this session's model. `/connect [provider]` lists providers or
+- Commands: `/model` opens a picker over every model whose provider has a key, the current one
+  marked (↑↓ select, Enter switches, Esc closes); `/model provider/model` switches this session's
+  model directly. `/connect [provider]` lists providers or
   stores a key without leaving the chat (see Connecting model providers). `/server` lists the saved
   AMP servers and `/server <name|address>` switches the session to one without a restart (see Saved
   servers). `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/quit` (also

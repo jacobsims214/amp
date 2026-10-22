@@ -292,7 +292,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         if input == "wait:amp" {
             wait_connected(&mut shell, &connected).await?;
         } else if let Some(key) = input.strip_prefix("key:") {
-            shell.press(key).map_err(CliError::usage)?;
+            shell.press(key).await.map_err(CliError::usage)?;
         } else {
             if shell.submit(input).await == Submit::Quit {
                 break;

@@ -260,6 +260,28 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
     wrap_in(s, width, Vec::new())
 }
 
+/// Hard-wraps one styled line at exactly `width` columns, keeping every character (spaces
+/// included), so a wrapped code line still copies whole. Like [`wrap`], each row closes its open
+/// SGR state and the next row re-opens it, as whole sequences: a truecolor `38;2;r;g;b` is never
+/// split into separate codes (rpi-tui 0.8.0's `wrap_text_with_ansi` replays `r`, `g` and `b` on
+/// to a continuation row as codes of their own, #2188). Always returns at least one row.
+pub fn hard_wrap(s: &str, width: usize) -> Vec<String> {
+    let mut rows = Rows::new(width);
+    for item in items(s) {
+        match item {
+            Item::Esc(e) => rows.esc(e),
+            Item::Char(c, w) => {
+                if rows.cur_w > 0 && rows.cur_w + w > rows.width {
+                    rows.break_row();
+                }
+                rows.char(c, w);
+            }
+        }
+    }
+    rows.end_line();
+    rows.rows
+}
+
 /// [`wrap`], for text that continues a row whose styling `active` is open: continuation rows
 /// re-open it too.
 fn wrap_in(s: &str, width: usize, active: Vec<String>) -> Vec<String> {

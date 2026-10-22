@@ -1,5 +1,6 @@
 //! The AMP command panels (M3-4, #2108): what `/amp`, `/ticket`, `/workers`, `/questions`,
-//! `/plan` and `/project` show, docked between the transcript and the editor.
+//! `/plan` and `/project` show, docked between the transcript and the editor. `/model` uses the
+//! same panel as a picker (#2188): Enter switches to the selected model.
 //!
 //! ```text
 //! ── AMP · questions ───────────────────────────────────────────────────────────
@@ -57,6 +58,8 @@ pub enum PanelKind {
     Plan,
     /// `/project`: the project.
     Project,
+    /// `/model`: the models this chat can switch to; Enter switches (no AMP data needed).
+    Model,
 }
 
 impl PanelKind {
@@ -68,6 +71,7 @@ impl PanelKind {
             Self::Questions => "AMP · questions",
             Self::Plan => "AMP · plan",
             Self::Project => "AMP · project",
+            Self::Model => "model",
         }
     }
 }
@@ -102,6 +106,20 @@ pub struct PanelState {
     pub plan_blocked: Option<Result<Value, String>>,
     /// A one-line note at the bottom (`answered #2107`, an error).
     pub note: Option<(String, bool)>,
+    /// `/model`'s choices, in the order shown.
+    pub models: Vec<ModelRow>,
+}
+
+/// One model in the `/model` picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRow {
+    /// `provider/model`, what `/model <reference>` takes.
+    pub reference: String,
+    /// The session's model now.
+    pub current: bool,
+    pub context_window: u64,
+    /// Whether the model thinks (has thinking levels).
+    pub reasoning: bool,
 }
 
 impl PanelState {
@@ -113,6 +131,17 @@ impl PanelState {
             plan: None,
             plan_blocked: None,
             note: None,
+            models: Vec::new(),
+        }
+    }
+
+    /// The `/model` picker over `models`, with the current one selected.
+    pub fn models(models: Vec<ModelRow>) -> Self {
+        let selected = models.iter().position(|m| m.current).unwrap_or(0);
+        Self {
+            selected,
+            models,
+            ..Self::new(PanelKind::Model)
         }
     }
 }
@@ -238,6 +267,8 @@ pub enum Target {
     Ticket { id: i64, question: Option<String> },
     /// A web page from [`Instance`]'s helpers (the project's Mission page, AMP itself).
     Page(String),
+    /// A model in `/model` (`provider/model`): Enter switches to it.
+    Model(String),
 }
 
 /// One piece of a row.
@@ -414,6 +445,9 @@ fn ticket_target(id: i64) -> Target {
 
 fn build_rows(state: &PanelState, data: Option<&ChromeData>, p: &AmpPalette) -> Vec<Row> {
     let c = colors();
+    if state.kind == PanelKind::Model {
+        return model_rows(state);
+    }
     let Some(data) = data else {
         return vec![Row::new(vec![flex(
             "no AMP metadata: the chat is not connected to AMP's metadata poller",
@@ -427,7 +461,49 @@ fn build_rows(state: &PanelState, data: Option<&ChromeData>, p: &AmpPalette) -> 
         PanelKind::Questions => question_rows(state, data, p),
         PanelKind::Plan => plan_rows(state, data, p),
         PanelKind::Project => project_rows(data, p),
+        PanelKind::Model => model_rows(state),
     }
+}
+
+/// `/model`: one selectable row per model, `● provider/model  current · 1M ctx · thinking`.
+/// The reference is the flex piece, so a long name is shortened rather than wrapped.
+fn model_rows(state: &PanelState) -> Vec<Row> {
+    let c = colors();
+    if state.models.is_empty() {
+        return vec![Row::new(vec![flex(
+            "no other models: add a provider with /connect",
+            c.dim,
+        )])];
+    }
+    state
+        .models
+        .iter()
+        .map(|m| {
+            let mark = if m.current {
+                c.success.fg("●")
+            } else {
+                c.dim.fg("○")
+            };
+            let mut detail = Vec::new();
+            if m.current {
+                detail.push(c.success.fg("current"));
+            }
+            if m.context_window > 0 {
+                detail.push(c.dim.fg(&format!(
+                    "{} ctx",
+                    crate::footer::format_tokens(m.context_window as i64)
+                )));
+            }
+            if m.reasoning {
+                detail.push(c.dim.fg("thinking"));
+            }
+            let mut pieces = vec![fixed(mark), flex(&m.reference, c.text)];
+            if !detail.is_empty() {
+                pieces.push(fixed(detail.join(&c.dim.fg(" · "))));
+            }
+            Row::new(pieces).target(Target::Model(m.reference.clone()))
+        })
+        .collect()
 }
 
 fn health_word(c: &Connection) -> String {
@@ -1158,6 +1234,9 @@ fn hint(state: &PanelState, has_targets: bool) -> String {
         }
         (Stage::Confirm { .. }, _) => "y / Enter send · n / Esc cancel".to_owned(),
         (Stage::Sending { .. }, _) => "sending…".to_owned(),
+        (Stage::Browse, PanelKind::Model) if has_targets => {
+            "↑↓ select · Enter switch · Esc close".to_owned()
+        }
         (Stage::Browse, PanelKind::Questions) if has_targets => {
             "↑↓ select · Enter answer · o open in browser · Esc close".to_owned()
         }
@@ -1282,6 +1361,7 @@ pub fn target_url(meta: &AmpMeta, target: &Target) -> Option<String> {
             Some(inst.ticket_url(meta.project_id?, *id))
         }
         Target::Page(url) => Some(url.clone()),
+        Target::Model(_) => None,
     }
 }
 

@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Duration};
 
 use amp_core::{agent::memory_session, events::ChannelEmitter};
 use amp_tui::{ModelChoice, Shell, ShellInfo, Submit};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
 use rpi_ai::{
     Model, ThinkingLevel,
@@ -174,24 +175,48 @@ async fn slash_commands() {
 
     rig.say("/usage").await;
     let screen = rig.screen();
+    // #2188: proper plurals; no failed count when nothing failed.
     assert!(
-        screen.contains("usage this session: 1 prompt(s), 1 turn(s), 0 tool call(s)"),
+        screen.contains("usage this session: 1 prompt, 1 turn, 0 tool calls"),
         "{screen}"
     );
+    assert!(!screen.contains("failed"), "{screen}");
+    assert!(!screen.contains("(s)"), "{screen}");
 
+    // #2188: /model opens a picker with the current model selected; ↓ Enter switches.
     rig.say("/model").await;
     let screen = rig.screen();
-    assert!(screen.contains("available: faux/"), "{screen}");
-
-    rig.say(&format!("/model {}/faux-2", rig.model.provider))
-        .await;
+    assert!(screen.contains("── model "), "{screen}");
+    let current = format!("› ● {}/{}", rig.model.provider, rig.model.id);
+    assert!(screen.contains(&current), "{screen}");
+    assert!(
+        screen.contains(&format!("○ {}/faux-2", rig.model.provider)),
+        "{screen}"
+    );
+    assert!(screen.contains("current"), "{screen}");
+    assert!(screen.contains("Enter switch"), "{screen}");
+    assert!(!screen.contains("available:"), "no comma list: {screen}");
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(rig.shell.key(&key(KeyCode::Down), true).await);
+    assert!(
+        rig.screen()
+            .contains(&format!("› ○ {}/faux-2", rig.model.provider))
+    );
+    assert!(rig.shell.key(&key(KeyCode::Enter), true).await);
+    assert!(!rig.shell.view().panel().is_open());
+    assert_eq!(rig.shell.info().model_id, "faux-2");
     let lines = rig.shell.view().render_plain(W, H);
     assert!(
         lines[H - 1].ends_with("faux-2 • thinking off"),
         "{}",
         lines[H - 1]
     );
-    assert_eq!(rig.shell.info().model_id, "faux-2");
+    assert!(rig.screen().contains("model: faux/faux-2"));
+
+    // Typing a reference still switches directly.
+    rig.say(&format!("/model {}/{}", rig.model.provider, rig.model.id))
+        .await;
+    assert_eq!(rig.shell.info().model_id, rig.model.id);
 
     rig.say("/model nope/nope").await;
     assert!(rig.screen().contains("unknown model `nope/nope`"));
