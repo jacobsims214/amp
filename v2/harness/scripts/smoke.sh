@@ -28,6 +28,16 @@
 # AMP has no hard delete for projects, so "deleted" means its tickets, story and epic are deleted
 # and the project is archived; the leg checks it is gone from amp_list_projects.
 #
+# keychain (#2165, opt-in: AMP_SMOKE_LEGS="keychain" or "compose keychain"; macOS only, skipped
+#          elsewhere). The binary as installed (AMP_HARNESS_BIN=$(command -v amp-harness) to test the
+#          installed one), no key in the environment, keys from the keychain only. With the real HOME
+#          (the login keychain) but a throwaway service amp-harness-smoke-<pid>, never your entries.
+#          `init --key-env` stores a dummy OpenRouter key through the harness; then `config show` and
+#          `run -p` (faux manager, compose server) each run in a new process with keychain dialogs
+#          turned off (AMP_HARNESS_KEYCHAIN_PROMPTS=never: a read that needs approval fails instead of
+#          prompting), must find the key, and must read each keychain item at most once
+#          (AMP_HARNESS_KEYCHAIN_TRACE). The item is deleted on exit.
+#
 # Exits non-zero on any failure. Cleanup runs on every exit path (trap), including failures.
 # The harness runs with HOME/XDG_CONFIG_HOME under target/ and AMP_CREDENTIAL_STORE=file, so your
 # real keychain and config.toml are never read or written.
@@ -64,6 +74,10 @@ for name in rpi-ai rpi-agent rpi-tools rpi-harness rpi-tui rmcp; do
   grep -Eq "^${name} [0-9]+\.[0-9]+\.[0-9]+$" <<<"$out" || die "--version has no ${name} version"
 done
 log "version ok ($(head -1 <<<"$out"))"
+
+# The keychain leg needs the real HOME: the macOS login keychain lives there.
+REAL_HOME="$HOME"
+KC_SERVICE=""
 
 # --- isolation ------------------------------------------------------------------------------------
 mkdir -p "$HARNESS_DIR/target"
@@ -152,6 +166,9 @@ on_exit() {
   local rc=$?
   trap - EXIT
   cleanup_leg || rc=1
+  if [[ -n "$KC_SERVICE" ]]; then
+    security delete-generic-password -s "$KC_SERVICE" -a provider:openrouter >/dev/null 2>&1 || true
+  fi
   rm -rf "$WORK"
   if ((${#RESULTS[@]})); then
     printf 'smoke: %s\n' "${RESULTS[@]}"
@@ -487,8 +504,71 @@ run_leg() {
   RESULTS+=("PASS $LEG ($proto_seen)")
 }
 
+# --- keychain only (#2165) -------------------------------------------------------------------------
+# kc_check PROCESS: the trace holds one process that read each item at most once, found the
+# OpenRouter key, and hit no keychain error.
+kc_check() {
+  local trace="$WORK/keychain-trace.tsv"
+  [[ -s "$trace" ]] || die "[keychain] $1: no keychain calls traced"
+  awk -F'\t' -v what="$1" '
+    { pids[$5] = 1 }
+    $1 == "read" { reads[$3]++ }
+    $1 == "read" && $3 == "provider:openrouter" && $4 == "found" { found = 1 }
+    $4 ~ /^error/ { print "smoke: [keychain] " what ": keychain error: " $1 " " $3 " " $4 > "/dev/stderr"; bad = 1 }
+    END {
+      n = 0; for (p in pids) n++
+      if (n != 1) { print "smoke: [keychain] " what ": expected one process, saw " n > "/dev/stderr"; bad = 1 }
+      for (a in reads) if (reads[a] > 1) { print "smoke: [keychain] " what ": " a " read " reads[a] " times" > "/dev/stderr"; bad = 1 }
+      if (!found) { print "smoke: [keychain] " what ": the OpenRouter key was not read from the keychain" > "/dev/stderr"; bad = 1 }
+      exit bad
+    }' "$trace" || die "[keychain] $1: keychain calls not as expected (trace: $(tr '\t' ' ' <"$trace" | tr '\n' ';'))"
+  log "[keychain] $1 ok: $(awk -F'\t' '$1 == "read" { n++ } END { print n + 0 }' "$trace") keychain reads, one per item, no dialog"
+}
+
+keychain_leg() {
+  LEG="keychain"
+  if [[ "$(uname -s)" != Darwin ]]; then
+    RESULTS+=("SKIP keychain (macOS only)")
+    return 0
+  fi
+  KC_SERVICE="amp-harness-smoke-$$"
+  local trace="$WORK/keychain-trace.tsv" out
+  log "== leg keychain: $BIN, service $KC_SERVICE, no key in the environment"
+  # k ARGS...: the binary with the real HOME, the keychain store under the throwaway service, no
+  # provider key in the environment, no stdin, and keychain dialogs off.
+  k() {
+    env -u OPENROUTER_API_KEY -u ANTHROPIC_API_KEY HOME="$REAL_HOME" AMP_CREDENTIAL_STORE=keychain \
+      AMP_HARNESS_KEYCHAIN_SERVICE="$KC_SERVICE" AMP_HARNESS_KEYCHAIN_PROMPTS=never \
+      AMP_HARNESS_KEYCHAIN_TRACE="$trace" AMP_MCP_URL="$COMPOSE_URL" AMP_WEB_URL="$COMPOSE_WEB_URL" \
+      "$@" "$BIN" "${KARGS[@]}" </dev/null
+  }
+  rm -f "$trace" .amp.json
+  KARGS=(init --yes --no-project --key-env AMP_SMOKE_DUMMY_KEY --provider openrouter --json)
+  out="$(k AMP_SMOKE_DUMMY_KEY="sk-or-v1-smoke-dummy-$$")" || die "[keychain] init could not store the key"
+  grep -q $'^write\t'"$KC_SERVICE"$'\tprovider:openrouter\tok' "$trace" ||
+    die "[keychain] init did not write the key through the harness"
+  log "[keychain] init stored a dummy OpenRouter key through the harness"
+
+  rm -f "$trace"
+  KARGS=(config show --json)
+  out="$(k)" || die "[keychain] config show failed"
+  expect "$out" '.providers | tostring | contains("keychain")' "config show does not report the keychain as a key source"
+  kc_check "config show"
+
+  rm -f "$trace"
+  printf '[{"text": "keychain smoke"}]\n' >"$WORK/kc-script.json"
+  KARGS=(run -p "say hi" --json)
+  out="$(k AMP_HARNESS_FAUX_SCRIPT="$WORK/kc-script.json")" || {
+    printf '%s\n' "$out" >&2
+    die "[keychain] run -p failed"
+  }
+  kc_check "run -p"
+  RESULTS+=("PASS keychain")
+}
+
 for leg in $LEGS; do
   case "$leg" in
+    keychain) keychain_leg ;;
     compose)
       for proto in $PROTOCOLS; do run_leg compose "$COMPOSE_URL" "$proto" "" "" "$COMPOSE_EMAIL" "$COMPOSE_WEB_URL"; done ;;
     cluster)

@@ -19,6 +19,7 @@ mod credentials;
 mod error;
 mod health;
 mod http;
+mod keychain;
 pub mod oauth;
 mod protocol;
 mod settings;
@@ -37,6 +38,11 @@ pub use health::Health;
 pub use http::{
     DEFAULT_OAUTH_REQUEST_TIMEOUT, OAUTH_CONNECT_TIMEOUT, build_http_client,
     build_oauth_http_client, load_ca_file,
+};
+pub use keychain::{
+    ENV_KEYCHAIN_PROMPTS, ENV_KEYCHAIN_TRACE, KEYCHAIN_REPAIR_HINT, KeychainError,
+    KeychainErrorKind, keychain_delete, keychain_forget, keychain_get, keychain_prompts_allowed,
+    keychain_reads, keychain_set,
 };
 pub use protocol::{Era, ProtocolMode};
 pub use settings::{

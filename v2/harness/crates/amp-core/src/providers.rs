@@ -77,6 +77,9 @@ pub enum KeySource {
         env: Option<String>,
         keychain_checked: bool,
     },
+    /// The keychain was asked and failed (denied, needs approval nobody can give, no keychain).
+    /// The message says what to do; it never holds a secret. Counts as missing.
+    KeychainFailed(String),
 }
 
 impl fmt::Display for KeySource {
@@ -101,13 +104,14 @@ impl fmt::Display for KeySource {
                 }
                 f.write_str(")")
             }
+            Self::KeychainFailed(why) => write!(f, "keychain: {why}"),
         }
     }
 }
 
 impl KeySource {
     pub fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing { .. })
+        matches!(self, Self::Missing { .. } | Self::KeychainFailed(_))
     }
 
     /// Short machine-readable form: `env`, `keychain`, `not-needed`, `missing`.
@@ -117,6 +121,29 @@ impl KeySource {
             Self::Keychain => "keychain",
             Self::NotNeeded => "not-needed",
             Self::Missing { .. } => "missing",
+            Self::KeychainFailed(_) => "keychain-error",
+        }
+    }
+}
+
+/// What the keychain said about a provider's key.
+#[derive(Clone, PartialEq, Eq)]
+pub enum KeychainKey {
+    /// The keychain is not consulted (`AMP_CREDENTIAL_STORE=file`, tests).
+    Off,
+    NotFound,
+    Found(String),
+    /// The lookup failed; the message says what to do.
+    Failed(String),
+}
+
+impl fmt::Debug for KeychainKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Off => f.write_str("Off"),
+            Self::NotFound => f.write_str("NotFound"),
+            Self::Found(_) => f.write_str("Found(<redacted>)"),
+            Self::Failed(why) => f.debug_tuple("Failed").field(why).finish(),
         }
     }
 }
@@ -124,8 +151,7 @@ impl KeySource {
 /// Where keys are looked up. Tests use a map; the binary uses [`SystemKeys`].
 pub trait KeyLookup: Send + Sync {
     fn env(&self, var: &str) -> Option<String>;
-    /// `None` when the keychain is not consulted at all.
-    fn keychain(&self, provider: &str) -> Option<Option<String>>;
+    fn keychain(&self, provider: &str) -> KeychainKey;
 }
 
 /// Process environment + the OS keychain (unless `AMP_CREDENTIAL_STORE=file`).
@@ -157,13 +183,19 @@ impl KeyLookup for SystemKeys {
         std::env::var(var).ok()
     }
 
-    fn keychain(&self, provider: &str) -> Option<Option<String>> {
-        let service = self.keychain_service.as_deref()?;
-        // Any keychain failure (no Secret Service, locked, ...) reads as "no key there".
-        let found = keyring::Entry::new(service, &keychain_account(provider))
-            .and_then(|entry| entry.get_password())
-            .ok();
-        Some(found)
+    /// Through amp-mcp's process-wide cache: each provider's entry is read at most once per
+    /// process, however many times keys are resolved (#2165).
+    fn keychain(&self, provider: &str) -> KeychainKey {
+        let Some(service) = self.keychain_service.as_deref() else {
+            return KeychainKey::Off;
+        };
+        match amp_mcp::keychain_get(service, &keychain_account(provider)) {
+            Ok(Some(key)) => KeychainKey::Found(key),
+            Ok(None) => KeychainKey::NotFound,
+            // No keychain on this machine (headless Linux): the same as no key there.
+            Err(e) if e.kind == amp_mcp::KeychainErrorKind::Unavailable => KeychainKey::NotFound,
+            Err(e) => KeychainKey::Failed(e.message),
+        }
     }
 }
 
@@ -179,8 +211,14 @@ impl KeyLookup for StaticKeys {
         self.env.get(var).cloned()
     }
 
-    fn keychain(&self, provider: &str) -> Option<Option<String>> {
-        self.keychain.as_ref().map(|k| k.get(provider).cloned())
+    fn keychain(&self, provider: &str) -> KeychainKey {
+        match &self.keychain {
+            None => KeychainKey::Off,
+            Some(k) => k
+                .get(provider)
+                .cloned()
+                .map_or(KeychainKey::NotFound, KeychainKey::Found),
+        }
     }
 }
 
@@ -194,15 +232,20 @@ pub fn resolve_key(provider: &ProviderConfig, keys: &dyn KeyLookup) -> (Option<S
     {
         return (Some(secret), KeySource::Env(var.clone()));
     }
-    let keychain = keys.keychain(&provider.id);
-    if let Some(secret) = keychain.clone().flatten().and_then(Secret::new) {
-        return (Some(secret), KeySource::Keychain);
-    }
+    let keychain_checked = match keys.keychain(&provider.id) {
+        KeychainKey::Found(key) => match Secret::new(key) {
+            Some(secret) => return (Some(secret), KeySource::Keychain),
+            None => true,
+        },
+        KeychainKey::Failed(why) => return (None, KeySource::KeychainFailed(why)),
+        KeychainKey::NotFound => true,
+        KeychainKey::Off => false,
+    };
     (
         None,
         KeySource::Missing {
             env: provider.key_env.clone(),
-            keychain_checked: keychain.is_some(),
+            keychain_checked,
         },
     )
 }

@@ -72,7 +72,14 @@ pub fn reconnector(settings: &Settings) -> Option<Reconnector> {
     let settings = settings.clone();
     Some(Arc::new(move || {
         let settings = settings.clone();
-        Box::pin(async move { connect(&settings).await })
+        Box::pin(async move {
+            // A reconnect follows "login required": read the stored login afresh, since keychain
+            // reads are cached per process (#2165) and the new login was written by another one.
+            if let Ok(backend) = CredentialBackend::resolve() {
+                backend.forget_cached(&settings.url);
+            }
+            connect(&settings).await
+        })
     }))
 }
 
