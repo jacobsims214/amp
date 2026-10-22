@@ -49,8 +49,9 @@ pub mod wrap;
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
 pub use shell::{
-    ConnectFuture, ConnectReply, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener,
-    ProviderConnect, RunDone, STOPPED, ServerControl, ServerSwitched, Shell, ShellInfo, Submit,
+    ConnectFuture, ConnectReply, CtrlC, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener,
+    ProviderConnect, QUIT_HINT, QUIT_HINT_FOR, RunDone, STOPPED, ServerControl, ServerSwitched,
+    Shell, ShellInfo, Submit,
 };
 pub use slash::{COMMANDS, CommandMenu, CommandSpec, Group, HelpBlock, KEYS, MenuKey};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};

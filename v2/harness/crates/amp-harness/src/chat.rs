@@ -256,9 +256,14 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
                 .chrome()
                 .set_workers(Arc::new(move || sup.workers()));
         }
-        return amp_tui::terminal::run(shell, events, done)
-            .await
-            .map_err(CliError::new);
+        let session_file = session.agent.session_file.clone();
+        let result = amp_tui::terminal::run(shell, events, done).await;
+        // Back on the main screen: where the conversation was saved (#2184).
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        if let Some(line) = exit_line(session_file.as_deref(), home.as_deref()) {
+            println!("{line}");
+        }
+        return result.map_err(CliError::new);
     };
     // No browser from a snapshot: /open reports the URL it would open.
     shell.set_opener(Arc::new(|_url: &str| {
@@ -422,6 +427,26 @@ pub(crate) fn start_meta_with(settings: amp_mcp::Settings, project_id: Option<i6
     )
 }
 
+/// The line printed after the TUI exits (#2184): `Session saved · ~/.local/state/...jsonl`, with
+/// `home` shown as `~`. None without a session file (`--no-session`) or when nothing was written
+/// to it, so it never names a file that isn't there.
+fn exit_line(session_file: Option<&Path>, home: Option<&Path>) -> Option<String> {
+    let path = session_file.filter(|p| p.is_file())?;
+    Some(format!("Session saved · {}", tilde(path, home)))
+}
+
+/// `path` with a leading `home` written as `~`.
+fn tilde(path: &Path, home: Option<&Path>) -> String {
+    match home
+        .filter(|h| !h.as_os_str().is_empty())
+        .and_then(|h| path.strip_prefix(h).ok())
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
 fn shell_info(s: &session::Session) -> ShellInfo {
     let resolved = &s.agent.resolved;
     let mcp = s.rt.mcp.session();
@@ -462,7 +487,7 @@ fn shell_info(s: &session::Session) -> ShellInfo {
                 resolved.model_id,
                 thinking_name(resolved.thinking)
             ),
-            "/help for commands · Esc aborts a reply · Ctrl+C quits".to_owned(),
+            "/help for commands · Esc aborts a reply · Ctrl+C twice quits".to_owned(),
         ],
     }
 }
@@ -498,7 +523,61 @@ fn git_branch(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::{exit_line, parse_size, tilde};
+    use std::path::Path;
+
+    #[test]
+    fn the_exit_line_names_the_session_file_with_a_tilde() {
+        let dir = scratch("exit-line");
+        let home = dir.as_path();
+        let file = home.join(".local/state/amp-harness/sessions/amp-manager/abc.jsonl");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{}\n").unwrap();
+        assert_eq!(
+            exit_line(Some(&file), Some(home)).as_deref(),
+            Some("Session saved · ~/.local/state/amp-harness/sessions/amp-manager/abc.jsonl")
+        );
+        // Outside home, or no home: the full path.
+        assert_eq!(
+            exit_line(Some(&file), Some(Path::new("/elsewhere"))),
+            Some(format!("Session saved · {}", file.display()))
+        );
+        assert_eq!(
+            exit_line(Some(&file), None),
+            Some(format!("Session saved · {}", file.display()))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_session_file_means_no_exit_line() {
+        // --no-session: the transcript was in memory.
+        assert_eq!(exit_line(None, Some(Path::new("/home/me"))), None);
+        // A session file nothing was written to is not named.
+        let dir = scratch("no-file");
+        assert_eq!(exit_line(Some(&dir.join("never.jsonl")), None), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh directory for one test (a few bytes; removed by the test).
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("amp-harness-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn tilde_only_replaces_a_whole_leading_home() {
+        let home = Some(Path::new("/home/me"));
+        assert_eq!(tilde(Path::new("/home/me/a/b"), home), "~/a/b");
+        assert_eq!(tilde(Path::new("/home/me"), home), "~");
+        assert_eq!(tilde(Path::new("/home/meow/a"), home), "/home/meow/a");
+        assert_eq!(
+            tilde(Path::new("/home/me/a"), Some(Path::new(""))),
+            "/home/me/a"
+        );
+    }
 
     #[test]
     fn snapshot_sizes() {

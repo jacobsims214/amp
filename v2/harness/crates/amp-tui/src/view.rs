@@ -27,7 +27,7 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -94,6 +94,9 @@ pub struct ChatView {
     /// The person asked the run to stop: its aborted (or failed) reply keeps what it streamed
     /// and shows no error, since the shell says "Stopped." once (#2181).
     stopping: bool,
+    /// What the empty editor says instead of [`PLACEHOLDER`] for a moment ("Press Ctrl+C again
+    /// to quit", #2184).
+    hint: Arc<Mutex<Option<String>>>,
 }
 
 impl Default for ChatView {
@@ -122,8 +125,12 @@ impl ChatView {
         let menu = CommandMenu::new(editor.clone());
         let menu_slot = Arc::new(Container::new());
         menu_slot.add_child(Arc::new(menu.clone()));
+        let hint = Arc::new(Mutex::new(None));
         let editor_slot = Arc::new(Container::new());
-        editor_slot.add_child(Arc::new(EditorView(editor.clone())));
+        editor_slot.add_child(Arc::new(EditorView {
+            editor: editor.clone(),
+            hint: Arc::clone(&hint),
+        }));
         let amp_status = Arc::new(Container::new());
         amp_status.add_child(chrome.status_line());
         let footer = Arc::new(FooterComponent::new());
@@ -162,6 +169,7 @@ impl ChatView {
             show_thinking: ThinkingDisplay::default(),
             last_thinking: None,
             stopping: false,
+            hint,
         }
     }
 
@@ -293,6 +301,17 @@ impl ChatView {
             working.message = message.to_owned();
             self.editor.set_working(Some(working));
         }
+    }
+
+    /// Shows `hint` dim in the empty editor in place of [`PLACEHOLDER`] (`None` puts the
+    /// placeholder back). The shell's "Press Ctrl+C again to quit" (#2184).
+    pub fn set_editor_hint(&self, hint: Option<&str>) {
+        *self.hint.lock().unwrap_or_else(|e| e.into_inner()) = hint.map(str::to_owned);
+    }
+
+    /// The hint the empty editor shows instead of [`PLACEHOLDER`], if any.
+    pub fn editor_hint(&self) -> Option<String> {
+        self.hint.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// The text next to the working spinner, if a run is going.
@@ -471,21 +490,27 @@ impl ChatView {
     }
 }
 
-/// pi's editor with [`PLACEHOLDER`] drawn dim after the cursor while it is empty.
+/// pi's editor with [`PLACEHOLDER`] (or the shell's hint, [`ChatView::set_editor_hint`]) drawn
+/// dim after the cursor while it is empty.
 ///
 /// rpi-tui 0.8.0's own `EditorOptions::placeholder` can't be used: its cursor marker is inserted
 /// inside the placeholder's `ESC[2m` (`insert_cursor_marker` ends an escape at `[`), so a real
 /// terminal would print `2m/ for commands`, undimmed. Here the editor renders as usual and the
 /// placeholder replaces the blank cells right after the cursor marker.
-struct EditorView(Arc<Editor>);
+struct EditorView {
+    editor: Arc<Editor>,
+    hint: Arc<Mutex<Option<String>>>,
+}
 
 impl Component for EditorView {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = self.0.render(width);
-        if !self.0.get_text().is_empty() {
+        let mut lines = self.editor.render(width);
+        if !self.editor.get_text().is_empty() {
             return lines;
         }
-        let want = rpi_tui::visible_width(PLACEHOLDER);
+        let hint = self.hint.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let text = hint.as_deref().unwrap_or(PLACEHOLDER);
+        let want = rpi_tui::visible_width(text);
         for line in &mut lines {
             let Some(at) = line.find(CURSOR_MARKER) else {
                 continue;
@@ -493,7 +518,7 @@ impl Component for EditorView {
             let after = at + CURSOR_MARKER.len();
             let blanks = line[after..].bytes().take_while(|b| *b == b' ').count();
             if blanks >= want {
-                let dim = theme().colors.dim.fg(PLACEHOLDER);
+                let dim = theme().colors.dim.fg(text);
                 line.replace_range(after..after + want, &dim);
             }
             break;
@@ -502,7 +527,7 @@ impl Component for EditorView {
     }
 
     fn invalidate(&self) {
-        self.0.invalidate();
+        self.editor.invalidate();
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

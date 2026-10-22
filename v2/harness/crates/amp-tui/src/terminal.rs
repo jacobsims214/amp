@@ -5,8 +5,9 @@
 //! The terminal is always given back: [`TerminalGuard`] stops the TUI (leave the alternate screen,
 //! raw mode off, cursor, mouse and bracketed paste restored) when the loop returns or unwinds, and
 //! a panic hook does the same before the panic message prints. Ctrl-C in raw mode is a key, not
-//! a signal: it aborts a running prompt, else clears the editor, else quits. SIGINT, SIGTERM and
-//! SIGHUP quit cleanly too.
+//! a signal: it aborts a running prompt, else clears the editor, else shows "Press Ctrl+C again to
+//! quit", and a second Ctrl+C within 1.5 s quits ([`Shell::ctrl_c`]). Ctrl-D on the empty editor,
+//! `/quit`, SIGINT, SIGTERM and SIGHUP quit at once.
 //!
 //! Quitting with a prompt or workers still running goes through [`Shell::quit`]: the workers are
 //! cancelled and the screen says it is waiting for their run reports (bounded; a second Ctrl-C or
@@ -18,7 +19,7 @@ use std::{
         Arc, Once,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
@@ -26,7 +27,7 @@ use rpi_agent::AgentEvent;
 use rpi_tui::{ProcessTerminal, TUI, TuiAltScreen, TuiStopOptions};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::shell::{QuitOutcome, RunDone, Shell, Submit};
+use crate::shell::{CtrlC, QuitOutcome, RunDone, Shell, Submit};
 
 /// Escape sequences that undo everything the TUI turns on: mouse tracking, bracketed paste,
 /// the kitty keyboard protocol, a hidden cursor and the alternate screen.
@@ -231,13 +232,21 @@ async fn event_loop(
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let editor = shell.view().editor().clone();
                         let editor_empty = editor.get_text().is_empty();
+                        if !is_ctrl(&key, 'c') {
+                            // The quit window is two Ctrl+Cs in a row.
+                            shell.clear_quit_hint();
+                        }
                         if shell.secret_key(&key) {
                             // A `/connect` key is being typed: it never reaches the editor.
-                        } else if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor_empty) {
+                        } else if is_ctrl(&key, 'c') {
+                            // Stop the reply, else clear the editor, else "Press Ctrl+C again
+                            // to quit", and the second one quits (#2184).
+                            if shell.ctrl_c(Instant::now()).await == CtrlC::Quit {
+                                break;
+                            }
+                        } else if is_ctrl(&key, 'd') && editor_empty {
                             if shell.is_running() {
                                 shell.abort().await;
-                            } else if !editor.get_text().is_empty() {
-                                editor.clear();
                             } else {
                                 break;
                             }

@@ -176,7 +176,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Shift+Enter", "new line"),
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
     ("Esc", "stop the reply, or close a panel or the menu"),
-    ("Ctrl+C", "stop the reply, clear the editor, or quit"),
+    ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
     ("Ctrl+D", "quit (with an empty editor)"),
     ("Ctrl+T", "show or hide the last thinking"),
 ];
