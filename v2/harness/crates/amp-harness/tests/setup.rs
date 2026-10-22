@@ -402,8 +402,10 @@ async fn the_chat_without_a_key_says_how_to_store_one() {
 
 /// Deletes the test keychain service's provider entry (macOS `security`, which never prompts for
 /// a delete by service/account).
+#[cfg(target_os = "macos")]
 struct KeychainCleanup(String);
 
+#[cfg(target_os = "macos")]
 impl Drop for KeychainCleanup {
     fn drop(&mut self) {
         let _ = std::process::Command::new("security")
