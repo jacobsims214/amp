@@ -12,6 +12,10 @@
 //! or the gap between events exceeds `stream_idle_timeout`, the request is cancelled and the stream
 //! ends with an `Error` that keeps the partial message (rpi has only a whole-request timeout, and
 //! DeepSeek stalls mid-stream).
+//!
+//! For OpenAI-compatible (and faux) providers it also removes text-format tool calls
+//! (`<tool_call><function=…>`) from the stream, and turns them into real calls when the model sent
+//! no structured one ([`crate::text_tool_calls`], #2179).
 
 use std::{
     collections::BTreeMap,
@@ -479,6 +483,9 @@ pub struct ConfiguredProvider {
     models: Vec<Model>,
     timeouts: Timeouts,
     max_retries: Option<u32>,
+    /// Scrub text-format tool calls (#2179): OpenAI-compatible and faux providers. Anthropic's
+    /// Messages API has structured tool use only, and its models don't write the markup.
+    text_tool_calls: bool,
 }
 
 impl ConfiguredProvider {
@@ -490,6 +497,10 @@ impl ConfiguredProvider {
             models: config.models.values().cloned().collect(),
             timeouts: config.timeouts,
             max_retries: config.max_retries,
+            text_tool_calls: matches!(
+                config.api,
+                ProviderApi::OpenaiCompletions | ProviderApi::Faux
+            ),
         }
     }
 
@@ -531,10 +542,16 @@ impl Provider for ConfiguredProvider {
         let cancel = opts.signal.child_token();
         opts.signal = cancel.clone();
         let inner = self.inner.stream_simple(model, ctx, &opts).await;
-        if self.timeouts.header.is_none() && self.timeouts.stream_idle.is_none() {
-            return inner;
+        let guarded = if self.timeouts.header.is_none() && self.timeouts.stream_idle.is_none() {
+            inner
+        } else {
+            guard_stream(inner, cancel, self.timeouts, &self.id, model)
+        };
+        if self.text_tool_calls {
+            crate::text_tool_calls::scrub_stream(guarded, ctx.tools.clone())
+        } else {
+            guarded
         }
-        guard_stream(inner, cancel, self.timeouts, &self.id, model)
     }
 }
 
