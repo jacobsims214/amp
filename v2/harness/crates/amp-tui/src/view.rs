@@ -13,7 +13,8 @@
 //!    the dim placeholder [`PLACEHOLDER`] while it is empty);
 //! 7. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
 //!    approval, board counts, artifacts in review, run reported);
-//! 8. pi's two-line **footer**, unchanged (cwd/branch/session; usage and model • thinking).
+//! 8. the **footer** ([`crate::footer`], #2186): cwd (branch) • session, `$0.004 · ctx 4%` and
+//!    model • thinking; one row below [`crate::footer::FOLD_BELOW`] columns, two above.
 //!
 //! Nothing here touches a terminal: [`ChatView::render_frame`] lays the screen out at any size,
 //! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
@@ -36,6 +37,7 @@ use amp_core::events::{stop_reason_str, tool_result_text};
 
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
+use crate::footer::Footer;
 use crate::overlay::Panel;
 use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
@@ -46,8 +48,8 @@ use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
     CURSOR_MARKER, Component, Container, Editor, EditorOptions, EditorStyle, Focusable,
-    FooterComponent, Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack,
-    WorkingState, strip_ansi, theme,
+    Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack, WorkingState,
+    strip_ansi, theme,
 };
 
 /// The dim hint in the empty editor (#2182).
@@ -77,7 +79,7 @@ pub struct ChatView {
     status: Arc<Container>,
     editor: Arc<Editor>,
     amp_status: Arc<Container>,
-    footer: Arc<FooterComponent>,
+    footer: Arc<Footer>,
     /// The AMP header and status line's inputs (M3-3).
     chrome: Chrome,
     /// The AMP command panel (M3-4), above the editor while open.
@@ -143,8 +145,7 @@ impl ChatView {
         }));
         let amp_status = Arc::new(Container::new());
         amp_status.add_child(chrome.status_line());
-        let footer = Arc::new(FooterComponent::new());
-        footer.set_hints("Enter send · Shift+Enter new line · Esc abort · Ctrl+C quit · /help");
+        let footer = Arc::new(Footer::new());
 
         let root = VStack::from_children(vec![
             StackChild::Entry(StackEntry::new(header.clone()).shrink(0)),
@@ -254,7 +255,7 @@ impl ChatView {
         &self.editor
     }
 
-    pub fn footer(&self) -> &Arc<FooterComponent> {
+    pub fn footer(&self) -> &Arc<Footer> {
         &self.footer
     }
 
@@ -363,7 +364,6 @@ impl ChatView {
         } else if self.editor.working().is_some() {
             self.editor.set_working(None);
         }
-        self.footer.set_status("");
     }
 
     /// The text next to the working spinner ("Working…", or a short hint), keeping the spinner's

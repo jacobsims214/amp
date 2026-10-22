@@ -56,6 +56,7 @@ async fn rig() -> Rig {
         context_window: 200_000,
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m4".into()),
+        session_file: None,
         banner: vec!["AMP harness · manager".into()],
     };
     let (mut shell, done) = Shell::new(Arc::new(harness), info, Vec::new());

@@ -554,9 +554,11 @@ fn header_line1(style: &Style, data: &ChromeData, p: &AmpPalette, width: usize) 
         HealthLevel::Degraded => c.warning,
         HealthLevel::Down => c.error,
     };
+    // The dot and its word ("connected") outlast everything else on the line (#2186): the
+    // protocol goes first, then the left side from the host to the project.
     let mut right = vec![
         Seg::new(dot.fg("●"), Lead::Space, 1),
-        Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 7),
+        Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 1),
     ];
     if let Some(inst) = &meta.instance {
         let protocol = clean(&inst.protocol);

@@ -81,6 +81,7 @@ async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
         context_window: 200_000,
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m3".into()),
+        session_file: None,
         banner: vec!["AMP harness · manager".into()],
     };
     let (mut shell, done) = Shell::new(Arc::new(harness), info, Vec::new());

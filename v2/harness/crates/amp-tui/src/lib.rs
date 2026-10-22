@@ -35,11 +35,15 @@
 //! - [`scroll`] (#2185): PageUp/PageDown, Ctrl+U/Ctrl+D and End scroll the transcript, and the
 //!   "↓ new output" pill shows while it is scrolled up and output arrives below.
 //!
+//! - [`footer`] (#2186): the footer in place of pi's: `~`-relative cwd shortened from the left,
+//!   branch, role · #ticket, `$0.004 · ctx 4%` and model • thinking; one row below 100 columns.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
 pub mod amp_render;
 pub mod chrome;
+pub mod footer;
 pub mod overlay;
 pub mod scroll;
 pub mod shell;
