@@ -12,6 +12,7 @@
 use std::{sync::Arc, time::Duration};
 
 use amp_core::events::{RunEvent, Totals};
+use amp_core::meta::MetaHandle;
 use amp_core::models::thinking_name;
 use rpi_agent::AgentEvent;
 use rpi_ai::{Model, ThinkingLevel};
@@ -83,6 +84,8 @@ pub struct Shell {
     prompts: u32,
     running: bool,
     done_tx: UnboundedSender<RunDone>,
+    /// The AMP metadata poller (#2104), if the caller started one.
+    meta: Option<MetaHandle>,
 }
 
 impl Shell {
@@ -106,6 +109,7 @@ impl Shell {
                 prompts: 0,
                 running: false,
                 done_tx,
+                meta: None,
             },
             done_rx,
         )
@@ -128,9 +132,23 @@ impl Shell {
         &self.totals
     }
 
+    /// Attaches the AMP metadata poller: from now on every `amp_*` tool call that ends without
+    /// error refreshes what it touched ([`MetaHandle::observe`]).
+    pub fn set_meta(&mut self, meta: MetaHandle) {
+        self.meta = Some(meta);
+    }
+
+    /// The AMP metadata poller, for the header and status line (M3-3).
+    pub fn meta(&self) -> Option<&MetaHandle> {
+        self.meta.as_ref()
+    }
+
     pub fn handle_event(&mut self, event: &AgentEvent) {
         if let Some(e) = RunEvent::from_agent(event) {
             self.totals.observe(&e);
+        }
+        if let Some(meta) = &self.meta {
+            meta.observe(event);
         }
         self.view.apply(event);
     }
