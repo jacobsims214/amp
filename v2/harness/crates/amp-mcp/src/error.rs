@@ -36,8 +36,9 @@ pub enum McpError {
     #[error("credential store: {0}")]
     CredentialStore(String),
 
-    /// The MCP lifecycle (discover and/or initialize) failed.
-    #[error("connect to {url}: {source}")]
+    /// The MCP lifecycle (discover and/or initialize) failed. The message includes the causes
+    /// (TLS, DNS, connection refused), which rmcp's own message leaves out.
+    #[error("connect to {url}: {source}{}", causes(source.as_ref()))]
     Connect {
         url: String,
         #[source]
@@ -53,7 +54,7 @@ pub enum McpError {
     Timeout { operation: String, after: Duration },
 
     /// A request failed after the connection was established.
-    #[error("{operation}: {source}")]
+    #[error("{operation}: {source}{}", causes(source.as_ref()))]
     Service {
         operation: String,
         #[source]
@@ -106,6 +107,46 @@ impl McpError {
             source: Box::new(error),
         }
     }
+}
+
+/// The error's source chain as `: cause: deeper cause`, skipping messages already shown.
+///
+/// rmcp's transport errors only say "error sending request for url (...)"; the reason (an untrusted
+/// certificate, a refused connection, a DNS failure) is further down, behind links rmcp doesn't
+/// expose through `source()` (see [`next_cause`]).
+fn causes(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut seen = error.to_string();
+    let mut out = String::new();
+    let mut current = next_cause(error);
+    while let Some(e) = current {
+        let msg = e.to_string();
+        if !msg.is_empty() && !seen.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+            seen.push_str(&msg);
+        }
+        current = next_cause(e);
+    }
+    out
+}
+
+/// `source()`, plus the links rmcp 3.6.0 leaves out of it: `ClientInitializeError::TransportError`,
+/// `ServiceError::TransportSend` and `StreamableHttpError::Client` hold their cause in a field that
+/// is not marked `#[source]`.
+fn next_cause<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    use rmcp::transport::streamable_http_client::StreamableHttpError;
+    if let Some(ClientInitializeError::TransportError { error, .. }) = error.downcast_ref() {
+        return Some(error);
+    }
+    if let Some(ServiceError::TransportSend(transport)) = error.downcast_ref() {
+        return Some(transport);
+    }
+    if let Some(StreamableHttpError::<reqwest::Error>::Client(client)) = error.downcast_ref() {
+        return Some(client);
+    }
+    error.source()
 }
 
 /// Walks an error's source chain for the transport's 401/403 errors.
