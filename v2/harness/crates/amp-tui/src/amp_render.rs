@@ -99,8 +99,13 @@ pub fn tool_args_summary(args: &Value) -> String {
     }
 }
 
+/// Keys [`result_text`] never lists: the ticket's inherited metadata is noise in a one-line summary.
+const SKIPPED_KEYS: &[&str] = &["effective_metadata"];
+
 /// A compact view of an AMP tool's result: an error's text as is; a JSON object as
-/// `key: value · ...` (scalars, list lengths); anything else as is.
+/// `key: value · ...` (scalars, list lengths); anything else as is. Empty values (null, `""`,
+/// `[]`, `{}`) and [`SKIPPED_KEYS`] are left out, and nested records (`task: #67 Card form`) lead,
+/// so the part worth reading isn't the part the header cuts.
 pub fn result_text(raw: &str, is_error: bool) -> String {
     if is_error {
         return raw.to_owned();
@@ -108,10 +113,18 @@ pub fn result_text(raw: &str, is_error: bool) -> String {
     let Ok(Value::Object(map)) = serde_json::from_str::<Value>(raw.trim()) else {
         return raw.to_owned();
     };
+    let mut records = Vec::new();
     let mut parts = Vec::new();
     for (k, v) in &map {
+        if SKIPPED_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        let mut record = false;
         let text = match v {
             Value::Null => continue,
+            Value::String(s) if s.is_empty() => continue,
+            Value::Array(a) if a.is_empty() => continue,
+            Value::Object(o) if o.is_empty() => continue,
             Value::Bool(b) => b.to_string(),
             Value::Number(n) => n.to_string(),
             Value::String(s) if s.chars().count() <= 60 => s.clone(),
@@ -124,6 +137,7 @@ pub fn result_text(raw: &str, is_error: bool) -> String {
                     .get("name")
                     .or_else(|| o.get("title"))
                     .and_then(Value::as_str);
+                record = id.is_some();
                 match (id, name) {
                     (Some(id), Some(n)) => format!("#{id} {}", shorten(n, 48)),
                     (Some(id), None) => format!("#{id}"),
@@ -131,8 +145,15 @@ pub fn result_text(raw: &str, is_error: bool) -> String {
                 }
             }
         };
-        parts.push(format!("{k}: {}", clean(&text)));
+        let part = format!("{k}: {}", clean(&text));
+        if record {
+            records.push(part);
+        } else {
+            parts.push(part);
+        }
     }
+    records.append(&mut parts);
+    let parts = records;
     if parts.is_empty() {
         "ok".to_owned()
     } else {
@@ -301,10 +322,28 @@ mod tests {
                 r#"{"ok":true,"task_id":2078,"unblocked":[1,2],"task":{"id":5,"name":"x"}}"#,
                 false
             ),
-            "ok: true · task_id: 2078 · unblocked: 2 items · task: #5 x"
+            "task: #5 x · ok: true · task_id: 2078 · unblocked: 2 items"
         );
         assert_eq!(result_text("task 9 not found", true), "task 9 not found");
         assert_eq!(result_text("plain text", false), "plain text");
         assert_eq!(result_text("{}", false), "ok");
+        assert_eq!(
+            result_text(
+                r#"{"a":null,"b":"","c":[],"d":{},"effective_metadata":{"x":1}}"#,
+                false
+            ),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn get_task_leads_with_the_task() {
+        // amp_get_task's shape: metadata first, the task second (it used to be cut off).
+        let plain = r#"{"effective_metadata":{},"task":{"id":67,"project_id":2,"name":"Card form","state":"in_progress","metadata":{}}}"#;
+        assert_eq!(result_text(plain, false), "task: #67 Card form");
+        let with_comments = r#"{"comments":[],"comments_total":0,"effective_metadata":{"team":"web"},"task":{"id":67,"name":"Card form"}}"#;
+        let text = result_text(with_comments, false);
+        assert_eq!(text, "task: #67 Card form · comments_total: 0");
+        assert!(!text.contains("effective_metadata") && !text.contains("comments:"));
     }
 }
