@@ -82,7 +82,9 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
                 state_dir: None,
             },
         )
-        .map_err(|e| CliError::new(e.to_string()))?,
+        .map_err(|e| CliError::new(e.to_string()))?
+        // --token-env's variable is a secret too: keep it out of bash (#2142).
+        .with_secret_env(req.conn.token_env.as_deref()),
     );
 
     let role_name = req
