@@ -3,9 +3,9 @@
 AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) with an MCP client on
 `rmcp`. Design and build plan: AMP project 2 KB, `decisions/amp-harness-architecture.md`.
 
-Status: **M1-5.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login),
-and the CLI has `login`, `logout`, `doctor`, `whoami`, `tickets list|get` and the hidden `mcp call`.
-`make smoke` runs them against a real local AMP.
+Status: **M2-4.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login),
+and the CLI has `login`, `logout`, `doctor`, `whoami`, `tickets list|get`, `config show`, `run -p`
+(a headless agent run) and the hidden `mcp call`. `make smoke` runs them against a real local AMP.
 
 ## Layout (D1)
 
@@ -163,6 +163,52 @@ each role's provider/model, thinking level, readiness and the layer that set it.
 provider in use for its live model list (OpenRouter's is public; Anthropic's needs the key) and
 flags ids that are missing. It exits 1 if a role does not resolve or a checked id is missing.
 
+## Headless runs (M2-4)
+
+```sh
+amp-harness run -p "What is on the board?" [--json] [--role ROLE] [--cwd DIR] [--no-session]
+amp-harness run --print-system-prompt [--role ROLE]
+```
+
+`run` builds one agent session (the manager unless `--role` names another) and runs the prompt
+until the agent stops. `-p -` reads the prompt from stdin. The session has:
+- the role's model from `config show`; a role whose provider has no key fails with the key to set;
+- rpi-tools (read, bash, edit, write, grep, find, ls) in the working directory plus every AMP tool
+  under AMP's own name, filtered by the role's policy, which also blocks denied calls;
+- a system prompt made of the role prompt, AMP's server instructions, an `<amp_context>` block
+  (role, server, the `.amp.json` project, working directory), the role's preloaded skills in full,
+  `AGENTS.md`/`CLAUDE.md` files (`~/.config/amp-harness/AGENTS.md`, then the working directory and
+  its parents) and the list of every skill with its path;
+- a JSONL transcript under `~/.local/state/amp-harness/sessions/<role>/` (`--no-session` keeps it
+  in memory).
+
+Text output streams the answer to stdout and logs tool calls on stderr. `--json` prints one JSON
+object per line: `session`, then `turn_start`, `text_delta`, `assistant` (text, tool calls, stop
+reason, usage), `tool_start`, `tool_end` (`is_error` covers policy denials, AMP errors and timeouts),
+`retry`, `turn_end`, and last `result` (outcome, final text, turns, tool counts, usage totals). Fields
+may be added, never renamed or removed. The exit code is 0 when the run completed, otherwise 1;
+Ctrl-C aborts the run.
+
+Offline runs use a faux provider and a scripted model:
+
+```toml
+# ~/.config/amp-harness/config.toml
+[providers.faux]
+api = "faux"
+[providers.faux.models."faux-1"]
+[roles.manager]
+model = "faux/faux-1"
+```
+
+```sh
+echo '[{"tool_calls":[{"name":"amp_whoami"}]},{"text":"You are {{last_tool_result}}"}]' >script.json
+AMP_HARNESS_FAUX_SCRIPT=script.json amp-harness run -p "who am I?" --json
+```
+
+Each step is one model response: `text`, `tool_calls` (`[{name, arguments, id?}]`) and `thinking`.
+`{{last_tool_result}}` and `{{system_prompt}}` in `text` are filled from what the model was sent.
+The file can also map provider ids to steps. A script that runs out fails the run instead of hanging.
+
 ## Dev loop
 
 ```sh
@@ -178,7 +224,8 @@ make -C v2/harness clean      # delete target/ (do this before removing a worktr
 
 `scripts/smoke.sh` runs the built binary against a real AMP and exits non-zero on any failure. Each
 leg runs `doctor --json` and `whoami --json`. It then creates a throwaway project (epic, story, two
-dependent tickets, a comment) with `mcp call` and reads it back with `tickets list|get`. Finally it
+dependent tickets, a comment) with `mcp call` and reads it back with `tickets list|get` and with
+`run -p` (the manager on a scripted faux model calling `amp_get_task`). Finally it
 deletes the tickets, story and epic and archives the project. AMP has no hard project delete, so the
 leg checks that the project is gone from `amp_list_projects`. Cleanup runs from an exit trap, so it
 also happens when a check fails. The harness runs with HOME under `target/` and

@@ -16,9 +16,11 @@ amp-core.workspace = true
 amp-mcp.workspace = true
 amp-tui.workspace = true
 clap.workspace = true
+rpi-agent.workspace = true
+rpi-harness.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 
 [dev-dependencies]
 axum.workspace = true

@@ -91,6 +91,8 @@ dependencies = [
  "axum",
  "clap",
  "rmcp",
+ "rpi-agent",
+ "rpi-harness",
  "serde",
  "serde_json",
  "tokio",

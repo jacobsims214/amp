@@ -293,6 +293,11 @@ impl ProviderSet {
     pub fn faux_script(&self, id: &str) -> Option<&FauxScript> {
         self.faux.get(id)
     }
+
+    /// The ids of the available faux providers.
+    pub fn faux_ids(&self) -> Vec<String> {
+        self.faux.keys().cloned().collect()
+    }
 }
 
 type Inner = (Arc<dyn Provider>, Option<FauxScript>);

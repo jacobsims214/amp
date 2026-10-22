@@ -22,9 +22,22 @@
 //!   denied call is a tool error the model sees, nothing ever prompts, and children get neither
 //!   the question tool nor the dispatch tool.
 //!
+//! M2-4 (#2095):
+//! - [`agent`]: [`agent::Runtime`] (what every session shares) and [`agent::Runtime::build`], one
+//!   rpi `AgentHarness` per role: model, rpi-tools + AMP tools filtered by the role's policy, the
+//!   system prompt (role + AMP server instructions + `.amp.json` context + preloaded skills +
+//!   AGENTS.md), and an in-memory or JSONL session.
+//! - [`mcp_tools`]: every AMP MCP tool as a native rpi tool under AMP's own name.
+//! - [`events`]: rpi agent events as `run --json` events, the channel emitter and usage totals.
+//! - [`faux`]: faux-provider scripts from a JSON file (`AMP_HARNESS_FAUX_SCRIPT`).
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
+pub mod agent;
 pub mod assets;
+pub mod events;
+pub mod faux;
+pub mod mcp_tools;
 pub mod models;
 pub mod policy;
 pub mod project;
