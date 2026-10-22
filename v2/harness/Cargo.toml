@@ -65,6 +65,10 @@ async-trait = "0.1"
 # For the TokenResponse trait on rmcp's token type (rmcp does not re-export oauth2). Same version rmcp uses.
 oauth2 = { version = "5.0", default-features = false }
 
+# doctor's CA check reads the CA file's subjects and validity dates (#2114). Same version rcgen
+# already brings in, so there is one copy.
+x509-parser = { version = "0.18", default-features = false }
+
 # Shared runtime/util crates (amp-mcp and up).
 # reqwest must stay on rmcp's major (0.13) so our reqwest::Client is the type rmcp's transport takes.
 # rmcp's `reqwest` feature already turns on reqwest's rustls backend; features unify.

@@ -97,15 +97,19 @@ dependencies = [
  "clap",
  "crossterm",
  "keyring",
+ "rcgen",
  "rmcp",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",
  "serde",
  "serde_json",
+ "time",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "toml",
+ "x509-parser",
 ]
 
 [[package]]

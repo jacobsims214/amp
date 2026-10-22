@@ -325,6 +325,21 @@ impl Drop for Running {
 
 /// Serves `mock` at `/mcp`. With `bearer`, requests without that token get a 401 challenge.
 pub async fn spawn(mock: MockAmp, bearer: Option<&'static str>) -> Running {
+    let app = app(&mock, bearer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Running {
+        url: format!("http://{addr}/mcp"),
+        mock,
+        task,
+    }
+}
+
+/// The mock's axum app (`/mcp`), for tests that serve it themselves (tests/doctor.rs: over TLS).
+pub fn app(mock: &MockAmp, bearer: Option<&'static str>) -> axum::Router {
     let served = mock.clone();
     let service: StreamableHttpService<MockAmp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(served.clone()),
@@ -337,16 +352,7 @@ pub async fn spawn(mock: MockAmp, bearer: Option<&'static str>) -> Running {
             require_bearer(token, req, next)
         }));
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    Running {
-        url: format!("http://{addr}/mcp"),
-        mock,
-        task,
-    }
+    app
 }
 
 async fn require_bearer(token: &'static str, req: Request, next: Next) -> Response {
