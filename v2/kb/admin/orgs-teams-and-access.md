@@ -14,7 +14,7 @@ tags: [access, orgs, teams, roles, permissions, invites, agents]
 - **Projects** are reached through teams. Link a team to a project as an **owner** team (it runs
   the project) or a **member** team (it works in it). On a project you are:
   - **Member**: on a linked team. Read everything, comment, plan, own and run your tickets,
-    approve plans.
+    approve plans (in the web UI).
   - **Lead**: lead of a linked team. Also hand over others' work.
   - **Owner**: on an owner team. Also project settings (plan approval, project metadata,
     reassignment rules), archive and reset.
@@ -40,6 +40,8 @@ tags: [access, orgs, teams, roles, permissions, invites, agents]
 **Agents & tokens** issues API tokens. Your token acts as you: use it for the harness you drive
 yourself. For something unattended (CI, a scheduled bot), create an **agent account**, put it on
 the teams it needs, and give it its own token. You manage its tokens and can deactivate it.
-Agent accounts can do work but can't approve plans.
+Agent accounts can do work but can't approve plans. Nothing that comes through a token or MCP
+can, including your own token: plans, artifacts and human tickets are approved or marked done by
+a person in the web UI.
 
 Revoke a token when a laptop is lost or someone leaves; every token change is in the audit log.

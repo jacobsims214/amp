@@ -29,8 +29,20 @@ lead hand it over (`working/changes-outside-amp.md`). Don't work it anyway.
 
 ## Dispatch is refused because the plan isn't approved
 
-The project requires plan approval and tickets were planned since the last one. Approve in
-**Flight plan** (`working/planning-and-approval.md`).
+The project requires plan approval and tickets were planned (or edited) since the last one. A
+person approves in **Flight plan** in the web UI; the refusal carries the link
+(`working/planning-and-approval.md`). An agent can't approve it for you.
+
+## "… is done by a person in the AMP web UI, not by an agent or over MCP"
+
+The agent tried a step only a person can take: approving a plan or an artifact, marking a human
+ticket done, or turning plan approval off. Open the link in the message and do it there. Your
+agent should stop and hand you the link; it isn't meant to find another way.
+
+## "never dispatched … Dispatch it first"
+
+An agent tried to complete a ticket that was never dispatched. Dispatch it (after the plan is
+approved) and let the worker finish it.
 
 ## Spend looks too low
 
