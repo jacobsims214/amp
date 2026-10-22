@@ -53,8 +53,10 @@ use crate::theme::{AmpPalette, palette};
 const REPORT_TOOLS: &[&str] = &["amp_complete_task", "amp_report_run"];
 /// Cells per brand band (four bands).
 const BAND_CELLS: usize = 2;
-/// The ticket name keeps at least this many cells before the epic label is shortened.
-const MIN_NAME_CELLS: usize = 16;
+/// Header line 2 keeps `▌ Epic` beside a shortened ticket name only while the name keeps at least
+/// this many cells (or all of it, when shorter); below that the label goes and the name gets the
+/// room.
+pub const MIN_NAME_CELLS: usize = 40;
 
 // ------------------------------------------------------------------------------------------------
 // Untrusted text and links
@@ -646,26 +648,23 @@ fn ticket_line(style: &Style, data: &ChromeData, p: &AmpPalette, id: i64, width:
     let mark = Seg::new(mark, Lead::Space, 1);
     let id_seg = Seg::new(id_text, Lead::Space, 0);
 
-    // `▌ Epic › Story`, `▌ Epic`, or nothing: the longest that leaves the name some room.
+    // `▌ Epic › Story`, `▌ Epic`, or nothing. The name comes first: the story is shown only
+    // beside the whole name, and the epic only while the name keeps MIN_NAME_CELLS.
     let epic_index = ticket.epic_index.unwrap_or(0);
     let epic = ticket.epic.as_ref().map(|e| clean(&e.name));
     let story = ticket.story.as_ref().map(|s| clean(&s.name));
-    let mut labels = Vec::new();
+    let (mut with_story, mut epic_only) = (None, None);
     if let Some(epic) = epic.filter(|e| !e.is_empty()) {
         let bar = if is_stale {
             c.dim.fg("▌")
         } else {
             p.epic(epic_index).fg("▌")
         };
-        if let Some(story) = story.filter(|s| !s.is_empty()) {
-            labels.push(format!(
-                "{bar} {}",
-                c.muted.fg(&format!("{epic} › {story}"))
-            ));
-        }
-        labels.push(format!("{bar} {}", c.muted.fg(&epic)));
+        with_story = story
+            .filter(|s| !s.is_empty())
+            .map(|story| format!("{bar} {}", c.muted.fg(&format!("{epic} › {story}"))));
+        epic_only = Some(format!("{bar} {}", c.muted.fg(&epic)));
     }
-    labels.push(String::new());
 
     let name = clean(&ticket.name);
     let name_w = visible_width(&name);
@@ -676,15 +675,17 @@ fn ticket_line(style: &Style, data: &ChromeData, p: &AmpPalette, id: i64, width:
             .saturating_sub(fixed)
             .saturating_sub(if label_w > 0 { label_w + MIN_GAP } else { 0 })
     };
-    // The longest label that leaves the whole name, else one that leaves it MIN_NAME_CELLS, else
-    // no label.
-    let label = labels
-        .iter()
-        .find(|l| room_with(l) >= name_w)
+    // 1. Epic › Story beside the whole name; 2. Epic beside the whole name; 3. Epic beside a
+    // name shortened to no less than MIN_NAME_CELLS; 4. no label.
+    let whole = |l: &&String| room_with(l) >= name_w;
+    let label = with_story
+        .as_ref()
+        .filter(whole)
+        .or_else(|| epic_only.as_ref().filter(whole))
         .or_else(|| {
-            labels
-                .iter()
-                .find(|l| room_with(l) >= MIN_NAME_CELLS.min(name_w))
+            epic_only
+                .as_ref()
+                .filter(|l| room_with(l) >= MIN_NAME_CELLS.min(name_w))
         })
         .cloned()
         .unwrap_or_default();
