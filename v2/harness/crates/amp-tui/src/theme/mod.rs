@@ -575,30 +575,179 @@ mod tests {
         assert_eq!(rpi_tui::strip_ansi(&p.brand_bands(2)), "▀▀▀▀▀▀▀▀");
     }
 
+    /// Explicit 256 values that deliberately differ from the CIELAB-nearest index, each with the
+    /// reason: `(theme, key, index)`.
+    ///
+    /// amp-red `#CF4426` is nearest to 124 (`#AF0000`), which is only 2.67:1 on the dark ground
+    /// `#060A0C`: under 3:1 for the Question glyph, the chip edge and the cursor. 160 (`#D70000`)
+    /// is 3.68:1 there, and the chip's white text on it is 5.40:1 (M3 design review #2109,
+    /// ticket #2150). amp-light keeps 124 (7.4:1 on white).
+    const CONTRAST_OVERRIDES: [(&str, &str, u8); 3] = [
+        ("amp-dark", "colors.borderAccent", 160),
+        ("amp-dark", "colors.cursor", 160),
+        ("amp-dark", "state.flag", 160),
+    ];
+
     /// The explicit 256 values in the embedded files are the CIELAB-nearest indexes (or
     /// `default` for the tinted backgrounds), so a user theme that leaves `colors256` out gets the
-    /// same treatment.
+    /// same treatment. The only exceptions are the documented [`CONTRAST_OVERRIDES`].
     #[test]
     fn explicit_256_values_are_the_nearest_indexes() {
         for json in [AMP_DARK_JSON, AMP_LIGHT_JSON] {
             let file: ThemeFile = serde_json::from_str(json).unwrap();
             let mut diffs = Vec::new();
-            for (key, hex) in &file.colors {
-                let (Some(rgb), Some(Value256::Index(i))) =
-                    (parse_hex(hex), file.colors256.get(key))
-                else {
-                    continue;
-                };
-                if nearest_256(rgb) != *i {
-                    diffs.push(format!(
-                        "{}.{key}: {hex} file {i} nearest {}",
-                        file.name,
-                        nearest_256(rgb)
-                    ));
+            let groups = [
+                ("colors", &file.colors, &file.colors256),
+                ("state", &file.amp.state, &file.amp.state256),
+            ];
+            for (group, hexes, indexes) in groups {
+                for (key, hex) in hexes {
+                    let (Some(rgb), Some(Value256::Index(i))) = (parse_hex(hex), indexes.get(key))
+                    else {
+                        continue;
+                    };
+                    let path = format!("{group}.{key}");
+                    let overridden = CONTRAST_OVERRIDES
+                        .iter()
+                        .any(|(t, k, v)| *t == file.name && *k == path && v == i);
+                    if nearest_256(rgb) != *i && !overridden {
+                        diffs.push(format!(
+                            "{}.{path}: {hex} file {i} nearest {}",
+                            file.name,
+                            nearest_256(rgb)
+                        ));
+                    }
                 }
             }
             assert!(diffs.is_empty(), "{diffs:#?}");
         }
+        // Every override is still in use (a stale entry would hide a real drift).
+        for (theme, path, index) in CONTRAST_OVERRIDES {
+            let json = if theme == "amp-dark" {
+                AMP_DARK_JSON
+            } else {
+                AMP_LIGHT_JSON
+            };
+            let file: ThemeFile = serde_json::from_str(json).unwrap();
+            let (group, key) = path.split_once('.').unwrap();
+            let (hexes, indexes) = match group {
+                "colors" => (&file.colors, &file.colors256),
+                _ => (&file.amp.state, &file.amp.state256),
+            };
+            assert!(
+                matches!(indexes.get(key), Some(Value256::Index(i)) if *i == index),
+                "{theme}.{path}: override {index} is not in the file"
+            );
+            let rgb = parse_hex(&hexes[key]).unwrap();
+            assert_ne!(
+                nearest_256(rgb),
+                index,
+                "{theme}.{path}: override not needed"
+            );
+        }
+    }
+
+    /// WCAG 2 contrast ratio of two colours.
+    fn contrast(a: (u8, u8, u8), b: (u8, u8, u8)) -> f64 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// The RGB a terminal shows for a loaded colour (`None` for `default`).
+    fn shown(c: Color) -> Option<(u8, u8, u8)> {
+        match c {
+            Color::Rgb(r, g, b) => Some((r, g, b)),
+            Color::Ansi256(i) => Some(xterm_rgb(i)),
+            _ => None,
+        }
+    }
+
+    /// Roles drawn as text on the terminal ground: WCAG AA, 4.5:1.
+    const TEXT_ROLES: [&str; 23] = [
+        "text",
+        "muted",
+        "dim",
+        "accent",
+        "error",
+        "success",
+        "warning",
+        "info",
+        "thinkingText",
+        "mdHeading",
+        "mdLink",
+        "mdLinkUrl",
+        "mdCode",
+        "mdCodeBlock",
+        "mdQuote",
+        "toolTitle",
+        "toolOutput",
+        "bashMode",
+        "customMessageLabel",
+        "customMessageText",
+        "toolDiffAdded",
+        "toolDiffRemoved",
+        "toolDiffContext",
+    ];
+    /// Roles drawn as marks (a cursor, an accent edge): non-text contrast, 3:1.
+    const MARK_ROLES: [&str; 2] = ["borderAccent", "cursor"];
+
+    /// Every text role is >= 4.5:1 and every state/epic mark >= 3:1 against the ground (amp-dark
+    /// `#060A0C`, amp-light `#FFFFFF`), in truecolor and in 256 colours; the Question chip's text
+    /// is >= 4.5:1 on its red.
+    #[test]
+    fn colours_meet_wcag_contrast_on_the_ground() {
+        let mut fails = Vec::new();
+        for t in both() {
+            let ground = if t.name == "amp-dark" {
+                (0x06, 0x0A, 0x0C)
+            } else {
+                (0xFF, 0xFF, 0xFF)
+            };
+            let mut check = |what: String, c: Color, on: (u8, u8, u8), min: f64| {
+                let Some(rgb) = shown(c) else {
+                    fails.push(format!("{} {:?} {what}: no colour", t.name, t.depth));
+                    return;
+                };
+                let ratio = contrast(rgb, on);
+                if ratio < min {
+                    fails.push(format!(
+                        "{} {:?} {what}: {ratio:.2}:1 < {min}:1",
+                        t.name, t.depth
+                    ));
+                }
+            };
+            let mut colors = t.theme.colors.clone();
+            for (name, field) in ROLES {
+                let min = if TEXT_ROLES.contains(&name) {
+                    4.5
+                } else if MARK_ROLES.contains(&name) {
+                    3.0
+                } else {
+                    continue;
+                };
+                check(name.to_string(), *field(&mut colors), ground, min);
+            }
+            let p = &t.palette;
+            for s in [
+                &p.ready,
+                &p.in_progress,
+                &p.waiting,
+                &p.question,
+                &p.scheduled,
+                &p.done,
+            ] {
+                check(format!("{} mark", s.label), s.mark, ground, 3.0);
+                check(format!("{} text", s.label), s.text, ground, 4.5);
+                if let Some((fg, bg)) = s.chip {
+                    let bg_rgb = shown(bg).unwrap();
+                    check(format!("{} chip text", s.label), fg, bg_rgb, 4.5);
+                }
+            }
+            for (i, c) in p.epic.iter().enumerate() {
+                check(format!("epic {i}"), *c, ground, 3.0);
+            }
+        }
+        assert!(fails.is_empty(), "{fails:#?}");
     }
 
     #[test]
