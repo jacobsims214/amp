@@ -1,0 +1,730 @@
+//! The AMP metadata poller (#2104) against a mock AMP: rmcp's Streamable HTTP server in-process,
+//! answering the tools the poller calls with AMP-shaped JSON (`v2/amp-api/internal/mcp`).
+//!
+//! No model is involved anywhere here: the poller calls AMP on its own client, so polling costs
+//! no tokens. Intervals are shortened to milliseconds; waits are bounded.
+
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+use amp_core::meta::{
+    AmpMeta, Connection, Connector, HealthLevel, Intervals, MetaHandle, MetaOptions, MetaPoller,
+};
+use amp_core::tickets::Status;
+use amp_mcp::{AmpMcpClient, ClientOptions};
+use axum::{
+    extract::Request,
+    http::StatusCode,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
+use rmcp::{
+    ErrorData, RoleServer, ServerHandler,
+    model::{
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult,
+        Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+        ServerCapabilities, ServerConfig, Tool,
+    },
+    service::{MaybeSendFuture, RequestContext},
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    },
+};
+use rpi_agent::{AgentEvent, AgentToolResult};
+use serde_json::{Value, json};
+
+const TOOLS: &[&str] = &[
+    "amp_whoami",
+    "amp_get_project",
+    "amp_list_tasks",
+    "amp_get_task",
+    "amp_get_plan",
+    "amp_check_plan",
+    "amp_list_artifacts",
+];
+
+/// What the mock answers; tests change it while the poller runs.
+#[derive(Debug, Clone)]
+struct Board {
+    /// The current ticket's AMP state.
+    ticket_state: &'static str,
+    require_plan_approval: bool,
+    artifact_status: &'static str,
+}
+
+#[derive(Clone)]
+struct Mock {
+    board: Arc<Mutex<Board>>,
+    calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// Answer every call with a JSON-RPC error.
+    fail: Arc<AtomicBool>,
+    /// Delay every call by this many ms.
+    delay_ms: Arc<AtomicU64>,
+    /// Reject every HTTP request with 401.
+    unauthorized: Arc<AtomicBool>,
+}
+
+impl Mock {
+    fn new(board: Board) -> Self {
+        Self {
+            board: Arc::new(Mutex::new(board)),
+            calls: Arc::default(),
+            fail: Arc::default(),
+            delay_ms: Arc::default(),
+            unauthorized: Arc::default(),
+        }
+    }
+
+    fn count(&self, tool: &str) -> usize {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == tool)
+            .count()
+    }
+
+    fn total(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+
+    fn args_of(&self, tool: &str) -> Vec<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(n, _)| n == tool)
+            .map(|(_, a)| a.clone())
+            .collect()
+    }
+}
+
+fn ok(v: Value) -> Result<CallToolResponse, ErrorData> {
+    Ok(CallToolResult::success(vec![ContentBlock::text(v.to_string())]).into())
+}
+
+fn task_json(id: i64, state: &str) -> Value {
+    json!({"task": {
+        "id": id, "project_id": 2, "epic_id": 161, "story_id": 393,
+        "name": format!("Ticket {id}"), "state": state,
+        "block_reason": if state == "blocked" { "Keychain or file?" } else { "" },
+        "assigned_to": "amp:amp-worker-backend", "dispatched_at": "2026-10-22T17:36:06Z"
+    }, "effective_metadata": {}})
+}
+
+impl ServerHandler for Mock {
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("amp-mock", "9.9.9"))
+    }
+
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(ProtocolVersion::KNOWN_VERSIONS)
+    }
+
+    fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<DiscoverResult, ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Ok(DiscoverResult::from_server_info(
+            self.supported_protocol_versions().into_owned(),
+            self.get_info(),
+        )))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, ErrorData> {
+        let Value::Object(schema) = json!({"type": "object"}) else {
+            unreachable!()
+        };
+        let schema = Arc::new(schema);
+        Ok(ListToolsResult::with_all_items(
+            TOOLS
+                .iter()
+                .map(|n| Tool::new(n.to_string(), "mock", schema.clone()))
+                .collect(),
+        ))
+    }
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        let args = Value::Object(request.arguments.clone().unwrap_or_default());
+        self.calls
+            .lock()
+            .unwrap()
+            .push((request.name.to_string(), args.clone()));
+        let delay = self.delay_ms.load(Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(ErrorData::internal_error("database is down", None));
+        }
+        let board = self.board.lock().unwrap().clone();
+        match request.name.as_ref() {
+            "amp_whoami" => ok(json!({
+                "user_id": 36199, "email": "jacob@example.com", "account": "human",
+                "via_api_token": false, "global_admin": true,
+                "orgs": [{"id": 3, "name": "simstech", "slug": "simstech", "teams": []}]
+            })),
+            "amp_get_project" => ok(json!({"project": {
+                "id": 2, "name": "AMP", "code": "amp", "state": "active", "org_id": 3,
+                "require_plan_approval": board.require_plan_approval
+            }})),
+            "amp_list_tasks" => {
+                assert_eq!(
+                    args["owner"], "any",
+                    "board counts cover everyone's tickets"
+                );
+                assert_eq!(args["format"], "compact");
+                ok(json!({
+                    "ready_to_dispatch": [2105, 2106], "in_progress": [2104],
+                    "questions": [{"id": 2107, "name": "M3-5", "question": "Dark or light?"}],
+                    "waiting": 4, "scheduled": 1, "completed": 30, "quiet": [],
+                    "waiting_on_people": [],
+                    "by_epic": {"AMP Harness": [
+                        {"id": 2104, "name": "M3-2 AMP metadata poller", "state": "in_progress",
+                         "assigned_to": "amp:amp-worker-backend"}
+                    ]},
+                    "count": 38, "owner_filter": "any"
+                }))
+            }
+            "amp_get_task" => {
+                let id = args["task_id"].as_i64().unwrap_or(0);
+                let state = if id == 2104 {
+                    board.ticket_state
+                } else {
+                    "in_progress"
+                };
+                ok(task_json(id, state))
+            }
+            "amp_get_plan" => ok(json!({"project_id": 2, "tickets": 40, "epics": [
+                {"id": 150, "name": "Earlier", "state": "done", "tickets": {}, "stories": []},
+                {"id": 161, "name": "AMP Harness", "state": "active", "tickets": {}, "stories": [
+                    {"id": 390, "name": "Research", "state": "done", "tickets": {}},
+                    {"id": 393, "name": "M3 theme + metadata", "state": "active", "tickets": {}}
+                ]}
+            ]})),
+            "amp_check_plan" => ok(json!({
+                "ok": true, "awaiting_approval": [2105, 2106],
+                "require_plan_approval": board.require_plan_approval, "tasks": 40,
+                "open_tasks": 10, "dependencies": 30, "ready_now": [], "longest_chain": 5,
+                "issues": [], "human_gates": [], "summary": "GO"
+            })),
+            "amp_list_artifacts" => ok(json!({"artifacts": [
+                {"id": 3, "project_id": 2, "task_id": args["task_id"], "title": "Header mock",
+                 "kind": "html", "status": board.artifact_status, "current_version": 2}
+            ], "count": 1})),
+            other => Err(ErrorData::invalid_params(
+                format!("unknown tool {other}"),
+                None,
+            )),
+        }
+    }
+}
+
+struct Running {
+    url: String,
+    mock: Mock,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn serve(mock: Mock) -> Running {
+    let served = mock.clone();
+    let service: StreamableHttpService<Mock, LocalSessionManager> = StreamableHttpService::new(
+        move || Ok(served.clone()),
+        Default::default(),
+        StreamableHttpServerConfig::default().with_json_response(true),
+    );
+    let flag = mock.unauthorized.clone();
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let flag = flag.clone();
+            async move {
+                if flag.load(Ordering::SeqCst) {
+                    let mut r: Response = (StatusCode::UNAUTHORIZED, "no").into_response();
+                    r.headers_mut().insert(
+                        "www-authenticate",
+                        "Bearer resource_metadata=\"http://127.0.0.1/.well-known/x\""
+                            .parse()
+                            .unwrap(),
+                    );
+                    return r;
+                }
+                next.run(req).await
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Running {
+        url: format!("http://{addr}/mcp"),
+        mock,
+        task,
+    }
+}
+
+fn default_board() -> Board {
+    Board {
+        ticket_state: "in_progress",
+        require_plan_approval: true,
+        artifact_status: "in_review",
+    }
+}
+
+/// Intervals in milliseconds, so a test sees several cycles in about a second.
+fn fast(board_ms: u64) -> Intervals {
+    Intervals {
+        board: Duration::from_millis(board_ms),
+        ticket: Duration::from_millis(board_ms),
+        plan: Duration::from_millis(board_ms),
+        artifacts: Duration::from_millis(board_ms),
+        idle_ping: Duration::from_secs(3600),
+        call_timeout: Duration::from_secs(5),
+        slow_after: Duration::from_secs(2),
+        reconnect: Duration::from_millis(200),
+    }
+}
+
+async fn client(url: &str) -> Arc<AmpMcpClient> {
+    Arc::new(
+        AmpMcpClient::connect(ClientOptions::new(url))
+            .await
+            .expect("connect to the mock"),
+    )
+}
+
+/// Waits (at most 5 s) until `cond` holds for the snapshot.
+async fn wait_for(meta: &MetaHandle, what: &str, cond: impl Fn(&AmpMeta) -> bool) -> Arc<AmpMeta> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snap = meta.snapshot();
+        if cond(&snap) {
+            return snap;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}; last snapshot: {snap:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Waits (at most 5 s) until `cond` holds for the mock's calls.
+async fn wait_calls(mock: &Mock, what: &str, cond: impl Fn(&Mock) -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !cond(mock) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}; calls: {:?}",
+            mock.calls.lock().unwrap()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn loaded(m: &AmpMeta) -> bool {
+    m.user.get().is_some()
+        && m.project.get().is_some()
+        && m.board.get().is_some()
+        && m.ticket.get().is_some()
+        && m.plan.get().is_some()
+        && m.artifacts.get().is_some()
+}
+
+fn tool_call(meta: &MetaHandle, id: &str, name: &str, args: Value, is_error: bool) {
+    meta.observe(&AgentEvent::ToolExecutionStart {
+        tool_call_id: id.into(),
+        tool_name: name.into(),
+        args,
+    });
+    meta.observe(&AgentEvent::ToolExecutionEnd {
+        tool_call_id: id.into(),
+        tool_name: name.into(),
+        result: AgentToolResult::text("{}"),
+        is_error,
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn loads_every_item_on_start_and_polls_on_the_intervals() {
+    let server = serve(Mock::new(default_board())).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(2104),
+            intervals: fast(150),
+            connector: None,
+        },
+    );
+    let m = wait_for(&meta, "every item", loaded).await;
+
+    let instance = m.instance.as_ref().unwrap();
+    assert_eq!(instance.web_base, server.url.trim_end_matches("/mcp"));
+    assert_eq!(instance.protocol, "2026-07-28");
+    assert_eq!(m.user.get().unwrap().email, "jacob@example.com");
+    let project = m.project.get().unwrap();
+    assert_eq!((project.id, project.name.as_str()), (2, "AMP"));
+    assert_eq!(m.org_name(), Some("simstech"));
+    let board = m.board.get().unwrap();
+    assert_eq!(
+        board.nonzero(),
+        vec![
+            (Status::InProgress, 1),
+            (Status::Ready, 2),
+            (Status::Question, 1),
+            (Status::Scheduled, 1)
+        ]
+    );
+    assert_eq!(board.questions[0].question, "Dark or light?");
+    assert_eq!(board.in_progress_tickets[0].id, 2104);
+    let ticket = m.ticket.get().unwrap();
+    assert_eq!(ticket.status, Status::InProgress);
+    assert_eq!(ticket.epic.as_ref().unwrap().name, "AMP Harness");
+    assert_eq!(ticket.story.as_ref().unwrap().name, "M3 theme + metadata");
+    assert_eq!(ticket.epic_index, Some(1), "cat colour by plan order");
+    assert_eq!(m.plan.get().unwrap().awaiting_approval, vec![2105, 2106]);
+    assert_eq!(m.artifacts_in_review().len(), 1);
+    assert_eq!(m.health.connection, Connection::Ok);
+    assert_eq!(m.health.connection.level(), HealthLevel::Ok);
+
+    // Over ~1.2 s at 150 ms: several more cycles of every periodic item, whoami only once
+    // (on connect), and the plan tree read once (cached).
+    let before = server.mock.count("amp_list_tasks");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    let polled = server.mock.count("amp_list_tasks") - before;
+    assert!((3..=12).contains(&polled), "board polled {polled} times");
+    assert!(server.mock.count("amp_get_task") >= 4);
+    assert!(server.mock.count("amp_check_plan") >= 4);
+    assert!(server.mock.count("amp_list_artifacts") >= 4);
+    assert_eq!(server.mock.count("amp_whoami"), 1);
+    assert_eq!(server.mock.count("amp_get_project"), 1);
+    assert_eq!(server.mock.count("amp_get_plan"), 1);
+    assert!(meta.snapshot().revision > m.revision);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn polls_only_what_applies() {
+    // A done ticket, no plan approval, an approved artifact: only the board keeps polling.
+    let server = serve(Mock::new(Board {
+        ticket_state: "completed",
+        require_plan_approval: false,
+        artifact_status: "approved",
+    }))
+    .await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(2104),
+            intervals: fast(100),
+            connector: None,
+        },
+    );
+    let m = wait_for(&meta, "the start-up load", |m| {
+        m.ticket.get().is_some() && m.artifacts.get().is_some() && m.board.get().is_some()
+    })
+    .await;
+    assert_eq!(m.ticket.get().unwrap().status, Status::Done);
+    assert!(
+        m.plan.get().is_none(),
+        "no approval required: never checked"
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(server.mock.count("amp_list_tasks") >= 4);
+    assert_eq!(server.mock.count("amp_get_task"), 1);
+    assert_eq!(server.mock.count("amp_list_artifacts"), 1);
+    assert_eq!(server.mock.count("amp_check_plan"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn amp_tool_calls_refresh_at_once() {
+    let server = serve(Mock::new(default_board())).await;
+    let mock = &server.mock;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(2104),
+            // Nothing is due again for an hour: every later call comes from a tool trigger.
+            intervals: fast(3_600_000),
+            connector: None,
+        },
+    );
+    wait_for(&meta, "every item", loaded).await;
+    let start = mock.total();
+    let (board, ticket) = (mock.count("amp_list_tasks"), mock.count("amp_get_task"));
+
+    // Not AMP, an AMP read, and a failed AMP call: nothing.
+    tool_call(&meta, "c1", "bash", json!({"command": "ls"}), false);
+    tool_call(&meta, "c2", "amp_get_task", json!({"task_id": 2104}), false);
+    tool_call(
+        &meta,
+        "c3",
+        "amp_complete_task",
+        json!({"task_id": 2104}),
+        true,
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(mock.total(), start, "nothing refreshed");
+
+    // The model completes the current ticket: board and ticket are refetched right away.
+    mock.board.lock().unwrap().ticket_state = "completed";
+    tool_call(
+        &meta,
+        "c4",
+        "amp_complete_task",
+        json!({"task_id": 2104}),
+        false,
+    );
+    wait_for(&meta, "the ticket to read done", |m| {
+        m.ticket.get().is_some_and(|t| t.status == Status::Done)
+    })
+    .await;
+    wait_calls(mock, "a board refresh", |m| {
+        m.count("amp_list_tasks") == board + 1
+    })
+    .await;
+    assert_eq!(mock.count("amp_get_task"), ticket + 1);
+
+    // Publishing an artifact refetches the artifacts only.
+    let artifacts = mock.count("amp_list_artifacts");
+    tool_call(
+        &meta,
+        "c5",
+        "amp_publish_artifact",
+        json!({"task_id": 2104}),
+        false,
+    );
+    wait_calls(mock, "an artifacts refresh", |m| {
+        m.count("amp_list_artifacts") == artifacts + 1
+    })
+    .await;
+    assert_eq!(mock.count("amp_list_tasks"), board + 1);
+
+    // Claiming a ticket makes it the current one.
+    tool_call(
+        &meta,
+        "c6",
+        "amp_claim_task",
+        json!({"task_id": 2105}),
+        false,
+    );
+    let m = wait_for(&meta, "ticket 2105", |m| {
+        m.ticket.get().is_some_and(|t| t.id == 2105)
+    })
+    .await;
+    assert_eq!(m.ticket_id, Some(2105));
+    assert!(
+        mock.args_of("amp_list_artifacts")
+            .iter()
+            .any(|a| a["task_id"] == 2105)
+    );
+
+    // The TUI's own switches.
+    meta.set_ticket(None);
+    let m = wait_for(&meta, "no ticket", |m| m.ticket_id.is_none()).await;
+    assert!(m.ticket.get().is_none() && m.artifacts.get().is_none());
+    let projects = mock.count("amp_get_project");
+    meta.refresh(amp_core::meta::Topics::PROJECT);
+    wait_calls(mock, "a project refresh", |m| {
+        m.count("amp_get_project") == projects + 1
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn health_follows_failures_slowness_and_auth() {
+    let server = serve(Mock::new(default_board())).await;
+    let mock = &server.mock;
+    // No project or ticket: the only calls are idle health probes (amp_whoami) every 100 ms.
+    let mut iv = fast(3_600_000);
+    iv.idle_ping = Duration::from_millis(100);
+    iv.slow_after = Duration::from_millis(150);
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            intervals: iv,
+            ..MetaOptions::default()
+        },
+    );
+    wait_for(&meta, "a user", |m| m.user.get().is_some()).await;
+    wait_calls(mock, "idle pings", |m| m.count("amp_whoami") >= 3).await;
+    assert_eq!(mock.count("amp_list_tasks"), 0);
+
+    mock.fail.store(true, Ordering::SeqCst);
+    let m = wait_for(&meta, "degraded", |m| {
+        matches!(m.health.connection, Connection::Degraded { .. })
+    })
+    .await;
+    assert_eq!(m.health.connection.level(), HealthLevel::Degraded);
+    assert!(m.user.get().is_some(), "the last good value is kept");
+    assert!(m.user.error.is_some());
+
+    mock.fail.store(false, Ordering::SeqCst);
+    wait_for(&meta, "recovered", |m| {
+        m.health.connection == Connection::Ok
+    })
+    .await;
+
+    mock.delay_ms.store(250, Ordering::SeqCst);
+    wait_for(&meta, "slow", |m| {
+        matches!(m.health.connection, Connection::Slow { .. })
+    })
+    .await;
+    mock.delay_ms.store(0, Ordering::SeqCst);
+
+    mock.unauthorized.store(true, Ordering::SeqCst);
+    let m = wait_for(&meta, "auth required", |m| {
+        m.health.connection == Connection::AuthRequired
+    })
+    .await;
+    assert_eq!(m.health.connection.level(), HealthLevel::Down);
+    mock.unauthorized.store(false, Ordering::SeqCst);
+    wait_for(&meta, "recovered", |m| {
+        m.health.connection == Connection::Ok
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connects_in_the_background_and_retries() {
+    let server = serve(Mock::new(default_board())).await;
+    let url = server.url.clone();
+    let attempts = Arc::new(AtomicU64::new(0));
+    let counter = attempts.clone();
+    // The first attempt fails (as if AMP were down at start); the next one connects.
+    let connector: Connector = Arc::new(move || {
+        let url = url.clone();
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            let url = if n == 0 {
+                "http://127.0.0.1:9/mcp".to_owned()
+            } else {
+                url
+            };
+            AmpMcpClient::connect(
+                ClientOptions::new(url).with_connect_timeout(Duration::from_secs(2)),
+            )
+            .await
+        })
+    });
+    let meta = MetaPoller::spawn(
+        None,
+        MetaOptions {
+            project_id: Some(2),
+            intervals: fast(3_600_000),
+            connector: Some(connector),
+            ..MetaOptions::default()
+        },
+    );
+    let m = meta.snapshot();
+    assert!(m.instance.is_none());
+    assert_eq!(m.health.connection.level(), HealthLevel::Degraded);
+    let m = wait_for(&meta, "a down connection", |m| {
+        matches!(m.health.connection, Connection::Down { .. })
+    })
+    .await;
+    assert!(m.user.get().is_none());
+    let m = wait_for(&meta, "connected and loaded", |m| {
+        m.user.get().is_some() && m.board.get().is_some() && m.project.get().is_some()
+    })
+    .await;
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+    assert!(m.instance.is_some());
+    assert_eq!(m.health.connection, Connection::Ok);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_poller_stops_with_its_last_handle() {
+    let server = serve(Mock::new(default_board())).await;
+    let mut iv = fast(3_600_000);
+    iv.idle_ping = Duration::from_millis(50);
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            intervals: iv,
+            ..MetaOptions::default()
+        },
+    );
+    let clone = meta.clone();
+    wait_calls(&server.mock, "pings", |m| m.count("amp_whoami") >= 2).await;
+    drop(meta);
+    wait_calls(&server.mock, "more pings", |m| m.count("amp_whoami") >= 4).await;
+    drop(clone);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let after = server.mock.count("amp_whoami");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        server.mock.count("amp_whoami"),
+        after,
+        "no calls after the last handle drops"
+    );
+}
+
+/// Against a real AMP, when asked: `AMP_META_LIVE_URL=http://localhost:18000/mcp
+/// AMP_META_LIVE_PROJECT=<id> cargo test -p amp-core --test meta live -- --nocapture`.
+/// Skips (passes) without the variables, so CI never needs an AMP.
+#[tokio::test(flavor = "multi_thread")]
+async fn live_amp_when_asked() {
+    let Ok(url) = std::env::var("AMP_META_LIVE_URL") else {
+        return;
+    };
+    let project_id = std::env::var("AMP_META_LIVE_PROJECT")
+        .ok()
+        .and_then(|p| p.parse().ok());
+    let meta = MetaPoller::spawn(
+        Some(client(&url).await),
+        MetaOptions {
+            project_id,
+            ..MetaOptions::default()
+        },
+    );
+    let m = wait_for(&meta, "the live load", |m| {
+        m.user.get().is_some() && (project_id.is_none() || m.board.get().is_some())
+    })
+    .await;
+    let instance = m.instance.as_ref().unwrap();
+    println!(
+        "{} ({}) as {} · health {} in {:?}",
+        instance.host(),
+        instance.protocol,
+        m.user.get().unwrap().email,
+        m.health.connection,
+        m.health.latency.unwrap_or_default()
+    );
+    if let (Some(p), Some(b)) = (m.project.get(), m.board.get()) {
+        println!(
+            "project #{} {} (org {:?}, plan approval {}) · board {:?} · questions {}",
+            p.id,
+            p.name,
+            m.org_name(),
+            p.require_plan_approval,
+            b.nonzero(),
+            b.questions.len()
+        );
+    }
+    assert_eq!(m.health.connection.level(), HealthLevel::Ok);
+}

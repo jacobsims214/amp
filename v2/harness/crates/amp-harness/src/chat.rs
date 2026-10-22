@@ -18,10 +18,15 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
 
-use amp_core::{agent::Runtime, models::thinking_name};
+use amp_core::{
+    agent::Runtime,
+    meta::{Connector, MetaHandle, MetaOptions, MetaPoller},
+    models::thinking_name,
+};
 use amp_tui::{AmpTheme, ModelChoice, Shell, ShellInfo, Submit, ThemeSettings};
 use clap::Args;
 
@@ -106,9 +111,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let info = shell_info(&session);
     let models = model_choices(&session.rt);
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    let project_id = session.project.as_ref().map(|p| p.project_id);
     let mut events = session.events;
 
     let Some((width, height)) = args.snapshot else {
+        shell.set_meta(start_meta(&args.conn, project_id)?);
         return amp_tui::terminal::run(shell, events, done)
             .await
             .map_err(CliError::new);
@@ -153,6 +160,26 @@ fn load_theme(args: &ChatArgs) -> Result<AmpTheme, CliError> {
                 .flatten()
         })
         .map_err(|e| CliError::usage(e.to_string()))
+}
+
+/// Starts the AMP metadata poller (#2104) on its own MCP connection, made in the background with
+/// the same settings as the session's (so the TUI opens at once, and reconnects are possible).
+/// Its calls never go through the model. `--snapshot` does not start it yet (M3-3 decides how
+/// render checks wait for it).
+fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, CliError> {
+    let settings = conn.settings()?;
+    let connector: Connector = Arc::new(move || {
+        let settings = settings.clone();
+        Box::pin(async move { crate::conn::connect(&settings).await })
+    });
+    Ok(MetaPoller::spawn(
+        None,
+        MetaOptions {
+            project_id,
+            connector: Some(connector),
+            ..MetaOptions::default()
+        },
+    ))
 }
 
 fn shell_info(s: &session::Session) -> ShellInfo {

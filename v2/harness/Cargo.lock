@@ -66,8 +66,10 @@ version = "0.1.0"
 dependencies = [
  "amp-mcp",
  "async-trait",
+ "axum",
  "include_dir",
  "keyring",
+ "rmcp",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",

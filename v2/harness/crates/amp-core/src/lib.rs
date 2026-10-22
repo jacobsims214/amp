@@ -43,6 +43,11 @@
 //!   reports a worker that ended without closing its ticket with `amp_report_run` ("abandoned:
 //!   <reason>"); [`run_report::SessionUsageTool`] is the native `amp_session_usage`.
 //!
+//! M3-2 (#2104):
+//! - [`meta`]: the AMP metadata poller behind the chat TUI's header and status line (D10): its own
+//!   MCP client, never the model; polled on #2078 §2's intervals and refreshed right after any
+//!   `amp_*` tool call; the TUI reads one shared [`meta::AmpMeta`] snapshot.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -50,6 +55,7 @@ pub mod assets;
 pub mod events;
 pub mod faux;
 pub mod mcp_tools;
+pub mod meta;
 pub mod models;
 pub mod policy;
 pub mod project;
