@@ -12,7 +12,10 @@ use std::{
 use amp_core::{
     assets::{Assets, OverrideDirs},
     models::{ModelsConfig, ModelsFile},
-    policy::{DISPATCH_TOOL, DenialReason, QUESTION_TOOL, ToolPolicy},
+    policy::{
+        DISPATCH_TOOL, DenialReason, Policy, QUESTION_TOOL, ToolPolicy, resolve_read_tool_path,
+        resolve_symlinks, resolve_tool_path,
+    },
     roles::{RoleError, RoleRegistry},
 };
 use rpi_agent::{AgentContext, AgentMessage, AgentTool, AgentToolResult, ToolResultPartial};
@@ -822,4 +825,273 @@ fn filter_tools_drops_what_a_role_can_never_use() {
         names(&policy("amp-reviewer")),
         ["read", "bash", "amp_get_task"]
     );
+}
+
+// ------------------------------------------------------------------------------------------------
+// Path resolution (#2141): the policy must judge the file rpi's tools will really touch.
+// ------------------------------------------------------------------------------------------------
+
+/// A fresh directory under this crate's target dir (never /tmp: RUST DISK RULE, and on macOS /tmp
+/// is itself a symlink).
+fn path_scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("paths")
+        .join(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn home() -> PathBuf {
+    resolve_symlinks(&dirs::home_dir().expect("a home dir"))
+}
+
+/// The policy's resolution is a copy of rpi-tools' (whose resolver is private to its env), so
+/// compare the two on every rule: `@`, unicode spaces, `~`, `file://`, `..`, and the read tools'
+/// typographic variants.
+#[tokio::test]
+async fn policy_resolves_paths_exactly_like_rpi_tools() {
+    let root = path_scratch("rpi-equivalence").join("wt");
+    fs::create_dir_all(root.join("docs")).unwrap();
+    // Files only the read tools' variant lookup finds.
+    fs::write(root.join("docs/log 2\u{202F}PM.txt"), "").unwrap();
+    fs::write(root.join("docs/it\u{2019}s.md"), "").unwrap();
+    fs::write(root.join("docs/cafe\u{0301}.md"), "").unwrap();
+    let env = rpi_tools::OsExecutionEnv::with_cwd(root.clone());
+    let edit_paths = [
+        "src/a.rs",
+        "./src/../src/a.rs",
+        "@src/a.rs",
+        "@@src/a.rs",
+        "@../../x",
+        "~",
+        "~/",
+        "~/.ssh/authorized_keys",
+        "~/../.opencode/x",
+        "~root/x",
+        "x/~/y",
+        "file:///etc/hosts",
+        "file://docs/a.md",
+        "file:///C:/x",
+        "@file:///etc/hosts",
+        "~/file:///x",
+        "a\u{00A0}b\u{3000}c.txt",
+        "\u{2003}@x",
+        "/abs/../../../x",
+        "../../../../../../../../../../../../../../x",
+        "",
+        ".",
+    ];
+    for raw in edit_paths {
+        let rpi = rpi_tools::resolve_tool_path(&env, raw, None).await.unwrap();
+        assert_eq!(
+            resolve_tool_path(&root, raw),
+            PathBuf::from(rpi),
+            "edit path {raw:?}"
+        );
+    }
+    let read_paths = [
+        "docs/log 2 PM.txt",
+        "docs/log 2 pm.txt",
+        "docs/it's.md",
+        "docs/caf\u{00E9}.md",
+        "@docs/it's.md",
+        "docs/missing it's 2 AM.txt",
+        "~/x",
+    ];
+    for raw in edit_paths.iter().chain(read_paths.iter()) {
+        let rpi = rpi_tools::resolve_read_tool_path(&env, raw, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            resolve_read_tool_path(&root, raw),
+            PathBuf::from(rpi),
+            "read path {raw:?}"
+        );
+    }
+}
+
+fn edit_policy(root: &Path) -> ToolPolicy {
+    // Like the manager's own-config rule: everything denied but `.opencode/**`.
+    let p = Policy::parse(Some(&json!({
+        "edit": {"*": "deny", ".opencode/**": "allow"},
+        "read": {"*": "deny", "docs/**": "allow", ".opencode/**": "allow"},
+    })))
+    .unwrap();
+    ToolPolicy::new("amp-x", true, p, root)
+}
+
+fn edit_subject(p: &ToolPolicy, raw: &str) -> Result<(), (String, String)> {
+    p.check("write", &json!({"path": raw, "content": "x"}))
+        .map_err(|d| (d.permission.clone(), d.subject.clone()))
+}
+
+#[test]
+fn tilde_at_and_file_urls_are_classified_where_rpi_writes() {
+    let base = path_scratch("tilde-at-file");
+    let root = base.join("wt");
+    fs::create_dir_all(root.join(".opencode")).unwrap();
+    let p = edit_policy(&root);
+    let real_root = resolve_symlinks(&root);
+    let real_base = resolve_symlinks(&base);
+    let external = |subject: PathBuf| {
+        Err((
+            "external_directory".to_string(),
+            subject.display().to_string(),
+        ))
+    };
+
+    // Inside, allowed: plain, `@`-prefixed, unicode space-free, and as a file:// URL.
+    assert_eq!(edit_subject(&p, ".opencode/x"), Ok(()));
+    assert_eq!(edit_subject(&p, "@.opencode/x"), Ok(()));
+    let url = format!("file://{}/.opencode/x", root.display());
+    assert_eq!(edit_subject(&p, &url), Ok(()));
+    assert_eq!(edit_subject(&p, &format!("@{url}")), Ok(()));
+    // `~` and `file:` used to be read as directory names inside the root.
+    assert_eq!(
+        edit_subject(&p, "~/.opencode/x"),
+        external(home().join(".opencode/x"))
+    );
+    assert_eq!(
+        edit_subject(&p, "~/.ssh/authorized_keys"),
+        external(home().join(".ssh/authorized_keys"))
+    );
+    // Used to collapse to `.opencode/x` and pass the allow rule.
+    let above_home = resolve_symlinks(&home().join("..")).join(".opencode/x");
+    assert_eq!(edit_subject(&p, "~/../.opencode/x"), external(above_home));
+    assert_eq!(
+        edit_subject(&p, "file:///.opencode/x"),
+        external(PathBuf::from("/.opencode/x"))
+    );
+    // `@..` climbs out of the worktree, so the `.opencode/x` of a sibling is outside.
+    assert_eq!(
+        edit_subject(&p, "@../other/.opencode/x"),
+        external(real_base.join("other/.opencode/x"))
+    );
+    // `@../wt/...` comes back in.
+    assert_eq!(edit_subject(&p, "@../wt/.opencode/x"), Ok(()));
+    // Inside but denied: the subject is relative to the root.
+    assert_eq!(
+        edit_subject(&p, "@src/a.rs"),
+        Err(("edit".into(), "src/a.rs".into()))
+    );
+    // A worker with `edit: allow` still needs external_directory for `~/`.
+    let worker = registry()
+        .get("amp-worker-backend")
+        .unwrap()
+        .tool_policy(&real_root);
+    let d = worker
+        .check(
+            "write",
+            &json!({"path": "~/.ssh/authorized_keys", "content": ""}),
+        )
+        .unwrap_err();
+    assert_eq!(d.permission, "external_directory");
+    assert_eq!(d.reason, DenialReason::Ask);
+    assert!(
+        worker
+            .check("write", &json!({"path": "@src/a.rs", "content": ""}))
+            .is_ok()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_are_followed_before_the_rules_see_the_path() {
+    use std::os::unix::fs::symlink;
+
+    let base = path_scratch("symlinks");
+    let root = base.join("wt");
+    let outside = base.join("outside");
+    fs::create_dir_all(root.join(".opencode")).unwrap();
+    fs::create_dir_all(root.join("docs")).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("secret.txt"), "s").unwrap();
+    let real_outside = resolve_symlinks(&outside);
+    // A directory link that leaves the worktree.
+    symlink(&outside, root.join(".opencode/escape")).unwrap();
+    // A file link and a dangling link (writing through it creates its target) out of it.
+    symlink(outside.join("secret.txt"), root.join(".opencode/file.md")).unwrap();
+    symlink(outside.join("new.md"), root.join(".opencode/dangling.md")).unwrap();
+    // A relative dangling link whose target is under a directory that doesn't exist yet.
+    symlink("../../outside/deep/new.md", root.join(".opencode/rel.md")).unwrap();
+    // Links that stay inside: the rules see the real path.
+    symlink(root.join(".opencode"), root.join("alias")).unwrap();
+    symlink("../src", root.join(".opencode/to-src")).unwrap();
+    // The worktree itself reached through a link.
+    let root_link = base.join("wt-link");
+    symlink(&root, &root_link).unwrap();
+    // A link loop.
+    symlink("loop-b", root.join(".opencode/loop-a")).unwrap();
+    symlink("loop-a", root.join(".opencode/loop-b")).unwrap();
+
+    let p = edit_policy(&root);
+    let external = |subject: PathBuf| {
+        Err((
+            "external_directory".to_string(),
+            subject.display().to_string(),
+        ))
+    };
+    assert_eq!(
+        edit_subject(&p, ".opencode/escape/x"),
+        external(real_outside.join("x"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/escape/a/b/c"),
+        external(real_outside.join("a/b/c"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/file.md"),
+        external(real_outside.join("secret.txt"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/dangling.md"),
+        external(real_outside.join("new.md"))
+    );
+    assert_eq!(
+        edit_subject(&p, ".opencode/rel.md"),
+        external(real_outside.join("deep/new.md"))
+    );
+    // `..` is collapsed before the link is seen, as rpi does: this is `.opencode/x`.
+    assert_eq!(edit_subject(&p, ".opencode/escape/../x"), Ok(()));
+    // Inside links: `alias/x` is really `.opencode/x`; `.opencode/to-src/a.rs` is `src/a.rs`.
+    assert_eq!(edit_subject(&p, "alias/x"), Ok(()));
+    assert_eq!(
+        edit_subject(&p, ".opencode/to-src/a.rs"),
+        Err(("edit".into(), "src/a.rs".into()))
+    );
+    // A loop ends (the tool itself fails with ELOOP, so the verdict doesn't matter).
+    let _ = edit_subject(&p, ".opencode/loop-a");
+    // A policy bound to the linked root sees the same inside paths.
+    let via_link = edit_policy(&root_link);
+    assert_eq!(edit_subject(&via_link, ".opencode/x"), Ok(()));
+    assert_eq!(
+        edit_subject(&via_link, ".opencode/escape/x"),
+        external(real_outside.join("x"))
+    );
+
+    // Reads use the same resolution: a link out of an allowed directory is not allowed.
+    let read = |raw: &str| p.check("read", &json!({ "path": raw }));
+    assert!(read("docs/a.md").is_ok());
+    assert!(read("@docs/a.md").is_ok());
+    assert!(read("alias/x").is_ok());
+    let d = read(".opencode/escape/secret.txt").unwrap_err();
+    assert_eq!(d.permission, "read");
+    assert_eq!(
+        d.subject,
+        real_outside.join("secret.txt").display().to_string()
+    );
+    assert!(read(".opencode/file.md").is_err());
+    assert!(read("~/.opencode/x").is_err());
+    for tool in ["grep", "find", "ls"] {
+        let checks = p
+            .checks(tool, &json!({"path": ".opencode/escape"}))
+            .unwrap();
+        assert_eq!(checks.len(), 1, "{tool}");
+        assert_eq!(
+            checks[0].subject,
+            real_outside.display().to_string(),
+            "{tool}"
+        );
+    }
 }
