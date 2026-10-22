@@ -1,0 +1,193 @@
+# Host-glue overrides for the AMP harness's embedded agents and skills (build_harness_assets.py).
+# Design: project 2 KB decisions/amp-harness-architecture.md, D5.
+#
+# The sources (v2/.opencode) are written for opencode. The harness has no `task` tool, no
+# `amp_amp_` double prefix, no `subagent_depth`, and its manager does not edit `.opencode/**`.
+# Workers run through the manager's `amp_run_ticket(task_id, agent_id)` tool (D7), which
+# dispatches the ticket in AMP, gives the worker its own worktree, runs it in the foreground and
+# returns its final message. Run reporting is automatic (D8).
+#
+# Rule kinds (per file, applied in order, then the global rules):
+#   paragraph: <substring>  + with: <text>   replace the whole blank-line-separated paragraph
+#                                            containing <substring> (empty `with` deletes it)
+#   find: <literal>         + replace: <text>
+#   regex: <pattern>        + replace: <text>
+# Per-file rules must match `count` times (default 1), or the build fails: when the source
+# changes, fix the rule rather than letting opencode wording through. Global rules are regexes
+# and may match any number of times. `banned` patterns must not survive in any generated markdown.
+
+exclude_skills:
+  - amp-agent-builder   # writes opencode/Claude config files; not v1 (D5)
+
+files:
+  agent/amp-manager.md:
+    frontmatter:
+      remove_lines:
+        - '    ".opencode/**": allow'
+        - '    "opencode.json": allow'
+        - '    "mkdir -p .opencode/*": allow'
+        - '    "general": allow'
+        - '    "explore": allow'
+    body:
+      - paragraph: "Your working set is: the full `amp_*` MCP tool surface"
+        with: |
+          Your working set is: the full `amp_*` MCP tool surface (projects, epics, stories, tasks, and the
+          knowledge base) — they're already in your tool list under their own names, so call them
+          directly — and the `amp_run_ticket` tool for running specialist workers. You cannot edit
+          files, and your `bash` is limited to `git status`, `git diff`, `git log` and `ls`. You do not
+          have `webfetch` — if you need information from the web, dispatch a research subagent to fetch
+          and report it back to you. You do not have `todowrite` either — AMP tickets and comments are
+          the only place work is planned and tracked in this system; never reach for a built-in planning
+          tool as a substitute. A worker cannot run a further worker: the harness doesn't give workers
+          `amp_run_ticket`, so don't try to route around it. `amp_run_ticket` runs only the `amp-*`
+          specialists its description lists.
+      - paragraph: "You never implement, edit project code, run builds, or fetch the web yourself."
+        with: |
+          You never implement, edit project code, run builds, or fetch the web yourself. Every unit of
+          real work goes through the `amp_run_ticket` tool to whichever specialist's description is the
+          best match for it — research, implementation in a given domain, or review. Read the live list
+          of available specialists from that tool's description each time you plan; do not memorize or
+          hardcode names here, because the roster can grow, shrink, or get renamed between releases, and
+          a name baked into this file would go stale.
+      - paragraph: "If nothing in the current roster fits"
+        with: |
+          If nothing in the current roster fits — no specialist covers the domain, and no skill covers
+          the gap either — tell your user which specialist is missing instead of force-fitting one. They
+          can add an agent file under `~/.config/amp-harness/agents/` or `.amp/harness/agents/`; you
+          don't edit agent or skill files yourself.
+      - find: "You run your user's tickets only, and only after `amp_dispatch_task` succeeded for that ticket —\nif dispatch is refused (it's someone else's), don't start a worker on it anyway."
+        replace: "You run your user's tickets only: `amp_run_ticket` refuses a ticket AMP won't dispatch to you\n(it's someone else's) — don't try to start a worker on it another way."
+      - paragraph: "Run at most 4 workers at once, and start the next as one finishes."
+        with: |
+          Run at most 4 workers at once, and start the next as one finishes (the harness caps it at 4;
+          extra calls wait for a free slot). Wide fan-outs (10+ workers in one turn) are where sessions
+          hang, and when they do every ticket in flight is orphaned at once. `amp_run_ticket` gives each
+          worker its own `git worktree` inside the repo, at `.worktrees/<ticket>`, so parallel workers'
+          branches don't collide (add `.worktrees/` to `.gitignore`).
+      - paragraph: "Dispatching is two steps in the same turn"
+        with: |
+          Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
+          runs the worker in the foreground and returns its final message when it finishes. Don't call
+          `amp_dispatch_task` on its own for a ticket you aren't about to run — everyone watching AMP sees
+          it in progress while nothing is happening. A headless run (`amp-harness run`, CI) ends the
+          moment you reply. There is no loop after you reply: your session stops when you answer your
+          user. If you stop with work still ready, say so plainly ("#152 is ready, not started") instead
+          of "I'll keep the loop running".
+      - paragraph: "**Runs and token spend.**"
+        with: |
+          **Runs and token spend.** The harness records each worker's model, token usage and git details
+          on its run automatically, including a worker that you stop, that times out or that dies before
+          completing or blocking its ticket (it's recorded as abandoned, with the reason). Use
+          `amp_report_run` only for what the harness can't see, such as a PR opened later.
+      - paragraph: "**If the AMP tools are missing**"
+        with: |
+          **If the AMP tools are missing** (no `amp_*` tools, or they fail to connect), stop and tell your
+          user: the harness needs to reconnect to AMP (`amp-harness login`, or a restart). Don't work
+          around it through the web UI's API, other people's tokens, or AMP's source code — you'd be
+          acting outside your user's permissions and the audit trail.
+      - paragraph: "Your subagents are listed with their descriptions in your `task` tool"
+        with: |
+          Your specialists are listed with their descriptions in your `amp_run_ticket` tool; that's all
+          you need to pick one. Don't read agent, skill or config files (`~/.config/amp-harness/`,
+          `.amp/harness/`) to decide who to dispatch or how they'll behave: it costs time and tells you
+          nothing the descriptions don't.
+
+  agent/amp-designer.md:
+    body:
+      - find: "Publish the file itself, don't paste it: in opencode, `amp_publish_artifact_file(path, task_id,\ntitle)`; elsewhere `amp-design-tools`' `publish_file.py`; only if neither works,"
+        replace: "Publish the file itself, don't paste it: with `amp-design-tools`' `publish_file.py`; only if that\ndoesn't work,"
+
+  skills/amp-index/SKILL.md:
+    body:
+      - find: "Load skills on demand using `skill(\"name\")` when you determine they are relevant."
+        replace: "Load skills on demand (read the SKILL.md listed for it in your system prompt) when you determine they are relevant."
+      - paragraph: "These are the agents currently defined under `.opencode/agent/*.md`."
+        with: |
+          These are the agents the harness ships. This list is for onboarding context only — when
+          actually picking who to dispatch, read the live list from your `amp_run_ticket` tool
+          description, since the roster can change after this doc was last updated.
+      - paragraph: "**amp-agent-builder**"
+        with: ""
+
+  skills/amp-planning/SKILL.md:
+    body:
+      - paragraph: "**Do not hardcode a roster here or memorize agent names across sessions.**"
+        with: |
+          **Do not hardcode a roster here or memorize agent names across sessions.** Your
+          `amp_run_ticket` tool description lists every currently available specialist — their name,
+          and a summary of what each covers — generated from the agents the harness loaded. Read that
+          list each time you plan. It is always accurate to what's deployed right now; a roster written
+          into this skill would go stale the moment an agent is added, renamed, or retired.
+      - find: "If nothing in the current list fits the work, load\n`skill(\"amp-agent-builder\")` to mint a new specialist — don't force-fit an existing one."
+        replace: "If nothing in the current list fits the work, tell your user which\nspecialist is missing — don't force-fit an existing one."
+      - find: "1. Load the code-reviewer skill: skill(\"code-reviewer\")"
+        replace: "1. Load the **code-reviewer** skill"
+      - find: "both touch .opencode/skills/amp-kb/SKILL.md"
+        replace: "both touch web/src/pages/Board.tsx"
+      - paragraph: "For every task in `ready_to_dispatch`, do both steps in this order"
+        with: |
+          For every task in `ready_to_dispatch`, run it with `amp_run_ticket`, using the task's own `assigned_to` value as the agent — not a fixed name. Call it once per task in a single message, so they run in parallel:
+      - paragraph: "**Step 1 — dispatch each task**"
+        with: |
+          ```
+          amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
+          amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
+          ```
+      - paragraph: "**Step 2 — spawn workers in a single message**"
+        with: ""
+      - paragraph: "Step 1 must happen before step 2."
+        with: |
+          `amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board), and returns when the worker finishes.
+
+  skills/amp-execution/SKILL.md:
+    body:
+      - find: "(opencode's `execute`, scripts, tests)"
+        replace: "(scripts, tests)"
+      - find: "← if your harness has it (opencode with the AMP plugin): your model,"
+        replace: "← if your harness has it (amp-harness does): your model,"
+      - find: "← opencode plugin: your own model/tokens/cost"
+        replace: "← your own model/tokens/cost"
+
+  skills/amp-mcp/SKILL.md:
+    body:
+      - find: "the harness plugin provides it (Claude Code with the AMP plugin, opencode)"
+        replace: "the harness provides it (amp-harness, and the AMP plugin for other hosts)"
+
+  skills/amp-init/SKILL.md:
+    body:
+      - find: "(e.g. the `amp` entry in `opencode.json`, `.mcp.json` or the plugin's MCP settings)"
+        replace: "(e.g. the server `amp-harness doctor` reports)"
+
+  skills/amp-design-tools/SKILL.md:
+    body:
+      - find: "In opencode with AMP's plugin, use the `amp_publish_artifact_file` tool instead\n(it knows AMP's address and your token). If neither is available, publish with"
+        replace: "If they aren't set, publish with"
+
+  skills/amp-image-gen/SKILL.md:
+    body:
+      - find: "`OPENROUTER_API_KEY`, or opencode's stored OpenRouter key. If neither\n  exists,"
+        replace: "`OPENROUTER_API_KEY`. If it isn't set,"
+
+global:
+  # opencode skill calls → the harness's skills (listed in the system prompt, preloaded per role).
+  - regex: '`?skill\("([a-z0-9-]+)"\)`?'
+    replace: 'the **\1** skill'
+  # opencode tool names → the harness's (rpi-tools: read, write, edit, bash, grep, find, ls).
+  - regex: '`task` tool'
+    replace: '`amp_run_ticket` tool'
+  - regex: '`edit`/write'
+    replace: '`edit`/`write`'
+  - regex: '`glob`'
+    replace: '`find`'
+
+banned:
+  - 'amp_amp_'
+  - 'subagent_depth'
+  - '\.opencode/'
+  - '\bopencode\b'
+  - '`task` tool'
+  - 'skill\('
+  - 'subagent_type'
+  - '\btask\(prompt='
+  - 'amp-agent-builder'
+  - 'amp_publish_artifact_file'

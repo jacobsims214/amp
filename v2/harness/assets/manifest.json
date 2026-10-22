@@ -1,0 +1,262 @@
+{
+ "generated_by": "v2/scripts/build-harness-assets.sh — do not edit; edit v2/.opencode or v2/scripts/lib/harness_overrides.yaml",
+ "source": "v2/.opencode",
+ "source_sha256": "d1ff7db931a54a5172626b0dc983f6435ccf43ce5161e9a94405033f61ae89e5",
+ "default_agent": "amp-manager",
+ "excluded_skills": [
+  "amp-agent-builder"
+ ],
+ "agents": [
+  {
+   "id": "amp-designer",
+   "mode": "subagent",
+   "description": "Design specialist — UI/UX design, visual polish, mockups and prototypes, standalone artifacts (HTML pages, SVG, diagrams, slides), and visual review of screenshots. Executes one assigned AMP task end-to-end. Use for tickets where how it looks is the point; plain React wiring goes to the frontend specialist."
+  },
+  {
+   "id": "amp-github-researcher",
+   "mode": "subagent",
+   "description": "GitHub research specialist — uses gh CLI, jq, fzf, delta, bat, git to search repos, cross-reference data, investigate issues/PRs, check CI status. Dispatched by the manager to research GitHub repos before planning."
+  },
+  {
+   "id": "amp-github-reviewer",
+   "mode": "subagent",
+   "description": "GitHub PR reviewer — uses gh CLI, jq, delta, git to fetch PR diffs, do full in-depth code reviews, post line-level review comments, approve or request changes. Dispatched by the manager to review a specific PR."
+  },
+  {
+   "id": "amp-kb-curator",
+   "mode": "subagent",
+   "description": "KB curator — prunes stale docs, merges duplicates, compacts annotations into doc content, reports KB health. Dispatched by the manager for KB maintenance."
+  },
+  {
+   "id": "amp-manager",
+   "mode": "primary",
+   "description": "AMP manager — plans work, builds the board via AMP MCP, dispatches specialist subagents, never edits project code/runs builds/fetches the web itself"
+  },
+  {
+   "id": "amp-media",
+   "mode": "subagent",
+   "description": "Media specialist — analyzes images, screenshots, scanned documents, charts, video and audio, and produces images (illustrations, icons, edits) with the image-generation skill. Executes one assigned AMP task end-to-end, or answers a question about a piece of media."
+  },
+  {
+   "id": "amp-researcher",
+   "mode": "subagent",
+   "description": "Read-only researcher — investigates and reports, never edits files. Dispatched by the manager to answer a question before planning."
+  },
+  {
+   "id": "amp-reviewer",
+   "mode": "subagent",
+   "description": "Reviewer — wave checks and full code reviews, never original implementation."
+  },
+  {
+   "id": "amp-worker-backend",
+   "mode": "subagent",
+   "description": "Backend specialist — Go, chi/pgx, Docker, Terraform/TFE, backend tests. Executes one assigned AMP task end-to-end."
+  },
+  {
+   "id": "amp-worker-docs",
+   "mode": "subagent",
+   "description": "Docs/ops specialist — git commits/PRs, KB writes, markdown docs, config-only edits. Executes one assigned AMP task end-to-end."
+  },
+  {
+   "id": "amp-worker-frontend",
+   "mode": "subagent",
+   "description": "Frontend specialist — React, TypeScript, Tailwind, frontend tests, wiring UI to APIs. Executes one assigned AMP task end-to-end. Look-and-feel work (visual design, mockups, polish) goes to the design specialist."
+  }
+ ],
+ "skills": [
+  {
+   "name": "amp-day-report",
+   "description": "End-of-day wrap-up in AMP — use when the user says \"wrap up today\", \"end of day\", \"day end report\", \"what did I get done\", or asks for a status update or someone else's daily report, or wants to sync daily work to Jira/Odoo",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-design-tools",
+   "description": "Fast tools for design work. Screenshot every state of a mockup in one call (capture.mjs), and publish a file as an AMP artifact without re-typing it (publish_file.py). Use them instead of screenshotting state by state with chrome-devtools, and instead of pasting a whole file into amp_publish_artifact.",
+   "files": [
+    "SKILL.md",
+    "scripts/capture.mjs",
+    "scripts/publish_file.py"
+   ]
+  },
+  {
+   "name": "amp-execution",
+   "description": "Full protocol for executing an AMP task — reading the ticket, doing the work, logging progress, writing to the KB, and completing",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-image-gen",
+   "description": "Generate or edit raster images (illustrations, hero art, icons, textures, photo edits) through OpenRouter and save them to files. Use when a ticket needs an image that can't reasonably be drawn as SVG or CSS.",
+   "files": [
+    "SKILL.md",
+    "scripts/gen_image.py"
+   ]
+  },
+  {
+   "name": "amp-index",
+   "description": "Skill index for AMP agents — load this first to understand what skills are available and when to use them",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-init",
+   "description": "Initialize a new AMP project — create the project, scan the codebase, seed the knowledge base with a project overview",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-kb",
+   "description": "How to search the AMP knowledge base before starting work, and how to write documents that embed well for semantic search",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-kb-curator",
+   "description": "KB maintenance workflow — pruning stale docs, merging duplicates, compacting annotations into doc content, and reporting KB health",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-mcp",
+   "description": "Complete reference for all amp MCP tools — exact names, required arguments, and what each returns",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-planning",
+   "description": "Full protocol for planning, creating the task hierarchy, getting approval, and dispatching workers — including the hard approval gate",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "amp-review",
+   "description": "Reviewer protocol for AMP — wave checks and full code reviews, the fix-task template, and rules for creating fix tasks instead of failing. Use when your task name contains \"check\", \"review\", or \"Code Review:\".",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "aws-sso-auth",
+   "description": "Use when you need to authenticate with AWS via SSO and run AWS CLI commands against AWS accounts and services (EKS, S3, CloudWatch, IAM, etc.). Covers aws-sso exec authentication flow, credential management, common AWS CLI commands, EKS cluster token, and troubleshooting auth issues.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "code-reviewer",
+   "description": "Tiered code review framework with Blocker, Significant, Suggestion, and Skip tiers. Use when reviewing Go, TypeScript/React, Dockerfile, or Terraform code changes.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "docker-engineering",
+   "description": "Use when writing Dockerfiles, docker-compose configs, or troubleshooting container builds — covers multi-stage builds, layer caching, security hardening, health checks, and corporate CA certificate injection.",
+   "files": [
+    "SKILL.md",
+    "examples.md"
+   ]
+  },
+  {
+   "name": "git-workflow",
+   "description": "Use when making commits, naming branches, or opening pull requests — covers conventional commit format, branch prefixes, PR hygiene, and force-push safety rules.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "github-pr-review",
+   "description": "GitHub PR review workflow using gh CLI, jq, delta, git — fetching PR diffs, checking CI, line-level review comments, approving or requesting changes. Load when dispatched to review a PR.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "github-research",
+   "description": "GitHub research workflow using gh CLI, jq, fzf, delta, bat, git — searching repos, code, issues, PRs, cross-referencing data, checking CI. Load when dispatched for GitHub research.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "go-engineer",
+   "description": "Go 1.22+ patterns for error handling, pgx/v5, HTTP handlers, chi routing, concurrency, and testing. Use when writing or reviewing Go backend code.",
+   "files": [
+    "SKILL.md",
+    "examples.md"
+   ]
+  },
+  {
+   "name": "kubectl-eks",
+   "description": "Use when you need to interact with Kubernetes clusters (especially EKS) using kubectl — viewing pods, reading logs, exec into containers, restarting deployments, and troubleshooting. Covers context switching, pod management, log retrieval, exec into containers, rollout restart, EKS-specific commands with aws-sso wrapper, and common debugging patterns.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "react-engineer",
+   "description": "React 18+TypeScript+Vite patterns for Zustand, TanStack Query, Tailwind, TypeScript, and async UX. Use when writing or reviewing React frontend code.",
+   "files": [
+    "SKILL.md",
+    "examples.md"
+   ]
+  },
+  {
+   "name": "testing-strategy",
+   "description": "Use when writing or reviewing tests in Go or React/TypeScript — covers table-driven tests, testify assertions, interface mocking, RTL query priority, MSW v2 handlers, and what not to test.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "tfe-manager",
+   "description": "Use when creating, configuring, or investigating Terraform Cloud/Enterprise workspaces — covers workspace lifecycle, variable sets, run types, run investigation, and VCS integration.",
+   "files": [
+    "SKILL.md"
+   ]
+  },
+  {
+   "name": "ui-ux-pro-max",
+   "description": "UI/UX design intelligence with searchable database",
+   "files": [
+    "SKILL.md",
+    "data/charts.csv",
+    "data/colors.csv",
+    "data/icons.csv",
+    "data/landing.csv",
+    "data/products.csv",
+    "data/react-performance.csv",
+    "data/stacks/astro.csv",
+    "data/stacks/flutter.csv",
+    "data/stacks/html-tailwind.csv",
+    "data/stacks/jetpack-compose.csv",
+    "data/stacks/nextjs.csv",
+    "data/stacks/nuxt-ui.csv",
+    "data/stacks/nuxtjs.csv",
+    "data/stacks/react-native.csv",
+    "data/stacks/react.csv",
+    "data/stacks/shadcn.csv",
+    "data/stacks/svelte.csv",
+    "data/stacks/swiftui.csv",
+    "data/stacks/vue.csv",
+    "data/styles.csv",
+    "data/typography.csv",
+    "data/ui-reasoning.csv",
+    "data/ux-guidelines.csv",
+    "data/web-interface.csv",
+    "scripts/core.py",
+    "scripts/design_system.py",
+    "scripts/search.py"
+   ]
+  }
+ ]
+}
