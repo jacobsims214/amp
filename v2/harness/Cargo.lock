@@ -126,7 +126,13 @@ name = "amp-tui"
 version = "0.1.0"
 dependencies = [
  "amp-core",
+ "crossterm",
+ "rpi-agent",
+ "rpi-ai",
+ "rpi-harness",
  "rpi-tui",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

@@ -24,17 +24,19 @@ use std::{
 };
 
 use amp_core::{
-    agent::{AgentSpec, BuiltAgent, Runtime, RuntimeOptions, SessionKind},
-    events::{ChannelEmitter, RunEvent, Totals},
+    agent::{BuiltAgent, Runtime},
+    events::{RunEvent, Totals},
     models::thinking_name,
-    project::{ENV_CEILING_DIR, ProjectMarker},
-    providers::SystemKeys,
+    project::ProjectMarker,
 };
 use clap::Args;
 use rpi_harness::agent_harness::{AgentLane, HarnessRunOutcome};
 use serde_json::{Value, json};
 
-use crate::conn::{self, CliError, ConnArgs};
+use crate::{
+    conn::{CliError, ConnArgs},
+    session,
+};
 
 #[derive(Args, Debug)]
 pub struct RunArgs {
@@ -162,62 +164,19 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         return Err(CliError::usage("the prompt is empty"));
     }
 
-    let cwd = match &args.cwd {
-        Some(dir) => dir.clone(),
-        None => {
-            std::env::current_dir().map_err(|e| CliError::new(format!("current directory: {e}")))?
-        }
-    };
-    let cwd = std::fs::canonicalize(&cwd)
-        .map_err(|e| CliError::usage(format!("--cwd {}: {e}", cwd.display())))?;
-    let ceiling = std::env::var_os(ENV_CEILING_DIR)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
-    let project = ProjectMarker::find_within(&cwd, ceiling.as_deref())?;
-    let repo_root = project
-        .as_ref()
-        .and_then(|p| p.path.parent().map(PathBuf::from));
-
-    let settings = args.conn.settings()?;
-    let client = Arc::new(conn::connect(&settings).await?);
-    let env = |k: &str| std::env::var(k).ok();
-    let keys = SystemKeys::from_env();
-    let rt = Runtime::load(
-        Arc::clone(&client),
-        RuntimeOptions {
-            repo_root,
-            models: None,
-            keys: &keys,
-            env: &env,
-            state_dir: None,
-        },
-    )
-    .map_err(|e| CliError::new(e.to_string()))?;
-
-    let role_name = args
-        .role
-        .clone()
-        .unwrap_or_else(|| rt.roles.manager().id.clone());
-    let role_id = rt
-        .role(&role_name)
-        .map_err(|e| CliError::usage(e.to_string()))?
-        .id
-        .clone();
-    let (emitter, mut rx) = ChannelEmitter::new();
-    let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());
-    spec.project = project.clone();
-    spec.emitter = Some(emitter.into_emitter());
-    spec.session = if args.no_session || args.print_system_prompt {
-        SessionKind::Memory
-    } else {
-        SessionKind::Jsonl {
-            dir: rt.state_dir.join("sessions").join(&role_id),
-        }
-    };
-    let agent = rt
-        .build(spec)
-        .await
-        .map_err(|e| CliError::new(e.to_string()))?;
+    let session::Session {
+        rt,
+        agent,
+        events: mut rx,
+        project,
+        ..
+    } = session::build(session::SessionRequest {
+        conn: &args.conn,
+        role: args.role.as_deref(),
+        cwd: args.cwd.as_deref(),
+        memory: args.no_session || args.print_system_prompt,
+    })
+    .await?;
 
     if args.print_system_prompt {
         println!("{}", agent.full_system_prompt(&rt.skills));
