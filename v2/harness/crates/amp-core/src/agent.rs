@@ -23,8 +23,13 @@
 //!      the harness config dir, then the working directory and its ancestors, deepest last);
 //!   6. `<available_skills>`: every skill by name, description and path, appended by rpi.
 //! - **Session:** in memory, or a JSONL file under the state directory.
+//! - **Bash environment:** the process environment minus the harness's own secrets (#2142):
+//!   `AMP_TOKEN`, the `--token-env` variable and every provider's `key_env`. A worker that runs
+//!   `env` never puts them in its transcript. `[secrets] pass_to_bash = [...]` in config.toml
+//!   passes a named one through on purpose (off by default).
 
 use std::{
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -44,7 +49,10 @@ use rpi_harness::{
     system_prompt::compose_system_prompt,
     types::{AgentHarnessOptions, AgentHarnessResources, HarnessTool, Skill},
 };
-use rpi_tools::{ExecutionEnv, ExecutionToolContext, OsExecutionEnv};
+use rpi_tools::{
+    BashExecution, BashPrepare, BashToolOptions, ExecutionEnv, ExecutionToolContext,
+    OsExecutionEnv, is_host_private_env,
+};
 
 use crate::{
     assets::{AssetError, Assets, OverrideDirs},
@@ -109,6 +117,81 @@ pub struct Runtime {
     pub faux_scripted: Vec<String>,
     /// `AMP_HARNESS_CEILING_DIR`: context files above it are not loaded.
     pub ceiling_dir: Option<PathBuf>,
+    /// Environment variables removed from every bash call: `AMP_TOKEN`, every provider's
+    /// `key_env` and (via [`Runtime::with_secret_env`]) the `--token-env` variable, minus
+    /// `pass_env`. Names only; values are never held here.
+    pub secret_env: BTreeSet<String>,
+    /// `[secrets] pass_to_bash` in config.toml: secrets passed to bash on purpose.
+    pub pass_env: BTreeSet<String>,
+}
+
+/// `[secrets]` in config.toml. Other tables are ignored.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SecretsFile {
+    #[serde(default)]
+    secrets: SecretsSection,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretsSection {
+    /// Secret env vars to pass to bash anyway (default: none).
+    #[serde(default)]
+    pass_to_bash: Vec<String>,
+}
+
+/// `[secrets] pass_to_bash` from the config file the models config was loaded from.
+fn pass_env_from(models: &ModelsConfig) -> Result<BTreeSet<String>, AgentError> {
+    let Some(path) = models.config_file.as_ref().filter(|_| models.config_found) else {
+        return Ok(BTreeSet::new());
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| AgentError::Io(format!("{}: {e}", path.display())))?;
+    let file: SecretsFile = toml::from_str(&text)
+        .map_err(|e| AgentError::Io(format!("{} [secrets]: {e}", path.display())))?;
+    Ok(file
+        .secrets
+        .pass_to_bash
+        .into_iter()
+        .map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .collect())
+}
+
+/// The names [`Runtime::secret_env`] starts from: `AMP_TOKEN` and every provider's `key_env`.
+pub fn secret_env_names(models: &ModelsConfig) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = models
+        .providers
+        .values()
+        .filter_map(|p| p.key_env.clone())
+        .filter(|n| !n.trim().is_empty())
+        .collect();
+    names.insert(amp_mcp::ENV_TOKEN.to_owned());
+    names
+}
+
+/// The environment a bash call gets: `vars` minus rpi's host-private plumbing and `secrets`.
+pub fn bash_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+    secrets: &BTreeSet<String>,
+) -> HashMap<String, String> {
+    vars.into_iter()
+        .filter(|(k, _)| !is_host_private_env(k) && !secrets.contains(k))
+        .collect()
+}
+
+/// A bash `prepare` hook that replaces the inherited environment with a filtered copy of the
+/// process environment, read at call time.
+fn scrubbing_prepare(secrets: BTreeSet<String>) -> BashPrepare {
+    let secrets = Arc::new(secrets);
+    Arc::new(move |exec: &mut BashExecution| {
+        let mut env = bash_env(std::env::vars(), &secrets);
+        // Whatever an earlier hook set explicitly still wins (rpi applies `env` last).
+        env.extend(std::mem::take(&mut exec.env));
+        exec.env = env;
+        exec.inherit_env = false;
+        Box::pin(async { Ok(()) })
+    })
 }
 
 /// How [`Runtime::load`] finds things. [`RuntimeOptions::from_env`] is the real process.
@@ -154,6 +237,11 @@ impl Runtime {
         let hash = assets.manifest().source_sha256.clone();
         let short = if hash.len() >= 12 { &hash[..12] } else { "dev" };
         let skills = assets.materialize_skills(&state_dir.join("skills").join(short))?;
+        let pass_env = pass_env_from(&models)?;
+        let secret_env = secret_env_names(&models)
+            .into_iter()
+            .filter(|n| !pass_env.contains(n))
+            .collect();
         Ok(Self {
             assets,
             roles,
@@ -167,7 +255,20 @@ impl Runtime {
             ceiling_dir: (opts.env)(ENV_CEILING_DIR)
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
+            secret_env,
+            pass_env,
         })
+    }
+
+    /// Also removes `name` from bash calls (the `--token-env` variable), unless it is in
+    /// `[secrets] pass_to_bash`.
+    pub fn with_secret_env(mut self, name: Option<&str>) -> Self {
+        if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty())
+            && !self.pass_env.contains(name)
+        {
+            self.secret_env.insert(name.to_owned());
+        }
+        self
     }
 
     pub fn role(&self, name: &str) -> Result<&Role, AgentError> {
@@ -190,7 +291,13 @@ impl Runtime {
 
         let mut tools: Vec<HarnessTool> = vec![
             HarnessTool::new(rpi_tools::create_read_tool(&ctx, None)),
-            HarnessTool::new(rpi_tools::create_bash_tool(&ctx, None)),
+            HarnessTool::new(rpi_tools::create_bash_tool(
+                &ctx,
+                Some(BashToolOptions {
+                    prepare: Some(scrubbing_prepare(self.secret_env.clone())),
+                    ..Default::default()
+                }),
+            )),
             HarnessTool::new(rpi_tools::create_edit_tool(&ctx)),
             HarnessTool::new(rpi_tools::create_write_tool(&ctx)),
             HarnessTool::new(rpi_tools::create_grep_tool(&ctx, None)),
@@ -506,6 +613,35 @@ pub async fn jsonl_session(dir: &Path, cwd: &Path) -> Result<(Session, PathBuf),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secrets_are_amp_token_and_every_provider_key_env() {
+        let models = ModelsConfig::load_with_env(&|_| None, None).unwrap();
+        let names = secret_env_names(&models);
+        for n in ["AMP_TOKEN", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY"] {
+            assert!(names.contains(n), "{n} missing from {names:?}");
+        }
+    }
+
+    #[test]
+    fn bash_env_drops_secrets_and_host_plumbing_and_keeps_the_rest() {
+        let secrets: BTreeSet<String> = ["AMP_TOKEN", "OPENROUTER_API_KEY"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let vars = [
+            ("AMP_TOKEN", "dummy-amp"),
+            ("OPENROUTER_API_KEY", "dummy-or"),
+            ("RPI_SESSION_ID", "dummy-session"),
+            ("PATH", "/usr/bin"),
+            ("AMP_MCP_URL", "http://x"),
+        ]
+        .map(|(k, v)| (k.to_owned(), v.to_owned()));
+        let env = bash_env(vars, &secrets);
+        let mut keys: Vec<&str> = env.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["AMP_MCP_URL", "PATH"]);
+    }
 
     #[test]
     fn state_dir_prefers_xdg_state_home() {

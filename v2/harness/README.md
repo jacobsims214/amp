@@ -213,6 +213,20 @@ flags ids that are missing. It exits 1 if a role does not resolve or a checked i
 `config show --config PATH` reads that file. The chat and `run` always read `[models]`, `[roles]`,
 `[providers]` and `[workers]` from the default config.toml; their `--config` only changes `[server]`.
 
+### Secrets never reach an agent's bash (#2142)
+
+Every session's `bash` (manager and workers) gets the harness's environment minus its own secrets:
+`AMP_TOKEN`, the variable named by `--token-env`, and every provider's `key_env` in the loaded
+models config (`OPENROUTER_API_KEY`, `ANTHROPIC_API_KEY`, ...). A worker that runs `env` while
+debugging would otherwise put them in its transcript, the provider request and possibly an AMP
+comment or commit. Everything else is passed through unchanged. To hand a named secret to bash on
+purpose (off by default), list it in config.toml:
+
+```toml
+[secrets]
+pass_to_bash = ["OPENROUTER_API_KEY"]
+```
+
 ## Headless runs (M2-4)
 
 ```sh
