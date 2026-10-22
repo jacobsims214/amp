@@ -148,6 +148,16 @@ impl CredentialBackend {
         matches!(self, Self::Keychain { .. })
     }
 
+    /// Drops this process's cached copy of a server's login (keychain only; the file is read every
+    /// time), so the next load reads the keychain again. Keychain reads are cached per process
+    /// (#2165); call this when the login may have changed in another process, e.g. before a
+    /// reconnect after "login required" (#2159), so `amp-harness login` in another terminal is seen.
+    pub fn forget_cached(&self, url: &str) {
+        if let Self::Keychain { service } = self {
+            crate::keychain_forget(service, &credential_key(url));
+        }
+    }
+
     /// The store for one server's login.
     pub fn store_for(&self, url: &str) -> AmpCredentialStore {
         AmpCredentialStore {
