@@ -43,8 +43,8 @@ use crate::{
 
 /// How long `--snapshot` waits for one prompt's run.
 const SNAPSHOT_RUN_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long `--theme auto` waits for the terminal to report its background colour.
-const BACKGROUND_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
+/// How long `--theme auto` waits for the terminal to start answering its background query (#2155).
+const BACKGROUND_QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Args, Debug, Default)]
 pub struct ChatArgs {
