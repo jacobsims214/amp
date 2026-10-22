@@ -134,8 +134,10 @@ dependencies = [
  "rpi-ai",
  "rpi-harness",
  "rpi-tui",
+ "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

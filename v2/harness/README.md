@@ -262,7 +262,7 @@ The file can also map provider ids to steps. A script that runs out fails the ru
 ## Chat (M2-7)
 
 ```sh
-amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--url URL] [--ca-file PEM] [--protocol P] [--config PATH] [--token-env VAR]
+amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--theme auto|dark|light|FILE] [--url URL] [--ca-file PEM] [--protocol P] [--config PATH] [--token-env VAR]
 ```
 
 With no subcommand, `amp-harness` opens a full-screen chat with the manager (or `--role`), built
@@ -278,8 +278,23 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
 
-This is the plain M2 shell (rpi-tui's default theme). The AMP theme, header, status line and AMP
-slash commands come in M3.
+### Theme (M3-1)
+
+The chat uses the AMP theme: `amp-dark` or `amp-light` (provisional simstech tokens v1, #1815),
+with square borders and AMP's ticket-state, epic and brand colours.
+
+| setting | flag      | env                 | `config.toml` `[tui]` | default |
+|---------|-----------|---------------------|-----------------------|---------|
+| theme   | `--theme` | `AMP_HARNESS_THEME` | `theme`               | `auto`  |
+| colours | -         | `AMP_HARNESS_COLOR` | `color`               | `auto`  |
+
+- `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
+  background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
+  file (same JSON format as `crates/amp-tui/themes/amp-dark.json`).
+- `color`: `auto` uses 24-bit colour when `COLORTERM` is `truecolor`/`24bit`, else the 256-colour
+  fallbacks. `truecolor` or `256` forces one.
+
+The header, status line and AMP slash commands come in M3.
 
 ## Roles, agents and skills (D5, D6)
 

@@ -7,7 +7,12 @@
 //! The chat needs a terminal on stdin and stdout; scripts use `run -p`. The hidden `--snapshot
 //! COLSxROWS` mode drives the same shell without a terminal: it submits each `--input` (prompts
 //! and slash commands), waits for each run to finish, and prints the final screen as plain text.
-//! The integration tests use it, and so can screenshots and M3's render checks.
+//! The integration tests use it, and so can screenshots and M3's render checks (`--ansi` keeps
+//! the colours).
+//!
+//! The AMP theme (M3-1) is installed before the shell is built: `--theme`, `AMP_HARNESS_THEME`,
+//! config.toml `[tui] theme`, else `auto` (the terminal's background via OSC 11; dark in
+//! `--snapshot`). Colour depth: `AMP_HARNESS_COLOR`, `[tui] color`, else `COLORTERM`.
 
 use std::{
     io::IsTerminal,
@@ -17,7 +22,7 @@ use std::{
 };
 
 use amp_core::{agent::Runtime, models::thinking_name};
-use amp_tui::{ModelChoice, Shell, ShellInfo, Submit};
+use amp_tui::{AmpTheme, ModelChoice, Shell, ShellInfo, Submit, ThemeSettings};
 use clap::Args;
 
 use crate::{
@@ -27,6 +32,8 @@ use crate::{
 
 /// How long `--snapshot` waits for one prompt's run.
 const SNAPSHOT_RUN_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long `--theme auto` waits for the terminal to report its background colour.
+const BACKGROUND_QUERY_TIMEOUT: Duration = Duration::from_millis(300);
 
 #[derive(Args, Debug, Default)]
 pub struct ChatArgs {
@@ -42,12 +49,19 @@ pub struct ChatArgs {
     /// ~/.local/state/amp-harness/sessions/<role>/.
     #[arg(long)]
     no_session: bool,
+    /// Colour theme: auto (by the terminal's background), dark, light, or a theme .json file
+    /// (default: AMP_HARNESS_THEME, then config.toml [tui] theme, then auto).
+    #[arg(long, value_name = "auto|dark|light|FILE")]
+    theme: Option<String>,
     /// Debug: no terminal; submit each --input, then print the screen at COLSxROWS as text.
     #[arg(long, hide = true, value_name = "COLSxROWS", value_parser = parse_size)]
     snapshot: Option<(usize, usize)>,
     /// Debug (with --snapshot): a prompt or slash command to submit. Repeatable.
     #[arg(long = "input", hide = true, requires = "snapshot")]
     inputs: Vec<String>,
+    /// Debug (with --snapshot): print the screen with its ANSI colours.
+    #[arg(long, hide = true, requires = "snapshot")]
+    ansi: bool,
 }
 
 fn parse_size(raw: &str) -> Result<(usize, usize), String> {
@@ -77,6 +91,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         ));
     }
 
+    // Before connecting, so a bad theme setting fails fast; before the shell, so every
+    // component renders in it.
+    let theme = load_theme(&args)?;
+    amp_tui::install_theme(&theme);
+
     let session = session::build(session::SessionRequest {
         conn: &args.conn,
         role: args.role.as_deref(),
@@ -103,10 +122,37 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             .await
             .map_err(CliError::new)?;
     }
-    for line in shell.view().render_plain(width, height) {
+    let lines = if args.ansi {
+        shell.view().render_frame(width, height)
+    } else {
+        shell.view().render_plain(width, height)
+    };
+    for line in lines {
         println!("{line}");
     }
     Ok(())
+}
+
+/// The theme from `--theme`, the environment and config.toml `[tui]`. `auto` asks the terminal
+/// for its background, except in `--snapshot` (no terminal), where it is dark.
+fn load_theme(args: &ChatArgs) -> Result<AmpTheme, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    let config_path = args
+        .conn
+        .config
+        .clone()
+        .or_else(|| amp_mcp::default_config_path(&env));
+    let config = config_path.and_then(|p| std::fs::read_to_string(p).ok());
+    let settings = ThemeSettings::resolve(args.theme.as_deref(), &env, config.as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))?;
+    let interactive = args.snapshot.is_none();
+    settings
+        .load(&env, || {
+            interactive
+                .then(|| amp_tui::theme::select::query_background(BACKGROUND_QUERY_TIMEOUT))
+                .flatten()
+        })
+        .map_err(|e| CliError::usage(e.to_string()))
 }
 
 fn shell_info(s: &session::Session) -> ShellInfo {
