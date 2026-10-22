@@ -1,0 +1,6 @@
+# Pinned toolchain (D13). On the dev Mac 1.98.1 is already installed; do not pull a new toolchain
+# onto the internal disk. CI installs it from this file.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
