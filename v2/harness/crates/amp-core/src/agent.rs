@@ -399,7 +399,11 @@ impl Runtime {
             HarnessTool::new(rpi_tools::create_find_tool(&ctx, None)),
             HarnessTool::new(rpi_tools::create_ls_tool(&ctx, None)),
         ];
-        tools.extend(mcp_tools::amp_tools(&self.mcp).await?);
+        // Offline (#2178: the chat opened while AMP was unreachable): no AMP tools yet;
+        // `Runtime::retarget` adds them once the connection is made.
+        if self.mcp.is_online() {
+            tools.extend(mcp_tools::amp_tools(&self.mcp).await?);
+        }
         tools.extend(spec.extra_tools);
         let policy = Arc::new(role.tool_policy(&cwd));
         let tools = filter_harness_tools(&policy, tools);

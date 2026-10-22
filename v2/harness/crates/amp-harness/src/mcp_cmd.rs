@@ -9,7 +9,7 @@ use std::{io::Read, time::Duration};
 use amp_core::tools::{parse_arguments, result_json, result_text};
 use clap::{Args, Subcommand};
 
-use crate::conn::{CliError, ConnArgs, connect, print_json};
+use crate::conn::{CliError, ConnArgs, connect_cli, print_json};
 
 #[derive(Subcommand)]
 pub enum McpCommand {
@@ -65,7 +65,7 @@ async fn call(args: CallArgs) -> Result<(), CliError> {
     };
     let arguments = parse_arguments(&raw_args).map_err(CliError::usage)?;
     let settings = args.conn.settings()?;
-    let client = connect(&settings).await?;
+    let client = connect_cli(&settings).await?;
     let result = client
         .call_tool_with_timeout(&args.tool, arguments, Duration::from_secs(args.timeout))
         .await;
@@ -96,7 +96,7 @@ struct ToolInfo {
 
 async fn tools(args: ToolsArgs) -> Result<(), CliError> {
     let settings = args.conn.settings()?;
-    let client = connect(&settings).await?;
+    let client = connect_cli(&settings).await?;
     let catalog = client.catalog().await;
     client.close().await;
     let catalog = catalog?;

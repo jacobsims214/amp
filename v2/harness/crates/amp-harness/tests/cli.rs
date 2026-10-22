@@ -598,7 +598,13 @@ async fn doctor_with_a_static_token_never_prints_it() {
     );
     let out = run(&dir, &amp.url, &["whoami"], &[]).await;
     assert_eq!(out.code, 1);
-    assert!(out.stderr.contains("AMP login required"), "{}", out.stderr);
+    // #2178: one plain sentence with the next step.
+    assert!(
+        out.stderr
+            .contains("needs you to log in (401). Run `amp-harness login --url"),
+        "{}",
+        out.stderr
+    );
 
     // With it: connected, described by its source only.
     for args in [

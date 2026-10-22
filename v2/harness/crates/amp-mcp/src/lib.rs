@@ -33,7 +33,7 @@ pub use credentials::{
     AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,
     ENV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE, credential_key, keychain_available, keychain_service,
 };
-pub use error::McpError;
+pub use error::{FailureKind, McpError};
 pub use health::Health;
 pub use http::{
     DEFAULT_OAUTH_REQUEST_TIMEOUT, OAUTH_CONNECT_TIMEOUT, build_http_client,

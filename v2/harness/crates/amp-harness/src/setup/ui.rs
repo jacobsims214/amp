@@ -42,6 +42,7 @@ fn cancelled() -> CliError {
     CliError {
         message: "setup cancelled".to_owned(),
         code: 130,
+        offline: false,
     }
 }
 

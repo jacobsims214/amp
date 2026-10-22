@@ -160,7 +160,9 @@ pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 /// One MCP connection: the rmcp service and what belongs to it. [`AmpMcpClient`] holds the current
 /// one and swaps it on a reconnect; a call keeps the connection it started on.
 struct Connection {
-    service: RunningService<RoleClient, AmpClientHandler>,
+    /// `None` for the placeholder of a client that started offline ([`AmpMcpClient::offline`]):
+    /// it reads as closed, so the first call (or [`AmpMcpClient::reconnect`]) connects.
+    service: Option<RunningService<RoleClient, AmpClientHandler>>,
     session: Arc<ServerSession>,
     catalog: Mutex<Option<Catalog>>,
     tools_changed: Arc<AtomicBool>,
@@ -168,7 +170,23 @@ struct Connection {
 
 impl Connection {
     fn is_closed(&self) -> bool {
-        self.service.is_closed() || self.service.peer().is_transport_closed()
+        match &self.service {
+            Some(service) => service.is_closed() || service.peer().is_transport_closed(),
+            None => true,
+        }
+    }
+
+    fn peer(&self) -> Result<Peer<RoleClient>, McpError> {
+        self.service
+            .as_ref()
+            .map(|s| s.peer().clone())
+            .ok_or(McpError::Closed)
+    }
+
+    fn cancel(&self) {
+        if let Some(service) = &self.service {
+            service.cancellation_token().cancel();
+        }
     }
 }
 
@@ -313,7 +331,7 @@ impl AmpMcpClient {
 
         Ok(Self {
             conn: RwLock::new(Arc::new(Connection {
-                service,
+                service: Some(service),
                 session: Arc::new(session),
                 catalog: Mutex::new(None),
                 tools_changed,
@@ -328,6 +346,49 @@ impl AmpMcpClient {
             last_attempt: Mutex::new(None),
             generation: AtomicU64::new(0),
         })
+    }
+
+    /// A client that is not connected yet (#2178: the chat opens while AMP is unreachable). It
+    /// reads as closed ([`Health::Disconnected`] with `reason`); [`Self::session`] has the URL and
+    /// nothing from the server. Set a [`Reconnector`] and the first call connects, or connect
+    /// elsewhere and [`Self::replace`]. Calls fail with [`McpError::Closed`] until then.
+    pub fn offline(options: &ClientOptions, reason: impl Into<String>) -> Self {
+        let health = HealthCell::new();
+        health.set(Health::Disconnected {
+            reason: reason.into(),
+        });
+        Self {
+            conn: RwLock::new(Arc::new(Connection {
+                service: None,
+                session: Arc::new(ServerSession {
+                    url: options.url.clone(),
+                    mode: options.protocol,
+                    protocol_version: ProtocolVersion::default(),
+                    era: Era::of(&ProtocolVersion::default()),
+                    fell_back: false,
+                    server_name: None,
+                    server_version: None,
+                    instructions: None,
+                    auth: options.auth.describe(),
+                }),
+                catalog: Mutex::new(None),
+                tools_changed: Arc::new(AtomicBool::new(false)),
+            })),
+            call_timeout: options.call_timeout,
+            catalog_default_ttl: options.catalog_default_ttl,
+            health,
+            reconnect: StdMutex::new(ReconnectConfig {
+                connector: None,
+                interval: DEFAULT_RECONNECT_INTERVAL,
+            }),
+            last_attempt: Mutex::new(None),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// False until a client made with [`Self::offline`] has connected.
+    pub fn is_online(&self) -> bool {
+        self.current().service.is_some()
     }
 
     /// The current connection. A call holds on to it until it ends, even across a swap.
@@ -370,6 +431,14 @@ impl AmpMcpClient {
 
     /// Current health. A closed transport always reads as disconnected.
     pub fn health(&self) -> Health {
+        if !self.is_online() {
+            return match self.health.get() {
+                h @ Health::Disconnected { .. } => h,
+                _ => Health::Disconnected {
+                    reason: "not connected yet".to_owned(),
+                },
+            };
+        }
         if self.is_closed() {
             return Health::Disconnected {
                 reason: "connection closed".to_owned(),
@@ -388,8 +457,14 @@ impl AmpMcpClient {
     }
 
     /// The rmcp peer of the current connection, for requests this crate does not wrap.
+    ///
+    /// # Panics
+    ///
+    /// On a client made with [`Self::offline`] that has not connected yet ([`Self::is_online`]).
     pub fn peer(&self) -> Peer<RoleClient> {
-        self.current().service.peer().clone()
+        self.current()
+            .peer()
+            .expect("peer() on an offline AMP client; check is_online() first")
     }
 
     /// How many times the connection has been replaced.
@@ -457,7 +532,7 @@ impl AmpMcpClient {
         );
         // Calls still running on the old connection fail now (TransportClosed) instead of waiting
         // out their timeout; the service ends when the last of them lets go of it.
-        old.service.cancellation_token().cancel();
+        old.cancel();
     }
 
     /// After `failed` could not be used (login required, or closed before a request was sent):
@@ -572,7 +647,7 @@ impl AmpMcpClient {
     async fn fetch_catalog(&self, conn: &Arc<Connection>) -> Result<Catalog, McpError> {
         // Cleared before the request, so a list_changed that lands mid-fetch is not lost.
         conn.tools_changed.store(false, Ordering::Release);
-        let peer = conn.service.peer().clone();
+        let peer = conn.peer()?;
         let fetch = async move {
             let fetched_at = Instant::now();
             let mut tools = Vec::new();
@@ -637,7 +712,7 @@ impl AmpMcpClient {
             }
             let operation = &operation;
             async move {
-                let peer = conn.service.peer().clone();
+                let peer = conn.peer()?;
                 self.with_timeout(&conn, operation, timeout, peer.call_tool(params))
                     .await
             }
@@ -690,10 +765,14 @@ impl AmpMcpClient {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner);
         match Arc::try_unwrap(conn) {
-            Ok(conn) => {
-                let _ = conn.service.cancel().await;
+            Ok(Connection {
+                service: Some(service),
+                ..
+            }) => {
+                let _ = service.cancel().await;
             }
-            Err(shared) => shared.service.cancellation_token().cancel(),
+            Ok(_) => {}
+            Err(shared) => shared.cancel(),
         }
     }
 }

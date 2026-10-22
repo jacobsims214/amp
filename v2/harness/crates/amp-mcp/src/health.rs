@@ -35,9 +35,8 @@ impl Health {
             Err(McpError::Closed) => Self::Disconnected {
                 reason: "connection closed".to_owned(),
             },
-            Err(e) => Self::Degraded {
-                reason: e.to_string(),
-            },
+            // A plain reason for the header and `/amp` (#2178), never rmcp's type names.
+            Err(e) => Self::Degraded { reason: e.reason() },
         }
     }
 }

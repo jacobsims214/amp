@@ -299,7 +299,11 @@ pub async fn first_run(conn: &ConnArgs, cwd: Option<&Path>) -> Result<Option<Out
         login: LoginPolicy::Ask,
         no_browser: false,
     };
-    run(&plan, ui.as_mut()).await.map(Some)
+    match run(&plan, ui.as_mut()).await {
+        // AMP is unreachable: the chat opens without it and says so (#2178).
+        Err(e) if e.offline => Ok(None),
+        other => other.map(Some),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -457,8 +461,25 @@ async fn server_step(
                 return Ok((client, settings, ask || save_flag));
             }
             Err(e) if ask && attempts < 4 && !e.is_auth_required() => {
-                ui.say(&format!("  Could not reach {}: {e}", settings.url));
+                ui.say(&format!(
+                    "  Can't reach AMP at {} ({}).",
+                    host_of(&settings.url),
+                    e.reason()
+                ));
                 ui.say("  Check the address (or that AMP is running) and try again.");
+            }
+            // The chat's first run with a server already chosen (config, AMP_MCP_URL, --url):
+            // the chat opens offline and retries (#2178) instead of stopping here.
+            Err(e)
+                if plan.mode == Mode::FirstRun
+                    && !ask
+                    && !e.is_auth_required()
+                    && e.kind() != amp_mcp::FailureKind::Config =>
+            {
+                return Err(CliError {
+                    offline: true,
+                    ..connect_error(&settings, e)
+                });
             }
             Err(e) => return Err(connect_error(&settings, e)),
         }
@@ -473,7 +494,11 @@ fn connect_error(settings: &Settings, e: McpError) -> CliError {
         };
         return CliError::new(format!("{} needs a login: {how}", settings.url));
     }
-    CliError::new(format!("could not connect to {}: {e}", settings.url))
+    CliError::new(crate::conn::connect_message_verbose(
+        &settings.url,
+        Some(&settings.auth),
+        &e,
+    ))
 }
 
 async fn connect_with_login(

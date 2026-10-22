@@ -1300,9 +1300,8 @@ impl MetaPoller {
                 let connection = if e.is_auth_required() {
                     Connection::AuthRequired
                 } else {
-                    Connection::Down {
-                        reason: e.to_string(),
-                    }
+                    // A plain reason for `/amp` (#2178), never rmcp's type names.
+                    Connection::Down { reason: e.reason() }
                 };
                 self.update(|m| m.health.connection = connection);
                 false
