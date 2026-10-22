@@ -14,6 +14,11 @@
 # Each leg: doctor --json, whoami --json, then a throwaway project (epic, story, two tickets, a
 # comment) created with the hidden `mcp call`, read back with `tickets list|get` and with `run -p` (the
 # manager on a scripted faux model calling amp_get_task), and deleted again.
+# M2-8 (#2099) adds, per leg: the manager dispatches worker-backend with amp_run_ticket (worker on its
+# own faux model, in a worktree of a throwaway git repo under target/); the worker comments and
+# completes with only task_id, and the ticket's run must carry the worker's model and tokens; a
+# worker whose script runs out leaves an abandoned run with a note; and denied calls (the manager's
+# bash, the worker writing outside its worktree) come back as visible tool errors and never run.
 # AMP has no hard delete for projects, so "deleted" means its tickets, story and epic are deleted
 # and the project is archived; the leg checks it is gone from amp_list_projects.
 #
@@ -59,15 +64,27 @@ export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/.config" XDG_STATE_HOME="$W
 export AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$WORK"
 unset AMP_HARNESS_PROFILE AMP_HARNESS_FAUX_SCRIPT
 mkdir -p "$XDG_CONFIG_HOME/amp-harness" "$WORK/project"
-# `run -p` (M2-4) uses the faux provider with a scripted model: offline, no LLM key needed.
+# `run -p` (M2-4) and dispatch (M2-8) use scripted faux models: offline, no LLM key needed. The
+# manager runs on provider `boss` and workers on `wf`, so the worker's own model is visible in the
+# runs AMP records (the faux providers call themselves "faux" in messages; compare model refs).
 cat >"$XDG_CONFIG_HOME/amp-harness/config.toml" <<'TOML'
-[providers.faux]
+[providers.boss]
 api = "faux"
-[providers.faux.models."faux-1"]
+[providers.boss.models."boss-1"]
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
 [roles.manager]
-model = "faux/faux-1"
+model = "boss/boss-1"
+[roles.worker-backend]
+model = "wf/wf-1"
 TOML
 cd "$WORK/project"
+# The manager's cwd is a throwaway git repo under target/, so workers get their worktrees at
+# target/smoke.*/project/.worktrees/<ticket> (never /tmp); the exit trap removes all of it.
+export GIT_AUTHOR_NAME=smoke GIT_AUTHOR_EMAIL=smoke@amp.local GIT_COMMITTER_NAME=smoke GIT_COMMITTER_EMAIL=smoke@amp.local
+git init -q -b main . && printf 'smoke repo\n' >README.md && git add README.md && git commit -q -m init ||
+  die "could not make the throwaway git repo"
 
 # --- per-leg state + cleanup ----------------------------------------------------------------------
 LEG="" LEG_URL="" LEG_PROTO="" LEG_TOKEN="" LEG_CA=""
@@ -138,6 +155,97 @@ on_exit() {
 }
 trap on_exit EXIT
 trap 'exit 130' INT TERM
+
+# --- dispatch, abandoned run, policy deny (M2-8) -----------------------------------------------
+# runs_of TASK: the ticket with its comments and runs.
+runs_of() { call amp_get_task "{\"task_id\":$1,\"include\":[\"comments\",\"runs\"]}"; }
+
+# dispatch_cases TICKET: needs .amp.json for the leg's project. TICKET must be ready.
+dispatch_cases() {
+  local t2="$1" t3 out report
+
+  # 1. The manager (faux `boss`) first tries a bash command its policy denies, then dispatches
+  #    worker-backend on TICKET with amp_run_ticket. The worker (faux `wf`, its own model, in its
+  #    own worktree) reads the ticket, tries to write outside its worktree (denied), comments and
+  #    completes with only task_id: the harness fills model and tokens (M2-6).
+  jq -nc --argjson t "$t2" '{
+    boss: [
+      {tool_calls: [{name: "bash", arguments: {command: "touch denied-by-policy"}}]},
+      {tool_calls: [{name: "amp_run_ticket", arguments: {task_id: $t, agent_id: "amp:amp-worker-backend"}}]},
+      {text: "Worker report: {{last_tool_result}}"}],
+    wf: [
+      {tool_calls: [{name: "amp_get_task", arguments: {task_id: $t}}]},
+      {tool_calls: [{name: "write", arguments: {path: "../escape.txt", content: "must not be written"}}]},
+      {tool_calls: [{name: "amp_add_task_comment", arguments: {task_id: $t, body: "smoke worker comment", author: "amp-worker"}}]},
+      {tool_calls: [{name: "amp_complete_task", arguments: {task_id: $t}}]},
+      {text: "Done."}]}' >"$WORK/dispatch.json"
+  out="$(AMP_HARNESS_FAUX_SCRIPT="$WORK/dispatch.json" h run -p "Run ticket #$t2" --json --no-session)" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] dispatch: run -p failed"
+  }
+  # Policy deny: the manager sees a tool error naming the policy, the command never ran, the run went on.
+  jq -s -e '
+      (.[-1] | .type == "result" and .outcome == "completed" and .tools_used == ["bash", "amp_run_ticket"]) and
+      ([.[] | select(.type == "tool_end" and .name == "bash")][0]
+        | .is_error == true and (.text | contains("Denied by the amp-manager tool policy")))' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] policy deny: expected a visible denial of the manager's bash call"
+  }
+  [[ ! -e denied-by-policy ]] || die "[$LEG] policy deny: the denied bash command ran"
+  report="$(jq -s -c '[.[] | select(.type == "tool_end" and .name == "amp_run_ticket")][0]' <<<"$out")"
+  jq -e --argjson t "$t2" '.is_error == false and (.text | fromjson
+      | .task_id == $t and .outcome == "completed" and .agent_id == "amp:amp-worker-backend"
+        and .model == "wf/wf-1" and .tool_errors == 1 and (.worktree | type == "string")
+        and .usage.input_tokens > 0)' >/dev/null <<<"$report" || {
+    printf '%s\n' "$report" | head -c 4000 >&2
+    die "[$LEG] dispatch: amp_run_ticket did not report a completed worker on wf/wf-1 with one denied call"
+  }
+  local wt
+  wt="$(jq -r '.text | fromjson | .worktree' <<<"$report")"
+  [[ "$wt" == "$WORK/project/.worktrees/$t2" || "$wt" == "$(cd "$WORK/project" && pwd -P)/.worktrees/$t2" ]] ||
+    die "[$LEG] dispatch: worker worktree $wt is not under the throwaway repo"
+  [[ ! -e "$(dirname "$wt")/escape.txt" ]] || die "[$LEG] policy deny: the worker wrote outside its worktree"
+  out="$(runs_of "$t2")"
+  jq -e '(.task.state == "completed") and ([.comments[]? | .body] | index("smoke worker comment")) != null and
+      ([.runs[]? | select(.outcome == "completed" and .model == "wf/wf-1"
+        and ((.input_tokens // 0) + (.output_tokens // 0)) > 0)] | length) == 1' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] dispatch: expected ticket $t2 completed, the worker comment, and a completed run on wf/wf-1 with tokens"
+  }
+  log "[$LEG] dispatch ok: worker-backend on wf/wf-1 completed #$t2 (run has model and tokens); policy denials visible"
+
+  # 2. Abandoned run: the worker's script runs out after one step, so it ends as `error` without
+  #    closing its ticket, and the harness reports an abandoned run with a note.
+  out="$(call amp_create_tasks "$(jq -nc --argjson p "$P_ID" --argjson s "$STORY_ID" '{project_id:$p, tasks:[
+      {ref:"third", story_id:$s, name:"smoke ticket three", description:"Throwaway; its worker gives up.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend"}]}')")"
+  t3="$(jq -r '.created[]? | select(.ref == "third") | .id' <<<"$out")"
+  [[ "$t3" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_tasks: no id for ticket three"
+  TASK_IDS+=("$t3")
+  jq -nc --argjson t "$t3" '{
+    boss: [
+      {tool_calls: [{name: "amp_run_ticket", arguments: {task_id: $t, agent_id: "amp:amp-worker-backend"}}]},
+      {text: "Worker report: {{last_tool_result}}"}],
+    wf: [{tool_calls: [{name: "amp_get_task", arguments: {task_id: $t}}]}]}' >"$WORK/abandon.json"
+  out="$(AMP_HARNESS_FAUX_SCRIPT="$WORK/abandon.json" h run -p "Run ticket #$t3" --json --no-session)" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] abandoned: run -p failed"
+  }
+  report="$(jq -s -c '[.[] | select(.type == "tool_end" and .name == "amp_run_ticket")][0]' <<<"$out")"
+  jq -e '.is_error == false and (.text | fromjson | .outcome == "error"
+      and ([.notes[]? | select(test("amp_report_run|abandoned"; "i"))] | length) > 0)' >/dev/null <<<"$report" || {
+    printf '%s\n' "$report" | head -c 4000 >&2
+    die "[$LEG] abandoned: expected the worker to end as error with a run-report note"
+  }
+  out="$(runs_of "$t3")"
+  jq -e '(.task.state == "in_progress") and
+      ([.runs[]? | select(.outcome == "abandoned" and .model == "wf/wf-1" and .agent_id == "amp:amp-worker-backend"
+        and (.note | startswith("abandoned: error:") and (startswith("abandoned: error: error") | not))
+        and ((.input_tokens // 0) + (.output_tokens // 0)) > 0)] | length) == 1' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] abandoned: expected one abandoned run on #$t3 with a note, the worker model and tokens"
+  }
+  log "[$LEG] abandoned ok: #$t3 has an abandoned run ($(jq -r '[.runs[] | select(.outcome == "abandoned")][0].note' <<<"$out" | cut -c1-80))"
+}
 
 # --- one leg --------------------------------------------------------------------------------------
 # run_leg NAME URL PROTOCOL TOKEN CA EXPECT_EMAIL ('' = any)
@@ -257,6 +365,8 @@ run_leg() {
     die "[$LEG] run -p: expected the manager to read ticket $t2 with amp_get_task"
   }
   log "[$LEG] run -p ok: the manager called amp_get_task on the faux model"
+
+  dispatch_cases "$t2"
 
   # A tool error exits 1 with the message on stderr.
   rc=0
