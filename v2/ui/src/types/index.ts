@@ -78,6 +78,8 @@ export interface Task {
   human_reason?: HumanReason
   /** when it last became ready: ready → started is time waiting to be picked up */
   ready_at?: string
+  /** when its scope (name, description, acceptance criteria) was last set; newer than the plan's approval = awaiting approval */
+  planned_at?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
   created_at: string
@@ -123,6 +125,8 @@ export interface PlanReport {
   ok: boolean
   /** open tickets planned since the plan was last approved */
   awaiting_approval?: number[]
+  /** the Flight plan page where a person approves, when tickets await approval */
+  approve_url?: string
   plan_approved_at?: string
   plan_approved_by?: number
   require_plan_approval?: boolean
@@ -298,6 +302,7 @@ export interface SSEEvent {
     | 'project.created'
     | 'project.archived'
     | 'project.restored'
+    | 'project.updated'
     | 'epic.created'
     | 'epic.state_changed'
     | 'story.created'
