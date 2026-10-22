@@ -117,6 +117,12 @@ amp-harness logout [--url URL]
   before expiry, and once more if the server rejects the token), then no credentials. When the
   refresh token is rejected, calls fail with "AMP login required: run `amp-harness login`" and
   health reads `re-login needed`.
+- Re-login without a restart (#2156, #2159): run `amp-harness login` in another terminal. The chat's
+  header reconnects within 15 s, and so does the session's own connection (the agent's `amp_*`
+  tools, run reporting, workers): the next call after the login reconnects from the store, at most
+  once every 15 s, and runs on the new connection. A call still running on the old connection fails
+  as a tool error ("connection was replaced"), never hangs. With `AMP_TOKEN` nothing reconnects: set
+  a new token and restart.
 - docker-desktop cluster: the cluster's protected-resource metadata names `https://amp.local/mcp`
   and the authorization server `https://amp.local/mcp-oauth` (port 443). rmcp requires the resource
   to match the URL you log in to (RFC 9728), so log in to `https://amp.local/mcp` with envoy

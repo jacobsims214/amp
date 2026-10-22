@@ -743,6 +743,74 @@ async fn re_login_needed_heals_by_reconnecting_through_the_connector() {
     assert_eq!(meta.snapshot().health.connection, Connection::Ok);
 }
 
+/// #2159: the session's own client (the model's amp_* tools, run reporting, the supervisor all
+/// share it) heals after `amp-harness login` the same way the poller does: the next tool call
+/// after the login reconnects through its reconnector and runs on the new connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_models_amp_tools_heal_after_a_re_login() {
+    use amp_core::mcp_tools::McpTool;
+    use rpi_agent::{AgentTool, ToolResultPartial};
+    use tokio_util::sync::CancellationToken;
+
+    let old = serve(Mock::new(default_board())).await;
+    let new = serve(Mock::new(default_board())).await;
+    let shared = client(&old.url).await;
+    let logged_in = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let reconnector: Connector = {
+        let (old_url, new_url) = (old.url.clone(), new.url.clone());
+        let (logged_in, attempts) = (logged_in.clone(), attempts.clone());
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let url = if logged_in.load(Ordering::SeqCst) {
+                new_url.clone()
+            } else {
+                old_url.clone()
+            };
+            Box::pin(async move {
+                AmpMcpClient::connect(
+                    ClientOptions::new(url).with_connect_timeout(Duration::from_secs(2)),
+                )
+                .await
+            })
+        })
+    };
+    // The poller's Connector and the client's Reconnector are the same closure type.
+    shared.set_reconnector(Some(reconnector));
+    let interval = Duration::from_millis(300);
+    shared.set_reconnect_interval(interval);
+    let catalog = shared.catalog().await.expect("catalog");
+    let tool = McpTool::new(
+        catalog.get("amp_whoami").expect("amp_whoami"),
+        shared.clone(),
+    );
+    async fn run(tool: &McpTool) -> Result<AgentToolResult, rpi_agent::AgentError> {
+        tool.execute(
+            "call-1",
+            json!({}),
+            CancellationToken::new(),
+            Arc::new(|_: ToolResultPartial| {}),
+        )
+        .await
+    }
+    run(&tool).await.expect("works before");
+
+    old.mock.unauthorized.store(true, Ordering::SeqCst);
+    let err = run(&tool).await.unwrap_err();
+    assert!(err.to_string().contains("amp-harness login"), "{err}");
+
+    logged_in.store(true, Ordering::SeqCst);
+    tokio::time::sleep(interval).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), run(&tool))
+        .await
+        .expect("no hang")
+        .expect("the same tool works again after the login");
+    assert!(!format!("{:?}", result.content).is_empty());
+    assert_eq!(new.mock.count("amp_whoami"), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(shared.generation(), 1);
+}
+
 /// #2108: a ticket that doesn't exist is that item's error (the header shows it unavailable); the
 /// connection stays healthy. Slash commands' own calls run on the poller's connection.
 #[tokio::test(flavor = "multi_thread")]

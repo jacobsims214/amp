@@ -68,7 +68,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         .and_then(|p| p.path.parent().map(PathBuf::from));
 
     let settings = req.conn.settings()?;
-    let client = Arc::new(conn::connect(&settings).await?);
+    // Heals itself after `amp-harness login` (#2159); everyone below shares this one client.
+    let client = Arc::new(conn::connect_session(&settings).await?);
     let env = |k: &str| std::env::var(k).ok();
     let keys = SystemKeys::from_env();
     let rt = Arc::new(

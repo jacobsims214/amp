@@ -64,6 +64,14 @@ pub enum McpError {
     /// The connection is closed; reconnect.
     #[error("MCP connection is closed")]
     Closed,
+
+    /// The connection was replaced (a reconnect after `amp-harness login`, or a server switch)
+    /// while this request was running, and the old one was closed under it. The request may or
+    /// may not have reached the server, so it is not retried.
+    #[error(
+        "{operation}: the AMP connection was replaced while this call ran (re-login or server switch); it may or may not have run, so check before retrying"
+    )]
+    Replaced { operation: String },
 }
 
 impl McpError {
