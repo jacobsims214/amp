@@ -283,7 +283,7 @@ async fn amp_commands_with_the_metadata_poller() {
         "/project/2/board?task=2085: --snapshot does not open a browser",
         // /workers: the board's in-progress ticket, run elsewhere.
         "AMP · workers",
-        "■ elsewhere #2085 M1-4 CLI worker-backend",
+        "■ In progress #2085 M1-4 CLI · amp:amp-worker-backend · elsewhere",
     ] {
         assert!(screen.contains(want), "missing {want:?} in\n{screen}");
     }
