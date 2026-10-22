@@ -327,10 +327,25 @@ impl ChatView {
     }
 
     /// The person's own message. Sending one jumps back to the latest output, so it is in view.
+    ///
+    /// Every bubble sits one blank row away from what comes before it (the banner and notices
+    /// end with one already) and from the reply after it ([`Self::start_assistant`] gives the
+    /// reply a gap), so the first message and later ones look the same (#2188).
     pub fn add_user(&self, text: &str) {
         self.end_group();
-        self.transcript.add_child(Arc::new(UserBlock::new(text)));
+        let block = UserBlock::new(text).with_margin_above(!self.transcript_ends_blank());
+        self.transcript.add_child(Arc::new(block));
         self.scroll.to_end();
+    }
+
+    /// Whether the transcript's last row is blank (or there is nothing yet).
+    fn transcript_ends_blank(&self) -> bool {
+        for child in self.transcript.get_children().iter().rev() {
+            if let Some(last) = child.render(80).last() {
+                return rpi_tui::strip_ansi(last).trim().is_empty();
+            }
+        }
+        true
     }
 
     /// A dim one-off line in the transcript (command output, run outcome).
@@ -338,8 +353,11 @@ impl ChatView {
         self.end_group();
         let colors = theme().colors;
         self.scroll.touch();
-        self.transcript
-            .add_child(Arc::new(WrapText::new(colors.dim.fg(text), 1, 1)));
+        self.transcript.add_child(Arc::new(WrapText::new(
+            theme_glyphs(text, colors.dim),
+            1,
+            1,
+        )));
     }
 
     /// An error line in the transcript.
@@ -347,8 +365,11 @@ impl ChatView {
         self.end_group();
         let colors = theme().colors;
         self.scroll.touch();
-        self.transcript
-            .add_child(Arc::new(WrapText::new(colors.error.fg(text), 1, 1)));
+        self.transcript.add_child(Arc::new(WrapText::new(
+            theme_glyphs(text, colors.error),
+            1,
+            1,
+        )));
     }
 
     /// Shows or hides pi's working spinner in the editor's top border.
@@ -540,6 +561,15 @@ impl ChatView {
 
     fn start_assistant(&mut self) -> Arc<AssistantBlock> {
         let component = Arc::new(AssistantBlock::with_thinking(self.show_thinking));
+        // A reply right under the person's bubble keeps a blank row from it (#2188).
+        if self
+            .transcript
+            .get_children()
+            .last()
+            .is_some_and(|c| c.as_any().is::<UserBlock>())
+        {
+            component.set_gap_above();
+        }
         self.transcript.add_child(component.clone());
         // It goes below the open tool group; if it shows anything, the next call starts a new
         // group under it.
@@ -695,4 +725,38 @@ fn blocks(m: &AssistantMessage) -> Vec<Block> {
             _ => None,
         })
         .collect()
+}
+
+/// `text` in `base`, with the emoji status glyphs a system line may carry (`✅`, `❌`, `⚠️`)
+/// mapped to the theme's `✓`, `✗` and `⚠` in the success, error and warning colours: the emoji
+/// render wider and heavier than the rest of the UI (#2188).
+pub fn theme_glyphs(text: &str, base: rpi_tui::theme::Color) -> String {
+    let colors = theme().colors;
+    let mut out = String::new();
+    let mut run = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let glyph = match c {
+            '✅' | '✔' => Some(colors.success.fg("✓")),
+            '❌' | '✖' => Some(colors.error.fg("✗")),
+            '⚠' => Some(colors.warning.fg("⚠")),
+            _ => None,
+        };
+        match glyph {
+            Some(g) => {
+                if chars.peek() == Some(&'\u{fe0f}') {
+                    chars.next();
+                }
+                if !run.is_empty() {
+                    out.push_str(&base.fg(&std::mem::take(&mut run)));
+                }
+                out.push_str(&g);
+            }
+            None => run.push(c),
+        }
+    }
+    if !run.is_empty() || out.is_empty() {
+        out.push_str(&base.fg(&run));
+    }
+    out
 }

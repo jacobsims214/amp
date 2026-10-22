@@ -155,7 +155,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Group::Chat,
         "model",
         "[provider/model]",
-        "the model; switch it for this session",
+        "pick the model for this session",
     ),
     CommandSpec::new(
         Group::Chat,
@@ -165,7 +165,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new(Group::Chat, "usage", "", "tokens and cost this session"),
     CommandSpec::new(Group::Chat, "abort", "", "stop the reply"),
-    CommandSpec::new(Group::Chat, "close", "", "close the AMP panel"),
+    CommandSpec::new(Group::Chat, "close", "", "close the open panel"),
     CommandSpec::new(Group::Chat, "help", "", "this list").aliases(&["?"]),
     CommandSpec::new(Group::Chat, "quit", "", "leave the chat").aliases(&["exit", "q"]),
 ];

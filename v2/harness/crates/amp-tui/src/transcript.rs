@@ -9,9 +9,13 @@
 //! - [`WrapMarkdown`]: rpi's own `Markdown` renders the text, but prose is rendered at an
 //!   unbounded width (rpi's markdown is line-based, so each source line becomes one row) and then
 //!   word-wrapped here, with list continuations under the item's text and quote borders
-//!   repeated. Fenced code and rules are width-dependent and keep rpi's rendering at the real
-//!   width (a long code line still wraps, so it stays copyable). Tables are drawn by
-//!   [`crate::table`] (#2180): box glyphs, padded cells, wrapped to fit or listed per row.
+//!   repeated. Inline code chips lose rpi's space padding: the chip's background alone marks
+//!   it, so no gap shows before punctuation (#2188). Fenced code is drawn here the way rpi draws
+//!   it (rpi's highlighter, its surface and indent), hard-wrapped by [`crate::wrap::hard_wrap`]
+//!   so a long line still copies whole: rpi's own wrap replays a truecolor colour's `r;g;b` as
+//!   separate SGR codes on the continuation row (dim, a bright background...), #2188. Rules
+//!   and Mermaid keep rpi's rendering at the real width. Tables are drawn by [`crate::table`]
+//!   (#2180): box glyphs, padded cells, wrapped to fit or listed per row.
 //! - [`AssistantBlock`]: an assistant message's text and thinking blocks, and its error line.
 //! - [`ThinkingBlock`]: a thinking section, collapsed to one live `Thinking · 18s ▸` line by
 //!   default (#2177); expanded, plain dim text behind a `│` gutter ([`ThinkingDisplay`]).
@@ -35,7 +39,7 @@ use rpi_tui::{
 };
 
 use crate::table;
-use crate::wrap::{open_sgr as open_style, plain, reflow_row};
+use crate::wrap::{hard_wrap, open_sgr as open_style, plain, reflow_row};
 
 /// The width prose is rendered at before it is word-wrapped: wide enough that rpi never wraps.
 const UNBOUNDED: usize = 1 << 20;
@@ -194,6 +198,7 @@ impl WrapMarkdown {
                 .iter()
                 .map(|r| r.trim_end().to_owned())
                 .filter(|r| !plain(r).trim().is_empty())
+                .map(|r| unpad_code_chips(&r))
                 .collect::<Vec<_>>()
                 .join(" ")
         };
@@ -205,6 +210,96 @@ impl WrapMarkdown {
         };
         table::render(&t, width.saturating_sub(self.padding_x), &style, &inline)
     }
+}
+
+impl WrapMarkdown {
+    /// Fenced code, rules and Mermaid at `width`. Code fences (not Mermaid) are drawn by
+    /// [`code_rows`]; the rest is left to rpi's `Markdown`.
+    fn block(&self, src: &str, width: usize) -> Vec<String> {
+        let lines: Vec<&str> = src.lines().collect();
+        let mut out = Vec::new();
+        let mut other: Vec<&str> = Vec::new();
+        let flush = |other: &mut Vec<&str>, out: &mut Vec<String>| {
+            if !other.is_empty() {
+                out.extend(self.markdown(other.join("\n")).render(width));
+                other.clear();
+            }
+        };
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            let Some(ch) = fence(line) else {
+                other.push(line);
+                i += 1;
+                continue;
+            };
+            let lang = line.trim_start()[3..].trim().to_ascii_lowercase();
+            // The block runs to the matching fence (or the end, while it streams).
+            let mut end = i + 1;
+            while end < lines.len() && fence(lines[end]) != Some(ch) {
+                end += 1;
+            }
+            let close = (end + 1).min(lines.len());
+            if lang == "mermaid" {
+                other.extend_from_slice(&lines[i..close]);
+            } else {
+                flush(&mut other, &mut out);
+                out.extend(code_rows(&lang, &lines[i + 1..end], width, self.padding_x));
+            }
+            i = close;
+        }
+        flush(&mut other, &mut out);
+        out
+    }
+}
+
+/// rpi's `code_block_indent` (Markdown's default).
+const CODE_INDENT: usize = 2;
+
+/// A fenced code block's rows, as rpi's `Markdown` draws them (`push_code_line`): each line
+/// highlighted by rpi's highlighter, then `pad` + indent + the code surface (one cell of
+/// inset, filled to the width). A line wider than the surface is hard-wrapped by
+/// [`hard_wrap`], which re-opens truecolor styles whole on the continuation row (rpi 0.8.0's
+/// `wrap_text_with_ansi` replays `38;2;r;g;b` as separate codes there, #2188). Streamed
+/// partial closing fences (a line of 1-2 fence characters) are skipped, as rpi does.
+fn code_rows(lang: &str, code: &[&str], width: usize, padding_x: usize) -> Vec<String> {
+    let colors = theme().colors;
+    let mut highlighter = rpi_tui::syntax_highlight::Highlighter::new(lang);
+    let pad = " ".repeat(padding_x);
+    let indent = " ".repeat(CODE_INDENT);
+    let cwidth = width.saturating_sub(padding_x * 2);
+    let panel_width = cwidth.saturating_sub(CODE_INDENT).max(1);
+    let body_width = panel_width.saturating_sub(2).max(1);
+    let mut out = Vec::new();
+    for line in code {
+        let t = line.trim();
+        if !t.is_empty() && t.len() <= 2 && t.chars().all(|c| c == '`' || c == '~') {
+            continue;
+        }
+        let expanded = line.replace('\t', "    ");
+        let styled = highlighter.highlight(&expanded, &colors);
+        for chunk in hard_wrap(&styled, body_width) {
+            let body = apply_background_to_line(&format!(" {chunk}"), panel_width, |text| {
+                colors.md_code_block_bg.bg(text)
+            });
+            out.push(format!("{pad}{indent}{body}"));
+        }
+    }
+    out
+}
+
+/// Drops the space rpi's `Markdown` puts on each side of an inline code chip
+/// (`bg(" " + fg(code) + " ")`), so the chip is marked by its background alone and no gap shows
+/// before the punctuation after it (`amp_check_plan:`), #2188.
+pub fn unpad_code_chips(row: &str) -> String {
+    let colors = theme().colors;
+    let bg = colors.md_code_bg.to_bg();
+    let fg = colors.md_code.to_fg();
+    if !row.contains(&bg) {
+        return row.to_owned();
+    }
+    row.replace(&format!("{bg} {fg}"), &format!("{bg}{fg}"))
+        .replace(&format!("\x1b[0m{bg} \x1b[0m"), "\x1b[0m")
 }
 
 /// Escapes what would make a cell's text render as a block (a heading, list item, quote, rule
@@ -242,10 +337,10 @@ impl Component for WrapMarkdown {
                 match segment {
                     Segment::Prose(s) => {
                         for row in self.markdown(s).render(UNBOUNDED) {
-                            lines.extend(reflow_row(&row, text_width));
+                            lines.extend(reflow_row(&unpad_code_chips(&row), text_width));
                         }
                     }
-                    Segment::Block(s) => lines.extend(self.markdown(s).render(width)),
+                    Segment::Block(s) => lines.extend(self.block(&s, width)),
                     Segment::Table(s) => lines.extend(self.table(&s, width)),
                 }
             }
@@ -788,7 +883,8 @@ impl AssistantBlock {
         thinking.truncate(section);
     }
 
-    /// Replaces the content with pi's error line (`❌ Error: …`, `❌ Operation aborted: …`).
+    /// Replaces the content with the error line: pi's (`❌ Error: …`), with the emoji mapped to
+    /// the theme's `✗` in the error colour (#2188).
     pub fn update_error(&self, error: &str, stop_reason: &str) {
         if let Ok(mut b) = self.blocks.lock() {
             b.clear();
@@ -798,11 +894,14 @@ impl AssistantBlock {
         }
         self.content.clear();
         self.content.add_child(Arc::new(Spacer::new(1)));
+        let colors = theme().colors;
         let text = match stop_reason {
-            "aborted" => format!("❌ Operation aborted: {error}"),
-            "error" => format!("❌ Error: {error}"),
-            "length" => "⚠️ Response was truncated before completion.".to_owned(),
-            _ => format!("❌ {error}"),
+            "aborted" => colors.error.fg(&format!("✗ Operation aborted: {error}")),
+            "error" => colors.error.fg(&format!("✗ Error: {error}")),
+            "length" => colors
+                .warning
+                .fg("! Response was truncated before completion."),
+            _ => colors.error.fg(&format!("✗ {error}")),
         };
         self.content
             .add_child(Arc::new(WrapText::new(text, Self::PAD, 0)));
@@ -842,6 +941,8 @@ const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
 pub struct UserBlock {
     text: String,
     inner: Mutex<(u64, BgBox)>,
+    /// A blank row above the bubble, when what comes before it doesn't end with one (#2188).
+    margin_above: bool,
 }
 
 fn user_box(text: &str) -> BgBox {
@@ -856,7 +957,17 @@ impl UserBlock {
     pub fn new(text: impl Into<String>) -> Self {
         let text = text.into();
         let inner = Mutex::new((theme_revision(), user_box(&text)));
-        Self { text, inner }
+        Self {
+            text,
+            inner,
+            margin_above: false,
+        }
+    }
+
+    /// Puts a blank row above the bubble (see [`crate::view::ChatView::add_user`]).
+    pub fn with_margin_above(mut self, margin: bool) -> Self {
+        self.margin_above = margin;
+        self
     }
 }
 
@@ -876,6 +987,9 @@ impl Component for UserBlock {
         }
         if let Some(last) = lines.last_mut() {
             last.insert_str(0, &format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}"));
+        }
+        if self.margin_above && !lines.is_empty() {
+            lines.insert(0, String::new());
         }
         lines
     }
@@ -1431,12 +1545,13 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                " ┌────┬───────────┬────────┐",
-                " │  # │ Ticket    │ State  │",
-                " ├────┼───────────┼────────┤",
-                " │  1 │ Say hello │  done  │",
-                " │ 22 │ Plan      │ ready  │",
-                " └────┴───────────┴────────┘",
+                // #2188: the `done` chip has no space padding.
+                " ┌────┬───────────┬───────┐",
+                " │  # │ Ticket    │ State │",
+                " ├────┼───────────┼───────┤",
+                " │  1 │ Say hello │ done  │",
+                " │ 22 │ Plan      │ ready │",
+                " └────┴───────────┴───────┘",
             ]
         );
     }

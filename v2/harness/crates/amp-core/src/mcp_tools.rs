@@ -122,9 +122,13 @@ pub fn model_text(result: &CallToolResult) -> String {
         .count();
     match (text.trim().is_empty(), others) {
         (_, 0) => text,
-        (true, n) => format!("[{n} non-text content block(s)]"),
-        (false, n) => format!("{text}\n[{n} non-text content block(s)]"),
+        (true, n) => format!("[{n} non-text content {}]", blocks(n)),
+        (false, n) => format!("{text}\n[{n} non-text content {}]", blocks(n)),
     }
+}
+
+fn blocks(n: usize) -> &'static str {
+    if n == 1 { "block" } else { "blocks" }
 }
 
 fn arguments(params: Value) -> Result<Option<JsonObject>, AgentError> {
@@ -193,9 +197,9 @@ mod tests {
         assert_eq!(model_text(&text_result(r#"{"a":1}"#)), r#"{"a":1}"#);
         let image = ContentBlock::image("aGk=", "image/png");
         let r = CallToolResult::success(vec![image.clone()]);
-        assert_eq!(model_text(&r), "[1 non-text content block(s)]");
+        assert_eq!(model_text(&r), "[1 non-text content block]");
         let r = CallToolResult::success(vec![ContentBlock::text("x"), image]);
-        assert_eq!(model_text(&r), "x\n[1 non-text content block(s)]");
+        assert_eq!(model_text(&r), "x\n[1 non-text content block]");
     }
 
     #[test]

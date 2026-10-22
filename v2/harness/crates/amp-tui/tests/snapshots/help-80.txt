@@ -10,11 +10,11 @@
    /server [name|address]   the AMP servers; switch to another
 
  Chat
-   /model [provider/model]  the model; switch it for this session
+   /model [provider/model]  pick the model for this session
    /connect [provider]      model providers and their keys; add a key
    /usage                   tokens and cost this session
    /abort                   stop the reply
-   /close                   close the AMP panel
+   /close                   close the open panel
    /help                    this list
    /quit                    leave the chat
 
