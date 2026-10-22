@@ -598,13 +598,14 @@ fn ticket_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
             flex(&path, c.muted),
         ]));
     }
+    // The state mark above carries the colour; the reason itself is ink, under the web's word.
     if let Some(reason) = &t.block_reason {
-        let color = if t.status == Status::Question {
-            p.state(Status::Question).text
+        let (word, color) = if t.status == Status::Question {
+            ("question", c.text)
         } else {
-            c.muted
+            ("waiting ", c.muted)
         };
-        rows.push(Row::new(vec![label("blocked "), flex(reason, color)]));
+        rows.push(Row::new(vec![label(word), flex(reason, color)]));
     }
     rows.push(Row::new(vec![
         label("AMP     "),
@@ -785,7 +786,6 @@ fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
 fn question_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
     let c = colors();
     let m = &data.meta;
-    let q = p.state(Status::Question);
     match &state.stage {
         Stage::Answer { ticket, question } => {
             let mut rows = vec![Row::new(vec![
@@ -793,7 +793,7 @@ fn question_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<R
                 fixed(ticket_id(m, *ticket)),
                 flex(&name_of_question(data, *ticket), c.text),
             ])];
-            rows.push(Row::new(vec![Piece::Flex(question.clone(), q.text)]).indent(2));
+            rows.push(Row::new(vec![Piece::Flex(question.clone(), c.text)]).indent(2));
             rows.push(Row::new(vec![flex(
                 "type the answer in the editor below and press Enter; nothing is sent until you confirm",
                 c.muted,
@@ -851,7 +851,8 @@ fn question_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<R
                 question: Some(clean(&question.question)),
             }),
         );
-        rows.push(Row::new(vec![flex(&question.question, q.text)]).indent(5));
+        // The QUESTION chip carries the state; the question itself reads in ink, not red.
+        rows.push(Row::new(vec![flex(&question.question, c.text)]).indent(5));
     }
     rows
 }
@@ -1345,6 +1346,70 @@ mod tests {
         );
         // The compact list (no buckets of tickets) is not a split.
         assert_eq!(blocked_split(&json!({"waiting": 1, "scheduled": 1})), None);
+    }
+
+    /// #2153: question text is ink (the theme's `text`), never the Question state's red; the
+    /// QUESTION chip and the state mark carry the state. `/ticket` labels the row `question`.
+    #[test]
+    fn question_text_is_ink_and_the_ticket_row_says_question() {
+        let p = crate::theme::palette();
+        let c = colors();
+        let red = p.state(Status::Question).text;
+        assert_ne!(red, c.text, "the test needs ink and red to differ");
+        let line_with = |lines: &[String], text: &str| {
+            lines
+                .iter()
+                .find(|l| chrome::plain(l).contains(text))
+                .cloned()
+                .unwrap_or_else(|| panic!("{text}: {lines:?}"))
+        };
+
+        let data = chrome::sample::data(true);
+        let lines = render_panel(&PanelState::new(PanelKind::Questions), Some(&data), &p, 100);
+        for text in ["Overlay or inline?", "README or KB?"] {
+            let line = line_with(&lines, text);
+            assert!(line.contains(&c.text.fg(text)), "{line:?}");
+            assert!(!line.contains(&red.fg(text)), "{line:?}");
+        }
+        // The chip still carries the state.
+        assert!(chrome::plain(&line_with(&lines, "#2107")).contains("QUESTION"));
+
+        // Answering shows the question in ink too.
+        let mut answering = PanelState::new(PanelKind::Questions);
+        answering.stage = Stage::Answer {
+            ticket: 2107,
+            question: "Overlay or inline?".to_owned(),
+        };
+        let lines = render_panel(&answering, Some(&data), &p, 100);
+        let line = line_with(&lines, "Overlay or inline?");
+        assert!(line.contains(&c.text.fg("Overlay or inline?")), "{line:?}");
+
+        // /ticket on a question: the row is labelled `question`, its text in ink.
+        let mut meta = chrome::sample::meta(true);
+        let t = meta.ticket.value.as_mut().expect("sample ticket");
+        t.state = "blocked".to_owned();
+        t.status = Status::Question;
+        t.block_reason = Some("Dark or light?".to_owned());
+        let data = ChromeData::new(meta.clone());
+        let lines = render_panel(&PanelState::new(PanelKind::Ticket), Some(&data), &p, 100);
+        let line = line_with(&lines, "Dark or light?");
+        assert!(line.contains(&c.dim.fg("question")), "{line:?}");
+        assert!(line.contains(&c.text.fg("Dark or light?")), "{line:?}");
+        assert!(!line.contains(&red.fg("Dark or light?")), "{line:?}");
+        assert!(!chrome::plain(&line).contains("blocked"), "{line:?}");
+
+        // A waiting ticket with a reason keeps a muted row, labelled `waiting`.
+        let t = meta.ticket.value.as_mut().expect("sample ticket");
+        t.status = Status::Waiting;
+        t.block_reason = Some("needs #2152".to_owned());
+        let data = ChromeData::new(meta);
+        let lines = render_panel(&PanelState::new(PanelKind::Ticket), Some(&data), &p, 100);
+        let line = line_with(&lines, "needs #2152");
+        assert!(
+            chrome::plain(&line).contains("waiting  needs #2152"),
+            "{line:?}"
+        );
+        assert!(line.contains(&c.muted.fg("needs #2152")), "{line:?}");
     }
 
     #[test]
