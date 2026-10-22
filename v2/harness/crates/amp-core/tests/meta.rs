@@ -69,6 +69,8 @@ struct Mock {
     delay_ms: Arc<AtomicU64>,
     /// Reject every HTTP request with 401.
     unauthorized: Arc<AtomicBool>,
+    /// HTTP requests seen, rejected ones included.
+    requests: Arc<AtomicU64>,
 }
 
 impl Mock {
@@ -79,6 +81,7 @@ impl Mock {
             fail: Arc::default(),
             delay_ms: Arc::default(),
             unauthorized: Arc::default(),
+            requests: Arc::default(),
         }
     }
 
@@ -260,10 +263,12 @@ async fn serve(mock: Mock) -> Running {
         StreamableHttpServerConfig::default().with_json_response(true),
     );
     let flag = mock.unauthorized.clone();
+    let requests = mock.requests.clone();
     let app = axum::Router::new()
         .nest_service("/mcp", service)
         .layer(middleware::from_fn(move |req: Request, next: Next| {
             let flag = flag.clone();
+            requests.fetch_add(1, Ordering::SeqCst);
             async move {
                 if flag.load(Ordering::SeqCst) {
                     let mut r: Response = (StatusCode::UNAUTHORIZED, "no").into_response();
@@ -638,6 +643,104 @@ async fn health_follows_failures_slowness_and_auth() {
         m.health.connection == Connection::Ok
     })
     .await;
+}
+
+/// #2156: `amp-harness login` registers a new OAuth client, which the open connection can't
+/// refresh for, so re-login needed on an open client must heal through the connector (a fresh
+/// connect picks up the new login), not by waiting for the old client to work again. Server A
+/// plays the old login (401 for good), server B the connection made after the re-login.
+#[tokio::test(flavor = "multi_thread")]
+async fn re_login_needed_heals_by_reconnecting_through_the_connector() {
+    let old = serve(Mock::new(default_board())).await;
+    let new = serve(Mock::new(default_board())).await;
+    let logged_in = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let connector: Connector = {
+        let (old_url, new_url) = (old.url.clone(), new.url.clone());
+        let (logged_in, attempts) = (logged_in.clone(), attempts.clone());
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let url = if logged_in.load(Ordering::SeqCst) {
+                new_url.clone()
+            } else {
+                old_url.clone()
+            };
+            Box::pin(async move {
+                AmpMcpClient::connect(
+                    ClientOptions::new(url).with_connect_timeout(Duration::from_secs(2)),
+                )
+                .await
+            })
+        })
+    };
+    let reconnect = Duration::from_millis(250);
+    let mut iv = fast(50);
+    iv.idle_ping = Duration::from_millis(50);
+    iv.reconnect = reconnect;
+    let meta = MetaPoller::spawn(
+        Some(client(&old.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: Some(2107),
+            intervals: iv,
+            connector: Some(connector),
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "loaded from the old login", loaded).await;
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        0,
+        "an open client needs no connect"
+    );
+
+    // The old login's tokens can't be refreshed any more: every request is a 401.
+    old.mock.unauthorized.store(true, Ordering::SeqCst);
+    wait_for(&meta, "re-login needed", |m| {
+        m.health.connection == Connection::AuthRequired
+    })
+    .await;
+    // While waiting for the login, the old client is not polled (topics are due every 50 ms):
+    // the only requests are the reconnect attempts, at most one per `reconnect`.
+    let (requests, tries) = (
+        old.mock.requests.load(Ordering::SeqCst),
+        attempts.load(Ordering::SeqCst),
+    );
+    let waited = Duration::from_millis(1_000);
+    tokio::time::sleep(waited).await;
+    let tries = attempts.load(Ordering::SeqCst) - tries;
+    let most = waited.as_millis() / reconnect.as_millis() + 1;
+    assert!(
+        (1..=most as u64).contains(&tries),
+        "{tries} reconnect attempts in {waited:?} (at most {most})"
+    );
+    let per_try = (old.mock.requests.load(Ordering::SeqCst) - requests) / tries;
+    assert!(
+        per_try <= 1,
+        "{per_try} requests per attempt: the old client is still polled"
+    );
+    assert_eq!(meta.snapshot().health.connection, Connection::AuthRequired);
+
+    // `amp-harness login` in another terminal: the next attempt connects with the new login.
+    logged_in.store(true, Ordering::SeqCst);
+    let m = wait_for(&meta, "reconnected with the new login", |m| {
+        m.health.connection == Connection::Ok && m.user.error.is_none()
+    })
+    .await;
+    assert!(m.board.get().is_some());
+    wait_calls(&new.mock, "everything refetched on the new client", |m| {
+        m.count("amp_whoami") >= 1 && m.count("amp_list_tasks") >= 1 && m.count("amp_get_task") >= 1
+    })
+    .await;
+    // The old client is never called again, even once its server would answer.
+    old.mock.unauthorized.store(false, Ordering::SeqCst);
+    let (old_requests, new_calls) = (old.mock.requests.load(Ordering::SeqCst), new.mock.total());
+    wait_calls(&new.mock, "more polls on the new client", |m| {
+        m.total() >= new_calls + 6
+    })
+    .await;
+    assert_eq!(old.mock.requests.load(Ordering::SeqCst), old_requests);
+    assert_eq!(meta.snapshot().health.connection, Connection::Ok);
 }
 
 /// #2108: a ticket that doesn't exist is that item's error (the header shows it unavailable); the
