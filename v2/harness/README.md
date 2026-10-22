@@ -39,7 +39,7 @@ to the config file. `.amp.json` is a project marker only; its `amp_api` is not r
 
 ```toml
 [server]
-url = "https://amp.local:8443/mcp"
+url = "https://amp.local/mcp"
 ca_file = "amp-local-ca.crt"
 protocol = "auto"            # auto | 2026-07-28 | 2025-11-25
 ```
