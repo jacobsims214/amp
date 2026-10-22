@@ -26,6 +26,12 @@ files:
         - '    ".opencode/**": allow'
         - '    "opencode.json": allow'
         - '    "mkdir -p .opencode/*": allow'
+        - '    "mkdir *..*": deny'
+        - '    "mkdir -p .opencode/* ?*": deny'
+        - '    "mkdir *$*": deny'
+        - '    "mkdir *\t*": deny'
+        - '    "*>*": deny'
+        - '    "*--ou*": deny'
         - '    "general": allow'
         - '    "explore": allow'
     body:

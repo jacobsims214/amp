@@ -12,11 +12,18 @@ permission:
     "opencode.json": allow
   bash:
     "*": deny
-    "git status*": allow
-    "git diff*": allow
-    "git log*": allow
+    "git status *": allow
+    "git diff *": allow
+    "git log *": allow
     "ls *": allow
     "mkdir -p .opencode/*": allow
+    "git difftool*": deny
+    "mkdir *..*": deny
+    "mkdir -p .opencode/* ?*": deny
+    "mkdir *$*": deny
+    "mkdir *\t*": deny
+    "*>*": deny
+    "*--ou*": deny
   webfetch: deny
   websearch: deny
   task:
