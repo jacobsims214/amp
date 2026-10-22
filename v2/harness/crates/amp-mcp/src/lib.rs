@@ -29,7 +29,7 @@ pub use client::{
 };
 pub use credentials::{
     AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,
-    KEYCHAIN_SERVICE, credential_key, keychain_available,
+    ENV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE, credential_key, keychain_available, keychain_service,
 };
 pub use error::McpError;
 pub use health::Health;
@@ -39,8 +39,8 @@ pub use http::{
 };
 pub use protocol::{Era, ProtocolMode};
 pub use settings::{
-    Auth, DEFAULT_MCP_URL, ENV_CA_FILE, ENV_MCP_URL, ENV_PROTOCOL, ENV_TOKEN, FileConfig,
-    Overrides, ServerSection, Settings, Source, StaticToken, default_config_path,
+    Auth, DEFAULT_MCP_URL, ENV_CA_FILE, ENV_MCP_URL, ENV_PROTOCOL, ENV_TOKEN, ENV_WEB_URL,
+    FileConfig, Overrides, ServerSection, Settings, Source, StaticToken, default_config_path,
 };
 
 /// The rmcp crate this client is built on, re-exported so downstream crates use the pinned version.

@@ -16,6 +16,11 @@ amp-core.workspace = true
 amp-mcp.workspace = true
 amp-tui.workspace = true
 clap.workspace = true
+# Hidden key entry in raw mode (setup). Same version and features rpi-tui uses.
+crossterm.workspace = true
+# Provider keys go to the OS keychain (setup).
+keyring.workspace = true
+toml.workspace = true
 rpi-agent.workspace = true
 rpi-harness.workspace = true
 serde.workspace = true

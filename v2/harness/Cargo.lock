@@ -95,6 +95,8 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "crossterm",
+ "keyring",
  "rmcp",
  "rpi-agent",
  "rpi-ai",
@@ -103,6 +105,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]

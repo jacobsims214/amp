@@ -285,6 +285,18 @@ impl ServerHandler for MockAmp {
                 Some(2084) => ok_json(json!({"task_id": 2084, "state": "backlog", "ok": true})),
                 _ => tool_error("task is not blocked with a question"),
             },
+            // M4-1 setup: the project picker and project creation.
+            "amp_list_projects" => ok_json(json!({"projects": [
+                {"id": 2, "name": "AMP v2", "code": "AV", "state": "active", "org_id": 1},
+                {"id": 9, "name": "Old", "code": "OLD", "state": "archived", "org_id": 1}
+            ]})),
+            "amp_list_orgs" => ok_json(json!({"orgs": [{"id": 1, "name": "Default"}]})),
+            "amp_create_project" => match (args["name"].as_str(), args["code"].as_str()) {
+                (Some(name), Some(code)) if !name.is_empty() && !code.is_empty() => ok_json(
+                    json!({"id": 77, "name": name, "code": code, "state": "active", "org_id": 1}),
+                ),
+                _ => tool_error("name and code are required"),
+            },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "plain text, not JSON",
