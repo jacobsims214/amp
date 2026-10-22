@@ -1,0 +1,767 @@
+//! The transcript's components, word-wrapped (#2176).
+//!
+//! rpi-tui 0.8.0 wraps every component's text with a per-character hard wrap (see
+//! [`crate::wrap`]), so the transcript uses these instead of pi's `Text`,
+//! `AssistantMessageComponent`, `UserMessageComponent` and `ToolExecutionComponent`. They look
+//! the same; only the wrapping differs:
+//!
+//! - [`WrapText`]: plain or styled lines (the banner, notices, `/help`, errors).
+//! - [`WrapMarkdown`]: rpi's own `Markdown` renders the text, but prose is rendered at an
+//!   unbounded width (rpi's markdown is line-based, so each source line becomes one row) and then
+//!   word-wrapped here, with list continuations under the item's text and quote borders
+//!   repeated. Fenced code, tables and rules are width-dependent and keep rpi's rendering at the
+//!   real width (a long code line still wraps, so it stays copyable).
+//! - [`AssistantBlock`]: an assistant message's text and thinking blocks, and its error line.
+//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers.
+//! - [`ToolBlock`]: a tool call on pi's tool panel (status glyph, title, summary, elapsed,
+//!   result preview), with the header and result word-wrapped.
+
+use std::{
+    any::Any,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use rpi_tui::{
+    Box as BgBox, Component, Container, Markdown, Spacer, apply_background_to_line, bold, theme,
+    theme_revision, truncate_to_width,
+};
+
+use crate::wrap::{open_sgr as open_style, plain, reflow_row, wrap};
+
+/// The width prose is rendered at before it is word-wrapped: wide enough that rpi never wraps.
+const UNBOUNDED: usize = 1 << 20;
+
+/// A render cached per width and theme.
+#[derive(Default)]
+struct Cache(Mutex<Option<(usize, u64, Vec<String>)>>);
+
+impl Cache {
+    fn get_or(&self, width: usize, render: impl FnOnce() -> Vec<String>) -> Vec<String> {
+        let revision = theme_revision();
+        if let Ok(cache) = self.0.lock()
+            && let Some((w, r, lines)) = cache.as_ref()
+            && *w == width
+            && *r == revision
+        {
+            return lines.clone();
+        }
+        let lines = render();
+        if let Ok(mut cache) = self.0.lock() {
+            *cache = Some((width, revision, lines.clone()));
+        }
+        lines
+    }
+
+    fn clear(&self) {
+        if let Ok(mut cache) = self.0.lock() {
+            *cache = None;
+        }
+    }
+}
+
+/// Word-wraps `text` (styled, several lines) to `width`, each row prefixed with `pad`. A style
+/// left open at the end of one line carries on to the next, as it does on a terminal.
+fn wrap_lines(text: &str, pad: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    let mut carry = String::new();
+    for line in text.split('\n') {
+        let styled = format!("{carry}{line}");
+        carry = open_style(&styled);
+        rows.extend(
+            reflow_row(&styled, width)
+                .into_iter()
+                .map(|r| format!("{pad}{r}")),
+        );
+    }
+    rows
+}
+
+/// Lines of text, word-wrapped: rpi's `Text` (left padding, blank rows above and below), with
+/// hanging indents under a line's leading spaces.
+pub struct WrapText {
+    text: String,
+    padding_x: usize,
+    padding_y: usize,
+    cache: Cache,
+}
+
+impl WrapText {
+    pub fn new(text: impl Into<String>, padding_x: usize, padding_y: usize) -> Self {
+        Self {
+            text: text.into(),
+            padding_x,
+            padding_y,
+            cache: Cache::default(),
+        }
+    }
+}
+
+impl Component for WrapText {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.cache.get_or(width, || {
+            let mut lines = vec![String::new(); self.padding_y];
+            let content_width = width.saturating_sub(self.padding_x).max(1);
+            lines.extend(wrap_lines(
+                &self.text,
+                &" ".repeat(self.padding_x),
+                content_width,
+            ));
+            lines.extend(std::iter::repeat_n(String::new(), self.padding_y));
+            lines
+        })
+    }
+
+    fn invalidate(&self) {
+        self.cache.clear();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// The markdown block styles [`WrapMarkdown`] supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownStyle {
+    Plain,
+    /// pi's thinking style: dim italic in the theme's thinking colour.
+    Thinking,
+}
+
+/// Markdown rendered by rpi and word-wrapped here (see the module docs).
+pub struct WrapMarkdown {
+    text: Mutex<String>,
+    padding_x: usize,
+    style: MarkdownStyle,
+    cache: Cache,
+}
+
+impl WrapMarkdown {
+    pub fn new(text: impl Into<String>, padding_x: usize, style: MarkdownStyle) -> Self {
+        Self {
+            text: Mutex::new(text.into()),
+            padding_x,
+            style,
+            cache: Cache::default(),
+        }
+    }
+
+    pub fn set_text(&self, text: impl Into<String>) {
+        if let Ok(mut t) = self.text.lock() {
+            *t = text.into();
+        }
+        self.cache.clear();
+    }
+
+    fn markdown(&self, text: String) -> Markdown {
+        let md = Markdown::new(text, self.padding_x, 0);
+        match self.style {
+            MarkdownStyle::Plain => md,
+            MarkdownStyle::Thinking => {
+                md.with_base_style(format!("\x1b[3m{}", theme().colors.thinking_text.to_fg()))
+            }
+        }
+    }
+}
+
+impl Component for WrapMarkdown {
+    fn render(&self, width: usize) -> Vec<String> {
+        let text = self.text.lock().map(|t| t.clone()).unwrap_or_default();
+        self.cache.get_or(width, || {
+            // rpi wraps markdown text at the width less the padding on both sides.
+            let text_width = width.saturating_sub(self.padding_x).max(1);
+            let mut lines = Vec::new();
+            for segment in segments(&text) {
+                match segment {
+                    Segment::Prose(s) => {
+                        for row in self.markdown(s).render(UNBOUNDED) {
+                            lines.extend(reflow_row(&row, text_width));
+                        }
+                    }
+                    Segment::Block(s) => lines.extend(self.markdown(s).render(width)),
+                }
+            }
+            lines
+        })
+    }
+
+    fn invalidate(&self) {
+        self.cache.clear();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// A run of markdown source lines: prose (word-wrapped by us) or a width-dependent block.
+#[derive(Debug, PartialEq)]
+enum Segment {
+    Prose(String),
+    /// A fenced code block (or Mermaid diagram), a table or a rule.
+    Block(String),
+}
+
+/// The fence character of a ```` ``` ```` / `~~~` fence line (rpi's `fence_info`).
+fn fence(line: &str) -> Option<char> {
+    let t = line.trim_start();
+    if t.starts_with("```") {
+        Some('`')
+    } else if t.starts_with("~~~") {
+        Some('~')
+    } else {
+        None
+    }
+}
+
+/// rpi's `is_table_row`.
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.ends_with('|') && t.len() > 1
+}
+
+/// rpi's `is_table_separator`.
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    t.contains('|')
+        && t.trim_matches('|').split('|').all(|cell| {
+            cell.chars().all(|c| matches!(c, '-' | ':' | ' ' | '\t')) && cell.contains('-')
+        })
+}
+
+/// A line rpi renders as a rule: `---`/`***` that is not a heading, list item or quote.
+fn is_rule(line: &str) -> bool {
+    let c = line.trim_start_matches([' ', '\t']);
+    let t = line.trim();
+    (t.starts_with("---") || t.starts_with("***"))
+        && !line.starts_with('#')
+        && !c.starts_with('>')
+        && !["- ", "* ", "+ "].iter().any(|m| c.starts_with(m))
+}
+
+/// Splits markdown source into prose and width-dependent blocks, the way rpi's renderer walks it.
+fn segments(text: &str) -> Vec<Segment> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<Segment> = Vec::new();
+    let mut push = |block: bool, chunk: &[&str]| {
+        let chunk = chunk.join("\n");
+        match (out.last_mut(), block) {
+            (Some(Segment::Prose(s)), false) | (Some(Segment::Block(s)), true) => {
+                s.push('\n');
+                s.push_str(&chunk);
+            }
+            _ => out.push(if block {
+                Segment::Block(chunk)
+            } else {
+                Segment::Prose(chunk)
+            }),
+        }
+    };
+    let mut i = 0;
+    while i < lines.len() {
+        let start = i;
+        let line = lines[i];
+        if let Some(ch) = fence(line) {
+            i += 1;
+            while i < lines.len() {
+                i += 1;
+                if fence(lines[i - 1]) == Some(ch) {
+                    break;
+                }
+            }
+            push(true, &lines[start..i]);
+        } else if is_table_row(line) && lines.get(i + 1).is_some_and(|l| is_table_separator(l)) {
+            i += 2;
+            while i < lines.len() && is_table_row(lines[i]) {
+                i += 1;
+            }
+            push(true, &lines[start..i]);
+        } else if is_rule(line) {
+            i += 1;
+            push(true, &lines[start..i]);
+        } else {
+            i += 1;
+            push(false, &lines[start..i]);
+        }
+    }
+    if out.is_empty() {
+        out.push(Segment::Prose(String::new()));
+    }
+    out
+}
+
+/// One visible block of an assistant message.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Block {
+    Text(String),
+    Thinking(String),
+}
+
+/// An assistant message: its text and thinking blocks (pi's `AssistantMessageComponent`
+/// layout: consecutive thinking blocks joined into one dim italic section, a blank row between
+/// thinking and what follows), word-wrapped.
+pub struct AssistantBlock {
+    content: Arc<Container>,
+    blocks: Mutex<Vec<Block>>,
+}
+
+impl Default for AssistantBlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AssistantBlock {
+    /// pi's output padding for assistant text.
+    const PAD: usize = 1;
+
+    pub fn new() -> Self {
+        Self {
+            content: Arc::new(Container::new()),
+            blocks: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn update_blocks(&self, blocks: &[Block]) {
+        if let Ok(mut b) = self.blocks.lock() {
+            if *b == blocks {
+                return;
+            }
+            *b = blocks.to_vec();
+        }
+        self.rebuild(blocks);
+    }
+
+    fn rebuild(&self, blocks: &[Block]) {
+        self.content.clear();
+        let visible = |b: &Block| match b {
+            Block::Text(t) | Block::Thinking(t) => !t.trim().is_empty(),
+        };
+        let mut i = 0;
+        while i < blocks.len() {
+            match &blocks[i] {
+                Block::Text(t) => {
+                    if !t.trim().is_empty() {
+                        self.content.add_child(Arc::new(WrapMarkdown::new(
+                            t.trim(),
+                            Self::PAD,
+                            MarkdownStyle::Plain,
+                        )));
+                    }
+                    i += 1;
+                }
+                Block::Thinking(_) => {
+                    let mut joined = Vec::new();
+                    while let Some(Block::Thinking(t)) = blocks.get(i) {
+                        if !t.trim().is_empty() {
+                            joined.push(t.trim());
+                        }
+                        i += 1;
+                    }
+                    if joined.is_empty() {
+                        continue;
+                    }
+                    self.content.add_child(Arc::new(WrapMarkdown::new(
+                        joined.join("\n\n"),
+                        Self::PAD,
+                        MarkdownStyle::Thinking,
+                    )));
+                    if blocks[i..].iter().any(visible) {
+                        self.content.add_child(Arc::new(Spacer::new(1)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Replaces the content with pi's error line (`❌ Error: …`, `❌ Operation aborted: …`).
+    pub fn update_error(&self, error: &str, stop_reason: &str) {
+        if let Ok(mut b) = self.blocks.lock() {
+            b.clear();
+        }
+        self.content.clear();
+        self.content.add_child(Arc::new(Spacer::new(1)));
+        let text = match stop_reason {
+            "aborted" => format!("❌ Operation aborted: {error}"),
+            "error" => format!("❌ Error: {error}"),
+            "length" => "⚠️ Response was truncated before completion.".to_owned(),
+            _ => format!("❌ {error}"),
+        };
+        self.content
+            .add_child(Arc::new(WrapText::new(text, Self::PAD, 0)));
+    }
+}
+
+impl Component for AssistantBlock {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.content.render(width)
+    }
+
+    fn invalidate(&self) {
+        let blocks = self.blocks.lock().map(|b| b.clone()).unwrap_or_default();
+        if !blocks.is_empty() {
+            self.rebuild(&blocks);
+        }
+        self.content.invalidate();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
+const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
+const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
+
+/// The user's message: markdown on the theme's surface colour inside a padded box, between OSC
+/// 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped.
+pub struct UserBlock {
+    text: String,
+    inner: Mutex<(u64, BgBox)>,
+}
+
+fn user_box(text: &str) -> BgBox {
+    let bg = theme().colors.surface;
+    let content = BgBox::new(1, 1);
+    content.set_bg_fn(Some(Arc::new(move |s: &str| bg.bg(s))));
+    content.add_child(Arc::new(WrapMarkdown::new(text, 0, MarkdownStyle::Plain)));
+    content
+}
+
+impl UserBlock {
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let inner = Mutex::new((theme_revision(), user_box(&text)));
+        Self { text, inner }
+    }
+}
+
+impl Component for UserBlock {
+    fn render(&self, width: usize) -> Vec<String> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        // The surface colour is baked into the box: rebuild it after a theme change.
+        let revision = theme_revision();
+        if inner.0 != revision {
+            *inner = (revision, user_box(&self.text));
+        }
+        let mut lines = inner.1.render(width);
+        if let Some(first) = lines.first_mut() {
+            first.insert_str(0, OSC133_ZONE_START);
+        }
+        if let Some(last) = lines.last_mut() {
+            last.insert_str(0, &format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}"));
+        }
+        lines
+    }
+
+    fn invalidate(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            *inner = (theme_revision(), user_box(&self.text));
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Where a tool call is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// Result rows shown under a tool's header (pi's collapsed preview).
+const RESULT_PREVIEW_LINES: usize = 12;
+
+struct ToolInner {
+    title: String,
+    summary: String,
+    state: ToolState,
+    started: Option<Instant>,
+    finished: Option<Instant>,
+    result: Option<String>,
+}
+
+/// A tool call on pi's tool panel: `✓ title summary 1.2s ▸` and up to 12 result rows behind a
+/// `│` gutter, on the status-tinted background, word-wrapped.
+pub struct ToolBlock {
+    inner: Mutex<ToolInner>,
+    cache: Cache,
+}
+
+impl ToolBlock {
+    /// `title` is shown bold; `summary` is the call's most telling argument (one line).
+    pub fn new(title: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            inner: Mutex::new(ToolInner {
+                title: title.into(),
+                summary: summary.into(),
+                state: ToolState::Pending,
+                started: None,
+                finished: None,
+                result: None,
+            }),
+            cache: Cache::default(),
+        }
+    }
+
+    pub fn set_running(&self) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.state = ToolState::Running;
+            i.started = Some(Instant::now());
+        }
+        self.cache.clear();
+    }
+
+    pub fn set_result(&self, result: &str, is_error: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.result = Some(result.to_owned());
+            i.state = if is_error {
+                ToolState::Failed
+            } else {
+                ToolState::Completed
+            };
+            i.finished = Some(Instant::now());
+        }
+        self.cache.clear();
+    }
+
+    pub fn state(&self) -> ToolState {
+        self.inner
+            .lock()
+            .map(|i| i.state)
+            .unwrap_or(ToolState::Pending)
+    }
+
+    fn render_panel(&self, width: usize) -> Vec<String> {
+        let Ok(inner) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let t = theme();
+        let colors = t.colors;
+        let width = width.max(1);
+        let (icon, icon_color, bg) = match inner.state {
+            ToolState::Pending => ("●", colors.muted, colors.tool_pending_bg),
+            ToolState::Running => ("●", colors.accent, colors.tool_pending_bg),
+            ToolState::Completed => ("✓", colors.success, colors.tool_success_bg),
+            ToolState::Failed => ("✗", colors.error, colors.tool_error_bg),
+        };
+        // pi's ToolPanel insets.
+        let padding_x = t.spacing.tool_panel_padding_x.min((width - 1) / 2);
+        let content_width = width - padding_x * 2;
+        let pad = " ".repeat(padding_x);
+        let line = |content: &str| {
+            let content = truncate_to_width(content, content_width, "");
+            apply_background_to_line(&format!("{pad}{content}"), width, |s| bg.bg(s))
+        };
+
+        // pi's top spacer, then the panel's own vertical padding.
+        let mut lines = vec![String::new()];
+        lines.extend(std::iter::repeat_n(
+            line(""),
+            t.spacing.tool_panel_padding_y,
+        ));
+
+        let elapsed = match (inner.state, inner.started, inner.finished) {
+            (ToolState::Running, Some(s), _) => format_elapsed(s.elapsed()),
+            (ToolState::Completed | ToolState::Failed, Some(s), Some(f)) => {
+                format_elapsed(f.duration_since(s))
+            }
+            _ => String::new(),
+        };
+        let mut head = vec![colors.tool_title.fg(&bold(&inner.title))];
+        if !inner.summary.is_empty() {
+            head.push(colors.tool_output.fg(&inner.summary));
+        }
+        if !elapsed.is_empty() {
+            head.push(colors.muted.fg(&elapsed));
+        }
+        head.push(colors.muted.fg("▸"));
+        // Continuation rows of a long header hang under the title, after the status glyph.
+        let glyph = icon_color.fg(icon);
+        // (A panel too narrow for the hang truncates its rows, as pi's does.)
+        let hang = 2.min(content_width.saturating_sub(1));
+        for (i, row) in wrap(&head.join(" "), content_width - hang)
+            .iter()
+            .enumerate()
+        {
+            let row = if i == 0 {
+                format!("{glyph} {row}")
+            } else {
+                format!("{}{row}", " ".repeat(hang))
+            };
+            lines.push(line(&row));
+        }
+
+        if let Some(result) = &inner.result {
+            let gutter = content_width > 2;
+            let body_width = content_width - if gutter { 2 } else { 0 };
+            let rows: Vec<String> = result
+                .replace("\r\n", "\n")
+                .replace('\r', "\n")
+                .split('\n')
+                .flat_map(|l| wrap_lines(&plain(l), "", body_width))
+                .collect();
+            for row in rows.iter().take(RESULT_PREVIEW_LINES) {
+                let row = if gutter {
+                    format!("{} {}", colors.dim.fg("│"), colors.tool_output.fg(row))
+                } else {
+                    colors.tool_output.fg(row)
+                };
+                lines.push(line(&row));
+            }
+            let hidden = rows.len().saturating_sub(RESULT_PREVIEW_LINES);
+            if hidden > 0 {
+                let hint = format!("… {hidden} more line{}", if hidden == 1 { "" } else { "s" });
+                lines.push(line(&colors.muted.fg(&hint)));
+            }
+        }
+        lines.extend(std::iter::repeat_n(
+            line(""),
+            t.spacing.tool_panel_padding_y,
+        ));
+        lines
+    }
+}
+
+/// pi's elapsed format: `0.4s`, `12.0s`, `1m5s`.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!(
+            "{}m{}s",
+            (secs / 60.0).floor() as u64,
+            (secs % 60.0).floor() as u64
+        )
+    }
+}
+
+impl Component for ToolBlock {
+    fn render(&self, width: usize) -> Vec<String> {
+        // A running call's timer changes every frame; a finished one is fixed.
+        if self.state() == ToolState::Running {
+            return self.render_panel(width);
+        }
+        self.cache.get_or(width, || self.render_panel(width))
+    }
+
+    fn invalidate(&self) {
+        self.cache.clear();
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn segments_split_prose_from_fences_tables_and_rules() {
+        let src = "intro\n```rust\nlet a = 1;\n```\nmiddle\n| a | b |\n|---|---|\n| 1 | 2 |\n---\n- item\nend";
+        assert_eq!(
+            segments(src),
+            vec![
+                Segment::Prose("intro".into()),
+                Segment::Block("```rust\nlet a = 1;\n```".into()),
+                Segment::Prose("middle".into()),
+                Segment::Block("| a | b |\n|---|---|\n| 1 | 2 |\n---".into()),
+                Segment::Prose("- item\nend".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fence_runs_to_the_end() {
+        assert_eq!(
+            segments("a\n~~~\ncode\n```\nmore"),
+            vec![
+                Segment::Prose("a".into()),
+                Segment::Block("~~~\ncode\n```\nmore".into()),
+            ]
+        );
+    }
+
+    fn plain_rows(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .map(|r| plain(r).trim_end().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn tool_blocks_wrap_their_header_and_result_at_words() {
+        let block = ToolBlock::new(
+            "AMP · kb_search",
+            "how the harness wraps transcript text in narrow terminals",
+        );
+        block.set_result(
+            "query: how the harness wraps transcript text · results: 3 items · top: architecture/amp-harness-chat-tui.md",
+            false,
+        );
+        let rows = plain_rows(&block.render(50));
+        // pi's top spacer and the panel's own padding (1 row in the default theme).
+        assert_eq!(rows[0], "");
+        let body: Vec<&str> = rows
+            .iter()
+            .map(String::as_str)
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert!(
+            body[0].starts_with("  ✓ AMP · kb_search how the harness"),
+            "{body:?}"
+        );
+        for row in &body {
+            assert!(visible_width_of(row) <= 50, "{row:?}");
+        }
+        // Header continuations hang under the title; result rows keep the gutter.
+        assert!(
+            body[1].starts_with("    ") && !body[1].starts_with("     "),
+            "{body:?}"
+        );
+        let result: Vec<&&str> = body.iter().filter(|r| r.starts_with("  │ ")).collect();
+        assert!(result.len() >= 3, "{body:?}");
+        assert!(result.iter().all(|r| !r.starts_with("  │  ")), "{body:?}");
+        let joined: Vec<String> = result.iter().map(|r| r[6..].to_owned()).collect();
+        assert_eq!(
+            joined.join(" "),
+            "query: how the harness wraps transcript text · results: 3 items · top: architecture/amp-harness-chat-tui.md"
+        );
+    }
+
+    fn visible_width_of(s: &str) -> usize {
+        rpi_tui::visible_width(s)
+    }
+
+    #[test]
+    fn long_tool_results_show_a_preview() {
+        let block = ToolBlock::new("read", "src/lib.rs");
+        let text: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
+        block.set_result(&text.join("\n"), false);
+        let rows = plain_rows(&block.render(60));
+        assert!(
+            rows.iter().any(|r| r.trim() == "… 8 more lines"),
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|r| r.contains("line 13")), "{rows:?}");
+    }
+
+    #[test]
+    fn list_markers_are_not_rules() {
+        assert!(!is_rule("- --- not a rule"));
+        assert!(!is_rule("* ** x"));
+        assert!(is_rule("---"));
+        assert!(is_rule("  ***"));
+    }
+}

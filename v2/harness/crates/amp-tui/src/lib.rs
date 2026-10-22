@@ -26,6 +26,9 @@
 //!   tool calls titled `AMP · complete_task #2078`, and the transcript marker when the current
 //!   ticket changes.
 //!
+//! - [`transcript`] and [`wrap`] (#2176): the transcript's components, word-wrapped (rpi-tui
+//!   0.8.0's own break lines mid-word).
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
@@ -35,7 +38,9 @@ pub mod overlay;
 pub mod shell;
 pub mod terminal;
 pub mod theme;
+pub mod transcript;
 pub mod view;
+pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use overlay::{Panel, PanelKind, PanelState, Stage, Target};
