@@ -7,7 +7,7 @@
 //!       Dark or light?
 //!    ■  QUESTION  #2110 M3-6 Docs
 //!       README or KB?
-//!  ↑↓ select · Enter answer · o open in browser · Esc close
+//!  ↑↓ select · Enter answer · Tab editor · Esc close
 //! ```
 //!
 //! The panel is part of the layout (not a floating TUI overlay), so the headless renders that the
@@ -102,6 +102,10 @@ pub struct PanelState {
     pub plan_blocked: Option<Result<Value, String>>,
     /// A one-line note at the bottom (`answered #2107`, an error).
     pub note: Option<(String, bool)>,
+    /// Whether ↑↓ / Enter go to the panel (true) or to the editor. A panel opens focused; a
+    /// printable key, a paste or a submitted prompt hands the keys back to the editor, and Tab
+    /// (with an empty editor) switches. Printable keys always reach the editor (#2161).
+    pub focused: bool,
 }
 
 impl PanelState {
@@ -113,6 +117,7 @@ impl PanelState {
             plan: None,
             plan_blocked: None,
             note: None,
+            focused: true,
         }
     }
 }
@@ -1137,11 +1142,12 @@ fn hint(state: &PanelState, has_targets: bool) -> String {
         }
         (Stage::Confirm { .. }, _) => "y / Enter send · n / Esc cancel".to_owned(),
         (Stage::Sending { .. }, _) => "sending…".to_owned(),
+        (Stage::Browse, _) if has_targets && !state.focused => "Tab select · Esc close".to_owned(),
         (Stage::Browse, PanelKind::Questions) if has_targets => {
-            "↑↓ select · Enter answer · o open in browser · Esc close".to_owned()
+            "↑↓ select · Enter answer · Tab editor · Esc close".to_owned()
         }
         (Stage::Browse, _) if has_targets => {
-            "↑↓ select · Enter / o open in browser · Esc close".to_owned()
+            "↑↓ select · Enter open in browser · Tab editor · Esc close".to_owned()
         }
         _ => "Esc close".to_owned(),
     }
@@ -1184,7 +1190,8 @@ pub fn render_panel(
         if is_target {
             target_index += 1;
         }
-        let marker = if is_selected {
+        // The marker shows only while the keys go to the panel.
+        let marker = if is_selected && state.focused {
             c.accent.fg("›")
         } else {
             " ".to_owned()

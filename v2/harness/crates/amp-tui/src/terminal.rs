@@ -239,17 +239,14 @@ async fn event_loop(
                             } else {
                                 break;
                             }
-                        } else if shell.panel_key(&key, editor_empty) {
-                            // An open AMP panel took it (select, answer, open, close).
-                        } else if key.code == KeyCode::Esc && shell.is_running() {
+                        } else if !shell.key(key) && shell.is_running() {
+                            // An Esc that no AMP panel took aborts the run.
                             shell.abort().await;
-                        } else {
-                            editor.handle_key(key);
                         }
                         tui.request_render(false);
                     }
                     Event::Paste(text) => {
-                        shell.view().editor().handle_paste(&text);
+                        shell.paste(&text);
                         tui.request_render(false);
                     }
                     _ => {}
