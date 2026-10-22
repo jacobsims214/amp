@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Harness smoke test v1 (D13, AMP ticket #2086). Runs the built amp-harness binary against a real AMP.
+# Harness smoke test (D13; v1 AMP ticket #2086, run -p leg #2095). Runs the built amp-harness binary against a real AMP.
 #
 #   make -C v2/harness smoke          # builds first, then runs this script
 #
@@ -12,7 +12,8 @@
 #            Otherwise it is reported as skipped. The token is only ever sent to the cluster leg.
 #
 # Each leg: doctor --json, whoami --json, then a throwaway project (epic, story, two tickets, a
-# comment) created with the hidden `mcp call`, read back with `tickets list|get`, and deleted again.
+# comment) created with the hidden `mcp call`, read back with `tickets list|get` and with `run -p` (the
+# manager on a scripted faux model calling amp_get_task), and deleted again.
 # AMP has no hard delete for projects, so "deleted" means its tickets, story and epic are deleted
 # and the project is archived; the leg checks it is gone from amp_list_projects.
 #
@@ -54,9 +55,18 @@ log "version ok ($(head -1 <<<"$out"))"
 # --- isolation ------------------------------------------------------------------------------------
 mkdir -p "$HARNESS_DIR/target"
 WORK="$(mktemp -d "$HARNESS_DIR/target/smoke.XXXXXX")"
-export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/.config"
+export HOME="$WORK/home" XDG_CONFIG_HOME="$WORK/home/.config" XDG_STATE_HOME="$WORK/home/.local/state"
 export AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$WORK"
-mkdir -p "$XDG_CONFIG_HOME" "$WORK/project"
+unset AMP_HARNESS_PROFILE AMP_HARNESS_FAUX_SCRIPT
+mkdir -p "$XDG_CONFIG_HOME/amp-harness" "$WORK/project"
+# `run -p` (M2-4) uses the faux provider with a scripted model: offline, no LLM key needed.
+cat >"$XDG_CONFIG_HOME/amp-harness/config.toml" <<'TOML'
+[providers.faux]
+api = "faux"
+[providers.faux.models."faux-1"]
+[roles.manager]
+model = "faux/faux-1"
+TOML
 cd "$WORK/project"
 
 # --- per-leg state + cleanup ----------------------------------------------------------------------
@@ -230,6 +240,23 @@ run_leg() {
   }
   out="$(h doctor --json)" || die "[$LEG] doctor with .amp.json failed"
   expect "$out" ".project.found and .project.id == $P_ID" "doctor did not find the .amp.json project"
+
+  # run -p (M2-4): the manager, on a scripted faux model, reads ticket two through AMP's own
+  # amp_get_task tool, and the tool's result reaches the model.
+  printf '[{"tool_calls":[{"name":"amp_get_task","arguments":{"task_id":%s}}]},{"text":"Ticket: {{last_tool_result}}"}]\n' "$t2" >"$WORK/faux.json"
+  out="$(AMP_HARNESS_FAUX_SCRIPT="$WORK/faux.json" h run -p "Read ticket #$t2" --json --no-session)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] run -p failed"
+  }
+  jq -s -e --argjson p "$P_ID" '
+      (.[0] | .type == "session" and .role == "amp-manager" and .project_id == $p and .mcp.instructions == true
+        and (.tools | index("amp_get_task")) != null and ([.tools[] | select(startswith("amp_amp_"))] == [])) and
+      (.[-1] | .type == "result" and .outcome == "completed" and .tools_used == ["amp_get_task"] and .tool_errors == 0
+        and (.text | contains("smoke ticket two")))' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] run -p: expected the manager to read ticket $t2 with amp_get_task"
+  }
+  log "[$LEG] run -p ok: the manager called amp_get_task on the faux model"
 
   # A tool error exits 1 with the message on stderr.
   rc=0
