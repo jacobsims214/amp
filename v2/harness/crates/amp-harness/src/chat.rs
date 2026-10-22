@@ -459,6 +459,39 @@ fn tilde(path: &Path, home: Option<&Path>) -> String {
     }
 }
 
+/// The banner's session line (#2186): `session 01a1…c795 (/usage for path)`, one row at 80
+/// columns, where the whole path took three; `/usage` and the exit line name the file.
+fn session_banner(file: Option<&Path>) -> String {
+    match file {
+        Some(path) => format!("session {} (/usage for path)", session_id(path)),
+        None => "session in memory (--no-session)".to_owned(),
+    }
+}
+
+/// A session file's short id: its uuid (the stem after the `<millis>-` prefix) as the first and
+/// last four characters, `01a1…c795`.
+fn session_id(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let id = match stem.split_once('-') {
+        Some((millis, rest))
+            if !millis.is_empty() && millis.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            rest.to_owned()
+        }
+        _ => stem,
+    };
+    let chars: Vec<char> = id.chars().collect();
+    if chars.len() <= 9 {
+        return id;
+    }
+    let head: String = chars[..4].iter().collect();
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{head}…{tail}")
+}
+
 fn shell_info(s: &session::Session) -> ShellInfo {
     let resolved = &s.agent.resolved;
     let mcp = s.rt.mcp.session();
@@ -469,10 +502,12 @@ fn shell_info(s: &session::Session) -> ShellInfo {
         },
         None => "no .amp.json here (no project)".to_owned(),
     };
-    let session_line = match &s.agent.session_file {
-        Some(path) => format!("session {}", path.display()),
-        None => "session in memory".to_owned(),
-    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let session_file = s
+        .agent
+        .session_file
+        .as_deref()
+        .map(|p| tilde(p, home.as_deref()));
     ShellInfo {
         role: s.agent.role.id.clone(),
         provider: resolved.provider.clone(),
@@ -482,6 +517,7 @@ fn shell_info(s: &session::Session) -> ShellInfo {
         context_window: resolved.model.context_window,
         cwd: s.cwd.display().to_string(),
         git_branch: git_branch(&s.cwd),
+        session_file,
         banner: vec![
             format!(
                 "AMP harness {} · {}",
@@ -494,11 +530,12 @@ fn shell_info(s: &session::Session) -> ShellInfo {
                 format!("{project} · {} ({})", mcp.url, mcp.protocol_version)
             },
             format!(
-                "{}/{} • thinking {} · {session_line}",
+                "{}/{} • thinking {}",
                 resolved.provider,
                 resolved.model_id,
                 thinking_name(resolved.thinking)
             ),
+            session_banner(s.agent.session_file.as_deref()),
             "/help for commands · Esc aborts a reply · Ctrl+C twice quits".to_owned(),
         ],
     }
@@ -535,7 +572,7 @@ fn git_branch(cwd: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{exit_line, parse_size, tilde};
+    use super::{exit_line, parse_size, session_banner, session_id, tilde};
     use std::path::Path;
 
     #[test]
@@ -589,6 +626,22 @@ mod tests {
             tilde(Path::new("/home/me/a"), Some(Path::new(""))),
             "/home/me/a"
         );
+    }
+
+    #[test]
+    fn the_banner_names_the_session_by_its_short_id() {
+        let path = Path::new(
+            "/Users/ada/.local/state/amp-harness/sessions/amp-manager/\
+             1792702008122-01a1655c-3f27-76e5-a3f9-a4e1bec7c795.jsonl",
+        );
+        assert_eq!(session_id(path), "01a1…c795");
+        let line = session_banner(Some(path));
+        assert_eq!(line, "session 01a1…c795 (/usage for path)");
+        // One row at 80 columns with the transcript's padding.
+        assert!(line.chars().count() <= 78);
+        assert_eq!(session_id(Path::new("/x/short.jsonl")), "short");
+        assert_eq!(session_id(Path::new("/x/12-ab.jsonl")), "ab");
+        assert_eq!(session_banner(None), "session in memory (--no-session)");
     }
 
     #[test]

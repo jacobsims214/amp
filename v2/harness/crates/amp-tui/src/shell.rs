@@ -186,6 +186,9 @@ pub struct ShellInfo {
     pub git_branch: Option<String>,
     /// Lines of the welcome banner at the top of the transcript.
     pub banner: Vec<String>,
+    /// The session file as `/usage` names it (`~/.local/state/...jsonl`); `None` keeps the
+    /// transcript in memory (`--no-session`). The banner only shows its short id (#2186).
+    pub session_file: Option<String>,
 }
 
 impl ShellInfo {
@@ -1503,7 +1506,9 @@ impl Shell {
         format!(
             "usage this session: {} prompt(s), {} turn(s), {} tool call(s) ({} failed)\n\
              tokens: input {} · output {} · cache read {} · cache write {} · cost ${:.4}\n\
-             model: {} • thinking {}",
+             {}\n\
+             model: {} • thinking {}\n\
+             session: {}",
             self.prompts,
             t.turns,
             t.tool_calls,
@@ -1513,9 +1518,32 @@ impl Shell {
             u.cache_read_tokens,
             u.cache_write_tokens,
             u.cost_usd,
+            self.context_text(),
             self.info.model_ref(),
             thinking_name(self.info.thinking),
+            self.info
+                .session_file
+                .as_deref()
+                .unwrap_or("in memory (not saved)"),
         )
+    }
+
+    /// `/usage`'s context line: what the footer's `ctx 4%` stands for, and the cache hit rate.
+    fn context_text(&self) -> String {
+        let footer = self.view.footer();
+        let mut text = match footer.context() {
+            Some(c) => format!(
+                "context: {} of {} tokens ({})",
+                crate::footer::format_tokens(c.tokens),
+                crate::footer::format_tokens(c.window),
+                crate::footer::context_label(c.percent),
+            ),
+            None => "context: not reported yet".to_owned(),
+        };
+        if let Some(rate) = footer.cache_hit_rate() {
+            text.push_str(&format!(" · cache hit {rate:.1}%"));
+        }
+        text
     }
 
     fn model_text(&self) -> String {

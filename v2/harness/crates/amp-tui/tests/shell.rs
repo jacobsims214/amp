@@ -52,6 +52,7 @@ async fn rig(steps: Vec<FauxStep>) -> Rig {
         context_window: 200_000,
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m2".into()),
+        session_file: None,
         banner: vec![
             "AMP harness · manager".into(),
             "project #2 AMP · http://amp.test/mcp".into(),

@@ -336,18 +336,17 @@ fn no_ticket_hides_line_two_and_no_source_hides_everything() {
             .any(|l| l.contains('▀') || l.contains("workers"))
     );
 
-    // With one, the header is on top and the status line sits between the editor and pi's
-    // footer (whose cwd line is empty here, so it is one line).
+    // With one, the header is on top and the status line sits between the editor and the
+    // footer (#2186: with no cwd, model or usage set, the footer has no rows).
     view.chrome().set_snapshot(sample::meta(true));
     let screen = view.render_plain(160, 20);
     assert!(screen[0].starts_with("▀▀▀▀▀▀▀▀ amp.simstech.cloud"));
     assert!(screen[1].starts_with("■ In progress #2106"));
-    assert!(screen[17].starts_with("────"), "{screen:#?}");
+    assert!(screen[18].starts_with("────"), "{screen:#?}");
     assert!(
-        screen[18].starts_with("■  2 QUESTIONS  │ workers 3 ■ running │"),
+        screen[19].starts_with("■  2 QUESTIONS  │ workers 3 ■ running │"),
         "{screen:#?}"
     );
-    assert!(screen[19].starts_with("Enter send"), "{screen:#?}");
 }
 
 #[test]
@@ -470,4 +469,26 @@ fn run_reports_come_from_the_sessions_tool_calls() {
         view.chrome().data().unwrap().reports.get(&2106),
         Some(&ReportState::Reported)
     );
+}
+
+/// #2186: header line 1 drops the protocol, then the left side (host, email, bands, project),
+/// and keeps the health dot and its word to the last.
+#[test]
+fn the_header_keeps_the_dot_and_connected_longest() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let p = palette();
+    let data = sample::data(false);
+    for width in 11..=160 {
+        let line = plain(&render_header(&data, &p, width)[0]);
+        assert!(visible_width(&line) <= width, "{width}: {line}");
+        assert!(line.ends_with("● connected") || line.ends_with("● connected 2026-07-28"));
+        if !line.ends_with("2026-07-28") && width >= 100 {
+            panic!("{width}: the protocol went with room to spare: {line}");
+        }
+    }
+    // Before "connected" goes, everything on the left has.
+    let line = plain(&render_header(&data, &p, 30)[0]);
+    assert_eq!(line.trim_start(), "● connected", "{line}");
+    let line = plain(&render_header(&data, &p, 50)[0]);
+    assert!(line.contains("AMP #2") && !line.contains('@'), "{line}");
 }
