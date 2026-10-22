@@ -3,8 +3,8 @@
 AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) with an MCP client on
 `rmcp`. Design and build plan: AMP project 2 KB, `decisions/amp-harness-architecture.md`.
 
-Status: **M1-2.** The workspace builds and `amp-harness --version` works. `amp-mcp` connects to AMP
-(both MCP protocol eras), lists tools and calls them; the CLI does not use it yet (M1-4).
+Status: **M1-4.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login),
+and the CLI has `login`, `logout`, `doctor`, `whoami`, `tickets list|get` and the hidden `mcp call`.
 
 ## Layout (D1)
 
@@ -86,6 +86,33 @@ Tests (`crates/amp-mcp/tests/oauth.rs`) run a mock authorization server (protect
 metadata, DCR, PKCE S256 check, rotating refresh tokens, `invalid_grant`) with a scripted browser.
 The keychain test uses a per-run service `amp-harness-test-<pid>`, deletes its entry, and skips
 where no keychain answers (Linux CI) or when `AMP_TEST_SKIP_KEYCHAIN` is set.
+
+## Commands (M1-4)
+
+Every command below takes the connection flags `--url`, `--ca-file`, `--protocol`, `--config` and
+`--token-env` (precedence above) and connects with D3's order: `AMP_TOKEN`, else the stored login,
+else no credentials.
+
+```sh
+amp-harness doctor [--json]          # config, credentials, connect, tools, contract, whoami, project
+amp-harness whoami [--json]
+amp-harness tickets list [--project N] [--owner mine|unassigned|any|EMAIL] [--state S[,S]] [--json]
+amp-harness tickets get ID [--comments] [--json]
+amp-harness mcp call TOOL ['{"json": "args"}' | -] [--raw] [--timeout SECS]   # hidden debug command
+amp-harness mcp tools [--json]                                                # hidden
+```
+
+- `.amp.json` (nearest one upwards from the working directory) only supplies the default
+  `project_id`; its `amp_api` field is ignored (D4). `AMP_HARNESS_CEILING_DIR` stops the search.
+- Ticket states use the web UI's words: `question`, `in_progress`, `ready`, `scheduled`, `waiting`,
+  `done` (labels Question, In progress, Ready, Scheduled, Waiting, Done). `--state` also takes
+  `blocked` (waiting + question + scheduled), `open` (the default: all but done) and `all`.
+- `doctor` exits 1 when a check fails (warnings don't count) and lists the D11 contract tools the
+  server is missing. It describes auth by source only and never prints a token.
+- `mcp call` prints the tool's JSON (or text); a tool error goes to stderr with exit 1. Bad
+  arguments exit 2.
+- `--json` output is a contract for scripts: fields are added, never renamed or removed. The full
+  shapes are pinned in `crates/amp-harness/tests/cli.rs` against a mock AMP (`tests/common`).
 
 ## Dev loop
 

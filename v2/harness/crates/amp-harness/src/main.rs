@@ -1,7 +1,15 @@
 //! `amp-harness`: the AMP agent harness binary (D1).
 //!
-//! M1-3: `login` / `logout` (OAuth with the keychain credential store, D3). Later milestones add
-//! the TUI (default), doctor, init, run, tickets and mcp call.
+//! - M1-3: `login` / `logout` (OAuth with the keychain credential store, D3).
+//! - M1-4: `doctor`, `whoami`, `tickets list|get` (each with `--json`) and the hidden `mcp call`.
+//!
+//! Later milestones add the TUI (default), init and run.
+
+mod conn;
+mod doctor;
+mod mcp_cmd;
+mod tickets;
+mod whoami;
 
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
@@ -48,6 +56,25 @@ enum Command {
     Login(LoginArgs),
     /// Forget the stored login for an AMP server.
     Logout(ServerArgs),
+    /// Check the connection to AMP: server, protocol, auth, tools, who you are, the project.
+    Doctor(JsonArgs),
+    /// Show who AMP thinks you are.
+    Whoami(JsonArgs),
+    /// List and read tickets.
+    #[command(subcommand)]
+    Tickets(tickets::TicketsCommand),
+    /// Debug: call AMP tools directly.
+    #[command(subcommand, hide = true)]
+    Mcp(mcp_cmd::McpCommand),
+}
+
+#[derive(Args)]
+struct JsonArgs {
+    #[command(flatten)]
+    conn: conn::ConnArgs,
+    /// Print JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args)]
@@ -85,16 +112,20 @@ impl ServerArgs {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let result = match cli.command {
+    let result: Result<(), conn::CliError> = match cli.command {
         Some(Command::Version) => {
             println!("amp-harness {LONG_VERSION}");
             Ok(())
         }
-        Some(Command::Login(args)) => login(args).await,
-        Some(Command::Logout(args)) => logout(args).await,
+        Some(Command::Login(args)) => login(args).await.map_err(Into::into),
+        Some(Command::Logout(args)) => logout(args).await.map_err(Into::into),
+        Some(Command::Doctor(args)) => doctor::run(args.conn, args.json).await,
+        Some(Command::Whoami(args)) => whoami::run(args.conn, args.json).await,
+        Some(Command::Tickets(command)) => tickets::run(command).await,
+        Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
         None => {
             eprintln!(
-                "amp-harness {}: try `amp-harness login` or --help",
+                "amp-harness {}: try `amp-harness doctor` or --help",
                 env!("CARGO_PKG_VERSION")
             );
             Ok(())
@@ -103,8 +134,10 @@ async fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("amp-harness: {e}");
-            ExitCode::FAILURE
+            if !e.message.is_empty() {
+                eprintln!("amp-harness: {e}");
+            }
+            ExitCode::from(e.code)
         }
     }
 }
