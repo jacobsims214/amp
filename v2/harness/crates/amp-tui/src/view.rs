@@ -36,6 +36,7 @@ use amp_core::events::{stop_reason_str, tool_result_text};
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::overlay::Panel;
+use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
 use crate::transcript::{AssistantBlock, Block, ThinkingDisplay, ToolBlock, UserBlock, WrapText};
 use rpi_agent::{AgentEvent, AgentMessage};
@@ -81,6 +82,8 @@ pub struct ChatView {
     /// The `/` completion menu (#2182), right above the editor while a command is being typed.
     menu: CommandMenu,
     root: Arc<dyn Component>,
+    /// The transcript's scroll position and the "↓ new output" pill (#2185).
+    scroll: TranscriptScroll,
     /// The assistant message being streamed, if any.
     assistant: Option<Arc<AssistantBlock>>,
     /// Running tool calls by id.
@@ -111,7 +114,7 @@ impl ChatView {
         let header = Arc::new(Container::new());
         header.add_child(chrome.header());
         let transcript = Arc::new(Container::new());
-        let scroll = Arc::new(ScrollView::primary(transcript.clone()));
+        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(transcript.clone())));
         let status = Arc::new(Container::new());
         let panel = Panel::new(chrome.clone());
         let panel_slot = Arc::new(Container::new());
@@ -139,7 +142,7 @@ impl ChatView {
         let root = VStack::from_children(vec![
             StackChild::Entry(StackEntry::new(header.clone()).shrink(0)),
             StackChild::Entry(
-                StackEntry::new(scroll)
+                StackEntry::new(scroll.view().clone())
                     .basis(0)
                     .grow(1)
                     .shrink(1)
@@ -163,6 +166,7 @@ impl ChatView {
             panel,
             menu,
             root: Arc::new(root),
+            scroll,
             assistant: None,
             tools: HashMap::new(),
             retry: None,
@@ -216,8 +220,15 @@ impl ChatView {
         &self.menu
     }
 
+    /// The transcript's scroll position: PageUp/PageDown, Ctrl+U/Ctrl+D, End, the wheel, and
+    /// the "↓ new output" pill (#2185).
+    pub fn scroll(&self) -> &TranscriptScroll {
+        &self.scroll
+    }
+
     /// Adds a component to the transcript (the ticket marker).
     pub fn add_to_transcript(&self, component: Arc<dyn Component>) {
+        self.scroll.touch();
         self.transcript.add_child(component);
     }
 
@@ -254,17 +265,21 @@ impl ChatView {
                 colors.dim.fg(line)
             });
         }
+        self.scroll.touch();
         self.transcript
             .add_child(Arc::new(WrapText::new(text.join("\n"), 1, 1)));
     }
 
+    /// The person's own message. Sending one jumps back to the latest output, so it is in view.
     pub fn add_user(&self, text: &str) {
         self.transcript.add_child(Arc::new(UserBlock::new(text)));
+        self.scroll.to_end();
     }
 
     /// A dim one-off line in the transcript (command output, run outcome).
     pub fn add_notice(&self, text: &str) {
         let colors = theme().colors;
+        self.scroll.touch();
         self.transcript
             .add_child(Arc::new(WrapText::new(colors.dim.fg(text), 1, 1)));
     }
@@ -272,6 +287,7 @@ impl ChatView {
     /// An error line in the transcript.
     pub fn add_error(&self, text: &str) {
         let colors = theme().colors;
+        self.scroll.touch();
         self.transcript
             .add_child(Arc::new(WrapText::new(colors.error.fg(text), 1, 1)));
     }
@@ -343,6 +359,7 @@ impl ChatView {
 
     /// Applies one rpi agent event to the transcript and footer.
     pub fn apply(&mut self, event: &AgentEvent) {
+        self.scroll.touch();
         self.chrome.observe(event);
         match event {
             AgentEvent::MessageStart {
@@ -476,9 +493,15 @@ impl ChatView {
         }
     }
 
-    /// Lays the whole screen out at `width` x `height` and returns its lines (with ANSI styling).
+    /// Lays the whole screen out at `width` x `height` and returns its lines (with ANSI styling),
+    /// with the "↓ new output" pill on the transcript's last row when it shows.
     pub fn render_frame(&self, width: usize, height: usize) -> Vec<String> {
-        rpi_tui::render_layout_frame(self.root(), width, height).lines
+        let frame = rpi_tui::render_layout_frame(self.root(), width, height);
+        let mut lines = frame.lines.clone();
+        if let Some(pill) = self.scroll.pill() {
+            paint_pill(&frame, &mut lines, pill);
+        }
+        lines
     }
 
     /// [`Self::render_frame`] without styling, right-trimmed: what the render tests compare.

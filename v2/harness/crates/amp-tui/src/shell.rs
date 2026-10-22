@@ -253,6 +253,24 @@ pub const QUIT_HINT: &str = "Press Ctrl+C again to quit";
 /// How long a second Ctrl+C on the empty editor still quits.
 pub const QUIT_HINT_FOR: Duration = Duration::from_millis(1500);
 
+/// After Ctrl+D scrolled the transcript (or was held at its end), Ctrl+D on the empty editor
+/// doesn't quit until it has been left alone this long, so scrolling down with it (or holding
+/// it) stops at the latest output instead of quitting (#2185).
+pub const CTRL_D_SETTLE: Duration = Duration::from_secs(1);
+
+/// What Ctrl+D on the empty editor did ([`Shell::ctrl_d`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtrlD {
+    /// The transcript was scrolled up: it went down half a page.
+    Scrolled,
+    /// At the latest output within [`CTRL_D_SETTLE`] of scrolling with Ctrl+D: nothing.
+    Held,
+    /// A run was going: it was asked to stop.
+    Stopped,
+    /// Quit.
+    Quit,
+}
+
 /// What Ctrl+C did ([`Shell::ctrl_c`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CtrlC {
@@ -310,6 +328,11 @@ pub struct Shell {
     esc_hint_until: Option<Instant>,
     /// Until when a second Ctrl+C on the empty editor quits ([`QUIT_HINT`]).
     quit_hint_until: Option<Instant>,
+    /// Until when Ctrl+D at the latest output doesn't quit ([`CTRL_D_SETTLE`]).
+    ctrl_d_settle_until: Option<Instant>,
+    /// Whether the terminal reports the mouse to us (wheel scrolling, the pill's click). Off,
+    /// the terminal's own click-drag selection works without a modifier (`[tui] mouse`, #2185).
+    mouse_capture: bool,
 }
 
 impl Shell {
@@ -349,6 +372,8 @@ impl Shell {
                 switching: false,
                 esc_hint_until: None,
                 quit_hint_until: None,
+                ctrl_d_settle_until: None,
+                mouse_capture: true,
             },
             done_rx,
         )
@@ -356,6 +381,15 @@ impl Shell {
 
     pub fn view(&self) -> &ChatView {
         &self.view
+    }
+
+    /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
+    pub fn set_mouse_capture(&mut self, on: bool) {
+        self.mouse_capture = on;
+    }
+
+    pub fn mouse_capture(&self) -> bool {
+        self.mouse_capture
     }
 
     pub fn info(&self) -> &ShellInfo {
@@ -777,8 +811,8 @@ impl Shell {
     }
 
     /// A key the editor doesn't get first: the `/` menu's keys ([`crate::slash::CommandMenu`]),
-    /// then an open AMP panel's keys ([`Shell::panel_key`]), then Esc during a run, which stops
-    /// the reply. Returns true when it was used; otherwise the caller gives it to the editor
+    /// then an open AMP panel's keys ([`Shell::panel_key`]), then the transcript's scroll keys
+    /// ([`Shell::scroll_key`]), then Esc during a run, which stops the reply. Returns true when it was used; otherwise the caller gives it to the editor
     /// (Enter on the menu puts the chosen command in the editor and returns false, so the editor
     /// submits it).
     ///
@@ -812,11 +846,63 @@ impl Shell {
             }
             return true;
         }
+        if self.scroll_key(key, editor_empty) {
+            return true;
+        }
         if is_esc && self.running {
             self.abort().await;
             return true;
         }
         false
+    }
+
+    /// The transcript's scroll keys, when no panel took the key (#2185):
+    /// - PageUp / PageDown: a page up or down (the editor's own page keys are Ctrl+PageUp/Down);
+    /// - Ctrl+U: half a page up, with an empty editor (with text, the editor deletes to the line
+    ///   start); Ctrl+D half a page down is [`Shell::ctrl_d`];
+    /// - End: back to the latest output, with an empty editor (with text it moves the cursor to
+    ///   the line end); Ctrl+End always.
+    ///
+    /// Returns whether the key was one of these.
+    pub fn scroll_key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
+        let scroll = self.view.scroll();
+        let mods = key.modifiers;
+        let plain = !mods.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::PageUp if plain => scroll.page_by(-1),
+            KeyCode::PageDown if plain => scroll.page_by(1),
+            KeyCode::Char('u') if mods == KeyModifiers::CONTROL && editor_empty => {
+                scroll.half_page_by(-1)
+            }
+            KeyCode::End if mods == KeyModifiers::CONTROL || (plain && editor_empty) => {
+                scroll.to_end()
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Ctrl+D on the empty editor at `now` (#2185): scrolled up, it scrolls half a page down;
+    /// at the latest output it stops a running reply or quits, as before, unless Ctrl+D scrolled
+    /// within [`CTRL_D_SETTLE`] (then nothing, so scrolling down with it never quits by
+    /// overshooting). With text in the editor, Ctrl+D is the editor's (delete forward).
+    pub async fn ctrl_d(&mut self, now: Instant) -> CtrlD {
+        let scroll = self.view.scroll();
+        if !scroll.at_end() {
+            scroll.half_page_by(1);
+            self.ctrl_d_settle_until = Some(now + CTRL_D_SETTLE);
+            return CtrlD::Scrolled;
+        }
+        if self.ctrl_d_settle_until.is_some_and(|until| now < until) {
+            self.ctrl_d_settle_until = Some(now + CTRL_D_SETTLE);
+            return CtrlD::Held;
+        }
+        self.ctrl_d_settle_until = None;
+        if self.running {
+            self.abort().await;
+            return CtrlD::Stopped;
+        }
+        CtrlD::Quit
     }
 
     fn show_esc_hint(&mut self) {
