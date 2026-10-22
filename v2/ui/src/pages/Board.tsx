@@ -25,6 +25,9 @@ import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOw
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
 import { HUMAN_REASONS } from '../lib/human'
 import { BandLoader } from '../components/brand/BandLoader'
+import { PlanApprovalBanner } from '../components/PlanApprovalBanner'
+import { usePlanApproval } from '../hooks/usePlanApproval'
+import { awaitingApproval } from '../lib/approval'
 
 // Label column width and task column min-width are tuned for responsiveness.
 // Label col: 180px | task col: 168px → total minimum = 180 + 5×168 = 1020px (fits 13" screens)
@@ -84,6 +87,9 @@ export function Board() {
   const [openReassign, setOpenReassign] = useState(false)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
+  // Tickets waiting on the person's approval, shown above the board.
+  const approval = usePlanApproval(pid)
+  const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
   const ownersOf = (ids: number[] | undefined): Person[] =>
     (ids ?? []).map(id => lookupPerson(people, id)!)
 
@@ -375,6 +381,13 @@ export function Board() {
           </>
         }
       />
+
+      {awaiting.length > 0 && (
+        <div className="px-5 pt-3 flex-shrink-0">
+          <PlanApprovalBanner variant="compact" projectId={pid} project={approval.project} awaiting={awaiting} people={people}
+            onApprove={() => { approval.approve() }} approving={approval.approving} error={approval.error} onOpen={setSelectedTaskId} />
+        </div>
+      )}
 
       {/* Filter bar */}
       <div className="px-5 py-3 flex-shrink-0" style={{ borderBottom: '1px solid var(--line-sub)', background: 'var(--bg)' }}>

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play } from 'lucide-react'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
+import { isRelayed, relayedFor } from '../lib/approval'
 import { api } from '../api/client'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
@@ -784,7 +785,10 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
 
   return (
     <div className="space-y-0">
-      {history.map((entry, i) => (
+      {history.map((entry, i) => {
+        // A manager passing on its person's answer over MCP: shown apart from the person's own words.
+        const relayed = isRelayed(entry.actor)
+        return (
         <div key={entry.id} className="flex gap-3">
           <div className="flex flex-col items-center flex-shrink-0">
             <div className="mt-1.5">
@@ -794,7 +798,12 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
           </div>
           <div className="pb-5 flex-1 min-w-0">
             <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-              <span className="text-xs font-semibold text-ink">{activityActor(entry, people)}</span>
+              <span className="text-xs font-semibold text-ink">{relayed ? (lookupPerson(people, entry.actor_user_id)?.name ?? relayedFor(entry.actor)) : activityActor(entry, people)}</span>
+              {relayed && (
+                <span className="inline-flex items-center gap-1 font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border border-dashed border-line-str text-ink-2"
+                  title="An agent passed this on for the person over MCP. They didn't type it in AMP themselves.">
+                  <Bot size={10} aria-hidden="true" />Relayed by agent</span>
+              )}
               <span className="text-ink-3 text-xs">·</span>
               <span className="text-xs text-ink-2 capitalize">{entry.action.replace('_', ' ')}</span>
               {entry.from_state && entry.to_state && (
@@ -807,7 +816,7 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
             {entry.detail && (
               <div className={`text-xs rounded-xl px-3.5 py-2.5 leading-relaxed whitespace-pre-wrap ${
                 entry.action === 'comment'
-                  ? 'bg-bg border border-line-sub text-ink'
+                  ? `bg-bg border text-ink ${relayed ? 'border-dashed border-line-str' : 'border-line-sub'}`
                   : 'text-ink-2'
               }`}>
                 {entry.detail}
@@ -815,7 +824,8 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
             )}
           </div>
         </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
@@ -888,7 +898,7 @@ function HumanWork({ task, meId, people, onChanged }: {
       <span className="amp-label flex items-center gap-1.5"><UserRound size={12} />
         {owner ? `${owner.name} does this` : 'A person does this'} · {reasonLabel(task.human_reason)}</span>
       <p className="m-0 text-[13px] leading-relaxed text-ink-2">
-        {reasonHint(task.human_reason)}. Agents never pick it up; the work that depends on it starts when it's marked done.
+        {reasonHint(task.human_reason)}. Agents never pick it up, and they can't mark it done: only {owner ? owner.name : 'its owner'} can, here in AMP. The work that depends on it starts then.
       </p>
       {waiting ? (
         <span className="text-[12.5px] text-ink-2">Waiting on #{(task.blocked_by_ids ?? task.dependency_ids).join(', #')} before it can start.</span>

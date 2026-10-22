@@ -15,6 +15,9 @@ import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { LastApproved } from '../components/PlanApprovalBanner'
+import { useProjectPeople } from '../hooks/useProjectPeople'
+import { planPath } from '../lib/approval'
 
 const slug = (t: string) => t.toLowerCase().replace(/[^a-z]+/g, '-')
 
@@ -48,6 +51,7 @@ export function ProjectSettings() {
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
   const canManage = canManageProject(myAccess)
+  const { people: approvalPeople } = useProjectPeople(pid)
   // The edited metadata; null until the user changes something.
   const [meta, setMeta] = useState<{ value: Metadata; error: string | null } | null>(null)
   const [metaSaving, setMetaSaving] = useState(false)
@@ -159,7 +163,7 @@ export function ProjectSettings() {
               </Section>
 
               <Section title="Plan approval"
-                description="Agents plan; a person approves before they start. With this on, tickets planned after the last approval can't be dispatched until someone approves the plan in Flight plan (or tells the orchestrator, which records it with amp_approve_plan).">
+                description="Agents plan; a person approves before they start. With this on, tickets planned (or rewritten) after the last approval can't be dispatched until a person approves the plan in Flight plan. Only a person can approve, here in the AMP web UI: agents, and managers acting for you over MCP, can't approve, and an agent saying you approved in chat doesn't count.">
                 <label className="flex items-center gap-3 text-[13px] text-ink cursor-pointer select-none">
                   <input type="checkbox" className="w-4 h-4 accent-[var(--ink)]" disabled={!canManage}
                     checked={!!project.require_plan_approval}
@@ -168,11 +172,17 @@ export function ProjectSettings() {
                       try { setProject(await api.updateProjectSettings(pid, { require_plan_approval: on })) }
                       catch (err) { setError(err instanceof Error ? err.message : 'Could not change the setting') }
                     }} />
-                  Require approval before agents start new tickets
+                  Require a person's approval before agents start new tickets
                 </label>
-                <p className="m-0 mt-2 text-[12px] text-ink-2">{project.plan_approved_at
-                  ? <>Last approved <span className="amp-num">{new Date(project.plan_approved_at).toLocaleString()}</span>.</>
-                  : 'The plan has never been approved.'}</p>
+                <p className="m-0 mt-2 text-[12px] text-ink-2 leading-relaxed">
+                  {project.require_plan_approval
+                    ? <>On. Turning it off works only from this page; agents asking over MCP are refused.</>
+                    : <>Off: agents can start tickets nobody has approved. Turn it back on any time.</>}
+                </p>
+                <p className="m-0 mt-1 text-[12px] text-ink-2">
+                  <LastApproved project={project} people={approvalPeople} />{' '}
+                  <Link to={`${planPath(pid)}#approve`} className="text-ink underline underline-offset-2">Review and approve in Flight plan</Link>
+                </p>
               </Section>
 
               <Section title="Metadata"
