@@ -23,10 +23,18 @@ pub enum McpError {
     #[error("http client: {0}")]
     Http(String),
 
-    /// The server answered 401/403. `challenge` is its `WWW-Authenticate` header when it sent one;
-    /// the OAuth flow (M1-3) starts from it.
-    #[error("AMP authorization required (log in, or set AMP_TOKEN)")]
+    /// The server answered 401/403, or a stored login can no longer be refreshed: re-login needed.
+    /// `challenge` is the `WWW-Authenticate` header when the server sent one; `login` starts from it.
+    #[error("AMP login required: run `amp-harness login` (or set AMP_TOKEN)")]
     AuthRequired { challenge: Option<String> },
+
+    /// The OAuth flow failed (discovery, registration, the browser step, the token exchange).
+    #[error("OAuth: {0}")]
+    OAuth(String),
+
+    /// The keychain or credentials file could not be read or written.
+    #[error("credential store: {0}")]
+    CredentialStore(String),
 
     /// The MCP lifecycle (discover and/or initialize) failed.
     #[error("connect to {url}: {source}")]
@@ -81,7 +89,13 @@ impl McpError {
     }
 
     pub(crate) fn from_service(operation: &str, error: ServiceError) -> Self {
-        if let Some(challenge) = auth_challenge_in_chain(&error) {
+        // `ServiceError::TransportSend` doesn't expose its transport error as `source()`, so a
+        // mid-session 401 is only found by starting the walk at the transport error itself.
+        let start: &(dyn std::error::Error + 'static) = match &error {
+            ServiceError::TransportSend(transport) => transport,
+            other => other,
+        };
+        if let Some(challenge) = auth_challenge_in_chain(start) {
             return Self::AuthRequired { challenge };
         }
         if matches!(error, ServiceError::TransportClosed) {

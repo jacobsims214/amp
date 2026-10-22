@@ -122,6 +122,9 @@ pub struct ServerSession {
     pub server_version: Option<String>,
     /// AMP's server instructions (from `server/discover`, or `initialize` on the legacy path).
     pub instructions: Option<String>,
+    /// How we authenticated, for `doctor` (e.g. `none`, `static token (env AMP_TOKEN)`,
+    /// `oauth (macOS Keychain ...)`). Never contains a secret.
+    pub auth: String,
 }
 
 /// The rmcp client-side handler: identifies us and notices `tools/list_changed`.
@@ -252,6 +255,7 @@ impl AmpMcpClient {
             server_name: info.server_info.as_ref().map(|s| s.name.clone()),
             server_version: info.server_info.as_ref().map(|s| s.version.clone()),
             instructions: info.instructions.clone(),
+            auth: options.auth.describe(),
         };
         tracing::debug!(
             url = %session.url,
@@ -274,6 +278,10 @@ impl AmpMcpClient {
 
     pub fn session(&self) -> &ServerSession {
         &self.session
+    }
+
+    pub(crate) fn set_auth_description(&mut self, auth: String) {
+        self.session.auth = auth;
     }
 
     /// AMP's server instructions, for the system prompt.
