@@ -5,7 +5,8 @@
 //! Covers: a completed run carries model, tokens and git (pushed) without overwriting what
 //! the model set; a blocked run on an unpushed commit; calls on another ticket are left alone;
 //! `amp_session_usage` for a worker; abandoned runs (error, turn budget) reported with
-//! `amp_report_run` and a note; AMP refusing that report; a read-only worker reports no git.
+//! `amp_report_run` and a note; AMP refusing that report; a read-only worker reports no git; a
+//! worker stopped (cancelled, over its turn budget) after closing its ticket is not abandoned.
 
 mod common;
 
@@ -454,4 +455,130 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
         "{:?}",
         r.notes
     );
+}
+
+/// A step that cancels `token` (as the manager's abort or Ctrl-C would, mid-turn), then starts a
+/// long bash call so the run is still going when the supervisor sees the cancel.
+fn cancel_then_sleep(token: CancellationToken) -> FauxStep {
+    FauxStep::factory(move |_ctx: &Context| {
+        token.cancel();
+        faux_assistant_message(
+            vec![
+                FauxBlock::text("Wrapping up."),
+                FauxBlock::tool_call("bash", json!({"command": "sleep 30"})),
+            ],
+            StopReason::ToolUse,
+        )
+    })
+}
+
+fn sleep_call() -> FauxStep {
+    template(
+        "One more thing.",
+        json!([{"name": "bash", "arguments": {"command": "sleep 30"}}]),
+    )
+}
+
+fn complete_call(task_id: i64) -> FauxStep {
+    template(
+        "Done.",
+        json!([{"name": "amp_complete_task", "arguments": {"task_id": task_id}}]),
+    )
+}
+
+// #2146: a worker stopped after its closing call succeeded keeps its outcome; reporting an
+// abandoned run as well would count the work as rework and its tokens twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
+    let f = fixture("stopped-after-close", false).await;
+
+    // 1. Completed, then cancelled during its final turn.
+    let sup = f.supervisor(config());
+    let signal = CancellationToken::new();
+    f.script(vec![complete_call(2087), cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(2087, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert_eq!(r.error, None, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("stopped after closing its ticket: cancelled")),
+        "{:?}",
+        r.notes
+    );
+    assert_eq!(f.calls("amp_complete_task").len(), 1);
+    assert!(f.calls("amp_report_run").is_empty(), "no abandoned run");
+
+    // 2. Blocked, then over its turn budget on the next turn.
+    let sup = f.supervisor(SupervisorConfig {
+        max_turns: 1,
+        ..config()
+    });
+    f.script(vec![
+        template(
+            "Need an answer.",
+            json!([{"name": "amp_block_task", "arguments": {"task_id": 2088, "reason": "A or B?"}}]),
+        ),
+        sleep_call(),
+    ]);
+    let r = sup
+        .run_ticket(req(2088, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Blocked, "{r:?}");
+    assert_eq!(r.error, None, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("stopped after closing its ticket: turn_budget")),
+        "{:?}",
+        r.notes
+    );
+    assert!(f.calls("amp_report_run").is_empty(), "no abandoned run");
+
+    // 3. Completed, then over its turn budget.
+    f.script(vec![complete_call(2089), sleep_call()]);
+    let r = sup
+        .run_ticket(req(2089, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Completed, "{r:?}");
+    assert!(f.calls("amp_report_run").is_empty(), "no abandoned run");
+
+    // 4. Cancelled before closing anything: still an abandoned run.
+    let sup = f.supervisor(config());
+    let signal = CancellationToken::new();
+    f.script(vec![cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(2090, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["task_id"], 2090);
+    assert_eq!(runs[0]["outcome"], "abandoned");
+    assert!(
+        runs[0]["run_note"]
+            .as_str()
+            .unwrap()
+            .starts_with("abandoned: cancelled"),
+        "{}",
+        runs[0]
+    );
+
+    // 5. Closing some other ticket does not close its own: cancelled after it is still abandoned.
+    let signal = CancellationToken::new();
+    f.script(vec![complete_call(9999), cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(2091, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1]["task_id"], 2091);
 }

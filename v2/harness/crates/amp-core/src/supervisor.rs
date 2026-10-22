@@ -746,6 +746,9 @@ impl Supervisor {
                 {
                     finish.text = text;
                 }
+                // Read after the abort settled: a closing call can end during the grace period.
+                let closed = *watch.closed.lock().unwrap();
+                let finish = finish.after_closing(closed, &mut notes);
                 return self.finish(&info, started, notes, finish).await;
             }
         };
@@ -790,6 +793,7 @@ impl Supervisor {
             finish.text = last;
         }
         finish.session_file = session_file;
+        let finish = finish.after_closing(closed, &mut notes);
         self.finish(&info, started, notes, finish).await
     }
 
@@ -915,6 +919,36 @@ impl Finish {
             error: Some(message.into()),
             text: String::new(),
             session_file: None,
+        }
+    }
+
+    /// A worker whose `amp_complete_task` / `amp_block_task` on its own ticket already succeeded
+    /// keeps that outcome, however its run then ended (cancelled, timed out, over its turn budget,
+    /// aborted or failed on a later turn). The ticket is closed and its run recorded with the
+    /// closing call, so this is not an abandoned run: reporting one would count the work as rework
+    /// and its tokens twice. The reason it stopped becomes a note, not an error.
+    fn after_closing(self, closed: Option<WorkerOutcome>, notes: &mut Vec<String>) -> Self {
+        let Some(closed) = closed else {
+            return self;
+        };
+        if self.outcome.closed_ticket() {
+            return self;
+        }
+        let mut why = self.outcome.as_str().to_owned();
+        if let Some(err) = self
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        {
+            why.push_str(": ");
+            why.push_str(err);
+        }
+        notes.push(format!("stopped after closing its ticket: {why}"));
+        Self {
+            outcome: closed,
+            error: None,
+            ..self
         }
     }
 }
@@ -1351,6 +1385,39 @@ mod tests {
         }
         assert!(WorkerOutcome::Blocked.closed_ticket());
         assert!(!WorkerOutcome::Stopped.closed_ticket());
+    }
+
+    #[test]
+    fn a_closed_ticket_outlives_how_the_run_ended() {
+        let stopped = |outcome, error: Option<&str>| Finish {
+            outcome,
+            error: error.map(str::to_owned),
+            text: String::new(),
+            session_file: None,
+        };
+        // Closed, then budget-stopped: keeps the closing outcome; the reason is a note.
+        let mut notes = Vec::new();
+        let f = stopped(
+            WorkerOutcome::TurnBudget,
+            Some("turn budget of 1 turns used up"),
+        )
+        .after_closing(Some(WorkerOutcome::Completed), &mut notes);
+        assert_eq!((f.outcome, f.error), (WorkerOutcome::Completed, None));
+        assert_eq!(
+            notes,
+            vec!["stopped after closing its ticket: turn_budget: turn budget of 1 turns used up"]
+        );
+        // Never closed: unchanged.
+        let mut notes = Vec::new();
+        let f = stopped(WorkerOutcome::Cancelled, Some("every worker was cancelled"))
+            .after_closing(None, &mut notes);
+        assert_eq!(f.outcome, WorkerOutcome::Cancelled);
+        assert!(f.error.is_some() && notes.is_empty());
+        // Already the closing outcome: no note.
+        let f = stopped(WorkerOutcome::Blocked, None)
+            .after_closing(Some(WorkerOutcome::Blocked), &mut notes);
+        assert_eq!(f.outcome, WorkerOutcome::Blocked);
+        assert!(notes.is_empty());
     }
 
     #[test]
