@@ -53,11 +53,20 @@
 //! bash would hide whole commands inside one that matches an allow rule, so the harness fails
 //! closed.
 //!
+//! Paths are resolved the way rpi-tools resolves them before it touches the disk
+//! ([`resolve_tool_path`], [`resolve_read_tool_path`]): a leading `@` is stripped, unicode spaces
+//! become ASCII spaces, `~` and `~/` expand to the home directory, `file://` URLs become paths,
+//! and `.`/`..` collapse. Then symlinks are followed ([`resolve_symlinks`]) and the result is
+//! compared with the worktree root with its own symlinks resolved. So `~/.ssh/x`, `@../x` and a
+//! link inside the worktree that points outside it all count as outside, and the globs see the
+//! path of the file that would really be written.
+//!
 //! rpi-tools has no `webfetch`, `websearch`, `todowrite` or `question` tool, so those rules only
 //! matter if a later ticket adds such a tool.
 
 use std::{
-    fmt,
+    ffi::OsString,
+    fmt, fs,
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
@@ -860,7 +869,7 @@ impl ToolPolicy {
             }
             "edit" | "write" => {
                 let raw = str_arg(args, &["path", "file_path", "filePath"]).ok_or_else(missing)?;
-                let (inside, rel) = self.relative_path(raw);
+                let (inside, rel) = self.classify(&resolve_tool_path(&self.root, raw));
                 let mut checks = Vec::new();
                 if !inside {
                     checks.push(Check::new("external_directory", rel.clone()));
@@ -883,7 +892,7 @@ impl ToolPolicy {
             )],
             "read" | "grep" | "find" | "ls" => {
                 let subject = str_arg(args, &["path", "file_path"])
-                    .map(|p| self.relative_path(p).1)
+                    .map(|p| self.classify(&resolve_read_tool_path(&self.root, p)).1)
                     .unwrap_or_else(|| "*".into());
                 vec![Check::new(permission, subject)]
             }
@@ -947,18 +956,17 @@ impl ToolPolicy {
         )
     }
 
-    /// `(inside root, path relative to root or absolute if outside)`.
-    fn relative_path(&self, raw: &str) -> (bool, String) {
-        let path = Path::new(raw);
-        let abs = if path.is_absolute() {
-            lexical_normalize(path)
-        } else {
-            lexical_normalize(&self.root.join(path))
-        };
-        match abs.strip_prefix(&self.root) {
+    /// `(inside root, path relative to root or absolute if outside)` for a path the tool has
+    /// already resolved ([`resolve_tool_path`]). Symlinks are followed on both sides, so a link
+    /// that leaves the root is outside and the subject names the file that would be touched.
+    fn classify(&self, abs: &Path) -> (bool, String) {
+        let real = resolve_symlinks(abs);
+        // Resolved per call: the worktree may be created after the policy.
+        let root = resolve_symlinks(&self.root);
+        match real.strip_prefix(&root) {
             Ok(rel) if rel.as_os_str().is_empty() => (true, ".".into()),
             Ok(rel) => (true, rel.to_string_lossy().replace('\\', "/")),
-            Err(_) => (false, abs.to_string_lossy().replace('\\', "/")),
+            Err(_) => (false, real.to_string_lossy().replace('\\', "/")),
         }
     }
 }
@@ -1002,6 +1010,172 @@ fn lexical_normalize(path: &Path) -> PathBuf {
             }
             other => out.push(other.as_os_str()),
         }
+    }
+    out
+}
+
+/// Where rpi-tools 0.8.0's `write` and `edit` tools put `raw` when their cwd is `cwd`, before any
+/// symlink is followed: `rpi_tools::resolve_tool_path` on an `OsExecutionEnv`. That is
+/// `normalize_tool_path` (unicode spaces to ASCII, one leading `@` stripped), then
+/// `OsExecutionEnv::resolve_path`: `~` and `~/` expand to `dirs::home_dir()` (empty if unknown,
+/// and no `~user`), a `file://` URL becomes its path, a relative path is joined to `cwd`, and `.`
+/// and `..` collapse (`..` at `/` stays at `/`). Kept in step with rpi by
+/// `tests/roles_policy.rs::policy_resolves_paths_exactly_like_rpi_tools`.
+pub fn resolve_tool_path(cwd: &Path, raw: &str) -> PathBuf {
+    let mut p = rpi_tools::normalize_tool_path(raw);
+    if p == "~" {
+        p = home_dir_string();
+    } else if let Some(rest) = p.strip_prefix("~/") {
+        p = format!("{}/{}", home_dir_string(), rest);
+    } else if cfg!(windows)
+        && let Some(rest) = p.strip_prefix("~\\")
+    {
+        p = format!("{}\\{}", home_dir_string(), rest);
+    }
+    if p.starts_with("file://")
+        && let Some(local) = file_url_to_path(&p)
+    {
+        p = local;
+    }
+    let pb = PathBuf::from(&p);
+    if pb.is_absolute() {
+        rpi_normalize(&pb)
+    } else {
+        rpi_normalize(&cwd.join(pb))
+    }
+}
+
+/// Where rpi-tools 0.8.0's `read`, `grep`, `find` and `ls` tools look for `raw`
+/// (`rpi_tools::resolve_read_tool_path`): [`resolve_tool_path`], then the first of its typographic
+/// variants that exists (`lstat`): itself, a narrow no-break space before `AM.`/`PM.`, NFD, `'` as
+/// `’`, and NFD with `’`. None exists: the resolved path.
+pub fn resolve_read_tool_path(cwd: &Path, raw: &str) -> PathBuf {
+    use unicode_normalization::UnicodeNormalization;
+    let resolved = resolve_tool_path(cwd, raw).to_string_lossy().into_owned();
+    let nfd: String = resolved.nfd().collect();
+    let variants = [
+        resolved.clone(),
+        replace_am_pm_space(&resolved),
+        nfd.clone(),
+        resolved.replace('\'', "\u{2019}"),
+        nfd.replace('\'', "\u{2019}"),
+    ];
+    variants
+        .iter()
+        .find(|v| fs::symlink_metadata(v).is_ok())
+        .map_or_else(|| PathBuf::from(&resolved), PathBuf::from)
+}
+
+/// The path the OS would really open for the absolute, normalized `path`: the longest ancestor
+/// that exists is canonicalized (every symlink in it followed), and the missing rest is put back.
+/// A dangling symlink just past that ancestor is followed too, because writing through it creates
+/// its target. `..` in a dangling link's target is collapsed lexically.
+pub fn resolve_symlinks(path: &Path) -> PathBuf {
+    // The kernel's own limit on links followed in one lookup (Linux and macOS: 40 and 32).
+    const MAX_LINKS: usize = 40;
+    let mut path = path.to_path_buf();
+    for _ in 0..MAX_LINKS {
+        let mut base = path.clone();
+        let mut tail: Vec<OsString> = Vec::new();
+        let mut real = loop {
+            if let Ok(real) = fs::canonicalize(&base) {
+                break real;
+            }
+            match (base.file_name().map(|n| n.to_os_string()), base.parent()) {
+                (Some(name), Some(parent)) => {
+                    tail.push(name);
+                    base = parent.to_path_buf();
+                }
+                _ => return path,
+            }
+        };
+        let Some(first) = tail.pop() else {
+            return real;
+        };
+        let next = real.join(&first);
+        if let Ok(target) = fs::read_link(&next) {
+            let mut followed = real.join(target);
+            followed.extend(tail.iter().rev());
+            path = lexical_normalize(&followed);
+            continue;
+        }
+        real.push(first);
+        real.extend(tail.iter().rev());
+        return real;
+    }
+    // A link loop: the tool fails with ELOOP, so any subject will do.
+    path
+}
+
+fn home_dir_string() -> String {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// rpi-tools' `normalize_absolute`: drops `.`, and `..` pops (a no-op at the root).
+fn rpi_normalize(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// rpi-tools' `file_url_to_path`: `file:///abs` → `/abs`, `file:///C:/x` → `C:/x`,
+/// `file://rest` → `rest`. No percent-decoding.
+fn file_url_to_path(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("file://")?;
+    if let Some(drive_rest) = rest.strip_prefix('/') {
+        if drive_rest.len() >= 2 && drive_rest.as_bytes()[1] == b':' {
+            return Some(drive_rest.to_string());
+        }
+        return Some(format!("/{drive_rest}"));
+    }
+    Some(rest.to_string())
+}
+
+/// rpi-tools' `replace_am_pm_space`: ` AM.`/` PM.` (ASCII, any case) get a narrow no-break space.
+fn replace_am_pm_space(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 3 < bytes.len() && bytes[i] == b' ' {
+            let a = bytes[i + 1].to_ascii_lowercase();
+            let m = bytes[i + 2].to_ascii_lowercase();
+            if (a == b'a' || a == b'p') && m == b'm' && bytes[i + 3] == b'.' {
+                out.push('\u{202F}');
+                out.push(bytes[i + 1] as char);
+                out.push(bytes[i + 2] as char);
+                out.push('.');
+                i += 4;
+                continue;
+            }
+        }
+        let first = bytes[i];
+        let len = if first < 0x80 {
+            1
+        } else if first >> 5 == 0b110 {
+            2
+        } else if first >> 4 == 0b1110 {
+            3
+        } else if first >> 3 == 0b11110 {
+            4
+        } else {
+            1
+        };
+        let end = (i + len).min(bytes.len());
+        if let Ok(slice) = std::str::from_utf8(&bytes[i..end]) {
+            out.push_str(slice);
+        }
+        i = end;
     }
     out
 }
@@ -1340,11 +1514,12 @@ mod tests {
             tp.check("edit", &json!({"path": "docs/../src/a.rs"}))
                 .is_err()
         );
+        // (A directory that doesn't exist: on macOS `/etc` is a link to `/private/etc`.)
         let d = tp
-            .check("write", &json!({"path": "../../etc/passwd"}))
+            .check("write", &json!({"path": "../../amp-no-such-dir/passwd"}))
             .unwrap_err();
         assert_eq!(d.permission, "external_directory");
-        assert_eq!(d.subject, "/etc/passwd");
+        assert_eq!(d.subject, "/amp-no-such-dir/passwd");
         assert_eq!(d.reason, DenialReason::Ask);
         assert_eq!(
             tp.check("write", &json!({})).unwrap_err().reason,

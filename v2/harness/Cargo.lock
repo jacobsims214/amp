@@ -66,6 +66,7 @@ version = "0.1.0"
 dependencies = [
  "amp-mcp",
  "async-trait",
+ "dirs",
  "include_dir",
  "keyring",
  "rpi-agent",
@@ -78,6 +79,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "unicode-normalization",
  "yaml_serde",
 ]
 
