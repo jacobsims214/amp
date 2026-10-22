@@ -267,6 +267,134 @@ pub fn marker_component(meta: &AmpMeta) -> Arc<TicketMarker> {
     Arc::new(TicketMarker::new(kind, meta))
 }
 
+/// What the person sees when AMP refused a step only they take, in the web UI (#2171): drawn
+/// under the refused tool call.
+///
+/// ```text
+///   ⏸ Waiting for your approval
+///     Plan approval is done by a person in the AMP web UI, not by an agent or over MCP: …
+///     Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)
+///     The manager stopped here; nothing else was run.
+/// ```
+///
+/// The server's sentence is untrusted text ([`clean`]); the link is built from the instance's URL
+/// helpers when AMP is connected, else the server's link is shown as plain text.
+pub struct ApprovalNotice {
+    refusal: amp_core::approval::Refusal,
+    /// The clickable link (from [`amp_core::meta::Instance`]), and the command that opens it.
+    url: Option<(String, &'static str)>,
+}
+
+impl ApprovalNotice {
+    pub fn new(refusal: amp_core::approval::Refusal, meta: Option<&AmpMeta>) -> Self {
+        use amp_core::approval::RefusalKind;
+        let url = meta.and_then(|m| {
+            let inst = m.instance.as_ref()?;
+            let pid = refusal.project_id.or(m.project_id)?;
+            Some(match (refusal.kind, refusal.ticket_id) {
+                (RefusalKind::PlanApproval, _) => (inst.plan_url(pid), "/open plan"),
+                (_, Some(t)) => (inst.ticket_url(pid, t), "/open <id>"),
+                _ => (inst.project_url(pid), "/open"),
+            })
+        });
+        Self { refusal, url }
+    }
+
+    pub fn refusal(&self) -> &amp_core::approval::Refusal {
+        &self.refusal
+    }
+
+    /// The clickable link, if AMP is connected.
+    pub fn url(&self) -> Option<&str> {
+        self.url.as_ref().map(|(u, _)| u.as_str())
+    }
+}
+
+/// Greedy word wrap of plain text to `width` cells (a word longer than a line is cut).
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let w = visible_width(word);
+        let used = visible_width(&line);
+        if !line.is_empty() && used + 1 + w > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if line.is_empty() && w > width {
+            lines.push(shorten(word, width));
+            continue;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+impl Component for ApprovalNotice {
+    fn render(&self, width: usize) -> Vec<String> {
+        use amp_core::approval::RefusalKind;
+        let c = rpi_tui::theme().colors;
+        let indent = "    ";
+        let room = width.saturating_sub(indent.len());
+        let (title, action) = match self.refusal.kind {
+            RefusalKind::PlanApproval => ("⏸ Waiting for your approval", "Approve it in AMP:"),
+            RefusalKind::PersonInUi => ("⏸ Waiting for you in the AMP web UI", "Do it in AMP:"),
+        };
+        let mut out = vec![
+            String::new(),
+            format!(
+                "  {}",
+                rpi_tui::bold(&c.warning.fg(&shorten(title, width.saturating_sub(2))))
+            ),
+        ];
+        for line in wrap_plain(&clean(&self.refusal.message), room) {
+            out.push(format!("{indent}{}", c.muted.fg(&line)));
+        }
+        match &self.url {
+            Some((url, cmd)) => {
+                let shown = shorten(url, room.saturating_sub(visible_width(action) + 1));
+                let mut line = format!(
+                    "{indent}{} {}",
+                    c.text.fg(action),
+                    link(url, &c.accent.fg(&shown))
+                );
+                let tail = format!("   ({cmd})");
+                if visible_width(&line) + visible_width(&tail) <= width {
+                    line.push_str(&c.dim.fg(&tail));
+                }
+                out.push(line);
+            }
+            None => {
+                if let Some(l) = &self.refusal.link {
+                    let text = format!("{action} {}", clean(l));
+                    for line in wrap_plain(&text, room) {
+                        out.push(format!("{indent}{}", c.text.fg(&line)));
+                    }
+                }
+            }
+        }
+        for line in wrap_plain(
+            "The manager stopped here; nothing else was run. Reply once it's done.",
+            room,
+        ) {
+            out.push(format!("{indent}{}", c.dim.fg(&line)));
+        }
+        out
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

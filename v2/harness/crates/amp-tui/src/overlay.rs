@@ -980,20 +980,38 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
                 flex(plan.plan_approved_at.as_deref().unwrap_or(""), c.dim),
             ])),
             Some(plan) => {
+                // #2171: a person approves in the web UI; agents can't. Say so, and link the
+                // Flight plan page (`o` on these rows, or `/open plan`).
                 let ids: Vec<String> = plan
                     .awaiting_approval
                     .iter()
                     .take(12)
                     .map(|id| format!("#{id}"))
                     .collect();
-                rows.push(Row::new(vec![
+                let approve = m.instance.as_ref().map(|i| i.plan_url(pid));
+                let mut row = Row::new(vec![
                     label("approval"),
                     fixed(c.warning.fg(&format!(
-                        "{} awaiting approval",
+                        "{} waiting for your approval",
                         plan.awaiting_approval.len()
                     ))),
                     flex(&ids.join(" "), c.muted),
-                ]));
+                ]);
+                let mut hint = Row::new(vec![
+                    fixed(c.dim.fg("approve the plan in AMP:")),
+                    match &approve {
+                        Some(url) => fixed(link(url, &c.accent.fg(url))),
+                        None => flex("the project's Flight plan page", c.dim),
+                    },
+                    fixed(c.dim.fg("(o or /open plan)")),
+                ])
+                .indent(2);
+                if let Some(url) = approve {
+                    row = row.target(Target::Page(url.clone()));
+                    hint = hint.target(Target::Page(url));
+                }
+                rows.push(row);
+                rows.push(hint);
             }
             None => rows.push(Row::new(vec![label("approval"), flex("loading…", c.dim)])),
         }

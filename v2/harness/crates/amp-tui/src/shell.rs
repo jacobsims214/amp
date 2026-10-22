@@ -48,7 +48,7 @@ use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome, Run
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-use crate::amp_render;
+use crate::amp_render::{self, ApprovalNotice};
 use crate::overlay::{self, PanelKind, PanelState, Stage, Target};
 use crate::view::{ChatView, FooterInfo};
 
@@ -170,7 +170,7 @@ pub enum Submit {
     Quit,
 }
 
-pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id]\n\
+pub const HELP: &str = "AMP: /amp  /ticket [id|none]  /workers  /questions  /plan  /project [id]  /open [id|plan]\n\
 server: /server (list)  /server <name|address> (switch AMP server)\n\
 commands: /model [provider/model]  /usage  /help  /quit\n\
 keys: Enter send · Shift+Enter new line · Esc abort the run (or close a panel) · Ctrl+C abort, clear, or quit";
@@ -392,6 +392,23 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        // #2171: AMP refused a step only a person takes in the web UI (approving the plan, a
+        // person's ticket). Say so plainly under the tool call, with the link; the harness ends
+        // the manager's turn.
+        if let AgentEvent::ToolExecutionEnd {
+            tool_name,
+            result,
+            is_error: true,
+            ..
+        } = event
+            && tool_name.starts_with("amp_")
+            && let Some(refusal) =
+                amp_core::approval::refusal(&amp_core::events::tool_result_text(result))
+        {
+            let snapshot = self.meta.as_ref().map(|m| m.snapshot());
+            self.view
+                .add_to_transcript(Arc::new(ApprovalNotice::new(refusal, snapshot.as_deref())));
+        }
     }
 
     /// Handles one editor submission: a slash command or a prompt to the agent.
@@ -683,6 +700,22 @@ impl Shell {
             return;
         };
         let m = meta.snapshot();
+        // `/open plan`: the Flight plan page, where a person approves the plan (#2171).
+        if arg.eq_ignore_ascii_case("plan") {
+            match (&m.instance, m.project_id) {
+                (Some(inst), Some(pid)) => {
+                    let url = inst.plan_url(pid);
+                    self.open_url(&url);
+                }
+                (None, _) => self
+                    .view
+                    .add_error("/open: not connected to AMP yet (no instance to link to)"),
+                (Some(_), None) => self
+                    .view
+                    .add_error("/open plan: no project yet (/project <id>)"),
+            }
+            return;
+        }
         let ticket = if arg.is_empty() {
             m.ticket_id
         } else {

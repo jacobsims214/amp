@@ -415,9 +415,21 @@ async fn plan_shows_the_tree_and_approval() {
     rig.say("/plan").await;
     let screen = rig.screen();
     assert!(screen.contains("AMP · plan"), "{screen}");
+    // #2171: the person approves, in the web UI; the row and its hint link the Flight plan page.
     assert!(
-        screen.contains("approval 2 awaiting approval #2108 #2109"),
+        screen.contains("approval 2 waiting for your approval #2108 #2109"),
         "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "approve the plan in AMP: https://amp.simstech.cloud/project/2/plan (o or /open plan)"
+        ),
+        "{screen}"
+    );
+    let frame = rig.shell.view().render_frame(W, H).join("\n");
+    assert!(
+        frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07"),
+        "the plan link is an OSC 8 hyperlink"
     );
     assert!(screen.contains("▌ Earlier ■ 12 Done"), "{screen}");
     // The six web words with state marks: the story's three blocked tickets are a question, a
@@ -444,10 +456,11 @@ async fn plan_shows_the_tree_and_approval() {
             json!({"project_id": 2, "owner": "any", "state": "blocked", "format": "full"})
         )
     );
+    // The first row is the approval: Enter opens the Flight plan page.
     rig.press(KeyCode::Enter).await;
     assert_eq!(
         rig.opened(),
-        vec!["https://amp.simstech.cloud/project/2".to_owned()]
+        vec!["https://amp.simstech.cloud/project/2/plan".to_owned()]
     );
     assert_fits(&rig);
 }
@@ -492,6 +505,12 @@ async fn open_opens_only_urls_from_the_helpers() {
     );
     rig.say("/open nope").await;
     assert!(rig.screen().contains("/open: `nope` is not a ticket id"));
+    // `/open plan`: the Flight plan page, where a person approves (#2171).
+    rig.say("/open plan").await;
+    assert_eq!(
+        rig.opened().last().unwrap(),
+        "https://amp.simstech.cloud/project/2/plan"
+    );
     // No current ticket: the project's Mission page.
     rig.say("/ticket none").await;
     rig.say("/open").await;
@@ -526,7 +545,7 @@ async fn without_metadata_the_commands_say_so() {
     rig.say("/help").await;
     assert!(
         rig.screen()
-            .contains("/questions  /plan  /project [id]  /open [id]")
+            .contains("/questions  /plan  /project [id]  /open [id|plan]")
     );
 }
 
@@ -553,4 +572,67 @@ async fn amp_tool_calls_are_titled_with_their_ticket() {
     assert!(!screen.contains("amp_complete_task {"), "{screen}");
     // Other tools keep pi's rendering.
     assert!(screen.contains("read README.md"), "{screen}");
+}
+
+/// #2171: AMP refused a step only a person takes. The transcript says so plainly, with the link
+/// built from the instance (not the server's text), under the refused call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
+    let mut rig = rig(vec![], true).await;
+    let refused = |name: &str, text: &str| AgentEvent::ToolExecutionEnd {
+        tool_call_id: format!("call-{name}"),
+        tool_name: name.into(),
+        result: rpi_agent::AgentToolResult::text(text),
+        is_error: true,
+    };
+    rig.shell.handle_event(&refused(
+        "amp_dispatch_task",
+        "ticket 2108 was planned after the plan was last approved; this project needs the plan \
+         approved before agents start new tickets. A person approves it in the AMP web UI (Approve \
+         plan): http://localhost:5173/project/2/plan. Agents can't approve: stop and ask your \
+         person to approve it there.\n[amp-harness] This needs a person in the AMP web UI.",
+    ));
+    let screen = rig.screen();
+    assert!(screen.contains("⏸ Waiting for your approval"), "{screen}");
+    assert!(
+        screen.contains(
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"
+        ),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("The manager stopped here; nothing else was run."),
+        "{screen}"
+    );
+    // The notice quotes the server's sentence, not the harness's note to the model.
+    let notice = &screen[screen.find("⏸").unwrap()..];
+    assert!(!notice.contains("[amp-harness]"), "{notice}");
+    let frame = rig.shell.view().render_frame(W, H).join("\n");
+    assert!(frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07"));
+
+    // A person's ticket: the board drawer for that ticket.
+    rig.shell.handle_event(&refused(
+        "amp_complete_task",
+        "Marking ticket 2110 (a person's ticket) done is done by a person in the AMP web UI, not \
+         by an agent or over MCP: http://localhost:5173/project/2/board?task=2110. Stop and ask \
+         your person to do it there.",
+    ));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for you in the AMP web UI"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Do it in AMP: https://amp.simstech.cloud/project/2/board?task=2110"),
+        "{screen}"
+    );
+
+    // Other errors are just errors.
+    let before = rig.screen().matches("⏸").count();
+    rig.shell.handle_event(&refused(
+        "amp_complete_task",
+        "ticket 5 is backlog: it was never dispatched, so an agent can't complete it",
+    ));
+    assert_eq!(rig.screen().matches("⏸").count(), before);
+    assert_fits(&rig);
 }

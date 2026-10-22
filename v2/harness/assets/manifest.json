@@ -1,7 +1,7 @@
 {
  "generated_by": "v2/scripts/build-harness-assets.sh — do not edit; edit v2/.opencode or v2/scripts/lib/harness_overrides.yaml",
  "source": "v2/.opencode",
- "source_sha256": "00b3c6de915d2314554853a00694e73baad39065d246bed345e1dcf241de6e19",
+ "source_sha256": "e5cc5b5b751fe2a8e7fd9bf486a5b3efd2d38a94aa508b25b938b0e13bf1b483",
  "default_agent": "amp-manager",
  "excluded_skills": [
   "amp-agent-builder"
@@ -132,7 +132,7 @@
   },
   {
    "name": "amp-planning",
-   "description": "Full protocol for planning, creating the task hierarchy, getting approval, and dispatching workers — including the hard approval gate",
+   "description": "Full protocol for planning, creating the task hierarchy, handing the plan to a person to approve in AMP's web UI, and dispatching workers — including the hard approval gate agents can never pass themselves",
    "files": [
     "SKILL.md"
    ]

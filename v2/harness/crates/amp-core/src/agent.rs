@@ -9,6 +9,8 @@
 //! What a session gets:
 //! - **Model:** the role's provider/model/thinking from models.toml + config.toml (#2091). A role
 //!   whose provider has no key fails here, with the key it needs.
+//! - **Manager only (#2171):** [`crate::approval`]'s guard runs before the policy, and a refusal
+//!   that needs a person in the AMP web UI (plan approval, a person's ticket) ends the turn.
 //! - **Tools:** rpi-tools (read, bash, edit, write, grep, find, ls) bound to the working
 //!   directory, every AMP tool under AMP's own name ([`crate::mcp_tools`]) and the spec's extra
 //!   tools, filtered by the role's policy; the policy's before-tool hook enforces the rest (D6).
@@ -441,7 +443,18 @@ impl Runtime {
             session,
             models: self.providers.all(),
             agent_emitter: spec.emitter,
-            before_tool_call: Some(policy.before_tool_call_then(spec.before_tool_call)),
+            // The manager (#2171): the approval guard before the policy (once AMP refused a step
+            // that needs a person, every further call ends the turn, denied or not); a refusal
+            // ends its turn. Workers report a refusal in their final message.
+            before_tool_call: Some(if role.primary {
+                let guard = Arc::new(crate::approval::ManagerGuard);
+                guard.before_tool_call_then(Some(
+                    policy.before_tool_call_then(spec.before_tool_call),
+                ))
+            } else {
+                policy.before_tool_call_then(spec.before_tool_call)
+            }),
+            after_tool_call: role.primary.then(crate::approval::end_turn_on_refusal),
             ..Default::default()
         };
         let harness = AgentHarness::create(options)

@@ -51,6 +51,7 @@
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
+pub mod approval;
 pub mod assets;
 pub mod events;
 pub mod faux;

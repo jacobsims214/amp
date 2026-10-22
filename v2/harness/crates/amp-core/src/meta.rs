@@ -328,6 +328,11 @@ impl Instance {
         format!("{}/artifacts/{artifact_id}", self.web_base)
     }
 
+    /// The Flight plan page, where a person approves the plan (`approve_url` in AMP).
+    pub fn plan_url(&self, project_id: i64) -> String {
+        format!("{}/project/{project_id}/plan", self.web_base)
+    }
+
     pub fn kb_url(&self, project_id: i64) -> String {
         format!("{}/project/{project_id}/kb", self.web_base)
     }
@@ -611,6 +616,9 @@ pub struct PlanApproval {
     /// Open tickets planned since the last approval.
     pub awaiting_approval: Vec<i64>,
     pub plan_approved_at: Option<String>,
+    /// The Flight plan page AMP gave (`approve_url`, #2167) while tickets await approval. Untrusted
+    /// text: links are built with [`Instance::plan_url`].
+    pub approve_url: Option<String>,
 }
 
 /// An artifact of the current ticket (§2 item 11).
@@ -1022,7 +1030,7 @@ impl MetaHandle {
                 tool_call_id,
                 tool_name,
                 is_error,
-                ..
+                result,
             } if tool_name.starts_with("amp_") => {
                 let started = self
                     .0
@@ -1031,6 +1039,10 @@ impl MetaHandle {
                     .ok()
                     .and_then(|mut s| s.remove(tool_call_id));
                 if *is_error {
+                    // A refusal that needs a person (#2171): show the approval state as it is now.
+                    if crate::approval::refusal(&agent_result_text(result)).is_some() {
+                        self.refresh(Topics::PROJECT | Topics::PLAN | Topics::BOARD);
+                    }
                     return;
                 }
                 let args = started.map(|(_, a)| a).unwrap_or(Value::Null);
@@ -1039,6 +1051,19 @@ impl MetaHandle {
             _ => {}
         }
     }
+}
+
+/// The text blocks of an agent tool result.
+fn agent_result_text(result: &rpi_agent::AgentToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            rpi_agent::TextContentOrImage::Text(t) => Some(t.text.as_str()),
+            rpi_agent::TextContentOrImage::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1456,6 +1481,7 @@ impl MetaPoller {
                     .filter_map(Value::as_i64)
                     .collect(),
                 plan_approved_at: v["plan_approved_at"].as_str().map(str::to_owned),
+                approve_url: v["approve_url"].as_str().map(str::to_owned),
             });
             self.update(|m| m.plan.set(r));
             ran |= Topics::PLAN;
