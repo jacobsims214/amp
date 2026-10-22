@@ -132,7 +132,7 @@ async fn live_meta(args: &RenderChromeArgs) -> Result<(AmpMeta, bool), CliError>
         None => ProjectMarker::find_from_cwd()?.map(|m| m.project_id),
     };
     let settings = args.conn.settings()?;
-    let client = Arc::new(conn::connect(&settings).await?);
+    let client = Arc::new(conn::connect_cli(&settings).await?);
     let handle = MetaPoller::spawn(
         Some(client),
         MetaOptions {

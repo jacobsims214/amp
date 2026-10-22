@@ -22,6 +22,15 @@
 //! the session (its AMP connection, the model's AMP tools and prompt, the metadata poller) to
 //! another one without a restart.
 //!
+//! **AMP unreachable at start (#2178).** The chat opens anyway, on an offline client: the
+//! transcript says why in one sentence with a next step (`amp-harness doctor`, `amp-harness server
+//! set`, `--url`), the header's dot is red, and chatting with the model works without AMP tools. A
+//! background retry ([`retry_offline`], backoff 2 s doubling to 60 s) connects it; then the model
+//! gets its AMP tools and the server's instructions ([`crate::server_cmd::Switcher::connect_offline`])
+//! and the transcript says so. `/server <name>` connects (or switches) at once. Headless commands
+//! (`run -p`, `whoami`, …) still exit non-zero with the same one-sentence message. In
+//! `--snapshot`, `--input wait:amp` waits (bounded) for that connection.
+//!
 //! The shell gets the session's worker supervisor: quitting while `amp_run_ticket` runs cancels
 //! the workers and waits (bounded) until their abandoned runs are reported ([`Shell::quit`]).
 
@@ -29,7 +38,10 @@ use std::{
     io::IsTerminal,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -38,11 +50,12 @@ use amp_core::{
     models::{ModelsConfig, thinking_name},
     providers::ProviderSet,
 };
-use amp_tui::{AmpTheme, ModelChoice, Shell, ShellInfo, Submit, ThemeSettings};
+use amp_tui::{AmpTheme, ModelChoice, Notifier, Shell, ShellInfo, Submit, ThemeSettings};
 use clap::Args;
 
 use crate::{
-    conn::{CliError, ConnArgs},
+    conn::{self, CliError, ConnArgs},
+    server_cmd::Switcher,
     session, setup,
 };
 
@@ -86,6 +99,12 @@ pub struct ChatArgs {
     #[arg(long, hide = true, requires = "snapshot")]
     meta: bool,
 }
+
+/// The offline retry's first wait and its cap (#2178); the wait doubles in between.
+const RETRY_FIRST: Duration = Duration::from_secs(2);
+const RETRY_MAX: Duration = Duration::from_secs(60);
+/// How long `--input wait:amp` waits for the offline session to connect.
+const SNAPSHOT_CONNECT_WAIT: Duration = Duration::from_secs(30);
 
 /// How long `--snapshot --meta` waits for the poller to load (and to settle after each input).
 const SNAPSHOT_META_WAIT: Duration = Duration::from_secs(10);
@@ -169,8 +188,10 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         role: args.role.as_deref(),
         cwd: args.cwd.as_deref(),
         memory: args.no_session,
+        allow_offline: true,
     })
     .await?;
+    let settings = args.conn.settings()?;
     let info = shell_info(&session);
     let models = model_choices(
         &session.rt.current_models(),
@@ -191,10 +212,10 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);
     // `/server` (#2164): list the saved servers and switch this session to another one.
-    shell.set_server_control(Arc::new(
-        crate::server_cmd::Switcher::new(
+    let switcher = Arc::new(
+        Switcher::new(
             args.conn.clone(),
-            args.conn.settings()?,
+            settings.clone(),
             Arc::clone(&session.rt),
             Arc::clone(&session.agent.harness),
             Arc::clone(&session.agent.policy),
@@ -202,7 +223,25 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             args.snapshot.is_none() || args.meta,
         )
         .await,
-    ));
+    );
+    shell.set_server_control(Arc::clone(&switcher) as Arc<dyn amp_tui::ServerControl>);
+    // AMP unreachable (#2178): say why and what to do, and keep trying in the background.
+    let connected = Arc::new(AtomicBool::new(session.offline.is_none()));
+    if let Some(e) = &session.offline {
+        shell.view().add_error(&format!(
+            "{} The chat works without AMP meanwhile and keeps retrying (the manager gets its AMP \
+             tools once connected); `/server <name|address>` switches from here.",
+            conn::connect_message(&settings.url, Some(&settings.auth), e)
+        ));
+        if conn::verbose() {
+            shell.view().add_notice(&format!("cause: {e}"));
+        }
+        tokio::spawn(retry_offline(
+            Arc::clone(&switcher),
+            shell.notifier(),
+            Arc::clone(&connected),
+        ));
+    }
     let mut events = session.events;
 
     let Some((width, height)) = args.snapshot else {
@@ -236,7 +275,9 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         None
     };
     for input in &args.inputs {
-        if let Some(key) = input.strip_prefix("key:") {
+        if input == "wait:amp" {
+            wait_connected(&mut shell, &connected).await?;
+        } else if let Some(key) = input.strip_prefix("key:") {
             shell.press(key).map_err(CliError::usage)?;
         } else {
             if shell.submit(input).await == Submit::Quit {
@@ -270,6 +311,48 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     for line in lines {
         println!("{line}");
     }
+    Ok(())
+}
+
+/// The offline session's background retry (#2178): connect with backoff until it works, or until
+/// `/server` connected the session first. Each failure is quiet unless it changed kind (refused,
+/// then host not found…); the header's dot stays red meanwhile.
+async fn retry_offline(switcher: Arc<Switcher>, notes: Notifier, connected: Arc<AtomicBool>) {
+    let mut wait = RETRY_FIRST;
+    let mut last_kind = None;
+    loop {
+        tokio::time::sleep(wait).await;
+        match switcher.connect_offline().await {
+            Ok(Some(line)) => {
+                notes.notice(line);
+                break;
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let kind = e.kind();
+                if last_kind.is_some_and(|k| k != kind) {
+                    notes.error(format!("Still can't reach AMP ({}); retrying.", e.reason()));
+                }
+                last_kind = Some(kind);
+                wait = (wait * 2).min(RETRY_MAX);
+            }
+        }
+    }
+    connected.store(true, Ordering::Release);
+}
+
+/// `--input wait:amp`: waits (bounded) until the offline session connected, then applies its line.
+async fn wait_connected(shell: &mut Shell, connected: &AtomicBool) -> Result<(), CliError> {
+    let deadline = tokio::time::Instant::now() + SNAPSHOT_CONNECT_WAIT;
+    while !connected.load(Ordering::Acquire) {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::new(format!(
+                "wait:amp: still not connected after {SNAPSHOT_CONNECT_WAIT:?}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    shell.poll();
     Ok(())
 }
 
@@ -351,7 +434,11 @@ fn shell_info(s: &session::Session) -> ShellInfo {
                 env!("CARGO_PKG_VERSION"),
                 amp_tui::shell::short_role(&s.agent.role.id)
             ),
-            format!("{project} · {} ({})", mcp.url, mcp.protocol_version),
+            if s.offline.is_some() {
+                format!("{project} · {} (not connected)", mcp.url)
+            } else {
+                format!("{project} · {} ({})", mcp.url, mcp.protocol_version)
+            },
             format!(
                 "{}/{} • thinking {} · {session_line}",
                 resolved.provider,

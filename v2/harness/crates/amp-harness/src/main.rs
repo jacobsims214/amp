@@ -11,6 +11,8 @@
 //! - #2163: `connect [provider]` / `connect --list` / `disconnect <provider>`: model provider keys
 //!   and custom providers without shell commands (the chat's `/connect` does the same).
 //! - #2164: `server` / `server set <url>` / `server use <name>` and the chat's `/server`.
+//! - #2178: connection failures read as one plain sentence with a next step (`--verbose` adds the
+//!   cause chain); the chat opens disconnected and retries instead of exiting.
 
 mod chat;
 mod config_cmd;
@@ -68,6 +70,9 @@ struct Cli {
     /// With no subcommand: chat with the manager in the terminal.
     #[command(flatten)]
     chat: chat::ChatArgs,
+    /// Show the full cause chain of connection errors (as does a non-empty RUST_LOG).
+    #[arg(long, global = true)]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -154,6 +159,7 @@ impl ServerArgs {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+    conn::set_verbose(cli.verbose);
     let result: Result<(), conn::CliError> = match cli.command {
         Some(Command::Version) => {
             println!("amp-harness {LONG_VERSION}");

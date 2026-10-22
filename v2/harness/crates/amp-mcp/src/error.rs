@@ -124,6 +124,193 @@ impl McpError {
     }
 }
 
+/// Why talking to AMP failed, in the terms a person can act on (#2178). [`McpError::kind`] reads it
+/// from the error and its whole cause chain, so callers never show rmcp's or reqwest's own text
+/// (type names, `Send message error Transport [...]`) unless asked for it (`--verbose`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FailureKind {
+    /// Nothing listens on that host and port.
+    Refused,
+    /// The host name does not resolve.
+    HostNotFound,
+    /// TLS failed: an untrusted or wrong certificate, or TLS spoken to a plain HTTP port.
+    Tls,
+    /// The server rejected our credentials (401/403), or we sent none.
+    LoginRequired,
+    /// The server answered, but that path is not an MCP endpoint (404).
+    NotFound,
+    /// The server answered with something that is not MCP (an HTTP error page, HTML, a non
+    /// JSON-RPC body): most likely the wrong address.
+    NotMcp,
+    /// No answer in time.
+    Timeout,
+    /// The connection was closed (the server went away mid-session).
+    Closed,
+    /// The settings themselves are wrong (a bad URL, an unreadable CA file).
+    Config,
+    /// Anything else; [`McpError::reason`] says what.
+    Other,
+}
+
+impl McpError {
+    /// What went wrong, read from the error and its cause chain (#2178).
+    pub fn kind(&self) -> FailureKind {
+        match self {
+            Self::AuthRequired { .. } => return FailureKind::LoginRequired,
+            Self::ConnectTimeout { .. } | Self::Timeout { .. } => return FailureKind::Timeout,
+            Self::Closed | Self::Replaced { .. } => return FailureKind::Closed,
+            Self::Config(_) | Self::CaFile { .. } => return FailureKind::Config,
+            Self::Http(_) | Self::OAuth(_) | Self::CredentialStore(_) => return FailureKind::Other,
+            Self::Connect { .. } | Self::Service { .. } => {}
+        }
+        if self.is_server_error() {
+            return FailureKind::Other;
+        }
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        let mut text = String::new();
+        while let Some(e) = current {
+            if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                match io.kind() {
+                    std::io::ErrorKind::ConnectionRefused => return FailureKind::Refused,
+                    std::io::ErrorKind::TimedOut => return FailureKind::Timeout,
+                    _ => {}
+                }
+            }
+            if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+                if re.is_timeout() {
+                    return FailureKind::Timeout;
+                }
+                if re.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                    return FailureKind::NotFound;
+                }
+            }
+            text.push_str(&e.to_string().to_lowercase());
+            text.push('\n');
+            current = next_cause(e);
+        }
+        classify_text(&text)
+    }
+
+    /// One short phrase for [`Self::kind`] with no Rust type names, e.g. "connection refused",
+    /// "host not found", "no answer within 30s". The full chain stays in `Display`
+    /// (`to_string()`), for `--verbose` and logs.
+    pub fn reason(&self) -> String {
+        match self.kind() {
+            FailureKind::Refused => "connection refused".to_owned(),
+            FailureKind::HostNotFound => "host not found".to_owned(),
+            FailureKind::Tls => {
+                "TLS failed: the server's certificate is not trusted, or it does not speak HTTPS"
+                    .to_owned()
+            }
+            FailureKind::LoginRequired => "login required".to_owned(),
+            FailureKind::NotFound => "no MCP endpoint at that path (HTTP 404)".to_owned(),
+            FailureKind::NotMcp => match self.http_status() {
+                Some(status) => format!("it answered HTTP {status}, not MCP"),
+                None => "it did not answer as an MCP server".to_owned(),
+            },
+            FailureKind::Timeout => match self {
+                Self::ConnectTimeout { after, .. } | Self::Timeout { after, .. } => {
+                    format!("no answer within {}s", after.as_secs().max(1))
+                }
+                _ => "no answer in time".to_owned(),
+            },
+            FailureKind::Closed => "the connection was closed".to_owned(),
+            FailureKind::Config => match self {
+                Self::Config(msg) => msg.clone(),
+                other => other.to_string(),
+            },
+            FailureKind::Other => match self {
+                // The server's own error message is meant for people; rmcp's wrappers are not.
+                Self::Service { source, .. } => match &**source {
+                    ServiceError::McpError(data) => data.message.to_string(),
+                    _ => "the request failed".to_owned(),
+                },
+                Self::Connect { .. } => "the server did not complete the MCP handshake".to_owned(),
+                other => other.to_string(),
+            },
+        }
+    }
+}
+
+impl McpError {
+    /// The HTTP status in rmcp's "unexpected server response: HTTP 501 Not Implemented: …", if any.
+    fn http_status(&self) -> Option<String> {
+        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(e) = current {
+            let text = e.to_string();
+            if let Some(at) = text.find("HTTP ") {
+                let code: String = text[at + 5..].chars().take(3).collect();
+                if code.len() == 3 && code.chars().all(|c| c.is_ascii_digit()) {
+                    return Some(code);
+                }
+            }
+            current = next_cause(e);
+        }
+        None
+    }
+}
+
+/// [`McpError::kind`] from the lowercased messages of the whole chain, for the causes that are
+/// only visible as text (hyper's DNS error, rustls' certificate errors, rmcp's `HTTP 404`).
+fn classify_text(text: &str) -> FailureKind {
+    let has = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+    if has(&[
+        "connection refused",
+        "os error 61",
+        "os error 111",
+        "os error 10061",
+    ]) {
+        FailureKind::Refused
+    } else if has(&[
+        "dns error",
+        "failed to lookup address",
+        "nodename nor servname",
+        "name or service not known",
+        "no such host",
+        "name resolution",
+    ]) {
+        FailureKind::HostNotFound
+    } else if has(&[
+        "certificate",
+        "invalid peer",
+        "tls handshake",
+        "handshake failure",
+        "invalidcontenttype",
+        "corrupt message",
+        "received corrupt",
+        "unknownissuer",
+        "unknown issuer",
+    ]) {
+        FailureKind::Tls
+    } else if has(&["http 401", "http 403", "401 unauthorized", "403 forbidden"]) {
+        FailureKind::LoginRequired
+    } else if has(&["http 404", "404 not found"]) {
+        FailureKind::NotFound
+    } else if has(&[
+        "unexpected server response",
+        "unexpected content type",
+        "deserialize error",
+        "http 4",
+        "http 5",
+    ]) {
+        FailureKind::NotMcp
+    } else if has(&["timed out", "deadline has elapsed", "operation timed out"]) {
+        FailureKind::Timeout
+    } else if has(&[
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "transport closed",
+        "channel closed",
+        "unexpected end of stream",
+    ]) {
+        FailureKind::Closed
+    } else {
+        FailureKind::Other
+    }
+}
+
 /// The error's source chain as `: cause: deeper cause`, skipping messages already shown.
 ///
 /// rmcp's transport errors only say "error sending request for url (...)"; the reason (an untrusted
@@ -145,7 +332,8 @@ fn causes(error: &(dyn std::error::Error + 'static)) -> String {
     out
 }
 
-/// `source()`, plus the links rmcp 3.6.0 leaves out of it: `ClientInitializeError::TransportError`,
+/// `source()`, plus the links rmcp 3.6.0 leaves out of it: `ClientInitializeError::TransportError`
+/// and `LegacyFallbackFailed`,
 /// `ServiceError::TransportSend` and `StreamableHttpError::Client` hold their cause in a field that
 /// is not marked `#[source]`.
 fn next_cause<'a>(
@@ -154,6 +342,11 @@ fn next_cause<'a>(
     use rmcp::transport::streamable_http_client::StreamableHttpError;
     if let Some(ClientInitializeError::TransportError { error, .. }) = error.downcast_ref() {
         return Some(error);
+    }
+    // Auto's fallback: discover failed, then so did `initialize`; the latter says why (#2178).
+    if let Some(ClientInitializeError::LegacyFallbackFailed { fallback, .. }) = error.downcast_ref()
+    {
+        return Some(&**fallback);
     }
     if let Some(ServiceError::TransportSend(transport)) = error.downcast_ref() {
         return Some(transport);

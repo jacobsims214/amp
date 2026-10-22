@@ -38,6 +38,10 @@ pub struct SessionRequest<'a> {
     pub cwd: Option<&'a Path>,
     /// Keep the transcript in memory instead of a JSONL file under `<state>/sessions/<role>/`.
     pub memory: bool,
+    /// When AMP can't be reached, build the session anyway on an offline client (the chat,
+    /// #2178) instead of failing: no AMP tools until the caller connects it. Bad settings (an
+    /// unparsable URL, an unreadable CA file) still fail.
+    pub allow_offline: bool,
 }
 
 pub struct Session {
@@ -48,6 +52,8 @@ pub struct Session {
     pub cwd: PathBuf,
     /// The manager's worker supervisor (`None` for a worker role).
     pub supervisor: Option<Arc<Supervisor>>,
+    /// Why AMP could not be reached, when the session started offline (`allow_offline`).
+    pub offline: Option<amp_mcp::McpError>,
 }
 
 pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
@@ -69,7 +75,26 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
 
     let settings = req.conn.settings()?;
     // Heals itself after `amp-harness login` (#2159); everyone below shares this one client.
-    let client = Arc::new(conn::connect_session(&settings).await?);
+    let (client, offline) = match conn::connect_session(&settings).await {
+        Ok(client) => (client, None),
+        Err(e) if req.allow_offline && e.kind() != amp_mcp::FailureKind::Config => {
+            // No reconnector yet: whoever connects it (the chat's retry, `/server`) also gives
+            // the model its AMP tools, which a silent reconnect would not.
+            let options = amp_mcp::ClientOptions::from_settings(&settings);
+            (
+                amp_mcp::AmpMcpClient::offline(&options, e.reason()),
+                Some(e),
+            )
+        }
+        Err(e) => {
+            return Err(CliError::new(conn::connect_message_verbose(
+                &settings.url,
+                Some(&settings.auth),
+                &e,
+            )));
+        }
+    };
+    let client = Arc::new(client);
     let env = |k: &str| std::env::var(k).ok();
     let keys = SystemKeys::from_env();
     let rt = Arc::new(
@@ -154,5 +179,6 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         project,
         cwd,
         supervisor,
+        offline,
     })
 }

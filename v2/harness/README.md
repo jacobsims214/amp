@@ -153,6 +153,32 @@ web_url = "http://localhost:5173"
 url = "https://amp.simstech.cloud/mcp"
 ```
 
+### When AMP can't be reached (#2178)
+
+A connection failure is one sentence that says what went wrong and what to do next, never rmcp's
+or reqwest's own error text:
+
+| Failure | What you see (abridged) |
+| --- | --- |
+| Nothing listens there | `Can't reach AMP at localhost:18999 (connection refused). Is the server running? Check with `amp-harness doctor`, or switch servers with `amp-harness server set <url>` (or --url).` |
+| Unknown host | `Can't reach AMP at amp.example.invalid (host not found). Check the address with `amp-harness server`, …` |
+| Untrusted certificate, or https to an http port | `Can't connect securely to AMP at … For a private CA save it with `amp-harness server set <url> --ca-file <PEM>` …` |
+| 401 / 403 | `AMP at … needs you to log in (401). Run `amp-harness login --url …`` (with AMP_TOKEN: `refused the token in AMP_TOKEN`, never its value) |
+| Wrong path | `AMP at … has no MCP endpoint at … (HTTP 404). Check the address (it usually ends in /mcp) …` |
+| Not an MCP server | `The server at … did not answer as AMP (it answered HTTP 501, not MCP). …` |
+| No answer | `AMP at … did not answer (no answer within 30s). Check the server and your network with `amp-harness doctor` …` |
+
+`--verbose` (after the subcommand: `amp-harness whoami --verbose`), or any non-empty `RUST_LOG`,
+adds the full cause chain on a `cause:` line.
+
+**The chat opens anyway.** When AMP is unreachable at start (or the first run can't reach the
+server already configured), the chat opens with that sentence in the transcript, `(not connected)`
+in the banner and a red dot in the header. Chatting with the model works meanwhile, without AMP
+tools. It retries in the background (2 s, doubling to 60 s); once connected the transcript says
+"Connected to AMP at …", and the manager gets its AMP tools and the server's instructions from its
+next reply. `/server <name|address>` connects (or switches) at once. Headless commands (`run -p`,
+`whoami`, `tickets`) print the sentence and exit 1.
+
 ### Logging in (OAuth, D3)
 
 ```sh

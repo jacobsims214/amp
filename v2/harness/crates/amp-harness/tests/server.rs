@@ -230,8 +230,18 @@ async fn set_saves_nothing_for_a_server_that_does_not_answer() {
     let dir = workdir("server-unreachable", None);
     let out = server(&dir, &["set", "http://127.0.0.1:9/mcp", "--yes"], &[]).await;
     assert_eq!(out.code, 1, "{}", out.stdout);
-    assert!(out.stderr.contains("could not reach"), "{}", out.stderr);
-    assert!(out.stderr.contains("Nothing was saved"), "{}", out.stderr);
+    // #2178: plain words, no rmcp/reqwest text.
+    assert!(
+        out.stderr
+            .contains("Can't reach AMP at 127.0.0.1:9 (connection refused), so nothing was saved"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        !out.stderr.contains("rmcp") && !out.stderr.contains("::"),
+        "{}",
+        out.stderr
+    );
     assert!(!config_path(&dir).exists());
 
     // Bad input never gets as far as connecting.

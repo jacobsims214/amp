@@ -198,6 +198,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         role: args.role.as_deref(),
         cwd: args.cwd.as_deref(),
         memory: args.no_session || args.print_system_prompt,
+        // Headless: no AMP, no run (the message says why and what to do).
+        allow_offline: false,
     })
     .await?;
 

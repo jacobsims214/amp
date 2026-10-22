@@ -684,11 +684,16 @@ async fn set(args: SetArgs) -> Result<(), CliError> {
     // 1. It must answer before anything is saved.
     ui.say(&format!("Checking {} ...", entry.url));
     let checked = check(&settings).await.map_err(|e| {
-        CliError::new(format!(
-            "could not reach {}: {e}\nNothing was saved. Check the address (and that AMP is \
+        let mut message = format!(
+            "Can't reach AMP at {} ({}), so nothing was saved. Check the address (and that AMP is \
              running there), then try again.",
-            entry.url
-        ))
+            setup::host_of(&entry.url),
+            e.reason()
+        );
+        if conn::verbose() {
+            message.push_str(&format!("\n  cause: {e}"));
+        }
+        CliError::new(message)
     })?;
 
     // 2. Its web UI.
@@ -768,9 +773,10 @@ async fn use_server(args: UseArgs) -> Result<(), CliError> {
         Err(e) => {
             out.status = "unreachable";
             let w = format!(
-                "{} did not answer ({e}); it is the active server anyway. `amp-harness doctor` \
+                "{} did not answer ({}); it is the active server anyway. `amp-harness doctor` \
                  checks it again.",
-                entry.url
+                entry.url,
+                e.reason()
             );
             if !args.write.json {
                 ui.say(&format!("warning: {w}"));
@@ -936,6 +942,8 @@ pub struct Switcher {
     /// Start a metadata poller for the new server (the chat has one).
     with_meta: bool,
     state: Mutex<SwitchState>,
+    /// One connection change at a time: a `/server` switch, or the offline retry (#2178).
+    busy: tokio::sync::Mutex<()>,
 }
 
 struct SwitchState {
@@ -955,9 +963,14 @@ impl Switcher {
         project_id: Option<i64>,
         with_meta: bool,
     ) -> Self {
-        let amp_tools = match rt.mcp.catalog().await {
-            Ok(c) => c.names().map(str::to_owned).collect(),
-            Err(_) => BTreeSet::new(),
+        // Offline (#2178): no AMP tools yet, and no connect attempt here (it would hold up the
+        // chat's start); [`Switcher::connect_offline`] makes it.
+        let amp_tools = match rt.mcp.is_online() {
+            true => match rt.mcp.catalog().await {
+                Ok(c) => c.names().map(str::to_owned).collect(),
+                Err(_) => BTreeSet::new(),
+            },
+            false => BTreeSet::new(),
         };
         Self {
             conn,
@@ -970,7 +983,50 @@ impl Switcher {
                 settings,
                 amp_tools,
             }),
+            busy: tokio::sync::Mutex::new(()),
         }
+    }
+
+    /// The chat started offline (#2178): one attempt to connect to the current server. On success
+    /// the session's connection, the model's AMP tools and its prompt move onto it, as a
+    /// `/server` switch does, and the result is the line for the transcript. `Ok(None)` when
+    /// the session is already online (a `/server` got there first).
+    pub async fn connect_offline(&self) -> Result<Option<String>, McpError> {
+        let _busy = self.busy.lock().await;
+        if self.rt.mcp.is_online() {
+            return Ok(None);
+        }
+        let settings = self.current();
+        let client = conn::connect(&settings).await?;
+        let new_tools: BTreeSet<String> =
+            client.catalog().await?.names().map(str::to_owned).collect();
+        let old_tools = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .amp_tools
+            .clone();
+        self.rt.mcp.replace(client);
+        self.rt.mcp.set_reconnector(conn::reconnector(&settings));
+        let retargeted = self
+            .rt
+            .retarget(&self.harness, &self.policy, &old_tools)
+            .await;
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .amp_tools = new_tools;
+        let host = setup::host_of(&settings.url);
+        Ok(Some(match retargeted {
+            Ok(r) => format!(
+                "Connected to AMP at {host}: the manager has its {} AMP tools now.",
+                r.amp_tools
+            ),
+            Err(e) => format!(
+                "Connected to AMP at {host}, but the manager's tools were not updated ({e}); \
+                 restart the chat to use AMP."
+            ),
+        }))
     }
 
     fn current(&self) -> Settings {
@@ -1018,12 +1074,14 @@ impl Switcher {
     }
 
     async fn switch_to(self: Arc<Self>, target: String) -> Result<ServerSwitched, String> {
+        let _busy = self.busy.lock().await;
         let target = target.trim().to_owned();
         let (config, servers) = self.servers()?;
         let entry = self.resolve(&target, &servers).await?;
         let current = self.current();
         let here = setup::host_of(&current.url);
-        if same_url(&entry.url, &current.url) {
+        // Offline (#2178), `/server <the same one>` connects it now instead of waiting for the retry.
+        if same_url(&entry.url, &current.url) && self.rt.mcp.is_online() {
             return Ok(ServerSwitched {
                 notice: format!("already on `{}` ({})", entry.name, entry.url),
                 meta: None,
@@ -1049,16 +1107,19 @@ impl Switcher {
             }
             Err(e) => {
                 return Err(format!(
-                    "could not reach {}: {e}. Still on {here}.",
-                    entry.url
+                    "can't reach {} ({}). Still on {here}.",
+                    entry.url,
+                    e.reason()
                 ));
             }
         };
         // Its tool list, fetched before the swap so a server without one changes nothing.
-        let catalog = client
-            .catalog()
-            .await
-            .map_err(|e| format!("{host} did not list its tools: {e}. Still on {here}."))?;
+        let catalog = client.catalog().await.map_err(|e| {
+            format!(
+                "{host} did not list its tools ({}). Still on {here}.",
+                e.reason()
+            )
+        })?;
         let new_tools: BTreeSet<String> = catalog.names().map(str::to_owned).collect();
 
         let old_tools = self

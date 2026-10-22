@@ -106,6 +106,33 @@ enum ShellMsg {
         models: Option<Vec<ModelChoice>>,
     },
     Server(Result<ServerSwitched, String>),
+    /// A line from a background task the shell did not start ([`Notifier`]); not counted in
+    /// `in_flight`.
+    Notice {
+        text: String,
+        error: bool,
+    },
+}
+
+/// Puts lines in the transcript from a task the shell did not start (#2178: the chat's retry
+/// while AMP is unreachable). [`Shell::poll`] applies them.
+#[derive(Clone)]
+pub struct Notifier(UnboundedSender<ShellMsg>);
+
+impl Notifier {
+    pub fn notice(&self, text: impl Into<String>) {
+        let _ = self.0.send(ShellMsg::Notice {
+            text: text.into(),
+            error: false,
+        });
+    }
+
+    pub fn error(&self, text: impl Into<String>) {
+        let _ = self.0.send(ShellMsg::Notice {
+            text: text.into(),
+            error: true,
+        });
+    }
 }
 
 /// What `/connect` did: a message for the transcript (never a secret), and the providers and
@@ -430,6 +457,11 @@ impl Shell {
                 .view
                 .add_error(&format!("/connect: {}", crate::chrome::clean(&e))),
         }
+    }
+
+    /// A [`Notifier`] for background tasks' transcript lines.
+    pub fn notifier(&self) -> Notifier {
+        Notifier(self.msgs_tx.clone())
     }
 
     /// Gives the shell `/server` (#2164).
@@ -1084,8 +1116,16 @@ impl Shell {
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
         while let Ok(msg) = self.msgs_rx.try_recv() {
-            self.in_flight = self.in_flight.saturating_sub(1);
             changed = true;
+            if let ShellMsg::Notice { text, error } = &msg {
+                if *error {
+                    self.view.add_error(text);
+                } else {
+                    self.view.add_notice(text);
+                }
+                continue;
+            }
+            self.in_flight = self.in_flight.saturating_sub(1);
             match msg {
                 ShellMsg::Plan {
                     project_id,
@@ -1125,6 +1165,7 @@ impl Shell {
                         Err(e) => self.view.add_error(&format!("/server: {e}")),
                     }
                 }
+                ShellMsg::Notice { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
                         self.view.panel().update(|s| {
