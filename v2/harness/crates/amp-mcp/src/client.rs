@@ -2,9 +2,10 @@
 
 use std::{
     path::PathBuf,
+    pin::Pin,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, PoisonError, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -144,23 +145,68 @@ impl ClientHandler for AmpClientHandler {
     }
 }
 
-/// A connected AMP MCP client. Share it behind an `Arc`; every method takes `&self`.
-pub struct AmpMcpClient {
+/// What a reconnect runs: a fresh connect with the session's settings, which picks up a new
+/// `amp-harness login` (#2159), or connects to another server (#2164's `/server`). The same shape as
+/// amp-core's metadata poller `Connector`, so one closure can serve both.
+pub type Reconnector = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<AmpMcpClient, McpError>> + Send>> + Send + Sync,
+>;
+
+/// Least time between two automatic reconnect attempts (the poller's `intervals.reconnect`).
+pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(15);
+/// Upper bound on one reconnect attempt (OAuth discovery plus the handshake, each bounded too).
+pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// One MCP connection: the rmcp service and what belongs to it. [`AmpMcpClient`] holds the current
+/// one and swaps it on a reconnect; a call keeps the connection it started on.
+struct Connection {
     service: RunningService<RoleClient, AmpClientHandler>,
-    session: ServerSession,
-    call_timeout: Duration,
-    catalog_default_ttl: Duration,
+    session: Arc<ServerSession>,
     catalog: Mutex<Option<Catalog>>,
     tools_changed: Arc<AtomicBool>,
+}
+
+impl Connection {
+    fn is_closed(&self) -> bool {
+        self.service.is_closed() || self.service.peer().is_transport_closed()
+    }
+}
+
+/// The automatic reconnect: off until [`AmpMcpClient::set_reconnector`].
+struct ReconnectConfig {
+    connector: Option<Reconnector>,
+    interval: Duration,
+}
+
+/// A connected AMP MCP client. Share it behind an `Arc`; every method takes `&self`.
+///
+/// The connection inside is replaceable (#2159): with a [`Reconnector`] set, a call the server
+/// rejects as "login required" (or a call on a closed connection) reconnects, at most once per
+/// [`DEFAULT_RECONNECT_INTERVAL`], and on success retries on the new connection (a 401 means the
+/// call never ran). Everyone holding the `Arc` (the model's tools, run reporting, the supervisor)
+/// then uses the new connection. [`Self::replace`] and [`Self::reconnect`] do the same swap on
+/// demand, e.g. to switch servers. A call still running on the old connection fails at once with
+/// [`McpError::Replaced`]; it is never retried, since it may have run.
+pub struct AmpMcpClient {
+    conn: RwLock<Arc<Connection>>,
+    call_timeout: Duration,
+    catalog_default_ttl: Duration,
+    /// One cell for every connection, so health watchers survive a swap.
     health: HealthCell,
+    reconnect: StdMutex<ReconnectConfig>,
+    /// Serialises reconnect attempts and holds when the last automatic one started.
+    last_attempt: Mutex<Option<Instant>>,
+    /// Bumped on every swap.
+    generation: AtomicU64,
 }
 
 impl std::fmt::Debug for AmpMcpClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AmpMcpClient")
-            .field("session", &self.session)
+            .field("session", &self.session())
             .field("call_timeout", &self.call_timeout)
             .field("health", &self.health.get())
+            .field("generation", &self.generation())
             .finish_non_exhaustive()
     }
 }
@@ -266,31 +312,56 @@ impl AmpMcpClient {
         );
 
         Ok(Self {
-            service,
-            session,
+            conn: RwLock::new(Arc::new(Connection {
+                service,
+                session: Arc::new(session),
+                catalog: Mutex::new(None),
+                tools_changed,
+            })),
             call_timeout: options.call_timeout,
             catalog_default_ttl: options.catalog_default_ttl,
-            catalog: Mutex::new(None),
-            tools_changed,
             health: HealthCell::new(),
+            reconnect: StdMutex::new(ReconnectConfig {
+                connector: None,
+                interval: DEFAULT_RECONNECT_INTERVAL,
+            }),
+            last_attempt: Mutex::new(None),
+            generation: AtomicU64::new(0),
         })
     }
 
-    pub fn session(&self) -> &ServerSession {
-        &self.session
+    /// The current connection. A call holds on to it until it ends, even across a swap.
+    fn current(&self) -> Arc<Connection> {
+        Arc::clone(&self.conn.read().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn is_current(&self, conn: &Arc<Connection>) -> bool {
+        Arc::ptr_eq(
+            conn,
+            &self.conn.read().unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// What the server said when the current connection was made.
+    pub fn session(&self) -> Arc<ServerSession> {
+        Arc::clone(&self.current().session)
     }
 
     pub(crate) fn set_auth_description(&mut self, auth: String) {
-        self.session.auth = auth;
+        let conn = self.conn.get_mut().unwrap_or_else(PoisonError::into_inner);
+        match Arc::get_mut(conn) {
+            Some(conn) => Arc::make_mut(&mut conn.session).auth = auth,
+            None => tracing::debug!("connection already shared; auth description not set"),
+        }
     }
 
     /// AMP's server instructions, for the system prompt.
-    pub fn instructions(&self) -> Option<&str> {
-        self.session.instructions.as_deref()
+    pub fn instructions(&self) -> Option<String> {
+        self.current().session.instructions.clone()
     }
 
-    pub fn protocol_version(&self) -> &ProtocolVersion {
-        &self.session.protocol_version
+    pub fn protocol_version(&self) -> ProtocolVersion {
+        self.current().session.protocol_version.clone()
     }
 
     pub fn call_timeout(&self) -> Duration {
@@ -307,33 +378,166 @@ impl AmpMcpClient {
         self.health.get()
     }
 
-    /// Watch health changes (the TUI header).
+    /// Watch health changes (the TUI header). The same receiver keeps working across swaps.
     pub fn watch_health(&self) -> watch::Receiver<Health> {
         self.health.subscribe()
     }
 
     pub fn is_closed(&self) -> bool {
-        self.service.is_closed() || self.service.peer().is_transport_closed()
+        self.current().is_closed()
     }
 
-    /// The rmcp peer, for requests this crate does not wrap.
-    pub fn peer(&self) -> &Peer<RoleClient> {
-        self.service.peer()
+    /// The rmcp peer of the current connection, for requests this crate does not wrap.
+    pub fn peer(&self) -> Peer<RoleClient> {
+        self.current().service.peer().clone()
+    }
+
+    /// How many times the connection has been replaced.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Turns the automatic reconnect on (`Some`) or off (`None`). Leave it off for a static token
+    /// (`AMP_TOKEN`): reconnecting can't fix a rejected token, the person sets a new one.
+    pub fn set_reconnector(&self, connector: Option<Reconnector>) {
+        self.reconnect_config().connector = connector;
+    }
+
+    /// The least time between two automatic reconnect attempts (default 15 s).
+    pub fn set_reconnect_interval(&self, interval: Duration) {
+        self.reconnect_config().interval = interval;
+    }
+
+    /// Whether a [`Reconnector`] is set.
+    pub fn can_reconnect(&self) -> bool {
+        self.reconnect_config().connector.is_some()
+    }
+
+    fn reconnect_config(&self) -> std::sync::MutexGuard<'_, ReconnectConfig> {
+        self.reconnect
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Reconnects now through the [`Reconnector`], ignoring the rate limit (after an explicit
+    /// login, or after [`Self::set_reconnector`] pointed it at another server). On failure the
+    /// current connection stays.
+    pub async fn reconnect(&self) -> Result<(), McpError> {
+        let connector = self.reconnect_config().connector.clone().ok_or_else(|| {
+            McpError::Config("this connection has no reconnector (static token)".to_owned())
+        })?;
+        let mut last = self.last_attempt.lock().await;
+        *last = Some(Instant::now());
+        let client = run_connector(&connector).await?;
+        self.adopt(client);
+        Ok(())
+    }
+
+    /// Replaces the connection with `client`'s (made elsewhere, e.g. for another server). The
+    /// timeouts, health watchers and reconnector stay this client's; `client`'s are dropped.
+    pub fn replace(&self, client: AmpMcpClient) {
+        self.adopt(client);
+    }
+
+    fn adopt(&self, client: AmpMcpClient) {
+        let new = client
+            .conn
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        let old = std::mem::replace(
+            &mut *self.conn.write().unwrap_or_else(PoisonError::into_inner),
+            new,
+        );
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        self.health.set(Health::Connected);
+        tracing::debug!(
+            generation,
+            url = %self.session().url,
+            "AMP MCP connection replaced"
+        );
+        // Calls still running on the old connection fail now (TransportClosed) instead of waiting
+        // out their timeout; the service ends when the last of them lets go of it.
+        old.service.cancellation_token().cancel();
+    }
+
+    /// After `failed` could not be used (login required, or closed before a request was sent):
+    /// true when a newer connection is now current, so the call may be sent again on it. Runs
+    /// the reconnector if one is set and the last automatic attempt is old enough.
+    async fn recover(&self, failed: &Arc<Connection>) -> bool {
+        if !self.is_current(failed) {
+            return true;
+        }
+        let Some((connector, interval)) = ({
+            let config = self.reconnect_config();
+            config.connector.clone().map(|c| (c, config.interval))
+        }) else {
+            return false;
+        };
+        // Single flight: callers that failed together wait for one attempt.
+        let mut last = self.last_attempt.lock().await;
+        if !self.is_current(failed) {
+            return true;
+        }
+        if last.is_some_and(|at| at.elapsed() < interval) {
+            return false;
+        }
+        *last = Some(Instant::now());
+        match run_connector(&connector).await {
+            Ok(client) => {
+                self.adopt(client);
+                true
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "AMP reconnect failed");
+                false
+            }
+        }
+    }
+
+    /// Runs `request` on the current connection. If it is closed, or the server says login
+    /// required, [`Self::recover`] may swap in a new connection; then the request runs once more
+    /// there. Neither case can have run the request on the server.
+    async fn recovering<T, F, Fut>(&self, request: F) -> Result<T, McpError>
+    where
+        F: Fn(Arc<Connection>) -> Fut,
+        Fut: Future<Output = Result<T, McpError>>,
+    {
+        let mut conn = self.current();
+        if conn.is_closed() {
+            if self.recover(&conn).await {
+                conn = self.current();
+            }
+            if conn.is_closed() {
+                let e = McpError::Closed;
+                self.health.set(Health::after(Err(&e)));
+                return Err(e);
+            }
+        }
+        match request(Arc::clone(&conn)).await {
+            Err(e) if e.is_auth_required() && self.recover(&conn).await => {
+                request(self.current()).await
+            }
+            other => other,
+        }
     }
 
     /// The tool catalog, refetched only when the cached one is stale (cache hint, list_changed).
     /// If a refetch fails and an older list exists, the older list is returned (SEP-2549 allows
     /// serving stale on error) and health shows the failure.
     pub async fn catalog(&self) -> Result<Catalog, McpError> {
-        let mut slot = self.catalog.lock().await;
-        let changed = self.tools_changed.load(Ordering::Acquire);
+        self.recovering(|conn| self.catalog_on(conn)).await
+    }
+
+    async fn catalog_on(&self, conn: Arc<Connection>) -> Result<Catalog, McpError> {
+        let mut slot = conn.catalog.lock().await;
+        let changed = conn.tools_changed.load(Ordering::Acquire);
         if let Some(catalog) = slot.as_ref()
             && !changed
             && catalog.is_fresh()
         {
             return Ok(catalog.clone());
         }
-        match self.fetch_catalog().await {
+        match self.fetch_catalog(&conn).await {
             Ok(catalog) => {
                 *slot = Some(catalog.clone());
                 Ok(catalog)
@@ -341,7 +545,7 @@ impl AmpMcpClient {
             Err(e) => {
                 // Keep a pending list_changed for the next attempt.
                 if changed {
-                    self.tools_changed.store(true, Ordering::Release);
+                    conn.tools_changed.store(true, Ordering::Release);
                 }
                 match slot.as_ref() {
                     Some(stale) if !e.is_auth_required() => {
@@ -356,16 +560,19 @@ impl AmpMcpClient {
 
     /// Refetches the catalog now, ignoring the cache hint.
     pub async fn refresh_catalog(&self) -> Result<Catalog, McpError> {
-        let mut slot = self.catalog.lock().await;
-        let catalog = self.fetch_catalog().await?;
-        *slot = Some(catalog.clone());
-        Ok(catalog)
+        self.recovering(|conn| async move {
+            let mut slot = conn.catalog.lock().await;
+            let catalog = self.fetch_catalog(&conn).await?;
+            *slot = Some(catalog.clone());
+            Ok(catalog)
+        })
+        .await
     }
 
-    async fn fetch_catalog(&self) -> Result<Catalog, McpError> {
+    async fn fetch_catalog(&self, conn: &Arc<Connection>) -> Result<Catalog, McpError> {
         // Cleared before the request, so a list_changed that lands mid-fetch is not lost.
-        self.tools_changed.store(false, Ordering::Release);
-        let peer = self.service.peer().clone();
+        conn.tools_changed.store(false, Ordering::Release);
+        let peer = conn.service.peer().clone();
         let fetch = async move {
             let fetched_at = Instant::now();
             let mut tools = Vec::new();
@@ -395,7 +602,7 @@ impl AmpMcpClient {
             Ok::<_, rmcp::ServiceError>((tools, fetched_at, ttl_ms, scope))
         };
         let result = self
-            .with_timeout("tools/list", self.call_timeout, fetch)
+            .with_timeout(conn, "tools/list", self.call_timeout, fetch)
             .await;
         result.map(|(tools, fetched_at, ttl_ms, scope)| {
             Catalog::new(tools, fetched_at, ttl_ms, scope, self.catalog_default_ttl)
@@ -422,30 +629,38 @@ impl AmpMcpClient {
         arguments: Option<JsonObject>,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        let mut params = CallToolRequestParams::new(name.to_owned());
-        if let Some(arguments) = arguments {
-            params = params.with_arguments(arguments);
-        }
-        let peer = self.service.peer();
-        self.with_timeout(
-            &format!("tools/call {name}"),
-            timeout,
-            peer.call_tool(params),
-        )
+        let operation = format!("tools/call {name}");
+        self.recovering(|conn| {
+            let mut params = CallToolRequestParams::new(name.to_owned());
+            if let Some(arguments) = arguments.clone() {
+                params = params.with_arguments(arguments);
+            }
+            let operation = &operation;
+            async move {
+                let peer = conn.service.peer().clone();
+                self.with_timeout(&conn, operation, timeout, peer.call_tool(params))
+                    .await
+            }
+        })
         .await
     }
 
-    /// Runs one request under `timeout`, maps its error and records health. Dropping the rmcp
-    /// future on timeout sends `notifications/cancelled` for the request.
+    /// Runs one request on `conn` under `timeout`, maps its error and records health. Dropping the
+    /// rmcp future on timeout sends `notifications/cancelled` for the request. Only the current
+    /// connection's outcomes change the health; a call cut off by a swap fails as
+    /// [`McpError::Replaced`].
     async fn with_timeout<T>(
         &self,
+        conn: &Arc<Connection>,
         operation: &str,
         timeout: Duration,
         request: impl Future<Output = Result<T, rmcp::ServiceError>>,
     ) -> Result<T, McpError> {
-        if self.is_closed() {
+        if conn.is_closed() {
             let e = McpError::Closed;
-            self.health.set(Health::after(Err(&e)));
+            if self.is_current(conn) {
+                self.health.set(Health::after(Err(&e)));
+            }
             return Err(e);
         }
         let result = match tokio::time::timeout(timeout, request).await {
@@ -456,12 +671,39 @@ impl AmpMcpClient {
             Ok(Err(e)) => Err(McpError::from_service(operation, e)),
             Ok(Ok(value)) => Ok(value),
         };
-        self.health.set(Health::after(result.as_ref().map(|_| ())));
-        result
+        if self.is_current(conn) {
+            self.health.set(Health::after(result.as_ref().map(|_| ())));
+            return result;
+        }
+        match result {
+            Err(e) if !e.is_server_error() && !e.is_auth_required() => Err(McpError::Replaced {
+                operation: operation.to_owned(),
+            }),
+            other => other,
+        }
     }
 
     /// Closes the connection.
     pub async fn close(self) {
-        let _ = self.service.cancel().await;
+        let conn = self
+            .conn
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        match Arc::try_unwrap(conn) {
+            Ok(conn) => {
+                let _ = conn.service.cancel().await;
+            }
+            Err(shared) => shared.service.cancellation_token().cancel(),
+        }
     }
+}
+
+/// One reconnect attempt, bounded by [`RECONNECT_TIMEOUT`].
+async fn run_connector(connector: &Reconnector) -> Result<AmpMcpClient, McpError> {
+    tokio::time::timeout(RECONNECT_TIMEOUT, connector())
+        .await
+        .map_err(|_| McpError::Timeout {
+            operation: "reconnect".to_owned(),
+            after: RECONNECT_TIMEOUT,
+        })?
 }

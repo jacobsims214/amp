@@ -25,7 +25,8 @@ mod settings;
 
 pub use catalog::{Catalog, MAX_CATALOG_TTL, TtlSource};
 pub use client::{
-    AmpMcpClient, ClientOptions, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, ServerSession,
+    AmpMcpClient, ClientOptions, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_RECONNECT_INTERVAL, RECONNECT_TIMEOUT, Reconnector, ServerSession,
 };
 pub use credentials::{
     AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,

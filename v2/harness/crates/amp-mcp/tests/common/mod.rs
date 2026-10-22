@@ -221,6 +221,50 @@ pub async fn spawn(server: TestServer) -> Running {
     spawn_with_bearer(server, None).await
 }
 
+/// A server that answers every request with 401 while `unauthorized` is set: a login whose tokens
+/// can no longer be used. `requests` counts every HTTP request it gets.
+pub struct Switchable {
+    pub running: Running,
+    pub unauthorized: Arc<std::sync::atomic::AtomicBool>,
+    pub requests: Arc<AtomicUsize>,
+}
+
+pub async fn spawn_switchable(server: TestServer) -> Switchable {
+    let unauthorized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counters = server.counters.clone();
+    let (flag, seen) = (unauthorized.clone(), requests.clone());
+    let app = router(server, None).layer(middleware::from_fn(move |req: Request, next: Next| {
+        let (flag, seen) = (flag.clone(), seen.clone());
+        async move {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if flag.load(Ordering::SeqCst) {
+                let mut response = (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+                response.headers_mut().insert(
+                    header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static(r#"Bearer error="invalid_token""#),
+                );
+                return response;
+            }
+            next.run(req).await
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Switchable {
+        running: Running {
+            url: format!("http://{addr}/mcp"),
+            counters,
+            task,
+        },
+        unauthorized,
+        requests,
+    }
+}
+
 pub async fn spawn_with_bearer(server: TestServer, bearer: Option<&'static str>) -> Running {
     let counters = server.counters.clone();
     let app = router(server, bearer);

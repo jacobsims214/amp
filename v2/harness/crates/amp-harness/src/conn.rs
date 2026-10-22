@@ -1,11 +1,11 @@
 //! Connection flags shared by the commands that talk to AMP, and the CLI's error type.
 
-use std::{fmt, path::PathBuf};
+use std::{fmt, path::PathBuf, sync::Arc};
 
 use amp_core::tools::ToolCallError;
 use amp_mcp::{
     AmpMcpClient, Auth, ClientOptions, CredentialBackend, McpError, Overrides, ProtocolMode,
-    Settings, oauth,
+    Reconnector, Settings, oauth,
 };
 use clap::Args;
 
@@ -50,6 +50,30 @@ pub async fn connect(settings: &Settings) -> Result<AmpMcpClient, McpError> {
     }
     let backend = CredentialBackend::resolve()?;
     oauth::connect(options, &backend).await
+}
+
+/// The session's own connection (the model's AMP tools, run reporting, the worker supervisor):
+/// [`connect`], plus the automatic reconnect, so `amp-harness login` in another terminal heals
+/// it within 15 s without restarting the chat (#2159). A static token gets no reconnect: a rejected
+/// AMP_TOKEN stays rejected until the person sets a new one and restarts.
+pub async fn connect_session(settings: &Settings) -> Result<AmpMcpClient, McpError> {
+    let client = connect(settings).await?;
+    client.set_reconnector(reconnector(settings));
+    Ok(client)
+}
+
+/// A fresh [`connect`] with `settings`, for [`AmpMcpClient::set_reconnector`]; `None` for a
+/// static token. #2164's `/server` builds one for the new server's settings and calls
+/// [`AmpMcpClient::reconnect`].
+pub fn reconnector(settings: &Settings) -> Option<Reconnector> {
+    if matches!(settings.auth, Auth::Static { .. }) {
+        return None;
+    }
+    let settings = settings.clone();
+    Some(Arc::new(move || {
+        let settings = settings.clone();
+        Box::pin(async move { connect(&settings).await })
+    }))
 }
 
 /// An error the CLI prints on stderr, with its exit code.
@@ -114,4 +138,34 @@ pub fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
         .map_err(|e| CliError::new(format!("encode JSON: {e}")))?;
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(token: Option<&str>) -> Settings {
+        let token = token.map(str::to_owned);
+        let env = move |key: &str| match key {
+            "AMP_TOKEN" => token.clone(),
+            "XDG_CONFIG_HOME" => Some("/nonexistent/amp-harness-conn-test".to_owned()),
+            _ => None,
+        };
+        Settings::resolve_with_env(
+            &Overrides {
+                url: Some("http://127.0.0.1:9/mcp".to_owned()),
+                ..Overrides::default()
+            },
+            &env,
+        )
+        .unwrap()
+    }
+
+    /// #2159: a stored login (or none yet) reconnects after `amp-harness login`; AMP_TOKEN never
+    /// does, so a rejected token stays rejected until the person sets a new one.
+    #[test]
+    fn only_a_session_without_a_static_token_reconnects() {
+        assert!(reconnector(&settings(None)).is_some());
+        assert!(reconnector(&settings(Some("amp_dummy_value"))).is_none());
+    }
 }
