@@ -173,3 +173,58 @@ async fn chat_flags_do_not_mix_with_subcommands() {
     let out = harness(&dir, &amp.url, &["--role", "reviewer", "version"]).await;
     assert_eq!(out.code, 2, "stdout: {}", out.stdout);
 }
+
+/// M3-1 (#2103): the chat installs the AMP theme before the shell is built. `[tui]` in
+/// config.toml picks it, `--theme` and AMP_HARNESS_COLOR override it, and a bad value is a usage
+/// error before anything reaches AMP.
+#[tokio::test]
+async fn the_chat_uses_the_amp_theme() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("chat-theme", json!([]));
+    let config = dir.join("home/.config/amp-harness/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("\n[tui]\ntheme = \"light\"\ncolor = \"256\"\n");
+    std::fs::write(&config, text).unwrap();
+    let screen_args = [
+        "--no-session",
+        "--snapshot",
+        "100x30",
+        "--ansi",
+        "--input",
+        "/usage",
+    ];
+
+    // amp-light in 256 colours: its dim (242) on the banner, no 24-bit colour anywhere.
+    let out = harness(&dir, &amp.url, &screen_args).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("\x1b[38;5;242m"), "{}", out.stdout);
+    assert!(!out.stdout.contains("38;2;"), "{}", out.stdout);
+
+    // --theme dark with truecolor from the environment: amp-dark's dim #7C8796.
+    let script = dir.join("script.json");
+    let mut args = vec!["--theme", "dark"];
+    args.extend(screen_args);
+    let out = run(
+        &dir,
+        &amp.url,
+        &args,
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("AMP_HARNESS_COLOR", "truecolor"),
+        ],
+    )
+    .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("38;2;124;135;150"), "{}", out.stdout);
+
+    // A bad theme fails before connecting.
+    let calls = amp.mock.calls_to("amp_whoami").len();
+    let out = harness(&dir, &amp.url, &["--theme", "neon", "--snapshot", "100x30"]).await;
+    assert_eq!(out.code, 2, "stdout: {}", out.stdout);
+    assert!(
+        out.stderr.contains("unknown theme `neon`"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(amp.mock.calls_to("amp_whoami").len(), calls);
+}

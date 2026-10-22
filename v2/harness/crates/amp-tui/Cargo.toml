@@ -15,7 +15,9 @@ rpi-harness.workspace = true
 rpi-tui.workspace = true
 # The same crossterm rpi-tui is built on (its Editor takes crossterm 0.27 key events).
 crossterm = { version = "=0.27.0", features = ["events", "bracketed-paste"] }
+serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "signal"] }
 
 [dev-dependencies]
