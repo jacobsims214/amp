@@ -8,6 +8,9 @@
 //! COLSxROWS` mode drives the same shell without a terminal: it submits each `--input` (prompts
 //! and slash commands), waits for each run to finish, and prints the final screen as plain text.
 //! The integration tests use it, and so can screenshots and M3's render checks.
+//!
+//! The shell gets the session's worker supervisor: quitting while `amp_run_ticket` runs cancels
+//! the workers and waits (bounded) until their abandoned runs are reported ([`Shell::quit`]).
 
 use std::{
     io::IsTerminal,
@@ -87,6 +90,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let info = shell_info(&session);
     let models = model_choices(&session.rt);
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
+    shell.set_supervisor(session.supervisor.clone());
     let mut events = session.events;
 
     let Some((width, height)) = args.snapshot else {
