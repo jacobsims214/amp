@@ -12,6 +12,8 @@ Your manager agent turns what you ask for into epics, stories and tickets:
 2. Tickets with `amp_create_tasks`: each gets a `ref`, and `depends_on` lists the refs it waits
    on, so the whole graph is wired in one call.
 3. `amp_check_plan` before anything runs.
+4. It presents the plan, gives you the **Approve plan** link (`approve_url` from
+   `amp_check_plan`), and stops until you've approved it in the web UI.
 
 Good tickets:
 - **One thing each.** If it needs "and" to describe it, split it.
@@ -49,12 +51,38 @@ Delete only unwanted work; deleted tickets, stories and epics go to the trash an
 
 ## Approval
 
-When a project has **Plan approval** turned on (Settings), tickets planned since the last
-approval can't be dispatched until a person approves. Approval is **your "go" on the plan your
-own agent drafted**: the manager waits for its human. Any person on the project can approve
-(**Approve plan** in Flight plan, or `amp_approve_plan` when you tell your agent to); agent
-accounts can't. Flight plan shows who approved and when. New scope added later needs approving
-again.
+**Plan approval** is on by default (Settings). Tickets planned since the last approval can't be
+dispatched until a person approves. Approval is **your "go" on the plan your own agent drafted**,
+and only a person gives it, in the web UI: **Approve plan** in Flight plan. Any person on the
+project can. Flight plan shows who approved and when.
+
+No agent can approve, not even your own manager running under your login. `amp_approve_plan`
+only reports the approval status and the link; it never approves. Saying "yes" or "go" in chat
+doesn't approve anything either: the manager answers with the link and keeps waiting. That's
+deliberate. A plan is approved only when a person has looked at the board and clicked.
+
+What your manager does:
+1. Plans, runs `amp_check_plan`, and presents the plan.
+2. Gives you the `approve_url` (the Flight plan link) and **stops**.
+3. Dispatches only after `awaiting_approval` is empty, that is, after you've clicked.
+
+A ticket needs approving again when it's created, restored from the trash, or its name,
+description or acceptance criteria change. Comments, priority, assignee and dependency changes
+don't. A dispatch of such a ticket is refused with "planned after the plan was last approved … A
+person approves it in the AMP web UI (Approve plan): <link>".
+
+Agents also can't complete a ticket that was never dispatched ("never dispatched … Dispatch it
+first"), so work can't skip the gate by being marked done.
+
+Only a person, in the UI, can turn **Plan approval** off for a project; agents can turn it on.
+
+## Asking where things stand
+
+"What's on the board?", "what's waiting on me?" and similar questions are read-only. Your
+manager answers from the board (`amp_list_tasks`, `amp_get_plan`, `amp_check_plan`,
+`amp_list_unmerged`) without commenting, claiming, dispatching or completing anything, and gives
+you links for anything that needs you: a plan to approve, a question, a human ticket. It only
+touches the tickets you ask it to work on.
 
 ## Scheduling
 
