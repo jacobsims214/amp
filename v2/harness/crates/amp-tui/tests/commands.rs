@@ -40,9 +40,21 @@ struct Rig {
 fn plan_json() -> Value {
     json!({"project_id": 2, "epics": [
         {"id": 150, "name": "Earlier", "tickets": {"completed": 12}, "stories": []},
-        {"id": 161, "name": "AMP Harness", "tickets": {"in_progress": 2, "backlog": 3, "blocked": 1, "completed": 9},
-         "stories": [{"id": 393, "name": "M3 theme + metadata", "tickets": {"in_progress": 2, "backlog": 1}}]}
+        {"id": 161, "name": "AMP Harness", "tickets": {"in_progress": 2, "backlog": 3, "blocked": 3, "completed": 9},
+         "stories": [{"id": 393, "name": "M3 theme + metadata", "tickets": {"in_progress": 2, "backlog": 1, "blocked": 3}}]}
     ]})
+}
+
+/// `amp_list_tasks(owner=any, state=blocked, format=full)`: story 393 has a question, a waiting
+/// ticket and a scheduled one (AMP stores all three as `blocked`).
+fn blocked_json() -> Value {
+    let t = |id: i64, reason: Option<&str>| json!({"id": id, "epic_id": 161, "story_id": 393, "state": "blocked", "block_reason": reason});
+    json!({
+        "ready_to_dispatch": [], "in_progress": [], "completed": [],
+        "blocked": [t(2107, Some("Dark or light?")), t(2111, None)],
+        "scheduled": [t(2112, Some("scheduled: 2026-11-01"))],
+        "questions": [t(2107, Some("Dark or light?"))]
+    })
 }
 
 async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
@@ -82,6 +94,9 @@ async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
         sample::meta(true),
         Arc::new(|tool, args| match tool {
             "amp_get_plan" => Ok(plan_json()),
+            "amp_list_tasks" if args["format"] == "full" && args["state"] == "blocked" => {
+                Ok(blocked_json())
+            }
             "amp_answer_question" if args["task_id"] == 2110 => Err(
                 "tools/call amp_answer_question: Mcp error: -32603: task 2110 is not blocked"
                     .into(),
@@ -377,15 +392,30 @@ async fn plan_shows_the_tree_and_approval() {
         "{screen}"
     );
     assert!(screen.contains("▌ Earlier ■ 12 Done"), "{screen}");
+    // The six web words with state marks: the story's three blocked tickets are a question, a
+    // waiting ticket and a scheduled one, not "3 blocked".
     assert!(
-        screen.contains("▌ AMP Harness ■ 2 In progress · 3 open · 1 blocked · ■ 9 Done"),
+        screen.contains(
+            "M3 theme + metadata ■ 2 In progress · □ 1 Ready · ■ 1 Question · ■ 1 Scheduled · □ 1 Waiting"
+        ),
         "{screen}"
     );
     assert!(
-        screen.contains("M3 theme + metadata ■ 2 In progress · 1 open"),
+        screen.contains("▌ AMP Harness ■ 2 In progress · □ 3 Ready · ■ 1 Question · ■ 1 Scheduled"),
         "{screen}"
     );
-    assert_eq!(rig.meta.stub_calls()[0].1, json!({"project_id": 2}));
+    for word in ["open", "blocked"] {
+        assert!(!screen.contains(&format!("1 {word}")), "{screen}");
+    }
+    let calls = rig.meta.stub_calls();
+    assert_eq!(calls[0].1, json!({"project_id": 2}));
+    assert_eq!(
+        calls[1],
+        (
+            "amp_list_tasks".to_owned(),
+            json!({"project_id": 2, "owner": "any", "state": "blocked", "format": "full"})
+        )
+    );
     rig.press(KeyCode::Enter).await;
     assert_eq!(
         rig.opened(),
