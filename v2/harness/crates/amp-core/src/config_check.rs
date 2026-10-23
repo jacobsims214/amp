@@ -163,7 +163,7 @@ pub const CHECKERS: &[(&str, Checker)] = &[
     ("roles", check_roles),
     ("workers", check_workers),
     ("tools", check_tools),
-    // #2233 (H2): ("mcp", crate::mcp_config::check),
+    ("mcp", check_mcp),
     // #2234 (H11): ("agents", ...), ("skills", ...),
 ];
 
@@ -247,6 +247,22 @@ pub fn check(
     report
 }
 
+/// An error message fit to print: toml's multi-line report (which quotes the source line, maybe a
+/// secret) becomes its first line plus the message, and serde's quoted string values are dropped.
+pub fn clean(message: &str) -> String {
+    let lines: Vec<&str> = message
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let short = match lines.as_slice() {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, .., last] => format!("{first}: {last}"),
+    };
+    crate::mcp_config::redact_serde(&short)
+}
+
 /// Reads and parses the layers once; read problems go in `read_problems`.
 pub fn read_inputs<'a>(
     paths: &'a amp_mcp::ConfigPaths,
@@ -280,11 +296,13 @@ pub fn read_inputs<'a>(
         toml::from_str(text)
             .map_err(|e| {
                 read_problems.push(
-                    Problem::error("files", Layer::User, format!("not valid TOML: {e}"))
-                        .file(user_path)
-                        .fix(
-                            "fix the syntax; nothing else in this file is checked until it parses",
-                        ),
+                    Problem::error(
+                        "files",
+                        Layer::User,
+                        format!("not valid TOML: {}", clean(&e.to_string())),
+                    )
+                    .file(user_path)
+                    .fix("fix the syntax; nothing else in this file is checked until it parses"),
                 );
             })
             .ok()
@@ -300,7 +318,7 @@ pub fn read_inputs<'a>(
         Some(Ok(repo)) => repo,
         Some(Err(e)) => {
             read_problems.push(
-                Problem::error("files", Layer::Repo, e.0)
+                Problem::error("files", Layer::Repo, clean(&e.0))
                     .file(repo_path.as_deref())
                     .fix("a repo config may hold only [mcp.*], [roles.*] and [models] profile"),
             );
@@ -373,7 +391,7 @@ fn check_server(inputs: &Inputs) -> Vec<Problem> {
     match toml::from_str::<amp_mcp::FileConfig>(text) {
         Ok(_) => Vec::new(),
         Err(e) => vec![
-            Problem::error("server", Layer::User, e.to_string())
+            Problem::error("server", Layer::User, clean(&e.to_string()))
                 .file(inputs.user_file())
                 .key("server"),
         ],
@@ -390,7 +408,7 @@ fn check_models(inputs: &Inputs) -> Vec<Problem> {
             Problem::error(
                 "models",
                 Layer::User,
-                e.0.trim_start_matches("parse : ").to_owned(),
+                clean(e.0.trim_start_matches("parse : ")),
             )
             .file(inputs.user_file())
             .fix("[models], [providers.*], [roles.*] and [profiles.*] accept only known keys"),
@@ -527,7 +545,7 @@ fn check_workers(inputs: &Inputs) -> Vec<Problem> {
     match crate::supervisor::SupervisorConfig::load(&|_| None, Some(path)) {
         Ok(_) => Vec::new(),
         Err(e) => vec![
-            Problem::error("workers", Layer::User, e)
+            Problem::error("workers", Layer::User, clean(&e))
                 .file(inputs.user_file())
                 .key("workers"),
         ],
@@ -542,10 +560,51 @@ fn check_tools(inputs: &Inputs) -> Vec<Problem> {
     match crate::agent::check_harness_tables(text) {
         Ok(()) => Vec::new(),
         Err(e) => vec![
-            Problem::error("tools", Layer::User, format!("[tools]/[secrets]: {e}"))
-                .file(inputs.user_file()),
+            Problem::error(
+                "tools",
+                Layer::User,
+                format!("[tools]/[secrets]: {}", clean(&e)),
+            )
+            .file(inputs.user_file()),
         ],
     }
+}
+
+/// `[mcp.*]` in both files, as the MCP layer reads them ([`crate::mcp_config::McpConfig::load`]).
+fn check_mcp(inputs: &Inputs) -> Vec<Problem> {
+    let repo_file = inputs.repo_file();
+    // A file that doesn't parse at all is already the files check's problem.
+    let user_broken = inputs.user_text.is_some() && inputs.user.is_none();
+    let repo_broken = inputs.repo.is_none() && repo_file.as_deref().is_some_and(Path::is_file);
+    crate::mcp_config::McpConfig::load(inputs.paths)
+        .problems
+        .into_iter()
+        .filter_map(|p| {
+            let layer = if repo_file.as_deref() == Some(p.file.as_path()) {
+                Layer::Repo
+            } else {
+                Layer::User
+            };
+            let duplicate = p.key == "mcp"
+                && match layer {
+                    Layer::Repo => repo_broken,
+                    _ => user_broken,
+                };
+            if duplicate {
+                return None;
+            }
+            let problem = match p.severity {
+                crate::mcp_config::Severity::Error => Problem::error("mcp", layer, p.message),
+                crate::mcp_config::Severity::Warning => Problem::warning("mcp", layer, p.message),
+            }
+            .file(Some(&p.file))
+            .key(p.key);
+            Some(match p.fix {
+                Some(fix) => problem.fix(fix),
+                None => problem,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -607,7 +666,8 @@ mod tests {
                 "providers",
                 "roles",
                 "workers",
-                "tools"
+                "tools",
+                "mcp"
             ]
         );
         let r = run(
@@ -714,6 +774,35 @@ mod tests {
         let p = &find(&r, "models")[0];
         assert_eq!(p.layer, Layer::Repo);
         assert!(p.message.contains("inherit"), "{}", p.message);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// #2233's MCP problems come through with their layer, and a broken line is never quoted.
+    #[test]
+    fn mcp_problems_and_no_quoted_source_lines() {
+        let d = dir("mcp");
+        let r = run(
+            &d,
+            Some("[mcp.amp]\ntype = \"http\"\nurl = \"https://x.test/mcp\"\n"),
+            Some("[mcp.fs]\ntype = \"stdio\"\n"),
+        );
+        let mcp = find(&r, "mcp");
+        let has = |layer: Layer, prefix: &str| {
+            mcp.iter().any(|p| {
+                p.layer == layer && p.key.as_deref().is_some_and(|k| k.starts_with(prefix))
+            })
+        };
+        assert!(has(Layer::User, "mcp.amp"), "{mcp:?}");
+        assert!(has(Layer::Repo, "mcp.fs"), "{mcp:?}");
+
+        let r = run(&d, Some("[server]\ntoken = sk-live-SECRET\n"), Some(""));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("SECRET"), "{json}");
+        assert_eq!(find(&r, "files").len(), 1, "{:?}", r.problems);
+        assert!(find(&r, "mcp").is_empty(), "no duplicate: {:?}", r.problems);
+        let r = run(&d, Some("[workers]\nmax_parallel = \"SECRET\"\n"), Some(""));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(!json.contains("SECRET"), "{json}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

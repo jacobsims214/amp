@@ -445,7 +445,7 @@ resolves. `models set` refuses an unknown provider; a model your config doesn't 
 up in the provider's live catalog (when it has a key) and added to your user file as an empty
 `[providers.<p>.models."<id>"]` table, and a model the catalog doesn't list is refused unless
 `--no-check`. `config check` reports every problem in every layer (files, server, models,
-providers, roles, workers, tools, tui; `--live` adds each role's model against the live catalog)
+providers, roles, workers, tools, tui, mcp; `--live` adds each role's model against the live catalog)
 with the file, the key and a fix, and exits 1 on errors (a missing key is a warning).
 
 ### Secrets never reach an agent's bash (#2142)
