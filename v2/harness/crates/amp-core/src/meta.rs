@@ -769,13 +769,11 @@ impl AmpMeta {
         self.project.get().is_some_and(|p| p.require_plan_approval)
     }
 
-    /// Whether tickets wait for a person's approval (the status line's chip is up).
+    /// Whether tickets wait for this person's approval (the status line's chip is up). Since
+    /// per-ticket approval (#2198) only their own count: others' tickets wait for their owners,
+    /// who may not approve soon, so they don't keep the plan on the fast poll (#2209).
     pub fn plan_pending(&self) -> bool {
-        self.plan_required()
-            && self
-                .plan
-                .get()
-                .is_some_and(|p| !p.awaiting_approval.is_empty())
+        self.plan_required() && self.plan.get().is_some_and(|p| !p.yours().is_empty())
     }
 
     fn ticket_open(&self) -> bool {
