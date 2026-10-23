@@ -1,6 +1,6 @@
 ---
 name: amp-planning
-description: Full protocol for planning, creating the task hierarchy, getting approval, and dispatching workers — including the hard approval gate
+description: Full protocol for planning, creating the task hierarchy, handing the plan to a person to approve in AMP's web UI, and dispatching workers — including the hard approval gate agents can never pass themselves
 ---
 
 # AMP Planning Skill
@@ -226,9 +226,11 @@ architecture sketch, an API shape, a data model).
   unapproved design. Say in each build ticket's description: "Build to the approved artifact on
   #<design ticket>."
 - The designer publishes, blocks the ticket asking for review, and stops. Tell the user the
-  artifact's link. They review in AMP, or tell you in chat and you record it with
-  `amp_review_artifact`. Then dispatch the design ticket again: the designer revises (a new
-  version) or, once approved, completes it, which unblocks the build.
+  artifact's link. **Approving it is theirs to do, in AMP** (Approve on the artifact page):
+  `amp_review_artifact` with `approve=true` is refused over MCP. If they tell you in chat what to
+  change, you may record that with `amp_review_artifact(approve=false, note=…)`. Then dispatch the
+  design ticket again: the designer revises (a new version) or, once approved, completes it,
+  which unblocks the build.
 - Skip it for changes with one obvious answer (a bug fix, a field added to an existing form) or
   when the user says to go straight to code.
 
@@ -261,7 +263,9 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
 - **A question that comes up mid-work.** A worker blocks its own ticket with the question
   (`amp_block_task`), and you answer it. Human tickets are steps you can see at plan time.
 - **Approving a mockup.** That's the design ticket's artifact review.
-- **Approving the plan.** That's `amp_approve_plan`.
+- **Approving the plan.** Each person approves their own tickets in AMP's web UI (Flight plan,
+  "Approve plan"); a lead may approve on someone's behalf. It isn't a ticket, and no agent can do
+  it.
 - **Anything an agent can do with the tools it has.** Don't hand agents' work to people. If an
   agent could do it but lacks a tool or access, say so in the plan; that gap is worth knowing.
 
@@ -503,7 +507,8 @@ If yes to any of these — add the dependency, regardless of which epic or story
 ### Check the plan before presenting it
 
 Run `amp_check_plan(project_id)` after creating the tickets and before presenting the plan or
-dispatching anything. It reports tickets connected to nothing (`isolated`), too much work that
+dispatching anything. When tickets await approval it also returns `approve_url`, the link you
+give the user (see "Stop after presenting"). It reports tickets connected to nothing (`isolated`), too much work that
 can start at once (`wide_start` — usually missing dependencies), and empty stories. Fix what it
 finds, then run it again. A warning on `amp_create_tasks` about missing
 dependencies means the same thing: decide now, not after dispatch.
@@ -585,32 +590,50 @@ plausible-looking.
 
 ---
 
-## ⛔ Stop after presenting — do not dispatch
+## ⛔ Stop after presenting — a person approves in the web UI
 
-Wait for explicit approval. Nothing further until the user says so.
+**You never approve a plan.** Only a person can, in AMP's web UI: the project's Flight plan page,
+"Approve plan". Approval is per ticket: each person approves **their own** tickets, and a project
+lead (or owner, admin) may approve someone else's on their behalf. There is no tool for it. `amp_approve_plan` always refuses (it only reports the
+approval status and the link), and so does anything else that tries to approve over MCP, whatever
+the user says in chat. Don't call it.
 
-Approval: "approved", "go ahead", "yes", "do it", or similar.
+After presenting the plan:
 
-Changes requested → update → present again → wait again.
+1. Run `amp_check_plan(project_id)` one last time. When tickets await approval it returns
+   `awaiting_approval` (everyone's), `awaiting_approval_tickets` (`{task_id, owner_user_id,
+   yours}`), `awaiting_yours` (your user's own) and **`approve_url`**, the Flight plan link.
+   That's where you stop.
+2. Hand off, in plain words, with the link, naming **their** tickets:
+   "The plan is on the board. #12, #14 and #15 are yours to approve in AMP when you're happy
+   with them: <approve_url>. I'll dispatch each once it's approved."
+   If some awaiting tickets belong to others, say so: "#16 is Sam's; it waits for Sam (or a lead
+   on Sam's behalf)." Don't ask your user to approve others' tickets unless they're a lead and
+   choose to.
+3. **Stop and wait.** Don't dispatch, claim, complete, or start anything in the meantime.
 
-When the user approves, **record it in AMP before dispatching**:
+Changes requested → update the plan → present again → hand off the link again → wait again.
 
-```
-amp_approve_plan(project_id=PROJECT_ID)
-```
+**Chat isn't approval.** "yes", "go", "looks good", "ship it", "do it", "sounds right" and the
+like don't approve anything, and you never treat ambiguous words as approval. When the user says
+something like that, check `amp_check_plan`: tickets no longer in `awaiting_approval` were
+approved in the UI and you can dispatch them; if `awaiting_yours` isn't empty, reply with the
+`approve_url` and say which of their tickets still need their click there.
 
-That's the same approval a person gives with "Approve plan" in AMP's Flight plan, and projects with
-`require_plan_approval` on refuse to dispatch tickets planned since the last approval until it's
-recorded. Never call it on your own judgment — only when the user has said yes. The user may also
-approve in the UI instead of in chat: `amp_check_plan`'s `awaiting_approval` is empty once the plan
-is approved, wherever that happened.
-
-Each new planning run (or fix tickets you add) needs approving again when the project requires it:
-if a dispatch is refused because the plan wasn't approved, present what's new and ask.
+Each new planning run (and fix tickets you add, and any ticket whose name, description or
+acceptance criteria you change) needs approving again, by its owner, when the project requires
+it. If a dispatch is refused with "ticket N isn't approved … Its owner approves it in the AMP web
+UI (Approve plan; a project lead may approve it on their behalf): <link>", present what's new,
+give the user that link (saying whose ticket it is), and stop.
 
 ---
 
 ## Dispatch — only after approval
+
+Dispatch a ticket only once it's approved in the UI (by its owner, or a lead on their behalf): it
+isn't in `amp_check_plan`'s `awaiting_approval` (or the project doesn't require approval). Never complete or move forward a ticket that
+wasn't dispatched: AMP refuses it ("never dispatched … Dispatch it first"), and the fix is to
+dispatch it, not to find another path.
 
 **Step 0 — re-run the file conflict check against the current batch:** before dispatching
 anything, look at everything currently in `ready_to_dispatch` (this includes fix tasks a reviewer
@@ -647,15 +670,17 @@ After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked ta
   - whether it's `stale` (no activity for two days).
 - Tell your user plainly: "Waiting on Sam to review and merge #31; nothing else can start until
   then." Keep dispatching everything that doesn't wait on it.
-- If it's your user's own, they can Start and Mark done in AMP. Or they tell you it's done and
-  you record it: `amp_complete_task(task_id, note, pr_url, hours_worked)`. Only on their word, and
-  ask how many hours it took if they don't say. A stale one is worth a nudge to its owner.
-- A teammate's human ticket is theirs to mark done, not yours, even when your user tells you it's
+- **Only the person marks a human ticket done, in AMP's web UI** (Start and Mark done in the
+  ticket drawer or My Work). You can't: `amp_complete_task` on a human ticket is refused with the
+  ticket's link. When your user says theirs is done, re-read the board; if it's still open, give
+  them the link and ask them to mark it done there. A stale one is worth a nudge to its owner.
+- A teammate's human ticket is theirs to mark done in the UI, even when your user tells you it's
   finished. Re-read the board (it's usually done already). If it's still open, say it's waiting on
   them.
 
 A worker that needs a person blocks its ticket with the question and stops; the ticket appears in
-`questions`. Ask your user, record the answer with `amp_answer_question`, and re-dispatch the
+`questions`. Ask your user, record their answer with `amp_answer_question` (it shows as
+"relayed by agent" in AMP; never answer from your own judgment), and re-dispatch the
 ticket when it comes back as ready — see "When a worker asks a question" in your instructions.
 Questions don't stop the loop: keep dispatching everything else.
 

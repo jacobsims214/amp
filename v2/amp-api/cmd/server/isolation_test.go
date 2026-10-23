@@ -52,6 +52,7 @@ func (ss *sharedStack) project(t *testing.T, label string) *mcpStack {
 	if err != nil {
 		t.Fatalf("create project %q: %v", label, err)
 	}
+	planApprovalOff(t, ss.repo, proj.ID)
 	epic, err := ss.repo.CreateEpic(ctx, domain.CreateEpicRequest{
 		ProjectID: proj.ID, Name: label + "-epic", Priority: "1",
 	})

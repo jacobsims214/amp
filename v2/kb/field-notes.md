@@ -22,7 +22,9 @@ own agents, with scope arriving through Slack). Each lesson is also in the page 
 6. **Metadata drifts.** One agent wrote `jira_key` where the others used `jira_epic`. Use keys
    already in use; the plan check now warns.
 7. **Approval is the engineer's go, not a manager's sign-off.** The agent waits for its own
-   human.
+   human, who clicks Approve plan in the web UI for their own tickets (approval is per ticket; a
+   lead may approve on someone's behalf). A manager once read a chat reply as approval and
+   marked work done that was never dispatched; AMP now refuses both over MCP.
 8. **Record usage from the start.** Work done before usage reporting has no spend and doesn't
    trace by commit. Reports say so, but you can't backfill it.
 9. **Put the ticket ref in every commit.** It's what lets anyone trace code back to its story.

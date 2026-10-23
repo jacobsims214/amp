@@ -55,6 +55,16 @@ services:
       TYPESENSE_API_KEY: amp-local-dev
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: nomic-embed-text
+      # Auth is off here (no OIDC_ISSUER_URL), so there's no UI token to
+      # check: REST (:3001, what the UI calls) counts as a person in the web
+      # UI, and MCP (:8000) never does. Plan approval, artifact approval and
+      # human tickets are therefore done in the UI; agents over MCP are
+      # refused with a link to the page, built from APP_PUBLIC_URL.
+      # APP_PUBLIC_URL is the UI's address as the browser sees it (the ui
+      # service's host port below). It makes approve_url, refusal links and
+      # artifact URLs absolute; without it links are relative and artifact
+      # URLs are left out. Change it if you publish the UI on another port.
+      APP_PUBLIC_URL: http://localhost:5173
     depends_on:
       postgres:
         condition: service_healthy

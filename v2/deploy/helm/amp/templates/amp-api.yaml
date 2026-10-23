@@ -108,6 +108,10 @@ spec:
               value: {{ .Values.auth.mcpAudience | quote }}
             - name: REST_AUDIENCES
               value: {{ .Values.oauth2Proxy.clientID | quote }}
+            # Tokens issued to this client on REST are the web UI (plan
+            # approval and other human-only actions need it).
+            - name: UI_CLIENT_ID
+              value: {{ .Values.auth.uiClientID | default .Values.oauth2Proxy.clientID | quote }}
             - name: MCP_ALLOWED_ORIGINS
               value: "https://{{ .Values.global.domain }}"
             {{- with .Values.ampApi.signupAllowedDomains }}

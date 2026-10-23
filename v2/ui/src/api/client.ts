@@ -5,6 +5,7 @@ import type {
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
   Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  ApproveRequest, ApproveResponse, ApproveResult,
 } from '../types'
 
 const BASE = '/api'
@@ -33,7 +34,7 @@ async function post<T>(path: string, body?: unknown): Promise<T> {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }))
-    throw new Error(err.error || `POST ${path}: ${res.status}`)
+    throw Object.assign(new Error(err.error || `POST ${path}: ${res.status}`), { status: res.status })
   }
   return res.json()
 }
@@ -166,9 +167,29 @@ export const api = {
     if (opts.groupBy) q.set('group_by', opts.groupBy)
     return get<ProjectReport>(`/projects/${projectId}/report?${q}`)
   },
-  /** A person approves the project's plan as it stands now. */
-  approvePlan: (projectId: number) =>
-    post<{ project: Project }>(`/projects/${projectId}/approve-plan`).then(r => r.project),
+  /**
+   * Approve tickets' plans (#2198). Every field is optional: taskIds are exactly
+   * the tickets to approve (omitted: all of the caller's own that wait, or
+   * everyone's with onBehalf); asOf is the newest planned_at among them,
+   * verbatim from the API (#2192); onBehalf allows other people's tickets
+   * (project leads and above). The server answers 403 naming the ids when
+   * on_behalf is missing or the caller isn't a lead.
+   */
+  approvePlan: (projectId: number, req: ApproveRequest = {}) => {
+    const body: Record<string, unknown> = {}
+    if (req.taskIds) body.task_ids = req.taskIds
+    if (req.asOf) body.as_of = req.asOf
+    if (req.onBehalf) body.on_behalf = true
+    return post<ApproveResponse>(`/projects/${projectId}/approve-plan`, body).then((r): ApproveResult => ({
+      project: r.project,
+      approved: r.approved ?? [],
+      awaitingApproval: r.awaiting_approval ?? [],
+      // An older server (one project-wide approval) has no owners: treat what waits as the caller's.
+      awaitingYours: r.awaiting_yours ?? r.awaiting_approval ?? [],
+      skipped: r.skipped ?? {},
+      onBehalf: !!r.on_behalf,
+    }))
+  },
   planCheck: (projectId: number) => get<PlanReport>(`/projects/${projectId}/plan-check`),
   updateTask: (id: number, req: UpdateTaskRequest) =>
     patch<{ task: Task }>(`/tasks/${id}`, req).then(r => r.task),

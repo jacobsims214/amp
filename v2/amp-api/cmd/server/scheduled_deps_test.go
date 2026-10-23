@@ -141,7 +141,7 @@ func TestScheduledDeps_StartAtFiresWithUnfinishedDependencyStaysBlocked(t *testi
 	// Nothing may dispatch it while it waits.
 	s.callExpectError(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(id), "agent_id": "agent"})
 
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(dep)})
+	s.finish(t, dep)
 	waitState(t, s, id, "backlog")
 }
 
@@ -155,7 +155,7 @@ func TestScheduledDeps_DependencyDoneFirstWaitsForStartAt(t *testing.T) {
 	at := time.Now().Add(1500 * time.Millisecond)
 	scheduleAt(t, s, id, &at)
 
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(dep)})
+	s.finish(t, dep)
 	if time.Now().After(at) {
 		t.Skip("machine too slow: start_at passed before the dependency completed")
 	}
@@ -261,7 +261,7 @@ func TestScheduledDeps_ClearingScheduleKeepsDependencyBlock(t *testing.T) {
 		t.Fatalf("schedule cleared with dependency %d unfinished: ticket is %q, want blocked", dep, st)
 	}
 
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(dep)})
+	s.finish(t, dep)
 	waitState(t, s, id, "backlog")
 }
 
@@ -587,7 +587,7 @@ func TestScheduledDeps_AnswerKeepsFutureSchedule(t *testing.T) {
 		if got := stored(id); got.State != domain.TaskStateBlocked || got.BlockReason != "" {
 			t.Fatalf("after start_at with dependency unfinished: state %q, block_reason %q; want blocked, \"\"", got.State, got.BlockReason)
 		}
-		s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(dep)})
+		s.finish(t, dep)
 		waitState(t, s, id, string(domain.TaskStateBacklog))
 	})
 

@@ -260,7 +260,7 @@ func (s *Service) AssignTask(ctx context.Context, p authz.Principal, taskID int,
 		}
 	}
 
-	return s.setOwner(ctx, p, t, newOwner, requireIdle)
+	return s.setOwner(ctx, p, t, newOwner, requireIdle, leadInUI(p, lvl))
 }
 
 // openReassign retries a reassignment the strict rules refused (refusal)
@@ -294,7 +294,7 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 	if !p.HasUser() {
 		return nil, authz.BadRequest("claiming needs a signed-in AMP user")
 	}
-	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskClaim)
+	t, lvl, err := s.LoadTask(ctx, p, taskID, authz.TaskClaim)
 	if err != nil {
 		return nil, err
 	}
@@ -302,10 +302,25 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 		// Even global admins, who pass every check, don't claim taken work.
 		return nil, authz.Forbidden("task %d is owned by user %d; claiming only takes unassigned tickets, use assign to reassign it", t.ID, *t.OwnerUserID)
 	}
-	return s.setOwner(ctx, p, t, p.UserRef(), false)
+	return s.setOwner(ctx, p, t, p.UserRef(), false, leadInUI(p, lvl))
 }
 
-func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Task, newOwner *int, requireIdle bool) (*domain.Task, error) {
+// leadInUI reports whether an ownership change by p (at level lvl) keeps
+// the ticket's plan approval: p is a project lead or above acting in the
+// AMP web UI. Off the UI (MCP, an API token, an agent) a lead's change is
+// treated like a Member's, because approving on someone's behalf is
+// UI-only (ApproveTickets) and an agent under a lead's login must not move
+// approved work to someone who never approved it (AMP #2223).
+func leadInUI(p authz.Principal, lvl authz.Level) bool {
+	return lvl >= authz.Lead && p.InUI()
+}
+
+// setOwner changes t's owner through its task actor. byLead (the caller is
+// a project lead or above, in the web UI: leadInUI) keeps the ticket's plan approval; anyone else's
+// change drops it when the ticket stops being the person it was approved
+// for (AMP #2218; see domain.Task.DropsApprovalOn). Handover goes through
+// AssignTask, so the same rule applies to it.
+func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Task, newOwner *int, requireIdle, byLead bool) (*domain.Task, error) {
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, err
@@ -316,6 +331,7 @@ func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Tas
 		ExpectOwner: t.OwnerUserID,
 		NewOwner:    newOwner,
 		RequireIdle: requireIdle,
+		ByLead:      byLead,
 		By:          p.UserRef(),
 		ByName:      p.Email,
 		ReplyCh:     replyCh,
@@ -335,7 +351,7 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 		return nil, err
 	}
 	proj, err := s.Repo.GetProject(ctx, t.ProjectID)
-	if err := planApprovalGate(proj, err, t); err != nil {
+	if err := planApprovalGate(proj, err, t, s.PlanURL(t.ProjectID)); err != nil {
 		return nil, err
 	}
 	pid, err := s.Registry.Get(t.ProjectID)
@@ -355,12 +371,13 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 }
 
 // planApprovalGate decides whether t may be dispatched as far as plan
-// approval goes: with the project's setting on, a ticket planned after the
-// last approval waits for a person to approve the plan. It fails closed: if
+// approval goes: with the project's setting on, a ticket a person hasn't
+// approved since it was last planned (Task.Approved, per ticket since AMP
+// #2198) waits for its owner, or a lead on their behalf. It fails closed: if
 // the project couldn't be loaded (lookupErr), we can't tell whether the gate
 // applies, so the dispatch is refused with a retryable 503 rather than let
 // through unchecked.
-func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task) error {
+func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, planURL string) error {
 	if lookupErr != nil || proj == nil {
 		reason := "project not found"
 		if lookupErr != nil {
@@ -370,8 +387,10 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task) err
 			"nothing was started, try the dispatch again", t.ID, t.ProjectID, reason)}
 	}
 	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
-		return authz.Forbidden("ticket %d was planned after the plan was last approved; this project needs the plan approved "+
-			"before agents start new tickets (amp_approve_plan, or Approve plan in AMP's Flight plan)", t.ID)
+		return authz.Forbidden("ticket %d isn't approved: nobody has approved it since it was planned or its scope last changed, and "+
+			"this project needs each ticket approved before agents start it. Its owner approves it in the AMP web UI (Approve plan; "+
+			"a project lead may approve it on their behalf): %s. "+
+			"Agents can't approve: stop and ask your person to approve it there.", t.ID, planURL)
 	}
 	return nil
 }
@@ -397,11 +416,18 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Owner); err != nil {
 		return nil, err
 	}
+	// Turning plan approval off lets agents start work nobody approved, so
+	// only a person in the web UI can. Turning it on is fine from anywhere.
+	if u.RequirePlanApproval != nil && !*u.RequirePlanApproval {
+		if err := authz.RequireUI(p, "Turning plan approval off", s.SettingsURL(projectID)); err != nil {
+			return nil, err
+		}
+	}
 	proj, err := s.Repo.UpdateProject(ctx, projectID, u)
 	if err == nil {
 		s.audit(ctx, p, domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
-				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata}})
+				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata, "channel": p.Channel}})
 	}
 	return proj, err
 }

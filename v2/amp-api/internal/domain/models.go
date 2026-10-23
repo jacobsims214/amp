@@ -64,10 +64,12 @@ type Project struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// AwaitsApproval reports whether a ticket was planned after the project's
-// plan was last approved (always, if it never was).
+// AwaitsApproval reports whether ticket t still waits for a person to
+// approve it. Since AMP #2198 approval is per ticket (Task.Approved): the
+// project's PlanApprovedAt is only when its last approval happened and no
+// longer decides. The project receiver is kept so callers read the same.
 func (p *Project) AwaitsApproval(t *Task) bool {
-	return p.PlanApprovedAt == nil || t.CreatedAt.After(*p.PlanApprovedAt)
+	return !t.Approved()
 }
 
 // ProjectSettings is a change to a project's settings; nil fields are kept.
@@ -163,6 +165,88 @@ type Task struct {
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+	// PlannedAt is when the ticket's scope was last set: its creation, its
+	// restore from the trash, or the last change to its name, description,
+	// or acceptance criteria. A plan approval covers tickets planned before
+	// it (Project.AwaitsApproval); comments and dependency changes don't
+	// move it.
+	PlannedAt time.Time `json:"planned_at"`
+	// ApprovedAt is when a person last approved the ticket's plan, and
+	// ApprovedBy who (nil: approved by a migration, or the person's account
+	// is gone). The ticket is approved iff ApprovedAt is at or after
+	// PlannedAt (Approved): re-planning it makes it wait again.
+	ApprovedAt *time.Time `json:"approved_at,omitempty"`
+	ApprovedBy *int       `json:"approved_by,omitempty"`
+	// ApprovedFor is whose ticket it was when it was approved: its owner,
+	// or for an unassigned ticket the person who planned it (nil: nobody's,
+	// a legacy row). When a Member moves the ticket to someone else, the
+	// approval is dropped; a project lead's reassignment and dispatch's
+	// automatic claim keep it (AMP #2218, Task.DropsApprovalOn).
+	ApprovedFor *int `json:"approved_for,omitempty"`
+}
+
+// Approved reports whether a person approved the ticket as it's planned
+// now: approved at or after its last planning (AMP #2198).
+func (t *Task) Approved() bool {
+	return t.ApprovedAt != nil && !t.ApprovedAt.Before(t.Planned())
+}
+
+// ApprovesAsOwn reports whether userID approving t approves their own work:
+// they own it, or nobody owns it and they created it. Anything else is
+// approving on someone's behalf (AMP #2198). A ticket with neither owner
+// nor creator (legacy rows, local dev) is nobody's, so only the local-dev
+// principal (user 0, no account) approves it as its own.
+func (t *Task) ApprovesAsOwn(userID int) bool {
+	who := t.OwnerUserID
+	if who == nil {
+		who = t.CreatedBy
+	}
+	if who == nil {
+		return userID == 0
+	}
+	return *who == userID
+}
+
+// ApprovalOwner is whose approval the ticket needs: its owner, or for an
+// unassigned ticket the person who planned it (nil when neither is set).
+func (t *Task) ApprovalOwner() *int {
+	if t.OwnerUserID != nil {
+		return t.OwnerUserID
+	}
+	return t.CreatedBy
+}
+
+// DropsApprovalOn reports whether giving t to newOwner (nil: releasing it)
+// drops its plan approval, when the person making the change isn't a
+// project lead or above acting in the AMP web UI (byLead false; a lead
+// over MCP or an API token counts as not a lead here, AMP #2223). An approval is for one person
+// (ApprovedFor): it survives only while the ticket is that person's again
+// afterwards, so a Member can't approve someone's ticket by claiming it,
+// approving it as their own and handing it back, nor hand their approved
+// ticket to someone who never approved it (AMP #2218). A lead's
+// reassignment in the web UI keeps it: a lead may approve on anyone's
+// behalf there anyway.
+func (t *Task) DropsApprovalOn(newOwner *int, byLead bool) bool {
+	if t.ApprovedAt == nil || byLead {
+		return false
+	}
+	next := newOwner
+	if next == nil {
+		next = t.CreatedBy
+	}
+	if next == nil || t.ApprovedFor == nil {
+		return !(next == nil && t.ApprovedFor == nil)
+	}
+	return *next != *t.ApprovedFor
+}
+
+// Planned is when the ticket was last planned (PlannedAt, or CreatedAt for
+// a value built without it).
+func (t *Task) Planned() time.Time {
+	if t.PlannedAt.IsZero() {
+		return t.CreatedAt
+	}
+	return t.PlannedAt
 }
 
 // IsHuman reports whether a person, not an agent, does this ticket.

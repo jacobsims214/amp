@@ -270,16 +270,20 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("Optional. New project name."),
 			"description":   str("Optional. New project description."),
 			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
-			"require_plan_approval": boolean("Optional. When true, tickets planned after the plan was last approved can't be dispatched until " +
-				"a person approves the plan again (amp_approve_plan, or Approve plan in AMP)."),
+			"require_plan_approval": boolean("Optional. When true (the default), approval is per ticket: a ticket can't be dispatched until " +
+				"its owner (or a project lead on their behalf) approves it, as it is currently planned, in AMP's web UI. Creating a ticket, " +
+				"restoring it, or changing its name, description or acceptance criteria makes it wait for approval again. " +
+				"Agents can turn it on; only a person in the web UI can turn it off."),
 			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	mcp.AddTool(tool("amp_approve_plan",
-		"Record that the user approved the project's plan as it stands now, so its tickets may be dispatched. Call it when the "+
-			"user approves your plan in chat (\"approved\", \"go ahead\"), never on your own. People can also approve in AMP's "+
-			"Flight plan. amp_check_plan lists the open tickets planned since the last approval (awaiting_approval); projects with "+
-			"require_plan_approval refuse to dispatch those until the plan is approved.",
+		"Plan approval status. Agents can't approve a plan: a person approves it in AMP's web UI (Flight plan, Approve plan), "+
+			"never through MCP and never because of something said in chat. This tool never approves: it always fails, with "+
+			"approve_url (the page to send your person to), awaiting_approval and require_plan_approval. Approval is per ticket: "+
+			"each person approves their own tickets, and a project lead may approve someone else's on their behalf. Use "+
+			"amp_check_plan to see which tickets await approval (awaiting_yours are your person's own); dispatch refuses a ticket "+
+			"until its owner approves it as it is currently planned, and editing its scope or restoring it makes it wait again.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.approvePlan)))
@@ -445,7 +449,11 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Check a project's plan before dispatching: tickets connected to nothing, too many tickets that can start at once "+
 			"(a sign of missing dependencies), empty stories, and the longest dependency chain. Also repairs tickets stuck "+
 			"blocked on dependencies that are all done. Run it after planning and after changing the plan. "+
-			"awaiting_approval lists open tickets planned since the user last approved the plan (see amp_approve_plan).",
+			"Approval is per ticket: awaiting_approval lists every open ticket awaiting approval (anyone's: one that is new, restored, "+
+			"or whose scope changed since it was approved); awaiting_approval_tickets lists the same as {task_id, owner_user_id, yours}; "+
+			"awaiting_yours is your person's own. When awaiting_approval isn't empty, approve_url is the page in AMP's web UI where "+
+			"each owner approves their tickets (a project lead may approve on their behalf; agents can't). Tell your person how many "+
+			"of THEIR tickets await (awaiting_yours) with the link, and that others' tickets wait for their owners.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.checkPlan)))
@@ -481,7 +489,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_update_task",
 		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, metadata, or who does "+
-			"it (performer: hand it to a person, or a person's ticket to agents) — pass only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
+			"it (performer: hand it to a person; turning a person's ticket into agent work is done by a person in the AMP web UI, "+
+			"and is refused here with the ticket's link) — pass only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
 			"amp_move_task; to schedule it, amp_set_task_start_at. Its creator, its owner, and team leads can change it.",
 		props{
 			"task_id":             num("REQUIRED. Task ID."),
@@ -492,7 +501,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"assigned_to":         str("Who should work this ticket — can be corrected by the user before dispatch."),
 			"agent_id":            str("Agent identifier — set at dispatch time, not plan time."),
 			"metadata":            obj(patchMetadataDesc),
-			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress."),
+			"performer":           str("'agent' or 'human' (its owner does it in AMP). Not while it's in progress. 'human' -> 'agent' only in the AMP web UI."),
 			"human_reason":        str("Why a person does it. " + humanReasonList() + "."),
 			"clear":               strArr(clearDesc("description, acceptance_criteria, assigned_to, agent_id")),
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
@@ -521,7 +530,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it. "+
 		"Also record the run: the model you used, your token usage if your harness can tell you (opencode: amp_session_usage), "+
 		"and where the work is (branch, commit, PR, pushed). AMP reports token spend and traces code back to tickets from these. "+
-		"For your person's own human ticket, only when they tell you they've done it: pass note, pr_url and hours_worked if they say.",
+		"Only a ticket that was dispatched (in progress) can be completed by an agent. A person's own human ticket is marked done by "+
+		"that person in AMP's web UI, not through this tool.",
 		withRunProps(props{
 			"task_id":      num("REQUIRED. Task ID."),
 			"hours_worked": num("Human tickets: the hours the person says they spent on it."),
@@ -604,7 +614,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_answer_question",
 		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
 			"and the ticket goes back to ready (or to waiting, if it still depends on unfinished tickets), so the next dispatch picks it up "+
-			"with the answer in its comments. Use this when the user answers a worker's question in your chat; people can also answer in the AMP UI.",
+			"with the answer in its comments. Use this only to relay an answer your person gave you in chat: it is recorded as relayed by "+
+			"agent. People can also answer in the AMP UI.",
 		props{
 			"task_id": num("REQUIRED. Task ID of the ticket with the question."),
 			"answer":  str("REQUIRED. The answer, as the person gave it, with any detail the next worker needs."),
@@ -617,7 +628,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"body":    str("REQUIRED. Comment text."),
-			"author":  str("Optional. Who is posting (defaults to 'agent')."),
+			"author":  str("Optional. Who is posting (defaults to 'agent'): your agent name. A person's email is recorded as '<email> (relayed by agent)'; to pass on a person's answer to a question, use amp_answer_question."),
 		}), wrap(ctx, s.guard(authz.Member, s.addComment)))
 
 	mcp.AddTool(tool("amp_get_task_comments", "Get all comments for a task.",
@@ -652,7 +663,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_set_task_state",
 		"Override a task's state directly. Use as a manager escape hatch — e.g. re-open a "+
 			"completed task, reset an in_progress task back to backlog if its agent crashed. "+
-			"Valid states: backlog, in_progress, completed, blocked.",
+			"Valid states: backlog, in_progress, completed, blocked. Agents can move work back (to backlog or blocked) "+
+			"but not forward: in_progress needs amp_dispatch_task, completed needs a dispatched ticket, and a question is "+
+			"answered (amp_answer_question), not cleared.",
 		props{
 			"task_id": num("REQUIRED. Task ID."),
 			"state":   str("REQUIRED. New state: backlog, in_progress, completed, or blocked."),
@@ -996,12 +1009,26 @@ func (s *Server) approvePlan(rctx context.Context, args map[string]interface{}) 
 	if err != nil {
 		return nil, err
 	}
-	proj, err := s.svc.ApprovePlan(rctx, caller(rctx).p, id)
-	if err != nil {
-		return nil, err
+	// Never approves: a person approves in the web UI, and MCP is never the
+	// web UI. Kept in the catalog (with the same input) so an old manager
+	// prompt that calls it gets the link to send its person to, and stops.
+	p := caller(rctx).p
+	if p.InUI() {
+		// Unreachable over the MCP listener; kept so the rule lives in one place.
+		proj, err := s.svc.ApprovePlan(rctx, p, id)
+		if err != nil {
+			return nil, err
+		}
+		return jsonResult(map[string]interface{}{"project_id": id, "plan_approved_at": proj.PlanApprovedAt})
 	}
-	return jsonResult(map[string]interface{}{"project_id": id, "plan_approved_at": proj.PlanApprovedAt,
-		"next": "Approved: dispatch everything in ready_to_dispatch."})
+	status := map[string]interface{}{"approve_url": s.svc.PlanURL(id)}
+	if r, err := s.svc.CheckPlan(rctx, p, id); err == nil {
+		status["awaiting_approval"] = r.AwaitingApproval
+		status["require_plan_approval"] = r.RequirePlanApproval
+		status["plan_approved_at"] = r.ApprovedAt
+	}
+	detail, _ := json.Marshal(status)
+	return nil, fmt.Errorf("%w %s", authz.UIOnly("Plan approval", s.svc.PlanURL(id)), detail)
 }
 
 func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1606,11 +1633,8 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 		return nil, err
 	}
 	// Changing a ticket's text is planning: its creator, owner, and leads may.
-	if _, _, err := s.svc.LoadTask(rctx, caller(rctx).p, taskID, authz.TaskPlan); err != nil {
-		return nil, err
-	}
-	// Route via repo lookup then actor.
-	task, err := s.repo.GetTask(context.Background(), taskID)
+	p := caller(rctx).p
+	task, _, err := s.svc.LoadTask(rctx, p, taskID, authz.TaskPlan)
 	if err != nil {
 		return nil, err
 	}
@@ -1633,15 +1657,9 @@ func (s *Server) updateTask(rctx context.Context, args map[string]interface{}) (
 	if req.Metadata, err = optMetadataPatch(args); err != nil {
 		return nil, err
 	}
-	replyCh := make(chan ReplySimple, 1)
-	pid, err := s.registry.Get(task.ProjectID)
-	if err != nil {
+	// A person's ticket isn't switched to agent work off the web UI.
+	if err := s.svc.UpdateTask(rctx, p, task, req); err != nil {
 		return nil, err
-	}
-	s.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-	reply := actor.Await(rctx, replyCh)
-	if reply.Err != nil {
-		return nil, reply.Err
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "updated": true})
 }
@@ -1775,6 +1793,8 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		return nil, err
 	}
 	if task.IsHuman() {
+		// Refused unless the caller is the person in the web UI (never, over
+		// MCP): the person marks their own ticket done there.
 		done := service.HumanDone{Note: optStr(args, "note", ""), PRURL: optStr(args, "pr_url", "")}
 		if h, ok := args["hours_worked"].(float64); ok {
 			done.HoursWorked = &h
@@ -1785,15 +1805,9 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		}
 		return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed", "human_work": true, "run": run})
 	}
-	replyCh := make(chan ReplySimple, 1)
-	pid, err := s.registry.Get(task.ProjectID)
-	if err != nil {
+	// Only dispatched (in-progress), approved work: see Service.CompleteTask.
+	if _, err := s.svc.CompleteTask(rctx, caller(rctx).p, taskID); err != nil {
 		return nil, err
-	}
-	s.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: caller(rctx).p.UserRef(), ReplyCh: replyCh})
-	reply := actor.Await(rctx, replyCh)
-	if reply.Err != nil {
-		return nil, reply.Err
 	}
 	out := map[string]interface{}{"task_id": taskID, "state": "completed"}
 	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
@@ -1891,7 +1905,7 @@ func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (
 	req := domain.AddCommentRequest{
 		TaskID:       taskID,
 		Body:         body,
-		Author:       optStr(args, "author", "agent"),
+		Author:       s.svc.CommentAuthor(rctx, caller(rctx).p, optStr(args, "author", "agent")),
 		AuthorUserID: caller(rctx).p.UserRef(),
 	}
 	replyCh := make(chan ReplyAddComment, 1)
@@ -2064,30 +2078,24 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 	}
 	fromState := string(task.State)
 
-	// Route through actor hierarchy so the TaskActor's in-memory state is updated.
-	pid, err := s.registry.Get(task.ProjectID)
+	// Through the service, which keeps agents from moving work forward by
+	// hand (see Service.SetTaskState), then the actor hierarchy.
+	updated, err := s.svc.SetTaskState(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason)
 	if err != nil {
 		return nil, err
 	}
-	replyCh := make(chan actor.ReplySimple, 1)
-	s.registry.System().Root.Send(pid, &actor.MsgSetTaskState{
-		TaskID:  taskID,
-		State:   domain.TaskState(stateStr),
-		Reason:  reason,
-		By:      caller(rctx).p.UserRef(),
-		ReplyCh: replyCh,
-	})
-	reply := actor.Await(rctx, replyCh)
-	if reply.Err != nil {
-		return nil, reply.Err
-	}
-
-	return jsonResult(map[string]interface{}{
+	out := map[string]interface{}{
 		"task_id":    taskID,
 		"from_state": fromState,
-		"to_state":   stateStr,
+		"to_state":   string(updated.State),
 		"reason":     reason,
-	})
+	}
+	if string(updated.State) != stateStr {
+		// Moved back while a dependency is open: it waits on it.
+		out["note"] = fmt.Sprintf("ticket %d waits on incomplete dependencies (of %v), so it's %s rather than %s; it becomes ready when they complete",
+			taskID, updated.DependencyIDs, updated.State, stateStr)
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) setTaskStartAt(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
