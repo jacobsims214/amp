@@ -21,6 +21,8 @@
 //!   `config check` (every layer's problems, naming file and key).
 //! - #2275: `setup` (= `init`) with `--preset FILE|URL` (an org preset), the first run's "your own
 //!   OpenAI-compatible endpoint" with models mapped per role, and `connect --role ROLE=MODEL`.
+//! - #2243: `mcp list|get|add|add-json|edit|remove|enable|disable|test|login|logout|secret` for any
+//!   MCP server, user or repo scope; the `mcp` group is no longer hidden.
 
 mod agents_cmd;
 mod chat;
@@ -30,6 +32,7 @@ mod connect;
 mod debug;
 mod doctor;
 mod mcp_cmd;
+mod mcp_crud;
 mod mcp_trust_cmd;
 mod models_cmd;
 mod reload;
@@ -146,8 +149,9 @@ enum Command {
     /// when run in a terminal; `--yes` never asks. Also `amp-harness setup`.
     #[command(visible_alias = "setup")]
     Init(setup::InitArgs),
-    /// Debug: call AMP tools directly.
-    #[command(subcommand, hide = true)]
+    /// MCP servers (stdio, http, sse): list, get, add, edit, remove, enable, disable, test,
+    /// login, logout, secret, trust; `mcp call`/`mcp tools` call tools (AMP's, or --server NAME).
+    #[command(subcommand)]
     Mcp(mcp_cmd::McpCommand),
     /// Debug: render checks (`render-chrome`).
     #[command(subcommand, hide = true)]

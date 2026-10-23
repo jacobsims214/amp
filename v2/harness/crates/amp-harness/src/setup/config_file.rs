@@ -64,7 +64,12 @@ fn is_key_line(line: &str, key: &str) -> bool {
 /// `text` with `[section] key = "value"` set: an existing key line is replaced, otherwise the key
 /// is added at the end of the section, which is appended when missing.
 pub fn set_string(text: &str, section: &str, key: &str, value: &str) -> String {
-    let new_line = format!("{key} = {}", toml_string(value));
+    set_raw(text, section, key, &toml_string(value))
+}
+
+/// [`set_string`] for any value already written as TOML (`false`, `["a", "b"]`, `30`).
+pub fn set_raw(text: &str, section: &str, key: &str, raw: &str) -> String {
+    let new_line = format!("{key} = {raw}");
     let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
     let start = lines.iter().position(|l| header_name(l) == Some(section));
     let Some(start) = start else {
@@ -161,6 +166,44 @@ pub fn remove_tables(text: &str, prefix: &str) -> (String, bool) {
     (text, cut)
 }
 
+/// The text of the table `prefix` and its sub-tables (`[prefix]`, `[prefix.*]`), as written
+/// (comments inside it included), when it is written with its own headers; `None` when there is
+/// no such header (absent, or only defined inline under a parent table).
+pub fn table_text(text: &str, prefix: &str) -> Option<String> {
+    // The same lines `remove_tables` cuts, comments and blank lines inside the table included.
+    let lines: Vec<&str> = text.lines().collect();
+    let inside = |line: &str| {
+        table_name(line).is_some_and(|n| n == prefix || n.starts_with(&format!("{prefix}.")))
+    };
+    let mut out: Vec<&str> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if !inside(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let mut end = i + 1;
+        while end < lines.len() && !is_header(lines[end]) {
+            end += 1;
+        }
+        // Comments right above the next table belong to it.
+        let mut stop = end;
+        if end < lines.len() && !inside(lines[end]) {
+            while stop > i + 1 && lines[stop - 1].trim().starts_with('#') {
+                stop -= 1;
+            }
+        }
+        out.extend_from_slice(&lines[i..stop]);
+        i = end;
+    }
+    if out.is_empty() {
+        return None;
+    }
+    let mut block = out.join("\n").trim_end().to_owned();
+    block.push('\n');
+    Some(block)
+}
+
 /// Reads `[section] key` as a string, if the text parses and has it. A dotted section
 /// (`servers.local`) is a nested table.
 pub fn get_string(text: &str, section: &str, key: &str) -> Option<String> {
@@ -235,6 +278,13 @@ pub enum Change {
         section: String,
         key: String,
     },
+    /// `[section] key = <raw>`, where `raw` is a TOML value as written (`false`, `["a"]`), made
+    /// by [`Change::set_value`].
+    SetRaw {
+        section: String,
+        key: String,
+        raw: String,
+    },
     DropSection(String),
     /// Drops the table `prefix` and all its sub-tables (`[prefix]`, `[prefix.*]`, quoted or not).
     DropTables(String),
@@ -252,6 +302,15 @@ impl Change {
         }
     }
 
+    /// Sets a non-string value (a bool, a number, an array).
+    pub fn set_value(section: &str, key: &str, value: &toml::Value) -> Self {
+        Self::SetRaw {
+            section: section.to_owned(),
+            key: key.to_owned(),
+            raw: value.to_string(),
+        }
+    }
+
     pub fn remove(section: &str, key: &str) -> Self {
         Self::Remove {
             section: section.to_owned(),
@@ -266,6 +325,7 @@ impl Change {
                 key,
                 value,
             } => set_string(text, section, key, value),
+            Self::SetRaw { section, key, raw } => set_raw(text, section, key, raw),
             Self::Remove { section, key } => remove_key(text, section, key),
             Self::DropSection(section) => remove_section(text, section),
             Self::DropTables(prefix) => remove_tables(text, prefix).0,
@@ -308,6 +368,14 @@ impl Change {
                 value,
             } => {
                 table_mut(doc, section).insert(key.clone(), toml::Value::String(value.clone()));
+            }
+            Self::SetRaw { section, key, raw } => {
+                // Made from a Value by `set_value`, so it parses back.
+                if let Ok(mut t) = toml::from_str::<toml::Table>(&format!("v = {raw}"))
+                    && let Some(v) = t.remove("v")
+                {
+                    table_mut(doc, section).insert(key.clone(), v);
+                }
             }
             Self::Remove { section, key } => {
                 if table_at(doc, section).is_some() {
@@ -487,7 +555,9 @@ impl ConfigFile {
         })?;
         let mut text = before.clone();
         for change in changes {
-            if let Change::Set { section, .. } | Change::Remove { section, .. } = change
+            if let Change::Set { section, .. }
+            | Change::SetRaw { section, .. }
+            | Change::Remove { section, .. } = change
                 && let Some(path) = non_table_on(&expected, section)
             {
                 return Err(format!(

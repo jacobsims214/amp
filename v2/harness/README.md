@@ -7,8 +7,8 @@ Status: **M2.** `amp-mcp` connects to AMP (both MCP protocol eras, static token 
 `amp-harness` with no subcommand is a chat with the manager, which plans on the board and dispatches
 specialist workers itself (`amp_run_ticket`); every worker's run, tokens and commit are reported to
 its ticket automatically. The CLI also has `login`, `logout`, `doctor`, `whoami`, `tickets list|get`,
-`config show`, `connect`/`disconnect` (model provider keys), `run -p` (a headless agent run) and the
-hidden `mcp call`. `make smoke` runs them against a real local AMP.
+`config show`, `connect`/`disconnect` (model provider keys), `run -p` (a headless agent run) and
+`mcp …` (MCP servers, plus `mcp call` for AMP's tools). `make smoke` runs them against a real local AMP.
 
 ## Install
 
@@ -335,6 +335,52 @@ again. Headless runs (`run -p` and every worker) never ask: they skip untrusted 
 warning. `--trust-repo-mcp` or `AMP_HARNESS_TRUST_REPO_MCP=1` lets them all start for that process
 (CI), and that is never recorded. Servers in your own config.toml are always trusted.
 
+### MCP servers: `amp-harness mcp` (#2243)
+
+Any MCP server, stdio, Streamable HTTP or legacy HTTP+SSE, is added, changed and removed without
+editing a file. The commands take the shapes Claude Code users know:
+
+```sh
+amp-harness mcp add fs -- npx -y @modelcontextprotocol/server-filesystem '${repo}'   # stdio
+amp-harness mcp add github https://api.githubcopilot.com/mcp/ --bearer-env GITHUB_TOKEN
+amp-harness mcp add docs --url https://docs.example.com/sse --transport sse -H 'X-Org: acme'
+amp-harness mcp add search --secret-env BRAVE_API_KEY -- npx -y brave-search-mcp     # asked hidden
+amp-harness mcp add db --scope repo -- ./tools/db-mcp          # repo file; trusted for you
+amp-harness mcp add-json linear '{"type":"http","url":"https://mcp.linear.app/mcp"}'  # or - (stdin)
+amp-harness mcp list [--no-health] [--json]     # every server with its health (connects to each)
+amp-harness mcp get NAME [--scope user|repo] [--no-health] [--json]
+amp-harness mcp edit NAME [--roles 'worker-*,reviewer']   # $EDITOR, checked, reopened on an error
+amp-harness mcp remove NAME [--scope user|repo] [--keep-secrets] [--keep-login]
+amp-harness mcp enable|disable NAME             # in your config.toml, also for a repo server
+amp-harness mcp test NAME [--json]              # status, timing, tools; stderr tail when it fails
+amp-harness mcp login|logout NAME               # OAuth for http/sse servers, like the AMP login
+amp-harness mcp secret NAME [WHICH…] [--missing] [--secret-stdin]   # store or rotate secrets
+```
+
+- Flags: `--scope user|repo` (also `--user` / `--repo`; `project` = repo; default user),
+  `--transport stdio|http|sse` (default: http for a URL, stdio for a command after `--`),
+  `--header "Name: value"`, `--env KEY=VALUE`, `--secret-header NAME`, `--secret-env KEY`,
+  `--bearer-env VAR`, `--auth auto|oauth|none`, `--client-id`, `--client-secret`,
+  `--oauth-scope`, `--callback-port`, `--no-sse-fallback`, `--workdir`, `--env-file`,
+  `--per-worktree`, `--roles`, `--startup`, `--startup-timeout`, `--timeout`, `--disabled`,
+  `--force` (replace), `--no-test`, `--json`.
+- Secrets never go in a file or on the command line. `--secret-header`/`--secret-env`/
+  `--client-secret` are asked hidden (or read one per line with `--secret-stdin`) and kept in the
+  OS keychain (`mcp:<name>:header:<name>`, `mcp:<name>:env:<VAR>`). A `--header`/`--env`/argument
+  value that looks secret is refused with these alternatives, and the value is never echoed.
+  `${VAR}` (Claude Code's spelling) is stored as `${env:VAR}`, read when the server starts.
+  `add-json` moves secret-looking literal values to the keychain. Without a keychain
+  (`AMP_CREDENTIAL_STORE=file`), use `${env:VAR}` references or `--bearer-env`.
+- Every write replaces only that server's table, keeps the rest of the file (comments included),
+  writes `config.toml.bak` first, and must load before it is saved. `add` connects once afterwards
+  (`--no-test` skips it); an OAuth server then says to run `mcp login NAME`.
+- `--scope repo` writes `<repo>/.amp/harness/config.toml` and trusts the server for you as written,
+  since you wrote it; others who clone the repo are still asked. `edit` re-trusts your new version
+  and `remove` forgets the trust. `remove` also deletes the server's keychain items and its stored
+  OAuth login when nothing else uses them.
+- `setup --preset` asks (hidden) for the secrets the preset's MCP servers declare. Without a
+  terminal or a keychain, the summary says to run `amp-harness mcp secret NAME`.
+
 ```toml
 # <repo>/.amp/harness/config.toml
 [models]
@@ -356,8 +402,8 @@ amp-harness doctor [--json]          # config, credentials, connect, tools, cont
 amp-harness whoami [--json]
 amp-harness tickets list [--project N] [--owner mine|unassigned|any|EMAIL] [--state S[,S]] [--json]
 amp-harness tickets get ID [--comments] [--json]
-amp-harness mcp call TOOL ['{"json": "args"}' | -] [--raw] [--timeout SECS]   # hidden debug command
-amp-harness mcp tools [--json]                                                # hidden
+amp-harness mcp call TOOL ['{"json": "args"}' | -] [--raw] [--timeout SECS] [--server NAME]
+amp-harness mcp tools [--json] [--server NAME]     # AMP's tools, or a configured MCP server's
 ```
 
 - `.amp.json` (nearest one upwards from the working directory) only supplies the default

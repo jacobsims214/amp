@@ -81,7 +81,7 @@ pub fn http_options(
             return Err(match &secret.source {
                 SecretSource::Keychain { account } => format!(
                     "MCP server `{name}`: keychain {account} is missing; store it with \
-                     `amp-harness mcp add` (or remove it from the config)"
+                     `amp-harness mcp secret {name}` (or remove it from the config)"
                 ),
                 SecretSource::Env { var } => {
                     format!("MCP server `{name}`: environment variable {var} is not set")

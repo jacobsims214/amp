@@ -157,6 +157,10 @@ pub struct Applied {
     pub roles: BTreeMap<String, String>,
     pub mcp: Vec<String>,
     pub server: Option<String>,
+    /// MCP secrets still to store (no person or no keychain to ask, #2243), each with the
+    /// command that stores it. Never a value.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp_secrets_needed: Vec<String>,
 }
 
 fn bad(source: &str, message: impl std::fmt::Display) -> CliError {

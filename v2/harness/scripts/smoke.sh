@@ -12,7 +12,7 @@
 #            Otherwise it is reported as skipped. The token is only ever sent to the cluster leg.
 #
 # Each leg: doctor --json, whoami --json, then a throwaway project (epic, story, two tickets, a
-# comment) created with the hidden `mcp call`, read back with `tickets list|get` and with `run -p` (the
+# comment) created with `mcp call`, read back with `tickets list|get` and with `run -p` (the
 # manager on a scripted faux model calling amp_get_task), and deleted again.
 # M2-8 (#2099) adds, per leg: the manager dispatches worker-backend with amp_run_ticket (worker on its
 # own faux model, in a worktree of a throwaway git repo under target/); the worker comments and
