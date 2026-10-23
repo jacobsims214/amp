@@ -769,11 +769,21 @@ impl AmpMeta {
         self.project.get().is_some_and(|p| p.require_plan_approval)
     }
 
-    /// Whether tickets wait for this person's approval (the status line's chip is up). Since
-    /// per-ticket approval (#2198) only their own count: others' tickets wait for their owners,
-    /// who may not approve soon, so they don't keep the plan on the fast poll (#2209).
+    /// Whether tickets wait for this person's approval (the status line's "waiting for your
+    /// approval" chip is up). Since per-ticket approval (#2198) only their own count.
     pub fn plan_pending(&self) -> bool {
         self.plan_required() && self.plan.get().is_some_and(|p| !p.yours().is_empty())
+    }
+
+    /// Whether any ticket waits for approval, the person's own or others' (either plan chip is
+    /// up). The plan is polled fast while this holds (#2209, #2230): a lead may approve others'
+    /// tickets on their behalf, and the others' chip must clear as soon as the person's own.
+    pub fn plan_awaiting(&self) -> bool {
+        self.plan_required()
+            && self
+                .plan
+                .get()
+                .is_some_and(|p| !p.awaiting_approval.is_empty())
     }
 
     fn ticket_open(&self) -> bool {
@@ -794,8 +804,9 @@ pub struct Intervals {
     pub ticket: Duration,
     /// Plan approval, when the project requires it (60 s).
     pub plan: Duration,
-    /// Plan approval while tickets wait for a person's approval (5 s, #2209): the person approves
-    /// in the web UI, and the status line's "waiting for your approval" chip must clear soon after.
+    /// Plan approval while any ticket waits for approval (5 s, #2209, #2230): the person (or a lead
+    /// on an owner's behalf) approves in the web UI, and the status line's plan chips must clear
+    /// soon after.
     pub plan_pending: Duration,
     /// The ticket's artifacts while one is in review (60 s).
     pub artifacts: Duration,
@@ -831,7 +842,7 @@ pub struct Conditions {
     pub project: bool,
     pub ticket_open: bool,
     pub plan_required: bool,
-    /// Tickets wait for a person's approval (polled every `plan_pending`).
+    /// Tickets wait for approval, anyone's (polled every `plan_pending`; `AmpMeta::plan_awaiting`).
     pub plan_pending: bool,
     pub artifacts_in_review: bool,
 }
@@ -842,7 +853,7 @@ impl Conditions {
             project: meta.project_id.is_some(),
             ticket_open: meta.ticket_open(),
             plan_required: meta.plan_required(),
-            plan_pending: meta.plan_pending(),
+            plan_pending: meta.plan_awaiting(),
             artifacts_in_review: !meta.artifacts_in_review().is_empty(),
         }
     }
@@ -1894,6 +1905,56 @@ mod tests {
         };
         assert!(
             !s.due(&iv, off, t0 + Duration::from_secs(600))
+                .contains(Topics::PLAN)
+        );
+    }
+
+    /// #2230: only others' tickets wait (a lead then approves them on their owners' behalf).
+    /// They keep the plan on the fast poll too, so the others' chip clears within the fast-poll
+    /// interval rather than after the 60 s plan poll.
+    #[test]
+    fn others_waiting_keep_the_plan_on_the_fast_poll() {
+        let iv = iv();
+        let mut meta = AmpMeta {
+            project_id: Some(2),
+            ..AmpMeta::default()
+        };
+        meta.project.set(Ok(Project {
+            id: 2,
+            name: "AMP".into(),
+            code: "amp".into(),
+            state: "active".into(),
+            org_id: None,
+            require_plan_approval: true,
+        }));
+        let others = |ids: Vec<i64>| PlanApproval {
+            require_plan_approval: true,
+            awaiting_approval: ids.clone(),
+            tickets: Some(
+                ids.iter()
+                    .map(|&task_id| AwaitingTicket {
+                        task_id,
+                        owner_user_id: Some(9),
+                        yours: false,
+                    })
+                    .collect(),
+            ),
+            ..PlanApproval::default()
+        };
+        meta.plan.set(Ok(others(vec![196])));
+        assert!(!meta.plan_pending(), "none of yours wait");
+        assert!(meta.plan_awaiting(), "others' wait");
+        let c = Conditions::of(&meta);
+        assert!(c.plan_pending);
+        let t0 = Instant::now();
+        let mut s = Schedule::default();
+        s.ran(Topics::ALL, t0);
+        assert!(s.due(&iv, c, t0 + iv.plan_pending).contains(Topics::PLAN));
+        // Approved on behalf: nothing waits, back to the 60 s poll.
+        meta.plan.set(Ok(others(vec![])));
+        assert!(!meta.plan_awaiting());
+        assert!(
+            !s.due(&iv, Conditions::of(&meta), t0 + Duration::from_secs(59))
                 .contains(Topics::PLAN)
         );
     }
