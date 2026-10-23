@@ -1,0 +1,46 @@
+name: Harness
+
+# fmt + clippy (-D warnings) + tests for the Rust harness in v2/harness (AMP KB
+# decisions/amp-harness-architecture.md, D1/D13). Runs on milestone branches (harness-m*) as well as
+# PRs and main, so each milestone is checked before its PR opens.
+
+on:
+  pull_request:
+    paths:
+      - "v2/harness/**"
+      - ".github/workflows/harness.yml"
+  push:
+    branches: [main, "harness-m*"]
+    paths:
+      - "v2/harness/**"
+      - ".github/workflows/harness.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2/harness
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: v2/harness
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --workspace --locked
+      # No smoke step: scripts/smoke.sh needs a live AMP. It joins CI in M5-2 (compose stack in the job, three protocol modes).

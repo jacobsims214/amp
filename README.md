@@ -177,7 +177,8 @@ make up          # postgres, typesense, ollama, amp-api, ui
 make kb-setup    # pull nomic-embed-text into Ollama (once)
 ```
 
-The UI is at `http://localhost:5173`. MCP is at `http://localhost:8000/mcp` and REST at `:3001`.
+The UI is at `http://localhost:5173` (compose publishes it from the UI container's nginx, which
+listens on 8080). MCP is at `http://localhost:8000/mcp` and REST at `:3001`.
 amp-api's `APP_PUBLIC_URL` (set in `docker-compose.yml`) must match the UI's address: approval
 links and artifact URLs are built from it.
 

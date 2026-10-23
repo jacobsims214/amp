@@ -1,0 +1,81 @@
+# AMP harness workspace. Architecture: project 2 KB decisions/amp-harness-architecture.md (D1).
+#
+# Dependency order is one-way (D1):
+#   amp-mcp      (rmcp only, no rpi)  <-  amp-core (rpi glue)  <-  amp-tui  <-  amp-harness (binary)
+# so the MCP/OAuth code builds and tests without rpi.
+#
+# Upstream pins are EXACT (D11). Bumping rpi-* or rmcp is its own ticket, gated on the smoke test.
+[workspace]
+resolver = "3"
+members = [
+    "crates/amp-mcp",
+    "crates/amp-core",
+    "crates/amp-tui",
+    "crates/amp-harness",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98.1"
+license = "Apache-2.0"
+repository = "https://github.com/jacobsims214/amp"
+publish = false
+
+[workspace.dependencies]
+# Internal crates.
+amp-mcp = { path = "crates/amp-mcp" }
+amp-core = { path = "crates/amp-core" }
+amp-tui = { path = "crates/amp-tui" }
+
+# pi-rust core crates: exact pins (D1, D11).
+rpi-ai = "=0.8.0"
+rpi-agent = "=0.8.0"
+rpi-tools = "=0.8.0"
+rpi-harness = "=0.8.0"
+rpi-tui = "=0.8.0"
+
+# MCP client: exact pin (D2, D3). Streamable HTTP over reqwest with rustls, OAuth (`auth`).
+# Default features (server, macros) are off; tests that need an in-process server add them as dev-deps.
+rmcp = { version = "=3.6.0", default-features = false, features = [
+    "client",
+    "transport-streamable-http-client-reqwest",
+    "auth",
+    "reqwest",
+] }
+
+clap = { version = "4.6", features = ["derive"] }
+
+# OAuth credential store (D3): OS keychain via keyring 4.x (macOS Keychain, Windows Credential Manager,
+# Secret Service on Linux), with a 0600 file fallback. rmcp's CredentialStore trait is #[async_trait].
+keyring = "4.2"
+async-trait = "0.1"
+# For the TokenResponse trait on rmcp's token type (rmcp does not re-export oauth2). Same version rmcp uses.
+oauth2 = { version = "5.0", default-features = false }
+
+# Shared runtime/util crates (amp-mcp and up).
+# reqwest must stay on rmcp's major (0.13) so our reqwest::Client is the type rmcp's transport takes.
+# rmcp's `reqwest` feature already turns on reqwest's rustls backend; features unify.
+reqwest = { version = "0.13", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+toml = "1"
+tracing = "0.1"
+
+# Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
+axum = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+rcgen = "0.14"
+time = "0.3"
+tokio-rustls = "0.26"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
