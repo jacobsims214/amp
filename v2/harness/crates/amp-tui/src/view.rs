@@ -16,6 +16,9 @@
 //! 8. the **footer** ([`crate::footer`], #2186): cwd (branch) • session, `$0.004 · ctx 4%` and
 //!    model • thinking; one row below [`crate::footer::FOLD_BELOW`] columns, two above.
 //!
+//! Every area sits [`crate::inset::Padding`] columns in from the left and right edges
+//! (`[tui] padding`, #2251); the transcript's inset is inside its scroll view.
+//!
 //! Nothing here touches a terminal: [`ChatView::render_frame`] lays the screen out at any size,
 //! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
 //! render nothing until [`ChatView::chrome`] has a metadata source.
@@ -39,6 +42,7 @@ use amp_core::provider_error;
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::footer::Footer;
+use crate::inset::{Inset, Padding};
 use crate::overlay::Panel;
 use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
@@ -113,6 +117,8 @@ pub struct ChatView {
     /// What the empty editor says instead of [`PLACEHOLDER`] for a moment ("Press Ctrl+C again
     /// to quit", #2184).
     hint: Arc<Mutex<Option<String>>>,
+    /// The left and right padding every area shares (#2251).
+    padding: Padding,
 }
 
 impl Default for ChatView {
@@ -123,11 +129,16 @@ impl Default for ChatView {
 
 impl ChatView {
     pub fn new() -> Self {
+        let padding = Padding::default();
+        let inset = |c: Arc<dyn Component>| -> Arc<dyn Component> {
+            Arc::new(Inset::new(c, padding.clone()))
+        };
         let chrome = Chrome::new();
         let header = Arc::new(Container::new());
         header.add_child(chrome.header());
         let transcript = Arc::new(Container::new());
-        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(transcript.clone())));
+        let scroll =
+            TranscriptScroll::new(Arc::new(ScrollView::primary(inset(transcript.clone()))));
         let status = Arc::new(Container::new());
         let panel = Panel::new(chrome.clone());
         let panel_slot = Arc::new(Container::new());
@@ -152,7 +163,7 @@ impl ChatView {
         let footer = Arc::new(Footer::new());
 
         let root = VStack::from_children(vec![
-            StackChild::Entry(StackEntry::new(header.clone()).shrink(0)),
+            StackChild::Entry(StackEntry::new(inset(header.clone())).shrink(0)),
             StackChild::Entry(
                 StackEntry::new(scroll.view().clone())
                     .basis(0)
@@ -160,12 +171,12 @@ impl ChatView {
                     .shrink(1)
                     .min_size(1),
             ),
-            StackChild::Entry(StackEntry::new(status.clone())),
-            StackChild::Entry(StackEntry::new(panel_slot).shrink(1)),
-            StackChild::Entry(StackEntry::new(menu_slot).shrink(1)),
-            StackChild::Entry(StackEntry::new(editor_slot).shrink(0).min_size(3)),
-            StackChild::Entry(StackEntry::new(amp_status.clone()).shrink(0)),
-            StackChild::Entry(StackEntry::new(footer.clone())),
+            StackChild::Entry(StackEntry::new(inset(status.clone()))),
+            StackChild::Entry(StackEntry::new(inset(panel_slot)).shrink(1)),
+            StackChild::Entry(StackEntry::new(inset(menu_slot)).shrink(1)),
+            StackChild::Entry(StackEntry::new(inset(editor_slot)).shrink(0).min_size(3)),
+            StackChild::Entry(StackEntry::new(inset(amp_status.clone())).shrink(0)),
+            StackChild::Entry(StackEntry::new(inset(footer.clone()))),
         ]);
         Self {
             header,
@@ -189,7 +200,20 @@ impl ChatView {
             stopping: false,
             error_shown: false,
             hint,
+            padding,
         }
+    }
+
+    /// Columns of space left and right of every area (`[tui] padding`, #2251; at most
+    /// [`crate::MAX_PADDING`]). Narrow terminals get less ([`Padding::at`]).
+    pub fn set_padding(&self, columns: usize) {
+        self.padding.set(columns);
+        self.root.invalidate();
+    }
+
+    /// The configured left and right padding.
+    pub fn padding(&self) -> usize {
+        self.padding.columns()
     }
 
     /// How new assistant messages show their thinking (#2177).

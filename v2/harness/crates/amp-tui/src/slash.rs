@@ -113,7 +113,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Group::Amp,
         "ticket",
         "[id|none]",
-        "the current ticket; switch to another, or clear it",
+        "the current ticket; switch it, or clear it",
     ),
     CommandSpec::new(
         Group::Amp,
@@ -179,19 +179,13 @@ pub const KEYS: &[(&str, &str)] = &[
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
     ("Esc", "stop the reply, or close a panel or the menu"),
     ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
-    (
-        "Ctrl+D",
-        "quit (with an empty editor, at the latest output)",
-    ),
+    ("Ctrl+D", "quit (empty editor, at the latest output)"),
     ("Ctrl+T", "show or hide the last thinking"),
     ("Ctrl+O", "show or hide tool call details"),
     ("PgUp/PgDn", "scroll the transcript a page"),
     ("Ctrl+U/D", "scroll half a page (with an empty editor)"),
     ("End", "jump to the latest output (with an empty editor)"),
-    (
-        "Fn/⌥-drag",
-        "select text: Fn in Terminal.app, Option in iTerm2",
-    ),
+    ("Fn/⌥-drag", "select text (Fn in Terminal.app, ⌥ in iTerm2)"),
 ];
 
 /// The Keys row for selecting text with mouse capture off (`[tui] mouse = false`, #2185): plain
