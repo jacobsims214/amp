@@ -1,17 +1,24 @@
 //! The chat screen: pi's components laid out as D10 describes, updated from rpi agent events.
 //!
 //! Top to bottom:
-//! 1. **header slot** (empty until M3: brand bands, instance/user, org › project, MCP health,
-//!    current ticket);
+//! 1. **header slot**: the AMP header ([`crate::chrome`]: brand bands, instance/user,
+//!    org › project, MCP health; the current ticket);
 //! 2. the **transcript** in a primary scroll view (banner, user messages, assistant messages,
 //!    tool calls, notices), built from rpi-tui's own components so it reads like pi;
 //! 3. pi's **status slot** (the retry countdown);
-//! 4. the **editor** (pi's, with the working spinner in its top border while a run is going);
-//! 5. **AMP status line slot** (empty until M3: workers, questions, plan approval, board counts);
-//! 6. pi's two-line **footer**, unchanged (cwd/branch/session; usage and model • thinking).
+//! 4. the **AMP panel slot** ([`crate::overlay`]): what `/amp`, `/ticket`, `/workers`,
+//!    `/questions`, `/plan` and `/project` show, docked above the editor while open;
+//! 5. the **editor** (pi's, with the working spinner in its top border while a run is going);
+//! 6. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
+//!    approval, board counts, artifacts in review, run reported);
+//! 7. pi's two-line **footer**, unchanged (cwd/branch/session; usage and model • thinking).
 //!
 //! Nothing here touches a terminal: [`ChatView::render_frame`] lays the screen out at any size,
-//! which is what the render tests (and `amp-harness --snapshot`) use.
+//! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
+//! render nothing until [`ChatView::chrome`] has a metadata source.
+//!
+//! `amp_*` tool calls are titled `AMP · complete_task #2078` with a compact result
+//! ([`crate::amp_render`]); other tools keep pi's own rendering.
 
 use std::{
     collections::HashMap,
@@ -20,6 +27,10 @@ use std::{
 };
 
 use amp_core::events::{stop_reason_str, tool_result_text};
+
+use crate::amp_render;
+use crate::chrome::Chrome;
+use crate::overlay::Panel;
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
 use rpi_tui::{
@@ -54,6 +65,10 @@ pub struct ChatView {
     editor: Arc<Editor>,
     amp_status: Arc<Container>,
     footer: Arc<FooterComponent>,
+    /// The AMP header and status line's inputs (M3-3).
+    chrome: Chrome,
+    /// The AMP command panel (M3-4), above the editor while open.
+    panel: Panel,
     root: Arc<dyn Component>,
     /// The assistant message being streamed, if any.
     assistant: Option<Arc<AssistantMessageComponent>>,
@@ -71,10 +86,15 @@ impl Default for ChatView {
 
 impl ChatView {
     pub fn new() -> Self {
+        let chrome = Chrome::new();
         let header = Arc::new(Container::new());
+        header.add_child(chrome.header());
         let transcript = Arc::new(Container::new());
         let scroll = Arc::new(ScrollView::primary(transcript.clone()));
         let status = Arc::new(Container::new());
+        let panel = Panel::new(chrome.clone());
+        let panel_slot = Arc::new(Container::new());
+        panel_slot.add_child(panel.component());
         let editor = Arc::new(Editor::new(
             EditorOptions::default(),
             EditorStyle::default(),
@@ -84,6 +104,7 @@ impl ChatView {
         let editor_slot = Arc::new(Container::new());
         editor_slot.add_child(editor.clone());
         let amp_status = Arc::new(Container::new());
+        amp_status.add_child(chrome.status_line());
         let footer = Arc::new(FooterComponent::new());
         footer.set_hints("Enter send · Shift+Enter new line · Esc abort · Ctrl+C quit · /help");
 
@@ -97,6 +118,7 @@ impl ChatView {
                     .min_size(1),
             ),
             StackChild::Entry(StackEntry::new(status.clone())),
+            StackChild::Entry(StackEntry::new(panel_slot).shrink(1)),
             StackChild::Entry(StackEntry::new(editor_slot).shrink(0).min_size(3)),
             StackChild::Entry(StackEntry::new(amp_status.clone()).shrink(0)),
             StackChild::Entry(StackEntry::new(footer.clone())),
@@ -108,6 +130,8 @@ impl ChatView {
             editor,
             amp_status,
             footer,
+            chrome,
+            panel,
             root: Arc::new(root),
             assistant: None,
             tools: HashMap::new(),
@@ -128,12 +152,27 @@ impl ChatView {
         &self.footer
     }
 
-    /// M3 slot: the AMP header (2 lines) goes in here. Empty containers render no lines.
+    /// The AMP header and status line's inputs: give it a metadata source to show them.
+    pub fn chrome(&self) -> &Chrome {
+        &self.chrome
+    }
+
+    /// The AMP command panel (`/questions`, `/workers`, ...): open, close, read its selection.
+    pub fn panel(&self) -> &Panel {
+        &self.panel
+    }
+
+    /// Adds a component to the transcript (the ticket marker).
+    pub fn add_to_transcript(&self, component: Arc<dyn Component>) {
+        self.transcript.add_child(component);
+    }
+
+    /// The header slot: the AMP header (2 lines, the second only while a ticket is current).
     pub fn header_slot(&self) -> &Arc<Container> {
         &self.header
     }
 
-    /// M3 slot: the one-line AMP status line, between the editor and pi's footer.
+    /// The one-line AMP status line slot, between the editor and pi's footer.
     pub fn amp_status_slot(&self) -> &Arc<Container> {
         &self.amp_status
     }
@@ -213,6 +252,7 @@ impl ChatView {
 
     /// Applies one rpi agent event to the transcript and footer.
     pub fn apply(&mut self, event: &AgentEvent) {
+        self.chrome.observe(event);
         match event {
             AgentEvent::MessageStart {
                 message: AgentMessage::Assistant(m),
@@ -246,7 +286,7 @@ impl ChatView {
                 tool_name,
                 args,
             } => {
-                let component = Arc::new(ToolExecutionComponent::new(tool_name, &args.to_string()));
+                let component = new_tool(tool_name, args);
                 component.set_running();
                 self.transcript.add_child(component.clone());
                 self.tools.insert(tool_call_id.clone(), component);
@@ -260,12 +300,17 @@ impl ChatView {
                 let component = match self.tools.remove(tool_call_id) {
                     Some(c) => c,
                     None => {
-                        let c = Arc::new(ToolExecutionComponent::new(tool_name, "{}"));
+                        let c = new_tool(tool_name, &serde_json::Value::Null);
                         self.transcript.add_child(c.clone());
                         c
                     }
                 };
-                component.set_result(&tool_result_text(result), *is_error);
+                let text = tool_result_text(result);
+                if amp_render::is_amp_tool(tool_name) {
+                    component.set_result(&amp_render::result_text(&text, *is_error), *is_error);
+                } else {
+                    component.set_result(&text, *is_error);
+                }
             }
             AgentEvent::RetryScheduled {
                 attempt,
@@ -343,6 +388,26 @@ impl ChatView {
             .iter()
             .map(|l| strip_ansi(l).trim_end().to_owned())
             .collect()
+    }
+}
+
+/// A tool block: pi's for most tools; `AMP · complete_task #2078` plus a short argument summary
+/// for `amp_*` tools.
+fn new_tool(name: &str, args: &serde_json::Value) -> Arc<ToolExecutionComponent> {
+    if amp_render::is_amp_tool(name) {
+        let c = ToolExecutionComponent::new(
+            amp_render::SUMMARY_TOOL,
+            &amp_render::tool_args_summary(args),
+        );
+        c.set_display_title(amp_render::tool_title(name, args));
+        Arc::new(c)
+    } else {
+        let args = if args.is_null() {
+            "{}".to_owned()
+        } else {
+            args.to_string()
+        };
+        Arc::new(ToolExecutionComponent::new(name, &args))
     }
 }
 

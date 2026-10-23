@@ -198,6 +198,8 @@ async fn event_loop(
 ) -> Result<(), String> {
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The AMP header and status line repaint when the metadata, workers or reports change.
+    let mut chrome_seen = shell.view().chrome().fingerprint();
     loop {
         tokio::select! {
             Some(event) = events.recv() => {
@@ -228,7 +230,8 @@ async fn event_loop(
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         let editor = shell.view().editor().clone();
-                        if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor.get_text().is_empty()) {
+                        let editor_empty = editor.get_text().is_empty();
+                        if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor_empty) {
                             if shell.is_running() {
                                 shell.abort().await;
                             } else if !editor.get_text().is_empty() {
@@ -236,15 +239,14 @@ async fn event_loop(
                             } else {
                                 break;
                             }
-                        } else if key.code == KeyCode::Esc && shell.is_running() {
+                        } else if !shell.key(key) && shell.is_running() {
+                            // An Esc that no AMP panel took aborts the run.
                             shell.abort().await;
-                        } else {
-                            editor.handle_key(key);
                         }
                         tui.request_render(false);
                     }
                     Event::Paste(text) => {
-                        shell.view().editor().handle_paste(&text);
+                        shell.paste(&text);
                         tui.request_render(false);
                     }
                     _ => {}
@@ -262,7 +264,12 @@ async fn event_loop(
             _ = ticker.tick() => {
                 tui.ensure_size();
                 let retrying = shell.view().tick();
-                if shell.is_running() || retrying {
+                // Finished AMP command calls, the ticket marker and the footer's #ticket.
+                let amp_changed = shell.poll();
+                let chrome = shell.view().chrome().fingerprint();
+                let chrome_changed = chrome != chrome_seen;
+                chrome_seen = chrome;
+                if shell.is_running() || retrying || chrome_changed || amp_changed {
                     tui.request_render(false);
                 }
             }

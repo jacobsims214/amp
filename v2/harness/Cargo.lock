@@ -66,9 +66,11 @@ version = "0.1.0"
 dependencies = [
  "amp-mcp",
  "async-trait",
+ "axum",
  "dirs",
  "include_dir",
  "keyring",
+ "rmcp",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",
@@ -131,13 +133,17 @@ name = "amp-tui"
 version = "0.1.0"
 dependencies = [
  "amp-core",
+ "amp-mcp",
  "crossterm",
+ "nix",
  "rpi-agent",
  "rpi-ai",
  "rpi-harness",
  "rpi-tui",
+ "serde",
  "serde_json",
  "tokio",
+ "toml",
 ]
 
 [[package]]

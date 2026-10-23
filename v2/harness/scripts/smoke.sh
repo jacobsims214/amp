@@ -19,6 +19,12 @@
 # completes with only task_id, and the ticket's run must carry the worker's model and tokens; a
 # worker whose script runs out leaves an abandoned run with a note; and denied calls (the manager's
 # bash, the worker writing outside its worktree) come back as visible tool errors and never run.
+# M3-6 (#2110, smoke v3) adds, per leg: `debug render-chrome --live` must show the project's name
+# and #id and the same status counts as amp_list_tasks (before and after a question is answered);
+# a question is answered through the chat's /questions panel (`--snapshot --meta`, Enter, the
+# answer, `y`) and the ticket must leave the Question state with the answer as a comment; and
+# /open must print the ticket's web UI URL (AMP_SMOKE_WEB_URL on compose, the MCP origin on the
+# cluster).
 # AMP has no hard delete for projects, so "deleted" means its tickets, story and epic are deleted
 # and the project is archived; the leg checks it is gone from amp_list_projects.
 #
@@ -35,11 +41,13 @@ CLUSTER_URL="${AMP_SMOKE_CLUSTER_URL:-https://amp.local/mcp}"
 PROTOCOLS="${AMP_SMOKE_PROTOCOLS:-auto 2025-11-25}"
 LEGS="${AMP_SMOKE_LEGS:-compose cluster}"
 COMPOSE_EMAIL="${AMP_SMOKE_COMPOSE_EMAIL:-local-dev@amp.local}"
+# Compose serves the web UI on its own port (amp-ui, :5173), not on the MCP origin.
+COMPOSE_WEB_URL="${AMP_SMOKE_WEB_URL:-http://localhost:5173}"
 
 # Keep the cluster credentials aside and out of the environment, so no other leg ever sends them.
 CLUSTER_TOKEN="${AMP_TOKEN:-}"
 CLUSTER_CA="${AMP_CA_FILE:-}"
-unset AMP_TOKEN AMP_CA_FILE AMP_MCP_URL AMP_MCP_PROTOCOL
+unset AMP_TOKEN AMP_CA_FILE AMP_MCP_URL AMP_MCP_PROTOCOL AMP_WEB_URL
 
 log() { printf 'smoke: %s\n' "$*"; }
 die() {
@@ -87,19 +95,17 @@ git init -q -b main . && printf 'smoke repo\n' >README.md && git add README.md &
   die "could not make the throwaway git repo"
 
 # --- per-leg state + cleanup ----------------------------------------------------------------------
-LEG="" LEG_URL="" LEG_PROTO="" LEG_TOKEN="" LEG_CA=""
-P_ID="" EPIC_ID="" STORY_ID="" TASK_IDS=()
+LEG="" LEG_URL="" LEG_PROTO="" LEG_TOKEN="" LEG_CA="" LEG_WEB=""
+P_ID="" P_NAME="" EPIC_ID="" STORY_ID="" TASK_IDS=() LEG_WEB_BASE=""
 RESULTS=()
 
 # h ARGS...: run the harness against the current leg. Connection settings go through the
-# environment (AMP_MCP_URL, AMP_MCP_PROTOCOL, AMP_TOKEN, AMP_CA_FILE), never argv.
+# environment (AMP_MCP_URL, AMP_MCP_PROTOCOL, AMP_TOKEN, AMP_CA_FILE, AMP_WEB_URL), never argv.
 h() {
-  if [[ -n "$LEG_TOKEN" ]]; then
-    AMP_MCP_URL="$LEG_URL" AMP_MCP_PROTOCOL="$LEG_PROTO" AMP_TOKEN="$LEG_TOKEN" AMP_CA_FILE="$LEG_CA" \
-      "$BIN" "$@"
-  else
-    AMP_MCP_URL="$LEG_URL" AMP_MCP_PROTOCOL="$LEG_PROTO" "$BIN" "$@"
-  fi
+  local -a e=(AMP_MCP_URL="$LEG_URL" AMP_MCP_PROTOCOL="$LEG_PROTO")
+  [[ -z "$LEG_TOKEN" ]] || e+=(AMP_TOKEN="$LEG_TOKEN" AMP_CA_FILE="$LEG_CA")
+  [[ -z "$LEG_WEB" ]] || e+=(AMP_WEB_URL="$LEG_WEB")
+  env "${e[@]}" "$BIN" "$@"
 }
 
 # call TOOL JSON: `mcp call`, prints the tool's JSON; fails the leg on a tool error.
@@ -247,10 +253,110 @@ dispatch_cases() {
   log "[$LEG] abandoned ok: #$t3 has an abandoned run ($(jq -r '[.runs[] | select(.outcome == "abandoned")][0].note' <<<"$out" | cut -c1-80))"
 }
 
+# --- live chrome, answering a question, /open (M3-6, smoke v3) -------------------------------------
+# check_chrome TICKET WHAT: `debug render-chrome --live` shows the leg's project (name and #id) and
+# the same status-line counts as AMP's own compact amp_list_tasks, with TICKET on the second line.
+check_chrome() {
+  local t="$1" what="$2" out list status n label
+  out="$(h debug render-chrome --live --project "$P_ID" --ticket "$t" --plain --width 220 --wait 20)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] render-chrome --live ($what) failed or did not finish loading"
+  }
+  list="$(call amp_list_tasks "{\"project_id\":$P_ID,\"owner\":\"any\"}")"
+  (($(wc -l <<<"$out") == 3)) || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] render-chrome --live ($what): expected two header lines and the status line"
+  }
+  local line1 line2
+  line1="$(sed -n 1p <<<"$out")" line2="$(sed -n 2p <<<"$out")" status="$(sed -n 3p <<<"$out")"
+  [[ "$line1" == *"$P_NAME #$P_ID"* ]] || die "[$LEG] chrome ($what): header has no '$P_NAME #$P_ID': $line1"
+  [[ "$line1" == *"● connected"* ]] || die "[$LEG] chrome ($what): header is not connected: $line1"
+  [[ "$line2" == *"#$t "* ]] || die "[$LEG] chrome ($what): second line is not ticket #$t: $line2"
+  # The counts the status line draws (Board::nonzero): questions as the chip, then In progress,
+  # Ready and Scheduled; a zero count is left out, and nothing open at all reads "no open tickets".
+  local nq ni nr ns
+  nq="$(jq '.questions | length' <<<"$list")" ni="$(jq '.in_progress | length' <<<"$list")"
+  nr="$(jq '.ready_to_dispatch | length' <<<"$list")" ns="$(jq '.scheduled // 0' <<<"$list")"
+  if ((nq > 0)); then
+    label=QUESTION; ((nq == 1)) || label=QUESTIONS
+    [[ "$status" == *"■  $nq $label "* ]] || die "[$LEG] chrome ($what): expected the '$nq $label' chip: $status"
+  else
+    [[ "$status" != *QUESTION* ]] || die "[$LEG] chrome ($what): a questions chip with no question on the board: $status"
+  fi
+  for pair in "$ni:In progress" "$nr:Ready" "$ns:Scheduled"; do
+    n="${pair%%:*}" label="${pair#*:}"
+    if ((n > 0)); then
+      [[ "$status" == *" $n $label"* ]] || die "[$LEG] chrome ($what): expected '$n $label' (amp_list_tasks): $status"
+    else
+      [[ "$status" != *" $label"* ]] || die "[$LEG] chrome ($what): '$label' shown but amp_list_tasks has none: $status"
+    fi
+  done
+  if ((nq + ni + nr + ns == 0)); then
+    [[ "$status" == *"no open tickets"* ]] || die "[$LEG] chrome ($what): expected 'no open tickets': $status"
+  fi
+  log "[$LEG] chrome ok ($what): ${status}"
+}
+
+# chrome_cases STAMP: needs .amp.json for the leg's project. Adds a ticket with a question.
+chrome_cases() {
+  local stamp="$1" t4 out
+  out="$(call amp_create_tasks "$(jq -nc --argjson p "$P_ID" --argjson s "$STORY_ID" '{project_id:$p, tasks:[
+      {ref:"fourth", story_id:$s, name:"smoke question ticket", description:"Throwaway; it asks a question.", acceptance_criteria:"None.", assigned_to:"amp:amp-worker-backend"}]}')")"
+  t4="$(jq -r '.created[]? | select(.ref == "fourth") | .id' <<<"$out")"
+  [[ "$t4" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_tasks: no id for the question ticket"
+  TASK_IDS+=("$t4")
+  call amp_block_task "{\"task_id\":$t4,\"reason\":\"Smoke question $stamp: red or blue?\"}" >/dev/null
+  out="$(call amp_list_tasks "{\"project_id\":$P_ID,\"owner\":\"any\"}")"
+  expect "$out" "[.questions[].id] == [$t4]" "expected #$t4 as the board's only question"
+
+  # 1. render-chrome --live: project, counts (a question, the abandoned worker's ticket in progress).
+  check_chrome "$t4" "with a question"
+
+  # 2. Answer it through the chat's /questions panel: Enter on the question, the answer, then y.
+  out="$(h --no-session --snapshot 140x40 --meta --input /questions --input key:enter \
+    --input "smoke answer $stamp" --input key:y)" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] /questions: the snapshot chat failed"
+  }
+  grep -q "answered #$t4" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] /questions: no 'answered #$t4' after key:y"
+  }
+  out="$(runs_of "$t4")"
+  jq -e --arg a "smoke answer $stamp" '.task.state != "blocked" and ([.comments[]?.body] | index($a)) != null' \
+    >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] /questions: #$t4 is still a question, or the answer is not on it"
+  }
+  out="$(call amp_list_tasks "{\"project_id\":$P_ID,\"owner\":\"any\"}")"
+  expect "$out" '.questions == []' "the board still lists a question after the answer"
+  log "[$LEG] /questions ok: answered #$t4, now $(jq -r .task.state <<<"$(runs_of "$t4")")"
+  check_chrome "$t4" "after the answer"
+
+  # 3. /open prints the ticket's web UI URL (the snapshot never opens a browser).
+  local url="$LEG_WEB_BASE/project/$P_ID/board?task=$t4"
+  out="$(h --no-session --snapshot 200x30 --meta --input "/ticket $t4" --input /open)" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] /open: the snapshot chat failed"
+  }
+  grep -qF "/open $url: --snapshot does not open a browser" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] /open: expected $url"
+  }
+  local code
+  code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' ${LEG_CA:+--cacert "$LEG_CA"} "$url" || true)"
+  if [[ "$code" == 200 ]]; then
+    log "[$LEG] /open ok: $url (the web UI answers 200)"
+  else
+    log "[$LEG] /open ok: $url (WARN: the web UI answered '${code:-nothing}', is it up?)"
+  fi
+}
+
 # --- one leg --------------------------------------------------------------------------------------
-# run_leg NAME URL PROTOCOL TOKEN CA EXPECT_EMAIL ('' = any)
+# run_leg NAME URL PROTOCOL TOKEN CA EXPECT_EMAIL ('' = any) WEB_URL ('' = the MCP URL's origin)
 run_leg() {
-  LEG="$1/$3" LEG_URL="$2" LEG_PROTO="$3" LEG_TOKEN="$4" LEG_CA="$5"
+  LEG="$1/$3" LEG_URL="$2" LEG_PROTO="$3" LEG_TOKEN="$4" LEG_CA="$5" LEG_WEB="$7"
+  LEG_WEB_BASE="${LEG_WEB:-$(sed -E 's#^([a-z]+://[^/?#]+).*#\1#' <<<"$LEG_URL")}"
   local want_email="$6" out rc
   log "== leg $LEG: $LEG_URL"
   rm -f .amp.json
@@ -287,7 +393,8 @@ run_leg() {
   local code stamp
   code="SM$(LC_ALL=C tr -dc '[:upper:]' </dev/urandom | head -c 4 || true)"
   stamp="$(date +%Y%m%d-%H%M%S)"
-  out="$(call amp_create_project "{\"name\":\"harness-smoke $LEG $stamp\",\"code\":\"$code\",\"description\":\"Throwaway project from v2/harness/scripts/smoke.sh; deleted by the run.\"}")"
+  P_NAME="harness-smoke $LEG $stamp"
+  out="$(call amp_create_project "{\"name\":\"$P_NAME\",\"code\":\"$code\",\"description\":\"Throwaway project from v2/harness/scripts/smoke.sh; deleted by the run.\"}")"
   P_ID="$(jq -r '.id // .project.id // empty' <<<"$out")"
   [[ "$P_ID" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_project returned no id"
   out="$(call amp_create_epic "{\"project_id\":$P_ID,\"name\":\"smoke epic\"}")"
@@ -367,6 +474,7 @@ run_leg() {
   log "[$LEG] run -p ok: the manager called amp_get_task on the faux model"
 
   dispatch_cases "$t2"
+  chrome_cases "$stamp"
 
   # A tool error exits 1 with the message on stderr.
   rc=0
@@ -382,14 +490,14 @@ run_leg() {
 for leg in $LEGS; do
   case "$leg" in
     compose)
-      for proto in $PROTOCOLS; do run_leg compose "$COMPOSE_URL" "$proto" "" "" "$COMPOSE_EMAIL"; done ;;
+      for proto in $PROTOCOLS; do run_leg compose "$COMPOSE_URL" "$proto" "" "" "$COMPOSE_EMAIL" "$COMPOSE_WEB_URL"; done ;;
     cluster)
       if [[ -z "$CLUSTER_TOKEN" || -z "$CLUSTER_CA" ]]; then
         RESULTS+=("SKIP cluster (set AMP_TOKEN and AMP_CA_FILE to run it against $CLUSTER_URL)")
         continue
       fi
       [[ -r "$CLUSTER_CA" ]] || die "AMP_CA_FILE $CLUSTER_CA is not readable"
-      for proto in $PROTOCOLS; do run_leg cluster "$CLUSTER_URL" "$proto" "$CLUSTER_TOKEN" "$CLUSTER_CA" ""; done ;;
+      for proto in $PROTOCOLS; do run_leg cluster "$CLUSTER_URL" "$proto" "$CLUSTER_TOKEN" "$CLUSTER_CA" "" ""; done ;;
     *) die "unknown leg '$leg' in AMP_SMOKE_LEGS" ;;
   esac
 done

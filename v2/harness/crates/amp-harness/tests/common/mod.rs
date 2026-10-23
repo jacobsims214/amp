@@ -143,6 +143,19 @@ pub fn list_tasks_json(owner: &str) -> Value {
     })
 }
 
+/// `amp_list_tasks(owner=any, format=compact)`: the board the metadata poller reads.
+pub fn compact_tasks_json() -> Value {
+    json!({
+        "ready_to_dispatch": [2086], "in_progress": [2085],
+        "questions": [{"id": 2084, "name": "M1-3 OAuth", "question": "Keychain or file?"}],
+        "waiting": 1, "scheduled": 1, "completed": 1, "quiet": [], "waiting_on_people": [2092],
+        "by_epic": {"AMP Harness": [
+            {"id": 2085, "name": "M1-4 CLI", "state": "in_progress", "assigned_to": "amp:amp-worker-backend"}
+        ]},
+        "count": 7, "owner_filter": "any"
+    })
+}
+
 pub fn get_task_json(with_comments: bool) -> Value {
     let mut out = json!({
         "task": task(2085, "M1-4 CLI", "in_progress", json!({
@@ -225,6 +238,11 @@ impl ServerHandler for MockAmp {
                 _ => tool_error("project not found"),
             },
             "amp_list_tasks" => {
+                // M3-3: the metadata poller's board (render-chrome --live).
+                if args["format"] == "compact" && args["owner"] == "any" && args["project_id"] == 2
+                {
+                    return ok_json(compact_tasks_json());
+                }
                 if args["format"] != "full" {
                     return tool_error("mock: the CLI must ask for format=full");
                 }
@@ -256,6 +274,16 @@ impl ServerHandler for MockAmp {
                 Some(4041) => tool_error("task 4041 not found"),
                 Some(id) => ok_json(json!({"task_id": id, "outcome": args["outcome"]})),
                 None => tool_error("task_id is required"),
+            },
+            "amp_get_plan" => ok_json(json!({"project_id": 2, "epics": [
+                {"id": 150, "name": "Earlier", "stories": []},
+                {"id": 161, "name": "AMP Harness", "stories": [{"id": 391, "name": "M1 CLI"}]}
+            ]})),
+            "amp_list_artifacts" => ok_json(json!({"artifacts": []})),
+            // M3-4: /questions answers through the metadata poller's connection.
+            "amp_answer_question" => match args["task_id"].as_i64() {
+                Some(2084) => ok_json(json!({"task_id": 2084, "state": "backlog", "ok": true})),
+                _ => tool_error("task is not blocked with a question"),
             },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(

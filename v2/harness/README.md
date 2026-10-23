@@ -70,10 +70,13 @@ Dependencies only point one way: `amp-mcp <- amp-core <- amp-tui <- amp-harness`
 | URL      | `--url`       | `AMP_MCP_URL`      | `[server] url`                      | `https://amp.simstech.cloud/mcp` |
 | extra CA | `--ca-file`   | `AMP_CA_FILE`      | `[server] ca_file`                  | none (system roots)              |
 | protocol | `--protocol`  | `AMP_MCP_PROTOCOL` | `[server] protocol`                 | `auto`                           |
+| web UI   |               | `AMP_WEB_URL`      | `[server] web_url`                  | the MCP URL's origin             |
 | token    | `--token-env` | `AMP_TOKEN`        | never                               | none                             |
 
 Flags beat env, env beats the file (`$XDG_CONFIG_HOME` is honoured). A relative `ca_file` is relative
-to the config file. `.amp.json` is a project marker only; its `amp_api` is not read.
+to the config file. `.amp.json` is a project marker only; its `amp_api` is not read. The web UI
+setting only changes links (`/open`, the header's host): set it when the UI is not served from the
+MCP origin, as on docker compose (`AMP_WEB_URL=http://localhost:5173`).
 
 ```toml
 [server]
@@ -297,7 +300,7 @@ The file can also map provider ids to steps. A script that runs out fails the ru
 ## Chat (M2-7)
 
 ```sh
-amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--url URL] [--ca-file PEM] [--protocol P] [--config PATH] [--token-env VAR]
+amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--theme auto|dark|light|FILE] [--url URL] [--ca-file PEM] [--protocol P] [--config PATH] [--token-env VAR]
 ```
 
 With no subcommand, `amp-harness` opens a full-screen chat with the manager (or `--role`), built
@@ -310,11 +313,56 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   cost, `/help`, `/abort`, `/quit` (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits.
+- AMP panels (`/amp`, `/ticket`, `/workers`, `/questions`, `/plan`, `/project`) open docked above the
+  editor and focused: with an empty editor, ↑↓ select a row and Enter acts on it (answers a
+  question, otherwise opens it in the browser). Typing, a paste or a sent prompt hands the keys back
+  to the editor (↑ recalls history again) and the panel stays docked; printable keys always reach
+  the editor. Tab, with an empty editor, switches between the panel and the editor. Esc closes it.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
 
-This is the plain M2 shell (rpi-tui's default theme). The AMP theme, header, status line and AMP
-slash commands come in M3.
+### Theme (M3-1)
+
+The chat uses the AMP theme: `amp-dark` or `amp-light` (provisional simstech tokens v1, #1815),
+with square borders and AMP's ticket-state, epic and brand colours.
+
+| setting | flag      | env                 | `config.toml` `[tui]` | default |
+|---------|-----------|---------------------|-----------------------|---------|
+| theme   | `--theme` | `AMP_HARNESS_THEME` | `theme`               | `auto`  |
+| colours | -         | `AMP_HARNESS_COLOR` | `color`               | `auto`  |
+
+- `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
+  background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
+  file (same JSON format as `crates/amp-tui/themes/amp-dark.json`).
+- `color`: `auto` uses 24-bit colour when `COLORTERM` is `truecolor`/`24bit`, else the 256-colour
+  fallbacks. `truecolor` or `256` forces one.
+
+### Header and status line (M3-3)
+
+Above the transcript, a two-line AMP header; between the editor and pi's footer, one AMP status
+line. The harness fetches what they show on its own AMP connection (the metadata poller), never
+through the model.
+
+```text
+▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2        ● connected 2026-07-28
+■ In progress #2106 M3-3 Header and AMP status line              ▌ AMP Harness › M3 theme + metadata
+■  2 QUESTIONS  │ workers 3 ■ running · 1 queued │ plan: 2 awaiting approval │ ■ 3 In progress · □ 5 Ready   unreported #2106
+```
+
+- Line 1: the AMP host, you, `org › project` (a link to the project in the web UI) and the MCP
+  connection (green connected, amber connecting/slow/degraded, red disconnected/re-login needed).
+- Line 2, while a ticket is current: its state in the web UI's words and colours, `#id` (a link
+  to the board with the ticket open), its name and `Epic › Story` in the epic's colour.
+- Status line: tickets waiting on a person's answer, workers (here and elsewhere), plan approval,
+  the board counts, the ticket's artifacts in review, and whether this session reported its run.
+  When the terminal is narrow, the board counts go first.
+
+Links are OSC 8 hyperlinks (Cmd/Ctrl-click in most terminals). Text from AMP is shown with control
+characters removed. `amp-harness debug render-chrome --width 100 [--theme dark|light] [--color
+truecolor|256] [--plain] [--live [--ticket ID]]` prints the header and status line alone, from a
+built-in sample or (`--live`) from AMP, for screenshots and render checks.
+
+AMP slash commands come in M3-4.
 
 ## Roles, agents and skills (D5, D6)
 
@@ -415,7 +463,11 @@ in a worktree of a throwaway git repo under `target/`; the worker comments and c
 `task_id`, and the ticket's run must carry `wf/wf-1` and tokens > 0. A second worker's script runs
 out, which must leave one abandoned run with a note `abandoned: error: ...`. Calls the role policy
 denies (the manager's bash, the worker writing outside its worktree) must come back as visible tool
-errors and never run. Cost is not asserted: the faux provider always reports 0. Finally it
+errors and never run. Cost is not asserted: the faux provider always reports 0. Smoke v3 (M3-6)
+adds a ticket with a question: `debug render-chrome --live` must show the project's name and `#id`
+and the same status counts as `amp_list_tasks`, before and after the question is answered through
+the chat's `/questions` panel (`--snapshot --meta`, Enter, the answer, `y`; the ticket must leave the
+Question state with the answer as a comment), and `/open` must print the ticket's web UI URL. Finally it
 deletes the tickets, story and epic and archives the project. AMP has no hard project delete, so the
 leg checks that the project is gone from `amp_list_projects`. Cleanup runs from an exit trap, so it
 also happens when a check fails. The harness runs with HOME under `target/` and
@@ -428,6 +480,7 @@ also happens when a check fails. The harness runs with HOME under `target/` and
 | `AMP_TOKEN` + `AMP_CA_FILE` | unset, so the cluster leg is skipped | cluster leg: an `amp_` token from the UI and `amp-local-ca.crt`. The token is only sent to this leg |
 | `AMP_SMOKE_CLUSTER_URL` | `https://amp.local/mcp` | envoy on 443, not `:8443` (RFC 9728 resource match) |
 | `AMP_SMOKE_LEGS` | `compose cluster` | |
+| `AMP_SMOKE_WEB_URL` | `http://localhost:5173` | compose leg's web UI, passed as `AMP_WEB_URL`; `/open` must print it. The cluster leg uses the MCP origin. An unreachable UI is only a WARN |
 
 On the dev Mac, the docker-desktop cluster's LoadBalancer can hold host :8000. In that case, publish
 compose's amp-api on another port and pass e.g. `AMP_MCP_URL=http://localhost:18000/mcp`. Don't run

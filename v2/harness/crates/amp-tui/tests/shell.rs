@@ -206,11 +206,13 @@ async fn slash_commands() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_m3_slots_are_empty_and_render_nothing() {
+async fn the_chrome_slots_render_nothing_without_metadata() {
     let rig = rig(vec![]).await;
     let view = rig.shell.view();
-    assert_eq!(view.header_slot().child_count(), 0);
-    assert_eq!(view.amp_status_slot().child_count(), 0);
+    // M3-3: each slot holds its chrome component, which draws nothing until there is metadata.
+    assert_eq!(view.header_slot().child_count(), 1);
+    assert_eq!(view.amp_status_slot().child_count(), 1);
+    assert!(rig.shell.meta().is_none() && view.chrome().data().is_none());
     // Without a header the banner is the first content (after its one-line top padding).
     let lines = view.render_plain(W, H);
     assert!(
