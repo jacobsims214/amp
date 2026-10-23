@@ -461,6 +461,39 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
     assert!(f.calls("amp_set_task_state").is_empty());
 }
 
+/// #2225: a worker whose model repeats one call is stopped at the 5th identical call, and its
+/// abandoned run says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_stopped_for_repeating_one_call_records_an_abandoned_run_saying_why() {
+    let f = fixture("repeating", false).await;
+    let sup = f.supervisor(config());
+    let mut steps: Vec<FauxStep> = (0..8)
+        .map(|_| {
+            template(
+                "Looking.",
+                json!([{"name": "bash", "arguments": {"command": "ls"}}]),
+            )
+        })
+        .collect();
+    steps.push(template("never reached", json!([])));
+    f.script(steps);
+    let r = sup
+        .run_ticket(req(2225, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped, "{r:?}");
+    let why = "the model kept repeating `bash ls` (5 identical calls in a row) and was stopped";
+    assert_eq!(r.error.as_deref(), Some(why), "{r:?}");
+    assert_eq!(r.tool_calls, 5, "nothing ran after the stop: {r:?}");
+    assert_eq!(r.tool_errors, 1, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["task_id"], 2225);
+    assert_eq!(runs[0]["outcome"], "abandoned");
+    assert_eq!(runs[0]["run_note"], format!("abandoned: stopped: {why}"));
+    assert!(f.calls("amp_complete_task").is_empty());
+}
+
 /// A step that cancels `token` (as the manager's abort or Ctrl-C would, mid-turn), then starts a
 /// long bash call so the run is still going when the supervisor sees the cancel.
 fn cancel_then_sleep(token: CancellationToken) -> FauxStep {

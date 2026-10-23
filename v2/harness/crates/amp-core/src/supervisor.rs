@@ -222,7 +222,8 @@ pub enum WorkerOutcome {
     Completed,
     /// The worker blocked its ticket with a question (`amp_block_task` succeeded).
     Blocked,
-    /// The worker stopped on its own without completing or blocking its ticket.
+    /// The worker stopped on its own without completing or blocking its ticket, or the repeat
+    /// guard stopped its model (#2225; `error` then says so).
     Stopped,
     /// The worker could not be set up (worktree, model key, ...) or its run failed (model error).
     Error,
@@ -760,6 +761,7 @@ impl Supervisor {
             budget: budget.clone(),
             closing: Mutex::new(HashMap::new()),
             closed: Mutex::new(None),
+            repeat_stop: Mutex::new(None),
         });
         if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
             w.watch = Some(Arc::clone(&watch));
@@ -849,7 +851,18 @@ impl Supervisor {
             Some(Ok(r)) => match r.outcome {
                 HarnessRunOutcome::Completed { final_message, .. } => Finish {
                     outcome: closed.unwrap_or(WorkerOutcome::Stopped),
-                    error: None,
+                    // #2225: say why it stopped (the abandoned run's note carries it).
+                    error: closed
+                        .is_none()
+                        .then(|| {
+                            watch
+                                .repeat_stop
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|s| s.reason())
+                        })
+                        .flatten(),
                     text: assistant_text(&final_message),
                     session_file: None,
                 },
@@ -1100,6 +1113,8 @@ struct WorkerWatch {
     /// Tool call id -> the outcome it means, for calls that close this ticket.
     closing: Mutex<HashMap<String, WorkerOutcome>>,
     closed: Mutex<Option<WorkerOutcome>>,
+    /// #2225: the repeat guard stopped the worker's model.
+    repeat_stop: Mutex<Option<crate::repeat::RepeatStop>>,
 }
 
 impl WorkerWatch {
@@ -1132,11 +1147,16 @@ impl WorkerWatch {
                     self.closing.lock().unwrap().insert(id.clone(), outcome);
                 }
             }
-            RunEvent::ToolEnd { id, is_error, .. } => {
+            RunEvent::ToolEnd {
+                id, is_error, text, ..
+            } => {
                 if let Some(outcome) = self.closing.lock().unwrap().remove(id)
                     && !is_error
                 {
                     *self.closed.lock().unwrap() = Some(outcome);
+                }
+                if *is_error && let Some(stop) = crate::repeat::stopped(text) {
+                    *self.repeat_stop.lock().unwrap() = Some(stop);
                 }
             }
             _ => {}
@@ -1435,6 +1455,7 @@ mod tests {
             budget: CancellationToken::new(),
             closing: Mutex::default(),
             closed: Mutex::default(),
+            repeat_stop: Mutex::default(),
         };
         let start = |id: &str, name: &str, task: i64| AgentEvent::ToolExecutionStart {
             tool_call_id: id.into(),
