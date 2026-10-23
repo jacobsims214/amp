@@ -1285,7 +1285,17 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 	res := &ApproveResult{Approved: []int{}, ApprovedTickets: []ApprovedTicket{}, AwaitingYours: []int{}}
 	owners := map[string]any{}
 	onBehalfOf := []any{}
+	// A ticket that fails (trashed since the list above, a DB error, no
+	// reply in time) is skipped with the reason, not fatal: the tickets
+	// already approved stay approved, so the call must still stamp, audit and
+	// publish them (AMP #2219). If the request itself ends, the tickets not
+	// yet sent aren't tried.
+	var stopped error
 	for _, t := range picked {
+		if stopped = ctx.Err(); stopped != nil {
+			skipped[idStr(t.ID)] = fmt.Sprintf("not tried: the request ended first (%v)", stopped)
+			continue
+		}
 		own := t.ApprovesAsOwn(p.UserID)
 		msg := &actor.MsgApproveTask{TaskID: t.ID, AsOf: req.AsOf, ExpectOwner: t.OwnerUserID, By: p.UserRef(), ByName: p.Label()}
 		if !own {
@@ -1294,11 +1304,13 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 		replyCh := make(chan actor.ReplyApproveTask, 1)
 		msg.ReplyCh = replyCh
 		if err := s.Registry.Send(projectID, msg); err != nil {
-			return nil, err
+			skipped[idStr(t.ID)] = "couldn't approve it: " + err.Error()
+			continue
 		}
 		reply := actor.Await(ctx, replyCh)
 		if reply.Err != nil {
-			return nil, reply.Err
+			skipped[idStr(t.ID)] = "couldn't approve it: " + reply.Err.Error()
+			continue
 		}
 		if !reply.Approved {
 			skipped[idStr(t.ID)] = reply.Why
@@ -1316,19 +1328,29 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 		res.Skipped = skipped
 	}
 
+	if stopped == nil {
+		stopped = ctx.Err() // ended while awaiting the last reply
+	}
+
+	// From here on the approvals are done and must be recorded, even if the
+	// request has ended or a read below fails: stamp, audit and publish on a
+	// context the caller can't cancel, and report any error only after.
+	fin, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var failed error
 	// The project's "last approved ... by" moves only when something was
 	// approved: a click that approved nothing (a stale page) takes no credit.
 	if len(res.Approved) > 0 {
-		res.Project, err = s.Repo.RecordPlanApproval(ctx, projectID, p.UserRef())
+		res.Project, err = s.Repo.RecordPlanApproval(fin, projectID, p.UserRef())
 	} else {
-		res.Project, err = s.Repo.GetProject(ctx, projectID)
+		res.Project, err = s.Repo.GetProject(fin, projectID)
 	}
 	if err != nil {
-		return nil, err
+		failed = err
 	}
-	awaiting, err := s.Repo.TasksAwaitingApproval(ctx, projectID)
-	if err != nil {
-		return nil, err
+	awaiting, err := s.Repo.TasksAwaitingApproval(fin, projectID)
+	if err != nil && failed == nil {
+		failed = err
 	}
 	res.AwaitingApproval, res.StillAwaiting = make([]int, 0, len(awaiting)), make([]AwaitingTicket, 0, len(awaiting))
 	for _, a := range awaiting {
@@ -1353,14 +1375,29 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 	if len(skipped) > 0 {
 		details["skipped"] = skipped
 	}
-	summary := fmt.Sprintf("approved %d ticket(s) in the plan of %s", len(res.Approved), res.Project.Name)
+	if failed != nil {
+		details["error"] = failed.Error()
+	}
+	name := fmt.Sprintf("project %d", projectID)
+	if res.Project != nil {
+		name = res.Project.Name
+	}
+	summary := fmt.Sprintf("approved %d ticket(s) in the plan of %s", len(res.Approved), name)
 	if res.OnBehalf {
 		summary += ", some on their owners' behalf"
 	}
-	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+	s.audit(fin, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 		Summary: summary, Details: details})
 	// Published here, not by the REST or MCP handler, so every way of
 	// approving refreshes open Flight plan pages the same way.
-	s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: res.Project, At: time.Now()})
+	if res.Project != nil {
+		s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: res.Project, At: time.Now()})
+	}
+	switch {
+	case stopped != nil:
+		return nil, fmt.Errorf("plan approval stopped early (%w); approved %v before it did, the rest weren't approved", stopped, res.Approved)
+	case failed != nil:
+		return nil, fmt.Errorf("plan approval: approved %v, then couldn't read the result: %w", res.Approved, failed)
+	}
 	return res, nil
 }
