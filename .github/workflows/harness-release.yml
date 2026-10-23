@@ -19,6 +19,8 @@ on:
       - "v2/harness/scripts/package.sh"
       - "v2/harness/scripts/render-formula.sh"
       - "v2/harness/scripts/test-install.sh"
+      - "v2/harness/scripts/test-install-distros.sh"
+      - "v2/harness/scripts/pty-run.py"
       - "v2/harness/packaging/**"
       - "v2/harness/Makefile"
       - "v2/harness/Cargo.toml"
@@ -31,6 +33,8 @@ on:
       - "v2/harness/scripts/package.sh"
       - "v2/harness/scripts/render-formula.sh"
       - "v2/harness/scripts/test-install.sh"
+      - "v2/harness/scripts/test-install-distros.sh"
+      - "v2/harness/scripts/pty-run.py"
       - "v2/harness/packaging/**"
       - "v2/harness/Makefile"
       - "v2/harness/Cargo.toml"
@@ -48,20 +52,29 @@ concurrency:
 
 jobs:
   # Offline installer tests (stub binary, file:// release mirror, temp HOME) on both OS families:
-  # Linux runs install.sh under dash, macOS under bash-as-sh.
+  # Linux runs install.sh under dash, macOS under bash-as-sh. Fresh install, upgrade (old → new),
+  # --uninstall, --preset passthrough, no-TTY output, and the setup handoff on a pseudo-terminal
+  # (scripts/pty-run.py, python3 from the runner image). Linux also runs install.sh inside distro
+  # containers: Debian slim (no curl/wget), Ubuntu with wget only, glibc 2.31 and Alpine (refused).
   install-test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
         if: runner.os == 'Linux'
-        run: shellcheck -s sh v2/harness/install.sh v2/harness/scripts/package.sh v2/harness/scripts/render-formula.sh v2/harness/scripts/test-install.sh
+        run: shellcheck -s sh v2/harness/install.sh v2/harness/scripts/package.sh v2/harness/scripts/render-formula.sh v2/harness/scripts/test-install.sh v2/harness/scripts/test-install-distros.sh
       - name: installer tests
-        run: v2/harness/scripts/test-install.sh
+        run: |
+          python3 --version
+          v2/harness/scripts/test-install.sh
+      - name: installer on Linux distributions (docker)
+        if: runner.os == 'Linux'
+        run: v2/harness/scripts/test-install-distros.sh
 
   build:
     needs: install-test

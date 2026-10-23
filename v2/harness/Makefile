@@ -13,11 +13,11 @@ BIN := target/debug/amp-harness
 PREFIX ?= $(HOME)/.local/bin
 
 .PHONY: help build test fmt fmt-check clippy lint check smoke version clean assets assets-check \
-	release dist install install-test
+	release dist install install-test install-test-distros
 
 help:
 	@echo "targets: build test fmt fmt-check clippy lint check smoke version clean assets assets-check"
-	@echo "         release dist install [PREFIX=$(PREFIX)] install-test"
+	@echo "         release dist install [PREFIX=$(PREFIX)] install-test install-test-distros"
 	@echo "CARGO_HOME=$${CARGO_HOME:-<unset: ~/.cargo>}"
 
 build:
@@ -60,6 +60,10 @@ install: release
 # Offline tests for install.sh / package.sh / render-formula.sh (stub binary, HOME under target/).
 install-test:
 	./scripts/test-install.sh
+
+# install.sh inside Debian, Ubuntu (old glibc, wget only) and Alpine containers (needs docker).
+install-test-distros:
+	./scripts/test-install-distros.sh
 
 # Agent/skill assets (D5): regenerate assets/ from v2/.opencode, or fail if the committed copy drifted.
 assets:
