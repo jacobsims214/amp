@@ -124,9 +124,14 @@ type MsgAssignTask struct {
 	// RequireIdle refuses the change if the ticket is in progress (set when
 	// only the project's open-reassign setting allows it).
 	RequireIdle bool
-	By          *int
-	ByName      string
-	ReplyCh     chan ReplyGetTask
+	// ByLead is set when the person making the change is a project lead or
+	// above: their reassignment keeps the ticket's plan approval. Anyone
+	// else's drops it when the ticket stops being the person it was approved
+	// for (domain.Task.DropsApprovalOn, AMP #2218).
+	ByLead  bool
+	By      *int
+	ByName  string
+	ReplyCh chan ReplyGetTask
 }
 
 type MsgUpdateTask struct {

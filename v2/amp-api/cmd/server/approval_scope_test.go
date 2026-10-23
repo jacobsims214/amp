@@ -505,3 +505,152 @@ func TestApprovalScope_WhoCanApprove(t *testing.T) {
 		t.Fatalf("refused approvals changed the plan: awaiting %v, want [%d]", got, id)
 	}
 }
+
+// An approval is for one person (AMP #2218): whose ticket it was when it was
+// approved (approved_for). When a Member moves the ticket to someone else,
+// the approval is dropped, so nobody can approve another person's ticket by
+// claiming or reassigning it, approving it as their own and handing it back,
+// nor hand their approved ticket to someone who never approved it. A project
+// lead's reassignment keeps it (a lead may approve on anyone's behalf), and
+// so does dispatch's automatic claim of an unassigned ticket.
+func TestApprovalScope_ApprovalDoesNotSurviveAMembersReassignment(t *testing.T) {
+	sw := newScopeWorld(t)
+	w := sw.w
+	alice, bob := w.alice.User.ID, w.bob.User.ID
+	assign := func(s *mcpStack, id int, user string) {
+		t.Helper()
+		s.call(t, "amp_assign_task", map[string]any{"task_id": float64(id), "user": user})
+	}
+	approveOwn := func(who string, id int) {
+		t.Helper()
+		if approved, _, _ := sw.post(t, who, map[string]any{"task_ids": []int{id}}); !slices.Equal(approved, []int{id}) {
+			t.Fatalf("%s approving ticket %d as their own approved %v", who, id, approved)
+		}
+	}
+	unassigned := func(s *mcpStack, story int, name string) int {
+		return taskID(t, s.call(t, "amp_create_task", map[string]any{
+			"project_id": float64(s.projectID), "story_id": float64(story), "name": name,
+			"description": "d", "acceptance_criteria": "a", "owner": "none",
+		}))
+	}
+	approvedFor := func(id int, want *int) {
+		t.Helper()
+		tk := sw.task(t, id)
+		if !tk.Approved() || !sameUserPtr(tk.ApprovedFor, want) {
+			t.Fatalf("ticket %d: approved=%v approved_for=%v, want approved for %v", id, tk.Approved(), tk.ApprovedFor, want)
+		}
+	}
+	awaits := func(id int) {
+		t.Helper()
+		tk := sw.task(t, id)
+		if tk.Approved() || tk.ApprovedAt != nil || tk.ApprovedBy != nil || tk.ApprovedFor != nil {
+			t.Fatalf("ticket %d should await approval again: approved_at=%v by=%v for=%v", id, tk.ApprovedAt, tk.ApprovedBy, tk.ApprovedFor)
+		}
+		if !slices.Contains(awaitingOf(t, sw.alice), id) {
+			t.Fatalf("ticket %d missing from amp_check_plan awaiting_approval", id)
+		}
+		dropped := false
+		hist, _ := w.s.repo.GetTicketHistory(context.Background(), id)
+		for _, h := range hist {
+			dropped = dropped || (h.Action == "approval_dropped" && strings.Contains(h.Detail, "Plan approval dropped"))
+		}
+		if !dropped {
+			t.Fatalf("ticket %d: no approval_dropped history entry in %+v", id, hist)
+		}
+	}
+	restDispatch := func(who string, id int) (int, map[string]any) {
+		return sw.ra.do(t, who, http.MethodPost, fmt.Sprintf("/api/tasks/%d/dispatch", id), map[string]any{"agent_id": "amp-worker"})
+	}
+
+	// (a) bob planned an unassigned ticket. alice claims it, approves it as
+	// her own, and releases it: it's bob's again (he planned it), and it awaits.
+	a := unassigned(sw.bob, sw.bobSt, "bob planned it, unassigned")
+	sw.alice.call(t, "amp_claim_task", map[string]any{"task_id": float64(a)})
+	approveOwn("alice", a)
+	approvedFor(a, &alice)
+	assign(sw.alice, a, "none")
+	awaits(a)
+	if !slices.Contains(yoursOf(t, sw.bob), a) {
+		t.Fatalf("ticket %d should await bob (he planned it)", a)
+	}
+	if code, out := restDispatch("bob", a); code != http.StatusForbidden || !strings.Contains(fmt.Sprint(out["error"]), "isn't approved") {
+		t.Fatalf("dispatching the released ticket: %d %v, want 403 isn't approved", code, out)
+	}
+	wantErr(t, dispatch(sw.bob, t, a), "isn't approved")
+
+	// (b) open_reassign (the default): alice takes bob's idle ticket, approves
+	// it, and gives it back. It awaits bob.
+	b := mkIn(t, sw.bob, sw.bobSt, "bob's own")
+	assign(sw.alice, b, "me")
+	approveOwn("alice", b)
+	assign(sw.alice, b, w.bob.Email)
+	if o := taskOwner(t, w.s, b); o == nil || *o != bob {
+		t.Fatalf("ticket %d owner %v, want bob", b, o)
+	}
+	awaits(b)
+	wantErr(t, dispatch(sw.bob, t, b), "isn't approved")
+
+	// (c) alice approves her own ticket, then hands it to bob, who never
+	// approved it. It awaits bob; once he approves it, it's approved for him.
+	c := mkIn(t, sw.alice, sw.aliceStory, "alice's, handed to bob")
+	approveOwn("alice", c)
+	assign(sw.alice, c, w.bob.Email)
+	awaits(c)
+	if !slices.Contains(yoursOf(t, sw.bob), c) {
+		t.Fatalf("ticket %d should await bob", c)
+	}
+	approveOwn("bob", c)
+	approvedFor(c, &bob)
+
+	// Handing a ticket back to the person it was approved for keeps it, and so
+	// does releasing your own ticket (it stays yours: you planned it).
+	own := mkIn(t, sw.alice, sw.aliceStory, "alice's, released")
+	approveOwn("alice", own)
+	assign(sw.alice, own, "none")
+	approvedFor(own, &alice)
+	assign(sw.alice, own, "me")
+	approvedFor(own, &alice)
+
+	// (d) A lead's reassignment keeps the approval (approved for whom it was).
+	d := mkIn(t, sw.alice, sw.aliceStory, "alice's, moved by the lead")
+	approveOwn("alice", d)
+	assign(w.as(w.lead), d, w.bob.Email)
+	if o := taskOwner(t, w.s, d); o == nil || *o != bob {
+		t.Fatalf("ticket %d owner %v, want bob", d, o)
+	}
+	approvedFor(d, &alice)
+	if slices.Contains(yoursOf(t, sw.bob), d) {
+		t.Fatalf("ticket %d moved by a lead should not await bob", d)
+	}
+	// A lead's handover keeps it too.
+	h := mkIn(t, sw.alice, sw.aliceStory, "alice's, handed over by the lead")
+	approveOwn("alice", h)
+	w.as(w.lead).call(t, "amp_handover_tasks", map[string]any{"project_id": float64(w.s.projectID),
+		"from": w.alice.Email, "to": w.bob.Email, "task_ids": []any{float64(h)}})
+	if o := taskOwner(t, w.s, h); o == nil || *o != bob {
+		t.Fatalf("ticket %d owner %v after the lead's handover, want bob", h, o)
+	}
+	approvedFor(h, &alice)
+	sw.bob.finish(t, d)
+
+	// (e) Dispatch's automatic claim of an approved unassigned ticket keeps
+	// it approved, and the ticket can be completed.
+	e := unassigned(sw.bob, sw.bobSt, "bob planned it, alice's agent runs it")
+	approveOwn("bob", e)
+	sw.alice.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(e), "agent_id": "amp-worker"})
+	if o := taskOwner(t, w.s, e); o == nil || *o != alice {
+		t.Fatalf("ticket %d owner %v after dispatch, want alice (claimed on dispatch)", e, o)
+	}
+	approvedFor(e, &bob)
+	sw.alice.call(t, "amp_complete_task", map[string]any{"task_id": float64(e)})
+	if tk := sw.task(t, e); tk.State != domain.TaskStateCompleted {
+		t.Fatalf("ticket %d state %s, want completed", e, tk.State)
+	}
+}
+
+func sameUserPtr(x, y *int) bool {
+	if x == nil || y == nil {
+		return x == nil && y == nil
+	}
+	return *x == *y
+}

@@ -437,3 +437,93 @@ func TestMigration_025BackfillsTicketApproval(t *testing.T) {
 	check(old, true, nil)
 	check(waiting, false, nil)
 }
+
+// Migration 026 records whom each ticket's approval was for (AMP #2218):
+// approved_for, backfilled from the ticket's owner (or, unassigned, its
+// creator) for approved tickets only. It's additive: approved_at and
+// approved_by are untouched, nothing approved stops being approved, and
+// running it again changes nothing.
+func TestMigration_026BackfillsApprovedFor(t *testing.T) {
+	ctx := context.Background()
+	dsn := freshDatabase(t)
+	repo, err := repository.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	var before []repository.Migration
+	var m026 *repository.Migration
+	for i, m := range migrations {
+		switch {
+		case m.Version < "026":
+			before = append(before, m)
+		case strings.HasPrefix(m.Version, "026"):
+			m026 = &migrations[i]
+		}
+	}
+	if m026 == nil {
+		t.Fatal("no migration 026")
+	}
+	if err := repo.RunMigrations(ctx, before); err != nil {
+		t.Fatalf("migrate to 025: %v", err)
+	}
+	db, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	q := func(sql string, dest *int, args ...any) {
+		t.Helper()
+		if err := db.QueryRow(ctx, sql, args...).Scan(dest); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	var approver, owner, planner, project, epic, story int
+	q(`INSERT INTO users (subject, email) VALUES ('sub-approver', 'approver@x.test') RETURNING id`, &approver)
+	q(`INSERT INTO users (subject, email) VALUES ('sub-owner', 'owner@x.test') RETURNING id`, &owner)
+	q(`INSERT INTO users (subject, email) VALUES ('sub-planner', 'planner@x.test') RETURNING id`, &planner)
+	q(`INSERT INTO projects (name, code, require_plan_approval) VALUES ('p', 'p', TRUE) RETURNING id`, &project)
+	q(`INSERT INTO epics (project_id, name) VALUES ($1, 'e') RETURNING id`, &epic, project)
+	q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 's') RETURNING id`, &story, project, epic)
+	mk := func(name string, ownerID, createdBy *int, approved bool) int {
+		t.Helper()
+		var id int
+		q(`INSERT INTO tasks (project_id, epic_id, story_id, name, owner_user_id, created_by, created_at, planned_at,
+		       approved_at, approved_by)
+		   VALUES ($1, $2, $3, $4, $5, $6, NOW() - INTERVAL '2 hours', NOW() - INTERVAL '2 hours',
+		       CASE WHEN $7 THEN NOW() - INTERVAL '1 hour' END, CASE WHEN $7 THEN $8::int END) RETURNING id`,
+			&id, project, epic, story, name, ownerID, createdBy, approved, approver)
+		return id
+	}
+	owned := mk("owned, approved", &owner, &planner, true)
+	pool := mk("unassigned, approved", nil, &planner, true)
+	nobodys := mk("nobody's, approved", nil, nil, true)
+	waiting := mk("owned, awaiting", &owner, &planner, false)
+
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
+		t.Fatalf("migrate 026: %v", err)
+	}
+	if _, err := db.Exec(ctx, m026.SQL); err != nil {
+		t.Fatalf("re-run 026: %v", err)
+	}
+	check := func(id int, wantApproved bool, wantFor *int) {
+		t.Helper()
+		tk, err := repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tk.Approved() != wantApproved {
+			t.Fatalf("ticket %q: approved=%v, want %v", tk.Name, tk.Approved(), wantApproved)
+		}
+		if wantApproved && (tk.ApprovedBy == nil || *tk.ApprovedBy != approver) {
+			t.Fatalf("ticket %q: approved_by %v, want %d (untouched)", tk.Name, tk.ApprovedBy, approver)
+		}
+		if (tk.ApprovedFor == nil) != (wantFor == nil) || (wantFor != nil && *tk.ApprovedFor != *wantFor) {
+			t.Fatalf("ticket %q: approved_for %v, want %v", tk.Name, tk.ApprovedFor, wantFor)
+		}
+	}
+	check(owned, true, &owner)
+	check(pool, true, &planner)
+	check(nobodys, true, nil)
+	check(waiting, false, nil)
+}

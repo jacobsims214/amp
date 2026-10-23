@@ -268,7 +268,9 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 
 	now := time.Now()
 	if claim {
-		if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.By); err != nil {
+		// Dispatch's claim keeps the approval (dispatch already passed the
+		// approval gate, and completing it checks again): AMP #2218.
+		if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.By, false); err != nil {
 			return fmt.Errorf("db claim on dispatch: %w", err)
 		}
 		owner := *msg.By
@@ -592,12 +594,17 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		t := a.withBlockedBy()
 		return &t, nil // no-op (e.g. claiming a ticket you already own)
 	}
-	if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.NewOwner); err != nil {
+	drop := a.task.DropsApprovalOn(msg.NewOwner, msg.ByLead)
+	if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.NewOwner, drop); err != nil {
 		return nil, fmt.Errorf("db set owner: %w", err)
 	}
 	from := ownerString(a.task.OwnerUserID)
+	approvedFor := a.task.ApprovedFor
 	a.task.OwnerUserID = msg.NewOwner
 	a.task.UpdatedAt = time.Now()
+	if drop {
+		a.task.ApprovedAt, a.task.ApprovedBy, a.task.ApprovedFor = nil, nil, nil
+	}
 
 	detail := fmt.Sprintf("Owner %s → %s", from, ownerString(msg.NewOwner))
 	if msg.NewOwner == nil && a.task.State == domain.TaskStateInProgress {
@@ -619,10 +626,25 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		action = "unassigned"
 	}
 	a.logActivityBy(msg.ByName, msg.By, action, "", "", detail)
+	if drop {
+		next := a.task.ApprovalOwner()
+		a.logActivityBy(msg.ByName, msg.By, "approval_dropped", "", "", fmt.Sprintf(
+			"Plan approval dropped: it was approved for %s, and the ticket is now %s's (owner changed by %s, who isn't a project lead). "+
+				"%s approves it again in the AMP web UI, or a project lead on their behalf",
+			ownerString(approvedFor), ownerString(next), nameOr(msg.ByName, ownerString(msg.By)), ownerString(next)))
+	}
 	t := a.withBlockedBy()
 	a.publish(domain.EventTaskAssigned, t)
 	a.log.Info(action, "owner", ownerString(msg.NewOwner))
 	return &t, nil
+}
+
+// nameOr returns name, or fallback when name is empty.
+func nameOr(name, fallback string) string {
+	if name == "" {
+		return fallback
+	}
+	return name
 }
 
 func sameOwner(a, b *int) bool {
@@ -813,14 +835,14 @@ func (a *TaskActor) handleApprove(msg *MsgApproveTask) ReplyApproveTask {
 	case msg.AsOf != nil && t.Planned().After(*msg.AsOf):
 		return skip("it was planned after what was approved (as_of)")
 	}
-	at, err := a.repo.ApproveTask(context.Background(), t.ID, msg.By, msg.AsOf)
+	at, forUser, err := a.repo.ApproveTask(context.Background(), t.ID, msg.By, msg.AsOf)
 	if err != nil {
 		return ReplyApproveTask{Err: fmt.Errorf("db approve task %d: %w", t.ID, err)}
 	}
 	if at == nil {
 		return skip("it was planned after what was approved (as_of)")
 	}
-	a.task.ApprovedAt, a.task.ApprovedBy = at, msg.By
+	a.task.ApprovedAt, a.task.ApprovedBy, a.task.ApprovedFor = at, msg.By, forUser
 	detail := "Plan approved by " + msg.ByName
 	if msg.OnBehalfOf != "" {
 		detail = "Plan approved on behalf of " + msg.OnBehalfOf + " by " + msg.ByName

@@ -177,6 +177,12 @@ type Task struct {
 	// PlannedAt (Approved): re-planning it makes it wait again.
 	ApprovedAt *time.Time `json:"approved_at,omitempty"`
 	ApprovedBy *int       `json:"approved_by,omitempty"`
+	// ApprovedFor is whose ticket it was when it was approved: its owner,
+	// or for an unassigned ticket the person who planned it (nil: nobody's,
+	// a legacy row). When a Member moves the ticket to someone else, the
+	// approval is dropped; a project lead's reassignment and dispatch's
+	// automatic claim keep it (AMP #2218, Task.DropsApprovalOn).
+	ApprovedFor *int `json:"approved_for,omitempty"`
 }
 
 // Approved reports whether a person approved the ticket as it's planned
@@ -199,6 +205,37 @@ func (t *Task) ApprovesAsOwn(userID int) bool {
 		return userID == 0
 	}
 	return *who == userID
+}
+
+// ApprovalOwner is whose approval the ticket needs: its owner, or for an
+// unassigned ticket the person who planned it (nil when neither is set).
+func (t *Task) ApprovalOwner() *int {
+	if t.OwnerUserID != nil {
+		return t.OwnerUserID
+	}
+	return t.CreatedBy
+}
+
+// DropsApprovalOn reports whether giving t to newOwner (nil: releasing it)
+// drops its plan approval, when the person making the change isn't a
+// project lead or above (byLead false). An approval is for one person
+// (ApprovedFor): it survives only while the ticket is that person's again
+// afterwards, so a Member can't approve someone's ticket by claiming it,
+// approving it as their own and handing it back, nor hand their approved
+// ticket to someone who never approved it (AMP #2218). A lead's
+// reassignment keeps it: a lead may approve on anyone's behalf anyway.
+func (t *Task) DropsApprovalOn(newOwner *int, byLead bool) bool {
+	if t.ApprovedAt == nil || byLead {
+		return false
+	}
+	next := newOwner
+	if next == nil {
+		next = t.CreatedBy
+	}
+	if next == nil || t.ApprovedFor == nil {
+		return !(next == nil && t.ApprovedFor == nil)
+	}
+	return *next != *t.ApprovedFor
 }
 
 // Planned is when the ticket was last planned (PlannedAt, or CreatedAt for
