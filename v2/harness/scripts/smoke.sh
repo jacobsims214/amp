@@ -56,6 +56,21 @@
 #           login shell under target/ too), installs it again over itself, and runs the installed
 #           binary's --version and doctor --json against compose.
 #
+# H16 (#2246) adds one leg against the compose server, in its own HOME under target/:
+# config   MCP servers, agents, skills and models configured through the CLI, then used. The smoke
+#          MCP server (examples/mcp_smoke_server, built by `make build`) runs as a stdio server, a
+#          Streamable HTTP server behind a bearer token (from an env var, never printed) and a
+#          legacy HTTP+SSE server: `mcp add` each (and its test must list the tools); `mcp import`
+#          a Claude Code `.mcp.json`; `mcp list` shows all four ready; `agents new smoke-helper
+#          --from blank` and `skills new smoke-skill` (preloaded with `agents skills add`); `doctor`
+#          must show each server ready with its auth and roles, the agent and skill as the person's
+#          own, the agent on worker-backend's model through the fallback, and, with the bearer
+#          variable unset, `mcp:web` as a warning naming it; the chat's `/model roles` must say the
+#          agent falls back; `models set smoke-helper wf2/wf2-1` then moves it to its own model.
+#          Last, on a throwaway project with an approved plan, the manager (faux) calls the
+#          imported server's tool and dispatches smoke-helper, whose worker (faux `wf2`) calls the
+#          stdio, http and sse servers' tools and completes its ticket.
+#
 # Exits non-zero on any failure. Cleanup runs on every exit path (trap), including failures.
 # The harness runs with HOME/XDG_CONFIG_HOME under target/ and AMP_CREDENTIAL_STORE=file, so your
 # real keychain and config.toml are never read or written.
@@ -67,7 +82,9 @@ BIN="${AMP_HARNESS_BIN:-$HARNESS_DIR/target/debug/amp-harness}"
 COMPOSE_URL="${AMP_MCP_URL:-http://localhost:8000/mcp}"
 CLUSTER_URL="${AMP_SMOKE_CLUSTER_URL:-https://amp.local/mcp}"
 PROTOCOLS="${AMP_SMOKE_PROTOCOLS:-auto 2025-11-25}"
-LEGS="${AMP_SMOKE_LEGS:-compose firstrun install cluster}"
+LEGS="${AMP_SMOKE_LEGS:-compose config firstrun install cluster}"
+# config leg (#2246): the MCP test server, built with the binary (an example of the amp-harness crate).
+MCP_SERVER="${AMP_SMOKE_MCP_SERVER:-$HARNESS_DIR/target/debug/examples/mcp_smoke_server}"
 COMPOSE_EMAIL="${AMP_SMOKE_COMPOSE_EMAIL:-local-dev@amp.local}"
 # Compose serves the web UI on its own port (amp-ui, :5173), not on the MCP origin.
 COMPOSE_WEB_URL="${AMP_SMOKE_WEB_URL:-http://localhost:5173}"
@@ -145,6 +162,8 @@ P_ID="" P_NAME="" EPIC_ID="" STORY_ID="" TASK_IDS=() LEG_WEB_BASE="" LEG_REST=""
 RESULTS=()
 # Projects the firstrun leg created through the harness itself; archived on exit.
 EXTRA_PROJECTS=()
+# MCP servers the config leg started in the background; stopped on exit.
+MCP_PIDS=()
 
 # h ARGS...: run the harness against the current leg. Connection settings go through the
 # environment (AMP_MCP_URL, AMP_MCP_PROTOCOL, AMP_TOKEN, AMP_CA_FILE, AMP_WEB_URL), never argv.
@@ -211,6 +230,10 @@ on_exit() {
       rc=1
       echo "smoke: cleanup: could not archive first-run project $p" >&2
     fi
+  done
+  local pid
+  for pid in "${MCP_PIDS[@]+"${MCP_PIDS[@]}"}"; do
+    kill "$pid" 2>/dev/null || true
   done
   if [[ -n "$KC_SERVICE" ]]; then
     security delete-generic-password -s "$KC_SERVICE" -a provider:openrouter >/dev/null 2>&1 || true
@@ -899,11 +922,264 @@ keychain_leg() {
   RESULTS+=("PASS keychain")
 }
 
+# --- MCP servers, agents, skills, models (H16, #2246) ------------------------------------------------
+# start_server NAME ARGS...: starts the smoke MCP server in the background (stdin a FIFO the script
+# holds open, so the server ends with the script) and sets SERVER_URL to the URL it prints.
+start_server() {
+  local name="$1" fifo="$CFG_ROOT/$1.in" out="$CFG_ROOT/$1.url" i
+  shift
+  mkfifo "$fifo"
+  env "${SERVER_ENV[@]+"${SERVER_ENV[@]}"}" "$MCP_SERVER" "$@" <"$fifo" >"$out" 2>"$CFG_ROOT/$name.err" &
+  MCP_PIDS+=("$!")
+  # Hold the write end open (fd 5 for http, 6 for sse); EOF on it stops the server.
+  case "$name" in
+    http) exec 5>"$fifo" ;;
+    sse) exec 6>"$fifo" ;;
+  esac
+  for i in $(seq 1 50); do
+    SERVER_URL="$(head -n 1 "$out" 2>/dev/null || true)"
+    [[ "$SERVER_URL" == http://* ]] && return 0
+    sleep 0.2
+  done
+  cat "$CFG_ROOT/$name.err" >&2
+  die "[$LEG] the $name smoke MCP server printed no URL"
+}
+
+config_leg() {
+  LEG="config" LEG_URL="$COMPOSE_URL" LEG_PROTO="auto" LEG_TOKEN="" LEG_CA="" LEG_WEB="$COMPOSE_WEB_URL"
+  LEG_REST="$REST_URL" LEG_WEB_BASE="$COMPOSE_WEB_URL"
+  [[ -x "$MCP_SERVER" ]] || die "[$LEG] $MCP_SERVER not found; run make -C v2/harness build (it builds the examples)"
+  CFG_ROOT="$WORK/cfg"
+  local home="$CFG_ROOT/home" project="$CFG_ROOT/project" out rc token
+  mkdir -p "$home/.config/amp-harness" "$project"
+  log "== leg config: MCP servers, agents, skills and models against $COMPOSE_URL"
+  # A second faux worker model, for `models set`.
+  cat >"$home/.config/amp-harness/config.toml" <<'TOML'
+[providers.boss]
+api = "faux"
+[providers.boss.models."boss-1"]
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
+[providers.wf2]
+api = "faux"
+[providers.wf2.models."wf2-1"]
+[roles.manager]
+model = "boss/boss-1"
+[roles.worker-backend]
+model = "wf/wf-1"
+TOML
+  git -C "$project" init -q -b main . && printf 'config smoke repo\n' >"$project/README.md" &&
+    git -C "$project" add README.md && git -C "$project" commit -q -m init ||
+    die "[$LEG] could not make the config leg's git repo"
+  # A bearer token for the http server: random, only ever in the environment.
+  token="smoke-mcp-$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 24 || true)"
+  # c ARGS...: the harness in this leg's HOME and project, against compose.
+  c() {
+    (cd "$project" && env -u AMP_HARNESS_PROMPTS HOME="$home" XDG_CONFIG_HOME="$home/.config" \
+      XDG_STATE_HOME="$home/.local/state" AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$CFG_ROOT" \
+      AMP_MCP_URL="$COMPOSE_URL" AMP_WEB_URL="$COMPOSE_WEB_URL" SMOKE_MCP_TOKEN="$token" \
+      "$BIN" "$@" </dev/null)
+  }
+  # no_token TEXT...: the bearer token is in none of the arguments' text nor in a file under HOME.
+  no_token() {
+    if printf '%s\n' "$@" | grep -qF "$token" || grep -rqF "$token" "$home" "$project" 2>/dev/null; then
+      die "[$LEG] the MCP bearer token was printed or written to a file"
+    fi
+  }
+
+  # 1. stdio, http (bearer from env) and legacy sse servers, each added and tested.
+  out="$(c mcp add fs --json -- "$MCP_SERVER" stdio fs)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] mcp add fs (stdio) failed"
+  }
+  expect "$out" '.type == "stdio" and .test.ok and .test.tools == ["echo", "has_env"]' "mcp add fs: test not ok"
+  SERVER_ENV=(SMOKE_MCP_TOKEN="$token")
+  start_server http http web --bearer-env SMOKE_MCP_TOKEN
+  SERVER_ENV=()
+  local http_url="$SERVER_URL"
+  out="$(c mcp add web "$http_url" --bearer-env SMOKE_MCP_TOKEN --json)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] mcp add web (http) failed"
+  }
+  expect "$out" '.type == "http" and .test.ok and .test.tools == ["echo", "has_env"]' "mcp add web: test not ok"
+  start_server sse sse
+  local sse_url="$SERVER_URL"
+  out="$(c mcp add old "$sse_url" --transport sse --json)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] mcp add old (sse) failed"
+  }
+  expect "$out" '.type == "sse" and .test.ok and .test.tools == ["echo"] and .test.protocol == "2024-11-05"' \
+    "mcp add old: test not ok (legacy SSE)"
+  log "[$LEG] mcp add ok: stdio fs, http web (bearer from env), sse old ($sse_url)"
+
+  # 2. import a Claude Code .mcp.json (project scope file -> the user config).
+  jq -n --arg cmd "$MCP_SERVER" '{mcpServers: {imported: {command: $cmd, args: ["stdio", "imported"]}}}' \
+    >"$project/.mcp.json"
+  out="$(c mcp import --from claude --yes --json)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] mcp import --from claude failed"
+  }
+  expect "$out" '.imported == 1 and ([.servers[] | select(.name == "imported") | .action] == ["add"])' \
+    "mcp import: expected one server added"
+  out="$(c mcp list --json)" || die "[$LEG] mcp list failed"
+  expect "$out" '[.[] | select(.status.state == "ready") | "\(.name)=\(.tools)"] | sort == ["fs=2", "imported=2", "old=1", "web=2"]' \
+    "mcp list: expected fs, imported, old and web ready"
+  log "[$LEG] mcp import ok: imported from .mcp.json; mcp list: 4 ready"
+
+  # 3. an agent and a skill of the person's own; the agent falls back to worker-backend's model.
+  out="$(c agents new smoke-helper --from blank --description "Smoke test helper: runs MCP tools." --json)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] agents new failed"
+  }
+  expect "$out" '.id == "smoke-helper" and .origin == "user" and .dispatchable and .model == "wf/wf-1" and (.model_source | startswith("fallback worker-backend"))' \
+    "agents new: expected a dispatchable user agent on worker-backend's model (fallback)"
+  c skills new smoke-skill --description "Smoke test skill." >/dev/null || die "[$LEG] skills new failed"
+  c agents skills smoke-helper add smoke-skill >/dev/null || die "[$LEG] agents skills add failed"
+  out="$(c skills list --json)" || die "[$LEG] skills list failed"
+  expect "$out" '[.skills[] | select(.name == "smoke-skill" and .origin == "user")] | length == 1' "skills list: no smoke-skill"
+  out="$(c agents show smoke-helper --json)" || die "[$LEG] agents show failed"
+  expect "$out" '.skills == ["smoke-skill"]' "agents show: smoke-skill is not preloaded"
+  log "[$LEG] agents/skills ok: smoke-helper (fallback worker-backend), smoke-skill preloaded"
+
+  # 4. doctor: each server ready with auth and roles, the agent and skill, the fallback model.
+  rc=0
+  out="$(c doctor --json)" || rc=$?
+  no_token "$out"
+  # Doctor's own checks of this leg: mcp, agents, skills, fallback (the key check for openrouter
+  # warns: the leg has no key; nothing may fail).
+  expect "$out" '.ok and ([.checks[] | select(.status == "fail")] == [])' "doctor not ok (exit $rc)"
+  expect "$out" '[.checks[] | select(.name | startswith("mcp:")) | "\(.name)=\(.status)"] | sort == ["mcp:fs=ok", "mcp:imported=ok", "mcp:old=ok", "mcp:web=ok"]' \
+    "doctor: expected the four MCP servers ok"
+  expect "$out" '(.checks[] | select(.name == "mcp:web") | .detail | contains("bearer token: env SMOKE_MCP_TOKEN (set)"))' \
+    "doctor: mcp:web does not name its bearer variable"
+  expect "$out" '(.checks[] | select(.name == "mcp:old") | .detail | contains("sse (user,") and contains("MCP 2024-11-05"))' \
+    "doctor: mcp:old is not the legacy SSE server"
+  expect "$out" '[.mcp.servers[] | select(.name == "fs") | .roles[] | select(.role == "smoke-helper") | .access] == ["all"]' \
+    "doctor: smoke-helper should see every fs tool"
+  expect "$out" '(.checks[] | select(.name == "agents") | .detail | contains("smoke-helper (user, wf/wf-1 via fallback worker-backend, dispatchable)"))' \
+    "doctor: agents does not list smoke-helper with its fallback"
+  expect "$out" '(.checks[] | select(.name == "skills") | .detail | contains("smoke-skill (user)"))' "doctor: skills does not list smoke-skill"
+  expect "$out" '[.models.roles[] | select(.role == "smoke-helper") | "\(.provider)/\(.model) \(.fallback)"] == ["wf/wf-1 fallback worker-backend"]' \
+    "doctor: models.roles has no smoke-helper on the fallback"
+  expect "$out" '.models.fallback.setting == "worker-backend" and .models.fallback.model == "wf-1"' "doctor: no fallback model"
+  log "[$LEG] doctor ok: $(jq -r '.checks[] | select(.name == "mcp") | .detail' <<<"$out"); fallback $(jq -r '.checks[] | select(.name == "fallback") | .detail' <<<"$out" | cut -c1-90)"
+  # Without the bearer variable: a warning that names it (never its value).
+  out="$(cd "$project" && env -u AMP_HARNESS_PROMPTS HOME="$home" XDG_CONFIG_HOME="$home/.config" \
+    XDG_STATE_HOME="$home/.local/state" AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$CFG_ROOT" \
+    AMP_MCP_URL="$COMPOSE_URL" "$BIN" doctor --json </dev/null)" || true
+  expect "$out" '(.checks[] | select(.name == "mcp:web") | .status == "warn" and (.detail | contains("SMOKE_MCP_TOKEN is not set")) and (.fix | length > 0))' \
+    "doctor without the bearer variable: mcp:web should warn naming SMOKE_MCP_TOKEN"
+  log "[$LEG] doctor ok without the bearer variable: mcp:web warns, naming SMOKE_MCP_TOKEN"
+
+  # 5. the project, its tickets and an approved plan, for the chat and the dispatch.
+  local code stamp t1
+  code="SC$(LC_ALL=C tr -dc '[:upper:]' </dev/urandom | head -c 4 || true)"
+  stamp="$(date +%Y%m%d-%H%M%S)"
+  P_NAME="harness-smoke config $stamp"
+  out="$(call amp_create_project "{\"name\":\"$P_NAME\",\"code\":\"$code\",\"description\":\"Throwaway project from v2/harness/scripts/smoke.sh (config leg); deleted by the run.\"}")"
+  P_ID="$(jq -r '.id // .project.id // empty' <<<"$out")"
+  [[ "$P_ID" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_project returned no id"
+  out="$(call amp_create_epic "{\"project_id\":$P_ID,\"name\":\"config smoke epic\"}")"
+  EPIC_ID="$(jq -r '.id // .epic.id // empty' <<<"$out")"
+  out="$(call amp_create_story "{\"project_id\":$P_ID,\"epic_id\":$EPIC_ID,\"name\":\"config smoke story\"}")"
+  STORY_ID="$(jq -r '.id // .story.id // empty' <<<"$out")"
+  out="$(call amp_create_tasks "$(jq -nc --argjson p "$P_ID" --argjson s "$STORY_ID" '{project_id:$p, tasks:[
+      {ref:"mcp", story_id:$s, name:"config smoke: call the MCP servers", description:"Throwaway; the smoke helper calls every MCP server.", acceptance_criteria:"None.", assigned_to:"amp:smoke-helper"}]}')")"
+  read -r -a TASK_IDS <<<"$(jq -r '[.created[]?.id] | map(tostring) | join(" ")' <<<"$out")"
+  t1="$(jq -r '.created[]? | select(.ref == "mcp") | .id' <<<"$out")"
+  [[ "$t1" =~ ^[0-9]+$ ]] || die "[$LEG] amp_create_tasks: no id"
+  approve_plan
+  printf '{"project_id": %s, "project_name": "harness smoke config"}\n' "$P_ID" >"$project/.amp.json"
+
+  # 6. the chat's /model roles says smoke-helper falls back (and names the fallback model).
+  out="$(c --no-session --snapshot 160x50 --input "/model roles")" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] /model roles: the snapshot chat failed"
+  }
+  grep -E "smoke-helper +wf/wf-1 .*fallback: worker-backend's model" <<<"$out" >/dev/null || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] /model roles: smoke-helper does not show its fallback"
+  }
+  grep -qF "fallback: wf/wf-1 (worker-backend's model, default) for roles with no model of their own" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] /model roles: no fallback line"
+  }
+  log "[$LEG] /model roles ok: smoke-helper on wf/wf-1, fallback: worker-backend's model"
+
+  # 7. models set: smoke-helper gets a model of its own.
+  out="$(c models set smoke-helper wf2/wf2-1 --json)" || {
+    printf '%s\n' "$out" >&2
+    die "[$LEG] models set failed"
+  }
+  expect "$out" '.action == "set" and .changed and .role.provider == "wf2" and .role.model == "wf2-1" and .role.fallback == null' \
+    "models set: smoke-helper is not on wf2/wf2-1"
+  out="$(c models list --json)" || die "[$LEG] models list failed"
+  expect "$out" '[.roles[] | select(.role == "smoke-helper") | "\(.provider)/\(.model)"] == ["wf2/wf2-1"]' \
+    "models list: smoke-helper is not on wf2/wf2-1"
+  log "[$LEG] models set ok: smoke-helper on wf2/wf2-1 ([roles.smoke-helper])"
+
+  # 8. the manager calls an external tool (the imported server) and dispatches smoke-helper, whose
+  #    worker calls the stdio, http and sse servers' tools, then completes its ticket.
+  jq -nc --argjson t "$t1" '{
+    boss: [
+      {tool_calls: [{name: "mcp__imported__echo", arguments: {text: "from the manager"}}]},
+      {tool_calls: [{name: "amp_run_ticket", arguments: {task_id: $t, agent_id: "amp:smoke-helper"}}]},
+      {text: "Worker report: {{last_tool_result}}"}],
+    wf2: [
+      {tool_calls: [{name: "mcp__fs__echo", arguments: {text: "worker stdio"}}]},
+      {tool_calls: [{name: "mcp__web__echo", arguments: {text: "worker http"}}]},
+      {tool_calls: [{name: "mcp__old__echo", arguments: {text: "worker sse"}}]},
+      {tool_calls: [{name: "amp_add_task_comment", arguments: {task_id: $t, body: "smoke helper called fs, web and old", author: "amp-worker"}}]},
+      {tool_calls: [{name: "amp_complete_task", arguments: {task_id: $t}}]},
+      {text: "MCP tools called."}]}' >"$CFG_ROOT/mcp-dispatch.json"
+  out="$(cd "$project" && env -u AMP_HARNESS_PROMPTS HOME="$home" XDG_CONFIG_HOME="$home/.config" \
+    XDG_STATE_HOME="$home/.local/state" AMP_CREDENTIAL_STORE=file AMP_HARNESS_CEILING_DIR="$CFG_ROOT" \
+    AMP_MCP_URL="$COMPOSE_URL" AMP_WEB_URL="$COMPOSE_WEB_URL" SMOKE_MCP_TOKEN="$token" \
+    AMP_HARNESS_FAUX_SCRIPT="$CFG_ROOT/mcp-dispatch.json" "$BIN" run -p "Run ticket #$t1" --json --no-session </dev/null)" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] dispatch with MCP tools: run -p failed"
+  }
+  no_token "$out"
+  jq -s -e '
+      (.[0] | .type == "session" and ([.mcp_servers[]? | select(.status.state == "ready") | .name] | sort) == ["fs", "imported", "old", "web"]
+        and (.tools | index("mcp__imported__echo")) != null) and
+      ([.[] | select(.type == "tool_end" and .name == "mcp__imported__echo")][0]
+        | .is_error == false and (.text | contains("imported: from the manager"))) and
+      (.[-1] | .type == "result" and .outcome == "completed" and .tools_used == ["mcp__imported__echo", "amp_run_ticket"])' \
+    >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | tail -c 4000 >&2
+    die "[$LEG] the manager did not call mcp__imported__echo, or its session lacks the MCP servers"
+  }
+  local report
+  report="$(jq -s -c '[.[] | select(.type == "tool_end" and .name == "amp_run_ticket")][0]' <<<"$out")"
+  jq -e --argjson t "$t1" '.is_error == false and (.text | fromjson
+      | .task_id == $t and .outcome == "completed" and .agent_id == "amp:smoke-helper"
+        and .model == "wf2/wf2-1" and .tool_calls == 5 and .tool_errors == 0)' >/dev/null <<<"$report" || {
+    printf '%s\n' "$report" | head -c 4000 >&2
+    die "[$LEG] the smoke-helper worker did not complete on wf2/wf2-1 with 5 tool calls and no errors"
+  }
+  out="$(runs_of "$t1")"
+  jq -e '(.task.state == "completed") and ([.comments[]? | .body] | index("smoke helper called fs, web and old")) != null and
+      ([.runs[]? | select(.outcome == "completed" and .model == "wf2/wf2-1")] | length) == 1' >/dev/null <<<"$out" || {
+    printf '%s\n' "$out" | head -c 4000 >&2
+    die "[$LEG] ticket $t1: expected completed with the worker's comment and a run on wf2/wf2-1"
+  }
+  log "[$LEG] dispatch ok: the manager called mcp__imported__echo; smoke-helper (wf2/wf2-1) called fs, web and old and completed #$t1"
+
+  rm -f "$project/.amp.json"
+  exec 5>&- 6>&-
+  cleanup_leg || die "[$LEG] cleanup failed"
+  LEG_REST=""
+  RESULTS+=("PASS config (mcp stdio/http/sse/import, agents, skills, models, doctor, /model roles, dispatch with MCP tools)")
+}
+
 for leg in $LEGS; do
   case "$leg" in
     keychain) keychain_leg ;;
     compose)
       for proto in $PROTOCOLS; do run_leg compose "$COMPOSE_URL" "$proto" "" "" "$COMPOSE_EMAIL" "$COMPOSE_WEB_URL" "$REST_URL"; done ;;
+    config) config_leg ;;
     firstrun) firstrun_leg ;;
     install) install_leg ;;
     cluster)

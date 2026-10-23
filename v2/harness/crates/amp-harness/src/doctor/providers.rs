@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
-    models::{ModelsConfig, Selection},
+    models::{ModelHints, ModelsConfig, Selection},
     provider_auth::{self, ProbeFailure, ProbeKind},
     providers::{KeyLookup, KeySource, resolve_key},
 };
@@ -43,8 +43,26 @@ pub struct ModelsReport {
     pub role_errors: BTreeMap<String, String>,
     /// The providers some role uses.
     pub providers: Vec<ProviderReport>,
-    /// Each role's provider, model and endpoint (#2275), sorted by role.
+    /// Each role's provider, model and endpoint (#2275), sorted by role. Since #2246 this also
+    /// lists every agent with no `[roles.<id>]` of its own, with how it fell back.
     pub roles: Vec<RoleModel>,
+    /// What a role with no model of its own runs on (#2246).
+    pub fallback: Option<FallbackReport>,
+}
+
+/// `doctor --json` `.models.fallback`: `[models] fallback` and the model it resolves to.
+#[derive(Debug, Serialize)]
+pub struct FallbackReport {
+    /// `[models] fallback` as written (a role or `provider/model`), default `worker-backend`.
+    pub setting: String,
+    /// Where it was set (`default`, `config <path>`, `inherit ...`).
+    pub source: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    /// Why it does not resolve.
+    pub error: Option<String>,
+    /// The roles running on it (or on another step of the fallback chain), sorted.
+    pub roles: Vec<String>,
 }
 
 /// One role's model in `doctor --json` `.models.roles`.
@@ -57,6 +75,9 @@ pub struct RoleModel {
     pub endpoint: String,
     /// Which layer set it (`default`, `inherit (config ...)`, `config ...`).
     pub source: String,
+    /// How a role with no `[roles.<id>]` got its model (#2246): `fallback worker-backend`,
+    /// `[models] fallback`, `based_on <role>` or `agent file model`. `null` for its own setting.
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,9 +121,12 @@ pub struct ModelReport {
 /// One named finding (`roles`, `key:<id>`, `models:<id>`).
 pub type Named = (String, Finding);
 
+/// `agents`: every agent's model role and fallback hints, so roles with no model of their own are
+/// checked with the model they really run on (#2246).
 pub async fn check(
     config: Result<ModelsConfig, String>,
     config_path: Option<String>,
+    agents: &[(String, ModelHints)],
     keys: &dyn KeyLookup,
     offline: bool,
 ) -> (ModelsReport, Vec<Named>) {
@@ -145,10 +169,15 @@ pub async fn check(
     let mut used: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     let mut primary_provider = None;
     let mut resolved = 0usize;
-    for (role, r) in config.resolve_all() {
+    let mut fell_back: Vec<String> = Vec::new();
+    for (role, r) in config.resolve_agents(agents) {
         match r {
             Ok(r) => {
                 resolved += 1;
+                let fallback = r.fell_back();
+                if let Some(how) = &fallback {
+                    fell_back.push(format!("{role} -> {} ({how})", r.model_ref()));
+                }
                 if role == PRIMARY_ROLE {
                     primary_provider = Some(r.provider.clone());
                 }
@@ -162,6 +191,7 @@ pub async fn check(
                         .map(|p| p.base_url.clone())
                         .unwrap_or_default(),
                     source: r.source.clone(),
+                    fallback,
                 });
                 used.entry(r.provider)
                     .or_default()
@@ -175,10 +205,15 @@ pub async fn check(
         }
     }
     let roles_finding = if report.role_errors.is_empty() {
-        Finding::new(
-            CheckStatus::Ok,
-            format!("{resolved} roles resolve ({mode} {selection})"),
-        )
+        let mut detail = format!("{resolved} roles resolve ({mode} {selection})");
+        if !fell_back.is_empty() {
+            detail.push_str(&format!(
+                "; {} without a model of their own: {}",
+                fell_back.len(),
+                fell_back.join(", ")
+            ));
+        }
+        Finding::new(CheckStatus::Ok, detail)
     } else {
         let list: Vec<String> = report
             .role_errors
@@ -196,6 +231,9 @@ pub async fn check(
         ))
     };
     out.push(("roles".to_owned(), roles_finding));
+    let (fallback, fallback_finding) = fallback_check(&config, &report.roles, &where_);
+    report.fallback = Some(fallback);
+    out.push(("fallback".to_owned(), fallback_finding));
 
     for (id, models) in used {
         let Some(provider) = config.providers.get(&id) else {
@@ -315,6 +353,59 @@ pub async fn check(
         });
     }
     (report, out)
+}
+
+/// `fallback` (#2246): what a role with no model of its own runs on. It fails only when a role
+/// needs it and it does not resolve (that role is already a `roles` failure); otherwise a broken
+/// fallback is a warning, since the next agent created would have no model.
+fn fallback_check(
+    config: &ModelsConfig,
+    roles: &[RoleModel],
+    where_: &str,
+) -> (FallbackReport, Finding) {
+    let f = config.fallback_model();
+    let users: Vec<String> = roles
+        .iter()
+        .filter(|r| r.fallback.is_some())
+        .map(|r| r.role.clone())
+        .collect();
+    let what = if f.setting.contains('/') {
+        format!("[models] fallback {}", f.setting)
+    } else if f.source.starts_with("inherit") {
+        format!("inherit {}", f.setting)
+    } else {
+        format!("{}'s model", f.setting)
+    };
+    let finding = match &f.resolved {
+        Ok(r) => Finding::new(
+            CheckStatus::Ok,
+            format!(
+                "roles without a model of their own run on {} ({what}, {}){}",
+                r.model_ref(),
+                f.source,
+                if users.is_empty() {
+                    String::new()
+                } else {
+                    format!("; used by {}", users.join(", "))
+                }
+            ),
+        ),
+        Err(e) => {
+            Finding::new(CheckStatus::Warn, format!("{what} ({}): {}", f.source, e.0)).fix(format!(
+                "set [models] fallback in {where_} to a role that has a model or to a \
+                 provider/model, e.g. fallback = \"worker-backend\""
+            ))
+        }
+    };
+    let report = FallbackReport {
+        setting: f.setting.clone(),
+        source: f.source.clone(),
+        provider: f.resolved.as_ref().ok().map(|r| r.provider.clone()),
+        model: f.resolved.as_ref().ok().map(|r| r.model_id.clone()),
+        error: f.resolved.as_ref().err().map(|e| e.0.clone()),
+        roles: users,
+    };
+    (report, finding)
 }
 
 fn models_finding(
@@ -566,7 +657,7 @@ mod tests {
              [providers.f.models.\"m\"]\n[roles.reviewer]\nmodel = \"anthropic/claude-opus-5-5\"\n",
         );
         let keys = StaticKeys::default();
-        let (report, out) = check(Ok(c), None, &keys, true).await;
+        let (report, out) = check(Ok(c), None, &[], &keys, true).await;
         assert_eq!(find(&out, "roles").status, CheckStatus::Ok);
         assert_eq!(find(&out, "key:f").status, CheckStatus::Ok);
         let anthropic = find(&out, "key:anthropic");
@@ -585,8 +676,72 @@ mod tests {
 
         // The manager on anthropic too: now it fails.
         let c = config("[roles.manager]\nmodel = \"anthropic/claude-opus-5-5\"\n");
-        let (_, out) = check(Ok(c), None, &keys, true).await;
+        let (_, out) = check(Ok(c), None, &[], &keys, true).await;
         assert_eq!(find(&out, "key:anthropic").status, CheckStatus::Fail);
+    }
+
+    #[tokio::test]
+    async fn roles_without_a_model_show_the_fallback() {
+        let c = config(
+            "[providers.f]\napi = \"faux\"\n[providers.f.models.\"m\"]\n\
+             [providers.g]\napi = \"faux\"\n[providers.g.models.\"n\"]\n\
+             [roles.manager]\nmodel = \"f/m\"\n[roles.worker-backend]\nmodel = \"g/n\"\n",
+        );
+        let agents = vec![
+            ("smoke-helper".to_owned(), ModelHints::default()),
+            (
+                "copy".to_owned(),
+                ModelHints {
+                    based_on: Some("manager".into()),
+                    ..ModelHints::default()
+                },
+            ),
+            // Configured: not a fallback.
+            ("worker-backend".to_owned(), ModelHints::default()),
+        ];
+        let keys = StaticKeys::default();
+        let (report, out) = check(Ok(c), None, &agents, &keys, true).await;
+        let role = |id: &str| report.roles.iter().find(|r| r.role == id).unwrap();
+        assert_eq!(role("smoke-helper").model, "n");
+        assert_eq!(
+            role("smoke-helper").fallback.as_deref(),
+            Some("fallback worker-backend")
+        );
+        assert_eq!(role("copy").model, "m");
+        assert_eq!(role("copy").fallback.as_deref(), Some("based_on manager"));
+        assert_eq!(role("worker-backend").fallback, None);
+        let roles = find(&out, "roles");
+        assert!(
+            roles
+                .detail
+                .contains("smoke-helper -> g/n (fallback worker-backend"),
+            "{roles:?}"
+        );
+        let fb = find(&out, "fallback");
+        assert_eq!(fb.status, CheckStatus::Ok);
+        assert!(
+            fb.detail.starts_with(
+                "roles without a model of their own run on g/n (worker-backend's model, default)"
+            ),
+            "{fb:?}"
+        );
+        assert!(fb.detail.contains("used by copy, smoke-helper"), "{fb:?}");
+        let f = report.fallback.unwrap();
+        assert_eq!(
+            (f.provider.as_deref(), f.model.as_deref()),
+            (Some("g"), Some("n"))
+        );
+
+        // A fallback that names a role nobody configured: a warning with the fix.
+        let c = config(
+            "[providers.f]\napi = \"faux\"\n[providers.f.models.\"m\"]\n\
+             [roles.manager]\nmodel = \"f/m\"\n[models]\nfallback = \"nobody\"\n",
+        );
+        let (report, out) = check(Ok(c), None, &[], &keys, true).await;
+        let fb = find(&out, "fallback");
+        assert_eq!(fb.status, CheckStatus::Warn, "{fb:?}");
+        assert!(fb.fix.as_deref().unwrap().contains("[models] fallback"));
+        assert!(report.fallback.unwrap().error.is_some());
     }
 
     #[test]
@@ -620,7 +775,7 @@ mod tests {
             ]),
             keychain: None,
         };
-        let (report, out) = check(Ok(c), None, &keys, true).await;
+        let (report, out) = check(Ok(c), None, &[], &keys, true).await;
         let text = format!("{}{out:?}", serde_json::to_string(&report).unwrap());
         assert!(!text.contains("TOPSECRET"), "{text}");
         assert_eq!(
@@ -634,6 +789,7 @@ mod tests {
         let (report, out) = check(
             Err("bad toml".into()),
             Some("/c.toml".into()),
+            &[],
             &StaticKeys::default(),
             true,
         )

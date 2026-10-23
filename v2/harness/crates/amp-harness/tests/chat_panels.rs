@@ -287,6 +287,57 @@ fn row<'a>(rows: &'a [String], start: &str) -> &'a str {
 // ---------------------------------------------------------------------------------------------
 // Cases
 
+/// #2246: a role with no model of its own says, in `/model roles` and `/config`, which fallback it
+/// runs on, and the panel names the fallback model.
+async fn model_roles_show_the_fallback() {
+    let dir = setup("fallback", "", "");
+    std::fs::write(
+        dir.join("home/.config/amp-harness/config.toml"),
+        "[providers.boss]\napi = \"faux\"\n[providers.boss.models.\"boss-1\"]\n\
+         [providers.wf]\napi = \"faux\"\n[providers.wf.models.\"wf-1\"]\n\
+         [roles.manager]\nmodel = \"boss/boss-1\"\n[roles.worker-backend]\nmodel = \"wf/wf-1\"\n",
+    )
+    .unwrap();
+    let agents = dir.join("home/.config/amp-harness/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(
+        agents.join("smoke-helper.md"),
+        "---\ndescription: test\nmode: subagent\ndispatch: true\nskills: []\n---\n\nHelp.\n",
+    )
+    .unwrap();
+    let out = chat(&dir, None, &["/model roles"], &[]).await;
+    let rows = panel(&out);
+    let helper = row(&rows, "smoke-helper");
+    assert!(
+        helper.contains("wf/wf-1  ") && helper.ends_with("fallback: worker-backend's model"),
+        "{rows:#?}"
+    );
+    assert!(
+        !row(&rows, "worker-backend").contains("fallback"),
+        "{rows:#?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(
+            "fallback: wf/wf-1 (worker-backend's model, default) for roles with no model"
+        )),
+        "{rows:#?}"
+    );
+    // /config lists it among the roles, with the fallback as its source.
+    let mut seen = String::new();
+    for downs in [0, 14, 28] {
+        let mut inputs = vec!["/config"];
+        inputs.extend(std::iter::repeat_n("key:down", downs));
+        let out = chat(&dir, None, &inputs, &[]).await;
+        seen.push_str(&panel(&out).join("\n"));
+        seen.push('\n');
+    }
+    let seen = flat(&seen);
+    assert!(
+        seen.contains("smoke-helper wf/wf-1 · off (fallback worker-backend (config config.toml))"),
+        "{seen}"
+    );
+}
+
 /// `/mcp` lists every server with its health (a ready user server, a disabled one, an untrusted
 /// repo one) and only the keys that apply to the selected one; the status line says `mcp 1/1`.
 async fn mcp_list_shows_health_and_the_status_line() {
@@ -756,6 +807,7 @@ fn main() {
         mcp_trust_and_untrust_a_repo_server,
         mcp_add_details_test_and_restart,
         model_per_role,
+        model_roles_show_the_fallback,
         agents_and_skills,
         config_overview_with_sources,
         help_lists_the_panels,

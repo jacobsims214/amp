@@ -660,15 +660,15 @@ fn hub_for(ctx: &Ctx, servers: Vec<McpServer>) -> Result<McpHub, CliError> {
 }
 
 /// What connecting to some servers showed.
-struct Probe {
-    health: BTreeMap<String, ServerHealth>,
-    tools: BTreeMap<String, Vec<String>>,
-    elapsed: Duration,
+pub(crate) struct Probe {
+    pub(crate) health: BTreeMap<String, ServerHealth>,
+    pub(crate) tools: BTreeMap<String, Vec<String>>,
+    pub(crate) elapsed: Duration,
 }
 
 /// Connects to `servers` (each as it would start in a session, lazy ones included), waits for the
 /// first attempts, records health and tool names, and shuts everything down.
-async fn probe(ctx: &Ctx, servers: Vec<McpServer>) -> Result<Probe, CliError> {
+pub(crate) async fn probe(ctx: &Ctx, servers: Vec<McpServer>) -> Result<Probe, CliError> {
     let servers: Vec<McpServer> = servers
         .into_iter()
         .map(|mut s| {
@@ -725,7 +725,7 @@ async fn probe(ctx: &Ctx, servers: Vec<McpServer>) -> Result<Probe, CliError> {
 }
 
 /// The last `n` lines of a server's stderr log.
-fn stderr_tail(path: Option<&Path>, n: usize) -> Vec<String> {
+pub(crate) fn stderr_tail(path: Option<&Path>, n: usize) -> Vec<String> {
     let Some(text) = path.and_then(|p| std::fs::read_to_string(p).ok()) else {
         return Vec::new();
     };
@@ -2037,7 +2037,7 @@ pub async fn get(args: GetArgs) -> Result<(), CliError> {
 }
 
 /// The server's URL with references expanded (for its login key).
-fn expand_url(ctx: &Ctx, server: &McpServer) -> Option<String> {
+pub(crate) fn expand_url(ctx: &Ctx, server: &McpServer) -> Option<String> {
     let expand = ExpandContext::from_paths(&ctx.paths, &env, None);
     match server.resolve(&expand).ok()? {
         Resolved::Http(r) | Resolved::Sse(r) => Some(r.url),
@@ -2045,7 +2045,7 @@ fn expand_url(ctx: &Ctx, server: &McpServer) -> Option<String> {
     }
 }
 
-fn secret_rows(server: &McpServer, service: Option<&str>) -> Vec<Value> {
+pub(crate) fn secret_rows(server: &McpServer, service: Option<&str>) -> Vec<Value> {
     let mut rows: Vec<Value> = keychain_items(server)
         .iter()
         .map(|item| {

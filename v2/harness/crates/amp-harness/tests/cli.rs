@@ -423,11 +423,17 @@ async fn doctor_json_is_pinned() {
         tail,
         [
             ("roles", "ok"),
+            ("fallback", "ok"),
             ("key:openrouter", "ok"),
-            ("models:openrouter", "skip")
+            ("models:openrouter", "skip"),
+            // #2246: MCP servers (none here), skills, agents and the rest of `config check`.
+            ("mcp", "skip"),
+            ("skills", "ok"),
+            ("agents", "ok"),
+            ("config-check", "ok")
         ]
     );
-    assert_eq!(model_checks[1]["detail"], "key from env OPENROUTER_API_KEY");
+    assert_eq!(model_checks[2]["detail"], "key from env OPENROUTER_API_KEY");
     let versions_check = checks[4]["detail"].as_str().unwrap().to_owned();
     assert!(
         versions_check.starts_with(&format!("harness {}, rpi ", env!("CARGO_PKG_VERSION")))
@@ -435,6 +441,19 @@ async fn doctor_json_is_pinned() {
         "{versions_check}"
     );
     checks[4]["detail"] = json!("<versions>");
+    let obj = v.as_object_mut().unwrap();
+    let mcp = obj.remove("mcp").unwrap();
+    assert_eq!(
+        mcp,
+        json!({"servers": [], "broken": [], "ready": 0, "checked": 0})
+    );
+    let agents = obj.remove("agents").unwrap();
+    assert!(agents["count"].as_u64().unwrap() > 0, "{agents}");
+    assert_eq!(agents["custom"], json!([]));
+    assert_eq!(agents["problems"], json!([]));
+    let skills = obj.remove("skills").unwrap();
+    assert!(skills["count"].as_u64().unwrap() > 0, "{skills}");
+    assert_eq!(skills["custom"], json!([]));
     assert_eq!(
         v,
         json!({
@@ -676,8 +695,14 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
             ("project", "skip"),
             // The model side still runs: no OpenRouter key for the manager.
             ("roles", "ok"),
+            ("fallback", "ok"),
             ("key:openrouter", "fail"),
-            ("models:openrouter", "skip")
+            ("models:openrouter", "skip"),
+            // #2246: and the configuration checks.
+            ("mcp", "skip"),
+            ("skills", "ok"),
+            ("agents", "ok"),
+            ("config-check", "ok")
         ]
     );
     let fix = v["checks"][3]["fix"].as_str().unwrap();
@@ -687,12 +712,12 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
         "{fix}"
     );
     assert!(
-        v["checks"][10]["fix"]
+        v["checks"][11]["fix"]
             .as_str()
             .unwrap()
             .starts_with("set OPENROUTER_API_KEY in the environment"),
         "{}",
-        v["checks"][10]
+        v["checks"][11]
     );
 
     // A bad URL fails at config.

@@ -749,3 +749,257 @@ async fn doctor_connect_failure_is_one_sentence() {
     assert_eq!(check(&v, "connect")["detail"], sentence.as_str());
     assert!(v["connection"]["error"].as_str().unwrap().len() > sentence.len());
 }
+
+// --- MCP servers, agents, skills, fallback (#2246) ------------------------------------------------
+
+/// The smoke test's MCP server (examples/mcp_smoke_server.rs), built with the tests.
+fn smoke_server() -> std::path::PathBuf {
+    let bin = Path::new(env!("CARGO_BIN_EXE_amp-harness"))
+        .parent()
+        .unwrap()
+        .join("examples/mcp_smoke_server");
+    assert!(
+        bin.exists(),
+        "{} is missing: `cargo test` builds the examples (make -C v2/harness test)",
+        bin.display()
+    );
+    bin
+}
+
+#[tokio::test]
+async fn mcp_servers_agents_skills_and_the_fallback_model() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("doctor-mcp-agents", Some(7));
+    let server = smoke_server();
+    let server = server.display();
+    let cfg = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(cfg.join("agents")).unwrap();
+    std::fs::create_dir_all(cfg.join("skills/smoke-skill")).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        format!(
+            "[providers.boss]\napi = \"faux\"\n[providers.boss.models.\"boss-1\"]\n\
+             [providers.wf]\napi = \"faux\"\n[providers.wf.models.\"wf-1\"]\n\
+             [roles.manager]\nmodel = \"boss/boss-1\"\n[roles.worker-backend]\nmodel = \"wf/wf-1\"\n\
+             [mcp.fs]\ntype = \"stdio\"\ncommand = \"{server}\"\nargs = [\"stdio\", \"fs\"]\n\
+             [mcp.only-workers]\ntype = \"stdio\"\ncommand = \"{server}\"\nargs = [\"stdio\"]\n\
+             roles = [\"worker-*\"]\n\
+             [mcp.dead]\ntype = \"stdio\"\ncommand = \"/bin/sh\"\n\
+             args = [\"-c\", \"echo dead-server-says-no >&2; exit 3\"]\nstartup_timeout_secs = 5\n\
+             [mcp.off]\ntype = \"stdio\"\ncommand = \"{server}\"\nargs = [\"stdio\"]\nenabled = false\n\
+             [mcp.broken]\ntype = \"stdio\"\n\
+             [mcp.web]\ntype = \"http\"\nurl = \"http://127.0.0.1:9/mcp\"\nbearer_env = \"DOCTOR_MCP_TOKEN\"\n"
+        ),
+    )
+    .unwrap();
+    // A new agent with no [roles] entry (falls back), one that may not use fs's has_env, and
+    // a skill of the person's own.
+    let agent = |extra: &str| {
+        format!(
+            "---\ndescription: test agent\nmode: subagent\ndispatch: true\nskills: []\n\
+             permission:\n  todowrite: deny\n{extra}---\n\nA test agent.\n"
+        )
+    };
+    std::fs::write(cfg.join("agents/smoke-helper.md"), agent("")).unwrap();
+    std::fs::write(
+        cfg.join("agents/no-env.md"),
+        agent("  mcp:\n    \"*\": allow\n    \"fs/has_env\": deny\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("skills/smoke-skill/SKILL.md"),
+        "---\nname: smoke-skill\ndescription: A test skill.\n---\n\nDo the thing.\n",
+    )
+    .unwrap();
+    // A repo server nobody trusted.
+    let repo = dir.join("project/.amp/harness");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(
+        repo.join("config.toml"),
+        format!("[mcp.repo-fs]\ntype = \"stdio\"\ncommand = \"{server}\"\nargs = [\"stdio\"]\n"),
+    )
+    .unwrap();
+
+    let out = run(&dir, &amp.url, &["doctor", "--json"], &[]).await;
+    let v = out.json();
+    // The broken table fails doctor; everything else only warns.
+    assert_eq!(out.code, 1, "{}", out.stdout);
+    assert_eq!(status(&v, "mcp:broken"), "fail", "{v}");
+    assert!(
+        check(&v, "mcp:broken")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("configuration error")
+    );
+    assert!(fix(&v, "mcp:broken").contains("amp-harness mcp edit broken"));
+
+    // Ready, with tools, auth and every role.
+    assert_eq!(status(&v, "mcp:fs"), "ok", "{v}");
+    let fs = check(&v, "mcp:fs")["detail"].as_str().unwrap().to_owned();
+    assert!(
+        fs.contains("stdio (user,") && fs.contains("ready, 2 tools"),
+        "{fs}"
+    );
+    assert!(fs.contains("auth: none"), "{fs}");
+    assert!(fs.contains("no-env: 1 tool (mcp policy)"), "{fs}");
+    let server_of = |name: &str| {
+        v["mcp"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap_or_else(|| panic!("no server {name}: {v}"))
+            .clone()
+    };
+    let fs = server_of("fs");
+    assert_eq!(fs["tools"], json!(["echo", "has_env"]));
+    assert_eq!(fs["status"]["state"], "ready");
+    let access = |s: &Value, role: &str| {
+        s["roles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["role"] == role)
+            .unwrap_or_else(|| panic!("no role {role}: {s}"))
+            .clone()
+    };
+    assert_eq!(access(&fs, "manager")["access"], "all");
+    assert_eq!(access(&fs, "no-env")["access"], "some");
+    assert_eq!(access(&fs, "no-env")["tools"], 1);
+    // The per-server roles filter.
+    let only = server_of("only-workers");
+    assert_eq!(access(&only, "manager")["access"], "none");
+    assert_eq!(access(&only, "manager")["why"], "roles filter");
+    assert_eq!(access(&only, "worker-backend")["access"], "all");
+
+    // A server that exits: a warning with its stderr and the fix.
+    assert_eq!(status(&v, "mcp:dead"), "warn", "{v}");
+    let dead = check(&v, "mcp:dead")["detail"].as_str().unwrap();
+    assert!(dead.contains("dead-server-says-no"), "{dead}");
+    assert!(fix(&v, "mcp:dead").contains("amp-harness mcp test dead"));
+    // Disabled, untrusted, a missing bearer variable (never its value).
+    assert_eq!(status(&v, "mcp:off"), "skip");
+    assert_eq!(status(&v, "mcp:repo-fs"), "warn");
+    assert!(fix(&v, "mcp:repo-fs").contains("amp-harness mcp trust repo-fs"));
+    assert_eq!(server_of("repo-fs")["trust"], "untrusted");
+    assert_eq!(status(&v, "mcp:web"), "warn");
+    assert!(
+        check(&v, "mcp:web")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("bearer token: env DOCTOR_MCP_TOKEN (not set)"),
+        "{v}"
+    );
+    assert_eq!(status(&v, "mcp"), "ok");
+    assert!(
+        check(&v, "mcp")["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("2 of ")
+    );
+
+    // Agents, skills and the fallback model.
+    assert_eq!(status(&v, "agents"), "ok", "{v}");
+    let agents = check(&v, "agents")["detail"].as_str().unwrap();
+    assert!(
+        agents.contains("smoke-helper (user, wf/wf-1 via fallback worker-backend, dispatchable)"),
+        "{agents}"
+    );
+    assert_eq!(status(&v, "skills"), "ok");
+    assert!(
+        check(&v, "skills")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("yours: smoke-skill (user)")
+    );
+    let role = v["models"]["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["role"] == "smoke-helper")
+        .unwrap()
+        .clone();
+    assert_eq!(role["model"], "wf-1");
+    assert_eq!(role["fallback"], "fallback worker-backend");
+    assert_eq!(v["models"]["fallback"]["setting"], "worker-backend");
+    assert_eq!(v["models"]["fallback"]["model"], "wf-1");
+    assert_eq!(status(&v, "fallback"), "ok");
+    assert_eq!(status(&v, "config-check"), "ok", "{v}");
+
+    // The human report shows the fallback.
+    let human = run(&dir, &amp.url, &["doctor"], &[]).await;
+    assert!(
+        human.stdout.lines().any(|l| l.contains("smoke-helper ")
+            && l.ends_with("wf/wf-1  (no model of its own: fallback worker-backend)")),
+        "{}",
+        human.stdout
+    );
+    assert!(
+        human
+            .stdout
+            .contains("fallback: wf/wf-1 (worker-backend's model, default)"),
+        "{}",
+        human.stdout
+    );
+
+    // The bearer value reaches the server and is never printed; --offline connects nothing.
+    let token = "doctor-mcp-SECRET-token-value";
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[("DOCTOR_MCP_TOKEN", token)],
+    )
+    .await;
+    assert!(!out.stdout.contains(token) && !out.stderr.contains(token));
+    let v = out.json();
+    assert_eq!(status(&v, "mcp"), "skip");
+    assert_eq!(status(&v, "mcp:fs"), "skip");
+    assert!(
+        check(&v, "mcp:web")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("bearer token: env DOCTOR_MCP_TOKEN (set)")
+    );
+}
+
+#[tokio::test]
+async fn a_bad_agent_and_a_bad_fallback_are_reported() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("doctor-agents-bad", None);
+    let cfg = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(cfg.join("agents")).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[providers.boss]\napi = \"faux\"\n[providers.boss.models.\"boss-1\"]\n\
+         [roles.manager]\nmodel = \"boss/boss-1\"\n[models]\nfallback = \"nobody\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("agents/orphan.md"),
+        "---\ndescription: test\nmode: subagent\nskills: []\n---\n\nAn agent with no model.\n",
+    )
+    .unwrap();
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
+    assert_eq!(out.code, 1);
+    let v = out.json();
+    assert_eq!(status(&v, "fallback"), "warn", "{v}");
+    assert!(fix(&v, "fallback").contains("[models] fallback"));
+    assert_eq!(status(&v, "agents"), "fail", "{v}");
+    assert!(
+        check(&v, "agents")["detail"]
+            .as_str()
+            .unwrap()
+            .contains("agent orphan:")
+    );
+    assert!(fix(&v, "agents").contains("amp-harness models set orphan"));
+    // The orphan's role error is a roles failure too.
+    assert_eq!(status(&v, "roles"), "fail");
+    assert_eq!(status(&v, "mcp"), "skip");
+}

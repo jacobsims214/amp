@@ -887,6 +887,29 @@ impl ResolvedRole {
     pub fn model_ref(&self) -> String {
         format!("{}/{}", self.provider, self.model_id)
     }
+
+    /// How the role got its model when it has no assignment of its own (D11's chain, #2246):
+    /// `agent file model`, `based_on <role>`, `fallback <role>` or `[models] fallback`. `None` when
+    /// the role has its own `[roles.<id>]` (or runs in inherit mode).
+    pub fn fell_back(&self) -> Option<String> {
+        let head = self.source.split(" (").next().unwrap_or_default();
+        let fell = head == "agent file model"
+            || head == "[models] fallback"
+            || head.starts_with("based_on ")
+            || head.starts_with("fallback ");
+        fell.then(|| head.to_owned())
+    }
+}
+
+/// What [`ModelsConfig::fallback`] resolves to, for display (doctor, `/model roles`).
+#[derive(Debug, Clone)]
+pub struct FallbackModel {
+    /// `[models] fallback` as written, or [`DEFAULT_FALLBACK_ROLE`].
+    pub setting: String,
+    /// Where the setting came from (`default`, `config <path>`, `inherit ...`).
+    pub source: String,
+    /// The model it resolves to (`Err` when it does not resolve).
+    pub resolved: Result<ResolvedRole, ModelsError>,
 }
 
 impl ModelsConfig {
@@ -1315,6 +1338,55 @@ impl ModelsConfig {
             .keys()
             .map(|role| (role.clone(), self.resolve_role(role)))
             .collect()
+    }
+
+    /// The configured roles plus every agent in `agents` (its model role and hints) that has no
+    /// assignment of its own, resolved with the fallback chain ([`Self::resolve_with`]), sorted by
+    /// role. This is what each role really runs on (#2246: doctor, `config show`, `models list`).
+    pub fn resolve_agents(
+        &self,
+        agents: &[(String, ModelHints)],
+    ) -> Vec<(String, Result<ResolvedRole, ModelsError>)> {
+        let mut all: BTreeMap<String, Result<ResolvedRole, ModelsError>> =
+            self.resolve_all().into_iter().collect();
+        for (role, hints) in agents {
+            let role = normalize_role(role);
+            if !all.contains_key(role) {
+                all.insert(role.to_owned(), self.resolve_with(role, hints));
+            }
+        }
+        all.into_iter().collect()
+    }
+
+    /// The model a role with no assignment and no agent-file hints runs on (`[models] fallback`,
+    /// default [`DEFAULT_FALLBACK_ROLE`]'s model; in inherit mode the inherited model).
+    pub fn fallback_model(&self) -> FallbackModel {
+        let (setting, source) = match (&self.selection, &self.fallback) {
+            (Selection::Inherit { model, source, .. }, _) => {
+                (model.clone(), format!("inherit ({source})"))
+            }
+            (_, Some((value, source))) => (value.clone(), source.clone()),
+            (_, None) => (DEFAULT_FALLBACK_ROLE.to_owned(), "default".to_owned()),
+        };
+        // A role name no file can configure, so only the fallback chain applies.
+        const PROBE: &str = "(fallback)";
+        let resolved = self
+            .resolve_with(PROBE, &ModelHints::default())
+            .map_err(|e| {
+                if e.0.starts_with("no model for role `(fallback)`") {
+                    ModelsError(format!(
+                        "the fallback role `{setting}` has no model (configured roles: {})",
+                        self.role_names().join(", ")
+                    ))
+                } else {
+                    ModelsError(e.0.replace("role `(fallback)`: ", "the fallback: "))
+                }
+            });
+        FallbackModel {
+            setting,
+            source,
+            resolved,
+        }
     }
 
     /// Providers some role uses.
@@ -1831,6 +1903,67 @@ thinking = "low"
             .resolve_with("x", &hints(Some("f/one"), None, Some("worker-backend")))
             .unwrap();
         assert_eq!(r.model_ref(), "f/two");
+    }
+
+    #[test]
+    fn fallback_roles_are_listed_and_named() {
+        let user = "[providers.f]\napi = \"faux\"\n[providers.f.models.\"one\"]\n\
+                    [providers.f.models.\"two\"]\n[roles.worker-backend]\nmodel = \"f/one\"\n\
+                    [roles.reviewer]\nmodel = \"f/two\"\n";
+        let c = config(user).unwrap();
+        let agents = vec![
+            ("sql-expert".to_owned(), ModelHints::default()),
+            (
+                "amp-copy".to_owned(),
+                ModelHints {
+                    based_on: Some("reviewer".into()),
+                    ..ModelHints::default()
+                },
+            ),
+            ("reviewer".to_owned(), ModelHints::default()),
+        ];
+        let all = c.resolve_agents(&agents);
+        let get = |role: &str| {
+            all.iter()
+                .find(|(r, _)| r == role)
+                .unwrap_or_else(|| panic!("no {role}"))
+                .1
+                .as_ref()
+                .unwrap()
+        };
+        assert_eq!(get("sql-expert").model_ref(), "f/one");
+        assert_eq!(
+            get("sql-expert").fell_back().as_deref(),
+            Some("fallback worker-backend")
+        );
+        assert_eq!(
+            get("copy").fell_back().as_deref(),
+            Some("based_on reviewer")
+        );
+        assert_eq!(get("reviewer").fell_back(), None);
+        // Configured roles come first-class, so every shipped role is still there once.
+        assert_eq!(all.iter().filter(|(r, _)| r == "reviewer").count(), 1);
+        let f = c.fallback_model();
+        assert_eq!(
+            (f.setting.as_str(), f.source.as_str()),
+            ("worker-backend", "default")
+        );
+        assert_eq!(f.resolved.unwrap().model_ref(), "f/one");
+        let c = config(&format!("{user}\n[models]\nfallback = \"nobody\"\n")).unwrap();
+        let e = c.fallback_model().resolved.unwrap_err();
+        assert!(
+            e.0.starts_with("the fallback role `nobody` has no model")
+                && !e.0.contains("(fallback)"),
+            "{e}"
+        );
+        let c = config(&format!(
+            "{user}\n[models]\nprofile = \"inherit\"\ninherit = \"f/two\"\n"
+        ))
+        .unwrap();
+        let f = c.fallback_model();
+        assert_eq!(f.setting, "f/two");
+        assert!(f.source.starts_with("inherit"), "{}", f.source);
+        assert_eq!(f.resolved.unwrap().model_ref(), "f/two");
     }
 
     #[test]
