@@ -358,7 +358,8 @@ pub async fn run(plan: &Plan, ui: &mut dyn Ui) -> Result<Outcome, CliError> {
     summary.user = Some(user);
 
     // 4. Project.
-    let (project, new_user) = project_step(plan, ui, &client, &settings).await?;
+    let (project, new_user) =
+        project_step(plan, ui, &client, &settings, &mut summary.warnings).await?;
     summary.project = project.clone();
 
     // 5. Models and keys.
@@ -810,12 +811,34 @@ pub fn derive_code(name: &str) -> String {
     code
 }
 
-/// Returns the linked project and whether the person had no projects before this run.
+/// Where a new `.amp.json` goes when it replaces `old`, a marker made for another server (#2206):
+/// the usual place (`--dir`, else the repository root) when the new file shadows `old` there or
+/// overwrites it, else the working directory. So a parent folder's marker for another server is
+/// shadowed, not rewritten.
+fn replacement_dir(plan: &Plan, old: &ProjectMarker) -> PathBuf {
+    let usual = marker_dir(plan);
+    if plan.dir.is_some() {
+        return usual;
+    }
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let old_dir = old.path.parent().map(canon).unwrap_or_default();
+    let usual_c = canon(&usual);
+    // `old` sits below the usual place: a file there would not be found first.
+    if old_dir != usual_c && old_dir.starts_with(&usual_c) {
+        plan.cwd.clone()
+    } else {
+        usual
+    }
+}
+
+/// Returns the linked project and whether the person had no projects before this run. Warnings
+/// about the marker (#2206) go to `warnings`.
 async fn project_step(
     plan: &Plan,
     ui: &mut dyn Ui,
     client: &AmpMcpClient,
     settings: &Settings,
+    warnings: &mut Vec<String>,
 ) -> Result<(Option<ProjectSummary>, bool), CliError> {
     let ceiling = std::env::var_os(ENV_CEILING_DIR)
         .filter(|v| !v.is_empty())
@@ -829,17 +852,26 @@ async fn project_step(
         created,
         linked_now: true,
     };
-    let link =
-        |ui: &mut dyn Ui, p: &ProjectInfo, created: bool| -> Result<ProjectSummary, CliError> {
-            let path = write_marker(&marker_dir(plan), p, &settings.url)?;
-            ui.say(&format!(
-                "{} {} and linked this folder ({}).",
-                if created { "Created" } else { "Using" },
-                p.label(),
-                path.display()
-            ));
-            Ok(summary(p, path, created))
-        };
+    // A marker made for another server, which the picker below may replace (#2206).
+    let mut replacing: Option<ProjectMarker> = None;
+    let link_dir = |replacing: &Option<ProjectMarker>| match replacing {
+        Some(old) => replacement_dir(plan, old),
+        None => marker_dir(plan),
+    };
+    let link = |ui: &mut dyn Ui,
+                p: &ProjectInfo,
+                created: bool,
+                dir: PathBuf|
+     -> Result<ProjectSummary, CliError> {
+        let path = write_marker(&dir, p, &settings.url)?;
+        ui.say(&format!(
+            "{} {} and linked this folder ({}).",
+            if created { "Created" } else { "Using" },
+            p.label(),
+            path.display()
+        ));
+        Ok(summary(p, path, created))
+    };
 
     match &plan.project {
         ProjectArg::Skip => return Ok((None, false)),
@@ -848,7 +880,7 @@ async fn project_step(
             let p = ProjectInfo::from_value(&v).ok_or_else(|| {
                 CliError::new(format!("amp_get_project {id}: no project in the answer"))
             })?;
-            return Ok((Some(link(ui, &p, false)?), false));
+            return Ok((Some(link(ui, &p, false, marker_dir(plan))?), false));
         }
         ProjectArg::Create {
             name,
@@ -857,7 +889,7 @@ async fn project_step(
             team,
         } => {
             let p = create_project(client, name, code.clone(), *org, *team).await?;
-            return Ok((Some(link(ui, &p, true)?), false));
+            return Ok((Some(link(ui, &p, true, marker_dir(plan))?), false));
         }
         ProjectArg::Auto => {}
     }
@@ -869,28 +901,53 @@ async fn project_step(
                 marker.project_id,
                 marker.project_name.as_deref().unwrap_or("")
             );
-            let keep = plan.mode == Mode::FirstRun
-                || !ui.interactive()
-                || ui.confirm(
-                    &format!(
-                        "This folder is linked to project {} ({}). Keep it?",
-                        label.trim_end(),
-                        marker.path.display()
-                    ),
-                    true,
-                )?;
+            // #2206: project ids are per server. A marker made for another server, or naming
+            // another project than this server's, is said; the former is not used silently.
+            let foreign = marker.other_server(&settings.url).is_some();
+            let server_name = if foreign || marker.project_name.is_some() {
+                call_json(
+                    client,
+                    "amp_get_project",
+                    json!({"project_id": marker.project_id}),
+                )
+                .await
+                .ok()
+                .and_then(|v| ProjectInfo::from_value(&v))
+                .and_then(|p| p.name)
+            } else {
+                None
+            };
+            if let Some(w) = marker.server_warning(&settings.url, server_name.as_deref()) {
+                if foreign && ui.interactive() {
+                    ui.say(&format!("Warning: {w}."));
+                }
+                warnings.push(w);
+            }
+            let keep = (foreign && !ui.interactive())
+                || (!foreign && plan.mode == Mode::FirstRun)
+                || (!foreign && !ui.interactive())
+                || (!foreign
+                    && ui.confirm(
+                        &format!(
+                            "This folder is linked to project {} ({}). Keep it?",
+                            label.trim_end(),
+                            marker.path.display()
+                        ),
+                        true,
+                    )?);
+            let kept = ProjectSummary {
+                id: marker.project_id,
+                name: marker.project_name.clone(),
+                code: marker.project_code.clone(),
+                marker: marker.path.clone(),
+                created: false,
+                linked_now: false,
+            };
             if keep {
-                return Ok((
-                    Some(ProjectSummary {
-                        id: marker.project_id,
-                        name: marker.project_name.clone(),
-                        code: marker.project_code.clone(),
-                        marker: marker.path.clone(),
-                        created: false,
-                        linked_now: false,
-                    }),
-                    false,
-                ));
+                return Ok((Some(kept), false));
+            }
+            if foreign {
+                replacing = Some(marker);
             }
         }
         Ok(None) => {}
@@ -917,17 +974,44 @@ async fn project_step(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "My project".to_owned());
 
+    // Skipping keeps the other server's marker, which the session would find anyway: say so.
+    let kept = replacing.as_ref().map(|m| ProjectSummary {
+        id: m.project_id,
+        name: m.project_name.clone(),
+        code: m.project_code.clone(),
+        marker: m.path.clone(),
+        created: false,
+        linked_now: false,
+    });
+    let skip =
+        |ui: &mut dyn Ui, new_user: bool| -> Result<(Option<ProjectSummary>, bool), CliError> {
+            match &kept {
+            Some(k) => ui.say(&format!(
+                "Keeping #{} from {} for now: run `amp-harness init` here to link this server's \
+                 project.",
+                k.id,
+                k.marker.display()
+            )),
+            None => ui.say("No project for now: run `amp-harness init` later to link one."),
+        }
+            Ok((kept.clone(), new_user))
+        };
+    let dir = link_dir(&replacing);
+
     if projects.is_empty() {
         ui.say("You have no AMP projects yet. Projects hold the plan, the tickets and the knowledge base.");
         if !ui.confirm("Create a project for this folder now?", true)? {
-            ui.say("No project for now: run `amp-harness init` later to link one.");
-            return Ok((None, true));
+            return skip(ui, true);
         }
         let p = create_interactive(ui, client, &default_name).await?;
-        return Ok((Some(link(ui, &p, true)?), true));
+        return Ok((Some(link(ui, &p, true, dir.clone())?), true));
     }
 
-    ui.say("This folder isn't linked to an AMP project yet. Pick one, or create a new one:");
+    ui.say(if replacing.is_some() {
+        "Pick this server's project for this folder, or create a new one:"
+    } else {
+        "This folder isn't linked to an AMP project yet. Pick one, or create a new one:"
+    });
     for (i, p) in projects.iter().take(PICKER_MAX).enumerate() {
         ui.say(&format!("  {:>2}) {}", i + 1, p.label()));
     }
@@ -938,16 +1022,22 @@ async fn project_step(
         ));
     }
     ui.say("   n) a new project");
+    let question = match &replacing {
+        Some(m) => format!(
+            "Project (number, #id, n, or Enter to keep #{} from .amp.json)",
+            m.project_id
+        ),
+        None => "Project (number, #id, n, or Enter to skip)".to_owned(),
+    };
     loop {
-        let answer = ui.ask("Project (number, #id, n, or Enter to skip)", Some(""))?;
+        let answer = ui.ask(&question, Some(""))?;
         let answer = answer.trim();
         if answer.is_empty() {
-            ui.say("No project for now: run `amp-harness init` later to link one.");
-            return Ok((None, false));
+            return skip(ui, false);
         }
         if answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("new") {
             let p = create_interactive(ui, client, &default_name).await?;
-            return Ok((Some(link(ui, &p, true)?), false));
+            return Ok((Some(link(ui, &p, true, dir.clone())?), false));
         }
         let chosen = if let Some(id) = answer.strip_prefix('#') {
             id.trim().parse::<i64>().ok().and_then(|id| {
@@ -988,7 +1078,7 @@ async fn project_step(
                 }
             }
         }
-        return Ok((Some(link(ui, &p, false)?), false));
+        return Ok((Some(link(ui, &p, false, dir.clone())?), false));
     }
 }
 

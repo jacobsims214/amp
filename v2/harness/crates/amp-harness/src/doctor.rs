@@ -190,6 +190,9 @@ pub struct ProjectReport {
     /// The name in `.amp.json`.
     pub marker_name: Option<String>,
     pub found: bool,
+    /// The marker was made for another server, or names another project than this server's
+    /// (#2206). `null` when it agrees.
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -528,8 +531,12 @@ async fn amp_checks(
                 ),
                 Err(_) => (false, None),
             };
-            match &fetched {
-                Ok(_) => checks.add(
+            let warning = match &fetched {
+                Ok(_) => marker.server_warning(&settings.url, name.as_deref()),
+                Err(_) => marker.server_warning(&settings.url, None),
+            };
+            match (&fetched, &warning) {
+                (Ok(_), None) => checks.add(
                     "project",
                     CheckStatus::Ok,
                     format!(
@@ -539,9 +546,27 @@ async fn amp_checks(
                         marker.path.display()
                     ),
                 ),
-                Err(e) => checks.fail(
+                (Ok(_), Some(w)) => checks.push(
                     "project",
-                    format!("#{} from {}: {e}", marker.project_id, marker.path.display()),
+                    Finding::new(CheckStatus::Warn, w.clone()).fix(format!(
+                        "if #{} is not this folder's project on {}, run `amp-harness init` here \
+                         to pick this server's project",
+                        marker.project_id,
+                        crate::setup::host_of(&settings.url)
+                    )),
+                ),
+                (Err(e), _) => checks.fail(
+                    "project",
+                    match &warning {
+                        Some(w) => format!(
+                            "#{} from {}: {e} ({w})",
+                            marker.project_id,
+                            marker.path.display()
+                        ),
+                        None => {
+                            format!("#{} from {}: {e}", marker.project_id, marker.path.display())
+                        }
+                    },
                     format!(
                         "check you can open project #{} in the AMP web UI as {}; if it is the \
                          wrong project, fix \"project_id\" in {}",
@@ -561,6 +586,7 @@ async fn amp_checks(
                 name,
                 marker_name: marker.project_name.clone(),
                 found: ok,
+                warning,
             });
         }
     }

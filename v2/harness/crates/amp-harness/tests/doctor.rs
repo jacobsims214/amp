@@ -599,3 +599,80 @@ async fn versions_report_pins_assets_and_protocol() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(text.contains(&format!("\nassets {commit}")), "{text}");
 }
+
+/// #2206: a `.amp.json` made for another server (its `amp_api`), or naming another project than
+/// this server's, is a [warn] with the way out; a marker that agrees is ok.
+#[tokio::test]
+async fn a_marker_made_for_another_server_is_a_warning() {
+    let amp = spawn(MockAmp::new(), None).await;
+    // workdir's marker: project #2 "AMP v2", amp_api https://stale.invalid.
+    let dir = workdir("doctor-foreign-marker", Some(2));
+    let marker = dir.join("project/.amp.json");
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stdout);
+    let v = out.json();
+    let want = format!(
+        ".amp.json at {} was made for https://stale.invalid; this server's #2 is \"AMP v2\"",
+        marker.display()
+    );
+    assert_eq!(status(&v, "project"), "warn");
+    assert_eq!(check(&v, "project")["detail"], want.as_str());
+    assert!(
+        fix(&v, "project").contains("run `amp-harness init` here"),
+        "{v}"
+    );
+    assert_eq!(v["project"]["warning"], want.as_str());
+    // The text report shows it as [warn] with the fix.
+    let out = run(&dir, &amp.url, &["doctor", "--offline"], &[OR_KEY]).await;
+    assert!(out.stdout.contains("[warn] project"), "{}", out.stdout);
+    assert!(out.stdout.contains(&want), "{}", out.stdout);
+
+    // Same origin, another name: still a warning.
+    let origin = amp.url.trim_end_matches("/mcp");
+    std::fs::write(
+        &marker,
+        json!({"project_id": 2, "project_name": "Somebody else's", "amp_api": origin}).to_string(),
+    )
+    .unwrap();
+    let v = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await
+    .json();
+    assert_eq!(status(&v, "project"), "warn");
+    assert!(
+        check(&v, "project")["detail"]
+            .as_str()
+            .unwrap()
+            .ends_with("names project #2 \"Somebody else's\", but this server's #2 is \"AMP v2\""),
+        "{v}"
+    );
+
+    // Made for this server (127.0.0.1 and localhost are one host) with its name: ok.
+    std::fs::write(
+        &marker,
+        json!({"project_id": 2, "project_name": "AMP v2",
+               "amp_api": origin.replace("127.0.0.1", "localhost")})
+        .to_string(),
+    )
+    .unwrap();
+    let v = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await
+    .json();
+    assert_eq!(status(&v, "project"), "ok", "{v}");
+    assert_eq!(v["project"]["warning"], Value::Null);
+}

@@ -1042,6 +1042,7 @@ mod tests {
             project_id: 2,
             project_name: Some("AMP v2".into()),
             project_code: None,
+            amp_api: None,
         };
         let text = amp_context(
             manager,
