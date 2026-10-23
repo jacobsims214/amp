@@ -127,7 +127,7 @@ func scanStory(row rowScanner, st *domain.Story) error {
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
-	performer, human_reason, ready_at, planned_at, approved_at, approved_by`
+	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for`
 
 func scanTask(row rowScanner, t *domain.Task) error {
 	return row.Scan(
@@ -137,7 +137,7 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
-		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy,
+		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor,
 	)
 }
 
@@ -258,20 +258,24 @@ func (r *Repo) RecordPlanApproval(ctx context.Context, id int, by *int) (*domain
 // approved_at = clock_timestamp() (the clock planned_at is written with),
 // approved_by = by. With asOf set it approves only while planned_at is at
 // or before asOf (the newest planned_at the person saw); it returns nil,
-// nil when that no longer holds. Callers go through the task actor
+// nil when that no longer holds. approved_for becomes whose ticket it is
+// at that moment (owner, else creator), returned with it (AMP #2218).
+// Callers go through the task actor
 // (MsgApproveTask), which keeps its copy of the ticket in step.
-func (r *Repo) ApproveTask(ctx context.Context, id int, by *int, asOf *time.Time) (*time.Time, error) {
+func (r *Repo) ApproveTask(ctx context.Context, id int, by *int, asOf *time.Time) (*time.Time, *int, error) {
 	var at time.Time
-	err := r.db.QueryRow(ctx, `UPDATE tasks SET approved_at = clock_timestamp(), approved_by = $2
+	var forUser *int
+	err := r.db.QueryRow(ctx, `UPDATE tasks SET approved_at = clock_timestamp(), approved_by = $2,
+		       approved_for = COALESCE(owner_user_id, created_by)
 		WHERE id = $1 AND ($3::timestamptz IS NULL OR planned_at <= $3::timestamptz)
-		RETURNING approved_at`, id, by, asOf).Scan(&at)
+		RETURNING approved_at, approved_for`, id, by, asOf).Scan(&at, &forUser)
 	if err == pgx.ErrNoRows {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return &at, nil
+	return &at, forUser, nil
 }
 
 // AwaitingTask is an open ticket waiting for a person to approve its plan.
@@ -624,11 +628,18 @@ func (r *Repo) SetTaskAgent(ctx context.Context, taskID int, agentID string, dis
 	return err
 }
 
-// SetTaskOwner sets (or, with nil, clears) a ticket's single owner.
-func (r *Repo) SetTaskOwner(ctx context.Context, taskID int, ownerUserID *int) error {
+// SetTaskOwner sets (or, with nil, clears) a ticket's single owner. With
+// dropApproval it also clears the ticket's plan approval in the same
+// statement (an owner change a Member made away from the person it was
+// approved for, AMP #2218).
+func (r *Repo) SetTaskOwner(ctx context.Context, taskID int, ownerUserID *int, dropApproval bool) error {
 	_, err := r.db.Exec(ctx,
-		`UPDATE tasks SET owner_user_id = $1, updated_at = NOW() WHERE id = $2`,
-		ownerUserID, taskID,
+		`UPDATE tasks SET owner_user_id = $1, updated_at = NOW(),
+		        approved_at  = CASE WHEN $3 THEN NULL ELSE approved_at END,
+		        approved_by  = CASE WHEN $3 THEN NULL ELSE approved_by END,
+		        approved_for = CASE WHEN $3 THEN NULL ELSE approved_for END
+		 WHERE id = $2`,
+		ownerUserID, taskID, dropApproval,
 	)
 	return err
 }

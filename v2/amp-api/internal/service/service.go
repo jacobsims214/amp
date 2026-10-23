@@ -260,7 +260,7 @@ func (s *Service) AssignTask(ctx context.Context, p authz.Principal, taskID int,
 		}
 	}
 
-	return s.setOwner(ctx, p, t, newOwner, requireIdle)
+	return s.setOwner(ctx, p, t, newOwner, requireIdle, lvl >= authz.Lead)
 }
 
 // openReassign retries a reassignment the strict rules refused (refusal)
@@ -294,7 +294,7 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 	if !p.HasUser() {
 		return nil, authz.BadRequest("claiming needs a signed-in AMP user")
 	}
-	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskClaim)
+	t, lvl, err := s.LoadTask(ctx, p, taskID, authz.TaskClaim)
 	if err != nil {
 		return nil, err
 	}
@@ -302,10 +302,15 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 		// Even global admins, who pass every check, don't claim taken work.
 		return nil, authz.Forbidden("task %d is owned by user %d; claiming only takes unassigned tickets, use assign to reassign it", t.ID, *t.OwnerUserID)
 	}
-	return s.setOwner(ctx, p, t, p.UserRef(), false)
+	return s.setOwner(ctx, p, t, p.UserRef(), false, lvl >= authz.Lead)
 }
 
-func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Task, newOwner *int, requireIdle bool) (*domain.Task, error) {
+// setOwner changes t's owner through its task actor. byLead (the caller is
+// a project lead or above) keeps the ticket's plan approval; anyone else's
+// change drops it when the ticket stops being the person it was approved
+// for (AMP #2218; see domain.Task.DropsApprovalOn). Handover goes through
+// AssignTask, so the same rule applies to it.
+func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Task, newOwner *int, requireIdle, byLead bool) (*domain.Task, error) {
 	pid, err := s.Registry.Get(t.ProjectID)
 	if err != nil {
 		return nil, err
@@ -316,6 +321,7 @@ func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Tas
 		ExpectOwner: t.OwnerUserID,
 		NewOwner:    newOwner,
 		RequireIdle: requireIdle,
+		ByLead:      byLead,
 		By:          p.UserRef(),
 		ByName:      p.Email,
 		ReplyCh:     replyCh,
