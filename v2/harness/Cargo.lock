@@ -95,6 +95,7 @@ dependencies = [
  "axum",
  "clap",
  "crossterm",
+ "nix",
  "rcgen",
  "rmcp",
  "rpi-agent",

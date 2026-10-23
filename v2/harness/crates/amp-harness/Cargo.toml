@@ -41,5 +41,9 @@ rcgen.workspace = true
 time.workspace = true
 tokio-rustls.workspace = true
 
+# tests/setup_ctrl_c.rs: a real pty for the setup prompts (#2227). Same version and features amp-tui uses.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", default-features = false, features = ["term"] }
+
 [lints]
 workspace = true
