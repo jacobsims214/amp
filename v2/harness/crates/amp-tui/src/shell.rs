@@ -890,12 +890,12 @@ impl Shell {
         Submit::Continue
     }
 
-    /// While the plan waits for a person's approval, re-reads it now (#2209): before the manager's
+    /// While any ticket waits for approval, re-reads the plan now (#2209, #2230): before the manager's
     /// turn, and after `/open plan`, so an approval made in the web UI shows without waiting for
     /// the next poll.
     fn refresh_pending_plan(&self) {
         if let Some(meta) = &self.meta
-            && meta.snapshot().plan_pending()
+            && meta.snapshot().plan_awaiting()
         {
             meta.refresh(Topics::PLAN);
         }

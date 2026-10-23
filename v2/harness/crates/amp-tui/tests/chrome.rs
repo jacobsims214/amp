@@ -122,9 +122,11 @@ fn plain_layout_at_80_and_160() {
         narrow[1],
         "■ In progress #2106 M3-3 Header and AMP status line                ▌ AMP Harness"
     );
+    // The workers count is dropped; `unreported #id` (dropped before it) still fits, with the
+    // three-cell gap, so it stays (#2230).
     assert_eq!(
         narrow[2],
-        "■  2 QUESTIONS  │ plan: 2 waiting for your approval"
+        "■  2 QUESTIONS  │ plan: 2 waiting for your approval             unreported #2106"
     );
     assert!(
         wide[2].contains("│ workers 1 ■ running · 1 queued │ plan: 2 waiting for your approval │")
@@ -611,4 +613,63 @@ fn plan_chip_counts_yours_apart_from_others() {
         "{only_yours}"
     );
     assert!(!only_yours.contains("others'"), "{only_yours}");
+}
+
+/// #2230 (QA pass 2): at 80 columns with 1 of yours + 1 others' awaiting, the others' chip (rank
+/// 7) has to go, but the board's `□ 1 Ready` (rank 10) fits in what is left and stays. Every width
+/// still fits, and a dropped chip never comes back wider than the line.
+#[test]
+fn a_chip_that_fits_after_a_wider_one_was_dropped_is_kept() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let mut meta = sample::meta(false);
+    let plan = meta.plan.value.as_mut().unwrap();
+    plan.awaiting_approval = vec![196, 197];
+    plan.tickets = Some(vec![
+        amp_core::meta::AwaitingTicket {
+            task_id: 196,
+            owner_user_id: Some(7),
+            yours: true,
+        },
+        amp_core::meta::AwaitingTicket {
+            task_id: 197,
+            owner_user_id: Some(9),
+            yours: false,
+        },
+    ]);
+    let board = meta.board.value.as_mut().unwrap();
+    board.in_progress = 0;
+    board.ready = 1;
+    board.question = 0;
+    board.scheduled = 0;
+    board.questions.clear();
+    board.in_progress_tickets.clear();
+    let data = ChromeData::new(meta);
+    let status = |w| plain(&render_status(&data, &palette(), w)[0]);
+
+    let wide = status(200);
+    assert!(
+        wide.contains(
+            "workers 0 │ plan: 1 of yours waiting for your approval │ 1 others' waiting for their owners │ □ 1 Ready"
+        ),
+        "{wide}"
+    );
+    assert_eq!(
+        status(80),
+        "workers 0 │ plan: 1 of yours waiting for your approval │ □ 1 Ready"
+    );
+    for w in 10..=220 {
+        let line = status(w);
+        assert!(visible_width(&line) <= w, "{w}: {line}");
+    }
+
+    // `■ 3 In progress` doesn't fit at 70 but `□ 1 Ready` does: it comes back after a bar, not
+    // a dot, since the count it followed is gone.
+    let mut meta = data.meta.as_ref().clone();
+    meta.board.value.as_mut().unwrap().in_progress = 3;
+    let data = ChromeData::new(meta);
+    let line = plain(&render_status(&data, &palette(), 70)[0]);
+    assert_eq!(
+        line,
+        "workers 0 │ plan: 1 of yours waiting for your approval │ □ 1 Ready"
+    );
 }
