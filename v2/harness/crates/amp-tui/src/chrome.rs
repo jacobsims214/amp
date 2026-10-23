@@ -28,13 +28,15 @@
 //! without control characters ([`link`]).
 //!
 //! When a line is too wide, segments are dropped by rank (the board counts first, the questions
-//! chip and the ticket id never); only the ticket name is shortened, as plain text before it is
+//! chip and the ticket id never); on the status line a dropped chip that still fits in what is
+//! left comes back (#2230). Only the ticket name is shortened, as plain text before it is
 //! styled, so a cut never lands inside an escape sequence or a link. An item whose last refresh
 //! failed keeps its last value, drawn dimmed. Without a metadata source both components render no
 //! lines at all.
 
 use std::{
     any::Any,
+    borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
@@ -387,11 +389,11 @@ impl Seg {
 }
 
 /// The lead actually drawn before `segs[i]` (`None` for the first).
-fn lead_of(segs: &[Seg], i: usize) -> Option<Lead> {
+fn lead_of<S: Borrow<Seg>>(segs: &[S], i: usize) -> Option<Lead> {
     match i {
         0 => None,
-        _ if segs[i - 1].then_space => Some(Lead::Space),
-        _ => Some(segs[i].lead),
+        _ if segs[i - 1].borrow().then_space => Some(Lead::Space),
+        _ => Some(segs[i].borrow().lead),
     }
 }
 
@@ -427,10 +429,10 @@ impl Style {
     }
 }
 
-fn side_width(style: &Style, segs: &[Seg]) -> usize {
+fn side_width<S: Borrow<Seg>>(style: &Style, segs: &[S]) -> usize {
     segs.iter()
         .enumerate()
-        .map(|(i, s)| s.width + lead_of(segs, i).map_or(0, |l| style.lead(l).1))
+        .map(|(i, s)| s.borrow().width + lead_of(segs, i).map_or(0, |l| style.lead(l).1))
         .sum()
 }
 
@@ -438,7 +440,7 @@ fn side_width(style: &Style, segs: &[Seg]) -> usize {
 /// as one phrase (#2148). When they don't fit with this gap, `fit` drops segments by rank.
 pub const MIN_GAP: usize = 3;
 
-fn line_width(style: &Style, left: &[Seg], right: &[Seg]) -> usize {
+fn line_width<S: Borrow<Seg>>(style: &Style, left: &[S], right: &[S]) -> usize {
     let (l, r) = (side_width(style, left), side_width(style, right));
     if right.is_empty() {
         l
@@ -449,26 +451,37 @@ fn line_width(style: &Style, left: &[Seg], right: &[Seg]) -> usize {
     }
 }
 
-/// Drops the highest-ranked segment (the rightmost of equal rank). False when none can go.
-fn drop_one(left: &mut Vec<Seg>, right: &mut Vec<Seg>) -> bool {
-    let best = left
-        .iter()
+/// The highest-ranked droppable segment of `left` (`false`) or `right` (`true`), the rightmost of
+/// equal rank.
+fn worst(left: &[(usize, Seg)], right: &[(usize, Seg)]) -> Option<(bool, usize)> {
+    left.iter()
         .enumerate()
-        .map(|(i, s)| (s.rank, false, i))
-        .chain(right.iter().enumerate().map(|(i, s)| (s.rank, true, i)))
+        .map(|(i, (_, s))| (s.rank, false, i))
+        .chain(
+            right
+                .iter()
+                .enumerate()
+                .map(|(i, (_, s))| (s.rank, true, i)),
+        )
         .filter(|(rank, _, _)| *rank > 0)
-        .max_by_key(|(rank, on_right, i)| (*rank, *on_right, *i));
-    match best {
-        Some((_, true, i)) => {
-            right.remove(i);
-            true
-        }
-        Some((_, false, i)) => {
-            left.remove(i);
-            true
-        }
-        None => false,
+        .max_by_key(|(rank, on_right, i)| (*rank, *on_right, *i))
+        .map(|(_, on_right, i)| (on_right, i))
+}
+
+fn segs(side: &[(usize, Seg)]) -> Vec<&Seg> {
+    side.iter().map(|(_, s)| s).collect()
+}
+
+/// Puts `seg` back at its place (by original index) in `side`. A `·`-led segment whose original
+/// predecessor is gone leads with the bar: it starts a group of its own (#2230: `□ 1 Ready` kept
+/// after `■ 1 In progress` was dropped).
+fn restore(side: &mut Vec<(usize, Seg)>, at: usize, mut seg: Seg) {
+    let pos = side.partition_point(|(i, _)| *i < at);
+    let follows_its_own = pos > 0 && side[pos - 1].0 + 1 == at;
+    if matches!(seg.lead, Lead::Dot) && !follows_its_own {
+        seg.lead = Lead::Bar;
     }
+    side.insert(pos, (at, seg));
 }
 
 fn join(style: &Style, segs: &[Seg]) -> String {
@@ -484,12 +497,51 @@ fn join(style: &Style, segs: &[Seg]) -> String {
 
 /// Lays `left` and right-aligned `right` out in `width` cells, dropping segments by rank until
 /// they fit. The result is never wider than `width`.
-fn fit(style: &Style, mut left: Vec<Seg>, mut right: Vec<Seg>, width: usize) -> String {
-    while line_width(style, &left, &right) > width {
-        if !drop_one(&mut left, &mut right) {
+fn fit(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> String {
+    fit_with(style, left, right, width, false)
+}
+
+/// [`fit`], then each dropped segment, most important (lowest rank) first, comes back if it still
+/// fits in what is left. The status line's chips are independent facts, so a narrow one outlasts
+/// a wide one of higher priority that had to go (#2230: `□ 1 Ready` after the others' plan chip
+/// was dropped). The header keeps plain drop order: its segments read as one phrase.
+fn fit_keeping(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> String {
+    fit_with(style, left, right, width, true)
+}
+
+fn fit_with(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize, keep: bool) -> String {
+    let mut l: Vec<(usize, Seg)> = left.into_iter().enumerate().collect();
+    let mut r: Vec<(usize, Seg)> = right.into_iter().enumerate().collect();
+    let width_of = |l: &[(usize, Seg)], r: &[(usize, Seg)]| {
+        let (ls, rs) = (segs(l), segs(r));
+        line_width(style, &ls, &rs)
+    };
+    let mut dropped: Vec<(bool, usize, Seg)> = Vec::new();
+    while width_of(&l, &r) > width {
+        let Some((on_right, i)) = worst(&l, &r) else {
             break;
+        };
+        let (at, seg) = if on_right { r.remove(i) } else { l.remove(i) };
+        dropped.push((on_right, at, seg));
+    }
+    if keep && !dropped.is_empty() && width_of(&l, &r) <= width {
+        // Lowest rank first; on equal ranks the left side, then the leftmost.
+        dropped.sort_by_key(|(on_right, at, s)| (s.rank, *on_right, *at));
+        for (on_right, at, seg) in dropped {
+            let side = if on_right { &mut r } else { &mut l };
+            restore(side, at, seg);
+            if width_of(&l, &r) > width {
+                let side = if on_right { &mut r } else { &mut l };
+                let pos = side
+                    .iter()
+                    .position(|(i, _)| *i == at)
+                    .expect("just restored");
+                side.remove(pos);
+            }
         }
     }
+    let left: Vec<Seg> = l.into_iter().map(|(_, s)| s).collect();
+    let right: Vec<Seg> = r.into_iter().map(|(_, s)| s).collect();
     let used = line_width(style, &left, &right);
     if used > width {
         // Only unbreakable segments are left and they still don't fit: plain text, cut.
@@ -854,7 +906,7 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
     }
 
     let right: Vec<Seg> = report_seg(&style, data).into_iter().collect();
-    vec![fit(&style, left, right, width)]
+    vec![fit_keeping(&style, left, right, width)]
 }
 
 /// `workers 1 ■ running · 1 queued · 1 ■ question`: the workers **this chat** runs (its

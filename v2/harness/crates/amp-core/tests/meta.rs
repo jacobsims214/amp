@@ -73,6 +73,8 @@ struct Mock {
     requests: Arc<AtomicU64>,
     /// The plan was approved (in the web UI): `amp_check_plan` reports nothing awaiting.
     approved: Arc<AtomicBool>,
+    /// The awaiting tickets are someone else's (#2198 per-ticket answer, `yours: false`).
+    others: Arc<AtomicBool>,
 }
 
 impl Mock {
@@ -85,6 +87,7 @@ impl Mock {
             unauthorized: Arc::default(),
             requests: Arc::default(),
             approved: Arc::default(),
+            others: Arc::default(),
         }
     }
 
@@ -228,17 +231,28 @@ impl ServerHandler for Mock {
                     {"id": 393, "name": "M3 theme + metadata", "state": "active", "tickets": {}}
                 ]}
             ]})),
-            "amp_check_plan" => ok(json!({
-                "ok": true,
-                "awaiting_approval": if self.approved.load(Ordering::SeqCst) {
-                    json!([])
+            "amp_check_plan" => {
+                let awaiting: Vec<i64> = if self.approved.load(Ordering::SeqCst) {
+                    vec![]
                 } else {
-                    json!([2105, 2106])
-                },
+                    vec![2105, 2106]
+                };
+                let mut plan = json!({
+                "ok": true,
+                "awaiting_approval": awaiting,
                 "require_plan_approval": board.require_plan_approval, "tasks": 40,
                 "open_tasks": 10, "dependencies": 30, "ready_now": [], "longest_chain": 5,
                 "issues": [], "human_gates": [], "summary": "GO"
-            })),
+                });
+                if self.others.load(Ordering::SeqCst) {
+                    plan["awaiting_approval_tickets"] = awaiting
+                        .iter()
+                        .map(|id| json!({"task_id": id, "owner_user_id": 9, "yours": false}))
+                        .collect();
+                    plan["awaiting_yours"] = json!([]);
+                }
+                ok(plan)
+            }
             "amp_list_artifacts" => ok(json!({"artifacts": [
                 {"id": 3, "project_id": 2, "task_id": args["task_id"], "title": "Header mock",
                  "kind": "html", "status": board.artifact_status, "current_version": 2}
@@ -443,6 +457,48 @@ async fn loads_every_item_on_start_and_polls_on_the_intervals() {
     assert_eq!(server.mock.count("amp_get_project"), 1);
     assert_eq!(server.mock.count("amp_get_plan"), 1);
     assert!(meta.snapshot().revision > m.revision);
+}
+
+/// #2230: only others' tickets wait, and a lead approves them on their owners' behalf. The others'
+/// chip clears on the fast `plan_pending` poll too, not after the 60 s plan poll.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_on_behalf_approval_clears_the_others_chip_on_the_fast_poll() {
+    let mock = Mock::new(default_board());
+    mock.others.store(true, Ordering::SeqCst);
+    let server = serve(mock).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: None,
+            intervals: Intervals {
+                plan: Duration::from_secs(60),
+                plan_pending: Duration::from_millis(150),
+                ..fast(150)
+            },
+            connector: None,
+            web_url: None,
+        },
+    );
+    let m = wait_for(&meta, "others' tickets waiting", |m| m.plan_awaiting()).await;
+    let plan = m.plan.get().unwrap();
+    assert_eq!((plan.yours(), plan.others()), (vec![], vec![2105, 2106]));
+    assert!(!m.plan_pending(), "none of them are yours");
+    wait_calls(&server.mock, "a fast plan poll", |m| {
+        m.count("amp_check_plan") >= 3
+    })
+    .await;
+
+    // A lead approves on the owners' behalf; nothing tells this harness.
+    server.mock.approved.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let m = wait_for(&meta, "the others' chip to clear", |m| !m.plan_awaiting()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cleared after {:?}",
+        started.elapsed()
+    );
+    assert!(m.plan.get().unwrap().others().is_empty());
 }
 
 /// #2209: approving in the web UI clears the "waiting for your approval" chip on the fast
