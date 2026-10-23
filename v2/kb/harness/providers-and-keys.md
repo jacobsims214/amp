@@ -47,7 +47,7 @@ config.toml.
 
 ```sh
 amp-harness connect example --base-url api.example.com --name "Example AI" \
-  --role manager=orchestrator --role workers=engineer --role reviewers=orchestrator
+  --role manager=orchestrator --role workers=engineer
 ```
 
 `api.example.com` becomes `https://api.example.com/v1`. The models come from the endpoint's own
@@ -55,6 +55,10 @@ list (or `--model ID`, repeatable). Non-secret headers go in `--header NAME=VALU
 header (an `Authorization` or `X-Api-Key` value) is refused there, because other processes can
 read command arguments. Add it in a terminal instead, where it goes to the keychain. The full
 walkthrough, including the first run and org presets, is `harness/enterprise-provider.md`.
+
+To change an endpoint you added, run `connect example` again with just the flags to change (for
+example `--ca-file corp.pem` or `--header X-Team=blue`). Only those settings change. Its models,
+including ones added with `models set --no-check`, stay, and `connect` prints what changed.
 
 How the endpoint authenticates (`--auth`, or the first run's question):
 

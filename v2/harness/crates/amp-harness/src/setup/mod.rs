@@ -240,6 +240,12 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
     let mut ui = ui::detect(!args.yes);
     // #2275: an org preset goes into config.toml first; its server is tried by the server step.
     let mut conn_args = args.conn.clone();
+    // #2307: `--url` takes what `server set` takes (`localhost:18000`, `amp.example.com`, a full
+    // URL), through the same normalisation as `server set` and a preset's `server.url`.
+    if let Some(url) = &args.conn.url {
+        conn_args.url =
+            Some(normalize_server_url(url).map_err(|e| CliError::usage(format!("--url: {e}")))?);
+    }
     let mut applied = None;
     let mut preset_web = None;
     if let Some(source) = &args.preset {

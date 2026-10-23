@@ -376,17 +376,35 @@ async fn connect_maps_models_per_role() {
         "{}",
         config(&dir)
     );
-    assert_mapping(&role_models(&env).await, "example/engineer");
+    // #2307: the same mapping as the first run: the reviewers follow the manager.
+    assert_mapping(&role_models(&env).await, "example/orchestrator");
 
-    // Only the roles: it has its key (env), so nothing is asked.
+    // Only the roles: it has its key (env), so nothing is asked; the roles not named keep their
+    // models on this provider.
     let out = env
         .run(
-            &["connect", "example", "--role", "reviewers=orchestrator"],
+            &["connect", "example", "--role", "reviewers=engineer"],
             None,
         )
         .await;
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
     assert!(out.stdout.contains("mapped the roles"), "{}", out.stdout);
+    assert_mapping(&role_models(&env).await, "example/engineer");
+    // Naming the manager again brings the reviewers with it, as the first run would.
+    let out = env
+        .run(
+            &[
+                "connect",
+                "example",
+                "--role",
+                "manager=orchestrator",
+                "--role",
+                "worker=engineer",
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
     assert_mapping(&role_models(&env).await, "example/orchestrator");
 
     let out = env.run(&["run", "-p", "hello", "--json"], None).await;
@@ -400,6 +418,138 @@ async fn connect_maps_models_per_role() {
         "{:?}",
         endpoint.seen()
     );
+    no_secret(&out, &dir);
+    assert_nothing_left_the_machine(&guard);
+}
+
+/// #2307: re-running `connect` on a custom provider (to add a header, an org, a CA...) merges
+/// into its table: only the given settings change; models added with `models set --no-check`,
+/// timeouts and comments stay; the output says what changed.
+#[tokio::test]
+async fn reconnect_merges_into_the_provider_table() {
+    let guard = spawn_proxy_guard().await;
+    let endpoint = example_endpoint(Some(KEY)).await;
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("enterprise-reconnect", None);
+    let env = Env::new(&dir, &guard)
+        .var("EXAMPLE_API_KEY", KEY)
+        .var("AMP_MCP_URL", amp.url.clone());
+    let host = endpoint.url.trim_end_matches("/v1").to_owned();
+    let out = env
+        .run(
+            &[
+                "connect",
+                "example",
+                "--base-url",
+                &host,
+                "--name",
+                "Example AI",
+                "--role",
+                "manager=orchestrator",
+                "--role",
+                "worker=engineer",
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    // A model the endpoint doesn't list, and a setting connect doesn't write.
+    let out = env
+        .run(
+            &[
+                "models",
+                "set",
+                "researcher",
+                "example/private-mini",
+                "--no-check",
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let text = config(&dir).replace(
+        "[providers.example]\n",
+        "[providers.example]\n# my note\nrequest_timeout_secs = 600\n",
+    );
+    write_config(&dir, &text);
+    assert!(config(&dir).contains("[providers.example.models.private-mini]"));
+
+    let out = env
+        .run(
+            &[
+                "connect",
+                "example",
+                "--organization",
+                "acme",
+                "--header",
+                "X-Team=blue",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let v = out.json();
+    let changed: Vec<String> = v["changed"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no changed in {v}"))
+        .iter()
+        .map(|c| c.as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        changed,
+        vec![
+            "headers = { X-Team = \"blue\" }".to_owned(),
+            "organization = \"acme\"".to_owned()
+        ],
+        "{v}"
+    );
+    no_secret(&out, &dir);
+    let text = config(&dir);
+    for want in [
+        "[providers.example.models.private-mini]",
+        "[providers.example.models.\"engineer\"]",
+        "[providers.example.models.\"orchestrator\"]",
+        "request_timeout_secs = 600",
+        "# my note",
+        "name = \"Example AI\"",
+        "organization = \"acme\"",
+        "key_env = \"EXAMPLE_API_KEY\"",
+        "Added by `amp-harness connect`",
+    ] {
+        assert!(text.contains(want), "missing {want:?}:\n{text}");
+    }
+    assert_eq!(
+        role_models(&env).await["researcher"],
+        "example/private-mini"
+    );
+
+    // People see what changed; nothing changed the second time.
+    let out = env
+        .run(&["connect", "example", "--organization", "acme"], None)
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("[providers.example] is unchanged"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("its 3 models"), "{}", out.stderr);
+    let out = env
+        .run(&["connect", "example", "--proxy", "direct"], None)
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr.contains("Updated [providers.example]"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("proxy = \"direct\""), "{}", out.stderr);
+    assert!(config(&dir).contains("[providers.example.models.private-mini]"));
+
+    // The endpoint saw the new organization header.
+    let out = env.run(&["run", "-p", "hello", "--json"], None).await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
     no_secret(&out, &dir);
     assert_nothing_left_the_machine(&guard);
 }

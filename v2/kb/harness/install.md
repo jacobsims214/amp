@@ -80,7 +80,7 @@ Running plain `amp-harness` in a new terminal does the same first run before the
 For scripts, everything has a flag (`amp-harness setup --help`): `--url`, `--project ID` or
 `--create NAME`, `--no-project`, `--key-env VAR`, `--profile NAME`, `--preset FILE|URL`,
 `--yes` (never ask) and `--json`. With `--yes` and no `--login`, setup doesn't open a browser.
-`--url` must be a full URL here (`https://amp.example.com/mcp`).
+`--url` takes the same forms as `server set`: `amp.example.com`, `localhost:18000` or a full URL.
 
 ## Check it
 

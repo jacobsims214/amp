@@ -129,12 +129,11 @@ One command adds the endpoint, asks for your key (hidden) and moves every role o
 
 ```sh
 amp-harness connect example --base-url api.example.com --name "Example AI" \
-  --role manager=orchestrator --role workers=engineer --role reviewers=orchestrator
+  --role manager=orchestrator --role workers=engineer
 ```
 
-- Name the reviewers too. Any role you don't name goes to the workers' model, so without
-  `--role reviewers=orchestrator` the reviewers would run on `engineer`. (The first run and
-  org presets put the reviewers on `orchestrator` by themselves.)
+- You get the same mapping as the first run. The reviewers follow the manager onto
+  `orchestrator`, and the helpers follow the workers onto `engineer`.
 - The roles and models are checked before anything is saved. A typo stores nothing.
 - The output shows the new mapping per group and per role.
 
@@ -153,7 +152,7 @@ amp-harness connect example --role helpers=orchestrator
 ```
 
 **In the chat** you can do the same without leaving it:
-`/connect example api.example.com manager=orchestrator workers=engineer reviewers=orchestrator`.
+`/connect example api.example.com manager=orchestrator workers=engineer`.
 Workers started from then on use the new models, and `/model` switches the chat itself.
 
 **Scripts and CI:** `printf '%s\n' "$KEY" | amp-harness connect example … --key-stdin`. Or set
@@ -312,6 +311,10 @@ Look for your provider and every role on it, and the endpoint check:
 
 `doctor`'s `models:example` line names the fix for most of these.
 
+Running `connect example` again with endpoint flags (`--ca-file`, `--header`, `--auth`, `--proxy`
+and so on) changes only what you give. The provider's models (including ones added with `models
+set --no-check`) and its other settings stay, and `connect` prints what changed.
+
 **TLS / a corporate CA.** "unknown CA" or a certificate error means the endpoint uses your
 company's certificate authority. Give the CA bundle once:
 `amp-harness connect example --ca-file /etc/ssl/corp-root.pem`. In a preset, put
@@ -353,8 +356,8 @@ Use https wherever the key crosses a network.
 - Run `amp-harness models list` and read the SOURCE column. A `[roles.<role>]` in your config
   from earlier is replaced by `connect --role`, but a repo's `.amp/harness/config.toml` can still
   set one.
-- `amp-harness connect example --role all=engineer --role manager=orchestrator --role reviewers=orchestrator`
-  puts every role on the endpoint.
+- `amp-harness connect example --role manager=orchestrator --role workers=engineer` puts every
+  role on the endpoint.
 
 **The key isn't kept.** On a machine with no keychain (`AMP_CREDENTIAL_STORE=file`, a headless
 Linux box), keys are never written to a file. Set `EXAMPLE_API_KEY` in the environment instead.
