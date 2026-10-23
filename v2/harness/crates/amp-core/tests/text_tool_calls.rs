@@ -518,3 +518,118 @@ async fn a_parsed_text_call_goes_through_the_tool_policy() {
         Some(AgentMessage::Assistant(a)) if a.stop_reason == StopReason::Stop
     ));
 }
+
+#[tokio::test]
+async fn a_structured_call_with_no_name_gives_way_to_the_text_call() {
+    // #2203: OpenRouter/MiMo streamed an empty `tool_calls` entry next to the text call. It is not
+    // a real structured call, so the text call is parsed in its place.
+    let (p, model) = provider(vec![vec![
+        Block::Text(chunks(
+            "before.\n<tool_call>{\"name\":\"amp_list_tasks\",\"arguments\":{}}</tool_call> after",
+            5,
+        )),
+        Block::Call("", "", json!({})),
+    ]]);
+    let seen = stream(&p, &model, vec![tool("amp_list_tasks", json!({}))]).await;
+    assert_no_markup(&seen);
+    let calls = calls(&seen.message);
+    assert_eq!(calls.len(), 1, "{:?}", seen.message.content);
+    assert_eq!(calls[0].name, "amp_list_tasks");
+    assert!(calls[0].id.starts_with("call_text_"));
+    assert_eq!(seen.message.stop_reason, StopReason::ToolUse);
+}
+
+#[tokio::test]
+async fn a_named_call_with_no_id_gets_one_and_an_empty_call_alone_ends_the_turn() {
+    let (p, model) = provider(vec![
+        vec![Block::Call("", "ls", json!({"path": "/x"}))],
+        vec![
+            Block::Text(vec!["nothing to call"]),
+            Block::Call("", "", json!({})),
+        ],
+    ]);
+    let tools = vec![tool("ls", json!({"path": {"type": "string"}}))];
+    let seen = stream(&p, &model, tools.clone()).await;
+    let named = calls(&seen.message);
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].name, "ls");
+    assert!(named[0].id.starts_with("call_amp_"), "{}", named[0].id);
+    assert_eq!(seen.message.stop_reason, StopReason::ToolUse);
+
+    let seen = stream(&p, &model, tools).await;
+    assert!(
+        calls(&seen.message).is_empty(),
+        "{:?}",
+        seen.message.content
+    );
+    assert_eq!(seen.message.stop_reason, StopReason::Stop);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_call_never_yields_an_empty_id_result_and_the_turn_ends() {
+    // #2203 through the agent loop on the faux-style provider: an empty-id/empty-name call next to
+    // text, then a normal turn. No tool result may carry an empty id (OpenRouter refuses the whole
+    // session after one), and the loop ends normally.
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let tools = vec![recorder("amp_list_tasks", json!({}), &ran)];
+    let (p, model) = provider(vec![
+        vec![
+            Block::Text(vec!["before.\n after"]),
+            Block::Call("", "", json!({})),
+        ],
+        vec![Block::Text(vec!["ok"])],
+    ]);
+    let stream_fn = rpi_agent::stream_fn(move |model, ctx, opts| {
+        let (mut producer, stream) = create_assistant_message_event_stream();
+        let (p, model, ctx, opts) = (Arc::clone(&p), model.clone(), ctx.clone(), opts.clone());
+        tokio::spawn(async move {
+            let mut s = p.stream_simple(&model, &ctx, &opts).await;
+            while let Some(event) = s.next().await {
+                producer.push(event);
+            }
+        });
+        stream
+    });
+    let allow: rpi_agent::BeforeToolCall = Arc::new(|_, _| Box::pin(async { None }));
+    let mut session = Vec::new();
+    for text in ["go", "Say ok."] {
+        let context = AgentContext {
+            system_prompt: String::new(),
+            messages: session.clone(),
+            tools: tools.clone(),
+        };
+        let prompt = AgentMessage::User(UserMessage::new(UserContent::Text(text.into()), 0));
+        let (collector, _events) = rpi_agent::CollectorEmitter::new();
+        let new = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            rpi_agent::run_agent_loop(
+                vec![prompt],
+                context,
+                loop_config(model.clone(), Arc::clone(&allow)),
+                Arc::new(collector),
+                stream_fn.clone(),
+            ),
+        )
+        .await
+        .expect("the loop finished")
+        .unwrap();
+        session.extend(new);
+    }
+    assert!(ran.lock().unwrap().is_empty());
+    assert!(
+        !session
+            .iter()
+            .any(|m| matches!(m, AgentMessage::ToolResult(_))),
+        "{session:?}"
+    );
+    let finals: Vec<_> = session
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Assistant(a) => Some(a),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(finals.len(), 2);
+    assert!(finals.iter().all(|a| a.stop_reason == StopReason::Stop));
+    assert!(calls(finals[0]).is_empty());
+}
