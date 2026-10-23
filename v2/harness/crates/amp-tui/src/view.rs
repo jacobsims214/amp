@@ -77,10 +77,28 @@ pub struct FooterInfo {
     pub session_name: Option<String>,
 }
 
+/// What [`ChatView::show_session`] swaps in to show a worker's session (#2252): its
+/// transcript (in the main scroll view), the bar above it, and the keys line in the editor's
+/// place.
+#[derive(Clone)]
+pub struct SessionParts {
+    pub transcript: Arc<dyn Component>,
+    pub bar: Arc<dyn Component>,
+    pub keys: Arc<dyn Component>,
+}
+
 /// The chat screen's components and transcript state.
 pub struct ChatView {
     header: Arc<Container>,
     transcript: Arc<Container>,
+    /// Holds the transcript, or a worker's while its session is shown (#2252).
+    transcript_slot: Arc<Container>,
+    /// The worker session's bar, under the header (empty: 0 lines).
+    session_slot: Arc<Container>,
+    /// Holds the editor, or the session's keys line.
+    editor_slot: Arc<Container>,
+    editor_view: Arc<dyn Component>,
+    session_shown: std::sync::atomic::AtomicBool,
     status: Arc<Container>,
     editor: Arc<Editor>,
     amp_status: Arc<Container>,
@@ -137,8 +155,12 @@ impl ChatView {
         let header = Arc::new(Container::new());
         header.add_child(chrome.header());
         let transcript = Arc::new(Container::new());
-        let scroll =
-            TranscriptScroll::new(Arc::new(ScrollView::primary(inset(transcript.clone()))));
+        let transcript_slot = Arc::new(Container::new());
+        transcript_slot.add_child(transcript.clone());
+        let scroll = TranscriptScroll::new(Arc::new(ScrollView::primary(inset(
+            transcript_slot.clone(),
+        ))));
+        let session_slot = Arc::new(Container::new());
         let status = Arc::new(Container::new());
         let panel = Panel::new(chrome.clone());
         let panel_slot = Arc::new(Container::new());
@@ -154,16 +176,18 @@ impl ChatView {
         menu_slot.add_child(Arc::new(menu.clone()));
         let hint = Arc::new(Mutex::new(None));
         let editor_slot = Arc::new(Container::new());
-        editor_slot.add_child(Arc::new(EditorView {
+        let editor_view: Arc<dyn Component> = Arc::new(EditorView {
             editor: editor.clone(),
             hint: Arc::clone(&hint),
-        }));
+        });
+        editor_slot.add_child(editor_view.clone());
         let amp_status = Arc::new(Container::new());
         amp_status.add_child(chrome.status_line());
         let footer = Arc::new(Footer::new());
 
         let root = VStack::from_children(vec![
             StackChild::Entry(StackEntry::new(inset(header.clone())).shrink(0)),
+            StackChild::Entry(StackEntry::new(inset(session_slot.clone())).shrink(0)),
             StackChild::Entry(
                 StackEntry::new(scroll.view().clone())
                     .basis(0)
@@ -174,13 +198,22 @@ impl ChatView {
             StackChild::Entry(StackEntry::new(inset(status.clone()))),
             StackChild::Entry(StackEntry::new(inset(panel_slot)).shrink(1)),
             StackChild::Entry(StackEntry::new(inset(menu_slot)).shrink(1)),
-            StackChild::Entry(StackEntry::new(inset(editor_slot)).shrink(0).min_size(3)),
+            StackChild::Entry(
+                StackEntry::new(inset(editor_slot.clone()))
+                    .shrink(0)
+                    .min_size(3),
+            ),
             StackChild::Entry(StackEntry::new(inset(amp_status.clone())).shrink(0)),
             StackChild::Entry(StackEntry::new(inset(footer.clone()))),
         ]);
         Self {
             header,
             transcript,
+            transcript_slot,
+            session_slot,
+            editor_slot,
+            editor_view,
+            session_shown: std::sync::atomic::AtomicBool::new(false),
             status,
             editor,
             amp_status,
@@ -202,6 +235,41 @@ impl ChatView {
             hint,
             padding,
         }
+    }
+
+    /// Shows a worker's session in place of the manager's transcript and editor (#2252), or
+    /// (`None`) the manager again. The transcript jumps to its latest output either way.
+    pub fn show_session(&self, session: Option<SessionParts>) {
+        self.transcript_slot.clear();
+        self.session_slot.clear();
+        self.editor_slot.clear();
+        match session {
+            Some(parts) => {
+                self.transcript_slot.add_child(parts.transcript);
+                self.session_slot.add_child(parts.bar);
+                self.editor_slot.add_child(parts.keys);
+            }
+            None => {
+                self.transcript_slot.add_child(self.transcript.clone());
+                self.editor_slot.add_child(self.editor_view.clone());
+            }
+        }
+        self.session_shown.store(
+            !self.session_slot.get_children().is_empty(),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.root.invalidate();
+        self.scroll.to_end();
+    }
+
+    /// Whether a worker's session is shown.
+    pub fn session_shown(&self) -> bool {
+        self.session_shown.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// This view's transcript, for showing it inside another view ([`SessionParts`]).
+    pub fn transcript_component(&self) -> Arc<dyn Component> {
+        self.transcript.clone()
     }
 
     /// Columns of space left and right of every area (`[tui] padding`, #2251; at most

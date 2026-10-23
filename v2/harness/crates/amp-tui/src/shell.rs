@@ -75,6 +75,7 @@ use crate::amp_render::{self, ApprovalNotice};
 use crate::overlay::{self, ModelRow, PanelKind, PanelState, Stage, Target};
 use crate::slash::MenuKey;
 use crate::view::{ChatView, FooterInfo};
+use crate::workers::{SessionView, Source, stop_question};
 
 /// Opens a URL in the browser (default: login's guarded opener; tests record instead).
 pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -403,6 +404,14 @@ pub struct Shell {
     /// Whether the terminal reports the mouse to us (wheel scrolling, the pill's click). Off,
     /// the terminal's own click-drag selection works without a modifier (`[tui] mouse`, #2185).
     mouse_capture: bool,
+    /// Worker sessions opened from the chat (#2252), by ticket.
+    sessions: std::collections::BTreeMap<i64, SessionView>,
+    /// The worker session shown instead of the manager's transcript.
+    viewing: Option<i64>,
+    /// A stop waiting for its `y` (#2252).
+    stop_confirm: Option<i64>,
+    /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
+    person: Option<String>,
 }
 
 impl Shell {
@@ -449,6 +458,10 @@ impl Shell {
                 quit_confirm_until: None,
                 released: Vec::new(),
                 mouse_capture: true,
+                sessions: Default::default(),
+                viewing: None,
+                stop_confirm: None,
+                person: None,
             },
             done_rx,
         )
@@ -483,12 +496,18 @@ impl Shell {
 
     /// Ctrl+T: expands or collapses the last thinking section. Returns whether there was one.
     pub fn toggle_thinking(&mut self) -> bool {
+        if let Some(s) = self.shown_session() {
+            return s.view().toggle_thinking().is_some();
+        }
         self.view.toggle_thinking().is_some()
     }
 
     /// Ctrl+O: shows or hides every tool call's arguments and result (#2183, pi's
     /// `app.tools.expand`). Returns whether they are now shown.
     pub fn toggle_tools(&mut self) -> bool {
+        if let Some(s) = self.shown_session() {
+            return s.view().toggle_tools();
+        }
         self.view.toggle_tools()
     }
 
@@ -1035,6 +1054,20 @@ impl Shell {
     /// Esc that closes a panel during a run doesn't stop it: the spinner line says
     /// [`ESC_HINT`] for [`ESC_HINT_FOR`], and the next Esc stops the reply (#2181).
     pub async fn key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
+        // #2252: a stop waiting for its answer takes the next key; a worker's session takes
+        // every key while it is shown (the editor is hidden).
+        if self.stop_confirm.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    let _ = self.confirm_stop();
+                }
+                _ => self.cancel_stop(),
+            }
+            return true;
+        }
+        if self.viewing.is_some() {
+            return self.session_key(key);
+        }
         let is_esc = key.code == KeyCode::Esc
             && !key
                 .modifiers
@@ -1228,6 +1261,7 @@ impl Shell {
             "abort" => self.abort().await,
             "amp" => self.open_panel("amp", PanelKind::Amp),
             "workers" => self.open_panel("workers", PanelKind::Workers),
+            "worker" => self.worker_command(arg),
             "questions" => self.open_panel("questions", PanelKind::Questions),
             "ticket" => self.ticket_command(arg),
             "project" => self.project_command(arg),
@@ -1541,12 +1575,25 @@ impl Shell {
                             panel.close();
                             self.pending_model = Some(reference);
                         }
+                        // #2252: Enter on a worker opens its session (o still opens AMP).
+                        Some(Target::Ticket { id, .. })
+                            if state.kind == PanelKind::Workers && self.has_session(id) =>
+                        {
+                            if let Err(e) = self.open_worker(id) {
+                                panel.update(|s| s.note = Some((e, true)));
+                            }
+                        }
                         Some(target) => self.open_target(&target),
                         None => {}
                     },
                     KeyCode::Char('o') => {
                         if let Some(target) = panel.selected() {
                             self.open_target(&target);
+                        }
+                    }
+                    KeyCode::Char('x') if state.kind == PanelKind::Workers => {
+                        if let Some(Target::Ticket { id, .. }) = panel.selected() {
+                            self.ask_stop(id);
                         }
                     }
                     _ => return false,
@@ -1576,6 +1623,10 @@ impl Shell {
             "esc" => KeyCode::Esc,
             "up" => KeyCode::Up,
             "down" => KeyCode::Down,
+            "tab" => KeyCode::Tab,
+            "backtab" => KeyCode::BackTab,
+            "left" => KeyCode::Left,
+            "right" => KeyCode::Right,
             c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap_or(' ')),
             other => {
                 return Err(format!(
@@ -1586,6 +1637,9 @@ impl Shell {
         let key = KeyEvent::new(code, KeyModifiers::NONE);
         if self.secret_key(&key) {
             return Ok(true);
+        }
+        if self.stop_confirm.is_some() || self.viewing.is_some() {
+            return Ok(self.key(&key, true).await);
         }
         let used = self.panel_key(&key, true);
         self.switch_pending_model().await;
@@ -1632,6 +1686,7 @@ impl Shell {
     /// Returns whether anything changed. The terminal loop calls it on its tick.
     pub fn poll(&mut self) -> bool {
         let mut changed = self.expire_hints(Instant::now());
+        changed |= self.pump_sessions();
         while let Ok(msg) = self.msgs_rx.try_recv() {
             changed = true;
             if let ShellMsg::Notice { text, error } = &msg {
@@ -1970,6 +2025,356 @@ impl Shell {
 }
 
 /// `2108` or `#2108`.
+/// Worker sessions (#2252): open one, follow it, switch, go back, stop.
+impl Shell {
+    /// Who the chat says stopped a worker (`stopped by <person> from the chat`). Without it, the
+    /// AMP user's email, else `$USER`.
+    pub fn set_person(&mut self, name: &str) {
+        self.person = Some(name.trim().to_owned()).filter(|n| !n.is_empty());
+    }
+
+    fn person(&self) -> String {
+        if let Some(p) = &self.person {
+            return p.clone();
+        }
+        if let Some(meta) = &self.meta
+            && let Some(user) = meta.snapshot().user.get()
+            && !user.email.trim().is_empty()
+        {
+            return user.email.trim().to_owned();
+        }
+        std::env::var("USER")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| "the person".to_owned())
+    }
+
+    /// The ticket whose worker session is shown.
+    pub fn viewing(&self) -> Option<i64> {
+        self.viewing
+    }
+
+    /// A worker session opened in this chat.
+    pub fn session(&self, task_id: i64) -> Option<&SessionView> {
+        self.sessions.get(&task_id)
+    }
+
+    fn shown_session(&self) -> Option<&SessionView> {
+        self.viewing.and_then(|id| self.sessions.get(&id))
+    }
+
+    /// The ticket whose stop is waiting for `y`.
+    pub fn stop_pending(&self) -> Option<i64> {
+        self.stop_confirm
+    }
+
+    /// Whether ticket `task_id` has a worker session to show: one of this chat's, or a session
+    /// file from an earlier one.
+    pub fn has_session(&self, task_id: i64) -> bool {
+        self.sessions.contains_key(&task_id)
+            || self.supervisor.as_ref().is_some_and(|s| {
+                s.session(task_id).is_some() || s.latest_session_file(task_id).is_some()
+            })
+    }
+
+    /// Shows the session of ticket `task_id`'s worker in place of the manager's transcript:
+    /// live (it follows the worker) for a worker of this chat, else read-only from its newest
+    /// session file. Esc goes back ([`Shell::close_worker`]).
+    pub fn open_worker(&mut self, task_id: i64) -> Result<(), String> {
+        let Some(sup) = self.supervisor.clone() else {
+            return Err("this chat runs no workers".to_owned());
+        };
+        let feed = sup.feed(task_id);
+        let fresh = match (self.sessions.get(&task_id), &feed) {
+            (Some(v), Some(f)) => !v.feed_is(f),
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if fresh {
+            let thinking = self.view.show_thinking();
+            let session = match feed {
+                Some(feed) => SessionView::new(task_id, Source::Chat, feed, thinking),
+                None => {
+                    let file = sup.latest_session_file(task_id).ok_or_else(|| {
+                        format!("#{task_id} has no worker session in this chat or on disk")
+                    })?;
+                    let events = amp_core::worker_session::replay(&file)?;
+                    let name = file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    SessionView::new(
+                        task_id,
+                        Source::File(name),
+                        amp_core::worker_session::WorkerFeed::from_events(events),
+                        thinking,
+                    )
+                }
+            };
+            self.sessions.insert(task_id, session);
+        }
+        if self.stop_confirm.is_some_and(|id| id != task_id) {
+            self.stop_confirm = None;
+        }
+        self.viewing = Some(task_id);
+        self.view.panel().close();
+        self.refresh_session(task_id);
+        if let Some(s) = self.sessions.get(&task_id) {
+            self.view.show_session(Some(s.parts()));
+        }
+        Ok(())
+    }
+
+    /// Back to the manager's transcript and editor.
+    pub fn close_worker(&mut self) {
+        if self.viewing.take().is_some() {
+            self.stop_confirm = None;
+            self.view.show_session(None);
+        }
+    }
+
+    /// The order Tab goes through: this chat's worker sessions (live first), plus the one shown
+    /// when it was read from disk.
+    fn session_order(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.sessions().iter().map(|i| i.task_id).collect())
+            .unwrap_or_default();
+        if let Some(v) = self.viewing
+            && !ids.contains(&v)
+        {
+            ids.push(v);
+        }
+        ids
+    }
+
+    /// Shows the next (`step` 1) or previous (-1) worker session; `None` when there is no other.
+    pub fn switch_worker(&mut self, step: isize) -> Option<i64> {
+        let ids = self.session_order();
+        if ids.len() < 2 {
+            return None;
+        }
+        let at = self
+            .viewing
+            .and_then(|v| ids.iter().position(|id| *id == v))
+            .unwrap_or(0) as isize;
+        let next = ids[(at + step).rem_euclid(ids.len() as isize) as usize];
+        self.open_worker(next).ok()?;
+        Some(next)
+    }
+
+    /// The keys of a shown session: Esc back, Tab/→ and Shift+Tab/← switch, x stop, and the
+    /// transcript's scroll keys. Every other key is swallowed (the editor is hidden).
+    pub fn session_key(&mut self, key: &KeyEvent) -> bool {
+        if self.scroll_key(key, true) {
+            return true;
+        }
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            return true;
+        }
+        match key.code {
+            KeyCode::Esc => self.close_worker(),
+            KeyCode::Tab | KeyCode::Right => {
+                self.switch_worker(1);
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                self.switch_worker(-1);
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') => {
+                if let Some(id) = self.viewing {
+                    self.ask_stop(id);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// `/worker [ticket]`: opens that ticket's worker session, or with no ticket the first live
+    /// worker of this chat (else the last one that finished).
+    fn worker_command(&mut self, arg: &str) {
+        let id = if arg.is_empty() {
+            self.supervisor.as_ref().and_then(|s| {
+                let all = s.sessions();
+                all.iter()
+                    .find(|i| i.is_live())
+                    .or(all.last())
+                    .map(|i| i.task_id)
+            })
+        } else {
+            parse_id(arg)
+        };
+        match id {
+            None if arg.is_empty() => self.view.add_notice(
+                "/worker: no worker has run in this chat yet (/worker <ticket> reads an earlier \
+                 session from disk)",
+            ),
+            None => self
+                .view
+                .add_notice(&format!("/worker {arg}: not a ticket id")),
+            Some(id) => {
+                if let Err(e) = self.open_worker(id) {
+                    self.view.add_notice(&format!("/worker: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Asks before stopping the live worker on `task_id` (x in its session or in /workers).
+    /// Returns whether the question is up.
+    pub fn ask_stop(&mut self, task_id: i64) -> bool {
+        let why = match self.supervisor.as_ref().and_then(|s| s.session(task_id)) {
+            Some(i) if i.is_live() && i.stopped_by.is_none() => None,
+            Some(i) if i.is_live() => Some(format!("the worker on #{task_id} is already stopping")),
+            Some(_) => Some(format!(
+                "the worker on #{task_id} has finished: nothing to stop"
+            )),
+            None => Some(format!("#{task_id} has no worker running in this chat")),
+        };
+        if let Some(why) = why {
+            self.say_about_stop(&why, false);
+            return false;
+        }
+        self.stop_confirm = Some(task_id);
+        self.say_about_stop(&stop_question(task_id), true);
+        true
+    }
+
+    /// Where the stop's question and answer show: the session's keys line, else the /workers
+    /// panel's note, else the transcript.
+    fn say_about_stop(&mut self, text: &str, question: bool) {
+        if let Some(s) = self.shown_session() {
+            s.keys().set(text, true);
+        } else if self.view.panel().is_open() {
+            self.view
+                .panel()
+                .update(|s| s.note = Some((text.to_owned(), question)));
+        } else {
+            self.view.add_notice(text);
+        }
+    }
+
+    /// The `y` to [`Shell::ask_stop`]: stops the worker as the person (run reporting records the
+    /// run abandoned, `stopped by <person> from the chat`, and returns the ticket to ready; the
+    /// manager's `amp_run_ticket` returns saying so).
+    pub fn confirm_stop(&mut self) -> Result<i64, String> {
+        let id = self
+            .stop_confirm
+            .take()
+            .ok_or_else(|| "no stop is waiting".to_owned())?;
+        let by = self.person();
+        let result = match &self.supervisor {
+            Some(sup) => sup.stop_worker(id, &by).map_err(|e| e.to_string()),
+            None => Err("this chat runs no workers".to_owned()),
+        };
+        match &result {
+            Ok(()) => {
+                let line = format!(
+                    "stopping the worker on #{id} ({}): its run is reported abandoned, the \
+                     ticket goes back to ready, and the manager is told",
+                    amp_core::supervisor::stopped_from_chat(&by)
+                );
+                self.view.add_warning(&line);
+                if let Some(s) = self.sessions.get(&id) {
+                    s.view().add_warning(&line);
+                }
+                if self.viewing.is_none() && self.view.panel().is_open() {
+                    self.view
+                        .panel()
+                        .update(|s| s.note = Some((format!("stopping #{id}"), false)));
+                }
+            }
+            Err(e) => self.say_about_stop(e, false),
+        }
+        if self.viewing == Some(id) {
+            self.refresh_session(id);
+        }
+        result.map(|()| id)
+    }
+
+    /// Any other key than `y` to [`Shell::ask_stop`]: the worker keeps going.
+    fn cancel_stop(&mut self) {
+        if let Some(id) = self.stop_confirm.take() {
+            if self.viewing == Some(id) {
+                self.refresh_session(id);
+            } else if self.view.panel().is_open() {
+                self.view
+                    .panel()
+                    .update(|s| s.note = Some((format!("#{id} keeps running"), false)));
+            }
+        }
+    }
+
+    /// The ticket's name, when the board knows it.
+    fn ticket_name(&self, task_id: i64) -> String {
+        let Some(meta) = &self.meta else {
+            return String::new();
+        };
+        let snap = meta.snapshot();
+        if let Some(t) = snap.ticket.get()
+            && t.id == task_id
+        {
+            return t.name.clone();
+        }
+        snap.board
+            .get()
+            .and_then(|b| {
+                b.in_progress_tickets
+                    .iter()
+                    .find(|t| t.id == task_id)
+                    .map(|t| t.name.clone())
+                    .or_else(|| {
+                        b.questions
+                            .iter()
+                            .find(|q| q.id == task_id)
+                            .map(|q| q.name.clone())
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    /// Brings one session up to date: new events, the bar, the keys line. Returns (new events,
+    /// still live).
+    fn refresh_session(&mut self, task_id: i64) -> (bool, bool) {
+        let info = self.supervisor.as_ref().and_then(|s| s.session(task_id));
+        let name = self.ticket_name(task_id);
+        let confirm = self.stop_confirm == Some(task_id);
+        let Some(s) = self.sessions.get_mut(&task_id) else {
+            return (false, false);
+        };
+        let info = if s.source == Source::Chat { info } else { None };
+        let got = s.pump();
+        let live = s.update(info.as_ref(), &name);
+        if confirm {
+            s.keys().set(&stop_question(task_id), true);
+        } else {
+            s.reset_keys();
+        }
+        (got, live)
+    }
+
+    /// Follows every opened session; true when the shown one changed (or is live: its elapsed
+    /// time moves).
+    fn pump_sessions(&mut self) -> bool {
+        let ids: Vec<i64> = self.sessions.keys().copied().collect();
+        let mut changed = false;
+        for id in ids {
+            let (got, live) = self.refresh_session(id);
+            if self.viewing == Some(id) && (got || live) {
+                changed = true;
+                if got {
+                    self.view.scroll().touch();
+                }
+            }
+        }
+        changed
+    }
+}
+
 fn parse_id(arg: &str) -> Option<i64> {
     arg.trim()
         .trim_start_matches('#')

@@ -89,3 +89,4 @@ pub mod templates;
 pub mod text_tool_calls;
 pub mod tickets;
 pub mod tools;
+pub mod worker_session;

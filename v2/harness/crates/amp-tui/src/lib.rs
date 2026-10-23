@@ -57,6 +57,7 @@ pub mod terminal;
 pub mod theme;
 pub mod transcript;
 pub mod view;
+pub mod workers;
 pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
@@ -73,7 +74,8 @@ pub use slash::{
 };
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use transcript::ThinkingDisplay;
-pub use view::{ChatView, FooterInfo, PLACEHOLDER};
+pub use view::{ChatView, FooterInfo, PLACEHOLDER, SessionParts};
+pub use workers::{SessionView, stop_question};
 
 /// Installs `theme` for every rpi-tui component (`global_theme_manager().set`, which also
 /// invalidates cached renders) and as the current [`theme::palette`]. Call it before building

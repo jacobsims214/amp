@@ -123,6 +123,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new(
         Group::Amp,
+        "worker",
+        "[id]",
+        "watch a worker live: Esc back, Tab next, x stop",
+    ),
+    CommandSpec::new(
+        Group::Amp,
         "questions",
         "",
         "tickets waiting on an answer; answer them here",

@@ -3,6 +3,7 @@
    /amp                     the AMP connection: server, user, MCP health
    /ticket [id|none]        the current ticket; switch it, or clear it
    /workers                 workers here, and tickets in progress elsewhere
+   /worker [id]             watch a worker live: Esc back, Tab next, x stop
    /questions               tickets waiting on an answer; answer them here
    /plan                    plan approval and the epics and stories
    /project [id]            the project and its board; switch to another
