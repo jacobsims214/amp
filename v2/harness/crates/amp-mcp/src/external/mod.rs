@@ -1,19 +1,20 @@
-//! Clients for third-party MCP servers (story 397, D1): one [`ExternalClient`] per configured
-//! `[mcp.<name>]` server.
+//! Clients for third-party MCP servers (D1 of decisions/amp-harness-configurability.md).
 //!
-//! [`ExternalClient`] is transport-agnostic: rmcp's `RunningService` hides the transport, so a stdio
-//! child (H3), Streamable HTTP ([`http`], H4) and legacy HTTP+SSE (H5) all end up as the same type.
-//! A transport module builds its rmcp transport and hands a factory for it to
-//! [`ExternalClient::connect_with`], which runs the MCP lifecycle in the configured
-//! [`ProtocolMode`] and keeps what the server said.
+//! One [`ExternalClient`] per configured `[mcp.<name>]` server. It shares rmcp, the error type and
+//! the protocol modes with [`crate::AmpMcpClient`], but none of AMP's own extras (catalog TTL
+//! hints, the health poller, reconnects): the hub (H6) owns restarts and tool lists.
 //!
-//! Unlike [`crate::AmpMcpClient`], an external client never swaps its connection: the hub (H6)
-//! drops a failed client and connects a new one with backoff. AMP-only behaviour (catalog TTL
-//! hints, the metadata poller, reconnect after `amp-harness login`) stays on `AmpMcpClient`.
+//! Transports:
+//! - [`stdio`]: a local child process ([`ExternalClient::connect_stdio`], #2236).
+//! - [`http`]: Streamable HTTP with headers, bearer and OAuth ([`http::connect`], #2237).
+//! - Legacy SSE (H5, #2238) connects through [`ExternalClient::handshake_with`] too, reusing
+//!   [`http::PreparedHttp`].
 //!
-//! Sampling, elicitation and roots are not advertised (D8): the client's capabilities are empty.
+//! The client never sees a configuration file: amp-core resolves `[mcp.<name>]` (env, secrets,
+//! paths) into a spec and hands it here, so this crate stays free of rpi and of config rules.
 
 pub mod http;
+pub mod stdio;
 
 use std::{
     sync::{
@@ -27,7 +28,7 @@ use rmcp::{
     ClientHandler, RoleClient,
     model::{
         CallToolRequestParams, CallToolResult, ClientCapabilities, ClientConfig, Implementation,
-        JsonObject, PaginatedRequestParams, ProtocolVersion, Tool,
+        JsonObject, ProtocolVersion, Tool,
     },
     service::{
         ClientCacheConfig, ClientInitializeError, ClientServiceExt, NotificationContext, Peer,
@@ -35,12 +36,12 @@ use rmcp::{
     },
     transport::IntoTransport,
 };
-use tokio::sync::watch;
 
-use crate::{
-    DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, Era, Health, McpError, ProtocolMode,
-    health::HealthCell,
+pub use stdio::{
+    SHUTDOWN_GRACE, STDERR_LOG_MAX_BYTES, StdioSpec, rotate_log_if_full, stderr_log_path,
 };
+
+use crate::{Era, McpError, ProtocolMode};
 
 /// A secret value (a header value, a bearer token, an OAuth client secret). `Debug` never shows
 /// it; [`Self::expose`] is the one way to read it, at the point it goes on the wire.
@@ -63,75 +64,58 @@ impl std::fmt::Debug for Secret {
     }
 }
 
-/// What every transport shares when connecting.
+/// Connect and call limits plus what we tell the server about ourselves.
 #[derive(Debug, Clone)]
 pub struct ExternalOptions {
-    /// The configured server name (`[mcp.<name>]`), used in messages.
-    pub server: String,
-    pub protocol: ProtocolMode,
-    /// Bound on the whole MCP lifecycle (and, for HTTP, OAuth discovery before it).
+    /// Spawn (stdio) or connect, plus the MCP handshake (`startup_timeout_secs`).
     pub connect_timeout: Duration,
-    /// Default bound on one request ([`ExternalClient::call_tool`], `tools/list`).
+    /// Each `tools/list` page and `tools/call` (`call_timeout_secs`).
     pub call_timeout: Duration,
-    /// `clientInfo` sent to the server.
+    /// `Legacy` (`initialize`) is the stdio default: every stdio server in the wild speaks it.
+    pub protocol: ProtocolMode,
     pub client_name: String,
     pub client_version: String,
 }
 
-impl ExternalOptions {
-    pub fn new(server: impl Into<String>) -> Self {
+impl Default for ExternalOptions {
+    fn default() -> Self {
         Self {
-            server: server.into(),
-            protocol: ProtocolMode::Auto,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            call_timeout: DEFAULT_CALL_TIMEOUT,
+            connect_timeout: Duration::from_secs(30),
+            call_timeout: crate::DEFAULT_CALL_TIMEOUT,
+            protocol: ProtocolMode::Legacy,
             client_name: "amp-harness".to_owned(),
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
     }
-
-    pub fn with_protocol(mut self, protocol: ProtocolMode) -> Self {
-        self.protocol = protocol;
-        self
-    }
-
-    pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
-        self.connect_timeout = timeout;
-        self
-    }
-
-    pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
-        self.call_timeout = timeout;
-        self
-    }
 }
 
-/// What a server told us when we connected. Holds no secrets.
+/// What the server told us in the handshake.
 #[derive(Debug, Clone)]
-pub struct ExternalSession {
-    /// The configured server name.
-    pub server: String,
-    /// `stdio`, `http`, `http (unix socket)`, `sse`.
-    pub transport: String,
-    /// Where it is: the URL's origin for remote servers, the command for stdio.
-    pub endpoint: String,
-    pub mode: ProtocolMode,
+pub struct ExternalInfo {
+    /// `stdio`, `http` or `sse`.
+    pub transport: &'static str,
     pub protocol_version: ProtocolVersion,
-    pub era: Era,
-    /// `Auto` found a server without 2026-07-28 and used `initialize`.
-    pub fell_back: bool,
     pub server_name: Option<String>,
     pub server_version: Option<String>,
-    /// The server's instructions (D8 puts them in the prompt, capped).
+    /// The server's `instructions` (D8 puts them in the prompt).
     pub instructions: Option<String>,
-    /// How we authenticated, e.g. `none`, `header X-Api-Key (keychain)`, `bearer (env GITHUB_TOKEN)`,
-    /// `oauth (macOS Keychain (service amp-harness))`. Never contains a secret.
+    /// `Auto` found a server without 2026-07-28 and used `initialize`.
+    pub fell_back: bool,
+    /// How we authenticate, e.g. `none`, `header X-Api-Key (keychain)`, `bearer (env TOKEN)`,
+    /// `oauth (macOS Keychain (service amp-harness))`. Never a secret.
     pub auth: String,
 }
 
-/// The rmcp handler: identifies us and notices `tools/list_changed`.
+impl ExternalInfo {
+    /// Stateless (2026-07-28) or the legacy `initialize` era.
+    pub fn era(&self) -> Era {
+        Era::of(&self.protocol_version)
+    }
+}
+
+/// The rmcp client handler: identifies us and notices `notifications/tools/list_changed`.
 #[derive(Debug, Clone)]
-pub struct ExternalHandler {
+pub(crate) struct ExternalHandler {
     info: ClientConfig,
     tools_changed: Arc<AtomicBool>,
 }
@@ -146,46 +130,63 @@ impl ClientHandler for ExternalHandler {
     }
 }
 
-/// A connected third-party MCP server. Share it behind an `Arc`; every method takes `&self`.
+/// A connected third-party MCP server. Share it behind an `Arc`; calls take `&self`.
+///
+/// Dropping it closes the connection; for a stdio server it also kills the server's whole process
+/// group at once. [`Self::shutdown`] is the graceful way (close stdin, wait, then kill).
 pub struct ExternalClient {
-    service: RunningService<RoleClient, ExternalHandler>,
-    session: ExternalSession,
+    name: String,
+    service: Option<RunningService<RoleClient, ExternalHandler>>,
+    info: ExternalInfo,
     call_timeout: Duration,
     tools_changed: Arc<AtomicBool>,
-    health: HealthCell,
+    /// The stdio server's process (group) and its stderr pump. `None` for remote servers.
+    child: Option<stdio::ChildGuard>,
 }
 
 impl std::fmt::Debug for ExternalClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExternalClient")
-            .field("session", &self.session)
+            .field("name", &self.name)
+            .field("info", &self.info)
             .field("call_timeout", &self.call_timeout)
-            .field("health", &self.health.get())
+            .field("pid", &self.pid())
             .finish_non_exhaustive()
     }
 }
 
-/// How a transport describes itself to [`ExternalClient::connect_with`].
-#[derive(Debug, Clone)]
-pub struct TransportInfo {
-    /// [`ExternalSession::transport`].
-    pub kind: String,
-    /// [`ExternalSession::endpoint`].
-    pub endpoint: String,
-    /// [`ExternalSession::auth`].
-    pub auth: String,
-}
-
 impl ExternalClient {
-    /// Runs the MCP lifecycle over transports from `make_transport`, in `options.protocol`.
-    ///
-    /// `make_transport` is called once, and once more when `Auto` meets a server that knows
-    /// `server/discover` but offers only pre-2026 versions (the retry needs a fresh transport). An
-    /// `Err` from it is returned as is. A 401 during the lifecycle becomes
-    /// [`McpError::ServerAuth`] (with the server's challenge, for `login`).
-    pub async fn connect_with<T, E, A, F>(
+    /// Runs the MCP handshake over `transport` under `options.connect_timeout`. `target` names the
+    /// server in errors (a URL origin, or `stdio server <name>`); it must not hold a secret.
+    pub(crate) async fn handshake<T, E, A>(
+        name: &str,
+        target: &str,
+        transport_kind: &'static str,
+        transport: T,
         options: &ExternalOptions,
-        info: TransportInfo,
+    ) -> Result<Self, McpError>
+    where
+        T: IntoTransport<RoleClient, E, A> + Send,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let mut once = Some(transport);
+        Self::handshake_with(name, target, transport_kind, "none", options, move || {
+            once.take().ok_or(McpError::Closed)
+        })
+        .await
+    }
+
+    /// [`Self::handshake`] over transports from `make_transport`, which is called again (once)
+    /// when `Auto` meets a server that knows `server/discover` but offers only `initialize`-era
+    /// versions (as in [`crate::AmpMcpClient`]; the retry needs a fresh transport). If it can't
+    /// make a second one, the first error stands. `auth` describes the credentials (never a
+    /// secret); a rejection becomes [`McpError::ServerAuth`] with a hint built from it.
+    pub(crate) async fn handshake_with<T, E, A, F>(
+        name: &str,
+        target: &str,
+        transport_kind: &'static str,
+        auth: &str,
+        options: &ExternalOptions,
         mut make_transport: F,
     ) -> Result<Self, McpError>
     where
@@ -199,34 +200,31 @@ impl ExternalClient {
                 ClientCapabilities::default(),
                 Implementation::new(options.client_name.clone(), options.client_version.clone()),
             )
-            .with_protocol_version(options.protocol.initialize_version()),
+            .with_protocol_version(ProtocolMode::LEGACY_VERSION),
             tools_changed: tools_changed.clone(),
         };
-        let map = |e: ClientInitializeError| {
-            server_auth(
-                McpError::from_init(&info.endpoint, e),
-                &options.server,
-                &info.auth,
-            )
-        };
-
+        let map =
+            |e: ClientInitializeError| server_auth(McpError::from_init(target, e), name, auth);
         let connect = async {
             let first = handler
                 .clone()
                 .serve_with_lifecycle(make_transport()?, options.protocol.lifecycle())
                 .await;
             match first {
-                // As in AmpMcpClient: rmcp's Auto falls back only when `server/discover` is
-                // unknown. A server that knows it but lists only initialize-era versions is legacy.
                 Err(ClientInitializeError::NoCompatibleProtocolVersion {
                     server_supported,
                     ..
                 }) if options.protocol == ProtocolMode::Auto
                     && server_supported.iter().any(ProtocolVersion::has_initialize) =>
                 {
+                    let Ok(transport) = make_transport() else {
+                        return Err(McpError::Config(format!(
+                            "{target}: the server offers only initialize-era versions; set protocol = \"legacy\""
+                        )));
+                    };
                     handler
                         .clone()
-                        .serve_with_lifecycle(make_transport()?, ProtocolMode::Legacy.lifecycle())
+                        .serve_with_lifecycle(transport, ProtocolMode::Legacy.lifecycle())
                         .await
                         .map_err(map)
                 }
@@ -236,119 +234,96 @@ impl ExternalClient {
         let service = tokio::time::timeout(options.connect_timeout, connect)
             .await
             .map_err(|_| McpError::ConnectTimeout {
-                url: info.endpoint.clone(),
+                url: target.to_owned(),
                 after: options.connect_timeout,
             })??;
-        // No response cache: list_changed and refreshes always reach the server.
+        // No response cache: the hub decides when to refetch (list_changed, /mcp restart).
         service
             .peer()
             .set_response_cache_config(ClientCacheConfig::disabled())
             .await;
-
         let peer_info = service.peer_info().ok_or_else(|| McpError::Connect {
-            url: info.endpoint.clone(),
+            url: target.to_owned(),
             source: Box::new(ClientInitializeError::ConnectionClosed(
                 "no server info after the handshake".to_owned(),
             )),
         })?;
-        let era = Era::of(&peer_info.protocol_version);
-        let session = ExternalSession {
-            server: options.server.clone(),
-            transport: info.kind,
-            endpoint: info.endpoint,
-            mode: options.protocol,
-            protocol_version: peer_info.protocol_version.clone(),
-            era,
-            fell_back: options.protocol == ProtocolMode::Auto && era == Era::Legacy,
+        let protocol_version = peer_info.protocol_version.clone();
+        let info = ExternalInfo {
+            transport: transport_kind,
+            fell_back: options.protocol == ProtocolMode::Auto
+                && Era::of(&protocol_version) == Era::Legacy,
+            protocol_version,
             server_name: peer_info.server_info.as_ref().map(|s| s.name.clone()),
             server_version: peer_info.server_info.as_ref().map(|s| s.version.clone()),
             instructions: peer_info.instructions.clone(),
-            auth: info.auth,
+            auth: auth.to_owned(),
         };
-        tracing::debug!(
-            server = %session.server,
-            transport = %session.transport,
-            protocol = %session.protocol_version,
-            "connected to MCP server"
-        );
         Ok(Self {
-            service,
-            session,
+            name: name.to_owned(),
+            service: Some(service),
+            info,
             call_timeout: options.call_timeout,
             tools_changed,
-            health: HealthCell::new(),
+            child: None,
         })
     }
 
-    /// What the server said when we connected.
-    pub fn session(&self) -> &ExternalSession {
-        &self.session
+    /// The configured server name (`[mcp.<name>]`).
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// The server's instructions, if any.
-    pub fn instructions(&self) -> Option<&str> {
-        self.session.instructions.as_deref()
+    pub fn info(&self) -> &ExternalInfo {
+        &self.info
     }
 
     pub fn call_timeout(&self) -> Duration {
         self.call_timeout
     }
 
-    /// The rmcp peer, for requests this type does not wrap (resources, prompts: H15).
-    pub fn peer(&self) -> Peer<RoleClient> {
-        self.service.peer().clone()
+    /// The stdio server's process id (also its process group and session id). `None` for remote
+    /// servers.
+    pub fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.pid)
     }
 
+    /// Where the stdio server's stderr goes. `None` for remote servers.
+    pub fn stderr_log(&self) -> Option<&std::path::Path> {
+        self.child.as_ref().map(|c| c.log.as_path())
+    }
+
+    /// The connection is gone (the server exited, or the transport failed).
     pub fn is_closed(&self) -> bool {
-        self.service.is_closed() || self.service.peer().is_transport_closed()
-    }
-
-    /// Current health. A closed transport always reads as disconnected.
-    pub fn health(&self) -> Health {
-        if self.is_closed() {
-            return Health::Disconnected {
-                reason: "connection closed".to_owned(),
-            };
+        match &self.service {
+            Some(s) => s.is_closed() || s.peer().is_transport_closed(),
+            None => true,
         }
-        self.health.get()
     }
 
-    pub fn watch_health(&self) -> watch::Receiver<Health> {
-        self.health.subscribe()
+    /// rmcp's peer, for requests this type does not wrap (resources, prompts).
+    pub fn peer(&self) -> Result<Peer<RoleClient>, McpError> {
+        self.service
+            .as_ref()
+            .map(|s| s.peer().clone())
+            .ok_or(McpError::Closed)
     }
 
-    /// True once after the server sent `notifications/tools/list_changed`: refetch with
-    /// [`Self::list_tools`].
+    /// True once after the server sent `notifications/tools/list_changed`.
     pub fn take_tools_changed(&self) -> bool {
         self.tools_changed.swap(false, Ordering::AcqRel)
     }
 
-    /// Every tool, all pages, under the call timeout.
+    /// Every tool, following `nextCursor`, under the call timeout.
     pub async fn list_tools(&self) -> Result<Vec<Tool>, McpError> {
-        // Cleared first, so a list_changed that lands mid-fetch is not lost.
-        self.tools_changed.store(false, Ordering::Release);
-        let peer = self.peer();
-        let fetch = async move {
-            let mut tools = Vec::new();
-            let mut cursor = None;
-            loop {
-                let mut params = PaginatedRequestParams::default();
-                params.cursor = cursor;
-                let page = peer.list_tools(Some(params)).await?;
-                tools.extend(page.tools);
-                cursor = page.next_cursor;
-                if cursor.is_none() {
-                    break;
-                }
-            }
-            Ok::<_, rmcp::ServiceError>(tools)
-        };
-        self.with_timeout("tools/list", self.call_timeout, fetch)
+        let peer = self.live_peer()?;
+        self.bounded("tools/list", self.call_timeout, peer.list_all_tools())
             .await
     }
 
-    /// Calls a tool (its original, unprefixed name) under the default call timeout. `Ok` includes
-    /// results the tool flagged `isError`; `Err` means the call did not complete.
+    /// Calls a tool under the call timeout. `Ok` includes results the tool flagged `isError`;
+    /// `Err` means the call did not complete. On timeout the request is dropped, which makes rmcp
+    /// send `notifications/cancelled`.
     pub async fn call_tool(
         &self,
         name: &str,
@@ -358,20 +333,18 @@ impl ExternalClient {
             .await
     }
 
-    /// [`Self::call_tool`] with an explicit timeout. Dropping the future (or the timeout) sends
-    /// `notifications/cancelled`.
     pub async fn call_tool_with_timeout(
         &self,
         name: &str,
         arguments: Option<JsonObject>,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
+        let peer = self.live_peer()?;
         let mut params = CallToolRequestParams::new(name.to_owned());
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
         }
-        let peer = self.peer();
-        self.with_timeout(
+        self.bounded(
             &format!("tools/call {name}"),
             timeout,
             peer.call_tool(params),
@@ -379,44 +352,47 @@ impl ExternalClient {
         .await
     }
 
-    async fn with_timeout<T>(
+    fn live_peer(&self) -> Result<Peer<RoleClient>, McpError> {
+        if self.is_closed() {
+            return Err(McpError::Closed);
+        }
+        self.peer()
+    }
+
+    async fn bounded<T>(
         &self,
         operation: &str,
         timeout: Duration,
         request: impl Future<Output = Result<T, rmcp::ServiceError>>,
     ) -> Result<T, McpError> {
-        if self.is_closed() {
-            let e = McpError::Closed;
-            self.health.set(Health::after(Err(&e)));
-            return Err(e);
-        }
-        let result = match tokio::time::timeout(timeout, request).await {
+        match tokio::time::timeout(timeout, request).await {
             Err(_) => Err(McpError::Timeout {
-                operation: format!("{}: {operation}", self.session.server),
+                operation: format!("{}: {operation}", self.name),
                 after: timeout,
             }),
-            Ok(Err(e)) => Err(self.map_service_error(operation, e)),
+            Ok(Err(e)) => Err(server_auth(
+                McpError::from_service(&format!("{}: {operation}", self.name), e),
+                &self.name,
+                &self.info.auth,
+            )),
             Ok(Ok(value)) => Ok(value),
-        };
-        self.health.set(Health::after(result.as_ref().map(|_| ())));
-        result
+        }
     }
 
-    fn map_service_error(&self, operation: &str, error: rmcp::ServiceError) -> McpError {
-        server_auth(
-            McpError::from_service(&format!("{}: {operation}", self.session.server), error),
-            &self.session.server,
-            &self.session.auth,
-        )
-    }
-
-    /// Closes the connection (for stdio, the transport ends the child).
-    pub async fn close(self) {
-        let _ = self.service.cancel().await;
+    /// Closes the connection. A stdio server gets EOF on stdin and [`SHUTDOWN_GRACE`] to exit;
+    /// then its whole process group is killed (so `npx`/`uvx` trees do not leak) and reaped.
+    pub async fn shutdown(mut self) {
+        if let Some(service) = self.service.take() {
+            // Closes the transport: for stdio that is the child's stdin.
+            let _ = tokio::time::timeout(SHUTDOWN_GRACE, service.cancel()).await;
+        }
+        if let Some(mut child) = self.child.take() {
+            child.shutdown(SHUTDOWN_GRACE).await;
+        }
     }
 }
 
-/// A rejection (rmcp's auth error with the server's challenge, or a bare HTTP 401/403 that many
+/// A rejection (rmcp's auth error with the server's challenge, or a bare HTTP 401/403, which many
 /// API-key servers send without `WWW-Authenticate`) as [`McpError::ServerAuth`]; anything else as
 /// is.
 fn server_auth(error: McpError, server: &str, auth: &str) -> McpError {

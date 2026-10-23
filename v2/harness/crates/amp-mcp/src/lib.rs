@@ -9,9 +9,9 @@
 //!
 //! - [`oauth`]: browser login (`login`/`logout`) and [`oauth::connect`], which picks `AMP_TOKEN`,
 //!   else a stored OAuth login (refreshed as needed), else no credentials (D3).
-//! - [`external`]: clients for third-party MCP servers (`[mcp.<name>]`): [`ExternalClient`] and
-//!   its Streamable HTTP transport with headers, bearer and OAuth ([`external::http`]).
 //! - [`CredentialBackend`]: logins in the OS keychain keyed by server URL, or a 0600 file.
+//! - [`external`]: clients for third-party MCP servers ([`ExternalClient`]): stdio child processes
+//!   (#2236) and Streamable HTTP with headers, bearer and OAuth ([`external::http`], #2237).
 //!
 //! This crate must never depend on rpi (D1).
 
@@ -41,7 +41,7 @@ pub use credentials::{
 };
 pub use error::{FailureKind, McpError};
 pub use external::{
-    ExternalClient, ExternalOptions, ExternalSession, Secret,
+    ExternalClient, ExternalInfo, ExternalOptions, Secret, StdioSpec,
     http::{HeaderSource, HttpAuth, HttpHeader, HttpServerOptions},
 };
 pub use health::Health;

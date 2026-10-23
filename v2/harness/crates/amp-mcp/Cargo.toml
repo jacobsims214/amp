@@ -11,13 +11,15 @@ publish.workspace = true
 async-trait.workspace = true
 keyring.workspace = true
 oauth2.workspace = true
+process-wrap.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 # net + io-util: the OAuth loopback redirect listener; rt: keychain calls run on the blocking pool.
-tokio = { workspace = true, features = ["net", "io-util", "rt"] }
+# process + fs: stdio MCP servers and their stderr logs (#2236).
+tokio = { workspace = true, features = ["net", "io-util", "rt", "process", "fs"] }
 toml.workspace = true
 tracing.workspace = true
 
@@ -29,11 +31,17 @@ axum.workspace = true
 base64.workspace = true
 rcgen.workspace = true
 # The in-process test servers: rmcp's server side + Streamable HTTP server transport (#2082 note).
-rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+# transport-io: the stdio test server in tests/stdio.rs (#2236).
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server", "transport-io"] }
 sha2.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tokio-rustls.workspace = true
+
+# The stdio tests re-run their own binary as the MCP server, so they own main() (#2236).
+[[test]]
+name = "stdio"
+harness = false
 
 [lints]
 workspace = true

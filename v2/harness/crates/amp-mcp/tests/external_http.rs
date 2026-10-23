@@ -19,8 +19,8 @@ use std::{
 };
 
 use amp_mcp::{
-    CredentialBackend, Era, ExternalClient, HeaderSource, Health, HttpAuth, HttpHeader,
-    HttpServerOptions, McpError, ProtocolMode, Secret,
+    CredentialBackend, Era, ExternalClient, HeaderSource, HttpAuth, HttpHeader, HttpServerOptions,
+    McpError, ProtocolMode, Secret,
     external::http::{self, wants_sse_fallback},
     oauth::{CALLBACK_PATH, LoginPrompt, OAuthClientSettings},
     rmcp::model::{ContentBlock, ProtocolVersion},
@@ -89,11 +89,8 @@ fn requiring_headers(kind: ServerKind, required: Vec<(&'static str, String)>) ->
 
 fn options(url: &str) -> HttpServerOptions {
     let mut options = HttpServerOptions::new("acme", url);
-    options.external = options
-        .external
-        .clone()
-        .with_connect_timeout(Duration::from_secs(15))
-        .with_call_timeout(Duration::from_secs(15));
+    options.external.connect_timeout = Duration::from_secs(15);
+    options.external.call_timeout = Duration::from_secs(15);
     options
 }
 
@@ -155,13 +152,13 @@ async fn static_and_secret_headers_are_sent_and_never_shown() {
     assert_no_secret(&format!("{opts:?}"));
     let client = http::connect(&opts, &backend).await.expect("connect");
     assert!(echo(&client).await.contains("world"));
-    let session = client.session();
-    assert_eq!(session.server, "acme");
+    let session = client.info();
+    assert_eq!(client.name(), "acme");
     assert_eq!(session.transport, "http");
     assert_eq!(session.auth, "header X-Api-Key (keychain)");
-    assert_eq!(client.health(), Health::Connected);
+    assert!(!client.is_closed());
     assert_no_secret(&format!("{client:?}"));
-    client.close().await;
+    client.shutdown().await;
 
     // Without the secret header the server refuses, and the error says what was used, not its value.
     let opts = options(&server.url)
@@ -197,8 +194,8 @@ async fn bearer_token_wins_and_a_wrong_one_names_its_variable() {
     .await
     .expect("connect with bearer");
     assert!(echo(&client).await.contains("world"));
-    assert_eq!(client.session().auth, "bearer (env ACME_TOKEN)");
-    client.close().await;
+    assert_eq!(client.info().auth, "bearer (env ACME_TOKEN)");
+    client.shutdown().await;
 
     let err = http::connect(
         &options(&server.url).with_bearer(format!("{MARK}-nope"), "env ACME_TOKEN"),
@@ -231,7 +228,7 @@ async fn an_authorization_header_works_like_a_bearer() {
     .await
     .expect("connect");
     assert!(echo(&client).await.contains("world"));
-    client.close().await;
+    client.shutdown().await;
 }
 
 #[tokio::test]
@@ -343,15 +340,15 @@ async fn every_protocol_version_from_2024_11_05_to_2026_07_28() {
     for (kind, mode, want, fell_back) in cases {
         let server = common::spawn(TestServer::new(kind)).await;
         let mut opts = options(&server.url);
-        opts.external = opts.external.clone().with_protocol(mode);
+        opts.external.protocol = mode;
         let client = http::connect(&opts, &backend)
             .await
             .unwrap_or_else(|e| panic!("{kind:?} {mode}: {e}"));
-        let session = client.session();
+        let session = client.info();
         assert_eq!(session.protocol_version, want, "{kind:?} {mode}");
         assert_eq!(session.fell_back, fell_back, "{kind:?} {mode}");
         assert_eq!(
-            session.era,
+            session.era(),
             if want == ProtocolVersion::V_2026_07_28 {
                 Era::Stateless
             } else {
@@ -361,13 +358,13 @@ async fn every_protocol_version_from_2024_11_05_to_2026_07_28() {
         assert_eq!(session.server_name.as_deref(), Some("amp-test"));
         assert_eq!(session.instructions.as_deref(), Some(common::INSTRUCTIONS));
         assert!(echo(&client).await.contains("world"), "{kind:?} {mode}");
-        client.close().await;
+        client.shutdown().await;
     }
 
     // Forcing 2026-07-28 on a server without it is an error, not a silent downgrade.
     let server = common::spawn(TestServer::new(ServerKind::Only20241105)).await;
     let mut opts = options(&server.url);
-    opts.external = opts.external.clone().with_protocol(ProtocolMode::Modern);
+    opts.external.protocol = ProtocolMode::Modern;
     assert!(http::connect(&opts, &backend).await.is_err());
 }
 
@@ -404,7 +401,7 @@ async fn tool_errors_and_timeouts() {
     let failed = client.call_tool("amp_fail", None).await.expect("answered");
     assert_eq!(failed.is_error, Some(true));
     assert!(!client.take_tools_changed());
-    client.close().await;
+    client.shutdown().await;
 }
 
 #[cfg(unix)]
@@ -430,9 +427,9 @@ async fn over_a_unix_socket() {
     )
     .await
     .expect("connect over the socket");
-    assert_eq!(client.session().transport, "http (unix socket)");
+    assert_eq!(client.info().transport, "http (unix socket)");
     assert!(echo(&client).await.contains("world"));
-    client.close().await;
+    client.shutdown().await;
     task.abort();
 }
 
@@ -833,12 +830,12 @@ async fn oauth_with_dynamic_registration_logs_in_connects_and_refreshes() {
         .await
         .expect("connect with the login");
     assert!(
-        client.session().auth.starts_with("oauth ("),
+        client.info().auth.starts_with("oauth ("),
         "{}",
-        client.session().auth
+        client.info().auth
     );
     assert!(echo(&client).await.contains("world"));
-    client.close().await;
+    client.shutdown().await;
 
     // auth = "none" ignores the stored login.
     let err = http::connect(&opts.clone().with_auth(HttpAuth::None), &backend)
@@ -854,7 +851,7 @@ async fn oauth_with_dynamic_registration_logs_in_connects_and_refreshes() {
     assert!(echo(&client).await.contains("world"));
     assert!(mock.state.refreshes.load(Ordering::SeqCst) >= 1);
     assert_eq!(mock.state.registrations.load(Ordering::SeqCst), 1);
-    client.close().await;
+    client.shutdown().await;
 
     // Logout removes it.
     assert!(http::logout(&opts, &backend).await.unwrap());
@@ -916,7 +913,7 @@ async fn oauth_with_a_pre_registered_confidential_client_and_a_metadata_url() {
         1 + refreshes,
         "every refresh authenticated with the client secret"
     );
-    client.close().await;
+    client.shutdown().await;
 
     // Without the secret the AS refuses the refresh as invalid_client (a config problem, not a
     // login one), and nothing secret is shown.

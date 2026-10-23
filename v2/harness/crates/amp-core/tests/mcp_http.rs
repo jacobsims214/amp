@@ -154,7 +154,7 @@ async fn ping(options: &amp_mcp::HttpServerOptions, backend: &CredentialBackend)
     let tools = client.list_tools().await.unwrap();
     assert_eq!(tools[0].name, "ping");
     let result = client.call_tool("ping", None).await.unwrap();
-    client.close().await;
+    client.shutdown().await;
     match &result.content[0] {
         ContentBlock::Text(t) => t.text.clone(),
         other => panic!("{other:?}"),

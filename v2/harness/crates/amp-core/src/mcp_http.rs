@@ -30,10 +30,12 @@ pub fn http_options(
 ) -> Result<HttpServerOptions, String> {
     let name = &server.name;
     let mut options = HttpServerOptions::new(name.clone(), remote.url.clone());
-    options.external = ExternalOptions::new(name.clone())
-        .with_protocol(remote.protocol)
-        .with_connect_timeout(server.startup_timeout)
-        .with_call_timeout(server.call_timeout);
+    options.external = ExternalOptions {
+        protocol: remote.protocol,
+        connect_timeout: server.startup_timeout,
+        call_timeout: server.call_timeout,
+        ..ExternalOptions::default()
+    };
     options.headers = remote
         .headers
         .iter()

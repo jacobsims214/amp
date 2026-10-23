@@ -61,6 +61,10 @@
 //! - [`mcp_http`]: a resolved http `[mcp.<name>]` table to amp-mcp's `HttpServerOptions`, reading
 //!   its secrets (keychain `secret_headers` / OAuth client secret, `bearer_env`).
 //!
+//! Story 397 (#2236, H3):
+//! - [`mcp_stdio`]: a resolved stdio server as an [`amp_mcp::StdioSpec`]: the D7 child environment
+//!   (the bash scrub of #2142 plus the server's own env and keychain secrets), cwd, stderr log.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -72,6 +76,7 @@ pub mod faux;
 pub mod links;
 pub mod mcp_config;
 pub mod mcp_http;
+pub mod mcp_stdio;
 pub mod mcp_tools;
 pub mod meta;
 pub mod models;

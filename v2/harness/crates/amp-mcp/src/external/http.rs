@@ -31,7 +31,7 @@ use rmcp::transport::{
     streamable_http_client::StreamableHttpClientTransportConfig,
 };
 
-use super::{ExternalClient, ExternalOptions, Secret, TransportInfo, auth_hint};
+use super::{ExternalClient, ExternalOptions, Secret, auth_hint};
 use crate::{
     CredentialBackend, McpError,
     http::{DEFAULT_OAUTH_REQUEST_TIMEOUT, build_http_client},
@@ -93,6 +93,9 @@ pub struct BearerToken {
 /// Everything [`connect`] and [`login`] need for one server.
 #[derive(Clone)]
 pub struct HttpServerOptions {
+    /// The configured server name (`[mcp.<name>]`), used in messages.
+    pub name: String,
+    /// Timeouts, protocol mode (`Auto` by default for HTTP) and client info.
     pub external: ExternalOptions,
     pub url: String,
     /// Every header to send, secret or not, in order.
@@ -114,7 +117,11 @@ pub struct HttpServerOptions {
 impl HttpServerOptions {
     pub fn new(server: impl Into<String>, url: impl Into<String>) -> Self {
         Self {
-            external: ExternalOptions::new(server),
+            name: server.into(),
+            external: ExternalOptions {
+                protocol: crate::ProtocolMode::Auto,
+                ..ExternalOptions::default()
+            },
             url: url.into(),
             headers: Vec::new(),
             bearer: None,
@@ -161,7 +168,7 @@ impl HttpServerOptions {
     }
 
     pub fn server(&self) -> &str {
-        &self.external.server
+        &self.name
     }
 
     /// Whether the config itself supplies `Authorization` (bearer or header).
@@ -186,7 +193,7 @@ impl HttpServerOptions {
 impl std::fmt::Debug for HttpServerOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpServerOptions")
-            .field("server", &self.external.server)
+            .field("server", &self.name)
             .field("url", &crate::url_origin(&self.url))
             .field(
                 "headers",
@@ -217,7 +224,7 @@ pub struct PreparedHttp {
     /// How we authenticate, for [`super::ExternalSession::auth`]. No secrets.
     pub auth: String,
     /// `http` or `http (unix socket)`.
-    pub transport: String,
+    pub transport: &'static str,
 }
 
 impl std::fmt::Debug for PreparedHttp {
@@ -348,7 +355,7 @@ pub async fn prepare(
         } else {
             auth_parts.join(", ")
         },
-        transport: transport.to_owned(),
+        transport,
     })
 }
 
@@ -429,7 +436,7 @@ pub async fn connect(
                 operation: format!("MCP server `{}`: OAuth discovery", options.server()),
                 after: options.external.connect_timeout,
             })??;
-    match connect_prepared(&options.external, &prepared).await {
+    match connect_prepared(options.server(), &options.external, &prepared).await {
         // H5 (#2238): retry as legacy HTTP+SSE here with the same `prepared`.
         Err(e) if options.fallback_sse && wants_sse_fallback(&e) => {
             tracing::debug!(
@@ -444,6 +451,7 @@ pub async fn connect(
 
 /// The Streamable HTTP lifecycle on an already prepared client.
 pub async fn connect_prepared(
+    name: &str,
     external: &ExternalOptions,
     prepared: &PreparedHttp,
 ) -> Result<ExternalClient, McpError> {
@@ -454,14 +462,11 @@ pub async fn connect_prepared(
     if let Some(token) = &prepared.bearer {
         config = config.auth_header(token.expose());
     }
-    let info = TransportInfo {
-        kind: prepared.transport.clone(),
-        endpoint: crate::url_origin(&prepared.url),
-        auth: prepared.auth.clone(),
-    };
+    let target = crate::url_origin(&prepared.url);
+    let (kind, auth) = (prepared.transport, prepared.auth.as_str());
     match &prepared.oauth {
         Some(client) => {
-            ExternalClient::connect_with(external, info, || {
+            ExternalClient::handshake_with(name, &target, kind, auth, external, || {
                 Ok(StreamableHttpClientTransport::with_client(
                     client.clone(),
                     config.clone(),
@@ -470,7 +475,7 @@ pub async fn connect_prepared(
             .await
         }
         None => {
-            ExternalClient::connect_with(external, info, || {
+            ExternalClient::handshake_with(name, &target, kind, auth, external, || {
                 Ok(StreamableHttpClientTransport::with_client(
                     prepared.http.clone(),
                     config.clone(),
@@ -516,15 +521,15 @@ where
     // The probe: the server's headers, no credentials, no stored login.
     let probe = HttpServerOptions {
         auth: HttpAuth::None,
-        external: options
-            .external
-            .clone()
-            .with_connect_timeout(options.oauth_request_timeout),
+        external: ExternalOptions {
+            connect_timeout: options.oauth_request_timeout,
+            ..options.external.clone()
+        },
         ..options.clone()
     };
     let challenge = match connect(&probe, &login_options.backend).await {
         Ok(client) => {
-            client.close().await;
+            client.shutdown().await;
             return Err(McpError::OAuth(format!(
                 "MCP server `{server}` accepts requests without credentials, so there is nothing \
                  to log in to"
