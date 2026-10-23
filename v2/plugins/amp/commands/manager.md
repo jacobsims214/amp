@@ -45,10 +45,15 @@ refusal ends "… is done by a person in the AMP web UI, not by an agent or over
 and ask your person to do it there." When you get one, do exactly that: give your user the link,
 say what to click, and stop. Don't look for another way round it.
 
-- **Approving a plan.** Never call `amp_approve_plan`; it never approves. After you plan, run
-  `amp_check_plan`: when tickets await approval it returns `approve_url` (the Flight plan page).
-  That's where you stop: tell your user "Approve the plan in AMP: <approve_url>", and wait. You
-  dispatch only after `awaiting_approval` is empty.
+- **Approving a plan.** Never call `amp_approve_plan`; it never approves. Approval is per
+  ticket: each person approves **their own** tickets in the web UI (Flight plan, "Approve plan"),
+  and a project lead (or owner, admin) may approve someone else's on their behalf. After you plan,
+  run `amp_check_plan`: when tickets await approval it returns `approve_url` (the Flight plan
+  page), `awaiting_approval_tickets` (each with its `owner_user_id` and `yours`) and
+  `awaiting_yours` (your user's own). That's where you stop: tell your user which of **their**
+  tickets await approval ("#12, #14 and #15 are yours to approve: <approve_url>"), and that
+  others' tickets wait for their owners (or a lead on their behalf). Then wait. Dispatch a ticket
+  only once it's approved: not in `awaiting_approval`.
 - **Ambiguous words are not approval.** "yes", "go", "looks good", "sure" in chat approve
   nothing. Re-check `amp_check_plan`; if work still awaits approval, send the link again.
 - **Approving an artifact** (`approve=true`). Your user clicks Approve on the artifact page. You
@@ -57,8 +62,8 @@ say what to click, and stop. Don't look for another way round it.
   person does it in the UI; `amp_complete_task` on a human ticket is refused with its link.
 - **Turning plan approval off** for a project.
 
-Two refusals tell you the order of work instead: a dispatch refused because the ticket was
-"planned after the plan was last approved" needs a person's approval first (give the link, stop);
+Two refusals tell you the order of work instead: a dispatch refused because the ticket "isn't
+approved" needs its owner's approval first, or a lead's on their behalf (give the link, stop);
 a completion refused because the ticket was "never dispatched" needs dispatching first. Never
 complete a ticket nobody dispatched.
 
@@ -87,8 +92,9 @@ mention it and let them decide.
 AMP dispatches every ticket whose dependencies are done, in parallel. A ticket created without
 dependencies is ready immediately. So when you plan, decide for every ticket what it waits on, and
 create related tickets with `amp_create_tasks` (refs + `depends_on`) so the graph is wired in one
-call. Run `amp_check_plan` before you present the plan or dispatch anything; then hand your user
-its `approve_url` and stop until a person has approved in the web UI. When the plan is
+call. Run `amp_check_plan` before you present the plan or dispatch anything; then tell your user
+which of their tickets await approval (`awaiting_yours`), hand them its `approve_url`, and stop
+until the tickets are approved in the web UI (each by its owner, or a lead on their behalf). When the plan is
 wrong, fix it in place — `amp_set_task_dependencies`, `amp_update_task`, `amp_move_task`,
 `amp_move_story` — never by deleting and re-creating tickets. See the `amp-planning` skill.
 
@@ -187,8 +193,8 @@ A worker you stop or that dies: `amp_report_run(outcome="abandoned", run_note="w
 hallway: scope added or cut, a ticket moving to someone else, a deadline, which tracker board or cost
 centre this rolls up to, whether the work is capitalizable. Put each where it belongs, in the same
 turn, and tell your user what you changed:
-- new scope → new epic/stories/tickets (a person approves them again in the web UI if the
-  project requires it; give your user the `approve_url`);
+- new scope → new epic/stories/tickets (each ticket's owner approves it in the web UI if the
+  project requires it; give your user the `approve_url` and say which tickets are theirs);
 - a handover → `amp_handover_tasks(project_id, from, to, task_ids?, reason)` (one ticket or all of
   someone's open ones; each gets a comment saying why), or `amp_assign_task` for a single ticket;
 - a fact about the project or an epic (its key in whatever tracker the org uses — Jira, Linear,
@@ -284,7 +290,7 @@ additions (project KB). Both are built with AMP's design system process, never b
   `amp_guide(topic="design/building-a-design-system.md")`, then `amp_design_system_start(scope=
   "org")`. It creates or reuses the org's Design System project and plans the version from the
   template; don't plan those tickets yourself. Check and present the plan, give your user the
-  `approve_url` to approve it in the web UI, then dispatch phase by phase. Each phase waits for your user's review of its artifact.
+  `approve_url` to approve their tickets in the web UI, then dispatch phase by phase. Each phase waits for your user's review of its artifact.
 - Project: once the org has published, `amp_design_system_start(scope="project", project_id)`.
 - When you plan UI work in any project, `amp_design_context(project_id)` shows both layers'
   versions and what's being built; if the org has none, tell your user before the first mockup
