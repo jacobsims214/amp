@@ -9,7 +9,9 @@ use crate::McpError;
 /// The state of the MCP connection, updated after every request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Health {
-    /// The last request succeeded (a tool reporting `isError` still counts: the server answered).
+    /// The last request got an answer. A tool reporting `isError`, or a JSON-RPC error response
+    /// (AMP's answer to an unknown ticket), still counts: the server answered. Only transport,
+    /// timeout and auth failures change the health (#2108).
     Connected,
     /// The last request failed or timed out, but the connection is still open.
     Degraded { reason: String },
@@ -28,6 +30,7 @@ impl Health {
     pub(crate) fn after(result: Result<(), &McpError>) -> Self {
         match result {
             Ok(()) => Self::Connected,
+            Err(e) if e.is_server_error() => Self::Connected,
             Err(McpError::AuthRequired { .. }) => Self::AuthRequired,
             Err(McpError::Closed) => Self::Disconnected {
                 reason: "connection closed".to_owned(),

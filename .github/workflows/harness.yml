@@ -8,11 +8,23 @@ on:
   pull_request:
     paths:
       - "v2/harness/**"
+      - "v2/.opencode/**"
+      - "v2/opencode.json"
+      - "v2/scripts/build-harness-assets.sh"
+      - "v2/scripts/lib/build_harness_assets.py"
+      - "v2/scripts/lib/build_opencode_plugin.py"
+      - "v2/scripts/lib/harness_overrides.yaml"
       - ".github/workflows/harness.yml"
   push:
     branches: [main, "harness-m*"]
     paths:
       - "v2/harness/**"
+      - "v2/.opencode/**"
+      - "v2/opencode.json"
+      - "v2/scripts/build-harness-assets.sh"
+      - "v2/scripts/lib/build_harness_assets.py"
+      - "v2/scripts/lib/build_opencode_plugin.py"
+      - "v2/scripts/lib/harness_overrides.yaml"
       - ".github/workflows/harness.yml"
 
 permissions:
@@ -23,6 +35,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # D5: v2/harness/assets is generated from v2/.opencode (agents + skills, host glue rewritten by
+  # v2/scripts/lib/harness_overrides.yaml). Regenerate and fail if the committed copy drifted.
+  assets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install PyYAML
+        run: python -m pip install pyyaml
+      - name: assets drift check
+        run: v2/scripts/build-harness-assets.sh --check
+
   harness:
     runs-on: ubuntu-latest
     defaults:
@@ -43,4 +69,6 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked
+      # The test step includes the render snapshots (amp-tui tests/chrome.rs and tests/theme.rs
+      # against tests/snapshots/*.txt; a missing or changed snapshot fails without UPDATE_SNAPSHOTS).
       # No smoke step: scripts/smoke.sh needs a live AMP. It joins CI in M5-2 (compose stack in the job, three protocol modes).

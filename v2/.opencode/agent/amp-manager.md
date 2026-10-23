@@ -7,16 +7,23 @@ temperature: 0.2
 steps: 1000
 permission:
   edit:
+    "*": deny
     ".opencode/**": allow
     "opencode.json": allow
-    "*": deny
   bash:
-    "git status*": allow
-    "git diff*": allow
-    "git log*": allow
+    "*": deny
+    "git status *": allow
+    "git diff *": allow
+    "git log *": allow
     "ls *": allow
     "mkdir -p .opencode/*": allow
-    "*": deny
+    "git difftool*": deny
+    "mkdir *..*": deny
+    "mkdir -p .opencode/* ?*": deny
+    "mkdir *$*": deny
+    "mkdir *\t*": deny
+    "*>*": deny
+    "*--ou*": deny
   webfetch: deny
   websearch: deny
   task:

@@ -1,0 +1,41 @@
+{
+  "name": "amp-light",
+  "provisional": "simstech tokens v1 (artifact #3, ticket #1815 not closed)",
+  "colors": {
+    "text": "#16181B", "muted": "#50555C", "dim": "#676C74", "accent": "#2C66B8",
+    "error": "#B23A20", "success": "#2A6E45", "warning": "#9A5E0A", "info": "#2C66B8",
+    "background": "default", "surface": "#EFEFEC", "border": "#83888F",
+    "borderAccent": "#CF4426", "borderMuted": "#C3C5C1", "selection": "#D1DDEF",
+    "cursor": "#CF4426", "thinkingText": "#676C74",
+    "mdHeading": "#16181B", "mdLink": "#2C66B8", "mdLinkUrl": "#676C74",
+    "mdCode": "#16181B", "mdCodeBg": "#EFEFEC", "mdCodeBlock": "#16181B",
+    "mdCodeBlockBg": "#EFEFEC", "mdCodeBlockBorder": "#C3C5C1", "mdQuote": "#50555C",
+    "mdQuoteBorder": "#C3C5C1", "mdHr": "#C3C5C1", "mdListBullet": "#83888F",
+    "toolPendingBg": "#F2F6FB", "toolSuccessBg": "#FAFAF9", "toolErrorBg": "#FCF4F2",
+    "toolTitle": "#16181B", "toolOutput": "#50555C", "bashMode": "#9A5E0A",
+    "customMessageBg": "#F4F2F9", "customMessageLabel": "#7A5BB5", "customMessageText": "#16181B",
+    "toolDiffAdded": "#2A6E45", "toolDiffRemoved": "#B23A20", "toolDiffContext": "#676C74"
+  },
+  "colors256": {
+    "text": 234, "muted": 240, "dim": 242, "accent": 25, "error": 88, "success": 29,
+    "warning": 94, "info": 25, "surface": 255, "border": 102, "borderAccent": 124,
+    "borderMuted": 251, "selection": 253, "cursor": 124, "thinkingText": 242,
+    "mdHeading": 234, "mdLink": 25, "mdLinkUrl": 242, "mdCode": 234, "mdCodeBg": 255,
+    "mdCodeBlock": 234, "mdCodeBlockBg": 255, "mdCodeBlockBorder": 251, "mdQuote": 240,
+    "mdQuoteBorder": 251, "mdHr": 251, "mdListBullet": 102,
+    "toolPendingBg": "default", "toolSuccessBg": "default", "toolErrorBg": "default",
+    "toolTitle": 234, "toolOutput": 240, "bashMode": 94,
+    "customMessageBg": "default", "customMessageLabel": 97, "customMessageText": 234,
+    "toolDiffAdded": 29, "toolDiffRemoved": 88, "toolDiffContext": 242
+  },
+  "amp": {
+    "state": { "ready": "#16181B", "prog": "#2C66B8", "progFill": "#2C66B8", "wait": "#676C74",
+               "flag": "#CF4426", "flagText": "#B23A20", "onFlag": "#FFFFFF", "sched": "#7A5BB5", "done": "#16181B" },
+    "state256": { "ready": 234, "prog": 25, "progFill": 25, "wait": 242, "flag": 124, "flagText": 88, "onFlag": 231, "sched": 97, "done": 234 },
+    "glyph": { "ready": "□", "prog": "■", "wait": "□", "flag": "■", "sched": "■", "done": "■" },
+    "epic": ["#3D5A98", "#1F7F74", "#8A4F9E", "#66732A", "#B8457A", "#94642B"],
+    "epic256": [25, 30, 97, 58, 168, 94],
+    "bands": ["#D9482B", "#EB8A2E", "#EBC34B", "#2C66B8"],
+    "bands256": [124, 172, 221, 25]
+  }
+}

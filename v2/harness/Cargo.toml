@@ -46,6 +46,16 @@ rmcp = { version = "=3.6.0", default-features = false, features = [
 
 clap = { version = "4.6", features = ["derive"] }
 
+# Tool-path resolution in the policy (#2141) copies rpi-tools 0.8.0's: the same home dir (dirs) and
+# the read tools' NFD variant (unicode-normalization). Same versions rpi-tools uses.
+dirs = "5"
+unicode-normalization = "0.1"
+
+# Embedded agent/skill assets (D5): v2/harness/assets, generated from v2/.opencode.
+include_dir = "0.7"
+# Agent/skill frontmatter. Same exact version rpi-harness pins, so there is one copy.
+yaml_serde = "=0.10.2"
+
 # OAuth credential store (D3): OS keychain via keyring 4.x (macOS Keychain, Windows Credential Manager,
 # Secret Service on Linux), with a 0600 file fallback. rmcp's CredentialStore trait is #[async_trait].
 keyring = "4.2"
@@ -62,6 +72,8 @@ serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["sync", "time"] }
 toml = "1"
+# rpi-ai's CancellationToken type (amp-core's provider stall guard).
+tokio-util = "0.7"
 tracing = "0.1"
 
 # Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
