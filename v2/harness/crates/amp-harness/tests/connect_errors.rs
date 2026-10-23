@@ -218,6 +218,43 @@ async fn the_chat_opens_offline_when_amp_is_unreachable() {
     assert_plain(screen);
 }
 
+/// #2211: `/server` from an offline chat (no AMP tools) to a full server summarises the tool
+/// change in one line instead of listing every tool name.
+#[tokio::test]
+async fn switching_from_offline_summarises_the_new_tools() {
+    let port = closed_port().await;
+    let down = format!("http://127.0.0.1:{port}/mcp");
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("chat-offline-switch", None);
+    write_faux_config(&dir);
+    let state = dir.join("home/.local/state");
+    let target = format!("/server {}", amp.url);
+    let out = run(
+        &dir,
+        &down,
+        &["--snapshot", "200x50", "--no-setup", "--input", &target],
+        &[("XDG_STATE_HOME", state.to_str().unwrap())],
+    )
+    .await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+    let screen = &out.stdout;
+    let line = screen
+        .lines()
+        .find(|l| l.contains("the manager's AMP tools:"))
+        .unwrap_or_else(|| panic!("no tools line in\n{screen}"));
+    assert!(line.contains("(was 0; "), "not a summary: {line:?}");
+    assert!(line.contains(" added)"), "not a summary: {line:?}");
+    assert!(!screen.contains("+amp_"), "tool names listed in\n{screen}");
+    assert!(
+        screen.contains("its prompt names the new server"),
+        "{screen}"
+    );
+}
+
 /// The offline chat connects once AMP comes up: the transcript says so, and the model's AMP
 /// tools work (its `amp_whoami` reaches the server).
 #[tokio::test]
