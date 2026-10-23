@@ -35,18 +35,23 @@ rpi-tools = "=0.8.0"
 rpi-harness = "=0.8.0"
 rpi-tui = "=0.8.0"
 
-# MCP client: exact pin (D2, D3). Streamable HTTP over reqwest with rustls, OAuth (`auth`).
+# MCP client: exact pin (D2, D3). Streamable HTTP over reqwest with rustls, OAuth (`auth`), and
+# stdio child processes for local servers (#2236, `transport-child-process`).
 # Default features (server, macros) are off; tests that need an in-process server add them as dev-deps.
 rmcp = { version = "=3.6.0", default-features = false, features = [
     "client",
     "transport-streamable-http-client-reqwest",
     "auth",
     "reqwest",
+    "transport-child-process",
 ] }
 
 # Local date/time for the per-request clock stamp (#2250). Both already in the tree through rmcp.
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 iana-time-zone = "0.1.65"
+# Stdio MCP servers (#2236): spawn in their own session/process group and kill the whole group. The
+# same major rmcp's `transport-child-process` uses, so there is one copy.
+process-wrap = { version = "10.0", features = ["tokio1"] }
 
 clap = { version = "4.6", features = ["derive"] }
 # Raw-mode key reading for hidden secret entry in setup. Same version rpi-tui 0.8.0 uses.
