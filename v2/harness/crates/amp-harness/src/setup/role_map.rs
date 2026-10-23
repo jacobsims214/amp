@@ -156,35 +156,51 @@ fn hinted<'a>(g: &RoleGroup, models: &'a [String]) -> Option<&'a String> {
     })
 }
 
-/// Default model per group by name match (`orchestrator` -> manager, `engineer` -> workers):
-/// workers get their match, else the first model the manager didn't match; the manager its match,
-/// else the workers' model; reviewers their match, else the manager's; helpers theirs, else the
-/// workers'. `models` must not be empty.
-pub fn guess(models: &[String]) -> BTreeMap<&'static str, String> {
+/// One model per group, the same way everywhere (first run, `connect --role`, presets): the
+/// models `given` for a group win; a group not given takes the model in `models` whose id suggests
+/// it (`orchestrator` -> manager, `engineer` -> workers, `review` -> reviewers, `mini` ->
+/// helpers); then the followers: **reviewers follow the manager and helpers follow the workers**.
+/// The workers fall back to the first model the manager didn't take, and the manager to the
+/// workers' model. A group is left out only when nothing at all decides it (no models, nothing
+/// given).
+pub fn fill_groups(
+    given: &BTreeMap<&str, String>,
+    models: &[String],
+) -> BTreeMap<&'static str, String> {
     let by = |name: &str| GROUPS.iter().find(|g| g.name == name).expect("known group");
-    let manager_hit = hinted(by("manager"), models).cloned();
-    let workers = hinted(by("workers"), models)
-        .cloned()
+    let pick = |name: &str| {
+        given
+            .get(name)
+            .cloned()
+            .or_else(|| hinted(by(name), models).cloned())
+    };
+    let manager_hit = pick("manager");
+    let workers = pick("workers")
         .or_else(|| {
             models
                 .iter()
                 .find(|m| Some(*m) != manager_hit.as_ref())
                 .cloned()
         })
-        .unwrap_or_else(|| models[0].clone());
-    let manager = manager_hit.unwrap_or_else(|| workers.clone());
-    let reviewers = hinted(by("reviewers"), models)
-        .cloned()
-        .unwrap_or_else(|| manager.clone());
-    let helpers = hinted(by("helpers"), models)
-        .cloned()
-        .unwrap_or_else(|| workers.clone());
-    BTreeMap::from([
+        .or_else(|| manager_hit.clone());
+    let manager = manager_hit.or_else(|| workers.clone());
+    let reviewers = pick("reviewers").or_else(|| manager.clone());
+    let helpers = pick("helpers").or_else(|| workers.clone());
+    [
         ("manager", manager),
         ("workers", workers),
         ("reviewers", reviewers),
         ("helpers", helpers),
-    ])
+    ]
+    .into_iter()
+    .filter_map(|(g, m)| m.map(|m| (g, m)))
+    .collect()
+}
+
+/// Default model per group by name match, for the first run's question: [`fill_groups`] with
+/// nothing given. `models` must not be empty.
+pub fn guess(models: &[String]) -> BTreeMap<&'static str, String> {
+    fill_groups(&BTreeMap::new(), models)
 }
 
 /// An assignment from one model per group (`provider/model` refs); every other role gets the
@@ -290,16 +306,26 @@ pub fn current(cfg: &ModelsConfig) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// An assignment from `ROLE=MODEL` pairs on `provider`. The default is the model given for `all`,
-/// else for the workers, else for worker-backend, else worker-backend's current model when it is
-/// already on `provider`, else the first pair's. A role nobody named keeps its current model when
-/// that is on `provider` (so `--role reviewers=x` changes only the reviewers), else runs on the
-/// default: every role ends up on `provider`.
+/// An assignment from `ROLE=MODEL` pairs on `provider`, whose models are `models`
+/// (`provider/model` refs; may be empty). The groups nobody named are filled by [`fill_groups`],
+/// the same rule as the first run: so `manager=orchestrator worker=engineer` also puts the
+/// reviewers on orchestrator and the helpers on engineer.
+///
+/// A role nobody named:
+/// - takes its group's model when that group follows a group named here (the reviewers follow
+///   `manager=`, the helpers follow `workers=`), or when `all` was given;
+/// - otherwise keeps its current model when that is already on `provider` (so
+///   `--role reviewers=x` alone changes only the reviewers);
+/// - otherwise takes its group's model (by name match or following), else the default.
+///
+/// The default (`[models] inherit`: roles outside the groups, agents added later) is the `all`
+/// model, else worker-backend's. Every role ends up on `provider`.
 pub fn from_pairs(
     pairs: &[(String, String)],
     roles: &[String],
     resolve_model: &dyn Fn(&str) -> Result<String, String>,
     provider: &str,
+    models: &[String],
     current: &BTreeMap<String, String>,
 ) -> Result<Assignment, String> {
     if pairs.is_empty() {
@@ -318,29 +344,70 @@ pub fn from_pairs(
             .find(|(_, _, w)| pred(w))
             .map(|(_, m, _)| m.clone())
     };
+    let all = pick(&|w| ALL.contains(&w));
+    // The groups named here (`all` names them all; a later group word wins).
+    let mut given: BTreeMap<&str, String> = BTreeMap::new();
+    for g in GROUPS {
+        let own = pick(&|w| group(w).is_some_and(|x| x.name == g.name));
+        if let Some(m) = own.or_else(|| all.clone()) {
+            given.insert(g.name, m);
+        }
+    }
     let on_provider = |m: &&String| m.starts_with(&format!("{provider}/"));
-    let default = pick(&|w| ALL.contains(&w))
-        .or_else(|| pick(&|w| group(w).is_some_and(|g| g.name == "workers")))
+    let filled = fill_groups(&given, models);
+    // A group decided by this call: named, or following a group that was named.
+    let decided = |g: &str| {
+        given.contains_key(g)
+            || match g {
+                "reviewers" => {
+                    given.contains_key("manager") && hinted(by_name(g), models).is_none()
+                }
+                "helpers" => given.contains_key("workers") && hinted(by_name(g), models).is_none(),
+                _ => false,
+            }
+    };
+    let workers_model = given
+        .get("workers")
+        .cloned()
         .or_else(|| pick(&|w| normalize_role(w) == "worker-backend"))
+        .or_else(|| filled.get("workers").cloned())
         .or_else(|| current.get("worker-backend").filter(on_provider).cloned())
         .unwrap_or_else(|| named[0].1.clone());
-    let explicit_all = pick(&|w| ALL.contains(&w)).is_some();
-    let mut out: BTreeMap<String, String> = roles
-        .iter()
-        .map(|r| {
-            let keep = current.get(r).filter(on_provider).filter(|_| !explicit_all);
-            (r.clone(), keep.cloned().unwrap_or_else(|| default.clone()))
-        })
-        .collect();
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for r in roles {
+        let g = GROUPS.iter().find(|g| g.roles.contains(&r.as_str()));
+        let model = match g {
+            Some(g) if decided(g.name) => filled[g.name].clone(),
+            _ if all.is_some() => all.clone().unwrap_or_default(),
+            _ => match current.get(r).filter(on_provider) {
+                Some(keep) => keep.clone(),
+                None => g
+                    .filter(|g| g.name != "workers")
+                    .and_then(|g| filled.get(g.name))
+                    .cloned()
+                    .unwrap_or_else(|| workers_model.clone()),
+            },
+        };
+        out.insert(r.clone(), model);
+    }
     for (targets, model, _) in &named {
         for r in targets {
             out.insert(r.clone(), model.clone());
         }
     }
+    let default = all.unwrap_or_else(|| {
+        out.get("worker-backend")
+            .cloned()
+            .unwrap_or_else(|| workers_model.clone())
+    });
     Ok(Assignment {
         default,
         roles: out,
     })
+}
+
+fn by_name(name: &str) -> &'static RoleGroup {
+    GROUPS.iter().find(|g| g.name == name).expect("known group")
 }
 
 /// The changes that put `a` into config.toml (`doc` is the file's current table): inherit mode
@@ -479,17 +546,25 @@ mod tests {
         let knows = |p: &str, m: &str| p == "ex" && ["engineer", "orchestrator"].contains(&m);
         let ids = vec!["ex".to_owned(), "openrouter".to_owned()];
         let resolve = |m: &str| model_ref(m, Some("ex"), &knows, &ids);
+        let models = vec!["ex/engineer".to_owned(), "ex/orchestrator".to_owned()];
         let pairs =
             parse_pairs(&["manager=orchestrator".into(), "worker=engineer".into()]).unwrap();
-        let a = from_pairs(&pairs, &roles, &resolve, "ex", &BTreeMap::new()).unwrap();
+        let a = from_pairs(&pairs, &roles, &resolve, "ex", &models, &BTreeMap::new()).unwrap();
         assert_eq!(a.default, "ex/engineer");
         assert_eq!(a.roles["manager"], "ex/orchestrator");
         assert_eq!(a.roles["worker-docs"], "ex/engineer");
-        assert_eq!(
-            a.roles["reviewer"], "ex/engineer",
-            "unnamed roles: the default"
-        );
+        // #2307: the same as the first run: reviewers follow the manager, helpers the workers.
+        assert_eq!(a.roles["reviewer"], "ex/orchestrator");
+        assert_eq!(a.roles["github-reviewer"], "ex/orchestrator");
+        assert_eq!(a.roles["researcher"], "ex/engineer");
         assert!(a.roles.values().all(|m| m.starts_with("ex/")));
+        // ... even when the roles are already on this provider (a re-connect).
+        let on_ex: BTreeMap<String, String> = roles
+            .iter()
+            .map(|r| (r.clone(), "ex/engineer".to_owned()))
+            .collect();
+        let again = from_pairs(&pairs, &roles, &resolve, "ex", &models, &on_ex).unwrap();
+        assert_eq!(again, a);
 
         // A role after its group wins; amp- prefixes are fine; `all` sets the default.
         let pairs = parse_pairs(&[
@@ -498,7 +573,7 @@ mod tests {
             "amp-worker-docs=ex/orchestrator".into(),
         ])
         .unwrap();
-        let a = from_pairs(&pairs, &roles, &resolve, "ex", &BTreeMap::new()).unwrap();
+        let a = from_pairs(&pairs, &roles, &resolve, "ex", &models, &BTreeMap::new()).unwrap();
         assert_eq!(a.default, "ex/orchestrator");
         assert_eq!(a.roles["worker-backend"], "ex/engineer");
         assert_eq!(a.roles["worker-docs"], "ex/orchestrator");
@@ -509,7 +584,8 @@ mod tests {
             ("manager=openrouter/nope", "openrouter has no model `nope`"),
         ] {
             let pairs = parse_pairs(&[bad.into()]).unwrap();
-            let e = from_pairs(&pairs, &roles, &resolve, "ex", &BTreeMap::new()).unwrap_err();
+            let e =
+                from_pairs(&pairs, &roles, &resolve, "ex", &models, &BTreeMap::new()).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");
         }
         // Only the reviewers: the rest keep their models on this provider; a role still on
@@ -521,7 +597,7 @@ mod tests {
         now.insert("manager".into(), "ex/orchestrator".into());
         now.insert("media".into(), "openrouter/x".into());
         let pairs = parse_pairs(&["reviewers=orchestrator".into()]).unwrap();
-        let a = from_pairs(&pairs, &roles, &resolve, "ex", &now).unwrap();
+        let a = from_pairs(&pairs, &roles, &resolve, "ex", &models, &now).unwrap();
         assert_eq!(a.default, "ex/engineer");
         assert_eq!(a.roles["manager"], "ex/orchestrator");
         assert_eq!(a.roles["reviewer"], "ex/orchestrator");
@@ -529,6 +605,54 @@ mod tests {
         assert_eq!(a.roles["media"], "ex/engineer");
         assert!(parse_pairs(&["manager".into()]).is_err());
         assert!(parse_pairs(&["=x".into()]).is_err());
+    }
+
+    #[test]
+    fn connect_setup_and_presets_share_one_group_rule() {
+        // #2307: the first run's guess is fill_groups with nothing given...
+        let models: Vec<String> = ["engineer", "orchestrator", "code-reviewer", "fast-mini"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(guess(&models), fill_groups(&BTreeMap::new(), &models));
+        // ... and what is given wins, the rest is matched by name or follows.
+        let given = BTreeMap::from([("manager", "orchestrator".to_owned())]);
+        let g = fill_groups(&given, &["engineer".into(), "orchestrator".into()]);
+        assert_eq!(g["reviewers"], "orchestrator");
+        assert_eq!(g["helpers"], "engineer");
+        let g = fill_groups(&given, &models);
+        assert_eq!(g["reviewers"], "code-reviewer");
+        assert_eq!(g["helpers"], "fast-mini");
+        // Nothing to go on: only what is given (and its followers).
+        let g = fill_groups(&given, &[]);
+        assert_eq!(g.len(), 4, "{g:?}");
+        assert!(g.values().all(|m| m == "orchestrator"));
+        assert!(fill_groups(&BTreeMap::new(), &[]).is_empty());
+
+        // from_pairs with a reviewer model on the provider: it is matched by name, as at setup.
+        let roles = roles();
+        let knows = |p: &str, m: &str| {
+            p == "ex" && ["engineer", "orchestrator", "code-reviewer"].contains(&m)
+        };
+        let ids = vec!["ex".to_owned()];
+        let resolve = |m: &str| model_ref(m, Some("ex"), &knows, &ids);
+        let refs: Vec<String> = ["engineer", "orchestrator", "code-reviewer"]
+            .map(|m| format!("ex/{m}"))
+            .to_vec();
+        let pairs =
+            parse_pairs(&["manager=orchestrator".into(), "workers=engineer".into()]).unwrap();
+        let a = from_pairs(&pairs, &roles, &resolve, "ex", &refs, &BTreeMap::new()).unwrap();
+        assert_eq!(a.roles["reviewer"], "ex/code-reviewer");
+        assert_eq!(a.roles["kb-curator"], "ex/engineer");
+        // worker-backend alone changes worker-backend only; the others keep theirs.
+        let on_ex: BTreeMap<String, String> = roles
+            .iter()
+            .map(|r| (r.clone(), "ex/orchestrator".to_owned()))
+            .collect();
+        let pairs = parse_pairs(&["worker-backend=engineer".into()]).unwrap();
+        let a = from_pairs(&pairs, &roles, &resolve, "ex", &refs, &on_ex).unwrap();
+        assert_eq!(a.roles["worker-backend"], "ex/engineer");
+        assert_eq!(a.roles["worker-docs"], "ex/orchestrator");
+        assert_eq!(a.roles["researcher"], "ex/orchestrator");
     }
 
     #[test]

@@ -296,6 +296,41 @@ async fn an_anthropic_key_alone_selects_the_anthropic_profile() {
     assert_not_in_files(&dir, SECRET);
 }
 
+/// #2307: `setup --url` takes what `server set` takes: `127.0.0.1:PORT` is http://…/mcp.
+#[tokio::test]
+async fn setup_url_takes_a_bare_host_and_port_like_server_set() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("setup-bare-url", None);
+    let bare = amp
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches("/mcp")
+        .to_owned();
+    let out = Run::new(
+        &dir,
+        &["setup", "--yes", "--url", &bare, "--no-project", "--json"],
+    )
+    .env("ANTHROPIC_API_KEY", SECRET)
+    .go()
+    .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(out.json()["server"], amp.url.as_str());
+    assert!(
+        config_text(&dir).contains(&format!("url = \"{}\"", amp.url)),
+        "{}",
+        config_text(&dir)
+    );
+    // Not an address at all: refused before anything is tried.
+    let out = Run::new(
+        &dir,
+        &["setup", "--yes", "--url", "ftp://x", "--no-project"],
+    )
+    .go()
+    .await;
+    assert_eq!(out.code, 2, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("--url"), "{}", out.stderr);
+}
+
 #[tokio::test]
 async fn init_never_opens_a_login_with_yes() {
     let amp = spawn(MockAmp::new(), Some("right-token")).await;

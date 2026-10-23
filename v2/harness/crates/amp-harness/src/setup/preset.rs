@@ -460,6 +460,7 @@ pub fn check(text: &str, source: &str) -> Result<Checked, CliError> {
                     .unwrap_or_default()
             )),
             auth,
+            merge: false,
         };
         // It must load as config.toml would (model settings included).
         spec.config().map_err(|e| {
@@ -558,7 +559,12 @@ fn assignment(
     } else {
         role_map::current(cfg)
     };
-    role_map::from_pairs(&pairs, &roles, &resolve, &provider, &current)
+    let models: Vec<String> = cfg
+        .providers
+        .get(&provider)
+        .map(|p| p.models.keys().map(|m| format!("{provider}/{m}")).collect())
+        .unwrap_or_default();
+    role_map::from_pairs(&pairs, &roles, &resolve, &provider, &models, &current)
         .map(Some)
         .map_err(|e| bad(&checked.source, format!("[roles]: {e}")))
 }

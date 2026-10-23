@@ -62,13 +62,18 @@ overrides the profile for one shell.
 When you connect a provider, you can place its models on the roles in one go:
 
 ```sh
-amp-harness connect example --role manager=orchestrator --role workers=engineer --role reviewers=orchestrator
+amp-harness connect example --role manager=orchestrator --role workers=engineer
 ```
 
 - ROLE is a group (`manager`, `workers`, `reviewers`, `helpers`), `all`, or one role's name.
   MODEL is one of the provider's models. Both are checked before anything is saved.
-- Roles you don't name keep their model if it is already on this provider. Otherwise they go to
-  the workers' model (or the `all` model). Either way, every role ends up on this provider.
+- Groups you don't name follow the same rule as the first run (below). The reviewers follow the
+  manager and the helpers follow the workers, unless a model's name points at them (`review`,
+  or `mini`/`fast`/`flash`). So the command above also puts the reviewers on `orchestrator` and
+  the helpers on `engineer`.
+- Naming only some roles changes only those. For example, `--role reviewers=engineer` leaves
+  the rest where they are. A role still on another provider moves to its group's model, so
+  every role ends up on this provider. `all` names every role.
 - A provider that already has its key isn't asked for it again, so the same command remaps the
   roles any time. In the chat: `/connect example manager=orchestrator workers=engineer`.
 

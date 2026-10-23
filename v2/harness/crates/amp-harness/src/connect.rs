@@ -33,7 +33,7 @@ use amp_core::{
     agent::Runtime,
     models::{
         DEFAULT_PROFILE, ModelsConfig, ModelsFile, ProviderApi, ProviderAuth, ProviderConfig,
-        Selection,
+        ProviderSpec, Selection,
     },
     provider_auth::{CLIENT_KEY_SECRET, secret_account},
     providers::{
@@ -48,7 +48,7 @@ use crate::{
     config_cmd,
     conn::{CliError, print_json},
     setup::{
-        self, ConfigFile, KeyCheck,
+        self, Change, ConfigFile, KeyCheck,
         config_file::toml_string,
         role_map,
         ui::{self, Ui},
@@ -105,8 +105,11 @@ pub struct ConnectArgs {
     pub role_model: Option<String>,
     /// Run a role (or group) on one of this provider's models, e.g. `--role manager=orchestrator
     /// --role worker=engineer` (repeatable). Groups: manager, workers, reviewers, helpers, all;
-    /// or a role name. Roles not named run on the workers' model, so every role is on this
-    /// provider. A provider that already has its key is not asked for it again.
+    /// or a role name. As in the first run, unnamed reviewers follow `manager=` and unnamed
+    /// helpers follow `workers=` (unless a model's name suggests them, e.g. `review`, `mini`).
+    /// Any other role not named keeps its model if it is already on this provider, else moves to
+    /// its group's model, so every role ends up on this provider. A provider that already has
+    /// its key is not asked for it again.
     #[arg(long = "role", value_name = "ROLE=MODEL")]
     pub roles: Vec<String>,
     /// Custom provider: how requests authenticate (#2277): bearer (default), header, none,
@@ -354,7 +357,37 @@ pub struct CustomSpec {
     pub note: Option<String>,
     /// Auth, OpenAI org/project, query, TLS and proxy settings (#2277).
     pub auth: AuthSpec,
+    /// #2307: a re-connect of a provider already in config.toml: [`CustomSpec::merge_write`]
+    /// changes only the keys that differ and keeps its models, timeouts and comments.
+    pub merge: bool,
 }
+
+/// The `[providers.<id>]` keys a [`CustomSpec`] writes; a re-connect removes only these, and only
+/// when the new settings drop them (another `--auth`, a key no longer needed).
+const SPEC_KEYS: &[&str] = &[
+    "name",
+    "api",
+    "base_url",
+    "key_env",
+    "auth",
+    "auth_header",
+    "auth_command",
+    "auth_command_timeout_secs",
+    "token_url",
+    "client_id",
+    "scopes",
+    "tenant_id",
+    "authority_host",
+    "organization",
+    "project",
+    "query",
+    "ca_file",
+    "client_cert",
+    "client_key",
+    "proxy",
+    "headers",
+    "secret_headers",
+];
 
 /// A custom provider's auth and transport settings, as written to its table (#2277). Only the
 /// mTLS key PEM is secret: it goes to the keychain (`provider:<id>:client-key`), never the file.
@@ -529,6 +562,78 @@ impl AuthSpec {
         Ok(a)
     }
 
+    /// The settings an existing `[providers.<id>]` table has (#2307).
+    pub(crate) fn from_spec(p: &ProviderSpec) -> Self {
+        AuthSpec {
+            kind: p
+                .auth
+                .as_deref()
+                .map(|k| k.trim().to_ascii_lowercase())
+                .unwrap_or_default(),
+            auth_header: p.auth_header.clone(),
+            auth_command: p.auth_command.clone().unwrap_or_default(),
+            token_url: p.token_url.clone(),
+            client_id: p.client_id.clone(),
+            scopes: p.scopes.clone().unwrap_or_default(),
+            tenant_id: p.tenant_id.clone(),
+            authority_host: p.authority_host.clone(),
+            auth_command_timeout_secs: p.auth_command_timeout_secs,
+            organization: p.organization.clone(),
+            project: p.project.clone(),
+            query: p.query.clone().unwrap_or_default(),
+            ca_file: p.ca_file.clone(),
+            client_cert: p.client_cert.clone(),
+            client_key: p.client_key.clone(),
+            proxy: p.proxy.clone(),
+            client_key_pem: None,
+        }
+    }
+
+    /// `self` (the settings already there) with what the flags in `given` set on top (#2307). A
+    /// new `--auth` drops the old auth's own settings (header, command, token URL, client id,
+    /// scopes, tenant), since they don't apply to another auth; everything else stays unless a
+    /// flag changes it. `--query` adds to the query parameters.
+    pub(crate) fn overlay(mut self, given: AuthSpec, auth_given: bool) -> Self {
+        if auth_given && given.kind != self.kind {
+            self.kind = given.kind.clone();
+            self.auth_header = None;
+            self.auth_command.clear();
+            self.auth_command_timeout_secs = None;
+            self.token_url = None;
+            self.client_id = None;
+            self.scopes.clear();
+            self.tenant_id = None;
+            self.authority_host = None;
+        }
+        let set = |old: &mut Option<String>, new: Option<String>| {
+            if new.is_some() {
+                *old = new;
+            }
+        };
+        set(&mut self.auth_header, given.auth_header);
+        set(&mut self.token_url, given.token_url);
+        set(&mut self.client_id, given.client_id);
+        set(&mut self.tenant_id, given.tenant_id);
+        set(&mut self.organization, given.organization);
+        set(&mut self.project, given.project);
+        set(&mut self.ca_file, given.ca_file);
+        set(&mut self.client_cert, given.client_cert);
+        set(&mut self.client_key, given.client_key);
+        set(&mut self.proxy, given.proxy);
+        if !given.auth_command.is_empty() {
+            self.auth_command = given.auth_command;
+        }
+        if !given.scopes.is_empty() {
+            self.scopes = given.scopes;
+        }
+        self.query.extend(given.query);
+        if given.client_key_pem.is_some() {
+            self.client_key_pem = given.client_key_pem;
+            self.client_key = None;
+        }
+        self
+    }
+
     /// Whether any flag set something.
     pub(crate) fn is_set(&self) -> bool {
         !self.lines(true).is_empty() || self.client_key_pem.is_some()
@@ -558,6 +663,7 @@ impl Default for CustomSpec {
             model_specs: BTreeMap::new(),
             note: None,
             auth: AuthSpec::default(),
+            merge: false,
         }
     }
 }
@@ -656,6 +762,118 @@ impl CustomSpec {
             &check,
         )
     }
+}
+
+impl CustomSpec {
+    /// #2307: writes a re-connect into the `[providers.<id>]` table already in config.toml by
+    /// changing only the keys that differ: its models (`models set --no-check` ones included),
+    /// timeouts, other settings and comments stay. Falls back to [`CustomSpec::write`] when the
+    /// table isn't there. Returns the backup and what changed, for people.
+    pub(crate) fn merge_write(
+        &self,
+        config: &ConfigFile,
+    ) -> Result<(Option<PathBuf>, Vec<String>), String> {
+        let text = config.text()?.unwrap_or_default();
+        let doc: toml::Table = toml::from_str(&text)
+            .map_err(|e| format!("{} does not parse: {}", config.path.display(), e.message()))?;
+        let Some(old) = raw_table(&doc, &self.id) else {
+            let backup = self.write(config)?;
+            return Ok((backup, vec![format!("added [providers.{}]", self.id)]));
+        };
+        let new_doc: toml::Table = toml::from_str(&self.block()).map_err(|e| e.to_string())?;
+        let new = raw_table(&new_doc, &self.id).cloned().unwrap_or_default();
+        let section = format!("providers.{}", self.id);
+        let mut changes = Vec::new();
+        let mut said = Vec::new();
+        for (k, v) in &new {
+            if k == "models" {
+                continue;
+            }
+            if old.get(k) != Some(v) {
+                changes.push(Change::set_value(&section, k, v));
+                said.push(format!("{k} = {v}"));
+            }
+        }
+        for k in SPEC_KEYS {
+            let bearer_word = *k == "auth"
+                && old
+                    .get("auth")
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|a| matches!(a, "key" | "bearer"));
+            if old.contains_key(*k) && !new.contains_key(*k) && !bearer_word {
+                changes.push(Change::remove(&section, k));
+                said.push(format!("removed {k}"));
+            }
+        }
+        let old_models = old.get("models").and_then(toml::Value::as_table);
+        for m in &self.models {
+            if old_models.is_some_and(|t| t.contains_key(m)) {
+                continue;
+            }
+            changes.push(Change::AddTable(vec![
+                "providers".to_owned(),
+                self.id.clone(),
+                "models".to_owned(),
+                m.clone(),
+            ]));
+            if let Some(spec) = self.model_specs.get(m) {
+                let model_section = format!(
+                    "{section}.models.{}",
+                    crate::setup::config_file::toml_key(m)
+                );
+                for (k, v) in spec {
+                    changes.push(Change::set_value(&model_section, k, v));
+                }
+            }
+            said.push(format!("added model {m}"));
+        }
+        if changes.is_empty() {
+            return Ok((None, said));
+        }
+        let preview = config.preview(&changes)?;
+        let user = ModelsFile::parse(&preview, "config.toml").map_err(|e| {
+            format!(
+                "{}: the change would not load ({}); nothing was written",
+                config.path.display(),
+                e.0
+            )
+        })?;
+        let cfg = ModelsConfig::from_files(ModelsFile::defaults(), Some(user), "config", &|_| None)
+            .map_err(|e| {
+                format!(
+                    "{}: the change would not load ({}); nothing was written",
+                    config.path.display(),
+                    e.0
+                )
+            })?;
+        if cfg
+            .providers
+            .get(&self.id)
+            .is_none_or(|p| p.base_url != self.base_url)
+        {
+            return Err(format!(
+                "[providers.{}] did not come out as written",
+                self.id
+            ));
+        }
+        let backup = config.edit(&changes)?;
+        Ok((backup, said))
+    }
+}
+
+/// The raw `[providers.<id>]` table in a parsed config.toml.
+fn raw_table<'a>(doc: &'a toml::Table, id: &str) -> Option<&'a toml::Table> {
+    doc.get("providers")?.as_table()?.get(id)?.as_table()
+}
+
+/// The `[providers.<id>]` table the user's config.toml has, as written there (not merged with
+/// the defaults), for a re-connect to start from (#2307).
+fn existing_spec(id: &str) -> Option<ProviderSpec> {
+    let text = config_file().ok()?.text().ok()??;
+    let doc: toml::Table = toml::from_str(&text).ok()?;
+    toml::Value::Table(raw_table(&doc, id)?.clone())
+        .try_into()
+        .ok()
 }
 
 /// Every secret this connect stores, keyed as [`StaticKeys`] looks them up. `client_key`: an mTLS
@@ -910,6 +1128,10 @@ pub struct ConnectSummary {
     pub models_added: Vec<String>,
     /// The roles' new model selection, when this run changed it.
     pub selection: Option<String>,
+    /// #2307: a re-connect's changes to the provider's table (`ca_file = "…"`, `added model m`,
+    /// `removed auth_header`); empty for a new provider.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
 }
 
 enum Target {
@@ -1018,8 +1240,8 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         s.needs_key = false;
     }
 
-    // Model ids for a new provider.
-    if let Some(s) = spec.as_mut() {
+    // Model ids for a new provider (#2307: a re-connect keeps its models; --model adds more).
+    if let Some(s) = spec.as_mut().filter(|s| !s.merge) {
         let provider = s.config().map_err(CliError::new)?;
         s.models = pick_models(
             &args,
@@ -1035,10 +1257,19 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
     let assignment = if role_pairs.is_empty() {
         None
     } else {
-        let models: Vec<String> = match &spec {
+        let mut models: Vec<String> = match &spec {
             Some(s) => s.models.clone(),
             None => provider.models.keys().cloned().collect(),
         };
+        if spec.as_ref().is_some_and(|s| s.merge)
+            && let Some(p) = cfg.providers.get(&provider.id)
+        {
+            for m in p.models.keys() {
+                if !models.contains(m) {
+                    models.push(m.clone());
+                }
+            }
+        }
         Some(assignment_for(&cfg, &provider.id, &models, &role_pairs)?)
     };
 
@@ -1088,7 +1319,38 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
             "Stored the {header} header value in the OS keychain."
         ));
     }
-    if let Some(s) = &spec {
+    if let Some(s) = spec.as_ref().filter(|s| s.merge) {
+        let (backup, changed) = s.merge_write(&config).map_err(CliError::new)?;
+        summary.backup = backup;
+        summary.models_added = changed
+            .iter()
+            .filter_map(|c| c.strip_prefix("added model "))
+            .map(str::to_owned)
+            .collect();
+        let kept = cfg.providers.get(&s.id).map_or(0, |p| p.models.len());
+        if changed.is_empty() {
+            ui.say(&format!("[providers.{}] is unchanged.", s.id));
+        } else {
+            ui.say(&format!(
+                "Updated [providers.{}] in {}{}:",
+                s.id,
+                config.path.display(),
+                summary
+                    .backup
+                    .as_ref()
+                    .map(|b| format!(" (previous file: {})", b.display()))
+                    .unwrap_or_default()
+            ));
+            for c in &changed {
+                ui.say(&format!("  {c}"));
+            }
+        }
+        ui.say(&format!(
+            "  kept its other settings and its {kept} model{}",
+            if kept == 1 { "" } else { "s" }
+        ));
+        summary.changed = changed;
+    } else if let Some(s) = &spec {
         summary.backup = s.write(&config).map_err(CliError::new)?;
         summary.models_added = s.models.clone();
         ui.say(&format!(
@@ -1145,11 +1407,13 @@ fn assignment_for(
     };
     let resolve = |m: &str| role_map::model_ref(m, Some(provider), &knows, &ids);
     let current = role_map::current(cfg);
+    let refs: Vec<String> = models.iter().map(|m| format!("{provider}/{m}")).collect();
     role_map::from_pairs(
         pairs,
         &role_map::all_roles(cfg),
         &resolve,
         provider,
+        &refs,
         &current,
     )
     .map_err(|e| {
@@ -1450,20 +1714,33 @@ fn custom_target(
         ..CustomSpec::default()
     };
     // #2277: re-adding a provider to change its auth keeps its headers (secret values stay in
-    // the keychain and are written back unchanged).
+    // the keychain and are written back unchanged). #2307: and every other setting in its table
+    // (the flags change only what they name), and it is merged into the table, not rewritten.
     if let Some(p) = existing {
-        for (k, v) in &p.headers {
-            if !k.eq_ignore_ascii_case("OpenAI-Organization")
-                && !k.eq_ignore_ascii_case("OpenAI-Project")
-            {
-                spec.headers.insert(k.clone(), v.clone());
+        let raw = existing_spec(&spec.id);
+        match raw.as_ref().and_then(|r| r.headers.as_ref()) {
+            Some(h) => spec.headers.extend(h.clone()),
+            None if raw.is_none() => {
+                for (k, v) in &p.headers {
+                    if !k.eq_ignore_ascii_case("OpenAI-Organization")
+                        && !k.eq_ignore_ascii_case("OpenAI-Project")
+                    {
+                        spec.headers.insert(k.clone(), v.clone());
+                    }
+                }
             }
+            None => {}
         }
         if let Ok(values) = resolve_secret_headers(p, &SystemKeys::from_env()) {
             spec.secret_headers = values;
         }
         if spec.key_env.is_some() && p.key_env.is_some() {
             spec.key_env = p.key_env.clone();
+        }
+        if let Some(raw) = &raw {
+            spec.auth = AuthSpec::from_spec(raw).overlay(spec.auth.clone(), args.auth.is_some());
+            spec.needs_key = p.needs_key || args.auth.is_some();
+            spec.merge = true;
         }
     }
     for h in &args.headers {
@@ -2309,6 +2586,37 @@ mod tests {
             ..CustomSpec::default()
         };
         assert!(!keyless.config().unwrap().needs_key);
+    }
+
+    #[test]
+    fn a_reconnect_overlays_only_the_given_settings() {
+        // #2307: the existing table's settings, with the flags on top.
+        let old: ProviderSpec = toml::from_str(
+            "auth = \"header\"\nauth_header = \"api-key\"\norganization = \"o1\"\n\
+             query = { api-version = \"1\" }\nca_file = \"/old.pem\"\n",
+        )
+        .unwrap();
+        let given = AuthSpec {
+            ca_file: Some("/new.pem".into()),
+            query: BTreeMap::from([("x".to_owned(), "y".to_owned())]),
+            ..AuthSpec::default()
+        };
+        let a = AuthSpec::from_spec(&old).overlay(given, false);
+        assert_eq!(a.kind, "header");
+        assert_eq!(a.auth_header.as_deref(), Some("api-key"));
+        assert_eq!(a.organization.as_deref(), Some("o1"));
+        assert_eq!(a.ca_file.as_deref(), Some("/new.pem"));
+        assert_eq!(a.query.len(), 2);
+        // Another --auth drops the old auth's own settings, and keeps the rest.
+        let given = AuthSpec {
+            kind: "bearer".into(),
+            ..AuthSpec::default()
+        };
+        let a = AuthSpec::from_spec(&old).overlay(given, true);
+        assert_eq!(a.kind, "bearer");
+        assert_eq!(a.auth_header, None);
+        assert_eq!(a.ca_file.as_deref(), Some("/old.pem"));
+        assert_eq!(a.organization.as_deref(), Some("o1"));
     }
 
     #[test]

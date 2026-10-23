@@ -70,8 +70,8 @@ amp-harness setup --preset https://intranet.example.com/amp-preset.toml   # with
 ```
 
 `make install` uses this same script (setup hand-off included); `PREFIX=DIR` installs elsewhere.
-`setup --url` takes a full URL (`https://amp.example.com/mcp`); `server set` also takes a bare
-`host` or `host:port`.
+`setup --url` takes what `server set` takes: a bare `host`, `host:port` or a full URL (one
+normalisation for both, and for a preset's `server.url`).
 
 ## Try it
 
@@ -590,19 +590,27 @@ Use these? [Y/n]
 
 ```sh
 amp-harness connect example --base-url api.example.com --name "Example AI" \
-  --role manager=orchestrator --role worker=engineer      # key hidden, from --key-stdin or EXAMPLE_API_KEY
-amp-harness connect example --role reviewers=orchestrator # it has its key: only the roles change
+  --role manager=orchestrator --role worker=engineer   # key hidden, from --key-stdin or EXAMPLE_API_KEY
+amp-harness connect example --role reviewers=engineer  # it has its key: only the reviewers change
 ```
 
-Name the reviewers in the first command when they should be on `orchestrator`: on a switch from
-OpenRouter, the roles you don't name go to the workers' model (the first run's name matching and an
-org preset put reviewers on the manager's model by themselves).
+The first command gives the same mapping as the first run: the reviewers follow the manager
+(`orchestrator`) and the helpers follow the workers (`engineer`). One function,
+`role_map::fill_groups`, does this for the first run, `connect --role`, `/connect` and presets.
 
 - ROLE is a group (`manager`, `workers`/`worker`, `reviewers`, `helpers`/`helper`), `all`, or a
   role name (`kb-curator`, `amp-worker-docs`). MODEL is one of the provider's models (or
   `provider/model`). Both are checked before anything is stored.
-- Roles you don't name keep their model if it is already on this provider. Otherwise they run on
-  the default: the `all` model, else the workers' model. So every role ends up on the provider.
+- Groups you don't name follow the groups you do: the reviewers follow `manager=`, the helpers
+  follow `workers=` (unless a model's name points at them: `review`, `mini`/`fast`/`flash`). Any
+  other role you don't name keeps its model if it is already on this provider, else moves to its
+  group's model (name match or follower). So every role ends up on the provider. `all` names
+  every role.
+- Running `connect <id>` again on a provider you added, with endpoint flags (`--ca-file`,
+  `--header`, `--auth`, `--organization`, `--model`, ...), merges into its `[providers.<id>]`
+  table. Only the given settings change, a new `--auth` drops the old auth's own keys, and its
+  models (including `models set --no-check` ones), timeouts and comments stay. It prints what
+  changed (`--json`: `changed`).
 - In the chat: `/connect example manager=orchestrator worker=engineer` (`--role` is optional). It
   asks for no key when the provider already has one.
 
