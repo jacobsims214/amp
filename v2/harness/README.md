@@ -366,6 +366,117 @@ amp-harness connect my-llm --base-url http://localhost:11434/v1 [--api openai-co
   (`sk-ant-oat…`) with that explanation.
 - Environment variables stay supported and take precedence: they are the CI/headless path.
 
+### Your company's own endpoint, models per role, org presets (#2275)
+
+Say your company serves its own models on `api.example.com` (OpenAI-compatible), called
+`engineer` and `orchestrator`. None of the three ways below needs OpenRouter, contacts it, or
+asks you to edit a file.
+
+**1. First run** (`amp-harness` in a new terminal, or `amp-harness setup`): when no provider has
+a key, setup asks which one to use:
+
+```text
+Which model provider do the agents use? Keys are kept in your OS keychain, never in a file.
+  1) OpenRouter — the opencode roster on OpenRouter (MiMo, DeepSeek, GLM, Kimi)
+  2) Anthropic API key (console.anthropic.com) — …
+  3) OpenAI API key (platform.openai.com) — pick the model each role runs on
+  4) Your own OpenAI-compatible endpoint (e.g. api.example.com: …) — your models, mapped to the roles
+Provider [1]: 4
+Name for it (shown in the harness) [My models]: Example AI
+Short id, used in model names like <id>/<model> (lowercase, digits, - and _) [example-ai]: example
+Endpoint address (e.g. api.example.com or https://api.example.com/v1): api.example.com
+Use https://api.example.com/v1? [Y/n]
+Extra header the endpoint needs (name, Enter for none):
+Example AI API key, Enter if it needs none (hidden):
+  Example AI accepted the key.
+It serves 2 models: engineer, orchestrator.
+Which model each role runs on (picked by name; you can change them):
+  manager    example/orchestrator   plans the work and dispatches it (the orchestrator) (manager)
+  workers    example/engineer       write the code, docs and designs (worker-backend, …, designer)
+  reviewers  example/orchestrator   review the work (reviewer, github-reviewer)
+  helpers    example/engineer       small, fast jobs: research, media, KB upkeep (researcher, …)
+Use these? [Y/n]
+```
+
+- The address: a bare host gets `https://` and `/v1` (after a confirmation); plain `http://` is
+  accepted without a question only for localhost.
+- The key: read hidden, checked with `GET /models` and kept in the OS keychain
+  (`provider:example`). Enter means the endpoint takes none. A key already in `EXAMPLE_API_KEY`
+  (`<ID>_API_KEY`) is used as is.
+- The models: what the endpoint lists (or typed, when it lists none). The defaults match on
+  names: `orchestrator`/`planner`/`lead` → manager; `engineer`/`coder` → workers; `review` →
+  reviewers (else the manager's model); `mini`/`fast`/`flash` → helpers (else the workers' model).
+- What gets written: `[providers.example]`, plus `[models] profile = "inherit"` with `inherit =
+  "example/engineer"` (every other role, and agents added later), plus `[roles.<role>] model` for
+  the roles on another model.
+- Without a keychain the menu still shows. A keyless endpoint, or a key in `EXAMPLE_API_KEY`,
+  works there; otherwise setup says to export the variable.
+
+**2. `connect` with `--role`** (scripts, or after the first run):
+
+```sh
+amp-harness connect example --base-url api.example.com --name "Example AI" \
+  --role manager=orchestrator --role worker=engineer      # key hidden, from --key-stdin or EXAMPLE_API_KEY
+amp-harness connect example --role reviewers=orchestrator # it has its key: only the roles change
+```
+
+- ROLE is a group (`manager`, `workers`/`worker`, `reviewers`, `helpers`/`helper`), `all`, or a
+  role name (`kb-curator`, `amp-worker-docs`). MODEL is one of the provider's models (or
+  `provider/model`). Both are checked before anything is stored.
+- Roles you don't name keep their model if it is already on this provider. Otherwise they run on
+  the default: the `all` model, else the workers' model. So every role ends up on the provider.
+- In the chat: `/connect example manager=orchestrator worker=engineer` (`--role` is optional). It
+  asks for no key when the provider already has one.
+
+**3. An org preset**: an admin ships one TOML file with **no secrets**
+([examples/enterprise-preset.toml](examples/enterprise-preset.toml)):
+
+```sh
+amp-harness setup --preset enterprise-preset.toml
+amp-harness setup --preset https://intranet.example.com/amp/enterprise-preset.toml
+```
+
+```toml
+[preset]
+name = "Example Corp"
+[server]
+url = "https://amp.example.com"
+[providers.example]
+name = "Example AI"
+base_url = "https://api.example.com/v1"
+models = ["engineer", "orchestrator"]   # or [providers.example.models.<id>] tables with settings
+[roles]
+default = "example/engineer"
+manager = "example/orchestrator"
+reviewers = "example/orchestrator"
+# [mcp.<name>]: optional, the config.toml schema
+```
+
+- Setup writes the preset into config.toml: the providers, the roles and the MCP servers. It
+  tries the server, then asks each person only for their own key(s), any `secret_headers` values
+  and their AMP login (plus the usual project link).
+- `--yes` asks nothing and takes keys from the environment.
+- The preset is refused, naming the key, when:
+  - it has an unknown key;
+  - anything looks like a secret (`api_key = …`, a `Bearer …` header, a token-shaped value);
+  - a URL is not https (http only for localhost).
+- A preset URL is fetched only over https (or http to localhost), and only up to 256 KiB.
+
+**`amp-harness doctor`** shows the models line, each provider in use with its endpoint and key
+source, and every role's `provider/model`:
+
+```text
+  models:   inherit example/engineer
+  provider: example (Example AI) https://api.example.com/v1 (key: keychain)
+  roles:    designer           example/engineer
+            manager            example/orchestrator
+            …
+```
+
+`models:example` checks that the endpoint answers `GET /models` with the key and lists every
+model a role uses. `doctor --json` has the same data under `.models.roles` (role, provider,
+model, endpoint, source).
+
 ## Providers and models (M2-3)
 
 Like opencode, several providers are active at once and every role (agent) picks its own

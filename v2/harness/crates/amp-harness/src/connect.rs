@@ -46,18 +46,19 @@ use crate::{
     setup::{
         self, ConfigFile, KeyCheck,
         config_file::toml_string,
+        role_map,
         ui::{self, Ui},
     },
 };
 
 /// The comment inside every table `connect` writes: `disconnect` removes only those tables.
-const ADDED_MARK: &str = "# Added by `amp-harness connect`.";
+pub(crate) const ADDED_MARK: &str = "# Added by `amp-harness connect`.";
 /// The menu entry and `--list` name for a custom endpoint.
 const CUSTOM: &str = "custom";
 /// How many listed models a non-interactive custom connect takes without `--model`.
-const MAX_AUTO_MODELS: usize = 50;
+pub(crate) const MAX_AUTO_MODELS: usize = 50;
 /// How many listed models the interactive picker shows.
-const PICKER_MODELS: usize = 15;
+pub(crate) const PICKER_MODELS: usize = 15;
 
 #[derive(Args, Debug, Default)]
 pub struct ConnectArgs {
@@ -65,7 +66,7 @@ pub struct ConnectArgs {
     /// id with --base-url (a custom endpoint). Asked in a terminal when left out.
     pub provider: Option<String>,
     /// List the providers and whether each has a key (and where it comes from; never the key).
-    #[arg(long, conflicts_with_all = ["key_stdin", "base_url", "api", "name", "models", "headers", "use_for_roles"])]
+    #[arg(long, conflicts_with_all = ["key_stdin", "base_url", "api", "name", "models", "headers", "use_for_roles", "roles"])]
     pub list: bool,
     /// Read the key from stdin (one line) instead of asking. Never pass a key as an argument.
     #[arg(long)]
@@ -91,8 +92,19 @@ pub struct ConnectArgs {
     #[arg(long = "use")]
     pub use_for_roles: bool,
     /// With --use on a custom provider: the model every role runs on.
-    #[arg(long, value_name = "ID", requires = "use_for_roles")]
+    #[arg(
+        long,
+        value_name = "ID",
+        requires = "use_for_roles",
+        conflicts_with = "roles"
+    )]
     pub role_model: Option<String>,
+    /// Run a role (or group) on one of this provider's models, e.g. `--role manager=orchestrator
+    /// --role worker=engineer` (repeatable). Groups: manager, workers, reviewers, helpers, all;
+    /// or a role name. Roles not named run on the workers' model, so every role is on this
+    /// provider. A provider that already has its key is not asked for it again.
+    #[arg(long = "role", value_name = "ROLE=MODEL")]
+    pub roles: Vec<String>,
     /// Print a JSON summary (never a secret).
     #[arg(long)]
     pub json: bool,
@@ -150,7 +162,7 @@ fn about(id: &str) -> Option<&'static str> {
 }
 
 /// The OpenAI preset (not shipped in models.toml: its models are listed live on connect).
-fn openai_preset() -> CustomSpec {
+pub(crate) fn openai_preset() -> CustomSpec {
     CustomSpec {
         id: "openai".to_owned(),
         name: Some("OpenAI".to_owned()),
@@ -162,12 +174,12 @@ fn openai_preset() -> CustomSpec {
     }
 }
 
-fn shipped_ids() -> BTreeSet<String> {
+pub(crate) fn shipped_ids() -> BTreeSet<String> {
     ModelsFile::defaults().providers.keys().cloned().collect()
 }
 
 /// Header names whose values are secrets.
-fn secret_name(name: &str) -> bool {
+pub(crate) fn secret_name(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     [
         "auth",
@@ -184,7 +196,7 @@ fn secret_name(name: &str) -> bool {
 }
 
 /// Values that look like credentials whatever the header is called.
-fn secret_value(value: &str) -> bool {
+pub(crate) fn secret_value(value: &str) -> bool {
     let v = value.trim();
     let lower = v.to_ascii_lowercase();
     lower.starts_with("bearer ")
@@ -212,7 +224,7 @@ fn added_by_connect(text: &str, id: &str) -> bool {
     false
 }
 
-fn valid_id(id: &str) -> Result<(), String> {
+pub(crate) fn valid_id(id: &str) -> Result<(), String> {
     let ok = !id.is_empty()
         && id.len() <= 40
         && id
@@ -233,7 +245,7 @@ fn valid_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn slug(name: &str) -> String {
+pub(crate) fn slug(name: &str) -> String {
     let mut out = String::new();
     for c in name.trim().chars() {
         if c.is_ascii_alphanumeric() {
@@ -245,18 +257,7 @@ fn slug(name: &str) -> String {
     out.trim_end_matches('-').chars().take(40).collect()
 }
 
-fn valid_url(url: &str) -> Result<String, String> {
-    let u = url.trim().trim_end_matches('/');
-    if !(u.starts_with("http://") || u.starts_with("https://")) || u.contains(char::is_whitespace) {
-        return Err(format!("`{url}` is not an http(s) URL"));
-    }
-    if u.split_once("://").is_none_or(|(_, rest)| rest.is_empty()) {
-        return Err(format!("`{url}` has no host"));
-    }
-    Ok(u.to_owned())
-}
-
-fn parse_api(api: &str) -> Result<ProviderApi, String> {
+pub(crate) fn parse_api(api: &str) -> Result<ProviderApi, String> {
     match ProviderApi::parse(api.trim()) {
         Some(a @ (ProviderApi::OpenaiCompletions | ProviderApi::AnthropicMessages)) => Ok(a),
         _ => Err(format!(
@@ -283,6 +284,11 @@ pub struct CustomSpec {
     /// Secret headers: name -> value (the value goes to the keychain, the name to the file).
     pub secret_headers: BTreeMap<String, String>,
     pub models: Vec<String>,
+    /// Settings for some of `models` (`context_window`, `max_tokens`, ...; an org preset's
+    /// `[providers.<id>.models.<m>]`), written into that model's table.
+    pub model_specs: BTreeMap<String, toml::Table>,
+    /// One more comment line in the table (e.g. which org preset wrote it).
+    pub note: Option<String>,
 }
 
 impl Default for CustomSpec {
@@ -297,13 +303,15 @@ impl Default for CustomSpec {
             headers: BTreeMap::new(),
             secret_headers: BTreeMap::new(),
             models: Vec::new(),
+            model_specs: BTreeMap::new(),
+            note: None,
         }
     }
 }
 
 impl CustomSpec {
     /// `MY_LLM_API_KEY` for `my-llm`: the variable a headless run can set instead.
-    fn default_key_env(id: &str) -> String {
+    pub(crate) fn default_key_env(id: &str) -> String {
         format!(
             "{}_API_KEY",
             id.to_ascii_uppercase().replace(['-', '.'], "_")
@@ -317,6 +325,9 @@ impl CustomSpec {
             "{ADDED_MARK} Its key is in the OS keychain (or {}), never here.\n",
             self.key_env.as_deref().unwrap_or("the environment")
         ));
+        if let Some(note) = &self.note {
+            t.push_str(&format!("# {note}\n"));
+        }
         if let Some(name) = &self.name {
             t.push_str(&format!("name = {}\n", toml_string(name)));
         }
@@ -347,12 +358,20 @@ impl CustomSpec {
                 self.id,
                 toml_string(model)
             ));
+            if let Some(spec) = self.model_specs.get(model) {
+                for (k, v) in spec {
+                    t.push_str(&format!(
+                        "{} = {v}\n",
+                        crate::setup::config_file::toml_key(k)
+                    ));
+                }
+            }
         }
         t
     }
 
     /// The provider as the harness will load it (from the block alone).
-    fn config(&self) -> Result<ProviderConfig, String> {
+    pub(crate) fn config(&self) -> Result<ProviderConfig, String> {
         let file = ModelsFile::parse(&self.block(), "the new provider").map_err(|e| e.0)?;
         let cfg =
             ModelsConfig::from_files(ModelsFile::defaults(), Some(file), "connect", &|_| None)
@@ -364,7 +383,7 @@ impl CustomSpec {
     }
 
     /// Writes the table into config.toml; the result must load with this provider in it.
-    fn write(&self, config: &ConfigFile) -> Result<Option<PathBuf>, String> {
+    pub(crate) fn write(&self, config: &ConfigFile) -> Result<Option<PathBuf>, String> {
         let id = self.id.clone();
         let base = self.base_url.clone();
         let check = move |text: &str| -> Result<(), String> {
@@ -406,7 +425,7 @@ fn static_keys(id: &str, key: &str, secret_headers: &BTreeMap<String, String>) -
 }
 
 /// Stores the key and secret header values in the OS keychain (never a file).
-fn store_secrets(
+pub(crate) fn store_secrets(
     id: &str,
     key: &str,
     secret_headers: &BTreeMap<String, String>,
@@ -433,7 +452,7 @@ fn store_secrets(
 }
 
 /// The model ids the endpoint lists (with the new key), sorted.
-async fn list_models(
+pub(crate) async fn list_models(
     p: &ProviderConfig,
     key: &str,
     secret_headers: &BTreeMap<String, String>,
@@ -445,7 +464,7 @@ async fn list_models(
 }
 
 /// What the key check said, for people.
-fn check_note(name: &str, check: &KeyCheck) -> String {
+pub(crate) fn check_note(name: &str, check: &KeyCheck) -> String {
     match check {
         KeyCheck::Ok => format!("{name} accepted the key."),
         KeyCheck::Rejected(status) => format!("{name} rejected the key (HTTP {status})."),
@@ -626,12 +645,28 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
     let mut ui = ui::detect(!args.key_stdin && !args.json);
     let ui = ui.as_mut();
 
+    // #2275: --role words are checked before anything is asked or stored.
+    let role_pairs = role_map::parse_pairs(&args.roles).map_err(CliError::usage)?;
+    let all_roles = role_map::all_roles(&cfg);
+    for (word, _) in &role_pairs {
+        role_map::roles_named(word, &all_roles).map_err(CliError::usage)?;
+    }
+
     let target = pick_target(&args, &cfg, ui)?;
     let (provider, mut spec) = match &target {
         Target::Known(p) => (p.clone(), None),
         Target::New(spec) => (spec.config().map_err(CliError::new)?, Some(spec.clone())),
     };
     let name = setup::display_name(&provider);
+    // Only the roles: a provider that already has its key (or needs none) is not asked again.
+    if spec.is_none() && !role_pairs.is_empty() && !args.key_stdin {
+        let keys = SystemKeys::from_env();
+        if !resolve_key(&provider, &keys).1.is_missing()
+            && resolve_secret_headers(&provider, &keys).is_ok()
+        {
+            return map_roles_only(&args, ui, &config, &cfg, &provider, &role_pairs).await;
+        }
+    }
     if spec.is_none() && !provider.needs_key && provider.secret_headers.is_empty() {
         return Err(CliError::usage(format!(
             "{name} ({}) needs no key (auth = \"none\")",
@@ -645,7 +680,8 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         .as_ref()
         .map(|s| s.secret_headers.clone())
         .unwrap_or_default();
-    let (key, check) = read_and_check_key(&args, ui, &provider, &name, keyless_ok, &extra).await?;
+    let (key, check, key_from_env) =
+        read_and_check_key(&args, ui, &provider, &name, keyless_ok, &extra).await?;
     // A custom endpoint that takes no key.
     if key.is_empty()
         && let Some(s) = spec.as_mut()
@@ -658,24 +694,39 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         let provider = s.config().map_err(CliError::new)?;
         s.models = pick_models(&args, ui, &provider, &key, &s.secret_headers).await?;
     }
+    // --role: checked against the provider's models before anything is stored.
+    let assignment = if role_pairs.is_empty() {
+        None
+    } else {
+        let models: Vec<String> = match &spec {
+            Some(s) => s.models.clone(),
+            None => provider.models.keys().cloned().collect(),
+        };
+        Some(assignment_for(&cfg, &provider.id, &models, &role_pairs)?)
+    };
 
     // Store: keychain first, then the config table.
     let key_env = spec
         .as_ref()
         .and_then(|s| s.key_env.clone())
         .or(provider.key_env.clone());
-    store_secrets(&provider.id, &key, &extra, key_env.as_deref())
+    let stored_key = if key_from_env { "" } else { key.as_str() };
+    store_secrets(&provider.id, stored_key, &extra, key_env.as_deref())
         .map_err(|e| CliError::new(format!("store the {name} key: {e}")))?;
     let mut summary = ConnectSummary {
         provider: provider.id.clone(),
         name: name.clone(),
-        key: if key.is_empty() { "none" } else { "keychain" }.to_owned(),
+        key: match (key.is_empty(), key_from_env) {
+            (true, _) => "none".to_owned(),
+            (false, true) => format!("env {}", key_env.as_deref().unwrap_or("")),
+            (false, false) => "keychain".to_owned(),
+        },
         check: check_json(&check),
         secret_headers: extra.keys().cloned().collect(),
         config: Some(config.path.clone()),
         ..ConnectSummary::default()
     };
-    if !key.is_empty() {
+    if !stored_key.is_empty() {
         ui.say(&format!(
             "Stored the {name} key in the OS keychain (service {}, account {}).",
             amp_mcp::keychain_service(),
@@ -704,8 +755,11 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         ));
     }
 
-    // 3. Point the roles at it?
-    summary.selection = offer_roles(&args, ui, &config, &provider.id, &summary.models_added)?;
+    // 3. Point the roles at it: --role maps them; otherwise offer (or --use) one selection.
+    summary.selection = match &assignment {
+        Some(a) => Some(write_assignment(ui, &config, a, args.json)?),
+        None => offer_roles(&args, ui, &config, &provider.id, &summary.models_added)?,
+    };
 
     if args.json {
         return print_json(&summary);
@@ -722,6 +776,103 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         "A chat that is already open picks it up with /connect; `amp-harness connect --list` shows \
          every provider."
     );
+    Ok(())
+}
+
+/// The [`role_map::Assignment`] for `--role` pairs on `provider` (whose models are `models`).
+fn assignment_for(
+    cfg: &ModelsConfig,
+    provider: &str,
+    models: &[String],
+    pairs: &[(String, String)],
+) -> Result<role_map::Assignment, CliError> {
+    let mut ids: Vec<String> = cfg.providers.keys().cloned().collect();
+    if !ids.iter().any(|i| i == provider) {
+        ids.push(provider.to_owned());
+    }
+    let knows = |p: &str, m: &str| {
+        (p == provider && models.iter().any(|x| x == m)) || cfg.knows_model(&format!("{p}/{m}"))
+    };
+    let resolve = |m: &str| role_map::model_ref(m, Some(provider), &knows, &ids);
+    let current = role_map::current(cfg);
+    role_map::from_pairs(
+        pairs,
+        &role_map::all_roles(cfg),
+        &resolve,
+        provider,
+        &current,
+    )
+    .map_err(|e| {
+        CliError::usage(format!(
+            "--role {e} (its models: {})",
+            if models.is_empty() {
+                "none".to_owned()
+            } else {
+                models.join(", ")
+            }
+        ))
+    })
+}
+
+/// Writes the role mapping and says what each group runs on. Returns the selection summary.
+fn write_assignment(
+    ui: &mut dyn Ui,
+    config: &ConfigFile,
+    a: &role_map::Assignment,
+    json: bool,
+) -> Result<String, CliError> {
+    role_map::write(config, a).map_err(CliError::new)?;
+    if !json {
+        ui.say("The roles now run on (saved in config.toml):");
+        for line in a.lines() {
+            ui.say(&line);
+        }
+        if let Ok(after) = setup::load_models(config, None) {
+            let over = role_map::overridden(&after, a);
+            if !over.is_empty() {
+                ui.say(&format!(
+                    "Note: this folder's .amp/harness/config.toml keeps {} (it wins over your \
+                     config.toml here).",
+                    over.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(format!("inherit {} (+ per-role models)", a.default))
+}
+
+/// `connect <id> --role ...` for a provider that already has its key: only the roles change.
+async fn map_roles_only(
+    args: &ConnectArgs,
+    ui: &mut dyn Ui,
+    config: &ConfigFile,
+    cfg: &ModelsConfig,
+    provider: &ProviderConfig,
+    pairs: &[(String, String)],
+) -> Result<(), CliError> {
+    let models: Vec<String> = provider.models.keys().cloned().collect();
+    let a = assignment_for(cfg, &provider.id, &models, pairs)?;
+    let selection = write_assignment(ui, config, &a, args.json)?;
+    let name = setup::display_name(provider);
+    if args.json {
+        let (_, source) = resolve_key(provider, &SystemKeys::from_env());
+        return print_json(&ConnectSummary {
+            provider: provider.id.clone(),
+            name,
+            key: source.kind().to_owned(),
+            check: "not asked: the key is already there".to_owned(),
+            config: Some(config.path.clone()),
+            selection: Some(selection),
+            ..ConnectSummary::default()
+        });
+    }
+    let cfg = setup::load_models(config, None)?;
+    let report = config_cmd::build_report(&cfg, &SystemKeys::from_env(), false).await;
+    println!(
+        "{name} ({}) already has its key; mapped the roles.",
+        provider.id
+    );
+    config_cmd::print_roles(&report);
     Ok(())
 }
 
@@ -820,8 +971,15 @@ fn picker(cfg: &ModelsConfig, ui: &mut dyn Ui) -> Result<String, CliError> {
          gateway…) or an Anthropic Messages one",
         ids.len() + 1
     ));
+    // #2275: the default is the provider the manager runs on (OpenRouter only when it is).
+    let default = cfg
+        .resolve_role("manager")
+        .ok()
+        .and_then(|r| ids.iter().position(|id| *id == r.provider))
+        .map_or(1, |i| i + 1)
+        .to_string();
     loop {
-        let a = ui.ask("Provider", Some("1"))?;
+        let a = ui.ask("Provider", Some(&default))?;
         if let Ok(n) = a.trim().parse::<usize>() {
             if (1..=ids.len()).contains(&n) {
                 return Ok(ids[n - 1].clone());
@@ -882,15 +1040,16 @@ fn custom_target(
     };
     valid_id(&id).map_err(CliError::usage)?;
     let base_url = match &args.base_url {
-        Some(u) => valid_url(u).map_err(CliError::usage)?,
+        // #2275: `api.example.com` is https://api.example.com/v1.
+        Some(u) => crate::setup::endpoint::normalize_base_url(u).map_err(CliError::usage)?,
         None => loop {
             let a = ask_or(
                 ui,
                 "--base-url",
-                "Base URL (e.g. http://localhost:11434/v1)",
+                "Base URL (e.g. api.example.com or http://localhost:11434/v1)",
                 None,
             )?;
-            match valid_url(&a) {
+            match crate::setup::endpoint::normalize_base_url(&a) {
                 Ok(u) => break u,
                 Err(e) => ui.say(&format!("  {e}")),
             }
@@ -979,7 +1138,29 @@ async fn read_and_check_key(
     name: &str,
     custom_without_key_ok: bool,
     extra: &BTreeMap<String, String>,
-) -> Result<(String, KeyCheck), CliError> {
+) -> Result<(String, KeyCheck, bool), CliError> {
+    // #2275: no terminal and no --key-stdin, but the key is in the provider's variable (the
+    // headless path): check it and keep it there; nothing is stored.
+    if !args.key_stdin
+        && !ui.interactive()
+        && let Some(var) = provider.key_env.as_deref()
+        && let Some(key) = std::env::var(var)
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    {
+        ui.say(&format!(
+            "Using the {name} key in {var} (it stays in the environment; nothing is stored)."
+        ));
+        let check = setup::check_key(provider, &key, extra).await;
+        ui.say(&format!("  {}", check_note(name, &check)));
+        if let KeyCheck::Rejected(status) = check {
+            return Err(CliError::new(format!(
+                "{name} rejected the key in {var} (HTTP {status}); nothing was changed"
+            )));
+        }
+        return Ok((key, check, true));
+    }
     for attempt in 0..3 {
         let key = if args.key_stdin {
             let mut line = String::new();
@@ -1005,7 +1186,7 @@ async fn read_and_check_key(
             if custom_without_key_ok && attempt == 0 {
                 ui.say(&format!("No key: {name} will be called without one."));
                 let check = setup::check_key(provider, "", extra).await;
-                return Ok((String::new(), check));
+                return Ok((String::new(), check, false));
             }
             return Err(CliError::usage(format!(
                 "no {name} key given: nothing stored"
@@ -1028,7 +1209,7 @@ async fn read_and_check_key(
             }
             continue;
         }
-        return Ok((key, check));
+        return Ok((key, check, false));
     }
     Err(CliError::new(format!(
         "no {name} key was accepted; nothing was stored"
@@ -1444,11 +1625,70 @@ impl ChatConnect {
         };
         Ok(Target::New(CustomSpec {
             id: id.to_owned(),
-            base_url: valid_url(words[1])?,
+            base_url: crate::setup::endpoint::normalize_base_url(words[1])?,
             api,
             key_env: Some(CustomSpec::default_key_env(id)),
             ..CustomSpec::default()
         }))
+    }
+
+    /// `/connect` arguments: the provider words, and `ROLE=MODEL` pairs (`--role` optional).
+    fn split(args: &str) -> Result<(String, Vec<(String, String)>), String> {
+        let mut rest = Vec::new();
+        let mut pairs = Vec::new();
+        for w in args.split_whitespace() {
+            if w == "--role" {
+                continue;
+            }
+            match w.strip_prefix("--role=").unwrap_or(w).split_once('=') {
+                Some(_) => pairs.push(w.strip_prefix("--role=").unwrap_or(w).to_owned()),
+                None => rest.push(w),
+            }
+        }
+        Ok((rest.join(" "), role_map::parse_pairs(&pairs)?))
+    }
+
+    /// The provider `id` when it already has its key (or needs none): roles only, no key asked.
+    fn ready_provider(&self, id: &str) -> Result<Option<ProviderConfig>, String> {
+        let cfg = self.load_models()?;
+        let Some(p) = cfg.providers.get(id) else {
+            return Ok(None);
+        };
+        let keys = SystemKeys::from_env();
+        Ok(
+            (!resolve_key(p, &keys).1.is_missing() && resolve_secret_headers(p, &keys).is_ok())
+                .then(|| p.clone()),
+        )
+    }
+
+    /// Maps the roles (`pairs`) onto `provider`, whose models are `models`. Returns the text.
+    fn map_roles(
+        &self,
+        provider: &str,
+        models: &[String],
+        pairs: &[(String, String)],
+    ) -> Result<String, String> {
+        let cfg = self.load_models()?;
+        let a = assignment_for(&cfg, provider, models, pairs).map_err(|e| e.message)?;
+        role_map::write(&self.config, &a)?;
+        let mut text = "The roles now run on (saved in config.toml):".to_owned();
+        for line in a.lines() {
+            text.push('\n');
+            text.push_str(&line);
+        }
+        text.push_str("\nWorkers started from now use them; /model switches this chat's model.");
+        Ok(text)
+    }
+
+    async fn roles_only(self, args: String) -> Result<amp_tui::ConnectReply, String> {
+        let (rest, pairs) = Self::split(&args)?;
+        let id = rest.split_whitespace().next().unwrap_or("");
+        let p = self
+            .ready_provider(id)?
+            .ok_or_else(|| format!("{id} has no key yet: /connect {id} asks for it"))?;
+        let models: Vec<String> = p.models.keys().cloned().collect();
+        let text = self.map_roles(&p.id, &models, &pairs)?;
+        self.reply(text)
     }
 
     /// Reloads config.toml and rebuilds the providers on the runtime.
@@ -1469,6 +1709,7 @@ impl ChatConnect {
 
     async fn store(self, args: String, key: String) -> Result<amp_tui::ConnectReply, String> {
         refuse_subscription_token("", &key)?;
+        let (args, pairs) = Self::split(&args)?;
         let (provider, mut spec) = match self.target(&args)? {
             Target::Known(p) => (p, None),
             Target::New(s) => (s.config()?, Some(s)),
@@ -1522,11 +1763,20 @@ impl ChatConnect {
                 if s.models.len() == 1 { "" } else { "s" }
             ));
         }
-        text.push_str(&format!(
-            "\n{name}'s models are available now (/model lists them). `amp-harness connect {} \
-             --use` points the agent roles at it.",
-            provider.id
-        ));
+        if pairs.is_empty() {
+            text.push_str(&format!(
+                "\n{name}'s models are available now (/model lists them). `amp-harness connect {} \
+                 --use` points the agent roles at it.",
+                provider.id
+            ));
+        } else {
+            let models: Vec<String> = match &spec {
+                Some(s) => s.models.clone(),
+                None => provider.models.keys().cloned().collect(),
+            };
+            text.push('\n');
+            text.push_str(&self.map_roles(&provider.id, &models, &pairs)?);
+        }
         self.reply(text)
     }
 
@@ -1559,6 +1809,20 @@ impl amp_tui::ProviderConnect for ChatConnect {
     }
 
     fn prepare(&self, args: &str) -> Result<String, String> {
+        let (rest, pairs) = Self::split(args)?;
+        if !pairs.is_empty() {
+            let cfg = self.load_models()?;
+            let roles = role_map::all_roles(&cfg);
+            for (word, _) in &pairs {
+                role_map::roles_named(word, &roles)?;
+            }
+            let words: Vec<&str> = rest.split_whitespace().collect();
+            // #2275: only the roles for a provider that has its key: nothing to ask.
+            if words.len() == 1 && self.ready_provider(words[0])?.is_some() {
+                return Ok(String::new());
+            }
+        }
+        let args = rest.as_str();
         let (id, name) = match self.target(args)? {
             Target::Known(p) => (p.id.clone(), setup::display_name(&p)),
             Target::New(s) => (
@@ -1574,6 +1838,9 @@ impl amp_tui::ProviderConnect for ChatConnect {
     fn connect(&self, args: &str, key: String) -> amp_tui::ConnectFuture {
         let me = self.clone();
         let args = args.to_owned();
+        if key.is_empty() {
+            return Box::pin(async move { me.roles_only(args).await });
+        }
         Box::pin(async move { me.store(args, key).await })
     }
 }
@@ -1613,11 +1880,15 @@ mod tests {
         assert!(valid_id("").is_err());
         assert_eq!(slug("My Local LLM!"), "my-local-llm");
         assert_eq!(
-            valid_url("http://localhost:11434/v1/").unwrap(),
+            crate::setup::endpoint::normalize_base_url("http://localhost:11434/v1/").unwrap(),
             "http://localhost:11434/v1"
         );
-        assert!(valid_url("localhost:1").is_err());
-        assert!(valid_url("https://").is_err());
+        // #2275: a bare host is an https (localhost: http) /v1 endpoint.
+        assert_eq!(
+            crate::setup::endpoint::normalize_base_url("localhost:1").unwrap(),
+            "http://localhost:1/v1"
+        );
+        assert!(crate::setup::endpoint::normalize_base_url("https://").is_err());
         assert_eq!(CustomSpec::default_key_env("my-llm"), "MY_LLM_API_KEY");
     }
 

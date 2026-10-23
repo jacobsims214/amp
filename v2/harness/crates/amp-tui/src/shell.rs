@@ -167,6 +167,8 @@ pub trait ProviderConnect: Send + Sync {
     /// keys and providers added elsewhere since the chat started.
     fn list(&self) -> ConnectFuture;
     /// `/connect <args>`: checks the arguments and returns what to ask for ("OpenRouter API key").
+    /// An empty prompt means nothing needs asking (#2275: only the roles change for a provider
+    /// that has its key): [`ProviderConnect::connect`] then runs at once with an empty key.
     fn prepare(&self, args: &str) -> Result<String, String>;
     /// Checks `key` with the provider, stores it, and rebuilds the providers.
     fn connect(&self, args: &str, key: String) -> ConnectFuture;
@@ -630,6 +632,11 @@ impl Shell {
             return;
         }
         match connect.prepare(arg) {
+            Ok(prompt) if prompt.is_empty() => {
+                self.view.panel().close();
+                let job = connect.connect(arg, String::new());
+                self.spawn_connect(job);
+            }
             Ok(prompt) => {
                 self.view.panel().close();
                 self.secret = Some(SecretEntry {

@@ -720,6 +720,34 @@ fn connect_failure(e: &McpError, settings: &Settings, ca_broken: bool) -> (Strin
     (detail, fix)
 }
 
+/// #2275: which provider and endpoint the roles use, and each role's model.
+fn print_models(m: &providers::ModelsReport) {
+    if let (Some(mode), Some(selection)) = (m.mode, &m.selection) {
+        println!("  models:   {mode} {selection}");
+    }
+    for p in &m.providers {
+        let name = if p.name == p.id {
+            String::new()
+        } else {
+            format!(" ({})", p.name)
+        };
+        println!(
+            "  provider: {}{name} {} (key: {})",
+            p.id, p.base_url, p.key_source
+        );
+    }
+    let width = m.roles.iter().map(|r| r.role.len()).max().unwrap_or(0);
+    for (i, r) in m.roles.iter().enumerate() {
+        println!(
+            "  {}{:<width$}  {}/{}",
+            if i == 0 { "roles:    " } else { "          " },
+            r.role,
+            r.provider,
+            r.model
+        );
+    }
+}
+
 fn print_human(r: &Report) {
     println!("amp-harness {} doctor", r.harness_version);
     if let Some(s) = &r.server {
@@ -735,6 +763,7 @@ fn print_human(r: &Report) {
     if let Some(method) = &r.auth.method {
         println!("  auth:     {method}");
     }
+    print_models(&r.models);
     println!();
     let width = r
         .checks

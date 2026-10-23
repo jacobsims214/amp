@@ -35,6 +35,9 @@
 //! onboarding), sent only when they press Enter.
 
 pub(crate) mod config_file;
+pub(crate) mod endpoint;
+pub(crate) mod preset;
+pub(crate) mod role_map;
 pub mod ui;
 
 use std::{
@@ -46,7 +49,9 @@ use std::{
 use amp_core::{
     models::{ENV_PROFILE, ModelsConfig, ProviderApi, ProviderConfig, Selection},
     project::{ENV_CEILING_DIR, MARKER_FILE, ProjectMarker},
-    providers::{KeyLookup, SystemKeys, keychain_account, resolve_key},
+    providers::{
+        KeyLookup, KeychainKey, SystemKeys, header_account, keychain_account, resolve_key,
+    },
     tools::call_json,
 };
 use amp_mcp::{AmpMcpClient, Auth, DEFAULT_MCP_URL, McpError, Settings, Source};
@@ -117,6 +122,11 @@ pub struct InitArgs {
     /// Never ask: use the flags and what is already set up.
     #[arg(long, short = 'y')]
     pub yes: bool,
+    /// Apply an org preset first: a TOML file or an https:// URL with the AMP server, the
+    /// company's model endpoint(s), which model each role runs on and optional MCP servers, and
+    /// no secrets. Then only your own key(s) and login are asked for.
+    #[arg(long, value_name = "FILE|URL")]
+    pub preset: Option<String>,
     /// Print a JSON summary on stdout.
     #[arg(long)]
     pub json: bool,
@@ -179,6 +189,9 @@ pub struct Summary {
     pub profile: Option<String>,
     /// Provider id -> where its key comes from (`env VAR`, `keychain`, `missing`, `not needed`).
     pub providers: std::collections::BTreeMap<String, String>,
+    /// The org preset applied by `--preset` (#2275).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preset: Option<preset::Applied>,
     pub warnings: Vec<String>,
 }
 
@@ -225,6 +238,60 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
         ProjectArg::Auto
     };
     let mut ui = ui::detect(!args.yes);
+    // #2275: an org preset goes into config.toml first; its server is tried by the server step.
+    let mut conn_args = args.conn.clone();
+    let mut applied = None;
+    let mut preset_web = None;
+    if let Some(source) = &args.preset {
+        let text = preset::read(source).await?;
+        let checked = preset::check(&text, source)?;
+        let config = ConfigFile::new(config_path(&args.conn)?);
+        let a = preset::apply(&checked, &config)?;
+        ui.say(&format!(
+            "Applied the org preset{} ({source}) to {}.",
+            a.name
+                .as_deref()
+                .map(|n| format!(" \"{n}\""))
+                .unwrap_or_default(),
+            config.path.display()
+        ));
+        if let Some(d) = &a.description {
+            ui.say(&format!("  {d}"));
+        }
+        for id in &a.providers {
+            ui.say(&format!("  provider: {id}"));
+        }
+        if !a.roles.is_empty() {
+            let cfg = load_models(&config, None)?;
+            let assignment = role_map::Assignment {
+                default: match &cfg.selection {
+                    Selection::Inherit { model, .. } => model.clone(),
+                    _ => String::new(),
+                },
+                roles: a.roles.clone(),
+            };
+            ui.say("  roles:");
+            for line in assignment.lines() {
+                ui.say(&format!("  {line}"));
+            }
+            let over = role_map::overridden(&cfg, &assignment);
+            if !over.is_empty() {
+                ui.say(&format!(
+                    "  note: this folder's .amp/harness/config.toml keeps {}",
+                    over.join(", ")
+                ));
+            }
+        }
+        for name in &a.mcp {
+            ui.say(&format!("  mcp server: {name}"));
+        }
+        if conn_args.url.is_none() {
+            conn_args.url = checked.server_url.clone();
+            preset_web = checked.web_url.clone();
+        }
+        applied = Some(a);
+    }
+    let web_url = args.web_url.clone().or(preset_web);
     let login = match (ui.interactive(), args.login) {
         (true, _) => LoginPolicy::Ask,
         (false, true) => LoginPolicy::Allow,
@@ -232,8 +299,8 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
     };
     let plan = Plan {
         mode: Mode::Init,
-        conn: args.conn.clone(),
-        web_url: args.web_url.clone(),
+        conn: conn_args,
+        web_url,
         project,
         dir: args.dir.clone(),
         cwd,
@@ -243,7 +310,8 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
         login,
         no_browser: args.no_browser,
     };
-    let outcome = run(&plan, ui.as_mut()).await?;
+    let mut outcome = run(&plan, ui.as_mut()).await?;
+    outcome.summary.preset = applied;
     if args.json {
         return conn::print_json(&outcome.summary);
     }
@@ -266,7 +334,11 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
         None => println!("  project: none linked"),
     }
     if let Some(profile) = &s.profile {
-        println!("  models:  profile {profile}");
+        if profile == amp_core::models::INHERIT {
+            println!("  models:  your own mapping (`amp-harness models list` shows each role)");
+        } else {
+            println!("  models:  profile {profile}");
+        }
     }
     for (id, source) in &s.providers {
         println!("  key:     {id}: {source}");
@@ -1499,9 +1571,48 @@ pub(crate) async fn check_key(
     }
 }
 
-/// Reads a key hidden, checks it, stores it in the keychain. `false` if the person skipped it.
-async fn prompt_key(ui: &mut dyn Ui, p: &ProviderConfig) -> Result<bool, CliError> {
-    let name = provider_name(&p.id);
+/// The secret headers of `p` with no value in the keychain.
+fn missing_headers(p: &ProviderConfig, keys: &dyn KeyLookup) -> Vec<String> {
+    p.secret_headers
+        .iter()
+        .filter(|h| !matches!(keys.secret_header(&p.id, h), KeychainKey::Found(v) if !v.trim().is_empty()))
+        .cloned()
+        .collect()
+}
+
+/// Reads what `p` lacks hidden (its secret header values, then its key), checks the key with the
+/// provider and keeps everything in the OS keychain. `false` if the person skipped it.
+async fn prompt_secrets(
+    ui: &mut dyn Ui,
+    p: &ProviderConfig,
+    keys: &dyn KeyLookup,
+) -> Result<bool, CliError> {
+    let name = display_name(p);
+    let mut extra = std::collections::BTreeMap::new();
+    for h in &p.secret_headers {
+        if let KeychainKey::Found(v) = keys.secret_header(&p.id, h)
+            && !v.trim().is_empty()
+        {
+            extra.insert(h.clone(), v.trim().to_owned());
+            continue;
+        }
+        let v = ui.secret(&format!(
+            "{name}: the {h} header value (kept in the OS keychain), Enter to skip"
+        ))?;
+        if v.is_empty() {
+            return Ok(false);
+        }
+        let service = keychain_for_keys().map_err(CliError::new)?;
+        amp_mcp::keychain_set(&service, &header_account(&p.id, h), &v)
+            .map_err(|e| CliError::new(format!("store the {h} header value: {e}")))?;
+        ui.say(&format!(
+            "  Stored the {h} header value in the OS keychain."
+        ));
+        extra.insert(h.clone(), v);
+    }
+    if !resolve_key(p, keys).1.is_missing() {
+        return Ok(true);
+    }
     for _ in 0..3 {
         let key = ui.secret(&format!(
             "{}, Enter to skip",
@@ -1514,7 +1625,7 @@ async fn prompt_key(ui: &mut dyn Ui, p: &ProviderConfig) -> Result<bool, CliErro
             ui.say(&format!("  {why}"));
             continue;
         }
-        match check_key(p, &key, &Default::default()).await {
+        match check_key(p, &key, &extra).await {
             KeyCheck::Ok => ui.say(&format!("  {name} accepted the key.")),
             KeyCheck::Rejected(status) => {
                 ui.say(&format!(
@@ -1535,6 +1646,93 @@ async fn prompt_key(ui: &mut dyn Ui, p: &ProviderConfig) -> Result<bool, CliErro
         return Ok(true);
     }
     Ok(false)
+}
+
+/// The first run's provider choice (#2275).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Choice {
+    /// A model profile (the shipped OpenRouter roster, `anthropic`, or one of the person's).
+    Profile(String),
+    OpenAi,
+    /// The person's own OpenAI-compatible endpoint.
+    Endpoint,
+}
+
+/// Which provider the agents use: one entry per profile whose providers need a key (OpenRouter's
+/// roster first, as before), then OpenAI and "your own OpenAI-compatible endpoint".
+fn choose_provider(
+    ui: &mut dyn Ui,
+    config: &ConfigFile,
+    cfg: &ModelsConfig,
+    keychain: bool,
+) -> Result<Choice, CliError> {
+    let mut options: Vec<(Choice, String)> = Vec::new();
+    let names = std::iter::once(amp_core::models::DEFAULT_PROFILE.to_owned())
+        .chain(cfg.profiles.keys().cloned());
+    for name in names {
+        let Ok(c) = load_models(config, Some(&name)) else {
+            continue;
+        };
+        let need: Vec<String> = c
+            .providers_in_use()
+            .into_iter()
+            .filter(|id| c.providers.get(id).is_some_and(|p| p.needs_key))
+            .collect();
+        if need.is_empty() {
+            continue;
+        }
+        let text = if name == amp_core::models::DEFAULT_PROFILE {
+            DEFAULT_PROFILE_TEXT.to_owned()
+        } else {
+            cfg.profiles
+                .get(&name)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| format!("profile {name}"))
+        };
+        // "Anthropic API key (console.anthropic.com)": never a Claude subscription (#2163).
+        let who: Vec<String> = need
+            .iter()
+            .map(|p| match p.as_str() {
+                "anthropic" => crate::connect::key_prompt(p, "Anthropic"),
+                other => provider_name(other),
+            })
+            .collect();
+        options.push((
+            Choice::Profile(name),
+            format!("{} — {text}", who.join(" + ")),
+        ));
+    }
+    options.push((
+        Choice::OpenAi,
+        "OpenAI API key (platform.openai.com) — pick the model each role runs on".to_owned(),
+    ));
+    options.push((
+        Choice::Endpoint,
+        "Your own OpenAI-compatible endpoint (e.g. api.example.com: a company gateway, vLLM, \
+         LiteLLM, Ollama) — your models, mapped to the roles"
+            .to_owned(),
+    ));
+    ui.say(if keychain {
+        "Which model provider do the agents use? Keys are kept in your OS keychain, never in a file."
+    } else {
+        "Which model provider do the agents use?"
+    });
+    for (i, (_, text)) in options.iter().enumerate() {
+        ui.say(&format!("  {}) {text}", i + 1));
+    }
+    loop {
+        let a = ui.ask("Provider", Some("1"))?;
+        if let Some(n) = a
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| (1..=options.len()).contains(n))
+        {
+            return Ok(options.swap_remove(n - 1).0);
+        }
+        ui.say("  Type a number from the list.");
+    }
 }
 
 async fn models_step(
@@ -1623,9 +1821,11 @@ async fn models_step(
         }
     }
 
-    // No keychain: nothing to ask. The first run has already linked the project (step 4) and ends
-    // below with one message naming the next command (#2214). Interactive init says why it asks
-    // nothing (its summary warning has the commands). The platform error only with --verbose.
+    // No keychain: no key can be kept. The first run has already linked the project (step 4)
+    // and ends below with one message naming the next command (#2214). A person who still has to
+    // pick a provider gets the menu (#2275: their own endpoint works with no key, or one in the
+    // environment); interactive init says why it asks for no key. The platform error only with
+    // --verbose.
     let keychain = keychain_for_keys();
     if !missing.is_empty()
         && plan.mode == Mode::Init
@@ -1646,87 +1846,68 @@ async fn models_step(
         }
         ui.say(&text);
     }
-    if !missing.is_empty() && ui.interactive() && keychain.is_ok() {
-        // Which provider does the person have a key for? One option per profile.
-        let mut options: Vec<(String, Vec<String>, String)> = Vec::new();
-        let mut names: Vec<String> = vec![profile.clone()];
-        if !explicit {
-            names.extend(
-                std::iter::once(amp_core::models::DEFAULT_PROFILE.to_owned())
-                    .chain(cfg.profiles.keys().cloned())
-                    .filter(|n| *n != profile),
-            );
-        }
-        for name in names {
-            let Ok(c) = load_models(config, Some(&name)) else {
-                continue;
-            };
-            let need: Vec<String> = c
-                .providers_in_use()
-                .into_iter()
-                .filter(|id| c.providers.get(id).is_some_and(|p| p.needs_key))
-                .collect();
-            if need.is_empty() {
-                continue;
-            }
-            let text = if name == amp_core::models::DEFAULT_PROFILE {
-                DEFAULT_PROFILE_TEXT.to_owned()
-            } else {
-                cfg.profiles
-                    .get(&name)
-                    .cloned()
-                    .flatten()
-                    .unwrap_or_else(|| format!("profile {name}"))
-            };
-            options.push((name, need, text));
-        }
-        ui.say("The agents need a model provider key. It is stored in your OS keychain, never in a file.");
-        let chosen = if options.len() > 1 {
-            for (i, (_, need, text)) in options.iter().enumerate() {
-                // "Anthropic API key (console.anthropic.com)": never a Claude subscription (#2163).
-                let who: Vec<String> = need
-                    .iter()
-                    .map(|p| match p.as_str() {
-                        "anthropic" => crate::connect::key_prompt(p, "Anthropic"),
-                        other => provider_name(other),
-                    })
-                    .collect();
-                ui.say(&format!("  {}) {} — {text}", i + 1, who.join(" + ")));
-            }
-            loop {
-                let a = ui.ask("Which key do you have", Some("1"))?;
-                if let Some(n) = a
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| (1..=options.len()).contains(n))
-                {
-                    break n - 1;
+    if !missing.is_empty() && ui.interactive() && !explicit {
+        // #2275: which provider? The shipped profiles, OpenAI, or the person's own endpoint.
+        match choose_provider(ui, config, &cfg, keychain.is_ok())? {
+            Choice::Profile(name) => {
+                let c = load_models(config, Some(&name))?;
+                if keychain.is_ok() {
+                    for id in missing_keys(&c, &keys) {
+                        if let Some(p) = c.providers.get(&id)
+                            && !prompt_secrets(ui, p, &keys).await?
+                        {
+                            break;
+                        }
+                    }
                 }
-                ui.say("  Type a number from the list.");
-            }
-        } else {
-            0
-        };
-        if let Some((name, _, _)) = options.get(chosen) {
-            let c = load_models(config, Some(name))?;
-            for id in missing_keys(&c, &keys) {
-                if let Some(p) = c.providers.get(&id)
-                    && !prompt_key(ui, p).await?
-                {
-                    break;
+                if name != profile {
+                    config
+                        .set(&[("models", "profile", name.as_str())])
+                        .map_err(CliError::new)?;
+                    ui.say(&format!(
+                        "Using the `{name}` model profile (saved in config.toml)."
+                    ));
                 }
             }
-            if *name != profile {
-                config
-                    .set(&[("models", "profile", name.as_str())])
-                    .map_err(CliError::new)?;
-                ui.say(&format!(
-                    "Using the `{name}` model profile (saved in config.toml)."
-                ));
+            other => {
+                let openai = matches!(other, Choice::OpenAi);
+                let e = endpoint::ask(ui, &cfg, openai).await?;
+                if let Some(why) = endpoint::store(ui, config, &e)?
+                    && !e.key.is_empty()
+                    && !e.key_from_env
+                {
+                    summary
+                        .warnings
+                        .push(format!("the key was not kept: {why}"));
+                }
             }
-            cfg = load_models(config, None)?;
-            profile = profile_of(&cfg).0;
-            missing = missing_keys(&cfg, &keys);
+        }
+        cfg = load_models(config, None)?;
+        profile = profile_of(&cfg).0;
+        missing = missing_keys(&cfg, &keys);
+    } else if !missing.is_empty() && ui.interactive() && keychain.is_ok() {
+        // The profile was chosen on purpose (config.toml, --profile, an org preset): ask for the
+        // keys (and secret header values) its providers lack.
+        for id in missing.clone() {
+            if let Some(p) = cfg.providers.get(&id)
+                && !prompt_secrets(ui, p, &keys).await?
+            {
+                break;
+            }
+        }
+        cfg = load_models(config, None)?;
+        profile = profile_of(&cfg).0;
+        missing = missing_keys(&cfg, &keys);
+    }
+    // Secret header values an explicit setup (an org preset) still lacks.
+    if ui.interactive() && keychain.is_ok() {
+        for id in cfg.providers_in_use() {
+            if let Some(p) = cfg.providers.get(&id)
+                && !missing_headers(p, &keys).is_empty()
+                && !resolve_key(p, &keys).1.is_missing()
+            {
+                prompt_secrets(ui, p, &keys).await?;
+            }
         }
     }
 

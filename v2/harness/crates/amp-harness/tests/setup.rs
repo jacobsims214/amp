@@ -217,8 +217,9 @@ async fn init_creates_a_project() {
 async fn init_asks_for_what_is_missing() {
     let amp = spawn(MockAmp::new(), None).await;
     let dir = workdir("setup-interactive", None);
-    // Server, then project 1 from the picker. The keychain is off (file store), so no key prompt.
-    let answers = format!("{}\n1\n", amp.url.trim_end_matches("/mcp"));
+    // Server, then project 1 from the picker. The keychain is off (file store), so no key prompt;
+    // the provider menu (#2275) still asks: 1 = OpenRouter.
+    let answers = format!("{}\n1\n1\n", amp.url.trim_end_matches("/mcp"));
     let mut run = Run::new(&dir, &["init", "--json"]);
     run.stdin = Some(&answers);
     let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
@@ -382,7 +383,7 @@ async fn a_taken_project_code_is_asked_again() {
     // n, a name, a code an archived project already has, then a free one.
     let args = ["init", "--url", &amp.url, "--json"];
     let mut run = Run::new(&dir, &args);
-    run.stdin = Some("n\nNew Thing\nold\nNT\n");
+    run.stdin = Some("n\nNew Thing\nold\nNT\n1\n");
     let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(
@@ -412,7 +413,7 @@ async fn the_default_code_is_free_and_a_taken_code_is_one_sentence() {
     let dir = workdir("setup-code-free", None);
     let mut run = Run::new(&dir, &args);
     // n, a name whose initials are taken, Enter for the default.
-    run.stdin = Some("n\nQA 2216 throwaway\n\n");
+    run.stdin = Some("n\nQA 2216 throwaway\n\n1\n");
     let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(out.stderr.contains("(2-6 letters) [QTH]"), "{}", out.stderr);
@@ -427,7 +428,7 @@ async fn the_default_code_is_free_and_a_taken_code_is_one_sentence() {
     let dir = workdir("setup-code-refused", None);
     let mut run = Run::new(&dir, &args);
     // n, a name, Enter (HI: refused), Enter again (the new default).
-    run.stdin = Some("n\nHidden Ideas\n\n\n");
+    run.stdin = Some("n\nHidden Ideas\n\n\n1\n");
     let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(
@@ -501,7 +502,8 @@ async fn the_chat_without_a_key_says_how_to_store_one() {
     // Scripted answers but no key and no keychain: the first run stops with the way out. The
     // marker was made for another server (#2206), so the picker comes first: Enter keeps it.
     let mut run = Run::new(&dir, &["--snapshot", "100x20", "--no-session"]);
-    run.stdin = Some("\n");
+    // Then the provider menu (#2275): 1 = OpenRouter.
+    run.stdin = Some("\n1\n");
     let out = run
         .env("AMP_HARNESS_PROMPTS", "stdin")
         .env("AMP_MCP_URL", amp.url.clone())
@@ -549,7 +551,9 @@ async fn without_a_keychain_the_first_run_links_the_project_then_says_the_next_s
         };
         let service = format!("amp-harness-test-2214-{}", std::process::id());
         let mut run = Run::new(&dir, args);
-        run.stdin = Some("n\nNew Thing\n\n");
+        // #2275: the provider menu shows without a keychain too (an own endpoint works with an
+        // env key or none); 1 = OpenRouter, which then needs the env var.
+        run.stdin = Some("n\nNew Thing\n\n1\n");
         run.unset.push("AMP_CREDENTIAL_STORE");
         let out = run
             .env("AMP_HARNESS_PROMPTS", "stdin")
@@ -753,7 +757,7 @@ async fn init_offers_the_picker_for_a_marker_made_for_another_server() {
 
     let args = ["init", "--url", &amp.url, "--json"];
     let mut run = Run::new(&dir, &args);
-    run.stdin = Some("1\n");
+    run.stdin = Some("1\n1\n");
     let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(out.stderr.contains(&want), "{}", out.stderr);

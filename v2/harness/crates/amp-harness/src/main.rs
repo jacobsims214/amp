@@ -19,6 +19,8 @@
 //!   `skills list|show|new|import|edit|remove|reset|validate`, at `--user` or `--repo` scope.
 //! - #2235: `models list|set|reset|profile` (per-role models, user or repo file) and
 //!   `config check` (every layer's problems, naming file and key).
+//! - #2275: `setup` (= `init`) with `--preset FILE|URL` (an org preset), the first run's "your own
+//!   OpenAI-compatible endpoint" with models mapped per role, and `connect --role ROLE=MODEL`.
 
 mod agents_cmd;
 mod chat;
@@ -132,8 +134,11 @@ enum Command {
     /// Skills: list, show, create, import (Claude Code / opencode skill dirs), edit, remove, reset.
     #[command(subcommand)]
     Skills(skills_cmd::SkillsCommand),
-    /// Set up this machine and folder: AMP server, login, project (.amp.json), provider key.
-    /// Asks for whatever the flags leave open when run in a terminal; `--yes` never asks.
+    /// Set up this machine and folder: AMP server, login, project (.amp.json), model provider
+    /// (OpenRouter, Anthropic, OpenAI or your own OpenAI-compatible endpoint, mapped per role).
+    /// `--preset FILE|URL` applies an org preset first. Asks for whatever the flags leave open
+    /// when run in a terminal; `--yes` never asks. Also `amp-harness setup`.
+    #[command(visible_alias = "setup")]
     Init(setup::InitArgs),
     /// Debug: call AMP tools directly.
     #[command(subcommand, hide = true)]

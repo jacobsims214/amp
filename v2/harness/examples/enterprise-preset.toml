@@ -1,0 +1,52 @@
+# amp-harness org preset: your company's model endpoint, which model each role runs on, and the
+# AMP server. Ship this file to your people (or host it at an https:// URL); each person runs
+#
+#     amp-harness setup --preset enterprise-preset.toml
+#     amp-harness setup --preset https://intranet.example.com/amp/enterprise-preset.toml
+#
+# and is then asked only for their own API key (kept in their OS keychain) and their AMP login.
+#
+# NO SECRETS here: no API keys, no tokens, no passwords. Setup refuses a preset that holds one.
+# Unknown keys are refused too, so a typo can't go unnoticed. URLs must be https:// (http:// only
+# for localhost).
+
+[preset]
+name = "Example Corp"
+description = "Example Corp's own models on api.example.com"
+
+# The AMP server (optional). Same forms as the first run's answer: amp.example.com works too.
+[server]
+url = "https://amp.example.com"
+
+# The company's OpenAI-compatible endpoint. `api.example.com` alone becomes
+# https://api.example.com/v1. Each person's key is asked at setup; a headless/CI run can set
+# EXAMPLE_API_KEY instead (the default name is <ID>_API_KEY).
+[providers.example]
+name = "Example AI"
+base_url = "https://api.example.com/v1"
+models = ["engineer", "orchestrator"]
+# api = "openai-completions"          # the default; or "anthropic-messages"
+# auth = "none"                       # an endpoint that takes no key
+# key_env = "EXAMPLE_API_KEY"
+# headers = { "X-Team" = "platform" } # plain headers only
+# secret_headers = ["X-Api-Key"]      # each person is asked for the value (OS keychain)
+#
+# Model settings, instead of the list above:
+# [providers.example.models.orchestrator]
+# context_window = 200000
+# max_tokens = 16384
+
+# Which model each role runs on: `provider/model` (or just the model id with one provider).
+# Groups: manager (plans and dispatches), workers (worker-backend, worker-frontend, worker-docs,
+# designer), reviewers (reviewer, github-reviewer), helpers (researcher, media,
+# github-researcher, kb-curator). A single role name works too, e.g. `kb-curator`.
+# `default` is every role not named here, and agents added later.
+[roles]
+default = "example/engineer"
+manager = "example/orchestrator"
+reviewers = "example/orchestrator"
+
+# MCP servers every person gets (optional; the same schema as [mcp.<name>] in config.toml).
+# [mcp.docs]
+# type = "http"
+# url = "https://mcp.example.com/mcp"

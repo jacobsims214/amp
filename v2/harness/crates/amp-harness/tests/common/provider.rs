@@ -28,6 +28,8 @@ pub struct ProviderState {
     pub reply: String,
     /// `(path, authorization, required header value)` of every request.
     pub seen: Arc<Mutex<Vec<Seen>>>,
+    /// The `model` of every chat completion request (#2275: which model a role used).
+    pub requested_models: Arc<Mutex<Vec<String>>>,
 }
 
 pub struct MockProvider {
@@ -46,6 +48,11 @@ impl Drop for MockProvider {
 impl MockProvider {
     pub fn seen(&self) -> Vec<Seen> {
         self.state.seen.lock().unwrap().clone()
+    }
+
+    /// The `model` of every chat completion it served.
+    pub fn requested_models(&self) -> Vec<String> {
+        self.state.requested_models.lock().unwrap().clone()
     }
 }
 
@@ -87,9 +94,19 @@ async fn models(State(s): State<ProviderState>, headers: HeaderMap) -> Response 
     Json(json!({"object": "list", "data": data})).into_response()
 }
 
-async fn completions(State(s): State<ProviderState>, headers: HeaderMap) -> Response {
+async fn completions(
+    State(s): State<ProviderState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     if !authorized(&s, "/v1/chat/completions", &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad key"}))).into_response();
+    }
+    if let Some(model) = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(str::to_owned))
+    {
+        s.requested_models.lock().unwrap().push(model);
     }
     let chunk = |delta: Value, finish: Value| {
         json!({
@@ -155,4 +172,71 @@ pub fn files_containing(dir: &std::path::Path, needle: &str) -> Vec<std::path::P
         }
     }
     out
+}
+
+/// A recording HTTP(S) proxy that refuses everything (#2275). Point `HTTPS_PROXY`/`HTTP_PROXY`
+/// (and `ALL_PROXY`) at it with `NO_PROXY=127.0.0.1,localhost`: every request the harness would
+/// send off this machine (to openrouter.ai, say) arrives here instead and is recorded by its first
+/// line (`CONNECT openrouter.ai:443 HTTP/1.1`), so a test can assert there was none.
+pub struct ProxyGuard {
+    pub url: String,
+    seen: Arc<Mutex<Vec<String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for ProxyGuard {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl ProxyGuard {
+    pub fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    /// The variables that send every off-machine request through the guard.
+    pub fn env(&self) -> Vec<(&'static str, String)> {
+        let no_proxy = "127.0.0.1,localhost,::1".to_owned();
+        vec![
+            ("HTTPS_PROXY", self.url.clone()),
+            ("https_proxy", self.url.clone()),
+            ("HTTP_PROXY", self.url.clone()),
+            ("http_proxy", self.url.clone()),
+            ("ALL_PROXY", self.url.clone()),
+            ("all_proxy", self.url.clone()),
+            ("NO_PROXY", no_proxy.clone()),
+            ("no_proxy", no_proxy),
+        ]
+    }
+}
+
+pub async fn spawn_proxy_guard() -> ProxyGuard {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = tcp.local_addr().unwrap();
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let record = Arc::clone(&seen);
+    let task = tokio::spawn(async move {
+        while let Ok((mut sock, _)) = tcp.accept().await {
+            let record = Arc::clone(&record);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&buf[..n]);
+                let first = text.lines().next().unwrap_or("").to_owned();
+                record.lock().unwrap().push(first);
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+    ProxyGuard {
+        url: format!("http://{addr}"),
+        seen,
+        task,
+    }
 }
