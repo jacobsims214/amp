@@ -416,12 +416,19 @@ async fn the_chat_without_a_key_says_how_to_store_one() {
         .await;
     assert_eq!(out.code, 1, "stdout: {}", out.stdout);
     assert!(out.stderr.contains("Keeping #2 from "), "{}", out.stderr);
+    // AMP_CREDENTIAL_STORE=file: connect can't store a key, so the way out is the variable.
     assert!(
-        out.stderr.contains("amp-harness connect openrouter"),
+        out.stderr
+            .contains("turned off (AMP_CREDENTIAL_STORE=file)"),
         "{}",
         out.stderr
     );
-    assert!(out.stderr.contains("OPENROUTER_API_KEY"), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("`export OPENROUTER_API_KEY=… && amp-harness`"),
+        "{}",
+        out.stderr
+    );
 
     // Without setup (no terminal, no script): the session error names connect too.
     let out = Run::new(&dir, &["--snapshot", "100x20", "--no-session"])
@@ -430,6 +437,65 @@ async fn the_chat_without_a_key_says_how_to_store_one() {
         .await;
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("amp-harness connect"), "{}", out.stderr);
+}
+
+/// #2214 (QA-1 #12): no usable keychain (a HOME without one: macOS finds no default keychain,
+/// Linux CI has no Secret Service) and no key in the environment. The first run still offers the
+/// picker and links the project, then ends with one message naming the next command; the platform
+/// error shows only with --verbose. A per-test keychain service and no dialogs, so the user's
+/// keychain is never touched.
+#[tokio::test]
+async fn without_a_keychain_the_first_run_links_the_project_then_says_the_next_step() {
+    let amp = spawn(MockAmp::new(), None).await;
+    for verbose in [false, true] {
+        let dir = workdir(&format!("setup-no-keychain-{verbose}"), None);
+        let args: &[&str] = if verbose {
+            &["--snapshot", "100x20", "--no-session", "--verbose"]
+        } else {
+            &["--snapshot", "100x20", "--no-session"]
+        };
+        let service = format!("amp-harness-test-2214-{}", std::process::id());
+        let mut run = Run::new(&dir, args);
+        run.stdin = Some("n\nNew Thing\n\n");
+        run.unset.push("AMP_CREDENTIAL_STORE");
+        let out = run
+            .env("AMP_HARNESS_PROMPTS", "stdin")
+            .env("AMP_MCP_URL", amp.url.clone())
+            .env("AMP_HARNESS_KEYCHAIN_SERVICE", service)
+            .env("AMP_HARNESS_KEYCHAIN_PROMPTS", "never")
+            .go()
+            .await;
+        assert_eq!(
+            out.code, 1,
+            "stdout: {}\nstderr: {}",
+            out.stdout, out.stderr
+        );
+        // The project step ran first and linked the folder.
+        assert!(
+            out.stderr.contains("Created #77 New Thing (NT)"),
+            "{}",
+            out.stderr
+        );
+        assert_eq!(marker(&dir)["project_id"], 77);
+        // Then exactly one message about the key, with the next command.
+        assert_eq!(
+            out.stderr.matches("model provider key").count(),
+            1,
+            "{}",
+            out.stderr
+        );
+        assert!(
+            out.stderr
+                .contains("`export OPENROUTER_API_KEY=… && amp-harness`"),
+            "{}",
+            out.stderr
+        );
+        // The raw keychain error (which names the probe item) only with --verbose.
+        assert_eq!(out.stderr.contains("  cause: "), verbose, "{}", out.stderr);
+        if !verbose {
+            assert!(!out.stderr.contains("amp-harness-probe"), "{}", out.stderr);
+        }
+    }
 }
 
 /// Deletes the test keychain service's provider entry (macOS `security`, which never prompts for
