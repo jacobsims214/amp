@@ -51,6 +51,9 @@ pub struct ClientOptions {
     /// `clientInfo` sent to the server.
     pub client_name: String,
     pub client_version: String,
+    /// The web UI's address, when it is not the MCP URL's origin (`AMP_WEB_URL`, `[server]
+    /// web_url`). Kept on [`ServerSession::web_url`] for links people click (#2205).
+    pub web_url: Option<String>,
 }
 
 impl ClientOptions {
@@ -65,6 +68,7 @@ impl ClientOptions {
             catalog_default_ttl: Duration::ZERO,
             client_name: "amp-harness".to_owned(),
             client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            web_url: None,
         }
     }
 
@@ -73,8 +77,14 @@ impl ClientOptions {
             ca_file: settings.ca_file.clone(),
             auth: settings.auth.clone(),
             protocol: settings.protocol,
+            web_url: settings.web_url.clone(),
             ..Self::new(settings.url.clone())
         }
+    }
+
+    pub fn with_web_url(mut self, web_url: impl Into<String>) -> Self {
+        self.web_url = Some(web_url.into());
+        self
     }
 
     pub fn with_protocol(mut self, protocol: ProtocolMode) -> Self {
@@ -126,6 +136,31 @@ pub struct ServerSession {
     /// How we authenticated, for `doctor` (e.g. `none`, `static token (env AMP_TOKEN)`,
     /// `oauth (macOS Keychain ...)`). Never contains a secret.
     pub auth: String,
+    /// The configured web UI address ([`ClientOptions::web_url`]); `None`: the MCP URL's origin.
+    pub web_url: Option<String>,
+}
+
+impl ServerSession {
+    /// The web UI origin people's links go to (`http://localhost:5173`): the configured web URL's
+    /// origin, else the MCP URL's.
+    pub fn web_base(&self) -> String {
+        origin(self.web_url.as_deref().unwrap_or(&self.url))
+    }
+
+    /// The MCP URL's origin (`http://localhost:18000`).
+    pub fn mcp_origin(&self) -> String {
+        origin(&self.url)
+    }
+}
+
+/// `scheme://host[:port]` of a URL (everything before the path).
+pub fn origin(url: &str) -> String {
+    let url = url.trim();
+    let start = url.find("://").map_or(0, |i| i + 3);
+    let end = url[start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |i| start + i);
+    url[..end].to_owned()
 }
 
 /// The rmcp client-side handler: identifies us and notices `tools/list_changed`.
@@ -332,6 +367,7 @@ impl AmpMcpClient {
             server_version: info.server_info.as_ref().map(|s| s.version.clone()),
             instructions: info.instructions.clone(),
             auth: options.auth.describe(),
+            web_url: options.web_url.clone(),
         };
         tracing::debug!(
             url = %session.url,
@@ -382,6 +418,7 @@ impl AmpMcpClient {
                     server_version: None,
                     instructions: None,
                     auth: options.auth.describe(),
+                    web_url: options.web_url.clone(),
                 }),
                 catalog: Mutex::new(None),
                 tools_changed: Arc::new(AtomicBool::new(false)),
