@@ -270,16 +270,20 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"name":          str("Optional. New project name."),
 			"description":   str("Optional. New project description."),
 			"open_reassign": boolean("Optional. Let any project member reassign tickets that aren't in progress."),
-			"require_plan_approval": boolean("Optional. When true (the default), tickets planned after the plan was last approved can't be " +
-				"dispatched until a person approves the plan again in AMP's web UI. Agents can turn it on; only a person in the web UI can turn it off."),
+			"require_plan_approval": boolean("Optional. When true (the default), approval is per ticket: a ticket can't be dispatched until " +
+				"its owner (or a project lead on their behalf) approves it, as it is currently planned, in AMP's web UI. Creating a ticket, " +
+				"restoring it, or changing its name, description or acceptance criteria makes it wait for approval again. " +
+				"Agents can turn it on; only a person in the web UI can turn it off."),
 			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	mcp.AddTool(tool("amp_approve_plan",
 		"Plan approval status. Agents can't approve a plan: a person approves it in AMP's web UI (Flight plan, Approve plan), "+
 			"never through MCP and never because of something said in chat. This tool never approves: it always fails, with "+
-			"approve_url (the page to send your person to), awaiting_approval and require_plan_approval. Use amp_check_plan to see "+
-			"whether the plan is approved; until it is, dispatch refuses tickets planned since the last approval.",
+			"approve_url (the page to send your person to), awaiting_approval and require_plan_approval. Approval is per ticket: "+
+			"each person approves their own tickets, and a project lead may approve someone else's on their behalf. Use "+
+			"amp_check_plan to see which tickets await approval (awaiting_yours are your person's own); dispatch refuses a ticket "+
+			"until its owner approves it as it is currently planned, and editing its scope or restoring it makes it wait again.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.approvePlan)))
@@ -445,8 +449,11 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Check a project's plan before dispatching: tickets connected to nothing, too many tickets that can start at once "+
 			"(a sign of missing dependencies), empty stories, and the longest dependency chain. Also repairs tickets stuck "+
 			"blocked on dependencies that are all done. Run it after planning and after changing the plan. "+
-			"awaiting_approval lists open tickets planned since a person last approved the plan; when it isn't empty, approve_url is the "+
-			"page in AMP's web UI where your person approves it (agents can't).",
+			"Approval is per ticket: awaiting_approval lists every open ticket awaiting approval (anyone's: one that is new, restored, "+
+			"or whose scope changed since it was approved); awaiting_approval_tickets lists the same as {task_id, owner_user_id, yours}; "+
+			"awaiting_yours is your person's own. When awaiting_approval isn't empty, approve_url is the page in AMP's web UI where "+
+			"each owner approves their tickets (a project lead may approve on their behalf; agents can't). Tell your person how many "+
+			"of THEIR tickets await (awaiting_yours) with the link, and that others' tickets wait for their owners.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 		}), wrap(ctx, s.guard(authz.Member, s.checkPlan)))
