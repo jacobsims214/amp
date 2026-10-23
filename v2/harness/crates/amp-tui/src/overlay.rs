@@ -1132,7 +1132,15 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
             Some(plan) if plan.awaiting_approval.is_empty() => rows.push(Row::new(vec![
                 label("approval"),
                 fixed(c.success.fg("plan approved")),
-                flex(plan.plan_approved_at.as_deref().unwrap_or(""), c.dim),
+                // #2215: relative, like /ticket's dispatch time (#2213).
+                flex(
+                    &plan
+                        .plan_approved_at
+                        .as_deref()
+                        .map(|at| since_text(at, SystemTime::now()))
+                        .unwrap_or_default(),
+                    c.dim,
+                ),
             ])),
             Some(plan) => {
                 // #2171: a person approves in the web UI; agents can't. Say so, and link the
@@ -1663,6 +1671,31 @@ mod tests {
             "{line:?}"
         );
         assert!(line.contains(&c.muted.fg("needs #2152")), "{line:?}");
+    }
+
+    /// #2215: `/plan`'s "plan approved" row shows the time relative (#2213's helper), not raw
+    /// RFC 3339.
+    #[test]
+    fn plan_approved_time_is_relative() {
+        let p = crate::theme::palette();
+        let mut meta = chrome::sample::meta(true);
+        meta.project
+            .value
+            .as_mut()
+            .expect("sample project")
+            .require_plan_approval = true;
+        let plan = meta.plan.value.as_mut().expect("sample plan");
+        plan.awaiting_approval.clear();
+        plan.plan_approved_at = Some("2026-10-20T00:00:00.4477798Z".to_owned());
+        let data = ChromeData::new(meta);
+        let lines = render_panel(&PanelState::new(PanelKind::Plan), Some(&data), &p, 100);
+        let line = lines
+            .iter()
+            .map(|l| chrome::plain(l))
+            .find(|l| l.contains("plan approved"))
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(line.trim_end().ends_with(" ago"), "{line}");
+        assert!(!line.contains("2026-10-20"), "{line}");
     }
 
     #[test]
