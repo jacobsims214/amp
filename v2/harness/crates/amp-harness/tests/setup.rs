@@ -651,12 +651,13 @@ impl Drop for KeychainCleanup {
 }
 
 /// The real keychain round trip, under a per-test service so the user's entries are untouched.
-/// macOS only (the login keychain lives under the real HOME); skipped with AMP_TEST_SKIP_KEYCHAIN.
+/// macOS only (the login keychain lives under the real HOME); opt-in with `AMP_TEST_KEYCHAIN=1`
+/// (#2309), like tests/keychain.rs, so a plain `make test` never touches the login keychain.
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn a_key_goes_to_the_keychain_and_nowhere_else() {
-    if std::env::var_os("AMP_TEST_SKIP_KEYCHAIN").is_some() {
-        eprintln!("skipped: AMP_TEST_SKIP_KEYCHAIN");
+    if std::env::var("AMP_TEST_KEYCHAIN").as_deref() != Ok("1") {
+        eprintln!("skipped: set AMP_TEST_KEYCHAIN=1 to run the real-keychain case");
         return;
     }
     let service = format!("amp-harness-test-{}", std::process::id());

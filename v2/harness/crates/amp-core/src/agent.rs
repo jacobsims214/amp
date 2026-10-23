@@ -224,6 +224,10 @@ struct ToolsSection {
     bash_timeout_secs: Option<f64>,
     /// The output cap for MCP servers that keep the default `max_output_tokens` (#2239).
     mcp_max_output_tokens: Option<u64>,
+    /// Days spilled MCP output (`<state>/mcp-output/`) is kept; 0 = no age limit (#2309).
+    mcp_output_keep_days: Option<u64>,
+    /// Most megabytes of spilled MCP output kept, oldest removed first; 0 = no size limit.
+    mcp_output_max_mb: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -465,6 +469,10 @@ impl Runtime {
             file.tools.mcp_max_output_tokens,
             (opts.env)(crate::mcp_hub::ENV_MAX_OUTPUT_TOKENS).as_deref(),
         )?;
+        hub_options.output_retention = Some(crate::mcp_hub::OutputRetention::from_config(
+            file.tools.mcp_output_keep_days,
+            file.tools.mcp_output_max_mb,
+        ));
         let mcp_hub = McpHub::new(mcp_config, hub_options);
         mcp_hub.set_strip(crate::mcp_stdio::strip_set(&secret_env, &pass_env));
         Ok(Self {

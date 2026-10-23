@@ -74,6 +74,8 @@ struct Mock {
     issued: Arc<Mutex<u32>>,
     token_lifetime: Arc<Mutex<u64>>,
     token_forms: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+    /// #2309: answer every request with a 307 to this base URL plus the request's path and query.
+    redirect: Arc<Mutex<Option<String>>>,
 }
 
 impl Mock {
@@ -119,17 +121,32 @@ impl Mock {
         });
         ok
     }
+
+    /// The 307 to answer with, when this mock redirects everything (#2309).
+    fn redirected(&self, uri: &OriginalUri) -> Option<Response> {
+        let to = self.redirect.lock().unwrap().clone()?;
+        let target = format!("{to}{}", uri.0);
+        Some((StatusCode::TEMPORARY_REDIRECT, [("location", target)]).into_response())
+    }
 }
 
 async fn models(State(m): State<Mock>, uri: OriginalUri, headers: HeaderMap) -> Response {
-    if !m.record(&uri, &headers) {
+    let accepted = m.record(&uri, &headers);
+    if let Some(r) = m.redirected(&uri) {
+        return r;
+    }
+    if !accepted {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "no"}))).into_response();
     }
     Json(json!({"object": "list", "data": [{"id": "gpt-4o"}, {"id": "m-1"}]})).into_response()
 }
 
 async fn chat(State(m): State<Mock>, uri: OriginalUri, headers: HeaderMap) -> Response {
-    if !m.record(&uri, &headers) {
+    let accepted = m.record(&uri, &headers);
+    if let Some(r) = m.redirected(&uri) {
+        return r;
+    }
+    if !accepted {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": {"message": "invalid token"}})),
@@ -159,6 +176,9 @@ async fn token(
     Form(form): Form<BTreeMap<String, String>>,
 ) -> Response {
     m.record(&uri, &headers);
+    if let Some(r) = m.redirected(&uri) {
+        return r;
+    }
     let mut shown = form.clone();
     let secret_ok = shown.remove("client_secret").as_deref() == Some(CLIENT_SECRET);
     m.token_forms.lock().unwrap().push(shown);
@@ -190,7 +210,15 @@ fn router(mock: Mock) -> Router {
         .route("/openai/deployments/{dep}/chat/completions", post(chat))
         .route("/token", post(token))
         .route("/{tenant}/oauth2/v2.0/token", post(token))
+        .route("/moved/{*rest}", get(moved).post(moved))
         .with_state(mock)
+}
+
+/// `/moved/<rest>` -> 307 to `/<rest>` on the same origin (#2309).
+async fn moved(State(m): State<Mock>, uri: OriginalUri, headers: HeaderMap) -> Response {
+    m.record(&uri, &headers);
+    let target = uri.0.to_string().replacen("/moved", "", 1);
+    (StatusCode::TEMPORARY_REDIRECT, [("location", target)]).into_response()
 }
 
 struct Server {
@@ -694,6 +722,58 @@ async fn oauth_client_credentials_fetch_refresh_and_never_show_the_secret() {
     let set = ProviderSet::build(&c, &wrong);
     let m = ask(&set, "gw", "m-1").await;
     assert!(!format!("{m:?}{set:?}").contains("cs-wrong"));
+}
+
+/// #2309 (H18 finding 6): a provider endpoint that redirects to another origin never gets the
+/// key in its own header, a secret header, or an OAuth client secret forwarded; a redirect on the
+/// same origin is still followed, credentials and all.
+#[tokio::test]
+async fn a_redirect_to_another_origin_carries_no_credentials() {
+    let other = spawn_http().await;
+    let gw = spawn_http().await;
+    *gw.mock.redirect.lock().unwrap() = Some(other.url.clone());
+    let c = config(&format!(
+        "[providers.hdr]\napi = \"openai-completions\"\nbase_url = \"{0}/v1\"\nkey_env = \"GW\"\n\
+         auth = \"header\"\n[providers.hdr.models.\"m-1\"]\n\
+         [providers.sec]\napi = \"openai-completions\"\nbase_url = \"{0}/v1\"\nkey_env = \"GW\"\n\
+         secret_headers = [\"X-Api-Key\"]\n[providers.sec.models.\"m-1\"]\n\
+         [providers.cc]\napi = \"openai-completions\"\nbase_url = \"{0}/v1\"\n\
+         auth = \"oauth-client-credentials\"\ntoken_url = \"{0}/token\"\nclient_id = \"amp\"\n\
+         key_env = \"GW_SECRET\"\n[providers.cc.models.\"m-1\"]\n\
+         [providers.same]\napi = \"openai-completions\"\nbase_url = \"{1}/moved/v1\"\n\
+         key_env = \"GW\"\nauth = \"header\"\n[providers.same.models.\"m-1\"]\n",
+        gw.url, other.url
+    ));
+    let k = keys(
+        &[("GW", KEY), ("GW_SECRET", CLIENT_SECRET)],
+        &[("sec:header:x-api-key", "xk-2309-planted-secret-header")],
+    );
+    let set = ProviderSet::build(&c, &k);
+    for id in ["hdr", "sec", "cc"] {
+        let m = ask(&set, id, "m-1").await;
+        assert_eq!(m.stop_reason, StopReason::Error, "{id}: {m:?}");
+        let shown = format!("{m:?}");
+        assert!(
+            !shown.contains(KEY) && !shown.contains(CLIENT_SECRET),
+            "{id}"
+        );
+    }
+    // The gateway saw each request (with its credentials); the other origin saw nothing at all.
+    assert!(gw.mock.seen().len() >= 3, "{:?}", gw.mock.seen());
+    assert!(other.mock.seen().is_empty(), "{:?}", other.mock.seen());
+    // The probe says why, naming only the target's origin.
+    let e = probe(&c.providers["hdr"], &k, ProbeKind::Auth)
+        .await
+        .unwrap_err();
+    assert!(e.message.contains("another origin"), "{e}");
+    assert!(other.mock.seen().is_empty());
+
+    // Same origin: `/moved/v1/chat/completions` -> `/v1/chat/completions`, key still sent.
+    ok(&ask(&set, "same", "m-1").await);
+    let seen = other.mock.seen();
+    let last = seen.last().unwrap();
+    assert_eq!(last.uri, "/v1/chat/completions");
+    assert_eq!(last.headers["api-key"], KEY);
 }
 
 #[tokio::test]
