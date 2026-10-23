@@ -31,6 +31,8 @@ async-trait.workspace = true
 # process: `git worktree` for workers (supervisor). macros: the metadata poller's select!.
 tokio = { workspace = true, features = ["rt", "time", "process", "macros"] }
 tokio-util.workspace = true
+# #2277: the provider HTTP client (CA file, mTLS, proxy) and the token endpoint calls.
+rpi-reqwest.workspace = true
 toml.workspace = true
 # #2250: the per-request clock stamp (request_time).
 chrono.workspace = true
@@ -44,6 +46,10 @@ rmcp = { workspace = true, features = ["server", "transport-streamable-http-serv
 # The legacy SSE mock (tests/mcp_http.rs includes amp-mcp's tests/common/legacy_sse.rs, #2238).
 futures.workspace = true
 serde.workspace = true
+# tests/provider_auth.rs (#2277): HTTPS and mTLS mock endpoints signed by a private CA.
+rcgen.workspace = true
+time.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

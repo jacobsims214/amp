@@ -11,10 +11,23 @@
 //!
 //! The result is `[providers.<id>]` plus the role mapping in config.toml, and the key in the OS
 //! keychain. OpenRouter is not needed and not contacted on this path.
+//!
+//! #2277: after the address, the endpoint is tried once without credentials. Only when that fails
+//! on TLS is the person asked for a CA bundle (unknown issuer) or a client certificate and key
+//! (the endpoint wants mTLS); only when it cannot be reached at all, for a proxy. Then "How does
+//! your endpoint authenticate?" (bearer key, a key in its own header such as Azure's `api-key`,
+//! none, a token command, OAuth client credentials, Microsoft Entra ID), with only the questions
+//! that choice needs. An Azure OpenAI address without a path becomes `…/openai/v1` (which needs no
+//! api-version); a classic `…/openai/deployments/…` address is asked for its api-version. OpenAI
+//! itself is asked for the optional organization and project ids.
 
 use std::collections::BTreeMap;
 
-use amp_core::models::{ModelsConfig, ProviderConfig};
+use amp_core::{
+    models::{ModelsConfig, ProviderAuth, ProviderConfig},
+    provider_auth::{ProbeFailure, ProbeKind, probe},
+    providers::StaticKeys,
+};
 
 use super::{KeyCheck, role_map, ui::Ui};
 use crate::{
@@ -197,7 +210,7 @@ async fn ask_key(
         };
         let key = ui.secret(&format!(
             "{}{suffix}",
-            connect::key_prompt(&provider.id, name)
+            connect::key_prompt_for(provider, name)
         ))?;
         if key.is_empty() && !keyless_ok {
             return Err(CliError::usage(format!(
@@ -251,7 +264,7 @@ async fn ask_models(
     key: &str,
     extra: &BTreeMap<String, String>,
 ) -> Result<Vec<String>, CliError> {
-    let listed = connect::list_models(provider, key, extra).await;
+    let listed = connect::list_models(provider, key, extra, None).await;
     let ids = match listed {
         Ok(ids) if !ids.is_empty() && ids.len() <= connect::MAX_AUTO_MODELS => {
             ui.say(&format!(
@@ -375,6 +388,223 @@ pub fn ask_roles(
     Ok(role_map::from_groups(&per_group, roles))
 }
 
+/// Whether `url` is an Azure OpenAI / AI Foundry endpoint.
+pub fn is_azure(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest
+        .split(['/', ':', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    [
+        ".openai.azure.com",
+        ".cognitiveservices.azure.com",
+        ".services.ai.azure.com",
+    ]
+    .iter()
+    .any(|s| host.ends_with(s))
+}
+
+/// The newest GA Azure OpenAI api-version for classic deployment URLs.
+pub const AZURE_API_VERSION: &str = "2024-10-21";
+
+/// Azure: a bare resource address means the v1 API (`…/openai/v1`, no api-version), and a
+/// deployment address keeps the deployment as `{model}` (the deployment name is the model id).
+fn azure_url(url: &str) -> String {
+    let base = url.trim_end_matches('/');
+    if let Some(root) = base.strip_suffix("/v1")
+        && !root.contains("/openai")
+    {
+        return format!("{root}/openai/v1");
+    }
+    if let Some(at) = base.find("/openai/deployments/") {
+        return format!("{}/openai/deployments/{{model}}", &base[..at]);
+    }
+    base.to_owned()
+}
+
+/// Tries the endpoint once without credentials; on a TLS failure asks for a CA bundle or a client
+/// certificate (mTLS), on no connection for a proxy. Asks nothing when it answers (any status).
+async fn ask_transport(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), CliError> {
+    let mut asked_proxy = false;
+    for _ in 0..4 {
+        let mut p = spec.config().map_err(CliError::new)?;
+        p.auth = ProviderAuth::None;
+        p.needs_key = false;
+        p.secret_headers.clear();
+        let keys = StaticKeys {
+            keychain: Some(BTreeMap::new()),
+            ..StaticKeys::default()
+        };
+        let failure = match probe(&p, &keys, ProbeKind::Auth).await {
+            Ok(_) => return Ok(()),
+            Err(e) => e,
+        };
+        let lower = failure.message.to_ascii_lowercase();
+        match failure.failure {
+            ProbeFailure::Tls
+                if [
+                    "certificaterequired",
+                    "certificate required",
+                    "badcertificate",
+                    "bad certificate",
+                    "handshakefailure",
+                ]
+                .iter()
+                .any(|n| lower.contains(n))
+                    && spec.auth.client_cert.is_none() =>
+            {
+                ui.say("  The endpoint asks for a client certificate (mutual TLS).");
+                let cert = ui.ask("Client certificate file (PEM, Enter to skip)", Some(""))?;
+                if cert.trim().is_empty() {
+                    return Ok(());
+                }
+                let key = ui.ask(
+                    "Client key file (PEM, Enter if the certificate file holds it)",
+                    Some(""),
+                )?;
+                spec.auth.client_cert = Some(absolute_path(cert.trim()));
+                spec.auth.client_key = Some(key.trim().to_owned())
+                    .filter(|k| !k.is_empty())
+                    .map(|k| absolute_path(&k));
+            }
+            ProbeFailure::Tls | ProbeFailure::Config if spec.auth.ca_file.is_none() => {
+                ui.say(&format!(
+                    "  Its TLS certificate is not trusted here ({}).",
+                    failure.message
+                ));
+                let ca = ui.ask(
+                    "CA bundle that signed it (PEM file, Enter to skip)",
+                    Some(""),
+                )?;
+                if ca.trim().is_empty() {
+                    return Ok(());
+                }
+                spec.auth.ca_file = Some(absolute_path(ca.trim()));
+            }
+            ProbeFailure::Network if !asked_proxy => {
+                asked_proxy = true;
+                ui.say(&format!("  Could not reach it ({}).", failure.message));
+                let proxy = ui.ask("Proxy for it (http://host:port, Enter for none)", Some(""))?;
+                if proxy.trim().is_empty() {
+                    return Ok(());
+                }
+                spec.auth.proxy = Some(proxy.trim().to_owned());
+            }
+            _ => {
+                if matches!(failure.failure, ProbeFailure::Tls | ProbeFailure::Config) {
+                    ui.say(&format!("  Still failing: {}", failure.message));
+                }
+                return Ok(());
+            }
+        }
+        // The new settings must load (a bad path is said, and asked again next round).
+        if let Err(e) = spec.config() {
+            ui.say(&format!("  {e}"));
+            spec.auth.ca_file = None;
+            spec.auth.client_cert = None;
+            spec.auth.client_key = None;
+            spec.auth.proxy = None;
+        }
+    }
+    Ok(())
+}
+
+fn absolute_path(p: &str) -> String {
+    let path = match p.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(rest))
+            .unwrap_or_else(|| p.into()),
+        None => std::path::PathBuf::from(p),
+    };
+    std::path::absolute(&path)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+/// "How does your endpoint authenticate?" and only the questions that choice needs.
+fn ask_auth(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), CliError> {
+    let azure = is_azure(&spec.base_url);
+    ui.say("How does your endpoint authenticate?");
+    ui.say("  1) An API key sent as a bearer token (Authorization: Bearer …) — most gateways");
+    ui.say("  2) An API key in a header of its own (Azure OpenAI's api-key, X-Api-Key, …)");
+    ui.say("  3) No authentication (a local or internal server)");
+    ui.say("  4) A command that prints a token (an SSO helper, Vault, az …)");
+    ui.say("  5) OAuth 2.0 client credentials (a client id and secret, a token endpoint)");
+    ui.say("  6) Microsoft Entra ID (Azure OpenAI / AI Foundry)");
+    let default = if azure { "2" } else { "1" };
+    let choice = loop {
+        let a = ui.ask("Authentication", Some(default))?;
+        match a.trim() {
+            n @ ("1" | "2" | "3" | "4" | "5" | "6") => break n.to_owned(),
+            _ => ui.say("  Type a number from 1 to 6."),
+        }
+    };
+    match choice.as_str() {
+        "1" => {}
+        "2" => {
+            spec.auth.kind = "header".to_owned();
+            let h = ui.ask("Header name", Some("api-key"))?;
+            let h = h.trim().trim_end_matches(':');
+            spec.auth.auth_header = Some(if h.is_empty() { "api-key" } else { h }.to_owned());
+        }
+        "3" => {
+            spec.auth.kind = "none".to_owned();
+            spec.needs_key = false;
+        }
+        "4" => {
+            spec.auth.kind = "command".to_owned();
+            loop {
+                let c = ui.ask(
+                    "Command that prints a token (program and arguments, e.g. vault read -field=token secret/llm)",
+                    None,
+                )?;
+                let argv: Vec<String> = c.split_whitespace().map(str::to_owned).collect();
+                if !argv.is_empty() {
+                    spec.auth.auth_command = argv;
+                    break;
+                }
+            }
+        }
+        "5" => {
+            spec.auth.kind = "oauth-client-credentials".to_owned();
+            loop {
+                let u = ui.ask("Token endpoint URL", None)?;
+                if u.trim().starts_with("https://") || is_local(u.trim()) {
+                    spec.auth.token_url = Some(u.trim().to_owned());
+                    break;
+                }
+                ui.say("  It must be an https:// URL (http only for localhost).");
+            }
+            spec.auth.client_id = Some(ask_nonempty(ui, "Client id")?);
+            let scopes = ui.ask("Scopes (space-separated, Enter for none)", Some(""))?;
+            spec.auth.scopes = scopes.split_whitespace().map(str::to_owned).collect();
+        }
+        _ => {
+            spec.auth.kind = "azure-entra".to_owned();
+            let tenant = ui.ask(
+                "Tenant id for a service principal (Enter to use your Azure CLI login, `az login`)",
+                Some(""),
+            )?;
+            if !tenant.trim().is_empty() {
+                spec.auth.tenant_id = Some(tenant.trim().to_owned());
+                spec.auth.client_id = Some(ask_nonempty(ui, "Client (application) id")?);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ask_nonempty(ui: &mut dyn Ui, prompt: &str) -> Result<String, CliError> {
+    loop {
+        let a = ui.ask(prompt, None)?;
+        if !a.trim().is_empty() {
+            return Ok(a.trim().to_owned());
+        }
+    }
+}
+
 /// The whole "own endpoint" conversation (or OpenAI's, with `openai = true`). Nothing is stored
 /// yet: the caller writes the provider, the roles and the key ([`store`]).
 pub async fn ask(ui: &mut dyn Ui, cfg: &ModelsConfig, openai: bool) -> Result<Endpoint, CliError> {
@@ -386,7 +616,21 @@ pub async fn ask(ui: &mut dyn Ui, cfg: &ModelsConfig, openai: bool) -> Result<En
              Studio… Its models get mapped to the agent roles.",
         );
         let (name, id) = ask_name_and_id(ui, cfg)?;
-        let base_url = ask_base_url(ui)?;
+        let mut base_url = ask_base_url(ui)?;
+        if is_azure(&base_url) {
+            let azure = azure_url(&base_url);
+            if azure != base_url {
+                ui.say(&format!(
+                    "  Azure OpenAI: using {azure}{}",
+                    if azure.contains("{model}") {
+                        " (the deployment name is the model id)"
+                    } else {
+                        " (the v1 API: deployment names are the model ids)"
+                    }
+                ));
+                base_url = azure;
+            }
+        }
         CustomSpec {
             key_env: Some(CustomSpec::default_key_env(&id)),
             id,
@@ -395,14 +639,41 @@ pub async fn ask(ui: &mut dyn Ui, cfg: &ModelsConfig, openai: bool) -> Result<En
             ..CustomSpec::default()
         }
     };
-    if !openai {
+    ask_transport(ui, &mut spec).await?;
+    if openai {
+        // OpenAI's optional organization and project headers.
+        let org = ui.ask("OpenAI organization id (Enter for your default)", Some(""))?;
+        spec.auth.organization = Some(org.trim().to_owned()).filter(|o| !o.is_empty());
+        let project = ui.ask("OpenAI project id (Enter for your default)", Some(""))?;
+        spec.auth.project = Some(project.trim().to_owned()).filter(|p| !p.is_empty());
+    } else {
+        ask_auth(ui, &mut spec)?;
+        if spec.base_url.contains("/deployments/") && is_azure(&spec.base_url) {
+            let v = ui.ask("Azure api-version", Some(AZURE_API_VERSION))?;
+            let v = if v.trim().is_empty() {
+                AZURE_API_VERSION
+            } else {
+                v.trim()
+            };
+            spec.auth
+                .query
+                .insert("api-version".to_owned(), v.to_owned());
+        }
         ask_headers(ui, &mut spec)?;
     }
     let provider = spec.config().map_err(CliError::new)?;
     let name = super::display_name(&provider);
     let extra = spec.secret_headers.clone();
-    let (key, key_from_env) = ask_key(ui, &provider, &name, !openai, &extra).await?;
-    if key.is_empty() {
+    let (key, key_from_env) = if provider.needs_key || provider.auth == ProviderAuth::Bearer {
+        let keyless = !openai && provider.auth == ProviderAuth::Bearer;
+        ask_key(ui, &provider, &name, keyless, &extra).await?
+    } else {
+        // none / a token command / Entra through az: nothing to ask; say whether it answers.
+        let check = super::check_key(&provider, "", &extra).await;
+        ui.say(&format!("  {}", connect::check_note(&name, &check)));
+        (String::new(), false)
+    };
+    if key.is_empty() && provider.auth == ProviderAuth::Bearer {
         spec.needs_key = false;
     }
     let provider = spec.config().map_err(CliError::new)?;

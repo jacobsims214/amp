@@ -212,8 +212,9 @@ async fn the_first_run_sets_up_an_own_endpoint_and_maps_models_to_roles() {
         .trim_end_matches("/v1")
         .to_owned();
     // No project for now; provider 4 (own endpoint); name; id; the address (bare host:port),
-    // confirm the /v1 URL; no extra header; no key; keep the suggested mapping.
-    let answers = format!("\n4\nExample AI\nexample\n{host}\n\n\n\n\n");
+    // confirm the /v1 URL; bearer auth (#2277, the default); no extra header; no key; keep the
+    // suggested mapping.
+    let answers = format!("\n4\nExample AI\nexample\n{host}\n\n\n\n\n\n");
     let out = env
         .run(&["--snapshot", "100x20", "--no-session"], Some(&answers))
         .await;
@@ -222,6 +223,7 @@ async fn the_first_run_sets_up_an_own_endpoint_and_maps_models_to_roles() {
     for want in [
         "Your own OpenAI-compatible endpoint",
         &format!("Use {}?", endpoint.url),
+        "How does your endpoint authenticate?",
         "It serves 2 models: engineer, orchestrator.",
         "manager    example/orchestrator",
         "workers    example/engineer",

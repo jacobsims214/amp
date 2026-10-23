@@ -17,6 +17,9 @@ use tokio::net::TcpListener;
 /// One request: `(path, authorization, required header value)`.
 pub type Seen = (String, Option<String>, Option<String>);
 
+/// One request's target (path and query) and headers, lowercase names (#2277).
+pub type Request = (String, std::collections::BTreeMap<String, String>);
+
 #[derive(Clone, Default)]
 pub struct ProviderState {
     /// The bearer key it accepts (`None`: any, or none).
@@ -30,6 +33,10 @@ pub struct ProviderState {
     pub seen: Arc<Mutex<Vec<Seen>>>,
     /// The `model` of every chat completion request (#2275: which model a role used).
     pub requested_models: Arc<Mutex<Vec<String>>>,
+    /// #2277: the key is expected in this header instead of `Authorization: Bearer`.
+    pub key_header: Option<String>,
+    /// #2277: every request's target (path and query) and headers (lowercase names).
+    pub requests: Arc<Mutex<Vec<Request>>>,
 }
 
 pub struct MockProvider {
@@ -54,6 +61,19 @@ impl MockProvider {
     pub fn requested_models(&self) -> Vec<String> {
         self.state.requested_models.lock().unwrap().clone()
     }
+
+    /// Every request's target and headers (#2277).
+    pub fn requests(&self) -> Vec<Request> {
+        self.state.requests.lock().unwrap().clone()
+    }
+}
+
+fn record(s: &ProviderState, uri: &axum::extract::OriginalUri, headers: &HeaderMap) {
+    let map = headers
+        .iter()
+        .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()))
+        .collect();
+    s.requests.lock().unwrap().push((uri.0.to_string(), map));
 }
 
 fn authorized(s: &ProviderState, path: &str, headers: &HeaderMap) -> bool {
@@ -71,10 +91,15 @@ fn authorized(s: &ProviderState, path: &str, headers: &HeaderMap) -> bool {
         .lock()
         .unwrap()
         .push((path.to_owned(), auth.clone(), extra.clone()));
-    let key_ok = s
-        .key
-        .as_ref()
-        .is_none_or(|k| auth.as_deref() == Some(format!("Bearer {k}").as_str()));
+    let key_ok = match &s.key_header {
+        Some(name) => s.key.as_ref().is_none_or(|k| {
+            headers.get(name.as_str()).and_then(|v| v.to_str().ok()) == Some(k.as_str())
+        }),
+        None => s
+            .key
+            .as_ref()
+            .is_none_or(|k| auth.as_deref() == Some(format!("Bearer {k}").as_str())),
+    };
     let header_ok = s
         .header
         .as_ref()
@@ -82,7 +107,12 @@ fn authorized(s: &ProviderState, path: &str, headers: &HeaderMap) -> bool {
     key_ok && header_ok
 }
 
-async fn models(State(s): State<ProviderState>, headers: HeaderMap) -> Response {
+async fn models(
+    State(s): State<ProviderState>,
+    uri: axum::extract::OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    record(&s, &uri, &headers);
     if !authorized(&s, "/v1/models", &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad key"}))).into_response();
     }
@@ -96,9 +126,11 @@ async fn models(State(s): State<ProviderState>, headers: HeaderMap) -> Response 
 
 async fn completions(
     State(s): State<ProviderState>,
+    uri: axum::extract::OriginalUri,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    record(&s, &uri, &headers);
     if !authorized(&s, "/v1/chat/completions", &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "bad key"}))).into_response();
     }

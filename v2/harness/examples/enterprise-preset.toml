@@ -27,6 +27,16 @@ base_url = "https://api.example.com/v1"
 models = ["engineer", "orchestrator"]
 # api = "openai-completions"          # the default; or "anthropic-messages"
 # auth = "none"                       # an endpoint that takes no key
+# auth = "header"                     # the key in its own header (auth_header, default api-key)
+# auth = "command"                    # a token from a program each person has:
+# auth_command = ["corp-sso", "token"]
+# auth = "oauth-client-credentials"   # token_url, client_id, scopes; secret asked at setup
+# auth = "azure-entra"                # tenant_id + client_id, or neither: `az login`
+# organization = "org-..."            # OpenAI-Organization / OpenAI-Project headers
+# query = { "api-version" = "2024-10-21" }   # Azure classic deployments
+# ca_file = "/etc/ssl/corp-root.pem"  # paths on each person's machine; never key material
+# client_cert = "~/.config/corp/me.pem"
+# proxy = "http://proxy.example.com:3128"
 # key_env = "EXAMPLE_API_KEY"
 # headers = { "X-Team" = "platform" } # plain headers only
 # secret_headers = ["X-Api-Key"]      # each person is asked for the value (OS keychain)

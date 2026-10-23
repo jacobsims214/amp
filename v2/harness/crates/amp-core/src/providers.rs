@@ -47,7 +47,7 @@ use rpi_ai::{
 };
 
 use crate::models::{
-    ModelsConfig, ModelsError, ProviderApi, ProviderConfig, ResolvedRole, Timeouts,
+    ModelsConfig, ModelsError, ProviderApi, ProviderAuth, ProviderConfig, ResolvedRole, Timeouts,
 };
 
 /// Keychain account prefix for provider keys (service [`amp_mcp::KEYCHAIN_SERVICE`]).
@@ -180,6 +180,12 @@ pub trait KeyLookup: Send + Sync {
         let _ = (provider, header);
         KeychainKey::Off
     }
+    /// Another of a provider's keychain items (`provider:<id>:<name>`, e.g. the mTLS
+    /// `client-key`, #2277).
+    fn provider_secret(&self, provider: &str, name: &str) -> KeychainKey {
+        let _ = (provider, name);
+        KeychainKey::Off
+    }
 }
 
 /// Process environment + the OS keychain (unless `AMP_CREDENTIAL_STORE=file`).
@@ -237,6 +243,19 @@ impl KeyLookup for SystemKeys {
             Err(e) => KeychainKey::Failed(e.message),
         }
     }
+
+    fn provider_secret(&self, provider: &str, name: &str) -> KeychainKey {
+        let Some(service) = self.keychain_service.as_deref() else {
+            return KeychainKey::Off;
+        };
+        let account = crate::provider_auth::secret_account(provider, name);
+        match amp_mcp::keychain_get(service, &account) {
+            Ok(Some(value)) => KeychainKey::Found(value),
+            Ok(None) => KeychainKey::NotFound,
+            Err(e) if e.kind == amp_mcp::KeychainErrorKind::Unavailable => KeychainKey::NotFound,
+            Err(e) => KeychainKey::Failed(e.message),
+        }
+    }
 }
 
 /// A fixed set of env values and keychain entries (tests).
@@ -271,6 +290,17 @@ impl KeyLookup for StaticKeys {
             None => KeychainKey::Off,
             Some(k) => k
                 .get(short)
+                .cloned()
+                .map_or(KeychainKey::NotFound, KeychainKey::Found),
+        }
+    }
+
+    /// Entries keyed `<provider>:<name>`.
+    fn provider_secret(&self, provider: &str, name: &str) -> KeychainKey {
+        match &self.keychain {
+            None => KeychainKey::Off,
+            Some(k) => k
+                .get(&format!("{provider}:{name}"))
                 .cloned()
                 .map_or(KeychainKey::NotFound, KeychainKey::Found),
         }
@@ -365,20 +395,25 @@ impl ProviderSet {
                     .insert(provider.id.clone(), format!("no key: {source}"));
                 continue;
             }
-            let extra = match resolve_secret_headers(provider, keys) {
+            let mut extra = match resolve_secret_headers(provider, keys) {
                 Ok(extra) => extra,
                 Err(why) => {
                     set.unavailable.insert(provider.id.clone(), why);
                     continue;
                 }
             };
-            match build_inner(provider, key) {
-                Ok((inner, faux)) => {
+            // #2277: `auth = "header"` sends the key in its own header, not as a bearer token.
+            if let (ProviderAuth::Header { name }, Some(k)) = (&provider.auth, &key) {
+                extra.insert(name.clone(), k.expose().to_owned());
+            }
+            match build_inner(provider, key, keys) {
+                Ok((inner, faux, tokens)) => {
                     if let Some(script) = faux {
                         set.faux.insert(provider.id.clone(), script);
                     }
                     let mut configured = ConfiguredProvider::new(provider, inner);
                     configured.extra_headers = extra;
+                    configured.tokens = tokens;
                     set.providers
                         .insert(provider.id.clone(), Arc::new(configured));
                 }
@@ -448,26 +483,36 @@ impl ProviderSet {
     }
 }
 
-type Inner = (Arc<dyn Provider>, Option<FauxScript>);
+type Inner = (
+    Arc<dyn Provider>,
+    Option<FauxScript>,
+    Option<Arc<crate::provider_auth::TokenSource>>,
+);
 
-fn build_inner(provider: &ProviderConfig, key: Option<Secret>) -> Result<Inner, String> {
+fn build_inner(
+    provider: &ProviderConfig,
+    key: Option<Secret>,
+    keys: &dyn KeyLookup,
+) -> Result<Inner, String> {
     let models: Vec<Model> = provider.models.values().cloned().collect();
     if provider.api == ProviderApi::Faux {
         let script = FauxScript::new();
         let faux: Arc<dyn Provider> = FauxProvider::with_models(script.clone(), models);
-        return Ok((faux, Some(script)));
+        return Ok((faux, Some(script), None));
     }
-    let mut builder = rpi_ai::http::client_builder_for(&provider.base_url, None, None)?;
-    if let Some(connect) = provider.timeouts.connect {
-        builder = builder.connect_timeout(connect);
-    }
-    let http = builder.build().map_err(|e| format!("http client: {e}"))?;
-    let key = key.map(|k| k.expose().to_owned());
+    // #2277: CA file, mTLS identity and proxy; the same client fetches tokens.
+    let http = crate::provider_auth::http_client(provider, keys)?;
+    let tokens = crate::provider_auth::TokenSource::new(provider, http.clone(), key.clone());
+    // Only a bearer key is rpi's to send; a header key and tokens go in per-request headers.
+    let key = match provider.auth {
+        ProviderAuth::Bearer => key.map(|k| k.expose().to_owned()),
+        _ => None,
+    };
     let inner: Arc<dyn Provider> = match provider.api {
         ProviderApi::AnthropicMessages => Arc::new(
             AnthropicProvider::with_models_without_env_api_key(key, http, models),
         ),
-        ProviderApi::OpenaiCompletions if provider.needs_key => {
+        ProviderApi::OpenaiCompletions if key.is_some() => {
             Arc::new(OpenAiCompletionsProvider::with_models_without_env_api_key(
                 provider.id.clone(),
                 key,
@@ -480,7 +525,7 @@ fn build_inner(provider: &ProviderConfig, key: Option<Secret>) -> Result<Inner, 
         ),
         ProviderApi::Faux => unreachable!("handled above"),
     };
-    Ok((inner, None))
+    Ok((inner, None, tokens))
 }
 
 /// A provider under its config id, with the configured deadline, retries and stall guard.
@@ -496,6 +541,13 @@ pub struct ConfiguredProvider {
     /// Scrub text-format tool calls (#2179): OpenAI-compatible and faux providers. Anthropic's
     /// Messages API has structured tool use only, and its models don't write the markup.
     text_tool_calls: bool,
+    /// Short-lived bearer tokens (#2277: command, OAuth client credentials, Entra).
+    tokens: Option<Arc<crate::provider_auth::TokenSource>>,
+    /// The configured base URL, its API and `query` (#2277), for requests that need a URL rpi
+    /// would not build itself.
+    base_url: String,
+    api: ProviderApi,
+    query: BTreeMap<String, String>,
 }
 
 impl ConfiguredProvider {
@@ -511,12 +563,150 @@ impl ConfiguredProvider {
                 config.api,
                 ProviderApi::OpenaiCompletions | ProviderApi::Faux
             ),
+            tokens: None,
+            base_url: config.base_url.clone(),
+            api: config.api,
+            query: config.query.clone(),
         }
     }
 
     pub fn timeouts(&self) -> Timeouts {
         self.timeouts
     }
+
+    /// The provider's token source, for token auth (tests and doctor).
+    pub fn token_source(&self) -> Option<&Arc<crate::provider_auth::TokenSource>> {
+        self.tokens.as_ref()
+    }
+
+    fn sender(&self) -> Sender {
+        Sender {
+            id: self.id.clone(),
+            inner: Arc::clone(&self.inner),
+            timeouts: self.timeouts,
+        }
+    }
+}
+
+/// What one attempt of a request needs (cloned into the 401-retry task).
+#[derive(Clone)]
+struct Sender {
+    id: String,
+    inner: Arc<dyn Provider>,
+    timeouts: Timeouts,
+}
+
+impl Sender {
+    /// One request to the inner provider under our own cancel token, behind the stall guard.
+    async fn send(
+        &self,
+        model: &Model,
+        ctx: &Context,
+        opts: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        let mut opts = opts.clone();
+        // Our own child token, so a stall cancels this request without cancelling the caller.
+        let cancel = opts.signal.child_token();
+        opts.signal = cancel.clone();
+        let inner = self.inner.stream_simple(model, ctx, &opts).await;
+        if self.timeouts.header.is_none() && self.timeouts.stream_idle.is_none() {
+            inner
+        } else {
+            guard_stream(inner, cancel, self.timeouts, &self.id, model)
+        }
+    }
+
+    /// One request with `token` as its bearer token.
+    async fn send_with(
+        &self,
+        model: &Model,
+        ctx: &Context,
+        opts: &SimpleStreamOptions,
+        token: &Secret,
+    ) -> AssistantMessageEventStream {
+        let mut opts = opts.clone();
+        let headers = opts.headers.get_or_insert_with(Default::default);
+        headers.retain(|k, _| !k.eq_ignore_ascii_case("authorization"));
+        headers.insert(
+            "authorization".to_owned(),
+            format!("Bearer {}", token.expose()),
+        );
+        opts.api_key = None;
+        self.send(model, ctx, &opts).await
+    }
+}
+
+/// Whether a request's first event says the endpoint refused the credentials (rpi:
+/// `http error 401: ...`).
+fn unauthorized(event: &AssistantMessageEvent) -> bool {
+    match event {
+        AssistantMessageEvent::Error { error, .. } => error
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("http error 401")),
+        _ => false,
+    }
+}
+
+/// A stream that is only an error (no token could be had).
+fn error_stream(provider: &str, model: &Model, message: String) -> AssistantMessageEventStream {
+    let (mut producer, consumer) = create_assistant_message_event_stream();
+    let mut error =
+        AssistantMessage::empty(model.api.clone(), provider, model.id.clone(), now_ms());
+    error.stop_reason = StopReason::Error;
+    error.error_message = Some(message);
+    producer.push(AssistantMessageEvent::Error {
+        reason: ErrorReason::Error,
+        error,
+    });
+    consumer
+}
+
+/// Token auth: the cached token; on a 401 before anything streamed, one new token and one retry.
+async fn send_with_tokens(
+    sender: Sender,
+    tokens: Arc<crate::provider_auth::TokenSource>,
+    model: Model,
+    ctx: Context,
+    opts: SimpleStreamOptions,
+) -> AssistantMessageEventStream {
+    let token = match tokens.token().await {
+        Ok(t) => t,
+        Err(why) => return error_stream(&sender.id, &model, format!("{}: auth: {why}", sender.id)),
+    };
+    let mut first_stream = sender.send_with(&model, &ctx, &opts, &token).await;
+    let (mut producer, consumer) = create_assistant_message_event_stream();
+    tokio::spawn(async move {
+        let Some(first) = first_stream.next().await else {
+            return;
+        };
+        let mut stream = if unauthorized(&first) {
+            match tokens.refresh(&token).await {
+                Ok(next) => sender.send_with(&model, &ctx, &opts, &next).await,
+                Err(why) => error_stream(
+                    &sender.id,
+                    &model,
+                    format!(
+                        "{}: the endpoint refused the token (401) and a new one could not be had: {why}",
+                        sender.id
+                    ),
+                ),
+            }
+        } else {
+            let terminal = first.is_terminal();
+            if !producer.push(first) || terminal {
+                return;
+            }
+            first_stream
+        };
+        while let Some(event) = stream.next().await {
+            let terminal = event.is_terminal();
+            if !producer.push(event) || terminal {
+                return;
+            }
+        }
+    });
+    consumer
 }
 
 #[async_trait]
@@ -542,15 +732,25 @@ impl Provider for ConfiguredProvider {
         if opts.max_retries.is_none() {
             opts.max_retries = self.max_retries;
         }
-        // Our own child token, so a stall cancels this request without cancelling the caller.
         if !self.extra_headers.is_empty() {
             let headers = opts.headers.get_or_insert_with(Default::default);
             for (name, value) in &self.extra_headers {
                 headers.insert(name.clone(), value.clone());
             }
         }
-        let cancel = opts.signal.child_token();
-        opts.signal = cancel.clone();
+        // #2277: `query` / `{model}` need a URL rpi would not build (see provider_auth).
+        let rewritten = crate::provider_auth::request_base_url(
+            self.api,
+            &self.base_url,
+            &self.query,
+            &model.id,
+        )
+        .map(|url| {
+            let mut m = model.clone();
+            m.base_url = url;
+            m
+        });
+        let model = rewritten.as_ref().unwrap_or(model);
         // The request's own copy of the history: cleaned (#2203), then every user message and
         // tool result stamped with its time (#2250). The session keeps what was written.
         let sanitized = sanitize_history(&ctx.messages);
@@ -563,11 +763,18 @@ impl Provider for ConfiguredProvider {
             messages,
             tools: ctx.tools.clone(),
         };
-        let inner = self.inner.stream_simple(model, &ctx, &opts).await;
-        let guarded = if self.timeouts.header.is_none() && self.timeouts.stream_idle.is_none() {
-            inner
-        } else {
-            guard_stream(inner, cancel, self.timeouts, &self.id, model)
+        let guarded = match &self.tokens {
+            Some(tokens) => {
+                send_with_tokens(
+                    self.sender(),
+                    Arc::clone(tokens),
+                    model.clone(),
+                    ctx.clone(),
+                    opts,
+                )
+                .await
+            }
+            None => self.sender().send(model, &ctx, &opts).await,
         };
         if self.text_tool_calls {
             crate::text_tool_calls::scrub_stream(guarded, ctx.tools.clone())
@@ -730,89 +937,18 @@ fn stall_error(
     }
 }
 
-/// Send a request built on rpi's reqwest client and decode the JSON body. A macro because rpi-ai
-/// does not re-export its reqwest (0.12) and we don't depend on that major ourselves.
-macro_rules! get_json {
-    ($request:expr) => {
-        async {
-            let response = $request.send().await.map_err(|e| format!("request: {e}"))?;
-            let status = response.status();
-            let body = response.text().await.map_err(|e| format!("read: {e}"))?;
-            if !status.is_success() {
-                let snippet: String = body.chars().take(200).collect();
-                return Err::<serde_json::Value, String>(format!("HTTP {status}: {snippet}"));
-            }
-            serde_json::from_str::<serde_json::Value>(&body).map_err(|e| format!("decode: {e}"))
-        }
-    };
-}
 /// The model ids a provider serves right now, from its own catalog endpoint: `GET /v1/models`
-/// (Anthropic; needs the key) or `GET /models` (OpenAI-compatible; OpenRouter's is public). For
-/// `amp-harness config show --check` and doctor. Faux returns its configured models.
+/// (Anthropic; needs the key) or `GET /models` (OpenAI-compatible; OpenRouter's is public), with
+/// the provider's auth, query, CA file, mTLS identity and proxy (#2277). For `amp-harness config
+/// show --check` and doctor. Faux returns its configured models.
 pub async fn live_model_ids(
     provider: &ProviderConfig,
     keys: &dyn KeyLookup,
 ) -> Result<std::collections::BTreeSet<String>, String> {
-    if provider.api == ProviderApi::Faux {
-        return Ok(provider.models.keys().cloned().collect());
-    }
-    let (key, source) = resolve_key(provider, keys);
-    let secret_headers = resolve_secret_headers(provider, keys)?;
-    let http = rpi_ai::http::client_builder_for(&provider.base_url, None, None)?
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
-    let mut ids = std::collections::BTreeSet::new();
-    match provider.api {
-        ProviderApi::AnthropicMessages => {
-            let Some(key) = key else {
-                return Err(format!("skipped: key {source}"));
-            };
-            let mut after: Option<String> = None;
-            loop {
-                let mut url = format!("{}/v1/models?limit=1000", provider.base_url);
-                if let Some(after) = &after {
-                    url.push_str("&after_id=");
-                    url.push_str(after);
-                }
-                let mut request = http
-                    .get(&url)
-                    .header("x-api-key", key.expose())
-                    .header("anthropic-version", "2023-06-01");
-                for (name, value) in provider.headers.iter().chain(secret_headers.iter()) {
-                    request = request.header(name.as_str(), value.as_str());
-                }
-                let page = get_json!(request).await?;
-                collect_ids(&page, &mut ids);
-                let more = page["has_more"].as_bool().unwrap_or(false);
-                match page["last_id"].as_str() {
-                    Some(last) if more => after = Some(last.to_owned()),
-                    _ => break,
-                }
-            }
-        }
-        ProviderApi::OpenaiCompletions => {
-            let mut request = http.get(format!("{}/models", provider.base_url));
-            for (name, value) in provider.headers.iter().chain(secret_headers.iter()) {
-                request = request.header(name.as_str(), value.as_str());
-            }
-            if let Some(key) = &key {
-                request = request.bearer_auth(key.expose());
-            }
-            collect_ids(&get_json!(request).await?, &mut ids);
-        }
-        ProviderApi::Faux => unreachable!("handled above"),
-    }
-    Ok(ids)
-}
-
-fn collect_ids(page: &serde_json::Value, ids: &mut std::collections::BTreeSet<String>) {
-    if let Some(data) = page["data"].as_array() {
-        ids.extend(
-            data.iter()
-                .filter_map(|m| m["id"].as_str().map(str::to_owned)),
-        );
-    }
+    crate::provider_auth::probe(provider, keys, crate::provider_auth::ProbeKind::Catalog)
+        .await
+        .map(|p| p.ids)
+        .map_err(|e| e.message)
 }
 
 #[cfg(test)]

@@ -1520,53 +1520,48 @@ pub(crate) enum KeyCheck {
 /// Asks the provider whether the key works, without spending tokens: Anthropic's model list,
 /// OpenRouter's key endpoint, an OpenAI-compatible model list. `extra` headers (a custom
 /// provider's, secret ones included) go on the request; an empty `key` sends none.
+///
+/// #2277: the request goes through the provider's own transport and auth (CA file, mTLS, proxy,
+/// query, header key, tokens from a command or token endpoint), so what is checked is what the
+/// harness will send.
 pub(crate) async fn check_key(
     p: &ProviderConfig,
     key: &str,
     extra: &std::collections::BTreeMap<String, String>,
 ) -> KeyCheck {
-    let Ok(http) = amp_mcp::build_http_client(None) else {
-        return KeyCheck::Unknown("no HTTP client".to_owned());
-    };
-    let base = p.base_url.trim_end_matches('/');
-    let mut req = match p.api {
-        ProviderApi::AnthropicMessages => {
-            let r = http
-                .get(format!("{base}/v1/models?limit=1"))
-                .header("anthropic-version", "2023-06-01");
-            if key.is_empty() {
-                r
-            } else {
-                r.header("x-api-key", key)
-            }
-        }
-        ProviderApi::OpenaiCompletions => {
-            let r = if p.id == "openrouter" || base.contains("openrouter.ai") {
-                http.get(format!("{base}/key"))
-            } else {
-                http.get(format!("{base}/models"))
-            };
-            if key.is_empty() {
-                r
-            } else {
-                r.bearer_auth(key)
-            }
-        }
-        _ => return KeyCheck::Ok,
-    };
-    for (name, value) in p.headers.iter().chain(extra.iter()) {
-        req = req.header(name.as_str(), value.as_str());
+    check_key_full(p, key, extra, None).await
+}
+
+/// [`check_key`] with an mTLS key PEM that is not in the keychain yet.
+pub(crate) async fn check_key_full(
+    p: &ProviderConfig,
+    key: &str,
+    extra: &std::collections::BTreeMap<String, String>,
+    client_key: Option<&str>,
+) -> KeyCheck {
+    if p.api == ProviderApi::Faux {
+        return KeyCheck::Ok;
     }
-    match tokio::time::timeout(KEY_CHECK_TIMEOUT, req.timeout(KEY_CHECK_TIMEOUT).send()).await {
-        Ok(Ok(resp)) => {
-            let status = resp.status().as_u16();
-            match status {
-                200..=299 => KeyCheck::Ok,
-                401 | 403 => KeyCheck::Rejected(status),
-                _ => KeyCheck::Unknown(format!("HTTP {status}")),
-            }
+    let mut p = p.clone();
+    // No key given for a provider that takes one: ask the endpoint without it (a keyless
+    // endpoint answers; one that wants a key says 401).
+    if key.is_empty() && p.needs_key && p.auth == amp_core::models::ProviderAuth::Bearer {
+        p.needs_key = false;
+        p.auth = amp_core::models::ProviderAuth::None;
+    }
+    let mut keys = crate::connect::static_keys(&p.id, key, extra, client_key);
+    // The key is the one given here, never one from the environment.
+    p.key_env = None;
+    if keys.keychain.is_none() {
+        keys.keychain = Some(Default::default());
+    }
+    use amp_core::provider_auth::{ProbeFailure, ProbeKind, probe};
+    match tokio::time::timeout(KEY_CHECK_TIMEOUT, probe(&p, &keys, ProbeKind::Auth)).await {
+        Ok(Ok(_)) => KeyCheck::Ok,
+        Ok(Err(e)) if e.failure == ProbeFailure::Rejected => {
+            KeyCheck::Rejected(e.status.unwrap_or(401))
         }
-        Ok(Err(e)) => KeyCheck::Unknown(e.to_string()),
+        Ok(Err(e)) => KeyCheck::Unknown(e.message),
         Err(_) => KeyCheck::Unknown("timed out".to_owned()),
     }
 }
@@ -1616,7 +1611,7 @@ async fn prompt_secrets(
     for _ in 0..3 {
         let key = ui.secret(&format!(
             "{}, Enter to skip",
-            crate::connect::key_prompt(&p.id, &name)
+            crate::connect::key_prompt_for(p, &name)
         ))?;
         if key.is_empty() {
             return Ok(false);
