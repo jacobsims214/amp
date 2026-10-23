@@ -31,7 +31,7 @@ use std::{
     time::Duration,
 };
 
-use amp_core::{agent::Runtime, policy::ToolPolicy, tools::call_json};
+use amp_core::{agent::Runtime, policy::ToolPolicy, project::ProjectMarker, tools::call_json};
 use amp_mcp::{
     AmpMcpClient, Auth, DEFAULT_MCP_URL, ENV_MCP_URL, ENV_WEB_URL, McpError, Overrides,
     ProtocolMode, Settings, Source,
@@ -998,7 +998,9 @@ pub struct Switcher {
     rt: Arc<Runtime>,
     harness: Arc<AgentHarness>,
     policy: Arc<ToolPolicy>,
-    project_id: Option<i64>,
+    /// The session's `.amp.json`: its project stays selected after a switch, and a marker made
+    /// for another server than the new one is called out (#2228, like the start's banner, #2206).
+    marker: Option<ProjectMarker>,
     /// Start a metadata poller for the new server (the chat has one).
     with_meta: bool,
     state: Mutex<SwitchState>,
@@ -1020,7 +1022,7 @@ impl Switcher {
         rt: Arc<Runtime>,
         harness: Arc<AgentHarness>,
         policy: Arc<ToolPolicy>,
-        project_id: Option<i64>,
+        marker: Option<ProjectMarker>,
         with_meta: bool,
     ) -> Self {
         // Offline (#2178): no AMP tools yet, and no connect attempt here (it would hold up the
@@ -1037,7 +1039,7 @@ impl Switcher {
             rt,
             harness,
             policy,
-            project_id,
+            marker,
             with_meta,
             state: Mutex::new(SwitchState {
                 settings,
@@ -1238,18 +1240,29 @@ impl Switcher {
                 "note: {ENV_MCP_URL} still names the old server for the next start"
             ));
         }
-        if let Some(pid) = self.project_id {
-            lines.push(format!(
-                "project #{pid} (.amp.json) stays selected; `/project <id>` picks another"
-            ));
+        if let Some(line) = self.marker.as_ref().map(|m| marker_line(m, &settings.url)) {
+            lines.push(line);
         }
+        let project_id = self.marker.as_ref().map(|m| m.project_id);
         let meta = self
             .with_meta
-            .then(|| crate::chat::start_meta_with(settings, self.project_id));
+            .then(|| crate::chat::start_meta_with(settings, project_id));
         Ok(ServerSwitched {
             notice: lines.join("\n"),
             meta,
         })
+    }
+}
+
+/// The switch notice's line about `.amp.json` (#2228): its project stays selected, or, when the
+/// marker was made for another server than `url` (its `amp_api`, compared by origin as at the
+/// start, #2206), one warning naming both servers and `/project`. Never a prompt: the chat goes on.
+fn marker_line(marker: &ProjectMarker, url: &str) -> String {
+    let pid = marker.project_id;
+    // With no server name to compare, only a marker made for another server warns.
+    match marker.server_warning(url, None) {
+        Some(w) => format!("warning: {w}; `/project <id>` picks this server's"),
+        None => format!("project #{pid} (.amp.json) stays selected; `/project <id>` picks another"),
     }
 }
 
@@ -1335,6 +1348,31 @@ fn tool_change(now: usize, added: &[String], removed: &[String], verbose: bool) 
 
 #[cfg(test)]
 mod tests {
+
+    /// #2228: after `/server`, a marker made for another server is one warning naming both
+    /// servers and `/project`; a marker for the new server (any loopback spelling) is not.
+    #[test]
+    fn the_switch_notice_warns_about_a_marker_made_for_another_server() {
+        let marker = ProjectMarker::parse(
+            std::path::Path::new("/w/.amp.json"),
+            r#"{"project_id": 71, "project_name": "AMP v2", "amp_api": "http://localhost:18000"}"#,
+        )
+        .unwrap();
+        let line = marker_line(&marker, "http://localhost:18001/mcp");
+        assert_eq!(
+            line,
+            "warning: .amp.json at /w/.amp.json was made for http://localhost:18000; #71 on this \
+             server (http://localhost:18001) may be another project; `/project <id>` picks this \
+             server's"
+        );
+        assert!(!line.contains('\n'));
+        for same in ["http://localhost:18000/mcp", "http://127.0.0.1:18000/mcp"] {
+            assert_eq!(
+                marker_line(&marker, same),
+                "project #71 (.amp.json) stays selected; `/project <id>` picks another"
+            );
+        }
+    }
 
     fn tools(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("amp_t{i}")).collect()

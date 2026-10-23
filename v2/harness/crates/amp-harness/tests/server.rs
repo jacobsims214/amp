@@ -332,6 +332,8 @@ async fn the_chat_switches_servers_without_a_restart() {
     two_mock.omit = vec!["amp_kb_write"];
     let two = spawn(two_mock, None).await;
     let dir = workdir("server-chat-switch", Some(2));
+    // A marker made for `two`: switching to it says only that its project stays (#2228).
+    write_marker(&dir, 2, &two.url);
     let config = format!(
         "{FAUX_CONFIG}\n[server]\nname = \"one\"\nurl = \"{0}\"\n\n[servers.one]\nurl = \"{0}\"\n\n\
          [servers.two]\nurl = \"{1}\"\nweb_url = \"http://localhost:5998\"\n",
@@ -394,6 +396,8 @@ async fn the_chat_switches_servers_without_a_restart() {
     ] {
         assert!(screen.contains(&want), "missing {want:?} in\n{screen}");
     }
+    // (The start's banner warns: the marker is `two`'s and the chat starts on `one`.)
+    assert!(!screen.contains("`/project <id>` picks this"), "{screen}");
     // The model's call went to the new server; the old one never saw it.
     assert!(one.mock.calls_to("amp_whoami").is_empty());
     assert_eq!(
@@ -409,6 +413,72 @@ async fn the_chat_switches_servers_without_a_restart() {
         Some("http://localhost:5998")
     );
     assert_eq!(t["roles"]["manager"]["model"].as_str(), Some("faux/faux-1"));
+}
+
+/// Writes `project/.amp.json` naming project `id`, made for the AMP at `mcp_url`.
+fn write_marker(dir: &Path, id: i64, mcp_url: &str) {
+    let origin = mcp_url.trim_end_matches("/mcp");
+    std::fs::write(
+        dir.join("project/.amp.json"),
+        json!({"project_id": id, "project_name": "AMP v2", "amp_api": origin}).to_string(),
+    )
+    .unwrap();
+}
+
+/// #2228: `/server` to another server than the one `.amp.json` was made for says so in one line
+/// naming both and `/project` (as the start does, #2206, but without a prompt); switching back to
+/// the marker's server prints no warning.
+#[tokio::test]
+async fn switching_away_from_the_markers_server_warns_once() {
+    let one = spawn(MockAmp::new(), None).await;
+    let two = spawn(MockAmp::new(), None).await;
+    let dir = workdir("server-chat-marker", Some(71));
+    write_marker(&dir, 71, &one.url);
+    let config = format!(
+        "{FAUX_CONFIG}\n[server]\nname = \"one\"\nurl = \"{0}\"\n\n[servers.one]\nurl = \"{0}\"\n\n\
+         [servers.two]\nurl = \"{1}\"\n",
+        one.url, two.url
+    );
+    std::fs::create_dir_all(config_path(&dir).parent().unwrap()).unwrap();
+    std::fs::write(config_path(&dir), &config).unwrap();
+    let state = dir.join("home/.local/state");
+    let out = run(
+        &dir,
+        "",
+        &[
+            "--snapshot",
+            "240x70",
+            "--no-setup",
+            "--input",
+            "/server two",
+            "--input",
+            "/server one",
+        ],
+        &[("XDG_STATE_HOME", state.to_str().unwrap())],
+    )
+    .await;
+    ok(&out);
+    let screen = &out.stdout;
+    let one_origin = one.url.trim_end_matches("/mcp");
+    let two_origin = two
+        .url
+        .trim_end_matches("/mcp")
+        .replace("127.0.0.1", "localhost");
+    let warning = format!(
+        "warning: .amp.json at {} was made for {one_origin}; #71 on this server ({two_origin}) \
+         may be another project; `/project <id>` picks this server's",
+        dir.join("project/.amp.json").display()
+    );
+    let flat: String = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains(&warning), "missing {warning:?} in\n{screen}");
+    assert_eq!(flat.matches("was made for").count(), 1, "{screen}");
+    // Back on the marker's server: the plain line, no warning.
+    assert!(
+        flat.contains("now on `one`")
+            && flat
+                .contains("project #71 (.amp.json) stays selected; `/project <id>` picks another"),
+        "{screen}"
+    );
 }
 
 /// The model's AMP tool list follows the server: after switching to a server without
