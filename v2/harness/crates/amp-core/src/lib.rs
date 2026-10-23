@@ -75,6 +75,7 @@ pub mod provider_error;
 pub mod providers;
 pub mod repeat;
 pub mod repo_config;
+pub mod request_time;
 pub mod roles;
 pub mod run_report;
 pub mod supervisor;

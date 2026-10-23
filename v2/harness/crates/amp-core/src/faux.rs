@@ -18,8 +18,10 @@
 //! - `thinking`: an optional thinking block before everything else.
 //!
 //! Placeholders in `text`, filled at call time from what the model was sent:
-//! - `{{last_tool_result}}`: the text of the newest tool result;
-//! - `{{system_prompt}}`: the whole system prompt.
+//! - `{{last_tool_result}}`: the text of the newest tool result, without the clock stamp;
+//! - `{{system_prompt}}`: the whole system prompt;
+//! - `{{current_time}}`: the newest clock stamp the request carried (#2250,
+//!   [`crate::request_time`]), or `none`.
 //!
 //! When the script runs out, the faux provider answers with an error ("No more faux responses
 //! queued"), so a script that is too short fails the run instead of hanging it.
@@ -154,10 +156,15 @@ impl StepSpec {
         } else {
             StopReason::ToolUse
         };
-        let has_placeholder = spec
-            .text
-            .as_deref()
-            .is_some_and(|t| t.contains("{{last_tool_result}}") || t.contains("{{system_prompt}}"));
+        let has_placeholder = spec.text.as_deref().is_some_and(|t| {
+            [
+                "{{last_tool_result}}",
+                "{{system_prompt}}",
+                "{{current_time}}",
+            ]
+            .iter()
+            .any(|p| t.contains(p))
+        });
         if !has_placeholder {
             return FauxStep::message(faux_assistant_message(spec.blocks(None), stop));
         }
@@ -186,27 +193,46 @@ impl StepSpec {
     }
 }
 
+fn texts(content: &[Content]) -> String {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn fill(template: &str, ctx: &Context) -> String {
     let last_tool_result = ctx
         .messages
         .iter()
         .rev()
         .find_map(|m| match m {
-            Message::ToolResult(r) => Some(
-                r.content
-                    .iter()
-                    .filter_map(|c| match c {
-                        Content::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ),
+            Message::ToolResult(r) => Some(crate::request_time::strip(&texts(&r.content))),
             _ => None,
         })
         .unwrap_or_default();
+    let current_time = ctx
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| {
+            let text = match m {
+                Message::ToolResult(r) => texts(&r.content),
+                Message::User(u) => match &u.content {
+                    rpi_ai::types::UserContent::Text(t) => t.clone(),
+                    rpi_ai::types::UserContent::Blocks(b) => texts(b),
+                },
+                Message::Assistant(_) => return None,
+            };
+            crate::request_time::last_stamp(&text).map(str::to_owned)
+        })
+        .unwrap_or_else(|| "none".to_owned());
     template
         .replace("{{last_tool_result}}", &last_tool_result)
+        .replace("{{current_time}}", &current_time)
         .replace(
             "{{system_prompt}}",
             ctx.system_prompt.as_deref().unwrap_or_default(),

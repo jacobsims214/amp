@@ -253,10 +253,11 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     // #2205: the web UI line; without a web URL it is the MCP URL's origin.
     let origin = amp.url.trim_end_matches("/mcp");
     assert!(prompt.contains(&format!(
-        "<amp_context>\nrole: amp-manager\namp_server: {}\namp_web_ui: {origin} (AMP's web UI: every link you give a person is on this origin, e.g. {origin}/project/<id>/plan to approve a plan; never build links from amp_server)\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\n</amp_context>",
+        "<amp_context>\nrole: amp-manager\namp_server: {}\namp_web_ui: {origin} (AMP's web UI: every link you give a person is on this origin, e.g. {origin}/project/<id>/plan to approve a plan; never build links from amp_server)\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\n{}\n</amp_context>",
         amp.url,
         project_dir.join(".amp.json").display(),
-        project_dir.display()
+        project_dir.display(),
+        amp_core::request_time::CONTEXT_LINE
     )), "no amp_context block");
     assert!(!prompt.contains("stale.invalid"));
     // 4. The manager's preloaded skills, in full.

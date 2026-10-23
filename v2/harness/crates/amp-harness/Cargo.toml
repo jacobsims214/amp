@@ -27,6 +27,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 x509-parser.workspace = true
 
 [dev-dependencies]
+# tests/clock.rs: parse the clock stamp's UTC time (#2250).
+chrono.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 # The in-process mock AMP: rmcp's server side + Streamable HTTP server transport.
