@@ -129,57 +129,82 @@ fn error_url(e: &McpError) -> Option<&str> {
 /// ([`connect_message_verbose`]). `url` is the server's MCP URL; `auth` says whether a static
 /// token (its variable's name, never its value) was refused.
 pub fn connect_message(url: &str, auth: Option<&Auth>, e: &McpError) -> String {
+    let (headline, next) = connect_parts(url, auth, e);
+    format!("{headline} {next}")
+}
+
+/// The first half of [`connect_message`]: what went wrong, without the next step ("Can't reach AMP
+/// at localhost:18999 (connection refused)."). `doctor` shows it as its `connect` check's detail
+/// and gives its own fix (#2208), so the two say the same thing.
+pub fn connect_headline(url: &str, auth: Option<&Auth>, e: &McpError) -> String {
+    connect_parts(url, auth, e).0
+}
+
+/// [`connect_message`] as (what went wrong, what to do next).
+fn connect_parts(url: &str, auth: Option<&Auth>, e: &McpError) -> (String, String) {
     let host = crate::setup::host_of(url);
     let switch = "or switch servers with `amp-harness server set <url>` (or --url)";
     match e.kind() {
-        FailureKind::Refused => format!(
-            "Can't reach AMP at {host} (connection refused). Is the server running? Check with \
-             `amp-harness doctor`, {switch}."
+        FailureKind::Refused => (
+            format!("Can't reach AMP at {host} (connection refused)."),
+            format!("Is the server running? Check with `amp-harness doctor`, {switch}."),
         ),
-        FailureKind::HostNotFound => format!(
-            "Can't reach AMP at {host} (host not found). Check the address with `amp-harness \
-             server`, {switch}."
+        FailureKind::HostNotFound => (
+            format!("Can't reach AMP at {host} (host not found)."),
+            format!("Check the address with `amp-harness server`, {switch}."),
         ),
-        FailureKind::Tls => format!(
-            "Can't connect securely to AMP at {host} (its certificate is not trusted, or it does \
-             not speak HTTPS). For a private CA save it with `amp-harness server set {url} \
-             --ca-file <PEM>`; `amp-harness doctor` shows the certificate problem."
+        FailureKind::Tls => (
+            format!(
+                "Can't connect securely to AMP at {host} (its certificate is not trusted, or it \
+                 does not speak HTTPS)."
+            ),
+            format!(
+                "For a private CA save it with `amp-harness server set {url} --ca-file <PEM>`; \
+                 `amp-harness doctor` shows the certificate problem."
+            ),
         ),
         FailureKind::LoginRequired => match auth {
-            Some(Auth::Static { env, .. }) => format!(
-                "AMP at {host} refused the token in {env} (401). Set a new token in {env}, or \
-                 unset it and run `amp-harness login --url {url}`."
+            Some(Auth::Static { env, .. }) => (
+                format!("AMP at {host} refused the token in {env} (401)."),
+                format!(
+                    "Set a new token in {env}, or unset it and run `amp-harness login --url {url}`."
+                ),
             ),
-            _ => format!(
-                "AMP at {host} needs you to log in (401). Run `amp-harness login --url {url}`, \
-                 then try again."
+            _ => (
+                format!("AMP at {host} needs you to log in (401)."),
+                format!("Run `amp-harness login --url {url}`, then try again."),
             ),
         },
-        FailureKind::NotFound => format!(
-            "AMP at {host} has no MCP endpoint at {url} (HTTP 404). Check the address (it \
-             usually ends in /mcp) with `amp-harness server`, {switch}."
+        FailureKind::NotFound => (
+            format!("AMP at {host} has no MCP endpoint at {url} (HTTP 404)."),
+            format!(
+                "Check the address (it usually ends in /mcp) with `amp-harness server`, {switch}."
+            ),
         ),
-        FailureKind::NotMcp => format!(
-            "The server at {host} did not answer as AMP ({}). Check the address (it usually ends \
-             in /mcp) with `amp-harness server`, {switch}.",
-            e.reason()
+        FailureKind::NotMcp => (
+            format!(
+                "The server at {host} did not answer as AMP ({}).",
+                e.reason()
+            ),
+            format!(
+                "Check the address (it usually ends in /mcp) with `amp-harness server`, {switch}."
+            ),
         ),
-        FailureKind::Timeout => format!(
-            "AMP at {host} did not answer ({}). Check the server and your network with \
-             `amp-harness doctor`, {switch}.",
-            e.reason()
+        FailureKind::Timeout => (
+            format!("AMP at {host} did not answer ({}).", e.reason()),
+            format!("Check the server and your network with `amp-harness doctor`, {switch}."),
         ),
-        FailureKind::Closed => format!(
-            "The connection to AMP at {host} was closed. Try again; `amp-harness doctor` checks \
-             the server."
+        FailureKind::Closed => (
+            format!("The connection to AMP at {host} was closed."),
+            "Try again; `amp-harness doctor` checks the server.".to_owned(),
         ),
-        FailureKind::Config => format!(
-            "The AMP server settings are not usable ({}). See them with `amp-harness server`.",
-            e.reason()
+        FailureKind::Config => (
+            format!("The AMP server settings are not usable ({}).", e.reason()),
+            "See them with `amp-harness server`.".to_owned(),
         ),
-        _ => format!(
-            "Can't connect to AMP at {host} ({}). Check with `amp-harness doctor`, {switch}.",
-            e.reason()
+        _ => (
+            format!("Can't connect to AMP at {host} ({}).", e.reason()),
+            format!("Check with `amp-harness doctor`, {switch}."),
         ),
     }
 }
