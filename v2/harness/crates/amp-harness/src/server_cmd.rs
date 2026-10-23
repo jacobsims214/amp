@@ -1148,24 +1148,10 @@ impl Switcher {
                 .unwrap_or_default()
         )];
         match retargeted {
-            Ok(r) if r.added.is_empty() && r.removed.is_empty() => lines.push(format!(
-                "the manager's AMP tools: {} (the same set); its prompt names the new server",
-                r.amp_tools
+            Ok(r) => lines.push(format!(
+                "the manager's AMP tools: {}; its prompt names the new server",
+                tool_change(r.amp_tools, &r.added, &r.removed, conn::verbose())
             )),
-            Ok(r) => {
-                let mut diff = Vec::new();
-                if !r.added.is_empty() {
-                    diff.push(format!("+{}", r.added.join(" +")));
-                }
-                if !r.removed.is_empty() {
-                    diff.push(format!("-{}", r.removed.join(" -")));
-                }
-                lines.push(format!(
-                    "the manager's AMP tools: {} ({}); its prompt names the new server",
-                    r.amp_tools,
-                    diff.join(" ")
-                ));
-            }
             Err(e) => lines.push(format!(
                 "warning: the manager's tools were not updated ({e}); restart the chat"
             )),
@@ -1256,8 +1242,69 @@ impl ServerControl for Switcher {
     }
 }
 
+/// Most tool names a `/server` notice lists; a bigger change (e.g. 0 to 75 tools, #2211) is
+/// summarised by counts unless `--verbose`.
+const LIST_TOOL_NAMES_UP_TO: usize = 5;
+
+/// How the manager's AMP tool set changed with a switch: `75 (the same set)`,
+/// `74 (-amp_kb_write)`, or `75 (was 0; 75 added)`.
+fn tool_change(now: usize, added: &[String], removed: &[String], verbose: bool) -> String {
+    if added.is_empty() && removed.is_empty() {
+        return format!("{now} (the same set)");
+    }
+    if verbose || added.len() + removed.len() <= LIST_TOOL_NAMES_UP_TO {
+        let mut diff = Vec::new();
+        if !added.is_empty() {
+            diff.push(format!("+{}", added.join(" +")));
+        }
+        if !removed.is_empty() {
+            diff.push(format!("-{}", removed.join(" -")));
+        }
+        return format!("{now} ({})", diff.join(" "));
+    }
+    let was = (now + removed.len()).saturating_sub(added.len());
+    let mut counts = Vec::new();
+    if !added.is_empty() {
+        counts.push(format!("{} added", added.len()));
+    }
+    if !removed.is_empty() {
+        counts.push(format!("{} removed", removed.len()));
+    }
+    format!("{now} (was {was}; {})", counts.join(", "))
+}
+
 #[cfg(test)]
 mod tests {
+
+    fn tools(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("amp_t{i}")).collect()
+    }
+
+    #[test]
+    fn tool_change_summarises_big_diffs_and_lists_small_ones() {
+        assert_eq!(tool_change(75, &[], &[], false), "75 (the same set)");
+        // #2211: 0 -> 75 is one short line, no names.
+        let line = tool_change(75, &tools(75), &[], false);
+        assert_eq!(line, "75 (was 0; 75 added)");
+        assert!(!line.contains("amp_t"));
+        assert_eq!(
+            tool_change(70, &tools(2), &tools(7), false),
+            "70 (was 75; 2 added, 7 removed)"
+        );
+        // Small diffs still name the tools.
+        assert_eq!(
+            tool_change(74, &[], &["amp_kb_write".to_owned()], false),
+            "74 (-amp_kb_write)"
+        );
+        assert_eq!(
+            tool_change(75, &tools(3), &tools(2), false),
+            "75 (+amp_t0 +amp_t1 +amp_t2 -amp_t0 -amp_t1)"
+        );
+        // --verbose lists every name.
+        let verbose = tool_change(75, &tools(75), &[], true);
+        assert!(verbose.starts_with("75 (+amp_t0 +amp_t1"));
+        assert!(verbose.contains("+amp_t74"));
+    }
     use super::*;
 
     fn saved(name: &str, url: &str) -> SavedServer {
