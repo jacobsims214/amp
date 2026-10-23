@@ -1,0 +1,34 @@
+
+ AMP
+   /amp                     the AMP connection: server, user, MCP health
+   /ticket [id|none]        the current ticket; switch to another, or clear it
+   /workers                 workers here, and tickets in progress elsewhere
+   /questions               tickets waiting on an answer; answer them here
+   /plan                    plan approval and the epics and stories
+   /project [id]            the project and its board; switch to another
+   /open [id|plan]          open the ticket (or the plan) in the browser
+   /server [name|address]   the AMP servers; switch to another
+
+ Chat
+   /model [provider/model]  pick the model for this session
+   /connect [provider]      model providers and their keys; add a key
+   /usage                   tokens and cost this session
+   /abort                   stop the reply
+   /close                   close the open panel
+   /help                    this list
+   /quit                    leave the chat
+
+ Keys
+   Enter                    send
+   Shift+Enter              new line
+   /                        commands: ↑↓ choose, Tab complete, Enter run
+   Esc                      stop the reply, or close a panel or the menu
+   Ctrl+C                   stop the reply, clear the editor; twice quits
+   Ctrl+D                   quit (with an empty editor, at the latest output)
+   Ctrl+T                   show or hide the last thinking
+   Ctrl+O                   show or hide tool call details
+   PgUp/PgDn                scroll the transcript a page
+   Ctrl+U/D                 scroll half a page (with an empty editor)
+   End                      jump to the latest output (with an empty editor)
+   drag                     select text
+

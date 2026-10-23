@@ -170,7 +170,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec::new(Group::Chat, "quit", "", "leave the chat").aliases(&["exit", "q"]),
 ];
 
-/// `/help`'s Keys group: (keys, what they do).
+/// `/help`'s Keys group with mouse capture on (the default): (keys, what they do). The last row
+/// is the terminal's selection, which needs a modifier while the terminal reports the mouse.
+/// [`keys`] gives the rows for either setting.
 pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "send"),
     ("Shift+Enter", "new line"),
@@ -191,6 +193,21 @@ pub const KEYS: &[(&str, &str)] = &[
         "select text: Fn in Terminal.app, Option in iTerm2",
     ),
 ];
+
+/// The Keys row for selecting text with mouse capture off (`[tui] mouse = false`, #2185): plain
+/// click-drag selects, so no modifier to name.
+pub const DRAG_KEY: (&str, &str) = ("drag", "select text");
+
+/// `/help`'s Keys group for the mouse-capture setting: [`KEYS`] when on; off, its last row (the
+/// modifier-drag) becomes [`DRAG_KEY`].
+pub fn keys(mouse_capture: bool) -> Vec<(&'static str, &'static str)> {
+    let mut rows = KEYS.to_vec();
+    if !mouse_capture {
+        rows.pop();
+        rows.push(DRAG_KEY);
+    }
+    rows
+}
 
 /// The command named `name` (or one of its aliases).
 pub fn find(name: &str) -> Option<&'static CommandSpec> {
@@ -412,19 +429,37 @@ impl Component for CommandMenu {
 /// `/help`: AMP, Chat and Keys, each a two-column list (command and arguments, then what it
 /// does), at full contrast. Descriptions word-wrap under their column; below
 /// [`HelpBlock::TWO_COLUMNS`] cells of description room they go under the command instead.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct HelpBlock;
+/// The Keys group follows the mouse-capture setting ([`keys`]).
+#[derive(Debug, Clone, Copy)]
+pub struct HelpBlock {
+    mouse_capture: bool,
+}
+
+impl Default for HelpBlock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl HelpBlock {
     /// The least description room (in cells) for the two-column layout.
     pub const TWO_COLUMNS: usize = 24;
 
+    /// `/help` with mouse capture on (the default).
     pub fn new() -> Self {
-        Self
+        Self {
+            mouse_capture: true,
+        }
+    }
+
+    /// `/help` for this mouse-capture setting (`[tui] mouse`, #2185).
+    pub fn mouse_capture(mut self, on: bool) -> Self {
+        self.mouse_capture = on;
+        self
     }
 
     /// The rows of each group: (group title, [(left column, description)]).
-    fn groups() -> Vec<(&'static str, Vec<(String, &'static str)>)> {
+    fn groups(&self) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         let mut groups = Vec::new();
         for group in [Group::Amp, Group::Chat] {
             let rows = COMMANDS
@@ -436,8 +471,9 @@ impl HelpBlock {
         }
         groups.push((
             "Keys",
-            KEYS.iter()
-                .map(|(k, about)| ((*k).to_owned(), *about))
+            keys(self.mouse_capture)
+                .into_iter()
+                .map(|(k, about)| (k.to_owned(), about))
                 .collect(),
         ));
         groups
@@ -451,7 +487,7 @@ const HELP_INDENT: usize = 3;
 impl Component for HelpBlock {
     fn render(&self, width: usize) -> Vec<String> {
         let c = theme().colors;
-        let groups = Self::groups();
+        let groups = self.groups();
         let col = groups
             .iter()
             .flat_map(|(_, rows)| rows.iter().map(|(left, _)| visible_width(left)))

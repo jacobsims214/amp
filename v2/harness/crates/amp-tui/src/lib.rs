@@ -63,7 +63,9 @@ pub use shell::{
     Notifier, Opener, ProviderConnect, QUIT_HINT, QUIT_HINT_FOR, RunDone, STOPPED, ServerControl,
     ServerSwitched, Shell, ShellInfo, Submit,
 };
-pub use slash::{COMMANDS, CommandMenu, CommandSpec, Group, HelpBlock, KEYS, MenuKey};
+pub use slash::{
+    COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, MenuKey, keys,
+};
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use transcript::ThinkingDisplay;
 pub use view::{ChatView, FooterInfo, PLACEHOLDER};
