@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { ago, awaitingApproval, changedSinceNotice, compareInstants, isRelayed, newestPlannedAt, planPath, plannedAt, relayedFor } from './approval'
+import { ago, approvalOf, approvalOwner, awaitingApproval, canApproveOnBehalf, changedSince, changedSinceNotice, isYours, listNames, splitAwaiting, ticketApproved, compareInstants, isRelayed, newestPlannedAt, planPath, plannedAt, relayedFor } from './approval'
 import type { Task } from '../types'
 
 const task = (id: number, over: Partial<Task> = {}): Task => ({
@@ -7,36 +7,99 @@ const task = (id: number, over: Partial<Task> = {}): Task => ({
   state: 'backlog', priority: '1', dependency_ids: [], created_at: '2026-10-20T10:00:00Z', updated_at: '2026-10-20T10:00:00Z', ...over,
 })
 
-describe('awaitingApproval', () => {
-  it('is every open ticket when the plan was never approved', () => {
+describe('awaitingApproval (per ticket, #2198)', () => {
+  it('is every open ticket nobody has approved', () => {
     const ts = [task(1), task(2, { state: 'completed' }), task(3, { state: 'blocked' })]
     expect(awaitingApproval(ts, {}).map(t => t.id)).toEqual([1, 3])
   })
 
-  it('is the open tickets planned after the last approval, oldest plan first', () => {
+  it('is the open tickets not approved since they were last planned, oldest plan first', () => {
     const ts = [
-      task(1, { planned_at: '2026-10-21T09:00:00Z' }),            // before approval
-      task(2, { planned_at: '2026-10-22T12:00:00Z' }),            // after
-      task(3, { planned_at: '2026-10-22T11:00:00Z' }),            // after, earlier
+      task(1, { planned_at: '2026-10-21T09:00:00Z', approved_at: '2026-10-22T10:00:00Z' }), // approved
+      task(2, { planned_at: '2026-10-22T12:00:00Z' }),                                       // never approved
+      task(3, { planned_at: '2026-10-22T11:00:00Z', approved_at: '2026-10-22T10:00:00Z' }), // re-planned after
       task(4, { planned_at: '2026-10-22T13:00:00Z', state: 'completed' }),
     ]
-    expect(awaitingApproval(ts, { plan_approved_at: '2026-10-22T10:00:00Z' }).map(t => t.id)).toEqual([3, 2])
+    expect(awaitingApproval(ts, {}).map(t => t.id)).toEqual([3, 2])
   })
 
-  it('counts a ticket rewritten after approval (planned_at moved) even if created before', () => {
-    const t = task(5, { created_at: '2026-10-01T00:00:00Z', planned_at: '2026-10-22T12:00:00Z' })
-    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T10:00:00Z' })).toHaveLength(1)
+  it("ignores the project's last approval: it no longer gates anything", () => {
+    const t = task(5, { planned_at: '2026-10-22T09:00:00Z' })
+    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T10:00:00Z' } as object)).toHaveLength(1)
   })
 
-  it('falls back to created_at on a server without planned_at', () => {
-    const t = task(6, { created_at: '2026-10-22T12:00:00Z' })
+  it('counts a ticket approved at exactly its plan time as approved, to the microsecond', () => {
+    const at = '2026-10-22T21:40:12.345678Z'
+    expect(ticketApproved(task(6, { planned_at: at, approved_at: at }))).toBe(true)
+    expect(ticketApproved(task(6, { planned_at: '2026-10-22T21:40:12.345679Z', approved_at: at }))).toBe(false)
+    expect(ticketApproved(task(6, { approved_at: '0001-01-01T00:00:00Z' }))).toBe(false)
+  })
+
+  it('falls back to created_at for the plan time', () => {
+    const t = task(7, { created_at: '2026-10-22T12:00:00Z', approved_at: '2026-10-22T11:00:00Z' })
     expect(plannedAt(t)).toBe('2026-10-22T12:00:00Z')
-    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T10:00:00Z' })).toHaveLength(1)
-    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T13:00:00Z' })).toHaveLength(0)
+    expect(awaitingApproval([t], {})).toHaveLength(1)
   })
 
   it('is nothing until the project has loaded', () => {
     expect(awaitingApproval([task(1)], null)).toEqual([])
+  })
+})
+
+describe('whose approval a ticket waits for', () => {
+  it('is the owner, else whoever planned it', () => {
+    expect(approvalOwner(task(1, { owner_user_id: 9, created_by: 7 }))).toBe(9)
+    expect(approvalOwner(task(1, { owner_user_id: null, created_by: 7 }))).toBe(7)
+    expect(approvalOwner(task(1))).toBeNull()
+  })
+
+  it('splits what waits into yours and others, keeping order', () => {
+    const ts = [task(1, { owner_user_id: 9 }), task(2, { owner_user_id: 7 }), task(3, { created_by: 7 }), task(4, { created_by: 9 })]
+    const { yours, others } = splitAwaiting(ts, 7)
+    expect(yours.map(t => t.id)).toEqual([2, 3])
+    expect(others.map(t => t.id)).toEqual([1, 4])
+  })
+
+  it("treats a ticket with no owner and no planner as local dev's own only", () => {
+    expect(isYours(task(1), undefined)).toBe(true)
+    expect(isYours(task(1), 0)).toBe(true)
+    expect(isYours(task(1), 7)).toBe(false)
+  })
+
+  it('lets only leads and above approve on behalf', () => {
+    expect(canApproveOnBehalf('member')).toBe(false)
+    expect(canApproveOnBehalf(null)).toBe(false)
+    for (const a of ['lead', 'owner', 'org_admin', 'global_admin'] as const) expect(canApproveOnBehalf(a)).toBe(true)
+  })
+
+  it('names owners naturally', () => {
+    expect(listNames(['Bob'])).toBe('Bob')
+    expect(listNames(['Bob', 'Carol', 'Bob'])).toBe('Bob and Carol')
+    expect(listNames(['Bob', 'Carol', 'Dee'])).toBe('Bob, Carol and Dee')
+  })
+})
+
+describe('who approved a ticket', () => {
+  const at = '2026-10-22T12:00:00Z'
+  it('is the approver, and the owner when they approved it on their behalf', () => {
+    expect(approvalOf(task(1, { owner_user_id: 7, approved_at: at, approved_by: 7 }))).toEqual({ at, approvedBy: 7, onBehalfOf: null })
+    expect(approvalOf(task(1, { owner_user_id: 9, approved_at: at, approved_by: 7 }))).toEqual({ at, approvedBy: 7, onBehalfOf: 9 })
+    expect(approvalOf(task(1, { created_by: 9, approved_at: at, approved_by: 7 }))?.onBehalfOf).toBe(9)
+  })
+  it('is a migration when approved_by is empty', () => {
+    expect(approvalOf(task(1, { owner_user_id: 9, approved_at: at, approved_by: null }))).toEqual({ at, approvedBy: null, onBehalfOf: null })
+  })
+  it('is nothing while the current plan is not approved', () => {
+    expect(approvalOf(task(1, { planned_at: '2026-10-22T13:00:00Z', approved_at: at, approved_by: 7 }))).toBeNull()
+  })
+})
+
+describe('changedSince (the notice after a click)', () => {
+  it('counts your own tickets the page did not show, and shown ones re-planned or re-owned', () => {
+    const r = { awaitingYours: [4, 5, 6], skipped: { '2': 'it was planned after what was approved (as_of)', '3': 'it is completed', '8': 'its owner changed' } }
+    // 5 was shown and deliberately left unticked; 4 and 6 arrived after the page loaded.
+    expect(changedSince(r, [1, 2, 3, 5, 8])).toEqual([2, 4, 6, 8])
+    expect(changedSince({ awaitingYours: [], skipped: {} }, [1])).toEqual([])
   })
 })
 
@@ -62,10 +125,10 @@ describe('plan times (as_of, #2192)', () => {
     expect(newestPlannedAt([])).toBeUndefined()
   })
 
-  it('keeps a ticket awaiting when it was planned microseconds after the approval', () => {
+  it('keeps a ticket awaiting when it was planned microseconds after its approval', () => {
     const t = task(4, { planned_at: '2026-10-22T21:40:12.345679Z' })
-    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T21:40:12.345678Z' })).toHaveLength(1)
-    expect(awaitingApproval([t], { plan_approved_at: '2026-10-22T21:40:12.345679Z' })).toHaveLength(0)
+    expect(awaitingApproval([{ ...t, approved_at: '2026-10-22T21:40:12.345678Z' }], {})).toHaveLength(1)
+    expect(awaitingApproval([{ ...t, approved_at: '2026-10-22T21:40:12.345679Z' }], {})).toHaveLength(0)
   })
 
   it('tells the person how many came in after the page loaded', () => {

@@ -5,7 +5,7 @@
  * helpers mirror the server's rule so the board can show what waits on the
  * person without polling the plan check.
  */
-import type { Project, Task } from '../types'
+import type { Project, ProjectAccess, Task } from '../types'
 
 /** Go's zero time ("0001-01-01T00:00:00Z"): what an unset time.Time encodes as. Not a real plan time. */
 export function isZeroTime(iso: string | null | undefined): boolean {
@@ -55,17 +55,91 @@ export function newestPlannedAt(tasks: Array<Pick<Task, 'created_at'> & { planne
 }
 
 /**
- * Open tickets planned since the plan was last approved, oldest plan first.
- * Mirrors domain.Project.AwaitsApproval: never approved, or planned after
- * plan_approved_at. Done tickets don't wait on anyone.
+ * Whether a ticket's current plan is approved (#2198): a person approved it at
+ * or after its scope was last set (approved_at >= planned_at). Re-planning a
+ * ticket (name, description or acceptance criteria) makes it wait again.
+ * Mirrors domain.Task.Approved.
  */
-export function awaitingApproval(tasks: Task[], project: Pick<Project, 'plan_approved_at'> | null | undefined): Task[] {
+export function ticketApproved(t: Pick<Task, 'created_at' | 'approved_at'> & { planned_at?: string }): boolean {
+  const at = t.approved_at
+  return !!at && !isZeroTime(at) && compareInstants(at, plannedAt(t)) >= 0
+}
+
+/**
+ * Open tickets whose current plan nobody has approved, oldest plan first.
+ * Approval is per ticket since #2198 (domain.Task.Approved); the project's
+ * plan_approved_at is only when it was last approved, and gates nothing.
+ * Empty until the project has loaded, so the banner doesn't flash.
+ */
+export function awaitingApproval(tasks: Task[], project: Pick<Project, 'id'> | object | null | undefined): Task[] {
   if (!project) return []
-  const approved = project.plan_approved_at && !isZeroTime(project.plan_approved_at) ? project.plan_approved_at : null
   return tasks
-    .filter(t => t.state !== 'completed')
-    .filter(t => approved == null || compareInstants(plannedAt(t), approved) > 0)
+    .filter(t => t.state !== 'completed' && !ticketApproved(t))
     .sort((a, b) => compareInstants(plannedAt(a), plannedAt(b)) || a.id - b.id)
+}
+
+/**
+ * Whose approval a ticket waits for (domain.Task.ApprovesAsOwn): its owner, or
+ * whoever planned it while it's unassigned. Null for legacy rows with neither.
+ */
+export function approvalOwner(t: Pick<Task, 'owner_user_id' | 'created_by'>): number | null {
+  return t.owner_user_id ?? t.created_by ?? null
+}
+
+/**
+ * Whether the person approves this ticket as their own (no on_behalf needed).
+ * A ticket with no owner and no planner is nobody's: only local dev (no signed-in
+ * user, user 0) approves those as its own, as the server does.
+ */
+export function isYours(t: Pick<Task, 'owner_user_id' | 'created_by'>, meId: number | null | undefined): boolean {
+  const who = approvalOwner(t)
+  if (who == null) return meId == null || meId === 0
+  return who === meId
+}
+
+/** The awaiting tickets split into the person's own and everyone else's, order kept. */
+export function splitAwaiting(awaiting: Task[], meId: number | null | undefined): { yours: Task[]; others: Task[] } {
+  const yours: Task[] = [], others: Task[] = []
+  for (const t of awaiting) (isYours(t, meId) ? yours : others).push(t)
+  return { yours, others }
+}
+
+const ACCESS_RANK: Record<ProjectAccess, number> = { member: 0, lead: 1, owner: 2, org_admin: 3, global_admin: 4 }
+
+/** Approving other people's tickets (on_behalf) takes project Lead or above; Members approve only their own. */
+export function canApproveOnBehalf(access: ProjectAccess | null | undefined): boolean {
+  return !!access && (ACCESS_RANK[access] ?? -1) >= ACCESS_RANK.lead
+}
+
+/** "Bob", "Bob and Carol", "Bob, Carol and Dee": owners named in "approve on behalf of". */
+export function listNames(names: string[]): string {
+  const u = [...new Set(names)]
+  if (u.length <= 1) return u[0] ?? ''
+  return `${u.slice(0, -1).join(', ')} and ${u[u.length - 1]}`
+}
+
+/**
+ * Who approved a ticket and for whom, for the ticket drawer. Null while its
+ * current plan isn't approved. approvedBy null with an approval means a
+ * migration approved it (the upgrade kept plans already approved).
+ */
+export function approvalOf(t: Task): { at: string; approvedBy: number | null; onBehalfOf: number | null } | null {
+  if (!ticketApproved(t)) return null
+  const by = t.approved_by ?? null
+  const owner = approvalOwner(t)
+  return { at: t.approved_at!, approvedBy: by, onBehalfOf: by != null && owner != null && owner !== by ? owner : null }
+}
+
+/**
+ * Tickets that should have been approved by a click but weren't because they
+ * changed under the person: their own tickets still awaiting that the page didn't
+ * show, plus shown ones the server skipped as planned after as_of or re-owned.
+ */
+export function changedSince(r: { awaitingYours: number[]; skipped: Record<string, string> }, shown: number[]): number[] {
+  const seen = new Set(shown)
+  const ids = new Set(r.awaitingYours.filter(id => !seen.has(id)))
+  for (const [id, why] of Object.entries(r.skipped)) if (/planned after|owner changed/.test(why)) ids.add(Number(id))
+  return [...ids].sort((a, b) => a - b)
 }
 
 /** What the person hears when their approval didn't cover everything: tickets came in after the page loaded. */
