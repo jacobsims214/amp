@@ -150,12 +150,11 @@ impl FileConfig {
     }
 }
 
-/// The default config file path, from `XDG_CONFIG_HOME` or `HOME`.
+/// The user config file in effect ([`crate::config_paths::current`]): the installed paths
+/// (`--config`, `--config-dir`), else `AMP_HARNESS_CONFIG`, `AMP_HARNESS_CONFIG_DIR`,
+/// `XDG_CONFIG_HOME` or `HOME` from `env`.
 pub fn default_config_path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let base = non_empty(env("XDG_CONFIG_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| non_empty(env("HOME")).map(|home| Path::new(&home).join(".config")))?;
-    Some(base.join("amp-harness").join("config.toml"))
+    crate::config_paths::current(env).user_file
 }
 
 /// The settings a connection needs, resolved from flags, env, config file and defaults.

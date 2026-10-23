@@ -1,15 +1,13 @@
-//! `amp-harness config show [--json] [--check] [--config PATH]`: the providers and the provider/model
-//! each role resolves to (M2-3, #2091).
+//! `amp-harness [--config FILE] [--config-dir DIR] config show [--json] [--check]`: the providers
+//! and the provider/model each role resolves to (M2-3, #2091), from the user config.toml and the
+//! repo's `.amp/harness/config.toml` (#2232).
 //!
 //! Never prints a key: a provider's key is described by where it came from (`env OPENROUTER_API_KEY`,
 //! `keychain`, `missing (...)`). `--check` asks each provider in use for its live model catalog and
 //! marks roles whose model id it does not list. Exit code 1 when a role does not resolve or a
 //! checked model is missing.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
     models::{ModelsConfig, Selection, thinking_name},
@@ -34,9 +32,6 @@ pub struct ShowArgs {
     /// Check each model id against the provider's live catalog (network; Anthropic needs its key).
     #[arg(long)]
     check: bool,
-    /// Config file (default: $XDG_CONFIG_HOME/amp-harness/config.toml, else ~/.config/...).
-    #[arg(long)]
-    config: Option<PathBuf>,
 }
 
 /// `config show --json`. Add fields, never rename or remove them.
@@ -45,6 +40,8 @@ pub struct Report {
     pub ok: bool,
     pub config_file: Option<String>,
     pub config_found: bool,
+    /// The repo's `.amp/harness/config.toml`, when one was merged in (#2232).
+    pub repo_file: Option<String>,
     /// `profile` or `inherit`.
     pub mode: &'static str,
     /// Profile name, or the inherited `provider/model`.
@@ -109,7 +106,10 @@ pub async fn run(command: ConfigCommand) -> Result<(), CliError> {
 }
 
 async fn show(args: ShowArgs) -> Result<(), CliError> {
-    let config = ModelsConfig::load_with_env(&|k| std::env::var(k).ok(), args.config.clone())
+    let cwd =
+        std::env::current_dir().map_err(|e| CliError::new(format!("current directory: {e}")))?;
+    let paths = crate::conn::config_paths_in(&cwd);
+    let config = ModelsConfig::load_paths(&|k| std::env::var(k).ok(), &paths)
         .map_err(|e| CliError::new(e.to_string()))?;
     let keys = SystemKeys::from_env();
     let report = build_report(&config, &keys, args.check).await;
@@ -220,6 +220,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
         ok,
         config_file: config.config_file.as_ref().map(|p| p.display().to_string()),
         config_found: config.config_found,
+        repo_file: config.repo_file.as_ref().map(|p| p.display().to_string()),
         mode,
         selection,
         selection_source,
@@ -241,6 +242,9 @@ fn print_human(r: &Report) {
         (Some(path), true) => println!("Config:    {path}"),
         (Some(path), false) => println!("Config:    {path} (not found; shipped defaults)"),
         (None, _) => println!("Config:    none (shipped defaults)"),
+    }
+    if let Some(repo) = &r.repo_file {
+        println!("Repo:      {repo}");
     }
     let mode = if r.mode == "inherit" {
         format!("inherit {}", r.selection)

@@ -96,9 +96,6 @@ pub struct ConnectArgs {
     /// Print a JSON summary (never a secret).
     #[arg(long)]
     pub json: bool,
-    /// Config file (default: $XDG_CONFIG_HOME/amp-harness/config.toml, else ~/.config/...).
-    #[arg(long)]
-    pub config: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Default)]
@@ -112,9 +109,6 @@ pub struct DisconnectArgs {
     /// Print a JSON summary.
     #[arg(long)]
     pub json: bool,
-    /// Config file (default: $XDG_CONFIG_HOME/amp-harness/config.toml, else ~/.config/...).
-    #[arg(long)]
-    pub config: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -618,7 +612,7 @@ enum Target {
 }
 
 pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
-    let config = config_file(args.config.as_ref())?;
+    let config = config_file()?;
     let cfg = setup::load_models(&config, None)?;
     if args.list {
         let listed = list_providers(&cfg, &SystemKeys::from_env());
@@ -731,14 +725,10 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn config_file(path: Option<&PathBuf>) -> Result<ConfigFile, CliError> {
-    let path = match path {
-        Some(p) => p.clone(),
-        None => amp_mcp::default_config_path(&|k| std::env::var(k).ok()).ok_or_else(|| {
-            CliError::new("no HOME or XDG_CONFIG_HOME: nowhere to keep config.toml")
-        })?,
-    };
-    Ok(ConfigFile::new(path))
+/// The user config.toml `connect` / `disconnect` write: the global `--config` / `--config-dir`
+/// (#2232), else the default path.
+fn config_file() -> Result<ConfigFile, CliError> {
+    crate::conn::user_config_file().map(ConfigFile::new)
 }
 
 /// Which provider: the argument, else the picker.
@@ -1279,7 +1269,7 @@ pub struct DisconnectSummary {
 }
 
 pub async fn disconnect(args: DisconnectArgs) -> Result<(), CliError> {
-    let config = config_file(args.config.as_ref())?;
+    let config = config_file()?;
     let cfg = setup::load_models(&config, None)?;
     let id = args.provider.trim().to_owned();
     let provider = cfg.providers.get(&id);
@@ -1396,18 +1386,27 @@ pub struct ChatConnect {
 }
 
 impl ChatConnect {
-    pub fn new(rt: Arc<Runtime>, config_path: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
+    /// Writes the user config.toml the session loaded (`rt.paths`, #2232).
+    pub fn new(rt: Arc<Runtime>) -> Result<Arc<Self>, CliError> {
+        let path = rt.paths.user_file_for_writing().map_err(CliError::new)?;
+        Ok(Arc::new(Self {
             rt,
-            config: ConfigFile::new(config_path),
-        })
+            config: ConfigFile::new(path),
+        }))
+    }
+
+    /// The models config as the session loads it: the user file plus the session's repo layer,
+    /// so a reload after `/connect` keeps the repo's `[roles]` (#2232).
+    fn load_models(&self) -> Result<ModelsConfig, String> {
+        ModelsConfig::load_paths(&|k| std::env::var(k).ok(), &self.rt.paths)
+            .map_err(|e| format!("models: {e}"))
     }
 
     /// `<id> [<base-url> [api]]` -> the target.
     fn target(&self, args: &str) -> Result<Target, String> {
         let words: Vec<&str> = args.split_whitespace().collect();
         let id = words.first().copied().unwrap_or("");
-        let cfg = setup::load_models(&self.config, None).map_err(|e| e.message)?;
+        let cfg = self.load_models()?;
         if words.len() == 1 {
             if let Some(p) = cfg.providers.get(id) {
                 if !p.needs_key {
@@ -1454,7 +1453,7 @@ impl ChatConnect {
 
     /// Reloads config.toml and rebuilds the providers on the runtime.
     fn reload(&self) -> Result<(ProviderSet, ModelsConfig), String> {
-        let cfg = setup::load_models(&self.config, None).map_err(|e| e.message)?;
+        let cfg = self.load_models()?;
         let set = self.rt.reload_models(cfg.clone(), &SystemKeys::from_env());
         Ok((set, cfg))
     }
@@ -1534,7 +1533,7 @@ impl ChatConnect {
     async fn list_now(self) -> Result<amp_tui::ConnectReply, String> {
         // Keys stored in another terminal since this chat started: forget the cached "missing".
         if let Ok(service) = setup::keychain_for_keys() {
-            let cfg = setup::load_models(&self.config, None).map_err(|e| e.message)?;
+            let cfg = self.load_models()?;
             let keys = SystemKeys::from_env();
             for p in cfg.providers.values() {
                 if resolve_key(p, &keys).1.is_missing() {
@@ -1547,7 +1546,7 @@ impl ChatConnect {
                 }
             }
         }
-        let cfg = setup::load_models(&self.config, None).map_err(|e| e.message)?;
+        let cfg = self.load_models()?;
         let text = list_text(&list_providers(&cfg, &SystemKeys::from_env()), true);
         self.reply(text)
     }

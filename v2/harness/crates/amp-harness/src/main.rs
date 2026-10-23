@@ -13,6 +13,8 @@
 //! - #2164: `server` / `server set <url>` / `server use <name>` and the chat's `/server`.
 //! - #2178: connection failures read as one plain sentence with a next step (`--verbose` adds the
 //!   cause chain); the chat opens disconnected and retries instead of exiting.
+//! - #2232: `--config FILE` / `--config-dir DIR` (and `AMP_HARNESS_CONFIG[_DIR]`) are global and
+//!   apply to every setting and command ([`amp_mcp::config_paths`]).
 
 mod chat;
 mod config_cmd;
@@ -73,6 +75,14 @@ struct Cli {
     /// Show the full cause chain of connection errors (as does a non-empty RUST_LOG).
     #[arg(long, global = true)]
     verbose: bool,
+    /// Read and write this config.toml instead of <config dir>/config.toml, for every setting and
+    /// every command (env AMP_HARNESS_CONFIG).
+    #[arg(long, global = true, value_name = "FILE")]
+    config: Option<PathBuf>,
+    /// Use this directory instead of ~/.config/amp-harness for the whole user layer: config.toml,
+    /// agents/, skills/, AGENTS.md and credentials.json (env AMP_HARNESS_CONFIG_DIR).
+    #[arg(long, global = true, value_name = "DIR")]
+    config_dir: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -160,6 +170,12 @@ impl ServerArgs {
 async fn main() -> ExitCode {
     let cli = parse_cli(std::env::args_os().collect());
     conn::set_verbose(cli.verbose);
+    // #2232: one set of config paths for every reader and writer in this process.
+    amp_mcp::config_paths::install(amp_mcp::ConfigPaths::resolve(
+        cli.config.clone(),
+        cli.config_dir.clone(),
+        &|k| std::env::var(k).ok(),
+    ));
     let result: Result<(), conn::CliError> = match cli.command {
         Some(Command::Version) => {
             println!("amp-harness {LONG_VERSION}");
@@ -383,5 +399,24 @@ mod tests {
         }
         let cli = super::parse_cli(line("amp-harness --url http://x/mcp --verbose doctor"));
         assert!(cli.verbose && matches!(cli.command, Some(super::Command::Doctor(_))));
+    }
+
+    /// #2232: `--config` / `--config-dir` are global: before or after any subcommand, and for the
+    /// chat (no subcommand).
+    #[test]
+    fn config_flags_are_global() {
+        use std::path::PathBuf;
+        for given in [
+            "amp-harness --config /c.toml --config-dir /d doctor --json",
+            "amp-harness doctor --json --config /c.toml --config-dir /d",
+            "amp-harness --url http://x/mcp --config /c.toml doctor --config-dir /d",
+            "amp-harness server set h --yes --config /c.toml --config-dir /d",
+            "amp-harness connect --list --config=/c.toml --config-dir=/d",
+            "amp-harness --config /c.toml --config-dir /d",
+        ] {
+            let cli = super::parse_cli(line(given));
+            assert_eq!(cli.config, Some(PathBuf::from("/c.toml")), "{given}");
+            assert_eq!(cli.config_dir, Some(PathBuf::from("/d")), "{given}");
+        }
     }
 }

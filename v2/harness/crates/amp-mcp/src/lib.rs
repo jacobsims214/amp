@@ -15,6 +15,7 @@
 
 mod catalog;
 mod client;
+pub mod config_paths;
 mod credentials;
 mod error;
 mod health;
@@ -30,6 +31,7 @@ pub use client::{
     DEFAULT_RECONNECT_INTERVAL, RECONNECT_TIMEOUT, Reconnector, ServerSession,
     origin as url_origin,
 };
+pub use config_paths::{ConfigPaths, ENV_CONFIG, ENV_CONFIG_DIR};
 pub use credentials::{
     AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,
     ENV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE, credential_key, keychain_available, keychain_service,
