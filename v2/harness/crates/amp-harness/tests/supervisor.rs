@@ -675,3 +675,80 @@ async fn cancel_all_stops_running_workers_and_queued_ones_never_dispatch() {
     );
     assert!(live_tickets(&sup).is_empty());
 }
+
+/// #2250: the manager's and a supervised worker's requests each carry the current time (the
+/// scripts echo the newest stamp they were sent), and neither transcript keeps the stamp.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manager_and_worker_requests_carry_the_current_time_but_transcripts_do_not() {
+    let f = fixture("clock").await;
+    let hooks = Arc::new(Recorder::default());
+    let sup = f.supervisor(config(), Arc::clone(&hooks));
+    f.script(
+        "boss",
+        vec![
+            template(
+                "m1={{current_time}}",
+                json!([{"name": "amp_run_ticket", "arguments": {"task_id": 2085, "agent_id": "amp:amp-worker-backend"}}]),
+            ),
+            template("m2={{current_time}}", json!([])),
+        ],
+    );
+    f.script(
+        "wf",
+        vec![
+            template(
+                "w1={{current_time}}",
+                json!([{"name": "bash", "arguments": {"command": "true"}}]),
+            ),
+            template("w2={{current_time}}", json!([])),
+        ],
+    );
+
+    let (emitter, mut rx) = ChannelEmitter::new();
+    let mut spec = AgentSpec::new("amp-manager", f.repo.clone());
+    spec.project = f.manager().project;
+    spec.extra_tools = vec![sup.tool()];
+    spec.emitter = Some(emitter.into_emitter());
+    let manager = f.rt.build(spec).await.expect("build the manager");
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        manager.harness.prompt_text("run #2085", Vec::new()),
+    )
+    .await
+    .expect("the manager finished")
+    .expect("the run");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+
+    let mut manager_text = String::new();
+    while let Ok(ev) = rx.try_recv() {
+        if let Some(RunEvent::Assistant { text, .. }) = RunEvent::from_agent(&ev) {
+            manager_text.push_str(&text);
+            manager_text.push('\n');
+        }
+    }
+    let reports = hooks.reports();
+    assert_eq!(reports.len(), 1, "{manager_text}");
+    let worker = std::fs::read_to_string(reports[0].session_file.as_ref().unwrap()).unwrap();
+    // Each turn saw a stamp (the prompt's, then the tool result's): never "none".
+    for (label, text) in [
+        ("m1=", &manager_text),
+        ("m2=", &manager_text),
+        ("w1=", &worker),
+        ("w2=", &worker),
+    ] {
+        // The last occurrence: the whole message (the JSONL also has the streamed deltas).
+        let at = text
+            .rfind(label)
+            .unwrap_or_else(|| panic!("no {label} in {text}"));
+        let stamp = &text[at + label.len()..];
+        assert!(
+            !stamp.starts_with("none") && stamp[..80.min(stamp.len())].contains(" UTC)"),
+            "{label}: {stamp}"
+        );
+    }
+    assert!(!worker.contains("<current_time>"), "{worker}");
+    assert!(!manager_text.contains("<current_time>"), "{manager_text}");
+}

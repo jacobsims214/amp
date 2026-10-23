@@ -22,9 +22,12 @@
 //! cleaned of calls and tool results that have no id ([`sanitize_history`]). A provider that once
 //! streamed an empty call (OpenRouter with MiMo) left a tool result with an empty `tool_call_id`,
 //! and every later request was refused with a 400; cleaning on send also recovers such a session.
+//!
+//! Clock (#2250), for every provider: the request's copy of the history has each user message and
+//! tool result stamped with its local date/time/timezone ([`crate::request_time`]), so every
+//! request carries the current time. Only the request is changed, never the session.
 
 use std::{
-    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
@@ -548,13 +551,17 @@ impl Provider for ConfiguredProvider {
         }
         let cancel = opts.signal.child_token();
         opts.signal = cancel.clone();
-        let ctx = match sanitize_history(&ctx.messages) {
-            Some(messages) => Cow::Owned(Context {
-                system_prompt: ctx.system_prompt.clone(),
-                messages,
-                tools: ctx.tools.clone(),
-            }),
-            None => Cow::Borrowed(ctx),
+        // The request's own copy of the history: cleaned (#2203), then every user message and
+        // tool result stamped with its time (#2250). The session keeps what was written.
+        let sanitized = sanitize_history(&ctx.messages);
+        let messages = crate::request_time::stamp_messages(
+            sanitized.as_deref().unwrap_or(&ctx.messages),
+            now_ms(),
+        );
+        let ctx = Context {
+            system_prompt: ctx.system_prompt.clone(),
+            messages,
+            tools: ctx.tools.clone(),
         };
         let inner = self.inner.stream_simple(model, &ctx, &opts).await;
         let guarded = if self.timeouts.header.is_none() && self.timeouts.stream_idle.is_none() {
