@@ -372,6 +372,14 @@ async fn doctor_json_is_pinned() {
     let dir = workdir("doctor-json", Some(2));
     let creds = dir.join("home/.config/amp-harness/credentials.json");
     let marker = dir.join("project/.amp.json");
+    // A marker made for this server (#2206: one made for another server is a warning).
+    std::fs::write(
+        &marker,
+        json!({"project_id": 2, "project_name": "AMP v2",
+               "amp_api": amp.url.trim_end_matches("/mcp")})
+        .to_string(),
+    )
+    .unwrap();
 
     let out = run(
         &dir,
@@ -453,7 +461,7 @@ async fn doctor_json_is_pinned() {
             "whoami": {"user_id": 7, "email": "local-dev@example.com", "account": "human"},
             "project": {
                 "marker": marker.display().to_string(), "id": 2, "name": "AMP v2",
-                "marker_name": "AMP v2", "found": true
+                "marker_name": "AMP v2", "found": true, "warning": null
             },
             "ca": {
                 "trust": "none", "file": null, "file_source": null, "certificates": [],
