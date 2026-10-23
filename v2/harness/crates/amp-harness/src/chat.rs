@@ -229,7 +229,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             Arc::clone(&session.rt),
             Arc::clone(&session.agent.harness),
             Arc::clone(&session.agent.policy),
-            project_id,
+            session.project.clone(),
             args.snapshot.is_none() || args.meta,
         )
         .await,
