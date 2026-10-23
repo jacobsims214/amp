@@ -858,6 +858,17 @@ impl Shell {
             self.view
                 .add_to_transcript(Arc::new(ApprovalNotice::new(refusal, snapshot.as_deref())));
         }
+        // #2225: the repeat guard stopped a model stuck on one tool call; say so in one sentence.
+        if let AgentEvent::ToolExecutionEnd {
+            result,
+            is_error: true,
+            ..
+        } = event
+            && let Some(stop) =
+                amp_core::repeat::stopped(&amp_core::events::tool_result_text(result))
+        {
+            self.view.add_warning(&stop.user_line("/model"));
+        }
     }
 
     /// Handles one editor submission: a slash command or a prompt to the agent.
