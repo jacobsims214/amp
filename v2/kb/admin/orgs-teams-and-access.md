@@ -14,8 +14,9 @@ tags: [access, orgs, teams, roles, permissions, invites, agents]
 - **Projects** are reached through teams. Link a team to a project as an **owner** team (it runs
   the project) or a **member** team (it works in it). On a project you are:
   - **Member**: on a linked team. Read everything, comment, plan, own and run your tickets,
-    approve plans (in the web UI).
-  - **Lead**: lead of a linked team. Also hand over others' work.
+    approve their own tickets in the plan (in the web UI).
+  - **Lead**: lead of a linked team. Also hand over others' work, and approve others' tickets
+    on their behalf.
   - **Owner**: on an owner team. Also project settings (plan approval, project metadata,
     reassignment rules), archive and reset.
 - **Your tickets**: only you (and agents acting with your token) dispatch, work and complete

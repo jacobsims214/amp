@@ -26,7 +26,7 @@ The process is the same for every org and every project, and AMP enforces it:
 - Direct writes to `design-system/` (`amp_kb_write`, the KB editor) are refused.
 
 As a manager: run `amp_design_system_start`, run `amp_check_plan`, present the plan, give your
-user the `approve_url` and wait until they've approved it in the web UI, then dispatch each ready
+user the `approve_url` and wait until they've approved their tickets in the web UI, then dispatch each ready
 phase ticket to the designer. Every phase stops for the user's review: they approve the artifact
 in AMP (you may relay a "request changes" note), then re-dispatch, and move on when it's
 approved.
