@@ -6,13 +6,16 @@ use rmcp::{service::ClientInitializeError, service::ServiceError};
 
 /// Everything that can go wrong talking to AMP over MCP.
 ///
+/// Display never shows a URL's userinfo or query values (#2308, [`crate::redact_urls`]): reqwest's
+/// errors print the full request URL, which can carry an `${env:..}` secret.
+///
 /// The model-facing adapter (M2) turns any `Err` from [`crate::AmpMcpClient::call_tool`] into a tool
 /// error the model can see; nothing here ever waits for a human.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum McpError {
     /// Settings could not be resolved (bad URL, unreadable config file, bad protocol name, ...).
-    #[error("config: {0}")]
+    #[error("config: {}", crate::redact_urls(.0))]
     Config(String),
 
     /// The extra root certificate file (`--ca-file` / `AMP_CA_FILE`) could not be used.
@@ -20,7 +23,7 @@ pub enum McpError {
     CaFile { path: PathBuf, reason: String },
 
     /// The HTTP client could not be built.
-    #[error("http client: {0}")]
+    #[error("http client: {}", crate::redact_urls(.0))]
     Http(String),
 
     /// The server answered 401/403, or a stored login can no longer be refreshed: re-login needed.
@@ -31,7 +34,7 @@ pub enum McpError {
     /// A third-party MCP server (`[mcp.<name>]`) answered 401, or its stored OAuth login can no
     /// longer be refreshed. `reason` says what to do (log in, or fix the configured header or
     /// bearer variable) and never holds a secret; `challenge` is the `WWW-Authenticate` header.
-    #[error("MCP server `{server}`: {reason}")]
+    #[error("MCP server `{server}`: {}", crate::redact_urls(reason))]
     ServerAuth {
         server: String,
         reason: String,
@@ -39,16 +42,16 @@ pub enum McpError {
     },
 
     /// The OAuth flow failed (discovery, registration, the browser step, the token exchange).
-    #[error("OAuth: {0}")]
+    #[error("OAuth: {}", crate::redact_urls(.0))]
     OAuth(String),
 
     /// The keychain or credentials file could not be read or written.
-    #[error("credential store: {0}")]
+    #[error("credential store: {}", crate::redact_urls(.0))]
     CredentialStore(String),
 
     /// The MCP lifecycle (discover and/or initialize) failed. The message includes the causes
     /// (TLS, DNS, connection refused), which rmcp's own message leaves out.
-    #[error("connect to {url}: {source}{}", causes(source.as_ref()))]
+    #[error("connect to {}: {}", crate::redact_url(url), crate::redact_urls(&format!("{source}{}", causes(source.as_ref()))))]
     Connect {
         url: String,
         #[source]
@@ -56,15 +59,15 @@ pub enum McpError {
     },
 
     /// Connecting took longer than the connect timeout.
-    #[error("connect to {url}: no answer within {after:?}")]
+    #[error("connect to {}: no answer within {after:?}", crate::redact_url(url))]
     ConnectTimeout { url: String, after: Duration },
 
     /// A request did not finish within its timeout. The request was cancelled.
-    #[error("{operation} timed out after {after:?}")]
+    #[error("{} timed out after {after:?}", crate::redact_urls(operation))]
     Timeout { operation: String, after: Duration },
 
     /// A request failed after the connection was established.
-    #[error("{operation}: {source}{}", causes(source.as_ref()))]
+    #[error("{}", crate::redact_urls(&format!("{operation}: {source}{}", causes(source.as_ref()))))]
     Service {
         operation: String,
         #[source]
@@ -77,7 +80,10 @@ pub enum McpError {
 
     /// A stdio MCP server could not be started (#2236): the command is missing, not executable,
     /// or its working directory does not exist. Holds the command name only, never its args.
-    #[error("start MCP server `{server}` (`{command}`): {reason}")]
+    #[error(
+        "start MCP server `{server}` (`{command}`): {}",
+        crate::redact_urls(reason)
+    )]
     Spawn {
         server: String,
         command: String,

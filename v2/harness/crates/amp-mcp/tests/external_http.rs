@@ -1042,3 +1042,72 @@ async fn login_is_refused_where_it_cannot_apply() {
     .expect_err("auth none");
     assert!(err.to_string().contains("auth = \"none\""), "{err}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// #2308: a repo server's login is its own; URLs in errors are redacted
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_scoped_server_never_uses_the_login_made_for_the_same_url() {
+    let mock = spawn_mock_as(3600).await;
+    let backend = file_backend("oauth-scoped");
+    let mine = oauth_options(&mock);
+    http::login(&mine, backend.clone(), Duration::from_secs(20), browser)
+        .await
+        .expect("login");
+    let client = http::connect(&mine, &backend).await.expect("mine connects");
+    client.shutdown().await;
+
+    // The same URL, from a cloned repo: no login of its own, so "login required".
+    let mut repo = oauth_options(&mock);
+    repo.credential_scope = Some("mcp-repo:0123456789abcdef:acme".into());
+    assert_ne!(repo.credential_key(), mine.credential_key());
+    let err = http::connect(&repo, &backend)
+        .await
+        .expect_err("the repo server must not get the person's login");
+    assert!(err.is_auth_required(), "{err:?}");
+
+    // Logging out of the repo server leaves the person's login alone.
+    assert!(!http::logout(&repo, &backend).await.unwrap());
+    assert!(
+        amp_mcp::oauth::has_login_key(&mine.credential_key(), &backend)
+            .await
+            .unwrap()
+    );
+    // `mcp secret --adopt` copies it on purpose; then the repo server connects.
+    assert!(
+        amp_mcp::oauth::copy_login(&mine.credential_key(), &repo.credential_key(), &backend)
+            .await
+            .unwrap()
+    );
+    let client = http::connect(&repo, &backend).await.expect("adopted login");
+    client.shutdown().await;
+    let CredentialBackend::File { path } = &backend else {
+        unreachable!("a file backend")
+    };
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("mcp-repo:0123456789abcdef:acme|"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failed_connect_never_shows_the_query_or_userinfo() {
+    // Nothing listens on port 1: the connect fails with reqwest's "error sending request for url".
+    for url in [
+        format!("http://127.0.0.1:1/x?k={MARK}&other=1"),
+        format!("http://user:{MARK}@127.0.0.1:1/x"),
+    ] {
+        let mut o = options(&url);
+        o.fallback_sse = true;
+        let err = http::connect(&o, &file_backend("redact"))
+            .await
+            .expect_err("nothing listens");
+        let shown = err.to_string();
+        assert_no_secret(&shown);
+        assert!(shown.contains("127.0.0.1:1"), "{shown}");
+        // Legacy SSE takes its own path (SseError::Request).
+        let err = http::connect(&o.clone().with_legacy_sse(), &file_backend("redact"))
+            .await
+            .expect_err("nothing listens");
+        assert_no_secret(&err.to_string());
+    }
+}

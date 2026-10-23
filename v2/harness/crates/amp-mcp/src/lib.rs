@@ -26,6 +26,7 @@ mod http;
 mod keychain;
 pub mod oauth;
 mod protocol;
+mod redact;
 mod settings;
 
 pub use catalog::{Catalog, MAX_CATALOG_TTL, TtlSource};
@@ -38,6 +39,7 @@ pub use config_paths::{ConfigPaths, ENV_CONFIG, ENV_CONFIG_DIR};
 pub use credentials::{
     AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,
     ENV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE, credential_key, keychain_available, keychain_service,
+    scoped_credential_key,
 };
 pub use error::{FailureKind, McpError};
 pub use external::{
@@ -57,6 +59,7 @@ pub use keychain::{
     keychain_reads, keychain_set, repair_hint,
 };
 pub use protocol::{Era, ProtocolMode};
+pub use redact::{REDACTED, redact_url, redact_urls, scrub_values};
 pub use settings::{
     Auth, DEFAULT_MCP_URL, ENV_CA_FILE, ENV_MCP_URL, ENV_PROTOCOL, ENV_TOKEN, ENV_WEB_URL,
     FileConfig, Overrides, ServerSection, Settings, Source, StaticToken, default_config_path,

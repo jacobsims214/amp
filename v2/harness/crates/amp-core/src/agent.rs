@@ -364,6 +364,23 @@ pub fn mcp_strip_names(
     crate::mcp_stdio::strip_set(&secret_env, &pass_env)
 }
 
+/// The variables no repo MCP server may read (#2308, [`crate::mcp_hub::McpHub::protect_env`]):
+/// `AMP_TOKEN`, every provider's `key_env`, `[secrets] pass_to_bash` and what the person's own
+/// MCP servers read. An unreadable `[secrets]` table protects the rest.
+pub fn mcp_protected_names(
+    models: &ModelsConfig,
+    mcp: &crate::mcp_config::McpConfig,
+) -> BTreeSet<String> {
+    let pass_env = harness_config_from(models)
+        .map(|f| pass_env_from(&f))
+        .unwrap_or_default();
+    secret_env_names(models)
+        .into_iter()
+        .chain(mcp.user_secret_env_names())
+        .chain(pass_env)
+        .collect()
+}
+
 /// The names [`Runtime::secret_env`] starts from: `AMP_TOKEN` and every provider's `key_env`.
 pub fn secret_env_names(models: &ModelsConfig) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = models
@@ -465,8 +482,14 @@ impl Runtime {
             file.tools.mcp_max_output_tokens,
             (opts.env)(crate::mcp_hub::ENV_MAX_OUTPUT_TOKENS).as_deref(),
         )?;
+        let protected: BTreeSet<String> = secret_env_names(&models)
+            .into_iter()
+            .chain(mcp_config.user_secret_env_names())
+            .chain(pass_env.iter().cloned())
+            .collect();
         let mcp_hub = McpHub::new(mcp_config, hub_options);
         mcp_hub.set_strip(crate::mcp_stdio::strip_set(&secret_env, &pass_env));
+        mcp_hub.protect_env(protected);
         Ok(Self {
             catalog: std::sync::RwLock::new(Arc::new(catalog)),
             models,
@@ -540,6 +563,8 @@ impl Runtime {
     pub fn with_secret_env(self, name: Option<&str>) -> Self {
         if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
             self.hide_env([name.to_owned()]);
+            // #2308: the AMP token's variable is the person's own credential.
+            self.mcp_hub.protect_env([name.to_owned()]);
         }
         self
     }
@@ -679,6 +704,12 @@ impl Runtime {
 
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(catalog);
         self.hide_env(secret_env_names(&models));
+        // #2308: repo MCP servers never read the person's credentials.
+        self.mcp_hub.protect_env(
+            secret_env_names(&models)
+                .into_iter()
+                .chain(mcp_config.user_secret_env_names()),
+        );
         self.reload_models(models, keys);
         // Before the hub starts anything: a new stdio server must not inherit a new secret.
         self.hide_env(mcp_config.secret_env_names());

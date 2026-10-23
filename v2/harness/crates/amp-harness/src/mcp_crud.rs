@@ -33,7 +33,7 @@ use std::{
 };
 
 use amp_core::{
-    agent::{mcp_strip_names, state_dir},
+    agent::{mcp_protected_names, mcp_strip_names, state_dir},
     mcp_config::{
         self, AuthMode, ExpandContext, Layer, McpConfig, McpProblem, McpServer, Origin, Resolved,
         Scope as RunScope, Severity, Startup, Transport, env_account, header_account,
@@ -335,6 +335,11 @@ pub struct SecretArgs {
     /// Read the values from stdin, one per line, in the order `mcp get` lists them.
     #[arg(long)]
     pub secret_stdin: bool,
+    /// A repo server: copy the secrets (and the OAuth login) stored for this name before repo
+    /// servers got their own keychain items, instead of typing them again. Only do this if those
+    /// items were stored for this repo's server, not for one of your own.
+    #[arg(long, conflicts_with_all = ["missing", "secret_stdin"])]
+    pub adopt: bool,
     /// Print JSON.
     #[arg(long)]
     pub json: bool,
@@ -639,12 +644,15 @@ pub(crate) fn state() -> Result<PathBuf, CliError> {
 /// store, keychain), not started.
 fn hub_for(ctx: &Ctx, servers: Vec<McpServer>) -> Result<McpHub, CliError> {
     let full = McpConfig::load(&ctx.paths);
-    let strip = match ModelsConfig::load_paths(&env, &ctx.paths) {
-        Ok(models) => mcp_strip_names(&models, &full),
+    let (strip, protected) = match ModelsConfig::load_paths(&env, &ctx.paths) {
+        Ok(models) => (
+            mcp_strip_names(&models, &full),
+            mcp_protected_names(&models, &full),
+        ),
         Err(_) => {
             let mut names = full.secret_env_names();
             names.insert(amp_mcp::ENV_TOKEN.to_owned());
-            names
+            (names, full.user_secret_env_names())
         }
     };
     let config = McpConfig {
@@ -656,6 +664,7 @@ fn hub_for(ctx: &Ctx, servers: Vec<McpServer>) -> Result<McpHub, CliError> {
     let opts = HubOptions::new(ctx.paths.clone(), state()?, cwd);
     let hub = McpHub::new(config, opts);
     hub.set_strip(strip);
+    hub.protect_env(protected);
     Ok(hub)
 }
 
@@ -747,12 +756,13 @@ pub(crate) fn trust_of(server: &McpServer, store: Option<&TrustStore>) -> TrustS
 
 /// Records trust for the repo server `name` as configured now (the person just wrote it).
 pub(crate) fn trust_now(ctx: &Ctx, name: &str) -> Result<PathBuf, CliError> {
-    let config = McpConfig::load(&ctx.paths);
-    let server = config
-        .servers
-        .get(name)
-        .filter(|s| s.is_repo())
-        .ok_or_else(|| CliError::new(format!("repo MCP server `{name}` did not load")))?;
+    // From the repo file itself: when the person's own config defines the name too, the repo
+    // table is ignored (#2308) but is still the one they just wrote.
+    let did_not_load = || CliError::new(format!("repo MCP server `{name}` did not load"));
+    let value = layer_table(ctx, Scope::Repo, name)?.ok_or_else(did_not_load)?;
+    let (server, _) =
+        parse_table(name, &value, origin(ctx, Scope::Repo)?).map_err(|_| did_not_load())?;
+    let server = &server;
     let path = TrustStore::path_in(&state()?);
     let mut store = TrustStore::load(&path).map_err(CliError::new)?;
     store.trust(server);
@@ -789,7 +799,6 @@ pub(crate) struct SecretItem {
 }
 
 pub(crate) fn keychain_items(server: &McpServer) -> Vec<SecretItem> {
-    let name = &server.name;
     let mut out = Vec::new();
     match &server.transport {
         Transport::Stdio(s) => {
@@ -797,7 +806,7 @@ pub(crate) fn keychain_items(server: &McpServer) -> Vec<SecretItem> {
                 out.push(SecretItem {
                     label: format!("env {v}"),
                     which: v.clone(),
-                    account: env_account(name, v),
+                    account: server.env_account(v),
                 });
             }
         }
@@ -806,14 +815,14 @@ pub(crate) fn keychain_items(server: &McpServer) -> Vec<SecretItem> {
                 out.push(SecretItem {
                     label: format!("header {h}"),
                     which: h.clone(),
-                    account: header_account(name, h),
+                    account: server.header_account(h),
                 });
             }
             if r.oauth.as_ref().is_some_and(|o| o.client_secret) {
                 out.push(SecretItem {
                     label: "OAuth client secret".to_owned(),
                     which: "oauth".to_owned(),
-                    account: oauth_client_secret_account(name),
+                    account: server.oauth_client_secret_account(),
                 });
             }
         }
@@ -1751,8 +1760,19 @@ pub(crate) fn add_server_in(
         ))
     })?;
 
-    // Secrets: asked (or taken) and stored before the config names them.
-    let (items, known): (Vec<SecretItem>, Vec<Option<String>>) = spec.secrets.into_iter().unzip();
+    // Secrets: asked (or taken) and stored before the config names them, under the accounts of
+    // the layer the server is written to (#2308: a repo server's are its own).
+    let scoped = keychain_items(&server);
+    let (items, known): (Vec<SecretItem>, Vec<Option<String>>) = spec
+        .secrets
+        .into_iter()
+        .map(|(mut item, value)| {
+            if let Some(s) = scoped.iter().find(|s| s.label == item.label) {
+                item.account = s.account.clone();
+            }
+            (item, value)
+        })
+        .unzip();
     if !items.is_empty() {
         let service = keychain_service(name)?;
         let ask: Vec<SecretItem> = items
@@ -1986,18 +2006,21 @@ pub async fn get(args: GetArgs) -> Result<(), CliError> {
         },
     };
     let store = trust_store();
-    let shadowed = server.origin.layer == Layer::User
+    // #2308: when both layers define the name, the user's server is used and the repo's ignored.
+    let ignored = server.is_repo()
         && config
             .servers
             .get(&server.name)
-            .is_some_and(|s| s.is_repo());
+            .is_some_and(|s| !s.is_repo());
     let service = setup::keychain_for_keys().ok();
     let secrets: Vec<Value> = secret_rows(&server, service.as_deref());
     let login = match server.transport.remote() {
         Some(r) if r.auth != AuthMode::None => match CredentialBackend::resolve() {
             Ok(backend) => {
-                let url = expand_url(&ctx, &server).unwrap_or_else(|| r.url.clone());
-                Some(oauth::has_login(&url, &backend).await.unwrap_or(false))
+                let key = login_key(&ctx, &server).unwrap_or_else(|| {
+                    amp_mcp::scoped_credential_key(&r.url, server.credential_scope().as_deref())
+                });
+                Some(oauth::has_login_key(&key, &backend).await.unwrap_or(false))
             }
             Err(_) => None,
         },
@@ -2016,7 +2039,7 @@ pub async fn get(args: GetArgs) -> Result<(), CliError> {
         json!(server.is_repo().then(|| trust_of(&server, store.as_ref()))),
     );
     obj.insert("login".into(), json!(login));
-    obj.insert("shadowed_by_repo".into(), json!(shadowed));
+    obj.insert("ignored_for_user_server".into(), json!(ignored));
     if let Some(h) = &health {
         obj.insert("status".into(), serde_json::to_value(h).unwrap_or_default());
     }
@@ -2024,9 +2047,10 @@ pub async fn get(args: GetArgs) -> Result<(), CliError> {
         return print_json(&view);
     }
     print_server(&server, &secrets, login, store.as_ref());
-    if shadowed {
+    if ignored {
         println!(
-            "  note:     the repo config defines `{}` too, and wins",
+            "  note:     your own config defines `{}` too, so this repo server is ignored (rename \
+             it in the repo config to use both)",
             server.name
         );
     }
@@ -2034,6 +2058,13 @@ pub async fn get(args: GetArgs) -> Result<(), CliError> {
         print_test(h, "  status:   ");
     }
     Ok(())
+}
+
+/// The key `server`'s OAuth login is stored under: its URL, scoped to the repo and server for a
+/// repo server (#2308, [`amp_mcp::scoped_credential_key`]).
+pub(crate) fn login_key(ctx: &Ctx, server: &McpServer) -> Option<String> {
+    expand_url(ctx, server)
+        .map(|u| amp_mcp::scoped_credential_key(&u, server.credential_scope().as_deref()))
 }
 
 /// The server's URL with references expanded (for its login key).
@@ -2520,10 +2551,10 @@ pub async fn remove(args: RemoveArgs) -> Result<(), CliError> {
     let removed = parse_table(&name, &value, origin(&ctx, scope)?)
         .ok()
         .map(|(s, _)| s);
-    let login_url = removed
+    let removed_key = removed
         .as_ref()
         .filter(|s| s.transport.remote().is_some())
-        .and_then(|s| expand_url(&ctx, s));
+        .and_then(|s| login_key(&ctx, s));
     let prefix = format!("mcp.{name}");
     let check = layer_check(scope, file.path.clone(), name.clone(), Expect::Absent);
     let backup = file
@@ -2537,14 +2568,13 @@ pub async fn remove(args: RemoveArgs) -> Result<(), CliError> {
         untrust_now(&ctx, &name);
     }
     let mut logged_out = false;
-    if let Some(url) = login_url.filter(|_| !args.keep_login) {
-        let key = credential_key(&url);
+    if let Some(key) = removed_key.filter(|_| !args.keep_login) {
         let config = McpConfig::load(&ctx.paths);
         let still_used = config
             .servers
             .values()
-            .filter_map(|s| expand_url(&ctx, s))
-            .any(|u| credential_key(&u) == key);
+            .filter_map(|s| login_key(&ctx, s))
+            .any(|k| k == key);
         let amp = crate::conn::ConnArgs::default()
             .settings()
             .map(|s| credential_key(&s.url))
@@ -2553,7 +2583,7 @@ pub async fn remove(args: RemoveArgs) -> Result<(), CliError> {
             && amp.as_deref() != Some(key.as_str())
             && let Ok(backend) = CredentialBackend::resolve()
         {
-            logged_out = oauth::logout(&url, &backend).await.unwrap_or(false);
+            logged_out = oauth::logout_key(&key, &backend).await.unwrap_or(false);
         }
     }
     let effective_now = McpConfig::load(&ctx.paths).servers.get(&name).cloned();
@@ -2704,6 +2734,9 @@ pub(crate) fn set_enabled_in(ctx: &Ctx, name: &str, on: bool) -> Result<Enabled,
 pub async fn secret(args: SecretArgs) -> Result<(), CliError> {
     let ctx = ctx()?;
     let server = effective(&ctx, &args.name)?;
+    if args.adopt {
+        return adopt(&ctx, &server, args.json).await;
+    }
     let all = keychain_items(&server);
     if all.is_empty() {
         return Err(CliError::usage(format!(
@@ -2757,6 +2790,82 @@ pub async fn secret(args: SecretArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// The account an item had before #2308 scoped repo servers' secrets: the user-layer form,
+/// `mcp:<name>:...`.
+fn legacy_account(server: &McpServer, item: &SecretItem) -> String {
+    let name = &server.name;
+    if item.which == "oauth" && item.label == "OAuth client secret" {
+        oauth_client_secret_account(name)
+    } else if item.label.starts_with("header ") {
+        header_account(name, &item.which)
+    } else {
+        env_account(name, &item.which)
+    }
+}
+
+/// `mcp secret NAME --adopt` (#2308): copies a repo server's secrets and OAuth login from where
+/// every server named NAME kept them before (`mcp:<name>:...`, the login under the URL alone) to
+/// the repo server's own items. The old items stay (one of your own servers may use them). Only
+/// the person can say those items were meant for this repo, so this never happens on its own.
+async fn adopt(ctx: &Ctx, server: &McpServer, json: bool) -> Result<(), CliError> {
+    let name = &server.name;
+    if !server.is_repo() {
+        return Err(CliError::usage(format!(
+            "`{name}` is one of your own servers; its secrets are already where they always were \
+             (--adopt is for repo servers)"
+        )));
+    }
+    let mut copied = Vec::new();
+    let mut missing = Vec::new();
+    let items = keychain_items(server);
+    if !items.is_empty() {
+        let service = keychain_service(name)?;
+        for item in &items {
+            if stored(Some(&service), item) == Some(true) {
+                continue;
+            }
+            let old = legacy_account(server, item);
+            match amp_mcp::keychain_get(&service, &old) {
+                Ok(Some(value)) => {
+                    amp_mcp::keychain_set(&service, &item.account, &value)
+                        .map_err(|e| CliError::new(format!("keychain {}: {e}", item.account)))?;
+                    copied.push(item.label.clone());
+                }
+                Ok(None) => missing.push(item.label.clone()),
+                Err(e) => return Err(CliError::new(format!("keychain {old}: {e}"))),
+            }
+        }
+    }
+    let mut login = false;
+    if let Some(r) = server.transport.remote()
+        && r.auth != AuthMode::None
+        && let (Some(url), Ok(backend)) = (expand_url(ctx, server), CredentialBackend::resolve())
+    {
+        let to = amp_mcp::scoped_credential_key(&url, server.credential_scope().as_deref());
+        login = oauth::copy_login(&credential_key(&url), &to, &backend)
+            .await
+            .map_err(|e| CliError::new(e.to_string()))?;
+    }
+    if json {
+        return print_json(&json!({
+            "name": name, "adopted": copied, "login_adopted": login, "not_found": missing,
+        }));
+    }
+    for l in &copied {
+        println!("Copied {l} to repo server `{name}`'s own keychain item.");
+    }
+    if login {
+        println!("Copied the OAuth login to repo server `{name}`.");
+    }
+    for l in &missing {
+        println!("No older {l} found for `{name}`: store it with `amp-harness mcp secret {name}`.");
+    }
+    if copied.is_empty() && !login && missing.is_empty() {
+        println!("Nothing to adopt for `{name}`.");
+    }
+    Ok(())
+}
+
 // ------------------------------------------------------------------------------------------------
 // login / logout
 // ------------------------------------------------------------------------------------------------
@@ -2782,6 +2891,15 @@ fn remote_options(
              trust {name}`",
             trust.word()
         )));
+    }
+    // #2308: the same rule as the hub's: a repo server never reads the person's credentials.
+    if server.is_repo() {
+        let full = McpConfig::load(&ctx.paths);
+        let protected = match ModelsConfig::load_paths(&env, &ctx.paths) {
+            Ok(models) => mcp_protected_names(&models, &full),
+            Err(_) => full.user_secret_env_names(),
+        };
+        amp_core::mcp_trust::check_repo_env(&server, &protected).map_err(CliError::new)?;
     }
     let expand = ExpandContext::from_paths(&ctx.paths, &env, None);
     let resolved = server
@@ -2867,8 +2985,9 @@ pub async fn logout(args: NameArgs) -> Result<(), CliError> {
             server.name
         ))
     })?;
+    let key = amp_mcp::scoped_credential_key(&url, server.credential_scope().as_deref());
     let backend = CredentialBackend::resolve().map_err(|e| CliError::new(e.to_string()))?;
-    let removed = oauth::logout(&url, &backend)
+    let removed = oauth::logout_key(&key, &backend)
         .await
         .map_err(|e| CliError::new(e.to_string()))?;
     if args.json {
@@ -2878,14 +2997,14 @@ pub async fn logout(args: NameArgs) -> Result<(), CliError> {
         println!(
             "Logged out of `{}` ({}; removed from {}).",
             server.name,
-            credential_key(&url),
+            amp_mcp::redact_url(&credential_key(&url)),
             backend.describe()
         );
     } else {
         println!(
             "No stored login for `{}` ({}).",
             server.name,
-            credential_key(&url)
+            amp_mcp::redact_url(&credential_key(&url))
         );
     }
     Ok(())

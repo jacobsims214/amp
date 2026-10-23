@@ -28,7 +28,6 @@ use tokio::{
 
 use crate::{
     AmpMcpClient, Auth, ClientOptions, CredentialBackend, McpError,
-    credentials::credential_key,
     external::Secret,
     http::{DEFAULT_OAUTH_REQUEST_TIMEOUT, build_http_client, build_oauth_http_client},
 };
@@ -55,6 +54,9 @@ pub struct LoginOptions {
     /// A pre-registered client, scopes, a fixed callback port or a metadata URL (`[mcp.<name>]
     /// oauth = {..}`). The default (AMP's case) registers dynamically and lets rmcp pick scopes.
     pub client: OAuthClientSettings,
+    /// The login's scope ([`crate::scoped_credential_key`]): `None` for AMP and the person's own
+    /// servers; a repo server's own scope otherwise (#2308).
+    pub credential_scope: Option<String>,
 }
 
 /// OAuth settings beyond discovery + dynamic registration, for third-party servers (D2).
@@ -98,7 +100,18 @@ impl LoginOptions {
             timeout: DEFAULT_LOGIN_TIMEOUT,
             request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
             client: OAuthClientSettings::default(),
+            credential_scope: None,
         }
+    }
+
+    pub fn with_credential_scope(mut self, scope: Option<String>) -> Self {
+        self.credential_scope = scope;
+        self
+    }
+
+    /// The key the login is stored under.
+    pub fn credential_key(&self) -> String {
+        crate::scoped_credential_key(&self.url, self.credential_scope.as_deref())
     }
 
     pub fn with_client(mut self, client: OAuthClientSettings) -> Self {
@@ -207,7 +220,7 @@ where
     let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
 
     // 3. Discovery + dynamic client registration + the PKCE authorization URL.
-    let store = options.backend.store_for(&options.url);
+    let store = options.backend.store_for_key(options.credential_key());
     let mut manager = new_manager(
         &options.url,
         options.ca_file.as_deref(),
@@ -316,7 +329,7 @@ pub(crate) async fn fetch_metadata(
 
 fn outcome(options: &LoginOptions, client_id: String, token: &OAuthTokenResponse) -> LoginOutcome {
     LoginOutcome {
-        key: credential_key(&options.url),
+        key: options.credential_key(),
         client_id,
         scopes: token_scopes(token),
         expires_in: token_expires_in(token),
@@ -329,6 +342,50 @@ fn outcome(options: &LoginOptions, client_id: String, token: &OAuthTokenResponse
 /// revocation endpoint in v1; the refresh token simply stops being used.)
 pub async fn logout(url: &str, backend: &CredentialBackend) -> Result<bool, McpError> {
     backend.store_for(url).clear_credentials().await
+}
+
+/// Removes the login stored under `key` ([`crate::scoped_credential_key`]). `Ok(true)` if there
+/// was one.
+pub async fn logout_key(key: &str, backend: &CredentialBackend) -> Result<bool, McpError> {
+    backend
+        .store_for_key(key.to_owned())
+        .clear_credentials()
+        .await
+}
+
+/// Copies the login stored under `from` to `to` (keys from [`crate::scoped_credential_key`]),
+/// keeping `from`. `Ok(false)` when there is none under `from`, or `to` already has one. For
+/// `amp-harness mcp secret --adopt` (#2308): a person giving a repo server the login that every
+/// server of that URL shared before logins were scoped.
+pub async fn copy_login(
+    from: &str,
+    to: &str,
+    backend: &CredentialBackend,
+) -> Result<bool, McpError> {
+    let target = backend.store_for_key(to.to_owned());
+    if target.load_credentials().await?.is_some() {
+        return Ok(false);
+    }
+    match backend
+        .store_for_key(from.to_owned())
+        .load_credentials()
+        .await?
+    {
+        Some(creds) if creds.token_response.is_some() => {
+            target.save_credentials(creds).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Whether a login with a token is stored under `key` ([`crate::scoped_credential_key`]).
+pub async fn has_login_key(key: &str, backend: &CredentialBackend) -> Result<bool, McpError> {
+    Ok(backend
+        .store_for_key(key.to_owned())
+        .load_credentials()
+        .await?
+        .is_some_and(|c| c.token_response.is_some()))
 }
 
 /// Whether a login with a token is stored for `url`.
@@ -379,7 +436,7 @@ pub async fn connect(
     let manager = tokio::time::timeout(options.connect_timeout, prepare)
         .await
         .map_err(|_| McpError::Timeout {
-            operation: format!("OAuth discovery for {}", options.url),
+            operation: format!("OAuth discovery for {}", crate::redact_url(&options.url)),
             after: options.connect_timeout,
         })??;
     let auth = format!("oauth ({})", backend.describe());

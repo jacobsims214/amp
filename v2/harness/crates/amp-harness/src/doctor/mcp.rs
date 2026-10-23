@@ -363,8 +363,8 @@ async fn auth_lines(
         match r.auth {
             AuthMode::None => lines.push("OAuth off".to_owned()),
             mode => {
-                let login = match (backend, mcp_crud::expand_url(ctx, s)) {
-                    (Some(b), Some(url)) => oauth::has_login(&url, b).await.ok(),
+                let login = match (backend, mcp_crud::login_key(ctx, s)) {
+                    (Some(b), Some(key)) => oauth::has_login_key(&key, b).await.ok(),
                     _ => None,
                 };
                 let word = if mode == AuthMode::Oauth {

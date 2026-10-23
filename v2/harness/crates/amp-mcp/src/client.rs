@@ -153,14 +153,18 @@ impl ServerSession {
     }
 }
 
-/// `scheme://host[:port]` of a URL (everything before the path).
+/// `scheme://host[:port]` of a URL (everything before the path), without userinfo (#2308: a
+/// `user:password@` is a secret).
 pub fn origin(url: &str) -> String {
     let url = url.trim();
     let start = url.find("://").map_or(0, |i| i + 3);
     let end = url[start..]
         .find(['/', '?', '#'])
         .map_or(url.len(), |i| start + i);
-    url[..end].to_owned()
+    match url[start..end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..start], &url[start + at + 1..end]),
+        None => url[..end].to_owned(),
+    }
 }
 
 /// The rmcp client-side handler: identifies us and notices `tools/list_changed`.

@@ -354,6 +354,23 @@ again. Headless runs (`run -p` and every worker) never ask: they skip untrusted 
 warning. `--trust-repo-mcp` or `AMP_HARNESS_TRUST_REPO_MCP=1` lets them all start for that process
 (CI), and that is never recorded. Servers in your own config.toml are always trusted.
 
+A repo server never reaches your own secrets (#2308), trusted or not, override or not:
+- Its keychain items are `mcp:repo:<repo id>:<name>:…` (repo id = 16 hex of sha256 of the
+  canonical repo path), and its OAuth login is stored under `mcp-repo:<repo id>:<name>|<url>`.
+  Your own servers keep `mcp:<name>:…` and the URL key, unchanged.
+- A repo table with the name of one of your servers is ignored with a warning; yours is used.
+- Trust records the environment variables the server reads (`env = […]` in trust.toml), and the
+  chat question names them. A record without them (from before) is asked again if it reads any.
+- It may never read provider `key_env`s, `AMP_TOKEN`, `--token-env`, `[secrets] pass_to_bash` or
+  a variable your own MCP servers read: it is stopped with a config error naming them.
+- Secrets stored for a repo server before this change are reported missing. If they were for this
+  repo's server, `amp-harness mcp secret NAME --adopt` copies them and its login.
+
+Every `${env:VAR}`, in any field, is secret-bearing: hidden from bash and stdio servers, and its
+value is scrubbed from the server's errors. MCP errors show URLs without userinfo and with query
+values as `<redacted>`. A secret-looking `${env:..}` in `args` (visible in `ps`) is a warning in
+your config and an error in a repo's: pass it through `env` instead.
+
 ### MCP servers: `amp-harness mcp` (#2243)
 
 Any MCP server, stdio, Streamable HTTP or legacy HTTP+SSE, is added, changed and removed without
@@ -374,6 +391,7 @@ amp-harness mcp enable|disable NAME             # in your config.toml, also for 
 amp-harness mcp test NAME [--json]              # status, timing, tools; stderr tail when it fails
 amp-harness mcp login|logout NAME               # OAuth for http/sse servers, like the AMP login
 amp-harness mcp secret NAME [WHICH…] [--missing] [--secret-stdin]   # store or rotate secrets
+amp-harness mcp secret NAME --adopt             # repo server: copy secrets stored before #2308
 ```
 
 - Flags: `--scope user|repo` (also `--user` / `--repo`; `project` = repo; default user),
@@ -385,7 +403,8 @@ amp-harness mcp secret NAME [WHICH…] [--missing] [--secret-stdin]   # store or
   `--force` (replace), `--no-test`, `--json`.
 - Secrets never go in a file or on the command line. `--secret-header`/`--secret-env`/
   `--client-secret` are asked hidden (or read one per line with `--secret-stdin`) and kept in the
-  OS keychain (`mcp:<name>:header:<name>`, `mcp:<name>:env:<VAR>`). A `--header`/`--env`/argument
+  OS keychain (`mcp:<name>:header:<name>`, `mcp:<name>:env:<VAR>`; a repo server's under
+  `mcp:repo:<repo id>:<name>:…`). A `--header`/`--env`/argument
   value that looks secret is refused with these alternatives, and the value is never echoed.
   `${VAR}` (Claude Code's spelling) is stored as `${env:VAR}`, read when the server starts.
   `add-json` moves secret-looking literal values to the keychain. Without a keychain

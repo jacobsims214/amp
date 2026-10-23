@@ -33,6 +33,11 @@ amp-harness mcp add-json linear '{"type":"http","url":"https://mcp.linear.app/mc
 - **Variables** in arguments, env and headers are filled in when the server starts:
   `${env:VAR}`, `${env:VAR:-default}`, `${repo}`, `${worktree}`, `${home}`, `${config_dir}`. Quote
   them in single quotes so your shell leaves them alone.
+- Every variable a server reads with `${env:VAR}` is treated as a secret, wherever it appears
+  (URL, arguments, env, headers): the agents' shell and other stdio servers don't see it, and its
+  value is never printed. Pass secrets to a stdio server through `env` (or `--secret-env`), not
+  its arguments: arguments show up in the process list. A secret-looking `${env:..}` in `args` is a
+  warning in your config and an error in a repo's.
 
 ## Secrets and auth
 
@@ -52,7 +57,9 @@ Secrets never go in a file or on the command line:
   references.
 
 The values are given only to the server (its environment or request headers). They never reach
-the model or the agents' shell.
+the model or the agents' shell. Errors and status lines show a server's URL without its password
+and with every query value replaced by `<redacted>` (`?key=<redacted>`), so a key in the URL
+stays out of the transcript, `doctor` and CI logs.
 
 ## Manage them
 
@@ -107,6 +114,29 @@ the agents send, so it starts only once you trust it:
   that one process.
 - Servers in your own config are always trusted.
 
+### What a repo server can't touch
+
+A repo server is kept apart from your own secrets, even when you trust it and even with
+`--trust-repo-mcp`:
+
+- **Its secrets are its own.** What you store for a repo server with `mcp secret` is kept under
+  that repo and server name. It never reads what you stored for your own server of the same
+  name, nor what you stored for another repo's. Its OAuth login is its own too: it never uses a
+  login you made for the same URL.
+- **It can't take a name you use.** If the repo defines a server with the name of one of yours
+  (say `github`), yours is used and the repo's is ignored, with a warning. Rename it in the repo
+  config to use both.
+- **It reads only the environment variables you approved.** Trusting it approves the variables
+  it names (the chat question lists them). If it later reads others, you are asked again.
+- **It never reads your credentials:** provider keys, `AMP_TOKEN`, `[secrets] pass_to_bash` and
+  any variable your own MCP servers use. A repo server that names one is stopped with a message
+  saying which; give it a variable of its own.
+
+Before this rule, every server of a name shared one set of keychain items. If you stored secrets
+for a repo server before, it now reports them missing. If those items really were for this
+repo's server, copy them, and its OAuth login, with `amp-harness mcp secret NAME --adopt`.
+Otherwise store new ones with `amp-harness mcp secret NAME`. Your own servers are unchanged.
+
 ## Which agents may use a server
 
 Two levels, applied in this order:
@@ -150,6 +180,9 @@ secret_env = ["BRAVE_API_KEY"]        # the value is in the keychain
   server authenticates and which roles may use it, with the fix.
 - `needs login`: run `amp-harness mcp login NAME` (then `/reload` in an open chat).
 - `not trusted`: run `amp-harness mcp trust NAME` (or press `T` in `/mcp`).
-- A missing secret: run `amp-harness mcp secret NAME --missing`.
+- A missing secret: run `amp-harness mcp secret NAME --missing` (for a repo server whose secret
+  you stored before it had its own, `--adopt`).
+- `reads … which hold your own credentials`: a repo server named one of your credential
+  variables. Give it its own variable in the repo config.
 - A server you just added in another terminal: the chat picks it up by itself after a couple of
   seconds, or at once with `/reload`.

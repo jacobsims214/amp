@@ -139,8 +139,10 @@ pub fn stdio_spec(
                     "secret_env",
                     format!("`{var}` has no value ({})", secret.describe()),
                     Some(format!(
-                        "store it with `amp-harness mcp secret {}` (or remove it from secret_env)",
-                        server.name
+                        "store it with `amp-harness mcp secret {}` (or remove it from \
+                         secret_env){}",
+                        server.name,
+                        crate::mcp_config::adopt_hint(server)
                     )),
                 ));
             }
