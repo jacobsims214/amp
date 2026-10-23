@@ -371,6 +371,9 @@ pub struct Shell {
     msgs_rx: UnboundedReceiver<ShellMsg>,
     /// Command calls still running.
     in_flight: usize,
+    /// The `task_id` argument of AMP tool calls still running, by call id (#2226): a refusal's
+    /// ticket is the call's own argument, not a number parsed out of the error's text.
+    call_tickets: std::collections::HashMap<String, i64>,
     /// The snapshot revision last looked at, and the ticket (id, state) last marked.
     seen_revision: u64,
     marked: Option<(i64, Option<Status>)>,
@@ -430,6 +433,7 @@ impl Shell {
                 msgs_tx,
                 msgs_rx,
                 in_flight: 0,
+                call_tickets: Default::default(),
                 seen_revision: 0,
                 marked: None,
                 footer_ticket: None,
@@ -818,6 +822,22 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        if let AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } = event
+            && tool_name.starts_with("amp_")
+            && let Some(id) = amp_core::approval::task_id_arg(args)
+        {
+            self.call_tickets.insert(tool_call_id.clone(), id);
+        }
+        let call_ticket = match event {
+            AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                self.call_tickets.remove(tool_call_id)
+            }
+            _ => None,
+        };
         // #2171: AMP refused a step only a person takes in the web UI (approving the plan, a
         // person's ticket). Say so plainly under the tool call, with the link; the harness ends
         // the manager's turn.
@@ -828,9 +848,12 @@ impl Shell {
             ..
         } = event
             && tool_name.starts_with("amp_")
-            && let Some(refusal) =
+            && let Some(mut refusal) =
                 amp_core::approval::refusal(&amp_core::events::tool_result_text(result))
         {
+            if call_ticket.is_some() {
+                refusal.ticket_id = call_ticket;
+            }
             let snapshot = self.meta.as_ref().map(|m| m.snapshot());
             self.view
                 .add_to_transcript(Arc::new(ApprovalNotice::new(refusal, snapshot.as_deref())));

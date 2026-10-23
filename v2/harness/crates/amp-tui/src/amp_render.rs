@@ -587,6 +587,9 @@ pub fn marker_component(meta: &AmpMeta) -> Arc<TicketMarker> {
     Arc::new(TicketMarker::new(kind, meta))
 }
 
+/// A refused call's own row: the [`ApprovalNotice`] under it carries the server's sentence.
+pub const REFUSED_LINE: &str = "AMP refused: this needs a person in the AMP web UI (below)";
+
 /// What the person sees when AMP refused a step only they take, in the web UI (#2171): drawn
 /// under the refused tool call.
 ///
@@ -666,6 +669,18 @@ impl ApprovalNotice {
     }
 }
 
+/// The server's sentence without its link (#2226): the notice's own link line follows, built
+/// from the instance's web URL, so a relative `/project/…` isn't shown twice. "… on their behalf):
+/// /project/71/plan. Agents …" reads "… on their behalf). Agents …".
+fn without_link(message: &str, link: Option<&str>) -> String {
+    let Some(link) = link.filter(|l| !l.is_empty()) else {
+        return message.to_owned();
+    };
+    message
+        .replace(&format!(": {link}"), "")
+        .replace(&format!(" {link}"), "")
+}
+
 /// Greedy word wrap of plain text to `width` cells (a word longer than a line is cut).
 fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
@@ -734,7 +749,8 @@ impl Component for ApprovalNotice {
         for line in wrap_plain(&title, width.saturating_sub(2)) {
             out.push(format!("  {}", rpi_tui::bold(&c.warning.fg(&line))));
         }
-        for line in wrap_plain(&clean(&self.refusal.message), room) {
+        let sentence = without_link(&self.refusal.message, self.refusal.link.as_deref());
+        for line in wrap_plain(&clean(&sentence), room) {
             out.push(format!("{indent}{}", c.muted.fg(&line)));
         }
         match &self.url {

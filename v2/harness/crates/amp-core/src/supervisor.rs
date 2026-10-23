@@ -637,9 +637,20 @@ impl Supervisor {
             json!({"task_id": req.task_id, "agent_id": agent_id}),
         )
         .await
-        .map_err(|e| RunTicketError::Dispatch {
-            task_id: req.task_id,
-            message: e.to_string(),
+        .map_err(|e| {
+            // #2226: AMP's refusals link the web UI; without a public URL the link is relative.
+            // Same rewrite as every other AMP tool result (#2205), so the model and the TUI see
+            // the web UI's absolute link, not `/project/71/plan`.
+            let session = self.rt.mcp.session();
+            RunTicketError::Dispatch {
+                task_id: req.task_id,
+                message: crate::links::web_links(
+                    &e.to_string(),
+                    &session.web_base(),
+                    &session.mcp_origin(),
+                )
+                .into_owned(),
+            }
         })?;
         if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
             w.dispatched = true;

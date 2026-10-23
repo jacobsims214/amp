@@ -95,12 +95,13 @@ pub fn refusal(text: &str) -> Option<Refusal> {
         None => message,
     };
     let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let message = server_sentence(&message).to_owned();
     let link = find_link(&message);
     let project_id = link.as_deref().and_then(|l| number_after(l, "/project/"));
     let ticket_id = link
         .as_deref()
         .and_then(|l| number_after(l, "task="))
-        .or_else(|| gate.then(|| number_after(&message, "ticket ")).flatten());
+        .or_else(|| gate.then(|| ticket_named(text)).flatten());
     let plan_link = link
         .as_deref()
         .is_some_and(|l| l.trim_end_matches('/').ends_with("/plan"));
@@ -117,6 +118,50 @@ pub fn refusal(text: &str) -> Option<Refusal> {
         project_id,
         ticket_id,
         per_ticket,
+    })
+}
+
+/// AMP's own sentence in a tool error, without the transport's wrapping before it:
+/// `tool error: amp_x: `, `AMP refused to dispatch ticket #N: ` (`amp_run_ticket`, #2226),
+/// `tools/call amp_x: Mcp error: -32603: `.
+pub fn server_sentence(text: &str) -> &str {
+    let mut text = text.trim();
+    if let Some(at) = text.find("Mcp error: ") {
+        text = &text[at + "Mcp error: ".len()..];
+        // The JSON-RPC code, `-32603: `.
+        if let Some((code, rest)) = text.split_once(": ")
+            && !code.is_empty()
+            && code
+                .trim_start_matches('-')
+                .chars()
+                .all(|c| c.is_ascii_digit())
+        {
+            text = rest;
+        }
+        return text.trim_start();
+    }
+    if let Some(rest) = text.strip_prefix("tool error: ") {
+        text = rest;
+    }
+    if let Some(rest) = text.strip_prefix("AMP refused to dispatch ticket #")
+        && let Some((id, rest)) = rest.split_once(": ")
+        && id.chars().all(|c| c.is_ascii_digit())
+    {
+        text = rest;
+    }
+    // A tool's name (`amp_dispatch_task: `), as `tools/call amp_x: ` without an MCP code.
+    let text = text.strip_prefix("tools/call ").unwrap_or(text);
+    match text.split_once(": ") {
+        Some((name, rest)) if name.starts_with("amp_") && !name.contains(' ') => rest.trim_start(),
+        _ => text,
+    }
+}
+
+/// The first "ticket N" or "ticket #N" in `text`.
+fn ticket_named(text: &str) -> Option<i64> {
+    text.match_indices("ticket ").find_map(|(i, m)| {
+        let rest = &text[i + m.len()..];
+        number_after(rest.strip_prefix('#').unwrap_or(rest), "")
     })
 }
 
@@ -272,6 +317,11 @@ impl ManagerGuard {
     }
 }
 
+/// A tool call's `task_id` argument (`9`, `"9"`, `"#9"`).
+pub fn task_id_arg(args: &Value) -> Option<i64> {
+    id_of(&args["task_id"])
+}
+
 fn id_of(v: &Value) -> Option<i64> {
     match v {
         Value::Number(n) => n.as_i64(),
@@ -423,6 +473,54 @@ mod tests {
         ] {
             assert_eq!(refusal(other), None, "{other}");
         }
+    }
+
+    /// #2226: `amp_run_ticket` wraps the dispatch refusal; the ticket is the one it names.
+    #[test]
+    fn run_ticket_refusals_name_their_ticket() {
+        let wrapped = "tool error: AMP refused to dispatch ticket #196: tools/call \
+             amp_dispatch_task: Mcp error: -32603: ticket 196 isn't approved: nobody has approved \
+             it since it was planned or its scope last changed, and this project needs each ticket \
+             approved before agents start it. Its owner approves it in the AMP web UI (Approve \
+             plan; a project lead may approve it on their behalf): /project/71/plan. Agents can't \
+             approve: stop and ask your person to approve it there.";
+        let r = refusal(wrapped).unwrap();
+        assert_eq!(r.kind, RefusalKind::PlanApproval);
+        assert_eq!((r.project_id, r.ticket_id), (Some(71), Some(196)));
+        assert!(r.per_ticket);
+        assert!(
+            r.message.starts_with("ticket 196 isn't approved"),
+            "{}",
+            r.message
+        );
+        for noise in [
+            "tool error",
+            "tools/call",
+            "Mcp error",
+            "-32603",
+            "refused to dispatch",
+        ] {
+            assert!(!r.message.contains(noise), "{noise}: {}", r.message);
+        }
+
+        // Only the harness's own wrapping (no MCP code): the ticket is still the one named.
+        let r = refusal(
+            "AMP refused to dispatch ticket #12: ticket #12 was planned after the plan was last \
+             approved. A person approves it: /project/3/plan.",
+        )
+        .unwrap();
+        assert_eq!(r.ticket_id, Some(12));
+        assert!(
+            r.message.starts_with("ticket #12 was planned"),
+            "{}",
+            r.message
+        );
+
+        assert_eq!(
+            server_sentence("tool error: amp_dispatch_task: ticket 9 isn't approved"),
+            "ticket 9 isn't approved"
+        );
+        assert_eq!(server_sentence("plain words: here"), "plain words: here");
     }
 
     #[test]
