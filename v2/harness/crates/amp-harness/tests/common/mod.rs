@@ -304,13 +304,19 @@ impl ServerHandler for MockAmp {
             // M4-1 setup: the project picker and project creation.
             "amp_list_projects" => ok_json(json!({"projects": [
                 {"id": 2, "name": "AMP v2", "code": "AV", "state": "active", "org_id": 1},
-                {"id": 9, "name": "Old", "code": "OLD", "state": "archived", "org_id": 1}
+                {"id": 9, "name": "Old", "code": "OLD", "state": "archived", "org_id": 1},
+                {"id": 68, "name": "QA throwaway", "code": "QT", "state": "archived", "org_id": 1}
             ]})),
             "amp_list_orgs" => ok_json(json!({"orgs": [{"id": 1, "name": "Default"}]})),
             "amp_create_project" => match (args["name"].as_str(), args["code"].as_str()) {
-                // Codes are unique, archived projects included (OLD is archived).
-                (Some(_), Some(code @ ("AV" | "OLD"))) => {
-                    tool_error(&format!("project code \"{code}\" already exists"))
+                // Codes are unique, archived projects included (OLD and QT are archived; HI
+                // belongs to a project this user can't list). Like compose, the refusal is a
+                // JSON-RPC error (-32603), not a tool result.
+                (Some(_), Some(code @ ("AV" | "OLD" | "QT" | "HI"))) => {
+                    Err(ErrorData::internal_error(
+                        format!("project code \"{code}\" already exists"),
+                        None,
+                    ))
                 }
                 (Some(name), Some(code)) if !name.is_empty() && !code.is_empty() => ok_json(
                     json!({"id": 77, "name": name, "code": code, "state": "active", "org_id": 1}),
