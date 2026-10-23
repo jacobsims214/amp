@@ -36,7 +36,31 @@
 //! | `websearch` | `websearch` | the query |
 //! | `todowrite`, `todoread` | `todowrite` | `*` |
 //! | `read`, `grep`, `find`, `ls` | `read`, `grep`, `glob`, `list` | the path, else `*` |
+//! | external MCP tools (`mcp__<server>__<tool>`) | `mcp`, then the tool name | `<server>/<tool>` (the server's own tool name), then `*` |
 //! | anything else (`amp_*` MCP tools) | the tool name | `*` |
+//!
+//! # External MCP servers (`mcp`, #2240)
+//!
+//! A tool of an external MCP server is checked under the `mcp` permission with the subject
+//! `<server>/<tool>`, where `<tool>` is the name the server gave it (before sanitising to
+//! `mcp__<server>__<tool>`), so `"github/delete_*": deny` works whatever the model-facing name is:
+//!
+//! ```yaml
+//! permission:
+//!   mcp:
+//!     "*": allow
+//!     "github/*": allow
+//!     "github/delete_*": deny
+//!     "db/*": deny
+//! ```
+//!
+//! No `mcp` rule means allow, so every role sees every server it is let in by the server's
+//! `roles = [...]` filter (applied first, by the hub). `ask` is deny. The model-facing name is also
+//! checked under its own name with subject `*` afterwards, so a key like
+//! `mcp__github__delete_repo: deny` works too. Because the subject names one tool exactly, a tool
+//! the rules deny is never usable and is left out of the role's tool list
+//! ([`ToolPolicy::exposes`]); a call that still arrives is denied with the rule in the error.
+//! The hub tells the policy each tool's subject ([`ToolPolicy::learn_mcp_subjects`]).
 //!
 //! Under a restricted bash policy (any bash rule that isn't `allow`), command substitution
 //! (`$(…)`, backticks, `<(…)`, `>(…)`) and output redirection to a file are denied outright. An
@@ -70,12 +94,16 @@ use std::{
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use rpi_agent::{AgentTool, BeforeToolCall, BeforeToolCallContext, BeforeToolCallResult};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
+
+/// The permission external MCP server tools are checked under (#2240), with subject
+/// `<server>/<tool>`.
+pub const MCP_PERMISSION: &str = "mcp";
 
 /// The manager's dispatch tool (D7). Children never get it.
 pub const DISPATCH_TOOL: &str = "amp_run_ticket";
@@ -822,6 +850,9 @@ pub struct ToolPolicy {
     child: bool,
     policy: Policy,
     root: PathBuf,
+    /// Model-facing `mcp__…` name -> `<server>/<tool>` (the server's own tool name), as the hub
+    /// named the tools this session was given. Shared by clones.
+    mcp_subjects: Arc<RwLock<std::collections::HashMap<String, String>>>,
 }
 
 type HookFuture = Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>;
@@ -840,7 +871,38 @@ impl ToolPolicy {
             child,
             policy,
             root: lexical_normalize(&root.into()),
+            mcp_subjects: Arc::default(),
         }
+    }
+
+    /// Records the `mcp` subject (`<server>/<tool>`) of external MCP tools by their model-facing
+    /// names, as the hub named them for this session. Call it before [`Self::filter_tools`] /
+    /// [`Self::exposes`] for those tools. Names are only added or updated, never removed, so a
+    /// call to a tool the session still has from an older view is judged by its real subject.
+    pub fn learn_mcp_subjects<'a>(&self, subjects: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let mut map = self.mcp_subjects.write().unwrap_or_else(|e| e.into_inner());
+        for (name, subject) in subjects {
+            map.insert(name.to_owned(), subject.to_owned());
+        }
+    }
+
+    /// The `mcp` subject of an external MCP tool (`mcp__<server>__<tool>`): the one the hub
+    /// recorded ([`Self::learn_mcp_subjects`]), else read from the name (`<server>/<rest>`; server
+    /// names have no `_`, so the first `__` ends the server). `None` for other tools.
+    pub fn mcp_subject(&self, tool: &str) -> Option<String> {
+        let rest = tool.strip_prefix(crate::mcp_config::TOOL_PREFIX)?;
+        if let Some(subject) = self
+            .mcp_subjects
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tool)
+        {
+            return Some(subject.clone());
+        }
+        Some(match rest.split_once("__") {
+            Some((server, name)) => format!("{server}/{name}"),
+            None => format!("{rest}/*"),
+        })
     }
 
     pub fn role(&self) -> &str {
@@ -865,6 +927,12 @@ impl ToolPolicy {
     pub fn exposes(&self, tool: &str) -> bool {
         if self.child && (tool == QUESTION_TOOL || tool == DISPATCH_TOOL) {
             return false;
+        }
+        if let Some(subject) = self.mcp_subject(tool) {
+            // One exact subject per tool: the rules decide it once and for all.
+            if !self.policy.evaluate(MCP_PERMISSION, &subject).allows() {
+                return false;
+            }
         }
         !self.policy.denies_everything(permission_for(tool))
     }
@@ -966,7 +1034,13 @@ impl ToolPolicy {
                     .unwrap_or_else(|| "*".into());
                 vec![Check::new(permission, subject)]
             }
-            _ => vec![Check::new(permission, "*")],
+            _ => match self.mcp_subject(tool) {
+                Some(subject) => vec![
+                    Check::new(MCP_PERMISSION, subject),
+                    Check::new(permission, "*"),
+                ],
+                None => vec![Check::new(permission, "*")],
+            },
         })
     }
 

@@ -598,6 +598,9 @@ struct Attached {
 /// What a session gets from the hub now: its `mcp__*` tools and the servers' instruction blocks.
 pub struct SessionView {
     pub tools: Vec<HarnessTool>,
+    /// Each tool's model-facing name and its `mcp` policy subject `<server>/<tool>` (#2240), for
+    /// [`ToolPolicy::learn_mcp_subjects`] before the tools are filtered.
+    pub subjects: Vec<(String, String)>,
     /// `<mcp_server_instructions server="name">…</mcp_server_instructions>`, one per server.
     pub instructions: Vec<String>,
     /// Identifies this view (tool names and instructions), to skip no-op updates.
@@ -1353,6 +1356,7 @@ fn session_view(
         .join(file_component(output_key));
     let mut names = ToolNames::new();
     let mut tools = Vec::new();
+    let mut subjects = Vec::new();
     let mut instructions = Vec::new();
     let mut signature = String::new();
     for cell in cells {
@@ -1381,6 +1385,7 @@ fn session_view(
             };
             signature.push_str(&name);
             signature.push('\n');
+            subjects.push((name.clone(), format!("{}/{}", cell.server.name, def.name)));
             tools.push(
                 ExternalTool::new(
                     def,
@@ -1400,6 +1405,7 @@ fn session_view(
     }
     SessionView {
         tools,
+        subjects,
         instructions,
         signature,
     }
@@ -1420,28 +1426,31 @@ async fn reconcile(inner: &Arc<Inner>) {
         if *a.applied.lock().unwrap_or_else(|e| e.into_inner()) == view.signature {
             continue;
         }
-        if let Err(e) = apply_view(&harness, &a.policy, view.tools, &view.instructions).await {
+        let signature = view.signature.clone();
+        if let Err(e) = apply_view(&harness, &a.policy, view).await {
             tracing::warn!("MCP: could not update a session: {e}");
             continue;
         }
-        *a.applied.lock().unwrap_or_else(|e| e.into_inner()) = view.signature;
+        *a.applied.lock().unwrap_or_else(|e| e.into_inner()) = signature;
     }
 }
 
-/// Replaces `harness`'s `mcp__*` tools with `tools` (after `policy`) and its instruction blocks
-/// with `instructions`. Everything else is kept. Effective from the next run.
+/// Replaces `harness`'s `mcp__*` tools with the view's (after `policy`, which learns their `mcp`
+/// subjects first) and its instruction blocks with the view's. Everything else is kept. Effective
+/// from the next run.
 async fn apply_view(
     harness: &AgentHarness,
     policy: &ToolPolicy,
-    tools: Vec<HarnessTool>,
-    instructions: &[String],
+    view: SessionView,
 ) -> Result<(), String> {
+    policy.learn_mcp_subjects(view.subjects.iter().map(|(n, s)| (n.as_str(), s.as_str())));
+    let instructions = &view.instructions;
     let current = harness.get_tools().await.map_err(|e| e.to_string())?;
     let mut next: Vec<HarnessTool> = current
         .into_iter()
         .filter(|t| !t.tool.schema().name.starts_with(TOOL_PREFIX))
         .collect();
-    next.extend(crate::agent::filter_harness_tools(policy, tools));
+    next.extend(crate::agent::filter_harness_tools(policy, view.tools));
     let names: Vec<String> = next.iter().map(|t| t.tool.schema().name.clone()).collect();
     harness
         .set_tools(next, Some(names))
