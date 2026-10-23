@@ -218,12 +218,14 @@ func (t *Task) ApprovalOwner() *int {
 
 // DropsApprovalOn reports whether giving t to newOwner (nil: releasing it)
 // drops its plan approval, when the person making the change isn't a
-// project lead or above (byLead false). An approval is for one person
+// project lead or above acting in the AMP web UI (byLead false; a lead
+// over MCP or an API token counts as not a lead here, AMP #2223). An approval is for one person
 // (ApprovedFor): it survives only while the ticket is that person's again
 // afterwards, so a Member can't approve someone's ticket by claiming it,
 // approving it as their own and handing it back, nor hand their approved
 // ticket to someone who never approved it (AMP #2218). A lead's
-// reassignment keeps it: a lead may approve on anyone's behalf anyway.
+// reassignment in the web UI keeps it: a lead may approve on anyone's
+// behalf there anyway.
 func (t *Task) DropsApprovalOn(newOwner *int, byLead bool) bool {
 	if t.ApprovedAt == nil || byLead {
 		return false

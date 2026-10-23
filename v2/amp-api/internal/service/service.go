@@ -260,7 +260,7 @@ func (s *Service) AssignTask(ctx context.Context, p authz.Principal, taskID int,
 		}
 	}
 
-	return s.setOwner(ctx, p, t, newOwner, requireIdle, lvl >= authz.Lead)
+	return s.setOwner(ctx, p, t, newOwner, requireIdle, leadInUI(p, lvl))
 }
 
 // openReassign retries a reassignment the strict rules refused (refusal)
@@ -302,11 +302,21 @@ func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) 
 		// Even global admins, who pass every check, don't claim taken work.
 		return nil, authz.Forbidden("task %d is owned by user %d; claiming only takes unassigned tickets, use assign to reassign it", t.ID, *t.OwnerUserID)
 	}
-	return s.setOwner(ctx, p, t, p.UserRef(), false, lvl >= authz.Lead)
+	return s.setOwner(ctx, p, t, p.UserRef(), false, leadInUI(p, lvl))
+}
+
+// leadInUI reports whether an ownership change by p (at level lvl) keeps
+// the ticket's plan approval: p is a project lead or above acting in the
+// AMP web UI. Off the UI (MCP, an API token, an agent) a lead's change is
+// treated like a Member's, because approving on someone's behalf is
+// UI-only (ApproveTickets) and an agent under a lead's login must not move
+// approved work to someone who never approved it (AMP #2223).
+func leadInUI(p authz.Principal, lvl authz.Level) bool {
+	return lvl >= authz.Lead && p.InUI()
 }
 
 // setOwner changes t's owner through its task actor. byLead (the caller is
-// a project lead or above) keeps the ticket's plan approval; anyone else's
+// a project lead or above, in the web UI: leadInUI) keeps the ticket's plan approval; anyone else's
 // change drops it when the ticket stops being the person it was approved
 // for (AMP #2218; see domain.Task.DropsApprovalOn). Handover goes through
 // AssignTask, so the same rule applies to it.

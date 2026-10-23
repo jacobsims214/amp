@@ -595,6 +595,7 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		return &t, nil // no-op (e.g. claiming a ticket you already own)
 	}
 	drop := a.task.DropsApprovalOn(msg.NewOwner, msg.ByLead)
+	wasApproved := a.task.Approved()
 	if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.NewOwner, drop); err != nil {
 		return nil, fmt.Errorf("db set owner: %w", err)
 	}
@@ -626,10 +627,12 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		action = "unassigned"
 	}
 	a.logActivityBy(msg.ByName, msg.By, action, "", "", detail)
-	if drop {
+	if drop && wasApproved {
+		// Only a live approval is worth telling anyone about: one already
+		// stale (the ticket was replanned since) is cleared silently.
 		next := a.task.ApprovalOwner()
 		a.logActivityBy(msg.ByName, msg.By, "approval_dropped", "", "", fmt.Sprintf(
-			"Plan approval dropped: it was approved for %s, and the ticket is now %s's (owner changed by %s, who isn't a project lead). "+
+			"Plan approval dropped: it was approved for %s, and the ticket is now %s's (owner changed by %s, not by a project lead in the AMP web UI). "+
 				"%s approves it again in the AMP web UI, or a project lead on their behalf",
 			ownerString(approvedFor), ownerString(next), nameOr(msg.ByName, ownerString(msg.By)), ownerString(next)))
 	}
