@@ -89,9 +89,12 @@ async fn eighty_by_twenty_four_leaves_at_least_fifteen_transcript_rows() {
     let footer = &lines[23];
     assert!(footer.contains("• manager · #2085"), "{footer}");
     assert!(footer.contains("ctx "), "{footer}");
-    // Inside the padding (#2251) the long test cwd leaves no room for the thinking level, the
-    // first piece to go.
-    assert!(footer.ends_with("faux-1"), "{footer}");
+    // Inside the padding (#2251), how much fits depends on the checkout's branch name: with a
+    // long one the thinking level, the first piece to go, is dropped.
+    assert!(
+        footer.ends_with("faux-1 • thinking off") || footer.ends_with("faux-1"),
+        "{footer}"
+    );
     // pi's unlabelled counters are gone (they are in /usage).
     for gone in ["↑", "↓", "(auto)", "%/"] {
         assert!(!footer.contains(gone), "{gone} in {footer}");
