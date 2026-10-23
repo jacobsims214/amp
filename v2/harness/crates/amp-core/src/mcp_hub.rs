@@ -52,6 +52,15 @@
 //! tools (a running worker keeps its snapshot) and stops once none does. Unchanged servers that
 //! were stopped or needed a login are tried again.
 //!
+//! # Trust (#2241)
+//!
+//! A server from a repo's `.amp/harness/config.toml` runs only once trusted
+//! ([`crate::mcp_trust`]): [`McpHub::new`] reads the trust store named in
+//! [`HubOptions::trust_store`] and every enabled repo server that is not trusted at its current
+//! fingerprint (nor covered by [`HubOptions::trust_all`]) is [`ServerStatus::Untrusted`]: never
+//! spawned or connected, no worktree instances, no tools. [`McpHub::trust`] lets one start (the
+//! chat calls it after asking; recording it in the store is the caller's job).
+//!
 //! # Health
 //!
 //! [`McpHub::health`] (one [`ServerHealth`] per server, including disabled and broken ones),
@@ -160,6 +169,11 @@ pub struct HubOptions {
     /// `[tools] mcp_max_output_tokens` / [`ENV_MAX_OUTPUT_TOKENS`]: the cap for servers that keep
     /// the default `max_output_tokens`.
     pub default_max_output_tokens: Option<u64>,
+    /// The repo-server trust store (`<state>/trust.toml`, #2241). `None`: no store, so no repo
+    /// server is trusted unless `trust_all`.
+    pub trust_store: Option<PathBuf>,
+    /// `--trust-repo-mcp` / `AMP_HARNESS_TRUST_REPO_MCP`: every repo server may start.
+    pub trust_all: bool,
 }
 
 impl HubOptions {
@@ -169,12 +183,14 @@ impl HubOptions {
             .is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"));
         Self {
             paths,
-            state_dir,
             default_cwd,
             keychain: (!file_store).then(amp_mcp::keychain_service),
             backoff: Backoff::default(),
             poll: Duration::from_millis(500),
             default_max_output_tokens: None,
+            trust_store: Some(crate::mcp_trust::TrustStore::path_in(&state_dir)),
+            trust_all: crate::mcp_trust::trust_all_from(&|k| std::env::var(k).ok()),
+            state_dir,
         }
     }
 }
@@ -205,6 +221,11 @@ pub enum ServerStatus {
     },
     /// `enabled = false`.
     Disabled,
+    /// A repo server the person has not trusted (or whose config changed since): never started
+    /// (#2241). `reason` says how to trust it.
+    Untrusted {
+        reason: String,
+    },
 }
 
 impl ServerStatus {
@@ -218,6 +239,7 @@ impl ServerStatus {
             Self::Stopped { .. } => "stopped",
             Self::NeedsLogin { .. } => "needs-login",
             Self::Disabled => "disabled",
+            Self::Untrusted { .. } => "untrusted",
         }
     }
 
@@ -225,7 +247,7 @@ impl ServerStatus {
     pub fn level(&self) -> HealthLevel {
         match self {
             Self::Ready | Self::Idle | Self::Disabled => HealthLevel::Ok,
-            Self::Starting | Self::Failed { .. } => HealthLevel::Degraded,
+            Self::Starting | Self::Failed { .. } | Self::Untrusted { .. } => HealthLevel::Degraded,
             Self::Stopped { .. } | Self::NeedsLogin { .. } => HealthLevel::Down,
         }
     }
@@ -234,7 +256,8 @@ impl ServerStatus {
         match self {
             Self::Failed { reason, .. }
             | Self::Stopped { reason }
-            | Self::NeedsLogin { reason } => Some(reason),
+            | Self::NeedsLogin { reason }
+            | Self::Untrusted { reason } => Some(reason),
             _ => None,
         }
     }
@@ -259,6 +282,7 @@ impl std::fmt::Display for ServerStatus {
             ),
             Self::Stopped { reason } => write!(f, "stopped: {reason}"),
             Self::NeedsLogin { reason } => write!(f, "needs login: {reason}"),
+            Self::Untrusted { reason } => write!(f, "not started, not trusted: {reason}"),
             other => f.write_str(other.word()),
         }
     }
@@ -396,6 +420,9 @@ pub struct McpReload {
     pub retried: Vec<String>,
     /// The configuration's errors now (`mcp.x.url: ...`); those servers are left out.
     pub problems: Vec<String>,
+    /// Repo servers that may not start until trusted (#2241): `amp-harness mcp trust <name>`,
+    /// then reload.
+    pub untrusted: Vec<String>,
 }
 
 impl McpReload {
@@ -414,6 +441,7 @@ impl McpReload {
                 .collect(),
             retried: Vec::new(),
             problems: new.errors().map(|p| p.to_string()).collect(),
+            untrusted: Vec::new(),
         }
     }
 
@@ -424,6 +452,7 @@ impl McpReload {
             && self.changed.is_empty()
             && self.retried.is_empty()
             && self.problems.is_empty()
+            && self.untrusted.is_empty()
     }
 }
 
@@ -631,6 +660,8 @@ struct Inner {
     cancel: CancellationToken,
     tasks: Mutex<Vec<JoinHandle<()>>>,
     started: AtomicBool,
+    /// Repo servers that may not start (#2241), by name, until [`McpHub::trust`].
+    untrusted: Mutex<BTreeMap<String, crate::mcp_trust::Untrusted>>,
 }
 
 /// The worktree instances of one worker (one per `scope = "worktree"` server).
@@ -674,6 +705,9 @@ struct Attached {
 /// What a session gets from the hub now: its `mcp__*` tools and the servers' instruction blocks.
 pub struct SessionView {
     pub tools: Vec<HarnessTool>,
+    /// Each tool's model-facing name and its `mcp` policy subject `<server>/<tool>` (#2240), for
+    /// [`ToolPolicy::learn_mcp_subjects`] before the tools are filtered.
+    pub subjects: Vec<(String, String)>,
     /// `<mcp_server_instructions server="name">…</mcp_server_instructions>`, one per server.
     pub instructions: Vec<String>,
     /// Identifies this view (tool names and instructions), to skip no-op updates.
@@ -699,8 +733,15 @@ impl McpHub {
     /// A hub for `config`'s enabled servers. Nothing runs until [`Self::start`].
     pub fn new(config: McpConfig, opts: HubOptions) -> Self {
         let cancel = CancellationToken::new();
+        let untrusted = untrusted_in(&config, &opts);
         let shared = shared_servers(&config)
-            .map(|s| (s.name.clone(), Arc::new(Cell::shared(s.clone(), &cancel))))
+            .map(|s| {
+                let cell = Cell::shared(s.clone(), &cancel);
+                if let Some(u) = untrusted.get(&s.name) {
+                    cell.lock().status = ServerStatus::Untrusted { reason: u.reason() };
+                }
+                (s.name.clone(), Arc::new(cell))
+            })
             .collect();
         let (rev, _) = watch::channel(0);
         let (events, _) = broadcast::channel(64);
@@ -720,8 +761,46 @@ impl McpHub {
                 cancel,
                 tasks: Mutex::new(Vec::new()),
                 started: AtomicBool::new(false),
+                untrusted: Mutex::new(untrusted),
             }),
         }
+    }
+
+    /// The enabled repo servers that may not start yet (#2241), for the chat's question and
+    /// warnings.
+    pub fn untrusted(&self) -> Vec<crate::mcp_trust::Untrusted> {
+        self.inner.untrusted_map().values().cloned().collect()
+    }
+
+    /// Lets the repo server `name` start (the person trusted it): it starts now if the hub is
+    /// started and it is not lazy, and worktree instances include it from now on. Recording the
+    /// decision in the trust store is the caller's job. A server that was not untrusted is fine.
+    pub fn trust(&self, name: &str) -> Result<(), String> {
+        let was = self
+            .inner
+            .untrusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        if was.is_none() {
+            return match self.inner.config().servers.get(name) {
+                Some(_) => Ok(()),
+                None => Err(self.unknown(name)),
+            };
+        }
+        if let Some(cell) = self.inner.shared_cell(name) {
+            let lazy = cell.server.startup == Startup::Lazy;
+            cell.lock().status = if lazy {
+                ServerStatus::Idle
+            } else {
+                ServerStatus::Starting
+            };
+            if self.inner.started.load(Ordering::Acquire) && !lazy {
+                self.spawn_cell(&cell, cell.stop.clone(), None);
+            }
+        }
+        self.inner.bump();
+        Ok(())
     }
 
     /// The configuration in effect (problems included): the one it was built from, or the last
@@ -747,8 +826,9 @@ impl McpHub {
         if self.inner.started.swap(true, Ordering::AcqRel) {
             return;
         }
+        let untrusted = self.inner.untrusted_map();
         for cell in self.inner.shared_cells() {
-            if cell.server.startup != Startup::Lazy {
+            if cell.server.startup != Startup::Lazy && !untrusted.contains_key(&cell.server.name) {
                 self.spawn_cell(&cell, cell.stop.clone(), None);
             }
         }
@@ -803,6 +883,12 @@ impl McpHub {
             .inner
             .shared_cell(name)
             .ok_or_else(|| self.unknown(name))?;
+        if let Some(u) = self.inner.untrusted_map().get(name) {
+            return Err(format!(
+                "MCP server `{name}` is not trusted: {}",
+                u.reason()
+            ));
+        }
         self.wake_or_spawn(&cell);
         Ok(())
     }
@@ -854,10 +940,11 @@ impl McpHub {
             if listed {
                 continue;
             }
-            let status = if server.enabled {
-                ServerStatus::Idle
-            } else {
-                ServerStatus::Disabled
+            let untrusted = self.inner.untrusted_map();
+            let status = match untrusted.get(&server.name) {
+                Some(u) if server.enabled => ServerStatus::Untrusted { reason: u.reason() },
+                _ if server.enabled => ServerStatus::Idle,
+                _ => ServerStatus::Disabled,
             };
             out.push(idle_health(server, status));
         }
@@ -894,7 +981,10 @@ impl McpHub {
         let mut worst = HealthLevel::Ok;
         for cell in self.inner.shared_cells() {
             let st = cell.lock();
-            if matches!(st.status, ServerStatus::Idle | ServerStatus::Disabled) {
+            if matches!(
+                st.status,
+                ServerStatus::Idle | ServerStatus::Disabled | ServerStatus::Untrusted { .. }
+            ) {
                 continue;
             }
             s.total += 1;
@@ -922,11 +1012,13 @@ impl McpHub {
     /// `None` when no such server is configured. The supervisor releases them with
     /// [`Self::release_worktree`].
     pub async fn start_worktree(&self, key: &str, worktree: &Path) -> Option<Arc<WorktreeSet>> {
+        // #2241: an untrusted repo server gets no instance (workers never ask).
+        let untrusted = self.inner.untrusted_map();
         let servers: Vec<McpServer> = self
             .inner
             .config()
             .enabled()
-            .filter(|s| s.scope == Scope::Worktree)
+            .filter(|s| s.scope == Scope::Worktree && !untrusted.contains_key(&s.name))
             .cloned()
             .collect();
         if servers.is_empty() {
@@ -1045,6 +1137,9 @@ impl McpHub {
     /// configuration.
     pub async fn reload(&self, config: McpConfig) -> McpReload {
         let mut report = McpReload::diff(&self.inner.config(), &config);
+        // #2241: trust as the store has it now (`mcp trust` in another terminal counts too).
+        let untrusted = untrusted_in(&config, &self.inner.opts);
+        let was_untrusted = self.inner.untrusted_map();
         let mut start = Vec::new();
         let mut retry = Vec::new();
         let mut retire = Vec::new();
@@ -1062,7 +1157,8 @@ impl McpHub {
                 retire.extend(shared.remove(&name));
             }
             for (name, server) in wanted {
-                let same = shared.get(&name).map(|c| c.server == server);
+                let trust_same = untrusted.contains_key(&name) == was_untrusted.contains_key(&name);
+                let same = shared.get(&name).map(|c| c.server == server && trust_same);
                 if same == Some(true) {
                     let cell = Arc::clone(&shared[&name]);
                     let status = cell.lock().status.clone();
@@ -1074,15 +1170,36 @@ impl McpHub {
                     }
                     continue;
                 }
-                let cell = Arc::new(Cell::shared(server, &self.inner.cancel));
+                let cell = Cell::shared(server, &self.inner.cancel);
+                if let Some(u) = untrusted.get(&name) {
+                    cell.lock().status = ServerStatus::Untrusted { reason: u.reason() };
+                }
+                let cell = Arc::new(cell);
                 retire.extend(shared.insert(name, Arc::clone(&cell)));
                 start.push(cell);
             }
         }
         *self.inner.config.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+        // Named only when that is news: new to the config, changed, or no longer trusted.
+        report.untrusted = untrusted
+            .keys()
+            .filter(|n| {
+                report.added.contains(n)
+                    || report.changed.contains(n)
+                    || !was_untrusted.contains_key(*n)
+            })
+            .cloned()
+            .collect();
+        *self
+            .inner
+            .untrusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = untrusted.clone();
         if self.inner.started.load(Ordering::Acquire) {
             for cell in &start {
-                if cell.server.startup != Startup::Lazy {
+                if cell.server.startup != Startup::Lazy
+                    && !untrusted.contains_key(&cell.server.name)
+                {
                     self.spawn_cell(cell, cell.stop.clone(), None);
                 }
             }
@@ -1317,6 +1434,27 @@ async fn wait_first_attempts(inner: &Arc<Inner>, cells: &[Arc<Cell>]) -> Vec<Str
     }
 }
 
+/// The enabled repo servers `opts` does not let start (#2241). An unreadable trust store trusts
+/// nothing (logged).
+fn untrusted_in(
+    config: &McpConfig,
+    opts: &HubOptions,
+) -> BTreeMap<String, crate::mcp_trust::Untrusted> {
+    use crate::mcp_trust::{TrustStore, untrusted};
+    if !config.enabled().any(McpServer::is_repo) {
+        return BTreeMap::new();
+    }
+    let store = match opts.trust_store.as_deref().map(TrustStore::load) {
+        Some(Ok(s)) => Some(s),
+        Some(Err(e)) => {
+            tracing::warn!("MCP trust store: {e}");
+            None
+        }
+        None => None,
+    };
+    untrusted(config, store.as_ref(), opts.trust_all)
+}
+
 impl Inner {
     fn config(&self) -> Arc<McpConfig> {
         Arc::clone(&self.config.lock().unwrap_or_else(|e| e.into_inner()))
@@ -1346,6 +1484,13 @@ impl Inner {
             .keys()
             .cloned()
             .collect()
+    }
+
+    fn untrusted_map(&self) -> BTreeMap<String, crate::mcp_trust::Untrusted> {
+        self.untrusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn bump(&self) {
@@ -1654,6 +1799,7 @@ fn session_view(
         .join(file_component(output_key));
     let mut names = ToolNames::new();
     let mut tools = Vec::new();
+    let mut subjects = Vec::new();
     let mut instructions = Vec::new();
     let mut signature = String::new();
     for cell in cells {
@@ -1682,6 +1828,7 @@ fn session_view(
             };
             signature.push_str(&name);
             signature.push('\n');
+            subjects.push((name.clone(), format!("{}/{}", cell.server.name, def.name)));
             tools.push(
                 ExternalTool::new(
                     def,
@@ -1701,6 +1848,7 @@ fn session_view(
     }
     SessionView {
         tools,
+        subjects,
         instructions,
         signature,
     }
@@ -1721,28 +1869,31 @@ async fn reconcile(inner: &Arc<Inner>) {
         if *a.applied.lock().unwrap_or_else(|e| e.into_inner()) == view.signature {
             continue;
         }
-        if let Err(e) = apply_view(&harness, &a.policy, view.tools, &view.instructions).await {
+        let signature = view.signature.clone();
+        if let Err(e) = apply_view(&harness, &a.policy, view).await {
             tracing::warn!("MCP: could not update a session: {e}");
             continue;
         }
-        *a.applied.lock().unwrap_or_else(|e| e.into_inner()) = view.signature;
+        *a.applied.lock().unwrap_or_else(|e| e.into_inner()) = signature;
     }
 }
 
-/// Replaces `harness`'s `mcp__*` tools with `tools` (after `policy`) and its instruction blocks
-/// with `instructions`. Everything else is kept. Effective from the next run.
+/// Replaces `harness`'s `mcp__*` tools with the view's (after `policy`, which learns their `mcp`
+/// subjects first) and its instruction blocks with the view's. Everything else is kept. Effective
+/// from the next run.
 async fn apply_view(
     harness: &AgentHarness,
     policy: &ToolPolicy,
-    tools: Vec<HarnessTool>,
-    instructions: &[String],
+    view: SessionView,
 ) -> Result<(), String> {
+    policy.learn_mcp_subjects(view.subjects.iter().map(|(n, s)| (n.as_str(), s.as_str())));
+    let instructions = &view.instructions;
     let current = harness.get_tools().await.map_err(|e| e.to_string())?;
     let mut next: Vec<HarnessTool> = current
         .into_iter()
         .filter(|t| !t.tool.schema().name.starts_with(TOOL_PREFIX))
         .collect();
-    next.extend(crate::agent::filter_harness_tools(policy, tools));
+    next.extend(crate::agent::filter_harness_tools(policy, view.tools));
     let names: Vec<String> = next.iter().map(|t| t.tool.schema().name.clone()).collect();
     harness
         .set_tools(next, Some(names))

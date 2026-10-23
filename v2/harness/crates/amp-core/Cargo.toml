@@ -34,6 +34,8 @@ tokio-util.workspace = true
 # #2277: the provider HTTP client (CA file, mTLS, proxy) and the token endpoint calls.
 rpi-reqwest.workspace = true
 toml.workspace = true
+# #2241: repo MCP server trust is recorded against a sha256 of the server's table.
+sha2.workspace = true
 # #2250: the per-request clock stamp (request_time).
 chrono.workspace = true
 iana-time-zone.workspace = true

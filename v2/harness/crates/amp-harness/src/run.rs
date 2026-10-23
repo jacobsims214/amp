@@ -253,6 +253,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         // Headless: no AMP, no run (the message says why and what to do).
         allow_offline: false,
         wait_mcp: true,
+        // #2241: headless never asks; untrusted repo MCP servers are skipped with a warning.
+        ask_trust: false,
     })
     .await?;
     mcp_warnings(&rt, &mcp_starting);

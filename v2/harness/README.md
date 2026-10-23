@@ -281,6 +281,16 @@ your AMP server, keys, bash environment or workers. Repo `[roles]` merge over th
 and the repo's `[models] profile` beats the user's (`AMP_HARNESS_PROFILE` beats both).
 `config show` prints the repo file it merged and, per role, the layer that set it (`repo <path>`).
 
+A repo's `[mcp.*]` servers start only once you trust them, because they can run commands or
+receive what the agents send. The chat asks for each one before it starts its MCP servers (`y`,
+`a` for all of them, Enter for not now). `amp-harness mcp trust` lists the servers and their trust,
+`mcp trust <name>…|--all` trusts them, and `mcp untrust <name>…|--all` forgets them. Trust is
+recorded in `~/.local/state/amp-harness/trust.toml` (outside the repo), keyed by repo path, server
+name and a sha256 of the server's table and its `env_file`. If any of those change, you are asked
+again. Headless runs (`run -p` and every worker) never ask: they skip untrusted servers with a
+warning. `--trust-repo-mcp` or `AMP_HARNESS_TRUST_REPO_MCP=1` lets them all start for that process
+(CI), and that is never recorded. Servers in your own config.toml are always trusted.
+
 ```toml
 # <repo>/.amp/harness/config.toml
 [models]

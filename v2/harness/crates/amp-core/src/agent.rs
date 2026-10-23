@@ -749,11 +749,18 @@ impl Runtime {
             .output_key
             .clone()
             .unwrap_or_else(|| format!("{}-{}", role.id, now_ms()));
-        let mcp_view = self
+        let mut mcp_view = self
             .mcp_hub
             .session_view(&role.id, mcp_worktree.as_ref(), &output_key);
-        tools.extend(mcp_view.tools);
+        tools.extend(std::mem::take(&mut mcp_view.tools));
         let policy = Arc::new(role.tool_policy(&cwd));
+        // #2240: the `mcp` permission judges each external tool by `<server>/<tool>`.
+        policy.learn_mcp_subjects(
+            mcp_view
+                .subjects
+                .iter()
+                .map(|(n, s)| (n.as_str(), s.as_str())),
+        );
         let tools = filter_harness_tools(&policy, tools);
         let tool_names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
 
@@ -1129,6 +1136,11 @@ impl Reloaded {
         }
         if !self.mcp.retried.is_empty() {
             out.push(format!("mcp: retrying {}", self.mcp.retried.join(", ")));
+        }
+        for name in &self.mcp.untrusted {
+            out.push(format!(
+                "mcp: {name} is not trusted yet (`amp-harness mcp trust {name}`, then /reload)"
+            ));
         }
         for p in &self.mcp.problems {
             out.push(format!("mcp problem: {p}"));

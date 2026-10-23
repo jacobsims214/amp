@@ -206,6 +206,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         allow_offline: true,
         // #2239: only eager MCP servers hold the chat up; the rest join as they connect.
         wait_mcp: false,
+        // #2241: ask about untrusted repo MCP servers (in the terminal, before the TUI opens).
+        ask_trust: true,
     })
     .await?;
     let settings = args.conn.settings()?;
@@ -260,6 +262,14 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             Arc::clone(&switcher),
             shell.notifier(),
             Arc::clone(&connected),
+        ));
+    }
+    // #2241: repo MCP servers left untrusted say so (and how to trust them) in the transcript.
+    for u in session.rt.mcp_hub.untrusted() {
+        shell.view().add_warning(&format!(
+            "MCP server `{}` not started: {}",
+            u.name,
+            u.reason()
         ));
     }
     let mut events = session.events;
