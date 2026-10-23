@@ -856,7 +856,12 @@ impl Supervisor {
                     ..
                 } => Finish {
                     outcome: WorkerOutcome::Error,
-                    error: Some(format!("{}: {}", error.code, error.message)),
+                    // One line, no response body (#2207): the manager reads this as a tool result.
+                    error: Some(crate::provider_error::run_failure(
+                        &error.code,
+                        &error.message,
+                        final_message.as_ref().map_or("", |m| m.provider.as_str()),
+                    )),
                     text: final_message
                         .as_ref()
                         .map(assistant_text)

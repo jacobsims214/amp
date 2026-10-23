@@ -444,6 +444,10 @@ impl StreamScrubber {
                 vec![E::Done { reason, message }]
             }
             E::Error { reason, mut error } => {
+                // #2207: the provider's body goes to the session log without the account id.
+                if let Some(message) = error.error_message.as_mut() {
+                    *message = crate::provider_error::redact(message);
+                }
                 if self.text {
                     scrub_message(&mut error, &self.tools, false);
                 } else {

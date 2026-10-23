@@ -30,6 +30,8 @@ unicode-width = "=0.1.14"
 nix = { version = "0.29", default-features = false, features = ["poll", "term"] }
 
 [dev-dependencies]
+# tests/provider_error.rs: a provider that refuses every request (#2207).
+async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
