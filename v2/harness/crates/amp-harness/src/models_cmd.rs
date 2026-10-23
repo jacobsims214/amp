@@ -407,6 +407,7 @@ async fn role_report(
             thinking: None,
             requested_thinking: None,
             source: None,
+            fallback: None,
             ready: false,
             live: None,
             error: config.resolve_role(role).err().map(|e| e.0),
@@ -773,7 +774,13 @@ async fn list(args: ListArgs) -> Result<(), CliError> {
     let config = current(&paths)?;
     let keys = SystemKeys::from_env();
     if !args.available {
-        let report = config_cmd::build_report(&config, &keys, args.check).await;
+        let report = config_cmd::build_report_with(
+            &config,
+            &keys,
+            args.check,
+            &config_cmd::agent_hints(&paths),
+        )
+        .await;
         if args.json {
             print_json(&report)?;
         } else {

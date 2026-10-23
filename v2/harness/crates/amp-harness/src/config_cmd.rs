@@ -14,9 +14,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
+    assets::{Assets, OverrideDirs},
     config_check::{self, Layer, Problem, Severity},
-    models::{ModelsConfig, Selection, thinking_name},
+    models::{ModelHints, ModelsConfig, Selection, thinking_name},
     providers::{KeyLookup, SystemKeys, live_model_ids, resolve_key},
+    roles::RoleRegistry,
 };
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -110,6 +112,9 @@ pub struct RoleReport {
     /// The level the config asked for, when it differs or was unset.
     pub requested_thinking: Option<&'static str>,
     pub source: Option<String>,
+    /// How a role with no `[roles.<id>]` of its own got its model (#2246): `fallback
+    /// worker-backend`, `[models] fallback`, `based_on <role>` or `agent file model`.
+    pub fallback: Option<String>,
     /// The provider has a key (or needs none).
     pub ready: bool,
     /// `--check`: `true` listed, `false` missing, `null` not checked.
@@ -125,7 +130,7 @@ pub async fn run(command: ConfigCommand) -> Result<(), CliError> {
 }
 
 /// Checks only the harness binary can run (they need crates amp-core doesn't depend on).
-const HARNESS_CHECKERS: &[(&str, config_check::Checker)] = &[("tui", check_tui)];
+pub(crate) const HARNESS_CHECKERS: &[(&str, config_check::Checker)] = &[("tui", check_tui)];
 
 /// `[tui]` as the chat reads it.
 fn check_tui(inputs: &config_check::Inputs) -> Vec<Problem> {
@@ -269,7 +274,7 @@ async fn show(args: ShowArgs) -> Result<(), CliError> {
     let config = ModelsConfig::load_paths(&|k| std::env::var(k).ok(), &paths)
         .map_err(|e| CliError::new(e.to_string()))?;
     let keys = SystemKeys::from_env();
-    let report = build_report(&config, &keys, args.check).await;
+    let report = build_report_with(&config, &keys, args.check, &agent_hints(&paths)).await;
     if args.json {
         print_json(&report)?;
     } else {
@@ -282,8 +287,40 @@ async fn show(args: ShowArgs) -> Result<(), CliError> {
     }
 }
 
+/// Every agent's model role and fallback hints, from the agent files `paths` names (none when
+/// they do not load: `agents validate` reports that).
+pub fn agent_hints(paths: &amp_mcp::ConfigPaths) -> Vec<(String, ModelHints)> {
+    let Ok(assets) = Assets::load(&OverrideDirs::from_paths(paths)) else {
+        return Vec::new();
+    };
+    RoleRegistry::from_assets(&assets)
+        .map(|roles| {
+            roles
+                .roles()
+                .map(|r| (r.model_role.clone(), r.model_hints()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The configured roles only. Use [`build_report_with`] to add the agents with no model of
+/// their own.
 pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bool) -> Report {
-    let in_use = config.providers_in_use();
+    build_report_with(config, keys, check, &[]).await
+}
+
+/// The configured roles plus every agent in `agents` that falls back (#2246).
+pub async fn build_report_with(
+    config: &ModelsConfig,
+    keys: &dyn KeyLookup,
+    check: bool,
+    agents: &[(String, ModelHints)],
+) -> Report {
+    let resolved = config.resolve_agents(agents);
+    let in_use: BTreeSet<String> = resolved
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok().map(|r| r.provider.clone()))
+        .collect();
     let mut live: BTreeMap<String, Result<BTreeSet<String>, String>> = BTreeMap::new();
     if check {
         for id in &in_use {
@@ -323,8 +360,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
         .collect();
 
     let mut ok = true;
-    let roles = config
-        .resolve_all()
+    let roles = resolved
         .into_iter()
         .map(|(role, resolved)| match resolved {
             Ok(r) => {
@@ -347,6 +383,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
                     thinking: Some(thinking_name(r.thinking)),
                     requested_thinking: requested,
                     source: Some(r.source.clone()),
+                    fallback: r.fell_back(),
                     live,
                     error: None,
                     role,
@@ -361,6 +398,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
                     thinking: None,
                     requested_thinking: None,
                     source: None,
+                    fallback: None,
                     ready: false,
                     live: None,
                     error: Some(e.to_string()),

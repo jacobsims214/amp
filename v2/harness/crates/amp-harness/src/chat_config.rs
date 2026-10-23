@@ -838,6 +838,9 @@ impl Inner {
                     cells.push(Cell::new(thinking_name(r.thinking), Tone::Muted).pad(8));
                     let source = if overrides.contains_key(normalize_role(&role.id)) {
                         Cell::new("this chat only", Tone::Accent)
+                    } else if let Some(how) = r.fell_back() {
+                        // #2246: no model of its own; say which fallback it runs on.
+                        Cell::new(fallback_label(&how), Tone::Warning)
                     } else {
                         Cell::new(short_source(&r.source), Tone::Dim)
                     };
@@ -851,6 +854,28 @@ impl Inner {
             }
             rows.push(row);
         }
+        // #2246: what a role with no model of its own runs on.
+        let fallback = models.fallback_model();
+        rows.push(InfoRow::text(
+            match &fallback.resolved {
+                Ok(r) => format!(
+                    "fallback: {} ({}) for roles with no model of their own",
+                    r.model_ref(),
+                    fallback_setting(&fallback)
+                ),
+                Err(e) => format!(
+                    "fallback: {} does not resolve ({}); set [models] fallback",
+                    fallback_setting(&fallback),
+                    e.0
+                ),
+            },
+            if fallback.resolved.is_ok() {
+                Tone::Muted
+            } else {
+                Tone::Warning
+            },
+            0,
+        ));
         rows.push(InfoRow::text(
             "● this chat's role · Enter picks a model (for this chat, or s to save it to \
              config.toml) · `amp-harness models set` in a terminal",
@@ -1008,7 +1033,15 @@ impl Inner {
     async fn config(&self) -> Result<ConfigReply, String> {
         let models = self.rt.current_models();
         let keys = SystemKeys::from_env();
-        let report = crate::config_cmd::build_report(&models, &keys, false).await;
+        // #2246: with every agent of the session's roster, so roles that fall back are listed.
+        let agents: Vec<_> = self
+            .rt
+            .catalog()
+            .roles
+            .roles()
+            .map(|r| (r.model_role.clone(), r.model_hints()))
+            .collect();
+        let report = crate::config_cmd::build_report_with(&models, &keys, false, &agents).await;
         let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
         let paths = &self.rt.paths;
         let user_text = paths
@@ -1734,6 +1767,34 @@ fn layer_dir(dir: &Option<PathBuf>, sub: &str) -> String {
     }
 }
 
+/// The "chosen by" cell of a role that fell back (#2246): `fallback: worker-backend's model`,
+/// `fallback: [models] fallback`, `based on reviewer` or `agent file model`. Short, so the model
+/// column keeps its width; the footer and /config name where the fallback was set.
+fn fallback_label(how: &str) -> String {
+    if let Some(role) = how.strip_prefix("fallback ") {
+        format!("fallback: {role}'s model")
+    } else if let Some(role) = how.strip_prefix("based_on ") {
+        format!("based on {role}")
+    } else if how == "[models] fallback" {
+        "fallback: [models] fallback".to_owned()
+    } else {
+        how.to_owned()
+    }
+}
+
+/// `worker-backend's model, default` / `[models] fallback, config.toml`.
+fn fallback_setting(f: &amp_core::models::FallbackModel) -> String {
+    if f.source.starts_with("inherit") {
+        return short_source(&f.source);
+    }
+    let what = if f.setting.contains('/') {
+        "[models] fallback".to_owned()
+    } else {
+        format!("{}'s model", f.setting)
+    };
+    format!("{what}, {}", short_source(&f.source))
+}
+
 /// `config /Users/x/.config/amp-harness/config.toml` -> `config config.toml`; the panels show
 /// the full paths under /config.
 fn short_source(source: &str) -> String {
@@ -1830,6 +1891,20 @@ mod tests {
         );
         assert_eq!(show_path("/elsewhere/x.md", Some(repo)), "/elsewhere/x.md");
         assert_eq!(show_path("/elsewhere/x.md", None), "/elsewhere/x.md");
+    }
+
+    #[test]
+    fn fallback_roles_say_which_fallback() {
+        assert_eq!(
+            fallback_label("fallback worker-backend"),
+            "fallback: worker-backend's model"
+        );
+        assert_eq!(fallback_label("based_on reviewer"), "based on reviewer");
+        assert_eq!(
+            fallback_label("[models] fallback"),
+            "fallback: [models] fallback"
+        );
+        assert_eq!(fallback_label("agent file model"), "agent file model");
     }
 
     #[test]

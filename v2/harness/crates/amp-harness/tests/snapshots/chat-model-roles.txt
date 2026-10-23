@@ -11,6 +11,7 @@
     worker-backend    wf/wf-1        off      inherit (config config.toml)
     worker-docs       wf/wf-1        off      inherit (config config.toml)
     worker-frontend   wf/wf-1        off      inherit (config config.toml)
+  fallback: wf/wf-1 (inherit (config config.toml)) for roles with no model of their own
   ● this chat's role · Enter picks a model (for this chat, or s to save it to config.toml) · `amp-harness
   models set` in a terminal
   ↑↓ select · Enter pick a model · Esc close

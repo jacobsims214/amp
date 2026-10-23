@@ -164,7 +164,8 @@ pub const CHECKERS: &[(&str, Checker)] = &[
     ("workers", check_workers),
     ("tools", check_tools),
     ("mcp", check_mcp),
-    // #2234 (H11): ("agents", ...), ("skills", ...),
+    ("skills", check_skills),
+    ("agents", check_agents),
 ];
 
 /// Top-level tables some part of the harness reads from the user file. Anything else is a warning
@@ -607,6 +608,115 @@ fn check_mcp(inputs: &Inputs) -> Vec<Problem> {
         .collect()
 }
 
+/// The layer an asset file belongs to, from its origin.
+fn asset_layer(origin: &crate::assets::Origin) -> (Layer, Option<PathBuf>) {
+    match origin {
+        crate::assets::Origin::Embedded => (Layer::Defaults, None),
+        crate::assets::Origin::User(p) => (Layer::User, Some(p.clone())),
+        crate::assets::Origin::Repo(p) => (Layer::Repo, Some(p.clone())),
+    }
+}
+
+/// The layer an asset loading error is in: the repo when it names a file under the repo's
+/// `.amp/harness`, else the user layer.
+fn error_layer(inputs: &Inputs, message: &str) -> Layer {
+    match &inputs.paths.repo_dir {
+        Some(repo) if message.contains(&*repo.to_string_lossy()) => Layer::Repo,
+        _ => Layer::User,
+    }
+}
+
+/// `skills`: every skill file loads (#2246). A preloaded skill that does not exist is the agents
+/// area's problem (the roster names the agent).
+fn check_skills(inputs: &Inputs) -> Vec<Problem> {
+    match crate::assets::Assets::load(&crate::assets::OverrideDirs::from_paths(inputs.paths)) {
+        Ok(_) => Vec::new(),
+        Err(e) => {
+            let message = clean(&e.to_string());
+            vec![
+                Problem::error("skills", error_layer(inputs, &message), message).fix(
+                    "fix or remove the file it names (`amp-harness skills validate` checks again)",
+                ),
+            ]
+        }
+    }
+}
+
+/// `agents`: the roster builds (frontmatter, permissions, preloaded skills) and every agent
+/// resolves to a model through D11's fallback chain (#2246).
+fn check_agents(inputs: &Inputs) -> Vec<Problem> {
+    // A file that does not load is reported by the skills area.
+    let Ok(assets) =
+        crate::assets::Assets::load(&crate::assets::OverrideDirs::from_paths(inputs.paths))
+    else {
+        return Vec::new();
+    };
+    let roles = match crate::roles::RoleRegistry::from_assets(&assets) {
+        Ok(roles) => roles,
+        Err(e) => {
+            let message = clean(&e.to_string());
+            return vec![
+                Problem::error("agents", error_layer(inputs, &message), message).fix(
+                    "fix the agent's frontmatter (`amp-harness agents validate` checks again)",
+                ),
+            ];
+        }
+    };
+    let mut out = Vec::new();
+    for role in roles.roles() {
+        let (layer, file) = assets
+            .agent(&role.id)
+            .map(|a| asset_layer(&a.origin))
+            .unwrap_or((Layer::Defaults, None));
+        if let Some(models) = &inputs.models
+            && let Err(e) = role.resolve_model(models)
+        {
+            out.push(
+                Problem::error("agents", layer, format!("agent {}: {}", role.id, e.0))
+                    .file(file.as_deref())
+                    .fix(format!(
+                        "`amp-harness models set {} <provider/model>`, or set [models] fallback \
+                         to a role or provider/model that resolves",
+                        normalize_role(&role.model_role)
+                    )),
+            );
+        }
+        if let Some(base) = &role.based_on
+            && roles.get(base).is_none()
+            && !inputs.models.as_ref().is_some_and(|m| m.has_role(base))
+        {
+            out.push(
+                Problem::warning(
+                    "agents",
+                    layer,
+                    format!(
+                        "agent {}: based_on {base:?} is not an agent or a configured role",
+                        role.id
+                    ),
+                )
+                .file(file.as_deref())
+                .key("based_on")
+                .fix("name an existing agent, or remove based_on to use [models] fallback"),
+            );
+        }
+        if role.dispatch && role.primary {
+            out.push(
+                Problem::warning(
+                    "agents",
+                    layer,
+                    format!(
+                        "agent {}: dispatch: true has no effect on a primary agent",
+                        role.id
+                    ),
+                )
+                .file(file.as_deref())
+                .key("dispatch"),
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -667,7 +777,9 @@ mod tests {
                 "roles",
                 "workers",
                 "tools",
-                "mcp"
+                "mcp",
+                "skills",
+                "agents"
             ]
         );
         let r = run(
@@ -677,6 +789,48 @@ mod tests {
         );
         assert!(r.ok && r.problems.is_empty(), "{:?}", r.problems);
         assert!(r.user_file_found && r.repo_file_found);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn agents_and_skills_are_checked() {
+        let d = dir("agents");
+        let agents = d.join("user/agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        // No [roles] and no usable fallback: the agent has no model.
+        std::fs::write(
+            agents.join("orphan.md"),
+            "---\ndescription: x\nmode: subagent\nbased_on: nobody\n---\n\nBody.\n",
+        )
+        .unwrap();
+        let r = run(&d, Some("[models]\nfallback = \"nobody\"\n"), None);
+        let found = find(&r, "agents");
+        assert!(
+            found
+                .iter()
+                .any(|p| p.severity == Severity::Error && p.message.starts_with("agent orphan:")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|p| p.severity == Severity::Warning && p.message.contains("based_on")),
+            "{found:?}"
+        );
+        assert_eq!(found[0].layer, Layer::User);
+        assert!(found[0].file.as_deref().unwrap().ends_with("orphan.md"));
+        // With a fallback that resolves, only the based_on warning stays.
+        let r = run(&d, Some("[models]\nfallback = \"worker-backend\"\n"), None);
+        assert!(r.ok, "{:?}", r.problems);
+        assert_eq!(find(&r, "agents").len(), 1);
+
+        // A skill that does not load is the skills area's error, not agents'.
+        let skill = d.join("user/skills/broken");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: [unclosed\n---\n").unwrap();
+        let r = run(&d, None, None);
+        assert_eq!(find(&r, "skills").len(), 1, "{:?}", r.problems);
+        assert!(find(&r, "agents").is_empty(), "{:?}", r.problems);
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -8,14 +8,20 @@
 //! - `versions`: harness, rpi/rmcp pins, embedded asset commit, negotiated MCP protocol (D11).
 //! - `tools` (tools/list), `contract` (D11 tools present), `whoami`, `project` (`.amp.json`, then
 //!   `amp_get_project`).
-//! - `roles`, `key:<provider>`, `models:<provider>`: see [`providers`]. These run even when AMP is
-//!   unreachable.
+//! - `roles`, `fallback`, `key:<provider>`, `models:<provider>`: see [`providers`]. These run even
+//!   when AMP is unreachable. Roles include every agent with no model of its own, with the model
+//!   it falls back to (#2246).
+//! - `mcp`, `mcp:<server>`: see [`mcp`] (#2246): each MCP server's health, trust, auth and which
+//!   roles may use it.
+//! - `skills`, `agents`, `config-check`: see [`config`] (#2246).
 //!
 //! Every warn/fail carries a `fix`: the exact thing to run or change. Never prints a secret: auth
 //! and provider keys are described by their source (`static token (env AMP_TOKEN)`, `env
 //! OPENROUTER_API_KEY`), never by value. Exit code 1 when any check fails; warnings don't count.
 
 mod ca;
+mod config;
+mod mcp;
 mod providers;
 
 use amp_core::{
@@ -64,6 +70,11 @@ pub struct Report {
     pub versions: VersionsReport,
     /// Roles, provider keys and pinned models (`roles`, `key:*`, `models:*` checks).
     pub models: providers::ModelsReport,
+    /// MCP servers (`mcp`, `mcp:*` checks, #2246).
+    pub mcp: mcp::McpReport,
+    /// Agents and skills (`agents`, `skills` checks, #2246).
+    pub agents: config::AgentsReport,
+    pub skills: config::SkillsReport,
     pub checks: Vec<Check>,
 }
 
@@ -207,7 +218,8 @@ pub enum CheckStatus {
 #[derive(Debug, Serialize)]
 pub struct Check {
     /// One of: config, credentials, ca, connect, versions, tools, contract, whoami, project, roles,
-    /// `key:<provider>`, `models:<provider>`.
+    /// fallback, `key:<provider>`, `models:<provider>`, mcp, `mcp:<server>`, skills, agents,
+    /// config-check.
     pub name: String,
     pub status: CheckStatus,
     pub detail: String,
@@ -311,13 +323,34 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
     // The model side needs no AMP connection: a brand-new machine sees both halves at once.
     let env = |k: &str| std::env::var(k).ok();
     // #2232: the user file `--config` / `--config-dir` name, plus the repo layer of this folder.
-    let paths = std::env::current_dir()
-        .map(|cwd| crate::conn::config_paths_in(&cwd))
-        .unwrap_or_else(|_| crate::conn::config_paths());
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let ctx = crate::agents_cmd::Ctx {
+        paths: crate::conn::config_paths_in(&cwd),
+        cwd,
+    };
+    let paths = &ctx.paths;
     let config_path = paths.user_file.as_ref().map(|p| p.display().to_string());
-    let models_config = ModelsConfig::load_paths(&env, &paths).map_err(|e| e.to_string());
-    let (models, findings) =
-        providers::check(models_config, config_path, &SystemKeys::from_env(), offline).await;
+    let models_config = ModelsConfig::load_paths(&env, paths).map_err(|e| e.to_string());
+    let models_ok = models_config.as_ref().ok().cloned();
+    // #2246: the roster, so roles with no model of their own show the model they fall back to.
+    let loaded = config::load(&ctx);
+    let (models, findings) = providers::check(
+        models_config,
+        config_path,
+        &loaded.hints(),
+        &SystemKeys::from_env(),
+        offline,
+    )
+    .await;
+    for (name, finding) in findings {
+        checks.push(&name, finding);
+    }
+    let (mcp, findings) = mcp::check(&ctx, loaded.roles.as_ref(), offline).await;
+    for (name, finding) in findings {
+        checks.push(&name, finding);
+    }
+    let report = config::config_report(&ctx);
+    let (agents, skills, findings) = config::check(&loaded, models_ok.as_ref(), &report);
     for (name, finding) in findings {
         checks.push(&name, finding);
     }
@@ -334,6 +367,9 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
         ca: amp.ca,
         versions,
         models,
+        mcp,
+        agents,
+        skills,
         checks: checks.0,
     }
 }
@@ -754,12 +790,36 @@ fn print_models(m: &providers::ModelsReport) {
     let width = m.roles.iter().map(|r| r.role.len()).max().unwrap_or(0);
     for (i, r) in m.roles.iter().enumerate() {
         println!(
-            "  {}{:<width$}  {}/{}",
+            "  {}{:<width$}  {}/{}{}",
             if i == 0 { "roles:    " } else { "          " },
             r.role,
             r.provider,
-            r.model
+            r.model,
+            // #2246: a role with no model of its own says what it fell back to.
+            r.fallback
+                .as_deref()
+                .map(|f| format!("  (no model of its own: {f})"))
+                .unwrap_or_default()
         );
+    }
+    if let Some(f) = &m.fallback {
+        match (&f.provider, &f.model) {
+            (Some(p), Some(model)) => println!(
+                "  fallback: {p}/{model} ({}, {}) for roles with no model of their own",
+                if f.setting.contains('/') {
+                    "[models] fallback".to_owned()
+                } else {
+                    format!("{}'s model", f.setting)
+                },
+                f.source
+            ),
+            _ => println!(
+                "  fallback: {} ({}) does not resolve: {}",
+                f.setting,
+                f.source,
+                f.error.as_deref().unwrap_or("?")
+            ),
+        }
     }
 }
 

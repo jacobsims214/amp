@@ -442,7 +442,8 @@ Every command below takes the connection flags `--url`, `--ca-file`, `--protocol
 else no credentials.
 
 ```sh
-amp-harness doctor [--json]          # config, credentials, connect, tools, contract, whoami, project
+amp-harness doctor [--json] [--offline]  # config, credentials, connect, tools, contract, whoami, project,
+                                        # roles, fallback, keys, models, mcp, skills, agents, config-check
 amp-harness whoami [--json]
 amp-harness tickets list [--project N] [--owner mine|unassigned|any|EMAIL] [--state S[,S]] [--json]
 amp-harness tickets get ID [--comments] [--json]
@@ -457,6 +458,16 @@ amp-harness mcp tools [--json] [--server NAME]     # AMP's tools, or a configure
   `blocked` (waiting + question + scheduled), `open` (the default: all but done) and `all`.
 - `doctor` exits 1 when a check fails (warnings don't count) and lists the D11 contract tools the
   server is missing. It describes auth by source only and never prints a token.
+- Since #2246 `doctor` also checks the configuration: `mcp` and one `mcp:<server>` per MCP server
+  (connected the way a session starts it: health and tool count, trust for repo servers, how it
+  authenticates with secrets by their source and state only, and which roles may use it through
+  the server's `roles` filter and each role's `mcp` permission; a table with errors fails, a server
+  that is untrusted, needs a login or does not start warns with the fix; `--offline` connects
+  nothing), `skills` and `agents` (they load, every agent resolves a model, which ones the manager
+  can dispatch, yours listed with their model), `fallback` (the model a role with no
+  `[roles.<id>]` runs on) and `config-check` (the rest of `amp-harness config check`). `roles` lists
+  every agent with no model of its own as `(no model of its own: fallback worker-backend)`, and
+  `config show`, `models list`, `/config` and `/model roles` show the same.
 - `mcp call` prints the tool's JSON (or text); a tool error goes to stderr with exit 1. Bad
   arguments exit 2.
 - `--json` output is a contract for scripts: fields are added, never renamed or removed. The full
@@ -1184,8 +1195,20 @@ once as the person: on compose with `POST /api/projects/P/approve-plan` on the R
 before human-only approval accept, and otherwise fails with the Flight plan link, or waits
 `AMP_SMOKE_APPROVE_WAIT` seconds for a person to approve there. Ticket one is dispatched before it is
 completed (completing it undispatched must be refused as "never dispatched"). On compose a person's
-ticket must be refused over MCP and is marked done with `POST /api/tasks/T/complete`. Two more legs
+ticket must be refused over MCP and is marked done with `POST /api/tasks/T/complete`. Three more legs
 run against the compose server:
+
+- `config` (#2246): MCP servers, agents, skills and models set up through the CLI in a HOME under
+  `target/`, then used. The smoke MCP server (`examples/mcp_smoke_server`, built by `make build`)
+  runs as a stdio server, a Streamable HTTP server behind a bearer token from an environment
+  variable, and a legacy HTTP+SSE server; each is added with `mcp add` (its test must list the
+  tools), and a Claude Code `.mcp.json` is brought in with `mcp import`. `agents new smoke-helper
+  --from blank` and `skills new` follow. `doctor` must show all four servers ready with their auth
+  and roles, the agent and skill as yours, and the agent on worker-backend's model through the
+  fallback (and, without the bearer variable, a warning naming it); the chat's `/model roles` must
+  say the agent falls back; `models set` then gives it a model of its own. Last, the manager (faux)
+  calls the imported server's tool and dispatches smoke-helper, whose worker calls the stdio, http
+  and sse servers' tools and completes its ticket.
 
 - `firstrun`: a brand-new HOME under `target/`. The chat's first run with scripted answers
   (`AMP_HARNESS_PROMPTS=stdin`: the server as `host:port`, `n`, a name, a code), started in a
@@ -1204,11 +1227,12 @@ run against the compose server:
 |---|---|---|
 | `AMP_MCP_URL` | `http://localhost:8000/mcp` | compose leg (`cd v2 && make up`; auth off, expects `local-dev@amp.local`) |
 | `AMP_SMOKE_PROTOCOLS` | `auto 2025-11-25` | one run per mode. `auto` must land on the stateless 2026-07-28 era |
-| `AMP_SMOKE_LEGS` | `compose firstrun install cluster` | add `keychain` (macOS) for the keychain-only leg: no key in the environment, real login keychain under a throwaway service, dialogs off, each item read at most once per process |
+| `AMP_SMOKE_LEGS` | `compose config firstrun install cluster` | add `keychain` (macOS) for the keychain-only leg: no key in the environment, real login keychain under a throwaway service, dialogs off, each item read at most once per process |
 | `AMP_TOKEN` + `AMP_CA_FILE` | unset, so the cluster leg is skipped | cluster leg: an `amp_` token from the UI and `amp-local-ca.crt`. The token is only sent to this leg |
 | `AMP_SMOKE_CLUSTER_URL` | `https://amp.local/mcp` | envoy on 443, not `:8443` (RFC 9728 resource match) |
 | `AMP_SMOKE_REST_URL` | `http://localhost:3001` | compose's REST listener: plan approval and marking a person's ticket done, as the person |
 | `AMP_SMOKE_APPROVE_WAIT` | `0` | cluster leg: seconds to wait for a person to approve the plan at the printed link when the server refuses agents (0 = fail at once) |
+| `AMP_SMOKE_MCP_SERVER` | `target/debug/examples/mcp_smoke_server` | config leg: the MCP test server |
 | `AMP_SMOKE_ARCHIVE` | unset | install leg: a release archive (with its `.sha256`) to install instead of packing the binary under test |
 | `AMP_SMOKE_WEB_URL` | `http://localhost:5173` | compose leg's web UI, passed as `AMP_WEB_URL`; `/open` must print it. The cluster leg uses the MCP origin. An unreachable UI is only a WARN |
 
