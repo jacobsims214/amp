@@ -34,6 +34,7 @@ use std::{
 };
 
 use amp_core::events::{stop_reason_str, tool_result_text};
+use amp_core::provider_error;
 
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
@@ -106,6 +107,9 @@ pub struct ChatView {
     /// The person asked the run to stop: its aborted (or failed) reply keeps what it streamed
     /// and shows no error, since the shell says "Stopped." once (#2181).
     stopping: bool,
+    /// A reply ended in an error and the transcript shows it: the shell's "run failed" line
+    /// doesn't repeat it (#2207). Taken by [`Self::take_error_shown`].
+    error_shown: bool,
     /// What the empty editor says instead of [`PLACEHOLDER`] for a moment ("Press Ctrl+C again
     /// to quit", #2184).
     hint: Arc<Mutex<Option<String>>>,
@@ -183,6 +187,7 @@ impl ChatView {
             show_thinking: ThinkingDisplay::default(),
             last_thinking: None,
             stopping: false,
+            error_shown: false,
             hint,
         }
     }
@@ -437,6 +442,11 @@ impl ChatView {
         self.stopping
     }
 
+    /// Whether a reply's error was shown since the last call (and forgets it).
+    pub fn take_error_shown(&mut self) -> bool {
+        std::mem::take(&mut self.error_shown)
+    }
+
     /// Ticks the retry countdown; returns whether one is shown.
     pub fn tick(&self) -> bool {
         match &self.retry {
@@ -475,11 +485,14 @@ impl ChatView {
                 let stopped = matches!(m.stop_reason, StopReason::Aborted)
                     || (self.stopping && matches!(m.stop_reason, StopReason::Error));
                 if !stopped && matches!(m.stop_reason, StopReason::Error | StopReason::Aborted) {
-                    let error = m.error_message.as_deref().unwrap_or(match m.stop_reason {
-                        StopReason::Aborted => "aborted",
-                        _ => "the model returned an error",
-                    });
-                    component.update_error(error, stop_reason_str(m.stop_reason));
+                    let error = match m.error_message.as_deref() {
+                        // One sentence, never the provider's raw body (#2207).
+                        Some(raw) => provider_error::summarize(&m.provider, raw),
+                        None if matches!(m.stop_reason, StopReason::Aborted) => "aborted".into(),
+                        None => "the model returned an error".into(),
+                    };
+                    component.update_error(&error, stop_reason_str(m.stop_reason));
+                    self.error_shown = true;
                 }
                 self.assistant = None;
                 self.add_usage(&m.usage);

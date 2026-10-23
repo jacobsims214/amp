@@ -215,7 +215,8 @@ impl RunEvent {
                 attempt: *attempt,
                 max_retries: *max_retries,
                 delay_ms: *delay_ms,
-                error: error.clone(),
+                // The whole provider body, minus the account id (#2207).
+                error: crate::provider_error::redact(error),
             }),
             _ => None,
         }

@@ -140,6 +140,7 @@ version = "0.1.0"
 dependencies = [
  "amp-core",
  "amp-mcp",
+ "async-trait",
  "crossterm",
  "nix",
  "rpi-agent",
