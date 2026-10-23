@@ -6,10 +6,15 @@
 //! `keychain`, `missing (...)`). `--check` asks each provider in use for its live model catalog and
 //! marks roles whose model id it does not list. Exit code 1 when a role does not resolve or a
 //! checked model is missing.
+//!
+//! `config check [--json] [--live]` (#2235) validates every layer (user file, repo file, defaults
+//! as overridden) area by area through [`amp_core::config_check`], naming the file and key of each
+//! problem and how to fix it. Exit code 1 when there is an error (warnings alone exit 0).
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
+    config_check::{self, Layer, Problem, Severity},
     models::{ModelsConfig, Selection, thinking_name},
     providers::{KeyLookup, SystemKeys, live_model_ids, resolve_key},
 };
@@ -22,6 +27,19 @@ use crate::conn::{CliError, print_json};
 pub enum ConfigCommand {
     /// Show the providers and the provider/model/thinking level each role resolves to.
     Show(ShowArgs),
+    /// Check every layer (user config.toml, the repo's .amp/harness/config.toml) and report each
+    /// problem with its file, key and a fix. Exit code 1 on errors.
+    Check(CheckArgs),
+}
+
+#[derive(Args)]
+pub struct CheckArgs {
+    /// Print JSON.
+    #[arg(long)]
+    json: bool,
+    /// Also check each role's model against its provider's live catalog (network; needs keys).
+    #[arg(long)]
+    live: bool,
 }
 
 #[derive(Args)]
@@ -102,6 +120,145 @@ pub struct RoleReport {
 pub async fn run(command: ConfigCommand) -> Result<(), CliError> {
     match command {
         ConfigCommand::Show(args) => show(args).await,
+        ConfigCommand::Check(args) => check(args).await,
+    }
+}
+
+/// Checks only the harness binary can run (they need crates amp-core doesn't depend on).
+const HARNESS_CHECKERS: &[(&str, config_check::Checker)] = &[("tui", check_tui)];
+
+/// `[tui]` as the chat reads it.
+fn check_tui(inputs: &config_check::Inputs) -> Vec<Problem> {
+    let (Some(text), Some(_)) = (&inputs.user_text, &inputs.user) else {
+        return Vec::new();
+    };
+    let home = (inputs.env)("HOME");
+    let env = move |k: &str| (k == "HOME").then(|| home.clone()).flatten();
+    match amp_tui::ThemeSettings::resolve(None, &env, Some(text)) {
+        Ok(_) => Vec::new(),
+        Err(e) => vec![
+            Problem::error("tui", Layer::User, e.0)
+                .file(inputs.user_file())
+                .key("tui"),
+        ],
+    }
+}
+
+async fn check(args: CheckArgs) -> Result<(), CliError> {
+    let cwd =
+        std::env::current_dir().map_err(|e| CliError::new(format!("current directory: {e}")))?;
+    let paths = crate::conn::config_paths_in(&cwd);
+    let env = |k: &str| std::env::var(k).ok();
+    let keys = SystemKeys::from_env();
+    let mut report = config_check::check(&paths, &env, &keys, HARNESS_CHECKERS);
+    if args.live {
+        let inputs = config_check::read_inputs(&paths, &env, &keys);
+        report.extend("catalog", live_problems(&inputs, &keys).await);
+    }
+    if args.json {
+        print_json(&report)?;
+    } else {
+        print_check(&report);
+    }
+    if report.ok {
+        Ok(())
+    } else {
+        Err(CliError::silent(1))
+    }
+}
+
+/// `--live`: roles whose model the provider's live catalog does not list.
+async fn live_problems(inputs: &config_check::Inputs<'_>, keys: &dyn KeyLookup) -> Vec<Problem> {
+    let Some(config) = &inputs.models else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut live: BTreeMap<String, Result<BTreeSet<String>, String>> = BTreeMap::new();
+    for (role, resolved) in config.resolve_all() {
+        let Ok(r) = resolved else { continue };
+        let Some(provider) = config.providers.get(&r.provider) else {
+            continue;
+        };
+        if !live.contains_key(&r.provider) {
+            let (key, source) = resolve_key(provider, keys);
+            let ids = if provider.needs_key && key.is_none() {
+                Err(format!("no key ({source})"))
+            } else {
+                live_model_ids(provider, keys).await
+            };
+            if let Err(e) = &ids {
+                out.push(
+                    Problem::warning(
+                        "catalog",
+                        Layer::Env,
+                        format!("{}'s live catalog was not checked: {e}", r.provider),
+                    )
+                    .key(format!("providers.{}", r.provider)),
+                );
+            }
+            live.insert(r.provider.clone(), ids);
+        }
+        if let Some(Ok(ids)) = live.get(&r.provider)
+            && !ids.contains(&r.model_id)
+        {
+            let (layer, file) = inputs.role_layer(&role);
+            out.push(
+                Problem::error(
+                    "catalog",
+                    layer,
+                    format!(
+                        "role `{role}` uses {}, which {}'s live catalog does not list",
+                        r.model_ref(),
+                        r.provider
+                    ),
+                )
+                .file(file.as_deref())
+                .key(format!("roles.{role}.model"))
+                .fix(format!(
+                    "`amp-harness models list --available --check` lists the models; `amp-harness models set {role} <provider/model>`"
+                )),
+            );
+        }
+    }
+    out
+}
+
+fn print_check(r: &config_check::CheckReport) {
+    let file = |path: &Option<std::path::PathBuf>, found: bool| match path {
+        Some(p) if found => p.display().to_string(),
+        Some(p) => format!("{} (not found)", p.display()),
+        None => "none".to_owned(),
+    };
+    println!("User config: {}", file(&r.user_file, r.user_file_found));
+    println!("Repo config: {}", file(&r.repo_file, r.repo_file_found));
+    println!("Checked:     {}", r.areas.join(", "));
+    for p in &r.problems {
+        let severity = match p.severity {
+            Severity::Error => "ERROR",
+            Severity::Warning => "warning",
+        };
+        let layer = serde_json::to_value(p.layer)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let mut head = format!("\n{severity} [{layer} {}]", p.area);
+        if let Some(key) = &p.key {
+            head.push_str(&format!(" {key}"));
+        }
+        if let Some(file) = &p.file {
+            head.push_str(&format!(" in {}", file.display()));
+        }
+        println!("{head}");
+        println!("  {}", p.message);
+        if let Some(fix) = &p.fix {
+            println!("  fix: {fix}");
+        }
+    }
+    let (errors, warnings) = (r.errors(), r.warnings());
+    if errors == 0 && warnings == 0 {
+        println!("\nOK: no problems.");
+    } else {
+        println!("\n{errors} error(s), {warnings} warning(s).");
     }
 }
 

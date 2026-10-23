@@ -1075,7 +1075,7 @@ pub fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
 // Parsing and validation
 
 /// Serde's messages can quote a value (`invalid type: string "..."`); drop the quoted part.
-fn redact_serde(message: &str) -> String {
+pub(crate) fn redact_serde(message: &str) -> String {
     let mut out = String::new();
     let mut rest = message;
     while let Some(i) = rest.find("string \"") {

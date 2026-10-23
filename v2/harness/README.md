@@ -427,6 +427,27 @@ flags ids that are missing. It exits 1 if a role does not resolve or a checked i
 `config show` reads the same files a session in this folder would: the user config.toml
 (`--config` / `--config-dir` apply) and the repo's `.amp/harness/config.toml`.
 
+### Changing models without editing files (#2235)
+
+```sh
+amp-harness models list [--available] [--check] [--json]
+amp-harness models set reviewer anthropic/claude-opus-5-5 [--thinking high] [--user|--repo] [--no-check]
+amp-harness models reset reviewer [--user|--repo]
+amp-harness models profile anthropic            # or opencode, a [profiles.X] of yours, or:
+amp-harness models profile inherit --inherit openrouter/z-ai/glm-5.3 [--thinking high]
+amp-harness config check [--json] [--live]
+```
+
+`--user` (the default) edits your config.toml; `--repo` edits the repo's `.amp/harness/config.toml`,
+which holds only `[roles.*]` and `[models] profile`. Edits keep your comments and other settings,
+copy the old file to `config.toml.bak`, and are written only if the result loads and the role
+resolves. `models set` refuses an unknown provider; a model your config doesn't define yet is looked
+up in the provider's live catalog (when it has a key) and added to your user file as an empty
+`[providers.<p>.models."<id>"]` table, and a model the catalog doesn't list is refused unless
+`--no-check`. `config check` reports every problem in every layer (files, server, models,
+providers, roles, workers, tools, tui, mcp; `--live` adds each role's model against the live catalog)
+with the file, the key and a fix, and exits 1 on errors (a missing key is a warning).
+
 ### Secrets never reach an agent's bash (#2142)
 
 Every session's `bash` (manager and workers) gets the harness's environment minus its own secrets:
