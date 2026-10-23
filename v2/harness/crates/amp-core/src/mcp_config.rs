@@ -353,6 +353,10 @@ pub struct McpServer {
     pub enabled: bool,
     /// The file `enabled` came from (the user file can switch a repo server).
     pub enabled_origin: Origin,
+    /// sha256 (hex) of the table as written (keys sorted, values unexpanded): what trust for a
+    /// repo server is recorded against (#2241, [`crate::mcp_trust`]). Empty when the server was
+    /// not built from a table.
+    pub table_sha256: String,
     pub transport: Transport,
     /// Role globs (without `amp-`); `["*"]` by default.
     pub roles: Vec<String>,
@@ -855,6 +859,17 @@ impl fmt::Debug for ResolvedRemote {
 }
 
 impl McpServer {
+    fn with_table_hash(mut self, value: &toml::Value) -> Self {
+        self.table_sha256 = table_sha256(value);
+        self
+    }
+
+    /// Whether the table came from a repo's `.amp/harness/config.toml` (and so needs trust before
+    /// it runs, #2241).
+    pub fn is_repo(&self) -> bool {
+        self.origin.layer == Layer::Repo
+    }
+
     /// Whether `role` (with or without `amp-`) may use this server (the coarse D5 filter; the
     /// role's `mcp` permission applies after it).
     pub fn allows_role(&self, role: &str) -> bool {
@@ -1155,7 +1170,53 @@ pub fn parse_server(
     origin: Origin,
 ) -> Result<(McpServer, Vec<McpProblem>), Vec<McpProblem>> {
     let raw = parse_raw(name, value, &origin.file)?;
-    build_server(name, raw, origin)
+    build_server(name, raw, origin).map(|(s, w)| (s.with_table_hash(value), w))
+}
+
+/// sha256 (hex) of a TOML value in a canonical form: tables with sorted keys, strings
+/// JSON-quoted, every scalar tagged with its type. Equal tables hash equal however they were
+/// written (inline or not, key order, quoting); any change to a key or value changes it.
+pub fn table_sha256(value: &toml::Value) -> String {
+    use sha2::{Digest, Sha256};
+    fn canon(v: &toml::Value, out: &mut String) {
+        let quote = |s: &str| serde_json::to_string(s).unwrap_or_default();
+        match v {
+            toml::Value::String(s) => {
+                out.push_str("s:");
+                out.push_str(&quote(s));
+            }
+            toml::Value::Integer(i) => out.push_str(&format!("i:{i}")),
+            toml::Value::Float(f) => out.push_str(&format!("f:{f:?}")),
+            toml::Value::Boolean(b) => out.push_str(&format!("b:{b}")),
+            toml::Value::Datetime(d) => out.push_str(&format!("d:{d}")),
+            toml::Value::Array(items) => {
+                out.push('[');
+                for item in items {
+                    canon(item, out);
+                    out.push(',');
+                }
+                out.push(']');
+            }
+            toml::Value::Table(t) => {
+                let mut keys: Vec<&String> = t.keys().collect();
+                keys.sort();
+                out.push('{');
+                for k in keys {
+                    out.push_str(&quote(k));
+                    out.push(':');
+                    canon(&t[k.as_str()], out);
+                    out.push(',');
+                }
+                out.push('}');
+            }
+        }
+    }
+    let mut text = String::new();
+    canon(value, &mut text);
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn parse_raw(name: &str, value: &toml::Value, file: &Path) -> Result<RawServer, Vec<McpProblem>> {
@@ -1464,6 +1525,7 @@ fn build_server(
         origin: origin.clone(),
         enabled: raw.enabled.unwrap_or(true),
         enabled_origin: origin,
+        table_sha256: String::new(),
         transport,
         roles,
         startup: raw.startup.unwrap_or_default(),
@@ -1607,7 +1669,7 @@ impl McpConfig {
                 match build_server(name, raw, origin) {
                     Ok((s, mut warnings)) => {
                         config.problems.append(&mut warnings);
-                        user_servers.insert(name.clone(), Ok(s));
+                        user_servers.insert(name.clone(), Ok(s.with_table_hash(value)));
                     }
                     Err(mut p) => {
                         config.problems.append(&mut p);

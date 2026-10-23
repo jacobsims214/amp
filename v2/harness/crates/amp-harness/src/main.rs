@@ -30,6 +30,7 @@ mod connect;
 mod debug;
 mod doctor;
 mod mcp_cmd;
+mod mcp_trust_cmd;
 mod models_cmd;
 mod run;
 mod server_cmd;
@@ -92,6 +93,10 @@ struct Cli {
     /// agents/, skills/, AGENTS.md and credentials.json (env AMP_HARNESS_CONFIG_DIR).
     #[arg(long, global = true, value_name = "DIR")]
     config_dir: Option<PathBuf>,
+    /// Let every MCP server from this repo's .amp/harness/config.toml start without being trusted
+    /// (CI; env AMP_HARNESS_TRUST_REPO_MCP=1). Nothing is recorded.
+    #[arg(long, global = true)]
+    trust_repo_mcp: bool,
 }
 
 #[derive(Subcommand)]
@@ -199,6 +204,8 @@ async fn main() -> ExitCode {
         cli.config_dir.clone(),
         &|k| std::env::var(k).ok(),
     ));
+    // #2241: trust every repo MCP server in this process (never recorded).
+    amp_core::mcp_trust::set_trust_all(cli.trust_repo_mcp);
     let result: Result<(), conn::CliError> = match cli.command {
         Some(Command::Version) => {
             println!("amp-harness {LONG_VERSION}");
