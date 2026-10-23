@@ -127,6 +127,11 @@ pub struct Runtime {
     /// The user's harness config dir (`~/.config/amp-harness`): its `AGENTS.md` is the global
     /// context file.
     pub config_dir: Option<PathBuf>,
+    /// The configuration paths this runtime loaded from (#2232): the user file and dir (`--config`,
+    /// `--config-dir`, their env variables, else the defaults) and the repo layer
+    /// (`<repo>/.amp/harness`). Reloads and writers use these, so they read and write the same
+    /// files the session started with.
+    pub paths: amp_mcp::ConfigPaths,
     /// The faux providers a script was loaded into (`AMP_HARNESS_FAUX_SCRIPT`).
     pub faux_scripted: Vec<String>,
     /// `AMP_HARNESS_CEILING_DIR`: context files above it are not loaded.
@@ -305,13 +310,14 @@ impl Runtime {
     /// Loads assets (with overrides), roles, models and providers, applies a faux script from the
     /// environment, and materializes the skills under `<state>/skills/<assets hash>/`.
     pub fn load(mcp: Arc<AmpMcpClient>, opts: RuntimeOptions<'_>) -> Result<Self, AgentError> {
-        let dirs = OverrideDirs::discover_with_env(opts.repo_root.as_deref(), opts.env);
+        let paths = amp_mcp::config_paths::current(opts.env).with_repo(opts.repo_root.as_deref());
+        let dirs = OverrideDirs::from_paths(&paths);
         let config_dir = dirs.user.clone();
         let assets = Assets::load(&dirs)?;
         let roles = RoleRegistry::from_assets(&assets)?;
         let models = match opts.models {
             Some(m) => m,
-            None => ModelsConfig::load_with_env(opts.env, None)?,
+            None => ModelsConfig::load_paths(opts.env, &paths)?,
         };
         let providers = ProviderSet::build(&models, opts.keys);
         let faux_scripted = match ScriptFile::from_env(opts.env)? {
@@ -352,6 +358,7 @@ impl Runtime {
             mcp,
             state_dir,
             config_dir,
+            paths,
             faux_scripted,
             ceiling_dir: (opts.env)(ENV_CEILING_DIR)
                 .filter(|v| !v.is_empty())

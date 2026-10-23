@@ -122,7 +122,9 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         .map_err(|e| CliError::usage(e.to_string()))?;
     let role_id = role.id.clone();
     let supervisor = if role.primary {
-        let config = SupervisorConfig::load(&env, None).map_err(CliError::new)?;
+        // #2232: [workers] from the same config.toml the runtime loaded (not the default path).
+        let config =
+            SupervisorConfig::load(&env, rt.paths.user_file.clone()).map_err(CliError::new)?;
         Some(Supervisor::with_hooks(
             Arc::clone(&rt),
             ManagerContext {

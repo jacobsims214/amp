@@ -4,7 +4,8 @@
 //!
 //! Layers, lowest to highest precedence (a later layer replaces the same file of an earlier one):
 //! 1. embedded: `v2/harness/assets/{agents,skills}` at build time;
-//! 2. user: `$XDG_CONFIG_HOME/amp-harness/{agents,skills}/` (else `~/.config/amp-harness/...`);
+//! 2. user: `<user config dir>/{agents,skills}/`: `--config-dir`, `AMP_HARNESS_CONFIG_DIR`, else
+//!    `$XDG_CONFIG_HOME/amp-harness`, else `~/.config/amp-harness` ([`amp_mcp::config_paths`]);
 //! 3. repo: `<repo>/.amp/harness/{agents,skills}/`.
 //!
 //! An agent is one file, `agents/<id>.md` (YAML frontmatter + system prompt), so an override
@@ -104,20 +105,22 @@ impl OverrideDirs {
         repo_root: Option<&Path>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::from_paths(&amp_mcp::config_paths::current(env).with_repo(repo_root))
+    }
+
+    /// The user and repo directories of resolved [`amp_mcp::ConfigPaths`].
+    pub fn from_paths(paths: &amp_mcp::ConfigPaths) -> Self {
         Self {
-            user: user_dir(env),
-            repo: repo_root.map(|r| r.join(".amp").join("harness")),
+            user: paths.user_dir.clone(),
+            repo: paths.repo_dir.clone(),
         }
     }
 }
 
-/// `$XDG_CONFIG_HOME/amp-harness`, else `$HOME/.config/amp-harness` (same base as config.toml).
+/// The user config directory in effect: `--config-dir` / `AMP_HARNESS_CONFIG_DIR`, else
+/// `$XDG_CONFIG_HOME/amp-harness`, else `$HOME/.config/amp-harness` (same dir as config.toml).
 pub fn user_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let non_empty = |k: &str| env(k).filter(|v| !v.is_empty());
-    let base = non_empty("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| non_empty("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("amp-harness"))
+    amp_mcp::config_paths::current(env).user_dir
 }
 
 /// One agent role: frontmatter plus its system prompt.

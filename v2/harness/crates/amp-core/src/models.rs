@@ -5,9 +5,12 @@
 //! 1. the shipped defaults, [`DEFAULTS_TOML`] (`crates/amp-core/models.toml`): the Anthropic and
 //!    OpenRouter providers, their models, the opencode roster as `[roles.*]` and the alternative
 //!    `[profiles.anthropic]`;
-//! 2. the user's `config.toml` (`$XDG_CONFIG_HOME/amp-harness/config.toml`, else
-//!    `~/.config/amp-harness/config.toml`). Its `[providers.*]`, `[roles.*]` and `[profiles.*]` are
-//!    merged over the defaults, and its `[models]` table picks the assignment mode.
+//! 2. the user's `config.toml` (`--config`, `AMP_HARNESS_CONFIG`, `--config-dir`, else
+//!    `$XDG_CONFIG_HOME/amp-harness/config.toml`, else `~/.config/amp-harness/config.toml`; see
+//!    [`amp_mcp::config_paths`]). Its `[providers.*]`, `[roles.*]` and `[profiles.*]` are merged
+//!    over the defaults, and its `[models]` table picks the assignment mode;
+//! 3. the repo's `<repo>/.amp/harness/config.toml` ([`crate::repo_config`]): only `[roles.*]` and
+//!    `[models] profile`, merged over the user file.
 //!
 //! There is no default provider. Each role names its own `provider/model` (the model id may contain
 //! `/`, e.g. `openrouter/xiaomi/mimo-v2.6-pro`; the provider is everything before the first `/`).
@@ -16,10 +19,11 @@
 //! 1. `[roles.<role>]` in the defaults (the opencode roster);
 //! 2. the selected profile's `[profiles.<name>.roles.<role>]`, or, in inherit mode, the one
 //!    `[models] inherit = "provider/model"` for every role;
-//! 3. `[roles.<role>]` in config.toml.
+//! 3. `[roles.<role>]` in config.toml;
+//! 4. `[roles.<role>]` in the repo config.
 //!
-//! The mode comes from `AMP_HARNESS_PROFILE`, then `[models] profile`, then `opencode` (the defaults
-//! as shipped). `inherit` is a mode, not a profile name.
+//! The mode comes from `AMP_HARNESS_PROFILE`, then the repo's `[models] profile`, then the user's,
+//! then `opencode` (the defaults as shipped). `inherit` is a mode, not a profile name.
 //!
 //! When a layer changes a role's `model`, the `extra_body` of the layers below is dropped (it was
 //! written for the other model), while `thinking` carries over unless the layer sets it too.
@@ -39,6 +43,8 @@ use rpi_ai::{
 };
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::repo_config::RepoConfig;
 
 /// The shipped defaults (embedded).
 pub const DEFAULTS_TOML: &str = include_str!("../models.toml");
@@ -163,7 +169,7 @@ pub struct CostSpec {
     pub cache_write: f64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleSpec {
     /// `provider/model`.
@@ -394,6 +400,8 @@ pub struct ModelsConfig {
     /// The config.toml looked at, and whether it exists.
     pub config_file: Option<PathBuf>,
     pub config_found: bool,
+    /// The repo config that was merged in (it existed), if any.
+    pub repo_file: Option<PathBuf>,
     /// Profiles available (shipped and user), with descriptions.
     pub profiles: BTreeMap<String, Option<String>>,
     roles: BTreeMap<String, RoleEntry>,
@@ -429,12 +437,30 @@ impl ModelsConfig {
     }
 
     /// `config_path` overrides the default location; `env` is looked up for `XDG_CONFIG_HOME`,
-    /// `HOME` and `AMP_HARNESS_PROFILE`.
+    /// `HOME`, `AMP_HARNESS_CONFIG[_DIR]` and `AMP_HARNESS_PROFILE`. No repo layer: use
+    /// [`ModelsConfig::load_paths`] for that.
     pub fn load_with_env(
         env: &dyn Fn(&str) -> Option<String>,
         config_path: Option<PathBuf>,
     ) -> Result<Self, ModelsError> {
-        let path = config_path.or_else(|| amp_mcp::default_config_path(env));
+        let mut paths = amp_mcp::config_paths::current(env).with_repo(None);
+        if let Some(path) = config_path {
+            paths = paths.with_user_file(path, amp_mcp::Source::Flag);
+        }
+        Self::load_paths(env, &paths)
+    }
+
+    /// Defaults + `paths.user_file` + `paths.repo_file()` (each only if it exists). A repo file
+    /// with keys other than `[roles]`, `[mcp]` and `[models] profile` is an error.
+    pub fn load_paths(
+        env: &dyn Fn(&str) -> Option<String>,
+        paths: &amp_mcp::ConfigPaths,
+    ) -> Result<Self, ModelsError> {
+        let path = paths.user_file.clone();
+        let repo = match paths.repo_file() {
+            Some(file) => RepoConfig::load(&file)?,
+            None => None,
+        };
         let user = match &path {
             Some(path) => ModelsFile::load(path)?,
             None => None,
@@ -444,7 +470,8 @@ impl ModelsConfig {
             .as_ref()
             .map(|p| format!("config {}", p.display()))
             .unwrap_or_else(|| "config".to_owned());
-        let mut config = Self::from_files(ModelsFile::defaults(), user, &label, env)?;
+        let mut config =
+            Self::from_layers(ModelsFile::defaults(), user, &label, repo.as_ref(), env)?;
         config.config_file = path;
         config.config_found = found;
         Ok(config)
@@ -457,7 +484,21 @@ impl ModelsConfig {
         user_label: &str,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, ModelsError> {
+        Self::from_layers(defaults, user, user_label, None, env)
+    }
+
+    /// Merge `user` over `defaults`, then `repo` (its `[roles]` and `[models] profile`) over both.
+    /// `user_label` names the user layer in sources; the repo layer is `repo <path>`.
+    pub fn from_layers(
+        defaults: ModelsFile,
+        user: Option<ModelsFile>,
+        user_label: &str,
+        repo: Option<&RepoConfig>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, ModelsError> {
         let user = user.unwrap_or_default();
+        let repo_label = repo.map(RepoConfig::label).unwrap_or_default();
+        let repo_layer = repo.map(RepoConfig::models_file).unwrap_or_default();
 
         // Providers and models.
         let mut provider_specs = defaults.providers;
@@ -496,10 +537,15 @@ impl ModelsConfig {
 
         // Mode.
         let env_profile = env(ENV_PROFILE).filter(|s| !s.trim().is_empty());
-        let (profile, profile_source) = match (env_profile, user.models.profile.clone()) {
-            (Some(p), _) => (p.trim().to_owned(), format!("env {ENV_PROFILE}")),
-            (None, Some(p)) => (p.trim().to_owned(), user_label.to_owned()),
-            (None, None) => (DEFAULT_PROFILE.to_owned(), "default".to_owned()),
+        let (profile, profile_source) = match (
+            env_profile,
+            repo_layer.models.profile.clone(),
+            user.models.profile.clone(),
+        ) {
+            (Some(p), _, _) => (p.trim().to_owned(), format!("env {ENV_PROFILE}")),
+            (None, Some(p), _) => (p.trim().to_owned(), repo_label.clone()),
+            (None, None, Some(p)) => (p.trim().to_owned(), user_label.to_owned()),
+            (None, None, None) => (DEFAULT_PROFILE.to_owned(), "default".to_owned()),
         };
 
         let mut roles: BTreeMap<String, RoleEntry> = BTreeMap::new();
@@ -561,12 +607,18 @@ impl ModelsConfig {
             let entry = overlay_role(roles.remove(&role), top, user_label);
             roles.insert(role, entry);
         }
+        for (role, top) in repo_layer.roles {
+            let role = normalize_role(&role).to_owned();
+            let entry = overlay_role(roles.remove(&role), top, &repo_label);
+            roles.insert(role, entry);
+        }
 
         Ok(Self {
             providers,
             selection,
             config_file: None,
             config_found: false,
+            repo_file: repo.map(|r| r.path.clone()),
             profiles: profiles
                 .into_iter()
                 .map(|(name, spec)| (name, spec.description))
@@ -1309,6 +1361,64 @@ thinking = "high"
         );
         assert_eq!(c.resolve_role("reviewer").unwrap().model_id, "z-ai/glm-5.3");
         assert!(c.profiles.contains_key("anthropic") && c.profiles.contains_key("cheap"));
+    }
+
+    /// #2232: the repo layer's [roles] and [models] profile beat the user file's;
+    /// AMP_HARNESS_PROFILE beats both; sources name the repo file.
+    #[test]
+    fn repo_layer_merges_over_the_user_file() {
+        let user = ModelsFile::parse(
+            "[models]\nprofile = \"anthropic\"\n[roles.reviewer]\nmodel = \"openrouter/xiaomi/mimo-v2.6-pro\"\nthinking = \"low\"\n",
+            "user",
+        )
+        .unwrap();
+        let repo = crate::repo_config::RepoConfig::parse(
+            "[models]\nprofile = \"opencode\"\n[roles.reviewer]\nthinking = \"high\"\n",
+            Path::new("/r/.amp/harness/config.toml"),
+        )
+        .unwrap();
+        let c = ModelsConfig::from_layers(
+            ModelsFile::defaults(),
+            Some(user.clone()),
+            "config u",
+            Some(&repo),
+            &|_| None,
+        )
+        .unwrap();
+        match &c.selection {
+            Selection::Profile { name, source } => {
+                assert_eq!(name, "opencode");
+                assert_eq!(source, "repo /r/.amp/harness/config.toml");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            c.repo_file,
+            Some(PathBuf::from("/r/.amp/harness/config.toml"))
+        );
+        let reviewer = c.resolve_role("reviewer").unwrap();
+        // The user's model, the repo's thinking.
+        assert_eq!(reviewer.model_ref(), "openrouter/xiaomi/mimo-v2.6-pro");
+        assert_eq!(reviewer.requested_thinking, Some(ThinkingLevel::High));
+        assert_eq!(
+            reviewer.source,
+            "config u + repo /r/.amp/harness/config.toml"
+        );
+
+        let env = |k: &str| (k == ENV_PROFILE).then(|| "anthropic".to_owned());
+        let c = ModelsConfig::from_layers(
+            ModelsFile::defaults(),
+            Some(user),
+            "config u",
+            Some(&repo),
+            &env,
+        )
+        .unwrap();
+        assert!(
+            matches!(&c.selection, Selection::Profile { name, .. } if name == "anthropic"),
+            "{:?}",
+            c.selection
+        );
     }
 
     #[test]

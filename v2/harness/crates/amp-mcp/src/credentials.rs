@@ -81,9 +81,13 @@ impl CredentialBackend {
         Self::File { path: path.into() }
     }
 
-    /// `$XDG_CONFIG_HOME/amp-harness/credentials.json`, else `~/.config/amp-harness/credentials.json`.
+    /// `credentials.json` in the user config directory: `--config-dir` / `AMP_HARNESS_CONFIG_DIR`,
+    /// else `$XDG_CONFIG_HOME/amp-harness`, else `~/.config/amp-harness`. `--config` (the file
+    /// alone) does not move it.
     pub fn default_file_path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-        crate::settings::default_config_path(env).map(|p| p.with_file_name(CREDENTIALS_FILE_NAME))
+        crate::config_paths::current(env)
+            .user_dir
+            .map(|d| d.join(CREDENTIALS_FILE_NAME))
     }
 
     /// Resolves against the real environment and keychain.

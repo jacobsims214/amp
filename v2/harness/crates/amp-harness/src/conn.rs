@@ -11,12 +11,13 @@ use std::{
 
 use amp_core::tools::ToolCallError;
 use amp_mcp::{
-    AmpMcpClient, Auth, ClientOptions, CredentialBackend, FailureKind, McpError, Overrides,
-    ProtocolMode, Reconnector, Settings, oauth,
+    AmpMcpClient, Auth, ClientOptions, ConfigPaths, CredentialBackend, FailureKind, McpError,
+    Overrides, ProtocolMode, Reconnector, Settings, oauth,
 };
 use clap::Args;
 
-/// `--url`, `--ca-file`, `--protocol`, `--config`, `--token-env` (D4; precedence in amp-mcp).
+/// `--url`, `--ca-file`, `--protocol`, `--token-env` (D4; precedence in amp-mcp). `--config` and
+/// `--config-dir` are global flags (#2232): see [`config_paths`].
 #[derive(Args, Debug, Clone, Default)]
 pub struct ConnArgs {
     /// MCP server URL (default: AMP_MCP_URL, then config.toml, then hosted AMP).
@@ -28,9 +29,6 @@ pub struct ConnArgs {
     /// MCP protocol: auto (default), 2026-07-28 or 2025-11-25.
     #[arg(long)]
     pub protocol: Option<ProtocolMode>,
-    /// Read this config.toml instead of ~/.config/amp-harness/config.toml.
-    #[arg(long)]
-    pub config: Option<PathBuf>,
     /// Read the static AMP token from this environment variable instead of AMP_TOKEN.
     #[arg(long)]
     pub token_env: Option<String>,
@@ -42,10 +40,37 @@ impl ConnArgs {
             url: self.url.clone(),
             ca_file: self.ca_file.clone(),
             protocol: self.protocol,
-            config_file: self.config.clone(),
+            // A file the person named must exist; the default one may be missing.
+            config_file: config_paths().explicit_user_file(),
             token_env: self.token_env.clone(),
         })
     }
+}
+
+/// The config paths in effect (the global `--config` / `--config-dir`, their env variables, else
+/// the defaults), without a repo layer.
+pub fn config_paths() -> ConfigPaths {
+    amp_mcp::config_paths::current_from_process()
+}
+
+/// [`config_paths`] with the repo layer of the project `cwd` is in (the directory holding the
+/// nearest `.amp.json`, below `AMP_HARNESS_CEILING_DIR`).
+pub fn config_paths_in(cwd: &std::path::Path) -> ConfigPaths {
+    let ceiling = std::env::var_os(amp_core::project::ENV_CEILING_DIR)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from);
+    let repo = amp_core::project::ProjectMarker::find_within(cwd, ceiling.as_deref())
+        .ok()
+        .flatten()
+        .and_then(|p| p.path.parent().map(PathBuf::from));
+    config_paths().with_repo(repo.as_deref())
+}
+
+/// The user config.toml for a writer, or an error saying what to set.
+pub fn user_config_file() -> Result<PathBuf, CliError> {
+    config_paths()
+        .user_file_for_writing()
+        .map_err(CliError::new)
 }
 
 /// Connects with D3's credential order: a static token, else the stored login, else none.

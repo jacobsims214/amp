@@ -214,10 +214,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         shell.view().editor().set_text(&text);
     }
     // /connect: store a provider key (hidden) and use it without a restart (#2163).
-    shell.set_connect(crate::connect::ChatConnect::new(
-        Arc::clone(&session.rt),
-        setup::config_path(&args.conn)?,
-    ));
+    shell.set_connect(crate::connect::ChatConnect::new(Arc::clone(&session.rt))?);
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);
@@ -388,13 +385,10 @@ fn load_theme(args: &ChatArgs) -> Result<AmpTheme, CliError> {
         .map_err(|e| CliError::usage(e.to_string()))
 }
 
-/// config.toml's text, if there is one.
-fn config_text(args: &ChatArgs) -> Option<String> {
-    let env = |k: &str| std::env::var(k).ok();
-    args.conn
-        .config
-        .clone()
-        .or_else(|| amp_mcp::default_config_path(&env))
+/// config.toml's text, if there is one (`--config` / `--config-dir` apply, #2232).
+fn config_text(_args: &ChatArgs) -> Option<String> {
+    conn::config_paths()
+        .user_file
         .and_then(|p| std::fs::read_to_string(p).ok())
 }
 

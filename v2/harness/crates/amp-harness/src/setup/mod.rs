@@ -314,12 +314,10 @@ fn env_var(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|v| !v.trim().is_empty())
 }
 
-/// The config.toml setup reads and writes: `--config`, else the default path.
-pub(crate) fn config_path(conn: &ConnArgs) -> Result<PathBuf, CliError> {
-    conn.config
-        .clone()
-        .or_else(|| amp_mcp::default_config_path(&|k| std::env::var(k).ok()))
-        .ok_or_else(|| CliError::new("no HOME or XDG_CONFIG_HOME: nowhere to keep config.toml"))
+/// The config.toml setup reads and writes: the global `--config` / `--config-dir` (#2232), else
+/// the default path.
+pub(crate) fn config_path(_conn: &ConnArgs) -> Result<PathBuf, CliError> {
+    conn::user_config_file()
 }
 
 pub async fn run(plan: &Plan, ui: &mut dyn Ui) -> Result<Outcome, CliError> {
@@ -1193,8 +1191,15 @@ pub(crate) fn load_models(
         }
         std::env::var(k).ok()
     };
-    ModelsConfig::load_with_env(&env, Some(config.path.clone()))
-        .map_err(|e| CliError::new(format!("models: {e}")))
+    // #2232: `config` over the repo layer of the current folder, as a session would load it.
+    let mut paths = match std::env::current_dir() {
+        Ok(cwd) => conn::config_paths_in(&cwd),
+        Err(_) => conn::config_paths(),
+    };
+    if paths.user_file.as_deref() != Some(config.path.as_path()) {
+        paths = paths.with_user_file(config.path.clone(), amp_mcp::Source::Flag);
+    }
+    ModelsConfig::load_paths(&env, &paths).map_err(|e| CliError::new(format!("models: {e}")))
 }
 
 pub(crate) fn profile_of(cfg: &ModelsConfig) -> (String, String) {

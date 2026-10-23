@@ -76,7 +76,8 @@ Dependencies only point one way: `amp-mcp <- amp-core <- amp-tui <- amp-harness`
 | token    | `--token-env` | `AMP_TOKEN`        | never                               | none                             |
 
 Flags beat env, env beats the file (`$XDG_CONFIG_HOME` is honoured). A relative `ca_file` is relative
-to the config file. `.amp.json` is a project marker only; its `amp_api` is not read. The web UI
+to the config file. Which config file and directory are used is described in
+[Where configuration lives](#where-configuration-lives-2232). `.amp.json` is a project marker only; its `amp_api` is not read. The web UI
 setting only changes links (`/open`, the header's host): set it when the UI is not served from the
 MCP origin, as on docker compose (`AMP_WEB_URL=http://localhost:5173`).
 
@@ -193,8 +194,8 @@ amp-harness logout [--url URL]
   says there is nothing to log in to.
 - Logins are stored per server URL (normalised), so local, cluster and hosted logins coexist:
   - OS keychain, service `amp-harness`, account = server URL (default when the keychain answers);
-  - otherwise `~/.config/amp-harness/credentials.json` (`$XDG_CONFIG_HOME` honoured), mode 0600 in
-    a 0700 directory. `AMP_CREDENTIAL_STORE=keychain|file|auto` forces one.
+  - otherwise `~/.config/amp-harness/credentials.json` (`$XDG_CONFIG_HOME` and `--config-dir`
+    honoured), mode 0600 in a 0700 directory. `AMP_CREDENTIAL_STORE=keychain|file|auto` forces one.
 - Connecting (`amp_mcp::oauth::connect`): `AMP_TOKEN` first, then the stored login (refreshed
   before expiry, and once more if the server rejects the token), then no credentials. When the
   refresh token is rejected, calls fail with "AMP login required: run `amp-harness login`" and
@@ -253,10 +254,47 @@ cases store keys with `connect --key-stdin` (a mock provider checks them), remov
 test's `keychain` leg (`AMP_SMOKE_LEGS=keychain`, macOS, needs the compose server) does the same
 with the built or installed binary (`AMP_HARNESS_BIN`). Both use throwaway services, never yours.
 
+## Where configuration lives (#2232)
+
+Two layers of files, built-in defaults below both:
+
+| layer | directory | config file |
+|-------|-----------|-------------|
+| user  | `--config-dir DIR`, else `AMP_HARNESS_CONFIG_DIR`, else `$XDG_CONFIG_HOME/amp-harness`, else `~/.config/amp-harness` | `--config FILE`, else `AMP_HARNESS_CONFIG`, else `<user dir>/config.toml` |
+| repo  | `<dir with .amp.json>/.amp/harness` | `<repo dir>/config.toml` |
+
+`--config` and `--config-dir` are global flags: they go before or after any subcommand
+(`amp-harness --config F run -p …` and `amp-harness run -p … --config F` are the same) and apply to
+every setting and every command, readers and writers alike: `[server]`, `[models]`, `[roles]`,
+`[providers]`, `[profiles]`, `[workers]`, `[tools]`, `[secrets]` and `[tui]`, and `server`,
+`connect`, `disconnect`, `init` and the chat's `/connect` and `/server` write that file.
+`--config` moves only the file; `--config-dir` moves the whole user layer: `config.toml`,
+`agents/`, `skills/`, `AGENTS.md` and `credentials.json`. A file named with `--config` /
+`AMP_HARNESS_CONFIG` must exist for commands that only read it (a typo is an error); one inside a
+fresh `--config-dir` may be missing. Relative paths are taken from the current directory.
+
+The repo file shares what belongs to the project and nothing else: `[mcp.*]` (MCP servers, read by
+the MCP layer), `[roles.*]` (same schema as the user file) and `[models] profile`. Anything else
+(`[server]`, `[providers]`, `[secrets]`, `[workers]`, `[tools]`, `[tui]`, `[profiles]`,
+`[models] inherit`, …) is an error naming the key and the file, so a cloned repo can't redirect
+your AMP server, keys, bash environment or workers. Repo `[roles]` merge over the user's per role,
+and the repo's `[models] profile` beats the user's (`AMP_HARNESS_PROFILE` beats both).
+`config show` prints the repo file it merged and, per role, the layer that set it (`repo <path>`).
+
+```toml
+# <repo>/.amp/harness/config.toml
+[models]
+profile = "anthropic"
+
+[roles.worker-backend]
+model = "anthropic/claude-sonnet-4-6"
+thinking = "high"
+```
+
 ## Commands (M1-4)
 
-Every command below takes the connection flags `--url`, `--ca-file`, `--protocol`, `--config` and
-`--token-env` (precedence above) and connects with D3's order: `AMP_TOKEN`, else the stored login,
+Every command below takes the connection flags `--url`, `--ca-file`, `--protocol` and
+`--token-env` (precedence above), plus the global `--config` / `--config-dir`, and connects with D3's order: `AMP_TOKEN`, else the stored login,
 else no credentials.
 
 ```sh
@@ -378,7 +416,7 @@ context_window = 262144
   request.
 
 ```sh
-amp-harness config show [--json] [--check] [--config PATH]
+amp-harness config show [--json] [--check]
 ```
 
 It prints each provider (api, URL, where its key comes from, never the key, and its timeouts) and
@@ -386,8 +424,8 @@ each role's provider/model, thinking level, readiness and the layer that set it.
 provider in use for its live model list (OpenRouter's is public; Anthropic's needs the key) and
 flags ids that are missing. It exits 1 if a role does not resolve or a checked id is missing.
 
-`config show --config PATH` reads that file. The chat and `run` always read `[models]`, `[roles]`,
-`[providers]` and `[workers]` from the default config.toml; their `--config` only changes `[server]`.
+`config show` reads the same files a session in this folder would: the user config.toml
+(`--config` / `--config-dir` apply) and the repo's `.amp/harness/config.toml`.
 
 ### Secrets never reach an agent's bash (#2142)
 
@@ -473,7 +511,7 @@ The file can also map provider ids to steps. A script that runs out fails the ru
 ## Chat (M2-7)
 
 ```sh
-amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--theme auto|dark|light|FILE] [--url URL] [--ca-file PEM] [--protocol P] [--config PATH] [--token-env VAR]
+amp-harness [--role ROLE] [--cwd DIR] [--no-session] [--theme auto|dark|light|FILE] [--url URL] [--ca-file PEM] [--protocol P] [--config FILE] [--config-dir DIR] [--token-env VAR]
 ```
 
 With no subcommand, `amp-harness` opens a full-screen chat with the manager (or `--role`), built
@@ -626,7 +664,8 @@ skill. Every other skill is listed with its path, for the agent to read when it 
 You can override or add agents and skills from disk. Later layers win:
 
 1. embedded: `v2/harness/assets/{agents,skills}`;
-2. user: `~/.config/amp-harness/{agents,skills}/` (`$XDG_CONFIG_HOME` honoured);
+2. user: `~/.config/amp-harness/{agents,skills}/` (`$XDG_CONFIG_HOME`, `--config-dir` and
+   `AMP_HARNESS_CONFIG_DIR` honoured);
 3. repo: `<dir with .amp.json>/.amp/harness/{agents,skills}/`.
 
 An agent override (`agents/amp-manager.md`) replaces the whole agent. Skills override per file:

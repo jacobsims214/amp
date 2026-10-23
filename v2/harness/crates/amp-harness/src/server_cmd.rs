@@ -363,13 +363,10 @@ pub(crate) fn save_web_url(config: &ConfigFile, web_url: &str) -> Result<(), Str
     config.edit(&changes).map(|_| ())
 }
 
-/// The config.toml the server commands read and write: `--config`, else the default path.
-fn config_file(conn: &ConnArgs) -> Result<ConfigFile, CliError> {
-    conn.config
-        .clone()
-        .or_else(|| amp_mcp::default_config_path(&|k| std::env::var(k).ok()))
-        .map(ConfigFile::new)
-        .ok_or_else(|| CliError::new("no HOME or XDG_CONFIG_HOME: nowhere to keep config.toml"))
+/// The config.toml the server commands read and write: the global `--config` / `--config-dir`
+/// (#2232), else the default path.
+fn config_file(_conn: &ConnArgs) -> Result<ConfigFile, CliError> {
+    conn::user_config_file().map(ConfigFile::new)
 }
 
 fn env_set(key: &str) -> Option<String> {
@@ -390,7 +387,8 @@ pub fn entry_settings(entry: &SavedServer, base: &ConnArgs) -> Result<Settings, 
         url: Some(entry.url.clone()),
         ca_file: entry.ca_file.as_ref().map(PathBuf::from),
         protocol,
-        config_file: base.config.clone(),
+        // The writer just created or changed the file; the default lookup finds it (#2232).
+        config_file: None,
         token_env: base.token_env.clone(),
     })?;
     if matches!(settings.ca_file_source, Some(Source::ConfigFile(_))) {
@@ -490,12 +488,9 @@ struct ShowArgs {
     json: bool,
 }
 
-/// What `set` and `use` share: where config.toml is, the token variable, and the login offer.
+/// What `set` and `use` share: the token variable and the login offer (`--config` is global).
 #[derive(Args, Debug)]
 struct WriteArgs {
-    /// Read and write this config.toml instead of ~/.config/amp-harness/config.toml.
-    #[arg(long)]
-    config: Option<PathBuf>,
     /// Read the static AMP token from this environment variable instead of AMP_TOKEN.
     #[arg(long)]
     token_env: Option<String>,
@@ -513,7 +508,6 @@ struct WriteArgs {
 impl WriteArgs {
     fn conn(&self) -> ConnArgs {
         ConnArgs {
-            config: self.config.clone(),
             token_env: self.token_env.clone(),
             ..ConnArgs::default()
         }
@@ -553,9 +547,6 @@ struct UseArgs {
 struct RemoveArgs {
     /// A saved server's name.
     name: String,
-    /// Read and write this config.toml instead of ~/.config/amp-harness/config.toml.
-    #[arg(long)]
-    config: Option<PathBuf>,
 }
 
 pub async fn run(args: ServerArgs) -> Result<(), CliError> {
@@ -851,11 +842,7 @@ async fn use_server(args: UseArgs) -> Result<(), CliError> {
 }
 
 fn remove(args: RemoveArgs) -> Result<(), CliError> {
-    let conn = ConnArgs {
-        config: args.config.clone(),
-        ..ConnArgs::default()
-    };
-    let config = config_file(&conn)?;
+    let config = config_file(&ConnArgs::default())?;
     let servers = Servers::load(&config).map_err(CliError::new)?;
     let Some(entry) = servers.get(&args.name) else {
         return Err(CliError::usage(format!(

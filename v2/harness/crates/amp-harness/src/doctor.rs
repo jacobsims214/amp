@@ -310,13 +310,12 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
 
     // The model side needs no AMP connection: a brand-new machine sees both halves at once.
     let env = |k: &str| std::env::var(k).ok();
-    let config_path = conn
-        .config
-        .clone()
-        .or_else(|| amp_mcp::default_config_path(&env))
-        .map(|p| p.display().to_string());
-    let models_config =
-        ModelsConfig::load_with_env(&env, conn.config.clone()).map_err(|e| e.to_string());
+    // #2232: the user file `--config` / `--config-dir` name, plus the repo layer of this folder.
+    let paths = std::env::current_dir()
+        .map(|cwd| crate::conn::config_paths_in(&cwd))
+        .unwrap_or_else(|_| crate::conn::config_paths());
+    let config_path = paths.user_file.as_ref().map(|p| p.display().to_string());
+    let models_config = ModelsConfig::load_paths(&env, &paths).map_err(|e| e.to_string());
     let (models, findings) =
         providers::check(models_config, config_path, &SystemKeys::from_env(), offline).await;
     for (name, finding) in findings {
