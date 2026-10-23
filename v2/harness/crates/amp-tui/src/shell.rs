@@ -905,6 +905,7 @@ impl Shell {
         self.refresh_pending_plan();
         self.running = true;
         self.prompts += 1;
+        self.view.take_error_shown();
         self.view.set_working(true);
         let harness = Arc::clone(&self.harness);
         let done = self.done_tx.clone();
@@ -952,6 +953,8 @@ impl Shell {
         self.view.set_working(false);
         let stopping = self.view.stopping();
         self.view.set_stopping(false);
+        // The reply's error line already says what went wrong: say it once (#2207).
+        let error_shown = self.view.take_error_shown();
         match result {
             Ok(r) => match r.outcome {
                 HarnessRunOutcome::Completed { .. } => {}
@@ -959,15 +962,28 @@ impl Shell {
                 // The provider may report a stopped request as an error ("Request was
                 // aborted"): the person asked for it, so it is not one.
                 HarnessRunOutcome::Failed { .. } if stopping => self.view.add_notice(STOPPED),
-                HarnessRunOutcome::Failed { error, .. } => self
-                    .view
-                    .add_error(&format!("run failed: {}: {}", error.code, error.message)),
+                HarnessRunOutcome::Failed { .. } if error_shown => {}
+                HarnessRunOutcome::Failed {
+                    error,
+                    final_message,
+                    ..
+                } => self.view.add_error(&format!(
+                    "✗ {}",
+                    amp_core::provider_error::run_failure(
+                        &error.code,
+                        &error.message,
+                        final_message.as_ref().map_or("", |m| m.provider.as_str()),
+                    )
+                )),
                 HarnessRunOutcome::Suspended { .. } => self
                     .view
                     .add_notice("the provider deferred its response (run suspended)"),
             },
             Err(_) if stopping => self.view.add_notice(STOPPED),
-            Err(e) => self.view.add_error(&format!("run failed: {e}")),
+            Err(e) => self.view.add_error(&format!(
+                "✗ run failed: {}",
+                amp_core::provider_error::summarize("", &e)
+            )),
         }
     }
 

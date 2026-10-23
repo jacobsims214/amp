@@ -31,6 +31,7 @@ use amp_core::{
     events::{RunEvent, Totals},
     models::thinking_name,
     project::ProjectMarker,
+    provider_error,
 };
 use clap::Args;
 use rpi_harness::agent_harness::{AgentLane, HarnessRunOutcome};
@@ -149,10 +150,24 @@ fn print_text_event(event: &RunEvent) -> bool {
             max_retries,
             delay_ms,
             error,
-        } => eprintln!("[retry {attempt}/{max_retries} in {delay_ms} ms] {error}"),
+        } => eprintln!(
+            "[retry {attempt}/{max_retries} in {delay_ms} ms] {}",
+            provider_error::summarize("", error)
+        ),
+        // One line (#2207); `--verbose` adds the provider's whole body (without the account id).
         RunEvent::Assistant {
-            error: Some(error), ..
-        } => eprintln!("[model error] {error}"),
+            error: Some(error),
+            provider,
+            ..
+        } => {
+            eprintln!(
+                "[model error] {}",
+                provider_error::summarize(provider, error)
+            );
+            if crate::conn::verbose() {
+                eprintln!("[model error body] {}", provider_error::redact(error));
+            }
+        }
         _ => {}
     }
     false
@@ -223,9 +238,14 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let harness = Arc::clone(&agent.harness);
     let mut totals = Totals::default();
     let mut printed_text = false;
+    // Text mode printed the model's error already: the exit message doesn't repeat it (#2207).
+    let mut printed_model_error = false;
     let mut handle = |event: rpi_agent::AgentEvent, totals: &mut Totals| {
         if let Some(e) = RunEvent::from_agent(&event) {
             totals.observe(&e);
+            if !args.json && matches!(e, RunEvent::Assistant { error: Some(_), .. }) {
+                printed_model_error = true;
+            }
             if args.json {
                 emit_json(&e);
             } else if print_text_event(&e) {
@@ -257,6 +277,8 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         handle(event, &mut totals);
     }
 
+    // `error` is one line for people; `error_detail` the provider's whole body (`--json` only).
+    let mut error_detail: Option<String> = None;
     let (outcome, text, error) = match result {
         Ok(r) => match r.outcome {
             HarnessRunOutcome::Completed { final_message, .. } => (
@@ -273,14 +295,22 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
                 error,
                 final_message,
                 ..
-            } => (
-                "failed",
-                final_message
-                    .as_ref()
-                    .map(amp_core::events::assistant_text)
-                    .unwrap_or_default(),
-                Some(format!("{}: {}", error.code, error.message)),
-            ),
+            } => {
+                let provider = final_message.as_ref().map_or("", |m| m.provider.as_str());
+                let summary = provider_error::run_failure(&error.code, &error.message, provider);
+                let detail = provider_error::redact(&error.message);
+                if detail != summary {
+                    error_detail = Some(detail);
+                }
+                (
+                    "failed",
+                    final_message
+                        .as_ref()
+                        .map(amp_core::events::assistant_text)
+                        .unwrap_or_default(),
+                    Some(summary),
+                )
+            }
             HarnessRunOutcome::Suspended { .. } => (
                 "suspended",
                 String::new(),
@@ -301,6 +331,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
             "outcome": outcome,
             "text": text,
             "error": error,
+            "error_detail": error_detail,
             "turns": totals.turns,
             "tool_calls": totals.tool_calls,
             "tool_errors": totals.tool_errors,
@@ -317,6 +348,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
 
     match outcome {
         "completed" => Ok(()),
+        "failed" if printed_model_error => Err(CliError::new("run failed (the model error above)")),
         _ => Err(CliError::new(format!(
             "run {outcome}: {}",
             error.unwrap_or_default()
