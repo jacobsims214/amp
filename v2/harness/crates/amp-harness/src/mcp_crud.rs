@@ -611,7 +611,7 @@ fn inline(v: &toml::Value) -> String {
     }
 }
 
-fn repo_root(ctx: &Ctx) -> Option<PathBuf> {
+pub(crate) fn repo_root(ctx: &Ctx) -> Option<PathBuf> {
     ctx.paths
         .repo_dir
         .as_deref()
@@ -619,7 +619,7 @@ fn repo_root(ctx: &Ctx) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn state() -> Result<PathBuf, CliError> {
+pub(crate) fn state() -> Result<PathBuf, CliError> {
     state_dir(&env).ok_or_else(|| CliError::new("no state directory: set HOME or XDG_STATE_HOME"))
 }
 
@@ -724,17 +724,17 @@ fn stderr_tail(path: Option<&Path>, n: usize) -> Vec<String> {
         .collect()
 }
 
-fn trust_store() -> Option<TrustStore> {
+pub(crate) fn trust_store() -> Option<TrustStore> {
     let state = state().ok()?;
     TrustStore::load(&TrustStore::path_in(&state)).ok()
 }
 
-fn trust_of(server: &McpServer, store: Option<&TrustStore>) -> TrustState {
+pub(crate) fn trust_of(server: &McpServer, store: Option<&TrustStore>) -> TrustState {
     mcp_trust::state_of(server, store, mcp_trust::trust_all_from(&env))
 }
 
 /// Records trust for the repo server `name` as configured now (the person just wrote it).
-fn trust_now(ctx: &Ctx, name: &str) -> Result<PathBuf, CliError> {
+pub(crate) fn trust_now(ctx: &Ctx, name: &str) -> Result<PathBuf, CliError> {
     let config = McpConfig::load(&ctx.paths);
     let server = config
         .servers
@@ -748,7 +748,7 @@ fn trust_now(ctx: &Ctx, name: &str) -> Result<PathBuf, CliError> {
     Ok(path)
 }
 
-fn untrust_now(ctx: &Ctx, name: &str) {
+pub(crate) fn untrust_now(ctx: &Ctx, name: &str) {
     let (Some(repo), Ok(state)) = (repo_root(ctx), state()) else {
         return;
     };
@@ -767,16 +767,16 @@ fn untrust_now(ctx: &Ctx, name: &str) {
 
 /// One secret a server keeps in the keychain.
 #[derive(Debug, Clone, Serialize)]
-struct SecretItem {
+pub(crate) struct SecretItem {
     /// `header X-Api-Key`, `env BRAVE_API_KEY`, `OAuth client secret`.
-    label: String,
+    pub(crate) label: String,
     /// What `mcp secret <name> <which>` matches.
     #[serde(skip)]
     which: String,
-    account: String,
+    pub(crate) account: String,
 }
 
-fn keychain_items(server: &McpServer) -> Vec<SecretItem> {
+pub(crate) fn keychain_items(server: &McpServer) -> Vec<SecretItem> {
     let name = &server.name;
     let mut out = Vec::new();
     match &server.transport {
@@ -995,7 +995,7 @@ fn refuse_secret(kind: &str, name: &str, value: &str) -> Result<(), CliError> {
 // ------------------------------------------------------------------------------------------------
 
 /// A server to add: its table and the secrets to store (a value already known, or to ask).
-struct NewServer {
+pub(crate) struct NewServer {
     table: toml::Table,
     secrets: Vec<(SecretItem, Option<String>)>,
 }
@@ -1037,6 +1037,46 @@ fn str_map(map: &BTreeMap<String, String>) -> toml::Value {
             .map(|(k, v)| (k.clone(), toml::Value::String(v.clone())))
             .collect(),
     )
+}
+
+/// The chat's `/mcp add <name> <url>` (#2245): an http server (or sse) with no headers or
+/// secrets, built exactly as `mcp add <name> <url>` builds it (a secret-looking URL is refused).
+pub(crate) fn http_spec(name: &str, url: &str, sse: bool) -> Result<NewServer, CliError> {
+    new_from_flags(&AddArgs {
+        name: name.to_owned(),
+        first: Some(url.to_owned()),
+        rest: Vec::new(),
+        transport: Some(if sse {
+            TransportArg::Sse
+        } else {
+            TransportArg::Http
+        }),
+        url: None,
+        headers: Vec::new(),
+        env: Vec::new(),
+        secret_headers: Vec::new(),
+        secret_env: Vec::new(),
+        secret_stdin: false,
+        bearer_env: None,
+        auth: None,
+        client_id: None,
+        client_secret: false,
+        oauth_scopes: Vec::new(),
+        callback_port: None,
+        no_sse_fallback: false,
+        workdir: None,
+        env_file: None,
+        per_worktree: false,
+        roles: Vec::new(),
+        startup: None,
+        startup_timeout: None,
+        timeout: None,
+        disabled: false,
+        force: false,
+        no_test: true,
+        scope: ScopeOpt::default(),
+        json: false,
+    })
 }
 
 fn new_from_flags(a: &AddArgs) -> Result<NewServer, CliError> {
@@ -1560,12 +1600,25 @@ pub async fn add_json(args: AddJsonArgs) -> Result<(), CliError> {
     .await
 }
 
-struct AddOpts {
-    force: bool,
-    no_test: bool,
-    secret_stdin: bool,
-    json: bool,
-    note: &'static str,
+pub(crate) struct AddOpts {
+    pub(crate) force: bool,
+    pub(crate) no_test: bool,
+    pub(crate) secret_stdin: bool,
+    pub(crate) json: bool,
+    pub(crate) note: &'static str,
+}
+
+/// What [`add_server_in`] wrote.
+pub(crate) struct Added {
+    pub(crate) server: McpServer,
+    pub(crate) replaced: bool,
+    pub(crate) file: PathBuf,
+    pub(crate) backup: Option<PathBuf>,
+    pub(crate) warnings: Vec<String>,
+    /// (label, keychain account) of each secret stored.
+    pub(crate) stored: Vec<(String, String)>,
+    /// The trust store, when a repo server was trusted for its author.
+    pub(crate) trusted: Option<PathBuf>,
 }
 
 async fn add_server(
@@ -1574,93 +1627,27 @@ async fn add_server(
     spec: NewServer,
     opts: AddOpts,
 ) -> Result<(), CliError> {
-    mcp_config::check_server_name(name).map_err(|(message, fix)| {
-        CliError::usage(match fix {
-            Some(fix) => format!("{message} ({fix})"),
-            None => message,
-        })
-    })?;
     let ctx = ctx()?;
-    let file = config_file(&ctx, scope)?;
-    let existing = layer_table(&ctx, scope, name)?;
-    if existing.is_some() && !opts.force {
-        return Err(CliError::usage(format!(
-            "MCP server `{name}` already exists in {}; use --force to replace it, or `amp-harness \
-             mcp edit {name}`",
-            file.path.display()
-        )));
-    }
-    let old_items: Vec<SecretItem> = existing
-        .as_ref()
-        .and_then(|v| parse_table(name, v, origin(&ctx, scope).ok()?).ok())
-        .map(|(s, _)| keychain_items(&s))
-        .unwrap_or_default();
-    let value = toml::Value::Table(spec.table);
-    let (server, warnings) = parse_table(name, &value, origin(&ctx, scope)?)?;
-    let block = mcp_block(name, &value, Some(opts.note))?;
-    let prefix = format!("mcp.{name}");
-    let check = layer_check(scope, file.path.clone(), name.to_owned(), Expect::Present);
-    let preview = preview_replace(&file, &prefix, Some(&block)).map_err(CliError::new)?;
-    check(&preview).map_err(|e| {
-        CliError::new(format!(
-            "{}: the change would not load ({e}); nothing was written",
-            file.path.display()
-        ))
-    })?;
-
-    // Secrets: asked (or taken) and stored before the config names them.
-    let (items, known): (Vec<SecretItem>, Vec<Option<String>>) = spec.secrets.into_iter().unzip();
-    let mut stored_labels = Vec::new();
-    if !items.is_empty() {
-        let service = keychain_service(name)?;
-        let ask: Vec<SecretItem> = items
-            .iter()
-            .zip(&known)
-            .filter(|(_, v)| v.is_none())
-            .map(|(i, _)| i.clone())
-            .collect();
-        let mut asked = read_secret_values(name, &ask, opts.secret_stdin)?.into_iter();
-        let values: Vec<String> = known
-            .into_iter()
-            .map(|v| v.or_else(|| asked.next()).unwrap_or_default())
-            .collect();
-        store_secrets(&service, &items, &values)?;
-        stored_labels = items.iter().map(|i| i.label.clone()).collect();
-    }
-
-    let backup = file
-        .replace_tables(&prefix, Some(&block), &check)
-        .map_err(CliError::new)?;
-    let dropped: Vec<SecretItem> = old_items
-        .into_iter()
-        .filter(|o| !items.iter().any(|i| i.account == o.account))
-        .collect();
-    forget_unused_secrets(&ctx, &dropped);
-    let trusted = if scope == Scope::Repo {
-        Some(trust_now(&ctx, name)?)
-    } else {
-        None
-    };
-    let kind = server.transport.kind().as_str();
+    let added = add_server_in(&ctx, name, scope, spec, &opts)?;
+    let kind = added.server.transport.kind().as_str();
+    let file = &added.file;
+    let existing = added.replaced;
+    let warnings = &added.warnings;
+    let trusted = added.trusted.clone();
+    let backup = added.backup.clone();
+    let stored_labels: Vec<String> = added.stored.iter().map(|(l, _)| l.clone()).collect();
     if !opts.json {
         println!(
             "{} {kind} MCP server `{name}` in the {} config ({}).",
-            if existing.is_some() {
-                "Replaced"
-            } else {
-                "Added"
-            },
+            if existing { "Replaced" } else { "Added" },
             scope.name(),
-            file.path.display()
+            file.display()
         );
-        for w in &warnings {
+        for w in warnings {
             eprintln!("  warning: {w}");
         }
-        for (label, item) in stored_labels.iter().zip(&items) {
-            println!(
-                "  Stored {label} in the OS keychain (account {}).",
-                item.account
-            );
+        for (label, account) in &added.stored {
+            println!("  Stored {label} in the OS keychain (account {account}).");
         }
         if let Some(path) = &trusted {
             println!(
@@ -1673,6 +1660,7 @@ async fn add_server(
             println!("  Backup: {}", b.display());
         }
     }
+    let server = added.server;
     let test = if opts.no_test || !server.enabled {
         None
     } else {
@@ -1687,9 +1675,9 @@ async fn add_server(
             added: name.to_owned(),
             kind,
             scope: scope.name(),
-            file: file.path.clone(),
+            file: file.clone(),
             backup,
-            replaced: existing.is_some(),
+            replaced: existing,
             secrets_stored: stored_labels,
             trusted: trusted.is_some(),
             test,
@@ -1698,12 +1686,100 @@ async fn add_server(
     Ok(())
 }
 
+/// Writes `[mcp.<name>]` into `scope`'s file (checked first; secrets stored before the config
+/// names them; a repo server trusted for its author). Prints nothing: the CLI and the chat's
+/// `/mcp add` (#2245) say what happened from [`Added`].
+pub(crate) fn add_server_in(
+    ctx: &Ctx,
+    name: &str,
+    scope: Scope,
+    spec: NewServer,
+    opts: &AddOpts,
+) -> Result<Added, CliError> {
+    mcp_config::check_server_name(name).map_err(|(message, fix)| {
+        CliError::usage(match fix {
+            Some(fix) => format!("{message} ({fix})"),
+            None => message,
+        })
+    })?;
+    let file = config_file(ctx, scope)?;
+    let existing = layer_table(ctx, scope, name)?;
+    if existing.is_some() && !opts.force {
+        return Err(CliError::usage(format!(
+            "MCP server `{name}` already exists in {}; use --force to replace it, or `amp-harness \
+             mcp edit {name}`",
+            file.path.display()
+        )));
+    }
+    let old_items: Vec<SecretItem> = existing
+        .as_ref()
+        .and_then(|v| parse_table(name, v, origin(ctx, scope).ok()?).ok())
+        .map(|(s, _)| keychain_items(&s))
+        .unwrap_or_default();
+    let value = toml::Value::Table(spec.table);
+    let (server, warnings) = parse_table(name, &value, origin(ctx, scope)?)?;
+    let block = mcp_block(name, &value, Some(opts.note))?;
+    let prefix = format!("mcp.{name}");
+    let check = layer_check(scope, file.path.clone(), name.to_owned(), Expect::Present);
+    let preview = preview_replace(&file, &prefix, Some(&block)).map_err(CliError::new)?;
+    check(&preview).map_err(|e| {
+        CliError::new(format!(
+            "{}: the change would not load ({e}); nothing was written",
+            file.path.display()
+        ))
+    })?;
+
+    // Secrets: asked (or taken) and stored before the config names them.
+    let (items, known): (Vec<SecretItem>, Vec<Option<String>>) = spec.secrets.into_iter().unzip();
+    if !items.is_empty() {
+        let service = keychain_service(name)?;
+        let ask: Vec<SecretItem> = items
+            .iter()
+            .zip(&known)
+            .filter(|(_, v)| v.is_none())
+            .map(|(i, _)| i.clone())
+            .collect();
+        let mut asked = read_secret_values(name, &ask, opts.secret_stdin)?.into_iter();
+        let values: Vec<String> = known
+            .into_iter()
+            .map(|v| v.or_else(|| asked.next()).unwrap_or_default())
+            .collect();
+        store_secrets(&service, &items, &values)?;
+    }
+
+    let backup = file
+        .replace_tables(&prefix, Some(&block), &check)
+        .map_err(CliError::new)?;
+    let dropped: Vec<SecretItem> = old_items
+        .into_iter()
+        .filter(|o| !items.iter().any(|i| i.account == o.account))
+        .collect();
+    forget_unused_secrets(ctx, &dropped);
+    let trusted = if scope == Scope::Repo {
+        Some(trust_now(ctx, name)?)
+    } else {
+        None
+    };
+    Ok(Added {
+        server,
+        replaced: existing.is_some(),
+        file: file.path.clone(),
+        backup,
+        warnings: warnings.iter().map(|w| w.to_string()).collect(),
+        stored: items
+            .iter()
+            .map(|i| (i.label.clone(), i.account.clone()))
+            .collect(),
+        trusted,
+    })
+}
+
 // ------------------------------------------------------------------------------------------------
 // list / get
 // ------------------------------------------------------------------------------------------------
 
 /// What a server runs or connects to, as written (no secrets: those are refused in these fields).
-fn target(server: &McpServer) -> String {
+pub(crate) fn target(server: &McpServer) -> String {
     match &server.transport {
         Transport::Stdio(s) => std::iter::once(s.command.as_str())
             .chain(s.args.iter().map(String::as_str))
@@ -2225,7 +2301,7 @@ pub async fn test(args: TestArgs) -> Result<(), CliError> {
 }
 
 /// The server in effect called `name`, or why there is none.
-fn effective(ctx: &Ctx, name: &str) -> Result<McpServer, CliError> {
+pub(crate) fn effective(ctx: &Ctx, name: &str) -> Result<McpServer, CliError> {
     let config = McpConfig::load(&ctx.paths);
     match config.servers.get(name) {
         Some(s) => Ok(s.clone()),
@@ -2487,20 +2563,63 @@ pub async fn remove(args: RemoveArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// What [`set_enabled_in`] did.
+pub(crate) struct Enabled {
+    /// False when it already was so (nothing written).
+    pub(crate) changed: bool,
+    /// The user config.toml (the switch is always written there).
+    pub(crate) file: PathBuf,
+    /// The server is the repo's: its file is unchanged.
+    pub(crate) repo: bool,
+}
+
 pub async fn set_enabled(args: NameArgs, on: bool) -> Result<(), CliError> {
     let ctx = ctx()?;
     let name = args.name.clone();
-    let server = effective(&ctx, &name)?;
+    let done = set_enabled_in(&ctx, &name, on)?;
+    if !done.changed {
+        if args.json {
+            return print_json(&json!({"name": name, "enabled": on, "changed": false}));
+        }
+        println!(
+            "`{name}` is already {}.",
+            if on { "enabled" } else { "disabled" }
+        );
+        return Ok(());
+    }
+    if args.json {
+        return print_json(&json!({
+            "name": name, "enabled": on, "changed": true, "file": done.file,
+            "layer": if done.repo { "repo" } else { "user" },
+        }));
+    }
+    let what = if on { "Enabled" } else { "Disabled" };
+    if done.repo {
+        println!(
+            "{what} repo MCP server `{name}` for you ({}); the repo's file is unchanged.",
+            done.file.display()
+        );
+    } else {
+        println!("{what} MCP server `{name}` ({}).", done.file.display());
+    }
+    Ok(())
+}
+
+/// Switches `name` on or off in the user config.toml (for a repo server too: a switch table),
+/// checked first. Prints nothing (the CLI and the chat's `/mcp enable|disable`, #2245).
+pub(crate) fn set_enabled_in(ctx: &Ctx, name: &str, on: bool) -> Result<Enabled, CliError> {
+    let name = name.to_owned();
+    let server = effective(ctx, &name)?;
     let user = ConfigFile::new(ctx.scope_config_file(Scope::User)?);
     let section = format!("mcp.{name}");
-    let user_table = layer_table(&ctx, Scope::User, &name)?;
+    let user_table = layer_table(ctx, Scope::User, &name)?;
     let changes: Vec<Change> = match (&server.origin.layer, &user_table) {
         // A repo server whose user switch only turned it off: drop the switch, unless the repo
         // table itself says enabled = false.
         (Layer::Repo, Some(v))
             if on
                 && is_switch(v)
-                && layer_table(&ctx, Scope::Repo, &name)?
+                && layer_table(ctx, Scope::Repo, &name)?
                     .and_then(|r| r.get("enabled").and_then(toml::Value::as_bool))
                     != Some(false) =>
         {
@@ -2513,14 +2632,11 @@ pub async fn set_enabled(args: NameArgs, on: bool) -> Result<(), CliError> {
         )],
     };
     if server.enabled == on {
-        if args.json {
-            return print_json(&json!({"name": name, "enabled": on, "changed": false}));
-        }
-        println!(
-            "`{name}` is already {}.",
-            if on { "enabled" } else { "disabled" }
-        );
-        return Ok(());
+        return Ok(Enabled {
+            changed: false,
+            file: user.path.clone(),
+            repo: server.is_repo(),
+        });
     }
     let preview = user.preview(&changes).map_err(CliError::new)?;
     let check = {
@@ -2556,22 +2672,11 @@ pub async fn set_enabled(args: NameArgs, on: bool) -> Result<(), CliError> {
         ))
     })?;
     user.edit(&changes).map_err(CliError::new)?;
-    if args.json {
-        return print_json(&json!({
-            "name": name, "enabled": on, "changed": true, "file": user.path,
-            "layer": server.origin.layer.as_str(),
-        }));
-    }
-    let what = if on { "Enabled" } else { "Disabled" };
-    if server.is_repo() {
-        println!(
-            "{what} repo MCP server `{name}` for you ({}); the repo's file is unchanged.",
-            user.path.display()
-        );
-    } else {
-        println!("{what} MCP server `{name}` ({}).", user.path.display());
-    }
-    Ok(())
+    Ok(Enabled {
+        changed: true,
+        file: user.path.clone(),
+        repo: server.is_repo(),
+    })
 }
 
 pub async fn secret(args: SecretArgs) -> Result<(), CliError> {
@@ -2669,20 +2774,31 @@ fn remote_options(
     Ok((server, options))
 }
 
+/// OAuth login to the remote server `name` (refusing stdio and untrusted repo servers);
+/// `prompt` shows the URL. The CLI's `mcp login` and the chat's `/mcp login` (#2245).
+pub(crate) async fn login_in(
+    ctx: &Ctx,
+    name: &str,
+    timeout: Duration,
+    prompt: impl FnOnce(&oauth::LoginPrompt),
+) -> Result<(McpServer, oauth::LoginOutcome), CliError> {
+    let (server, options) = remote_options(ctx, name, "login")?;
+    let backend = CredentialBackend::resolve().map_err(|e| CliError::new(e.to_string()))?;
+    let outcome = http::login(&options, backend, timeout, prompt)
+        .await
+        .map_err(|e| CliError::new(e.to_string()))?;
+    Ok((server, outcome))
+}
+
 pub async fn login(args: LoginArgs) -> Result<(), CliError> {
     let ctx = ctx()?;
-    let (server, options) = remote_options(&ctx, &args.name, "login")?;
-    let backend = CredentialBackend::resolve().map_err(|e| CliError::new(e.to_string()))?;
     let no_browser = args.no_browser;
     if !args.json {
-        eprintln!(
-            "Logging in to MCP server `{}` ({}) …",
-            server.name, options.url
-        );
+        eprintln!("Logging in to MCP server `{}` …", args.name);
     }
-    let outcome = http::login(
-        &options,
-        backend,
+    let (server, outcome) = login_in(
+        &ctx,
+        &args.name,
         Duration::from_secs(args.timeout),
         |prompt: &oauth::LoginPrompt| {
             eprintln!(
@@ -2698,8 +2814,7 @@ pub async fn login(args: LoginArgs) -> Result<(), CliError> {
             eprintln!("\n  {}\n", prompt.authorization_url);
         },
     )
-    .await
-    .map_err(|e| CliError::new(e.to_string()))?;
+    .await?;
     if args.json {
         return print_json(&json!({
             "name": server.name, "logged_in": outcome.key, "client_id": outcome.client_id,

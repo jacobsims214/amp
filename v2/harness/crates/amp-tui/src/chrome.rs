@@ -138,6 +138,9 @@ pub fn shorten(text: &str, max: usize) -> String {
 /// Live workers for the status line (the manager's `Supervisor::workers`).
 pub type WorkersFn = Arc<dyn Fn() -> Vec<WorkerStatus> + Send + Sync>;
 
+/// The MCP hub's health for the status line (#2245): `mcp 3/4` (ready of those that should run).
+pub type McpFn = Arc<dyn Fn() -> amp_core::mcp_hub::HubSummary + Send + Sync>;
+
 /// Whether this session's run is on a ticket (§2 item 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReportState {
@@ -152,6 +155,7 @@ struct Inputs {
     handle: Option<MetaHandle>,
     fixed: Option<Arc<AmpMeta>>,
     workers: Option<WorkersFn>,
+    mcp: Option<McpFn>,
     /// Report outcomes by ticket, and the most recent one.
     reports: BTreeMap<i64, ReportState>,
     last_report: Option<i64>,
@@ -166,6 +170,8 @@ pub struct ChromeData {
     pub workers: Vec<WorkerStatus>,
     pub reports: BTreeMap<i64, ReportState>,
     pub last_report: Option<i64>,
+    /// The external MCP servers' health (`None`: no hub, or no server that should run).
+    pub mcp: Option<amp_core::mcp_hub::HubSummary>,
 }
 
 impl ChromeData {
@@ -175,6 +181,7 @@ impl ChromeData {
             workers: Vec::new(),
             reports: BTreeMap::new(),
             last_report: None,
+            mcp: None,
         }
     }
 }
@@ -208,6 +215,11 @@ impl Chrome {
     /// Where local workers come from (the manager's supervisor).
     pub fn set_workers(&self, workers: WorkersFn) {
         self.with(|i| i.workers = Some(workers));
+    }
+
+    /// Where the MCP servers' health comes from (the session's hub, #2245).
+    pub fn set_mcp(&self, mcp: McpFn) {
+        self.with(|i| i.mcp = Some(mcp));
     }
 
     /// Records a report outcome for `ticket` directly.
@@ -255,19 +267,26 @@ impl Chrome {
 
     /// This frame's data, or `None` without a metadata source (the chrome is then hidden).
     pub fn data(&self) -> Option<ChromeData> {
-        let (meta, workers, reports, last_report) = self.with(|i| {
+        let (meta, workers, mcp, reports, last_report) = self.with(|i| {
             let meta = match (&i.fixed, &i.handle) {
                 (Some(m), _) => Some(Arc::clone(m)),
                 (None, Some(h)) => Some(h.snapshot()),
                 (None, None) => None,
             };
-            (meta, i.workers.clone(), i.reports.clone(), i.last_report)
+            (
+                meta,
+                i.workers.clone(),
+                i.mcp.clone(),
+                i.reports.clone(),
+                i.last_report,
+            )
         });
         Some(ChromeData {
             meta: meta?,
             workers: workers.map(|f| f()).unwrap_or_default(),
             reports,
             last_report,
+            mcp: mcp.map(|f| f()).filter(|s| s.total > 0),
         })
     }
 
@@ -281,6 +300,9 @@ impl Chrome {
             }
             d.reports.hash(&mut h);
             d.last_report.hash(&mut h);
+            if let Some(m) = d.mcp {
+                (m.ready, m.total, m.level as u8).hash(&mut h);
+            }
         }
         h.finish()
     }
@@ -807,6 +829,21 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
     }
 
     left.push(workers_seg(&style, data, p));
+
+    // #2245: the external MCP servers, `mcp 3/4` (/mcp lists them).
+    if let Some(m) = data.mcp {
+        use amp_core::mcp_hub::HubLevel;
+        let color = match m.level {
+            HubLevel::Ok => c.muted,
+            HubLevel::Degraded => c.warning,
+            HubLevel::Down => c.error,
+        };
+        left.push(Seg::new(
+            color.fg(&format!("mcp {}/{}", m.ready, m.total)),
+            Lead::Bar,
+            9,
+        ));
+    }
 
     // Plan approval.
     if meta.plan_required()

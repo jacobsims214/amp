@@ -26,6 +26,7 @@
 
 mod agents_cmd;
 mod chat;
+mod chat_config;
 mod config_cmd;
 mod conn;
 mod connect;

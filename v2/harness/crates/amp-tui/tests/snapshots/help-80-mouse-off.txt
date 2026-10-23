@@ -10,10 +10,16 @@
    /open [id|plan]          open the ticket (or the plan) in the browser
    /server [name|address]   the AMP servers; switch to another
 
- Chat
-   /model [provider/model]  pick the model for this session
+ Config
+   /model [p/m|roles|role]  this chat's model; /model roles: every role's
    /connect [provider]      model providers and their keys; add a key
+   /mcp [name|action name]  MCP servers: health, restart, enable, trust
+   /agents [id]             agents: model, skills, which file they're from
+   /skills [name]           skills: what each does, where it's from
+   /config                  every setting and where it comes from
    /reload                  reload agents, skills, models, MCP servers
+
+ Chat
    /usage                   tokens and cost this session
    /abort                   stop the reply
    /close                   close the open panel

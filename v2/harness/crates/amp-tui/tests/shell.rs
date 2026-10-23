@@ -225,7 +225,9 @@ async fn slash_commands() {
     assert!(rig.screen().contains("unknown command: /bogus"));
 
     rig.say("/help").await;
-    assert!(rig.screen().contains("/model [provider/model]"));
+    // Tall enough for the whole list.
+    let help = rig.shell.view().render_plain(W, 90).join("\n");
+    assert!(help.contains("/model [p/m|roles|role]"), "{help}");
 
     assert_eq!(rig.shell.submit("/quit").await, Submit::Quit);
     assert_eq!(rig.shell.submit("/exit").await, Submit::Quit);

@@ -1,0 +1,16 @@
+── models by role ────────────────────────────────────────────────────────────────────────────────────────
+    role              provider/model thinking chosen by
+›   designer          wf/wf-1        off      inherit (config config.toml)
+    github-researcher wf/wf-1        off      inherit (config config.toml)
+    github-reviewer   wf/wf-1        off      inherit (config config.toml)
+    kb-curator        wf/wf-1        off      inherit (config config.toml)
+  ● manager           boss/boss-1    off      config config.toml
+    media             wf/wf-1        off      inherit (config config.toml)
+    researcher        wf/wf-1        off      inherit (config config.toml)
+    reviewer          wf/wf-1        off      inherit (config config.toml)
+    worker-backend    wf/wf-1        off      inherit (config config.toml)
+    worker-docs       wf/wf-1        off      inherit (config config.toml)
+    worker-frontend   wf/wf-1        off      inherit (config config.toml)
+  ● this chat's role · Enter picks a model (for this chat, or s to save it to config.toml) · `amp-harness
+  models set` in a terminal
+  ↑↓ select · Enter pick a model · Esc close

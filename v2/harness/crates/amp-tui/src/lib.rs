@@ -62,12 +62,15 @@ pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use inset::{DEFAULT_PADDING, Inset, MAX_PADDING, MIN_INNER, Padding};
-pub use overlay::{ModelRow, Panel, PanelKind, PanelState, Stage, Target};
+pub use overlay::{
+    Cell, InfoPanel, InfoRow, ModelRow, Panel, PanelKey, PanelKind, PanelState, Stage, Target, Tone,
+};
 pub use scroll::{NEW_OUTPUT, TranscriptScroll};
 pub use shell::{
-    CTRL_D_SETTLE, ConnectFuture, ConnectReply, CtrlC, CtrlD, ESC_HINT, ESC_HINT_FOR, ModelChoice,
-    Notifier, Opener, ProviderConnect, QUIT_HINT, QUIT_HINT_FOR, ReloadControl, ReloadFuture,
-    ReloadReply, RunDone, STOPPED, ServerControl, ServerSwitched, Shell, ShellInfo, Submit,
+    CTRL_D_SETTLE, ConfigControl, ConfigFuture, ConfigReply, ConnectFuture, ConnectReply, CtrlC,
+    CtrlD, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener, ProviderConnect, QUIT_HINT,
+    QUIT_HINT_FOR, ReloadControl, ReloadFuture, ReloadReply, RunDone, STOPPED, ServerControl,
+    ServerSwitched, Shell, ShellInfo, Submit,
 };
 pub use slash::{
     COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, MenuKey, keys,

@@ -117,28 +117,28 @@ pub async fn run(command: SkillsCommand) -> Result<(), CliError> {
 
 /// `skills list --json` / `skills show --json`. Add fields, never rename or remove.
 #[derive(Debug, Serialize)]
-struct SkillReport {
-    name: String,
-    description: String,
+pub(crate) struct SkillReport {
+    pub(crate) name: String,
+    pub(crate) description: String,
     /// `built-in`, `user` or `repo`: where SKILL.md comes from.
-    origin: &'static str,
+    pub(crate) origin: &'static str,
     /// SKILL.md's file (`None` for built-in).
-    path: Option<String>,
+    pub(crate) path: Option<String>,
     /// Every layer some file comes from (a user SKILL.md over built-in scripts: built-in, user).
-    layers: Vec<&'static str>,
-    files: Vec<FileReport>,
+    pub(crate) layers: Vec<&'static str>,
+    pub(crate) files: Vec<FileReport>,
     /// Agents that preload it.
-    preloaded_by: Vec<String>,
+    pub(crate) preloaded_by: Vec<String>,
     /// SKILL.md's instructions (show only).
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    pub(crate) content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct FileReport {
-    path: String,
-    origin: &'static str,
-    file: Option<String>,
+pub(crate) struct FileReport {
+    pub(crate) path: String,
+    pub(crate) origin: &'static str,
+    pub(crate) file: Option<String>,
 }
 
 fn kind(origin: &Origin) -> (&'static str, Option<String>) {
@@ -149,7 +149,12 @@ fn kind(origin: &Origin) -> (&'static str, Option<String>) {
     }
 }
 
-fn report(assets: &Assets, roles: Option<&RoleRegistry>, name: &str, content: bool) -> SkillReport {
+pub(crate) fn report(
+    assets: &Assets,
+    roles: Option<&RoleRegistry>,
+    name: &str,
+    content: bool,
+) -> SkillReport {
     let skill = assets.skill(name).expect("listed skill");
     let (origin, path) = kind(skill.origin());
     let mut layers = Vec::new();
