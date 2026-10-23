@@ -88,7 +88,7 @@ enum ScopeName {
 }
 
 impl ScopeOpt {
-    fn get(self) -> Option<Scope> {
+    pub(crate) fn get(self) -> Option<Scope> {
         match (self.scope, self.user, self.repo) {
             (Some(ScopeName::User), ..) | (None, true, _) => Some(Scope::User),
             (Some(ScopeName::Repo), ..) | (None, _, true) => Some(Scope::Repo),
@@ -344,7 +344,7 @@ pub struct SecretArgs {
 // Context: files, layers, hub
 // ------------------------------------------------------------------------------------------------
 
-fn ctx() -> Result<Ctx, CliError> {
+pub(crate) fn ctx() -> Result<Ctx, CliError> {
     Ctx::here()
 }
 
@@ -359,7 +359,7 @@ fn layer_of(scope: Scope) -> Layer {
     }
 }
 
-fn config_file(ctx: &Ctx, scope: Scope) -> Result<ConfigFile, CliError> {
+pub(crate) fn config_file(ctx: &Ctx, scope: Scope) -> Result<ConfigFile, CliError> {
     let path = ctx.scope_config_file(scope)?;
     Ok(match scope {
         Scope::User => ConfigFile::new(path),
@@ -379,7 +379,11 @@ fn layer_mcp(text: &str, file: &Path) -> Result<toml::Table, String> {
 }
 
 /// The raw `[mcp.<name>]` of `scope`'s file, if it has one.
-fn layer_table(ctx: &Ctx, scope: Scope, name: &str) -> Result<Option<toml::Value>, CliError> {
+pub(crate) fn layer_table(
+    ctx: &Ctx,
+    scope: Scope,
+    name: &str,
+) -> Result<Option<toml::Value>, CliError> {
     let Ok(file) = config_file(ctx, scope) else {
         return Ok(None);
     };
@@ -441,7 +445,7 @@ fn pick_scope(
     }
 }
 
-fn origin(ctx: &Ctx, scope: Scope) -> Result<Origin, CliError> {
+pub(crate) fn origin(ctx: &Ctx, scope: Scope) -> Result<Origin, CliError> {
     Ok(Origin {
         layer: layer_of(scope),
         file: ctx.scope_config_file(scope)?,
@@ -449,7 +453,7 @@ fn origin(ctx: &Ctx, scope: Scope) -> Result<Origin, CliError> {
 }
 
 /// Parses one table as `scope` would load it; errors list every problem.
-fn parse_table(
+pub(crate) fn parse_table(
     name: &str,
     value: &toml::Value,
     origin: Origin,
@@ -468,13 +472,13 @@ fn parse_table(
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Expect {
+pub(crate) enum Expect {
     Present,
     Absent,
 }
 
 /// What a changed layer file must load to: `name` present and valid, or gone.
-fn layer_check(
+pub(crate) fn layer_check(
     scope: Scope,
     file: PathBuf,
     name: String,
@@ -510,7 +514,11 @@ fn layer_check(
 }
 
 /// The text `replace_tables` would write (to check before anything else is changed).
-fn preview_replace(file: &ConfigFile, prefix: &str, block: Option<&str>) -> Result<String, String> {
+pub(crate) fn preview_replace(
+    file: &ConfigFile,
+    prefix: &str,
+    block: Option<&str>,
+) -> Result<String, String> {
     let before = file.text()?.unwrap_or_default();
     let (mut text, _) = remove_tables(&before, prefix);
     if let Some(block) = block {
@@ -558,7 +566,11 @@ const KEY_ORDER: [&str; 26] = [
 
 /// `[mcp.<name>]` as TOML text: one header, `note` as a comment under it, keys in
 /// [`KEY_ORDER`], and `env`/`headers`/`oauth` as inline tables.
-fn mcp_block(name: &str, value: &toml::Value, note: Option<&str>) -> Result<String, CliError> {
+pub(crate) fn mcp_block(
+    name: &str,
+    value: &toml::Value,
+    note: Option<&str>,
+) -> Result<String, CliError> {
     let table = value
         .as_table()
         .ok_or_else(|| CliError::new(format!("`mcp.{name}` is not a table")))?;
@@ -772,7 +784,7 @@ pub(crate) struct SecretItem {
     pub(crate) label: String,
     /// What `mcp secret <name> <which>` matches.
     #[serde(skip)]
-    which: String,
+    pub(crate) which: String,
     pub(crate) account: String,
 }
 
@@ -810,7 +822,7 @@ pub(crate) fn keychain_items(server: &McpServer) -> Vec<SecretItem> {
 }
 
 /// The keychain service, or why secrets can't be kept here (with the safe alternatives).
-fn keychain_service(server: &str) -> Result<String, CliError> {
+pub(crate) fn keychain_service(server: &str) -> Result<String, CliError> {
     setup::keychain_for_keys().map_err(|why| {
         CliError::new(format!(
             "MCP server `{server}`: {why}. Its secrets are kept only in the OS keychain, never in \
@@ -931,7 +943,7 @@ fn forget_unused_secrets(ctx: &Ctx, old: &[SecretItem]) -> Vec<String> {
 
 /// `${VAR}` / `${VAR:-default}` (Claude Code, Cursor) -> `${env:VAR}` / `${env:VAR:-default}`;
 /// our own references and `$${` are left as they are.
-fn env_refs(s: &str) -> String {
+pub(crate) fn env_refs(s: &str) -> String {
     const OURS: [&str; 4] = ["repo", "worktree", "home", "config_dir"];
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -996,8 +1008,8 @@ fn refuse_secret(kind: &str, name: &str, value: &str) -> Result<(), CliError> {
 
 /// A server to add: its table and the secrets to store (a value already known, or to ask).
 pub(crate) struct NewServer {
-    table: toml::Table,
-    secrets: Vec<(SecretItem, Option<String>)>,
+    pub(crate) table: toml::Table,
+    pub(crate) secrets: Vec<(SecretItem, Option<String>)>,
 }
 
 fn split_pair(s: &str, seps: &[char], what: &str) -> Result<(String, String), CliError> {
@@ -1331,7 +1343,7 @@ fn common_fields(
 
 /// Claude Code / Cursor / VS Code server JSON -> our table. Literal secret-looking header and env
 /// values are moved to the keychain (`secret_headers` / `secret_env`), never written.
-fn new_from_json(name: &str, text: &str) -> Result<NewServer, CliError> {
+pub(crate) fn new_from_json(name: &str, text: &str) -> Result<NewServer, CliError> {
     let v: Value = serde_json::from_str(text).map_err(|e| {
         CliError::usage(format!(
             "the server JSON does not parse (line {}, column {})",
@@ -1461,7 +1473,7 @@ fn new_from_json(name: &str, text: &str) -> Result<NewServer, CliError> {
         }
     } else {
         let url = get_str("url").ok_or_else(|| CliError::usage("`url` is missing"))?;
-        t.insert("url".into(), toml::Value::String(url));
+        t.insert("url".into(), toml::Value::String(env_refs(&url)));
         let (keep, moved) = keep_or_move("header", map_of("headers")?);
         if !keep.is_empty() {
             t.insert("headers".into(), str_map(&keep));
@@ -1542,17 +1554,17 @@ fn new_from_json(name: &str, text: &str) -> Result<NewServer, CliError> {
 }
 
 #[derive(Serialize)]
-struct AddReport {
-    added: String,
+pub(crate) struct AddReport {
+    pub(crate) added: String,
     #[serde(rename = "type")]
-    kind: &'static str,
-    scope: &'static str,
-    file: PathBuf,
-    backup: Option<PathBuf>,
-    replaced: bool,
-    secrets_stored: Vec<String>,
-    trusted: bool,
-    test: Option<TestReport>,
+    pub(crate) kind: &'static str,
+    pub(crate) scope: &'static str,
+    pub(crate) file: PathBuf,
+    pub(crate) backup: Option<PathBuf>,
+    pub(crate) replaced: bool,
+    pub(crate) secrets_stored: Vec<String>,
+    pub(crate) trusted: bool,
+    pub(crate) test: Option<TestReport>,
 }
 
 pub async fn add(args: AddArgs) -> Result<(), CliError> {
@@ -1568,9 +1580,11 @@ pub async fn add(args: AddArgs) -> Result<(), CliError> {
             secret_stdin: args.secret_stdin,
             json: args.json,
             note: "Added by `amp-harness mcp add`.",
+            quiet: false,
         },
     )
     .await
+    .map(drop)
 }
 
 pub async fn add_json(args: AddJsonArgs) -> Result<(), CliError> {
@@ -1595,9 +1609,11 @@ pub async fn add_json(args: AddJsonArgs) -> Result<(), CliError> {
             secret_stdin: false,
             json: args.json,
             note: "Added by `amp-harness mcp add-json`.",
+            quiet: false,
         },
     )
     .await
+    .map(drop)
 }
 
 pub(crate) struct AddOpts {
@@ -1606,6 +1622,8 @@ pub(crate) struct AddOpts {
     pub(crate) secret_stdin: bool,
     pub(crate) json: bool,
     pub(crate) note: &'static str,
+    /// Print nothing; the caller reports (`mcp import`, the chat's `/mcp add`).
+    pub(crate) quiet: bool,
 }
 
 /// What [`add_server_in`] wrote.
@@ -1621,12 +1639,14 @@ pub(crate) struct Added {
     pub(crate) trusted: Option<PathBuf>,
 }
 
-async fn add_server(
+/// Writes one server (secrets first, then the checked table, then repo trust), optionally tests
+/// it, and reports what it did (printed unless `opts.quiet`).
+pub(crate) async fn add_server(
     name: &str,
     scope: Scope,
     spec: NewServer,
     opts: AddOpts,
-) -> Result<(), CliError> {
+) -> Result<AddReport, CliError> {
     let ctx = ctx()?;
     let added = add_server_in(&ctx, name, scope, spec, &opts)?;
     let kind = added.server.transport.kind().as_str();
@@ -1636,7 +1656,8 @@ async fn add_server(
     let trusted = added.trusted.clone();
     let backup = added.backup.clone();
     let stored_labels: Vec<String> = added.stored.iter().map(|(l, _)| l.clone()).collect();
-    if !opts.json {
+    let print = !opts.json && !opts.quiet;
+    if print {
         println!(
             "{} {kind} MCP server `{name}` in the {} config ({}).",
             if existing { "Replaced" } else { "Added" },
@@ -1665,25 +1686,26 @@ async fn add_server(
         None
     } else {
         let report = test_server(&ctx, server.clone()).await?;
-        if !opts.json {
+        if print {
             print_test(&report, "  Test: ");
         }
         Some(report)
     };
-    if opts.json {
-        return print_json(&AddReport {
-            added: name.to_owned(),
-            kind,
-            scope: scope.name(),
-            file: file.clone(),
-            backup,
-            replaced: existing,
-            secrets_stored: stored_labels,
-            trusted: trusted.is_some(),
-            test,
-        });
+    let report = AddReport {
+        added: name.to_owned(),
+        kind,
+        scope: scope.name(),
+        file: file.clone(),
+        backup,
+        replaced: existing,
+        secrets_stored: stored_labels,
+        trusted: trusted.is_some(),
+        test,
+    };
+    if opts.json && !opts.quiet {
+        print_json(&report)?;
     }
-    Ok(())
+    Ok(report)
 }
 
 /// Writes `[mcp.<name>]` into `scope`'s file (checked first; secrets stored before the config
@@ -2240,7 +2262,7 @@ async fn test_server(ctx: &Ctx, mut server: McpServer) -> Result<TestReport, Cli
     })
 }
 
-fn print_test(r: &TestReport, prefix: &str) {
+pub(crate) fn print_test(r: &TestReport, prefix: &str) {
     if r.ok {
         let mut line = format!(
             "{prefix}ready in {:.1} s, {} tool{}",

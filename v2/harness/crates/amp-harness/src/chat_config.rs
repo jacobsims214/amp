@@ -453,6 +453,7 @@ impl Inner {
                         secret_stdin: false,
                         json: false,
                         note: "Added from the chat (`/mcp add`).",
+                        quiet: true,
                     },
                 )
                 .map_err(|e| e.to_string())?;
