@@ -278,8 +278,9 @@ amp-harness logout [--url URL]
 
 Tests (`crates/amp-mcp/tests/oauth.rs`) run a mock authorization server (protected-resource and AS
 metadata, DCR, PKCE S256 check, rotating refresh tokens, `invalid_grant`) with a scripted browser.
-The keychain test uses a per-run service `amp-harness-test-<pid>`, deletes its entry, and skips
-where no keychain answers (Linux CI) or when `AMP_TEST_SKIP_KEYCHAIN` is set.
+The keychain test uses a per-run service `amp-harness-test-<pid>` and deletes its entry. Like
+every test that writes the real keychain, it is opt-in: it runs only with `AMP_TEST_KEYCHAIN=1`, so a
+plain `make test` never touches your login keychain or raises a keychain dialog.
 
 ## Keychain on macOS (#2165)
 
@@ -343,6 +344,12 @@ the MCP layer), `[roles.*]` (same schema as the user file) and `[models] profile
 your AMP server, keys, bash environment or workers. Repo `[roles]` merge over the user's per role,
 and the repo's `[models] profile` beats the user's (`AMP_HARNESS_PROFILE` beats both).
 `config show` prints the repo file it merged and, per role, the layer that set it (`repo <path>`).
+
+Every write to a config.toml (`connect`, `mcp add`, `models set`, the chat's `/model` and `/mcp`
+panels, …) takes an advisory lock on `config.toml.lock` next to the file, re-reads the file under
+it and writes through a uniquely named temporary file, so a chat and a CLI writing at the same time
+both keep their change. A symlinked config.toml (stow, chezmoi, home-manager) stays a symlink: the
+file it points to is written, and its lock sits next to that file.
 
 A repo's `[mcp.*]` servers start only once you trust them, because they can run commands or
 receive what the agents send. The chat asks for each one before it starts its MCP servers (`y`,
@@ -462,6 +469,13 @@ amp-harness mcp import                              # lists what it finds here a
   import changes nothing. Any server that can't be imported stops the import before anything is
   written, naming `--only` for the rest. Writing asks for confirmation (`--yes` without a
   terminal); `--scope repo` also trusts what it writes for you; `--test` connects afterwards.
+
+A tool result longer than the server's `max_output_tokens` (default 25 000, or `[tools]
+mcp_max_output_tokens`) is cut, and the whole text is saved under
+`~/.local/state/amp-harness/mcp-output/<ticket or session>/<call>.txt` for the agent to read. Those
+files are private (0600, in 0700 directories). Each chat and `run -p` prunes them when it starts
+and every hour: files older than `[tools] mcp_output_keep_days` (default 7) go, then the oldest
+until the rest fit in `[tools] mcp_output_max_mb` (default 512). `0` turns either limit off.
 
 ```toml
 # <repo>/.amp/harness/config.toml
@@ -776,6 +790,12 @@ client_key = "~/.config/corp/me.key"
     - client certificate required: `--client-cert` / `--client-key`;
     - a token tool missing or failing: install it, or run it yourself;
     - Entra: `az login`, or tenant/client id.
+
+- **Redirects:** a provider request (and a token request) follows a redirect only to the same
+  origin (scheme, host and port) as its base_url or token_url. A redirect to any other origin is
+  refused with "refused a redirect to another origin (<origin>)", so `api-key`, `x-api-key`,
+  secret headers and client secrets are never sent to another host. Set `base_url` to the address
+  the endpoint redirects to. MCP servers already follow only same-origin 307/308 redirects.
 
 ## Providers and models (M2-3)
 

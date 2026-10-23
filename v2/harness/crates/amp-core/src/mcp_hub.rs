@@ -33,7 +33,9 @@
 //! `call_timeout_secs`; a cancelled run drops it (rmcp sends `notifications/cancelled`).
 //! Text beyond `max_output_tokens` (4 characters per token) is cut: the model gets the head plus a
 //! line naming the file under `<state>/mcp-output/<ticket or session>/` that holds all of it
-//! ([`cap_output`]).
+//! ([`cap_output`]). Those files are private (0600, in 0700 directories) and pruned by age and
+//! total size ([`OutputRetention`], [`prune_output`]) when the hub starts and every hour after
+//! (#2309).
 //!
 //! # Sessions
 //!
@@ -113,6 +115,11 @@ pub const MAX_INSTRUCTIONS_BYTES: usize = 4096;
 pub const ENV_MAX_OUTPUT_TOKENS: &str = "AMP_HARNESS_MCP_MAX_OUTPUT_TOKENS";
 /// Characters per token when estimating output size (D9).
 pub const CHARS_PER_TOKEN: u64 = 4;
+/// How often a started hub prunes `<state>/mcp-output/` again ([`prune_output`]).
+pub const OUTPUT_PRUNE_EVERY: Duration = Duration::from_secs(3600);
+/// Empty `<state>/mcp-output/<key>/` directories are removed once they are this old, so one a
+/// session has just created is not taken from under it.
+const EMPTY_DIR_GRACE: Duration = Duration::from_secs(3600);
 /// The tag around each server's instructions in the system prompt.
 pub const INSTRUCTIONS_TAG: &str = "mcp_server_instructions";
 
@@ -174,6 +181,41 @@ pub struct HubOptions {
     pub trust_store: Option<PathBuf>,
     /// `--trust-repo-mcp` / `AMP_HARNESS_TRUST_REPO_MCP`: every repo server may start.
     pub trust_all: bool,
+    /// How long and how much spilled output `<state>/mcp-output/` keeps (#2309): pruned at
+    /// [`McpHub::start`] and every [`OUTPUT_PRUNE_EVERY`]. `None` (the default here; a session's
+    /// runtime sets the configured one) never prunes, so a short-lived CLI hub cannot apply other
+    /// limits than the person's.
+    pub output_retention: Option<OutputRetention>,
+}
+
+/// How much spilled MCP output (`<state>/mcp-output/`) is kept (#2309): `[tools]
+/// mcp_output_keep_days` (default 7) and `mcp_output_max_mb` (default 512). `None` keeps files
+/// regardless of age or of total size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputRetention {
+    pub max_age: Option<Duration>,
+    pub max_bytes: Option<u64>,
+}
+
+impl OutputRetention {
+    pub const DEFAULT_KEEP_DAYS: u64 = 7;
+    pub const DEFAULT_MAX_MB: u64 = 512;
+
+    /// From `[tools] mcp_output_keep_days` / `mcp_output_max_mb`; 0 turns that limit off.
+    pub fn from_config(keep_days: Option<u64>, max_mb: Option<u64>) -> Self {
+        let days = keep_days.unwrap_or(Self::DEFAULT_KEEP_DAYS);
+        let mb = max_mb.unwrap_or(Self::DEFAULT_MAX_MB);
+        Self {
+            max_age: (days > 0).then(|| Duration::from_secs(days.saturating_mul(86_400))),
+            max_bytes: (mb > 0).then(|| mb.saturating_mul(1024 * 1024)),
+        }
+    }
+}
+
+impl Default for OutputRetention {
+    fn default() -> Self {
+        Self::from_config(None, None)
+    }
 }
 
 impl HubOptions {
@@ -190,6 +232,7 @@ impl HubOptions {
             default_max_output_tokens: None,
             trust_store: Some(crate::mcp_trust::TrustStore::path_in(&state_dir)),
             trust_all: crate::mcp_trust::trust_all_from(&|k| std::env::var(k).ok()),
+            output_retention: None,
             state_dir,
         }
     }
@@ -858,12 +901,45 @@ impl McpHub {
         if self.inner.started.swap(true, Ordering::AcqRel) {
             return;
         }
+        self.spawn_output_pruner();
         let untrusted = self.inner.untrusted_map();
         for cell in self.inner.shared_cells() {
             if cell.server.startup != Startup::Lazy && !untrusted.contains_key(&cell.server.name) {
                 self.spawn_cell(&cell, cell.stop.clone(), None);
             }
         }
+    }
+
+    /// Prunes `<state>/mcp-output/` now and every [`OUTPUT_PRUNE_EVERY`] until shutdown (#2309).
+    fn spawn_output_pruner(&self) {
+        let Some(retention) = self.inner.opts.output_retention else {
+            return;
+        };
+        let root = self.inner.opts.state_dir.join("mcp-output");
+        let cancel = self.inner.cancel.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let dir = root.clone();
+                let pruned = tokio::task::spawn_blocking(move || {
+                    prune_output(&dir, retention, std::time::SystemTime::now())
+                })
+                .await;
+                if let Ok(p) = pruned
+                    && p.removed > 0
+                {
+                    tracing::debug!(removed = p.removed, kept = p.kept, "pruned mcp-output");
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(OUTPUT_PRUNE_EVERY) => {}
+                }
+            }
+        });
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(task);
     }
 
     fn spawn_cell(
@@ -2243,7 +2319,7 @@ pub fn cap_output(text: &str, max_tokens: u64, dir: &Path, call_id: &str) -> Str
         id => id,
     };
     let path = dir.join(format!("{id}.txt"));
-    let saved = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&path, text));
+    let saved = write_private_output(dir, &path, text);
     match saved {
         Ok(()) => format!(
             "{head}\n\n[truncated: {tokens} tokens, over the {max_tokens}-token limit; full output \
@@ -2255,6 +2331,140 @@ pub fn cap_output(text: &str, max_tokens: u64, dir: &Path, call_id: &str) -> Str
              output could not be saved: {e}]"
         ),
     }
+}
+
+/// Writes a spill file 0600 inside `dir` (0700, as is `<state>/mcp-output/` when it is created
+/// here). Tool output can hold anything the server could read, so no other user may read it.
+fn write_private_output(dir: &Path, path: &Path, text: &str) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        builder.mode(0o700);
+        builder.create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    builder.create(dir)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        // An older file of the same name may have been created with the umask's mode.
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::io::Write::write_all(&mut file, text.as_bytes())
+}
+
+/// What [`prune_output`] did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneOutcome {
+    /// Files deleted.
+    pub removed: usize,
+    /// Files kept.
+    pub kept: usize,
+    /// Their total size in bytes.
+    pub kept_bytes: u64,
+}
+
+/// Prunes spilled MCP output under `root` (`<state>/mcp-output/`, laid out `<key>/<call>.txt`):
+/// files older than `retention.max_age` go, then the oldest until the rest fit in
+/// `retention.max_bytes`; empty key directories older than an hour go too. Everything kept is
+/// made private (files 0600, directories 0700), which also fixes files from older versions.
+/// Symlinks are never followed or deleted through. Errors on single entries are skipped.
+pub fn prune_output(
+    root: &Path,
+    retention: OutputRetention,
+    now: std::time::SystemTime,
+) -> PruneOutcome {
+    let mut out = PruneOutcome::default();
+    let is_dir = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+    if !is_dir(root) {
+        return out;
+    }
+    make_private(root, 0o700);
+    let age = |m: &std::fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default()
+    };
+    let mut files: Vec<(PathBuf, std::time::SystemTime, u64)> = Vec::new();
+    let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+    let Ok(keys) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for key in keys.flatten() {
+        let Ok(meta) = std::fs::symlink_metadata(key.path()) else {
+            continue;
+        };
+        if !meta.file_type().is_dir() {
+            continue;
+        }
+        let dir = key.path();
+        // Judged before its files are pruned (which touches it): a directory nobody has written
+        // to for an hour is no session's current one.
+        let idle = age(&meta) > EMPTY_DIR_GRACE;
+        make_private(&dir, 0o700);
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let Ok(m) = std::fs::symlink_metadata(entry.path()) else {
+                    continue;
+                };
+                if !m.file_type().is_file() {
+                    continue;
+                }
+                if retention.max_age.is_some_and(|max| age(&m) > max) {
+                    if std::fs::remove_file(entry.path()).is_ok() {
+                        out.removed += 1;
+                    }
+                    continue;
+                }
+                make_private(&entry.path(), 0o600);
+                let modified = m.modified().unwrap_or(std::time::UNIX_EPOCH);
+                files.push((entry.path(), modified, m.len()));
+            }
+        }
+        dirs.push((dir, idle));
+    }
+    // Oldest first, until the rest fit.
+    files.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mut total: u64 = files.iter().map(|f| f.2).sum();
+    for (path, _, len) in files {
+        if retention.max_bytes.is_some_and(|max| total > max) && std::fs::remove_file(&path).is_ok()
+        {
+            out.removed += 1;
+            total -= len;
+        } else {
+            out.kept += 1;
+        }
+    }
+    out.kept_bytes = total;
+    for (dir, idle) in dirs {
+        if idle {
+            // Fails (and is skipped) unless it is empty.
+            let _ = std::fs::remove_dir(&dir);
+        }
+    }
+    out
+}
+
+fn make_private(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
 }
 
 /// `s` with everything but `[A-Za-z0-9_.-]` replaced by `_` (a file or directory name).
@@ -2387,6 +2597,182 @@ mod tests {
     fn file_components_are_safe() {
         assert_eq!(file_component("../x y"), "_x_y");
         assert_eq!(file_component("amp-manager-17"), "amp-manager-17");
+    }
+
+    /// #2309 (H18 finding 10): spill files are 0600 in 0700 directories, even when an older
+    /// file of the same name was world-readable.
+    #[cfg(unix)]
+    #[test]
+    fn spilled_output_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("cap-private").join("mcp-output");
+        let dir = root.join("amp-manager-1");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        cap_output(&"x".repeat(100), 2, &dir, "c1");
+        assert_eq!(mode(&dir.join("c1.txt")), 0o600);
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&root), 0o700);
+        std::fs::set_permissions(dir.join("c1.txt"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        cap_output(&"y".repeat(100), 2, &dir, "c1");
+        assert_eq!(mode(&dir.join("c1.txt")), 0o600);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("c1.txt")).unwrap(),
+            "y".repeat(100)
+        );
+    }
+
+    /// Writes `len` bytes to `path`, last modified `age` ago.
+    fn aged(path: &Path, len: usize, age: Duration) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "z".repeat(len)).unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(std::time::SystemTime::now() - age).unwrap();
+    }
+
+    const DAY: Duration = Duration::from_secs(86_400);
+
+    #[test]
+    fn retention_comes_from_config_with_defaults_and_zero_turns_a_limit_off() {
+        assert_eq!(
+            OutputRetention::default(),
+            OutputRetention {
+                max_age: Some(DAY * 7),
+                max_bytes: Some(512 * 1024 * 1024)
+            }
+        );
+        assert_eq!(
+            OutputRetention::from_config(Some(0), Some(1)),
+            OutputRetention {
+                max_age: None,
+                max_bytes: Some(1024 * 1024)
+            }
+        );
+        assert_eq!(
+            OutputRetention::from_config(Some(2), Some(0)).max_bytes,
+            None
+        );
+    }
+
+    /// #2309: pruning removes files past the age limit, then the oldest until the rest fit, and
+    /// never deletes through a symlink.
+    #[test]
+    fn prune_removes_old_output_then_the_oldest_over_the_size_cap() {
+        let base = scratch("prune");
+        let root = base.join("mcp-output");
+        aged(&root.join("old-session/a.txt"), 10, DAY * 9);
+        std::fs::File::open(root.join("old-session"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - DAY * 9)
+            .unwrap();
+        aged(&root.join("t42/b.txt"), 100, DAY * 3);
+        aged(&root.join("t42/c.txt"), 100, DAY * 2);
+        aged(&root.join("now/d.txt"), 100, Duration::from_secs(5));
+        // A file outside, reached through a symlink in the tree: never touched.
+        aged(&base.join("outside.txt"), 10, DAY * 30);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(base.join("outside.txt"), root.join("t42/link.txt")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&base, root.join("linked-dir")).unwrap();
+        // An empty directory from long ago goes; the empty one just made stays.
+        std::fs::create_dir_all(root.join("empty-old")).unwrap();
+        std::fs::File::open(root.join("empty-old"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - DAY)
+            .unwrap();
+        std::fs::create_dir_all(root.join("empty-new")).unwrap();
+
+        let retention = OutputRetention {
+            max_age: Some(DAY * 7),
+            max_bytes: Some(250),
+        };
+        let out = prune_output(&root, retention, std::time::SystemTime::now());
+        assert_eq!(
+            out,
+            PruneOutcome {
+                removed: 2,
+                kept: 2,
+                kept_bytes: 200
+            }
+        );
+        assert!(!root.join("old-session/a.txt").exists());
+        assert!(!root.join("old-session").exists());
+        assert!(!root.join("t42/b.txt").exists(), "the oldest goes first");
+        assert!(root.join("t42/c.txt").exists() && root.join("now/d.txt").exists());
+        assert!(base.join("outside.txt").exists());
+        assert!(!root.join("empty-old").exists());
+        assert!(root.join("empty-new").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode(&root.join("t42/c.txt")),
+                0o600,
+                "fixed from the umask's mode"
+            );
+            assert_eq!(mode(&root.join("t42")), 0o700);
+            assert_eq!(mode(&root), 0o700);
+            assert!(
+                std::fs::symlink_metadata(root.join("t42/link.txt"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+        // No limits: nothing goes. No directory: nothing to do.
+        let none = OutputRetention {
+            max_age: None,
+            max_bytes: None,
+        };
+        assert_eq!(
+            prune_output(&root, none, std::time::SystemTime::now()).removed,
+            0
+        );
+        assert_eq!(
+            prune_output(
+                &base.join("missing"),
+                retention,
+                std::time::SystemTime::now()
+            ),
+            PruneOutcome::default()
+        );
+    }
+
+    /// #2309: a session's hub prunes when it starts; a hub without a retention never does.
+    #[tokio::test]
+    async fn a_started_hub_prunes_old_output() {
+        let base = scratch("prune-start");
+        let old = base.join("state/mcp-output/s/old.txt");
+        let config = || McpConfig {
+            servers: BTreeMap::new(),
+            problems: Vec::new(),
+            broken: BTreeSet::new(),
+        };
+        let options = |retention| {
+            let mut o = HubOptions::new(ConfigPaths::default(), base.join("state"), base.clone());
+            o.trust_store = None;
+            o.output_retention = retention;
+            o
+        };
+        aged(&old, 10, DAY * 30);
+        let hub = McpHub::new(config(), options(None));
+        hub.start();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(old.exists(), "no retention: nothing pruned");
+        hub.shutdown().await;
+
+        let hub = McpHub::new(config(), options(Some(OutputRetention::default())));
+        hub.start();
+        let started = Instant::now();
+        while old.exists() && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!old.exists(), "pruned at start");
+        // The hourly pruner stops with the hub.
+        tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
+            .await
+            .expect("shutdown is not held up by the pruner");
     }
 
     fn scratch(name: &str) -> PathBuf {

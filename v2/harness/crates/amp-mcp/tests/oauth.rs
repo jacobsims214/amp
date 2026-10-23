@@ -934,12 +934,13 @@ async fn a_loosened_credentials_file_is_put_back_to_0600() {
 }
 
 /// The real OS keychain, under a test-only service name; the entry is deleted afterwards even if
-/// the test fails. Skipped (with a note) where there is no keychain, e.g. Linux CI without a
-/// Secret Service, or when AMP_TEST_SKIP_KEYCHAIN is set.
+/// the test fails. Opt-in (#2309): it runs only with `AMP_TEST_KEYCHAIN=1`, because it writes to
+/// the developer's login keychain and can raise a GUI prompt; also skipped where there is no
+/// keychain.
 #[tokio::test]
 async fn keychain_store_round_trip_and_login() {
-    if std::env::var_os("AMP_TEST_SKIP_KEYCHAIN").is_some() {
-        eprintln!("skipped: AMP_TEST_SKIP_KEYCHAIN is set");
+    if std::env::var("AMP_TEST_KEYCHAIN").as_deref() != Ok("1") {
+        eprintln!("skipped: set AMP_TEST_KEYCHAIN=1 to run the real-keychain case");
         return;
     }
     let service = format!("amp-harness-test-{}", std::process::id());

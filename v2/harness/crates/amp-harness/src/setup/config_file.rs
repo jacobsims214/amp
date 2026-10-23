@@ -9,12 +9,23 @@
 //! ([`ConfigFile::replace_tables`]): the tables of that one provider are cut out line by line, the
 //! new block is appended, the result must pass the caller's check, and the previous file is kept as
 //! `config.toml.bak` first.
+//!
+//! Writes are safe against other writers (#2309): the chat's panels and any number of CLI
+//! commands may change the same file at once. Every read-modify-write holds an advisory lock on
+//! `<file>.lock` next to the real file, re-reads the file under it, and writes through a uniquely
+//! named temporary file in the same directory. A symlinked config.toml (stow, chezmoi,
+//! home-manager) stays a symlink: the file it points to is written instead.
 
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+/// How long a writer waits for another one to finish before giving up.
+const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// The header of a config.toml that setup creates.
 const NEW_FILE_HEADER: &str = "# amp-harness settings, written by the first run, `amp-harness init` and `amp-harness server`. Edit freely.\n\
@@ -475,6 +486,7 @@ impl ConfigFile {
         block: Option<&str>,
         check: &dyn Fn(&str) -> Result<(), String>,
     ) -> Result<Option<PathBuf>, String> {
+        let _lock = lock_config(&self.path)?;
         let before = self.read()?;
         let (mut text, _) = remove_tables(&before, prefix);
         if let Some(block) = block {
@@ -525,6 +537,9 @@ impl ConfigFile {
         if changes.is_empty() {
             return Ok(None);
         }
+        // Read, check and write under the lock, so a concurrent writer's change is either already
+        // in the text the changes apply to, or waits for this one.
+        let _lock = lock_config(&self.path)?;
         let existing = self.text()?;
         let text = self.preview(changes)?;
         if existing.as_deref() == Some(text.as_str()) {
@@ -592,6 +607,7 @@ impl ConfigFile {
         if entries.is_empty() {
             return Ok(());
         }
+        let _lock = lock_config(&self.path)?;
         let mut text = self.read()?;
         for (section, key, value) in entries {
             text = set_string(&text, section, key, value);
@@ -623,12 +639,85 @@ fn non_table_on(doc: &toml::Table, section: &str) -> Option<String> {
     None
 }
 
-/// Writes `text` to `path` through a temporary file in the same directory, mode 0600, creating
-/// the directory (0700) when needed.
-pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| format!("{}: no parent directory", path.display()))?;
+/// The file a write to `path` lands in: `path` itself, or, when it is a symlink, the file the
+/// link (and any links after it) points to, which need not exist yet. Relative link targets are
+/// resolved against the link's directory.
+pub fn write_target(path: &Path) -> Result<PathBuf, String> {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let link = fs::read_link(&current)
+                    .map_err(|e| format!("read link {}: {e}", current.display()))?;
+                current = match current.parent() {
+                    Some(dir) if link.is_relative() => dir.join(link),
+                    _ => link,
+                };
+            }
+            _ => return Ok(current),
+        }
+    }
+    Err(format!("{}: too many levels of symlinks", path.display()))
+}
+
+/// An advisory lock on a config file, held until dropped (the OS also releases it when the
+/// process exits, so a crashed writer never leaves it held).
+#[derive(Debug)]
+pub struct ConfigLock {
+    _file: fs::File,
+}
+
+/// Takes the lock on `<real file>.lock` that every writer of `path` takes, waiting up to
+/// [`LOCK_WAIT`] for another writer to finish. The lock file sits next to the real file (behind
+/// any symlink), so writers that reach it through different links share one lock. It is left in
+/// place: removing it would let two writers lock two different files.
+pub fn lock_config(path: &Path) -> Result<ConfigLock, String> {
+    let target = write_target(path)?;
+    let dir = parent_of(&target)?;
+    ensure_private_dir(dir)?;
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    let lock_path = dir.join(name);
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|e| format!("lock {}: {e}", lock_path.display()))?;
+    let started = Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(ConfigLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) if started.elapsed() < LOCK_WAIT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "{}: another amp-harness has been writing it for {} s; nothing was \
+                     changed, try again",
+                    target.display(),
+                    LOCK_WAIT.as_secs()
+                ));
+            }
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(format!("lock {}: {e}", lock_path.display()));
+            }
+        }
+    }
+}
+
+fn parent_of(path: &Path) -> Result<&Path, String> {
+    path.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| format!("{}: no parent directory", path.display()))
+}
+
+/// Creates `dir` (0700) when it does not exist yet; an existing directory is left as it is.
+fn ensure_private_dir(dir: &Path) -> Result<(), String> {
     if !dir.is_dir() {
         fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
         #[cfg(unix)]
@@ -637,10 +726,35 @@ pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
         }
     }
-    let tmp = path.with_extension("toml.tmp");
+    Ok(())
+}
+
+/// Writes `text` to `path` atomically, mode 0600, creating the directory (0700) when needed.
+///
+/// The text goes to a uniquely named temporary file in the same directory (so concurrent writers
+/// never truncate each other's), which is then renamed over the file. A symlink at `path` is kept:
+/// the file it points to is replaced instead. Callers that read the file first hold
+/// [`lock_config`] around the read and this write.
+pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let target = write_target(path)?;
+    let dir = parent_of(&target)?;
+    ensure_private_dir(dir)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let mut name = std::ffi::OsString::from(".");
+    name.push(target.file_name().unwrap_or_default());
+    name.push(format!(
+        ".{}-{nanos}-{}.tmp",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = dir.join(name);
     let write = || -> std::io::Result<()> {
         let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -649,7 +763,7 @@ pub fn write_private(path: &Path, text: &str) -> Result<(), String> {
         let mut file = options.open(&tmp)?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, &target)
     };
     write().map_err(|e| {
         let _ = fs::remove_file(&tmp);
@@ -919,6 +1033,149 @@ mod tests {
             let mode = fs::metadata(&file.path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/config-file-2309")
+            .join(name);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #2309 (H18 finding 9): writers racing on one file each keep their change, and leave no
+    /// temporary file behind.
+    #[test]
+    fn concurrent_writers_never_lose_a_change() {
+        let dir = scratch("race");
+        let path = dir.join("config.toml");
+        fs::write(&path, "# mine\n[tui]\ntheme = \"dark\"\n").unwrap();
+        let threads: Vec<_> = (0..12)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let file = ConfigFile::new(path);
+                    for round in 0..5 {
+                        let section = format!("roles.r{i}");
+                        if i % 3 == 0 {
+                            file.set(&[(section.as_str(), "model", &format!("p/m{round}"))])
+                                .unwrap();
+                        } else if i % 3 == 1 {
+                            file.edit(&[Change::set(&section, "model", format!("p/m{round}"))])
+                                .unwrap();
+                        } else {
+                            let block = format!("[{section}]\nmodel = \"p/m{round}\"\n");
+                            file.replace_tables(&section, Some(&block), &|_| Ok(()))
+                                .unwrap();
+                        }
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        let doc: toml::Table = toml::from_str(&text).unwrap();
+        for i in 0..12 {
+            assert_eq!(
+                doc["roles"][&format!("r{i}")]["model"].as_str(),
+                Some("p/m4"),
+                "r{i} lost: {text}"
+            );
+        }
+        assert_eq!(doc["tui"]["theme"].as_str(), Some("dark"));
+        assert!(text.starts_with("# mine"));
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2309: a symlinked config.toml (dotfile managers) stays a link; its target is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_stays_a_symlink() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = scratch("symlink");
+        fs::create_dir_all(dir.join("dotfiles")).unwrap();
+        fs::create_dir_all(dir.join("home")).unwrap();
+        let real = dir.join("dotfiles/config.toml");
+        fs::write(&real, "# tracked\n[tui]\ntheme = \"dark\"\n").unwrap();
+        let link = dir.join("home/config.toml");
+        symlink("../dotfiles/config.toml", &link).unwrap();
+        let file = ConfigFile::new(link.clone());
+
+        let backup = file
+            .edit(&[Change::set("server", "url", "http://x/mcp")])
+            .unwrap()
+            .unwrap();
+        file.set(&[("models", "profile", "anthropic")]).unwrap();
+        file.replace_tables(
+            "providers.gw",
+            Some("[providers.gw]\nbase_url = \"http://gw/v1\"\n"),
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        let text = fs::read_to_string(&real).unwrap();
+        assert!(text.starts_with("# tracked"), "{text}");
+        for want in ["http://x/mcp", "anthropic", "http://gw/v1", "theme"] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_to_string(backup).unwrap().contains("# tracked"));
+        // The lock sits next to the real file, not the link.
+        assert!(dir.join("dotfiles/config.toml.lock").is_file());
+
+        // A link to a file that does not exist yet: the file is created where it points.
+        let fresh = dir.join("home/fresh.toml");
+        symlink("../dotfiles/fresh.toml", &fresh).unwrap();
+        ConfigFile::new(fresh.clone())
+            .set(&[("server", "url", "http://y/mcp")])
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(&fresh)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::read_to_string(dir.join("dotfiles/fresh.toml"))
+                .unwrap()
+                .contains("http://y/mcp")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2309: a writer that cannot get the lock gives up with a message instead of waiting forever.
+    #[test]
+    fn a_held_lock_is_waited_for() {
+        let dir = scratch("held");
+        let path = dir.join("config.toml");
+        let held = lock_config(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || ConfigFile::new(path).set(&[("server", "url", "http://z")]))
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!writer.is_finished(), "the writer waits for the lock");
+        drop(held);
+        writer.join().unwrap().unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("http://z"));
         let _ = fs::remove_dir_all(&dir);
     }
 }

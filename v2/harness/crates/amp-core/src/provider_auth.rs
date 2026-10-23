@@ -85,6 +85,7 @@ pub fn http_client(p: &ProviderConfig, keys: &dyn KeyLookup) -> Result<reqwest::
                 .pool_idle_timeout(POOL_IDLE)
         }
     };
+    builder = builder.redirect(same_origin_redirects());
     if let Some(connect) = p.timeouts.connect {
         builder = builder.connect_timeout(connect);
     }
@@ -99,6 +100,38 @@ pub fn http_client(p: &ProviderConfig, keys: &dyn KeyLookup) -> Result<reqwest::
     builder
         .build()
         .map_err(|e| format!("http client: {}", error_chain(&e)))
+}
+
+/// Most redirects a provider request follows (reqwest's default).
+const MAX_REDIRECTS: usize = 10;
+
+/// The provider client's redirect policy: follow a redirect only to the origin (scheme, host and
+/// port) of the request that was sent, and refuse one to any other origin.
+///
+/// reqwest's default follows cross-host redirects and drops only `Authorization`, `Cookie` and
+/// `Proxy-Authorization`, so `api-key` (Azure, `auth = "header"`), Anthropic's `x-api-key`, every
+/// `secret_headers` value and an OAuth token request's form body (the client secret) would be sent
+/// to the new host. Refusing is safer than stripping: we cannot know which configured header is a
+/// credential, and an https -> http downgrade on the same host is a different origin too. The
+/// error names only the target's origin, never its path or query.
+pub fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if !same_origin {
+            let to = attempt.url().origin().ascii_serialization();
+            attempt.error(format!(
+                "refused a redirect to another origin ({to}): a provider's credentials are only \
+                 sent to its own base_url; set base_url to the address it redirects to"
+            ))
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error(format!("exceeded {MAX_REDIRECTS} redirects"))
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// The CA bundle, checked the way `[server] ca_file` is (amp-mcp's loader: readable, PEM, at least
