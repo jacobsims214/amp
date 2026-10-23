@@ -513,6 +513,13 @@ fn stale<T>(f: &Fetched<T>) -> bool {
     f.value.is_some() && f.error.is_some()
 }
 
+/// The poller's connection is closed (its first attempt failed, or it dropped): nothing is
+/// loading, so the chrome says "not connected" / "retrying…" rather than an ellipsis that never
+/// ends next to "● disconnected" (#2215).
+fn disconnected(meta: &AmpMeta) -> bool {
+    matches!(meta.health.connection, Connection::Down { .. })
+}
+
 // ------------------------------------------------------------------------------------------------
 // Header
 // ------------------------------------------------------------------------------------------------
@@ -533,7 +540,14 @@ fn header_line1(style: &Style, data: &ChromeData, p: &AmpPalette, width: usize) 
     let mut left = vec![Seg::new(p.brand_bands(BAND_CELLS), Lead::Space, 4).then_space()];
     match &meta.instance {
         Some(inst) => left.push(Seg::new(c.muted.fg(&clean(inst.host())), Lead::Space, 8)),
-        None => left.push(Seg::new(c.dim.fg("connecting…"), Lead::Space, 8)),
+        None => {
+            let word = if disconnected(meta) {
+                "retrying…"
+            } else {
+                "connecting…"
+            };
+            left.push(Seg::new(c.dim.fg(word), Lead::Space, 8));
+        }
     }
     if let Some(user) = meta.user.get() {
         let email = clean(&user.email);
@@ -634,6 +648,7 @@ fn ticket_line(style: &Style, data: &ChromeData, p: &AmpPalette, id: i64, width:
     let Some(ticket) = meta.ticket.get() else {
         let note = match &meta.ticket.error {
             Some(_) => "unavailable",
+            None if disconnected(meta) => "not connected",
             None => "loading…",
         };
         let left = vec![
@@ -828,6 +843,8 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         None if meta.project_id.is_some() => {
             let note = if meta.board.error.is_some() {
                 "board unavailable"
+            } else if disconnected(meta) {
+                "board: not connected"
             } else {
                 "board…"
             };

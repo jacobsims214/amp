@@ -14,7 +14,7 @@ use std::{
 };
 
 use amp_core::{
-    meta::{AmpMeta, Fetched},
+    meta::{AmpMeta, Connection, Fetched},
     supervisor::WorkerPhase,
     tickets::Status,
 };
@@ -420,6 +420,41 @@ fn stale_items_are_dimmed_and_loading_is_shown() {
     );
     assert!(out[0].ends_with(" ● connecting"), "{}", out[0]);
     assert_eq!(out[1], "workers 0 │ no project");
+}
+
+/// #2215: a disconnected start (AMP down) used to read `connecting… · project #68 … ●
+/// disconnected` with `board…` forever. Once the first attempt fails the header says
+/// `retrying…` and the status line `board: not connected`, matching the red dot.
+#[test]
+fn disconnected_start_does_not_say_connecting_or_loading() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let mut meta = AmpMeta {
+        project_id: Some(68),
+        ticket_id: Some(2106),
+        ..Default::default()
+    };
+    meta.health.connection = Connection::Down {
+        reason: "connection refused".to_owned(),
+    };
+    let out: Vec<String> = lines(&ChromeData::new(meta.clone()), 120)
+        .iter()
+        .map(|l| plain(l))
+        .collect();
+    assert!(out[0].starts_with("▀▀▀▀▀▀▀▀ retrying… · "), "{}", out[0]);
+    assert!(!out[0].contains("connecting"), "{}", out[0]);
+    assert!(out[0].ends_with(" ● disconnected"), "{}", out[0]);
+    assert_eq!(out[1], "#2106 not connected");
+    assert!(out[2].ends_with("│ board: not connected"), "{}", out[2]);
+    assert!(!out[2].contains('…'), "{}", out[2]);
+
+    // Still connecting (no failure yet): the ellipses stay.
+    meta.health.connection = Connection::Connecting;
+    let out: Vec<String> = lines(&ChromeData::new(meta), 120)
+        .iter()
+        .map(|l| plain(l))
+        .collect();
+    assert!(out[0].starts_with("▀▀▀▀▀▀▀▀ connecting… · "), "{}", out[0]);
+    assert!(out[2].ends_with("│ board…"), "{}", out[2]);
 }
 
 #[test]
