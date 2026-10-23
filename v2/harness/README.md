@@ -381,6 +381,50 @@ amp-harness mcp secret NAME [WHICH…] [--missing] [--secret-stdin]   # store or
 - `setup --preset` asks (hidden) for the secrets the preset's MCP servers declare. Without a
   terminal or a keychain, the summary says to run `amp-harness mcp secret NAME`.
 
+#### Importing from other tools: `amp-harness mcp import` (#2244)
+
+Other tools' MCP files are never loaded on their own; `mcp import` copies their servers in, once,
+when you ask:
+
+```sh
+amp-harness mcp import --from claude --dry-run     # the TOML it would write; secrets only by name
+amp-harness mcp import --from claude --yes         # .mcp.json + ~/.claude.json (user and local)
+amp-harness mcp import --from vscode --only perplexity --secret-stdin < key.txt
+amp-harness mcp import --from ./some/mcp.json --scope repo --rename GitHub=gh
+amp-harness mcp import                              # lists what it finds here and asks
+```
+
+| `--from` | Files read (highest precedence first) |
+|---|---|
+| `claude` | `~/.claude.json` `projects[<this project>]` (local), `<project>/.mcp.json`, `~/.claude.json` root (user); `$CLAUDE_CONFIG_DIR/.claude.json` first when set |
+| `opencode` | `<project>/opencode.json[c]`, `$OPENCODE_CONFIG`, `~/.config/opencode/opencode.json[c]` |
+| `vscode` | `<project>/.vscode/mcp.json`, the user profile's `mcp.json` (`~/Library/Application Support/Code/User/` on macOS, `~/.config/Code/User/` on Linux) |
+| `cursor` | `<project>/.cursor/mcp.json`, `~/.cursor/mcp.json` |
+| `claude-desktop` | `~/Library/Application Support/Claude/claude_desktop_config.json` (Linux: `~/.config/Claude/`) |
+| a file | any of these formats, recognised by name and keys |
+
+- Variables become ours: Claude Code `${VAR}`/`${VAR:-d}` -> `${env:VAR}`/`${env:VAR:-d}`; opencode
+  `{env:VAR}` -> `${env:VAR:-}` (it uses an empty string when unset); VS Code and Cursor
+  `${workspaceFolder}` -> `${repo}`, `${userHome}` -> `${home}`, `${env:X}` -> `${env:X:-}`. A
+  variable with no equivalent (`${workspaceFolderBasename}`, `${config:…}`) makes that server
+  fail with the reason. Claude Desktop values are literal.
+- Secrets go to the OS keychain, never to TOML: literal header/env values that look secret and
+  OAuth client secrets (Cursor `auth.CLIENT_SECRET`, opencode `oauth.clientSecret`) are moved there.
+  VS Code `${input:id}` and opencode `{file:path}` in a header or env value are asked at import
+  (hidden for password inputs, or one line each with `--secret-stdin`); the file is not read.
+  With `AMP_CREDENTIAL_STORE=file` a server that needs the keychain is refused before anything
+  is written.
+- Mapping: opencode `local`/`remote` -> stdio/http, its `timeout` (time to list tools) ->
+  `startup_timeout_secs`, `oauth: false` -> `auth = "none"`; Claude Code `timeout` (ms) ->
+  `call_timeout_secs`; Claude Code `disabledMcpServers` and opencode `enabled: false` ->
+  `enabled = false`. Dropped with a warning: `headersHelper`, VS Code `dev`/`sandbox`. `ws` servers
+  and pickString/command inputs can't be imported.
+- Names are made valid (`GitHub` -> `github`). A different server of the same name gets `-2`
+  (`--force` replaces it, `--rename OLD=NEW` picks one); an identical one is skipped, so a repeat
+  import changes nothing. Any server that can't be imported stops the import before anything is
+  written, naming `--only` for the rest. Writing asks for confirmation (`--yes` without a
+  terminal); `--scope repo` also trusts what it writes for you; `--test` connects afterwards.
+
 ```toml
 # <repo>/.amp/harness/config.toml
 [models]
