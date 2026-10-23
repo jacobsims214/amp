@@ -365,3 +365,33 @@ async fn open_uses_the_web_url_setting() {
     assert_ne!(out.code, 0, "stdout: {}", out.stdout);
     assert!(out.stderr.contains("AMP_WEB_URL"), "{}", out.stderr);
 }
+
+/// #2206: the banner warns when `.amp.json` was made for another server, and is quiet when the
+/// marker was made for this one.
+#[tokio::test]
+async fn the_banner_warns_about_a_marker_made_for_another_server() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("chat-foreign-marker", json!([]));
+    let marker = dir.join("project/.amp.json");
+    let out = harness(&dir, &amp.url, &["--snapshot", "500x30"]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let want = format!(
+        "warning: .amp.json at {} was made for https://stale.invalid; this server's #2 is \
+         \"AMP v2\". If that's not this folder's project here, `amp-harness init` picks this \
+         server's.",
+        marker.display()
+    );
+    assert!(out.stdout.contains(&want), "{}", out.stdout);
+
+    std::fs::write(
+        &marker,
+        json!({"project_id": 2, "project_name": "AMP v2",
+               "amp_api": amp.url.trim_end_matches("/mcp")})
+        .to_string(),
+    )
+    .unwrap();
+    let out = harness(&dir, &amp.url, &["--snapshot", "500x30"]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("project #2 AMP v2"), "{}", out.stdout);
+    assert!(!out.stdout.contains("warning: .amp.json"), "{}", out.stdout);
+}

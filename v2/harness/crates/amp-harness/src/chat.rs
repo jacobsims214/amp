@@ -199,7 +199,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     })
     .await?;
     let settings = args.conn.settings()?;
-    let info = shell_info(&session);
+    let marker_warning = marker_warning(&session).await;
+    let info = shell_info(&session, marker_warning.as_deref());
     let models = model_choices(
         &session.rt.current_models(),
         &session.rt.current_providers(),
@@ -492,7 +493,41 @@ fn session_id(path: &Path) -> String {
     format!("{head}…{tail}")
 }
 
-fn shell_info(s: &session::Session) -> ShellInfo {
+/// How long the banner waits for this server's name of the marker's project (#2206).
+const MARKER_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// The banner's warning when `.amp.json` was made for another server or names another project
+/// than this server's (#2206). Asks AMP for the project's name only when the marker could
+/// disagree with it (it has an `amp_api` or a name), within [`MARKER_CHECK_TIMEOUT`].
+async fn marker_warning(s: &session::Session) -> Option<String> {
+    let marker = s.project.as_ref()?;
+    let url = s.rt.mcp.session().url.clone();
+    let server_name =
+        if s.offline.is_none() && (marker.amp_api.is_some() || marker.project_name.is_some()) {
+            let call = amp_core::tools::call_json(
+                &s.rt.mcp,
+                "amp_get_project",
+                serde_json::json!({"project_id": marker.project_id}),
+            );
+            tokio::time::timeout(MARKER_CHECK_TIMEOUT, call)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|v| {
+                    v.pointer("/project/name")
+                        .or_else(|| v.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_owned)
+                })
+        } else {
+            None
+        };
+    marker.server_warning(&url, server_name.as_deref()).map(|w| {
+        format!("warning: {w}. If that's not this folder's project here, `amp-harness init` picks this server's.")
+    })
+}
+
+fn shell_info(s: &session::Session, marker_warning: Option<&str>) -> ShellInfo {
     let resolved = &s.agent.resolved;
     let mcp = s.rt.mcp.session();
     let project = match &s.project {
@@ -508,6 +543,29 @@ fn shell_info(s: &session::Session) -> ShellInfo {
         .session_file
         .as_deref()
         .map(|p| tilde(p, home.as_deref()));
+    let mut banner = vec![
+        format!(
+            "AMP harness {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            amp_tui::shell::short_role(&s.agent.role.id)
+        ),
+        if s.offline.is_some() {
+            format!("{project} · {} (not connected)", mcp.url)
+        } else {
+            format!("{project} · {} ({})", mcp.url, mcp.protocol_version)
+        },
+    ];
+    banner.extend(marker_warning.map(str::to_owned));
+    banner.extend([
+        format!(
+            "{}/{} • thinking {}",
+            resolved.provider,
+            resolved.model_id,
+            thinking_name(resolved.thinking)
+        ),
+        session_banner(s.agent.session_file.as_deref()),
+        "/help for commands · Esc aborts a reply · Ctrl+C twice quits".to_owned(),
+    ]);
     ShellInfo {
         role: s.agent.role.id.clone(),
         provider: resolved.provider.clone(),
@@ -518,26 +576,7 @@ fn shell_info(s: &session::Session) -> ShellInfo {
         cwd: s.cwd.display().to_string(),
         git_branch: git_branch(&s.cwd),
         session_file,
-        banner: vec![
-            format!(
-                "AMP harness {} · {}",
-                env!("CARGO_PKG_VERSION"),
-                amp_tui::shell::short_role(&s.agent.role.id)
-            ),
-            if s.offline.is_some() {
-                format!("{project} · {} (not connected)", mcp.url)
-            } else {
-                format!("{project} · {} ({})", mcp.url, mcp.protocol_version)
-            },
-            format!(
-                "{}/{} • thinking {}",
-                resolved.provider,
-                resolved.model_id,
-                thinking_name(resolved.thinking)
-            ),
-            session_banner(s.agent.session_file.as_deref()),
-            "/help for commands · Esc aborts a reply · Ctrl+C twice quits".to_owned(),
-        ],
+        banner,
     }
 }
 

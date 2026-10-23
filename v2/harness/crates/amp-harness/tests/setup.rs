@@ -405,15 +405,17 @@ async fn a_taken_project_code_is_asked_again() {
 async fn the_chat_without_a_key_says_how_to_store_one() {
     let amp = spawn(MockAmp::new(), None).await;
     let dir = workdir("setup-chat-nokey", Some(2));
-    // Scripted answers but no key and no keychain: the first run stops with the way out.
+    // Scripted answers but no key and no keychain: the first run stops with the way out. The
+    // marker was made for another server (#2206), so the picker comes first: Enter keeps it.
     let mut run = Run::new(&dir, &["--snapshot", "100x20", "--no-session"]);
-    run.stdin = Some("");
+    run.stdin = Some("\n");
     let out = run
         .env("AMP_HARNESS_PROMPTS", "stdin")
         .env("AMP_MCP_URL", amp.url.clone())
         .go()
         .await;
     assert_eq!(out.code, 1, "stdout: {}", out.stdout);
+    assert!(out.stderr.contains("Keeping #2 from "), "{}", out.stderr);
     assert!(
         out.stderr.contains("amp-harness connect openrouter"),
         "{}",
@@ -501,4 +503,109 @@ async fn a_key_goes_to_the_keychain_and_nowhere_else() {
     let v: Value = serde_json::from_str(&text).unwrap();
     let providers = v["providers"].to_string();
     assert!(providers.contains("keychain"), "{providers}");
+}
+
+/// #2206: a parent folder's `.amp.json` made for another server (prod) is not used silently on
+/// this one: the first run says so and offers the picker; the pick is written in the working
+/// folder, so the parent's marker is shadowed, not rewritten. The next start asks nothing.
+#[tokio::test]
+async fn a_parent_marker_made_for_another_server_offers_the_picker() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("setup-foreign-parent", Some(2));
+    let parent = dir.join("project/.amp.json");
+    let before = std::fs::read_to_string(&parent).unwrap();
+    let sub = dir.join("project/tools/sub");
+    std::fs::create_dir_all(&sub).unwrap();
+
+    let mut run = Run::new(&dir, &["--snapshot", "400x30", "--no-session"]);
+    run.cwd = Some(sub.clone());
+    run.stdin = Some("1\n");
+    let out = run
+        .env("AMP_HARNESS_PROMPTS", "stdin")
+        .env("AMP_MCP_URL", amp.url.clone())
+        .env("OPENROUTER_API_KEY", SECRET)
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    for want in [
+        format!(
+            "Warning: .amp.json at {} was made for https://stale.invalid; this server's #2 is \
+             \"AMP v2\".",
+            parent.display()
+        ),
+        "Pick this server's project for this folder, or create a new one:".to_owned(),
+        "1) #2 AMP v2 (AV)".to_owned(),
+        "Enter to keep #2 from .amp.json".to_owned(),
+        "Using #2 AMP v2 (AV) and linked this folder".to_owned(),
+    ] {
+        assert!(
+            out.stderr.contains(&want),
+            "missing {want:?} in\n{}",
+            out.stderr
+        );
+    }
+    let written: Value =
+        serde_json::from_str(&std::fs::read_to_string(sub.join(".amp.json")).unwrap()).unwrap();
+    assert_eq!(written["project_id"], 2);
+    assert_eq!(written["amp_api"], amp.url.trim_end_matches("/mcp"));
+    assert_eq!(std::fs::read_to_string(&parent).unwrap(), before);
+    // The banner has no warning: the new marker is this server's.
+    assert!(!out.stdout.contains("was made for"), "{}", out.stdout);
+
+    // Second start: the folder's own marker agrees with the server; nothing is asked.
+    let mut run = Run::new(&dir, &["--snapshot", "400x30", "--no-session"]);
+    run.cwd = Some(sub);
+    let out = run
+        .env("AMP_HARNESS_PROMPTS", "stdin")
+        .env("AMP_MCP_URL", amp.url.clone())
+        .env("OPENROUTER_API_KEY", SECRET)
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.trim().is_empty(), "{}", out.stderr);
+}
+
+/// #2206 in `init`: interactive, a marker made for another server goes to the picker (not "Keep
+/// it?") and is replaced in place; with --yes it is kept and the summary warns.
+#[tokio::test]
+async fn init_offers_the_picker_for_a_marker_made_for_another_server() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("setup-foreign-init", Some(2));
+    let want = format!(
+        ".amp.json at {} was made for https://stale.invalid; this server's #2 is \"AMP v2\"",
+        dir.join("project/.amp.json").display()
+    );
+
+    let out = Run::new(&dir, &["init", "--yes", "--url", &amp.url, "--json"])
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let v = out.json();
+    assert_eq!(v["project"]["id"], 2);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w == want.as_str()),
+        "{v}"
+    );
+    assert_eq!(marker(&dir)["amp_api"], "https://stale.invalid");
+
+    let args = ["init", "--url", &amp.url, "--json"];
+    let mut run = Run::new(&dir, &args);
+    run.stdin = Some("1\n");
+    let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains(&want), "{}", out.stderr);
+    assert!(!out.stderr.contains("Keep it?"), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("Pick this server's project for this folder"),
+        "{}",
+        out.stderr
+    );
+    let m = marker(&dir);
+    assert_eq!(m["project_id"], 2);
+    assert_eq!(m["amp_api"], amp.url.trim_end_matches("/mcp"));
 }
