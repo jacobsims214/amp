@@ -65,6 +65,15 @@ pub enum McpError {
     #[error("MCP connection is closed")]
     Closed,
 
+    /// A stdio MCP server could not be started (#2236): the command is missing, not executable,
+    /// or its working directory does not exist. Holds the command name only, never its args.
+    #[error("start MCP server `{server}` (`{command}`): {reason}")]
+    Spawn {
+        server: String,
+        command: String,
+        reason: String,
+    },
+
     /// The connection was replaced (a reconnect after `amp-harness login`, or a server switch)
     /// while this request was running, and the old one was closed under it. The request may or
     /// may not have reached the server, so it is not retried.
@@ -161,7 +170,9 @@ impl McpError {
             Self::ConnectTimeout { .. } | Self::Timeout { .. } => return FailureKind::Timeout,
             Self::Closed | Self::Replaced { .. } => return FailureKind::Closed,
             Self::Config(_) | Self::CaFile { .. } => return FailureKind::Config,
-            Self::Http(_) | Self::OAuth(_) | Self::CredentialStore(_) => return FailureKind::Other,
+            Self::Http(_) | Self::OAuth(_) | Self::CredentialStore(_) | Self::Spawn { .. } => {
+                return FailureKind::Other;
+            }
             Self::Connect { .. } | Self::Service { .. } => {}
         }
         if self.is_server_error() {

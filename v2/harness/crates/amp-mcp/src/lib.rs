@@ -10,6 +10,8 @@
 //! - [`oauth`]: browser login (`login`/`logout`) and [`oauth::connect`], which picks `AMP_TOKEN`,
 //!   else a stored OAuth login (refreshed as needed), else no credentials (D3).
 //! - [`CredentialBackend`]: logins in the OS keychain keyed by server URL, or a 0600 file.
+//! - [`external`]: clients for third-party MCP servers ([`ExternalClient`]); stdio child processes
+//!   so far (#2236).
 //!
 //! This crate must never depend on rpi (D1).
 
@@ -18,6 +20,7 @@ mod client;
 pub mod config_paths;
 mod credentials;
 mod error;
+pub mod external;
 mod health;
 mod http;
 mod keychain;
@@ -37,6 +40,7 @@ pub use credentials::{
     ENV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE, credential_key, keychain_available, keychain_service,
 };
 pub use error::{FailureKind, McpError};
+pub use external::{ExternalClient, ExternalInfo, ExternalOptions, StdioSpec};
 pub use health::Health;
 pub use http::{
     DEFAULT_OAUTH_REQUEST_TIMEOUT, OAUTH_CONNECT_TIMEOUT, build_http_client,
