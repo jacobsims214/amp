@@ -6,11 +6,14 @@
 //!
 //! Transports:
 //! - [`stdio`]: a local child process ([`ExternalClient::connect_stdio`], #2236).
-//! - Streamable HTTP (#2237) and legacy SSE (H5) connect through [`ExternalClient::handshake`].
+//! - [`http`]: Streamable HTTP with headers, bearer and OAuth ([`http::connect`], #2237).
+//! - Legacy SSE (H5, #2238) connects through [`ExternalClient::handshake_with`] too, reusing
+//!   [`http::PreparedHttp`].
 //!
 //! The client never sees a configuration file: amp-core resolves `[mcp.<name>]` (env, secrets,
 //! paths) into a spec and hands it here, so this crate stays free of rpi and of config rules.
 
+pub mod http;
 pub mod stdio;
 
 use std::{
@@ -38,7 +41,28 @@ pub use stdio::{
     SHUTDOWN_GRACE, STDERR_LOG_MAX_BYTES, StdioSpec, rotate_log_if_full, stderr_log_path,
 };
 
-use crate::{McpError, ProtocolMode};
+use crate::{Era, McpError, ProtocolMode};
+
+/// A secret value (a header value, a bearer token, an OAuth client secret). `Debug` never shows
+/// it; [`Self::expose`] is the one way to read it, at the point it goes on the wire.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(<redacted>)")
+    }
+}
 
 /// Connect and call limits plus what we tell the server about ourselves.
 #[derive(Debug, Clone)]
@@ -75,6 +99,18 @@ pub struct ExternalInfo {
     pub server_version: Option<String>,
     /// The server's `instructions` (D8 puts them in the prompt).
     pub instructions: Option<String>,
+    /// `Auto` found a server without 2026-07-28 and used `initialize`.
+    pub fell_back: bool,
+    /// How we authenticate, e.g. `none`, `header X-Api-Key (keychain)`, `bearer (env TOKEN)`,
+    /// `oauth (macOS Keychain (service amp-harness))`. Never a secret.
+    pub auth: String,
+}
+
+impl ExternalInfo {
+    /// Stateless (2026-07-28) or the legacy `initialize` era.
+    pub fn era(&self) -> Era {
+        Era::of(&self.protocol_version)
+    }
 }
 
 /// The rmcp client handler: identifies us and notices `notifications/tools/list_changed`.
@@ -130,8 +166,33 @@ impl ExternalClient {
         options: &ExternalOptions,
     ) -> Result<Self, McpError>
     where
+        T: IntoTransport<RoleClient, E, A> + Send,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        let mut once = Some(transport);
+        Self::handshake_with(name, target, transport_kind, "none", options, move || {
+            once.take().ok_or(McpError::Closed)
+        })
+        .await
+    }
+
+    /// [`Self::handshake`] over transports from `make_transport`, which is called again (once)
+    /// when `Auto` meets a server that knows `server/discover` but offers only `initialize`-era
+    /// versions (as in [`crate::AmpMcpClient`]; the retry needs a fresh transport). If it can't
+    /// make a second one, the first error stands. `auth` describes the credentials (never a
+    /// secret); a rejection becomes [`McpError::ServerAuth`] with a hint built from it.
+    pub(crate) async fn handshake_with<T, E, A, F>(
+        name: &str,
+        target: &str,
+        transport_kind: &'static str,
+        auth: &str,
+        options: &ExternalOptions,
+        mut make_transport: F,
+    ) -> Result<Self, McpError>
+    where
         T: IntoTransport<RoleClient, E, A>,
         E: std::error::Error + Send + Sync + 'static,
+        F: FnMut() -> Result<T, McpError> + Send,
     {
         let tools_changed = Arc::new(AtomicBool::new(false));
         let handler = ExternalHandler {
@@ -142,16 +203,40 @@ impl ExternalClient {
             .with_protocol_version(ProtocolMode::LEGACY_VERSION),
             tools_changed: tools_changed.clone(),
         };
-        let service = tokio::time::timeout(
-            options.connect_timeout,
-            handler.serve_with_lifecycle(transport, options.protocol.lifecycle()),
-        )
-        .await
-        .map_err(|_| McpError::ConnectTimeout {
-            url: target.to_owned(),
-            after: options.connect_timeout,
-        })?
-        .map_err(|e| McpError::from_init(target, e))?;
+        let map =
+            |e: ClientInitializeError| server_auth(McpError::from_init(target, e), name, auth);
+        let connect = async {
+            let first = handler
+                .clone()
+                .serve_with_lifecycle(make_transport()?, options.protocol.lifecycle())
+                .await;
+            match first {
+                Err(ClientInitializeError::NoCompatibleProtocolVersion {
+                    server_supported,
+                    ..
+                }) if options.protocol == ProtocolMode::Auto
+                    && server_supported.iter().any(ProtocolVersion::has_initialize) =>
+                {
+                    let Ok(transport) = make_transport() else {
+                        return Err(McpError::Config(format!(
+                            "{target}: the server offers only initialize-era versions; set protocol = \"legacy\""
+                        )));
+                    };
+                    handler
+                        .clone()
+                        .serve_with_lifecycle(transport, ProtocolMode::Legacy.lifecycle())
+                        .await
+                        .map_err(map)
+                }
+                other => other.map_err(map),
+            }
+        };
+        let service = tokio::time::timeout(options.connect_timeout, connect)
+            .await
+            .map_err(|_| McpError::ConnectTimeout {
+                url: target.to_owned(),
+                after: options.connect_timeout,
+            })??;
         // No response cache: the hub decides when to refetch (list_changed, /mcp restart).
         service
             .peer()
@@ -163,12 +248,16 @@ impl ExternalClient {
                 "no server info after the handshake".to_owned(),
             )),
         })?;
+        let protocol_version = peer_info.protocol_version.clone();
         let info = ExternalInfo {
             transport: transport_kind,
-            protocol_version: peer_info.protocol_version.clone(),
+            fell_back: options.protocol == ProtocolMode::Auto
+                && Era::of(&protocol_version) == Era::Legacy,
+            protocol_version,
             server_name: peer_info.server_info.as_ref().map(|s| s.name.clone()),
             server_version: peer_info.server_info.as_ref().map(|s| s.version.clone()),
             instructions: peer_info.instructions.clone(),
+            auth: auth.to_owned(),
         };
         Ok(Self {
             name: name.to_owned(),
@@ -278,10 +367,14 @@ impl ExternalClient {
     ) -> Result<T, McpError> {
         match tokio::time::timeout(timeout, request).await {
             Err(_) => Err(McpError::Timeout {
-                operation: operation.to_owned(),
+                operation: format!("{}: {operation}", self.name),
                 after: timeout,
             }),
-            Ok(Err(e)) => Err(McpError::from_service(operation, e)),
+            Ok(Err(e)) => Err(server_auth(
+                McpError::from_service(&format!("{}: {operation}", self.name), e),
+                &self.name,
+                &self.info.auth,
+            )),
             Ok(Ok(value)) => Ok(value),
         }
     }
@@ -296,5 +389,30 @@ impl ExternalClient {
         if let Some(mut child) = self.child.take() {
             child.shutdown(SHUTDOWN_GRACE).await;
         }
+    }
+}
+
+/// A rejection (rmcp's auth error with the server's challenge, or a bare HTTP 401/403, which many
+/// API-key servers send without `WWW-Authenticate`) as [`McpError::ServerAuth`]; anything else as
+/// is.
+fn server_auth(error: McpError, server: &str, auth: &str) -> McpError {
+    let challenge = match error {
+        McpError::AuthRequired { challenge } => challenge,
+        e if e.kind() == crate::FailureKind::LoginRequired && !e.is_server_error() => None,
+        other => return other,
+    };
+    McpError::ServerAuth {
+        server: server.to_owned(),
+        reason: auth_hint(server, auth),
+        challenge,
+    }
+}
+
+/// What to tell a person whose server rejected us, given how we authenticated.
+pub(crate) fn auth_hint(server: &str, auth: &str) -> String {
+    if auth.starts_with("oauth") || auth == "none" {
+        format!("login required: run `amp-harness mcp login {server}`")
+    } else {
+        format!("the server rejected the configured credentials ({auth})")
     }
 }

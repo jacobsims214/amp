@@ -21,6 +21,19 @@ pub fn build_http_client(ca_file: Option<&Path>) -> Result<reqwest::Client, McpE
         .map_err(|e| McpError::Http(e.to_string()))
 }
 
+/// [`build_http_client`] whose connections all go to the unix socket at `socket` (`[mcp.<name>]
+/// socket = ..`). The URL still gives the Host header and path; an `https` URL still uses TLS.
+#[cfg(unix)]
+pub fn build_unix_socket_http_client(
+    ca_file: Option<&Path>,
+    socket: &Path,
+) -> Result<reqwest::Client, McpError> {
+    base_builder(ca_file)?
+        .unix_socket(socket)
+        .build()
+        .map_err(|e| McpError::Http(e.to_string()))
+}
+
 /// Default bound on one OAuth HTTP request (discovery, registration, token exchange, refresh):
 /// rmcp's own default OAuth client uses the same 30 s.
 pub const DEFAULT_OAUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);

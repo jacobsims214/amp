@@ -57,6 +57,10 @@
 //!   schema, validation, layering, `${...}` substitution, keychain accounts and `mcp__<server>__<tool>`
 //!   names.
 //!
+//! Story 397 (#2237, H4):
+//! - [`mcp_http`]: a resolved http `[mcp.<name>]` table to amp-mcp's `HttpServerOptions`, reading
+//!   its secrets (keychain `secret_headers` / OAuth client secret, `bearer_env`).
+//!
 //! Story 397 (#2236, H3):
 //! - [`mcp_stdio`]: a resolved stdio server as an [`amp_mcp::StdioSpec`]: the D7 child environment
 //!   (the bash scrub of #2142 plus the server's own env and keychain secrets), cwd, stderr log.
@@ -71,6 +75,7 @@ pub mod events;
 pub mod faux;
 pub mod links;
 pub mod mcp_config;
+pub mod mcp_http;
 pub mod mcp_stdio;
 pub mod mcp_tools;
 pub mod meta;
