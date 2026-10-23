@@ -207,6 +207,11 @@ impl Policy {
         &self.rules
     }
 
+    /// Add a rule after the others (so it wins over earlier matches).
+    pub fn push(&mut self, rule: Rule) {
+        self.rules.push(rule);
+    }
+
     /// The last rule matching `(permission, subject)`, or `None` when the default applies.
     pub fn matching_rule(&self, permission: &str, subject: &str) -> Option<&Rule> {
         self.rules.iter().rev().find(|r| {

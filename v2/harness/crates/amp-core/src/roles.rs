@@ -4,9 +4,13 @@
 //! - **Prompt:** the agent file's markdown body.
 //! - **Preloaded skills:** a `skills:` list in the frontmatter (an override file can set it), else
 //!   the table in [`default_skills`]. Every name must be a loaded skill.
-//! - **Model:** [`Role::model_role`] is the key into [`crate::models::ModelsConfig::resolve_role`]
-//!   (the agent id without `amp-`). The frontmatter's own `model` is kept for display only;
-//!   models.toml and config.toml decide (#2091).
+//! - **Model:** [`Role::resolve_model`]: `[roles.<id>]` (the agent id without `amp-`) decides,
+//!   as in models.toml and config.toml (#2091). A role with no assignment falls back (#2234, D11)
+//!   to the frontmatter `model` if that provider is configured, then its `based_on` role's model,
+//!   then `[models] fallback` (default: worker-backend's), so a new agent always runs.
+//! - **Dispatch:** a subagent is dispatchable when the manager's `task` rules allow its id
+//!   (`amp-*`) or its frontmatter says `dispatch: true`; a manager rule naming it with deny still
+//!   wins (#2234, D11).
 //! - **Policy:** the frontmatter `permission` block, parsed by [`Policy::parse`].
 //!   [`Role::tool_policy`] binds it to a worktree for the before-tool hook.
 
@@ -16,8 +20,8 @@ use serde_json::Value;
 
 use crate::{
     assets::{AgentAsset, Assets},
-    models::normalize_role,
-    policy::{Policy, PolicyError, ToolPolicy, canonical_agent_id},
+    models::{ModelHints, ModelsConfig, ModelsError, ResolvedRole, normalize_role},
+    policy::{Action, Policy, PolicyError, Rule, ToolPolicy, canonical_agent_id},
 };
 
 /// One role, ready to build an agent from.
@@ -33,8 +37,17 @@ pub struct Role {
     pub skills: Vec<String>,
     /// The key for [`crate::models::ModelsConfig::resolve_role`].
     pub model_role: String,
-    /// The frontmatter `model` (opencode's), for display. Not used to pick the model.
+    /// The frontmatter `model` (opencode's). Used only when the role has no `[roles.<id>]` and
+    /// that provider and model are configured ([`Role::resolve_model`]).
     pub frontmatter_model: Option<String>,
+    /// The frontmatter `variant` (opencode's thinking variant), with `frontmatter_model`.
+    pub frontmatter_variant: Option<String>,
+    /// The frontmatter `based_on`: the role whose model this one shares when it has none of its
+    /// own (`agents new --from` writes it).
+    pub based_on: Option<String>,
+    /// The frontmatter `dispatch: true`: the manager may dispatch this subagent even when its id
+    /// doesn't match the manager's `task` rules (`amp-*`).
+    pub dispatch: bool,
     pub policy: Policy,
 }
 
@@ -48,8 +61,41 @@ impl Role {
         ToolPolicy::new(self.id.clone(), self.is_child(), self.policy.clone(), root)
     }
 
+    /// The hints [`ModelsConfig::resolve_with`] falls back on.
+    pub fn model_hints(&self) -> ModelHints {
+        ModelHints {
+            model: self.frontmatter_model.clone(),
+            thinking: self.frontmatter_variant.clone(),
+            based_on: self.based_on.clone(),
+        }
+    }
+
+    /// The provider, model and thinking level this role runs on (D11's fallback chain).
+    pub fn resolve_model(&self, models: &ModelsConfig) -> Result<ResolvedRole, ModelsError> {
+        models.resolve_with(&self.model_role, &self.model_hints())
+    }
+
     fn from_asset(asset: &AgentAsset, assets: &Assets) -> Result<Self, RoleError> {
         let fm = &asset.frontmatter;
+        let invalid = |message: &str| RoleError::Invalid {
+            role: asset.id.clone(),
+            message: message.to_owned(),
+        };
+        let dispatch = match fm.get("dispatch") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err(invalid("dispatch must be true or false")),
+        };
+        let based_on = match fm.get("based_on") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+            Some(_) => return Err(invalid("based_on must be an agent id")),
+        };
+        let text = |key: &str| match fm.get(key) {
+            Some(Value::String(s)) => Some(s.clone()),
+            Some(Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        };
         let policy = Policy::parse(fm.get("permission")).map_err(|e| RoleError::Policy {
             role: asset.id.clone(),
             source: e,
@@ -92,7 +138,10 @@ impl Role {
             prompt: asset.prompt.clone(),
             skills,
             model_role: normalize_role(&asset.id).to_string(),
-            frontmatter_model: fm.get("model").and_then(Value::as_str).map(str::to_string),
+            frontmatter_model: text("model"),
+            frontmatter_variant: text("variant"),
+            based_on,
+            dispatch,
             policy,
         })
     }
@@ -144,7 +193,7 @@ impl RoleRegistry {
     /// Build every role from the loaded assets (embedded plus overrides). Fails on the first role
     /// with a malformed policy or a missing skill.
     pub fn from_assets(assets: &Assets) -> Result<Self, RoleError> {
-        let roles = assets
+        let mut roles = assets
             .agents()
             .map(|a| Role::from_asset(a, assets))
             .collect::<Result<Vec<_>, _>>()?;
@@ -153,6 +202,29 @@ impl RoleRegistry {
             .filter(|a| a.is_primary())
             .map(|a| a.id.clone())
             .ok_or(RoleError::NoManager)?;
+        // D11: `dispatch: true` subagents join every primary's `task` allowlist, as a rule at the
+        // end (last match wins), so `dispatchable` and the before-tool hook agree. A primary rule
+        // that names the agent (not a catch-all) and denies it still wins.
+        let opted_in: Vec<String> = roles
+            .iter()
+            .filter(|r| r.is_child() && r.dispatch)
+            .map(|r| r.id.clone())
+            .collect();
+        for role in roles.iter_mut().filter(|r| r.primary) {
+            for id in &opted_in {
+                let explicit_deny = role
+                    .policy
+                    .matching_rule("task", id)
+                    .is_some_and(|r| !r.action.allows() && r.pattern != "*" && r.pattern != "**");
+                if !explicit_deny && !role.policy.evaluate("task", id).allows() {
+                    role.policy.push(Rule {
+                        permission: "task".into(),
+                        pattern: id.clone(),
+                        action: Action::Allow,
+                    });
+                }
+            }
+        }
         Ok(Self { roles, manager })
     }
 
