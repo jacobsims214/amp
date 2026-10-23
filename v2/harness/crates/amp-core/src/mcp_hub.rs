@@ -1276,8 +1276,8 @@ impl From<&Inner> for ConnectCtx {
 /// A server resolved for one attempt: expanded, secrets read, ready to connect.
 enum Prepared {
     Stdio(amp_mcp::StdioSpec),
-    Http(amp_mcp::HttpServerOptions),
-    Sse(amp_mcp::HttpServerOptions),
+    /// Streamable HTTP or legacy SSE (`HttpServerOptions::legacy_sse`).
+    Remote(amp_mcp::HttpServerOptions),
 }
 
 /// Expands `${...}`, reads env files and secrets (synchronously: nothing here is held across an
@@ -1309,8 +1309,7 @@ fn prepare(cell: &Cell, ctx: &ConnectCtx) -> Result<Prepared, Fail> {
                     .map_err(|p| Fail::Config(p.to_string()))?,
             )
         }
-        Resolved::Http(r) => Prepared::Http(remote(&r)?),
-        Resolved::Sse(r) => Prepared::Sse(remote(&r)?),
+        Resolved::Http(r) | Resolved::Sse(r) => Prepared::Remote(remote(&r)?),
     })
 }
 
@@ -1321,30 +1320,16 @@ async fn connect_cell(
 ) -> Result<(ExternalClient, Vec<McpToolDef>), Fail> {
     let client = match prepare(cell, ctx)? {
         Prepared::Stdio(spec) => ExternalClient::connect_stdio(spec).await,
-        Prepared::Http(options) => {
+        // `type = "sse"` has `legacy_sse` set by `http_options`; `http::connect` speaks legacy
+        // HTTP+SSE to it, and falls back to it for `type = "http"` (#2238).
+        Prepared::Remote(options) => {
             let backend = CredentialBackend::resolve().map_err(classify)?;
             http::connect(&options, &backend).await
-        }
-        Prepared::Sse(options) => {
-            let backend = CredentialBackend::resolve().map_err(classify)?;
-            connect_sse(&options, &backend).await
         }
     }
     .map_err(classify)?;
     let tools = client.list_tools().await.map_err(classify)?;
     Ok((client, tools))
-}
-
-/// `type = "sse"`: the legacy HTTP+SSE transport is #2238 (H5). Until it lands this goes through
-/// Streamable HTTP with the SSE fallback on, which is where #2238 hooks in; #2238 may replace
-/// this one function with its explicit SSE connect.
-async fn connect_sse(
-    options: &amp_mcp::HttpServerOptions,
-    backend: &CredentialBackend,
-) -> Result<ExternalClient, McpError> {
-    let mut options = options.clone();
-    options.fallback_sse = true;
-    http::connect(&options, backend).await
 }
 
 // ---------------------------------------------------------------------------------------------
