@@ -28,6 +28,16 @@ pub enum McpError {
     #[error("AMP login required: run `amp-harness login` (or set AMP_TOKEN)")]
     AuthRequired { challenge: Option<String> },
 
+    /// A third-party MCP server (`[mcp.<name>]`) answered 401, or its stored OAuth login can no
+    /// longer be refreshed. `reason` says what to do (log in, or fix the configured header or
+    /// bearer variable) and never holds a secret; `challenge` is the `WWW-Authenticate` header.
+    #[error("MCP server `{server}`: {reason}")]
+    ServerAuth {
+        server: String,
+        reason: String,
+        challenge: Option<String>,
+    },
+
     /// The OAuth flow failed (discovery, registration, the browser step, the token exchange).
     #[error("OAuth: {0}")]
     OAuth(String),
@@ -82,7 +92,7 @@ impl McpError {
 
     /// True when the server rejected our credentials (or we sent none).
     pub fn is_auth_required(&self) -> bool {
-        matches!(self, Self::AuthRequired { .. })
+        matches!(self, Self::AuthRequired { .. } | Self::ServerAuth { .. })
     }
 
     /// True when the server answered the request with a JSON-RPC error: AMP's tools return one
@@ -157,7 +167,9 @@ impl McpError {
     /// What went wrong, read from the error and its cause chain (#2178).
     pub fn kind(&self) -> FailureKind {
         match self {
-            Self::AuthRequired { .. } => return FailureKind::LoginRequired,
+            Self::AuthRequired { .. } | Self::ServerAuth { .. } => {
+                return FailureKind::LoginRequired;
+            }
             Self::ConnectTimeout { .. } | Self::Timeout { .. } => return FailureKind::Timeout,
             Self::Closed | Self::Replaced { .. } => return FailureKind::Closed,
             Self::Config(_) | Self::CaFile { .. } => return FailureKind::Config,
@@ -235,7 +247,7 @@ impl McpError {
 
 impl McpError {
     /// The HTTP status in rmcp's "unexpected server response: HTTP 501 Not Implemented: …", if any.
-    fn http_status(&self) -> Option<String> {
+    pub(crate) fn http_status(&self) -> Option<String> {
         let mut current: Option<&(dyn std::error::Error + 'static)> = Some(self);
         while let Some(e) = current {
             let text = e.to_string();

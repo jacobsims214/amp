@@ -31,7 +31,7 @@ impl Health {
         match result {
             Ok(()) => Self::Connected,
             Err(e) if e.is_server_error() => Self::Connected,
-            Err(McpError::AuthRequired { .. }) => Self::AuthRequired,
+            Err(McpError::AuthRequired { .. } | McpError::ServerAuth { .. }) => Self::AuthRequired,
             Err(McpError::Closed) => Self::Disconnected {
                 reason: "connection closed".to_owned(),
             },

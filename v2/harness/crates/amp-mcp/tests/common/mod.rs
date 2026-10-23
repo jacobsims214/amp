@@ -41,6 +41,9 @@ pub enum ServerKind {
     /// A server whose SDK knows `server/discover` but supports only versions up to 2025-11-25: it
     /// answers the probe with "unsupported protocol version" (amp-mcp's extra fallback path).
     NoModernVersion,
+    /// A third-party server from the first MCP spec (#2237): only `initialize` at 2024-11-05, and
+    /// `server/discover` is "method not found".
+    Only20241105,
 }
 
 #[derive(Debug, Default)]
@@ -101,6 +104,7 @@ impl ServerHandler for TestServer {
             ServerKind::NoModernVersion => {
                 Cow::Borrowed(ProtocolVersion::known_up_to(&ProtocolVersion::V_2025_11_25))
             }
+            ServerKind::Only20241105 => Cow::Owned(vec![ProtocolVersion::V_2024_11_05]),
         }
     }
 
@@ -113,7 +117,7 @@ impl ServerHandler for TestServer {
                 self.supported_protocol_versions().into_owned(),
                 self.get_info(),
             )),
-            ServerKind::LegacyOnly => Err(ErrorData::new(
+            ServerKind::LegacyOnly | ServerKind::Only20241105 => Err(ErrorData::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 "Method not found",
                 None,
