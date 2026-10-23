@@ -16,9 +16,16 @@
 //! For OpenAI-compatible (and faux) providers it also removes text-format tool calls
 //! (`<tool_call><function=…>`) from the stream, and turns them into real calls when the model sent
 //! no structured one ([`crate::text_tool_calls`], #2179).
+//!
+//! Tool-call hygiene (#2203), for every provider: a finished message's structured call with no
+//! name is dropped and one with no id gets a generated id, and before each request the history is
+//! cleaned of calls and tool results that have no id ([`sanitize_history`]). A provider that once
+//! streamed an empty call (OpenRouter with MiMo) left a tool result with an empty `tool_call_id`,
+//! and every later request was refused with a 400; cleaning on send also recovers such a session.
 
 use std::{
-    collections::BTreeMap,
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,7 +34,7 @@ use std::{
 use async_trait::async_trait;
 use rpi_ai::{
     AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, Context, ErrorReason,
-    Model, Provider, SimpleStreamOptions, StopReason,
+    Message, Model, Provider, SimpleStreamOptions, StopReason,
     event_stream::create_assistant_message_event_stream,
     providers::{
         anthropic::AnthropicProvider,
@@ -541,7 +548,15 @@ impl Provider for ConfiguredProvider {
         }
         let cancel = opts.signal.child_token();
         opts.signal = cancel.clone();
-        let inner = self.inner.stream_simple(model, ctx, &opts).await;
+        let ctx = match sanitize_history(&ctx.messages) {
+            Some(messages) => Cow::Owned(Context {
+                system_prompt: ctx.system_prompt.clone(),
+                messages,
+                tools: ctx.tools.clone(),
+            }),
+            None => Cow::Borrowed(ctx),
+        };
+        let inner = self.inner.stream_simple(model, &ctx, &opts).await;
         let guarded = if self.timeouts.header.is_none() && self.timeouts.stream_idle.is_none() {
             inner
         } else {
@@ -550,9 +565,58 @@ impl Provider for ConfiguredProvider {
         if self.text_tool_calls {
             crate::text_tool_calls::scrub_stream(guarded, ctx.tools.clone())
         } else {
-            guarded
+            crate::text_tool_calls::repair_stream(guarded)
         }
     }
+}
+
+/// The history to send without the tool calls no provider accepts (#2203): an assistant tool call
+/// with an empty id or name, and a tool result with an empty `tool_call_id` or answering a call
+/// that was dropped. An assistant message left with no content is dropped too. `None` when there
+/// is nothing to remove (the common case: no copy).
+///
+/// Sessions saved before the provider-side repair can hold such a pair (the call, then rpi-agent's
+/// "rejected: provider returned an empty tool-call id" result); without this every later prompt in
+/// the session, resumed or not, fails with a 400.
+pub fn sanitize_history(messages: &[Message]) -> Option<Vec<Message>> {
+    use rpi_ai::types::{Content, ToolCall};
+    let bad_call = |c: &ToolCall| c.id.trim().is_empty() || c.name.trim().is_empty();
+    let dirty = messages.iter().any(|m| match m {
+        Message::Assistant(a) => a
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall(call) if bad_call(call))),
+        Message::ToolResult(r) => r.tool_call_id.trim().is_empty(),
+        Message::User(_) => false,
+    });
+    if !dirty {
+        return None;
+    }
+    let mut dropped: BTreeSet<String> = BTreeSet::new();
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            Message::Assistant(a) => {
+                let mut a = a.clone();
+                a.content.retain(|c| match c {
+                    Content::ToolCall(call) if bad_call(call) => {
+                        if !call.id.trim().is_empty() {
+                            dropped.insert(call.id.clone());
+                        }
+                        false
+                    }
+                    _ => true,
+                });
+                if !a.content.is_empty() {
+                    out.push(Message::Assistant(a));
+                }
+            }
+            Message::ToolResult(r)
+                if r.tool_call_id.trim().is_empty() || dropped.contains(&r.tool_call_id) => {}
+            other => out.push(other.clone()),
+        }
+    }
+    Some(out)
 }
 
 fn now_ms() -> i64 {
@@ -749,6 +813,70 @@ mod tests {
     use super::*;
     use crate::models::ModelsFile;
     use rpi_ai::{Message, UserMessage, providers::faux::FauxStep};
+
+    fn call(id: &str, name: &str) -> rpi_ai::types::Content {
+        rpi_ai::types::Content::tool_call(id, name, serde_json::json!({}))
+    }
+
+    fn assistant(content: Vec<rpi_ai::types::Content>) -> Message {
+        let mut a =
+            AssistantMessage::empty(rpi_ai::types::Api::OpenaiCompletions, "openrouter", "m", 0);
+        a.content = content;
+        Message::Assistant(Box::new(a))
+    }
+
+    fn result(id: &str) -> Message {
+        Message::ToolResult(Box::new(rpi_ai::types::ToolResultMessage {
+            role: Default::default(),
+            tool_call_id: id.into(),
+            tool_name: String::new(),
+            content: vec![rpi_ai::types::Content::text("rejected")],
+            details: None,
+            usage: None,
+            added_tool_names: Vec::new(),
+            is_error: true,
+            timestamp: 0,
+        }))
+    }
+
+    #[test]
+    fn history_without_bad_calls_is_sent_as_is() {
+        let history = vec![
+            Message::User(UserMessage::new("go", 0)),
+            assistant(vec![call("call_1", "ls")]),
+            result("call_1"),
+        ];
+        assert!(sanitize_history(&history).is_none());
+    }
+
+    #[test]
+    fn history_drops_calls_without_an_id_or_name_and_their_results() {
+        let history = vec![
+            Message::User(UserMessage::new("go", 0)),
+            assistant(vec![
+                rpi_ai::types::Content::text("before.\n after"),
+                call("", ""),
+                call("call_2", ""),
+                call("call_3", "ls"),
+            ]),
+            result(""),
+            result("call_2"),
+            result("call_3"),
+            // A message that held only a bad call goes entirely.
+            assistant(vec![call("", "ls")]),
+            result(""),
+            Message::User(UserMessage::new("Say ok.", 0)),
+        ];
+        let clean = sanitize_history(&history).expect("changed");
+        assert_eq!(clean.len(), 4, "{clean:#?}");
+        let Message::Assistant(a) = &clean[1] else {
+            panic!("{:?}", clean[1])
+        };
+        assert_eq!(a.content.len(), 2);
+        assert!(matches!(&a.content[1], rpi_ai::types::Content::ToolCall(c) if c.id == "call_3"));
+        assert!(matches!(&clean[2], Message::ToolResult(r) if r.tool_call_id == "call_3"));
+        assert!(matches!(&clean[3], Message::User(_)));
+    }
 
     fn config(user: &str) -> ModelsConfig {
         let user = ModelsFile::parse(user, "test").unwrap();

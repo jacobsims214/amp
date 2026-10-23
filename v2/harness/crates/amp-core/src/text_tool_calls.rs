@@ -283,19 +283,76 @@ fn set_block_text(content: &mut Content, text: &str) {
     }
 }
 
-/// A unique id for a call parsed from text.
-fn new_call_id() -> String {
+/// A unique id with `prefix`: `<prefix>_<ms hex>_<n>`.
+fn unique_id(prefix: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or_default();
-    format!("call_text_{ms:x}_{}", NEXT.fetch_add(1, Ordering::Relaxed))
+    format!("{prefix}_{ms:x}_{}", NEXT.fetch_add(1, Ordering::Relaxed))
+}
+
+/// A unique id for a call parsed from text.
+fn new_call_id() -> String {
+    unique_id("call_text")
+}
+
+/// Whether a structured call can't be dispatched: no tool name. rpi-agent rejects it, and the
+/// rejection's tool result is what poisons the session (#2203).
+fn unusable(call: &ToolCall) -> bool {
+    call.name.trim().is_empty()
+}
+
+/// Repair the structured tool calls of a finished message (#2203). Some OpenAI-compatible
+/// providers (OpenRouter with MiMo) stream a `tool_calls` entry with no id and no name next to a
+/// text-format call. rpi-agent rejects such a call with a tool result whose `tool_call_id` is
+/// empty, and every later request is then refused (400 "tool messages must include a non-empty
+/// string tool_call_id"). So: a call with no name is dropped, and a named call with no id gets a
+/// generated one (`call_amp_…`). When no call is left, a `ToolUse` stop reason becomes `Stop`.
+/// Returns how many calls were dropped.
+pub fn repair_tool_calls(message: &mut AssistantMessage) -> usize {
+    let before = message.content.len();
+    message
+        .content
+        .retain(|c| !matches!(c, Content::ToolCall(call) if unusable(call)));
+    let dropped = before - message.content.len();
+    let mut any = false;
+    for content in &mut message.content {
+        if let Content::ToolCall(call) = content {
+            any = true;
+            if call.id.trim().is_empty() {
+                call.id = unique_id("call_amp");
+            }
+        }
+    }
+    if !any && message.stop_reason == StopReason::ToolUse {
+        message.stop_reason = StopReason::Stop;
+    }
+    dropped
+}
+
+/// The `Done` reason that matches a repaired message: `ToolUse` exactly when it has calls left
+/// (a `Length` or other reason is kept).
+fn done_reason(reason: DoneReason, message: &AssistantMessage) -> DoneReason {
+    let has_calls = message
+        .content
+        .iter()
+        .any(|c| matches!(c, Content::ToolCall(_)));
+    match reason {
+        DoneReason::Stop if has_calls => DoneReason::ToolUse,
+        DoneReason::ToolUse if !has_calls => DoneReason::Stop,
+        other => other,
+    }
 }
 
 /// Scrub a finished message. With `parse_calls`, text calls become real calls when the message has
 /// no structured one; returns whether it did.
+///
+/// Structured calls are repaired first ([`repair_tool_calls`]), so a call with no name doesn't
+/// count as structured: the text calls are parsed in its place.
 pub fn scrub_message(message: &mut AssistantMessage, tools: &[Tool], parse_calls: bool) -> bool {
+    repair_tool_calls(message);
     let mut calls: Vec<TextCall> = Vec::new();
     let content = std::mem::take(&mut message.content);
     for mut block in content {
@@ -346,6 +403,9 @@ pub fn scrub_message(message: &mut AssistantMessage, tools: &[Tool], parse_calls
 pub struct StreamScrubber {
     tools: Vec<Tool>,
     blocks: BTreeMap<usize, Scrubber>,
+    /// Scrub and parse text-format calls. Without it only the final message's structured calls
+    /// are repaired ([`repair_tool_calls`]); every other event passes through.
+    text: bool,
 }
 
 impl StreamScrubber {
@@ -353,6 +413,16 @@ impl StreamScrubber {
         Self {
             tools,
             blocks: BTreeMap::new(),
+            text: true,
+        }
+    }
+
+    /// Repair structured calls only (providers that never write text calls: Anthropic).
+    pub fn calls_only() -> Self {
+        Self {
+            tools: Vec::new(),
+            blocks: BTreeMap::new(),
+            text: false,
         }
     }
 
@@ -365,18 +435,23 @@ impl StreamScrubber {
                 reason,
                 mut message,
             } => {
-                let parsed = scrub_message(&mut message, &self.tools, true);
-                let reason = if parsed && reason == DoneReason::Stop {
-                    DoneReason::ToolUse
+                if self.text {
+                    scrub_message(&mut message, &self.tools, true);
                 } else {
-                    reason
-                };
+                    repair_tool_calls(&mut message);
+                }
+                let reason = done_reason(reason, &message);
                 vec![E::Done { reason, message }]
             }
             E::Error { reason, mut error } => {
-                scrub_message(&mut error, &self.tools, false);
+                if self.text {
+                    scrub_message(&mut error, &self.tools, false);
+                } else {
+                    repair_tool_calls(&mut error);
+                }
                 vec![E::Error { reason, error }]
             }
+            other if !self.text => vec![other],
             E::Start { partial } => vec![E::Start {
                 partial: self.update(&partial, None),
             }],
@@ -565,12 +640,24 @@ impl StreamScrubber {
 /// Forward `inner` through a [`StreamScrubber`]. `tools` are the request's tools (for argument
 /// types).
 pub fn scrub_stream(
-    mut inner: AssistantMessageEventStream,
+    inner: AssistantMessageEventStream,
     tools: Vec<Tool>,
+) -> AssistantMessageEventStream {
+    forward(inner, StreamScrubber::new(tools))
+}
+
+/// Forward `inner`, repairing only the final message's structured tool calls
+/// ([`repair_tool_calls`], #2203).
+pub fn repair_stream(inner: AssistantMessageEventStream) -> AssistantMessageEventStream {
+    forward(inner, StreamScrubber::calls_only())
+}
+
+fn forward(
+    mut inner: AssistantMessageEventStream,
+    mut scrubber: StreamScrubber,
 ) -> AssistantMessageEventStream {
     let (mut producer, consumer) = create_assistant_message_event_stream();
     tokio::spawn(async move {
-        let mut scrubber = StreamScrubber::new(tools);
         while let Some(event) = inner.next().await {
             let terminal = event.is_terminal();
             for out in scrubber.on_event(event) {
