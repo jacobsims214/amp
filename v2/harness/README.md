@@ -3,16 +3,24 @@
 AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) with an MCP client on
 `rmcp`. Design and build plan: AMP project 2 KB, `decisions/amp-harness-architecture.md`.
 
-Status: **M2.** `amp-mcp` connects to AMP (both MCP protocol eras, static token or OAuth login).
-`amp-harness` with no subcommand is a chat with the manager, which plans on the board and dispatches
-specialist workers itself (`amp_run_ticket`); every worker's run, tokens and commit are reported to
-its ticket automatically. The CLI also has `login`, `logout`, `doctor`, `whoami`, `tickets list|get`,
-`config show`, `connect`/`disconnect` (model provider keys), `run -p` (a headless agent run) and
-`mcp …` (MCP servers, plus `mcp call` for AMP's tools). `make smoke` runs them against a real local AMP.
+Status: **M4.** `amp-harness` with no subcommand is a chat with the manager, which plans on the
+board and dispatches specialist workers itself (`amp_run_ticket`); every worker's run, tokens and
+commit are reported to its ticket automatically. The CLI sets everything up without editing a file:
+`setup` (first run, org presets), `server`, `login`/`logout`, `connect`/`disconnect` (model
+providers), `models`, `agents`, `skills`, `mcp` (any MCP server, import, trust), `config show|check`,
+`doctor`, `whoami`, `tickets list|get` and `run -p` (a headless agent run). `make smoke` runs them
+against a real local AMP.
+
+**User guide:** the AMP guide's harness pages, `v2/kb/harness/` (served by `amp_guide`; start at
+[`v2/kb/harness/start-here.md`](../kb/harness/start-here.md)). They cover install, servers,
+providers and keys, models per role, agents and skills, MCP servers, configuration, running work and
+troubleshooting, plus a step-by-step walkthrough for a company's own model endpoint
+([`enterprise-provider.md`](../kb/harness/enterprise-provider.md)). This README is the reference
+for developers and admins; keep the two in step.
 
 ## Install
 
-macOS (Apple silicon or Intel) and Linux (x86_64 or aarch64, glibc 2.35+), one line:
+macOS 13+ (Apple silicon or Intel) and Linux (x86_64 or aarch64, glibc 2.35+), one line:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh
@@ -50,9 +58,20 @@ it installs and prints the setup command instead.
   on Alpine and other musl systems (not supported yet), on glibc older than 2.35 (e.g. Ubuntu 20.04),
   and when a needed tool is missing.
 
-Until the first release is published (M5-1, #2122), install from a checkout:
-`make -C v2/harness install` builds a release binary, packs it and installs it with this same
-script.
+**Until the first release.** The one-liner works only once the first `harness-v*` release is
+published (M5-1, #2122) and the harness branch has reached `main`; before that it stops with "no
+harness-v* release found". Install from a checkout instead (git and rustup needed):
+
+```sh
+git clone https://github.com/jacobsims214/amp.git && cd amp
+git checkout harness-m4                    # until the harness reaches main
+make -C v2/harness install                 # release build, packed and installed by install.sh
+amp-harness setup --preset https://intranet.example.com/amp-preset.toml   # with an org preset
+```
+
+`make install` uses this same script (setup hand-off included); `PREFIX=DIR` installs elsewhere.
+`setup --url` takes a full URL (`https://amp.example.com/mcp`); `server set` also takes a bare
+`host` or `host:port`.
 
 ## Try it
 
@@ -575,6 +594,10 @@ amp-harness connect example --base-url api.example.com --name "Example AI" \
 amp-harness connect example --role reviewers=orchestrator # it has its key: only the roles change
 ```
 
+Name the reviewers in the first command when they should be on `orchestrator`: on a switch from
+OpenRouter, the roles you don't name go to the workers' model (the first run's name matching and an
+org preset put reviewers on the manager's model by themselves).
+
 - ROLE is a group (`manager`, `workers`/`worker`, `reviewers`, `helpers`/`helper`), `all`, or a
   role name (`kb-curator`, `amp-worker-docs`). MODEL is one of the provider's models (or
   `provider/model`). Both are checked before anything is stored.
@@ -913,9 +936,12 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   model directly. `/connect [provider]` lists providers or
   stores a key without leaving the chat (see Connecting model providers). `/server` lists the saved
   AMP servers and `/server <name|address>` switches the session to one without a restart (see Saved
-  servers). `/reload` picks up agents, skills, models and MCP servers changed from another
-  terminal (see below). `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/quit`
-  (also `/exit`, `/q`).
+  servers). `/mcp`, `/agents`, `/skills`, `/model roles` and `/config` are panels over the same
+  settings as the CLI (health, details, enable/disable, trust, per-role models, every setting with
+  its source). `/reload` picks up agents, skills, models and MCP servers changed from another
+  terminal (see below). AMP: `/ticket`, `/project`, `/questions`, `/plan`, `/open`, `/workers`,
+  `/worker`, `/amp`. `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/close`,
+  `/quit` (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T expands (or collapses
   again) the last thinking section; Ctrl+O shows (or hides) every tool call's arguments and result.
@@ -1019,8 +1045,6 @@ Links are OSC 8 hyperlinks (Cmd/Ctrl-click in most terminals). Text from AMP is 
 characters removed. `amp-harness debug render-chrome --width 100 [--theme dark|light] [--color
 truecolor|256] [--plain] [--live [--ticket ID]]` prints the header and status line alone, from a
 built-in sample or (`--live`) from AMP, for screenshots and render checks.
-
-AMP slash commands come in M3-4.
 
 ### Waiting for your approval (#2171)
 

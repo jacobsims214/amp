@@ -1,6 +1,6 @@
 ---
 title: Connect your agent harness to AMP
-tags: [setup, harness, mcp, tokens, claude-code, opencode, onboarding]
+tags: [setup, harness, mcp, tokens, claude-code, opencode, amp-harness, onboarding]
 ---
 
 # Connect your agent harness to AMP
@@ -36,6 +36,13 @@ skills, MCP servers and model settings) as one `plugins` entry in your global
 `--url https://<your-amp>/mcp` (default `$AMP_MCP_URL`); pass `--token <token>`, or omit it to
 sign in with OAuth. `--inherit-models` runs every agent on your own default model. If you used
 the old `sync-global-config.sh`, rerun with `--clean` to remove the files it copied.
+
+**AMP Harness** (`amp-harness`, AMP's own harness)
+
+Nothing to wire up: `amp-harness setup` signs you in to AMP in the browser, links the folder to
+a project and connects a model provider, and the manager, workers and skills are built in. Start
+with `harness/start-here.md` (install: `harness/install.md`; your company's own model endpoint:
+`harness/enterprise-provider.md`).
 
 **Anything else** that speaks MCP: point it at `https://<your-amp>/mcp` with
 `Authorization: Bearer <token>`.
