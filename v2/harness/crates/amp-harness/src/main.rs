@@ -28,13 +28,13 @@ mod setup;
 mod tickets;
 mod whoami;
 
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
 use amp_mcp::{
     CredentialBackend, McpError, Overrides, Settings,
     oauth::{self, LoginOptions, LoginPrompt},
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 
 /// Harness version, the exact upstream versions it was built against, and the commit of the
 /// embedded agent/skill assets (D11).
@@ -158,7 +158,7 @@ impl ServerArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_cli(std::env::args_os().collect());
     conn::set_verbose(cli.verbose);
     let result: Result<(), conn::CliError> = match cli.command {
         Some(Command::Version) => {
@@ -189,6 +189,63 @@ async fn main() -> ExitCode {
             ExitCode::from(e.code)
         }
     }
+}
+
+/// Parses the command line. The top-level (chat) flags conflict with subcommands, so clap rejects
+/// `amp-harness --url X doctor` ("the subcommand 'doctor' cannot be used with '--url'") while
+/// `amp-harness doctor --url X` works. #2208: flags given before a subcommand are moved after it
+/// and the line is parsed again, so both orders work for every subcommand that takes the flag; one
+/// that doesn't (`version --url`) gets clap's own "unexpected argument" error for that subcommand.
+fn parse_cli(args: Vec<OsString>) -> Cli {
+    match Cli::try_parse_from(&args) {
+        Ok(cli) => cli,
+        Err(e) if e.kind() == clap::error::ErrorKind::ArgumentConflict => {
+            match flags_after_subcommand(&args) {
+                Some(moved) => Cli::try_parse_from(moved).unwrap_or_else(|e| e.exit()),
+                None => e.exit(),
+            }
+        }
+        Err(e) => e.exit(),
+    }
+}
+
+/// `[bin, --url, X, doctor, --json]` -> `[bin, doctor, --json, --url, X]`: the leading top-level
+/// long flags (with their values) moved to the end of the subcommand's arguments, before a `--`.
+/// `None` when the line doesn't start with known long flags followed by a subcommand name.
+fn flags_after_subcommand(args: &[OsString]) -> Option<Vec<OsString>> {
+    let cmd = Cli::command();
+    let is_subcommand = |t: &str| {
+        cmd.get_subcommands()
+            .any(|s| s.get_name() == t || s.get_all_aliases().any(|a| a == t))
+    };
+    let mut i = 1;
+    loop {
+        let t = args.get(i)?.to_str()?;
+        if is_subcommand(t) {
+            break;
+        }
+        let flag = t.strip_prefix("--").filter(|f| !f.is_empty())?;
+        let (name, inline_value) = match flag.split_once('=') {
+            Some((name, _)) => (name, true),
+            None => (flag, false),
+        };
+        let arg = cmd.get_arguments().find(|a| a.get_long() == Some(name))?;
+        i += if !inline_value && arg.get_action().takes_values() {
+            2
+        } else {
+            1
+        };
+    }
+    if i == 1 {
+        return None;
+    }
+    let (flags, rest) = (&args[1..i], &args[i..]);
+    let end = rest.iter().position(|a| a == "--").unwrap_or(rest.len());
+    let mut moved = vec![args[0].clone()];
+    moved.extend_from_slice(&rest[..end]);
+    moved.extend_from_slice(flags);
+    moved.extend_from_slice(&rest[end..]);
+    Some(moved)
 }
 
 async fn login(args: LoginArgs) -> Result<(), McpError> {
@@ -269,11 +326,62 @@ async fn logout(args: ServerArgs) -> Result<(), McpError> {
 
 #[cfg(test)]
 mod tests {
-    use super::Cli;
-    use clap::CommandFactory;
+    use std::ffi::OsString;
+
+    use super::{Cli, flags_after_subcommand};
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    fn line(s: &str) -> Vec<OsString> {
+        s.split(' ').map(OsString::from).collect()
+    }
+
+    /// #2208: clap still rejects top-level flags before a subcommand, which is why they are moved.
+    #[test]
+    fn flags_before_a_subcommand_move_after_it() {
+        let rejected = Cli::try_parse_from(line("amp-harness --url http://x/mcp doctor"));
+        assert_eq!(
+            rejected.err().map(|e| e.kind()),
+            Some(clap::error::ErrorKind::ArgumentConflict)
+        );
+        for (given, moved) in [
+            (
+                "amp-harness --url http://x/mcp doctor --json",
+                "amp-harness doctor --json --url http://x/mcp",
+            ),
+            (
+                "amp-harness --url=http://x/mcp --verbose tickets list",
+                "amp-harness tickets list --url=http://x/mcp --verbose",
+            ),
+            (
+                "amp-harness --verbose mcp call amp_whoami -- {}",
+                "amp-harness mcp call amp_whoami --verbose -- {}",
+            ),
+        ] {
+            assert_eq!(
+                flags_after_subcommand(&line(given)),
+                Some(line(moved)),
+                "{given}"
+            );
+        }
+        // `--role doctor` is a flag's value, not the subcommand.
+        assert_eq!(
+            flags_after_subcommand(&line("amp-harness --role doctor --url u doctor")),
+            Some(line("amp-harness doctor --role doctor --url u"))
+        );
+        for left in [
+            "amp-harness doctor --url u",
+            "amp-harness --url u",
+            "amp-harness --nope doctor",
+            "amp-harness stray doctor",
+        ] {
+            assert_eq!(flags_after_subcommand(&line(left)), None, "{left}");
+        }
+        let cli = super::parse_cli(line("amp-harness --url http://x/mcp --verbose doctor"));
+        assert!(cli.verbose && matches!(cli.command, Some(super::Command::Doctor(_))));
     }
 }

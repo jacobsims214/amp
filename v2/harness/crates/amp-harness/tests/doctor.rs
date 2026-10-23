@@ -676,3 +676,76 @@ async fn a_marker_made_for_another_server_is_a_warning() {
     assert_eq!(status(&v, "project"), "ok", "{v}");
     assert_eq!(v["project"]["warning"], Value::Null);
 }
+
+// --- connect (#2208) ------------------------------------------------------------------------------
+
+/// A refused connection reads as the one sentence the other commands print, with no rmcp types and
+/// no AMP-repo hint (`make up`, :8000); the cause chain appears only with --verbose. The URL flag
+/// works before the subcommand too (`amp-harness --url X doctor`).
+#[tokio::test]
+async fn doctor_connect_failure_is_one_sentence() {
+    let dir = workdir("doctor-connect-sentence", None);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let url = format!("http://{addr}/mcp");
+    let sentence = format!("Can't reach AMP at {addr} (connection refused).");
+
+    for args in [
+        &["doctor", "--offline", "--url", &url][..],
+        &["--url", &url, "doctor", "--offline"][..],
+    ] {
+        // AMP_MCP_URL points elsewhere: the flag must win in both orders.
+        let out = run(&dir, "http://127.0.0.1:9/mcp", args, &[OR_KEY]).await;
+        assert_eq!(out.code, 1, "{args:?}: {}{}", out.stdout, out.stderr);
+        assert!(out.stderr.is_empty(), "{args:?}: {}", out.stderr);
+        let line = out
+            .stdout
+            .lines()
+            .find(|l| l.contains("[FAIL] connect"))
+            .unwrap_or_else(|| panic!("{args:?}: {}", out.stdout));
+        assert!(line.trim_end().ends_with(&sentence), "{line}");
+        for leaked in [
+            "rmcp::",
+            "Transport",
+            "os error",
+            "make up",
+            ":8000",
+            "cause:",
+        ] {
+            assert!(!out.stdout.contains(leaked), "{leaked}: {}", out.stdout);
+        }
+        assert!(
+            out.stdout.contains(&format!(
+                "fix: is AMP running at {url} (from flag)? Start it, or"
+            )),
+            "{}",
+            out.stdout
+        );
+    }
+
+    // --verbose (either side of the subcommand) adds the chain on a cause: line under connect.
+    for args in [
+        &["doctor", "--offline", "--verbose"][..],
+        &["--verbose", "doctor", "--offline"][..],
+    ] {
+        let out = run(&dir, &url, args, &[OR_KEY]).await;
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("[FAIL] connect"))
+            .unwrap_or_else(|| panic!("{args:?}: {}", out.stdout));
+        let cause = lines[at + 1..]
+            .iter()
+            .take(2)
+            .find(|l| l.trim_start().starts_with("cause: "))
+            .unwrap_or_else(|| panic!("{args:?}: {}", out.stdout));
+        assert!(cause.contains("onnection refused"), "{cause}");
+    }
+
+    // JSON: the check's detail is the sentence; connection.error keeps the full chain for scripts.
+    let out = run(&dir, &url, &["doctor", "--json", "--offline"], &[OR_KEY]).await;
+    let v = out.json();
+    assert_eq!(check(&v, "connect")["detail"], sentence.as_str());
+    assert!(v["connection"]["error"].as_str().unwrap().len() > sentence.len());
+}

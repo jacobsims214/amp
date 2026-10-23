@@ -24,7 +24,7 @@ use amp_core::{
     providers::SystemKeys,
     tools::{call_json, missing_contract_tools},
 };
-use amp_mcp::{Auth, CredentialBackend, McpError, Settings, oauth};
+use amp_mcp::{Auth, CredentialBackend, FailureKind, McpError, Settings, oauth};
 use clap::Args;
 use serde::Serialize;
 use serde_json::json;
@@ -681,17 +681,18 @@ fn login_fix(settings: &Settings) -> String {
     }
 }
 
-/// `connect`'s detail and fix for a failed connection.
+/// `connect`'s detail and fix for a failed connection. The detail is the same one sentence the
+/// other commands print ([`crate::conn::connect_headline`], #2208); the full cause chain is in
+/// the JSON's `connection.error` and, with `--verbose`, on a `cause:` line. The fix never assumes
+/// the AMP repo (no `make up`): a user of the released binary has neither it nor its ports.
 fn connect_failure(e: &McpError, settings: &Settings, ca_broken: bool) -> (String, String) {
+    let detail = crate::conn::connect_headline(&settings.url, Some(&settings.auth), e);
     if e.is_auth_required() {
-        return (
-            format!("{} answered, but needs a login: {e}", settings.url),
-            login_fix(settings),
-        );
+        return (detail, login_fix(settings));
     }
     if ca_broken || matches!(e, McpError::CaFile { .. }) {
         return (
-            e.to_string(),
+            detail,
             "fix the `ca` check above, then run `amp-harness doctor` again".to_owned(),
         );
     }
@@ -702,20 +703,22 @@ fn connect_failure(e: &McpError, settings: &Settings, ca_broken: bool) -> (Strin
     } else {
         let switch = match &settings.url_source {
             amp_mcp::Source::Env(var) => format!(
-                "unset {var} (it overrides the saved server), or switch with `amp-harness server \
-                 use <name>` / `amp-harness server set <your AMP's address>`"
+                "or unset {var} (it overrides the saved server), or switch with `amp-harness \
+                 server use <name>` / `amp-harness server set <your AMP's address>`"
             ),
-            _ => "otherwise switch to your AMP with `amp-harness server set <its address>` (or \
+            _ => "or switch to your AMP with `amp-harness server set <its address>` (or \
                   `amp-harness server use <name>` for a saved one)"
                 .to_owned(),
         };
-        format!(
-            "is AMP running at {} (from {})? For local compose run `cd v2 && make up` (MCP at \
-             http://localhost:8000/mcp); {switch}",
-            settings.url, settings.url_source
-        )
+        let (url, source) = (&settings.url, &settings.url_source);
+        match e.kind() {
+            FailureKind::HostNotFound | FailureKind::NotFound | FailureKind::NotMcp => format!(
+                "check the address {url} (from {source}; AMP's usually ends in /mcp), {switch}"
+            ),
+            _ => format!("is AMP running at {url} (from {source})? Start it, {switch}"),
+        }
     };
-    (e.to_string(), fix)
+    (detail, fix)
 }
 
 fn print_human(r: &Report) {
@@ -749,6 +752,14 @@ fn print_human(r: &Report) {
             CheckStatus::Skip => "skip",
         };
         println!("  [{mark}] {:<width$} {}", c.name, c.detail);
+        // #2208: the cause chain behind the connect sentence, only with --verbose / RUST_LOG.
+        if c.name == "connect"
+            && c.status == CheckStatus::Fail
+            && crate::conn::verbose()
+            && let Some(error) = &r.connection.error
+        {
+            println!("         {:<width$} cause: {error}", "");
+        }
         if let Some(fix) = &c.fix
             && matches!(c.status, CheckStatus::Warn | CheckStatus::Fail)
         {
