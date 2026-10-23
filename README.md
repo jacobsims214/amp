@@ -178,6 +178,8 @@ make kb-setup    # pull nomic-embed-text into Ollama (once)
 ```
 
 The UI is at `http://localhost:5173`. MCP is at `http://localhost:8000/mcp` and REST at `:3001`.
+amp-api's `APP_PUBLIC_URL` (set in `docker-compose.yml`) must match the UI's address: approval
+links and artifact URLs are built from it.
 
 **The Helm chart on docker-desktop Kubernetes** matches production, with sign-in and TLS. See
 [`v2/docs/deploy-architecture.md`](./v2/docs/deploy-architecture.md).

@@ -60,6 +60,10 @@ services:
       # UI, and MCP (:8000) never does. Plan approval, artifact approval and
       # human tickets are therefore done in the UI; agents over MCP are
       # refused with a link to the page, built from APP_PUBLIC_URL.
+      # APP_PUBLIC_URL is the UI's address as the browser sees it (the ui
+      # service's host port below). It makes approve_url, refusal links and
+      # artifact URLs absolute; without it links are relative and artifact
+      # URLs are left out. Change it if you publish the UI on another port.
       APP_PUBLIC_URL: http://localhost:5173
     depends_on:
       postgres:
