@@ -79,6 +79,7 @@ pub mod mcp_http;
 pub mod mcp_hub;
 pub mod mcp_stdio;
 pub mod mcp_tools;
+pub mod mcp_trust;
 pub mod meta;
 pub mod models;
 pub mod policy;

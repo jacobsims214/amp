@@ -16,6 +16,8 @@
 //! before the session is built. A headless run (`wait_mcp`) waits for every background and eager
 //! server's first attempt (each bounded by its `startup_timeout_secs`); the chat waits only for
 //! eager ones and picks the rest up as they connect. Callers shut the hub down before exiting.
+//! Repo servers start only once trusted (#2241): the chat asks first (`ask_trust`); headless runs
+//! skip untrusted ones.
 
 use std::{
     path::{Path, PathBuf},
@@ -49,6 +51,9 @@ pub struct SessionRequest<'a> {
     pub allow_offline: bool,
     /// Wait for background MCP servers too (`run -p`); otherwise only for eager ones (the chat).
     pub wait_mcp: bool,
+    /// Ask the person whether to trust this repo's untrusted MCP servers before they start (the
+    /// chat, #2241). Headless runs never ask: untrusted repo servers are skipped.
+    pub ask_trust: bool,
 }
 
 pub struct Session {
@@ -124,6 +129,10 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         .with_secret_env(req.conn.token_env.as_deref()),
     );
 
+    // #2241: repo MCP servers start only once trusted; the chat asks here, before the hub starts.
+    if req.ask_trust {
+        crate::mcp_trust_cmd::ask(&rt.mcp_hub, &rt.state_dir)?;
+    }
     // #2239: external MCP servers, connected in the background (waited for as asked).
     let mcp_events = rt.mcp_hub.subscribe();
     rt.mcp_hub.start();

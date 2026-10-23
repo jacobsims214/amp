@@ -1,4 +1,5 @@
-//! Hidden debug commands: `amp-harness mcp call <tool> [json]` and `mcp tools`.
+//! Hidden debug commands: `amp-harness mcp call <tool> [json]` and `mcp tools`; and trust for
+//! repo MCP servers, `mcp trust` / `mcp untrust` (#2241, [`crate::mcp_trust_cmd`]).
 //!
 //! `mcp call` is what scripts (the M1-5 smoke test) use to create and clean up throwaway data.
 //! Output: the tool's JSON result, pretty-printed (or its text when it is not JSON); `--raw` prints
@@ -17,6 +18,11 @@ pub enum McpCommand {
     Call(CallArgs),
     /// List the tools the server offers.
     Tools(ToolsArgs),
+    /// Trust MCP servers from this repo's .amp/harness/config.toml as configured now (recorded
+    /// outside the repo; a change asks again). No names: list every server and its trust.
+    Trust(crate::mcp_trust_cmd::TrustArgs),
+    /// Forget trusted repo MCP servers.
+    Untrust(crate::mcp_trust_cmd::UntrustArgs),
 }
 
 #[derive(Args)]
@@ -48,6 +54,8 @@ pub async fn run(command: McpCommand) -> Result<(), CliError> {
     match command {
         McpCommand::Call(args) => call(args).await,
         McpCommand::Tools(args) => tools(args).await,
+        McpCommand::Trust(args) => crate::mcp_trust_cmd::trust(args),
+        McpCommand::Untrust(args) => crate::mcp_trust_cmd::untrust(args),
     }
 }
 
