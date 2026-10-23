@@ -2,7 +2,8 @@
 //! (secrets from a test-only keychain service and the env) -> `external::http::connect` -> tools.
 //!
 //! The keychain test uses service `amp-harness-test-h4-<pid>`, deletes its item in a Drop guard,
-//! and is skipped where there is no keychain (Linux CI) or AMP_TEST_SKIP_KEYCHAIN is set.
+//! and is opt-in (#2309): it runs only with `AMP_TEST_KEYCHAIN=1` (and a usable keychain), so a
+//! plain `make test` never writes to the developer's login keychain.
 
 use std::{path::Path, sync::Arc, time::Duration};
 
@@ -234,8 +235,8 @@ impl Drop for KeychainGuard {
 
 #[tokio::test]
 async fn secret_headers_come_from_the_keychain() {
-    if std::env::var_os("AMP_TEST_SKIP_KEYCHAIN").is_some() {
-        eprintln!("skipped: AMP_TEST_SKIP_KEYCHAIN is set");
+    if std::env::var("AMP_TEST_KEYCHAIN").as_deref() != Ok("1") {
+        eprintln!("skipped: set AMP_TEST_KEYCHAIN=1 to run the real-keychain case");
         return;
     }
     let service = format!("amp-harness-test-h4-{}", std::process::id());
