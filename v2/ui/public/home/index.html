@@ -35,6 +35,7 @@
   --font-data: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
+html { scroll-padding-top: 72px; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 var(--font-body); }
 a { color: inherit; }
 .wrap { max-width: 1160px; margin: 0 auto; padding-inline: 24px; }
@@ -89,6 +90,19 @@ section { padding-block: 96px; }
 .chip { font: 500 13px var(--font-data); border: 1px solid var(--line); padding: 7px 10px; background: var(--bg); }
 .flow { stroke-dasharray: 6 8; animation: flow 1.4s linear infinite; }
 @keyframes flow { to { stroke-dashoffset: -28; } }
+
+/* ---- AMP Harness ---- */
+.own { border-top: 1px solid var(--line); }
+.own .split { align-items: start; }
+.own .panel { background: var(--void); border-color: var(--void-line); min-width: 0; }
+.own .panel .ph { background: var(--void-2); border-color: var(--void-line); align-items: center; }
+.own .pre { font-size: 14px; color: var(--ink-2); margin: 0; }
+.own .ctas { display: flex; gap: 12px; flex-wrap: wrap; }
+.feats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); }
+.feat { padding: 20px 18px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: grid; gap: 8px; align-content: start; position: relative; min-width: 0; }
+.feat .tick { position: absolute; top: -1px; left: -1px; width: 30px; height: 4px; }
+.feat h3 { font: 700 19px/1.05 var(--font-label); text-transform: uppercase; letter-spacing: .03em; margin: 0; }
+.feat p { margin: 0; color: var(--ink-2); font-size: 14.5px; }
 
 /* ---- Flight loop ---- */
 .loop { background: var(--void); color: var(--star); position: relative; overflow: hidden; }
@@ -227,6 +241,7 @@ footer a { color: var(--star-2); text-decoration: none; }
   .phase { border-right: 0; border-bottom: 1px solid var(--void-line); padding: 18px 0 18px !important; }
   .phase .lamp { left: 0 !important; }
   .crew-grid, .installs { grid-template-columns: minmax(0, 1fr); }
+  .own .split { gap: 40px; }
   .viewer .vfoot { grid-template-columns: minmax(0, 1fr); }
   .cell { border-right: 0; border-bottom: 1px solid var(--line); }
   .cell:last-child { border-bottom: 0; }
@@ -234,6 +249,10 @@ footer a { color: var(--star-2); text-decoration: none; }
   .board .side { border-right: 0; border-bottom: 1px solid var(--line); }
   .nav-links a:not(.btn) { display: none; }
   section { padding-block: 72px; }
+}
+@media (max-width: 560px) {
+  .wrap { padding-inline: 16px; }
+  .feats { grid-template-columns: minmax(0, 1fr); }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; }
@@ -251,6 +270,7 @@ footer a { color: var(--star-2); text-decoration: none; }
     </a>
     <nav class="nav-links" aria-label="Sections">
       <a href="#harness">Any harness</a>
+      <a href="#amp-harness">AMP Harness</a>
       <a href="#loop">The loop</a>
       <a href="#artifacts">Artifacts</a>
       <a href="#install">Install</a>
@@ -291,7 +311,7 @@ footer a { color: var(--star-2); text-decoration: none; }
         <h2 id="harness-title">Every ship docks at the same station</h2>
         <p class="lede">Your engineers already have a favorite cockpit. AMP doesn't ask them to leave it. Each person's agent connects over MCP with their own token, picks up the same plan, and reports back to the same board.</p>
         <div class="chips" aria-label="Harnesses">
-          <span class="chip">Claude Code</span><span class="chip">opencode</span><span class="chip">any MCP client</span><span class="chip">CI bots</span>
+          <a class="chip" href="#amp-harness">AMP Harness</a><span class="chip">Claude Code</span><span class="chip">opencode</span><span class="chip">any MCP client</span><span class="chip">CI bots</span>
         </div>
         <div><a class="btn solid ink" href="#install">Install the plugin</a></div>
       </div>
@@ -317,6 +337,34 @@ footer a { color: var(--star-2); text-decoration: none; }
             <text x="400" y="216" font-family="JetBrains Mono, monospace" font-size="10" fill="#5E6876">/mcp · one board</text>
           </g>
         </svg>
+      </div>
+    </div>
+  </section>
+
+  <section id="amp-harness" class="own" aria-labelledby="own-title">
+    <div class="wrap split">
+      <div class="head">
+        <span class="label">AMP Harness</span>
+        <h2 id="own-title">Or fly the cockpit built for AMP</h2>
+        <p class="lede">AMP ships its own harness: <b>amp-harness</b>, a terminal chat and coding agent you run beside the web UI. Your manager agent plans on the board, runs specialist workers on your tickets and reports every run, with nothing to wire up.</p>
+        <p class="lede">It's the built-in default, not a requirement. The Claude Code and opencode plugins below keep working.</p>
+        <div class="panel">
+          <div class="ph"><span class="label" style="color:var(--star-2)">Install · macOS and Linux</span><button type="button" class="copy" data-copy="install-harness" aria-label="Copy the AMP Harness install command">Copy</button></div>
+<pre class="code" id="install-harness" style="white-space:pre-wrap;overflow-wrap:anywhere">curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh</pre>
+        </div>
+        <p class="pre">Before the first harness release, <a href="/home/harness/#prerelease">build it from source</a>.</p>
+        <div class="ctas">
+          <a class="btn solid ink" href="/home/harness/">Meet AMP Harness</a>
+          <a class="btn" href="#install">Use a plugin instead</a>
+        </div>
+      </div>
+      <div class="feats" aria-label="AMP Harness features">
+        <div class="feat"><span class="tick b4" aria-hidden="true"></span><h3>Chat with AMP built in</h3><p>AMP's theme, with the project, the ticket in flight, questions, workers and plan approval live in the header and status line.</p></div>
+        <div class="feat"><span class="tick b3" aria-hidden="true"></span><h3>Manager plus specialists</h3><p>Workers dispatched through AMP, each in its own git worktree. Only a person approves the plan.</p></div>
+        <div class="feat"><span class="tick b2" aria-hidden="true"></span><h3>Any model, per role</h3><p>OpenRouter, Anthropic, OpenAI or your own endpoint, including Azure and Entra ID, custom CAs, mTLS and proxies.</p></div>
+        <div class="feat"><span class="tick b1" aria-hidden="true"></span><h3>Any MCP server</h3><p>stdio, Streamable HTTP and SSE, with OAuth. Import from Claude Code, opencode, VS Code, Cursor and Claude Desktop.</p></div>
+        <div class="feat"><span class="tick b4" aria-hidden="true"></span><h3>Your agents and skills</h3><p>Override or add them for yourself or a whole repo. Changes reload into the running chat.</p></div>
+        <div class="feat"><span class="tick b3" aria-hidden="true"></span><h3>Keys in the keychain</h3><p>Typed into a hidden prompt, never a file. <span class="mono" style="font-size:13px">amp-harness doctor</span> checks it all.</p></div>
       </div>
     </div>
   </section>
@@ -644,7 +692,7 @@ helm install amp . -n amp --create-namespace -f my-values.yaml
   <div class="wrap">
     <span class="mark" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i><i class="b4"></i></span>
     <span>AMP · open-source mission control for humans and agents · Apache-2.0</span>
-    <a href="/oauth2/start?rd=%2F">Sign in</a><a href="#self-host">Self-host</a><a href="https://github.com/jacobsims214/amp">GitHub</a><a href="https://github.com/jacobsims214/amp/tree/main/v2/kb">Guide</a>
+    <a href="/oauth2/start?rd=%2F">Sign in</a><a href="#self-host">Self-host</a><a href="https://github.com/jacobsims214/amp">GitHub</a><a href="/home/harness/">AMP Harness</a><a href="https://github.com/jacobsims214/amp/tree/main/v2/kb">Guide</a>
   </div>
 </footer>
 
