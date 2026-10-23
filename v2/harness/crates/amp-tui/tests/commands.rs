@@ -726,3 +726,123 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
     assert_eq!(rig.screen().matches("⏸").count(), before);
     assert_fits(&rig);
 }
+
+/// #2201: per-ticket approval (#2198). `amp_check_plan` says whose each awaiting ticket is.
+fn per_ticket_plan(m: &mut amp_core::meta::AmpMeta) {
+    let plan = amp_core::meta::PlanApproval::from_check_plan(&json!({
+        "require_plan_approval": true,
+        "awaiting_approval": [2108, 2109, 2203],
+        "awaiting_approval_tickets": [
+            {"task_id": 2108, "owner_user_id": 7, "yours": true},
+            {"task_id": 2109, "owner_user_id": 7, "yours": true},
+            {"task_id": 2203, "owner_user_id": 9, "yours": false}
+        ],
+        "awaiting_yours": [2108, 2109],
+        "approve_url": "http://localhost:5173/project/2/plan"
+    }));
+    m.plan.value = Some(plan);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_shows_yours_apart_from_others() {
+    let mut rig = rig(vec![], true).await;
+    rig.meta.stub_update(per_ticket_plan);
+    rig.say("/plan").await;
+    let screen = rig.screen();
+    assert!(
+        screen.contains("approval 2 of yours waiting for your approval #2108 #2109"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "approve yours in AMP: https://amp.simstech.cloud/project/2/plan (o or /open plan)"
+        ),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("others' 1 waiting for their owners' approval #2203"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("their owners approve them in AMP (a project lead may, on their behalf)"),
+        "{screen}"
+    );
+    // The status line counts the person's own (the others' segment goes first when narrow; see
+    // tests/chrome.rs).
+    assert!(
+        screen.contains("│ plan: 2 of yours waiting for your approval"),
+        "{screen}"
+    );
+    assert_fits(&rig);
+
+    // None of the person's own: the panel says so, the chip names only others'.
+    rig.meta.stub_update(|m| {
+        let plan = m.plan.value.as_mut().unwrap();
+        for t in plan.tickets.as_mut().unwrap() {
+            t.yours = false;
+        }
+    });
+    rig.say("/plan").await;
+    let screen = rig.screen();
+    assert!(
+        screen.contains("approval none of yours waiting"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("others' 3 waiting for their owners' approval #2108 #2109 #2203"),
+        "{screen}"
+    );
+    assert!(!screen.contains("waiting for your approval"), "{screen}");
+}
+
+/// #2201: a per-ticket refusal (#2198) says whose approval the ticket waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_ticket_refusal_says_whose_approval() {
+    let mut rig = rig(vec![], true).await;
+    rig.meta.stub_update(per_ticket_plan);
+    let refused = |id: i64| AgentEvent::ToolExecutionEnd {
+        tool_call_id: format!("call-{id}"),
+        tool_name: "amp_dispatch_task".into(),
+        result: rpi_agent::AgentToolResult::text(format!(
+            "tool error: amp_dispatch_task: tools/call amp_dispatch_task: Mcp error: -32603: ticket \
+             {id} isn't approved: nobody has approved it since it was planned or its scope last \
+             changed, and this project needs each ticket approved before agents start it. Its owner \
+             approves it in the AMP web UI (Approve plan; a project lead may approve it on their \
+             behalf): http://localhost:5173/project/2/plan. Agents can't approve: stop and ask your \
+             person to approve it there.\n[amp-harness] This needs a person in the AMP web UI."
+        )),
+        is_error: true,
+    };
+    rig.shell.handle_event(&refused(2108));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for your approval: #2108 is yours"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"
+        ),
+        "{screen}"
+    );
+
+    rig.shell.handle_event(&refused(2203));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for its owner's approval: #2203 is someone else's"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Flight plan: https://amp.simstech.cloud/project/2/plan"),
+        "{screen}"
+    );
+
+    // Not in the last plan check: its owner's, possibly the person's own.
+    rig.shell.handle_event(&refused(4242));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for #4242's owner to approve it"),
+        "{screen}"
+    );
+    assert_fits(&rig);
+}

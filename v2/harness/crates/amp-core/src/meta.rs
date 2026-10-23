@@ -608,12 +608,96 @@ impl Board {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanApproval {
     pub require_plan_approval: bool,
-    /// Open tickets planned since the last approval.
+    /// Open tickets awaiting approval, anyone's (project-wide, board order).
     pub awaiting_approval: Vec<i64>,
     pub plan_approved_at: Option<String>,
     /// The Flight plan page AMP gave (`approve_url`, #2167) while tickets await approval. Untrusted
     /// text: links are built with [`Instance::plan_url`].
     pub approve_url: Option<String>,
+    /// Per-ticket approval (#2198): each awaiting ticket with its owner and whether it is the
+    /// caller's own (`awaiting_approval_tickets`). `None` from servers before #2198, which have
+    /// one project-wide approval: then every awaiting ticket is shown as the person's to approve.
+    pub tickets: Option<Vec<AwaitingTicket>>,
+}
+
+/// A ticket awaiting approval, from `amp_check_plan`'s `awaiting_approval_tickets` (#2198).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingTicket {
+    pub task_id: i64,
+    /// The ticket's owner (`None`: unassigned, approved by whoever planned it).
+    pub owner_user_id: Option<i64>,
+    /// The caller's own: their click approves it. Others' wait for their owners (or a project
+    /// lead, on their behalf).
+    pub yours: bool,
+}
+
+impl PlanApproval {
+    /// From an `amp_check_plan` result. Works with servers before and after #2198.
+    pub fn from_check_plan(v: &Value) -> Self {
+        let ids = |key: &str| -> Vec<i64> {
+            v[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .collect()
+        };
+        let awaiting_approval = ids("awaiting_approval");
+        let tickets = v["awaiting_approval_tickets"].as_array().map(|list| {
+            let yours_ids = v["awaiting_yours"]
+                .as_array()
+                .map(|_| ids("awaiting_yours"));
+            list.iter()
+                .filter_map(|t| {
+                    let task_id = t["task_id"].as_i64()?;
+                    let yours = match t["yours"].as_bool() {
+                        Some(y) => y,
+                        None => yours_ids.as_ref().is_some_and(|y| y.contains(&task_id)),
+                    };
+                    Some(AwaitingTicket {
+                        task_id,
+                        owner_user_id: t["owner_user_id"].as_i64(),
+                        yours,
+                    })
+                })
+                .collect()
+        });
+        PlanApproval {
+            require_plan_approval: v["require_plan_approval"].as_bool().unwrap_or(false),
+            awaiting_approval,
+            plan_approved_at: v["plan_approved_at"].as_str().map(str::to_owned),
+            approve_url: v["approve_url"].as_str().map(str::to_owned),
+            tickets,
+        }
+    }
+
+    /// Whether the server approves per ticket (#2198) and said whose each ticket is.
+    pub fn per_ticket(&self) -> bool {
+        self.tickets.is_some()
+    }
+
+    /// The awaiting tickets the person approves themselves. Before #2198 that is every awaiting
+    /// ticket (one click approved the whole plan).
+    pub fn yours(&self) -> Vec<i64> {
+        match &self.tickets {
+            Some(t) => t.iter().filter(|t| t.yours).map(|t| t.task_id).collect(),
+            None => self.awaiting_approval.clone(),
+        }
+    }
+
+    /// The awaiting tickets that are someone else's: their owners approve them (or a project
+    /// lead, on their behalf). Always empty before #2198.
+    pub fn others(&self) -> Vec<i64> {
+        match &self.tickets {
+            Some(t) => t.iter().filter(|t| !t.yours).map(|t| t.task_id).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whose approval ticket `id` waits for, when AMP said (#2198).
+    pub fn whose(&self, id: i64) -> Option<&AwaitingTicket> {
+        self.tickets.as_ref()?.iter().find(|t| t.task_id == id)
+    }
 }
 
 /// An artifact of the current ticket (§2 item 11).
@@ -1484,17 +1568,7 @@ impl MetaPoller {
             let r = self
                 .call("amp_check_plan", json!({"project_id": pid}))
                 .await;
-            let r = r.map(|v| PlanApproval {
-                require_plan_approval: v["require_plan_approval"].as_bool().unwrap_or(false),
-                awaiting_approval: v["awaiting_approval"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(Value::as_i64)
-                    .collect(),
-                plan_approved_at: v["plan_approved_at"].as_str().map(str::to_owned),
-                approve_url: v["approve_url"].as_str().map(str::to_owned),
-            });
+            let r = r.map(|v| PlanApproval::from_check_plan(&v));
             self.update(|m| m.plan.set(r));
             ran |= Topics::PLAN;
         }
@@ -1791,5 +1865,42 @@ mod tests {
         );
         assert_eq!(Connection::AuthRequired.level(), HealthLevel::Down);
         assert_eq!(Connection::Connecting.level(), HealthLevel::Degraded);
+    }
+
+    #[test]
+    fn plan_approval_reads_old_and_per_ticket_servers() {
+        // Before #2198: one project-wide approval; every awaiting ticket is the person's to approve.
+        let old = PlanApproval::from_check_plan(&json!({
+            "require_plan_approval": true, "awaiting_approval": [3, 4],
+            "approve_url": "/project/2/plan"
+        }));
+        assert!(!old.per_ticket());
+        assert_eq!((old.yours(), old.others()), (vec![3, 4], vec![]));
+        assert_eq!(old.whose(3), None);
+
+        // #2198: owners and `yours` per ticket.
+        let new = PlanApproval::from_check_plan(&json!({
+            "require_plan_approval": true, "awaiting_approval": [3, 4, 5],
+            "awaiting_approval_tickets": [
+                {"task_id": 3, "owner_user_id": 7, "yours": true},
+                {"task_id": 4, "owner_user_id": 9, "yours": false},
+                {"task_id": 5, "owner_user_id": null}
+            ],
+            "awaiting_yours": [3, 5]
+        }));
+        assert!(new.per_ticket());
+        // `yours` missing on an item falls back to awaiting_yours.
+        assert_eq!((new.yours(), new.others()), (vec![3, 5], vec![4]));
+        assert_eq!(
+            new.whose(4).map(|t| (t.owner_user_id, t.yours)),
+            Some((Some(9), false))
+        );
+        assert_eq!(new.whose(5).map(|t| t.owner_user_id), Some(None));
+
+        // Nothing awaiting on a per-ticket server.
+        let none = PlanApproval::from_check_plan(&json!({
+            "awaiting_approval": [], "awaiting_approval_tickets": [], "awaiting_yours": []
+        }));
+        assert!(none.per_ticket() && none.yours().is_empty() && none.others().is_empty());
     }
 }

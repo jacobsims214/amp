@@ -1061,36 +1061,72 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
             Some(plan) => {
                 // #2171: a person approves in the web UI; agents can't. Say so, and link the
                 // Flight plan page (`o` on these rows, or `/open plan`).
-                let ids: Vec<String> = plan
-                    .awaiting_approval
-                    .iter()
-                    .take(12)
-                    .map(|id| format!("#{id}"))
-                    .collect();
+                // #2198: approval is per ticket. The person's own tickets are theirs to approve;
+                // others' wait for their owners (a project lead may approve them on their behalf).
+                let ids = |list: &[i64]| -> String {
+                    let mut out: Vec<String> =
+                        list.iter().take(12).map(|id| format!("#{id}")).collect();
+                    if list.len() > 12 {
+                        out.push("…".to_owned());
+                    }
+                    out.join(" ")
+                };
                 let approve = m.instance.as_ref().map(|i| i.plan_url(pid));
-                let mut row = Row::new(vec![
-                    label("approval"),
-                    fixed(c.warning.fg(&format!(
-                        "{} waiting for your approval",
-                        plan.awaiting_approval.len()
-                    ))),
-                    flex(&ids.join(" "), c.muted),
-                ]);
-                let mut hint = Row::new(vec![
-                    fixed(c.dim.fg("approve the plan in AMP:")),
-                    match &approve {
-                        Some(url) => fixed(link(url, &c.accent.fg(url))),
-                        None => flex("the project's Flight plan page", c.dim),
-                    },
-                    fixed(c.dim.fg("(o or /open plan)")),
-                ])
-                .indent(2);
-                if let Some(url) = approve {
-                    row = row.target(Target::Page(url.clone()));
-                    hint = hint.target(Target::Page(url));
+                let target = |row: Row| match &approve {
+                    Some(url) => row.target(Target::Page(url.clone())),
+                    None => row,
+                };
+                let yours = plan.yours();
+                let others = plan.others();
+                if !yours.is_empty() {
+                    let what = if plan.per_ticket() {
+                        format!("{} of yours waiting for your approval", yours.len())
+                    } else {
+                        format!("{} waiting for your approval", yours.len())
+                    };
+                    rows.push(target(Row::new(vec![
+                        label("approval"),
+                        fixed(c.warning.fg(&what)),
+                        flex(&ids(&yours), c.muted),
+                    ])));
+                    rows.push(target(
+                        Row::new(vec![
+                            fixed(c.dim.fg(if plan.per_ticket() {
+                                "approve yours in AMP:"
+                            } else {
+                                "approve the plan in AMP:"
+                            })),
+                            match &approve {
+                                Some(url) => fixed(link(url, &c.accent.fg(url))),
+                                None => flex("the project's Flight plan page", c.dim),
+                            },
+                            fixed(c.dim.fg("(o or /open plan)")),
+                        ])
+                        .indent(2),
+                    ));
+                } else {
+                    rows.push(Row::new(vec![
+                        label("approval"),
+                        fixed(c.success.fg("none of yours waiting")),
+                    ]));
                 }
-                rows.push(row);
-                rows.push(hint);
+                if !others.is_empty() {
+                    rows.push(target(Row::new(vec![
+                        label("others'"),
+                        fixed(c.muted.fg(&format!(
+                            "{} waiting for their owners' approval",
+                            others.len()
+                        ))),
+                        flex(&ids(&others), c.dim),
+                    ])));
+                    rows.push(target(
+                        Row::new(vec![flex(
+                            "their owners approve them in AMP (a project lead may, on their behalf)",
+                            c.dim,
+                        )])
+                        .indent(2),
+                    ));
+                }
             }
             None => rows.push(Row::new(vec![label("approval"), flex("loading…", c.dim)])),
         }

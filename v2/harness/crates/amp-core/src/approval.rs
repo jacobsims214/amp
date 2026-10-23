@@ -3,7 +3,10 @@
 //! Since #2167 AMP refuses every agent attempt to approve a plan, approve an artifact, mark a
 //! person's ticket done or turn plan approval off: "… is done by a person in the AMP web UI, not by
 //! an agent or over MCP: <link>. Stop and ask your person to do it there." It also refuses to
-//! dispatch (or complete) a ticket "planned after the plan was last approved". The prompts (#2169)
+//! dispatch (or complete) a ticket nobody approved: before #2198 one "planned after the plan was
+//! last approved"; since #2198 (per-ticket approval) a ticket that "isn't approved … since it was
+//! planned or its scope last changed", which "Its owner approves … (a project lead may approve it
+//! on their behalf)". The prompts (#2169)
 //! tell the manager to hand the link to its person and stop; this module makes the harness hold
 //! it to that:
 //!
@@ -35,8 +38,14 @@ use tokio_util::sync::CancellationToken;
 
 /// The UI-only refusal (`authz.UIOnly` in amp-api).
 pub const UI_ONLY_MARK: &str = "is done by a person in the AMP web UI";
-/// The plan-approval gate (`planApprovalGate`, `approvalGate` in amp-api).
+/// The plan-approval gate (`planApprovalGate`, `approvalGate` in amp-api) before #2198.
 pub const PLAN_GATE_MARK: &str = "planned after the plan was last approved";
+/// The same gates since #2198 (per-ticket approval): "ticket N isn't approved: nobody has approved
+/// it since it was planned or its scope last changed" (dispatch), "ticket N can't be completed: it
+/// isn't approved since it was planned or its scope last changed" (complete).
+pub const TICKET_GATE_MARK: &str = "since it was planned or its scope last changed";
+/// Words in the #2198 dispatch refusal saying the ticket's owner approves it.
+const OWNER_APPROVES: &str = "Its owner approves it";
 
 /// Tools the manager may use only on tickets its user named or it dispatched.
 pub const TICKET_SCOPED_TOOLS: &[&str] = &["amp_complete_task", "amp_claim_task"];
@@ -63,14 +72,18 @@ pub struct Refusal {
     pub link: Option<String>,
     /// `/project/{id}/…` in the link.
     pub project_id: Option<i64>,
-    /// `?task={id}` in the link.
+    /// `?task={id}` in the link, or the "ticket N" a plan-gate refusal names.
     pub ticket_id: Option<i64>,
+    /// The server approves per ticket (#2198): the refusal is about one ticket, approved by its
+    /// owner (or a project lead on their behalf), not by whoever approves the plan.
+    pub per_ticket: bool,
 }
 
 /// Recognises an approval or UI-only refusal in a tool error's text.
 pub fn refusal(text: &str) -> Option<Refusal> {
     let ui = text.contains(UI_ONLY_MARK);
-    let gate = text.contains(PLAN_GATE_MARK);
+    let ticket_gate = text.contains(TICKET_GATE_MARK);
+    let gate = ticket_gate || text.contains(PLAN_GATE_MARK);
     if !ui && !gate {
         return None;
     }
@@ -84,7 +97,10 @@ pub fn refusal(text: &str) -> Option<Refusal> {
     let message = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let link = find_link(&message);
     let project_id = link.as_deref().and_then(|l| number_after(l, "/project/"));
-    let ticket_id = link.as_deref().and_then(|l| number_after(l, "task="));
+    let ticket_id = link
+        .as_deref()
+        .and_then(|l| number_after(l, "task="))
+        .or_else(|| gate.then(|| number_after(&message, "ticket ")).flatten());
     let plan_link = link
         .as_deref()
         .is_some_and(|l| l.trim_end_matches('/').ends_with("/plan"));
@@ -93,12 +109,14 @@ pub fn refusal(text: &str) -> Option<Refusal> {
     } else {
         RefusalKind::PersonInUi
     };
+    let per_ticket = ticket_gate || message.contains(OWNER_APPROVES);
     Some(Refusal {
         kind,
         message,
         link,
         project_id,
         ticket_id,
+        per_ticket,
     })
 }
 
@@ -368,6 +386,8 @@ mod tests {
         let r = refusal(gate).unwrap();
         assert_eq!(r.kind, RefusalKind::PlanApproval);
         assert_eq!(r.link.as_deref(), Some("/project/3/plan"));
+        assert_eq!(r.ticket_id, Some(9));
+        assert!(!r.per_ticket);
 
         let human = "amp_complete_task: Marking ticket 41 (a person's ticket) done is done by a \
              person in the AMP web UI, not by an agent or over MCP: \
@@ -375,6 +395,26 @@ mod tests {
         let r = refusal(human).unwrap();
         assert_eq!(r.kind, RefusalKind::PersonInUi);
         assert_eq!((r.project_id, r.ticket_id), (Some(2), Some(41)));
+        assert!(!r.per_ticket);
+
+        // #2198: per-ticket approval.
+        let dispatch = "tool error: amp_dispatch_task: tools/call amp_dispatch_task: Mcp error: \
+             -32603: ticket 2203 isn't approved: nobody has approved it since it was planned or its \
+             scope last changed, and this project needs each ticket approved before agents start \
+             it. Its owner approves it in the AMP web UI (Approve plan; a project lead may approve \
+             it on their behalf): /project/2/plan. Agents can't approve: stop and ask your person.";
+        let r = refusal(dispatch).unwrap();
+        assert_eq!(r.kind, RefusalKind::PlanApproval);
+        assert_eq!((r.project_id, r.ticket_id), (Some(2), Some(2203)));
+        assert!(r.per_ticket);
+        let complete = "ticket 77 can't be completed: it isn't approved since it was planned or its \
+             scope last changed, and agents can't move unapproved work forward. A person approves \
+             the plan in the AMP web UI: https://amp.test/project/4/plan. Stop and ask.";
+        let r = refusal(complete).unwrap();
+        assert_eq!(
+            (r.kind, r.ticket_id, r.per_ticket),
+            (RefusalKind::PlanApproval, Some(77), true)
+        );
 
         for other in [
             "ticket 5 is backlog: it was never dispatched, so an agent can't complete it",

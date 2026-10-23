@@ -16,8 +16,9 @@
 //!   the board with the ticket's drawer open), the name, and `▌ Epic › Story` in the epic's cat
 //!   colour.
 //! - **Status line:** the red questions chip, this chat's workers (from its supervisor only;
-//!   tickets in progress elsewhere are in the board counts), plan approval ("waiting for your approval", a link to the
-//!   Flight plan page), the board counts in the web UI's words, the
+//!   tickets in progress elsewhere are in the board counts), plan approval ("N of yours waiting
+//!   for your approval", and others' tickets apart since per-ticket approval (#2198), links to
+//!   the Flight plan page), the board counts in the web UI's words, the
 //!   current ticket's artifacts in review, and, right-aligned, whether this session reported its
 //!   run to AMP.
 //!
@@ -745,19 +746,35 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         && let Some(plan) = meta.plan.get()
         && !plan.awaiting_approval.is_empty()
     {
-        // #2171: the plan waits on the person at the keyboard; the chip links to the Flight plan
-        // page where they approve it (`/open plan` opens it too). Their next step outranks the
-        // workers count when the line is narrow (only the questions chip stays longer).
-        let text = format!(
-            "plan: {} waiting for your approval",
-            plan.awaiting_approval.len()
-        );
-        let painted = style.paint(c.warning, &text, stale(&meta.plan));
-        let text = match (&meta.instance, meta.project_id) {
+        let plan_link = |painted: String| match (&meta.instance, meta.project_id) {
             (Some(inst), Some(pid)) => link(&inst.plan_url(pid), &painted),
             _ => painted,
         };
-        left.push(Seg::new(text, Lead::Bar, 2));
+        // #2171: the plan waits on the person at the keyboard; the chip links to the Flight plan
+        // page where they approve it (`/open plan` opens it too). Their next step outranks the
+        // workers count when the line is narrow (only the questions chip stays longer).
+        // #2198: approval is per ticket. The chip counts the person's own tickets; others' wait
+        // for their owners (or a lead), so they get a quieter segment that goes first.
+        let yours = plan.yours().len();
+        if yours > 0 {
+            let text = if plan.per_ticket() {
+                format!("plan: {yours} of yours waiting for your approval")
+            } else {
+                format!("plan: {yours} waiting for your approval")
+            };
+            let painted = style.paint(c.warning, &text, stale(&meta.plan));
+            left.push(Seg::new(plan_link(painted), Lead::Bar, 2));
+        }
+        let others = plan.others().len();
+        if others > 0 {
+            let text = if yours > 0 {
+                format!("{others} others' waiting for their owners")
+            } else {
+                format!("plan: {others} others' waiting for their owners' approval")
+            };
+            let painted = style.paint(c.muted, &text, stale(&meta.plan));
+            left.push(Seg::new(plan_link(painted), Lead::Bar, 7));
+        }
     }
 
     // Artifacts of the current ticket in review.
@@ -1052,6 +1069,7 @@ pub mod sample {
                 awaiting_approval: vec![2108, 2109],
                 plan_approved_at: None,
                 approve_url: Some("https://amp.simstech.cloud/project/2/plan".into()),
+                tickets: None,
             }),
             artifacts: ok(Vec::new()),
         }

@@ -307,7 +307,18 @@ fn check_plan_summary(v: &Value) -> Option<String> {
     }
     let awaiting = size(&v["awaiting_approval"]);
     if awaiting > 0 {
-        parts.push(format!("{awaiting} awaiting approval"));
+        // #2198: per-ticket approval says which are the caller's own.
+        match v["awaiting_yours"].as_array().map(Vec::len) {
+            Some(yours) if v["awaiting_approval_tickets"].is_array() => {
+                let others = awaiting.saturating_sub(yours);
+                parts.push(match (yours, others) {
+                    (_, 0) => format!("{yours} of yours awaiting approval"),
+                    (0, _) => format!("{others} others' awaiting their owners' approval"),
+                    _ => format!("{yours} of yours awaiting approval, {others} others'"),
+                });
+            }
+            _ => parts.push(format!("{awaiting} awaiting approval")),
+        }
     }
     Some(parts.join(" · "))
 }
@@ -580,7 +591,8 @@ pub fn marker_component(meta: &AmpMeta) -> Arc<TicketMarker> {
 /// under the refused tool call.
 ///
 /// ```text
-///   ⏸ Waiting for your approval
+///   ⏸ Waiting for your approval          (per-ticket servers, #2198: "… #2203 is yours", or
+///                                         "Waiting for its owner's approval: #2203 is someone else's")
 ///     Plan approval is done by a person in the AMP web UI, not by an agent or over MCP: …
 ///     Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)
 ///     The manager stopped here; nothing else was run.
@@ -592,11 +604,37 @@ pub struct ApprovalNotice {
     refusal: amp_core::approval::Refusal,
     /// The clickable link (from [`amp_core::meta::Instance`]), and the command that opens it.
     url: Option<(String, &'static str)>,
+    /// Whose approval a plan-gate refusal waits for (#2198).
+    whose: Whose,
+}
+
+/// Whose approval a refused ticket waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Whose {
+    /// The person at the keyboard: their own ticket, or (before #2198) the whole plan.
+    Yours,
+    /// Someone else's ticket: its owner approves it, or a project lead on their behalf.
+    Owners,
+    /// Per-ticket approval, but the ticket isn't in the last plan check: its owner's.
+    Unknown,
 }
 
 impl ApprovalNotice {
     pub fn new(refusal: amp_core::approval::Refusal, meta: Option<&AmpMeta>) -> Self {
         use amp_core::approval::RefusalKind;
+        let whose = if !refusal.per_ticket {
+            Whose::Yours
+        } else {
+            let plan = meta.and_then(|m| m.plan.get());
+            match (plan, refusal.ticket_id) {
+                (Some(plan), Some(t)) => match plan.whose(t) {
+                    Some(a) if a.yours => Whose::Yours,
+                    Some(_) => Whose::Owners,
+                    None => Whose::Unknown,
+                },
+                _ => Whose::Unknown,
+            }
+        };
         let url = meta.and_then(|m| {
             let inst = m.instance.as_ref()?;
             let pid = refusal.project_id.or(m.project_id)?;
@@ -606,7 +644,16 @@ impl ApprovalNotice {
                 _ => (inst.project_url(pid), "/open"),
             })
         });
-        Self { refusal, url }
+        Self {
+            refusal,
+            url,
+            whose,
+        }
+    }
+
+    /// Whose approval the refusal waits for.
+    pub fn whose(&self) -> Whose {
+        self.whose
     }
 
     pub fn refusal(&self) -> &amp_core::approval::Refusal {
@@ -651,17 +698,42 @@ impl Component for ApprovalNotice {
         let c = rpi_tui::theme().colors;
         let indent = "    ";
         let room = width.saturating_sub(indent.len());
-        let (title, action) = match self.refusal.kind {
-            RefusalKind::PlanApproval => ("⏸ Waiting for your approval", "Approve it in AMP:"),
-            RefusalKind::PersonInUi => ("⏸ Waiting for you in the AMP web UI", "Do it in AMP:"),
-        };
-        let mut out = vec![
-            String::new(),
-            format!(
-                "  {}",
-                rpi_tui::bold(&c.warning.fg(&shorten(title, width.saturating_sub(2))))
+        let ticket = self
+            .refusal
+            .ticket_id
+            .map_or_else(|| "this ticket".to_owned(), |t| format!("#{t}"));
+        let (title, action) = match (self.refusal.kind, self.whose) {
+            (RefusalKind::PersonInUi, _) => (
+                "⏸ Waiting for you in the AMP web UI".to_owned(),
+                "Do it in AMP:",
             ),
-        ];
+            (RefusalKind::PlanApproval, Whose::Yours) if self.refusal.per_ticket => (
+                format!("⏸ Waiting for your approval: {ticket} is yours"),
+                "Approve it in AMP:",
+            ),
+            (RefusalKind::PlanApproval, Whose::Yours) => (
+                "⏸ Waiting for your approval".to_owned(),
+                "Approve it in AMP:",
+            ),
+            (RefusalKind::PlanApproval, Whose::Owners) => (
+                format!(
+                    "⏸ Waiting for its owner's approval: {ticket} is someone else's (a project \
+                     lead may approve it on their behalf)"
+                ),
+                "Flight plan:",
+            ),
+            (RefusalKind::PlanApproval, Whose::Unknown) => (
+                format!(
+                    "⏸ Waiting for {ticket}'s owner to approve it (yours if it's your ticket; a \
+                     project lead may approve it on their behalf)"
+                ),
+                "Approve it in AMP:",
+            ),
+        };
+        let mut out = vec![String::new()];
+        for line in wrap_plain(&title, width.saturating_sub(2)) {
+            out.push(format!("  {}", rpi_tui::bold(&c.warning.fg(&line))));
+        }
         for line in wrap_plain(&clean(&self.refusal.message), room) {
             out.push(format!("{indent}{}", c.muted.fg(&line)));
         }
@@ -913,6 +985,17 @@ mod tests {
         for (tool, raw, want) in cases {
             assert_eq!(result_summary(tool, raw, false), want, "{tool}");
         }
+        // #2198: per-ticket approval says which are the caller's own.
+        let mine = r#"{"ok":true,"issues":[],"ready_now":[],"awaiting_approval":[1,2,3],"awaiting_approval_tickets":[{"task_id":1,"yours":true},{"task_id":2,"yours":true},{"task_id":3,"yours":false}],"awaiting_yours":[1,2]}"#;
+        assert_eq!(
+            result_summary("amp_check_plan", mine, false),
+            "plan OK · 2 of yours awaiting approval, 1 others'"
+        );
+        let theirs = r#"{"ok":true,"issues":[],"awaiting_approval":[3],"awaiting_approval_tickets":[{"task_id":3,"yours":false}],"awaiting_yours":[]}"#;
+        assert_eq!(
+            result_summary("amp_check_plan", theirs, false),
+            "plan OK · 1 others' awaiting their owners' approval"
+        );
         // Every contract tool has its own summary, not the raw keys.
         for tool in amp_core::tools::CONTRACT_TOOLS {
             assert!(
