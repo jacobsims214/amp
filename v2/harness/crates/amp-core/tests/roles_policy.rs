@@ -1060,6 +1060,199 @@ fn filter_tools_drops_what_a_role_can_never_use() {
 }
 
 // ------------------------------------------------------------------------------------------------
+// External MCP servers: the `mcp` permission (#2240, H7).
+// ------------------------------------------------------------------------------------------------
+
+/// A worker whose frontmatter has `mcp` rules (catch-all first, last match wins).
+const MCP_WORKER: &str = "---\ndescription: mcp\nmode: subagent\npermission:\n  edit: allow\n  bash: allow\n  mcp:\n    \"*\": deny\n    \"github/*\": allow\n    \"github/delete_*\": deny\n    \"github/delete_branch\": allow\n    \"fs/*\": allow\n    \"fs/write.*\": ask\n  mcp__fs__nuke: deny\n---\nPrompt.\n";
+
+fn mcp_policy(name: &str) -> ToolPolicy {
+    let reg = load_with_repo_agent(name, "amp-worker-docs.md", MCP_WORKER).unwrap();
+    let p = reg.get("worker-docs").unwrap().tool_policy(ROOT);
+    // As the hub names them: `write.file` is sanitised to `write_file`.
+    p.learn_mcp_subjects([
+        ("mcp__github__get_issue", "github/get_issue"),
+        ("mcp__github__delete_repo", "github/delete_repo"),
+        ("mcp__github__delete_branch", "github/delete_branch"),
+        ("mcp__fs__read", "fs/read"),
+        ("mcp__fs__write_file", "fs/write.file"),
+        ("mcp__fs__nuke", "fs/nuke"),
+        ("mcp__db__query", "db/query"),
+    ]);
+    p
+}
+
+#[test]
+fn mcp_permission_judges_server_slash_tool_last_match_wins() {
+    let p = mcp_policy("mcp-rules");
+    let ok = |t: &str| p.check(t, &json!({})).is_ok();
+    assert!(ok("mcp__github__get_issue"));
+    assert!(!ok("mcp__github__delete_repo"));
+    // A later, narrower allow wins over the earlier deny.
+    assert!(ok("mcp__github__delete_branch"));
+    assert!(ok("mcp__fs__read"));
+    // The subject is the server's own tool name (`write.file`), not the sanitised one; ask = deny.
+    let d = p.check("mcp__fs__write_file", &json!({})).unwrap_err();
+    assert_eq!(d.reason, DenialReason::Ask);
+    assert_eq!(
+        (d.permission.as_str(), d.subject.as_str()),
+        ("mcp", "fs/write.file")
+    );
+    // The catch-all denies a server no rule names.
+    assert!(!ok("mcp__db__query"));
+    // A key named after the tool itself still applies, after `mcp`.
+    let d = p.check("mcp__fs__nuke", &json!({})).unwrap_err();
+    assert_eq!(d.permission, "mcp__fs__nuke");
+    // A name the hub never reported is read from the name: `<server>/<rest>`.
+    assert_eq!(
+        p.mcp_subject("mcp__github__list_prs").unwrap(),
+        "github/list_prs"
+    );
+    assert!(ok("mcp__github__list_prs"));
+    assert!(!ok("mcp__github__delete_tag"));
+    assert_eq!(p.mcp_subject("amp_get_task"), None);
+    // AMP's own tools are not `mcp`.
+    assert!(ok("amp_get_task"));
+}
+
+#[test]
+fn mcp_denial_is_visible_and_names_the_rule() {
+    let p = mcp_policy("mcp-denial");
+    let text = p
+        .check("mcp__github__delete_repo", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text.contains("Denied by the amp-worker-docs tool policy: mcp `github/delete_repo` matches the rule \"github/delete_*\": deny"),
+        "{text}"
+    );
+    assert!(text.contains("never asks for approval"), "{text}");
+    let text = p
+        .check("mcp__fs__write_file", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("(ask is treated as deny)"), "{text}");
+}
+
+#[test]
+fn tools_a_role_can_never_use_are_left_out_of_its_list() {
+    let p = mcp_policy("mcp-filter");
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let names: Vec<String> = p
+        .filter_tools(vec![
+            recorder("read", &ran),
+            recorder("amp_get_task", &ran),
+            recorder("mcp__github__get_issue", &ran),
+            recorder("mcp__github__delete_repo", &ran),
+            recorder("mcp__github__delete_branch", &ran),
+            recorder("mcp__fs__read", &ran),
+            recorder("mcp__fs__write_file", &ran),
+            recorder("mcp__fs__nuke", &ran),
+            recorder("mcp__db__query", &ran),
+        ])
+        .iter()
+        .map(|t| t.schema().name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "read",
+            "amp_get_task",
+            "mcp__github__get_issue",
+            "mcp__github__delete_branch",
+            "mcp__fs__read"
+        ]
+    );
+
+    // `mcp: deny` hides every external tool and nothing else.
+    let reg = load_with_repo_agent(
+        "mcp-none",
+        "amp-worker-docs.md",
+        "---\ndescription: none\nmode: subagent\npermission:\n  mcp: deny\n---\nPrompt.\n",
+    )
+    .unwrap();
+    let p = reg.get("worker-docs").unwrap().tool_policy(ROOT);
+    assert!(!p.exposes("mcp__github__get_issue"));
+    assert!(p.check("mcp__github__get_issue", &json!({})).is_err());
+    assert!(p.exposes("amp_get_task") && p.exposes("read"));
+}
+
+#[test]
+fn with_no_mcp_rule_every_shipped_role_sees_every_server() {
+    let reg = registry();
+    for role in reg.roles() {
+        let p = role.tool_policy(ROOT);
+        p.learn_mcp_subjects([("mcp__github__delete_repo", "github/delete_repo")]);
+        assert!(
+            p.exposes("mcp__github__delete_repo")
+                && p.check("mcp__github__delete_repo", &json!({})).is_ok(),
+            "{}",
+            role.id
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_mcp_call_never_runs_and_the_model_sees_why() {
+    let policy = Arc::new(mcp_policy("mcp-loop"));
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let tools = vec![
+        recorder("mcp__github__get_issue", &ran),
+        recorder("mcp__github__delete_repo", &ran),
+    ];
+    let script = scripted(vec![
+        assistant(
+            vec![
+                call("c1", "mcp__github__delete_repo", json!({"repo": "x"})),
+                call("c2", "mcp__github__get_issue", json!({"n": 1})),
+            ],
+            StopReason::ToolUse,
+        ),
+        assistant(vec![Content::text("done")], StopReason::Stop),
+    ]);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools,
+    };
+    let prompt = AgentMessage::User(UserMessage::new(UserContent::Text("go".into()), 0));
+    let (collector, _events) = rpi_agent::CollectorEmitter::new();
+    let messages = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rpi_agent::run_agent_loop(
+            vec![prompt],
+            context,
+            loop_config(policy.before_tool_call()),
+            Arc::new(collector),
+            script,
+        ),
+    )
+    .await
+    .expect("the loop finished")
+    .unwrap();
+    assert_eq!(ran.lock().unwrap().clone(), vec![json!({"n": 1})]);
+    let denied = messages
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::ToolResult(t) if t.tool_call_id == "c1" => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    let body: String = denied
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        denied.is_error && body.contains("mcp `github/delete_repo`"),
+        "{body}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
 // Path resolution (#2141): the policy must judge the file rpi's tools will really touch.
 // ------------------------------------------------------------------------------------------------
 
