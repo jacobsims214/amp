@@ -28,7 +28,7 @@ use std::{
 use amp_core::{
     agent::{AgentSpec, Runtime, RuntimeOptions},
     mcp_config::McpConfig,
-    mcp_hub::{Backoff, HubEvent, HubOptions, McpHub, ServerStatus},
+    mcp_hub::{Backoff, HubEvent, HubOptions, McpHub, McpReload, ServerStatus},
     providers::StaticKeys,
 };
 use amp_mcp::{AmpMcpClient, ClientOptions, ConfigPaths};
@@ -859,6 +859,299 @@ async fn live_sessions_follow_connects_and_tool_list_changes() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Reload (#2242)
+
+/// The hub's paths for a [`hub`] built in `dir`.
+fn hub_paths(dir: &Path) -> ConfigPaths {
+    ConfigPaths {
+        user_file: Some(dir.join("config.toml")),
+        user_dir: Some(dir.to_path_buf()),
+        ..ConfigPaths::default()
+    }
+}
+
+/// Rewrites a [`hub`]'s config.toml and reloads it.
+async fn rewrite(hub: &McpHub, dir: &Path, toml_text: &str) -> McpReload {
+    std::fs::write(dir.join("config.toml"), toml_text).unwrap();
+    hub.reload(McpConfig::load(&hub_paths(dir))).await
+}
+
+async fn wait_gone(hub: &McpHub, name: &str, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    while Instant::now() < deadline {
+        if !hub.health().iter().any(|h| h.name == name) && !hub.retired().contains(&name.into()) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
+/// `/reload` after `[mcp.*]` changed: only what changed restarts. An unchanged server keeps its
+/// process; a changed one gets a new process and its old one stops; a removed one keeps serving
+/// the session that still holds its tools (a running worker's snapshot) and stops once that is
+/// dropped; a new one starts.
+async fn reload_restarts_only_changed_servers() {
+    let tables = |b_extra: &str, with_c: bool, with_d: bool| {
+        let mut t = stdio_table("a", "normal", "");
+        t.push_str(&stdio_table("b", "normal", b_extra));
+        if with_c {
+            t.push_str(&stdio_table("c", "normal", ""));
+        }
+        if with_d {
+            t.push_str(&stdio_table("d", "normal", ""));
+        }
+        t
+    };
+    let (hub, dir) = hub("reload", &tables("", true, false), fast());
+    hub.start();
+    assert!(hub.wait_started(true).await.is_empty());
+    let pid = |name: &'static str| {
+        let hub = &hub;
+        async move {
+            pid_in(
+                &call(hub, &format!("mcp__{name}__whereami"), json!({}))
+                    .await
+                    .unwrap(),
+            )
+        }
+    };
+    let (a1, b1, c1) = (pid("a").await, pid("b").await, pid("c").await);
+    // A running worker's tools for c (its snapshot).
+    let held: Vec<_> = hub
+        .session_view("amp-worker-backend", None, "worker")
+        .tools
+        .into_iter()
+        .filter(|t| t.tool.schema().name.starts_with("mcp__c__"))
+        .collect();
+    assert_eq!(held.len(), 5);
+
+    // Nothing changed: nothing restarts.
+    let same = rewrite(&hub, &dir, &tables("", true, false)).await;
+    assert!(same.is_empty(), "{same:?}");
+    assert_eq!(pid("a").await, a1);
+
+    let report = rewrite(
+        &hub,
+        &dir,
+        &tables("env = { RELOADED = \"1\" }", false, true),
+    )
+    .await;
+    assert_eq!(report.added, vec!["d"]);
+    assert_eq!(report.removed, vec!["c"]);
+    assert_eq!(report.changed, vec!["b"]);
+    assert!(report.retried.is_empty() && report.problems.is_empty());
+    for name in ["b", "d"] {
+        assert_eq!(
+            wait_status(&hub, name, "ready", Duration::from_secs(20)).await,
+            ServerStatus::Ready,
+            "{name}"
+        );
+    }
+    assert_eq!(pid("a").await, a1, "an unchanged server keeps its process");
+    let b2 = pid("b").await;
+    assert_ne!(b2, b1, "a changed server restarts");
+    assert!(
+        wait_dead(b1, Duration::from_secs(10)).await,
+        "the old b stops: nobody holds it"
+    );
+    pid("d").await;
+    // c is gone from the hub but still serves the worker that holds its tools...
+    assert!(!hub.health().iter().any(|h| h.name == "c"));
+    assert!(
+        hub.session_view("amp-worker-backend", None, "new")
+            .tools
+            .iter()
+            .all(|t| !t.tool.schema().name.starts_with("mcp__c__"))
+    );
+    assert!(alive(c1), "c stops only once no session holds it");
+    let echo = held
+        .iter()
+        .find(|t| t.tool.schema().name == "mcp__c__echo")
+        .unwrap();
+    let out = echo
+        .tool
+        .execute(
+            "c1",
+            json!({"text": "still here"}),
+            tokio_util::sync::CancellationToken::new(),
+            Arc::new(|_| {}),
+        )
+        .await
+        .unwrap();
+    assert!(format!("{:?}", out.content).contains("still here"));
+    // ...until the worker is done with it.
+    drop(held);
+    assert!(
+        wait_dead(c1, Duration::from_secs(10)).await,
+        "c stops once released"
+    );
+    assert!(wait_gone(&hub, "c", Duration::from_secs(5)).await);
+    hub.shutdown().await;
+    for p in [a1, b2] {
+        assert!(wait_dead(p, Duration::from_secs(5)).await);
+    }
+}
+
+/// An HTTP server that answers 401 until `open` is set (a login done elsewhere).
+async fn serve_gated(open: Arc<AtomicBool>) -> Http {
+    let service: StreamableHttpService<HubTestServer, LocalSessionManager> =
+        StreamableHttpService::new(
+            || Ok(HubTestServer { name: "hub-http" }),
+            Default::default(),
+            StreamableHttpServerConfig::default().with_json_response(true),
+        );
+    let app = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            let open = Arc::clone(&open);
+            async move {
+                if open.load(Ordering::SeqCst) {
+                    next.run(req).await
+                } else {
+                    (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+                }
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Http {
+        url: format!("http://{addr}/mcp"),
+        task,
+    }
+}
+
+/// A server that needed a login (never retried on its own) is tried again by a reload, so a
+/// login done in another terminal takes effect after `/reload` without restarting the chat.
+async fn reload_retries_a_server_that_needed_a_login() {
+    let open = Arc::new(AtomicBool::new(false));
+    let web = serve_gated(Arc::clone(&open)).await;
+    let toml_text = format!("[mcp.web]\nurl = {:?}\nauth = \"none\"\n", web.url);
+    let (hub, dir) = hub("reload-login", &toml_text, fast());
+    hub.start();
+    hub.wait_started(true).await;
+    assert_eq!(status(&hub, "web").word(), "needs-login");
+    open.store(true, Ordering::SeqCst);
+    let report = rewrite(&hub, &dir, &toml_text).await;
+    assert_eq!(report.retried, vec!["web"], "{report:?}");
+    assert_eq!(
+        wait_status(&hub, "web", "ready", Duration::from_secs(20)).await,
+        ServerStatus::Ready
+    );
+    // A broken table is reported, and its server left out.
+    let broken = format!("{toml_text}[mcp.bad]\ntype = \"stdio\"\n");
+    let report = rewrite(&hub, &dir, &broken).await;
+    assert_eq!(report.added, vec!["bad"]);
+    assert!(
+        report.problems.iter().any(|p| p.contains("mcp.bad")),
+        "{report:?}"
+    );
+    assert_eq!(status(&hub, "web"), ServerStatus::Ready);
+    hub.shutdown().await;
+}
+
+/// `Runtime::reload` with a live session: a server added to config.toml reaches the session
+/// (tools and instructions) without rebuilding it, even though the session was built when no
+/// server was configured; removing it takes its tools away and stops it.
+async fn runtime_reload_adds_and_removes_servers_for_a_live_session() {
+    let dir = scratch("runtime-reload");
+    let amp = spawn(MockAmp::new(), None).await;
+    let home = dir.join("home");
+    let config = home.join(".config/amp-harness");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), FAUX).unwrap();
+    let client = Arc::new(
+        AmpMcpClient::connect(ClientOptions::new(amp.url.clone()))
+            .await
+            .unwrap(),
+    );
+    let home_s = home.display().to_string();
+    let env = move |k: &str| match k {
+        "HOME" => Some(home_s.clone()),
+        "XDG_CONFIG_HOME" => Some(format!("{home_s}/.config")),
+        "XDG_STATE_HOME" => Some(format!("{home_s}/.local/state")),
+        _ => None,
+    };
+    let rt = Runtime::load(
+        client,
+        RuntimeOptions {
+            repo_root: None,
+            models: None,
+            keys: &StaticKeys::default(),
+            env: &env,
+            state_dir: None,
+        },
+    )
+    .unwrap();
+    rt.mcp_hub.start();
+    let built = rt
+        .build(AgentSpec::new("amp-manager", dir.clone()))
+        .await
+        .unwrap();
+    let names = |h: Arc<rpi_harness::agent_harness::AgentHarness>| async move {
+        h.get_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.tool.schema().name.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        !names(Arc::clone(&built.harness))
+            .await
+            .iter()
+            .any(|n| n.starts_with("mcp__"))
+    );
+
+    std::fs::write(
+        config.join("config.toml"),
+        format!("{FAUX}\n{}", stdio_table("fs", "normal", "")),
+    )
+    .unwrap();
+    let report = rt.reload(&StaticKeys::default(), &env).await.unwrap();
+    assert_eq!(report.mcp.added, vec!["fs"]);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !names(Arc::clone(&built.harness))
+        .await
+        .contains(&"mcp__fs__echo".to_owned())
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        names(Arc::clone(&built.harness))
+            .await
+            .contains(&"mcp__fs__echo".to_owned())
+    );
+    let prompt = built.harness.get_system_prompt().await.unwrap().unwrap();
+    assert!(
+        prompt.contains("<mcp_server_instructions server=\"fs\">"),
+        "{prompt}"
+    );
+    let pid = rt.mcp_hub.health()[0].pid.expect("a stdio pid");
+
+    std::fs::write(config.join("config.toml"), FAUX).unwrap();
+    let report = rt.reload(&StaticKeys::default(), &env).await.unwrap();
+    assert_eq!(report.mcp.removed, vec!["fs"]);
+    assert!(
+        !names(Arc::clone(&built.harness))
+            .await
+            .iter()
+            .any(|n| n.starts_with("mcp__"))
+    );
+    let prompt = built.harness.get_system_prompt().await.unwrap().unwrap();
+    assert!(!prompt.contains("<mcp_server_instructions"), "{prompt}");
+    assert!(
+        wait_dead(pid, Duration::from_secs(10)).await,
+        "the removed server stops"
+    );
+    rt.mcp_hub.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Runner
 
 type Case = fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>;
@@ -890,6 +1183,9 @@ fn main() {
         lazy_servers_wait_for_a_restart_and_calls_time_out,
         the_role_filter_and_disabled_servers,
         live_sessions_follow_connects_and_tool_list_changes,
+        reload_restarts_only_changed_servers,
+        reload_retries_a_server_that_needed_a_login,
+        runtime_reload_adds_and_removes_servers_for_a_live_session,
     ];
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

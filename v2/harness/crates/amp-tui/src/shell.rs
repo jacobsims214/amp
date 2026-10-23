@@ -122,6 +122,13 @@ enum ShellMsg {
         models: Option<Vec<ModelChoice>>,
     },
     Server(Result<ServerSwitched, String>),
+    /// `/reload` finished (`auto`: started by the file watcher, [`Notifier::reload`]).
+    Reloaded {
+        result: Result<ReloadReply, String>,
+        auto: bool,
+    },
+    /// The file watcher saw the configuration change: reload (not counted in `in_flight`).
+    ReloadRequest,
     /// A line from a background task the shell did not start ([`Notifier`]); not counted in
     /// `in_flight`.
     Notice {
@@ -149,6 +156,12 @@ impl Notifier {
             error: true,
         });
     }
+
+    /// Asks the shell to `/reload` (#2242: the configuration files changed). Ignored when the
+    /// shell has no [`ReloadControl`].
+    pub fn reload(&self) {
+        let _ = self.0.send(ShellMsg::ReloadRequest);
+    }
 }
 
 /// What `/connect` did: a message for the transcript (never a secret), and the providers and
@@ -172,6 +185,29 @@ pub trait ProviderConnect: Send + Sync {
     fn prepare(&self, args: &str) -> Result<String, String>;
     /// Checks `key` with the provider, stores it, and rebuilds the providers.
     fn connect(&self, args: &str, key: String) -> ConnectFuture;
+}
+
+/// What `/reload` did (#2242): a summary for the transcript, and what the chat takes from it.
+pub struct ReloadReply {
+    /// One line per change (never a secret); empty when nothing changed.
+    pub lines: Vec<String>,
+    /// The providers the harness uses from now on.
+    pub providers: Vec<Arc<dyn rpi_ai::Provider>>,
+    /// What `/model` can switch to now.
+    pub models: Vec<ModelChoice>,
+    /// The chat's role got another model in the config: switch this chat to it
+    /// (`provider/model`, one of `models`).
+    pub switch_to: Option<String>,
+    /// Lines to show as warnings (a permission change that needs a restart).
+    pub warnings: Vec<String>,
+}
+
+pub type ReloadFuture = Pin<Box<dyn Future<Output = Result<ReloadReply, String>> + Send>>;
+
+/// The harness side of `/reload` (amp-harness): re-reads agents, skills, models and MCP servers
+/// changed by a CLI in another terminal and brings the chat's session up to date.
+pub trait ReloadControl: Send + Sync {
+    fn reload(&self) -> ReloadFuture;
 }
 
 /// A key being typed for `/connect` (never drawn).
@@ -393,6 +429,11 @@ pub struct Shell {
     server: Option<Arc<dyn ServerControl>>,
     /// A `/server` switch is running.
     switching: bool,
+    /// `/reload` (#2242), if the caller gave one.
+    reload: Option<Arc<dyn ReloadControl>>,
+    /// A reload is running; `reload_again` asks for one more when it ends.
+    reloading: bool,
+    reload_again: bool,
     /// Until when the spinner line shows [`ESC_HINT`].
     esc_hint_until: Option<Instant>,
     /// Until when a second Ctrl+C on the empty editor quits ([`QUIT_HINT`]).
@@ -454,6 +495,9 @@ impl Shell {
                 secret: None,
                 server: None,
                 switching: false,
+                reload: None,
+                reloading: false,
+                reload_again: false,
                 esc_hint_until: None,
                 quit_hint_until: None,
                 ctrl_d_settle_until: None,
@@ -662,6 +706,54 @@ impl Shell {
     /// Gives the shell `/server` (#2164).
     pub fn set_server_control(&mut self, control: Arc<dyn ServerControl>) {
         self.server = Some(control);
+    }
+
+    /// Gives the shell `/reload` (#2242).
+    pub fn set_reload(&mut self, control: Arc<dyn ReloadControl>) {
+        self.reload = Some(control);
+    }
+
+    /// `/reload` (or the file watcher, `auto`): re-reads the configuration in the background; the
+    /// result is applied by [`Shell::poll`]. A reload asked for while one runs follows it.
+    fn reload_command(&mut self, auto: bool) {
+        let Some(control) = self.reload.clone() else {
+            if !auto {
+                self.view
+                    .add_notice("/reload: not available in this session");
+            }
+            return;
+        };
+        if self.reloading {
+            self.reload_again = true;
+            if !auto {
+                self.view
+                    .add_notice("/reload: already reloading; once more when it is done");
+            }
+            return;
+        }
+        self.reloading = true;
+        self.in_flight += 1;
+        if !auto {
+            self.view
+                .add_notice("reloading agents, skills, models and MCP servers…");
+        }
+        let harness = Arc::clone(&self.harness);
+        let tx = self.msgs_tx.clone();
+        tokio::spawn(async move {
+            // Its own task, so a panic in the reload still ends `reloading`.
+            let result = match tokio::spawn(control.reload()).await {
+                Ok(result) => result,
+                Err(e) => Err(format!("the reload crashed: {e}")),
+            };
+            let result = match result {
+                Ok(reply) => match harness.set_models(reply.providers.clone()).await {
+                    Ok(()) => Ok(reply),
+                    Err(e) => Err(format!("the chat could not take the new providers: {e}")),
+                },
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(ShellMsg::Reloaded { result, auto });
+        });
     }
 
     /// Tickets with a live (queued, running or reporting) worker.
@@ -1275,6 +1367,7 @@ impl Shell {
             "plan" => self.plan_command(),
             "open" => self.open_command(arg),
             "server" => self.server_command(arg),
+            "reload" => self.reload_command(false),
             "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
@@ -1704,6 +1797,10 @@ impl Shell {
                 }
                 continue;
             }
+            if let ShellMsg::ReloadRequest = &msg {
+                self.reload_command(true);
+                continue;
+            }
             self.in_flight = self.in_flight.saturating_sub(1);
             match msg {
                 ShellMsg::Plan {
@@ -1744,7 +1841,14 @@ impl Shell {
                         Err(e) => self.view.add_error(&format!("/server: {e}")),
                     }
                 }
-                ShellMsg::Notice { .. } => {}
+                ShellMsg::Reloaded { result, auto } => {
+                    self.reloading = false;
+                    self.apply_reload(result, auto);
+                    if std::mem::take(&mut self.reload_again) {
+                        self.reload_command(true);
+                    }
+                }
+                ShellMsg::Notice { .. } | ShellMsg::ReloadRequest => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
                         self.view.panel().update(|s| {
@@ -1950,6 +2054,87 @@ impl Shell {
             text.push_str("\nno other models: add a provider with /connect");
         }
         text
+    }
+
+    /// A finished reload: the transcript says what changed; `/model` gets the new choices; the
+    /// chat's role's new model (from the config) is switched to like `/model` would, from the
+    /// next run.
+    fn apply_reload(&mut self, result: Result<ReloadReply, String>, auto: bool) {
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(e) => {
+                let what = if auto { "auto-reload" } else { "/reload" };
+                self.view
+                    .add_error(&format!("{what}: {}", crate::chrome::clean(&e)));
+                return;
+            }
+        };
+        self.models = reply.models;
+        let mut lines = reply.lines;
+        if let Some(reference) = reply.switch_to
+            && let Some(choice) = self
+                .models
+                .iter()
+                .find(|m| m.reference == reference)
+                .cloned()
+        {
+            let thinking = if choice.model.reasoning {
+                choice.model.clamp_thinking_level(
+                    self.info
+                        .requested_thinking
+                        .unwrap_or(ThinkingLevel::Medium),
+                )
+            } else {
+                ThinkingLevel::Off
+            };
+            let (provider, model_id) = reference.split_once('/').unwrap_or(("", &reference));
+            self.info.provider = provider.to_owned();
+            self.info.model_id = model_id.to_owned();
+            self.info.thinking = thinking;
+            self.info.context_window = choice.model.context_window;
+            self.view.set_footer(&self.info.footer(self.footer_ticket));
+            lines.push(format!(
+                "this chat now runs on {} • thinking {} (from the next reply)",
+                self.info.model_ref(),
+                thinking_name(thinking)
+            ));
+            let harness = Arc::clone(&self.harness);
+            let model = choice.model.clone();
+            let tx = self.msgs_tx.clone();
+            tokio::spawn(async move {
+                let mut failed = harness.set_model(model).await.err().map(|e| e.to_string());
+                if failed.is_none() {
+                    failed = harness
+                        .set_thinking_level(thinking)
+                        .await
+                        .err()
+                        .map(|e| format!("thinking: {e}"));
+                }
+                if let Some(e) = failed {
+                    let _ = tx.send(ShellMsg::Notice {
+                        text: format!("/reload: could not switch the model: {e}"),
+                        error: true,
+                    });
+                }
+            });
+        }
+        if lines.is_empty() {
+            if !auto {
+                self.view
+                    .add_notice("reloaded: nothing changed since the last load");
+            }
+        } else {
+            let head = if auto {
+                "configuration changed elsewhere; reloaded (workers already running keep theirs):"
+            } else {
+                "reloaded (workers already running keep theirs):"
+            };
+            self.view
+                .add_notice(&format!("{head}\n  {}", lines.join("\n  ")));
+        }
+        for w in reply.warnings {
+            self.view.add_error(&w);
+        }
     }
 
     async fn switch_model(&mut self, reference: &str) {

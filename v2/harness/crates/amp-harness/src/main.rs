@@ -31,6 +31,7 @@ mod debug;
 mod doctor;
 mod mcp_cmd;
 mod models_cmd;
+mod reload;
 mod run;
 mod server_cmd;
 mod session;

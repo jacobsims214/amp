@@ -709,14 +709,12 @@ impl Supervisor {
             .insert(report.task_id, FinishedWorker { info, feed });
     }
 
-    fn manager_role(&self) -> Option<&Role> {
-        self.rt.roles.get(&self.manager.role)
-    }
-
-    /// The roles this manager may dispatch.
-    pub fn dispatchable(&self) -> Vec<&Role> {
-        match self.manager_role() {
-            Some(m) => self.rt.roles.dispatchable(m),
+    /// The roles this manager may dispatch, from the roster as it is now (a `/reload` may have
+    /// changed it, #2242).
+    pub fn dispatchable(&self) -> Vec<Role> {
+        let catalog = self.rt.catalog();
+        match catalog.roles.get(&self.manager.role) {
+            Some(m) => catalog.roles.dispatchable(m).into_iter().cloned().collect(),
             None => Vec::new(),
         }
     }
@@ -762,9 +760,8 @@ impl Supervisor {
     fn resolve_role(&self, agent: &str) -> Result<Role, RunTicketError> {
         let role = self
             .rt
-            .roles
-            .get(agent)
-            .ok_or_else(|| RunTicketError::UnknownAgent {
+            .role(agent)
+            .map_err(|_| RunTicketError::UnknownAgent {
                 agent: agent.to_owned(),
                 available: self.available(),
             })?;
@@ -775,7 +772,7 @@ impl Supervisor {
                 available: self.available(),
             });
         }
-        Ok(role.clone())
+        Ok(role)
     }
 
     /// Runs one ticket. `Err` means nothing was dispatched; once AMP has the dispatch, every end
@@ -893,7 +890,7 @@ impl Supervisor {
         let mut notes = Vec::new();
         let totals = Arc::new(Mutex::new(Totals::default()));
         let model = role
-            .resolve_model(&self.rt.models)
+            .resolve_model(&self.rt.current_models())
             .map(|r| r.model_ref())
             .unwrap_or_default();
 

@@ -169,6 +169,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         "[provider]",
         "model providers and their keys; add a key",
     ),
+    CommandSpec::new(
+        Group::Chat,
+        "reload",
+        "",
+        "reload agents, skills, models, MCP servers",
+    ),
     CommandSpec::new(Group::Chat, "usage", "", "tokens and cost this session"),
     CommandSpec::new(Group::Chat, "abort", "", "stop the reply"),
     CommandSpec::new(Group::Chat, "close", "", "close the open panel"),

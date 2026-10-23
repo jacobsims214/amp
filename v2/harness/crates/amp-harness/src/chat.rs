@@ -39,6 +39,12 @@
 //!
 //! The shell gets the session's worker supervisor: quitting while `amp_run_ticket` runs cancels
 //! the workers and waits (bounded) until their abandoned runs are reported ([`Shell::quit`]).
+//!
+//! `/reload` (#2242, [`crate::reload`]) picks up agents, skills, models and MCP servers changed by
+//! the CLI in another terminal; a watcher on those files does it on its own (not in
+//! `--snapshot`; `AMP_HARNESS_AUTO_RELOAD=0` turns it off). In `--snapshot`, `--input exec:<cmd>`
+//! runs `sh -c <cmd>` between inputs (bounded; a failure ends the snapshot), so a test can change
+//! the configuration while the chat runs.
 
 use std::{
     io::IsTerminal,
@@ -237,6 +243,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         .await,
     );
     shell.set_server_control(Arc::clone(&switcher) as Arc<dyn amp_tui::ServerControl>);
+    // `/reload` (#2242): CLI changes made in another terminal, without a restart.
+    shell.set_reload(Arc::new(crate::reload::ChatReload::new(&session)));
     // AMP unreachable (#2178): say why and what to do, and keep trying in the background.
     let connected = Arc::new(AtomicBool::new(session.offline.is_none()));
     if let Some(e) = &session.offline {
@@ -261,6 +269,15 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
 
     let Some((width, height)) = args.snapshot else {
         shell.set_meta(start_meta(&args.conn, project_id)?);
+        // The same as `/reload`, when the configuration files change (#2242).
+        let watcher = crate::reload::auto_reload(&|k| std::env::var(k).ok()).then(|| {
+            let notes = shell.notifier();
+            tokio::spawn(crate::reload::watch(
+                session.rt.paths.clone(),
+                crate::reload::WATCH_EVERY,
+                move || notes.reload(),
+            ))
+        });
         if let Some(sup) = session.supervisor.clone() {
             shell
                 .view()
@@ -269,6 +286,9 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         }
         let session_file = session.agent.session_file.clone();
         let result = amp_tui::terminal::run(shell, events, done).await;
+        if let Some(watcher) = watcher {
+            watcher.abort();
+        }
         // Stdio MCP servers get EOF and their process groups are killed before we exit.
         hub.shutdown().await;
         // Back on the main screen: where the conversation was saved (#2184).
@@ -299,6 +319,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     for input in &args.inputs {
         if input == "wait:amp" {
             wait_connected(&mut shell, &connected).await?;
+        } else if let Some(command) = input.strip_prefix("exec:") {
+            exec_input(command).await?;
         } else if let Some(key) = input.strip_prefix("key:") {
             shell.press(key).await.map_err(CliError::usage)?;
         } else {
@@ -378,6 +400,37 @@ async fn retry_offline(switcher: Arc<Switcher>, notes: Notifier, connected: Arc<
         }
     }
     connected.store(true, Ordering::Release);
+}
+
+/// How long `--input exec:<cmd>` may take.
+const SNAPSHOT_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// `--input exec:<cmd>` (tests): runs `sh -c <cmd>` in the chat's environment and waits for it
+/// (bounded). A failure (non-zero exit, timeout) ends the snapshot with its output.
+async fn exec_input(command: &str) -> Result<(), CliError> {
+    let child = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(SNAPSHOT_EXEC_TIMEOUT, child)
+        .await
+        .map_err(|_| {
+            CliError::new(format!(
+                "exec: `{command}` still running after {SNAPSHOT_EXEC_TIMEOUT:?}"
+            ))
+        })?
+        .map_err(|e| CliError::new(format!("exec: `{command}`: {e}")))?;
+    if !out.status.success() {
+        return Err(CliError::new(format!(
+            "exec: `{command}` failed ({}):\n{}{}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
 }
 
 /// `--input wait:amp`: waits (bounded) until the offline session connected, then applies its line.

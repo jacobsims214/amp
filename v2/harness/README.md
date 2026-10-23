@@ -758,8 +758,9 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   model directly. `/connect [provider]` lists providers or
   stores a key without leaving the chat (see Connecting model providers). `/server` lists the saved
   AMP servers and `/server <name|address>` switches the session to one without a restart (see Saved
-  servers). `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/quit` (also
-  `/exit`, `/q`).
+  servers). `/reload` picks up agents, skills, models and MCP servers changed from another
+  terminal (see below). `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/quit`
+  (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T expands (or collapses
   again) the last thinking section; Ctrl+O shows (or hides) every tool call's arguments and result.
@@ -788,6 +789,28 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   thinking.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
+
+### Changes from another terminal: `/reload` (#2242)
+
+`amp-harness agents|skills|models|mcp …` (or an edit to config.toml, `agents/`, `skills/`, in your
+config dir or the repo's `.amp/harness/`) reaches a running chat without a restart. `/reload` does it
+at once. A watcher does it by itself a couple of seconds after the files settle (it checks sizes and
+modification times every 2 s; `AMP_HARNESS_AUTO_RELOAD=0` turns it off). The transcript lists what
+changed (`agents: +sql-expert`, `model amp-manager: … → …`, `mcp: +github ~fs -old`).
+
+| Change | When it takes effect |
+|---|---|
+| New, edited or removed agent (the roster) | `amp_run_ticket` lists it, and the manager may dispatch it, from its next reply. Workers dispatched from then on are built from the new file. |
+| Skills | Listed (and preloaded) from the manager's next reply and in every new worker. |
+| A role's model or thinking (`[roles]`, `[models]`, `[providers]`, keys) | Workers dispatched from then on. If the chat's own role changed, the chat switches to it from the next reply. `/model` still picks one for this chat only. |
+| The manager's permissions | From its next tool call. |
+| `[mcp.<name>]` | Only servers whose table changed restart. New ones start. Removed or disabled ones leave the tool list at once and stop once no running worker still holds their tools. A server that was stopped or needed a login is tried again, so `mcp login` in another terminal followed by `/reload` brings it back. A broken table is named and its server left out. |
+| `AGENTS.md` | Re-read for the manager's next reply. |
+
+Workers already running keep what they were built with (prompt, tools, model) until they finish.
+`[workers]`, `[tools]` and `[secrets]` are read when the chat starts. A broken agent file or an
+unparsable config.toml changes nothing, and the error says what to fix. A secret variable a new
+provider or MCP server reads is hidden from bash from then on.
 
 ### Theme (M3-1)
 
