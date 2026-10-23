@@ -41,6 +41,9 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 # The metadata poller's tests: a mock AMP on rmcp's Streamable HTTP server (tests/meta.rs).
 axum.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+# The legacy SSE mock (tests/mcp_http.rs includes amp-mcp's tests/common/legacy_sse.rs, #2238).
+futures.workspace = true
+serde.workspace = true
 
 [lints]
 workspace = true

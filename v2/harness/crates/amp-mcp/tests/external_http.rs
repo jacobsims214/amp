@@ -34,7 +34,7 @@ use axum::{
     routing::{get, post},
 };
 use base64::Engine as _;
-use common::{ServerKind, TestServer};
+use common::{ServerKind, TestServer, legacy_sse::LegacyState};
 use sha2::Digest as _;
 
 /// Planted in every secret value, so a leak into an error or Debug output is caught.
@@ -530,6 +530,12 @@ impl Drop for MockAs {
 }
 
 async fn spawn_mock_as(expires_in: u64) -> MockAs {
+    spawn_mock_as_serving(expires_in, None).await
+}
+
+/// The mock AS with its protected resource at `/mcp`: the Streamable HTTP test server, or with
+/// `legacy` a legacy HTTP+SSE server (#2238) behind the same header and bearer checks.
+async fn spawn_mock_as_serving(expires_in: u64, legacy: Option<Arc<LegacyState>>) -> MockAs {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let state = Arc::new(AsState {
@@ -538,9 +544,22 @@ async fn spawn_mock_as(expires_in: u64) -> MockAs {
         dcr: AtomicBool::new(true),
         ..Default::default()
     });
-    let mcp = requiring_headers(ServerKind::Dual, vec![("x-org", "simstech".into())]).layer(
-        middleware::from_fn_with_state(state.clone(), require_issued_bearer),
-    );
+    let mcp = match legacy {
+        None => requiring_headers(ServerKind::Dual, vec![("x-org", "simstech".into())]),
+        Some(legacy) => common::legacy_sse::router(legacy, "/mcp").layer(middleware::from_fn(
+            |req: Request, next: Next| async move {
+                if req.headers().get("x-org").and_then(|v| v.to_str().ok()) == Some("simstech") {
+                    next.run(req).await
+                } else {
+                    (StatusCode::UNAUTHORIZED, "missing or wrong header").into_response()
+                }
+            },
+        )),
+    }
+    .layer(middleware::from_fn_with_state(
+        state.clone(),
+        require_issued_bearer,
+    ));
     let app = Router::new()
         .route("/.well-known/oauth-protected-resource/mcp", get(prm))
         .route("/.well-known/oauth-authorization-server", get(well_known))
@@ -948,6 +967,44 @@ async fn oauth_with_a_pre_registered_confidential_client_and_a_metadata_url() {
     };
     assert!(err.to_string().contains("invalid_client"), "{err}");
     assert_no_secret(&format!("{err} {err:?}"));
+}
+
+#[tokio::test]
+async fn oauth_login_and_connect_to_a_legacy_sse_server() {
+    // #2238: the resource at /mcp speaks only legacy HTTP+SSE. Login probes it like any server;
+    // connect gets 405 for the Streamable HTTP POST and falls back to SSE with the OAuth token
+    // (and the configured header) on the GET and every POST.
+    let legacy = LegacyState::new();
+    let mock = spawn_mock_as_serving(3600, Some(legacy.clone())).await;
+    let backend = file_backend("oauth-sse");
+    for opts in [oauth_options(&mock), oauth_options(&mock).with_legacy_sse()] {
+        let err = http::connect(&opts, &backend).await.expect_err("no login");
+        assert!(
+            matches!(&err, McpError::ServerAuth { challenge: Some(c), .. } if c.contains("resource_metadata")),
+            "{err:?}"
+        );
+    }
+    http::login(
+        &oauth_options(&mock).with_legacy_sse(),
+        backend.clone(),
+        Duration::from_secs(20),
+        browser,
+    )
+    .await
+    .expect("login");
+    for opts in [oauth_options(&mock), oauth_options(&mock).with_legacy_sse()] {
+        let client = http::connect(&opts, &backend).await.expect("connect");
+        assert_eq!(client.info().transport, "sse");
+        assert!(
+            client.info().auth.starts_with("oauth ("),
+            "{}",
+            client.info().auth
+        );
+        assert_eq!(client.list_tools().await.expect("tools/list").len(), 1);
+        client.shutdown().await;
+    }
+    assert_eq!(legacy.gets.load(Ordering::SeqCst), 2);
+    assert!(legacy.posts.load(Ordering::SeqCst) >= 6);
 }
 
 #[tokio::test]

@@ -18,9 +18,11 @@
 //!
 //! [`login`] is the browser login for one server (H9's `amp-harness mcp login <name>`).
 //!
-//! Legacy HTTP+SSE (H5, #2238) plugs in at [`connect`]: [`wants_sse_fallback`] says when a refused
-//! Streamable HTTP handshake should be retried as SSE, and [`PreparedHttp`] carries the client,
-//! headers and authorization an SSE transport needs.
+//! Legacy HTTP+SSE (H5, #2238, [`super::sse`]) shares all of this: [`connect`] uses it for
+//! `type = "sse"` ([`HttpServerOptions::legacy_sse`]), and for `type = "http"` when the server
+//! refuses the Streamable HTTP POST with 400, 404 or 405 ([`wants_sse_fallback`]) unless
+//! `fallback_sse = false`. If the fallback finds no SSE server either, the Streamable HTTP error
+//! is the one reported.
 
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
@@ -110,6 +112,8 @@ pub struct HttpServerOptions {
     pub socket: Option<PathBuf>,
     /// Retry as legacy HTTP+SSE when Streamable HTTP is refused (H5).
     pub fallback_sse: bool,
+    /// `type = "sse"`: connect over legacy HTTP+SSE only (`url` is the event stream's URL).
+    pub legacy_sse: bool,
     /// Bound on each OAuth request (discovery, refresh).
     pub oauth_request_timeout: Duration,
 }
@@ -130,6 +134,7 @@ impl HttpServerOptions {
             ca_file: None,
             socket: None,
             fallback_sse: true,
+            legacy_sse: false,
             oauth_request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
         }
     }
@@ -164,6 +169,12 @@ impl HttpServerOptions {
 
     pub fn with_socket(mut self, socket: impl Into<PathBuf>) -> Self {
         self.socket = Some(socket.into());
+        self
+    }
+
+    /// `type = "sse"`: legacy HTTP+SSE only, no Streamable HTTP attempt.
+    pub fn with_legacy_sse(mut self) -> Self {
+        self.legacy_sse = true;
         self
     }
 
@@ -204,12 +215,13 @@ impl std::fmt::Debug for HttpServerOptions {
             .field("oauth", &self.oauth)
             .field("socket", &self.socket)
             .field("fallback_sse", &self.fallback_sse)
+            .field("legacy_sse", &self.legacy_sse)
             .finish_non_exhaustive()
     }
 }
 
 /// A server's HTTP client, headers and authorization, ready for a transport: Streamable HTTP
-/// here, legacy SSE in H5.
+/// here, legacy SSE in [`super::sse`].
 #[derive(Clone)]
 pub struct PreparedHttp {
     pub url: String,
@@ -422,28 +434,49 @@ async fn stored_login(
     Ok(Some(AuthClient::new(http, manager)))
 }
 
-/// Connects to the server over Streamable HTTP and runs the MCP lifecycle in
-/// `options.external.protocol` (2026-07-28 `server/discover`, or `initialize` at any version from
-/// 2024-11-05 to 2025-11-25 that the server picks).
+/// [`prepare`] under the connect timeout (a stalled OAuth discovery must not hang a connect).
+pub(crate) async fn prepare_bounded(
+    options: &HttpServerOptions,
+    backend: &CredentialBackend,
+) -> Result<PreparedHttp, McpError> {
+    tokio::time::timeout(options.external.connect_timeout, prepare(options, backend))
+        .await
+        .map_err(|_| McpError::Timeout {
+            operation: format!("MCP server `{}`: OAuth discovery", options.server()),
+            after: options.external.connect_timeout,
+        })?
+}
+
+/// Connects to a remote server and runs the MCP lifecycle in `options.external.protocol`
+/// (2026-07-28 `server/discover`, or `initialize` at any version from 2024-11-05 to 2025-11-25
+/// that the server picks).
+///
+/// - `legacy_sse` (`type = "sse"`): legacy HTTP+SSE only ([`super::sse::connect`]).
+/// - Otherwise Streamable HTTP; when the server refuses its POST with 400, 404 or 405 and
+///   `fallback_sse` is on, legacy HTTP+SSE at the same URL with the same headers and
+///   credentials. If that server doesn't speak SSE either, the Streamable HTTP error is returned;
+///   if it does but fails (a rejection, a broken handshake), that error is.
 pub async fn connect(
     options: &HttpServerOptions,
     backend: &CredentialBackend,
 ) -> Result<ExternalClient, McpError> {
-    let prepared =
-        tokio::time::timeout(options.external.connect_timeout, prepare(options, backend))
-            .await
-            .map_err(|_| McpError::Timeout {
-                operation: format!("MCP server `{}`: OAuth discovery", options.server()),
-                after: options.external.connect_timeout,
-            })??;
-    match connect_prepared(options.server(), &options.external, &prepared).await {
-        // H5 (#2238): retry as legacy HTTP+SSE here with the same `prepared`.
+    let prepared = prepare_bounded(options, backend).await?;
+    let name = options.server();
+    if options.legacy_sse {
+        return super::sse::connect_prepared(name, &options.external, &prepared).await;
+    }
+    match connect_prepared(name, &options.external, &prepared).await {
         Err(e) if options.fallback_sse && wants_sse_fallback(&e) => {
             tracing::debug!(
-                server = options.server(),
-                "Streamable HTTP refused; legacy SSE fallback is not available yet"
+                server = name,
+                status = e.http_status().as_deref().unwrap_or(""),
+                "Streamable HTTP refused; trying legacy HTTP+SSE"
             );
-            Err(e)
+            match super::sse::attempt(name, &options.external, &prepared).await {
+                Ok(client) => Ok(client),
+                Err(failure) if failure.not_sse => Err(e),
+                Err(failure) => Err(failure.error),
+            }
         }
         other => other,
     }

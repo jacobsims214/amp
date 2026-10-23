@@ -5,17 +5,22 @@
 //! options (request headers only, never logged) and errors name the item, never the value.
 //!
 //! ```ignore
-//! let Resolved::Http(remote) = server.resolve(&ctx)? else { .. };
+//! let (Resolved::Http(remote) | Resolved::Sse(remote)) = server.resolve(&ctx)? else { .. };
 //! let options = mcp_http::http_options(server, &remote, Some(&amp_mcp::keychain_service()), env)?;
 //! let client = amp_mcp::external::http::connect(&options, &backend).await?;
 //! ```
+//!
+//! `type = "sse"` sets [`HttpServerOptions::legacy_sse`], so the same `http::connect` speaks
+//! legacy HTTP+SSE to it; `type = "http"` falls back to SSE unless `fallback_sse = false` (#2238).
 
 use amp_mcp::{
     ExternalOptions, HeaderSource, HttpAuth, HttpHeader, HttpServerOptions, Secret,
     oauth::OAuthClientSettings,
 };
 
-use crate::mcp_config::{AuthMode, McpServer, ResolvedRemote, SecretSource, SecretTarget};
+use crate::mcp_config::{
+    AuthMode, McpServer, ResolvedRemote, SecretSource, SecretTarget, TransportKind,
+};
 
 /// Builds the connect options for `server` (whose resolved http/sse table is `remote`), fetching
 /// its secrets. `keychain` is the keychain service ([`amp_mcp::keychain_service`]; a test-only
@@ -58,6 +63,7 @@ pub fn http_options(
     options.ca_file = remote.ca_file.clone();
     options.socket = remote.socket.clone();
     options.fallback_sse = remote.fallback_sse;
+    options.legacy_sse = server.transport.kind() == TransportKind::Sse;
 
     for secret in &remote.secrets {
         let value = match (&secret.source, keychain) {

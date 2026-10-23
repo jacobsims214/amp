@@ -93,6 +93,11 @@ toml = "1"
 # rpi-ai's CancellationToken type (amp-core's provider stall guard).
 tokio-util = "0.7"
 tracing = "0.1"
+# Legacy HTTP+SSE MCP client (#2238): rmcp 3.6.0 has none, so amp-mcp parses the event stream with
+# the same sse-stream rmcp's Streamable HTTP client uses (exact: one copy), and futures for streams.
+sse-stream = "=0.2.6"
+futures = "0.3"
+bytes = "1"
 
 # Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
 axum = "0.8"
