@@ -177,7 +177,8 @@ make up          # postgres, typesense, ollama, amp-api, ui
 make kb-setup    # pull nomic-embed-text into Ollama (once)
 ```
 
-The UI is at `http://localhost:5173`. MCP is at `http://localhost:8000/mcp` and REST at `:3001`.
+The UI is at `http://localhost:5173` (compose publishes it from the UI container's nginx, which
+listens on 8080). MCP is at `http://localhost:8000/mcp` and REST at `:3001`.
 
 **The Helm chart on docker-desktop Kubernetes** matches production, with sign-in and TLS. See
 [`v2/docs/deploy-architecture.md`](./v2/docs/deploy-architecture.md).
