@@ -488,6 +488,13 @@ reason, usage), `tool_start`, `tool_end` (`is_error` covers policy denials, AMP 
 may be added, never renamed or removed. The exit code is 0 when the run completed, otherwise 1;
 Ctrl-C aborts the run.
 
+A model stuck on one tool call is stopped, for every role (#2225). The harness counts identical
+calls (same tool, same arguments) in a row since the user's last message; any other call resets
+the count. The 3rd and 4th identical call still run, with a line in the result telling the model
+it is repeating itself. The 5th is not run and ends the run. `run -p` then exits 1 with outcome
+`stopped` and one stderr line ("The model kept repeating `bash ls` and was stopped; ..."); the chat
+shows the same sentence in the transcript, and a new message starts the count again.
+
 Offline runs use a faux provider and a scripted model:
 
 ```toml
@@ -720,8 +727,8 @@ them in for every worker it dispatches:
   `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `branch`, `commit` and
   `pushed`, but only the fields the model left out. Usage is the worker's live totals; git comes from
   its worktree.
-- A worker that ends without closing its ticket (error, timeout, cancel, turn budget, or it just
-  stopped) is reported with `amp_report_run`, outcome `abandoned` and a note
+- A worker that ends without closing its ticket (error, timeout, cancel, turn budget, stopped for
+  repeating one tool call, or it just stopped) is reported with `amp_report_run`, outcome `abandoned` and a note
   `abandoned: <reason>`, with the same usage and git fields, so the board shows the run and its
   tokens.
 - Only numbers the provider reported are sent: no token fields without usage, and no `cost_usd` when

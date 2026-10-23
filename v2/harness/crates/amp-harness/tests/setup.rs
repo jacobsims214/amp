@@ -386,7 +386,7 @@ async fn a_taken_project_code_is_asked_again() {
     let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(
-        out.stderr.contains("project code \"OLD\" already exists"),
+        out.stderr.contains("Code OLD is taken; pick another."),
         "{}",
         out.stderr
     );
@@ -399,6 +399,99 @@ async fn a_taken_project_code_is_asked_again() {
     assert_eq!(codes, vec![json!("OLD"), json!("NT")]);
     assert_eq!(out.json()["project"]["created"], true);
     assert_eq!(marker(&dir)["project_id"], 77);
+}
+
+/// #2229 (QA-2 #5): the default code avoids the listed codes (QT is archived), and a code AMP
+/// refuses (HI, a project this user can't list) is one sentence, not the transport's error, then
+/// a free default.
+#[tokio::test]
+async fn the_default_code_is_free_and_a_taken_code_is_one_sentence() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let args = ["init", "--url", &amp.url, "--json"];
+
+    let dir = workdir("setup-code-free", None);
+    let mut run = Run::new(&dir, &args);
+    // n, a name whose initials are taken, Enter for the default.
+    run.stdin = Some("n\nQA 2216 throwaway\n\n");
+    let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("(2-6 letters) [QTH]"), "{}", out.stderr);
+    let codes: Vec<Value> = amp
+        .mock
+        .calls_to("amp_create_project")
+        .iter()
+        .map(|c| c["code"].clone())
+        .collect();
+    assert_eq!(codes, vec![json!("QTH")], "QT was never tried");
+
+    let dir = workdir("setup-code-refused", None);
+    let mut run = Run::new(&dir, &args);
+    // n, a name, Enter (HI: refused), Enter again (the new default).
+    run.stdin = Some("n\nHidden Ideas\n\n\n");
+    let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr.contains("  Code HI is taken; pick another.\n"),
+        "{}",
+        out.stderr
+    );
+    for raw in ["tools/call", "Mcp error", "-32603", "already exists"] {
+        assert!(!out.stderr.contains(raw), "{raw} in: {}", out.stderr);
+    }
+    assert!(out.stderr.contains("(2-6 letters) [HID]"), "{}", out.stderr);
+    let codes: Vec<Value> = amp
+        .mock
+        .calls_to("amp_create_project")
+        .iter()
+        .map(|c| c["code"].clone())
+        .collect();
+    assert_eq!(codes, vec![json!("QTH"), json!("HI"), json!("HID")]);
+    assert_eq!(marker(&dir)["project_id"], 77);
+
+    // init --create without --code also skips the taken initials; a taken --code is one sentence.
+    let dir = workdir("setup-code-flag", None);
+    let out = Run::new(
+        &dir,
+        &[
+            "init",
+            "--yes",
+            "--url",
+            &amp.url,
+            "--create",
+            "QA 2216 throwaway",
+        ],
+    )
+    .go()
+    .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(
+        amp.mock.calls_to("amp_create_project").last().unwrap()["code"],
+        "QTH"
+    );
+    let dir = workdir("setup-code-flag-taken", None);
+    let out = Run::new(
+        &dir,
+        &[
+            "init",
+            "--yes",
+            "--url",
+            &amp.url,
+            "--create",
+            "Hidden Ideas",
+            "--code",
+            "hi",
+        ],
+    )
+    .go()
+    .await;
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stderr
+            .contains("Code HI is taken; pick another with --code."),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains("Mcp error"), "{}", out.stderr);
 }
 
 #[tokio::test]

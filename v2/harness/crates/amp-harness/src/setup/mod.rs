@@ -38,6 +38,7 @@ pub(crate) mod config_file;
 pub mod ui;
 
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -807,6 +808,66 @@ pub fn derive_code(name: &str) -> String {
     code
 }
 
+/// A code for `name` that is not in `taken` (upper case), for the default the first run offers
+/// (#2229). Codes are unique across AMP, archived projects included, so [`derive_code`]'s
+/// initials are often gone. Tries, in order: the initials; the initials plus the last word's next
+/// letters (QT -> QTH); the name's letters (QATH); the initials plus one letter (QTA..QTZ). Falls
+/// back to [`derive_code`] when everything is taken.
+pub fn free_code(name: &str, taken: &BTreeSet<String>) -> String {
+    let base = derive_code(name);
+    let words: Vec<String> = name
+        .split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_ascii_uppercase())
+        .collect();
+    let mut candidates = vec![base.clone()];
+    if words.len() >= 2 && base.len() < 6 {
+        let rest: String = words.last().map(|w| w[1..].to_owned()).unwrap_or_default();
+        for n in 1..=rest.len().min(6 - base.len()) {
+            candidates.push(format!("{base}{}", &rest[..n]));
+        }
+    }
+    let letters: String = words.concat();
+    for n in 2..=letters.len().min(6) {
+        candidates.push(letters[..n].to_owned());
+    }
+    let stem: String = base.chars().take(5).collect();
+    candidates.extend(('A'..='Z').map(|c| format!("{stem}{c}")));
+    candidates
+        .into_iter()
+        .find(|c| (2..=6).contains(&c.len()) && !taken.contains(c))
+        .unwrap_or(base)
+}
+
+/// AMP's own words in a tool error, without the transport's (`tools/call amp_x: Mcp error:
+/// -32603: ` from a JSON-RPC error; a tool result error has none).
+fn amp_message(message: &str) -> &str {
+    let m = message.trim();
+    let m = match m.strip_prefix("tools/call ") {
+        Some(rest) => rest.split_once(": ").map_or(rest, |(_, r)| r),
+        None => m,
+    };
+    match m.strip_prefix("Mcp error: ") {
+        Some(rest) => rest.split_once(": ").map_or(rest, |(_, r)| r),
+        None => m,
+    }
+}
+
+/// Whether AMP refused a project because its code is taken (`project code "QT" already exists`).
+fn code_taken(e: &CliError) -> bool {
+    e.message.contains("code") && e.message.contains("already exists")
+}
+
+/// The codes of every project `amp_list_projects` returned, archived ones included, upper case.
+fn listed_codes(projects: &[ProjectInfo]) -> BTreeSet<String> {
+    projects
+        .iter()
+        .filter_map(|p| p.code.as_deref())
+        .map(|c| c.trim().to_ascii_uppercase())
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
 /// Where a new `.amp.json` goes when it replaces `old`, a marker made for another server (#2206):
 /// the usual place (`--dir`, else the repository root) when the new file shadows `old` there or
 /// overwrites it, else the working directory. So a parent folder's marker for another server is
@@ -884,7 +945,35 @@ async fn project_step(
             org,
             team,
         } => {
-            let p = create_project(client, name, code.clone(), *org, *team).await?;
+            // #2229: without --code, a code no listed project has; a taken one is one sentence.
+            let code = match code {
+                Some(c) => c.clone(),
+                None => {
+                    let listed = call_json(client, "amp_list_projects", json!({})).await.ok();
+                    let all: Vec<ProjectInfo> = listed
+                        .as_ref()
+                        .map(|v| {
+                            list_of(v, "projects")
+                                .into_iter()
+                                .filter_map(ProjectInfo::from_value)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    free_code(name, &listed_codes(&all))
+                }
+            };
+            let p = create_project(client, name, Some(code.clone()), *org, *team)
+                .await
+                .map_err(|e| {
+                    if code_taken(&e) {
+                        CliError::usage(format!(
+                            "Code {} is taken; pick another with --code.",
+                            code.trim().to_ascii_uppercase()
+                        ))
+                    } else {
+                        e
+                    }
+                })?;
             return Ok((Some(link(ui, &p, true, marker_dir(plan))?), false));
         }
         ProjectArg::Auto => {}
@@ -960,9 +1049,14 @@ async fn project_step(
     }
 
     let listed = call_json(client, "amp_list_projects", json!({})).await?;
-    let projects: Vec<ProjectInfo> = list_of(&listed, "projects")
+    let all: Vec<ProjectInfo> = list_of(&listed, "projects")
         .into_iter()
         .filter_map(ProjectInfo::from_value)
+        .collect();
+    // #2229: a new project's default code avoids every listed code, archived ones included.
+    let taken = listed_codes(&all);
+    let projects: Vec<ProjectInfo> = all
+        .into_iter()
         .filter(|p| p.state.as_deref().is_none_or(|s| s == "active"))
         .collect();
     let default_name = marker_dir(plan)
@@ -999,7 +1093,7 @@ async fn project_step(
         if !ui.confirm("Create a project for this folder now?", true)? {
             return skip(ui, true);
         }
-        let p = create_interactive(ui, client, &default_name).await?;
+        let p = create_interactive(ui, client, &default_name, taken.clone()).await?;
         return Ok((Some(link(ui, &p, true, dir.clone())?), true));
     }
 
@@ -1032,7 +1126,7 @@ async fn project_step(
             return skip(ui, false);
         }
         if answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("new") {
-            let p = create_interactive(ui, client, &default_name).await?;
+            let p = create_interactive(ui, client, &default_name, taken.clone()).await?;
             return Ok((Some(link(ui, &p, true, dir.clone())?), false));
         }
         let chosen = if let Some(id) = answer.strip_prefix('#') {
@@ -1082,6 +1176,7 @@ async fn create_interactive(
     ui: &mut dyn Ui,
     client: &AmpMcpClient,
     default_name: &str,
+    mut taken: BTreeSet<String>,
 ) -> Result<ProjectInfo, CliError> {
     let name = loop {
         let n = ui.ask("Project name", Some(default_name))?;
@@ -1090,7 +1185,7 @@ async fn create_interactive(
         }
     };
     let code_prompt = "Short code, the ticket prefix (2-6 letters)";
-    let mut code = ui.ask(code_prompt, Some(&derive_code(&name)))?;
+    let mut code = ui.ask(code_prompt, Some(&free_code(&name, &taken)))?;
     let orgs_v = call_json(client, "amp_list_orgs", json!({})).await.ok();
     let orgs: Vec<(i64, String)> = orgs_v
         .as_ref()
@@ -1131,12 +1226,16 @@ async fn create_interactive(
             Ok(p) => return Ok(p),
             // Codes are unique across AMP, archived projects included: ask for another one
             // instead of ending the first run.
-            Err(e) if e.message.contains("code") && e.message.contains("already exists") => {
-                ui.say(&format!("  {}", e.message));
-                code = ui.ask(code_prompt, None)?;
+            // #2229: one sentence, not the transport's error, and a free code as the default
+            // (amp_list_projects shows only the projects the person can see).
+            Err(e) if code_taken(&e) => {
+                let upper = code.trim().to_ascii_uppercase();
+                ui.say(&format!("  Code {upper} is taken; pick another."));
+                taken.insert(upper);
+                code = ui.ask(code_prompt, Some(&free_code(&name, &taken)))?;
             }
             Err(e) if team.is_none() && e.message.contains("team") => {
-                ui.say(&format!("  {}", e.message));
+                ui.say(&format!("  {}", amp_message(&e.message)));
                 let t = ui.ask("Team id that should own it (see the AMP web UI)", None)?;
                 team = Some(
                     t.trim()
@@ -1779,6 +1878,40 @@ mod tests {
         assert_eq!(derive_code("x"), "XPR");
         assert_eq!(derive_code("a b c d e f g h"), "ABCDEF");
         assert_eq!(derive_code("Setup test 2113"), "ST");
+    }
+
+    #[test]
+    fn free_codes() {
+        let taken = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+        assert_eq!(free_code("QA 2216 throwaway", &taken(&[])), "QT");
+        assert_eq!(free_code("QA 2216 throwaway", &taken(&["QT"])), "QTH");
+        assert_eq!(
+            free_code("QA 2216 throwaway", &taken(&["QT", "QTH"])),
+            "QTHR"
+        );
+        assert_eq!(free_code("amp", &taken(&["AMP"])), "AM");
+        assert_eq!(free_code("ab", &taken(&["AB"])), "ABA");
+        let all: Vec<String> = ('A'..='Z')
+            .map(|c| format!("AB{c}"))
+            .chain(["AB".into()])
+            .collect();
+        let all: BTreeSet<String> = all.into_iter().collect();
+        assert_eq!(
+            free_code("ab", &all),
+            "AB",
+            "everything taken: the initials"
+        );
+    }
+
+    #[test]
+    fn amp_messages() {
+        assert_eq!(
+            amp_message(
+                "tools/call amp_create_project: Mcp error: -32603: project code \"QT\" already exists"
+            ),
+            "project code \"QT\" already exists"
+        );
+        assert_eq!(amp_message("team_id is required"), "team_id is required");
     }
 
     #[test]
