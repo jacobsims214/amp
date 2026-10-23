@@ -34,17 +34,10 @@ func TestHierarchyActor_StoryAutoCompletesWhenAllTasksDone(t *testing.T) {
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id1)})
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(id2)})
 
-	// Give the async rollup a moment to propagate.
-	time.Sleep(50 * time.Millisecond)
-
-	// Verify story is completed in DB.
-	story := s.call(t, "amp_get_story", map[string]interface{}{"story_id": float64(s.storyID)})
-	storyMap := story["story"].(map[string]interface{})
-	state := storyMap["state"].(string)
-	if state != "completed" {
-		t.Errorf("story should be completed after all tasks done, got %q", state)
-	}
-	t.Logf("story auto-completed ✓ (state=%s)", state)
+	// The rollup is async (TaskActor → StoryActor is fire-and-forget): wait
+	// for it rather than sleeping a fixed time, which flakes under -race.
+	waitRollupState(t, s, "story", s.storyID, "completed")
+	t.Logf("story auto-completed ✓")
 }
 
 // TestHierarchyActor_EpicAutoCompletesWhenAllStoriesDone verifies the full rollup
@@ -59,17 +52,9 @@ func TestHierarchyActor_EpicAutoCompletesWhenAllStoriesDone(t *testing.T) {
 	s.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(taskID), "agent_id": "agent"})
 	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(taskID)})
 
-	// Allow async rollup to propagate: task → story → epic.
-	time.Sleep(100 * time.Millisecond)
-
-	// Verify epic is completed.
-	epic := s.call(t, "amp_get_epic", map[string]interface{}{"epic_id": float64(s.epicID)})
-	epicMap := epic["epic"].(map[string]interface{})
-	state := epicMap["state"].(string)
-	if state != "completed" {
-		t.Errorf("epic should be completed after all tasks done, got %q", state)
-	}
-	t.Logf("epic auto-completed ✓ (state=%s)", state)
+	// Wait for the async rollup to propagate: task → story → epic.
+	waitRollupState(t, s, "epic", s.epicID, "completed")
+	t.Logf("epic auto-completed ✓")
 }
 
 // TestHierarchyActor_StoryMovesToInProgressOnFirstDispatch verifies that
@@ -87,14 +72,8 @@ func TestHierarchyActor_StoryMovesToInProgressOnFirstDispatch(t *testing.T) {
 
 	s.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(taskID), "agent_id": "agent"})
 
-	// Allow async rollup.
-	time.Sleep(50 * time.Millisecond)
-
-	story2 := s.call(t, "amp_get_story", map[string]interface{}{"story_id": float64(s.storyID)})
-	afterState := story2["story"].(map[string]interface{})["state"].(string)
-	if afterState != "in_progress" {
-		t.Errorf("story should be in_progress after first task dispatched, got %q", afterState)
-	}
+	// Wait for the async rollup.
+	waitRollupState(t, s, "story", s.storyID, "in_progress")
 	t.Logf("story moved to in_progress on first dispatch ✓")
 }
 
@@ -236,4 +215,27 @@ func TestHierarchyActor_CrossEpicDepUnblocksCorrectly(t *testing.T) {
 		t.Errorf("epic-b task should be ready after epic-a task completes. ready=%v", readyIDs)
 	}
 	t.Logf("cross-epic dep unblocked via ProjectActor fan-out ✓")
+}
+
+// waitRollupState polls amp_get_story / amp_get_epic until the story or epic
+// reaches want, failing after 5s. Story and epic state roll up asynchronously
+// (TaskActor → StoryActor → EpicActor are fire-and-forget sends, each hop
+// persisting to Postgres), so the state lands some time after the MCP call
+// that triggered it returns. The ordering is deterministic; only the latency
+// varies, and under -race with the whole package running it can exceed any
+// fixed sleep.
+func waitRollupState(t *testing.T, s *mcpStack, kind string, id int, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		res := s.call(t, "amp_get_"+kind, map[string]interface{}{kind + "_id": float64(id)})
+		got, _ := res[kind].(map[string]interface{})["state"].(string)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s %d: state %q after 5s, want %q", kind, id, got, want)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }
