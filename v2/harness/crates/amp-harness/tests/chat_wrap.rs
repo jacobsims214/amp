@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::HashSet;
 
-use common::{MockAmp, Output, run, spawn, workdir};
+use common::{MockAmp, Output, run, spawn, unpad, workdir};
 use serde_json::{Value, json};
 
 const FAUX_CONFIG: &str = r#"
@@ -95,7 +95,7 @@ async fn snapshot_env(
     );
     let rows: Vec<String> = out.stdout.lines().map(str::to_owned).collect();
     assert_eq!(rows.len(), size.1, "{}", out.stdout);
-    rows
+    unpad(rows)
 }
 
 /// Words split across two rows: a row's last token and the next row's first token that only
@@ -211,7 +211,7 @@ async fn thinking_wraps_at_words() {
         let screen = full_thinking("wrap-thinking", script, size, "explain waves").await;
         check(&screen, &[THINKING], size.0);
         assert!(
-            screen.iter().any(|r| r.contains("silly and repetitive.")),
+            screen.iter().any(|r| r.contains("repetitive.")),
             "{screen:?}"
         );
     }

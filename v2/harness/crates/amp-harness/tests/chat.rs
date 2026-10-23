@@ -88,7 +88,7 @@ async fn the_chat_talks_to_the_manager() {
     assert!(screen.contains("faux/faux-1 • thinking"), "{screen}");
     // #2186: the banner names the session by its short id, on a row of its own; /usage names
     // the file, and the context the footer's `ctx N%` stands for.
-    assert!(screen.contains("\n session "), "{screen}");
+    assert!(screen.contains("\n   session "), "{screen}");
     assert!(screen.contains(" (/usage for path)"), "{screen}");
     assert!(
         screen.contains("session: ~/.local/state/amp-harness/sessions/"),

@@ -252,7 +252,10 @@ async fn the_new_output_pill_shows_only_while_scrolled_up_with_output_below() {
         .lines()
         .position(|l| l.contains(NEW_OUTPUT.trim()))
         .unwrap();
-    let editor_top = screen.lines().position(|l| l.starts_with('─')).unwrap();
+    let editor_top = screen
+        .lines()
+        .position(|l| l.trim_start().starts_with('─'))
+        .unwrap();
     assert!(row < editor_top, "{screen}");
     let styled = r.shell.view().render_frame(W, H);
     assert!(

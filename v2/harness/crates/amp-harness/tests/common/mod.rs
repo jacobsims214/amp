@@ -442,6 +442,16 @@ impl Output {
     }
 }
 
+/// `--snapshot` rows without the chat's left padding (`[tui] padding`, #2251), so a test that
+/// checks where something sits within the transcript reads columns as before. amp-tui's
+/// `tests/padding.rs` covers the padding itself.
+pub fn unpad(rows: Vec<String>) -> Vec<String> {
+    let pad = " ".repeat(amp_tui::DEFAULT_PADDING);
+    rows.into_iter()
+        .map(|r| r.strip_prefix(&pad).map(str::to_owned).unwrap_or(r))
+        .collect()
+}
+
 /// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {

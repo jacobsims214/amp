@@ -363,11 +363,17 @@ fn no_ticket_hides_line_two_and_no_source_hides_everything() {
     // footer (#2186: with no cwd, model or usage set, the footer has no rows).
     view.chrome().set_snapshot(sample::meta(true));
     let screen = view.render_plain(160, 20);
-    assert!(screen[0].starts_with("▀▀▀▀▀▀▀▀ amp.simstech.cloud"));
-    assert!(screen[1].starts_with("■ In progress #2106"));
-    assert!(screen[18].starts_with("────"), "{screen:#?}");
     assert!(
-        screen[19].starts_with("■  2 QUESTIONS  │ workers 0 │"),
+        screen[0]
+            .trim_start()
+            .starts_with("▀▀▀▀▀▀▀▀ amp.simstech.cloud")
+    );
+    assert!(screen[1].trim_start().starts_with("■ In progress #2106"));
+    assert!(screen[18].trim_start().starts_with("────"), "{screen:#?}");
+    assert!(
+        screen[19]
+            .trim_start()
+            .starts_with("■  2 QUESTIONS  │ workers 0 │"),
         "{screen:#?}"
     );
 }

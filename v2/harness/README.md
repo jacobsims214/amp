@@ -566,6 +566,7 @@ with square borders and AMP's ticket-state, epic and brand colours.
 | colours  | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
 | thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
 | mouse    | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
+| padding  | -         | `AMP_HARNESS_PADDING`       | `padding`             | `2`         |
 
 - `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
   background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
@@ -578,6 +579,9 @@ with square borders and AMP's ticket-state, epic and brand colours.
 - `mouse`: `true` (the wheel scrolls the transcript; select with Fn-drag in Terminal.app,
   Option-drag in iTerm2) or `false` (no mouse reporting: plain click-drag selects). The env var
   takes `on`/`off`.
+- `padding`: columns of space left and right of every part of the chat (header, transcript,
+  panels, editor, status line, footer), 0 to 8. Below 44 columns it shrinks so the content keeps
+  at least 40 columns (none at 41 columns or fewer).
 
 ### Header and status line (M3-3)
 

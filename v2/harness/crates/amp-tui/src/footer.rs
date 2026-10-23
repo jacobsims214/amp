@@ -29,8 +29,10 @@ use crate::chrome::shorten;
 
 pub use rpi_tui::footer::format_tokens;
 
-/// Below this many columns the footer is one row (the AMP status line above it is the other).
-pub const FOLD_BELOW: usize = 100;
+/// Below this many columns (the footer's own width, inside the `[tui] padding`: 96 is a
+/// 100-column terminal with the default 2-column padding) the footer is one row (the AMP status
+/// line above it is the other).
+pub const FOLD_BELOW: usize = 96;
 /// The fewest blank cells between the footer's left and right groups.
 const GAP: usize = 2;
 
