@@ -700,11 +700,16 @@ mod pty_tests {
         (File::from(pair.master), File::from(pair.slave))
     }
 
-    /// Plays `script` (delay from start, bytes) on the terminal side, in a thread that ends by
-    /// itself once the script is done.
-    fn terminal(master: &File, script: Vec<(u64, &'static [u8])>) -> thread::JoinHandle<()> {
+    /// Plays `script` (delay from `start`, bytes) on the terminal side, in a thread that ends by
+    /// itself once the script is done. `start` is the test's own clock (#2278): with one shared
+    /// origin, a byte scripted at `at` is never written before `start + at`, so a test that
+    /// measures from `start` can assert lower bounds without racing the thread's setup.
+    fn terminal(
+        master: &File,
+        start: Instant,
+        script: Vec<(u64, &'static [u8])>,
+    ) -> thread::JoinHandle<()> {
         let mut master = master.try_clone().unwrap();
-        let start = Instant::now();
         thread::spawn(move || {
             for (at, bytes) in script {
                 let at = Duration::from_millis(at);
@@ -752,8 +757,8 @@ mod pty_tests {
         let (master, slave) = pty();
         let reply = concat(&[OSC11_REPLY, DA1_REPLY]);
         let reply: &'static [u8] = Box::leak(reply.into_boxed_slice());
-        let term = terminal(&master, vec![(20, reply)]);
         let started = Instant::now();
+        let term = terminal(&master, started, vec![(20, reply)]);
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         assert!(
             started.elapsed() < FIRST,
@@ -770,6 +775,7 @@ mod pty_tests {
         let (master, slave) = pty();
         let term = terminal(
             &master,
+            Instant::now(),
             vec![(20, b"\x1b]11;rgb:0000/0000/0000\x07\x1b[?1;2ck")],
         );
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
@@ -782,8 +788,8 @@ mod pty_tests {
     #[test]
     fn da1_only_ends_the_exchange() {
         let (master, slave) = pty();
-        let term = terminal(&master, vec![(20, DA1_REPLY)]);
         let started = Instant::now();
+        let term = terminal(&master, started, vec![(20, DA1_REPLY)]);
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         assert!(started.elapsed() < FIRST);
         term.join().unwrap();
@@ -812,16 +818,19 @@ mod pty_tests {
     #[test]
     fn a_reply_finishing_past_the_first_bound_is_drained() {
         let (master, slave) = pty();
-        // Starts inside the first bound, finishes (DA1) after it but inside the drain.
+        // Starts inside the first bound, finishes (DA1) after it but inside the drain. The script
+        // runs on the test's clock, so the DA1 byte exists no earlier than `started + 550ms` and
+        // `exchange` cannot have read it, and returned, any sooner.
+        let started = Instant::now();
         let term = terminal(
             &master,
+            started,
             vec![
                 (100, &OSC11_REPLY[..8]),
                 (500, &OSC11_REPLY[8..]),
                 (550, DA1_REPLY),
             ],
         );
-        let started = Instant::now();
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         let took = started.elapsed();
         term.join().unwrap();
@@ -838,8 +847,8 @@ mod pty_tests {
     #[test]
     fn an_incomplete_reply_stops_at_the_drain_bound() {
         let (master, slave) = pty();
-        let term = terminal(&master, vec![(50, &OSC11_REPLY[..8])]);
         let started = Instant::now();
+        let term = terminal(&master, started, vec![(50, &OSC11_REPLY[..8])]);
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         let took = started.elapsed();
         term.join().unwrap();
