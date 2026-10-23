@@ -10,13 +10,15 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 // Plan approval covers only what the person saw (AMP #2192). The UI sends
 // approve-plan {"as_of": <the newest planned_at on the page>}: tickets
 // created, restored or re-scoped after it are not approved and keep awaiting
-// (listed in the response's awaiting_approval). No body approves the plan
-// as it stands now, as before.
+// (listed in the response's awaiting_approval). No body approves the
+// caller's own tickets as they stand now. Approval is per ticket (#2198):
+// root planned every ticket here, so root approves them.
 func TestPlanApproval_AsOfCoversOnlyWhatWasSeen(t *testing.T) {
 	w := newRBACWorld(t)
 	ra := newRestAs(t, w)
@@ -26,22 +28,15 @@ func TestPlanApproval_AsOfCoversOnlyWhatWasSeen(t *testing.T) {
 	path := fmt.Sprintf("/api/projects/%d/approve-plan", pid)
 	ctx := context.Background()
 
-	planned := func(id int) time.Time {
+	ticket := func(id int) *domain.Task {
 		t.Helper()
 		tk, err := w.s.repo.GetTask(ctx, id)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return tk.PlannedAt
+		return tk
 	}
-	approvedAt := func() time.Time {
-		t.Helper()
-		p, err := w.s.repo.GetProject(ctx, pid)
-		if err != nil || p.PlanApprovedAt == nil {
-			t.Fatalf("project: %v %v", p, err)
-		}
-		return *p.PlanApprovedAt
-	}
+	planned := func(id int) time.Time { return ticket(id).PlannedAt }
 	awaiting := func(out map[string]any) []int {
 		t.Helper()
 		raw, ok := out["awaiting_approval"].([]any)
@@ -50,6 +45,14 @@ func TestPlanApproval_AsOfCoversOnlyWhatWasSeen(t *testing.T) {
 		}
 		ids := []int{}
 		for _, v := range raw {
+			ids = append(ids, int(v.(float64)))
+		}
+		return ids
+	}
+	approved := func(out map[string]any) []int {
+		t.Helper()
+		ids := []int{}
+		for _, v := range out["approved"].([]any) {
 			ids = append(ids, int(v.(float64)))
 		}
 		return ids
@@ -66,12 +69,16 @@ func TestPlanApproval_AsOfCoversOnlyWhatWasSeen(t *testing.T) {
 	}
 
 	// Approving as of what was seen approves a, not b: b still awaits.
-	out := ra.want(t, 200, "bob", http.MethodPost, path, asOf(seen))
+	out := ra.want(t, 200, "root", http.MethodPost, path, asOf(seen))
 	if got := awaiting(out); !same(got, b) {
 		t.Fatalf("awaiting after as_of approval = %v, want [%d]", got, b)
 	}
-	if !approvedAt().Equal(seen) {
-		t.Fatalf("plan_approved_at = %v, want as_of %v", approvedAt(), seen)
+	if got := approved(out); !same(got, a) {
+		t.Fatalf("approved = %v, want [%d]", got, a)
+	}
+	aApproved := ticket(a).ApprovedAt
+	if aApproved == nil || aApproved.Before(seen) || ticket(a).ApprovedBy == nil || *ticket(a).ApprovedBy != w.root.User.ID {
+		t.Fatalf("a approved at %v by %v", aApproved, ticket(a).ApprovedBy)
 	}
 	root.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(a), "agent_id": "w"})
 	wantErr(t, root.callExpectError(t, "amp_dispatch_task", map[string]any{"task_id": float64(b), "agent_id": "w"}), "approved")
@@ -80,34 +87,35 @@ func TestPlanApproval_AsOfCoversOnlyWhatWasSeen(t *testing.T) {
 		t.Fatalf("plan check after as_of approval: %v", check["awaiting_approval"])
 	}
 
-	// A stale page (as_of older than the current approval) never moves the
-	// approval back: a stays approved.
-	ra.want(t, 200, "bob", http.MethodPost, path, asOf(seen.Add(-time.Hour)))
-	if !approvedAt().Equal(seen) {
-		t.Fatalf("stale as_of moved plan_approved_at to %v (was %v)", approvedAt(), seen)
+	// A stale page (as_of older than anything awaiting) approves nothing and
+	// never un-approves: a keeps its approval.
+	out = ra.want(t, 200, "root", http.MethodPost, path, asOf(seen.Add(-time.Hour)))
+	if got := approved(out); len(got) != 0 || !ticket(a).ApprovedAt.Equal(*aApproved) {
+		t.Fatalf("stale as_of approved %v; a approved at %v (was %v)", got, ticket(a).ApprovedAt, aApproved)
 	}
 
 	// A re-scoped ticket is planned again: an approval as of before the edit
 	// doesn't cover it.
 	root.call(t, "amp_update_task", map[string]any{"task_id": float64(b), "description": "changed scope"})
 	rescoped := planned(b)
-	out = ra.want(t, 200, "bob", http.MethodPost, path, asOf(seen))
+	out = ra.want(t, 200, "root", http.MethodPost, path, asOf(seen))
 	if got := awaiting(out); !same(got, b) {
 		t.Fatalf("awaiting after re-scope = %v, want [%d]", got, b)
 	}
 	// Seeing the re-scoped ticket and approving as of it approves it.
-	out = ra.want(t, 200, "bob", http.MethodPost, path, asOf(rescoped))
+	out = ra.want(t, 200, "root", http.MethodPost, path, asOf(rescoped))
 	if got := awaiting(out); !same(got) {
 		t.Fatalf("awaiting after approving as of the re-scope = %v", got)
 	}
-	if !approvedAt().Equal(rescoped) {
-		t.Fatalf("plan_approved_at = %v, want %v", approvedAt(), rescoped)
+	if !ticket(b).Approved() {
+		t.Fatalf("b not approved after approving as of its re-scope: %+v", ticket(b))
 	}
 
-	// as_of in the future is capped at now: a ticket planned later awaits.
-	before := time.Now()
-	ra.want(t, 200, "bob", http.MethodPost, path, asOf(time.Now().Add(24*time.Hour)))
-	if at := approvedAt(); at.After(time.Now().Add(time.Minute)) || at.Before(before.Add(-time.Minute)) {
+	// as_of in the future approves what exists now, stamped now; a ticket
+	// planned later awaits.
+	c0 := mkIn(t, root, w.s.storyID, "before a future as_of")
+	ra.want(t, 200, "root", http.MethodPost, path, asOf(time.Now().Add(24*time.Hour)))
+	if at := ticket(c0).ApprovedAt; at == nil || at.After(time.Now().Add(time.Minute)) {
 		t.Fatalf("future as_of stamped %v", at)
 	}
 	c := mkIn(t, root, w.s.storyID, "after a future as_of")
@@ -117,19 +125,18 @@ func TestPlanApproval_AsOfCoversOnlyWhatWasSeen(t *testing.T) {
 	}
 
 	// A malformed as_of is a 400 and approves nothing.
-	was := approvedAt()
-	if code, out := ra.do(t, "bob", http.MethodPost, path, map[string]any{"as_of": "yesterday"}); code != 400 || !strings.Contains(fmt.Sprint(out["error"]), "as_of") {
+	if code, out := ra.do(t, "root", http.MethodPost, path, map[string]any{"as_of": "yesterday"}); code != 400 || !strings.Contains(fmt.Sprint(out["error"]), "as_of") {
 		t.Fatalf("bad as_of: %d %v", code, out)
 	}
-	if !approvedAt().Equal(was) {
-		t.Fatal("a refused approve-plan changed plan_approved_at")
+	if ticket(c).ApprovedAt != nil {
+		t.Fatal("a refused approve-plan approved a ticket")
 	}
 
-	// No body, or a body without as_of, approves the plan as it stands now
-	// (backward compatible): nothing awaits.
+	// No body, or a body without as_of, approves the caller's own tickets as
+	// they stand now (backward compatible for one person): nothing awaits.
 	for _, body := range []any{nil, map[string]any{}} {
 		mkIn(t, root, w.s.storyID, "approved by a body-less approve")
-		out = ra.want(t, 200, "bob", http.MethodPost, path, body)
+		out = ra.want(t, 200, "root", http.MethodPost, path, body)
 		if got := awaiting(out); !same(got) {
 			t.Fatalf("awaiting after approve with body %v = %v", body, got)
 		}
