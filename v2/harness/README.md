@@ -10,6 +10,50 @@ its ticket automatically. The CLI also has `login`, `logout`, `doctor`, `whoami`
 `config show`, `connect`/`disconnect` (model provider keys), `run -p` (a headless agent run) and
 `mcp …` (MCP servers, plus `mcp call` for AMP's tools). `make smoke` runs them against a real local AMP.
 
+## Install
+
+macOS (Apple silicon or Intel) and Linux (x86_64 or aarch64, glibc 2.35+), one line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh
+```
+
+With your company's org preset (its AMP server, its model endpoint and which model each role runs
+on; no secrets, see [org presets](#your-companys-own-endpoint-models-per-role-org-presets-2275)):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh -s -- --preset https://intranet.example.com/amp-preset.toml
+```
+
+The script downloads the newest `harness-v*` release for your platform, checks its SHA-256 and puts
+`amp-harness` in `~/.local/bin` (no sudo). On a terminal it then asks
+``Run `amp-harness setup` now? [Y/n]``. This works under `curl | sh` too, because the answer is
+read from `/dev/tty`. Setup signs you in to AMP, links the current folder to a project and connects a
+model provider, starting from the preset when you passed one. Without a terminal (CI, Dockerfiles)
+it installs and prints the setup command instead.
+
+| option (env) | |
+|---|---|
+| `--preset FILE\|URL` (`AMP_HARNESS_PRESET`) | handed to `amp-harness setup --preset`. A file is checked before anything is installed |
+| `--no-setup` (`AMP_HARNESS_NO_SETUP=1`) | install only, then print the setup command |
+| `--version X.Y.Z` (`AMP_HARNESS_VERSION`) | a specific release (default: the newest) |
+| `--prefix DIR` (`AMP_HARNESS_PREFIX`) | where the binary goes (default `~/.local/bin`) |
+| `--uninstall` | remove `DIR/amp-harness`. Config, keychain items and projects' `.amp.json` stay; it says where they are |
+| `--modify-path` | add DIR to your login shell's profile when it isn't on PATH (a backup is kept). By default it only tells you the line to add |
+| `--archive FILE [--sha256 HEX\|FILE]` | install a local archive (`make dist`) instead of downloading |
+| `--target TRIPLE`, `--no-path-check` | override platform detection; skip the PATH check |
+
+- **Upgrade:** run the same line again. It replaces the binary in place, without overwriting a
+  running one, and says `Updated amp-harness 0.1.0 → 0.2.0`.
+- **Uninstall:** `curl -fsSL …/install.sh | sh -s -- --uninstall`.
+- **Linux:** any glibc distro with `curl` or `wget`, plus `tar`. The script stops with a clear message
+  on Alpine and other musl systems (not supported yet), on glibc older than 2.35 (e.g. Ubuntu 20.04),
+  and when a needed tool is missing.
+
+Until the first release is published (M5-1, #2122), install from a checkout:
+`make -C v2/harness install` builds a release binary, packs it and installs it with this same
+script.
+
 ## Try it
 
 From the repo root of a worktree on `/Volumes/external-data` (see the Rust disk rule below):
@@ -1129,7 +1173,14 @@ compose's amp-api on another port and pass e.g. `AMP_MCP_URL=http://localhost:18
 `make up`: it kills whatever holds :8000, which there is Docker Desktop itself.
 
 CI: the `harness` job in `.github/workflows/harness.yml` runs fmt, clippy `-D warnings` and the tests
-on any push or PR that touches `v2/harness/**`.
+on any push or PR that touches `v2/harness/**`. `.github/workflows/harness-release.yml`'s
+`install-test` job runs `scripts/test-install.sh` on ubuntu-latest and macos-latest
+(`make install-test`): a stub binary in a file:// release mirror, HOME under `target/`, covering
+fresh install, upgrade, `--uninstall`, `--preset` passthrough, the no-terminal output and the setup
+handoff on a pseudo-terminal (`scripts/pty-run.py`). On Linux it also runs
+`scripts/test-install-distros.sh` (`make install-test-distros`, needs docker): Debian slim with no
+curl or wget, Ubuntu 24.04 with wget only, Ubuntu 20.04 (glibc 2.31, refused) and Alpine (musl,
+refused).
 
 Pins are exact. Bumping `rpi-*` or `rmcp` is its own ticket, gated on the smoke test. `--version`
 prints the versions resolved in `Cargo.lock`, and a test fails if they drift from the pins.
