@@ -49,7 +49,8 @@ Plan a human ticket for a step you can see coming that only a person can do. Don
 - **A question that comes up while an agent works.** The agent blocks its own ticket with the
   question, and you answer it (`working/questions.md`).
 - **Approving a mockup.** That's the design ticket's artifact review (`working/artifacts.md`).
-- **Approving the plan.** That's Flight plan's Approve, done by a person in the web UI.
+- **Approving the plan.** That's Flight plan's Approve, done in the web UI by each person for
+  their own tickets (or a lead on their behalf).
 
 A good human ticket:
 - has **one person and one action**: "Review and merge: quotes API PR", not "QA and release";

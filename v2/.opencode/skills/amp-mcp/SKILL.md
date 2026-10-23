@@ -48,19 +48,26 @@ stop. Don't retry, and don't try another tool or the REST API.
 
 | Step | Where the person does it | What you get over MCP |
 |---|---|---|
-| Approving a plan | Flight plan, "Approve plan" | `amp_approve_plan` always refuses, with `approve_url`, `awaiting_approval`, `require_plan_approval`, `plan_approved_at`. Never call it to approve. |
+| Approving a plan (per ticket: each person their own; a lead on someone's behalf) | Flight plan, "Approve plan" | `amp_approve_plan` always refuses, with `approve_url`, `awaiting_approval`, `require_plan_approval`, `plan_approved_at`. Never call it to approve. |
 | Approving an artifact | Artifact page, Approve | `amp_review_artifact(approve=true)` refuses; `approve=false` with a note still works |
 | Marking a human ticket done | Ticket drawer or My Work, Mark done | `amp_complete_task` / `amp_set_task_state(completed)` refuse with the ticket link |
 | Turning `require_plan_approval` off | Project settings | `amp_update_project_settings` refuses; turning it on works |
 
 The approval gate in practice:
 
+- **Approval is per ticket.** Each person approves their own tickets in the web UI; a project
+  lead (or owner, admin) may approve someone else's on their behalf. A ticket you plan for your
+  person is theirs to approve (an unassigned ticket belongs to whoever planned it).
 - **`amp_check_plan`** returns `approve_url` (the Flight plan link) whenever `awaiting_approval`
-  isn't empty. That's the hand-off point: give your person the link and wait.
-- **`amp_dispatch_task`** on a ticket planned after the last approval refuses: "planned after the
-  plan was last approved … A person approves it in the AMP web UI (Approve plan): <link>".
-  A ticket is re-planned (needs approving again) when it's created, restored from the trash, or
-  its name, description or acceptance criteria change.
+  isn't empty. `awaiting_approval` is every open ticket awaiting approval, anyone's;
+  `awaiting_approval_tickets` lists them as `{task_id, owner_user_id, yours}`, and
+  `awaiting_yours` is your person's own. That's the hand-off point: tell your person which of
+  **their** tickets await approval (`awaiting_yours`) with the link, say others' tickets wait for
+  their owners (or a lead on their behalf), and wait.
+- **`amp_dispatch_task`** on a ticket that isn't approved refuses: "ticket N isn't approved …
+  Its owner approves it in the AMP web UI (Approve plan; a project lead may approve it on their
+  behalf): <link>". A ticket is re-planned (needs approving again) when it's created, restored
+  from the trash, or its name, description or acceptance criteria change.
 - **`amp_complete_task`** on a ticket that was never dispatched refuses: "never dispatched …
   Dispatch it first". Off the UI a ticket can only be completed from `in_progress`.
 - **`amp_set_task_state`** can't move a ticket to `in_progress` (use `amp_dispatch_task`) or take a
