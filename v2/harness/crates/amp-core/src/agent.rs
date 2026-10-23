@@ -344,8 +344,11 @@ impl Runtime {
             file.tools.bash_timeout_secs,
             (opts.env)(ENV_BASH_TIMEOUT_SECS).as_deref(),
         )?;
+        // #2233: every variable an MCP server reads a secret from is hidden from bash too. A
+        // broken [mcp] table is not fatal here; the MCP hub reports it.
         let secret_env = secret_env_names(&models)
             .into_iter()
+            .chain(crate::mcp_config::McpConfig::load(&paths).secret_env_names())
             .filter(|n| !pass_env.contains(n))
             .collect();
         Ok(Self {
