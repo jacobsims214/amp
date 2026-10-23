@@ -360,6 +360,18 @@ impl ChatView {
         )));
     }
 
+    /// A warning line in the transcript (something the person should decide on).
+    pub fn add_warning(&self, text: &str) {
+        self.end_group();
+        let colors = theme().colors;
+        self.scroll.touch();
+        self.transcript.add_child(Arc::new(WrapText::new(
+            theme_glyphs(text, colors.warning),
+            1,
+            1,
+        )));
+    }
+
     /// An error line in the transcript.
     pub fn add_error(&self, text: &str) {
         self.end_group();

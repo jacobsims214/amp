@@ -276,6 +276,15 @@ pub async fn run(
             ids.join(", ")
         );
     }
+    // #2204: what became of the tickets whose workers the quit abandoned.
+    for (id, result) in shell.released() {
+        match result {
+            Ok(()) => eprintln!("amp-harness: #{id} was returned to ready in AMP"),
+            Err(e) => eprintln!(
+                "amp-harness: #{id} is still in progress in AMP (could not return it to ready: {e})"
+            ),
+        }
+    }
     outcome
 }
 

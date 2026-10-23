@@ -214,7 +214,7 @@ impl ServerHandler for MockAmp {
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = CONTRACT
             .iter()
-            .chain(&["amp_kb_search", "amp_fail"])
+            .chain(&["amp_kb_search", "amp_fail", "amp_set_task_state"])
             .filter(|name| !self.omit.contains(name))
             .map(|name| tool(name))
             .collect();
@@ -275,6 +275,15 @@ impl ServerHandler for MockAmp {
             "amp_report_run" => match args["task_id"].as_i64() {
                 Some(4041) => tool_error("task 4041 not found"),
                 Some(id) => ok_json(json!({"task_id": id, "outcome": args["outcome"]})),
+                None => tool_error("task_id is required"),
+            },
+            // #2204: an abandoned ticket handed back to ready; ticket 4042 is refused (as AMP
+            // refuses moving someone else's ticket).
+            "amp_set_task_state" => match args["task_id"].as_i64() {
+                Some(4042) => tool_error("task 4042 is owned by someone else"),
+                Some(id) => ok_json(
+                    json!({"task_id": id, "from_state": "in_progress", "to_state": args["state"]}),
+                ),
                 None => tool_error("task_id is required"),
             },
             "amp_get_plan" => ok_json(json!({"project_id": 2, "epics": [

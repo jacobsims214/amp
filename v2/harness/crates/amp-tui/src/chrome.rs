@@ -6,7 +6,7 @@
 //! ▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2      ● connected 2026-07-28
 //! ■ In progress #2106 M3-3 Header and AMP status line                    ▌ AMP Harness › M3
 //! ...transcript, editor...
-//! ■  2 QUESTIONS  │ workers 2 ■ running · 1 queued │ plan: 2 waiting for your approval │ ■ 3 In progress · □ 5 Ready   reported ✓ #2106
+//! ■  2 QUESTIONS  │ workers 1 ■ running · 1 queued │ plan: 2 waiting for your approval │ ■ 3 In progress · □ 5 Ready   reported ✓ #2106
 //! ```
 //!
 //! - **Header line 1:** the brand bands, the AMP host, the user, `org › project` (an OSC 8 link
@@ -15,8 +15,8 @@
 //! - **Header line 2** (only while a ticket is current): the web UI's state mark, `#id` (a link to
 //!   the board with the ticket's drawer open), the name, and `▌ Epic › Story` in the epic's cat
 //!   colour.
-//! - **Status line:** the red questions chip, workers (local from the supervisor, remote from the
-//!   board's in-progress tickets), plan approval ("waiting for your approval", a link to the
+//! - **Status line:** the red questions chip, this chat's workers (from its supervisor only;
+//!   tickets in progress elsewhere are in the board counts), plan approval ("waiting for your approval", a link to the
 //!   Flight plan page), the board counts in the web UI's words, the
 //!   current ticket's artifacts in review, and, right-aligned, whether this session reported its
 //!   run to AMP.
@@ -823,8 +823,11 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
     vec![fit(&style, left, right, width)]
 }
 
-/// `workers 3 ■ running · 1 queued · 1 ■ question`: local workers plus the board's other
-/// in-progress tickets (workers elsewhere).
+/// `workers 1 ■ running · 1 queued · 1 ■ question`: the workers **this chat** runs (its
+/// supervisor). Tickets in progress elsewhere (another chat, another person, or a run this chat
+/// abandoned) are not workers of this chat: they stay in the board's `In progress` count, and
+/// `/workers` lists them as "elsewhere" (#2204: a fresh chat used to count a dead ticket as a
+/// running worker).
 fn workers_seg(style: &Style, data: &ChromeData, p: &AmpPalette) -> Seg {
     let c = &style.colors;
     let meta = &data.meta;
@@ -832,7 +835,6 @@ fn workers_seg(style: &Style, data: &ChromeData, p: &AmpPalette) -> Seg {
     let questions: HashSet<i64> = board
         .map(|b| b.questions.iter().map(|q| q.id).collect())
         .unwrap_or_default();
-    let local: HashSet<i64> = data.workers.iter().map(|w| w.task_id).collect();
     let mut running = 0;
     let mut queued = 0;
     let mut asking = 0;
@@ -845,14 +847,6 @@ fn workers_seg(style: &Style, data: &ChromeData, p: &AmpPalette) -> Seg {
             running += 1;
         }
     }
-    running += board
-        .map(|b| {
-            b.in_progress_tickets
-                .iter()
-                .filter(|t| !local.contains(&t.id))
-                .count()
-        })
-        .unwrap_or(0);
 
     let is_stale = stale(&meta.board);
     let prog = p.state(Status::InProgress);
@@ -1063,7 +1057,8 @@ pub mod sample {
         }
     }
 
-    fn worker(task_id: i64, phase: WorkerPhase) -> WorkerStatus {
+    /// A live worker of this chat on `task_id`.
+    pub fn worker(task_id: i64, phase: WorkerPhase) -> WorkerStatus {
         WorkerStatus {
             task_id,
             agent_id: "amp:amp-worker-backend".to_owned(),

@@ -455,6 +455,10 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
         "{:?}",
         r.notes
     );
+
+    // #2204: none of these was stopped by the chat, so their manager decides what happens to the
+    // ticket next; nothing was handed back.
+    assert!(f.calls("amp_set_task_state").is_empty());
 }
 
 /// A step that cancels `token` (as the manager's abort or Ctrl-C would, mid-turn), then starts a
@@ -569,6 +573,26 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
         "{}",
         runs[0]
     );
+    // #2204: the chat stopped it, so nobody is on the ticket: it is handed back to ready.
+    let released = f.calls("amp_set_task_state");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["task_id"], 2090);
+    assert_eq!(released[0]["state"], "backlog");
+    assert!(
+        released[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("returned to ready by amp-harness: abandoned: cancelled"),
+        "{}",
+        released[0]
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "returned #2090 to ready in AMP (nobody is working on it now)"),
+        "{:?}",
+        r.notes
+    );
 
     // 5. Closing some other ticket does not close its own: cancelled after it is still abandoned.
     let signal = CancellationToken::new();
@@ -581,4 +605,22 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
     let runs = f.calls("amp_report_run");
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[1]["task_id"], 2091);
+    assert_eq!(f.calls("amp_set_task_state")[1]["task_id"], 2091);
+
+    // 6. AMP refuses to take the ticket back: the report says so, nothing fails.
+    let signal = CancellationToken::new();
+    f.script(vec![cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(4042, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("could not return #4042 to ready in AMP")
+                && n.contains("owned by someone else")),
+        "{:?}",
+        r.notes
+    );
 }
