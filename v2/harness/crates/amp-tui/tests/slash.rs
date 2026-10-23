@@ -8,7 +8,7 @@
 use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 
 use amp_core::{agent::memory_session, events::ChannelEmitter};
-use amp_tui::{COMMANDS, HelpBlock, KEYS, PLACEHOLDER, Shell, ShellInfo, Submit};
+use amp_tui::{COMMANDS, DRAG_KEY, HelpBlock, KEYS, PLACEHOLDER, Shell, ShellInfo, Submit, keys};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
 use rpi_ai::{
@@ -342,6 +342,57 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
     }
 
     snapshot("help-80", &rows);
+}
+
+/// With mouse capture off (`[tui] mouse = false`, #2185) plain drag selects: /help names no
+/// modifier and no terminal (#2210). On, it keeps the Fn/Option row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn help_keys_follow_mouse_capture() {
+    let _lock = LOCK.lock().await;
+    let mut rig = rig().await;
+    rig.shell.set_mouse_capture(false);
+    rig.shell.submit("/help").await;
+    let screen = rig.shell.view().render_plain(W, 80);
+    assert!(
+        screen.iter().any(|l| {
+            let l = l.trim();
+            l.starts_with("drag ") && l.ends_with("select text")
+        }),
+        "{}",
+        screen.join("\n")
+    );
+    for gone in ["Fn/⌥-drag", "Terminal.app", "iTerm2", "wheel"] {
+        assert!(
+            !screen.iter().any(|l| l.contains(gone)),
+            "{gone}\n{}",
+            screen.join("\n")
+        );
+    }
+
+    let rows = |on: bool| -> Vec<String> {
+        HelpBlock::new()
+            .mouse_capture(on)
+            .render(80)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
+            .collect()
+    };
+    let (on, off) = (rows(true), rows(false));
+    assert_eq!(
+        on,
+        HelpBlock::new()
+            .render(80)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert!(on.iter().any(|r| r.contains("Fn/⌥-drag")), "{on:?}");
+    assert!(!off.iter().any(|r| r.contains("Fn/⌥-drag")), "{off:?}");
+    assert_eq!(keys(true), KEYS.to_vec());
+    assert_eq!(keys(false).last(), Some(&DRAG_KEY));
+    assert_eq!(keys(false).len(), KEYS.len());
+    snapshot("help-80", &on);
+    snapshot("help-80-mouse-off", &off);
 }
 
 fn snapshot(name: &str, rows: &[String]) {

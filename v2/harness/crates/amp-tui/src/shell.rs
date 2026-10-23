@@ -1179,9 +1179,9 @@ impl Shell {
                     return Submit::Quit;
                 }
             }
-            "help" | "?" => self
-                .view
-                .add_to_transcript(Arc::new(crate::slash::HelpBlock::new())),
+            "help" | "?" => self.view.add_to_transcript(Arc::new(
+                crate::slash::HelpBlock::new().mouse_capture(self.mouse_capture),
+            )),
             "usage" => self.view.add_notice(&self.usage_text()),
             "model" if arg.is_empty() => self.model_picker(),
             "model" => self.switch_model(arg).await,
