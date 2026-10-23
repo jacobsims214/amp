@@ -44,6 +44,10 @@ rmcp = { version = "=3.6.0", default-features = false, features = [
     "reqwest",
 ] }
 
+# Local date/time for the per-request clock stamp (#2250). Both already in the tree through rmcp.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+iana-time-zone = "0.1.65"
+
 clap = { version = "4.6", features = ["derive"] }
 # Raw-mode key reading for hidden secret entry in setup. Same version rpi-tui 0.8.0 uses.
 crossterm = { version = "0.27", default-features = false, features = ["events"] }

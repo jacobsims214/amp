@@ -806,6 +806,8 @@ fn amp_context(
     if let Some(extra) = extra.map(str::trim).filter(|e| !e.is_empty()) {
         lines.push(extra.to_owned());
     }
+    // #2250: what the per-request <current_time> stamp is. Fixed text, so the prompt stays cached.
+    lines.push(crate::request_time::CONTEXT_LINE.to_owned());
     lines.push("</amp_context>".to_owned());
     lines.join("\n")
 }
@@ -1155,8 +1157,9 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "<amp_context>\nrole: amp-manager\namp_server: http://localhost:8000/mcp\n{}\nproject_id: 2\nproject_name: AMP v2\nproject_marker: /repo/.amp.json\nworking_directory: /repo\nticket: #7\n</amp_context>",
-                web_ui_line(&compose)
+                "<amp_context>\nrole: amp-manager\namp_server: http://localhost:8000/mcp\n{}\nproject_id: 2\nproject_name: AMP v2\nproject_marker: /repo/.amp.json\nworking_directory: /repo\nticket: #7\n{}\n</amp_context>",
+                web_ui_line(&compose),
+                crate::request_time::CONTEXT_LINE
             )
         );
         assert!(

@@ -112,6 +112,8 @@ async fn the_chat_talks_to_the_manager() {
     }
     // #2188: proper plurals, no `(s)`.
     assert!(!screen.contains("(s)"), "{screen}");
+    // #2250: every request carries a clock stamp; the transcript never shows it.
+    assert!(!screen.contains("current_time"), "{screen}");
     assert_eq!(amp.mock.calls_to("amp_whoami"), vec![json!({})]);
 
     // The footer, two rows at 220 columns: cwd • role, then `ctx N%` … model • thinking.
