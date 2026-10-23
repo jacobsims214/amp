@@ -407,22 +407,19 @@ async fn tool_errors_and_timeouts() {
 #[cfg(unix)]
 #[tokio::test]
 async fn over_a_unix_socket() {
-    // Kept short: unix socket paths are limited to about 104 bytes.
+    // Unix socket paths are limited to about 104 bytes and target/ is deep, so the socket is
+    // named relative to the current directory (the crate), which keeps the address short.
     let dir = scratch("sock");
-    let path = dir.join("s");
-    let path = if path.as_os_str().len() < 100 {
-        path
-    } else {
-        eprintln!("skipped: scratch path too long for a unix socket");
-        return;
-    };
+    let path = relative_to_cwd(&dir.join("s"));
+    assert!(path.as_os_str().len() < 100, "{}", path.display());
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let app = common::router(TestServer::new(ServerKind::Dual), None);
     let task = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
     let client = http::connect(
-        &options("http://mcp.local/mcp").with_socket(&path),
+        // rmcp's server allows only localhost Host headers by default; no DNS happens anyway.
+        &options("http://localhost/mcp").with_socket(&path),
         &file_backend("sock-creds"),
     )
     .await
@@ -431,6 +428,29 @@ async fn over_a_unix_socket() {
     assert!(echo(&client).await.contains("world"));
     client.shutdown().await;
     task.abort();
+}
+
+/// `path` relative to the current directory (`..` up to the common ancestor).
+#[cfg(unix)]
+fn relative_to_cwd(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let (cwd, path) = (cwd.canonicalize().unwrap(), {
+        let parent = path.parent().unwrap().canonicalize().unwrap();
+        parent.join(path.file_name().unwrap())
+    });
+    let common = cwd
+        .components()
+        .zip(path.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut rel = PathBuf::new();
+    for _ in cwd.components().skip(common) {
+        rel.push("..");
+    }
+    for part in path.components().skip(common) {
+        rel.push(part);
+    }
+    rel
 }
 
 // ---------------------------------------------------------------------------------------------
