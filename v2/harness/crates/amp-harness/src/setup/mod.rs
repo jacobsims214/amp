@@ -439,25 +439,25 @@ async fn server_step(
         let settings = conn.settings()?;
         match connect_with_login(plan, ui, &settings).await {
             Ok(client) => {
-                if (ask || save_flag) && Some(&settings.url) != config.get("server", "url").as_ref()
-                {
-                    let mut entries = vec![("server", "url", settings.url.as_str())];
-                    let ca = plan
+                if ask || save_flag {
+                    // Saved as a named server, as `server set` does (#2212).
+                    let ca_text = plan
                         .conn
                         .ca_file
                         .as_ref()
                         .filter(|_| init)
-                        .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()));
-                    let ca_text = ca.as_ref().map(|p| p.display().to_string());
-                    if let Some(ca) = &ca_text {
-                        entries.push(("server", "ca_file", ca.as_str()));
+                        .map(|p| std::path::absolute(p).unwrap_or_else(|_| p.clone()))
+                        .map(|p| p.display().to_string());
+                    let saved = crate::server_cmd::save_chosen(config, &settings.url, ca_text)
+                        .map_err(CliError::new)?;
+                    if let Some(entry) = saved {
+                        ui.say(&format!(
+                            "Saved the server {} as `{}` in {}.",
+                            settings.url,
+                            entry.name,
+                            config.path.display()
+                        ));
                     }
-                    config.set(&entries).map_err(CliError::new)?;
-                    ui.say(&format!(
-                        "Saved the server {} to {}.",
-                        settings.url,
-                        config.path.display()
-                    ));
                 }
                 return Ok((client, settings, ask || save_flag));
             }
@@ -639,9 +639,7 @@ async fn web_step(
     server_chosen: bool,
 ) -> Result<Option<String>, CliError> {
     let save = |ui: &mut dyn Ui, url: &str| -> Result<(), CliError> {
-        config
-            .set(&[("server", "web_url", url)])
-            .map_err(CliError::new)?;
+        crate::server_cmd::save_web_url(config, url).map_err(CliError::new)?;
         ui.say(&format!("Web UI: {url} (saved as web_url)."));
         Ok(())
     };
