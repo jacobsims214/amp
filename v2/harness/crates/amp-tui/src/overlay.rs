@@ -689,7 +689,7 @@ fn ticket_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
         fields.push(format!("assigned {a}"));
     }
     if let Some(d) = t.dispatched_at.as_deref().filter(|d| !d.is_empty()) {
-        fields.push(format!("dispatched {d}"));
+        fields.push(format!("dispatched {}", since_text(d, SystemTime::now())));
     }
     rows.push(Row::new(vec![
         label("AMP     "),
@@ -754,6 +754,82 @@ fn elapsed(since: SystemTime) -> String {
         60..3600 => format!("{}m{:02}s", d / 60, d % 60),
         _ => format!("{}h{:02}m", d / 3600, (d % 3600) / 60),
     }
+}
+
+/// An AMP timestamp (RFC 3339, e.g. `2026-10-23T00:00:01.4477798Z`) as a relative time like the
+/// rest of the chrome: `just now`, `42s ago`, `3m ago`, `5h ago`, `2d ago` (#2213). A time in the
+/// future (clock skew) reads `just now`; one that doesn't parse is shown as AMP sent it.
+fn since_text(at: &str, now: SystemTime) -> String {
+    let Some(then) = parse_rfc3339(at) else {
+        return at.to_owned();
+    };
+    let d = now.duration_since(then).unwrap_or(Duration::ZERO).as_secs();
+    match d {
+        0..5 => "just now".to_owned(),
+        5..60 => format!("{d}s ago"),
+        60..3600 => format!("{}m ago", d / 60),
+        3600..86_400 => format!("{}h ago", d / 3600),
+        _ => format!("{}d ago", d / 86_400),
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`; `None` for anything else. No time crate in amp-tui
+/// for one field, so this is the civil-days arithmetic by hand.
+fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+    let b = s.as_bytes();
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let part = s.get(r)?;
+        (!part.is_empty() && part.bytes().all(|c| c.is_ascii_digit()))
+            .then(|| part.parse().ok())
+            .flatten()
+    };
+    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || !matches!(b[10], b'T' | b't' | b' ') {
+        return None;
+    }
+    if b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    let mut i = 19;
+    let mut nanos = 0u32;
+    if b[i] == b'.' {
+        let start = i + 1;
+        i = start;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == start {
+            return None;
+        }
+        let digits = &s[start..i.min(start + 9)];
+        nanos = digits.parse::<u32>().ok()? * 10u32.pow(9 - digits.len() as u32);
+    }
+    let offset = match s.get(i..)? {
+        "Z" | "z" => 0,
+        tz if tz.len() == 6
+            && matches!(tz.as_bytes()[0], b'+' | b'-')
+            && tz.as_bytes()[3] == b':' =>
+        {
+            let secs = num(i + 1..i + 3)? * 3600 + num(i + 4..i + 6)? * 60;
+            if tz.starts_with('-') { -secs } else { secs }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let yy = if mo <= 2 { y - 1 } else { y };
+    let era = yy.div_euclid(400);
+    let yoe = yy - era * 400;
+    let mp = (mo + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + h * 3600 + mi * 60 + sec - offset;
+    let secs = u64::try_from(secs).ok()?;
+    Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos))
 }
 
 fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
@@ -1403,6 +1479,46 @@ pub fn target_url(meta: &AmpMeta, target: &Target) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dispatched_times_read_relative() {
+        use super::{parse_rfc3339, since_text};
+        let at = |s: &str| parse_rfc3339(s).unwrap();
+        let now = at("2026-10-23T00:03:01Z");
+        assert_eq!(
+            at("1970-01-01T00:00:00Z"),
+            std::time::SystemTime::UNIX_EPOCH
+        );
+        assert_eq!(
+            at("2026-10-23T00:00:01.4477798Z")
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            1_792_713_601_447_779_800
+        );
+        assert_eq!(at("2026-10-23T02:00:01+02:00"), at("2026-10-23T00:00:01Z"));
+        assert_eq!(at("2026-10-22T19:00:01-05:00"), at("2026-10-23T00:00:01Z"));
+        assert_eq!(since_text("2026-10-23T00:00:00.4477798Z", now), "3m ago");
+        assert_eq!(since_text("2026-10-23T00:03:00Z", now), "just now");
+        assert_eq!(
+            since_text("2026-10-23T00:05:00Z", now),
+            "just now",
+            "future"
+        );
+        assert_eq!(since_text("2026-10-23T00:02:31Z", now), "30s ago");
+        assert_eq!(since_text("2026-10-22T19:03:01Z", now), "5h ago");
+        assert_eq!(since_text("2026-10-20T00:03:01Z", now), "3d ago");
+        for bad in [
+            "",
+            "yesterday",
+            "2026-10-23",
+            "2026-13-01T00:00:00Z",
+            "2026-10-23T00:00:00",
+            "2026-10-23T00:00:00.Z",
+        ] {
+            assert_eq!(since_text(bad, now), bad);
+        }
+    }
+
     use super::*;
 
     #[test]
