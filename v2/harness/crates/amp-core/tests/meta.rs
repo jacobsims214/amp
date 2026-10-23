@@ -71,6 +71,8 @@ struct Mock {
     unauthorized: Arc<AtomicBool>,
     /// HTTP requests seen, rejected ones included.
     requests: Arc<AtomicU64>,
+    /// The plan was approved (in the web UI): `amp_check_plan` reports nothing awaiting.
+    approved: Arc<AtomicBool>,
 }
 
 impl Mock {
@@ -82,6 +84,7 @@ impl Mock {
             delay_ms: Arc::default(),
             unauthorized: Arc::default(),
             requests: Arc::default(),
+            approved: Arc::default(),
         }
     }
 
@@ -226,7 +229,12 @@ impl ServerHandler for Mock {
                 ]}
             ]})),
             "amp_check_plan" => ok(json!({
-                "ok": true, "awaiting_approval": [2105, 2106],
+                "ok": true,
+                "awaiting_approval": if self.approved.load(Ordering::SeqCst) {
+                    json!([])
+                } else {
+                    json!([2105, 2106])
+                },
                 "require_plan_approval": board.require_plan_approval, "tasks": 40,
                 "open_tasks": 10, "dependencies": 30, "ready_now": [], "longest_chain": 5,
                 "issues": [], "human_gates": [], "summary": "GO"
@@ -309,6 +317,7 @@ fn fast(board_ms: u64) -> Intervals {
         board: Duration::from_millis(board_ms),
         ticket: Duration::from_millis(board_ms),
         plan: Duration::from_millis(board_ms),
+        plan_pending: Duration::from_millis(board_ms),
         artifacts: Duration::from_millis(board_ms),
         idle_ping: Duration::from_secs(3600),
         call_timeout: Duration::from_secs(5),
@@ -434,6 +443,49 @@ async fn loads_every_item_on_start_and_polls_on_the_intervals() {
     assert_eq!(server.mock.count("amp_get_project"), 1);
     assert_eq!(server.mock.count("amp_get_plan"), 1);
     assert!(meta.snapshot().revision > m.revision);
+}
+
+/// #2209: approving in the web UI clears the "waiting for your approval" chip on the fast
+/// `plan_pending` poll, not the 60 s plan poll; once nothing is pending the plan poll slows down.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_in_the_web_ui_clears_the_pending_plan_on_the_fast_poll() {
+    let server = serve(Mock::new(default_board())).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_id: Some(2),
+            ticket_id: None,
+            intervals: Intervals {
+                plan: Duration::from_secs(60),
+                plan_pending: Duration::from_millis(150),
+                ..fast(150)
+            },
+            connector: None,
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "the plan waiting for approval", |m| m.plan_pending()).await;
+    // While pending, the plan is polled on the fast interval, not the 60 s one.
+    wait_calls(&server.mock, "a fast plan poll", |m| {
+        m.count("amp_check_plan") >= 3
+    })
+    .await;
+
+    // A person approves in the web UI; nothing tells the harness.
+    server.mock.approved.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let m = wait_for(&meta, "the chip to clear", |m| !m.plan_pending()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cleared after {:?}",
+        started.elapsed()
+    );
+    assert!(m.plan.get().unwrap().awaiting_approval.is_empty());
+
+    // Nothing pending: back on the 60 s plan poll.
+    let before = server.mock.count("amp_check_plan");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(server.mock.count("amp_check_plan"), before);
 }
 
 #[tokio::test(flavor = "multi_thread")]
