@@ -48,6 +48,10 @@
 //!   MCP client, never the model; polled on #2078 §2's intervals and refreshed right after any
 //!   `amp_*` tool call; the TUI reads one shared [`meta::AmpMeta`] snapshot.
 //!
+//! #2225:
+//! - [`repeat`]: the repeat guard. A model that makes the same tool call (same name, same
+//!   arguments) again and again is nudged, then stopped, for every role.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -63,6 +67,7 @@ pub mod policy;
 pub mod project;
 pub mod provider_error;
 pub mod providers;
+pub mod repeat;
 pub mod roles;
 pub mod run_report;
 pub mod supervisor;

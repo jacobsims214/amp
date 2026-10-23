@@ -463,6 +463,7 @@ impl Runtime {
             }
         };
 
+        let repeat = crate::repeat::RepeatGuard::default();
         let options = AgentHarnessOptions {
             model: resolved.model.clone(),
             thinking_level: resolved.thinking,
@@ -485,15 +486,20 @@ impl Runtime {
             // The manager (#2171): the approval guard before the policy (once AMP refused a step
             // that needs a person, every further call ends the turn, denied or not); a refusal
             // ends its turn. Workers report a refusal in their final message.
-            before_tool_call: Some(if role.primary {
+            // Every role (#2225): the repeat guard first, so a model stuck on one call (even one
+            // the policy denies each time) is stopped; it nudges the model in the result first.
+            before_tool_call: Some(repeat.before_tool_call_then(Some(if role.primary {
                 let guard = Arc::new(crate::approval::ManagerGuard);
                 guard.before_tool_call_then(Some(
                     policy.before_tool_call_then(spec.before_tool_call),
                 ))
             } else {
                 policy.before_tool_call_then(spec.before_tool_call)
-            }),
-            after_tool_call: role.primary.then(crate::approval::end_turn_on_refusal),
+            }))),
+            after_tool_call: Some(
+                repeat
+                    .after_tool_call_then(role.primary.then(crate::approval::end_turn_on_refusal)),
+            ),
             ..Default::default()
         };
         let harness = AgentHarness::create(options)

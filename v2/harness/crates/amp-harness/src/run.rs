@@ -11,6 +11,9 @@
 //!   `tool_end`, `retry`, `turn_end`), then `result` (outcome, final text, usage totals). Fields
 //!   may be added, never renamed or removed.
 //! - Exit 0 when the run completed, 1 when it failed or was aborted (Ctrl-C aborts the run).
+//! - #2225: a model that keeps repeating one tool call is stopped by the repeat guard
+//!   ([`amp_core::repeat`]): the outcome is `stopped`, it exits 1, and its one stderr line says
+//!   so.
 //! - `--print-system-prompt` builds the session and prints the system prompt as the model would
 //!   receive it, without calling a model.
 //!
@@ -240,9 +243,20 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let mut printed_text = false;
     // Text mode printed the model's error already: the exit message doesn't repeat it (#2207).
     let mut printed_model_error = false;
+    // #2225: the repeat guard stopped the run.
+    let mut repeat_stop: Option<amp_core::repeat::RepeatStop> = None;
     let mut handle = |event: rpi_agent::AgentEvent, totals: &mut Totals| {
         if let Some(e) = RunEvent::from_agent(&event) {
             totals.observe(&e);
+            if let RunEvent::ToolEnd {
+                is_error: true,
+                text,
+                ..
+            } = &e
+                && let Some(stop) = amp_core::repeat::stopped(text)
+            {
+                repeat_stop = Some(stop);
+            }
             if !args.json && matches!(e, RunEvent::Assistant { error: Some(_), .. }) {
                 printed_model_error = true;
             }
@@ -319,6 +333,10 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         },
         Err(e) => ("failed", String::new(), Some(format!("{e}"))),
     };
+    let (outcome, error) = match (&repeat_stop, outcome) {
+        (Some(stop), "completed") => ("stopped", Some(stop.reason())),
+        _ => (outcome, error),
+    };
     let text = if text.is_empty() {
         totals.last_text.clone()
     } else {
@@ -348,6 +366,10 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
 
     match outcome {
         "completed" => Ok(()),
+        // The one stderr line (main prints it as `amp-harness: ...`).
+        "stopped" if let Some(stop) = &repeat_stop => Err(CliError::new(
+            stop.user_line("set another model for the role in config.toml"),
+        )),
         "failed" if printed_model_error => Err(CliError::new("run failed (the model error above)")),
         _ => Err(CliError::new(format!(
             "run {outcome}: {}",
