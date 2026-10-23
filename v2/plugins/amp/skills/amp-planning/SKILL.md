@@ -263,8 +263,9 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
 - **A question that comes up mid-work.** A worker blocks its own ticket with the question
   (`amp_block_task`), and you answer it. Human tickets are steps you can see at plan time.
 - **Approving a mockup.** That's the design ticket's artifact review.
-- **Approving the plan.** A person does that in AMP's web UI (Flight plan, "Approve plan"). It
-  isn't a ticket, and no agent can do it.
+- **Approving the plan.** Each person approves their own tickets in AMP's web UI (Flight plan,
+  "Approve plan"); a lead may approve on someone's behalf. It isn't a ticket, and no agent can do
+  it.
 - **Anything an agent can do with the tools it has.** Don't hand agents' work to people. If an
   agent could do it but lacks a tool or access, say so in the plan; that gap is worth knowing.
 
@@ -592,38 +593,45 @@ plausible-looking.
 ## ⛔ Stop after presenting — a person approves in the web UI
 
 **You never approve a plan.** Only a person can, in AMP's web UI: the project's Flight plan page,
-"Approve plan". There is no tool for it. `amp_approve_plan` always refuses (it only reports the
+"Approve plan". Approval is per ticket: each person approves **their own** tickets, and a project
+lead (or owner, admin) may approve someone else's on their behalf. There is no tool for it. `amp_approve_plan` always refuses (it only reports the
 approval status and the link), and so does anything else that tries to approve over MCP, whatever
 the user says in chat. Don't call it.
 
 After presenting the plan:
 
 1. Run `amp_check_plan(project_id)` one last time. When tickets await approval it returns
-   `awaiting_approval` and **`approve_url`**, the Flight plan link. That's where you stop.
-2. Hand off, in plain words, with the link:
-   "The plan is on the board. Approve it in AMP when you're happy with it: <approve_url>. I'll
-   dispatch once it's approved."
+   `awaiting_approval` (everyone's), `awaiting_approval_tickets` (`{task_id, owner_user_id,
+   yours}`), `awaiting_yours` (your user's own) and **`approve_url`**, the Flight plan link.
+   That's where you stop.
+2. Hand off, in plain words, with the link, naming **their** tickets:
+   "The plan is on the board. #12, #14 and #15 are yours to approve in AMP when you're happy
+   with them: <approve_url>. I'll dispatch each once it's approved."
+   If some awaiting tickets belong to others, say so: "#16 is Sam's; it waits for Sam (or a lead
+   on Sam's behalf)." Don't ask your user to approve others' tickets unless they're a lead and
+   choose to.
 3. **Stop and wait.** Don't dispatch, claim, complete, or start anything in the meantime.
 
 Changes requested → update the plan → present again → hand off the link again → wait again.
 
 **Chat isn't approval.** "yes", "go", "looks good", "ship it", "do it", "sounds right" and the
 like don't approve anything, and you never treat ambiguous words as approval. When the user says
-something like that, check `amp_check_plan`: if `awaiting_approval` is empty, a person approved in
-the UI and you can dispatch; if it isn't, reply with the `approve_url` and say the plan still
-needs their click there.
+something like that, check `amp_check_plan`: tickets no longer in `awaiting_approval` were
+approved in the UI and you can dispatch them; if `awaiting_yours` isn't empty, reply with the
+`approve_url` and say which of their tickets still need their click there.
 
 Each new planning run (and fix tickets you add, and any ticket whose name, description or
-acceptance criteria you change) needs approving again when the project requires it. If a dispatch
-is refused with "planned after the plan was last approved … A person approves it in the AMP web
-UI (Approve plan): <link>", present what's new, give the user that link, and stop.
+acceptance criteria you change) needs approving again, by its owner, when the project requires
+it. If a dispatch is refused with "ticket N isn't approved … Its owner approves it in the AMP web
+UI (Approve plan; a project lead may approve it on their behalf): <link>", present what's new,
+give the user that link (saying whose ticket it is), and stop.
 
 ---
 
 ## Dispatch — only after approval
 
-Dispatch only once a person has approved in the UI: `amp_check_plan`'s `awaiting_approval` is
-empty (or the project doesn't require approval). Never complete or move forward a ticket that
+Dispatch a ticket only once it's approved in the UI (by its owner, or a lead on their behalf): it
+isn't in `amp_check_plan`'s `awaiting_approval` (or the project doesn't require approval). Never complete or move forward a ticket that
 wasn't dispatched: AMP refuses it ("never dispatched … Dispatch it first"), and the fix is to
 dispatch it, not to find another path.
 

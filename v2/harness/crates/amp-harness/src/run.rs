@@ -104,9 +104,16 @@ fn preview(text: &str, max: usize) -> String {
 /// The text-mode line for a refusal that needs a person in the AMP web UI (#2171).
 fn refusal_line(r: &amp_core::approval::Refusal) -> String {
     use amp_core::approval::RefusalKind;
-    let what = match r.kind {
-        RefusalKind::PlanApproval => "waiting for your approval: approve the plan in AMP",
-        RefusalKind::PersonInUi => "waiting for you in the AMP web UI",
+    let what = match (r.kind, r.ticket_id) {
+        // #2198: per-ticket approval; its owner approves it (or a project lead on their behalf).
+        (RefusalKind::PlanApproval, Some(t)) if r.per_ticket => format!(
+            "waiting for #{t}'s owner to approve it in AMP (you, if it's yours; or a project lead \
+             on their behalf)"
+        ),
+        (RefusalKind::PlanApproval, _) => {
+            "waiting for your approval: approve the plan in AMP".to_owned()
+        }
+        (RefusalKind::PersonInUi, _) => "waiting for you in the AMP web UI".to_owned(),
     };
     match &r.link {
         Some(link) => format!("[{what}] {link} (the manager stopped here)"),
@@ -371,6 +378,20 @@ mod tests {
             refusal_line(&r),
             "[waiting for your approval: approve the plan in AMP] /project/50/plan (the manager \
              stopped here)"
+        );
+        // #2198: per-ticket approval names whose approval it waits for.
+        let r = amp_core::approval::refusal(
+            "tool error: amp_dispatch_task: ticket 2203 isn't approved: nobody has approved it \
+             since it was planned or its scope last changed, and this project needs each ticket \
+             approved before agents start it. Its owner approves it in the AMP web UI (Approve \
+             plan; a project lead may approve it on their behalf): /project/2/plan. Agents can't \
+             approve.",
+        )
+        .unwrap();
+        assert_eq!(
+            refusal_line(&r),
+            "[waiting for #2203's owner to approve it in AMP (you, if it's yours; or a project \
+             lead on their behalf)] /project/2/plan (the manager stopped here)"
         );
     }
 }

@@ -737,9 +737,10 @@ impl fmt::Display for Denial {
                 f,
                 "{who}: `{}` {} is a person's step, in the AMP web UI (approving the plan, \
                  plan approval and reassignment settings); no agent takes it. For approval, run \
-                 amp_check_plan: give your user its approve_url, say \"Approve the plan in \
-                 AMP\", and stop until awaiting_approval is empty. For a setting, tell your user \
-                 what to change in the project's settings.",
+                 amp_check_plan: give your user its approve_url, tell them how many of their \
+                 own tickets await approval (awaiting_yours; others' tickets wait for their \
+                 owners, or a project lead on their behalf), and stop until they've approved \
+                 them. For a setting, tell your user what to change in the project's settings.",
                 self.tool, self.subject
             ),
             DenialReason::Substitution => write!(

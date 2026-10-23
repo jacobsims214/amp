@@ -588,6 +588,21 @@ transcript shows, under the refused call:
 
 and the manager's turn ends: it doesn't retry another way. Approve in the web UI, then reply.
 
+**Per-ticket approval (#2198, #2201).** On servers that approve each ticket (its owner approves it;
+a project lead may approve it on their behalf), `amp_check_plan` says whose each awaiting ticket
+is. The status line then says `plan: N of yours waiting for your approval`, and others' tickets get
+a quieter `M others' waiting for their owners` (dropped first on a narrow line). `/plan` shows an
+`approval` row for yours and an `others'` row for theirs, both linking the Flight plan page. A
+dispatch refusal names whose approval it waits for:
+
+```text
+  ⏸ Waiting for your approval: #2203 is yours
+  ⏸ Waiting for its owner's approval: #2204 is someone else's (a project lead may approve it on their behalf)
+```
+
+(`⏸ Waiting for #N's owner to approve it …` when the ticket isn't in the last plan check). Older
+servers, without `awaiting_approval_tickets`, keep the words above: one approval covers the plan.
+
 The manager's tool policy adds (all roles for the first two):
 
 - `amp_approve_plan` is always denied, with a visible error pointing at `amp_check_plan`'s

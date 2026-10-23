@@ -513,3 +513,67 @@ fn the_header_keeps_the_dot_and_connected_longest() {
     let line = plain(&render_header(&data, &p, 50)[0]);
     assert!(line.contains("AMP #2") && !line.contains('@'), "{line}");
 }
+
+/// #2201: per-ticket approval (#2198). The chip counts the person's own tickets; others' are a
+/// quieter segment, dropped before the workers count. Old servers keep "N waiting for your
+/// approval" (the sample data has no per-ticket list; see plain_layout_at_80_and_160).
+#[test]
+fn plan_chip_counts_yours_apart_from_others() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let with = |yours: &[i64], others: &[i64]| {
+        let mut meta = sample::meta(true);
+        let plan = meta.plan.value.as_mut().unwrap();
+        plan.awaiting_approval = yours.iter().chain(others).copied().collect();
+        plan.tickets = Some(
+            yours
+                .iter()
+                .map(|&id| (id, true))
+                .chain(others.iter().map(|&id| (id, false)))
+                .map(|(task_id, yours)| amp_core::meta::AwaitingTicket {
+                    task_id,
+                    owner_user_id: Some(if yours { 7 } else { 9 }),
+                    yours,
+                })
+                .collect(),
+        );
+        ChromeData::new(meta)
+    };
+    let status = |d: &ChromeData, w| plain(&render_status(d, &palette(), w)[0]);
+
+    let both = with(&[2108, 2109], &[2203]);
+    let wide = status(&both, 200);
+    assert!(
+        wide.contains(
+            "│ plan: 2 of yours waiting for your approval │ 1 others' waiting for their owners │"
+        ),
+        "{wide}"
+    );
+    // Narrow: others' go first; the person's own chip stays.
+    assert_eq!(
+        status(&both, 80),
+        "■  2 QUESTIONS  │ workers 0 │ plan: 2 of yours waiting for your approval"
+    );
+    // Both link the Flight plan page.
+    let raw = render_status(&both, &palette(), 200)[0].clone();
+    assert_eq!(
+        raw.matches("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07")
+            .count(),
+        2,
+        "{}",
+        visible(&raw)
+    );
+
+    let only_others = status(&with(&[], &[2203]), 200);
+    assert!(
+        only_others.contains("│ plan: 1 others' waiting for their owners' approval │"),
+        "{only_others}"
+    );
+    assert!(!only_others.contains("your approval"), "{only_others}");
+
+    let only_yours = status(&with(&[2108], &[]), 200);
+    assert!(
+        only_yours.contains("│ plan: 1 of yours waiting for your approval │"),
+        "{only_yours}"
+    );
+    assert!(!only_yours.contains("others'"), "{only_yours}");
+}

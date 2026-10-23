@@ -31,7 +31,7 @@ Covers: creating a new project, scanning the codebase, seeding the knowledge bas
 
 **amp-planning**
 Use when planning and dispatching work for an existing project.
-Covers: the full planning protocol, task hierarchy, DAG dependencies, dispatch, and the approval gate: a person approves the plan in AMP's web UI (agents never approve), so after planning you give them the `approve_url` and wait.
+Covers: the full planning protocol, task hierarchy, DAG dependencies, dispatch, and the approval gate: approval is per ticket, each person approves their own tickets in AMP's web UI (a lead may approve on someone's behalf; agents never approve), so after planning you tell them which of their tickets await approval, give them the `approve_url` and wait.
 
 **amp-execution**
 Use when executing an assigned task as a worker agent.
