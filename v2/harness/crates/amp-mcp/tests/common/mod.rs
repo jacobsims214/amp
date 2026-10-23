@@ -1,6 +1,8 @@
 //! In-process MCP servers for the amp-mcp tests: rmcp's own Streamable HTTP server under axum.
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+pub mod legacy_sse;
+
 use std::{
     borrow::Cow,
     sync::{

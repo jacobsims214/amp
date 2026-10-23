@@ -6,6 +6,11 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
+/// amp-mcp's mock legacy HTTP+SSE server (#2238).
+#[allow(dead_code, reason = "shared with amp-mcp's tests")]
+#[path = "../../amp-mcp/tests/common/legacy_sse.rs"]
+mod legacy_sse;
+
 use amp_core::{
     mcp_config::{ExpandContext, McpConfig, Resolved, header_account},
     mcp_http::http_options,
@@ -135,7 +140,7 @@ fn resolve(
         config_dir: None,
     };
     match server.resolve(&ctx).unwrap() {
-        Resolved::Http(remote) => (server, remote),
+        Resolved::Http(remote) | Resolved::Sse(remote) => (server, remote),
         other => panic!("{other:?}"),
     }
 }
@@ -262,4 +267,74 @@ async fn secret_headers_come_from_the_keychain() {
         http_options(&server_cfg, &remote, Some(&service), &|_: &str| None).expect("options");
     assert!(!format!("{options:?}").contains(MARK));
     assert_eq!(ping(&options, &scratch_backend("keychain")).await, "pong");
+}
+
+#[tokio::test]
+async fn sse_servers_connect_explicitly_and_by_fallback() {
+    // #2238: a legacy HTTP+SSE server at /sse, behind a bearer.
+    let state = legacy_sse::LegacyState::new();
+    let token = format!("{MARK}-sse");
+    let required = Arc::new(format!("Bearer {token}"));
+    let app = legacy_sse::router(state.clone(), "/sse").layer(middleware::from_fn(
+        move |req: Request, next: Next| {
+            let required = required.clone();
+            async move {
+                let ok = req
+                    .headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    == Some(required.as_str());
+                if ok {
+                    next.run(req).await
+                } else {
+                    (StatusCode::UNAUTHORIZED, "no").into_response()
+                }
+            }
+        },
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/sse", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let _server = Server {
+        url: url.clone(),
+        task,
+    };
+    let env = {
+        let token = token.clone();
+        move |k: &str| (k == "SSE_TOKEN").then(|| token.clone())
+    };
+    let connect = |body: String| {
+        let env = env.clone();
+        async move {
+            let (server_cfg, remote) = resolve(&body, &env);
+            let options = http_options(&server_cfg, &remote, None, &env).expect("options");
+            assert!(!format!("{options:?}").contains(MARK));
+            http::connect(&options, &scratch_backend("sse")).await
+        }
+    };
+    let common = format!("url = \"{url}\"\nbearer_env = \"SSE_TOKEN\"\nstartup_timeout_secs = 10");
+
+    // type = "sse", and type = "http" falling back to it.
+    for body in [
+        format!("type = \"sse\"\n{common}"),
+        format!("type = \"http\"\n{common}"),
+    ] {
+        let client = connect(body).await.expect("connect");
+        assert_eq!(client.info().transport, "sse");
+        assert_eq!(client.info().protocol_version.as_str(), "2024-11-05");
+        assert_eq!(client.info().auth, "bearer (env SSE_TOKEN)");
+        assert_eq!(client.list_tools().await.unwrap()[0].name, "echo");
+        client.shutdown().await;
+    }
+    assert_eq!(state.gets.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    // fallback_sse = false: the Streamable HTTP refusal stands.
+    let err = connect(format!("type = \"http\"\nfallback_sse = false\n{common}"))
+        .await
+        .expect_err("no fallback");
+    assert!(http::wants_sse_fallback(&err), "{err}");
+    assert!(!err.to_string().contains(MARK));
+    assert_eq!(state.gets.load(std::sync::atomic::Ordering::SeqCst), 2);
 }
