@@ -18,8 +18,8 @@ use std::{path::PathBuf, time::Duration};
 use oauth2::TokenResponse as _;
 
 use rmcp::transport::auth::{
-    AuthClient, AuthError, AuthorizationManager, AuthorizationMetadataSource, AuthorizationRequest,
-    AuthorizationSession, OAuthTokenResponse,
+    AuthClient, AuthError, AuthorizationManager, AuthorizationMetadata,
+    AuthorizationMetadataSource, AuthorizationRequest, AuthorizationSession, OAuthTokenResponse,
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -29,6 +29,7 @@ use tokio::{
 use crate::{
     AmpMcpClient, Auth, ClientOptions, CredentialBackend, McpError,
     credentials::credential_key,
+    external::Secret,
     http::{DEFAULT_OAUTH_REQUEST_TIMEOUT, build_http_client, build_oauth_http_client},
 };
 
@@ -51,6 +52,40 @@ pub struct LoginOptions {
     /// Upper bound on each HTTP request of the flow (the 401 probe, discovery, client
     /// registration, token exchange).
     pub request_timeout: Duration,
+    /// A pre-registered client, scopes, a fixed callback port or a metadata URL (`[mcp.<name>]
+    /// oauth = {..}`). The default (AMP's case) registers dynamically and lets rmcp pick scopes.
+    pub client: OAuthClientSettings,
+}
+
+/// OAuth settings beyond discovery + dynamic registration, for third-party servers (D2).
+#[derive(Clone, Default)]
+pub struct OAuthClientSettings {
+    /// A client registered out of band: no dynamic registration.
+    pub client_id: Option<String>,
+    /// That client's secret (a confidential client), from the keychain. Needs `client_id`.
+    pub client_secret: Option<Secret>,
+    /// Scopes to request; empty lets rmcp choose from the server's metadata and challenge.
+    pub scopes: Vec<String>,
+    /// The loopback redirect port; 0 picks a free one. A pre-registered client usually needs a
+    /// fixed one, since its redirect URI is registered.
+    pub callback_port: u16,
+    /// Authorization server metadata (RFC 8414) to use instead of discovery.
+    pub auth_server_metadata_url: Option<String>,
+}
+
+impl std::fmt::Debug for OAuthClientSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthClientSettings")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field("scopes", &self.scopes)
+            .field("callback_port", &self.callback_port)
+            .field("auth_server_metadata_url", &self.auth_server_metadata_url)
+            .finish()
+    }
 }
 
 impl LoginOptions {
@@ -62,7 +97,13 @@ impl LoginOptions {
             client_name: DEFAULT_CLIENT_NAME.to_owned(),
             timeout: DEFAULT_LOGIN_TIMEOUT,
             request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
+            client: OAuthClientSettings::default(),
         }
+    }
+
+    pub fn with_client(mut self, client: OAuthClientSettings) -> Self {
+        self.client = client;
+        self
     }
 
     pub fn with_ca_file(mut self, ca_file: Option<PathBuf>) -> Self {
@@ -129,11 +170,36 @@ where
         Err(McpError::AuthRequired { challenge }) => challenge,
         Err(e) => return Err(e),
     };
+    login_from_challenge(&options, challenge, prompt).await
+}
 
-    // 2. Loopback redirect listener on a random port (RFC 8252 §7.3).
-    let listener = TcpListener::bind(("127.0.0.1", 0))
+/// Steps 2-5 of [`login`], after a probe got the server's 401 (`challenge` is its
+/// `WWW-Authenticate` header, if any). [`crate::external::http::login`] probes a third-party
+/// server its own way (with its headers) and continues here.
+pub(crate) async fn login_from_challenge<F>(
+    options: &LoginOptions,
+    challenge: Option<String>,
+    prompt: F,
+) -> Result<LoginOutcome, McpError>
+where
+    F: FnOnce(&LoginPrompt),
+{
+    let client = &options.client;
+    if client.client_secret.is_some() && client.client_id.is_none() {
+        return Err(McpError::Config(
+            "an OAuth client secret needs a client_id".to_owned(),
+        ));
+    }
+
+    // 2. Loopback redirect listener (RFC 8252 §7.3), on a random port unless one is configured.
+    let listener = TcpListener::bind(("127.0.0.1", client.callback_port))
         .await
-        .map_err(|e| McpError::OAuth(format!("bind the loopback redirect listener: {e}")))?;
+        .map_err(|e| {
+            McpError::OAuth(format!(
+                "bind the loopback redirect listener on 127.0.0.1:{}: {e}",
+                client.callback_port
+            ))
+        })?;
     let port = listener
         .local_addr()
         .map_err(|e| McpError::OAuth(format!("loopback listener: {e}")))?
@@ -149,19 +215,38 @@ where
     )
     .await?;
     manager.set_credential_store(store.clone());
-    let resolution = manager
-        .resolve_metadata_from_challenge(challenge.as_deref())
-        .await
-        .map_err(oauth_error)?;
-    if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
-        return Err(McpError::OAuth(format!(
-            "{} publishes no OAuth metadata (RFC 9728 / RFC 8414); use AMP_TOKEN instead",
-            options.url
-        )));
+    if let Some(metadata_url) = &client.auth_server_metadata_url {
+        let metadata = fetch_metadata(
+            metadata_url,
+            options.ca_file.as_deref(),
+            options.request_timeout,
+        )
+        .await?;
+        manager.set_metadata(metadata);
+    } else {
+        let resolution = manager
+            .resolve_metadata_from_challenge(challenge.as_deref())
+            .await
+            .map_err(oauth_error)?;
+        if resolution.source == AuthorizationMetadataSource::LegacyEndpointFallback {
+            return Err(McpError::OAuth(format!(
+                "{} publishes no OAuth metadata (RFC 9728 / RFC 8414); use AMP_TOKEN instead                  (for an [mcp] server: bearer_env, secret_headers or oauth.auth_server_metadata_url)",
+                options.url
+            )));
+        }
+        manager.set_metadata(resolution.metadata);
     }
-    manager.set_metadata(resolution.metadata);
-    let request = AuthorizationRequest::new(redirect_uri.clone())
+    let mut request = AuthorizationRequest::new(redirect_uri.clone())
         .with_client_name(options.client_name.clone());
+    if let Some(client_id) = &client.client_id {
+        request = request.with_preregistered_client(client_id.clone());
+    }
+    if let Some(secret) = &client.client_secret {
+        request = request.with_client_secret(secret.expose().to_owned());
+    }
+    if !client.scopes.is_empty() {
+        request = request.with_scopes(client.scopes.iter().cloned());
+    }
     let session = AuthorizationSession::new(manager, request)
         .await
         .map_err(|(_, e)| oauth_error(e))?;
@@ -197,7 +282,36 @@ where
         .map_err(oauth_error)?;
     let (client_id, _) = session.get_credentials().await.map_err(oauth_error)?;
 
-    Ok(outcome(&options, client_id, &token))
+    Ok(outcome(options, client_id, &token))
+}
+
+/// Reads RFC 8414 authorization server metadata from `url` (`oauth.auth_server_metadata_url`),
+/// with the OAuth client's roots, redirect policy and timeouts.
+pub(crate) async fn fetch_metadata(
+    url: &str,
+    ca_file: Option<&std::path::Path>,
+    request_timeout: Duration,
+) -> Result<AuthorizationMetadata, McpError> {
+    let http = build_oauth_http_client(ca_file, request_timeout)?;
+    let fail = |reason: String| {
+        McpError::OAuth(format!(
+            "authorization server metadata at {}: {reason}",
+            crate::url_origin(url)
+        ))
+    };
+    let response = http
+        .get(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|e| fail(e.without_url().to_string()))?;
+    if !response.status().is_success() {
+        return Err(fail(format!("HTTP {}", response.status())));
+    }
+    response
+        .json::<AuthorizationMetadata>()
+        .await
+        .map_err(|e| fail(format!("not OAuth metadata: {}", e.without_url())))
 }
 
 fn outcome(options: &LoginOptions, client_id: String, token: &OAuthTokenResponse) -> LoginOutcome {
@@ -275,7 +389,7 @@ pub async fn connect(
     Ok(client)
 }
 
-async fn new_manager(
+pub(crate) async fn new_manager(
     url: &str,
     ca_file: Option<&std::path::Path>,
     request_timeout: Duration,
