@@ -32,7 +32,8 @@ chrono.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 # The in-process mock AMP: rmcp's server side + Streamable HTTP server transport.
-rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+# transport-io: tests/mcp_hub.rs runs its own binary as a stdio MCP server (#2239).
+rmcp = { workspace = true, features = ["server", "transport-streamable-http-server", "transport-io"] }
 serde_json.workspace = true
 # tests/supervisor.rs: faux steps and cancellation tokens.
 rpi-ai.workspace = true
@@ -46,6 +47,11 @@ tokio-rustls.workspace = true
 # tests/setup_ctrl_c.rs: a real pty for the setup prompts (#2227). Same version and features amp-tui uses.
 [target.'cfg(unix)'.dev-dependencies]
 nix = { version = "0.29", default-features = false, features = ["term"] }
+
+# tests/mcp_hub.rs re-runs its own binary as the stdio MCP server, so it owns main() (#2239).
+[[test]]
+name = "mcp_hub"
+harness = false
 
 [lints]
 workspace = true

@@ -24,6 +24,11 @@
 //!   5. `<project_context>`: `AGENTS.md`/`CLAUDE.md` files, pi-style (the user's global one in
 //!      the harness config dir, then the working directory and its ancestors, deepest last);
 //!   6. `<available_skills>`: every skill by name, description and path, appended by rpi.
+//! - **External MCP servers (#2239):** every `[mcp.<name>]` server's tools as
+//!   `mcp__<server>__<tool>` next to AMP's, and each server's instructions as
+//!   `<mcp_server_instructions>` before `<amp_context>`, from the process-wide
+//!   [`crate::mcp_hub::McpHub`]. The session is attached to the hub, which keeps both in step as
+//!   servers connect, restart or change their tools.
 //! - **Session:** in memory, or a JSONL file under the state directory.
 //! - **Bash environment:** the process environment minus the harness's own secrets (#2142):
 //!   `AMP_TOKEN`, the `--token-env` variable and every provider's `key_env`. A worker that runs
@@ -66,6 +71,7 @@ use rpi_tools::{
 use crate::{
     assets::{AssetError, Assets, OverrideDirs},
     faux::{FauxScriptError, ScriptFile},
+    mcp_hub::{HubOptions, McpHub, WorktreeSet, with_mcp_instructions},
     mcp_tools,
     models::{ModelsConfig, ModelsError, ResolvedRole},
     policy::ToolPolicy,
@@ -145,6 +151,9 @@ pub struct Runtime {
     /// The bash tool's default timeout in seconds, when the model passes none (#2143). `None`:
     /// no default (`bash_timeout_secs = 0`).
     pub bash_timeout: Option<f64>,
+    /// Every configured external MCP server (#2239). Built here, started by whoever runs sessions
+    /// ([`McpHub::start`]); shut it down before the process exits ([`McpHub::shutdown`]).
+    pub mcp_hub: Arc<McpHub>,
 }
 
 /// The bash tool's default timeout when nothing configures one.
@@ -168,6 +177,8 @@ struct HarnessConfigFile {
 struct ToolsSection {
     /// The bash tool's default timeout in seconds; 0 = none.
     bash_timeout_secs: Option<f64>,
+    /// The output cap for MCP servers that keep the default `max_output_tokens` (#2239).
+    mcp_max_output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -195,6 +206,30 @@ pub fn check_harness_tables(text: &str) -> Result<(), String> {
     toml::from_str::<HarnessConfigFile>(text)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// The default MCP output cap: [`crate::mcp_hub::ENV_MAX_OUTPUT_TOKENS`], else `[tools]
+/// mcp_max_output_tokens`, else `None` (each server's own, 25 000 by default). Zero or a
+/// non-number is an error naming its source.
+pub fn mcp_max_output_from(
+    config: Option<u64>,
+    env: Option<&str>,
+) -> Result<Option<u64>, AgentError> {
+    use crate::mcp_hub::ENV_MAX_OUTPUT_TOKENS;
+    match env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) if n > 0 => Ok(Some(n)),
+            _ => Err(AgentError::Io(format!(
+                "{ENV_MAX_OUTPUT_TOKENS}: must be a whole number of tokens above 0, got {v:?}"
+            ))),
+        },
+        None => match config {
+            Some(0) => Err(AgentError::Io(
+                "config.toml [tools] mcp_max_output_tokens: must be above 0".to_owned(),
+            )),
+            other => Ok(other),
+        },
+    }
 }
 
 /// `[secrets] pass_to_bash`, trimmed, empty names dropped.
@@ -354,11 +389,25 @@ impl Runtime {
         )?;
         // #2233: every variable an MCP server reads a secret from is hidden from bash too. A
         // broken [mcp] table is not fatal here; the MCP hub reports it.
-        let secret_env = secret_env_names(&models)
+        let mcp_config = crate::mcp_config::McpConfig::load(&paths);
+        let secret_env: BTreeSet<String> = secret_env_names(&models)
             .into_iter()
-            .chain(crate::mcp_config::McpConfig::load(&paths).secret_env_names())
+            .chain(mcp_config.secret_env_names())
             .filter(|n| !pass_env.contains(n))
             .collect();
+        // #2239: the hub (not started yet). Stdio servers start in the repo root by default.
+        let default_cwd = opts
+            .repo_root
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| state_dir.clone());
+        let mut hub_options = HubOptions::new(paths.clone(), state_dir.clone(), default_cwd);
+        hub_options.default_max_output_tokens = mcp_max_output_from(
+            file.tools.mcp_max_output_tokens,
+            (opts.env)(crate::mcp_hub::ENV_MAX_OUTPUT_TOKENS).as_deref(),
+        )?;
+        let mcp_hub = McpHub::new(mcp_config, hub_options);
+        mcp_hub.set_strip(crate::mcp_stdio::strip_set(&secret_env, &pass_env));
         Ok(Self {
             assets,
             roles,
@@ -377,6 +426,7 @@ impl Runtime {
             secret_env,
             pass_env,
             bash_timeout,
+            mcp_hub: Arc::new(mcp_hub),
         })
     }
 
@@ -387,6 +437,10 @@ impl Runtime {
             && !self.pass_env.contains(name)
         {
             self.secret_env.insert(name.to_owned());
+            self.mcp_hub.set_strip(crate::mcp_stdio::strip_set(
+                &self.secret_env,
+                &self.pass_env,
+            ));
         }
         self
     }
@@ -460,6 +514,17 @@ impl Runtime {
             tools.extend(mcp_tools::amp_tools(&self.mcp).await?);
         }
         tools.extend(spec.extra_tools);
+        // #2239: the external MCP servers' tools as they are now; the hub keeps them in step.
+        let mcp_worktree = spec.mcp.worktree.clone();
+        let output_key = spec
+            .mcp
+            .output_key
+            .clone()
+            .unwrap_or_else(|| format!("{}-{}", role.id, now_ms()));
+        let mcp_view = self
+            .mcp_hub
+            .session_view(&role.id, mcp_worktree.as_ref(), &output_key);
+        tools.extend(mcp_view.tools);
         let policy = Arc::new(role.tool_policy(&cwd));
         let tools = filter_harness_tools(&policy, tools);
         let tool_names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
@@ -472,6 +537,7 @@ impl Runtime {
             extra_context: spec.extra_context.as_deref(),
             context_files: &context_files,
         });
+        let system_prompt = with_mcp_instructions(&system_prompt, &mcp_view.instructions);
 
         let (session, session_file) = match &spec.session {
             SessionKind::Memory => (memory_session(), None),
@@ -520,11 +586,25 @@ impl Runtime {
             ),
             ..Default::default()
         };
-        let harness = AgentHarness::create(options)
-            .await
-            .map_err(|e| AgentError::Harness(format!("{e}")))?;
+        let harness = Arc::new(
+            AgentHarness::create(options)
+                .await
+                .map_err(|e| AgentError::Harness(format!("{e}")))?,
+        );
+        if self.mcp_hub.has_servers() {
+            self.mcp_hub
+                .attach(
+                    &harness,
+                    &role.id,
+                    Arc::clone(&policy),
+                    output_key,
+                    mcp_worktree,
+                    mcp_view.signature,
+                )
+                .await;
+        }
         Ok(BuiltAgent {
-            harness: Arc::new(harness),
+            harness,
             role,
             resolved,
             system_prompt,
@@ -846,6 +926,18 @@ pub struct AgentSpec {
     pub emitter: Option<Arc<dyn AgentEmitter>>,
     /// Runs after the policy allows a call (M2-6's run reporting).
     pub before_tool_call: Option<BeforeToolCall>,
+    /// External MCP servers for this session (#2239).
+    pub mcp: McpSessionSpec,
+}
+
+/// What a session needs from the MCP hub besides its role (#2239).
+#[derive(Debug, Clone, Default)]
+pub struct McpSessionSpec {
+    /// Names the directory oversized tool output is saved in (`<state>/mcp-output/<key>/`): the
+    /// ticket id for a worker. Default: `<role>-<unix ms>`.
+    pub output_key: Option<String>,
+    /// The worker's worktree-scoped server instances ([`McpHub::start_worktree`]).
+    pub worktree: Option<Arc<WorktreeSet>>,
 }
 
 impl AgentSpec {
@@ -859,6 +951,7 @@ impl AgentSpec {
             session: SessionKind::Memory,
             emitter: None,
             before_tool_call: None,
+            mcp: McpSessionSpec::default(),
         }
     }
 }
