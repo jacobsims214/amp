@@ -514,7 +514,8 @@ func TestApprovalScope_WhoCanApprove(t *testing.T) {
 // claiming or reassigning it, approving it as their own and handing it back,
 // nor hand their approved ticket to someone who never approved it. A project
 // lead's reassignment keeps it (a lead may approve on anyone's behalf), and
-// so does dispatch's automatic claim of an unassigned ticket.
+// so does dispatch's automatic claim of an unassigned ticket. A lead's change
+// keeps it only in the web UI: over MCP or a token it drops (AMP #2223).
 func TestApprovalScope_ApprovalDoesNotSurviveAMembersReassignment(t *testing.T) {
 	sw := newScopeWorld(t)
 	w := sw.w
@@ -613,10 +614,11 @@ func TestApprovalScope_ApprovalDoesNotSurviveAMembersReassignment(t *testing.T) 
 	assign(sw.alice, own, "me")
 	approvedFor(own, &alice)
 
-	// (d) A lead's reassignment keeps the approval (approved for whom it was).
-	d := mkIn(t, sw.alice, sw.aliceStory, "alice's, moved by the lead")
+	// (d) A lead's reassignment in the web UI keeps the approval (approved
+	// for whom it was): a lead may approve on anyone's behalf there anyway.
+	d := mkIn(t, sw.alice, sw.aliceStory, "alice's, moved by the lead in the UI")
 	approveOwn("alice", d)
-	assign(w.as(w.lead), d, w.bob.Email)
+	sw.ra.want(t, http.StatusOK, "lead", http.MethodPost, fmt.Sprintf("/api/tasks/%d/assign", d), map[string]any{"user": w.bob.Email})
 	if o := taskOwner(t, w.s, d); o == nil || *o != bob {
 		t.Fatalf("ticket %d owner %v, want bob", d, o)
 	}
@@ -624,16 +626,59 @@ func TestApprovalScope_ApprovalDoesNotSurviveAMembersReassignment(t *testing.T) 
 	if slices.Contains(yoursOf(t, sw.bob), d) {
 		t.Fatalf("ticket %d moved by a lead should not await bob", d)
 	}
-	// A lead's handover keeps it too.
-	h := mkIn(t, sw.alice, sw.aliceStory, "alice's, handed over by the lead")
+	// A lead's handover in the UI keeps it too.
+	h := mkIn(t, sw.alice, sw.aliceStory, "alice's, handed over by the lead in the UI")
 	approveOwn("alice", h)
-	w.as(w.lead).call(t, "amp_handover_tasks", map[string]any{"project_id": float64(w.s.projectID),
-		"from": w.alice.Email, "to": w.bob.Email, "task_ids": []any{float64(h)}})
+	sw.ra.want(t, http.StatusOK, "lead", http.MethodPost, fmt.Sprintf("/api/projects/%d/handover", w.s.projectID),
+		map[string]any{"from": w.alice.Email, "to": w.bob.Email, "task_ids": []int{h}})
 	if o := taskOwner(t, w.s, h); o == nil || *o != bob {
 		t.Fatalf("ticket %d owner %v after the lead's handover, want bob", h, o)
 	}
 	approvedFor(h, &alice)
 	sw.bob.finish(t, d)
+
+	// (d2) Off the UI a lead's change is a Member's (AMP #2223): approving on
+	// someone's behalf is UI-only, so an agent under a lead's MCP login must
+	// not move approved work to someone who never approved it. Assign,
+	// handover and claim over MCP all drop the approval, and bob's agent
+	// can't dispatch it.
+	lead := w.as(w.lead)
+	md := mkIn(t, sw.alice, sw.aliceStory, "alice's, moved by the lead over MCP")
+	approveOwn("alice", md)
+	assign(lead, md, w.bob.Email)
+	if o := taskOwner(t, w.s, md); o == nil || *o != bob {
+		t.Fatalf("ticket %d owner %v, want bob", md, o)
+	}
+	awaits(md)
+	if !slices.Contains(yoursOf(t, sw.bob), md) {
+		t.Fatalf("ticket %d moved by a lead over MCP should await bob", md)
+	}
+	wantErr(t, dispatch(sw.bob, t, md), "isn't approved")
+	if code, out := restDispatch("bob", md); code != http.StatusForbidden || !strings.Contains(fmt.Sprint(out["error"]), "isn't approved") {
+		t.Fatalf("dispatching ticket %d: %d %v, want 403 isn't approved", md, code, out)
+	}
+	if hist, _ := w.s.repo.GetTicketHistory(context.Background(), md); !slices.ContainsFunc(hist, func(e domain.ActivityLog) bool {
+		return e.Action == "approval_dropped" && strings.Contains(e.Detail, "not by a project lead in the AMP web UI")
+	}) {
+		t.Fatalf("ticket %d: approval_dropped should say the change wasn't a lead's in the web UI: %+v", md, hist)
+	}
+	mh := mkIn(t, sw.alice, sw.aliceStory, "alice's, handed over by the lead over MCP")
+	approveOwn("alice", mh)
+	lead.call(t, "amp_handover_tasks", map[string]any{"project_id": float64(w.s.projectID),
+		"from": w.alice.Email, "to": w.bob.Email, "task_ids": []any{float64(mh)}})
+	if o := taskOwner(t, w.s, mh); o == nil || *o != bob {
+		t.Fatalf("ticket %d owner %v after the lead's handover, want bob", mh, o)
+	}
+	awaits(mh)
+	wantErr(t, dispatch(sw.bob, t, mh), "isn't approved")
+	mc := unassigned(sw.bob, sw.bobSt, "bob planned it, the lead claims it over MCP")
+	approveOwn("bob", mc)
+	lead.call(t, "amp_claim_task", map[string]any{"task_id": float64(mc)})
+	if o := taskOwner(t, w.s, mc); o == nil || *o != w.lead.User.ID {
+		t.Fatalf("ticket %d owner %v after the lead's claim, want the lead", mc, o)
+	}
+	awaits(mc)
+	wantErr(t, dispatch(lead, t, mc), "isn't approved")
 
 	// (e) Dispatch's automatic claim of an approved unassigned ticket keeps
 	// it approved, and the ticket can be completed.

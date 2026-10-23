@@ -125,7 +125,8 @@ type MsgAssignTask struct {
 	// only the project's open-reassign setting allows it).
 	RequireIdle bool
 	// ByLead is set when the person making the change is a project lead or
-	// above: their reassignment keeps the ticket's plan approval. Anyone
+	// above acting in the AMP web UI (not over MCP or an API token, AMP
+	// #2223): their reassignment keeps the ticket's plan approval. Anyone
 	// else's drops it when the ticket stops being the person it was approved
 	// for (domain.Task.DropsApprovalOn, AMP #2218).
 	ByLead  bool
