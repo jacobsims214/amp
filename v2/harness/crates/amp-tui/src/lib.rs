@@ -38,12 +38,16 @@
 //! - [`footer`] (#2186): the footer in place of pi's: `~`-relative cwd shortened from the left,
 //!   branch, role · #ticket, `$0.004 · ctx 4%` and model • thinking; one row below 100 columns.
 //!
+//! - [`inset`] (#2251): `[tui] padding` columns of space left and right of every area of the
+//!   chat ([`inset::Inset`], one shared [`inset::Padding`]), shrinking on narrow terminals.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
 pub mod amp_render;
 pub mod chrome;
 pub mod footer;
+pub mod inset;
 pub mod overlay;
 pub mod scroll;
 pub mod shell;
@@ -56,6 +60,7 @@ pub mod view;
 pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
+pub use inset::{DEFAULT_PADDING, Inset, MAX_PADDING, MIN_INNER, Padding};
 pub use overlay::{ModelRow, Panel, PanelKind, PanelState, Stage, Target};
 pub use scroll::{NEW_OUTPUT, TranscriptScroll};
 pub use shell::{

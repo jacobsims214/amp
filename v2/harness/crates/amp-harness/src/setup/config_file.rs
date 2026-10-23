@@ -20,6 +20,23 @@ use std::{
 const NEW_FILE_HEADER: &str = "# amp-harness settings, written by the first run, `amp-harness init` and `amp-harness server`. Edit freely.\n\
 # Provider keys are never stored here: they live in the OS keychain or the environment.\n";
 
+/// The header of a repo `.amp/harness/config.toml` that `amp-harness models --repo` creates.
+pub const REPO_FILE_HEADER: &str = "# amp-harness settings for everyone working in this repo (`amp-harness models --repo`).\n\
+# Only [mcp.*], [roles.*] and [models] profile are allowed here; keys and servers stay in your user config.\n";
+
+/// A TOML key, bare when it can be (`worker-backend`), else quoted (`"openai/gpt-oss-120b"`).
+pub fn toml_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        key.to_owned()
+    } else {
+        toml_string(key)
+    }
+}
+
 /// A TOML basic string for `value` (JSON string escapes are valid TOML basic-string escapes).
 pub fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("a string always encodes")
@@ -219,6 +236,11 @@ pub enum Change {
         key: String,
     },
     DropSection(String),
+    /// Drops the table `prefix` and all its sub-tables (`[prefix]`, `[prefix.*]`, quoted or not).
+    DropTables(String),
+    /// Adds an empty table at this key path (`["providers", "openrouter", "models", "a/b"]`)
+    /// unless its header is already there.
+    AddTable(Vec<String>),
 }
 
 impl Change {
@@ -246,6 +268,23 @@ impl Change {
             } => set_string(text, section, key, value),
             Self::Remove { section, key } => remove_key(text, section, key),
             Self::DropSection(section) => remove_section(text, section),
+            Self::DropTables(prefix) => remove_tables(text, prefix).0,
+            Self::AddTable(parts) => {
+                let name = parts.join(".");
+                if text
+                    .lines()
+                    .any(|l| table_name(l).as_deref() == Some(&name))
+                {
+                    return text.to_owned();
+                }
+                let header: Vec<String> = parts.iter().map(|p| toml_key(p)).collect();
+                let mut out = text.trim_end().to_owned();
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.push_str(&format!("[{}]\n", header.join(".")));
+                out
+            }
         }
     }
 
@@ -273,6 +312,29 @@ impl Change {
             Self::Remove { section, key } => {
                 if table_at(doc, section).is_some() {
                     table_mut(doc, section).remove(key);
+                }
+            }
+            Self::DropTables(prefix) => {
+                let parts: Vec<&str> = prefix.split('.').collect();
+                let (last, parents) = parts.split_last().expect("split yields one part");
+                let mut table = Some(doc);
+                for part in parents {
+                    table = table
+                        .and_then(|t| t.get_mut(*part))
+                        .and_then(|v| v.as_table_mut());
+                }
+                if let Some(t) = table {
+                    t.remove(*last);
+                }
+            }
+            Self::AddTable(parts) => {
+                let mut table = doc;
+                for part in parts {
+                    table = table
+                        .entry(part.clone())
+                        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+                        .as_table_mut()
+                        .expect("checked: a table");
                 }
             }
             Self::DropSection(section) => match section.rsplit_once('.') {
@@ -304,11 +366,24 @@ fn prune_empty(doc: &mut toml::Table) {
 #[derive(Debug, Clone)]
 pub struct ConfigFile {
     pub path: PathBuf,
+    /// The comment a new file starts with.
+    header: &'static str,
 }
 
 impl ConfigFile {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            header: NEW_FILE_HEADER,
+        }
+    }
+
+    /// A repo's `.amp/harness/config.toml` (#2235): a new file gets [`REPO_FILE_HEADER`].
+    pub fn repo(path: PathBuf) -> Self {
+        Self {
+            path,
+            header: REPO_FILE_HEADER,
+        }
     }
 
     pub fn exists(&self) -> bool {
@@ -318,7 +393,7 @@ impl ConfigFile {
     fn read(&self) -> Result<String, String> {
         match fs::read_to_string(&self.path) {
             Ok(text) => Ok(text),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(NEW_FILE_HEADER.to_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(self.header.to_owned()),
             Err(e) => Err(format!("read {}: {e}", self.path.display())),
         }
     }
@@ -383,9 +458,27 @@ impl ConfigFile {
             return Ok(None);
         }
         let existing = self.text()?;
-        let before = existing
-            .clone()
-            .unwrap_or_else(|| NEW_FILE_HEADER.to_owned());
+        let text = self.preview(changes)?;
+        if existing.as_deref() == Some(text.as_str()) {
+            return Ok(None);
+        }
+        let backup = match &existing {
+            Some(old) => {
+                let backup = self.path.with_extension("toml.bak");
+                write_private(&backup, old)?;
+                Some(backup)
+            }
+            None => None,
+        };
+        write_private(&self.path, &text)?;
+        Ok(backup)
+    }
+
+    /// The text [`ConfigFile::edit`] would write, without writing it (so a caller can check that
+    /// the result loads first). Errors exactly when `edit` would refuse.
+    pub fn preview(&self, changes: &[Change]) -> Result<String, String> {
+        let existing = self.text()?;
+        let before = existing.unwrap_or_else(|| self.header.to_owned());
         let mut expected: toml::Table = toml::from_str(&before).map_err(|e| {
             format!(
                 "{} does not parse ({e}); fix it first, nothing was changed",
@@ -420,19 +513,7 @@ impl ConfigFile {
                 self.path.display()
             ));
         }
-        if existing.as_deref() == Some(text.as_str()) {
-            return Ok(None);
-        }
-        let backup = match &existing {
-            Some(old) => {
-                let backup = self.path.with_extension("toml.bak");
-                write_private(&backup, old)?;
-                Some(backup)
-            }
-            None => None,
-        };
-        write_private(&self.path, &text)?;
-        Ok(backup)
+        Ok(text)
     }
 
     /// Sets the keys and writes the file (0600, in a 0700 directory) atomically. The result must
@@ -698,6 +779,53 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read_to_string(&file.path).unwrap(), "[server\nurl=");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #2235: whole role tables go (quoted headers and sub-tables too), a model table is added
+    /// once, and `preview` writes nothing.
+    #[test]
+    fn drop_and_add_tables() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/config-file-tables2");
+        let _ = fs::remove_dir_all(&dir);
+        let file = ConfigFile::repo(dir.join(".amp/harness/config.toml"));
+        let changes = [
+            Change::AddTable(vec![
+                "providers".into(),
+                "openrouter".into(),
+                "models".into(),
+                "openai/gpt-oss-120b".into(),
+            ]),
+            Change::set("roles.reviewer", "model", "openrouter/openai/gpt-oss-120b"),
+        ];
+        let text = file.preview(&changes).unwrap();
+        assert!(!file.path.exists());
+        assert!(text.starts_with(REPO_FILE_HEADER), "{text}");
+        assert!(
+            text.contains("[providers.openrouter.models.\"openai/gpt-oss-120b\"]\n"),
+            "{text}"
+        );
+        file.edit(&changes).unwrap();
+        // Adding it again changes nothing.
+        assert_eq!(file.edit(&changes).unwrap(), None);
+        let mut text = fs::read_to_string(&file.path).unwrap();
+        text.push_str(
+            "# kept\n[roles.\"manager\"]\nthinking = \"low\"\n[roles.manager.extra_body]\na = 1\n\n[roles.managerial]\nthinking = \"high\"\n",
+        );
+        fs::write(&file.path, &text).unwrap();
+        let bak = file
+            .edit(&[Change::DropTables("roles.manager".into())])
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read_to_string(bak).unwrap(), text);
+        let doc: toml::Table = toml::from_str(&fs::read_to_string(&file.path).unwrap()).unwrap();
+        assert!(doc["roles"].get("manager").is_none(), "{doc}");
+        assert_eq!(
+            doc["roles"]["managerial"]["thinking"].as_str(),
+            Some("high")
+        );
+        assert!(doc["roles"]["reviewer"]["model"].is_str());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -693,10 +693,8 @@ impl Supervisor {
         let started = Instant::now();
         let mut notes = Vec::new();
         let totals = Arc::new(Mutex::new(Totals::default()));
-        let model = self
-            .rt
-            .models
-            .resolve_role(&role.model_role)
+        let model = role
+            .resolve_model(&self.rt.models)
             .map(|r| r.model_ref())
             .unwrap_or_default();
 

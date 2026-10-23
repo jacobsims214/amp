@@ -66,6 +66,7 @@
 pub mod agent;
 pub mod approval;
 pub mod assets;
+pub mod config_check;
 pub mod events;
 pub mod faux;
 pub mod links;
@@ -84,6 +85,7 @@ pub mod request_time;
 pub mod roles;
 pub mod run_report;
 pub mod supervisor;
+pub mod templates;
 pub mod text_tool_calls;
 pub mod tickets;
 pub mod tools;
