@@ -9,13 +9,17 @@ publish.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
 keyring.workspace = true
 oauth2.workspace = true
 process-wrap.workspace = true
-reqwest.workspace = true
+# stream: the legacy SSE event stream (#2238); rmcp's reqwest feature turns it on already.
+reqwest = { workspace = true, features = ["stream"] }
 rmcp.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sse-stream.workspace = true
 thiserror.workspace = true
 # net + io-util: the OAuth loopback redirect listener; rt: keychain calls run on the blocking pool.
 # process + fs: stdio MCP servers and their stderr logs (#2236).

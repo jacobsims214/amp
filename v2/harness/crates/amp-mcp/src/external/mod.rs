@@ -7,13 +7,14 @@
 //! Transports:
 //! - [`stdio`]: a local child process ([`ExternalClient::connect_stdio`], #2236).
 //! - [`http`]: Streamable HTTP with headers, bearer and OAuth ([`http::connect`], #2237).
-//! - Legacy SSE (H5, #2238) connects through [`ExternalClient::handshake_with`] too, reusing
-//!   [`http::PreparedHttp`].
+//! - [`sse`]: legacy HTTP+SSE (2024-11-05) for `type = "sse"` and as `http`'s fallback
+//!   ([`http::connect`] picks; #2238). It reuses [`http::PreparedHttp`] (headers, bearer, OAuth).
 //!
 //! The client never sees a configuration file: amp-core resolves `[mcp.<name>]` (env, secrets,
 //! paths) into a spec and hands it here, so this crate stays free of rpi and of config rules.
 
 pub mod http;
+pub mod sse;
 pub mod stdio;
 
 use std::{
