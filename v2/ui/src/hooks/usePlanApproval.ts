@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api/client'
-import { changedSinceNotice } from '../lib/approval'
+import { changedSince, changedSinceNotice } from '../lib/approval'
 import { useSSE } from './useSSE'
-import type { Project, SSEEvent } from '../types'
+import type { ApproveRequest, Project, SSEEvent } from '../types'
 
 /**
  * The project's approval state, kept live (project.updated arrives when
- * anyone approves), and the person's one-click approve. Approving is only
- * accepted from this web UI session; the server refuses agents and MCP.
+ * anyone approves), and the person's approve (their own tickets, or others'
+ * on their behalf). Approving is only accepted from this web UI session;
+ * the server refuses agents and MCP.
  */
 export function usePlanApproval(projectId: number) {
   const [project, setProject] = useState<Project | null>(null)
@@ -29,18 +30,22 @@ export function usePlanApproval(projectId: number) {
   }, [projectId]))
 
   /**
-   * Approve what the person was shown: asOf is the newest planned_at among the
-   * tickets on screen (newestPlannedAt). Resolves to whether it went through
-   * and whether the plan changed under the person (tickets added or re-scoped
-   * since the page loaded), in which case the page should refresh its tickets.
+   * Approve the tickets the person ticked (#2198): taskIds, asOf = the newest
+   * planned_at among them, onBehalf when any isn't theirs. shown is every ticket
+   * id the page showed, so own tickets that arrived after it loaded (or that
+   * changed under the person) are reported in the notice. Resolves to whether
+   * it went through and whether the page should refresh its tickets.
    */
-  const approve = useCallback(async (asOf?: string): Promise<{ ok: boolean; changed: boolean }> => {
+  const approve = useCallback(async (req: ApproveRequest & { shown?: number[] } = {}): Promise<{ ok: boolean; changed: boolean }> => {
     setApproving(true); setError(null); setNotice(null)
+    const { shown, ...body } = req
     try {
-      const r = await api.approvePlan(projectId, asOf)
+      const r = await api.approvePlan(projectId, body)
       setProject(r.project)
-      if (r.awaitingApproval.length > 0) setNotice(changedSinceNotice(r.awaitingApproval.length))
-      return { ok: true, changed: r.awaitingApproval.length > 0 }
+      const changed = changedSince(r, shown ?? body.taskIds ?? [])
+      if (changed.length > 0) setNotice(changedSinceNotice(changed.length))
+      // Refresh whenever something was approved too, so each ticket shows its approver.
+      return { ok: true, changed: changed.length > 0 || r.approved.length > 0 }
     } catch (e) {
       // The server stamps rather than refusing (#2192), but if one ever answers
       // 409 (the plan changed), say so and refresh rather than show a failure.

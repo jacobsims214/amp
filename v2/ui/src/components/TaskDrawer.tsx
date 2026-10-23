@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play } from 'lucide-react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play, ShieldCheck, ShieldAlert } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
-import { isRelayed, relayedFor } from '../lib/approval'
+import { approvalOf, formatWhen, isRelayed, planPath, relayedFor } from '../lib/approval'
 import { api } from '../api/client'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
@@ -63,6 +64,7 @@ const ACTION_DOT: Record<string, string> = {
   blocked:    'bg-danger',
   unblocked:  'bg-warning-ink',
   comment:    'bg-line-str ring-1 ring-ink-2/40',
+  plan_approved: 'bg-success',
 }
 
 const inputCls =
@@ -512,6 +514,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
           ? <span className="text-ink-2" title={creator.email}>{creator.name}{task.created_by === meId ? ' (you)' : ''}</span>
           : <span className="italic">unknown</span>}
       </div>
+      <ApprovalLine task={task} people={people} meId={meId} />
       {!canWork && owner && (
         <p className="text-xs text-warning-ink">
           Owned by {owner.name} — {canTakeOver
@@ -522,6 +525,38 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
         </p>
       )}
       {error && <p className="text-xs text-danger-ink">{error}</p>}
+    </div>
+  )
+}
+
+/**
+ * Who approved this ticket's plan (#2198), and for whom when it wasn't their
+ * own: "Approved by Lee on behalf of Bob · Oct 22". An open ticket whose plan
+ * nobody approved says so and links to the Flight plan, where people approve.
+ */
+export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<number, Person>; meId?: number }) {
+  const a = approvalOf(task)
+  const name = (id: number) => (lookupPerson(people, id)?.name ?? `User #${id}`) + (id === meId ? ' (you)' : '')
+  if (!a) {
+    if (task.state === 'completed') return null
+    return (
+      <div className="text-xs text-ink-3 flex items-center gap-1.5 flex-wrap">
+        <ShieldAlert size={12} className="text-warning-ink" aria-hidden="true" />
+        <span>Plan not approved yet{task.approved_at ? ' (changed since it was approved)' : ''}.</span>
+        <Link to={`${planPath(task.project_id)}#approve`} className="text-ink-2 underline underline-offset-2">Approve in Flight plan</Link>
+      </div>
+    )
+  }
+  return (
+    <div className="text-xs text-ink-3 flex items-center gap-1.5 flex-wrap">
+      <ShieldCheck size={12} className="text-success-ink" aria-hidden="true" />
+      <span>
+        {a.approvedBy == null
+          ? <>Approved by <span className="text-ink-2">the AMP upgrade</span> (kept from an earlier approval)</>
+          : <>Approved by <span className="text-ink-2">{name(a.approvedBy)}</span>
+              {a.onBehalfOf != null && <> on behalf of <span className="text-ink-2">{name(a.onBehalfOf)}</span></>}</>}
+        {formatWhen(a.at) && <> · <span className="tabular-nums">{formatWhen(a.at)}</span></>}
+      </span>
     </div>
   )
 }

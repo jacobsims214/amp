@@ -80,6 +80,10 @@ export interface Task {
   ready_at?: string
   /** when its scope (name, description, acceptance criteria) was last set; newer than the plan's approval = awaiting approval */
   planned_at?: string
+  /** when a person last approved its plan (#2198); approved iff approved_at >= planned_at */
+  approved_at?: string
+  /** who approved it (null with approved_at set: a migration kept an earlier approval) */
+  approved_by?: number | null
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
   created_at: string
@@ -108,6 +112,45 @@ export interface ActivityLog {
   /** the AMP user behind the action, when there was one */
   actor_user_id?: number
   created_at: string
+}
+
+// ---- Plan approval (POST /projects/:id/approve-plan, #2198) ----
+
+/** What a person approves: see api.approvePlan. */
+export interface ApproveRequest {
+  taskIds?: number[]
+  asOf?: string
+  onBehalf?: boolean
+}
+
+/** One ticket still waiting, and whether it's the caller's own. */
+export interface AwaitingTicket {
+  task_id: number
+  owner_user_id?: number | null
+  yours: boolean
+}
+
+/** The server's answer (service.ApproveResult); older servers send only project and awaiting_approval. */
+export interface ApproveResponse {
+  project: Project
+  approved?: number[]
+  approved_tickets?: Array<{ task_id: number; owner_user_id?: number | null; on_behalf: boolean }>
+  awaiting_approval?: number[]
+  still_awaiting?: AwaitingTicket[]
+  awaiting_yours?: number[]
+  /** ticket id -> why it wasn't approved ("it was planned after what was approved (as_of)") */
+  skipped?: Record<string, string>
+  on_behalf?: boolean
+}
+
+/** ApproveResponse with defaults filled in. */
+export interface ApproveResult {
+  project: Project
+  approved: number[]
+  awaitingApproval: number[]
+  awaitingYours: number[]
+  skipped: Record<string, string>
+  onBehalf: boolean
 }
 
 // ---- Plan check (GET /projects/:id/plan-check) ----

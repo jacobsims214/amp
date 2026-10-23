@@ -23,7 +23,7 @@ import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { usePlanApproval } from '../hooks/usePlanApproval'
 import { awaitingApproval } from '../lib/approval'
-import { PlanApprovalBanner } from '../components/PlanApprovalBanner'
+import { PlanApprovalBanner, type ApproveSelection } from '../components/PlanApprovalBanner'
 import { ProjectNav } from '../components/ProjectNav'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
@@ -126,8 +126,8 @@ export function FlightPlan() {
   const runCheck = () => { setChecking(true); check() }
   const approval = usePlanApproval(pid)
   const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
-  const approve = async (asOf?: string) => {
-    const r = await approval.approve(asOf)
+  const approve = async (sel: ApproveSelection) => {
+    const r = await approval.approve(sel)
     if (r.changed) refresh()
     if (r.ok || r.changed) check()
   }
@@ -200,7 +200,7 @@ export function FlightPlan() {
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         <PlanApprovalBanner projectId={pid} project={approval.project} awaiting={awaiting} people={people}
-          onApprove={approve} approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setOpenId} />
+          meId={me?.user_id} myAccess={myAccess} onApprove={approve} approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setOpenId} />
         <Readouts items={[
           { label: 'Tickets', value: tasks.length, sub: `${openCount} open` },
           { label: 'Epics · stories', value: <>{epics.length}<span className="text-[14px] text-ink-3"> · {stories.length}</span></>, sub: 'in this plan' },
