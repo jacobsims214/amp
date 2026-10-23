@@ -1,6 +1,7 @@
 //! `amp-harness mcp …`: MCP servers (#2243, [`crate::mcp_crud`]): `list`, `get`, `add`,
-//! `add-json`, `edit`, `remove`, `enable`, `disable`, `test`, `login`, `logout`, `secret`, and trust
-//! for repo servers (`trust` / `untrust`, #2241, [`crate::mcp_trust_cmd`]).
+//! `add-json`, `import` (#2244, [`crate::mcp_import`]), `edit`, `remove`, `enable`, `disable`,
+//! `test`, `login`, `logout`, `secret`, and trust for repo servers (`trust` / `untrust`, #2241,
+//! [`crate::mcp_trust_cmd`]).
 //!
 //! `mcp call <tool> [json]` and `mcp tools` talk to AMP's own MCP server by default (scripts such as
 //! the M1-5 smoke test use them to create and clean up throwaway data); `--server <name>` points
@@ -34,6 +35,9 @@ pub enum McpCommand {
     Add(Box<mcp_crud::AddArgs>),
     /// Add a server from Claude Code / Cursor / VS Code JSON (`-` reads it from stdin).
     AddJson(mcp_crud::AddJsonArgs),
+    /// Import servers from Claude Code, opencode, VS Code, Cursor or Claude Desktop (`--from`), with
+    /// secrets moved to the OS keychain. `--dry-run` shows the TOML first. Never automatic.
+    Import(Box<crate::mcp_import::ImportArgs>),
     /// Edit a server's table in $EDITOR (checked before it is saved; reopened on an error), or set
     /// its roles with --roles.
     Edit(mcp_crud::EditArgs),
@@ -101,6 +105,7 @@ pub async fn run(command: McpCommand) -> Result<(), CliError> {
         McpCommand::Get(args) => mcp_crud::get(args).await,
         McpCommand::Add(args) => mcp_crud::add(*args).await,
         McpCommand::AddJson(args) => mcp_crud::add_json(args).await,
+        McpCommand::Import(args) => crate::mcp_import::import(*args).await,
         McpCommand::Edit(args) => mcp_crud::edit(args).await,
         McpCommand::Remove(args) => mcp_crud::remove(args).await,
         McpCommand::Enable(args) => mcp_crud::set_enabled(args, true).await,
