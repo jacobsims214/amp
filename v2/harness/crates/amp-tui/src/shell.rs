@@ -60,7 +60,7 @@ use std::{
 };
 
 use amp_core::events::{RunEvent, Totals};
-use amp_core::meta::MetaHandle;
+use amp_core::meta::{MetaHandle, Topics};
 use amp_core::models::thinking_name;
 use amp_core::supervisor::Supervisor;
 use amp_core::tickets::Status;
@@ -890,7 +890,19 @@ impl Shell {
         Submit::Continue
     }
 
+    /// While the plan waits for a person's approval, re-reads it now (#2209): before the manager's
+    /// turn, and after `/open plan`, so an approval made in the web UI shows without waiting for
+    /// the next poll.
+    fn refresh_pending_plan(&self) {
+        if let Some(meta) = &self.meta
+            && meta.snapshot().plan_pending()
+        {
+            meta.refresh(Topics::PLAN);
+        }
+    }
+
     fn start_run(&mut self, prompt: String) {
+        self.refresh_pending_plan();
         self.running = true;
         self.prompts += 1;
         self.view.set_working(true);
@@ -1345,6 +1357,7 @@ impl Shell {
                 (Some(inst), Some(pid)) => {
                     let url = inst.plan_url(pid);
                     self.open_url(&url);
+                    self.refresh_pending_plan();
                 }
                 (None, _) => self
                     .view

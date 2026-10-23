@@ -769,6 +769,15 @@ impl AmpMeta {
         self.project.get().is_some_and(|p| p.require_plan_approval)
     }
 
+    /// Whether tickets wait for a person's approval (the status line's chip is up).
+    pub fn plan_pending(&self) -> bool {
+        self.plan_required()
+            && self
+                .plan
+                .get()
+                .is_some_and(|p| !p.awaiting_approval.is_empty())
+    }
+
     fn ticket_open(&self) -> bool {
         self.ticket_id.is_some() && self.ticket.get().is_none_or(|t| t.status != Status::Done)
     }
@@ -787,6 +796,9 @@ pub struct Intervals {
     pub ticket: Duration,
     /// Plan approval, when the project requires it (60 s).
     pub plan: Duration,
+    /// Plan approval while tickets wait for a person's approval (5 s, #2209): the person approves
+    /// in the web UI, and the status line's "waiting for your approval" chip must clear soon after.
+    pub plan_pending: Duration,
     /// The ticket's artifacts while one is in review (60 s).
     pub artifacts: Duration,
     /// A health probe after this long without any call (60 s).
@@ -805,6 +817,7 @@ impl Default for Intervals {
             board: Duration::from_secs(30),
             ticket: Duration::from_secs(30),
             plan: Duration::from_secs(60),
+            plan_pending: Duration::from_secs(5),
             artifacts: Duration::from_secs(60),
             idle_ping: Duration::from_secs(60),
             call_timeout: Duration::from_secs(10),
@@ -820,6 +833,8 @@ pub struct Conditions {
     pub project: bool,
     pub ticket_open: bool,
     pub plan_required: bool,
+    /// Tickets wait for a person's approval (polled every `plan_pending`).
+    pub plan_pending: bool,
     pub artifacts_in_review: bool,
 }
 
@@ -829,6 +844,7 @@ impl Conditions {
             project: meta.project_id.is_some(),
             ticket_open: meta.ticket_open(),
             plan_required: meta.plan_required(),
+            plan_pending: meta.plan_pending(),
             artifacts_in_review: !meta.artifacts_in_review().is_empty(),
         }
     }
@@ -853,6 +869,7 @@ impl Schedule {
         match t {
             Topics::BOARD if c.project => Some(iv.board),
             Topics::TICKET if c.ticket_open => Some(iv.ticket),
+            Topics::PLAN if c.plan_required && c.plan_pending => Some(iv.plan_pending),
             Topics::PLAN if c.plan_required => Some(iv.plan),
             Topics::ARTIFACTS if c.artifacts_in_review => Some(iv.artifacts),
             _ => None,
@@ -1747,6 +1764,7 @@ mod tests {
             project: true,
             ticket_open: true,
             plan_required: false,
+            plan_pending: false,
             artifacts_in_review: false,
         };
         // Nothing ran yet: board and ticket are due (plan and artifacts don't apply).
@@ -1780,6 +1798,106 @@ mod tests {
             ..c
         };
         assert_eq!(s.due(&iv, c, t0 + Duration::from_secs(45)), Topics::BOARD);
+    }
+
+    /// #2209: a person approves the plan in the web UI; the poller must notice soon. A faux clock
+    /// steps the pure schedule in 100 ms ticks, running whatever is due (the "server" answers the
+    /// plan with the approval state at that instant), for approvals landing at every offset of
+    /// a poll cycle. The chip (AmpMeta::plan_pending) clears within 10 s of the approval, and
+    /// with nothing pending the plan goes back to the 60 s poll.
+    #[test]
+    fn a_pending_plan_is_polled_fast_so_the_chip_clears_within_10s_of_approval() {
+        let iv = iv();
+        assert!(iv.plan_pending <= Duration::from_secs(5));
+        let project = Project {
+            id: 2,
+            name: "AMP".into(),
+            code: "amp".into(),
+            state: "active".into(),
+            org_id: None,
+            require_plan_approval: true,
+        };
+        let plan = |awaiting: Vec<i64>| PlanApproval {
+            require_plan_approval: true,
+            awaiting_approval: awaiting,
+            ..PlanApproval::default()
+        };
+        let tick = Duration::from_millis(100);
+        let t0 = Instant::now();
+        for approve_at_ms in (0..=65_000u64).step_by(700) {
+            let approve_at = t0 + Duration::from_secs(1) + Duration::from_millis(approve_at_ms);
+            let mut meta = AmpMeta {
+                project_id: Some(2),
+                ..AmpMeta::default()
+            };
+            meta.project.set(Ok(project.clone()));
+            meta.plan.set(Ok(plan(vec![2105])));
+            let mut s = Schedule::default();
+            s.ran(Topics::ALL, t0);
+            s.called(t0);
+            assert!(meta.plan_pending(), "the chip is up");
+            let mut now = t0;
+            let cleared = loop {
+                now += tick;
+                assert!(
+                    now < approve_at + Duration::from_secs(120),
+                    "never cleared (approval at +{approve_at_ms} ms)"
+                );
+                let due = s.due(&iv, Conditions::of(&meta), now);
+                if due.contains(Topics::PLAN) {
+                    let awaiting = if now >= approve_at {
+                        vec![]
+                    } else {
+                        vec![2105]
+                    };
+                    meta.plan.set(Ok(plan(awaiting)));
+                }
+                s.ran(due, now);
+                s.called(now);
+                if !meta.plan_pending() {
+                    break now;
+                }
+            };
+            let lag = cleared.saturating_duration_since(approve_at);
+            assert!(
+                lag <= Duration::from_secs(10),
+                "cleared {lag:?} after an approval at +{approve_at_ms} ms"
+            );
+        }
+        // Nothing pending: the plan is back on its 60 s poll.
+        let c = Conditions {
+            project: true,
+            plan_required: true,
+            ..Conditions::default()
+        };
+        let mut s = Schedule::default();
+        s.ran(Topics::PLAN, t0);
+        assert!(
+            !s.due(&iv, c, t0 + Duration::from_secs(59))
+                .contains(Topics::PLAN)
+        );
+        assert!(
+            s.due(&iv, c, t0 + Duration::from_secs(60))
+                .contains(Topics::PLAN)
+        );
+        let pending = Conditions {
+            plan_pending: true,
+            ..c
+        };
+        assert!(
+            s.due(&iv, pending, t0 + Duration::from_secs(5))
+                .contains(Topics::PLAN)
+        );
+        assert!(s.next_wake(&iv, pending, t0) <= t0 + Duration::from_secs(5));
+        // Pending but the project doesn't require approval: the plan isn't polled at all.
+        let off = Conditions {
+            plan_required: false,
+            ..pending
+        };
+        assert!(
+            !s.due(&iv, off, t0 + Duration::from_secs(600))
+                .contains(Topics::PLAN)
+        );
     }
 
     #[test]
