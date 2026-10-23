@@ -340,12 +340,7 @@ impl Instance {
 
 /// `scheme://host[:port]` of a URL (everything before the path).
 pub fn web_base(url: &str) -> String {
-    let url = url.trim();
-    let start = url.find("://").map_or(0, |i| i + 3);
-    let end = url[start..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |i| start + i);
-    url[..end].to_owned()
+    amp_mcp::url_origin(url)
 }
 
 /// The MCP connection as the header shows it (§2 item 2).

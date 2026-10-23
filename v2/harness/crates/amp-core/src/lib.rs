@@ -55,6 +55,7 @@ pub mod approval;
 pub mod assets;
 pub mod events;
 pub mod faux;
+pub mod links;
 pub mod mcp_tools;
 pub mod meta;
 pub mod models;

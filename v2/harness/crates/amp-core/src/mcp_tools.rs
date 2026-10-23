@@ -10,6 +10,10 @@
 //!   transport, auth): a tool error with the reason, never a hang;
 //! - a cancelled run: the call is dropped (rmcp then sends `notifications/cancelled`).
 //!
+//! In all of these, AMP's web UI links (a relative `approve_url`, a refusal's `/project/N/plan`, a
+//! page on the MCP origin) are pointed at the web UI first ([`crate::links`], #2205), so the model
+//! never builds a link from the MCP URL.
+//!
 //! Tools AMP marks `readOnlyHint` are registered with [`ToolReplay::Safe`], so crash recovery may
 //! re-run them; everything else stays `Never` (rpi's default).
 
@@ -25,7 +29,10 @@ use rpi_harness::types::{HarnessTool, ToolReplay};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::result_text;
+use crate::{
+    links::{web_links, web_links_json},
+    tools::result_text,
+};
 
 /// One AMP tool, called through the shared MCP client.
 pub struct McpTool {
@@ -165,8 +172,12 @@ impl AgentTool for McpTool {
             _ = signal.cancelled() => return Err(AgentError::Abort),
             r = call => r,
         };
-        let result = result.map_err(|e| AgentError::Tool(format!("{}: {e}", self.schema.name)))?;
-        let text = model_text(&result);
+        let session = self.client.session();
+        let (web, mcp) = (session.web_base(), session.mcp_origin());
+        let links = |s: &str| web_links(s, &web, &mcp).into_owned();
+        let result =
+            result.map_err(|e| AgentError::Tool(links(&format!("{}: {e}", self.schema.name))))?;
+        let text = links(&model_text(&result));
         if result.is_error == Some(true) {
             let message = if text.trim().is_empty() {
                 "the tool reported an error".to_owned()
@@ -178,6 +189,7 @@ impl AgentTool for McpTool {
         let mut out = AgentToolResult::text(text);
         if let Some(structured) = &result.structured_content {
             out.details = structured.clone();
+            web_links_json(&mut out.details, &web, &mcp);
         }
         Ok(out)
     }

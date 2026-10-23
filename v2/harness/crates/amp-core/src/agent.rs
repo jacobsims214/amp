@@ -538,7 +538,7 @@ impl Runtime {
         }
         append.push(amp_context(
             input.role,
-            &self.mcp_url(),
+            &session,
             input.project,
             input.cwd,
             input.extra_context,
@@ -565,10 +565,6 @@ impl Runtime {
             Some(&context),
             Some(&append.join("\n\n")),
         )
-    }
-
-    fn mcp_url(&self) -> String {
-        self.mcp.session().url.clone()
     }
 
     /// After [`Runtime::mcp`] was pointed at another AMP server (`/server`, #2164): gives
@@ -682,22 +678,53 @@ pub fn retarget_system_prompt(prompt: &str, session: &ServerSession) -> String {
         }
         (None, None) => {}
     }
-    if let Some(start) = out.find(CONTEXT_OPEN) {
-        let end = out[start..]
-            .find("</amp_context>")
-            .map_or(out.len(), |i| start + i);
-        if let Some(i) = out[start..end].find("\namp_server: ") {
-            let line_start = start + i + 1;
-            let line_end = out[line_start..]
-                .find('\n')
-                .map_or(out.len(), |j| line_start + j);
-            out.replace_range(
-                line_start..line_end,
-                &format!("amp_server: {}", session.url),
-            );
-        }
+    replace_context_line(
+        &mut out,
+        SERVER_KEY,
+        &format!("amp_server: {}", session.url),
+    );
+    // A prompt from before #2205 has no web UI line: add it after amp_server.
+    if !replace_context_line(&mut out, WEB_UI_KEY, &web_ui_line(session)) {
+        insert_context_line_after(&mut out, SERVER_KEY, &web_ui_line(session));
     }
     out
+}
+
+/// The `<amp_context>` block's bounds in `prompt`.
+fn context_bounds(prompt: &str) -> Option<(usize, usize)> {
+    let start = prompt.find(CONTEXT_OPEN)?;
+    let end = prompt[start..]
+        .find("</amp_context>")
+        .map_or(prompt.len(), |i| start + i);
+    Some((start, end))
+}
+
+/// The line starting with `key` (`"\nname: "`) inside `<amp_context>`: (start, end) without
+/// the newlines.
+fn context_line(prompt: &str, key: &str) -> Option<(usize, usize)> {
+    let (start, end) = context_bounds(prompt)?;
+    let line_start = start + prompt[start..end].find(key)? + 1;
+    let line_end = prompt[line_start..]
+        .find('\n')
+        .map_or(prompt.len(), |j| line_start + j);
+    Some((line_start, line_end))
+}
+
+/// Replaces the `<amp_context>` line starting with `key`; false when there is none.
+fn replace_context_line(prompt: &mut String, key: &str, line: &str) -> bool {
+    match context_line(prompt, key) {
+        Some((start, end)) => {
+            prompt.replace_range(start..end, line);
+            true
+        }
+        None => false,
+    }
+}
+
+fn insert_context_line_after(prompt: &mut String, key: &str, line: &str) {
+    if let Some((_, end)) = context_line(prompt, key) {
+        prompt.insert_str(end, &format!("\n{line}"));
+    }
 }
 
 /// What [`Runtime::system_prompt`] needs.
@@ -709,9 +736,22 @@ pub struct SystemPromptInput<'a> {
     pub context_files: &'a [ContextFile],
 }
 
+/// The `<amp_context>` line naming the web UI (#2205): links people click (the plan to approve, a
+/// ticket, an artifact) go there, never to the MCP server's origin.
+pub fn web_ui_line(session: &ServerSession) -> String {
+    let web = session.web_base();
+    format!(
+        "amp_web_ui: {web} (AMP's web UI: every link you give a person is on this origin, e.g. \
+         {web}/project/<id>/plan to approve a plan; never build links from amp_server)"
+    )
+}
+
+const WEB_UI_KEY: &str = "\namp_web_ui: ";
+const SERVER_KEY: &str = "\namp_server: ";
+
 fn amp_context(
     role: &Role,
-    url: &str,
+    session: &ServerSession,
     project: Option<&ProjectMarker>,
     cwd: &Path,
     extra: Option<&str>,
@@ -719,7 +759,8 @@ fn amp_context(
     let mut lines = vec![
         "<amp_context>".to_owned(),
         format!("role: {}", role.id),
-        format!("amp_server: {url}"),
+        format!("amp_server: {}", session.url),
+        web_ui_line(session),
     ];
     match project {
         Some(p) => {
@@ -891,7 +932,36 @@ mod tests {
             server_version: Some("2".to_owned()),
             instructions: instructions.map(str::to_owned),
             auth: "none".to_owned(),
+            web_url: None,
         }
+    }
+
+    /// #2205: the web UI line names the configured web UI, else the MCP URL's origin.
+    #[test]
+    fn the_context_names_the_web_ui_origin() {
+        let mut compose = session("http://localhost:18000/mcp", None);
+        assert!(web_ui_line(&compose).starts_with("amp_web_ui: http://localhost:18000 ("));
+        compose.web_url = Some("http://localhost:5173/".to_owned());
+        let line = web_ui_line(&compose);
+        assert!(
+            line.starts_with(
+                "amp_web_ui: http://localhost:5173 (AMP's web UI: every link you give a person \
+                 is on this origin, e.g. http://localhost:5173/project/<id>/plan"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("18000"), "{line}");
+
+        // A prompt from before #2205 gets the line after amp_server; a second retarget replaces it.
+        let old = "<amp_context>\nrole: amp-manager\namp_server: http://localhost:18000/mcp\nproject_id: 2\n</amp_context>";
+        let new = retarget_system_prompt(old, &compose);
+        assert_eq!(
+            new,
+            format!(
+                "<amp_context>\nrole: amp-manager\namp_server: http://localhost:18000/mcp\n{line}\nproject_id: 2\n</amp_context>"
+            )
+        );
+        assert_eq!(retarget_system_prompt(&new, &compose), new);
     }
 
     /// #2164: `/server` rewrites the server details and keeps everything else.
@@ -900,7 +970,8 @@ mod tests {
         let old = session("http://old:1/mcp", Some("old rules"));
         let block = server_instructions_block(&old).unwrap();
         let prompt = format!(
-            "ROLE\n\n{block}\n\n<amp_context>\nrole: amp-manager\namp_server: http://old:1/mcp\nproject_id: 2\n</amp_context>\n\nTAIL"
+            "ROLE\n\n{block}\n\n<amp_context>\nrole: amp-manager\namp_server: http://old:1/mcp\n{}\nproject_id: 2\n</amp_context>\n\nTAIL",
+            web_ui_line(&old)
         );
         let new = retarget_system_prompt(&prompt, &session("https://new/mcp", Some("new rules")));
         assert!(
@@ -908,7 +979,11 @@ mod tests {
             "{new}"
         );
         assert!(
-            new.contains("\namp_server: https://new/mcp\nproject_id: 2\n"),
+            new.contains("\namp_server: https://new/mcp\namp_web_ui: https://new (AMP's web UI"),
+            "{new}"
+        );
+        assert!(
+            new.contains("never build links from amp_server)\nproject_id: 2\n"),
             "{new}"
         );
         assert!(new.starts_with("ROLE\n\n<amp_server_instructions") && new.ends_with("TAIL"));
@@ -1044,18 +1119,27 @@ mod tests {
             project_code: None,
             amp_api: None,
         };
+        let mut compose = session("http://localhost:8000/mcp", None);
+        compose.web_url = Some("http://localhost:5173".into());
         let text = amp_context(
             manager,
-            "http://localhost:8000/mcp",
+            &compose,
             Some(&marker),
             Path::new("/repo"),
             Some("ticket: #7"),
         );
         assert_eq!(
             text,
-            "<amp_context>\nrole: amp-manager\namp_server: http://localhost:8000/mcp\nproject_id: 2\nproject_name: AMP v2\nproject_marker: /repo/.amp.json\nworking_directory: /repo\nticket: #7\n</amp_context>"
+            format!(
+                "<amp_context>\nrole: amp-manager\namp_server: http://localhost:8000/mcp\n{}\nproject_id: 2\nproject_name: AMP v2\nproject_marker: /repo/.amp.json\nworking_directory: /repo\nticket: #7\n</amp_context>",
+                web_ui_line(&compose)
+            )
         );
-        let text = amp_context(manager, "u", None, Path::new("/r"), None);
+        assert!(
+            text.contains("\namp_web_ui: http://localhost:5173 ("),
+            "{text}"
+        );
+        let text = amp_context(manager, &session("u", None), None, Path::new("/r"), None);
         assert!(text.contains("project_id: none"), "{text}");
     }
 }
