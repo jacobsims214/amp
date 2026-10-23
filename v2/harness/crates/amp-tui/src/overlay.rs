@@ -2,6 +2,12 @@
 //! `/plan` and `/project` show, docked between the transcript and the editor. `/model` uses the
 //! same panel as a picker (#2188): Enter switches to the selected model.
 //!
+//! The configuration panels (#2245: `/mcp`, `/agents`, `/skills`, `/model roles`, `/config`) are
+//! [`PanelKind::Info`] panels: the harness hands over an [`InfoPanel`] whose rows it builds (from
+//! live state, at every render, so `/mcp` follows the servers' health) and whose actions are slash
+//! commands: Enter and the letter keys run `"/mcp restart {}"`-style commands with `{}` the
+//! selected row's key, so a key and the typed command take the same path.
+//!
 //! ```text
 //! ── AMP · questions ───────────────────────────────────────────────────────────
 //!  › ■  QUESTION  #2107 M3-5 Inline ticket chips
@@ -42,6 +48,8 @@ use crate::{
 
 /// Rows shown at once; the list scrolls to keep the selection visible.
 pub const MAX_ROWS: usize = 14;
+/// Rows a configuration panel shows at once (#2245); ↓ past its last selectable row scrolls on.
+pub const MAX_INFO_ROWS: usize = 18;
 
 /// Which panel is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +68,9 @@ pub enum PanelKind {
     Project,
     /// `/model`: the models this chat can switch to; Enter switches (no AMP data needed).
     Model,
+    /// A configuration panel the harness describes ([`InfoPanel`], #2245): `/mcp`, `/agents`,
+    /// `/skills`, `/model roles`, `/config`. No AMP data needed.
+    Info,
 }
 
 impl PanelKind {
@@ -72,6 +83,7 @@ impl PanelKind {
             Self::Plan => "AMP · plan",
             Self::Project => "AMP · project",
             Self::Model => "model",
+            Self::Info => "settings",
         }
     }
 }
@@ -108,6 +120,10 @@ pub struct PanelState {
     pub note: Option<(String, bool)>,
     /// `/model`'s choices, in the order shown.
     pub models: Vec<ModelRow>,
+    /// [`PanelKind::Info`]'s content.
+    pub info: Option<Arc<InfoPanel>>,
+    /// Lines scrolled past the selection (a configuration panel longer than it shows).
+    pub scroll: usize,
 }
 
 /// One model in the `/model` picker.
@@ -132,6 +148,33 @@ impl PanelState {
             plan_blocked: None,
             note: None,
             models: Vec::new(),
+            info: None,
+            scroll: 0,
+        }
+    }
+
+    /// A configuration panel ([`PanelKind::Info`]); the row whose key is `select` is selected.
+    pub fn info(panel: Arc<InfoPanel>, select: Option<&str>) -> Self {
+        let selected = select
+            .and_then(|key| {
+                (panel.rows)()
+                    .iter()
+                    .filter(|r| r.key.is_some())
+                    .position(|r| r.key.as_deref() == Some(key))
+            })
+            .unwrap_or(0);
+        Self {
+            selected,
+            info: Some(panel),
+            ..Self::new(PanelKind::Info)
+        }
+    }
+
+    /// The panel's title rule text.
+    pub fn title(&self) -> String {
+        match &self.info {
+            Some(info) if self.kind == PanelKind::Info => info.title.clone(),
+            _ => self.kind.title().to_owned(),
         }
     }
 
@@ -144,6 +187,203 @@ impl PanelState {
             ..Self::new(PanelKind::Model)
         }
     }
+}
+
+// ------------------------------------------------------------------------------------------------
+// Configuration panels (#2245)
+// ------------------------------------------------------------------------------------------------
+
+/// How a cell of an [`InfoRow`] is coloured (the theme's own colours).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Ink: names, values.
+    Text,
+    /// Secondary detail.
+    Muted,
+    /// Labels and hints.
+    Dim,
+    Accent,
+    Success,
+    Warning,
+    Error,
+}
+
+/// One piece of an [`InfoRow`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cell {
+    pub text: String,
+    pub tone: Tone,
+    /// Shortened to the room left (at most one per row; the rest are kept whole or dropped).
+    pub flex: bool,
+    /// Padded with spaces to this many cells (a column), when it fits.
+    pub width: Option<usize>,
+}
+
+impl Cell {
+    pub fn new(text: impl Into<String>, tone: Tone) -> Self {
+        Self {
+            text: text.into(),
+            tone,
+            flex: false,
+            width: None,
+        }
+    }
+
+    /// A cell that is shortened when the row is too wide.
+    pub fn flex(text: impl Into<String>, tone: Tone) -> Self {
+        Self {
+            flex: true,
+            ..Self::new(text, tone)
+        }
+    }
+
+    /// Pads the cell to `width` cells (a column).
+    pub fn pad(mut self, width: usize) -> Self {
+        self.width = Some(width);
+        self
+    }
+}
+
+/// One line of an [`InfoPanel`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InfoRow {
+    pub cells: Vec<Cell>,
+    /// Selectable rows have a key: what `{}` stands for in the panel's commands.
+    pub key: Option<String>,
+    /// Which of the panel's letter keys apply to this row (`None`: all of them).
+    pub keys: Option<Vec<char>>,
+    /// Indent in cells. An indented row with one flex cell is wrapped text.
+    pub indent: usize,
+    /// A row of one flex cell that wraps at word boundaries instead of being shortened.
+    pub wrap: bool,
+}
+
+impl InfoRow {
+    pub fn new(cells: Vec<Cell>) -> Self {
+        Self {
+            cells,
+            ..Self::default()
+        }
+    }
+
+    /// A row of wrapped text, indented by `indent`.
+    pub fn text(text: impl Into<String>, tone: Tone, indent: usize) -> Self {
+        Self {
+            cells: vec![Cell::flex(text, tone)],
+            indent,
+            wrap: true,
+            ..Self::default()
+        }
+    }
+
+    /// `label  value`: a dim label padded to `width`, the value shortened to fit.
+    pub fn field(label: &str, width: usize, value: impl Into<String>, tone: Tone) -> Self {
+        Self::new(vec![
+            Cell::new(label, Tone::Dim).pad(width),
+            Cell::flex(value, tone),
+        ])
+    }
+
+    /// Makes the row selectable; `{}` in the panel's commands is `key`.
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = Some(key.into());
+        self
+    }
+
+    /// Only these letter keys apply to this row.
+    pub fn keys(mut self, keys: &[char]) -> Self {
+        self.keys = Some(keys.to_vec());
+        self
+    }
+
+    pub fn indent(mut self, n: usize) -> Self {
+        self.indent = n;
+        self
+    }
+}
+
+/// A letter key of an [`InfoPanel`]: runs `command` (with `{}` the selected row's key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PanelKey {
+    pub key: char,
+    /// What the hint says (`restart`).
+    pub label: String,
+    pub command: String,
+}
+
+impl PanelKey {
+    pub fn new(key: char, label: &str, command: &str) -> Self {
+        Self {
+            key,
+            label: label.to_owned(),
+            command: command.to_owned(),
+        }
+    }
+}
+
+/// The rows of an [`InfoPanel`], built at every render.
+pub type RowsFn = Arc<dyn Fn() -> Vec<InfoRow> + Send + Sync>;
+
+/// A configuration panel the harness describes (#2245). Rows come from `rows` at every render
+/// (live state); Enter runs `enter` and a letter key runs its [`PanelKey::command`] for the
+/// selected row, as slash commands.
+pub struct InfoPanel {
+    pub title: String,
+    pub rows: RowsFn,
+    /// Enter: (hint word, command), `{}` the selected row's key.
+    pub enter: Option<(String, String)>,
+    pub keys: Vec<PanelKey>,
+}
+
+impl std::fmt::Debug for InfoPanel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InfoPanel")
+            .field("title", &self.title)
+            .field("enter", &self.enter)
+            .field("keys", &self.keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl InfoPanel {
+    /// A panel with fixed rows.
+    pub fn fixed(title: impl Into<String>, rows: Vec<InfoRow>) -> Self {
+        Self::live(title, Arc::new(move || rows.clone()))
+    }
+
+    /// A panel whose rows are rebuilt at every render.
+    pub fn live(title: impl Into<String>, rows: RowsFn) -> Self {
+        Self {
+            title: title.into(),
+            rows,
+            enter: None,
+            keys: Vec::new(),
+        }
+    }
+
+    /// Enter runs `command` (hint: `word`).
+    pub fn on_enter(mut self, word: &str, command: &str) -> Self {
+        self.enter = Some((word.to_owned(), command.to_owned()));
+        self
+    }
+
+    pub fn with_key(mut self, key: char, label: &str, command: &str) -> Self {
+        self.keys.push(PanelKey::new(key, label, command));
+        self
+    }
+
+    /// The letter keys that apply to `row`.
+    pub fn keys_for(&self, row: &InfoRow) -> Vec<&PanelKey> {
+        self.keys
+            .iter()
+            .filter(|k| row.keys.as_ref().is_none_or(|only| only.contains(&k.key)))
+            .collect()
+    }
+}
+
+/// `command` with `{}` replaced by `key`.
+pub fn fill_command(command: &str, key: &str) -> String {
+    command.replace("{}", key)
 }
 
 /// The panel slot's shared state. Clones share it; the component reads it at every render.
@@ -203,16 +443,33 @@ impl Panel {
         self.rows().into_iter().filter_map(|r| r.target).collect()
     }
 
-    /// Moves the selection by `delta` among the selectable rows.
+    /// Moves the selection by `delta` among the selectable rows. In a configuration panel, ↓ at
+    /// the last selectable row scrolls the rest into view, and ↑ scrolls back first.
     pub fn move_selection(&self, delta: isize) {
-        let n = self.targets().len();
+        let rows = self.rows();
+        let n = rows.iter().filter(|r| r.target.is_some()).count();
+        // Never further than there are rows below the selection (wrapped rows may need a few
+        // more presses, never an endless run back up).
+        let room = rows.len().saturating_sub(MAX_INFO_ROWS.min(rows.len()));
         self.update(|s| {
+            let info = s.kind == PanelKind::Info;
+            if info && delta < 0 && s.scroll > 0 {
+                s.scroll = s.scroll.saturating_sub(delta.unsigned_abs());
+                return;
+            }
             if n == 0 {
                 s.selected = 0;
-            } else {
-                let at = s.selected.min(n - 1) as isize + delta;
-                s.selected = at.clamp(0, n as isize - 1) as usize;
+                if info && delta > 0 {
+                    s.scroll = (s.scroll + delta as usize).min(room + 2);
+                }
+                return;
             }
+            let last = n - 1;
+            let at = s.selected.min(last) as isize + delta;
+            if info && at > last as isize {
+                s.scroll = (s.scroll + (at - last as isize) as usize).min(room + 2);
+            }
+            s.selected = at.clamp(0, last as isize) as usize;
         });
     }
 
@@ -269,6 +526,8 @@ pub enum Target {
     Page(String),
     /// A model in `/model` (`provider/model`): Enter switches to it.
     Model(String),
+    /// A row of a configuration panel ([`InfoRow::key`]).
+    Item(String),
 }
 
 /// One piece of a row.
@@ -287,6 +546,8 @@ pub struct Row {
     pub target: Option<Target>,
     /// Indent in cells (continuation lines).
     pub indent: usize,
+    /// A single flex piece wraps at word boundaries (as an indented one does).
+    pub wrap: bool,
 }
 
 impl Row {
@@ -448,6 +709,9 @@ fn build_rows(state: &PanelState, data: Option<&ChromeData>, p: &AmpPalette) -> 
     if state.kind == PanelKind::Model {
         return model_rows(state);
     }
+    if state.kind == PanelKind::Info {
+        return info_rows(state);
+    }
     let Some(data) = data else {
         return vec![Row::new(vec![flex(
             "no AMP metadata: the chat is not connected to AMP's metadata poller",
@@ -462,6 +726,61 @@ fn build_rows(state: &PanelState, data: Option<&ChromeData>, p: &AmpPalette) -> 
         PanelKind::Plan => plan_rows(state, data, p),
         PanelKind::Project => project_rows(data, p),
         PanelKind::Model => model_rows(state),
+        PanelKind::Info => info_rows(state),
+    }
+}
+
+/// A configuration panel's rows as [`Row`]s: each cell styled whole, the flex one shortened.
+fn info_rows(state: &PanelState) -> Vec<Row> {
+    let c = colors();
+    let Some(info) = &state.info else {
+        return Vec::new();
+    };
+    let rows = (info.rows)();
+    if rows.is_empty() {
+        return vec![Row::new(vec![flex("nothing to show", c.dim)])];
+    }
+    rows.into_iter()
+        .map(|r| {
+            let pieces = r
+                .cells
+                .iter()
+                .map(|cell| {
+                    let color = tone_color(cell.tone);
+                    let mut text = clean(&cell.text);
+                    if let Some(w) = cell.width {
+                        let have = visible_width(&text);
+                        if have < w {
+                            text.push_str(&" ".repeat(w - have));
+                        }
+                    }
+                    if cell.flex {
+                        Piece::Flex(text, color)
+                    } else {
+                        Piece::Fixed(color.fg(&text))
+                    }
+                })
+                .collect();
+            let mut row = Row::new(pieces).indent(r.indent);
+            row.wrap = r.wrap;
+            if let Some(key) = r.key {
+                row = row.target(Target::Item(key));
+            }
+            row
+        })
+        .collect()
+}
+
+fn tone_color(tone: Tone) -> Color {
+    let c = colors();
+    match tone {
+        Tone::Text => c.text,
+        Tone::Muted => c.muted,
+        Tone::Dim => c.dim,
+        Tone::Accent => c.accent,
+        Tone::Success => c.success,
+        Tone::Warning => c.warning,
+        Tone::Error => c.error,
     }
 }
 
@@ -1347,7 +1666,59 @@ fn project_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
 // Rendering
 // ------------------------------------------------------------------------------------------------
 
-fn hint(state: &PanelState, has_targets: bool) -> String {
+/// The open configuration panel's selected row (what its keys act on).
+fn selected_info_row(state: &PanelState) -> Option<InfoRow> {
+    let info = state.info.as_ref()?;
+    let rows: Vec<InfoRow> = (info.rows)()
+        .into_iter()
+        .filter(|r| r.key.is_some())
+        .collect();
+    let at = state.selected.min(rows.len().checked_sub(1)?);
+    rows.into_iter().nth(at)
+}
+
+/// A configuration panel's hint: Enter's word and the letter keys that apply to the selected row.
+fn info_hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
+    let mut parts = Vec::new();
+    match (has_targets, overflow) {
+        (true, _) => parts.push("↑↓ select".to_owned()),
+        (false, true) => parts.push("↑↓ scroll".to_owned()),
+        (false, false) => {}
+    }
+    if let Some(info) = &state.info
+        && let Some(row) = selected_info_row(state)
+    {
+        if let Some((word, _)) = &info.enter {
+            parts.push(format!("Enter {word}"));
+        }
+        for k in info.keys_for(&row) {
+            parts.push(format!("{} {}", k.key, k.label));
+        }
+    }
+    parts.push("Esc close".to_owned());
+    parts.join(" · ")
+}
+
+/// The letter key's command for the selected row of a configuration panel, if `key` is one.
+pub fn info_command(state: &PanelState, key: char) -> Option<String> {
+    let info = state.info.as_ref()?;
+    let row = selected_info_row(state)?;
+    let k = info.keys_for(&row).into_iter().find(|k| k.key == key)?;
+    Some(fill_command(&k.command, row.key.as_deref()?))
+}
+
+/// Enter's command for the selected row of a configuration panel.
+pub fn info_enter(state: &PanelState) -> Option<String> {
+    let info = state.info.as_ref()?;
+    let row = selected_info_row(state)?;
+    let (_, command) = info.enter.as_ref()?;
+    Some(fill_command(command, row.key.as_deref()?))
+}
+
+fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
+    if state.kind == PanelKind::Info && state.stage == Stage::Browse {
+        return info_hint(state, has_targets, overflow);
+    }
     match (&state.stage, state.kind) {
         (Stage::Answer { .. }, _) => {
             "Enter (in the editor) review the answer · Esc cancel".to_owned()
@@ -1383,7 +1754,7 @@ pub fn render_panel(
     }
     let c = colors();
     let rule_char = rpi_tui::theme().border_style.chars().horizontal;
-    let title = format!(" {} ", state.kind.title());
+    let title = format!(" {} ", state.title());
     let title = shorten(&title, width.saturating_sub(2));
     let fill = width.saturating_sub(2 + visible_width(&title));
     let mut out = vec![format!(
@@ -1416,7 +1787,7 @@ pub fn render_panel(
             selected_line = lines.len();
         }
         // An indented single-flex row is wrapped text (a question, an answer).
-        if row.indent > 0
+        if (row.indent > 0 || row.wrap)
             && let [Piece::Flex(text, color)] = row.pieces.as_slice()
         {
             for part in wrap_plain(text, inner.saturating_sub(row.indent).max(1)) {
@@ -1431,8 +1802,14 @@ pub fn render_panel(
         let body = fit_pieces(&row.pieces, inner.saturating_sub(row.indent));
         lines.push(format!("{marker} {}{body}", " ".repeat(row.indent)));
     }
-    let start = selected_line.saturating_sub(MAX_ROWS.saturating_sub(2));
-    let end = (start + MAX_ROWS).min(lines.len());
+    let max_rows = if state.kind == PanelKind::Info {
+        MAX_INFO_ROWS
+    } else {
+        MAX_ROWS
+    };
+    let start = (selected_line.saturating_sub(max_rows.saturating_sub(2)) + state.scroll)
+        .min(lines.len().saturating_sub(max_rows));
+    let end = (start + max_rows).min(lines.len());
     if start > 0 {
         out.push(c.dim.fg(&shorten(&format!("  ↑ {start} more"), width)));
     }
@@ -1453,7 +1830,7 @@ pub fn render_panel(
     out.push(format!(
         "  {}",
         c.dim.fg(&shorten(
-            &hint(state, n_targets > 0),
+            &hint(state, n_targets > 0, lines.len() > max_rows),
             width.saturating_sub(2)
         ))
     ));
@@ -1484,7 +1861,7 @@ pub fn target_url(meta: &AmpMeta, target: &Target) -> Option<String> {
             Some(inst.ticket_url(meta.project_id?, *id))
         }
         Target::Page(url) => Some(url.clone()),
-        Target::Model(_) => None,
+        Target::Model(_) | Target::Item(_) => None,
     }
 }
 

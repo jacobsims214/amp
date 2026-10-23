@@ -65,7 +65,7 @@ pub struct ListArgs {
     json: bool,
 }
 
-#[derive(Args, Clone, Copy)]
+#[derive(Args, Clone, Copy, Default)]
 pub struct ScopeArgs {
     /// Write the user config.toml (the default).
     #[arg(long, conflicts_with = "repo")]
@@ -474,17 +474,37 @@ fn finish(outcome: &Outcome, json: bool) -> Result<(), CliError> {
 }
 
 async fn set(args: SetArgs) -> Result<(), CliError> {
-    let role = role_id(&args.role)?;
-    let thinking = args
-        .thinking
-        .as_deref()
+    let paths = paths()?;
+    let outcome = set_role_in(
+        &paths,
+        &args.role,
+        &args.model,
+        args.thinking.as_deref(),
+        args.scope,
+        args.no_check,
+    )
+    .await?;
+    finish(&outcome, args.json)
+}
+
+/// `models set` into `paths`' user (or repo) file, checked first; prints nothing. The CLI and the
+/// chat's `/model <role> <provider/model> --save` (#2245).
+pub(crate) async fn set_role_in(
+    paths: &amp_mcp::ConfigPaths,
+    role: &str,
+    model: &str,
+    thinking: Option<&str>,
+    scope: ScopeArgs,
+    no_check: bool,
+) -> Result<Outcome, CliError> {
+    let role = role_id(role)?;
+    let thinking = thinking
         .map(|t| parse_thinking(t).map(thinking_name))
         .transpose()
         .map_err(|e| CliError::usage(e.0))?;
-    let model_ref = args.model.trim().to_owned();
-    let paths = paths()?;
-    let target = Target::new(&paths, args.scope)?;
-    let config = current(&paths)?;
+    let model_ref = model.trim().to_owned();
+    let target = Target::new(paths, scope)?;
+    let config = current(paths)?;
     let keys = SystemKeys::from_env();
     let mut warnings = Vec::new();
     if config.role_source(&role).is_none()
@@ -497,15 +517,7 @@ async fn set(args: SetArgs) -> Result<(), CliError> {
             "`{role}` is a new role; it is used by an agent whose id is `{role}` or `amp-{role}`"
         ));
     }
-    let added = check_model(
-        &config,
-        &target,
-        &model_ref,
-        args.no_check,
-        &keys,
-        &mut warnings,
-    )
-    .await?;
+    let added = check_model(&config, &target, &model_ref, no_check, &keys, &mut warnings).await?;
 
     let tables = target.role_tables(&role)?;
     let section = match tables.as_slice() {
@@ -538,7 +550,7 @@ async fn set(args: SetArgs) -> Result<(), CliError> {
     let repo_scope = target.repo;
     let want = model_ref.clone();
     let role_for_check = role.clone();
-    let (changed, backup, after) = write(&paths, &target, &changes, &move |c: &ModelsConfig| {
+    let (changed, backup, after) = write(paths, &target, &changes, &move |c: &ModelsConfig| {
         let r = c.resolve_role(&role_for_check).map_err(|e| e.0)?;
         // Only the repo layer can override the user's choice; that is a warning, not a failure.
         if r.model_ref() != want && (repo_scope || !r.source.contains("repo ")) {
@@ -580,7 +592,7 @@ async fn set(args: SetArgs) -> Result<(), CliError> {
         },
         warnings,
     };
-    finish(&outcome, args.json)
+    Ok(outcome)
 }
 
 /// The table at a dotted path (role ids never contain `.`).

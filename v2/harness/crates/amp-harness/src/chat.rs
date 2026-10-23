@@ -40,6 +40,10 @@
 //! The shell gets the session's worker supervisor: quitting while `amp_run_ticket` runs cancels
 //! the workers and waits (bounded) until their abandoned runs are reported ([`Shell::quit`]).
 //!
+//! `/mcp`, `/agents`, `/skills`, `/model roles` and `/config` (#2245, [`crate::chat_config`]) are
+//! panels over the session's configuration; what they change is applied through `/reload`'s path.
+//! In `--snapshot`, `--input wait:mcp` waits (bounded) until no MCP server is still starting.
+//!
 //! `/reload` (#2242, [`crate::reload`]) picks up agents, skills, models and MCP servers changed by
 //! the CLI in another terminal; a watcher on those files does it on its own (not in
 //! `--snapshot`; `AMP_HARNESS_AUTO_RELOAD=0` turns it off). In `--snapshot`, `--input exec:<cmd>`
@@ -247,6 +251,19 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_server_control(Arc::clone(&switcher) as Arc<dyn amp_tui::ServerControl>);
     // `/reload` (#2242): CLI changes made in another terminal, without a restart.
     shell.set_reload(Arc::new(crate::reload::ChatReload::new(&session)));
+    // #2245: `/mcp`, `/agents`, `/skills`, `/model roles`, `/config`; their changes reload.
+    shell.set_config(Arc::new(crate::chat_config::ChatConfig::new(
+        crate::chat_config::ChatConfigParts {
+            rt: Arc::clone(&session.rt),
+            cwd: session.cwd.clone(),
+            role: session.agent.role.id.clone(),
+            settings: Some(settings.clone()),
+            workers: session.supervisor.as_ref().map(|s| s.config().clone()),
+            theme_flag: args.theme.clone(),
+            notes: shell.notifier(),
+            browser: args.snapshot.is_none(),
+        },
+    )));
     // AMP unreachable (#2178): say why and what to do, and keep trying in the background.
     let connected = Arc::new(AtomicBool::new(session.offline.is_none()));
     if let Some(e) = &session.offline {
@@ -271,6 +288,14 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             u.name,
             u.reason()
         ));
+    }
+    // #2245: `mcp 3/4` in the AMP status line.
+    {
+        let hub = Arc::clone(&session.rt.mcp_hub);
+        shell
+            .view()
+            .chrome()
+            .set_mcp(Arc::new(move || hub.summary()));
     }
     let mut events = session.events;
     // #2239: one transcript line per MCP server change ("github: 12 tools", a failure).
@@ -329,6 +354,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     for input in &args.inputs {
         if input == "wait:amp" {
             wait_connected(&mut shell, &connected).await?;
+        } else if input == "wait:mcp" {
+            wait_mcp(&mut shell, &hub).await?;
         } else if let Some(command) = input.strip_prefix("exec:") {
             exec_input(command).await?;
         } else if let Some(key) = input.strip_prefix("key:") {
@@ -440,6 +467,38 @@ async fn exec_input(command: &str) -> Result<(), CliError> {
             String::from_utf8_lossy(&out.stderr)
         )));
     }
+    Ok(())
+}
+
+/// How long `--input wait:mcp` waits for the MCP servers to settle.
+const SNAPSHOT_MCP_WAIT: Duration = Duration::from_secs(30);
+
+/// `--input wait:mcp` (#2245): waits (bounded) until no MCP server is starting, then applies the
+/// hub's transcript lines.
+async fn wait_mcp(shell: &mut Shell, hub: &amp_core::mcp_hub::McpHub) -> Result<(), CliError> {
+    use amp_core::mcp_hub::ServerStatus;
+    let deadline = tokio::time::Instant::now() + SNAPSHOT_MCP_WAIT;
+    loop {
+        let starting: Vec<String> = hub
+            .health()
+            .into_iter()
+            .filter(|h| h.status == ServerStatus::Starting)
+            .map(|h| h.name)
+            .collect();
+        if starting.is_empty() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CliError::new(format!(
+                "wait:mcp: still starting after {SNAPSHOT_MCP_WAIT:?}: {}",
+                starting.join(", ")
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // The hub's events reach the transcript through a forwarding task.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    shell.poll();
     Ok(())
 }
 

@@ -261,10 +261,18 @@ fn origin_kind(origin: &Origin) -> (&'static str, Option<String>) {
 }
 
 fn agent_report(ctx: &Ctx, loaded: &Loaded, role: &Role) -> AgentReport {
-    let asset = loaded
-        .assets
-        .agent(&role.id)
-        .expect("roles come from assets");
+    agent_report_from(ctx, &loaded.assets, &loaded.roles, &loaded.models, role)
+}
+
+/// One agent's report from what is loaded (the CLI's files, or a running chat's catalog, #2245).
+pub(crate) fn agent_report_from(
+    ctx: &Ctx,
+    assets: &Assets,
+    roles: &RoleRegistry,
+    models: &ModelsConfig,
+    role: &Role,
+) -> AgentReport {
+    let asset = assets.agent(&role.id).expect("roles come from assets");
     let (origin, path) = origin_kind(&asset.origin);
     let mut overrides = Vec::new();
     if Assets::embedded_agent_text(&role.id).is_some() && origin != "built-in" {
@@ -277,13 +285,9 @@ fn agent_report(ctx: &Ctx, loaded: &Loaded, role: &Role) -> AgentReport {
     {
         overrides.push("user");
     }
-    let resolved = role.resolve_model(&loaded.models);
-    let manager = loaded.roles.manager();
-    let dispatchable = loaded
-        .roles
-        .dispatchable(manager)
-        .iter()
-        .any(|r| r.id == role.id);
+    let resolved = role.resolve_model(models);
+    let manager = roles.manager();
+    let dispatchable = roles.dispatchable(manager).iter().any(|r| r.id == role.id);
     AgentReport {
         id: role.id.clone(),
         description: role.description.clone(),

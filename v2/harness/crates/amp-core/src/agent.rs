@@ -48,7 +48,7 @@
 //!   timeout kills it. Without a controlling terminal (CI, the supervisor) the open fails at once.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -185,7 +185,21 @@ pub struct Runtime {
     /// Every configured external MCP server (#2239). Built here, started by whoever runs sessions
     /// ([`McpHub::start`]); shut it down before the process exits ([`McpHub::shutdown`]).
     pub mcp_hub: Arc<McpHub>,
+    /// Role models set for this process only (the chat's `/model <role> <provider/model>`,
+    /// #2245), by role: (`provider/model`, thinking). [`Runtime::reload`] keeps them over what the
+    /// files say.
+    role_overrides: std::sync::RwLock<BTreeMap<String, RoleOverride>>,
 }
+
+/// A role's model set for this process only ([`Runtime::set_role_override`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleOverride {
+    pub model: String,
+    pub thinking: Option<String>,
+}
+
+/// The source a process-only role model reports.
+pub const ROLE_OVERRIDE_SOURCE: &str = "this chat (/model, until it ends)";
 
 /// The bash tool's default timeout when nothing configures one.
 pub const DEFAULT_BASH_TIMEOUT_SECS: f64 = 600.0;
@@ -470,7 +484,55 @@ impl Runtime {
             pass_env,
             bash_timeout,
             mcp_hub: Arc::new(mcp_hub),
+            role_overrides: std::sync::RwLock::new(BTreeMap::new()),
         })
+    }
+
+    /// Records `role`'s model for this process only (#2245), after checking it resolves against
+    /// the current models config. It takes effect with the next [`Runtime::reload`] (the chat
+    /// reloads at once), which keeps it over the files from then on.
+    pub fn set_role_override(
+        &self,
+        role: &str,
+        model_ref: &str,
+        thinking: Option<&str>,
+    ) -> Result<ResolvedRole, AgentError> {
+        let role = crate::models::normalize_role(role).to_owned();
+        let resolved = self.current_models().override_role(
+            &role,
+            model_ref,
+            thinking,
+            ROLE_OVERRIDE_SOURCE,
+        )?;
+        self.role_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                role,
+                RoleOverride {
+                    model: model_ref.trim().to_owned(),
+                    thinking: thinking.map(str::to_owned),
+                },
+            );
+        Ok(resolved)
+    }
+
+    /// Forgets `role`'s process-only model (it was saved to a file, or reset); true when there
+    /// was one. Takes effect with the next [`Runtime::reload`].
+    pub fn clear_role_override(&self, role: &str) -> bool {
+        self.role_overrides
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(crate::models::normalize_role(role))
+            .is_some()
+    }
+
+    /// The process-only role models, by role.
+    pub fn role_overrides(&self) -> BTreeMap<String, RoleOverride> {
+        self.role_overrides
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Also removes `name` from bash calls (the `--token-env` variable), unless it is in
@@ -558,7 +620,17 @@ impl Runtime {
     ) -> Result<Reloaded, AgentError> {
         // Read everything first: a failure here leaves the runtime as it was.
         let catalog = Catalog::load(&self.paths, &self.state_dir)?;
-        let models = ModelsConfig::load_paths(env, &self.paths)?;
+        let mut models = ModelsConfig::load_paths(env, &self.paths)?;
+        // #2245: a role set for this process in the chat stays set (a model that is gone is
+        // dropped from the overrides, and the role falls back to its files).
+        for (role, o) in self.role_overrides() {
+            if models
+                .override_role(&role, &o.model, o.thinking.as_deref(), ROLE_OVERRIDE_SOURCE)
+                .is_err()
+            {
+                self.clear_role_override(&role);
+            }
+        }
         let mcp_config = McpConfig::load(&self.paths);
 
         let old_catalog = self.catalog();

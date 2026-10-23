@@ -62,5 +62,10 @@ harness = false
 name = "mcp_cli"
 harness = false
 
+# tests/chat_panels.rs too (#2245).
+[[test]]
+name = "chat_panels"
+harness = false
+
 [lints]
 workspace = true

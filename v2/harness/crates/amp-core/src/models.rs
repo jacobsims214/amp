@@ -1109,6 +1109,39 @@ impl ModelsConfig {
             .map(|entry| entry.source.as_str())
     }
 
+    /// Sets `role`'s model in memory only (the chat's `/model <role> <provider/model>`, #2245):
+    /// it wins over every layer until the process ends or the role is set again. `source` says
+    /// where it came from. No `extra_body` (that was written for another model).
+    pub fn override_role(
+        &mut self,
+        role: &str,
+        model_ref: &str,
+        thinking: Option<&str>,
+        source: &str,
+    ) -> Result<ResolvedRole, ModelsError> {
+        let role = normalize_role(role);
+        if !self.knows_model(model_ref) {
+            return err(format!(
+                "`{model_ref}` is not a configured model (`amp-harness models list --available` \
+                 lists them)"
+            ));
+        }
+        if let Some(t) = thinking {
+            parse_thinking(t)?;
+        }
+        let entry = RoleEntry {
+            spec: RoleSpec {
+                model: Some(model_ref.trim().to_owned()),
+                thinking: thinking.map(str::to_owned),
+                extra_body: None,
+            },
+            source: source.to_owned(),
+        };
+        let resolved = self.resolve_entry(role, entry.clone())?;
+        self.roles.insert(role.to_owned(), entry);
+        Ok(resolved)
+    }
+
     /// Every role with an assignment, sorted.
     pub fn role_names(&self) -> Vec<String> {
         self.roles.keys().cloned().collect()
@@ -1673,6 +1706,46 @@ mod tests {
 
     /// #2234 (D11): a role with no [roles.<id>] still resolves: agent file model (if configured),
     /// then based_on, then [models] fallback (a role or provider/model), default worker-backend.
+    /// #2245: the chat's `/model <role> <provider/model>`: in memory, over every layer.
+    #[test]
+    fn a_role_override_wins_and_is_checked() {
+        let user = r#"
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
+[providers.wf.models."wf-2"]
+reasoning = true
+
+[roles.worker-backend]
+model = "wf/wf-1"
+extra_body = { seed = 1 }
+"#;
+        let mut c = config(user).unwrap();
+        let r = c
+            .override_role("amp-worker-backend", "wf/wf-2", Some("high"), "this chat")
+            .unwrap();
+        assert_eq!(r.model_ref(), "wf/wf-2");
+        let again = c.resolve_role("worker-backend").unwrap();
+        assert_eq!(again.model_ref(), "wf/wf-2");
+        assert_eq!(again.source, "this chat");
+        assert_eq!(again.requested_thinking, Some(ThinkingLevel::High));
+        // The old model's extra_body is not carried over.
+        assert!(!format!("{:?}", again.model).contains("seed"));
+        // Unknown models and bad thinking levels change nothing.
+        assert!(
+            c.override_role("worker-backend", "wf/nope", None, "x")
+                .is_err()
+        );
+        assert!(
+            c.override_role("worker-backend", "wf/wf-1", Some("loud"), "x")
+                .is_err()
+        );
+        assert_eq!(
+            c.resolve_role("worker-backend").unwrap().model_ref(),
+            "wf/wf-2"
+        );
+    }
+
     #[test]
     fn unconfigured_roles_fall_back() {
         let user = r#"

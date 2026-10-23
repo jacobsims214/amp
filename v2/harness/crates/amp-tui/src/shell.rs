@@ -39,6 +39,14 @@
 //! and rebuilds the providers; the running harness takes them with `set_models`, so the chat uses
 //! the new key without a restart.
 //!
+//! **Configuration panels (#2245).** `/mcp`, `/agents`, `/skills`, `/config` and the per-role
+//! forms of `/model` (`/model roles`, `/model <role> [provider/model] [--save]`) go to the
+//! binary's [`ConfigControl`] in the background; its [`ConfigReply`] opens an
+//! [`overlay::InfoPanel`], adds lines to the transcript, and (`reload: true`) runs the `/reload`
+//! path at once, so a change made from a panel reaches the session exactly as a CLI change does.
+//! Enter and the panel's letter keys run slash commands (`/mcp restart github`), so pressing `r`
+//! and typing the command behave the same.
+//!
 //! Quitting ([`Shell::quit`]) never drops a worker's run report (D8): with workers live it cancels
 //! them, aborts the prompt and waits, bounded by [`Shell::quit_bound`], until each worker has
 //! stopped and its `amp_report_run` has returned. Without workers it waits [`ABORT_GRACE`] for the
@@ -72,7 +80,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::amp_render::{self, ApprovalNotice};
-use crate::overlay::{self, ModelRow, PanelKind, PanelState, Stage, Target};
+use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, Stage, Target};
 use crate::slash::MenuKey;
 use crate::view::{ChatView, FooterInfo};
 use crate::workers::{SessionView, Source, stop_question};
@@ -122,10 +130,15 @@ enum ShellMsg {
         models: Option<Vec<ModelChoice>>,
     },
     Server(Result<ServerSwitched, String>),
-    /// `/reload` finished (`auto`: started by the file watcher, [`Notifier::reload`]).
+    /// `/reload` finished (`cause`: who asked for it).
     Reloaded {
         result: Result<ReloadReply, String>,
-        auto: bool,
+        cause: ReloadCause,
+    },
+    /// A configuration command finished (#2245); `command`: what was typed, for errors.
+    Config {
+        result: Result<ConfigReply, String>,
+        command: String,
     },
     /// The file watcher saw the configuration change: reload (not counted in `in_flight`).
     ReloadRequest,
@@ -203,6 +216,63 @@ pub struct ReloadReply {
 }
 
 pub type ReloadFuture = Pin<Box<dyn Future<Output = Result<ReloadReply, String>> + Send>>;
+
+/// Who asked for a reload: it decides what the transcript says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadCause {
+    /// `/reload`.
+    Command,
+    /// The file watcher ([`Notifier::reload`]): quiet when nothing changed.
+    Watcher,
+    /// A change made from a configuration panel (#2245): quiet start, "applied:" lines.
+    Panel,
+}
+
+/// What a configuration command did (#2245).
+#[derive(Default)]
+pub struct ConfigReply {
+    /// A panel to open (it replaces the open one).
+    pub panel: Option<Arc<InfoPanel>>,
+    /// Select the row with this key in the panel.
+    pub select: Option<String>,
+    /// Lines for the transcript (never a secret).
+    pub lines: Vec<String>,
+    /// Lines for the transcript, as errors.
+    pub errors: Vec<String>,
+    /// A one-line note at the bottom of the open panel (`true`: an error).
+    pub note: Option<(String, bool)>,
+    /// The configuration files changed: run the `/reload` path now so the session takes it.
+    pub reload: bool,
+}
+
+impl ConfigReply {
+    /// Opens `panel`.
+    pub fn panel(panel: InfoPanel) -> Self {
+        Self {
+            panel: Some(Arc::new(panel)),
+            ..Self::default()
+        }
+    }
+
+    /// A line in the transcript and the open panel's note.
+    pub fn done(line: impl Into<String>) -> Self {
+        let line = line.into();
+        Self {
+            note: Some((line.clone(), false)),
+            lines: vec![line],
+            ..Self::default()
+        }
+    }
+}
+
+pub type ConfigFuture = Pin<Box<dyn Future<Output = Result<ConfigReply, String>> + Send>>;
+
+/// The harness side of the configuration panels (#2245): `/mcp`, `/agents`, `/skills`,
+/// `/config`, and `/model` for a role. `name` is the command without its slash, `args` the rest.
+/// Writers change the same files the CLI does and ask for a reload ([`ConfigReply::reload`]).
+pub trait ConfigControl: Send + Sync {
+    fn run(&self, name: &str, args: &str) -> ConfigFuture;
+}
 
 /// The harness side of `/reload` (amp-harness): re-reads agents, skills, models and MCP servers
 /// changed by a CLI in another terminal and brings the chat's session up to date.
@@ -433,7 +503,12 @@ pub struct Shell {
     reload: Option<Arc<dyn ReloadControl>>,
     /// A reload is running; `reload_again` asks for one more when it ends.
     reloading: bool,
-    reload_again: bool,
+    reload_again: Option<ReloadCause>,
+    /// The configuration panels (#2245), if the caller gave them.
+    config: Option<Arc<dyn ConfigControl>>,
+    /// A slash command chosen in a configuration panel (Enter or a letter key), run by
+    /// [`Shell::key`] / [`Shell::press`] (commands are async; the panel keys are not).
+    pending_command: Option<String>,
     /// Until when the spinner line shows [`ESC_HINT`].
     esc_hint_until: Option<Instant>,
     /// Until when a second Ctrl+C on the empty editor quits ([`QUIT_HINT`]).
@@ -497,7 +572,9 @@ impl Shell {
                 switching: false,
                 reload: None,
                 reloading: false,
-                reload_again: false,
+                reload_again: None,
+                config: None,
+                pending_command: None,
                 esc_hint_until: None,
                 quit_hint_until: None,
                 ctrl_d_settle_until: None,
@@ -713,19 +790,108 @@ impl Shell {
         self.reload = Some(control);
     }
 
-    /// `/reload` (or the file watcher, `auto`): re-reads the configuration in the background; the
-    /// result is applied by [`Shell::poll`]. A reload asked for while one runs follows it.
-    fn reload_command(&mut self, auto: bool) {
+    /// Gives the shell the configuration panels (#2245).
+    pub fn set_config(&mut self, control: Arc<dyn ConfigControl>) {
+        self.config = Some(control);
+    }
+
+    /// `/mcp`, `/agents`, `/skills`, `/config`, `/model <role> …` (#2245): runs in the
+    /// background; [`Shell::poll`] applies the reply.
+    fn config_command(&mut self, name: &str, arg: &str) {
+        let Some(control) = self.config.clone() else {
+            self.view.add_notice(&format!(
+                "/{name}: not available in this session (`amp-harness {}` in a terminal)",
+                match name {
+                    "model" => "models",
+                    other => other,
+                }
+            ));
+            return;
+        };
+        let command = if arg.is_empty() {
+            format!("/{name}")
+        } else {
+            format!("/{name} {arg}")
+        };
+        self.in_flight += 1;
+        let tx = self.msgs_tx.clone();
+        let job = control.run(name, arg);
+        tokio::spawn(async move {
+            // Its own task, so a panic in the command still reports back.
+            let result = match tokio::spawn(job).await {
+                Ok(result) => result,
+                Err(e) => Err(format!("the command crashed: {e}")),
+            };
+            let _ = tx.send(ShellMsg::Config { result, command });
+        });
+    }
+
+    /// A configuration command's reply: the panel, the transcript, the note, then the reload.
+    fn apply_config(&mut self, result: Result<ConfigReply, String>, command: &str) {
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(e) => {
+                let e = crate::chrome::clean(&e);
+                self.view.panel().update(|s| {
+                    if s.kind == PanelKind::Info {
+                        s.note = Some((e.clone(), true));
+                    }
+                });
+                self.view.add_error(&format!("{command}: {e}"));
+                return;
+            }
+        };
+        if let Some(panel) = reply.panel {
+            // The same panel again (a refresh) keeps its selection.
+            let keep = self.view.panel().state().and_then(|s| {
+                (s.kind == PanelKind::Info
+                    && s.info.as_ref().is_some_and(|i| i.title == panel.title))
+                .then_some(s.selected)
+            });
+            let mut state = PanelState::info(panel, reply.select.as_deref());
+            if let (Some(at), None) = (keep, reply.select.as_deref()) {
+                state.selected = at;
+            }
+            self.view.panel().open(state);
+        }
+        if let Some(note) = reply.note {
+            self.view.panel().update(|s| {
+                if s.kind == PanelKind::Info {
+                    s.note = Some(note);
+                }
+            });
+        }
+        for line in &reply.lines {
+            self.view.add_notice(line);
+        }
+        for line in &reply.errors {
+            self.view.add_error(line);
+        }
+        if reply.reload {
+            self.reload_command(ReloadCause::Panel);
+        }
+    }
+
+    /// `/reload` (or the file watcher, or a panel's change): re-reads the configuration in the
+    /// background; the result is applied by [`Shell::poll`]. A reload asked for while one runs
+    /// follows it.
+    fn reload_command(&mut self, cause: ReloadCause) {
         let Some(control) = self.reload.clone() else {
-            if !auto {
+            if cause == ReloadCause::Command {
                 self.view
                     .add_notice("/reload: not available in this session");
             }
             return;
         };
         if self.reloading {
-            self.reload_again = true;
-            if !auto {
+            // A panel's or a person's request outranks the watcher's (it says what changed).
+            if self.reload_again != Some(ReloadCause::Command) {
+                self.reload_again = match (self.reload_again, cause) {
+                    (Some(ReloadCause::Panel), ReloadCause::Watcher) => Some(ReloadCause::Panel),
+                    _ => Some(cause),
+                };
+            }
+            if cause == ReloadCause::Command {
                 self.view
                     .add_notice("/reload: already reloading; once more when it is done");
             }
@@ -733,7 +899,7 @@ impl Shell {
         }
         self.reloading = true;
         self.in_flight += 1;
-        if !auto {
+        if cause == ReloadCause::Command {
             self.view
                 .add_notice("reloading agents, skills, models and MCP servers…");
         }
@@ -752,7 +918,7 @@ impl Shell {
                 },
                 Err(e) => Err(e),
             };
-            let _ = tx.send(ShellMsg::Reloaded { result, auto });
+            let _ = tx.send(ShellMsg::Reloaded { result, cause });
         });
     }
 
@@ -1193,6 +1359,7 @@ impl Shell {
                 self.show_esc_hint();
             }
             self.switch_pending_model().await;
+            self.run_pending_command().await;
             return true;
         }
         if self.scroll_key(key, editor_empty) {
@@ -1355,7 +1522,11 @@ impl Shell {
             )),
             "usage" => self.view.add_notice(&self.usage_text()),
             "model" if arg.is_empty() => self.model_picker(),
+            // `/model provider/model` switches this chat; `/model roles`, `/model <role> …` are a
+            // role's model (#2245).
+            "model" if !is_model_ref(arg) => self.config_command("model", arg),
             "model" => self.switch_model(arg).await,
+            "mcp" | "agents" | "skills" | "config" => self.config_command(name, arg),
             "connect" => self.connect_command(arg),
             "abort" => self.abort().await,
             "amp" => self.open_panel("amp", PanelKind::Amp),
@@ -1367,7 +1538,7 @@ impl Shell {
             "plan" => self.plan_command(),
             "open" => self.open_command(arg),
             "server" => self.server_command(arg),
-            "reload" => self.reload_command(false),
+            "reload" => self.reload_command(ReloadCause::Command),
             "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
@@ -1675,6 +1846,11 @@ impl Shell {
                             panel.close();
                             self.pending_model = Some(reference);
                         }
+                        Some(Target::Item(_)) => {
+                            if let Some(command) = overlay::info_enter(&state) {
+                                self.pending_command = Some(command);
+                            }
+                        }
                         // #2252: Enter on a worker opens its session (o still opens AMP).
                         Some(Target::Ticket { id, .. })
                             if state.kind == PanelKind::Workers && self.has_session(id) =>
@@ -1686,6 +1862,13 @@ impl Shell {
                         Some(target) => self.open_target(&target),
                         None => {}
                     },
+                    // A configuration panel's letter keys (#2245): before `o`, which they may use.
+                    KeyCode::Char(c)
+                        if state.kind == PanelKind::Info
+                            && overlay::info_command(&state, c).is_some() =>
+                    {
+                        self.pending_command = overlay::info_command(&state, c);
+                    }
                     KeyCode::Char('o') => {
                         if let Some(target) = panel.selected() {
                             self.open_target(&target);
@@ -1743,11 +1926,20 @@ impl Shell {
         }
         let used = self.panel_key(&key, true);
         self.switch_pending_model().await;
+        self.run_pending_command().await;
         Ok(used)
     }
 
+    /// Runs the slash command a configuration panel's key chose, if one did.
+    async fn run_pending_command(&mut self) {
+        if let Some(command) = self.pending_command.take() {
+            // Boxed: `submit` reaches `key` only through the terminal, never back here.
+            Box::pin(self.submit(&command)).await;
+        }
+    }
+
     fn open_target(&mut self, target: &Target) {
-        if matches!(target, Target::Model(_)) {
+        if matches!(target, Target::Model(_) | Target::Item(_)) {
             return;
         }
         let Some(meta) = &self.meta else { return };
@@ -1798,7 +1990,7 @@ impl Shell {
                 continue;
             }
             if let ShellMsg::ReloadRequest = &msg {
-                self.reload_command(true);
+                self.reload_command(ReloadCause::Watcher);
                 continue;
             }
             self.in_flight = self.in_flight.saturating_sub(1);
@@ -1841,13 +2033,14 @@ impl Shell {
                         Err(e) => self.view.add_error(&format!("/server: {e}")),
                     }
                 }
-                ShellMsg::Reloaded { result, auto } => {
+                ShellMsg::Reloaded { result, cause } => {
                     self.reloading = false;
-                    self.apply_reload(result, auto);
-                    if std::mem::take(&mut self.reload_again) {
-                        self.reload_command(true);
+                    self.apply_reload(result, cause);
+                    if let Some(again) = self.reload_again.take() {
+                        self.reload_command(again);
                     }
                 }
+                ShellMsg::Config { result, command } => self.apply_config(result, &command),
                 ShellMsg::Notice { .. } | ShellMsg::ReloadRequest => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
@@ -2026,7 +2219,7 @@ impl Shell {
         let mut state = PanelState::models(rows);
         state.note = Some((
             format!(
-                "now {} • thinking {} (role {})",
+                "now {} • thinking {} (role {}); /model roles: every role's model",
                 current,
                 thinking_name(self.info.thinking),
                 short_role(&self.info.role)
@@ -2059,11 +2252,15 @@ impl Shell {
     /// A finished reload: the transcript says what changed; `/model` gets the new choices; the
     /// chat's role's new model (from the config) is switched to like `/model` would, from the
     /// next run.
-    fn apply_reload(&mut self, result: Result<ReloadReply, String>, auto: bool) {
+    fn apply_reload(&mut self, result: Result<ReloadReply, String>, cause: ReloadCause) {
         let reply = match result {
             Ok(reply) => reply,
             Err(e) => {
-                let what = if auto { "auto-reload" } else { "/reload" };
+                let what = match cause {
+                    ReloadCause::Watcher => "auto-reload",
+                    ReloadCause::Command => "/reload",
+                    ReloadCause::Panel => "applying the change",
+                };
                 self.view
                     .add_error(&format!("{what}: {}", crate::chrome::clean(&e)));
                 return;
@@ -2119,15 +2316,17 @@ impl Shell {
             });
         }
         if lines.is_empty() {
-            if !auto {
+            if cause == ReloadCause::Command {
                 self.view
                     .add_notice("reloaded: nothing changed since the last load");
             }
         } else {
-            let head = if auto {
-                "configuration changed elsewhere; reloaded (workers already running keep theirs):"
-            } else {
-                "reloaded (workers already running keep theirs):"
+            let head = match cause {
+                ReloadCause::Watcher => {
+                    "configuration changed elsewhere; reloaded (workers already running keep theirs):"
+                }
+                ReloadCause::Command => "reloaded (workers already running keep theirs):",
+                ReloadCause::Panel => "applied (workers already running keep theirs):",
             };
             self.view
                 .add_notice(&format!("{head}\n  {}", lines.join("\n  ")));
@@ -2216,7 +2415,6 @@ impl Shell {
     }
 }
 
-/// `2108` or `#2108`.
 /// Worker sessions (#2252): open one, follow it, switch, go back, stop.
 impl Shell {
     /// Who the chat says stopped a worker (`stopped by <person> from the chat`). Without it, the
@@ -2567,6 +2765,15 @@ impl Shell {
     }
 }
 
+/// Whether `/model`'s argument is this chat's model (`provider/model`), not a role (#2245):
+/// the first word holds a `/`.
+fn is_model_ref(arg: &str) -> bool {
+    arg.split_whitespace()
+        .next()
+        .is_some_and(|w| w.contains('/'))
+}
+
+/// `2108` or `#2108`.
 fn parse_id(arg: &str) -> Option<i64> {
     arg.trim()
         .trim_start_matches('#')

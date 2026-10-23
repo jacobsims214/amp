@@ -266,16 +266,20 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
     rig.shell.submit("/help").await;
     // Tall enough for the whole list.
     let screen = rig.shell.view().render_plain(W, 80).join("\n");
-    for heading in ["AMP", "Chat", "Keys"] {
+    for heading in ["AMP", "Config", "Chat", "Keys"] {
         assert!(
             screen.lines().any(|l| l.trim() == heading),
             "{heading}\n{screen}"
         );
     }
     let amp = screen.find("\n   AMP\n").expect("AMP heading");
+    let config = screen.find("\n   Config\n").expect("Config heading");
     let chat = screen.find("\n   Chat\n").expect("Chat heading");
     let keys = screen.find("\n   Keys\n").expect("Keys heading");
-    assert!(amp < chat && chat < keys, "AMP first, then Chat, then Keys");
+    assert!(
+        amp < config && config < chat && chat < keys,
+        "AMP first, then Config, Chat, Keys"
+    );
 
     // Full contrast: AMP commands are drawn in the text colour, never dim.
     let colors = rpi_tui::theme().colors;
@@ -309,7 +313,7 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         }))
-        .chain(["AMP", "Chat", "Keys"].map(str::to_owned))
+        .chain(["AMP", "Config", "Chat", "Keys"].map(str::to_owned))
         .collect();
     for row in &rows {
         assert!(

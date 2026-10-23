@@ -7,7 +7,7 @@
 //!   name being typed (one line, no space yet), filtered by prefix. ↑↓ move, Tab completes the
 //!   selected command into the editor, Enter runs it, Esc dismisses the menu until the text
 //!   changes. It reads the editor at render time, so it follows every keystroke without a hook.
-//! - [`HelpBlock`]: `/help` as a grouped two-column list (AMP, Chat, Keys) at full contrast, the
+//! - [`HelpBlock`]: `/help` as a grouped two-column list (AMP, Config, Chat, Keys) at full contrast, the
 //!   descriptions word-wrapped under their column ([`crate::wrap`]); on a narrow screen each
 //!   description goes under its command instead.
 
@@ -26,6 +26,8 @@ use crate::wrap::wrap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Group {
     Amp,
+    /// Models, providers, MCP servers, agents, skills and settings (#2245).
+    Config,
     Chat,
 }
 
@@ -33,6 +35,7 @@ impl Group {
     pub fn title(self) -> &'static str {
         match self {
             Group::Amp => "AMP",
+            Group::Config => "Config",
             Group::Chat => "Chat",
         }
     }
@@ -158,19 +161,43 @@ pub const COMMANDS: &[CommandSpec] = &[
         "the AMP servers; switch to another",
     ),
     CommandSpec::new(
-        Group::Chat,
+        Group::Config,
         "model",
-        "[provider/model]",
-        "pick the model for this session",
+        "[p/m|roles|role]",
+        "this chat's model; /model roles: every role's",
     ),
     CommandSpec::new(
-        Group::Chat,
+        Group::Config,
         "connect",
         "[provider]",
         "model providers and their keys; add a key",
     ),
     CommandSpec::new(
-        Group::Chat,
+        Group::Config,
+        "mcp",
+        "[name|action name]",
+        "MCP servers: health, restart, enable, trust",
+    ),
+    CommandSpec::new(
+        Group::Config,
+        "agents",
+        "[id]",
+        "agents: model, skills, which file they're from",
+    ),
+    CommandSpec::new(
+        Group::Config,
+        "skills",
+        "[name]",
+        "skills: what each does, where it's from",
+    ),
+    CommandSpec::new(
+        Group::Config,
+        "config",
+        "",
+        "every setting and where it comes from",
+    ),
+    CommandSpec::new(
+        Group::Config,
         "reload",
         "",
         "reload agents, skills, models, MCP servers",
@@ -432,7 +459,7 @@ impl Component for CommandMenu {
     }
 }
 
-/// `/help`: AMP, Chat and Keys, each a two-column list (command and arguments, then what it
+/// `/help`: AMP, Config, Chat and Keys, each a two-column list (command and arguments, then what it
 /// does), at full contrast. Descriptions word-wrap under their column; below
 /// [`HelpBlock::TWO_COLUMNS`] cells of description room they go under the command instead.
 /// The Keys group follows the mouse-capture setting ([`keys`]).
@@ -467,7 +494,7 @@ impl HelpBlock {
     /// The rows of each group: (group title, [(left column, description)]).
     fn groups(&self) -> Vec<(&'static str, Vec<(String, &'static str)>)> {
         let mut groups = Vec::new();
-        for group in [Group::Amp, Group::Chat] {
+        for group in [Group::Amp, Group::Config, Group::Chat] {
             let rows = COMMANDS
                 .iter()
                 .filter(|c| c.group == group)
@@ -580,16 +607,25 @@ mod tests {
     }
 
     #[test]
-    fn amp_commands_come_first() {
-        let first_chat = COMMANDS
-            .iter()
-            .position(|c| c.group == Group::Chat)
-            .unwrap();
-        assert!(COMMANDS[..first_chat].iter().all(|c| c.group == Group::Amp));
+    fn amp_commands_come_first_then_config_then_chat() {
+        let order = |g: Group| match g {
+            Group::Amp => 0,
+            Group::Config => 1,
+            Group::Chat => 2,
+        };
         assert!(
-            COMMANDS[first_chat..]
-                .iter()
-                .all(|c| c.group == Group::Chat)
+            COMMANDS
+                .windows(2)
+                .all(|w| order(w[0].group) <= order(w[1].group)),
+            "grouped in order"
         );
+        for g in [Group::Amp, Group::Config, Group::Chat] {
+            assert!(COMMANDS.iter().any(|c| c.group == g), "{g:?}");
+        }
+        for name in [
+            "mcp", "agents", "skills", "config", "model", "connect", "reload",
+        ] {
+            assert_eq!(find(name).unwrap().group, Group::Config, "/{name}");
+        }
     }
 }

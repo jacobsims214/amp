@@ -612,7 +612,8 @@ async fn without_metadata_the_commands_say_so() {
     assert!(!rig.shell.view().panel().is_open());
     assert!(rig.opened().is_empty());
     rig.say("/help").await;
-    let screen = rig.screen();
+    // Tall enough for the whole list (#2245 added the Config group).
+    let screen = rig.shell.view().render_plain(W, 90).join("\n");
     for usage in ["/questions", "/plan", "/project [id]", "/open [id|plan]"] {
         assert!(screen.contains(usage), "{usage}\n{screen}");
     }
