@@ -215,6 +215,16 @@ async fn ticket_shows_and_switches_the_current_ticket() {
         screen.contains("state in_progress · assigned amp:amp-worker-backend"),
         "{screen}"
     );
+    // #2213: the dispatch time is relative like the rest of the chrome, not raw RFC 3339.
+    let amp_row = screen
+        .lines()
+        .find(|l| l.contains("AMP      state in_progress"))
+        .unwrap_or_else(|| panic!("AMP row\n{screen}"));
+    assert!(
+        amp_row.contains("· dispatched ") && amp_row.trim_end().ends_with(" ago"),
+        "{amp_row}"
+    );
+    assert!(!amp_row.contains("2026-10-22T"), "{amp_row}");
     assert!(
         screen.contains("this session has not reported a run"),
         "{screen}"
