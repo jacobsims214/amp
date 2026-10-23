@@ -14,7 +14,10 @@
 //!   - its `on_finish` reports every worker that ended without closing its ticket (error,
 //!     timeout, cancel, turn budget, or it just stopped) with `amp_report_run` (outcome
 //!     `abandoned`, `run_note` "abandoned: <reason>"), the same usage and git fields, so the
-//!     run and its tokens are on the ticket and the manager sees it as quiet.
+//!     run and its tokens are on the ticket and the manager sees it as quiet. A worker the chat
+//!     stopped (`cancelled`: Esc/Ctrl+C on the reply, or quitting) leaves nobody on its ticket,
+//!     so its ticket is also handed back to ready ([`WorkerHooks::release`]:
+//!     `amp_set_task_state` backlog, with a "returned to ready by amp-harness" reason; #2204).
 //! - [`SessionUsageTool`] is the native `amp_session_usage`, so the existing prompts (amp-execution
 //!   step 6) keep working: the session's own model, tokens and cost so far.
 //!
@@ -40,7 +43,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     events::Totals,
-    supervisor::{BLOCK_TOOL, COMPLETE_TOOL, WorkerHooks, WorkerInfo, WorkerReport, task_id_arg},
+    supervisor::{
+        BLOCK_TOOL, COMPLETE_TOOL, WorkerHooks, WorkerInfo, WorkerOutcome, WorkerReport,
+        task_id_arg,
+    },
     tools::result_text,
 };
 
@@ -50,8 +56,14 @@ pub const SESSION_USAGE_TOOL: &str = "amp_session_usage";
 pub const REPORT_RUN_TOOL: &str = "amp_report_run";
 /// The `amp_report_run` outcome for a worker that ended without closing its ticket.
 pub const ABANDONED: &str = "abandoned";
+/// AMP's tool that hands an abandoned ticket back (in progress -> ready).
+pub const SET_STATE_TOOL: &str = "amp_set_task_state";
+/// The AMP state "ready" is stored as (AMP keeps it blocked while a dependency is open).
+pub const READY_STATE: &str = "backlog";
 /// How long `on_finish` waits for AMP to take an abandoned run (shutdown waits on it).
 const REPORT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long handing an abandoned ticket back may take.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the git commands behind the run fields may take.
 const GIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `run_note` is one line; long errors are cut.
@@ -255,6 +267,17 @@ impl RunReporter {
     }
 }
 
+/// The history line of a ticket returned to ready: `returned to ready by amp-harness: <why>`,
+/// one line, cut to [`NOTE_MAX_CHARS`].
+pub fn release_reason(why: &str) -> String {
+    let why = why.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut reason = format!("returned to ready by amp-harness: {why}");
+    if reason.chars().count() > NOTE_MAX_CHARS {
+        reason = reason.chars().take(NOTE_MAX_CHARS - 1).collect::<String>() + "…";
+    }
+    reason
+}
+
 type HookFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<BeforeToolCallResult>> + Send>>;
 
@@ -309,6 +332,40 @@ impl WorkerHooks for RunReporter {
         }
         let note = self.report_abandoned(worker, report).await;
         report.notes.push(note);
+        // #2204: a worker the chat stopped (Esc/Ctrl+C on the reply, or quitting) leaves nobody
+        // on its ticket: hand it back so it isn't stuck in progress. Other ends (error, timeout,
+        // turn budget, stopped) go back to a live manager, which decides what happens next.
+        if report.outcome == WorkerOutcome::Cancelled {
+            let id = worker.task_id;
+            report
+                .notes
+                .push(match self.release(id, &abandoned_note(report)).await {
+                    Ok(()) => {
+                        format!("returned #{id} to ready in AMP (nobody is working on it now)")
+                    }
+                    Err(e) => format!("could not return #{id} to ready in AMP: {e}"),
+                });
+        }
+    }
+
+    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
+        let args = json!({
+            "task_id": task_id,
+            "state": READY_STATE,
+            "reason": release_reason(why),
+        });
+        let Value::Object(args) = args else {
+            unreachable!()
+        };
+        match self
+            .mcp
+            .call_tool_with_timeout(SET_STATE_TOOL, Some(args), RELEASE_TIMEOUT)
+            .await
+        {
+            Ok(r) if r.is_error == Some(true) => Err(result_text(&r).trim().to_owned()),
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        }
     }
 }
 

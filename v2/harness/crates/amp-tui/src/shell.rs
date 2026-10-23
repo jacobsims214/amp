@@ -43,6 +43,14 @@
 //! them, aborts the prompt and waits, bounded by [`Shell::quit_bound`], until each worker has
 //! stopped and its `amp_report_run` has returned. Without workers it waits [`ABORT_GRACE`] for the
 //! aborted prompt so its session file is complete.
+//!
+//! **Quitting with a worker running (#2204).** While a worker of this chat is live, the first quit
+//! (Ctrl+C, also mid-reply, since stopping the reply stops the worker; Ctrl+C twice on the empty
+//! editor; Ctrl+D; `/quit`) only warns ([`worker_quit_warning`]): "a worker is running on #190 —
+//! quit anyway? it will be returned to ready". Another quit within [`QUIT_CONFIRM_FOR`] quits.
+//! Esc and `/abort` still just stop the reply, with a note that the worker stops too. A stopped or abandoned worker's ticket is handed back to ready in
+//! AMP (run reporting's `on_finish`; [`Supervisor::release_unfinished`] when quitting without
+//! waiting), so it is not left in progress with nobody on it. Signals still quit at once.
 
 use std::{
     future::Future,
@@ -257,6 +265,47 @@ pub const QUIT_HINT: &str = "Press Ctrl+C again to quit";
 /// How long a second Ctrl+C on the empty editor still quits.
 pub const QUIT_HINT_FOR: Duration = Duration::from_millis(1500);
 
+/// How long, after [`worker_quit_warning`], the same quit again goes through (#2204).
+pub const QUIT_CONFIRM_FOR: Duration = Duration::from_secs(10);
+
+/// What the empty editor says while a quit is waiting to be confirmed.
+pub const QUIT_CONFIRM_HINT: &str = "Quit again to stop the worker and leave";
+
+/// How long quitting without waiting still gives AMP to take the abandoned tickets back.
+pub const RELEASE_BOUND: Duration = Duration::from_secs(5);
+
+/// The warning the first quit shows while workers of this chat are live (#2204).
+pub fn worker_quit_warning(tickets: &[i64]) -> String {
+    let ids = tickets
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (who, it) = if tickets.len() == 1 {
+        ("a worker is", "it")
+    } else {
+        ("workers are", "they")
+    };
+    format!(
+        "{who} running on {ids} — quit anyway? {it} will be returned to ready \
+         (Ctrl+C, Ctrl+D or /quit again to quit)"
+    )
+}
+
+/// The note when stopping the reply also stops this chat's workers (#2204).
+pub fn worker_stop_notice(tickets: &[i64]) -> String {
+    let ids = tickets
+        .iter()
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if tickets.len() == 1 {
+        format!("stopping the worker on {ids} too; its ticket goes back to ready")
+    } else {
+        format!("stopping the workers on {ids} too; their tickets go back to ready")
+    }
+}
+
 /// After Ctrl+D scrolled the transcript (or was held at its end), Ctrl+D on the empty editor
 /// doesn't quit until it has been left alone this long, so scrolling down with it (or holding
 /// it) stops at the latest output instead of quitting (#2185).
@@ -269,6 +318,8 @@ pub enum CtrlD {
     Scrolled,
     /// At the latest output within [`CTRL_D_SETTLE`] of scrolling with Ctrl+D: nothing.
     Held,
+    /// A worker of this chat is live: the quit only warned ([`worker_quit_warning`]).
+    Confirm,
     /// A run was going: it was asked to stop.
     Stopped,
     /// Quit.
@@ -284,6 +335,9 @@ pub enum CtrlC {
     Cleared,
     /// The editor was empty: it now says [`QUIT_HINT`] for [`QUIT_HINT_FOR`].
     Hint,
+    /// A second Ctrl+C on the empty editor within [`QUIT_HINT_FOR`], with a worker of this chat
+    /// live: the quit only warned ([`worker_quit_warning`]); one more Ctrl+C quits.
+    Confirm,
     /// A second Ctrl+C on the empty editor within [`QUIT_HINT_FOR`]: quit.
     Quit,
 }
@@ -339,6 +393,10 @@ pub struct Shell {
     quit_hint_until: Option<Instant>,
     /// Until when Ctrl+D at the latest output doesn't quit ([`CTRL_D_SETTLE`]).
     ctrl_d_settle_until: Option<Instant>,
+    /// Until when a quit goes through although workers are live ([`QUIT_CONFIRM_FOR`]).
+    quit_confirm_until: Option<Instant>,
+    /// What quitting without waiting did with the abandoned tickets ([`Shell::released`]).
+    released: Vec<(i64, Result<(), String>)>,
     /// Whether the terminal reports the mouse to us (wheel scrolling, the pill's click). Off,
     /// the terminal's own click-drag selection works without a modifier (`[tui] mouse`, #2185).
     mouse_capture: bool,
@@ -384,6 +442,8 @@ impl Shell {
                 esc_hint_until: None,
                 quit_hint_until: None,
                 ctrl_d_settle_until: None,
+                quit_confirm_until: None,
+                released: Vec::new(),
                 mouse_capture: true,
             },
             done_rx,
@@ -617,7 +677,7 @@ impl Shell {
             // The manager may be starting a worker right now: nothing new may start.
             sup.cancel_all();
         }
-        self.abort().await;
+        self.abort_quietly().await;
         tokio::pin!(skip);
         let mut ticker = tokio::time::interval(Duration::from_millis(120));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -654,16 +714,76 @@ impl Shell {
                 }
                 () = &mut skip => {
                     self.view.add_notice("quitting without waiting");
-                    repaint(self);
+                    self.release_unfinished("the chat quit without waiting for its worker", &mut repaint).await;
                     return QuitOutcome::Skipped;
                 }
                 () = tokio::time::sleep_until(deadline) => {
                     self.view.add_notice("gave up waiting");
-                    repaint(self);
+                    self.release_unfinished("the chat quit before its worker stopped", &mut repaint).await;
                     return QuitOutcome::TimedOut;
                 }
                 _ = ticker.tick() => {}
             }
+        }
+    }
+
+    /// Quitting without waiting: the workers' own `on_finish` won't run, so hand their tickets
+    /// back to ready now, within [`RELEASE_BOUND`] (#2204).
+    async fn release_unfinished<R: FnMut(&Self)>(&mut self, why: &str, repaint: &mut R) {
+        let Some(sup) = self.supervisor.clone() else {
+            repaint(self);
+            return;
+        };
+        let ids = sup.unfinished();
+        if ids.is_empty() {
+            repaint(self);
+            return;
+        }
+        let list = ids
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.view
+            .add_notice(&format!("returning {list} to ready in AMP…"));
+        repaint(self);
+        self.released = sup.release_unfinished(why, RELEASE_BOUND).await;
+        repaint(self);
+    }
+
+    /// What quitting without waiting did with each abandoned ticket: `Ok` when AMP has it back
+    /// in ready. Empty when the workers settled (their `on_finish` handed them back).
+    pub fn released(&self) -> &[(i64, Result<(), String>)] {
+        &self.released
+    }
+
+    /// Whether a quit may go ahead at `now` (#2204). With no worker of this chat live, always.
+    /// Otherwise the first quit shows [`worker_quit_warning`] and returns false; another quit
+    /// within [`QUIT_CONFIRM_FOR`] returns true.
+    pub fn confirm_quit(&mut self, now: Instant) -> bool {
+        let live = self.live_tickets();
+        if live.is_empty() {
+            self.clear_quit_confirm();
+            return true;
+        }
+        if self.quit_confirm_until.is_some_and(|until| now < until) {
+            self.clear_quit_confirm();
+            return true;
+        }
+        self.quit_confirm_until = Some(now + QUIT_CONFIRM_FOR);
+        self.view.add_warning(&worker_quit_warning(&live));
+        self.view.set_editor_hint(Some(QUIT_CONFIRM_HINT));
+        false
+    }
+
+    /// A quit is waiting to be confirmed ([`Shell::confirm_quit`]).
+    pub fn quit_confirm_pending(&self) -> bool {
+        self.quit_confirm_until.is_some()
+    }
+
+    fn clear_quit_confirm(&mut self) {
+        if self.quit_confirm_until.take().is_some() {
+            self.view.set_editor_hint(None);
         }
     }
 
@@ -791,6 +911,18 @@ impl Shell {
     /// Asks the running prompt to stop; it then finishes as aborted, and the transcript says
     /// "Stopped." once, below whatever the reply had streamed ([`Shell::finish_run`]).
     pub async fn abort(&mut self) {
+        if self.running {
+            let live = self.live_tickets();
+            if !live.is_empty() {
+                // Stopping the reply cancels the manager's amp_run_ticket, and so its workers.
+                self.view.add_warning(&worker_stop_notice(&live));
+            }
+        }
+        self.abort_quietly().await;
+    }
+
+    /// [`Shell::abort`] without the note about workers ([`Shell::quit`] says its own).
+    async fn abort_quietly(&mut self) {
         if !self.running {
             return;
         }
@@ -916,9 +1048,13 @@ impl Shell {
             return CtrlD::Held;
         }
         self.ctrl_d_settle_until = None;
-        if self.running {
+        if self.running && self.live_tickets().is_empty() {
             self.abort().await;
             return CtrlD::Stopped;
+        }
+        // With a worker of this chat live (in this reply or still reporting), ask first (#2204).
+        if !self.confirm_quit(now) {
+            return CtrlD::Confirm;
         }
         CtrlD::Quit
     }
@@ -936,9 +1072,23 @@ impl Shell {
 
     /// Ctrl+C at `now` (#2184): stops a running reply, else clears a non-empty editor, else
     /// shows [`QUIT_HINT`] in the empty editor; a second Ctrl+C there within [`QUIT_HINT_FOR`]
-    /// returns [`CtrlC::Quit`]. `/quit`, Ctrl+D and signals still quit at once, and Ctrl+C
-    /// during the "stopping N workers" wait skips it ([`Shell::quit`]).
+    /// returns [`CtrlC::Quit`]. With a worker of this chat live, Ctrl+C never stops the reply
+    /// (and the worker) or quits silently: it warns first ([`CtrlC::Confirm`],
+    /// [`Shell::confirm_quit`]) and the next Ctrl+C quits (#2204). Signals still quit
+    /// at once, and Ctrl+C during the "stopping N workers" wait skips it ([`Shell::quit`]).
     pub async fn ctrl_c(&mut self, now: Instant) -> CtrlC {
+        if self.running && !self.live_tickets().is_empty() {
+            // A worker of this chat is running inside this reply: stopping the reply would stop
+            // it too, which is what the person pressing Ctrl+C (to quit) may not know. Ask first;
+            // the next Ctrl+C quits (the quit stops and reports the workers). Esc still only
+            // stops the reply.
+            self.clear_quit_hint();
+            return if self.confirm_quit(now) {
+                CtrlC::Quit
+            } else {
+                CtrlC::Confirm
+            };
+        }
         if self.running {
             self.clear_quit_hint();
             self.abort().await;
@@ -949,8 +1099,16 @@ impl Shell {
             self.view.editor().clear();
             return CtrlC::Cleared;
         }
+        if self.quit_confirm_until.is_some_and(|until| now < until) {
+            // The worker warning is up: this Ctrl+C confirms it.
+            self.clear_quit_confirm();
+            return CtrlC::Quit;
+        }
         if self.quit_hint_until.is_some_and(|until| now < until) {
             self.clear_quit_hint();
+            if !self.confirm_quit(now) {
+                return CtrlC::Confirm;
+            }
             return CtrlC::Quit;
         }
         self.quit_hint_until = Some(now + QUIT_HINT_FOR);
@@ -979,12 +1137,20 @@ impl Shell {
             self.clear_quit_hint();
             changed = true;
         }
+        if self.quit_confirm_until.is_some_and(|until| now >= until) {
+            self.clear_quit_confirm();
+            changed = true;
+        }
         changed
     }
 
     async fn command(&mut self, name: &str, arg: &str) -> Submit {
         match name {
-            "quit" | "exit" | "q" => return Submit::Quit,
+            "quit" | "exit" | "q" => {
+                if self.confirm_quit(Instant::now()) {
+                    return Submit::Quit;
+                }
+            }
             "help" | "?" => self
                 .view
                 .add_to_transcript(Arc::new(crate::slash::HelpBlock::new())),

@@ -127,7 +127,7 @@ fn plain_layout_at_80_and_160() {
         "■  2 QUESTIONS  │ plan: 2 waiting for your approval"
     );
     assert!(
-        wide[2].contains("│ workers 3 ■ running · 1 queued │ plan: 2 waiting for your approval │")
+        wide[2].contains("│ workers 1 ■ running · 1 queued │ plan: 2 waiting for your approval │")
     );
 }
 
@@ -150,7 +150,7 @@ fn every_width_fits() {
 }
 
 /// `data` shaped like the live board the #2109 review saw at 80 columns: two questions, two
-/// workers running elsewhere, eight tickets awaiting plan approval, and the current ticket #67
+/// workers of this chat running (#67, #68), eight tickets awaiting plan approval, and the current ticket #67
 /// unreported.
 fn live_like() -> ChromeData {
     let mut meta = sample::meta(true);
@@ -163,7 +163,28 @@ fn live_like() -> ChromeData {
     board.in_progress_tickets[0].id = 67;
     board.in_progress_tickets[1].id = 68;
     meta.plan.value.as_mut().unwrap().awaiting_approval = (100..108).collect();
-    ChromeData::new(meta)
+    let mut data = ChromeData::new(meta);
+    data.workers = vec![
+        sample::worker(67, WorkerPhase::Running),
+        sample::worker(68, WorkerPhase::Running),
+    ];
+    data
+}
+
+#[test]
+fn tickets_in_progress_elsewhere_are_not_workers_of_this_chat() {
+    // #2204: a fresh chat whose board has tickets in progress (another chat's, or a run an
+    // earlier chat abandoned) has no workers of its own: `workers 0`, and the board counts them.
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let mut data = live_like();
+    data.workers.clear();
+    let status = plain(&render_status(&data, &palette(), 160)[0]);
+    assert!(
+        status.starts_with(
+            "■  2 QUESTIONS  │ workers 0 │ plan: 8 waiting for your approval │ ■ 2 In progress"
+        ),
+        "{status}"
+    );
 }
 
 /// The blank cells before the right-aligned item that starts with `marker`, if it is drawn after
@@ -344,7 +365,7 @@ fn no_ticket_hides_line_two_and_no_source_hides_everything() {
     assert!(screen[1].starts_with("■ In progress #2106"));
     assert!(screen[18].starts_with("────"), "{screen:#?}");
     assert!(
-        screen[19].starts_with("■  2 QUESTIONS  │ workers 3 ■ running │"),
+        screen[19].starts_with("■  2 QUESTIONS  │ workers 0 │"),
         "{screen:#?}"
     );
 }
@@ -409,7 +430,7 @@ fn local_workers_that_ask_show_as_questions() {
     data.workers[1].phase = WorkerPhase::Running;
     let status = plain(&render_status(&data, &palette(), 200)[0]);
     assert!(
-        status.contains("workers 3 ■ running · 1 ■ question"),
+        status.contains("workers 1 ■ running · 1 ■ question"),
         "{status}"
     );
     let q = palette();

@@ -321,6 +321,15 @@ pub trait WorkerHooks: Send + Sync {
     /// goes back to the manager. Run reporting calls `amp_report_run` here when
     /// `!report.outcome.closed_ticket()` and adds a note to the report.
     async fn on_finish(&self, _worker: &WorkerInfo, _report: &mut WorkerReport) {}
+
+    /// Hands ticket `task_id` back after this process abandoned its worker (#2204): AMP moves it
+    /// from in progress to ready, so it isn't left in progress with nobody on it. `why` is one
+    /// line for the ticket's history. Run reporting calls it from `on_finish` for a `cancelled`
+    /// worker (the chat stopped or quit), and [`Supervisor::release_unfinished`] calls it when
+    /// the chat quits without waiting for `on_finish`.
+    async fn release(&self, _task_id: i64, _why: &str) -> Result<(), String> {
+        Err("no run reporting in this process".to_owned())
+    }
 }
 
 /// Why `amp_run_ticket` refused or failed before a worker was dispatched.
@@ -367,6 +376,10 @@ pub struct WorkerStatus {
 
 struct LiveWorker {
     agent_id: String,
+    /// AMP has the dispatch (the ticket is in progress).
+    dispatched: bool,
+    /// Whether the worker has closed its ticket yet (set once it is running).
+    watch: Option<Arc<WorkerWatch>>,
     phase: WorkerPhase,
     model: Option<String>,
     cwd: Option<PathBuf>,
@@ -456,6 +469,66 @@ impl Supervisor {
                     .unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// Tickets AMP has as dispatched to a live worker of this process that hasn't closed its
+    /// ticket (completed or blocked) yet: what quitting now would leave in progress.
+    pub fn unfinished(&self) -> Vec<i64> {
+        let live = self.live.lock().unwrap();
+        live.iter()
+            .filter(|(_, w)| {
+                w.dispatched
+                    && w.watch
+                        .as_ref()
+                        .is_none_or(|watch| watch.closed.lock().unwrap().is_none())
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Returns every [`Supervisor::unfinished`] ticket to ready through the hooks
+    /// ([`WorkerHooks::release`]), all at once, within `bound`. Quitting without waiting calls
+    /// it, because the workers' own `on_finish` will not get to run (#2204). Each ticket comes
+    /// back with its result; one still going when `bound` passes says so.
+    pub async fn release_unfinished(
+        &self,
+        why: &str,
+        bound: Duration,
+    ) -> Vec<(i64, Result<(), String>)> {
+        let ids = self.unfinished();
+        let Some(hooks) = self.hooks.clone() else {
+            return ids
+                .into_iter()
+                .map(|id| (id, Err("no run reporting in this process".to_owned())))
+                .collect();
+        };
+        let mut set = tokio::task::JoinSet::new();
+        for id in &ids {
+            let (hooks, id, why) = (Arc::clone(&hooks), *id, why.to_owned());
+            set.spawn(async move { (id, hooks.release(id, &why).await) });
+        }
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(bound, async {
+            while let Some(done) = set.join_next().await {
+                if let Ok(r) = done {
+                    out.push(r);
+                }
+            }
+        })
+        .await;
+        for id in ids {
+            if !out.iter().any(|(d, _)| *d == id) {
+                out.push((
+                    id,
+                    Err(format!(
+                        "AMP did not answer within {}",
+                        human_duration(bound)
+                    )),
+                ));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
     }
 
     /// The most workers that ran at the same time.
@@ -568,6 +641,9 @@ impl Supervisor {
             task_id: req.task_id,
             message: e.to_string(),
         })?;
+        if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
+            w.dispatched = true;
+        }
 
         let report = self.run_dispatched(&req, &role, &agent_id, signal).await;
         drop(permit);
@@ -583,6 +659,8 @@ impl Supervisor {
             task_id,
             LiveWorker {
                 agent_id: agent_id.to_owned(),
+                dispatched: false,
+                watch: None,
                 phase: WorkerPhase::Queued,
                 model: None,
                 cwd: None,
@@ -674,6 +752,9 @@ impl Supervisor {
             closing: Mutex::new(HashMap::new()),
             closed: Mutex::new(None),
         });
+        if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
+            w.watch = Some(Arc::clone(&watch));
+        }
         let mut spec = AgentSpec::new(role.id.clone(), info.cwd.clone());
         spec.project = self.manager.project.clone();
         spec.extra_context = Some(worker_context(&info, &self.manager.role));
