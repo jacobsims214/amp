@@ -53,6 +53,7 @@
 pub mod agent;
 pub mod approval;
 pub mod assets;
+pub mod config_check;
 pub mod events;
 pub mod faux;
 pub mod links;

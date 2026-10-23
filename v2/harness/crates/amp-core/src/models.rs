@@ -627,6 +627,14 @@ impl ModelsConfig {
         })
     }
 
+    /// Which layers set `role`'s assignment (`default`, `profile anthropic`, `config <path>`,
+    /// `config <path> + repo <path>`, ...); `None` for a role nobody configured.
+    pub fn role_source(&self, role: &str) -> Option<&str> {
+        self.roles
+            .get(normalize_role(role))
+            .map(|entry| entry.source.as_str())
+    }
+
     /// Every role with an assignment, sorted.
     pub fn role_names(&self) -> Vec<String> {
         self.roles.keys().cloned().collect()
@@ -748,6 +756,19 @@ pub fn thinking_name(level: ThinkingLevel) -> &'static str {
         ThinkingLevel::Xhigh => "xhigh",
         ThinkingLevel::Max => "max",
     }
+}
+
+/// Each provider of `defaults` merged with `user` that would not build, as (`id`, why), for
+/// `config check` (#2235): [`ModelsConfig::from_layers`] stops at the first one.
+pub fn provider_problems(defaults: &ModelsFile, user: &ModelsFile) -> Vec<(String, String)> {
+    let mut specs = defaults.providers.clone();
+    for (id, spec) in user.providers.clone() {
+        merge_provider(specs.entry(id).or_default(), spec);
+    }
+    specs
+        .into_iter()
+        .filter_map(|(id, spec)| build_provider(&id, spec).err().map(|e| (id, e.0)))
+        .collect()
 }
 
 // ------------------------------------------------------------------------------------------------

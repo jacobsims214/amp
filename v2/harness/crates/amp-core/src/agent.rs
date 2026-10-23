@@ -189,6 +189,14 @@ fn harness_config_from(models: &ModelsConfig) -> Result<HarnessConfigFile, Agent
         .map_err(|e| AgentError::Io(format!("{} [secrets]/[tools]: {e}", path.display())))
 }
 
+/// Checks config.toml's `[secrets]` and `[tools]` tables the way a session reads them
+/// (`config check`, #2235).
+pub fn check_harness_tables(text: &str) -> Result<(), String> {
+    toml::from_str::<HarnessConfigFile>(text)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 /// `[secrets] pass_to_bash`, trimmed, empty names dropped.
 fn pass_env_from(file: &HarnessConfigFile) -> BTreeSet<String> {
     file.secrets

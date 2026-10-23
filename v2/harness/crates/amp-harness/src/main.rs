@@ -15,6 +15,8 @@
 //!   cause chain); the chat opens disconnected and retries instead of exiting.
 //! - #2232: `--config FILE` / `--config-dir DIR` (and `AMP_HARNESS_CONFIG[_DIR]`) are global and
 //!   apply to every setting and command ([`amp_mcp::config_paths`]).
+//! - #2235: `models list|set|reset|profile` (per-role models, user or repo file) and
+//!   `config check` (every layer's problems, naming file and key).
 
 mod chat;
 mod config_cmd;
@@ -23,6 +25,7 @@ mod connect;
 mod debug;
 mod doctor;
 mod mcp_cmd;
+mod models_cmd;
 mod run;
 mod server_cmd;
 mod session;
@@ -106,6 +109,10 @@ enum Command {
     /// Providers, models and the model each role runs on.
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+    /// The model each role runs on: `models list`, `models set <role> <provider/model>`,
+    /// `models reset <role>`, `models profile <name>` (--user, the default, or --repo).
+    #[command(subcommand)]
+    Models(models_cmd::ModelsCommand),
     /// Add a model provider: its key (asked hidden, checked, kept in the OS keychain) or a custom
     /// OpenAI-compatible endpoint. `connect --list` shows every provider and where its key comes from.
     Connect(connect::ConnectArgs),
@@ -188,6 +195,7 @@ async fn main() -> ExitCode {
         Some(Command::Tickets(command)) => tickets::run(command).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
+        Some(Command::Models(command)) => models_cmd::run(command).await,
         Some(Command::Connect(args)) => connect::run(args).await,
         Some(Command::Disconnect(args)) => connect::disconnect(args).await,
         Some(Command::Init(args)) => setup::init(args).await,
