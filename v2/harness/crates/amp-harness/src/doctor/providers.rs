@@ -37,11 +37,27 @@ pub struct ModelsReport {
     pub role_errors: BTreeMap<String, String>,
     /// The providers some role uses.
     pub providers: Vec<ProviderReport>,
+    /// Each role's provider, model and endpoint (#2275), sorted by role.
+    pub roles: Vec<RoleModel>,
+}
+
+/// One role's model in `doctor --json` `.models.roles`.
+#[derive(Debug, Serialize)]
+pub struct RoleModel {
+    pub role: String,
+    pub provider: String,
+    pub model: String,
+    /// The provider's base URL (the endpoint the role's requests go to).
+    pub endpoint: String,
+    /// Which layer set it (`default`, `inherit (config ...)`, `config ...`).
+    pub source: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ProviderReport {
     pub id: String,
+    /// Display name (`[providers.<id>] name`, else the id).
+    pub name: String,
     pub api: &'static str,
     pub base_url: String,
     /// `env`, `keychain`, `not-needed` or `missing`.
@@ -119,6 +135,17 @@ pub async fn check(
                 if role == PRIMARY_ROLE {
                     primary_provider = Some(r.provider.clone());
                 }
+                report.roles.push(RoleModel {
+                    role: role.clone(),
+                    provider: r.provider.clone(),
+                    model: r.model_id.clone(),
+                    endpoint: config
+                        .providers
+                        .get(&r.provider)
+                        .map(|p| p.base_url.clone())
+                        .unwrap_or_default(),
+                    source: r.source.clone(),
+                });
                 used.entry(r.provider)
                     .or_default()
                     .entry(r.model_id)
@@ -228,6 +255,7 @@ pub async fn check(
         out.push((format!("models:{id}"), models_finding));
 
         report.providers.push(ProviderReport {
+            name: crate::setup::display_name(provider),
             api: provider.api.as_str(),
             base_url: provider.base_url.clone(),
             key: source.kind(),
