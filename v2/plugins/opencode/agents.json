@@ -187,6 +187,11 @@
   "permissions": [
    {
     "action": "edit",
+    "resource": "*",
+    "effect": "deny"
+   },
+   {
+    "action": "edit",
     "resource": ".opencode/**",
     "effect": "allow"
    },
@@ -196,23 +201,23 @@
     "effect": "allow"
    },
    {
-    "action": "edit",
+    "action": "shell",
     "resource": "*",
     "effect": "deny"
    },
    {
     "action": "shell",
-    "resource": "git status*",
+    "resource": "git status *",
     "effect": "allow"
    },
    {
     "action": "shell",
-    "resource": "git diff*",
+    "resource": "git diff *",
     "effect": "allow"
    },
    {
     "action": "shell",
-    "resource": "git log*",
+    "resource": "git log *",
     "effect": "allow"
    },
    {
@@ -227,7 +232,37 @@
    },
    {
     "action": "shell",
-    "resource": "*",
+    "resource": "git difftool*",
+    "effect": "deny"
+   },
+   {
+    "action": "shell",
+    "resource": "mkdir *..*",
+    "effect": "deny"
+   },
+   {
+    "action": "shell",
+    "resource": "mkdir -p .opencode/* ?*",
+    "effect": "deny"
+   },
+   {
+    "action": "shell",
+    "resource": "mkdir *$*",
+    "effect": "deny"
+   },
+   {
+    "action": "shell",
+    "resource": "mkdir *\t*",
+    "effect": "deny"
+   },
+   {
+    "action": "shell",
+    "resource": "*>*",
+    "effect": "deny"
+   },
+   {
+    "action": "shell",
+    "resource": "*--ou*",
     "effect": "deny"
    },
    {

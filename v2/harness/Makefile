@@ -10,10 +10,10 @@ endif
 CARGO ?= cargo
 BIN := target/debug/amp-harness
 
-.PHONY: help build test fmt fmt-check clippy lint check smoke version clean
+.PHONY: help build test fmt fmt-check clippy lint check smoke version clean assets assets-check
 
 help:
-	@echo "targets: build test fmt fmt-check clippy lint check smoke version clean"
+	@echo "targets: build test fmt fmt-check clippy lint check smoke version clean assets assets-check"
 	@echo "CARGO_HOME=$${CARGO_HOME:-<unset: ~/.cargo>}"
 
 build:
@@ -40,6 +40,13 @@ smoke: build
 
 version: build
 	@$(BIN) --version
+
+# Agent/skill assets (D5): regenerate assets/ from v2/.opencode, or fail if the committed copy drifted.
+assets:
+	../scripts/build-harness-assets.sh
+
+assets-check:
+	../scripts/build-harness-assets.sh --check
 
 # Deletes target/ (GiBs). Do this before removing a worktree.
 clean:

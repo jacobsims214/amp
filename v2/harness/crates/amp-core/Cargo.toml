@@ -6,15 +6,34 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
+build = "build.rs"
 
 [dependencies]
 amp-mcp.workspace = true
-rpi-ai.workspace = true
+# `providers`: rpi's HTTP providers (Anthropic Messages, OpenAI Chat Completions); off by default.
+rpi-ai = { workspace = true, features = ["providers"] }
 rpi-agent.workspace = true
 rpi-tools.workspace = true
 rpi-harness.workspace = true
+# #2141: resolve tool paths exactly like rpi-tools (home dir, read-path variants).
+dirs.workspace = true
+unicode-normalization.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# preserve_order: permission rules are evaluated in file order (last match wins). It is also on
+# through schemars' feature unification today; this makes it explicit.
+serde_json = { workspace = true, features = ["preserve_order"] }
+thiserror.workspace = true
+include_dir.workspace = true
+yaml_serde.workspace = true
+async-trait.workspace = true
+keyring.workspace = true
+# process: `git worktree` for workers (supervisor).
+tokio = { workspace = true, features = ["rt", "time", "process"] }
+tokio-util.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

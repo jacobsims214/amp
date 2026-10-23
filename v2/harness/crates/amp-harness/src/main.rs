@@ -2,12 +2,19 @@
 //!
 //! - M1-3: `login` / `logout` (OAuth with the keychain credential store, D3).
 //! - M1-4: `doctor`, `whoami`, `tickets list|get` (each with `--json`) and the hidden `mcp call`.
+//! - M2-3: `config show` (providers and the provider/model each role resolves to).
+//! - M2-4: `run -p "..." [--json]`: a headless agent run (the manager by default).
+//! - M2-7: no subcommand opens the chat TUI with the manager (`amp_tui`).
 //!
-//! Later milestones add the TUI (default), init and run.
+//! Later milestones add init.
 
+mod chat;
+mod config_cmd;
 mod conn;
 mod doctor;
 mod mcp_cmd;
+mod run;
+mod session;
 mod tickets;
 mod whoami;
 
@@ -42,10 +49,14 @@ const LONG_VERSION: &str = concat!(
     about = "AMP agent harness",
     version = env!("CARGO_PKG_VERSION"),
     long_version = LONG_VERSION,
+    args_conflicts_with_subcommands = true,
 )]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+    /// With no subcommand: chat with the manager in the terminal.
+    #[command(flatten)]
+    chat: chat::ChatArgs,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +74,11 @@ enum Command {
     /// List and read tickets.
     #[command(subcommand)]
     Tickets(tickets::TicketsCommand),
+    /// Run an agent headless on one prompt (the manager by default).
+    Run(run::RunArgs),
+    /// Providers, models and the model each role runs on.
+    #[command(subcommand)]
+    Config(config_cmd::ConfigCommand),
     /// Debug: call AMP tools directly.
     #[command(subcommand, hide = true)]
     Mcp(mcp_cmd::McpCommand),
@@ -122,14 +138,10 @@ async fn main() -> ExitCode {
         Some(Command::Doctor(args)) => doctor::run(args.conn, args.json).await,
         Some(Command::Whoami(args)) => whoami::run(args.conn, args.json).await,
         Some(Command::Tickets(command)) => tickets::run(command).await,
+        Some(Command::Run(args)) => run::run(args).await,
+        Some(Command::Config(command)) => config_cmd::run(command).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
-        None => {
-            eprintln!(
-                "amp-harness {}: try `amp-harness doctor` or --help",
-                env!("CARGO_PKG_VERSION")
-            );
-            Ok(())
-        }
+        None => chat::run(cli.chat).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

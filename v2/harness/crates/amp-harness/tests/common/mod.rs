@@ -242,6 +242,21 @@ impl ServerHandler for MockAmp {
                 }
                 _ => tool_error("task not found"),
             },
+            // M2-5: ticket 4040 belongs to someone else, like AMP's refusal.
+            "amp_dispatch_task" => match args["task_id"].as_i64() {
+                Some(4040) => tool_error("task 4040 is owned by someone else"),
+                Some(id) => ok_json(json!({"task_id": id, "dispatched_to": args["agent_id"]})),
+                None => tool_error("task_id is required"),
+            },
+            "amp_complete_task" | "amp_block_task" => {
+                ok_json(json!({"task_id": args["task_id"], "ok": true}))
+            }
+            // M2-6: ticket 4041's runs are refused, like AMP refusing a run it can't record.
+            "amp_report_run" => match args["task_id"].as_i64() {
+                Some(4041) => tool_error("task 4041 not found"),
+                Some(id) => ok_json(json!({"task_id": id, "outcome": args["outcome"]})),
+                None => tool_error("task_id is required"),
+            },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "plain text, not JSON",
@@ -362,6 +377,9 @@ pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> 
         .env_remove("AMP_TOKEN")
         .env_remove("AMP_CA_FILE")
         .env_remove("AMP_MCP_PROTOCOL")
+        .env_remove("AMP_HARNESS_PROFILE")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
         .env_remove("RUST_LOG");
     for (k, v) in env {
         cmd.env(k, v);
