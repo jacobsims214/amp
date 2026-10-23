@@ -64,6 +64,8 @@ pub fn http_options(
     options.socket = remote.socket.clone();
     options.fallback_sse = remote.fallback_sse;
     options.legacy_sse = server.transport.kind() == TransportKind::Sse;
+    // #2308: a repo server's OAuth login is its own, never the person's login for that URL.
+    options.credential_scope = server.credential_scope();
 
     for secret in &remote.secrets {
         let value = match (&secret.source, keychain) {
@@ -81,7 +83,8 @@ pub fn http_options(
             return Err(match &secret.source {
                 SecretSource::Keychain { account } => format!(
                     "MCP server `{name}`: keychain {account} is missing; store it with \
-                     `amp-harness mcp secret {name}` (or remove it from the config)"
+                     `amp-harness mcp secret {name}` (or remove it from the config){}",
+                    crate::mcp_config::adopt_hint(server)
                 ),
                 SecretSource::Env { var } => {
                     format!("MCP server `{name}`: environment variable {var} is not set")

@@ -116,6 +116,10 @@ pub struct HttpServerOptions {
     pub legacy_sse: bool,
     /// Bound on each OAuth request (discovery, refresh).
     pub oauth_request_timeout: Duration,
+    /// Where the OAuth login is kept ([`crate::scoped_credential_key`]): `None` for the person's
+    /// own servers (the URL alone, beside AMP's login), a repo server's own scope otherwise, so
+    /// it never uses a login the person made for the same URL (#2308).
+    pub credential_scope: Option<String>,
 }
 
 impl HttpServerOptions {
@@ -136,6 +140,7 @@ impl HttpServerOptions {
             fallback_sse: true,
             legacy_sse: false,
             oauth_request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
+            credential_scope: None,
         }
     }
 
@@ -191,9 +196,15 @@ impl HttpServerOptions {
                 .any(|h| h.name.eq_ignore_ascii_case("authorization"))
     }
 
+    /// The key this server's OAuth login is stored under.
+    pub fn credential_key(&self) -> String {
+        crate::scoped_credential_key(&self.url, self.credential_scope.as_deref())
+    }
+
     /// The [`LoginOptions`] for this server's OAuth login.
     pub fn login_options(&self, backend: CredentialBackend) -> LoginOptions {
         LoginOptions::new(self.url.clone(), backend)
+            .with_credential_scope(self.credential_scope.clone())
             .with_ca_file(self.ca_file.clone())
             .with_request_timeout(self.oauth_request_timeout)
             .with_client(self.oauth.clone())
@@ -378,7 +389,7 @@ async fn stored_login(
     options: &HttpServerOptions,
     backend: &CredentialBackend,
 ) -> Result<Option<AuthClient<reqwest::Client>>, McpError> {
-    let store = backend.store_for(&options.url);
+    let store = backend.store_for_key(options.credential_key());
     let Some(stored) = store.load_credentials().await? else {
         return Ok(None);
     };
@@ -579,5 +590,5 @@ pub async fn logout(
     options: &HttpServerOptions,
     backend: &CredentialBackend,
 ) -> Result<bool, McpError> {
-    oauth::logout(&options.url, backend).await
+    oauth::logout_key(&options.credential_key(), backend).await
 }

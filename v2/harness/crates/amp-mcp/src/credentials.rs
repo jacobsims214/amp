@@ -61,6 +61,17 @@ pub fn credential_key(url: &str) -> String {
     }
 }
 
+/// [`credential_key`] in a scope (#2308): `None` is the URL alone (AMP's server and the person's
+/// own MCP servers, as before); `Some(scope)` (a repo server's, `mcp-repo:<repo id>:<name>`) is
+/// `<scope>|<credential_key>`, so a server from a cloned repo never reads or overwrites the
+/// person's own login for the same URL.
+pub fn scoped_credential_key(url: &str, scope: Option<&str>) -> String {
+    match scope {
+        None => credential_key(url),
+        Some(scope) => format!("{scope}|{}", credential_key(url)),
+    }
+}
+
 /// Where logins are kept.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CredentialBackend {
@@ -164,9 +175,14 @@ impl CredentialBackend {
 
     /// The store for one server's login.
     pub fn store_for(&self, url: &str) -> AmpCredentialStore {
+        self.store_for_key(credential_key(url))
+    }
+
+    /// The store for the login kept under `key` ([`scoped_credential_key`]).
+    pub fn store_for_key(&self, key: String) -> AmpCredentialStore {
         AmpCredentialStore {
             backend: self.clone(),
-            key: credential_key(url),
+            key,
         }
     }
 }

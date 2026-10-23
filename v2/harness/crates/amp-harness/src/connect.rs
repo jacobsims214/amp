@@ -1584,7 +1584,7 @@ fn picker(cfg: &ModelsConfig, ui: &mut dyn Ui) -> Result<String, CliError> {
         let text = about(id).map(str::to_owned).unwrap_or_else(|| {
             cfg.providers
                 .get(id)
-                .map(|p| format!("{} ({})", p.base_url, p.api.as_str()))
+                .map(|p| format!("{} ({})", amp_mcp::redact_url(&p.base_url), p.api.as_str()))
                 .unwrap_or_default()
         });
         ui.say(&format!("  {}) {name} — {text}{status}", i + 1));

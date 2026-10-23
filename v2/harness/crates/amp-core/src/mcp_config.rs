@@ -46,24 +46,26 @@
 //!
 //! # Layers
 //!
-//! User file < repo file, per server name: a repo table replaces the user table of the same name.
-//! The person keeps the last word on whether it runs: an `enabled` the user file sets for that name
-//! wins over the repo's, and a user table holding only `enabled` is a switch for a repo server.
+//! The user file and the repo file each add servers. A repo table never replaces one of the
+//! person's own servers (#2308): when both define a name, the user's is used and the repo's is
+//! left out with a warning. The person keeps the last word on whether a repo server runs: a user
+//! table holding only `enabled` is a switch for the repo server of that name.
 //!
 //! # Substitution
 //!
 //! `${env:VAR}`, `${env:VAR:-default}` (default when unset or empty), `${repo}`, `${worktree}`,
 //! `${home}`, `${config_dir}`; `$${` is a literal `${`. References are checked when the config is
 //! parsed and expanded only by [`McpServer::resolve`] at spawn or connect time; nothing is written
-//! back. Every `${env:VAR}` in `headers` or `env`, every `bearer_env` and every `secret_env` name
+//! back. Every `${env:VAR}` (in any field, #2308), every `bearer_env` and every `secret_env` name
 //! joins [`crate::agent::Runtime::secret_env`] ([`McpConfig::secret_env_names`]), so bash never
-//! sees them.
+//! sees them. A repo server may read only the variables trusted with it ([`crate::mcp_trust`]).
 //!
 //! # Secrets
 //!
 //! Only in the keychain (service [`amp_mcp::keychain_service`]), under [`header_account`],
-//! [`env_account`] and [`oauth_client_secret_account`], or in the process environment
-//! (`bearer_env`, `${env:..}`). A literal value that looks secret (an `Authorization` header, a
+//! [`env_account`] and [`oauth_client_secret_account`] (user servers) or the same accounts under
+//! `mcp:repo:<repo id>:<name>` (repo servers, [`account_prefix`], #2308), or in the process
+//! environment (`bearer_env`, `${env:..}`). A literal value that looks secret (an `Authorization` header, a
 //! `*_TOKEN` variable, `Bearer ...`, `sk-...`, `ghp_...`) is an error whose fix says where to put
 //! it, and no message here ever repeats a configured value.
 
@@ -500,19 +502,96 @@ fn valid_header_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
-/// The keychain account of a secret header: `mcp:<server>:header:<lowercase header>`.
+/// The keychain account of a user-layer server's secret header:
+/// `mcp:<server>:header:<lowercase header>`. A repo server's is [`McpServer::header_account`].
 pub fn header_account(server: &str, header: &str) -> String {
-    format!("mcp:{server}:header:{}", header.to_ascii_lowercase())
+    header_account_in(None, server, header)
 }
 
-/// The keychain account of a secret environment variable: `mcp:<server>:env:<VAR>`.
+/// The keychain account of a user-layer server's secret environment variable:
+/// `mcp:<server>:env:<VAR>`. A repo server's is [`McpServer::env_account`].
 pub fn env_account(server: &str, var: &str) -> String {
-    format!("mcp:{server}:env:{var}")
+    env_account_in(None, server, var)
 }
 
-/// The keychain account of a pre-registered OAuth client's secret.
+/// The keychain account of a user-layer server's pre-registered OAuth client secret. A repo
+/// server's is [`McpServer::oauth_client_secret_account`].
 pub fn oauth_client_secret_account(server: &str) -> String {
-    format!("mcp:{server}:oauth-client-secret")
+    oauth_client_secret_account_in(None, server)
+}
+
+/// Where a server's keychain accounts live (#2308): `mcp:<server>` for the user layer (the
+/// accounts every earlier version used, so stored secrets keep working), and
+/// `mcp:repo:<repo id>:<server>` for a repo server ([`repo_secret_id`]). A repo server therefore
+/// never reads an item stored for the person's own server of the same name, nor one stored for
+/// another repo's.
+pub fn account_prefix(repo: Option<&str>, server: &str) -> String {
+    match repo {
+        None => format!("mcp:{server}"),
+        Some(id) => format!("mcp:repo:{id}:{server}"),
+    }
+}
+
+/// [`header_account`] in the scope `repo` ([`account_prefix`]).
+pub fn header_account_in(repo: Option<&str>, server: &str, header: &str) -> String {
+    format!(
+        "{}:header:{}",
+        account_prefix(repo, server),
+        header.to_ascii_lowercase()
+    )
+}
+
+/// [`env_account`] in the scope `repo` ([`account_prefix`]).
+pub fn env_account_in(repo: Option<&str>, server: &str, var: &str) -> String {
+    format!("{}:env:{var}", account_prefix(repo, server))
+}
+
+/// [`oauth_client_secret_account`] in the scope `repo` ([`account_prefix`]).
+pub fn oauth_client_secret_account_in(repo: Option<&str>, server: &str) -> String {
+    format!("{}:oauth-client-secret", account_prefix(repo, server))
+}
+
+/// A repo's identity in keychain accounts and OAuth login keys: 16 hex digits of sha256 over its
+/// canonical root (the same path the trust store records, [`crate::mcp_trust::repo_root`]).
+pub fn repo_secret_id(repo_root: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(repo_root.to_string_lossy().as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The OAuth login scope of a repo server ([`amp_mcp::HttpServerOptions::credential_scope`]):
+/// its login is stored apart from the person's own logins for the same URL.
+pub fn repo_credential_scope(repo_id: &str, server: &str) -> String {
+    format!("mcp-repo:{repo_id}:{server}")
+}
+
+/// For a repo server whose keychain item is missing: since #2308 its items are its own, and an
+/// item stored before under `mcp:<name>:...` can be copied over by the person. Empty for a user
+/// server.
+pub fn adopt_hint(server: &McpServer) -> String {
+    if server.is_repo() {
+        format!(
+            ". Repo servers keep their own secrets now; if you stored this one before for this \
+             repo's `{0}`, copy it with `amp-harness mcp secret {0} --adopt`",
+            server.name
+        )
+    } else {
+        String::new()
+    }
+}
+
+/// Everything secret a server reads, by name (#2308): what the trust question shows (#2310) and
+/// what trust approves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SecretInputs {
+    /// Environment variables read through `${env:..}` (any field) and `bearer_env`.
+    pub env: BTreeSet<String>,
+    /// Keychain accounts (`secret_env`, `secret_headers`, the OAuth client secret), scoped to
+    /// the server's layer.
+    pub keychain: Vec<String>,
+    /// The OAuth login scope for a repo http/sse server (logins of repo servers are kept apart
+    /// from yours); `None` for user servers and stdio.
+    pub oauth_scope: Option<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -558,8 +637,21 @@ pub fn looks_secret_value(value: &str) -> bool {
         .any(|p| lower.starts_with(p) && v.len() > p.len())
 }
 
-/// Whether a URL carries a literal credential in its query (`?token=...`, `&api_key=...`).
+/// Whether a URL carries a literal credential in its query (`?token=...`, `&api_key=...`) or a
+/// literal `user:password@` (#2308).
 fn url_has_literal_secret(url: &str) -> bool {
+    if let Some(i) = url.find("://") {
+        let rest = &url[i + 3..];
+        let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+        if let Some((userinfo, _)) = authority.rsplit_once('@')
+            && userinfo.contains(':')
+            && !userinfo
+                .split_once(':')
+                .is_some_and(|(_, p)| p.starts_with("${"))
+        {
+            return true;
+        }
+    }
     let Some((_, query)) = url.split_once('?') else {
         return false;
     };
@@ -880,21 +972,56 @@ impl McpServer {
         })
     }
 
+    /// The repo id this server's secrets are scoped to ([`repo_secret_id`] of its canonical repo
+    /// root), or `None` for a user-layer server (#2308).
+    pub fn repo_secret_id(&self) -> Option<String> {
+        crate::mcp_trust::repo_root(self).map(|root| repo_secret_id(&root))
+    }
+
+    /// The keychain account of secret header `header` ([`account_prefix`]: user-layer accounts
+    /// are `mcp:<name>:...`, a repo server's `mcp:repo:<id>:<name>:...`).
+    pub fn header_account(&self, header: &str) -> String {
+        header_account_in(self.repo_secret_id().as_deref(), &self.name, header)
+    }
+
+    /// The keychain account of `secret_env` variable `var` ([`McpServer::header_account`]).
+    pub fn env_account(&self, var: &str) -> String {
+        env_account_in(self.repo_secret_id().as_deref(), &self.name, var)
+    }
+
+    /// The keychain account of the OAuth client secret ([`McpServer::header_account`]).
+    pub fn oauth_client_secret_account(&self) -> String {
+        oauth_client_secret_account_in(self.repo_secret_id().as_deref(), &self.name)
+    }
+
+    /// The OAuth login scope: `None` (the URL alone, as before) for a user server, a per-repo,
+    /// per-server scope for a repo server so it never uses the person's own logins (#2308).
+    pub fn credential_scope(&self) -> Option<String> {
+        self.repo_secret_id()
+            .map(|id| repo_credential_scope(&id, &self.name))
+    }
+
     /// The keychain accounts this server's config names (for `mcp remove` and `mcp show`).
     pub fn keychain_accounts(&self) -> Vec<String> {
+        let repo = self.repo_secret_id();
+        let repo = repo.as_deref();
         let mut accounts = Vec::new();
         match &self.transport {
             Transport::Stdio(s) => {
-                accounts.extend(s.secret_env.iter().map(|v| env_account(&self.name, v)));
+                accounts.extend(
+                    s.secret_env
+                        .iter()
+                        .map(|v| env_account_in(repo, &self.name, v)),
+                );
             }
             Transport::Http(r) | Transport::Sse(r) => {
                 accounts.extend(
                     r.secret_headers
                         .iter()
-                        .map(|h| header_account(&self.name, h)),
+                        .map(|h| header_account_in(repo, &self.name, h)),
                 );
                 if r.oauth.as_ref().is_some_and(|o| o.client_secret) {
-                    accounts.push(oauth_client_secret_account(&self.name));
+                    accounts.push(oauth_client_secret_account_in(repo, &self.name));
                 }
             }
         }
@@ -906,24 +1033,53 @@ impl McpServer {
         !self.keychain_accounts().is_empty()
     }
 
-    /// The variables to hide from bash: `${env:..}` in headers/env, `bearer_env`, `secret_env`.
-    pub fn secret_env_names(&self) -> BTreeSet<String> {
+    /// Every environment variable the server reads (#2308): `${env:..}` in any field (command,
+    /// args, env, env_file, cwd, url, headers, ca_file, socket) and `bearer_env`. These are
+    /// secret-bearing: they are hidden from bash and stdio servers ([`Self::secret_env_names`]),
+    /// a repo server may read only those trusted with it ([`crate::mcp_trust`]), and their values
+    /// are scrubbed from its error messages.
+    pub fn env_reads(&self) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
+        let mut add = |v: &str| names.extend(template_env_names(v));
         match &self.transport {
             Transport::Stdio(s) => {
-                for v in s.env.values() {
-                    names.extend(template_env_names(v));
-                }
-                names.extend(s.secret_env.iter().cloned());
+                add(&s.command);
+                s.args.iter().for_each(|a| add(a));
+                s.env.values().for_each(|v| add(v));
+                s.env_file.iter().for_each(|v| add(v));
+                s.cwd.iter().for_each(|v| add(v));
             }
             Transport::Http(r) | Transport::Sse(r) => {
-                for v in r.headers.values() {
-                    names.extend(template_env_names(v));
-                }
+                add(&r.url);
+                r.headers.values().for_each(|v| add(v));
+                r.ca_file.iter().for_each(|v| add(v));
+                r.socket.iter().for_each(|v| add(v));
                 names.extend(r.bearer_env.iter().cloned());
             }
         }
         names
+    }
+
+    /// The variables to hide from bash and stdio servers: [`Self::env_reads`] plus `secret_env`
+    /// (whose values come from the keychain under that name).
+    pub fn secret_env_names(&self) -> BTreeSet<String> {
+        let mut names = self.env_reads();
+        if let Transport::Stdio(s) = &self.transport {
+            names.extend(s.secret_env.iter().cloned());
+        }
+        names
+    }
+
+    /// Every secret the server reads, by name (#2308; the trust question shows these, #2310).
+    pub fn secret_inputs(&self) -> SecretInputs {
+        SecretInputs {
+            env: self.env_reads(),
+            keychain: self.keychain_accounts(),
+            oauth_scope: match self.transport {
+                Transport::Stdio(_) => None,
+                _ => self.credential_scope(),
+            },
+        }
     }
 
     /// The directory relative paths (`env_file`, `cwd`, `ca_file`, `socket`) are relative to: the
@@ -952,6 +1108,8 @@ impl McpServer {
             }
         };
         let expand = |k: &str, v: &str| ctx.expand(v).map_err(|m| fail(k, m));
+        let repo = self.repo_secret_id();
+        let repo = repo.as_deref();
         match &self.transport {
             Transport::Stdio(s) => {
                 let mut env = BTreeMap::new();
@@ -976,7 +1134,7 @@ impl McpServer {
                         .map(|v| SecretRef {
                             target: SecretTarget::Env(v.clone()),
                             source: SecretSource::Keychain {
-                                account: env_account(&self.name, v),
+                                account: env_account_in(repo, &self.name, v),
                             },
                         })
                         .collect(),
@@ -999,7 +1157,7 @@ impl McpServer {
                     .map(|h| SecretRef {
                         target: SecretTarget::Header(h.clone()),
                         source: SecretSource::Keychain {
-                            account: header_account(&self.name, h),
+                            account: header_account_in(repo, &self.name, h),
                         },
                     })
                     .collect();
@@ -1013,7 +1171,7 @@ impl McpServer {
                     secrets.push(SecretRef {
                         target: SecretTarget::OAuthClientSecret,
                         source: SecretSource::Keychain {
-                            account: oauth_client_secret_account(&self.name),
+                            account: oauth_client_secret_account_in(repo, &self.name),
                         },
                     });
                 }
@@ -1306,6 +1464,23 @@ fn build_server(
                 if template_literal_secret(a) {
                     c.error("args", "an argument looks like a credential").fix =
                         Some("pass it through secret_env (keychain) or ${env:VAR} instead".into());
+                }
+                // #2308: an expanded `${env:..}` in argv is visible to every local user (`ps`).
+                for var in template_env_names(a) {
+                    let fix = format!(
+                        "pass it in the environment instead: env = {{ {var} = \"${{env:{var}}}\" }} \
+                         (or secret_env, kept in the keychain), and let the server read it there"
+                    );
+                    let message = format!(
+                        "`${{env:{var}}}` in args puts its value in the process list, where any \
+                         local user can read it"
+                    );
+                    if origin.layer == Layer::Repo && looks_secret_name(&var) {
+                        c.error("args", message).fix = Some(fix);
+                    } else if looks_secret_name(&var) {
+                        let p = McpProblem::warning(&file, c.key("args"), message).fix(fix);
+                        c.problems.push(p);
+                    }
                 }
             }
             let env = raw.env.clone().unwrap_or_default();
@@ -1714,7 +1889,35 @@ impl McpConfig {
             }
         }
 
-        // Repo replaces user per name.
+        // #2308: a repo table never replaces one of the person's own servers. A cloned repo could
+        // otherwise point the name they know (`github`) at its own URL or command. Their server
+        // wins and the repo's is left out with a warning.
+        let shadowed: Vec<String> = repo_servers
+            .keys()
+            .filter(|n| user_servers.contains_key(*n))
+            .cloned()
+            .collect();
+        if let Some((_, file)) = repo {
+            for name in shadowed {
+                repo_servers.remove(&name);
+                config.problems.push(
+                    McpProblem::warning(
+                        file,
+                        format!("mcp.{name}"),
+                        format!(
+                            "this repo defines an MCP server `{name}`, and so does your own config; \
+                             yours is used and the repo's is ignored"
+                        ),
+                    )
+                    .fix(format!(
+                        "rename it in the repo config (e.g. `{name}-repo`) to use both, or remove \
+                         [mcp.{name}] from your own config to use the repo's"
+                    )),
+                );
+            }
+        }
+
+        // Then the two layers have no name in common (a user switch is not a server).
         let mut merged = user_servers;
         merged.extend(repo_servers);
         for (name, server) in merged {
@@ -1749,6 +1952,16 @@ impl McpConfig {
         self.problems
             .iter()
             .filter(|p| p.severity == Severity::Error)
+    }
+
+    /// The variables the person's own (user-layer) servers read: their credentials, which no
+    /// repo server may read (#2308, [`crate::mcp_trust::check_repo_env`]).
+    pub fn user_secret_env_names(&self) -> BTreeSet<String> {
+        self.servers
+            .values()
+            .filter(|s| !s.is_repo())
+            .flat_map(McpServer::secret_env_names)
+            .collect()
     }
 
     /// Every variable any configured server reads a secret from, for
@@ -2119,16 +2332,24 @@ env = { API_TOKEN = "${env:API_TOKEN}", LOG_LEVEL = "debug", EMPTY_TOKEN = "" }
     }
 
     #[test]
-    fn repo_replaces_user_and_user_enabled_wins() {
+    fn a_repo_table_never_replaces_a_users_and_user_enabled_wins() {
         let c = layered(
             "[mcp.a]\ncommand = \"user-a\"\n[mcp.b]\ncommand = \"user-b\"\n[mcp.c]\nenabled = false\n[mcp.d]\nenabled = true\n[mcp.e]\nenabled = false\n",
             "[mcp.a]\nurl = \"https://repo.test/a\"\n[mcp.c]\ncommand = \"repo-c\"\n[mcp.d]\ncommand = \"repo-d\"\nenabled = false\n",
         );
         assert_eq!(c.errors().count(), 0, "{:#?}", c.problems);
-        // Repo replaces the user's table of the same name.
+        // #2308: the user's table of the same name wins; the repo's is ignored with a warning.
         let a = &c.servers["a"];
-        assert_eq!(a.origin.layer, Layer::Repo);
-        assert_eq!(a.transport.kind(), TransportKind::Http);
+        assert_eq!(a.origin.layer, Layer::User);
+        assert_eq!(a.transport.kind(), TransportKind::Stdio);
+        let shadow = c
+            .problems
+            .iter()
+            .find(|p| p.key == "mcp.a")
+            .expect("a warning for the ignored repo table");
+        assert_eq!(shadow.severity, Severity::Warning);
+        assert_eq!(shadow.file, Path::new(REPO));
+        assert!(shadow.message.contains("yours is used"), "{shadow}");
         // User-only servers stay.
         assert_eq!(c.servers["b"].origin.layer, Layer::User);
         // A user switch turns a repo server off, or back on.
@@ -2150,7 +2371,7 @@ env = { API_TOKEN = "${env:API_TOKEN}", LOG_LEVEL = "debug", EMPTY_TOKEN = "" }
             .iter()
             .filter(|p| p.severity == Severity::Warning)
             .collect();
-        assert_eq!(w.len(), 1);
+        assert_eq!(w.len(), 2);
         assert_eq!(w[0].key, "mcp.e");
         assert!(w[0].to_string().starts_with("warning: "));
     }
@@ -2158,10 +2379,10 @@ env = { API_TOKEN = "${env:API_TOKEN}", LOG_LEVEL = "debug", EMPTY_TOKEN = "" }
     #[test]
     fn a_broken_repo_table_breaks_that_name() {
         let c = layered(
-            "[mcp.a]\ncommand = \"ok\"\n",
+            "[mcp.b]\ncommand = \"ok\"\n",
             "[mcp.a]\ncommand = \"x\"\nurl = \"https://x.test\"\ntype = \"stdio\"\n",
         );
-        assert!(c.servers.is_empty());
+        assert_eq!(c.servers.keys().collect::<Vec<_>>(), ["b"]);
         assert!(c.broken.contains("a"));
         let e = c.errors().next().unwrap().to_string();
         assert!(e.starts_with(REPO) && e.contains("`mcp.a.url`"), "{e}");
@@ -2264,16 +2485,21 @@ env = { API_TOKEN = "${env:API_TOKEN}", LOG_LEVEL = "debug", EMPTY_TOKEN = "" }
                 .collect::<Vec<_>>(),
             ["FROM_FILE=one", "OVERRIDDEN=env", "QUOTED=two"]
         );
+        // #2308: a repo server's keychain items are its own.
+        let account = format!(
+            "mcp:repo:{}:s:env:API_KEY",
+            repo_secret_id(&std::fs::canonicalize(&dir).unwrap())
+        );
         assert_eq!(
             s.secrets,
             [SecretRef {
                 target: SecretTarget::Env("API_KEY".into()),
                 source: SecretSource::Keychain {
-                    account: "mcp:s:env:API_KEY".into()
+                    account: account.clone()
                 },
             }]
         );
-        assert_eq!(s.secrets[0].describe(), "keychain mcp:s:env:API_KEY");
+        assert_eq!(s.secrets[0].describe(), format!("keychain {account}"));
         // Debug lists env names, not values.
         let debug = format!("{s:?}");
         assert!(
@@ -2592,5 +2818,115 @@ url = "http://localhost:1/sse"
         for value in ["Bearer", "Bearer ", "sk-", "simstech", "application/json"] {
             assert!(!looks_secret_value(value), "{value}");
         }
+    }
+
+    // #2308 -----------------------------------------------------------------------------------
+
+    #[test]
+    fn user_accounts_are_unchanged_and_repo_accounts_are_scoped_per_repo() {
+        let gh = "[mcp.gh]\ntype = \"http\"\nurl = \"https://gh.test/mcp\"\nsecret_headers = [\"Authorization\"]\noauth = { client_id = \"c\", client_secret = true }\n";
+        // The user layer keeps the accounts every earlier version stored secrets under.
+        let mine = &user(gh).servers["gh"];
+        assert_eq!(
+            mine.keychain_accounts(),
+            ["mcp:gh:header:authorization", "mcp:gh:oauth-client-secret"]
+        );
+        assert_eq!(mine.credential_scope(), None);
+        assert_eq!(
+            header_account("gh", "Authorization"),
+            mine.header_account("Authorization")
+        );
+        // The same table in two repos: three different sets of items.
+        let a = scratch("scoped-a");
+        let b = scratch("scoped-b");
+        let in_repo = |dir: &Path| {
+            let file = dir.join(".amp/harness/config.toml");
+            McpConfig::from_tables(None, Some((&table(gh), &file))).servers["gh"].clone()
+        };
+        let (ra, rb) = (in_repo(&a), in_repo(&b));
+        let id_a = repo_secret_id(&std::fs::canonicalize(&a).unwrap());
+        assert_eq!(id_a.len(), 16);
+        assert_eq!(
+            ra.keychain_accounts(),
+            [
+                format!("mcp:repo:{id_a}:gh:header:authorization"),
+                format!("mcp:repo:{id_a}:gh:oauth-client-secret")
+            ]
+        );
+        assert_ne!(ra.keychain_accounts(), rb.keychain_accounts());
+        assert!(
+            rb.keychain_accounts()
+                .iter()
+                .all(|a| !mine.keychain_accounts().contains(a))
+        );
+        assert_eq!(ra.credential_scope(), Some(format!("mcp-repo:{id_a}:gh")));
+        let inputs = ra.secret_inputs();
+        assert_eq!(inputs.keychain, ra.keychain_accounts());
+        assert_eq!(inputs.oauth_scope, ra.credential_scope());
+        assert!(inputs.env.is_empty());
+        // The resolved references point at the scoped items.
+        let ctx = ExpandContext {
+            env: &no_env,
+            repo: Some(a.clone()),
+            worktree: None,
+            home: None,
+            config_dir: None,
+        };
+        let Resolved::Http(r) = ra.resolve(&ctx).unwrap() else {
+            panic!("not http")
+        };
+        assert!(
+            r.secrets.iter().all(|s| s.describe().contains(&id_a)),
+            "{r:?}"
+        );
+    }
+
+    #[test]
+    fn env_in_any_field_is_secret_bearing() {
+        let c = user(
+            "[mcp.r]\ntype = \"http\"\nurl = \"https://h.test/${env:PATH_KEY}/mcp?k=${env:Q_KEY}\"\nca_file = \"${env:CA_DIR}/ca.pem\"\n[mcp.s]\ncommand = \"${env:BIN_DIR}/srv\"\nargs = [\"--project\", \"${env:PROJECT}\"]\ncwd = \"${env:WORK}\"\nenv_file = \"${env:ENVF}\"\nsecret_env = [\"K\"]\n",
+        );
+        assert_eq!(c.errors().count(), 0, "{:#?}", c.problems);
+        assert_eq!(
+            c.servers["r"].env_reads().into_iter().collect::<Vec<_>>(),
+            ["CA_DIR", "PATH_KEY", "Q_KEY"]
+        );
+        assert_eq!(
+            c.secret_env_names().into_iter().collect::<Vec<_>>(),
+            [
+                "BIN_DIR", "CA_DIR", "ENVF", "K", "PATH_KEY", "PROJECT", "Q_KEY", "WORK"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_secret_env_reference_in_args_is_refused_in_a_repo_and_warned_about_in_yours() {
+        let text = "[mcp.s]\ncommand = \"srv\"\nargs = [\"--token\", \"${env:GH_TOKEN}\", \"${env:PROJECT}\"]\n";
+        let mine = user(text);
+        assert!(mine.servers.contains_key("s"));
+        let w: Vec<_> = mine.problems.iter().map(|p| p.to_string()).collect();
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(
+            w[0].starts_with("warning: ") && w[0].contains("GH_TOKEN"),
+            "{w:?}"
+        );
+        assert!(w[0].contains("env = { GH_TOKEN"), "{w:?}");
+        let repo = McpConfig::from_tables(None, Some((&table(text), Path::new(REPO))));
+        assert!(repo.servers.is_empty());
+        let e = repo.errors().next().unwrap().to_string();
+        assert!(
+            e.contains("`mcp.s.args`") && e.contains("process list"),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn a_password_in_the_url_is_refused() {
+        let c = user("[mcp.r]\nurl = \"https://me:hunter2-SECRET@h.test/mcp\"\n");
+        let e = c.errors().next().expect("refused").to_string();
+        assert!(e.contains("credential") && !e.contains("hunter2"), "{e}");
+        // A reference is fine (it is expanded at connect time and never printed).
+        let c = user("[mcp.r]\nurl = \"https://me:${env:PW}@h.test/mcp\"\n");
+        assert_eq!(c.errors().count(), 0, "{:#?}", c.problems);
     }
 }

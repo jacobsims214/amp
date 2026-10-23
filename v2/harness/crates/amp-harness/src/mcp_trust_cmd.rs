@@ -156,6 +156,10 @@ pub fn trust(args: TrustArgs) -> Result<(), CliError> {
     }
     for s in &servers {
         println!("trusted {}: {}", s.name, mcp_trust::summary(s));
+        let note = mcp_trust::env_note(s);
+        if !note.is_empty() {
+            println!("  {}", note.trim());
+        }
     }
     eprintln!(
         "Recorded in {}. A change to a server's config asks again.",
@@ -279,8 +283,10 @@ fn ask_with(
         let yes = all || {
             let answer = ui.ask(
                 &format!(
-                    "  `{}` {}.{changed} Trust it? [y: yes, a: all, N: not now]",
-                    u.name, u.what
+                    "  `{}` {}.{changed}{} Trust it? [y: yes, a: all, N: not now]",
+                    u.name,
+                    u.what,
+                    mcp_trust::env_note(server)
                 ),
                 Some(""),
             )?;

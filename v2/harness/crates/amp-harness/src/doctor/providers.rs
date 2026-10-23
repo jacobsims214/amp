@@ -510,7 +510,7 @@ fn probe_finding(
             } else {
                 format!("refused (HTTP {status})")
             };
-            Finding::new(serious, format!("{} {why} {what}", p.base_url)).fix(fix)
+            Finding::new(serious, format!("{} {why} {what}", amp_mcp::redact_url(&p.base_url))).fix(fix)
         }
         ProbeFailure::Tls => {
             let mtls = ["certificaterequired", "certificate required", "badcertificate", "bad certificate", "handshakefailure", "unknownca"]
@@ -548,7 +548,7 @@ fn probe_finding(
                      `amp-harness connect {id} --ca-file <PEM>`), or add it to the OS trust store"
                 )
             };
-            Finding::new(serious, format!("TLS to {} failed: {}", p.base_url, e.message)).fix(fix)
+            Finding::new(serious, format!("TLS to {} failed: {}", amp_mcp::redact_url(&p.base_url), amp_mcp::redact_urls(&e.message))).fix(fix)
         }
         ProbeFailure::Token => Finding::new(serious, format!("no token: {}", e.message)).fix(
             match &p.auth {

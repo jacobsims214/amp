@@ -1164,7 +1164,7 @@ impl Inner {
             line(
                 &mut rows,
                 &p.id,
-                format!("{} · {}", p.api, p.base_url),
+                format!("{} · {}", p.api, amp_mcp::redact_url(&p.base_url)),
                 format!("key: {}", p.key_source),
             );
         }

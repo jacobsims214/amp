@@ -772,7 +772,9 @@ async fn http_at_user_and_repo_scope() {
         "/mcp",
     )
     .await;
-    let env = [("GH_TOKEN", BEARER)];
+    // #2308: the repo server below reads its own variable; a repo server may never read one
+    // the person's own servers use.
+    let env = [("GH_TOKEN", BEARER), ("RGH_TOKEN", BEARER)];
     let out = t
         .run_with(
             &[
@@ -841,7 +843,7 @@ async fn http_at_user_and_repo_scope() {
                 "--scope",
                 "project",
                 "-H",
-                "Authorization: Bearer ${GH_TOKEN}",
+                "Authorization: Bearer ${RGH_TOKEN}",
                 "-H",
                 "X-Org=s",
                 "--json",
@@ -854,7 +856,7 @@ async fn http_at_user_and_repo_scope() {
     assert_eq!(v["trusted"], true);
     assert_eq!(v["test"]["ok"], true, "{v}");
     assert!(
-        T::read(&t.repo_file()).contains("Authorization = \"Bearer ${env:GH_TOKEN}\""),
+        T::read(&t.repo_file()).contains("Authorization = \"Bearer ${env:RGH_TOKEN}\""),
         "{}",
         T::read(&t.repo_file())
     );

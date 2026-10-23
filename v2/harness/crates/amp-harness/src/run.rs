@@ -223,7 +223,11 @@ fn mcp_warnings(rt: &Runtime, starting: &[String]) {
                 "amp-harness: MCP server `{label}` is still starting; this run goes on without its tools"
             ),
             ServerStatus::Starting => {}
-            other => eprintln!("amp-harness: MCP server `{label}`: {other}"),
+            // #2308: the hub already redacts; CI logs get a second pass.
+            other => eprintln!(
+                "amp-harness: MCP server `{label}`: {}",
+                amp_mcp::redact_urls(&other.to_string())
+            ),
         }
     }
 }

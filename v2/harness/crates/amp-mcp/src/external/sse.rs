@@ -196,7 +196,10 @@ impl LegacySseTransport {
                     .header(ACCEPT, "text/event-stream"),
             )
             .await?;
-        let response = request.send().await.map_err(SseError::Request)?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| SseError::Request(e.without_url()))?;
         if !response.status().is_success() {
             return Err(status_error(&response));
         }
@@ -331,7 +334,10 @@ impl Transport<RoleClient> for LegacySseTransport {
                         .body(body),
                 )
                 .await?;
-            let response = request.send().await.map_err(SseError::Request)?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| SseError::Request(e.without_url()))?;
             if response.status().is_success() {
                 Ok(())
             } else {
@@ -360,7 +366,7 @@ where
 {
     let mut size = EventSize::default();
     stream.map(move |chunk| {
-        let chunk = chunk.map_err(SseError::Request)?;
+        let chunk = chunk.map_err(|e| SseError::Request(e.without_url()))?;
         size.observe(&chunk, max)?;
         Ok(chunk)
     })

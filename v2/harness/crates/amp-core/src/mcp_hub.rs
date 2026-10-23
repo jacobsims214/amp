@@ -695,6 +695,9 @@ struct Inner {
     /// Names never inherited by stdio servers ([`mcp_stdio::strip_set`]); updated when the
     /// runtime learns another secret name (`--token-env`).
     strip: Mutex<BTreeSet<String>>,
+    /// The person's own credential variables, which no repo server may read (#2308,
+    /// [`crate::mcp_trust::check_repo_env`]).
+    protected: Mutex<BTreeSet<String>>,
     /// The shared servers by name; [`McpHub::reload`] adds, replaces and removes cells.
     shared: Mutex<BTreeMap<String, Arc<Cell>>>,
     /// Shared cells a reload removed or replaced, still running until no session holds their
@@ -809,6 +812,7 @@ impl McpHub {
                 opts,
                 config: Mutex::new(Arc::new(config)),
                 strip: Mutex::new(BTreeSet::new()),
+                protected: Mutex::new(BTreeSet::new()),
                 shared: Mutex::new(shared),
                 retired: Mutex::new(Vec::new()),
                 sweeping: AtomicBool::new(false),
@@ -872,6 +876,18 @@ impl McpHub {
     /// `pass_to_bash`, [`mcp_stdio::strip_set`]).
     pub fn set_strip(&self, names: BTreeSet<String>) {
         *self.inner.strip.lock().unwrap_or_else(|e| e.into_inner()) = names;
+    }
+
+    /// Adds variable names that hold the person's own credentials (provider keys, AMP_TOKEN,
+    /// `--token-env`, `pass_to_bash`, what their own MCP servers read): a repo server that reads
+    /// one is stopped with a config error instead of connecting (#2308). `AMP_TOKEN` is always
+    /// protected.
+    pub fn protect_env(&self, names: impl IntoIterator<Item = String>) {
+        self.inner
+            .protected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(names);
     }
 
     /// Whether any server is configured to run (shared or per worktree).
@@ -1807,6 +1823,7 @@ struct ConnectCtx {
     default_cwd: PathBuf,
     keychain: Option<String>,
     strip: BTreeSet<String>,
+    protected: BTreeSet<String>,
 }
 
 impl From<&Inner> for ConnectCtx {
@@ -1817,6 +1834,11 @@ impl From<&Inner> for ConnectCtx {
             default_cwd: h.opts.default_cwd.clone(),
             keychain: h.opts.keychain.clone(),
             strip: h.strip.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            protected: h
+                .protected
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 }
@@ -1828,10 +1850,59 @@ enum Prepared {
     Remote(amp_mcp::HttpServerOptions),
 }
 
+/// The environment a server's config may read (#2308): everything for a user server; for a repo
+/// server only the variables it names ([`McpServer::env_reads`], approved when it was trusted)
+/// plus `HOME` (for `${home}`), never one in `protected`.
+fn config_env(
+    server: &McpServer,
+    protected: &BTreeSet<String>,
+) -> impl Fn(&str) -> Option<String> + use<> {
+    let reads = server.env_reads();
+    let repo = server.is_repo();
+    let protected = protected.clone();
+    move |k: &str| {
+        if repo
+            && (protected.contains(k)
+                || k == amp_mcp::ENV_TOKEN
+                || (k != "HOME" && !reads.contains(k)))
+        {
+            return None;
+        }
+        std::env::var(k).ok()
+    }
+}
+
+/// The values of the variables `server` reads, to scrub from its error messages: a URL with
+/// `${env:KEY}` in its path or query must not show up in a status line, the transcript or
+/// `run -p`'s stderr (#2308).
+fn env_values(server: &McpServer, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    server
+        .env_reads()
+        .iter()
+        .filter_map(|k| env(k))
+        .filter(|v| !v.trim().is_empty())
+        .collect()
+}
+
+impl Fail {
+    /// The same failure with URLs redacted and `values` replaced (#2308).
+    fn scrubbed(self, values: &[String]) -> Self {
+        let clean = |m: String| amp_mcp::scrub_values(&amp_mcp::redact_urls(&m), values);
+        match self {
+            Self::Transient(m) => Self::Transient(clean(m)),
+            Self::Auth(m) => Self::Auth(clean(m)),
+            Self::Config(m) => Self::Config(clean(m)),
+        }
+    }
+}
+
 /// Expands `${...}`, reads env files and secrets (synchronously: nothing here is held across an
 /// await).
 fn prepare(cell: &Cell, ctx: &ConnectCtx) -> Result<Prepared, Fail> {
-    let env = |k: &str| std::env::var(k).ok();
+    // #2308: a repo server never reads the person's own credentials, and only the variables it
+    // was trusted with.
+    crate::mcp_trust::check_repo_env(&cell.server, &ctx.protected).map_err(Fail::Config)?;
+    let env = config_env(&cell.server, &ctx.protected);
     let expand = ExpandContext::from_paths(&ctx.paths, &env, cell.worktree.as_deref());
     let resolved = cell
         .server
@@ -1843,7 +1914,8 @@ fn prepare(cell: &Cell, ctx: &ConnectCtx) -> Result<Prepared, Fail> {
     Ok(match resolved {
         Resolved::Stdio(r) => {
             let service = ctx.keychain.clone().unwrap_or_default();
-            let fetch = move |s: &SecretRef| s.fetch(&service, &|k| std::env::var(k).ok());
+            let env_ref = &env;
+            let fetch = move |s: &SecretRef| s.fetch(&service, env_ref);
             let default_cwd = cell.worktree.clone().unwrap_or(ctx.default_cwd.clone());
             let mut sctx = mcp_stdio::StdioContext::from_process(
                 &ctx.strip,
@@ -1863,6 +1935,16 @@ fn prepare(cell: &Cell, ctx: &ConnectCtx) -> Result<Prepared, Fail> {
 
 /// Connects with the server's transport, then lists its tools.
 async fn connect_cell(
+    cell: &Cell,
+    ctx: &ConnectCtx,
+) -> Result<(ExternalClient, Vec<McpToolDef>), Fail> {
+    let values = env_values(&cell.server, &config_env(&cell.server, &ctx.protected));
+    connect_cell_inner(cell, ctx)
+        .await
+        .map_err(|f| f.scrubbed(&values))
+}
+
+async fn connect_cell_inner(
     cell: &Cell,
     ctx: &ConnectCtx,
 ) -> Result<(ExternalClient, Vec<McpToolDef>), Fail> {
