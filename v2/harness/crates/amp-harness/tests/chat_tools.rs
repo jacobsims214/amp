@@ -69,7 +69,7 @@ async fn snapshot(name: &str, script: Value, size: (usize, usize), inputs: &[&st
     }
     let rows: Vec<String> = out.stdout.lines().map(str::to_owned).collect();
     assert_eq!(rows.len(), size.1, "{}", out.stdout);
-    rows
+    common::unpad(rows)
 }
 
 /// The rows the three calls take: from the blank row above the first to the last call's line.

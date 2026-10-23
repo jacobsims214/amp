@@ -15,7 +15,12 @@
 //!   cause chain); the chat opens disconnected and retries instead of exiting.
 //! - #2232: `--config FILE` / `--config-dir DIR` (and `AMP_HARNESS_CONFIG[_DIR]`) are global and
 //!   apply to every setting and command ([`amp_mcp::config_paths`]).
+//! - #2234: `agents list|show|new|edit|remove|reset|validate|skills` and
+//!   `skills list|show|new|import|edit|remove|reset|validate`, at `--user` or `--repo` scope.
+//! - #2235: `models list|set|reset|profile` (per-role models, user or repo file) and
+//!   `config check` (every layer's problems, naming file and key).
 
+mod agents_cmd;
 mod chat;
 mod config_cmd;
 mod conn;
@@ -23,10 +28,12 @@ mod connect;
 mod debug;
 mod doctor;
 mod mcp_cmd;
+mod models_cmd;
 mod run;
 mod server_cmd;
 mod session;
 mod setup;
+mod skills_cmd;
 mod tickets;
 mod whoami;
 
@@ -106,6 +113,10 @@ enum Command {
     /// Providers, models and the model each role runs on.
     #[command(subcommand)]
     Config(config_cmd::ConfigCommand),
+    /// The model each role runs on: `models list`, `models set <role> <provider/model>`,
+    /// `models reset <role>`, `models profile <name>` (--user, the default, or --repo).
+    #[command(subcommand)]
+    Models(models_cmd::ModelsCommand),
     /// Add a model provider: its key (asked hidden, checked, kept in the OS keychain) or a custom
     /// OpenAI-compatible endpoint. `connect --list` shows every provider and where its key comes from.
     Connect(connect::ConnectArgs),
@@ -114,6 +125,13 @@ enum Command {
     /// Show, save and switch AMP servers (`server`, `server set <url>`, `server use <name>`),
     /// without editing config.toml by hand.
     Server(server_cmd::ServerArgs),
+    /// Agents: list, show, create (from a template or a copy), edit in $EDITOR, remove, reset, and
+    /// the skills each preloads. `--user` (default) or `--repo` picks the layer a change goes to.
+    #[command(subcommand)]
+    Agents(agents_cmd::AgentsCommand),
+    /// Skills: list, show, create, import (Claude Code / opencode skill dirs), edit, remove, reset.
+    #[command(subcommand)]
+    Skills(skills_cmd::SkillsCommand),
     /// Set up this machine and folder: AMP server, login, project (.amp.json), provider key.
     /// Asks for whatever the flags leave open when run in a terminal; `--yes` never asks.
     Init(setup::InitArgs),
@@ -188,11 +206,14 @@ async fn main() -> ExitCode {
         Some(Command::Tickets(command)) => tickets::run(command).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
+        Some(Command::Models(command)) => models_cmd::run(command).await,
         Some(Command::Connect(args)) => connect::run(args).await,
         Some(Command::Disconnect(args)) => connect::disconnect(args).await,
         Some(Command::Init(args)) => setup::init(args).await,
         Some(Command::Server(args)) => server_cmd::run(args).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
+        Some(Command::Agents(command)) => agents_cmd::run(command).await,
+        Some(Command::Skills(command)) => skills_cmd::run(command).await,
         Some(Command::Debug(command)) => debug::run(command).await,
         None => chat::run(cli.chat).await,
     };

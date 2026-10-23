@@ -249,7 +249,11 @@ async fn the_chrome_slots_render_nothing_without_metadata() {
     view.header_slot()
         .add_child(Arc::new(rpi_tui::Text::new("HEADER", 0, 0)));
     let lines = view.render_plain(W, H);
-    assert_eq!(lines[0], "HEADER");
+    // Inside the left padding (#2251).
+    assert_eq!(
+        lines[0],
+        format!("{}HEADER", " ".repeat(amp_tui::DEFAULT_PADDING))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

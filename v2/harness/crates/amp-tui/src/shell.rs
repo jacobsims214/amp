@@ -459,6 +459,11 @@ impl Shell {
     }
 
     /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
+    /// Columns of space left and right of the chat (`[tui] padding`, #2251).
+    pub fn set_padding(&mut self, columns: usize) {
+        self.view.set_padding(columns);
+    }
+
     pub fn set_mouse_capture(&mut self, on: bool) {
         self.mouse_capture = on;
     }

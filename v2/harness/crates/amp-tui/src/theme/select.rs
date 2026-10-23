@@ -21,6 +21,7 @@ pub const ENV_THEME: &str = "AMP_HARNESS_THEME";
 pub const ENV_COLOR: &str = "AMP_HARNESS_COLOR";
 pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
 pub const ENV_MOUSE: &str = "AMP_HARNESS_MOUSE";
+pub const ENV_PADDING: &str = "AMP_HARNESS_PADDING";
 
 /// Dark or light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,6 +110,8 @@ struct TuiTable {
     show_thinking: Option<String>,
     /// `true`/`false` (or `"on"`/`"off"`), #2185.
     mouse: Option<toml::Value>,
+    /// Columns left and right of the chat, #2251.
+    padding: Option<toml::Value>,
 }
 
 /// How the chat shows thinking (#2177): `AMP_HARNESS_SHOW_THINKING`, then config.toml `[tui]
@@ -168,6 +171,48 @@ pub fn resolve_mouse(
         Some(other) => Err(ThemeError(format!(
             "[tui] mouse: unknown value `{other}`: use true or false"
         ))),
+    }
+}
+
+/// Columns of space left and right of the chat (#2251): `AMP_HARNESS_PADDING`, then config.toml
+/// `[tui] padding`, then [`crate::DEFAULT_PADDING`]. A whole number from 0 to
+/// [`crate::MAX_PADDING`].
+pub fn resolve_padding(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<usize, ThemeError> {
+    if let Some(v) = env(ENV_PADDING).filter(|v| !v.trim().is_empty()) {
+        return parse_padding(v.trim()).map_err(|e| ThemeError(format!("{ENV_PADDING}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.padding {
+        None => Ok(crate::DEFAULT_PADDING),
+        Some(toml::Value::Integer(n)) => {
+            parse_padding(&n.to_string()).map_err(|e| ThemeError(format!("[tui] padding: {e}")))
+        }
+        Some(toml::Value::String(v)) => {
+            parse_padding(v.trim()).map_err(|e| ThemeError(format!("[tui] padding: {e}")))
+        }
+        Some(other) => Err(ThemeError(format!(
+            "[tui] padding: unknown value `{other}`: use a number of columns from 0 to {}",
+            crate::MAX_PADDING
+        ))),
+    }
+}
+
+fn parse_padding(v: &str) -> Result<usize, String> {
+    match v.parse::<usize>() {
+        Ok(n) if n <= crate::MAX_PADDING => Ok(n),
+        _ => Err(format!(
+            "unknown value `{v}`: use a number of columns from 0 to {}",
+            crate::MAX_PADDING
+        )),
     }
 }
 
@@ -488,6 +533,40 @@ mod tests {
         assert!(e.0.contains("[tui] mouse"), "{}", e.0);
         let e = resolve_mouse(&env_of(&[(ENV_MOUSE, "maybe")]), None).unwrap_err();
         assert!(e.0.contains(ENV_MOUSE), "{}", e.0);
+    }
+
+    #[test]
+    fn padding_from_env_then_config_then_default() {
+        let none = env_of(&[]);
+        assert_eq!(
+            resolve_padding(&none, None).unwrap(),
+            crate::DEFAULT_PADDING
+        );
+        assert_eq!(
+            resolve_padding(&none, Some("[tui]\ntheme = \"dark\"\n")).unwrap(),
+            crate::DEFAULT_PADDING
+        );
+        assert_eq!(
+            resolve_padding(&none, Some("[tui]\npadding = 0\n")).unwrap(),
+            0
+        );
+        assert_eq!(
+            resolve_padding(&none, Some("[tui]\npadding = \"3\"\n")).unwrap(),
+            3
+        );
+        let env = env_of(&[(ENV_PADDING, "1")]);
+        assert_eq!(
+            resolve_padding(&env, Some("[tui]\npadding = 4\n")).unwrap(),
+            1
+        );
+        let e = resolve_padding(&none, Some("[tui]\npadding = 9\n")).unwrap_err();
+        assert!(e.0.contains("[tui] padding"), "{}", e.0);
+        let e = resolve_padding(&none, Some("[tui]\npadding = -1\n")).unwrap_err();
+        assert!(e.0.contains("[tui] padding"), "{}", e.0);
+        let e = resolve_padding(&none, Some("[tui]\npadding = true\n")).unwrap_err();
+        assert!(e.0.contains("[tui] padding"), "{}", e.0);
+        let e = resolve_padding(&env_of(&[(ENV_PADDING, "wide")]), None).unwrap_err();
+        assert!(e.0.contains(ENV_PADDING), "{}", e.0);
     }
 
     #[test]

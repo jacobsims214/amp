@@ -21,6 +21,8 @@ use tokio::sync::{Mutex, mpsc::UnboundedReceiver};
 
 const W: usize = 100;
 const H: usize = 40;
+/// The width `/help` gets in an 80-column terminal: inside the chat's padding (#2251).
+const HELP_80: usize = 80 - 2 * amp_tui::DEFAULT_PADDING;
 
 struct Rig {
     shell: Shell,
@@ -106,10 +108,15 @@ impl Rig {
         let Some(start) = screen.iter().position(|l| l.contains("── commands")) else {
             return Vec::new();
         };
+        // Without the chat's left padding (#2251).
         screen[start + 1..]
             .iter()
             .take_while(|l| !l.contains("Tab complete"))
-            .cloned()
+            .map(|l| {
+                l.strip_prefix(&" ".repeat(amp_tui::DEFAULT_PADDING))
+                    .unwrap_or(l)
+                    .to_owned()
+            })
             .collect()
     }
 
@@ -265,9 +272,9 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
             "{heading}\n{screen}"
         );
     }
-    let amp = screen.find("\n AMP\n").expect("AMP heading");
-    let chat = screen.find("\n Chat\n").expect("Chat heading");
-    let keys = screen.find("\n Keys\n").expect("Keys heading");
+    let amp = screen.find("\n   AMP\n").expect("AMP heading");
+    let chat = screen.find("\n   Chat\n").expect("Chat heading");
+    let keys = screen.find("\n   Keys\n").expect("Keys heading");
     assert!(amp < chat && chat < keys, "AMP first, then Chat, then Keys");
 
     // Full contrast: AMP commands are drawn in the text colour, never dim.
@@ -280,9 +287,10 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
     assert!(ticket.contains(&colors.text.fg("/ticket")), "{ticket:?}");
     assert!(!ticket.contains(&colors.dim.fg("/ticket")), "{ticket:?}");
 
-    // At 80 columns: every row fits, no word is split, descriptions line up in one column.
+    // In an 80-column terminal (inside the padding): every row fits, no word is split,
+    // descriptions line up in one column, and none wraps onto a second row.
     let rows: Vec<String> = HelpBlock::new()
-        .render(80)
+        .render(HELP_80)
         .iter()
         .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
         .collect();
@@ -305,8 +313,8 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
         .collect();
     for row in &rows {
         assert!(
-            rpi_tui::visible_width(row) <= 80,
-            "{row:?} is wider than 80"
+            rpi_tui::visible_width(row) <= HELP_80,
+            "{row:?} is wider than {HELP_80}"
         );
         for word in row.split_whitespace() {
             assert!(
@@ -315,6 +323,11 @@ async fn help_is_grouped_with_descriptions_and_fits_80_columns() {
             );
         }
     }
+    assert!(
+        !rows.iter().any(|r| r.starts_with(&" ".repeat(10))),
+        "a description wrapped:\n{}",
+        rows.join("\n")
+    );
     for c in COMMANDS {
         let row = rows
             .iter()
@@ -372,7 +385,7 @@ async fn help_keys_follow_mouse_capture() {
     let rows = |on: bool| -> Vec<String> {
         HelpBlock::new()
             .mouse_capture(on)
-            .render(80)
+            .render(HELP_80)
             .iter()
             .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
             .collect()
@@ -381,7 +394,7 @@ async fn help_keys_follow_mouse_capture() {
     assert_eq!(
         on,
         HelpBlock::new()
-            .render(80)
+            .render(HELP_80)
             .iter()
             .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
             .collect::<Vec<_>>()

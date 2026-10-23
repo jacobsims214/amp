@@ -1,7 +1,7 @@
 
  AMP
    /amp                     the AMP connection: server, user, MCP health
-   /ticket [id|none]        the current ticket; switch to another, or clear it
+   /ticket [id|none]        the current ticket; switch it, or clear it
    /workers                 workers here, and tickets in progress elsewhere
    /questions               tickets waiting on an answer; answer them here
    /plan                    plan approval and the epics and stories
@@ -24,11 +24,11 @@
    /                        commands: ↑↓ choose, Tab complete, Enter run
    Esc                      stop the reply, or close a panel or the menu
    Ctrl+C                   stop the reply, clear the editor; twice quits
-   Ctrl+D                   quit (with an empty editor, at the latest output)
+   Ctrl+D                   quit (empty editor, at the latest output)
    Ctrl+T                   show or hide the last thinking
    Ctrl+O                   show or hide tool call details
    PgUp/PgDn                scroll the transcript a page
    Ctrl+U/D                 scroll half a page (with an empty editor)
    End                      jump to the latest output (with an empty editor)
-   Fn/⌥-drag                select text: Fn in Terminal.app, Option in iTerm2
+   Fn/⌥-drag                select text (Fn in Terminal.app, ⌥ in iTerm2)
 

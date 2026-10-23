@@ -140,9 +140,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     };
     let (emitter, events) = ChannelEmitter::new();
     let totals = Arc::new(Mutex::new(Totals::default()));
-    let model = rt
-        .models
-        .resolve_role(&role.model_role)
+    let model = role
+        .resolve_model(&rt.models)
         .map(|r| r.model_ref())
         .unwrap_or_default();
     let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());

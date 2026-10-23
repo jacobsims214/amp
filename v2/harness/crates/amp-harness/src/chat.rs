@@ -22,6 +22,7 @@
 //! shows every tool call's arguments and result (#2183). Mouse reporting (#2185):
 //! `AMP_HARNESS_MOUSE`, `[tui] mouse` (true|false), else on; off gives the terminal's plain
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
+//! Padding (#2251): `AMP_HARNESS_PADDING`, `[tui] padding` (0-8 columns each side), else 2.
 //!
 //! `/server` (#2164) gets a [`crate::server_cmd::Switcher`]: it lists the saved servers and moves
 //! the session (its AMP connection, the model's AMP tools and prompt, the metadata poller) to
@@ -180,6 +181,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     amp_tui::install_theme(&theme);
     let show_thinking = load_show_thinking(&args)?;
     let mouse = load_mouse(&args)?;
+    let padding = load_padding(&args)?;
 
     // First run (D12): ask for whatever is missing before connecting for real. In --snapshot only
     // with scripted answers (AMP_HARNESS_PROMPTS=stdin), so render checks never stop on a question.
@@ -208,6 +210,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
     shell.set_show_thinking(show_thinking);
     shell.set_mouse_capture(mouse);
+    shell.set_padding(padding);
     // A suggested first prompt (new project: seed the KB; new user: the AMP guide). Nothing is
     // sent until the person presses Enter.
     if let Some(text) = outcome.and_then(|o| o.prefill) {
@@ -404,6 +407,14 @@ fn load_show_thinking(args: &ChatArgs) -> Result<amp_tui::ThinkingDisplay, CliEr
 fn load_mouse(args: &ChatArgs) -> Result<bool, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_tui::theme::select::resolve_mouse(&env, config_text(args).as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))
+}
+
+/// Left and right padding (#2251): `AMP_HARNESS_PADDING`, then config.toml `[tui] padding`,
+/// else [`amp_tui::DEFAULT_PADDING`].
+fn load_padding(args: &ChatArgs) -> Result<usize, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_tui::theme::select::resolve_padding(&env, config_text(args).as_deref())
         .map_err(|e| CliError::usage(e.to_string()))
 }
 

@@ -648,7 +648,7 @@ async fn amp_tool_calls_are_titled_with_their_ticket() {
         rows[at + 1..]
             .iter()
             .take(6)
-            .any(|r| r.starts_with(" ✗ read README.md")),
+            .any(|r| r.starts_with("   ✗ read README.md")),
         "{screen}"
     );
     assert!(
@@ -687,7 +687,7 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
     let rows: Vec<&str> = screen.lines().collect();
     let call = rows
         .iter()
-        .position(|r| r.starts_with(" ✗ dispatch_task"))
+        .position(|r| r.starts_with("   ✗ dispatch_task"))
         .expect(&screen);
     let notice = rows
         .iter()

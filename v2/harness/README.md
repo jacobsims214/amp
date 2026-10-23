@@ -427,6 +427,27 @@ flags ids that are missing. It exits 1 if a role does not resolve or a checked i
 `config show` reads the same files a session in this folder would: the user config.toml
 (`--config` / `--config-dir` apply) and the repo's `.amp/harness/config.toml`.
 
+### Changing models without editing files (#2235)
+
+```sh
+amp-harness models list [--available] [--check] [--json]
+amp-harness models set reviewer anthropic/claude-opus-5-5 [--thinking high] [--user|--repo] [--no-check]
+amp-harness models reset reviewer [--user|--repo]
+amp-harness models profile anthropic            # or opencode, a [profiles.X] of yours, or:
+amp-harness models profile inherit --inherit openrouter/z-ai/glm-5.3 [--thinking high]
+amp-harness config check [--json] [--live]
+```
+
+`--user` (the default) edits your config.toml; `--repo` edits the repo's `.amp/harness/config.toml`,
+which holds only `[roles.*]` and `[models] profile`. Edits keep your comments and other settings,
+copy the old file to `config.toml.bak`, and are written only if the result loads and the role
+resolves. `models set` refuses an unknown provider; a model your config doesn't define yet is looked
+up in the provider's live catalog (when it has a key) and added to your user file as an empty
+`[providers.<p>.models."<id>"]` table, and a model the catalog doesn't list is refused unless
+`--no-check`. `config check` reports every problem in every layer (files, server, models,
+providers, roles, workers, tools, tui, mcp; `--live` adds each role's model against the live catalog)
+with the file, the key and a fix, and exits 1 on errors (a missing key is a warning).
+
 ### Secrets never reach an agent's bash (#2142)
 
 Every session's `bash` (manager and workers) gets the harness's environment minus its own secrets:
@@ -573,6 +594,7 @@ with square borders and AMP's ticket-state, epic and brand colours.
 | colours  | -         | `AMP_HARNESS_COLOR`         | `color`               | `auto`      |
 | thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
 | mouse    | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
+| padding  | -         | `AMP_HARNESS_PADDING`       | `padding`             | `2`         |
 
 - `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
   background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
@@ -585,6 +607,9 @@ with square borders and AMP's ticket-state, epic and brand colours.
 - `mouse`: `true` (the wheel scrolls the transcript; select with Fn-drag in Terminal.app,
   Option-drag in iTerm2) or `false` (no mouse reporting: plain click-drag selects). The env var
   takes `on`/`off`.
+- `padding`: columns of space left and right of every part of the chat (header, transcript,
+  panels, editor, status line, footer), 0 to 8. Below 44 columns it shrinks so the content keeps
+  at least 40 columns (none at 41 columns or fewer).
 
 ### Header and status line (M3-3)
 
@@ -678,8 +703,18 @@ You can override or add agents and skills from disk. Later layers win:
 An agent override (`agents/amp-manager.md`) replaces the whole agent. Skills override per file:
 `skills/amp-kb/SKILL.md` replaces only that file, and the skill keeps its other embedded files. Files
 that don't exist in the embedded set add new agents or skills. Names are lowercase letters, digits
-and hyphens. A malformed override is an error naming the file, never skipped silently. A new agent
-needs a `[roles.<id without amp->]` model in config.toml.
+and hyphens. A malformed override is an error naming the file, never skipped silently.
+
+`amp-harness agents list|show|new|edit|remove|reset|validate` and `agents skills <id> add|remove
+<skill>`, and `amp-harness skills list|show|new|import|edit|remove|reset|validate`, do this without
+editing files by hand (#2234). Writers take `--user` (default) or `--repo` and validate before they
+write; `edit` opens `$VISUAL`/`$EDITOR` and can reopen an invalid edit. `agents new <id> --from
+worker|reviewer|researcher|blank|<agent id>` writes `dispatch: true` (the manager may run it whatever
+its id; a manager `task` rule that names it with `deny` still wins) and `based_on: <role>`. A new
+agent needs no `[roles]` entry: its model is `[roles.<id without amp->]` (repo, then user), else the
+frontmatter `model` if that provider/model is configured, else the `based_on` role's model, else
+`[models] fallback` (a role name or `provider/model`; default `worker-backend`). `agents new
+--model p/m [--thinking L]` writes `[roles.<id>]` to the chosen layer's config.toml.
 
 Tool policy uses opencode's `permission` semantics, enforced by the harness before each tool call:
 the last matching rule wins, `ask` is treated as `deny` (nothing ever prompts), and a denied call
