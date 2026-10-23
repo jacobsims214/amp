@@ -734,7 +734,7 @@ fn ticket_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
     rows
 }
 
-fn tokens(n: i64) -> String {
+pub(crate) fn tokens(n: i64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1e6)
     } else if n >= 1_000 {
@@ -1356,6 +1356,9 @@ fn hint(state: &PanelState, has_targets: bool) -> String {
         (Stage::Sending { .. }, _) => "sending…".to_owned(),
         (Stage::Browse, PanelKind::Model) if has_targets => {
             "↑↓ select · Enter switch · Esc close".to_owned()
+        }
+        (Stage::Browse, PanelKind::Workers) if has_targets => {
+            "↑↓ select · Enter watch · x stop · o open in browser · Esc close".to_owned()
         }
         (Stage::Browse, PanelKind::Questions) if has_targets => {
             "↑↓ select · Enter answer · o open in browser · Esc close".to_owned()

@@ -59,6 +59,7 @@ use crate::{
     project::ProjectMarker,
     roles::Role,
     tools::call_json,
+    worker_session::{self, WorkerFeed},
 };
 
 /// The AMP tools that close a ticket. A worker that ends without one of them succeeding on its
@@ -352,6 +353,63 @@ pub enum RunTicketError {
     Cancelled,
     #[error("bad arguments: {0}")]
     BadArguments(String),
+    /// The person stopped the worker from the chat while it waited for a slot (#2252).
+    #[error(
+        "{by} stopped the worker on #{task_id} from the chat before it started; nothing was dispatched. Ask them before running it again"
+    )]
+    Stopped { task_id: i64, by: String },
+}
+
+/// Why [`Supervisor::stop_worker`] did nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StopError {
+    #[error("#{0} has no worker in this chat")]
+    NotFound(i64),
+    #[error("the worker on #{0} has already finished")]
+    Finished(i64),
+    #[error("the worker on #{0} is already stopping")]
+    AlreadyStopping(i64),
+}
+
+/// A worker's session as the chat lists it (#2252): live (running or queued) or finished in this
+/// process.
+#[derive(Debug, Clone)]
+pub struct WorkerSessionInfo {
+    pub task_id: i64,
+    pub agent_id: String,
+    /// `Some` while the worker is live; `None` once it has finished.
+    pub phase: Option<WorkerPhase>,
+    pub model: Option<String>,
+    pub cwd: Option<PathBuf>,
+    /// When it started running (or was queued).
+    pub since: SystemTime,
+    /// When it finished.
+    pub ended: Option<SystemTime>,
+    pub totals: Totals,
+    /// How it ended (finished workers).
+    pub outcome: Option<WorkerOutcome>,
+    pub error: Option<String>,
+    /// Who stopped it from the chat, once someone has asked it to stop.
+    pub stopped_by: Option<String>,
+    pub session_file: Option<PathBuf>,
+}
+
+impl WorkerSessionInfo {
+    pub fn is_live(&self) -> bool {
+        self.phase.is_some()
+    }
+}
+
+/// A worker that finished in this process: its feed stays viewable.
+struct FinishedWorker {
+    info: WorkerSessionInfo,
+    feed: Arc<WorkerFeed>,
+}
+
+/// What a stop from the chat says (#2252): the worker's error, the abandoned run's note
+/// (`abandoned: cancelled: stopped by ... from the chat`) and the reason the ticket is handed back.
+pub fn stopped_from_chat(by: &str) -> String {
+    format!("stopped by {by} from the chat")
 }
 
 /// A worker's phase, for a `/workers` view.
@@ -386,6 +444,11 @@ struct LiveWorker {
     cwd: Option<PathBuf>,
     since: SystemTime,
     totals: Option<Arc<Mutex<Totals>>>,
+    /// Every event the worker emitted, for the chat's session view (#2252).
+    feed: Arc<WorkerFeed>,
+    /// Cancelled by [`Supervisor::stop_worker`]; `stopped_by` says who.
+    stop: CancellationToken,
+    stopped_by: Arc<Mutex<Option<String>>>,
 }
 
 /// Runs workers for one manager. Share it as `Arc<Supervisor>`; [`Supervisor::tool`] is the
@@ -398,6 +461,8 @@ pub struct Supervisor {
     cancel: CancellationToken,
     hooks: Option<Arc<dyn WorkerHooks>>,
     live: Mutex<BTreeMap<i64, LiveWorker>>,
+    /// Workers that finished in this process, by ticket (the latest run of each).
+    finished: Mutex<BTreeMap<i64, FinishedWorker>>,
     running: AtomicUsize,
     peak: AtomicUsize,
     /// Serializes `git worktree` changes (git's own lock fails rather than waits).
@@ -432,6 +497,7 @@ impl Supervisor {
             cancel: CancellationToken::new(),
             hooks,
             live: Mutex::new(BTreeMap::new()),
+            finished: Mutex::new(BTreeMap::new()),
             running: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             git_lock: tokio::sync::Mutex::new(()),
@@ -537,6 +603,112 @@ impl Supervisor {
         self.peak.load(Ordering::SeqCst)
     }
 
+    /// Every worker session of this chat: the live ones (by ticket), then the finished ones
+    /// (by ticket) that have no live run (#2252).
+    pub fn sessions(&self) -> Vec<WorkerSessionInfo> {
+        let mut out: Vec<WorkerSessionInfo> = {
+            let live = self.live.lock().unwrap();
+            live.iter().map(|(id, w)| live_info(*id, w)).collect()
+        };
+        let finished = self.finished.lock().unwrap();
+        for (id, f) in finished.iter() {
+            if !out.iter().any(|s| s.task_id == *id) {
+                out.push(f.info.clone());
+            }
+        }
+        out
+    }
+
+    /// One worker session of this chat, live or finished.
+    pub fn session(&self, task_id: i64) -> Option<WorkerSessionInfo> {
+        if let Some(w) = self.live.lock().unwrap().get(&task_id) {
+            return Some(live_info(task_id, w));
+        }
+        self.finished
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .map(|f| f.info.clone())
+    }
+
+    /// The events of ticket `task_id`'s worker in this chat (live, or the last finished run).
+    pub fn feed(&self, task_id: i64) -> Option<Arc<WorkerFeed>> {
+        if let Some(w) = self.live.lock().unwrap().get(&task_id) {
+            return Some(Arc::clone(&w.feed));
+        }
+        self.finished
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .map(|f| Arc::clone(&f.feed))
+    }
+
+    /// The newest session file a worker on `task_id` wrote, in this process or an earlier one.
+    pub fn latest_session_file(&self, task_id: i64) -> Option<PathBuf> {
+        worker_session::latest_session(&self.rt.state_dir, task_id)
+    }
+
+    /// Stops the live worker on `task_id` because `by` (the person at the chat) asked to
+    /// (#2252). Its run ends as `cancelled` with the error [`stopped_from_chat`]: run reporting
+    /// records it abandoned and hands the ticket back to ready (#2204), and the manager's
+    /// `amp_run_ticket` returns with a note saying who stopped it. A worker still waiting for a
+    /// slot is never dispatched.
+    pub fn stop_worker(&self, task_id: i64, by: &str) -> Result<(), StopError> {
+        let live = self.live.lock().unwrap();
+        let Some(w) = live.get(&task_id) else {
+            return Err(if self.finished.lock().unwrap().contains_key(&task_id) {
+                StopError::Finished(task_id)
+            } else {
+                StopError::NotFound(task_id)
+            });
+        };
+        if w.stop.is_cancelled() {
+            return Err(StopError::AlreadyStopping(task_id));
+        }
+        let by = by.trim();
+        *w.stopped_by.lock().unwrap() = Some(if by.is_empty() {
+            "the person".to_owned()
+        } else {
+            by.to_owned()
+        });
+        w.stop.cancel();
+        Ok(())
+    }
+
+    /// Keeps a finished worker's session viewable, and forgets it from the live map's point of
+    /// view (the live guard removes it right after).
+    fn record_finished(&self, report: &WorkerReport) {
+        let (feed, since, stopped_by) = {
+            let live = self.live.lock().unwrap();
+            match live.get(&report.task_id) {
+                Some(w) => (
+                    Arc::clone(&w.feed),
+                    w.since,
+                    w.stopped_by.lock().unwrap().clone(),
+                ),
+                None => (WorkerFeed::new(), SystemTime::now(), None),
+            }
+        };
+        let info = WorkerSessionInfo {
+            task_id: report.task_id,
+            agent_id: report.agent_id.clone(),
+            phase: None,
+            model: Some(report.model.clone()).filter(|m| !m.is_empty()),
+            cwd: Some(report.cwd.clone()),
+            since,
+            ended: Some(SystemTime::now()),
+            totals: report.totals.clone(),
+            outcome: Some(report.outcome),
+            error: report.error.clone(),
+            stopped_by,
+            session_file: report.session_file.clone(),
+        };
+        self.finished
+            .lock()
+            .unwrap()
+            .insert(report.task_id, FinishedWorker { info, feed });
+    }
+
     fn manager_role(&self) -> Option<&Role> {
         self.rt.roles.get(&self.manager.role)
     }
@@ -622,12 +794,17 @@ impl Supervisor {
         let role = self.resolve_role(&req.agent_id)?;
         let agent_id = format!("amp:{}", role.id);
         let _guard = self.claim(req.task_id, &agent_id)?;
+        let (stop, stopped_by) = self.stop_handle(req.task_id);
 
         // Wait for a slot; a cancelled wait dispatches nothing.
         let permit = tokio::select! {
             biased;
             _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
             _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
+            _ = stop.cancelled() => {
+                let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                return Err(RunTicketError::Stopped { task_id: req.task_id, by });
+            }
             p = Arc::clone(&self.slots).acquire_owned() => p.map_err(|_| RunTicketError::Cancelled)?,
         };
         let _running = Running::start(self);
@@ -657,9 +834,19 @@ impl Supervisor {
             w.dispatched = true;
         }
 
-        let report = self.run_dispatched(&req, &role, &agent_id, signal).await;
+        let report = self
+            .run_dispatched(&req, &role, &agent_id, signal, stop, stopped_by)
+            .await;
         drop(permit);
         Ok(report)
+    }
+
+    fn stop_handle(&self, task_id: i64) -> (CancellationToken, Arc<Mutex<Option<String>>>) {
+        let live = self.live.lock().unwrap();
+        match live.get(&task_id) {
+            Some(w) => (w.stop.clone(), Arc::clone(&w.stopped_by)),
+            None => (CancellationToken::new(), Arc::default()),
+        }
     }
 
     fn claim(&self, task_id: i64, agent_id: &str) -> Result<LiveGuard<'_>, RunTicketError> {
@@ -678,6 +865,9 @@ impl Supervisor {
                 cwd: None,
                 since: SystemTime::now(),
                 totals: None,
+                feed: WorkerFeed::new(),
+                stop: CancellationToken::new(),
+                stopped_by: Arc::default(),
             },
         );
         Ok(LiveGuard { sup: self, task_id })
@@ -689,8 +879,17 @@ impl Supervisor {
         role: &Role,
         agent_id: &str,
         signal: CancellationToken,
+        stop: CancellationToken,
+        stopped_by: Arc<Mutex<Option<String>>>,
     ) -> WorkerReport {
         let started = Instant::now();
+        let feed = self
+            .live
+            .lock()
+            .unwrap()
+            .get(&req.task_id)
+            .map(|w| Arc::clone(&w.feed))
+            .unwrap_or_default();
         let mut notes = Vec::new();
         let totals = Arc::new(Mutex::new(Totals::default()));
         let model = role
@@ -762,6 +961,7 @@ impl Supervisor {
             closing: Mutex::new(HashMap::new()),
             closed: Mutex::new(None),
             repeat_stop: Mutex::new(None),
+            feed,
         });
         if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
             w.watch = Some(Arc::clone(&watch));
@@ -800,6 +1000,16 @@ impl Supervisor {
         let session_file = built.session_file.clone();
         let harness = Arc::clone(&built.harness);
         let prompt = worker_prompt(&info, req, self.manager.project.as_ref());
+        // The chat's session view starts with the prompt (#2252); rpi doesn't emit it.
+        watch.feed.push(&AgentEvent::MessageStart {
+            message: rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage {
+                role: Default::default(),
+                content: rpi_ai::types::UserContent::Text(prompt.clone()),
+                timestamp: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64),
+            }),
+        });
 
         // Run it in the foreground of this call.
         let run = harness.prompt_text(&prompt, Vec::new());
@@ -813,6 +1023,10 @@ impl Supervisor {
             _ = self.cancel.cancelled() => Stop::Ended(WorkerOutcome::Cancelled, "every worker was cancelled".to_owned()),
             _ = &mut deadline => Stop::Ended(WorkerOutcome::Timeout, format!("no result after {}", human_duration(self.config.timeout))),
             _ = budget.cancelled() => Stop::Ended(WorkerOutcome::TurnBudget, format!("turn budget of {} turns used up", self.config.max_turns)),
+            _ = stop.cancelled() => {
+                let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                Stop::Ended(WorkerOutcome::Cancelled, stopped_from_chat(&by))
+            }
         };
         let result = match stop {
             Stop::Returned(r) => Some(r),
@@ -840,6 +1054,16 @@ impl Supervisor {
                 }
                 // Read after the abort settled: a closing call can end during the grace period.
                 let closed = *watch.closed.lock().unwrap();
+                if closed.is_none()
+                    && let Some(by) = stopped_by.lock().unwrap().clone()
+                {
+                    // #2252: the manager reads this in amp_run_ticket's result.
+                    notes.push(format!(
+                        "{by} watched this worker and stopped it from the chat; ask them \
+                         before running #{} again",
+                        req.task_id
+                    ));
+                }
                 let finish = finish.after_closing(closed, &mut notes);
                 return self.finish(&info, started, notes, finish).await;
             }
@@ -936,6 +1160,7 @@ impl Supervisor {
         if let Some(hooks) = &self.hooks {
             hooks.on_finish(info, &mut report).await;
         }
+        self.record_finished(&report);
         report
     }
 
@@ -1115,10 +1340,13 @@ struct WorkerWatch {
     closed: Mutex<Option<WorkerOutcome>>,
     /// #2225: the repeat guard stopped the worker's model.
     repeat_stop: Mutex<Option<crate::repeat::RepeatStop>>,
+    /// The chat's session view reads the worker's events from here (#2252).
+    feed: Arc<WorkerFeed>,
 }
 
 impl WorkerWatch {
     fn observe(&self, event: &AgentEvent) {
+        self.feed.push(event);
         let Some(e) = RunEvent::from_agent(event) else {
             return;
         };
@@ -1161,6 +1389,27 @@ impl WorkerWatch {
             }
             _ => {}
         }
+    }
+}
+
+fn live_info(task_id: i64, w: &LiveWorker) -> WorkerSessionInfo {
+    WorkerSessionInfo {
+        task_id,
+        agent_id: w.agent_id.clone(),
+        phase: Some(w.phase),
+        model: w.model.clone(),
+        cwd: w.cwd.clone(),
+        since: w.since,
+        ended: None,
+        totals: w
+            .totals
+            .as_ref()
+            .map(|t| t.lock().unwrap().clone())
+            .unwrap_or_default(),
+        outcome: None,
+        error: None,
+        stopped_by: w.stopped_by.lock().unwrap().clone(),
+        session_file: None,
     }
 }
 
@@ -1456,6 +1705,7 @@ mod tests {
             closing: Mutex::default(),
             closed: Mutex::default(),
             repeat_stop: Mutex::default(),
+            feed: WorkerFeed::new(),
         };
         let start = |id: &str, name: &str, task: i64| AgentEvent::ToolExecutionStart {
             tool_call_id: id.into(),
