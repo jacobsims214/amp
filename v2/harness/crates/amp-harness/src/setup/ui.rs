@@ -124,7 +124,11 @@ impl Ui for ScriptedUi {
     }
 }
 
-/// The person at a terminal.
+/// The person at a terminal. Every answer is read in raw mode (#2227), so Ctrl+C, Esc and Ctrl+D
+/// on an empty line are keys that cancel setup ("setup cancelled", exit 130) whatever the process's
+/// SIGINT disposition is: a parent that ignores SIGINT (a pexpect driver, `nohup`, a background job
+/// of a script) used to leave a cooked-mode prompt echoing ^C forever. The terminal is restored on
+/// every way out.
 pub struct TerminalUi;
 
 impl Ui for TerminalUi {
@@ -135,10 +139,7 @@ impl Ui for TerminalUi {
         eprintln!("{text}");
     }
     fn ask(&mut self, prompt: &str, default: Option<&str>) -> Result<String, CliError> {
-        let mut err = io::stderr();
-        let _ = write!(err, "{}", prompt_text(prompt, default));
-        let _ = err.flush();
-        let line = read_line()?.ok_or_else(cancelled)?;
+        let line = read_terminal(&prompt_text(prompt, default), Echo::Visible)?;
         let line = line.trim();
         Ok(match (line.is_empty(), default) {
             (true, Some(d)) => d.to_owned(),
@@ -146,17 +147,51 @@ impl Ui for TerminalUi {
         })
     }
     fn secret(&mut self, prompt: &str) -> Result<String, CliError> {
-        let mut err = io::stderr();
-        let _ = write!(err, "{prompt} (hidden): ");
-        let _ = err.flush();
-        let result = read_hidden();
-        let _ = writeln!(err);
-        result
+        Ok(
+            read_terminal(&format!("{prompt} (hidden): "), Echo::Hidden)?
+                .trim()
+                .to_owned(),
+        )
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Echo {
+    Visible,
+    /// Nothing is echoed, not even `*`.
+    Hidden,
+}
+
+/// Writes the prompt and reads one answer at the terminal. Raw mode when it can be had, else a
+/// cooked line (where only Ctrl+D cancels).
+fn read_terminal(prompt: &str, echo: Echo) -> Result<String, CliError> {
+    let mut err = io::stderr();
+    let _ = write!(err, "{prompt}");
+    let _ = err.flush();
+    let result = match RawMode::enable() {
+        Ok(raw) => {
+            let result = read_raw(echo);
+            drop(raw);
+            result
+        }
+        Err(_) if echo == Echo::Visible => read_line().and_then(|l| l.ok_or_else(cancelled)),
+        Err(e) => Err(e),
+    };
+    // Cooked again: end the prompt's line (the Enter or ^C left the cursor on it).
+    let _ = writeln!(err);
+    result
 }
 
 /// Restores cooked mode when dropped, even on an error or a panic.
 struct RawMode;
+
+impl RawMode {
+    fn enable() -> Result<Self, CliError> {
+        crossterm::terminal::enable_raw_mode()
+            .map_err(|e| CliError::new(format!("terminal raw mode: {e}")))?;
+        Ok(Self)
+    }
+}
 
 impl Drop for RawMode {
     fn drop(&mut self) {
@@ -164,38 +199,96 @@ impl Drop for RawMode {
     }
 }
 
-/// Reads one line in raw mode without echoing anything. Ctrl-C and Esc cancel; Backspace and
-/// Ctrl-U edit; pasted text arrives as key presses and is accepted.
-fn read_hidden() -> Result<String, CliError> {
-    use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+/// What a key does to the answer being typed.
+#[derive(Debug, PartialEq, Eq)]
+enum Edit {
+    Done,
+    Cancel,
+    /// Characters appended (to echo).
+    Typed(String),
+    /// Characters removed from the end (to rub out).
+    Erased(usize),
+    Nothing,
+}
 
-    crossterm::terminal::enable_raw_mode()
-        .map_err(|e| CliError::new(format!("terminal raw mode: {e}")))?;
-    let _raw = RawMode;
+/// Applies one key to `out`. Ctrl-C, Esc and Ctrl-D on an empty answer cancel; Backspace, Ctrl-U
+/// and Ctrl-W edit; pasted text arrives as key presses and is accepted.
+fn apply_key(out: &mut String, key: crossterm::event::KeyEvent) -> Edit {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+    if key.kind == KeyEventKind::Release {
+        return Edit::Nothing;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let erase = |out: &mut String, keep: usize| {
+        let n = out[keep..].chars().count();
+        out.truncate(keep);
+        if n == 0 {
+            Edit::Nothing
+        } else {
+            Edit::Erased(n)
+        }
+    };
+    match key.code {
+        KeyCode::Enter => Edit::Done,
+        KeyCode::Char('j' | 'm') if ctrl => Edit::Done,
+        KeyCode::Esc => Edit::Cancel,
+        KeyCode::Char('c') if ctrl => Edit::Cancel,
+        KeyCode::Char('d') if ctrl && out.is_empty() => Edit::Cancel,
+        KeyCode::Char('u') if ctrl => erase(out, 0),
+        KeyCode::Char('w') if ctrl => {
+            let trimmed = out.trim_end_matches(char::is_whitespace);
+            let keep = trimmed.rfind(char::is_whitespace).map_or(0, |i| {
+                i + trimmed[i..].chars().next().map_or(1, char::len_utf8)
+            });
+            erase(out, keep)
+        }
+        KeyCode::Backspace => match out.char_indices().next_back() {
+            Some((i, _)) => erase(out, i),
+            None => Edit::Nothing,
+        },
+        KeyCode::Char(c) if !ctrl => {
+            out.push(c);
+            Edit::Typed(c.to_string())
+        }
+        _ => Edit::Nothing,
+    }
+}
+
+/// Reads one line in raw mode, echoing it unless hidden (#2113: a secret shows nothing).
+fn read_raw(echo: Echo) -> Result<String, CliError> {
+    use crossterm::event::{self, Event};
+
+    let mut err = io::stderr();
     let mut out = String::new();
     loop {
         let ev = event::read().map_err(|e| CliError::new(format!("read key: {e}")))?;
-        let Event::Key(key) = ev else {
-            if let Event::Paste(text) = ev {
-                out.push_str(text.trim_end_matches(['\r', '\n']));
+        let edit = match ev {
+            Event::Key(key) => apply_key(&mut out, key),
+            Event::Paste(text) => {
+                let text = text.trim_end_matches(['\r', '\n']).to_owned();
+                out.push_str(&text);
+                Edit::Typed(text)
             }
-            continue;
+            _ => Edit::Nothing,
         };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Enter => return Ok(out.trim().to_owned()),
-            KeyCode::Esc => return Err(cancelled()),
-            KeyCode::Char('c') | KeyCode::Char('d') if ctrl => return Err(cancelled()),
-            KeyCode::Char('u') if ctrl => out.clear(),
-            KeyCode::Backspace => {
-                out.pop();
+        match edit {
+            Edit::Done => return Ok(out),
+            Edit::Cancel => {
+                if echo == Echo::Visible {
+                    let _ = write!(err, "^C");
+                }
+                return Err(cancelled());
             }
-            KeyCode::Char(c) if !ctrl => out.push(c),
-            _ => {}
+            Edit::Typed(text) if echo == Echo::Visible => {
+                let _ = write!(err, "{text}");
+            }
+            Edit::Erased(n) if echo == Echo::Visible => {
+                let _ = write!(err, "{}", "\x08 \x08".repeat(n));
+            }
+            _ => continue,
         }
+        let _ = err.flush();
     }
 }
 
@@ -258,6 +351,37 @@ mod tests {
     fn no_ui_names_the_question() {
         let e = NoUi.ask("Project", None).unwrap_err();
         assert!(e.message.contains("Project") && e.message.contains("init --help"));
+    }
+
+    #[test]
+    fn keys_edit_and_cancel() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let mut out = String::new();
+        for c in "two wörds".chars() {
+            apply_key(&mut out, key(c));
+        }
+        assert_eq!(
+            apply_key(&mut out, KeyEvent::from(KeyCode::Backspace)),
+            Edit::Erased(1)
+        );
+        assert_eq!(out, "two wörd");
+        assert_eq!(apply_key(&mut out, ctrl('w')), Edit::Erased(4));
+        assert_eq!(out, "two ");
+        // Ctrl-D only cancels an empty answer, like end of input in cooked mode.
+        assert_eq!(apply_key(&mut out, ctrl('d')), Edit::Nothing);
+        assert_eq!(apply_key(&mut out, ctrl('u')), Edit::Erased(4));
+        assert_eq!(apply_key(&mut out, ctrl('d')), Edit::Cancel);
+        assert_eq!(apply_key(&mut out, ctrl('c')), Edit::Cancel);
+        assert_eq!(
+            apply_key(&mut out, KeyEvent::from(KeyCode::Esc)),
+            Edit::Cancel
+        );
+        assert_eq!(
+            apply_key(&mut out, KeyEvent::from(KeyCode::Enter)),
+            Edit::Done
+        );
     }
 
     #[test]
