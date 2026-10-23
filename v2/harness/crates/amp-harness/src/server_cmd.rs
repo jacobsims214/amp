@@ -303,6 +303,66 @@ pub fn activate(config: &ConfigFile, entry: &SavedServer) -> Result<Activated, S
     Ok(Activated { backup, kept })
 }
 
+/// The first run and `init` chose `url`: save it as a named server and make it active, the same
+/// way `server set` does, so `amp-harness server` lists it and `server use` can come back to it
+/// (#2212). A server already saved under that URL keeps its name and settings (`ca_file`
+/// replaces its CA file); `[server]` with that URL but no name keeps its keys under a derived
+/// name. Returns the entry when config.toml changed, `None` when it was already saved and active.
+pub(crate) fn save_chosen(
+    config: &ConfigFile,
+    url: &str,
+    ca_file: Option<String>,
+) -> Result<Option<SavedServer>, String> {
+    let servers = Servers::load(config)?;
+    let previous = servers.name_of(url).and_then(|n| servers.get(n)).cloned();
+    let active = servers.active.clone().filter(|a| same_url(&a.url, url));
+    if let (Some(a), Some(p)) = (&active, &previous)
+        && a.name == p.name
+        && ca_file
+            .as_ref()
+            .is_none_or(|c| p.ca_file.as_ref() == Some(c))
+    {
+        return Ok(None);
+    }
+    let name = previous
+        .as_ref()
+        .map(|p| p.name.clone())
+        .unwrap_or_else(|| derive_name(url, &servers.saved));
+    let base = previous.or(active).unwrap_or_else(|| SavedServer {
+        name: String::new(),
+        url: url.to_owned(),
+        web_url: None,
+        ca_file: None,
+        protocol: None,
+    });
+    let entry = SavedServer {
+        name,
+        url: url.to_owned(),
+        ca_file: ca_file.or(base.ca_file),
+        ..base
+    };
+    activate(config, &entry)?;
+    Ok(Some(entry))
+}
+
+/// Saves the web UI address of the server in effect: `[server] web_url`, and the same key on its
+/// `[servers.<name>]` entry so `server use` brings it back.
+pub(crate) fn save_web_url(config: &ConfigFile, web_url: &str) -> Result<(), String> {
+    let servers = Servers::load(config)?;
+    let mut changes = vec![Change::set("server", "web_url", web_url)];
+    if let Some(active) = &servers.active
+        && let Some(saved) = servers.get(&active.name)
+        && same_url(&saved.url, &active.url)
+    {
+        changes.push(Change::set(
+            &format!("{SERVERS}.{}", saved.name),
+            "web_url",
+            web_url,
+        ));
+    }
+    config.edit(&changes).map(|_| ())
+}
+
 /// The config.toml the server commands read and write: `--config`, else the default path.
 fn config_file(conn: &ConnArgs) -> Result<ConfigFile, CliError> {
     conn.config

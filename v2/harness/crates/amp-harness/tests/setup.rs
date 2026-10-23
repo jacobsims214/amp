@@ -609,3 +609,79 @@ async fn init_offers_the_picker_for_a_marker_made_for_another_server() {
     assert_eq!(m["project_id"], 2);
     assert_eq!(m["amp_api"], amp.url.trim_end_matches("/mcp"));
 }
+
+/// #2212: the first run said "Saved the server" but `amp-harness server` then said "No saved
+/// servers". The first run and init save the server as a named entry, as `server set` does.
+#[tokio::test]
+async fn the_first_run_saves_the_server_by_name() {
+    let one = spawn(MockAmp::new(), None).await;
+    let two = spawn(MockAmp::new(), None).await;
+    let dir = workdir("setup-saved-server", None);
+    // Server (without /mcp), then project 1 from the picker.
+    let answers = format!("{}\n1\n", one.url.trim_end_matches("/mcp"));
+    let mut run = Run::new(&dir, &["--snapshot", "120x30", "--no-session"]);
+    run.stdin = Some(&answers);
+    let out = run
+        .env("AMP_HARNESS_PROMPTS", "stdin")
+        .env("OPENROUTER_API_KEY", SECRET)
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(
+        out.stderr
+            .contains(&format!("Saved the server {} as `local`", one.url)),
+        "{}",
+        out.stderr
+    );
+    let config = config_text(&dir);
+    assert!(config.contains("[servers.local]"), "{config}");
+    assert!(config.contains("name = \"local\""), "{config}");
+
+    // `amp-harness server` lists it, saved and active.
+    let out = Run::new(&dir, &["server"]).go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(!out.stdout.contains("No saved servers"), "{}", out.stdout);
+    assert!(out.stdout.contains("AMP server: local"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains(&format!("* local  {}", one.url)),
+        "{}",
+        out.stdout
+    );
+    let shown = Run::new(&dir, &["server", "--json"]).go().await.json();
+    assert_eq!(shown["name"], "local");
+    assert_eq!(shown["saved"][0]["name"], "local");
+    assert_eq!(shown["saved"][0]["url"], one.url.as_str());
+
+    // init --url another server: saved next to the first, which `server use` brings back.
+    let out = Run::new(
+        &dir,
+        &["init", "--yes", "--url", &two.url, "--no-project", "--json"],
+    )
+    .go()
+    .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let shown = Run::new(&dir, &["server", "--json"]).go().await.json();
+    let names: Vec<&str> = shown["saved"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 2, "{shown}");
+    assert!(names.contains(&"local"), "{shown}");
+    assert_ne!(shown["name"], "local", "{shown}");
+    assert_eq!(shown["url"]["value"], two.url.as_str());
+
+    let out = Run::new(&dir, &["server", "use", "local"]).go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let shown = Run::new(&dir, &["server", "--json"]).go().await.json();
+    assert_eq!(shown["name"], "local");
+    assert_eq!(shown["url"]["value"], one.url.as_str());
+
+    // Running init again for the active server changes nothing and says nothing about saving.
+    let out = Run::new(&dir, &["init", "--yes", "--url", &one.url, "--no-project"])
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(!out.stderr.contains("Saved the server"), "{}", out.stderr);
+}
