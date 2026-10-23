@@ -856,3 +856,76 @@ async fn a_per_ticket_refusal_says_whose_approval() {
     );
     assert_fits(&rig);
 }
+
+/// #2226: `amp_run_ticket` wraps the dispatch refusal ("AMP refused to dispatch ticket #N: …");
+/// the notice still says whose ticket it is (from the call's own `task_id`), shows the server's
+/// sentence once without the transport's prefix, and no relative link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_ticket_refusal_says_whose_ticket() {
+    let mut rig = rig(vec![], true).await;
+    rig.meta.stub_update(per_ticket_plan);
+    // `named` is the ticket the error's text names; the call's own `task_id` wins.
+    let mut refuse = |id: i64, named: i64| {
+        let call = format!("run-{id}");
+        rig.shell.handle_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: call.clone(),
+            tool_name: "amp_run_ticket".into(),
+            args: serde_json::json!({"task_id": id, "agent_id": "amp-worker-backend"}),
+        });
+        rig.shell.handle_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: call,
+            tool_name: "amp_run_ticket".into(),
+            result: rpi_agent::AgentToolResult::text(format!(
+                "tool error: AMP refused to dispatch ticket #{named}: tools/call amp_dispatch_task: \
+                 Mcp error: -32603: ticket {named} isn't approved: nobody has approved it since it \
+                 was planned or its scope last changed, and this project needs each ticket \
+                 approved before agents start it. Its owner approves it in the AMP web UI \
+                 (Approve plan; a project lead may approve it on their behalf): /project/2/plan. \
+                 Agents can't approve: stop and ask your person to approve it there.\n\
+                 [amp-harness] This needs a person in the AMP web UI."
+            )),
+            is_error: true,
+        });
+    };
+    refuse(2108, 2108);
+    // Structured over parsed: a text naming another ticket still reads as the call's.
+    refuse(2203, 4242);
+    // Words, not rows: the sentence wraps.
+    let screen = rig
+        .screen()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        screen.contains("⏸ Waiting for your approval: #2108 is yours"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("⏸ Waiting for its owner's approval: #2203 is someone else's"),
+        "{screen}"
+    );
+    assert!(!screen.contains("#4242"), "{screen}");
+    for noise in [
+        "tool error",
+        "tools/call",
+        "Mcp error",
+        "-32603",
+        "refused to dispatch",
+    ] {
+        assert!(!screen.contains(noise), "{noise}: {screen}");
+    }
+    assert!(!screen.contains(": /project/"), "{screen}");
+    assert!(!screen.contains(" /project/"), "{screen}");
+    // The sentence once per refusal (the tool rows point at the notice instead).
+    assert_eq!(
+        screen.matches("isn't approved: nobody").count(),
+        2,
+        "{screen}"
+    );
+    assert!(screen.contains("on their behalf). Agents"), "{screen}");
+    assert!(
+        screen.contains("Approve it in AMP: https://amp.simstech.cloud/project/2/plan"),
+        "{screen}"
+    );
+    assert_fits(&rig);
+}

@@ -517,7 +517,15 @@ impl ChatView {
                     None => self.add_tool(tool_name, &serde_json::Value::Null),
                 };
                 let text = tool_result_text(result);
-                if amp_render::is_amp_tool(tool_name) {
+                if amp_render::is_amp_tool(tool_name)
+                    && *is_error
+                    && amp_core::approval::refusal(&text).is_some()
+                {
+                    // #2226: the shell's ApprovalNotice right under it says it all, with the
+                    // server's sentence and the link: not the same sentence twice.
+                    let line = amp_render::REFUSED_LINE;
+                    component.set_result(line, line, true);
+                } else if amp_render::is_amp_tool(tool_name) {
                     let summary = amp_render::result_summary(tool_name, &text, *is_error);
                     let detail = if *is_error {
                         amp_render::error_text(&text).to_owned()
