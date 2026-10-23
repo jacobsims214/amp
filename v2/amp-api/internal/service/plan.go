@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -349,7 +350,13 @@ type PlanReport struct {
 	OK bool `json:"ok"`
 	// Plan approval: open tickets planned since the last approval, when
 	// that was, and whether the project requires it before dispatch.
-	AwaitingApproval    []int      `json:"awaiting_approval"`
+	AwaitingApproval []int `json:"awaiting_approval"`
+	// AwaitingApprovalTickets are the same tickets with their owners and
+	// whether they're the caller's own to approve (AMP #2198: a person
+	// approves their own tickets; others' only on their behalf, as a lead).
+	AwaitingApprovalTickets []AwaitingTicket `json:"awaiting_approval_tickets"`
+	// AwaitingYours are the caller's own among AwaitingApproval.
+	AwaitingYours       []int      `json:"awaiting_yours"`
 	ApprovedAt          *time.Time `json:"plan_approved_at,omitempty"`
 	ApprovedBy          *int       `json:"plan_approved_by,omitempty"`
 	RequirePlanApproval bool       `json:"require_plan_approval"`
@@ -407,15 +414,21 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if err != nil {
 		return nil, err
 	}
-	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{}, HumanGates: []HumanGate{}}
+	r := &PlanReport{Tasks: len(tasks), ReadyNow: []int{}, Issues: []PlanIssue{}, AwaitingApproval: []int{},
+		AwaitingApprovalTickets: []AwaitingTicket{}, AwaitingYours: []int{}, HumanGates: []HumanGate{}}
 	proj, err := s.Repo.GetProject(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
 	r.ApprovedAt, r.ApprovedBy, r.RequirePlanApproval = proj.PlanApprovedAt, proj.PlanApprovedBy, proj.RequirePlanApproval
 	for i := range tasks {
-		if tasks[i].State != domain.TaskStateCompleted && proj.AwaitsApproval(&tasks[i]) {
-			r.AwaitingApproval = append(r.AwaitingApproval, tasks[i].ID)
+		if t := &tasks[i]; t.State != domain.TaskStateCompleted && proj.AwaitsApproval(t) {
+			yours := t.ApprovesAsOwn(p.UserID)
+			r.AwaitingApproval = append(r.AwaitingApproval, t.ID)
+			r.AwaitingApprovalTickets = append(r.AwaitingApprovalTickets, AwaitingTicket{TaskID: t.ID, OwnerUserID: t.OwnerUserID, Yours: yours})
+			if yours {
+				r.AwaitingYours = append(r.AwaitingYours, t.ID)
+			}
 		}
 	}
 	if len(r.AwaitingApproval) > 0 {
@@ -1103,50 +1116,251 @@ func (s *Service) answer(ctx context.Context, p authz.Principal, t *domain.Task,
 
 // ---- Plan approval ----
 
-// ApprovePlan records that a person approved the project's plan as it is
-// now: every ticket planned so far may be dispatched. Any person with at
-// least member access to the project (on one of its teams, or an org or
-// global admin) can approve, not only team leads and project owners. Only
-// a person in the web UI can: never an agent, over MCP or with a token,
-// and never a manager on the strength of something said in chat.
-func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
-	proj, _, err := s.ApprovePlanAsOf(ctx, p, projectID, nil)
-	return proj, err
+// Plan approval is per ticket (AMP #2198, option D of #2197). A person in
+// the web UI approves specific tickets; each records approved_at and
+// approved_by, and a ticket is approved iff approved_at >= planned_at. By
+// default a person approves only their own tickets (Task.ApprovesAsOwn);
+// approving anyone else's is "on behalf" of its owner: asked for
+// explicitly (on_behalf) and allowed to project leads, owners and admins.
+// See KB architecture/plan-approval.md, "The approve-plan contract".
+
+// ApproveRequest says which tickets a person approves.
+type ApproveRequest struct {
+	// TaskIDs are the tickets to approve. nil (missing) means the default:
+	// every open ticket awaiting approval that the caller approves as their
+	// own, or everyone's when OnBehalf is set. Tickets that are completed
+	// or already approved are skipped.
+	TaskIDs []int `json:"task_ids"`
+	// AsOf, when set, is the newest planned_at the person was shown: only
+	// tickets planned at or before it are approved.
+	AsOf *time.Time `json:"as_of"`
+	// OnBehalf allows approving tickets that aren't the caller's own.
+	OnBehalf bool `json:"on_behalf"`
 }
 
-// ApprovePlanAsOf is ApprovePlan covering only what the person saw. asOf is
-// the newest planned_at on the page they approved from: tickets planned
-// after it (created, restored or re-scoped since the page loaded) are not
-// approved and keep awaiting approval; plan_approved_at becomes asOf (see
-// Repo.ApprovePlan for the caps). asOf nil approves everything planned up
-// to now, as ApprovePlan always did. It also returns the open tickets that
-// still await approval afterwards (empty when the approval covered them all).
-func (s *Service) ApprovePlanAsOf(ctx context.Context, p authz.Principal, projectID int, asOf *time.Time) (*domain.Project, []int, error) {
-	if _, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member); err != nil {
-		return nil, nil, err
+// ApprovedTicket is a ticket an approve call approved.
+type ApprovedTicket struct {
+	TaskID      int  `json:"task_id"`
+	OwnerUserID *int `json:"owner_user_id"`
+	// OnBehalf: the ticket wasn't the approver's own.
+	OnBehalf bool `json:"on_behalf"`
+}
+
+// AwaitingTicket is an open ticket still waiting for a person to approve it.
+type AwaitingTicket struct {
+	TaskID      int  `json:"task_id"`
+	OwnerUserID *int `json:"owner_user_id"`
+	// Yours: the caller would approve it as their own (Task.ApprovesAsOwn).
+	Yours bool `json:"yours"`
+}
+
+// ApproveResult is what an approve call did and what still awaits.
+type ApproveResult struct {
+	// Project is the project after the call; plan_approved_at/by are its
+	// last approval (moved only when this call approved something).
+	Project *domain.Project `json:"project"`
+	// Approved are the tickets this call approved, by id.
+	Approved        []int            `json:"approved"`
+	ApprovedTickets []ApprovedTicket `json:"approved_tickets"`
+	// AwaitingApproval are every open ticket in the project still awaiting
+	// approval afterwards, anyone's (as before #2198), and StillAwaiting
+	// the same with owners; AwaitingYours the caller's own among them.
+	AwaitingApproval []int            `json:"awaiting_approval"`
+	StillAwaiting    []AwaitingTicket `json:"still_awaiting"`
+	AwaitingYours    []int            `json:"awaiting_yours"`
+	// Skipped are requested tickets this call didn't approve, with why.
+	Skipped map[string]string `json:"skipped,omitempty"`
+	// OnBehalf: at least one approved ticket was someone else's.
+	OnBehalf bool `json:"on_behalf"`
+}
+
+// ApprovePlan approves the caller's own tickets awaiting approval: the
+// default ApproveTickets. MCP's amp_approve_plan calls it only to be
+// refused (approval is for a person in the web UI).
+func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID int) (*domain.Project, error) {
+	r, err := s.ApproveTickets(ctx, p, projectID, ApproveRequest{})
+	if err != nil {
+		return nil, err
+	}
+	return r.Project, nil
+}
+
+// ApproveTickets records a person's approval of tickets in the project's
+// plan (see ApproveRequest). Only a person in the web UI, with at least
+// member access, approves. Approving tickets that aren't the caller's own
+// needs req.OnBehalf and lead access or above; otherwise nothing is
+// approved (403). Each approved ticket gets a history entry, and the call
+// one plan.approve audit row naming the tickets and their owners.
+func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, projectID int, req ApproveRequest) (*ApproveResult, error) {
+	lvl, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member)
+	if err != nil {
+		return nil, err
 	}
 	if err := authz.RequireUI(p, "Plan approval", s.PlanURL(projectID)); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	// Approval is the person saying "go" to the plan their agent drafted: any
-	// person on the project may give it (agent accounts can't, above).
-	proj, err := s.Repo.ApprovePlan(ctx, projectID, p.UserRef(), asOf)
+	tasks, err := s.Repo.ListTasks(ctx, projectID, "")
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	awaiting, err := s.Repo.TasksAwaitingApproval(ctx, projectID, proj.PlanApprovedAt)
+	byID := make(map[int]*domain.Task, len(tasks))
+	for i := range tasks {
+		byID[tasks[i].ID] = &tasks[i]
+	}
+	awaits := func(t *domain.Task) bool { return t.State != domain.TaskStateCompleted && !t.Approved() }
+
+	// Which tickets: the ones asked for, or by default the caller's own
+	// awaiting ones (everyone's with on_behalf).
+	var picked []*domain.Task
+	skipped := map[string]string{}
+	if req.TaskIDs != nil {
+		seen := map[int]bool{}
+		for _, id := range req.TaskIDs {
+			t, ok := byID[id]
+			if !ok {
+				return nil, authz.BadRequest("ticket %d is not in project %d; nothing was approved", id, projectID)
+			}
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			switch {
+			case t.State == domain.TaskStateCompleted:
+				skipped[idStr(id)] = "it is completed"
+			case t.Approved():
+				skipped[idStr(id)] = "it is already approved"
+			default:
+				picked = append(picked, t)
+			}
+		}
+	} else {
+		for i := range tasks {
+			if t := &tasks[i]; awaits(t) && (req.OnBehalf || t.ApprovesAsOwn(p.UserID)) {
+				picked = append(picked, t)
+			}
+		}
+	}
+	slices.SortFunc(picked, func(a, b *domain.Task) int { return a.ID - b.ID })
+
+	// Someone else's tickets: only on_behalf, and only for a lead or above.
+	var others []int
+	for _, t := range picked {
+		if !t.ApprovesAsOwn(p.UserID) {
+			others = append(others, t.ID)
+		}
+	}
+	if len(others) > 0 && !req.OnBehalf {
+		return nil, authz.Forbidden("tickets %v aren't yours (they're owned by, or were planned by, someone else); approving them is "+
+			"approving on their owner's behalf: send on_behalf: true (project leads, owners and admins only), or approve only your "+
+			"own tickets. Nothing was approved.", others)
+	}
+	if len(others) > 0 && lvl < authz.Lead {
+		return nil, authz.Forbidden("approving other people's tickets %v on their behalf needs lead access or above on project %d; "+
+			"you can approve your own tickets, and their owners (or a lead) approve theirs. Nothing was approved.", others, projectID)
+	}
+
+	// Approve each through its task actor, which re-checks it as it is now.
+	names := map[int]string{}
+	ownerLabel := func(t *domain.Task) string {
+		who := t.OwnerUserID
+		if who == nil {
+			who = t.CreatedBy
+		}
+		if who == nil {
+			return "nobody (unassigned)"
+		}
+		if n, ok := names[*who]; ok {
+			return n
+		}
+		n := fmt.Sprintf("user %d", *who)
+		if u, err := s.Repo.GetUserByID(ctx, *who); err == nil && u.Email != "" {
+			n = u.Email
+		}
+		if t.OwnerUserID == nil {
+			n += " (unassigned, planned by them)"
+		}
+		names[*who] = n
+		return n
+	}
+	res := &ApproveResult{Approved: []int{}, ApprovedTickets: []ApprovedTicket{}, AwaitingYours: []int{}}
+	owners := map[string]any{}
+	onBehalfOf := []any{}
+	for _, t := range picked {
+		own := t.ApprovesAsOwn(p.UserID)
+		msg := &actor.MsgApproveTask{TaskID: t.ID, AsOf: req.AsOf, ExpectOwner: t.OwnerUserID, By: p.UserRef(), ByName: p.Label()}
+		if !own {
+			msg.OnBehalfOf = ownerLabel(t)
+		}
+		replyCh := make(chan actor.ReplyApproveTask, 1)
+		msg.ReplyCh = replyCh
+		if err := s.Registry.Send(projectID, msg); err != nil {
+			return nil, err
+		}
+		reply := actor.Await(ctx, replyCh)
+		if reply.Err != nil {
+			return nil, reply.Err
+		}
+		if !reply.Approved {
+			skipped[idStr(t.ID)] = reply.Why
+			continue
+		}
+		res.Approved = append(res.Approved, t.ID)
+		res.ApprovedTickets = append(res.ApprovedTickets, ApprovedTicket{TaskID: t.ID, OwnerUserID: t.OwnerUserID, OnBehalf: !own})
+		owners[idStr(t.ID)] = t.OwnerUserID
+		if !own {
+			res.OnBehalf = true
+			onBehalfOf = append(onBehalfOf, msg.OnBehalfOf)
+		}
+	}
+	if len(skipped) > 0 {
+		res.Skipped = skipped
+	}
+
+	// The project's "last approved ... by" moves only when something was
+	// approved: a click that approved nothing (a stale page) takes no credit.
+	if len(res.Approved) > 0 {
+		res.Project, err = s.Repo.RecordPlanApproval(ctx, projectID, p.UserRef())
+	} else {
+		res.Project, err = s.Repo.GetProject(ctx, projectID)
+	}
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
-	details := map[string]any{"channel": p.Channel}
-	if asOf != nil {
-		details["as_of"] = asOf.UTC().Format(time.RFC3339Nano)
-		details["still_awaiting"] = awaiting
+	awaiting, err := s.Repo.TasksAwaitingApproval(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	res.AwaitingApproval, res.StillAwaiting = make([]int, 0, len(awaiting)), make([]AwaitingTicket, 0, len(awaiting))
+	for _, a := range awaiting {
+		yours := (&domain.Task{OwnerUserID: a.OwnerUserID, CreatedBy: a.CreatedBy}).ApprovesAsOwn(p.UserID)
+		res.AwaitingApproval = append(res.AwaitingApproval, a.ID)
+		res.StillAwaiting = append(res.StillAwaiting, AwaitingTicket{TaskID: a.ID, OwnerUserID: a.OwnerUserID, Yours: yours})
+		if yours {
+			res.AwaitingYours = append(res.AwaitingYours, a.ID)
+		}
+	}
+
+	details := map[string]any{
+		"channel": p.Channel, "approved": res.Approved, "owners": owners, "approved_by": p.UserRef(),
+		"on_behalf": res.OnBehalf, "on_behalf_of": onBehalfOf, "still_awaiting": res.AwaitingApproval,
+	}
+	if req.AsOf != nil {
+		details["as_of"] = req.AsOf.UTC().Format(time.RFC3339Nano)
+	}
+	if req.TaskIDs != nil {
+		details["task_ids"] = req.TaskIDs
+	}
+	if len(skipped) > 0 {
+		details["skipped"] = skipped
+	}
+	summary := fmt.Sprintf("approved %d ticket(s) in the plan of %s", len(res.Approved), res.Project.Name)
+	if res.OnBehalf {
+		summary += ", some on their owners' behalf"
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
-		Summary: fmt.Sprintf("approved the plan of %s", proj.Name), Details: details})
+		Summary: summary, Details: details})
 	// Published here, not by the REST or MCP handler, so every way of
 	// approving refreshes open Flight plan pages the same way.
-	s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: proj, At: time.Now()})
-	return proj, awaiting, nil
+	s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: res.Project, At: time.Now()})
+	return res, nil
 }

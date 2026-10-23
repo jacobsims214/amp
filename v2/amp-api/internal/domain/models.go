@@ -64,12 +64,12 @@ type Project struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// AwaitsApproval reports whether a ticket was planned after the project's
-// plan was last approved (always, if it never was). A ticket is planned
-// when it's created, restored from the trash, or its name, description, or
-// acceptance criteria change (Task.PlannedAt).
+// AwaitsApproval reports whether ticket t still waits for a person to
+// approve it. Since AMP #2198 approval is per ticket (Task.Approved): the
+// project's PlanApprovedAt is only when its last approval happened and no
+// longer decides. The project receiver is kept so callers read the same.
 func (p *Project) AwaitsApproval(t *Task) bool {
-	return p.PlanApprovedAt == nil || t.Planned().After(*p.PlanApprovedAt)
+	return !t.Approved()
 }
 
 // ProjectSettings is a change to a project's settings; nil fields are kept.
@@ -171,6 +171,34 @@ type Task struct {
 	// it (Project.AwaitsApproval); comments and dependency changes don't
 	// move it.
 	PlannedAt time.Time `json:"planned_at"`
+	// ApprovedAt is when a person last approved the ticket's plan, and
+	// ApprovedBy who (nil: approved by a migration, or the person's account
+	// is gone). The ticket is approved iff ApprovedAt is at or after
+	// PlannedAt (Approved): re-planning it makes it wait again.
+	ApprovedAt *time.Time `json:"approved_at,omitempty"`
+	ApprovedBy *int       `json:"approved_by,omitempty"`
+}
+
+// Approved reports whether a person approved the ticket as it's planned
+// now: approved at or after its last planning (AMP #2198).
+func (t *Task) Approved() bool {
+	return t.ApprovedAt != nil && !t.ApprovedAt.Before(t.Planned())
+}
+
+// ApprovesAsOwn reports whether userID approving t approves their own work:
+// they own it, or nobody owns it and they created it. Anything else is
+// approving on someone's behalf (AMP #2198). A ticket with neither owner
+// nor creator (legacy rows, local dev) is nobody's, so only the local-dev
+// principal (user 0, no account) approves it as its own.
+func (t *Task) ApprovesAsOwn(userID int) bool {
+	who := t.OwnerUserID
+	if who == nil {
+		who = t.CreatedBy
+	}
+	if who == nil {
+		return userID == 0
+	}
+	return *who == userID
 }
 
 // Planned is when the ticket was last planned (PlannedAt, or CreatedAt for

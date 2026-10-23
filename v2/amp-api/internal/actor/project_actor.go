@@ -178,6 +178,9 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgSetTaskStartAt:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
+	case *MsgApproveTask:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
 	case *MsgAddComment:
 		a.routeTaskMsg(ctx, msg.Req.TaskID, msg)
 

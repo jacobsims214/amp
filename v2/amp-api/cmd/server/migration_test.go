@@ -342,3 +342,98 @@ func TestMigration_023TurnsPlanApprovalOn(t *testing.T) {
 		t.Fatalf("new project default: %v %v", def, err)
 	}
 }
+
+// Migration 025 moves plan approval onto each ticket (AMP #2198). Every
+// ticket the project-wide approval covered (planned at or before
+// plan_approved_at) is backfilled as approved then, by that person (NULL for
+// a grandfathered approval); tickets planned later, and tickets of projects
+// never approved, keep waiting. The backfill only fills rows still NULL, so
+// running it again changes nothing.
+func TestMigration_025BackfillsTicketApproval(t *testing.T) {
+	ctx := context.Background()
+	dsn := freshDatabase(t)
+	repo, err := repository.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer repo.Close()
+	var before []repository.Migration
+	var m025 *repository.Migration
+	for i, m := range migrations {
+		switch {
+		case m.Version < "025":
+			before = append(before, m)
+		case strings.HasPrefix(m.Version, "025"):
+			m025 = &migrations[i]
+		}
+	}
+	if m025 == nil {
+		t.Fatal("no migration 025")
+	}
+	if err := repo.RunMigrations(ctx, before); err != nil {
+		t.Fatalf("migrate to 024: %v", err)
+	}
+	db, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	q := func(sql string, dest *int, args ...any) {
+		t.Helper()
+		if err := db.QueryRow(ctx, sql, args...).Scan(dest); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	var approver int
+	q(`INSERT INTO users (subject, email) VALUES ('sub-approver', 'approver@x.test') RETURNING id`, &approver)
+	// approved: approved by a person an hour ago; grandfathered: approved by
+	// migration 023 (by NULL); never: never approved.
+	var approved, grandfathered, never int
+	q(`INSERT INTO projects (name, code, require_plan_approval, plan_approved_at, plan_approved_by)
+	   VALUES ('approved', 'approved', TRUE, NOW() - INTERVAL '1 hour', $1) RETURNING id`, &approved, approver)
+	q(`INSERT INTO projects (name, code, require_plan_approval, plan_approved_at)
+	   VALUES ('grandfathered', 'grandfathered', TRUE, NOW() - INTERVAL '1 hour') RETURNING id`, &grandfathered)
+	q(`INSERT INTO projects (name, code, require_plan_approval) VALUES ('never', 'never', TRUE) RETURNING id`, &never)
+	mk := func(project int, name, plannedAgo string) int {
+		t.Helper()
+		var epic, story, id int
+		q(`INSERT INTO epics (project_id, name) VALUES ($1, 'e') RETURNING id`, &epic, project)
+		q(`INSERT INTO stories (project_id, epic_id, name) VALUES ($1, $2, 's') RETURNING id`, &story, project, epic)
+		q(`INSERT INTO tasks (project_id, epic_id, story_id, name, created_at, planned_at)
+		   VALUES ($1, $2, $3, $4, NOW() - $5::interval, NOW() - $5::interval) RETURNING id`, &id, project, epic, story, name, plannedAgo)
+		return id
+	}
+	covered := mk(approved, "planned before the approval", "2 hours")
+	later := mk(approved, "planned after the approval", "10 minutes")
+	old := mk(grandfathered, "grandfathered", "2 hours")
+	waiting := mk(never, "never approved", "2 hours")
+
+	if err := repo.RunMigrations(ctx, migrations); err != nil {
+		t.Fatalf("migrate 025: %v", err)
+	}
+	// Running the backfill again (a re-applied migration) changes nothing.
+	if _, err := db.Exec(ctx, m025.SQL); err != nil {
+		t.Fatalf("re-run 025: %v", err)
+	}
+	p, _ := repo.GetProject(ctx, approved)
+	check := func(id int, wantApproved bool, wantBy *int) {
+		t.Helper()
+		tk, err := repo.GetTask(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if tk.Approved() != wantApproved || wantApproved != (tk.ApprovedAt != nil) {
+			t.Fatalf("ticket %q: approved_at %v (planned %v), want approved=%v", tk.Name, tk.ApprovedAt, tk.PlannedAt, wantApproved)
+		}
+		if (tk.ApprovedBy == nil) != (wantBy == nil) || (wantBy != nil && *tk.ApprovedBy != *wantBy) {
+			t.Fatalf("ticket %q: approved_by %v, want %v", tk.Name, tk.ApprovedBy, wantBy)
+		}
+	}
+	check(covered, true, &approver)
+	if tk, _ := repo.GetTask(ctx, covered); !tk.ApprovedAt.Equal(*p.PlanApprovedAt) {
+		t.Fatalf("covered ticket approved at %v, want the project's approval %v", tk.ApprovedAt, p.PlanApprovedAt)
+	}
+	check(later, false, nil)
+	check(old, true, nil)
+	check(waiting, false, nil)
+}

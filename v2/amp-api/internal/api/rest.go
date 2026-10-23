@@ -657,29 +657,29 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "approve-plan":
-		// POST: a person approves the project's plan. Optional body
-		// {"as_of": RFC 3339, the newest planned_at the person saw}: only
-		// tickets planned at or before it are approved, newer ones keep
-		// awaiting (listed in awaiting_approval). No body (or no as_of)
-		// approves the plan as it stands now.
+		// POST: a person approves tickets in the project's plan (per ticket,
+		// AMP #2198). Optional body {"task_ids": [...], "as_of": RFC 3339,
+		// "on_behalf": bool}. No task_ids: the caller's own awaiting tickets
+		// (everyone's with on_behalf). as_of: only tickets planned at or
+		// before it. Others' tickets need on_behalf and lead access. See
+		// service.ApproveRequest / ApproveResult and KB
+		// architecture/plan-approval.md.
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
 			return
 		}
-		var body struct {
-			AsOf *time.Time `json:"as_of"`
-		}
+		var body service.ApproveRequest
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
-			jsonErr(w, fmt.Errorf("approve-plan body: as_of must be an RFC 3339 timestamp: %w", err), 400)
+			jsonErr(w, fmt.Errorf("approve-plan body: want {\"task_ids\": [ticket ids], \"as_of\": RFC 3339 timestamp, \"on_behalf\": bool}, all optional (as_of must be an RFC 3339 timestamp): %w", err), 400)
 			return
 		}
-		// ApprovePlanAsOf publishes project.updated itself.
-		proj, awaiting, err := h.svc.ApprovePlanAsOf(r.Context(), pr, projectID, body.AsOf)
+		// ApproveTickets publishes project.updated itself.
+		res, err := h.svc.ApproveTickets(r.Context(), pr, projectID, body)
 		if err != nil {
 			fail(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"project": proj, "awaiting_approval": awaiting})
+		jsonOK(w, res)
 		return
 
 	case "report":

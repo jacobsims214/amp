@@ -164,6 +164,9 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		err := a.handleSetTaskStartAt(msg.StartAt)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
+	case *MsgApproveTask:
+		msg.ReplyCh <- a.handleApprove(msg)
+
 	case *MsgAddComment:
 		comment, err := a.handleAddComment(msg.Req)
 		msg.ReplyCh <- ReplyAddComment{Comment: comment, Err: err}
@@ -788,6 +791,53 @@ func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
 		Payload:   payload,
 		At:        time.Now(),
 	})
+}
+
+// handleApprove records a person's approval of the ticket's plan, checked
+// against the ticket as it is now (see MsgApproveTask). The database writes
+// approved_at with clock_timestamp(), the clock planned_at uses, and only
+// while planned_at is still at or before AsOf.
+func (a *TaskActor) handleApprove(msg *MsgApproveTask) ReplyApproveTask {
+	t := a.task
+	skip := func(why string) ReplyApproveTask {
+		cur := a.withBlockedBy()
+		return ReplyApproveTask{Task: &cur, Why: why}
+	}
+	switch {
+	case !sameUser(t.OwnerUserID, msg.ExpectOwner):
+		return skip("its owner changed")
+	case t.State == domain.TaskStateCompleted:
+		return skip("it is completed")
+	case t.Approved():
+		return skip("it is already approved")
+	case msg.AsOf != nil && t.Planned().After(*msg.AsOf):
+		return skip("it was planned after what was approved (as_of)")
+	}
+	at, err := a.repo.ApproveTask(context.Background(), t.ID, msg.By, msg.AsOf)
+	if err != nil {
+		return ReplyApproveTask{Err: fmt.Errorf("db approve task %d: %w", t.ID, err)}
+	}
+	if at == nil {
+		return skip("it was planned after what was approved (as_of)")
+	}
+	a.task.ApprovedAt, a.task.ApprovedBy = at, msg.By
+	detail := "Plan approved by " + msg.ByName
+	if msg.OnBehalfOf != "" {
+		detail = "Plan approved on behalf of " + msg.OnBehalfOf + " by " + msg.ByName
+	}
+	a.logActivityBy(msg.ByName, msg.By, "plan_approved", "", "", detail)
+	cur := a.withBlockedBy()
+	a.publish(domain.EventTaskUpdated, cur)
+	return ReplyApproveTask{Task: &cur, Approved: true}
+}
+
+// sameUser reports whether two optional user ids are the same (both unset
+// counts as the same).
+func sameUser(x, y *int) bool {
+	if x == nil || y == nil {
+		return x == nil && y == nil
+	}
+	return *x == *y
 }
 
 func (a *TaskActor) logActivity(actorName, action, fromState, toState, detail string) {

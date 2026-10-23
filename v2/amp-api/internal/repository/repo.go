@@ -127,7 +127,7 @@ func scanStory(row rowScanner, st *domain.Story) error {
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
-	performer, human_reason, ready_at, planned_at`
+	performer, human_reason, ready_at, planned_at, approved_at, approved_by`
 
 func scanTask(row rowScanner, t *domain.Task) error {
 	return row.Scan(
@@ -137,7 +137,7 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
-		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt,
+		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy,
 	)
 }
 
@@ -239,45 +239,68 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 	return p, err
 }
 
-// ApprovePlan records that a user approved the project's plan.
-//
-// asOf nil approves everything planned up to now: plan_approved_at is
-// clock_timestamp() (the statement's wall clock, not the transaction's
-// start, the same clock planned_at is written with).
-//
-// asOf set approves only what the person saw: plan_approved_at becomes
-// asOf (the newest planned_at on the page they approved from), so a ticket
-// created or re-planned after it still awaits approval. It never moves
-// into the future (capped at clock_timestamp()) and never moves back (an
-// older asOf than the current approval keeps the current approval, so a
-// stale page can't un-approve tickets someone else already approved).
-func (r *Repo) ApprovePlan(ctx context.Context, id int, by *int, asOf *time.Time) (*domain.Project, error) {
+// RecordPlanApproval stamps the project's last plan approval: when (now,
+// on clock_timestamp()) and by whom. Since AMP #2198 it is informational
+// (shown as "last approved ... by"); each ticket carries its own approval
+// (ApproveTask), which is what gates work.
+func (r *Repo) RecordPlanApproval(ctx context.Context, id int, by *int) (*domain.Project, error) {
 	p := &domain.Project{}
 	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET
-		   plan_approved_at = CASE WHEN $3::timestamptz IS NULL THEN clock_timestamp()
-		                           ELSE GREATEST(plan_approved_at, LEAST($3::timestamptz, clock_timestamp())) END,
-		   plan_approved_by = $2, updated_at = NOW()
-		 WHERE id = $1 RETURNING `+projectCols, id, by, asOf), p)
+		   plan_approved_at = clock_timestamp(), plan_approved_by = $2, updated_at = NOW()
+		 WHERE id = $1 RETURNING `+projectCols, id, by), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
 	}
 	return p, err
 }
 
-// TasksAwaitingApproval lists the project's open (not completed) tickets
-// planned after approvedAt (all open tickets when approvedAt is nil), by id.
-func (r *Repo) TasksAwaitingApproval(ctx context.Context, projectID int, approvedAt *time.Time) ([]int, error) {
-	rows, err := r.db.Query(ctx, `SELECT id FROM tasks
-		WHERE project_id = $1 AND state <> 'completed' AND ($2::timestamptz IS NULL OR planned_at > $2::timestamptz)
-		ORDER BY id`, projectID, approvedAt)
+// ApproveTask records that user by approved ticket id's plan as it is now:
+// approved_at = clock_timestamp() (the clock planned_at is written with),
+// approved_by = by. With asOf set it approves only while planned_at is at
+// or before asOf (the newest planned_at the person saw); it returns nil,
+// nil when that no longer holds. Callers go through the task actor
+// (MsgApproveTask), which keeps its copy of the ticket in step.
+func (r *Repo) ApproveTask(ctx context.Context, id int, by *int, asOf *time.Time) (*time.Time, error) {
+	var at time.Time
+	err := r.db.QueryRow(ctx, `UPDATE tasks SET approved_at = clock_timestamp(), approved_by = $2
+		WHERE id = $1 AND ($3::timestamptz IS NULL OR planned_at <= $3::timestamptz)
+		RETURNING approved_at`, id, by, asOf).Scan(&at)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	ids, err := pgx.CollectRows(rows, pgx.RowTo[int])
-	if ids == nil {
-		ids = []int{}
+	return &at, nil
+}
+
+// AwaitingTask is an open ticket waiting for a person to approve its plan.
+type AwaitingTask struct {
+	ID          int  `json:"task_id"`
+	OwnerUserID *int `json:"owner_user_id"`
+	CreatedBy   *int `json:"-"`
+}
+
+// TasksAwaitingApproval lists the project's open (not completed) tickets
+// that aren't approved as planned now (approved_at unset or before
+// planned_at), by id, with their owners.
+func (r *Repo) TasksAwaitingApproval(ctx context.Context, projectID int) ([]AwaitingTask, error) {
+	rows, err := r.db.Query(ctx, `SELECT id, owner_user_id, created_by FROM tasks
+		WHERE project_id = $1 AND state <> 'completed' AND (approved_at IS NULL OR approved_at < planned_at)
+		ORDER BY id`, projectID)
+	if err != nil {
+		return nil, err
 	}
-	return ids, err
+	defer rows.Close()
+	out := []AwaitingTask{}
+	for rows.Next() {
+		var a AwaitingTask
+		if err := rows.Scan(&a.ID, &a.OwnerUserID, &a.CreatedBy); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repo) setProjectState(ctx context.Context, id int, state domain.ProjectState) (*domain.Project, error) {

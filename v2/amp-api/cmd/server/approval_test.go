@@ -81,8 +81,10 @@ func TestPlanApproval(t *testing.T) {
 		t.Fatalf("plan approved by a refused call at %v", p.PlanApprovedAt)
 	}
 
-	// A person approves in the web UI; now it dispatches. The audit row says who and how.
-	ra.want(t, 200, "bob", http.MethodPost, fmt.Sprintf("/api/projects/%d/approve-plan", pid), nil)
+	// A person approves in the web UI; now it dispatches. The audit row says
+	// who and how. Approval is per ticket (#2198): with no body a person
+	// approves their own tickets, so root (who planned a) approves it.
+	ra.want(t, 200, "root", http.MethodPost, fmt.Sprintf("/api/projects/%d/approve-plan", pid), nil)
 	check = root.call(t, "amp_check_plan", map[string]any{"project_id": float64(pid)})
 	if len(check["awaiting_approval"].([]any)) != 0 || check["plan_approved_at"] == nil || check["approve_url"] != nil {
 		t.Fatalf("after approval: %v", check)
@@ -92,11 +94,13 @@ func TestPlanApproval(t *testing.T) {
 	if err != nil || len(entries) != 1 {
 		t.Fatalf("plan.approve audit: %v %v", entries, err)
 	}
-	if e := entries[0]; e.ActorEmail != w.bob.User.Email || e.Details["channel"] != auth.ChannelUI {
+	if e := entries[0]; e.ActorEmail != w.root.User.Email || e.Details["channel"] != auth.ChannelUI ||
+		fmt.Sprint(e.Details["approved"]) != fmt.Sprint([]any{float64(a)}) {
 		t.Fatalf("audit = %+v", e)
 	}
 
-	// Any person on the project can approve in the UI; someone outside it can't.
+	// Any person on the project can approve (their own tickets) in the UI;
+	// someone outside it can't.
 	for _, who := range []string{"bob", "owner", "lead", "orgadmin"} {
 		ra.want(t, 200, who, http.MethodPost, fmt.Sprintf("/api/projects/%d/approve-plan", pid), nil)
 	}
@@ -257,7 +261,7 @@ func TestPlanApproval_ReplannedWorkWaitsAgain(t *testing.T) {
 	if !containsID(awaiting(), a) {
 		t.Fatalf("description change didn't re-plan ticket %d", a)
 	}
-	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(a)}), "planned after", planPath(pid))
+	wantErr(t, alice.callExpectError(t, "amp_complete_task", map[string]any{"task_id": float64(a)}), "isn't approved", planPath(pid))
 	// Renaming a ready ticket: dispatch refuses.
 	alice.call(t, "amp_update_task", map[string]any{"task_id": float64(b), "name": "b, renamed"})
 	wantErr(t, alice.callExpectError(t, "amp_dispatch_task", map[string]any{"task_id": float64(b), "agent_id": "amp-worker"}), "approved")
@@ -334,6 +338,9 @@ func TestApprovePlanPublishesProjectUpdated(t *testing.T) {
 	if n := count(); n != 1 {
 		t.Fatalf("service approve: %d events", n)
 	}
+	// root approves a ticket of their own, so the project's last approval moves.
+	mkIn(t, w.s.as(w.root), w.s.storyID, "root's")
+	count()
 	ra.want(t, 200, "root", http.MethodPost, fmt.Sprintf("/api/projects/%d/approve-plan", w.s.projectID), nil)
 	mu.Lock()
 	if len(got) != 1 {

@@ -175,6 +175,22 @@ type MsgSetTaskStartAt struct {
 	ReplyCh chan ReplySimple
 }
 
+// MsgApproveTask records a person's approval of one ticket's plan (AMP
+// #2198). The task actor approves it only if, at that moment, it is still
+// open, not already approved as planned now, planned at or before AsOf
+// (when set: what the person saw), and owned by ExpectOwner (whom the
+// service checked the approver may approve for). Otherwise it replies with
+// Approved false and Why. ByName/OnBehalfOf word the history entry.
+type MsgApproveTask struct {
+	TaskID      int
+	AsOf        *time.Time
+	ExpectOwner *int
+	By          *int
+	ByName      string
+	OnBehalfOf  string
+	ReplyCh     chan ReplyApproveTask
+}
+
 // MsgScheduledUnblock is sent by the timer goroutine to the TaskActor
 // when a scheduled task's start_at time has been reached.
 type MsgScheduledUnblock struct {
@@ -386,6 +402,15 @@ type ReplyGetTask struct {
 type ReplyListTasks struct {
 	Tasks []domain.Task
 	Err   error
+}
+
+// ReplyApproveTask answers MsgApproveTask: the ticket as it is now, whether
+// this call approved it, and why not when it didn't.
+type ReplyApproveTask struct {
+	Task     *domain.Task
+	Approved bool
+	Why      string
+	Err      error
 }
 
 type ReplySimple struct {

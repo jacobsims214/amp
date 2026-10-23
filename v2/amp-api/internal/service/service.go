@@ -355,8 +355,9 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 }
 
 // planApprovalGate decides whether t may be dispatched as far as plan
-// approval goes: with the project's setting on, a ticket planned after the
-// last approval waits for a person to approve the plan. It fails closed: if
+// approval goes: with the project's setting on, a ticket a person hasn't
+// approved since it was last planned (Task.Approved, per ticket since AMP
+// #2198) waits for its owner, or a lead on their behalf. It fails closed: if
 // the project couldn't be loaded (lookupErr), we can't tell whether the gate
 // applies, so the dispatch is refused with a retryable 503 rather than let
 // through unchecked.
@@ -370,8 +371,9 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 			"nothing was started, try the dispatch again", t.ID, t.ProjectID, reason)}
 	}
 	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
-		return authz.Forbidden("ticket %d was planned after the plan was last approved; this project needs the plan approved "+
-			"before agents start new tickets. A person approves it in the AMP web UI (Approve plan): %s. "+
+		return authz.Forbidden("ticket %d isn't approved: nobody has approved it since it was planned or its scope last changed, and "+
+			"this project needs each ticket approved before agents start it. Its owner approves it in the AMP web UI (Approve plan; "+
+			"a project lead may approve it on their behalf): %s. "+
 			"Agents can't approve: stop and ask your person to approve it there.", t.ID, planURL)
 	}
 	return nil

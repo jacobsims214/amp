@@ -45,8 +45,8 @@ func (s *Service) SettingsURL(projectID int) string {
 }
 
 // approvalGate refuses a non-UI caller moving t forward while it waits for
-// the plan to be approved (the project requires approval and t was planned
-// after the last one). It fails closed when the project can't be loaded.
+// approval (the project requires approval and t isn't approved as planned
+// now: Task.Approved). It fails closed when the project can't be loaded.
 func (s *Service) approvalGate(ctx context.Context, p authz.Principal, t *domain.Task, doing string) error {
 	if p.InUI() {
 		return nil
@@ -57,7 +57,7 @@ func (s *Service) approvalGate(ctx context.Context, p authz.Principal, t *domain
 			t.ID, t.ProjectID, err)}
 	}
 	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
-		return authz.Forbidden("ticket %d can't be %s: it was planned after the plan was last approved, and agents can't move "+
+		return authz.Forbidden("ticket %d can't be %s: it isn't approved since it was planned or its scope last changed, and agents can't move "+
 			"unapproved work forward. A person approves the plan in the AMP web UI: %s. Stop and ask your person to approve it there.",
 			t.ID, doing, s.PlanURL(t.ProjectID))
 	}
