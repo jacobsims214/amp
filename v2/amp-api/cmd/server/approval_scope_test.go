@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 )
@@ -646,6 +648,116 @@ func TestApprovalScope_ApprovalDoesNotSurviveAMembersReassignment(t *testing.T) 
 	if tk := sw.task(t, e); tk.State != domain.TaskStateCompleted {
 		t.Fatalf("ticket %d state %s, want completed", e, tk.State)
 	}
+}
+
+// A ticket that fails partway through a click (trashed after the service
+// listed it, a DB error, no reply in time) is skipped with the reason; the
+// other tickets are still approved, and the call still stamps the project,
+// writes its one plan.approve audit row and returns 200 (AMP #2219). Before,
+// it returned 500 and left the earlier tickets approved with no audit row.
+func TestApprovalScope_OneFailingTicketDoesntLoseTheOthers(t *testing.T) {
+	sw := newScopeWorld(t)
+	alice := sw.w.alice.User.ID
+	a1 := mkIn(t, sw.alice, sw.aliceStory, "alice's first")
+	a2 := mkIn(t, sw.alice, sw.aliceStory, "alice's second")
+	a3 := mkIn(t, sw.alice, sw.aliceStory, "alice's third")
+	before := sw.project(t)
+
+	// Make the DB refuse to approve a2 only, so its task actor replies with
+	// an error (the same path as a ticket gone from the DB mid-click).
+	ctx := context.Background()
+	db, err := pgx.Connect(ctx, os.Getenv("TEST_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	fn := fmt.Sprintf("refuse_approve_%d", a2)
+	if _, err := db.Exec(ctx, fmt.Sprintf(`CREATE FUNCTION %[1]s() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			IF NEW.id = %[2]d AND NEW.approved_at IS DISTINCT FROM OLD.approved_at THEN
+				RAISE EXCEPTION 'test: refusing to approve ticket %[2]d';
+			END IF;
+			RETURN NEW;
+		END $$;
+		CREATE TRIGGER %[1]s BEFORE UPDATE ON tasks FOR EACH ROW EXECUTE FUNCTION %[1]s();`, fn, a2)); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		c := context.Background()
+		db, err := pgx.Connect(c, os.Getenv("TEST_DATABASE_URL"))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer db.Close(c)
+		if _, err := db.Exec(c, fmt.Sprintf(`DROP TRIGGER IF EXISTS %[1]s ON tasks; DROP FUNCTION IF EXISTS %[1]s();`, fn)); err != nil {
+			t.Error(err)
+		}
+	})
+
+	approved, awaiting, out := sw.post(t, "alice", map[string]any{"task_ids": []int{a1, a2, a3}})
+	if !slices.Equal(approved, []int{a1, a3}) {
+		t.Fatalf("approved %v, want [%d %d] (a2 failed, the others must still be approved)", approved, a1, a3)
+	}
+	if !slices.Contains(awaiting, a2) {
+		t.Fatalf("awaiting %v, want a2 (%d) still awaiting", awaiting, a2)
+	}
+	skipped, _ := out["skipped"].(map[string]any)
+	if why := fmt.Sprint(skipped[fmt.Sprint(a2)]); !strings.HasPrefix(why, "couldn't approve it: ") || !strings.Contains(why, "refusing to approve") {
+		t.Fatalf("skipped[a2] = %q, want \"couldn't approve it: <the DB error>\" (skipped: %v)", why, out["skipped"])
+	}
+	for _, id := range []int{a1, a3} {
+		if tk := sw.task(t, id); !tk.Approved() || tk.ApprovedBy == nil || *tk.ApprovedBy != alice {
+			t.Fatalf("ticket %d approved %v by %v, want approved by alice", id, tk.Approved(), tk.ApprovedBy)
+		}
+	}
+	if tk := sw.task(t, a2); tk.Approved() || tk.ApprovedAt != nil {
+		t.Fatalf("a2 approved_at %v, want unapproved", tk.ApprovedAt)
+	}
+
+	// Exactly one plan.approve row for the click, listing what was approved
+	// and why a2 wasn't.
+	entries, err := sw.w.s.repo.ListAudit(ctx, domain.AuditFilter{ProjectID: sw.w.s.projectID, Action: "plan.approve"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows []domain.AuditEntry
+	for _, e := range entries {
+		if e.ActorUserID != nil && *e.ActorUserID == alice {
+			rows = append(rows, e)
+		}
+	}
+	if len(rows) != 1 {
+		t.Fatalf("%d plan.approve rows by alice, want 1: %v", len(rows), rows)
+	}
+	if got := idList(t, toAny(rows[0].Details["approved"])); !slices.Equal(got, []int{a1, a3}) {
+		t.Fatalf("audit approved %v, want [%d %d]", got, a1, a3)
+	}
+	if !strings.Contains(fmt.Sprint(rows[0].Details["skipped"]), "couldn't approve it") {
+		t.Fatalf("audit skipped %v, want a2's reason", rows[0].Details["skipped"])
+	}
+
+	// The project's "last approved ... by" moved to this click.
+	after := sw.project(t)
+	if after.PlanApprovedAt == nil || (before.PlanApprovedAt != nil && !after.PlanApprovedAt.After(*before.PlanApprovedAt)) {
+		t.Fatalf("plan_approved_at %v -> %v, want it moved", before.PlanApprovedAt, after.PlanApprovedAt)
+	}
+	if after.PlanApprovedBy == nil || *after.PlanApprovedBy != alice {
+		t.Fatalf("plan_approved_by %v, want alice", after.PlanApprovedBy)
+	}
+}
+
+// toAny turns a decoded audit detail (a []any from JSON, or a []int written
+// in-process) into []any for idList.
+func toAny(v any) any {
+	if ids, ok := v.([]int); ok {
+		out := make([]any, len(ids))
+		for i, id := range ids {
+			out[i] = float64(id)
+		}
+		return out
+	}
+	return v
 }
 
 func sameUserPtr(x, y *int) bool {
