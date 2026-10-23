@@ -282,6 +282,11 @@ impl ServerHandler for MockAmp {
                 {"id": 161, "name": "AMP Harness", "stories": [{"id": 391, "name": "M1 CLI"}]}
             ]})),
             "amp_list_artifacts" => ok_json(json!({"artifacts": []})),
+            // #2205: amp-api without APP_PUBLIC_URL (compose) gives relative web UI links.
+            "amp_check_plan" => ok_json(json!({
+                "project_id": 2, "require_plan_approval": true, "awaiting_approval": [4042],
+                "approve_url": "/project/2/plan"
+            })),
             // M3-4: /questions answers through the metadata poller's connection.
             "amp_answer_question" => match args["task_id"].as_i64() {
                 Some(2084) => ok_json(json!({"task_id": 2084, "state": "backlog", "ok": true})),
@@ -442,6 +447,7 @@ pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> 
         .env("AMP_HARNESS_CEILING_DIR", dir)
         .env_remove("AMP_TOKEN")
         .env_remove("AMP_CA_FILE")
+        .env_remove("AMP_WEB_URL")
         .env_remove("AMP_MCP_PROTOCOL")
         .env_remove("AMP_HARNESS_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")

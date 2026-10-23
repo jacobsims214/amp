@@ -172,6 +172,51 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
     );
 }
 
+/// #2205 (QA pass 1): compose's amp-api has no APP_PUBLIC_URL, so `approve_url` is relative and
+/// the manager used to hand out `http://localhost:18000/project/N/plan` (the MCP port). With the
+/// web UI configured (`AMP_WEB_URL`, as setup saves `[server] web_url`), the model gets the web
+/// UI link in the tool result and the web UI origin in its context.
+#[tokio::test]
+async fn a_planning_turn_gets_the_web_ui_link_not_the_mcp_origin() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup(
+        "run-web-links",
+        json!([
+            {"tool_calls": [{"name": "amp_check_plan", "arguments": {"project_id": 2}, "id": "c-1"}]},
+            {"text": "Approve it here: {{last_tool_result}}\n---\n{{system_prompt}}"}
+        ]),
+    );
+    let state = dir.join("home/.local/state");
+    let script = dir.join("script.json");
+    let out = run(
+        &dir,
+        &amp.url,
+        &["run", "-p", "plan it", "--json", "--no-session"],
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("AMP_WEB_URL", "http://localhost:5173"),
+        ],
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let events = json_lines(&out);
+    let text = events.last().unwrap()["text"].as_str().unwrap();
+    let mcp_origin = amp.url.trim_end_matches("/mcp");
+    assert!(!text.contains(&format!("{mcp_origin}/project")), "{text}");
+
+    let (result, prompt) = text.split_once("\n---\n").unwrap();
+    assert!(
+        result.contains(r#""approve_url":"http://localhost:5173/project/2/plan""#),
+        "{result}"
+    );
+    // The manager's context names the web UI origin.
+    assert!(
+        prompt.contains("\namp_web_ui: http://localhost:5173 (AMP's web UI: every link you give a person is on this origin, e.g. http://localhost:5173/project/<id>/plan"),
+        "no amp_web_ui line"
+    );
+}
+
 #[tokio::test]
 async fn the_model_receives_amp_instructions_and_project_context() {
     let amp = spawn(MockAmp::new(), None).await;
@@ -205,8 +250,10 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     );
     // 3. The project from .amp.json (its stale amp_api is ignored).
     let project_dir = std::fs::canonicalize(dir.join("project")).unwrap();
+    // #2205: the web UI line; without a web URL it is the MCP URL's origin.
+    let origin = amp.url.trim_end_matches("/mcp");
     assert!(prompt.contains(&format!(
-        "<amp_context>\nrole: amp-manager\namp_server: {}\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\n</amp_context>",
+        "<amp_context>\nrole: amp-manager\namp_server: {}\namp_web_ui: {origin} (AMP's web UI: every link you give a person is on this origin, e.g. {origin}/project/<id>/plan to approve a plan; never build links from amp_server)\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\n</amp_context>",
         amp.url,
         project_dir.join(".amp.json").display(),
         project_dir.display()
