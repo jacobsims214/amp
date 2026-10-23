@@ -127,7 +127,7 @@ func scanStory(row rowScanner, st *domain.Story) error {
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
-	performer, human_reason, ready_at`
+	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for`
 
 func scanTask(row rowScanner, t *domain.Task) error {
 	return row.Scan(
@@ -137,7 +137,7 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
-		&t.Performer, &t.HumanReason, &t.ReadyAt,
+		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor,
 	)
 }
 
@@ -239,15 +239,72 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 	return p, err
 }
 
-// ApprovePlan records that a user approved the project's plan now.
-func (r *Repo) ApprovePlan(ctx context.Context, id int, by *int) (*domain.Project, error) {
+// RecordPlanApproval stamps the project's last plan approval: when (now,
+// on clock_timestamp()) and by whom. Since AMP #2198 it is informational
+// (shown as "last approved ... by"); each ticket carries its own approval
+// (ApproveTask), which is what gates work.
+func (r *Repo) RecordPlanApproval(ctx context.Context, id int, by *int) (*domain.Project, error) {
 	p := &domain.Project{}
-	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET plan_approved_at = NOW(), plan_approved_by = $2, updated_at = NOW()
+	err := scanProject(r.db.QueryRow(ctx, `UPDATE projects SET
+		   plan_approved_at = clock_timestamp(), plan_approved_by = $2, updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols, id, by), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
 	}
 	return p, err
+}
+
+// ApproveTask records that user by approved ticket id's plan as it is now:
+// approved_at = clock_timestamp() (the clock planned_at is written with),
+// approved_by = by. With asOf set it approves only while planned_at is at
+// or before asOf (the newest planned_at the person saw); it returns nil,
+// nil when that no longer holds. approved_for becomes whose ticket it is
+// at that moment (owner, else creator), returned with it (AMP #2218).
+// Callers go through the task actor
+// (MsgApproveTask), which keeps its copy of the ticket in step.
+func (r *Repo) ApproveTask(ctx context.Context, id int, by *int, asOf *time.Time) (*time.Time, *int, error) {
+	var at time.Time
+	var forUser *int
+	err := r.db.QueryRow(ctx, `UPDATE tasks SET approved_at = clock_timestamp(), approved_by = $2,
+		       approved_for = COALESCE(owner_user_id, created_by)
+		WHERE id = $1 AND ($3::timestamptz IS NULL OR planned_at <= $3::timestamptz)
+		RETURNING approved_at, approved_for`, id, by, asOf).Scan(&at, &forUser)
+	if err == pgx.ErrNoRows {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return &at, forUser, nil
+}
+
+// AwaitingTask is an open ticket waiting for a person to approve its plan.
+type AwaitingTask struct {
+	ID          int  `json:"task_id"`
+	OwnerUserID *int `json:"owner_user_id"`
+	CreatedBy   *int `json:"-"`
+}
+
+// TasksAwaitingApproval lists the project's open (not completed) tickets
+// that aren't approved as planned now (approved_at unset or before
+// planned_at), by id, with their owners.
+func (r *Repo) TasksAwaitingApproval(ctx context.Context, projectID int) ([]AwaitingTask, error) {
+	rows, err := r.db.Query(ctx, `SELECT id, owner_user_id, created_by FROM tasks
+		WHERE project_id = $1 AND state <> 'completed' AND (approved_at IS NULL OR approved_at < planned_at)
+		ORDER BY id`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []AwaitingTask{}
+	for rows.Next() {
+		var a AwaitingTask
+		if err := rows.Scan(&a.ID, &a.OwnerUserID, &a.CreatedBy); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
 
 func (r *Repo) setProjectState(ctx context.Context, id int, state domain.ProjectState) (*domain.Project, error) {
@@ -367,8 +424,8 @@ func (r *Repo) CreateTask(ctx context.Context, req domain.CreateTaskRequest) (*d
 	t := &domain.Task{}
 	err := scanTask(r.db.QueryRow(ctx,
 		`INSERT INTO tasks (project_id, epic_id, story_id, name, description, acceptance_criteria, priority, assigned_to, start_at, created_by, owner_user_id, metadata,
-		                    performer, human_reason, ready_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())
+		                    performer, human_reason, ready_at, planned_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), clock_timestamp())
 		 RETURNING `+taskCols,
 		req.ProjectID, req.EpicID, req.StoryID, req.Name, req.Description, req.AcceptanceCriteria, req.Priority, req.AssignedTo, req.StartAt,
 		req.CreatedBy, req.OwnerUserID, metaOrEmpty(req.Metadata), performerOrAgent(req.Performer), req.HumanReason,
@@ -571,11 +628,18 @@ func (r *Repo) SetTaskAgent(ctx context.Context, taskID int, agentID string, dis
 	return err
 }
 
-// SetTaskOwner sets (or, with nil, clears) a ticket's single owner.
-func (r *Repo) SetTaskOwner(ctx context.Context, taskID int, ownerUserID *int) error {
+// SetTaskOwner sets (or, with nil, clears) a ticket's single owner. With
+// dropApproval it also clears the ticket's plan approval in the same
+// statement (an owner change a Member made away from the person it was
+// approved for, AMP #2218).
+func (r *Repo) SetTaskOwner(ctx context.Context, taskID int, ownerUserID *int, dropApproval bool) error {
 	_, err := r.db.Exec(ctx,
-		`UPDATE tasks SET owner_user_id = $1, updated_at = NOW() WHERE id = $2`,
-		ownerUserID, taskID,
+		`UPDATE tasks SET owner_user_id = $1, updated_at = NOW(),
+		        approved_at  = CASE WHEN $3 THEN NULL ELSE approved_at END,
+		        approved_by  = CASE WHEN $3 THEN NULL ELSE approved_by END,
+		        approved_for = CASE WHEN $3 THEN NULL ELSE approved_for END
+		 WHERE id = $2`,
+		ownerUserID, taskID, dropApproval,
 	)
 	return err
 }
@@ -589,6 +653,14 @@ func (r *Repo) SetTaskStartAt(ctx context.Context, taskID int, startAt *time.Tim
 }
 
 func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) error {
+	_, err := r.UpdateTaskPlanned(ctx, req)
+	return err
+}
+
+// UpdateTaskPlanned is UpdateTask returning the ticket's planned_at after
+// the change (moved to now when its name, description, or acceptance
+// criteria changed).
+func (r *Repo) UpdateTaskPlanned(ctx context.Context, req domain.UpdateTaskRequest) (time.Time, error) {
 	// Empty = keep; fields named in req.Clear are blanked.
 	clr := func(f string) bool { return slices.Contains(req.Clear, f) }
 	query := `UPDATE tasks SET
@@ -599,6 +671,15 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 	   agent_id            = CASE WHEN $10 THEN '' WHEN $5 != '' THEN $5 ELSE agent_id END,
 	   priority            = CASE WHEN $6 != '' THEN $6 ELSE priority END,
 	   updated_at          = NOW()`
+	// A change to what the ticket is (name, description, acceptance
+	// criteria) re-plans it: the last plan approval no longer covers it.
+	// clock_timestamp(), not NOW(): NOW() is the transaction's start, which a
+	// long transaction could hold from before an approval it commits after.
+	query += `,
+	   planned_at = CASE WHEN ($1 != '' AND $1 IS DISTINCT FROM name)
+	                       OR ($7 AND description != '') OR ($2 != '' AND $2 IS DISTINCT FROM description)
+	                       OR ($8 AND acceptance_criteria != '') OR ($3 != '' AND $3 IS DISTINCT FROM acceptance_criteria)
+	                     THEN clock_timestamp() ELSE planned_at END`
 
 	args := []interface{}{req.Name, req.Description, req.AcceptanceCriteria, req.AssignedTo, req.AgentID, req.Priority,
 		clr("description"), clr("acceptance_criteria"), clr("assigned_to"), clr("agent_id")}
@@ -615,11 +696,15 @@ func (r *Repo) UpdateTask(ctx context.Context, req domain.UpdateTaskRequest) err
 		query += fmt.Sprintf(`, human_reason = $%d`, len(args))
 	}
 
-	query += ` WHERE id = $` + fmt.Sprint(len(args)+1)
+	query += ` WHERE id = $` + fmt.Sprint(len(args)+1) + ` RETURNING planned_at`
 	args = append(args, req.TaskID)
 
-	_, err := r.db.Exec(ctx, query, args...)
-	return err
+	var planned time.Time
+	err := r.db.QueryRow(ctx, query, args...).Scan(&planned)
+	if err == pgx.ErrNoRows {
+		return planned, fmt.Errorf("task %d not found", req.TaskID)
+	}
+	return planned, err
 }
 
 // UpdateEpic updates an epic's mutable fields. Empty string = keep existing

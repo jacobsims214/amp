@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -656,18 +657,29 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "approve-plan":
-		// POST: a person approves the project's plan as it stands now.
+		// POST: a person approves tickets in the project's plan (per ticket,
+		// AMP #2198). Optional body {"task_ids": [...], "as_of": RFC 3339,
+		// "on_behalf": bool}. No task_ids: the caller's own awaiting tickets
+		// (everyone's with on_behalf). as_of: only tickets planned at or
+		// before it. Others' tickets need on_behalf and lead access. See
+		// service.ApproveRequest / ApproveResult and KB
+		// architecture/plan-approval.md.
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
 			return
 		}
-		// ApprovePlan publishes project.updated itself (MCP approves too).
-		proj, err := h.svc.ApprovePlan(r.Context(), pr, projectID)
+		var body service.ApproveRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil && err != io.EOF {
+			jsonErr(w, fmt.Errorf("approve-plan body: want {\"task_ids\": [ticket ids], \"as_of\": RFC 3339 timestamp, \"on_behalf\": bool}, all optional (as_of must be an RFC 3339 timestamp): %w", err), 400)
+			return
+		}
+		// ApproveTickets publishes project.updated itself.
+		res, err := h.svc.ApproveTickets(r.Context(), pr, projectID, body)
 		if err != nil {
 			fail(w, err, 500)
 			return
 		}
-		jsonOK(w, map[string]interface{}{"project": proj})
+		jsonOK(w, res)
 		return
 
 	case "report":
@@ -1045,7 +1057,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodDelete:
 			if err := h.svc.DeleteEpic(r.Context(), pr, epic); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			jsonOK(w, map[string]interface{}{"epic_id": epicID, "deleted": true})
@@ -1185,7 +1197,7 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodDelete:
 		if err := h.svc.DeleteStory(r.Context(), pr, story); err != nil {
-			jsonErr(w, err, 500)
+			fail(w, err, 500)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"story_id": storyID, "deleted": true})
@@ -1270,12 +1282,9 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 400)
 				return
 			}
-			req.TaskID = taskID
-			replyCh := make(chan actor.ReplySimple, 1)
-			h.registry.System().Root.Send(pid, &actor.MsgUpdateTask{Req: req, ReplyCh: replyCh})
-			reply := actor.Await(r.Context(), replyCh)
-			if reply.Err != nil {
-				jsonErr(w, reply.Err, 400)
+			// Off the web UI, a person's ticket isn't switched to agent work.
+			if err := h.svc.UpdateTask(r.Context(), pr, task, req); err != nil {
+				fail(w, err, 400)
 				return
 			}
 			updated, err := h.repo.GetTask(r.Context(), taskID)
@@ -1287,7 +1296,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 
 		case http.MethodDelete:
 			if _, err := h.svc.DeleteTask(r.Context(), pr, task); err != nil {
-				jsonErr(w, err, 500)
+				fail(w, err, 500)
 				return
 			}
 			h.hub.Publish(domain.Event{
@@ -1397,11 +1406,10 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed", "task": t, "run": run})
 			return
 		}
-		replyCh := make(chan actor.ReplySimple, 1)
-		h.registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: pr.UserRef(), ReplyCh: replyCh})
-		reply := actor.Await(r.Context(), replyCh)
-		if reply.Err != nil {
-			jsonErr(w, reply.Err, 400)
+		// A person in the web UI completes any ticket they can work; other
+		// callers (API tokens, MCP-audience tokens) only dispatched work.
+		if _, err := h.svc.CompleteTask(r.Context(), pr, taskID); err != nil {
+			fail(w, err, 400)
 			return
 		}
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "state": "completed"})
@@ -1451,6 +1459,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 			if req.Author == "" || req.Author == "user" {
 				req.Author = pr.Email
 			}
+			req.Author = h.svc.CommentAuthor(r.Context(), pr, req.Author)
 			replyCh := make(chan actor.ReplyAddComment, 1)
 			h.registry.System().Root.Send(pid, &actor.MsgAddComment{Req: req, ReplyCh: replyCh})
 			reply := actor.Await(r.Context(), replyCh)

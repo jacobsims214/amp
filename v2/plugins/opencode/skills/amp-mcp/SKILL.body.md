@@ -19,10 +19,10 @@ one feature with no obvious entry point — scheduling.
 - **Epics**: `amp_create_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
 - **Stories**: `amp_create_story`, `amp_update_story`, `amp_move_story`, `amp_delete_story`
 - **Planning**: `amp_create_tasks` (several tickets and their dependencies in one call), `amp_set_task_dependencies`, `amp_move_task`, `amp_check_plan` — see the `amp-planning` skill. Dependencies drive dispatch: never leave them out, and never delete and re-create tickets to fix them
-- **Tasks**: `amp_create_tasks`, `amp_list_tasks` (compact board; `format: "full"` for full records), `amp_get_task` (`include: ["comments","history","runs"]` for its comments, activity and runs), `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan`, `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_claim_task`, `amp_assign_task`, `amp_handover_tasks` (move a person's open tickets to someone else)
+- **Tasks**: `amp_create_tasks`, `amp_list_tasks` (compact board; `format: "full"` for full records), `amp_get_task` (`include: ["comments","history","runs"]` for its comments, activity and runs), `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan` (approval status only: it never approves; see below), `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_claim_task`, `amp_assign_task`, `amp_handover_tasks` (move a person's open tickets to someone else)
 - **Runs and trace**: `amp_report_run` (record a run without changing the ticket's state: killed, abandoned or handed over, usage learned afterwards, a PR opened after completion), `amp_trace` (commit, branch or PR → the tickets that produced it), `amp_list_unmerged` (done tickets whose pushed work isn't merged yet), `amp_report_merged` (CI or a person records a merge by `commit`, `branch` or `pr_url`, with `merge_commit` for the merge SHA; every ticket whose runs produced it gets a run marked merged). `amp_session_usage` is not an AMP server tool: the harness plugin provides it (Claude Code with the AMP plugin, opencode) to report your own model, tokens and cost, which you pass to `amp_complete_task` / `amp_block_task`
 - **Trash**: `amp_list_deleted_tasks` (tickets, epics and stories deleted in the last 30 days), `amp_restore_tasks` (`task_ids`, `story_ids`, `epic_ids`; restore the epic, then its stories, then their tickets, in the same call)
-- **Artifacts**: `amp_publish_artifact` (mockups, prototypes, diagrams, images, PDFs, documents for review), `amp_get_artifact`, `amp_list_artifacts`, `amp_review_artifact` and `amp_keep_artifact` (people only: approve or request changes, keep it from expiring). Design systems: `amp_design_context`, `amp_design_system_start`, `amp_design_system_publish`
+- **Artifacts**: `amp_publish_artifact` (mockups, prototypes, diagrams, images, PDFs, documents for review), `amp_get_artifact`, `amp_list_artifacts`, `amp_review_artifact` and `amp_keep_artifact` (people only: request changes, keep it from expiring; approving, `approve=true`, is done by a person on the artifact page in the web UI and refused over MCP). Design systems: `amp_design_context`, `amp_design_system_start`, `amp_design_system_publish`
 - **People**: `amp_whoami`, `amp_list_project_members`
 - **Human tickets**: `performer: "human"` + `human_reason` on `amp_create_tasks` / `amp_update_task`; `waiting_on_people` in `amp_list_tasks`; `human_gates` in `amp_check_plan`; `amp_human_impact` (agents vs people, what held the plan up)
 - **Daily reports**: `amp_day_report`, `amp_save_day_report`, `amp_list_day_reports`, `amp_velocity` — see the `amp-day-report` skill
@@ -31,6 +31,48 @@ one feature with no obvious entry point — scheduling.
 - **Knowledge base**: `amp_kb_sources`, `amp_kb_search`, `amp_kb_get`, `amp_kb_write`, `amp_kb_list`, `amp_kb_delete`, `amp_kb_list_deleted`, `amp_kb_restore`, `amp_kb_annotate`, `amp_kb_resolve_annotation`, `amp_kb_status`, `amp_kb_reindex` — the project KB by default; `scope: "team"` / `"org"` reach the team and org KBs (write there only when your user decides). See the `amp-kb` skill
 - **`amp_kb_reindex`**: rebuilds a KB's search index by re-embedding every document. Use it when search looks broken: scores far above 1, results that match only on keywords, or a doc that `amp_kb_get` reads but `amp_kb_search` never finds. It runs in the background and returns at once (search again in a minute), doesn't change documents, and needs write access to that KB, like `amp_kb_write`
 - **`amp_kb_list_deleted` / `amp_kb_restore`**: a deleted KB doc stays in the KB's trash for 30 days. `amp_kb_list_deleted` lists them (path, title, deleted_at, deleted_by); `amp_kb_restore` brings one back by path with its content, tags and annotations, readable and searchable again. Both need write access to that KB, like `amp_kb_delete`, and refuse the global KB
+
+---
+
+## What only a person does, in the web UI
+
+Some steps are refused over MCP for every caller, agent accounts and a person's own MCP login
+alike. The refusal ends: "… is done by a person in the AMP web UI, not by an agent or over MCP:
+<link>. Stop and ask your person to do it there." Do exactly that: give your person the link and
+stop. Don't retry, and don't try another tool or the REST API.
+
+| Step | Where the person does it | What you get over MCP |
+|---|---|---|
+| Approving a plan (per ticket: each person their own; a lead on someone's behalf) | Flight plan, "Approve plan" | `amp_approve_plan` always refuses, with `approve_url`, `awaiting_approval`, `require_plan_approval`, `plan_approved_at`. Never call it to approve. |
+| Approving an artifact | Artifact page, Approve | `amp_review_artifact(approve=true)` refuses; `approve=false` with a note still works |
+| Marking a human ticket done | Ticket drawer or My Work, Mark done | `amp_complete_task` / `amp_set_task_state(completed)` refuse with the ticket link |
+| Turning `require_plan_approval` off | Project settings | `amp_update_project_settings` refuses; turning it on works |
+
+The approval gate in practice:
+
+- **Approval is per ticket.** Each person approves their own tickets in the web UI; a project
+  lead (or owner, admin) may approve someone else's on their behalf. A ticket you plan for your
+  person is theirs to approve (an unassigned ticket belongs to whoever planned it).
+- **`amp_check_plan`** returns `approve_url` (the Flight plan link) whenever `awaiting_approval`
+  isn't empty. `awaiting_approval` is every open ticket awaiting approval, anyone's;
+  `awaiting_approval_tickets` lists them as `{task_id, owner_user_id, yours}`, and
+  `awaiting_yours` is your person's own. That's the hand-off point: tell your person which of
+  **their** tickets await approval (`awaiting_yours`) with the link, say others' tickets wait for
+  their owners (or a lead on their behalf), and wait.
+- **`amp_dispatch_task`** on a ticket that isn't approved refuses: "ticket N isn't approved …
+  Its owner approves it in the AMP web UI (Approve plan; a project lead may approve it on their
+  behalf): <link>". A ticket is re-planned (needs approving again) when it's created, restored
+  from the trash, or its name, description or acceptance criteria change.
+- **`amp_complete_task`** on a ticket that was never dispatched refuses: "never dispatched …
+  Dispatch it first". Off the UI a ticket can only be completed from `in_progress`.
+- **`amp_set_task_state`** can't move a ticket to `in_progress` (use `amp_dispatch_task`) or take a
+  question back to backlog (answer it). Moving work back (to backlog or blocked) is allowed.
+- **`amp_answer_question`** is allowed: it relays your person's answer, and AMP shows it as
+  "<email> (relayed by agent)". Only relay what they said.
+
+Reading is always fine. A status question ("what's on the board?") needs only `amp_list_tasks`,
+`amp_get_plan`, `amp_get_task`, `amp_check_plan` and `amp_list_unmerged`: don't comment, claim,
+dispatch or complete anything to answer it.
 
 ---
 
@@ -76,9 +118,10 @@ A subagent can't wait for an answer, so a question lives on the ticket:
   is the question people see in AMP ("Avalara or Stripe Tax? …"). Not for waiting on other
   tickets — that's a dependency.
 - `amp_list_tasks` returns a `questions` list: each blocked ticket with its question.
-- `amp_answer_question` {task_id, answer} — the orchestrator's way to record the user's answer:
-  it's posted as a comment and the ticket goes back to ready (or to waiting, if it still depends
-  on unfinished tickets). People answering in the AMP UI do exactly the same.
+- `amp_answer_question` {task_id, answer} — the orchestrator's way to relay the user's answer:
+  it's posted as a comment marked "relayed by agent" and the ticket goes back to ready (or to
+  waiting, if it still depends on unfinished tickets). People answering in the AMP UI do exactly
+  the same, under their own name. Never answer from your own judgment.
 - The next worker dispatched to the ticket reads its comments first (`amp_get_task` with `include: ["comments"]`) and finds the answer.
 
 ---
@@ -91,13 +134,12 @@ and its `owner` the person who does it (required). It sits in the dependency gra
 ticket, so whatever `depends_on` it waits for the person.
 
 - **Never dispatched.** `amp_dispatch_task` refuses it. Its owner clicks Start and Mark done in
-  AMP. It isn't in `ready_to_dispatch` or `in_progress`, and it's never `quiet`.
+  AMP's web UI. It isn't in `ready_to_dispatch` or `in_progress`, and it's never `quiet`.
 - **`amp_list_tasks` → `waiting_on_people`**: the human tickets a person can do now that matter to
   you. Each has `owner` (email), `reason`, `state` (ready | in_progress), `waiting_hours`,
   `holding_up` (open ticket IDs downstream) and `stale` (48h with no activity).
-- **Recording one done for your own user, on their word**: `amp_complete_task(task_id, note,
-  pr_url, hours_worked)`. It's recorded as their work, noted as entered by their agent. Agent
-  accounts can't.
+- **Only the person marks it done, in the web UI.** `amp_complete_task` on a human ticket is
+  refused for every MCP caller, even on your user's word; give them the ticket link instead.
 - **Switching who does it**: `amp_update_task(task_id, performer, human_reason)`. Not while it's
   in progress; the change is on the ticket's history.
 - **`amp_check_plan` → `human_gates`**: each open human ticket and how many open tickets wait on

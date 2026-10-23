@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play } from 'lucide-react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, Check, UserRound, Play, ShieldCheck, ShieldAlert } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
+import { approvalOf, formatWhen, isRelayed, planPath, relayedFor } from '../lib/approval'
 import { api } from '../api/client'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
@@ -62,6 +64,7 @@ const ACTION_DOT: Record<string, string> = {
   blocked:    'bg-danger',
   unblocked:  'bg-warning-ink',
   comment:    'bg-line-str ring-1 ring-ink-2/40',
+  plan_approved: 'bg-success',
 }
 
 const inputCls =
@@ -511,6 +514,7 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
           ? <span className="text-ink-2" title={creator.email}>{creator.name}{task.created_by === meId ? ' (you)' : ''}</span>
           : <span className="italic">unknown</span>}
       </div>
+      <ApprovalLine task={task} people={people} meId={meId} />
       {!canWork && owner && (
         <p className="text-xs text-warning-ink">
           Owned by {owner.name} — {canTakeOver
@@ -521,6 +525,38 @@ function OwnerSection({ task, people, members, meId, myAccess, openReassign, can
         </p>
       )}
       {error && <p className="text-xs text-danger-ink">{error}</p>}
+    </div>
+  )
+}
+
+/**
+ * Who approved this ticket's plan (#2198), and for whom when it wasn't their
+ * own: "Approved by Lee on behalf of Bob · Oct 22". An open ticket whose plan
+ * nobody approved says so and links to the Flight plan, where people approve.
+ */
+export function ApprovalLine({ task, people, meId }: { task: Task; people: Map<number, Person>; meId?: number }) {
+  const a = approvalOf(task)
+  const name = (id: number) => (lookupPerson(people, id)?.name ?? `User #${id}`) + (id === meId ? ' (you)' : '')
+  if (!a) {
+    if (task.state === 'completed') return null
+    return (
+      <div className="text-xs text-ink-3 flex items-center gap-1.5 flex-wrap">
+        <ShieldAlert size={12} className="text-warning-ink" aria-hidden="true" />
+        <span>Plan not approved yet{task.approved_at ? ' (changed since it was approved)' : ''}.</span>
+        <Link to={`${planPath(task.project_id)}#approve`} className="text-ink-2 underline underline-offset-2">Approve in Flight plan</Link>
+      </div>
+    )
+  }
+  return (
+    <div className="text-xs text-ink-3 flex items-center gap-1.5 flex-wrap">
+      <ShieldCheck size={12} className="text-success-ink" aria-hidden="true" />
+      <span>
+        {a.approvedBy == null
+          ? <>Approved by <span className="text-ink-2">the AMP upgrade</span> (kept from an earlier approval)</>
+          : <>Approved by <span className="text-ink-2">{name(a.approvedBy)}</span>
+              {a.onBehalfOf != null && <> on behalf of <span className="text-ink-2">{name(a.onBehalfOf)}</span></>}</>}
+        {formatWhen(a.at) && <> · <span className="tabular-nums">{formatWhen(a.at)}</span></>}
+      </span>
     </div>
   )
 }
@@ -784,7 +820,10 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
 
   return (
     <div className="space-y-0">
-      {history.map((entry, i) => (
+      {history.map((entry, i) => {
+        // A manager passing on its person's answer over MCP: shown apart from the person's own words.
+        const relayed = isRelayed(entry.actor)
+        return (
         <div key={entry.id} className="flex gap-3">
           <div className="flex flex-col items-center flex-shrink-0">
             <div className="mt-1.5">
@@ -794,7 +833,12 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
           </div>
           <div className="pb-5 flex-1 min-w-0">
             <div className="flex items-center gap-1.5 mb-1 flex-wrap">
-              <span className="text-xs font-semibold text-ink">{activityActor(entry, people)}</span>
+              <span className="text-xs font-semibold text-ink">{relayed ? (lookupPerson(people, entry.actor_user_id)?.name ?? relayedFor(entry.actor)) : activityActor(entry, people)}</span>
+              {relayed && (
+                <span className="inline-flex items-center gap-1 font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border border-dashed border-line-str text-ink-2"
+                  title="An agent passed this on for the person over MCP. They didn't type it in AMP themselves.">
+                  <Bot size={10} aria-hidden="true" />Relayed by agent</span>
+              )}
               <span className="text-ink-3 text-xs">·</span>
               <span className="text-xs text-ink-2 capitalize">{entry.action.replace('_', ' ')}</span>
               {entry.from_state && entry.to_state && (
@@ -807,7 +851,7 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
             {entry.detail && (
               <div className={`text-xs rounded-xl px-3.5 py-2.5 leading-relaxed whitespace-pre-wrap ${
                 entry.action === 'comment'
-                  ? 'bg-bg border border-line-sub text-ink'
+                  ? `bg-bg border text-ink ${relayed ? 'border-dashed border-line-str' : 'border-line-sub'}`
                   : 'text-ink-2'
               }`}>
                 {entry.detail}
@@ -815,7 +859,8 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
             )}
           </div>
         </div>
-      ))}
+        )
+      })}
     </div>
   )
 }
@@ -888,7 +933,7 @@ function HumanWork({ task, meId, people, onChanged }: {
       <span className="amp-label flex items-center gap-1.5"><UserRound size={12} />
         {owner ? `${owner.name} does this` : 'A person does this'} · {reasonLabel(task.human_reason)}</span>
       <p className="m-0 text-[13px] leading-relaxed text-ink-2">
-        {reasonHint(task.human_reason)}. Agents never pick it up; the work that depends on it starts when it's marked done.
+        {reasonHint(task.human_reason)}. Agents never pick it up, and they can't mark it done: only {owner ? owner.name : 'its owner'} can, here in AMP. The work that depends on it starts then.
       </p>
       {waiting ? (
         <span className="text-[12.5px] text-ink-2">Waiting on #{(task.blocked_by_ids ?? task.dependency_ids).join(', #')} before it can start.</span>

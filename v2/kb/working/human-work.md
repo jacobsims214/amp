@@ -22,7 +22,9 @@ plan shows who it's waiting on, and the reports show what that waiting costs.
   2. When you're done, click **Mark done**. You can add a note, a link (the PR, the doc) and the
      hours you actually spent.
 
-  Or tell your manager agent "I merged it, about an hour" and it records it for you.
+  Only you can mark it done, and only in the web UI. Your manager agent can't record it for
+  you (`amp_complete_task` on a human ticket is refused over MCP); if you tell it you've merged,
+  it gives you the ticket's link.
 - **It's never flagged as quiet.** People work in days, not the minutes an agent takes. It shows as
   **stale** after two days with no activity.
 
@@ -47,7 +49,8 @@ Plan a human ticket for a step you can see coming that only a person can do. Don
 - **A question that comes up while an agent works.** The agent blocks its own ticket with the
   question, and you answer it (`working/questions.md`).
 - **Approving a mockup.** That's the design ticket's artifact review (`working/artifacts.md`).
-- **Approving the plan.** That's Flight plan's Approve.
+- **Approving the plan.** That's Flight plan's Approve, done in the web UI by each person for
+  their own tickets (or a lead on their behalf).
 
 A good human ticket:
 - has **one person and one action**: "Review and merge: quotes API PR", not "QA and release";

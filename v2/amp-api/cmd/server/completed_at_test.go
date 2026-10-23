@@ -16,7 +16,7 @@ func TestCompletedAtSurvivesActorRestart(t *testing.T) {
 	s := setupMCP(t)
 	ctx := context.Background()
 	tid := taskID(t, s.mkTask(t, "finish me", nil))
-	s.call(t, "amp_complete_task", map[string]interface{}{"task_id": float64(tid)})
+	s.finish(t, tid)
 
 	stored, err := s.repo.GetTask(ctx, tid)
 	if err != nil || stored.CompletedAt == nil {
@@ -47,6 +47,8 @@ func TestCompletedAtSurvivesActorRestart(t *testing.T) {
 	if v, ok := task["completed_at"]; ok && v != nil {
 		t.Fatalf("reopened task (actor view) completed_at = %v", v)
 	}
+	// Agents complete only dispatched work, by hand or not.
+	s.call(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(tid), "agent_id": "amp-worker"})
 	s.call(t, "amp_set_task_state", map[string]interface{}{"task_id": float64(tid), "state": "completed", "reason": "done after all"})
 	if got, _ := s.repo.GetTask(ctx, tid); got.CompletedAt == nil {
 		t.Fatal("manually completed task has no completed_at")

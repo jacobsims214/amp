@@ -1,6 +1,7 @@
 package authz
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/simstech/amp-api/internal/domain"
@@ -191,6 +192,32 @@ func TestTaskViewIncludes(t *testing.T) {
 	for _, c := range cases {
 		if got := c.v.Includes(&c.task, c.me); got != c.want {
 			t.Errorf("%s: got %v", c.name, got)
+		}
+	}
+}
+
+// Only a person (not an agent account) on the web UI channel passes RequireUI;
+// the refusal names the page.
+func TestRequireUI(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    Principal
+		ok   bool
+	}{
+		{"person in the UI", Principal{UserID: 1, Channel: "ui"}, true},
+		{"local dev on REST", Principal{Super: true, Channel: "ui"}, true},
+		{"agent account on the UI channel", Principal{UserID: 1, Agent: true, Channel: "ui"}, false},
+		{"person over MCP", Principal{UserID: 1, Super: true, Channel: "mcp"}, false},
+		{"API token", Principal{UserID: 1, ViaToken: true, Channel: "token"}, false},
+		{"MCP token on REST", Principal{UserID: 1, Channel: "rest-other"}, false},
+		{"in-process, no channel", Principal{UserID: 1}, false},
+	} {
+		err := RequireUI(tc.p, "Plan approval", "https://amp.test/project/1/plan")
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: err = %v, want ok=%v", tc.name, err, tc.ok)
+		}
+		if err != nil && (StatusOf(err, 0) != 403 || !strings.Contains(err.Error(), "https://amp.test/project/1/plan")) {
+			t.Errorf("%s: refusal %q (status %d) lacks the link", tc.name, err, StatusOf(err, 0))
 		}
 	}
 }

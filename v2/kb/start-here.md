@@ -57,7 +57,12 @@ Ask for a small real goal ("add a health endpoint", "write the README"). Plan it
 1. Create an epic and stories, then tickets with `amp_create_tasks` (refs + `depends_on`).
 2. Run `amp_check_plan` and explain what it says.
 3. Show them the plan in **Flight plan** and **Graph**.
-4. Have *them* approve it. Approval is their "go"; you never approve your own plan.
+4. Tell them which of *their* tickets await approval (`awaiting_yours` from `amp_check_plan`),
+   give them the `approve_url`, and have *them* click **Approve plan** in the web UI. Approval is
+   per ticket and is their "go": each person approves their own tickets (a lead may approve on
+   someone's behalf), you can't approve (`amp_approve_plan` always refuses), and "yes" in chat
+   isn't approval. Dispatch a ticket once it's no longer in `awaiting_approval`; others' tickets
+   wait for their owners.
 
 ## Step 4: run it, and show them where to watch
 

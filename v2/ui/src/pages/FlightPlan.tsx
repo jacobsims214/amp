@@ -9,6 +9,10 @@
  * Clicking a ticket lights up everything it waits on and everything waiting
  * on it; the critical path is outlined. AMP's plan check sits beside it as a
  * GO / NO-GO poll.
+ *
+ * It is also where a person approves the plan: /project/{id}/plan is the link
+ * agents get when they're refused for want of approval, so the approval
+ * banner (what waits, who planned it, Approve plan) sits at the top.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
@@ -17,7 +21,9 @@ import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
 import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
-import { lookupPerson } from '../lib/people'
+import { usePlanApproval } from '../hooks/usePlanApproval'
+import { awaitingApproval } from '../lib/approval'
+import { PlanApprovalBanner, type ApproveSelection } from '../components/PlanApprovalBanner'
 import { ProjectNav } from '../components/ProjectNav'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
@@ -118,14 +124,18 @@ export function FlightPlan() {
     .finally(() => setChecking(false)), [pid])
   useEffect(() => { check() }, [check])
   const runCheck = () => { setChecking(true); check() }
-  const [approving, setApproving] = useState(false)
-  const [approveError, setApproveError] = useState<string | null>(null)
-  const approve = async () => {
-    setApproving(true); setApproveError(null)
-    try { await api.approvePlan(pid); await check() }
-    catch (e) { setApproveError(e instanceof Error ? e.message : 'Could not approve the plan') }
-    finally { setApproving(false) }
+  const approval = usePlanApproval(pid)
+  const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
+  const approve = async (sel: ApproveSelection) => {
+    const r = await approval.approve(sel)
+    if (r.changed) refresh()
+    if (r.ok || r.changed) check()
   }
+  // The link agents are given lands here; bring the approval into view once it's drawn.
+  const approvalShown = !!approval.project && !(loading && !tasks.length)
+  useEffect(() => {
+    if (approvalShown && window.location.hash === '#approve') document.getElementById('approve')?.scrollIntoView({ block: 'nearest' })
+  }, [approvalShown])
 
   const shape = useMemo(() => planShape(tasks), [tasks])
   const lit = useMemo(() => {
@@ -189,6 +199,8 @@ export function FlightPlan() {
       </>} />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
+        <PlanApprovalBanner projectId={pid} project={approval.project} awaiting={awaiting} people={people}
+          meId={me?.user_id} myAccess={myAccess} onApprove={approve} approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setOpenId} />
         <Readouts items={[
           { label: 'Tickets', value: tasks.length, sub: `${openCount} open` },
           { label: 'Epics · stories', value: <>{epics.length}<span className="text-[14px] text-ink-3"> · {stories.length}</span></>, sub: 'in this plan' },
@@ -291,8 +303,6 @@ export function FlightPlan() {
                     : 'Nothing is blocked on finished work.'}</span>
                 </div>
                 <p className="m-0 px-4 py-2.5 border-t border-line text-[11.5px] text-ink-3">{report.summary}</p>
-                <Approval key={poll} report={report} onApprove={approve} approving={approving} error={approveError} onFocus={setFocus}
-                  approver={report.plan_approved_by != null ? lookupPerson(people, report.plan_approved_by)?.name : undefined} />
               </>}
             </Panel>
 
@@ -302,41 +312,6 @@ export function FlightPlan() {
 
       <TaskDrawer task={opened} onClose={() => setOpenId(null)} onRefresh={refresh}
         members={members} meId={me?.user_id} myAccess={myAccess} openReassign={openReassign} onTaskUpdated={applyTask} />
-    </div>
-  )
-}
-
-/** Plan approval: what's new since the last approval, and the button. */
-function Approval({ report, onApprove, approving, error, onFocus, approver }: {
-  report: PlanReport; onApprove: () => void; approving: boolean; error: string | null; onFocus: (id: number) => void; approver?: string
-}) {
-  const waiting = report.awaiting_approval ?? []
-  const when = report.plan_approved_at ? new Date(report.plan_approved_at).toLocaleString(undefined, { weekday: 'short', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : null
-  return (
-    <div className="grid gap-2.5 px-4 py-3.5 border-t-2 border-ink">
-      <div className="grid grid-cols-[1fr_auto] gap-x-3 gap-y-1">
-        <span className="text-[13px] font-semibold text-ink">Plan approval</span>
-        <Verdict ok={waiting.length === 0} stampDelay={700} />
-        <span className="col-span-2 text-[11.5px] text-ink-2 leading-snug">
-          {waiting.length === 0
-            ? <>Approved{when ? <> {when}</> : null}{approver ? <> by {approver}</> : null}. Nothing new has been planned since.</>
-            : <>{waiting.length} open ticket{waiting.length === 1 ? '' : 's'} planned {when ? <>since the last approval ({when}{approver ? `, ${approver}` : ''})</> : 'and never approved'}.{' '}
-                {report.require_plan_approval ? 'Agents can\'t start them until the plan is approved.' : 'This project doesn\'t require approval, so agents can already start them.'}</>}
-        </span>
-        {waiting.length > 0 && (
-          <span className="col-span-2 flex flex-wrap gap-1">
-            {waiting.slice(0, 24).map(id => <button key={id} type="button" onClick={() => onFocus(id)} className="amp-num text-[10.5px] px-1 border border-line hover:border-ink cursor-pointer">#{id}</button>)}
-            {waiting.length > 24 && <span className="amp-num text-[10.5px] text-ink-3">+{waiting.length - 24}</span>}
-          </span>
-        )}
-      </div>
-      {error && <span className="text-[12px] text-danger-ink">{error}</span>}
-      {waiting.length > 0 && (
-        <div className="flex gap-2">
-          <button type="button" className="amp-btn amp-btn-accent" disabled={approving} onClick={onApprove}>
-            {approving && <Loader2 size={12} className="animate-spin" />}Approve plan</button>
-        </div>
-      )}
     </div>
   )
 }

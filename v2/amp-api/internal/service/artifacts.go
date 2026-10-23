@@ -233,6 +233,17 @@ func (s *Service) ReviewArtifact(ctx context.Context, p authz.Principal, id, ver
 	if err != nil {
 		return nil, err
 	}
+	// Approving is a person's call, made in the web UI. Asking for changes
+	// moves work back, so it may come over MCP (an agent relaying it).
+	if approve {
+		link := s.ArtifactURL(id)
+		if link == "" {
+			link = s.link(fmt.Sprintf("/artifacts/%d", id))
+		}
+		if err := authz.RequireUI(p, "Approving an artifact", link); err != nil {
+			return nil, err
+		}
+	}
 	if version == 0 {
 		version = a.CurrentVersion
 	}

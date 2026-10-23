@@ -129,7 +129,7 @@ func TestWebhooks_ProjectEventsAreSignedAndFiltered(t *testing.T) {
 		"project_id": float64(w.s.projectID), "story_id": float64(w.s.storyID), "name": "Ship <it>", "description": "d", "acceptance_criteria": "a",
 	}))
 	owner.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(id), "agent_id": "worker"})
-	owner.call(t, "amp_complete_task", map[string]any{"task_id": float64(id)})
+	owner.finish(t, id)
 
 	got := rc.wait(t, "created and completed", func(g []received) bool { return len(g) >= 2 })
 	time.Sleep(100 * time.Millisecond) // anything else would have arrived by now
@@ -210,7 +210,7 @@ func TestWebhooks_OrgWebhookSlackAndAudit(t *testing.T) {
 	id := taskID(t, owner.call(t, "amp_create_task", map[string]any{
 		"project_id": float64(w.s.projectID), "story_id": float64(w.s.storyID), "name": "Ship <it>", "description": "d", "acceptance_criteria": "a",
 	}))
-	owner.call(t, "amp_complete_task", map[string]any{"task_id": float64(id)})
+	owner.finish(t, id)
 
 	got := rc.wait(t, "audit entry and completion", func(g []received) bool {
 		ev := strings.Join(events(g), " ")
