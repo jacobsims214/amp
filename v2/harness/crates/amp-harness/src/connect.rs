@@ -31,10 +31,14 @@ use std::{
 
 use amp_core::{
     agent::Runtime,
-    models::{DEFAULT_PROFILE, ModelsConfig, ModelsFile, ProviderApi, ProviderConfig, Selection},
+    models::{
+        DEFAULT_PROFILE, ModelsConfig, ModelsFile, ProviderApi, ProviderAuth, ProviderConfig,
+        Selection,
+    },
+    provider_auth::{CLIENT_KEY_SECRET, secret_account},
     providers::{
-        KeySource, ProviderSet, StaticKeys, SystemKeys, header_account, keychain_account,
-        live_model_ids, resolve_key, resolve_secret_headers,
+        KeyLookup, KeySource, ProviderSet, StaticKeys, SystemKeys, header_account,
+        keychain_account, live_model_ids, resolve_key, resolve_secret_headers,
     },
 };
 use clap::Args;
@@ -105,6 +109,56 @@ pub struct ConnectArgs {
     /// provider. A provider that already has its key is not asked for it again.
     #[arg(long = "role", value_name = "ROLE=MODEL")]
     pub roles: Vec<String>,
+    /// Custom provider: how requests authenticate (#2277): bearer (default), header, none,
+    /// command, oauth-client-credentials or azure-entra.
+    #[arg(long, value_name = "TYPE")]
+    pub auth: Option<String>,
+    /// With --auth header: the header the key goes in (default api-key, Azure OpenAI's).
+    #[arg(long, value_name = "NAME")]
+    pub auth_header: Option<String>,
+    /// With --auth command (or azure-entra): the program that prints a token, with its arguments,
+    /// split on spaces (e.g. "vault read -field=token secret/llm"). Arguments with spaces: edit
+    /// auth_command in config.toml.
+    #[arg(long, value_name = "COMMAND")]
+    pub auth_command: Option<String>,
+    /// With --auth oauth-client-credentials: the token endpoint.
+    #[arg(long, value_name = "URL")]
+    pub token_url: Option<String>,
+    /// OAuth / Entra client id (the client secret is read like a key: hidden, or --key-stdin).
+    #[arg(long, value_name = "ID")]
+    pub client_id: Option<String>,
+    /// OAuth scope (repeatable; Entra default: https://cognitiveservices.azure.com/.default).
+    #[arg(long = "scope", value_name = "SCOPE")]
+    pub scopes: Vec<String>,
+    /// With --auth azure-entra: the tenant (with --client-id: client credentials; without both:
+    /// `az account get-access-token`).
+    #[arg(long, value_name = "ID")]
+    pub tenant_id: Option<String>,
+    /// OpenAI's OpenAI-Organization header.
+    #[arg(long, value_name = "ORG")]
+    pub organization: Option<String>,
+    /// OpenAI's OpenAI-Project header.
+    #[arg(long, value_name = "PROJECT")]
+    pub project: Option<String>,
+    /// A query parameter on every request, NAME=VALUE (repeatable), e.g. api-version=2024-10-21.
+    #[arg(long = "query", value_name = "NAME=VALUE")]
+    pub query: Vec<String>,
+    /// A PEM bundle of extra CA certificates for the endpoint (added to the OS trust store).
+    #[arg(long, value_name = "PEM")]
+    pub ca_file: Option<PathBuf>,
+    /// mTLS: the client certificate (PEM).
+    #[arg(long, value_name = "PEM")]
+    pub client_cert: Option<PathBuf>,
+    /// mTLS: the client key (PEM). With --store-client-key it is copied into the OS keychain and
+    /// config.toml keeps no path to it.
+    #[arg(long, value_name = "PEM", requires = "client_cert")]
+    pub client_key: Option<PathBuf>,
+    /// Keep the --client-key in the OS keychain (provider:<id>:client-key) instead of on disk.
+    #[arg(long, requires = "client_key")]
+    pub store_client_key: bool,
+    /// The proxy for this endpoint (http://proxy:3128), or `direct`. Default: HTTPS_PROXY/NO_PROXY.
+    #[arg(long, value_name = "URL")]
+    pub proxy: Option<String>,
     /// Print a JSON summary (never a secret).
     #[arg(long)]
     pub json: bool,
@@ -126,6 +180,15 @@ pub struct DisconnectArgs {
 // ---------------------------------------------------------------------------------------------
 // Words shared with setup
 // ---------------------------------------------------------------------------------------------
+
+/// What to ask for, for `p`: its key, or its client secret (OAuth / Entra client credentials).
+pub fn key_prompt_for(p: &ProviderConfig, name: &str) -> String {
+    if p.auth.key_word() == "client secret" {
+        format!("{name} client secret (kept in the OS keychain)")
+    } else {
+        key_prompt(&p.id, name)
+    }
+}
 
 /// What to ask for: the key and where to get one.
 pub fn key_prompt(id: &str, name: &str) -> String {
@@ -289,6 +352,195 @@ pub struct CustomSpec {
     pub model_specs: BTreeMap<String, toml::Table>,
     /// One more comment line in the table (e.g. which org preset wrote it).
     pub note: Option<String>,
+    /// Auth, OpenAI org/project, query, TLS and proxy settings (#2277).
+    pub auth: AuthSpec,
+}
+
+/// A custom provider's auth and transport settings, as written to its table (#2277). Only the
+/// mTLS key PEM is secret: it goes to the keychain (`provider:<id>:client-key`), never the file.
+#[derive(Clone, Default)]
+pub struct AuthSpec {
+    /// The `auth` word; empty: bearer (or `none` when there is no key).
+    pub kind: String,
+    pub auth_header: Option<String>,
+    pub auth_command: Vec<String>,
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+    pub scopes: Vec<String>,
+    pub tenant_id: Option<String>,
+    pub authority_host: Option<String>,
+    pub auth_command_timeout_secs: Option<u64>,
+    pub organization: Option<String>,
+    pub project: Option<String>,
+    pub query: BTreeMap<String, String>,
+    pub ca_file: Option<String>,
+    pub client_cert: Option<String>,
+    pub client_key: Option<String>,
+    pub proxy: Option<String>,
+    /// The mTLS private key (PEM) to keep in the keychain. Never written to a file or shown.
+    pub client_key_pem: Option<String>,
+}
+
+impl std::fmt::Debug for AuthSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthSpec")
+            .field("kind", &self.kind)
+            .field("auth_header", &self.auth_header)
+            .field("auth_command", &self.auth_command)
+            .field("token_url", &self.token_url)
+            .field("client_id", &self.client_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("query", &self.query)
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl AuthSpec {
+    /// Whether the provider takes a key (or client secret) with this auth; `default` for bearer.
+    fn needs_key(&self, default: bool) -> bool {
+        match self.kind.as_str() {
+            "" | "bearer" | "key" => default,
+            "none" | "command" => false,
+            "azure-entra" | "entra" => self.client_id.is_some() && self.auth_command.is_empty(),
+            _ => true,
+        }
+    }
+
+    /// The TOML lines (no secret in them).
+    fn lines(&self, needs_key: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let kv = |k: &str, v: &str| format!("{k} = {}", toml_string(v));
+        let list = |v: &[String]| {
+            format!(
+                "[{}]",
+                v.iter()
+                    .map(|s| toml_string(s))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        match self.kind.as_str() {
+            "" | "bearer" | "key" if !needs_key => out.push("auth = \"none\"".to_owned()),
+            "" | "bearer" | "key" => {}
+            other => out.push(kv("auth", other)),
+        }
+        if let Some(h) = &self.auth_header {
+            out.push(kv("auth_header", h));
+        }
+        if !self.auth_command.is_empty() {
+            out.push(format!("auth_command = {}", list(&self.auth_command)));
+        }
+        if let Some(t) = self.auth_command_timeout_secs {
+            out.push(format!("auth_command_timeout_secs = {t}"));
+        }
+        for (k, v) in [
+            ("token_url", &self.token_url),
+            ("client_id", &self.client_id),
+            ("tenant_id", &self.tenant_id),
+            ("authority_host", &self.authority_host),
+            ("organization", &self.organization),
+            ("project", &self.project),
+        ] {
+            if let Some(v) = v {
+                out.push(kv(k, v));
+            }
+        }
+        if !self.scopes.is_empty() {
+            out.push(format!("scopes = {}", list(&self.scopes)));
+        }
+        if !self.query.is_empty() {
+            let pairs: Vec<String> = self
+                .query
+                .iter()
+                .map(|(k, v)| format!("{} = {}", toml_string(k), toml_string(v)))
+                .collect();
+            out.push(format!("query = {{ {} }}", pairs.join(", ")));
+        }
+        for (k, v) in [
+            ("ca_file", &self.ca_file),
+            ("client_cert", &self.client_cert),
+            ("client_key", &self.client_key),
+            ("proxy", &self.proxy),
+        ] {
+            if let Some(v) = v {
+                out.push(kv(k, v));
+            }
+        }
+        out
+    }
+
+    /// From connect's flags. `None` when no auth flag was given.
+    pub(crate) fn from_args(args: &ConnectArgs) -> Result<Self, String> {
+        let mut a = AuthSpec {
+            kind: args
+                .auth
+                .as_deref()
+                .map(|k| k.trim().to_ascii_lowercase())
+                .unwrap_or_default(),
+            auth_header: args.auth_header.clone(),
+            auth_command: args
+                .auth_command
+                .as_deref()
+                .map(|c| c.split_whitespace().map(str::to_owned).collect())
+                .unwrap_or_default(),
+            token_url: args.token_url.clone(),
+            client_id: args.client_id.clone(),
+            scopes: args.scopes.clone(),
+            tenant_id: args.tenant_id.clone(),
+            organization: args.organization.clone(),
+            project: args.project.clone(),
+            ca_file: args.ca_file.as_ref().map(|p| absolute(p)),
+            client_cert: args.client_cert.as_ref().map(|p| absolute(p)),
+            client_key: args.client_key.as_ref().map(|p| absolute(p)),
+            proxy: args.proxy.clone(),
+            ..AuthSpec::default()
+        };
+        for q in &args.query {
+            let (k, v) = q
+                .split_once('=')
+                .ok_or_else(|| format!("--query {q}: expected NAME=VALUE"))?;
+            if secret_name(k) || secret_value(v) {
+                return Err(format!(
+                    "--query {}: that looks like a secret; query parameters are written to \
+                     config.toml (use --auth header for a key)",
+                    k.trim()
+                ));
+            }
+            a.query.insert(k.trim().to_owned(), v.trim().to_owned());
+        }
+        if args.store_client_key
+            && let Some(path) = &args.client_key
+        {
+            let pem = std::fs::read_to_string(path)
+                .map_err(|e| format!("--client-key {}: {e}", path.display()))?;
+            if !pem.contains("PRIVATE KEY-----") {
+                return Err(format!(
+                    "--client-key {}: no PEM private key in it",
+                    path.display()
+                ));
+            }
+            a.client_key_pem = Some(pem);
+            a.client_key = None;
+        }
+        Ok(a)
+    }
+
+    /// Whether any flag set something.
+    pub(crate) fn is_set(&self) -> bool {
+        !self.lines(true).is_empty() || self.client_key_pem.is_some()
+    }
+}
+
+/// A path as an absolute string (config.toml is read from elsewhere).
+fn absolute(p: &std::path::Path) -> String {
+    std::path::absolute(p)
+        .unwrap_or_else(|_| p.to_path_buf())
+        .display()
+        .to_string()
 }
 
 impl Default for CustomSpec {
@@ -305,6 +557,7 @@ impl Default for CustomSpec {
             models: Vec::new(),
             model_specs: BTreeMap::new(),
             note: None,
+            auth: AuthSpec::default(),
         }
     }
 }
@@ -333,12 +586,13 @@ impl CustomSpec {
         }
         t.push_str(&format!("api = {}\n", toml_string(self.api.as_str())));
         t.push_str(&format!("base_url = {}\n", toml_string(&self.base_url)));
-        if self.needs_key {
-            if let Some(var) = &self.key_env {
-                t.push_str(&format!("key_env = {}\n", toml_string(var)));
-            }
-        } else {
-            t.push_str("auth = \"none\"\n");
+        let needs_key = self.auth.needs_key(self.needs_key);
+        if needs_key && let Some(var) = &self.key_env {
+            t.push_str(&format!("key_env = {}\n", toml_string(var)));
+        }
+        for line in self.auth.lines(self.needs_key) {
+            t.push_str(&line);
+            t.push('\n');
         }
         if !self.headers.is_empty() {
             let pairs: Vec<String> = self
@@ -404,9 +658,24 @@ impl CustomSpec {
     }
 }
 
-/// Every secret this connect stores, keyed as [`StaticKeys`] looks them up.
-fn static_keys(id: &str, key: &str, secret_headers: &BTreeMap<String, String>) -> StaticKeys {
+/// Every secret this connect stores, keyed as [`StaticKeys`] looks them up. `client_key`: an mTLS
+/// key PEM about to be stored (#2277); without one, a key already in the keychain is used.
+pub(crate) fn static_keys(
+    id: &str,
+    key: &str,
+    secret_headers: &BTreeMap<String, String>,
+    client_key: Option<&str>,
+) -> StaticKeys {
     let mut map = BTreeMap::new();
+    let client_key = client_key.map(str::to_owned).or_else(|| {
+        match SystemKeys::from_env().provider_secret(id, CLIENT_KEY_SECRET) {
+            amp_core::providers::KeychainKey::Found(pem) => Some(pem),
+            _ => None,
+        }
+    });
+    if let Some(pem) = client_key {
+        map.insert(format!("{id}:{CLIENT_KEY_SECRET}"), pem);
+    }
     if !key.is_empty() {
         map.insert(id.to_owned(), key.to_owned());
     }
@@ -431,7 +700,18 @@ pub(crate) fn store_secrets(
     secret_headers: &BTreeMap<String, String>,
     key_env: Option<&str>,
 ) -> Result<(), String> {
-    if key.is_empty() && secret_headers.is_empty() {
+    store_all_secrets(id, key, secret_headers, None, key_env)
+}
+
+/// [`store_secrets`] plus an mTLS key PEM (`provider:<id>:client-key`, #2277).
+pub(crate) fn store_all_secrets(
+    id: &str,
+    key: &str,
+    secret_headers: &BTreeMap<String, String>,
+    client_key: Option<&str>,
+    key_env: Option<&str>,
+) -> Result<(), String> {
+    if key.is_empty() && secret_headers.is_empty() && client_key.is_none() {
         return Ok(());
     }
     let service = setup::keychain_for_keys().map_err(|why| {
@@ -448,6 +728,10 @@ pub(crate) fn store_secrets(
         amp_mcp::keychain_set(&service, &header_account(id, name), value)
             .map_err(|e| e.to_string())?;
     }
+    if let Some(pem) = client_key {
+        amp_mcp::keychain_set(&service, &secret_account(id, CLIENT_KEY_SECRET), pem)
+            .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -456,8 +740,9 @@ pub(crate) async fn list_models(
     p: &ProviderConfig,
     key: &str,
     secret_headers: &BTreeMap<String, String>,
+    client_key: Option<&str>,
 ) -> Result<Vec<String>, String> {
-    let keys = static_keys(&p.id, key, secret_headers);
+    let keys = static_keys(&p.id, key, secret_headers, client_key);
     live_model_ids(p, &keys)
         .await
         .map(|ids| ids.into_iter().collect())
@@ -505,6 +790,9 @@ pub struct ListedProvider {
     pub builtin: bool,
     /// Roles that run on it.
     pub roles: Vec<String>,
+    /// How requests authenticate (#2277): bearer, header, none, command,
+    /// oauth-client-credentials, azure-entra.
+    pub auth: &'static str,
 }
 
 pub fn list_providers(
@@ -539,6 +827,7 @@ pub fn list_providers(
                 secret_headers: headers,
                 builtin: shipped.contains(&p.id),
                 roles: by_provider.get(&p.id).cloned().unwrap_or_default(),
+                auth: p.auth.name(),
             }
         })
         .collect()
@@ -668,20 +957,60 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         }
     }
     if spec.is_none() && !provider.needs_key && provider.secret_headers.is_empty() {
+        if provider.auth.is_token() {
+            // #2277: nothing to store; say whether a token can be had and is accepted.
+            let check = setup::check_key(&provider, "", &BTreeMap::new()).await;
+            ui.say(&format!(
+                "{name} ({}) authenticates with a {}: there is no key to store.",
+                provider.id,
+                provider.auth.describe()
+            ));
+            ui.say(&format!("  {}", check_note(&name, &check)));
+            return match check {
+                KeyCheck::Rejected(status) => Err(CliError::new(format!(
+                    "{name} refused the token (HTTP {status})"
+                ))),
+                _ => Ok(()),
+            };
+        }
         return Err(CliError::usage(format!(
-            "{name} ({}) needs no key (auth = \"none\")",
-            provider.id
+            "{name} ({}) needs no key (auth = \"{}\")",
+            provider.id,
+            provider.auth.name()
         )));
     }
 
     // The key: hidden in a terminal, else one line of stdin.
-    let keyless_ok = spec.as_ref().is_some_and(|s| s.id != "openai");
+    let keyless_ok = spec
+        .as_ref()
+        .is_some_and(|s| s.id != "openai" && provider.auth == ProviderAuth::Bearer);
     let extra = spec
         .as_ref()
         .map(|s| s.secret_headers.clone())
         .unwrap_or_default();
-    let (key, check, key_from_env) =
-        read_and_check_key(&args, ui, &provider, &name, keyless_ok, &extra).await?;
+    let client_key = spec.as_ref().and_then(|s| s.auth.client_key_pem.clone());
+    let (key, check, key_from_env) = if spec.is_some() && !provider.needs_key {
+        // #2277: none or a token command: no key to read; check the endpoint (and the token).
+        let check = setup::check_key_full(&provider, "", &extra, client_key.as_deref()).await;
+        ui.say(&format!("  {}", check_note(&name, &check)));
+        if let KeyCheck::Rejected(status) = check {
+            return Err(CliError::new(format!(
+                "{name} refused the request (HTTP {status}); nothing was stored"
+            )));
+        }
+        (String::new(), check, false)
+    } else {
+        read_and_check_key(
+            &args,
+            ui,
+            &provider,
+            &name,
+            keyless_ok,
+            &extra,
+            client_key.as_deref(),
+        )
+        .await?
+    };
     // A custom endpoint that takes no key.
     if key.is_empty()
         && let Some(s) = spec.as_mut()
@@ -692,7 +1021,15 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
     // Model ids for a new provider.
     if let Some(s) = spec.as_mut() {
         let provider = s.config().map_err(CliError::new)?;
-        s.models = pick_models(&args, ui, &provider, &key, &s.secret_headers).await?;
+        s.models = pick_models(
+            &args,
+            ui,
+            &provider,
+            &key,
+            &s.secret_headers,
+            client_key.as_deref(),
+        )
+        .await?;
     }
     // --role: checked against the provider's models before anything is stored.
     let assignment = if role_pairs.is_empty() {
@@ -711,8 +1048,21 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         .and_then(|s| s.key_env.clone())
         .or(provider.key_env.clone());
     let stored_key = if key_from_env { "" } else { key.as_str() };
-    store_secrets(&provider.id, stored_key, &extra, key_env.as_deref())
-        .map_err(|e| CliError::new(format!("store the {name} key: {e}")))?;
+    store_all_secrets(
+        &provider.id,
+        stored_key,
+        &extra,
+        client_key.as_deref(),
+        key_env.as_deref(),
+    )
+    .map_err(|e| CliError::new(format!("store the {name} key: {e}")))?;
+    if client_key.is_some() {
+        ui.say(&format!(
+            "Stored the mTLS client key in the OS keychain (account {}); config.toml keeps no \
+             path to it.",
+            secret_account(&provider.id, CLIENT_KEY_SECRET)
+        ));
+    }
     let mut summary = ConnectSummary {
         provider: provider.id.clone(),
         name: name.clone(),
@@ -888,6 +1238,7 @@ fn pick_target(
     cfg: &ModelsConfig,
     ui: &mut dyn Ui,
 ) -> Result<Target, CliError> {
+    let auth_flags = AuthSpec::from_args(args).map_err(CliError::usage)?.is_set();
     let custom_flags = args.base_url.is_some() || args.api.is_some() || args.name.is_some();
     let chosen = match &args.provider {
         Some(p) => p.trim().to_owned(),
@@ -903,10 +1254,10 @@ fn pick_target(
     };
     let shipped = shipped_ids();
     if chosen == CUSTOM {
-        return custom_target(args, ui, None).map(Target::New);
+        return custom_target(args, ui, None, None).map(Target::New);
     }
     if let Some(p) = cfg.providers.get(&chosen) {
-        if custom_flags {
+        if custom_flags || (auth_flags && !shipped.contains(&chosen)) {
             if shipped.contains(&chosen) {
                 return Err(CliError::usage(format!(
                     "{chosen} is built in: --base-url/--api/--name are for custom providers \
@@ -914,13 +1265,21 @@ fn pick_target(
                 )));
             }
             // Redefine a provider this person added before.
-            return custom_target(args, ui, Some(&chosen)).map(Target::New);
+            return custom_target(args, ui, Some(&chosen), Some(p)).map(Target::New);
+        }
+        if auth_flags {
+            return Err(CliError::usage(format!(
+                "{chosen} is built in: --auth, --query, --ca-file and the other endpoint flags are \
+                 for custom providers (add `[providers.{chosen}]` settings to config.toml instead)"
+            )));
         }
         return Ok(Target::Known(p.clone()));
     }
     if chosen == "openai" && !custom_flags {
         let mut spec = openai_preset();
         spec.models = args.models.clone();
+        // #2277: --organization / --project (and a proxy or CA) on the OpenAI preset.
+        spec.auth = AuthSpec::from_args(args).map_err(CliError::usage)?;
         return Ok(Target::New(spec));
     }
     valid_id(&chosen).map_err(CliError::usage)?;
@@ -930,7 +1289,7 @@ fn pick_target(
              openai-completions|anthropic-messages] [--name NAME]"
         )));
     }
-    custom_target(args, ui, Some(&chosen)).map(Target::New)
+    custom_target(args, ui, Some(&chosen), None).map(Target::New)
 }
 
 fn picker(cfg: &ModelsConfig, ui: &mut dyn Ui) -> Result<String, CliError> {
@@ -1000,6 +1359,7 @@ fn custom_target(
     args: &ConnectArgs,
     ui: &mut dyn Ui,
     id: Option<&str>,
+    existing: Option<&ProviderConfig>,
 ) -> Result<CustomSpec, CliError> {
     let interactive = ui.interactive();
     let ask_or = |ui: &mut dyn Ui, flag: &str, prompt: &str, default: Option<&str>| {
@@ -1013,6 +1373,7 @@ fn custom_target(
     };
     let name = match &args.name {
         Some(n) => Some(n.trim().to_owned()),
+        None if existing.is_some() => existing.and_then(|p| p.name.clone()),
         None if interactive => {
             let n = ui.ask("Display name", id)?;
             Some(n.trim().to_owned()).filter(|n| !n.is_empty())
@@ -1042,6 +1403,8 @@ fn custom_target(
     let base_url = match &args.base_url {
         // #2275: `api.example.com` is https://api.example.com/v1.
         Some(u) => crate::setup::endpoint::normalize_base_url(u).map_err(CliError::usage)?,
+        // #2277: changing only the auth of a provider added before keeps its address.
+        None if existing.is_some() => existing.map(|p| p.base_url.clone()).unwrap_or_default(),
         None => loop {
             let a = ask_or(
                 ui,
@@ -1057,6 +1420,7 @@ fn custom_target(
     };
     let api = match &args.api {
         Some(a) => parse_api(a).map_err(CliError::usage)?,
+        None if existing.is_some() => existing.map_or(ProviderApi::OpenaiCompletions, |p| p.api),
         None if interactive => {
             ui.say("API style:");
             ui.say("  1) openai-completions — OpenAI-compatible chat completions (most endpoints)");
@@ -1082,8 +1446,26 @@ fn custom_target(
         base_url,
         api,
         models: args.models.clone(),
+        auth: AuthSpec::from_args(args).map_err(CliError::usage)?,
         ..CustomSpec::default()
     };
+    // #2277: re-adding a provider to change its auth keeps its headers (secret values stay in
+    // the keychain and are written back unchanged).
+    if let Some(p) = existing {
+        for (k, v) in &p.headers {
+            if !k.eq_ignore_ascii_case("OpenAI-Organization")
+                && !k.eq_ignore_ascii_case("OpenAI-Project")
+            {
+                spec.headers.insert(k.clone(), v.clone());
+            }
+        }
+        if let Ok(values) = resolve_secret_headers(p, &SystemKeys::from_env()) {
+            spec.secret_headers = values;
+        }
+        if spec.key_env.is_some() && p.key_env.is_some() {
+            spec.key_env = p.key_env.clone();
+        }
+    }
     for h in &args.headers {
         let (k, v) = h
             .split_once('=')
@@ -1100,7 +1482,7 @@ fn custom_target(
         }
         spec.headers.insert(k.to_owned(), v.to_owned());
     }
-    if interactive && args.headers.is_empty() {
+    if interactive && args.headers.is_empty() && existing.is_none() {
         loop {
             let name = ui.ask("Extra header name (Enter for none)", Some(""))?;
             let name = name.trim().trim_end_matches(':').to_owned();
@@ -1138,6 +1520,7 @@ async fn read_and_check_key(
     name: &str,
     custom_without_key_ok: bool,
     extra: &BTreeMap<String, String>,
+    client_key: Option<&str>,
 ) -> Result<(String, KeyCheck, bool), CliError> {
     // #2275: no terminal and no --key-stdin, but the key is in the provider's variable (the
     // headless path): check it and keep it there; nothing is stored.
@@ -1152,7 +1535,7 @@ async fn read_and_check_key(
         ui.say(&format!(
             "Using the {name} key in {var} (it stays in the environment; nothing is stored)."
         ));
-        let check = setup::check_key(provider, &key, extra).await;
+        let check = setup::check_key_full(provider, &key, extra, client_key).await;
         ui.say(&format!("  {}", check_note(name, &check)));
         if let KeyCheck::Rejected(status) = check {
             return Err(CliError::new(format!(
@@ -1169,7 +1552,7 @@ async fn read_and_check_key(
                 .map_err(|e| CliError::new(format!("read the key from stdin: {e}")))?;
             line.lines().next().unwrap_or("").trim().to_owned()
         } else if ui.interactive() {
-            let prompt = key_prompt(&provider.id, name);
+            let prompt = key_prompt_for(provider, name);
             let suffix = if custom_without_key_ok {
                 ", Enter if the endpoint needs none"
             } else {
@@ -1185,7 +1568,7 @@ async fn read_and_check_key(
         if key.is_empty() {
             if custom_without_key_ok && attempt == 0 {
                 ui.say(&format!("No key: {name} will be called without one."));
-                let check = setup::check_key(provider, "", extra).await;
+                let check = setup::check_key_full(provider, "", extra, client_key).await;
                 return Ok((String::new(), check, false));
             }
             return Err(CliError::usage(format!(
@@ -1199,7 +1582,7 @@ async fn read_and_check_key(
             ui.say(&format!("  {why}"));
             continue;
         }
-        let check = setup::check_key(provider, &key, extra).await;
+        let check = setup::check_key_full(provider, &key, extra, client_key).await;
         ui.say(&format!("  {}", check_note(name, &check)));
         if let KeyCheck::Rejected(status) = check {
             if args.key_stdin || !ui.interactive() {
@@ -1223,11 +1606,12 @@ async fn pick_models(
     p: &ProviderConfig,
     key: &str,
     secret_headers: &BTreeMap<String, String>,
+    client_key: Option<&str>,
 ) -> Result<Vec<String>, CliError> {
     if !args.models.is_empty() {
         return Ok(args.models.clone());
     }
-    let listed = list_models(p, key, secret_headers).await;
+    let listed = list_models(p, key, secret_headers, client_key).await;
     if !ui.interactive() {
         return match listed {
             Ok(ids) if !ids.is_empty() && ids.len() <= MAX_AUTO_MODELS => Ok(ids),
@@ -1724,7 +2108,7 @@ impl ChatConnect {
             ));
         }
         if let Some(s) = spec.as_mut() {
-            let ids = list_models(&provider, &key, &BTreeMap::new())
+            let ids = list_models(&provider, &key, &BTreeMap::new(), None)
                 .await
                 .map_err(|e| {
                     format!(

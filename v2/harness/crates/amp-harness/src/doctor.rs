@@ -735,6 +735,21 @@ fn print_models(m: &providers::ModelsReport) {
             "  provider: {}{name} {} (key: {})",
             p.id, p.base_url, p.key_source
         );
+        // #2277: how it authenticates (never a secret), and what TLS/proxy settings apply.
+        let mut auth = format!("            auth: {}", p.auth_detail);
+        if let Some(at) = &p.token_expires {
+            auth.push_str(&format!(", token valid until {at}"));
+        }
+        if let Some(ca) = &p.ca_file {
+            auth.push_str(&format!("; CA file {ca}"));
+        }
+        if let Some(cert) = &p.client_cert {
+            auth.push_str(&format!("; client certificate {cert}"));
+        }
+        if let Some(proxy) = &p.proxy {
+            auth.push_str(&format!("; proxy {proxy}"));
+        }
+        println!("{auth}");
     }
     let width = m.roles.iter().map(|r| r.role.len()).max().unwrap_or(0);
     for (i, r) in m.roles.iter().enumerate() {

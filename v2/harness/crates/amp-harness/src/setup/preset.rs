@@ -16,7 +16,12 @@
 //! name = "Example AI"
 //! base_url = "https://api.example.com/v1"  # api.example.com works too
 //! models = ["engineer", "orchestrator"]    # or [providers.example.models.engineer] tables
-//! # api = "openai-completions"   auth = "key" | "none"   key_env = "EXAMPLE_API_KEY"
+//! # api = "openai-completions"   key_env = "EXAMPLE_API_KEY"
+//! # auth = "bearer" (or "key") | "header" | "none" | "command" | "oauth-client-credentials"
+//! #        | "azure-entra"   (#2277; with auth_header, auth_command, token_url, client_id,
+//! #        scopes, tenant_id, authority_host as config.toml takes them; secrets are asked)
+//! # organization = "org-..."  project = "proj_..."  query = { "api-version" = "2024-10-21" }
+//! # ca_file = "/etc/ssl/corp-ca.pem"  client_cert = "..."  client_key = "..."  proxy = "..."
 //! # headers = { "X-Team" = "platform" }    secret_headers = ["X-Api-Key"]  (values asked)
 //!
 //! [roles]                                  # a group, a role or `default` -> model
@@ -88,8 +93,27 @@ pub struct PresetProvider {
     pub name: Option<String>,
     pub base_url: String,
     pub api: Option<String>,
-    /// `key` (default) or `none`.
+    /// `bearer`/`key` (default), `header`, `none`, `command`, `oauth-client-credentials`,
+    /// `azure-entra` (#2277).
     pub auth: Option<String>,
+    pub auth_header: Option<String>,
+    pub auth_command: Option<Vec<String>>,
+    pub auth_command_timeout_secs: Option<u64>,
+    pub token_url: Option<String>,
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub tenant_id: Option<String>,
+    pub authority_host: Option<String>,
+    pub organization: Option<String>,
+    pub project: Option<String>,
+    #[serde(default)]
+    pub query: BTreeMap<String, String>,
+    /// Paths on each person's machine (no key material: that is refused).
+    pub ca_file: Option<String>,
+    pub client_cert: Option<String>,
+    pub client_key: Option<String>,
+    pub proxy: Option<String>,
     pub key_env: Option<String>,
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
@@ -185,6 +209,8 @@ fn secret_setting(name: &str) -> bool {
     if matches!(
         n.as_str(),
         "key_env" | "secret_headers" | "secret_env" | "bearer_env" | "client_secret"
+            // #2277: a path to a key file, not a key (PEM content is refused below).
+            | "client_key" | "auth_header"
     ) {
         return false;
     }
@@ -241,7 +267,9 @@ fn refuse_secrets(source: &str, path: &str, value: &toml::Value) -> Result<(), C
                 refuse_secrets(source, &format!("{path}[{i}]"), v)?;
             }
         }
-        toml::Value::String(s) if mcp_config::looks_secret_value(s) => {
+        toml::Value::String(s)
+            if mcp_config::looks_secret_value(s) || s.contains("PRIVATE KEY-----") =>
+        {
             return Err(bad(
                 source,
                 format!("`{path}` looks like a secret: {advice}"),
@@ -322,10 +350,51 @@ pub fn check(text: &str, source: &str) -> Result<Checked, CliError> {
             }
             None => amp_core::models::ProviderApi::OpenaiCompletions,
         };
-        let needs_key = match p.auth.as_deref().map(str::trim) {
-            None | Some("key") => true,
-            Some("none") => false,
-            Some(_) => return Err(bad(source, format!("`{}`: key or none", key("auth")))),
+        let kind = p
+            .auth
+            .as_deref()
+            .map(|a| a.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        let needs_key = kind != "none";
+        let kind = if kind == "none" || kind == "key" {
+            String::new()
+        } else {
+            kind
+        };
+        for (k, url) in [
+            ("token_url", &p.token_url),
+            ("authority_host", &p.authority_host),
+        ] {
+            if let Some(url) = url {
+                secure_url(source, &key(k), url)?;
+            }
+        }
+        if let Some(cmd) = &p.auth_command
+            && cmd.iter().any(|a| mcp_config::looks_secret_value(a))
+        {
+            return Err(bad(
+                source,
+                format!("`{}` looks like it holds a secret", key("auth_command")),
+            ));
+        }
+        let auth = connect::AuthSpec {
+            kind,
+            auth_header: p.auth_header.clone(),
+            auth_command: p.auth_command.clone().unwrap_or_default(),
+            token_url: p.token_url.clone(),
+            client_id: p.client_id.clone(),
+            scopes: p.scopes.clone(),
+            tenant_id: p.tenant_id.clone(),
+            organization: p.organization.clone(),
+            project: p.project.clone(),
+            query: p.query.clone(),
+            ca_file: p.ca_file.clone(),
+            client_cert: p.client_cert.clone(),
+            client_key: p.client_key.clone(),
+            proxy: p.proxy.clone(),
+            authority_host: p.authority_host.clone(),
+            auth_command_timeout_secs: p.auth_command_timeout_secs,
+            client_key_pem: None,
         };
         if let Some(var) = &p.key_env
             && (var.is_empty()
@@ -386,6 +455,7 @@ pub fn check(text: &str, source: &str) -> Result<Checked, CliError> {
                     .map(|n| format!(" \"{n}\""))
                     .unwrap_or_default()
             )),
+            auth,
         };
         // It must load as config.toml would (model settings included).
         spec.config().map_err(|e| {
@@ -680,5 +750,76 @@ mod tests {
         );
         let doc: toml::Table = toml::from_str(&block).unwrap();
         assert_eq!(doc["mcp"]["fs"]["command"].as_str(), Some("npx"));
+    }
+
+    #[test]
+    fn auth_and_transport_settings_round_trip_and_key_material_is_refused() {
+        let text = "[providers.az]\nbase_url = \"https://r.openai.azure.com/openai/deployments/{model}\"\n\
+                    auth = \"header\"\nquery = { \"api-version\" = \"2024-10-21\" }\n\
+                    models = [\"gpt-4o\"]\n\
+                    [providers.sso]\nbase_url = \"https://gw.example/v1\"\nauth = \"command\"\n\
+                    auth_command = [\"corp-sso\", \"token\", \"--json\"]\n\
+                    ca_file = \"/etc/ssl/corp-ca.pem\"\nclient_cert = \"/etc/ssl/me.pem\"\n\
+                    client_key = \"/etc/ssl/me.key\"\nproxy = \"http://proxy.example:3128\"\n\
+                    organization = \"org-1\"\nmodels = [\"m\"]\n\
+                    [providers.ent]\nbase_url = \"https://e.openai.azure.com/openai/v1\"\n\
+                    auth = \"azure-entra\"\ntenant_id = \"t-1\"\nclient_id = \"app-1\"\n\
+                    models = [\"gpt-4o\"]\n\
+                    [providers.cc]\nbase_url = \"https://cc.example/v1\"\n\
+                    auth = \"oauth-client-credentials\"\ntoken_url = \"https://idp.example/token\"\n\
+                    client_id = \"amp\"\nscopes = [\"api://cc/.default\"]\nmodels = [\"m\"]\n";
+        let checked = check(text, "p.toml").unwrap();
+        let by_id = |id: &str| {
+            checked
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap()
+                .config()
+                .unwrap()
+        };
+        let az = by_id("az");
+        assert_eq!(az.auth.name(), "header");
+        assert_eq!(az.query["api-version"], "2024-10-21");
+        let sso = by_id("sso");
+        assert_eq!(sso.auth.name(), "command");
+        assert!(!sso.needs_key);
+        assert_eq!(
+            sso.tls.client_key.as_deref(),
+            Some(std::path::Path::new("/etc/ssl/me.key"))
+        );
+        assert_eq!(sso.headers["OpenAI-Organization"], "org-1");
+        let ent = by_id("ent");
+        assert!(ent.needs_key, "the client secret is asked at setup");
+        assert_eq!(ent.auth.key_word(), "client secret");
+        assert!(by_id("cc").needs_key);
+
+        let pem = "-----BEGIN PRIVATE KEY-----\\nMIIEvQ\\n-----END PRIVATE KEY-----";
+        for (bad, want) in [
+            (
+                format!("{OK_PROVIDER}client_cert = \"/c.pem\"\nclient_key = \"{pem}\"\n"),
+                "`providers.ex.client_key` looks like a secret",
+            ),
+            (
+                format!(
+                    "{OK_PROVIDER}auth = \"command\"\nauth_command = [\"t\", \"sk-abcdefghijklmnopqrstuvwx1234\"]\n"
+                ),
+                "looks like a secret",
+            ),
+            (
+                format!(
+                    "{OK_PROVIDER}auth = \"oauth-client-credentials\"\ntoken_url = \"http://idp.example/t\"\nclient_id = \"a\"\n"
+                ),
+                "only https://",
+            ),
+            (
+                format!("{OK_PROVIDER}auth = \"magic\"\n"),
+                "unknown auth `magic`",
+            ),
+        ] {
+            let e = err(&bad);
+            assert!(e.contains(want), "{bad}: {e}");
+            assert!(!e.contains("MIIEvQ") && !e.contains("sk-abcdef"), "{e}");
+        }
     }
 }

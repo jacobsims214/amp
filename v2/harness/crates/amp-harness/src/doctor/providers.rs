@@ -8,12 +8,18 @@
 //!   lookup as `config show --check`). An unreadable catalog warns; `--offline` skips it.
 //!
 //! Keys are described by their source only, never by value.
+//!
+//! #2277: each provider's auth type is shown (bearer, header, none, command, OAuth client
+//! credentials, Entra) with the token's expiry for token auth; the catalog call goes through the
+//! provider's own transport (CA file, mTLS, proxy, query) and auth, and a refused key or token, a
+//! TLS failure or a token that could not be had gets the fix that applies.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
     models::{ModelsConfig, Selection},
-    providers::{KeyLookup, KeySource, live_model_ids, resolve_key},
+    provider_auth::{self, ProbeFailure, ProbeKind},
+    providers::{KeyLookup, KeySource, resolve_key},
 };
 use serde::Serialize;
 
@@ -62,6 +68,17 @@ pub struct ProviderReport {
     pub base_url: String,
     /// `env`, `keychain`, `not-needed` or `missing`.
     pub key: &'static str,
+    /// How requests authenticate (#2277): bearer, header, none, command,
+    /// oauth-client-credentials, azure-entra.
+    pub auth: &'static str,
+    /// The auth in words (the header name, the command, the client id; never a secret).
+    pub auth_detail: String,
+    /// When the token doctor fetched expires (`YYYY-MM-DD HH:MM:SS UTC`), for token auth.
+    pub token_expires: Option<String>,
+    /// Extra CA file / mTLS certificate / proxy, when configured.
+    pub ca_file: Option<String>,
+    pub client_cert: Option<String>,
+    pub proxy: Option<String>,
     /// Where the key came from (never the key).
     pub key_source: String,
     pub roles: Vec<String>,
@@ -192,9 +209,15 @@ pub async fn check(
         let key_finding = if has_key {
             Finding::new(
                 CheckStatus::Ok,
-                match &source {
-                    KeySource::NotNeeded => "no key needed".to_owned(),
-                    other => format!("key from {other}"),
+                match (&source, &provider.auth) {
+                    (KeySource::NotNeeded, auth) if auth.is_token() => {
+                        format!("no key needed: {}", auth.describe())
+                    }
+                    (KeySource::NotNeeded, _) => "no key needed".to_owned(),
+                    (other, amp_core::models::ProviderAuth::Bearer) => format!("key from {other}"),
+                    (other, auth) => {
+                        format!("{} from {other} ({})", auth.key_word(), auth.describe())
+                    }
                 },
             )
         } else {
@@ -223,35 +246,35 @@ pub async fn check(
 
         let mut catalog_checked = false;
         let mut catalog_error = None;
+        let mut token_expires = None;
+        let primary = primary_provider.as_deref() == Some(id.as_str());
         let mut live: BTreeMap<String, Option<bool>> =
             models.keys().map(|m| (m.clone(), None)).collect();
-        let models_finding =
-            if offline {
-                Finding::new(CheckStatus::Skip, "--offline: model catalog not checked")
-            } else if !has_key {
-                Finding::new(CheckStatus::Skip, "no key: model catalog not checked")
-            } else {
-                match live_model_ids(provider, keys).await {
-                    Ok(ids) => {
-                        catalog_checked = true;
-                        for (m, v) in live.iter_mut() {
-                            *v = Some(ids.contains(m));
-                        }
-                        models_finding(&id, &models, &ids, &where_)
+        let models_finding = if offline {
+            Finding::new(CheckStatus::Skip, "--offline: model catalog not checked")
+        } else if !has_key {
+            Finding::new(CheckStatus::Skip, "no key: model catalog not checked")
+        } else {
+            match provider_auth::probe(provider, keys, ProbeKind::Catalog).await {
+                Ok(found) => {
+                    catalog_checked = true;
+                    token_expires = found.token_expires_at.map(provider_auth::format_unix);
+                    let ids = found.ids;
+                    for (m, v) in live.iter_mut() {
+                        *v = Some(ids.contains(m));
                     }
-                    Err(e) => {
-                        catalog_error = Some(e.clone());
-                        Finding::new(
-                        CheckStatus::Warn,
-                        format!("could not read the model catalog at {}: {e}", provider.base_url),
-                    )
-                    .fix(format!(
-                        "check the network and [providers.{id}] base_url, then run `amp-harness \
-                         doctor` again (or `--offline` to skip this check)"
-                    ))
+                    let mut f = models_finding(&id, &models, &ids, &where_);
+                    if let Some(at) = &token_expires {
+                        f.detail.push_str(&format!(" (token valid until {at})"));
                     }
+                    f
                 }
-            };
+                Err(e) => {
+                    catalog_error = Some(e.message.clone());
+                    probe_finding(provider, &e, primary, &where_)
+                }
+            }
+        };
         out.push((format!("models:{id}"), models_finding));
 
         report.providers.push(ProviderReport {
@@ -260,6 +283,23 @@ pub async fn check(
             base_url: provider.base_url.clone(),
             key: source.kind(),
             key_source: source.to_string(),
+            auth: provider.auth.name(),
+            auth_detail: provider.auth.describe(),
+            token_expires,
+            ca_file: provider
+                .tls
+                .ca_file
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            client_cert: provider
+                .tls
+                .client_cert
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            proxy: provider.proxy.as_ref().map(|p| match p {
+                amp_core::models::ProxySetting::Url(u) => u.clone(),
+                amp_core::models::ProxySetting::Direct => "direct".to_owned(),
+            }),
             models: models
                 .iter()
                 .map(|(m, r)| ModelReport {
@@ -309,6 +349,163 @@ fn models_finding(
         "pick a model the provider lists and set it in {where_}, e.g. [roles.{example_role}] \
          model = \"{provider}/<model id>\" (`amp-harness config show --check` shows every role)"
     ))
+}
+
+/// A failed catalog call, with the fix for what failed (#2277). Network trouble stays a warning
+/// (the old wording); a refused key or token, a TLS failure or no token fails for the manager's
+/// provider and warns for others, like a missing key.
+fn probe_finding(
+    p: &amp_core::models::ProviderConfig,
+    e: &provider_auth::ProbeError,
+    primary: bool,
+    where_: &str,
+) -> Finding {
+    let id = &p.id;
+    let serious = if primary {
+        CheckStatus::Fail
+    } else {
+        CheckStatus::Warn
+    };
+    let lower = e.message.to_ascii_lowercase();
+    match e.failure {
+        ProbeFailure::Rejected => {
+            let status = e.status.unwrap_or(401);
+            let (what, fix) = match &p.auth {
+                auth if auth.is_token() => (
+                    format!("the token ({})", auth.describe()),
+                    match auth {
+                        amp_core::models::ProviderAuth::Command { argv, .. } => format!(
+                            "run `{}` yourself and check it prints a current token for this \
+                             endpoint (log in to the tool again if it needs that)",
+                            argv.join(" ")
+                        ),
+                        amp_core::models::ProviderAuth::AzureEntra(_) => format!(
+                            "check that the identity has a role on the resource (Cognitive \
+                             Services OpenAI User) and that [providers.{id}] tenant_id / client_id \
+                             or `az login` are right"
+                        ),
+                        _ => format!(
+                            "check [providers.{id}] client_id and scopes; store a new client \
+                             secret with `amp-harness connect {id}`"
+                        ),
+                    },
+                ),
+                amp_core::models::ProviderAuth::Header { name } => (
+                    format!("the key in the {name} header"),
+                    format!(
+                        "store the right key with `amp-harness connect {id}` (or check that \
+                         {name} is the header the endpoint reads)"
+                    ),
+                ),
+                amp_core::models::ProviderAuth::None => (
+                    "a request without credentials".to_owned(),
+                    format!(
+                        "the endpoint wants credentials: set auth in [providers.{id}] ({where_}) \
+                         and run `amp-harness connect {id}`"
+                    ),
+                ),
+                _ => (
+                    "the key".to_owned(),
+                    format!(
+                        "store a working key with `amp-harness connect {id}` (it is checked \
+                         before it is kept)"
+                    ),
+                ),
+            };
+            let why = if status == 403 {
+                "refused (HTTP 403: authenticated, but not allowed; check the key's permissions \
+                 or the organization/project)"
+                    .to_owned()
+            } else {
+                format!("refused (HTTP {status})")
+            };
+            Finding::new(serious, format!("{} {why} {what}", p.base_url)).fix(fix)
+        }
+        ProbeFailure::Tls => {
+            let mtls = ["certificaterequired", "certificate required", "badcertificate", "bad certificate", "handshakefailure", "unknownca"]
+                .iter()
+                .any(|n| lower.contains(n));
+            let fix = if mtls && p.tls.client_cert.is_none() {
+                format!(
+                    "the endpoint asks for a client certificate (mTLS): `amp-harness connect {id} \
+                     --client-cert <PEM> --client-key <PEM>` (or client_cert / client_key in \
+                     [providers.{id}])"
+                )
+            } else if mtls {
+                format!(
+                    "the endpoint refused the client certificate {}: use one its CA signed",
+                    p.tls
+                        .client_cert
+                        .as_ref()
+                        .map(|c| c.display().to_string())
+                        .unwrap_or_default()
+                )
+            } else if lower.contains("expired") {
+                "the endpoint's certificate (or its CA) has expired: ask its owner to renew it"
+                    .to_owned()
+            } else if lower.contains("notvalidforname") || lower.contains("not valid for name") {
+                format!("its certificate does not name this host: use the host name it was issued for in [providers.{id}] base_url")
+            } else if let Some(ca) = &p.tls.ca_file {
+                format!(
+                    "its certificate is not signed by the CA in {}: export the CA that signed it",
+                    ca.display()
+                )
+            } else {
+                format!(
+                    "its certificate is not signed by a CA this machine trusts: save the \
+                     company CA (PEM) and set ca_file = \"<PEM>\" in [providers.{id}] (or \
+                     `amp-harness connect {id} --ca-file <PEM>`), or add it to the OS trust store"
+                )
+            };
+            Finding::new(serious, format!("TLS to {} failed: {}", p.base_url, e.message)).fix(fix)
+        }
+        ProbeFailure::Token => Finding::new(serious, format!("no token: {}", e.message)).fix(
+            match &p.auth {
+                amp_core::models::ProviderAuth::Command { .. }
+                | amp_core::models::ProviderAuth::AzureEntra(_)
+                    if lower.contains("not found") =>
+                {
+                    let program = match &p.auth {
+                        amp_core::models::ProviderAuth::Command { argv, .. } => argv[0].clone(),
+                        _ => "az".to_owned(),
+                    };
+                    format!("install `{program}` (or put it on PATH), or change auth_command in [providers.{id}]")
+                }
+                amp_core::models::ProviderAuth::AzureEntra(_) => format!(
+                    "run `az login` (or set tenant_id and client_id in [providers.{id}] and store the \
+                     client secret with `amp-harness connect {id}`)"
+                ),
+                amp_core::models::ProviderAuth::Command { .. } => {
+                    "run the auth_command yourself to see why it fails; raise \
+                     auth_command_timeout_secs if it needs longer"
+                        .to_owned()
+                }
+                _ => format!(
+                    "check [providers.{id}] token_url, client_id and scopes, and the client secret \
+                     (`amp-harness connect {id}` stores a new one)"
+                ),
+            },
+        ),
+        ProbeFailure::Config => Finding::new(serious, e.message.clone()).fix(format!(
+            "fix [providers.{id}] in {where_} (`amp-harness config show` checks it)"
+        )),
+        ProbeFailure::Http | ProbeFailure::Network => Finding::new(
+            CheckStatus::Warn,
+            format!(
+                "could not read the model catalog at {}: {}",
+                p.base_url, e.message
+            ),
+        )
+        .fix(format!(
+            "check the network and [providers.{id}] base_url{}, then run `amp-harness doctor` \
+             again (or `--offline` to skip this check)",
+            if p.proxy.is_none() {
+                " (behind a proxy: set HTTPS_PROXY, or proxy in the table)"
+            } else {
+                " and proxy"
+            }
+        )),
+    }
 }
 
 fn key_fix(provider: &str, source: &KeySource, where_: &str) -> String {
@@ -472,6 +669,107 @@ mod tests {
         assert_eq!(
             models_finding("p", &models, &ids, "").status,
             CheckStatus::Ok
+        );
+    }
+
+    #[test]
+    fn failed_probes_get_the_fix_that_applies() {
+        let c = config(
+            "[providers.gw]\napi = \"openai-completions\"\nbase_url = \"https://gw.example/v1\"\n\
+             auth = \"header\"\n[providers.gw.models.\"m\"]\n\
+             [providers.sso]\napi = \"openai-completions\"\nbase_url = \"https://gw.example/v1\"\n\
+             auth = \"command\"\nauth_command = [\"corp-sso\"]\n[providers.sso.models.\"m\"]\n",
+        );
+        let e = |failure, status: Option<u16>, message: &str| provider_auth::ProbeError {
+            failure,
+            status,
+            message: message.to_owned(),
+        };
+        let gw = &c.providers["gw"];
+        let f = probe_finding(
+            gw,
+            &e(ProbeFailure::Rejected, Some(401), "HTTP 401"),
+            true,
+            "c.toml",
+        );
+        assert_eq!(f.status, CheckStatus::Fail);
+        assert!(
+            f.detail
+                .contains("refused (HTTP 401) the key in the api-key header"),
+            "{f:?}"
+        );
+        assert!(f.fix.unwrap().contains("amp-harness connect gw"));
+        let f = probe_finding(
+            gw,
+            &e(ProbeFailure::Rejected, Some(403), "HTTP 403"),
+            false,
+            "",
+        );
+        assert_eq!(f.status, CheckStatus::Warn);
+        assert!(f.detail.contains("not allowed"), "{f:?}");
+
+        let f = probe_finding(
+            gw,
+            &e(
+                ProbeFailure::Tls,
+                None,
+                "request: invalid peer certificate: UnknownIssuer",
+            ),
+            true,
+            "",
+        );
+        assert!(f.fix.as_deref().unwrap().contains("ca_file"), "{f:?}");
+        let f = probe_finding(
+            gw,
+            &e(
+                ProbeFailure::Tls,
+                None,
+                "request: received fatal alert: CertificateRequired",
+            ),
+            true,
+            "",
+        );
+        assert!(f.fix.as_deref().unwrap().contains("--client-cert"), "{f:?}");
+
+        let sso = &c.providers["sso"];
+        let f = probe_finding(
+            sso,
+            &e(ProbeFailure::Rejected, Some(401), "HTTP 401"),
+            true,
+            "",
+        );
+        assert!(
+            f.fix
+                .as_deref()
+                .unwrap()
+                .contains("run `corp-sso` yourself"),
+            "{f:?}"
+        );
+        let f = probe_finding(
+            sso,
+            &e(
+                ProbeFailure::Token,
+                None,
+                "auth_command `corp-sso` was not found (is it installed and on PATH?)",
+            ),
+            true,
+            "",
+        );
+        assert!(
+            f.fix.as_deref().unwrap().contains("install `corp-sso`"),
+            "{f:?}"
+        );
+        // Network trouble keeps the old wording and stays a warning.
+        let f = probe_finding(
+            gw,
+            &e(ProbeFailure::Network, None, "request: refused"),
+            true,
+            "",
+        );
+        assert_eq!(f.status, CheckStatus::Warn);
+        assert!(
+            f.detail.starts_with("could not read the model catalog at"),
+            "{f:?}"
         );
     }
 }

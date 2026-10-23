@@ -121,7 +121,7 @@ enum Command {
     Models(models_cmd::ModelsCommand),
     /// Add a model provider: its key (asked hidden, checked, kept in the OS keychain) or a custom
     /// OpenAI-compatible endpoint. `connect --list` shows every provider and where its key comes from.
-    Connect(connect::ConnectArgs),
+    Connect(Box<connect::ConnectArgs>),
     /// Remove a provider's key from the OS keychain (and a custom provider from config.toml).
     Disconnect(connect::DisconnectArgs),
     /// Show, save and switch AMP servers (`server`, `server set <url>`, `server use <name>`),
@@ -212,7 +212,7 @@ async fn main() -> ExitCode {
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
         Some(Command::Models(command)) => models_cmd::run(command).await,
-        Some(Command::Connect(args)) => connect::run(args).await,
+        Some(Command::Connect(args)) => connect::run(*args).await,
         Some(Command::Disconnect(args)) => connect::disconnect(args).await,
         Some(Command::Init(args)) => setup::init(args).await,
         Some(Command::Server(args)) => server_cmd::run(args).await,

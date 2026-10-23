@@ -120,8 +120,43 @@ pub struct ProviderSpec {
     pub base_url: Option<String>,
     /// Environment variable holding the key. The keychain is the fallback.
     pub key_env: Option<String>,
-    /// `key` (default for HTTP providers) or `none` (local endpoints that take no key).
+    /// How requests authenticate (#2277): `bearer` (default; `key` is the same), `header` (the key
+    /// in `auth_header`, e.g. Azure OpenAI's `api-key`), `none`, `command` (a token printed by
+    /// `auth_command`), `oauth-client-credentials` or `azure-entra`. See [`ProviderAuth`].
     pub auth: Option<String>,
+    /// `auth = "header"`: the header the key goes in (default `api-key`).
+    pub auth_header: Option<String>,
+    /// `auth = "command"` (or `azure-entra` with your own helper): the program and its arguments.
+    /// It prints a token, or JSON `{"token"|"access_token"|"accessToken", "expires_in"|"expires_on"}`.
+    pub auth_command: Option<Vec<String>>,
+    /// How long `auth_command` may run (default 30 s).
+    pub auth_command_timeout_secs: Option<u64>,
+    /// `auth = "oauth-client-credentials"`: the token endpoint.
+    pub token_url: Option<String>,
+    /// OAuth / Entra client id (not a secret; the client secret is the provider's key).
+    pub client_id: Option<String>,
+    /// OAuth scopes (Entra default: `https://cognitiveservices.azure.com/.default`).
+    pub scopes: Option<Vec<String>>,
+    /// `auth = "azure-entra"`: the Microsoft Entra tenant (with `client_id`: client credentials;
+    /// without: `az account get-access-token`).
+    pub tenant_id: Option<String>,
+    /// Entra authority (default `https://login.microsoftonline.com`; sovereign clouds differ).
+    pub authority_host: Option<String>,
+    /// OpenAI's `OpenAI-Organization` header.
+    pub organization: Option<String>,
+    /// OpenAI's `OpenAI-Project` header.
+    pub project: Option<String>,
+    /// Query parameters on every request, e.g. `{ "api-version" = "2024-10-21" }` (Azure OpenAI).
+    pub query: Option<BTreeMap<String, String>>,
+    /// PEM bundle of extra CA certificates for this endpoint (added to the OS trust store).
+    pub ca_file: Option<String>,
+    /// mTLS: the client certificate (PEM; may also hold the key).
+    pub client_cert: Option<String>,
+    /// mTLS: the client key file (PEM). Left out: the cert file's key, else the keychain
+    /// (`provider:<id>:client-key`).
+    pub client_key: Option<String>,
+    /// Proxy for this endpoint (`http://proxy:3128`), or `direct`. Default: HTTPS_PROXY/NO_PROXY.
+    pub proxy: Option<String>,
     /// Extra HTTP headers on every request.
     pub headers: Option<BTreeMap<String, String>>,
     /// Headers whose values are secrets: kept in the OS keychain (account
@@ -243,6 +278,24 @@ fn merge_provider(base: &mut ProviderSpec, top: ProviderSpec) {
     over(&mut base.base_url, top.base_url);
     over(&mut base.key_env, top.key_env);
     over(&mut base.auth, top.auth);
+    over(&mut base.auth_header, top.auth_header);
+    over(&mut base.auth_command, top.auth_command);
+    over(
+        &mut base.auth_command_timeout_secs,
+        top.auth_command_timeout_secs,
+    );
+    over(&mut base.token_url, top.token_url);
+    over(&mut base.client_id, top.client_id);
+    over(&mut base.scopes, top.scopes);
+    over(&mut base.tenant_id, top.tenant_id);
+    over(&mut base.authority_host, top.authority_host);
+    over(&mut base.organization, top.organization);
+    over(&mut base.project, top.project);
+    over_map(&mut base.query, top.query);
+    over(&mut base.ca_file, top.ca_file);
+    over(&mut base.client_cert, top.client_cert);
+    over(&mut base.client_key, top.client_key);
+    over(&mut base.proxy, top.proxy);
     over_map(&mut base.headers, top.headers);
     over(&mut base.secret_headers, top.secret_headers);
     over(&mut base.connect_timeout_secs, top.connect_timeout_secs);
@@ -360,6 +413,381 @@ pub struct Timeouts {
     pub request: Option<Duration>,
 }
 
+/// How a provider's requests authenticate (#2277). Secrets are never here: the API key or client
+/// secret is the provider's key (`key_env`, else the keychain), tokens live in memory only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProviderAuth {
+    /// `Authorization: Bearer <key>` (Anthropic Messages: `x-api-key`). `auth = "bearer"` / `"key"`.
+    #[default]
+    Bearer,
+    /// The key in a header of its own (`auth_header`, default `api-key`).
+    Header { name: String },
+    /// No credentials.
+    None,
+    /// A token printed by a program, sent as a bearer token; re-run at expiry and once on 401.
+    Command {
+        argv: Vec<String>,
+        timeout: Duration,
+    },
+    /// OAuth 2.0 client credentials (client secret = the provider's key), sent as a bearer token.
+    ClientCredentials {
+        token_url: String,
+        client_id: String,
+        scopes: Vec<String>,
+    },
+    /// Microsoft Entra ID: client credentials against the tenant's token endpoint, or a command
+    /// (`az account get-access-token` by default).
+    AzureEntra(Box<ProviderAuth>),
+}
+
+impl ProviderAuth {
+    /// The `auth` word it was configured with.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::Header { .. } => "header",
+            Self::None => "none",
+            Self::Command { .. } => "command",
+            Self::ClientCredentials { .. } => "oauth-client-credentials",
+            Self::AzureEntra(_) => "azure-entra",
+        }
+    }
+
+    /// Whether the provider's key (API key or client secret) is needed.
+    pub fn needs_key(&self) -> bool {
+        match self {
+            Self::Bearer | Self::Header { .. } | Self::ClientCredentials { .. } => true,
+            Self::None | Self::Command { .. } => false,
+            Self::AzureEntra(inner) => inner.needs_key(),
+        }
+    }
+
+    /// Whether requests carry a short-lived token (fetched, cached, refreshed).
+    pub fn is_token(&self) -> bool {
+        matches!(
+            self,
+            Self::Command { .. } | Self::ClientCredentials { .. } | Self::AzureEntra(_)
+        )
+    }
+
+    /// What the key is called in prompts and messages.
+    pub fn key_word(&self) -> &'static str {
+        if matches!(self, Self::ClientCredentials { .. } | Self::AzureEntra(_)) {
+            "client secret"
+        } else {
+            "key"
+        }
+    }
+
+    /// One line for people (doctor, connect --list): never a secret.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Bearer => "bearer key".to_owned(),
+            Self::Header { name } => format!("key in the {name} header"),
+            Self::None => "none".to_owned(),
+            Self::Command { argv, .. } => format!(
+                "token from `{}`",
+                argv.first().map(String::as_str).unwrap_or("")
+            ),
+            Self::ClientCredentials {
+                token_url,
+                client_id,
+                ..
+            } => format!("OAuth client credentials ({client_id} at {token_url})"),
+            Self::AzureEntra(inner) => match inner.as_ref() {
+                Self::ClientCredentials { client_id, .. } => {
+                    format!("Microsoft Entra ID (client {client_id})")
+                }
+                other => format!("Microsoft Entra ID, {}", other.describe()),
+            },
+        }
+    }
+}
+
+/// The Entra scope for Azure OpenAI / AI Foundry.
+pub const ENTRA_COGNITIVE_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
+/// The public-cloud Entra authority.
+pub const ENTRA_AUTHORITY: &str = "https://login.microsoftonline.com";
+/// Default bound on `auth_command`.
+pub const DEFAULT_AUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The command `auth = "azure-entra"` runs when no client id is configured.
+pub fn az_cli_command(scope: &str) -> Vec<String> {
+    [
+        "az",
+        "account",
+        "get-access-token",
+        "--scope",
+        scope,
+        "--output",
+        "json",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect()
+}
+
+/// A provider's TLS settings (#2277). Paths only; key material in the keychain is read when the
+/// HTTP client is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTls {
+    pub ca_file: Option<PathBuf>,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+}
+
+impl ProviderTls {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A provider's `proxy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxySetting {
+    /// `http(s)://host:port`
+    Url(String),
+    /// `direct`: no proxy, whatever HTTPS_PROXY says.
+    Direct,
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+fn https_or_local(url: &str, what: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = lower.strip_prefix("http://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+        let name = if host.starts_with('[') {
+            host.split(']')
+                .next()
+                .unwrap_or(host)
+                .trim_start_matches('[')
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
+        if matches!(name, "localhost" | "127.0.0.1" | "::1") {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "{what} `{url}` must be https:// (plain http only to localhost)"
+    ))
+}
+
+/// `auth` and its fields, checked. Every field that does not apply to the chosen auth is an error,
+/// so a typo or a leftover surfaces.
+fn build_auth(api: ProviderApi, spec: &ProviderSpec) -> Result<ProviderAuth, String> {
+    let word = spec
+        .auth
+        .as_deref()
+        .map(|a| a.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "bearer".to_owned());
+    let timeout = spec
+        .auth_command_timeout_secs
+        .filter(|s| *s > 0)
+        .map_or(DEFAULT_AUTH_COMMAND_TIMEOUT, Duration::from_secs);
+    let command = spec
+        .auth_command
+        .clone()
+        .map(|argv| {
+            argv.into_iter()
+                .map(|a| a.trim().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .filter(|argv| !argv.is_empty());
+    if command.as_ref().is_some_and(|a| a[0].is_empty()) {
+        return Err("`auth_command` needs the program as its first element".to_owned());
+    }
+    let scopes: Vec<String> = spec
+        .scopes
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let client_id = nonempty(spec.client_id.clone());
+    let token_url = nonempty(spec.token_url.clone());
+    let tenant = nonempty(spec.tenant_id.clone());
+    let authority = nonempty(spec.authority_host.clone());
+    let only = |field: &str, present: bool, allowed: &[&str]| -> Result<(), String> {
+        if present && !allowed.contains(&word.as_str()) {
+            return Err(format!(
+                "`{field}` applies to auth = {} (this provider has auth = \"{word}\")",
+                allowed
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ));
+        }
+        Ok(())
+    };
+    only("auth_header", spec.auth_header.is_some(), &["header"])?;
+    only(
+        "auth_command",
+        command.is_some(),
+        &["command", "azure-entra"],
+    )?;
+    only(
+        "auth_command_timeout_secs",
+        spec.auth_command_timeout_secs.is_some(),
+        &["command", "azure-entra"],
+    )?;
+    only(
+        "token_url",
+        token_url.is_some(),
+        &["oauth-client-credentials"],
+    )?;
+    only(
+        "client_id",
+        client_id.is_some(),
+        &["oauth-client-credentials", "azure-entra"],
+    )?;
+    only(
+        "scopes",
+        !scopes.is_empty(),
+        &["oauth-client-credentials", "azure-entra"],
+    )?;
+    only("tenant_id", tenant.is_some(), &["azure-entra"])?;
+    only("authority_host", authority.is_some(), &["azure-entra"])?;
+    Ok(match word.as_str() {
+        "bearer" | "key" => ProviderAuth::Bearer,
+        "none" => ProviderAuth::None,
+        "header" => {
+            let name = nonempty(spec.auth_header.clone()).unwrap_or_else(|| match api {
+                ProviderApi::AnthropicMessages => "x-api-key".to_owned(),
+                _ => "api-key".to_owned(),
+            });
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+            {
+                return Err(format!("`auth_header` `{name}` is not a header name"));
+            }
+            // rpi's Anthropic provider only sends a request whose auth it recognises.
+            if api == ProviderApi::AnthropicMessages
+                && !["x-api-key", "authorization", "cf-aig-authorization"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+            {
+                return Err(format!(
+                    "anthropic-messages providers take the key in x-api-key, authorization or                      cf-aig-authorization, not `{name}`"
+                ));
+            }
+            ProviderAuth::Header { name }
+        }
+        "command" => ProviderAuth::Command {
+            argv: command
+                .ok_or("auth = \"command\" needs `auth_command = [\"program\", \"arg\"]`")?,
+            timeout,
+        },
+        "oauth-client-credentials" | "client-credentials" | "oauth" => {
+            let token_url =
+                token_url.ok_or("auth = \"oauth-client-credentials\" needs `token_url`")?;
+            https_or_local(&token_url, "token_url")?;
+            ProviderAuth::ClientCredentials {
+                token_url,
+                client_id: client_id
+                    .ok_or("auth = \"oauth-client-credentials\" needs `client_id`")?,
+                scopes,
+            }
+        }
+        "azure-entra" | "entra" | "azure-ad" => {
+            let scopes = if scopes.is_empty() {
+                vec![ENTRA_COGNITIVE_SCOPE.to_owned()]
+            } else {
+                scopes
+            };
+            let inner = match (command, tenant, client_id) {
+                (Some(argv), None, None) => ProviderAuth::Command { argv, timeout },
+                (Some(_), _, _) => {
+                    return Err(
+                        "azure-entra: use either `auth_command` or `tenant_id` + `client_id`"
+                            .to_owned(),
+                    );
+                }
+                (None, Some(tenant), Some(client_id)) => {
+                    let authority = authority.unwrap_or_else(|| ENTRA_AUTHORITY.to_owned());
+                    https_or_local(&authority, "authority_host")?;
+                    ProviderAuth::ClientCredentials {
+                        token_url: format!(
+                            "{}/{tenant}/oauth2/v2.0/token",
+                            authority.trim_end_matches('/')
+                        ),
+                        client_id,
+                        scopes,
+                    }
+                }
+                (None, None, None) => ProviderAuth::Command {
+                    argv: az_cli_command(&scopes[0]),
+                    timeout,
+                },
+                (None, _, _) => {
+                    return Err(
+                        "azure-entra client credentials need both `tenant_id` and `client_id`                          (or neither, to use `az account get-access-token`)"
+                            .to_owned(),
+                    );
+                }
+            };
+            ProviderAuth::AzureEntra(Box::new(inner))
+        }
+        other => {
+            return Err(format!(
+                "unknown auth `{other}` (bearer, header, none, command, oauth-client-credentials,                  azure-entra)"
+            ));
+        }
+    })
+}
+
+fn build_proxy(proxy: Option<String>) -> Result<Option<ProxySetting>, String> {
+    let Some(proxy) = nonempty(proxy) else {
+        return Ok(None);
+    };
+    if matches!(
+        proxy.to_ascii_lowercase().as_str(),
+        "direct" | "none" | "off"
+    ) {
+        return Ok(Some(ProxySetting::Direct));
+    }
+    let lower = proxy.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(format!(
+            "`proxy` must be an http:// or https:// URL, or \"direct\" (SOCKS and PAC are not supported), not `{proxy}`"
+        ));
+    }
+    let authority = proxy
+        .split_once("://")
+        .map_or("", |(_, r)| r)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if let Some((userinfo, _)) = authority.rsplit_once('@')
+        && userinfo.contains(':')
+    {
+        return Err(
+            "`proxy` holds a password: config files never hold secrets. Put the proxy URL with \
+             its credentials in HTTPS_PROXY instead"
+                .to_owned(),
+        );
+    }
+    Ok(Some(ProxySetting::Url(proxy)))
+}
+
 fn secs(value: Option<u64>) -> Option<Duration> {
     value.filter(|s| *s > 0).map(Duration::from_secs)
 }
@@ -372,8 +800,18 @@ pub struct ProviderConfig {
     pub api: ProviderApi,
     pub base_url: String,
     pub key_env: Option<String>,
-    /// False for `auth = "none"` and faux.
+    /// True when the provider needs its key (`key_env` / keychain `provider:<id>`): bearer and
+    /// header auth (the API key), OAuth client credentials and Entra client credentials (the client
+    /// secret). False for `none`, `command`, Entra through `az`, and faux.
     pub needs_key: bool,
+    /// How requests authenticate (#2277).
+    pub auth: ProviderAuth,
+    /// Query parameters added to every request (#2277).
+    pub query: BTreeMap<String, String>,
+    /// CA file and mTLS identity (#2277).
+    pub tls: ProviderTls,
+    /// `proxy`: `None` follows HTTPS_PROXY/NO_PROXY.
+    pub proxy: Option<ProxySetting>,
     /// Provider-level headers (already merged into every model's headers).
     pub headers: BTreeMap<String, String>,
     /// Header names whose values come from the keychain (see [`ProviderSpec::secret_headers`]).
@@ -915,18 +1353,51 @@ fn build_provider(id: &str, spec: ProviderSpec) -> Result<ProviderConfig, Models
             "unknown api `{api_name}` (anthropic-messages, openai-completions, faux)"
         ))
     })?;
+    let auth_spec = spec.clone();
     let base_url = match (api, spec.base_url) {
         (_, Some(url)) => url.trim_end_matches('/').to_owned(),
         (ProviderApi::Faux, None) => "faux://local".to_owned(),
         (_, None) => return Err(ctx("missing `base_url`".into())),
     };
-    let needs_key = match (api, spec.auth.as_deref()) {
-        (ProviderApi::Faux, _) => false,
-        (_, None | Some("key")) => true,
-        (_, Some("none")) => false,
-        (_, Some(other)) => return Err(ctx(format!("unknown auth `{other}` (key, none)"))),
+    let auth = match api {
+        ProviderApi::Faux => ProviderAuth::None,
+        _ => build_auth(api, &auth_spec).map_err(ctx)?,
     };
-    let headers = spec.headers.unwrap_or_default();
+    let needs_key = auth.needs_key();
+    let mut headers = spec.headers.clone().unwrap_or_default();
+    // OpenAI's optional organization / project headers (#2277).
+    for (field, header, value) in [
+        ("organization", "OpenAI-Organization", &spec.organization),
+        ("project", "OpenAI-Project", &spec.project),
+    ] {
+        if let Some(value) = nonempty(value.clone()) {
+            if headers.keys().any(|k| k.eq_ignore_ascii_case(header)) {
+                return Err(ctx(format!(
+                    "`{field}` and headers.{header} both set it: keep one"
+                )));
+            }
+            headers.insert(header.to_owned(), value);
+        }
+    }
+    let query: BTreeMap<String, String> = spec
+        .query
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    if query.keys().any(String::is_empty) {
+        return Err(ctx("`query` has an empty parameter name".into()));
+    }
+    let tls = ProviderTls {
+        ca_file: nonempty(spec.ca_file.clone()).map(|p| expand_home(&p)),
+        client_cert: nonempty(spec.client_cert.clone()).map(|p| expand_home(&p)),
+        client_key: nonempty(spec.client_key.clone()).map(|p| expand_home(&p)),
+    };
+    if tls.client_key.is_some() && tls.client_cert.is_none() {
+        return Err(ctx("`client_key` needs `client_cert`".into()));
+    }
+    let proxy = build_proxy(spec.proxy.clone()).map_err(ctx)?;
     let mut models = BTreeMap::new();
     for (model_id, model_spec) in spec.models {
         let model = build_model(id, api, &base_url, &headers, &model_id, model_spec)
@@ -940,6 +1411,10 @@ fn build_provider(id: &str, spec: ProviderSpec) -> Result<ProviderConfig, Models
         base_url,
         key_env: spec.key_env.filter(|s| !s.trim().is_empty()),
         needs_key,
+        auth,
+        query,
+        tls,
+        proxy,
         headers,
         secret_headers: spec
             .secret_headers

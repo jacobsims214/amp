@@ -83,6 +83,7 @@ pub mod meta;
 pub mod models;
 pub mod policy;
 pub mod project;
+pub mod provider_auth;
 pub mod provider_error;
 pub mod providers;
 pub mod repeat;

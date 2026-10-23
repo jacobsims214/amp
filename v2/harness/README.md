@@ -477,6 +477,101 @@ source, and every role's `provider/model`:
 model a role uses. `doctor --json` has the same data under `.models.roles` (role, provider,
 model, endpoint, source).
 
+### How a provider endpoint authenticates: keys, tokens, Azure, TLS and proxies (#2277)
+
+Every `[providers.<id>]` takes `auth` and the settings that go with it. Secrets are never in
+config.toml. The API key or client secret is the provider's key: `key_env`, else the OS keychain
+(`provider:<id>`), as `connect` stores it. Tokens live only in memory.
+
+| `auth` | What is sent | Settings | Secret |
+|---|---|---|---|
+| `bearer` (default; `key` is the same) | `Authorization: Bearer <key>` (Anthropic Messages: `x-api-key`) | | the API key |
+| `header` | the key in its own header | `auth_header` (default `api-key`, Azure OpenAI's) | the API key |
+| `none` | nothing | | |
+| `command` | `Authorization: Bearer <token>` | `auth_command = ["prog", "arg"]`, `auth_command_timeout_secs` (30) | none (the tool logs in) |
+| `oauth-client-credentials` | a client-credentials token | `token_url`, `client_id`, `scopes` | the client secret |
+| `azure-entra` | a Microsoft Entra ID token for `https://cognitiveservices.azure.com/.default` | `tenant_id` + `client_id` (client credentials; `authority_host` for sovereign clouds), or neither (runs `az account get-access-token`), or your own `auth_command` | the client secret, or none with `az` |
+
+- **Tokens.** `auth_command` prints a token, or JSON with `token` / `access_token` / `accessToken`
+  and `expires_in` (seconds) or `expires_on` (Unix time; the shape `az` prints).
+  - A token is cached in memory and fetched again shortly before it expires (60 s early, or a
+    tenth of its lifetime if that is shorter).
+  - It is also fetched again once if the endpoint answers 401; the request is then retried once.
+  - A token with no expiry is kept until a 401.
+  - A command that runs longer than `auth_command_timeout_secs` is killed.
+  - A command's stderr is never logged. Only its last line goes into the error, with anything
+    token-shaped removed.
+  - This covers corporate SSO helpers, Vault, `az account get-access-token` and
+    `gcloud auth print-access-token`.
+- **OpenAI.** `organization` and `project` send `OpenAI-Organization` and `OpenAI-Project`.
+- **Query parameters.** `query = { "api-version" = "2024-10-21" }` adds parameters to every
+  request, the catalog call included.
+- **Azure OpenAI.**
+  - The v1 API (`https://<resource>.openai.azure.com/openai/v1`) needs no api-version, and the
+    deployment name is the model id.
+  - Classic deployments: `base_url = "https://<resource>.openai.azure.com/openai/deployments/{model}"`
+    with `query = { "api-version" = "2024-10-21" }`. `{model}` is replaced by the model id, so
+    again the deployment name is the model id.
+  - Use `auth = "header"` (the `api-key` header) for key auth, or `auth = "azure-entra"`.
+- **TLS.**
+  - `ca_file` is a PEM bundle added to the OS trust store (macOS Keychain, Linux `/etc/ssl`), which
+    is always used.
+  - `client_cert` + `client_key` enable mTLS.
+  - Without `client_key`, the key is read from the cert file, else from the keychain
+    (`provider:<id>:client-key`; `connect --store-client-key` puts it there).
+- **Proxies.**
+  - `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` and `NO_PROXY` apply by default.
+  - `proxy = "http://proxy:3128"` (honouring `NO_PROXY`) or `proxy = "direct"` overrides them for
+    one provider.
+  - A proxy password is refused in config: put that URL in `HTTPS_PROXY`.
+
+```toml
+[providers.azure]
+name = "Azure OpenAI"
+api = "openai-completions"
+base_url = "https://contoso.openai.azure.com/openai/deployments/{model}"
+query = { "api-version" = "2024-10-21" }
+auth = "azure-entra"            # with `az login`; or tenant_id + client_id for a service principal
+[providers.azure.models."gpt-4o"]  # the deployment name
+
+[providers.gateway]
+api = "openai-completions"
+base_url = "https://llm.corp.example/v1"
+auth = "command"
+auth_command = ["corp-sso", "token", "--audience", "llm"]
+ca_file = "/etc/ssl/corp-root.pem"
+client_cert = "~/.config/corp/me.pem"
+client_key = "~/.config/corp/me.key"
+```
+
+- **connect:**
+  - Flags: `--auth TYPE`, `--auth-header NAME`, `--auth-command "prog args"`, `--token-url`,
+    `--client-id`, `--scope` (repeatable), `--tenant-id`, `--organization`, `--project`,
+    `--query NAME=VALUE` (repeatable), `--ca-file`, `--client-cert`, `--client-key`,
+    `--store-client-key` and `--proxy`.
+  - A client secret is read like a key: hidden, or `--key-stdin`.
+  - `connect <id>` on a token provider stores nothing and checks that a token can be had and is
+    accepted.
+- **First run:** the own-endpoint path asks "How does your endpoint authenticate?".
+  - It asks only the questions the chosen option needs: the header name; the command; the token
+    URL, client id and scopes; or the Entra tenant and client id.
+  - A CA bundle or client certificate is asked for only when the endpoint fails TLS without one.
+    A proxy is asked for only when the endpoint can't be reached.
+  - An Azure resource address becomes `…/openai/v1`. A deployment address is asked for its
+    api-version. OpenAI is asked for the optional organization and project.
+- **Org presets** take the same settings. A preset holding key material (PEM, tokens) is refused.
+- **doctor:**
+  - Shows each provider's auth (`auth: key in the api-key header`,
+    ``auth: Microsoft Entra ID, token from `az`, token valid until …``) and any CA file, client
+    certificate and proxy. It never shows a secret.
+  - The `models:<id>` check calls the catalog through the provider's own TLS, proxy, query and
+    auth. A failure names the fix:
+    - 401/403: which credential was refused, and how to replace it;
+    - unknown CA: `ca_file`;
+    - client certificate required: `--client-cert` / `--client-key`;
+    - a token tool missing or failing: install it, or run it yourself;
+    - Entra: `az login`, or tenant/client id.
+
 ## Providers and models (M2-3)
 
 Like opencode, several providers are active at once and every role (agent) picks its own
