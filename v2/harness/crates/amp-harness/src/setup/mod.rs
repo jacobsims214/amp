@@ -1230,11 +1230,93 @@ pub(crate) fn display_name(p: &ProviderConfig) -> String {
     p.name.clone().unwrap_or_else(|| provider_name(&p.id))
 }
 
+/// `AMP_CREDENTIAL_STORE=file`: the person turned the OS keychain off.
+fn credential_store_is_file() -> bool {
+    std::env::var(amp_mcp::ENV_CREDENTIAL_STORE)
+        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
+}
+
+/// Why provider keys can't be kept here, for [`first_run_key_message`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NoKeychain<'a> {
+    /// `AMP_CREDENTIAL_STORE=file` (said plainly) rather than a platform failure.
+    pub turned_off: bool,
+    /// The raw reason ([`keychain_for_keys`]'s error): shown only with `--verbose`.
+    pub why: &'a str,
+}
+
+/// The one message the chat's first run ends with when no provider key resulted (#2214): what is
+/// missing and the next command. With a keychain: `amp-harness connect <id>` (env var for
+/// CI/headless). Without one: `export VAR=… && amp-harness`. The platform error is added on a
+/// `cause:` line only with `--verbose`, like connection errors (#2178).
+pub(crate) fn first_run_key_message(
+    missing: &[&ProviderConfig],
+    no_keychain: Option<NoKeychain<'_>>,
+    verbose: bool,
+) -> String {
+    let names: Vec<String> = missing.iter().map(|p| display_name(p)).collect();
+    let what = if names.is_empty() {
+        "a model provider key".to_owned()
+    } else {
+        format!("a model provider key ({})", names.join(" + "))
+    };
+    let vars: Vec<&str> = missing
+        .iter()
+        .filter_map(|p| p.key_env.as_deref())
+        .collect();
+    let connects: Vec<String> = missing
+        .iter()
+        .map(|p| format!("`amp-harness connect {}`", p.id))
+        .collect();
+    match no_keychain {
+        None => {
+            let mut text = format!(
+                "The chat needs {what}. Store it with {}, then run `amp-harness` again",
+                connects.join(" and ")
+            );
+            if !vars.is_empty() {
+                text.push_str(&format!(
+                    " (CI/headless: set {} instead)",
+                    vars.join(" and ")
+                ));
+            }
+            text.push('.');
+            text
+        }
+        Some(nk) => {
+            let why = if nk.turned_off {
+                format!(
+                    "the OS keychain is turned off ({}=file)",
+                    amp_mcp::ENV_CREDENTIAL_STORE
+                )
+            } else {
+                "there is no usable OS keychain here".to_owned()
+            };
+            let mut text = format!("The chat needs {what}, and {why} to keep it in. ");
+            if vars.is_empty() {
+                text.push_str(&format!(
+                    "Give the provider a `key_env` in config.toml and set that variable, then run \
+                     `amp-harness` again ({} needs a keychain).",
+                    connects.join(" and ")
+                ));
+            } else {
+                let exports: Vec<String> = vars.iter().map(|v| format!("{v}=…")).collect();
+                text.push_str(&format!(
+                    "Set it in your environment and start again: `export {} && amp-harness`.",
+                    exports.join(" ")
+                ));
+            }
+            if verbose && !nk.turned_off {
+                text.push_str(&format!("\n  cause: {}", nk.why));
+            }
+            text
+        }
+    }
+}
+
 /// Whether provider keys can be stored here (the OS keychain only).
 pub(crate) fn keychain_for_keys() -> Result<String, String> {
-    if std::env::var(amp_mcp::ENV_CREDENTIAL_STORE)
-        .is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
-    {
+    if credential_store_is_file() {
         return Err(format!(
             "the OS keychain is turned off ({}=file)",
             amp_mcp::ENV_CREDENTIAL_STORE
@@ -1437,15 +1519,28 @@ async fn models_step(
         }
     }
 
+    // No keychain: nothing to ask. The first run has already linked the project (step 4) and ends
+    // below with one message naming the next command (#2214). Interactive init says why it asks
+    // nothing (its summary warning has the commands). The platform error only with --verbose.
     let keychain = keychain_for_keys();
     if !missing.is_empty()
+        && plan.mode == Mode::Init
         && ui.interactive()
         && let Err(why) = &keychain
     {
-        ui.say(&format!(
-            "The agents need a model provider key. Keys are kept only in the OS keychain, and {why}: \
-             set the key in your environment instead (for example OPENROUTER_API_KEY or ANTHROPIC_API_KEY)."
-        ));
+        let mut text = format!(
+            "Keys are kept only in the OS keychain, and {}: set the key in your environment instead \
+             (for example OPENROUTER_API_KEY or ANTHROPIC_API_KEY).",
+            if credential_store_is_file() {
+                why.as_str()
+            } else {
+                "there is no usable OS keychain here"
+            }
+        );
+        if crate::conn::verbose() && !credential_store_is_file() {
+            text.push_str(&format!("\n  cause: {why}"));
+        }
+        ui.say(&text);
     }
     if !missing.is_empty() && ui.interactive() && keychain.is_ok() {
         // Which provider does the person have a key for? One option per profile.
@@ -1554,9 +1649,18 @@ async fn models_step(
             .collect();
         let message = format!("no model provider key: {}", how.join(", "));
         if plan.mode == Mode::FirstRun {
-            return Err(CliError::new(format!(
-                "the chat needs a model provider key: {}",
-                how.join(", ")
+            let providers: Vec<&ProviderConfig> = missing
+                .iter()
+                .filter_map(|id| cfg.providers.get(id))
+                .collect();
+            let no_keychain = keychain.as_ref().err().map(|why| NoKeychain {
+                turned_off: credential_store_is_file(),
+                why: why.as_str(),
+            });
+            return Err(CliError::new(first_run_key_message(
+                &providers,
+                no_keychain,
+                crate::conn::verbose(),
             )));
         }
         summary.warnings.push(message);
@@ -1590,6 +1694,42 @@ fn path_hint() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2214: one message with the next command; the platform error only with --verbose.
+    #[test]
+    fn the_first_run_key_message_names_the_next_command() {
+        let cfg = ModelsConfig::load_with_env(&|_| None, None).unwrap();
+        let or = cfg.providers.get("openrouter").unwrap();
+        let raw = "keychain read failed: Platform failure: A default keychain could not be found.";
+
+        let with = first_run_key_message(&[or], None, false);
+        assert!(with.contains("`amp-harness connect openrouter`"), "{with}");
+        assert!(with.contains("OPENROUTER_API_KEY"), "{with}");
+
+        let unusable = NoKeychain {
+            turned_off: false,
+            why: raw,
+        };
+        let without = first_run_key_message(&[or], Some(unusable), false);
+        assert!(
+            without.contains("`export OPENROUTER_API_KEY=… && amp-harness`"),
+            "{without}"
+        );
+        assert!(without.contains("no usable OS keychain"), "{without}");
+        assert!(!without.contains("Platform failure"), "{without}");
+        assert!(!without.contains('\n'), "{without}");
+
+        let verbose = first_run_key_message(&[or], Some(unusable), true);
+        assert!(verbose.ends_with(&format!("\n  cause: {raw}")), "{verbose}");
+
+        let off = NoKeychain {
+            turned_off: true,
+            why: "the OS keychain is turned off (AMP_CREDENTIAL_STORE=file)",
+        };
+        let off = first_run_key_message(&[or], Some(off), true);
+        assert!(off.contains("AMP_CREDENTIAL_STORE=file"), "{off}");
+        assert!(!off.contains("cause:"), "{off}");
+    }
 
     #[test]
     fn server_urls() {
