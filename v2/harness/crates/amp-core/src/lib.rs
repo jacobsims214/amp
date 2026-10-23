@@ -52,6 +52,11 @@
 //! - [`repeat`]: the repeat guard. A model that makes the same tool call (same name, same
 //!   arguments) again and again is nudged, then stopped, for every role.
 //!
+//! Story 397 (#2233, H2):
+//! - [`mcp_config`]: `[mcp.<name>]` external MCP servers in the user and repo config files:
+//!   schema, validation, layering, `${...}` substitution, keychain accounts and `mcp__<server>__<tool>`
+//!   names.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -60,6 +65,7 @@ pub mod assets;
 pub mod events;
 pub mod faux;
 pub mod links;
+pub mod mcp_config;
 pub mod mcp_tools;
 pub mod meta;
 pub mod models;
