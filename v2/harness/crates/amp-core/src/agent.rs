@@ -429,7 +429,7 @@ impl Runtime {
         let role = self.role(&spec.role)?.clone();
         let models = self.current_models();
         let providers = self.current_providers();
-        let resolved = models.resolve_role(&role.model_role)?;
+        let resolved = role.resolve_model(&models)?;
         // Fail early with the key the role needs ("no key: set OPENROUTER_API_KEY ...").
         providers.for_role(&resolved)?;
 

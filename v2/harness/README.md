@@ -703,8 +703,18 @@ You can override or add agents and skills from disk. Later layers win:
 An agent override (`agents/amp-manager.md`) replaces the whole agent. Skills override per file:
 `skills/amp-kb/SKILL.md` replaces only that file, and the skill keeps its other embedded files. Files
 that don't exist in the embedded set add new agents or skills. Names are lowercase letters, digits
-and hyphens. A malformed override is an error naming the file, never skipped silently. A new agent
-needs a `[roles.<id without amp->]` model in config.toml.
+and hyphens. A malformed override is an error naming the file, never skipped silently.
+
+`amp-harness agents list|show|new|edit|remove|reset|validate` and `agents skills <id> add|remove
+<skill>`, and `amp-harness skills list|show|new|import|edit|remove|reset|validate`, do this without
+editing files by hand (#2234). Writers take `--user` (default) or `--repo` and validate before they
+write; `edit` opens `$VISUAL`/`$EDITOR` and can reopen an invalid edit. `agents new <id> --from
+worker|reviewer|researcher|blank|<agent id>` writes `dispatch: true` (the manager may run it whatever
+its id; a manager `task` rule that names it with `deny` still wins) and `based_on: <role>`. A new
+agent needs no `[roles]` entry: its model is `[roles.<id without amp->]` (repo, then user), else the
+frontmatter `model` if that provider/model is configured, else the `based_on` role's model, else
+`[models] fallback` (a role name or `provider/model`; default `worker-backend`). `agents new
+--model p/m [--thinking L]` writes `[roles.<id>]` to the chosen layer's config.toml.
 
 Tool policy uses opencode's `permission` semantics, enforced by the harness before each tool call:
 the last matching rule wins, `ask` is treated as `deny` (nothing ever prompts), and a denied call

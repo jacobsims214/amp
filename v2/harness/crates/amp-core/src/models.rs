@@ -56,6 +56,9 @@ pub const DEFAULT_PROFILE: &str = "opencode";
 pub const INHERIT: &str = "inherit";
 /// Thinking level for a role that names none (and whose model reasons).
 pub const DEFAULT_THINKING: ThinkingLevel = ThinkingLevel::Medium;
+/// The role whose model an unconfigured role falls back to, unless `[models] fallback` says
+/// otherwise (#2234, D11).
+pub const DEFAULT_FALLBACK_ROLE: &str = "worker-backend";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelsError(pub String);
@@ -101,6 +104,10 @@ pub struct ModelsSection {
     pub inherit: Option<String>,
     /// Thinking level for every role in inherit mode.
     pub inherit_thinking: Option<String>,
+    /// The model a role with no `[roles.<id>]` runs on when its agent file names no usable model
+    /// and no `based_on` role (#2234, D11): a role name (`worker-backend`, the default) or a
+    /// `provider/model`.
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -404,7 +411,21 @@ pub struct ModelsConfig {
     pub repo_file: Option<PathBuf>,
     /// Profiles available (shipped and user), with descriptions.
     pub profiles: BTreeMap<String, Option<String>>,
+    /// `[models] fallback` and the layer that set it; `None` means [`DEFAULT_FALLBACK_ROLE`].
+    pub fallback: Option<(String, String)>,
     roles: BTreeMap<String, RoleEntry>,
+}
+
+/// What an agent file says about its model, for roles with no `[roles.<id>]` (#2234, D11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelHints {
+    /// The frontmatter `model` (`provider/model`). Used only when that provider and model are
+    /// configured; opencode's ids for other setups are skipped.
+    pub model: Option<String>,
+    /// The frontmatter `variant`, used as the thinking level when it is one.
+    pub thinking: Option<String>,
+    /// The frontmatter `based_on`: the role whose model this one shares (`agents new --from`).
+    pub based_on: Option<String>,
 }
 
 /// One role's provider, model and thinking level, ready for an `AgentHarness`.
@@ -613,12 +634,27 @@ impl ModelsConfig {
             roles.insert(role, entry);
         }
 
+        let fallback = user
+            .models
+            .fallback
+            .clone()
+            .map(|f| f.trim().to_owned())
+            .filter(|f| !f.is_empty())
+            .map(|f| (f, user_label.to_owned()));
+        if let Some((value, source)) = &fallback
+            && value.contains('/')
+        {
+            parse_model_ref(value)
+                .map_err(|e| ModelsError(format!("[models] fallback ({source}): {e}")))?;
+        }
+
         Ok(Self {
             providers,
             selection,
             config_file: None,
             config_found: false,
             repo_file: repo.map(|r| r.path.clone()),
+            fallback,
             profiles: profiles
                 .into_iter()
                 .map(|(name, spec)| (name, spec.description))
@@ -640,8 +676,93 @@ impl ModelsConfig {
         self.roles.keys().cloned().collect()
     }
 
+    /// Whether `role` has an assignment of its own (defaults, profile, user or repo `[roles]`).
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.contains_key(normalize_role(role))
+    }
+
+    /// Resolve an agent's role with D11's fallback chain, so a new agent always gets a model:
+    /// 1. its own assignment ([`Self::resolve_role`]: `[roles.<id>]`, repo over user over the
+    ///    defaults; or inherit mode);
+    /// 2. the agent file's `model` (and `variant` as thinking), if that provider and model are
+    ///    configured;
+    /// 3. the `based_on` role's assignment;
+    /// 4. `[models] fallback`: a role name or `provider/model` (default: [`DEFAULT_FALLBACK_ROLE`]).
+    pub fn resolve_with(
+        &self,
+        role: &str,
+        hints: &ModelHints,
+    ) -> Result<ResolvedRole, ModelsError> {
+        let role = normalize_role(role);
+        if self.roles.contains_key(role) || matches!(self.selection, Selection::Inherit { .. }) {
+            return self.resolve_role(role);
+        }
+        let thinking = hints.thinking.clone().filter(|t| parse_thinking(t).is_ok());
+        if let Some(model_ref) = hints.model.as_deref()
+            && self.knows_model(model_ref)
+        {
+            return self.resolve_entry(
+                role,
+                RoleEntry {
+                    spec: RoleSpec {
+                        model: Some(model_ref.trim().to_owned()),
+                        thinking,
+                        extra_body: None,
+                    },
+                    source: "agent file model".to_owned(),
+                },
+            );
+        }
+        if let Some(base) = hints.based_on.as_deref().map(normalize_role)
+            && base != role
+            && let Some(entry) = self.roles.get(base)
+        {
+            let mut entry = entry.clone();
+            entry.source = format!("based_on {base} ({})", entry.source);
+            return self.resolve_entry(role, entry);
+        }
+        let (value, source) = self
+            .fallback
+            .clone()
+            .unwrap_or_else(|| (DEFAULT_FALLBACK_ROLE.to_owned(), "default".to_owned()));
+        if value.contains('/') {
+            return self.resolve_entry(
+                role,
+                RoleEntry {
+                    spec: RoleSpec {
+                        model: Some(value.clone()),
+                        thinking,
+                        extra_body: None,
+                    },
+                    source: format!("[models] fallback ({source})"),
+                },
+            );
+        }
+        let base = normalize_role(&value);
+        match self.roles.get(base) {
+            Some(entry) if base != role => {
+                let mut entry = entry.clone();
+                entry.source = format!("fallback {base} ({})", entry.source);
+                self.resolve_entry(role, entry)
+            }
+            _ => err(format!(
+                "no model for role `{role}`: add [roles.{role}] model = \"provider/model\" to config.toml, or set [models] fallback (the fallback role `{base}` has no model; configured roles: {})",
+                self.role_names().join(", ")
+            )),
+        }
+    }
+
+    /// Whether `provider/model` names a configured provider and one of its models.
+    pub fn knows_model(&self, model_ref: &str) -> bool {
+        parse_model_ref(model_ref).is_ok_and(|(p, m)| {
+            self.providers
+                .get(p)
+                .is_some_and(|provider| provider.models.contains_key(m))
+        })
+    }
+
     /// Resolve one role (`amp-` prefix optional). A role nobody configured resolves only in inherit
-    /// mode.
+    /// mode; agents should use [`Self::resolve_with`], which falls back.
     pub fn resolve_role(&self, role: &str) -> Result<ResolvedRole, ModelsError> {
         let role = normalize_role(role);
         let entry = match (self.roles.get(role), &self.selection) {
@@ -668,6 +789,10 @@ impl ModelsConfig {
                 ));
             }
         };
+        self.resolve_entry(role, entry)
+    }
+
+    fn resolve_entry(&self, role: &str, entry: RoleEntry) -> Result<ResolvedRole, ModelsError> {
         let Some(model_ref) = entry.spec.model.as_deref() else {
             return err(format!("role `{role}` has no model ({})", entry.source));
         };
@@ -1070,6 +1195,95 @@ mod tests {
             ThinkingLevel::High,
         ),
     ];
+
+    /// #2234 (D11): a role with no [roles.<id>] still resolves: agent file model (if configured),
+    /// then based_on, then [models] fallback (a role or provider/model), default worker-backend.
+    #[test]
+    fn unconfigured_roles_fall_back() {
+        let user = r#"
+[providers.f]
+api = "faux"
+[providers.f.models."one"]
+[providers.f.models."two"]
+[roles.worker-backend]
+model = "f/one"
+[roles.reviewer]
+model = "f/two"
+thinking = "low"
+"#;
+        let c = config(user).unwrap();
+        let hints =
+            |model: Option<&str>, thinking: Option<&str>, based_on: Option<&str>| ModelHints {
+                model: model.map(str::to_owned),
+                thinking: thinking.map(str::to_owned),
+                based_on: based_on.map(str::to_owned),
+            };
+        // Its own [roles] wins over everything.
+        let r = c
+            .resolve_with(
+                "amp-reviewer",
+                &hints(Some("f/one"), None, Some("worker-backend")),
+            )
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        // Nothing: worker-backend's model.
+        let r = c
+            .resolve_with("sql-expert", &ModelHints::default())
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/one");
+        assert!(
+            r.source.starts_with("fallback worker-backend (config test"),
+            "{}",
+            r.source
+        );
+        // A configured frontmatter model, with its variant as thinking.
+        let r = c
+            .resolve_with(
+                "sql-expert",
+                &hints(Some("f/two"), Some("high"), Some("worker-backend")),
+            )
+            .unwrap();
+        assert_eq!(
+            (r.model_ref().as_str(), r.source.as_str()),
+            ("f/two", "agent file model")
+        );
+        assert_eq!(r.requested_thinking, Some(ThinkingLevel::High));
+        // opencode's ids for providers that aren't configured are skipped; `on` isn't a level.
+        let r = c
+            .resolve_with(
+                "sql-expert",
+                &hints(Some("nowhere/x"), Some("on"), Some("amp-reviewer")),
+            )
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        assert_eq!(r.requested_thinking, Some(ThinkingLevel::Low));
+        assert!(r.source.starts_with("based_on reviewer ("), "{}", r.source);
+        // [models] fallback: a role, or a provider/model.
+        let c = config(&format!("{user}\n[models]\nfallback = \"reviewer\"\n")).unwrap();
+        let r = c.resolve_with("x", &ModelHints::default()).unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        let c = config(&format!("{user}\n[models]\nfallback = \"f/two\"\n")).unwrap();
+        let r = c.resolve_with("x", &ModelHints::default()).unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        assert!(
+            r.source.starts_with("[models] fallback (config test"),
+            "{}",
+            r.source
+        );
+        assert!(config(&format!("{user}\n[models]\nfallback = \"/\"\n")).is_err());
+        let c = config(&format!("{user}\n[models]\nfallback = \"nobody\"\n")).unwrap();
+        let e = c.resolve_with("x", &ModelHints::default()).unwrap_err();
+        assert!(e.0.contains("no model for role `x`"), "{e}");
+        // Inherit mode still gives every role its one model.
+        let c = config(&format!(
+            "{user}\n[models]\nprofile = \"inherit\"\ninherit = \"f/two\"\n"
+        ))
+        .unwrap();
+        let r = c
+            .resolve_with("x", &hints(Some("f/one"), None, Some("worker-backend")))
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+    }
 
     #[test]
     fn shipped_defaults_mirror_the_opencode_roster() {

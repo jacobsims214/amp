@@ -137,6 +137,94 @@ fn manager_dispatches_exactly_the_ten_workers() {
     assert!(reg.dispatchable(worker).is_empty());
 }
 
+/// #2234 (D11): `dispatch: true` lets the manager run a subagent whose id doesn't match its
+/// `task` rules, in `dispatchable` and in the before-tool hook alike; a manager rule that names
+/// the agent with deny still wins.
+#[test]
+fn dispatch_true_opts_a_subagent_in_unless_the_manager_names_it_denied() {
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("roles-dispatch");
+    let _ = std::fs::remove_dir_all(&base);
+    let agents = base.join("user/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let agent = |id: &str, extra: &str| {
+        std::fs::write(
+            agents.join(format!("{id}.md")),
+            format!("---\ndescription: {id}\nmode: subagent\n{extra}---\nDo {id}.\n"),
+        )
+        .unwrap();
+    };
+    agent("sql-expert", "dispatch: true\n");
+    agent("helper", "");
+    agent("blocked", "dispatch: true\n");
+    let load = || {
+        let assets = Assets::load(&OverrideDirs {
+            user: Some(base.join("user")),
+            repo: None,
+        })
+        .unwrap();
+        RoleRegistry::from_assets(&assets).unwrap()
+    };
+    let reg = load();
+    let ids: Vec<&str> = reg
+        .dispatchable(reg.manager())
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"sql-expert") && ids.contains(&"blocked"),
+        "{ids:?}"
+    );
+    assert!(!ids.contains(&"helper"), "{ids:?}");
+    let hook = reg.manager().tool_policy(ROOT);
+    assert!(allowed(
+        &hook,
+        "amp_run_ticket",
+        json!({"task_id": 1, "agent_id": "amp:sql-expert"})
+    ));
+    assert!(!allowed(
+        &hook,
+        "amp_run_ticket",
+        json!({"task_id": 1, "agent_id": "amp:helper"})
+    ));
+
+    // A manager override that denies `blocked` by name keeps it out; the catch-all doesn't.
+    let manager = Assets::embedded_agent_text("amp-manager").unwrap().replace(
+        "    \"amp-*\": allow\n",
+        "    \"amp-*\": allow\n    \"blocked\": deny\n",
+    );
+    assert!(manager.contains("\"blocked\": deny"));
+    std::fs::write(agents.join("amp-manager.md"), manager).unwrap();
+    let reg = load();
+    let ids: Vec<&str> = reg
+        .dispatchable(reg.manager())
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"sql-expert") && !ids.contains(&"blocked"),
+        "{ids:?}"
+    );
+    let hook = reg.manager().tool_policy(ROOT);
+    assert!(!allowed(
+        &hook,
+        "amp_run_ticket",
+        json!({"task_id": 1, "agent_id": "blocked"})
+    ));
+
+    // Bad values are errors naming the agent.
+    agent("bad", "dispatch: yes please\n");
+    let assets = Assets::load(&OverrideDirs {
+        user: Some(base.join("user")),
+        repo: None,
+    })
+    .unwrap();
+    let e = RoleRegistry::from_assets(&assets).unwrap_err().to_string();
+    assert!(
+        e.contains("agent bad: dispatch must be true or false"),
+        "{e}"
+    );
+}
+
 // ------------------------------------------------------------------------------------------------
 // The manager.
 // ------------------------------------------------------------------------------------------------

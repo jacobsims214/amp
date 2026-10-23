@@ -80,6 +80,7 @@ pub mod request_time;
 pub mod roles;
 pub mod run_report;
 pub mod supervisor;
+pub mod templates;
 pub mod text_tool_calls;
 pub mod tickets;
 pub mod tools;

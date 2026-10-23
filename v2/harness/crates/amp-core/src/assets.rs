@@ -356,6 +356,64 @@ impl Assets {
         &self.manifest
     }
 
+    /// The text of the embedded (built-in) agent file `id`, if there is one.
+    pub fn embedded_agent_text(id: &str) -> Option<&'static str> {
+        EMBEDDED
+            .get_file(format!("{AGENTS_DIR}/{id}.md"))
+            .and_then(|f| f.contents_utf8())
+    }
+
+    /// The embedded (built-in) skill file `<name>/<rel>`, if there is one.
+    pub fn embedded_skill_file(name: &str, rel: &str) -> Option<&'static [u8]> {
+        EMBEDDED
+            .get_file(format!("{SKILLS_DIR}/{name}/{rel}"))
+            .map(|f| f.contents())
+    }
+
+    /// Whether a built-in skill `name` exists.
+    pub fn is_embedded_skill(name: &str) -> bool {
+        EMBEDDED.get_dir(format!("{SKILLS_DIR}/{name}")).is_some()
+    }
+
+    /// Adds or replaces agent `id` with `text` as if it had been read from `origin`, with the same
+    /// checks as [`Assets::load`]. The CLI validates a new or edited agent this way before it
+    /// writes the file.
+    pub fn put_agent(&mut self, id: &str, text: &str, origin: Origin) -> Result<(), AssetError> {
+        let label = match &origin {
+            Origin::Embedded => format!("embedded {AGENTS_DIR}/{id}.md"),
+            Origin::User(p) | Origin::Repo(p) => p.display().to_string(),
+        };
+        let asset = AgentAsset::parse(id, text, origin, &label)?;
+        self.agents.insert(id.to_owned(), asset);
+        Ok(())
+    }
+
+    /// Adds or replaces file `rel` (`/`-separated, e.g. `SKILL.md`) of skill `name` (creating
+    /// the skill), with the same checks as [`Assets::load`].
+    pub fn put_skill_file(
+        &mut self,
+        name: &str,
+        rel: &str,
+        bytes: Vec<u8>,
+        origin: Origin,
+    ) -> Result<(), AssetError> {
+        if !valid_name(name) {
+            return Err(AssetError::invalid(
+                format!("{SKILLS_DIR}/{name}"),
+                "skill directory name must be lowercase letters, digits and hyphens",
+            ));
+        }
+        let mut files = self
+            .skills
+            .get(name)
+            .map(|s| s.files.clone())
+            .unwrap_or_default();
+        files.insert(rel.to_owned(), SkillFile { bytes, origin });
+        let skill = SkillAsset::from_files(name, files)?;
+        self.skills.insert(name.to_owned(), skill);
+        Ok(())
+    }
+
     /// The TUI's default role: the manifest's `default_agent`, else the first primary agent.
     pub fn default_agent(&self) -> Option<&AgentAsset> {
         self.manifest
@@ -502,7 +560,7 @@ fn md_stem(path: &Path) -> Option<String> {
 }
 
 /// Lowercase letters, digits and single hyphens, as rpi's skill names (and AMP agent ids).
-fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name
