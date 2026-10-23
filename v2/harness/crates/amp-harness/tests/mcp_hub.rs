@@ -858,6 +858,176 @@ async fn live_sessions_follow_connects_and_tool_list_changes() {
     rt.mcp_hub.shutdown().await;
 }
 
+/// #2240 (H7): a role's `mcp` rules (subject `<server>/<tool>`) shape its session: denied tools
+/// are left out when it is built and when a server adds a tool later, and a denied call is a
+/// visible tool error naming the rule.
+async fn the_mcp_permission_shapes_a_roles_tools() {
+    let dir = scratch("mcp-permission");
+    let amp = spawn(MockAmp::new(), None).await;
+    let home = dir.join("home");
+    let config = home.join(".config/amp-harness");
+    std::fs::create_dir_all(config.join("agents")).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!("{FAUX}\n{}", stdio_table("fs", "normal", "")),
+    )
+    .unwrap();
+    std::fs::write(
+        config.join("agents/amp-worker-backend.md"),
+        "---\ndescription: backend\nmode: subagent\npermission:\n  edit: allow\n  bash: allow\n  mcp:\n    \"*\": allow\n    \"fs/big\": deny\n    \"fs/extra\": deny\n    \"fs/sleep_*\": ask\n---\nPrompt.\n",
+    )
+    .unwrap();
+    let client = Arc::new(
+        AmpMcpClient::connect(ClientOptions::new(amp.url.clone()))
+            .await
+            .unwrap(),
+    );
+    let home_s = home.display().to_string();
+    let env = move |k: &str| match k {
+        "HOME" => Some(home_s.clone()),
+        "XDG_CONFIG_HOME" => Some(format!("{home_s}/.config")),
+        "XDG_STATE_HOME" => Some(format!("{home_s}/.local/state")),
+        _ => None,
+    };
+    let rt = Runtime::load(
+        client,
+        RuntimeOptions {
+            repo_root: None,
+            models: None,
+            keys: &StaticKeys::default(),
+            env: &env,
+            state_dir: None,
+        },
+    )
+    .unwrap();
+    rt.mcp_hub.start();
+    rt.mcp_hub.wait_started(true).await;
+    // The hub offers every tool; the role's policy drops the denied ones.
+    assert_eq!(
+        rt.mcp_hub
+            .session_view("amp-worker-backend", None, "k")
+            .tools
+            .len(),
+        5
+    );
+    let built = rt
+        .build(AgentSpec::new("worker-backend", dir.clone()))
+        .await
+        .unwrap();
+    let mcp: Vec<&str> = built
+        .tool_names
+        .iter()
+        .map(String::as_str)
+        .filter(|n| n.starts_with("mcp__"))
+        .collect();
+    assert_eq!(
+        mcp,
+        ["mcp__fs__echo", "mcp__fs__whereami", "mcp__fs__add_tool"],
+        "{:?}",
+        built.tool_names
+    );
+    let denial = built
+        .policy
+        .check("mcp__fs__big", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        denial.contains("mcp `fs/big` matches the rule \"fs/big\": deny"),
+        "{denial}"
+    );
+    assert!(
+        built
+            .policy
+            .check("mcp__fs__sleep_ms", &json!({}))
+            .unwrap_err()
+            .to_string()
+            .contains("ask is treated as deny")
+    );
+    assert!(built.policy.check("mcp__fs__echo", &json!({})).is_ok());
+
+    // A tool the server adds later (list_changed) that the rules deny never reaches the session.
+    call(&rt.mcp_hub, "mcp__fs__add_tool", json!({}))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rt.mcp_hub.health()[0].tools != 6 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(rt.mcp_hub.health()[0].tools, 6);
+    rt.mcp_hub.reconcile().await;
+    let names: Vec<String> = built
+        .harness
+        .get_tools()
+        .await
+        .unwrap()
+        .iter()
+        .map(|t| t.tool.schema().name.clone())
+        .collect();
+    assert!(names.contains(&"mcp__fs__echo".to_owned()), "{names:?}");
+    assert!(
+        !names.contains(&"mcp__fs__extra".to_owned())
+            && !names.contains(&"mcp__fs__big".to_owned()),
+        "{names:?}"
+    );
+    rt.mcp_hub.shutdown().await;
+}
+
+/// #2240: a denied external tool called anyway in `run -p` comes back as a tool error and the run
+/// goes on; the default (no `mcp` rule) manager is unaffected by another role's rules.
+async fn a_denied_mcp_call_is_a_visible_error_in_run_p() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup(
+        "mcp-deny-run",
+        &stdio_table("fs", "normal", ""),
+        json!([
+            {"tool_calls": [{"name": "mcp__fs__big", "arguments": {"n": 3}, "id": "c1"}]},
+            {"tool_calls": [{"name": "mcp__fs__echo", "arguments": {"text": "ok"}, "id": "c2"}]},
+            {"text": "done"}
+        ]),
+    );
+    let manager = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../assets/agents/amp-manager.md"
+    ))
+    .unwrap();
+    let manager = manager.replacen(
+        "\npermission:\n",
+        "\npermission:\n  mcp:\n    \"*\": allow\n    \"fs/big\": deny\n",
+        1,
+    );
+    assert!(manager.contains("\"fs/big\": deny"));
+    let agents = dir.join("home/.config/amp-harness/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    std::fs::write(agents.join("amp-manager.md"), manager).unwrap();
+    let out = harness(&dir, &amp.url, &["run", "-p", "go", "--json"], &[]).await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+    let ev = events(&out);
+    let tools: Vec<&str> = ev[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t.as_str().unwrap())
+        .collect();
+    assert!(tools.contains(&"mcp__fs__echo"), "{tools:?}");
+    assert!(!tools.contains(&"mcp__fs__big"), "{tools:?}");
+    let ends = tool_ends(&ev);
+    assert_eq!(ends.len(), 2, "{ends:?}");
+    // Left out of the list, so rpi answers "Tool mcp__fs__big not found"; a call that reached the
+    // hook would get the policy's denial (the_mcp_permission_shapes_a_roles_tools).
+    assert_eq!(ends[0]["is_error"], true, "{}", ends[0]);
+    assert!(
+        ends[0]["text"].as_str().unwrap().contains("mcp__fs__big"),
+        "{}",
+        ends[0]
+    );
+    assert_eq!(ends[1]["is_error"], false, "{}", ends[1]);
+    assert_eq!(ends[1]["text"], "hub-stdio: ok");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Runner
 
@@ -890,6 +1060,8 @@ fn main() {
         lazy_servers_wait_for_a_restart_and_calls_time_out,
         the_role_filter_and_disabled_servers,
         live_sessions_follow_connects_and_tool_list_changes,
+        the_mcp_permission_shapes_a_roles_tools,
+        a_denied_mcp_call_is_a_visible_error_in_run_p,
     ];
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
