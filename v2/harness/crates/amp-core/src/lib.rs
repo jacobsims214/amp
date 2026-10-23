@@ -76,6 +76,7 @@ pub mod faux;
 pub mod links;
 pub mod mcp_config;
 pub mod mcp_http;
+pub mod mcp_hub;
 pub mod mcp_stdio;
 pub mod mcp_tools;
 pub mod meta;

@@ -11,6 +11,11 @@
 //! `amp_complete_task` / `amp_block_task` carries its model, tokens, cost and git fields, and a
 //! worker that ends without closing its ticket is reported with `amp_report_run`. Every session
 //! also has the native `amp_session_usage` tool over its own live [`Totals`].
+//!
+//! External MCP servers (#2239): the runtime's [`amp_core::mcp_hub::McpHub`] is started here,
+//! before the session is built. A headless run (`wait_mcp`) waits for every background and eager
+//! server's first attempt (each bounded by its `startup_timeout_secs`); the chat waits only for
+//! eager ones and picks the rest up as they connect. Callers shut the hub down before exiting.
 
 use std::{
     path::{Path, PathBuf},
@@ -42,6 +47,8 @@ pub struct SessionRequest<'a> {
     /// #2178) instead of failing: no AMP tools until the caller connects it. Bad settings (an
     /// unparsable URL, an unreadable CA file) still fail.
     pub allow_offline: bool,
+    /// Wait for background MCP servers too (`run -p`); otherwise only for eager ones (the chat).
+    pub wait_mcp: bool,
 }
 
 pub struct Session {
@@ -54,6 +61,10 @@ pub struct Session {
     pub supervisor: Option<Arc<Supervisor>>,
     /// Why AMP could not be reached, when the session started offline (`allow_offline`).
     pub offline: Option<amp_mcp::McpError>,
+    /// MCP hub changes from before the hub started (a server ready, failed, its tools changed).
+    pub mcp_events: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
+    /// MCP servers still on their first attempt when the session was built.
+    pub mcp_starting: Vec<String>,
 }
 
 pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
@@ -112,6 +123,11 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         // --token-env's variable is a secret too: keep it out of bash (#2142).
         .with_secret_env(req.conn.token_env.as_deref()),
     );
+
+    // #2239: external MCP servers, connected in the background (waited for as asked).
+    let mcp_events = rt.mcp_hub.subscribe();
+    rt.mcp_hub.start();
+    let mcp_starting = rt.mcp_hub.wait_started(req.wait_mcp).await;
 
     let role_name = req
         .role
@@ -181,5 +197,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         cwd,
         supervisor,
         offline,
+        mcp_events,
+        mcp_starting,
     })
 }

@@ -983,6 +983,14 @@ impl Supervisor {
             spec.before_tool_call = hooks.before_tool_call(&info);
             spec.extra_tools.extend(hooks.extra_tools(&info));
         }
+        // #2239: a worker waits for shared MCP servers still on their first attempt (a no-op once
+        // they are up) and gets its own instances of worktree-scoped ones, released in finish().
+        let key = req.task_id.to_string();
+        self.rt.mcp_hub.wait_started(true).await;
+        if let Some(worktree) = &info.worktree {
+            spec.mcp.worktree = self.rt.mcp_hub.start_worktree(&key, worktree).await;
+        }
+        spec.mcp.output_key = Some(key);
         let built = match self.rt.build(spec).await {
             Ok(b) => b,
             Err(e) => {
@@ -1157,6 +1165,11 @@ impl Supervisor {
             notes,
             totals,
         };
+        // #2239: the worker's worktree-scoped MCP server instances end with it.
+        self.rt
+            .mcp_hub
+            .release_worktree(&info.task_id.to_string())
+            .await;
         if let Some(hooks) = &self.hooks {
             hooks.on_finish(info, &mut report).await;
         }

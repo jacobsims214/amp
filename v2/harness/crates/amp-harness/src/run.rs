@@ -20,6 +20,12 @@
 //! The manager gets `amp_run_ticket` (M2-5, see [`crate::session`]); Ctrl-C aborts the manager
 //! and cancels its workers.
 //!
+//! External MCP servers (#2239): `run -p` waits for each configured server's first connection
+//! attempt (bounded by its `startup_timeout_secs`) so a headless run sees the same tools every
+//! time; a server that is not ready by then is one `amp-harness: MCP server ...` warning line on
+//! stderr, not a failure. `--json`'s `session` lists them under `mcp_servers`. Every server is
+//! shut down (stdio process groups included) before the command exits.
+//!
 //! The faux provider (`api = "faux"` in config.toml) plus `AMP_HARNESS_FAUX_SCRIPT` runs it
 //! offline and deterministically.
 
@@ -199,7 +205,27 @@ fn session_json(rt: &Runtime, agent: &BuiltAgent, project: Option<&ProjectMarker
         "context_files": agent.context_files,
         "session_file": agent.session_file,
         "faux_scripted": rt.faux_scripted,
+        "mcp_servers": rt.mcp_hub.health(),
     })
+}
+
+/// One stderr line per MCP server that is not ready for a headless run.
+fn mcp_warnings(rt: &Runtime, starting: &[String]) {
+    use amp_core::mcp_hub::ServerStatus;
+    for h in rt.mcp_hub.health() {
+        let label = match &h.instance {
+            Some(i) => format!("{} (#{i})", h.name),
+            None => h.name.clone(),
+        };
+        match &h.status {
+            ServerStatus::Ready | ServerStatus::Idle | ServerStatus::Disabled => {}
+            ServerStatus::Starting if starting.contains(&h.name) => eprintln!(
+                "amp-harness: MCP server `{label}` is still starting; this run goes on without its tools"
+            ),
+            ServerStatus::Starting => {}
+            other => eprintln!("amp-harness: MCP server `{label}`: {other}"),
+        }
+    }
 }
 
 pub async fn run(args: RunArgs) -> Result<(), CliError> {
@@ -214,9 +240,10 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let session::Session {
         rt,
         agent,
-        events: mut rx,
+        events: rx,
         project,
         supervisor,
+        mcp_starting,
         ..
     } = session::build(session::SessionRequest {
         conn: &args.conn,
@@ -225,9 +252,25 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         memory: args.no_session || args.print_system_prompt,
         // Headless: no AMP, no run (the message says why and what to do).
         allow_offline: false,
+        wait_mcp: true,
     })
     .await?;
+    mcp_warnings(&rt, &mcp_starting);
+    let result = drive(&args, prompt, &rt, agent, rx, project, supervisor).await;
+    // #2239: stdio servers get EOF and their process groups are killed before we exit.
+    rt.mcp_hub.shutdown().await;
+    result
+}
 
+async fn drive(
+    args: &RunArgs,
+    prompt: Option<String>,
+    rt: &Arc<Runtime>,
+    agent: BuiltAgent,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<rpi_agent::AgentEvent>,
+    project: Option<ProjectMarker>,
+    supervisor: Option<Arc<amp_core::supervisor::Supervisor>>,
+) -> Result<(), CliError> {
     if args.print_system_prompt {
         println!("{}", agent.full_system_prompt(&rt.skills));
         return Ok(());
@@ -235,7 +278,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
     let prompt = prompt.expect("clap requires -p unless --print-system-prompt");
 
     if args.json {
-        emit_json(&session_json(&rt, &agent, project.as_ref()));
+        emit_json(&session_json(rt, &agent, project.as_ref()));
     }
 
     let harness = Arc::clone(&agent.harness);

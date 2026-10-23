@@ -23,6 +23,8 @@ serde.workspace = true
 # through schemars' feature unification today; this makes it explicit.
 serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
+# #2239: the MCP hub logs reconnects and skipped tools.
+tracing.workspace = true
 include_dir.workspace = true
 yaml_serde.workspace = true
 async-trait.workspace = true

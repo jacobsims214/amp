@@ -198,6 +198,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         cwd: args.cwd.as_deref(),
         memory: args.no_session,
         allow_offline: true,
+        // #2239: only eager MCP servers hold the chat up; the rest join as they connect.
+        wait_mcp: false,
     })
     .await?;
     let settings = args.conn.settings()?;
@@ -253,6 +255,9 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         ));
     }
     let mut events = session.events;
+    // #2239: one transcript line per MCP server change ("github: 12 tools", a failure).
+    tokio::spawn(forward_mcp_events(session.mcp_events, shell.notifier()));
+    let hub = Arc::clone(&session.rt.mcp_hub);
 
     let Some((width, height)) = args.snapshot else {
         shell.set_meta(start_meta(&args.conn, project_id)?);
@@ -264,6 +269,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         }
         let session_file = session.agent.session_file.clone();
         let result = amp_tui::terminal::run(shell, events, done).await;
+        // Stdio MCP servers get EOF and their process groups are killed before we exit.
+        hub.shutdown().await;
         // Back on the main screen: where the conversation was saved (#2184).
         let home = std::env::var_os("HOME").map(PathBuf::from);
         if let Some(line) = exit_line(session_file.as_deref(), home.as_deref()) {
@@ -326,7 +333,24 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     for line in lines {
         println!("{line}");
     }
+    hub.shutdown().await;
     Ok(())
+}
+
+/// Puts each MCP hub change in the transcript until the hub goes away.
+async fn forward_mcp_events(
+    mut rx: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
+    notes: amp_tui::Notifier,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match rx.recv().await {
+            Ok(event) if event.is_error() => notes.error(event.line()),
+            Ok(event) => notes.notice(event.line()),
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => break,
+        }
+    }
 }
 
 /// The offline session's background retry (#2178): connect with backoff until it works, or until

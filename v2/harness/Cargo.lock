@@ -82,6 +82,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tracing",
  "unicode-normalization",
  "yaml_serde",
 ]
