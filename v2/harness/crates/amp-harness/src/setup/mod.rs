@@ -246,7 +246,7 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
         let text = preset::read(source).await?;
         let checked = preset::check(&text, source)?;
         let config = ConfigFile::new(config_path(&args.conn)?);
-        let a = preset::apply(&checked, &config)?;
+        let mut a = preset::apply(&checked, &config)?;
         ui.say(&format!(
             "Applied the org preset{} ({source}) to {}.",
             a.name
@@ -284,6 +284,13 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
         }
         for name in &a.mcp {
             ui.say(&format!("  mcp server: {name}"));
+        }
+        // #2243: the secrets the preset's MCP servers declare are asked now (hidden, into the
+        // keychain); without a person or a keychain the summary says how to store them.
+        a.mcp_secrets_needed =
+            crate::mcp_crud::ask_preset_secrets(ui.as_mut(), &config.path, &a.mcp);
+        for note in &a.mcp_secrets_needed {
+            ui.say(&format!("  note: {note}"));
         }
         if conn_args.url.is_none() {
             conn_args.url = checked.server_url.clone();
@@ -1407,7 +1414,7 @@ pub(crate) fn display_name(p: &ProviderConfig) -> String {
 }
 
 /// `AMP_CREDENTIAL_STORE=file`: the person turned the OS keychain off.
-fn credential_store_is_file() -> bool {
+pub(crate) fn credential_store_is_file() -> bool {
     std::env::var(amp_mcp::ENV_CREDENTIAL_STORE)
         .is_ok_and(|v| v.trim().eq_ignore_ascii_case("file"))
 }

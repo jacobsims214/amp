@@ -331,6 +331,25 @@ pub fn noninteractive_env(env: &mut HashMap<String, String>) {
     }
 }
 
+/// What stdio MCP servers must not inherit, computed the way [`Runtime::load`] does
+/// ([`crate::mcp_stdio::strip_set`] of the secret names and `[secrets] pass_to_bash`), for a hub
+/// built outside a runtime (the `amp-harness mcp` CLI, #2243). An unreadable `[secrets]` table
+/// strips the secret names only.
+pub fn mcp_strip_names(
+    models: &ModelsConfig,
+    mcp: &crate::mcp_config::McpConfig,
+) -> BTreeSet<String> {
+    let pass_env = harness_config_from(models)
+        .map(|f| pass_env_from(&f))
+        .unwrap_or_default();
+    let secret_env: BTreeSet<String> = secret_env_names(models)
+        .into_iter()
+        .chain(mcp.secret_env_names())
+        .filter(|n| !pass_env.contains(n))
+        .collect();
+    crate::mcp_stdio::strip_set(&secret_env, &pass_env)
+}
+
 /// The names [`Runtime::secret_env`] starts from: `AMP_TOKEN` and every provider's `key_env`.
 pub fn secret_env_names(models: &ModelsConfig) -> BTreeSet<String> {
     let mut names: BTreeSet<String> = models

@@ -543,6 +543,14 @@ impl Cell {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The live client and its tools, or why there is none (naming the server).
+    fn connection(&self) -> Result<(Arc<ExternalClient>, Vec<McpToolDef>), String> {
+        let client = self
+            .client()
+            .map_err(|e| format!("MCP server `{}` {e}", self.server.name))?;
+        Ok((client, self.lock().tools.clone()))
+    }
+
     fn client(&self) -> Result<Arc<ExternalClient>, String> {
         let st = self.lock();
         match &st.client {
@@ -679,6 +687,14 @@ impl WorktreeSet {
 
     pub fn health(&self) -> Vec<ServerHealth> {
         self.cells.values().map(|c| c.health()).collect()
+    }
+
+    /// This set's instance of `name`: its client and tools ([`McpHub::connection`]).
+    pub fn connection(&self, name: &str) -> Result<(Arc<ExternalClient>, Vec<McpToolDef>), String> {
+        self.cells
+            .get(name)
+            .ok_or_else(|| format!("MCP server `{name}` has no instance here"))?
+            .connection()
     }
 }
 
@@ -916,6 +932,16 @@ impl McpHub {
 
     /// Every server: shared ones, running worktree instances, worktree-scoped servers with no
     /// instance (shown idle), disabled ones and broken ones (stopped, with the problem).
+    /// A connected shared server's client and the tools it listed, for the CLI (`amp-harness mcp
+    /// test`, `mcp call --server`, `mcp tools --server`, #2243). Sessions never use this: their
+    /// tools go through the cell, so a reconnect is invisible to them.
+    pub fn connection(&self, name: &str) -> Result<(Arc<ExternalClient>, Vec<McpToolDef>), String> {
+        self.inner
+            .shared_cell(name)
+            .ok_or_else(|| format!("MCP server `{name}` is not running in this hub"))?
+            .connection()
+    }
+
     pub fn health(&self) -> Vec<ServerHealth> {
         let config = self.inner.config();
         let mut out: Vec<ServerHealth> = self

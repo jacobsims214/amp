@@ -343,9 +343,9 @@ async fn mcp_call_prints_json_text_raw_and_errors() {
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("JSON object"), "{}", out.stderr);
 
-    // Hidden from --help.
+    // #2243: the `mcp` group is no longer hidden (it manages MCP servers now).
     let out = run(&dir, &amp.url, &["--help"], &[]).await;
-    assert!(!out.stdout.contains("\n  mcp "), "{}", out.stdout);
+    assert!(out.stdout.contains("\n  mcp "), "{}", out.stdout);
     assert!(out.stdout.contains("doctor") && out.stdout.contains("tickets"));
 }
 

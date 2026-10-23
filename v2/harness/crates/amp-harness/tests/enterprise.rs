@@ -552,7 +552,8 @@ async fn a_preset_from_a_url_and_bad_presets() {
         "[preset]\nname = \"Local\"\n[providers.example]\nbase_url = \"{}\"\nauth = \"none\"\n\
          models = [\"engineer\", \"orchestrator\"]\n[roles]\ndefault = \"engineer\"\n\
          manager = \"orchestrator\"\nreviewers = \"orchestrator\"\n\
-         [mcp.docs]\ntype = \"http\"\nurl = \"https://mcp.example.com/mcp\"\n",
+         [mcp.docs]\ntype = \"http\"\nurl = \"https://mcp.example.com/mcp\"\n\
+         secret_headers = [\"X-Api-Key\"]\n",
         endpoint.url
     );
     let secret = format!(
@@ -623,6 +624,15 @@ async fn a_preset_from_a_url_and_bad_presets() {
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
     let v: Value = out.json();
     assert_eq!(v["preset"]["mcp"], serde_json::json!(["docs"]));
+    // #2243: the server's secret header can't be asked here (no person, no keychain); the summary
+    // names the command that stores it.
+    let needed = v["preset"]["mcp_secrets_needed"][0]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        needed.contains("header X-Api-Key") && needed.contains("amp-harness mcp secret docs"),
+        "{v}"
+    );
     assert_eq!(v["providers"]["example"], "not needed");
     let text = config(&dir);
     assert!(text.contains("[mcp.docs]"), "{text}");

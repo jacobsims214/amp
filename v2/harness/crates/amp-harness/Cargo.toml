@@ -39,6 +39,10 @@ serde_json.workspace = true
 rpi-ai.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "process"] }
 tokio-util.workspace = true
+# tests/mcp_cli.rs (#2243): amp-mcp's legacy SSE mock (futures) and the scripted OAuth browser
+# (reqwest); both already in the lock.
+futures.workspace = true
+reqwest.workspace = true
 # tests/doctor.rs: an HTTPS mock AMP signed by a private CA.
 rcgen.workspace = true
 time.workspace = true
@@ -51,6 +55,11 @@ nix = { version = "0.29", default-features = false, features = ["term"] }
 # tests/mcp_hub.rs re-runs its own binary as the stdio MCP server, so it owns main() (#2239).
 [[test]]
 name = "mcp_hub"
+harness = false
+
+# tests/mcp_cli.rs runs its own binary as a stdio MCP server too (#2243).
+[[test]]
+name = "mcp_cli"
 harness = false
 
 [lints]
