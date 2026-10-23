@@ -843,16 +843,30 @@ impl Check {
     }
 }
 
-/// A role's policy bound to a worktree root: what the before-tool hook enforces.
-#[derive(Debug, Clone)]
+/// A role's policy bound to a worktree root: what the before-tool hook enforces. Its rules can be
+/// replaced in place ([`ToolPolicy::replace_policy`], #2242), so every holder (the hook, the MCP
+/// hub, `/server`) enforces the new ones from the next call.
+#[derive(Debug)]
 pub struct ToolPolicy {
     role: String,
     child: bool,
-    policy: Policy,
+    policy: std::sync::RwLock<Policy>,
     root: PathBuf,
     /// Model-facing `mcp__…` name -> `<server>/<tool>` (the server's own tool name), as the hub
     /// named the tools this session was given. Shared by clones.
     mcp_subjects: Arc<RwLock<std::collections::HashMap<String, String>>>,
+}
+
+impl Clone for ToolPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            role: self.role.clone(),
+            child: self.child,
+            policy: std::sync::RwLock::new(self.policy()),
+            root: self.root.clone(),
+            mcp_subjects: Arc::clone(&self.mcp_subjects),
+        }
+    }
 }
 
 type HookFuture = Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>;
@@ -869,7 +883,7 @@ impl ToolPolicy {
         Self {
             role: role.into(),
             child,
-            policy,
+            policy: std::sync::RwLock::new(policy),
             root: lexical_normalize(&root.into()),
             mcp_subjects: Arc::default(),
         }
@@ -913,8 +927,19 @@ impl ToolPolicy {
         self.child
     }
 
-    pub fn policy(&self) -> &Policy {
-        &self.policy
+    /// The rules in force now (a copy).
+    pub fn policy(&self) -> Policy {
+        self.rules().clone()
+    }
+
+    /// Puts `policy` in force in place of the current rules (a role's permissions changed and
+    /// the live session takes them: `/reload`, #2242).
+    pub fn replace_policy(&self, policy: Policy) {
+        *self.policy.write().unwrap_or_else(|e| e.into_inner()) = policy;
+    }
+
+    fn rules(&self) -> std::sync::RwLockReadGuard<'_, Policy> {
+        self.policy.read().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn root(&self) -> &Path {
@@ -930,11 +955,11 @@ impl ToolPolicy {
         }
         if let Some(subject) = self.mcp_subject(tool) {
             // One exact subject per tool: the rules decide it once and for all.
-            if !self.policy.evaluate(MCP_PERMISSION, &subject).allows() {
+            if !self.rules().evaluate(MCP_PERMISSION, &subject).allows() {
                 return false;
             }
         }
-        !self.policy.denies_everything(permission_for(tool))
+        !self.rules().denies_everything(permission_for(tool))
     }
 
     /// Keep the tools this role may see ([`Self::exposes`]).
@@ -984,7 +1009,7 @@ impl ToolPolicy {
             "bash" | "powershell" => {
                 let script = str_arg(args, &["command"]).ok_or_else(missing)?;
                 let scan = scan_shell(script);
-                if !self.policy.allows_everything("bash") {
+                if !self.rules().allows_everything("bash") {
                     // First: when the split itself is in doubt, the other flags are too.
                     if scan.unparseable {
                         return Err(deny(script.to_string(), DenialReason::Unparseable));
@@ -1047,8 +1072,12 @@ impl ToolPolicy {
     /// `Ok(())` to let the call run, `Err` with the reason the model will see.
     pub fn check(&self, tool: &str, args: &Value) -> Result<(), Box<Denial>> {
         for check in self.checks(tool, args)? {
-            let rule = self.policy.matching_rule(&check.permission, &check.subject);
+            let rule = self
+                .rules()
+                .matching_rule(&check.permission, &check.subject)
+                .cloned();
             let action = rule
+                .as_ref()
                 .map(|r| r.action)
                 .unwrap_or_else(|| default_action(&check.permission));
             if !action.allows() {
@@ -1057,7 +1086,7 @@ impl ToolPolicy {
                     tool: tool.to_string(),
                     permission: check.permission,
                     subject: check.subject,
-                    rule: rule.cloned(),
+                    rule,
                     reason: if action == Action::Ask {
                         DenialReason::Ask
                     } else {

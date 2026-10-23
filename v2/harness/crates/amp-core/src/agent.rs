@@ -30,6 +30,11 @@
 //!   [`crate::mcp_hub::McpHub`]. The session is attached to the hub, which keeps both in step as
 //!   servers connect, restart or change their tools.
 //! - **Session:** in memory, or a JSONL file under the state directory.
+//! - **Reload (#2242):** [`Runtime::reload`] re-reads agents, skills, models and `[mcp.*]` from
+//!   the same files (a CLI in another terminal changed them) and puts them in place for sessions
+//!   built from then on; [`Runtime::refresh_session`] brings a live session (the chat's manager)
+//!   up to date from its next run. Sessions already running (workers) keep what they were built
+//!   with.
 //! - **Bash environment:** the process environment minus the harness's own secrets (#2142):
 //!   `AMP_TOKEN`, the `--token-env` variable and every provider's `key_env`. A worker that runs
 //!   `env` never puts them in its transcript. `[secrets] pass_to_bash = [...]` in config.toml
@@ -71,9 +76,10 @@ use rpi_tools::{
 use crate::{
     assets::{AssetError, Assets, OverrideDirs},
     faux::{FauxScriptError, ScriptFile},
-    mcp_hub::{HubOptions, McpHub, WorktreeSet, with_mcp_instructions},
+    mcp_config::McpConfig,
+    mcp_hub::{HubOptions, McpHub, McpReload, WorktreeSet, with_mcp_instructions},
     mcp_tools,
-    models::{ModelsConfig, ModelsError, ResolvedRole},
+    models::{ModelsConfig, ModelsError, ResolvedRole, thinking_name},
     policy::ToolPolicy,
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::{KeyLookup, ProviderSet},
@@ -115,10 +121,36 @@ pub fn state_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".local/state/amp-harness"))
 }
 
-/// Everything sessions in one process share.
-pub struct Runtime {
+/// The agents and skills sessions are built from: what [`Runtime::reload`] replaces as one.
+#[derive(Debug, Clone)]
+pub struct Catalog {
     pub assets: Assets,
     pub roles: RoleRegistry,
+    /// Every skill, written to disk so the model can read them (and their scripts) by path.
+    pub skills: Vec<Skill>,
+}
+
+impl Catalog {
+    /// Loads the assets with their user and repo overrides, the roles, and writes the skills
+    /// under `<state>/skills/<assets hash>/`.
+    fn load(paths: &amp_mcp::ConfigPaths, state_dir: &Path) -> Result<Self, AgentError> {
+        let assets = Assets::load(&OverrideDirs::from_paths(paths))?;
+        let roles = RoleRegistry::from_assets(&assets)?;
+        let hash = assets.manifest().source_sha256.clone();
+        let short = if hash.len() >= 12 { &hash[..12] } else { "dev" };
+        let skills = assets.materialize_skills(&state_dir.join("skills").join(short))?;
+        Ok(Self {
+            assets,
+            roles,
+            skills,
+        })
+    }
+}
+
+/// Everything sessions in one process share.
+pub struct Runtime {
+    /// Agents, roles and skills; [`Runtime::catalog`] gives the current ones.
+    catalog: std::sync::RwLock<Arc<Catalog>>,
     /// The models config and providers as loaded. After [`Runtime::reload_models`] (a provider
     /// connected in the chat, #2163) sessions use [`Runtime::current_models`] /
     /// [`Runtime::current_providers`] instead.
@@ -126,8 +158,6 @@ pub struct Runtime {
     pub providers: ProviderSet,
     /// What [`Runtime::reload_models`] put in place, if anything.
     reloaded: std::sync::RwLock<Option<(ModelsConfig, ProviderSet)>>,
-    /// Every skill, written to disk so the model can read them (and their scripts) by path.
-    pub skills: Vec<Skill>,
     pub mcp: Arc<AmpMcpClient>,
     pub state_dir: PathBuf,
     /// The user's harness config dir (`~/.config/amp-harness`): its `AGENTS.md` is the global
@@ -143,9 +173,10 @@ pub struct Runtime {
     /// `AMP_HARNESS_CEILING_DIR`: context files above it are not loaded.
     pub ceiling_dir: Option<PathBuf>,
     /// Environment variables removed from every bash call: `AMP_TOKEN`, every provider's
-    /// `key_env` and (via [`Runtime::with_secret_env`]) the `--token-env` variable, minus
-    /// `pass_env`. Names only; values are never held here.
-    pub secret_env: BTreeSet<String>,
+    /// `key_env`, every variable an MCP server reads a secret from and (via
+    /// [`Runtime::with_secret_env`]) the `--token-env` variable, minus `pass_env`. Names only;
+    /// values are never held here. A reload only adds names ([`Runtime::secret_env`]).
+    secret_env: std::sync::RwLock<BTreeSet<String>>,
     /// `[secrets] pass_to_bash` in config.toml: secrets passed to bash on purpose.
     pub pass_env: BTreeSet<String>,
     /// The bash tool's default timeout in seconds, when the model passes none (#2143). `None`:
@@ -354,10 +385,7 @@ impl Runtime {
     /// environment, and materializes the skills under `<state>/skills/<assets hash>/`.
     pub fn load(mcp: Arc<AmpMcpClient>, opts: RuntimeOptions<'_>) -> Result<Self, AgentError> {
         let paths = amp_mcp::config_paths::current(opts.env).with_repo(opts.repo_root.as_deref());
-        let dirs = OverrideDirs::from_paths(&paths);
-        let config_dir = dirs.user.clone();
-        let assets = Assets::load(&dirs)?;
-        let roles = RoleRegistry::from_assets(&assets)?;
+        let config_dir = OverrideDirs::from_paths(&paths).user;
         let models = match opts.models {
             Some(m) => m,
             None => ModelsConfig::load_paths(opts.env, &paths)?,
@@ -378,9 +406,7 @@ impl Runtime {
             .ok_or_else(|| {
                 AgentError::Io("no state directory: set HOME or XDG_STATE_HOME".into())
             })?;
-        let hash = assets.manifest().source_sha256.clone();
-        let short = if hash.len() >= 12 { &hash[..12] } else { "dev" };
-        let skills = assets.materialize_skills(&state_dir.join("skills").join(short))?;
+        let catalog = Catalog::load(&paths, &state_dir)?;
         let file = harness_config_from(&models)?;
         let pass_env = pass_env_from(&file);
         let bash_timeout = bash_timeout_from(
@@ -409,12 +435,10 @@ impl Runtime {
         let mcp_hub = McpHub::new(mcp_config, hub_options);
         mcp_hub.set_strip(crate::mcp_stdio::strip_set(&secret_env, &pass_env));
         Ok(Self {
-            assets,
-            roles,
+            catalog: std::sync::RwLock::new(Arc::new(catalog)),
             models,
             providers,
             reloaded: std::sync::RwLock::new(None),
-            skills,
             mcp,
             state_dir,
             config_dir,
@@ -423,7 +447,7 @@ impl Runtime {
             ceiling_dir: (opts.env)(ENV_CEILING_DIR)
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
-            secret_env,
+            secret_env: std::sync::RwLock::new(secret_env),
             pass_env,
             bash_timeout,
             mcp_hub: Arc::new(mcp_hub),
@@ -432,17 +456,36 @@ impl Runtime {
 
     /// Also removes `name` from bash calls (the `--token-env` variable), unless it is in
     /// `[secrets] pass_to_bash`.
-    pub fn with_secret_env(mut self, name: Option<&str>) -> Self {
-        if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty())
-            && !self.pass_env.contains(name)
-        {
-            self.secret_env.insert(name.to_owned());
-            self.mcp_hub.set_strip(crate::mcp_stdio::strip_set(
-                &self.secret_env,
-                &self.pass_env,
-            ));
+    pub fn with_secret_env(self, name: Option<&str>) -> Self {
+        if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+            self.hide_env([name.to_owned()]);
         }
         self
+    }
+
+    /// Adds `names` to [`Runtime::secret_env`] (those in `[secrets] pass_to_bash` excepted) and
+    /// tells the MCP hub, so stdio servers started from now on don't inherit them either.
+    fn hide_env(&self, names: impl IntoIterator<Item = String>) {
+        let mut set = self.secret_env.write().unwrap_or_else(|e| e.into_inner());
+        let before = set.len();
+        set.extend(names.into_iter().filter(|n| !self.pass_env.contains(n)));
+        if set.len() != before {
+            self.mcp_hub
+                .set_strip(crate::mcp_stdio::strip_set(&set, &self.pass_env));
+        }
+    }
+
+    /// The variables removed from bash calls now (names only).
+    pub fn secret_env(&self) -> BTreeSet<String> {
+        self.secret_env
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The agents, roles and skills sessions are built from now.
+    pub fn catalog(&self) -> Arc<Catalog> {
+        Arc::clone(&self.catalog.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// The models config sessions are built with now.
@@ -472,15 +515,219 @@ impl Runtime {
         providers
     }
 
-    pub fn role(&self, name: &str) -> Result<&Role, AgentError> {
-        self.roles
+    /// Re-reads everything a CLI in another terminal may have changed (#2242, the chat's
+    /// `/reload`): agents and skills (built-in < user < repo), the models config (`[models]`,
+    /// `[roles]`, `[providers]`, with `keys` as they are now) and `[mcp.*]`, from the files this
+    /// runtime was loaded from ([`Runtime::paths`]).
+    ///
+    /// Agents, skills and models are all-or-nothing: if any of them fails to load (a broken
+    /// agent file, an unparsable config.toml) nothing changes and the error says what to fix. A
+    /// broken `[mcp]` table is not fatal; its server is left out and named in
+    /// [`McpReload::problems`].
+    ///
+    /// Sessions built from now on (workers the manager dispatches next) use what was loaded;
+    /// sessions already running keep what they were built with, except that the MCP hub keeps
+    /// attached sessions' `mcp__*` tools in step from their next run ([`McpHub::reload`]). A live
+    /// session that should take the rest too (the chat's manager) calls
+    /// [`Runtime::refresh_session`]. New secret variable names (a provider's `key_env`, an MCP
+    /// server's) are hidden from bash; none is ever un-hidden. `[secrets]`, `[tools]` and
+    /// `[workers]` are read at start only.
+    pub async fn reload(
+        &self,
+        keys: &(dyn KeyLookup + Sync),
+        env: &(dyn Fn(&str) -> Option<String> + Sync),
+    ) -> Result<Reloaded, AgentError> {
+        // Read everything first: a failure here leaves the runtime as it was.
+        let catalog = Catalog::load(&self.paths, &self.state_dir)?;
+        let models = ModelsConfig::load_paths(env, &self.paths)?;
+        let mcp_config = McpConfig::load(&self.paths);
+
+        let old_catalog = self.catalog();
+        let old_models = self.current_models();
+        let mut report = Reloaded {
+            agents: Changes::between(
+                old_catalog.roles.roles().map(|r| (r.id.as_str(), r)),
+                catalog.roles.roles().map(|r| (r.id.as_str(), r)),
+            ),
+            skills: Changes::between(
+                old_catalog
+                    .skills
+                    .iter()
+                    .map(|s| (s.name.as_str(), skill_key(s))),
+                catalog
+                    .skills
+                    .iter()
+                    .map(|s| (s.name.as_str(), skill_key(s))),
+            ),
+            providers: Changes::between(
+                old_models
+                    .providers
+                    .iter()
+                    .map(|(id, p)| (id.as_str(), format!("{p:?}"))),
+                models
+                    .providers
+                    .iter()
+                    .map(|(id, p)| (id.as_str(), format!("{p:?}"))),
+            ),
+            ..Reloaded::default()
+        };
+        for role in catalog.roles.roles() {
+            let Some(old_role) = old_catalog.roles.get(&role.id) else {
+                continue;
+            };
+            let from = describe_model(old_role.resolve_model(&old_models));
+            let to = describe_model(role.resolve_model(&models));
+            if from != to {
+                report.models.push(ModelChange {
+                    role: role.id.clone(),
+                    from,
+                    to,
+                });
+            }
+        }
+
+        *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(catalog);
+        self.hide_env(secret_env_names(&models));
+        self.reload_models(models, keys);
+        // Before the hub starts anything: a new stdio server must not inherit a new secret.
+        self.hide_env(mcp_config.secret_env_names());
+        report.mcp = self.mcp_hub.reload(mcp_config).await;
+        Ok(report)
+    }
+
+    /// Brings a live session (the chat's manager) up to date after [`Runtime::reload`], from its
+    /// next run, for its role as the catalog has it now:
+    /// - its system prompt is rebuilt (role prompt, preloaded skills, `AGENTS.md` files re-read;
+    ///   the MCP blocks kept) and it lists the current skills;
+    /// - its policy takes the role's current rules in place ([`ToolPolicy::replace_policy`]: the
+    ///   before-tool hook, the MCP hub and `/server` hold the same policy). That is how a new
+    ///   `dispatch: true` agent becomes dispatchable; tools the new rules deny everywhere leave
+    ///   its tool list, and built-in or AMP tools they now allow join it;
+    /// - `replace_tools` take the place of its tools of the same names (a fresh `amp_run_ticket`
+    ///   listing the new roster).
+    ///
+    /// The transcript stays. Its model is not changed here: the caller switches it
+    /// ([`Refreshed::resolved`]).
+    pub async fn refresh_session(&self, live: LiveSession<'_>) -> Result<Refreshed, AgentError> {
+        let catalog = self.catalog();
+        let role = catalog
+            .roles
+            .get(live.role)
+            .cloned()
+            .ok_or_else(|| AgentError::UnknownRole(live.role.to_owned()))?;
+        let (exec, builtin) = self.builtin_tools(live.cwd);
+        let context_files = self.context_files(&exec, live.cwd).await;
+        let base = self.system_prompt_with(
+            &catalog,
+            &SystemPromptInput {
+                role: &role,
+                cwd: live.cwd,
+                project: live.project,
+                extra_context: live.extra_context,
+                context_files: &context_files,
+            },
+        );
+        let before = live
+            .harness
+            .get_system_prompt()
+            .await
+            .map_err(harness_error)?
+            .unwrap_or_default();
+        let after = self
+            .mcp_hub
+            .set_session_prompt(live.harness, &base)
+            .await
+            .map_err(AgentError::Harness)?;
+
+        let mut resources = live.harness.get_resources().await.map_err(harness_error)?;
+        let skills_before = resources.skills.clone().unwrap_or_default();
+        resources.skills = Some(catalog.skills.clone());
+        resources.context_files = context_files
+            .iter()
+            .map(|f| f.path.to_string_lossy().into_owned())
+            .collect();
+        live.harness
+            .set_resources(resources)
+            .await
+            .map_err(harness_error)?;
+
+        // The role's rules now, in force for every holder of this session's policy.
+        let rules = role.tool_policy(live.cwd).policy();
+        let policy_changed = rules != live.policy.policy();
+        if policy_changed {
+            live.policy.replace_policy(rules);
+        }
+
+        // Tools: replaced ones by name; the rest kept unless the rules now deny them
+        // everywhere; built-in and AMP tools the rules now allow added. `mcp__*` tools are the
+        // hub's (re-applied below).
+        let replaced: BTreeSet<String> = live
+            .replace_tools
+            .iter()
+            .map(|t| t.tool.schema().name.clone())
+            .collect();
+        let current = live.harness.get_tools().await.map_err(harness_error)?;
+        let before_names: Vec<String> = current
+            .iter()
+            .map(|t| t.tool.schema().name.clone())
+            .collect();
+        let mut tools: Vec<HarnessTool> = current
+            .into_iter()
+            .filter(|t| {
+                let name = &t.tool.schema().name;
+                !replaced.contains(name)
+                    && (name.starts_with(crate::mcp_config::TOOL_PREFIX)
+                        || live.policy.exposes(name))
+            })
+            .collect();
+        tools.extend(filter_harness_tools(live.policy, live.replace_tools));
+        let mut candidates = builtin;
+        if policy_changed && self.mcp.is_online() {
+            candidates.extend(mcp_tools::amp_tools(&self.mcp).await?);
+        }
+        for tool in filter_harness_tools(live.policy, candidates) {
+            let name = tool.tool.schema().name.clone();
+            if !tools.iter().any(|t| t.tool.schema().name == name) {
+                tools.push(tool);
+            }
+        }
+        let names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
+        if names != before_names || !replaced.is_empty() {
+            live.harness
+                .set_tools(tools, Some(names))
+                .await
+                .map_err(harness_error)?;
+        }
+        if policy_changed {
+            self.mcp_hub.reapply(live.harness).await;
+        }
+
+        Ok(Refreshed {
+            prompt_changed: before != after,
+            skills_changed: skills_before.iter().map(skill_key).collect::<Vec<_>>()
+                != catalog.skills.iter().map(skill_key).collect::<Vec<_>>(),
+            policy_changed,
+            resolved: role.resolve_model(&self.current_models()).ok(),
+        })
+    }
+
+    /// The role `name` names now (a copy: a reload may replace the registry).
+    pub fn role(&self, name: &str) -> Result<Role, AgentError> {
+        self.catalog()
+            .roles
             .get(name)
+            .cloned()
             .ok_or_else(|| AgentError::UnknownRole(name.to_owned()))
     }
 
     /// Builds one session.
     pub async fn build(&self, spec: AgentSpec) -> Result<BuiltAgent, AgentError> {
-        let role = self.role(&spec.role)?.clone();
+        let catalog = self.catalog();
+        let role = catalog
+            .roles
+            .get(&spec.role)
+            .cloned()
+            .ok_or_else(|| AgentError::UnknownRole(spec.role.clone()))?;
         let models = self.current_models();
         let providers = self.current_providers();
         let resolved = role.resolve_model(&models)?;
@@ -488,26 +735,7 @@ impl Runtime {
         providers.for_role(&resolved)?;
 
         let cwd = spec.cwd.clone();
-        let env = Arc::new(OsExecutionEnv::with_cwd(cwd.clone()));
-        let exec: Arc<dyn ExecutionEnv> = env.clone();
-        let ctx = ExecutionToolContext::new(exec.clone(), Some(env.clone()));
-
-        let mut tools: Vec<HarnessTool> = vec![
-            HarnessTool::new(rpi_tools::create_read_tool(&ctx, None)),
-            HarnessTool::new(rpi_tools::create_bash_tool(
-                &ctx,
-                Some(BashToolOptions {
-                    prepare: Some(scrubbing_prepare(self.secret_env.clone())),
-                    default_timeout: self.bash_timeout,
-                    ..Default::default()
-                }),
-            )),
-            HarnessTool::new(rpi_tools::create_edit_tool(&ctx)),
-            HarnessTool::new(rpi_tools::create_write_tool(&ctx)),
-            HarnessTool::new(rpi_tools::create_grep_tool(&ctx, None)),
-            HarnessTool::new(rpi_tools::create_find_tool(&ctx, None)),
-            HarnessTool::new(rpi_tools::create_ls_tool(&ctx, None)),
-        ];
+        let (exec, mut tools) = self.builtin_tools(&cwd);
         // Offline (#2178: the chat opened while AMP was unreachable): no AMP tools yet;
         // `Runtime::retarget` adds them once the connection is made.
         if self.mcp.is_online() {
@@ -537,13 +765,16 @@ impl Runtime {
         let tool_names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
 
         let context_files = self.context_files(&exec, &cwd).await;
-        let system_prompt = self.system_prompt(&SystemPromptInput {
-            role: &role,
-            cwd: &cwd,
-            project: spec.project.as_ref(),
-            extra_context: spec.extra_context.as_deref(),
-            context_files: &context_files,
-        });
+        let system_prompt = self.system_prompt_with(
+            &catalog,
+            &SystemPromptInput {
+                role: &role,
+                cwd: &cwd,
+                project: spec.project.as_ref(),
+                extra_context: spec.extra_context.as_deref(),
+                context_files: &context_files,
+            },
+        );
         let system_prompt = with_mcp_instructions(&system_prompt, &mcp_view.instructions);
 
         let (session, session_file) = match &spec.session {
@@ -569,7 +800,7 @@ impl Runtime {
                     .map(|f| f.path.to_string_lossy().into_owned())
                     .collect(),
                 prompt_templates: None,
-                skills: Some(self.skills.clone()),
+                skills: Some(catalog.skills.clone()),
             },
             session,
             models: providers.all(),
@@ -598,7 +829,8 @@ impl Runtime {
                 .await
                 .map_err(|e| AgentError::Harness(format!("{e}")))?,
         );
-        if self.mcp_hub.has_servers() {
+        // Attached even with no server configured yet: a reload may add one (#2242).
+        {
             self.mcp_hub
                 .attach(
                     &harness,
@@ -622,6 +854,30 @@ impl Runtime {
         })
     }
 
+    /// The rpi-tools ([`BUILTIN_TOOLS`]) bound to `cwd`, and the execution env they share.
+    fn builtin_tools(&self, cwd: &Path) -> (Arc<dyn ExecutionEnv>, Vec<HarnessTool>) {
+        let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
+        let exec: Arc<dyn ExecutionEnv> = env.clone();
+        let ctx = ExecutionToolContext::new(exec.clone(), Some(env));
+        let tools = vec![
+            HarnessTool::new(rpi_tools::create_read_tool(&ctx, None)),
+            HarnessTool::new(rpi_tools::create_bash_tool(
+                &ctx,
+                Some(BashToolOptions {
+                    prepare: Some(scrubbing_prepare(self.secret_env())),
+                    default_timeout: self.bash_timeout,
+                    ..Default::default()
+                }),
+            )),
+            HarnessTool::new(rpi_tools::create_edit_tool(&ctx)),
+            HarnessTool::new(rpi_tools::create_write_tool(&ctx)),
+            HarnessTool::new(rpi_tools::create_grep_tool(&ctx, None)),
+            HarnessTool::new(rpi_tools::create_find_tool(&ctx, None)),
+            HarnessTool::new(rpi_tools::create_ls_tool(&ctx, None)),
+        ];
+        (exec, tools)
+    }
+
     /// pi's context files, minus any above `AMP_HARNESS_CEILING_DIR`.
     async fn context_files(&self, env: &Arc<dyn ExecutionEnv>, cwd: &Path) -> Vec<ContextFile> {
         // A directory that cannot exist stands in for "no global dir".
@@ -641,6 +897,10 @@ impl Runtime {
 
     /// The system prompt rpi gets as its base (it appends `<available_skills>` itself).
     pub fn system_prompt(&self, input: &SystemPromptInput<'_>) -> String {
+        self.system_prompt_with(&self.catalog(), input)
+    }
+
+    fn system_prompt_with(&self, catalog: &Catalog, input: &SystemPromptInput<'_>) -> String {
         let session = self.mcp.session();
         let mut append = Vec::new();
 
@@ -659,7 +919,7 @@ impl Runtime {
             .role
             .skills
             .iter()
-            .filter_map(|name| self.skills.iter().find(|s| &s.name == name))
+            .filter_map(|name| catalog.skills.iter().find(|s| &s.name == name))
             .map(|s| format_skill_invocation(s, None))
             .collect();
         if !preloaded.is_empty() {
@@ -738,6 +998,182 @@ pub struct Retargeted {
     pub amp_tools: usize,
     /// Every tool name the session has now.
     pub tool_names: Vec<String>,
+}
+
+/// What changed in one kind of thing (agents, skills, providers) across a reload, by id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Changes {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub changed: Vec<String>,
+}
+
+impl Changes {
+    fn between<'a, T: PartialEq>(
+        old: impl Iterator<Item = (&'a str, T)>,
+        new: impl Iterator<Item = (&'a str, T)>,
+    ) -> Self {
+        let old: std::collections::BTreeMap<&str, T> = old.collect();
+        let new: std::collections::BTreeMap<&str, T> = new.collect();
+        let mut out = Self::default();
+        for (id, v) in &new {
+            match old.get(id) {
+                None => out.added.push((*id).to_owned()),
+                Some(o) if o != v => out.changed.push((*id).to_owned()),
+                Some(_) => {}
+            }
+        }
+        out.removed = old
+            .keys()
+            .filter(|id| !new.contains_key(*id))
+            .map(|id| (*id).to_owned())
+            .collect();
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty() && self.changed.is_empty()
+    }
+
+    /// `+a +b ~c -d`, or `None` when nothing changed.
+    pub fn line(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let marked = |mark: &str, ids: &[String]| {
+            ids.iter().map(|i| format!("{mark}{i}")).collect::<Vec<_>>()
+        };
+        let mut parts = marked("+", &self.added);
+        parts.extend(marked("~", &self.changed));
+        parts.extend(marked("-", &self.removed));
+        Some(parts.join(" "))
+    }
+}
+
+/// A role whose model a reload changed: `provider/model (thinking level)`, or `None` when it
+/// doesn't resolve (its error in [`ModelChange::to`]'s place is not kept: `models list` says why).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ModelChange {
+    pub role: String,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+fn harness_error(e: impl std::fmt::Display) -> AgentError {
+    AgentError::Harness(e.to_string())
+}
+
+fn describe_model(resolved: Result<ResolvedRole, ModelsError>) -> Option<String> {
+    resolved
+        .ok()
+        .map(|r| format!("{} (thinking {})", r.model_ref(), thinking_name(r.thinking)))
+}
+
+/// What a skill's listing and content are, to tell a changed one.
+fn skill_key(s: &Skill) -> (String, String, String, Option<bool>) {
+    (
+        s.name.clone(),
+        s.description.clone(),
+        s.content.clone(),
+        s.disable_model_invocation,
+    )
+}
+
+/// What [`Runtime::reload`] changed.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Reloaded {
+    pub agents: Changes,
+    pub skills: Changes,
+    pub providers: Changes,
+    /// Roles (that existed before) whose resolved model or thinking changed.
+    pub models: Vec<ModelChange>,
+    pub mcp: McpReload,
+}
+
+impl Reloaded {
+    /// Nothing changed.
+    pub fn is_empty(&self) -> bool {
+        self.agents.is_empty()
+            && self.skills.is_empty()
+            && self.providers.is_empty()
+            && self.models.is_empty()
+            && self.mcp.is_empty()
+    }
+
+    /// The change for `role` (an id), if its model changed.
+    pub fn model_change(&self, role: &str) -> Option<&ModelChange> {
+        self.models.iter().find(|m| m.role == role)
+    }
+
+    /// One line per kind of change, for a transcript or a terminal.
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(l) = self.agents.line() {
+            out.push(format!("agents: {l}"));
+        }
+        if let Some(l) = self.skills.line() {
+            out.push(format!("skills: {l}"));
+        }
+        if let Some(l) = self.providers.line() {
+            out.push(format!("providers: {l}"));
+        }
+        for m in &self.models {
+            let show = |v: &Option<String>| v.clone().unwrap_or_else(|| "unresolved".to_owned());
+            out.push(format!(
+                "model {}: {} → {}",
+                m.role,
+                show(&m.from),
+                show(&m.to)
+            ));
+        }
+        let mcp = Changes {
+            added: self.mcp.added.clone(),
+            removed: self.mcp.removed.clone(),
+            changed: self.mcp.changed.clone(),
+        };
+        if let Some(l) = mcp.line() {
+            out.push(format!("mcp: {l}"));
+        }
+        if !self.mcp.retried.is_empty() {
+            out.push(format!("mcp: retrying {}", self.mcp.retried.join(", ")));
+        }
+        for name in &self.mcp.untrusted {
+            out.push(format!(
+                "mcp: {name} is not trusted yet (`amp-harness mcp trust {name}`, then /reload)"
+            ));
+        }
+        for p in &self.mcp.problems {
+            out.push(format!("mcp problem: {p}"));
+        }
+        out
+    }
+}
+
+/// A live session for [`Runtime::refresh_session`]: what it was built with.
+pub struct LiveSession<'a> {
+    pub harness: &'a Arc<AgentHarness>,
+    /// The role id it was built for.
+    pub role: &'a str,
+    pub cwd: &'a Path,
+    pub project: Option<&'a ProjectMarker>,
+    pub extra_context: Option<&'a str>,
+    /// The policy it was built with (its before-tool hook's): it takes the role's current rules.
+    pub policy: &'a ToolPolicy,
+    /// Tools to put in place of those with the same names (a fresh `amp_run_ticket`).
+    pub replace_tools: Vec<HarnessTool>,
+}
+
+/// What [`Runtime::refresh_session`] did.
+#[derive(Debug, Clone, Default)]
+pub struct Refreshed {
+    /// The system prompt is different now.
+    pub prompt_changed: bool,
+    /// The skills listed are different now.
+    pub skills_changed: bool,
+    /// The role's permissions changed; the live session enforces the new ones now.
+    pub policy_changed: bool,
+    /// The role's model as configured now (`None` when it no longer resolves).
+    pub resolved: Option<ResolvedRole>,
 }
 
 /// `<amp_server_instructions server="amp 1.2">…</amp_server_instructions>` for `session`, or

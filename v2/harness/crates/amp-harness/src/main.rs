@@ -32,6 +32,7 @@ mod doctor;
 mod mcp_cmd;
 mod mcp_trust_cmd;
 mod models_cmd;
+mod reload;
 mod run;
 mod server_cmd;
 mod session;

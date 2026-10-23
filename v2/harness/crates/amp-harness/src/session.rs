@@ -141,7 +141,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     let role_name = req
         .role
         .map(str::to_owned)
-        .unwrap_or_else(|| rt.roles.manager().id.clone());
+        .unwrap_or_else(|| rt.catalog().roles.manager().id.clone());
     let role = rt
         .role(&role_name)
         .map_err(|e| CliError::usage(e.to_string()))?;
@@ -166,7 +166,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     let (emitter, events) = ChannelEmitter::new();
     let totals = Arc::new(Mutex::new(Totals::default()));
     let model = role
-        .resolve_model(&rt.models)
+        .resolve_model(&rt.current_models())
         .map(|r| r.model_ref())
         .unwrap_or_default();
     let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());

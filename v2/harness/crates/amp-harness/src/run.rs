@@ -274,7 +274,7 @@ async fn drive(
     supervisor: Option<Arc<amp_core::supervisor::Supervisor>>,
 ) -> Result<(), CliError> {
     if args.print_system_prompt {
-        println!("{}", agent.full_system_prompt(&rt.skills));
+        println!("{}", agent.full_system_prompt(&rt.catalog().skills));
         return Ok(());
     }
     let prompt = prompt.expect("clap requires -p unless --print-system-prompt");

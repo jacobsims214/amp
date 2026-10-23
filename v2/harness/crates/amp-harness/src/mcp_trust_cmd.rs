@@ -265,8 +265,10 @@ fn ask_with(
     ));
     let mut all = false;
     let mut trusted: Vec<&McpServer> = Vec::new();
+    // The configuration in effect (a reload may replace it, #2242).
+    let config = hub.config();
     for u in pending {
-        let Some(server) = hub.config().servers.get(&u.name) else {
+        let Some(server) = config.servers.get(&u.name) else {
             continue;
         };
         let changed = if u.changed {

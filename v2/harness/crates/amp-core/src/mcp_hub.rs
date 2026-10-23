@@ -44,6 +44,14 @@
 //! ([`with_mcp_instructions`]), effective from the next run. Workers built later see the current
 //! state.
 //!
+//! # Reload (#2242)
+//!
+//! [`McpHub::reload`] puts a new configuration in place and restarts only what changed: unchanged
+//! servers keep their connection, new and changed ones get a fresh cell, and removed, disabled or
+//! changed old cells are *retired*. A retired cell keeps serving the sessions that still hold its
+//! tools (a running worker keeps its snapshot) and stops once none does. Unchanged servers that
+//! were stopped or needed a login are tried again.
+//!
 //! # Trust (#2241)
 //!
 //! A server from a repo's `.amp/harness/config.toml` runs only once trusted
@@ -398,6 +406,56 @@ impl HubEvent {
     }
 }
 
+/// What [`McpHub::reload`] changed (#2242), by server name.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct McpReload {
+    /// Servers that are new in the configuration.
+    pub added: Vec<String>,
+    /// Servers no longer configured (their tables are gone).
+    pub removed: Vec<String>,
+    /// Servers whose table changed (enabled, command, url, ...): restarted with the new one.
+    pub changed: Vec<String>,
+    /// Unchanged servers that were stopped or needed a login, tried again (a secret stored or a
+    /// login done in another terminal).
+    pub retried: Vec<String>,
+    /// The configuration's errors now (`mcp.x.url: ...`); those servers are left out.
+    pub problems: Vec<String>,
+    /// Repo servers that may not start until trusted (#2241): `amp-harness mcp trust <name>`,
+    /// then reload.
+    pub untrusted: Vec<String>,
+}
+
+impl McpReload {
+    fn diff(old: &McpConfig, new: &McpConfig) -> Self {
+        let names = |c: &McpConfig| -> BTreeSet<String> {
+            c.servers.keys().chain(c.broken.iter()).cloned().collect()
+        };
+        let (before, after) = (names(old), names(new));
+        Self {
+            added: after.difference(&before).cloned().collect(),
+            removed: before.difference(&after).cloned().collect(),
+            changed: after
+                .intersection(&before)
+                .filter(|n| old.servers.get(*n) != new.servers.get(*n))
+                .cloned()
+                .collect(),
+            retried: Vec::new(),
+            problems: new.errors().map(|p| p.to_string()).collect(),
+            untrusted: Vec::new(),
+        }
+    }
+
+    /// Nothing changed and nothing is wrong.
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty()
+            && self.removed.is_empty()
+            && self.changed.is_empty()
+            && self.retried.is_empty()
+            && self.problems.is_empty()
+            && self.untrusted.is_empty()
+    }
+}
+
 fn count(n: usize, what: &str) -> String {
     if n == 1 {
         format!("1 {what}")
@@ -420,6 +478,9 @@ struct Cell {
     /// A restart request.
     wake: Notify,
     task_running: AtomicBool,
+    /// Stops this cell alone (a shared server removed or changed by a reload, #2242). A child of
+    /// the hub's token, so [`McpHub::shutdown`] stops it too. Worktree cells use their set's.
+    stop: CancellationToken,
 }
 
 struct CellState {
@@ -467,7 +528,15 @@ impl Cell {
             }),
             wake: Notify::new(),
             task_running: AtomicBool::new(false),
+            stop: CancellationToken::new(),
         }
+    }
+
+    /// A shared server's cell, stoppable on its own under `hub` (the hub's token).
+    fn shared(server: McpServer, hub: &CancellationToken) -> Self {
+        let mut cell = Self::new(server, None, None);
+        cell.stop = hub.child_token();
+        cell
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, CellState> {
@@ -555,6 +624,11 @@ fn classify(e: McpError) -> Fail {
     }
 }
 
+/// The servers that run as one shared instance: enabled, `scope = "shared"`.
+fn shared_servers(config: &McpConfig) -> impl Iterator<Item = &McpServer> {
+    config.enabled().filter(|s| s.scope == Scope::Shared)
+}
+
 // ---------------------------------------------------------------------------------------------
 // The hub
 
@@ -565,11 +639,18 @@ pub struct McpHub {
 
 struct Inner {
     opts: HubOptions,
-    config: McpConfig,
+    /// The configuration in effect; [`McpHub::reload`] replaces it (#2242).
+    config: Mutex<Arc<McpConfig>>,
     /// Names never inherited by stdio servers ([`mcp_stdio::strip_set`]); updated when the
     /// runtime learns another secret name (`--token-env`).
     strip: Mutex<BTreeSet<String>>,
-    shared: BTreeMap<String, Arc<Cell>>,
+    /// The shared servers by name; [`McpHub::reload`] adds, replaces and removes cells.
+    shared: Mutex<BTreeMap<String, Arc<Cell>>>,
+    /// Shared cells a reload removed or replaced, still running until no session holds their
+    /// tools (a running worker keeps its snapshot, #2242). [`sweep_retired`] stops them.
+    retired: Mutex<Vec<Arc<Cell>>>,
+    /// A [`sweep_retired`] task is running.
+    sweeping: AtomicBool,
     worktrees: Mutex<BTreeMap<String, Arc<WorktreeSet>>>,
     attached: Mutex<Vec<Arc<Attached>>>,
     /// Serializes reconciles, so two changes never interleave `get_tools`/`set_tools`.
@@ -636,7 +717,7 @@ pub struct SessionView {
 impl std::fmt::Debug for McpHub {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpHub")
-            .field("servers", &self.inner.shared.keys().collect::<Vec<_>>())
+            .field("servers", &self.inner.shared_names())
             .finish_non_exhaustive()
     }
 }
@@ -651,12 +732,11 @@ impl Drop for McpHub {
 impl McpHub {
     /// A hub for `config`'s enabled servers. Nothing runs until [`Self::start`].
     pub fn new(config: McpConfig, opts: HubOptions) -> Self {
+        let cancel = CancellationToken::new();
         let untrusted = untrusted_in(&config, &opts);
-        let shared = config
-            .enabled()
-            .filter(|s| s.scope == Scope::Shared)
+        let shared = shared_servers(&config)
             .map(|s| {
-                let cell = Cell::new(s.clone(), None, None);
+                let cell = Cell::shared(s.clone(), &cancel);
                 if let Some(u) = untrusted.get(&s.name) {
                     cell.lock().status = ServerStatus::Untrusted { reason: u.reason() };
                 }
@@ -668,15 +748,17 @@ impl McpHub {
         Self {
             inner: Arc::new(Inner {
                 opts,
-                config,
+                config: Mutex::new(Arc::new(config)),
                 strip: Mutex::new(BTreeSet::new()),
-                shared,
+                shared: Mutex::new(shared),
+                retired: Mutex::new(Vec::new()),
+                sweeping: AtomicBool::new(false),
                 worktrees: Mutex::new(BTreeMap::new()),
                 attached: Mutex::new(Vec::new()),
                 apply: tokio::sync::Mutex::new(()),
                 rev,
                 events,
-                cancel: CancellationToken::new(),
+                cancel,
                 tasks: Mutex::new(Vec::new()),
                 started: AtomicBool::new(false),
                 untrusted: Mutex::new(untrusted),
@@ -701,12 +783,12 @@ impl McpHub {
             .unwrap_or_else(|e| e.into_inner())
             .remove(name);
         if was.is_none() {
-            return match self.inner.config.servers.get(name) {
+            return match self.inner.config().servers.get(name) {
                 Some(_) => Ok(()),
                 None => Err(self.unknown(name)),
             };
         }
-        if let Some(cell) = self.inner.shared.get(name) {
+        if let Some(cell) = self.inner.shared_cell(name) {
             let lazy = cell.server.startup == Startup::Lazy;
             cell.lock().status = if lazy {
                 ServerStatus::Idle
@@ -714,16 +796,17 @@ impl McpHub {
                 ServerStatus::Starting
             };
             if self.inner.started.load(Ordering::Acquire) && !lazy {
-                self.spawn_cell(cell, self.inner.cancel.clone(), None);
+                self.spawn_cell(&cell, cell.stop.clone(), None);
             }
         }
         self.inner.bump();
         Ok(())
     }
 
-    /// The configuration it was built from (problems included).
-    pub fn config(&self) -> &McpConfig {
-        &self.inner.config
+    /// The configuration in effect (problems included): the one it was built from, or the last
+    /// one [`Self::reload`] put in place.
+    pub fn config(&self) -> Arc<McpConfig> {
+        self.inner.config()
     }
 
     /// Sets the variable names stdio servers never inherit (the runtime's secrets plus
@@ -734,7 +817,7 @@ impl McpHub {
 
     /// Whether any server is configured to run (shared or per worktree).
     pub fn has_servers(&self) -> bool {
-        self.inner.config.enabled().next().is_some()
+        self.inner.config().enabled().next().is_some()
     }
 
     /// Starts every enabled shared server except lazy ones, in the background. Needs a tokio
@@ -744,9 +827,9 @@ impl McpHub {
             return;
         }
         let untrusted = self.inner.untrusted_map();
-        for cell in self.inner.shared.values() {
+        for cell in self.inner.shared_cells() {
             if cell.server.startup != Startup::Lazy && !untrusted.contains_key(&cell.server.name) {
-                self.spawn_cell(cell, self.inner.cancel.clone(), None);
+                self.spawn_cell(&cell, cell.stop.clone(), None);
             }
         }
     }
@@ -783,13 +866,12 @@ impl McpHub {
     pub async fn wait_started(&self, background: bool) -> Vec<String> {
         let cells: Vec<Arc<Cell>> = self
             .inner
-            .shared
-            .values()
+            .shared_cells()
+            .into_iter()
             .filter(|c| {
                 c.server.startup == Startup::Eager
                     || (background && c.server.startup == Startup::Background)
             })
-            .cloned()
             .collect();
         wait_first_attempts(&self.inner, &cells).await
     }
@@ -799,8 +881,7 @@ impl McpHub {
     pub fn restart(&self, name: &str) -> Result<(), String> {
         let cell = self
             .inner
-            .shared
-            .get(name)
+            .shared_cell(name)
             .ok_or_else(|| self.unknown(name))?;
         if let Some(u) = self.inner.untrusted_map().get(name) {
             return Err(format!(
@@ -808,19 +889,25 @@ impl McpHub {
                 u.reason()
             ));
         }
-        if cell.task_running.load(Ordering::Acquire) {
-            cell.wake.notify_one();
-        } else {
-            self.spawn_cell(cell, self.inner.cancel.clone(), None);
-        }
+        self.wake_or_spawn(&cell);
         Ok(())
     }
 
+    /// Wakes a shared cell's task (a restart), or starts it when it has none.
+    fn wake_or_spawn(&self, cell: &Arc<Cell>) {
+        if cell.task_running.load(Ordering::Acquire) {
+            cell.wake.notify_one();
+        } else {
+            self.spawn_cell(cell, cell.stop.clone(), None);
+        }
+    }
+
     fn unknown(&self, name: &str) -> String {
-        match self.inner.config.servers.get(name) {
+        let config = self.inner.config();
+        match config.servers.get(name) {
             Some(s) if !s.enabled => format!("MCP server `{name}` is disabled"),
             Some(_) => format!("MCP server `{name}` runs one instance per worker worktree"),
-            None if self.inner.config.broken.contains(name) => {
+            None if config.broken.contains(name) => {
                 format!("MCP server `{name}` has configuration errors (amp-harness config check)")
             }
             None => format!("no MCP server named `{name}`"),
@@ -830,7 +917,13 @@ impl McpHub {
     /// Every server: shared ones, running worktree instances, worktree-scoped servers with no
     /// instance (shown idle), disabled ones and broken ones (stopped, with the problem).
     pub fn health(&self) -> Vec<ServerHealth> {
-        let mut out: Vec<ServerHealth> = self.inner.shared.values().map(|c| c.health()).collect();
+        let config = self.inner.config();
+        let mut out: Vec<ServerHealth> = self
+            .inner
+            .shared_cells()
+            .iter()
+            .map(|c| c.health())
+            .collect();
         let worktrees = self
             .inner
             .worktrees
@@ -842,7 +935,7 @@ impl McpHub {
         for set in &worktrees {
             out.extend(set.health());
         }
-        for server in self.inner.config.servers.values() {
+        for server in config.servers.values() {
             let listed = out.iter().any(|h| h.name == server.name);
             if listed {
                 continue;
@@ -855,10 +948,8 @@ impl McpHub {
             };
             out.push(idle_health(server, status));
         }
-        for name in &self.inner.config.broken {
-            let reason = self
-                .inner
-                .config
+        for name in &config.broken {
+            let reason = config
                 .errors()
                 .find(|p| {
                     p.key == format!("mcp.{name}") || p.key.starts_with(&format!("mcp.{name}."))
@@ -888,7 +979,7 @@ impl McpHub {
     pub fn summary(&self) -> HubSummary {
         let mut s = HubSummary::default();
         let mut worst = HealthLevel::Ok;
-        for cell in self.inner.shared.values() {
+        for cell in self.inner.shared_cells() {
             let st = cell.lock();
             if matches!(
                 st.status,
@@ -925,7 +1016,7 @@ impl McpHub {
         let untrusted = self.inner.untrusted_map();
         let servers: Vec<McpServer> = self
             .inner
-            .config
+            .config()
             .enabled()
             .filter(|s| s.scope == Scope::Worktree && !untrusted.contains_key(&s.name))
             .cloned()
@@ -1032,6 +1123,198 @@ impl McpHub {
         reconcile(&self.inner).await;
     }
 
+    /// Puts `config` in place without restarting what didn't change (#2242, `/reload` after
+    /// `[mcp.*]` was edited in another terminal):
+    /// - a shared server whose table is unchanged keeps its connection (and its process); one
+    ///   that was stopped or needed a login is tried again;
+    /// - a new or changed one gets a fresh cell, started now (unless lazy) when the hub runs;
+    /// - a removed, disabled or changed one's old cell is *retired*: it keeps serving the sessions
+    ///   that still hold its tools (a running worker keeps its snapshot) and stops once none
+    ///   does.
+    ///
+    /// Attached sessions get the new tools and instructions from their next run. Worktree
+    /// instances already running keep theirs; workers built from now on use the new
+    /// configuration.
+    pub async fn reload(&self, config: McpConfig) -> McpReload {
+        let mut report = McpReload::diff(&self.inner.config(), &config);
+        // #2241: trust as the store has it now (`mcp trust` in another terminal counts too).
+        let untrusted = untrusted_in(&config, &self.inner.opts);
+        let was_untrusted = self.inner.untrusted_map();
+        let mut start = Vec::new();
+        let mut retry = Vec::new();
+        let mut retire = Vec::new();
+        {
+            let mut shared = self.inner.shared.lock().unwrap_or_else(|e| e.into_inner());
+            let wanted: BTreeMap<String, McpServer> = shared_servers(&config)
+                .map(|s| (s.name.clone(), s.clone()))
+                .collect();
+            let gone: Vec<String> = shared
+                .keys()
+                .filter(|n| !wanted.contains_key(*n))
+                .cloned()
+                .collect();
+            for name in gone {
+                retire.extend(shared.remove(&name));
+            }
+            for (name, server) in wanted {
+                let trust_same = untrusted.contains_key(&name) == was_untrusted.contains_key(&name);
+                let same = shared.get(&name).map(|c| c.server == server && trust_same);
+                if same == Some(true) {
+                    let cell = Arc::clone(&shared[&name]);
+                    let status = cell.lock().status.clone();
+                    if matches!(
+                        status,
+                        ServerStatus::Stopped { .. } | ServerStatus::NeedsLogin { .. }
+                    ) {
+                        retry.push(cell);
+                    }
+                    continue;
+                }
+                let cell = Cell::shared(server, &self.inner.cancel);
+                if let Some(u) = untrusted.get(&name) {
+                    cell.lock().status = ServerStatus::Untrusted { reason: u.reason() };
+                }
+                let cell = Arc::new(cell);
+                retire.extend(shared.insert(name, Arc::clone(&cell)));
+                start.push(cell);
+            }
+        }
+        *self.inner.config.lock().unwrap_or_else(|e| e.into_inner()) = Arc::new(config);
+        // Named only when that is news: new to the config, changed, or no longer trusted.
+        report.untrusted = untrusted
+            .keys()
+            .filter(|n| {
+                report.added.contains(n)
+                    || report.changed.contains(n)
+                    || !was_untrusted.contains_key(*n)
+            })
+            .cloned()
+            .collect();
+        *self
+            .inner
+            .untrusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = untrusted.clone();
+        if self.inner.started.load(Ordering::Acquire) {
+            for cell in &start {
+                if cell.server.startup != Startup::Lazy
+                    && !untrusted.contains_key(&cell.server.name)
+                {
+                    self.spawn_cell(cell, cell.stop.clone(), None);
+                }
+            }
+            for cell in &retry {
+                report.retried.push(cell.server.name.clone());
+                self.wake_or_spawn(cell);
+            }
+        }
+        if !retire.is_empty() {
+            self.inner
+                .retired
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .extend(retire);
+            self.spawn_sweeper();
+        }
+        self.inner.bump();
+        reconcile(&self.inner).await;
+        report
+    }
+
+    /// Stops retired cells as soon as no session holds their tools (checked every
+    /// [`HubOptions::poll`]); ends when none is left or the hub shuts down.
+    fn spawn_sweeper(&self) {
+        if self.inner.sweeping.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let hub = Arc::downgrade(&self.inner);
+        let cancel = self.inner.cancel.clone();
+        let poll = self.inner.opts.poll;
+        tokio::spawn(async move {
+            loop {
+                let Some(inner) = hub.upgrade() else {
+                    return;
+                };
+                if sweep_retired(&inner) {
+                    inner.sweeping.store(false, Ordering::Release);
+                    // A reload may have retired another cell after the sweep and before the flag
+                    // went down; then this task carries on.
+                    let empty = inner
+                        .retired
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_empty();
+                    if empty || inner.sweeping.swap(true, Ordering::AcqRel) {
+                        return;
+                    }
+                }
+                drop(inner);
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(poll) => {}
+                }
+            }
+        });
+    }
+
+    /// Applies the hub's view to `harness` again even when it looks unchanged: its policy's rules
+    /// were replaced (#2242), so tools it filtered out before may be allowed now, or the reverse.
+    pub async fn reapply(&self, harness: &Arc<AgentHarness>) {
+        {
+            let list = self
+                .inner
+                .attached
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for a in list.iter() {
+                if a.harness
+                    .upgrade()
+                    .is_some_and(|h| Arc::ptr_eq(&h, harness))
+                {
+                    a.applied
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push_str("\n(reapply)");
+                }
+            }
+        }
+        reconcile(&self.inner).await;
+    }
+
+    /// Shared servers a reload retired that still run (some session holds their tools).
+    pub fn retired(&self) -> Vec<String> {
+        self.inner
+            .retired
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|c| c.server.name.clone())
+            .collect()
+    }
+
+    /// Replaces `harness`'s system prompt with `base` (a prompt [`crate::agent::Runtime`] built,
+    /// without MCP blocks) plus the `<mcp_server_instructions>` blocks the session has now
+    /// (#2242: `/reload` rebuilt the role's prompt). Serialized with the hub's own updates, so a
+    /// server connecting meanwhile can't lose its block. Returns the prompt set.
+    pub async fn set_session_prompt(
+        &self,
+        harness: &AgentHarness,
+        base: &str,
+    ) -> Result<String, String> {
+        let _serial = self.inner.apply.lock().await;
+        let current = harness
+            .get_system_prompt()
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_default();
+        let prompt = with_mcp_instructions(base, &mcp_instruction_blocks(&current));
+        harness
+            .set_system_prompt(Some(prompt.clone()))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(prompt)
+    }
+
     /// Closes every server (shared and worktree instances) gracefully, bounded by
     /// [`amp_mcp::external::SHUTDOWN_GRACE`] plus a second. Call it before the process exits.
     pub async fn shutdown(&self) {
@@ -1085,6 +1368,24 @@ async fn stop_set(set: &WorktreeSet) {
     set.cancel.cancel();
     let tasks = std::mem::take(&mut *set.tasks.lock().unwrap_or_else(|e| e.into_inner()));
     join_bounded(tasks).await;
+}
+
+/// Stops each retired cell no session holds any more (only the retired list and its own task
+/// have it). Returns whether none is left.
+fn sweep_retired(inner: &Inner) -> bool {
+    let mut list = inner.retired.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|cell| {
+        let task = usize::from(cell.task_running.load(Ordering::Acquire));
+        let held = Arc::strong_count(cell) > 1 + task;
+        if !held {
+            cell.lock().status = ServerStatus::Stopped {
+                reason: "removed or replaced by a reload".to_owned(),
+            };
+            cell.stop.cancel();
+        }
+        held
+    });
+    list.is_empty()
 }
 
 async fn join_bounded(tasks: Vec<JoinHandle<()>>) {
@@ -1155,6 +1456,36 @@ fn untrusted_in(
 }
 
 impl Inner {
+    fn config(&self) -> Arc<McpConfig> {
+        Arc::clone(&self.config.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    fn shared_cells(&self) -> Vec<Arc<Cell>> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn shared_cell(&self, name: &str) -> Option<Arc<Cell>> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+    }
+
+    fn shared_names(&self) -> Vec<String> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     fn untrusted_map(&self) -> BTreeMap<String, crate::mcp_trust::Untrusted> {
         self.untrusted
             .lock()
@@ -1456,7 +1787,7 @@ fn session_view(
     worktree: Option<&Arc<WorktreeSet>>,
     output_key: &str,
 ) -> SessionView {
-    let mut cells: Vec<Arc<Cell>> = inner.shared.values().cloned().collect();
+    let mut cells: Vec<Arc<Cell>> = inner.shared_cells();
     if let Some(set) = worktree {
         cells.extend(set.cells.values().cloned());
     }
@@ -1629,6 +1960,22 @@ pub fn with_mcp_instructions(prompt: &str, blocks: &[String]) -> String {
             }
             out.push_str(&joined);
         }
+    }
+    out
+}
+
+/// The `<mcp_server_instructions>` blocks in `prompt`, in order.
+pub fn mcp_instruction_blocks(prompt: &str) -> Vec<String> {
+    let open = format!("<{INSTRUCTIONS_TAG} ");
+    let close = format!("</{INSTRUCTIONS_TAG}>");
+    let mut out = Vec::new();
+    let mut rest = prompt;
+    while let Some(start) = rest.find(&open) {
+        let Some(end) = rest[start..].find(&close).map(|i| start + i + close.len()) else {
+            break;
+        };
+        out.push(rest[start..end].to_owned());
+        rest = &rest[end..];
     }
     out
 }

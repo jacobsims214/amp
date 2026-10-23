@@ -510,3 +510,54 @@ fn an_unreadable_trust_store_trusts_nothing() {
     assert!(err.contains("is not trusted"), "{err}");
     assert!(!repo.ran("fs"));
 }
+
+/// #2242: `/reload` takes trust given in another terminal (`mcp trust`), and names a repo server
+/// added since that still needs it, without starting it.
+#[tokio::test]
+async fn a_reload_takes_trust_given_elsewhere() {
+    let repo = Repo::new("reload", "", "");
+    repo.write_repo(&marker_table("fs", &repo.marker("fs"), ""));
+    let paths = ConfigPaths {
+        user_file: Some(repo.dir.join("home/.config/amp-harness/config.toml")),
+        user_dir: Some(repo.dir.join("home/.config/amp-harness")),
+        repo_dir: Some(repo.dir.join("project/.amp/harness")),
+        ..ConfigPaths::default()
+    };
+    let mut opts = HubOptions::new(
+        paths.clone(),
+        repo.state().join("amp-harness"),
+        repo.dir.join("project"),
+    );
+    opts.keychain = None;
+    opts.trust_all = false;
+    let hub = McpHub::new(McpConfig::load(&paths), opts);
+    hub.start();
+    assert_eq!(hub.untrusted().len(), 1);
+
+    let out = repo
+        .run("http://127.0.0.1:9/mcp", &["mcp", "trust", "fs"], &[])
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    // Another repo server appears at the same time: named, not started.
+    repo.write_repo(&format!(
+        "{}{}",
+        marker_table("fs", &repo.marker("fs"), ""),
+        marker_table("new", &repo.marker("new"), "")
+    ));
+    let report = hub.reload(McpConfig::load(&paths)).await;
+    assert_eq!(report.added, vec!["new"], "{report:?}");
+    assert_eq!(report.untrusted, vec!["new"], "{report:?}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !repo.ran("fs") && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        repo.ran("fs"),
+        "trusted elsewhere: it starts after the reload"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!repo.ran("new"));
+    let names: Vec<String> = hub.untrusted().into_iter().map(|u| u.name).collect();
+    assert_eq!(names, vec!["new"]);
+    hub.shutdown().await;
+}
