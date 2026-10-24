@@ -608,6 +608,13 @@ async fn a_repo_server_shadowed_by_yours_is_named_everywhere() {
         "{}",
         out.stdout
     );
+    // #2339: with short paths, as /config writes them.
+    assert!(
+        screen.contains("(<repo>/.amp/harness/config.toml)")
+            && screen.contains("(~/.config/amp-harness/config.toml)"),
+        "{}",
+        out.stdout
+    );
     assert!(!out.stderr.contains("Trust `fs`?"), "{}", out.stderr);
     assert!(repo.ran("user-fs"));
     assert!(!repo.ran("repo-fs"), "the repo's fs never starts");
@@ -690,12 +697,26 @@ async fn a_repo_server_shadowed_by_yours_is_named_everywhere() {
     opts.keychain = None;
     opts.trust_all = true;
     repo.clear_markers();
-    let hub = McpHub::new(McpConfig::load(&paths), opts);
+    // #2339: the hub began without the repo's file; the reload that brings the shadowing names
+    // it once (short paths), and the next two (nothing changed) don't repeat it.
+    let without_repo = ConfigPaths {
+        repo_dir: None,
+        ..paths.clone()
+    };
+    let hub = McpHub::new(McpConfig::load(&without_repo), opts);
     hub.start();
     let report = hub.reload(McpConfig::load(&paths)).await;
     assert_eq!(report.shadowed.len(), 1, "{report:?}");
     assert!(named(&report.shadowed[0]), "{report:?}");
+    assert!(
+        report.shadowed[0].contains("(<repo>/.amp/harness/config.toml)"),
+        "{report:?}"
+    );
     assert!(!report.is_empty());
+    for _ in 0..2 {
+        let again = hub.reload(McpConfig::load(&paths)).await;
+        assert!(again.shadowed.is_empty(), "repeated: {again:?}");
+    }
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!repo.ran("repo-fs"), "even with every repo server trusted");
     hub.shutdown().await;
