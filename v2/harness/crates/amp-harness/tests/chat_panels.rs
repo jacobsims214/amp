@@ -246,7 +246,7 @@ fn flat(s: &str) -> String {
 
 /// The open panel as drawn (title rule to key hint), without the chat's padding.
 fn panel(out: &Output) -> Vec<String> {
-    let rows = common::unpad(out.stdout.lines().map(str::to_owned).collect());
+    let rows = common::unpad(out.stdout.lines().map(str::to_owned).collect(), 110);
     let Some(start) = rows.iter().position(|l| l.starts_with("── ")) else {
         panic!("no panel open:\n{}", out.stdout);
     };
