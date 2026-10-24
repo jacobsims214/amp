@@ -1658,9 +1658,19 @@ pub(crate) async fn check_key_full(
     if keys.keychain.is_none() {
         keys.keychain = Some(Default::default());
     }
+    // #2343: secret headers with no value yet are left out of the try.
+    let (p, pending) = crate::connect::without_pending_headers(&p, extra);
     use amp_core::provider_auth::{ProbeFailure, ProbeKind, probe};
     match tokio::time::timeout(KEY_CHECK_TIMEOUT, probe(&p, &keys, ProbeKind::Auth)).await {
         Ok(Ok(_)) => KeyCheck::Ok,
+        // Refused without a header it may need: not the key's fault.
+        Ok(Err(e)) if e.failure == ProbeFailure::Rejected && !pending.is_empty() => {
+            KeyCheck::Unknown(format!(
+                "HTTP {} without {}, which has no value yet",
+                e.status.unwrap_or(401),
+                pending.join(", ")
+            ))
+        }
         Ok(Err(e)) if e.failure == ProbeFailure::Rejected => {
             KeyCheck::Rejected(e.status.unwrap_or(401))
         }
@@ -1672,10 +1682,15 @@ pub(crate) async fn check_key_full(
     }
 }
 
-/// The secret headers of `p` with no value in the keychain.
+/// The secret headers of `p` with no value in `<ID>_<HEADER>` (#2343) or the keychain.
 fn missing_headers(p: &ProviderConfig, keys: &dyn KeyLookup) -> Vec<String> {
     p.secret_headers
         .iter()
+        .filter(|h| {
+            !keys
+                .env(&amp_core::providers::header_env(&p.id, h))
+                .is_some_and(|v| !v.trim().is_empty())
+        })
         .filter(|h| !matches!(keys.secret_header(&p.id, h), KeychainKey::Found(v) if !v.trim().is_empty()))
         .cloned()
         .collect()
@@ -1690,11 +1705,16 @@ async fn prompt_secrets(
 ) -> Result<bool, CliError> {
     let name = display_name(p);
     let mut extra = std::collections::BTreeMap::new();
+    let missing = missing_headers(p, keys);
     for h in &p.secret_headers {
-        if let KeychainKey::Found(v) = keys.secret_header(&p.id, h)
-            && !v.trim().is_empty()
-        {
-            extra.insert(h.clone(), v.trim().to_owned());
+        if !missing.contains(h) {
+            // In `<ID>_<HEADER>` (an empty value here: the check reads the variable) or the
+            // keychain.
+            let value = match keys.secret_header(&p.id, h) {
+                KeychainKey::Found(v) => v.trim().to_owned(),
+                _ => String::new(),
+            };
+            extra.insert(h.clone(), value);
             continue;
         }
         let v = ui.secret(&format!(
@@ -1981,6 +2001,14 @@ async fn models_step(
                     summary
                         .warnings
                         .push(format!("the key was not kept: {why}"));
+                }
+                // #2343: secret header values not asked for (no keychain).
+                for (h, var) in crate::connect::headers_not_kept(&e.spec) {
+                    summary.warnings.push(format!(
+                        "the {h} header value was not kept (no OS keychain): set {var} in your \
+                         environment; {} needs it",
+                        e.spec.id
+                    ));
                 }
             }
         }
