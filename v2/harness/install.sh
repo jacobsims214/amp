@@ -158,6 +158,44 @@ version_of() {
     "$1" --version 2>/dev/null | head -n 1 | cut -d' ' -f2 || true
 }
 
+# Compares two versions: prints "<", "=" or ">" for A against B, or "?" when they can't be ordered
+# (two different pre-releases of one version). Numeric dot parts; a pre-release (X.Y.Z-rc1) sorts
+# before its release, as in semver.
+version_cmp() {
+    printf '%s %s\n' "$1" "$2" | awk '{
+        a = $1; b = $2
+        if (a == b) { print "="; exit }
+        pa = index(a, "-"); pb = index(b, "-")
+        ra = pa ? substr(a, pa + 1) : ""; rb = pb ? substr(b, pb + 1) : ""
+        if (pa) a = substr(a, 1, pa - 1)
+        if (pb) b = substr(b, 1, pb - 1)
+        na = split(a, x, "."); nb = split(b, y, ".")
+        n = na > nb ? na : nb
+        for (i = 1; i <= n; i++) {
+            if (x[i] + 0 < y[i] + 0) { print "<"; exit }
+            if (x[i] + 0 > y[i] + 0) { print ">"; exit }
+        }
+        if (ra == "" && rb != "") { print ">"; exit }
+        if (ra != "" && rb == "") { print "<"; exit }
+        print "?"
+    }'
+}
+
+# The .amp.json that links this folder to an AMP project: the nearest one in $PWD or a parent,
+# searching no higher than AMP_HARNESS_CEILING_DIR (amp-harness's own rule). Fails when there is none.
+project_marker() {
+    d=$PWD
+    while :; do
+        if [ -f "$d/.amp.json" ]; then
+            printf '%s\n' "$d/.amp.json"
+            return 0
+        fi
+        [ -n "${AMP_HARNESS_CEILING_DIR:-}" ] && [ "$d" = "${AMP_HARNESS_CEILING_DIR%/}" ] && return 1
+        [ "$d" != / ] && [ -n "$d" ] || return 1
+        d=$(dirname "$d")
+    done
+}
+
 # Prints the PATH a login shell sees. Shell profiles can print noise, so the value is read from a
 # marked line instead of the whole output stream.
 login_path() {
@@ -204,6 +242,8 @@ check_path() {
         )
         if [ -n "$first" ] && [ "$first" != "$prefix/$BIN" ]; then
             on_path=0
+            # #2341: the note after the install already said this about the same binary.
+            [ "$first" = "$shadow_noted" ] && return 0
             warn "$first comes before $prefix on your PATH, so \`$BIN\` runs that one; remove it or reorder PATH"
         fi
         return 0
@@ -305,16 +345,16 @@ uninstall() {
     say ""
     say "Kept, in case you reinstall:"
     say "  - your settings: $config_dir (config.toml, and credentials.json if keys were kept in a file)"
-    case "$(uname -s)" in
-        Darwin)
-            say "  - saved keys and AMP logins: your login keychain, items with service \"$BIN\""
-            say "    (Keychain Access; or \`security delete-generic-password -s $BIN\` once per item)"
-            ;;
-        *)
-            say "  - saved keys and AMP logins: your Secret Service keyring, items with service \"$BIN\""
-            say "    (Passwords and Keys / seahorse; or \`secret-tool clear service $BIN\`)"
-            ;;
-    esac
+    if [ "${AMP_CREDENTIAL_STORE:-}" = file ]; then
+        # #2341: the keychain is turned off; keys and logins are in the settings directory.
+        say "  - saved keys and AMP logins: $config_dir/credentials.json (AMP_CREDENTIAL_STORE=file)"
+    elif [ "$(uname -s)" = Darwin ]; then
+        say "  - saved keys and AMP logins: your login keychain, items with service \"$BIN\""
+        say "    (Keychain Access; or \`security delete-generic-password -s $BIN\` once per item)"
+    else
+        say "  - saved keys and AMP logins: your Secret Service keyring, items with service \"$BIN\""
+        say "    (Passwords and Keys / seahorse; or \`secret-tool clear service $BIN\`)"
+    fi
     say "  - each project's .amp.json and .amp/harness/ (they belong to the project)"
     prof=$(profile_file)
     if [ -f "$prof" ] && grep -q "Added by the amp-harness installer" "$prof" 2>/dev/null; then
@@ -452,15 +492,22 @@ main() {
     elif [ "$old" = "$new" ]; then
         say "Reinstalled $BIN $new at $prefix/$BIN (already up to date)"
     else
-        say "Updated $BIN $old → $new at $prefix/$BIN"
+        # #2341: an older version over a newer one is not an update.
+        case "$(version_cmp "$old" "$new")" in
+            "<") say "Updated $BIN $old → $new at $prefix/$BIN" ;;
+            ">") say "Downgraded $BIN $old → $new at $prefix/$BIN" ;;
+            *) say "Replaced $BIN $old with $new at $prefix/$BIN" ;;
+        esac
     fi
 
     # #2336: a shell that already ran another amp-harness (zsh, bash and sh remember where a
     # command was found) keeps running that one until its cache is cleared.
     other=$(other_on_path "$prefix/$BIN")
+    shadow_noted=""
     if [ -n "$other" ]; then
         current=$(command -v "$BIN" 2>/dev/null || true)
         if [ "$current" = "$other" ]; then
+            shadow_noted=$other
             say "Note: \`$BIN\` in this shell runs $other, not this one. Remove it"
             say "  ($(removal_hint "$other")) or put $prefix first on PATH, then run \`hash -r\` (zsh: \`rehash\`)."
         else
@@ -480,6 +527,13 @@ main() {
     [ -z "$preset" ] || setup_cmd="$setup_cmd --preset $(shell_word "$preset")"
 
     say ""
+    # #2341: already set up (a config, no new preset) and this folder is linked: nothing to set up,
+    # with or without a terminal.
+    if [ -z "$preset" ] && [ -f "$(config_dir)/config.toml" ] && marker=$(project_marker); then
+        say "Your settings ($(config_dir)), saved keys and AMP logins were kept, and this folder is"
+        say "linked to AMP ($marker). \`$cmd doctor\` checks the setup."
+        return 0
+    fi
     if [ "$run_setup" = 1 ] && interactive; then
         say "Setup signs you in to AMP, links this folder ($PWD) to a project and connects a model"
         say "provider${preset:+, starting from the preset $preset}."
