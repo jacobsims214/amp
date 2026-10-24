@@ -57,6 +57,9 @@ pub struct LoginOptions {
     /// The login's scope ([`crate::scoped_credential_key`]): `None` for AMP and the person's own
     /// servers; a repo server's own scope otherwise (#2308).
     pub credential_scope: Option<String>,
+    /// The `[mcp.<name>]` server this login is for; `None` is AMP's own login. Names the server
+    /// on the browser page and in keychain repair hints (#2352).
+    pub mcp_server: Option<String>,
 }
 
 /// OAuth settings beyond discovery + dynamic registration, for third-party servers (D2).
@@ -101,6 +104,22 @@ impl LoginOptions {
             request_timeout: DEFAULT_OAUTH_REQUEST_TIMEOUT,
             client: OAuthClientSettings::default(),
             credential_scope: None,
+            mcp_server: None,
+        }
+    }
+
+    /// A login to the `[mcp.<name>]` server `name` rather than to AMP.
+    pub fn with_mcp_server(mut self, name: impl Into<String>) -> Self {
+        self.mcp_server = Some(name.into());
+        self
+    }
+
+    /// The store this login is kept in, with the right repair hint for its keychain item.
+    pub(crate) fn store(&self) -> crate::AmpCredentialStore {
+        let store = self.backend.store_for_key(self.credential_key());
+        match &self.mcp_server {
+            Some(name) => store.for_mcp_server(name),
+            None => store,
         }
     }
 
@@ -220,7 +239,7 @@ where
     let redirect_uri = format!("http://127.0.0.1:{port}{CALLBACK_PATH}");
 
     // 3. Discovery + dynamic client registration + the PKCE authorization URL.
-    let store = options.backend.store_for_key(options.credential_key());
+    let store = options.store();
     let mut manager = new_manager(
         &options.url,
         options.ca_file.as_deref(),
@@ -279,7 +298,12 @@ where
     // 5. Wait for the redirect, then exchange the code (rmcp saves the tokens to the store).
     let callback = tokio::time::timeout(
         options.timeout,
-        wait_for_callback(&listener, port, &expected_state),
+        wait_for_callback(
+            &listener,
+            port,
+            &expected_state,
+            &CallbackText::new(options.mcp_server.as_deref()),
+        ),
     )
     .await
     .map_err(|_| {
@@ -531,10 +555,65 @@ const PER_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 /// Serves the loopback listener until the browser arrives at [`CALLBACK_PATH`] with our `state`.
 /// Anything else (favicon, a stale tab, a request with another state) gets an error page and the
 /// wait goes on. Returns the full callback URL.
+/// What the loopback callback page says: AMP's sign-in, or a login to one MCP server (#2352).
+struct CallbackText {
+    /// The page title.
+    title: String,
+    /// Done: "… complete. You can close this tab …".
+    done: String,
+    /// The authorization server said no.
+    failed: String,
+    /// Not the redirect this login waits for.
+    wrong_state: String,
+}
+
+impl CallbackText {
+    fn new(mcp_server: Option<&str>) -> Self {
+        match mcp_server {
+            None => Self {
+                title: "AMP sign-in".to_owned(),
+                done: "AMP sign-in complete. You can close this tab and return to the terminal."
+                    .to_owned(),
+                failed: "AMP sign-in failed. Return to the terminal for details.".to_owned(),
+                wrong_state: "This sign-in link is not the one amp-harness is waiting for. Run \
+                              `amp-harness login` again if needed."
+                    .to_owned(),
+            },
+            // Server names are `[a-z0-9-]` (checked when the config loads); escape anyway.
+            Some(name) => {
+                let name = html_escape(name);
+                Self {
+                    title: format!("MCP server {name}: login"),
+                    done: format!(
+                        "Logged in to MCP server <code>{name}</code>. You can close this tab and \
+                         return to the terminal."
+                    ),
+                    failed: format!(
+                        "Login to MCP server <code>{name}</code> failed. Return to the terminal \
+                         for details."
+                    ),
+                    wrong_state: format!(
+                        "This login link is not the one amp-harness is waiting for. Run \
+                         <code>amp-harness mcp login {name}</code> again if needed."
+                    ),
+                }
+            }
+        }
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 async fn wait_for_callback(
     listener: &TcpListener,
     port: u16,
     expected_state: &str,
+    text: &CallbackText,
 ) -> Result<String, McpError> {
     loop {
         let (mut stream, _) = listener
@@ -548,11 +627,11 @@ async fn wait_for_callback(
             };
         let url = format!("http://127.0.0.1:{port}{target}");
         let Ok(parsed) = reqwest::Url::parse(&url) else {
-            respond(&mut stream, 400, "Bad request.").await;
+            respond(&mut stream, 400, &text.title, "Bad request.").await;
             continue;
         };
         if parsed.path() != CALLBACK_PATH {
-            respond(&mut stream, 404, "Not found.").await;
+            respond(&mut stream, 404, &text.title, "Not found.").await;
             continue;
         }
         let param = |name: &str| {
@@ -562,36 +641,27 @@ async fn wait_for_callback(
                 .map(|(_, v)| v.into_owned())
         };
         if param("state").as_deref() != Some(expected_state) {
-            respond(
-                &mut stream,
-                400,
-                "This sign-in link is not the one amp-harness is waiting for. Run `amp-harness login` again if needed.",
-            )
-            .await;
+            respond(&mut stream, 400, &text.title, &text.wrong_state).await;
             continue;
         }
         if let Some(error) = param("error") {
             let description = param("error_description").unwrap_or_default();
-            respond(
-                &mut stream,
-                400,
-                "AMP sign-in failed. Return to the terminal for details.",
-            )
-            .await;
+            respond(&mut stream, 400, &text.title, &text.failed).await;
             return Err(McpError::OAuth(format!(
                 "authorization failed: {error} {description}"
             )));
         }
         if param("code").is_none() {
-            respond(&mut stream, 400, "The sign-in response has no code.").await;
+            respond(
+                &mut stream,
+                400,
+                &text.title,
+                "The sign-in response has no code.",
+            )
+            .await;
             continue;
         }
-        respond(
-            &mut stream,
-            200,
-            "AMP sign-in complete. You can close this tab and return to the terminal.",
-        )
-        .await;
+        respond(&mut stream, 200, &text.title, &text.done).await;
         return Ok(url);
     }
 }
@@ -617,14 +687,14 @@ async fn read_target(stream: &mut TcpStream) -> Option<String> {
     (method == "GET" && target.starts_with('/')).then(|| target.to_owned())
 }
 
-async fn respond(stream: &mut TcpStream, status: u16, message: &str) {
+async fn respond(stream: &mut TcpStream, status: u16, title: &str, message: &str) {
     let reason = match status {
         200 => "OK",
         404 => "Not Found",
         _ => "Bad Request",
     };
     let body = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>AMP sign-in</title></head>\
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{title}</title></head>\
          <body style=\"font-family:system-ui,sans-serif;margin:3rem\"><p>{message}</p></body></html>"
     );
     let response = format!(
@@ -673,6 +743,54 @@ pub fn open_browser(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GETs `target` from a callback listener waiting with `text`; returns the whole response.
+    async fn callback_page(text: CallbackText, target: &str) -> (Result<String, McpError>, String) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let waiting =
+            tokio::spawn(async move { wait_for_callback(&listener, port, "st", &text).await });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut page = String::new();
+        stream.read_to_string(&mut page).await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("callback returned")
+            .unwrap();
+        (result, page)
+    }
+
+    /// #2352: an MCP server's login names the server on the browser page; AMP's says AMP.
+    #[tokio::test]
+    async fn callback_page_names_the_mcp_server() {
+        let (result, page) = callback_page(
+            CallbackText::new(Some("oauthy")),
+            "/callback?state=st&code=c",
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            page.contains("Logged in to MCP server <code>oauthy</code>")
+                && !page.contains("AMP sign-in"),
+            "{page}"
+        );
+        let (result, page) = callback_page(
+            CallbackText::new(Some("oauthy")),
+            "/callback?state=st&error=access_denied",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            page.contains("Login to MCP server <code>oauthy</code> failed"),
+            "{page}"
+        );
+        let (_, page) = callback_page(CallbackText::new(None), "/callback?state=st&code=c").await;
+        assert!(page.contains("AMP sign-in complete"), "{page}");
+    }
 
     #[test]
     fn authorization_url_must_be_https_or_loopback_http() {

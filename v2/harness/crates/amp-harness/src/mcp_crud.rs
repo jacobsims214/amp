@@ -1023,8 +1023,9 @@ fn read_secret_values(
 }
 
 fn ask_secret(ui: &mut dyn Ui, server: &str, item: &SecretItem) -> Result<String, CliError> {
+    // `Ui::secret` says "(hidden)" itself (#2352).
     let v = ui.secret(&format!(
-        "{server}: {} (hidden; kept in the OS keychain)",
+        "{server}: {} (kept in the OS keychain)",
         item.label
     ))?;
     Ok(v.trim().to_owned())
@@ -3180,7 +3181,11 @@ pub async fn logout(args: NameArgs) -> Result<(), CliError> {
     })?;
     let key = amp_mcp::scoped_credential_key(&url, server.credential_scope().as_deref());
     let backend = CredentialBackend::resolve().map_err(|e| CliError::new(e.to_string()))?;
-    let removed = oauth::logout_key(&key, &backend)
+    // Local only: the tokens are forgotten here, not revoked at the authorization server.
+    let removed = backend
+        .store_for_key(key)
+        .for_mcp_server(&server.name)
+        .clear_credentials()
         .await
         .map_err(|e| CliError::new(e.to_string()))?;
     if args.json {
@@ -3251,7 +3256,7 @@ pub async fn connect_external(
                 .health()
                 .into_iter()
                 .find(|h| h.name == name)
-                .map(|h| h.status.to_string());
+                .map(|h| h.status.describe_for(name));
             hub.shutdown().await;
             Err(CliError::new(match status {
                 Some(s) => format!("MCP server `{name}`: {s}"),
@@ -3355,6 +3360,40 @@ pub fn ask_preset_secrets(ui: &mut dyn Ui, config: &Path, names: &[String]) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Ui that renders a secret prompt the way the terminal one does.
+    struct Shown(Vec<String>);
+
+    impl Ui for Shown {
+        fn interactive(&self) -> bool {
+            true
+        }
+        fn say(&mut self, _text: &str) {}
+        fn ask(&mut self, prompt: &str, _default: Option<&str>) -> Result<String, CliError> {
+            self.0.push(prompt.to_owned());
+            Ok(String::new())
+        }
+        fn secret(&mut self, prompt: &str) -> Result<String, CliError> {
+            self.0.push(format!("{prompt} (hidden): "));
+            Ok("v".to_owned())
+        }
+    }
+
+    /// #2352: `mcp secret authd QA_TOKEN` says "hidden" once.
+    #[test]
+    fn secret_prompt_says_hidden_once() {
+        let mut ui = Shown(Vec::new());
+        let item = SecretItem {
+            label: "env QA_TOKEN".into(),
+            which: "QA_TOKEN".into(),
+            account: "mcp:authd:env:QA_TOKEN".into(),
+        };
+        assert_eq!(ask_secret(&mut ui, "authd", &item).unwrap(), "v");
+        assert_eq!(
+            ui.0,
+            ["authd: env QA_TOKEN (kept in the OS keychain) (hidden): "]
+        );
+    }
 
     #[test]
     fn claude_style_references_become_env_references() {
