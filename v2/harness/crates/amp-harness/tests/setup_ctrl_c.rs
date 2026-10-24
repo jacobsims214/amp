@@ -27,14 +27,46 @@ struct Pty {
     master: File,
     /// The test's own handle on the terminal, to read its mode after the child exits.
     slave: OwnedFd,
+    /// The terminal's device path. When the child led a session on it (`start_dev_tty`), macOS
+    /// revokes every open handle as it exits (ENOTTY), so the mode is read through a fresh open.
+    slave_path: Option<std::path::PathBuf>,
     seen: Arc<Mutex<Vec<u8>>>,
 }
 
 impl Pty {
     fn start(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Self {
+        Self::spawn(dir, args, env, false)
+    }
+
+    /// Like [`Pty::start`], but the pty is the child's controlling terminal and its stdin is
+    /// opened from `/dev/tty`, as install.sh hands off to setup (`setup </dev/tty`, #2330). On
+    /// macOS kqueue can't poll that fd, so this is the case a plain pty stdin can't catch.
+    fn start_dev_tty(dir: &Path, args: &[&str]) -> Self {
+        Self::spawn(dir, args, &[], true)
+    }
+
+    fn spawn(dir: &Path, args: &[&str], env: &[(&str, &str)], dev_tty: bool) -> Self {
         let pty = openpty(None, None).expect("openpty");
         let stdio = || Stdio::from(pty.slave.try_clone().unwrap());
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_amp-harness"));
+        let bin = env!("CARGO_BIN_EXE_amp-harness");
+        let slave_path = dev_tty.then(|| nix::unistd::ttyname(&pty.slave).expect("ttyname"));
+        let mut cmd = if dev_tty {
+            // A new session whose controlling terminal is the pty (stdin is the slave here), so
+            // /dev/tty is it; then `exec BIN ARGS </dev/tty`. Python does the setsid + TIOCSCTTY
+            // because this crate forbids `unsafe` (Command::pre_exec).
+            let mut py = Command::new("python3");
+            py.args([
+                "-c",
+                "import fcntl, os, sys, termios\n\
+                 os.setsid()\n\
+                 fcntl.ioctl(0, termios.TIOCSCTTY, 0)\n\
+                 os.execv('/bin/sh', ['sh', '-c', 'exec \"$0\" \"$@\" </dev/tty'] + sys.argv[1:])",
+                bin,
+            ]);
+            py
+        } else {
+            Command::new(bin)
+        };
         cmd.args(args)
             .current_dir(dir.join("project"))
             .env("HOME", dir.join("home"))
@@ -77,6 +109,7 @@ impl Pty {
             child,
             master,
             slave: pty.slave,
+            slave_path,
             seen,
         }
     }
@@ -98,9 +131,11 @@ impl Pty {
         }
     }
 
+    /// Types `bytes`. A child that already exited (EIO) shows up in the exit-code check, with
+    /// what it printed.
     fn send(&mut self, bytes: &[u8]) {
-        self.master.write_all(bytes).unwrap();
-        self.master.flush().unwrap();
+        let _ = self.master.write_all(bytes);
+        let _ = self.master.flush();
     }
 
     /// The exit code; the child must exit within 5 s ("promptly").
@@ -136,7 +171,11 @@ impl Pty {
             1,
             "one line: {text}"
         );
-        let mode = tcgetattr(&self.slave).expect("tcgetattr");
+        let mode = match &self.slave_path {
+            Some(path) => tcgetattr(File::open(path).expect("reopen the pty")),
+            None => tcgetattr(&self.slave),
+        }
+        .expect("tcgetattr");
         assert!(
             mode.local_flags
                 .contains(LocalFlags::ECHO | LocalFlags::ICANON | LocalFlags::ISIG),
@@ -161,6 +200,19 @@ fn ctrl_c_at_the_first_run_server_prompt_cancels() {
     let pty = Pty::start(&dir, &[], &[]);
     let text = pty.ctrl_c_cancels("AMP server [");
     assert!(text.contains("abc"), "a visible prompt echoes: {text}");
+    nothing_written(&dir);
+}
+
+/// #2330: install.sh runs `setup </dev/tty` (stdin may be the `curl | sh` pipe). On macOS the key
+/// reader failed at once with "read key: Failed to initialize input reader". The prompt must
+/// take typed input, and Ctrl+C must still cancel.
+#[test]
+fn the_server_prompt_reads_keys_from_dev_tty() {
+    let dir = workdir("dev-tty-server", None);
+    let pty = Pty::start_dev_tty(&dir, &["setup"]);
+    let text = pty.ctrl_c_cancels("AMP server [");
+    assert!(text.contains("abc"), "typed input echoes: {text}");
+    assert!(!text.contains("read key"), "{text}");
     nothing_written(&dir);
 }
 

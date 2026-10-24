@@ -66,10 +66,12 @@ harness-v* release found". Install from a checkout instead (git and rustup neede
 git clone https://github.com/jacobsims214/amp.git && cd amp
 git checkout harness-m4                    # until the harness reaches main
 make -C v2/harness install                 # release build, packed and installed by install.sh
+cd ~/code/my-project                       # setup links the folder it runs in
 amp-harness setup --preset https://intranet.example.com/amp-preset.toml   # with an org preset
 ```
 
-`make install` uses this same script (setup hand-off included); `PREFIX=DIR` installs elsewhere.
+`make install` uses this same script but passes `--no-setup` (make runs it in `v2/harness`, not your
+project), so it prints the setup command instead of offering it; `PREFIX=DIR` installs elsewhere.
 `setup --url` takes what `server set` takes: a bare `host`, `host:port` or a full URL (one
 normalisation for both, and for a preset's `server.url`).
 

@@ -236,6 +236,21 @@ if [ -n "${AMP_HARNESS_TEST_ARCHIVE:-}" ]; then
     expect_ok "install the real archive" sh "$install_sh" --archive "$AMP_HARNESS_TEST_ARCHIVE" --prefix "$T/real" --no-path-check
     out_has "real binary reports its version" "Installed amp-harness $version"
     if "$T/real/amp-harness" --version | head -n 1 | grep -q "^amp-harness $version"; then ok "real --version"; else bad "real --version"; fi
+    # The setup hand-off with the real binary (#2330): under `curl | sh` stdin is the pipe, so
+    # install.sh hands setup /dev/tty, which crossterm on macOS could not poll ("read key: Failed
+    # to initialize input reader"). The server prompt must take keys, and Ctrl+C must cancel.
+    if command -v python3 >/dev/null 2>&1; then
+        mkdir -p "$T/real-project"
+        python3 "$pty" --timeout 30 --expect "[Y/n]" --send 'y\n' --expect "AMP server [" --send 'abc' --expect 'abc' --send '\x03' -- \
+            env -u AMP_MCP_URL -u AMP_TOKEN -u AMP_HARNESS_PROMPTS -u AMP_HARNESS_PROFILE AMP_CREDENTIAL_STORE=file \
+            sh -c "cd '$T/real-project' && cat '$install_sh' | sh -s -- --archive '$AMP_HARNESS_TEST_ARCHIVE' --prefix '$T/real' --no-path-check" \
+            >"$T/out" 2>&1 && rc=0 || rc=$?
+        if [ "$rc" = 130 ]; then ok "real setup from curl | sh: Ctrl+C at the server prompt cancels (exit 130)"; else bad "real setup from curl | sh: exit $rc, want 130"; fi
+        out_has "real setup reads typed keys from /dev/tty" "AMP server [https://amp.simstech.cloud]: abc^C"
+        out_has "real setup says it was cancelled" "amp-harness: setup cancelled"
+        if grep -qF "read key" "$T/out"; then bad "real setup could not read keys"; else ok "no key-reader error"; fi
+        if [ -e "$T/real-project/.amp.json" ]; then bad "cancelled setup linked the folder"; else ok "cancelled setup wrote no .amp.json"; fi
+    fi
 fi
 
 echo "$pass passed, $fail failed"
