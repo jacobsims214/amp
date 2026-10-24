@@ -1083,8 +1083,16 @@ with square borders and AMP's ticket-state, epic and brand colours.
   Option-drag in iTerm2) or `false` (no mouse reporting: plain click-drag selects). The env var
   takes `on`/`off`.
 - `padding`: columns of space left and right of every part of the chat (header, transcript,
-  panels, editor, status line, footer), 0 to 8. Below 44 columns it shrinks so the content keeps
-  at least 40 columns (none at 41 columns or fewer).
+  panels, editor, status line, footer), 0 to 8. At 80 columns or fewer it is halved, rounded up
+  (the default 2 becomes 1), and it shrinks further so the content keeps at least 40 columns
+  (none at 41 columns or fewer). A blank row sits above the header and below the footer too,
+  except on terminals shorter than 24 rows.
+
+The message box shows the terminal's cursor as a blinking bar at the insertion point whenever it
+has the keys: on start, after a panel closes, and after a click into it (with mouse reporting on,
+a click also moves the insertion point). It is hidden while a panel has the keys (a panel open
+with an empty message box, an answer waiting for `y`). The terminal's own cursor shape comes back
+on exit.
 
 ### Header and status line (M3-3)
 

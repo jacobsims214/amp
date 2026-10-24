@@ -22,7 +22,8 @@
 //! shows every tool call's arguments and result (#2183). Mouse reporting (#2185):
 //! `AMP_HARNESS_MOUSE`, `[tui] mouse` (true|false), else on; off gives the terminal's plain
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
-//! Padding (#2251): `AMP_HARNESS_PADDING`, `[tui] padding` (0-8 columns each side), else 2.
+//! Padding (#2251): `AMP_HARNESS_PADDING`, `[tui] padding` (0-8 columns each side), else 2; halved
+//! at 80 columns or fewer, with a blank row above and below the chat (#2344, amp_tui::inset).
 //!
 //! `/server` (#2164) gets a [`crate::server_cmd::Switcher`]: it lists the saved servers and moves
 //! the session (its AMP connection, the model's AMP tools and prompt, the metadata poller) to

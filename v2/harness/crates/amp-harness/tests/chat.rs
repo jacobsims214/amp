@@ -116,9 +116,11 @@ async fn the_chat_talks_to_the_manager() {
     assert!(!screen.contains("current_time"), "{screen}");
     assert_eq!(amp.mock.calls_to("amp_whoami"), vec![json!({})]);
 
-    // The footer, two rows at 220 columns: cwd • role, then `ctx N%` … model • thinking.
-    assert!(lines[58].contains("• manager"), "{}", lines[58]);
-    assert!(lines[59].contains("faux-1 • "), "{}", lines[59]);
+    // The footer, two rows at 220 columns: cwd • role, then `ctx N%` … model • thinking; then
+    // the blank bottom row (#2344).
+    assert!(lines[57].contains("• manager"), "{}", lines[57]);
+    assert!(lines[58].contains("faux-1 • "), "{}", lines[58]);
+    assert_eq!(lines[59].trim(), "", "{screen}");
 
     // The session was written to the JSONL state dir, like run -p.
     let sessions = dir.join("home/.local/state/amp-harness/sessions/amp-manager");
@@ -164,7 +166,8 @@ async fn model_switches_and_quit_in_the_chat() {
     assert!(screen.contains("model: faux/faux-2"), "{screen}");
     assert!(screen.contains("session in memory"), "{screen}");
     assert!(!screen.contains("never sent"), "{screen}");
-    let last = screen.lines().last().unwrap();
+    // The footer's last row is above the blank bottom row (#2344).
+    let last = screen.lines().rev().nth(1).unwrap();
     assert!(last.contains("faux-2 • "), "{last}");
 }
 
