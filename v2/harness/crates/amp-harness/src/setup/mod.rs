@@ -591,7 +591,11 @@ async fn server_step(
                             "Saved the server {} as `{}` in {}.",
                             settings.url,
                             entry.name,
-                            config.path.display()
+                            // #2351: `~/…`, so the line is short enough to read in one go.
+                            crate::chat::tilde(
+                                &config.path,
+                                std::env::var_os("HOME").map(PathBuf::from).as_deref()
+                            )
                         ));
                     }
                 }
