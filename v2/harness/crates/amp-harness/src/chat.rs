@@ -343,7 +343,9 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         // Back on the main screen: where the conversation was saved (#2184).
         let home = std::env::var_os("HOME").map(PathBuf::from);
         if let Some(line) = exit_line(session_file.as_deref(), home.as_deref()) {
-            println!("{line}");
+            // Wrapped at the `·` rather than inside the path (#2351).
+            let width = crate::setup::ui::terminal_width(&std::io::stdout());
+            println!("{}", crate::setup::ui::wrap_text(&line, width));
         }
         return result.map_err(CliError::new);
     };
@@ -628,7 +630,7 @@ fn exit_line(session_file: Option<&Path>, home: Option<&Path>) -> Option<String>
 }
 
 /// `path` with a leading `home` written as `~`.
-fn tilde(path: &Path, home: Option<&Path>) -> String {
+pub(crate) fn tilde(path: &Path, home: Option<&Path>) -> String {
     match home
         .filter(|h| !h.as_os_str().is_empty())
         .and_then(|h| path.strip_prefix(h).ok())

@@ -35,6 +35,8 @@
 //! - [`scroll`] (#2185): PageUp/PageDown, Ctrl+U/Ctrl+D and End scroll the transcript, and the
 //!   "↓ new output" pill shows while it is scrolled up and output arrives below.
 //!
+//! - [`history`] (#2348): ↑↓ in the editor recall the prompts sent earlier in the chat.
+//!
 //! - [`footer`] (#2186): the footer in place of pi's: `~`-relative cwd shortened from the left,
 //!   branch, role · #ticket, `$0.004 · ctx 4%` and model • thinking; one row below 100 columns.
 //!
@@ -48,6 +50,7 @@
 pub mod amp_render;
 pub mod chrome;
 pub mod footer;
+pub mod history;
 pub mod inset;
 pub mod overlay;
 pub mod scroll;
@@ -62,6 +65,7 @@ pub mod workers;
 pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
+pub use history::{HISTORY_LIMIT, PromptHistory, Recall};
 pub use inset::{
     DEFAULT_PADDING, Gap, Inset, MAX_PADDING, MIN_INNER, NARROW, Padding, SHORT, VERTICAL,
 };

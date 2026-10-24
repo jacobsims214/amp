@@ -56,11 +56,24 @@ config.
 **macOS keeps asking for keychain access**:
 
 - Once per item after an upgrade or rebuild is expected. Choose "Always Allow".
-- Asking on every read means the item was made by Apple's `security` tool. Store the key again
-  with `amp-harness connect <provider>` (or `amp-harness login`), and the harness will own the item.
-- In scripts and for agents, dialogs are switched off. The command fails at once and names the
-  item and the fix. `AMP_HARNESS_KEYCHAIN_TRACE=<file>` logs every keychain call (never a
-  secret).
+- Asking on every read means the item was made by Apple's `security` tool. Store it again
+  through amp-harness (table below), and the harness will own the item.
+- In scripts and for agents, dialogs are switched off. The command fails at once (`Not asking
+  (OSStatus …)`) and names the item and the command that fixes it. Run that command in a
+  terminal. If an earlier amp-harness build made the item, any amp-harness command run in a
+  terminal also works: choose "Always Allow" when macOS asks. `AMP_HARNESS_KEYCHAIN_TRACE=<file>`
+  logs every keychain call (never a secret).
+
+Which command stores an item again depends on the item (the keychain account in the message):
+
+| Keychain account | What it is | Store it again with |
+|---|---|---|
+| `provider:<id>…` | a provider key or header | `amp-harness connect <id>` |
+| `mcp:<server>:env:<VAR>`, `mcp:<server>:header:<name>` | an MCP server's secret | `amp-harness mcp secret <server> <VAR or name>` |
+| `mcp:<server>:oauth-client-secret` | an MCP server's OAuth client secret | `amp-harness mcp secret <server> oauth` |
+| `mcp:repo:<id>:<server>:…` | a repo MCP server's secret | the same `mcp secret` command, run in that repo |
+| an MCP server's URL, or `mcp-repo:<id>:<server>\|<url>` | an MCP server's OAuth login | `amp-harness mcp login <server>` |
+| AMP's URL (`https://…/mcp`) | the AMP login | `amp-harness login` |
 
 **No keychain (Linux server, container)**: logins go to `~/.config/amp-harness/credentials.json`
 (mode 0600). Provider keys must come from environment variables (`OPENROUTER_API_KEY`,

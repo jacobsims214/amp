@@ -330,7 +330,7 @@ impl Inner {
             }
             Err(_) => {
                 let status = h
-                    .map(|h| h.status.to_string())
+                    .map(|h| h.status.describe_for(name))
                     .unwrap_or_else(|| "not started".to_owned());
                 let mut errors = vec![format!("MCP server `{name}`: {status}")];
                 let tail = stderr_tail(h.and_then(|h| h.stderr_log.as_deref()), 5);
@@ -1085,7 +1085,8 @@ impl Inner {
                 Cell::flex(short(&value), Tone::Text),
             ];
             if !source.is_empty() {
-                cells.push(Cell::new(format!("({})", short(&source)), Tone::Muted));
+                // A note: on its own line when narrow, so the value isn't cut for it (#2351).
+                cells.push(Cell::note(format!("({})", short(&source)), Tone::Muted));
             }
             rows.push(InfoRow::new(cells).indent(2));
         };

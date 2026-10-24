@@ -80,6 +80,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::amp_render::{self, ApprovalNotice};
+use crate::history::{PromptHistory, Recall};
 use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, Stage, Target};
 use crate::slash::MenuKey;
 use crate::view::{ChatView, FooterInfo};
@@ -539,6 +540,8 @@ pub struct Shell {
     person: Option<String>,
     /// The screen's size, for Ctrl+T to find the thinking in sight ([`Shell::set_screen`]).
     screen: Option<(usize, usize)>,
+    /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
+    history: PromptHistory,
 }
 
 impl Shell {
@@ -596,6 +599,7 @@ impl Shell {
                 editor_clicked: false,
                 person: None,
                 screen: None,
+                history: PromptHistory::new(),
             },
             done_rx,
         )
@@ -1303,6 +1307,8 @@ impl Shell {
             }
             return Submit::Continue;
         }
+        // ↑ recalls it (#2348); answers above stay out (they belong to their question).
+        self.history.record(text);
         if let Some(rest) = trimmed.strip_prefix('/') {
             let (name, arg) = match rest.split_once(char::is_whitespace) {
                 Some((name, arg)) => (name, arg.trim()),
@@ -1453,6 +1459,11 @@ impl Shell {
             self.view.panel().state().map(|s| s.stage),
             Some(Stage::Confirm { .. } | Stage::Sending { .. })
         );
+        // ↑↓ recall earlier prompts (#2348): before the `/` menu while a recalled prompt is
+        // shown (a recalled `/usage` opens the menu), after it otherwise.
+        if self.history_key(key, true) {
+            return true;
+        }
         if !confirming {
             match self.view.menu().key(key) {
                 MenuKey::Pass => {}
@@ -1464,6 +1475,9 @@ impl Shell {
                     return true;
                 }
             }
+        }
+        if self.history_key(key, false) {
+            return true;
         }
         let panel_open = self.view.panel().is_open();
         if self.panel_key(key, editor_empty) {
@@ -1482,6 +1496,30 @@ impl Shell {
             return true;
         }
         false
+    }
+
+    /// Plain ↑ / ↓ as prompt history ([`crate::history`], #2348), while no panel is open (panels
+    /// keep their ↑↓). `browsing_only`: only while a recalled prompt is shown unchanged (checked
+    /// before the `/` menu, which otherwise keeps its ↑↓). Returns whether the key was used.
+    fn history_key(&mut self, key: &KeyEvent, browsing_only: bool) -> bool {
+        let recall = match key.code {
+            KeyCode::Up => Recall::Older,
+            KeyCode::Down => Recall::Newer,
+            _ => return false,
+        };
+        if !key.modifiers.is_empty() || self.view.panel().is_open() {
+            return false;
+        }
+        let editor = self.view.editor().clone();
+        if browsing_only && !self.history.is_browsing(&editor.get_text()) {
+            return false;
+        }
+        self.history.apply(recall, &editor)
+    }
+
+    /// The prompts recorded for ↑↓ (#2348), oldest first.
+    pub fn history(&self) -> &[String] {
+        self.history.entries()
     }
 
     /// The transcript's scroll keys, when no panel took the key (#2185):

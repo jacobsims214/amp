@@ -61,6 +61,150 @@ fn prompt_text(prompt: &str, default: Option<&str>) -> String {
     }
 }
 
+/// The terminal's width in columns when `stream` is a terminal (#2351), else `None`.
+pub fn terminal_width(stream: &impl IsTerminal) -> Option<usize> {
+    if !stream.is_terminal() {
+        return None;
+    }
+    crossterm::terminal::size()
+        .ok()
+        .map(|(cols, _)| usize::from(cols))
+        .filter(|&w| w > 0)
+}
+
+/// `text` word-wrapped to `width` columns (#2351), so plain output printed outside the TUI never
+/// breaks inside a word at the terminal's edge. Each line breaks at spaces; its continuation rows
+/// hang under its text: after a `1) ` / `• ` / `- ` marker, under the value of a `label   value`
+/// line (the trust prompt's details), else at the line's indentation. Only a word wider than the
+/// row (a path, a URL) is broken inside, after a `/` when it has one. `None` (not a terminal)
+/// leaves the text as it is.
+pub fn wrap_text(text: &str, width: Option<usize>) -> String {
+    let Some(width) = width.filter(|&w| w > 0) else {
+        return text.to_owned();
+    };
+    text.split('\n')
+        .flat_map(|line| wrap_line(line, width))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn cols(s: &str) -> usize {
+    amp_tui::table::width(s)
+}
+
+/// Where a line's continuation rows start (see [`wrap_text`]), in bytes of `line` (the head is
+/// ASCII: spaces, digits, a label) and columns.
+fn hang(line: &str) -> usize {
+    let lead = line.len() - line.trim_start_matches(' ').len();
+    let rest = &line[lead..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0
+        && matches!(rest.as_bytes().get(digits), Some(b')' | b'.'))
+        && rest.as_bytes().get(digits + 1) == Some(&b' ')
+    {
+        return lead + digits + 2;
+    }
+    if rest.starts_with("- ") {
+        return lead + 2;
+    }
+    if rest.starts_with("• ") {
+        return lead + "• ".len();
+    }
+    // `label   value`: a short label (one or two words), two or more spaces, then the value.
+    if let Some(gap) = rest.find("  ")
+        && gap > 0
+        && gap <= 24
+        && rest[..gap].split(' ').count() <= 2
+        && rest.is_ascii()
+    {
+        let value = rest[gap..].len() - rest[gap..].trim_start_matches(' ').len();
+        if gap + value < rest.len() {
+            return lead + gap + value;
+        }
+    }
+    lead
+}
+
+/// One line wrapped to `width` (see [`wrap_text`]).
+fn wrap_line(line: &str, width: usize) -> Vec<String> {
+    if cols(line) <= width {
+        return vec![line.to_owned()];
+    }
+    let mut at = hang(line);
+    // Keep a third of the row (and 16 columns) for the text, else hang at the indentation.
+    let lead = line.len() - line.trim_start_matches(' ').len();
+    if at + (width / 3).max(16) > width {
+        at = if lead + (width / 3).max(16) <= width {
+            lead
+        } else {
+            0
+        };
+    }
+    let (head, body) = line.split_at(at);
+    let room = width - cols(head);
+    let mut rows: Vec<String> = vec![String::new()];
+    for word in body.split(' ').filter(|w| !w.is_empty()) {
+        let cur = rows.last_mut().expect("one row");
+        let need = cols(cur) + usize::from(!cur.is_empty()) + cols(word);
+        if need <= room {
+            if !cur.is_empty() {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            continue;
+        }
+        if !cur.is_empty() {
+            rows.push(String::new());
+        }
+        for (i, piece) in break_word(word, room).into_iter().enumerate() {
+            if i > 0 {
+                rows.push(String::new());
+            }
+            rows.last_mut().expect("one row").push_str(&piece);
+        }
+    }
+    let pad = " ".repeat(cols(head));
+    rows.into_iter()
+        .enumerate()
+        .map(|(i, r)| {
+            if i == 0 {
+                format!("{head}{r}")
+            } else {
+                format!("{pad}{r}")
+            }
+        })
+        .collect()
+}
+
+/// `word` in pieces of at most `room` columns, each ending after its last `/` when it has one past
+/// its first character, so a path breaks between its directories.
+fn break_word(word: &str, room: usize) -> Vec<String> {
+    let room = room.max(1);
+    let mut out = Vec::new();
+    let mut rest = word;
+    while cols(rest) > room {
+        let mut end = 0;
+        let mut used = 0;
+        for (i, c) in rest.char_indices() {
+            let w = cols(c.encode_utf8(&mut [0; 4]));
+            if used + w > room {
+                break;
+            }
+            used += w;
+            end = i + c.len_utf8();
+        }
+        let end = end.max(rest.chars().next().map_or(1, char::len_utf8));
+        let cut = match rest[..end].rfind('/') {
+            Some(i) if i > 0 => i + 1,
+            _ => end,
+        };
+        out.push(rest[..cut].to_owned());
+        rest = &rest[cut..];
+    }
+    out.push(rest.to_owned());
+    out
+}
+
 /// The UI for this process: scripted when `AMP_HARNESS_PROMPTS=stdin`, the terminal when stdin
 /// and stderr are one, else none. `allow` = false forces [`NoUi`] (`init --yes`).
 pub fn detect(allow: bool) -> Box<dyn Ui> {
@@ -150,7 +294,7 @@ impl Ui for TerminalUi {
         true
     }
     fn say(&mut self, text: &str) {
-        eprintln!("{text}");
+        eprintln!("{}", wrap_text(text, terminal_width(&io::stderr())));
     }
     fn ask(&mut self, prompt: &str, default: Option<&str>) -> Result<String, CliError> {
         let line = read_terminal(&prompt_text(prompt, default), Echo::Visible)?;
@@ -395,6 +539,74 @@ mod tests {
         assert_eq!(
             apply_key(&mut out, KeyEvent::from(KeyCode::Enter)),
             Edit::Done
+        );
+    }
+
+    #[test]
+    fn wrap_text_breaks_at_words_with_a_hanging_indent() {
+        // #2351: setup's lines broke mid-word ("…the othe" / "r workers") at the terminal edge.
+        let menu = "  3) Your own OpenAI-compatible endpoint (e.g. api.example.com: a company \
+                    gateway, vLLM, LiteLLM, Ollama) — your models, mapped to the roles";
+        let out = wrap_text(menu, Some(40));
+        let rows: Vec<&str> = out.lines().collect();
+        assert!(rows.len() > 1, "{rows:?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 40), "{rows:?}");
+        assert!(rows[0].starts_with("  3) Your own"), "{rows:?}");
+        // Continuations hang under the text after `3) `, and no word is split.
+        assert!(
+            rows[1..]
+                .iter()
+                .all(|r| r.starts_with("     ") && !r.starts_with("      "))
+        );
+        let words: Vec<&str> = out.split_whitespace().collect();
+        let want: Vec<&str> = menu.split_whitespace().collect();
+        assert_eq!(words, want);
+
+        let saved = "Saved the server http://localhost:8080 as `local` in \
+                     ~/.config/amp-harness/config.toml.";
+        let out = wrap_text(saved, Some(50));
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "Saved the server http://localhost:8080 as `local`",
+                "in ~/.config/amp-harness/config.toml."
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_text_leaves_short_lines_and_pipes_alone() {
+        assert_eq!(wrap_text("a b\n  c", Some(80)), "a b\n  c");
+        let long = "word ".repeat(40);
+        assert_eq!(wrap_text(&long, None), long);
+        // A `label   value` line hangs under its value; a long path breaks after a `/`.
+        let detail =
+            "    dir         /Volumes/external-data/development/simstech/demo/.qa/project/.amp/";
+        let out = wrap_text(detail, Some(60));
+        assert_eq!(
+            out.lines().collect::<Vec<_>>(),
+            [
+                "    dir         /Volumes/external-data/development/simstech/",
+                "                demo/.qa/project/.amp/"
+            ]
+        );
+        // The chat's exit line: broken after `·`, and the path between directories.
+        let saved = "Session saved · ~/.local/state/amp-harness/sessions/amp-manager/\
+                     1792874601408-01a16fa7-5bc0-7262-a506-54f6f400fc7d.jsonl";
+        assert_eq!(
+            wrap_text(saved, Some(80)).lines().collect::<Vec<_>>(),
+            [
+                "Session saved ·",
+                "~/.local/state/amp-harness/sessions/amp-manager/",
+                "1792874601408-01a16fa7-5bc0-7262-a506-54f6f400fc7d.jsonl"
+            ]
+        );
+        // A word wider than the line is broken inside, never dropped.
+        let out = wrap_text("see /a/very/long/path/that/does/not/fit ok", Some(12));
+        assert!(out.lines().all(|r| r.chars().count() <= 12), "{out}");
+        assert_eq!(
+            out.split_whitespace().collect::<String>(),
+            "see/a/very/long/path/that/does/not/fitok"
         );
     }
 
