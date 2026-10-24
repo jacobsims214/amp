@@ -553,6 +553,128 @@ async fn cli_writes_to_the_repo_layer_are_trusted() {
     assert_eq!(ids, ["agent:sql-expert", "role:manager"]);
 }
 
+/// #2332: `models profile` / `models set` report what will run, resolved as `models list` does.
+/// An untrusted repo profile or role is not used, so they don't say it wins; once trusted they do.
+#[tokio::test]
+async fn models_writes_report_the_trusted_resolution() {
+    let repo = Repo::new("models-writes");
+    std::fs::create_dir_all(repo.harness()).unwrap();
+    std::fs::write(
+        repo.harness().join("config.toml"),
+        "[models]\nprofile = \"opencode\"\n\n[roles.manager]\nmodel = \"faux/faux-2\"\n",
+    )
+    .unwrap();
+    let selection = |out: &Output| -> String {
+        let v: Value = serde_json::from_str(&out.stdout).unwrap();
+        format!(
+            "{} {} ({})",
+            v["mode"].as_str().unwrap(),
+            v["selection"].as_str().unwrap(),
+            v["selection_source"].as_str().unwrap()
+        )
+    };
+
+    // Untrusted: the user's choice is what runs, and the summary says so.
+    let out = repo.run(NO_AMP, &["models", "profile", "anthropic"]).await;
+    ok(&out, "models profile anthropic");
+    assert!(
+        out.stdout.contains("models: profile anthropic (config "),
+        "{}",
+        out.stdout
+    );
+    assert!(!out.stdout.contains("repo "), "{}", out.stdout);
+    assert!(!out.stderr.contains("wins"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains("not trusted, so yours is used")
+            && out.stderr.contains("amp-harness trust setting:profile"),
+        "{}",
+        out.stderr
+    );
+    let list = repo.run(NO_AMP, &["models", "list", "--json"]).await;
+    ok(&list, "models list");
+    assert!(selection(&list).starts_with("profile anthropic (config "));
+
+    let out = repo
+        .run(
+            NO_AMP,
+            &[
+                "models",
+                "set",
+                "manager",
+                "faux/faux-1",
+                "--no-check",
+                "--json",
+            ],
+        )
+        .await;
+    ok(&out, "models set");
+    let o: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(o["role"]["model"], "faux-1", "{o}");
+    assert!(
+        o["role"]["source"].as_str().unwrap().starts_with("config "),
+        "{o}"
+    );
+    let warnings = o["warnings"].to_string();
+    assert!(!warnings.contains("wins"), "{warnings}");
+    assert!(
+        warnings.contains("not trusted, so yours is used")
+            && warnings.contains("amp-harness trust role:manager"),
+        "{warnings}"
+    );
+    assert_eq!(repo.manager_model().await, "faux/faux-1");
+
+    // Trusted: the repo's settings win, and the summary warns.
+    ok(
+        &repo
+            .run(NO_AMP, &["trust", "setting:profile", "role:manager"])
+            .await,
+        "trust",
+    );
+    let out = repo
+        .run(NO_AMP, &["models", "profile", "anthropic", "--json"])
+        .await;
+    ok(&out, "models profile anthropic (trusted)");
+    let o: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert!(
+        o["profile"]
+            .as_str()
+            .unwrap()
+            .starts_with("profile opencode (repo "),
+        "{o}"
+    );
+    assert!(
+        o["warnings"].to_string().contains("wins in this repo"),
+        "{o}"
+    );
+    assert!(!o["warnings"].to_string().contains("not trusted"), "{o}");
+    let list = repo.run(NO_AMP, &["models", "list", "--json"]).await;
+    assert!(selection(&list).starts_with("profile opencode (repo "));
+
+    let out = repo
+        .run(
+            NO_AMP,
+            &[
+                "models",
+                "set",
+                "manager",
+                "faux/faux-1",
+                "--no-check",
+                "--json",
+            ],
+        )
+        .await;
+    ok(&out, "models set (trusted)");
+    let o: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(o["role"]["model"], "faux-2", "{o}");
+    assert!(
+        o["warnings"]
+            .to_string()
+            .contains("wins over your user config"),
+        "{o}"
+    );
+    assert_eq!(repo.manager_model().await, "faux/faux-2");
+}
+
 /// A repo dir without .amp.json is no repo: `trust` says so.
 #[tokio::test]
 async fn trust_outside_a_repo_says_so() {

@@ -28,6 +28,7 @@ use amp_core::{
     },
     providers::{KeyLookup, SystemKeys, live_model_ids, resolve_key},
     repo_config::RepoConfig,
+    repo_trust::{self, ItemKind},
 };
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -222,7 +223,10 @@ impl Target {
     }
 }
 
-/// The models config with `new_text` in place of the target file: what the change would load as.
+/// The models config with `new_text` in place of the target file: what the change would load as,
+/// resolved like [`current`] (and `models list`): the repo's `[roles.*]` and `[models] profile`
+/// count only when trusted (#2332). A `--repo` write is the person's own, and is recorded as
+/// trusted when the command succeeds (`trust_cmd::RepoWrites`), so what it adds or changes counts.
 fn load_with(
     paths: &amp_mcp::ConfigPaths,
     target: &Target,
@@ -238,10 +242,14 @@ fn load_with(
             None => Ok(None),
         }
     };
-    let (user_text, repo_text) = if target.repo {
-        (read(paths.user_file.clone())?, Some(new_text.to_owned()))
+    let (user_text, repo_text, repo_before) = if target.repo {
+        (
+            read(paths.user_file.clone())?,
+            Some(new_text.to_owned()),
+            read(paths.repo_file())?,
+        )
     } else {
-        (Some(new_text.to_owned()), read(paths.repo_file())?)
+        (Some(new_text.to_owned()), read(paths.repo_file())?, None)
     };
     let user_label = paths
         .user_file
@@ -253,7 +261,38 @@ fn load_with(
         .transpose()
         .map_err(|e| e.0)?;
     let repo = match (paths.repo_file(), repo_text) {
-        (Some(path), Some(text)) => Some(RepoConfig::parse(&text, &path).map_err(|e| e.0)?),
+        (Some(path), Some(text)) => {
+            let mut repo = RepoConfig::parse(&text, &path).map_err(|e| e.0)?;
+            let gate = amp_core::repo_trust::Gate::from_env(paths, &env);
+            // What this write changes in the repo file (recorded as trusted only when there is a
+            // state dir to record it in, as `RepoWrites::finish` does).
+            let before = (target.repo && amp_core::agent::state_dir(&env).is_some()).then(|| {
+                repo_before
+                    .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
+                    .unwrap_or_default()
+            });
+            let written = |kind: ItemKind, name: &str, sha256: &str| -> bool {
+                let Some(before) = &before else {
+                    return false;
+                };
+                let old = match kind {
+                    ItemKind::Role => before
+                        .get("roles")
+                        .and_then(|r| r.get(name))
+                        .map(repo_trust::role_fingerprint),
+                    ItemKind::Setting => before
+                        .get("models")
+                        .and_then(|m| m.get(name))
+                        .map(|v| repo_trust::setting_fingerprint(name, v)),
+                    _ => return false,
+                };
+                old.as_deref() != Some(sha256)
+            };
+            repo.retain_allowed(&|kind, name, sha256| {
+                gate.allows(kind, name, sha256) || written(kind, name, sha256)
+            });
+            Some(repo)
+        }
         _ => None,
     };
     let mut config = ModelsConfig::from_layers(
@@ -568,6 +607,18 @@ pub(crate) async fn set_role_in(
             "the repo's config sets `{role}` to {} and wins over your user config here; `amp-harness models reset {role} --repo` drops it",
             resolved.model_ref()
         ));
+    } else if !target.repo
+        && !resolved.source.contains("repo ")
+        && let Some(repo) = repo_as_written(paths)
+        && let Some(id) = [role.clone(), format!("amp-{role}")]
+            .into_iter()
+            .find(|id| repo.roles.contains_key(id))
+    {
+        warnings.push(format!(
+            "{} sets [roles.{id}], which is not trusted, so yours is used; it is not used until \
+             you trust it (`amp-harness trust role:{id}`)",
+            repo.path.display()
+        ));
     }
     if let (Some(asked), Some(req)) = (thinking, resolved.requested_thinking)
         && thinking_name(resolved.thinking) != asked
@@ -695,15 +746,27 @@ async fn profile(args: ProfileArgs) -> Result<(), CliError> {
             amp_core::models::ENV_PROFILE
         ));
     } else if !target.repo
-        && let Some(repo) = paths
-            .repo_file()
-            .and_then(|f| RepoConfig::load(&f).ok().flatten())
+        && let Some(repo) = repo_as_written(&paths)
         && let Some(p) = repo.profile
     {
-        warnings.push(format!(
-            "{} sets profile = \"{p}\", which wins in this repo; `amp-harness models profile <name> --repo` changes it",
-            repo.path.display()
-        ));
+        // `after` resolves the repo layer as `models list` does: its profile counts only when
+        // trusted (#2332).
+        let repo_wins = matches!(
+            &after.selection,
+            amp_core::models::Selection::Profile { source, .. } if source.starts_with("repo ")
+        );
+        warnings.push(if repo_wins {
+            format!(
+                "{} sets profile = \"{p}\", which wins in this repo; `amp-harness models profile <name> --repo` changes it",
+                repo.path.display()
+            )
+        } else {
+            format!(
+                "{} sets profile = \"{p}\", which is not trusted, so yours is used; it is not used \
+                 until you trust it (`amp-harness trust setting:profile`)",
+                repo.path.display()
+            )
+        });
     }
     let profile = match &after.selection {
         amp_core::models::Selection::Profile { name, source } => {
@@ -735,6 +798,13 @@ async fn profile(args: ProfileArgs) -> Result<(), CliError> {
         config_cmd::print_roles(&report);
     }
     Ok(())
+}
+
+/// The repo file as written (trusted or not), when there is one that loads.
+fn repo_as_written(paths: &amp_mcp::ConfigPaths) -> Option<RepoConfig> {
+    paths
+        .repo_file()
+        .and_then(|f| RepoConfig::load(&f).ok().flatten())
 }
 
 /// Defaults + the user's providers, with the shipped profile: for checking a model while the
