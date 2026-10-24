@@ -605,17 +605,17 @@ mod tests {
         let agent = items[0].details.join("\n");
         assert!(agent.contains("the built-in agent amp-manager"), "{agent}");
         assert!(
-            agent.contains("permission bash: {\"*\":\"allow\"}"),
+            agent.contains("permission  bash: {\"*\":\"allow\"}"),
             "{agent}"
         );
         assert!(agent.contains("edit: allow"), "{agent}");
-        assert!(agent.contains("mode       primary"), "{agent}");
+        assert!(agent.contains("mode        primary"), "{agent}");
         let skill = items[1].details.join("\n");
         assert!(skill.contains("run.sh (18 B)"), "{skill}");
         assert!(skill.contains("nothing (a new skill)"), "{skill}");
         let role = items[2].details.join("\n");
-        assert!(role.contains("extra_body { store = true }"), "{role}");
-        assert!(role.contains("model      \"a/b\""), "{role}");
+        assert!(role.contains("extra_body  { store = true }"), "{role}");
+        assert!(role.contains("model       \"a/b\""), "{role}");
         assert_eq!(items[3].summary, "[models] profile = \"anthropic\"");
         // Stable, and any change changes it.
         assert_eq!(scan(&paths(&dir)), items);

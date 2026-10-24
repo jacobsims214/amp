@@ -1075,13 +1075,15 @@ impl Inner {
         let head = |rows: &mut Vec<InfoRow>, title: &str| {
             rows.push(InfoRow::new(vec![Cell::new(title, Tone::Accent)]));
         };
+        let repo_root = paths.repo_dir.as_deref().and_then(|d| d.ancestors().nth(2));
+        let short = |text: &str| tilde(&repo_relative(text, repo_root));
         let line = |rows: &mut Vec<InfoRow>, label: &str, value: String, source: String| {
             let mut cells = vec![
                 Cell::new(label, Tone::Dim).pad(18),
-                Cell::flex(tilde(&value), Tone::Text),
+                Cell::flex(short(&value), Tone::Text),
             ];
             if !source.is_empty() {
-                cells.push(Cell::new(format!("({})", tilde(&source)), Tone::Muted));
+                cells.push(Cell::new(format!("({})", short(&source)), Tone::Muted));
             }
             rows.push(InfoRow::new(cells).indent(2));
         };
@@ -1092,6 +1094,11 @@ impl Inner {
             Some(p) => format!("{} (not there yet)", p.display()),
             None => "(none)".to_owned(),
         };
+        // Every row names files in the repo as `<repo>/…` and this row says where it is, so a
+        // narrow panel keeps their useful tail (#2335).
+        if let Some(root) = repo_root {
+            line(&mut rows, "repo", root.display().to_string(), String::new());
+        }
         line(
             &mut rows,
             "user config",
@@ -1836,6 +1843,14 @@ fn show_path(path: &str, repo_dir: Option<&Path>) -> String {
     tilde(path)
 }
 
+/// `text` with every path inside the repo at `root` written as `<repo>/…` (#2335).
+fn repo_relative(text: &str, root: Option<&Path>) -> String {
+    match root.map(|r| r.display().to_string()) {
+        Some(r) if r.len() > 1 => text.replace(&format!("{}/", r.trim_end_matches('/')), "<repo>/"),
+        _ => text.to_owned(),
+    }
+}
+
 /// `path` with a leading `$HOME` written as `~` (anywhere in a value or a source).
 fn tilde(text: &str) -> String {
     match std::env::var("HOME") {
@@ -1881,6 +1896,24 @@ fn permission_lines(frontmatter: Option<&Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_values_name_repo_files_from_the_repo() {
+        let root = Path::new("/work/proj");
+        assert_eq!(
+            repo_relative(
+                "/work/proj/.amp/harness/agents · config /work/proj/.amp/harness/config.toml",
+                Some(root)
+            ),
+            "<repo>/.amp/harness/agents · config <repo>/.amp/harness/config.toml"
+        );
+        assert_eq!(repo_relative("/work/proj", Some(root)), "/work/proj");
+        assert_eq!(
+            repo_relative("/work/project2/x", Some(root)),
+            "/work/project2/x"
+        );
+        assert_eq!(repo_relative("/work/proj/x", None), "/work/proj/x");
+    }
 
     #[test]
     fn detail_paths_are_repo_relative_or_under_home() {

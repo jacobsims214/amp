@@ -139,8 +139,8 @@ pub fn summary(server: &McpServer) -> String {
 
 /// The width [`details`] wraps long values at.
 const DETAIL_WIDTH: usize = 96;
-/// The label column of [`details`].
-const LABEL: usize = 11;
+/// The label column of [`details`]: the longest label (`description`) and a space (#2335).
+const LABEL: usize = 12;
 
 /// Everything trusting `server` lets run or be sent (#2310, review #2248 finding 3), one field per
 /// line, for the trust question and `mcp trust`: the whole command line (every argument, wrapped,
@@ -272,7 +272,8 @@ pub fn details(server: &McpServer) -> Vec<String> {
 }
 
 /// One `label      value` line of [`details`], the value wrapped at [`DETAIL_WIDTH`] under itself. A long word
-/// (an `sh -c` script, a URL) is broken wherever it must be: nothing is ever cut.
+/// (an `sh -c` script, a URL, a path) is broken after a `/` when it has one, else wherever it must
+/// be (#2335): nothing is ever cut.
 pub fn detail_field(out: &mut Vec<String>, label: &str, value: &str) {
     let width = DETAIL_WIDTH - LABEL;
     let mut lines: Vec<String> = vec![String::new()];
@@ -293,12 +294,11 @@ pub fn detail_field(out: &mut Vec<String>, label: &str, value: &str) {
         if !cur.is_empty() {
             lines.push(String::new());
         }
-        let chars: Vec<char> = word.chars().collect();
-        for (i, chunk) in chars.chunks(width).enumerate() {
+        for (i, chunk) in break_word(word, width).into_iter().enumerate() {
             if i > 0 {
                 lines.push(String::new());
             }
-            lines.last_mut().expect("one line").extend(chunk.iter());
+            lines.last_mut().expect("one line").push_str(&chunk);
         }
     }
     for (i, l) in lines.into_iter().enumerate() {
@@ -311,6 +311,23 @@ pub fn detail_field(out: &mut Vec<String>, label: &str, value: &str) {
         };
         out.push(format!("{label:<LABEL$}{sep}{l}").trim_end().to_owned());
     }
+}
+
+/// `word` in pieces of at most `width` characters, each ending after its last `/` when it has one
+/// past its first character, so a path wraps between its directories, not inside a name.
+fn break_word(word: &str, width: usize) -> Vec<String> {
+    let mut rest: Vec<char> = word.chars().collect();
+    let mut out = Vec::new();
+    while rest.len() > width {
+        let cut = rest[1..width]
+            .iter()
+            .rposition(|&c| c == '/')
+            .map(|i| i + 2)
+            .unwrap_or(width);
+        out.push(rest.drain(..cut).collect());
+    }
+    out.push(rest.into_iter().collect());
+    out
 }
 
 /// A value as written; a literal that looks like a credential is redacted (config files refuse
@@ -1258,7 +1275,7 @@ mod tests {
         assert!(joined.contains("id_ed25519"), "{fs}");
         assert!(joined.contains("https://x.test/steal"), "{fs}");
         assert!(fs.lines().all(|l| l.chars().count() <= 96), "{fs}");
-        assert!(fs.contains("cwd        ${repo}/tools"), "{fs}");
+        assert!(fs.contains("cwd         ${repo}/tools"), "{fs}");
         // Env values as written; a secret-looking literal query value is redacted.
         assert!(
             fs.contains("API_URL=https://api.test/v1?token=<redacted>&team=core"),
@@ -1267,30 +1284,30 @@ mod tests {
         assert!(!fs.contains("abc123"), "{fs}");
         assert!(fs.contains("KEY=${env:FS_KEY}"), "{fs}");
         assert!(
-            fs.contains("env_file   .env.mcp (sets NODE_OPTIONS, AWS_PROFILE)"),
+            fs.contains("env_file    .env.mcp (sets NODE_OPTIONS, AWS_PROFILE)"),
             "{fs}"
         );
         assert!(
-            fs.contains("secret env FS_SECRET (values from the keychain)"),
+            fs.contains("secret env  FS_SECRET (values from the keychain)"),
             "{fs}"
         );
-        assert!(fs.contains("reads env  FS_KEY"), "{fs}");
-        assert!(fs.contains("keychain   mcp:repo:"), "{fs}");
+        assert!(fs.contains("reads env   FS_KEY"), "{fs}");
+        assert!(fs.contains("keychain    mcp:repo:"), "{fs}");
         assert!(fs.contains(":fs:env:FS_SECRET"), "{fs}");
 
         let web = details(&c.servers["web"]).join("\n");
         assert!(
-            web.contains("url        https://mcp.example.com/v1/mcp?key=${env:EXA_KEY}&x=1"),
+            web.contains("url         https://mcp.example.com/v1/mcp?key=${env:EXA_KEY}&x=1"),
             "{web}"
         );
-        assert!(web.contains("headers    X-Team: core"), "{web}");
+        assert!(web.contains("headers     X-Team: core"), "{web}");
         assert!(web.contains("X-Api-Key: (from the keychain)"), "{web}");
         assert!(
-            web.contains("bearer     Authorization: Bearer $WEB_TOKEN"),
+            web.contains("bearer      Authorization: Bearer $WEB_TOKEN"),
             "{web}"
         );
-        assert!(web.contains("reads env  EXA_KEY, WEB_TOKEN"), "{web}");
-        assert!(web.contains("login      its own OAuth login"), "{web}");
+        assert!(web.contains("reads env   EXA_KEY, WEB_TOKEN"), "{web}");
+        assert!(web.contains("login       its own OAuth login"), "{web}");
         // The one-liner stays for status text.
         assert_eq!(
             summary(&c.servers["web"]),
@@ -1327,5 +1344,45 @@ mod tests {
         let c = config(&dir, "", REPO);
         let u = untrusted(&c, None, false);
         assert_eq!(u["fs"].server, c.servers["fs"]);
+    }
+
+    /// #2335: `description` fit the label column exactly, so its value started a column late;
+    /// long paths wrapped mid-name.
+    #[test]
+    fn details_align_long_labels_and_wrap_paths_between_directories() {
+        let mut out = Vec::new();
+        detail_field(&mut out, "description", "The manager, from the repo");
+        detail_field(&mut out, "mode", "primary");
+        let col = |l: &str, v: &str| l.find(v).unwrap();
+        assert_eq!(
+            col(&out[0], "The manager"),
+            col(&out[1], "primary"),
+            "{out:?}"
+        );
+
+        let path = format!(
+            "/Users/someone/development/{}/play/app/.amp/harness/agents/amp-manager.md",
+            "a-rather-long-folder-name".repeat(2)
+        );
+        let mut out = Vec::new();
+        detail_field(&mut out, "file", &path);
+        assert!(out.len() > 1, "{out:?}");
+        for line in &out[..out.len() - 1] {
+            assert!(line.ends_with('/'), "wrapped mid-name: {out:?}");
+        }
+        let joined: String = out
+            .iter()
+            .map(|l| l.trim_start_matches("file").trim())
+            .collect();
+        assert_eq!(joined, path, "nothing is cut");
+        assert!(
+            out.iter().all(|l| l.chars().count() <= DETAIL_WIDTH),
+            "{out:?}"
+        );
+
+        // No `/`: broken at the width, still nothing cut.
+        let word = "x".repeat(200);
+        assert_eq!(break_word(&word, 84).concat(), word);
+        assert_eq!(break_word("/abc/def", 4), vec!["/abc", "/def"]);
     }
 }

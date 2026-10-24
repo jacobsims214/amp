@@ -23,7 +23,7 @@ every role's `provider/model`. Then one line per check:
 | `roles`, `fallback` | every role resolves to a model; what a role with no model of its own runs on |
 | `key:<provider>`, `models:<provider>` | the key is there; the endpoint answers with it and lists every model a role uses |
 | `mcp`, `mcp:<server>` | each MCP server: health, trust, how it authenticates, which roles may use it |
-| `skills`, `agents`, `config-check` | your agents and skills load; every problem `config check` finds |
+| `skills`, `agents`, `config-check` | your agents and skills load; a repo's untrusted ones are `not trusted, not used` (a warning); every problem `config check` finds |
 
 It exits 1 when a check fails (warnings don't count). It never prints a key or token. Only
 where a secret comes from.

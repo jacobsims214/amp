@@ -294,8 +294,8 @@ fn server_finding(
             format!("{what}: a repo server, {changed}, so it never starts"),
         )
         .fix(format!(
-            "if you trust what it runs, `amp-harness mcp trust {name}` (or --trust-repo-mcp for \
-             one run)"
+            "if you trust what it runs, run with `--trust-repo` to start it for one run, or \
+             `amp-harness mcp trust {name}` to trust it as it is now"
         ));
     }
     if offline {

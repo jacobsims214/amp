@@ -15,6 +15,7 @@ use amp_core::{
     config_check::{self, CheckReport, Problem, Severity},
     models::{ModelHints, ModelsConfig},
     providers::SystemKeys,
+    repo_trust::{self, Gate, ItemKind, UntrustedItem},
     roles::RoleRegistry,
 };
 use serde::Serialize;
@@ -31,9 +32,31 @@ pub struct AgentsReport {
     pub count: usize,
     /// The agents the manager may dispatch (ids).
     pub dispatchable: Vec<String>,
-    /// Agents from the user or repo layer (new ones and overrides of built-in ones).
+    /// Agents from the user or repo layer (new ones and overrides of built-in ones) in use: a repo
+    /// agent only when it is trusted.
     pub custom: Vec<AgentRow>,
     pub problems: Vec<Problem>,
+    /// Repo agents not used because they are not trusted as they are now (#2335).
+    pub untrusted: Vec<UntrustedRow>,
+}
+
+/// A repo agent or skill that is not used until it is trusted.
+#[derive(Debug, Serialize)]
+pub struct UntrustedRow {
+    pub name: String,
+    pub file: String,
+    /// It was trusted before, at another fingerprint.
+    pub changed: bool,
+}
+
+impl UntrustedRow {
+    fn from_item(u: &UntrustedItem) -> Self {
+        Self {
+            name: u.item.name.clone(),
+            file: u.item.file.display().to_string(),
+            changed: u.changed,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -54,9 +77,11 @@ pub struct AgentRow {
 #[derive(Debug, Default, Serialize)]
 pub struct SkillsReport {
     pub count: usize,
-    /// Skills from the user or repo layer.
+    /// Skills from the user or repo layer in use: a repo skill only when it is trusted.
     pub custom: Vec<SkillRow>,
     pub problems: Vec<Problem>,
+    /// Repo skills not used because they are not trusted as they are now (#2335).
+    pub untrusted: Vec<UntrustedRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +95,8 @@ pub struct SkillRow {
 pub struct Loaded {
     pub roles: Option<RoleRegistry>,
     pub assets: Option<Assets>,
+    /// The repo's agents and skills that are left out because they are not trusted.
+    pub untrusted: Vec<UntrustedItem>,
 }
 
 impl Loaded {
@@ -86,12 +113,82 @@ impl Loaded {
     }
 }
 
+/// Loads the roster as sessions do (#2335): a repo agent or skill counts only when it is trusted
+/// (or `--trust-repo`); the ones left out are listed in [`Loaded::untrusted`].
 pub fn load(ctx: &Ctx) -> Loaded {
-    let assets = Assets::load(&OverrideDirs::from_paths(&ctx.paths)).ok();
+    let env = |k: &str| std::env::var(k).ok();
+    let gate = Gate::from_env(&ctx.paths, &env);
+    let assets = Assets::load_gated(&OverrideDirs::from_paths(&ctx.paths), &gate).ok();
     let roles = assets
         .as_ref()
         .and_then(|a| RoleRegistry::from_assets(a).ok());
-    Loaded { roles, assets }
+    let untrusted = repo_trust::untrusted(&repo_trust::scan(&ctx.paths), &gate)
+        .into_iter()
+        .filter(|u| matches!(u.item.kind, ItemKind::Agent | ItemKind::Skill))
+        .collect();
+    Loaded {
+        roles,
+        assets,
+        untrusted,
+    }
+}
+
+/// `; not trusted, not used: a (repo), b (repo, changed since you trusted it)`, or nothing.
+fn untrusted_text(rows: &[UntrustedRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = rows
+        .iter()
+        .map(|r| {
+            if r.changed {
+                format!("{} (repo, changed since you trusted it)", r.name)
+            } else {
+                format!("{} (repo)", r.name)
+            }
+        })
+        .collect();
+    format!("; not trusted, not used: {}", names.join(", "))
+}
+
+/// The fix for untrusted repo items of `kind`: `--trust-repo` first (#2335), as the guide does.
+fn untrusted_fix(kind: ItemKind, rows: &[UntrustedRow]) -> Option<String> {
+    let first = rows.first()?;
+    Some(format!(
+        "review it, then run with `--trust-repo` to use what the repo brings for one run, or          `amp-harness trust {}:{}` to trust it as it is now",
+        kind.word(),
+        first.name
+    ))
+}
+
+/// `yours: a (user); the repo's: b`: the agents or skills in use that are not built in. Only the
+/// user layer is "yours"; the repo's are named as such (#2335).
+fn custom_text<'a>(rows: impl Iterator<Item = (&'a str, String)>) -> String {
+    let (mut yours, mut repo) = (Vec::new(), Vec::new());
+    for (layer, text) in rows {
+        if layer == "repo" {
+            repo.push(text);
+        } else {
+            yours.push(text);
+        }
+    }
+    let mut parts = Vec::new();
+    if !yours.is_empty() {
+        parts.push(format!("yours: {}", yours.join(", ")));
+    }
+    if !repo.is_empty() {
+        parts.push(format!("the repo's (trusted): {}", repo.join(", ")));
+    }
+    parts.join("; ")
+}
+
+/// A clean finding becomes a warning when repo items are left out for want of trust (a repo MCP
+/// server that is not trusted warns the same way); problems keep their own status and fix.
+fn with_untrusted(finding: Finding, kind: ItemKind, rows: &[UntrustedRow]) -> Finding {
+    match (&finding.status, untrusted_fix(kind, rows)) {
+        (CheckStatus::Ok, Some(fix)) => Finding::new(CheckStatus::Warn, finding.detail).fix(fix),
+        _ => finding,
+    }
 }
 
 /// `config check`'s report for this folder (the same checkers, plus `[tui]`).
@@ -176,22 +273,34 @@ pub fn check(
             }
         }
     }
-    let custom: Vec<String> = skills
-        .custom
+    skills.untrusted = loaded
+        .untrusted
         .iter()
-        .map(|s| format!("{} ({})", s.name, s.layer))
+        .filter(|u| u.item.kind == ItemKind::Skill)
+        .map(UntrustedRow::from_item)
         .collect();
-    let ok = if custom.is_empty() {
+    let custom = custom_text(
+        skills
+            .custom
+            .iter()
+            .map(|s| (s.layer, format!("{} ({})", s.name, s.layer))),
+    );
+    let mut ok = if custom.is_empty() {
         format!("{} skills, all built in", skills.count)
     } else {
-        format!("{} skills; yours: {}", skills.count, custom.join(", "))
+        format!("{} skills; {custom}", skills.count)
     };
+    ok.push_str(&untrusted_text(&skills.untrusted));
     out.push((
         "skills".to_owned(),
-        from_problems(
-            &skills.problems,
-            ok,
-            "fix the skill file it names; `amp-harness skills validate` checks again",
+        with_untrusted(
+            from_problems(
+                &skills.problems,
+                ok,
+                "fix the skill file it names; `amp-harness skills validate` checks again",
+            ),
+            ItemKind::Skill,
+            &skills.untrusted,
         ),
     ));
 
@@ -225,37 +334,47 @@ pub fn check(
         }
         agents.dispatchable = dispatchable;
     }
-    let custom: Vec<String> = agents
-        .custom
+    agents.untrusted = loaded
+        .untrusted
         .iter()
-        .map(|a| {
-            let model = match (&a.model, &a.fallback) {
-                (Some(m), Some(f)) => format!(", {m} via {f}"),
-                (Some(m), None) => format!(", {m}"),
-                _ => String::new(),
-            };
+        .filter(|u| u.item.kind == ItemKind::Agent)
+        .map(UntrustedRow::from_item)
+        .collect();
+    let custom = custom_text(agents.custom.iter().map(|a| {
+        let model = match (&a.model, &a.fallback) {
+            (Some(m), Some(f)) => format!(", {m} via {f}"),
+            (Some(m), None) => format!(", {m}"),
+            _ => String::new(),
+        };
+        (
+            a.layer,
             format!(
                 "{} ({}{model}{})",
                 a.id,
                 a.layer,
                 if a.dispatchable { ", dispatchable" } else { "" }
-            )
-        })
-        .collect();
+            ),
+        )
+    }));
     let mut ok = format!(
         "{} agents, {} the manager can dispatch",
         agents.count,
         agents.dispatchable.len()
     );
     if !custom.is_empty() {
-        ok.push_str(&format!("; yours: {}", custom.join(", ")));
+        ok.push_str(&format!("; {custom}"));
     }
+    ok.push_str(&untrusted_text(&agents.untrusted));
     out.push((
         "agents".to_owned(),
-        from_problems(
-            &agents.problems,
-            ok,
-            "fix the agent file it names; `amp-harness agents validate` checks again",
+        with_untrusted(
+            from_problems(
+                &agents.problems,
+                ok,
+                "fix the agent file it names; `amp-harness agents validate` checks again",
+            ),
+            ItemKind::Agent,
+            &agents.untrusted,
         ),
     ));
 

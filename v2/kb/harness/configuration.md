@@ -40,7 +40,8 @@ amp-harness server               # the AMP server settings and where each comes 
 ```
 
 **In the chat:** `/config` shows every setting with its source (built in, user file, repo file,
-env VAR, flag) and the paths in use. Secrets show only where they come from.
+env VAR, flag) and the paths in use. Files in the repo are shown as `<repo>/…`, and its `repo` row
+says which folder that is. Secrets show only where they come from.
 
 ## Use another configuration: `--config` and `--config-dir`
 

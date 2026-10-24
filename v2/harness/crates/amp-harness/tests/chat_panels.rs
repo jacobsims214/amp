@@ -757,6 +757,7 @@ async fn config_overview_with_sources() {
     for want in [
         "files",
         "user config ~/.config/amp-harness/config.toml",
+        "repo config <repo>/.amp/harness/config.toml",
         "AMP server",
         "url http://127.0.0.1:9/mcp (env AMP_MCP_URL)",
         "inherit wf/wf-1",

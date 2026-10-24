@@ -242,6 +242,40 @@ async fn init_asks_for_what_is_missing() {
     assert_eq!(out.json()["project"]["id"], 2);
 }
 
+/// #2335: setup in a new folder with a server already saved asked "AMP server [...]" again, and an
+/// answer meant for the next prompt was taken as a server address. A saved server is kept.
+#[tokio::test]
+async fn init_in_a_new_folder_keeps_the_saved_server() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("setup-saved-server-kept", None);
+    let answers = format!("{}\n1\n1\n", amp.url.trim_end_matches("/mcp"));
+    let mut run = Run::new(&dir, &["init", "--json"]);
+    run.stdin = Some(&answers);
+    let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.contains("AMP server ["), "{}", out.stderr);
+
+    // A second folder: the server is not asked again, so "1" picks the project (then the
+    // provider, still without a key), not a server.
+    let other = dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let mut run = Run::new(&dir, &["init", "--json"]);
+    run.stdin = Some("1\n1\n");
+    run.cwd = Some(other.clone());
+    let out = run.env("AMP_HARNESS_PROMPTS", "stdin").go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(!out.stderr.contains("AMP server ["), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains(&format!("AMP server: {} (already set up", amp.url)),
+        "{}",
+        out.stderr
+    );
+    let text = std::fs::read_to_string(other.join(".amp.json")).expect(".amp.json written");
+    let m: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(m["project_id"], 2);
+}
+
 #[tokio::test]
 async fn init_without_a_keychain_refuses_to_store_a_key_anywhere() {
     let amp = spawn(MockAmp::new(), None).await;
