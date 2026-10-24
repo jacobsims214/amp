@@ -215,6 +215,7 @@ pub const COMMANDS: &[CommandSpec] = &[
 pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "send"),
     ("Shift+Enter", "new line"),
+    ("↑/↓", "earlier prompts (empty or one-line editor)"),
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
     ("Esc", "stop the reply, or close a panel or the menu"),
     ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
