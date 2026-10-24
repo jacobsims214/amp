@@ -863,6 +863,23 @@ fn print_human(r: &Report) {
         {
             println!("         {:<width$} cause: {error}", "");
         }
+        // #2333: likewise the provider's raw catalog error behind a `models:<id>` sentence.
+        if let Some(id) = c.name.strip_prefix("models:")
+            && matches!(c.status, CheckStatus::Warn | CheckStatus::Fail)
+            && crate::conn::verbose()
+            && let Some(error) = r
+                .models
+                .providers
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.catalog_error.as_deref())
+        {
+            println!(
+                "         {:<width$} cause: {}",
+                "",
+                amp_mcp::redact_urls(error)
+            );
+        }
         if let Some(fix) = &c.fix
             && matches!(c.status, CheckStatus::Warn | CheckStatus::Fail)
         {
