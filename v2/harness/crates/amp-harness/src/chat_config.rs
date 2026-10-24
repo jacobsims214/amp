@@ -1083,7 +1083,8 @@ impl Inner {
                 Cell::flex(short(&value), Tone::Text),
             ];
             if !source.is_empty() {
-                cells.push(Cell::new(format!("({})", short(&source)), Tone::Muted));
+                // A note: on its own line when narrow, so the value isn't cut for it (#2351).
+                cells.push(Cell::note(format!("({})", short(&source)), Tone::Muted));
             }
             rows.push(InfoRow::new(cells).indent(2));
         };
