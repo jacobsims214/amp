@@ -1457,6 +1457,24 @@ pub(crate) fn missing_keys(cfg: &ModelsConfig, keys: &dyn KeyLookup) -> Vec<Stri
         .collect()
 }
 
+/// The environment variables that would supply the `missing` providers' keys, for a hint:
+/// `EXAMPLE_API_KEY`, or `A_API_KEY or B_API_KEY`; the shipped providers' when none has one.
+fn key_env_hint(cfg: &ModelsConfig, missing: &[String]) -> String {
+    let mut vars: Vec<&str> = Vec::new();
+    for id in missing {
+        if let Some(var) = cfg.providers.get(id).and_then(|p| p.key_env.as_deref())
+            && !vars.contains(&var)
+        {
+            vars.push(var);
+        }
+    }
+    if vars.is_empty() {
+        "for example OPENROUTER_API_KEY or ANTHROPIC_API_KEY".to_owned()
+    } else {
+        vars.join(" or ")
+    }
+}
+
 pub(crate) fn provider_name(id: &str) -> String {
     match id {
         "openrouter" => "OpenRouter".to_owned(),
@@ -1899,9 +1917,12 @@ async fn models_step(
         && ui.interactive()
         && let Err(why) = &keychain
     {
+        // #2336: name the variables of the providers that still need a key (a preset's
+        // `example` reads EXAMPLE_API_KEY), not the shipped profiles' ones.
+        let vars = key_env_hint(&cfg, &missing);
         let mut text = format!(
             "Keys are kept only in the OS keychain, and {}: set the key in your environment instead \
-             (for example OPENROUTER_API_KEY or ANTHROPIC_API_KEY).",
+             ({vars}).",
             if credential_store_is_file() {
                 why.as_str()
             } else {
@@ -2081,6 +2102,33 @@ mod tests {
         let off = first_run_key_message(&[or], Some(off), true);
         assert!(off.contains("AMP_CREDENTIAL_STORE=file"), "{off}");
         assert!(!off.contains("cause:"), "{off}");
+    }
+
+    /// #2336: the no-keychain hint names the missing providers' own variables (a preset writes
+    /// `key_env = "<ID>_API_KEY"` for its provider).
+    #[test]
+    fn the_key_env_hint_names_the_missing_providers_variables() {
+        let preset = amp_core::models::ModelsFile::parse(
+            "[providers.example]\napi = \"openai-completions\"\nbase_url = \"https://api.example.com/v1\"\nkey_env = \"EXAMPLE_API_KEY\"\n[providers.example.models.m]\n",
+            "preset",
+        )
+        .unwrap();
+        let cfg = ModelsConfig::from_files(
+            amp_core::models::ModelsFile::defaults(),
+            Some(preset),
+            "preset test",
+            &|_| None,
+        )
+        .unwrap();
+        assert_eq!(key_env_hint(&cfg, &["example".into()]), "EXAMPLE_API_KEY");
+        assert_eq!(
+            key_env_hint(&cfg, &["example".into(), "anthropic".into()]),
+            "EXAMPLE_API_KEY or ANTHROPIC_API_KEY"
+        );
+        assert_eq!(
+            key_env_hint(&cfg, &[]),
+            "for example OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
+        );
     }
 
     #[test]
