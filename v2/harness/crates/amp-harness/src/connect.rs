@@ -1284,7 +1284,7 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         return Ok(());
     }
     // --key-stdin is the scripted path: no questions at all.
-    let mut ui = ui::detect(!args.key_stdin && !args.json);
+    let mut ui = ui::detect_for(!args.key_stdin && !args.json, "connect");
     let ui = ui.as_mut();
 
     // #2275: --role words are checked before anything is asked or stored.
@@ -1924,11 +1924,23 @@ fn custom_target(
         spec.headers.insert(k.to_owned(), v.to_owned());
     }
     if interactive && args.headers.is_empty() && existing.is_none() {
+        // #2340: secret header values live only in the OS keychain; without one, a secret value
+        // typed here could not be kept.
+        let keychain_off = setup::keychain_for_keys().err();
         loop {
             let name = ui.ask("Extra header name (Enter for none)", Some(""))?;
             let name = name.trim().trim_end_matches(':').to_owned();
             if name.is_empty() {
                 break;
+            }
+            if let Some(why) = keychain_off.as_deref()
+                && secret_name(&name)
+            {
+                ui.say(&format!(
+                    "  {name} looks like a secret, and {why}: it could not be kept, so it was \
+                     left out."
+                ));
+                continue;
             }
             if secret_name(&name) {
                 let v = ui.secret(&format!("{name} value (kept in the OS keychain)"))?;
@@ -1938,6 +1950,15 @@ fn custom_target(
                 continue;
             }
             let v = ui.ask(&format!("{name} value"), None)?;
+            if let Some(why) = keychain_off.as_deref()
+                && secret_value(&v)
+            {
+                ui.say(&format!(
+                    "  That looks like a secret, and {why}: {name} could not be kept, so it was \
+                     left out."
+                ));
+                continue;
+            }
             if secret_value(&v) {
                 ui.say(&format!(
                     "  That looks like a secret: {name} goes to the OS keychain, not config.toml."
@@ -1963,10 +1984,10 @@ async fn read_and_check_key(
     extra: &BTreeMap<String, String>,
     client_key: Option<&str>,
 ) -> Result<(String, KeyCheck, bool), CliError> {
-    // #2275: no terminal and no --key-stdin, but the key is in the provider's variable (the
-    // headless path): check it and keep it there; nothing is stored.
+    // #2275: no --key-stdin, but the key is in the provider's variable (the headless path): check
+    // it and keep it there; nothing is stored. #2340: in a terminal too, rather than asking for a
+    // key the variable would override anyway.
     if !args.key_stdin
-        && !ui.interactive()
         && let Some(var) = provider.key_env.as_deref()
         && let Some(key) = std::env::var(var)
             .ok()
@@ -1984,6 +2005,33 @@ async fn read_and_check_key(
             )));
         }
         return Ok((key, check, true));
+    }
+    // #2340: no keychain (AMP_CREDENTIAL_STORE=file): a key typed here could not be kept, so it
+    // is not asked for. An endpoint that answers without one is added keyless; otherwise the way
+    // out is the provider's variable.
+    if !args.key_stdin
+        && ui.interactive()
+        && let Err(why) = setup::keychain_for_keys()
+    {
+        let var = provider
+            .key_env
+            .as_deref()
+            .unwrap_or("the provider's key_env variable");
+        if custom_without_key_ok {
+            let check = setup::check_key_full(provider, "", extra, client_key).await;
+            refuse_untrusted(&check)?;
+            if check == KeyCheck::Ok {
+                ui.say(&format!(
+                    "{name} answers without a key, so none is asked for ({why}; a key would go \
+                     in {var})."
+                ));
+                return Ok((String::new(), check, false));
+            }
+        }
+        return Err(CliError::usage(format!(
+            "{why}, so a key typed here for {name} could not be kept: set {var} in your \
+             environment and run this again (it stays there; nothing is stored)"
+        )));
     }
     for attempt in 0..3 {
         let key = if args.key_stdin {

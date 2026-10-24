@@ -187,21 +187,67 @@ fn ask_headers(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), CliError> {
     }
 }
 
+/// Where the endpoint's key comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyAnswer {
+    /// Typed (hidden) and checked; empty = the endpoint takes none.
+    Typed(String),
+    /// From `<ID>_API_KEY`.
+    Env(String),
+    /// Not asked: no keychain to keep it in, and the variable is not set yet (#2340). The
+    /// endpoint still needs one; the person sets the variable.
+    Later,
+}
+
 /// The key: from `<ID>_API_KEY` when set, else asked hidden and checked against the endpoint's
-/// model list (3 tries on a 401/403). Empty = the endpoint takes none.
+/// model list (3 tries on a 401/403). Without a keychain (`no_keychain` = why) a key typed here
+/// could not be kept, so it is not asked for (#2340): the endpoint is tried without one, and the
+/// person is told which variable to set.
 async fn ask_key(
     ui: &mut dyn Ui,
     provider: &ProviderConfig,
     name: &str,
     keyless_ok: bool,
     extra: &BTreeMap<String, String>,
-) -> Result<(String, bool), CliError> {
+    no_keychain: Option<&String>,
+) -> Result<KeyAnswer, CliError> {
     if let Some(var) = &provider.key_env
         && let Some(key) = std::env::var(var).ok().filter(|v| !v.trim().is_empty())
     {
         ui.say(&format!("Using the {name} key in {var}."));
-        return Ok((key.trim().to_owned(), true));
+        return Ok(KeyAnswer::Env(key.trim().to_owned()));
     }
+    if let Some(why) = no_keychain {
+        if keyless_ok {
+            match super::check_key(provider, "", extra).await {
+                KeyCheck::Ok => {
+                    ui.say(&format!("  {name} answered without a key."));
+                    return Ok(KeyAnswer::Typed(String::new()));
+                }
+                KeyCheck::Untrusted(message) => ui.say(&format!("  {message}")),
+                KeyCheck::Rejected(_) | KeyCheck::Unknown(_) => {}
+            }
+        }
+        let var = provider
+            .key_env
+            .as_deref()
+            .unwrap_or("its key_env variable");
+        super::say_no_keychain(ui, why, var);
+        return Ok(KeyAnswer::Later);
+    }
+    ask_typed_key(ui, provider, name, keyless_ok, extra)
+        .await
+        .map(KeyAnswer::Typed)
+}
+
+/// [`ask_key`]'s hidden prompt (3 tries). Empty = the endpoint takes none.
+async fn ask_typed_key(
+    ui: &mut dyn Ui,
+    provider: &ProviderConfig,
+    name: &str,
+    keyless_ok: bool,
+    extra: &BTreeMap<String, String>,
+) -> Result<String, CliError> {
     for _ in 0..3 {
         let suffix = if keyless_ok {
             ", Enter if it needs none"
@@ -231,27 +277,27 @@ async fn ask_key(
                     ));
                     let again = ui.secret(&connect::key_prompt(&provider.id, name))?;
                     if again.is_empty() {
-                        return Ok((String::new(), false));
+                        return Ok(String::new());
                     }
                     let check = super::check_key(provider, &again, extra).await;
                     ui.say(&format!("  {}", connect::check_note(name, &check)));
                     if let KeyCheck::Rejected(_) = check {
                         continue;
                     }
-                    return Ok((again, false));
+                    return Ok(again);
                 }
                 KeyCheck::Unknown(why) => ui.say(&format!(
                     "  Could not reach {name} ({why}); going on without a key."
                 )),
                 KeyCheck::Untrusted(message) => ui.say(&format!("  {message}")),
             }
-            return Ok((String::new(), false));
+            return Ok(String::new());
         }
         ui.say(&format!("  {}", connect::check_note(name, &check)));
         if let KeyCheck::Rejected(_) = check {
             continue;
         }
-        return Ok((key, false));
+        return Ok(key);
     }
     Err(CliError::new(format!(
         "no {name} key was accepted; nothing was stored"
@@ -648,7 +694,12 @@ fn ask_nonempty(ui: &mut dyn Ui, prompt: &str) -> Result<String, CliError> {
 
 /// The whole "own endpoint" conversation (or OpenAI's, with `openai = true`). Nothing is stored
 /// yet: the caller writes the provider, the roles and the key ([`store`]).
-pub async fn ask(ui: &mut dyn Ui, cfg: &ModelsConfig, openai: bool) -> Result<Endpoint, CliError> {
+pub async fn ask(
+    ui: &mut dyn Ui,
+    cfg: &ModelsConfig,
+    openai: bool,
+    no_keychain: Option<&String>,
+) -> Result<Endpoint, CliError> {
     let mut spec = if openai {
         connect::openai_preset()
     } else {
@@ -705,16 +756,23 @@ pub async fn ask(ui: &mut dyn Ui, cfg: &ModelsConfig, openai: bool) -> Result<En
     let provider = spec.config().map_err(CliError::new)?;
     let name = super::display_name(&provider);
     let extra = spec.secret_headers.clone();
-    let (key, key_from_env) = if provider.needs_key || provider.auth == ProviderAuth::Bearer {
+    let answer = if provider.needs_key || provider.auth == ProviderAuth::Bearer {
         let keyless = !openai && provider.auth == ProviderAuth::Bearer;
-        ask_key(ui, &provider, &name, keyless, &extra).await?
+        ask_key(ui, &provider, &name, keyless, &extra, no_keychain).await?
     } else {
         // none / a token command / Entra through az: nothing to ask; say whether it answers.
         let check = super::check_key(&provider, "", &extra).await;
         ui.say(&format!("  {}", connect::check_note(&name, &check)));
-        (String::new(), false)
+        KeyAnswer::Typed(String::new())
     };
-    if key.is_empty() && provider.auth == ProviderAuth::Bearer {
+    // Later: the endpoint needs a key the person has yet to set; it stays `needs_key`.
+    let later = answer == KeyAnswer::Later;
+    let (key, key_from_env) = match answer {
+        KeyAnswer::Typed(k) => (k, false),
+        KeyAnswer::Env(k) => (k, true),
+        KeyAnswer::Later => (String::new(), false),
+    };
+    if key.is_empty() && provider.auth == ProviderAuth::Bearer && !later {
         spec.needs_key = false;
     }
     let provider = spec.config().map_err(CliError::new)?;

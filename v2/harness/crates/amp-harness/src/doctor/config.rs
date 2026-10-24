@@ -155,7 +155,7 @@ fn untrusted_text(rows: &[UntrustedRow]) -> String {
 fn untrusted_fix(kind: ItemKind, rows: &[UntrustedRow]) -> Option<String> {
     let first = rows.first()?;
     Some(format!(
-        "review it, then run with `--trust-repo` to use what the repo brings for one run, or          `amp-harness trust {}:{}` to trust it as it is now",
+        "review it, then run with `--trust-repo` to use what the repo brings for one run, or `amp-harness trust {}:{}` to trust it as it is now",
         kind.word(),
         first.name
     ))
@@ -405,4 +405,27 @@ pub fn check(
         ),
     ));
     (agents, skills, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2340: the fix text was one string literal with a run of spaces mid-sentence.
+    #[test]
+    fn the_untrusted_fix_has_no_space_run() {
+        let rows = [UntrustedRow {
+            name: "repo-lint".to_owned(),
+            file: ".amp/harness/skills/repo-lint/SKILL.md".to_owned(),
+            changed: false,
+        }];
+        let fix = untrusted_fix(ItemKind::Skill, &rows).unwrap();
+        assert_eq!(
+            fix,
+            "review it, then run with `--trust-repo` to use what the repo brings for one run, or \
+             `amp-harness trust skill:repo-lint` to trust it as it is now"
+        );
+        assert!(!fix.contains("  "), "{fix}");
+        assert!(untrusted_fix(ItemKind::Agent, &[]).is_none());
+    }
 }

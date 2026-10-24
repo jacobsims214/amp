@@ -1489,6 +1489,23 @@ pub(crate) fn display_name(p: &ProviderConfig) -> String {
     p.name.clone().unwrap_or_else(|| provider_name(&p.id))
 }
 
+/// Why no key is asked for: `why` the keychain can't keep one, and the variable(s) to set.
+pub(crate) fn say_no_keychain(ui: &mut dyn Ui, why: &str, vars: &str) {
+    let mut text = format!(
+        "Keys are kept only in the OS keychain, and {}: set the key in your environment instead \
+         ({vars}).",
+        if credential_store_is_file() {
+            why
+        } else {
+            "there is no usable OS keychain here"
+        }
+    );
+    if crate::conn::verbose() && !credential_store_is_file() {
+        text.push_str(&format!("\n  cause: {why}"));
+    }
+    ui.say(&text);
+}
+
 /// `AMP_CREDENTIAL_STORE=file`: the person turned the OS keychain off.
 pub(crate) fn credential_store_is_file() -> bool {
     std::env::var(amp_mcp::ENV_CREDENTIAL_STORE)
@@ -1912,33 +1929,30 @@ async fn models_step(
     // environment); interactive init says why it asks for no key. The platform error only with
     // --verbose.
     let keychain = keychain_for_keys();
+    // Interactive init says why it asks for no key, naming the variable of the provider that
+    // needs one: the profile's when it was chosen on purpose, else the one picked from the menu
+    // (#2340: it named OPENROUTER_API_KEY before the person picked their own endpoint).
+    let keychain_note = plan.mode == Mode::Init && ui.interactive();
     if !missing.is_empty()
-        && plan.mode == Mode::Init
-        && ui.interactive()
+        && keychain_note
+        && explicit
         && let Err(why) = &keychain
     {
         // #2336: name the variables of the providers that still need a key (a preset's
         // `example` reads EXAMPLE_API_KEY), not the shipped profiles' ones.
-        let vars = key_env_hint(&cfg, &missing);
-        let mut text = format!(
-            "Keys are kept only in the OS keychain, and {}: set the key in your environment instead \
-             ({vars}).",
-            if credential_store_is_file() {
-                why.as_str()
-            } else {
-                "there is no usable OS keychain here"
-            }
-        );
-        if crate::conn::verbose() && !credential_store_is_file() {
-            text.push_str(&format!("\n  cause: {why}"));
-        }
-        ui.say(&text);
+        say_no_keychain(ui, why, &key_env_hint(&cfg, &missing));
     }
     if !missing.is_empty() && ui.interactive() && !explicit {
         // #2275: which provider? The shipped profiles, OpenAI, or the person's own endpoint.
         match choose_provider(ui, config, &cfg, keychain.is_ok())? {
             Choice::Profile(name) => {
                 let c = load_models(config, Some(&name))?;
+                if keychain_note && let Err(why) = &keychain {
+                    let need = missing_keys(&c, &keys);
+                    if !need.is_empty() {
+                        say_no_keychain(ui, why, &key_env_hint(&c, &need));
+                    }
+                }
                 if keychain.is_ok() {
                     for id in missing_keys(&c, &keys) {
                         if let Some(p) = c.providers.get(&id)
@@ -1959,7 +1973,7 @@ async fn models_step(
             }
             other => {
                 let openai = matches!(other, Choice::OpenAi);
-                let e = endpoint::ask(ui, &cfg, openai).await?;
+                let e = endpoint::ask(ui, &cfg, openai, keychain.as_ref().err()).await?;
                 if let Some(why) = endpoint::store(ui, config, &e)?
                     && !e.key.is_empty()
                     && !e.key_from_env

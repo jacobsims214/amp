@@ -154,7 +154,12 @@ impl Pty {
     }
 
     /// Ctrl+C at the prompt `prompt`: setup cancelled, exit 130, terminal back in cooked mode.
-    fn ctrl_c_cancels(mut self, prompt: &str) -> String {
+    fn ctrl_c_cancels(self, prompt: &str) -> String {
+        self.ctrl_c_cancels_command(prompt, "setup")
+    }
+
+    /// [`Pty::ctrl_c_cancels`] for `command` ("connect cancelled", #2340).
+    fn ctrl_c_cancels_command(mut self, prompt: &str, command: &str) -> String {
         self.expect(prompt);
         // A partial answer is dropped too.
         self.send(b"abc");
@@ -165,11 +170,13 @@ impl Pty {
         std::thread::sleep(Duration::from_millis(100));
         let text = self.text();
         assert_eq!(code, 130, "{text}");
-        assert!(text.contains("amp-harness: setup cancelled"), "{text}");
+        let said = format!("{command} cancelled");
+        assert!(text.contains(&format!("amp-harness: {said}")), "{text}");
+        assert_eq!(text.matches(&said).count(), 1, "one line: {text}");
         assert_eq!(
-            text.matches("setup cancelled").count(),
+            text.matches(" cancelled").count(),
             1,
-            "one line: {text}"
+            "only `{said}`: {text}"
         );
         let mode = match &self.slave_path {
             Some(path) => tcgetattr(File::open(path).expect("reopen the pty")),
@@ -226,11 +233,33 @@ fn ctrl_c_at_the_project_picker_cancels() {
     nothing_written(&dir);
 }
 
+/// #2340: Ctrl+C in `connect`'s prompts said "setup cancelled". (Its hidden key prompt needs a
+/// keychain since #2340, so the picker is the prompt here; the real-keychain cases are in
+/// tests/keychain.rs.)
 #[test]
-fn ctrl_c_at_the_hidden_key_prompt_cancels_and_restores_echo() {
-    let dir = workdir("ctrl-c-key", None);
-    let pty = Pty::start(&dir, &["connect", "openrouter"], &[]);
-    let text = pty.ctrl_c_cancels("OpenRouter API key (openrouter.ai/keys) (hidden): ");
-    assert!(!text.contains("abc"), "the hidden prompt echoed: {text}");
+fn ctrl_c_in_connect_says_connect_cancelled() {
+    let dir = workdir("ctrl-c-connect", None);
+    let pty = Pty::start(&dir, &["connect"], &[]);
+    let text = pty.ctrl_c_cancels_command("Provider [", "connect");
+    assert!(text.contains("abc"), "a visible prompt echoes: {text}");
+    assert!(!text.contains("setup"), "{text}");
+    nothing_written(&dir);
+}
+
+/// #2340: in a terminal with the keychain off, `connect` asks for no key it could not keep: it
+/// names the variable to set instead, before any hidden prompt.
+#[test]
+fn connect_in_a_terminal_without_a_keychain_asks_for_no_key() {
+    let dir = workdir("pty-connect-no-keychain", None);
+    let mut pty = Pty::start(&dir, &["connect", "openrouter"], &[]);
+    let code = pty.exit_code();
+    std::thread::sleep(Duration::from_millis(100));
+    let text = pty.text();
+    assert_eq!(code, 2, "{text}");
+    assert!(!text.contains("(hidden)"), "{text}");
+    assert!(
+        text.contains("set OPENROUTER_API_KEY in your environment"),
+        "{text}"
+    );
     nothing_written(&dir);
 }
