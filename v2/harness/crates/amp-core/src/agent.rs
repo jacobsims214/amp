@@ -1328,6 +1328,9 @@ impl Reloaded {
         for p in &self.mcp.problems {
             out.push(format!("mcp problem: {p}"));
         }
+        for w in &self.mcp.shadowed {
+            out.push(format!("mcp warning: {w}"));
+        }
         for u in &self.untrusted {
             out.push(
                 u.reason()

@@ -285,6 +285,10 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     for line in crate::trust_cmd::warnings(&session.rt.repo_untrusted()) {
         shell.view().add_warning(&line);
     }
+    // #2331: a repo MCP server ignored because one of the person's own has its name says so.
+    for line in session.rt.mcp_hub.config().shadow_warnings() {
+        shell.view().add_warning(&line);
+    }
     // #2241: repo MCP servers left untrusted say so (and how to trust them) in the transcript.
     for u in session.rt.mcp_hub.untrusted() {
         shell.view().add_warning(&format!(

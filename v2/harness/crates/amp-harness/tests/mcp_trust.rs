@@ -570,3 +570,133 @@ async fn a_reload_takes_trust_given_elsewhere() {
     assert_eq!(names, vec!["new"]);
     hub.shutdown().await;
 }
+
+/// #2331: a repo `[mcp.fs]` with the name of one of the person's own servers never starts, and
+/// every place that lists repo servers says so once, naming both files and the fix: the chat's
+/// start, a reload, `mcp list`, `mcp trust`, `trust` and doctor.
+#[tokio::test]
+async fn a_repo_server_shadowed_by_yours_is_named_everywhere() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let eager = "startup = \"eager\"";
+    let repo = Repo::new("shadow", "", "");
+    let user_file = repo.dir.join("home/.config/amp-harness/config.toml");
+    std::fs::write(
+        &user_file,
+        format!(
+            "{FAUX}\n{}",
+            marker_table("fs", &repo.marker("user-fs"), eager)
+        ),
+    )
+    .unwrap();
+    repo.write_repo(&marker_table("fs", &repo.marker("repo-fs"), eager));
+    let repo_file = repo.dir.join("project/.amp/harness/config.toml");
+    let named = |text: &str| {
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        flat.contains("repo MCP server `fs`")
+            && flat.contains("your own `fs`")
+            && flat.contains("Fix: rename it in the repo's file (e.g. [mcp.fs-repo])")
+    };
+
+    // The chat's start: one warning in the transcript; no trust question for it; theirs runs.
+    let out = repo.chat(&amp.url, "").await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let screen = out.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(named(&screen), "{}", out.stdout);
+    assert_eq!(
+        screen.matches("repo MCP server `fs`").count(),
+        1,
+        "{}",
+        out.stdout
+    );
+    assert!(!out.stderr.contains("Trust `fs`?"), "{}", out.stderr);
+    assert!(repo.ran("user-fs"));
+    assert!(!repo.ran("repo-fs"), "the repo's fs never starts");
+
+    // `mcp list` (text: stdout; --json: stderr, the JSON unchanged).
+    let out = repo
+        .run(&amp.url, &["mcp", "list", "--no-health"], &[])
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(named(&out.stdout), "{}", out.stdout);
+    let out = repo.run(&amp.url, &["mcp", "list", "--json"], &[]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let rows: Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+    assert_eq!(rows[0]["layer"], "user");
+    assert!(named(&out.stderr), "{}", out.stderr);
+
+    // `mcp trust` and `trust` list it; `mcp trust fs` says why it is not the repo's.
+    for args in [&["mcp", "trust"][..], &["trust"][..]] {
+        let out = repo.run(&amp.url, args, &[]).await;
+        assert_eq!(out.code, 0, "{args:?} stderr: {}", out.stderr);
+        assert!(named(&out.stdout), "{args:?}: {}", out.stdout);
+        assert!(
+            out.stdout.contains(&repo_file.display().to_string()),
+            "{}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains(&user_file.display().to_string()),
+            "{}",
+            out.stdout
+        );
+    }
+    let out = repo.run(&amp.url, &["mcp", "trust", "fs"], &[]).await;
+    assert_eq!(out.code, 2, "stderr: {}", out.stderr);
+    assert!(named(&out.stderr), "{}", out.stderr);
+    assert!(!repo.trust_file().exists());
+
+    // doctor: a warning check of its own, and `.mcp.shadowed` in --json.
+    let out = repo
+        .run(&amp.url, &["doctor", "--json", "--offline"], &[])
+        .await;
+    let v: Value = serde_json::from_str(&out.stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}): {}\n{}", out.stdout, out.stderr));
+    let check = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "mcp:fs:repo")
+        .unwrap_or_else(|| panic!("no mcp:fs:repo check: {v}"));
+    assert_eq!(check["status"], "warn", "{check}");
+    assert!(named(check["detail"].as_str().unwrap()), "{check}");
+    assert!(
+        check["fix"]
+            .as_str()
+            .unwrap()
+            .contains("rename [mcp.fs] in"),
+        "{check}"
+    );
+    assert_eq!(v["mcp"]["shadowed"][0]["name"], "fs", "{v}");
+    assert_eq!(
+        v["mcp"]["shadowed"][0]["repo_file"],
+        repo_file.display().to_string()
+    );
+    let out = repo.run(&amp.url, &["doctor", "--offline"], &[]).await;
+    assert!(named(&out.stdout), "{}\n{}", out.stdout, out.stderr);
+
+    // A reload names it too, and still never starts the repo's.
+    let paths = ConfigPaths {
+        user_file: Some(user_file.clone()),
+        user_dir: Some(repo.dir.join("home/.config/amp-harness")),
+        repo_dir: Some(repo.dir.join("project/.amp/harness")),
+        ..ConfigPaths::default()
+    };
+    let mut opts = HubOptions::new(
+        paths.clone(),
+        repo.state().join("amp-harness"),
+        repo.dir.join("project"),
+    );
+    opts.keychain = None;
+    opts.trust_all = true;
+    repo.clear_markers();
+    let hub = McpHub::new(McpConfig::load(&paths), opts);
+    hub.start();
+    let report = hub.reload(McpConfig::load(&paths)).await;
+    assert_eq!(report.shadowed.len(), 1, "{report:?}");
+    assert!(named(&report.shadowed[0]), "{report:?}");
+    assert!(!report.is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!repo.ran("repo-fs"), "even with every repo server trusted");
+    hub.shutdown().await;
+}

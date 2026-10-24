@@ -666,6 +666,7 @@ fn hub_for(ctx: &Ctx, servers: Vec<McpServer>) -> Result<McpHub, CliError> {
         servers: servers.into_iter().map(|s| (s.name.clone(), s)).collect(),
         problems: Vec::new(),
         broken: BTreeSet::new(),
+        shadowed: Vec::new(),
     };
     let cwd = repo_root(ctx).unwrap_or_else(|| ctx.cwd.clone());
     let opts = HubOptions::new(ctx.paths.clone(), state()?, cwd);
@@ -2006,6 +2007,19 @@ struct ListRow {
     problems: Vec<String>,
 }
 
+/// #2331: a warning line for each repo MCP server ignored because one of the person's own has
+/// its name, wherever repo servers are listed. On stdout as part of a text listing (`to_stdout`),
+/// on stderr otherwise, so `--json` output keeps its shape.
+pub(crate) fn print_shadowed(config: &McpConfig, to_stdout: bool) {
+    for w in config.shadow_warnings() {
+        if to_stdout {
+            println!("warning: {w}");
+        } else {
+            eprintln!("amp-harness: warning: {w}");
+        }
+    }
+}
+
 pub async fn list(args: ListArgs) -> Result<(), CliError> {
     let ctx = ctx()?;
     let config = McpConfig::load(&ctx.paths);
@@ -2085,6 +2099,7 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
         });
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
+    print_shadowed(&config, !args.json);
     if args.json {
         return print_json(&rows);
     }
