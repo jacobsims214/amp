@@ -17,7 +17,15 @@
 //!    model • thinking; one row below [`crate::footer::FOLD_BELOW`] columns, two above.
 //!
 //! Every area sits [`crate::inset::Padding`] columns in from the left and right edges
-//! (`[tui] padding`, #2251); the transcript's inset is inside its scroll view.
+//! (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344); the transcript's inset is
+//! inside its scroll view. A blank row sits above the header and below the footer
+//! ([`crate::inset::Gap`], #2344; none on terminals under 24 rows): call
+//! [`ChatView::set_height`] with the terminal's height before a frame.
+//!
+//! The editor carries rpi-tui's cursor marker while the input has focus
+//! ([`ChatView::set_input_focus`], #2344), which the terminal turns into its real cursor (a
+//! blinking bar, [`crate::terminal`]); while a panel or prompt has the keys there is no marker
+//! and the cursor is hidden. [`ChatView::editor_hit`] maps a click to a place in the text.
 //!
 //! Nothing here touches a terminal: [`ChatView::render_frame`] lays the screen out at any size,
 //! which is what the render tests (and `amp-harness --snapshot`) use. The header and status line
@@ -32,7 +40,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -42,7 +53,7 @@ use amp_core::provider_error;
 use crate::amp_render;
 use crate::chrome::{Chrome, clean, shorten};
 use crate::footer::Footer;
-use crate::inset::{Inset, Padding};
+use crate::inset::{Gap, Inset, Padding};
 use crate::overlay::Panel;
 use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
@@ -137,6 +148,12 @@ pub struct ChatView {
     hint: Arc<Mutex<Option<String>>>,
     /// The left and right padding every area shares (#2251).
     padding: Padding,
+    /// The editor's inset (what the layout places), to find it in a frame for clicks (#2344).
+    editor_box: Arc<dyn Component>,
+    /// Whether the input has the keys: the editor then shows the terminal cursor (#2344).
+    input_focus: Arc<AtomicBool>,
+    /// The blank rows above and below the screen (#2344).
+    gap: Gap,
 }
 
 impl Default for ChatView {
@@ -175,17 +192,22 @@ impl ChatView {
         let menu_slot = Arc::new(Container::new());
         menu_slot.add_child(Arc::new(menu.clone()));
         let hint = Arc::new(Mutex::new(None));
+        let input_focus = Arc::new(AtomicBool::new(true));
         let editor_slot = Arc::new(Container::new());
         let editor_view: Arc<dyn Component> = Arc::new(EditorView {
             editor: editor.clone(),
             hint: Arc::clone(&hint),
+            focus: Arc::clone(&input_focus),
         });
         editor_slot.add_child(editor_view.clone());
         let amp_status = Arc::new(Container::new());
         amp_status.add_child(chrome.status_line());
         let footer = Arc::new(Footer::new());
+        let editor_box = inset(editor_slot.clone());
+        let gap = Gap::default();
 
         let root = VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(Arc::new(gap.clone())).shrink(0)),
             StackChild::Entry(StackEntry::new(inset(header.clone())).shrink(0)),
             StackChild::Entry(StackEntry::new(inset(session_slot.clone())).shrink(0)),
             StackChild::Entry(
@@ -198,13 +220,10 @@ impl ChatView {
             StackChild::Entry(StackEntry::new(inset(status.clone()))),
             StackChild::Entry(StackEntry::new(inset(panel_slot)).shrink(1)),
             StackChild::Entry(StackEntry::new(inset(menu_slot)).shrink(1)),
-            StackChild::Entry(
-                StackEntry::new(inset(editor_slot.clone()))
-                    .shrink(0)
-                    .min_size(3),
-            ),
+            StackChild::Entry(StackEntry::new(editor_box.clone()).shrink(0).min_size(3)),
             StackChild::Entry(StackEntry::new(inset(amp_status.clone())).shrink(0)),
             StackChild::Entry(StackEntry::new(inset(footer.clone()))),
+            StackChild::Entry(StackEntry::new(Arc::new(gap.clone())).shrink(0)),
         ]);
         Self {
             header,
@@ -234,7 +253,85 @@ impl ChatView {
             error_shown: false,
             hint,
             padding,
+            editor_box,
+            input_focus,
+            gap,
         }
+    }
+
+    /// The terminal's height, before a frame is laid out (#2344): picks the blank rows above
+    /// and below the screen. [`Self::render_frame`] calls it itself.
+    pub fn set_height(&self, height: usize) {
+        let rows = self.gap.rows();
+        self.gap.set_height(height);
+        if rows != self.gap.rows() {
+            self.root.invalidate();
+        }
+    }
+
+    /// The blank rows above and below the screen now.
+    pub fn vertical_padding(&self) -> usize {
+        self.gap.rows()
+    }
+
+    /// The screen laid out at `width` x `height`.
+    fn layout(&self, width: usize, height: usize) -> rpi_tui::LayoutFrame {
+        self.set_height(height);
+        rpi_tui::render_layout_frame(self.root(), width, height)
+    }
+
+    /// Whether the input has the keys (#2344). While it does, the editor marks its insertion
+    /// point and the terminal shows its cursor there; while a panel or prompt has them, the
+    /// cursor is hidden.
+    pub fn set_input_focus(&self, focused: bool) {
+        self.input_focus.store(focused, Ordering::Relaxed);
+    }
+
+    pub fn input_focused(&self) -> bool {
+        self.input_focus.load(Ordering::Relaxed)
+    }
+
+    /// Where the insertion point is on a `width` x `height` screen: `(row, column)`, 0-based, or
+    /// `None` while the input doesn't have focus (no cursor shows). What the terminal's cursor
+    /// is moved to.
+    pub fn cursor_position(&self, width: usize, height: usize) -> Option<(usize, usize)> {
+        let frame = self.layout(width, height);
+        frame.lines.iter().enumerate().find_map(|(row, line)| {
+            line.find(CURSOR_MARKER)
+                .map(|at| (row, rpi_tui::visible_width(&line[..at])))
+        })
+    }
+
+    /// A click at `(row, column)` (0-based) on a `width` x `height` screen (#2344): inside the
+    /// editor box, the text position it lands on, as `(line, byte offset)` for
+    /// [`Editor::set_cursor`]. A click on the box's borders goes to the nearest text row, one
+    /// past a row's end to its end. `None` outside the box, or while a worker's session is shown
+    /// in the editor's place.
+    pub fn editor_hit(
+        &self,
+        width: usize,
+        height: usize,
+        row: usize,
+        column: usize,
+    ) -> Option<(usize, usize)> {
+        if self.session_shown() {
+            return None;
+        }
+        let frame = self.layout(width, height);
+        let rect = find_box(&frame.root, &self.editor_box)?;
+        if row < rect.y || row >= rect.y + rect.height || column >= rect.x + rect.width {
+            return None;
+        }
+        let pad = self.padding.at(rect.width);
+        let inner = rect.width.saturating_sub(2 * pad);
+        // The box is a border row, the text rows, a border row.
+        let text_rows = rect.height.saturating_sub(2).max(1);
+        let visual = (row - rect.y).saturating_sub(1).min(text_rows - 1);
+        let col = column.saturating_sub(rect.x + pad);
+        let text = self.editor.get_text();
+        let lines: Vec<&str> = text.split('\n').collect();
+        let (cursor_row, _) = self.editor.cursor_position();
+        Some(text_position(&lines, cursor_row, inner, visual, col))
     }
 
     /// Shows a worker's session in place of the manager's transcript and editor (#2252), or
@@ -711,7 +808,7 @@ impl ChatView {
     /// Lays the whole screen out at `width` x `height` and returns its lines (with ANSI styling),
     /// with the "↓ new output" pill on the transcript's last row when it shows.
     pub fn render_frame(&self, width: usize, height: usize) -> Vec<String> {
-        let frame = rpi_tui::render_layout_frame(self.root(), width, height);
+        let frame = self.layout(width, height);
         let mut lines = frame.lines.clone();
         if let Some(pill) = self.scroll.pill() {
             paint_pill(&frame, &mut lines, pill);
@@ -735,14 +832,38 @@ impl ChatView {
 /// inside the placeholder's `ESC[2m` (`insert_cursor_marker` ends an escape at `[`), so a real
 /// terminal would print `2m/ for commands`, undimmed. Here the editor renders as usual and the
 /// placeholder replaces the blank cells right after the cursor marker.
+///
+/// Without input focus ([`ChatView::set_input_focus`], #2344) the cursor marker is taken out,
+/// so the terminal hides its cursor.
 struct EditorView {
     editor: Arc<Editor>,
     hint: Arc<Mutex<Option<String>>>,
+    focus: Arc<AtomicBool>,
 }
 
 impl Component for EditorView {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut lines = self.editor.render(width);
+        let mut lines = self.placeholder(self.editor.render(width));
+        if !self.focus.load(Ordering::Relaxed) {
+            for line in &mut lines {
+                *line = line.replace(CURSOR_MARKER, "");
+            }
+        }
+        lines
+    }
+
+    fn invalidate(&self) {
+        self.editor.invalidate();
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+impl EditorView {
+    /// The editor's rows with the placeholder (or hint) after the cursor while it is empty.
+    fn placeholder(&self, mut lines: Vec<String>) -> Vec<String> {
         if !self.editor.get_text().is_empty() {
             return lines;
         }
@@ -763,14 +884,75 @@ impl Component for EditorView {
         }
         lines
     }
+}
 
-    fn invalidate(&self) {
-        self.editor.invalidate();
+/// The rectangle of `target` in a laid-out frame.
+fn find_box(node: &rpi_tui::LayoutBox, target: &Arc<dyn Component>) -> Option<rpi_tui::LayoutRect> {
+    if std::ptr::addr_eq(Arc::as_ptr(&node.component), Arc::as_ptr(target)) {
+        return Some(node.rect);
     }
+    node.children.iter().find_map(|c| find_box(c, target))
+}
 
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+/// The editor's wrapping (rpi-tui 0.8.0 `wrap_line_ranges`): byte ranges of `line` at most
+/// `max` columns wide.
+fn wrap_ranges(line: &str, max: usize) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let (mut start, mut width) = (0, 0);
+    for (i, ch) in line.char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if i > start && width + w > max {
+            ranges.push((start, i));
+            start = i;
+            width = 0;
+        }
+        width += w;
     }
+    ranges.push((start, line.len()));
+    ranges
+}
+
+/// The `(line, byte offset)` at `visual` row (counted from the editor's first text row) and
+/// `column` (from its left edge) of `lines` drawn `width` columns wide, as the editor draws
+/// them: the cursor's line wraps a column early, the rest at the full width. A column inside a
+/// wide character lands before it; past a row's end, at its end (on a wrapped row, before its
+/// last character, so the cursor stays on that row).
+fn text_position(
+    lines: &[&str],
+    cursor_row: usize,
+    width: usize,
+    visual: usize,
+    column: usize,
+) -> (usize, usize) {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let max = if i == cursor_row {
+            width.saturating_sub(1).max(1)
+        } else {
+            width
+        };
+        let ranges = wrap_ranges(line, max);
+        let last = ranges.len() - 1;
+        for (k, r) in ranges.into_iter().enumerate() {
+            rows.push((i, r, k == last));
+        }
+    }
+    let Some(&(line, (start, end), is_last)) = rows.get(visual).or(rows.last()) else {
+        return (0, 0);
+    };
+    let text = lines[line];
+    let mut at = start;
+    let mut used = 0;
+    for (i, ch) in text[start..end].char_indices() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > column {
+            return (line, start + i);
+        }
+        used += w;
+        at = start + i;
+    }
+    if is_last { (line, end) } else { (line, at) }
 }
 
 /// The open tool group and the assistant messages added after it.

@@ -54,7 +54,7 @@ async fn screen(name: &str, extra: &[&str]) -> Vec<String> {
     }
     let lines: Vec<String> = out.stdout.lines().map(str::to_owned).collect();
     assert_eq!(lines.len(), 24, "{}", out.stdout);
-    common::unpad(lines)
+    common::unpad(lines, 80)
 }
 
 #[tokio::test]
@@ -86,7 +86,7 @@ async fn eighty_by_twenty_four_leaves_at_least_fifteen_transcript_rows() {
     assert_eq!(visible, transcript, "{text}");
     // Below the editor: the AMP status line and a one-row footer, nothing else.
     assert_eq!(lines.len() - rule, 5, "{text}");
-    let footer = &lines[23];
+    let footer = &lines[lines.len() - 1];
     assert!(footer.contains("• manager · #2085"), "{footer}");
     assert!(footer.contains("ctx "), "{footer}");
     // Inside the padding (#2251), how much fits depends on the checkout's branch name: with a

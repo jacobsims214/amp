@@ -1,35 +1,33 @@
-  ▀▀▀▀▀▀▀▀ ada@example.com · simstech › AMP #2                     ● connected  |
-  ■ In progress #2106 M3-3 Header and AMP status line            ▌ AMP Harness  |
                                                                                 |
-   AMP harness · manager                                                        |
-   project #2 AMP                                                               |
+ ▀▀▀▀▀▀▀▀ ada@example.com · simstech › AMP #2                       ● connected |
+ ■ In progress #2106 M3-3 Header and AMP status line              ▌ AMP Harness |
                                                                                 |
-                                                                                |
-   show me the board                                                            |
+  AMP harness · manager                                                         |
+  project #2 AMP                                                                |
                                                                                 |
                                                                                 |
-   ✗ ls crates · # ms                                                           |
-     │ Tool ls not found                                                        |
-                                                                                |
-   Here is the board, with a paragraph long enough that it has to wrap at       |
-   eighty columns and again at a hundred and twenty-seven, so the right edge    |
-   shows.                                                                       |
-   ┌────────┬─────────────┬────────────────┐                                    |
-   │ ticket │ state       │ owner          │                                    |
-   ├────────┼─────────────┼────────────────┤                                    |
-   │ #2251  │ in progress │ backend worker │                                    |
-   │ #2252  │ ready       │ backend worker │                                    |
-   └────────┴─────────────┴────────────────┘                                    |
-                                                                                |
-      fn padded(width: usize, padding: usize) -> usize { width - 2 * padding    |
-       } // inner                                                               |
-                                                                                |
-   Done.                                                                        |
-                                                                                |
-  ── ■ In progress #2106 M3-3 Header and AMP status line ─────────────────────  |
+  show me the board                                                             |
                                                                                 |
                                                                                 |
+  ✗ ls crates · # ms                                                            |
+    │ Tool ls not found                                                         |
                                                                                 |
+  Here is the board, with a paragraph long enough that it has to wrap at        |
+  eighty columns and again at a hundred and twenty-seven, so the right edge     |
+  shows.                                                                        |
+  ┌────────┬─────────────┬────────────────┐                                     |
+  │ ticket │ state       │ owner          │                                     |
+  ├────────┼─────────────┼────────────────┤                                     |
+  │ #2251  │ in progress │ backend worker │                                     |
+  │ #2252  │ ready       │ backend worker │                                     |
+  └────────┴─────────────┴────────────────┘                                     |
+                                                                                |
+     fn padded(width: usize, padding: usize) -> usize { width - 2 * padding }   |
+      // inner                                                                  |
+                                                                                |
+  Done.                                                                         |
+                                                                                |
+ ── ■ In progress #2106 M3-3 Header and AMP status line ─────────────────────── |
                                                                                 |
                                                                                 |
                                                                                 |
@@ -41,20 +39,22 @@
                                                                                 |
                                                                                 |
                                                                                 |
-  ── AMP · workers ───────────────────────────────────────────────────────────  |
-  › ■ In progress running #2105 M3-5 Inline… · amp:amp-worker-backend · local   |
-      claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                |
-    □ Ready queued #2111 · amp:amp-worker-backend · local                       |
-      claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                |
-    ■ In progress #2104 M3-2 AMP metada… · amp:amp-worker-backend · elsewhere   |
-    ■ In progress #2106 M3-3 Header and… · amp:amp-worker-backend · elsewhere   |
-    ↑↓ select · Enter watch · x stop · o open in browser · Esc close            |
-  ── commands ────────────────────────────────────────────────────────────────  |
-  › /questions   tickets waiting on an answer; answer them here                 |
-    /quit        leave the chat                                                 |
-    ↑↓ choose · Tab complete · Enter run · Esc dismiss                          |
-  ────────────────────────────────────────────────────────────────────────────  |
-  /q                                                                            |
-  ────────────────────────────────────────────────────────────────────────────  |
-  ■  2 QUESTIONS  │ plan: 2 waiting for your approval         unreported #2106  |
-  /work/amp (harness-m4) • manager · #2106     ctx <1% · faux-1 • thinking off  |
+                                                                                |
+ ── AMP · workers ───────────────────────────────────────────────────────────── |
+ › ■ In progress running #2105 M3-5 Inline t… · amp:amp-worker-backend · local  |
+     claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                 |
+   □ Ready queued #2111 · amp:amp-worker-backend · local                        |
+     claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                 |
+   ■ In progress #2104 M3-2 AMP metadata… · amp:amp-worker-backend · elsewhere  |
+   ■ In progress #2106 M3-3 Header and A… · amp:amp-worker-backend · elsewhere  |
+   ↑↓ select · Enter watch · x stop · o open in browser · Esc close             |
+ ── commands ────────────────────────────────────────────────────────────────── |
+ › /questions   tickets waiting on an answer; answer them here                  |
+   /quit        leave the chat                                                  |
+   ↑↓ choose · Tab complete · Enter run · Esc dismiss                           |
+ ────────────────────────────────────────────────────────────────────────────── |
+ /q                                                                             |
+ ────────────────────────────────────────────────────────────────────────────── |
+ ■  2 QUESTIONS  │ plan: 2 waiting for your approval           unreported #2106 |
+ /work/amp (harness-m4) • manager · #2106       ctx <1% · faux-1 • thinking off |
+                                                                                |
