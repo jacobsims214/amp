@@ -95,7 +95,7 @@ async fn snapshot_env(
     );
     let rows: Vec<String> = out.stdout.lines().map(str::to_owned).collect();
     assert_eq!(rows.len(), size.1, "{}", out.stdout);
-    unpad(rows)
+    unpad(rows, size.0)
 }
 
 /// Words split across two rows: a row's last token and the next row's first token that only
