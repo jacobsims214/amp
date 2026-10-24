@@ -38,9 +38,16 @@ pub trait Ui {
     }
 }
 
+/// The command a cancelled prompt names ("setup cancelled", "connect cancelled"): set once per
+/// process by [`detect_for`]; setup's when nothing set it.
+static CANCELLED_COMMAND: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
 fn cancelled() -> CliError {
     CliError {
-        message: "setup cancelled".to_owned(),
+        message: format!(
+            "{} cancelled",
+            CANCELLED_COMMAND.get().copied().unwrap_or("setup")
+        ),
         code: 130,
         offline: false,
     }
@@ -57,6 +64,13 @@ fn prompt_text(prompt: &str, default: Option<&str>) -> String {
 /// The UI for this process: scripted when `AMP_HARNESS_PROMPTS=stdin`, the terminal when stdin
 /// and stderr are one, else none. `allow` = false forces [`NoUi`] (`init --yes`).
 pub fn detect(allow: bool) -> Box<dyn Ui> {
+    detect_for(allow, "setup")
+}
+
+/// [`detect`] for `command`: a cancelled prompt says "`command` cancelled" (#2340: Ctrl+C in
+/// `connect` said "setup cancelled").
+pub fn detect_for(allow: bool, command: &'static str) -> Box<dyn Ui> {
+    let _ = CANCELLED_COMMAND.set(command);
     if !allow {
         return Box::new(NoUi);
     }

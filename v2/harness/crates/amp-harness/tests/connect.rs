@@ -222,8 +222,11 @@ async fn without_a_keychain_the_key_is_checked_but_never_written() {
     assert_eq!(read_config(&dir), before);
 }
 
+/// #2340: with the keychain off, a terminal asks for no key it could not keep: the picker, then
+/// the variable to set (no hidden prompt). The hidden prompt itself is covered with a keychain in
+/// tests/keychain.rs.
 #[tokio::test]
-async fn the_hidden_prompt_never_echoes_the_key() {
+async fn without_a_keychain_the_terminal_asks_for_no_key() {
     let provider = spawn_provider(ProviderState {
         key: Some(KEY.into()),
         models: vec!["m-1".into()],
@@ -232,8 +235,9 @@ async fn the_hidden_prompt_never_echoes_the_key() {
     .await;
     let dir = workdir("connect-scripted", None);
     write_config(&dir, &mock_config(&provider.url));
-    // The picker (openrouter, anthropic, openai, then faux? no: faux is hidden, then mock), then
-    // the key.
+    let before = read_config(&dir);
+    // The picker (openrouter, anthropic, openai, then faux? no: faux is hidden, then mock). A
+    // key line after it is never read as an answer.
     let out = run(
         &dir,
         &["connect"],
@@ -247,14 +251,51 @@ async fn the_hidden_prompt_never_echoes_the_key() {
         out.stderr
     );
     assert!(out.stderr.contains("5) Custom"), "{}", out.stderr);
+    assert!(!out.stderr.contains("(hidden)"), "{}", out.stderr);
     assert!(
-        out.stderr.contains("Mock AI API key") && out.stderr.contains("(hidden)"),
+        out.stderr.contains(
+            "the OS keychain is turned off (AMP_CREDENTIAL_STORE=file), so a key typed here for \
+             Mock AI could not be kept: set MOCK_KEY in your environment"
+        ),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    assert!(provider.seen().is_empty(), "{:?}", provider.seen());
+    no_secret(&out, &dir, &[KEY]);
+    assert_eq!(read_config(&dir), before);
+}
+
+/// #2340: in a terminal, a key in the provider's variable is used as it is without a terminal:
+/// checked, left in the environment, no hidden prompt.
+#[tokio::test]
+async fn a_terminal_uses_the_key_in_the_environment() {
+    let provider = spawn_provider(ProviderState {
+        key: Some(KEY.into()),
+        models: vec!["m-1".into()],
+        ..ProviderState::default()
+    })
+    .await;
+    let dir = workdir("connect-scripted-env", None);
+    write_config(&dir, &mock_config(&provider.url));
+    let out = run(
+        &dir,
+        &["connect", "mock"],
+        // "Run … on mock/m-1?": no.
+        Some("n\n"),
+        &[("AMP_HARNESS_PROMPTS", "stdin"), ("MOCK_KEY", KEY)],
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(!out.stderr.contains("(hidden)"), "{}", out.stderr);
+    assert!(
+        out.stderr.contains(
+            "Using the Mock AI key in MOCK_KEY (it stays in the environment; nothing is stored)."
+        ),
         "{}",
         out.stderr
     );
     assert!(out.stderr.contains("accepted the key"), "{}", out.stderr);
-    // Stored nowhere (no keychain here), shown nowhere.
-    assert_eq!(out.code, 1);
     no_secret(&out, &dir, &[KEY]);
 }
 

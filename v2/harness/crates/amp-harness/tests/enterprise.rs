@@ -304,6 +304,106 @@ async fn the_first_run_sets_up_an_own_endpoint_and_maps_models_to_roles() {
     assert_nothing_left_the_machine(&guard);
 }
 
+/// #2340: `setup` with the keychain off named OPENROUTER_API_KEY before the provider menu, then
+/// asked for the own endpoint's key hidden and warned it was not kept. The variable is named once
+/// the provider is picked (EXAMPLE_API_KEY), and no key is asked for.
+#[tokio::test]
+async fn keychain_off_setup_names_the_picked_providers_variable_and_asks_for_no_key() {
+    let guard = spawn_proxy_guard().await;
+    let amp = spawn(MockAmp::new(), None).await;
+    let endpoint = example_endpoint(Some(KEY)).await;
+    let dir = workdir("enterprise-setup-no-keychain", None);
+    let env = Env::new(&dir, &guard)
+        .var("AMP_HARNESS_PROMPTS", "stdin")
+        .var("AMP_MCP_URL", amp.url.clone());
+    let host = endpoint
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1")
+        .to_owned();
+    // No project; provider 4 (own endpoint); name; id; the address, confirm the /v1 URL; bearer
+    // auth; no extra header; (no key prompt) the models typed (it lists none without the key);
+    // keep the suggested mapping.
+    let answers = format!("\n4\nExample AI\nexample\n{host}\n\n\n\nengineer,orchestrator\n\n");
+    let out = env.run(&["init", "--json"], Some(&answers)).await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let err = &out.stderr;
+    let menu = err
+        .find("Which model provider do the agents use?")
+        .unwrap_or_else(|| panic!("no menu:\n{err}"));
+    let note = err
+        .find("Keys are kept only in the OS keychain")
+        .unwrap_or_else(|| panic!("no keychain note:\n{err}"));
+    assert!(
+        menu < note,
+        "the note comes after the provider is picked:\n{err}"
+    );
+    assert!(
+        err.contains(
+            "the OS keychain is turned off (AMP_CREDENTIAL_STORE=file): set the key in your \
+             environment instead (EXAMPLE_API_KEY)."
+        ),
+        "{err}"
+    );
+    assert!(!err.contains("OPENROUTER_API_KEY"), "{err}");
+    assert!(!err.contains("(hidden)"), "{err}");
+    assert!(!err.contains("was not kept"), "{err}");
+    let text = config(&dir);
+    assert!(text.contains("[providers.example]"), "{text}");
+    // Still a provider that needs its key (set later in EXAMPLE_API_KEY).
+    assert!(!text.contains("auth = \"none\""), "{text}");
+    no_secret(&out, &dir);
+    assert_nothing_left_the_machine(&guard);
+}
+
+/// #2340: QA's `connect example --base-url … --role …` in a terminal, EXAMPLE_API_KEY set and the
+/// keychain off: the key in the variable is used (no hidden prompt), and a secret header, which
+/// could not be kept, is not asked for either.
+#[tokio::test]
+async fn keychain_off_connect_in_a_terminal_uses_the_variable() {
+    let guard = spawn_proxy_guard().await;
+    let endpoint = example_endpoint(Some(KEY)).await;
+    let dir = workdir("enterprise-connect-terminal-env", None);
+    let env = Env::new(&dir, &guard)
+        .var("AMP_HARNESS_PROMPTS", "stdin")
+        .var("EXAMPLE_API_KEY", KEY);
+    let host = endpoint.url.trim_end_matches("/v1").to_owned();
+    // Display name; API 1; a secret-named header (left out), no more headers; all its models.
+    let out = env
+        .run(
+            &[
+                "connect",
+                "example",
+                "--base-url",
+                &host,
+                "--role",
+                "manager=orchestrator",
+                "--role",
+                "workers=engineer",
+            ],
+            Some("Example AI\n1\nX-Api-Key\n\n\n"),
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let err = &out.stderr;
+    assert!(!err.contains("(hidden)"), "{err}");
+    assert!(
+        err.contains(
+            "Using the Example AI key in EXAMPLE_API_KEY (it stays in the environment; nothing \
+             is stored)."
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("X-Api-Key looks like a secret, and the OS keychain is turned off"),
+        "{err}"
+    );
+    assert!(err.contains("Example AI accepted the key"), "{err}");
+    assert!(err.contains("manager    example/orchestrator"), "{err}");
+    no_secret(&out, &dir);
+    assert_nothing_left_the_machine(&guard);
+}
+
 /// `connect example --base-url api-host --role manager=orchestrator --role worker=engineer`: the
 /// key from the environment, checked against /models; the roles mapped in one step; then
 /// `connect example --role reviewers=orchestrator` changes only the roles (no key asked), and bad

@@ -236,6 +236,13 @@ async fn init_asks_for_what_is_missing() {
         out.stderr
     );
     assert!(out.stderr.contains("OPENROUTER_API_KEY"), "{}", out.stderr);
+    // #2340: said once OpenRouter is picked, not before the menu.
+    let menu = out.stderr.find("Which model provider").unwrap();
+    let note = out
+        .stderr
+        .find("Keys are kept only in the OS keychain")
+        .unwrap();
+    assert!(menu < note, "{}", out.stderr);
     // The answer had no /mcp: setup added it and saved the URL after connecting.
     assert!(config_text(&dir).contains(&format!("url = \"{}\"", amp.url)));
     assert_eq!(marker(&dir)["project_id"], 2);
