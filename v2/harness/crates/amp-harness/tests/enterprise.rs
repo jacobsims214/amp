@@ -547,6 +547,25 @@ async fn reconnect_merges_into_the_provider_table() {
     assert!(out.stderr.contains("proxy = \"direct\""), "{}", out.stderr);
     assert!(config(&dir).contains("[providers.example.models.private-mini]"));
 
+    // #2311: in a terminal, endpoint flags alone don't ask for the key again (stdin is empty, so
+    // a question would fail the command).
+    let tty = Env::new(&dir, &guard)
+        .var("EXAMPLE_API_KEY", KEY)
+        .var("AMP_MCP_URL", amp.url.clone())
+        .var("AMP_HARNESS_PROMPTS", "stdin");
+    let out = tty
+        .run(&["connect", "example", "--organization", "acme2"], Some(""))
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr
+            .contains("Example AI: key unchanged (in EXAMPLE_API_KEY)"),
+        "{}",
+        out.stderr
+    );
+    assert!(config(&dir).contains("organization = \"acme2\""));
+    no_secret(&out, &dir);
+
     // The endpoint saw the new organization header.
     let out = env.run(&["run", "-p", "hello", "--json"], None).await;
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);

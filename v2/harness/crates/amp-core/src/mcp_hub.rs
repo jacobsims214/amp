@@ -456,7 +456,8 @@ pub struct McpReload {
     pub added: Vec<String>,
     /// Servers no longer configured (their tables are gone).
     pub removed: Vec<String>,
-    /// Servers whose table changed (enabled, command, url, ...): restarted with the new one.
+    /// Servers whose table changed (enabled, command, url, ...), or whose keychain secret or
+    /// env_file contents changed (#2311): restarted with the new one.
     pub changed: Vec<String>,
     /// Unchanged servers that were stopped or needed a login, tried again (a secret stored or a
     /// login done in another terminal).
@@ -521,6 +522,9 @@ struct Cell {
     /// A restart request.
     wake: Notify,
     task_running: AtomicBool,
+    /// [`crate::mcp_stamp::server_stamp`] when the cell was made (shared cells; empty for
+    /// worktree ones): a reload restarts the server when it differs, though the table is the same.
+    stamp: String,
     /// Stops this cell alone (a shared server removed or changed by a reload, #2242). A child of
     /// the hub's token, so [`McpHub::shutdown`] stops it too. Worktree cells use their set's.
     stop: CancellationToken,
@@ -571,14 +575,16 @@ impl Cell {
             }),
             wake: Notify::new(),
             task_running: AtomicBool::new(false),
+            stamp: String::new(),
             stop: CancellationToken::new(),
         }
     }
 
     /// A shared server's cell, stoppable on its own under `hub` (the hub's token).
-    fn shared(server: McpServer, hub: &CancellationToken) -> Self {
+    fn shared(server: McpServer, hub: &CancellationToken, stamp: String) -> Self {
         let mut cell = Self::new(server, None, None);
         cell.stop = hub.child_token();
+        cell.stamp = stamp;
         cell
     }
 
@@ -796,9 +802,10 @@ impl McpHub {
     pub fn new(config: McpConfig, opts: HubOptions) -> Self {
         let cancel = CancellationToken::new();
         let untrusted = untrusted_in(&config, &opts);
+        let stamps = Stamper::new(&opts);
         let shared = shared_servers(&config)
             .map(|s| {
-                let cell = Cell::shared(s.clone(), &cancel);
+                let cell = Cell::shared(s.clone(), &cancel, stamps.of(s));
                 if let Some(u) = untrusted.get(&s.name) {
                     cell.lock().status = ServerStatus::Untrusted { reason: u.reason() };
                 }
@@ -935,11 +942,7 @@ impl McpHub {
                 }
             }
         });
-        self.inner
-            .tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(task);
+        push_task(&self.inner.tasks, task);
     }
 
     fn spawn_cell(
@@ -956,15 +959,14 @@ impl McpHub {
             st.status = ServerStatus::Starting;
             st.first_attempt = Some(Instant::now());
         }
-        let task = tokio::spawn(run_cell(
-            Arc::downgrade(&self.inner),
-            Arc::clone(cell),
-            cancel,
-        ));
-        into.unwrap_or(&self.inner.tasks)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(task);
+        let (hub, owned) = (Arc::downgrade(&self.inner), Arc::clone(cell));
+        let task = tokio::spawn(async move {
+            // Cleared however the task ends (return, cancel, panic or abort), so a later restart
+            // spawns a new task instead of waking one that is gone (#2311).
+            let _running = TaskRunning(Arc::downgrade(&owned));
+            run_cell(hub, owned, cancel).await;
+        });
+        push_task(into.unwrap_or(&self.inner.tasks), task);
         self.inner.bump();
     }
 
@@ -1253,6 +1255,25 @@ impl McpHub {
     /// Attached sessions get the new tools and instructions from their next run. Worktree
     /// instances already running keep theirs; workers built from now on use the new
     /// configuration.
+    /// Files outside the configuration whose change should reload it (#2311): the secret
+    /// versions file and every configured stdio server's env_file. The chat's watcher looks at
+    /// them with the config files.
+    pub fn watched_files(&self) -> Vec<PathBuf> {
+        let config = self.inner.config();
+        let env = |k: &str| std::env::var(k).ok();
+        let ctx = ExpandContext::from_paths(&self.inner.opts.paths, &env, None);
+        let mut files = vec![crate::mcp_stamp::versions_path(&self.inner.opts.state_dir)];
+        files.extend(
+            config
+                .servers
+                .values()
+                .filter_map(|s| crate::mcp_stamp::env_file_path(s, &ctx)),
+        );
+        files.sort();
+        files.dedup();
+        files
+    }
+
     pub async fn reload(&self, config: McpConfig) -> McpReload {
         let mut report = McpReload::diff(&self.inner.config(), &config);
         // #2241: trust as the store has it now (`mcp trust` in another terminal counts too).
@@ -1261,6 +1282,7 @@ impl McpHub {
         let mut start = Vec::new();
         let mut retry = Vec::new();
         let mut retire = Vec::new();
+        let stamps = Stamper::new(&self.inner.opts);
         {
             let mut shared = self.inner.shared.lock().unwrap_or_else(|e| e.into_inner());
             let wanted: BTreeMap<String, McpServer> = shared_servers(&config)
@@ -1276,7 +1298,18 @@ impl McpHub {
             }
             for (name, server) in wanted {
                 let trust_same = untrusted.contains_key(&name) == was_untrusted.contains_key(&name);
-                let same = shared.get(&name).map(|c| c.server == server && trust_same);
+                let stamp = stamps.of(&server);
+                let same = shared
+                    .get(&name)
+                    .map(|c| c.server == server && c.stamp == stamp && trust_same);
+                if let Some(c) = shared.get(&name)
+                    && c.server == server
+                    && c.stamp != stamp
+                    && !report.changed.contains(&name)
+                {
+                    // #2311: `mcp secret` rotated a value, or the env_file was edited.
+                    report.changed.push(name.clone());
+                }
                 if same == Some(true) {
                     let cell = Arc::clone(&shared[&name]);
                     let status = cell.lock().status.clone();
@@ -1288,7 +1321,7 @@ impl McpHub {
                     }
                     continue;
                 }
-                let cell = Cell::shared(server, &self.inner.cancel);
+                let cell = Cell::shared(server, &self.inner.cancel, stamp);
                 if let Some(u) = untrusted.get(&name) {
                     cell.lock().status = ServerStatus::Untrusted { reason: u.reason() };
                 }
@@ -1480,6 +1513,47 @@ fn worse(a: HealthLevel, b: HealthLevel) -> HealthLevel {
         HealthLevel::Down => 2,
     };
     if rank(b) > rank(a) { b } else { a }
+}
+
+/// Takes [`crate::mcp_stamp::server_stamp`]s with one read of the versions file.
+struct Stamper<'a> {
+    opts: &'a HubOptions,
+    versions: BTreeMap<String, String>,
+}
+
+impl<'a> Stamper<'a> {
+    fn new(opts: &'a HubOptions) -> Self {
+        Self {
+            opts,
+            versions: crate::mcp_stamp::load(&opts.state_dir),
+        }
+    }
+
+    fn of(&self, server: &McpServer) -> String {
+        let env = |k: &str| std::env::var(k).ok();
+        let ctx = ExpandContext::from_paths(&self.opts.paths, &env, None);
+        crate::mcp_stamp::server_stamp(server, &self.versions, &ctx)
+    }
+}
+
+/// Adds a task handle, dropping the handles of tasks that have finished, so the list holds only
+/// live tasks however often servers restart or reload (#2311).
+fn push_task(list: &Mutex<Vec<JoinHandle<()>>>, task: JoinHandle<()>) {
+    let mut list = list.lock().unwrap_or_else(|e| e.into_inner());
+    list.retain(|t| !t.is_finished());
+    list.push(task);
+}
+
+/// Resets [`Cell::task_running`] when a cell's task ends. Weak, so the task still holds exactly
+/// one strong reference, which [`sweep_retired`] counts.
+struct TaskRunning(Weak<Cell>);
+
+impl Drop for TaskRunning {
+    fn drop(&mut self) {
+        if let Some(cell) = self.0.upgrade() {
+            cell.task_running.store(false, Ordering::Release);
+        }
+    }
 }
 
 async fn stop_set(set: &WorktreeSet) {
@@ -2773,6 +2847,50 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
             .await
             .expect("shutdown is not held up by the pruner");
+    }
+
+    /// #2311 (review #2248 finding 11): a cell's task clears `task_running` when it ends, and the
+    /// hub's task list keeps only live handles however often a server is restarted.
+    #[tokio::test]
+    async fn finished_cell_tasks_are_forgotten() {
+        let base = scratch("task-handles");
+        let table: toml::Table = toml::from_str(
+            "[gone]\ncommand = \"/nonexistent/amp-test-server\"\nstartup = \"background\"\n",
+        )
+        .unwrap();
+        let config = McpConfig::from_tables(Some((&table, &base.join("config.toml"))), None);
+        assert!(config.servers.contains_key("gone"), "{:?}", config.problems);
+        let mut opts = HubOptions::new(ConfigPaths::default(), base.join("state"), base.clone());
+        opts.trust_store = None;
+        let hub = McpHub::new(config, opts);
+        hub.start();
+        let cell = hub.inner.shared_cell("gone").unwrap();
+        assert!(cell.task_running.load(Ordering::Acquire));
+
+        // The cell's task ends (as when a reload retires it): the flag is cleared.
+        cell.stop.cancel();
+        let started = Instant::now();
+        while cell.task_running.load(Ordering::Acquire)
+            && started.elapsed() < Duration::from_secs(5)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!cell.task_running.load(Ordering::Acquire), "flag cleared");
+
+        // Each restart now spawns a task (its token is cancelled, so it ends at once); the list
+        // never holds more than the live ones plus the newest.
+        for _ in 0..50 {
+            hub.restart("gone").unwrap();
+            let started = Instant::now();
+            while cell.task_running.load(Ordering::Acquire)
+                && started.elapsed() < Duration::from_secs(5)
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        let held = hub.inner.tasks.lock().unwrap().len();
+        assert!(held <= 2, "{held} task handles kept");
+        hub.shutdown().await;
     }
 
     fn scratch(name: &str) -> PathBuf {

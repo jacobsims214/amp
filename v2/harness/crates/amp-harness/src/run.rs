@@ -10,7 +10,10 @@
 //!   MCP server), then the run's events (`turn_start`, `text_delta`, `assistant`, `tool_start`,
 //!   `tool_end`, `retry`, `turn_end`), then `result` (outcome, final text, usage totals). Fields
 //!   may be added, never renamed or removed.
-//! - Exit 0 when the run completed, 1 when it failed or was aborted (Ctrl-C aborts the run).
+//! - Exit 0 when the run completed, 1 when it failed or was aborted. Ctrl-C, SIGTERM (a CI
+//!   cancel) and SIGHUP abort the run the same way (#2311): workers are cancelled, the MCP hub is
+//!   shut down and stdio servers' process groups are killed before the command exits. A second
+//!   signal shuts the hub down and exits at once.
 //! - #2225: a model that keeps repeating one tool call is stopped by the repeat guard
 //!   ([`amp_core::repeat`]): the outcome is `stopped`, it exits 1, and its one stderr line says
 //!   so.
@@ -232,7 +235,60 @@ fn mcp_warnings(rt: &Runtime, starting: &[String]) {
     }
 }
 
+/// Ctrl-C, SIGTERM and SIGHUP, installed once at the start of `run -p` so a signal during
+/// startup is caught too: the default action would end the process without shutting the MCP hub
+/// down, leaving stdio servers (which run in their own session) behind.
+pub(crate) struct StopSignals {
+    #[cfg(unix)]
+    term: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hup: tokio::signal::unix::Signal,
+}
+
+impl StopSignals {
+    pub(crate) fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                term: signal(SignalKind::terminate())?,
+                hup: signal(SignalKind::hangup())?,
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+
+    /// Waits for the next one and names it.
+    pub(crate) async fn recv(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => "Ctrl-C",
+                _ = self.term.recv() => "SIGTERM",
+                _ = self.hup.recv() => "SIGHUP",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl-C"
+        }
+    }
+}
+
+/// The conventional exit status for a process ended by `signal` (128 + its number).
+fn signal_exit(signal: &str) -> i32 {
+    match signal {
+        "SIGHUP" => 129,
+        "SIGTERM" => 143,
+        _ => 130,
+    }
+}
+
 pub async fn run(args: RunArgs) -> Result<(), CliError> {
+    let mut signals =
+        StopSignals::install().map_err(|e| CliError::new(format!("signal handlers: {e}")))?;
     let prompt = match &args.prompt {
         Some(raw) => Some(read_prompt(raw)?),
         None => None,
@@ -241,15 +297,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         return Err(CliError::usage("the prompt is empty"));
     }
 
-    let session::Session {
-        rt,
-        agent,
-        events: rx,
-        project,
-        supervisor,
-        mcp_starting,
-        ..
-    } = session::build(session::SessionRequest {
+    let build = session::build(session::SessionRequest {
         conn: &args.conn,
         role: args.role.as_deref(),
         cwd: args.cwd.as_deref(),
@@ -259,15 +307,42 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         wait_mcp: true,
         // #2241: headless never asks; untrusted repo MCP servers are skipped with a warning.
         ask_trust: false,
-    })
-    .await?;
+    });
+    let session = tokio::select! {
+        s = build => s?,
+        signal = signals.recv() => {
+            // Dropping the half-built session drops its hub, which cancels every server task;
+            // the stdio clients kill their process groups as the runtime drops them.
+            return Err(CliError::new(format!("stopped while starting ({signal})")));
+        }
+    };
+    let session::Session {
+        rt,
+        agent,
+        events: rx,
+        project,
+        supervisor,
+        mcp_starting,
+        ..
+    } = session;
     mcp_warnings(&rt, &mcp_starting);
-    let result = drive(&args, prompt, &rt, agent, rx, project, supervisor).await;
+    let result = drive(
+        &args,
+        prompt,
+        &rt,
+        agent,
+        rx,
+        project,
+        supervisor,
+        &mut signals,
+    )
+    .await;
     // #2239: stdio servers get EOF and their process groups are killed before we exit.
     rt.mcp_hub.shutdown().await;
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     args: &RunArgs,
     prompt: Option<String>,
@@ -276,6 +351,7 @@ async fn drive(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<rpi_agent::AgentEvent>,
     project: Option<ProjectMarker>,
     supervisor: Option<Arc<amp_core::supervisor::Supervisor>>,
+    signals: &mut StopSignals,
 ) -> Result<(), CliError> {
     if args.print_system_prompt {
         println!("{}", agent.full_system_prompt(&rt.catalog().skills));
@@ -319,14 +395,20 @@ async fn drive(
 
     let run = harness.prompt_text(&prompt, Vec::new());
     tokio::pin!(run);
-    let mut aborted_by_user = false;
+    let mut aborted_by: Option<&'static str> = None;
     let result = loop {
         tokio::select! {
             biased;
             Some(event) = rx.recv() => handle(event, &mut totals),
-            _ = tokio::signal::ctrl_c(), if !aborted_by_user => {
-                aborted_by_user = true;
-                eprintln!("amp-harness: aborting the run (Ctrl-C)");
+            signal = signals.recv() => {
+                if aborted_by.is_some() {
+                    // A second signal: don't wait for the run to wind down.
+                    eprintln!("amp-harness: stopping now ({signal})");
+                    rt.mcp_hub.shutdown().await;
+                    std::process::exit(signal_exit(signal));
+                }
+                aborted_by = Some(signal);
+                eprintln!("amp-harness: aborting the run ({signal})");
                 if let Some(sup) = &supervisor {
                     sup.cancel_all();
                 }
@@ -384,6 +466,13 @@ async fn drive(
     };
     let (outcome, error) = match (&repeat_stop, outcome) {
         (Some(stop), "completed") => ("stopped", Some(stop.reason())),
+        _ => (outcome, error),
+    };
+    // A signal aborted it: whatever the agent loop made of the abort, the run did not finish.
+    let (outcome, error) = match aborted_by {
+        Some(signal) if outcome != "aborted" => {
+            ("aborted", Some(format!("the run was aborted ({signal})")))
+        }
         _ => (outcome, error),
     };
     let text = if text.is_empty() {

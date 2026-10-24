@@ -307,9 +307,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         // The same as `/reload`, when the configuration files change (#2242).
         let watcher = crate::reload::auto_reload(&|k| std::env::var(k).ok()).then(|| {
             let notes = shell.notifier();
+            let hub = Arc::clone(&session.rt.mcp_hub);
             tokio::spawn(crate::reload::watch(
                 session.rt.paths.clone(),
                 crate::reload::WATCH_EVERY,
+                move || hub.watched_files(),
                 move || notes.reload(),
             ))
         });

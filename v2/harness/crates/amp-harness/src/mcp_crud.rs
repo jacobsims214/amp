@@ -238,8 +238,15 @@ pub struct AddJsonArgs {
 
 #[derive(Args)]
 pub struct ListArgs {
-    /// Don't connect: list the configuration only.
-    #[arg(long)]
+    /// Connect to every enabled server now (in parallel) and show its live health. Without it,
+    /// list shows each server's last known health and starts nothing.
+    #[arg(long, conflicts_with = "no_health")]
+    pub health: bool,
+    /// With --health: give each server at most this many seconds to start (default 5).
+    #[arg(long, value_name = "SECS", requires = "health")]
+    pub timeout: Option<u64>,
+    /// The configuration only: no live check and no last known health.
+    #[arg(long, hide = true)]
     pub no_health: bool,
     /// Print JSON.
     #[arg(long)]
@@ -678,10 +685,23 @@ pub(crate) struct Probe {
 /// Connects to `servers` (each as it would start in a session, lazy ones included), waits for the
 /// first attempts, records health and tool names, and shuts everything down.
 pub(crate) async fn probe(ctx: &Ctx, servers: Vec<McpServer>) -> Result<Probe, CliError> {
+    probe_within(ctx, servers, None).await
+}
+
+/// [`probe`], giving each server at most `cap` to start (`mcp list --health`). All of them start
+/// at once, so the whole probe takes about the slowest one, not the sum.
+pub(crate) async fn probe_within(
+    ctx: &Ctx,
+    servers: Vec<McpServer>,
+    cap: Option<Duration>,
+) -> Result<Probe, CliError> {
     let servers: Vec<McpServer> = servers
         .into_iter()
         .map(|mut s| {
             s.startup = Startup::Background;
+            if let Some(cap) = cap {
+                s.startup_timeout = s.startup_timeout.min(cap);
+            }
             s
         })
         .collect();
@@ -689,6 +709,10 @@ pub(crate) async fn probe(ctx: &Ctx, servers: Vec<McpServer>) -> Result<Probe, C
         .iter()
         .any(|s| s.enabled && s.scope == RunScope::Worktree);
     let names: Vec<String> = servers.iter().map(|s| s.name.clone()).collect();
+    let fingerprints: BTreeMap<String, String> = servers
+        .iter()
+        .map(|s| (s.name.clone(), mcp_trust::fingerprint(s)))
+        .collect();
     let hub = hub_for(ctx, servers)?;
     let started = Instant::now();
     hub.start();
@@ -726,11 +750,114 @@ pub(crate) async fn probe(ctx: &Ctx, servers: Vec<McpServer>) -> Result<Probe, C
         hub.release_worktree("mcp-cli").await;
     }
     hub.shutdown().await;
+    if let Ok(state) = state() {
+        HealthCache::record(&state, &health, &fingerprints);
+    }
     Ok(Probe {
         health,
         tools,
         elapsed,
     })
+}
+
+/// The last health each server showed when the CLI connected to it (`mcp test`, `get`, `add`,
+/// `list --health`), so `mcp list` can show it without starting anything (#2311). Kept in
+/// `<state>/mcp-health.json`; an entry counts only while the server's table (and env_file) is the
+/// one that was checked.
+#[derive(Serialize, serde::Deserialize, Default)]
+pub(crate) struct HealthCache {
+    #[serde(default)]
+    servers: BTreeMap<String, CachedHealth>,
+}
+
+#[derive(Serialize, serde::Deserialize, Clone)]
+pub(crate) struct CachedHealth {
+    /// [`mcp_trust::fingerprint`] of the server that was checked.
+    fingerprint: String,
+    /// Unix seconds.
+    checked_at: i64,
+    /// [`ServerStatus`] as JSON.
+    status: Value,
+    /// The status as `mcp list` prints it.
+    text: String,
+    tools: usize,
+}
+
+impl HealthCache {
+    fn path(state: &Path) -> PathBuf {
+        state.join("mcp-health.json")
+    }
+
+    pub(crate) fn load(state: &Path) -> Self {
+        std::fs::read(Self::path(state))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    /// The entry for `server` if it was checked as configured now.
+    fn get(&self, server: &McpServer) -> Option<&CachedHealth> {
+        self.servers
+            .get(&server.name)
+            .filter(|c| c.fingerprint == mcp_trust::fingerprint(server))
+    }
+
+    /// Best effort: a cache that can't be written only costs the next list its last status.
+    fn record(
+        state: &Path,
+        health: &BTreeMap<String, ServerHealth>,
+        fingerprints: &BTreeMap<String, String>,
+    ) {
+        let mut cache = Self::load(state);
+        let now = unix_now();
+        for (name, h) in health {
+            let Some(fingerprint) = fingerprints.get(name) else {
+                continue;
+            };
+            let Ok(status) = serde_json::to_value(&h.status) else {
+                continue;
+            };
+            cache.servers.insert(
+                name.clone(),
+                CachedHealth {
+                    fingerprint: fingerprint.clone(),
+                    checked_at: now,
+                    status,
+                    text: status_text(&h.status, h.tools),
+                    tools: h.tools,
+                },
+            );
+        }
+        let Ok(bytes) = serde_json::to_vec_pretty(&cache) else {
+            return;
+        };
+        let path = Self::path(state);
+        let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+        if std::fs::create_dir_all(state).is_ok() && std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 days ago".
+fn ago(checked_at: i64, now: i64) -> String {
+    let secs = (now - checked_at).max(0);
+    match secs {
+        0..60 => "just now".to_owned(),
+        60..3600 => format!("{} min ago", secs / 60),
+        3600..86400 => format!("{} h ago", secs / 3600),
+        _ => {
+            let days = secs / 86400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
+    }
 }
 
 /// The last `n` lines of a server's stderr log.
@@ -912,8 +1039,19 @@ fn labels(items: &[SecretItem]) -> String {
 
 fn store_secrets(service: &str, items: &[SecretItem], values: &[String]) -> Result<(), CliError> {
     for (item, value) in items.iter().zip(values) {
-        amp_mcp::keychain_set(service, &item.account, value)
+        set_secret(service, &item.account, value)
             .map_err(|e| CliError::new(format!("keychain {}: {e}", item.account)))?;
+    }
+    Ok(())
+}
+
+/// Stores one MCP secret and records a new version of it (#2311), so a running chat's reload
+/// restarts the servers that read it. Every MCP secret write goes through here.
+pub(crate) fn set_secret(service: &str, account: &str, value: &str) -> Result<(), String> {
+    amp_mcp::keychain_set(service, account, value).map_err(|e| e.to_string())?;
+    // Best effort: without it a running chat needs `/mcp restart` for the new value.
+    if let Ok(state) = state() {
+        let _ = amp_core::mcp_stamp::bump(&state, &[account]);
     }
     Ok(())
 }
@@ -1588,7 +1726,7 @@ pub async fn add(args: AddArgs) -> Result<(), CliError> {
             no_test: args.no_test,
             secret_stdin: args.secret_stdin,
             json: args.json,
-            note: "Added by `amp-harness mcp add`.",
+            note: "Added by `amp-harness mcp add`.".into(),
             quiet: false,
         },
     )
@@ -1617,7 +1755,7 @@ pub async fn add_json(args: AddJsonArgs) -> Result<(), CliError> {
             no_test: args.no_test,
             secret_stdin: false,
             json: args.json,
-            note: "Added by `amp-harness mcp add-json`.",
+            note: "Added by `amp-harness mcp add-json`.".into(),
             quiet: false,
         },
     )
@@ -1630,7 +1768,8 @@ pub(crate) struct AddOpts {
     pub(crate) no_test: bool,
     pub(crate) secret_stdin: bool,
     pub(crate) json: bool,
-    pub(crate) note: &'static str,
+    /// The comment written under the table's header.
+    pub(crate) note: std::borrow::Cow<'static, str>,
     /// Print nothing; the caller reports (`mcp import`, the chat's `/mcp add`).
     pub(crate) quiet: bool,
 }
@@ -1749,7 +1888,7 @@ pub(crate) fn add_server_in(
         .unwrap_or_default();
     let value = toml::Value::Table(spec.table);
     let (server, warnings) = parse_table(name, &value, origin(ctx, scope)?)?;
-    let block = mcp_block(name, &value, Some(opts.note))?;
+    let block = mcp_block(name, &value, Some(&opts.note))?;
     let prefix = format!("mcp.{name}");
     let check = layer_check(scope, file.path.clone(), name.to_owned(), Expect::Present);
     let preview = preview_replace(&file, &prefix, Some(&block)).map_err(CliError::new)?;
@@ -1855,8 +1994,14 @@ struct ListRow {
     enabled: Option<bool>,
     trust: Option<TrustState>,
     target: Option<String>,
-    /// The health (`--no-health`: absent), or `{"state": "broken"}` for a table with errors.
+    /// The live health (`--health`), else the last known one (absent when never checked as
+    /// configured now), or `{"state": "broken"}` for a table with errors.
     status: Option<Value>,
+    /// When `status` was seen (unix seconds).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    checked_at: Option<i64>,
+    /// Whether `status` comes from connecting just now (`--health`).
+    live: bool,
     tools: Option<usize>,
     problems: Vec<String>,
 }
@@ -1865,23 +2010,42 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
     let ctx = ctx()?;
     let config = McpConfig::load(&ctx.paths);
     let store = trust_store();
-    let health = if args.no_health || config.servers.is_empty() {
+    let enabled: Vec<McpServer> = config
+        .servers
+        .values()
+        .filter(|s| s.enabled)
+        .cloned()
+        .collect();
+    let health = if !args.health || enabled.is_empty() {
         None
     } else {
         if !args.json {
             eprintln!("Checking MCP server health…");
         }
-        Some(probe(&ctx, config.servers.values().cloned().collect()).await?)
+        let cap = Duration::from_secs(args.timeout.unwrap_or(5).max(1));
+        Some(probe_within(&ctx, enabled, Some(cap)).await?)
     };
+    let cache = match state() {
+        Ok(state) if health.is_none() && !args.no_health => HealthCache::load(&state),
+        _ => HealthCache::default(),
+    };
+    let now = unix_now();
     let mut rows: Vec<ListRow> = Vec::new();
     for s in config.servers.values() {
         let h = health.as_ref().and_then(|p| p.health.get(&s.name));
+        let cached = cache.get(s).filter(|_| s.enabled);
         let status = match (h, s.enabled) {
             (_, false) => Some(json!({"state": "disabled"})),
             (Some(h), _) => serde_json::to_value(&h.status).ok(),
-            (None, _) => None,
+            (None, _) => cached.map(|c| c.status.clone()),
         };
         rows.push(ListRow {
+            checked_at: if h.is_some() {
+                Some(now)
+            } else {
+                cached.map(|c| c.checked_at)
+            },
+            live: h.is_some(),
             name: s.name.clone(),
             kind: Some(s.transport.kind().as_str()),
             layer: Some(s.origin.layer.as_str()),
@@ -1890,7 +2054,7 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
             trust: s.is_repo().then(|| trust_of(s, store.as_ref())),
             target: Some(target(s)),
             status,
-            tools: h.map(|h| h.tools),
+            tools: h.map(|h| h.tools).or(cached.map(|c| c.tools)),
             problems: Vec::new(),
         });
     }
@@ -1914,6 +2078,8 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
             trust: None,
             target: None,
             status: Some(json!({"state": "broken"})),
+            checked_at: None,
+            live: false,
             tools: None,
             problems,
         });
@@ -1929,6 +2095,7 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
         );
         return Ok(());
     }
+    let mut unchecked_since = false;
     for r in &rows {
         if !r.problems.is_empty() || r.kind.is_none() {
             println!("{}: config error", r.name);
@@ -1950,7 +2117,11 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
                 t.word(),
                 s.name
             )
+        } else if let Some(c) = cache.get(s) {
+            unchecked_since = true;
+            format!("{} (checked {})", c.text, ago(c.checked_at, now))
         } else {
+            unchecked_since = true;
             "not checked".to_owned()
         };
         println!(
@@ -1960,6 +2131,9 @@ pub async fn list(args: ListArgs) -> Result<(), CliError> {
             r.layer.unwrap_or_default(),
             r.target.as_deref().unwrap_or_default()
         );
+    }
+    if unchecked_since && !args.no_health {
+        println!("Nothing was started. `amp-harness mcp list --health` checks every server now.");
     }
     Ok(())
 }
@@ -2787,6 +2961,10 @@ pub async fn secret(args: SecretArgs) -> Result<(), CliError> {
     for l in labels {
         println!("Stored {l} for `{}` in the OS keychain.", server.name);
     }
+    println!(
+        "A running chat restarts `{}` with it on its next reload (automatic, or /reload).",
+        server.name
+    );
     Ok(())
 }
 
@@ -2827,7 +3005,7 @@ async fn adopt(ctx: &Ctx, server: &McpServer, json: bool) -> Result<(), CliError
             let old = legacy_account(server, item);
             match amp_mcp::keychain_get(&service, &old) {
                 Ok(Some(value)) => {
-                    amp_mcp::keychain_set(&service, &item.account, &value)
+                    set_secret(&service, &item.account, &value)
                         .map_err(|e| CliError::new(format!("keychain {}: {e}", item.account)))?;
                     copied.push(item.label.clone());
                 }
@@ -3147,7 +3325,7 @@ pub fn ask_preset_secrets(ui: &mut dyn Ui, config: &Path, names: &[String]) -> V
                     continue;
                 }
             };
-            match amp_mcp::keychain_set(service, &item.account, &value) {
+            match set_secret(service, &item.account, &value) {
                 Ok(()) => ui.say(&format!("  Stored {} in the OS keychain.", item.label)),
                 Err(e) => notes.push(format!(
                     "MCP server `{name}`: could not store {}: {e}",

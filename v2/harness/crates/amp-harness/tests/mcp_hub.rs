@@ -147,6 +147,24 @@ fn run_server(mode: &str) {
                 std::process::exit(3);
             }
             "hang" => tokio::time::sleep(Duration::from_secs(300)).await,
+            // Like `npx` -> node: the server has a child of its own (its pid in TREE_PID_FILE).
+            "tree" => {
+                // Never waited for: the hub's process-group kill is what ends it.
+                #[allow(clippy::zombie_processes)]
+                let child = Command::new("sleep")
+                    .arg("300")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn sleep");
+                let file = std::env::var("TREE_PID_FILE").expect("TREE_PID_FILE");
+                std::fs::write(&file, child.id().to_string()).unwrap();
+                let running = HubTestServer { name: "hub-stdio" }
+                    .serve(rmcp::transport::stdio())
+                    .await
+                    .expect("serve");
+                let _ = running.waiting().await;
+            }
             _ => {
                 let running = HubTestServer { name: "hub-stdio" }
                     .serve(rmcp::transport::stdio())
@@ -549,6 +567,92 @@ async fn a_server_that_does_not_start_is_a_warning_not_a_failure() {
         out.stderr
     );
     assert!(started.elapsed() < Duration::from_secs(20));
+}
+
+/// #2311 (review #2248 finding 16): a CI cancel sends SIGTERM. `run -p` aborts the run, shuts
+/// the hub down and kills each stdio server's process group, so a wrapper's child (npx -> node)
+/// does not outlive it. SIGHUP is handled the same way.
+async fn sigterm_ends_the_run_and_its_server_trees() {
+    for (signal, name) in [("TERM", "SIGTERM"), ("HUP", "SIGHUP")] {
+        let amp = spawn(MockAmp::new(), None).await;
+        let dir = setup(
+            &format!("signal-{signal}"),
+            "",
+            json!([
+                {"tool_calls": [{"name": "mcp__fs__sleep_ms", "arguments": {"ms": 60000}}]},
+                {"text": "never"}
+            ]),
+        );
+        let pid_file = dir.join("tree.pid");
+        let config = dir.join("home/.config/amp-harness/config.toml");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&stdio_table(
+            "fs",
+            "tree",
+            &format!(
+                "env = {{ TREE_PID_FILE = {:?} }}",
+                pid_file.to_str().unwrap()
+            ),
+        ));
+        std::fs::write(&config, text).unwrap();
+
+        let script = dir.join("script.json");
+        let state = dir.join("home/.local/state");
+        let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_amp-harness"));
+        cmd.args(["run", "-p", "go"])
+            .current_dir(dir.join("project"))
+            .env("HOME", dir.join("home"))
+            .env("XDG_CONFIG_HOME", dir.join("home/.config"))
+            .env("XDG_STATE_HOME", &state)
+            .env("AMP_HARNESS_FAUX_SCRIPT", &script)
+            .env("AMP_CREDENTIAL_STORE", "file")
+            .env("AMP_MCP_URL", &amp.url)
+            .env("AMP_HARNESS_CEILING_DIR", &dir)
+            .env_remove("AMP_TOKEN")
+            .env_remove("AMP_CA_FILE")
+            .env_remove("AMP_WEB_URL")
+            .env_remove("AMP_HARNESS_PROFILE")
+            .env_remove("RUST_LOG")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn amp-harness");
+        let harness_pid = child.id().unwrap();
+
+        // The server and its child are up, and the run is in its long tool call.
+        let started = Instant::now();
+        while !pid_file.exists() && started.elapsed() < Duration::from_secs(20) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let tree: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the server started")
+            .trim()
+            .parse()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(alive(tree));
+
+        let killed = Command::new("kill")
+            .args([format!("-{signal}"), harness_pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(killed.success());
+        let out = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output())
+            .await
+            .expect("amp-harness exits soon after the signal")
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_ne!(out.status.code(), Some(0), "{stderr}");
+        assert!(
+            out.status.code().is_some(),
+            "{name} ended the process instead of being handled: {stderr}"
+        );
+        assert!(stderr.contains(name), "{stderr}");
+        assert!(
+            wait_dead(tree, Duration::from_secs(10)).await,
+            "{name}: the server's child outlived the harness"
+        );
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -1061,6 +1165,70 @@ async fn wait_gone(hub: &McpHub, name: &str, within: Duration) -> bool {
 /// process; a changed one gets a new process and its old one stops; a removed one keeps serving
 /// the session that still holds its tools (a running worker's snapshot) and stops once that is
 /// dropped; a new one starts.
+/// #2311 (review #2248 finding 14): a reload restarts a server whose keychain secret was rotated
+/// (`mcp secret` records a new version) or whose env_file changed, though its table did not.
+async fn reload_restarts_a_server_after_a_secret_or_env_file_change() {
+    let tables = format!(
+        "{}{}",
+        stdio_table("e", "normal", "env_file = \"e.env\""),
+        stdio_table("s", "normal", "secret_env = [\"API_KEY\"]"),
+    );
+    let dir = scratch("reload-stamp");
+    std::fs::write(dir.join("e.env"), "X=1\n").unwrap();
+    let (hub, dir) = {
+        let file = dir.join("config.toml");
+        std::fs::write(&file, &tables).unwrap();
+        let paths = ConfigPaths {
+            user_file: Some(file),
+            user_dir: Some(dir.clone()),
+            ..ConfigPaths::default()
+        };
+        let config = McpConfig::load(&paths);
+        assert!(config.problems.is_empty(), "{:?}", config.problems);
+        let mut opts = HubOptions::new(paths, dir.join("state"), dir.clone());
+        opts.keychain = None;
+        opts.backoff = fast();
+        opts.poll = Duration::from_millis(50);
+        (McpHub::new(config, opts), dir)
+    };
+    // The chat's watcher looks at the versions file and the env_file too.
+    let watched = hub.watched_files();
+    assert!(watched.contains(&dir.join("e.env")), "{watched:?}");
+    assert!(
+        watched.contains(&dir.join("state/mcp-secret-versions.json")),
+        "{watched:?}"
+    );
+    hub.start();
+    hub.wait_started(true).await;
+    let pid = || async { pid_in(&call(&hub, "mcp__e__whereami", json!({})).await.unwrap()) };
+    let e1 = pid().await;
+
+    // (s has no secret here, so it is stopped and every reload retries it.)
+    let report = rewrite(&hub, &dir, &tables).await;
+    assert!(report.changed.is_empty(), "{report:?}");
+    assert_eq!(pid().await, e1);
+
+    // The env_file's contents changed: e restarts, s does not.
+    std::fs::write(dir.join("e.env"), "X=2\n").unwrap();
+    let report = rewrite(&hub, &dir, &tables).await;
+    assert_eq!(report.changed, vec!["e"], "{report:?}");
+    assert_eq!(
+        wait_status(&hub, "e", "ready", Duration::from_secs(20)).await,
+        ServerStatus::Ready
+    );
+    let e2 = pid().await;
+    assert_ne!(e2, e1);
+    assert!(wait_dead(e1, Duration::from_secs(10)).await);
+
+    // `mcp secret s` stored a new API_KEY: s restarts, e keeps its process.
+    amp_core::mcp_stamp::bump(&dir.join("state"), &["mcp:s:env:API_KEY"]).unwrap();
+    let report = rewrite(&hub, &dir, &tables).await;
+    assert_eq!(report.changed, vec!["s"], "{report:?}");
+    assert_eq!(pid().await, e2);
+    assert!(rewrite(&hub, &dir, &tables).await.changed.is_empty());
+    hub.shutdown().await;
+}
+
 async fn reload_restarts_only_changed_servers() {
     let tables = |b_extra: &str, with_c: bool, with_d: bool| {
         let mut t = stdio_table("a", "normal", "");
@@ -1346,6 +1514,7 @@ fn main() {
         instructions_are_in_the_system_prompt_after_amps,
         output_over_the_cap_is_saved_to_a_file,
         a_server_that_does_not_start_is_a_warning_not_a_failure,
+        sigterm_ends_the_run_and_its_server_trees,
         a_worker_gets_shared_tools_and_its_own_worktree_instance,
         restarts_with_backoff_after_the_server_dies,
         gives_up_after_repeated_failures_until_restarted,
@@ -1356,6 +1525,7 @@ fn main() {
         the_mcp_permission_shapes_a_roles_tools,
         a_denied_mcp_call_is_a_visible_error_in_run_p,
         reload_restarts_only_changed_servers,
+        reload_restarts_a_server_after_a_secret_or_env_file_change,
         reload_retries_a_server_that_needed_a_login,
         runtime_reload_adds_and_removes_servers_for_a_live_session,
     ];
