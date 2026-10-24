@@ -746,6 +746,84 @@ impl fmt::Display for ProbeError {
     }
 }
 
+impl ProbeError {
+    /// What is wrong with the endpoint's certificate, when the TLS failure was the certificate
+    /// check (#2333); `None` for any other failure (mTLS refusals, https to an http port, ...).
+    pub fn cert_problem(&self) -> Option<CertProblem> {
+        if self.failure != ProbeFailure::Tls {
+            return None;
+        }
+        CertProblem::classify(&self.message)
+    }
+}
+
+/// Why the endpoint's certificate was not accepted (#2333).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertProblem {
+    /// Signed by a CA this machine does not trust (a private or company CA, or self-signed).
+    UnknownIssuer,
+    /// Expired, or not valid yet (also a wrong clock here).
+    Expired,
+    /// Issued for another host name.
+    NameMismatch,
+}
+
+impl CertProblem {
+    /// Reads rustls' (and the OS verifier's) wording: `invalid peer certificate: UnknownIssuer`,
+    /// `certificate expired: …`, `certificate not valid for name "…"`, `NotValidForName`, ...
+    pub fn classify(text: &str) -> Option<Self> {
+        let lower = text.to_ascii_lowercase();
+        let has = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
+        // The server refusing *our* client certificate is not a problem with its certificate.
+        if has(&[
+            "received fatal alert",
+            "certificaterequired",
+            "certificate required",
+        ]) {
+            return None;
+        }
+        if has(&["notvalidforname", "not valid for name", "name mismatch"]) {
+            Some(Self::NameMismatch)
+        } else if has(&["expired", "notvalidyet", "not valid yet"]) {
+            Some(Self::Expired)
+        } else if has(&[
+            "unknownissuer",
+            "unknown issuer",
+            "self signed",
+            "self-signed",
+            "unable to get local issuer",
+            "not trusted",
+            "untrusted",
+        ]) {
+            Some(Self::UnknownIssuer)
+        } else {
+            None
+        }
+    }
+
+    /// One sentence naming the problem for `host` ("api.example.com's certificate isn't trusted:
+    /// it's signed by a CA this machine doesn't know."). `ca_file` is the CA bundle the provider
+    /// already has, if any.
+    pub fn sentence(self, host: &str, ca_file: Option<&std::path::Path>) -> String {
+        match (self, ca_file) {
+            (Self::UnknownIssuer, None) => format!(
+                "{host}'s certificate isn't trusted: it's signed by a CA this machine doesn't know."
+            ),
+            (Self::UnknownIssuer, Some(ca)) => format!(
+                "{host}'s certificate isn't trusted: it isn't signed by the CA in {}.",
+                ca.display()
+            ),
+            (Self::Expired, _) => format!(
+                "{host}'s certificate isn't valid now: it has expired (or this machine's clock is \
+                 wrong)."
+            ),
+            (Self::NameMismatch, _) => {
+                format!("{host}'s certificate isn't trusted: it was issued for another host name.")
+            }
+        }
+    }
+}
+
 /// What a probe found.
 #[derive(Debug, Clone, Default)]
 pub struct Probe {
@@ -911,6 +989,55 @@ pub fn format_unix(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2333: rustls' wording for each certificate problem; mTLS refusals are not one.
+    #[test]
+    fn certificate_problems_are_recognised() {
+        let tls = |message: &str| ProbeError {
+            failure: ProbeFailure::Tls,
+            status: None,
+            message: message.to_owned(),
+        };
+        for (text, want) in [
+            (
+                "request: error sending request for url (https://h/v1/models): client error \
+                 (Connect): invalid peer certificate: UnknownIssuer",
+                Some(CertProblem::UnknownIssuer),
+            ),
+            (
+                "invalid peer certificate: certificate expired: verification time 2 (UNIX), but \
+                 certificate is not valid after 1 (1 seconds ago)",
+                Some(CertProblem::Expired),
+            ),
+            (
+                "invalid peer certificate: certificate not valid yet: verification time 1",
+                Some(CertProblem::Expired),
+            ),
+            (
+                "invalid peer certificate: certificate not valid for name \"localhost\"; \
+                 certificate is only valid for other.example.com",
+                Some(CertProblem::NameMismatch),
+            ),
+            (
+                "invalid peer certificate: NotValidForName",
+                Some(CertProblem::NameMismatch),
+            ),
+            ("received fatal alert: CertificateRequired", None),
+            ("received fatal alert: UnknownCA", None),
+            ("received corrupt message of type InvalidContentType", None),
+        ] {
+            assert_eq!(tls(text).cert_problem(), want, "{text}");
+        }
+        // Only a TLS failure is a certificate problem.
+        let mut network = tls("invalid peer certificate: UnknownIssuer");
+        network.failure = ProbeFailure::Network;
+        assert_eq!(network.cert_problem(), None);
+        assert_eq!(
+            CertProblem::UnknownIssuer.sentence("api.example.com", None),
+            "api.example.com's certificate isn't trusted: it's signed by a CA this machine \
+             doesn't know."
+        );
+    }
 
     #[test]
     fn query_and_model_placeholder_urls() {
