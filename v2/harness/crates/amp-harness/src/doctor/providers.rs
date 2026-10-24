@@ -512,6 +512,13 @@ fn probe_finding(
             };
             Finding::new(serious, format!("{} {why} {what}", amp_mcp::redact_url(&p.base_url))).fix(fix)
         }
+        // #2333: an unknown CA, an expired certificate or another host's name: one sentence and
+        // the fix `connect` gives too; the raw cause only with --verbose (doctor prints it).
+        ProbeFailure::Tls if e.cert_problem().is_some() => {
+            let problem = e.cert_problem().expect("checked");
+            Finding::new(serious, crate::connect::cert_sentence(p, problem))
+                .fix(crate::connect::cert_fix(p, problem))
+        }
         ProbeFailure::Tls => {
             let mtls = ["certificaterequired", "certificate required", "badcertificate", "bad certificate", "handshakefailure", "unknownca"]
                 .iter()
@@ -874,7 +881,18 @@ mod tests {
             true,
             "",
         );
-        assert!(f.fix.as_deref().unwrap().contains("ca_file"), "{f:?}");
+        // #2333: one sentence, and the --ca-file fix.
+        assert_eq!(
+            f.detail,
+            "gw.example's certificate isn't trusted: it's signed by a CA this machine doesn't know."
+        );
+        assert!(
+            f.fix
+                .as_deref()
+                .unwrap()
+                .contains("`amp-harness connect gw --ca-file /path/corp-root.pem`"),
+            "{f:?}"
+        );
         let f = probe_finding(
             gw,
             &e(

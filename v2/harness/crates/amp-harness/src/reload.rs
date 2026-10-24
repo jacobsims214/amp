@@ -108,15 +108,25 @@ impl Live {
         }
         let providers = self.rt.current_providers();
         let models = crate::chat::model_choices(&self.rt.current_models(), &providers);
-        let switch_to = report
+        let mut stays = None;
+        let mut switch_to = report
             .model_change(&self.role)
             .and(refreshed.resolved.as_ref())
             .map(|r| r.model_ref());
+        // The role moved to a model this process can't use (its provider has no key here):
+        // the chat stays where it is, and says why (#2334).
+        if let Some(target) = &switch_to
+            && !models.iter().any(|m| &m.reference == target)
+        {
+            stays = Some(stays_reason(&self.role, target, &providers));
+            switch_to = None;
+        }
         Ok(ReloadReply {
             lines,
             providers: providers.all(),
             models,
             switch_to,
+            stays,
             warnings: Vec::new(),
         })
     }
@@ -126,6 +136,27 @@ impl ReloadControl for ChatReload {
     fn reload(&self) -> ReloadFuture {
         Box::pin(Arc::clone(&self.0).run())
     }
+}
+
+/// Why a chat whose `role` moved to `target` (`provider/model`) stays on its model:
+/// `providers` can't serve `target` here.
+fn stays_reason(role: &str, target: &str, providers: &amp_core::providers::ProviderSet) -> String {
+    let provider = target.split_once('/').map_or(target, |(p, _)| p);
+    let why = match providers.unavailable().get(provider) {
+        // `no key: missing (set X_API_KEY, or store it with `amp-harness connect`)`.
+        Some(why) => match why.strip_prefix("no key: ") {
+            Some(key) => {
+                let how = key
+                    .strip_prefix("missing (")
+                    .and_then(|k| k.strip_suffix(')'))
+                    .unwrap_or(key);
+                format!("{provider} has no key here ({how}, then /reload)")
+            }
+            None => format!("{provider} is unavailable here ({why})"),
+        },
+        None => format!("{target} isn't available here"),
+    };
+    format!("{role} moved to {target}, but {why}")
 }
 
 /// Whether the watcher runs: on unless [`ENV_AUTO_RELOAD`] says no.

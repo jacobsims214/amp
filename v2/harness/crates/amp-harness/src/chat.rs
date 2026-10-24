@@ -285,6 +285,10 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     for line in crate::trust_cmd::warnings(&session.rt.repo_untrusted()) {
         shell.view().add_warning(&line);
     }
+    // #2331: a repo MCP server ignored because one of the person's own has its name says so.
+    for line in session.rt.mcp_hub.config().shadow_warnings() {
+        shell.view().add_warning(&line);
+    }
     // #2241: repo MCP servers left untrusted say so (and how to trust them) in the transcript.
     for u in session.rt.mcp_hub.untrusted() {
         shell.view().add_warning(&format!(
@@ -402,16 +406,21 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Puts each MCP hub change in the transcript until the hub goes away.
+/// Puts each MCP hub change in the transcript until the hub goes away. A server's failure is
+/// shown once, and again only when it changes (#2334): every reload retries a stopped server.
 async fn forward_mcp_events(
     mut rx: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
     notes: amp_tui::Notifier,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+    let mut shown = amp_core::mcp_hub::FailureLog::default();
     loop {
         match rx.recv().await {
-            Ok(event) if event.is_error() => notes.error(event.line()),
-            Ok(event) => notes.notice(event.line()),
+            Ok(event) => match shown.line(&event) {
+                Some(line) if event.is_error() => notes.error(line),
+                Some(line) => notes.notice(line),
+                None => {}
+            },
             Err(RecvError::Lagged(_)) => continue,
             Err(RecvError::Closed) => break,
         }

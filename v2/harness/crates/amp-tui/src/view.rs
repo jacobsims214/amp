@@ -445,40 +445,30 @@ impl ChatView {
         true
     }
 
+    /// A notice, warning or error: one blank row above and below it, so a run of them has one
+    /// blank row between each, not two (#2334).
+    fn add_line(&self, text: &str, color: rpi_tui::theme::Color) {
+        self.end_group();
+        self.scroll.touch();
+        let top = !self.transcript_ends_blank();
+        self.transcript.add_child(Arc::new(
+            WrapText::new(theme_glyphs(text, color), 1, 1).with_top_padding(top),
+        ));
+    }
+
     /// A dim one-off line in the transcript (command output, run outcome).
     pub fn add_notice(&self, text: &str) {
-        self.end_group();
-        let colors = theme().colors;
-        self.scroll.touch();
-        self.transcript.add_child(Arc::new(WrapText::new(
-            theme_glyphs(text, colors.dim),
-            1,
-            1,
-        )));
+        self.add_line(text, theme().colors.dim);
     }
 
     /// A warning line in the transcript (something the person should decide on).
     pub fn add_warning(&self, text: &str) {
-        self.end_group();
-        let colors = theme().colors;
-        self.scroll.touch();
-        self.transcript.add_child(Arc::new(WrapText::new(
-            theme_glyphs(text, colors.warning),
-            1,
-            1,
-        )));
+        self.add_line(text, theme().colors.warning);
     }
 
     /// An error line in the transcript.
     pub fn add_error(&self, text: &str) {
-        self.end_group();
-        let colors = theme().colors;
-        self.scroll.touch();
-        self.transcript.add_child(Arc::new(WrapText::new(
-            theme_glyphs(text, colors.error),
-            1,
-            1,
-        )));
+        self.add_line(text, theme().colors.error);
     }
 
     /// Shows or hides pi's working spinner in the editor's top border.

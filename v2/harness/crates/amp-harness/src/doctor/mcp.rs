@@ -33,6 +33,8 @@ pub struct McpReport {
     pub servers: Vec<ServerReport>,
     /// Tables that did not load, with their errors.
     pub broken: Vec<BrokenReport>,
+    /// Repo servers ignored because one of the person's own has the same name (#2331).
+    pub shadowed: Vec<ShadowReport>,
     /// Ready servers out of the enabled, trusted ones that were connected.
     pub ready: usize,
     pub checked: usize,
@@ -74,6 +76,16 @@ pub struct RoleAccess {
     pub tools: Option<usize>,
     /// Why not all: `roles filter` or `mcp policy`.
     pub why: Option<&'static str>,
+}
+
+/// A repo `[mcp.<name>]` left out for the person's own `<name>`: theirs runs, the repo's never
+/// starts.
+#[derive(Debug, Serialize)]
+pub struct ShadowReport {
+    pub name: String,
+    pub repo_file: String,
+    pub user_file: String,
+    pub warning: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +203,25 @@ pub async fn check(
             problems,
         });
     }
+    // #2331: a repo server ignored because one of the person's own has its name.
+    for sh in &config.shadowed {
+        let name = &sh.name;
+        out.push((
+            format!("mcp:{name}:repo"),
+            Finding::new(CheckStatus::Warn, sh.warning()).fix(format!(
+                "rename [mcp.{name}] in {} (e.g. [mcp.{name}-repo]) to use both, or remove \
+                 [mcp.{name}] from {} to use the repo's",
+                sh.repo_file.display(),
+                sh.user_file.display()
+            )),
+        ));
+        report.shadowed.push(ShadowReport {
+            name: name.clone(),
+            repo_file: sh.repo_file.display().to_string(),
+            user_file: sh.user_file.display().to_string(),
+            warning: sh.warning(),
+        });
+    }
     let enabled = config.servers.values().filter(|s| s.enabled).count();
     let summary = if offline {
         Finding::new(
@@ -208,6 +239,13 @@ pub async fn check(
         }
         if !config.broken.is_empty() {
             detail.push_str(&format!(", {} with errors", config.broken.len()));
+        }
+        if !config.shadowed.is_empty() {
+            detail.push_str(&format!(
+                ", {} repo server{} ignored (same name as yours)",
+                config.shadowed.len(),
+                if config.shadowed.len() == 1 { "" } else { "s" }
+            ));
         }
         if let Some(p) = &probe {
             detail.push_str(&format!(" (connected in {} ms)", p.elapsed.as_millis()));

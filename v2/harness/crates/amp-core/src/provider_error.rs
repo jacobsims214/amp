@@ -80,6 +80,11 @@ pub fn summarize(provider: &str, raw: &str) -> String {
             clip(&one_line(strip_transport(rest)))
         );
     }
+    // rpi's `Provider finish_reason: <reason>`: the stream ended with a reason it doesn't take
+    // as a normal end (#2334). OpenRouter sends `error` when the upstream failed mid-reply.
+    if let Some(reason) = raw.strip_prefix("Provider finish_reason:") {
+        return finish_reason(&label, reason.trim());
+    }
     // A mid-stream error body (`{"error":{...}}`) or plain text.
     if raw.starts_with('{') {
         let message = body_message(raw);
@@ -88,6 +93,24 @@ pub fn summarize(provider: &str, raw: &str) -> String {
         }
     }
     clip(&one_line(&redact(raw)))
+}
+
+/// A reply the provider ended with `reason` (its `finish_reason`), with a next step.
+fn finish_reason(label: &str, reason: &str) -> String {
+    match reason {
+        "error" | "" => {
+            format!("{label} ended the reply with an error; try again, or /model to switch.")
+        }
+        "content_filter" => format!(
+            "{label} stopped the reply (its content filter); rephrase the request, or /model to \
+             switch."
+        ),
+        other => format!(
+            "{label} ended the reply unexpectedly (finish_reason {}); try again, or /model to \
+             switch.",
+            clip(&one_line(other))
+        ),
+    }
 }
 
 /// A failed run's error (rpi's `HarnessRunOutcome::Failed { error, final_message }`) as one line.
@@ -288,6 +311,25 @@ mod tests {
 
     /// QA pass 1's body (#2173), as rpi formats it.
     const QA_400: &str = r#"http error 400: {"error":{"message":"messages[9]: tool messages must include a non-empty string tool_call_id","code":400,"metadata":{"provider_name":null,"previous_errors":[{"message":"messages[9]: tool messages must include a non-empty string tool_call_id","code":400},{"message":"messages[9]: tool messages must include a non-empty string tool_call_id","code":400},{"message":"messages[9]: tool messages must include a non-empty string tool_call_id","code":400},{"message":"messages[9]: tool messages must include a non-empty string tool_call_id","code":400}]}},"user_id":"user_3FPq9ZxAbCdEf"}"#;
+
+    /// #2334: QA pass 3's first manager turn ended "Provider finish_reason: error".
+    #[test]
+    fn a_finish_reason_is_a_sentence_with_a_next_step() {
+        assert_eq!(
+            summarize("openrouter", "Provider finish_reason: error"),
+            "OpenRouter ended the reply with an error; try again, or /model to switch."
+        );
+        assert_eq!(
+            summarize("", "Provider finish_reason: content_filter"),
+            "The provider stopped the reply (its content filter); rephrase the request, or \
+             /model to switch."
+        );
+        assert_eq!(
+            summarize("example", "Provider finish_reason: weird"),
+            "example ended the reply unexpectedly (finish_reason weird); try again, or /model \
+             to switch."
+        );
+    }
 
     #[test]
     fn openrouter_400_is_one_sentence() {

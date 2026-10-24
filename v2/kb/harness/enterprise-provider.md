@@ -349,13 +349,17 @@ Running `connect example` again with endpoint flags (`--ca-file`, `--header`, `-
 and so on) changes only what you give. The provider's models (including ones added with `models
 set --no-check`) and its other settings stay, and `connect` prints what changed.
 
-**TLS / a corporate CA.** "unknown CA" or a certificate error means the endpoint uses your
+**TLS / a corporate CA.** `connect`, the first run and doctor's `models:example` say it in one
+sentence, e.g. "api.example.com's certificate isn't trusted: it's signed by a CA this machine
+doesn't know." (add `--verbose` to see the full TLS error). It means the endpoint uses your
 company's certificate authority. Give the CA bundle once:
-`amp-harness connect example --ca-file /etc/ssl/corp-root.pem`. In a preset, put
+`amp-harness connect example --ca-file /etc/ssl/corp-root.pem`. An expired certificate or one
+issued for another host name is said as such; a CA bundle won't fix those. In a preset, put
 `ca_file = "/etc/ssl/corp-root.pem"`, a path that exists on each machine. The bundle is added to
 the OS trust store, which is always used too. If the endpoint asks for a client certificate, add
 `--client-cert me.pem --client-key me.key` (`--store-client-key` keeps the key in the keychain).
-The first run asks for a CA or certificate only when the endpoint fails without one.
+The first run asks for a CA bundle (or a client certificate) only when the endpoint fails without
+one.
 
 **A proxy.** `HTTPS_PROXY` and `NO_PROXY` apply by default. For this endpoint only, use
 `--proxy http://proxy.example.com:3128` (or `--proxy direct`). A proxy password goes in

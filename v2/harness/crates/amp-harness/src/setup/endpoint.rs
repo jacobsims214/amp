@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 
 use amp_core::{
     models::{ModelsConfig, ProviderAuth, ProviderConfig},
-    provider_auth::{ProbeFailure, ProbeKind, probe},
+    provider_auth::{CertProblem, ProbeError, ProbeFailure, ProbeKind, probe},
     providers::StaticKeys,
 };
 
@@ -243,6 +243,7 @@ async fn ask_key(
                 KeyCheck::Unknown(why) => ui.say(&format!(
                     "  Could not reach {name} ({why}); going on without a key."
                 )),
+                KeyCheck::Untrusted(message) => ui.say(&format!("  {message}")),
             }
             return Ok((String::new(), false));
         }
@@ -285,6 +286,10 @@ async fn ask_models(
                 ui.say(&format!("  {id}"));
             }
             ids
+        }
+        Err(connect::ListError::Untrusted(m)) => {
+            ui.say(&m);
+            Vec::new()
         }
         Err(e) => {
             ui.say(&format!("Could not list its models ({e})."));
@@ -468,11 +473,24 @@ async fn ask_transport(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), Cli
                     .filter(|k| !k.is_empty())
                     .map(|k| absolute_path(&k));
             }
+            // #2333: an expired certificate or another host's name: a CA would not help.
+            _ if matches!(
+                failure.cert_problem(),
+                Some(CertProblem::Expired | CertProblem::NameMismatch)
+            ) =>
+            {
+                ui.say(&format!("  {}", cert_text(&p, &failure)));
+                return Ok(());
+            }
             ProbeFailure::Tls | ProbeFailure::Config if spec.auth.ca_file.is_none() => {
-                ui.say(&format!(
-                    "  Its TLS certificate is not trusted here ({}).",
-                    failure.message
-                ));
+                if failure.cert_problem().is_some() {
+                    ui.say(&format!("  {}", cert_sentence(&p, &failure)));
+                } else {
+                    ui.say(&format!(
+                        "  Its TLS certificate is not trusted here ({}).",
+                        failure.message
+                    ));
+                }
                 let ca = ui.ask(
                     "CA bundle that signed it (PEM file, Enter to skip)",
                     Some(""),
@@ -492,7 +510,9 @@ async fn ask_transport(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), Cli
                 spec.auth.proxy = Some(proxy.trim().to_owned());
             }
             _ => {
-                if matches!(failure.failure, ProbeFailure::Tls | ProbeFailure::Config) {
+                if failure.cert_problem().is_some() {
+                    ui.say(&format!("  {}", cert_text(&p, &failure)));
+                } else if matches!(failure.failure, ProbeFailure::Tls | ProbeFailure::Config) {
                     ui.say(&format!("  Still failing: {}", failure.message));
                 }
                 return Ok(());
@@ -508,6 +528,27 @@ async fn ask_transport(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), Cli
         }
     }
     Ok(())
+}
+
+/// The certificate sentence alone (the question that follows is the fix), with the cause under
+/// it only with --verbose.
+fn cert_sentence(p: &ProviderConfig, failure: &ProbeError) -> String {
+    let Some(problem) = failure.cert_problem() else {
+        return failure.message.clone();
+    };
+    let mut text = connect::cert_sentence(p, problem);
+    if crate::conn::verbose() {
+        text.push_str(&format!(
+            "\n    cause: {}",
+            amp_mcp::redact_urls(&failure.message)
+        ));
+    }
+    text
+}
+
+/// The certificate sentence and its fix ([`connect::cert_message`]).
+fn cert_text(p: &ProviderConfig, failure: &ProbeError) -> String {
+    connect::cert_message(p, failure).unwrap_or_else(|| failure.message.clone())
 }
 
 fn absolute_path(p: &str) -> String {
