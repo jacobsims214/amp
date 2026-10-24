@@ -251,6 +251,43 @@ shell_word() {
     esac
 }
 
+# The user config directory (amp-harness's own rule: AMP_HARNESS_CONFIG_DIR, else XDG, else ~/.config).
+config_dir() {
+    printf '%s\n' "${AMP_HARNESS_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/amp-harness}"
+}
+
+# True when PATH points into a Homebrew keg (…/Cellar/amp-harness/…), itself or through the
+# symlink Homebrew puts in its bin directory (#2336: a plain file is not Homebrew's).
+from_homebrew() {
+    case "$1" in */Cellar/"$BIN"/*) return 0 ;; esac
+    [ -L "$1" ] && has readlink || return 1
+    case "$(readlink "$1" 2>/dev/null)" in */Cellar/"$BIN"/*) return 0 ;; esac
+    return 1
+}
+
+# How to remove another amp-harness at PATH (not the one this script manages).
+removal_hint() {
+    if from_homebrew "$1"; then
+        printf 'brew uninstall %s' "$BIN"
+    else
+        printf 'install.sh --uninstall --prefix %s, or rm %s' "$(shell_word "$(dirname "$1")")" "$(shell_word "$1")"
+    fi
+}
+
+# The first amp-harness on this shell's PATH other than PATH_ARG, or nothing.
+other_on_path() {
+    (
+        IFS=:
+        for d in $PATH; do
+            [ -n "$d" ] || continue
+            if [ -x "$d/$BIN" ] && [ ! -d "$d/$BIN" ] && [ "$d/$BIN" != "$1" ]; then
+                echo "$d/$BIN"
+                break
+            fi
+        done
+    )
+}
+
 uninstall() {
     prefix=$1
     path="$prefix/$BIN"
@@ -262,9 +299,9 @@ uninstall() {
         say "No $BIN in $prefix; nothing to remove (pass --prefix DIR if you installed it elsewhere)."
     fi
     if other=$(command -v "$BIN" 2>/dev/null) && [ -n "$other" ] && [ "$other" != "$path" ]; then
-        say "Another $BIN is still on your PATH: $other (Homebrew: brew uninstall $BIN)."
+        say "Another $BIN is still on your PATH: $other (to remove it: $(removal_hint "$other"))."
     fi
-    config_dir=${AMP_HARNESS_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/amp-harness}
+    config_dir=$(config_dir)
     say ""
     say "Kept, in case you reinstall:"
     say "  - your settings: $config_dir (config.toml, and credentials.json if keys were kept in a file)"
@@ -418,6 +455,20 @@ main() {
         say "Updated $BIN $old → $new at $prefix/$BIN"
     fi
 
+    # #2336: a shell that already ran another amp-harness (zsh, bash and sh remember where a
+    # command was found) keeps running that one until its cache is cleared.
+    other=$(other_on_path "$prefix/$BIN")
+    if [ -n "$other" ]; then
+        current=$(command -v "$BIN" 2>/dev/null || true)
+        if [ "$current" = "$other" ]; then
+            say "Note: \`$BIN\` in this shell runs $other, not this one. Remove it"
+            say "  ($(removal_hint "$other")) or put $prefix first on PATH, then run \`hash -r\` (zsh: \`rehash\`)."
+        else
+            say "Note: another $BIN is on your PATH ($other). A shell that ran it before may keep"
+            say "  running it: run \`hash -r\` (zsh: \`rehash\`) or open a new terminal."
+        fi
+    fi
+
     on_path=0
     if [ "$path_check" = 1 ]; then
         check_path "$prefix" "$modify_path"
@@ -453,6 +504,12 @@ main() {
                 ;;
         esac
         say "Skipped. Run \`$setup_cmd\` when you're ready; \`$cmd doctor\` checks the setup."
+        return 0
+    fi
+    # #2336: already set up here (a config, no new preset): nothing to set up again.
+    if [ -z "$preset" ] && [ -f "$(config_dir)/config.toml" ]; then
+        say "Your settings ($(config_dir)), saved keys and AMP logins were kept; \`$cmd doctor\` checks"
+        say "them. Run \`$setup_cmd\` in a project directory that isn't linked to AMP yet."
         return 0
     fi
     say "Next: run \`$setup_cmd\` in your project directory. It signs you in to AMP, links the folder to"

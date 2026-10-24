@@ -381,6 +381,54 @@ async fn agents_crud_at_user_and_repo_scope() {
     );
 }
 
+/// #2336: `models set` on an agent made with `agents new` doesn't call it a new role, and
+/// `agents list` names the config file, not its whole path (lines stay short).
+#[tokio::test]
+async fn models_set_on_a_new_agent_and_a_short_agents_list() {
+    let dir = setup("models-set-new-agent");
+    ok(&cli(&dir, &["agents", "new", "sql-expert"]).await, "new");
+
+    let out = cli(
+        &dir,
+        &["models", "set", "sql-expert", "wf/wf-2", "--no-check"],
+    )
+    .await;
+    ok(&out, "models set sql-expert");
+    let all = format!("{}{}", out.stdout, out.stderr);
+    assert!(!all.contains("is a new role"), "{all}");
+
+    let out = cli(&dir, &["models", "set", "ghost", "wf/wf-2", "--no-check"]).await;
+    ok(&out, "models set ghost");
+    let all = format!("{}{}", out.stdout, out.stderr);
+    assert!(all.contains("`ghost` is a new role"), "{all}");
+
+    let out = cli(&dir, &["agents", "list"]).await;
+    ok(&out, "list");
+    let home = dir.join("home").display().to_string();
+    assert!(
+        !out.stdout
+            .lines()
+            .take_while(|l| !l.is_empty())
+            .any(|l| l.contains(&home)),
+        "{}",
+        out.stdout
+    );
+    let row = out
+        .stdout
+        .lines()
+        .find(|l| l.starts_with("sql-expert "))
+        .unwrap_or_else(|| panic!("{}", out.stdout));
+    assert!(row.contains("config config.toml"), "{row}");
+    let width = out
+        .stdout
+        .lines()
+        .take_while(|l| !l.is_empty())
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap();
+    assert!(width < 160, "{width} columns:\n{}", out.stdout);
+}
+
 #[tokio::test]
 async fn skills_crud_at_user_and_repo_scope() {
     let dir = setup("skills-crud");

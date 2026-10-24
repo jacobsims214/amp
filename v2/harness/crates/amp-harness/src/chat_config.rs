@@ -1803,8 +1803,8 @@ fn fallback_setting(f: &amp_core::models::FallbackModel) -> String {
 }
 
 /// `config /Users/x/.config/amp-harness/config.toml` -> `config config.toml`; the panels show
-/// the full paths under /config.
-fn short_source(source: &str) -> String {
+/// the full paths under /config (and `agents list --json`).
+pub(crate) fn short_source(source: &str) -> String {
     let mut out = String::new();
     for word in source.split(' ') {
         if !out.is_empty() {

@@ -484,6 +484,13 @@ fn print_human(r: &Report) {
 
 /// The ROLE / PROVIDER/MODEL / THINKING / READY / SOURCE table (`config show`, `connect`).
 pub fn print_roles(r: &Report) {
+    print!("{}", roles_table(r));
+}
+
+/// [`print_roles`]' text. THINKING is as wide as its widest cell, so "off (asked low)" keeps
+/// READY and SOURCE in line (#2336).
+fn roles_table(r: &Report) -> String {
+    use std::fmt::Write as _;
     let width = r
         .roles
         .iter()
@@ -494,47 +501,66 @@ pub fn print_roles(r: &Report) {
                 .map(|(p, m)| p.len() + m.len() + 1)
         })
         .max()
-        .unwrap_or(20);
+        .unwrap_or(20)
+        .max("PROVIDER/MODEL".len());
+    let thinking_of = |role: &RoleReport| {
+        let mut thinking = role.thinking.unwrap_or("-").to_owned();
+        if let Some(req) = role.requested_thinking
+            && req != "unset"
+        {
+            thinking = format!("{thinking} (asked {req})");
+        }
+        thinking
+    };
+    let think_w = r
+        .roles
+        .iter()
+        .filter(|x| x.provider.is_some() && x.model.is_some())
+        .map(|x| thinking_of(x).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(8);
     let ready_w = if r.roles.iter().any(|x| x.live.is_some()) {
         22
     } else {
         7
     };
-    println!(
-        "  {:<18} {:<width$}  {:<8} {:<ready_w$} SOURCE",
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  {:<18} {:<width$}  {:<think_w$} {:<ready_w$} SOURCE",
         "ROLE", "PROVIDER/MODEL", "THINKING", "READY"
     );
     for role in &r.roles {
         match (&role.provider, &role.model) {
             (Some(p), Some(m)) => {
-                let mut thinking = role.thinking.unwrap_or("-").to_owned();
-                if let Some(req) = role.requested_thinking
-                    && req != "unset"
-                {
-                    thinking = format!("{thinking} (asked {req})");
-                }
                 let mut ready = if role.ready { "yes" } else { "no key" }.to_owned();
                 match role.live {
                     Some(true) => ready.push_str(", live ok"),
                     Some(false) => ready.push_str(", NOT IN CATALOG"),
                     None => {}
                 }
-                println!(
-                    "  {:<18} {:<width$}  {:<8} {:<ready_w$} {}",
+                let _ = writeln!(
+                    out,
+                    "  {:<18} {:<width$}  {:<think_w$} {:<ready_w$} {}",
                     role.role,
                     format!("{p}/{m}"),
-                    thinking,
+                    thinking_of(role),
                     ready,
                     role.source.as_deref().unwrap_or("")
                 );
             }
-            _ => println!(
-                "  {:<18} ERROR: {}",
-                role.role,
-                role.error.as_deref().unwrap_or("unresolved")
-            ),
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "  {:<18} ERROR: {}",
+                    role.role,
+                    role.error.as_deref().unwrap_or("unresolved")
+                );
+            }
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -580,5 +606,44 @@ mod tests {
         assert_eq!(anthropic.key, "env");
         assert_eq!(anthropic.key_source, "env ANTHROPIC_API_KEY");
         assert!(anthropic.in_use);
+    }
+
+    /// #2336: "off (asked low)" is wider than THINKING; READY and SOURCE still line up.
+    #[test]
+    fn the_roles_table_columns_line_up_with_asked_thinking() {
+        let role = |name: &str, thinking, requested| RoleReport {
+            role: name.into(),
+            provider: Some("wf".into()),
+            model: Some("wf-1".into()),
+            thinking: Some(thinking),
+            requested_thinking: requested,
+            source: Some("config config.toml".into()),
+            fallback: None,
+            ready: true,
+            live: None,
+            error: None,
+        };
+        let report = Report {
+            ok: true,
+            config_file: None,
+            config_found: true,
+            repo_file: None,
+            mode: "profile",
+            selection: "x".into(),
+            selection_source: "test".into(),
+            profiles: vec![],
+            providers: vec![],
+            roles: vec![
+                role("manager", "high", None),
+                role("worker-docs", "off", Some("low")),
+            ],
+        };
+        let table = roles_table(&report);
+        let cols: Vec<usize> = table
+            .lines()
+            .map(|l| l.find("yes").or_else(|| l.find("READY")).unwrap())
+            .collect();
+        assert!(cols.windows(2).all(|w| w[0] == w[1]), "{table}");
+        assert!(table.contains("off (asked low) yes"), "{table}");
     }
 }

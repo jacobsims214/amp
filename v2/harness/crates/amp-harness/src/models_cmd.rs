@@ -527,6 +527,15 @@ async fn set(args: SetArgs) -> Result<(), CliError> {
     finish(&outcome, args.json)
 }
 
+/// True when an agent here (built-in, user or repo) runs as `role`: `agents new sql-expert`
+/// makes `sql-expert` a known role before any model is set for it (#2336).
+fn agent_exists(paths: &amp_mcp::ConfigPaths, role: &str) -> bool {
+    amp_core::assets::Assets::load(&amp_core::assets::OverrideDirs::from_paths(paths))
+        .ok()
+        .and_then(|a| amp_core::roles::RoleRegistry::from_assets(&a).ok())
+        .is_some_and(|r| r.get(role).is_some())
+}
+
 /// `models set` into `paths`' user (or repo) file, checked first; prints nothing. The CLI and the
 /// chat's `/model <role> <provider/model> --save` (#2245).
 pub(crate) async fn set_role_in(
@@ -552,6 +561,7 @@ pub(crate) async fn set_role_in(
             config.selection,
             amp_core::models::Selection::Inherit { .. }
         )
+        && !agent_exists(paths, &role)
     {
         warnings.push(format!(
             "`{role}` is a new role; it is used by an agent whose id is `{role}` or `amp-{role}`"

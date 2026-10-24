@@ -76,6 +76,20 @@ if [ -z "$(find "$T/p1" -name amp-harness -perm -0755)" ]; then bad "mode 0755";
 expect_ok "reinstall over an existing binary" sh "$install_sh" --archive "$archive" --prefix "$T/p1" --no-path-check
 out_has "says it is already up to date" "Reinstalled amp-harness $version at $T/p1/amp-harness (already up to date)"
 
+# Another amp-harness on this shell's PATH (#2336): a shell that hashed it keeps running it, so
+# install.sh says \`hash -r\`. A plain PATH (no person's own ~/.local/bin) for the case with none.
+clean_path=/usr/bin:/bin:/usr/sbin:/sbin
+stub "$T/plain" 0.0.1
+expect_ok "install with no other amp-harness on PATH" env PATH="$clean_path" sh "$install_sh" --archive "$archive" --prefix "$T/h1" --no-path-check
+if grep -qF "hash -r" "$T/out"; then bad "no hash -r note without another amp-harness"; else ok "no hash -r note without another amp-harness"; fi
+expect_ok "install while another amp-harness comes first on PATH" env PATH="$T/plain:$clean_path" sh "$install_sh" --archive "$archive" --prefix "$T/h1" --no-path-check
+out_has "says which one this shell runs" "Note: \`amp-harness\` in this shell runs $T/plain/amp-harness, not this one."
+out_has "says how to remove it" "(install.sh --uninstall --prefix $T/plain, or rm $T/plain/amp-harness) or put $T/h1 first on PATH"
+out_has "suggests hash -r / rehash" "then run \`hash -r\` (zsh: \`rehash\`)."
+expect_ok "install ahead of another amp-harness on PATH" env PATH="$T/h1:$T/plain:$clean_path" sh "$install_sh" --archive "$archive" --prefix "$T/h1" --no-path-check
+out_has "names the other one" "Note: another amp-harness is on your PATH ($T/plain/amp-harness)."
+out_has "suggests hash -r for a shell that hashed it" "running it: run \`hash -r\` (zsh: \`rehash\`) or open a new terminal."
+
 # Checksum failures install nothing.
 cp "$archive" "$T/tampered.tar.gz"
 cp "$archive.sha256" "$T/tampered.tar.gz.sha256"
@@ -167,6 +181,24 @@ out_has "says the saved keys are kept, and where" "items with service \"amp-harn
 if [ -f "$XDG_CONFIG_HOME/amp-harness/config.toml" ]; then ok "config left in place"; else bad "config left in place"; fi
 expect_ok "--uninstall again is a no-op" sh -c "cat '$install_sh' | sh -s -- --uninstall --prefix '$T/up'"
 out_has "says there is nothing to remove" "No amp-harness in $T/up; nothing to remove"
+
+# The other amp-harness left on PATH (#2336): Homebrew's only when it is in a Cellar keg.
+expect_ok "--uninstall with a plain amp-harness elsewhere on PATH" env PATH="$T/plain:$PATH" sh "$install_sh" --uninstall --prefix "$T/up"
+out_has "names the plain file and how to remove it" "Another amp-harness is still on your PATH: $T/plain/amp-harness (to remove it: install.sh --uninstall --prefix $T/plain, or rm $T/plain/amp-harness)."
+if grep -qF "brew" "$T/out"; then bad "a plain file is not called Homebrew's"; else ok "a plain file is not called Homebrew's"; fi
+stub "$T/brew/Cellar/amp-harness/0.0.1/bin" 0.0.1
+mkdir -p "$T/brew/bin"
+ln -s ../Cellar/amp-harness/0.0.1/bin/amp-harness "$T/brew/bin/amp-harness"
+expect_ok "--uninstall with Homebrew's amp-harness on PATH" env PATH="$T/brew/bin:$PATH" sh "$install_sh" --uninstall --prefix "$T/up"
+out_has "suggests brew uninstall for a Cellar keg" "Another amp-harness is still on your PATH: $T/brew/bin/amp-harness (to remove it: brew uninstall amp-harness)."
+
+# Reinstall/upgrade with no terminal where a config exists (#2336): kept, and doctor, not setup.
+expect_ok "install with no terminal on a machine already set up" sh "$install_sh" --archive "$archive" --prefix "$T/k1" --no-path-check
+out_has "says the settings, keys and logins were kept" "Your settings ($XDG_CONFIG_HOME/amp-harness), saved keys and AMP logins were kept; \`$T/k1/amp-harness doctor\` checks"
+if grep -qF "Next: run" "$T/out"; then bad "no setup step when already set up"; else ok "no setup step when already set up"; fi
+expect_ok "AMP_HARNESS_CONFIG_DIR is where the config is looked for" env AMP_HARNESS_CONFIG_DIR="$T/elsewhere" sh "$install_sh" --archive "$archive" --prefix "$T/k1" --no-path-check
+out_has "an empty config dir still gets the setup step" "Next: run \`$T/k1/amp-harness setup\`"
+rm -rf "$XDG_CONFIG_HOME/amp-harness"
 
 # --preset without a terminal: checked, made absolute, and printed in the next step.
 mkdir -p "$T/work"

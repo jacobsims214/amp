@@ -328,9 +328,12 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
                 a.mode.clone(),
                 a.origin.to_owned(),
                 a.model.clone().unwrap_or_else(|| "(none)".into()),
-                a.model_source
-                    .clone()
-                    .unwrap_or_else(|| a.model_error.clone().unwrap_or_default()),
+                // #2336: `config config.toml`, as /model roles shows it; the full paths are in
+                // --json and under the table.
+                a.model_source.as_deref().map_or_else(
+                    || a.model_error.clone().unwrap_or_default(),
+                    crate::chat_config::short_source,
+                ),
                 if a.mode == "primary" {
                     "-".into()
                 } else if a.dispatchable {
