@@ -306,6 +306,15 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     // Opened as soon as the worker exists: the view then follows it live.
     r.until("both workers", |r| r.sup.sessions().len() == 2)
         .await;
+    // #2347: the manager's transcript scrolled up stays where it was across a session.
+    for n in 0..80 {
+        r.shell.view().add_notice(&format!("filler line {n}"));
+    }
+    r.screen();
+    r.shell.view().scroll().page_by(-1);
+    r.screen();
+    let before = r.shell.view().scroll().position();
+    assert!(!before.at_end, "{before:?}");
     r.shell.submit(&format!("/worker {A}")).await;
     assert_eq!(r.shell.viewing(), Some(A));
     r.until("the worker's bash call in its session", |r| {
@@ -326,7 +335,7 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
         !screen.contains("I should look around first."),
         "thinking is collapsed as in the main chat: {screen}"
     );
-    assert!(screen.contains("Esc back to the manager"), "{screen}");
+    assert!(screen.contains("Esc back to the chat"), "{screen}");
     // #2251: the session's bar, transcript and keys line sit inside the shared padding.
     for row in screen.lines().filter(|l| !l.trim().is_empty()) {
         assert!(
@@ -338,6 +347,16 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
         !screen.contains("run both tickets"),
         "the manager's transcript is not shown: {screen}"
     );
+
+    // #2347: Esc restores the manager's scroll position; the session opens again.
+    assert!(r.press(KeyCode::Esc).await);
+    r.screen();
+    let after = r.shell.view().scroll().position();
+    assert_eq!(after.top, before.top, "{before:?} {after:?}");
+    assert!(!after.at_end);
+    r.shell.view().scroll().to_end();
+    r.shell.submit(&format!("/worker {A}")).await;
+    assert_eq!(r.shell.viewing(), Some(A));
 
     // Switch to the other worker and back.
     assert!(r.press(KeyCode::Tab).await);
@@ -408,7 +427,10 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     assert!(r.press(KeyCode::Esc).await);
     assert_eq!(r.shell.viewing(), None);
     let screen = r.screen();
-    assert!(screen.contains("run both tickets"), "{screen}");
+    assert!(
+        screen.contains("filler line 79"),
+        "the manager's transcript: {screen}"
+    );
     assert!(
         screen.contains(&format!(
             "stopping the worker on #{A} (stopped by {PERSON} from the chat)"
@@ -430,9 +452,26 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
         .view()
         .chrome()
         .set_workers(Arc::new(move || sup.workers()));
+    // #2347: o in a session opens its ticket in AMP's web UI.
+    let opened: Arc<Mutex<Vec<String>>> = Arc::default();
+    let sink = Arc::clone(&opened);
+    r.shell.set_opener(Arc::new(move |url: &str| {
+        sink.lock().unwrap().push(url.to_owned());
+        Ok(())
+    }));
+    r.shell.submit(&format!("/worker {B}")).await;
+    assert!(r.press(KeyCode::Char('o')).await);
+    assert_eq!(
+        *opened.lock().unwrap(),
+        vec![format!(
+            "https://amp.simstech.cloud/project/2/board?task={B}"
+        )]
+    );
+    assert_eq!(r.shell.viewing(), Some(B), "o keeps the session open");
+    assert!(r.press(KeyCode::Esc).await);
     r.shell.submit("/workers").await;
     assert!(
-        r.screen().contains("Enter watch · x stop"),
+        r.screen().contains("Enter or click watch · x stop"),
         "{}",
         r.screen()
     );

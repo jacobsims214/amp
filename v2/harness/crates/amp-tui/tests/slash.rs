@@ -407,7 +407,10 @@ async fn help_keys_follow_mouse_capture() {
     assert!(!off.iter().any(|r| r.contains("Fn/⌥-drag")), "{off:?}");
     assert_eq!(keys(true), KEYS.to_vec());
     assert_eq!(keys(false).last(), Some(&DRAG_KEY));
-    assert_eq!(keys(false).len(), KEYS.len());
+    // #2347: clicking a worker needs mouse reporting, so its row goes too.
+    assert_eq!(keys(false).len(), KEYS.len() - 1);
+    assert!(keys(true).iter().any(|(k, _)| *k == "click"));
+    assert!(!keys(false).iter().any(|(k, _)| *k == "click"));
     snapshot("help-80", &on);
     snapshot("help-80-mouse-off", &off);
 }
