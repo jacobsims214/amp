@@ -1084,7 +1084,13 @@ pub struct ToolBlock {
     inner: Mutex<ToolInner>,
     display: Arc<ToolDisplay>,
     cache: Mutex<Option<ToolRows>>,
+    /// A row under the line drawn fresh on every frame (#2347: what a dispatched worker is for
+    /// and how it is doing).
+    live_row: Mutex<Option<LiveRow>>,
 }
+
+/// [`ToolBlock::set_live_row`]'s source: the row's text at a width, or `None` for no row.
+pub type LiveRow = Arc<dyn Fn(usize) -> Option<String> + Send + Sync>;
 
 impl ToolBlock {
     /// `title` is shown bold; `args` is the call's most telling argument (one line).
@@ -1111,7 +1117,30 @@ impl ToolBlock {
             }),
             display,
             cache: Mutex::new(None),
+            live_row: Mutex::new(None),
         }
+    }
+
+    /// A row under the call's line, drawn fresh every frame behind a `│` gutter (#2347).
+    pub fn set_live_row(&self, row: LiveRow) {
+        *self.live_row.lock().unwrap_or_else(|e| e.into_inner()) = Some(row);
+    }
+
+    /// The live row at `width` (with its gutter), if there is one now.
+    fn live_rows(&self, width: usize) -> Option<String> {
+        let row = self
+            .live_row
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let indent = 3.min(width.saturating_sub(1));
+        let text = row(width.saturating_sub(indent + 2).max(1))?;
+        let colors = theme().colors;
+        Some(truncate_to_width(
+            &format!("{}{} {text}", " ".repeat(indent), colors.dim.fg("│")),
+            width,
+            "",
+        ))
     }
 
     /// The whole arguments, shown when expanded.
@@ -1175,6 +1204,14 @@ impl ToolBlock {
 
     /// The call's rows: its line, then its error or (expanded) its details.
     pub fn rows(&self, width: usize) -> Vec<String> {
+        let mut rows = self.cached_rows(width);
+        if let Some(live) = self.live_rows(width) {
+            rows.insert(1.min(rows.len()), live);
+        }
+        rows
+    }
+
+    fn cached_rows(&self, width: usize) -> Vec<String> {
         let expanded = self.display.is_expanded();
         // A running call's timer changes every frame; a finished one is fixed.
         if self.state() == ToolState::Running {

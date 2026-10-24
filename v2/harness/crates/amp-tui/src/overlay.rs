@@ -1094,7 +1094,7 @@ fn since_text(at: &str, now: SystemTime) -> String {
 
 /// `YYYY-MM-DDTHH:MM:SS[.frac](Z|±HH:MM)`; `None` for anything else. No time crate in amp-tui
 /// for one field, so this is the civil-days arithmetic by hand.
-fn parse_rfc3339(s: &str) -> Option<SystemTime> {
+pub(crate) fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     let b = s.as_bytes();
     let num = |r: std::ops::Range<usize>| -> Option<i64> {
         let part = s.get(r)?;
@@ -1151,10 +1151,132 @@ fn parse_rfc3339(s: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::new(secs, nanos))
 }
 
+/// `/workers` from the chat's roster (#2347): this chat's workers (live, then finished), then
+/// tickets in progress elsewhere. Each is a row with the web's shape (state, id, name, agent,
+/// where) and a detail row: model, state and elapsed time, tokens, context, cost, branch, what it
+/// waits on, story › epic. A worker elsewhere shows AMP's record of its last run, and when it was
+/// recorded.
+fn roster_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
+    use crate::roster::Phase;
+    let c = colors();
+    let m = &data.meta;
+    let board = m.board.get();
+    let asking = |id: i64| board.is_some_and(|b| b.questions.iter().any(|q| q.id == id));
+    let mut entries = data.roster.clone();
+    entries.sort_by_key(|e| (!e.local, !e.is_live(), e.task_id));
+    let mut rows = Vec::new();
+    for e in &entries {
+        let mark = if asking(e.task_id) {
+            p.state_mark(Status::Question)
+        } else {
+            match e.phase {
+                Phase::Queued => {
+                    format!("{} {}", p.state_mark(Status::Ready), c.muted.fg("queued"))
+                }
+                Phase::Running => format!(
+                    "{} {}",
+                    p.state_mark(Status::InProgress),
+                    p.state(Status::InProgress).text.fg("running")
+                ),
+                Phase::Stopping => format!(
+                    "{} {}",
+                    p.state_mark(Status::InProgress),
+                    c.warning.fg("stopping")
+                ),
+                Phase::Finished => {
+                    format!("{} {}", p.state_mark(Status::Done), c.muted.fg("finished"))
+                }
+                Phase::Elsewhere => p.state_mark(Status::InProgress),
+            }
+        };
+        let where_ = if e.local {
+            "· local"
+        } else if e.viewable {
+            "· elsewhere (session on disk)"
+        } else {
+            "· elsewhere"
+        };
+        let agent = if e.agent_id.is_empty() {
+            "unassigned".to_owned()
+        } else {
+            clean(&e.agent_id)
+        };
+        rows.push(
+            Row::new(vec![
+                fixed(mark),
+                fixed(ticket_id(m, e.task_id)),
+                flex(&e.name, c.text),
+                fixed(format!(
+                    "{} {} {}",
+                    c.dim.fg("·"),
+                    c.muted.fg(&agent),
+                    c.dim.fg(where_)
+                )),
+            ])
+            .target(ticket_target(e.task_id)),
+        );
+        let mut detail: Vec<String> = Vec::new();
+        if !e.model.is_empty() {
+            detail.push(clean(&e.model));
+        }
+        if !e.state.is_empty() {
+            detail.push(clean(&e.state));
+        }
+        let u = &e.usage;
+        match e.usage_recorded {
+            Some(at) => detail.push(format!(
+                "last run {} · recorded {}",
+                crate::roster::tok_label(e.tokens()),
+                crate::roster::ago(at, SystemTime::now())
+            )),
+            None if e.tokens() > 0 => detail.push(format!(
+                "{} (in {} · out {} · cached {})",
+                crate::roster::tok_label(e.tokens()),
+                tokens(u.input_tokens),
+                tokens(u.output_tokens),
+                tokens(u.cache_read_tokens + u.cache_write_tokens)
+            )),
+            None if !e.local => detail.push("no run recorded yet".to_owned()),
+            None => {}
+        }
+        if let Some(pc) = e.context_percent() {
+            detail.push(crate::roster::ctx_label(pc));
+        }
+        if u.cost_usd > 0.0 {
+            detail.push(format!("${:.2}", u.cost_usd));
+        }
+        if let Some(b) = e.branch.as_deref().filter(|b| !b.is_empty()) {
+            detail.push(format!("branch {}", clean(b)));
+        }
+        if !e.waiting_on.is_empty() {
+            let ids: Vec<String> = e.waiting_on.iter().map(|id| format!("#{id}")).collect();
+            detail.push(format!("waits on {}", ids.join(", ")));
+        }
+        let epic = e.epic_story();
+        if !epic.is_empty() {
+            detail.push(epic);
+        }
+        if !detail.is_empty() {
+            rows.push(Row::new(vec![flex(&detail.join(" · "), c.dim)]).indent(2));
+        }
+    }
+    rows
+}
+
 fn worker_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
     let c = colors();
     let m = &data.meta;
     let board = m.board.get();
+    // The roster when it has every local worker (a chat with a supervisor); else the workers
+    // and the board as given (`render-chrome`, tests).
+    let covered = data.workers.iter().all(|w| {
+        data.roster
+            .iter()
+            .any(|e| e.task_id == w.task_id && e.local)
+    });
+    if !data.roster.is_empty() && covered {
+        return roster_rows(data, p);
+    }
     let name_of = |id: i64| -> String {
         board
             .and_then(|b| {
@@ -1729,7 +1851,7 @@ fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
             "↑↓ select · Enter switch · Esc close".to_owned()
         }
         (Stage::Browse, PanelKind::Workers) if has_targets => {
-            "↑↓ select · Enter watch · x stop · o open in browser · Esc close".to_owned()
+            "↑↓ select · Enter or click watch · x stop · o open in browser · Esc close".to_owned()
         }
         (Stage::Browse, PanelKind::Questions) if has_targets => {
             "↑↓ select · Enter answer · o open in browser · Esc close".to_owned()

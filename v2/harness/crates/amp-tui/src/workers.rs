@@ -8,8 +8,9 @@
 //!   this process) or from a replay of its session JSONL ([`amp_core::worker_session::replay`])
 //!   for an older one. Only its transcript is shown: [`ChatView::show_session`] swaps it into the
 //!   main scroll view.
-//! - [`SessionBar`] is the line above it: `worker #2252 name · amp:amp-worker-backend · model ·
-//!   running 1m03s · ↑12.3k ↓1.2k $0.04`.
+//! - [`SessionBar`] is the header above it (#2347): `worker #2252 name` and its state, the
+//!   agent, model, story › epic, branch and what it waits on, then its tokens, cost and context
+//!   (`ctx ███░░░░░░░ 31% of 128k`), all live.
 //! - [`KeysBar`] takes the editor's place while a session is shown: the keys, or the stop
 //!   confirmation ([`stop_question`]).
 //!
@@ -27,16 +28,16 @@ use amp_core::{
 };
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{Content, UserContent};
-use rpi_tui::{Component, theme, visible_width};
+use rpi_tui::{Component, theme};
 
-use crate::chrome::{clean, shorten};
+use crate::roster::WorkerEntry;
 use crate::transcript::ThinkingDisplay;
 use crate::view::ChatView;
 
 /// The keys while a session is shown.
-pub const SESSION_KEYS: &str = "Esc back to the manager · Tab/→ next worker · Shift+Tab/← previous · x stop · PgUp/PgDn scroll";
+pub const SESSION_KEYS: &str = "Esc back to the chat · Tab/→ next worker · Shift+Tab/← previous · x stop · o open ticket in AMP · PgUp/PgDn scroll";
 /// The keys for a session that can't be stopped (finished, or read from disk).
-pub const READ_ONLY_KEYS: &str = "Esc back to the manager · Tab/→ next worker · Shift+Tab/← previous · PgUp/PgDn scroll · read-only";
+pub const READ_ONLY_KEYS: &str = "Esc back to the chat · Tab/→ next worker · Shift+Tab/← previous · o open ticket in AMP · PgUp/PgDn scroll · read-only";
 
 /// The question before a stop: one key stops, anything else keeps the worker going.
 pub fn stop_question(task_id: i64) -> String {
@@ -55,80 +56,31 @@ pub enum Source {
     File(String),
 }
 
-/// What the session bar shows.
-#[derive(Debug, Clone, Default)]
-pub struct BarInfo {
-    pub task_id: i64,
-    /// The ticket's name, when the board knows it.
-    pub name: String,
-    pub agent_id: String,
-    pub model: String,
-    /// `running 1m03s`, `queued 4s`, `completed after 3m10s`, `stopped by … from the chat`.
-    pub state: String,
-    /// Whether it is still running (the state is drawn in the accent colour).
-    pub live: bool,
-    pub totals: Totals,
-}
-
-/// The line above a worker's transcript.
+/// The header above a worker's transcript (#2347): the ticket and its state, who runs it on
+/// what for which story, and its live tokens and context ([`crate::roster::header_lines`]),
+/// then a rule.
 #[derive(Debug, Default)]
 pub struct SessionBar {
-    info: Mutex<BarInfo>,
+    entry: Mutex<WorkerEntry>,
 }
 
 impl SessionBar {
-    pub fn set(&self, info: BarInfo) {
-        *self.info.lock().unwrap_or_else(|e| e.into_inner()) = info;
+    pub fn set(&self, entry: WorkerEntry) {
+        *self.entry.lock().unwrap_or_else(|e| e.into_inner()) = entry;
     }
 
-    pub fn info(&self) -> BarInfo {
-        self.info.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    pub fn entry(&self) -> WorkerEntry {
+        self.entry.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
 impl Component for SessionBar {
     fn render(&self, width: usize) -> Vec<String> {
-        let i = self.info();
+        let e = self.entry();
         let c = theme().colors;
-        let u = &i.totals.usage;
-        let usage = format!(
-            "↑{} ↓{} ${:.2}",
-            crate::overlay::tokens(u.input_tokens + u.cache_read_tokens + u.cache_write_tokens),
-            crate::overlay::tokens(u.output_tokens),
-            u.cost_usd
-        );
-        let head = format!("worker #{}", i.task_id);
-        // Kept whole while they fit, in this order; the ticket name takes what is left.
-        let tail: Vec<(String, rpi_tui::theme::Color)> = [
-            (clean(&i.agent_id), c.muted),
-            (clean(&i.model), c.muted),
-            (clean(&i.state), if i.live { c.accent } else { c.text }),
-            (usage, c.dim),
-        ]
-        .into_iter()
-        .filter(|(t, _)| !t.is_empty())
-        .collect();
-        let sep = " · ";
-        let mut used = visible_width(&head);
-        let mut parts = vec![rpi_tui::bold(&c.accent.fg(&head))];
-        let mut kept = Vec::new();
-        for (text, color) in &tail {
-            let w = visible_width(sep) + visible_width(text);
-            if used + w > width {
-                break;
-            }
-            used += w;
-            kept.push(c.dim.fg(sep) + &color.fg(text));
-        }
-        let name = clean(&i.name);
-        let room = width.saturating_sub(used + 1);
-        if !name.is_empty() && room >= 8 {
-            parts.push(" ".to_owned() + &c.text.fg(&shorten(&name, room)));
-        }
-        parts.extend(kept);
-        let line = parts.concat();
-        let rule = c.border_muted.fg(&"─".repeat(width));
-        vec![line, rule]
+        let mut lines = crate::roster::header_lines(&e, width, SystemTime::now());
+        lines.push(c.border_muted.fg(&"─".repeat(width)));
+        lines
     }
 
     fn invalidate(&self) {}
@@ -267,35 +219,49 @@ impl SessionView {
         }
     }
 
-    /// Follows the supervisor's view of the worker (`None`: a session read from disk). Returns
+    /// Follows the supervisor's view of the worker (`None`: a session read from disk), with the
+    /// rest of what the chat knows about it in `entry` (the roster's, or a bare one). Returns
     /// whether the worker is still live.
-    pub fn update(&mut self, info: Option<&WorkerSessionInfo>, name: &str) -> bool {
-        let mut bar = BarInfo {
-            task_id: self.task_id,
-            name: name.to_owned(),
-            ..BarInfo::default()
-        };
+    pub fn update(&mut self, info: Option<&WorkerSessionInfo>, mut entry: WorkerEntry) -> bool {
+        entry.task_id = self.task_id;
         match info {
             Some(i) => {
-                bar.agent_id = i.agent_id.clone();
-                bar.model = i.model.clone().unwrap_or_else(|| self.model.clone());
-                bar.totals = i.totals.clone();
-                bar.live = i.is_live();
-                bar.state = session_state(i, SystemTime::now());
-                self.live = bar.live;
+                if entry.model.is_empty() {
+                    entry.model = i.model.clone().unwrap_or_else(|| self.model.clone());
+                }
+                self.live = i.is_live();
             }
             None => {
-                bar.model = self.model.clone();
-                bar.totals = self.totals.clone();
-                bar.state = match &self.source {
-                    Source::File(name) => format!("from {name}"),
-                    Source::Chat => "finished".to_owned(),
-                };
+                if entry.model.is_empty() {
+                    entry.model = self.model.clone();
+                }
+                if entry.tokens() == 0 {
+                    entry.usage = self.totals.usage;
+                }
+                if entry.context_tokens == 0 {
+                    entry.context_tokens = self.totals.context_tokens;
+                }
+                if entry.state.is_empty() {
+                    entry.state = match &self.source {
+                        Source::File(name) => format!("from {name}"),
+                        Source::Chat => "finished".to_owned(),
+                    };
+                }
                 self.live = false;
             }
         }
-        self.bar.set(bar);
+        self.bar.set(entry);
         self.live
+    }
+
+    /// The model the session's own events name (`provider/model`).
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Usage counted from its own events (a session read from disk).
+    pub fn totals(&self) -> &Totals {
+        &self.totals
     }
 
     pub fn is_live(&self) -> bool {
@@ -372,12 +338,7 @@ pub fn session_state(i: &WorkerSessionInfo, now: SystemTime) -> String {
 }
 
 fn duration(d: Duration) -> String {
-    let s = d.as_secs();
-    match s {
-        0..60 => format!("{s}s"),
-        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
-        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
-    }
+    crate::roster::duration(d)
 }
 
 #[cfg(test)]
@@ -403,6 +364,8 @@ mod tests {
             error: None,
             stopped_by: by.map(str::to_owned),
             session_file: None,
+            branch: None,
+            context_window: None,
         }
     }
 
@@ -434,18 +397,19 @@ mod tests {
     #[test]
     fn the_bar_keeps_every_line_within_the_width() {
         let bar = SessionBar::default();
-        bar.set(BarInfo {
+        bar.set(WorkerEntry {
             task_id: 2252,
             name: "Open a worker's live session from the chat, and stop it from there".into(),
             agent_id: "amp:amp-worker-backend".into(),
             model: "openrouter/deepseek/deepseek-v4.1".into(),
             state: "running 1m03s".into(),
-            live: true,
-            totals: Totals::default(),
+            phase: crate::roster::Phase::Running,
+            local: true,
+            ..WorkerEntry::default()
         });
         for w in [30, 60, 80, 140] {
             for line in bar.render(w) {
-                assert!(visible_width(&line) <= w, "{w}: {line}");
+                assert!(rpi_tui::visible_width(&line) <= w, "{w}: {line}");
             }
         }
         let wide = rpi_tui::strip_ansi(&bar.render(140)[0]);

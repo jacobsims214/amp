@@ -156,6 +156,8 @@ struct Inputs {
     fixed: Option<Arc<AmpMeta>>,
     workers: Option<WorkersFn>,
     mcp: Option<McpFn>,
+    /// What each worker is for (#2347), for `/workers`.
+    roster: Option<crate::roster::Roster>,
     /// Report outcomes by ticket, and the most recent one.
     reports: BTreeMap<i64, ReportState>,
     last_report: Option<i64>,
@@ -172,6 +174,8 @@ pub struct ChromeData {
     pub last_report: Option<i64>,
     /// The external MCP servers' health (`None`: no hub, or no server that should run).
     pub mcp: Option<amp_core::mcp_hub::HubSummary>,
+    /// What each worker is for and how it is doing (#2347; empty without a shell).
+    pub roster: Vec<crate::roster::WorkerEntry>,
 }
 
 impl ChromeData {
@@ -182,6 +186,7 @@ impl ChromeData {
             reports: BTreeMap::new(),
             last_report: None,
             mcp: None,
+            roster: Vec::new(),
         }
     }
 }
@@ -215,6 +220,11 @@ impl Chrome {
     /// Where local workers come from (the manager's supervisor).
     pub fn set_workers(&self, workers: WorkersFn) {
         self.with(|i| i.workers = Some(workers));
+    }
+
+    /// What each worker is for (#2347; the chat view's roster).
+    pub fn set_roster(&self, roster: crate::roster::Roster) {
+        self.with(|i| i.roster = Some(roster));
     }
 
     /// Where the MCP servers' health comes from (the session's hub, #2245).
@@ -267,7 +277,7 @@ impl Chrome {
 
     /// This frame's data, or `None` without a metadata source (the chrome is then hidden).
     pub fn data(&self) -> Option<ChromeData> {
-        let (meta, workers, mcp, reports, last_report) = self.with(|i| {
+        let (meta, workers, mcp, reports, last_report, roster) = self.with(|i| {
             let meta = match (&i.fixed, &i.handle) {
                 (Some(m), _) => Some(Arc::clone(m)),
                 (None, Some(h)) => Some(h.snapshot()),
@@ -279,6 +289,7 @@ impl Chrome {
                 i.mcp.clone(),
                 i.reports.clone(),
                 i.last_report,
+                i.roster.clone(),
             )
         });
         Some(ChromeData {
@@ -287,6 +298,7 @@ impl Chrome {
             reports,
             last_report,
             mcp: mcp.map(|f| f()).filter(|s| s.total > 0),
+            roster: roster.map(|r| r.all()).unwrap_or_default(),
         })
     }
 
@@ -300,6 +312,8 @@ impl Chrome {
             }
             d.reports.hash(&mut h);
             d.last_report.hash(&mut h);
+            self.with(|i| i.roster.as_ref().map(|r| r.revision()))
+                .hash(&mut h);
             if let Some(m) = d.mcp {
                 (m.ready, m.total, m.level as u8).hash(&mut h);
             }
@@ -1110,6 +1124,8 @@ pub mod sample {
                     slug: "simstech".to_owned(),
                 }],
             }),
+            worker_ids: Vec::new(),
+            workers: Default::default(),
             project_id: Some(2),
             project: ok(Project {
                 id: 2,

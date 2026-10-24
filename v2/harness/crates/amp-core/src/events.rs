@@ -295,6 +295,10 @@ pub struct Totals {
     pub usage: UsageJson,
     /// The last assistant message's text (the run's answer).
     pub last_text: String,
+    /// The latest response's context size: its input, output and cache tokens (#2347), what the
+    /// chat's `ctx N%` divides by the model's window. Not part of the run record.
+    #[serde(skip)]
+    pub context_tokens: i64,
 }
 
 impl Totals {
@@ -307,6 +311,13 @@ impl Totals {
                 self.usage.cache_read_tokens += usage.cache_read_tokens;
                 self.usage.cache_write_tokens += usage.cache_write_tokens;
                 self.usage.cost_usd += usage.cost_usd;
+                let context = usage.input_tokens
+                    + usage.output_tokens
+                    + usage.cache_read_tokens
+                    + usage.cache_write_tokens;
+                if context > 0 {
+                    self.context_tokens = context;
+                }
                 self.last_text = text.clone();
             }
             RunEvent::ToolStart { name, .. } => {

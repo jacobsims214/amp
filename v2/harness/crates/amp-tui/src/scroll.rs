@@ -32,6 +32,15 @@ struct Mark {
     height: usize,
 }
 
+/// A saved scroll position ([`TranscriptScroll::position`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrollPos {
+    pub top: usize,
+    pub content: usize,
+    pub viewport: usize,
+    pub at_end: bool,
+}
+
 /// The transcript's scroll position and whether output arrived while it was scrolled up.
 /// Cloneable: the clones share their state (the terminal's pill label holds one).
 #[derive(Clone)]
@@ -101,6 +110,29 @@ impl TranscriptScroll {
     /// Ctrl+U (`-1`) / Ctrl+D (`1`).
     pub fn half_page_by(&self, halves: i32) {
         self.scroll_by(halves * self.half_page());
+    }
+
+    /// Where the view is now, to come back to with [`Self::restore`] (#2347: a worker's session
+    /// shown in its place and closed again).
+    pub fn position(&self) -> ScrollPos {
+        ScrollPos {
+            top: self.view.scroll_top(),
+            content: self.view.content_height(),
+            viewport: self.view.viewport_height(),
+            at_end: self.at_end(),
+        }
+    }
+
+    /// Back to `pos`. The transcript only grows, so its old top is still a valid place; at the
+    /// end, it follows the end again.
+    pub fn restore(&self, pos: ScrollPos) {
+        if pos.at_end {
+            self.to_end();
+            return;
+        }
+        self.view.update_layout(pos.content, pos.viewport, None);
+        self.view.scroll_to(pos.top);
+        self.note_position();
     }
 
     /// End: back to the latest output, following the stream again.

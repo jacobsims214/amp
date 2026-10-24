@@ -392,6 +392,10 @@ pub struct WorkerSessionInfo {
     /// Who stopped it from the chat, once someone has asked it to stop.
     pub stopped_by: Option<String>,
     pub session_file: Option<PathBuf>,
+    /// The worktree's branch, once the worker has one (#2347).
+    pub branch: Option<String>,
+    /// The worker model's context window in tokens, when known (#2347: the chat's `ctx N%`).
+    pub context_window: Option<u64>,
 }
 
 impl WorkerSessionInfo {
@@ -449,6 +453,8 @@ struct LiveWorker {
     /// Cancelled by [`Supervisor::stop_worker`]; `stopped_by` says who.
     stop: CancellationToken,
     stopped_by: Arc<Mutex<Option<String>>>,
+    branch: Option<String>,
+    context_window: Option<u64>,
 }
 
 /// Runs workers for one manager. Share it as `Arc<Supervisor>`; [`Supervisor::tool`] is the
@@ -678,15 +684,16 @@ impl Supervisor {
     /// Keeps a finished worker's session viewable, and forgets it from the live map's point of
     /// view (the live guard removes it right after).
     fn record_finished(&self, report: &WorkerReport) {
-        let (feed, since, stopped_by) = {
+        let (feed, since, stopped_by, context_window) = {
             let live = self.live.lock().unwrap();
             match live.get(&report.task_id) {
                 Some(w) => (
                     Arc::clone(&w.feed),
                     w.since,
                     w.stopped_by.lock().unwrap().clone(),
+                    w.context_window,
                 ),
-                None => (WorkerFeed::new(), SystemTime::now(), None),
+                None => (WorkerFeed::new(), SystemTime::now(), None, None),
             }
         };
         let info = WorkerSessionInfo {
@@ -702,6 +709,8 @@ impl Supervisor {
             error: report.error.clone(),
             stopped_by,
             session_file: report.session_file.clone(),
+            branch: report.branch.clone(),
+            context_window,
         };
         self.finished
             .lock()
@@ -865,6 +874,8 @@ impl Supervisor {
                 feed: WorkerFeed::new(),
                 stop: CancellationToken::new(),
                 stopped_by: Arc::default(),
+                branch: None,
+                context_window: None,
             },
         );
         Ok(LiveGuard { sup: self, task_id })
@@ -889,10 +900,12 @@ impl Supervisor {
             .unwrap_or_default();
         let mut notes = Vec::new();
         let totals = Arc::new(Mutex::new(Totals::default()));
-        let model = role
-            .resolve_model(&self.rt.current_models())
-            .map(|r| r.model_ref())
-            .unwrap_or_default();
+        let resolved = role.resolve_model(&self.rt.current_models()).ok();
+        let model = resolved.as_ref().map(|r| r.model_ref()).unwrap_or_default();
+        let context_window = resolved
+            .as_ref()
+            .map(|r| r.model.context_window)
+            .filter(|w| *w > 0);
 
         // Where the worker runs.
         let wants_worktree = req
@@ -945,6 +958,8 @@ impl Supervisor {
                 w.cwd = Some(info.cwd.clone());
                 w.since = SystemTime::now();
                 w.totals = Some(Arc::clone(&totals));
+                w.branch = info.branch.clone();
+                w.context_window = context_window;
             }
         }
 
@@ -1420,6 +1435,8 @@ fn live_info(task_id: i64, w: &LiveWorker) -> WorkerSessionInfo {
         error: None,
         stopped_by: w.stopped_by.lock().unwrap().clone(),
         session_file: None,
+        branch: w.branch.clone(),
+        context_window: w.context_window,
     }
 }
 
