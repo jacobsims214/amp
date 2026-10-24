@@ -448,11 +448,22 @@ impl Output {
     }
 }
 
-/// `--snapshot` rows without the chat's left padding (`[tui] padding`, #2251), so a test that
-/// checks where something sits within the transcript reads columns as before. amp-tui's
-/// `tests/padding.rs` covers the padding itself.
-pub fn unpad(rows: Vec<String>) -> Vec<String> {
-    let pad = " ".repeat(amp_tui::DEFAULT_PADDING);
+/// `--snapshot` rows of a `width`-column screen without the chat's padding: the left padding
+/// (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344) and the blank row above and
+/// below the screen (#2344, checked blank), so a test that checks where something sits reads rows
+/// and columns as before. amp-tui's `tests/padding.rs` covers the padding itself.
+pub fn unpad(mut rows: Vec<String>, width: usize) -> Vec<String> {
+    let gap = amp_tui::Gap::rows_at(rows.len());
+    for _ in 0..gap {
+        assert!(rows[0].trim().is_empty(), "top padding row: {rows:#?}");
+        assert!(
+            rows[rows.len() - 1].trim().is_empty(),
+            "bottom padding row: {rows:#?}"
+        );
+        rows.remove(0);
+        rows.pop();
+    }
+    let pad = " ".repeat(amp_tui::Padding::new(amp_tui::DEFAULT_PADDING).at(width));
     rows.into_iter()
         .map(|r| r.strip_prefix(&pad).map(str::to_owned).unwrap_or(r))
         .collect()

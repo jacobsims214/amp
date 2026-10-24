@@ -41,22 +41,92 @@ pub const ENV_KEYCHAIN_TRACE: &str = "AMP_HARNESS_KEYCHAIN_TRACE";
 pub const KEYCHAIN_REPAIR_HINT: &str = "run `amp-harness connect` in a terminal to store it again through amp-harness, or \
      set the key in the environment instead";
 
-/// [`KEYCHAIN_REPAIR_HINT`] for one item: a provider key (`provider:<id>[:header:<name>]`) is
-/// stored again with `amp-harness connect <id>`; anything else is the AMP login (`amp-harness
-/// login`).
+/// What fixes one keychain item that cannot be read, by the kind of item its account names
+/// (#2352). Every message about an unreadable item ends with one of these, so a person is told the
+/// command that stores *that* item again, never another kind's:
+///
+/// | account                                             | command                                 |
+/// |-----------------------------------------------------|-----------------------------------------|
+/// | `provider:<id>[:header:<name>\|:secret:<name>]`     | `amp-harness connect <id>`              |
+/// | `mcp:[repo:<id>:]<server>:env:<VAR>`                | `amp-harness mcp secret <server> <VAR>` |
+/// | `mcp:[repo:<id>:]<server>:header:<name>`            | `amp-harness mcp secret <server> <name>`|
+/// | `mcp:[repo:<id>:]<server>:oauth-client-secret`      | `amp-harness mcp secret <server> oauth` |
+/// | `mcp-repo:<id>:<server>\|<url>` (a repo server's login) | `amp-harness mcp login <server>`    |
+/// | a URL                                               | `amp-harness login` (AMP's login)       |
+///
+/// A person's own MCP server keeps its OAuth login under its URL alone, exactly like AMP's login,
+/// so the account cannot tell those two apart: the caller that knows it read an MCP server's login
+/// says so with [`KeychainError::with_repair_hint`] and [`mcp_login_repair_hint`].
 pub fn repair_hint(account: &str) -> String {
-    match account.strip_prefix("provider:") {
-        Some(rest) => {
-            let id = rest.split(':').next().unwrap_or(rest);
-            format!(
-                "run `amp-harness connect {id}` in a terminal to store it again through \
-                 amp-harness, or set the key in the environment instead"
-            )
-        }
-        None => {
-            "run `amp-harness login` in a terminal to log in again through amp-harness".to_owned()
+    if let Some(rest) = account.strip_prefix("provider:") {
+        let id = rest.split(':').next().unwrap_or(rest);
+        return provider_repair_hint(id);
+    }
+    if let Some((server, which)) = mcp_secret_item(account) {
+        return mcp_secret_repair_hint(server, which);
+    }
+    if let Some(server) = repo_login_server(account) {
+        return mcp_login_repair_hint(server);
+    }
+    amp_login_repair_hint()
+}
+
+/// The fix for a provider key (`provider:<id>…`).
+pub fn provider_repair_hint(id: &str) -> String {
+    format!(
+        "run `amp-harness connect {id}` in a terminal to store it again through amp-harness, or \
+         set the key in the environment instead"
+    )
+}
+
+/// The fix for an MCP server's keychain secret: `which` is the env var, the header name or
+/// `oauth` (the OAuth client secret), as `amp-harness mcp secret` takes it.
+pub fn mcp_secret_repair_hint(server: &str, which: &str) -> String {
+    format!(
+        "run `amp-harness mcp secret {server} {which}` in a terminal to store it again through \
+         amp-harness"
+    )
+}
+
+/// The fix for an MCP server's OAuth login.
+pub fn mcp_login_repair_hint(server: &str) -> String {
+    format!(
+        "run `amp-harness mcp login {server}` in a terminal to log in to it again through \
+         amp-harness"
+    )
+}
+
+/// The fix for the AMP login.
+pub fn amp_login_repair_hint() -> String {
+    "run `amp-harness login` in a terminal to log in again through amp-harness".to_owned()
+}
+
+/// `mcp:[repo:<id>:]<server>:{env:<VAR>|header:<name>|oauth-client-secret}` → (server, which).
+fn mcp_secret_item(account: &str) -> Option<(&str, &str)> {
+    let rest = account.strip_prefix("mcp:")?;
+    // A repo server's item: `repo:<16 hex digits>:` comes first. (A server may be named `repo`.)
+    let rest = match rest.strip_prefix("repo:").and_then(|r| r.split_once(':')) {
+        Some((id, scoped)) if id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit()) => scoped,
+        _ => rest,
+    };
+    if let Some(server) = rest.strip_suffix(":oauth-client-secret") {
+        return Some((server, "oauth"));
+    }
+    for kind in [":env:", ":header:"] {
+        if let Some((server, which)) = rest.split_once(kind) {
+            return Some((server, which));
         }
     }
+    None
+}
+
+/// A repo server's OAuth login key, `mcp-repo:<repo id>:<server>|<url>` → its server name.
+fn repo_login_server(account: &str) -> Option<&str> {
+    let (scope, _url) = account.split_once('|')?;
+    scope
+        .strip_prefix("mcp-repo:")?
+        .split_once(':')
+        .map(|(_, server)| server)
 }
 
 /// Why a keychain call failed.
@@ -97,6 +167,14 @@ impl KeychainError {
             kind,
             message: message.into(),
         }
+    }
+
+    /// The same error with `hint` in place of what [`repair_hint`] says for `account`: for a
+    /// caller that knows better than the account what the item is (an MCP server's OAuth login is
+    /// stored under its URL, like AMP's own login).
+    pub fn with_repair_hint(mut self, account: &str, hint: &str) -> Self {
+        self.message = self.message.replace(&repair_hint(account), hint);
+        self
     }
 }
 
@@ -420,7 +498,8 @@ fn classify(op: &str, service: &str, account: &str, e: keyring::Error) -> Keycha
                 "macOS would have to ask before amp-harness can {op} {item} (it was made by \
                  another program, such as `security add-generic-password`, or by an earlier \
                  amp-harness build), and this run cannot show the dialog. Not asking \
-                 (OSStatus {code}): {hint}"
+                 (OSStatus {code}): {hint}. If an earlier amp-harness build made it, running \
+                 amp-harness once in a terminal and choosing \"Always Allow\" also works"
             ),
         )
     };
@@ -632,5 +711,109 @@ mod tests {
             keyring::Error::NoDefaultStore,
         );
         assert_eq!(e.kind, KeychainErrorKind::Unavailable);
+    }
+
+    /// #2352: each kind of item names the command that stores that item again.
+    #[test]
+    fn repair_hint_names_the_command_for_each_kind_of_item() {
+        let cases = [
+            ("provider:openrouter", "`amp-harness connect openrouter`"),
+            ("provider:gw:header:x-api-key", "`amp-harness connect gw`"),
+            (
+                "mcp:authd:env:QA_TOKEN",
+                "`amp-harness mcp secret authd QA_TOKEN`",
+            ),
+            (
+                "mcp:k:header:x-api-key",
+                "`amp-harness mcp secret k x-api-key`",
+            ),
+            (
+                "mcp:s:oauth-client-secret",
+                "`amp-harness mcp secret s oauth`",
+            ),
+            (
+                "mcp:repo:0123456789abcdef:gh:env:GH_TOKEN",
+                "`amp-harness mcp secret gh GH_TOKEN`",
+            ),
+            (
+                "mcp:repo:0123456789abcdef:gh:oauth-client-secret",
+                "`amp-harness mcp secret gh oauth`",
+            ),
+            // A server that happens to be named `repo`.
+            ("mcp:repo:env:TOKEN", "`amp-harness mcp secret repo TOKEN`"),
+            (
+                "mcp-repo:0123456789abcdef:acme|https://mcp.acme.example/mcp",
+                "`amp-harness mcp login acme`",
+            ),
+            ("https://amp.example/mcp", "`amp-harness login`"),
+        ];
+        for (account, want) in cases {
+            let hint = repair_hint(account);
+            assert!(hint.contains(want), "{account}: {hint}");
+            if !want.contains("amp-harness login`") {
+                assert!(!hint.contains("`amp-harness login`"), "{account}: {hint}");
+            }
+        }
+        // A person's own MCP server's login is stored under its URL, like AMP's: the caller says.
+        let e = classify(
+            "read",
+            "amp-harness",
+            "https://mcp.oauthy.example/mcp",
+            keyring::Error::BadEncoding(b"tok".to_vec()),
+        )
+        .with_repair_hint(
+            "https://mcp.oauthy.example/mcp",
+            &mcp_login_repair_hint("oauthy"),
+        );
+        assert!(
+            e.message.contains("`amp-harness mcp login oauthy`")
+                && !e.message.contains("`amp-harness login`"),
+            "{}",
+            e.message
+        );
+    }
+
+    /// #2352: the needs-approval message (no terminal, an item this build is not trusted for)
+    /// ends with the right command for each kind of item.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn needs_approval_names_the_command_for_each_kind_of_item() {
+        let needs_approval = |account: &str| {
+            let e = classify(
+                "read",
+                "amp-harness",
+                account,
+                keyring::Error::PlatformFailure(Box::new(
+                    security_framework::base::Error::from_code(ERR_SEC_INTERACTION_NOT_ALLOWED),
+                )),
+            );
+            assert_eq!(e.kind, KeychainErrorKind::NeedsApproval, "{}", e.message);
+            e
+        };
+        let e = needs_approval("mcp:authd:env:QA_TOKEN");
+        assert!(
+            e.message
+                .contains("`amp-harness mcp secret authd QA_TOKEN`")
+                && !e.message.contains("`amp-harness login`")
+                && e.message.contains("Always Allow"),
+            "{}",
+            e.message
+        );
+        let url = "https://mcp.oauthy.example/mcp";
+        let e = needs_approval(url).with_repair_hint(url, &mcp_login_repair_hint("oauthy"));
+        assert!(
+            e.message.contains("`amp-harness mcp login oauthy`")
+                && !e.message.contains("`amp-harness login`"),
+            "{}",
+            e.message
+        );
+        let e = needs_approval("provider:openrouter:header:x-org");
+        assert!(
+            e.message.contains("`amp-harness connect openrouter`"),
+            "{}",
+            e.message
+        );
+        let e = needs_approval("https://amp.example/mcp");
+        assert!(e.message.contains("`amp-harness login`"), "{}", e.message);
     }
 }

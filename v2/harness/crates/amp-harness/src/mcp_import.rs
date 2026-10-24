@@ -1561,7 +1561,7 @@ fn answers(
     }
     for a in asks {
         let v = if a.hidden {
-            ui.secret(&format!("{} (hidden; kept in the OS keychain)", a.prompt))?
+            ui.secret(&format!("{} (kept in the OS keychain)", a.prompt))?
         } else {
             ui.ask(&a.prompt, None)?
         };

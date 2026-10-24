@@ -1,9 +1,11 @@
-//! #2251: left and right padding around every area of the chat.
+//! #2251: left and right padding around every area of the chat; #2344: halved at 80 columns or
+//! fewer, and a blank row above and below the whole screen (none under 24 rows).
 //!
 //! The same screens (the AMP header, a user bubble, a reply with a table, a code block and a long
 //! paragraph, tool calls, the `/workers` panel, the `/` menu, the editor, the AMP status line and
 //! the footer) are rendered at 80 and 127 columns and compared with
-//! `tests/snapshots/padding-{80,127}.txt` (plain text; `|` marks the right edge). Regenerate them
+//! `tests/snapshots/padding-{80,127}.txt` (plain text; `|` marks the right edge), and at 120x40 and
+//! 80x24 with every row kept, `padding-{120x40,80x24}.txt`. Regenerate them
 //! with `UPDATE_SNAPSHOTS=1 cargo test -p amp-tui --test padding` and review the diff. The other
 //! tests check that every row keeps the padding clear, that narrow terminals still fit and that
 //! `[tui] padding` changes it.
@@ -18,8 +20,8 @@ use std::{
 
 use amp_core::{agent::memory_session, events::ChannelEmitter, meta::MetaHandle};
 use amp_tui::{
-    AmpTheme, ColorDepth, DEFAULT_PADDING, MIN_INNER, Shell, ShellInfo, Submit, Variant,
-    chrome::sample, install_theme,
+    AmpTheme, ColorDepth, DEFAULT_PADDING, Gap, MIN_INNER, Padding, SHORT, Shell, ShellInfo,
+    Submit, VERTICAL, Variant, chrome::sample, install_theme,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
@@ -124,15 +126,19 @@ impl Rig {
     }
 
     fn rows(&self, width: usize) -> Vec<String> {
+        self.rows_at(width, H)
+    }
+
+    fn rows_at(&self, width: usize, height: usize) -> Vec<String> {
         let rows: Vec<String> = self
             .shell
             .view()
-            .render_frame(width, H)
+            .render_frame(width, height)
             .iter()
             .map(|l| strip_ansi(l))
             .collect();
         // Leading blank rows of the transcript's top are not interesting; the frame always fills.
-        assert_eq!(rows.len(), H);
+        assert_eq!(rows.len(), height);
         rows
     }
 }
@@ -153,6 +159,18 @@ fn assert_padded(rows: &[String], width: usize, pad: usize) {
             "touches the right edge ({used}): {row:?}"
         );
     }
+}
+
+/// Every row, with `|` at the right edge (blank rows kept, so the top and bottom padding show).
+fn full_snapshot_text(rows: &[String], width: usize) -> String {
+    let mut out = String::new();
+    for row in rows {
+        let row = row.trim_end();
+        let fill = width.saturating_sub(visible_width(row));
+        out.push_str(&mask_times(&format!("{row}{}|", " ".repeat(fill))));
+        out.push('\n');
+    }
+    out
 }
 
 /// The rows that show something, with `|` at the right edge.
@@ -248,9 +266,45 @@ async fn every_area_is_padded_at_80_and_127_columns() {
         ] {
             assert!(text.contains(part), "{part} at {width}:\n{text}");
         }
-        assert_padded(&rows, width, DEFAULT_PADDING);
+        assert_padded(&rows, width, Padding::new(DEFAULT_PADDING).at(width));
         check_snapshot(&format!("padding-{width}"), &snapshot_text(&rows, width));
     }
+}
+
+/// #2344: padding on all four sides at 120x40 and 80x24: 2 columns left and right at 120, 1 at
+/// 80, and a blank row at the top and the bottom of both.
+#[allow(clippy::await_holding_lock)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_side_is_padded_at_120x40_and_80x24() {
+    let _g = themed();
+    let mut rig = rig().await;
+    rig.say("/workers").await;
+    for (width, height, side) in [(120, 40, 2), (80, 24, 1)] {
+        let rows = rig.rows_at(width, height);
+        assert_eq!(rig.shell.view().vertical_padding(), VERTICAL);
+        assert_eq!(rows[0].trim(), "", "a blank top row at {width}x{height}");
+        assert_eq!(
+            rows[height - 1].trim(),
+            "",
+            "a blank bottom row at {width}x{height}"
+        );
+        // The header is right under the top row, the footer right over the bottom one.
+        assert!(rows[1].contains("ada@example.com"), "{rows:#?}");
+        assert!(rows[height - 2].contains("thinking off"), "{rows:#?}");
+        assert_padded(&rows, width, side);
+        let left = |row: &str| row.len() - row.trim_start_matches(' ').len();
+        assert_eq!(left(&rows[1]), side, "{rows:#?}");
+        assert_eq!(left(&rows[height - 2]), side, "{rows:#?}");
+        check_snapshot(
+            &format!("padding-{width}x{height}"),
+            &full_snapshot_text(&rows, width),
+        );
+    }
+    // Shorter than 24 rows: no blank rows, the footer is the last row.
+    let rows = rig.rows_at(80, SHORT - 1);
+    assert_eq!(Gap::rows_at(SHORT - 1), 0);
+    assert!(rows[0].contains("ada@example.com"), "{rows:#?}");
+    assert!(rows[SHORT - 2].contains("thinking off"), "{rows:#?}");
 }
 
 #[allow(clippy::await_holding_lock)]
@@ -260,7 +314,7 @@ async fn narrow_terminals_shrink_the_padding_and_still_fit() {
     let mut rig = rig().await;
     rig.say("/workers").await;
     for width in [24usize, 30, 40, 41, 42, 43, 44, 50, 60] {
-        let pad = DEFAULT_PADDING.min(width.saturating_sub(MIN_INNER) / 2);
+        let pad = Padding::new(DEFAULT_PADDING).at(width);
         let rows = rig.rows(width);
         assert_padded(&rows, width, pad);
         if width <= MIN_INNER + 1 {

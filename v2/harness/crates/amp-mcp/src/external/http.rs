@@ -208,6 +208,7 @@ impl HttpServerOptions {
             .with_ca_file(self.ca_file.clone())
             .with_request_timeout(self.oauth_request_timeout)
             .with_client(self.oauth.clone())
+            .with_mcp_server(self.name.clone())
     }
 }
 
@@ -389,7 +390,9 @@ async fn stored_login(
     options: &HttpServerOptions,
     backend: &CredentialBackend,
 ) -> Result<Option<AuthClient<reqwest::Client>>, McpError> {
-    let store = backend.store_for_key(options.credential_key());
+    let store = backend
+        .store_for_key(options.credential_key())
+        .for_mcp_server(options.server());
     let Some(stored) = store.load_credentials().await? else {
         return Ok(None);
     };
@@ -590,5 +593,9 @@ pub async fn logout(
     options: &HttpServerOptions,
     backend: &CredentialBackend,
 ) -> Result<bool, McpError> {
-    oauth::logout_key(&options.credential_key(), backend).await
+    backend
+        .store_for_key(options.credential_key())
+        .for_mcp_server(options.server())
+        .clear_credentials()
+        .await
 }

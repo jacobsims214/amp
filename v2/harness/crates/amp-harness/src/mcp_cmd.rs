@@ -54,7 +54,8 @@ pub enum McpCommand {
     Test(mcp_crud::TestArgs),
     /// Log in to an http/sse server with OAuth in the browser (kept like the AMP login).
     Login(mcp_crud::LoginArgs),
-    /// Forget a server's OAuth login.
+    /// Forget a server's OAuth login. Local only: the tokens are removed from this machine, not
+    /// revoked at the server (revoke them in the provider's settings if they may have leaked).
     Logout(mcp_crud::NameArgs),
     /// Store (or replace) a server's secret values in the OS keychain, asked hidden.
     Secret(mcp_crud::SecretArgs),

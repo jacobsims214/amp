@@ -328,7 +328,7 @@ impl Inner {
             }
             Err(_) => {
                 let status = h
-                    .map(|h| h.status.to_string())
+                    .map(|h| h.status.describe_for(name))
                     .unwrap_or_else(|| "not started".to_owned());
                 let mut errors = vec![format!("MCP server `{name}`: {status}")];
                 let tail = stderr_tail(h.and_then(|h| h.stderr_log.as_deref()), 5);
