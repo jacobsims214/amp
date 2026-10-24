@@ -1743,7 +1743,6 @@ pub async fn import(args: ImportArgs) -> Result<(), CliError> {
                 .map(|s| (s.item.clone(), Some(fill_str(&s.value, &answer))))
                 .collect(),
         };
-        let note: &'static str = note_for(r).leak();
         let done = mcp_crud::add_server(
             &r.name,
             scope,
@@ -1753,7 +1752,7 @@ pub async fn import(args: ImportArgs) -> Result<(), CliError> {
                 no_test: !args.test,
                 secret_stdin: false,
                 json: args.json,
-                note,
+                note: note_for(r).into(),
                 quiet: true,
             },
         )

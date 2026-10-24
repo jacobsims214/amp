@@ -1132,6 +1132,33 @@ pub struct ConnectSummary {
     /// `removed auth_header`); empty for a new provider.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub changed: Vec<String>,
+    /// #2311: a re-connect kept the key it already had (no key flag given); nothing was asked.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub key_unchanged: bool,
+}
+
+/// The key a re-connect keeps (#2311): re-running `connect <id>` with only endpoint flags
+/// (`--ca-file`, `--header`, `--organization`, …) must not ask for a key that is already there.
+/// Only when no key flag (`--key-stdin`) and no `--auth` change was given. A stored key always
+/// counts; a key in the environment counts in a terminal (without one, the env path in
+/// [`read_and_check_key`] already uses it).
+fn kept_key(
+    provider: &ProviderConfig,
+    keys: &dyn KeyLookup,
+    key_flag: bool,
+    auth_changed: bool,
+    interactive: bool,
+) -> Option<(String, KeySource)> {
+    if key_flag || auth_changed || !provider.needs_key {
+        return None;
+    }
+    match resolve_key(provider, keys) {
+        (Some(key), source @ KeySource::Keychain) => Some((key.expose().to_owned(), source)),
+        (Some(key), source @ KeySource::Env(_)) if interactive => {
+            Some((key.expose().to_owned(), source))
+        }
+        _ => None,
+    }
 }
 
 enum Target {
@@ -1211,7 +1238,35 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         .map(|s| s.secret_headers.clone())
         .unwrap_or_default();
     let client_key = spec.as_ref().and_then(|s| s.auth.client_key_pem.clone());
-    let (key, check, key_from_env) = if spec.is_some() && !provider.needs_key {
+    let kept = spec.as_ref().filter(|s| s.merge).and_then(|_| {
+        kept_key(
+            &provider,
+            &SystemKeys::from_env(),
+            args.key_stdin,
+            args.auth.is_some(),
+            ui.interactive(),
+        )
+    });
+    let key_unchanged = kept.is_some();
+    let (key, check, key_from_env) = if let Some((key, source)) = kept {
+        // Checked against the endpoint as it is now configured (a new --ca-file, proxy, ...).
+        let check = setup::check_key_full(&provider, &key, &extra, client_key.as_deref()).await;
+        let place = match &source {
+            KeySource::Env(var) => format!("in {var}"),
+            _ => "in the OS keychain".to_owned(),
+        };
+        ui.say(&format!("{name}: key unchanged ({place})."));
+        ui.say(&format!("  {}", check_note(&name, &check)));
+        if let KeyCheck::Rejected(status) = check {
+            return Err(CliError::new(format!(
+                "{name} rejected the key it has (HTTP {status}); nothing was changed. Enter a new \
+                 one with `amp-harness connect {}` (no other flags), or pipe it in with \
+                 --key-stdin",
+                provider.id
+            )));
+        }
+        (key, check, matches!(source, KeySource::Env(_)))
+    } else if spec.is_some() && !provider.needs_key {
         // #2277: none or a token command: no key to read; check the endpoint (and the token).
         let check = setup::check_key_full(&provider, "", &extra, client_key.as_deref()).await;
         ui.say(&format!("  {}", check_note(&name, &check)));
@@ -1278,7 +1333,11 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         .as_ref()
         .and_then(|s| s.key_env.clone())
         .or(provider.key_env.clone());
-    let stored_key = if key_from_env { "" } else { key.as_str() };
+    let stored_key = if key_from_env || key_unchanged {
+        ""
+    } else {
+        key.as_str()
+    };
     store_all_secrets(
         &provider.id,
         stored_key,
@@ -1305,6 +1364,7 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
         check: check_json(&check),
         secret_headers: extra.keys().cloned().collect(),
         config: Some(config.path.clone()),
+        key_unchanged,
         ..ConnectSummary::default()
     };
     if !stored_key.is_empty() {
@@ -2509,6 +2569,54 @@ impl amp_tui::ProviderConnect for ChatConnect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2311: a re-connect keeps a key that is there unless a key flag or an --auth change says
+    /// otherwise.
+    #[test]
+    fn a_reconnect_keeps_the_key_it_has() {
+        use amp_core::providers::StaticKeys;
+        let cfg = ModelsConfig::from_files(ModelsFile::defaults(), None, "t", &|_| None).unwrap();
+        let provider = cfg.providers["openrouter"].clone();
+        let var = provider.key_env.clone().unwrap();
+        let stored = StaticKeys {
+            env: BTreeMap::new(),
+            keychain: Some(BTreeMap::from([(
+                "openrouter".to_owned(),
+                "k-stored".to_owned(),
+            )])),
+        };
+        let kept = |keys: &StaticKeys, flag, auth, tty| {
+            kept_key(&provider, keys, flag, auth, tty).map(|(k, s)| (k, s.to_string()))
+        };
+        let (key, _) = kept(&stored, false, false, true).expect("stored key kept");
+        assert_eq!(key, "k-stored");
+        assert!(
+            kept(&stored, false, false, false).is_some(),
+            "no terminal either"
+        );
+        assert!(kept(&stored, true, false, true).is_none(), "--key-stdin");
+        assert!(kept(&stored, false, true, true).is_none(), "--auth changes");
+        let none = StaticKeys {
+            env: BTreeMap::new(),
+            keychain: Some(BTreeMap::new()),
+        };
+        assert!(
+            kept(&none, false, false, true).is_none(),
+            "nothing stored: asked"
+        );
+        let env = StaticKeys {
+            env: BTreeMap::from([(var, "k-env".to_owned())]),
+            keychain: None,
+        };
+        assert!(
+            kept(&env, false, false, true).is_some(),
+            "env key in a terminal"
+        );
+        assert!(
+            kept(&env, false, false, false).is_none(),
+            "headless: the env path"
+        );
+    }
 
     #[test]
     fn subscription_tokens_are_refused() {

@@ -390,7 +390,7 @@ amp-harness mcp add docs --url https://docs.example.com/sse --transport sse -H '
 amp-harness mcp add search --secret-env BRAVE_API_KEY -- npx -y brave-search-mcp     # asked hidden
 amp-harness mcp add db --scope repo -- ./tools/db-mcp          # repo file; trusted for you
 amp-harness mcp add-json linear '{"type":"http","url":"https://mcp.linear.app/mcp"}'  # or - (stdin)
-amp-harness mcp list [--no-health] [--json]     # every server with its health (connects to each)
+amp-harness mcp list [--health [--timeout S]] [--json]   # last known health; --health checks now
 amp-harness mcp get NAME [--scope user|repo] [--no-health] [--json]
 amp-harness mcp edit NAME [--roles 'worker-*,reviewer']   # $EDITOR, checked, reopened on an error
 amp-harness mcp remove NAME [--scope user|repo] [--keep-secrets] [--keep-login]
