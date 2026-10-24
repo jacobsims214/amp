@@ -401,6 +401,12 @@ pub fn secret_env_names(models: &ModelsConfig) -> BTreeSet<String> {
         .filter_map(|p| p.key_env.clone())
         .filter(|n| !n.trim().is_empty())
         .collect();
+    // Secret header values can come from the environment too (#2343).
+    for p in models.providers.values() {
+        for h in &p.secret_headers {
+            names.insert(crate::providers::header_env(&p.id, h));
+        }
+    }
     names.insert(amp_mcp::ENV_TOKEN.to_owned());
     names
 }

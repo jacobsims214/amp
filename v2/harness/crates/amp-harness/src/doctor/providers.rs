@@ -19,7 +19,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use amp_core::{
     models::{ModelHints, ModelsConfig, Selection},
     provider_auth::{self, ProbeFailure, ProbeKind},
-    providers::{KeyLookup, KeySource, resolve_key},
+    providers::{KeyLookup, KeySource, KeychainKey, header_env, resolve_key},
 };
 use serde::Serialize;
 
@@ -281,6 +281,11 @@ pub async fn check(
             .fix(key_fix(&id, &source, &where_))
         };
         out.push((format!("key:{id}"), key_finding));
+        let mut headers_missing = false;
+        if let Some(f) = headers_finding(provider, keys, &roles, primary_provider.as_deref()) {
+            headers_missing = f.status != CheckStatus::Ok;
+            out.push((format!("headers:{id}"), f));
+        }
 
         let mut catalog_checked = false;
         let mut catalog_error = None;
@@ -292,6 +297,11 @@ pub async fn check(
             Finding::new(CheckStatus::Skip, "--offline: model catalog not checked")
         } else if !has_key {
             Finding::new(CheckStatus::Skip, "no key: model catalog not checked")
+        } else if headers_missing {
+            Finding::new(
+                CheckStatus::Skip,
+                "a secret header value is missing: model catalog not checked",
+            )
         } else {
             match provider_auth::probe(provider, keys, ProbeKind::Catalog).await {
                 Ok(found) => {
@@ -604,6 +614,70 @@ fn probe_finding(
             }
         )),
     }
+}
+
+/// `headers:<provider>` (#2343): a provider with `secret_headers` has each value, from
+/// `<ID>_<HEADER>` or the keychain. One that lacks a value (setup or connect could not keep it,
+/// the keychain being off) fails for the manager's provider and warns otherwise, like a key.
+fn headers_finding(
+    provider: &amp_core::models::ProviderConfig,
+    keys: &dyn KeyLookup,
+    roles: &[String],
+    primary: Option<&str>,
+) -> Option<Finding> {
+    if provider.secret_headers.is_empty() {
+        return None;
+    }
+    let id = &provider.id;
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for h in &provider.secret_headers {
+        let var = header_env(id, h);
+        if keys.env(&var).is_some_and(|v| !v.trim().is_empty()) {
+            found.push(format!("{h} from env {var}"));
+        } else if matches!(keys.secret_header(id, h), KeychainKey::Found(v) if !v.trim().is_empty())
+        {
+            found.push(format!("{h} from keychain"));
+        } else {
+            missing.push((h.clone(), var));
+        }
+    }
+    if missing.is_empty() {
+        return Some(Finding::new(CheckStatus::Ok, found.join(", ")));
+    }
+    let status = if primary == Some(id.as_str()) {
+        CheckStatus::Fail
+    } else {
+        CheckStatus::Warn
+    };
+    let names: Vec<&str> = missing.iter().map(|(h, _)| h.as_str()).collect();
+    let vars: Vec<&str> = missing.iter().map(|(_, v)| v.as_str()).collect();
+    let keychain_off = matches!(keys.secret_header(id, &missing[0].0), KeychainKey::Off);
+    let fix = if keychain_off {
+        format!(
+            "set {} in the environment (the OS keychain is off, so `amp-harness connect` can't \
+             keep a header value)",
+            vars.join(" and ")
+        )
+    } else {
+        format!(
+            "run `amp-harness connect {id}` (asks for the value hidden and keeps it in the OS \
+             keychain), or set {} in the environment",
+            vars.join(" and ")
+        )
+    };
+    Some(
+        Finding::new(
+            status,
+            format!(
+                "needs the {} header value{}, so these roles cannot run: {}",
+                names.join(", "),
+                if names.len() == 1 { "" } else { "s" },
+                roles.join(", ")
+            ),
+        )
+        .fix(fix),
+    )
 }
 
 fn key_fix(provider: &str, source: &KeySource, where_: &str) -> String {

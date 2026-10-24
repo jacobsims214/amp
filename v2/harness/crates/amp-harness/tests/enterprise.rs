@@ -356,9 +356,116 @@ async fn keychain_off_setup_names_the_picked_providers_variable_and_asks_for_no_
     assert_nothing_left_the_machine(&guard);
 }
 
+/// #2343: setup's own-endpoint path with the keychain off asked for a secret header's value
+/// hidden, then dropped it without a word. Now it is not asked for: setup says which header was
+/// not kept and names `<ID>_<HEADER>`, the provider is saved as still needing it, doctor says so,
+/// and with the variable set the header reaches the endpoint.
+#[tokio::test]
+async fn keychain_off_setup_names_the_variable_for_a_secret_header_it_cannot_keep() {
+    const HDR: &str = "hdr-TOPSECRET-team-token";
+    let guard = spawn_proxy_guard().await;
+    let amp = spawn(MockAmp::new(), None).await;
+    let endpoint = spawn_provider(ProviderState {
+        key: Some(KEY.into()),
+        header: Some(("X-Team-Token".into(), HDR.into())),
+        models: vec!["engineer".into(), "orchestrator".into()],
+        reply: "on it".into(),
+        ..ProviderState::default()
+    })
+    .await;
+    let dir = workdir("enterprise-setup-no-keychain-header", None);
+    let env = Env::new(&dir, &guard)
+        .var("AMP_HARNESS_PROMPTS", "stdin")
+        .var("AMP_MCP_URL", amp.url.clone())
+        .var("EXAMPLE_API_KEY", KEY);
+    let host = endpoint
+        .url
+        .trim_start_matches("http://")
+        .trim_end_matches("/v1")
+        .to_owned();
+    // No project; own endpoint; name; id; the address, confirm the /v1 URL; bearer auth; a
+    // secret-named header (no value asked), a header whose typed value looks secret, no more;
+    // (the key from EXAMPLE_API_KEY) the models typed (the endpoint can't be listed without the
+    // header); keep the suggested mapping.
+    let answers = format!(
+        "\n4\nExample AI\nexample\n{host}\n\n\nX-Team-Token\nX-Signed\nBearer {HDR}\n\n\
+         engineer,orchestrator\n\n"
+    );
+    let out = env.run(&["init", "--json"], Some(&answers)).await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let err = &out.stderr;
+    assert!(
+        !err.contains("X-Team-Token value"),
+        "asked for the value:\n{err}"
+    );
+    assert!(!err.contains("(kept in the OS keychain)"), "{err}");
+    assert!(
+        err.contains(
+            "X-Team-Token looks like a secret, and the OS keychain is turned off \
+             (AMP_CREDENTIAL_STORE=file): its value could not be kept, so it is not asked for. \
+             Set EXAMPLE_X_TEAM_TOKEN in your environment instead; example is saved as still \
+             needing X-Team-Token."
+        ),
+        "{err}"
+    );
+    assert!(
+        err.contains("the X-Signed value was not kept. Set EXAMPLE_X_SIGNED in your environment"),
+        "{err}"
+    );
+    assert!(
+        !out.stdout.contains(HDR) && !err.contains(HDR),
+        "header value echoed"
+    );
+    assert!(
+        files_containing(&dir, HDR).is_empty(),
+        "header value in a file"
+    );
+    let text = config(&dir);
+    assert!(
+        text.contains("secret_headers = [\"X-Signed\", \"X-Team-Token\"]"),
+        "saved as still needing the headers:\n{text}"
+    );
+
+    // doctor: the manager's provider lacks the header values; the fix names the variables.
+    let out = env.run(&["doctor", "--json"], None).await;
+    let v = out.json();
+    let check = |v: &serde_json::Value, name: &str| {
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no check {name}: {v}"))
+            .clone()
+    };
+    let headers = check(&v, "headers:example");
+    assert_eq!(headers["status"], "fail", "{v}");
+    let detail = headers["detail"].as_str().unwrap();
+    assert!(detail.contains("X-Signed, X-Team-Token"), "{detail}");
+    let fix = headers["fix"].as_str().unwrap();
+    assert!(
+        fix.contains("EXAMPLE_X_SIGNED and EXAMPLE_X_TEAM_TOKEN")
+            && fix.contains("keychain is off"),
+        "{fix}"
+    );
+    assert_eq!(check(&v, "models:example")["status"], "skip", "{v}");
+
+    // With the variables set, the header works without a keychain.
+    let env = env
+        .var("EXAMPLE_X_TEAM_TOKEN", HDR)
+        .var("EXAMPLE_X_SIGNED", "Bearer signed");
+    let out = env.run(&["doctor", "--json"], None).await;
+    let v = out.json();
+    let headers = check(&v, "headers:example");
+    assert_eq!(headers["status"], "ok", "{v}");
+    assert_eq!(check(&v, "models:example")["status"], "ok", "{v}");
+    assert!(!out.stdout.contains(HDR), "header value in doctor's output");
+    assert_nothing_left_the_machine(&guard);
+}
+
 /// #2340: QA's `connect example --base-url … --role …` in a terminal, EXAMPLE_API_KEY set and the
 /// keychain off: the key in the variable is used (no hidden prompt), and a secret header, which
-/// could not be kept, is not asked for either.
+/// could not be kept, is not asked for either (#2343: it is saved as needing EXAMPLE_X_API_KEY).
 #[tokio::test]
 async fn keychain_off_connect_in_a_terminal_uses_the_variable() {
     let guard = spawn_proxy_guard().await;
@@ -397,6 +504,19 @@ async fn keychain_off_connect_in_a_terminal_uses_the_variable() {
     assert!(
         err.contains("X-Api-Key looks like a secret, and the OS keychain is turned off"),
         "{err}"
+    );
+    // #2343: the same words as setup: the variable that supplies it, and still needed.
+    assert!(
+        err.contains(
+            "Set EXAMPLE_X_API_KEY in your environment instead; example is saved as still \
+             needing X-Api-Key."
+        ),
+        "{err}"
+    );
+    assert!(
+        config(&dir).contains("secret_headers = [\"X-Api-Key\"]"),
+        "{}",
+        config(&dir)
     );
     assert!(err.contains("Example AI accepted the key"), "{err}");
     assert!(err.contains("manager    example/orchestrator"), "{err}");

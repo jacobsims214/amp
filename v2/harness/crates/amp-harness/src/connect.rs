@@ -37,8 +37,8 @@ use amp_core::{
     },
     provider_auth::{CLIENT_KEY_SECRET, secret_account},
     providers::{
-        KeyLookup, KeySource, ProviderSet, StaticKeys, SystemKeys, header_account,
-        keychain_account, resolve_key, resolve_secret_headers,
+        KeyLookup, KeySource, KeychainKey, ProviderSet, StaticKeys, SystemKeys, header_account,
+        header_env, keychain_account, resolve_key, resolve_secret_headers,
     },
 };
 use clap::Args;
@@ -261,6 +261,55 @@ pub(crate) fn secret_name(name: &str) -> bool {
     .any(|w| n.contains(w))
 }
 
+/// What setup's own-endpoint path and connect say for a secret header whose value can't be kept
+/// because there is no keychain (`why`), #2343. `typed`: the value was already typed in plain
+/// (it looked secret only afterwards). Either way it is not kept, and the provider is saved as
+/// still needing the header, which [`header_env`] supplies without a keychain.
+pub(crate) fn header_not_kept(id: &str, name: &str, why: &str, typed: bool) -> String {
+    let var = header_env(id, name);
+    if typed {
+        format!(
+            "  That looks like a secret, and {why}: the {name} value was not kept. Set {var} in \
+             your environment instead; {id} is saved as still needing {name}."
+        )
+    } else {
+        format!(
+            "  {name} looks like a secret, and {why}: its value could not be kept, so it is not \
+             asked for. Set {var} in your environment instead; {id} is saved as still needing \
+             {name}."
+        )
+    }
+}
+
+/// The secret headers of `spec` that were not kept ([`header_not_kept`]): (name, variable).
+pub(crate) fn headers_not_kept(spec: &CustomSpec) -> Vec<(String, String)> {
+    spec.secret_headers
+        .iter()
+        .filter(|(_, v)| v.is_empty())
+        .map(|(h, _)| (h.clone(), header_env(&spec.id, h)))
+        .filter(|(_, var)| std::env::var(var).map_or(true, |v| v.trim().is_empty()))
+        .collect()
+}
+
+/// `p` as setup and connect try it before anything is stored: without the secret headers that
+/// have no value yet (empty in `extra`, nothing in `<ID>_<HEADER>`, #2343), so the endpoint is
+/// still tried, and those headers' names (for the note when it refuses).
+pub(crate) fn without_pending_headers(
+    p: &ProviderConfig,
+    extra: &BTreeMap<String, String>,
+) -> (ProviderConfig, Vec<String>) {
+    let pending: Vec<String> = p
+        .secret_headers
+        .iter()
+        .filter(|h| extra.get(*h).is_some_and(String::is_empty))
+        .filter(|h| std::env::var(header_env(&p.id, h)).map_or(true, |v| v.trim().is_empty()))
+        .cloned()
+        .collect();
+    let mut p = p.clone();
+    p.secret_headers.retain(|h| !pending.contains(h));
+    (p, pending)
+}
+
 /// Values that look like credentials whatever the header is called.
 pub(crate) fn secret_value(value: &str) -> bool {
     let v = value.trim();
@@ -347,7 +396,9 @@ pub struct CustomSpec {
     pub needs_key: bool,
     /// Plain headers (written to the file).
     pub headers: BTreeMap<String, String>,
-    /// Secret headers: name -> value (the value goes to the keychain, the name to the file).
+    /// Secret headers: name -> value (the value goes to the keychain, the name to the file). An
+    /// empty value: not kept here (no keychain, #2343); the provider still needs it, from
+    /// [`header_env`] or a later connect.
     pub secret_headers: BTreeMap<String, String>,
     pub models: Vec<String>,
     /// Settings for some of `models` (`context_window`, `max_tokens`, ...; an org preset's
@@ -897,7 +948,17 @@ pub(crate) fn static_keys(
     if !key.is_empty() {
         map.insert(id.to_owned(), key.to_owned());
     }
+    let mut env = BTreeMap::new();
     for (name, value) in secret_headers {
+        // #2343: a value in `<ID>_<HEADER>` wins, as it will at run time; an empty value (not
+        // kept) is not a value.
+        let var = header_env(id, name);
+        if let Some(v) = std::env::var(&var).ok().filter(|v| !v.trim().is_empty()) {
+            env.insert(var, v);
+        }
+        if value.is_empty() {
+            continue;
+        }
         let account = header_account(id, name);
         let short = account
             .strip_prefix(amp_core::providers::KEYCHAIN_ACCOUNT_PREFIX)
@@ -906,7 +967,7 @@ pub(crate) fn static_keys(
         map.insert(short, value.clone());
     }
     StaticKeys {
-        env: BTreeMap::new(),
+        env,
         keychain: Some(map),
     }
 }
@@ -929,6 +990,11 @@ pub(crate) fn store_all_secrets(
     client_key: Option<&str>,
     key_env: Option<&str>,
 ) -> Result<(), String> {
+    // #2343: headers with no value (not kept) have nothing to store.
+    let secret_headers: BTreeMap<&String, &String> = secret_headers
+        .iter()
+        .filter(|(_, v)| !v.is_empty())
+        .collect();
     if key.is_empty() && secret_headers.is_empty() && client_key.is_none() {
         return Ok(());
     }
@@ -979,12 +1045,18 @@ pub(crate) async fn list_models(
     client_key: Option<&str>,
 ) -> Result<Vec<String>, ListError> {
     let keys = static_keys(&p.id, key, secret_headers, client_key);
-    amp_core::provider_auth::probe(p, &keys, amp_core::provider_auth::ProbeKind::Catalog)
+    let (p, pending) = without_pending_headers(p, secret_headers);
+    amp_core::provider_auth::probe(&p, &keys, amp_core::provider_auth::ProbeKind::Catalog)
         .await
         .map(|found| found.ids.into_iter().collect())
-        .map_err(|e| match cert_message(p, &e) {
+        .map_err(|e| match cert_message(&p, &e) {
             Some(m) => ListError::Untrusted(m),
-            None => ListError::Other(e.message),
+            None if pending.is_empty() => ListError::Other(e.message),
+            None => ListError::Other(format!(
+                "{} (tried without {}, which has no value yet)",
+                e.message,
+                pending.join(", ")
+            )),
         })
 }
 
@@ -1895,8 +1967,15 @@ fn custom_target(
             }
             None => {}
         }
-        if let Ok(values) = resolve_secret_headers(p, &SystemKeys::from_env()) {
-            spec.secret_headers = values;
+        // Values from the keychain are written back unchanged; one it lacks stays needed
+        // (empty, #2343), and one in `<ID>_<HEADER>` is never copied into the keychain.
+        let keys = SystemKeys::from_env();
+        for h in &p.secret_headers {
+            let value = match keys.secret_header(&p.id, h) {
+                KeychainKey::Found(v) => v.trim().to_owned(),
+                _ => String::new(),
+            };
+            spec.secret_headers.insert(h.clone(), value);
         }
         if spec.key_env.is_some() && p.key_env.is_some() {
             spec.key_env = p.key_env.clone();
@@ -1936,10 +2015,8 @@ fn custom_target(
             if let Some(why) = keychain_off.as_deref()
                 && secret_name(&name)
             {
-                ui.say(&format!(
-                    "  {name} looks like a secret, and {why}: it could not be kept, so it was \
-                     left out."
-                ));
+                ui.say(&header_not_kept(&spec.id, &name, why, false));
+                spec.secret_headers.insert(name, String::new());
                 continue;
             }
             if secret_name(&name) {
@@ -1953,10 +2030,8 @@ fn custom_target(
             if let Some(why) = keychain_off.as_deref()
                 && secret_value(&v)
             {
-                ui.say(&format!(
-                    "  That looks like a secret, and {why}: {name} could not be kept, so it was \
-                     left out."
-                ));
+                ui.say(&header_not_kept(&spec.id, &name, why, true));
+                spec.secret_headers.insert(name, String::new());
                 continue;
             }
             if secret_value(&v) {
