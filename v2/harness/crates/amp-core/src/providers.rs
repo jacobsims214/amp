@@ -67,6 +67,23 @@ pub fn header_account(provider: &str, header: &str) -> String {
     )
 }
 
+/// The environment variable a provider's secret header value can come from instead of the
+/// keychain (#2343): `<ID>_<HEADER>`, upper case, other characters as `_` (`example` +
+/// `X-Team-Token` = `EXAMPLE_X_TEAM_TOKEN`). It is how such a header works with the OS keychain
+/// off (`AMP_CREDENTIAL_STORE=file`, CI), as `key_env` is for the key.
+pub fn header_env(provider: &str, header: &str) -> String {
+    format!("{provider}_{}", header.trim())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// A provider key. `Debug` and `Display` are redacted.
 #[derive(Clone)]
 pub struct Secret(String);
@@ -314,19 +331,30 @@ pub fn resolve_secret_headers(
 ) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
     for name in &provider.secret_headers {
+        let var = header_env(&provider.id, name);
+        if let Some(value) = keys.env(&var).filter(|v| !v.trim().is_empty()) {
+            out.insert(name.clone(), value.trim().to_owned());
+            continue;
+        }
         match keys.secret_header(&provider.id, name) {
             KeychainKey::Found(value) if !value.trim().is_empty() => {
                 out.insert(name.clone(), value.trim().to_owned());
             }
-            KeychainKey::Failed(why) => return Err(format!("header {name}: keychain: {why}")),
+            KeychainKey::Failed(why) => {
+                return Err(format!(
+                    "header {name}: keychain: {why} (or set {var} in the environment)"
+                ));
+            }
             KeychainKey::Off => {
                 return Err(format!(
-                    "header {name} is kept in the OS keychain, which is off here"
+                    "header {name} is kept in the OS keychain, which is off here: set {var} in \
+                     the environment instead"
                 ));
             }
             _ => {
                 return Err(format!(
-                    "no value for header {name} (run `amp-harness connect {}`)",
+                    "no value for header {name} (run `amp-harness connect {}`, or set {var} in \
+                     the environment)",
                     provider.id
                 ));
             }
@@ -1071,6 +1099,38 @@ mod tests {
         let set = ProviderSet::build(&c, &keys);
         assert!(set.get("gw").is_ok(), "{set:?}");
         assert!(!format!("{set:?}").contains("TOPSECRET"));
+    }
+
+    #[test]
+    fn a_secret_header_value_can_come_from_the_environment() {
+        // #2343: with the keychain off, `<ID>_<HEADER>` is how a secret header works.
+        let c = config(
+            "[providers.my-gw]\nname = \"Gateway\"\napi = \"openai-completions\"\n\
+             base_url = \"http://gw.invalid/v1\"\nauth = \"none\"\n\
+             secret_headers = [\"X-Team-Token\"]\n[providers.my-gw.models.\"m\"]\n",
+        );
+        let gw = &c.providers["my-gw"];
+        assert_eq!(header_env("my-gw", "X-Team-Token"), "MY_GW_X_TEAM_TOKEN");
+        // Keychain off, nothing set: the error names the variable (never a value).
+        let why = resolve_secret_headers(gw, &StaticKeys::default()).unwrap_err();
+        assert!(why.contains("X-Team-Token"), "{why}");
+        assert!(why.contains("MY_GW_X_TEAM_TOKEN"), "{why}");
+        // Set: used, keychain or not.
+        let keys = StaticKeys {
+            env: BTreeMap::from([(
+                "MY_GW_X_TEAM_TOKEN".to_owned(),
+                " ENV-TOPSECRET ".to_owned(),
+            )]),
+            ..StaticKeys::default()
+        };
+        assert_eq!(
+            resolve_secret_headers(gw, &keys).unwrap()["X-Team-Token"],
+            "ENV-TOPSECRET"
+        );
+        let set = ProviderSet::build(&c, &keys);
+        assert!(set.get("my-gw").is_ok(), "{set:?}");
+        // And it is kept from bash and MCP servers like a key variable.
+        assert!(crate::agent::secret_env_names(&c).contains("MY_GW_X_TEAM_TOKEN"));
     }
 
     #[test]

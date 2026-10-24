@@ -197,7 +197,8 @@ reviewers = "example/orchestrator"
   - `auth = "oauth-client-credentials"` or `"azure-entra"`;
   - `ca_file`, `client_cert`, `proxy`, `query`;
   - `secret_headers = ["X-Team-Token"]`: each person is asked for the value, which goes to their
-    keychain.
+    keychain. Without a keychain (CI, `AMP_CREDENTIAL_STORE=file`) the value comes from
+    `<ID>_<HEADER>` instead (`EXAMPLE_X_TEAM_TOKEN`).
 - MCP servers everyone should have go in `[mcp.<name>]` tables, in the config.toml schema
   (`harness/mcp-servers.md`). Their secrets are asked from each person at setup.
 
@@ -373,6 +374,16 @@ one.
 - An extra header that isn't secret (`X-Team: platform`): `--header X-Team=platform`.
 - An extra header that is secret: add it in a terminal, where its value goes to the keychain.
   `--header` refuses secret values.
+- A secret header with the keychain off (`AMP_CREDENTIAL_STORE=file`, CI): set
+  `<ID>_<HEADER>` in the environment, upper case, other characters as `_`
+  (`example` + `X-Team-Token` = `EXAMPLE_X_TEAM_TOKEN`). It wins over the keychain. Setup and
+  connect don't ask for a value they can't keep: they say
+  `X-Team-Token looks like a secret, and the OS keychain is turned off (AMP_CREDENTIAL_STORE=file):
+  its value could not be kept, so it is not asked for. Set EXAMPLE_X_TEAM_TOKEN in your
+  environment instead; example is saved as still needing X-Team-Token.` The provider keeps
+  `secret_headers = ["X-Team-Token"]`, and doctor's `headers:example` check fails (manager's
+  provider) or warns until the variable is set. Like a key variable, it is never passed to
+  bash or MCP servers.
 - Tokens from an SSO tool: `--auth command --auth-command "corp-sso token --audience llm"`.
 
 **A model isn't listed.** Check what the endpoint returns with `amp-harness models list

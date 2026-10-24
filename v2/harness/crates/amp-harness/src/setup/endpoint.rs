@@ -6,7 +6,8 @@
 //! `https://api.example.com/v1` after a confirmation; plain http only for localhost unless the
 //! person confirms), the API key (hidden; Enter for an endpoint that takes none; a key already in
 //! `<ID>_API_KEY` is used as is), extra header names (values that are secrets are read hidden and
-//! kept in the OS keychain), then the models it lists (`GET /models`, or typed when it lists
+//! kept in the OS keychain; with the keychain off they are not asked for, and the provider is
+//! saved as needing `<ID>_<HEADER>`, #2343), then the models it lists (`GET /models`, or typed when it lists
 //! none) and which model each group of roles runs on ([`super::role_map`]), defaulting by name.
 //!
 //! The result is `[providers.<id>]` plus the role mapping in config.toml, and the key in the OS
@@ -157,8 +158,15 @@ fn ask_name_and_id(ui: &mut dyn Ui, cfg: &ModelsConfig) -> Result<(String, Strin
     Ok((name, id))
 }
 
-/// Extra headers: names asked one by one; secret values hidden (keychain), others plain.
-fn ask_headers(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), CliError> {
+/// Extra headers: names asked one by one; secret values hidden (keychain), others plain. Without
+/// a keychain (`no_keychain` = why) a secret value could not be kept, so it is not asked for
+/// (#2343, as connect does): the person is told which variable supplies it, and the header is
+/// saved as still needed (an empty value).
+fn ask_headers(
+    ui: &mut dyn Ui,
+    spec: &mut CustomSpec,
+    no_keychain: Option<&String>,
+) -> Result<(), CliError> {
     loop {
         let name = ui.ask(
             "Extra header the endpoint needs (name, Enter for none)",
@@ -168,6 +176,13 @@ fn ask_headers(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), CliError> {
         if name.is_empty() {
             return Ok(());
         }
+        if let Some(why) = no_keychain
+            && connect::secret_name(&name)
+        {
+            ui.say(&connect::header_not_kept(&spec.id, &name, why, false));
+            spec.secret_headers.insert(name, String::new());
+            continue;
+        }
         if connect::secret_name(&name) {
             let v = ui.secret(&format!("{name} value (kept in the OS keychain)"))?;
             if !v.is_empty() {
@@ -176,6 +191,13 @@ fn ask_headers(ui: &mut dyn Ui, spec: &mut CustomSpec) -> Result<(), CliError> {
             continue;
         }
         let v = ui.ask(&format!("{name} value"), None)?;
+        if let Some(why) = no_keychain
+            && connect::secret_value(&v)
+        {
+            ui.say(&connect::header_not_kept(&spec.id, &name, why, true));
+            spec.secret_headers.insert(name, String::new());
+            continue;
+        }
         if connect::secret_value(&v) {
             ui.say(&format!(
                 "  That looks like a secret: {name} goes to the OS keychain, not config.toml."
@@ -751,7 +773,7 @@ pub async fn ask(
                 .query
                 .insert("api-version".to_owned(), v.to_owned());
         }
-        ask_headers(ui, &mut spec)?;
+        ask_headers(ui, &mut spec, no_keychain)?;
     }
     let provider = spec.config().map_err(CliError::new)?;
     let name = super::display_name(&provider);
