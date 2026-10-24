@@ -530,9 +530,11 @@ impl Component for HelpBlock {
             + 2;
         let inner = width.saturating_sub(HELP_INDENT).max(1);
         let two_columns = inner >= col + Self::TWO_COLUMNS;
+        // Compact (#2346): no blank rows between the groups or after the list.
+        let compact = crate::density::compact();
         let mut out = vec![String::new()];
         for (g, (title, rows)) in groups.iter().enumerate() {
-            if g > 0 {
+            if g > 0 && !compact {
                 out.push(String::new());
             }
             out.push(format!(
@@ -569,7 +571,9 @@ impl Component for HelpBlock {
                 }
             }
         }
-        out.push(String::new());
+        if !compact {
+            out.push(String::new());
+        }
         out
     }
 

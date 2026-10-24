@@ -353,7 +353,8 @@ impl Component for Footer {
             return Vec::new();
         }
         let c = theme().colors;
-        if width >= FOLD_BELOW {
+        // Compact (#2346): one row at any width.
+        if width >= FOLD_BELOW && !crate::density::compact() {
             // Two rows: where, then what it costs and the model.
             let mut lines = Vec::new();
             let left = p.left();
@@ -408,6 +409,10 @@ impl Component for Footer {
         }
         let left = p.left();
         let (rp, rs) = p.right();
+        if left.is_empty() && rp.is_empty() {
+            // Nothing to say (no cwd, model or usage yet): no row, as the two-row layout.
+            return Vec::new();
+        }
         if visible_width(&left) + visible_width(&rp) + GAP > width && !rp.is_empty() {
             // Still too wide (a tiny terminal): the left side alone, cut.
             return vec![c.dim.fg(&shorten(&left, width))];
@@ -464,11 +469,25 @@ mod tests {
     }
 
     #[test]
-    fn wide_is_two_rows() {
+    fn wide_is_one_row_when_compact() {
         let f = footer();
         f.add_usage(1, 1, 0, 0, 0.0042);
         f.set_context_tokens(Some(44_000));
         let rows = plain(&f.render(120));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].starts_with("/Volumes/"), "{rows:?}");
+        assert!(
+            rows[0].ends_with("$0.004 · ctx 4% · xiaomi/mimo-v2.6-pro • high"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn wide_is_two_rows_when_comfortable() {
+        let f = footer();
+        f.add_usage(1, 1, 0, 0, 0.0042);
+        f.set_context_tokens(Some(44_000));
+        let rows = crate::density::with(crate::Density::Comfortable, || plain(&f.render(120)));
         assert_eq!(
             rows,
             vec![

@@ -1,17 +1,12 @@
                                                                                 |
  ▀▀▀▀▀▀▀▀ ada@example.com · simstech › AMP #2                       ● connected |
  ■ In progress #2106 M3-3 Header and AMP status line              ▌ AMP Harness |
-                                                                                |
   AMP harness · manager                                                         |
   project #2 AMP                                                                |
                                                                                 |
-                                                                                |
   show me the board                                                             |
                                                                                 |
-                                                                                |
-  ✗ ls crates · # ms                                                            |
-    │ Tool ls not found                                                         |
-                                                                                |
+  ✗ ls crates · Tool ls not found · # ms                                        |
   Here is the board, with a paragraph long enough that it has to wrap at        |
   eighty columns and again at a hundred and twenty-seven, so the right edge     |
   shows.                                                                        |
@@ -28,6 +23,11 @@
   Done.                                                                         |
                                                                                 |
  ── ■ In progress #2106 M3-3 Header and AMP status line ─────────────────────── |
+                                                                                |
+                                                                                |
+                                                                                |
+                                                                                |
+                                                                                |
                                                                                 |
                                                                                 |
                                                                                 |

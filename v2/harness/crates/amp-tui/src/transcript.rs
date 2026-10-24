@@ -99,6 +99,8 @@ pub struct WrapText {
     padding_y: usize,
     /// The blank rows above it too (else only below).
     padding_top: bool,
+    /// The blank rows below it too (else only above, #2346).
+    padding_bottom: bool,
     cache: Cache,
 }
 
@@ -109,6 +111,7 @@ impl WrapText {
             padding_x,
             padding_y,
             padding_top: true,
+            padding_bottom: true,
             cache: Cache::default(),
         }
     }
@@ -116,6 +119,12 @@ impl WrapText {
     /// Without the blank rows above, when what comes before already ends with one (#2334).
     pub fn with_top_padding(mut self, top: bool) -> Self {
         self.padding_top = top;
+        self
+    }
+
+    /// Without the blank rows below (compact notices, #2346).
+    pub fn with_bottom_padding(mut self, bottom: bool) -> Self {
+        self.padding_bottom = bottom;
         self
     }
 }
@@ -131,7 +140,9 @@ impl Component for WrapText {
                 &" ".repeat(self.padding_x),
                 content_width,
             ));
-            lines.extend(std::iter::repeat_n(String::new(), self.padding_y));
+            if self.padding_bottom {
+                lines.extend(std::iter::repeat_n(String::new(), self.padding_y));
+            }
             lines
         })
     }
@@ -348,6 +359,11 @@ impl Component for WrapMarkdown {
             for segment in segments(&text) {
                 match segment {
                     Segment::Prose(s) => {
+                        let s = if self.style == MarkdownStyle::Plain && crate::density::compact() {
+                            compact_prose(&s)
+                        } else {
+                            s
+                        };
                         for row in self.markdown(s).render(UNBOUNDED) {
                             lines.extend(reflow_row(&unpad_code_chips(&row), text_width));
                         }
@@ -367,6 +383,36 @@ impl Component for WrapMarkdown {
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Compact prose (#2346): headings of every level render as bold text (`#`/`##` lose rpi's
+/// underline: they become `###`), with no blank line under them, and a run of blank lines
+/// shows as one.
+fn compact_prose(src: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut after_heading = false;
+    let mut blank_run = false;
+    for line in src.lines() {
+        if line.trim().is_empty() {
+            if after_heading || blank_run {
+                continue;
+            }
+            blank_run = true;
+            out.push(String::new());
+            continue;
+        }
+        blank_run = false;
+        let t = line.trim_start();
+        let hashes = t.bytes().take_while(|&b| b == b'#').count();
+        let heading = (1..=6).contains(&hashes) && t[hashes..].starts_with(' ');
+        after_heading = heading;
+        if heading && hashes < 3 {
+            out.push(format!("###{}", &t[hashes..]));
+        } else {
+            out.push(line.to_owned());
+        }
+    }
+    out.join("\n")
 }
 
 /// A run of markdown source lines: prose (word-wrapped by us) or a width-dependent block.
@@ -727,7 +773,8 @@ impl Component for ThinkingBlock {
         if self.is_expanded() {
             rows.extend(self.body(&s.text, width));
         }
-        if s.spacer {
+        // Compact (#2346): the answer follows a collapsed header straight away.
+        if s.spacer && (self.is_expanded() || !crate::density::compact()) {
             rows.push(String::new());
         }
         rows
@@ -1066,7 +1113,8 @@ pub struct UserBlock {
 
 fn user_box(text: &str) -> BgBox {
     let bg = theme().colors.surface;
-    let content = BgBox::new(1, 1);
+    // Compact (#2346): no padding rows above and below the text.
+    let content = BgBox::new(1, if crate::density::compact() { 0 } else { 1 });
     content.set_bg_fn(Some(Arc::new(move |s: &str| bg.bg(s))));
     content.add_child(Arc::new(WrapText::new(verbatim(text), 0, 0)));
     content
@@ -1119,8 +1167,10 @@ impl Component for UserBlock {
         if let Some(first) = lines.first_mut() {
             first.insert_str(0, OSC133_ZONE_START);
         }
+        // The zone ends after the text: at the end of the last row, so a one-row bubble
+        // (compact, #2346) still reads start, text, end.
         if let Some(last) = lines.last_mut() {
-            last.insert_str(0, &format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}"));
+            last.push_str(&format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}"));
         }
         if self.margin_above && !lines.is_empty() {
             lines.insert(0, String::new());
@@ -1346,9 +1396,20 @@ impl ToolBlock {
             }
             _ => String::new(),
         };
+        // Compact (#2346): a failed call is one line too, its error's first line on it; the
+        // whole error shows with Ctrl+O.
+        let error_inline =
+            inner.state == ToolState::Failed && !expanded && crate::density::compact();
+        let first_error = inner
+            .detail
+            .as_deref()
+            .and_then(|d| d.lines().map(str::trim).find(|l| !l.is_empty()))
+            .map(plain)
+            .unwrap_or_default();
         let summary = match inner.state {
             // A failed call's error is under it, whole.
             ToolState::Completed => inner.summary.as_str(),
+            ToolState::Failed if error_inline => first_error.as_str(),
             _ => "",
         };
         let mut rows = vec![paint(&tool_line(
@@ -1357,6 +1418,7 @@ impl ToolBlock {
                 title: &inner.title,
                 args: &inner.args,
                 summary,
+                error: error_inline,
                 elapsed: &elapsed,
             },
             width,
@@ -1403,6 +1465,7 @@ impl ToolBlock {
             }
         }
         match (&inner.detail, inner.state, expanded) {
+            (Some(_), ToolState::Failed, _) if error_inline => {}
             (Some(detail), ToolState::Failed, _) => {
                 let limit = if expanded {
                     RESULT_PREVIEW_LINES
@@ -1430,6 +1493,8 @@ struct ToolLine<'a> {
     title: &'a str,
     args: &'a str,
     summary: &'a str,
+    /// The summary is a failed call's error (compact, #2346): drawn in the error colour.
+    error: bool,
     elapsed: &'a str,
 }
 
@@ -1460,7 +1525,11 @@ fn tool_line(l: &ToolLine, width: usize) -> String {
         let sum_room = room.saturating_sub(arg_cap).min(sum_need);
         (room - sum_room, sum_room)
     };
-    let mut line = format!(" {} {}", l.glyph, colors.tool_title.fg(&bold(&title)));
+    let mut line = format!(
+        " {} {}",
+        l.glyph,
+        colors.tool_title.fg(&crate::density::strong(&title))
+    );
     if arg_room > 2 {
         let args = crate::chrome::shorten(l.args, arg_room - 1);
         line.push_str(&format!(" {}", colors.muted.fg(&args)));
@@ -1468,7 +1537,12 @@ fn tool_line(l: &ToolLine, width: usize) -> String {
     let sep = colors.dim.fg(" · ");
     if sum_room > 4 {
         let summary = crate::chrome::shorten(l.summary, sum_room - 3);
-        line.push_str(&format!("{sep}{}", colors.tool_output.fg(&summary)));
+        let color = if l.error {
+            colors.error
+        } else {
+            colors.tool_output
+        };
+        line.push_str(&format!("{sep}{}", color.fg(&summary)));
     }
     if !elapsed.is_empty() {
         line.push_str(&format!("{sep}{}", colors.dim.fg(elapsed)));
@@ -1580,6 +1654,7 @@ impl ToolGroup {
                 title: &format!("{} calls", calls.len()),
                 args: "",
                 summary: &names.join(", "),
+                error: false,
                 elapsed: &format_elapsed(took),
             },
             width,
@@ -1801,7 +1876,21 @@ mod tests {
             "the plan was last approved before #2078 was planned\nApprove it in AMP",
             true,
         );
-        let rows = failed.rows(60);
+        // Compact (#2346): one line, the error's first line on it.
+        let rows = failed.rows(100);
+        assert!(rows.iter().all(|r| r.contains("\x1b[48")), "{rows:?}");
+        let rows = plain_rows(&rows);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].starts_with(
+                " ✗ complete_task #2078 all done · the plan was last approved before #2078 was"
+            ),
+            "{rows:?}"
+        );
+        // Comfortable: the error under it.
+        failed.clear_cache();
+        let rows = crate::density::with(crate::Density::Comfortable, || failed.rows(60));
+        failed.clear_cache();
         assert!(rows.iter().all(|r| r.contains("\x1b[48")), "{rows:?}");
         let rows = plain_rows(&rows);
         assert!(
@@ -1907,13 +1996,26 @@ mod tests {
     const TYPED: &str = "export it from mathx/__init__.py, rename a_b_c, match *.rs and keep **x**";
 
     #[test]
+    fn a_one_row_message_marks_its_prompt_zone_in_order() {
+        let rows = UserBlock::new("hi").render(40);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (a, b, c) = (
+            rows[0].find(OSC133_ZONE_START).unwrap(),
+            rows[0].find(OSC133_ZONE_END).unwrap(),
+            rows[0].find(OSC133_ZONE_FINAL).unwrap(),
+        );
+        let text = rows[0].find("hi").unwrap();
+        assert!(a < text && text < b && b < c, "{:?}", rows[0]);
+    }
+
+    #[test]
     fn the_users_message_is_shown_exactly_as_typed() {
         let rows = plain_rows(&UserBlock::new(TYPED).render(120));
         assert!(rows.iter().any(|r| r.trim() == TYPED), "{rows:#?}");
 
         // Wrapped at 40 columns, the words are the same and in order.
         let rows = plain_rows(&UserBlock::new(TYPED).render(40));
-        assert!(rows.len() > 3, "{rows:#?}");
+        assert!(rows.len() >= 3, "{rows:#?}");
         assert!(rows.iter().all(|r| r.chars().count() <= 40), "{rows:#?}");
         let words: Vec<String> = rows
             .iter()
@@ -1974,6 +2076,13 @@ mod tests {
             Block::Text("The answer.".into()),
         ]);
         let rows = plain_rows(&block.render(80));
+        assert_eq!(rows, vec![" ▸ Thought for 0s", " The answer."]);
+        // Comfortable: a blank row between them.
+        let rows = crate::density::with(crate::Density::Comfortable, || {
+            block.invalidate();
+            plain_rows(&block.render(80))
+        });
+        block.invalidate();
         assert_eq!(rows, vec![" ▸ Thought for 0s", "", " The answer."]);
         let thinking = block.thinking.lock().unwrap()[0].clone();
         assert!(!thinking.is_live());
@@ -2038,7 +2147,7 @@ mod tests {
         let rows = plain_rows(&block.render(40));
         assert_eq!(
             rows,
-            vec![" ▸ Thinking", "", " a", " ▾ Thinking", " │ two", "", " b"]
+            vec![" ▸ Thinking", " a", " ▾ Thinking", " │ two", "", " b"]
         );
         assert_eq!(block.toggle_thinking(), Some(false));
         assert!(!plain_rows(&block.render(40)).contains(&" │ two".to_owned()));
@@ -2091,7 +2200,7 @@ mod tests {
         let block = two_sections(ThinkingDisplay::Collapsed);
         assert_eq!(
             plain_rows(&block.render(40)),
-            vec![" ▸ Thought for 0s", "", " a", " ▸ Thought for 0s", "", " b"]
+            vec![" ▸ Thought for 0s", " a", " ▸ Thought for 0s", " b"]
         );
         assert_eq!(block.toggle_section(0), Some(true));
         assert_eq!(
@@ -2102,7 +2211,6 @@ mod tests {
                 "",
                 " a",
                 " ▸ Thought for 0s",
-                "",
                 " b"
             ]
         );
@@ -2116,14 +2224,14 @@ mod tests {
         block.set_hint(Some(THINKING_HINT));
         let rows = plain_rows(&block.render(60));
         assert_eq!(rows[0], " ▸ Thought for 0s");
-        assert_eq!(rows[3], " ▸ Thought for 0s · Ctrl+T or click to open");
+        assert_eq!(rows[2], " ▸ Thought for 0s · Ctrl+T or click to open");
         // Open, it says nothing; too narrow, neither.
         block.toggle_thinking();
-        assert_eq!(plain_rows(&block.render(60))[3], " ▾ Thought for 0s");
+        assert_eq!(plain_rows(&block.render(60))[2], " ▾ Thought for 0s");
         block.toggle_thinking();
-        assert_eq!(plain_rows(&block.render(30))[3], " ▸ Thought for 0s");
+        assert_eq!(plain_rows(&block.render(30))[2], " ▸ Thought for 0s");
         block.set_hint(None);
-        assert_eq!(plain_rows(&block.render(60))[3], " ▸ Thought for 0s");
+        assert_eq!(plain_rows(&block.render(60))[2], " ▸ Thought for 0s");
     }
 
     #[test]
@@ -2154,13 +2262,18 @@ mod tests {
     #[test]
     fn header_rows_count_the_gap_and_open_sections() {
         let block = two_sections(ThinkingDisplay::Collapsed);
-        assert_eq!(block.thinking_headers(40), vec![(0, 0), (3, 1)]);
+        assert_eq!(block.thinking_headers(40), vec![(0, 0), (2, 1)]);
         block.toggle_section(0);
         assert_eq!(block.thinking_headers(40), vec![(0, 0), (4, 1)]);
         let after_tools = two_sections(ThinkingDisplay::Collapsed);
         after_tools.set_gap_above();
         assert_eq!(after_tools.render(40)[0], "");
-        assert_eq!(after_tools.thinking_headers(40), vec![(1, 0), (4, 1)]);
+        assert_eq!(after_tools.thinking_headers(40), vec![(1, 0), (3, 1)]);
+        // Comfortable: a blank row under each collapsed header.
+        let rows = crate::density::with(crate::Density::Comfortable, || {
+            after_tools.thinking_headers(40)
+        });
+        assert_eq!(rows, vec![(1, 0), (4, 1)]);
     }
 
     #[test]

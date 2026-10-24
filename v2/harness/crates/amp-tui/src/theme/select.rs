@@ -22,6 +22,7 @@ pub const ENV_COLOR: &str = "AMP_HARNESS_COLOR";
 pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
 pub const ENV_MOUSE: &str = "AMP_HARNESS_MOUSE";
 pub const ENV_PADDING: &str = "AMP_HARNESS_PADDING";
+pub const ENV_DENSITY: &str = "AMP_HARNESS_DENSITY";
 
 /// Dark or light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,8 @@ struct TuiTable {
     mouse: Option<toml::Value>,
     /// Columns left and right of the chat, #2251.
     padding: Option<toml::Value>,
+    /// `compact` or `comfortable`, #2346.
+    density: Option<String>,
 }
 
 /// How the chat shows thinking (#2177): `AMP_HARNESS_SHOW_THINKING`, then config.toml `[tui]
@@ -203,6 +206,28 @@ pub fn resolve_padding(
             "[tui] padding: unknown value `{other}`: use a number of columns from 0 to {}",
             crate::MAX_PADDING
         ))),
+    }
+}
+
+/// How tightly the chat is laid out (#2346): `AMP_HARNESS_DENSITY`, then config.toml `[tui]
+/// density`, then compact. Values: `compact`, `comfortable`.
+pub fn resolve_density(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<crate::Density, ThemeError> {
+    if let Some(v) = env(ENV_DENSITY).filter(|v| !v.trim().is_empty()) {
+        return crate::Density::parse(&v).map_err(|e| ThemeError(format!("{ENV_DENSITY}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.density {
+        None => Ok(crate::Density::default()),
+        Some(v) => crate::Density::parse(&v).map_err(|e| ThemeError(format!("[tui] density: {e}"))),
     }
 }
 
@@ -533,6 +558,26 @@ mod tests {
         assert!(e.0.contains("[tui] mouse"), "{}", e.0);
         let e = resolve_mouse(&env_of(&[(ENV_MOUSE, "maybe")]), None).unwrap_err();
         assert!(e.0.contains(ENV_MOUSE), "{}", e.0);
+    }
+
+    #[test]
+    fn density_from_env_then_config_then_compact() {
+        let none = |_: &str| None;
+        assert_eq!(
+            resolve_density(&none, None).unwrap(),
+            crate::Density::Compact
+        );
+        assert_eq!(
+            resolve_density(&none, Some("[tui]\ndensity = \"comfortable\"\n")).unwrap(),
+            crate::Density::Comfortable
+        );
+        let env = env_of(&[(ENV_DENSITY, "compact")]);
+        assert_eq!(
+            resolve_density(&env, Some("[tui]\ndensity = \"comfortable\"\n")).unwrap(),
+            crate::Density::Compact
+        );
+        let e = resolve_density(&none, Some("[tui]\ndensity = \"cosy\"\n")).unwrap_err();
+        assert!(e.0.contains("[tui] density"), "{}", e.0);
     }
 
     #[test]

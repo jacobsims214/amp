@@ -1263,6 +1263,8 @@ impl Inner {
             &amp_tui::DEFAULT_PADDING.to_string(),
         );
         line(&mut rows, "padding", v, src);
+        let (v, src) = setting("tui", "density", "AMP_HARNESS_DENSITY", "compact");
+        line(&mut rows, "density", v, src);
         let auto = if crate::reload::auto_reload(&|k| std::env::var(k).ok()) {
             "on"
         } else {

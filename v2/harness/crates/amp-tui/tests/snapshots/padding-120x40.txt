@@ -1,14 +1,12 @@
                                                                                                                         |
   ▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2                             ● connected 2026-07-28  |
   ■ In progress #2106 M3-3 Header and AMP status line                              ▌ AMP Harness › M3 theme + metadata  |
-                                                                                                                        |
+   AMP harness · manager                                                                                                |
+   project #2 AMP                                                                                                       |
                                                                                                                         |
    show me the board                                                                                                    |
                                                                                                                         |
-                                                                                                                        |
-   ✗ ls crates · # ms                                                                                                   |
-     │ Tool ls not found                                                                                                |
-                                                                                                                        |
+   ✗ ls crates · Tool ls not found · # ms                                                                               |
    Here is the board, with a paragraph long enough that it has to wrap at eighty columns and again at a hundred and     |
    twenty-seven, so the right edge shows.                                                                               |
    ┌────────┬─────────────┬────────────────┐                                                                            |
@@ -23,6 +21,9 @@
    Done.                                                                                                                |
                                                                                                                         |
   ── ■ In progress #2106 M3-3 Header and AMP status line ─────────────────────────────────────────────────────────────  |
+                                                                                                                        |
+                                                                                                                        |
+                                                                                                                        |
   ── AMP · workers ───────────────────────────────────────────────────────────────────────────────────────────────────  |
   › ■ In progress running #2105 M3-5 Inline ticket chips · amp:amp-worker-backend · local                               |
       claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                                                        |
@@ -35,6 +36,5 @@
   / for commands                                                                                                        |
   ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────  |
   ■  2 QUESTIONS  │ workers 1 ■ running · 1 queued │ plan: 2 waiting for your approval │ □ 5 Ready    unreported #2106  |
-  /work/amp (harness-m4) • manager · #2106                                                                              |
-  ctx <1%                                                                                        faux-1 • thinking off  |
+  /work/amp (harness-m4) • manager · #2106                                             ctx <1% · faux-1 • thinking off  |
                                                                                                                         |

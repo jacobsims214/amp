@@ -747,7 +747,10 @@ impl Component for ApprovalNotice {
         };
         let mut out = vec![String::new()];
         for line in wrap_plain(&title, width.saturating_sub(2)) {
-            out.push(format!("  {}", rpi_tui::bold(&c.warning.fg(&line))));
+            out.push(format!(
+                "  {}",
+                crate::density::strong(&c.warning.fg(&line))
+            ));
         }
         let sentence = without_link(&self.refusal.message, self.refusal.link.as_deref());
         for line in wrap_plain(&clean(&sentence), room) {

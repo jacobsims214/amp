@@ -110,18 +110,17 @@ async fn a_prompt_renders_the_reply_and_the_footer() {
 
     let lines = rig.shell.view().render_plain(W, H);
     assert_eq!(lines.len(), H, "the frame fills the screen");
-    // The two-line footer is the last two lines above the bottom padding row (#2344): cwd
-    // (branch) • role, then stats … model.
+    // The one-row footer (compact, #2346) is the last line above the bottom padding row
+    // (#2344): cwd (branch) • role, then stats … model.
     assert_eq!(lines[H - 1], "", "a blank row below the footer");
-    let footer1 = &lines[H - V - 2];
-    let footer2 = &lines[H - V - 1];
+    let footer = &lines[H - V - 1];
     assert!(
-        footer1.contains("/work/amp (harness-m2) • manager"),
-        "{footer1}"
+        footer.contains("/work/amp (harness-m2) • manager"),
+        "{footer}"
     );
     assert!(
-        footer2.ends_with(&format!("{} • thinking off", rig.model.id)),
-        "{footer2}"
+        footer.ends_with(&format!("{} • thinking off", rig.model.id)),
+        "{footer}"
     );
     assert!(!rig.shell.is_running());
 }
