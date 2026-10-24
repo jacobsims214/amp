@@ -533,6 +533,9 @@ pub struct Shell {
     viewing: Option<i64>,
     /// A stop waiting for its `y` (#2252).
     stop_confirm: Option<i64>,
+    /// The person clicked into the editor while a panel was open (#2344): the editor has the
+    /// keys (↑↓ and Enter included) until the panel closes or something is sent.
+    editor_clicked: bool,
     /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
     person: Option<String>,
     /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
@@ -591,6 +594,7 @@ impl Shell {
                 sessions: Default::default(),
                 viewing: None,
                 stop_confirm: None,
+                editor_clicked: false,
                 person: None,
                 history: PromptHistory::new(),
             },
@@ -602,12 +606,61 @@ impl Shell {
         &self.view
     }
 
-    /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
     /// Columns of space left and right of the chat (`[tui] padding`, #2251).
     pub fn set_padding(&mut self, columns: usize) {
         self.view.set_padding(columns);
     }
 
+    /// Whether the input has the keys (#2344), so the terminal shows its cursor in the editor.
+    /// It doesn't while:
+    /// - a `/connect` key is being typed (hidden), or a worker stop waits for its `y`;
+    /// - a worker's session is shown in the editor's place;
+    /// - `/questions` shows an answer for confirmation, or sends it;
+    /// - a panel is open with an empty editor (↑↓, Enter and a configuration panel's letter
+    ///   keys go to it), unless the person clicked into the editor.
+    pub fn input_focused(&self) -> bool {
+        if self.secret.is_some() || self.stop_confirm.is_some() || self.viewing.is_some() {
+            return false;
+        }
+        match self.view.panel().state().map(|s| s.stage) {
+            None | Some(Stage::Answer { .. }) => true,
+            Some(Stage::Confirm { .. } | Stage::Sending { .. }) => false,
+            Some(Stage::Browse) => self.editor_clicked || !self.view.editor().get_text().is_empty(),
+        }
+    }
+
+    /// Hands [`Shell::input_focused`] to the view, which shows or hides the cursor. The terminal
+    /// loop calls it before every repaint.
+    pub fn sync_focus(&mut self) {
+        if !self.view.panel().is_open() {
+            self.editor_clicked = false;
+        }
+        self.view.set_input_focus(self.input_focused());
+    }
+
+    /// A left click at `(row, column)` (0-based) on a `width` x `height` screen (#2344). Inside
+    /// the editor box it gives the editor the keys and puts the insertion point where it landed.
+    /// Returns whether it did.
+    pub fn click(&mut self, width: usize, height: usize, row: usize, column: usize) -> bool {
+        if self.secret.is_some() || self.stop_confirm.is_some() || self.viewing.is_some() {
+            return false;
+        }
+        let Some((line, byte)) = self.view.editor_hit(width, height, row, column) else {
+            return false;
+        };
+        if matches!(
+            self.view.panel().state().map(|s| s.stage),
+            Some(Stage::Confirm { .. } | Stage::Sending { .. })
+        ) {
+            return false;
+        }
+        self.editor_clicked = self.view.panel().is_open();
+        self.view.editor().set_cursor(line, byte);
+        self.sync_focus();
+        true
+    }
+
+    /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
     pub fn set_mouse_capture(&mut self, on: bool) {
         self.mouse_capture = on;
     }
@@ -1170,6 +1223,7 @@ impl Shell {
 
     /// Handles one editor submission: a slash command or a prompt to the agent.
     pub async fn submit(&mut self, text: &str) -> Submit {
+        self.editor_clicked = false;
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return Submit::Continue;
@@ -1863,7 +1917,8 @@ impl Shell {
                     panel.close();
                     return true;
                 }
-                if !editor_empty {
+                // #2344: a click into the editor gave it the keys.
+                if !editor_empty || self.editor_clicked {
                     return false;
                 }
                 match key.code {

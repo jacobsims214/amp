@@ -41,7 +41,8 @@
 //!   branch, role · #ticket, `$0.004 · ctx 4%` and model • thinking; one row below 100 columns.
 //!
 //! - [`inset`] (#2251): `[tui] padding` columns of space left and right of every area of the
-//!   chat ([`inset::Inset`], one shared [`inset::Padding`]), shrinking on narrow terminals.
+//!   chat ([`inset::Inset`], one shared [`inset::Padding`]), shrinking on narrow terminals, and
+//!   a blank row above and below it ([`inset::Gap`], #2344).
 //!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
@@ -65,7 +66,9 @@ pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
 pub use history::{HISTORY_LIMIT, PromptHistory, Recall};
-pub use inset::{DEFAULT_PADDING, Inset, MAX_PADDING, MIN_INNER, Padding};
+pub use inset::{
+    DEFAULT_PADDING, Gap, Inset, MAX_PADDING, MIN_INNER, NARROW, Padding, SHORT, VERTICAL,
+};
 pub use overlay::{
     Cell, InfoPanel, InfoRow, ModelRow, Panel, PanelKey, PanelKind, PanelState, Stage, Target, Tone,
 };
