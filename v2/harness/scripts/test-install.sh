@@ -16,6 +16,10 @@ mkdir -p "$T/home" "$T/tmp" "$T/stub"
 export HOME="$T/home" TMPDIR="$T/tmp" SHELL=/bin/sh XDG_CONFIG_HOME="$T/home/.config"
 unset AMP_HARNESS_VERSION AMP_HARNESS_PREFIX AMP_HARNESS_ARCHIVE AMP_HARNESS_SHA256 AMP_HARNESS_TARGET \
     AMP_HARNESS_BASE_URL AMP_HARNESS_RELEASES_URL AMP_HARNESS_PRESET AMP_HARNESS_NO_SETUP AMP_HARNESS_CONFIG_DIR
+# A folder is linked to AMP by the nearest .amp.json in it or a parent (#2341); none above $T counts.
+export AMP_HARNESS_CEILING_DIR="$T"
+unset AMP_CREDENTIAL_STORE
+cd "$T"
 # The stub appends each `setup` it is handed (its arguments, and whether stdin is a terminal) here.
 export STUB_LOG="$T/setup.log"
 
@@ -89,6 +93,16 @@ out_has "suggests hash -r / rehash" "then run \`hash -r\` (zsh: \`rehash\`)."
 expect_ok "install ahead of another amp-harness on PATH" env PATH="$T/h1:$T/plain:$clean_path" sh "$install_sh" --archive "$archive" --prefix "$T/h1" --no-path-check
 out_has "names the other one" "Note: another amp-harness is on your PATH ($T/plain/amp-harness)."
 out_has "suggests hash -r for a shell that hashed it" "running it: run \`hash -r\` (zsh: \`rehash\`) or open a new terminal."
+# #2341: with the login PATH check on too, the shadowing binary is named once, not twice.
+mkdir -p "$T/home-shadow"
+# shellcheck disable=SC2016 # $PATH is for the login shell
+printf 'export PATH="%s:%s:$PATH"\n' "$T/plain" "$T/h1" >"$T/home-shadow/.profile"
+expect_ok "install shadowed on this shell's and the login PATH" env HOME="$T/home-shadow" PATH="$T/plain:$T/h1:$clean_path" sh "$install_sh" --archive "$archive" --prefix "$T/h1"
+out_has "the note names the shadowing binary" "Note: \`amp-harness\` in this shell runs $T/plain/amp-harness, not this one."
+if [ "$(grep -c "$T/plain/amp-harness" "$T/out")" = 2 ] && ! grep -qF "comes before" "$T/out"; then ok "the shadowing binary is not reported twice"; else bad "the shadowing binary is not reported twice"; fi
+out_has "the next step names the full path while shadowed" "$T/h1/amp-harness setup"
+expect_ok "login PATH shadows only" env HOME="$T/home-shadow" PATH="$T/h1:$clean_path" sh "$install_sh" --archive "$archive" --prefix "$T/h1"
+out_has "warns when only the login PATH finds another first" "$T/plain/amp-harness comes before $T/h1 on your PATH"
 
 # Checksum failures install nothing.
 cp "$archive" "$T/tampered.tar.gz"
@@ -168,6 +182,12 @@ out_has "says old → new" "Updated amp-harness $old → $version at $T/up/amp-h
 if [ "$("$T/up/amp-harness" --version)" = "amp-harness $version (stub)" ]; then ok "upgraded binary runs"; else bad "upgraded binary runs"; fi
 expect_ok "re-run with curl | sh when up to date" sh -c "cat '$install_sh' | sh -s -- --target $tgt --prefix '$T/up' --no-path-check"
 out_has "says already up to date" "Reinstalled amp-harness $version at $T/up/amp-harness (already up to date)"
+# #2341: an older release over a newer one is a downgrade, not an update.
+expect_ok "install an older release over a newer one" sh "$install_sh" --version "$old" --target "$tgt" --prefix "$T/down" --no-path-check
+expect_ok "install the newer one first" sh "$install_sh" --version "$version" --target "$tgt" --prefix "$T/down" --no-path-check
+expect_ok "then the older one over it" sh "$install_sh" --version "$old" --target "$tgt" --prefix "$T/down" --no-path-check
+out_has "says Downgraded new → old" "Downgraded amp-harness $version → $old at $T/down/amp-harness"
+if grep -qF "Updated" "$T/out"; then bad "a downgrade does not say Updated"; else ok "a downgrade does not say Updated"; fi
 unset AMP_HARNESS_BASE_URL AMP_HARNESS_RELEASES_URL
 
 # --uninstall removes only the binary.
@@ -178,6 +198,10 @@ if [ -e "$T/up/amp-harness" ]; then bad "binary removed"; else ok "binary remove
 out_has "names what it removed" "Removed amp-harness $version from $T/up/amp-harness."
 out_has "says the settings are kept, and where" "your settings: $XDG_CONFIG_HOME/amp-harness"
 out_has "says the saved keys are kept, and where" "items with service \"amp-harness\""
+# #2341: with the keychain turned off, the keys are in the file store, not the keychain.
+expect_ok "--uninstall with AMP_CREDENTIAL_STORE=file" env AMP_CREDENTIAL_STORE=file sh "$install_sh" --uninstall --prefix "$T/up"
+out_has "names the credentials file" "saved keys and AMP logins: $XDG_CONFIG_HOME/amp-harness/credentials.json (AMP_CREDENTIAL_STORE=file)"
+if grep -qiE "keychain|keyring" "$T/out"; then bad "no keychain with the file store"; else ok "no keychain with the file store"; fi
 if [ -f "$XDG_CONFIG_HOME/amp-harness/config.toml" ]; then ok "config left in place"; else bad "config left in place"; fi
 expect_ok "--uninstall again is a no-op" sh -c "cat '$install_sh' | sh -s -- --uninstall --prefix '$T/up'"
 out_has "says there is nothing to remove" "No amp-harness in $T/up; nothing to remove"
@@ -198,7 +222,12 @@ out_has "says the settings, keys and logins were kept" "Your settings ($XDG_CONF
 if grep -qF "Next: run" "$T/out"; then bad "no setup step when already set up"; else ok "no setup step when already set up"; fi
 expect_ok "AMP_HARNESS_CONFIG_DIR is where the config is looked for" env AMP_HARNESS_CONFIG_DIR="$T/elsewhere" sh "$install_sh" --archive "$archive" --prefix "$T/k1" --no-path-check
 out_has "an empty config dir still gets the setup step" "Next: run \`$T/k1/amp-harness setup\`"
-rm -rf "$XDG_CONFIG_HOME/amp-harness"
+# #2341: set up and in a linked folder (an .amp.json here or in a parent): kept, and doctor.
+mkdir -p "$T/linked/sub"
+echo '{"project_id": 1}' >"$T/linked/.amp.json"
+expect_ok "no terminal, in a linked folder" sh -c "cd '$T/linked/sub' && sh '$install_sh' --archive '$archive' --prefix '$T/k1' --no-path-check"
+out_has "says kept and linked" "linked to AMP ($T/linked/.amp.json). \`$T/k1/amp-harness doctor\` checks the setup."
+if grep -qF "Next: run" "$T/out"; then bad "no setup step in a linked folder"; else ok "no setup step in a linked folder"; fi
 
 # --preset without a terminal: checked, made absolute, and printed in the next step.
 mkdir -p "$T/work"
@@ -216,6 +245,21 @@ expect_fail "a file:// preset is refused" sh "$install_sh" --archive "$archive" 
 
 # On a terminal (a pty from scripts/pty-run.py, so /dev/tty works as under `curl | sh`).
 pty="$here/scripts/pty-run.py"
+if command -v python3 >/dev/null 2>&1; then
+    # #2341: an upgrade in a terminal, set up and in a linked folder, does not offer setup again.
+    : >"$STUB_LOG"
+    expect_ok "terminal: upgrade in a linked folder" python3 "$pty" -- \
+        sh -c "cd '$T/linked' && cat '$install_sh' | sh -s -- --archive '$archive' --prefix '$T/k1' --no-path-check"
+    if grep -qF "[Y/n]" "$T/out"; then bad "terminal: no setup offer in a linked folder"; else ok "terminal: no setup offer in a linked folder"; fi
+    out_has "terminal: says kept and linked" "linked to AMP ($T/linked/.amp.json). \`$T/k1/amp-harness doctor\` checks the setup."
+    no_setup_ran "terminal: setup is not started in a linked folder"
+    : >"$STUB_LOG"
+    expect_ok "terminal: a preset in a linked folder still offers setup" python3 "$pty" --expect "[Y/n]" --send 'n\n' -- \
+        sh -c "cd '$T/linked' && sh '$install_sh' --archive '$archive' --prefix '$T/k1' --no-path-check --preset '$T/work/preset.toml'"
+    out_has "terminal: offers setup with the preset" "Run \`$T/k1/amp-harness setup --preset $T/work/preset.toml\` now? [Y/n]"
+fi
+rm -rf "$XDG_CONFIG_HOME/amp-harness"
+
 if command -v python3 >/dev/null 2>&1; then
     : >"$STUB_LOG"
     expect_ok "terminal: Enter runs setup (curl | sh, relative --preset)" python3 "$pty" --expect "[Y/n]" --send '\n' -- \
