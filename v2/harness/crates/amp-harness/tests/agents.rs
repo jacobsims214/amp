@@ -795,3 +795,264 @@ async fn a_new_agent_is_dispatched_by_the_manager_on_a_resolved_model() {
         "a reviewer can't edit: no worktree"
     );
 }
+
+/// #2338 (QA pass 3b): `agents list/show`, `models list` and `skills list/show` loaded the repo's
+/// agents and skills without the trust gate, so an untrusted repo agent showed as dispatchable,
+/// with a model row, and as a user of a skill. They load through the gate sessions and doctor use:
+/// untrusted repo items are "not trusted, not used" with how to trust them (`--json`: an additive
+/// `untrusted` list and `trusted: false`); trusted (or `--trust-repo`) they show as before.
+#[tokio::test]
+async fn untrusted_repo_agents_and_skills_are_not_listed_as_in_use() {
+    let dir = setup("untrusted-repo-listings");
+    let repo = repo_dir(&dir);
+    std::fs::create_dir_all(repo.join("agents")).unwrap();
+    std::fs::create_dir_all(repo.join("skills/repo-lint")).unwrap();
+    std::fs::write(
+        repo.join("agents/repo-helper.md"),
+        "---\ndescription: from the repo\nmode: subagent\ndispatch: true\nbased_on: amp-worker-docs\n\
+         skills: [amp-execution]\n---\n\nHelp.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("skills/repo-lint/SKILL.md"),
+        "---\nname: repo-lint\ndescription: Lint the repo.\n---\n\nLint it.\n",
+    )
+    .unwrap();
+    let state = dir.join("home/.local/state");
+    let state = state.to_string_lossy().into_owned();
+    let env = [("XDG_STATE_HOME", state.as_str())];
+    let json = |out: &Output| -> Value { serde_json::from_str(&out.stdout).unwrap() };
+    let names = |v: &Value, key: &str, field: &str| -> Vec<String> {
+        v[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("no {key} in {v:#}"))
+            .iter()
+            .map(|x| x[field].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let preloaded_by = |v: &Value, skill: &str| -> Vec<String> {
+        v["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == skill)
+            .unwrap_or_else(|| panic!("no {skill} in {v:#}"))["preloaded_by"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    // Untrusted.
+    let out = cli_env(&dir, &["agents", "list", "--json"], &env).await;
+    ok(&out, "agents list --json");
+    let v = json(&out);
+    assert!(
+        !names(&v, "agents", "id").contains(&"repo-helper".into()),
+        "{v:#}"
+    );
+    assert_eq!(names(&v, "untrusted", "name"), ["repo-helper"], "{v:#}");
+    assert_eq!(v["untrusted"][0]["changed"], false, "{v:#}");
+    assert_eq!(agent(&v, "amp-worker-docs")["trusted"], true, "{v:#}");
+
+    let out = cli_env(&dir, &["agents", "list"], &env).await;
+    ok(&out, "agents list");
+    assert!(
+        !out.stdout.lines().any(|l| l.starts_with("repo-helper ")),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("not trusted, not used: repo-helper (repo)"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("`amp-harness trust agent:repo-helper`")
+            && out.stdout.contains("--trust-repo"),
+        "{}",
+        out.stdout
+    );
+
+    let out = cli_env(&dir, &["agents", "show", "repo-helper"], &env).await;
+    ok(&out, "agents show");
+    assert!(
+        out.stdout
+            .starts_with("repo-helper  (repo, not trusted, not used)"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("amp-harness trust agent:repo-helper"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("dispatch:    no (not trusted, so the manager cannot dispatch it)"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        !out.stdout.contains("yes (dispatch: true)"),
+        "{}",
+        out.stdout
+    );
+    let out = cli_env(&dir, &["agents", "show", "repo-helper", "--json"], &env).await;
+    ok(&out, "agents show --json");
+    let v = json(&out);
+    assert_eq!(v["trusted"], false, "{v:#}");
+    assert_eq!(v["dispatchable"], false, "{v:#}");
+    assert_eq!(v["dispatch"], true, "{v:#}");
+
+    let out = cli_env(&dir, &["models", "list", "--json"], &env).await;
+    ok(&out, "models list --json");
+    let v = json(&out);
+    assert!(
+        !names(&v, "roles", "role").contains(&"repo-helper".into()),
+        "{v:#}"
+    );
+    assert_eq!(
+        names(&v, "untrusted_agents", "name"),
+        ["repo-helper"],
+        "{v:#}"
+    );
+    let out = cli_env(&dir, &["models", "list"], &env).await;
+    ok(&out, "models list");
+    assert!(
+        !out.stdout
+            .lines()
+            .any(|l| l.trim_start().starts_with("repo-helper ")),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("not trusted, not used: repo-helper (repo)"),
+        "{}",
+        out.stdout
+    );
+
+    let out = cli_env(&dir, &["skills", "list", "--json"], &env).await;
+    ok(&out, "skills list --json");
+    let v = json(&out);
+    assert!(
+        !names(&v, "skills", "name").contains(&"repo-lint".into()),
+        "{v:#}"
+    );
+    assert_eq!(names(&v, "untrusted", "name"), ["repo-lint"], "{v:#}");
+    assert!(
+        !preloaded_by(&v, "amp-execution").contains(&"repo-helper".into()),
+        "{v:#}"
+    );
+    let out = cli_env(&dir, &["skills", "list"], &env).await;
+    ok(&out, "skills list");
+    assert!(
+        !out.stdout.lines().any(|l| l.starts_with("repo-lint ")),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout
+            .contains("not trusted, not used: repo-lint (repo)")
+            && out.stdout.contains("`amp-harness trust skill:repo-lint`"),
+        "{}",
+        out.stdout
+    );
+    assert!(!out.stdout.contains("repo-helper"), "{}", out.stdout);
+    let out = cli_env(&dir, &["skills", "show", "repo-lint", "--json"], &env).await;
+    ok(&out, "skills show --json");
+    assert_eq!(json(&out)["trusted"], false, "{}", out.stdout);
+    let out = cli_env(&dir, &["skills", "show", "repo-lint"], &env).await;
+    ok(&out, "skills show");
+    assert!(
+        out.stdout
+            .starts_with("repo-lint  (repo, not trusted, not used)"),
+        "{}",
+        out.stdout
+    );
+
+    // --trust-repo for one run, then `trust` recorded: both show them as in use, as before.
+    let check_trusted = |prefix: &'static [&'static str]| {
+        let dir = dir.clone();
+        let state = state.clone();
+        async move {
+            let env = [("XDG_STATE_HOME", state.as_str())];
+            let with = |args: &[&'static str]| -> Vec<&'static str> {
+                prefix.iter().chain(args).copied().collect()
+            };
+            let out = cli_env(&dir, &with(&["agents", "list", "--json"]), &env).await;
+            ok(&out, "agents list --json (trusted)");
+            let v: Value = serde_json::from_str(&out.stdout).unwrap();
+            let helper = agent(&v, "repo-helper");
+            assert_eq!(helper["dispatchable"], true, "{v:#}");
+            assert_eq!(helper["trusted"], true, "{v:#}");
+            assert_eq!(helper["origin"], "repo", "{v:#}");
+            assert!(v["untrusted"].as_array().unwrap().is_empty(), "{v:#}");
+            let out = cli_env(&dir, &with(&["agents", "list"]), &env).await;
+            assert!(!out.stdout.contains("not trusted"), "{}", out.stdout);
+
+            let out = cli_env(&dir, &with(&["agents", "show", "repo-helper"]), &env).await;
+            ok(&out, "agents show (trusted)");
+            assert!(
+                out.stdout.starts_with("repo-helper  (repo)\n")
+                    && out.stdout.contains("dispatch:    yes (dispatch: true)"),
+                "{}",
+                out.stdout
+            );
+
+            let out = cli_env(&dir, &with(&["models", "list", "--json"]), &env).await;
+            ok(&out, "models list --json (trusted)");
+            let v: Value = serde_json::from_str(&out.stdout).unwrap();
+            assert!(
+                v["roles"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["role"] == "repo-helper"),
+                "{v:#}"
+            );
+            assert!(
+                v["untrusted_agents"].as_array().unwrap().is_empty(),
+                "{v:#}"
+            );
+
+            let out = cli_env(&dir, &with(&["skills", "list", "--json"]), &env).await;
+            ok(&out, "skills list --json (trusted)");
+            let v: Value = serde_json::from_str(&out.stdout).unwrap();
+            let skill = v["skills"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["name"] == "repo-lint")
+                .unwrap_or_else(|| panic!("no repo-lint in {v:#}"))
+                .clone();
+            assert_eq!(skill["trusted"], true, "{v:#}");
+            assert!(v["untrusted"].as_array().unwrap().is_empty(), "{v:#}");
+            assert!(
+                v["skills"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["name"] == "amp-execution")
+                    .unwrap()["preloaded_by"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a == "repo-helper"),
+                "{v:#}"
+            );
+        }
+    };
+    check_trusted(&["--trust-repo"]).await;
+    let out = cli_env(
+        &dir,
+        &["trust", "agent:repo-helper", "skill:repo-lint"],
+        &env,
+    )
+    .await;
+    ok(&out, "trust");
+    check_trusted(&[]).await;
+}

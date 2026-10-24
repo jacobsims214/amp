@@ -58,6 +58,14 @@ now**:
   `amp-harness doctor` warns about them too: `agents … not trusted, not used: amp-manager (repo)`,
   with the fix (`--trust-repo` for one run, or `amp-harness trust agent:amp-manager`). The ones
   in use are listed as `yours:` (your own config) and `the repo's (trusted):`.
+- The listings show what runs, through the same check: `agents list`, `skills list` and
+  `models list` leave an untrusted repo agent or skill out of their table (it is not dispatchable,
+  has no model row, and preloads nothing) and print under it
+  `not trusted, not used: repo-helper (repo)` with the same fix. `agents show repo-helper` and
+  `skills show repo-lint` still show the file, marked `(repo, not trusted, not used)`, with
+  `dispatch: no (not trusted, ...)` and the model it would run on once trusted. In `--json` they
+  are under `untrusted` (`models list`: `untrusted_agents`), and `show --json` has
+  `"trusted": false`.
   `--trust-repo` (or `AMP_HARNESS_TRUST_REPO=1`) uses everything for that one process, without
   recording it.
 - What you write into the repo layer with these commands (`agents new --repo`,
