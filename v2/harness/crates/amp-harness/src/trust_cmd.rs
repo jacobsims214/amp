@@ -87,8 +87,8 @@ fn context(cwd: Option<&Path>) -> Result<Ctx, CliError> {
     Ok(Ctx { paths, repo, state })
 }
 
-fn repo_servers(paths: &ConfigPaths) -> Vec<McpServer> {
-    McpConfig::load(paths)
+fn repo_servers_of(config: McpConfig) -> Vec<McpServer> {
+    config
         .servers
         .into_values()
         .filter(McpServer::is_repo)
@@ -123,7 +123,10 @@ pub fn trust(args: TrustArgs) -> Result<(), CliError> {
         return list(&ctx, args.json);
     }
     let items = repo_trust::scan(&ctx.paths);
-    let servers = repo_servers(&ctx.paths);
+    let config = McpConfig::load(&ctx.paths);
+    // #2331: a repo server ignored in favour of the person's own says why (it is not trustable).
+    crate::mcp_crud::print_shadowed(&config, false);
+    let servers = repo_servers_of(config);
     let (chosen_items, chosen_servers): (Vec<&RepoItem>, Vec<&McpServer>) = if args.all {
         if items.is_empty() && servers.is_empty() {
             return Err(CliError::usage(
@@ -215,7 +218,9 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
             file: i.file,
         })
         .collect();
-    rows.extend(repo_servers(&ctx.paths).into_iter().map(|s| Row {
+    let config = McpConfig::load(&ctx.paths);
+    crate::mcp_crud::print_shadowed(&config, !json);
+    rows.extend(repo_servers_of(config).into_iter().map(|s| Row {
         item: format!("mcp:{}", s.name),
         trust: mcp_trust::state_of(&s, store.as_ref(), trust_all),
         what: mcp_trust::summary(&s),

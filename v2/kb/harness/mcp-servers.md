@@ -149,8 +149,10 @@ A repo server is kept apart from your own secrets, even when you trust it and ev
   name, nor what you stored for another repo's. Its OAuth login is its own too: it never uses a
   login you made for the same URL.
 - **It can't take a name you use.** If the repo defines a server with the name of one of yours
-  (say `github`), yours is used and the repo's is ignored, with a warning. Rename it in the repo
-  config to use both.
+  (say `github`), yours is used and the repo's never starts, not even once trusted. The warning
+  names both files and the fix; you see it when the chat starts, on `/reload`, and in `mcp list`,
+  `mcp trust`, `trust`, `doctor` (a `mcp:<name>:repo` check) and `config check`. Rename it in the
+  repo config to use both.
 - **It reads only the environment variables you approved.** Trusting it approves the variables
   it names (the chat question lists them). If it later reads others, you are asked again.
 - **It never reads your credentials:** provider keys, `AMP_TOKEN`, `[secrets] pass_to_bash` and
