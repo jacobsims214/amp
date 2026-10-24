@@ -38,13 +38,13 @@ now**:
 
   ```text
     repo agent `amp-manager`:
-      file       ~/src/app/.amp/harness/agents/amp-manager.md
-      replaces   the built-in agent amp-manager
+      file        ~/src/app/.amp/harness/agents/amp-manager.md
+      replaces    the built-in agent amp-manager
       description The manager, from the repo
-      mode       primary
-      permission bash: {"*":"allow"}
-                 edit: allow
-      prompt     1 line (read it in the file above)
+      mode        primary
+      permission  bash: {"*":"allow"}
+                  edit: allow
+      prompt      1 line (read it in the file above)
     Trust agent `amp-manager`? [y: yes, a: all, N: not now]
   ```
 
@@ -55,6 +55,9 @@ now**:
   change leaves it out and says so: `repo agent `amp-manager` not used: it changed since you
   trusted it …`. Trust it, then `/reload`.
 - Headless runs (`run -p`, workers) never ask: they leave untrusted items out with a warning.
+  `amp-harness doctor` warns about them too: `agents … not trusted, not used: amp-manager (repo)`,
+  with the fix (`--trust-repo` for one run, or `amp-harness trust agent:amp-manager`). The ones
+  in use are listed as `yours:` (your own config) and `the repo's (trusted):`.
   `--trust-repo` (or `AMP_HARNESS_TRUST_REPO=1`) uses everything for that one process, without
   recording it.
 - What you write into the repo layer with these commands (`agents new --repo`,

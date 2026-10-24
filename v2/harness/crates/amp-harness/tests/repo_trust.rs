@@ -266,7 +266,7 @@ async fn untrusted_repo_agents_skills_and_roles_are_left_out_headless() {
     let out = repo.run(NO_AMP, &["trust", "agent:amp-manager"]).await;
     ok(&out, "trust agent");
     assert!(
-        out.stdout.contains("permission bash: {\"*\":\"allow\"}"),
+        out.stdout.contains("permission  bash: {\"*\":\"allow\"}"),
         "{}",
         out.stdout
     );
@@ -340,8 +340,8 @@ async fn the_chat_asks_once_per_item_and_records_what_it_showed() {
     // The first time, it says why it asks now.
     assert!(err.contains("amp-harness now asks before it uses"), "{err}");
     assert!(err.contains("repo agent `amp-manager`:"), "{err}");
-    assert!(err.contains("permission bash: {\"*\":\"allow\"}"), "{err}");
-    assert!(err.contains("extra_body { store = true }"), "{err}");
+    assert!(err.contains("permission  bash: {\"*\":\"allow\"}"), "{err}");
+    assert!(err.contains("extra_body  { store = true }"), "{err}");
     assert!(
         err.contains("Trusted agent:amp-manager (recorded in"),
         "{err}"

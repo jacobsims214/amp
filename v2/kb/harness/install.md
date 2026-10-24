@@ -64,7 +64,9 @@ Setup (also `amp-harness init`; it's the same command) asks only for what isn't 
 Press Enter to keep the value in [brackets]:
 
 1. **AMP server.** Type `amp.example.com`, `host:port` or a full URL. It is checked before it is
-   saved. See `harness/servers-and-login.md`.
+   saved. See `harness/servers-and-login.md`. Once a server is saved, setup in another folder
+   doesn't ask again: it prints `AMP server: … (already set up …)`. To change it, pass `--url` or
+   run `amp-harness server set`.
 2. **Login.** "Log in with your browser now?" Setup opens AMP's sign-in page and keeps the login
    in your OS keychain.
 3. **Project.** Setup links this folder to an AMP project: an existing one, or a new one it

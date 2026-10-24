@@ -881,6 +881,12 @@ async fn mcp_servers_agents_skills_and_the_fallback_model() {
     assert_eq!(status(&v, "mcp:off"), "skip");
     assert_eq!(status(&v, "mcp:repo-fs"), "warn");
     assert!(fix(&v, "mcp:repo-fs").contains("amp-harness mcp trust repo-fs"));
+    // #2335: the fix leads with --trust-repo, as the guide does (not the older --trust-repo-mcp).
+    assert!(
+        fix(&v, "mcp:repo-fs").contains("run with `--trust-repo`")
+            && !fix(&v, "mcp:repo-fs").contains("--trust-repo-mcp"),
+        "{v}"
+    );
     assert_eq!(server_of("repo-fs")["trust"], "untrusted");
     assert_eq!(status(&v, "mcp:web"), "warn");
     assert!(
@@ -1002,4 +1008,82 @@ async fn a_bad_agent_and_a_bad_fallback_are_reported() {
     // The orphan's role error is a roles failure too.
     assert_eq!(status(&v, "roles"), "fail");
     assert_eq!(status(&v, "mcp"), "skip");
+}
+
+/// #2335: doctor said `[ok] skills … yours: repo-lint (repo)` for a repo skill nobody trusted,
+/// which sessions leave out. Untrusted repo agents and skills are "not trusted, not used" (a
+/// warning whose fix leads with --trust-repo), and repo items are never "yours".
+#[tokio::test]
+async fn untrusted_repo_agents_and_skills_are_not_used_nor_yours() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("doctor-repo-untrusted", Some(7));
+    let cfg = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "[providers.boss]\napi = \"faux\"\n[providers.boss.models.\"boss-1\"]\n\
+         [roles.manager]\nmodel = \"boss/boss-1\"\n[roles.worker-backend]\nmodel = \"boss/boss-1\"\n",
+    )
+    .unwrap();
+    let repo = dir.join("project/.amp/harness");
+    std::fs::create_dir_all(repo.join("agents")).unwrap();
+    std::fs::create_dir_all(repo.join("skills/repo-lint")).unwrap();
+    std::fs::write(
+        repo.join("agents/repo-helper.md"),
+        "---\ndescription: from the repo\nmode: subagent\ndispatch: true\nskills: []\n---\n\nHelp.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("skills/repo-lint/SKILL.md"),
+        "---\nname: repo-lint\ndescription: Lint the repo.\n---\n\nLint it.\n",
+    )
+    .unwrap();
+
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
+    let v = out.json();
+    for (name, item, id) in [
+        ("skills", "repo-lint (repo)", "skill:repo-lint"),
+        ("agents", "repo-helper (repo)", "agent:repo-helper"),
+    ] {
+        assert_eq!(status(&v, name), "warn", "{v}");
+        let detail = check(&v, name)["detail"].as_str().unwrap();
+        assert!(
+            detail.contains(&format!("not trusted, not used: {item}")),
+            "{detail}"
+        );
+        assert!(!detail.contains("yours"), "{detail}");
+        let fix = fix(&v, name);
+        assert!(
+            fix.starts_with("review it, then run with `--trust-repo`"),
+            "{fix}"
+        );
+        assert!(fix.contains(&format!("amp-harness trust {id}")), "{fix}");
+        assert_eq!(v[name]["untrusted"][0]["changed"], false, "{v}");
+    }
+    assert!(v["agents"]["custom"].as_array().unwrap().is_empty(), "{v}");
+
+    // With --trust-repo they are used: the repo's, not "yours".
+    let out = run(
+        &dir,
+        &amp.url,
+        &["--trust-repo", "doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
+    let v = out.json();
+    assert_eq!(status(&v, "skills"), "ok", "{v}");
+    let detail = check(&v, "skills")["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("the repo's (trusted): repo-lint (repo)") && !detail.contains("yours"),
+        "{detail}"
+    );
+    let detail = check(&v, "agents")["detail"].as_str().unwrap();
+    assert!(detail.contains("repo-helper (repo"), "{detail}");
+    assert!(!detail.contains("not trusted"), "{detail}");
 }

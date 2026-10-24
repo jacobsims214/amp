@@ -534,12 +534,17 @@ async fn server_step(
 ) -> Result<(AmpMcpClient, Settings, bool), CliError> {
     let current = plan.conn.settings()?;
     let init = plan.mode == Mode::Init;
-    // Does this run choose the server (and save it)?
-    let ask = ui.interactive()
-        && plan.conn.url.is_none()
-        && (current.url_source == Source::Default
-            || (init && current.url_source != Source::Env(amp_mcp::ENV_MCP_URL.to_owned())));
+    // Does this run choose the server (and save it)? Only when none is set up yet: a server saved
+    // in config.toml (or given by AMP_MCP_URL / --url) is kept, not asked again (#2335).
+    // `--url` or `amp-harness server set` changes it.
+    let ask = ui.interactive() && plan.conn.url.is_none() && current.url_source == Source::Default;
     let save_flag = init && plan.conn.url.is_some();
+    if init && !ask && plan.conn.url.is_none() && ui.interactive() {
+        ui.say(&format!(
+            "AMP server: {} (already set up; `--url` or `amp-harness server set` changes it).",
+            amp_mcp::redact_url(&current.url)
+        ));
+    }
     if ask && plan.mode == Mode::FirstRun {
         ui.say(
             "Welcome to amp-harness. A few questions and you're chatting with your AMP manager.",

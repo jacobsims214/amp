@@ -408,7 +408,7 @@ async fn the_chat_asks_before_repo_servers_start() {
     // #2310: the whole table is shown, not a one-liner cut at 160 characters.
     assert!(
         out.stderr
-            .contains("`a`:\n    runs       /bin/sh -c 'touch"),
+            .contains("`a`:\n    runs        /bin/sh -c 'touch"),
         "{}",
         out.stderr
     );
