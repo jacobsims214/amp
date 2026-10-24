@@ -193,6 +193,59 @@ async fn the_chat_takes_cli_changes_on_reload() {
     assert!(screen.contains("boss2-1"), "{screen}");
 }
 
+/// #2334 (QA pass 3 finding 4): the manager role moves (in another terminal) to a provider that
+/// has no key in this process. The chat stays on its model and says why, with the way out,
+/// instead of the footer and `/model roles` silently disagreeing.
+#[tokio::test]
+async fn a_role_moved_to_a_provider_without_a_key_here_says_why_the_chat_stays() {
+    let dir = setup("stays");
+    let config = dir.join("home/.config/amp-harness/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "\n[providers.example]\napi = \"openai-completions\"\nbase_url = \"http://127.0.0.1:9/v1\"\n\
+         key_env = \"AMP_TEST_2334_EXAMPLE_KEY\"\n[providers.example.models.\"orchestrator\"]\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let set_model = exec(&[
+        "models",
+        "set",
+        "manager",
+        "example/orchestrator",
+        "--no-check",
+    ]);
+    let state = dir.join("home/.local/state");
+    let out = common::run(
+        &dir,
+        NO_AMP,
+        &[
+            "--snapshot",
+            "160x60",
+            "--no-setup",
+            "--input",
+            &set_model,
+            "--input",
+            "/reload",
+        ],
+        &[("XDG_STATE_HOME", state.to_str().unwrap())],
+    )
+    .await;
+    ok(&out, "the chat");
+    let screen = &out.stdout;
+    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(
+            "this chat stays on boss/boss-1: amp-manager moved to example/orchestrator, but \
+             example has no key here (set AMP_TEST_2334_EXAMPLE_KEY"
+        ),
+        "{screen}"
+    );
+    assert!(
+        flat.contains("/model picks another for this chat"),
+        "{screen}"
+    );
+    assert!(!flat.contains("this chat now runs on"), "{screen}");
+}
+
 /// A runtime over `dir`'s HOME and project, with the mock AMP.
 async fn runtime(
     dir: &Path,

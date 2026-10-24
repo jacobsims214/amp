@@ -95,6 +95,8 @@ pub struct WrapText {
     text: String,
     padding_x: usize,
     padding_y: usize,
+    /// The blank rows above it too (else only below).
+    padding_top: bool,
     cache: Cache,
 }
 
@@ -104,15 +106,23 @@ impl WrapText {
             text: text.into(),
             padding_x,
             padding_y,
+            padding_top: true,
             cache: Cache::default(),
         }
+    }
+
+    /// Without the blank rows above, when what comes before already ends with one (#2334).
+    pub fn with_top_padding(mut self, top: bool) -> Self {
+        self.padding_top = top;
+        self
     }
 }
 
 impl Component for WrapText {
     fn render(&self, width: usize) -> Vec<String> {
         self.cache.get_or(width, || {
-            let mut lines = vec![String::new(); self.padding_y];
+            let above = if self.padding_top { self.padding_y } else { 0 };
+            let mut lines = vec![String::new(); above];
             let content_width = width.saturating_sub(self.padding_x).max(1);
             lines.extend(wrap_lines(
                 &self.text,

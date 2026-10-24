@@ -440,12 +440,79 @@ impl HubEvent {
                 server,
                 instance,
                 status,
-            } => format!("MCP server {}: {status}", label(server, instance)),
+            } => {
+                // The reason often names the server itself (`MCP server `x`: …`): once is enough
+                // (#2334).
+                let reason = status.reason().map(|r| without_server_prefix(r, server));
+                let status = match (status, reason) {
+                    (ServerStatus::Failed { retry_in_ms, .. }, Some(r)) => {
+                        format!("failed: {r} (retrying in {})", human_ms(*retry_in_ms))
+                    }
+                    (ServerStatus::Stopped { .. }, Some(r)) => format!("stopped: {r}"),
+                    (ServerStatus::NeedsLogin { .. }, Some(r)) => format!("needs login: {r}"),
+                    (other, _) => other.to_string(),
+                };
+                let next = if is_unset_variable(&status) {
+                    "; set it where you start amp-harness, then /reload"
+                } else {
+                    ""
+                };
+                format!("MCP server {}: {status}{next}", label(server, instance))
+            }
         }
     }
 
     pub fn is_error(&self) -> bool {
         matches!(self, Self::Failed { .. })
+    }
+}
+
+/// `reason` without a leading ``MCP server `name`: `` (the connect errors start with it).
+fn without_server_prefix<'a>(reason: &'a str, server: &str) -> &'a str {
+    reason
+        .strip_prefix(&format!("MCP server `{server}`: "))
+        .unwrap_or(reason)
+}
+
+/// Whether a failure is an environment variable that isn't set (the person sets it where the
+/// harness starts; nothing else fixes it).
+fn is_unset_variable(status: &str) -> bool {
+    status.contains("environment variable ") && status.contains(" is not set")
+}
+
+/// Which servers' failures a transcript has shown (#2334): a reload retries every stopped server,
+/// and a failing one fails again the same way, so the transcript says it once and again only when
+/// the failure changes (or after the server was ready in between). Transient retries' "retrying
+/// in N s" doesn't count as a change.
+#[derive(Debug, Default)]
+pub struct FailureLog {
+    shown: BTreeMap<(String, Option<String>), String>,
+}
+
+impl FailureLog {
+    /// The transcript line for `event`, or `None` when it would repeat a failure already shown.
+    pub fn line(&mut self, event: &HubEvent) -> Option<String> {
+        match event {
+            HubEvent::Failed {
+                server,
+                instance,
+                status,
+            } => {
+                let seen = format!("{} {}", status.word(), status.reason().unwrap_or_default());
+                let key = (server.clone(), instance.clone());
+                if self.shown.get(&key) == Some(&seen) {
+                    return None;
+                }
+                self.shown.insert(key, seen);
+            }
+            HubEvent::Ready {
+                server, instance, ..
+            } => {
+                self.shown.remove(&(server.clone(), instance.clone()));
+            }
+            HubEvent::ToolsChanged { .. } => {}
+        }
+        Some(event.line())
     }
 }
 
@@ -2676,6 +2743,29 @@ mod tests {
             tools: 1,
         };
         assert_eq!(changed.line(), "fs (#7): tools changed (1 tool)");
+        // #2334: the reason's own `MCP server `x`:` isn't repeated, and an unset variable says
+        // what to do.
+        let unset = HubEvent::Failed {
+            server: "authd".into(),
+            instance: None,
+            status: ServerStatus::Stopped {
+                reason: "MCP server `authd`: environment variable QA_TOKEN is not set".into(),
+            },
+        };
+        assert_eq!(
+            unset.line(),
+            "MCP server authd: stopped: environment variable QA_TOKEN is not set; set it where \
+             you start amp-harness, then /reload"
+        );
+        let other = HubEvent::Failed {
+            server: "fs".into(),
+            instance: None,
+            status: failed.clone(),
+        };
+        assert_eq!(
+            other.line(),
+            "MCP server fs: failed: boom (retrying in 4 s)"
+        );
         assert_eq!(
             HubSummary {
                 ready: 3,
@@ -2685,6 +2775,45 @@ mod tests {
             .to_string(),
             "mcp 3/4"
         );
+    }
+
+    /// #2334: a reload retries a stopped server and it fails the same way: shown once, again
+    /// when the failure changes or after it was ready in between.
+    #[test]
+    fn a_failure_is_shown_once_per_change() {
+        let fail = |server: &str, reason: &str, retry_in_ms: u64| HubEvent::Failed {
+            server: server.into(),
+            instance: None,
+            status: ServerStatus::Failed {
+                reason: reason.into(),
+                retry_in_ms,
+            },
+        };
+        let stopped = |reason: &str| HubEvent::Failed {
+            server: "a".into(),
+            instance: None,
+            status: ServerStatus::Stopped {
+                reason: reason.into(),
+            },
+        };
+        let mut log = FailureLog::default();
+        assert!(log.line(&stopped("no TOKEN")).is_some());
+        assert_eq!(log.line(&stopped("no TOKEN")), None);
+        assert_eq!(log.line(&stopped("no TOKEN")), None);
+        // Another server's failure is its own.
+        assert!(log.line(&fail("b", "refused", 1000)).is_some());
+        // The backoff's delay is not a change; the reason is.
+        assert_eq!(log.line(&fail("b", "refused", 2000)), None);
+        assert!(log.line(&fail("b", "timed out", 4000)).is_some());
+        assert!(log.line(&stopped("no OTHER")).is_some());
+        // Ready in between: the same failure is news again.
+        let ready = HubEvent::Ready {
+            server: "a".into(),
+            instance: None,
+            tools: 2,
+        };
+        assert_eq!(log.line(&ready).as_deref(), Some("a: 2 tools"));
+        assert!(log.line(&stopped("no OTHER")).is_some());
     }
 
     #[test]

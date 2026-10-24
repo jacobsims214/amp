@@ -310,3 +310,28 @@ fn emoji_in_system_lines_become_theme_glyphs() {
     assert!(text.contains("✗ not saved"), "{text}");
     assert!(text.contains("✗ Error: boom"), "{text}");
 }
+
+/// #2334 (QA pass 3 finding 3): notices, warnings and errors in a row have one blank row between
+/// them, not two, so a few of them don't fill the screen.
+#[test]
+fn notices_in_a_row_have_one_blank_row_between() {
+    let _g = themed(Variant::Dark, ColorDepth::TrueColor);
+    let view = amp_tui::ChatView::new();
+    view.add_notice("first");
+    view.add_warning("second");
+    view.add_error("third");
+    view.add_notice("fourth");
+    let rows: Vec<String> = view
+        .render_frame(W, 30)
+        .iter()
+        .map(|r| rpi_tui::strip_ansi(r).trim().to_owned())
+        .collect();
+    let at = |t: &str| rows.iter().position(|r| r.contains(t)).expect(t);
+    for pair in [
+        ["first", "second"],
+        ["second", "third"],
+        ["third", "fourth"],
+    ] {
+        assert_eq!(at(pair[1]) - at(pair[0]), 2, "{pair:?}: {rows:#?}");
+    }
+}
