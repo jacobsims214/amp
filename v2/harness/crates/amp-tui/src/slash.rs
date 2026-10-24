@@ -128,7 +128,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Group::Amp,
         "worker",
         "[id]",
-        "watch a worker live: Esc back, Tab next, x stop",
+        "watch a worker: Esc back, Tab, x stop, o AMP",
     ),
     CommandSpec::new(
         Group::Amp,
@@ -225,19 +225,25 @@ pub const KEYS: &[(&str, &str)] = &[
     ("PgUp/PgDn", "scroll the transcript a page"),
     ("Ctrl+U/D", "scroll half a page (with an empty editor)"),
     ("End", "jump to the latest output (with an empty editor)"),
+    ("Ctrl+W", "pick a running worker: ←/→, Enter watch"),
+    ("click", "a worker or its #ticket: watch its session"),
     ("Fn/⌥-drag", "select text (Fn in Terminal.app, ⌥ in iTerm2)"),
 ];
+
+/// The Keys row for clicking a worker (#2347): only while the terminal reports the mouse.
+pub const CLICK_KEY: &str = "click";
 
 /// The Keys row for selecting text with mouse capture off (`[tui] mouse = false`, #2185): plain
 /// click-drag selects, so no modifier to name.
 pub const DRAG_KEY: (&str, &str) = ("drag", "select text");
 
 /// `/help`'s Keys group for the mouse-capture setting: [`KEYS`] when on; off, its last row (the
-/// modifier-drag) becomes [`DRAG_KEY`].
+/// modifier-drag) becomes [`DRAG_KEY`] and clicking a worker ([`CLICK_KEY`]) goes.
 pub fn keys(mouse_capture: bool) -> Vec<(&'static str, &'static str)> {
     let mut rows = KEYS.to_vec();
     if !mouse_capture {
         rows.pop();
+        rows.retain(|(k, _)| *k != CLICK_KEY);
         rows.push(DRAG_KEY);
     }
     rows

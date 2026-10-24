@@ -47,7 +47,7 @@
       claude-opus-5-5 · ######h##m · ↑0 ↓0 $0.00                                                                               |
     ■ In progress #2104 M3-2 AMP metadata poller · amp:amp-worker-backend · elsewhere                                          |
     ■ In progress #2106 M3-3 Header and AMP status line · amp:amp-worker-backend · elsewhere                                   |
-    ↑↓ select · Enter watch · x stop · o open in browser · Esc close                                                           |
+    ↑↓ select · Enter or click watch · x stop · o open in browser · Esc close                                                  |
   ── commands ───────────────────────────────────────────────────────────────────────────────────────────────────────────────  |
   › /questions   tickets waiting on an answer; answer them here                                                                |
     /quit        leave the chat                                                                                                |

@@ -40,6 +40,19 @@ fn id_of(v: &Value) -> Option<i64> {
 }
 
 /// The tickets a call names: `task_id`, else up to three of `task_ids` (`#1 #2 #3 +4`).
+/// The tickets a call names: its `task_id`, else its `task_ids`.
+pub fn ticket_ids(args: &Value) -> Vec<i64> {
+    if let Some(id) = id_of(&args["task_id"]) {
+        return vec![id];
+    }
+    args["task_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(id_of)
+        .collect()
+}
+
 fn ticket_refs(args: &Value) -> String {
     if let Some(id) = id_of(&args["task_id"]) {
         return format!("#{id}");

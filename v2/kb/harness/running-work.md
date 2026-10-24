@@ -1,6 +1,6 @@
 ---
 title: AMP Harness — chat, workers, approvals and limits
-tags: [harness, amp-harness, chat, run, workers, dispatch, approval, worker-limits, worktrees]
+tags: [harness, amp-harness, chat, run, workers, dispatch, approval, worker-limits, worktrees, worker-session, mouse]
 ---
 
 # Chat, workers, approvals and limits
@@ -17,7 +17,7 @@ workers, plan approval and the board counts.
 | `/ticket [id]`, `/project [id]` | the current ticket or project; switch to another |
 | `/questions` | tickets waiting on an answer; answer them right there |
 | `/plan`, `/open [id\|plan]` | plan approval, epics and stories; open a ticket or the plan in the browser |
-| `/workers`, `/worker [id]` | workers here and elsewhere; watch one live (`x` stops it) |
+| `/workers`, `/worker [id]` | workers here and elsewhere; watch one live (`x` stops it, `o` opens its ticket) |
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
 | `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
 
@@ -28,8 +28,55 @@ the `/` menu and the panels they move the selection. Workers' prompts are not in
 Esc stops the reply. The model's thinking shows as one `▸ Thought for 12s` line: click it, or
 press Ctrl+T, to open it (Ctrl+T opens the lowest one on screen), and `/config thinking` switches
 between collapsed, full and hidden (see [configuration](configuration.md)). Ctrl+O shows tool
-calls in full. To select text with the mouse, hold Fn (Terminal.app) or
-Option (iTerm2) while dragging, or set `[tui] mouse = false`.
+calls in full. Ctrl+W (with an empty message box) picks a running worker.
+
+**Selecting text.** The chat reports the mouse to itself (wheel scrolling, clicking a worker), so
+a plain drag doesn't select. Hold Fn (Terminal.app) or Option (iTerm2) while dragging, or set
+`[tui] mouse = false` (plain drag selects again; clicking a worker then doesn't work, Ctrl+W
+still does).
+
+## Watching a worker
+
+While workers run, each one has a line above the message box, with a hint under them:
+
+```text
+▸ #2142 Fix installer setup hand-off · AMP Harness › M4 · worker-backend (deepseek-v4.1) · running 3m12s · 48.0k tok · ctx 31%
+▸ #2143 Thinking toggle · worker-frontend (deepseek-v4.1) · running 1m02s · 12.4k tok · ctx 9%
+2 running · click one or Ctrl+W to watch
+```
+
+Every line shows what the worker is for: the ticket's id and name, story › epic, the agent and
+its model, the state and how long it has run, tokens so far and how full the model's context is.
+The numbers update every second. At 80 columns the name is shortened with `…` first; the id,
+agent and state always stay. The ticket's name, story and epic come from AMP (the metadata
+poller reads each worker's ticket every 30 s, never through the model); without AMP a line shows
+the bare id. A ticket in progress elsewhere (another chat or person) shows in `/workers` with AMP's
+record of its last run and when that was recorded.
+
+The same details are on the transcript's lines: `▶ worker started #2142 …`, the dispatch line
+`run_ticket #2142` (its second row), and `■ worker finished #2142 … completed after 3m10s ·
+48.0k tok`.
+
+**Open a worker's session** any of these ways:
+
+- click it: a line above the message box, a `/workers` row, a worker notice or dispatch line, or
+  any `#2142` in the chat that has a worker session;
+- Ctrl+W, then ←/→ to choose and Enter;
+- `/workers`, ↑↓ and Enter; or `/worker 2142`.
+
+The session shows the worker's transcript live (tool calls, collapsed thinking, messages) under a
+header:
+
+```text
+worker #2142 Fix installer setup hand-off                                     running 3m12s
+amp:amp-worker-backend · openrouter/deepseek/deepseek-v4.1 · AMP Harness › M4 · branch amp-2142
+in 12.3k · out 1.2k · cached 34.5k · $0.04                       ctx ███░░░░░░░ 31% of 128.0k
+```
+
+Keys: Esc back to the chat (where you left it, scroll included), Tab/→ and Shift+Tab/← the next
+or previous worker, `x` stop (asks first), `o` open the ticket in AMP, PgUp/PgDn scroll. The chat
+keeps running underneath. A finished worker's session stays viewable (read-only) until the chat
+ends; an earlier chat's worker opens from its session file with `/worker <id>`.
 
 ## Headless: `run -p`
 
