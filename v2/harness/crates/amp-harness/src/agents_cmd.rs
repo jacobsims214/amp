@@ -21,6 +21,7 @@ use std::{
 use amp_core::{
     assets::{AGENTS_DIR, Assets, Origin, OverrideDirs, valid_name},
     models::{ModelsConfig, ResolvedRole, normalize_role, parse_thinking, thinking_name},
+    repo_trust::{ItemKind, UntrustedItem},
     roles::{Role, RoleRegistry},
     templates::{self, set_frontmatter_key, yaml_list, yaml_string},
 };
@@ -31,6 +32,7 @@ use serde_json::Value;
 
 use crate::{
     conn::{self, CliError, print_json},
+    roster::{self, UntrustedRow},
     setup::{Change, ConfigFile},
 };
 
@@ -243,13 +245,19 @@ pub struct AgentReport {
     /// Its frontmatter says `dispatch: true`.
     pub dispatch: bool,
     pub based_on: Option<String>,
+    /// It is used: `false` only for a repo agent that is not trusted as it is now (`agents show`
+    /// of one; `agents list` puts those in `untrusted`), which nothing runs (#2338).
+    pub trusted: bool,
 }
 
 #[derive(Debug, Serialize)]
 struct ListReport {
     user_dir: Option<String>,
     repo_dir: Option<String>,
+    /// The agents in use: a repo agent only when it is trusted (#2338).
     agents: Vec<AgentReport>,
+    /// Repo agents not used because they are not trusted as they are now (#2338).
+    untrusted: Vec<UntrustedRow>,
 }
 
 fn origin_kind(origin: &Origin) -> (&'static str, Option<String>) {
@@ -303,11 +311,13 @@ pub(crate) fn agent_report_from(
         dispatchable,
         dispatch: role.dispatch,
         based_on: role.based_on.clone(),
+        trusted: true,
     }
 }
 
 fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
-    let loaded = ctx.load()?;
+    let (loaded, untrusted) = ctx.load_in_use()?;
+    let untrusted = roster::rows(&untrusted, ItemKind::Agent);
     let agents: Vec<AgentReport> = loaded
         .roles
         .roles()
@@ -318,6 +328,7 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
             user_dir: ctx.paths.user_dir.as_ref().map(|p| p.display().to_string()),
             repo_dir: ctx.paths.repo_dir.as_ref().map(|p| p.display().to_string()),
             agents,
+            untrusted,
         });
     }
     let rows: Vec<Vec<String>> = agents
@@ -357,15 +368,31 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
         ],
         &rows,
     );
+    if let Some(footer) = roster::footer(ItemKind::Agent, &untrusted) {
+        println!("\n{footer}");
+    }
     println!();
     ctx.print_layers(AGENTS_DIR);
     Ok(())
 }
 
 fn show(ctx: &Ctx, id: &str, json: bool) -> Result<(), CliError> {
-    let loaded = ctx.load()?;
-    let role = loaded.role(id)?;
-    let report = agent_report(ctx, &loaded, role);
+    let (in_use, untrusted) = ctx.load_in_use()?;
+    let id = amp_core::policy::canonical_agent_id(id);
+    let left_out = roster::find(&untrusted, ItemKind::Agent, &id);
+    // An untrusted repo agent that is not in use: reported from its file, marked as not trusted
+    // and not dispatchable (#2338). One that overrides an agent in use: that one is shown, with a
+    // note about the repo file.
+    let (loaded, untrusted_self) = match (in_use.roles.get(&id), left_out) {
+        (None, Some(_)) => (ctx.load()?, true),
+        _ => (in_use, false),
+    };
+    let role = loaded.role(&id)?;
+    let mut report = agent_report(ctx, &loaded, role);
+    if untrusted_self {
+        report.trusted = false;
+        report.dispatchable = false;
+    }
     if json {
         return print_json(&report);
     }
@@ -373,7 +400,14 @@ fn show(ctx: &Ctx, id: &str, json: bool) -> Result<(), CliError> {
         .assets
         .agent(&role.id)
         .expect("roles come from assets");
-    println!("{}  ({})", report.id, report.origin);
+    if untrusted_self {
+        println!("{}  ({}, not trusted, not used)", report.id, report.origin);
+    } else {
+        println!("{}  ({})", report.id, report.origin);
+    }
+    if let Some(u) = left_out {
+        println!("  trust:       {}", u.reason());
+    }
     println!(
         "  file:        {}",
         report
@@ -387,6 +421,10 @@ fn show(ctx: &Ctx, id: &str, json: bool) -> Result<(), CliError> {
     println!("  description: {}", one_line(&report.description));
     println!("  mode:        {}", report.mode);
     match (&report.model, &report.model_error) {
+        (Some(model), _) if untrusted_self => println!(
+            "  model:       none in use (it would run on {model}, from {}, once trusted)",
+            report.model_source.as_deref().unwrap_or("?")
+        ),
         (Some(model), _) => println!(
             "  model:       {model} (thinking {}), from {}",
             report.thinking.unwrap_or("off"),
@@ -407,7 +445,9 @@ fn show(ctx: &Ctx, id: &str, json: bool) -> Result<(), CliError> {
         }
     );
     if report.mode != "primary" {
-        let why = if !report.dispatchable {
+        let why = if untrusted_self {
+            "no (not trusted, so the manager cannot dispatch it)".to_owned()
+        } else if !report.dispatchable {
             "no (the manager's task rules deny it; add `dispatch: true`)".to_owned()
         } else if report.dispatch {
             "yes (dispatch: true)".to_owned()
@@ -917,8 +957,21 @@ impl Ctx {
             .map_err(|e| CliError::new(e.to_string()))
     }
 
+    /// What sessions here use (#2338): the repo's agents and skills only when trusted, through
+    /// the same gate as sessions and doctor; plus the repo agents and skills left out.
+    pub fn load_in_use(&self) -> Result<(Loaded, Vec<UntrustedItem>), CliError> {
+        let gate = roster::gate(&self.paths);
+        let assets = roster::load_assets(&self.paths, &gate).map_err(CliError::new)?;
+        let loaded = self.load_from(assets)?;
+        Ok((loaded, roster::untrusted(&self.paths, &gate)))
+    }
+
+    /// Every file, trusted or not: for inspecting and editing the files (writers, `validate`).
     pub fn load(&self) -> Result<Loaded, CliError> {
-        let assets = self.load_assets()?;
+        self.load_from(self.load_assets()?)
+    }
+
+    fn load_from(&self, assets: Assets) -> Result<Loaded, CliError> {
         let roles = RoleRegistry::from_assets(&assets).map_err(|e| CliError::new(e.to_string()))?;
         let models = ModelsConfig::load_paths(&|k| std::env::var(k).ok(), &self.paths)
             .map_err(|e| CliError::new(e.to_string()))?;

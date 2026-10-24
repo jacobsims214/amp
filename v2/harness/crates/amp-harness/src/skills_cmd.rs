@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use amp_core::{
     assets::{Assets, Origin, SKILL_FILE, SKILLS_DIR, parse_frontmatter, valid_name},
+    repo_trust::ItemKind,
     roles::RoleRegistry,
     templates::{self, set_frontmatter_key, yaml_string},
 };
@@ -24,6 +25,7 @@ use crate::{
         print_table, read_text, stash_and_check, write_file,
     },
     conn::{CliError, print_json},
+    roster,
 };
 
 #[derive(Subcommand)]
@@ -127,8 +129,11 @@ pub(crate) struct SkillReport {
     /// Every layer some file comes from (a user SKILL.md over built-in scripts: built-in, user).
     pub(crate) layers: Vec<&'static str>,
     pub(crate) files: Vec<FileReport>,
-    /// Agents that preload it.
+    /// Agents in use that preload it (an untrusted repo agent is not one, #2338).
     pub(crate) preloaded_by: Vec<String>,
+    /// It is used: `false` only for a repo skill that is not trusted as it is now (`skills show`
+    /// of one; `skills list` puts those in `untrusted`), which no session loads (#2338).
+    pub(crate) trusted: bool,
     /// SKILL.md's instructions (show only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) content: Option<String>,
@@ -190,12 +195,24 @@ pub(crate) fn report(
             })
             .unwrap_or_default(),
         content: content.then(|| skill.content.clone()),
+        trusted: true,
     }
 }
 
-fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
-    let assets = ctx.load_assets()?;
+/// The skills and agents sessions here use (repo ones only when trusted, #2338), and the repo
+/// skills left out.
+fn load_in_use(
+    ctx: &Ctx,
+) -> Result<(Assets, Option<RoleRegistry>, Vec<roster::UntrustedRow>), CliError> {
+    let gate = roster::gate(&ctx.paths);
+    let assets = roster::load_assets(&ctx.paths, &gate).map_err(CliError::new)?;
     let roles = RoleRegistry::from_assets(&assets).ok();
+    let untrusted = roster::rows(&roster::untrusted(&ctx.paths, &gate), ItemKind::Skill);
+    Ok((assets, roles, untrusted))
+}
+
+fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
+    let (assets, roles, untrusted) = load_in_use(ctx)?;
     let skills: Vec<SkillReport> = assets
         .skills()
         .map(|s| report(&assets, roles.as_ref(), &s.name, false))
@@ -205,6 +222,7 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
             "user_dir": ctx.paths.user_dir.as_ref().map(|p| p.display().to_string()),
             "repo_dir": ctx.paths.repo_dir.as_ref().map(|p| p.display().to_string()),
             "skills": skills,
+            "untrusted": untrusted,
         }));
     }
     let rows: Vec<Vec<String>> = skills
@@ -227,22 +245,48 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
         })
         .collect();
     print_table(&["SKILL", "FROM", "DESCRIPTION", "PRELOADED BY"], &rows);
+    if let Some(footer) = roster::footer(ItemKind::Skill, &untrusted) {
+        println!("\n{footer}");
+    }
     println!();
     ctx.print_layers(SKILLS_DIR);
     Ok(())
 }
 
 fn show(ctx: &Ctx, name: &str, json: bool) -> Result<(), CliError> {
-    let assets = ctx.load_assets()?;
+    let gate = roster::gate(&ctx.paths);
+    let in_use = roster::load_assets(&ctx.paths, &gate).map_err(CliError::new)?;
+    let roles = RoleRegistry::from_assets(&in_use).ok();
+    let untrusted = roster::untrusted(&ctx.paths, &gate);
+    let left_out = roster::find(&untrusted, ItemKind::Skill, name);
+    // An untrusted repo skill nothing uses is reported from its files, marked as not trusted
+    // (#2338); "preloaded by" counts only the agents in use.
+    let untrusted_self = in_use.skill(name).is_none() && left_out.is_some();
+    let assets = if untrusted_self {
+        ctx.load_assets()?
+    } else {
+        in_use
+    };
     if assets.skill(name).is_none() {
         return Err(no_skill(name));
     }
-    let roles = RoleRegistry::from_assets(&assets).ok();
-    let r = report(&assets, roles.as_ref(), name, true);
+    let mut r = report(&assets, roles.as_ref(), name, true);
+    r.trusted = !untrusted_self;
     if json {
         return print_json(&r);
     }
-    println!("{}  ({})", r.name, r.layers.join(" + "));
+    if untrusted_self {
+        println!(
+            "{}  ({}, not trusted, not used)",
+            r.name,
+            r.layers.join(" + ")
+        );
+    } else {
+        println!("{}  ({})", r.name, r.layers.join(" + "));
+    }
+    if let Some(u) = left_out {
+        println!("  trust:        {}", u.reason());
+    }
     println!(
         "  file:         {}",
         r.path
