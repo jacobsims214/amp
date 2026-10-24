@@ -467,6 +467,9 @@ pub struct McpReload {
     /// Repo servers that may not start until trusted (#2241): `amp-harness mcp trust <name>`,
     /// then reload.
     pub untrusted: Vec<String>,
+    /// Repo servers ignored because one of the person's own has the same name (#2331), as
+    /// [`crate::mcp_config::Shadowed::warning`] lines; theirs runs, the repo's never starts.
+    pub shadowed: Vec<String>,
 }
 
 impl McpReload {
@@ -486,6 +489,7 @@ impl McpReload {
             retried: Vec::new(),
             problems: new.errors().map(|p| p.to_string()).collect(),
             untrusted: Vec::new(),
+            shadowed: new.shadow_warnings(),
         }
     }
 
@@ -497,6 +501,7 @@ impl McpReload {
             && self.retried.is_empty()
             && self.problems.is_empty()
             && self.untrusted.is_empty()
+            && self.shadowed.is_empty()
     }
 }
 
@@ -2842,6 +2847,7 @@ mod tests {
             servers: BTreeMap::new(),
             problems: Vec::new(),
             broken: BTreeSet::new(),
+            shadowed: Vec::new(),
         };
         let options = |retention| {
             let mut o = HubOptions::new(ConfigPaths::default(), base.join("state"), base.clone());

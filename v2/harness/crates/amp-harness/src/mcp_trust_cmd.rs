@@ -123,6 +123,8 @@ pub fn trust(args: TrustArgs) -> Result<(), CliError> {
     if args.names.is_empty() && !args.all {
         return list(&ctx, args.json);
     }
+    // #2331: `mcp trust <name>` for a repo server ignored in favour of the person's own says why.
+    crate::mcp_crud::print_shadowed(&ctx.config, false);
     let servers: Vec<&McpServer> = if args.all {
         let all: Vec<&McpServer> = ctx
             .config
@@ -176,6 +178,7 @@ fn list(ctx: &Ctx, json: bool) -> Result<(), CliError> {
             None
         }
     };
+    crate::mcp_crud::print_shadowed(&ctx.config, !json);
     let trust_all = mcp_trust::trust_all_from(&|k| std::env::var(k).ok());
     let rows: Vec<Row> = ctx
         .config

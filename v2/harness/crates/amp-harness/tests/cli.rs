@@ -445,7 +445,7 @@ async fn doctor_json_is_pinned() {
     let mcp = obj.remove("mcp").unwrap();
     assert_eq!(
         mcp,
-        json!({"servers": [], "broken": [], "ready": 0, "checked": 0})
+        json!({"servers": [], "broken": [], "shadowed": [], "ready": 0, "checked": 0})
     );
     let agents = obj.remove("agents").unwrap();
     assert!(agents["count"].as_u64().unwrap() > 0, "{agents}");
