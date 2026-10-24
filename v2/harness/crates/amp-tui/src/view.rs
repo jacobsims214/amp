@@ -14,7 +14,8 @@
 //! 7. **AMP status line slot**: [`crate::chrome`]'s status line (questions, workers, plan
 //!    approval, board counts, artifacts in review, run reported);
 //! 8. the **footer** ([`crate::footer`], #2186): cwd (branch) • session, `$0.004 · ctx 4%` and
-//!    model • thinking; one row below [`crate::footer::FOLD_BELOW`] columns, two above.
+//!    model • thinking; one row below [`crate::footer::FOLD_BELOW`] columns, two above (one at
+//!    any width when compact, [`crate::density`]).
 //!
 //! Every area sits [`crate::inset::Padding`] columns in from the left and right edges
 //! (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344); the transcript's inset is
@@ -661,14 +662,19 @@ impl ChatView {
         let mut text = Vec::with_capacity(lines.len());
         for (i, line) in lines.iter().enumerate() {
             text.push(if i == 0 {
-                rpi_tui::bold(line)
+                crate::density::strong(line)
             } else {
                 colors.dim.fg(line)
             });
         }
         self.scroll.touch();
-        self.transcript
-            .add_child(Arc::new(WrapText::new(text.join("\n"), 1, 1)));
+        // Compact (#2346): no blank rows around it; the first message keeps its one blank row.
+        let compact = crate::density::compact();
+        self.transcript.add_child(Arc::new(
+            WrapText::new(text.join("\n"), 1, 1)
+                .with_top_padding(!compact)
+                .with_bottom_padding(!compact),
+        ));
     }
 
     /// The person's own message. Sending one jumps back to the latest output, so it is in view.
@@ -694,13 +700,15 @@ impl ChatView {
     }
 
     /// A notice, warning or error: one blank row above and below it, so a run of them has one
-    /// blank row between each, not two (#2334).
+    /// blank row between each, not two (#2334). Compact (#2346): the blank row above only.
     fn add_line(&self, text: &str, color: rpi_tui::theme::Color) {
         self.end_group();
         self.scroll.touch();
         let top = !self.transcript_ends_blank();
         self.transcript.add_child(Arc::new(
-            WrapText::new(theme_glyphs(text, color), 1, 1).with_top_padding(top),
+            WrapText::new(theme_glyphs(text, color), 1, 1)
+                .with_top_padding(top)
+                .with_bottom_padding(!crate::density::compact()),
         ));
     }
 
@@ -953,14 +961,16 @@ impl ChatView {
         }
         self.transcript.add_child(component.clone());
         // It goes below the open tool group; if it shows anything, the next call starts a new
-        // group under it.
+        // group under it. Compact (#2346): right under the group's last call.
         if let Some(g) = self
             .group
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_mut()
         {
-            component.set_gap_above();
+            if !crate::density::compact() {
+                component.set_gap_above();
+            }
             g.after.push(Arc::clone(&component));
         }
         self.assistant = Some(component.clone());
@@ -1013,6 +1023,11 @@ struct EditorView {
 
 impl Component for EditorView {
     fn render(&self, width: usize) -> Vec<String> {
+        // Compact (#2346): the editor's rules in the muted border colour, as the panels' are.
+        let muted = crate::density::compact().then(|| theme().colors.border_muted);
+        if self.editor.border_color() != muted {
+            self.editor.set_border_color(muted);
+        }
         let mut lines = self.placeholder(self.editor.render(width));
         if !self.focus.load(Ordering::Relaxed) {
             for line in &mut lines {

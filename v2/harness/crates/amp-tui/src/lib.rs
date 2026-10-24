@@ -54,6 +54,7 @@
 
 pub mod amp_render;
 pub mod chrome;
+pub mod density;
 pub mod footer;
 pub mod history;
 pub mod inset;
@@ -72,6 +73,7 @@ pub mod workers;
 pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
+pub use density::Density;
 pub use history::{HISTORY_LIMIT, PromptHistory, Recall};
 pub use inset::{
     DEFAULT_PADDING, Gap, Inset, MAX_PADDING, MIN_INNER, NARROW, Padding, SHORT, VERTICAL,

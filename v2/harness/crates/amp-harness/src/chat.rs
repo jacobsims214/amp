@@ -26,6 +26,8 @@
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
 //! Padding (#2251): `AMP_HARNESS_PADDING`, `[tui] padding` (0-8 columns each side), else 2; halved
 //! at 80 columns or fewer, with a blank row above and below the chat (#2344, amp_tui::inset).
+//! Density (#2346): `AMP_HARNESS_DENSITY`, `[tui] density` (compact|comfortable), else compact
+//! (amp_tui::density): fewer blank rows, less bold, a one-row footer and a shorter banner.
 //!
 //! `/server` (#2164) gets a [`crate::server_cmd::Switcher`]: it lists the saved servers and moves
 //! the session (its AMP connection, the model's AMP tools and prompt, the metadata poller) to
@@ -195,6 +197,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let show_thinking = load_show_thinking(&args)?;
     let mouse = load_mouse(&args)?;
     let padding = load_padding(&args)?;
+    amp_tui::density::set(load_density(&args)?);
 
     // First run (D12): ask for whatever is missing before connecting for real. In --snapshot only
     // with scripted answers (AMP_HARNESS_PROMPTS=stdin), so render checks never stop on a question.
@@ -594,6 +597,14 @@ fn load_padding(args: &ChatArgs) -> Result<usize, CliError> {
         .map_err(|e| CliError::usage(e.to_string()))
 }
 
+/// How tightly the chat is laid out (#2346): `AMP_HARNESS_DENSITY`, then config.toml `[tui]
+/// density`, else compact.
+fn load_density(args: &ChatArgs) -> Result<amp_tui::Density, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_tui::theme::select::resolve_density(&env, config_text(args).as_deref())
+        .map_err(|e| CliError::usage(e.to_string()))
+}
+
 /// Starts the AMP metadata poller (#2104) on its own MCP connection, made in the background with
 /// the same settings as the session's (so the TUI opens at once, and reconnects are possible).
 /// Its calls never go through the model. `--snapshot` does not start it, so its screen has no AMP
@@ -724,29 +735,39 @@ fn shell_info(s: &session::Session, marker_warning: Option<&str>) -> ShellInfo {
         .session_file
         .as_deref()
         .map(|p| tilde(p, home.as_deref()));
-    let mut banner = vec![
-        format!(
-            "AMP harness {} · {}",
-            env!("CARGO_PKG_VERSION"),
-            amp_tui::shell::short_role(&s.agent.role.id)
-        ),
-        if s.offline.is_some() {
-            format!("{project} · {} (not connected)", mcp.url)
-        } else {
-            format!("{project} · {} ({})", mcp.url, mcp.protocol_version)
-        },
-    ];
-    banner.extend(marker_warning.map(str::to_owned));
-    banner.extend([
-        format!(
-            "{}/{} • thinking {}",
-            resolved.provider,
-            resolved.model_id,
-            thinking_name(resolved.thinking)
-        ),
-        session_banner(s.agent.session_file.as_deref()),
-        "/help for commands · Esc aborts a reply · Ctrl+C twice quits".to_owned(),
-    ]);
+    let connection = if s.offline.is_some() {
+        format!("{project} · {} (not connected)", mcp.url)
+    } else {
+        format!("{project} · {} ({})", mcp.url, mcp.protocol_version)
+    };
+    let model = format!(
+        "{}/{} • thinking {}",
+        resolved.provider,
+        resolved.model_id,
+        thinking_name(resolved.thinking)
+    );
+    let title = format!(
+        "AMP harness {} · {}",
+        env!("CARGO_PKG_VERSION"),
+        amp_tui::shell::short_role(&s.agent.role.id)
+    );
+    let session_line = session_banner(s.agent.session_file.as_deref());
+    // #2346: compact folds the five lines into three: who and which model, where, the session.
+    let banner = if amp_tui::density::compact() {
+        let mut banner = vec![format!("{title} · {model}"), connection];
+        banner.extend(marker_warning.map(str::to_owned));
+        banner.push(format!("{session_line} · /help for commands"));
+        banner
+    } else {
+        let mut banner = vec![title, connection];
+        banner.extend(marker_warning.map(str::to_owned));
+        banner.extend([
+            model,
+            session_line,
+            "/help for commands · Esc aborts a reply · Ctrl+C twice quits".to_owned(),
+        ]);
+        banner
+    };
     ShellInfo {
         role: s.agent.role.id.clone(),
         provider: resolved.provider.clone(),

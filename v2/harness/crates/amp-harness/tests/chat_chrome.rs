@@ -115,9 +115,13 @@ async fn the_banner_session_line_is_one_row_and_light_has_no_stray_background() 
         .iter()
         .position(|l| l.starts_with(" session "))
         .expect("the banner's session row");
-    assert!(plain[at].ends_with(" (/usage for path)"), "{text}");
-    // The next row is the banner's last line, not the rest of a path.
-    assert!(plain[at + 1].starts_with(" /help for commands"), "{text}");
+    // Compact (#2346): the banner's last line, the session and where help is, on one row; the
+    // next row is the gap above the first message, not the rest of a path.
+    assert!(
+        plain[at].ends_with(" (/usage for path) · /help for commands"),
+        "{text}"
+    );
+    assert!(plain[at + 1].trim().is_empty(), "{text}");
     // The transcript sets foregrounds only: no background colour anywhere above the editor (the
     // review's yellow highlight was SGR 103, a truecolor red component replayed on its own).
     let rule = plain.iter().position(|l| l.starts_with("────")).unwrap();

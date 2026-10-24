@@ -97,7 +97,24 @@ theme = "auto"            # auto | dark | light | a theme .json file (--theme, A
 show_thinking = "collapsed"   # collapsed | full | hidden
 mouse = true              # false gives plain click-drag text selection back
 padding = 2
+density = "compact"       # compact | comfortable (AMP_HARNESS_DENSITY)
 ```
+
+`density` decides how tightly the chat is laid out (`AMP_HARNESS_DENSITY` beats it):
+
+- `compact` (the default): your message is one shaded row with one blank row before the reply; a
+  collapsed `▸ Thought for 12s` line, tool calls and the reply's text follow each other with no
+  blank rows; a failed tool call is one line too (Ctrl+O shows the whole error); markdown
+  headings are bold text, not underlined, with no blank row under them; notices have one blank
+  row above them and none below; the start banner is three lines; `/help` has no blank rows
+  between its groups; the footer is one row at any width. Bold is kept for headings.
+- `comfortable`: the roomier layout from before: padded message bubbles, blank rows around
+  thinking, tool calls and notices, underlined top-level headings, a two-row footer from 100
+  columns.
+
+Compact fits about a third more of the same conversation on screen (at 120x40, 24 lines of it
+instead of 18; at 80x24, 13 instead of 10). The harness can't change the font size: to make the
+text itself smaller, set it in your terminal (Cmd+- in Terminal.app and iTerm2, Cmd+0 to reset).
 
 `show_thinking` decides how the model's thinking shows in the chat (`AMP_HARNESS_SHOW_THINKING`
 beats it):

@@ -116,9 +116,9 @@ async fn the_chat_talks_to_the_manager() {
     assert!(!screen.contains("current_time"), "{screen}");
     assert_eq!(amp.mock.calls_to("amp_whoami"), vec![json!({})]);
 
-    // The footer, two rows at 220 columns: cwd • role, then `ctx N%` … model • thinking; then
-    // the blank bottom row (#2344).
-    assert!(lines[57].contains("• manager"), "{}", lines[57]);
+    // The footer, one row at 220 columns (compact, #2346): cwd • role … `ctx N%` · model •
+    // thinking; then the blank bottom row (#2344).
+    assert!(lines[58].contains("• manager"), "{}", lines[58]);
     assert!(lines[58].contains("faux-1 • "), "{}", lines[58]);
     assert_eq!(lines[59].trim(), "", "{screen}");
 

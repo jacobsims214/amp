@@ -1,27 +1,27 @@
  
- 
    AMP harness · manager
  
-▌
 ▌  one
-▌
  
    first answer
  
-▌
 ▌  two
-▌
  
-   ✗ ls · 0 ms
-     │ Tool ls not found
- 
+   ✗ ls · Tool ls not found · 0 ms
    second answer
  
-▌
 ▌  three
-▌
  
    third answer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
  
   ──────────────────────────────────────────────────────────
   / for commands

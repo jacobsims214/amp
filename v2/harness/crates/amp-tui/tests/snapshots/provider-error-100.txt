@@ -1,5 +1,4 @@
    go
 
-
    ✗ Error: OpenRouter refused the request (400): messages[9]: tool messages must include a
    non-empty string tool_call_id

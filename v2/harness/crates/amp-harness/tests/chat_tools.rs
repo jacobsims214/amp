@@ -118,10 +118,9 @@ async fn three_amp_calls_take_at_most_four_rows() {
             assert!(block[3].contains("· M1-4 CLI · in progress"), "{screen}");
             assert!(!screen.contains("owner_filter"), "{screen}");
             assert!(!screen.contains("AMP · list_tasks"), "{screen}");
-            // The answer follows after one blank row.
+            // The answer follows right under the last call (compact, #2346).
             let at = rows.iter().position(|r| r.contains(ANSWER)).unwrap();
-            assert!(rows[at - 1].trim().is_empty(), "{screen}");
-            assert!(rows[at - 2].starts_with(" ✓ get_task #2085"), "{screen}");
+            assert!(rows[at - 1].starts_with(" ✓ get_task #2085"), "{screen}");
         }
     }
 }
