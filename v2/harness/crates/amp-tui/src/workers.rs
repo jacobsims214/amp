@@ -273,6 +273,11 @@ impl SessionView {
         Arc::ptr_eq(&self.feed, feed)
     }
 
+    /// How its transcript shows thinking (`/config thinking`, #2345).
+    pub fn set_show_thinking(&mut self, display: ThinkingDisplay) {
+        self.view.set_show_thinking(display);
+    }
+
     /// The transcript's view (thinking and tool toggles act on it while it is shown).
     pub fn view(&self) -> &ChatView {
         &self.view

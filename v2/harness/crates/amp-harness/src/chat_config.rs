@@ -20,6 +20,8 @@
 //! - **`/config`**: the files in use, the AMP server, models, providers (keys as their source),
 //!   roles, MCP servers, `[tui]`, `[tools]`, `[workers]` and `[secrets]`, each with where its value
 //!   comes from (default, a config file, an env variable, a flag).
+//!   `t` runs `/config thinking`, which the shell handles itself: the chat's thinking display
+//!   moves to the next mode (#2345).
 //!
 //! Writes go through the CLI's own code ([`crate::mcp_crud`], [`crate::models_cmd`]): the same
 //! checks, backups and trust rules. A change asks the shell to reload ([`ConfigReply::reload`]),
@@ -328,7 +330,7 @@ impl Inner {
             }
             Err(_) => {
                 let status = h
-                    .map(|h| h.status.to_string())
+                    .map(|h| h.status.describe_for(name))
                     .unwrap_or_else(|| "not started".to_owned());
                 let mut errors = vec![format!("MCP server `{name}`: {status}")];
                 let tail = stderr_tail(h.and_then(|h| h.stderr_log.as_deref()), 5);
@@ -1083,7 +1085,8 @@ impl Inner {
                 Cell::flex(short(&value), Tone::Text),
             ];
             if !source.is_empty() {
-                cells.push(Cell::new(format!("({})", short(&source)), Tone::Muted));
+                // A note: on its own line when narrow, so the value isn't cut for it (#2351).
+                cells.push(Cell::note(format!("({})", short(&source)), Tone::Muted));
             }
             rows.push(InfoRow::new(cells).indent(2));
         };
@@ -1353,7 +1356,10 @@ impl Inner {
             Tone::Dim,
             0,
         ));
-        Ok(ConfigReply::panel(InfoPanel::fixed("config", rows)))
+        // #2345: `t` shows thinking the next way for this chat (the shell runs it).
+        Ok(ConfigReply::panel(
+            InfoPanel::fixed("config", rows).with_key('t', "thinking", "/config thinking"),
+        ))
     }
 }
 

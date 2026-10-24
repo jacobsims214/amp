@@ -21,8 +21,14 @@ workers, plan approval and the board counts.
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
 | `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
 
-Enter sends and Shift+Enter starts a new line. Esc stops the reply. Ctrl+T expands the thinking
-and Ctrl+O shows tool calls in full. Ctrl+W (with an empty message box) picks a running worker.
+Enter sends and Shift+Enter starts a new line. Up in an empty (or one-line) editor recalls the
+prompts you sent earlier in this chat, newest first; Down goes forward again, and Down past the
+newest gives back what you had typed. In a multi-line draft Up and Down move the cursor, and in
+the `/` menu and the panels they move the selection. Workers' prompts are not in this history.
+Esc stops the reply. The model's thinking shows as one `▸ Thought for 12s` line: click it, or
+press Ctrl+T, to open it (Ctrl+T opens the lowest one on screen), and `/config thinking` switches
+between collapsed, full and hidden (see [configuration](configuration.md)). Ctrl+O shows tool
+calls in full. Ctrl+W (with an empty message box) picks a running worker.
 
 **Selecting text.** The chat reports the mouse to itself (wheel scrolling, clicking a worker), so
 a plain drag doesn't select. Hold Fn (Terminal.app) or Option (iTerm2) while dragging, or set

@@ -59,7 +59,8 @@ use crate::roster::{NoticeKind, Roster, WorkerNotice, WorkerStrip};
 use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
 use crate::transcript::{
-    AssistantBlock, Block, ThinkingDisplay, ToolBlock, ToolDisplay, ToolGroup, UserBlock, WrapText,
+    AssistantBlock, Block, THINKING_HINT, THINKING_HINT_KEY, ThinkingDisplay, ToolBlock,
+    ToolDisplay, ToolGroup, UserBlock, WrapText,
 };
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, StopReason, Usage};
@@ -139,8 +140,11 @@ pub struct ChatView {
     retry: Option<Arc<StatusIndicator>>,
     /// How thinking shows (`[tui] show_thinking`, #2177).
     show_thinking: ThinkingDisplay,
-    /// The last assistant message with thinking: what Ctrl+T expands.
+    /// The last assistant message with thinking: what Ctrl+T expands when no thinking header is
+    /// in sight.
     last_thinking: Option<Arc<AssistantBlock>>,
+    /// Clicks reach the chat (`[tui] mouse`): the last thinking's hint names them (#2345).
+    mouse: bool,
     /// The person asked the run to stop: its aborted (or failed) reply keeps what it streamed
     /// and shows no error, since the shell says "Stopped." once (#2181).
     stopping: bool,
@@ -262,6 +266,7 @@ impl ChatView {
             retry: None,
             show_thinking: ThinkingDisplay::default(),
             last_thinking: None,
+            mouse: true,
             stopping: false,
             error_shown: false,
             hint,
@@ -415,19 +420,115 @@ impl ChatView {
         self.padding.columns()
     }
 
-    /// How new assistant messages show their thinking (#2177).
+    /// How assistant messages show their thinking (#2177): new ones, and (`/config thinking`,
+    /// #2345) those already in the transcript, which open for `full` and close otherwise.
     pub fn set_show_thinking(&mut self, display: ThinkingDisplay) {
         self.show_thinking = display;
+        for child in self.transcript.get_children() {
+            if let Some(a) = child.as_any().downcast_ref::<AssistantBlock>() {
+                a.set_display(display);
+            }
+        }
+        self.transcript.invalidate();
     }
 
     pub fn show_thinking(&self) -> ThinkingDisplay {
         self.show_thinking
     }
 
+    /// Whether clicks reach the chat (`[tui] mouse`); the last thinking's hint says so (#2345).
+    pub fn set_mouse(&mut self, on: bool) {
+        self.mouse = on;
+        if let Some(last) = &self.last_thinking {
+            last.set_hint(Some(self.thinking_hint()));
+        }
+    }
+
+    fn thinking_hint(&self) -> &'static str {
+        if self.mouse {
+            THINKING_HINT
+        } else {
+            THINKING_HINT_KEY
+        }
+    }
+
     /// Expands or collapses the last thinking section (Ctrl+T). `None` when there is none yet,
     /// else whether it is now expanded.
     pub fn toggle_thinking(&self) -> Option<bool> {
         self.last_thinking.as_ref()?.toggle_thinking()
+    }
+
+    /// Ctrl+T on a `width` x `height` screen (#2345): expands or collapses the lowest thinking
+    /// header in sight in the shown transcript (the manager's or a worker's), so scrolling to an
+    /// older one and pressing Ctrl+T opens that one. `None` when no header is in sight.
+    pub fn toggle_visible_thinking(&self, width: usize, height: usize) -> Option<bool> {
+        let (rect, tw) = self.transcript_rect(width, height)?;
+        let top = self.scroll.top();
+        let (at, message, section) = self
+            .thinking_headers(tw)
+            .into_iter()
+            .rfind(|(at, ..)| (top..top + rect.height).contains(at))?;
+        self.toggle_header(at, &message, section, (width, height))
+    }
+
+    /// A left click at `(row, column)` (0-based) on a `width` x `height` screen (#2345): on a
+    /// thinking header, opens or closes it. `None` when it isn't on one, else whether it is now
+    /// expanded.
+    pub fn click_thinking(&self, width: usize, height: usize, row: usize) -> Option<bool> {
+        let (rect, tw) = self.transcript_rect(width, height)?;
+        if row < rect.y || row >= rect.y + rect.height {
+            return None;
+        }
+        let line = self.scroll.top() + (row - rect.y);
+        let (at, message, section) = self
+            .thinking_headers(tw)
+            .into_iter()
+            .find(|(at, ..)| *at == line)?;
+        self.toggle_header(at, &message, section, (width, height))
+    }
+
+    /// The transcript's place on a `width` x `height` screen, and the width its entries render
+    /// at (inside the scroll view's scrollbar column and the padding).
+    fn transcript_rect(&self, width: usize, height: usize) -> Option<(rpi_tui::LayoutRect, usize)> {
+        let frame = self.layout(width, height);
+        let view: Arc<dyn Component> = self.scroll.view().clone();
+        let rect = find_box(&frame.root, &view)?;
+        let content = self.scroll.view().get_content_width(rect.width);
+        Some((rect, content.saturating_sub(2 * self.padding.at(content))))
+    }
+
+    /// Every thinking header in the shown transcript at `width`: its line, its message and the
+    /// section's index in it.
+    fn thinking_headers(&self, width: usize) -> Vec<(usize, Arc<dyn Component>, usize)> {
+        let mut out = Vec::new();
+        let slot: Arc<dyn Component> = self.transcript_slot.clone();
+        collect_headers(&slot, width, 0, &mut out);
+        out
+    }
+
+    /// Toggles section `section` of `message`, whose header is on transcript line `at`, on a
+    /// `screen` (width, height). While the view follows the end, an opened section that would
+    /// push its header off the top is scrolled to instead, so it reads from its first line.
+    fn toggle_header(
+        &self,
+        at: usize,
+        message: &Arc<dyn Component>,
+        section: usize,
+        screen: (usize, usize),
+    ) -> Option<bool> {
+        let following = self.scroll.at_end();
+        let expanded = message
+            .as_any()
+            .downcast_ref::<AssistantBlock>()?
+            .toggle_section(section)?;
+        if expanded && following {
+            // A layout first, so the scroll view knows the new height (it stays at the end).
+            self.layout(screen.0, screen.1);
+            if at < self.scroll.top() {
+                self.scroll.scroll_to(at);
+            }
+        }
+        Some(expanded)
     }
 
     /// Expands or collapses every tool call's details (Ctrl+O, #2183); returns whether they are
@@ -808,6 +909,13 @@ impl ChatView {
     fn update_assistant(&mut self, component: &Arc<AssistantBlock>, blocks: &[Block]) {
         component.update_blocks(blocks);
         if component.has_thinking() {
+            // Only the transcript's last thinking says how to open it (#2345).
+            if let Some(old) = &self.last_thinking
+                && !Arc::ptr_eq(old, component)
+            {
+                old.set_hint(None);
+            }
+            component.set_hint(Some(self.thinking_hint()));
             self.last_thinking = Some(Arc::clone(component));
         }
     }
@@ -925,6 +1033,30 @@ impl EditorView {
         }
         lines
     }
+}
+
+/// Adds the thinking headers of `component` (rendered at `width`, its first row at transcript
+/// line `base`) to `out`, looking inside containers; returns its rows.
+fn collect_headers(
+    component: &Arc<dyn Component>,
+    width: usize,
+    base: usize,
+    out: &mut Vec<(usize, Arc<dyn Component>, usize)>,
+) -> usize {
+    if let Some(message) = component.as_any().downcast_ref::<AssistantBlock>() {
+        for (row, section) in message.thinking_headers(width) {
+            out.push((base + row, Arc::clone(component), section));
+        }
+        return component.render(width).len();
+    }
+    if let Some(container) = component.as_any().downcast_ref::<Container>() {
+        let mut rows = 0;
+        for child in container.get_children() {
+            rows += collect_headers(&child, width, base + rows, out);
+        }
+        return rows;
+    }
+    component.render(width).len()
 }
 
 /// The rectangle of `target` in a laid-out frame.

@@ -217,6 +217,9 @@ pub struct Cell {
     pub flex: bool,
     /// Padded with spaces to this many cells (a column), when it fits.
     pub width: Option<usize>,
+    /// A note about the value before it (where it was set): drawn after the value when the row
+    /// fits, else on its own line under the value, so the value is never shortened for it (#2351).
+    pub note: bool,
 }
 
 impl Cell {
@@ -226,6 +229,16 @@ impl Cell {
             tone,
             flex: false,
             width: None,
+            note: false,
+        }
+    }
+
+    /// A note about the row's value (`(config ~/.config/…)`): it moves to its own line under the
+    /// value rather than shortening it when the row is too wide (#2351).
+    pub fn note(text: impl Into<String>, tone: Tone) -> Self {
+        Self {
+            note: true,
+            ..Self::new(text, tone)
         }
     }
 
@@ -391,6 +404,9 @@ pub fn fill_command(command: &str, key: &str) -> String {
 pub struct Panel {
     state: Arc<Mutex<Option<PanelState>>>,
     chrome: Chrome,
+    /// The width the panel was last drawn at, so scrolling counts the lines it really takes
+    /// (notes under values and wrapped hints add lines at narrow widths, #2351). 0: not drawn yet.
+    width: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Panel {
@@ -398,6 +414,7 @@ impl Panel {
         Self {
             state: Arc::default(),
             chrome,
+            width: Arc::default(),
         }
     }
 
@@ -448,9 +465,17 @@ impl Panel {
     pub fn move_selection(&self, delta: isize) {
         let rows = self.rows();
         let n = rows.iter().filter(|r| r.target.is_some()).count();
-        // Never further than there are rows below the selection (wrapped rows may need a few
-        // more presses, never an endless run back up).
-        let room = rows.len().saturating_sub(MAX_INFO_ROWS.min(rows.len()));
+        // Never further than there are lines below the selection: the lines as last drawn, else
+        // the rows (wrapped rows may then need a few more presses, never an endless run back up).
+        let width = self.width.load(std::sync::atomic::Ordering::Relaxed);
+        let lines = match self.state() {
+            Some(state) if width > 0 => {
+                let data = self.chrome.data();
+                layout(&state, data.as_ref(), &palette(), width).0.len()
+            }
+            _ => rows.len(),
+        };
+        let room = lines.saturating_sub(MAX_INFO_ROWS.min(lines));
         self.update(|s| {
             let info = s.kind == PanelKind::Info;
             if info && delta < 0 && s.scroll > 0 {
@@ -502,6 +527,9 @@ impl Component for PanelView {
         let Some(state) = self.0.state() else {
             return Vec::new();
         };
+        self.0
+            .width
+            .store(width, std::sync::atomic::Ordering::Relaxed);
         let data = self.0.chrome.data();
         render_panel(&state, data.as_ref(), &palette(), width)
     }
@@ -537,6 +565,9 @@ pub enum Piece {
     Fixed(String),
     /// Plain text shortened to the room left, then drawn in `Color`.
     Flex(String, Color),
+    /// Plain text about the value before it: kept on the row when everything fits, else drawn
+    /// on a line of its own under the value (see [`render_panel`]).
+    Note(String, Color),
 }
 
 /// One line of a panel.
@@ -584,7 +615,7 @@ pub fn fit_pieces(pieces: &[Piece], width: usize) -> String {
     let fixed_w: usize = pieces
         .iter()
         .map(|p| match p {
-            Piece::Fixed(s) => visible_width(s),
+            Piece::Fixed(s) | Piece::Note(s, _) => visible_width(s),
             Piece::Flex(..) => 0,
         })
         .sum();
@@ -596,9 +627,10 @@ pub fn fit_pieces(pieces: &[Piece], width: usize) -> String {
     for p in pieces {
         let (text, w) = match p {
             Piece::Fixed(s) => (s.clone(), visible_width(s)),
+            Piece::Note(s, c) => (c.fg(s), visible_width(s)),
             Piece::Flex(s, c) if !flex_done => {
                 flex_done = true;
-                let short = shorten(s, room);
+                let short = shorten_value(s, room);
                 if short.is_empty() {
                     continue;
                 }
@@ -621,6 +653,108 @@ pub fn fit_pieces(pieces: &[Piece], width: usize) -> String {
         used += gap + w;
     }
     out
+}
+
+/// Whether `pieces` fit `width` cells with every piece whole (one space between pieces).
+fn fits_whole(pieces: &[Piece], width: usize) -> bool {
+    let w: usize = pieces
+        .iter()
+        .map(|p| match p {
+            Piece::Fixed(s) | Piece::Flex(s, _) | Piece::Note(s, _) => visible_width(s),
+        })
+        .sum();
+    w + pieces.len().saturating_sub(1) <= width
+}
+
+/// The column the first [`Piece::Flex`] starts at when `pieces` are laid out whole.
+fn flex_column(pieces: &[Piece]) -> usize {
+    let mut col = 0;
+    for p in pieces {
+        match p {
+            Piece::Flex(..) => return col,
+            Piece::Fixed(s) | Piece::Note(s, _) => col += visible_width(s) + 1,
+        }
+    }
+    0
+}
+
+/// A row with a [`Piece::Note`] laid out in `width` cells (#2351): one line when everything
+/// fits; otherwise the row without its notes, then each note on its own line, lined up under the
+/// value (or two cells in when that leaves too little room), shortened only if it must be.
+pub fn fit_with_notes(pieces: &[Piece], width: usize) -> Vec<String> {
+    if fits_whole(pieces, width) || !pieces.iter().any(|p| matches!(p, Piece::Note(..))) {
+        return vec![fit_pieces(pieces, width)];
+    }
+    let main: Vec<Piece> = pieces
+        .iter()
+        .filter(|p| !matches!(p, Piece::Note(..)))
+        .cloned()
+        .collect();
+    let mut col = flex_column(&main);
+    let mut out = vec![fit_pieces(&main, width)];
+    for p in pieces {
+        if let Piece::Note(s, c) = p {
+            if col + visible_width(s) > width && col > 2 {
+                col = 2.min(width);
+            }
+            let room = width.saturating_sub(col);
+            if room > 0 {
+                out.push(format!("{}{}", " ".repeat(col), c.fg(&shorten(s, room))));
+            }
+        }
+    }
+    out
+}
+
+/// `text` shortened to `max` cells. A path (`/…`, `~/…`, `<repo>/…`, no spaces) keeps its tail,
+/// the directory or file it names, behind a `…` (#2351); anything else is cut at the end.
+pub fn shorten_value(text: &str, max: usize) -> String {
+    let is_path = !text.contains(' ')
+        && (text.starts_with('/') || text.starts_with("~/") || text.starts_with("<repo>/"));
+    if !is_path || visible_width(text) <= max || max < 8 {
+        return shorten(text, max);
+    }
+    // The longest tail that fits after `…`, starting at a `/` when one fits.
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = chars.len();
+    let mut used = 0;
+    while start > 0 {
+        let mut buf = [0; 4];
+        let w = visible_width(chars[start - 1].encode_utf8(&mut buf));
+        if used + w > max - 1 {
+            break;
+        }
+        used += w;
+        start -= 1;
+    }
+    let tail: String = chars[start..].iter().collect();
+    let tail = match tail.find('/') {
+        Some(i) if i > 0 && tail.len() - i > 1 => &tail[i..],
+        _ => tail.as_str(),
+    };
+    format!("…{tail}")
+}
+
+/// A key hint (`↑↓ select · Enter use · s save · Esc close`) in rows of at most `width` cells,
+/// broken between its ` · ` parts so no key is cut (#2351). A part wider than a row is shortened.
+pub fn wrap_hint(hint: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for part in hint.split(" · ") {
+        let part = shorten(part, width);
+        if cur.is_empty() {
+            cur = part;
+        } else if visible_width(&cur) + 3 + visible_width(&part) <= width {
+            cur.push_str(" · ");
+            cur.push_str(&part);
+        } else {
+            rows.push(std::mem::take(&mut cur));
+            cur = part;
+        }
+    }
+    rows.push(cur);
+    rows
 }
 
 /// Plain text wrapped at word boundaries to `width` cells (long words are cut).
@@ -754,7 +888,9 @@ fn info_rows(state: &PanelState) -> Vec<Row> {
                             text.push_str(&" ".repeat(w - have));
                         }
                     }
-                    if cell.flex {
+                    if cell.note {
+                        Piece::Note(text, color)
+                    } else if cell.flex {
                         Piece::Flex(text, color)
                     } else {
                         Piece::Fixed(color.fg(&text))
@@ -1863,29 +1999,14 @@ fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
     }
 }
 
-/// The panel at `width`: a title rule, the rows (at most [`MAX_ROWS`], scrolled to the
-/// selection), the note and the key hint. Every line fits `width`.
-pub fn render_panel(
+/// Every row of the panel laid out at `width` (wrapped rows and notes take several lines), the
+/// line the selection is on and how many rows are selectable.
+fn layout(
     state: &PanelState,
     data: Option<&ChromeData>,
     p: &AmpPalette,
     width: usize,
-) -> Vec<String> {
-    if width == 0 {
-        return Vec::new();
-    }
-    let c = colors();
-    let rule_char = rpi_tui::theme().border_style.chars().horizontal;
-    let title = format!(" {} ", state.title());
-    let title = shorten(&title, width.saturating_sub(2));
-    let fill = width.saturating_sub(2 + visible_width(&title));
-    let mut out = vec![format!(
-        "{}{}{}",
-        c.border_muted.fg(&rule_char.repeat(2.min(width))),
-        rpi_tui::bold(&c.text.fg(&title)),
-        c.border_muted.fg(&rule_char.repeat(fill))
-    )];
-
+) -> (Vec<String>, usize, usize) {
     let rows = build_rows(state, data, p);
     let n_targets = rows.iter().filter(|r| r.target.is_some()).count();
     let selected = state.selected.min(n_targets.saturating_sub(1));
@@ -1894,6 +2015,7 @@ pub fn render_panel(
     let mut selected_line = 0;
     let mut target_index = 0;
     let inner = width.saturating_sub(3);
+    let c = colors();
     for row in &rows {
         let is_target = row.target.is_some();
         let is_selected = is_target && target_index == selected && state.stage == Stage::Browse;
@@ -1921,9 +2043,39 @@ pub fn render_panel(
             }
             continue;
         }
-        let body = fit_pieces(&row.pieces, inner.saturating_sub(row.indent));
-        lines.push(format!("{marker} {}{body}", " ".repeat(row.indent)));
+        let room = inner.saturating_sub(row.indent);
+        for (i, body) in fit_with_notes(&row.pieces, room).into_iter().enumerate() {
+            let marker = if i == 0 { marker.as_str() } else { " " };
+            lines.push(format!("{marker} {}{body}", " ".repeat(row.indent)));
+        }
     }
+    (lines, selected_line, n_targets)
+}
+
+/// The panel at `width`: a title rule, the rows (at most [`MAX_ROWS`], scrolled to the
+/// selection), the note and the key hint. Every line fits `width`.
+pub fn render_panel(
+    state: &PanelState,
+    data: Option<&ChromeData>,
+    p: &AmpPalette,
+    width: usize,
+) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let c = colors();
+    let rule_char = rpi_tui::theme().border_style.chars().horizontal;
+    let title = format!(" {} ", state.title());
+    let title = shorten(&title, width.saturating_sub(2));
+    let fill = width.saturating_sub(2 + visible_width(&title));
+    let mut out = vec![format!(
+        "{}{}{}",
+        c.border_muted.fg(&rule_char.repeat(2.min(width))),
+        rpi_tui::bold(&c.text.fg(&title)),
+        c.border_muted.fg(&rule_char.repeat(fill))
+    )];
+
+    let (lines, selected_line, n_targets) = layout(state, data, p, width);
     let max_rows = if state.kind == PanelKind::Info {
         MAX_INFO_ROWS
     } else {
@@ -1942,20 +2094,20 @@ pub fn render_panel(
                 .fg(&shorten(&format!("  ↓ {} more", lines.len() - end), width)),
         );
     }
+    // The note and the key hint wrap rather than lose their ends (#2351: `l login` read `l l…`).
     if let Some((note, error)) = &state.note {
         let color = if *error { c.error } else { c.success };
-        out.push(format!(
-            "  {}",
-            color.fg(&shorten(&clean(note), width.saturating_sub(2)))
-        ));
+        for part in wrap_plain(note, width.saturating_sub(2))
+            .into_iter()
+            .take(3)
+        {
+            out.push(format!("  {}", color.fg(&part)));
+        }
     }
-    out.push(format!(
-        "  {}",
-        c.dim.fg(&shorten(
-            &hint(state, n_targets > 0, lines.len() > max_rows),
-            width.saturating_sub(2)
-        ))
-    ));
+    let hint = hint(state, n_targets > 0, lines.len() > max_rows);
+    for part in wrap_hint(&hint, width.saturating_sub(2)) {
+        out.push(format!("  {}", c.dim.fg(&part)));
+    }
     // A last guard: nothing wider than the terminal (the pieces are already fitted).
     out.into_iter()
         .map(|l| {
@@ -2046,6 +2198,182 @@ mod tests {
         let line = chrome::plain(&fit_pieces(&pieces, 24));
         assert!(line.starts_with("#2108 a long"), "{line}");
         assert!(line.ends_with("… tail") || line.ends_with("tail"), "{line}");
+    }
+
+    /// A `/config`-shaped panel and an `/mcp` details-shaped one (#2351).
+    fn narrow_panels() -> (PanelState, PanelState) {
+        let line = |label: &str, value: &str, note: &str| {
+            let mut cells = vec![
+                Cell::new(label, Tone::Dim).pad(18),
+                Cell::flex(value, Tone::Text),
+            ];
+            if !note.is_empty() {
+                cells.push(Cell::note(note, Tone::Muted));
+            }
+            InfoRow::new(cells).indent(2)
+        };
+        let config = InfoPanel::fixed(
+            "configuration",
+            vec![
+                InfoRow::new(vec![Cell::new("files", Tone::Accent)]),
+                line(
+                    "repo",
+                    "/Volumes/external-data/development/simstech/demo/harness-play/qa-3c",
+                    "",
+                ),
+                InfoRow::new(vec![Cell::new("AMP server", Tone::Accent)]),
+                line(
+                    "url",
+                    "http://localhost:8080",
+                    "(config ~/.config/amp-harness/config.toml)",
+                ),
+                line(
+                    "openrouter",
+                    "openai-completions · https://openrouter.ai/api/v1",
+                    "(key: env OPENROUTER_API_KEY)",
+                ),
+                line("protocol", "streamable", "(default)"),
+            ],
+        );
+        let mcp = InfoPanel::fixed(
+            "MCP server amp",
+            vec![InfoRow::new(vec![Cell::flex("amp · ready", Tone::Text)]).key("amp")],
+        )
+        .on_enter("back to the list", "/mcp")
+        .with_key('r', "restart", "/mcp restart {}")
+        .with_key('t', "test", "/mcp test {}")
+        .with_key('e', "enable", "/mcp enable {}")
+        .with_key('d', "disable", "/mcp disable {}")
+        .with_key('l', "login", "/mcp login {}")
+        .with_key('T', "trust", "/mcp trust {}")
+        .with_key('U', "untrust", "/mcp untrust {}");
+        (
+            PanelState::info(Arc::new(config), None),
+            PanelState::info(Arc::new(mcp), Some("amp")),
+        )
+    }
+
+    #[test]
+    fn narrow_config_keeps_values_whole_and_moves_notes_under_them() {
+        // #2351: at 80 columns (76 inside the default padding) the url read `http://l…` while its
+        // source note took the rest of the row.
+        let (config, _) = narrow_panels();
+        let p = palette();
+        let lines: Vec<String> = render_panel(&config, None, &p, 76)
+            .iter()
+            .map(|l| chrome::plain(l))
+            .collect();
+        assert!(lines.iter().all(|l| visible_width(l) <= 76), "{lines:#?}");
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} not in {lines:#?}"))
+        };
+        let url = at("url");
+        assert!(
+            lines[url].trim_end().ends_with("http://localhost:8080"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[url + 1].contains("(config ~/.config/amp-harness/config.toml)"),
+            "{lines:#?}"
+        );
+        // The note lines up under the value.
+        let value_col = lines[url].find("http").unwrap();
+        assert_eq!(lines[url + 1].find('(').unwrap(), value_col, "{lines:#?}");
+        let api = at("openrouter");
+        assert!(
+            lines[api].contains("openai-completions · https://openrouter.ai/api/v1"),
+            "{lines:#?}"
+        );
+        assert!(lines[api + 1].contains("(key: env OPENROUTER_API_KEY)"));
+        // A short row keeps its note on the same line.
+        assert!(lines[at("protocol")].contains("streamable (default)"));
+        // A long path keeps the folder it names.
+        let repo = &lines[at("repo")];
+        assert!(
+            repo.contains("repo               …/")
+                && repo.trim_end().ends_with("/harness-play/qa-3c"),
+            "{repo}"
+        );
+
+        // Wide enough, every note stays on its row.
+        let wide: Vec<String> = render_panel(&config, None, &p, 116)
+            .iter()
+            .map(|l| chrome::plain(l))
+            .collect();
+        assert!(wide.iter().any(|l| {
+            l.contains("http://localhost:8080 (config ~/.config/amp-harness/config.toml)")
+        }));
+        assert!(!wide.iter().any(|l| l.contains('…')), "{wide:#?}");
+    }
+
+    #[test]
+    fn narrow_key_hints_wrap_between_keys() {
+        // #2351: the /mcp details hint ended in `l l…` at 80 columns.
+        let (_, mcp) = narrow_panels();
+        let lines: Vec<String> = render_panel(&mcp, None, &palette(), 76)
+            .iter()
+            .map(|l| chrome::plain(l))
+            .collect();
+        assert!(lines.iter().all(|l| visible_width(l) <= 76), "{lines:#?}");
+        let hint = lines
+            .iter()
+            .skip_while(|l| !l.contains("↑↓ select"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(hint.len() >= 2, "{lines:#?}");
+        let joined = hint.join(" · ");
+        for key in [
+            "Enter back to the list",
+            "l login",
+            "T trust",
+            "U untrust",
+            "Esc close",
+        ] {
+            assert!(joined.contains(key), "{key:?} in {hint:#?}");
+        }
+        assert!(!joined.contains('…'), "{hint:#?}");
+        assert_eq!(wrap_hint("a · b · c", 5), ["a · b", "c"]);
+    }
+
+    #[test]
+    fn a_narrow_panel_scrolls_to_its_last_line() {
+        // #2351: notes under values add lines at narrow widths; ↓ must still reach the end.
+        let line = |i: usize| {
+            InfoRow::new(vec![
+                Cell::new(format!("row {i}"), Tone::Dim).pad(18),
+                Cell::flex("http://localhost:8080/mcp", Tone::Text),
+                Cell::note("(config ~/.config/amp-harness/config.toml)", Tone::Muted),
+            ])
+            .indent(2)
+        };
+        let rows: Vec<InfoRow> = (0..30).map(line).collect();
+        let panel = Panel::new(Chrome::new());
+        panel.open(PanelState::info(
+            Arc::new(InfoPanel::fixed("config", rows)),
+            None,
+        ));
+        let view = panel.component();
+        let draw = || -> Vec<String> { view.render(76).iter().map(|l| chrome::plain(l)).collect() };
+        let more = |l: &String| l.trim_start().starts_with("↓ ");
+        assert!(draw().iter().any(more), "{:#?}", draw());
+        for _ in 0..200 {
+            panel.move_selection(1);
+            draw();
+        }
+        let lines = draw();
+        assert!(lines.iter().any(|l| l.contains("row 29")), "{lines:#?}");
+        assert!(!lines.iter().any(more), "{lines:#?}");
+    }
+
+    #[test]
+    fn path_values_keep_their_tail() {
+        assert_eq!(shorten_value("/a/bb/ccc/dddd", 10), "…/ccc/dddd");
+        assert_eq!(shorten_value("http://localhost:8080/x", 10), "http://lo…");
+        assert_eq!(shorten_value("~/short", 10), "~/short");
+        assert_eq!(shorten_value("a b/c/d/e/f/g", 6), "a b/c…");
     }
 
     #[test]

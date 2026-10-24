@@ -103,4 +103,5 @@ explanation.
   Choose "Always Allow".
 - With no terminal (agents, scripts, CI) the harness never shows a keychain dialog nobody can
   answer. An item that would need one fails at once with a message naming the item and the
-  command to fix it. `AMP_HARNESS_KEYCHAIN_PROMPTS=never` forces that.
+  command to fix it (`connect <id>` for a provider key, `mcp secret`/`mcp login` for an MCP
+  server's secret or login, `login` for the AMP login; see `harness/troubleshooting.md`). `AMP_HARNESS_KEYCHAIN_PROMPTS=never` forces that.

@@ -193,8 +193,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec::new(
         Group::Config,
         "config",
-        "",
-        "every setting and where it comes from",
+        "[thinking]",
+        "every setting, where it's from; thinking mode",
     ),
     CommandSpec::new(
         Group::Config,
@@ -215,11 +215,12 @@ pub const COMMANDS: &[CommandSpec] = &[
 pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "send"),
     ("Shift+Enter", "new line"),
+    ("↑/↓", "earlier prompts (empty or one-line editor)"),
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
     ("Esc", "stop the reply, or close a panel or the menu"),
     ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
     ("Ctrl+D", "quit (empty editor, at the latest output)"),
-    ("Ctrl+T", "show or hide the last thinking"),
+    ("Ctrl+T", "open or close the thinking in sight, or click it"),
     ("Ctrl+O", "show or hide tool call details"),
     ("PgUp/PgDn", "scroll the transcript a page"),
     ("Ctrl+U/D", "scroll half a page (with an empty editor)"),

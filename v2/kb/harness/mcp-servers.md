@@ -50,7 +50,9 @@ Secrets never go in a file or on the command line:
 - A plain `--header` or `--env` value that looks like a secret is refused, with these
   alternatives.
 - **OAuth:** `--auth auto` (the default) logs in when the server asks for it.
-  `amp-harness mcp login NAME` opens the browser and `mcp logout NAME` forgets the login. For a
+  `amp-harness mcp login NAME` opens the browser and `mcp logout NAME` forgets the login. Logout
+  is local only: the tokens are removed from this machine, not revoked at the server. If they may
+  have leaked, revoke the app's access in the provider's settings. For a
   server that needs a pre-registered app: `--client-id`, `--client-secret` (asked hidden),
   `--oauth-scope`, `--callback-port`.
 - Where there is no keychain (`AMP_CREDENTIAL_STORE=file`), use `--bearer-env` or `${env:VAR}`

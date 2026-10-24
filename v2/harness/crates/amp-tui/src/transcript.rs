@@ -17,9 +17,11 @@
 //!   and Mermaid keep rpi's rendering at the real width. Tables are drawn by [`crate::table`]
 //!   (#2180): box glyphs, padded cells, wrapped to fit or listed per row.
 //! - [`AssistantBlock`]: an assistant message's text and thinking blocks, and its error line.
-//! - [`ThinkingBlock`]: a thinking section, collapsed to one live `Thinking · 18s ▸` line by
-//!   default (#2177); expanded, plain dim text behind a `│` gutter ([`ThinkingDisplay`]).
-//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers.
+//! - [`ThinkingBlock`]: a thinking section, collapsed to one live `▸ Thinking · 18s` line by
+//!   default (#2177), `▸ Thought for 18s` once it ends (#2345); expanded, plain dim text behind
+//!   a `│` gutter ([`ThinkingDisplay`]). A click on its line or Ctrl+T opens and closes it.
+//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers; plain
+//!   text, shown exactly as typed (#2350).
 //! - [`ToolBlock`]: a tool call on one line (status glyph, title, argument, the result's
 //!   summary, `12 ms`), its details under it when expanded (Ctrl+O, [`ToolDisplay`]); a failed
 //!   call shows its error. [`ToolGroup`] holds consecutive calls as one block (#2183).
@@ -504,8 +506,8 @@ pub enum Block {
 /// How the transcript shows the model's thinking (`[tui] show_thinking`, #2177).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkingDisplay {
-    /// One line per thinking section: `Thinking · 18s ▸`, with the latest sentence while it
-    /// streams. Ctrl+T expands the last one.
+    /// One line per thinking section: `▸ Thinking · 18s`, with the latest sentence while it
+    /// streams, then `▸ Thought for 18s`. A click or Ctrl+T opens one.
     #[default]
     Collapsed,
     /// The whole text, as plain dim text behind a `│` gutter.
@@ -544,16 +546,26 @@ struct ThinkingState {
     timed: bool,
     /// A blank row after it (something visible follows).
     spacer: bool,
+    /// How it shows (`/config thinking` changes it for blocks already in the transcript, #2345).
+    display: ThinkingDisplay,
+    /// The transcript's last thinking: collapsed, its header says how to open it
+    /// ([`THINKING_HINT`]).
+    hint: Option<&'static str>,
 }
 
+/// What the transcript's last collapsed thinking header says after its duration (#2345).
+pub const THINKING_HINT: &str = "Ctrl+T or click to open";
+/// [`THINKING_HINT`] with mouse capture off (`[tui] mouse = false`): clicks don't reach the chat.
+pub const THINKING_HINT_KEY: &str = "Ctrl+T to open";
+
 /// One thinking section of an assistant message (#2177). Collapsed it is one dim line,
-/// `Thinking · 18s ▸`, followed while it streams by the latest sentence; expanded, the text
-/// follows as plain dim rows behind a `│` gutter, with no markdown styling, so it never reads
-/// like the answer.
+/// `▸ Thinking · 18s`, followed while it streams by the latest sentence, and `▸ Thought for 18s`
+/// once it ends (#2345); expanded (`▾`), the text follows as plain dim rows behind a `│` gutter,
+/// with no markdown styling, so it never reads like the answer. A click on the header, or Ctrl+T,
+/// opens and closes it.
 pub struct ThinkingBlock {
     state: Mutex<ThinkingState>,
     expanded: AtomicBool,
-    display: ThinkingDisplay,
     /// The expanded body's rows.
     cache: Cache,
 }
@@ -570,9 +582,10 @@ impl ThinkingBlock {
                 ended: None,
                 timed: true,
                 spacer: false,
+                display,
+                hint: None,
             }),
             expanded: AtomicBool::new(display == ThinkingDisplay::Full),
-            display,
             cache: Cache::default(),
         }
     }
@@ -607,6 +620,22 @@ impl ThinkingBlock {
         }
     }
 
+    /// A new display mode (`/config thinking`, #2345): it opens for `full`, closes otherwise.
+    pub fn set_display(&self, display: ThinkingDisplay) {
+        if let Ok(mut s) = self.state.lock() {
+            s.display = display;
+        }
+        self.expanded
+            .store(display == ThinkingDisplay::Full, Ordering::Relaxed);
+    }
+
+    /// What its collapsed header says about opening it, if anything.
+    pub fn set_hint(&self, hint: Option<&'static str>) {
+        if let Ok(mut s) = self.state.lock() {
+            s.hint = hint;
+        }
+    }
+
     /// Expands or collapses it; returns whether it is now expanded.
     pub fn toggle(&self) -> bool {
         !self.expanded.fetch_xor(true, Ordering::Relaxed)
@@ -616,35 +645,47 @@ impl ThinkingBlock {
         self.expanded.load(Ordering::Relaxed)
     }
 
+    /// `Thinking · 18s` while it streams, `Thought for 18s` after, `Thinking` without a duration.
+    fn label(s: &ThinkingState) -> String {
+        if !s.timed {
+            return "Thinking".to_owned();
+        }
+        let secs = s
+            .ended
+            .unwrap_or_else(Instant::now)
+            .duration_since(s.started)
+            .as_secs();
+        if s.ended.is_some() {
+            format!("Thought for {secs}s")
+        } else {
+            format!("Thinking · {secs}s")
+        }
+    }
+
     fn header(&self, s: &ThinkingState, width: usize) -> String {
         let colors = theme().colors;
         let expanded = self.is_expanded();
-        let mut label = "Thinking".to_owned();
-        if s.timed {
-            let secs = s
-                .ended
-                .unwrap_or_else(Instant::now)
-                .duration_since(s.started)
-                .as_secs();
-            label.push_str(&format!(" · {secs}s"));
-        }
+        let label = Self::label(s);
         let glyph = if expanded { "▾" } else { "▸" };
         let pad = " ".repeat(Self::PAD);
-        let head = format!("{label} {glyph}");
+        let head = format!("{glyph} {label}");
         let room = width.saturating_sub(Self::PAD + rpi_tui::visible_width(&head) + 1);
-        let latest = if s.ended.is_none() && !expanded {
-            tail_to_width(&latest_sentence(&s.text), room)
+        let tail = if s.ended.is_none() && !expanded {
+            let latest = tail_to_width(&latest_sentence(&s.text), room);
+            (!latest.is_empty()).then(|| colors.thinking_text.fg(&latest))
         } else {
-            String::new()
+            s.hint
+                .filter(|h| !expanded && room >= rpi_tui::visible_width(h) + 2)
+                .map(|hint| colors.dim.fg(&format!("· {hint}")))
         };
         let mut row = format!(
             "{pad}{} {}",
-            colors.thinking_text.fg(&label),
-            colors.muted.fg(glyph)
+            colors.muted.fg(glyph),
+            colors.thinking_text.fg(&label)
         );
-        if !latest.is_empty() {
+        if let Some(tail) = tail {
             row.push(' ');
-            row.push_str(&colors.thinking_text.fg(&latest));
+            row.push_str(&tail);
         }
         truncate_to_width(&row, width, "")
     }
@@ -675,10 +716,10 @@ impl ThinkingBlock {
 
 impl Component for ThinkingBlock {
     fn render(&self, width: usize) -> Vec<String> {
-        let shown = self.display != ThinkingDisplay::Hidden || self.is_expanded();
         let Ok(s) = self.state.lock() else {
             return Vec::new();
         };
+        let shown = s.display != ThinkingDisplay::Hidden || self.is_expanded();
         if !shown || s.text.trim().is_empty() {
             return Vec::new();
         }
@@ -757,7 +798,7 @@ fn tail_to_width(s: &str, width: usize) -> String {
 pub struct AssistantBlock {
     content: Arc<Container>,
     blocks: Mutex<Vec<Block>>,
-    display: ThinkingDisplay,
+    display: Mutex<ThinkingDisplay>,
     /// One per thinking section, kept across rebuilds (they hold its timer and expansion).
     thinking: Mutex<Vec<Arc<ThinkingBlock>>>,
     finished: AtomicBool,
@@ -783,7 +824,7 @@ impl AssistantBlock {
         Self {
             content: Arc::new(Container::new()),
             blocks: Mutex::new(Vec::new()),
-            display,
+            display: Mutex::new(display),
             thinking: Mutex::new(Vec::new()),
             finished: AtomicBool::new(false),
             gap_above: AtomicBool::new(false),
@@ -824,10 +865,75 @@ impl AssistantBlock {
     /// Expands or collapses its last thinking section; `None` when it has none, else whether
     /// it is now expanded.
     pub fn toggle_thinking(&self) -> Option<bool> {
-        let last = self.thinking.lock().ok()?.last().cloned()?;
-        let expanded = last.toggle();
+        let last = self.thinking.lock().ok()?.len().checked_sub(1)?;
+        self.toggle_section(last)
+    }
+
+    /// Expands or collapses its thinking section `index` (a click on its header, #2345).
+    pub fn toggle_section(&self, index: usize) -> Option<bool> {
+        let block = self.thinking.lock().ok()?.get(index).cloned()?;
+        let expanded = block.toggle();
         self.content.invalidate();
         Some(expanded)
+    }
+
+    /// Shows its thinking, and any section added later, as `display` (`/config thinking`,
+    /// #2345): every section opens for `full` and closes otherwise.
+    pub fn set_display(&self, display: ThinkingDisplay) {
+        if let Ok(mut d) = self.display.lock() {
+            *d = display;
+        }
+        if let Ok(t) = self.thinking.lock() {
+            for block in t.iter() {
+                block.set_display(display);
+            }
+        }
+        self.content.invalidate();
+    }
+
+    /// What its last section's collapsed header says about opening it (the transcript's last
+    /// thinking, #2345); the others say nothing.
+    pub fn set_hint(&self, hint: Option<&'static str>) {
+        if let Ok(t) = self.thinking.lock() {
+            let last = t.len().saturating_sub(1);
+            for (i, block) in t.iter().enumerate() {
+                block.set_hint(hint.filter(|_| i == last));
+            }
+        }
+    }
+
+    /// The rows (of [`Component::render`] at `width`) holding a thinking header, with its
+    /// section's index (#2345): what a click maps to.
+    pub fn thinking_headers(&self, width: usize) -> Vec<(usize, usize)> {
+        let Ok(thinking) = self.thinking.lock().map(|t| t.clone()) else {
+            return Vec::new();
+        };
+        let children = self.content.get_children();
+        let mut rows = Vec::new();
+        let mut at = 0;
+        for child in &children {
+            let rendered = child.render(width);
+            if !rendered.is_empty()
+                && let Some(index) = thinking
+                    .iter()
+                    .position(|t| std::ptr::addr_eq(Arc::as_ptr(t), Arc::as_ptr(child)))
+            {
+                rows.push((at, index));
+            }
+            at += rendered.len();
+        }
+        // The blank row above it (after a tool group) moves everything down one.
+        let first_shown = children
+            .iter()
+            .flat_map(|c| c.render(width))
+            .next()
+            .is_some_and(|r| !r.trim().is_empty());
+        if self.gap_above.load(Ordering::Relaxed) && first_shown {
+            for row in &mut rows {
+                row.0 += 1;
+            }
+        }
+        rows
     }
 
     fn rebuild(&self, blocks: &[Block]) {
@@ -836,6 +942,7 @@ impl AssistantBlock {
             Block::Text(t) | Block::Thinking(t) => !t.trim().is_empty(),
         };
         let finished = self.finished.load(Ordering::Relaxed);
+        let display = self.display.lock().map(|d| *d).unwrap_or_default();
         let Ok(mut thinking) = self.thinking.lock() else {
             return;
         };
@@ -872,7 +979,7 @@ impl AssistantBlock {
                             Arc::clone(b)
                         }
                         None => {
-                            let b = Arc::new(ThinkingBlock::new(self.display, text));
+                            let b = Arc::new(ThinkingBlock::new(display, text));
                             // Seen complete at once (a replayed message): no duration.
                             if followed || finished {
                                 b.end(false);
@@ -946,8 +1053,10 @@ const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
 const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
 
-/// The user's message: markdown on the theme's surface colour inside a padded box, between OSC
-/// 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped.
+/// The user's message: plain text on the theme's surface colour inside a padded box, between
+/// OSC 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped. It is shown exactly
+/// as typed, not as markdown (#2350): paths like `mathx/__init__.py`, `snake_case` and `*.rs`
+/// globs are what engineers type, and emphasis parsing would change them on screen.
 pub struct UserBlock {
     text: String,
     inner: Mutex<(u64, BgBox)>,
@@ -959,8 +1068,23 @@ fn user_box(text: &str) -> BgBox {
     let bg = theme().colors.surface;
     let content = BgBox::new(1, 1);
     content.set_bg_fn(Some(Arc::new(move |s: &str| bg.bg(s))));
-    content.add_child(Arc::new(WrapMarkdown::new(text, 0, MarkdownStyle::Plain)));
+    content.add_child(Arc::new(WrapText::new(verbatim(text), 0, 0)));
     content
+}
+
+/// The user's text as it shows: tabs as spaces, and control characters (an escape sequence
+/// pasted in) dropped so they can't restyle the terminal; everything else as typed.
+fn verbatim(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.replace("\r\n", "\n").chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl UserBlock {
@@ -1815,6 +1939,58 @@ mod tests {
         );
     }
 
+    // #2350: the user's own message is shown as typed, not as markdown.
+
+    const TYPED: &str = "export it from mathx/__init__.py, rename a_b_c, match *.rs and keep **x**";
+
+    #[test]
+    fn the_users_message_is_shown_exactly_as_typed() {
+        let rows = plain_rows(&UserBlock::new(TYPED).render(120));
+        assert!(rows.iter().any(|r| r.trim() == TYPED), "{rows:#?}");
+
+        // Wrapped at 40 columns, the words are the same and in order.
+        let rows = plain_rows(&UserBlock::new(TYPED).render(40));
+        assert!(rows.len() > 3, "{rows:#?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 40), "{rows:#?}");
+        let words: Vec<String> = rows
+            .iter()
+            .flat_map(|r| r.split_whitespace().map(str::to_owned))
+            .collect();
+        assert_eq!(words.join(" "), TYPED);
+
+        // No bold or italic from the `**x**` and `__init__` either.
+        let raw = UserBlock::new("**x** and __init__").render(80).join("\n");
+        assert!(
+            !raw.contains("\x1b[1m") && !raw.contains("\x1b[3m"),
+            "{raw:?}"
+        );
+    }
+
+    #[test]
+    fn the_users_message_keeps_its_lines_and_drops_control_characters() {
+        let rows =
+            plain_rows(&UserBlock::new("# not a heading\n- not a list\tx\x1b[31m").render(80));
+        let text: Vec<&str> = rows
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert_eq!(text, vec!["# not a heading", "- not a list    x[31m"]);
+    }
+
+    #[test]
+    fn assistant_replies_still_render_markdown() {
+        let block = AssistantBlock::new();
+        block.update_blocks(&[Block::Text("see mathx/__init__.py and **x**".into())]);
+        let raw = block.render(80).join("\n");
+        let rows = plain_rows(&block.render(80));
+        assert!(
+            rows.iter().any(|r| r.trim() == "see mathx/init.py and x"),
+            "{rows:#?}"
+        );
+        assert!(raw.contains("\x1b[1m"), "{raw:?}");
+    }
+
     // #2177: thinking.
 
     const THOUGHT: &str = "## Plan\nFirst I **check** the guide. Then I write the `ticket` and ask";
@@ -1826,16 +2002,16 @@ mod tests {
         let rows = plain_rows(&block.render(80));
         assert_eq!(
             rows,
-            vec![" Thinking · 0s ▸ Then I write the ticket and ask"]
+            vec![" ▸ Thinking · 0s Then I write the ticket and ask"]
         );
 
-        // The answer starts: the line collapses to its duration and the timer stops.
+        // The answer starts: the line collapses to "Thought for Ns" and the timer stops (#2345).
         block.update_blocks(&[
             Block::Thinking(THOUGHT.into()),
             Block::Text("The answer.".into()),
         ]);
         let rows = plain_rows(&block.render(80));
-        assert_eq!(rows, vec![" Thinking · 0s ▸", "", " The answer."]);
+        assert_eq!(rows, vec![" ▸ Thought for 0s", "", " The answer."]);
         let thinking = block.thinking.lock().unwrap()[0].clone();
         assert!(!thinking.is_live());
     }
@@ -1844,7 +2020,7 @@ mod tests {
     fn the_latest_sentence_keeps_its_end_when_narrow() {
         let block = ThinkingBlock::new(ThinkingDisplay::Collapsed, THOUGHT);
         let rows = plain_rows(&block.render(30));
-        assert_eq!(rows, vec![" Thinking · 0s ▸ …cket and ask"]);
+        assert_eq!(rows, vec![" ▸ Thinking · 0s …cket and ask"]);
         assert!(rpi_tui::visible_width(&block.render(30)[0]) <= 30);
         assert_eq!(latest_sentence("- one. two? **three"), "three");
         assert_eq!(latest_sentence("a.\n\n"), "a.");
@@ -1861,7 +2037,7 @@ mod tests {
         let styled = block.render(80);
         let rows = plain_rows(&styled);
         // Seen complete at once: no duration.
-        assert_eq!(rows[0], " Thinking ▾");
+        assert_eq!(rows[0], " ▾ Thinking");
         // Markdown stays literal text: no heading, no bold.
         assert_eq!(rows[1], " │ ## Plan");
         assert_eq!(
@@ -1899,7 +2075,7 @@ mod tests {
         let rows = plain_rows(&block.render(40));
         assert_eq!(
             rows,
-            vec![" Thinking ▸", "", " a", " Thinking ▾", " │ two", "", " b"]
+            vec![" ▸ Thinking", "", " a", " ▾ Thinking", " │ two", "", " b"]
         );
         assert_eq!(block.toggle_thinking(), Some(false));
         assert!(!plain_rows(&block.render(40)).contains(&" │ two".to_owned()));
@@ -1913,7 +2089,7 @@ mod tests {
         block.toggle_thinking();
         assert_eq!(
             plain_rows(&block.render(40)),
-            vec![" Thinking ▾", " │ why", "", " a"]
+            vec![" ▾ Thinking", " │ why", "", " a"]
         );
     }
 
@@ -1922,7 +2098,106 @@ mod tests {
         let block = AssistantBlock::new();
         block.finish();
         block.update_blocks(&[Block::Thinking("why".into()), Block::Text("a".into())]);
-        assert_eq!(plain_rows(&block.render(40))[0], " Thinking ▸");
+        assert_eq!(plain_rows(&block.render(40))[0], " ▸ Thinking");
+    }
+
+    // #2345: per-section toggles, the hint, the display mode changed in place, header rows.
+
+    /// A message streamed live: thinking, then an answer, then thinking, then an answer.
+    fn two_sections(display: ThinkingDisplay) -> AssistantBlock {
+        let block = AssistantBlock::with_thinking(display);
+        block.update_blocks(&[Block::Thinking("one".into())]);
+        block.update_blocks(&[Block::Thinking("one".into()), Block::Text("a".into())]);
+        block.update_blocks(&[
+            Block::Thinking("one".into()),
+            Block::Text("a".into()),
+            Block::Thinking("two".into()),
+        ]);
+        block.update_blocks(&[
+            Block::Thinking("one".into()),
+            Block::Text("a".into()),
+            Block::Thinking("two".into()),
+            Block::Text("b".into()),
+        ]);
+        block.finish();
+        block
+    }
+
+    #[test]
+    fn each_section_opens_and_closes_on_its_own() {
+        let block = two_sections(ThinkingDisplay::Collapsed);
+        assert_eq!(
+            plain_rows(&block.render(40)),
+            vec![" ▸ Thought for 0s", "", " a", " ▸ Thought for 0s", "", " b"]
+        );
+        assert_eq!(block.toggle_section(0), Some(true));
+        assert_eq!(
+            plain_rows(&block.render(40)),
+            vec![
+                " ▾ Thought for 0s",
+                " │ one",
+                "",
+                " a",
+                " ▸ Thought for 0s",
+                "",
+                " b"
+            ]
+        );
+        assert_eq!(block.toggle_section(0), Some(false));
+        assert_eq!(block.toggle_section(2), None);
+    }
+
+    #[test]
+    fn the_last_collapsed_section_names_its_key() {
+        let block = two_sections(ThinkingDisplay::Collapsed);
+        block.set_hint(Some(THINKING_HINT));
+        let rows = plain_rows(&block.render(60));
+        assert_eq!(rows[0], " ▸ Thought for 0s");
+        assert_eq!(rows[3], " ▸ Thought for 0s · Ctrl+T or click to open");
+        // Open, it says nothing; too narrow, neither.
+        block.toggle_thinking();
+        assert_eq!(plain_rows(&block.render(60))[3], " ▾ Thought for 0s");
+        block.toggle_thinking();
+        assert_eq!(plain_rows(&block.render(30))[3], " ▸ Thought for 0s");
+        block.set_hint(None);
+        assert_eq!(plain_rows(&block.render(60))[3], " ▸ Thought for 0s");
+    }
+
+    #[test]
+    fn a_new_display_mode_applies_to_sections_already_shown() {
+        let block = two_sections(ThinkingDisplay::Collapsed);
+        block.set_display(ThinkingDisplay::Full);
+        assert_eq!(
+            plain_rows(&block.render(40)),
+            vec![
+                " ▾ Thought for 0s",
+                " │ one",
+                "",
+                " a",
+                " ▾ Thought for 0s",
+                " │ two",
+                "",
+                " b"
+            ]
+        );
+        block.set_display(ThinkingDisplay::Hidden);
+        assert_eq!(plain_rows(&block.render(40)), vec![" a", " b"]);
+        assert!(block.thinking_headers(40).is_empty());
+        // A section added later takes the new mode.
+        block.set_display(ThinkingDisplay::Collapsed);
+        assert_eq!(plain_rows(&block.render(40))[0], " ▸ Thought for 0s");
+    }
+
+    #[test]
+    fn header_rows_count_the_gap_and_open_sections() {
+        let block = two_sections(ThinkingDisplay::Collapsed);
+        assert_eq!(block.thinking_headers(40), vec![(0, 0), (3, 1)]);
+        block.toggle_section(0);
+        assert_eq!(block.thinking_headers(40), vec![(0, 0), (4, 1)]);
+        let after_tools = two_sections(ThinkingDisplay::Collapsed);
+        after_tools.set_gap_above();
+        assert_eq!(after_tools.render(40)[0], "");
+        assert_eq!(after_tools.thinking_headers(40), vec![(1, 0), (4, 1)]);
     }
 
     #[test]

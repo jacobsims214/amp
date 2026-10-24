@@ -372,7 +372,7 @@ async fn watch_at(cols: u16, rows: u16) {
     let config = dir.join("home/.config/amp-harness");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config.toml"), CONFIG).unwrap();
-    std::fs::write(dir.join("script.json"), script(6).to_string()).unwrap();
+    std::fs::write(dir.join("script.json"), script(8).to_string()).unwrap();
     let mut chat = Chat::start(&dir, &amp.url, cols, rows);
     chat.wait("the editor", |s| s.text().contains("/ for commands"))
         .await;
@@ -491,6 +491,35 @@ async fn watch_at(cols: u16, rows: u16) {
     .await;
     chat.send(b"\r");
     chat.wait("the session of #9002", |s| {
+        s.text().contains(&format!("worker #{UNKNOWN}"))
+    })
+    .await;
+    chat.send(b"\x1b");
+    chat.wait("the chat again", |s| s.text().contains("run both tickets"))
+        .await;
+
+    // /workers lists both with the same details, and a click on a row watches it.
+    chat.send(b"/workers\r");
+    let s = chat
+        .wait("the /workers panel", |s| {
+            let t = s.text();
+            t.contains("AMP · workers") && t.contains("Enter or click watch")
+        })
+        .await;
+    dump("/workers panel", &s);
+    let t = s.text();
+    assert!(t.contains(&format!("#{KNOWN} M1-4 CLI")), "{t}");
+    assert!(t.contains("amp:amp-worker-backend · local"), "{t}");
+    for line in s.lines() {
+        assert!(line.chars().count() <= width, "{line:?}");
+    }
+    let row = s
+        .lines()
+        .iter()
+        .position(|l| l.contains(&format!("#{UNKNOWN} ")) && l.contains("· local"))
+        .unwrap();
+    chat.click(row, 6);
+    chat.wait("the session of #9002 from /workers", |s| {
         s.text().contains(&format!("worker #{UNKNOWN}"))
     })
     .await;
