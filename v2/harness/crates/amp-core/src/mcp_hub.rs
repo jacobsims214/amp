@@ -272,6 +272,21 @@ pub enum ServerStatus {
 }
 
 impl ServerStatus {
+    /// The status as its [`Display`](std::fmt::Display), for a line that already names `server`:
+    /// a reason that starts with ``MCP server `server`: `` (the connect errors do) loses it, so
+    /// the server is named once (#2334, #2352).
+    pub fn describe_for(&self, server: &str) -> String {
+        let reason = self.reason().map(|r| without_server_prefix(r, server));
+        match (self, reason) {
+            (Self::Failed { retry_in_ms, .. }, Some(r)) => {
+                format!("failed: {r} (retrying in {})", human_ms(*retry_in_ms))
+            }
+            (Self::Stopped { .. }, Some(r)) => format!("stopped: {r}"),
+            (Self::NeedsLogin { .. }, Some(r)) => format!("needs login: {r}"),
+            (other, _) => other.to_string(),
+        }
+    }
+
     /// One word: idle, starting, ready, failed, stopped, needs-login, disabled.
     pub fn word(&self) -> &'static str {
         match self {
@@ -443,15 +458,7 @@ impl HubEvent {
             } => {
                 // The reason often names the server itself (`MCP server `x`: …`): once is enough
                 // (#2334).
-                let reason = status.reason().map(|r| without_server_prefix(r, server));
-                let status = match (status, reason) {
-                    (ServerStatus::Failed { retry_in_ms, .. }, Some(r)) => {
-                        format!("failed: {r} (retrying in {})", human_ms(*retry_in_ms))
-                    }
-                    (ServerStatus::Stopped { .. }, Some(r)) => format!("stopped: {r}"),
-                    (ServerStatus::NeedsLogin { .. }, Some(r)) => format!("needs login: {r}"),
-                    (other, _) => other.to_string(),
-                };
+                let status = status.describe_for(server);
                 let next = if is_unset_variable(&status) {
                     "; set it where you start amp-harness, then /reload"
                 } else {
@@ -2662,6 +2669,24 @@ fn file_component(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2352: a CLI error that names the server itself doesn't name it again.
+    #[test]
+    fn describe_for_drops_the_reasons_own_server_prefix() {
+        let s = ServerStatus::NeedsLogin {
+            reason: "MCP server `oauthy`: login required: run `amp-harness mcp login oauthy`"
+                .into(),
+        };
+        let line = format!("MCP server `oauthy`: {}", s.describe_for("oauthy"));
+        assert_eq!(
+            line,
+            "MCP server `oauthy`: needs login: login required: run `amp-harness mcp login oauthy`"
+        );
+        assert_eq!(line.matches("MCP server `oauthy`").count(), 1);
+        // Another server's prefix is not ours to drop.
+        assert!(s.describe_for("other").contains("MCP server `oauthy`"));
+        assert_eq!(ServerStatus::Ready.describe_for("x"), "ready");
+    }
 
     #[test]
     fn backoff_doubles_to_the_cap() {

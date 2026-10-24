@@ -183,6 +183,7 @@ impl CredentialBackend {
         AmpCredentialStore {
             backend: self.clone(),
             key,
+            repair_hint: None,
         }
     }
 }
@@ -218,9 +219,27 @@ const KEYCHAIN_PROBE_ACCOUNT: &str = "amp-harness-probe";
 pub struct AmpCredentialStore {
     backend: CredentialBackend,
     key: String,
+    /// What to tell a person whose keychain item cannot be read, when the key alone says the
+    /// wrong thing: an MCP server's login is stored under its URL, like AMP's (#2352).
+    repair_hint: Option<String>,
 }
 
 impl AmpCredentialStore {
+    /// The same store, saying "run `amp-harness mcp login <server>`" when its keychain item can't
+    /// be read (by default a URL key is AMP's login: "run `amp-harness login`").
+    pub fn for_mcp_server(mut self, server: &str) -> Self {
+        self.repair_hint = Some(crate::mcp_login_repair_hint(server));
+        self
+    }
+
+    fn store_error(&self, e: crate::KeychainError) -> McpError {
+        let e = match &self.repair_hint {
+            Some(hint) => e.with_repair_hint(&self.key, hint),
+            None => e,
+        };
+        McpError::CredentialStore(e.message)
+    }
+
     pub fn backend(&self) -> &CredentialBackend {
         &self.backend
     }
@@ -249,7 +268,7 @@ impl AmpCredentialStore {
     fn load_sync(&self) -> Result<Option<StoredCredentials>, McpError> {
         match &self.backend {
             CredentialBackend::Keychain { service } => crate::keychain_get(service, &self.key)
-                .map_err(store_error)?
+                .map_err(|e| self.store_error(e))?
                 .map(|json| parse_entry(&json))
                 .transpose(),
             CredentialBackend::File { path } => {
@@ -264,7 +283,7 @@ impl AmpCredentialStore {
             CredentialBackend::Keychain { service } => {
                 let json = serde_json::to_string(credentials)
                     .map_err(|e| McpError::CredentialStore(format!("encode credentials: {e}")))?;
-                crate::keychain_set(service, &self.key, &json).map_err(store_error)
+                crate::keychain_set(service, &self.key, &json).map_err(|e| self.store_error(e))
             }
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
@@ -278,7 +297,7 @@ impl AmpCredentialStore {
     fn clear_sync(&self) -> Result<bool, McpError> {
         match &self.backend {
             CredentialBackend::Keychain { service } => {
-                crate::keychain_delete(service, &self.key).map_err(store_error)
+                crate::keychain_delete(service, &self.key).map_err(|e| self.store_error(e))
             }
             CredentialBackend::File { path } => {
                 let _lock = file_lock();
@@ -338,10 +357,6 @@ static REFRESH_LOCKS: LazyLock<StdMutex<RefreshLocks>> = LazyLock::new(Default::
 
 fn auth_store_error(e: McpError) -> AuthError {
     AuthError::CredentialStoreError(e.to_string())
-}
-
-fn store_error(e: crate::KeychainError) -> McpError {
-    McpError::CredentialStore(e.message)
 }
 
 fn parse_entry(json: &str) -> Result<StoredCredentials, McpError> {
@@ -480,6 +495,32 @@ fn tighten_permissions(_path: &Path) -> Result<(), McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2352: an MCP server's login is kept under its URL like AMP's, so its store says which
+    /// command fixes an unreadable item; AMP's store still says `amp-harness login`.
+    #[test]
+    fn an_mcp_servers_store_names_mcp_login_in_keychain_errors() {
+        let url = "https://mcp.oauthy.example/mcp";
+        let backend = CredentialBackend::keychain("amp-harness-test");
+        let failed = || {
+            crate::KeychainError::new(
+                crate::KeychainErrorKind::NeedsApproval,
+                format!("Not asking (OSStatus -25308): {}", crate::repair_hint(url)),
+            )
+        };
+        let mcp = backend.store_for(url).for_mcp_server("oauthy");
+        let msg = mcp.store_error(failed()).to_string();
+        assert!(
+            msg.contains("`amp-harness mcp login oauthy`") && !msg.contains("`amp-harness login`"),
+            "{msg}"
+        );
+        let msg = backend.store_for(url).store_error(failed()).to_string();
+        assert!(msg.contains("`amp-harness login`"), "{msg}");
+        // The login options of an MCP server give that store.
+        let options = crate::oauth::LoginOptions::new(url, backend).with_mcp_server("oauthy");
+        let msg = options.store().store_error(failed()).to_string();
+        assert!(msg.contains("`amp-harness mcp login oauthy`"), "{msg}");
+    }
 
     #[test]
     fn keys_are_normalised_urls() {
