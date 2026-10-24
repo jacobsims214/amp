@@ -20,6 +20,8 @@
 //! - **`/config`**: the files in use, the AMP server, models, providers (keys as their source),
 //!   roles, MCP servers, `[tui]`, `[tools]`, `[workers]` and `[secrets]`, each with where its value
 //!   comes from (default, a config file, an env variable, a flag).
+//!   `t` runs `/config thinking`, which the shell handles itself: the chat's thinking display
+//!   moves to the next mode (#2345).
 //!
 //! Writes go through the CLI's own code ([`crate::mcp_crud`], [`crate::models_cmd`]): the same
 //! checks, backups and trust rules. A change asks the shell to reload ([`ConfigReply::reload`]),
@@ -1353,7 +1355,10 @@ impl Inner {
             Tone::Dim,
             0,
         ));
-        Ok(ConfigReply::panel(InfoPanel::fixed("config", rows)))
+        // #2345: `t` shows thinking the next way for this chat (the shell runs it).
+        Ok(ConfigReply::panel(
+            InfoPanel::fixed("config", rows).with_key('t', "thinking", "/config thinking"),
+        ))
     }
 }
 

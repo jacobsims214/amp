@@ -93,6 +93,12 @@ impl TranscriptScroll {
         (self.viewport() / 2).max(1) as i32
     }
 
+    /// Puts transcript line `line` at the top of the view (a thinking header that opened, #2345).
+    pub fn scroll_to(&self, line: usize) {
+        self.view.scroll_to(line);
+        self.note_position();
+    }
+
     /// PageUp (`-1`) / PageDown (`1`).
     pub fn page_by(&self, pages: i32) {
         self.scroll_by(pages * self.page());

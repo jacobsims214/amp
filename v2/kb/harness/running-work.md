@@ -21,8 +21,10 @@ workers, plan approval and the board counts.
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
 | `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
 
-Enter sends and Shift+Enter starts a new line. Esc stops the reply. Ctrl+T expands the thinking
-and Ctrl+O shows tool calls in full. To select text with the mouse, hold Fn (Terminal.app) or
+Enter sends and Shift+Enter starts a new line. Esc stops the reply. The model's thinking shows as
+one `▸ Thought for 12s` line: click it, or press Ctrl+T, to open it (Ctrl+T opens the lowest one
+on screen), and `/config thinking` switches between collapsed, full and hidden (see
+[configuration](configuration.md)). Ctrl+O shows tool calls in full. To select text with the mouse, hold Fn (Terminal.app) or
 Option (iTerm2) while dragging, or set `[tui] mouse = false`.
 
 ## Headless: `run -p`

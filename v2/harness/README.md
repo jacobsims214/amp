@@ -1008,8 +1008,8 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   `/worker`, `/amp`. `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/close`,
   `/quit` (also `/exit`, `/q`).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
-  else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T expands (or collapses
-  again) the last thinking section; Ctrl+O shows (or hides) every tool call's arguments and result.
+  else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T opens (or closes
+  again) the lowest thinking section on screen, else the last one (#2345); Ctrl+O shows (or hides) every tool call's arguments and result.
 - Scrolling the transcript (#2185): the mouse wheel; PageUp/PageDown a page; with an empty editor,
   Ctrl+U/Ctrl+D half a page and End back to the latest output (Ctrl+End jumps from anywhere; with
   text in the editor these keys stay the editor's). Ctrl+D at the latest output still quits, but not
@@ -1028,11 +1028,16 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   and consecutive calls share one block (more than five fold their earliest successful ones into
   `✓ 4 calls · get_task ×3, list_tasks`). Only running and failed calls keep the tinted surface,
   and a failed call shows its error under it.
-- Thinking (#2177) is collapsed by default: one dim line per section, `Thinking · 18s ▸`, which
-  shows the model's latest sentence while it thinks and stops its timer when the answer starts.
-  Expanded (Ctrl+T, or `show_thinking = "full"`), it is plain dim text behind a `│` gutter, with no
-  markdown styling, so it never reads like the answer. The session file always keeps the full
-  thinking.
+- Thinking (#2177) is collapsed by default: one dim line per section, `▸ Thinking · 18s`, which
+  shows the model's latest sentence while it thinks; when the answer starts its timer stops and it
+  reads `▸ Thought for 18s` (#2345). The transcript's last one adds `· Ctrl+T or click to open`
+  (`Ctrl+T to open` with `[tui] mouse = false`). Expanded (`▾`), it is plain dim text behind a `│`
+  gutter, with no markdown styling, so it never reads like the answer. A click on a section's line
+  opens or closes that one; Ctrl+T the lowest one on screen (scroll up to an older one and press
+  it), else the last. Opening one while following the stream scrolls to its header if its text
+  would push the header off the top. `/config thinking [collapsed|full|hidden]` (or `t` in the
+  `/config` panel) changes the mode for the chat, sections already shown included; without a
+  value it goes to the next. The session file always keeps the full thinking.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
 
@@ -1076,9 +1081,9 @@ with square borders and AMP's ticket-state, epic and brand colours.
   file (same JSON format as `crates/amp-tui/themes/amp-dark.json`).
 - `color`: `auto` uses 24-bit colour when `COLORTERM` is `truecolor`/`24bit`, else the 256-colour
   fallbacks. `truecolor` or `256` forces one.
-- `show_thinking`: `collapsed` (one `Thinking · Ns ▸` line per section; Ctrl+T expands the last
+- `show_thinking`: `collapsed` (one `▸ Thought for Ns` line per section; a click or Ctrl+T opens
   one), `full` (every section expanded as plain dim text) or `hidden` (none shown; Ctrl+T still
-  shows the last one).
+  shows the last one). `/config thinking` changes it for one chat.
 - `mouse`: `true` (the wheel scrolls the transcript; select with Fn-drag in Terminal.app,
   Option-drag in iTerm2) or `false` (no mouse reporting: plain click-drag selects). The env var
   takes `on`/`off`.
