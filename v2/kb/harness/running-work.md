@@ -21,8 +21,18 @@ workers, plan approval and the board counts.
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
 | `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
 
-Enter sends and Shift+Enter starts a new line. Up in an empty (or one-line) editor recalls the
-prompts you sent earlier in this chat, newest first; Down goes forward again, and Down past the
+Enter sends and Shift+Enter starts a new line. Ctrl+J also starts a new line in every terminal,
+as does Alt+Enter where Option/Alt sends Esc+ (iTerm2's Option key set to "Esc+", Terminal.app's
+"Use Option as Meta key", most Linux terminals), and so does Enter right after a `\` at the end
+of what you typed (the backslash becomes the line break).
+
+Shift+Enter needs a terminal that tells it apart from Enter: one with the kitty keyboard protocol
+(kitty, Ghostty, WezTerm, foot, and iTerm2 when it answers the protocol's query), xterm with
+modifyOtherKeys, or Terminal.app on your own Mac. Others, including tmux without extended keys and
+Terminal.app over ssh, send Shift+Enter as a plain Enter, so it **sends** the message. In those terminals the empty editor says
+`/ for commands · Ctrl+J new line` and `/help` says so too: use Ctrl+J (or `\` then Enter) there.
+
+Up in an empty (or one-line) editor recalls the prompts you sent earlier in this chat, newest first; Down goes forward again, and Down past the
 newest gives back what you had typed. In a multi-line draft Up and Down move the cursor, and in
 the `/` menu and the panels they move the selection. Workers' prompts are not in this history.
 Esc stops the reply. The model's thinking shows as one `▸ Thought for 12s` line: click it, or

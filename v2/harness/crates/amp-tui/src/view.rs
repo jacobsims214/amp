@@ -76,6 +76,10 @@ const WORKER_TOOLS: &[&str] = &["amp_run_ticket", "amp_dispatch_task"];
 /// The dim hint in the empty editor (#2182).
 pub const PLACEHOLDER: &str = "/ for commands";
 
+/// The empty editor's hint where Shift+Enter sends like Enter (no kitty keyboard protocol,
+/// #2349): it names the key that starts a new line. [`PLACEHOLDER`] when it doesn't fit.
+pub const LEGACY_PLACEHOLDER: &str = "/ for commands · Ctrl+J new line";
+
 /// What the footer shows about the session. The footer's own setters take these.
 #[derive(Debug, Clone, Default)]
 pub struct FooterInfo {
@@ -154,6 +158,8 @@ pub struct ChatView {
     /// What the empty editor says instead of [`PLACEHOLDER`] for a moment ("Press Ctrl+C again
     /// to quit", #2184).
     hint: Arc<Mutex<Option<String>>>,
+    /// The empty editor's usual hint: [`PLACEHOLDER`], or [`LEGACY_PLACEHOLDER`] (#2349).
+    placeholder: Arc<Mutex<&'static str>>,
     /// The left and right padding every area shares (#2251).
     padding: Padding,
     /// The editor's inset (what the layout places), to find it in a frame for clicks (#2344).
@@ -208,11 +214,13 @@ impl ChatView {
         let menu_slot = Arc::new(Container::new());
         menu_slot.add_child(Arc::new(menu.clone()));
         let hint = Arc::new(Mutex::new(None));
+        let placeholder = Arc::new(Mutex::new(PLACEHOLDER));
         let input_focus = Arc::new(AtomicBool::new(true));
         let editor_slot = Arc::new(Container::new());
         let editor_view: Arc<dyn Component> = Arc::new(EditorView {
             editor: editor.clone(),
             hint: Arc::clone(&hint),
+            placeholder: Arc::clone(&placeholder),
             focus: Arc::clone(&input_focus),
         });
         editor_slot.add_child(editor_view.clone());
@@ -270,6 +278,7 @@ impl ChatView {
             stopping: false,
             error_shown: false,
             hint,
+            placeholder,
             padding,
             editor_box,
             input_focus,
@@ -742,6 +751,17 @@ impl ChatView {
         *self.hint.lock().unwrap_or_else(|e| e.into_inner()) = hint.map(str::to_owned);
     }
 
+    /// The empty editor's usual hint ([`PLACEHOLDER`] unless set, #2349). It falls back to
+    /// [`PLACEHOLDER`] where it doesn't fit.
+    pub fn set_placeholder(&self, text: &'static str) {
+        *self.placeholder.lock().unwrap_or_else(|e| e.into_inner()) = text;
+    }
+
+    /// The empty editor's usual hint.
+    pub fn placeholder(&self) -> &'static str {
+        *self.placeholder.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The hint the empty editor shows instead of [`PLACEHOLDER`], if any.
     pub fn editor_hint(&self) -> Option<String> {
         self.hint.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -987,6 +1007,7 @@ impl ChatView {
 struct EditorView {
     editor: Arc<Editor>,
     hint: Arc<Mutex<Option<String>>>,
+    placeholder: Arc<Mutex<&'static str>>,
     focus: Arc<AtomicBool>,
 }
 
@@ -1017,15 +1038,20 @@ impl EditorView {
             return lines;
         }
         let hint = self.hint.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let text = hint.as_deref().unwrap_or(PLACEHOLDER);
-        let want = rpi_tui::visible_width(text);
+        let placeholder = *self.placeholder.lock().unwrap_or_else(|e| e.into_inner());
+        // The shell's hint, else the usual one, else the short one where that doesn't fit.
+        let texts: Vec<&str> = match hint.as_deref() {
+            Some(hint) => vec![hint],
+            None => vec![placeholder, PLACEHOLDER],
+        };
         for line in &mut lines {
             let Some(at) = line.find(CURSOR_MARKER) else {
                 continue;
             };
             let after = at + CURSOR_MARKER.len();
             let blanks = line[after..].bytes().take_while(|b| *b == b' ').count();
-            if blanks >= want {
+            if let Some(text) = texts.iter().find(|t| rpi_tui::visible_width(t) <= blanks) {
+                let want = rpi_tui::visible_width(text);
                 let dim = theme().colors.dim.fg(text);
                 line.replace_range(after..after + want, &dim);
             }

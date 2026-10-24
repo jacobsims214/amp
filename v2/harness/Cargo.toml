@@ -13,6 +13,8 @@ members = [
     "crates/amp-tui",
     "crates/amp-harness",
 ]
+# vendor/ holds patched upstream crates ([patch.crates-io] below), not workspace members.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -118,6 +120,12 @@ sha2 = "0.10"
 rcgen = "0.14"
 time = "0.3"
 tokio-rustls = "0.26"
+
+# crossterm 0.27.0 with one parser fix (#2349, vendor/crossterm/PATCHED.md): xterm's modifyOtherKeys
+# `CSI 27;mod;key~` (Shift+Enter is `CSI 27;2;13~`) is decoded instead of dropped. rpi-tui reads
+# through the same crossterm, so the patch covers both.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

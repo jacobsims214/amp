@@ -1007,7 +1007,13 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   terminal (see below). AMP: `/ticket`, `/project`, `/questions`, `/plan`, `/open`, `/workers`,
   `/worker`, `/amp`. `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/close`,
   `/quit` (also `/exit`, `/q`).
-- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. Ctrl-C aborts a run,
+- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. A new line also comes
+  from Ctrl+J (every terminal), Alt+Enter (`ESC CR`: Option as Esc+/Meta on a Mac) and `\` then
+  Enter (#2349). Without the kitty keyboard protocol most terminals send Shift+Enter as a plain CR,
+  so it sends; a local Terminal.app is the exception (rpi-tui reads the Shift key from macOS), and
+  xterm's modifyOtherKeys `CSI 27;2;13~` is decoded by the patched crossterm in `vendor/crossterm`.
+  There the empty editor's hint reads `/ for commands · Ctrl+J new line` and `/help` says Shift+Enter
+  sends (`amp_tui::newline`). Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T opens (or closes
   again) the lowest thinking section on screen, else the last one (#2345); Ctrl+O shows (or hides) every tool call's arguments and result.
 - Scrolling the transcript (#2185): the mouse wheel; PageUp/PageDown a page; with an empty editor,

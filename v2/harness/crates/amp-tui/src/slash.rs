@@ -17,6 +17,8 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::newline::NewlineMode;
 use rpi_tui::{Component, Editor, bold, theme, visible_width};
 
 use crate::chrome::shorten;
@@ -215,6 +217,9 @@ pub const COMMANDS: &[CommandSpec] = &[
 pub const KEYS: &[(&str, &str)] = &[
     ("Enter", "send"),
     ("Shift+Enter", "new line"),
+    ("Ctrl+J", "new line, in every terminal"),
+    ("Alt+Enter", "new line (on a Mac, with ⌥ as Esc+ or Meta)"),
+    ("\\ Enter", "new line: Enter right after a \\"),
     ("↑/↓", "earlier prompts (empty or one-line editor)"),
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
     ("Esc", "stop the reply, or close a panel or the menu"),
@@ -230,6 +235,13 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Fn/⌥-drag", "select text (Fn in Terminal.app, ⌥ in iTerm2)"),
 ];
 
+/// The Shift+Enter row where the terminal has no kitty keyboard protocol (#2349): it sends the
+/// same CR as Enter there.
+pub const LEGACY_SHIFT_ENTER: (&str, &str) = (
+    "Shift+Enter",
+    "sends, like Enter (no kitty keyboard protocol here): use Ctrl+J",
+);
+
 /// The Keys row for clicking a worker (#2347): only while the terminal reports the mouse.
 pub const CLICK_KEY: &str = "click";
 
@@ -240,11 +252,24 @@ pub const DRAG_KEY: (&str, &str) = ("drag", "select text");
 /// `/help`'s Keys group for the mouse-capture setting: [`KEYS`] when on; off, its last row (the
 /// modifier-drag) becomes [`DRAG_KEY`] and clicking a worker ([`CLICK_KEY`]) goes.
 pub fn keys(mouse_capture: bool) -> Vec<(&'static str, &'static str)> {
+    keys_for(mouse_capture, NewlineMode::Kitty)
+}
+
+/// [`keys`] for this terminal's new-line keys ([`NewlineMode`], #2349): where Shift+Enter sends,
+/// its row says so ([`LEGACY_SHIFT_ENTER`]).
+pub fn keys_for(mouse_capture: bool, newline: NewlineMode) -> Vec<(&'static str, &'static str)> {
     let mut rows = KEYS.to_vec();
     if !mouse_capture {
         rows.pop();
         rows.retain(|(k, _)| *k != CLICK_KEY);
         rows.push(DRAG_KEY);
+    }
+    if !newline.shift_enter() {
+        for row in &mut rows {
+            if row.0 == LEGACY_SHIFT_ENTER.0 {
+                *row = LEGACY_SHIFT_ENTER;
+            }
+        }
     }
     rows
 }
@@ -473,6 +498,7 @@ impl Component for CommandMenu {
 #[derive(Debug, Clone, Copy)]
 pub struct HelpBlock {
     mouse_capture: bool,
+    newline: NewlineMode,
 }
 
 impl Default for HelpBlock {
@@ -489,7 +515,14 @@ impl HelpBlock {
     pub fn new() -> Self {
         Self {
             mouse_capture: true,
+            newline: NewlineMode::Kitty,
         }
+    }
+
+    /// `/help` for this terminal's new-line keys (#2349).
+    pub fn newline(mut self, mode: NewlineMode) -> Self {
+        self.newline = mode;
+        self
     }
 
     /// `/help` for this mouse-capture setting (`[tui] mouse`, #2185).
@@ -511,7 +544,7 @@ impl HelpBlock {
         }
         groups.push((
             "Keys",
-            keys(self.mouse_capture)
+            keys_for(self.mouse_capture, self.newline)
                 .into_iter()
                 .map(|(k, about)| (k.to_owned(), about))
                 .collect(),

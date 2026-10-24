@@ -57,6 +57,7 @@ pub mod chrome;
 pub mod footer;
 pub mod history;
 pub mod inset;
+pub mod newline;
 pub mod overlay;
 pub mod roster;
 pub mod scroll;
@@ -75,6 +76,7 @@ pub use history::{HISTORY_LIMIT, PromptHistory, Recall};
 pub use inset::{
     DEFAULT_PADDING, Gap, Inset, MAX_PADDING, MIN_INNER, NARROW, Padding, SHORT, VERTICAL,
 };
+pub use newline::NewlineMode;
 pub use overlay::{
     Cell, InfoPanel, InfoRow, ModelRow, Panel, PanelKey, PanelKind, PanelState, Stage, Target, Tone,
 };
@@ -87,11 +89,12 @@ pub use shell::{
     ServerSwitched, Shell, ShellInfo, Submit,
 };
 pub use slash::{
-    COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, MenuKey, keys,
+    COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, LEGACY_SHIFT_ENTER,
+    MenuKey, keys, keys_for,
 };
 pub use theme::{AmpPalette, AmpTheme, ColorDepth, ThemeSettings, Variant};
 pub use transcript::ThinkingDisplay;
-pub use view::{ChatView, FooterInfo, PLACEHOLDER, SessionParts};
+pub use view::{ChatView, FooterInfo, LEGACY_PLACEHOLDER, PLACEHOLDER, SessionParts};
 pub use workers::{SessionView, stop_question};
 
 /// Installs `theme` for every rpi-tui component (`global_theme_manager().set`, which also

@@ -81,6 +81,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::amp_render::{self, ApprovalNotice};
 use crate::history::{PromptHistory, Recall};
+use crate::newline::NewlineMode;
 use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, Stage, Target};
 use crate::roster::{NoticeKind, Phase, WorkerEntry};
 use crate::scroll::ScrollPos;
@@ -529,6 +530,9 @@ pub struct Shell {
     /// Whether the terminal reports the mouse to us (wheel scrolling, the pill's click). Off,
     /// the terminal's own click-drag selection works without a modifier (`[tui] mouse`, #2185).
     mouse_capture: bool,
+    /// How this terminal starts a new line (#2349): the empty editor's hint and `/help` name the
+    /// key that works.
+    newline: NewlineMode,
     /// Worker sessions opened from the chat (#2252), by ticket.
     sessions: std::collections::BTreeMap<i64, SessionView>,
     /// The worker session shown instead of the manager's transcript.
@@ -599,6 +603,7 @@ impl Shell {
                 quit_confirm_until: None,
                 released: Vec::new(),
                 mouse_capture: true,
+                newline: NewlineMode::default(),
                 sessions: Default::default(),
                 viewing: None,
                 stop_confirm: None,
@@ -702,6 +707,33 @@ impl Shell {
 
     pub fn mouse_capture(&self) -> bool {
         self.mouse_capture
+    }
+
+    /// This terminal's new-line keys (#2349; the terminal loop sets it once the kitty keyboard
+    /// protocol is negotiated). Without Shift+Enter the empty editor's hint names Ctrl+J
+    /// ([`crate::LEGACY_PLACEHOLDER`]) and `/help` says Shift+Enter sends.
+    pub fn set_newline_mode(&mut self, mode: NewlineMode) {
+        self.newline = mode;
+        self.view.set_placeholder(if mode.shift_enter() {
+            crate::PLACEHOLDER
+        } else {
+            crate::LEGACY_PLACEHOLDER
+        });
+    }
+
+    pub fn newline_mode(&self) -> NewlineMode {
+        self.newline
+    }
+
+    /// A key for the editor, once nothing else took it ([`Shell::key`] returned false): Enter
+    /// right after a `\` starts a new line instead of sending ([`crate::newline::continue_line`],
+    /// #2349); anything else goes to rpi-tui's editor (Shift+Enter and Ctrl+J insert a new line,
+    /// Enter sends).
+    pub fn editor_key(&mut self, key: KeyEvent) {
+        let editor = self.view.editor().clone();
+        if !crate::newline::continue_line(&editor, &key) {
+            editor.handle_key(key);
+        }
     }
 
     pub fn info(&self) -> &ShellInfo {
@@ -1691,7 +1723,9 @@ impl Shell {
                 }
             }
             "help" | "?" => self.view.add_to_transcript(Arc::new(
-                crate::slash::HelpBlock::new().mouse_capture(self.mouse_capture),
+                crate::slash::HelpBlock::new()
+                    .mouse_capture(self.mouse_capture)
+                    .newline(self.newline),
             )),
             "usage" => self.view.add_notice(&self.usage_text()),
             "model" if arg.is_empty() => self.model_picker(),

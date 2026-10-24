@@ -249,8 +249,10 @@ async fn help_wraps_at_words() {
             .collect();
         let help: Vec<&str> = help.iter().map(String::as_str).collect();
         check(&screen, &help, size.0);
+        // The Keys group is on screen. Its title can be scrolled off at 80x24 now that the
+        // group is longer (#2347, #2349), so look for one of its rows.
         assert!(
-            screen.iter().any(|r| r.trim() == "Keys")
+            screen.iter().any(|r| r.trim_start().starts_with("Ctrl+C"))
                 && screen.iter().any(|r| r.contains("Enter run")),
             "{screen:?}"
         );

@@ -29,6 +29,9 @@
  Keys
    Enter                    send
    Shift+Enter              new line
+   Ctrl+J                   new line, in every terminal
+   Alt+Enter                new line (on a Mac, with ⌥ as Esc+ or Meta)
+   \ Enter                  new line: Enter right after a \
    ↑/↓                      earlier prompts (empty or one-line editor)
    /                        commands: ↑↓ choose, Tab complete, Enter run
    Esc                      stop the reply, or close a panel or the menu
