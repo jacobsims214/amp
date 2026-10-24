@@ -61,7 +61,7 @@
 #          MCP server (examples/mcp_smoke_server, built by `make build`) runs as a stdio server, a
 #          Streamable HTTP server behind a bearer token (from an env var, never printed) and a
 #          legacy HTTP+SSE server: `mcp add` each (and its test must list the tools); `mcp import`
-#          a Claude Code `.mcp.json`; `mcp list` shows all four ready; `agents new smoke-helper
+#          a Claude Code `.mcp.json`; `mcp list --health` shows all four ready; `agents new smoke-helper
 #          --from blank` and `skills new smoke-skill` (preloaded with `agents skills add`); `doctor`
 #          must show each server ready with its auth and roles, the agent and skill as the person's
 #          own, the agent on worker-backend's model through the fallback, and, with the bearer
@@ -1022,7 +1022,7 @@ TOML
   }
   expect "$out" '.imported == 1 and ([.servers[] | select(.name == "imported") | .action] == ["add"])' \
     "mcp import: expected one server added"
-  out="$(c mcp list --json)" || die "[$LEG] mcp list failed"
+  out="$(c mcp list --health --json)" || die "[$LEG] mcp list failed"
   expect "$out" '[.[] | select(.status.state == "ready") | "\(.name)=\(.tools)"] | sort == ["fs=2", "imported=2", "old=1", "web=2"]' \
     "mcp list: expected fs, imported, old and web ready"
   log "[$LEG] mcp import ok: imported from .mcp.json; mcp list: 4 ready"

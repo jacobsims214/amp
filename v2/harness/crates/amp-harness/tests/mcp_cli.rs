@@ -618,16 +618,29 @@ async fn stdio_at_user_and_repo_scope() {
         "{text}"
     );
 
-    let list = ok(&t.run(&["mcp", "list", "--json"]).await).json();
+    let list = ok(&t.run(&["mcp", "list", "--health", "--json"]).await).json();
     assert_eq!(row(&list, "fs")["status"]["state"], "ready");
     assert_eq!(row(&list, "fs")["tools"], 2);
-    let out = ok(&t.run(&["mcp", "list"]).await).stdout.clone();
+    assert_eq!(row(&list, "fs")["live"], true);
+    let out = ok(&t.run(&["mcp", "list", "--health"]).await)
+        .stdout
+        .clone();
     assert!(
         out.contains(&format!(
             "fs (stdio, user): {me} --stdio-server normal - ready, 2 tools"
         )),
         "{out}"
     );
+    // #2311: without --health nothing is started; the last check is shown with its age.
+    let list = ok(&t.run(&["mcp", "list", "--json"]).await).json();
+    assert_eq!(row(&list, "fs")["status"]["state"], "ready");
+    assert_eq!(row(&list, "fs")["live"], false);
+    assert!(row(&list, "fs")["checked_at"].as_i64().is_some(), "{list}");
+    let out = ok(&t.run(&["mcp", "list"]).await).stdout.clone();
+    assert!(out.contains("- ready, 2 tools (checked just now)"), "{out}");
+    assert!(out.contains("`amp-harness mcp list --health`"), "{out}");
+    let list = ok(&t.run(&["mcp", "list", "--no-health", "--json"]).await).json();
+    assert!(row(&list, "fs")["status"].is_null(), "{list}");
 
     let v = ok(&t.run(&["mcp", "get", "fs", "--json"]).await).json();
     assert_eq!(v["command"], me);
@@ -642,11 +655,11 @@ async fn stdio_at_user_and_repo_scope() {
     assert_eq!(ok(&out).stdout.trim(), "cli-stdio: hi");
 
     ok(&t.run(&["mcp", "disable", "fs"]).await);
-    let list = ok(&t.run(&["mcp", "list", "--json"]).await).json();
+    let list = ok(&t.run(&["mcp", "list", "--health", "--json"]).await).json();
     assert_eq!(row(&list, "fs")["status"]["state"], "disabled");
     assert!(T::read(&t.user_file()).contains("enabled = false"));
     ok(&t.run(&["mcp", "enable", "fs"]).await);
-    let list = ok(&t.run(&["mcp", "list", "--json"]).await).json();
+    let list = ok(&t.run(&["mcp", "list", "--health", "--json"]).await).json();
     assert_eq!(row(&list, "fs")["status"]["state"], "ready");
 
     // $EDITOR: a valid change is saved; an invalid one (no terminal to ask again) is not.
@@ -718,7 +731,7 @@ async fn stdio_at_user_and_repo_scope() {
     let out = t.run(&["mcp", "test", "rfs", "--json"]).await;
     assert_eq!(out.code, 1, "{}", out.stdout);
     assert_eq!(out.json()["status"]["state"], "untrusted");
-    let list = ok(&t.run(&["mcp", "list", "--json"]).await).json();
+    let list = ok(&t.run(&["mcp", "list", "--health", "--json"]).await).json();
     assert_eq!(row(&list, "rfs")["status"]["state"], "untrusted");
     assert_eq!(row(&list, "rfs")["trust"], "changed");
 
@@ -807,7 +820,10 @@ async fn http_at_user_and_repo_scope() {
         "{v}"
     );
 
-    let list = ok(&t.run_with(&["mcp", "list", "--json"], &env, None).await).json();
+    let list = ok(&t
+        .run_with(&["mcp", "list", "--health", "--json"], &env, None)
+        .await)
+    .json();
     assert_eq!(row(&list, "gh")["status"]["state"], "ready");
     let v = ok(&t
         .run_with(&["mcp", "get", "gh", "--json"], &env, None)
@@ -949,7 +965,7 @@ async fn sse_at_user_and_repo_scope() {
     assert!(ok(&out).stdout.contains("sse"), "{}", out.stdout);
     let v = ok(&t.run(&["mcp", "tools", "--server", "rold", "--json"]).await).json();
     assert_eq!(tools_of(&v), ["echo"]);
-    let list = ok(&t.run(&["mcp", "list", "--json"]).await).json();
+    let list = ok(&t.run(&["mcp", "list", "--health", "--json"]).await).json();
     for name in ["old", "fb", "rold"] {
         assert_eq!(
             row(&list, name)["status"]["state"],

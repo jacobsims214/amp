@@ -452,7 +452,7 @@ impl Inner {
                         no_test: true,
                         secret_stdin: false,
                         json: false,
-                        note: "Added from the chat (`/mcp add`).",
+                        note: "Added from the chat (`/mcp add`).".into(),
                         quiet: true,
                     },
                 )

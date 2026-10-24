@@ -145,9 +145,18 @@ type Stamp = (PathBuf, u64, Option<SystemTime>);
 /// global `AGENTS.md`, everything under `agents/` and `skills/` in both layers). Names starting
 /// with `.` are skipped (the CLI's `.edit/` scratch and backups). Missing files are left out, so
 /// creating one is a change.
+#[cfg(test)]
 pub fn fingerprint(paths: &ConfigPaths) -> Vec<Stamp> {
+    fingerprint_with(paths, &[])
+}
+
+/// [`fingerprint`] plus `extra` files: the MCP secret versions and each server's env_file
+/// ([`amp_core::mcp_hub::McpHub::watched_files`], #2311), so `mcp secret` in another terminal or
+/// an edited env_file reloads too.
+pub fn fingerprint_with(paths: &ConfigPaths, extra: &[PathBuf]) -> Vec<Stamp> {
     let mut out = Vec::new();
     let mut files: Vec<PathBuf> = paths.user_file.iter().cloned().collect();
+    files.extend(extra.iter().cloned());
     files.extend(paths.repo_file());
     if let Some(dir) = &paths.user_dir {
         files.push(dir.join("AGENTS.md"));
@@ -197,11 +206,20 @@ fn walk(dir: &Path, out: &mut Vec<Stamp>, depth: usize) {
 
 /// Calls `on_change` each time the configuration files ([`fingerprint`]) changed and then stayed
 /// the same for one more look, `every` apart. Runs until the task is dropped or aborted.
-pub async fn watch(paths: ConfigPaths, every: Duration, on_change: impl Fn() + Send + 'static) {
+/// `extra` names more files to watch, asked again on every look (the MCP servers' env_files
+/// change with the configuration).
+pub async fn watch(
+    paths: ConfigPaths,
+    every: Duration,
+    extra: impl Fn() -> Vec<PathBuf> + Send + Sync + 'static,
+    on_change: impl Fn() + Send + 'static,
+) {
+    let extra = std::sync::Arc::new(extra);
     let look = move || {
         let paths = paths.clone();
+        let extra = std::sync::Arc::clone(&extra);
         async move {
-            tokio::task::spawn_blocking(move || fingerprint(&paths))
+            tokio::task::spawn_blocking(move || fingerprint_with(&paths, &extra()))
                 .await
                 .unwrap_or_default()
         }
@@ -296,9 +314,16 @@ mod tests {
         std::fs::create_dir_all(dir.join("user")).unwrap();
         let fired = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&fired);
-        let task = tokio::spawn(watch(p, Duration::from_millis(40), move || {
-            counter.fetch_add(1, Ordering::SeqCst);
-        }));
+        let env_file = dir.join("srv.env");
+        let extra = vec![env_file.clone()];
+        let task = tokio::spawn(watch(
+            p,
+            Duration::from_millis(40),
+            move || extra.clone(),
+            move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
         let wait_for = |n: usize| {
             let fired = Arc::clone(&fired);
             async move {
@@ -318,6 +343,9 @@ mod tests {
         assert_eq!(fired.load(Ordering::SeqCst), 1);
         std::fs::create_dir_all(dir.join("user/skills/new")).unwrap();
         assert_eq!(wait_for(2).await, 2);
+        // #2311: an extra file (an MCP server's env_file, the secret versions) counts too.
+        std::fs::write(&env_file, "A=1\n").unwrap();
+        assert_eq!(wait_for(3).await, 3);
         task.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

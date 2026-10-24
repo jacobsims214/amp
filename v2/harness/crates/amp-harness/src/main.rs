@@ -156,8 +156,9 @@ enum Command {
     /// when run in a terminal; `--yes` never asks. Also `amp-harness setup`.
     #[command(visible_alias = "setup")]
     Init(setup::InitArgs),
-    /// MCP servers (stdio, http, sse): list, get, add, edit, remove, enable, disable, test,
-    /// login, logout, secret, trust; `mcp call`/`mcp tools` call tools (AMP's, or --server NAME).
+    /// MCP servers (stdio, http, sse): list, get, add, add-json, import, edit, remove, enable,
+    /// disable, test, login, logout, secret, trust, untrust; `mcp call`/`mcp tools` call tools
+    /// (AMP's, or --server NAME).
     #[command(subcommand)]
     Mcp(mcp_cmd::McpCommand),
     /// What this repo's .amp/harness/ brings (agents, skills, [roles.*], [models] profile, MCP

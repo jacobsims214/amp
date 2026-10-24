@@ -21,7 +21,8 @@ use crate::{
 
 #[derive(Subcommand)]
 pub enum McpCommand {
-    /// List MCP servers (user and repo) with their health: connects to each (--no-health skips).
+    /// List MCP servers (user and repo) with their last known health; starts nothing. `--health`
+    /// connects to every enabled server now, in parallel, with a short timeout.
     #[command(visible_alias = "ls")]
     List(mcp_crud::ListArgs),
     /// Show one server: its config, where each secret comes from (never the value), trust, login
