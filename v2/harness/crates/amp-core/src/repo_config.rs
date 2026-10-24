@@ -119,13 +119,22 @@ impl RepoConfig {
     /// written now (#2310: a cloned repo can't pick your models or add request fields until you
     /// trusted that). Returns what was left out, as `role:<id>` / `setting:<key>`.
     pub fn retain_trusted(&mut self, gate: &crate::repo_trust::Gate) -> Vec<String> {
+        self.retain_allowed(&|kind, name, sha256| gate.allows(kind, name, sha256))
+    }
+
+    /// [`RepoConfig::retain_trusted`] with the decision made by `allows(kind, name, sha256)`:
+    /// for a caller that also counts what it is about to record as trusted (a CLI write, #2332).
+    pub fn retain_allowed(
+        &mut self,
+        allows: &dyn Fn(crate::repo_trust::ItemKind, &str, &str) -> bool,
+    ) -> Vec<String> {
         use crate::repo_trust::{ItemKind, role_fingerprint, setting_fingerprint};
         let mut dropped = Vec::new();
         let raw_roles = self.raw_roles.clone();
         self.roles.retain(|role, _| {
             let ok = raw_roles
                 .get(role)
-                .is_some_and(|v| gate.allows(ItemKind::Role, role, &role_fingerprint(v)));
+                .is_some_and(|v| allows(ItemKind::Role, role, &role_fingerprint(v)));
             if !ok {
                 dropped.push(format!("role:{role}"));
             }
@@ -133,7 +142,7 @@ impl RepoConfig {
         });
         if self.profile.is_some() {
             let ok = self.raw_models.get("profile").is_some_and(|v| {
-                gate.allows(
+                allows(
                     ItemKind::Setting,
                     "profile",
                     &setting_fingerprint("profile", v),
