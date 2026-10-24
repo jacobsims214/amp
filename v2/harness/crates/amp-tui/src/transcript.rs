@@ -19,7 +19,8 @@
 //! - [`AssistantBlock`]: an assistant message's text and thinking blocks, and its error line.
 //! - [`ThinkingBlock`]: a thinking section, collapsed to one live `Thinking · 18s ▸` line by
 //!   default (#2177); expanded, plain dim text behind a `│` gutter ([`ThinkingDisplay`]).
-//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers.
+//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers; plain
+//!   text, shown exactly as typed (#2350).
 //! - [`ToolBlock`]: a tool call on one line (status glyph, title, argument, the result's
 //!   summary, `12 ms`), its details under it when expanded (Ctrl+O, [`ToolDisplay`]); a failed
 //!   call shows its error. [`ToolGroup`] holds consecutive calls as one block (#2183).
@@ -946,8 +947,10 @@ const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
 const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
 
-/// The user's message: markdown on the theme's surface colour inside a padded box, between OSC
-/// 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped.
+/// The user's message: plain text on the theme's surface colour inside a padded box, between
+/// OSC 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped. It is shown exactly
+/// as typed, not as markdown (#2350): paths like `mathx/__init__.py`, `snake_case` and `*.rs`
+/// globs are what engineers type, and emphasis parsing would change them on screen.
 pub struct UserBlock {
     text: String,
     inner: Mutex<(u64, BgBox)>,
@@ -959,8 +962,23 @@ fn user_box(text: &str) -> BgBox {
     let bg = theme().colors.surface;
     let content = BgBox::new(1, 1);
     content.set_bg_fn(Some(Arc::new(move |s: &str| bg.bg(s))));
-    content.add_child(Arc::new(WrapMarkdown::new(text, 0, MarkdownStyle::Plain)));
+    content.add_child(Arc::new(WrapText::new(verbatim(text), 0, 0)));
     content
+}
+
+/// The user's text as it shows: tabs as spaces, and control characters (an escape sequence
+/// pasted in) dropped so they can't restyle the terminal; everything else as typed.
+fn verbatim(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.replace("\r\n", "\n").chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\n' => out.push('\n'),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 impl UserBlock {
@@ -1776,6 +1794,58 @@ mod tests {
             rows.iter().any(|r| r.starts_with(" ✓ get_task #0")),
             "{rows:?}"
         );
+    }
+
+    // #2350: the user's own message is shown as typed, not as markdown.
+
+    const TYPED: &str = "export it from mathx/__init__.py, rename a_b_c, match *.rs and keep **x**";
+
+    #[test]
+    fn the_users_message_is_shown_exactly_as_typed() {
+        let rows = plain_rows(&UserBlock::new(TYPED).render(120));
+        assert!(rows.iter().any(|r| r.trim() == TYPED), "{rows:#?}");
+
+        // Wrapped at 40 columns, the words are the same and in order.
+        let rows = plain_rows(&UserBlock::new(TYPED).render(40));
+        assert!(rows.len() > 3, "{rows:#?}");
+        assert!(rows.iter().all(|r| r.chars().count() <= 40), "{rows:#?}");
+        let words: Vec<String> = rows
+            .iter()
+            .flat_map(|r| r.split_whitespace().map(str::to_owned))
+            .collect();
+        assert_eq!(words.join(" "), TYPED);
+
+        // No bold or italic from the `**x**` and `__init__` either.
+        let raw = UserBlock::new("**x** and __init__").render(80).join("\n");
+        assert!(
+            !raw.contains("\x1b[1m") && !raw.contains("\x1b[3m"),
+            "{raw:?}"
+        );
+    }
+
+    #[test]
+    fn the_users_message_keeps_its_lines_and_drops_control_characters() {
+        let rows =
+            plain_rows(&UserBlock::new("# not a heading\n- not a list\tx\x1b[31m").render(80));
+        let text: Vec<&str> = rows
+            .iter()
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+            .collect();
+        assert_eq!(text, vec!["# not a heading", "- not a list    x[31m"]);
+    }
+
+    #[test]
+    fn assistant_replies_still_render_markdown() {
+        let block = AssistantBlock::new();
+        block.update_blocks(&[Block::Text("see mathx/__init__.py and **x**".into())]);
+        let raw = block.render(80).join("\n");
+        let rows = plain_rows(&block.render(80));
+        assert!(
+            rows.iter().any(|r| r.trim() == "see mathx/init.py and x"),
+            "{rows:#?}"
+        );
+        assert!(raw.contains("\x1b[1m"), "{raw:?}");
     }
 
     // #2177: thinking.
