@@ -535,7 +535,10 @@ pub struct McpReload {
     /// then reload.
     pub untrusted: Vec<String>,
     /// Repo servers ignored because one of the person's own has the same name (#2331), as
-    /// [`crate::mcp_config::Shadowed::warning`] lines; theirs runs, the repo's never starts.
+    /// [`crate::mcp_config::Shadowed::notice`] lines; theirs runs, the repo's never starts. Like
+    /// a failure (#2334, [`FailureLog`]), each is said once: only the ones that are new since the
+    /// configuration the hub ran (the chat's start shows those it began with), so a reload for an
+    /// unrelated change doesn't repeat it (#2339).
     pub shadowed: Vec<String>,
 }
 
@@ -556,7 +559,15 @@ impl McpReload {
             retried: Vec::new(),
             problems: new.errors().map(|p| p.to_string()).collect(),
             untrusted: Vec::new(),
-            shadowed: new.shadow_warnings(),
+            shadowed: {
+                let notices = new.shadow_notices();
+                new.shadowed
+                    .iter()
+                    .zip(notices)
+                    .filter(|(s, _)| !old.shadowed.contains(s))
+                    .map(|(_, n)| n)
+                    .collect()
+            },
         }
     }
 

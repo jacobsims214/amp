@@ -1784,6 +1784,32 @@ impl Shadowed {
             self.user_file.display()
         )
     }
+
+    /// [`Shadowed::warning`] for the chat's transcript (#2339): the same sentence with short
+    /// paths, as `/config` writes them (#2335): the repo's file as `<repo>/…` and one under
+    /// `home` as `~/…`, so it wraps less.
+    pub fn notice(&self, home: Option<&Path>) -> String {
+        let name = &self.name;
+        let repo = match self.repo_file.ancestors().nth(3) {
+            Some(root) if root.parent().is_some() => match self.repo_file.strip_prefix(root) {
+                Ok(rest) => format!("<repo>/{}", rest.display()),
+                Err(_) => self.repo_file.display().to_string(),
+            },
+            _ => self.repo_file.display().to_string(),
+        };
+        let user = match home.filter(|h| h.parent().is_some()) {
+            Some(h) => match self.user_file.strip_prefix(h) {
+                Ok(rest) => format!("~/{}", rest.display()),
+                Err(_) => self.user_file.display().to_string(),
+            },
+            None => self.user_file.display().to_string(),
+        };
+        format!(
+            "repo MCP server `{name}` ({repo}) is ignored: your own `{name}` ({user}) has the same \
+             name, so yours runs. Fix: rename it in the repo's file (e.g. [mcp.{name}-repo]) to \
+             use both."
+        )
+    }
 }
 
 impl McpConfig {
@@ -1986,6 +2012,16 @@ impl McpConfig {
     /// [`Shadowed::warning`] for each repo server left out for one of the person's own (#2331).
     pub fn shadow_warnings(&self) -> Vec<String> {
         self.shadowed.iter().map(Shadowed::warning).collect()
+    }
+
+    /// [`Shadowed::notice`] for each repo server left out for one of the person's own, with
+    /// `$HOME` as `~` (the chat's transcript, #2339).
+    pub fn shadow_notices(&self) -> Vec<String> {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        self.shadowed
+            .iter()
+            .map(|s| s.notice(home.as_deref()))
+            .collect()
     }
 
     /// The errors (servers left out).
@@ -2397,6 +2433,22 @@ env = { API_TOKEN = "${env:API_TOKEN}", LOG_LEVEL = "debug", EMPTY_TOKEN = "" }
         assert!(w.contains("repo MCP server `a`"), "{w}");
         assert!(w.contains(REPO) && w.contains(USER), "{w}");
         assert!(w.contains("rename it in the repo's file"), "{w}");
+        // #2339: the chat's notice says the same with short paths.
+        let s = &c.shadowed[0];
+        let short = Shadowed {
+            repo_file: PathBuf::from("/work/app/.amp/harness/config.toml"),
+            user_file: PathBuf::from("/home/me/.config/amp-harness/config.toml"),
+            ..s.clone()
+        }
+        .notice(Some(Path::new("/home/me")));
+        assert!(
+            short.contains("(<repo>/.amp/harness/config.toml)")
+                && short.contains("(~/.config/amp-harness/config.toml)")
+                && short.contains("repo MCP server `a`")
+                && short.contains("rename it in the repo's file (e.g. [mcp.a-repo])"),
+            "{short}"
+        );
+        assert!(s.notice(None).contains(USER), "no home: the full path");
         // User-only servers stay.
         assert_eq!(c.servers["b"].origin.layer, Layer::User);
         // A user switch turns a repo server off, or back on.
