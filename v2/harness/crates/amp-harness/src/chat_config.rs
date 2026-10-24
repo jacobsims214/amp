@@ -1224,8 +1224,8 @@ impl Inner {
             line(
                 &mut rows,
                 "repo trust",
-                "every repo server allowed".to_owned(),
-                "--trust-repo-mcp / env AMP_HARNESS_TRUST_REPO_MCP".to_owned(),
+                "everything from the repo allowed".to_owned(),
+                "--trust-repo / env AMP_HARNESS_TRUST_REPO".to_owned(),
             );
         }
 

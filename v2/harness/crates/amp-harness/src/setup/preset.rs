@@ -588,10 +588,199 @@ fn mcp_block(name: &str, value: &toml::Value, source: &str) -> Result<String, Cl
     })
 }
 
+/// What applying a preset would write, worked out before anything is written (#2310, review
+/// #2248 finding 5): every table as it will be written, every command it makes this machine run,
+/// and a diff for each table of the person's config.toml it would replace.
+#[derive(Debug, Default)]
+pub struct Review {
+    /// For the person, in order.
+    pub lines: Vec<String>,
+    /// `providers.<id>` / `mcp.<name>` tables the config already has with other contents.
+    pub replaces: Vec<String>,
+    /// The person's tables as they were when reviewed (by section), so applying can tell when the
+    /// file changed after the review.
+    before: BTreeMap<String, Option<toml::Value>>,
+}
+
+/// The `[section]` table of config.toml as parsed now (`None`: not there).
+fn existing(doc: &toml::Table, section: &str) -> Option<toml::Value> {
+    super::config_file::table_at(doc, section).map(|t| toml::Value::Table(t.clone()))
+}
+
+/// The table `section` of a TOML block on its own (comments dropped).
+fn block_table(block: &str, section: &str) -> Option<toml::Value> {
+    let doc: toml::Table = toml::from_str(block).ok()?;
+    existing(&doc, section)
+}
+
+/// A line diff (`-` old, `+` new, two spaces for kept lines) by longest common subsequence.
+pub(crate) fn diff_lines(old: &str, new: &str) -> Vec<String> {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    let mut lcs = vec![vec![0usize; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i][j] = if a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut out = Vec::new();
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            out.push(format!("  {}", a[i]));
+            i += 1;
+            j += 1;
+        } else if i < a.len() && (j == b.len() || lcs[i + 1][j] >= lcs[i][j + 1]) {
+            out.push(format!("- {}", a[i]));
+            i += 1;
+        } else {
+            out.push(format!("+ {}", b[j]));
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Works out [`Review`] for `checked` against `config` as it is now.
+pub fn review(checked: &Checked, config: &ConfigFile) -> Result<Review, CliError> {
+    let text = config.text().map_err(CliError::new)?.unwrap_or_default();
+    let doc: toml::Table = toml::from_str(&text).map_err(|e| {
+        CliError::new(format!(
+            "{} does not parse: {}",
+            config.path.display(),
+            e.message()
+        ))
+    })?;
+    let mut r = Review::default();
+    let mut runs: Vec<String> = Vec::new();
+    let mut tables: Vec<(String, String)> = Vec::new();
+    for spec in &checked.providers {
+        tables.push((format!("providers.{}", spec.id), spec.block()));
+        if !spec.auth.auth_command.is_empty() {
+            runs.push(format!(
+                "{} (provider {}'s auth_command: runs each time a token is needed)",
+                shell_line(&spec.auth.auth_command),
+                spec.id
+            ));
+        }
+    }
+    for (name, value) in &checked.mcp {
+        let block = mcp_block(name, value, &checked.source)?;
+        if let Some(cmd) = value.get("command").and_then(toml::Value::as_str) {
+            let args: Vec<String> = value
+                .get("args")
+                .and_then(toml::Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut line = vec![cmd.to_owned()];
+            line.extend(args);
+            runs.push(format!(
+                "{} (MCP server {name}: starts with every chat and run)",
+                shell_line(&line)
+            ));
+        }
+        tables.push((format!("mcp.{name}"), block));
+    }
+    if !runs.is_empty() {
+        r.lines.push("  It makes this machine run:".to_owned());
+        for line in &runs {
+            r.lines.push(format!("    {line}"));
+        }
+    }
+    for (section, block) in &tables {
+        let new = block_table(block, section);
+        let old = existing(&doc, section);
+        r.before.insert(section.clone(), old.clone());
+        match &old {
+            None => {
+                r.lines.push(format!("  adds [{section}]:"));
+                r.lines
+                    .extend(block.trim_end().lines().map(|l| format!("    {l}")));
+            }
+            Some(o) if Some(o) == new.as_ref() => {
+                r.lines.push(format!(
+                    "  [{section}]: you already have it as the preset has it"
+                ));
+            }
+            Some(o) => {
+                r.replaces.push(section.clone());
+                r.lines.push(format!(
+                    "  REPLACES your [{section}] (- yours, + the preset's):"
+                ));
+                let old_text =
+                    super::config_file::table_text(&text, section).unwrap_or_else(|| {
+                        let mut t = toml::Table::new();
+                        t.insert(section.clone(), o.clone());
+                        toml::to_string(&t).unwrap_or_default()
+                    });
+                r.lines.extend(
+                    diff_lines(&old_text, block)
+                        .into_iter()
+                        .map(|l| format!("    {l}")),
+                );
+            }
+        }
+    }
+    if !checked.roles.is_empty() {
+        let pairs: Vec<String> = checked
+            .roles
+            .iter()
+            .map(|(w, m)| format!("{w} = {m}"))
+            .collect();
+        r.lines.push(format!(
+            "  sets the model of each role: {} (your [roles.*] model for those roles is replaced)",
+            pairs.join(", ")
+        ));
+    }
+    if let Some(url) = &checked.server_url {
+        r.lines.push(format!(
+            "  AMP server: {url} (tried, then saved, by the next step)"
+        ));
+    }
+    Ok(r)
+}
+
+fn shell_line(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|w| {
+            if !w.is_empty()
+                && w.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_./:=@%+,${}~".contains(c))
+            {
+                w.clone()
+            } else {
+                format!("'{}'", w.replace('\'', "'\\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Writes the preset into `config`: the providers, the role mapping and the MCP servers. The
 /// server is left to setup's server step (it is tried before it is saved). Every write is checked
 /// to load first; nothing secret is written.
-pub fn apply(checked: &Checked, config: &ConfigFile) -> Result<Applied, CliError> {
+/// `reviewed` is what the person saw: if config.toml changed since, nothing is written.
+pub fn apply(
+    checked: &Checked,
+    config: &ConfigFile,
+    reviewed: &Review,
+) -> Result<Applied, CliError> {
+    let now = review(checked, config)?;
+    if now.before != reviewed.before {
+        return Err(CliError::new(format!(
+            "{} changed while the preset was being reviewed; nothing was written. Run setup again",
+            config.path.display()
+        )));
+    }
     let mut applied = Applied {
         source: checked.source.clone(),
         name: checked.name.clone(),
@@ -831,5 +1020,61 @@ mod tests {
             assert!(e.contains(want), "{bad}: {e}");
             assert!(!e.contains("MIIEvQ") && !e.contains("sk-abcdef"), "{e}");
         }
+    }
+
+    #[test]
+    fn the_review_shows_commands_and_diffs_before_anything_is_written() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/test-scratch/amp-harness-preset-review");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mine = "[mcp.docs]\ntype = \"http\"\nurl = \"https://docs.mine.example.com/mcp\"\n";
+        std::fs::write(&path, mine).unwrap();
+        let config = ConfigFile::new(path.clone());
+        let checked = check(
+            "[providers.ex]\nbase_url = \"api.example.com\"\nauth = \"command\"\n\
+             auth_command = [\"get-token\", \"--tenant\", \"acme corp\"]\nmodels = [\"engineer\"]\n\
+             [mcp.docs]\ntype = \"http\"\nurl = \"https://mcp.example.com/mcp\"\n\
+             [mcp.sh]\ncommand = \"sh\"\nargs = [\"-c\", \"echo hi; curl https://x.test\"]\n",
+            "p.toml",
+        )
+        .unwrap();
+        let r = review(&checked, &config).unwrap();
+        let text = r.lines.join("\n");
+        assert!(text.contains("It makes this machine run:"), "{text}");
+        assert!(
+            text.contains("get-token --tenant 'acme corp' (provider ex's auth_command"),
+            "{text}"
+        );
+        assert!(
+            text.contains("sh -c 'echo hi; curl https://x.test' (MCP server sh"),
+            "{text}"
+        );
+        assert!(text.contains("adds [providers.ex]:"), "{text}");
+        assert!(text.contains("auth_command = "), "{text}");
+        assert_eq!(r.replaces, ["mcp.docs"]);
+        assert!(
+            text.contains("- url = \"https://docs.mine.example.com/mcp\""),
+            "{text}"
+        );
+        // Nothing was written by the review.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), mine);
+        // The file changing after the review stops apply.
+        std::fs::write(&path, mine.replace("docs.mine", "docs.other")).unwrap();
+        let e = apply(&checked, &config, &r).unwrap_err();
+        assert!(
+            e.message.contains("changed while the preset"),
+            "{}",
+            e.message
+        );
+    }
+
+    #[test]
+    fn diffs_mark_removed_and_added_lines() {
+        assert_eq!(
+            diff_lines("a\nb\nc\n", "a\nx\nc\n"),
+            ["  a", "- b", "+ x", "  c"]
+        );
     }
 }

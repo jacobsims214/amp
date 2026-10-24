@@ -215,6 +215,10 @@ fn session_json(rt: &Runtime, agent: &BuiltAgent, project: Option<&ProjectMarker
 /// One stderr line per MCP server that is not ready for a headless run.
 fn mcp_warnings(rt: &Runtime, starting: &[String]) {
     use amp_core::mcp_hub::ServerStatus;
+    // #2310: repo agents, skills and settings left out because nobody trusted them.
+    for line in crate::trust_cmd::warnings(&rt.repo_untrusted()) {
+        eprintln!("amp-harness: {line}");
+    }
     for h in rt.mcp_hub.health() {
         let label = match &h.instance {
             Some(i) => format!("{} (#{i})", h.name),

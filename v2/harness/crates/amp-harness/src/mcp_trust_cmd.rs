@@ -3,7 +3,7 @@
 //!
 //! The rules live in [`amp_core::mcp_trust`]: a server from `<repo>/.amp/harness/config.toml` runs
 //! only once trusted at its current config (`<state>/trust.toml`, outside the repo); headless runs
-//! never ask and skip untrusted servers unless `--trust-repo-mcp` / `AMP_HARNESS_TRUST_REPO_MCP=1`.
+//! never ask and skip untrusted servers unless `--trust-repo` / `AMP_HARNESS_TRUST_REPO=1`.
 
 use std::path::{Path, PathBuf};
 
@@ -156,9 +156,9 @@ pub fn trust(args: TrustArgs) -> Result<(), CliError> {
     }
     for s in &servers {
         println!("trusted {}: {}", s.name, mcp_trust::summary(s));
-        let note = mcp_trust::env_note(s);
-        if !note.is_empty() {
-            println!("  {}", note.trim());
+        // #2310: everything it runs, sends and reads, as trusted.
+        for line in mcp_trust::details(s) {
+            println!("    {line}");
         }
     }
     eprintln!(
@@ -265,29 +265,28 @@ fn ask_with(
     let file = pending[0].file.display().to_string();
     ui.say(&format!(
         "{file} defines MCP servers you have not trusted. A trusted server can run commands on \
-         this machine (stdio) or receive what the agents send it (http)."
+         this machine (stdio) or receive what the agents send it (http). Here is everything each \
+         one runs, sends and reads:"
     ));
     let mut all = false;
+    // #2310 (review #2248 finding 15): each question shows the server as it was when `pending`
+    // was worked out, and exactly that server is recorded and let start. A reload that lands in
+    // between can't get a config the person never saw trusted.
     let mut trusted: Vec<&McpServer> = Vec::new();
-    // The configuration in effect (a reload may replace it, #2242).
-    let config = hub.config();
     for u in pending {
-        let Some(server) = config.servers.get(&u.name) else {
-            continue;
-        };
+        let server = &u.server;
         let changed = if u.changed {
-            " Its config changed since you trusted it."
+            " (its config changed since you trusted it)"
         } else {
             ""
         };
+        ui.say(&format!("\n  `{}`{changed}:", u.name));
+        for line in mcp_trust::details(server) {
+            ui.say(&format!("    {line}"));
+        }
         let yes = all || {
             let answer = ui.ask(
-                &format!(
-                    "  `{}` {}.{changed}{} Trust it? [y: yes, a: all, N: not now]",
-                    u.name,
-                    u.what,
-                    mcp_trust::env_note(server)
-                ),
+                &format!("  Trust `{}`? [y: yes, a: all, N: not now]", u.name),
                 Some(""),
             )?;
             match answer.trim().to_ascii_lowercase().as_str() {
@@ -329,7 +328,13 @@ fn ask_with(
         )),
     }
     for s in trusted {
-        hub.trust(&s.name).map_err(CliError::new)?;
+        if !hub.trust_as_shown(s).map_err(CliError::new)? {
+            ui.say(&format!(
+                "  `{}` changed while you were asked (a reload); it stays off until you are asked \
+                 about the new config.",
+                s.name
+            ));
+        }
     }
     Ok(())
 }

@@ -127,6 +127,10 @@ pub struct InitArgs {
     /// no secrets. Then only your own key(s) and login are asked for.
     #[arg(long, value_name = "FILE|URL")]
     pub preset: Option<String>,
+    /// With --preset and --yes: replace [providers.*] / [mcp.*] tables you already have that the
+    /// preset defines differently (without --yes, setup shows the diff and asks).
+    #[arg(long, requires = "preset")]
+    pub force: bool,
     /// Print a JSON summary on stdout.
     #[arg(long)]
     pub json: bool,
@@ -252,13 +256,56 @@ pub async fn init(args: InitArgs) -> Result<(), CliError> {
         let text = preset::read(source).await?;
         let checked = preset::check(&text, source)?;
         let config = ConfigFile::new(config_path(&args.conn)?);
-        let mut a = preset::apply(&checked, &config)?;
+        let title = checked
+            .name
+            .as_deref()
+            .map(|n| format!(" \"{n}\""))
+            .unwrap_or_default();
+        // #2310 (review #2248 finding 5): show exactly what it writes, every command it makes this
+        // machine run, and a diff for each of your tables it replaces; then ask once.
+        let review = preset::review(&checked, &config)?;
         ui.say(&format!(
-            "Applied the org preset{} ({source}) to {}.",
-            a.name
-                .as_deref()
-                .map(|n| format!(" \"{n}\""))
-                .unwrap_or_default(),
+            "The org preset{title} ({source}) writes this into {}:",
+            config.path.display()
+        ));
+        for line in &review.lines {
+            ui.say(line);
+        }
+        let replaced = review
+            .replaces
+            .iter()
+            .map(|t| format!("[{t}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if ui.interactive() {
+            let question = if review.replaces.is_empty() {
+                "Apply it?".to_owned()
+            } else {
+                format!("Apply it, replacing your {replaced}?")
+            };
+            if !ui.confirm(&question, false)? {
+                return Err(CliError::new(format!(
+                    "the org preset was not applied; nothing was written to {}",
+                    config.path.display()
+                )));
+            }
+        } else if !args.yes {
+            return Err(CliError::usage(format!(
+                "the org preset writes the commands and addresses above into {}; run setup in a \
+                 terminal to review and confirm it, or pass --yes",
+                config.path.display()
+            )));
+        } else if !review.replaces.is_empty() && !args.force {
+            return Err(CliError::usage(format!(
+                "the org preset would replace your {replaced} in {} (diff above); nothing was \
+                 written. Pass --force with --yes to replace them, or run setup in a terminal to \
+                 review it",
+                config.path.display()
+            )));
+        }
+        let mut a = preset::apply(&checked, &config, &review)?;
+        ui.say(&format!(
+            "Applied the org preset{title} ({source}) to {}.",
             config.path.display()
         ));
         if let Some(d) = &a.description {

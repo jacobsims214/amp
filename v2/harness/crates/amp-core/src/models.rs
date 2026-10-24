@@ -933,16 +933,21 @@ impl ModelsConfig {
     }
 
     /// Defaults + `paths.user_file` + `paths.repo_file()` (each only if it exists). A repo file
-    /// with keys other than `[roles]`, `[mcp]` and `[models] profile` is an error.
+    /// with keys other than `[roles]`, `[mcp]` and `[models] profile` is an error. The repo's
+    /// `[roles.*]` tables and `[models] profile` count only once trusted (#2310,
+    /// [`crate::repo_trust`]; the trust store and `--trust-repo` are looked up through `env`).
     pub fn load_paths(
         env: &dyn Fn(&str) -> Option<String>,
         paths: &amp_mcp::ConfigPaths,
     ) -> Result<Self, ModelsError> {
         let path = paths.user_file.clone();
-        let repo = match paths.repo_file() {
+        let mut repo = match paths.repo_file() {
             Some(file) => RepoConfig::load(&file)?,
             None => None,
         };
+        if let Some(repo) = repo.as_mut() {
+            repo.retain_trusted(&crate::repo_trust::Gate::from_env(paths, env));
+        }
         let user = match &path {
             Some(path) => ModelsFile::load(path)?,
             None => None,

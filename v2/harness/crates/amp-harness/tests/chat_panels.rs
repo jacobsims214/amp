@@ -663,6 +663,16 @@ async fn agents_and_skills() {
         "---\ndescription: Writes SQL for this repo\nmode: subagent\ndispatch: true\n---\nYou write SQL.\n",
     )
     .unwrap();
+    // #2310: a repo agent is used once trusted.
+    let state = dir.join("home/.local/state");
+    let out = common::run(
+        &dir,
+        NO_AMP,
+        &["trust", "agent:sql-expert"],
+        &[("XDG_STATE_HOME", state.to_str().unwrap())],
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
     let out = chat(&dir, None, &["/agents"], &[]).await;
     let rows = panel(&out);
     snapshot("chat-agents", &rows);

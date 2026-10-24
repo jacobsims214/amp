@@ -19,8 +19,12 @@ setting comes from, sharing settings with a repo, and running with another confi
 Later layers win. The repo layer is deliberately limited. A repo `config.toml` that sets anything
 else (`[server]`, `[providers]`, `[secrets]`, `[workers]`, `[tools]`, `[tui]`…) is an error naming
 the key and the file. A cloned repo can't redirect your AMP server or your keys, or change what
-your agents' shell sees. Its MCP servers also start only once you trust them
-(`harness/mcp-servers.md`).
+your agents' shell sees. What it does bring is used only once you trust it, as it is now: its
+MCP servers (`harness/mcp-servers.md`), its agents and skills (`harness/agents-and-skills.md`),
+and its `[roles.*]` tables and `[models] profile`. A repo role table can pick another model or
+add `extra_body` fields to every request of that role, so until you trust it your own setting is
+used. `amp-harness trust` lists and trusts them; the chat asks at start; `--trust-repo` (or
+`AMP_HARNESS_TRUST_REPO=1`) uses them all for one process (CI).
 
 For a single setting the order is **flag, then environment variable, then config file, then
 default**. For example, the AMP server is `--url`, then `AMP_MCP_URL`, then `[server] url`, then
@@ -50,7 +54,7 @@ amp-harness --config-dir ~/amp-work doctor
 - `--config-dir DIR` (or `AMP_HARNESS_CONFIG_DIR`) moves the whole user layer: `config.toml`,
   `agents/`, `skills/`, `AGENTS.md` and `credentials.json`.
 - Both are global flags: they go before or after the command.
-- `$XDG_CONFIG_HOME` is honoured too. Sessions, logs and the MCP trust list live in
+- `$XDG_CONFIG_HOME` is honoured too. Sessions, logs and the trust list (MCP servers, agents, skills, settings) live in
   `~/.local/state/amp-harness` (`$XDG_STATE_HOME`).
 
 ## Reload without a restart

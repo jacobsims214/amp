@@ -235,7 +235,7 @@ async fn untrusted_repo_servers_never_start_headless() {
             out.stderr
         );
     }
-    assert!(out.stderr.contains("--trust-repo-mcp"), "{}", out.stderr);
+    assert!(out.stderr.contains("--trust-repo"), "{}", out.stderr);
     // Headless never records anything.
     assert!(!repo.trust_file().exists());
 }
@@ -405,8 +405,17 @@ async fn the_chat_asks_before_repo_servers_start() {
         "{}",
         out.stderr
     );
+    // #2310: the whole table is shown, not a one-liner cut at 160 characters.
     assert!(
-        out.stderr.contains("`a` runs `/bin/sh -c"),
+        out.stderr
+            .contains("`a`:\n    runs       /bin/sh -c 'touch"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("exec sleep 30'"), "{}", out.stderr);
+    assert!(
+        out.stderr
+            .contains("Trust `a`? [y: yes, a: all, N: not now]"),
         "{}",
         out.stderr
     );
@@ -436,7 +445,7 @@ async fn the_chat_asks_before_repo_servers_start() {
     repo.clear_markers();
     let out = repo.chat(&amp.url, "a\n").await;
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    assert!(!out.stderr.contains("`b` runs"), "{}", out.stderr);
+    assert!(!out.stderr.contains("`b`:"), "{}", out.stderr);
     assert!(repo.ran("a") && repo.ran("b") && repo.ran("c"));
 
     // Everything trusted: no question at all (stdin is empty).

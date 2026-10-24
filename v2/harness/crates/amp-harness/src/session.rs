@@ -17,7 +17,8 @@
 //! server's first attempt (each bounded by its `startup_timeout_secs`); the chat waits only for
 //! eager ones and picks the rest up as they connect. Callers shut the hub down before exiting.
 //! Repo servers start only once trusted (#2241): the chat asks first (`ask_trust`); headless runs
-//! skip untrusted ones.
+//! skip untrusted ones. The same goes for the repo's agents, skills and model settings (#2310),
+//! asked about before the runtime loads them.
 
 use std::{
     path::{Path, PathBuf},
@@ -113,6 +114,14 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     let client = Arc::new(client);
     let env = |k: &str| std::env::var(k).ok();
     let keys = SystemKeys::from_env();
+    // #2310: the chat asks about the repo's untrusted agents, skills and model settings before the
+    // runtime loads them (it loads only trusted ones; headless runs leave the rest out).
+    if req.ask_trust
+        && let Some(state) = amp_core::agent::state_dir(&env)
+    {
+        let paths = conn::config_paths().with_repo(repo_root.as_deref());
+        crate::trust_cmd::ask(&paths, &state)?;
+    }
     let rt = Arc::new(
         Runtime::load(
             Arc::clone(&client),

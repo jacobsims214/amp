@@ -324,7 +324,22 @@ async fn repo_layer_sets_roles_and_profile_only() {
     )
     .unwrap();
 
-    // The repo's [roles] beat the user's; [mcp] is accepted (the MCP layer reads it).
+    // #2310: the repo's [roles] count only once trusted.
+    let out = harness(&dir, &amp.url, &["config", "show", "--json"], &[]).await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let report = out.json();
+    let manager = report["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["role"] == "manager")
+        .unwrap()
+        .clone();
+    assert_eq!(manager["model"], "faux-1", "{manager}");
+    let out = harness(&dir, &amp.url, &["trust", "role:manager"], &[]).await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+
+    // Trusted, the repo's [roles] beat the user's; [mcp] is accepted (the MCP layer reads it).
     let out = harness(&dir, &amp.url, &["config", "show", "--json"], &[]).await;
     assert_eq!(out.code, 0, "{}", out.stderr);
     let report = out.json();
