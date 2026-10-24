@@ -14,7 +14,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
-    assets::{Assets, OverrideDirs},
     config_check::{self, Layer, Problem, Severity},
     models::{ModelHints, ModelsConfig, Selection, thinking_name},
     providers::{KeyLookup, SystemKeys, live_model_ids, resolve_key},
@@ -70,6 +69,9 @@ pub struct Report {
     pub profiles: Vec<ProfileReport>,
     pub providers: Vec<ProviderReport>,
     pub roles: Vec<RoleReport>,
+    /// Repo agents not used (so not in `roles`) because they are not trusted as they are now
+    /// (#2338).
+    pub untrusted_agents: Vec<crate::roster::UntrustedRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,7 +276,9 @@ async fn show(args: ShowArgs) -> Result<(), CliError> {
     let config = ModelsConfig::load_paths(&|k| std::env::var(k).ok(), &paths)
         .map_err(|e| CliError::new(e.to_string()))?;
     let keys = SystemKeys::from_env();
-    let report = build_report_with(&config, &keys, args.check, &agent_hints(&paths)).await;
+    let (hints, untrusted) = agents_in_use(&paths);
+    let mut report = build_report_with(&config, &keys, args.check, &hints).await;
+    report.untrusted_agents = untrusted;
     if args.json {
         print_json(&report)?;
     } else {
@@ -287,20 +291,37 @@ async fn show(args: ShowArgs) -> Result<(), CliError> {
     }
 }
 
-/// Every agent's model role and fallback hints, from the agent files `paths` names (none when
-/// they do not load: `agents validate` reports that).
-pub fn agent_hints(paths: &amp_mcp::ConfigPaths) -> Vec<(String, ModelHints)> {
-    let Ok(assets) = Assets::load(&OverrideDirs::from_paths(paths)) else {
-        return Vec::new();
-    };
-    RoleRegistry::from_assets(&assets)
+/// Every agent's model role and fallback hints, from the agents sessions here use: a repo agent
+/// only when it is trusted (#2338); none when they do not load (`agents validate` reports that).
+/// Also the repo agents left out because they are not trusted.
+pub fn agents_in_use(
+    paths: &amp_mcp::ConfigPaths,
+) -> (Vec<(String, ModelHints)>, Vec<crate::roster::UntrustedRow>) {
+    let gate = crate::roster::gate(paths);
+    let untrusted = crate::roster::rows(
+        &crate::roster::untrusted(paths, &gate),
+        amp_core::repo_trust::ItemKind::Agent,
+    );
+    let hints = crate::roster::load_assets(paths, &gate)
+        .ok()
+        .and_then(|assets| RoleRegistry::from_assets(&assets).ok())
         .map(|roles| {
             roles
                 .roles()
                 .map(|r| (r.model_role.clone(), r.model_hints()))
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (hints, untrusted)
+}
+
+/// Under the roles table: the repo agents left out, and how to trust them (#2338).
+pub fn print_untrusted_agents(r: &Report) {
+    if let Some(footer) =
+        crate::roster::footer(amp_core::repo_trust::ItemKind::Agent, &r.untrusted_agents)
+    {
+        println!("\n{footer}");
+    }
 }
 
 /// The configured roles only. Use [`build_report_with`] to add the agents with no model of
@@ -429,6 +450,7 @@ pub async fn build_report_with(
             .collect(),
         providers,
         roles,
+        untrusted_agents: Vec::new(),
     }
 }
 
@@ -480,6 +502,7 @@ fn print_human(r: &Report) {
 
     println!("\nRoles:");
     print_roles(r);
+    print_untrusted_agents(r);
 }
 
 /// The ROLE / PROVIDER/MODEL / THINKING / READY / SOURCE table (`config show`, `connect`).
@@ -637,6 +660,7 @@ mod tests {
                 role("manager", "high", None),
                 role("worker-docs", "off", Some("low")),
             ],
+            untrusted_agents: vec![],
         };
         let table = roles_table(&report);
         let cols: Vec<usize> = table

@@ -854,13 +854,9 @@ async fn list(args: ListArgs) -> Result<(), CliError> {
     let config = current(&paths)?;
     let keys = SystemKeys::from_env();
     if !args.available {
-        let report = config_cmd::build_report_with(
-            &config,
-            &keys,
-            args.check,
-            &config_cmd::agent_hints(&paths),
-        )
-        .await;
+        let (hints, untrusted) = config_cmd::agents_in_use(&paths);
+        let mut report = config_cmd::build_report_with(&config, &keys, args.check, &hints).await;
+        report.untrusted_agents = untrusted;
         if args.json {
             print_json(&report)?;
         } else {
@@ -870,6 +866,7 @@ async fn list(args: ListArgs) -> Result<(), CliError> {
             };
             println!("Models: {mode} ({})", report.selection_source);
             config_cmd::print_roles(&report);
+            config_cmd::print_untrusted_agents(&report);
         }
         return if report.ok {
             Ok(())

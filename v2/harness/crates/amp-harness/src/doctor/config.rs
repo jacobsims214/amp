@@ -11,17 +11,17 @@
 //! Problems come from [`amp_core::config_check`], so doctor and `config check` never disagree.
 
 use amp_core::{
-    assets::{Assets, Origin, OverrideDirs},
+    assets::{Assets, Origin},
     config_check::{self, CheckReport, Problem, Severity},
     models::{ModelHints, ModelsConfig},
     providers::SystemKeys,
-    repo_trust::{self, Gate, ItemKind, UntrustedItem},
+    repo_trust::{ItemKind, UntrustedItem},
     roles::RoleRegistry,
 };
 use serde::Serialize;
 
 use super::{CheckStatus, Finding, providers::Named};
-use crate::agents_cmd::Ctx;
+use crate::{agents_cmd::Ctx, roster};
 
 /// Areas with a doctor check of their own (or covered by `roles`, `key:*`, `models:*`).
 const OWN_CHECKS: &[&str] = &["models", "providers", "roles", "mcp", "agents", "skills"];
@@ -40,24 +40,7 @@ pub struct AgentsReport {
     pub untrusted: Vec<UntrustedRow>,
 }
 
-/// A repo agent or skill that is not used until it is trusted.
-#[derive(Debug, Serialize)]
-pub struct UntrustedRow {
-    pub name: String,
-    pub file: String,
-    /// It was trusted before, at another fingerprint.
-    pub changed: bool,
-}
-
-impl UntrustedRow {
-    fn from_item(u: &UntrustedItem) -> Self {
-        Self {
-            name: u.item.name.clone(),
-            file: u.item.file.display().to_string(),
-            changed: u.changed,
-        }
-    }
-}
+pub use crate::roster::UntrustedRow;
 
 #[derive(Debug, Serialize)]
 pub struct AgentRow {
@@ -114,22 +97,18 @@ impl Loaded {
 }
 
 /// Loads the roster as sessions do (#2335): a repo agent or skill counts only when it is trusted
-/// (or `--trust-repo`); the ones left out are listed in [`Loaded::untrusted`].
+/// (or `--trust-repo`); the ones left out are listed in [`Loaded::untrusted`]. The listings
+/// (`agents list`, `skills list`, `models list`) load through the same [`roster`] gate (#2338).
 pub fn load(ctx: &Ctx) -> Loaded {
-    let env = |k: &str| std::env::var(k).ok();
-    let gate = Gate::from_env(&ctx.paths, &env);
-    let assets = Assets::load_gated(&OverrideDirs::from_paths(&ctx.paths), &gate).ok();
+    let gate = roster::gate(&ctx.paths);
+    let assets = roster::load_assets(&ctx.paths, &gate).ok();
     let roles = assets
         .as_ref()
         .and_then(|a| RoleRegistry::from_assets(a).ok());
-    let untrusted = repo_trust::untrusted(&repo_trust::scan(&ctx.paths), &gate)
-        .into_iter()
-        .filter(|u| matches!(u.item.kind, ItemKind::Agent | ItemKind::Skill))
-        .collect();
     Loaded {
         roles,
         assets,
-        untrusted,
+        untrusted: roster::untrusted(&ctx.paths, &gate),
     }
 }
 
@@ -138,27 +117,7 @@ fn untrusted_text(rows: &[UntrustedRow]) -> String {
     if rows.is_empty() {
         return String::new();
     }
-    let names: Vec<String> = rows
-        .iter()
-        .map(|r| {
-            if r.changed {
-                format!("{} (repo, changed since you trusted it)", r.name)
-            } else {
-                format!("{} (repo)", r.name)
-            }
-        })
-        .collect();
-    format!("; not trusted, not used: {}", names.join(", "))
-}
-
-/// The fix for untrusted repo items of `kind`: `--trust-repo` first (#2335), as the guide does.
-fn untrusted_fix(kind: ItemKind, rows: &[UntrustedRow]) -> Option<String> {
-    let first = rows.first()?;
-    Some(format!(
-        "review it, then run with `--trust-repo` to use what the repo brings for one run, or `amp-harness trust {}:{}` to trust it as it is now",
-        kind.word(),
-        first.name
-    ))
+    format!("; not trusted, not used: {}", roster::names(rows))
 }
 
 /// `yours: a (user); the repo's: b`: the agents or skills in use that are not built in. Only the
@@ -185,7 +144,7 @@ fn custom_text<'a>(rows: impl Iterator<Item = (&'a str, String)>) -> String {
 /// A clean finding becomes a warning when repo items are left out for want of trust (a repo MCP
 /// server that is not trusted warns the same way); problems keep their own status and fix.
 fn with_untrusted(finding: Finding, kind: ItemKind, rows: &[UntrustedRow]) -> Finding {
-    match (&finding.status, untrusted_fix(kind, rows)) {
+    match (&finding.status, roster::fix(kind, rows)) {
         (CheckStatus::Ok, Some(fix)) => Finding::new(CheckStatus::Warn, finding.detail).fix(fix),
         _ => finding,
     }
@@ -273,12 +232,7 @@ pub fn check(
             }
         }
     }
-    skills.untrusted = loaded
-        .untrusted
-        .iter()
-        .filter(|u| u.item.kind == ItemKind::Skill)
-        .map(UntrustedRow::from_item)
-        .collect();
+    skills.untrusted = roster::rows(&loaded.untrusted, ItemKind::Skill);
     let custom = custom_text(
         skills
             .custom
@@ -334,12 +288,7 @@ pub fn check(
         }
         agents.dispatchable = dispatchable;
     }
-    agents.untrusted = loaded
-        .untrusted
-        .iter()
-        .filter(|u| u.item.kind == ItemKind::Agent)
-        .map(UntrustedRow::from_item)
-        .collect();
+    agents.untrusted = roster::rows(&loaded.untrusted, ItemKind::Agent);
     let custom = custom_text(agents.custom.iter().map(|a| {
         let model = match (&a.model, &a.fallback) {
             (Some(m), Some(f)) => format!(", {m} via {f}"),
@@ -419,13 +368,13 @@ mod tests {
             file: ".amp/harness/skills/repo-lint/SKILL.md".to_owned(),
             changed: false,
         }];
-        let fix = untrusted_fix(ItemKind::Skill, &rows).unwrap();
+        let fix = roster::fix(ItemKind::Skill, &rows).unwrap();
         assert_eq!(
             fix,
             "review it, then run with `--trust-repo` to use what the repo brings for one run, or \
              `amp-harness trust skill:repo-lint` to trust it as it is now"
         );
         assert!(!fix.contains("  "), "{fix}");
-        assert!(untrusted_fix(ItemKind::Agent, &[]).is_none());
+        assert!(roster::fix(ItemKind::Agent, &[]).is_none());
     }
 }
