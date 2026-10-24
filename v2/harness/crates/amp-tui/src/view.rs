@@ -55,6 +55,7 @@ use crate::chrome::{Chrome, clean, shorten};
 use crate::footer::Footer;
 use crate::inset::{Gap, Inset, Padding};
 use crate::overlay::Panel;
+use crate::roster::{NoticeKind, Roster, WorkerNotice, WorkerStrip};
 use crate::scroll::{TranscriptScroll, paint_pill};
 use crate::slash::CommandMenu;
 use crate::transcript::{
@@ -68,6 +69,9 @@ use rpi_tui::{
     Keybindings, ScrollView, StackChild, StackEntry, StatusIndicator, VStack, WorkingState,
     strip_ansi, theme,
 };
+
+/// The tools that hand a ticket to a worker: their line gets the worker's live row (#2347).
+const WORKER_TOOLS: &[&str] = &["amp_run_ticket", "amp_dispatch_task"];
 
 /// The dim hint in the empty editor (#2182).
 pub const PLACEHOLDER: &str = "/ for commands";
@@ -164,6 +168,11 @@ pub struct ChatView {
     input_focus: Arc<AtomicBool>,
     /// The blank rows above and below the screen (#2344).
     gap: Gap,
+    /// What each worker is for and how it is doing (#2347), shared with the strip, the
+    /// transcript's worker lines and the chrome.
+    roster: Roster,
+    /// The workers above the editor (#2347).
+    strip: Arc<WorkerStrip>,
 }
 
 impl Default for ChatView {
@@ -179,6 +188,9 @@ impl ChatView {
             Arc::new(Inset::new(c, padding.clone()))
         };
         let chrome = Chrome::new();
+        let roster = Roster::default();
+        chrome.set_roster(roster.clone());
+        let strip = Arc::new(WorkerStrip::new(roster.clone()));
         let header = Arc::new(Container::new());
         header.add_child(chrome.header());
         let transcript = Arc::new(Container::new());
@@ -232,6 +244,7 @@ impl ChatView {
             StackChild::Entry(StackEntry::new(inset(status.clone()))),
             StackChild::Entry(StackEntry::new(inset(panel_slot)).shrink(1)),
             StackChild::Entry(StackEntry::new(inset(menu_slot)).shrink(1)),
+            StackChild::Entry(StackEntry::new(inset(strip.clone())).shrink(1)),
             StackChild::Entry(StackEntry::new(editor_box.clone()).shrink(0).min_size(3)),
             StackChild::Entry(StackEntry::new(inset(amp_status.clone())).shrink(0)),
             StackChild::Entry(StackEntry::new(inset(footer.clone()))),
@@ -270,7 +283,28 @@ impl ChatView {
             editor_box,
             input_focus,
             gap,
+            roster,
+            strip,
         }
+    }
+
+    /// What each worker is for and how it is doing (#2347): the shell fills it on its tick.
+    pub fn roster(&self) -> &Roster {
+        &self.roster
+    }
+
+    /// The workers above the editor (#2347).
+    pub fn strip(&self) -> &Arc<WorkerStrip> {
+        &self.strip
+    }
+
+    /// Adds a `▶ worker started` / `■ worker finished` line for `task_id` (#2347).
+    pub fn add_worker_notice(&self, task_id: i64, kind: NoticeKind) {
+        self.add_to_transcript(Arc::new(WorkerNotice::new(
+            task_id,
+            kind,
+            self.roster.clone(),
+        )));
     }
 
     /// The terminal's height, before a frame is laid out (#2344): picks the blank rows above
@@ -546,6 +580,13 @@ impl ChatView {
     /// Adds a tool call to the transcript, in the open group.
     fn add_tool(&self, name: &str, args: &serde_json::Value) -> Arc<ToolBlock> {
         let call = new_tool(name, args, Arc::clone(&self.tool_display));
+        // #2347: a dispatch says what the worker is for, and how it is doing, under its line.
+        if WORKER_TOOLS.contains(&name)
+            && let Some(id) = amp_render::ticket_ids(args).first().copied()
+        {
+            let roster = self.roster.clone();
+            call.set_live_row(Arc::new(move |width| roster.detail(id, width)));
+        }
         self.tool_group().push(Arc::clone(&call));
         call
     }

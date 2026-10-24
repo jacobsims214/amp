@@ -17,6 +17,7 @@
 //! | current ticket (`TICKET`) + its epic/story names (`TREE`, `amp_get_plan`, cached) | `amp_get_task` | every 30 s while the ticket is not done | after an `amp_*` call naming it |
 //! | plan approval (`PLAN`) | `amp_check_plan` | every 60 s, only when the project requires approval | after `amp_create_tasks` / `amp_approve_plan` / `amp_set_task_dependencies` / … |
 //! | the ticket's artifacts (`ARTIFACTS`) | `amp_list_artifacts(task_id)` | every 60 s while one is in review | after `amp_publish_artifact` / `amp_review_artifact` |
+//! | workers' tickets (`WORKERS`, #2347) | `amp_get_task(include=runs)` per ticket | every 30 s while the chat shows workers ([`MetaHandle::set_workers`]) | when a new worker shows |
 //! | MCP health | every call above | `amp_whoami` after 60 s without any call | — |
 //!
 //! Immediate refresh: feed the session's agent events to [`MetaHandle::observe`] (the chat shell
@@ -85,6 +86,9 @@ impl Topics {
     pub const PING: Self = Self(1 << 6);
     /// `amp_get_plan`: epic and story names (and epic order, for the cat colours).
     pub const TREE: Self = Self(1 << 7);
+    /// `amp_get_task(include=runs)` on each ticket the chat shows a worker for
+    /// ([`MetaHandle::set_workers`], #2347): name, story › epic, dependencies, the last run.
+    pub const WORKERS: Self = Self(1 << 8);
     /// Everything fetched on start and after a reconnect.
     pub const ALL: Self = Self(
         Self::WHOAMI.0
@@ -93,7 +97,8 @@ impl Topics {
             | Self::TICKET.0
             | Self::PLAN.0
             | Self::ARTIFACTS.0
-            | Self::TREE.0,
+            | Self::TREE.0
+            | Self::WORKERS.0,
     );
 
     pub fn contains(self, other: Self) -> bool {
@@ -113,6 +118,7 @@ impl Topics {
             (Self::TICKET, "ticket"),
             (Self::PLAN, "plan"),
             (Self::ARTIFACTS, "artifacts"),
+            (Self::WORKERS, "workers"),
             (Self::PING, "ping"),
         ]
         .into_iter()
@@ -496,6 +502,67 @@ pub struct Ticket {
     pub epic_index: Option<usize>,
 }
 
+/// A ticket a worker runs (#2347): what the chat shows next to the worker. From
+/// `amp_get_task(include=runs)`, polled with the current ticket's interval while the chat shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerTicket {
+    /// Name, state, assignee, story and epic (the same reading as the current ticket's).
+    pub ticket: Ticket,
+    pub dependency_ids: Vec<i64>,
+    /// The dependencies not completed yet.
+    pub waiting_on: Vec<i64>,
+    /// The newest run AMP recorded on it (a worker elsewhere reports its usage there).
+    pub last_run: Option<RunRecord>,
+}
+
+/// One run AMP recorded on a ticket (`amp_get_task`'s `runs`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunRecord {
+    pub agent_id: String,
+    pub model: String,
+    pub outcome: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub branch: String,
+    /// When AMP recorded it.
+    pub recorded_at: Option<std::time::SystemTime>,
+}
+
+impl RunRecord {
+    /// The newest of `amp_get_task`'s `runs` (by `created_at`), if any.
+    pub fn latest(runs: &Value) -> Option<Self> {
+        let num = |r: &Value, k: &str| r[k].as_i64().unwrap_or(0);
+        let text = |r: &Value, k: &str| r[k].as_str().unwrap_or("").to_owned();
+        runs.as_array()?
+            .iter()
+            .max_by(|a, b| text(a, "created_at").cmp(&text(b, "created_at")))
+            .map(|r| Self {
+                agent_id: text(r, "agent_id"),
+                model: text(r, "model"),
+                outcome: text(r, "outcome"),
+                input_tokens: num(r, "input_tokens"),
+                output_tokens: num(r, "output_tokens"),
+                cache_read_tokens: num(r, "cache_read_tokens"),
+                cache_write_tokens: num(r, "cache_write_tokens"),
+                cost_usd: r["cost_usd"].as_f64(),
+                branch: text(r, "branch"),
+                recorded_at: r["created_at"]
+                    .as_str()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(std::time::SystemTime::from),
+            })
+    }
+
+    /// Whether the run reported any token counts.
+    pub fn has_usage(&self) -> bool {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+            > 0
+    }
+}
+
 /// A ticket waiting on a person's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Question {
@@ -740,6 +807,10 @@ pub struct AmpMeta {
     pub ticket: Fetched<Ticket>,
     pub plan: Fetched<PlanApproval>,
     pub artifacts: Fetched<Vec<Artifact>>,
+    /// The tickets the chat shows workers for ([`MetaHandle::set_workers`], #2347).
+    pub worker_ids: Vec<i64>,
+    /// Their tickets, by id (a failed fetch keeps the last value).
+    pub workers: std::collections::BTreeMap<i64, Fetched<WorkerTicket>>,
 }
 
 impl AmpMeta {
@@ -845,6 +916,8 @@ pub struct Conditions {
     /// Tickets wait for approval, anyone's (polled every `plan_pending`; `AmpMeta::plan_awaiting`).
     pub plan_pending: bool,
     pub artifacts_in_review: bool,
+    /// The chat shows workers ([`AmpMeta::worker_ids`]).
+    pub workers: bool,
 }
 
 impl Conditions {
@@ -855,6 +928,7 @@ impl Conditions {
             plan_required: meta.plan_required(),
             plan_pending: meta.plan_awaiting(),
             artifacts_in_review: !meta.artifacts_in_review().is_empty(),
+            workers: !meta.worker_ids.is_empty(),
         }
     }
 }
@@ -867,11 +941,12 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    const PERIODIC: [Topics; 4] = [
+    const PERIODIC: [Topics; 5] = [
         Topics::BOARD,
         Topics::TICKET,
         Topics::PLAN,
         Topics::ARTIFACTS,
+        Topics::WORKERS,
     ];
 
     fn interval(iv: &Intervals, t: Topics, c: Conditions) -> Option<Duration> {
@@ -881,6 +956,7 @@ impl Schedule {
             Topics::PLAN if c.plan_required && c.plan_pending => Some(iv.plan_pending),
             Topics::PLAN if c.plan_required => Some(iv.plan),
             Topics::ARTIFACTS if c.artifacts_in_review => Some(iv.artifacts),
+            Topics::WORKERS if c.workers => Some(iv.ticket),
             _ => None,
         }
     }
@@ -961,6 +1037,7 @@ enum Command {
     Refresh(Topics),
     SetProject(Option<i64>),
     SetTicket(Option<i64>),
+    SetWorkers(Vec<i64>),
     Call(Call),
 }
 
@@ -988,6 +1065,9 @@ struct Inner {
 
 /// The calls a [`MetaHandle::stub`] answered: (tool, arguments).
 type CallLog = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// The most worker tickets [`MetaHandle::set_workers`] follows (one `amp_get_task` each per poll).
+pub const MAX_WORKER_TICKETS: usize = 8;
 
 /// How long [`MetaHandle::call`] waits beyond its own timeout for the poller to get to the call
 /// (it may be in the middle of a refresh, whose calls have their own 10 s timeouts).
@@ -1029,6 +1109,18 @@ impl MetaHandle {
     /// Switches the current ticket (`/ticket`, a claim): clears its items and refetches them.
     pub fn set_ticket(&self, ticket_id: Option<i64>) {
         let _ = self.0.commands.send(Command::SetTicket(ticket_id));
+    }
+
+    /// The tickets the chat shows workers for (#2347; at most [`MAX_WORKER_TICKETS`], in order).
+    /// New ones are fetched at once, then with the current ticket's interval; ones no longer
+    /// shown are dropped. Nothing is sent when the set is unchanged, so call it on every tick.
+    pub fn set_workers(&self, ids: &[i64]) {
+        let mut ids: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+        ids.dedup();
+        ids.truncate(MAX_WORKER_TICKETS);
+        if self.0.meta.borrow().worker_ids != ids {
+            let _ = self.0.commands.send(Command::SetWorkers(ids));
+        }
     }
 
     /// Calls an AMP tool on the poller's own connection (a slash command's read or write; never
@@ -1080,6 +1172,7 @@ impl MetaHandle {
                     Command::Refresh(_) => {}
                     Command::SetProject(id) => bump(&|m| m.project_id = id),
                     Command::SetTicket(id) => bump(&|m| m.ticket_id = id),
+                    Command::SetWorkers(ids) => bump(&|m| m.worker_ids = ids.clone()),
                     Command::Call(c) => {
                         if let Ok(mut log) = recorded.lock() {
                             log.push((c.tool.clone(), c.args.clone()));
@@ -1387,6 +1480,18 @@ impl MetaPoller {
                 });
                 Topics::TICKET | Topics::ARTIFACTS
             }
+            Command::SetWorkers(ids) => {
+                let meta = self.meta();
+                if meta.worker_ids == ids {
+                    return Topics::NONE;
+                }
+                let added = ids.iter().any(|id| !meta.workers.contains_key(id));
+                self.update(|m| {
+                    m.workers.retain(|id, _| ids.contains(id));
+                    m.worker_ids = ids;
+                });
+                if added { Topics::WORKERS } else { Topics::NONE }
+            }
         }
     }
 
@@ -1615,12 +1720,52 @@ impl MetaPoller {
             });
             ran |= Topics::ARTIFACTS;
         }
+        if topics.contains(Topics::WORKERS) {
+            for id in self.meta().worker_ids.clone() {
+                let r = self.fetch_worker_ticket(id).await;
+                self.update(|m| {
+                    if m.worker_ids.contains(&id) {
+                        m.workers.entry(id).or_default().set(r);
+                    }
+                });
+            }
+            ran |= Topics::WORKERS;
+        }
         // Items that did not apply count as run, so they wait a full interval before retrying.
         self.schedule.ran(topics | ran, now);
     }
 
+    /// A worker's ticket with its dependencies and newest run (#2347).
+    async fn fetch_worker_ticket(&mut self, id: i64) -> Result<WorkerTicket, String> {
+        let (ticket, v) = self
+            .fetch_task(json!({"task_id": id, "include": ["runs"], "limit": 5}))
+            .await?;
+        let ids = |k: &str| -> Vec<i64> {
+            v["task"][k]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .collect()
+        };
+        Ok(WorkerTicket {
+            ticket,
+            dependency_ids: ids("dependency_ids"),
+            waiting_on: ids("blocked_by_ids"),
+            last_run: RunRecord::latest(&v["runs"]),
+        })
+    }
+
     async fn fetch_ticket(&mut self, id: i64) -> Result<Ticket, String> {
-        let v = self.call("amp_get_task", json!({"task_id": id})).await?;
+        self.fetch_task(json!({"task_id": id}))
+            .await
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// `amp_get_task(args)` read as a [`Ticket`] (with its story and epic names), plus the
+    /// whole result.
+    async fn fetch_task(&mut self, args: Value) -> Result<(Ticket, Value), String> {
+        let v = self.call("amp_get_task", args).await?;
         let t: TaskRecord =
             serde_json::from_value(v["task"].clone()).map_err(|e| format!("amp_get_task: {e}"))?;
         let mut ticket = Ticket {
@@ -1666,7 +1811,7 @@ impl MetaPoller {
                 });
             }
         }
-        Ok(ticket)
+        Ok((ticket, v))
     }
 }
 
@@ -1775,6 +1920,7 @@ mod tests {
             plan_required: false,
             plan_pending: false,
             artifacts_in_review: false,
+            workers: false,
         };
         // Nothing ran yet: board and ticket are due (plan and artifacts don't apply).
         assert_eq!(s.due(&iv, c, t0), Topics::BOARD | Topics::TICKET);

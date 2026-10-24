@@ -44,6 +44,11 @@
 //!   chat ([`inset::Inset`], one shared [`inset::Padding`]), shrinking on narrow terminals, and
 //!   a blank row above and below it ([`inset::Gap`], #2344).
 //!
+//! - [`roster`] (#2347): what each worker is for and how it is doing (ticket name, story › epic,
+//!   agent, model, state, elapsed, tokens, context), shared by the worker strip above the editor,
+//!   the transcript's worker notices and dispatch lines, the session header and `/workers`.
+//!   Every worker mention can be clicked (or reached with Ctrl+W) to watch its session.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
@@ -54,6 +59,7 @@ pub mod history;
 pub mod inset;
 pub mod newline;
 pub mod overlay;
+pub mod roster;
 pub mod scroll;
 pub mod shell;
 pub mod slash;
@@ -74,6 +80,7 @@ pub use newline::NewlineMode;
 pub use overlay::{
     Cell, InfoPanel, InfoRow, ModelRow, Panel, PanelKey, PanelKind, PanelState, Stage, Target, Tone,
 };
+pub use roster::{Phase, Roster, WorkerEntry, WorkerStrip};
 pub use scroll::{NEW_OUTPUT, TranscriptScroll};
 pub use shell::{
     CTRL_D_SETTLE, ConfigControl, ConfigFuture, ConfigReply, ConnectFuture, ConnectReply, CtrlC,

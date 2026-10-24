@@ -83,9 +83,11 @@ use crate::amp_render::{self, ApprovalNotice};
 use crate::history::{PromptHistory, Recall};
 use crate::newline::NewlineMode;
 use crate::overlay::{self, InfoPanel, ModelRow, PanelKind, PanelState, Stage, Target};
+use crate::roster::{NoticeKind, Phase, WorkerEntry};
+use crate::scroll::ScrollPos;
 use crate::slash::MenuKey;
 use crate::view::{ChatView, FooterInfo};
-use crate::workers::{SessionView, Source, stop_question};
+use crate::workers::{SessionView, Source, session_state, stop_question};
 
 /// Opens a URL in the browser (default: login's guarded opener; tests record instead).
 pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
@@ -542,6 +544,10 @@ pub struct Shell {
     editor_clicked: bool,
     /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
     person: Option<String>,
+    /// The manager's scroll position while a worker's session is shown (#2347).
+    scroll_back: Option<ScrollPos>,
+    /// The workers the transcript has a notice for, and whether each was live then (#2347).
+    noticed: std::collections::BTreeMap<i64, bool>,
     /// The screen's size, for Ctrl+T to find the thinking in sight ([`Shell::set_screen`]).
     screen: Option<(usize, usize)>,
     /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
@@ -603,6 +609,8 @@ impl Shell {
                 stop_confirm: None,
                 editor_clicked: false,
                 person: None,
+                scroll_back: None,
+                noticed: Default::default(),
                 screen: None,
                 history: PromptHistory::new(),
             },
@@ -627,7 +635,11 @@ impl Shell {
     /// - a panel is open with an empty editor (↑↓, Enter and a configuration panel's letter
     ///   keys go to it), unless the person clicked into the editor.
     pub fn input_focused(&self) -> bool {
-        if self.secret.is_some() || self.stop_confirm.is_some() || self.viewing.is_some() {
+        if self.secret.is_some()
+            || self.stop_confirm.is_some()
+            || self.viewing.is_some()
+            || self.view.strip().is_focused()
+        {
             return false;
         }
         match self.view.panel().state().map(|s| s.stage) {
@@ -651,16 +663,23 @@ impl Shell {
     /// Returns whether it did.
     ///
     /// On a thinking header in the transcript it opens or closes that section (#2345).
+    ///
+    /// Anywhere else, a click on a worker (#2347) opens its session: a chip above the editor, a
+    /// `/workers` row, a worker notice or dispatch line, or any `#ticket` mention of a ticket
+    /// with a worker session (the mention under the click, else the row's first such ticket).
     pub fn click(&mut self, width: usize, height: usize, row: usize, column: usize) -> bool {
         self.screen = Some((width, height));
         if self.view.click_thinking(width, height, row).is_some() {
             return true;
         }
-        if self.secret.is_some() || self.stop_confirm.is_some() || self.viewing.is_some() {
+        if self.secret.is_some() || self.stop_confirm.is_some() {
             return false;
         }
+        if self.viewing.is_some() {
+            return self.click_worker(width, height, row, column);
+        }
         let Some((line, byte)) = self.view.editor_hit(width, height, row, column) else {
-            return false;
+            return self.click_worker(width, height, row, column);
         };
         if matches!(
             self.view.panel().state().map(|s| s.stage),
@@ -1480,6 +1499,10 @@ impl Shell {
             }
             return true;
         }
+        // #2347: the worker strip, while Ctrl+W gave it the keys.
+        if self.view.strip().is_focused() && self.strip_key(key) {
+            return true;
+        }
         if self.viewing.is_some() {
             return self.session_key(key);
         }
@@ -2090,6 +2113,9 @@ impl Shell {
             self.toggle_tools();
             return Ok(true);
         }
+        if name.eq_ignore_ascii_case("ctrl+w") {
+            return Ok(self.toggle_workers_focus());
+        }
         let code = match name {
             "enter" => KeyCode::Enter,
             "esc" => KeyCode::Esc,
@@ -2110,7 +2136,7 @@ impl Shell {
         if self.secret_key(&key) {
             return Ok(true);
         }
-        if self.stop_confirm.is_some() || self.viewing.is_some() {
+        if self.stop_confirm.is_some() || self.viewing.is_some() || self.view.strip().is_focused() {
             return Ok(self.key(&key, true).await);
         }
         let used = self.panel_key(&key, true);
@@ -2167,6 +2193,7 @@ impl Shell {
     /// Returns whether anything changed. The terminal loop calls it on its tick.
     pub fn poll(&mut self) -> bool {
         let mut changed = self.expire_hints(Instant::now());
+        changed |= self.build_roster();
         changed |= self.pump_sessions();
         while let Ok(msg) = self.msgs_rx.try_recv() {
             changed = true;
@@ -2707,7 +2734,12 @@ impl Shell {
         if self.stop_confirm.is_some_and(|id| id != task_id) {
             self.stop_confirm = None;
         }
+        if self.viewing.is_none() {
+            self.scroll_back = Some(self.view.scroll().position());
+        }
         self.viewing = Some(task_id);
+        self.view.strip().blur();
+        self.view.strip().set_viewing(Some(task_id));
         self.view.panel().close();
         self.refresh_session(task_id);
         if let Some(s) = self.sessions.get(&task_id) {
@@ -2721,6 +2753,11 @@ impl Shell {
         if self.viewing.take().is_some() {
             self.stop_confirm = None;
             self.view.show_session(None);
+            self.view.strip().set_viewing(None);
+            // #2347: the manager's transcript where the person left it.
+            if let Some(pos) = self.scroll_back.take() {
+                self.view.scroll().restore(pos);
+            }
         }
     }
 
@@ -2780,9 +2817,233 @@ impl Shell {
                     self.ask_stop(id);
                 }
             }
+            // #2347: the ticket in AMP's web UI.
+            KeyCode::Char('o') | KeyCode::Char('O') => {
+                if let Some(id) = self.viewing {
+                    self.open_ticket(id);
+                }
+            }
             _ => {}
         }
         true
+    }
+
+    /// Opens ticket `id` in AMP's web UI (o in a session or the worker strip).
+    fn open_ticket(&mut self, id: i64) {
+        if self.meta.is_none() {
+            let text = format!("#{id}: no AMP connection in this chat to open it in");
+            if let Some(s) = self.shown_session() {
+                s.keys().set(&text, true);
+            } else {
+                self.view.add_notice(&text);
+            }
+            return;
+        }
+        self.open_target(&Target::Ticket { id, question: None });
+    }
+
+    /// Ctrl+W (#2347): gives the worker strip the keys, or takes them back. False when there is
+    /// no worker to choose (the key then does what it did before).
+    pub fn toggle_workers_focus(&mut self) -> bool {
+        let strip = self.view.strip().clone();
+        if strip.is_focused() {
+            strip.blur();
+            return true;
+        }
+        if self.stop_confirm.is_some() || self.secret.is_some() {
+            return false;
+        }
+        self.build_roster();
+        strip.focus()
+    }
+
+    /// The worker strip's keys (#2347): ←/→ (and ↑/↓, Tab) choose, Enter watches, o opens the
+    /// ticket in AMP, x stops it, Esc or Ctrl+W gives the keys back. Any other key gives them
+    /// back too and goes on to the editor (returns false), unless a session is shown.
+    pub fn strip_key(&mut self, key: &KeyEvent) -> bool {
+        let strip = self.view.strip().clone();
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('w') {
+            strip.blur();
+            return true;
+        }
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => strip.move_by(-1),
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => strip.move_by(1),
+            KeyCode::Esc => strip.blur(),
+            KeyCode::Enter => {
+                strip.blur();
+                if let Some(id) = strip.selected()
+                    && let Err(e) = self.open_worker(id)
+                {
+                    self.view.add_notice(&format!("#{id}: {e}"));
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Char('O') if plain => {
+                if let Some(id) = strip.selected() {
+                    self.open_ticket(id);
+                }
+            }
+            KeyCode::Char('x') | KeyCode::Char('X') if plain => {
+                strip.blur();
+                if let Some(id) = strip.selected() {
+                    self.ask_stop(id);
+                }
+            }
+            _ => {
+                strip.blur();
+                return self.viewing.is_some();
+            }
+        }
+        true
+    }
+
+    /// A click outside the editor (#2347): opens the session of the worker the clicked row
+    /// names. Returns whether it did.
+    fn click_worker(&mut self, width: usize, height: usize, row: usize, column: usize) -> bool {
+        let lines = self.view.render_plain(width, height);
+        let Some(text) = lines.get(row) else {
+            return false;
+        };
+        let has = |id: i64| self.view.roster().get(id).is_some_and(|e| e.viewable);
+        let Some(id) = crate::roster::ticket_at(text, column, has) else {
+            return false;
+        };
+        if self.viewing == Some(id) || !self.has_session(id) {
+            return false;
+        }
+        self.view.strip().blur();
+        if let Err(e) = self.open_worker(id) {
+            self.view.add_notice(&format!("#{id}: {e}"));
+        }
+        true
+    }
+
+    /// Rebuilds the roster (#2347): this chat's workers from the supervisor, sessions read from
+    /// disk, and tickets in progress elsewhere, joined with the metadata poller's tickets. Tells
+    /// the poller which tickets to follow, and adds a transcript notice when a worker of this
+    /// chat starts or finishes. Returns whether anything shown changed (elapsed times tick once a
+    /// second while workers are live).
+    fn build_roster(&mut self) -> bool {
+        let now = std::time::SystemTime::now();
+        let snap = self.meta.as_ref().map(|m| m.snapshot());
+        let sessions = self
+            .supervisor
+            .as_ref()
+            .map(|s| s.sessions())
+            .unwrap_or_default();
+        let mut entries: std::collections::BTreeMap<i64, WorkerEntry> = Default::default();
+        for i in &sessions {
+            let model = i.model.clone().unwrap_or_default();
+            let window = i
+                .context_window
+                .unwrap_or_else(|| self.context_window_of(&model));
+            let phase = match i.phase {
+                Some(_) if i.stopped_by.is_some() => Phase::Stopping,
+                Some(amp_core::supervisor::WorkerPhase::Queued) => Phase::Queued,
+                Some(amp_core::supervisor::WorkerPhase::Running) => Phase::Running,
+                None => Phase::Finished,
+            };
+            entries.insert(
+                i.task_id,
+                WorkerEntry {
+                    task_id: i.task_id,
+                    agent_id: i.agent_id.clone(),
+                    model,
+                    phase,
+                    state: session_state(i, now),
+                    outcome: i.outcome.map(|o| o.as_str().to_owned()),
+                    usage: i.totals.usage,
+                    context_tokens: i.totals.context_tokens,
+                    context_window: window,
+                    branch: i.branch.clone(),
+                    viewable: true,
+                    local: true,
+                    ..WorkerEntry::default()
+                },
+            );
+        }
+        // Sessions read from disk (an earlier chat's workers).
+        for (id, s) in &self.sessions {
+            if entries.contains_key(id) || s.source == Source::Chat {
+                continue;
+            }
+            let model = s.model().to_owned();
+            entries.insert(
+                *id,
+                WorkerEntry {
+                    task_id: *id,
+                    context_window: self.context_window_of(&model),
+                    model,
+                    phase: Phase::Finished,
+                    state: match &s.source {
+                        Source::File(name) => format!("from {name}"),
+                        Source::Chat => "finished".to_owned(),
+                    },
+                    usage: s.totals().usage,
+                    context_tokens: s.totals().context_tokens,
+                    viewable: true,
+                    ..WorkerEntry::default()
+                },
+            );
+        }
+        if let Some(m) = &snap {
+            if let Some(b) = m.board.get() {
+                for t in &b.in_progress_tickets {
+                    entries.entry(t.id).or_insert_with(|| WorkerEntry {
+                        task_id: t.id,
+                        name: t.name.clone(),
+                        epic: t.epic.clone(),
+                        agent_id: t.assigned_to.clone().unwrap_or_default(),
+                        phase: Phase::Elsewhere,
+                        state: "in progress".to_owned(),
+                        ..WorkerEntry::default()
+                    });
+                }
+            }
+            for e in entries.values_mut() {
+                fill_from_meta(e, m, now);
+            }
+            // Follow live workers here first, then elsewhere, then finished ones.
+            let mut ids: Vec<&WorkerEntry> = entries.values().collect();
+            ids.sort_by_key(|e| (!e.is_live(), e.phase == Phase::Finished, e.task_id));
+            let ids: Vec<i64> = ids.into_iter().map(|e| e.task_id).collect();
+            if let Some(meta) = &self.meta {
+                meta.set_workers(&ids);
+            }
+        }
+        for e in entries.values_mut() {
+            if e.name.is_empty() {
+                e.name = self.ticket_name(e.task_id);
+            }
+        }
+        // Started and finished notices in the manager's transcript.
+        for i in &sessions {
+            let live = i.is_live();
+            match self.noticed.get(&i.task_id) {
+                Some(was) if *was == live => {}
+                Some(false) | None if live => {
+                    self.view.add_worker_notice(i.task_id, NoticeKind::Started);
+                }
+                _ => self.view.add_worker_notice(i.task_id, NoticeKind::Finished),
+            }
+            self.noticed.insert(i.task_id, live);
+        }
+        if self.view.strip().is_focused() && self.view.strip().shown().is_empty() {
+            self.view.strip().blur();
+        }
+        self.view.roster().set(entries)
+    }
+
+    /// The context window of `model` (`provider/model`) from the chat's model list; 0 unknown.
+    fn context_window_of(&self, model: &str) -> u64 {
+        self.models
+            .iter()
+            .find(|m| m.reference == model)
+            .map(|m| m.model.context_window)
+            .unwrap_or(0)
     }
 
     /// `/worker [ticket]`: opens that ticket's worker session, or with no ticket the first live
@@ -2939,7 +3200,12 @@ impl Shell {
         };
         let info = if s.source == Source::Chat { info } else { None };
         let got = s.pump();
-        let live = s.update(info.as_ref(), &name);
+        let entry = self.view.roster().get(task_id).unwrap_or(WorkerEntry {
+            task_id,
+            name,
+            ..WorkerEntry::default()
+        });
+        let live = s.update(info.as_ref(), entry);
         if confirm {
             s.keys().set(&stop_question(task_id), true);
         } else {
@@ -2963,6 +3229,62 @@ impl Shell {
             }
         }
         changed
+    }
+}
+
+/// Adds what the metadata poller knows about `e`'s ticket (#2347): name, story › epic,
+/// assignee, what it waits on, and for a worker elsewhere the last run AMP recorded.
+fn fill_from_meta(e: &mut WorkerEntry, m: &amp_core::meta::AmpMeta, now: std::time::SystemTime) {
+    if let Some(b) = m.board.get()
+        && e.name.is_empty()
+        && let Some(t) = b.in_progress_tickets.iter().find(|t| t.id == e.task_id)
+    {
+        e.name = t.name.clone();
+        e.epic = t.epic.clone();
+    }
+    let Some(w) = m.workers.get(&e.task_id).and_then(|f| f.get()) else {
+        return;
+    };
+    let t = &w.ticket;
+    if !t.name.is_empty() {
+        e.name = t.name.clone();
+    }
+    if let Some(epic) = &t.epic {
+        e.epic = epic.name.clone();
+    }
+    if let Some(story) = &t.story {
+        e.story = story.name.clone();
+    }
+    if e.agent_id.is_empty() {
+        e.agent_id = t.assigned_to.clone().unwrap_or_default();
+    }
+    e.waiting_on = w.waiting_on.clone();
+    if e.phase == Phase::Elsewhere {
+        if let Some(since) = t.dispatched_at.as_deref().and_then(overlay::parse_rfc3339) {
+            let d = now.duration_since(since).unwrap_or_default();
+            e.state = format!("in progress {}", crate::roster::duration(d));
+        }
+        if let Some(run) = &w.last_run {
+            if run.has_usage() {
+                e.usage = amp_core::events::UsageJson {
+                    input_tokens: run.input_tokens,
+                    output_tokens: run.output_tokens,
+                    cache_read_tokens: run.cache_read_tokens,
+                    cache_write_tokens: run.cache_write_tokens,
+                    cost_usd: run.cost_usd.unwrap_or(0.0),
+                };
+                e.usage_recorded = run.recorded_at;
+            }
+            if e.model.is_empty() {
+                e.model = run.model.clone();
+            }
+        }
+    }
+    if e.branch.is_none()
+        && let Some(run) = &w.last_run
+        && !run.branch.is_empty()
+    {
+        e.branch = Some(run.branch.clone());
     }
 }
 

@@ -3,7 +3,7 @@
    /amp                     the AMP connection: server, user, MCP health
    /ticket [id|none]        the current ticket; switch it, or clear it
    /workers                 workers here, and tickets in progress elsewhere
-   /worker [id]             watch a worker live: Esc back, Tab next, x stop
+   /worker [id]             watch a worker: Esc back, Tab, x stop, o AMP
    /questions               tickets waiting on an answer; answer them here
    /plan                    plan approval and the epics and stories
    /project [id]            the project and its board; switch to another
@@ -42,5 +42,6 @@
    PgUp/PgDn                scroll the transcript a page
    Ctrl+U/D                 scroll half a page (with an empty editor)
    End                      jump to the latest output (with an empty editor)
+   Ctrl+W                   pick a running worker: ←/→, Enter watch
    drag                     select text
 

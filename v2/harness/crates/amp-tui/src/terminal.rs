@@ -23,6 +23,11 @@
 //! (quit, suspend), the guard and the panic hook put back the terminal's default cursor shape
 //! and show it.
 //!
+//! Workers (#2347): a left click on a worker chip above the editor, a `/workers` row, a worker
+//! notice or dispatch line, or a `#ticket` with a worker session opens that worker's live session
+//! ([`Shell::click`]); Ctrl+W (with an empty editor) gives the worker strip the keys
+//! ([`Shell::toggle_workers_focus`]).
+//!
 //! Quitting with a prompt or workers still running goes through [`Shell::quit`]: the workers are
 //! cancelled and the screen says it is waiting for their run reports (bounded; a second Ctrl-C or
 //! signal skips the wait). Tickets still unreported when the TUI exits are printed to stderr.
@@ -408,6 +413,7 @@ async fn event_loop(
                             MouseEventKind::ScrollDown => shell.view().scroll().scroll_by(WHEEL_LINES),
                             MouseEventKind::Down(MouseButton::Left) => {
                                 // #2344: a click into the editor focuses it, cursor where it landed;
+                                // #2347: a click on a worker (or its #ticket) opens its session.
                                 // #2345: one on a thinking header opens or closes it.
                                 if let Ok((w, h)) = crossterm::terminal::size() {
                                     shell.click(
@@ -442,6 +448,13 @@ async fn event_loop(
                             if shell.ctrl_d(Instant::now()).await == CtrlD::Quit {
                                 break;
                             }
+                        } else if is_ctrl(&key, 'w')
+                            && (editor_empty
+                                || shell.viewing().is_some()
+                                || shell.view().strip().is_focused())
+                            && shell.toggle_workers_focus()
+                        {
+                            // #2347: the workers above the editor take the keys (←/→, Enter).
                         } else if is_ctrl(&key, 't') {
                             // Expand or collapse the thinking in sight, else the last (#2177,
                             // #2345).
