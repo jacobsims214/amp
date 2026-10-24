@@ -55,7 +55,11 @@ process-wrap = { version = "10.0", features = ["tokio1"] }
 
 clap = { version = "4.6", features = ["derive"] }
 # Raw-mode key reading for hidden secret entry in setup. Same version rpi-tui 0.8.0 uses.
-crossterm = { version = "0.27", default-features = false, features = ["events"] }
+# use-dev-tty (#2330): read keys with poll() (select() on macOS, via filedescriptor) instead of mio.
+# mio's kqueue can't register a fd opened from /dev/tty on macOS (EINVAL), so `setup </dev/tty`
+# (install.sh's hand-off under `curl | sh`) failed with "Failed to initialize input reader".
+# Features unify, so the chat TUI (amp-tui, rpi-tui) reads keys the same way.
+crossterm = { version = "0.27", default-features = false, features = ["events", "use-dev-tty"] }
 
 # Tool-path resolution in the policy (#2141) copies rpi-tools 0.8.0's: the same home dir (dirs) and
 # the read tools' NFD variant (unicode-normalization). Same versions rpi-tools uses.

@@ -1317,9 +1317,9 @@ impl Reloaded {
         if let Some(l) = mcp.line() {
             out.push(format!("mcp: {l}"));
         }
-        if !self.mcp.retried.is_empty() {
-            out.push(format!("mcp: retrying {}", self.mcp.retried.join(", ")));
-        }
+        // `self.mcp.retried` gets no line (#2334): every reload retries every stopped server, so
+        // it would repeat on each one. The retry's outcome is the news: the server's tools when
+        // it starts, its failure when that changed.
         for name in &self.mcp.untrusted {
             out.push(format!(
                 "mcp: {name} is not trusted yet (`amp-harness mcp trust {name}`, then /reload)"

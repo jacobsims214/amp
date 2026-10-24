@@ -10,8 +10,9 @@
 # Downloads amp-harness-<version>-<target>.tar.gz and its .sha256 from the release tagged
 # harness-v<version> on jacobsims214/amp, verifies the checksum, and installs the binary into
 # ~/.local/bin (no sudo). Re-running it upgrades in place. On a terminal it then offers to run
-# `amp-harness setup` (sign in to AMP, pick a project, connect a model provider); this works under
-# `curl | sh` too, because the answer is read from /dev/tty. Pass options with `sh -s -- <options>`.
+# `amp-harness setup` (sign in to AMP, pick a project, connect a model provider) for the current
+# folder; this works under `curl | sh` too, because the answer is read from /dev/tty. Pass options
+# with `sh -s -- <options>`.
 #
 # Options (most have an environment variable, for `curl | sh` without -s):
 #   --preset FILE|URL AMP_HARNESS_PRESET    hand this org preset to `amp-harness setup --preset`
@@ -234,6 +235,14 @@ interactive() {
     { : </dev/tty; } 2>/dev/null
 }
 
+# Runs a command with the terminal as its stdin: stdin itself when it is one, else /dev/tty (stdin
+# is the script under `curl | sh`). amp-harness reads keys from either (crossterm's use-dev-tty,
+# #2330: mio's kqueue can't poll a /dev/tty fd on macOS), but the person's own terminal is the
+# plainer hand-off when there is one.
+on_tty() {
+    if [ -t 0 ]; then "$@"; else "$@" </dev/tty; fi
+}
+
 # Quotes one word for a command line shown to the person (single quotes only when needed).
 shell_word() {
     case "$1" in
@@ -431,9 +440,9 @@ main() {
                 say ""
                 status=0
                 if [ -n "$preset" ]; then
-                    "$prefix/$BIN" setup --preset "$preset" </dev/tty || status=$?
+                    on_tty "$prefix/$BIN" setup --preset "$preset" || status=$?
                 else
-                    "$prefix/$BIN" setup </dev/tty || status=$?
+                    on_tty "$prefix/$BIN" setup || status=$?
                 fi
                 if [ "$status" != 0 ]; then
                     say ""

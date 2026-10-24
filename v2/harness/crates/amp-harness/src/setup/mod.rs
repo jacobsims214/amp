@@ -1580,6 +1580,9 @@ pub(crate) enum KeyCheck {
     Ok,
     Rejected(u16),
     Unknown(String),
+    /// The endpoint's certificate was refused (#2333): [`crate::connect::cert_message`]'s
+    /// sentence and fix.
+    Untrusted(String),
 }
 
 /// Asks the provider whether the key works, without spending tokens: Anthropic's model list,
@@ -1626,7 +1629,10 @@ pub(crate) async fn check_key_full(
         Ok(Err(e)) if e.failure == ProbeFailure::Rejected => {
             KeyCheck::Rejected(e.status.unwrap_or(401))
         }
-        Ok(Err(e)) => KeyCheck::Unknown(e.message),
+        Ok(Err(e)) => match crate::connect::cert_message(&p, &e) {
+            Some(message) => KeyCheck::Untrusted(message),
+            None => KeyCheck::Unknown(e.message),
+        },
         Err(_) => KeyCheck::Unknown("timed out".to_owned()),
     }
 }
@@ -1696,6 +1702,7 @@ async fn prompt_secrets(
             KeyCheck::Unknown(why) => ui.say(&format!(
                 "  Could not check the key with {name} ({why}); keeping it."
             )),
+            KeyCheck::Untrusted(message) => ui.say(&format!("  {message}")),
         }
         store_key(&p.id, &key).map_err(|e| CliError::new(format!("store the {name} key: {e}")))?;
         ui.say(&format!(

@@ -166,11 +166,16 @@ async fn completions(
     ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
 }
 
-pub async fn spawn_provider(state: ProviderState) -> MockProvider {
-    let app = Router::new()
+/// The provider's routes, for a test that serves them itself (#2333: over TLS).
+pub fn provider_app(state: ProviderState) -> Router {
+    Router::new()
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(completions))
-        .with_state(state.clone());
+        .with_state(state)
+}
+
+pub async fn spawn_provider(state: ProviderState) -> MockProvider {
+    let app = provider_app(state.clone());
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = tcp.local_addr().unwrap();
     let task = tokio::spawn(async move {

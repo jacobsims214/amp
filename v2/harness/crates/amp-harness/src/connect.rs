@@ -38,7 +38,7 @@ use amp_core::{
     provider_auth::{CLIENT_KEY_SECRET, secret_account},
     providers::{
         KeyLookup, KeySource, ProviderSet, StaticKeys, SystemKeys, header_account,
-        keychain_account, live_model_ids, resolve_key, resolve_secret_headers,
+        keychain_account, resolve_key, resolve_secret_headers,
     },
 };
 use clap::Args;
@@ -953,17 +953,103 @@ pub(crate) fn store_all_secrets(
     Ok(())
 }
 
+/// Why the endpoint's model list could not be had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ListError {
+    /// Its certificate was refused: [`cert_message`]'s sentence and fix (#2333). Naming models
+    /// with --model would not help, so callers stop or say only this.
+    Untrusted(String),
+    /// Anything else (the probe's one-line message).
+    Other(String),
+}
+
+impl std::fmt::Display for ListError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Untrusted(m) | Self::Other(m) => f.write_str(m),
+        }
+    }
+}
+
 /// The model ids the endpoint lists (with the new key), sorted.
 pub(crate) async fn list_models(
     p: &ProviderConfig,
     key: &str,
     secret_headers: &BTreeMap<String, String>,
     client_key: Option<&str>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ListError> {
     let keys = static_keys(&p.id, key, secret_headers, client_key);
-    live_model_ids(p, &keys)
+    amp_core::provider_auth::probe(p, &keys, amp_core::provider_auth::ProbeKind::Catalog)
         .await
-        .map(|ids| ids.into_iter().collect())
+        .map(|found| found.ids.into_iter().collect())
+        .map_err(|e| match cert_message(p, &e) {
+            Some(m) => ListError::Untrusted(m),
+            None => ListError::Other(e.message),
+        })
+}
+
+/// #2333: the endpoint's certificate was refused (an unknown CA, expired, another host's name).
+/// One sentence naming the problem plus the fix ("api.example.com's certificate isn't trusted:
+/// it's signed by a CA this machine doesn't know. Fix: `amp-harness connect example --ca-file
+/// /path/corp-root.pem` …"), and the full cause on its own line only with --verbose / RUST_LOG.
+/// `None` for any other failure, TLS ones included (mTLS refusals keep their own wording).
+pub(crate) fn cert_message(
+    p: &ProviderConfig,
+    e: &amp_core::provider_auth::ProbeError,
+) -> Option<String> {
+    let problem = e.cert_problem()?;
+    let mut text = format!(
+        "{} Fix: {}.",
+        cert_sentence(p, problem),
+        cert_fix(p, problem)
+    );
+    if crate::conn::verbose() {
+        text.push_str(&format!("\n  cause: {}", amp_mcp::redact_urls(&e.message)));
+    }
+    Some(text)
+}
+
+/// [`CertProblem::sentence`] for `p`'s host and CA file.
+///
+/// [`CertProblem::sentence`]: amp_core::provider_auth::CertProblem::sentence
+pub(crate) fn cert_sentence(
+    p: &ProviderConfig,
+    problem: amp_core::provider_auth::CertProblem,
+) -> String {
+    problem.sentence(&setup::host_of(&p.base_url), p.tls.ca_file.as_deref())
+}
+
+/// What to do about a refused certificate. Built-in providers take no endpoint flags, so theirs
+/// goes in config.toml.
+pub(crate) fn cert_fix(
+    p: &ProviderConfig,
+    problem: amp_core::provider_auth::CertProblem,
+) -> String {
+    use amp_core::provider_auth::CertProblem;
+    let id = &p.id;
+    let builtin = shipped_ids().contains(id);
+    match problem {
+        CertProblem::UnknownIssuer if builtin => format!(
+            "set ca_file = \"/path/corp-root.pem\" (the CA that signed it, PEM) in \
+             [providers.{id}] in config.toml, or add that CA to the OS trust store"
+        ),
+        CertProblem::UnknownIssuer => format!(
+            "`amp-harness connect {id} --ca-file /path/corp-root.pem` (the PEM of the CA that \
+             signed it)"
+        ),
+        CertProblem::Expired => {
+            "ask the endpoint's owner to renew it, or set this machine's date and time right"
+                .to_owned()
+        }
+        CertProblem::NameMismatch if builtin => format!(
+            "use the host name it was issued for in [providers.{id}] base_url, or check for a \
+             proxy in between"
+        ),
+        CertProblem::NameMismatch => format!(
+            "use the host name it was issued for: `amp-harness connect {id} --base-url \
+             https://<that host>/…`"
+        ),
+    }
 }
 
 /// What the key check said, for people.
@@ -974,7 +1060,24 @@ pub(crate) fn check_note(name: &str, check: &KeyCheck) -> String {
         KeyCheck::Unknown(why) => {
             format!("Could not check the key with {name} ({why}); keeping it.")
         }
+        KeyCheck::Untrusted(message) => message.clone(),
     }
+}
+
+/// #2333: a refused certificate ends `connect` with its one sentence and fix; nothing is stored
+/// (the key could not be checked, and the models could not be listed).
+fn refuse_untrusted(check: &KeyCheck) -> Result<(), CliError> {
+    match check {
+        KeyCheck::Untrusted(message) => Err(CliError::new(message.clone())),
+        _ => Ok(()),
+    }
+}
+
+/// [`check_note`] in a terminal, or the error that ends `connect` for a refused certificate.
+fn say_check(ui: &mut dyn Ui, name: &str, check: &KeyCheck) -> Result<(), CliError> {
+    refuse_untrusted(check)?;
+    ui.say(&format!("  {}", check_note(name, check)));
+    Ok(())
 }
 
 fn check_json(check: &KeyCheck) -> String {
@@ -982,6 +1085,7 @@ fn check_json(check: &KeyCheck) -> String {
         KeyCheck::Ok => "ok".to_owned(),
         KeyCheck::Rejected(status) => format!("rejected {status}"),
         KeyCheck::Unknown(why) => format!("unchecked: {why}"),
+        KeyCheck::Untrusted(_) => "untrusted certificate".to_owned(),
     }
 }
 
@@ -1214,7 +1318,7 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
                 provider.id,
                 provider.auth.describe()
             ));
-            ui.say(&format!("  {}", check_note(&name, &check)));
+            say_check(ui, &name, &check)?;
             return match check {
                 KeyCheck::Rejected(status) => Err(CliError::new(format!(
                     "{name} refused the token (HTTP {status})"
@@ -1256,7 +1360,7 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
             _ => "in the OS keychain".to_owned(),
         };
         ui.say(&format!("{name}: key unchanged ({place})."));
-        ui.say(&format!("  {}", check_note(&name, &check)));
+        say_check(ui, &name, &check)?;
         if let KeyCheck::Rejected(status) = check {
             return Err(CliError::new(format!(
                 "{name} rejected the key it has (HTTP {status}); nothing was changed. Enter a new \
@@ -1269,7 +1373,7 @@ pub async fn run(args: ConnectArgs) -> Result<(), CliError> {
     } else if spec.is_some() && !provider.needs_key {
         // #2277: none or a token command: no key to read; check the endpoint (and the token).
         let check = setup::check_key_full(&provider, "", &extra, client_key.as_deref()).await;
-        ui.say(&format!("  {}", check_note(&name, &check)));
+        say_check(ui, &name, &check)?;
         if let KeyCheck::Rejected(status) = check {
             return Err(CliError::new(format!(
                 "{name} refused the request (HTTP {status}); nothing was stored"
@@ -1873,7 +1977,7 @@ async fn read_and_check_key(
             "Using the {name} key in {var} (it stays in the environment; nothing is stored)."
         ));
         let check = setup::check_key_full(provider, &key, extra, client_key).await;
-        ui.say(&format!("  {}", check_note(name, &check)));
+        say_check(ui, name, &check)?;
         if let KeyCheck::Rejected(status) = check {
             return Err(CliError::new(format!(
                 "{name} rejected the key in {var} (HTTP {status}); nothing was changed"
@@ -1906,6 +2010,7 @@ async fn read_and_check_key(
             if custom_without_key_ok && attempt == 0 {
                 ui.say(&format!("No key: {name} will be called without one."));
                 let check = setup::check_key_full(provider, "", extra, client_key).await;
+                refuse_untrusted(&check)?;
                 return Ok((String::new(), check, false));
             }
             return Err(CliError::usage(format!(
@@ -1920,7 +2025,7 @@ async fn read_and_check_key(
             continue;
         }
         let check = setup::check_key_full(provider, &key, extra, client_key).await;
-        ui.say(&format!("  {}", check_note(name, &check)));
+        say_check(ui, name, &check)?;
         if let KeyCheck::Rejected(status) = check {
             if args.key_stdin || !ui.interactive() {
                 return Err(CliError::new(format!(
@@ -1961,6 +2066,7 @@ async fn pick_models(
                 p.base_url,
                 ids.len()
             ))),
+            Err(ListError::Untrusted(m)) => Err(CliError::new(m)),
             Err(e) => Err(CliError::usage(format!(
                 "could not list the models at {} ({e}): name them with --model ID",
                 p.base_url
@@ -1973,6 +2079,7 @@ async fn pick_models(
             ui.say("The endpoint lists no models.");
             Vec::new()
         }
+        Err(ListError::Untrusted(m)) => return Err(CliError::new(m)),
         Err(e) => {
             ui.say(&format!("Could not list the models ({e})."));
             Vec::new()
@@ -2444,15 +2551,19 @@ impl ChatConnect {
                 provider.id
             ));
         }
+        if let KeyCheck::Untrusted(message) = &check {
+            return Err(format!("{message} Nothing was stored."));
+        }
         if let Some(s) = spec.as_mut() {
             let ids = list_models(&provider, &key, &BTreeMap::new(), None)
                 .await
-                .map_err(|e| {
-                    format!(
+                .map_err(|e| match e {
+                    ListError::Untrusted(m) => m,
+                    ListError::Other(e) => format!(
                         "could not list the models at {} ({e}); add it with `amp-harness connect \
                          {}` in a terminal to name them",
                         provider.base_url, provider.id
-                    )
+                    ),
                 })?;
             if ids.is_empty() || ids.len() > MAX_AUTO_MODELS {
                 return Err(format!(

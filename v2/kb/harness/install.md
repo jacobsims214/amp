@@ -21,9 +21,17 @@ git checkout harness-m4          # until the harness reaches main
 make -C v2/harness install       # release build, packed and installed by install.sh
 ```
 
-`make install` puts `amp-harness` in `~/.local/bin` through the same installer, so everything
-below (setup hand-off, upgrade, uninstall) works the same way. `PREFIX=/some/bin` installs it
-somewhere else. To upgrade, `git pull` and run it again.
+`make install` puts `amp-harness` in `~/.local/bin` through the same installer, so upgrade and
+uninstall below work the same way. It does not offer to run setup (make runs the installer inside
+`v2/harness`, which is not your project); it prints the command instead. Then go to your project
+folder and run setup there:
+
+```sh
+cd ~/code/my-project
+amp-harness setup                # or: amp-harness setup --preset <file or URL your admin gave you>
+```
+
+`PREFIX=/some/bin` installs it somewhere else. To upgrade, `git pull` and run it again.
 
 ## The one-liner (macOS and Linux)
 

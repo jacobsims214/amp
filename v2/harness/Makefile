@@ -54,8 +54,10 @@ release:
 dist: release
 	./scripts/package.sh
 
+# --no-setup (#2330): make runs install.sh in v2/harness, so setup would link the harness folder
+# instead of your project. install.sh prints the setup command to run in your project folder instead.
 install: release
-	archive=$$(./scripts/package.sh | tail -n 1) && ./install.sh --archive "$$archive" --prefix "$(PREFIX)"
+	archive=$$(./scripts/package.sh | tail -n 1) && ./install.sh --archive "$$archive" --prefix "$(PREFIX)" --no-setup
 
 # Offline tests for install.sh / package.sh / render-formula.sh (stub binary, HOME under target/).
 install-test:
