@@ -110,6 +110,7 @@ impl ReloadControl for FakeReload {
                 providers: Vec::new(),
                 models: Vec::new(),
                 switch_to: None,
+                stays: None,
                 warnings: Vec::new(),
             })
         })

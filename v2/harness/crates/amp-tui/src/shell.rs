@@ -211,6 +211,10 @@ pub struct ReloadReply {
     /// The chat's role got another model in the config: switch this chat to it
     /// (`provider/model`, one of `models`).
     pub switch_to: Option<String>,
+    /// The chat's role got another model this process can't use (its provider has no key
+    /// here): why the chat stays on its model (#2334), e.g. `manager moved to x/y, but x has
+    /// no key here (set X_API_KEY, then /reload)`.
+    pub stays: Option<String>,
     /// Lines to show as warnings (a permission change that needs a restart).
     pub warnings: Vec<String>,
 }
@@ -2268,13 +2272,25 @@ impl Shell {
         };
         self.models = reply.models;
         let mut lines = reply.lines;
-        if let Some(reference) = reply.switch_to
-            && let Some(choice) = self
+        let mut stays = reply.stays;
+        let choice = reply.switch_to.and_then(|reference| {
+            let found = self
                 .models
                 .iter()
                 .find(|m| m.reference == reference)
-                .cloned()
-        {
+                .cloned();
+            if found.is_none() {
+                stays.get_or_insert(format!("{reference} isn't available here"));
+            }
+            found.map(|choice| (reference, choice))
+        });
+        if let Some(why) = stays {
+            lines.push(format!(
+                "this chat stays on {}: {why}; /model picks another for this chat",
+                self.info.model_ref()
+            ));
+        }
+        if let Some((reference, choice)) = choice {
             let thinking = if choice.model.reasoning {
                 choice.model.clamp_thinking_level(
                     self.info
