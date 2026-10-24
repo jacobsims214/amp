@@ -44,6 +44,7 @@ use rpi_agent::AgentEvent;
 use rpi_tui::{ProcessTerminal, TUI, Terminal, TerminalInfo, TuiAltScreen, TuiStopOptions};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
+use crate::newline::NewlineMode;
 use crate::scroll::WHEEL_LINES;
 use crate::shell::{CtrlC, CtrlD, QuitOutcome, RunDone, Shell, Submit};
 
@@ -121,7 +122,8 @@ impl Drop for TerminalGuard {
 /// The process terminal, with mouse reporting kept off when `mouse` is false (`[tui] mouse`):
 /// rpi-tui turns it on whenever it enters the alternate screen or raw mode.
 struct MouseGate {
-    inner: ProcessTerminal,
+    /// Shared with [`run`], which reads whether the kitty keyboard protocol was negotiated.
+    inner: Arc<ProcessTerminal>,
     mouse: bool,
 }
 
@@ -221,6 +223,15 @@ fn fit_height(shell: &Shell) -> bool {
     before != shell.view().vertical_padding()
 }
 
+/// A key as the reader hands it on (#2349): rpi-tui's normalization for this protocol (a local
+/// Terminal.app's Shift+Enter, legacy iTerm2's Option+arrows; `kitty`: whether the kitty keyboard
+/// protocol is on), then Alt+Enter as Shift+Enter ([`crate::newline::normalize`]).
+pub fn read_key(key: KeyEvent, kitty: bool) -> KeyEvent {
+    crate::newline::normalize(rpi_tui::terminal::normalize_key_event_with_protocol(
+        key, kitty,
+    ))
+}
+
 fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(ch)
 }
@@ -232,9 +243,10 @@ pub async fn run(
     mut done: UnboundedReceiver<RunDone>,
 ) -> Result<(), String> {
     install_panic_hook();
+    let terminal = Arc::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(
         Box::new(MouseGate {
-            inner: ProcessTerminal::new(),
+            inner: Arc::clone(&terminal),
             mouse: shell.mouse_capture(),
         }),
         // #2344: the terminal's cursor at the editor's insertion point (rpi-tui's cursor marker).
@@ -254,6 +266,11 @@ pub async fn run(
     };
     tui.start_render_scheduler();
     tui.start_readerless();
+    // #2349: entering raw mode negotiated the kitty keyboard protocol (or not). Our reader does
+    // what rpi-tui's own reader does with each key (Terminal.app's Shift+Enter, iTerm2's
+    // Option+arrows), and Alt+Enter becomes a new line.
+    let kitty = terminal.info().supports_kitty_keyboard;
+    shell.set_newline_mode(NewlineMode::detect(kitty));
 
     let (submit_tx, mut submit_rx) = unbounded_channel::<String>();
     shell.view().editor().on_submit(Arc::new(move |text: &str| {
@@ -274,6 +291,10 @@ pub async fn run(
                 }
                 match crossterm::event::read() {
                     Ok(event) => {
+                        let event = match event {
+                            Event::Key(key) => Event::Key(read_key(key, kitty)),
+                            other => other,
+                        };
                         if input_tx.send(event).is_err() {
                             break;
                         }
@@ -402,8 +423,7 @@ async fn event_loop(
                         repaint(shell, tui);
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        let editor = shell.view().editor().clone();
-                        let editor_empty = editor.get_text().is_empty();
+                        let editor_empty = shell.view().editor().get_text().is_empty();
                         if !is_ctrl(&key, 'c') {
                             // The quit window is two Ctrl+Cs in a row.
                             shell.clear_quit_hint();
@@ -436,7 +456,8 @@ async fn event_loop(
                             // An open AMP panel took it (select, answer, open, close), or Esc
                             // stopped the run (Esc that closes a panel mid-run only hints).
                         } else {
-                            editor.handle_key(key);
+                            // `\` Enter starts a new line; the rest is the editor's (#2349).
+                            shell.editor_key(key);
                         }
                         repaint(shell, tui);
                     }
