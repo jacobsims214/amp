@@ -386,7 +386,8 @@ async fn event_loop(
                             MouseEventKind::ScrollUp => shell.view().scroll().scroll_by(-WHEEL_LINES),
                             MouseEventKind::ScrollDown => shell.view().scroll().scroll_by(WHEEL_LINES),
                             MouseEventKind::Down(MouseButton::Left) => {
-                                // #2344: a click into the editor focuses it, cursor where it landed.
+                                // #2344: a click into the editor focuses it, cursor where it landed;
+                                // #2345: one on a thinking header opens or closes it.
                                 if let Ok((w, h)) = crossterm::terminal::size() {
                                     shell.click(
                                         usize::from(w),
@@ -422,7 +423,11 @@ async fn event_loop(
                                 break;
                             }
                         } else if is_ctrl(&key, 't') {
-                            // Expand or collapse the last thinking (#2177).
+                            // Expand or collapse the thinking in sight, else the last (#2177,
+                            // #2345).
+                            if let Ok((w, h)) = crossterm::terminal::size() {
+                                shell.set_screen(usize::from(w), usize::from(h));
+                            }
                             shell.toggle_thinking();
                         } else if is_ctrl(&key, 'o') {
                             // Show or hide the tool calls' details (#2183).

@@ -18,7 +18,9 @@
 //! config.toml `[tui] theme`, else `auto` (the terminal's background via OSC 11; dark in
 //! `--snapshot`). Colour depth: `AMP_HARNESS_COLOR`, `[tui] color`, else `COLORTERM`. Thinking
 //! (#2177): `AMP_HARNESS_SHOW_THINKING`, `[tui] show_thinking` (collapsed|full|hidden), else
-//! collapsed; Ctrl+T (`--input key:ctrl+t`) expands the last one. Ctrl+O (`--input key:ctrl+o`)
+//! collapsed; Ctrl+T (`--input key:ctrl+t`) opens or closes the lowest one in sight, else the
+//! last, and a click on its line (`--input click:<row>,<col>`, 0-based) opens or closes that one
+//! (#2345); `/config thinking [collapsed|full|hidden]` changes it for the chat. Ctrl+O (`--input key:ctrl+o`)
 //! shows every tool call's arguments and result (#2183). Mouse reporting (#2185):
 //! `AMP_HARNESS_MOUSE`, `[tui] mouse` (true|false), else on; off gives the terminal's plain
 //! click-drag selection back (the wheel then no longer scrolls the transcript; PageUp/PageDown do).
@@ -347,6 +349,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         }
         return result.map_err(CliError::new);
     };
+    // Ctrl+T finds the thinking in sight on the snapshot's screen (#2345).
+    shell.set_screen(width, height);
     // No browser from a snapshot: /open reports the URL it would open.
     shell.set_opener(Arc::new(|_url: &str| {
         Err("--snapshot does not open a browser".to_owned())
@@ -374,6 +378,13 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             exec_input(command).await?;
         } else if let Some(key) = input.strip_prefix("key:") {
             shell.press(key).await.map_err(CliError::usage)?;
+        } else if let Some(at) = input.strip_prefix("click:") {
+            // #2345: a left click at `row,col` (0-based) on the snapshot's screen.
+            let (row, col) = at
+                .split_once(',')
+                .and_then(|(r, c)| Some((r.trim().parse().ok()?, c.trim().parse().ok()?)))
+                .ok_or_else(|| CliError::usage(format!("click:{at}: use click:<row>,<col>")))?;
+            shell.click(width, height, row, col);
         } else {
             if shell.submit(input).await == Submit::Quit {
                 break;

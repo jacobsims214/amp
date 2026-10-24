@@ -538,6 +538,8 @@ pub struct Shell {
     editor_clicked: bool,
     /// Who stops workers from this chat ([`Shell::set_person`]); else the AMP user's email.
     person: Option<String>,
+    /// The screen's size, for Ctrl+T to find the thinking in sight ([`Shell::set_screen`]).
+    screen: Option<(usize, usize)>,
     /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
     history: PromptHistory,
 }
@@ -596,6 +598,7 @@ impl Shell {
                 stop_confirm: None,
                 editor_clicked: false,
                 person: None,
+                screen: None,
                 history: PromptHistory::new(),
             },
             done_rx,
@@ -641,7 +644,13 @@ impl Shell {
     /// A left click at `(row, column)` (0-based) on a `width` x `height` screen (#2344). Inside
     /// the editor box it gives the editor the keys and puts the insertion point where it landed.
     /// Returns whether it did.
+    ///
+    /// On a thinking header in the transcript it opens or closes that section (#2345).
     pub fn click(&mut self, width: usize, height: usize, row: usize, column: usize) -> bool {
+        self.screen = Some((width, height));
+        if self.view.click_thinking(width, height, row).is_some() {
+            return true;
+        }
         if self.secret.is_some() || self.stop_confirm.is_some() || self.viewing.is_some() {
             return false;
         }
@@ -663,6 +672,13 @@ impl Shell {
     /// Whether the terminal loop turns mouse reporting on (`[tui] mouse`, default on, #2185).
     pub fn set_mouse_capture(&mut self, on: bool) {
         self.mouse_capture = on;
+        self.view.set_mouse(on);
+    }
+
+    /// The terminal's size (the terminal loop sets it before Ctrl+T; `--snapshot` once), so
+    /// Ctrl+T opens the thinking in sight ([`Shell::toggle_thinking`]).
+    pub fn set_screen(&mut self, width: usize, height: usize) {
+        self.screen = Some((width, height));
     }
 
     pub fn mouse_capture(&self) -> bool {
@@ -673,13 +689,51 @@ impl Shell {
         &self.info
     }
 
-    /// How the transcript shows thinking (`[tui] show_thinking`, #2177).
+    /// How the transcript shows thinking (`[tui] show_thinking`, #2177); `/config thinking`
+    /// changes it for the messages already shown too, worker sessions included (#2345).
     pub fn set_show_thinking(&mut self, display: crate::ThinkingDisplay) {
         self.view.set_show_thinking(display);
+        for session in self.sessions.values_mut() {
+            session.set_show_thinking(display);
+        }
     }
 
-    /// Ctrl+T: expands or collapses the last thinking section. Returns whether there was one.
+    /// `/config thinking [collapsed|full|hidden]` (#2345): sets how this chat shows thinking;
+    /// without a value it goes to the next one (collapsed, full, hidden). Saving it is
+    /// `[tui] show_thinking` in config.toml.
+    fn thinking_command(&mut self, arg: &str) {
+        use crate::ThinkingDisplay as D;
+        let next = if arg.trim().is_empty() {
+            Ok(match self.view.show_thinking() {
+                D::Collapsed => D::Full,
+                D::Full => D::Hidden,
+                D::Hidden => D::Collapsed,
+            })
+        } else {
+            D::parse(arg)
+        };
+        let command = format!("/config thinking {arg}").trim_end().to_owned();
+        match next {
+            Ok(display) => {
+                self.set_show_thinking(display);
+                let line = format!(
+                    "thinking: {} for this chat ([tui] show_thinking in config.toml keeps it)",
+                    display.word()
+                );
+                self.apply_config(Ok(ConfigReply::done(line)), &command);
+            }
+            Err(e) => self.apply_config(Err(e), &command),
+        }
+    }
+
+    /// Ctrl+T: expands or collapses the lowest thinking header in sight, else the last thinking
+    /// section (#2177, #2345). Returns whether there was one.
     pub fn toggle_thinking(&mut self) -> bool {
+        if let Some((w, h)) = self.screen
+            && self.view.toggle_visible_thinking(w, h).is_some()
+        {
+            return true;
+        }
         if let Some(s) = self.shown_session() {
             return s.view().toggle_thinking().is_some();
         }
@@ -1622,6 +1676,10 @@ impl Shell {
             // role's model (#2245).
             "model" if !is_model_ref(arg) => self.config_command("model", arg),
             "model" => self.switch_model(arg).await,
+            // `/config thinking …` is the chat's own (#2345).
+            "config" if arg.split_whitespace().next() == Some("thinking") => {
+                self.thinking_command(arg.trim_start().trim_start_matches("thinking"))
+            }
             "mcp" | "agents" | "skills" | "config" => self.config_command(name, arg),
             "connect" => self.connect_command(arg),
             "abort" => self.abort().await,

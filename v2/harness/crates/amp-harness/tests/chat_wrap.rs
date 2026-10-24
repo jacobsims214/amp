@@ -274,16 +274,22 @@ async fn a_token_wider_than_the_row_still_breaks() {
 
 // #2177: thinking is collapsed by default.
 
-/// Rows that show a thinking header: `Thinking · 3s ▸` (or `Thinking ▸` without a duration).
+/// Rows that show a thinking header: `▸ Thinking · 3s` while it streams, `▸ Thought for 3s`
+/// after (#2345), `▸ Thinking` without a duration; `▾` when open.
 fn thinking_headers(screen: &[String]) -> Vec<&String> {
     screen
         .iter()
         .filter(|r| {
-            r.starts_with(" Thinking ·")
-                || r.starts_with(" Thinking ▸")
-                || r.starts_with(" Thinking ▾")
+            ["▸", "▾"].iter().any(|g| {
+                r.starts_with(&format!(" {g} Thinking"))
+                    || r.starts_with(&format!(" {g} Thought for "))
+            })
         })
         .collect()
+}
+
+fn is_open(header: &str) -> bool {
+    header.starts_with(" ▾")
 }
 
 /// Session files under the snapshot's state dir, read whole.
@@ -324,10 +330,15 @@ async fn thinking_shows_one_line_per_turn_by_default() {
         let text = screen.join("\n");
         let headers = thinking_headers(&screen);
         assert_eq!(headers.len(), 2, "one thinking line per turn:\n{text}");
-        for h in &headers {
-            // Collapsed once the answer started: the duration and ▸, no sentence after it.
-            assert!(h.trim_end().ends_with('▸'), "{h:?}\n{text}");
-        }
+        // Collapsed once the answer started: "Thought for Ns", no sentence after it; the last
+        // one says how to open it (#2345).
+        assert!(headers[0].starts_with(" ▸ Thought for "), "{text}");
+        assert!(headers[0].trim_end().ends_with('s'), "{text}");
+        assert!(
+            headers[1].starts_with(" ▸ Thought for ")
+                && headers[1].ends_with("s · Ctrl+T or click to open"),
+            "{text}"
+        );
         for phrase in ["silly and repetitive", "The user is asking", "Create epic?"] {
             assert!(!text.contains(phrase), "{phrase:?} shown:\n{text}");
         }
@@ -357,14 +368,8 @@ async fn ctrl_t_expands_the_last_thinking() {
     let text = screen.join("\n");
     let headers = thinking_headers(&screen);
     assert_eq!(headers.len(), 2, "{text}");
-    assert!(
-        headers[0].trim_end().ends_with('▸'),
-        "the first stays collapsed:\n{text}"
-    );
-    assert!(
-        headers[1].trim_end().ends_with('▾'),
-        "the last is expanded:\n{text}"
-    );
+    assert!(!is_open(headers[0]), "the first stays collapsed:\n{text}");
+    assert!(is_open(headers[1]), "the last is expanded:\n{text}");
     assert!(!text.contains("silly and repetitive"), "{text}");
     // Plain rows behind the gutter, not a markdown list.
     let item = rows_from(&screen, "3. Create epic?");
@@ -382,9 +387,7 @@ async fn ctrl_t_expands_the_last_thinking() {
     let text = screen.join("\n");
     assert!(!text.contains("Create epic?"), "{text}");
     assert!(
-        thinking_headers(&screen)
-            .iter()
-            .all(|h| h.trim_end().ends_with('▸')),
+        thinking_headers(&screen).iter().all(|h| !is_open(h)),
         "{text}"
     );
 }
@@ -420,6 +423,97 @@ async fn show_thinking_hidden_in_config_shows_none_until_ctrl_t() {
     let text = screen.join("\n");
     assert_eq!(thinking_headers(&screen).len(), 1, "{text}");
     assert!(text.contains("silly and repetitive"), "{text}");
+}
+
+// #2345: a click on a header opens that section; `/config thinking` changes the mode.
+
+#[tokio::test]
+async fn a_click_on_a_thinking_line_opens_and_closes_it() {
+    for size in SIZES {
+        let script = json!([
+            { "thinking": THINKING_STEPS, "text": "Planned." },
+            { "thinking": "Short.", "text": "Done." }
+        ]);
+        let inputs = ["plan it", "explain waves"];
+        let screen = snapshot("think-click-0", script.clone(), size, &inputs).await;
+        let row = screen
+            .iter()
+            .position(|r| r.starts_with(" ▸ Thought for "))
+            .unwrap_or_else(|| panic!("{}", screen.join("\n")));
+        // Rows and columns are 0-based on the whole screen: below the blank top row, and the
+        // header starts after the padding.
+        let row = row + amp_tui::Gap::rows_at(size.1);
+        let click = format!("click:{row},6");
+        let opened = snapshot(
+            "think-click-1",
+            script.clone(),
+            size,
+            &[inputs[0], inputs[1], &click],
+        )
+        .await;
+        let text = opened.join("\n");
+        // It opened; at 80x24 its text pushes the second turn down and the view scrolls so the
+        // header stays in sight with its first line under it.
+        let headers = thinking_headers(&opened);
+        assert!(is_open(headers[0]), "the clicked one opened:\n{text}");
+        assert!(headers.iter().skip(1).all(|h| !is_open(h)), "{text}");
+        let at = opened.iter().position(|r| is_open(r)).unwrap();
+        assert_eq!(opened[at + 1], " │ Steps:", "{text}");
+
+        // A second click where the header is now closes it: as before.
+        let again = format!("click:{},6", at + amp_tui::Gap::rows_at(size.1));
+        let closed = snapshot(
+            "think-click-2",
+            script,
+            size,
+            &[inputs[0], inputs[1], &click, &again],
+        )
+        .await;
+        // The transcript from the first prompt to the editor (the banner and footer name the
+        // run's own dir, port and session).
+        let turns = |rows: &[String]| -> Vec<String> {
+            rows.iter()
+                .skip_while(|r| r.as_str() != " plan it")
+                .take_while(|r| !r.starts_with('─'))
+                .cloned()
+                .collect()
+        };
+        assert!(turns(&screen).len() > 5, "{}", screen.join("\n"));
+        assert_eq!(
+            turns(&closed),
+            turns(&screen),
+            "opened and closed: as before"
+        );
+    }
+}
+
+#[tokio::test]
+async fn config_thinking_switches_the_mode_for_the_chat() {
+    let size = SIZES[1];
+    let script = json!([{ "thinking": THINKING_STEPS, "text": "Planned." }]);
+    let screen = snapshot(
+        "think-config-full",
+        script.clone(),
+        size,
+        &["plan it", "/config thinking full"],
+    )
+    .await;
+    let text = screen.join("\n");
+    assert!(is_open(thinking_headers(&screen)[0]), "{text}");
+    assert!(screen.iter().any(|r| r == " │ Steps:"), "{text}");
+    assert!(text.contains("thinking: full for this chat"), "{text}");
+
+    let screen = snapshot(
+        "think-config-hidden",
+        script,
+        size,
+        &["plan it", "/config thinking full", "/config thinking"],
+    )
+    .await;
+    let text = screen.join("\n");
+    assert!(thinking_headers(&screen).is_empty(), "{text}");
+    assert!(text.contains("thinking: hidden for this chat"), "{text}");
+    assert!(screen.iter().any(|r| r == " Planned."), "{text}");
 }
 
 /// #2180: a 4-column ticket table, like the board answer in the review (finding 5).

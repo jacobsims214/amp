@@ -99,6 +99,22 @@ mouse = true              # false gives plain click-drag text selection back
 padding = 2
 ```
 
+`show_thinking` decides how the model's thinking shows in the chat (`AMP_HARNESS_SHOW_THINKING`
+beats it):
+
+- `collapsed` (the default): one dim line per thinking section. While the model thinks it reads
+  `▸ Thinking · 12s` with its latest sentence; once the answer starts, `▸ Thought for 12s`. The
+  newest one adds `· Ctrl+T or click to open`.
+- `full`: every section open, its text dimmed behind a `│` gutter under a `▾ Thought for 12s`
+  line.
+- `hidden`: no thinking lines at all (Ctrl+T still opens the last one).
+
+Click a thinking line to open or close it. Ctrl+T opens or closes the lowest one on screen, so
+scroll up to an older one (PgUp) and press Ctrl+T to read it. `/config thinking` switches this
+chat to the next mode (collapsed, full, hidden), and `/config thinking full` (or `collapsed`,
+`hidden`) picks one; `t` in the `/config` panel does the same. That lasts for this chat; set
+`show_thinking` here to keep it. Session files and `run -p` always keep the full thinking.
+
 Environment variables beat the file. Unknown keys are errors, so a typo never goes unnoticed.
 
 `AGENTS.md` in your config folder, and `AGENTS.md` or `CLAUDE.md` in the working directory and
