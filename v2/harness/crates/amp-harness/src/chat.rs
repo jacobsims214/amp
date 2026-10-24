@@ -281,6 +281,10 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             Arc::clone(&connected),
         ));
     }
+    // #2310: so do the repo's agents, skills and settings left out.
+    for line in crate::trust_cmd::warnings(&session.rt.repo_untrusted()) {
+        shell.view().add_warning(&line);
+    }
     // #2241: repo MCP servers left untrusted say so (and how to trust them) in the transcript.
     for u in session.rt.mcp_hub.untrusted() {
         shell.view().add_warning(&format!(

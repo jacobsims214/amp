@@ -258,8 +258,19 @@ impl Assets {
         Self::load(&OverrideDirs::default())
     }
 
-    /// The embedded assets with the user and repo overrides layered on top.
+    /// The embedded assets with the user and repo overrides layered on top, every repo file
+    /// included (for inspecting the files; sessions use [`Assets::load_gated`]).
     pub fn load(dirs: &OverrideDirs) -> Result<Self, AssetError> {
+        Self::load_gated(dirs, &crate::repo_trust::Gate::open())
+    }
+
+    /// [`Assets::load`], with each repo agent and skill only if `gate` trusts it as it is on disk
+    /// now (#2310): an untrusted repo file is left out, so the built-in or user one is used.
+    pub fn load_gated(
+        dirs: &OverrideDirs,
+        gate: &crate::repo_trust::Gate,
+    ) -> Result<Self, AssetError> {
+        use crate::repo_trust::{ItemKind, agent_fingerprint, skill_fingerprint};
         let manifest_file = EMBEDDED
             .get_file("manifest.json")
             .ok_or_else(|| AssetError::invalid("embedded manifest.json", "missing"))?;
@@ -296,12 +307,16 @@ impl Assets {
             (dirs.repo.as_deref(), Origin::Repo as fn(PathBuf) -> Origin),
         ] {
             let Some(root) = root else { continue };
+            let repo = dirs.repo.as_deref() == Some(root);
             for path in list_dir(&root.join(AGENTS_DIR))? {
                 let Some(id) = md_stem(&path) else { continue };
                 if !path.is_file() {
                     continue;
                 }
                 let text = read_utf8(&path)?;
+                if repo && !gate.allows(ItemKind::Agent, &id, &agent_fingerprint(text.as_bytes())) {
+                    continue;
+                }
                 let label = path.display().to_string();
                 agent_files.insert(id, (text, origin(path), label));
             }
@@ -310,8 +325,20 @@ impl Assets {
                     continue;
                 }
                 let name = file_name(&skill_dir);
-                let files = skill_files.entry(name).or_default();
-                collect_disk(&skill_dir, &skill_dir, origin, files)?;
+                let mut found = BTreeMap::new();
+                collect_disk(&skill_dir, &skill_dir, origin, &mut found)?;
+                if repo
+                    && !gate.allows(
+                        ItemKind::Skill,
+                        &name,
+                        &skill_fingerprint(
+                            found.iter().map(|(k, f)| (k.as_str(), f.bytes.as_slice())),
+                        ),
+                    )
+                {
+                    continue;
+                }
+                skill_files.entry(name).or_default().extend(found);
             }
         }
 
@@ -507,8 +534,16 @@ fn collect_disk(
     Ok(())
 }
 
+/// Every file of a skill directory on disk (the same files [`Assets::load`] takes: dot-names
+/// skipped), by `/`-separated relative path.
+pub(crate) fn read_skill_dir(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, AssetError> {
+    let mut files = BTreeMap::new();
+    collect_disk(dir, dir, Origin::Repo, &mut files)?;
+    Ok(files.into_iter().map(|(k, f)| (k, f.bytes)).collect())
+}
+
 /// Sorted entries of a directory; a missing directory is empty.
-fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, AssetError> {
+pub(crate) fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, AssetError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -545,14 +580,14 @@ fn rel_key(rel: &Path) -> String {
         .join("/")
 }
 
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
 /// `amp-worker-backend` for `.../amp-worker-backend.md`; `None` for anything else.
-fn md_stem(path: &Path) -> Option<String> {
+pub(crate) fn md_stem(path: &Path) -> Option<String> {
     if path.extension()? != "md" {
         return None;
     }

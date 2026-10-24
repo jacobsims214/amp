@@ -358,8 +358,24 @@ receive what the agents send. The chat asks for each one before it starts its MC
 recorded in `~/.local/state/amp-harness/trust.toml` (outside the repo), keyed by repo path, server
 name and a sha256 of the server's table and its `env_file`. If any of those change, you are asked
 again. Headless runs (`run -p` and every worker) never ask: they skip untrusted servers with a
-warning. `--trust-repo-mcp` or `AMP_HARNESS_TRUST_REPO_MCP=1` lets them all start for that process
-(CI), and that is never recorded. Servers in your own config.toml are always trusted.
+warning. `--trust-repo` or `AMP_HARNESS_TRUST_REPO=1` (older names: `--trust-repo-mcp`,
+`AMP_HARNESS_TRUST_REPO_MCP=1`) lets them all start for that process (CI), and that is never
+recorded. Servers in your own config.toml are always trusted. The question shows the whole table
+(`mcp_trust::details`): the full command line, cwd, env and env_file (with the names it sets), the
+full URL (secret-looking literal query values redacted), headers, auth, and every env variable,
+keychain item and OAuth login it reads; trusting records exactly the server shown (#2310).
+
+The repo's agents (`.amp/harness/agents/*.md`), skills (`skills/<name>/`), `[roles.*]` tables and
+`[models] profile` need trust the same way (#2310): until trusted as they are now, they are left
+out (the built-in or your own is used), so a `git pull` can't swap the manager's `permission:`
+block or add `extra_body` to your requests, not even through live reload. The chat asks once per
+item; `amp-harness trust [agent:<id>|skill:<name>|role:<id>|setting:profile|mcp:<name>|--all]`
+and `untrust` do it from the CLI; headless runs warn and leave them out unless `--trust-repo`.
+What you write with `agents|skills|models … --repo` is trusted as written.
+
+`setup --preset` shows every table it will write, every command it makes the machine run (stdio
+MCP servers, `auth_command`) and a diff for each of your tables it would replace, then asks once.
+Without a person it needs `--yes`, and `--force` too if it would replace one of your tables.
 
 A repo server never reaches your own secrets (#2308), trusted or not, override or not:
 - Its keychain items are `mcp:repo:<repo id>:<name>:…` (repo id = 16 hex of sha256 of the

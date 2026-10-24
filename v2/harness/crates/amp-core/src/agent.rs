@@ -133,8 +133,13 @@ pub struct Catalog {
 impl Catalog {
     /// Loads the assets with their user and repo overrides, the roles, and writes the skills
     /// under `<state>/skills/<assets hash>/`.
-    fn load(paths: &amp_mcp::ConfigPaths, state_dir: &Path) -> Result<Self, AgentError> {
-        let assets = Assets::load(&OverrideDirs::from_paths(paths))?;
+    /// Repo agents and skills count only once trusted (#2310): `gate` decides.
+    fn load(
+        paths: &amp_mcp::ConfigPaths,
+        state_dir: &Path,
+        gate: &crate::repo_trust::Gate,
+    ) -> Result<Self, AgentError> {
+        let assets = Assets::load_gated(&OverrideDirs::from_paths(paths), gate)?;
         let roles = RoleRegistry::from_assets(&assets)?;
         let hash = assets.manifest().source_sha256.clone();
         let short = if hash.len() >= 12 { &hash[..12] } else { "dev" };
@@ -189,6 +194,9 @@ pub struct Runtime {
     /// #2245), by role: (`provider/model`, thinking). [`Runtime::reload`] keeps them over what the
     /// files say.
     role_overrides: std::sync::RwLock<BTreeMap<String, RoleOverride>>,
+    /// Repo agents, skills and settings left out because they are not trusted as they are now
+    /// (#2310), as of the last load or reload.
+    repo_untrusted: std::sync::RwLock<Vec<crate::repo_trust::UntrustedItem>>,
 }
 
 /// A role's model set for this process only ([`Runtime::set_role_override`]).
@@ -460,7 +468,14 @@ impl Runtime {
             .ok_or_else(|| {
                 AgentError::Io("no state directory: set HOME or XDG_STATE_HOME".into())
             })?;
-        let catalog = Catalog::load(&paths, &state_dir)?;
+        // #2310: repo agents, skills, [roles.*] and [models] profile count only once trusted.
+        let gate = crate::repo_trust::Gate::load(
+            &paths,
+            Some(&state_dir),
+            crate::mcp_trust::trust_all_from(opts.env),
+        );
+        let catalog = Catalog::load(&paths, &state_dir, &gate)?;
+        let repo_untrusted = crate::repo_trust::untrusted(&crate::repo_trust::scan(&paths), &gate);
         let file = harness_config_from(&models)?;
         let pass_env = pass_env_from(&file);
         let bash_timeout = bash_timeout_from(
@@ -516,7 +531,17 @@ impl Runtime {
             bash_timeout,
             mcp_hub: Arc::new(mcp_hub),
             role_overrides: std::sync::RwLock::new(BTreeMap::new()),
+            repo_untrusted: std::sync::RwLock::new(repo_untrusted),
         })
+    }
+
+    /// The repo agents, skills and settings left out because they are not trusted (#2310), as of
+    /// the last load or reload: the chat and `run -p` say so.
+    pub fn repo_untrusted(&self) -> Vec<crate::repo_trust::UntrustedItem> {
+        self.repo_untrusted
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Records `role`'s model for this process only (#2245), after checking it resolves against
@@ -651,8 +676,16 @@ impl Runtime {
         keys: &(dyn KeyLookup + Sync),
         env: &(dyn Fn(&str) -> Option<String> + Sync),
     ) -> Result<Reloaded, AgentError> {
-        // Read everything first: a failure here leaves the runtime as it was.
-        let catalog = Catalog::load(&self.paths, &self.state_dir)?;
+        // Read everything first: a failure here leaves the runtime as it was. #2310: trust is
+        // re-read too, so a pulled agent, skill or role change waits until it is trusted.
+        let gate = crate::repo_trust::Gate::load(
+            &self.paths,
+            Some(&self.state_dir),
+            crate::mcp_trust::trust_all_from(env),
+        );
+        let catalog = Catalog::load(&self.paths, &self.state_dir, &gate)?;
+        let repo_untrusted =
+            crate::repo_trust::untrusted(&crate::repo_trust::scan(&self.paths), &gate);
         let mut models = ModelsConfig::load_paths(env, &self.paths)?;
         // #2245: a role set for this process in the chat stays set (a model that is gone is
         // dropped from the overrides, and the role falls back to its files).
@@ -711,6 +744,22 @@ impl Runtime {
         }
 
         *self.catalog.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(catalog);
+        {
+            let mut seen = self
+                .repo_untrusted
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            report.untrusted = repo_untrusted
+                .iter()
+                .filter(|u| {
+                    !seen
+                        .iter()
+                        .any(|s| s.item.id() == u.item.id() && s.item.sha256 == u.item.sha256)
+                })
+                .cloned()
+                .collect();
+            *seen = repo_untrusted;
+        }
         self.hide_env(secret_env_names(&models));
         // #2308: repo MCP servers never read the person's credentials.
         self.mcp_hub.protect_env(
@@ -1218,6 +1267,9 @@ pub struct Reloaded {
     /// Roles (that existed before) whose resolved model or thinking changed.
     pub models: Vec<ModelChange>,
     pub mcp: McpReload,
+    /// Repo agents, skills and settings that are new or changed on disk but not trusted as they
+    /// are now (#2310), so this reload left them out. Each is reported once.
+    pub untrusted: Vec<crate::repo_trust::UntrustedItem>,
 }
 
 impl Reloaded {
@@ -1228,6 +1280,7 @@ impl Reloaded {
             && self.providers.is_empty()
             && self.models.is_empty()
             && self.mcp.is_empty()
+            && self.untrusted.is_empty()
     }
 
     /// The change for `role` (an id), if its model changed.
@@ -1274,6 +1327,12 @@ impl Reloaded {
         }
         for p in &self.mcp.problems {
             out.push(format!("mcp problem: {p}"));
+        }
+        for u in &self.untrusted {
+            out.push(
+                u.reason()
+                    .replace("(the chat asks at start)", "then /reload"),
+            );
         }
         out
     }

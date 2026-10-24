@@ -866,6 +866,26 @@ impl McpHub {
         Ok(())
     }
 
+    /// [`Self::trust`], but only if the server in effect now is exactly `shown` (the one the
+    /// person was asked about, #2310, review #2248 finding 15). When a reload replaced it in
+    /// between, nothing changes and this returns `Ok(false)`: the new config was never shown, so
+    /// it stays untrusted (its record, made from `shown`, does not match it either).
+    pub fn trust_as_shown(&self, shown: &McpServer) -> Result<bool, String> {
+        let same = self
+            .inner
+            .config()
+            .servers
+            .get(&shown.name)
+            .is_some_and(|now| {
+                now == shown
+                    && crate::mcp_trust::fingerprint(now) == crate::mcp_trust::fingerprint(shown)
+            });
+        if !same {
+            return Ok(false);
+        }
+        self.trust(&shown.name).map(|()| true)
+    }
+
     /// The configuration in effect (problems included): the one it was built from, or the last
     /// one [`Self::reload`] put in place.
     pub fn config(&self) -> Arc<McpConfig> {

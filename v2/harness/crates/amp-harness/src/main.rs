@@ -44,6 +44,7 @@ mod session;
 mod setup;
 mod skills_cmd;
 mod tickets;
+mod trust_cmd;
 mod whoami;
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
@@ -99,8 +100,12 @@ struct Cli {
     /// agents/, skills/, AGENTS.md and credentials.json (env AMP_HARNESS_CONFIG_DIR).
     #[arg(long, global = true, value_name = "DIR")]
     config_dir: Option<PathBuf>,
-    /// Let every MCP server from this repo's .amp/harness/config.toml start without being trusted
-    /// (CI; env AMP_HARNESS_TRUST_REPO_MCP=1). Nothing is recorded.
+    /// Use everything this repo's .amp/harness/ brings (MCP servers, agents, skills, [roles.*],
+    /// [models] profile) without trusting it first (CI; env AMP_HARNESS_TRUST_REPO=1). Nothing is
+    /// recorded.
+    #[arg(long, global = true)]
+    trust_repo: bool,
+    /// The older name of --trust-repo (#2241); does the same (env AMP_HARNESS_TRUST_REPO_MCP=1).
     #[arg(long, global = true)]
     trust_repo_mcp: bool,
 }
@@ -155,6 +160,12 @@ enum Command {
     /// login, logout, secret, trust; `mcp call`/`mcp tools` call tools (AMP's, or --server NAME).
     #[command(subcommand)]
     Mcp(mcp_cmd::McpCommand),
+    /// What this repo's .amp/harness/ brings (agents, skills, [roles.*], [models] profile, MCP
+    /// servers) and whether you trust each; `trust agent:<id>|skill:<name>|role:<id>|mcp:<name>`
+    /// or `--all` trusts them as they are now (a change asks again).
+    Trust(trust_cmd::TrustArgs),
+    /// Forget trust given to this repo's agents, skills, settings or MCP servers.
+    Untrust(trust_cmd::UntrustArgs),
     /// Debug: render checks (`render-chrome`).
     #[command(subcommand, hide = true)]
     Debug(debug::DebugCommand),
@@ -211,8 +222,8 @@ async fn main() -> ExitCode {
         cli.config_dir.clone(),
         &|k| std::env::var(k).ok(),
     ));
-    // #2241: trust every repo MCP server in this process (never recorded).
-    amp_core::mcp_trust::set_trust_all(cli.trust_repo_mcp);
+    // #2241/#2310: trust everything the repo brings in this process (never recorded).
+    amp_core::mcp_trust::set_trust_all(cli.trust_repo || cli.trust_repo_mcp);
     let result: Result<(), conn::CliError> = match cli.command {
         Some(Command::Version) => {
             println!("amp-harness {LONG_VERSION}");
@@ -225,14 +236,34 @@ async fn main() -> ExitCode {
         Some(Command::Tickets(command)) => tickets::run(command).await,
         Some(Command::Run(args)) => run::run(args).await,
         Some(Command::Config(command)) => config_cmd::run(command).await,
-        Some(Command::Models(command)) => models_cmd::run(command).await,
+        Some(Command::Models(command)) => {
+            // #2310: what the person writes into the repo layer is trusted as written.
+            let writes = trust_cmd::RepoWrites::start();
+            let result = models_cmd::run(command).await;
+            writes.finish(result.is_ok());
+            result
+        }
         Some(Command::Connect(args)) => connect::run(*args).await,
         Some(Command::Disconnect(args)) => connect::disconnect(args).await,
         Some(Command::Init(args)) => setup::init(args).await,
         Some(Command::Server(args)) => server_cmd::run(args).await,
         Some(Command::Mcp(command)) => mcp_cmd::run(command).await,
-        Some(Command::Agents(command)) => agents_cmd::run(command).await,
-        Some(Command::Skills(command)) => skills_cmd::run(command).await,
+        Some(Command::Agents(command)) => {
+            // #2310: what the person writes into the repo layer is trusted as written.
+            let writes = trust_cmd::RepoWrites::start();
+            let result = agents_cmd::run(command).await;
+            writes.finish(result.is_ok());
+            result
+        }
+        Some(Command::Skills(command)) => {
+            // #2310: what the person writes into the repo layer is trusted as written.
+            let writes = trust_cmd::RepoWrites::start();
+            let result = skills_cmd::run(command).await;
+            writes.finish(result.is_ok());
+            result
+        }
+        Some(Command::Trust(args)) => trust_cmd::trust(args),
+        Some(Command::Untrust(args)) => trust_cmd::untrust(args),
         Some(Command::Debug(command)) => debug::run(command).await,
         None => chat::run(cli.chat).await,
     };

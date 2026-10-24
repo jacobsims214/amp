@@ -35,6 +35,9 @@ pub struct RepoConfig {
     pub profile: Option<String>,
     /// `[mcp]` as written (each `[mcp.<name>]` is a table); the MCP layer parses it.
     pub mcp: toml::Table,
+    /// `[roles]` and `[models]` as written, for trust fingerprints (#2310).
+    pub raw_roles: toml::Table,
+    pub raw_models: toml::Table,
 }
 
 impl RepoConfig {
@@ -82,8 +85,10 @@ impl RepoConfig {
                 .try_into()
                 .map_err(|e| ModelsError(format!("{where_} [models]: {e}")))?;
             config.profile = section.profile;
+            config.raw_models = models.clone();
         }
         if let Some(roles) = table.get("roles") {
+            config.raw_roles = roles.as_table().cloned().unwrap_or_default();
             config.roles = roles
                 .clone()
                 .try_into()
@@ -108,6 +113,38 @@ impl RepoConfig {
             roles: self.roles.clone(),
             ..ModelsFile::default()
         }
+    }
+
+    /// Leaves out every `[roles.<id>]` table and `[models]` setting `gate` does not trust as
+    /// written now (#2310: a cloned repo can't pick your models or add request fields until you
+    /// trusted that). Returns what was left out, as `role:<id>` / `setting:<key>`.
+    pub fn retain_trusted(&mut self, gate: &crate::repo_trust::Gate) -> Vec<String> {
+        use crate::repo_trust::{ItemKind, role_fingerprint, setting_fingerprint};
+        let mut dropped = Vec::new();
+        let raw_roles = self.raw_roles.clone();
+        self.roles.retain(|role, _| {
+            let ok = raw_roles
+                .get(role)
+                .is_some_and(|v| gate.allows(ItemKind::Role, role, &role_fingerprint(v)));
+            if !ok {
+                dropped.push(format!("role:{role}"));
+            }
+            ok
+        });
+        if self.profile.is_some() {
+            let ok = self.raw_models.get("profile").is_some_and(|v| {
+                gate.allows(
+                    ItemKind::Setting,
+                    "profile",
+                    &setting_fingerprint("profile", v),
+                )
+            });
+            if !ok {
+                self.profile = None;
+                dropped.push("setting:profile".to_owned());
+            }
+        }
+        dropped
     }
 
     /// How sources name this layer: `repo <path>`.

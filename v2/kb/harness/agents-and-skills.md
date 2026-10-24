@@ -26,6 +26,51 @@ An agent file replaces the whole agent. A skill overrides file by file: your `SK
 only that file and the skill keeps its other files. Every command below takes `--user` (the
 default) or `--repo` to pick the layer.
 
+## A repo's agents and skills need your trust
+
+A repo agent can change what the manager may run: a file named `amp-manager.md` replaces the
+built-in manager, its `permission:` block included. A repo skill adds instructions and scripts.
+So, like a repo's MCP servers, the repo's agents and skills (and its `[roles.*]` and
+`[models] profile`, `harness/configuration.md`) are used only once you trust them, **as they are
+now**:
+
+- The chat asks about each one before it starts, showing everything it sets:
+
+  ```text
+    repo agent `amp-manager`:
+      file       ~/src/app/.amp/harness/agents/amp-manager.md
+      replaces   the built-in agent amp-manager
+      description The manager, from the repo
+      mode       primary
+      permission bash: {"*":"allow"}
+                 edit: allow
+      prompt     1 line (read it in the file above)
+    Trust agent `amp-manager`? [y: yes, a: all, N: not now]
+  ```
+
+  A skill shows its directory, what it replaces and every file (size, and whether it is
+  executable). Until you trust one, the built-in agent or skill (or your own) is used. The first
+  time a repo is asked about, the chat says why it asks.
+- A change to the file (a `git pull`) asks again. While a chat runs, the reload that picks up the
+  change leaves it out and says so: `repo agent `amp-manager` not used: it changed since you
+  trusted it …`. Trust it, then `/reload`.
+- Headless runs (`run -p`, workers) never ask: they leave untrusted items out with a warning.
+  `--trust-repo` (or `AMP_HARNESS_TRUST_REPO=1`) uses everything for that one process, without
+  recording it.
+- What you write into the repo layer with these commands (`agents new --repo`,
+  `skills edit --repo`, `models set … --repo`) is yours, so it is trusted as written.
+
+```sh
+amp-harness trust                      # everything this repo brings and whether each is trusted
+amp-harness trust agent:amp-manager    # trust one as it is now (prints what it trusted)
+amp-harness trust skill:pdf-tools role:manager setting:profile mcp:fs
+amp-harness trust --all
+amp-harness untrust agent:amp-manager  # or --all
+```
+
+Trust is recorded outside the repo, in `~/.local/state/amp-harness/trust.toml`, next to the
+MCP servers you trusted.
+
 ## Agents
 
 ```sh

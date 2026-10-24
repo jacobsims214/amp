@@ -228,7 +228,8 @@ curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/in
 
 The installer installs the binary and runs `amp-harness setup --preset …`. Setup:
 
-1. writes the preset's provider, roles and MCP servers into the person's config.toml;
+1. shows what the preset writes and asks once (below), then writes its provider, roles and MCP
+   servers into the person's config.toml;
 2. saves the preset's AMP server and offers the browser login;
 3. links their folder to a project;
 4. asks for their own key, hidden, and checks it.
@@ -245,6 +246,38 @@ EXAMPLE_API_KEY=… amp-harness setup --preset https://intranet.example.com/amp-
 ```
 
 `--yes` asks nothing and takes keys from the environment. The AMP login comes from `AMP_TOKEN`.
+
+### What people see before anything is written
+
+A preset goes into each person's own config, which is always trusted, so setup shows **exactly
+what it writes** first and asks once:
+
+```text
+The org preset "Example Corp" (https://intranet.example.com/amp-preset.toml) writes this into ~/.config/amp-harness/config.toml:
+  It makes this machine run:
+    npx -y @acme/tools-mcp --root ${repo} (MCP server tools: starts with every chat and run)
+    get-token --tenant 'acme corp' (provider example's auth_command: runs each time a token is needed)
+  adds [providers.example]:
+    [providers.example]
+    …every line of the table…
+  REPLACES your [mcp.docs] (- yours, + the preset's):
+      [mcp.docs]
+      type = "http"
+    - url = "https://docs.mine.example.com/mcp"
+    + url = "https://mcp.example.com/mcp"
+  sets the model of each role: default = example/engineer, manager = example/orchestrator (your [roles.*] model for those roles is replaced)
+Apply it, replacing your [mcp.docs]? [y/N]
+```
+
+- Every table is shown as it will be written, and every command it makes the machine run (stdio
+  MCP servers and a provider's `auth_command`) is listed first.
+- A table the person already has with other contents is never replaced silently: setup shows the
+  diff and asks. A table they already have as the preset has it is left as it is.
+- With no person (no terminal, no `AMP_HARNESS_PROMPTS=stdin`), setup needs `--yes`. If the
+  preset would replace one of their tables, it also needs `--force`; otherwise nothing is
+  written and the diff says why.
+- If config.toml changes between the question and the answer, nothing is written; run setup
+  again.
 
 ## D. Per-repo overrides
 
@@ -271,10 +304,11 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "${repo}"]
 - A repo file may hold only `[roles.*]`, `[models] profile` and `[mcp.*]`. Providers, keys and
   the AMP server stay in each person's own config, so everyone needs the `example` provider
   (from **A**, **B** or **C**) first.
-- Repo roles win over a person's own. `amp-harness models list` shows `repo …` in its SOURCE
-  column for them.
-- Each person is asked to trust the repo's MCP servers before they start
-  (`harness/mcp-servers.md`).
+- Repo roles, once trusted, win over a person's own. `amp-harness models list` shows `repo …` in
+  its SOURCE column for them.
+- Each person is asked to trust the repo's MCP servers, agents, skills and `[roles.*]` before
+  they are used (`harness/mcp-servers.md`, `harness/agents-and-skills.md`). Until then their own
+  settings win. `--trust-repo` uses them all on a build machine.
 - Agents and skills for the repo go in `.amp/harness/agents/` and `skills/`, written with
   `--repo` (`harness/agents-and-skills.md`).
 

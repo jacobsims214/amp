@@ -793,6 +793,139 @@ async fn a_preset_from_a_url_and_bad_presets() {
     assert_nothing_left_the_machine(&guard);
 }
 
+/// #2310 (review #2248 finding 5): a preset shows exactly what it writes (every table, every
+/// command it makes this machine run) before it writes anything, asks once (and needs --yes
+/// without a person), and never silently replaces a table the person has: it shows the diff, asks,
+/// and with --yes needs --force.
+#[tokio::test]
+async fn a_preset_shows_what_it_writes_and_never_silently_replaces() {
+    let guard = spawn_proxy_guard().await;
+    let endpoint = example_endpoint(None).await;
+    let dir = workdir("enterprise-preset-review", None);
+    let env = Env::new(&dir, &guard);
+    let mine = "[mcp.docs]\ntype = \"http\"\nurl = \"https://docs.mine.example.com/mcp\"\n";
+    write_config(&dir, mine);
+    let preset = format!(
+        "[preset]\nname = \"Review\"\n[providers.example]\nbase_url = \"{}\"\nauth = \"none\"\n\
+         models = [\"engineer\"]\n\
+         [mcp.docs]\ntype = \"http\"\nurl = \"https://mcp.example.com/mcp\"\n\
+         [mcp.tools]\ncommand = \"npx\"\nargs = [\"-y\", \"@acme/tools-mcp\", \"--root\", \"${{repo}}\"]\n",
+        endpoint.url
+    );
+    let file = dir.join("preset.toml");
+    std::fs::write(&file, &preset).unwrap();
+    let file = file.to_str().unwrap();
+
+    let shows_everything = |err: &str| {
+        assert!(err.contains("writes this into"), "{err}");
+        assert!(err.contains("It makes this machine run:"), "{err}");
+        assert!(
+            err.contains("npx -y @acme/tools-mcp --root ${repo} (MCP server tools"),
+            "{err}"
+        );
+        assert!(err.contains("adds [providers.example]:"), "{err}");
+        assert!(err.contains("adds [mcp.tools]:"), "{err}");
+        assert!(
+            err.contains("REPLACES your [mcp.docs] (- yours, + the preset's):"),
+            "{err}"
+        );
+        assert!(
+            err.contains("- url = \"https://docs.mine.example.com/mcp\""),
+            "{err}"
+        );
+        assert!(
+            err.contains("+ url = \"https://mcp.example.com/mcp\""),
+            "{err}"
+        );
+    };
+
+    // No person and no --yes: shown, nothing written.
+    let out = env
+        .run(&["setup", "--preset", file, "--no-project"], None)
+        .await;
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    shows_everything(&out.stderr);
+    assert!(out.stderr.contains("or pass --yes"), "{}", out.stderr);
+    assert_eq!(config(&dir), mine);
+
+    // --yes, but it would replace the person's table: refused without --force.
+    let out = env
+        .run(&["setup", "--preset", file, "--yes", "--no-project"], None)
+        .await;
+    assert_eq!(out.code, 2, "{}", out.stderr);
+    shows_everything(&out.stderr);
+    assert!(
+        out.stderr.contains("would replace your [mcp.docs]") && out.stderr.contains("--force"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(config(&dir), mine);
+
+    // A person says no: nothing written.
+    let scripted = Env::new(&dir, &guard).var("AMP_HARNESS_PROMPTS", "stdin");
+    let out = scripted
+        .run(&["setup", "--preset", file, "--no-project"], Some("n\n"))
+        .await;
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    shows_everything(&out.stderr);
+    assert!(
+        out.stderr
+            .contains("Apply it, replacing your [mcp.docs]? [y/N]"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("was not applied"), "{}", out.stderr);
+    assert_eq!(config(&dir), mine);
+
+    // --yes --force: replaced, as shown.
+    let amp = spawn(MockAmp::new(), None).await;
+    let out = env
+        .run(
+            &[
+                "setup",
+                "--preset",
+                file,
+                "--yes",
+                "--force",
+                "--url",
+                &amp.url,
+                "--no-project",
+                "--json",
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    let text = config(&dir);
+    assert!(text.contains("https://mcp.example.com/mcp"), "{text}");
+    assert!(!text.contains("docs.mine.example.com"), "{text}");
+    assert!(text.contains("[mcp.tools]"), "{text}");
+
+    // The same preset again: nothing differs, so --yes alone is enough.
+    let out = env
+        .run(
+            &[
+                "setup",
+                "--preset",
+                file,
+                "--yes",
+                "--url",
+                &amp.url,
+                "--no-project",
+            ],
+            None,
+        )
+        .await;
+    assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(
+        out.stderr
+            .contains("[mcp.docs]: you already have it as the preset has it"),
+        "{}",
+        out.stderr
+    );
+    assert_nothing_left_the_machine(&guard);
+}
+
 /// The guard is real: with the shipped roster and an OpenRouter key, doctor's catalog check goes
 /// to openrouter.ai, and the guard records it (so the assertions above can fail).
 #[tokio::test]
