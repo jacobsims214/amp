@@ -1755,6 +1755,35 @@ pub struct McpConfig {
     pub problems: Vec<McpProblem>,
     /// Names whose winning table had errors (for `mcp list`: shown as failed).
     pub broken: BTreeSet<String>,
+    /// Repo tables left out because one of the person's own servers has the same name (#2308).
+    /// Each is also a warning in `problems`; [`Shadowed::warning`] is the line every place that
+    /// lists repo servers shows (#2331).
+    pub shadowed: Vec<Shadowed>,
+}
+
+/// A repo `[mcp.<name>]` ignored because the person's own config defines `<name>` too: theirs
+/// runs, the repo's never starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shadowed {
+    pub name: String,
+    /// The repo's `.amp/harness/config.toml`.
+    pub repo_file: PathBuf,
+    /// The person's own config.toml.
+    pub user_file: PathBuf,
+}
+
+impl Shadowed {
+    /// One line naming both files and the fix (rename it in the repo).
+    pub fn warning(&self) -> String {
+        let name = &self.name;
+        format!(
+            "repo MCP server `{name}` ({}) is ignored: your own `{name}` ({}) has the same name, \
+             so yours runs and the repo's never starts. Fix: rename it in the repo's file (e.g. \
+             [mcp.{name}-repo]) to use both.",
+            self.repo_file.display(),
+            self.user_file.display()
+        )
+    }
 }
 
 impl McpConfig {
@@ -1900,6 +1929,13 @@ impl McpConfig {
         if let Some((_, file)) = repo {
             for name in shadowed {
                 repo_servers.remove(&name);
+                if let Some((_, user_file)) = user {
+                    config.shadowed.push(Shadowed {
+                        name: name.clone(),
+                        repo_file: file.to_path_buf(),
+                        user_file: user_file.to_path_buf(),
+                    });
+                }
                 config.problems.push(
                     McpProblem::warning(
                         file,
@@ -1945,6 +1981,11 @@ impl McpConfig {
     /// The enabled servers.
     pub fn enabled(&self) -> impl Iterator<Item = &McpServer> {
         self.servers.values().filter(|s| s.enabled)
+    }
+
+    /// [`Shadowed::warning`] for each repo server left out for one of the person's own (#2331).
+    pub fn shadow_warnings(&self) -> Vec<String> {
+        self.shadowed.iter().map(Shadowed::warning).collect()
     }
 
     /// The errors (servers left out).
@@ -2350,6 +2391,12 @@ env = { API_TOKEN = "${env:API_TOKEN}", LOG_LEVEL = "debug", EMPTY_TOKEN = "" }
         assert_eq!(shadow.severity, Severity::Warning);
         assert_eq!(shadow.file, Path::new(REPO));
         assert!(shadow.message.contains("yours is used"), "{shadow}");
+        // #2331: and once in `shadowed`, naming both files and the fix.
+        assert_eq!(c.shadowed.len(), 1, "{:?}", c.shadowed);
+        let w = c.shadow_warnings().remove(0);
+        assert!(w.contains("repo MCP server `a`"), "{w}");
+        assert!(w.contains(REPO) && w.contains(USER), "{w}");
+        assert!(w.contains("rename it in the repo's file"), "{w}");
         // User-only servers stay.
         assert_eq!(c.servers["b"].origin.layer, Layer::User);
         // A user switch turns a repo server off, or back on.
