@@ -395,6 +395,10 @@ export interface Me {
   teams?: { id: number; name: string; org_id: number; role: string }[]
   kind?: UserKind
   via_token?: boolean
+  /** Feature flags for this caller. Absent on older APIs (treat as unavailable). */
+  capabilities?: {
+    remote_control?: { available: boolean; org_ids?: number[]; reason?: string | null }
+  }
 }
 
 export type UserKind = 'human' | 'agent'

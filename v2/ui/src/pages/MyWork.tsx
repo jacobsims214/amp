@@ -18,6 +18,8 @@ import { BandLoader } from '../components/brand/BandLoader'
 import { ExpiringArtifacts } from '../components/artifacts/ExpiringArtifacts'
 import { UserRound } from 'lucide-react'
 import { isHuman, reasonLabel } from '../lib/human'
+import { MySessionsPanel } from '../components/remote/MySessionsPanel'
+import { remoteAvailable, useRemote } from '../remote/remote-context'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const NEXT_UP: DisplayState[] = ['prog', 'flag', 'ready', 'wait', 'sched', 'done']
@@ -53,6 +55,7 @@ function Velocity({ days }: { days: VelocityDay[] }) {
 
 export function MyWork() {
   const { me } = useAuth()
+  const remote = useRemote()
   const navigate = useNavigate()
   const [work, setWork] = useState<MyWorkData | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -169,6 +172,7 @@ export function MyWork() {
             </div>
 
             <div className="grid grid-cols-1 gap-4 min-w-0">
+              {remoteAvailable(me, remote) && <MySessionsPanel />}
               <Panel label="My agents" title="On station" right={<Link to="/access" className="underline underline-offset-2 hover:text-ink">manage</Link>}>
                 {flying.map(t => (
                   <Link key={t.id} to={ticketLink(t)} className="grid grid-cols-[auto_1fr_auto] gap-x-2.5 gap-y-0.5 items-center px-4 py-2.5 border-t border-line first:border-t-0 hover:bg-surface-2">

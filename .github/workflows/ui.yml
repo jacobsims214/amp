@@ -1,18 +1,21 @@
 name: UI
 
-# Lint (eslint) and production build (tsc -b && vite build) for the web UI in v2/ui, on every PR
-# touching it and on pushes to main and the milestone integration branches (harness-m*, remote-m*).
-# v2/ui has no unit-test script yet; when one is added, add an `npm test` step here.
+# Lint (eslint), unit/component tests (vitest) and production build (tsc -b && vite build) for the
+# web UI in v2/ui, on every PR touching it and on pushes to main and the milestone integration
+# branches (harness-m*, remote-m*). The remote-control tests read the shared protocol vectors in
+# v2/testdata/remote-control, so changes there run this workflow too.
 
 on:
   pull_request:
     paths:
       - "v2/ui/**"
+      - "v2/testdata/remote-control/**"
       - ".github/workflows/ui.yml"
   push:
     branches: [main, "harness-m*", "remote-m*"]
     paths:
       - "v2/ui/**"
+      - "v2/testdata/remote-control/**"
       - ".github/workflows/ui.yml"
   # manual run, e.g. to confirm a milestone branch head is green when no path filter fired
   workflow_dispatch:
@@ -40,5 +43,7 @@ jobs:
       - run: npm ci --no-audit --no-fund
       - name: lint
         run: npm run lint
+      - name: test
+        run: npm test
       - name: build
         run: npm run build
