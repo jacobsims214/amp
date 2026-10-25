@@ -23,6 +23,13 @@ import (
 
 // RegisterBrowser registers the browser leg on the REST mux.
 func (rl *Relay) RegisterBrowser(mux *http.ServeMux) {
+	m := rl.browserMux()
+	mux.Handle("/api/sessions", m)
+	mux.Handle("/api/sessions/", m)
+}
+
+// browserMux routes the browser leg.
+func (rl *Relay) browserMux() *http.ServeMux {
 	m := http.NewServeMux()
 	m.HandleFunc("GET /api/sessions", rl.ui(rl.listSessions))
 	m.HandleFunc("POST /api/sessions/revoke-all", rl.ui(rl.revokeAll))
@@ -34,14 +41,13 @@ func (rl *Relay) RegisterBrowser(mux *http.ServeMux) {
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(404, domain.RemoteCodeNotFound, "not found"))
 	})
-	mux.Handle("/api/sessions", m)
-	mux.Handle("/api/sessions/", m)
+	return m
 }
 
 // ui requires a person in the web UI (protocol 8.1).
 func (rl *Relay) ui(h func(http.ResponseWriter, *http.Request, authz.Principal)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		p, err := authz.FromContext(r.Context())
+		p, err := principalOf(r)
 		switch {
 		case err != nil:
 			writeErr(w, err)
@@ -108,10 +114,7 @@ func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, na
 		names[sess.ProjectID] = proj.Name
 		project = map[string]any{"id": sess.ProjectID, "name": proj.Name}
 	}
-	online, viewers := false, 0
-	if live := rl.reg.Get(sess.ID); live != nil {
-		online, viewers = live.Online(rl.cfg.Now(), rl.cfg.OfflineAfter), live.Viewers()
-	}
+	online, viewers := rl.presence(ctx, sess)
 	v := map[string]any{
 		"session_id": sess.ID, "harness_id": sess.HarnessID, "harness_fp_display": FingerprintDisplay(sess.HarnessPub),
 		"host": sess.Host, "os": sess.OS, "harness_version": sess.HarnessVersion, "project": project,
@@ -223,6 +226,9 @@ func (rl *Relay) eventStream(w http.ResponseWriter, r *http.Request, p authz.Pri
 		if !hasStart || e.seq >= start {
 			initial = append(initial, frame{id: e.seq, event: "envelope", data: e.data})
 		}
+	}
+	if hasStart && start > live.acceptedThrough {
+		st.want = start // still ahead of the buffer: a gap can only show on the next event
 	}
 	live.viewers[st] = struct{}{}
 	live.tellHarnessViewers()
@@ -513,13 +519,7 @@ func (rl *Relay) revokeAll(w http.ResponseWriter, r *http.Request, p authz.Princ
 		return
 	}
 	for i := range list {
-		if live := rl.reg.Get(list[i].ID); live != nil {
-			live.mu.Lock()
-			if live.harness != nil {
-				live.harness.send(frame{event: "device_revoked", data: []byte(`{"all":true}`)})
-			}
-			live.mu.Unlock()
-		}
+		rl.deviceRevoked(ctx, &list[i]) // on the replica holding it
 	}
 	ended, devices, err := rl.svc.RevokeAllRemote(ctx, p)
 	if err != nil {

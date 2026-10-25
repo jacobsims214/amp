@@ -619,8 +619,11 @@ func TestRemote_SessionAndDeviceStore(t *testing.T) {
 	if l, _ := repo.ListRemoteDevices(ctx, w.alice.User.ID, ""); len(l) != 0 {
 		t.Fatalf("devices after revoke: %+v", l)
 	}
-	if _, err := repo.RemoteSessionByConnectToken(ctx, "hash-"+sess.ID); err == nil {
-		t.Fatal("an ended session's connect token still resolves")
+	// The ended session's token hash is kept so every replica answers 410
+	// with the reason (#2377); the session it resolves to has ended.
+	if got, err := repo.RemoteSessionByConnectToken(ctx, "hash-"+sess.ID); err != nil || got.Active() ||
+		got.EndReason == nil || *got.EndReason != domain.RemoteEndRevoked {
+		t.Fatalf("an ended session's connect token: %+v %v", got, err)
 	}
 	if ok, _ := repo.TouchRemoteHeartbeat(ctx, sess.ID); ok {
 		t.Fatal("heartbeat on an ended session")

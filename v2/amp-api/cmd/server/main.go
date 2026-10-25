@@ -149,6 +149,9 @@ func main() {
 	defer stopCluster()
 	var node *cluster.Node
 	var internalServer *http.Server
+	// internalMux is the internal listener's: project actors, plus the
+	// remote control relay's forwarded requests once it is set up (6a).
+	var internalMux *http.ServeMux
 	if os.Getenv("CLUSTER_MODE") != "off" {
 		internalAddr := envOrDefault("CLUSTER_ADDR", ":3003")
 		advertise := os.Getenv("CLUSTER_ADVERTISE_ADDR")
@@ -164,7 +167,9 @@ func main() {
 		registry.EnableCluster(node)
 		go node.Run(clusterCtx)
 		go cluster.NewRelay(repo, sseHub, node.ID()).Run(clusterCtx)
-		internalServer = &http.Server{Addr: internalAddr, Handler: registry.InternalHandler()}
+		internalMux = http.NewServeMux()
+		internalMux.Handle("/", registry.InternalHandler())
+		internalServer = &http.Server{Addr: internalAddr, Handler: internalMux}
 		go func() {
 			slog.Info("replica listener up", "addr", internalAddr, "advertised", advertise, "node", node.ID())
 			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -352,12 +357,16 @@ func main() {
 	// is not: register and token refresh take the harness's OAuth token
 	// through the MCP-audience verifier (as /mcp does), and the rest take
 	// the session's connect token.
-	relayNode := ""
+	// With replicas, every request for a session is served on the replica
+	// holding it, over the internal listener (internal/relay/cluster.go).
+	relayCfg := relay.Config{AppURL: appPublicURL()}
 	if node != nil {
-		relayNode = node.ID()
+		relayCfg.Cluster = node
 	}
-	relayHandler, rl := setupRelay(remoteCfg, restHandler, mux, mcpVerifier.Middleware,
-		relay.Config{AppURL: appPublicURL(), Node: relayNode})
+	relayHandler, rl := setupRelay(remoteCfg, restHandler, mux, mcpVerifier.Middleware, relayCfg)
+	if rl != nil && internalMux != nil {
+		internalMux.Handle("/internal/relay/", rl.InternalHandler())
+	}
 	if rl != nil {
 		go rl.Run(ctx)
 		slog.Info("remote control relay enabled", "app_url", appPublicURL())

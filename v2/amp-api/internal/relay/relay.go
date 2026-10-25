@@ -14,8 +14,8 @@
 // never in Postgres, logs or audit rows (which hold metadata only, D3).
 //
 // The store, the org policy and the audit trail are in service/remote.go
-// (#2371). M1 runs one replica; Registry and Forwarder are the seams for
-// multi-replica forwarding (#2377).
+// (#2371). With several replicas, a session is served on the one holding it
+// (cluster.go, #2377).
 package relay
 
 import (
@@ -48,7 +48,15 @@ type Config struct {
 	// session_url and the only Origin the browser leg accepts.
 	AppURL string
 	// Node is this replica's api_nodes id (empty with CLUSTER_MODE=off).
+	// Defaults to Cluster.ID().
 	Node string
+	// Cluster is this replica's membership; nil with CLUSTER_MODE=off (one
+	// replica). With it, every request for a session is served on the
+	// replica holding the session (cluster.go).
+	Cluster Cluster
+	// RouteTimeout bounds how long a request waits for a session's holder
+	// to answer or be replaced (20 s: longer than the cluster TTL).
+	RouteTimeout time.Duration
 	// Keepalive is the SSE comment interval on both streams (20 s).
 	Keepalive time.Duration
 	// OfflineAfter marks the harness offline without a heartbeat (60 s).
@@ -90,25 +98,26 @@ func (c *Config) defaults() {
 	if c.Registry == nil {
 		c.Registry = NewLocalRegistry()
 	}
+	if c.RouteTimeout <= 0 {
+		c.RouteTimeout = 20 * time.Second
+	}
+	if c.Cluster != nil && c.Node == "" {
+		c.Node = c.Cluster.ID()
+	}
 	c.AppURL = strings.TrimSuffix(c.AppURL, "/")
 }
 
 // Relay serves both legs.
 type Relay struct {
-	svc   *service.Service
-	repo  *repository.Repo
-	cfg   Config
-	reg   Registry
-	oauth func(http.Handler) http.Handler
+	svc    *service.Service
+	repo   *repository.Repo
+	cfg    Config
+	reg    Registry
+	oauth  func(http.Handler) http.Handler
+	client *http.Client // calls to other replicas
 
-	mu         sync.Mutex
-	registers  map[int]*bucket      // per user: 10 registrations a minute
-	tombstones map[string]tombstone // connect-token hash -> the ended session
-}
-
-type tombstone struct {
-	reason string
-	until  time.Time
+	mu        sync.Mutex
+	registers map[int]*bucket // per user: 10 registration attempts a minute here
 }
 
 // New builds the relay on svc (whose Remote config must have the instance
@@ -120,7 +129,10 @@ func New(svc *service.Service, oauth func(http.Handler) http.Handler, cfg Config
 	cfg.defaults()
 	rl := &Relay{
 		svc: svc, repo: svc.Repo, cfg: cfg, reg: cfg.Registry, oauth: oauth,
-		registers: map[int]*bucket{}, tombstones: map[string]tombstone{},
+		client: newInternalClient(), registers: map[int]*bucket{},
+	}
+	if cfg.Cluster != nil && cfg.Forwarder == nil {
+		rl.cfg.Forwarder = &clusterForwarder{rl: rl, client: rl.client}
 	}
 	prev := svc.OnRemoteEnded
 	svc.OnRemoteEnded = func(ended []domain.RemoteSession) {
@@ -135,28 +147,33 @@ func New(svc *service.Service, oauth func(http.Handler) http.Handler, cfg Config
 // Registry is the relay's session registry.
 func (rl *Relay) Registry() Registry { return rl.reg }
 
-// sessionsEnded closes the streams of sessions that just ended.
+// sessionsEnded closes the streams of sessions that just ended: here, and on
+// the replica holding each one when that's another.
 func (rl *Relay) sessionsEnded(ended []domain.RemoteSession) {
+	elsewhere := map[string][]endNote{}
 	for i := range ended {
 		reason := domain.RemoteEndHarnessEnded
 		if ended[i].EndReason != nil {
 			reason = *ended[i].EndReason
 		}
-		live := rl.reg.Remove(ended[i].ID)
-		if live == nil {
-			continue
+		rl.endHere(ended[i].ID, reason)
+		if h := ended[i].HolderNode; rl.cfg.Cluster != nil && h != nil && *h != "" && *h != rl.cfg.Node {
+			elsewhere[*h] = append(elsewhere[*h], endNote{ID: ended[i].ID, Reason: reason})
 		}
-		live.mu.Lock()
-		hashes := live.tokenHashes
-		live.mu.Unlock()
-		rl.mu.Lock()
-		for _, h := range hashes {
-			rl.tombstones[h] = tombstone{reason: reason, until: rl.cfg.Now().Add(rl.cfg.TokenTTL)}
-		}
-		rl.mu.Unlock()
-		live.end(reason)
-		slog.Info("remote session ended", "session", ended[i].ID, "reason", reason)
 	}
+	for node, notes := range elsewhere {
+		rl.tellEnded(node, notes)
+	}
+}
+
+// endHere closes the streams of a session held here, if it is.
+func (rl *Relay) endHere(id, reason string) {
+	live := rl.reg.Remove(id)
+	if live == nil {
+		return
+	}
+	live.end(reason)
+	slog.Info("remote session ended", "session", id, "reason", reason)
 }
 
 // Run sweeps presence and buffers, and ends sessions past their idle limit
@@ -186,6 +203,7 @@ func (rl *Relay) ExpireNow(ctx context.Context) {
 }
 
 func (rl *Relay) sweep() {
+	rl.reconcile()
 	now := rl.cfg.Now()
 	for _, l := range rl.reg.All() {
 		l.mu.Lock()
@@ -193,13 +211,6 @@ func (rl *Relay) sweep() {
 		l.evict(now)
 		l.mu.Unlock()
 	}
-	rl.mu.Lock()
-	for h, ts := range rl.tombstones {
-		if now.After(ts.until) {
-			delete(rl.tombstones, h)
-		}
-	}
-	rl.mu.Unlock()
 }
 
 // ---- connect tokens ----
@@ -211,7 +222,7 @@ func hashToken(tok string) string {
 
 // mintToken issues a new connect token for sess (protocol 8.2) and returns it
 // with its expiry. Only its hash is stored.
-func (rl *Relay) mintToken(ctx context.Context, sess *domain.RemoteSession, live *Live) (string, time.Time, error) {
+func (rl *Relay) mintToken(ctx context.Context, sess *domain.RemoteSession) (string, time.Time, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", time.Time{}, err
@@ -220,14 +231,6 @@ func (rl *Relay) mintToken(ctx context.Context, sess *domain.RemoteSession, live
 	exp := rl.cfg.Now().Add(rl.cfg.TokenTTL)
 	if err := rl.repo.SetRemoteConnectToken(ctx, sess.ID, hashToken(tok), exp); err != nil {
 		return "", time.Time{}, err
-	}
-	if live != nil {
-		live.mu.Lock()
-		live.tokenHashes = append(live.tokenHashes, hashToken(tok))
-		if len(live.tokenHashes) > 4 {
-			live.tokenHashes = live.tokenHashes[len(live.tokenHashes)-4:]
-		}
-		live.mu.Unlock()
 	}
 	return tok, exp, nil
 }

@@ -117,12 +117,20 @@ func (rl *Relay) register(w http.ResponseWriter, r *http.Request) {
 	rl.mu.Lock()
 	b := rl.registers[p.UserID]
 	if b == nil {
-		b = newBucket(10, 10)
+		b = newBucket(registrationsPerMin, registrationsPerMin)
 		rl.registers[p.UserID] = b
 	}
 	ok, wait := b.take(now)
 	rl.mu.Unlock()
 	if !ok {
+		writeErr(w, errf(429, "rate_limited", "too many registrations; wait a minute").with("retry_after_s", retryAfter(wait)))
+		return
+	}
+	// The same limit across replicas: sessions started in the last minute.
+	if n, wait, err := rl.repo.RecentRemoteRegistrations(ctx, p.UserID, time.Minute); err != nil {
+		writeErr(w, err)
+		return
+	} else if n >= registrationsPerMin {
 		writeErr(w, errf(429, "rate_limited", "too many registrations; wait a minute").with("retry_after_s", retryAfter(wait)))
 		return
 	}
@@ -135,8 +143,8 @@ func (rl *Relay) register(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	live := rl.reg.Ensure(sess)
-	tok, exp, err := rl.mintToken(ctx, sess, live)
+	rl.reg.Ensure(sess)
+	tok, exp, err := rl.mintToken(ctx, sess)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -190,7 +198,7 @@ func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(403, domain.RemoteCodeDisabled, "remote control is off for this project's org"))
 		return
 	}
-	tok, exp, err := rl.mintToken(ctx, sess, rl.reg.Get(sess.ID))
+	tok, exp, err := rl.mintToken(ctx, sess)
 	if err != nil {
 		writeErr(w, serviceErr(sess, err))
 		return
@@ -200,9 +208,14 @@ func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 
 // ---- connect-token calls ----
 
+// registrationsPerMin limits a person's registrations (protocol 10).
+const registrationsPerMin = 10
+
 // withToken authenticates a harness call by the session's connect token. The
-// token is bound to one session; an ended session is 410 (while this replica
-// remembers it), an expired token 401 token_expired.
+// token is bound to one session; an ended session is 410 with its reason (the
+// database keeps the ended session's token hash, so every replica knows), an
+// expired token 401 token_expired. The call is then served on the replica
+// holding the session.
 func (rl *Relay) withToken(h func(http.ResponseWriter, *http.Request, *domain.RemoteSession)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		hdr := r.Header.Get("Authorization")
@@ -214,13 +227,6 @@ func (rl *Relay) withToken(h func(http.ResponseWriter, *http.Request, *domain.Re
 		hash := hashToken(tok)
 		sess, err := rl.repo.RemoteSessionByConnectToken(r.Context(), hash)
 		if errors.Is(err, repository.ErrNotFound) {
-			rl.mu.Lock()
-			ts, ended := rl.tombstones[hash]
-			rl.mu.Unlock()
-			if ended {
-				writeErr(w, errf(410, domain.RemoteCodeSessionEnded, "remote session has ended").with("reason", ts.reason))
-				return
-			}
 			writeErr(w, errf(401, "unauthenticated", "unknown connect token"))
 			return
 		}
@@ -235,6 +241,7 @@ func (rl *Relay) withToken(h func(http.ResponseWriter, *http.Request, *domain.Re
 			writeErr(w, sessionEnded(sess))
 		case sess.ConnectTokenExpiresAt != nil && !rl.cfg.Now().Before(*sess.ConnectTokenExpiresAt):
 			writeErr(w, errf(401, "token_expired", "the connect token has expired; refresh it"))
+		case rl.cfg.Forwarder != nil && rl.cfg.Forwarder.Forward(w, r, sess):
 		default:
 			h(w, r, sess)
 		}
@@ -373,7 +380,15 @@ func (rl *Relay) publish(w http.ResponseWriter, r *http.Request, sess *domain.Re
 			return
 		}
 		// A replica with no state for the session (a fresh session, or one
-		// taken over after a failover) accepts the first seq it sees.
+		// taken over after a failover) accepts the first seq it sees; a
+		// viewer waiting to resume from an earlier seq is told of the gap.
+		if acc == 0 {
+			for v := range live.viewers {
+				if v.want > 0 && v.want < env.Seq {
+					v.send(relayFrame(map[string]any{"type": "gap", "requested_seq": v.want, "oldest_seq": env.Seq}))
+				}
+			}
+		}
 		live.acceptedThrough = env.Seq
 		live.ring = append(live.ring, bufferedEvent{seq: env.Seq, data: data, at: now})
 		live.ringBytes += len(data)
