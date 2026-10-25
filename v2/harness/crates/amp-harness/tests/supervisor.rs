@@ -27,6 +27,7 @@ use amp_core::{
         ManagerContext, RunRequest, RunTicketError, Supervisor, SupervisorConfig, WorkerHooks,
         WorkerInfo, WorkerOutcome, WorkerReport, live_tickets,
     },
+    workspace::{Isolation, Placement},
 };
 use amp_mcp::{AmpMcpClient, ClientOptions};
 use common::{MockAmp, Running, spawn};
@@ -449,6 +450,9 @@ async fn at_most_max_parallel_workers_run_at_once() {
     let sup = f.supervisor(
         SupervisorConfig {
             max_parallel: 2,
+            // #2364: a folder each (no worktrees to make); `worktree: false` would make editing
+            // workers take turns in the manager's folder.
+            isolation: Isolation::Folder,
             ..config()
         },
         Arc::clone(&hooks),
@@ -460,14 +464,8 @@ async fn at_most_max_parallel_workers_run_at_once() {
     for id in 101..=105 {
         let sup = Arc::clone(&sup);
         set.spawn(async move {
-            sup.run_ticket(
-                RunRequest {
-                    worktree: Some(false),
-                    ..req(id, "amp:amp-worker-backend")
-                },
-                CancellationToken::new(),
-            )
-            .await
+            sup.run_ticket(req(id, "amp:amp-worker-backend"), CancellationToken::new())
+                .await
         });
     }
     let mut outcomes = Vec::new();
@@ -781,9 +779,11 @@ async fn workers_run_in_place_without_a_usable_repository_and_say_why() {
         )
     };
 
-    // Untracked by the parent repository: not a worktree of the parent.
+    // Untracked by the parent repository: not a worktree of the parent, a folder of its own
+    // (#2364: `auto` outside a usable repository).
     let r = run(11).await.unwrap();
-    assert_eq!(r.cwd, child, "{r:?}");
+    assert_eq!(r.cwd, child.join("amp-work/11"), "{r:?}");
+    assert_eq!(r.workspace, Placement::Folder, "{r:?}");
     assert!(r.worktree.is_none(), "{r:?}");
     assert!(!f.repo.join(".worktrees/11").exists());
     assert!(
@@ -791,14 +791,14 @@ async fn workers_run_in_place_without_a_usable_repository_and_say_why() {
             "{} is inside the git repository {} but none of its files are in it",
             child.display(),
             f.repo.display()
-        )) && n.contains("run `git init` in")),
+        )) && n.contains("run `git init` and commit once in")),
         "{r:?}"
     );
 
     // Its own repository, no commit yet.
     git(&child, &["init", "-q", "-b", "main"]);
     let r = run(12).await.unwrap();
-    assert_eq!(r.cwd, child, "{r:?}");
+    assert_eq!(r.cwd, child.join("amp-work/12"), "{r:?}");
     assert!(r.worktree.is_none(), "{r:?}");
     assert!(
         r.notes
@@ -817,4 +817,175 @@ async fn workers_run_in_place_without_a_usable_repository_and_say_why() {
         Some(child.join(".worktrees/13").as_path())
     );
     assert!(r.notes.is_empty(), "{r:?}");
+}
+
+/// The ticket a worker works, from its prompt ("You are working AMP ticket #N").
+fn ticket_of(ctx: &Context) -> String {
+    let all = serde_json::to_string(&ctx.messages).unwrap();
+    let at = all.find("AMP ticket #").expect("a worker prompt") + "AMP ticket #".len();
+    all[at..].chars().take_while(char::is_ascii_digit).collect()
+}
+
+/// #2364: a worker step for a shared queue that writes `out.md` (relative to its working
+/// directory) naming its ticket, waits a moment so the other worker overlaps, then completes.
+/// Every system prompt and first prompt it saw is kept in `seen`.
+fn write_then_done(seen: Arc<Mutex<Vec<String>>>) -> FauxStep {
+    FauxStep::factory(move |ctx: &Context| {
+        let ticket = ticket_of(ctx);
+        if has_tool_result(ctx) {
+            faux_assistant_message(vec![FauxBlock::text("done")], StopReason::Stop)
+        } else {
+            seen.lock().unwrap().push(format!(
+                "{}\n{}",
+                ctx.system_prompt.clone().unwrap_or_default(),
+                serde_json::to_string(&ctx.messages).unwrap()
+            ));
+            faux_assistant_message(
+                vec![
+                    FauxBlock::tool_call(
+                        "write",
+                        json!({"path": "out.md", "content": format!("ticket {ticket}\n")}),
+                    ),
+                    FauxBlock::tool_call("bash", json!({"command": "sleep 1"})),
+                ],
+                StopReason::ToolUse,
+            )
+        }
+    })
+}
+
+/// #2364: `isolation = "folder"` (what `auto` gives outside a usable git repository): two
+/// workers that edit files run at once, each in its own folder `amp-work/<ticket>/`, so the same
+/// relative file never collides, and neither is told to commit; the manager is told not to plan
+/// git steps. `shared` instead runs editing workers one at a time in the manager's folder.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outside_git_worktrees_parallel_workers_get_their_own_folders_and_no_git_steps() {
+    let f = fixture("folders").await;
+    let hooks = Arc::new(Recorder::default());
+    let sup = f.supervisor(
+        SupervisorConfig {
+            isolation: Isolation::Folder,
+            ..config()
+        },
+        Arc::clone(&hooks),
+    );
+    let ctx = sup.workspace_context();
+    assert!(
+        ctx.starts_with("workers_workspace: isolation = folder"),
+        "{ctx}"
+    );
+    assert!(ctx.contains("don't plan those steps"), "{ctx}");
+    assert!(sup.workspace_banner().is_some());
+    let desc = sup.tool().tool.schema().description.clone();
+    assert!(desc.contains("a folder amp-work/<task_id>/"), "{desc}");
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    f.script(
+        "wf",
+        (0..4).map(|_| write_then_done(Arc::clone(&seen))).collect(),
+    );
+    let none = CancellationToken::new();
+    let (a, b) = tokio::join!(
+        sup.run_ticket(req(21, "amp:amp-worker-backend"), none.clone()),
+        sup.run_ticket(req(22, "amp:amp-worker-backend"), none.clone()),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(sup.peak_running(), 2, "they ran at the same time");
+    for (r, id) in [(&a, 21), (&b, 22)] {
+        let folder = f.repo.join(format!("amp-work/{id}"));
+        assert_eq!(r.cwd, folder, "{r:?}");
+        assert_eq!(r.workspace, Placement::Folder);
+        assert!(r.worktree.is_none() && r.branch.is_none(), "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("out.md")).unwrap(),
+            format!("ticket {id}\n"),
+            "each worker's file is its own"
+        );
+    }
+    assert!(!f.repo.join("out.md").exists());
+    assert!(!f.repo.join(".worktrees").exists());
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    for prompt in &seen {
+        assert!(prompt.contains("workspace: folder "), "{prompt}");
+        assert!(
+            prompt.contains("don't commit, branch, push or open a pull request"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("commit your work"), "{prompt}");
+    }
+
+    // Shared: the manager's folder, editing workers one at a time.
+    let hooks = Arc::new(Recorder::default());
+    let sup = f.supervisor(
+        SupervisorConfig {
+            isolation: Isolation::Shared,
+            ..config()
+        },
+        Arc::clone(&hooks),
+    );
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    f.script(
+        "wf",
+        (0..4).map(|_| write_then_done(Arc::clone(&seen))).collect(),
+    );
+    let (a, b) = tokio::join!(
+        sup.run_ticket(req(23, "amp:amp-worker-backend"), none.clone()),
+        sup.run_ticket(req(24, "amp:amp-worker-backend"), none.clone()),
+    );
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_eq!(sup.peak_running(), 1, "editing workers took turns");
+    for r in [&a, &b] {
+        assert_eq!(r.cwd, f.repo, "{r:?}");
+        assert_eq!(r.workspace, Placement::Shared);
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .all(|p| p.contains("workspace: shared ") && p.contains("git: not yours here")),
+        "{seen:?}"
+    );
+}
+
+/// #2364: `isolation = "worktree"` refuses a folder without a usable repository before anything
+/// happens in AMP, and says how to fix it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worktree_isolation_refuses_a_folder_without_a_usable_repository() {
+    let f = fixture("strict").await;
+    let hooks = Arc::new(Recorder::default());
+    let child = f.repo.join("untracked");
+    std::fs::create_dir_all(&child).unwrap();
+    let sup = Supervisor::with_hooks(
+        Arc::clone(&f.rt),
+        ManagerContext {
+            role: "amp-manager".into(),
+            cwd: child.clone(),
+            project: f.manager().project,
+        },
+        SupervisorConfig {
+            isolation: Isolation::Worktree,
+            ..config()
+        },
+        Some(Arc::clone(&hooks) as Arc<dyn WorkerHooks>),
+    );
+    let e = sup
+        .run_ticket(req(31, "amp:amp-worker-backend"), CancellationToken::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, RunTicketError::Workspace(_)), "{e}");
+    let text = e.to_string();
+    assert!(
+        text.contains("isolation = \"worktree\" needs a git repository"),
+        "{text}"
+    );
+    assert!(text.contains("nothing was dispatched"), "{text}");
+    assert!(f.dispatched().is_empty());
+    assert!(!child.join("amp-work").exists());
+    // A read-only role still runs (it needs no place of its own).
+    f.script("wf", vec![template("Read it.", json!([]))]);
+    let r = sup
+        .run_ticket(req(32, "researcher"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.cwd, child);
 }

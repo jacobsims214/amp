@@ -252,8 +252,13 @@ them to your user if they matter, but don't offer to start them.
 Run at most 4 workers at once, and start the next as one finishes (the harness caps it at 4;
 extra calls wait for a free slot). Wide fan-outs (10+ workers in one turn) are where sessions
 hang, and when they do every ticket in flight is orphaned at once. `amp_run_ticket` gives each
-worker its own `git worktree` inside the repo, at `.worktrees/<ticket>`, so parallel workers'
-branches don't collide (add `.worktrees/` to `.gitignore`).
+worker that edits files its own place, so parallel workers never write over each other: in a
+git repository its own `git worktree` at `.worktrees/<ticket>` on branch `amp-<ticket>` (add
+`.worktrees/` to `.gitignore`); outside git, its own folder `amp-work/<ticket>/`. The
+`workers_workspace:` line in your AMP context block says which applies here. Not all work is
+engineering: when it says workers don't commit (business or ops work in a plain folder), plan
+no commit, branch, pull-request or merge steps and no review-and-merge tickets; a person
+reviewing the deliverable (the doc, the email draft) is the gate instead.
 
 Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
 runs the worker in the foreground and returns its final message when it finishes. Don't call

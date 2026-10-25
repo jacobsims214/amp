@@ -14,6 +14,9 @@
 //! - `mcp`, `mcp:<server>`: see [`mcp`] (#2246): each MCP server's health, trust, auth and which
 //!   roles may use it.
 //! - `skills`, `agents`, `config-check`: see [`config`] (#2246).
+//! - `workspace` (#2364): where workers work in this folder: git worktrees, or (not a git
+//!   repository) a folder each under `amp-work/`. Not an error; a warning only when
+//!   `[workers] isolation = "worktree"` can't work here.
 //!
 //! Every warn/fail carries a `fix`: the exact thing to run or change. Never prints a secret: auth
 //! and provider keys are described by their source (`static token (env AMP_TOKEN)`, `env
@@ -219,7 +222,7 @@ pub enum CheckStatus {
 pub struct Check {
     /// One of: config, credentials, ca, connect, versions, tools, contract, whoami, project, roles,
     /// fallback, `key:<provider>`, `models:<provider>`, mcp, `mcp:<server>`, skills, agents,
-    /// config-check.
+    /// config-check, workspace.
     pub name: String,
     pub status: CheckStatus,
     pub detail: String,
@@ -354,6 +357,10 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
     for (name, finding) in findings {
         checks.push(&name, finding);
     }
+    checks.push(
+        "workspace",
+        workspace_finding(&env, paths.user_file.clone(), &ctx.cwd),
+    );
 
     Report {
         ok: checks.0.iter().all(|c| c.status != CheckStatus::Fail),
@@ -371,6 +378,37 @@ async fn diagnose(conn: &ConnArgs, offline: bool) -> Report {
         agents,
         skills,
         checks: checks.0,
+    }
+}
+
+/// #2364: where workers work here, in one line. A folder outside git is fine (each worker gets
+/// its own folder), so it is `ok`; only `isolation = "worktree"` without a usable repo warns.
+fn workspace_finding(
+    env: &dyn Fn(&str) -> Option<String>,
+    user_file: Option<std::path::PathBuf>,
+    cwd: &std::path::Path,
+) -> Finding {
+    use amp_core::workspace::{self, Repo};
+    let isolation = match amp_core::supervisor::SupervisorConfig::load(env, user_file) {
+        Ok(c) => c.isolation,
+        // config-check reports the bad value; say where workers would go by default.
+        Err(_) => workspace::Isolation::Auto,
+    };
+    let repo = Repo::probe(cwd);
+    match workspace::placement(isolation, &repo, cwd, false) {
+        Ok(_) => Finding::new(
+            CheckStatus::Ok,
+            format!(
+                "isolation {}: {}",
+                isolation.as_str(),
+                workspace::summary(isolation, cwd, &repo)
+            ),
+        ),
+        Err(e) => Finding::new(CheckStatus::Warn, e).fix(format!(
+            "{} in {}, or set [workers] isolation = \"auto\" in config.toml",
+            repo.fix(),
+            cwd.display()
+        )),
     }
 }
 

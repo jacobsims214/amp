@@ -1013,7 +1013,7 @@ async fn a_new_folder_under_a_linked_repo_is_asked_about_and_gets_its_own_marker
             "Created #77 New Thing",
             &format!("({})", child.join(".amp.json").display()),
             &format!("The parent folder's {parent_shown} (#45) is unchanged."),
-            "is not a git repository of its own, so workers will work in this folder directly",
+            "is not a git repository of its own, so workers will work in this folder, each in its own folder amp-work/<ticket>/",
             "Run `git init` there and commit once",
         ],
     );
@@ -1058,7 +1058,7 @@ async fn a_child_repo_under_a_linked_folder_is_asked_and_enter_links_the_parents
             "Using #45 Harness play (HP) and linked this folder",
             "(#45) is unchanged.",
             // No commit yet: workers can't branch from it.
-            "has no commit yet, so workers will work in this folder directly",
+            "has no commit yet, so workers will work in this folder, each in its own folder amp-work/<ticket>/",
             "Commit once there to give them their own worktrees.",
         ],
     );

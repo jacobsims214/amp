@@ -84,6 +84,7 @@ read when the chat starts: restart the chat for those.
 max_parallel = 4          # workers at once (AMP_HARNESS_MAX_WORKERS)
 timeout_minutes = 60      # per worker (AMP_HARNESS_WORKER_TIMEOUT_SECS, in seconds)
 max_turns = 400           # model turns per worker, 0 = no limit (AMP_HARNESS_WORKER_MAX_TURNS)
+isolation = "auto"        # auto | worktree | folder | shared (AMP_HARNESS_WORKER_ISOLATION); harness/git-and-the-harness.md
 
 [tools]
 bash_timeout_secs = 600   # default bash timeout (AMP_HARNESS_BASH_TIMEOUT_SECS; 0 = none)

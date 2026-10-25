@@ -1519,7 +1519,9 @@ fn amp_context(
             }
             lines.push(format!("project_marker: {}", p.path.display()));
             // #2356: a parent folder's marker. "Set up a new project here" is not a plan in it.
-            if p.in_parent_of(cwd) {
+            // Only the manager is asked that; a worker in its own folder (`amp-work/<ticket>`,
+            // #2364) or worktree is always below the marker.
+            if role.primary && p.in_parent_of(cwd) {
                 lines.push(format!(
                     "project_marker_note: this .amp.json is in a parent folder ({}), not in the \
                      working directory. If your user asks to set up a new project for this \
@@ -1931,6 +1933,16 @@ mod tests {
         assert!(note.contains("parent folder (/repo)"), "{note}");
         assert!(note.contains("`amp-harness init` here"), "{note}");
         assert!(note.contains("don't create or plan it in #2"), "{note}");
+        // #2364: a worker in its own folder below the marker isn't told that.
+        let worker = roles.get("amp-worker-docs").unwrap();
+        let text = amp_context(
+            worker,
+            &compose,
+            Some(&marker),
+            Path::new("/repo/amp-work/7"),
+            None,
+        );
+        assert!(!text.contains("project_marker_note"), "{text}");
         let text = amp_context(manager, &session("u", None), None, Path::new("/r"), None);
         assert!(text.contains("project_id: none"), "{text}");
     }

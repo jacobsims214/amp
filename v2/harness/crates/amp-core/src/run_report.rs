@@ -199,6 +199,28 @@ pub fn fill_missing(args: &Value, fields: &Map<String, Value>) -> Option<Value> 
     changed.then_some(Value::Object(out))
 }
 
+/// The git run fields a worker without a worktree may not set (#2364): `branch`, `commit` and
+/// `pushed` (they come only from a worktree), and a `pr_url` that isn't a URL. `None` when there
+/// is nothing to drop.
+pub fn drop_git_fields(args: &Value) -> Option<Value> {
+    let Value::Object(map) = args else {
+        return None;
+    };
+    let mut out = map.clone();
+    let mut changed = false;
+    for k in ["branch", "commit", "pushed"] {
+        changed |= out.remove(k).is_some();
+    }
+    if out
+        .get("pr_url")
+        .is_some_and(|u| !u.as_str().is_some_and(|u| u.starts_with("http")))
+    {
+        out.remove("pr_url");
+        changed = true;
+    }
+    changed.then_some(Value::Object(out))
+}
+
 /// `"abandoned: <outcome>[: <error>]"` on one line, cut to [`NOTE_MAX_CHARS`].
 pub fn abandoned_note(report: &WorkerReport) -> String {
     let outcome = report.outcome.as_str();
@@ -287,6 +309,9 @@ impl WorkerHooks for RunReporter {
         let task_id = worker.task_id;
         let model = worker.model.clone();
         let worktree = worker.worktree.clone();
+        // #2364: no git of its own: no repository at all, or its own folder (`amp-work/<id>`).
+        let no_git = worktree.is_none()
+            && (!worker.git || worker.workspace == crate::workspace::Placement::Folder);
         let totals = Arc::clone(&worker.totals);
         Some(Arc::new(
             move |ctx: BeforeToolCallContext<'_>, _signal: CancellationToken| -> HookFuture {
@@ -307,12 +332,18 @@ impl WorkerHooks for RunReporter {
                         None => None,
                     };
                     let fields = run_fields(&model, &totals, git.as_ref());
-                    fill_missing(&args, &fields).map(|args| BeforeToolCallResult {
-                        block: false,
-                        reason: None,
-                        terminate: false,
-                        args: Some(args),
-                    })
+                    // #2364: a worker with no git of its own has no git fields; drop whatever
+                    // it made up (a real run passed branch "__OMIT__").
+                    let stripped = no_git.then(|| drop_git_fields(&args)).flatten();
+                    let base = stripped.clone().unwrap_or(args);
+                    fill_missing(&base, &fields)
+                        .or(stripped)
+                        .map(|args| BeforeToolCallResult {
+                            block: false,
+                            reason: None,
+                            terminate: false,
+                            args: Some(args),
+                        })
                 })
             },
         ))
@@ -529,6 +560,18 @@ mod tests {
         assert_eq!(fill_missing(&json!([1]), &fields), None);
     }
 
+    #[test]
+    fn a_worker_without_a_worktree_sends_no_git_fields() {
+        let args = json!({"task_id": 7, "branch": "__OMIT__", "commit": "", "pushed": false,
+                          "pr_url": "none", "model": "m"});
+        assert_eq!(
+            drop_git_fields(&args),
+            Some(json!({"task_id": 7, "model": "m"}))
+        );
+        let pr = json!({"task_id": 7, "pr_url": "https://x/pr/1"});
+        assert_eq!(drop_git_fields(&pr), None);
+    }
+
     fn report(outcome: WorkerOutcome, error: Option<&str>) -> WorkerReport {
         WorkerReport {
             task_id: 7,
@@ -541,6 +584,7 @@ mod tests {
             cwd: PathBuf::from("."),
             worktree: None,
             branch: None,
+            workspace: crate::workspace::Placement::Shared,
             session_file: None,
             turns: 0,
             tool_calls: 0,

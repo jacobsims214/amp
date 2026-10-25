@@ -971,7 +971,7 @@ fn link_dir(plan: &Plan, found: Option<&ProjectMarker>) -> PathBuf {
 
 /// The note for a folder just linked whose workers can't get worktrees (#2356): it is in no git
 /// repository, is a folder another repository doesn't track, or its repository has no commit.
-/// Workers then run in it directly (see the supervisor).
+/// Workers then each get a folder `amp-work/<ticket>/` in it (#2364, see amp_core::workspace).
 fn no_repo_note(dir: &Path) -> Option<String> {
     let root = repo_root(dir).filter(|root| canon(root) == canon(dir) || has_tracked_files(dir));
     let lead = match root {
@@ -987,8 +987,9 @@ fn no_repo_note(dir: &Path) -> Option<String> {
         "Run `git init` there and commit once"
     };
     Some(format!(
-        "Note: {lead}, so workers will work in this folder directly instead of each on its own \
-         branch. {fix} to give them their own worktrees."
+        "Note: {lead}, so workers will work in this folder, each in its own folder amp-work/<ticket>/, \
+         instead of each on its own git branch (fine for work that isn't code). {fix} to give \
+         them their own worktrees."
     ))
 }
 

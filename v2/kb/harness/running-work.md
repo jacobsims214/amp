@@ -122,11 +122,12 @@ It builds the same session as the chat and exits 0 when the run completes.
 When the manager dispatches a ticket (its `amp_run_ticket` tool), the harness:
 
 1. waits for a free worker slot, then marks the ticket dispatched in AMP;
-2. for roles that edit files, creates a git worktree `<repo>/.worktrees/<ticket>` on branch
-   `amp-<ticket>` (read-only roles work in your folder). When your folder is in no git
-   repository, is a new folder that another repository doesn't track, or is a repository with no
-   commit yet, the worker works in your folder directly and its report says why; `git init` and
-   one commit give workers their own worktrees;
+2. gives a role that edits files a place of its own (read-only roles work in your folder): in a
+   git repository with a commit, a git worktree `<repo>/.worktrees/<ticket>` on branch
+   `amp-<ticket>`; anywhere else (no git repository, a new folder another repository doesn't
+   track, a repository with no commit yet), a folder `amp-work/<ticket>/`, and the worker is told
+   not to commit or open pull requests. `[workers] isolation` changes this; see
+   `harness/git-and-the-harness.md`;
 3. runs the worker on its role's model until it finishes, times out or uses up its turns;
 4. **reports the run to the ticket by itself**: model, tokens, cost, branch, commit. A worker
    that stops without closing its ticket is recorded as abandoned, with the reason.
@@ -142,10 +143,11 @@ time limit.
 max_parallel = 4          # workers at once; extra dispatches wait for a slot
 timeout_minutes = 60      # wall clock per worker
 max_turns = 400           # model turns per worker; 0 = no limit
+isolation = "auto"        # auto | worktree | folder | shared (harness/git-and-the-harness.md)
 ```
 
 The environment variables `AMP_HARNESS_MAX_WORKERS`, `AMP_HARNESS_WORKER_TIMEOUT_SECS` (in
-seconds) and `AMP_HARNESS_WORKER_MAX_TURNS` win over the file. A model that keeps repeating the
+seconds) and `AMP_HARNESS_WORKER_MAX_TURNS` and `AMP_HARNESS_WORKER_ISOLATION` win over the file. A model that keeps repeating the
 same tool call is stopped after the fifth time, in the chat and in workers.
 
 ## Approvals
