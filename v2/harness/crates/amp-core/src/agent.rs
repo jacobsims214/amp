@@ -182,6 +182,9 @@ pub struct Runtime {
     /// [`Runtime::with_secret_env`]) the `--token-env` variable, minus `pass_env`. Names only;
     /// values are never held here. A reload only adds names ([`Runtime::secret_env`]).
     secret_env: std::sync::RwLock<BTreeSet<String>>,
+    /// Moves whenever the secrets the runtime knows may have changed ([`Runtime::reload_models`],
+    /// new secret variable names): the remote link reads its redaction sources again (#2391).
+    secrets_generation: std::sync::atomic::AtomicU64,
     /// `[secrets] pass_to_bash` in config.toml: secrets passed to bash on purpose.
     pub pass_env: BTreeSet<String>,
     /// The bash tool's default timeout in seconds, when the model passes none (#2143). `None`:
@@ -533,6 +536,7 @@ impl Runtime {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             secret_env: std::sync::RwLock::new(secret_env),
+            secrets_generation: std::sync::atomic::AtomicU64::new(0),
             pass_env,
             bash_timeout,
             mcp_hub: Arc::new(mcp_hub),
@@ -617,7 +621,21 @@ impl Runtime {
         if set.len() != before {
             self.mcp_hub
                 .set_strip(crate::mcp_stdio::strip_set(&set, &self.pass_env));
+            self.bump_secrets();
         }
+    }
+
+    fn bump_secrets(&self) {
+        self.secrets_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A counter that moves whenever the secrets this runtime knows may have changed: a provider
+    /// connected or a config reloaded ([`Runtime::reload_models`]), a new secret variable name.
+    /// The remote link reads its redaction sources again when it moves (#2391, M5).
+    pub fn secrets_generation(&self) -> u64 {
+        self.secrets_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The variables removed from bash calls now (names only).
@@ -657,6 +675,7 @@ impl Runtime {
         let providers = self.current_providers().rebuild(&models, keys);
         *self.reloaded.write().unwrap_or_else(|e| e.into_inner()) =
             Some((models, providers.clone()));
+        self.bump_secrets();
         providers
     }
 

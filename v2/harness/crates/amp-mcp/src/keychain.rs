@@ -200,6 +200,20 @@ pub fn keychain_forget(service: &str, account: &str) {
     KEYCHAIN.forget(service, account);
 }
 
+/// The secrets this process already holds from the keychain under `service` for accounts that
+/// start with `prefix` (`mcp:` for every MCP server's `secret_env`, `secret_headers` and OAuth
+/// client secret): what earlier reads and writes put in the cache. Never reads the keychain, so
+/// it can't raise a dialog. For the remote link's redaction (#2391, M4). Never log these.
+pub fn keychain_cached_secrets(service: &str, prefix: &str) -> Vec<String> {
+    KEYCHAIN.cached_secrets(service, prefix)
+}
+
+/// A counter that moves whenever the cache takes a new secret (a read that found one, a write),
+/// so a holder of [`keychain_cached_secrets`] knows when to ask again.
+pub fn keychain_generation() -> u64 {
+    KEYCHAIN.generation()
+}
+
 /// How many real keychain reads this process made for one item (tests, diagnostics).
 pub fn keychain_reads(service: &str, account: &str) -> u64 {
     KEYCHAIN.reads(service, account)
@@ -244,6 +258,8 @@ trait Backend: Send + Sync {
 struct State {
     cache: HashMap<Key, Cached>,
     reads: HashMap<Key, u64>,
+    /// Moves on every secret the cache takes ([`keychain_generation`]).
+    generation: u64,
 }
 
 struct Keychain<B> {
@@ -276,7 +292,10 @@ impl<B: Backend> Keychain<B> {
                 let result = self.backend.get(service, account);
                 trace("read", service, account, &outcome(&result));
                 let cached = match result {
-                    Ok(Some(secret)) => Cached::Found(secret),
+                    Ok(Some(secret)) => {
+                        state.generation += 1;
+                        Cached::Found(secret)
+                    }
                     Ok(None) => Cached::Missing,
                     Err(e) => Cached::Failed(e),
                 };
@@ -303,6 +322,7 @@ impl<B: Backend> Keychain<B> {
         let key = (service.to_owned(), account.to_owned());
         match &result {
             Ok(()) => {
+                state.generation += 1;
                 state.cache.insert(key, Cached::Found(secret.to_owned()));
             }
             // What is in the keychain now is unknown: ask again next time.
@@ -338,6 +358,22 @@ impl<B: Backend> Keychain<B> {
         self.lock()
             .cache
             .remove(&(service.to_owned(), account.to_owned()));
+    }
+
+    fn cached_secrets(&self, service: &str, prefix: &str) -> Vec<String> {
+        self.lock()
+            .cache
+            .iter()
+            .filter(|((s, a), _)| s == service && a.starts_with(prefix))
+            .filter_map(|(_, c)| match c {
+                Cached::Found(secret) => Some(secret.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn generation(&self) -> u64 {
+        self.lock().generation
     }
 
     fn reads(&self, service: &str, account: &str) -> u64 {
@@ -648,6 +684,57 @@ mod tests {
             assert_eq!(err.kind, KeychainErrorKind::Denied);
         }
         assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn cached_mcp_secrets_are_listed_without_reading() {
+        let fake = Fake::default();
+        {
+            let mut items = fake.items.lock().unwrap();
+            items.insert(
+                ("s".into(), "mcp:brave:env:BRAVE_API_KEY".into()),
+                "v1".into(),
+            );
+            items.insert(
+                ("s".into(), "mcp:never-read:header:x-key".into()),
+                "v2".into(),
+            );
+            items.insert(("s".into(), "provider:openrouter".into()), "v3".into());
+            items.insert(
+                ("t".into(), "mcp:brave:env:BRAVE_API_KEY".into()),
+                "v4".into(),
+            );
+        }
+        let kc = Keychain::new(fake.clone());
+        let g0 = kc.generation();
+        assert_eq!(
+            kc.get("s", "mcp:brave:env:BRAVE_API_KEY")
+                .unwrap()
+                .as_deref(),
+            Some("v1")
+        );
+        assert_eq!(kc.get("s", "mcp:missing:env:X").unwrap(), None);
+        assert_eq!(
+            kc.get("s", "provider:openrouter").unwrap().as_deref(),
+            Some("v3")
+        );
+        assert_eq!(
+            kc.get("t", "mcp:brave:env:BRAVE_API_KEY")
+                .unwrap()
+                .as_deref(),
+            Some("v4")
+        );
+        let g1 = kc.generation();
+        assert!(g1 > g0, "a found secret moves the generation");
+        let calls = fake.calls.load(Ordering::SeqCst);
+        // Only what was read under this service and prefix; an item never read stays unread.
+        assert_eq!(kc.cached_secrets("s", "mcp:"), vec!["v1".to_owned()]);
+        assert_eq!(fake.calls.load(Ordering::SeqCst), calls, "no keychain call");
+        kc.set("s", "mcp:other:header:x-api-key", "v5").unwrap();
+        assert!(kc.generation() > g1, "a write moves the generation");
+        let mut got = kc.cached_secrets("s", "mcp:");
+        got.sort();
+        assert_eq!(got, vec!["v1".to_owned(), "v5".to_owned()]);
     }
 
     #[test]

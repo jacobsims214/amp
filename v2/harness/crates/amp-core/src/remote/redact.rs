@@ -10,8 +10,13 @@
 //!   `Bearer …` values, PEM private keys), whether or not the harness knows the value.
 //!
 //! The replacement is [`REDACTED`]. A secret split across two streamed deltas is caught by
-//! [`DeltaGuard`], which holds back a trailing token-like word until the next delta of the same
+//! [`DeltaGuard`], which holds back a trailing token-like word, and any tail that could be the
+//! start of a known value whatever its characters (#2391, L1), until the next delta of the same
 //! message (or a flush) completes it; a field the feed cut short loses its last partial word.
+//!
+//! The known values come from sources ([`Redactor::add_source`]) that are read again whenever the
+//! epoch ([`Redactor::set_epoch`]) moves: a key stored with `/connect`, an MCP secret read or
+//! changed, a `/reload` (#2391, M5).
 
 use std::sync::{Arc, RwLock};
 
@@ -48,6 +53,9 @@ pub fn is_secret_env_name(name: &str) -> bool {
 /// A source of known secret values, read when the link starts and again on demand.
 pub type SecretSource = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
 
+/// A cheap counter that moves whenever a source may have new values ([`Redactor::set_epoch`]).
+pub type SecretEpoch = Arc<dyn Fn() -> u64 + Send + Sync>;
+
 fn patterns() -> &'static [Regex] {
     static PATTERNS: std::sync::OnceLock<Vec<Regex>> = std::sync::OnceLock::new();
     PATTERNS.get_or_init(|| {
@@ -83,6 +91,8 @@ fn bearer() -> &'static Regex {
 pub struct Redactor {
     values: Arc<RwLock<Vec<String>>>,
     sources: Arc<RwLock<Vec<SecretSource>>>,
+    /// The epoch and the value it had when the sources were last read.
+    epoch: Arc<RwLock<Option<(SecretEpoch, u64)>>>,
 }
 
 impl std::fmt::Debug for Redactor {
@@ -133,6 +143,40 @@ impl Redactor {
         );
     }
 
+    /// Reads the sources again whenever `epoch` moves (checked before each redaction), so a key
+    /// stored with `/connect`, an MCP secret, or a `/reload` after the link started is redacted
+    /// too (#2391, M5).
+    pub fn set_epoch(&self, epoch: SecretEpoch) {
+        let now = epoch();
+        *self.epoch.write().unwrap_or_else(|e| e.into_inner()) = Some((epoch, now));
+    }
+
+    /// [`Redactor::refresh`] if the epoch moved since the sources were last read.
+    fn refresh_if_moved(&self) {
+        let moved = {
+            let guard = self.epoch.read().unwrap_or_else(|e| e.into_inner());
+            match &*guard {
+                Some((epoch, seen)) => {
+                    let now = epoch();
+                    (now != *seen).then_some(now)
+                }
+                None => None,
+            }
+        };
+        let Some(now) = moved else {
+            return;
+        };
+        if let Some((_, seen)) = self
+            .epoch
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            *seen = now;
+        }
+        self.refresh();
+    }
+
     /// Reads every source again (keys added with `/connect` since).
     pub fn refresh(&self) {
         let sources = self
@@ -147,6 +191,7 @@ impl Redactor {
 
     /// `text` with every known value and token shape replaced.
     pub fn redact(&self, text: &str) -> String {
+        self.refresh_if_moved();
         let mut out = text.to_owned();
         {
             let values = self.values.read().unwrap_or_else(|e| e.into_inner());
@@ -169,6 +214,45 @@ impl Redactor {
                 .into_owned();
         }
         out
+    }
+
+    /// Where a streamed `text` can be cut so that no known value is split (#2391, L1): at most
+    /// `cut`, never inside a whole known value, and never after the start of a tail that is the
+    /// beginning of one (the rest may come in the next delta). Any characters, not only
+    /// token-like ones. Always a char boundary.
+    pub fn safe_cut(&self, text: &str, cut: usize) -> usize {
+        self.refresh_if_moved();
+        let values = self.values.read().unwrap_or_else(|e| e.into_inner());
+        let bytes = text.as_bytes();
+        let mut cut = cut.min(text.len());
+        // A tail that a known value starts with.
+        for v in values.iter() {
+            let vb = v.as_bytes();
+            let from = text.len().saturating_sub(vb.len() - 1);
+            if let Some(i) = (from..text.len())
+                .find(|&i| text.is_char_boundary(i) && vb.starts_with(&bytes[i..]))
+            {
+                cut = cut.min(i);
+            }
+        }
+        // A whole value across the cut (moving the cut back may put another one across it).
+        loop {
+            let before = cut;
+            for v in values.iter() {
+                for (i, _) in text.match_indices(v.as_str()) {
+                    if i < cut && cut < i + v.len() {
+                        cut = i;
+                    }
+                }
+            }
+            if cut == before {
+                break;
+            }
+        }
+        while !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        cut
     }
 
     /// Redacts every string (keys too) of `value` in place.
@@ -233,13 +317,15 @@ pub struct DeltaGuard {
 
 impl DeltaGuard {
     /// The text to send now for a delta of `message_id`: what was held for it plus `delta`,
-    /// without its trailing word (held until the next delta or a flush). Anything held for
-    /// another message comes back in `flushed` first.
+    /// without its trailing word or any tail that could start one of `redactor`'s known values
+    /// (held until the next delta or a flush). Anything held for another message comes back in
+    /// `flushed` first.
     pub fn push(
         &mut self,
         message_id: &str,
         thinking: bool,
         delta: &str,
+        redactor: &Redactor,
     ) -> (Option<(String, bool, String)>, String) {
         let mut flushed = None;
         let mut text = String::new();
@@ -250,7 +336,7 @@ impl DeltaGuard {
         }
         text.push_str(delta);
         self.since = Some(std::time::Instant::now());
-        let cut = trailing_word_start(&text);
+        let cut = redactor.safe_cut(&text, trailing_word_start(&text));
         // A whole delta of one word (no boundary yet) is held, up to a bound.
         if cut == 0 && text.len() < 8 * 1024 {
             self.held = Some((message_id.to_owned(), thinking, text));
@@ -320,11 +406,135 @@ mod tests {
         let r = Redactor::new();
         r.add_values(["supersecretvalue42"]);
         let mut g = DeltaGuard::default();
-        let (_, a) = g.push("m1", false, "the key is supersec");
-        let (_, b) = g.push("m1", false, "retvalue42 ok ");
+        let (_, a) = g.push("m1", false, "the key is supersec", &r);
+        let (_, b) = g.push("m1", false, "retvalue42 ok ", &r);
         let c = g.flush().map(|x| x.2).unwrap_or_default();
         let sent = format!("{}{}{}", r.redact(&a), r.redact(&b), r.redact(&c));
         assert_eq!(sent, "the key is [redacted] ok ");
         assert!(!a.contains("supersec"));
+    }
+
+    /// A tiny deterministic PRNG (xorshift64*), so the property test needs no extra crate and
+    /// a failure is reproducible from its seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn pick(&mut self, from: &[char]) -> char {
+            from[self.below(from.len())]
+        }
+    }
+
+    /// L1: a known value made of any characters (`@`, `:`, `!`, spaces, non-ASCII), split
+    /// across deltas at random points, never leaves whole or in pieces that rejoin.
+    #[test]
+    fn a_known_value_split_at_random_points_never_leaks() {
+        let secret_chars: Vec<char> = "abcXYZ019@:!#$%&*()[]{}<>?,;'\" |^`é€ -_./+=~"
+            .chars()
+            .collect();
+        let text_chars: Vec<char> = "abc xyz@:!.,\n é€".chars().collect();
+        for seed in 1..=3000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let len = MIN_SECRET_LEN + rng.below(24);
+            let mut secret: String = (0..len).map(|_| rng.pick(&secret_chars)).collect();
+            // A value is trimmed when added; keep its ends non-blank so it is used as written.
+            secret = format!("p{}w", secret.trim());
+            let r = Redactor::new();
+            r.add_values([secret.as_str()]);
+            let around = |rng: &mut Rng| -> String {
+                (0..rng.below(20)).map(|_| rng.pick(&text_chars)).collect()
+            };
+            let mut stream = around(&mut rng);
+            for _ in 0..1 + rng.below(3) {
+                stream.push_str(&secret);
+                stream.push_str(&around(&mut rng));
+            }
+            // Random split points (on char boundaries), 1-6 deltas.
+            let bounds: Vec<usize> = stream.char_indices().map(|(i, _)| i).collect();
+            let mut cuts: Vec<usize> = (0..rng.below(6))
+                .map(|_| bounds[rng.below(bounds.len())])
+                .collect();
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut deltas = Vec::new();
+            let mut at = 0;
+            for c in cuts.into_iter().chain([stream.len()]) {
+                if c > at {
+                    deltas.push(&stream[at..c]);
+                    at = c;
+                }
+            }
+            let mut g = DeltaGuard::default();
+            let mut sent = String::new();
+            for d in &deltas {
+                let (flushed, now) = g.push("m1", false, d, &r);
+                assert!(flushed.is_none());
+                sent.push_str(&r.redact(&now));
+            }
+            if let Some((_, _, rest)) = g.flush() {
+                sent.push_str(&r.redact(&rest));
+            }
+            assert!(
+                !sent.contains(&secret),
+                "seed {seed}: {secret:?} leaked from {deltas:?} as {sent:?}"
+            );
+            assert_eq!(
+                sent,
+                r.redact(&stream),
+                "seed {seed}: the deltas sent differ from the whole text redacted"
+            );
+        }
+    }
+
+    #[test]
+    fn split_at_a_colon_or_at_sign_is_held() {
+        let r = Redactor::new();
+        r.add_values(["p@ss:w0rd!xyz123"]);
+        let mut g = DeltaGuard::default();
+        let (_, a) = g.push("m1", false, "login p@", &r);
+        let (_, b) = g.push("m1", false, "ss:", &r);
+        let (_, c) = g.push("m1", false, "w0rd!xyz123 done.", &r);
+        let rest = g.flush().map(|x| x.2).unwrap_or_default();
+        let sent = format!(
+            "{}{}{}{}",
+            r.redact(&a),
+            r.redact(&b),
+            r.redact(&c),
+            r.redact(&rest)
+        );
+        assert_eq!(sent, "login [redacted] done.");
+    }
+
+    #[test]
+    fn sources_are_read_again_when_the_epoch_moves() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let keys = Arc::new(RwLock::new(vec!["first-secret-value".to_owned()]));
+        let epoch = Arc::new(AtomicU64::new(1));
+        let r = Redactor::new();
+        {
+            let keys = Arc::clone(&keys);
+            r.add_source(Arc::new(move || keys.read().unwrap().clone()));
+        }
+        {
+            let epoch = Arc::clone(&epoch);
+            r.set_epoch(Arc::new(move || epoch.load(Ordering::SeqCst)));
+        }
+        assert_eq!(r.redact("a first-secret-value"), "a [redacted]");
+        // A key stored after the link started (`/connect`): unknown until the epoch moves.
+        keys.write().unwrap().push("connected-later-key".to_owned());
+        assert_eq!(r.redact("b connected-later-key"), "b connected-later-key");
+        epoch.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(r.redact("c connected-later-key"), "c [redacted]");
+        assert_eq!(r.redact("d first-secret-value"), "d [redacted]");
     }
 }

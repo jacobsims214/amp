@@ -780,14 +780,20 @@ impl Shell {
         if text.is_empty() || self.running || self.switching {
             return false;
         }
-        // #2376: a prompt from a paired device says so above its bubble.
-        let tag = match &origin {
+        // #2376: a prompt from a paired device says so above its bubble. #2391 (L2): its text
+        // came over the network, so escape sequences and invisible or bidi characters are
+        // dropped from what shows here; the model gets the text as sent.
+        match &origin {
             amp_core::chat_event::PromptOrigin::Remote { device_name, .. } => {
-                Some(format!("[remote: {device_name}]"))
+                use amp_core::remote::pairing::{
+                    sanitize_for_terminal, sanitize_text_for_terminal,
+                };
+                let tag = format!("[remote: {}]", sanitize_for_terminal(device_name, 64));
+                self.view
+                    .add_user_tagged(&sanitize_text_for_terminal(text), Some(tag));
             }
-            amp_core::chat_event::PromptOrigin::Local => None,
-        };
-        self.view.add_user_tagged(text, tag);
+            amp_core::chat_event::PromptOrigin::Local => self.view.add_user_tagged(text, None),
+        }
         self.start_run_as(text.to_owned(), origin, prompt_id);
         true
     }

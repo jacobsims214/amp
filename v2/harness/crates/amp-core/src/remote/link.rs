@@ -1540,12 +1540,14 @@ impl Actor {
         }
         self.feed_seen = entry.seq;
         let event = entry.event;
-        // Deltas: hold a trailing word back so a split secret is redacted whole.
+        // Deltas: hold a trailing word, or a tail a known value starts with, back so a split
+        // secret is redacted whole.
         match &event {
             ChatEvent::TextDelta { message_id, delta }
             | ChatEvent::ThinkingDelta { message_id, delta } => {
                 let thinking = matches!(event, ChatEvent::ThinkingDelta { .. });
-                let (flushed, now) = self.guard.push(message_id, thinking, delta);
+                let redactor = self.deps().redactor.clone();
+                let (flushed, now) = self.guard.push(message_id, thinking, delta, &redactor);
                 if let Some((id, th, text)) = flushed {
                     self.send_delta(&id, th, text);
                 }
