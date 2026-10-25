@@ -43,6 +43,7 @@ const (
 	CodeDeviceExpired      = "device_expired"
 	CodeBadSignature       = "bad_signature"
 	CodeStaleTS            = "stale_ts"
+	CodeReplayedNonce      = "replayed_nonce"
 )
 
 // envelopeMembers are the exactly 11 members of every envelope.

@@ -33,6 +33,7 @@ VERSION = 1
 ALG = "ES256"
 SIG_PREFIX_ENVELOPE = b"amp-rc/1 envelope\n"
 SIG_PREFIX_PAIR = b"amp-rc/1 pair-request\n"
+SIG_PREFIX_TOKEN = b"amp-rc/1 token\n"
 PAIRING_ID_PREFIX = b"amp-rc/1 pairing-id\n"
 HKDF_INFO_MAC = b"amp-rc/1 pair-mac"
 HKDF_INFO_SAS = b"amp-rc/1 sas"
@@ -1036,6 +1037,109 @@ def pairing_file():
     }
 
 
+# ---------------------------------------------------------------------------------------------
+# Token refresh proof (protocol.md 8.2, #2390)
+# ---------------------------------------------------------------------------------------------
+
+TOKEN_PROOF_FIELDS = ["v", "alg", "session_id", "harness_id", "ts", "nonce", "sig"]
+
+
+def token_proof(signer: Key, *, session=SESSION, harness=HARNESS, ts=NOW_MS - 500, nonce_label="t1", v=VERSION, alg=ALG):
+    proof = {"v": v, "alg": alg, "session_id": session, "harness_id": harness.fp, "ts": ts, "nonce": nonce(nonce_label)}
+    proof["sig"] = b64u(signer.sign(SIG_PREFIX_TOKEN + jcs(proof).encode("utf-8")))
+    return proof
+
+
+def _high_s(signed: dict) -> dict:
+    """The same signature with s as n - s when that is the high one (verifiers must accept high-S)."""
+    raw = b64u_dec(signed["sig"])
+    r, s = raw[:32], int.from_bytes(raw[32:], "big")
+    return signed if s > N // 2 else dict(signed, sig=b64u(r + (N - s).to_bytes(32, "big")))
+
+
+def check_token(text: str, rx: dict) -> str:
+    """The relay's refresh-proof check, in the normative order of protocol.md 8.2."""
+    try:
+        body = strict_parse(text)
+    except (ValueError, Malformed):
+        return "malformed"
+    if not isinstance(body, dict) or set(body.keys()) != {"proof"}:
+        return "malformed"
+    p = body["proof"]
+    if not isinstance(p, dict) or set(p.keys()) != set(TOKEN_PROOF_FIELDS):
+        return "malformed"
+    ints = ("v", "ts")
+    for k in TOKEN_PROOF_FIELDS:
+        if k in ints:
+            if not isinstance(p[k], int) or isinstance(p[k], bool):
+                return "malformed"
+        elif not isinstance(p[k], str):
+            return "malformed"
+    if not NONCE_RE.match(p["nonce"]):
+        return "malformed"
+    if p["v"] != VERSION:
+        return "unsupported_version"
+    if p["alg"] != ALG:
+        return "unsupported_alg"
+    if p["session_id"] != rx["session_id"]:
+        return "wrong_session"
+    if p["harness_id"] != rx["harness_id"]:
+        return "wrong_harness"
+    unsigned = {k: v for k, v in p.items() if k != "sig"}
+    try:
+        sig = b64u_dec(p["sig"])
+    except ValueError:
+        return "bad_signature"
+    if len(sig) != 64 or not verify(b64u_dec(rx["harness_pub"]), SIG_PREFIX_TOKEN + jcs(unsigned).encode("utf-8"), sig):
+        return "bad_signature"
+    if abs(p["ts"] - rx["now_ms"]) > TS_WINDOW_MS:
+        return "stale_ts"
+    if p["nonce"] in rx["seen_nonces"]:
+        return "replayed_nonce"
+    return "ok"
+
+
+def token_file():
+    rx = {"now_ms": NOW_MS, "session_id": SESSION, "harness_id": HARNESS.fp, "harness_pub": b64u(HARNESS.pub_raw), "seen_nonces": []}
+    vectors = []
+
+    def add(name, proof_or_text, expect, note, **over):
+        text = proof_or_text if isinstance(proof_or_text, str) else json.dumps({"proof": proof_or_text}, separators=(", ", ": "))
+        r = dict(rx, **over)
+        got = check_token(text, r)
+        if got != expect:
+            raise SystemExit("token vector %s: got %s want %s" % (name, got, expect))
+        vectors.append({"name": name, "note": note, "receiver": r, "body": text, "expect": expect})
+
+    good = token_proof(HARNESS)
+    unsigned = {k: v for k, v in good.items() if k != "sig"}
+    add("valid", good, "ok", "Signed by the session's registered harness key.")
+    add("valid_high_s", _high_s(good), "ok", "The same proof with s replaced by n - s: verifiers accept high-S.")
+    add("malformed_extra_member", '{"proof": %s, "x": 1}' % json.dumps(good), "malformed", "A member besides proof.")
+    add("malformed_missing_nonce", {k: v for k, v in good.items() if k != "nonce"}, "malformed", "No nonce.")
+    add("malformed_bad_nonce", token_proof(HARNESS, nonce_label="t2") | {"nonce": "short"}, "malformed", "The nonce isn't 16 bytes of b64u.")
+    add("malformed_float_ts", '{"proof": %s}' % json.dumps(good).replace('"ts": %d' % good["ts"], '"ts": %d.0' % good["ts"]), "malformed",
+        "ts written as a float (profile 3.3).")
+    add("unsupported_version", token_proof(HARNESS, v=2, nonce_label="t3"), "unsupported_version", "v is 2.")
+    add("unsupported_alg", token_proof(HARNESS, alg="EdDSA", nonce_label="t4"), "unsupported_alg", "alg isn't ES256.")
+    add("wrong_session", token_proof(HARNESS, session=SESSION_OTHER, nonce_label="t5"), "wrong_session", "A proof for another session.")
+    add("wrong_harness", token_proof(HARNESS_OTHER, harness=HARNESS_OTHER, nonce_label="t6"), "wrong_harness",
+        "Another harness's own proof: it isn't the session's registered key.")
+    add("bad_signature_other_key", token_proof(HARNESS_OTHER, nonce_label="t7"), "bad_signature",
+        "Claims the session's harness_id but is signed by another key (someone with the owner's login, not the key).")
+    add("bad_signature_envelope_prefix", unsigned | {"sig": b64u(HARNESS.sign(SIG_PREFIX_ENVELOPE + jcs(unsigned).encode("utf-8")))},
+        "bad_signature", "Signed under the envelope prefix, not the token prefix (domain separation).")
+    add("stale_ts", token_proof(HARNESS, ts=NOW_MS - 61_000, nonce_label="t8"), "stale_ts", "61 s old.")
+    add("replayed_nonce", good, "replayed_nonce", "A proof the relay already accepted within 120 s.", seen_nonces=[good["nonce"]])
+    return {
+        "description": "Token refresh proofs (protocol.md 8.2): the body of POST /relay/v1/sessions/:id/token. Run each `body` "
+        "through the relay's proof check with `receiver` (now_ms, the session in the path, its registered harness key, the "
+        "nonces seen in the last 120 s) and expect `expect`. Signing input: \"amp-rc/1 token\\n\" + JCS(proof without sig).",
+        "signing_input": (SIG_PREFIX_TOKEN + jcs(unsigned).encode("utf-8")).decode("utf-8"),
+        "vectors": vectors,
+    }
+
+
 def generate() -> dict:
     files = {
         "keys.json": keys_file(),
@@ -1044,6 +1148,7 @@ def generate() -> dict:
         "commands.json": commands_file(),
         "events.json": events_file(),
         "pairing.json": pairing_file(),
+        "token.json": token_file(),
     }
     gen = {"generator": "v2/testdata/remote-control/gen_vectors.py", "protocol": "v2/docs/remote-control/protocol.md", "protocol_version": VERSION}
     return {name: json.dumps(dict(_meta=gen, **body), indent=2, ensure_ascii=False) + "\n" for name, body in files.items()}

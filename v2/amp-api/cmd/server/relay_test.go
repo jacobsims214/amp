@@ -425,6 +425,16 @@ func (e *relayEnv) register(t *testing.T, who string) *rcSession {
 	return &rcSession{e: e, who: who, harness: k, id: body["session_id"].(string), token: body["connect_token"].(string)}
 }
 
+// tokenProof is a refresh body signed by k for session id (protocol 8.2, #2390).
+func (e *relayEnv) tokenProof(t *testing.T, k rcKey, id string) []byte {
+	t.Helper()
+	b, err := relay.SignTokenProof(k.priv, id, k.id, e.clock.Now().UnixMilli(), rcNonce())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func (e *relayEnv) registration(k rcKey) map[string]any {
 	return map[string]any{
 		"protocol_versions": []int{1}, "harness_id": k.id, "harness_pub": k.pub,
@@ -584,7 +594,7 @@ func TestRelay_HarnessLegAuth(t *testing.T) {
 	wantStatus(t, "refresh someone else's session", st, body, 404, "not_found")
 	st, body, _ = e.do(t, "POST", "/relay/v1/sessions/"+id+"/token", nil, as("alice"), via(auth.ChannelToken))
 	wantStatus(t, "refresh with an API token", st, body, 403, "token_not_allowed")
-	st, body, _ = e.do(t, "POST", "/relay/v1/sessions/"+id+"/token", nil, as("alice"))
+	st, body, _ = e.do(t, "POST", "/relay/v1/sessions/"+id+"/token", e.tokenProof(t, k, id), as("alice"))
 	wantStatus(t, "refresh", st, body, 200, "")
 	fresh := body["connect_token"].(string)
 	st, body, _ = e.do(t, "POST", hb, nil, bearer(tok))
@@ -651,8 +661,19 @@ func TestRelay_InstanceSwitchOff(t *testing.T) {
 		svc := service.New(w.s.repo, nil, nil)
 		svc.Remote = cfg
 		rs := relayserver.New(svc, relayserver.Options{})
-		if rs.Relay != nil || rs.InternalHandler() != nil {
+		if rs.Relay != nil {
 			t.Fatalf("%+v: relay set up", cfg)
+		}
+		// Never nil (#2390): an http.Server with a nil Handler serves
+		// http.DefaultServeMux.
+		ih := rs.InternalHandler()
+		if ih == nil {
+			t.Fatalf("%+v: nil internal handler", cfg)
+		}
+		rec := httptest.NewRecorder()
+		ih.ServeHTTP(rec, httptest.NewRequest("GET", "/debug/pprof/", nil))
+		if rec.Code != 404 {
+			t.Fatalf("%+v: internal handler answered %d, want 404", cfg, rec.Code)
 		}
 		srv := httptest.NewServer(rs.Handler())
 		for _, path := range []string{"/relay/v1/sessions", "/relay/v1/sessions/rs_x/commands", "/api/sessions", "/api/sessions/rs_x/events"} {

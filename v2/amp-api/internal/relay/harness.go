@@ -177,7 +177,8 @@ func (rl *Relay) register(w http.ResponseWriter, r *http.Request) {
 }
 
 // refresh is POST /relay/v1/sessions/:id/token: a new connect token, after
-// re-checking the person and the org policy.
+// re-checking the person, the harness key's proof (token.go) and the org
+// policy.
 func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	p, err := harnessPerson(r)
@@ -188,6 +189,40 @@ func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 	sess, err := rl.svc.OwnRemoteSession(ctx, p, r.PathValue("id"))
 	if err != nil {
 		writeErr(w, serviceErr(sess, err))
+		return
+	}
+	// The OAuth login alone isn't enough (#2390): the harness proves it holds
+	// the session's key, so another program with the same login can't take
+	// the session over.
+	if err := requireJSON(r); err != nil {
+		writeErr(w, err)
+		return
+	}
+	body, err := readBody(w, r, MaxSmallBody)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	key, _ := parsePub(sess.HarnessPub)
+	now := rl.cfg.Now()
+	code := CheckTokenProof(body, TokenProofReceiver{
+		NowMS: now.UnixMilli(), SessionID: sess.ID, HarnessID: sess.HarnessID, Harness: key,
+		Seen: func(nonce string) bool {
+			rl.mu.Lock()
+			defer rl.mu.Unlock()
+			return rl.proofNonces.seenOrAdd(sess.ID+" "+nonce, now, 2*TSWindow)
+		},
+	})
+	if code != CodeOK {
+		status := 400
+		switch code {
+		case CodeBadSignature:
+			status = 403
+		case CodeTooLarge:
+			status = 413
+		}
+		slog.Warn("remote token refresh refused", "session", sess.ID, "user_id", p.UserID, "code", code)
+		writeErr(w, errf(status, code, "the token refresh needs a proof signed by the session's harness key: %s", code))
 		return
 	}
 	pol, _, err := rl.repo.ProjectRemotePolicy(ctx, sess.ProjectID)
@@ -287,7 +322,7 @@ func (rl *Relay) commandStream(w http.ResponseWriter, r *http.Request, sess *dom
 	live.mu.Unlock()
 	slog.Info("remote harness connected", "session", sess.ID)
 
-	rl.pump(ctx, startSSE(w), st)
+	rl.pump(ctx, rl.startSSE(w), st)
 
 	live.mu.Lock()
 	if live.harness == st {
@@ -296,6 +331,7 @@ func (rl *Relay) commandStream(w http.ResponseWriter, r *http.Request, sess *dom
 	}
 	live.mu.Unlock()
 	st.close()
+	st.drain()
 	slog.Info("remote harness disconnected", "session", sess.ID)
 }
 
@@ -328,6 +364,15 @@ func (rl *Relay) publish(w http.ResponseWriter, r *http.Request, sess *domain.Re
 		return
 	}
 	live := rl.reg.Ensure(sess)
+	// Event bytes per session (#2390): a harness can't push more than the
+	// relay and its viewers can carry.
+	live.mu.Lock()
+	ok, wait := live.events.takeN(rl.cfg.Now(), float64(len(body)))
+	live.mu.Unlock()
+	if !ok {
+		writeErr(w, errf(429, "rate_limited", "too many event bytes; slow down").with("retry_after_s", retryAfter(wait)))
+		return
+	}
 	rx := EventReceiver{SessionID: sess.ID, HarnessID: sess.HarnessID, Harness: live.harnessKey}
 	acceptedThrough := func() int64 {
 		live.mu.Lock()

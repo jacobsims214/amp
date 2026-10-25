@@ -101,10 +101,12 @@ func New(svc *service.Service, o Options) *Server {
 func (s *Server) Handler() http.Handler { return s.public }
 
 // InternalHandler is the internal listener's handler: /internal/relay/ (with
-// the cluster token), nothing else. Nil when the relay is off.
+// the cluster token), nothing else. With the relay off it answers 404 to
+// everything (never nil: an http.Server with a nil Handler would serve
+// http.DefaultServeMux).
 func (s *Server) InternalHandler() http.Handler {
 	if s.Relay == nil {
-		return nil
+		return http.NotFoundHandler()
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/internal/relay/", s.Relay.InternalHandler())

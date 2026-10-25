@@ -194,10 +194,13 @@ func (r *Repo) SetRemoteConnectToken(ctx context.Context, id, tokenHash string, 
 
 // RemoteSessionByConnectToken finds the session whose current connect token
 // hashes to tokenHash (active or ended; the caller checks state and expiry).
+// A deactivated owner's token finds nothing (#2390): deactivation ends the
+// owner's sessions, and this holds even if that end didn't happen.
 func (r *Repo) RemoteSessionByConnectToken(ctx context.Context, tokenHash string) (*domain.RemoteSession, error) {
 	var s domain.RemoteSession
 	err := scanRemoteSession(r.db.QueryRow(ctx, `SELECT `+remoteSessionCols+` FROM remote_sessions
-		WHERE connect_token_hash = $1`, tokenHash), &s)
+		WHERE connect_token_hash = $1
+		  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = owner_user_id AND u.disabled_at IS NOT NULL)`, tokenHash), &s)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("remote session: %w", ErrNotFound)
 	}
