@@ -227,7 +227,7 @@ func (rl *Relay) eventStream(w http.ResponseWriter, r *http.Request, p authz.Pri
 
 	live := rl.reg.Ensure(sess)
 	now := rl.cfg.Now()
-	st := newStream(viewerQueue)
+	st := newViewerStream(rl.viewerBytes)
 	live.mu.Lock()
 	if live.ended {
 		live.mu.Unlock()
@@ -286,7 +286,7 @@ func (rl *Relay) eventStream(w http.ResponseWriter, r *http.Request, p authz.Pri
 		slog.Warn("recording remote activity failed", "session", sess.ID, "err", err)
 	}
 
-	out := startSSE(w)
+	out := rl.startSSE(w)
 	ok = out.raw("retry: 3000\n\n") == nil
 	for _, f := range initial {
 		if !ok {
@@ -305,6 +305,7 @@ func (rl *Relay) eventStream(w http.ResponseWriter, r *http.Request, p authz.Pri
 	}
 	live.mu.Unlock()
 	st.close()
+	st.drain()
 }
 
 // pinLookup reads the relay's record of a device (remote_devices) for the

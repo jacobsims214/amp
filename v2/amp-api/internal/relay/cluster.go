@@ -224,6 +224,11 @@ func (f *clusterForwarder) Forward(w http.ResponseWriter, r *http.Request, sess 
 var hopHeaders = []string{"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization", "Te", "Trailer",
 	"Transfer-Encoding", "Upgrade"}
 
+// credentialHeaders carry the caller's login (the oauth2-proxy session
+// cookie and what ext_authz passes upstream); none is forwarded.
+var credentialHeaders = []string{"Cookie", "X-Auth-Request-User", "X-Auth-Request-Email",
+	"X-Auth-Request-Access-Token", "X-Forwarded-Access-Token", "X-Forwarded-Id-Token"}
+
 // send passes r (with body) to the holder at addr.
 func (f *clusterForwarder) send(r *http.Request, addr string, body []byte) (*http.Response, error) {
 	var rd io.Reader
@@ -237,6 +242,16 @@ func (f *clusterForwarder) send(r *http.Request, addr string, body []byte) (*htt
 	req.Header = r.Header.Clone()
 	for _, h := range hopHeaders {
 		req.Header.Del(h)
+	}
+	// The caller's credentials stay here (#2390): the holder trusts the
+	// principal header behind the cluster token, so the browser's cookie and
+	// login token never cross the cluster in plaintext. The harness leg keeps
+	// Authorization: its connect token is checked again on the holder.
+	for _, h := range credentialHeaders {
+		req.Header.Del(h)
+	}
+	if !strings.HasPrefix(r.URL.Path, "/relay/") {
+		req.Header.Del("Authorization")
 	}
 	req.Header.Del(principalHeader)
 	req.Header.Set(tokenHeader, f.rl.cfg.Cluster.Token())

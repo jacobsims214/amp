@@ -8,6 +8,7 @@
 //! - [`redact`]: secret redaction before signing.
 //! - [`policy`]: the local off switches and the server/login checks.
 //! - [`relay`]: the relay's harness-leg HTTP API.
+//! - [`token`]: the token refresh proof signed with the harness key (section 8.2).
 //! - [`link`]: [`link::RemoteLink`], the outbound link the chat turns on with `/remote`.
 //! - `mock_relay` (feature `mock-relay`): an in-process relay for end-to-end tests.
 
@@ -21,6 +22,7 @@ pub mod pairing;
 pub mod policy;
 pub mod redact;
 pub mod relay;
+pub mod token;
 
 pub use link::{
     AmpConnection, BoardCounts, Enabled, FixedToken, HostStatus, LinkTuning, LocalEvent,

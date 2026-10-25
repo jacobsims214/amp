@@ -50,6 +50,16 @@ impl RelayError {
         }
     }
 
+    /// An answer that isn't the relay's (see [`NOT_RELAY`]).
+    fn not_relay(status: u16) -> Self {
+        Self {
+            status,
+            code: Some(NOT_RELAY.to_owned()),
+            message: "the answer isn't from AMP's remote control relay".to_owned(),
+            body: Box::new(Value::Null),
+        }
+    }
+
     pub fn is_network(&self) -> bool {
         self.status == 0
     }
@@ -68,7 +78,9 @@ impl RelayError {
     /// What to tell the person when registration fails (decision section 9).
     pub fn register_message(&self) -> String {
         match (self.status, self.code.as_deref()) {
-            (404, _) => "Remote control isn't available on this AMP server.".to_owned(),
+            (404, _) | (_, Some(NOT_RELAY)) => {
+                "Remote control isn't available on this AMP server.".to_owned()
+            }
             (403, Some("remote_disabled")) => {
                 "Remote control is turned off for this project's organization (an org admin can \
                  turn it on in the org settings)."
@@ -103,6 +115,16 @@ impl RelayError {
             _ => format!("AMP refused remote control: {self}"),
         }
     }
+}
+
+/// The `code` the client gives an answer that isn't the relay's (#2390): a redirect, or a success
+/// whose body isn't a JSON object, such as the web app's HTML when the relay is off.
+pub const NOT_RELAY: &str = "not_relay";
+
+/// Whether an answer is the relay's: never a redirect (the client doesn't follow them), and a
+/// success always carries a JSON object.
+fn is_relay_answer(status: u16, value: &Value) -> bool {
+    !(300..400).contains(&status) && (!(200..300).contains(&status) || value.is_object())
 }
 
 /// `POST /relay/v1/sessions`'s answer (201).
@@ -179,8 +201,20 @@ impl RelayClient {
     /// keeps its connections open (#2380): the link posts an event batch about every 100 ms while
     /// a reply streams, and a new connection per batch cost a DNS lookup and TLS handshake each
     /// time (5 s a batch on a Mac resolving `amp.local`).
+    ///
+    /// It never follows a redirect (#2390): every `/relay/` call carries the OAuth or connect token,
+    /// and a redirect means the answer isn't the relay's (with the relay off, `/relay/` reaches the
+    /// web app, which sends a login redirect). Such an answer reads as "isn't available".
     pub fn new(base: &str, ca_file: Option<&Path>) -> Result<Self, String> {
-        let http = amp_mcp::build_keepalive_http_client(ca_file).map_err(|e| e.to_string())?;
+        let mut builder = reqwest::Client::builder()
+            .pool_max_idle_per_host(usize::MAX)
+            .pool_idle_timeout(amp_mcp::KEEPALIVE_IDLE)
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(path) = ca_file {
+            builder =
+                builder.tls_certs_merge(amp_mcp::load_ca_file(path).map_err(|e| e.to_string())?);
+        }
+        let http = builder.build().map_err(|e| e.to_string())?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),
@@ -221,6 +255,9 @@ impl RelayClient {
                 .await
                 .map_err(|e| RelayError::network(e.without_url()))?;
             let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if !is_relay_answer(status, &value) {
+                return Err(RelayError::not_relay(status));
+            }
             if (200..300).contains(&status) {
                 return Ok(value);
             }
@@ -274,17 +311,21 @@ impl RelayClient {
         Self::parse(v)
     }
 
+    /// Renews the connect token: the OAuth login plus a proof signed by the harness key the
+    /// session was registered with (protocol 8.2, #2390).
     pub async fn refresh(
         &self,
         session_id: &str,
         oauth_token: &str,
+        key: &crate::remote::crypto::KeyPair,
     ) -> Result<Refreshed, RelayError> {
+        let body = crate::remote::token::refresh_body(key, session_id, now_ms());
         let v = self
             .call(
                 reqwest::Method::POST,
                 &format!("/{session_id}/token"),
                 oauth_token,
-                Some(json!({})),
+                Some(body),
             )
             .await?;
         Self::parse(v)
@@ -371,6 +412,14 @@ impl RelayClient {
             .map_err(|_| RelayError::network("opening the command stream timed out"))?
             .map_err(|e| RelayError::network(e.without_url()))?;
         let status = resp.status().as_u16();
+        let event_stream = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.starts_with("text/event-stream"));
+        if (300..400).contains(&status) || ((200..300).contains(&status) && !event_stream) {
+            return Err(RelayError::not_relay(status));
+        }
         if !(200..300).contains(&status) {
             let text = resp.text().await.unwrap_or_default();
             let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -473,6 +522,20 @@ mod register_message_tests {
             message: "x".into(),
             body: Box::new(Value::Null),
         }
+    }
+
+    #[test]
+    fn non_relay_answers_read_as_not_available() {
+        assert!(!is_relay_answer(302, &json!({})));
+        assert!(!is_relay_answer(200, &Value::Null)); // HTML
+        assert!(!is_relay_answer(200, &json!([1])));
+        assert!(is_relay_answer(200, &json!({"accepted_through": 1})));
+        assert!(is_relay_answer(503, &Value::Null)); // Envoy without an upstream
+        assert!(
+            RelayError::not_relay(302)
+                .register_message()
+                .contains("isn't available on this AMP")
+        );
     }
 
     #[test]

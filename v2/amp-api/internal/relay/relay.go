@@ -75,6 +75,12 @@ type Config struct {
 	// Forwarder sends browser calls to the replica that holds the session;
 	// nil serves everything here (single replica).
 	Forwarder Forwarder
+	// MaxQueuedBytes bounds the bytes queued for all viewers on this
+	// replica (DefaultQueuedBytes); a viewer that would pass it is dropped.
+	MaxQueuedBytes int64
+	// WriteTimeout bounds one write to a stream (30 s), so a client that
+	// stops reading can't hold its handler and queue forever.
+	WriteTimeout time.Duration
 }
 
 func (c *Config) defaults() {
@@ -102,6 +108,12 @@ func (c *Config) defaults() {
 	if c.RouteTimeout <= 0 {
 		c.RouteTimeout = 20 * time.Second
 	}
+	if c.MaxQueuedBytes <= 0 {
+		c.MaxQueuedBytes = DefaultQueuedBytes
+	}
+	if c.WriteTimeout <= 0 {
+		c.WriteTimeout = 30 * time.Second
+	}
 	if c.Cluster != nil && c.Node == "" {
 		c.Node = c.Cluster.ID()
 	}
@@ -117,8 +129,11 @@ type Relay struct {
 	oauth  func(http.Handler) http.Handler
 	client *http.Client // calls to other replicas
 
-	mu        sync.Mutex
-	registers map[int]*bucket // per user: 10 registration attempts a minute here
+	mu          sync.Mutex
+	registers   map[int]*bucket // per user: 10 registration attempts a minute here
+	proofNonces nonceCache      // refresh-proof nonces seen here (token.go)
+
+	viewerBytes *byteBudget // bytes queued for all viewers here
 }
 
 // New builds the relay on svc (whose Remote config must have the instance
@@ -131,6 +146,7 @@ func New(svc *service.Service, oauth func(http.Handler) http.Handler, cfg Config
 	rl := &Relay{
 		svc: svc, repo: svc.Repo, cfg: cfg, reg: cfg.Registry, oauth: oauth,
 		client: newInternalClient(), registers: map[int]*bucket{},
+		viewerBytes: newByteBudget(cfg.MaxQueuedBytes),
 	}
 	if cfg.Cluster != nil && cfg.Forwarder == nil {
 		rl.cfg.Forwarder = &clusterForwarder{rl: rl, client: rl.client}
@@ -147,6 +163,9 @@ func New(svc *service.Service, oauth func(http.Handler) http.Handler, cfg Config
 
 // Registry is the relay's session registry.
 func (rl *Relay) Registry() Registry { return rl.reg }
+
+// QueuedViewerBytes is the bytes queued for all viewers on this replica.
+func (rl *Relay) QueuedViewerBytes() int64 { return rl.viewerBytes.Used() }
 
 // sessionsEnded closes the streams of sessions that just ended: here, and on
 // the replica holding each one when that's another.
@@ -332,8 +351,23 @@ func readBody(w http.ResponseWriter, r *http.Request, max int) ([]byte, error) {
 
 // sse is an open text/event-stream response.
 type sse struct {
-	w  http.ResponseWriter
-	rc *http.ResponseController
+	w       http.ResponseWriter
+	rc      *http.ResponseController
+	timeout time.Duration // per write (0: none)
+}
+
+func (rl *Relay) startSSE(w http.ResponseWriter) *sse {
+	s := startSSE(w)
+	s.timeout = rl.cfg.WriteTimeout
+	return s
+}
+
+// deadline bounds the next write; a ResponseWriter without deadlines (a
+// test recorder) is written without one.
+func (s *sse) deadline() {
+	if s.timeout > 0 {
+		_ = s.rc.SetWriteDeadline(time.Now().Add(s.timeout))
+	}
 }
 
 func startSSE(w http.ResponseWriter) *sse {
@@ -363,6 +397,7 @@ func (s *sse) write(f frame) error {
 	b.WriteString("data: ")
 	b.Write(f.data)
 	b.WriteString("\n\n")
+	s.deadline()
 	if _, err := s.w.Write([]byte(b.String())); err != nil {
 		return err
 	}
@@ -370,6 +405,7 @@ func (s *sse) write(f frame) error {
 }
 
 func (s *sse) raw(text string) error {
+	s.deadline()
 	if _, err := s.w.Write([]byte(text)); err != nil {
 		return err
 	}
@@ -384,6 +420,7 @@ func (rl *Relay) pump(ctx context.Context, out *sse, st *stream) {
 	for {
 		select {
 		case f := <-st.ch:
+			st.dequeued(f)
 			if out.write(f) != nil {
 				return
 			}
@@ -396,6 +433,7 @@ func (rl *Relay) pump(ctx context.Context, out *sse, st *stream) {
 			for {
 				select {
 				case f := <-st.ch:
+					st.dequeued(f)
 					if out.write(f) != nil {
 						return
 					}

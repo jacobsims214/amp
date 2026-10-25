@@ -136,6 +136,7 @@ The bytes that are signed are a fixed ASCII prefix followed by the JCS canonical
 |---|---|
 | Envelope (command or event) | `"amp-rc/1 envelope\n"` ‖ UTF-8(JCS(envelope **without** the `sig` member)) |
 | Pairing request | `"amp-rc/1 pair-request\n"` ‖ UTF-8(JCS(request object)) |
+| Token refresh proof (8.2) | `"amp-rc/1 token\n"` ‖ UTF-8(JCS(proof **without** the `sig` member)) |
 
 The prefixes end in one LF (0x0A) byte. The signer computes ECDSA-SHA256 over the whole signing input. The
 WebCrypto, Go and Rust APIs hash internally, so pass them the signing input, not its hash. Go's `ecdsa.Verify`
@@ -644,7 +645,8 @@ for `rejected`, `failed` and `locked` results.
 - **Harness leg (`/relay/v1/…`).** Envoy route `/relay/` has ext_authz off, `timeout: 0s` and
   `max_stream_duration: 12h`.
   - `POST /relay/v1/sessions` and `POST …/token` take the harness's **OAuth access token**: a Dex JWT whose
-    audience includes `amp-mcp`, verified as `/mcp` verifies it.
+    audience includes `amp-mcp`, verified as `/mcp` verifies it. `POST …/token` also takes a proof signed by
+    the session's harness key (8.2): the OAuth login alone never renews a session's connect token.
   - Refused: `amp_` API tokens (`403 token_not_allowed`), agent accounts (`users.kind = 'agent'`,
     `403 agent_not_allowed`) and an auth-disabled server (the routes don't exist, so `404`).
   - Every other harness call takes `Authorization: Bearer rct_…`, the connect token, which is bound to one
@@ -707,13 +709,44 @@ The relay checks:
 - ≤ 10 registrations a minute for this user → else `429 rate_limited`
 - the `remote.enable` audit row is written → else `503 audit_unavailable` (fail closed)
 
-A harness that gets `404` says "Remote control isn't available on this AMP server" (decision section 9).
+A harness that gets `404` says "Remote control isn't available on this AMP server" (decision section 9). It
+says the same when the answer isn't the relay's at all (#2390): any redirect (`3xx`), or a success whose body
+isn't a JSON object (the web app's HTML, which is what `/relay/` reaches when the instance switch is off). The
+harness never follows redirects on `/relay/` calls, so its tokens are only ever sent to the AMP origin's relay.
 
 #### `POST /relay/v1/sessions/:id/token`: refresh the connect token
 
-Auth: the OAuth access token, as for registration. It also re-checks policy. Response `200 {"connect_token",
-"connect_token_expires_at_ms"}`. The token lasts **15 minutes**; the harness refreshes it when two thirds of
-that has passed.
+Auth: the OAuth access token, as for registration, **and** a proof that the caller holds the session's
+harness key (#2390). Many programs hold the person's own OAuth token (Claude Code with the AMP plugin, a manager
+on another machine), and the session id is not a secret; without the proof any of them could mint a connect
+token, void the harness's own, take over the command stream and read every prompt (review #2381, M1).
+
+Request (≤ 8 KiB, `application/json`), exactly one member:
+
+```json
+{"proof": {"v": 1, "alg": "ES256", "session_id": "rs_…", "harness_id": "<fp>",
+           "ts": 1792948799500, "nonce": "<22 chars>", "sig": "<86 chars>"}}
+```
+
+`sig` is the harness key's ES256 signature over `"amp-rc/1 token\n"` ‖ JCS(proof without `sig`) (section 3.2);
+a fresh random `nonce` (16 bytes, b64u) and the current `ts` every time. The relay checks, in this order:
+
+1. the body is in the profile (3.3), has only `proof`, and the proof has exactly the 7 members with the right
+   types and a 22-character nonce → else `400 malformed`
+2. `v == 1` → else `400 unsupported_version`; `alg == "ES256"` → else `400 unsupported_alg`
+3. `session_id` is the path's → else `400 wrong_session`; `harness_id` is the session's registered one → else
+   `400 wrong_harness`
+4. the signature verifies with the **registered** `harness_pub` (`remote_sessions.harness_pub`) → else
+   `403 bad_signature`
+5. `ts` within ±60 s → else `400 stale_ts`
+6. the nonce wasn't used in the last 120 s → else `400 replayed_nonce` (a per-replica cache; a captured proof
+   is useless after 60 s anyway)
+
+Ownership comes first (someone else's session `404`, an ended one `410`), then the proof, then the org policy
+(`403 remote_disabled`). Response `200 {"connect_token", "connect_token_expires_at_ms"}`. The token lasts
+**15 minutes**; the harness refreshes it when two thirds of that has passed. Every other harness call needs the
+connect token, so a client without the harness key can't open the command stream, post events, open a pairing
+window or end the session. The vectors are in `token.json`.
 
 - An expired token on any harness call → `401 token_expired`.
 - Streams that are already open are not cut when their token expires.
@@ -757,6 +790,9 @@ Responses:
 - `400 malformed | bad_signature | wrong_session {"accepted_through": …, "index": i}`. The relay keeps the
   envelopes before index `i`. The harness treats this as a bug: it ends remote with a local notice.
 - `413 too_large`
+- `429 rate_limited {"retry_after_s"}`: the session's harness posted more than **2 MiB/s** of event bytes
+  (burst 8 MiB, counted by request body). Nothing in the batch was accepted; the harness waits and sends it
+  again (#2390).
 - `410 session_ended`
 
 The relay appends accepted envelopes to the buffer (section 11) and fans them out to viewers. It keeps the
@@ -934,6 +970,7 @@ so the flag is a new member there:
 | 400 | `unsupported_alg` | `alg` isn't `ES256` |
 | 400 | `wrong_session` / `wrong_harness` | The envelope doesn't match the session in the path |
 | 400 | `stale_ts` | Outside ±60 s |
+| 400 | `replayed_nonce` | A token refresh proof whose nonce was already used (8.2) |
 | 401 | `unauthenticated` | No credential, or an invalid one |
 | 401 | `token_expired` | The connect token has expired; refresh it |
 | 403 | `token_not_allowed` | An `amp_` API token on the harness leg |
@@ -941,7 +978,7 @@ so the flag is a new member there:
 | 403 | `not_ui_channel` | The browser leg was called by something other than a person in the web UI |
 | 403 | `cross_site` | A cross-site request, or a foreign Origin |
 | 403 | `remote_disabled` | The org setting is off |
-| 403 | `unknown_device` / `device_expired` / `bad_signature` | The relay's early command checks (5.8) |
+| 403 | `unknown_device` / `device_expired` / `bad_signature` | The relay's early command checks (5.8), or a token refresh proof not signed by the session's harness key (8.2) |
 | 404 | `not_found` | No such session, or not the caller's (deliberately the same) |
 | 409 | `harness_offline` | No live command stream, or the heartbeat is older than 60 s |
 | 409 | `seq_gap` | Events aren't contiguous (`expected_seq`) |
@@ -978,6 +1015,9 @@ Clients MUST treat an unknown `code` as a generic failure of that HTTP status. N
 | Prompt text | 1..49 152 UTF-8 bytes | harness, relay (via the envelope size); the UI checks before sending |
 | Event envelope | ≤ 1 048 576 bytes | harness, relay, browser |
 | Event batch | ≤ 64 envelopes and ≤ 2 MiB | relay |
+| Event bytes per session | 2 MiB/s, burst 8 MiB (`429 rate_limited`) | relay |
+| Viewer queue | 512 frames and 4 MiB per viewer; 64 MiB for all viewers on one relay replica. A viewer past either is dropped and resumes with `Last-Event-ID` | relay |
+| Stream write | 30 s per write; a client that stops reading is dropped | relay |
 | `tool_start.arguments_json` / `tool_end.text` / deltas | ≤ 16 KiB / 32 KiB / 16 KiB | harness |
 | Register and pair request bodies | ≤ 8 KiB | relay |
 | Prompts | 20/min per session, burst 5 | relay and harness |
@@ -1042,6 +1082,10 @@ harness sends don't count.
     checked against the sessions started in the last minute in Postgres.
   - After an end, every replica answers the connect token with `410` and the reason (Postgres keeps the
     ended session's token hash).
+  - A proxied call carries no caller credentials (#2390): the `Cookie` (the oauth2-proxy session), the
+    headers ext_authz passes upstream and, on the browser leg, `Authorization` are removed. The holder trusts
+    only the verified-principal header, and only behind the cluster token. The harness leg keeps
+    `Authorization`: its connect token is checked again on the holder.
 - **Failover.** A replica takes a session over only when the holder's cluster heartbeat is older than the
   cluster TTL (10 s; at once after a graceful shutdown). Until the harness reconnects, the session is offline
   there: viewers attach with `online: false` and commands get `409 harness_offline`. The harness reconnects to
@@ -1070,7 +1114,7 @@ laptop registers a new session, and the device pins still apply.
 | `harness_ended` | `/remote off`, harness exit, or `DELETE` without a reason |
 | `detached` | A signed `detach` command |
 | `disconnected` | The browser's Disconnect endpoint |
-| `revoked` | Revoke-all |
+| `revoked` | Revoke-all, or the owner's AMP account was deactivated |
 | `policy_off` | The org or instance switch was turned off |
 | `idle` | 30 min (or the org value) without remote activity |
 | `expired` | 12 h since registration |
@@ -1085,6 +1129,10 @@ Every path ends in under 5 s. The relay closes all of the session's streams (R-M
   deadlines (after sleep they may have passed, and then it ends locally), refreshes the token (the relay
   re-checks org policy) and reloads its pins.
 - The relay re-checks org policy on register, on token refresh and on policy change.
+- **Deactivating a person** (`POST /api/users/:id/deactivate`) ends all of their live sessions with reason
+  `revoked`, audited as `remote.disable`; amp-api tells the holder as for the org switch, so the streams close
+  at once. The connect token of a deactivated owner is refused (`401`) on every replica even if that end
+  didn't happen (#2390).
 
 ### 12.4 Audit (D3: metadata only)
 
@@ -1363,6 +1411,7 @@ only, deterministic). The `README.md` there shows how to load them from Rust, Go
 | `commands.json` | Valid prompt, stop and detach (including high-S and an ASCII-escaped wire), and every refusal of 5.6 with the receiver state |
 | `events.json` | Valid hello, deltas, tool_start, message_end, ack, refused and pair_result, plus duplicate, bad signature, fake harness, wrong session, unknown op and unsupported version |
 | `pairing.json` | Link, `pairing_id`, `k_mac`, `k_sas`, MAC, signature and SAS code, plus the pairing rejection cases |
+| `token.json` | Token refresh proofs (8.2): valid (incl. high-S), and every refusal of the relay's proof check |
 
 Each vector's `receiver` holds the state the check needs (`now_ms`, pins, `last_seq`, seen nonces). Signing is
 tested as a round trip, because production ECDSA is randomized. Verification, canonical bytes, fingerprints and

@@ -26,7 +26,7 @@ use amp_core::{
         crypto::{self, KeyPair, KeyStore},
         envelope, jcs, pairing,
         redact::Redactor,
-        relay::now_ms,
+        relay::{RelayClient, now_ms},
     },
 };
 use amp_tui::{Shell, ShellInfo};
@@ -250,6 +250,7 @@ async fn live_go_relay() {
     std::fs::create_dir_all(&dir).unwrap();
     let redactor = Redactor::new();
     redactor.add_values([PROVIDER_KEY]);
+    let keys = KeyStore::memory();
     let link = RemoteLink::new(RemoteDeps {
         setup: RemoteSetup {
             api_base: env.url.clone(),
@@ -263,8 +264,8 @@ async fn live_go_relay() {
         tokens: Arc::new(FixedToken(env.token.clone(), env.user_id)),
         host: shell.remote_host(),
         feed: Arc::clone(&feed),
-        // Never the real keychain in tests (the Mac may be locked).
-        keys: KeyStore::memory(),
+        // Never the real keychain in tests (the Mac may be locked); `keys` is in memory.
+        keys: keys.clone(),
         pins: Some(dir.join("remote-devices.json")),
         action_log: Some(dir.join("remote-actions.log")),
         redactor,
@@ -300,6 +301,25 @@ async fn live_go_relay() {
         enabled.link.split('#').next().unwrap()
     );
     let (secret, h) = pairing::parse_link_fragment(&enabled.link).unwrap();
+
+    // #2390: the Go relay renews the connect token only with the harness key's proof (protocol
+    // 8.2). The harness's own proof passes; the same OAuth login with another key doesn't.
+    {
+        let client = RelayClient::new(&env.url, None).unwrap();
+        let key = keys.load_or_create().unwrap();
+        assert_eq!(key.id(), h, "the link's key");
+        let r = client
+            .refresh(&sid, &env.token, &key)
+            .await
+            .expect("refresh with the harness key");
+        assert!(r.connect_token.starts_with("rct_"));
+        let e = client
+            .refresh(&sid, &env.token, &KeyPair::generate())
+            .await
+            .unwrap_err();
+        assert_eq!(e.status, 400, "{e}"); // wrong_harness: another key's own proof
+        assert_eq!(e.code.as_deref(), Some("wrong_harness"));
+    }
 
     // The browser checks the link's h against the session, then watches.
     let (st, session) = browser

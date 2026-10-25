@@ -6,6 +6,7 @@ package relay
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -256,5 +257,72 @@ func TestSignRoundTrip(t *testing.T) {
 	})
 	if code != CodeOK {
 		t.Fatalf("round trip: %s", code)
+	}
+}
+
+// token.json: the refresh proof (protocol.md 8.2, #2390).
+func TestTokenProofVectors(t *testing.T) {
+	var f struct {
+		SigningInput string `json:"signing_input"`
+		Vectors      []struct {
+			Name     string
+			Body     string
+			Expect   string
+			Receiver struct {
+				NowMS      int64    `json:"now_ms"`
+				SessionID  string   `json:"session_id"`
+				HarnessID  string   `json:"harness_id"`
+				HarnessPub string   `json:"harness_pub"`
+				SeenNonces []string `json:"seen_nonces"`
+			}
+		}
+	}
+	loadVectors(t, "token.json", &f)
+	if len(f.Vectors) < 10 || f.SigningInput == "" {
+		t.Fatal("no token vectors")
+	}
+	for _, v := range f.Vectors {
+		pub, ok := parsePub(v.Receiver.HarnessPub)
+		if !ok {
+			t.Fatalf("%s: bad harness_pub", v.Name)
+		}
+		seen := v.Receiver.SeenNonces
+		got := CheckTokenProof([]byte(v.Body), TokenProofReceiver{
+			NowMS: v.Receiver.NowMS, SessionID: v.Receiver.SessionID, HarnessID: v.Receiver.HarnessID, Harness: pub,
+			Seen: func(n string) bool {
+				for _, s := range seen {
+					if s == n {
+						return true
+					}
+				}
+				return false
+			},
+		})
+		if got != v.Expect {
+			t.Errorf("%s: got %s, want %s", v.Name, got, v.Expect)
+		}
+	}
+}
+
+// SignTokenProof round-trips through CheckTokenProof.
+func TestTokenProofRoundTrip(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := priv.PublicKey.Bytes()
+	id := Fingerprint(raw)
+	body, err := SignTokenProof(priv, "rs_x", id, 1000, "AAAAAAAAAAAAAAAAAAAAAA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	rx := TokenProofReceiver{NowMS: 1000, SessionID: "rs_x", HarnessID: id, Harness: &priv.PublicKey,
+		Seen: func(string) bool { calls++; return calls > 1 }}
+	if got := CheckTokenProof(body, rx); got != CodeOK {
+		t.Fatalf("round trip: %s", got)
+	}
+	if got := CheckTokenProof(body, rx); got != CodeReplayedNonce {
+		t.Fatalf("replay: %s", got)
 	}
 }

@@ -1147,7 +1147,11 @@ impl Actor {
                 return;
             }
         };
-        match self.client.refresh(&self.session_id, &oauth).await {
+        match self
+            .client
+            .refresh(&self.session_id, &oauth, &self.key)
+            .await
+        {
             Ok(r) => {
                 self.deps()
                     .redactor
@@ -1170,8 +1174,9 @@ impl Actor {
                 }
                 if let Some(reason) = e.ended_reason() {
                     let _ = self.inbound_tx.send(Inbound::Fatal(reason, None));
-                } else if e.status == 403 {
-                    // The org switch went off (section 12.3).
+                } else if e.status == 403 && e.code.as_deref() == Some("remote_disabled") {
+                    // The org switch went off (section 12.3). Another 403 (a refused proof,
+                    // #2390) is retried like any other failure.
                     let _ = self.inbound_tx.send(Inbound::Fatal(
                         "policy_off".into(),
                         Some(e.register_message()),
@@ -1954,6 +1959,17 @@ impl Poster {
                             .inbound
                             .send(Inbound::Fatal(e.ended_reason().unwrap_or_default(), None));
                         return;
+                    }
+                    Err(e) if e.status == 429 => {
+                        // Over the session's event byte rate (#2390): wait as told, keep the batch.
+                        let told = e
+                            .body
+                            .get("retry_after_s")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1)
+                            .clamp(1, 30);
+                        tokio::time::sleep(Duration::from_secs(told).max(retry)).await;
+                        retry = (retry * 2).min(Duration::from_secs(5));
                     }
                     Err(e) if e.status == 401 => {
                         let _ = self.inbound.send(Inbound::TokenExpired);

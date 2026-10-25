@@ -318,6 +318,7 @@ fn remote_link_opens_no_listening_socket() {
         ("remote/policy.rs", include_str!("../src/remote/policy.rs")),
         ("remote/redact.rs", include_str!("../src/remote/redact.rs")),
         ("remote/relay.rs", include_str!("../src/remote/relay.rs")),
+        ("remote/token.rs", include_str!("../src/remote/token.rs")),
         (
             "amp-tui remote.rs",
             include_str!("../../amp-tui/src/remote.rs"),
@@ -347,4 +348,50 @@ fn remote_link_opens_no_listening_socket() {
         modules.contains("#[cfg(feature = \"mock-relay\")]\npub mod mock_relay;"),
         "the mock relay (which listens) is compiled only with the test feature"
     );
+}
+
+/// token.json (#2390): every token refresh proof through the relay's check of section 8.2, and
+/// the harness's own proofs round-trip through it.
+#[test]
+fn token_proof_vectors() {
+    use amp_core::remote::token;
+    let file = load("token.json");
+    let vectors = file["vectors"].as_array().unwrap();
+    assert!(vectors.len() >= 10);
+    for v in vectors {
+        let rx = &v["receiver"];
+        let harness_pub = crypto::b64u_decode(rx["harness_pub"].as_str().unwrap()).unwrap();
+        let seen: Vec<String> = rx["seen_nonces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_str().unwrap().to_owned())
+            .collect();
+        let got = token::check(
+            v["body"].as_str().unwrap().as_bytes(),
+            token::ProofReceiver {
+                now_ms: rx["now_ms"].as_i64().unwrap(),
+                session_id: rx["session_id"].as_str().unwrap(),
+                harness_id: rx["harness_id"].as_str().unwrap(),
+                harness_pub: &harness_pub,
+                seen: &mut |n: &str| seen.iter().any(|s| s == n),
+            },
+        );
+        assert_eq!(got, v["expect"].as_str().unwrap(), "{}", v["name"]);
+    }
+    let keys = load("keys.json");
+    let k = &keys["keys"][0];
+    let key = KeyPair::from_scalar(&hex(k["private_scalar_hex"].as_str().unwrap())).unwrap();
+    let body = token::refresh_body(&key, "rs_YIL0d-r7J-AHLPpZ00o2bA", 1_000).to_string();
+    let got = token::check(
+        body.as_bytes(),
+        token::ProofReceiver {
+            now_ms: 1_000,
+            session_id: "rs_YIL0d-r7J-AHLPpZ00o2bA",
+            harness_id: key.id(),
+            harness_pub: key.public_raw(),
+            seen: &mut |_: &str| false,
+        },
+    );
+    assert_eq!(got, "ok");
 }

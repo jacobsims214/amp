@@ -65,6 +65,7 @@ struct Session {
     harness_id: String,
     harness_pub: Vec<u8>,
     tokens: Vec<String>,
+    proof_nonces: Vec<String>,
     events: Vec<Value>,
     accepted_through: i64,
     stream: Option<mpsc::UnboundedSender<Bytes>>,
@@ -229,7 +230,12 @@ async fn register(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Re
     )
 }
 
-async fn refresh(State(app): State<App>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+async fn refresh(
+    State(app): State<App>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     app.note("token".into());
     let token = bearer(&headers);
     if token.starts_with("amp_") {
@@ -245,6 +251,27 @@ async fn refresh(State(app): State<App>, Path(id): Path<String>, headers: Header
     };
     if let Some(reason) = &s.ended {
         return err(410, "session_ended", json!({"reason": reason}));
+    }
+    // The harness key's proof (protocol 8.2, #2390).
+    let (harness_id, harness_pub) = (s.harness_id.clone(), s.harness_pub.clone());
+    let nonces = &mut s.proof_nonces;
+    let code = super::token::check(
+        &body,
+        super::token::ProofReceiver {
+            now_ms: now_ms(),
+            session_id: &id,
+            harness_id: &harness_id,
+            harness_pub: &harness_pub,
+            seen: &mut |n: &str| {
+                let hit = nonces.iter().any(|x| x == n);
+                nonces.push(n.to_owned());
+                hit
+            },
+        },
+    );
+    if code != "ok" {
+        let status = if code == "bad_signature" { 403 } else { 400 };
+        return err(status, code, json!({}));
     }
     s.tokens.push(connect.clone());
     ok(
