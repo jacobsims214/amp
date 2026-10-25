@@ -72,11 +72,16 @@ export interface SessionState {
   /** The harness speaks a newer protocol: stop applying events (5.7 step 3). */
   versionMismatch: boolean
   lastAppliedSeq: number
+  /** The seq of the envelope the shown `hello` / `status` came from (0: none yet). A snapshot or
+   *  event older than what's shown is ignored, so a relay can't replay a stale status (#2393). */
+  helloSeq: number
+  statusSeq: number
 }
 
 export const initialSessionState: SessionState = {
   hello: null, status: null, items: [], queue: [], workers: [], outgoing: [], online: null,
   connection: 'connecting', running: null, runStartedAt: null, totals: noTotals, workersAt: null, compaction: null, ended: null, versionMismatch: false, lastAppliedSeq: 0,
+  helloSeq: 0, statusSeq: 0,
 }
 
 export type SessionAction =
@@ -217,15 +222,29 @@ function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
   }
 }
 
+/**
+ * A `hello` or `status`, from the stream or a snapshot, with the same freshness rule for both:
+ * nothing older than what's shown replaces it (#2381 info, #2393). Snapshots are signed but carry
+ * no seq check of their own (5.7), so without this a relay could replay an old, genuine status.
+ * A hello's embedded status counts only when it is newer than the status shown.
+ */
+function applyHelloOrStatus(s: SessionState, env: Envelope): SessionState {
+  if (env.op === 'status') {
+    if (env.seq < s.statusSeq) return s
+    return { ...s, status: env.body as SessionStatus, statusSeq: env.seq }
+  }
+  if (env.seq < s.helloSeq) return s
+  const hello = env.body as HelloBody
+  const newer = !!hello.status && env.seq > s.statusSeq
+  return { ...s, hello, helloSeq: env.seq, ...(newer ? { status: hello.status!, statusSeq: env.seq } : {}) }
+}
+
 function applyEvent(s: SessionState, env: Envelope, myDeviceId: string | null): SessionState {
   const base = { ...s, lastAppliedSeq: env.seq }
   switch (env.op) {
-    case 'hello': {
-      const hello = env.body as HelloBody
-      return { ...base, hello, status: hello.status ?? base.status }
-    }
+    case 'hello':
     case 'status':
-      return { ...base, status: env.body as SessionStatus }
+      return applyHelloOrStatus(base, env)
     case 'chat_event':
       return applyChat(base, env.body as ChatEvent, typeof env.ts === 'number' ? env.ts : Date.now())
     case 'ack': {
@@ -266,12 +285,7 @@ export function sessionReducer(s: SessionState, a: SessionAction): SessionState 
       return { ...s, lastAppliedSeq: Math.max(s.lastAppliedSeq, a.seq) }
     case 'snapshot':
       // Snapshots restore the status bar; they never move lastAppliedSeq (5.7).
-      if (a.env.op === 'hello') {
-        const hello = a.env.body as HelloBody
-        return { ...s, hello, status: s.status ?? hello.status ?? null }
-      }
-      if (a.env.op === 'status') return { ...s, status: a.env.body as SessionStatus }
-      return s
+      return a.env.op === 'hello' || a.env.op === 'status' ? applyHelloOrStatus(s, a.env) : s
     case 'relay': {
       const f = a.frame
       if (f.type === 'attached') return { ...s, online: f.online, connection: 'live' }

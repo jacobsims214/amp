@@ -1334,6 +1334,21 @@ sequenceDiagram
 - `EventSource` doesn't notice silence: reopen it after 60 s without a keepalive.
 - Strict CSP on `/sessions/:id` (no inline script, `connect-src 'self'`, no `unsafe-eval`). Render with the
   sanitizing Markdown component, without raw HTML or images.
+- Baseline CSP on every other page (#2393): `script-src 'self'`, `object-src 'none'`, `base-uri 'none'`,
+  `frame-ancestors 'none'`, same-origin connect. The device key can be used by any script on the AMP origin,
+  so script injected on `/board` must not run either. Both policies live in `ui/src/remote/csp.ts`; nginx and
+  `vite preview` serve them, and `csp.test.ts` keeps them in step.
+- The strict policy only covers a **full load** of `/sessions/…`. Links to a session page are plain `<a href>`,
+  never a router `<Link>`/`navigate()` (a test fails on one). The device key's private operations
+  (`ensureDevice`, `signCommand`, `signPairRequest`, `pinHarness`) refuse unless the document was loaded at
+  `/sessions/…` and is still there (`ui/src/remote/keyGate.ts`).
+- Snapshots (`hello`/`status`) older than the one shown are ignored, and so are older `status` events, so a
+  relay can't roll the status bar back with a replayed but genuine envelope.
+- **Residual risk (T-UI-4/T-UI-5).** The key gate covers AMP's own code path, not the origin: the key is
+  non-extractable, but script that does run on any AMP page can open the same IndexedDB store and sign with it.
+  The baseline CSP is what keeps such script from running. The real fix is a step-up for prompts (R-S3:
+  WebAuthn user verification per prompt or per short window, so a signature needs the person's presence),
+  planned for a later milestone. Serving the session page from its own origin would also isolate the key.
 
 ## 16. Test vectors
 
