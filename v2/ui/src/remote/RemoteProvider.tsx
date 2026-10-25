@@ -15,6 +15,12 @@ export function RemoteProvider({ children, deps }: { children: ReactNode; deps?:
     // Compared inline (not through a variable) so a normal build drops both branches and the mock.
     if (import.meta.env.VITE_REMOTE_MOCK === '1') {
       import('./mock/mockRelay').then(m => setMockDeps(m.devMockDeps()))
+    } else if (import.meta.env.VITE_REMOTE_MOCK === 'parity2388') {
+      // #2388: the real harness run with its status, workers, compaction, refusal and provider error.
+      Promise.all([import('./mock/mockRelay'), import('./mock/parity2388.json')])
+        .then(([m, r]) => setMockDeps(m.devMockDeps2388(r.default as Parameters<typeof m.devMockDeps2388>[0], {
+          cut: Number(import.meta.env.VITE_PARITY_CUT ?? 0), workers: import.meta.env.VITE_PARITY_SCENE === 'workers',
+        })))
     } else if (import.meta.env.VITE_REMOTE_MOCK === 'parity') {
       // The feed recorded from the real harness chat (#2386), for side-by-side checks with the TUI.
       Promise.all([import('./mock/mockRelay'), import('./mock/parityStream.json')])

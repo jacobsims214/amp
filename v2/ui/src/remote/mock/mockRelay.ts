@@ -419,3 +419,27 @@ export function devMockDeps(kind: string = '1', stream?: { at_ms: number; event:
   if (open) relay.markRunning(open)
   return { transport: mockTransport(relay), crypto: mockCrypto({ paired: !pairingLinkFor(MOCK_SESSION_ID) }), mock: true }
 }
+
+/**
+ * Dev wiring for `VITE_REMOTE_MOCK=parity2388` (#2388): the run recorded from the real harness
+ * (parity2388.json) with the status its remote link sent. `cut` stops the replay after that many
+ * events (a compaction in flight); `workers` adds the recorded worker_status of two real workers.
+ */
+export function devMockDeps2388(rec: { status: SessionStatus; stream: { at_ms: number; event: ChatEvent }[]; workers: { at_ms: number; event: ChatEvent } },
+  opts: { cut?: number; workers?: boolean } = {}): RemoteDeps {
+  const now = Date.now()
+  const cut = opts.cut && opts.cut > 0 ? rec.stream.slice(0, opts.cut) : rec.stream
+  const shift = now - 1_500 - cut[cut.length - 1].at_ms
+  const replay = cut.map(e => ({ at_ms: e.at_ms + shift, event: e.event }))
+  let status = rec.status
+  if (opts.workers && rec.workers.event.type === 'worker_status') {
+    // As captured: both workers running for 2 s.
+    const started = now - 2_400
+    replay.push({ at_ms: now - 400, event: { ...rec.workers.event, workers: rec.workers.event.workers.map(w => ({ ...w, started_at_ms: started })) } })
+    status = { ...status, workers_running: rec.workers.event.workers.length }
+  }
+  const relay = new MockRelay({ stream: replay, status })
+  const open = replay.reduce<string | null>((run, e) => e.event.type === 'run_start' ? e.event.run_id : e.event.type === 'run_end' ? null : run, null)
+  if (open || opts.workers) relay.markRunning(open ?? 'run_workers')
+  return { transport: mockTransport(relay), crypto: mockCrypto({ paired: true }), mock: true }
+}
