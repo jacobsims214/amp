@@ -925,3 +925,251 @@ async fn the_first_run_saves_the_server_by_name() {
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
     assert!(!out.stderr.contains("Saved the server"), "{}", out.stderr);
 }
+
+/// Runs git in `dir` with a fixed identity; panics on failure.
+fn git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "t")
+        .env("GIT_AUTHOR_EMAIL", "t@example.com")
+        .env("GIT_COMMITTER_NAME", "t")
+        .env("GIT_COMMITTER_EMAIL", "t@example.com")
+        .output()
+        .expect("run git");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// #2356's fixture, like the user's harness-play: `project/` is a git repository with a committed
+/// `.amp.json` for #45 "Harness play" (made for no particular server, so it is not foreign) and a
+/// tracked `src/`. Returns the workdir and the parent marker's bytes.
+fn linked_parent_repo(name: &str) -> (PathBuf, Vec<u8>) {
+    let dir = workdir(name, None);
+    let project = dir.join("project");
+    std::fs::write(
+        project.join(".amp.json"),
+        "{\n  \"project_id\": 45,\n  \"project_name\": \"Harness play\",\n  \"project_code\": \"HP\"\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(project.join("src")).unwrap();
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    git(&project, &["init", "-q", "-b", "main"]);
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-q", "-m", "init"]);
+    let bytes = std::fs::read(project.join(".amp.json")).unwrap();
+    (dir, bytes)
+}
+
+fn first_run<'a>(dir: &'a Path, cwd: &Path, url: &str, stdin: Option<&'a str>) -> Run<'a> {
+    let mut run = Run::new(dir, &["--snapshot", "400x30", "--no-session"]);
+    run.cwd = Some(cwd.to_path_buf());
+    run.stdin = stdin;
+    run.env("AMP_HARNESS_PROMPTS", "stdin")
+        .env("AMP_MCP_URL", url.to_owned())
+        .env("OPENROUTER_API_KEY", SECRET)
+}
+
+fn read_json(path: &Path) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(path).expect("a marker")).unwrap()
+}
+
+fn assert_has(text: &str, wants: &[&str]) {
+    for want in wants {
+        assert!(text.contains(want), "missing {want:?} in\n{text}");
+    }
+}
+
+/// #2356: an empty new folder inside a linked repository (no `git init`) is not silently the
+/// parent's project. The first run says which marker it would use, offers the picker, writes the
+/// new project's `.amp.json` in the new folder and leaves the parent's byte for byte. The next
+/// start asks nothing and the banner shows the folder's own project.
+#[tokio::test]
+async fn a_new_folder_under_a_linked_repo_is_asked_about_and_gets_its_own_marker() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let (dir, parent_bytes) = linked_parent_repo("setup-child-new");
+    let parent = dir.join("project/.amp.json");
+    let child = dir.join("project/test-project-2");
+    std::fs::create_dir_all(&child).unwrap();
+
+    let out = first_run(&dir, &child, &amp.url, Some("n\nNew Thing\n\n"))
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let parent_shown = parent.display().to_string();
+    assert_has(
+        &out.stderr,
+        &[
+            "This folder (test-project-2) has no .amp.json of its own: it would use project #45 \
+             Harness play from ../.amp.json in a parent folder",
+            &parent_shown,
+            "Pick a project for this folder, or create a new one:",
+            "1) #2 AMP v2 (AV)",
+            "Enter to use #45 here too",
+            "Created #77 New Thing",
+            &format!("({})", child.join(".amp.json").display()),
+            &format!("The parent folder's {parent_shown} (#45) is unchanged."),
+            "is not a git repository of its own, so workers will work in this folder directly",
+            "Run `git init` there and commit once",
+        ],
+    );
+    assert_eq!(read_json(&child.join(".amp.json"))["project_id"], 77);
+    assert_eq!(
+        std::fs::read(&parent).unwrap(),
+        parent_bytes,
+        "byte for byte"
+    );
+    assert!(
+        out.stdout.contains("project #77 New Thing"),
+        "{}",
+        out.stdout
+    );
+    assert!(!out.stdout.contains("(from ../"), "{}", out.stdout);
+
+    let out = first_run(&dir, &child, &amp.url, None).go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.trim().is_empty(), "{}", out.stderr);
+    assert_eq!(std::fs::read(&parent).unwrap(), parent_bytes);
+}
+
+/// #2356 with `git init` in the new folder (its own repository, no commit yet): asked about too.
+/// Enter keeps the parent's project for this folder by linking it here as well, so the next start
+/// doesn't ask; the parent's file is unchanged.
+#[tokio::test]
+async fn a_child_repo_under_a_linked_folder_is_asked_and_enter_links_the_parents_project() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let (dir, parent_bytes) = linked_parent_repo("setup-child-git");
+    let parent = dir.join("project/.amp.json");
+    let child = dir.join("project/test-project-3");
+    std::fs::create_dir_all(&child).unwrap();
+    git(&child, &["init", "-q", "-b", "main"]);
+
+    let out = first_run(&dir, &child, &amp.url, Some("\n")).go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_has(
+        &out.stderr,
+        &[
+            "This folder (test-project-3) has no .amp.json of its own",
+            "Enter to use #45 here too",
+            "Using #45 Harness play (HP) and linked this folder",
+            "(#45) is unchanged.",
+            // No commit yet: workers can't branch from it.
+            "has no commit yet, so workers will work in this folder directly",
+            "Commit once there to give them their own worktrees.",
+        ],
+    );
+    let m = read_json(&child.join(".amp.json"));
+    assert_eq!(m["project_id"], 45);
+    assert_eq!(m["project_name"], "Harness play");
+    assert_eq!(std::fs::read(&parent).unwrap(), parent_bytes);
+
+    let out = first_run(&dir, &child, &amp.url, None).go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.trim().is_empty(), "{}", out.stderr);
+}
+
+/// #2356: an ordinary subfolder of a linked repository (`cd src/`) uses the repository's project
+/// without a question; the banner says the marker is a parent folder's.
+#[tokio::test]
+async fn a_subfolder_of_a_linked_repo_uses_its_project_without_asking() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let (dir, parent_bytes) = linked_parent_repo("setup-child-src");
+    let src = dir.join("project/src");
+
+    let out = first_run(&dir, &src, &amp.url, None).go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stderr.trim().is_empty(), "{}", out.stderr);
+    assert!(
+        out.stdout
+            .contains("project #45 Harness play (from ../.amp.json)"),
+        "{}",
+        out.stdout
+    );
+    assert!(!src.join(".amp.json").exists());
+    assert_eq!(
+        std::fs::read(dir.join("project/.amp.json")).unwrap(),
+        parent_bytes
+    );
+}
+
+/// #2356: `init` in a child folder never writes over the parent's `.amp.json`, whether the project
+/// comes from a flag, from the picker after "Keep it? n", or from `cd src/`. With --yes and no
+/// project flag, the parent's project is kept and the summary says how to link the folder.
+#[tokio::test]
+async fn init_in_a_child_folder_never_overwrites_the_parents_marker() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let (dir, parent_bytes) = linked_parent_repo("setup-child-init");
+    let parent = dir.join("project/.amp.json");
+    let child = dir.join("project/child");
+    std::fs::create_dir_all(&child).unwrap();
+    let url = amp.url.clone();
+
+    // --yes, no project flag: kept, with a warning naming init.
+    let args = ["init", "--yes", "--url", &url, "--json"];
+    let mut run = Run::new(&dir, &args);
+    run.cwd = Some(child.clone());
+    let out = run.go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let v = out.json();
+    assert_eq!(v["project"]["id"], 45);
+    assert!(
+        v["warnings"].as_array().unwrap().iter().any(|w| {
+            w.as_str().is_some_and(|w| {
+                w.contains("from ../.amp.json in a parent folder") && w.contains("amp-harness init")
+            })
+        }),
+        "{v}"
+    );
+    assert!(!child.join(".amp.json").exists());
+
+    // Interactive: "Keep it?" names the parent's marker; n, then 1 from the picker.
+    let args = ["init", "--url", &url, "--json"];
+    let mut run = Run::new(&dir, &args);
+    run.cwd = Some(child.clone());
+    run.stdin = Some("n\n1\n");
+    let out = run
+        .env("AMP_HARNESS_PROMPTS", "stdin")
+        .env("OPENROUTER_API_KEY", SECRET)
+        .go()
+        .await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_has(
+        &out.stderr,
+        &[
+            "This folder uses project #45 Harness play from ../.amp.json in a parent folder",
+            "Keep it?",
+            "Pick a project for this folder",
+            "Using #2 AMP v2 (AV) and linked this folder",
+            "(#45) is unchanged.",
+        ],
+    );
+    assert_eq!(read_json(&child.join(".amp.json"))["project_id"], 2);
+    assert_eq!(std::fs::read(&parent).unwrap(), parent_bytes);
+
+    // --project from a tracked subfolder: written there, not over the repository root's.
+    let src = dir.join("project/src");
+    let args = ["init", "--yes", "--url", &url, "--project", "2"];
+    let mut run = Run::new(&dir, &args);
+    run.cwd = Some(src.clone());
+    let out = run.go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(read_json(&src.join(".amp.json"))["project_id"], 2);
+    assert_eq!(std::fs::read(&parent).unwrap(), parent_bytes);
+
+    // --create in a folder with no git repository below the linked one.
+    let plain = dir.join("project/notes/new");
+    std::fs::create_dir_all(&plain).unwrap();
+    let args = [
+        "init", "--yes", "--url", &url, "--create", "Notes", "--json",
+    ];
+    let mut run = Run::new(&dir, &args);
+    run.cwd = Some(plain.clone());
+    let out = run.go().await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert_eq!(read_json(&plain.join(".amp.json"))["project_id"], 77);
+    assert_eq!(std::fs::read(&parent).unwrap(), parent_bytes);
+}

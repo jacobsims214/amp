@@ -104,7 +104,10 @@ When the manager dispatches a ticket (its `amp_run_ticket` tool), the harness:
 
 1. waits for a free worker slot, then marks the ticket dispatched in AMP;
 2. for roles that edit files, creates a git worktree `<repo>/.worktrees/<ticket>` on branch
-   `amp-<ticket>` (read-only roles work in your folder);
+   `amp-<ticket>` (read-only roles work in your folder). When your folder is in no git
+   repository, is a new folder that another repository doesn't track, or is a repository with no
+   commit yet, the worker works in your folder directly and its report says why; `git init` and
+   one commit give workers their own worktrees;
 3. runs the worker on its role's model until it finishes, times out or uses up its turns;
 4. **reports the run to the ticket by itself**: model, tokens, cost, branch, commit. A worker
    that stops without closing its ticket is recorded as abandoned, with the reason.

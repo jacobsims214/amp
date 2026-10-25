@@ -1,7 +1,7 @@
 {
  "generated_by": "v2/scripts/build-harness-assets.sh — do not edit; edit v2/.opencode or v2/scripts/lib/harness_overrides.yaml",
  "source": "v2/.opencode",
- "source_sha256": "f75afbcc8dcd24b9296e795713785af810c68e7aeaf5a3dfb9cd3d632fe77344",
+ "source_sha256": "0abdd77c69bb8c52a854220f7a31f89fe8cb330f7bc91071b34fcfa9e97ad3af",
  "default_agent": "amp-manager",
  "excluded_skills": [
   "amp-agent-builder"

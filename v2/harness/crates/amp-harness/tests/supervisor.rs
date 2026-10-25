@@ -752,3 +752,69 @@ async fn manager_and_worker_requests_carry_the_current_time_but_transcripts_do_n
     assert!(!worker.contains("<current_time>"), "{worker}");
     assert!(!manager_text.contains("<current_time>"), "{manager_text}");
 }
+
+/// #2356: a manager in a new folder that the surrounding repository doesn't track, or in a
+/// repository with no commit yet, can't give a worker a useful worktree (it would be a checkout of
+/// the other repository, or there is nothing to branch from). The worker runs in the folder
+/// itself, and its report says why and how to get worktrees. After a commit, worktrees work.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workers_run_in_place_without_a_usable_repository_and_say_why() {
+    let f = fixture("in-place").await;
+    let hooks = Arc::new(Recorder::default());
+    let child = f.repo.join("new-folder");
+    std::fs::create_dir_all(&child).unwrap();
+    let sup = Supervisor::with_hooks(
+        Arc::clone(&f.rt),
+        ManagerContext {
+            role: "amp-manager".into(),
+            cwd: child.clone(),
+            project: f.manager().project,
+        },
+        config(),
+        Some(Arc::clone(&hooks) as Arc<dyn WorkerHooks>),
+    );
+    let run = |task_id: i64| {
+        f.script("wf", vec![template("Done here.", json!([]))]);
+        sup.run_ticket(
+            req(task_id, "amp:amp-worker-backend"),
+            CancellationToken::new(),
+        )
+    };
+
+    // Untracked by the parent repository: not a worktree of the parent.
+    let r = run(11).await.unwrap();
+    assert_eq!(r.cwd, child, "{r:?}");
+    assert!(r.worktree.is_none(), "{r:?}");
+    assert!(!f.repo.join(".worktrees/11").exists());
+    assert!(
+        r.notes.iter().any(|n| n.contains(&format!(
+            "{} is inside the git repository {} but none of its files are in it",
+            child.display(),
+            f.repo.display()
+        )) && n.contains("run `git init` in")),
+        "{r:?}"
+    );
+
+    // Its own repository, no commit yet.
+    git(&child, &["init", "-q", "-b", "main"]);
+    let r = run(12).await.unwrap();
+    assert_eq!(r.cwd, child, "{r:?}");
+    assert!(r.worktree.is_none(), "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.contains("has no commit yet, so there is nothing to branch from")),
+        "{r:?}"
+    );
+
+    // After one commit: a worktree of the folder's own repository.
+    std::fs::write(child.join("README.md"), "child\n").unwrap();
+    git(&child, &["add", "."]);
+    git(&child, &["commit", "-q", "-m", "init"]);
+    let r = run(13).await.unwrap();
+    assert_eq!(
+        r.worktree.as_deref(),
+        Some(child.join(".worktrees/13").as_path())
+    );
+    assert!(r.notes.is_empty(), "{r:?}");
+}

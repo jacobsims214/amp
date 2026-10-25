@@ -406,6 +406,7 @@ async fn loads_every_item_on_start_and_polls_on_the_intervals() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             intervals: fast(150),
@@ -469,6 +470,7 @@ async fn an_on_behalf_approval_clears_the_others_chip_on_the_fast_poll() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: None,
             intervals: Intervals {
@@ -509,6 +511,7 @@ async fn an_approval_in_the_web_ui_clears_the_pending_plan_on_the_fast_poll() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: None,
             intervals: Intervals {
@@ -556,6 +559,7 @@ async fn polls_only_what_applies() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             intervals: fast(100),
@@ -586,6 +590,7 @@ async fn amp_tool_calls_refresh_at_once() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             // Nothing is due again for an hour: every later call comes from a tool trigger.
@@ -788,6 +793,7 @@ async fn re_login_needed_heals_by_reconnecting_through_the_connector() {
     let meta = MetaPoller::spawn(
         Some(client(&old.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2107),
             intervals: iv,
@@ -928,6 +934,7 @@ async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(99_999),
             intervals: fast(3_600_000),
