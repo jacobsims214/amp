@@ -6,7 +6,14 @@
 // relay routes and doesn't link the relay (internal/relay); it only ends
 // sessions in the database (an org admin turning remote control off for the
 // org) and then calls POST /internal/relay/ctl/end on the holder's internal
-// listener, with the cluster token, so the holder closes the streams at once.
+// listener, with the relay cluster token, so the holder closes the streams at
+// once.
+//
+// The relay cluster token (#2392) is the relay's own: RELAY_CLUSTER_TOKEN
+// (the Helm chart's Secret amp-relay-cluster-token, mounted in amp-relay and
+// amp-api), else a cluster_settings row of its own (relay_token). It is never
+// amp-api's cluster token, so a relay that leaks it exposes only the relay's
+// internal listener, and amp-api's actors refuse it.
 // If no relay replica is running, there's nobody to tell: a session can't be
 // live without one. If the call fails, the holder's own sweep (every 5 s)
 // finds the session ended in the database and closes it anyway.
@@ -21,6 +28,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +41,10 @@ const (
 	// InternalPrefix is where the relay's internal listener serves forwarded
 	// requests and control calls.
 	InternalPrefix = "/internal/relay"
+	// TokenEnv names the relay cluster token's environment variable.
+	TokenEnv = "RELAY_CLUSTER_TOKEN"
+	// MinTokenLen is the shortest relay cluster token accepted from TokenEnv.
+	MinTokenLen = 32
 	// TokenHeader carries the cluster token on every internal call.
 	TokenHeader = "X-AMP-Cluster-Token"
 	// CallTimeout bounds one control call.
@@ -40,6 +53,27 @@ const (
 	// gone (cluster.Options' default).
 	DefaultTTL = 10 * time.Second
 )
+
+// ConfiguredToken is the relay cluster token from the environment (TokenEnv),
+// or "" when it isn't set. A token shorter than MinTokenLen is an error.
+func ConfiguredToken() (string, error) {
+	tok := strings.TrimSpace(os.Getenv(TokenEnv))
+	if tok != "" && len(tok) < MinTokenLen {
+		return "", fmt.Errorf("%s is too short: use at least %d random characters", TokenEnv, MinTokenLen)
+	}
+	return tok, nil
+}
+
+// Token is the relay cluster token: ConfiguredToken, else the relay's own
+// cluster_settings row (repository.RelayClusterToken), created on first use.
+// It is never amp-api's cluster token.
+func Token(ctx context.Context, repo *repository.Repo) (string, error) {
+	tok, err := ConfiguredToken()
+	if err != nil || tok != "" {
+		return tok, err
+	}
+	return repo.RelayClusterToken(ctx)
+}
 
 // EndNote names a session that ended, and why.
 type EndNote struct {
@@ -66,7 +100,7 @@ func Notes(ended []domain.RemoteSession, skip string) map[string][]EndNote {
 }
 
 // Call makes a control call (path under /internal/relay/ctl/) to the replica
-// at addr with the cluster token; out, if set, receives the JSON reply.
+// at addr with the relay cluster token; out, if set, receives the JSON reply.
 func Call(ctx context.Context, client *http.Client, token, addr, method, path string, in, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, CallTimeout)
 	defer cancel()
@@ -139,7 +173,7 @@ func (n *EndNotifier) clusterToken(ctx context.Context) (string, error) {
 	if n.token != "" {
 		return n.token, nil
 	}
-	tok, err := n.repo.ClusterToken(ctx)
+	tok, err := Token(ctx, n.repo)
 	if err != nil {
 		return "", err
 	}
@@ -158,7 +192,7 @@ func (n *EndNotifier) Notify(ended []domain.RemoteSession) {
 		defer cancel()
 		tok, err := n.clusterToken(ctx)
 		if err != nil {
-			slog.Warn("reading the cluster token failed; the relay's sweep will close ended sessions", "err", err)
+			slog.Warn("reading the relay cluster token failed; the relay's sweep will close ended sessions", "err", err)
 			return
 		}
 		var wg sync.WaitGroup

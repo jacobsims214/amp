@@ -2,8 +2,6 @@ package repository
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -91,18 +89,7 @@ func (r *Repo) ClaimProject(ctx context.Context, projectID int, node string, ttl
 // it the first time. Anything that can read the database is already
 // trusted with everything the token protects.
 func (r *Repo) ClusterToken(ctx context.Context) (string, error) {
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	if _, err := r.db.Exec(ctx, `
-		INSERT INTO cluster_settings (key, value) VALUES ('internal_token', $1)
-		ON CONFLICT (key) DO NOTHING`, hex.EncodeToString(b)); err != nil {
-		return "", err
-	}
-	var tok string
-	err := r.db.QueryRow(ctx, `SELECT value FROM cluster_settings WHERE key = 'internal_token'`).Scan(&tok)
-	return tok, err
+	return r.settingToken(ctx, "internal_token")
 }
 
 // ProjectsWithDueSchedules lists projects with a ticket waiting on a start

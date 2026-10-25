@@ -2,6 +2,7 @@ import { createContext, useContext } from 'react'
 import { unpairedCrypto, type RemoteCrypto } from './crypto'
 import { hasWebCrypto, webRemoteCrypto } from './webCrypto'
 import { httpTransport, type RelayTransport } from './transport'
+import { sessionPageOnly } from './keyGate'
 import type { Me } from '../types'
 
 /** What the remote-control UI talks to. Tests and the dev mock swap both. */
@@ -15,11 +16,12 @@ export interface RemoteDeps {
 /**
  * The real deps: the HTTP relay client and WebCrypto with IndexedDB. A browser
  * without either (an insecure origin, an old browser) gets `unpairedCrypto`, so
- * it can never sign or trust anything.
+ * it can never sign or trust anything. The key's private operations work only on a
+ * session page loaded in full (keyGate.ts, #2393).
  */
 export const defaultRemoteDeps: RemoteDeps = {
   transport: httpTransport,
-  crypto: hasWebCrypto() ? webRemoteCrypto() : unpairedCrypto,
+  crypto: hasWebCrypto() ? sessionPageOnly(webRemoteCrypto()) : unpairedCrypto,
   mock: false,
 }
 
