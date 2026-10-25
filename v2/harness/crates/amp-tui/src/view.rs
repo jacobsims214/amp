@@ -150,6 +150,8 @@ pub struct ChatView {
     last_thinking: Option<Arc<AssistantBlock>>,
     /// Clicks reach the chat (`[tui] mouse`): the last thinking's hint names them (#2345).
     mouse: bool,
+    /// The welcome banner, for [`Self::replace_in_banner`] (#2383).
+    banner: Mutex<Option<Arc<WrapText>>>,
     /// The person asked the run to stop: its aborted (or failed) reply keeps what it streamed
     /// and shows no error, since the shell says "Stopped." once (#2181).
     stopping: bool,
@@ -278,6 +280,7 @@ impl ChatView {
             show_thinking: ThinkingDisplay::default(),
             last_thinking: None,
             mouse: true,
+            banner: Mutex::new(None),
             stopping: false,
             error_shown: false,
             hint,
@@ -673,11 +676,30 @@ impl ChatView {
         self.scroll.touch();
         // Compact (#2346): no blank rows around it; the first message keeps its one blank row.
         let compact = crate::density::compact();
-        self.transcript.add_child(Arc::new(
+        let banner = Arc::new(
             WrapText::new(text.join("\n"), 1, 1)
                 .with_top_padding(!compact)
                 .with_bottom_padding(!compact),
-        ));
+        );
+        if let Ok(mut slot) = self.banner.lock() {
+            *slot = Some(Arc::clone(&banner));
+        }
+        self.transcript.add_child(banner);
+    }
+
+    /// Replaces the first `from` in the welcome banner with `to` (#2383: its project line, once
+    /// the chat's folder is linked). False when the banner has no `from`.
+    pub fn replace_in_banner(&self, from: &str, to: &str) -> bool {
+        let Some(banner) = self.banner.lock().ok().and_then(|b| b.clone()) else {
+            return false;
+        };
+        let text = banner.text();
+        if from.is_empty() || !text.contains(from) {
+            return false;
+        }
+        banner.set_text(text.replacen(from, to, 1));
+        self.scroll.touch();
+        true
     }
 
     /// The person's own message. Sending one jumps back to the latest output, so it is in view.
