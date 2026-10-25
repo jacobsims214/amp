@@ -143,3 +143,13 @@ runAsUser: 0
           - endpoint: { address: { socket_address: { address: amp-relay.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 3002 } } }
 {{- end }}
 {{- end -}}
+
+{{/* amp-relay's database role Secret (basic-auth: username, password), #2392. */}}
+{{- define "amp.relayDbSecret" -}}
+{{- .Values.relay.database.existingSecret | default "amp-relay-db" -}}
+{{- end -}}
+
+{{/* amp-relay's cluster token Secret, #2392. */}}
+{{- define "amp.relayTokenSecret" -}}
+{{- .Values.relay.clusterToken.existingSecret | default "amp-relay-cluster-token" -}}
+{{- end -}}

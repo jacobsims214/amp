@@ -123,6 +123,16 @@ spec:
             # Remote control of harness sessions (epic 165): the instance switch.
             - name: RELAY_ENABLED
               value: {{ .Values.relay.enabled | default false | quote }}
+            {{- if .Values.relay.enabled }}
+            # amp-relay's own database role: amp-api grants it what the relay
+            # uses after migrating (#2392).
+            - name: RELAY_DB_ROLE
+              value: {{ .Values.relay.database.role | quote }}
+            # amp-api ends sessions on the relay replica holding them with the
+            # relay's cluster token (never its own).
+            - name: RELAY_CLUSTER_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayTokenSecret" . }}, key: {{ .Values.relay.clusterToken.key }} } }
+            {{- end }}
             {{- with .Values.ampApi.appPublicUrl }}
             # The web origin (links, and the relay's exact Origin check on
             # browser POSTs). Unset: derived from MCP_PUBLIC_URL.
