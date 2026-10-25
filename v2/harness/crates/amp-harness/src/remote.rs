@@ -10,7 +10,8 @@
 //!   managed file's, the user config's and the repo config's `[remote] enabled = false`.
 //! - State: the harness key in the keychain (or `remote-harness-key.json` 0600 when logins are in
 //!   a file), pins in `<state>/remote-devices.json`, the local action log in
-//!   `<state>/remote-actions.log` (metadata only).
+//!   `<state>/remote-actions.log` (metadata only), session ends the relay hasn't heard yet in
+//!   `<state>/remote-pending-ends.json` (#2396).
 //! - Redaction: provider keys and secret headers, secret-looking environment values, the login's
 //!   tokens.
 
@@ -208,6 +209,7 @@ pub async fn build(
         keys,
         pins: Some(state.join(amp_core::remote::pairing::PIN_FILE)),
         action_log: Some(state.join("remote-actions.log")),
+        pending_ends: Some(state.join(amp_core::remote::pending::PENDING_ENDS_FILE)),
         redactor,
         switches: Arc::new(move || switches.check(&|k: &str| std::env::var(k).ok())),
         tuning: LinkTuning::default(),

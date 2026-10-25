@@ -388,7 +388,11 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         .await;
         // #2376: `/remote` turns it on, shows why it can't, and draws the badge and pairing.
         match &remote {
-            Ok((link, warning)) => shell.set_remote(Ok(link.clone()), warning.clone()),
+            Ok((link, warning)) => {
+                // #2396: a `/remote off` or exit the relay missed (it was down) is sent now.
+                link.retry_pending_ends();
+                shell.set_remote(Ok(link.clone()), warning.clone())
+            }
             Err(why) => shell.set_remote(Err(why.clone()), None),
         }
         if let Ok((w, h)) = crossterm::terminal::size() {

@@ -6,7 +6,8 @@
 //! Covered: register, pair, a prompt arriving as a user turn tagged remote (literal text, never
 //! a slash command), a prompt queued while busy, stop (clears the queue), every rejection case,
 //! reconnect with seq resume, detach, the idle and lifetime timeouts, a relay-side end, `amp_`
-//! tokens and an AMP without remote control refused, and no secret in any event.
+//! tokens and an AMP without remote control refused, no secret in any event, and `/remote off`
+//! during a relay outage reaching the relay once it's back (#2396).
 
 use std::{
     sync::{Arc, Mutex},
@@ -54,6 +55,7 @@ struct Rig {
     seen: Arc<Mutex<Vec<String>>>,
     script: FauxScript,
     log: std::path::PathBuf,
+    keys: KeyStore,
     _dir: TempDir,
 }
 
@@ -86,6 +88,7 @@ fn tuning() -> LinkTuning {
         tick: Duration::from_millis(50),
         bye_wait: Duration::from_secs(3),
         refused_every: Duration::ZERO,
+        end_retry: Duration::from_millis(200),
     }
 }
 
@@ -105,6 +108,16 @@ async fn rig(opts: MockOptions, tag: &str, token: &str) -> Rig {
 type Switches = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
 async fn rig_with(opts: MockOptions, tag: &str, token: &str, switches: Switches) -> Rig {
+    rig_tuned(opts, tag, token, switches, tuning()).await
+}
+
+async fn rig_tuned(
+    opts: MockOptions,
+    tag: &str,
+    token: &str,
+    switches: Switches,
+    tuning: LinkTuning,
+) -> Rig {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let script = FauxScript::new().with_tokens_per_second(40.0);
     let provider = FauxProvider::new(script.clone());
@@ -144,6 +157,7 @@ async fn rig_with(opts: MockOptions, tag: &str, token: &str, switches: Switches)
     let redactor = Redactor::new();
     redactor.add_values([PROVIDER_KEY]);
     let log = dir.0.join("remote-actions.log");
+    let keys = KeyStore::memory();
     let link = RemoteLink::new(RemoteDeps {
         setup: RemoteSetup {
             api_base: mock.base.clone(),
@@ -158,12 +172,13 @@ async fn rig_with(opts: MockOptions, tag: &str, token: &str, switches: Switches)
         host: shell.remote_host(),
         feed: Arc::clone(&feed),
         // Never the real keychain in tests (the Mac may be locked).
-        keys: KeyStore::memory(),
+        keys: keys.clone(),
         pins: Some(dir.0.join("remote-devices.json")),
         action_log: Some(log.clone()),
+        pending_ends: Some(dir.0.join("remote-pending-ends.json")),
         redactor,
         switches,
-        tuning: tuning(),
+        tuning,
     });
     let local = link.take_local_events().expect("local events");
     Rig {
@@ -177,6 +192,7 @@ async fn rig_with(opts: MockOptions, tag: &str, token: &str, switches: Switches)
         seen,
         script,
         log,
+        keys,
         _dir: dir,
     }
 }
@@ -1343,4 +1359,189 @@ async fn status_facts_and_compaction_reach_the_browser() {
         body,
         json!({"type": "compaction", "active": true, "manual": false})
     );
+}
+
+/// The notices the link has sent so far.
+fn notices(local: &mut UnboundedReceiver<LocalEvent>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(e) = local.try_recv() {
+        if let LocalEvent::Notice { text, .. } = e {
+            out.push(text);
+        }
+    }
+    out
+}
+
+/// #2396: `/remote off` while AMP's relay is down turns remote control off here at once, and the
+/// relay hears it once it's back: the chat keeps trying in the background with a token refresh
+/// signed by the harness key (the connect token lapsed meanwhile), then `DELETE`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_off_during_a_relay_outage_reaches_the_relay_when_it_is_back() {
+    let opts = MockOptions::default();
+    let mut r = rig(opts.clone(), "outage", &opts.oauth_token).await;
+    r.link.enable().await.expect("enable");
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "hello"))
+            .await
+    );
+    let sid = r.sid();
+    r.mock.set_down(true);
+    r.mock.expire_tokens(); // the outage outlasts the 15 minute connect token
+    r.link.disable().await;
+    assert!(matches!(r.link.current(), RemoteState::Off { .. }));
+    assert_eq!(r.mock.ended(), None, "the relay never heard the end");
+    let said = notices(&mut r.local).join("\n");
+    assert!(said.contains("Remote control is off."), "{said}");
+    assert!(
+        said.contains("AMP still lists this remote session"),
+        "{said}"
+    );
+    let pending = r.link.pending_ends();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].session_id, sid);
+    assert_eq!(pending[0].reason, "harness_ended");
+    let file = r._dir.0.join("remote-pending-ends.json");
+    let text = std::fs::read_to_string(&file).expect("the pending end is on disk");
+    assert!(!text.contains("rct_"), "no connect token on disk");
+
+    // Still down: it keeps the end and keeps trying.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(r.mock.ended(), None);
+    assert_eq!(r.link.pending_ends().len(), 1);
+
+    r.mock.set_down(false);
+    assert!(
+        r.mock
+            .wait_until(WAIT, |m| m.ended().as_deref() == Some("harness_ended"))
+            .await,
+        "the relay hears the end once it's back"
+    );
+    let reqs = r.mock.requests();
+    let back = reqs
+        .iter()
+        .rposition(|q| q.starts_with("down:"))
+        .expect("calls while down");
+    assert_eq!(
+        reqs[back + 1..]
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["token", "delete"],
+        "a signed refresh, then DELETE"
+    );
+    for _ in 0..50 {
+        if r.link.pending_ends().is_empty() && !file.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(r.link.pending_ends().is_empty());
+    assert!(!file.exists(), "the file goes once nothing is pending");
+    let log = std::fs::read_to_string(&r.log).unwrap();
+    assert!(
+        log.contains(r#""op":"end_late""#) && log.contains(r#""result":"ok""#),
+        "{log}"
+    );
+}
+
+/// #2396: quitting the chat during an outage leaves the end on disk; the next chat (a new link
+/// with the same state and harness key) sends it when it starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_next_start_sends_an_end_the_relay_missed() {
+    let opts = MockOptions::default();
+    // The first chat retries only once (then waits an hour): it "exits" before the relay is back.
+    let slow = LinkTuning {
+        end_retry: Duration::from_secs(3600),
+        ..tuning()
+    };
+    let mut r = rig_tuned(
+        opts.clone(),
+        "restart",
+        &opts.oauth_token,
+        Arc::new(|| Ok(())),
+        slow,
+    )
+    .await;
+    r.link.enable().await.expect("enable");
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "hello"))
+            .await
+    );
+    r.mock.set_down(true);
+    r.link.disable().await;
+    assert_eq!(r.link.pending_ends().len(), 1);
+    tokio::time::sleep(Duration::from_millis(200)).await; // its one try, still down
+    r.mock.set_down(false);
+    assert_eq!(r.mock.ended(), None);
+
+    let next = RemoteLink::new(RemoteDeps {
+        setup: RemoteSetup {
+            api_base: r.mock.base.clone(),
+            web_origin: "https://amp.example.test".into(),
+            ca_file: None,
+            project_id: Some(2),
+            host: "test-host".into(),
+            os: "macos".into(),
+            version: "0.0.0-test".into(),
+        },
+        tokens: Arc::new(FixedToken(opts.oauth_token.clone(), USER)),
+        host: r.shell.remote_host(),
+        feed: ManagerFeed::new(),
+        keys: r.keys.clone(),
+        pins: Some(r._dir.0.join("remote-devices.json")),
+        action_log: Some(r.log.clone()),
+        pending_ends: Some(r._dir.0.join("remote-pending-ends.json")),
+        redactor: Redactor::new(),
+        switches: Arc::new(|| Ok(())),
+        tuning: tuning(),
+    });
+    assert_eq!(next.pending_ends().len(), 1, "read from the file");
+    next.retry_pending_ends(); // what the chat does at start
+    assert!(
+        r.mock
+            .wait_until(WAIT, |m| m.ended().as_deref() == Some("harness_ended"))
+            .await,
+        "the next start ends it"
+    );
+    for _ in 0..50 {
+        if next.pending_ends().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(next.pending_ends().is_empty());
+    // Nothing pending: no key, login or relay call.
+    let before = r.mock.requests().len();
+    assert_eq!(next.send_pending_ends().await, 0);
+    assert_eq!(r.mock.requests().len(), before);
+}
+
+/// #2396: an end recorded for another AMP server, or for another harness key, is never sent here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_end_only_goes_to_its_own_server() {
+    let opts = MockOptions::default();
+    let r = rig(opts.clone(), "other", &opts.oauth_token).await;
+    let file = r._dir.0.join("remote-pending-ends.json");
+    let far = 4_102_444_800_000_i64; // 2100
+    std::fs::write(
+        &file,
+        json!({"v": 1, "ends": [
+            {"api_base": "https://other.example", "session_id": "rs_OtherServerAAAAAAAAAA",
+             "harness_id": "h", "reason": "harness_ended", "until_ms": far},
+        ]})
+        .to_string(),
+    )
+    .unwrap();
+    assert!(r.link.pending_ends().is_empty());
+    assert_eq!(r.link.send_pending_ends().await, 0);
+    assert!(r.mock.requests().is_empty(), "nothing sent anywhere");
+    assert!(file.exists(), "the other server's entry is kept");
+
+    // A `/remote off` the relay hears (its DELETE answers 204) leaves nothing pending.
+    r.link.enable().await.expect("enable");
+    r.link.disable().await;
+    assert_eq!(r.mock.ended().as_deref(), Some("harness_ended"));
+    assert!(r.link.pending_ends().is_empty());
+    let log = std::fs::read_to_string(&r.log).unwrap();
+    assert!(!log.contains("end_late"), "{log}");
 }

@@ -9,6 +9,7 @@
 //! - [`policy`]: the local off switches and the server/login checks.
 //! - [`relay`]: the relay's harness-leg HTTP API.
 //! - [`token`]: the token refresh proof signed with the harness key (section 8.2).
+//! - [`pending`]: session ends the relay hasn't heard yet, sent when it's back (#2396).
 //! - [`link`]: [`link::RemoteLink`], the outbound link the chat turns on with `/remote`.
 //! - `mock_relay` (feature `mock-relay`): an in-process relay for end-to-end tests.
 
@@ -19,6 +20,7 @@ pub mod link;
 #[cfg(feature = "mock-relay")]
 pub mod mock_relay;
 pub mod pairing;
+pub mod pending;
 pub mod policy;
 pub mod redact;
 pub mod relay;

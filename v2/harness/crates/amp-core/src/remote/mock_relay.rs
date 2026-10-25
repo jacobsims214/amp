@@ -88,6 +88,27 @@ struct App {
     opts: MockOptions,
     inner: Arc<Mutex<Inner>>,
     changed: Arc<Notify>,
+    /// The relay service is down (#2396): every call gets the proxy's `503`.
+    down: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// While the relay is "down", answer as Envoy does with no amp-relay behind it: `503`, a text
+/// body, no relay `code`. The request is still noted (`down:<path>`).
+async fn proxy(
+    State(app): State<App>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if app.down.load(std::sync::atomic::Ordering::SeqCst) {
+        app.note(format!("down:{} {}", req.method(), req.uri().path()));
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [("content-type", "text/plain")],
+            "no healthy upstream",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// The running mock. Dropping it stops the server.
@@ -446,6 +467,7 @@ impl MockRelay {
             opts,
             inner: Default::default(),
             changed: Arc::new(Notify::new()),
+            down: Default::default(),
         };
         let router = Router::new()
             .route("/relay/v1/sessions", post(register))
@@ -455,6 +477,7 @@ impl MockRelay {
             .route("/relay/v1/sessions/{id}/heartbeat", post(heartbeat))
             .route("/relay/v1/sessions/{id}/pairings", post(pairings))
             .route("/relay/v1/sessions/{id}", delete(end))
+            .route_layer(axum::middleware::from_fn_with_state(app.clone(), proxy))
             .with_state(app.clone())
             .merge(extra);
         let base = format!("http://{}", listener.local_addr().expect("addr"));
@@ -516,6 +539,23 @@ impl MockRelay {
             }
             s.ended = Some(reason.to_owned());
         });
+    }
+
+    /// Takes the relay service down (`true`) or brings it back (#2396). While down, every
+    /// harness call gets `503 no healthy upstream` and the command stream is cut.
+    pub fn set_down(&self, down: bool) {
+        self.app
+            .down
+            .store(down, std::sync::atomic::Ordering::SeqCst);
+        if down {
+            self.drop_stream();
+        }
+    }
+
+    /// Forgets the session's connect tokens, as if they lapsed during an outage: only a token
+    /// refresh (OAuth plus the harness key's proof) gets a new one.
+    pub fn expire_tokens(&self) {
+        self.with_last(|s| s.tokens.clear());
     }
 
     /// Every accepted event envelope, in seq order.
