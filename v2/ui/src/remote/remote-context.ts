@@ -1,5 +1,6 @@
 import { createContext, useContext } from 'react'
 import { unpairedCrypto, type RemoteCrypto } from './crypto'
+import { hasWebCrypto, webRemoteCrypto } from './webCrypto'
 import { httpTransport, type RelayTransport } from './transport'
 import type { Me } from '../types'
 
@@ -11,7 +12,16 @@ export interface RemoteDeps {
   mock: boolean
 }
 
-export const defaultRemoteDeps: RemoteDeps = { transport: httpTransport, crypto: unpairedCrypto, mock: false }
+/**
+ * The real deps: the HTTP relay client and WebCrypto with IndexedDB. A browser
+ * without either (an insecure origin, an old browser) gets `unpairedCrypto`, so
+ * it can never sign or trust anything.
+ */
+export const defaultRemoteDeps: RemoteDeps = {
+  transport: httpTransport,
+  crypto: hasWebCrypto() ? webRemoteCrypto() : unpairedCrypto,
+  mock: false,
+}
 
 export const RemoteContext = createContext<RemoteDeps>(defaultRemoteDeps)
 

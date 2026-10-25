@@ -1,8 +1,10 @@
 /**
  * The browser's event check (protocol 5.7) and command building (5.3).
- * Signature verification and signing are delegated to RemoteCrypto (crypto.ts).
+ * Signature verification and signing are delegated to RemoteCrypto (crypto.ts,
+ * implemented on WebCrypto in webCrypto.ts / protocol.ts).
  */
 import type { RemoteCrypto } from './crypto'
+import { b64uEncode } from './protocol'
 import type { CommandBody, CommandOp, Envelope, EventVerdict, HarnessPin, UnsignedCommand } from './types'
 
 export const MAX_EVENT_BYTES = 1_048_576
@@ -96,19 +98,13 @@ export function nextSeq(lastSent: number, now: number): number {
   return Math.max(lastSent + 1, now)
 }
 
-export function b64u(bytes: Uint8Array): string {
-  let s = ''
-  for (const b of bytes) s += String.fromCharCode(b)
-  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-
 export function newNonce(): string {
-  return b64u(crypto.getRandomValues(new Uint8Array(16)))
+  return b64uEncode(crypto.getRandomValues(new Uint8Array(16)))
 }
 
 /** A browser-chosen id matching `^[A-Za-z0-9_-]{1,64}$`. */
 export function newClientMsgId(): string {
-  return `m-${b64u(crypto.getRandomValues(new Uint8Array(9)))}`
+  return `m-${b64uEncode(crypto.getRandomValues(new Uint8Array(9)))}`
 }
 
 export function buildCommand(args: {
