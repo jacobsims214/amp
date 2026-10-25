@@ -28,7 +28,7 @@ import (
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
-	"github.com/simstech/amp-api/internal/relay"
+	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/service"
 	"github.com/simstech/amp-api/internal/webhook"
@@ -149,9 +149,6 @@ func main() {
 	defer stopCluster()
 	var node *cluster.Node
 	var internalServer *http.Server
-	// internalMux is the internal listener's: project actors, plus the
-	// remote control relay's forwarded requests once it is set up (6a).
-	var internalMux *http.ServeMux
 	if os.Getenv("CLUSTER_MODE") != "off" {
 		internalAddr := envOrDefault("CLUSTER_ADDR", ":3003")
 		advertise := os.Getenv("CLUSTER_ADVERTISE_ADDR")
@@ -167,9 +164,7 @@ func main() {
 		registry.EnableCluster(node)
 		go node.Run(clusterCtx)
 		go cluster.NewRelay(repo, sseHub, node.ID()).Run(clusterCtx)
-		internalMux = http.NewServeMux()
-		internalMux.Handle("/", registry.InternalHandler())
-		internalServer = &http.Server{Addr: internalAddr, Handler: internalMux}
+		internalServer = &http.Server{Addr: internalAddr, Handler: registry.InternalHandler()}
 		go func() {
 			slog.Info("replica listener up", "addr", internalAddr, "advertised", advertise, "node", node.ID())
 			if err := internalServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -342,35 +337,21 @@ func main() {
 	}()
 
 	// ---- 6. REST + SSE API (port 3001) ----
-	mux := http.NewServeMux()
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
+	// ---- 6a. Remote control (epic 165) ----
+	// The relay itself is its own service, amp-relay (cmd/relay): amp-api
+	// serves none of its routes (/relay/, /api/sessions). It keeps the org
+	// setting (/api/orgs/:id/remote-control) and the capability on /api/me,
+	// where RELAY_ENABLED (Helm relay.enabled, which also deploys amp-relay)
+	// is only the signal that a relay is deployed. Sessions an org admin ends
+	// here are closed on the relay replica holding them, over its internal
+	// listener (relayctl); with no relay running there is nothing to close.
 	remoteCfg := remoteConfig()
 	restHandler.SetRemoteControl(remoteCfg)
-	restHandler.Register(mux)
-
-	// ---- 6a. Remote control relay (epic 165, protocol.md) ----
-	// Only with the instance switch and auth on; otherwise every relay URL
-	// is a plain 404. The browser leg (/api/sessions) is on the REST mux,
-	// behind restVerifier like the rest of /api. The harness leg (/relay/)
-	// is not: register and token refresh take the harness's OAuth token
-	// through the MCP-audience verifier (as /mcp does), and the rest take
-	// the session's connect token.
-	// With replicas, every request for a session is served on the replica
-	// holding it, over the internal listener (internal/relay/cluster.go).
-	relayCfg := relay.Config{AppURL: appPublicURL()}
-	if node != nil {
-		relayCfg.Cluster = node
-	}
-	relayHandler, rl := setupRelay(remoteCfg, restHandler, mux, mcpVerifier.Middleware, relayCfg)
-	if rl != nil && internalMux != nil {
-		internalMux.Handle("/internal/relay/", rl.InternalHandler())
-	}
-	if rl != nil {
-		go rl.Run(ctx)
-		slog.Info("remote control relay enabled", "app_url", appPublicURL())
-	}
+	hookRelayEnds(restHandler.Service(), repo, node)
+	mux := apiMux(restHandler)
 	// Artifacts nobody kept are deleted after the retention period.
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
@@ -408,7 +389,6 @@ func main() {
 	var apiHandler http.Handler = mux
 	apiHandler = api.RejectCrossSiteWrites(apiHandler)
 	apiHandler = authExceptHealth(restVerifier, apiHandler)
-	apiHandler = relayBypass(relayHandler, apiHandler)
 	apiHandler = corsMiddleware.Handler(apiHandler)
 
 	apiServer := &http.Server{
@@ -484,31 +464,22 @@ func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	})
 }
 
-// setupRelay registers the remote control relay when the instance switch and
-// auth are both on: the browser leg on mux, and the harness leg returned as
-// the handler for /relay/. Otherwise nothing is registered and the returned
-// handler answers every /relay/ URL with a plain 404 (protocol 8.1).
-func setupRelay(cfg service.RemoteConfig, h *api.RestHandler, mux *http.ServeMux,
-	oauth func(http.Handler) http.Handler, rcfg relay.Config) (http.Handler, *relay.Relay) {
-	if !cfg.InstanceEnabled || !cfg.AuthEnabled {
-		return http.HandlerFunc(http.NotFound), nil
-	}
-	rl := relay.New(h.Service(), oauth, rcfg)
-	rl.RegisterBrowser(mux)
-	return rl.HarnessHandler(), rl
+// apiMux is amp-api's REST routes (the /health and /ready probes are added
+// by main). It has no remote control relay route: the relay is amp-relay.
+func apiMux(h *api.RestHandler) *http.ServeMux {
+	mux := http.NewServeMux()
+	h.Register(mux)
+	return mux
 }
 
-// relayBypass sends the remote control harness leg (/relay/) to relay, which
-// authenticates it itself, and everything else to next (behind restVerifier,
-// which accepts only the REST audiences and would mis-classify the harness).
-func relayBypass(relay, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/relay" || strings.HasPrefix(r.URL.Path, "/relay/") {
-			relay.ServeHTTP(w, r)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+// hookRelayEnds makes sessions svc ends (an org turning remote control off)
+// close on the amp-relay replica holding them.
+func hookRelayEnds(svc *service.Service, repo *repository.Repo, node *cluster.Node) {
+	ttl := time.Duration(0)
+	if node != nil {
+		ttl = node.TTL()
+	}
+	svc.OnRemoteEnded = relayctl.NewEndNotifier(repo, ttl).Notify
 }
 
 // appPublicURL is AMP's public address, for links to pages in the UI:
@@ -555,9 +526,10 @@ func kbReconcileInterval() time.Duration {
 }
 
 // remoteConfig is the instance's remote control configuration (epic 165).
-// RELAY_ENABLED (Helm relay.enabled) is the instance switch, off unless set
-// to true; it never turns on with auth off (OIDC_ISSUER_URL empty: compose
-// and local dev, where every caller is a global admin).
+// RELAY_ENABLED (Helm relay.enabled, which also deploys amp-relay) says a
+// relay is deployed, so /api/me can offer remote control; off unless set to
+// true, and never on with auth off (OIDC_ISSUER_URL empty: compose and local
+// dev, where every caller is a global admin). It turns no route on here.
 func remoteConfig() service.RemoteConfig {
 	on, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("RELAY_ENABLED")))
 	cfg := service.RemoteConfig{InstanceEnabled: on, AuthEnabled: os.Getenv("OIDC_ISSUER_URL") != ""}

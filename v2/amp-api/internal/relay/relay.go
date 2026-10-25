@@ -37,6 +37,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/service"
 )
@@ -150,18 +151,17 @@ func (rl *Relay) Registry() Registry { return rl.reg }
 // sessionsEnded closes the streams of sessions that just ended: here, and on
 // the replica holding each one when that's another.
 func (rl *Relay) sessionsEnded(ended []domain.RemoteSession) {
-	elsewhere := map[string][]endNote{}
 	for i := range ended {
 		reason := domain.RemoteEndHarnessEnded
 		if ended[i].EndReason != nil {
 			reason = *ended[i].EndReason
 		}
 		rl.endHere(ended[i].ID, reason)
-		if h := ended[i].HolderNode; rl.cfg.Cluster != nil && h != nil && *h != "" && *h != rl.cfg.Node {
-			elsewhere[*h] = append(elsewhere[*h], endNote{ID: ended[i].ID, Reason: reason})
-		}
 	}
-	for node, notes := range elsewhere {
+	if rl.cfg.Cluster == nil {
+		return
+	}
+	for node, notes := range relayctl.Notes(ended, rl.cfg.Node) {
 		rl.tellEnded(node, notes)
 	}
 }

@@ -1,7 +1,8 @@
 # AMP remote control: wire protocol v1 (M1)
 
 **Status:** contract for milestone M1 (epic 165, story 402). Ticket #2369. Written 2026-10-25.
-**Implemented by:** the Rust harness (`v2/harness`), the Go relay inside amp-api (`v2/amp-api`) and the
+**Implemented by:** the Rust harness (`v2/harness`), the Go relay service amp-relay (`v2/amp-api/cmd/relay`,
+its own binary, image and Deployment since #2387; the code is shared in the `v2/amp-api` module) and the
 TypeScript web app (`v2/ui`). All three test suites load the shared vectors in
 [`v2/testdata/remote-control/`](../../testdata/remote-control/README.md).
 
@@ -49,15 +50,15 @@ wrong and regenerate. Don't special-case either one.
 ```mermaid
 flowchart LR
   B[Browser / phone<br/>amp-ui /sessions/:id<br/>non-extractable P-256 device key] -- "GET /api/sessions/:id/events (SSE)<br/>POST /api/sessions/:id/commands" --> R
-  R[amp-api relay<br/>owner authz, registry,<br/>in-memory buffer, audit] -- "GET /relay/v1/sessions/:id/commands (SSE)" --> H
+  R[amp-relay<br/>owner authz, registry,<br/>in-memory buffer, audit] -- "GET /relay/v1/sessions/:id/commands (SSE)" --> H
   H[amp-harness on the laptop<br/>P-256 harness key in keychain<br/>verifies commands, signs events] -- "POST /relay/v1/sessions/:id/events" --> R
 ```
 
 - **Transport:** HTTPS only. Server-sent events (SSE) carry streams, and POST carries sends, on both legs.
   There is no WebSocket and no listening socket on the laptop (R-M1).
 - **Two legs:**
-  - **Harness leg** `/relay/v1/...`: bearer auth. Envoy runs it with ext_authz off, and amp-api verifies the
-    token itself, as it does for `/mcp`.
+  - **Harness leg** `/relay/v1/...`: bearer auth. Envoy runs it with ext_authz off, and amp-relay verifies the
+    token itself, with the same MCP-audience verifier amp-api uses for `/mcp`.
   - **Browser leg** `/api/sessions/...`: the normal oauth2-proxy cookie through Envoy ext_authz. Every call
     requires a person in the web UI (`Channel == ui`).
 - **End-to-end authentication, not end-to-end encryption.** The browser signs every command with a key that the
@@ -599,8 +600,10 @@ for `rejected`, `failed` and `locked` results.
   taken from the verified token. Someone else's session, or a session that doesn't exist, gets the same
   `404 not_found`, so existence never leaks. An ended session of the caller's own gets `410 session_ended`.
 - **Policy gates:**
-  - Instance switch off (`relay.enabled: false`, env `RELAY_ENABLED` unset): no relay routes are registered,
-    so every relay URL is a plain `404`.
+  - Instance switch off (`relay.enabled: false`): amp-relay isn't deployed and Envoy has no relay route.
+    amp-api serves no relay route either way, so `/api/sessions...` is amp-api's plain `404`, and `/relay/...`
+    falls through to the web app's catch-all and never reaches a relay. With `relay.enabled: true` and
+    amp-relay scaled to 0, Envoy has no upstream: both legs get `503` and remote control is unavailable.
   - Org switch off for the session's project: `403 remote_disabled`.
   - `AMP_HARNESS_DISABLE_REMOTE=1` on the laptop: the harness never calls the relay at all.
 
@@ -817,10 +820,12 @@ The per-device `DELETE /api/sessions/devices/:device_id` and the device list are
 
 - Defaults: `enabled: false`; `idle_timeout_min` 5..240, default 30; `device_pin_days` 0..30, default 30.
 - `PUT` audits `remote.policy.set`.
-- Turning `enabled` off ends every live session in the org within seconds (reason `policy_off`). The replica
-  that takes the `PUT` ends the sessions in Postgres and tells each session's holding replica with a small
-  control call on the internal `:3003` listener (section 11), which closes the streams. Chat payloads never
-  cross replicas this way, and nothing goes through Postgres NOTIFY.
+- Served by **amp-api** (not the relay). Turning `enabled` off ends every live session in the org within
+  seconds (reason `policy_off`). amp-api ends the sessions in Postgres and tells each session's holding
+  amp-relay replica with a control call on its internal `:3003` listener (`POST /internal/relay/ctl/end`,
+  cluster token; section 11), which closes the streams. With no relay running there is nothing to close. If
+  the call fails, the holder's own sweep finds the ended rows within seconds. Chat payloads never cross
+  services this way, and nothing goes through Postgres NOTIFY.
 
 #### Capability flag: `GET /api/me` (additive)
 
@@ -831,6 +836,8 @@ so the flag is a new member there:
 "capabilities": {"remote_control": {"available": true, "org_ids": [3], "reason": null}}
 ```
 
+- Served by **amp-api**. The instance switch here is `RELAY_ENABLED`, which Helm sets from `relay.enabled`
+  (the same value that deploys amp-relay); amp-api uses it only for this flag.
 - `available` is true when the instance switch is on, auth is enabled, the caller is a person (not an agent,
   not an API token), and at least one of the caller's orgs has the setting on.
 - Otherwise `reason` is one of `"instance_disabled"`, `"auth_disabled"`, `"not_a_person"`, `"no_org_enabled"`.
@@ -921,7 +928,23 @@ harness sends don't count.
 
 - The relay keeps one ring per session: the newest events within **200 events / 2 MiB / 10 minutes**, evicting
   the oldest first. The latest `hello` and `status` are kept outside the ring (the snapshot slot).
-- The ring lives only in the memory of the replica that holds the harness connection. It is **never** written to
+- **Which service serves what (#2387).** The relay is its own service, **amp-relay** (`cmd/relay`, image
+  `amp-relay`, Deployment `amp-relay`), sharing the database and the Go packages with amp-api:
+
+  | Endpoint | Served by |
+  |---|---|
+  | `/relay/v1/...` (harness leg, all of 8.2) | amp-relay (public `:3002`) |
+  | `/api/sessions`, `/api/sessions/...` (browser leg, all of 8.3, incl. `revoke-all`) | amp-relay (public `:3002`) |
+  | `/internal/relay/...` (forwarding between relay replicas; `ctl/end`, `ctl/device-revoked`, `ctl/presence`) | amp-relay (internal `:3003`, cluster token) |
+  | `GET`/`PUT /api/orgs/:id/remote-control` (org policy) | amp-api |
+  | `GET /api/me` `capabilities.remote_control` | amp-api |
+  | migrations, the idle/lifetime sweep | amp-api migrates; amp-relay runs the sweep |
+
+  amp-api serves none of the relay's routes and doesn't link the relay code, so with no amp-relay pod
+  running nobody can reach a harness. amp-relay never migrates the database: it waits for amp-api's
+  remote control migration. Its replicas join the same replica group (`api_nodes`) as amp-api's, which is
+  how relay replicas find a session's holder and how amp-api reaches it, but they never run project actors.
+- The ring lives only in the memory of the relay replica that holds the harness connection. It is **never** written to
   Postgres, the logs or traces, and it is dropped when the session ends.
 - **Multiple replicas.** The `remote_sessions` row names the replica that holds the session (`holder_node`):
   the replica that registered it, until that one is gone. Every call for a session, on either leg (the
@@ -1039,7 +1062,7 @@ sequenceDiagram
   autonumber
   actor U as Person at laptop
   participant H as amp-harness
-  participant R as amp-api relay
+  participant R as amp-relay
   participant DB as Postgres
   U->>H: /remote
   H->>H: check AMP_HARNESS_DISABLE_REMOTE, real OAuth login (not amp_ token), TLS or loopback
@@ -1066,7 +1089,7 @@ sequenceDiagram
   autonumber
   actor U as Person
   participant B as Browser (phone)
-  participant R as amp-api relay
+  participant R as amp-relay
   participant H as amp-harness
   U->>B: open link / scan QR
   B->>B: read #p and #h, then history.replaceState (drop the fragment)
@@ -1189,7 +1212,7 @@ sequenceDiagram
   vector by hand.
 - Never log envelopes, bodies, connect tokens, pairing secrets or keys. Log op, sizes, ids and codes.
 
-**Go (amp-api)**
+**Go (amp-api module: amp-api and amp-relay)**
 - **`Principal.Channel` / `InUI()` (epic 162) are on `main` but not on `remote-m1`**, which was cut from
   `harness-m4`. Before the browser leg can enforce `Channel == ui`, `main` has to be merged into `remote-m1`
   (the manager's call), or the relay ticket has to depend on that merge. Don't re-implement it differently.

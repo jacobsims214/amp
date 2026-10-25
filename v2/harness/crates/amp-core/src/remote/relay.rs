@@ -92,6 +92,13 @@ impl RelayError {
             (503, Some("audit_unavailable")) => {
                 "AMP couldn't record the audit entry, so it refused; try again shortly.".to_owned()
             }
+            // No relay behind the proxy: amp-relay is its own service (#2387), and with it
+            // scaled down or not deployed Envoy answers 502/503 without a relay `code`.
+            (502..=504, None) => {
+                "Remote control is unavailable: AMP's relay service isn't running \
+                 right now. Try again later, or ask your AMP admin."
+                    .to_owned()
+            }
             (0, _) => format!("AMP could not be reached: {}", self.message),
             _ => format!("AMP refused remote control: {self}"),
         }
@@ -449,5 +456,41 @@ impl ConnectToken {
 
     pub fn get(&self) -> String {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+#[cfg(test)]
+mod register_message_tests {
+    use super::*;
+
+    fn err(status: u16, code: Option<&str>) -> RelayError {
+        RelayError {
+            status,
+            code: code.map(str::to_owned),
+            message: "x".into(),
+            body: Box::new(Value::Null),
+        }
+    }
+
+    #[test]
+    fn relay_service_down_reads_as_unavailable() {
+        for s in [502, 503, 504] {
+            assert!(
+                err(s, None)
+                    .register_message()
+                    .starts_with("Remote control is unavailable"),
+                "{s}"
+            );
+        }
+        assert!(
+            err(503, Some("audit_unavailable"))
+                .register_message()
+                .contains("audit entry")
+        );
+        assert!(
+            err(404, None)
+                .register_message()
+                .contains("isn't available")
+        );
     }
 }

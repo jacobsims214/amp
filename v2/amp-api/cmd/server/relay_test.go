@@ -16,18 +16,22 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/simstech/amp-api/internal/api"
 	"github.com/simstech/amp-api/internal/auth"
+	"github.com/simstech/amp-api/internal/cluster"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/relay"
+	"github.com/simstech/amp-api/internal/relayserver"
 	"github.com/simstech/amp-api/internal/service"
 )
 
@@ -54,17 +58,24 @@ func (c *testClock) Add(d time.Duration) {
 type relayEnv struct {
 	w     *rbacWorld
 	rl    *relay.Relay
-	svc   *service.Service
-	srv   *httptest.Server
+	svc   *service.Service // amp-relay's service
+	srv   *httptest.Server // "Envoy": the relay paths to amp-relay, the rest to amp-api
 	clock *testClock
 	ids   map[string]*auth.Identity
+	// node and internal are this amp-relay replica's cluster membership and
+	// internal listener; stop ends its heartbeats and sweeps.
+	node     *cluster.Node
+	internal *httptest.Server
+	stop     context.CancelFunc
 }
 
-// newRelayEnv serves both legs the way main wires them (setupRelay and
-// relayBypass), with test identities in place of the two verifiers:
-// X-Test-As names the user, X-Test-Channel overrides how the request came
-// (default: the web UI on the browser leg, an MCP-audience OAuth token on
-// the harness leg).
+// newRelayEnv runs one amp-relay replica (relayserver, exactly what
+// cmd/relay serves) and amp-api's REST routes (apiMux, as cmd/server serves
+// them) behind one test server that splits paths the way Envoy does: /relay/
+// and /api/sessions to the relay, the rest to amp-api. Test identities stand
+// in for the verifiers: X-Test-As names the user, X-Test-Channel overrides
+// how the request came (default: the web UI on the browser leg and amp-api,
+// an MCP-audience OAuth token on the harness leg).
 func newRelayEnv(t *testing.T, tune func(*relay.Config)) *relayEnv {
 	t.Helper()
 	w := newRBACWorld(t)
@@ -72,8 +83,10 @@ func newRelayEnv(t *testing.T, tune func(*relay.Config)) *relayEnv {
 	return newRelayEnvIn(t, w, &testClock{at: time.Now()}, tune)
 }
 
+var relayEnvSeq atomic.Int64
+
 // newRelayEnvIn is newRelayEnv on an existing world and clock: several
-// relays (replicas) can share them.
+// relay replicas can share them.
 func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*relay.Config)) *relayEnv {
 	t.Helper()
 	agent := *w.alice
@@ -101,22 +114,68 @@ func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*rela
 			next.ServeHTTP(rw, r.WithContext(auth.WithIdentity(r.Context(), &c)))
 		})
 	}
-	h := api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb)
-	h.SetRemoteControl(remoteOn)
-	mux := http.NewServeMux()
-	h.Register(mux)
-	cfg := relay.Config{AppURL: relayOrigin, Now: e.clock.Now}
+
+	// amp-relay always joins the replica group (cmd/relay): its replicas find
+	// each other there, and amp-api finds the one holding a session.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := fastCluster
+	opts.ID = fmt.Sprintf("relay-%s-%d-%d", t.Name(), relayEnvSeq.Add(1), time.Now().UnixNano())
+	opts.Addr = ln.Addr().String()
+	node, err := cluster.Join(context.Background(), w.s.repo, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go node.Run(ctx)
+	e.node, e.stop = node, cancel
+
+	// amp-relay.
+	e.svc = service.New(w.s.repo, nil, nil)
+	e.svc.Remote, e.svc.AppURL = remoteOn, relayOrigin
+	cfg := relay.Config{AppURL: relayOrigin, Now: e.clock.Now, Cluster: node}
 	if tune != nil {
 		tune(&cfg)
 	}
-	oauth := func(next http.Handler) http.Handler { return identify("mcp", auth.ChannelMCP, next) }
-	harness, rl := setupRelay(remoteOn, h, mux, oauth, cfg)
-	if rl == nil {
+	rs := relayserver.New(e.svc, relayserver.Options{
+		Relay:       cfg,
+		HarnessAuth: func(next http.Handler) http.Handler { return identify("mcp", auth.ChannelMCP, next) },
+		BrowserAuth: func(next http.Handler) http.Handler { return identify("rest", auth.ChannelUI, next) },
+	})
+	if rs.Relay == nil {
 		t.Fatal("relay not set up")
 	}
-	e.rl, e.svc = rl, h.Service()
-	e.srv = httptest.NewServer(relayBypass(harness, identify("rest", auth.ChannelUI, api.RejectCrossSiteWrites(mux))))
-	t.Cleanup(e.srv.Close)
+	e.rl = rs.Relay
+	e.internal = httptest.NewUnstartedServer(rs.InternalHandler())
+	e.internal.Listener.Close()
+	e.internal.Listener = ln
+	e.internal.Start()
+
+	// amp-api: its REST routes, offering remote control, telling the relay
+	// about the sessions it ends.
+	h := api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb)
+	h.SetRemoteControl(remoteOn)
+	hookRelayEnds(h.Service(), w.s.repo, node)
+	ampAPI := identify("rest", auth.ChannelUI, api.RejectCrossSiteWrites(apiMux(h)))
+
+	relaySrv := rs.Handler()
+	e.srv = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if relayserver.IsRelayPath(r.URL.Path) {
+			relaySrv.ServeHTTP(rw, r)
+			return
+		}
+		ampAPI.ServeHTTP(rw, r)
+	}))
+	t.Cleanup(func() {
+		cancel()
+		e.srv.CloseClientConnections()
+		e.srv.Close()
+		e.internal.CloseClientConnections()
+		e.internal.Close()
+		_ = node.Leave(context.Background())
+	})
 	return e
 }
 
@@ -578,19 +637,18 @@ func TestRelay_RegistrationLimits(t *testing.T) {
 	e.register(t, "bob")
 }
 
-// With the instance switch or auth off, no relay route exists: plain 404s.
+// With the instance switch or auth off, amp-relay serves no relay route:
+// plain 404s. (cmd/relay refuses to start without auth anyway.)
 func TestRelay_InstanceSwitchOff(t *testing.T) {
 	w := newRBACWorld(t)
 	for _, cfg := range []service.RemoteConfig{{}, {InstanceEnabled: true}, {AuthEnabled: true}} {
-		h := api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb)
-		h.SetRemoteControl(cfg)
-		mux := http.NewServeMux()
-		h.Register(mux)
-		harness, rl := setupRelay(cfg, h, mux, func(n http.Handler) http.Handler { return n }, relay.Config{})
-		if rl != nil {
+		svc := service.New(w.s.repo, nil, nil)
+		svc.Remote = cfg
+		rs := relayserver.New(svc, relayserver.Options{})
+		if rs.Relay != nil || rs.InternalHandler() != nil {
 			t.Fatalf("%+v: relay set up", cfg)
 		}
-		srv := httptest.NewServer(relayBypass(harness, mux))
+		srv := httptest.NewServer(rs.Handler())
 		for _, path := range []string{"/relay/v1/sessions", "/relay/v1/sessions/rs_x/commands", "/api/sessions", "/api/sessions/rs_x/events"} {
 			resp, err := http.Post(srv.URL+path, "application/json", strings.NewReader("{}"))
 			if err != nil {

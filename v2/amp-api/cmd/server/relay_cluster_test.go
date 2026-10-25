@@ -12,59 +12,32 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/simstech/amp-api/internal/cluster"
 	"github.com/simstech/amp-api/internal/relay"
 )
 
-// relayReplica is one amp-api replica's relay: public listener (both legs),
-// cluster node and internal listener.
+// relayReplica is one amp-relay replica (with its own amp-api in front of
+// the same database): public listener, cluster node and internal listener.
 type relayReplica struct {
 	*relayEnv
-	node     *cluster.Node
-	internal *httptest.Server
-	stop     context.CancelFunc
 }
 
 func newRelayReplica(t *testing.T, w *rbacWorld, clock *testClock, name string) *relayReplica {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	opts := fastCluster
-	opts.ID = fmt.Sprintf("%s-%s-%d", t.Name(), name, time.Now().UnixNano())
-	opts.Addr = ln.Addr().String()
-	node, err := cluster.Join(context.Background(), w.s.repo, opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	go node.Run(ctx)
 	e := newRelayEnvIn(t, w, clock, func(c *relay.Config) {
-		c.Cluster = node
 		c.Sweep = 50 * time.Millisecond
 		c.RouteTimeout = 10 * time.Second
 	})
+	ctx, cancel := context.WithCancel(context.Background())
 	go e.rl.Run(ctx)
-	internal := httptest.NewUnstartedServer(e.rl.InternalHandler())
-	internal.Listener.Close()
-	internal.Listener = ln
-	internal.Start()
-	t.Cleanup(func() {
-		cancel()
-		internal.CloseClientConnections()
-		internal.Close()
-		_ = node.Leave(context.Background())
-	})
-	return &relayReplica{relayEnv: e, node: node, internal: internal, stop: cancel}
+	stopNode := e.stop
+	e.stop = func() { cancel(); stopNode() }
+	return &relayReplica{relayEnv: e}
 }
 
 // crash stops the replica the way a killed pod stops: no heartbeat, no
