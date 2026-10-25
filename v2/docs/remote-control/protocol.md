@@ -820,6 +820,27 @@ Response `204`. The relay ends the session, sends `relay {type: "ended"}` to the
 audits `remote.disable` (or `remote.expire` for `idle` and `expired`). The harness sends `bye` before
 `DELETE` when it can.
 
+**An end the relay missed (#2396).** When `/remote off`, `detach` or the harness exiting can't reach the relay
+(no answer, a `5xx`, `429`, or `401` because the connect token lapsed during an outage), remote control is
+off on the laptop at once, and the harness SHOULD still tell the relay. Otherwise AMP lists the session as
+live and offline until its idle limit. The harness records the end locally
+(`<state>/remote-pending-ends.json`, mode 0600: the AMP origin, session id, harness id, reason and a
+deadline; never a token). It then sends the end in the background while it runs, and again when it next
+starts. Sending it is a token refresh signed with the harness key (`POST …/token`, above), then this
+`DELETE` with the new token and the original reason. The wire is unchanged.
+
+The harness drops the entry when:
+
+- the relay ends the session (`204`), or says it's over (`410`, or `404`);
+- the org switch is off (`403 remote_disabled`): the relay ended the org's sessions itself;
+- another `4xx` means it can never succeed (a proof from another key, for example);
+- the deadline passes. The deadline is the earlier of the session's idle deadline and its lifetime, because by
+  then the relay ends the session by itself.
+
+An end with reason `idle` or `expired` is never recorded, for the same reason. Only the AMP origin that the
+session belongs to is ever sent its end. The relay serves both calls on any replica: a holder that's gone is
+taken over (section 11), as `TestRelay_EndAfterOutageWithSignedRefresh` checks.
+
 ### 8.3 Browser leg
 
 #### `GET /api/sessions`

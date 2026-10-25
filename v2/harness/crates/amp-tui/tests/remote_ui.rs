@@ -58,6 +58,7 @@ fn tuning() -> LinkTuning {
         tick: Duration::from_millis(50),
         bye_wait: Duration::from_secs(3),
         refused_every: Duration::ZERO,
+        end_retry: Duration::from_millis(200),
     }
 }
 
@@ -117,6 +118,7 @@ async fn rig(tag: &str, opts: MockOptions, size: (usize, usize)) -> Rig {
         keys: KeyStore::memory(),
         pins: Some(dir.join("remote-devices.json")),
         action_log: Some(dir.join("remote-actions.log")),
+        pending_ends: None,
         redactor: Redactor::new(),
         switches: Arc::new(|| Ok(())),
         tuning: tuning(),

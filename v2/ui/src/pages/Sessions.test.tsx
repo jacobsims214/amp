@@ -11,6 +11,7 @@ import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
 import type { RemoteDeps } from '../remote/remote-context'
 import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport } from '../remote/mock/mockRelay'
+import { httpTransport } from '../remote/transport'
 import type { SessionSummary } from '../remote/types'
 import type { Me } from '../types'
 
@@ -181,5 +182,26 @@ describe('Sessions page', () => {
     expect(inTime(now + 6 * 3_600_000 + 59.7 * 60_000, now)).toBe('in 7h 00m')
     expect(inTime(now + 30 * 86_400_000 - 9 * 60_000, now)).toBe('in 30 days')
     expect(inTime(now + 47 * 3_600_000, now)).toBe('in 47h 00m')
+  })
+})
+
+describe('Sessions page while amp-relay is down', () => {
+  it('says remote control is unavailable instead of a raw 503', async () => {
+    // Envoy answers for a relay with no replicas: 503, a text body, no relay code.
+    server.use(http.get('*/api/sessions', () => new HttpResponse('no healthy upstream', { status: 503, headers: { 'Content-Type': 'text/plain' } })))
+    const deps: RemoteDeps = { transport: httpTransport, crypto: mockCrypto(), mock: false }
+    render(
+      <AuthContext.Provider value={{ me: me(true), loading: false, error: null, isAdmin: false }}>
+        <RemoteProvider deps={deps}>
+          <MemoryRouter initialEntries={['/sessions']}>
+            <Routes><Route element={<AppShell />}><Route path="/sessions" element={<Sessions />} /></Route></Routes>
+          </MemoryRouter>
+        </RemoteProvider>
+      </AuthContext.Provider>,
+    )
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent("Remote control is unavailable right now (the relay service isn't running).")
+    expect(screen.queryByText(/Request failed/)).toBeNull()
+    server.resetHandlers()
   })
 })

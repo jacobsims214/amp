@@ -46,4 +46,31 @@ describe('SafeMarkdown (R-M10, T-UI-4)', () => {
     expect(safeUrl('data:image/png;base64,AAA')).toBe('')
     expect(safeUrl('/relative')).toBe('')
   })
+
+  it('keeps single newlines as line breaks, like the terminal (#2396)', () => {
+    const { container } = render(<SafeMarkdown>{'Counting:\n1\n2\n3'}</SafeMarkdown>)
+    const p = container.querySelector('p')!
+    expect(container.querySelectorAll('p')).toHaveLength(1)
+    expect(p.querySelectorAll('br')).toHaveLength(3)
+    expect(p.innerHTML.replace(/\n/g, '')).toBe('Counting:<br>1<br>2<br>3')
+    // A blank line still starts a new paragraph.
+    expect(render(<SafeMarkdown>{'one\n\ntwo'}</SafeMarkdown>).container.querySelectorAll('p')).toHaveLength(2)
+  })
+
+  it('leaves code blocks, inline code and tables alone', () => {
+    const md = 'Run:\n```sh\nmake check\nmake test\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\nuse `x` and\n`y`'
+    const { container } = render(<SafeMarkdown>{md}</SafeMarkdown>)
+    const pre = container.querySelector('pre')!
+    expect(pre.textContent).toBe('make check\nmake test\n')
+    expect(pre.querySelector('br')).toBeNull()
+    expect(container.querySelectorAll('tbody tr')).toHaveLength(2)
+    expect(container.querySelector('table br')).toBeNull()
+    const last = [...container.querySelectorAll('p')].at(-1)!
+    expect(last.querySelectorAll('code')).toHaveLength(2)
+    expect(last.querySelectorAll('br')).toHaveLength(1)
+    // Lists stay lists.
+    const list = render(<SafeMarkdown>{'- a\n- b'}</SafeMarkdown>).container
+    expect(list.querySelectorAll('li')).toHaveLength(2)
+    expect(list.querySelector('br')).toBeNull()
+  })
 })

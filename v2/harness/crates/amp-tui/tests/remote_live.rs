@@ -268,6 +268,7 @@ async fn live_go_relay() {
         keys: keys.clone(),
         pins: Some(dir.join("remote-devices.json")),
         action_log: Some(dir.join("remote-actions.log")),
+        pending_ends: Some(dir.join("remote-pending-ends.json")),
         redactor,
         switches: Arc::new(|| Ok(())),
         tuning: LinkTuning {

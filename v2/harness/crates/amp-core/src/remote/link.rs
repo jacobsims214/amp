@@ -35,6 +35,7 @@ use super::envelope::{
 use super::pairing::{
     self, PairCandidate, PairCheckInput, PairResult, PairingWindow, PinStore, StoredPin,
 };
+use super::pending::{self as pending_ends, PendingEnd, PendingStore};
 use super::redact::{self, DeltaGuard, Redactor};
 use super::relay::{ConnectToken, Frame, RelayClient, RelayError, now_ms};
 use crate::chat_event::{ChatEvent, NoticeLevel, PromptOrigin, QueueItem, RunOutcome};
@@ -164,6 +165,9 @@ pub struct LinkTuning {
     pub bye_wait: Duration,
     /// At most one `refused` event per device this often (section 5.6 allows one a second).
     pub refused_every: Duration,
+    /// The first wait before sending an end the relay didn't hear again (#2396); it doubles up
+    /// to a minute.
+    pub end_retry: Duration,
 }
 
 impl Default for LinkTuning {
@@ -178,6 +182,7 @@ impl Default for LinkTuning {
             tick: Duration::from_millis(250),
             bye_wait: Duration::from_secs(3),
             refused_every: Duration::from_secs(1),
+            end_retry: Duration::from_secs(5),
         }
     }
 }
@@ -207,6 +212,9 @@ pub struct RemoteDeps {
     pub pins: Option<PathBuf>,
     /// The local log of remote actions (`<state>/remote-actions.log`); `None`: no log.
     pub action_log: Option<PathBuf>,
+    /// Session ends the relay hasn't heard yet (`<state>/remote-pending-ends.json`, #2396);
+    /// `None`: memory only.
+    pub pending_ends: Option<PathBuf>,
     pub redactor: Redactor,
     /// The local off switches, re-read on every enable and reconnect ([`super::policy`]).
     pub switches: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
@@ -326,6 +334,10 @@ struct Shared {
     control: Mutex<Option<mpsc::UnboundedSender<Control>>>,
     pins: Mutex<Option<PinStore>>,
     key: Mutex<Option<KeyPair>>,
+    /// Ends to send again (#2396), and one sender at a time.
+    pending: Mutex<PendingStore>,
+    sending_pending: tokio::sync::Mutex<()>,
+    retrying: std::sync::atomic::AtomicBool,
 }
 
 /// The remote link of one chat. Cheap to clone.
@@ -346,8 +358,12 @@ impl RemoteLink {
     pub fn new(deps: RemoteDeps) -> Self {
         let (state, _) = watch::channel(RemoteState::Off { reason: None });
         let (local_tx, local_rx) = mpsc::unbounded_channel();
+        let pending = Mutex::new(PendingStore::new(deps.pending_ends.clone()));
         Self {
             shared: Arc::new(Shared {
+                pending,
+                sending_pending: tokio::sync::Mutex::new(()),
+                retrying: std::sync::atomic::AtomicBool::new(false),
                 deps,
                 state,
                 local_tx,
@@ -477,6 +493,8 @@ impl RemoteLink {
             ));
         }
         self.shared.state.send_replace(RemoteState::Starting);
+        // Ends the relay missed earlier (#2396) go out too, now that it may be back.
+        self.retry_pending_ends();
         let result = self.enable_inner().await;
         if let Err(e) = &result {
             self.shared.state.send_replace(RemoteState::Off {
@@ -586,6 +604,138 @@ impl RemoteLink {
         );
         tokio::spawn(actor.run());
         Ok(enabled)
+    }
+
+    /// The harness key, loaded once (from the store, creating it if there is none).
+    async fn harness_key(&self) -> Result<KeyPair, String> {
+        if let Some(k) = lock(&self.shared.key).clone() {
+            return Ok(k);
+        }
+        let store = self.shared.deps.keys.clone();
+        let key = tokio::task::spawn_blocking(move || store.load_or_create())
+            .await
+            .map_err(|e| format!("the harness key: {e}"))??;
+        *lock(&self.shared.key) = Some(key.clone());
+        Ok(key)
+    }
+
+    /// The session ends recorded for this AMP server that the relay hasn't heard yet (#2396).
+    pub fn pending_ends(&self) -> Vec<PendingEnd> {
+        let api_base = &self.shared.deps.setup.api_base;
+        lock(&self.shared.pending)
+            .load(now_ms())
+            .into_iter()
+            .filter(|e| &e.api_base == api_base)
+            .collect()
+    }
+
+    /// Sends every recorded end for this AMP server once (#2396): a token refresh signed with
+    /// the harness key, then `DELETE`. Returns how many are still waiting for the relay. Reads no
+    /// key and asks for no login when nothing is waiting.
+    pub async fn send_pending_ends(&self) -> usize {
+        let _one = self.shared.sending_pending.lock().await;
+        let ends = self.pending_ends();
+        if ends.is_empty() {
+            return 0;
+        }
+        let deps = &self.shared.deps;
+        let mut settled: Vec<String> = Vec::new();
+        let left = 'send: {
+            let key = match self.harness_key().await {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::debug!(error = %e, "remote: no harness key for the pending ends");
+                    break 'send ends.len();
+                }
+            };
+            let client = match RelayClient::new(&deps.setup.api_base, deps.setup.ca_file.as_deref())
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::debug!(error = %e, "remote: no relay client for the pending ends");
+                    break 'send ends.len();
+                }
+            };
+            let oauth = match deps.tokens.oauth_token().await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(error = %e, "remote: no login for the pending ends");
+                    break 'send ends.len();
+                }
+            };
+            deps.redactor.add_values([oauth.clone()]);
+            let mut left = 0;
+            for end in &ends {
+                // Only the key the session was registered with can prove the end.
+                let result = if end.harness_id != key.id() {
+                    pending_ends::Outcome::GiveUp
+                } else {
+                    match client.refresh(&end.session_id, &oauth, &key).await {
+                        Ok(r) => {
+                            deps.redactor.add_values([r.connect_token.clone()]);
+                            match client
+                                .end(&end.session_id, &r.connect_token, &end.reason)
+                                .await
+                            {
+                                Ok(()) => pending_ends::Outcome::Done,
+                                Err(e) => pending_ends::outcome(&e),
+                            }
+                        }
+                        Err(e) => pending_ends::outcome(&e),
+                    }
+                };
+                match result {
+                    pending_ends::Outcome::Retry => left += 1,
+                    done => {
+                        let ok = done == pending_ends::Outcome::Done;
+                        if let Some(path) = &deps.action_log {
+                            let line = json!({
+                                "at_ms": now_ms(), "session_id": end.session_id, "op": "end_late",
+                                "device_id": null, "result": if ok { "ok" } else { "gave_up" },
+                            });
+                            append_private(path, &format!("{line}\n"));
+                        }
+                        settled.push(end.session_id.clone());
+                    }
+                }
+            }
+            left
+        };
+        if !settled.is_empty()
+            && let Err(e) = lock(&self.shared.pending).remove(&settled, now_ms())
+        {
+            tracing::warn!(error = %e, "remote: the pending ends file could not be written");
+        }
+        left
+    }
+
+    /// Sends the recorded ends in the background until the relay has heard them all (or their
+    /// deadlines pass), waiting `end_retry`, doubling up to a minute, between tries. One loop
+    /// at a time; the chat calls it at start, and `/remote` and a missed end call it too.
+    pub fn retry_pending_ends(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.pending_ends().is_empty() || tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        if self.shared.retrying.swap(true, SeqCst) {
+            return;
+        }
+        let link = self.clone();
+        tokio::spawn(async move {
+            let mut wait = link.shared.deps.tuning.end_retry;
+            loop {
+                if link.send_pending_ends().await == 0 {
+                    break;
+                }
+                tokio::time::sleep(wait).await;
+                wait = (wait * 2).min(Duration::from_secs(60));
+            }
+            link.shared.retrying.store(false, SeqCst);
+            // An end recorded while the loop was finishing.
+            if !link.pending_ends().is_empty() {
+                link.retry_pending_ends();
+            }
+        });
     }
 
     fn notice(&self, level: NoticeLevel, text: impl Into<String>) {
@@ -1773,6 +1923,7 @@ impl Actor {
     /// Ends the session: `bye` and `DELETE` when the relay should hear it, then everything stops.
     async fn finish(&mut self, reason: &str, tell_relay: bool) {
         self.flush_guard();
+        let mut late_end = false;
         if tell_relay {
             self.send("bye", None, json!({"reason": reason}));
             let (done, rx) = oneshot::channel();
@@ -1789,6 +1940,30 @@ impl Actor {
                 .await
             {
                 tracing::debug!(error = %e, "remote: DELETE failed");
+                // #2396: the relay is out of reach (or the token lapsed during an outage).
+                // Remote control is off here now; the relay hears it when it's back. An idle or
+                // expired session needs nothing: the relay ends it by itself.
+                let until_ms = self
+                    .expires_at_ms
+                    .min(self.last_activity_ms + self.idle_timeout_ms);
+                if pending_ends::outcome(&e) == pending_ends::Outcome::Retry
+                    && matches!(delete_reason, "harness_ended" | "detached")
+                    && until_ms > now_ms()
+                {
+                    let end = PendingEnd {
+                        api_base: self.deps().setup.api_base.clone(),
+                        session_id: self.session_id.clone(),
+                        harness_id: self.key.id().to_owned(),
+                        reason: delete_reason.to_owned(),
+                        until_ms,
+                    };
+                    match lock(&self.link.shared.pending).add(end, now_ms()) {
+                        Ok(()) => late_end = true,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "remote: the pending end was not saved")
+                        }
+                    }
+                }
             }
         }
         for t in self.tasks.drain(..) {
@@ -1821,9 +1996,20 @@ impl Actor {
             other => format!("Remote control turned off ({other})."),
         };
         self.link.notice(NoticeLevel::Info, text);
+        if late_end {
+            self.link.notice(
+                NoticeLevel::Warn,
+                "AMP's relay couldn't be reached, so AMP still lists this remote session; the \
+                 harness tells it the session ended once the relay is back (or the next time it \
+                 starts).",
+            );
+        }
         self.link.shared.state.send_replace(RemoteState::Off {
             reason: Some(reason.to_owned()),
         });
+        if late_end {
+            self.link.retry_pending_ends();
+        }
     }
 }
 

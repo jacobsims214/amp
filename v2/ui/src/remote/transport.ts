@@ -49,8 +49,26 @@ export interface RelayTransport {
   pair(id: string, msg: PairMessage): Promise<{ expires_at_ms: number | null }>
 }
 
+/** Shown when the relay service isn't running (amp-relay scaled to 0 or not deployed). */
+export const RELAY_DOWN_MESSAGE = "Remote control is unavailable right now (the relay service isn't running)."
+
+/**
+ * The error for a failed relay call. A 502/503/504 without a relay `code` is
+ * the proxy in front of AMP answering for a relay that isn't there (Envoy's
+ * "no healthy upstream"), the same rule the harness uses (relay.rs). A 503
+ * that the relay itself sends carries a code (relay_unavailable,
+ * audit_unavailable) and keeps its own message.
+ */
 async function errorFrom(res: Response): Promise<RelayError> {
-  const body = await res.json().catch(() => ({})) as { error?: string; code?: string }
+  const raw = await res.text().catch(() => '')
+  let body: { error?: string; code?: string } = {}
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) body = parsed as typeof body
+  } catch { /* not JSON: a proxy's text page */ }
+  if (!body.code && (res.status === 502 || res.status === 503 || res.status === 504)) {
+    return new RelayError(res.status, 'relay_down', RELAY_DOWN_MESSAGE)
+  }
   return new RelayError(res.status, body.code ?? `http_${res.status}`, body.error ?? `Request failed (${res.status})`)
 }
 

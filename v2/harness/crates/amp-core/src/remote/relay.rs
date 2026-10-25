@@ -122,9 +122,13 @@ impl RelayError {
 pub const NOT_RELAY: &str = "not_relay";
 
 /// Whether an answer is the relay's: never a redirect (the client doesn't follow them), and a
-/// success always carries a JSON object.
+/// success always carries a JSON object, except `204 No Content` (the `DELETE`), which carries
+/// nothing (#2396: before, every successful `DELETE` read as `not_relay`).
 fn is_relay_answer(status: u16, value: &Value) -> bool {
-    !(300..400).contains(&status) && (!(200..300).contains(&status) || value.is_object())
+    !(300..400).contains(&status)
+        && (!(200..300).contains(&status)
+            || value.is_object()
+            || (status == 204 && value.is_null()))
 }
 
 /// `POST /relay/v1/sessions`'s answer (201).
@@ -531,6 +535,8 @@ mod register_message_tests {
         assert!(!is_relay_answer(200, &json!([1])));
         assert!(is_relay_answer(200, &json!({"accepted_through": 1})));
         assert!(is_relay_answer(503, &Value::Null)); // Envoy without an upstream
+        assert!(is_relay_answer(204, &Value::Null)); // DELETE: no content
+        assert!(!is_relay_answer(204, &json!("x")));
         assert!(
             RelayError::not_relay(302)
                 .register_message()
