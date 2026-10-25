@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -70,12 +71,14 @@ func (r *Repo) ProjectRemotePolicy(ctx context.Context, projectID int) (domain.R
 
 const remoteSessionCols = `id, owner_user_id, project_id, host, os, harness_version, harness_id, harness_pub,
 	protocol_version, holder_node, state, end_reason, started_at, heartbeat_at, last_activity_at, expires_at, ended_at,
-	connect_token_expires_at`
+	connect_token_expires_at, model, current_ticket_id,
+	COALESCE(current_ticket_name, (SELECT t.name FROM tasks t
+		WHERE t.id = remote_sessions.current_ticket_id AND t.project_id = remote_sessions.project_id))`
 
 func scanRemoteSession(row rowScanner, s *domain.RemoteSession) error {
 	return row.Scan(&s.ID, &s.OwnerUserID, &s.ProjectID, &s.Host, &s.OS, &s.HarnessVersion, &s.HarnessID, &s.HarnessPub,
 		&s.ProtocolVersion, &s.HolderNode, &s.State, &s.EndReason, &s.StartedAt, &s.HeartbeatAt, &s.LastActivityAt,
-		&s.ExpiresAt, &s.EndedAt, &s.ConnectTokenExpiresAt)
+		&s.ExpiresAt, &s.EndedAt, &s.ConnectTokenExpiresAt, &s.Model, &s.CurrentTicketID, &s.CurrentTicketName)
 }
 
 // CreateRemoteSession inserts an active session. ID, OwnerUserID, ProjectID,
@@ -125,6 +128,49 @@ func (r *Repo) ListActiveRemoteSessions(ctx context.Context, ownerUserID int) ([
 		return nil, err
 	}
 	return collect(rows, scanRemoteSession)
+}
+
+// ListRecentRemoteSessions lists ownerUserID's live sessions and, after
+// them, up to limit of the sessions that ended within the window (newest
+// first). This is GET /api/sessions (#2389).
+func (r *Repo) ListRecentRemoteSessions(ctx context.Context, ownerUserID int, window time.Duration, limit int) ([]domain.RemoteSession, error) {
+	rows, err := r.db.Query(ctx, `(SELECT `+remoteSessionCols+` FROM remote_sessions
+			WHERE owner_user_id = $1 AND state = 'active' ORDER BY started_at DESC, id)
+		UNION ALL
+		(SELECT `+remoteSessionCols+` FROM remote_sessions
+			WHERE owner_user_id = $1 AND state = 'ended' AND ended_at > NOW() - $2::float8 * interval '1 second'
+			ORDER BY ended_at DESC, id LIMIT $3)`, ownerUserID, window.Seconds(), limit)
+	if err != nil {
+		return nil, err
+	}
+	list, err := collect(rows, scanRemoteSession)
+	if err != nil {
+		return nil, err
+	}
+	// UNION ALL doesn't promise to keep each branch's order.
+	sort.SliceStable(list, func(i, j int) bool {
+		a, b := list[i], list[j]
+		if a.Active() != b.Active() {
+			return a.Active()
+		}
+		ta, tb := a.StartedAt, b.StartedAt
+		if !a.Active() && a.EndedAt != nil && b.EndedAt != nil {
+			ta, tb = *a.EndedAt, *b.EndedAt
+		}
+		if !ta.Equal(tb) {
+			return ta.After(tb)
+		}
+		return a.ID < b.ID
+	})
+	return list, nil
+}
+
+// SetRemoteStatusMeta stores the model and current ticket from a live
+// session's status. It changes nothing once the session has ended.
+func (r *Repo) SetRemoteStatusMeta(ctx context.Context, id string, m domain.RemoteStatusMeta) error {
+	_, err := r.db.Exec(ctx, `UPDATE remote_sessions SET model = $2, current_ticket_id = $3, current_ticket_name = $4
+		WHERE id = $1 AND state = 'active'`, id, m.Model, m.TicketID, m.TicketName)
+	return err
 }
 
 // CountActiveRemoteSessions counts ownerUserID's live sessions.

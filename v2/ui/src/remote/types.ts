@@ -42,6 +42,8 @@ export interface SessionStatus {
   cost_usd_micros: number | null
   project: ProjectRef | null
   ticket_id: number | null
+  /** The current ticket's name (#2389). Optional: a harness that predates it omits it. */
+  ticket_name?: string | null
   branch: string | null
   queue_len: number
   workers_running: number
@@ -144,7 +146,22 @@ export interface SessionSummary {
   expires_at_ms: number
   last_activity_at_ms: number
   protocol_version: number
+  // Added by #2389 (protocol 8.3). Optional, because a relay that predates them leaves them out.
+  /** `active`, or `ended` for a session that ended in the last 7 days. */
+  state?: 'active' | 'ended'
+  /** Why it ended (protocol 12.2), for an ended session. */
+  end_reason?: string | null
+  ended_at_ms?: number | null
+  /** The last model the harness's status named. */
+  model?: string | null
+  /** The current ticket from the harness's status; `name` is null when neither the harness nor AMP has it. */
+  ticket?: { id: number; name: string | null } | null
+  /** Browsers paired with this harness install that are neither revoked nor expired. */
+  devices?: SessionDevice[]
 }
+
+/** A browser paired with a harness, as GET /api/sessions lists it (#2389). */
+export interface SessionDevice { device_id: string; name: string; paired_at_ms: number; expires_at_ms: number }
 
 export interface SessionDetail extends SessionSummary { harness_pub: string }
 

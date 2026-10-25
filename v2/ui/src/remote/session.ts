@@ -318,6 +318,21 @@ export function endReasonText(reason: string): string {
   return m[reason] ?? 'This session has ended.'
 }
 
+/** Short words for an end reason (protocol 12.2), for the Sessions page's badge; endReasonText is the full sentence. */
+export function endReasonLabel(reason: string | null | undefined): string {
+  const m: Record<string, string> = {
+    harness_ended: 'Turned off on the laptop',
+    detached: 'Detached on the laptop',
+    disconnected: 'Disconnected',
+    revoked: 'Revoked',
+    policy_off: 'Turned off by your org',
+    idle: 'Idle timeout',
+    expired: '12-hour limit',
+    killed: 'Ended by an admin',
+  }
+  return (reason && m[reason]) || 'Ended'
+}
+
 /** Integer micro-USD for people: $1.83, or $12 once it's ten dollars or more. */
 export function formatCost(micros: number | null | undefined): string {
   return micros == null ? '—' : `$${(micros / 1_000_000).toFixed(micros < 10_000_000 ? 2 : 0)}`

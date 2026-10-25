@@ -140,8 +140,12 @@ export class MockRelay {
 
   /** What GET /api/sessions returns. */
   list(): SessionSummary[] {
-    if (this.revoked) return []
-    return [...(this.ended ? [] : [this.summary()]), ...this.others]
+    const others = this.revoked ? this.others.map(o => o.state === 'ended' ? o : endedCopy(o, 'revoked')) : this.others
+    const live = others.filter(o => o.state !== 'ended')
+    const ended = others.filter(o => o.state === 'ended')
+    const mine: SessionSummary = this.ended ? endedCopy(this.summary(), this.ended) : this.summary()
+    // Live first, then the ended ones (protocol 8.3).
+    return mine.state === 'ended' ? [...live, mine, ...ended] : [mine, ...live, ...ended]
   }
 
   /** A replayed feed that stops inside a run: the fake harness counts as busy, so prompts queue. */
@@ -149,7 +153,7 @@ export class MockRelay {
 
   /** POST /api/sessions/revoke-all. */
   revokeAll(): { ended: number; devices_revoked: number } {
-    const ended = this.list().length
+    const ended = this.list().filter(s => s.state !== 'ended').length
     this.revoked = true
     if (!this.ended) this.end('revoked')
     return { ended, devices_revoked: 1 }
@@ -160,6 +164,9 @@ export class MockRelay {
       session_id: this.sessionId, harness_id: MOCK_HARNESS_ID, harness_fp_display: '29CA-E6B5-00C2-66CB', harness_pub: MOCK_HARNESS_PUB,
       host: 'jacobs-mbp', os: 'macos', harness_version: '0.4.0', project: { id: 2, name: 'AMP' }, online: this.online, viewers: this.listeners.size,
       started_at_ms: Date.now() - 3_600_000, expires_at_ms: Date.now() + 11 * 3_600_000, last_activity_at_ms: Date.now(), protocol_version: 1,
+      state: 'active', end_reason: null, ended_at_ms: null, model: this.statusBody.model,
+      ticket: this.statusBody.ticket_id == null ? null : { id: this.statusBody.ticket_id, name: this.statusBody.ticket_name ?? null },
+      devices: this.statusBody.devices.map(d => ({ ...d, paired_at_ms: Date.now() - 2 * 86_400_000, expires_at_ms: Date.now() + 28 * 86_400_000 })),
     }
   }
 
@@ -296,6 +303,13 @@ export class MockRelay {
   private fan(f: Frame) { for (const l of this.listeners) l(f) }
 }
 
+/** A session as GET /api/sessions lists it once it has ended. */
+function endedCopy(s: SessionSummary, reason: string): SessionSummary {
+  const out: SessionSummary & { harness_pub?: string } = { ...s, state: 'ended', end_reason: reason, ended_at_ms: Date.now(), online: false, viewers: 0 }
+  delete out.harness_pub // the list never carries the key
+  return out
+}
+
 /** A RelayTransport over a MockRelay (no HTTP at all). */
 export function mockTransport(relay: MockRelay): RelayTransport {
   const check = (id: string) => { if (id !== relay.sessionId) throw new RelayError(404, 'not_found', 'No such session.') }
@@ -326,8 +340,8 @@ export function mockTransport(relay: MockRelay): RelayTransport {
     },
     postCommand: async (id, env) => { check(id); relay.receive(env) },
     disconnect: async id => {
-      const other = relay.others.findIndex(o => o.session_id === id)
-      if (other >= 0) { relay.others.splice(other, 1); return }
+      const other = relay.others.findIndex(o => o.session_id === id && o.state !== 'ended')
+      if (other >= 0) { relay.others[other] = endedCopy(relay.others[other], 'disconnected'); return }
       check(id); relay.end('disconnected')
     },
     pair: async (id, msg) => {
@@ -375,7 +389,13 @@ export function devMockDeps(kind: string = '1', stream?: { at_ms: number; event:
   const others: SessionSummary[] = [
     { session_id: 'rs_OtherSessionBBBBBBBBBB', harness_id: 'h-other', harness_fp_display: '8F1D-02AA-71C3-9E40', host: 'build-box',
       os: 'linux', harness_version: '0.4.0', project: { id: 158, name: 'QA 2365 plan' }, online: false, viewers: 0,
-      started_at_ms: now - 5 * 3_600_000, expires_at_ms: now + 7 * 3_600_000, last_activity_at_ms: now - 42 * 60_000, protocol_version: 1 },
+      started_at_ms: now - 5 * 3_600_000, expires_at_ms: now + 7 * 3_600_000, last_activity_at_ms: now - 42 * 60_000, protocol_version: 1,
+      state: 'active', end_reason: null, ended_at_ms: null, model: 'openai/gpt-5.5', ticket: { id: 2389, name: 'Sessions list with ended sessions' },
+      devices: [{ device_id: 'd-pixel', name: 'Chrome on Pixel 9', paired_at_ms: now - 3 * 86_400_000, expires_at_ms: now + 27 * 86_400_000 }] },
+    { session_id: 'rs_EndedSessionCCCCCCCCCC', harness_id: 'h-old', harness_fp_display: '41B0-77E2-0C5A-D913', host: 'jacobs-mbp',
+      os: 'macos', harness_version: '0.3.9', project: { id: 2, name: 'AMP' }, online: false, viewers: 0,
+      started_at_ms: now - 30 * 3_600_000, expires_at_ms: now - 18 * 3_600_000, last_activity_at_ms: now - 26 * 3_600_000, protocol_version: 1,
+      state: 'ended', end_reason: 'idle', ended_at_ms: now - 25 * 3_600_000, model: 'anthropic/claude-opus-5-5', ticket: null, devices: [] },
   ]
   let replay: { at_ms: number; event: ChatEvent }[] | undefined
   if (kind === 'parity') {

@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
@@ -422,8 +423,10 @@ func (rl *Relay) afterEvent(ctx context.Context, sess *domain.RemoteSession, liv
 	case "hello":
 		st, _ := env.Body["status"].(map[string]any)
 		rl.reconcileDevices(ctx, sess, live, st)
+		rl.storeStatusMeta(ctx, sess, live, st)
 	case "status":
 		rl.reconcileDevices(ctx, sess, live, env.Body)
+		rl.storeStatusMeta(ctx, sess, live, env.Body)
 	case "pair_result":
 		if env.DeviceID == nil {
 			return
@@ -485,6 +488,62 @@ func (rl *Relay) reconcileDevices(ctx context.Context, sess *domain.RemoteSessio
 	if _, err := rl.repo.PruneRemoteDevices(ctx, sess.OwnerUserID, sess.HarnessID, keep); err != nil {
 		slog.Warn("reconciling remote devices failed", "session", sess.ID, "err", err)
 	}
+}
+
+// Longest model and ticket name the relay stores, in bytes (cut on a rune boundary).
+const (
+	maxModelBytes      = 200
+	maxTicketNameBytes = 200
+)
+
+// statusMeta picks the members of a status the relay stores (#2389): model,
+// ticket_id and ticket_name. Nothing else in the status is ever stored. A
+// member missing or of the wrong type counts as null; an older harness has no
+// ticket_name.
+func statusMeta(status map[string]any) domain.RemoteStatusMeta {
+	var m domain.RemoteStatusMeta
+	if v, ok := status["model"].(string); ok && strings.TrimSpace(v) != "" {
+		v = clipRunes(strings.TrimSpace(v), maxModelBytes)
+		m.Model = &v
+	}
+	if v, ok := status["ticket_id"].(int64); ok && v > 0 {
+		m.TicketID = &v
+		if n, ok := status["ticket_name"].(string); ok && strings.TrimSpace(n) != "" {
+			n = clipRunes(strings.TrimSpace(n), maxTicketNameBytes)
+			m.TicketName = &n
+		}
+	}
+	return m
+}
+
+// storeStatusMeta writes the status's model and current ticket to the
+// session row when they changed since the last status this replica stored.
+func (rl *Relay) storeStatusMeta(ctx context.Context, sess *domain.RemoteSession, live *Live, status map[string]any) {
+	if status == nil {
+		return
+	}
+	m := statusMeta(status)
+	key := fmt.Sprintf("%v|%v|%v", deref(m.Model), deref(m.TicketID), deref(m.TicketName))
+	live.mu.Lock()
+	same := live.meta == key
+	live.meta = key
+	live.mu.Unlock()
+	if same {
+		return
+	}
+	if err := rl.repo.SetRemoteStatusMeta(ctx, sess.ID, m); err != nil {
+		slog.Warn("storing remote session status failed", "session", sess.ID, "err", err)
+		live.mu.Lock()
+		live.meta = "" // try again on the next status
+		live.mu.Unlock()
+	}
+}
+
+func deref[T any](p *T) any {
+	if p == nil {
+		return nil
+	}
+	return *p
 }
 
 // ownerPrincipal is the session owner, for audit entries the harness causes.

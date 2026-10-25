@@ -28,6 +28,21 @@ const (
 // RemoteMaxLifetime is how long a session lives after `/remote` (protocol 10).
 const RemoteMaxLifetime = 12 * time.Hour
 
+// RemoteListEndedFor is how far back GET /api/sessions lists ended sessions,
+// and RemoteListEndedMax how many of them at most (#2389).
+const (
+	RemoteListEndedFor = 7 * 24 * time.Hour
+	RemoteListEndedMax = 100
+)
+
+// RemoteStatusMeta is what the relay stores from a harness status: the model
+// and the current ticket. Nil members are null in the status.
+type RemoteStatusMeta struct {
+	Model      *string
+	TicketID   *int64
+	TicketName *string
+}
+
 // RemoteMaxLiveSessions is how many live sessions one user may have.
 const RemoteMaxLiveSessions = 5
 
@@ -50,6 +65,13 @@ type RemoteSession struct {
 	LastActivityAt  time.Time  `json:"last_activity_at"`
 	ExpiresAt       time.Time  `json:"expires_at"`
 	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	// Model and the current ticket are copied from the harness's signed
+	// status (protocol 6.3, #2389): metadata for the session list, never
+	// message content. CurrentTicketName falls back to the ticket's name in
+	// AMP when the harness didn't send one.
+	Model             *string `json:"model,omitempty"`
+	CurrentTicketID   *int64  `json:"current_ticket_id,omitempty"`
+	CurrentTicketName *string `json:"current_ticket_name,omitempty"`
 	// ConnectTokenExpiresAt is when the current connect token stops working.
 	// The token's hash is never read back out of the store.
 	ConnectTokenExpiresAt *time.Time `json:"-"`
