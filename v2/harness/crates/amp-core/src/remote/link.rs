@@ -1197,6 +1197,25 @@ impl Actor {
             Frame::PairRequest(data) => self.on_pair_request(data.as_bytes()),
             Frame::Viewers(n) => self.set_viewers(n),
             Frame::DeviceRevoked { device_id, all } => {
+                // #2376: the chat says which device AMP revoked.
+                let name = device_id.as_deref().and_then(|d| {
+                    self.link
+                        .devices()
+                        .ok()?
+                        .into_iter()
+                        .find(|p| p.device_id == d)
+                        .map(|p| p.name)
+                });
+                let text = match (all, name) {
+                    (true, _) => "Remote control: AMP revoked every paired device; each must pair \
+                                  again (/remote pair)."
+                        .to_owned(),
+                    (false, Some(n)) => format!(
+                        "Remote control: AMP revoked \"{n}\"; its commands are refused from now on."
+                    ),
+                    (false, None) => "Remote control: AMP revoked a paired device.".to_owned(),
+                };
+                self.link.notice(NoticeLevel::Info, text);
                 if let Ok(mut pins) = self.link.pins()
                     && let Some(p) = pins.as_mut()
                 {

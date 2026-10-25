@@ -49,6 +49,10 @@
 //!   the transcript's worker notices and dispatch lines, the session header and `/workers`.
 //!   Every worker mention can be clicked (or reached with Ctrl+W) to watch its session.
 //!
+//! - [`remote_ui`] (#2376): `/remote` (on, off, pair, devices), the footer's `REMOTE ON · n
+//!   devices` badge, the pairing link with its QR code, the local-only pairing `y/N`, and
+//!   remote prompts tagged `[remote: <device>]` in the transcript.
+//!
 //! [`install_theme`] installs the AMP theme; call it before the shell is built. Components read
 //! [`theme::palette`] for AMP colours.
 
@@ -61,6 +65,7 @@ pub mod inset;
 pub mod newline;
 pub mod overlay;
 pub mod remote;
+pub mod remote_ui;
 pub mod roster;
 pub mod scroll;
 pub mod shell;

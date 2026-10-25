@@ -366,6 +366,14 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
             shell.remote_host(),
         )
         .await;
+        // #2376: `/remote` turns it on, shows why it can't, and draws the badge and pairing.
+        match &remote {
+            Ok((link, warning)) => shell.set_remote(Ok(link.clone()), warning.clone()),
+            Err(why) => shell.set_remote(Err(why.clone()), None),
+        }
+        if let Ok((w, h)) = crossterm::terminal::size() {
+            shell.set_screen(usize::from(w), usize::from(h));
+        }
         let result = amp_tui::terminal::run(shell, events, done).await;
         // Leaving the chat ends remote control (bye + DELETE).
         if let Ok((link, _)) = &remote {

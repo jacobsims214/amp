@@ -1,0 +1,381 @@
+//! #2376: `/remote` in a real chat `Shell`, against #2373's in-process mock relay. The test plays
+//! the browser and reads the screen: the badge, the pairing link with (or without) its QR code,
+//! the local-only y/N with No as the default, a remote prompt tagged `[remote: …]`, `/remote
+//! devices` (list, revoke), the notices on a relay-side end, and the errors before turning on.
+
+use std::{sync::Arc, time::Duration};
+
+use amp_core::{
+    agent::memory_session,
+    events::{ChannelEmitter, FanOutEmitter},
+    manager_feed::ManagerFeed,
+    remote::{
+        FixedToken, LinkTuning, RemoteDeps, RemoteLink, RemoteSetup,
+        crypto::{self, KeyPair, KeyStore},
+        envelope,
+        mock_relay::{MockOptions, MockRelay},
+        pairing,
+        redact::Redactor,
+        relay::now_ms,
+    },
+};
+use amp_tui::{RunDone, Shell, ShellInfo};
+use rpi_agent::AgentEvent;
+use rpi_ai::{
+    ThinkingLevel,
+    providers::faux::{FauxProvider, FauxScript, FauxStep},
+};
+use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+const WAIT: Duration = Duration::from_secs(20);
+const USER: i64 = 1001;
+
+struct Rig {
+    shell: Shell,
+    events: UnboundedReceiver<AgentEvent>,
+    done: UnboundedReceiver<RunDone>,
+    mock: MockRelay,
+    script: FauxScript,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for Rig {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn tuning() -> LinkTuning {
+    LinkTuning {
+        batch_every: Duration::from_millis(30),
+        silence: Duration::from_secs(5),
+        backoff_base: Duration::from_millis(100),
+        backoff_max: Duration::from_millis(400),
+        status_min: Duration::from_millis(200),
+        status_max: Duration::from_secs(60),
+        tick: Duration::from_millis(50),
+        bye_wait: Duration::from_secs(3),
+        refused_every: Duration::ZERO,
+    }
+}
+
+async fn rig(tag: &str, opts: MockOptions, size: (usize, usize)) -> Rig {
+    let script = FauxScript::new();
+    let provider = FauxProvider::new(script.clone());
+    let model = provider.default_model().clone();
+    let (tui, events) = ChannelEmitter::new();
+    let fanout = FanOutEmitter::new();
+    fanout.add_sink(tui.into_emitter());
+    let feed = ManagerFeed::new();
+    fanout.add_sink(feed.emitter());
+    let harness = AgentHarness::create(AgentHarnessOptions {
+        model: model.clone(),
+        session: memory_session(),
+        models: vec![provider],
+        agent_emitter: Some(fanout.clone().into_emitter()),
+        ..Default::default()
+    })
+    .await
+    .expect("harness");
+    let info = ShellInfo {
+        role: "amp-manager".into(),
+        provider: model.provider.to_string(),
+        model_id: model.id.clone(),
+        thinking: ThinkingLevel::Off,
+        requested_thinking: None,
+        context_window: 200_000,
+        cwd: "/work/amp".into(),
+        git_branch: Some("remote-m1-2376".into()),
+        session_file: None,
+        banner: vec!["AMP harness · manager".into()],
+    };
+    let (mut shell, done) = Shell::new(Arc::new(harness), info, vec![]);
+    shell.set_feed(Some(Arc::clone(&feed)));
+    shell.set_screen(size.0, size.1);
+    let mock = MockRelay::start(opts.clone()).await;
+    let dir = std::env::temp_dir().join(format!(
+        "amp-remote-ui-{tag}-{}-{}",
+        std::process::id(),
+        crypto::b64u(&crypto::random_bytes(6))
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let link = RemoteLink::new(RemoteDeps {
+        setup: RemoteSetup {
+            api_base: mock.base.clone(),
+            web_origin: "https://amp.local".into(),
+            ca_file: None,
+            project_id: Some(2),
+            host: "test-host".into(),
+            os: "macos".into(),
+            version: "0.0.0-test".into(),
+        },
+        tokens: Arc::new(FixedToken(opts.oauth_token.clone(), USER)),
+        host: shell.remote_host(),
+        feed,
+        keys: KeyStore::memory(),
+        pins: Some(dir.join("remote-devices.json")),
+        action_log: Some(dir.join("remote-actions.log")),
+        redactor: Redactor::new(),
+        switches: Arc::new(|| Ok(())),
+        tuning: tuning(),
+    });
+    shell.set_remote(Ok(link), None);
+    Rig {
+        shell,
+        events,
+        done,
+        mock,
+        script,
+        dir,
+    }
+}
+
+impl Rig {
+    /// Drives the shell (as the terminal loop does) until the screen holds `needle`.
+    async fn until(&mut self, needle: &str) -> String {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            self.shell.poll();
+            let screen = self.screen();
+            if screen.contains(needle) {
+                return screen;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no `{needle}` on screen:\n{screen}"
+            );
+            tokio::select! {
+                Some(e) = self.events.recv() => self.shell.handle_event(&e),
+                Some(r) = self.done.recv() => {
+                    while let Ok(e) = self.events.try_recv() {
+                        self.shell.handle_event(&e);
+                    }
+                    self.shell.finish_run(r);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    fn screen(&self) -> String {
+        self.shell.view().render_plain(200, 300).join("\n")
+    }
+
+    fn hello(&self) -> Value {
+        self.mock
+            .events()
+            .into_iter()
+            .find(|e| e["op"] == "hello")
+            .expect("hello")
+    }
+
+    /// The pairing link on screen.
+    fn link(&self) -> String {
+        self.screen()
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| l.starts_with("https://amp.local/sessions/"))
+            .expect("a pairing link")
+            .to_owned()
+    }
+
+    /// Sends a pair request for `device` with the link on screen; returns the code.
+    fn pair_request(&self, device: &KeyPair) -> String {
+        let (secret, h) = pairing::parse_link_fragment(&self.link()).unwrap();
+        let hello = self.hello();
+        let sid = self.mock.session_id().unwrap();
+        assert_eq!(hello["harness_id"], h.as_str());
+        let msg =
+            pairing::build_pair_request(&secret, &sid, &h, device, "Safari on iPhone", now_ms());
+        assert!(self.mock.send_pair_request(msg, USER, "jsims@example.test"));
+        let harness_pub =
+            crypto::b64u_decode(hello["body"]["harness"]["harness_pub"].as_str().unwrap()).unwrap();
+        pairing::sas_code(&secret, &sid, &harness_pub, device.public_raw())
+    }
+
+    async fn wait_hello(&mut self) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !self.mock.events().iter().any(|e| e["op"] == "hello") {
+            assert!(tokio::time::Instant::now() < deadline, "no hello");
+            self.shell.poll();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn pair_result(&mut self, n: usize) -> Value {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            self.shell.poll();
+            let results: Vec<Value> = self
+                .mock
+                .events()
+                .into_iter()
+                .filter(|e| e["op"] == "pair_result")
+                .collect();
+            if results.len() >= n {
+                return results[n - 1].clone();
+            }
+            assert!(tokio::time::Instant::now() < deadline, "no pair_result {n}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_in_the_chat() {
+    let mut r = rig("flow", MockOptions::default(), (120, 40)).await;
+    r.script.set_responses(vec![FauxStep::text(
+        "Hi phone, this reply came from the laptop.",
+    )]);
+
+    // Before it is on.
+    assert!(r.shell.submit("/remote devices").await == amp_tui::Submit::Continue);
+    r.until("No paired devices").await;
+    r.shell.submit("/remote pair").await;
+    r.until("remote control is off; /remote turns it on first")
+        .await;
+
+    // On: the badge, the link, the QR code (120x40 has room) and when it ends.
+    r.shell.submit("/remote").await;
+    let screen = r.until("REMOTE ON · 0 devices").await;
+    let screen = if screen.contains("https://amp.local/sessions/") {
+        screen
+    } else {
+        r.until("https://amp.local/sessions/").await
+    };
+    assert!(screen.contains("Remote control is on until"), "{screen}");
+    assert!(screen.contains("It works once, for 5 min"), "{screen}");
+    assert!(screen.contains("████"), "the QR code:\n{screen}");
+    assert!(!screen.contains("No QR code"), "{screen}");
+
+    // A pairing question: Enter is No.
+    let device = KeyPair::generate();
+    r.wait_hello().await;
+    let code = r.pair_request(&device);
+    let screen = r
+        .until("Allow \"Safari on iPhone\" (jsims@example.test) to control this session?")
+        .await;
+    assert!(screen.contains(&format!("code {code} [y/N]")), "{screen}");
+    assert!(screen.contains("Only this keyboard can answer"), "{screen}");
+    assert!(r.shell.pairing_pending());
+    assert!(!r.shell.input_focused(), "the question has the keys");
+    // A remote prompt can't answer it: it is only a prompt (and this device isn't paired).
+    r.shell.press("enter").await.unwrap();
+    assert_eq!(r.pair_result(1).await["body"]["result"], "rejected");
+    r.until("Refused \"Safari on iPhone\": it was not paired.")
+        .await;
+
+    // A new link; y pairs it.
+    r.shell.submit("/remote pair").await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while r.screen().matches("https://amp.local/sessions/").count() < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "no second link");
+        r.shell.poll();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let code = r.pair_request(&device);
+    r.until(&format!("code {code} [y/N]")).await;
+    r.shell.press("y").await.unwrap();
+    let res = r.pair_result(2).await;
+    assert_eq!(res["body"]["result"], "accepted", "{res}\n{}", r.screen());
+    r.until("Allowed \"Safari on iPhone\"").await;
+    assert!(r.mock.set_viewers(1));
+    r.until("REMOTE ON · 1 device").await;
+
+    // A remote prompt shows tagged.
+    let hid = r.hello()["harness_id"].as_str().unwrap().to_owned();
+    let cmd = envelope::sign_command(
+        &device,
+        &r.mock.session_id().unwrap(),
+        &hid,
+        now_ms(),
+        now_ms(),
+        &crypto::new_nonce(),
+        "prompt",
+        json!({"text": "hello from the phone", "client_msg_id": "m-1"}),
+    );
+    assert!(r.mock.send_command(&cmd));
+    let screen = r.until("this reply came from the laptop").await;
+    let tag = screen
+        .lines()
+        .position(|l| l.trim() == "[remote: Safari on iPhone]")
+        .unwrap_or_else(|| panic!("the tag line:\n{screen}"));
+    assert!(
+        screen
+            .lines()
+            .nth(tag + 1)
+            .unwrap()
+            .contains("hello from the phone"),
+        "{screen}"
+    );
+
+    // Devices: listed, then revoked.
+    r.shell.submit("/remote devices").await;
+    r.until("1. Safari on iPhone · paired").await;
+    r.shell.submit("/remote devices revoke 2").await;
+    r.until("there is no device 2").await;
+    r.shell.submit("/remote devices revoke 1").await;
+    r.until("Revoked \"Safari on iPhone\"").await;
+
+    // The relay ends it (Disconnect on the web page): a notice, and the badge goes.
+    r.mock.end_session("disconnected");
+    let screen = r
+        .until("Remote control turned off from the web app (Disconnect).")
+        .await;
+    assert!(!screen.contains("REMOTE ON"), "{screen}");
+    r.shell.submit("/remote off").await;
+    r.until("Remote control is already off.").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_80x24_window_gets_the_link_alone_and_off_says_so() {
+    let mut r = rig("small", MockOptions::default(), (80, 24)).await;
+    r.shell.submit("/remote").await;
+    let screen = r.until("No QR code").await;
+    assert!(screen.contains("https://amp.local/sessions/"), "{screen}");
+    assert!(!screen.contains("████"), "{screen}");
+    r.shell.submit("/remote off").await;
+    let screen = r.until("Remote control is off.").await;
+    assert!(r.mock.ended().is_some());
+    assert!(!screen.contains("REMOTE ON"), "{screen}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refusals_are_clear() {
+    // An AMP without remote control (404) and an org with it off (403).
+    let mut r = rig(
+        "404",
+        MockOptions {
+            refuse_register: Some((404, "not_found")),
+            ..MockOptions::default()
+        },
+        (80, 24),
+    )
+    .await;
+    r.shell.submit("/remote").await;
+    r.until("/remote: Remote control isn't available on this AMP server.")
+        .await;
+    let mut r = rig(
+        "403",
+        MockOptions {
+            refuse_register: Some((403, "remote_disabled")),
+            ..MockOptions::default()
+        },
+        (80, 24),
+    )
+    .await;
+    r.shell.submit("/remote").await;
+    r.until("/remote: Remote control is turned off for this project's organization")
+        .await;
+    // Why it can't be used from here at all (the login, a switch): said as is.
+    r.shell.set_remote(
+        Err("remote control needs your AMP login; run `amp-harness login`".into()),
+        None,
+    );
+    r.shell.submit("/remote").await;
+    r.until("/remote: remote control needs your AMP login")
+        .await;
+}

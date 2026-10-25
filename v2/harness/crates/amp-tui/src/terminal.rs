@@ -400,7 +400,9 @@ async fn event_loop(
             maybe_input = input_rx.recv() => {
                 let Some(input) = maybe_input else { break };
                 match input {
-                    Event::Resize(_, rows) => {
+                    Event::Resize(cols, rows) => {
+                        // #2376: `/remote` sizes its QR code by the screen.
+                        shell.set_screen(usize::from(cols), usize::from(rows));
                         shell.view().set_height(usize::from(rows));
                         tui.note_resize();
                     }

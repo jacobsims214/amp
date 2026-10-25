@@ -48,6 +48,17 @@ struct State {
     context_tokens: Option<i64>,
     context_window: i64,
     cache_hit: Option<f64>,
+    /// The remote control badge (#2376), drawn first on the first row.
+    badge: Option<(String, BadgeTone)>,
+}
+
+/// How the footer's badge is drawn (#2376).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BadgeTone {
+    /// Remote control is on and connected.
+    On,
+    /// Starting, offline or reconnecting.
+    Warn,
 }
 
 /// The chat footer. Setters take effect on the next render.
@@ -121,6 +132,17 @@ impl Footer {
     /// The latest response's context size (`None` = not known yet).
     pub fn set_context_tokens(&self, tokens: Option<i64>) {
         self.with(|s| s.context_tokens = tokens);
+    }
+
+    /// The badge before everything else on the first row (`REMOTE ON · 1 device`, #2376);
+    /// `None` removes it.
+    pub fn set_badge(&self, badge: Option<(String, BadgeTone)>) {
+        self.with(|s| s.badge = badge);
+    }
+
+    /// The badge's text, if one is shown.
+    pub fn badge(&self) -> Option<String> {
+        self.with(|s| s.badge.as_ref().map(|(t, _)| t.clone()))
     }
 
     /// The latest prompt-cache hit rate, 0..=100.
@@ -346,8 +368,54 @@ fn row(left: &str, right_plain: &str, right_styled: &str, width: usize) -> Strin
 const MIN_CWD: usize = 16;
 
 impl Component for Footer {
+    /// With a badge (#2376): the badge, then the footer in the columns left, on the first row;
+    /// the badge alone when the footer would get fewer than [`MIN_CWD`] columns.
     fn render(&self, width: usize) -> Vec<String> {
-        let state = self.with(|s| s.clone());
+        let (badge, mut state) = self.with(|s| (s.badge.clone(), s.clone()));
+        let Some((text, tone)) = badge else {
+            return self.render_plain(&state, width);
+        };
+        let c = theme().colors;
+        let text = shorten(&text, width);
+        let bw = visible_width(&text);
+        let styled = match tone {
+            BadgeTone::On => c.success.fg(&rpi_tui::bold(&text)),
+            BadgeTone::Warn => c.warning.fg(&rpi_tui::bold(&text)),
+        };
+        let rest = width.saturating_sub(bw + GAP);
+        state.badge = None;
+        let lines = if rest >= MIN_CWD {
+            self.render_plain(&state, rest)
+        } else {
+            Vec::new()
+        };
+        if lines.is_empty() {
+            return vec![styled];
+        }
+        let indent = " ".repeat(bw + GAP);
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, line)| {
+                if i == 0 {
+                    format!("{styled}{}{line}", " ".repeat(GAP))
+                } else {
+                    format!("{indent}{line}")
+                }
+            })
+            .collect()
+    }
+
+    fn invalidate(&self) {}
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl Footer {
+    fn render_plain(&self, state: &State, width: usize) -> Vec<String> {
+        let state = state.clone();
         let mut p = Pieces::from(&state);
         if width == 0 {
             return Vec::new();
@@ -418,12 +486,6 @@ impl Component for Footer {
             return vec![c.dim.fg(&shorten(&left, width))];
         }
         vec![row(&left, &rp, &rs, width)]
-    }
-
-    fn invalidate(&self) {}
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 }
 

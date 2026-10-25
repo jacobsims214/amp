@@ -406,6 +406,15 @@ async fn end(
 
 impl MockRelay {
     pub async fn start(opts: MockOptions) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock relay");
+        Self::serve(opts, listener, Router::new())
+    }
+
+    /// Serves the relay on `listener` with `extra` routes on the same origin (#2376: a stand-in
+    /// AMP with its MCP server and OAuth endpoints next to the relay, for driving the chat).
+    pub fn serve(opts: MockOptions, listener: tokio::net::TcpListener, extra: Router) -> Self {
         let app = App {
             opts,
             inner: Default::default(),
@@ -419,10 +428,8 @@ impl MockRelay {
             .route("/relay/v1/sessions/{id}/heartbeat", post(heartbeat))
             .route("/relay/v1/sessions/{id}/pairings", post(pairings))
             .route("/relay/v1/sessions/{id}", delete(end))
-            .with_state(app.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind the mock relay");
+            .with_state(app.clone())
+            .merge(extra);
         let base = format!("http://{}", listener.local_addr().expect("addr"));
         let server = tokio::spawn(async move {
             let _ = axum::serve(listener, router).await;
