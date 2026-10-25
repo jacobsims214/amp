@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/actor"
@@ -38,6 +39,9 @@ func (s *Service) StartHumanTask(ctx context.Context, p authz.Principal, taskID 
 	if err != nil {
 		return nil, err
 	}
+	if err := authz.RequireUI(p, fmt.Sprintf("Starting ticket %d (a person's ticket)", taskID), s.TaskURL(t.ProjectID, taskID)); err != nil {
+		return nil, err
+	}
 	if !t.IsHuman() {
 		return nil, authz.BadRequest("ticket %d is agent work; dispatch it to an agent, or switch it to a person first", taskID)
 	}
@@ -57,7 +61,9 @@ func (s *Service) StartHumanTask(ctx context.Context, p authz.Principal, taskID 
 
 // CompleteHumanTask marks a human ticket done and records the person's work
 // as a run (agent_id "human"): their note, a link, and the hours they spent.
-// viaAgent is set when their agent records it for them (over MCP).
+// A human ticket is the person's own gate (a merge, a deploy, a sign-off),
+// so only the person marks it done, in the web UI; an agent recording it
+// for them (viaAgent, over MCP) is refused with the ticket's link.
 func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, taskID int, done HumanDone, viaAgent bool) (*domain.Task, *domain.Run, error) {
 	if err := refuseAgentAccount(p); err != nil {
 		return nil, nil, err
@@ -69,6 +75,9 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if !t.IsHuman() {
 		return nil, nil, authz.BadRequest("ticket %d is agent work, not a person's", taskID)
 	}
+	if viaAgent || !p.InUI() {
+		return nil, nil, authz.UIOnly(fmt.Sprintf("Marking ticket %d (a person's ticket) done", taskID), s.TaskURL(t.ProjectID, taskID))
+	}
 	if h := done.HoursWorked; h != nil && (*h < 0 || *h > 1000) {
 		return nil, nil, authz.BadRequest("hours_worked must be between 0 and 1000")
 	}
@@ -77,18 +86,11 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 		return nil, nil, err
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
-	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ReplyCh: replyCh})
+	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ByName: p.Label(), ReplyCh: replyCh})
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, nil, reply.Err
 	}
 	note := strings.TrimSpace(done.Note)
-	if viaAgent {
-		who := p.Email
-		if who == "" {
-			who = "its owner"
-		}
-		note = strings.TrimSpace("Recorded by " + who + "'s agent. " + note)
-	}
 	run, err := s.recordRun(ctx, p, t, domain.Run{
 		AgentID: domain.HumanAgentID, Outcome: domain.RunCompleted,
 		PRURL: strings.TrimSpace(done.PRURL), Note: note, HoursWorked: done.HoursWorked,

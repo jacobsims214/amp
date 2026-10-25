@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/coreos/go-oidc/v3/oidc"
@@ -39,7 +40,34 @@ type Identity struct {
 	// APIToken is set when the request authenticated with an AMP API token
 	// rather than a Dex-issued token.
 	APIToken bool
+	// Listener is the label of the verifier that accepted the request
+	// ("mcp" or "rest"); empty for in-process callers.
+	Listener string
+	// Audience and AZP are the verified token's aud and azp claims (empty
+	// for API tokens and local dev).
+	Audience []string
+	AZP      string
+	// Channel is how the request reached AMP (see the Channel constants):
+	// only ChannelUI is a person in the web UI. Set by Middleware; empty
+	// (treated as not the UI) for in-process callers.
+	Channel string
 }
+
+// Channels a request can arrive on. Approvals (a plan, an artifact, a
+// person's own ticket) need ChannelUI.
+const (
+	// ChannelUI: the web UI's session, i.e. a Dex token issued to the UI's
+	// oauth2-proxy client (aud contains UIClientID, azp empty or the same)
+	// on the REST listener. With auth disabled, anything on REST.
+	ChannelUI = "ui"
+	// ChannelMCP: anything on the MCP listener.
+	ChannelMCP = "mcp"
+	// ChannelToken: an AMP API token (amp_...), on either listener.
+	ChannelToken = "token"
+	// ChannelRESTOther: a Dex token on REST that wasn't issued to the UI
+	// (e.g. an MCP-audience token).
+	ChannelRESTOther = "rest-other"
+)
 
 // Verifier validates bearer tokens against Dex's JWKS. Safe for concurrent use.
 type Verifier struct {
@@ -57,6 +85,10 @@ type Verifier struct {
 	// Scope, when set, is advertised as the scope= parameter of the
 	// WWW-Authenticate challenge (MCP 2026-07-28 scope selection strategy).
 	Scope string
+
+	// uiClientID is the web UI's (oauth2-proxy's) Dex client ID: a REST
+	// token whose audience names it is a person in the web UI.
+	uiClientID string
 }
 
 // Config controls verifier construction.
@@ -70,6 +102,10 @@ type Config struct {
 	DiscoveryURL   string
 	BootstrapAdmin string // comma-separated emails granted admin on first sight
 	Repo           *repository.Repo
+	// UIClientID is the web UI's oauth2-proxy Dex client ID (UI_CLIENT_ID).
+	// Only REST requests carrying a token issued to it count as the web UI
+	// (ChannelUI). Empty: no Dex token counts as the UI.
+	UIClientID string
 }
 
 // NewVerifier builds a Verifier. When cfg.IssuerURL is empty, auth is disabled
@@ -85,7 +121,7 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 
 	if cfg.IssuerURL == "" {
 		slog.Warn("auth disabled: OIDC_ISSUER_URL not set — all requests treated as anonymous local-dev user")
-		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins}, nil
+		return &Verifier{enabled: false, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID)}, nil
 	}
 
 	discoveryURL := cfg.DiscoveryURL
@@ -102,7 +138,7 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	keySet := oidc.NewRemoteKeySet(ctx, strings.TrimSuffix(discoveryURL, "/")+"/keys")
 	verifier := oidc.NewVerifier(cfg.IssuerURL, keySet, &oidc.Config{SkipClientIDCheck: true})
 
-	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins}
+	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID)}
 	return v, nil
 }
 
@@ -145,7 +181,8 @@ func (v *Verifier) verifyAudience(audience []string) bool {
 func (v *Verifier) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !v.enabled {
-			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev", LocalDev: true}
+			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev", LocalDev: true, Listener: v.label}
+			ident.Channel = v.channelOf(ident)
 			r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
 			next.ServeHTTP(w, r)
 			return
@@ -169,6 +206,8 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		if ident == nil {
 			return // the response has been written
 		}
+		ident.Listener = v.label
+		ident.Channel = v.channelOf(ident)
 		if ident.User != nil && ident.User.DisabledAt != nil {
 			slog.Warn("request refused: account deactivated", "listener", v.label, "user_id", ident.User.ID, "email", ident.User.Email)
 			w.Header().Set("Content-Type", "application/json")
@@ -197,6 +236,7 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 	}
 
 	var claims struct {
+		AZP     string `json:"azp"`
 		Subject string `json:"sub"`
 		Email   string `json:"email"`
 		Name    string `json:"name"`
@@ -217,7 +257,8 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 		return nil
 	}
 
-	ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name}
+	ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name,
+		Audience: append([]string(nil), idToken.Audience...), AZP: claims.AZP}
 	if v.repo == nil {
 		return ident
 	}
@@ -274,6 +315,29 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 	}
 	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true}
 }
+
+// channelOf decides how a request reached AMP (see the Channel constants).
+// Only the REST listener can be the web UI: with auth on, the token must
+// have been issued to the UI's own client (its audience names UIClientID
+// and azp, if any, is that client too), which only the UI's oauth2-proxy
+// can obtain, with a secret no agent holds. With auth off (local dev and
+// compose), REST counts as the UI and MCP never does.
+func (v *Verifier) channelOf(ident *Identity) string {
+	switch {
+	case ident.APIToken:
+		return ChannelToken
+	case v.label != "rest":
+		return ChannelMCP
+	case ident.LocalDev:
+		return ChannelUI
+	case v.uiClientID != "" && slices.Contains(ident.Audience, v.uiClientID) && (ident.AZP == "" || ident.AZP == v.uiClientID):
+		return ChannelUI
+	}
+	return ChannelRESTOther
+}
+
+// IsUI reports whether the request came from a person in the web UI.
+func (i *Identity) IsUI() bool { return i != nil && i.Channel == ChannelUI }
 
 // WithIdentity returns ctx carrying ident, as the middleware would. For
 // in-process callers (tests, background jobs) that bypass HTTP.

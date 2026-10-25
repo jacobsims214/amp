@@ -96,11 +96,23 @@ func main() {
 	if os.Getenv("OIDC_AUDIENCES") != "" {
 		slog.Warn("OIDC_AUDIENCES is deprecated and ignored; token audiences come from MCP_AUDIENCE and REST_AUDIENCES")
 	}
+	// UI_CLIENT_ID is the web UI's oauth2-proxy Dex client: only REST
+	// requests with a token issued to it count as a person in the web UI,
+	// the one channel that can approve plans and artifacts, turn plan
+	// approval off, or mark a person's ticket done. Defaults to the first
+	// REST_AUDIENCES entry (which Helm sets to that client).
+	uiClientID := os.Getenv("UI_CLIENT_ID")
+	if uiClientID == "" {
+		if auds := splitList(os.Getenv("REST_AUDIENCES")); len(auds) > 0 {
+			uiClientID = auds[0]
+		}
+	}
 	verifier, err := auth.NewVerifier(ctx, auth.Config{
 		IssuerURL:      os.Getenv("OIDC_ISSUER_URL"),
 		DiscoveryURL:   os.Getenv("OIDC_DISCOVERY_URL"),
 		BootstrapAdmin: os.Getenv("BOOTSTRAP_ADMIN_EMAILS"),
 		Repo:           repo,
+		UIClientID:     uiClientID,
 	})
 	if err != nil {
 		slog.Error("failed to initialize auth verifier", "err", err)
@@ -307,7 +319,10 @@ func main() {
 	mcpVerifier.ResourceMetadataURL = mcpCfg.PublicURL + "/.well-known/oauth-protected-resource"
 	mcpVerifier.Scope = strings.Join(mcpCfg.Scopes, " ")
 	restVerifier := verifier.WithAudiences("rest", restAudiences...)
-	slog.Info("token audience policy", "mcp", mcpAudience, "rest", restAudiences)
+	slog.Info("token audience policy", "mcp", mcpAudience, "rest", restAudiences, "ui_client", uiClientID)
+	if os.Getenv("OIDC_ISSUER_URL") != "" && uiClientID == "" {
+		slog.Warn("UI_CLIENT_ID and REST_AUDIENCES unset: no request counts as the web UI, so nobody can approve a plan")
+	}
 
 	mcpPublicServer := &http.Server{
 		Addr:    mcpAddr,

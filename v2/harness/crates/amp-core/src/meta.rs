@@ -891,6 +891,9 @@ pub struct Intervals {
     pub slow_after: Duration,
     /// Wait between reconnect attempts (15 s).
     pub reconnect: Duration,
+    /// How long [`MetaHandle::call`] waits beyond its own timeout for the poller to get to the
+    /// call ([`CALL_QUEUE_GRACE`], 30 s).
+    pub call_queue_grace: Duration,
 }
 
 impl Default for Intervals {
@@ -905,6 +908,7 @@ impl Default for Intervals {
             call_timeout: Duration::from_secs(10),
             slow_after: Duration::from_secs(3),
             reconnect: Duration::from_secs(15),
+            call_queue_grace: CALL_QUEUE_GRACE,
         }
     }
 }
@@ -1051,6 +1055,10 @@ struct Call {
     tool: String,
     args: Value,
     timeout: Duration,
+    /// When the caller stops waiting ([`MetaHandle::call`] returns Err). The poller never starts
+    /// the call after it, and bounds the call itself by it: a write the user was told failed
+    /// must not land later (#2160).
+    deadline: tokio::time::Instant,
     reply: oneshot::Sender<Result<Value, String>>,
 }
 
@@ -1059,6 +1067,8 @@ pub type StubResponder = Arc<dyn Fn(&str, &Value) -> Result<Value, String> + Sen
 
 struct Inner {
     commands: UnboundedSender<Command>,
+    /// [`Intervals::call_queue_grace`].
+    call_queue_grace: Duration,
     meta: watch::Receiver<Arc<AmpMeta>>,
     /// `amp_*` tool calls in flight: call id → (name, arguments), from `ToolExecutionStart`.
     started: Mutex<HashMap<String, (String, Value)>>,
@@ -1132,24 +1142,28 @@ impl MetaHandle {
     /// the model's). `timeout` bounds the call itself; the whole wait, including a refresh the
     /// poller may be in the middle of, is bounded by `timeout` + [`CALL_QUEUE_GRACE`]. When a
     /// write succeeds, what it touched is refetched ([`topics_for_tool`]).
+    ///
+    /// Once this returns Err for a timeout, the call is never sent: the poller drops a queued
+    /// call whose deadline has passed (or whose caller has gone away), and a call it starts is
+    /// cut off at the same deadline (#2160).
     pub async fn call(&self, tool: &str, args: Value, timeout: Duration) -> Result<Value, String> {
         let (reply, answer) = oneshot::channel();
+        let bound = timeout + self.0.call_queue_grace;
+        let deadline = tokio::time::Instant::now() + bound;
         self.0
             .commands
             .send(Command::Call(Call {
                 tool: tool.to_owned(),
                 args,
                 timeout,
+                deadline,
                 reply,
             }))
             .map_err(|_| "the AMP metadata poller has stopped".to_owned())?;
-        match tokio::time::timeout(timeout + CALL_QUEUE_GRACE, answer).await {
+        match tokio::time::timeout_at(deadline, answer).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err("the AMP metadata poller has stopped".to_owned()),
-            Err(_) => Err(format!(
-                "{tool}: no answer within {:?}",
-                timeout + CALL_QUEUE_GRACE
-            )),
+            Err(_) => Err(format!("{tool}: no answer within {bound:?}")),
         }
     }
 
@@ -1191,6 +1205,7 @@ impl MetaHandle {
             commands,
             meta: rx,
             started: Mutex::new(HashMap::new()),
+            call_queue_grace: CALL_QUEUE_GRACE,
             stub_calls: Some(calls),
             stub_meta: Some(stub_meta),
         }))
@@ -1306,6 +1321,14 @@ pub struct MetaPoller {
     auth_required: bool,
     /// Slash-command calls waiting to run ([`MetaHandle::call`]).
     calls: Vec<Call>,
+    /// Commands other than calls that arrived during a refresh; applied after it, so a project
+    /// or ticket switch never lands in the middle of a pass.
+    held: Vec<Command>,
+    /// The last call failed in transport, by timeout or on auth (not an error AMP answered).
+    /// A refresh pass stops at the first such failure (#2160).
+    failed: bool,
+    /// Topics a stopped refresh pass did not get to; they join the next pass.
+    deferred: Topics,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1361,6 +1384,7 @@ impl MetaPoller {
         };
         let (tx, rx) = watch::channel(Arc::new(meta));
         let (commands, command_rx) = unbounded_channel();
+        let call_queue_grace = options.intervals.call_queue_grace;
         let poller = Self {
             tx,
             client,
@@ -1372,10 +1396,14 @@ impl MetaPoller {
             next_reconnect: None,
             auth_required: false,
             calls: Vec::new(),
+            held: Vec::new(),
+            failed: false,
+            deferred: Topics::NONE,
         };
         tokio::spawn(poller.run(command_rx));
         MetaHandle(Arc::new(Inner {
             commands,
+            call_queue_grace,
             meta: rx,
             started: Mutex::new(HashMap::new()),
             stub_calls: None,
@@ -1411,9 +1439,12 @@ impl MetaPoller {
                     .schedule
                     .due(&self.iv, Conditions::of(&self.meta()), now);
                 if !pending.is_empty() {
-                    let topics = std::mem::take(&mut pending);
-                    self.refresh(topics).await;
+                    let topics = std::mem::take(&mut pending) | std::mem::take(&mut self.deferred);
+                    pending |= self.refresh(topics, &mut commands).await;
                 }
+            }
+            for cmd in std::mem::take(&mut self.held) {
+                pending |= self.apply(cmd);
             }
             // Commands that arrived during the refresh run before sleeping.
             loop {
@@ -1570,12 +1601,22 @@ impl MetaPoller {
 
     /// Runs the queued slash-command calls. Without a client they fail at once (rather than wait
     /// for a reconnect). Returns what successful writes touched.
+    ///
+    /// A call whose caller has stopped waiting (its deadline passed, or the caller went away) is
+    /// dropped unsent: the user was already told it failed, so a write such as
+    /// `amp_answer_question` must not land later (#2160). A call that does run is cut off at the
+    /// caller's deadline.
     async fn run_calls(&mut self) -> Topics {
         let mut touched = Topics::NONE;
         for c in std::mem::take(&mut self.calls) {
+            let now = tokio::time::Instant::now();
+            if c.reply.is_closed() || now >= c.deadline {
+                continue;
+            }
             let open = self.client.as_ref().is_some_and(|c| !c.is_closed());
             let result = if open {
-                self.call_with(&c.tool, c.args.clone(), c.timeout).await
+                let timeout = c.timeout.min(c.deadline - now);
+                self.call_with(&c.tool, c.args.clone(), timeout).await
             } else {
                 Err(format!("{}: not connected to AMP", c.tool))
             };
@@ -1620,6 +1661,7 @@ impl MetaPoller {
         let answered = result
             .as_ref()
             .map_or_else(McpError::is_server_error, |_| true);
+        self.failed = !answered;
         if answered {
             self.auth_required = false;
         } else if connection == Connection::AuthRequired {
@@ -1649,96 +1691,156 @@ impl MetaPoller {
         result_json(&result).ok_or_else(|| format!("{tool}: no JSON in the result"))
     }
 
-    async fn refresh(&mut self, topics: Topics) {
+    /// Refetches `topics`, one AMP call (or two, for the ticket) per topic. Returns what the
+    /// slash-command calls run between topics touched.
+    ///
+    /// The pass stops at the first transport, timeout or auth failure (an error AMP answered
+    /// does not stop it): against a hung AMP, every remaining call would wait out its own
+    /// timeout too. The failed topic and those it did not get to wait in `deferred` for the
+    /// next pass. Queued
+    /// slash-command calls run between topics, so one waits for at most one call (#2160).
+    async fn refresh(
+        &mut self,
+        topics: Topics,
+        commands: &mut UnboundedReceiver<Command>,
+    ) -> Topics {
+        const STEPS: [Topics; 7] = [
+            Topics::WHOAMI,
+            Topics::PROJECT,
+            Topics::BOARD,
+            Topics::TICKET,
+            Topics::PLAN,
+            Topics::ARTIFACTS,
+            Topics::WORKERS,
+        ];
         let now = Instant::now();
-        let mut ran = Topics::NONE;
-        if topics.contains(Topics::WHOAMI) || topics.contains(Topics::PING) {
-            let r = self.call("amp_whoami", json!({})).await;
-            let r = r.and_then(|v| serde_json::from_value::<User>(v).map_err(|e| e.to_string()));
-            self.update(|m| m.user.set(r));
-            ran |= Topics::WHOAMI;
-        }
-        let project_id = self.meta().project_id;
-        if topics.contains(Topics::PROJECT)
-            && let Some(pid) = project_id
-        {
-            let r = self
-                .call("amp_get_project", json!({"project_id": pid}))
-                .await;
-            let r = r.and_then(|v| {
-                serde_json::from_value::<Project>(v["project"].clone()).map_err(|e| e.to_string())
-            });
-            self.update(|m| m.project.set(r));
-        }
         if topics.contains(Topics::TREE) {
             self.tree = None;
         }
-        if topics.contains(Topics::BOARD)
-            && let Some(pid) = project_id
-        {
-            let r = self
-                .call(
-                    "amp_list_tasks",
-                    json!({"project_id": pid, "owner": "any", "format": "compact"}),
-                )
-                .await;
-            let r = r.and_then(|v| Board::from_compact(&v));
-            self.update(|m| m.board.set(r));
-            ran |= Topics::BOARD;
+        self.failed = false;
+        let mut touched = Topics::NONE;
+        for step in STEPS {
+            let wanted =
+                topics.contains(step) || (step == Topics::WHOAMI && topics.contains(Topics::PING));
+            if !wanted {
+                continue;
+            }
+            if self.failed {
+                self.deferred |= step;
+                continue;
+            }
+            self.fetch_topic(step).await;
+            if self.failed {
+                // It got no answer either, so it is retried with the rest.
+                self.deferred |= step;
+            }
+            touched |= self.calls_between_topics(commands).await;
         }
+        // Items that did not apply (or were deferred) count as run, so their periodic polls wait a
+        // full interval: a stopped pass does not turn into a tight retry loop.
+        self.schedule.ran(topics, now);
+        touched
+    }
+
+    /// Takes the commands that arrived so far: calls run now, the rest wait for the end of the
+    /// refresh (`held`). Returns what successful writes touched.
+    async fn calls_between_topics(&mut self, commands: &mut UnboundedReceiver<Command>) -> Topics {
+        while let Ok(cmd) = commands.try_recv() {
+            match cmd {
+                Command::Call(call) => self.calls.push(call),
+                other => self.held.push(other),
+            }
+        }
+        if self.calls.is_empty() {
+            return Topics::NONE;
+        }
+        self.run_calls().await
+    }
+
+    /// Fetches one topic into the snapshot.
+    async fn fetch_topic(&mut self, step: Topics) {
+        let project_id = self.meta().project_id;
         let ticket_id = self.meta().ticket_id;
-        if topics.contains(Topics::TICKET)
-            && let Some(tid) = ticket_id
-        {
-            let r = self.fetch_ticket(tid).await;
-            self.update(|m| {
-                if m.ticket_id == Some(tid) {
-                    m.ticket.set(r);
-                }
-            });
-            ran |= Topics::TICKET;
-        }
-        if topics.contains(Topics::PLAN)
-            && let Some(pid) = project_id
-            && self.meta().plan_required()
-        {
-            let r = self
-                .call("amp_check_plan", json!({"project_id": pid}))
-                .await;
-            let r = r.map(|v| PlanApproval::from_check_plan(&v));
-            self.update(|m| m.plan.set(r));
-            ran |= Topics::PLAN;
-        }
-        if topics.contains(Topics::ARTIFACTS)
-            && let Some(tid) = ticket_id
-        {
-            let r = self
-                .call("amp_list_artifacts", json!({"task_id": tid}))
-                .await;
-            let r = r.and_then(|v| {
-                serde_json::from_value::<Vec<Artifact>>(v["artifacts"].clone())
-                    .map_err(|e| e.to_string())
-            });
-            self.update(|m| {
-                if m.ticket_id == Some(tid) {
-                    m.artifacts.set(r);
-                }
-            });
-            ran |= Topics::ARTIFACTS;
-        }
-        if topics.contains(Topics::WORKERS) {
-            for id in self.meta().worker_ids.clone() {
-                let r = self.fetch_worker_ticket(id).await;
+        match step {
+            Topics::WHOAMI => {
+                let r = self.call("amp_whoami", json!({})).await;
+                let r =
+                    r.and_then(|v| serde_json::from_value::<User>(v).map_err(|e| e.to_string()));
+                self.update(|m| m.user.set(r));
+            }
+            Topics::PROJECT => {
+                let Some(pid) = project_id else { return };
+                let r = self
+                    .call("amp_get_project", json!({"project_id": pid}))
+                    .await;
+                let r = r.and_then(|v| {
+                    serde_json::from_value::<Project>(v["project"].clone())
+                        .map_err(|e| e.to_string())
+                });
+                self.update(|m| m.project.set(r));
+            }
+            Topics::BOARD => {
+                let Some(pid) = project_id else { return };
+                let r = self
+                    .call(
+                        "amp_list_tasks",
+                        json!({"project_id": pid, "owner": "any", "format": "compact"}),
+                    )
+                    .await;
+                let r = r.and_then(|v| Board::from_compact(&v));
+                self.update(|m| m.board.set(r));
+            }
+            Topics::TICKET => {
+                let Some(tid) = ticket_id else { return };
+                let r = self.fetch_ticket(tid).await;
                 self.update(|m| {
-                    if m.worker_ids.contains(&id) {
-                        m.workers.entry(id).or_default().set(r);
+                    if m.ticket_id == Some(tid) {
+                        m.ticket.set(r);
                     }
                 });
             }
-            ran |= Topics::WORKERS;
+            Topics::PLAN => {
+                let Some(pid) = project_id else { return };
+                if !self.meta().plan_required() {
+                    return;
+                }
+                let r = self
+                    .call("amp_check_plan", json!({"project_id": pid}))
+                    .await;
+                let r = r.map(|v| PlanApproval::from_check_plan(&v));
+                self.update(|m| m.plan.set(r));
+            }
+            Topics::ARTIFACTS => {
+                let Some(tid) = ticket_id else { return };
+                let r = self
+                    .call("amp_list_artifacts", json!({"task_id": tid}))
+                    .await;
+                let r = r.and_then(|v| {
+                    serde_json::from_value::<Vec<Artifact>>(v["artifacts"].clone())
+                        .map_err(|e| e.to_string())
+                });
+                self.update(|m| {
+                    if m.ticket_id == Some(tid) {
+                        m.artifacts.set(r);
+                    }
+                });
+            }
+            Topics::WORKERS => {
+                for id in self.meta().worker_ids.clone() {
+                    let r = self.fetch_worker_ticket(id).await;
+                    self.update(|m| {
+                        if m.worker_ids.contains(&id) {
+                            m.workers.entry(id).or_default().set(r);
+                        }
+                    });
+                    if self.failed {
+                        // A transport failure stops the pass (#2160); the rest wait for the next.
+                        return;
+                    }
+                }
+            }
+            _ => {}
         }
-        // Items that did not apply count as run, so they wait a full interval before retrying.
-        self.schedule.ran(topics | ran, now);
     }
 
     /// A worker's ticket with its dependencies and newest run (#2347).

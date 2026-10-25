@@ -2,6 +2,7 @@ package actor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -118,7 +119,7 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgCompleteTask:
-		err := a.handleComplete(ctx, msg.By)
+		err := a.handleComplete(ctx, msg)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgBlockTask:
@@ -130,21 +131,41 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplyGetTask{Task: t, Err: err}
 
 	case *MsgUpdateTask:
-		err := a.handleUpdate(msg.Req)
+		err := a.handleUpdate(msg.Req, msg.KeepHuman)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskState:
+		if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
+			msg.ReplyCh <- ReplySimple{Err: fmt.Errorf("task %d is %s, not in progress: it wasn't dispatched, so it can't be set to %s off the web UI",
+				a.task.ID, a.task.State, msg.State)}
+			return
+		}
+		state := msg.State
+		if msg.RequireDeps {
+			var err error
+			if state, err = a.holdForDeps(msg.State); err != nil {
+				msg.ReplyCh <- ReplySimple{Err: err}
+				return
+			}
+		}
 		// Cancel timer if armed before applying state change
 		if a.scheduleTimer != nil {
 			a.scheduleTimer.Stop()
 			a.scheduleTimer = nil
 		}
-		err := a.handleSetState(msg.State, msg.Reason, msg.By)
+		reason := msg.Reason
+		if state != msg.State {
+			reason = "" // blocked on its dependencies: no reason of its own
+		}
+		err := a.handleSetState(state, reason, msg.By, msg.ByName)
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgSetTaskStartAt:
 		err := a.handleSetTaskStartAt(msg.StartAt)
 		msg.ReplyCh <- ReplySimple{Err: err}
+
+	case *MsgApproveTask:
+		msg.ReplyCh <- a.handleApprove(msg)
 
 	case *MsgAddComment:
 		comment, err := a.handleAddComment(msg.Req)
@@ -223,25 +244,33 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	if msg.Human {
 		agentID = domain.HumanAgentID
 	}
-	if a.task.State == domain.TaskStateBlocked {
-		var incomplete []int
-		for _, depID := range a.task.DependencyIDs {
-			if !a.completedDeps[depID] {
-				incomplete = append(incomplete, depID)
-			}
-		}
-		return fmt.Errorf("task %d is blocked — waiting on task IDs: %v", a.task.ID, incomplete)
-	}
 	if a.task.State == domain.TaskStateInProgress {
 		return fmt.Errorf("task %d is already in_progress (agent: %s)", a.task.ID, a.task.AgentID)
 	}
 	if a.task.State == domain.TaskStateCompleted {
 		return fmt.Errorf("task %d is already completed", a.task.ID)
 	}
+	// Work never starts while a dependency is incomplete, whatever the
+	// ticket's state says: a ticket can reach backlog without its
+	// dependencies done (a state override, a dependency reopened after it
+	// completed), and the state alone would let it through. The states are
+	// re-read here, in the actor, so the check is atomic with the dispatch.
+	open, err := a.openDeps()
+	if err != nil {
+		return fmt.Errorf("task %d: couldn't check its dependencies (%v); nothing was started, try again", a.task.ID, err)
+	}
+	if len(open) > 0 {
+		return fmt.Errorf("task %d is blocked — waiting on task IDs: %v (its dependencies aren't complete, so it can't start)", a.task.ID, open)
+	}
+	if a.task.State == domain.TaskStateBlocked {
+		return fmt.Errorf("task %d is blocked (%s); it can't start until it's unblocked", a.task.ID, a.task.BlockReason)
+	}
 
 	now := time.Now()
 	if claim {
-		if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.By); err != nil {
+		// Dispatch's claim keeps the approval (dispatch already passed the
+		// approval gate, and completing it checks again): AMP #2218.
+		if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.By, false); err != nil {
 			return fmt.Errorf("db claim on dispatch: %w", err)
 		}
 		owner := *msg.By
@@ -274,9 +303,19 @@ func (a *TaskActor) handleDispatch(msg *MsgDispatchTask, ctx actor.Context) erro
 	return nil
 }
 
-func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
+func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) error {
+	by := msg.By
 	if a.task.State == domain.TaskStateCompleted {
 		return nil // idempotent
+	}
+	if msg.RequireStarted && a.task.State != domain.TaskStateInProgress {
+		return fmt.Errorf("task %d is %s: it was never dispatched, so it can't be completed off the web UI; dispatch it first",
+			a.task.ID, a.task.State)
+	}
+	if msg.RequireDeps {
+		if err := a.refuseOpenDeps("completed"); err != nil {
+			return err
+		}
 	}
 
 	prevState := a.task.State // capture before mutation for accurate activity log
@@ -292,9 +331,17 @@ func (a *TaskActor) handleComplete(ctx actor.Context, by *int) error {
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
 	if a.task.IsHuman() {
 		a.logActivityBy(domain.HumanAgentID, by, "completed", string(prevState), "completed", "Done by its owner (human work)")
-	} else {
+	} else if a.task.AgentID != "" {
 		a.logActivityBy(a.task.AgentID, by, "completed", string(prevState), "completed",
 			fmt.Sprintf("Task completed by agent %q", a.task.AgentID))
+	} else {
+		// Never dispatched, so no agent to name: name the caller, never "".
+		who := msg.ByName
+		if who == "" {
+			who = "agent (no dispatch)"
+		}
+		a.logActivityBy(who, by, "completed", string(prevState), "completed",
+			fmt.Sprintf("Task completed by %s without a dispatch", who))
 	}
 	a.log.Info("completed")
 
@@ -333,10 +380,18 @@ func (a *TaskActor) handleBlock(reason string, by *int) error {
 	return nil
 }
 
-func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
+func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest, keepHuman string) error {
 	clr, err := domain.ParseClears(req.Clear, domain.TaskClearable)
 	if err != nil {
 		return err
+	}
+	// A person's ticket becomes agent work only by that choice in the web UI;
+	// otherwise an agent could flip it, dispatch it and complete it. Checked
+	// before anything changes, so a refusal leaves the ticket as it was.
+	if keepHuman != "" && a.task.IsHuman() && req.Performer != "" {
+		if p, _, err := domain.NormalizePerformer(req.Performer, ""); err == nil && p == domain.PerformerAgent {
+			return errors.New(keepHuman)
+		}
 	}
 	if req.Name != "" {
 		a.task.Name = req.Name
@@ -373,9 +428,15 @@ func (a *TaskActor) handleUpdate(req domain.UpdateTaskRequest) error {
 	}
 	a.task.UpdatedAt = time.Now()
 
-	if err := a.repo.UpdateTask(context.Background(), req); err != nil {
+	planned, err := a.repo.UpdateTaskPlanned(context.Background(), req)
+	if err != nil {
 		return fmt.Errorf("db update: %w", err)
 	}
+	// A change to what the ticket is (name, description, acceptance
+	// criteria) re-plans it, so the last plan approval no longer covers it.
+	// The database decides (Repo.UpdateTaskPlanned), on the same clock as
+	// plan_approved_at.
+	a.task.PlannedAt = planned
 	if prevPerformer != a.task.Performer {
 		who := map[string]string{domain.PerformerAgent: "an agent", domain.PerformerHuman: "a person"}
 		detail := fmt.Sprintf("Now done by %s (was %s)", who[a.task.Performer], who[prevPerformer])
@@ -412,7 +473,10 @@ func (a *TaskActor) saveState(state domain.TaskState, blockReason string) error 
 	return nil
 }
 
-func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *int) error {
+func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *int, byName string) error {
+	if byName == "" {
+		byName = "manager"
+	}
 	from := string(a.task.State)
 	a.task.State = state
 	a.task.UpdatedAt = time.Now()
@@ -430,7 +494,7 @@ func (a *TaskActor) handleSetState(state domain.TaskState, reason string, by *in
 	if err := a.repo.LogActivity(context.Background(), domain.ActivityLog{
 		TaskID:    a.task.ID,
 		ProjectID: a.projectID,
-		Actor:     "manager",
+		Actor:     byName,
 		Action:    "state_change",
 		FromState: from,
 		ToState:   string(state),
@@ -530,12 +594,18 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		t := a.withBlockedBy()
 		return &t, nil // no-op (e.g. claiming a ticket you already own)
 	}
-	if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.NewOwner); err != nil {
+	drop := a.task.DropsApprovalOn(msg.NewOwner, msg.ByLead)
+	wasApproved := a.task.Approved()
+	if err := a.repo.SetTaskOwner(context.Background(), a.task.ID, msg.NewOwner, drop); err != nil {
 		return nil, fmt.Errorf("db set owner: %w", err)
 	}
 	from := ownerString(a.task.OwnerUserID)
+	approvedFor := a.task.ApprovedFor
 	a.task.OwnerUserID = msg.NewOwner
 	a.task.UpdatedAt = time.Now()
+	if drop {
+		a.task.ApprovedAt, a.task.ApprovedBy, a.task.ApprovedFor = nil, nil, nil
+	}
 
 	detail := fmt.Sprintf("Owner %s → %s", from, ownerString(msg.NewOwner))
 	if msg.NewOwner == nil && a.task.State == domain.TaskStateInProgress {
@@ -557,10 +627,27 @@ func (a *TaskActor) handleAssign(msg *MsgAssignTask, ctx actor.Context) (*domain
 		action = "unassigned"
 	}
 	a.logActivityBy(msg.ByName, msg.By, action, "", "", detail)
+	if drop && wasApproved {
+		// Only a live approval is worth telling anyone about: one already
+		// stale (the ticket was replanned since) is cleared silently.
+		next := a.task.ApprovalOwner()
+		a.logActivityBy(msg.ByName, msg.By, "approval_dropped", "", "", fmt.Sprintf(
+			"Plan approval dropped: it was approved for %s, and the ticket is now %s's (owner changed by %s, not by a project lead in the AMP web UI). "+
+				"%s approves it again in the AMP web UI, or a project lead on their behalf",
+			ownerString(approvedFor), ownerString(next), nameOr(msg.ByName, ownerString(msg.By)), ownerString(next)))
+	}
 	t := a.withBlockedBy()
 	a.publish(domain.EventTaskAssigned, t)
 	a.log.Info(action, "owner", ownerString(msg.NewOwner))
 	return &t, nil
+}
+
+// nameOr returns name, or fallback when name is empty.
+func nameOr(name, fallback string) string {
+	if name == "" {
+		return fallback
+	}
+	return name
 }
 
 func sameOwner(a, b *int) bool {
@@ -648,6 +735,68 @@ func (a *TaskActor) reconcileDeps(why string) error {
 
 // ---- Helpers ----
 
+// openDeps re-reads which of the task's dependencies are complete (the
+// in-memory set can be stale: a dependency moved back from completed sends
+// no message) and returns the incomplete ones.
+func (a *TaskActor) openDeps() ([]int, error) {
+	if len(a.task.DependencyIDs) == 0 {
+		return nil, nil
+	}
+	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	a.completedDeps = done
+	var open []int
+	for _, d := range a.task.DependencyIDs {
+		if !done[d] {
+			open = append(open, d)
+		}
+	}
+	return open, nil
+}
+
+// refuseOpenDeps returns an error naming the incomplete dependencies, if any.
+func (a *TaskActor) refuseOpenDeps(doing string) error {
+	open, err := a.openDeps()
+	if err != nil {
+		return fmt.Errorf("task %d: couldn't check its dependencies (%v); nothing changed, try again", a.task.ID, err)
+	}
+	if len(open) > 0 {
+		return fmt.Errorf("task %d can't be %s off the web UI: it's waiting on task IDs: %v, which aren't complete", a.task.ID, doing, open)
+	}
+	return nil
+}
+
+// holdForDeps applies MsgSetTaskState.RequireDeps: the state to store
+// instead of want, or a refusal. Only a ticket whose dependencies are all
+// complete is made ready (backlog), started or done by hand off the UI.
+func (a *TaskActor) holdForDeps(want domain.TaskState) (domain.TaskState, error) {
+	switch want {
+	case domain.TaskStateBacklog, domain.TaskStateInProgress, domain.TaskStateCompleted:
+	default:
+		return want, nil
+	}
+	if want == domain.TaskStateCompleted && a.task.State == domain.TaskStateCompleted {
+		return want, nil
+	}
+	if want == domain.TaskStateBacklog && (a.task.State == domain.TaskStateInProgress || a.task.State == domain.TaskStateCompleted) {
+		// Moving work back stays allowed; with a dependency open it waits
+		// on it (blocked, no reason) rather than showing as ready.
+		open, err := a.openDeps()
+		if err != nil {
+			return want, fmt.Errorf("task %d: couldn't check its dependencies (%v); nothing changed, try again", a.task.ID, err)
+		}
+		if len(open) > 0 {
+			return domain.TaskStateBlocked, nil
+		}
+		return want, nil
+	}
+	doing := map[domain.TaskState]string{domain.TaskStateBacklog: "made ready (backlog)",
+		domain.TaskStateInProgress: "set in progress", domain.TaskStateCompleted: "completed"}[want]
+	return want, a.refuseOpenDeps(doing)
+}
+
 // withBlockedBy returns a copy of the task with BlockedByIDs computed from completedDeps.
 func (a *TaskActor) withBlockedBy() domain.Task {
 	t := a.task
@@ -667,6 +816,53 @@ func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
 		Payload:   payload,
 		At:        time.Now(),
 	})
+}
+
+// handleApprove records a person's approval of the ticket's plan, checked
+// against the ticket as it is now (see MsgApproveTask). The database writes
+// approved_at with clock_timestamp(), the clock planned_at uses, and only
+// while planned_at is still at or before AsOf.
+func (a *TaskActor) handleApprove(msg *MsgApproveTask) ReplyApproveTask {
+	t := a.task
+	skip := func(why string) ReplyApproveTask {
+		cur := a.withBlockedBy()
+		return ReplyApproveTask{Task: &cur, Why: why}
+	}
+	switch {
+	case !sameUser(t.OwnerUserID, msg.ExpectOwner):
+		return skip("its owner changed")
+	case t.State == domain.TaskStateCompleted:
+		return skip("it is completed")
+	case t.Approved():
+		return skip("it is already approved")
+	case msg.AsOf != nil && t.Planned().After(*msg.AsOf):
+		return skip("it was planned after what was approved (as_of)")
+	}
+	at, forUser, err := a.repo.ApproveTask(context.Background(), t.ID, msg.By, msg.AsOf)
+	if err != nil {
+		return ReplyApproveTask{Err: fmt.Errorf("db approve task %d: %w", t.ID, err)}
+	}
+	if at == nil {
+		return skip("it was planned after what was approved (as_of)")
+	}
+	a.task.ApprovedAt, a.task.ApprovedBy, a.task.ApprovedFor = at, msg.By, forUser
+	detail := "Plan approved by " + msg.ByName
+	if msg.OnBehalfOf != "" {
+		detail = "Plan approved on behalf of " + msg.OnBehalfOf + " by " + msg.ByName
+	}
+	a.logActivityBy(msg.ByName, msg.By, "plan_approved", "", "", detail)
+	cur := a.withBlockedBy()
+	a.publish(domain.EventTaskUpdated, cur)
+	return ReplyApproveTask{Task: &cur, Approved: true}
+}
+
+// sameUser reports whether two optional user ids are the same (both unset
+// counts as the same).
+func sameUser(x, y *int) bool {
+	if x == nil || y == nil {
+		return x == nil && y == nil
+	}
+	return *x == *y
 }
 
 func (a *TaskActor) logActivity(actorName, action, fromState, toState, detail string) {

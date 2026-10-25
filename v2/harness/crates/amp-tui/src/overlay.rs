@@ -14,7 +14,7 @@
 //!       Dark or light?
 //!    ■  QUESTION  #2110 M3-6 Docs
 //!       README or KB?
-//!  ↑↓ select · Enter answer · o open in browser · Esc close
+//!  ↑↓ select · Enter answer · Tab editor · Esc close
 //! ```
 //!
 //! The panel is part of the layout (not a floating TUI overlay), so the headless renders that the
@@ -1998,10 +1998,10 @@ fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
             "↑↓ select · Enter or click watch · x stop · o open in browser · Esc close".to_owned()
         }
         (Stage::Browse, PanelKind::Questions) if has_targets => {
-            "↑↓ select · Enter answer · o open in browser · Esc close".to_owned()
+            "↑↓ select · Enter answer · Tab editor · Esc close".to_owned()
         }
         (Stage::Browse, _) if has_targets => {
-            "↑↓ select · Enter / o open in browser · Esc close".to_owned()
+            "↑↓ select · Enter open in browser · Tab editor · Esc close".to_owned()
         }
         _ => "Esc close".to_owned(),
     }
@@ -2030,6 +2030,7 @@ fn layout(
         if is_target {
             target_index += 1;
         }
+        // The marker shows only while the keys go to the panel.
         let marker = if is_selected {
             c.accent.fg("›")
         } else {

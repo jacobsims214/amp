@@ -92,7 +92,7 @@ func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 		"amp_archive_project", "amp_restore_project", "amp_reset_project", "amp_export_project", "amp_import_project",
 		"amp_create_org", "amp_kb_tags"}
 	admin := []string{"amp_manage_invites", "amp_manage_org_members", "amp_manage_teams", "amp_audit_log"}
-	person := []string{"amp_approve_plan", "amp_review_artifact", "amp_keep_artifact"}
+	person := []string{"amp_review_artifact", "amp_keep_artifact"}
 
 	agentUser := *w.alice.User
 	agentUser.Kind = domain.UserKindAgent
@@ -126,7 +126,9 @@ func TestCatalog_ListedToolsPerCaller(t *testing.T) {
 		}
 		// amp_kb_reindex is listed for everyone, agents included: it checks
 		// write access to the KB it names when called.
-		for _, n := range []string{"amp_get_task", "amp_get_plan", "amp_list_tasks", "amp_dispatch_task", "amp_create_tasks", "amp_manage_team_members", "amp_kb_reindex"} {
+		// amp_approve_plan too: it never approves, it tells any caller (old
+		// manager prompts included) where a person approves.
+		for _, n := range []string{"amp_get_task", "amp_get_plan", "amp_list_tasks", "amp_dispatch_task", "amp_create_tasks", "amp_manage_team_members", "amp_kb_reindex", "amp_approve_plan"} {
 			if !got[n] {
 				t.Errorf("%s: %s not listed", c.who, n)
 			}

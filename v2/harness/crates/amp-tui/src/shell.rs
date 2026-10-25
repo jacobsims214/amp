@@ -877,11 +877,15 @@ impl Shell {
         true
     }
 
-    /// Pasted text: into the `/connect` key when one is being typed, else the editor.
+    /// Pasted text: into the `/connect` key when one is being typed, else the editor, which then
+    /// has the keys while a panel is docked (#2161).
     pub fn paste(&mut self, text: &str) {
         match self.secret.as_mut() {
             Some(entry) => entry.buf.push_str(text.trim_end_matches(['\r', '\n'])),
-            None => self.view.editor().handle_paste(text),
+            None => {
+                self.editor_clicked = self.view.panel().is_open();
+                self.view.editor().handle_paste(text);
+            }
         }
     }
 
@@ -1404,6 +1408,9 @@ impl Shell {
             };
             return self.command(name, arg).await;
         }
+        // A prompt hands the keys back to the editor; a docked panel stays, unfocused.
+        // #2161: a sent prompt hands the keys back to the editor; a docked panel stays.
+        self.editor_clicked = self.view.panel().is_open();
         if self.running {
             self.view
                 .add_notice("still working: wait for the reply, or press Esc to abort it");
@@ -2024,10 +2031,14 @@ impl Shell {
     }
 
     /// A key while a panel is open. Returns true when the panel used it (the editor must not).
-    /// Esc closes the panel (or backs out of an answer). With an empty editor, ↑/↓ select,
-    /// Enter acts on the selection (answers a question; otherwise opens it) and `o` opens it.
-    /// While an answer waits for confirmation, `y`/Enter sends it and `n`/Esc cancels; other keys
-    /// are swallowed.
+    ///
+    /// Esc closes the panel (or backs out of an answer). While the editor is empty and has not
+    /// been given the keys, ↑/↓/PgUp/PgDn select and Enter acts on the selection (answers a
+    /// question; otherwise opens it); a configuration panel's letters and the workers panel's
+    /// `x`/`o` are commands. Any other printable key is typing: it goes to the editor, which keeps
+    /// the keys (#2161: typing "ok…" must never open a browser). Tab, with an empty editor,
+    /// switches the keys between the panel and the editor. While an answer waits for
+    /// confirmation, `y`/Enter sends it and `n`/Esc cancels; other keys are swallowed.
     pub fn panel_key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         let panel = self.view.panel().clone();
         let Some(state) = panel.state() else {
@@ -2071,7 +2082,12 @@ impl Shell {
                     panel.close();
                     return true;
                 }
-                // #2344: a click into the editor gave it the keys.
+                // #2161: Tab (with an empty editor) hands the keys to the editor and back.
+                if key.code == KeyCode::Tab && editor_empty {
+                    self.editor_clicked = !self.editor_clicked;
+                    return true;
+                }
+                // #2344: a click into the editor (or typing, Tab, a paste) gave it the keys.
                 if !editor_empty || self.editor_clicked {
                     return false;
                 }
@@ -2113,14 +2129,15 @@ impl Shell {
                         Some(target) => self.open_target(&target),
                         None => {}
                     },
-                    // A configuration panel's letter keys (#2245): before `o`, which they may use.
+                    // A configuration panel's letter keys (#2245).
                     KeyCode::Char(c)
                         if state.kind == PanelKind::Info
                             && overlay::info_command(&state, c).is_some() =>
                     {
                         self.pending_command = overlay::info_command(&state, c);
                     }
-                    KeyCode::Char('o') => {
+                    // The workers panel's commands (#2252): `o` opens the ticket in AMP.
+                    KeyCode::Char('o') if state.kind == PanelKind::Workers => {
                         if let Some(target) = panel.selected() {
                             self.open_target(&target);
                         }
@@ -2130,6 +2147,14 @@ impl Shell {
                             self.ask_stop(id);
                         }
                     }
+                    // #2161: any other printable key is typing. It goes to the editor, and so do
+                    // the keys after it, so a prompt starting "ok" never opens a browser. A
+                    // configuration panel keeps the keys: its letters are commands, and one that
+                    // doesn't apply to the row does nothing (#2245).
+                    KeyCode::Char(_) if state.kind != PanelKind::Info => {
+                        self.editor_clicked = true;
+                        return false;
+                    }
                     _ => return false,
                 }
                 true
@@ -2138,7 +2163,7 @@ impl Shell {
     }
 
     /// [`Self::panel_key`] by name, with an empty editor (`--snapshot`'s `--input key:<name>`):
-    /// `enter`, `esc`, `up`, `down`, or one character. `ctrl+t` toggles the last thinking,
+    /// `enter`, `esc`, `up`, `down`, `tab`, or one character. `ctrl+t` toggles the last thinking,
     /// `ctrl+o` the tool calls' details.
     pub async fn press(&mut self, name: &str) -> Result<bool, String> {
         if let Some(text) = name.strip_prefix("paste:") {
@@ -2167,7 +2192,7 @@ impl Shell {
             c if c.chars().count() == 1 => KeyCode::Char(c.chars().next().unwrap_or(' ')),
             other => {
                 return Err(format!(
-                    "key `{other}`: not a key (enter, esc, up, down, or one character)"
+                    "key `{other}`: not a key (enter, esc, up, down, tab, or one character)"
                 ));
             }
         };

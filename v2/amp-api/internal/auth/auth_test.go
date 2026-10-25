@@ -187,3 +187,71 @@ func TestChallenges(t *testing.T) {
 		}
 	})
 }
+
+// channelSeen runs one request through v and returns the identity's channel.
+func channelSeen(t *testing.T, v *Verifier, authz string) string {
+	t.Helper()
+	var got string
+	h := v.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ident, _ := FromContext(r.Context())
+		got = ident.Channel
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	if authz != "" {
+		req.Header.Set("Authorization", authz)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("request refused: %d %s", rec.Code, rec.Body)
+	}
+	return got
+}
+
+// Only a token issued to the UI's own client, on the REST listener, is the
+// web UI. The same person's MCP token is not, on either listener.
+func TestChannel(t *testing.T) {
+	idp := newTestIdP(t)
+	base, err := NewVerifier(context.Background(), Config{IssuerURL: testIssuer, DiscoveryURL: idp.server.URL, UIClientID: "amp-ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rest := base.WithAudiences("rest", "amp-ui", "amp-mcp")
+	mcp := base.WithAudiences("mcp", "amp-mcp")
+	ui := idp.token(t, map[string]any{"aud": "amp-ui"})
+	uiAZP := idp.token(t, map[string]any{"aud": []string{"amp-ui"}, "azp": "amp-ui"})
+	mcpTok := idp.token(t, map[string]any{"aud": []string{"amp-mcp", "mcp-1234"}, "azp": "mcp-1234"})
+	// A token naming the UI among its audiences but issued to another client.
+	borrowed := idp.token(t, map[string]any{"aud": []string{"amp-ui", "amp-mcp"}, "azp": "mcp-1234"})
+	for _, tc := range []struct {
+		name string
+		v    *Verifier
+		tok  string
+		want string
+	}{
+		{"UI token on REST", rest, ui, ChannelUI},
+		{"UI token with azp on REST", rest, uiAZP, ChannelUI},
+		{"MCP token on REST", rest, mcpTok, ChannelRESTOther},
+		{"UI audience, other azp", rest, borrowed, ChannelRESTOther},
+		{"MCP token on MCP", mcp, mcpTok, ChannelMCP},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := channelSeen(t, tc.v, "Bearer "+tc.tok); got != tc.want {
+				t.Fatalf("channel = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// Without UI_CLIENT_ID, no token is the UI.
+	noUI := idp.verifier(t).WithAudiences("rest", "amp-ui")
+	if got := channelSeen(t, noUI, "Bearer "+ui); got != ChannelRESTOther {
+		t.Fatalf("no UI client configured: channel = %q", got)
+	}
+	// Auth off (compose): REST is the UI, MCP never is.
+	off, _ := NewVerifier(context.Background(), Config{})
+	if got := channelSeen(t, off.WithAudiences("rest"), ""); got != ChannelUI {
+		t.Fatalf("auth off, REST: %q", got)
+	}
+	if got := channelSeen(t, off.WithAudiences("mcp"), ""); got != ChannelMCP {
+		t.Fatalf("auth off, MCP: %q", got)
+	}
+}

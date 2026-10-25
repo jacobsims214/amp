@@ -1083,6 +1083,12 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   would push the header off the top. `/config thinking [collapsed|full|hidden]` (or `t` in the
   `/config` panel) changes the mode for the chat, sections already shown included; without a
   value it goes to the next. The session file always keeps the full thinking.
+- AMP panels (`/amp`, `/ticket`, `/workers`, `/questions`, `/plan`, `/project`) open docked above the
+  editor with the keys: with an empty editor, ↑↓ select a row and Enter acts on it (answers a
+  question, otherwise opens it in the browser). Typing, a paste or a sent prompt hands the keys back
+  to the editor and the panel stays docked (#2161); printable keys reach the editor, except the
+  `/workers` panel's `x` (stop) and `o` (open in AMP) and a configuration panel's letters. Tab, with
+  an empty editor, switches between the panel and the editor. Esc closes it.
 - The terminal is restored on exit, on a signal and on a panic. Quitting mid-run aborts the run
   (and any workers it started) and waits briefly so the session file is complete.
 
