@@ -25,6 +25,10 @@
 //! - `{{context:KEY}}`: the value of the system prompt's `<amp_context>` line `KEY: …` (#2383,
 //!   e.g. `{{context:project_id}}`), or `none`.
 //!
+//! `AMP_HARNESS_FAUX_TOKENS_PER_SECOND=<n>` streams every faux response at about n tokens a second
+//! (4 characters a token) instead of all at once, so a pty test can watch a long reply or tool
+//! call arrive (#2384).
+//!
 //! When the script runs out, the faux provider answers with an error ("No more faux responses
 //! queued"), so a script that is too short fails the run instead of hanging it.
 
@@ -41,6 +45,17 @@ use crate::providers::ProviderSet;
 
 /// The environment variable naming the script file.
 pub const ENV_FAUX_SCRIPT: &str = "AMP_HARNESS_FAUX_SCRIPT";
+
+/// The environment variable that slows the faux providers' streaming down (#2384).
+pub const ENV_FAUX_TOKENS_PER_SECOND: &str = "AMP_HARNESS_FAUX_TOKENS_PER_SECOND";
+
+/// The faux providers' streaming speed from [`ENV_FAUX_TOKENS_PER_SECOND`]: `None` (all at once)
+/// unless it is a positive number.
+pub fn tokens_per_second(env: &dyn Fn(&str) -> Option<String>) -> Option<f64> {
+    env(ENV_FAUX_TOKENS_PER_SECOND)
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|tps| tps.is_finite() && *tps > 0.0)
+}
 
 /// One scripted response.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
@@ -275,6 +290,19 @@ fn fill_context(text: &str, system: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokens_per_second_needs_a_positive_number() {
+        let with = |v: &'static str| {
+            move |k: &str| (k == ENV_FAUX_TOKENS_PER_SECOND).then(|| v.to_owned())
+        };
+        assert_eq!(tokens_per_second(&with("400")), Some(400.0));
+        assert_eq!(tokens_per_second(&with(" 2.5 ")), Some(2.5));
+        for bad in ["", "0", "-1", "fast", "NaN", "inf"] {
+            assert_eq!(tokens_per_second(&with(bad)), None, "{bad}");
+        }
+        assert_eq!(tokens_per_second(&|_| None), None);
+    }
 
     #[test]
     fn parses_both_shapes_and_rejects_unknown_keys() {

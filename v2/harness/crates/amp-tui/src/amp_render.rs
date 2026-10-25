@@ -84,6 +84,92 @@ pub fn tool_title(name: &str, args: &Value) -> String {
     clean(&title)
 }
 
+/// The spinner line while the model is still writing a tool call's arguments (#2384): a large
+/// `amp_create_tasks` streams for tens of seconds before it runs, and "Working…" alone looked
+/// stuck. `json` is the arguments streamed so far (partial JSON): `Writing create_tasks 7
+/// tickets · 18 KB ·` — the tool line's title as far as it can be read, and the size once it
+/// passes 1 KB. The spinner adds the elapsed time after it.
+pub fn streaming_line(name: &str, json: &str) -> String {
+    let mut args = rpi_ai::json_parse::parse_streaming_json(Some(json));
+    // The parse gives up on a key cut in half (`{"tasks": [{…}, {"na`), which is most of the
+    // time: count the elements of the top-level lists as far as they have started instead.
+    if let Value::Object(map) = &mut args {
+        for (key, n) in started_lists(json) {
+            let longer = map
+                .get(&key)
+                .and_then(Value::as_array)
+                .is_none_or(|a| a.len() < n);
+            if longer {
+                map.insert(key, Value::Array(vec![Value::Null; n]));
+            }
+        }
+    }
+    let mut line = format!("Writing {}", tool_title(name, &args));
+    let kb = json.len() / 1024;
+    if kb > 0 {
+        line.push_str(&format!(" · {kb} KB"));
+    }
+    // The spinner puts the elapsed time right after: `… · 5 KB · 7s`.
+    line.push_str(" ·");
+    line
+}
+
+/// The top-level lists of a (partial) JSON object and how many elements each has begun.
+fn started_lists(json: &str) -> Vec<(String, usize)> {
+    let mut lists: Vec<(String, usize)> = Vec::new();
+    // The open objects and lists, outermost first.
+    let mut open: Vec<char> = Vec::new();
+    let (mut in_string, mut escaped) = (false, false);
+    let (mut string, mut key) = (String::new(), String::new());
+    // Inside a top-level list, before its next element.
+    let mut expecting = false;
+    for c in json.chars() {
+        if in_string {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => string.push(c),
+            }
+            if !in_string && open.len() == 1 {
+                key = std::mem::take(&mut string);
+            }
+            continue;
+        }
+        if c.is_whitespace() {
+            continue;
+        }
+        let in_list = open.len() == 2 && open[1] == '[';
+        if in_list && expecting && c != ']' {
+            if let Some(last) = lists.last_mut() {
+                last.1 += 1;
+            }
+            expecting = false;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                string.clear();
+            }
+            '{' | '[' => {
+                if open.len() == 1 && c == '[' {
+                    lists.push((std::mem::take(&mut key), 0));
+                    expecting = true;
+                }
+                open.push(c);
+            }
+            '}' | ']' => {
+                open.pop();
+                expecting = false;
+            }
+            ',' if in_list => expecting = true,
+            _ => {}
+        }
+    }
+    lists.retain(|(key, _)| !key.is_empty());
+    lists
+}
+
 /// What follows the title in the block header: the call's most telling argument, on one line,
 /// cleaned and short (empty for none).
 pub fn tool_summary(args: &Value) -> String {
@@ -832,6 +918,30 @@ mod tests {
             "create_tasks 2 tickets"
         );
         assert_eq!(tool_title("amp_whoami", &json!({})), "whoami");
+    }
+
+    #[test]
+    fn streaming_line_counts_the_tickets_written_so_far() {
+        assert_eq!(
+            streaming_line("amp_create_tasks", ""),
+            "Writing create_tasks ·"
+        );
+        assert_eq!(
+            streaming_line(
+                "amp_create_tasks",
+                r#"{"project_id": 2, "tasks": [{"ref": "a"}, {"ref": "b"}, {"na"#
+            ),
+            "Writing create_tasks 3 tickets ·"
+        );
+        let big = format!(r#"{{"tasks": [{{"description": "{}"}}"#, "x".repeat(3000));
+        assert_eq!(
+            streaming_line("amp_create_tasks", &big),
+            "Writing create_tasks 1 ticket · 2 KB ·"
+        );
+        assert_eq!(
+            streaming_line("write", r#"{"path": "a.md", "con"#),
+            "Writing write ·"
+        );
     }
 
     #[test]
