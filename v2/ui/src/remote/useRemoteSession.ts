@@ -7,6 +7,7 @@ import { useCallback, useEffect, useLayoutEffect, useReducer, useRef, useState }
 import { useRemote } from './remote-context'
 import { buildCommand, checkEvent, isSecurityVerdict, newClientMsgId, nextSeq, type EventCheck } from './envelope'
 import { NotPairedError } from './crypto'
+import { KeyGateError } from './keyGate'
 import { RelayError } from './transport'
 import { forgetPairingLink, pairingLinkFor, type PairingLink } from './pairingLink'
 import { initialSessionState, refusalText, sessionReducer, type SessionState } from './session'
@@ -101,6 +102,7 @@ export function useRemoteSession(sessionId: string) {
       await post(seq, op, body)
     } catch (e) {
       const problem = e instanceof NotPairedError ? 'This browser isn\'t paired with the laptop yet.'
+        : e instanceof KeyGateError ? e.message
         : e instanceof RelayError ? refusalText(e.code, e.message)
         : 'Couldn\'t reach AMP. Check your connection.'
       dispatch({ type: 'outgoing_update', seq, patch: { state: 'failed', problem } })

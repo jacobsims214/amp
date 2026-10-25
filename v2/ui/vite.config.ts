@@ -2,18 +2,20 @@
 import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
-import { SESSION_CSP, SESSION_PATH_PREFIX } from './src/remote/csp'
+import { cspFor } from './src/remote/csp'
 
 /**
- * The remote session page's strict CSP under `vite preview`, matching nginx in
- * production. Not under `vite dev`: its HMR client injects inline styles.
+ * The pages' CSPs under `vite preview`, matching nginx in production: the strict
+ * one on /sessions/, the baseline everywhere else, none on the proxied /api/.
+ * Not under `vite dev`: its HMR client injects inline script and styles.
  */
-function sessionCsp(): Plugin {
+function pageCsp(): Plugin {
   return {
-    name: 'amp-session-csp',
+    name: 'amp-page-csp',
     configurePreviewServer(server) {
       server.middlewares.use((req, res, next) => {
-        if (req.url?.startsWith(SESSION_PATH_PREFIX)) res.setHeader('Content-Security-Policy', SESSION_CSP)
+        const path = req.url ?? '/'
+        if (!path.startsWith('/api/')) res.setHeader('Content-Security-Policy', cspFor(path))
         next()
       })
     },
@@ -21,7 +23,7 @@ function sessionCsp(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), sessionCsp()],
+  plugins: [react(), tailwindcss(), pageCsp()],
   server: {
     port: 5173,
     proxy: {
