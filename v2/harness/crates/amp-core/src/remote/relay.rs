@@ -92,6 +92,13 @@ impl RelayError {
             (503, Some("audit_unavailable")) => {
                 "AMP couldn't record the audit entry, so it refused; try again shortly.".to_owned()
             }
+            // No relay behind the proxy: amp-relay is its own service (#2387), and with it
+            // scaled down or not deployed Envoy answers 502/503 without a relay `code`.
+            (502..=504, None) => {
+                "Remote control is unavailable: AMP's relay service isn't running \
+                 right now. Try again later, or ask your AMP admin."
+                    .to_owned()
+            }
             (0, _) => format!("AMP could not be reached: {}", self.message),
             _ => format!("AMP refused remote control: {self}"),
         }
@@ -449,5 +456,58 @@ impl ConnectToken {
 
     pub fn get(&self) -> String {
         self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
+#[cfg(test)]
+mod register_message_tests {
+    use super::*;
+
+    fn err(status: u16, code: Option<&str>) -> RelayError {
+        RelayError {
+            status,
+            code: code.map(str::to_owned),
+            message: "x".into(),
+            body: Box::new(Value::Null),
+        }
+    }
+
+    #[test]
+    fn relay_service_down_reads_as_unavailable() {
+        for s in [502, 503, 504] {
+            assert!(
+                err(s, None)
+                    .register_message()
+                    .starts_with("Remote control is unavailable"),
+                "{s}"
+            );
+        }
+        assert!(
+            err(503, Some("audit_unavailable"))
+                .register_message()
+                .contains("audit entry")
+        );
+        assert!(
+            err(404, None)
+                .register_message()
+                .contains("isn't available")
+        );
+    }
+
+    /// Live probe of what a person is told when registering against a real AMP (#2387's
+    /// kill-switch check): `AMP_RELAY_PROBE_URL=https://amp.local AMP_RELAY_PROBE_CA=<pem>
+    /// cargo test -p amp-core live_register_probe -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_register_probe() {
+        let url = std::env::var("AMP_RELAY_PROBE_URL").expect("AMP_RELAY_PROBE_URL");
+        let ca = std::env::var("AMP_RELAY_PROBE_CA").ok();
+        let c = RelayClient::new(&url, ca.as_deref().map(Path::new)).unwrap();
+        let e = c
+            .register("not-a-real-token", "h", "p", "host", "os", "0", None)
+            .await
+            .unwrap_err();
+        println!("PROBE status={} code={:?}", e.status, e.code);
+        println!("PROBE message: {}", e.register_message());
     }
 }

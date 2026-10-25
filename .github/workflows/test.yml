@@ -78,3 +78,28 @@ jobs:
         run: go test -race -count=1 ./...
       - name: go test across replicas (every MCP test through a forwarding replica)
         run: TEST_CLUSTER=1 go test -race -count=1 ./cmd/server
+
+  # The two service images built from this module: amp-api (cmd/server) and
+  # amp-relay (cmd/relay, the remote control relay, its own service). Built,
+  # not pushed (build-images.yml pushes on main).
+  images:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: amp-api
+            dockerfile: v2/amp-api/Dockerfile
+          - component: amp-relay
+            dockerfile: v2/amp-api/Dockerfile.relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: docker build ${{ matrix.component }}
+        uses: docker/build-push-action@v6
+        with:
+          context: v2
+          file: ${{ matrix.dockerfile }}
+          push: false
+          tags: ${{ matrix.component }}:ci
+          cache-from: type=gha,scope=${{ matrix.component }}

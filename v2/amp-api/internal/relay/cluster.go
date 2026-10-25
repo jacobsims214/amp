@@ -33,7 +33,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -44,6 +43,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/relayctl"
 )
 
 // Cluster is this replica's membership (a *cluster.Node).
@@ -57,11 +57,11 @@ type Cluster interface {
 }
 
 const (
-	internalPrefix  = "/internal/relay"
-	tokenHeader     = "X-AMP-Cluster-Token"
+	internalPrefix  = relayctl.InternalPrefix
+	tokenHeader     = relayctl.TokenHeader
 	principalHeader = "X-AMP-Relay-Principal"
 	notHolderHeader = "X-AMP-Relay-Not-Holder"
-	ctlTimeout      = 3 * time.Second
+	ctlTimeout      = relayctl.CallTimeout
 	dialTimeout     = 3 * time.Second
 	// maxForwardBody is read before forwarding (so a refused hop can be
 	// retried); one byte over the largest limit, so the holder still answers
@@ -318,10 +318,7 @@ func (rl *Relay) InternalHandler() http.Handler {
 	})
 }
 
-type endNote struct {
-	ID     string `json:"id"`
-	Reason string `json:"reason"`
-}
+type endNote = relayctl.EndNote
 
 // ctlEnd closes the streams of sessions another replica ended.
 func (rl *Relay) ctlEnd(w http.ResponseWriter, r *http.Request) {
@@ -359,33 +356,7 @@ func (rl *Relay) ctlPresence(w http.ResponseWriter, r *http.Request) {
 // ctl makes a control call to the replica at addr; out, if set, receives the
 // JSON reply.
 func (rl *Relay) ctl(ctx context.Context, addr, method, path string, in, out any) error {
-	ctx, cancel := context.WithTimeout(ctx, ctlTimeout)
-	defer cancel()
-	var rd io.Reader
-	if in != nil {
-		raw, _ := json.Marshal(in)
-		rd = bytes.NewReader(raw)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, "http://"+addr+internalPrefix+"/ctl/"+path, rd)
-	if err != nil {
-		return err
-	}
-	req.Header.Set(tokenHeader, rl.cfg.Cluster.Token())
-	if in != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	resp, err := rl.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("replica %s: %s %s: %d", addr, method, path, resp.StatusCode)
-	}
-	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
-	}
-	return nil
+	return relayctl.Call(ctx, rl.client, rl.cfg.Cluster.Token(), addr, method, path, in, out)
 }
 
 // ---- side effects that reach the holder ----
@@ -394,15 +365,7 @@ func (rl *Relay) ctl(ctx context.Context, addr, method, path string, in, out any
 // A replica that's gone holds nothing; a failed call is caught by the
 // holder's own sweep, which checks its sessions against the database.
 func (rl *Relay) tellEnded(node string, notes []endNote) {
-	ctx, cancel := context.WithTimeout(context.Background(), ctlTimeout)
-	defer cancel()
-	addr, alive, err := rl.repo.NodeAddr(ctx, node, rl.cfg.Cluster.TTL())
-	if err != nil || !alive {
-		return
-	}
-	if err := rl.ctl(ctx, addr, http.MethodPost, "end", map[string]any{"sessions": notes}, nil); err != nil {
-		slog.Warn("telling the holder a remote session ended failed", "holder", node, "err", err)
-	}
+	relayctl.TellEnded(context.Background(), rl.repo, rl.client, rl.cfg.Cluster.Token(), rl.cfg.Cluster.TTL(), node, notes)
 }
 
 // deviceRevoked sends device_revoked {all} to the session's harness, on

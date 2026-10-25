@@ -1,0 +1,36 @@
+name: Helm chart
+
+# Template tests for the AMP chart (v2/deploy/helm/amp): with relay.enabled
+# off nothing relay-related renders; with it on, amp-relay is deployed and
+# Envoy routes /relay/ and /api/sessions/* to it (AMP #2387). Every rendered
+# Envoy config is checked with `envoy --mode validate`.
+
+on:
+  pull_request:
+    paths:
+      - "v2/deploy/helm/**"
+      - ".github/workflows/helm.yml"
+  push:
+    branches: [main, "harness-m*", "remote-m*"]
+    paths:
+      - "v2/deploy/helm/**"
+      - ".github/workflows/helm.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  template:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - name: chart dependencies
+        run: |
+          helm repo add valkey https://valkey.io/valkey-helm/
+          helm dependency build v2/deploy/helm/amp
+      - name: PyYAML
+        run: python3 -m pip install --user pyyaml
+      - name: relay on/off template tests + envoy validate
+        run: python3 v2/deploy/helm/test_relay_chart.py --envoy-validate

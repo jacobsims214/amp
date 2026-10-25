@@ -65,9 +65,10 @@ services:
       # artifact URLs absolute; without it links are relative and artifact
       # URLs are left out. Change it if you publish the UI on another port.
       APP_PUBLIC_URL: http://localhost:5173
-      # Remote control (epic 165) is off here: RELAY_ENABLED is unset, and
-      # amp-api never turns the relay on without OIDC anyway. A warned,
-      # loopback-only dev override is docker-compose.remote-dev.yml.
+      # Remote control (epic 165) is off here: the relay is its own service,
+      # amp-relay, which this stack doesn't run (amp-api serves no relay
+      # route). A warned, loopback-only dev override that adds it is
+      # docker-compose.remote-dev.yml.
     depends_on:
       postgres:
         condition: service_healthy
