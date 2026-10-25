@@ -2152,11 +2152,35 @@ impl Shell {
     /// Enter acts on the selection (answers a question; otherwise opens it) and `o` opens it.
     /// While an answer waits for confirmation, `y`/Enter sends it and `n`/Esc cancels; other keys
     /// are swallowed.
+    ///
+    /// #2395: the /workers panel takes no printable key, so typing always reaches the editor
+    /// while it is open. Its actions are chords instead ([`overlay::WORKERS_STOP_KEY`],
+    /// [`overlay::WORKERS_OPEN_KEY`]), which act on the selected row whatever the editor holds.
     pub fn panel_key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         let panel = self.view.panel().clone();
         let Some(state) = panel.state() else {
             return false;
         };
+        if state.kind == PanelKind::Workers
+            && state.stage == Stage::Browse
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            match key.code {
+                KeyCode::Char('x') => {
+                    if let Some(Target::Ticket { id, .. }) = panel.selected() {
+                        self.ask_stop(id);
+                    }
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    if let Some(target) = panel.selected() {
+                        self.open_target(&target);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -2244,14 +2268,10 @@ impl Shell {
                     {
                         self.pending_command = overlay::info_command(&state, c);
                     }
-                    KeyCode::Char('o') => {
+                    // #2395: not in /workers, where typing goes to the editor (Ctrl+G opens).
+                    KeyCode::Char('o') if state.kind != PanelKind::Workers => {
                         if let Some(target) = panel.selected() {
                             self.open_target(&target);
-                        }
-                    }
-                    KeyCode::Char('x') if state.kind == PanelKind::Workers => {
-                        if let Some(Target::Ticket { id, .. }) = panel.selected() {
-                            self.ask_stop(id);
                         }
                     }
                     _ => return false,

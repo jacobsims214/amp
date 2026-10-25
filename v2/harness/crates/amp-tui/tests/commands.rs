@@ -376,9 +376,28 @@ async fn workers_lists_local_and_remote_workers() {
         frame.contains(&c.muted.fg("amp:amp-worker-backend")),
         "{frame:?}"
     );
-    // ↓ then o: the second worker's ticket.
+    // #2395: printable keys belong to the editor while /workers is open, even an empty one.
+    for c in ['x', 'o', 'X', 'O', 'y', ' '] {
+        assert!(
+            !rig.press(KeyCode::Char(c)).await,
+            "{c:?} goes to the editor"
+        );
+    }
+    assert!(rig.opened().is_empty(), "o opened nothing");
+    assert!(
+        rig.shell.stop_pending().is_none(),
+        "x asked to stop nothing"
+    );
+    // ↓ then Ctrl+G: the second worker's ticket.
     rig.press(KeyCode::Down).await;
-    rig.press(KeyCode::Char('o')).await;
+    assert!(
+        rig.shell.panel_key(
+            &KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            false
+        ),
+        "Ctrl+G opens whatever the editor holds"
+    );
+    rig.settle().await;
     assert_eq!(
         rig.opened(),
         vec!["https://amp.simstech.cloud/project/2/board?task=2111".to_owned()]

@@ -453,7 +453,7 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
         "Esc in a session never stops the manager"
     );
 
-    // Stop B from the /workers panel: Enter watches, x stops.
+    // Stop B from the /workers panel: Enter watches, Ctrl+X stops (#2395: x is typing).
     r.shell.set_meta(MetaHandle::stub(
         sample::meta(false),
         Arc::new(|_, _| Ok(json!({}))),
@@ -482,7 +482,8 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     assert!(r.press(KeyCode::Esc).await);
     r.shell.submit("/workers").await;
     assert!(
-        r.screen().contains("Enter or click watch · x stop"),
+        r.screen()
+            .contains("Enter/click watch · Ctrl+X stop · Ctrl+G open in AMP"),
         "{}",
         r.screen()
     );
@@ -490,7 +491,19 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     assert_eq!(r.shell.viewing(), Some(B), "Enter on the row watches it");
     assert!(r.press(KeyCode::Esc).await);
     r.shell.submit("/workers").await;
-    assert!(r.press(KeyCode::Char('x')).await);
+    assert!(
+        !r.press(KeyCode::Char('x')).await,
+        "x in /workers is the editor's"
+    );
+    assert_eq!(r.shell.stop_pending(), None);
+    assert!(
+        r.shell
+            .key(
+                &KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+                true
+            )
+            .await
+    );
     assert_eq!(r.shell.stop_pending(), Some(B));
     assert!(r.press(KeyCode::Enter).await, "Enter confirms too");
     r.until("B to finish", |r| r.finished(B)).await;
