@@ -18,6 +18,7 @@ workers, plan approval and the board counts.
 | `/questions` | tickets waiting on an answer; answer them right there |
 | `/plan`, `/open [id\|plan]` | plan approval, epics and stories; open a ticket or the plan in the browser |
 | `/workers`, `/worker [id]` | workers here and elsewhere; watch one live (`x` stops it, `o` opens its ticket) |
+| `/remote [off\|pair\|devices]` | control this chat from the AMP web app or a phone (`harness/remote-control.md`) |
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
 | `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
 

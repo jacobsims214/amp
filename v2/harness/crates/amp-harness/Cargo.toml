@@ -29,6 +29,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal"] }
 x509-parser.workspace = true
 
 [dev-dependencies]
+# tests/remote_rig.rs (#2376): #2373's in-process mock relay behind a stand-in AMP.
+amp-core = { workspace = true, features = ["mock-relay"] }
 # tests/clock.rs: parse the clock stamp's UTC time (#2250).
 chrono.workspace = true
 async-trait.workspace = true
@@ -62,6 +64,12 @@ harness = false
 # tests/mcp_cli.rs runs its own binary as a stdio MCP server too (#2243).
 [[test]]
 name = "mcp_cli"
+harness = false
+
+# tests/remote_rig.rs (#2376): a stand-in AMP for driving /remote from a pty; idle unless
+# AMP_REMOTE_RIG=1.
+[[test]]
+name = "remote_rig"
 harness = false
 
 # tests/chat_panels.rs too (#2245).

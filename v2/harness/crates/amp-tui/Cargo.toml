@@ -21,6 +21,11 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "signal"] }
+# /remote (#2376): the expiry times in local time.
+chrono.workspace = true
+# /remote (#2376): the pairing link's QR code. Nayuki's QR Code generator, pure Rust, no
+# dependencies, MIT licence.
+qrcodegen = "1.8"
 # Column widths for word wrapping (#2176). The same version rpi-tui measures text with.
 unicode-width = "=0.1.14"
 
