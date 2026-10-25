@@ -8,18 +8,17 @@ package main
 // Skipped unless AMP_RELAY_LIVE_HARNESS names the compiled Rust test binary;
 // v2/scripts/remote-live-e2e.sh builds it and runs this test.
 //
-// The relay is built from internal/relay's own constructor and handlers
-// (relay.New, HarnessHandler, RegisterBrowser), not amp-api's main router, so
-// the test carries over when the relay becomes its own service (#2387). Only
-// the fixtures (rbacWorld, remoteAudit, testDSN) are from this package.
+// The relay is amp-relay's own router (relayserver, exactly what cmd/relay
+// serves, #2387) with its cluster node and internal listener, behind the same
+// Envoy-like split as the other relay tests (newRelayEnvIn); amp-api serves
+// no relay route. Only the fixtures (rbacWorld, remoteAudit, testDSN) are
+// from this package.
 
 import (
 	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"regexp"
@@ -28,8 +27,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/simstech/amp-api/internal/api"
-	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/relay"
 )
@@ -135,48 +132,18 @@ func TestRelay_LiveRustHarness(t *testing.T) {
 	}
 }
 
-// newLiveRelay serves both legs from internal/relay on a real database, with
-// the real clock (the harness signs with it). Identities stand in for the two
-// verifiers: the harness's OAuth token is "test-oauth-<user>", and the
-// browser names its user in X-Test-As (the oauth2-proxy session, Channel ui).
+// newLiveRelay serves both legs from amp-relay's router on a real database,
+// with the real clock (the harness signs with it). Identities stand in for
+// the two verifiers: the harness's OAuth token is "test-oauth-<user>", and
+// the browser names its user in X-Test-As (the oauth2-proxy session, Channel
+// ui).
 func newLiveRelay(t *testing.T) (string, *rbacWorld) {
 	t.Helper()
 	w := newRBACWorld(t)
 	enableOrg(t, w.s.repo, w.org.ID, true)
-	ids := map[string]*auth.Identity{
-		"alice": w.alice, "bob": w.bob, "owner": w.owner, "outsider": w.outsider, "root": w.root, "orgadmin": w.orgadmin,
-	}
-	identify := func(listener, channel string, who func(*http.Request) string, next http.Handler) http.Handler {
-		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			ident, ok := ids[who(r)]
-			if !ok {
-				rw.WriteHeader(http.StatusUnauthorized)
-				fmt.Fprint(rw, `{"error":"missing bearer token"}`)
-				return
-			}
-			c := *ident
-			c.Listener, c.Channel = listener, channel
-			next.ServeHTTP(rw, r.WithContext(auth.WithIdentity(r.Context(), &c)))
-		})
-	}
-	oauth := func(next http.Handler) http.Handler {
-		return identify("mcp", auth.ChannelMCP, func(r *http.Request) string {
-			who, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer test-oauth-")
-			return who
-		}, next)
-	}
-	h := api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb)
-	h.SetRemoteControl(remoteOn)
-	rl := relay.New(h.Service(), oauth, relay.Config{AppURL: relayOrigin})
-	browser := http.NewServeMux()
-	rl.RegisterBrowser(browser)
-	root := http.NewServeMux()
-	root.Handle("/relay/", rl.HarnessHandler())
-	root.Handle("/", identify("rest", auth.ChannelUI, func(r *http.Request) string { return r.Header.Get("X-Test-As") },
-		api.RejectCrossSiteWrites(browser)))
+	e := newRelayEnvIn(t, w, &testClock{at: time.Now()}, func(c *relay.Config) { c.Now = time.Now })
 	ctx, cancel := context.WithCancel(context.Background())
-	go rl.Run(ctx)
-	srv := httptest.NewServer(root)
-	t.Cleanup(func() { srv.Close(); cancel() })
-	return srv.URL, w
+	go e.rl.Run(ctx)
+	t.Cleanup(cancel)
+	return e.srv.URL, w
 }

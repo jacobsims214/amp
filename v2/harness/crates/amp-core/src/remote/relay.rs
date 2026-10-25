@@ -493,4 +493,21 @@ mod register_message_tests {
                 .contains("isn't available")
         );
     }
+
+    /// Live probe of what a person is told when registering against a real AMP (#2387's
+    /// kill-switch check): `AMP_RELAY_PROBE_URL=https://amp.local AMP_RELAY_PROBE_CA=<pem>
+    /// cargo test -p amp-core live_register_probe -- --ignored --nocapture`.
+    #[tokio::test]
+    #[ignore]
+    async fn live_register_probe() {
+        let url = std::env::var("AMP_RELAY_PROBE_URL").expect("AMP_RELAY_PROBE_URL");
+        let ca = std::env::var("AMP_RELAY_PROBE_CA").ok();
+        let c = RelayClient::new(&url, ca.as_deref().map(Path::new)).unwrap();
+        let e = c
+            .register("not-a-real-token", "h", "p", "host", "os", "0", None)
+            .await
+            .unwrap_err();
+        println!("PROBE status={} code={:?}", e.status, e.code);
+        println!("PROBE message: {}", e.register_message());
+    }
 }

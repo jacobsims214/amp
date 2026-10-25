@@ -99,7 +99,13 @@ func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*rela
 	}}
 	identify := func(listener, defChannel string, next http.Handler) http.Handler {
 		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			ident, ok := e.ids[r.Header.Get("X-Test-As")]
+			who := r.Header.Get("X-Test-As")
+			if who == "" {
+				// The live Rust harness (relay_live_test.go) sends its
+				// OAuth token as "Bearer test-oauth-<user>".
+				who, _ = strings.CutPrefix(r.Header.Get("Authorization"), "Bearer test-oauth-")
+			}
+			ident, ok := e.ids[who]
 			if !ok {
 				rw.WriteHeader(http.StatusUnauthorized)
 				fmt.Fprint(rw, `{"error":"missing bearer token"}`)
