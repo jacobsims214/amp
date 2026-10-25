@@ -1887,6 +1887,14 @@ fn project_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
             ),
         ]));
     }
+    // #2356: the session's project comes from a parent folder's .amp.json.
+    if let Some((_, shown)) = m
+        .project_marker
+        .as_ref()
+        .filter(|(id, _)| Some(*id) == m.project_id)
+    {
+        rows.push(Row::new(vec![label("marker  "), flex(shown, c.muted)]));
+    }
     if let Some(board) = m.board.get() {
         let counts: Vec<String> = board
             .nonzero()
@@ -2526,6 +2534,34 @@ mod tests {
             .unwrap_or_else(|| panic!("{lines:?}"));
         assert!(line.trim_end().ends_with(" ago"), "{line}");
         assert!(!line.contains("2026-10-20"), "{line}");
+    }
+
+    /// #2356: `/project` says where a parent folder's `.amp.json` is, only while the panel shows
+    /// that marker's project.
+    #[test]
+    fn project_panel_names_a_parent_folders_marker() {
+        let p = crate::theme::palette();
+        let mut meta = chrome::sample::meta(true);
+        let text = |meta: &AmpMeta| {
+            let data = ChromeData::new(meta.clone());
+            render_panel(&PanelState::new(PanelKind::Project), Some(&data), &p, 100)
+                .iter()
+                .map(|l| chrome::plain(l))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!text(&meta).contains("marker"), "{}", text(&meta));
+        meta.project_marker = Some((
+            2,
+            "../.amp.json (a parent folder's: /work/.amp.json)".into(),
+        ));
+        assert!(
+            text(&meta).contains("marker   ../.amp.json (a parent folder's: /work/.amp.json)"),
+            "{}",
+            text(&meta)
+        );
+        meta.project_id = Some(5);
+        assert!(!text(&meta).contains("marker"), "{}", text(&meta));
     }
 
     #[test]
