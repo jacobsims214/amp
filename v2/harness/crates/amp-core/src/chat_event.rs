@@ -82,6 +82,11 @@ pub enum ChatEvent {
         truncated: bool,
         /// The result text's size before the cut.
         full_bytes: u64,
+        /// #2388: when AMP refused the call because a person must act in the web UI (a plan or
+        /// human-ticket approval), the TUI's own row line ([`crate::approval::REFUSED_LINE`]);
+        /// otherwise null. Optional within v1: an older harness leaves it out.
+        #[serde(default)]
+        refused_line: Option<String>,
     },
     /// An assistant message finished.
     MessageEnd {
@@ -91,6 +96,11 @@ pub enum ChatEvent {
         model: String,
         provider: String,
         usage: ChatUsage,
+        /// #2388: the TUI's one sentence for `error` ([`crate::provider_error::summarize`]), or
+        /// null without an error. `error` stays the provider's raw text (the detail). Optional
+        /// within v1: an older harness leaves it out.
+        #[serde(default)]
+        error_summary: Option<String>,
     },
     /// The provider failed and the request will be retried.
     Retry {
@@ -117,6 +127,9 @@ pub enum ChatEvent {
     Queue { items: Vec<QueueItem> },
     /// The worker roster changed.
     WorkerStatus { workers: Vec<WorkerChip> },
+    /// #2388: the context is being compacted (`active: true`), or that finished (`false`).
+    /// `manual`: asked for by the person; else automatic (the context crossed the threshold).
+    Compaction { active: bool, manual: bool },
 }
 
 /// Where a prompt came from.
@@ -239,6 +252,38 @@ pub struct WorkerChip {
     pub state: WorkerState,
     pub model: Option<String>,
     pub started_at_ms: Option<i64>,
+    // #2388: what the TUI's chip shows besides. Optional within v1: an older harness leaves
+    // them out (they read as null).
+    /// When the run ended, for `completed after 3m10s`.
+    #[serde(default)]
+    pub ended_at_ms: Option<i64>,
+    /// The run's token use and cost so far.
+    #[serde(default)]
+    pub usage: Option<ChatUsage>,
+    /// The latest response's context size and the model's window (`ctx 31%`).
+    #[serde(default)]
+    pub context_tokens: Option<i64>,
+    #[serde(default)]
+    pub context_window: Option<i64>,
+    /// The ticket's epic and story names, and its board state (`in_progress`, `question`, …;
+    /// [`crate::tickets::Status::word`]).
+    #[serde(default)]
+    pub epic: Option<String>,
+    #[serde(default)]
+    pub story: Option<String>,
+    #[serde(default)]
+    pub ticket_state: Option<String>,
+}
+
+/// What the chat knows about a worker's ticket beyond the supervisor (the metadata poller's
+/// ticket, the model's window): [`ChatEvent::worker_status`]'s second input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChipMeta {
+    pub name: Option<String>,
+    pub epic: Option<String>,
+    pub story: Option<String>,
+    pub ticket_state: Option<String>,
+    pub context_window: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -272,24 +317,49 @@ impl ChatEvent {
         }
     }
 
-    /// The `worker_status` snapshot of the supervisor's sessions; `name` gives a ticket's name.
-    pub fn worker_status(
-        sessions: &[WorkerSessionInfo],
-        name: impl Fn(i64) -> Option<String>,
-    ) -> Self {
+    /// The `worker_status` snapshot of the supervisor's sessions; `meta` gives what the chat
+    /// knows of a ticket (its name, epic, story, state, the model's window).
+    pub fn worker_status(sessions: &[WorkerSessionInfo], meta: impl Fn(i64) -> ChipMeta) -> Self {
         let mut workers: Vec<WorkerChip> = sessions
             .iter()
-            .map(|s| WorkerChip {
-                task_id: s.task_id,
-                name: name(s.task_id).unwrap_or_else(|| format!("#{}", s.task_id)),
-                role: s
-                    .agent_id
-                    .strip_prefix("amp:")
-                    .unwrap_or(&s.agent_id)
-                    .to_owned(),
-                state: worker_state(s),
-                model: s.model.clone(),
-                started_at_ms: ms_since_epoch(s.since),
+            .map(|s| {
+                let m = meta(s.task_id);
+                let nonempty = |v: Option<String>| v.filter(|t| !t.trim().is_empty());
+                let usage = &s.totals.usage;
+                let used = usage.input_tokens
+                    + usage.output_tokens
+                    + usage.cache_read_tokens
+                    + usage.cache_write_tokens;
+                WorkerChip {
+                    task_id: s.task_id,
+                    name: nonempty(m.name).unwrap_or_else(|| format!("#{}", s.task_id)),
+                    role: s
+                        .agent_id
+                        .strip_prefix("amp:")
+                        .unwrap_or(&s.agent_id)
+                        .to_owned(),
+                    state: worker_state(s),
+                    model: s.model.clone(),
+                    started_at_ms: ms_since_epoch(s.since),
+                    ended_at_ms: s.ended.and_then(ms_since_epoch),
+                    usage: (used > 0 || usage.cost_usd > 0.0).then(|| ChatUsage {
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        cache_read_tokens: usage.cache_read_tokens,
+                        cache_write_tokens: usage.cache_write_tokens,
+                        cost_usd_micros: usd_micros(usage.cost_usd),
+                    }),
+                    context_tokens: (s.totals.context_tokens > 0)
+                        .then_some(s.totals.context_tokens),
+                    context_window: s
+                        .context_window
+                        .and_then(|w| i64::try_from(w).ok())
+                        .or(m.context_window)
+                        .filter(|w| *w > 0),
+                    epic: nonempty(m.epic),
+                    story: nonempty(m.story),
+                    ticket_state: m.ticket_state,
+                }
             })
             .collect();
         workers.sort_by_key(|w| w.task_id);
@@ -312,6 +382,7 @@ impl ChatEvent {
             Self::Notice { .. } => "notice",
             Self::Queue { .. } => "queue",
             Self::WorkerStatus { .. } => "worker_status",
+            Self::Compaction { .. } => "compaction",
         }
     }
 }
@@ -487,13 +558,23 @@ impl ChatMapper {
                     push_deltas(&mut out, &id, &assistant_text(m), false);
                 }
                 self.current = None;
+                // #2388: the raw text is the detail (the remote link redacts it like every
+                // string); the summary is the TUI's one sentence.
+                let error = m
+                    .error_message
+                    .as_deref()
+                    .map(crate::provider_error::redact);
+                let error_summary = error
+                    .as_deref()
+                    .map(|raw| crate::provider_error::summarize(&m.provider, raw));
                 out.push(ChatEvent::MessageEnd {
                     message_id: id,
                     stop_reason: stop_reason_str(m.stop_reason).to_owned(),
-                    error: m.error_message.clone(),
+                    error,
                     model: m.model.clone(),
                     provider: m.provider.clone(),
                     usage: ChatUsage::from(&m.usage),
+                    error_summary,
                 });
             }
             AgentEvent::ToolExecutionStart {
@@ -519,6 +600,10 @@ impl ChatMapper {
             } => {
                 let full = tool_result_text(result);
                 let (text, truncated) = cut(&full, TOOL_TEXT_MAX);
+                // #2388: as the TUI's row (#2226): an AMP call refused for a person's step.
+                let refused = *is_error
+                    && tool_name.starts_with("amp_")
+                    && crate::approval::refusal(&full).is_some();
                 out.push(ChatEvent::ToolEnd {
                     tool_call_id: tool_call_id.clone(),
                     name: tool_name.clone(),
@@ -526,6 +611,7 @@ impl ChatMapper {
                     text: text.to_owned(),
                     truncated,
                     full_bytes: full.len() as u64,
+                    refused_line: refused.then(|| crate::approval::REFUSED_LINE.to_owned()),
                 });
             }
             AgentEvent::RetryScheduled {
@@ -622,6 +708,36 @@ mod tests {
         for t in ["text_delta", "tool_start", "message_end", "notice"] {
             assert!(seen.contains(t), "the vectors have a {t}");
         }
+    }
+
+    /// #2388: the shared vectors' error summary and refused line are what this harness writes.
+    #[test]
+    fn shared_vectors_match_the_harness_texts() {
+        let text = std::fs::read_to_string(vectors_dir().join("events.json")).unwrap();
+        let file: Value = serde_json::from_str(&text).unwrap();
+        let body = |name: &str| -> Value {
+            let v = file["vectors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["name"] == name)
+                .unwrap_or_else(|| panic!("vector {name}"));
+            serde_json::from_str::<Value>(v["wire"].as_str().unwrap()).unwrap()["body"].clone()
+        };
+        let m = body("chat_message_end_error_summary_valid");
+        assert_eq!(
+            crate::provider_error::summarize(
+                m["provider"].as_str().unwrap(),
+                m["error"].as_str().unwrap()
+            ),
+            m["error_summary"].as_str().unwrap()
+        );
+        assert_eq!(
+            body("chat_tool_end_refused_valid")["refused_line"],
+            crate::approval::REFUSED_LINE
+        );
+        let t = body("chat_tool_end_refused_valid");
+        assert!(crate::approval::refusal(t["text"].as_str().unwrap()).is_some());
     }
 
     #[test]
@@ -751,14 +867,117 @@ mod tests {
                        "error": null, "model": "claude-opus-5-5", "provider": "anthropic",
                        "usage": {"input_tokens": 12034, "output_tokens": 311,
                                  "cache_read_tokens": 90000, "cache_write_tokens": 0,
-                                 "cost_usd_micros": 41250}}),
+                                 "cost_usd_micros": 41250},
+                       "error_summary": null}),
                 json!({"type": "tool_start", "message_id": "msg_1", "tool_call_id": "call_1",
                        "name": "bash",
                        "arguments_json": "{\"command\":\"cargo test\",\"timeout\":1.5}",
                        "truncated": false}),
                 json!({"type": "tool_end", "tool_call_id": "call_1", "name": "bash",
-                       "is_error": false, "text": "ok", "truncated": false, "full_bytes": 2}),
+                       "is_error": false, "text": "ok", "truncated": false, "full_bytes": 2,
+                       "refused_line": null}),
             ]
+        );
+    }
+
+    /// #2388: a failed reply carries the TUI's one sentence next to the raw text, and an AMP call
+    /// refused for a person's step carries the TUI's row line.
+    #[test]
+    fn errors_carry_the_tui_summary_and_refusals_the_tui_line() {
+        let mut m = faux_assistant_message(vec![], StopReason::Error);
+        m.provider = "openrouter".into();
+        m.model = "x/y".into();
+        m.error_message = Some(
+            r#"http error 429: {"error":{"message":"Rate limit exceeded: free-models-per-day","code":429}}"#
+                .into(),
+        );
+        let mut mapper = ChatMapper::live();
+        let out = mapper.map(&AgentEvent::MessageEnd {
+            message: AgentMessage::Assistant(Box::new(m)),
+        });
+        match out.last().unwrap() {
+            ChatEvent::MessageEnd {
+                error,
+                error_summary,
+                ..
+            } => {
+                assert!(error.as_deref().unwrap().starts_with("http error 429"));
+                let summary = error_summary.as_deref().unwrap();
+                assert!(summary.starts_with("OpenRouter"), "{summary}");
+                assert!(summary.contains("Rate limit exceeded"), "{summary}");
+                assert!(!summary.contains('{'), "{summary}");
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let refusal = format!(
+            "Mcp error: -32603: Approving the plan {}. [amp-harness] the turn ended",
+            crate::approval::UI_ONLY_MARK
+        );
+        for (name, is_error, want) in [
+            (
+                "amp_approve_plan",
+                true,
+                Some(crate::approval::REFUSED_LINE),
+            ),
+            (
+                "amp_amp_approve_plan",
+                true,
+                Some(crate::approval::REFUSED_LINE),
+            ),
+            ("amp_approve_plan", false, None),
+            ("bash", true, None),
+        ] {
+            let out = mapper.map(&AgentEvent::ToolExecutionEnd {
+                tool_call_id: "c".into(),
+                tool_name: name.into(),
+                result: AgentToolResult::text(refusal.clone()),
+                is_error,
+            });
+            match &out[0] {
+                ChatEvent::ToolEnd { refused_line, .. } => {
+                    assert_eq!(refused_line.as_deref(), want, "{name} {is_error}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// #2388: the new members are optional within v1. A body from an older harness (without
+    /// them) still parses, and a compaction event has the protocol's shape.
+    #[test]
+    fn older_bodies_parse_and_compaction_has_its_shape() {
+        let old: ChatEvent = serde_json::from_value(json!({
+            "type": "worker_status", "workers": [{"task_id": 1, "name": "A", "role": "r",
+            "state": "running", "model": null, "started_at_ms": null}]
+        }))
+        .unwrap();
+        match old {
+            ChatEvent::WorkerStatus { workers } => {
+                assert_eq!(workers[0].usage, None);
+                assert_eq!(workers[0].epic, None);
+            }
+            other => panic!("{other:?}"),
+        }
+        let old: ChatEvent = serde_json::from_value(json!({
+            "type": "tool_end", "tool_call_id": "c", "name": "n", "is_error": false, "text": "",
+            "truncated": false, "full_bytes": 0
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            ChatEvent::ToolEnd {
+                refused_line: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(ChatEvent::Compaction {
+                active: true,
+                manual: false
+            })
+            .unwrap(),
+            json!({"type": "compaction", "active": true, "manual": false})
         );
     }
 
@@ -878,14 +1097,45 @@ mod tests {
             outcome: Some(WorkerOutcome::Timeout),
             ..base.clone()
         };
-        let e = ChatEvent::worker_status(&[base, done], |id| (id == 7).then(|| "Build it".into()));
+        let mut base = base;
+        base.totals.usage.input_tokens = 7000;
+        base.totals.usage.output_tokens = 800;
+        base.totals.usage.cost_usd = 0.0412;
+        base.totals.context_tokens = 7800;
+        let done = WorkerSessionInfo {
+            ended: Some(UNIX_EPOCH + std::time::Duration::from_millis(1_792_945_390_000)),
+            ..done
+        };
+        let e = ChatEvent::worker_status(&[base, done], |id| {
+            if id == 7 {
+                ChipMeta {
+                    name: Some("Build it".into()),
+                    epic: Some("QA3d epic".into()),
+                    story: Some("Watch workers".into()),
+                    ticket_state: Some("in_progress".into()),
+                    context_window: Some(100_000),
+                }
+            } else {
+                ChipMeta {
+                    name: Some(" ".into()),
+                    ..ChipMeta::default()
+                }
+            }
+        });
         assert_eq!(
             serde_json::to_value(&e).unwrap(),
             json!({"type": "worker_status", "workers": [
                 {"task_id": 3, "name": "#3", "role": "amp-worker-backend", "state": "failed",
-                 "model": "anthropic/claude", "started_at_ms": 1_792_945_200_000_i64},
+                 "model": "anthropic/claude", "started_at_ms": 1_792_945_200_000_i64,
+                 "ended_at_ms": 1_792_945_390_000_i64, "usage": null, "context_tokens": null,
+                 "context_window": null, "epic": null, "story": null, "ticket_state": null},
                 {"task_id": 7, "name": "Build it", "role": "amp-worker-backend", "state": "running",
-                 "model": "anthropic/claude", "started_at_ms": 1_792_945_200_000_i64},
+                 "model": "anthropic/claude", "started_at_ms": 1_792_945_200_000_i64,
+                 "ended_at_ms": null,
+                 "usage": {"input_tokens": 7000, "output_tokens": 800, "cache_read_tokens": 0,
+                           "cache_write_tokens": 0, "cost_usd_micros": 41200},
+                 "context_tokens": 7800, "context_window": 100_000, "epic": "QA3d epic",
+                 "story": "Watch workers", "ticket_state": "in_progress"},
             ]})
         );
     }

@@ -36,6 +36,11 @@ use rpi_ai::types::{Content, UserContent};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+/// A refused call's own row in the chat (#2226): the approval notice under it carries the
+/// server's sentence. The TUI draws it, and the manager feed's `tool_end.refused_line` carries it
+/// (#2388) so a remote viewer shows the same line.
+pub const REFUSED_LINE: &str = "AMP refused: this needs a person in the AMP web UI (below)";
+
 /// The UI-only refusal (`authz.UIOnly` in amp-api).
 pub const UI_ONLY_MARK: &str = "is done by a person in the AMP web UI";
 /// The plan-approval gate (`planApprovalGate`, `approvalGate` in amp-api) before #2198.

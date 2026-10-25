@@ -45,6 +45,7 @@ const PROVIDER_KEY: &str = "sk-test-provider-key-0123456789abcdef";
 
 struct Rig {
     shell: Shell,
+    harness: Arc<AgentHarness>,
     events: UnboundedReceiver<AgentEvent>,
     done: UnboundedReceiver<RunDone>,
     mock: MockRelay,
@@ -134,7 +135,8 @@ async fn rig_with(opts: MockOptions, tag: &str, token: &str, switches: Switches)
         session_file: None,
         banner: vec!["AMP harness · manager".into()],
     };
-    let (mut shell, done) = Shell::new(Arc::new(harness), info, vec![]);
+    let harness = Arc::new(harness);
+    let (mut shell, done) = Shell::new(Arc::clone(&harness), info, vec![]);
     shell.set_feed(Some(Arc::clone(&feed)));
     let _flusher = feed.spawn_flusher();
     let mock = MockRelay::start(opts).await;
@@ -166,6 +168,7 @@ async fn rig_with(opts: MockOptions, tag: &str, token: &str, switches: Switches)
     let local = link.take_local_events().expect("local events");
     Rig {
         shell,
+        harness,
         events,
         done,
         mock,
@@ -1256,5 +1259,88 @@ async fn local_switch_off_is_honoured_on_reconnect() {
     assert!(
         r.link.enable().await.is_err(),
         "enable is refused while off"
+    );
+}
+
+/// #2388: the status carries what the TUI's footer shows (the working directory's last
+/// component only), and the harness's compaction reaches the browser as a chat_event while the
+/// TUI shows its indicator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn status_facts_and_compaction_reach_the_browser() {
+    use rpi_harness::events::{CompactionProgressEvent, HarnessEvent};
+    let opts = MockOptions::default();
+    let mut r = rig(opts.clone(), "status", &opts.oauth_token).await;
+    r.link.enable().await.expect("enable");
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "hello"))
+            .await
+    );
+    let status = r.hello()["body"]["status"].clone();
+    assert_eq!(status["role"], "manager");
+    assert_eq!(status["thinking"], "off");
+    assert_eq!(status["cwd"], "amp");
+    assert_eq!(status["branch"], "remote-m1-2373");
+    // No metadata poller in this rig: the AMP facts are null, never made up.
+    for k in [
+        "ticket_name",
+        "ticket_state",
+        "epic",
+        "board",
+        "amp_connection",
+        "usage",
+    ] {
+        assert!(status.get(k).is_some_and(Value::is_null), "{k}: {status}");
+    }
+    assert!(
+        !r.mock
+            .events()
+            .iter()
+            .any(|e| e.to_string().contains("/work/amp")),
+        "the full working directory never leaves the laptop"
+    );
+
+    let progress = |active| {
+        HarnessEvent::CompactionProgress(CompactionProgressEvent {
+            lane: "main".into(),
+            manual: false,
+            active,
+        })
+    };
+    let compaction = |active: bool| {
+        move |m: &MockRelay| {
+            m.events()
+                .iter()
+                .any(|e| is_chat(e, "compaction") && e["body"]["active"] == active)
+        }
+    };
+    r.harness.events().emit(&progress(true));
+    assert!(r.drive(WAIT, compaction(true)).await, "compaction start");
+    assert!(
+        r.shell
+            .view()
+            .render_plain(100, 30)
+            .join("\n")
+            .contains("Auto-compacting"),
+        "the TUI shows its indicator"
+    );
+    r.harness.events().emit(&progress(false));
+    assert!(r.drive(WAIT, compaction(false)).await, "compaction end");
+    assert!(
+        !r.shell
+            .view()
+            .render_plain(100, 30)
+            .join("\n")
+            .contains("Auto-compacting")
+    );
+    let body = r
+        .mock
+        .events()
+        .into_iter()
+        .find(|e| is_chat(e, "compaction"))
+        .unwrap()["body"]
+        .clone();
+    assert_eq!(
+        body,
+        json!({"type": "compaction", "active": true, "manual": false})
     );
 }

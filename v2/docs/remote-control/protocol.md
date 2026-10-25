@@ -386,7 +386,17 @@ browser MUST ignore body members it doesn't know, because later v1 harnesses may
     "branch": "remote-m1-2369",
     "queue_len": 0,
     "workers_running": 1,
-    "devices": [{"device_id": "...", "name": "Safari on iPhone"}]
+    "devices": [{"device_id": "...", "name": "Safari on iPhone"}],
+    "ticket_state": "in_progress",
+    "epic": "Remote control",
+    "story": "M1",
+    "usage": {"input_tokens": 120340, "output_tokens": 8311, "cache_read_tokens": 901200, "cache_write_tokens": 0},
+    "thinking": "high",
+    "role": "manager",
+    "cwd": "amp",
+    "board": {"in_progress": 3, "ready": 5, "question": 1, "scheduled": 0},
+    "plan_approval": {"yours": 2, "others": 0},
+    "amp_connection": {"state": "connected", "latency_ms": null}
   }
 }
 ```
@@ -406,6 +416,28 @@ browser MUST ignore body members it doesn't know, because later v1 harnesses may
   0-100, or null. `devices` lists the devices **currently pinned at the harness** for this user. The relay uses it
   to reconcile its device table (section 7.6).
 - `host` and `os` are display strings ≤ 64 chars. `os` is one of `macos`, `linux`, `windows`.
+- **What the TUI shows besides** (#2388). These members are optional within v1: a harness that predates them
+  omits them, and a browser treats a missing member like `null` ("not known"; draw nothing for it). A harness that
+  has them always sends every one, `null` when unknown (for example before AMP answered, or without a project).
+  They are display facts only: the relay stores none of them (the list above is the whole of what it stores).
+  - `ticket_state` (string|null): the current ticket's board state, one of `ready`, `in_progress`, `question`,
+    `scheduled`, `waiting`, `done` (the web UI's display states). `epic`, `story` (string|null): its epic and
+    story names (≤ 200 chars each, like `ticket_name`).
+  - `usage` (`{input_tokens, output_tokens, cache_read_tokens, cache_write_tokens}`|null): the session's token
+    totals, as the harness counted them. `cost_usd_micros` above is the matching cost. A browser shows these and
+    never sums `message_end` usage itself (that undercounts after a buffer gap). `null` before the first reply.
+  - `thinking` (string|null): the thinking level (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`). `role`
+    (string|null): the agent role without its prefix (`manager`).
+  - `cwd` (string|null): the **last component only** of the session's working directory (`amp`, never
+    `/Users/ada/dev/amp`), ≤ 64 chars.
+  - `board` (`{in_progress, ready, question, scheduled}`|null): the project board's counts the TUI's status line
+    shows (`null` while unknown). `plan_approval` (`{yours, others}`|null): tickets awaiting plan approval, the
+    person's own and others'; `null` when the project doesn't require plan approval or it isn't known. These are
+    counts only: approving still happens in the AMP web UI, never from this page.
+  - `amp_connection` (`{state, latency_ms}`|null): the harness's own connection to AMP, as the TUI header's dot
+    says it. `state` is one of `connecting`, `connected`, `slow` (with `latency_ms`, an integer), `degraded`,
+    `login_needed`, `disconnected` (the harness keeps retrying). `latency_ms` is `null` except for `slow`. This is
+    the harness's MCP connection, independent of the remote link itself.
 
 ### 6.4 ChatEvent (`op: "chat_event"`)
 
@@ -421,21 +453,37 @@ harness keeps `run --json` unchanged (decision section 9).
 | `text_delta` | `message_id`, `delta` | `MessageUpdate` / `TextDelta`, coalesced about every 100 ms |
 | `thinking_delta` | `message_id`, `delta` | `MessageUpdate` / `ThinkingDelta`, coalesced. The UI folds it by default. |
 | `tool_start` | `message_id`, `tool_call_id`, `name`, `arguments_json`, `truncated` | `ToolExecutionStart`. `arguments_json` is the arguments' JSON **text**, cut at ≤ 16 KiB on a UTF-8 boundary; `truncated: true` when it was cut. |
-| `tool_end` | `tool_call_id`, `name`, `is_error`, `text`, `truncated`, `full_bytes` | `ToolExecutionEnd`. `text` is cut at ≤ 32 KiB; `full_bytes` is the original size. The UI shows "full output on the laptop" when `truncated`. |
-| `message_end` | `message_id`, `stop_reason`, `error: string\|null`, `model`, `provider`, `usage` | `MessageEnd` (assistant). `usage` = `{input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_micros}`, all integers. `cost_usd_micros = round(cost_usd × 1e6)`. |
+| `tool_end` | `tool_call_id`, `name`, `is_error`, `text`, `truncated`, `full_bytes`, `refused_line: string\|null` | `ToolExecutionEnd`. `text` is cut at ≤ 32 KiB; `full_bytes` is the original size. The UI shows "full output on the laptop" when `truncated`. `refused_line` (#2388): when AMP refused the call because a person must act in the AMP web UI (plan or human-ticket approval), the fixed line the TUI draws for the call's row (`AMP refused: this needs a person in the AMP web UI (below)`); the UI shows it in place of the error, next to the `approval_refused` notice. Otherwise `null`. |
+| `message_end` | `message_id`, `stop_reason`, `error: string\|null`, `model`, `provider`, `usage`, `error_summary: string\|null` | `MessageEnd` (assistant). `usage` = `{input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_micros}`, all integers. `cost_usd_micros = round(cost_usd × 1e6)`. `error` is the provider's raw text (the detail); `error_summary` (#2388) is the one sentence the TUI shows for it (`provider_error::summarize`), `null` without an error. |
 | `retry` | `attempt`, `max_retries`, `delay_ms`, `error` | `RetryScheduled` (the error text already goes through `provider_error::redact`) |
 | `run_end` | `run_id`, `outcome: "completed"\|"aborted"\|"failed"\|"suspended"`, `error: string\|null` | `finish_run` in the shell |
 | `notice` | `level: "info"\|"warn"\|"error"`, `code: string\|null`, `text` | Notices the TUI shows: MCP hub changes, approval refusals, repeat guard, "Stopped.", offline |
 | `queue` | `items: [{prompt_id, origin, device_id: string\|null, preview}]` | The follow-up queue changed. `preview` is the first 80 chars. |
-| `worker_status` | `workers: [{task_id, name, role, state: "running"\|"done"\|"failed"\|"stopped"\|"blocked", model: string\|null, started_at_ms: integer\|null}]` | A snapshot from `Supervisor::workers()` when the roster changes. M1 shows read-only chips. |
+| `worker_status` | `workers: [{task_id, name, role, state: "running"\|"done"\|"failed"\|"stopped"\|"blocked", model: string\|null, started_at_ms: integer\|null, ended_at_ms: integer\|null, usage: {…}\|null, context_tokens: integer\|null, context_window: integer\|null, epic: string\|null, story: string\|null, ticket_state: string\|null}]` | A snapshot from `Supervisor::workers()` when the roster changes (also when a worker's tokens change). M1 shows read-only chips. The members after `started_at_ms` are #2388's (below). |
+| `compaction` | `active: boolean`, `manual: boolean` | #2388. The harness started (`active: true`) or finished (`false`) compacting the context; `manual` when the person asked for it, else automatic (the context crossed its threshold). The TUI shows `Auto-compacting…` / `Compacting context…` in its status slot meanwhile; the UI shows the same while the latest compaction is active. |
 
 A browser that receives an unknown `type` ignores it (it may log it in development). It is not an error.
 
+**Members added within v1 (#2388).** `message_end.error_summary`, `tool_end.refused_line`, the `worker_status`
+members after `started_at_ms`, and the `compaction` type are additive: a harness that predates them leaves the
+members out (and never sends `compaction`), so a browser reads a missing member as `null`. A harness that has them
+always sends them (`null` when unset), as for every other member. In `worker_status`:
+- `usage` is the worker run's `{input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+  cost_usd_micros}` (the TUI chip's `48k tok` is the sum of the four token counts, and `$0.04` the cost), `null`
+  before its first reply.
+- `context_tokens` is the latest response's context size and `context_window` the model's window; the chip's
+  `ctx N%` is `context_tokens × 100 / context_window` (`ctx <1%` for a sliver), shown only when both are known.
+- `ended_at_ms` is when a finished run ended (`completed after 3m10s`); `null` while it runs.
+- `epic`, `story`: the ticket's epic and story names (`Epic › Story`). `ticket_state`: its board state, as
+  `status.ticket_state` (section 6.3).
+
 **Redaction (R-M11, T-H-5).** Before signing, the harness MUST replace every known secret value with
 `[redacted]` in every string of every event: keychain secrets, provider keys, MCP secret env values, OAuth
-tokens. Redaction happens before truncation, so a secret can't be split across the cut.
+tokens. Redaction happens before truncation, so a secret can't be split across the cut. This covers the
+`status` body too, and #2388's new text (`message_end.error` and `error_summary`, ticket, epic and story names).
 
-**Rendering (R-M10).** `text`, `delta`, `arguments_json`, tool output and notices are untrusted. The UI renders
+**Rendering (R-M10).** `text`, `delta`, `arguments_json`, tool output, notices, error texts and the status's
+names are untrusted. The UI renders
 them as text or sanitized Markdown, with no raw HTML, no auto-loaded images, and links shown with their full
 URL. Approvals and questions are never drawn from this text.
 
