@@ -3,6 +3,7 @@
  * Rendered only when the capability flag says remote control is available.
  */
 import { useEffect, useState } from 'react'
+import { Link } from 'react-router-dom'
 import { MonitorSmartphone } from 'lucide-react'
 import { Panel } from '../ui/PageHeader'
 import { useRemote } from '../../remote/remote-context'
@@ -30,7 +31,7 @@ export function MySessionsPanel() {
   }, [transport])
 
   return (
-    <Panel label="My sessions" title={sessions?.length ? 'Remote control' : 'No live sessions'} right={sessions ? <span>{sessions.length} live</span> : undefined}>
+    <Panel label="My sessions" title={sessions?.length ? 'Remote control' : 'No live sessions'} right={<>{sessions && <span>{sessions.length} live</span>}<Link to="/sessions" className="text-link hover:underline font-sans text-[12px]">All sessions</Link></>}>
       {error && <p className="m-0 px-4 py-3 text-[13px] text-danger-ink">{error}</p>}
       {!error && sessions?.length === 0 && (
         <p className="m-0 px-4 py-4 text-[13px] text-ink-2">Run <code className="font-mono">/remote</code> in the harness on your laptop to drive that session from here or from your phone.</p>

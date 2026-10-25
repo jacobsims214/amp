@@ -296,3 +296,55 @@ fn pairing_tries_lock_and_terminal_text_is_sanitized() {
         .unwrap_err();
     assert_eq!(r.code.unwrap().as_str(), "pairing_expired");
 }
+
+/// #2379, R-M1 / T-H-1: the harness side of remote control is outbound only. No source file of
+/// the link (the mock relay aside, which is test-only behind the `mock-relay` feature) opens a
+/// listening socket or serves HTTP.
+#[test]
+fn remote_link_opens_no_listening_socket() {
+    let sources = [
+        ("remote/mod.rs", include_str!("../src/remote/mod.rs")),
+        ("remote/crypto.rs", include_str!("../src/remote/crypto.rs")),
+        (
+            "remote/envelope.rs",
+            include_str!("../src/remote/envelope.rs"),
+        ),
+        ("remote/jcs.rs", include_str!("../src/remote/jcs.rs")),
+        ("remote/link.rs", include_str!("../src/remote/link.rs")),
+        (
+            "remote/pairing.rs",
+            include_str!("../src/remote/pairing.rs"),
+        ),
+        ("remote/policy.rs", include_str!("../src/remote/policy.rs")),
+        ("remote/redact.rs", include_str!("../src/remote/redact.rs")),
+        ("remote/relay.rs", include_str!("../src/remote/relay.rs")),
+        (
+            "amp-tui remote.rs",
+            include_str!("../../amp-tui/src/remote.rs"),
+        ),
+        (
+            "amp-harness remote.rs",
+            include_str!("../../amp-harness/src/remote.rs"),
+        ),
+    ];
+    for (name, src) in sources {
+        for listener in [
+            "TcpListener",
+            "UdpSocket",
+            "UnixListener",
+            ".bind(",
+            "axum::serve",
+            "hyper::server",
+        ] {
+            assert!(
+                !src.contains(listener),
+                "{name} uses {listener}: remote control must stay outbound only"
+            );
+        }
+    }
+    let modules = include_str!("../src/remote/mod.rs");
+    assert!(
+        modules.contains("#[cfg(feature = \"mock-relay\")]\npub mod mock_relay;"),
+        "the mock relay (which listens) is compiled only with the test feature"
+    );
+}

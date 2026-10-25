@@ -678,8 +678,14 @@ func TestRelay_BrowserLegAuthz(t *testing.T) {
 	st, body, _ := e.do(t, "GET", mine, nil, as("agent"))
 	wantStatus(t, "agent account", st, body, 403, "not_ui_channel")
 
-	// Someone else, a global admin included, gets the same 404 as a missing session.
-	for _, who := range []string{"bob", "root"} {
+	// Someone else gets the same 404 as a missing session: a teammate (bob),
+	// the org owner, the project-owner team, a global admin and another
+	// org's user (#2379). None of them sees it in their list either.
+	for _, who := range []string{"bob", "orgadmin", "owner", "root", "outsider"} {
+		st, body, _ := e.do(t, "GET", "/api/sessions", nil, as(who))
+		if st != 200 || len(body["sessions"].([]any)) != 0 {
+			t.Fatalf("%s's list: %d %v", who, st, body)
+		}
 		st, body, _ = e.do(t, "GET", mine, nil, as(who))
 		wantStatus(t, who+" GET", st, body, 404, "not_found")
 		c := e.openSSE(t, mine+"/events", as(who))
