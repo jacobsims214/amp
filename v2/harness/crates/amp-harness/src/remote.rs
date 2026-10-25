@@ -116,6 +116,23 @@ async fn login_kind(settings: &Settings) -> LoginKind {
     }
 }
 
+/// Keychain accounts of MCP servers' secrets (`mcp:[repo:<id>:]<server>:…`).
+const MCP_ACCOUNT_PREFIX: &str = "mcp:";
+
+/// The MCP secret values to redact: `cached` keychain values, and the values of the variables
+/// `names` (secret variable names the runtime knows) in `env`. Never logged.
+fn mcp_secret_values(
+    cached: Vec<String>,
+    names: impl IntoIterator<Item = String>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    cached
+        .into_iter()
+        .chain(names.into_iter().filter_map(|n| env(&n)))
+        .filter(|v| !v.trim().is_empty())
+        .collect()
+}
+
 /// The chat's remote link, or why remote control can't be used here (shown by `/remote`).
 /// `Ok` carries the dev-override warning to show, if any. Nothing is sent until `enable`.
 pub async fn build(
@@ -145,6 +162,31 @@ pub async fn build(
             )
         }));
     }
+    // #2391 (M4): MCP servers' secrets too: the keychain values the harness has read for them
+    // (`secret_env`, `secret_headers`, OAuth client secrets; from the cache, so no new keychain
+    // read) and the values of every variable a server reads a secret from (`bearer_env`,
+    // `${env:..}`), whatever its name.
+    {
+        let rt = Arc::clone(rt);
+        redactor.add_source(Arc::new(move || {
+            mcp_secret_values(
+                amp_mcp::keychain_cached_secrets(&amp_mcp::keychain_service(), MCP_ACCOUNT_PREFIX),
+                rt.secret_env()
+                    .into_iter()
+                    .chain(rt.pass_env.iter().cloned()),
+                &|k| std::env::var(k).ok(),
+            )
+        }));
+    }
+    // #2391 (M5): read the sources again when a key is stored (`/connect`, `mcp secret`), a
+    // secret is read for a server that just started, or the config is reloaded.
+    {
+        let rt = Arc::clone(rt);
+        redactor.set_epoch(Arc::new(move || {
+            rt.secrets_generation()
+                .wrapping_add(amp_mcp::keychain_generation())
+        }));
+    }
     let keys = KeyStore::resolve()?;
     let state: PathBuf = rt.state_dir.clone();
     let link = RemoteLink::new(RemoteDeps {
@@ -171,4 +213,29 @@ pub async fn build(
         tuning: LinkTuning::default(),
     });
     Ok((link, server.warning))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// M4: an MCP server's keychain secret and a secret read from a variable whose name doesn't
+    /// look secret are both redacted.
+    #[test]
+    fn mcp_secrets_reach_the_redactor() {
+        let redactor = Redactor::new();
+        redactor.add_env([("BRAVE_SEARCH".to_owned(), "env-value-brave-0001".to_owned())]);
+        let env = |k: &str| (k == "BRAVE_SEARCH").then(|| "env-value-brave-0001".to_owned());
+        redactor.add_source(Arc::new(move || {
+            mcp_secret_values(
+                vec!["keychain-mcp-header-0002".to_owned(), "  ".to_owned()],
+                ["BRAVE_SEARCH".to_owned(), "UNSET_VAR".to_owned()],
+                &env,
+            )
+        }));
+        assert_eq!(
+            redactor.redact("tool said keychain-mcp-header-0002 and env-value-brave-0001"),
+            "tool said [redacted] and [redacted]"
+        );
+    }
 }

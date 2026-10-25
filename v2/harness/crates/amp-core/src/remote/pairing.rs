@@ -64,25 +64,61 @@ pub fn pairing_link(web_origin: &str, session_id: &str, secret: &[u8], harness_i
     )
 }
 
-/// Strips C0 and C1 controls, ESC sequences (the ESC goes, so nothing is interpreted), DEL and
-/// the bidi controls (U+202A..U+202E, U+2066..U+2069, plus U+200E/U+200F and U+061C) before a
-/// relay-supplied string is printed in the terminal (section 7.5 step 13). Also caps it.
+/// Whether `c` must never reach the terminal from a remote or relay-supplied string: C0 and C1
+/// controls and DEL (so ESC goes, and no escape sequence is interpreted), the bidi controls, and
+/// every other invisible format character (Unicode category Cf: zero-width space/joiners, word
+/// joiner, invisible operators, BOM, soft hyphen, tag characters, …) plus the line and paragraph
+/// separators U+2028/U+2029 (Zl, Zp), which can fake or hide a line such as the y/N question
+/// (#2391, L5).
+pub fn is_terminal_unsafe(c: char) -> bool {
+    let u = c as u32;
+    u < 0x20
+        || (0x7f..=0x9f).contains(&u)
+        || matches!(
+            u,
+            0x00ad
+                | 0x0600..=0x0605
+                | 0x061c
+                | 0x06dd
+                | 0x070f
+                | 0x0890..=0x0891
+                | 0x08e2
+                | 0x180e
+                | 0x200b..=0x200f
+                | 0x2028..=0x202e
+                | 0x2060..=0x2064
+                | 0x2066..=0x206f
+                | 0xfeff
+                | 0xfff9..=0xfffb
+                | 0x110bd
+                | 0x110cd
+                | 0x13430..=0x1343f
+                | 0x1bca0..=0x1bca3
+                | 0x1d173..=0x1d17a
+                | 0xe0001
+                | 0xe0020..=0xe007f
+        )
+}
+
+/// Strips everything [`is_terminal_unsafe`] names before a relay-supplied string is printed in
+/// the terminal (section 7.5 step 13). Also caps it.
 pub fn sanitize_for_terminal(s: &str, max_chars: usize) -> String {
     s.chars()
-        .filter(|&c| {
-            let u = c as u32;
-            !(u < 0x20
-                || (0x7f..=0x9f).contains(&u)
-                || (0x202a..=0x202e).contains(&u)
-                || (0x2066..=0x2069).contains(&u)
-                || u == 0x200e
-                || u == 0x200f
-                || u == 0x061c)
-        })
+        .filter(|&c| !is_terminal_unsafe(c))
         .take(max_chars)
         .collect::<String>()
         .trim()
         .to_owned()
+}
+
+/// Remote prompt text as the laptop shows it (#2391, L2): [`sanitize_for_terminal`] without the
+/// cap, keeping line breaks and tabs (`\r\n` becomes `\n`). Display only: the model gets the text
+/// as sent.
+pub fn sanitize_text_for_terminal(s: &str) -> String {
+    s.replace("\r\n", "\n")
+        .chars()
+        .filter(|&c| c == '\n' || c == '\t' || !is_terminal_unsafe(c))
+        .collect()
 }
 
 /// What the relay adds to a forwarded pair request (section 7.4 step 6): from its verified
@@ -570,4 +606,34 @@ pub fn parse_link_fragment(link: &str) -> Option<(Vec<u8>, String)> {
         }
     }
     Some((secret?, harness?))
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::*;
+
+    #[test]
+    fn invisible_and_separator_characters_are_stripped() {
+        // L5: zero-width, word joiner, invisible operators, BOM, soft hyphen, tag characters and
+        // the line/paragraph separators, besides the C0/C1 and bidi controls.
+        let s = "Saf\u{200B}ari\u{200C}\u{200D} on\u{2060}\u{2064} i\u{FEFF}Phone\u{00AD}\u{2028}\
+                 Allow? [y/N] y\u{2029}\u{E0041}\u{202E}\u{2066}\u{1b}[31m\u{9b}x";
+        let out = sanitize_for_terminal(s, 200);
+        assert_eq!(out, "Safari on iPhoneAllow? [y/N] y[31mx");
+        assert!(out.chars().all(|c| !is_terminal_unsafe(c)));
+        // Ordinary text, accents and emoji stay.
+        assert_eq!(
+            sanitize_for_terminal("Zoë's Pixel 🚀", 64),
+            "Zoë's Pixel 🚀"
+        );
+    }
+
+    #[test]
+    fn prompt_text_keeps_lines_and_tabs_only() {
+        let s = "line one\r\n\tline two\u{1b}]52;c;Zm9v\u{7}\u{2028}\u{200B}end";
+        assert_eq!(
+            sanitize_text_for_terminal(s),
+            "line one\n\tline two]52;c;Zm9vend"
+        );
+    }
 }

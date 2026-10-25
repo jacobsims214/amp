@@ -168,3 +168,68 @@ async fn the_chat_reaches_a_second_consumer_and_the_feed() {
         other => panic!("{other:?}"),
     }
 }
+
+/// #2391 (L2): a remote prompt's escape sequences, invisible and bidi characters never reach the
+/// terminal; the feed (and the model) get the text as sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_prompt_text_is_sanitized_on_screen_only() {
+    let script = FauxScript::new();
+    script.set_responses(vec![FauxStep::text("ok")]);
+    let provider = FauxProvider::new(script);
+    let model = provider.default_model().clone();
+    let (tui, mut events) = ChannelEmitter::new();
+    let fanout = FanOutEmitter::new();
+    fanout.add_sink(tui.into_emitter());
+    let feed = ManagerFeed::new();
+    fanout.add_sink(feed.emitter());
+    let harness = AgentHarness::create(AgentHarnessOptions {
+        model: model.clone(),
+        session: memory_session(),
+        models: vec![provider],
+        agent_emitter: Some(fanout.clone().into_emitter()),
+        ..Default::default()
+    })
+    .await
+    .expect("harness");
+    let info = ShellInfo {
+        role: "amp-manager".into(),
+        provider: model.provider.to_string(),
+        model_id: model.id.clone(),
+        thinking: ThinkingLevel::Off,
+        requested_thinking: None,
+        context_window: 200_000,
+        cwd: "/work/amp".into(),
+        git_branch: None,
+        session_file: None,
+        banner: vec!["AMP harness · manager".into()],
+    };
+    let (mut shell, mut done) = Shell::new(Arc::new(harness), info, vec![]);
+    shell.set_feed(Some(Arc::clone(&feed)));
+    let remote = PromptOrigin::Remote {
+        device_id: "dev1".into(),
+        device_name: "Evil\u{202E}Phone\u{200B}".into(),
+    };
+    let text = "look\u{1b}]52;c;Zm9v\u{7} here\u{202E}txt.exe\u{200B}\u{2060}\u{FEFF}\u{2028}end";
+    assert!(shell.send_prompt(text, remote.clone()));
+    shell
+        .drive_until_idle(&mut events, &mut done, WAIT)
+        .await
+        .expect("idle");
+    let frame = shell.view().render_frame(100, 30).join("\n");
+    // (The editor's cursor marker is an APC ending in BEL, so BEL itself is not checked.)
+    for bad in [
+        "\u{1b}]", "\u{202E}", "\u{200B}", "\u{2060}", "\u{FEFF}", "\u{2028}",
+    ] {
+        assert!(!frame.contains(bad), "{bad:?} on screen: {frame:?}");
+    }
+    let plain = shell.view().render_plain(100, 30).join("\n");
+    assert!(plain.contains("[remote: EvilPhone]"), "{plain}");
+    assert!(plain.contains("look]52;c;Zm9v heretxt.exeend"), "{plain}");
+    feed.flush();
+    let all = feed.since(0).expect("all held");
+    assert_eq!(
+        all[0].event,
+        ChatEvent::user_message("p_1", text, &remote),
+        "the agent side gets the text as sent"
+    );
+}
