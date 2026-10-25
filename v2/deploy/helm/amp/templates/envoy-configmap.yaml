@@ -115,6 +115,7 @@ data:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
+                            {{- include "amp.relayHarnessRoutes" . | nindent 28 }}
                             # ---- Public: the home page, and what the app needs to load and check
                             # its session. Signed out at "/", the app sends you to /home/; every
                             # other path still goes through oauth2-proxy to sign in.
@@ -153,6 +154,7 @@ data:
                             # timeout, matched before the general /api prefix below.
                             - match: { path: "/api/events" }
                               route: { cluster: amp_api_rest, timeout: 0s }
+                            {{- include "amp.relayBrowserRoutes" . | nindent 28 }}
                             - match: { prefix: "/api" }
                               route: { cluster: amp_api_rest }
                             - match: { prefix: "/authadmin" }
@@ -313,6 +315,7 @@ data:
                                 envoy.filters.http.ext_authz:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
+                            {{- include "amp.relayHarnessRoutes" . | nindent 28 }}
                             # ---- Public: the home page, and what the app needs to load and check
                             # its session. Signed out at "/", the app sends you to /home/; every
                             # other path still goes through oauth2-proxy to sign in.
@@ -349,6 +352,7 @@ data:
                             # ---- Everything below requires a browser session via oauth2-proxy ----
                             - match: { path: "/api/events" }
                               route: { cluster: amp_api_rest, timeout: 0s }
+                            {{- include "amp.relayBrowserRoutes" . | nindent 28 }}
                             - match: { prefix: "/api" }
                               route: { cluster: amp_api_rest }
                             - match: { prefix: "/authadmin" }
