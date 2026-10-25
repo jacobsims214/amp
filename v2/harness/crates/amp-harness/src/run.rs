@@ -18,7 +18,8 @@
 //!   ([`amp_core::repeat`]): the outcome is `stopped`, it exits 1, and its one stderr line says
 //!   so.
 //! - `--print-system-prompt` builds the session and prints the system prompt as the model would
-//!   receive it, without calling a model.
+//!   receive it, without calling a model. `--print-tools` prints its tools (name, description,
+//!   parameters) as one JSON array the same way (#2367: measuring what a session's prompt costs).
 //!
 //! The manager gets `amp_run_ticket` (M2-5, see [`crate::session`]); Ctrl-C aborts the manager
 //! and cancels its workers.
@@ -62,7 +63,7 @@ pub struct RunArgs {
     #[arg(
         short = 'p',
         long = "prompt",
-        required_unless_present = "print_system_prompt"
+        required_unless_present_any = ["print_system_prompt", "print_tools"]
     )]
     prompt: Option<String>,
     /// Print JSON events, one per line.
@@ -82,6 +83,10 @@ pub struct RunArgs {
     /// Print the system prompt the model would get, and exit without calling a model.
     #[arg(long)]
     print_system_prompt: bool,
+    /// Print the tools the model would get (name, description, parameters) as one JSON array,
+    /// and exit without calling a model. With --print-system-prompt, the prompt comes first.
+    #[arg(long)]
+    print_tools: bool,
 }
 
 fn read_prompt(raw: &str) -> Result<String, CliError> {
@@ -305,7 +310,7 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         conn: &args.conn,
         role: args.role.as_deref(),
         cwd: args.cwd.as_deref(),
-        memory: args.no_session || args.print_system_prompt,
+        memory: args.no_session || args.print_system_prompt || args.print_tools,
         // Headless: no AMP, no run (the message says why and what to do).
         allow_offline: false,
         wait_mcp: true,
@@ -359,9 +364,26 @@ async fn drive(
 ) -> Result<(), CliError> {
     if args.print_system_prompt {
         println!("{}", agent.full_system_prompt(&rt.catalog().skills));
+    }
+    if args.print_tools {
+        let tools = agent
+            .harness
+            .get_tools()
+            .await
+            .map_err(|e| CliError::new(format!("tools: {e}")))?;
+        let tools: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                let s = t.tool.schema();
+                json!({"name": s.name, "description": s.description, "parameters": s.parameters})
+            })
+            .collect();
+        println!("{}", Value::Array(tools));
+    }
+    if args.print_system_prompt || args.print_tools {
         return Ok(());
     }
-    let prompt = prompt.expect("clap requires -p unless --print-system-prompt");
+    let prompt = prompt.expect("clap requires -p unless --print-system-prompt or --print-tools");
 
     if args.json {
         emit_json(&session_json(rt, &agent, project.as_ref()));

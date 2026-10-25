@@ -88,7 +88,8 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
     assert_eq!(session["mcp"]["server"], "amp-mock");
     assert_eq!(session["mcp"]["instructions"], true);
     assert_eq!(session["faux_scripted"], json!(["faux"]));
-    assert_eq!(session["skills"], json!(["amp-index", "amp-planning"]));
+    // #2367: the manager preloads no skill; it reads amp-planning when it plans.
+    assert_eq!(session["skills"], json!([]));
     let tools: Vec<&str> = session["tools"]
         .as_array()
         .unwrap()
@@ -269,10 +270,9 @@ async fn the_model_receives_amp_instructions_and_project_context() {
         amp_core::request_time::CONTEXT_LINE
     )));
     assert!(!prompt.contains("stale.invalid"));
-    // 4. The manager's preloaded skills, in full.
-    assert!(prompt.contains("<preloaded_skills>"));
-    assert!(prompt.contains("<skill name=\"amp-index\""));
-    assert!(prompt.contains("<skill name=\"amp-planning\""));
+    // 4. The manager preloads no skill (#2367): its prompt says to read amp-planning to plan.
+    assert!(!prompt.contains("<preloaded_skills>"));
+    assert!(prompt.contains("Read the **amp-planning** skill before you plan"));
     // 5. AGENTS.md.
     assert!(prompt.contains("<project_context>"));
     assert!(prompt.contains("Repo rule: run make check before committing."));
@@ -283,7 +283,6 @@ async fn the_model_receives_amp_instructions_and_project_context() {
         "# AMP Manager",
         "<amp_server_instructions",
         "<amp_context>",
-        "<preloaded_skills>",
         "<project_context>",
         "<available_skills>",
     ];
@@ -306,6 +305,31 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     let out = harness(&dir, &amp.url, &["run", "--print-system-prompt"]).await;
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(out.stdout.trim_end(), prompt.trim_end());
+
+    // #2367: --print-tools prints the tools as one JSON array, built-in schemas compacted.
+    let out = harness(&dir, &amp.url, &["run", "--print-tools"]).await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let tools: Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"amp_run_ticket") && names.contains(&"amp_whoami"),
+        "{names:?}"
+    );
+    // The manager's policy keeps amp_dispatch_task out (amp_run_ticket dispatches).
+    assert!(!names.contains(&"amp_dispatch_task"), "{names:?}");
+    let read = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "read")
+        .unwrap();
+    assert!(read["parameters"].get("$schema").is_none(), "{read}");
+    assert_eq!(read["parameters"]["required"], json!(["path"]));
 }
 
 #[tokio::test]

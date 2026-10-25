@@ -63,7 +63,8 @@ fn registry_has_every_role_with_prompt_skills_and_model_key() {
     let manager = reg.manager();
     assert_eq!(manager.id, "amp-manager");
     assert!(manager.primary);
-    assert_eq!(manager.skills, ["amp-index", "amp-planning"]);
+    // #2367: nothing preloaded; the manager reads amp-planning when it plans.
+    assert!(manager.skills.is_empty());
     assert_eq!(manager.model_role, "manager");
 
     let expect_skills: &[(&str, &[&str])] = &[

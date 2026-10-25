@@ -52,13 +52,14 @@ impl std::fmt::Debug for McpTool {
 }
 
 impl McpTool {
-    /// Adapts one `tools/list` entry. The name, description and input schema are AMP's, unchanged.
+    /// Adapts one `tools/list` entry. The name and input schema are AMP's, unchanged; the
+    /// description is AMP's minus its "Use for: ..." line ([`without_use_for`]).
     pub fn new(tool: &amp_mcp::rmcp::model::Tool, client: Arc<AmpMcpClient>) -> Self {
         let name = tool.name.to_string();
         let description = tool
             .description
             .as_deref()
-            .map(str::to_owned)
+            .map(without_use_for)
             .unwrap_or_else(|| name.clone());
         let label = tool
             .title
@@ -200,9 +201,44 @@ pub fn text_result(text: &str) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text.to_owned())])
 }
 
+/// AMP's description without its trailing "Use for: <phrases>." line (#2367). Those phrases are
+/// for clients that search a deferred tool list by keyword (Claude Code's tool search); the harness
+/// puts every tool in the prompt, where they repeat the description in every request (~1k tokens
+/// over AMP's tools). A description without one is returned as it is.
+pub fn without_use_for(description: &str) -> String {
+    match description.rfind("Use for:") {
+        // Only a last line: a "Use for:" with more text after it is part of the description.
+        Some(at) if at > 0 && !description[at..].contains('\n') => {
+            description[..at].trim_end().to_owned()
+        }
+        _ => description.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn use_for_lines_are_dropped_from_descriptions() {
+        assert_eq!(
+            without_use_for("List tasks. By default yours. Use for: my tickets, the board."),
+            "List tasks. By default yours."
+        );
+        assert_eq!(
+            without_use_for("Read a doc.\nUse for: read a doc by path."),
+            "Read a doc."
+        );
+        assert_eq!(without_use_for("No trailer."), "No trailer.");
+        assert_eq!(
+            without_use_for("Use for: everything."),
+            "Use for: everything."
+        );
+        assert_eq!(
+            without_use_for("Desc. Use for: x.\nMore text after it."),
+            "Desc. Use for: x.\nMore text after it."
+        );
+    }
 
     #[test]
     fn model_text_names_non_text_blocks() {

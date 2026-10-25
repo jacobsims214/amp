@@ -150,16 +150,21 @@ impl Role {
 /// The skills a role preloads when its frontmatter has no `skills:` list. These are the skills
 /// each prompt says to "load first" (D5), so the model starts with them instead of spending a
 /// turn reading them.
+///
+/// #2367: the manager preloads nothing. Its system prompt goes with every request of every
+/// session, and amp-index (a list the `<available_skills>` block and `amp_run_ticket` already
+/// give) plus amp-planning (~10k tokens) were a third of it. Its prompt says to read
+/// amp-planning before planning, so only planning sessions pay for it.
 pub fn default_skills(id: &str, primary: bool) -> &'static [&'static str] {
     match id {
-        "amp-manager" => &["amp-index", "amp-planning"],
+        "amp-manager" => &[],
         "amp-reviewer" => &["amp-review", "code-reviewer"],
         "amp-github-reviewer" => &["amp-review", "github-pr-review"],
         "amp-github-researcher" => &["github-research"],
         "amp-kb-curator" => &["amp-kb-curator"],
         // Read-only and answers a question; its prompt loads nothing up front.
         "amp-researcher" => &[],
-        _ if primary => &["amp-index", "amp-planning"],
+        _ if primary => &[],
         // worker-backend/frontend/docs, designer, media, and any added worker.
         _ => &["amp-execution"],
     }
