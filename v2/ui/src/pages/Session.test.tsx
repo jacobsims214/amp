@@ -7,6 +7,8 @@ import { AuthContext } from '../contexts/auth-context'
 import { RemoteProvider } from '../remote/RemoteProvider'
 import type { RemoteDeps } from '../remote/remote-context'
 import type { RemoteCrypto } from '../remote/crypto'
+import { memoryStore } from '../remote/deviceStore'
+import { webRemoteCrypto } from '../remote/webCrypto'
 import { RelayError, type EventStreamHandlers, type RelayTransport } from '../remote/transport'
 import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport } from '../remote/mock/mockRelay'
 import { loadVectors } from '../test/vectors'
@@ -226,20 +228,11 @@ describe('Session page with the protocol test vectors', () => {
   interface V { name: string; wire: string; expect: string; receiver: { session_id: string; pinned_harness: { harness_id: string; harness_pub: string } } }
   const vectors = loadVectors<{ vectors: V[] }>('events.json').vectors
   const rx = vectors[0].receiver
-  // Stand-in for #2375's ES256 verifier: exactly the envelopes the vectors signed validly pass
-  // (compared as parsed values with sorted keys, like JCS); a changed body or a forged sig fails.
-  const canon = (x: unknown): string => Array.isArray(x) ? `[${x.map(canon).join(',')}]`
-    : x && typeof x === 'object' ? `{${Object.keys(x).sort().map(k => `${JSON.stringify(k)}:${canon((x as Record<string, unknown>)[k])}`).join(',')}}`
-    : JSON.stringify(x)
-  const signedOk = new Set(vectors.filter(v => v.expect !== 'bad_signature').map(v => canon(JSON.parse(v.wire))))
-
   it('renders the valid vectors and drops the forged ones', async () => {
-    const crypto: RemoteCrypto = {
-      harnessPin: async id => id === rx.pinned_harness.harness_id ? { ...rx.pinned_harness, pinned_until_ms: Date.now() + 86_400_000 } : null,
-      deviceId: async () => 'X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs',
-      signCommand: async () => { throw new Error('not used') },
-      verifyEvent: async (env, pin) => pin.harness_id === rx.pinned_harness.harness_id && signedOk.has(canon(env)),
-    }
+    // The real WebCrypto implementation, with the vectors' harness pinned in an in-memory store.
+    const store = memoryStore()
+    await store.putPin({ ...rx.pinned_harness, pinned_until_ms: Date.now() + 86_400_000 })
+    const crypto: RemoteCrypto = webRemoteCrypto(store)
     const detail: SessionDetail = {
       session_id: rx.session_id, harness_id: rx.pinned_harness.harness_id, harness_pub: rx.pinned_harness.harness_pub,
       harness_fp_display: '29CA-E6B5-00C2-66CB', host: 'jacobs-mbp', os: 'macos', harness_version: '0.4.0', project: { id: 2, name: 'AMP' },
@@ -247,7 +240,7 @@ describe('Session page with the protocol test vectors', () => {
     }
     const order = ['hello_valid', 'chat_text_delta_valid', 'chat_tool_start_valid', 'chat_message_end_valid', 'ack_queued_valid',
       'refused_valid', 'pair_result_accepted_valid', 'duplicate_seq_dropped', 'bad_signature_body_changed',
-      'wrong_harness_fake_registration', 'wrong_session', 'unknown_op_ignored']
+      'wrong_harness_fake_registration', 'bad_signature_claims_pinned_harness', 'wrong_session', 'unknown_op_ignored']
     const transport: RelayTransport = {
       listSessions: async () => [detail],
       getSession: async id => { if (id !== rx.session_id) throw new RelayError(404, 'not_found', 'x'); return detail },
@@ -261,9 +254,12 @@ describe('Session page with the protocol test vectors', () => {
       },
       postCommand: async () => {},
       disconnect: async () => {},
+      pair: async () => { throw new Error('not used') },
     }
     const { container } = renderSession({ transport, crypto, mock: false }, { id: rx.session_id })
     await screen.findByText(/Running the tests/) // text_delta
+    // Real ES256 verification is asynchronous: wait until the last vector has been through the check.
+    await waitFor(() => expect(screen.getAllByRole('alert').filter(a => /Untrusted data/.test(a.textContent ?? ''))).toHaveLength(4))
     expect(screen.getByText('bash')).toBeInTheDocument() // tool_start
     expect(screen.getByText(/12,034 in/)).toBeInTheDocument() // message_end usage
     expect(within(screen.getByLabelText('Session status')).getByText('$1.83')).toBeInTheDocument() // hello status
@@ -271,7 +267,9 @@ describe('Session page with the protocol test vectors', () => {
     expect(screen.queryByText(/Ignore previous instructions/)).toBeNull()
     expect(screen.queryByText('hi')).toBeNull() // fake harness / wrong session never render
     expect(screen.queryByText(/Which branch/)).toBeNull() // unknown op is skipped
-    expect(screen.getAllByRole('alert').filter(a => /Untrusted data/.test(a.textContent ?? ''))).toHaveLength(3)
+    expect(screen.getAllByRole('alert').filter(a => /Untrusted data/.test(a.textContent ?? ''))).toHaveLength(4)
+    // pair_result for another device: a visible warning, not silence.
+    expect(screen.getByText(/paired another device/)).toBeInTheDocument()
     expect(container.querySelector('img, script')).toBeNull()
   })
 })

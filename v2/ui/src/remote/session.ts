@@ -4,7 +4,7 @@
  * outgoing commands. Pure, so it is tested without React.
  */
 import type {
-  AckBody, ByeBody, ChatEvent, Envelope, EventVerdict, HelloBody, QueueItem, RefusedBody, RelayFrame,
+  AckBody, ByeBody, ChatEvent, Envelope, EventVerdict, HelloBody, PairResultBody, QueueItem, RefusedBody, RelayFrame,
   SessionStatus, Usage, WorkerInfo,
 } from './types'
 
@@ -184,8 +184,16 @@ function applyEvent(s: SessionState, env: Envelope, myDeviceId: string | null): 
     }
     case 'bye':
       return { ...base, ended: { reason: (env.body as ByeBody).reason ?? 'harness_ended' } }
+    case 'pair_result': {
+      // This device's own pairing is handled by the pairing screen (usePairing). Here, tell
+      // the reader when the laptop accepted another device, so a pairing they didn't make shows.
+      const b = env.body as PairResultBody
+      if (b.result !== 'accepted' || env.device_id === myDeviceId) return base
+      return { ...base, items: [...base.items, { kind: 'notice', key: nextKey('n'), level: 'warn', code: 'device_paired',
+        text: 'The laptop paired another device for remote control. If that wasn\'t you, run /remote off on the laptop.' }] }
+    }
     default:
-      return base // pair_result is #2375's (pairing screen)
+      return base
   }
 }
 

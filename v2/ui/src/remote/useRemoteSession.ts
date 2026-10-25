@@ -8,6 +8,7 @@ import { useRemote } from './remote-context'
 import { buildCommand, checkEvent, isSecurityVerdict, newClientMsgId, nextSeq, type EventCheck } from './envelope'
 import { NotPairedError } from './crypto'
 import { RelayError } from './transport'
+import { forgetPairingLink, pairingLinkFor, type PairingLink } from './pairingLink'
 import { initialSessionState, refusalText, sessionReducer, type SessionState } from './session'
 import type { CommandBody, CommandOp, HarnessPin, RefusedBody, SessionDetail } from './types'
 
@@ -22,6 +23,8 @@ export type Phase =
   | { kind: 'gone'; reason: string }
   | { kind: 'error'; message: string }
   | { kind: 'unpaired'; detail: SessionDetail }
+  /** Not paired yet, but the page was opened from a pairing link (protocol 7.1). */
+  | { kind: 'pairing'; detail: SessionDetail; link: PairingLink }
   | { kind: 'ready'; detail: SessionDetail; pin: HarnessPin; deviceId: string | null }
 
 interface Sent { op: CommandOp; body: CommandBody; retried: boolean }
@@ -36,6 +39,8 @@ export function useRemoteSession(sessionId: string) {
   const lastSent = useRef(0)
   const sent = useRef(new Map<number, Sent>())
   const ackTimers = useRef(new Map<number, ReturnType<typeof setTimeout>>())
+  /** Bumped after a pairing succeeds, to load the new pin. */
+  const [loads, setLoads] = useState(0)
 
   // ── Load the session and the pin ──────────────────────────────────────────
   useEffect(() => {
@@ -46,8 +51,14 @@ export function useRemoteSession(sessionId: string) {
         const [pin, deviceId] = await Promise.all([crypto.harnessPin(detail.harness_id), crypto.deviceId()])
         if (cancelled) return
         // Only a pin for exactly this harness counts; a relay-supplied key is never trusted (7.7, T-R-1).
-        if (!pin || pin.harness_id !== detail.harness_id || pin.pinned_until_ms <= Date.now()) setPhase({ kind: 'unpaired', detail })
-        else setPhase({ kind: 'ready', detail, pin, deviceId })
+        if (!pin || pin.harness_id !== detail.harness_id || pin.pinned_until_ms <= Date.now()) {
+          const link = pairingLinkFor(sessionId)
+          setPhase(link ? { kind: 'pairing', detail, link } : { kind: 'unpaired', detail })
+        } else {
+          // Already paired with this laptop: a pairing link isn't needed (pins last up to 30 days, D1).
+          forgetPairingLink()
+          setPhase({ kind: 'ready', detail, pin, deviceId })
+        }
       } catch (e) {
         if (cancelled) return
         if (e instanceof RelayError && e.status === 404) setPhase({ kind: 'not_found' })
@@ -56,7 +67,9 @@ export function useRemoteSession(sessionId: string) {
       }
     })()
     return () => { cancelled = true }
-  }, [sessionId, transport, crypto])
+  }, [sessionId, transport, crypto, loads])
+
+  const paired = useCallback(() => setLoads(n => n + 1), [])
 
   const deviceId = phase.kind === 'ready' ? phase.deviceId : null
   const pin = phase.kind === 'ready' ? phase.pin : null
@@ -216,5 +229,5 @@ export function useRemoteSession(sessionId: string) {
     }
   }, [transport, sessionId, deviceId, sendCommand])
 
-  return { phase, state, sendPrompt, stop, disconnect, canSign: !!deviceId }
+  return { phase, state, sendPrompt, stop, disconnect, paired, canSign: !!deviceId }
 }
