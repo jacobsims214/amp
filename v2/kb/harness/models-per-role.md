@@ -28,6 +28,51 @@ amp-harness models list --check       # also ask each provider whether the model
 **In the chat:** `/model roles` lists every role. `/model <role>` opens a picker: Enter uses the
 model in this chat only, `s` saves it.
 
+## The manager's model
+
+The manager plans, keeps the board and runs the workers. It is the role you talk to, so it needs
+a model that follows instructions, calls tools correctly and doesn't think for minutes before
+acting. The shipped default is OpenRouter's `openai/gpt-6.1-sol` at `low` thinking; the workers
+stay on cheaper models.
+
+What the manager eval (#2363) measured on four tasks, against a test AMP:
+
+| manager model | new project, plan, status, run | about a session like that |
+|---|---|---|
+| `openrouter/openai/gpt-6.1-sol` (low, default) | all pass; planning a new project ~2 min | $0.55 |
+| Claude Sonnet 5.5 via OpenRouter's Messages endpoint (low) | all pass, fewest tool errors; planning ~45 s | $0.60–0.75 |
+| `openrouter/z-ai/glm-5.3` (low) | passes most runs, but sometimes repeats a broken call | $0.10 |
+| `openrouter/xiaomi/mimo-v2.6-pro`, reasoning off | passes, slow (up to 85 s of silent thinking) | $0.05 |
+| `openrouter/xiaomi/mimo-v2.6-pro`, reasoning on (the old default) | thinks for minutes; never finished a plan in 8 min | $0.05 |
+
+To run the manager on Claude through your OpenRouter key with prompt caching, add OpenRouter's
+Anthropic-compatible endpoint as a second provider and give it the same key
+(`amp-harness connect openrouter-messages`, or `OPENROUTER_API_KEY` in the environment):
+
+```toml
+# ~/.config/amp-harness/config.toml
+[providers.openrouter-messages]
+api = "anthropic-messages"
+base_url = "https://openrouter.ai/api"
+key_env = "OPENROUTER_API_KEY"
+
+[providers.openrouter-messages.models."anthropic/claude-sonnet-5.5"]
+reasoning = true
+context_window = 1000000
+max_tokens = 64000
+cost = { input = 2.0, output = 10.0, cache_read = 0.1, cache_write = 2.5 }
+unsupported_thinking = ["off"]
+compat = { force_adaptive_thinking = true, supports_temperature = false }
+
+[roles.manager]
+model = "openrouter-messages/anthropic/claude-sonnet-5.5"
+thinking = "low"
+```
+
+Through OpenRouter's usual (chat) endpoint Claude isn't cached, so every manager step pays for
+the whole prompt again; use the Messages endpoint above, or an Anthropic key (`models profile
+anthropic`).
+
 ## Change one role
 
 ```sh
@@ -49,7 +94,7 @@ only the model of the chat you're in.
 ## Change them all at once: profiles
 
 ```sh
-amp-harness models profile opencode     # the shipped roster on OpenRouter (the default)
+amp-harness models profile opencode     # the shipped roster on OpenRouter (the default; manager on GPT-6.1 Sol)
 amp-harness models profile anthropic    # Anthropic only: Opus for the manager and reviewers, Sonnet for the rest
 amp-harness models profile inherit --inherit openrouter/z-ai/glm-5.3   # one model for every role
 ```

@@ -31,7 +31,7 @@ async fn shipped_defaults_are_the_opencode_roster() {
     assert_eq!(report["config_found"], false);
     let manager = role(&report, "manager");
     assert_eq!(manager["provider"], "openrouter");
-    assert_eq!(manager["model"], "xiaomi/mimo-v2.6-pro");
+    assert_eq!(manager["model"], "openai/gpt-6.1-sol");
     assert_eq!(manager["ready"], false);
     assert_eq!(role(&report, "worker-backend")["thinking"], "max");
 }

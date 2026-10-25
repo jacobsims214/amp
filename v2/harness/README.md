@@ -850,9 +850,10 @@ context_window = 262144
   `designer`, `media`, plus any agent you add (see Roles below).
 - A role resolves from the defaults' `[roles.<role>]`, then the selected profile (or the inherit
   model), then your `[roles.<role>]`. `AMP_HARNESS_PROFILE` overrides `[models] profile`. Profiles:
-  `opencode` (the shipped `[roles.*]`: the manager, researchers and media on OpenRouter's
-  `xiaomi/mimo-v2.6-pro`, workers on `deepseek/deepseek-v4.1-flash-1017`, reviewers on `z-ai/glm-5.3`,
-  the designer on `moonshotai/kimi-k3`), `anthropic` (Opus for the manager and reviewers, Sonnet for
+  `opencode` (the shipped `[roles.*]`: the manager on OpenRouter's `openai/gpt-6.1-sol` at low
+  effort, researchers and media on `xiaomi/mimo-v2.6-pro`, workers on
+  `deepseek/deepseek-v4.1-flash-1017`, reviewers on `z-ai/glm-5.3`, the designer on
+  `moonshotai/kimi-k3`), `anthropic` (Opus for the manager and reviewers, Sonnet for
   the other workers) and `inherit` (one `[models] inherit` model for every role).
 - When a layer changes a role's `model`, the lower layers' `extra_body` is dropped; `thinking`
   carries over unless that layer sets it.
@@ -964,6 +965,44 @@ the count. The 3rd and 4th identical call still run, with a line in the result t
 it is repeating itself. The 5th is not run and ends the run. `run -p` then exits 1 with outcome
 `stopped` and one stderr line ("The model kept repeating `bash ls` and was stopped; ..."); the chat
 shows the same sentence in the transcript, and a new message starts the count again.
+
+### Manager eval (#2363)
+
+`scripts/manager-eval.py` runs the manager headless through four scripted scenarios against a
+compose AMP and measures how it behaves, so a manager model, prompt or policy change can be
+compared before and after:
+
+| scenario | setup | passes when |
+|---|---|---|
+| `init` | an empty git folder, no commits, no `.amp.json`: "set up a new project here, it's a Go API" | the project exists, `.amp.json` is written here, `architecture/project-overview.md` is in its KB |
+| `plan` | a repo with no commits linked to an empty project (plan approval on): the user's real "plan out this project" prompt | epics, stories, 4+ tickets with dependencies, `amp_check_plan`, no dispatch, the approve link in the answer |
+| `status` | a seeded board: "What's on the board? Where are we?" | only read tools |
+| `run` | a seeded project with plan approval off and one small docs ticket: "Run the ready tickets." | `amp_run_ticket` ran it and the ticket is done |
+
+Every scenario also fails on a schema error, a policy denial or a run that doesn't complete. Per
+run it reports wall time, time to the first tool call, silent time (a model turn with no text or
+tool call yet: what a person sees as "Thinking"), turns, tool calls and errors, tokens, the
+harness's cost and the cost at OpenRouter's live list price.
+
+```sh
+# in a subshell, so the key never lands in your shell history or the output
+( source ~/.config/amp-harness/dev-keys.env
+  python3 -I scripts/manager-eval.py --models default,sonnet --scenarios all )
+python3 -I scripts/manager-eval.py --report target/manager-eval/<dir> ...   # one table, no runs
+```
+
+- `--models`: presets (`default`, `mimo-high`, `mimo-off`, `glm-low`, `gpt-sol`, `sonnet`,
+  `haiku`, `gemini-flash`) or `label=provider/model@thinking`. `sonnet` and `haiku` go through
+  OpenRouter's Anthropic Messages endpoint (provider `orm`), which caches the prompt; OpenRouter's
+  chat endpoint doesn't cache Claude.
+- Each run gets its own HOME, git repo and `QA 2363 …` project under `target/manager-eval/`; the
+  project is archived afterwards. Plan approval is turned off over REST (`--rest`, default
+  `http://localhost:3001`) only for the `run` scenario's project. The eval never approves a plan.
+- `--budget` (USD, default 3) stops starting runs once the harness's cost passes it.
+- Runs of different models can go in parallel (one process per model); each run only touches its
+  own project.
+
+Results for #2363 are in the project KB (`discoveries/amp-harness-manager-eval.md`).
 
 Offline runs use a faux provider and a scripted model:
 
