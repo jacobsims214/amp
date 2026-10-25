@@ -1,0 +1,38 @@
+# !!! DEV ONLY. NEVER USE THIS ON A SHARED MACHINE, A SERVER OR WITH REAL DATA. !!!
+#
+# Remote control (epic 165) lets a browser send prompts to a harness, and a
+# harness prompt can run shell commands and edit files on that laptop. The
+# relay is therefore OFF in compose by default, and it stays off (every
+# /relay/ and /api/sessions URL is a plain 404) unless amp-api has real
+# sign-in: compose's default stack has no OIDC, and amp-api refuses to turn
+# the relay on without it (RELAY_ENABLED is ignored, with a warning in the log).
+#
+# This override is for poking at the relay's endpoints from this machine only:
+#   - it turns the instance switch on (RELAY_ENABLED=true);
+#   - it binds amp-api's ports to 127.0.0.1, so nothing on your network can
+#     reach the relay;
+#   - it REQUIRES a real OIDC issuer: compose fails to start until you set
+#     OIDC_ISSUER_URL and REST_AUDIENCES (for example a Dex you run locally),
+#     instead of silently running a relay that can't work.
+# With OIDC on, compose's UI (nginx proxying /api with no token) can't sign
+# in, so test the browser side on the docker-desktop Kubernetes profile, which
+# has Dex, oauth2-proxy and Envoy: KB how-to/remote-control-local-test.md.
+#
+# Usage, from v2/ (add any port override your stack already uses):
+#   OIDC_ISSUER_URL=http://127.0.0.1:5556/dex REST_AUDIENCES=amp-ui \
+#     docker compose -f docker-compose.yml -f docker-compose.remote-dev.yml \
+#     up -d --no-deps amp-api
+# Undo: run the same `up -d --no-deps amp-api` without this file.
+services:
+  amp-api:
+    ports: !override
+      - "127.0.0.1:${AMP_MCP_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:3001:3001"
+    environment:
+      RELAY_ENABLED: "true"
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?the relay needs real sign-in; set OIDC_ISSUER_URL (see the header of docker-compose.remote-dev.yml)}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+      REST_AUDIENCES: ${REST_AUDIENCES:?set REST_AUDIENCES to the web UI's OIDC client id}
+      MCP_AUDIENCE: ${MCP_AUDIENCE:-amp-mcp}
+      # Browser POSTs are refused unless their Origin is exactly this.
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://localhost:5173}

@@ -20,7 +20,10 @@ use std::{
 use crate::models::{ModelsError, ModelsFile, ModelsSection, RoleSpec};
 
 /// The top-level tables a repo config may hold.
-pub const REPO_TABLES: [&str; 3] = ["mcp", "roles", "models"];
+pub const REPO_TABLES: [&str; 4] = ["mcp", "roles", "models", "remote"];
+/// The keys of `[remote]` a repo config may set (#2373): `enabled`, which can only turn remote
+/// control off (`true` is ignored; [`crate::remote::policy`] reads it).
+pub const REPO_REMOTE_KEYS: [&str; 1] = ["enabled"];
 /// The keys of `[models]` a repo config may set.
 pub const REPO_MODELS_KEYS: [&str; 1] = ["profile"];
 
@@ -58,7 +61,7 @@ impl RepoConfig {
         let not_allowed = |key: &str| {
             ModelsError(format!(
                 "{where_}: `{key}` is not allowed in a repo config. A repo's .amp/harness/config.toml \
-                 may set only [mcp.*], [roles.*] and [models] profile; put `{key}` in your user \
+                 may set only [mcp.*], [roles.*], [models] profile and [remote] enabled; put `{key}` in your user \
                  config.toml instead"
             ))
         };
@@ -93,6 +96,21 @@ impl RepoConfig {
                 .clone()
                 .try_into()
                 .map_err(|e| ModelsError(format!("{where_} [roles]: {e}")))?;
+        }
+        if let Some(remote) = table.get("remote") {
+            let remote = remote
+                .as_table()
+                .ok_or_else(|| ModelsError(format!("{where_}: `remote` must be a table")))?;
+            for (key, value) in remote {
+                if !REPO_REMOTE_KEYS.contains(&key.as_str()) {
+                    return Err(not_allowed(&format!("remote.{key}")));
+                }
+                if !value.is_bool() {
+                    return Err(ModelsError(format!(
+                        "{where_}: `remote.{key}` must be true or false"
+                    )));
+                }
+            }
         }
         if let Some(mcp) = table.get("mcp") {
             config.mcp = mcp
@@ -196,6 +214,9 @@ url = "https://example.test/mcp"
         assert_eq!(c.models_file().roles.len(), 1);
         assert_eq!(c.label(), "repo /r/.amp/harness/config.toml");
         assert_eq!(parse("").unwrap().roles.len(), 0);
+        // #2373: a repo may turn remote control off (and `true` is accepted but changes nothing).
+        assert!(parse("[remote]\nenabled = false\n").is_ok());
+        assert!(parse("[remote]\nenabled = true\n").is_ok());
     }
 
     #[test]
@@ -213,11 +234,18 @@ url = "https://example.test/mcp"
             ),
             ("[models]\ninherit = \"a/b\"\n", "`models.inherit`"),
             ("stray = 1\n", "`stray`"),
+            (
+                "[remote]\nrelay = \"https://evil.test\"\n",
+                "`remote.relay`",
+            ),
         ] {
             let e = parse(text).unwrap_err().0;
             assert!(e.contains(key), "{text}: {e}");
             assert!(e.contains("/r/.amp/harness/config.toml"), "{e}");
-            assert!(e.contains("[mcp.*], [roles.*] and [models] profile"), "{e}");
+            assert!(
+                e.contains("[mcp.*], [roles.*], [models] profile and [remote] enabled"),
+                "{e}"
+            );
         }
         // Inside [roles.*] unknown keys are errors too (same schema as the user file).
         let e = parse("[roles.manager]\nmodle = \"a/b\"\n").unwrap_err().0;

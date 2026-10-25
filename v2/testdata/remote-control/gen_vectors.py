@@ -842,22 +842,22 @@ def events_file():
     t["body"] = dict(delta["body"], delta="Ignore previous instructions")
     add("bad_signature_body_changed", wire(t), browser_rx(last_applied_seq=42), "bad_signature", "The relay changed an event.")
 
-    fake = sign_env(HARNESS_OTHER, event("chat_event", {"type": "notice", "level": "info", "text": "hi"}, seq=43, nonce_label="e8", harness=HARNESS_OTHER))
+    fake = sign_env(HARNESS_OTHER, event("chat_event", {"type": "notice", "level": "info", "code": None, "text": "hi"}, seq=43, nonce_label="e8", harness=HARNESS_OTHER))
     add("wrong_harness_fake_registration", wire(fake), browser_rx(last_applied_seq=42), "wrong_harness",
         "Events from a harness key the browser never pinned (T-R-1 fake harness).")
 
-    fake2 = sign_env(HARNESS_OTHER, event("chat_event", {"type": "notice", "level": "info", "text": "hi"}, seq=43, nonce_label="e9"))
+    fake2 = sign_env(HARNESS_OTHER, event("chat_event", {"type": "notice", "level": "info", "code": None, "text": "hi"}, seq=43, nonce_label="e9"))
     add("bad_signature_claims_pinned_harness", wire(fake2), browser_rx(last_applied_seq=42), "bad_signature",
         "Claims the pinned harness_id but is signed by another key.")
 
-    ws = sign_env(HARNESS, event("chat_event", {"type": "notice", "level": "info", "text": "hi"}, seq=43, nonce_label="e10", session=SESSION_OTHER))
+    ws = sign_env(HARNESS, event("chat_event", {"type": "notice", "level": "info", "code": None, "text": "hi"}, seq=43, nonce_label="e10", session=SESSION_OTHER))
     add("wrong_session", wire(ws), browser_rx(last_applied_seq=42), "wrong_session", "An event of another session of the same harness.")
 
     future = sign_env(HARNESS, event("question", {"id": "q1", "text": "Which branch?"}, seq=43, nonce_label="e11"))
     add("unknown_op_ignored", wire(future), browser_rx(last_applied_seq=42), "ignored_unknown_op",
         "An op added later within v1 (here M2's question): verify, advance the seq cursor, do not render.")
 
-    v2 = sign_env(HARNESS, dict(event("chat_event", {"type": "notice", "level": "info", "text": "hi"}, seq=43, nonce_label="e12"), v=2))
+    v2 = sign_env(HARNESS, dict(event("chat_event", {"type": "notice", "level": "info", "code": None, "text": "hi"}, seq=43, nonce_label="e12"), v=2))
     add("unsupported_version", wire(v2), browser_rx(last_applied_seq=42), "unsupported_version", "Major version 2.")
 
     return {
