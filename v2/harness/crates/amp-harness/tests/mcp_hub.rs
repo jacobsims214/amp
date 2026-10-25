@@ -121,6 +121,10 @@ impl ServerHandler for HubTestServer {
                 std::process::id()
             )),
             "sleep_ms" => {
+                // Lets a test wait for the call to be under way instead of guessing a time.
+                if let Ok(file) = std::env::var("SLEEP_STARTED_FILE") {
+                    std::fs::write(file, "started").unwrap();
+                }
                 tokio::time::sleep(Duration::from_millis(num("ms"))).await;
                 text("slept")
             }
@@ -584,14 +588,16 @@ async fn sigterm_ends_the_run_and_its_server_trees() {
             ]),
         );
         let pid_file = dir.join("tree.pid");
+        let started_file = dir.join("sleep.started");
         let config = dir.join("home/.config/amp-harness/config.toml");
         let mut text = std::fs::read_to_string(&config).unwrap();
         text.push_str(&stdio_table(
             "fs",
             "tree",
             &format!(
-                "env = {{ TREE_PID_FILE = {:?} }}",
-                pid_file.to_str().unwrap()
+                "env = {{ TREE_PID_FILE = {:?}, SLEEP_STARTED_FILE = {:?} }}",
+                pid_file.to_str().unwrap(),
+                started_file.to_str().unwrap()
             ),
         ));
         std::fs::write(&config, text).unwrap();
@@ -619,9 +625,13 @@ async fn sigterm_ends_the_run_and_its_server_trees() {
         let child = cmd.spawn().expect("spawn amp-harness");
         let harness_pid = child.id().unwrap();
 
-        // The server and its child are up, and the run is in its long tool call.
+        // The server and its child are up, and the run is in its long tool call (the server
+        // says so when the call arrives), so the signal reaches a run, not a process still
+        // starting up.
         let started = Instant::now();
-        while !pid_file.exists() && started.elapsed() < Duration::from_secs(20) {
+        while !(pid_file.exists() && started_file.exists())
+            && started.elapsed() < Duration::from_secs(30)
+        {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         let tree: u32 = std::fs::read_to_string(&pid_file)
@@ -629,7 +639,7 @@ async fn sigterm_ends_the_run_and_its_server_trees() {
             .trim()
             .parse()
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(started_file.exists(), "the run never called sleep_ms");
         assert!(alive(tree));
 
         let killed = Command::new("kill")
@@ -793,9 +803,23 @@ async fn gives_up_after_repeated_failures_until_restarted() {
     let restarts = hub.health()[0].restarts;
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert_eq!(hub.health()[0].restarts, restarts);
-    // ...until restarted, which starts the count again.
+    // ...until restarted, which starts the count again: its next failure is a retry, not
+    // straight back to stopped. Read from the hub's events, since polling the status can miss
+    // a "failed" that lasts one 100 ms backoff on a loaded machine.
+    let mut events = hub.subscribe();
     hub.restart("bad").unwrap();
-    let again = wait_status(&hub, "bad", "failed", Duration::from_secs(10)).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let again = loop {
+        let event = tokio::time::timeout_at(deadline.into(), events.recv())
+            .await
+            .expect("a failure event within 10 s")
+            .unwrap();
+        if let HubEvent::Failed { server, status, .. } = event
+            && server == "bad"
+        {
+            break status;
+        }
+    };
     assert_eq!(again.word(), "failed", "{again:?}");
     assert!(
         hub.restart("nope")
@@ -930,7 +954,19 @@ async fn live_sessions_follow_connects_and_tool_list_changes() {
                 .any(|n| n == want)
         }
     };
-    while !has("mcp__fs__echo").await && Instant::now() < deadline {
+    // The hub swaps a session's tools, then its instruction blocks (both effective from the
+    // next run): wait for both, not just the first.
+    let instructed = || {
+        let h = Arc::clone(&built.harness);
+        async move {
+            h.get_system_prompt()
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("<mcp_server_instructions server=\"fs\">")
+        }
+    };
+    while !(has("mcp__fs__echo").await && instructed().await) && Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(has("mcp__fs__echo").await);
@@ -1451,10 +1487,18 @@ async fn runtime_reload_adds_and_removes_servers_for_a_live_session() {
     .unwrap();
     let report = rt.reload(&StaticKeys::default(), &env).await.unwrap();
     assert_eq!(report.mcp.added, vec!["fs"]);
+    // Tools first, then the instruction blocks: wait for both.
     let deadline = Instant::now() + Duration::from_secs(20);
-    while !names(Arc::clone(&built.harness))
+    while !(names(Arc::clone(&built.harness))
         .await
         .contains(&"mcp__fs__echo".to_owned())
+        && built
+            .harness
+            .get_system_prompt()
+            .await
+            .unwrap()
+            .unwrap()
+            .contains("<mcp_server_instructions server=\"fs\">"))
         && Instant::now() < deadline
     {
         tokio::time::sleep(Duration::from_millis(25)).await;

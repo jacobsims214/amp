@@ -296,6 +296,15 @@ impl Rig {
             .collect()
     }
 
+    /// Whether `task`'s worker has started its run and its first bash call (the `sleep 30`).
+    fn in_bash(&self, task: i64) -> bool {
+        self.sup.feed(task).is_some_and(|feed| {
+            feed.since(0).0.iter().any(|(_, e)| {
+                matches!(e, AgentEvent::ToolExecutionStart { tool_name, .. } if tool_name == "bash")
+            })
+        })
+    }
+
     fn finished(&self, task: i64) -> bool {
         self.sup.session(task).is_some_and(|s| !s.is_live())
     }
@@ -551,8 +560,13 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
 async fn esc_leaving_a_session_hints_before_the_next_esc_stops_the_workers() {
     let mut r = rig("esc-after-session").await;
     r.shell.submit("run both tickets").await;
-    r.until("both workers", |r| r.sup.workers().len() == 2)
-        .await;
+    // Both in their `sleep 30`, as when a person watches a busy worker. Claimed is not enough:
+    // a worker stopped while it still waits to start (repo probe, slot) is dropped without a
+    // finished session (nothing was dispatched yet), so `finished` below would never hold.
+    r.until("both workers in their sleep 30", |r| {
+        r.sup.workers().len() == 2 && r.in_bash(A) && r.in_bash(B)
+    })
+    .await;
     let live = r.shell.live_tickets();
     assert_eq!(live.len(), 2, "{live:?}");
     let hint = esc_hint(&live);
