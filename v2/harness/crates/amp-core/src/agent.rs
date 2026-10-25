@@ -1060,7 +1060,8 @@ impl Runtime {
             HarnessTool::new(rpi_tools::create_find_tool(&ctx, None)),
             HarnessTool::new(rpi_tools::create_ls_tool(&ctx, None)),
         ];
-        (exec, tools)
+        // #2363: say what each takes, and name the right tool when arguments are misrouted.
+        (exec, crate::tool_guide::guide_tools(tools))
     }
 
     /// pi's context files, minus any above `AMP_HARNESS_CEILING_DIR`.

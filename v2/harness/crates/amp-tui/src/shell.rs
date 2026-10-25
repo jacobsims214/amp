@@ -573,6 +573,9 @@ pub struct Shell {
     scroll_back: Option<ScrollPos>,
     /// The workers the transcript has a notice for, and whether each was live then (#2347).
     noticed: std::collections::BTreeMap<i64, bool>,
+    /// Workers seen running (AMP has their dispatch): a new one refreshes the board, so the
+    /// status line's Ready count follows the dispatch rather than the next poll (#2355).
+    running_seen: std::collections::BTreeSet<i64>,
     /// The screen's size, for Ctrl+T to find the thinking in sight ([`Shell::set_screen`]).
     screen: Option<(usize, usize)>,
     /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
@@ -636,6 +639,7 @@ impl Shell {
                 person: None,
                 scroll_back: None,
                 noticed: Default::default(),
+                running_seen: Default::default(),
                 screen: None,
                 history: PromptHistory::new(),
             },
@@ -1302,6 +1306,14 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        // #2355: a worker's run has ended (the supervisor recorded it) by the time its
+        // `amp_run_ticket` returns: the strip stops saying running, and its finished notice lands
+        // now, before the manager's reply, not on the next tick.
+        if let AgentEvent::ToolExecutionEnd { tool_name, .. } = event
+            && tool_name == amp_core::policy::DISPATCH_TOOL
+        {
+            self.build_roster();
+        }
         if let AgentEvent::ToolExecutionStart {
             tool_call_id,
             tool_name,
@@ -3064,6 +3076,18 @@ impl Shell {
                 _ => self.view.add_worker_notice(i.task_id, NoticeKind::Finished),
             }
             self.noticed.insert(i.task_id, live);
+        }
+        // A worker that just started running was just dispatched: AMP's ready count changed.
+        let mut dispatched = false;
+        for i in &sessions {
+            if i.phase == Some(amp_core::supervisor::WorkerPhase::Running) {
+                dispatched |= self.running_seen.insert(i.task_id);
+            } else if !i.is_live() {
+                self.running_seen.remove(&i.task_id);
+            }
+        }
+        if dispatched && let Some(meta) = &self.meta {
+            meta.refresh(Topics::BOARD);
         }
         if self.view.strip().is_focused() && self.view.strip().shown().is_empty() {
             self.view.strip().blur();

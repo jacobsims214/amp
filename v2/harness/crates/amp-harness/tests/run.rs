@@ -106,10 +106,10 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
     ] {
         assert!(tools.contains(&name), "{name} missing from {tools:?}");
     }
-    // The manager never gets edit/write (its policy denies them outright), and no tool is
-    // double-prefixed.
+    // The manager gets edit/write only for `.amp.json` (#2363, the amp-init skill); the policy
+    // denies every other path. No tool is double-prefixed.
     assert!(
-        !tools.contains(&"edit") && !tools.contains(&"write"),
+        tools.contains(&"edit") && tools.contains(&"write"),
         "{tools:?}"
     );
     assert!(
@@ -338,9 +338,16 @@ async fn policy_denials_and_amp_tool_errors_reach_the_model_and_the_run_goes_on(
     );
     assert_eq!(end("c2")["is_error"], true);
     assert!(end("c2")["text"].as_str().unwrap().contains("it broke"));
-    // The manager has no write tool at all.
+    // The manager may write `.amp.json` only (#2363): any other file is denied.
     assert_eq!(end("c3")["is_error"], true);
-    assert!(end("c3")["text"].as_str().unwrap().contains("not found"));
+    assert!(
+        end("c3")["text"]
+            .as_str()
+            .unwrap()
+            .contains("Denied by the amp-manager tool policy"),
+        "{}",
+        end("c3")
+    );
     assert!(!dir.join("project/x.txt").exists());
     let result = events.last().unwrap();
     assert_eq!(result["outcome"], "completed");

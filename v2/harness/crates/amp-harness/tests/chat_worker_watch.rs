@@ -14,6 +14,9 @@
 //! - Esc goes back to the chat; Ctrl+W, → and Enter open the other worker; Esc again;
 //! - once both finish, a click on a `■ worker finished` notice opens a finished session,
 //!   read-only.
+//! - #2355: the dispatches refresh the board at once; the session opened mid-run shows the
+//!   earlier `sleep` call's duration (never `0 ms`); when the manager's reply shows, both
+//!   finished notices are above it and the strip no longer says running.
 //!
 //! The screen is rebuilt from the escape stream by a small emulator ([`Screen`]). HOME, XDG dirs
 //! and the file credential store live under cargo's target tmp dir; AMP is the in-process mock.
@@ -388,6 +391,28 @@ async fn watch_at(cols: u16, rows: u16) {
         })
         .await;
     dump("chat with two running workers", &s);
+    // #2355: the dispatches refresh the board (the status line's Ready count) at once, not on
+    // the next 30s poll: AMP gets an amp_list_tasks after the last amp_dispatch_task.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let calls = amp.mock.calls.lock().unwrap().clone();
+        let last_dispatch = calls
+            .iter()
+            .rposition(|(name, _)| name == "amp_dispatch_task")
+            .expect("dispatched");
+        if calls[last_dispatch..]
+            .iter()
+            .any(|(name, _)| name == "amp_list_tasks")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no board refresh after the dispatches: {:?}",
+            calls.iter().map(|(n, _)| n).collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let known = chip(&s, KNOWN).unwrap();
     let unknown = chip(&s, UNKNOWN).unwrap();
     for line in s.lines() {
@@ -454,6 +479,22 @@ async fn watch_at(cols: u16, rows: u16) {
         "the worker's transcript: {t}"
     );
     assert!(t.contains(&format!("watching #{KNOWN}")), "{t}");
+    // #2355: what the worker did before the view opened shows how long it took (its first
+    // `sleep 8` call), never `0 ms`; its thinking says it thought, not a bare "Thinking".
+    let done: Vec<&String> = lines.iter().filter(|l| l.contains("✓ bash")).collect();
+    assert!(!done.is_empty(), "{t}");
+    for line in done {
+        let line = line.trim_end();
+        assert!(!line.ends_with(" ms"), "{t}");
+        assert!(line.ends_with('s'), "{t}");
+    }
+    assert!(
+        !lines.iter().any(|l| {
+            let l = l.trim();
+            l == "▸ Thinking" || l.starts_with("▸ Thinking · Ctrl+T")
+        }),
+        "{t}"
+    );
     assert!(
         !t.contains("run both tickets"),
         "the manager's transcript is hidden: {t}"
@@ -528,12 +569,37 @@ async fn watch_at(cols: u16, rows: u16) {
         .await;
 
     // Both finish: notices say so, and a click on one opens its finished session, read-only.
+    // #2355: by the time the manager's reply shows, both notices are above it and the strip no
+    // longer says they are running.
     let s = chat
-        .wait("both workers to finish", |s| {
-            s.text().matches("■ worker finished").count() >= 2
+        .wait("the manager's reply", |s| {
+            s.text().contains("Both workers are done.")
         })
         .await;
     dump("chat after both workers finished", &s);
+    let t = s.text();
+    let reply = find(&s, "Both workers are done.").unwrap().0;
+    for id in [KNOWN, UNKNOWN] {
+        let notice = find(&s, &format!("■ worker finished #{id}"))
+            .or_else(|| {
+                s.lines()
+                    .iter()
+                    .position(|l| l.contains("■ worker finished") && l.contains(&format!("#{id}")))
+                    .map(|r| (r, 0))
+            })
+            .unwrap_or_else(|| panic!("no finished notice for #{id}: {t}"));
+        assert!(
+            notice.0 < reply,
+            "#{id}'s notice comes before the reply: {t}"
+        );
+    }
+    assert!(!t.contains("running · click one"), "{t}");
+    assert!(
+        !s.lines()
+            .iter()
+            .any(|l| l.trim_start().starts_with('▸') && l.contains("running ")),
+        "{t}"
+    );
     let (row, col) = find(&s, &format!("■ worker finished #{KNOWN}"))
         .or_else(|| find(&s, &format!("#{KNOWN}")))
         .unwrap();
