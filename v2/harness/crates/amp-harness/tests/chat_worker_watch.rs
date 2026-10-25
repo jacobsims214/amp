@@ -209,6 +209,17 @@ struct Chat {
 
 impl Chat {
     fn start(dir: &Path, url: &str, cols: u16, rows: u16) -> Self {
+        Self::start_with_path(
+            dir,
+            url,
+            cols,
+            rows,
+            &std::env::var("PATH").unwrap_or_default(),
+        )
+    }
+
+    /// [`Self::start`] with the chat's PATH (#2395: a fake browser opener in front).
+    fn start_with_path(dir: &Path, url: &str, cols: u16, rows: u16, path: &str) -> Self {
         let size = Winsize {
             ws_row: rows,
             ws_col: cols,
@@ -228,6 +239,7 @@ impl Chat {
             .env("AMP_HARNESS_CEILING_DIR", dir)
             .env("AMP_HARNESS_FAUX_SCRIPT", dir.join("script.json"))
             .env("TERM", "xterm-256color")
+            .env("PATH", path)
             .env_remove("AMP_TOKEN")
             .env_remove("AMP_CA_FILE")
             .env_remove("AMP_WEB_URL")
@@ -544,7 +556,7 @@ async fn watch_at(cols: u16, rows: u16) {
     let s = chat
         .wait("the /workers panel", |s| {
             let t = s.text();
-            t.contains("AMP · workers") && t.contains("Enter or click watch")
+            t.contains("AMP · workers") && t.contains("Enter/click watch")
         })
         .await;
     dump("/workers panel", &s);
@@ -618,6 +630,141 @@ async fn watch_at(cols: u16, rows: u16) {
     chat.send(b"\x1b");
     chat.wait("the chat again", |s| s.text().contains("run both tickets"))
         .await;
+
+    for _ in 0..3 {
+        chat.send(b"\x03");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// #2395: while /workers is open every printable key is typing. On a real pty, with both workers
+/// running: `xo hello` lands in the editor exactly, nothing is stopped or opened (a fake `open` /
+/// `xdg-open` on PATH records any URL the chat opens); then Ctrl+G opens the selected row's ticket
+/// and Ctrl+X asks to stop its worker, `y` stops it, and the typed text is still in the editor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = workdir("chat-workers-panel-typing", Some(2));
+    let config = dir.join("home/.config/amp-harness");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), CONFIG).unwrap();
+    std::fs::write(dir.join("script.json"), script(20).to_string()).unwrap();
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let opened = dir.join("opened.txt");
+    for name in ["open", "xdg-open"] {
+        let path = bin.join(name);
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\necho \"$1\" >> '{}'\n", opened.display()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut chat = Chat::start_with_path(&dir, &amp.url, 120, 40, &path);
+    chat.wait("the editor", |s| s.text().contains("/ for commands"))
+        .await;
+    chat.send(b"run both tickets\r");
+    chat.wait("two running workers", |s| {
+        s.text()
+            .contains("2 running · click one or Ctrl+W to watch")
+    })
+    .await;
+
+    chat.send(b"/workers\r");
+    let s = chat
+        .wait("the workers panel and its hint", |s| {
+            let t = s.text();
+            t.contains("AMP · workers")
+                && t.contains("Enter/click watch · Ctrl+X stop · Ctrl+G open in AMP · Esc close")
+        })
+        .await;
+    dump("workers panel", &s);
+
+    chat.send(b"xo hello");
+    let s = chat
+        .wait("the typed text in the editor", |s| {
+            s.text().contains("xo hello")
+        })
+        .await;
+    // Give a wrongly taken key time to show its effect before checking for none.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let s2 = chat.screen();
+    dump("typed with the panel open", &s2);
+    let t = s2.text();
+    let typed: Vec<String> = s2
+        .lines()
+        .into_iter()
+        .filter(|l| l.contains("xo hello"))
+        .collect();
+    assert_eq!(typed.len(), 1, "{t}");
+    assert_eq!(
+        typed[0].trim_matches(|c: char| !c.is_alphanumeric()),
+        "xo hello",
+        "exactly the typed text: {t}"
+    );
+    assert!(t.contains("AMP · workers"), "the panel stays open: {t}");
+    assert!(!t.contains("stop the worker on"), "x asked nothing: {t}");
+    assert!(!opened.exists(), "o opened nothing: {t}");
+    assert!(amp.mock.calls_to("amp_set_task_state").is_empty(), "{t}");
+    assert!(s.text().contains("2 running"), "{}", s.text());
+
+    // Ctrl+G opens the selected row's ticket in AMP, whatever the editor holds.
+    chat.send(b"\x07");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let url = loop {
+        let text = std::fs::read_to_string(&opened).unwrap_or_default();
+        if text.contains("task=") {
+            break text.trim().to_owned();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Ctrl+G opened nothing:\n{}",
+            chat.screen().text()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(url.lines().count(), 1, "{url}");
+    let id: i64 = url
+        .rsplit("task=")
+        .next()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no task id in {url}"));
+    assert!([KNOWN, UNKNOWN].contains(&id), "{url}");
+
+    // Ctrl+X asks to stop that row's worker; y stops it.
+    chat.send(b"\x18");
+    let s = chat
+        .wait("the stop question", |s| {
+            s.text().contains(&format!("stop the worker on #{id}?"))
+        })
+        .await;
+    dump("stop question in the workers panel", &s);
+    chat.send(b"y");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while amp.mock.calls_to("amp_set_task_state").is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "y stopped nothing:\n{}",
+            chat.screen().text()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let states = amp.mock.calls_to("amp_set_task_state");
+    assert_eq!(states.len(), 1, "{states:?}");
+    assert_eq!(states[0]["task_id"], json!(id), "{states:?}");
+    let s = chat.screen();
+    assert!(
+        s.text().contains("xo hello"),
+        "the typed text is still in the editor: {}",
+        s.text()
+    );
 
     for _ in 0..3 {
         chat.send(b"\x03");

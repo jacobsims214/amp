@@ -2756,16 +2756,40 @@ impl Shell {
     ///
     /// Esc closes the panel (or backs out of an answer). While the editor is empty and has not
     /// been given the keys, ↑/↓/PgUp/PgDn select and Enter acts on the selection (answers a
-    /// question; otherwise opens it); a configuration panel's letters and the workers panel's
-    /// `x`/`o` are commands. Any other printable key is typing: it goes to the editor, which keeps
-    /// the keys (#2161: typing "ok…" must never open a browser). Tab, with an empty editor,
-    /// switches the keys between the panel and the editor. While an answer waits for
-    /// confirmation, `y`/Enter sends it and `n`/Esc cancels; other keys are swallowed.
+    /// question; otherwise opens it); a configuration panel's letters are commands. Any other
+    /// printable key is typing: it goes to the editor, which keeps the keys (#2161: typing "ok…"
+    /// must never open a browser). Tab, with an empty editor, switches the keys between the panel
+    /// and the editor. While an answer waits for confirmation, `y`/Enter sends it and `n`/Esc
+    /// cancels; other keys are swallowed.
+    ///
+    /// #2395: the /workers panel takes no printable key at all, so typing always reaches the
+    /// editor while it is open. Its actions are chords instead ([`overlay::WORKERS_STOP_KEY`],
+    /// [`overlay::WORKERS_OPEN_KEY`]), which act on the selected row whatever the editor holds.
     pub fn panel_key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         let panel = self.view.panel().clone();
         let Some(state) = panel.state() else {
             return false;
         };
+        if state.kind == PanelKind::Workers
+            && state.stage == Stage::Browse
+            && key.modifiers == KeyModifiers::CONTROL
+        {
+            match key.code {
+                KeyCode::Char('x') => {
+                    if let Some(Target::Ticket { id, .. }) = panel.selected() {
+                        self.ask_stop(id);
+                    }
+                    return true;
+                }
+                KeyCode::Char('g') => {
+                    if let Some(target) = panel.selected() {
+                        self.open_target(&target);
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -2858,21 +2882,11 @@ impl Shell {
                     {
                         self.pending_command = overlay::info_command(&state, c);
                     }
-                    // The workers panel's commands (#2252): `o` opens the ticket in AMP.
-                    KeyCode::Char('o') if state.kind == PanelKind::Workers => {
-                        if let Some(target) = panel.selected() {
-                            self.open_target(&target);
-                        }
-                    }
-                    KeyCode::Char('x') if state.kind == PanelKind::Workers => {
-                        if let Some(Target::Ticket { id, .. }) = panel.selected() {
-                            self.ask_stop(id);
-                        }
-                    }
                     // #2161: any other printable key is typing. It goes to the editor, and so do
                     // the keys after it, so a prompt starting "ok" never opens a browser. A
                     // configuration panel keeps the keys: its letters are commands, and one that
-                    // doesn't apply to the row does nothing (#2245).
+                    // doesn't apply to the row does nothing (#2245). #2395: /workers has no letter
+                    // commands (Ctrl+X stops, Ctrl+G opens), so `x` and `o` are typing too.
                     KeyCode::Char(_) if state.kind != PanelKind::Info => {
                         self.editor_clicked = true;
                         return false;

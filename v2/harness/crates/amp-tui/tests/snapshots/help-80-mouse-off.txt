@@ -41,4 +41,5 @@
    Ctrl+U/D                 scroll half a page (with an empty editor)
    End                      jump to the latest output (with an empty editor)
    Ctrl+W                   pick a running worker: ←/→, Enter watch
+   Ctrl+X/G                 in /workers: stop the worker / open it in AMP
    drag                     select text

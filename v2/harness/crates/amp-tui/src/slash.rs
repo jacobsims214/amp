@@ -237,6 +237,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl+U/D", "scroll half a page (with an empty editor)"),
     ("End", "jump to the latest output (with an empty editor)"),
     ("Ctrl+W", "pick a running worker: ←/→, Enter watch"),
+    ("Ctrl+X/G", "in /workers: stop the worker / open it in AMP"),
     ("click", "a worker or its #ticket: watch its session"),
     ("Fn/⌥-drag", "select text (Fn in Terminal.app, ⌥ in iTerm2)"),
 ];

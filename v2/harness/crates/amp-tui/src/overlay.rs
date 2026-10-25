@@ -1981,6 +1981,13 @@ pub fn info_enter(state: &PanelState) -> Option<String> {
     Some(fill_command(command, row.key.as_deref()?))
 }
 
+/// The /workers panel's key that stops the selected row's worker (#2395). The panel takes no
+/// printable key: whatever is typed while it is open goes to the editor.
+pub const WORKERS_STOP_KEY: &str = "Ctrl+X";
+
+/// The /workers panel's key that opens the selected row's ticket in AMP's web UI (#2395).
+pub const WORKERS_OPEN_KEY: &str = "Ctrl+G";
+
 fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
     if state.kind == PanelKind::Info && state.stage == Stage::Browse {
         return info_hint(state, has_targets, overflow);
@@ -1994,9 +2001,10 @@ fn hint(state: &PanelState, has_targets: bool, overflow: bool) -> String {
         (Stage::Browse, PanelKind::Model) if has_targets => {
             "↑↓ select · Enter switch · Esc close".to_owned()
         }
-        (Stage::Browse, PanelKind::Workers) if has_targets => {
-            "↑↓ select · Enter or click watch · x stop · o open in browser · Esc close".to_owned()
-        }
+        // #2395: chords only, so typing reaches the editor while /workers is open.
+        (Stage::Browse, PanelKind::Workers) if has_targets => format!(
+            "↑↓ select · Enter/click watch · {WORKERS_STOP_KEY} stop · {WORKERS_OPEN_KEY} open in AMP · Esc close"
+        ),
         (Stage::Browse, PanelKind::Questions) if has_targets => {
             "↑↓ select · Enter answer · Tab editor · Esc close".to_owned()
         }

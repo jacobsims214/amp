@@ -17,7 +17,7 @@ workers, plan approval and the board counts.
 | `/ticket [id]`, `/project [id]` | the current ticket or project; switch to another |
 | `/questions` | tickets waiting on an answer; answer them right there |
 | `/plan`, `/open [id\|plan]` | plan approval, epics and stories; open a ticket or the plan in the browser |
-| `/workers`, `/worker [id]` | workers here and elsewhere; watch one live (`x` stops it, `o` opens its ticket) |
+| `/workers`, `/worker [id]` | workers here and elsewhere (Ctrl+X stops one, Ctrl+G opens its ticket); watch one live |
 | `/remote [off\|pair\|devices]` | control this chat from the AMP web app or a phone (`harness/remote-control.md`) |
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
 | `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
@@ -93,6 +93,11 @@ The same details are on the transcript's lines: `▶ worker started #2142 …`, 
   any `#2142` in the chat that has a worker session;
 - Ctrl+W, then ←/→ to choose and Enter;
 - `/workers`, ↑↓ and Enter; or `/worker 2142`.
+
+While `/workers` is open, everything you type goes to the message box, so the panel's own actions
+are chords: ↑↓ select a row (with an empty message box), Enter or a click watches it, Ctrl+X stops
+its worker (asks first: y or Enter stops, any other key keeps it running), Ctrl+G opens its ticket
+in AMP, and Esc closes the panel.
 
 The session shows the worker's transcript live (tool calls, collapsed thinking, messages) under a
 header:

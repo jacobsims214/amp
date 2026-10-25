@@ -394,9 +394,30 @@ async fn workers_lists_local_and_remote_workers() {
         frame.contains(&c.muted.fg("amp:amp-worker-backend")),
         "{frame:?}"
     );
-    // ↓ then Enter: the second worker's ticket.
+    // #2395: printable keys belong to the editor while /workers is open, even an empty one.
+    for c in ['x', 'o', 'X', 'O', 'y', ' '] {
+        assert!(
+            !rig.press(KeyCode::Char(c)).await,
+            "{c:?} goes to the editor"
+        );
+    }
+    assert!(rig.opened().is_empty(), "o opened nothing");
+    assert!(
+        rig.shell.stop_pending().is_none(),
+        "x asked to stop nothing"
+    );
+    // Typing gave the editor the keys (#2161); Tab gives them back to the panel.
+    assert!(rig.press(KeyCode::Tab).await);
+    // ↓ then Ctrl+G: the second worker's ticket.
     rig.press(KeyCode::Down).await;
-    rig.press(KeyCode::Enter).await;
+    assert!(
+        rig.shell.panel_key(
+            &KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            false
+        ),
+        "Ctrl+G opens whatever the editor holds"
+    );
+    rig.settle().await;
     assert_eq!(
         rig.opened(),
         vec!["https://amp.simstech.cloud/project/2/board?task=2111".to_owned()]
@@ -951,8 +972,8 @@ async fn a_run_ticket_refusal_says_whose_ticket() {
 
 /// #2161: with a panel open and an empty editor, a prompt that starts with `o` ("ok…") goes to the
 /// editor and opens nothing; once typing starts (or a prompt is sent) ↑ is the editor's again,
-/// and Tab gives the keys back to the panel. (On harness-m4 the workers panel keeps its `x`/`o`
-/// commands, #2252, and configuration panels their letters, #2245; every other panel types.)
+/// and Tab gives the keys back to the panel. (Configuration panels keep their letters, #2245;
+/// every other panel types, the workers panel included since #2395: Ctrl+X stops, Ctrl+G opens.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_with_a_panel_open_goes_to_the_editor() {
     let mut rig = rig(vec![FauxStep::text("fine")], true).await;
