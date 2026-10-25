@@ -180,6 +180,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         .unwrap_or_default();
     let mut spec = AgentSpec::new(role_id.clone(), cwd.clone());
     spec.project = project.clone();
+    // #2364: where its workers work (git worktrees, a folder each, or this folder shared).
+    spec.extra_context = supervisor.as_ref().map(|s| s.workspace_context());
     spec.extra_tools = supervisor.iter().map(|s| s.tool()).collect();
     spec.extra_tools.push(SessionUsageTool::harness_tool(
         model,

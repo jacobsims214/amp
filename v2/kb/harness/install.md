@@ -112,9 +112,11 @@ goes in this folder (or at its own repository's root), and setup says the parent
 unchanged. The chat banner and `/project` show where the `.amp.json` is when it is in a parent
 folder (`project #45 Harness play (from ../.amp.json)`).
 
-Workers need a git repository with at least one commit to get their own worktree and branch.
-In a folder that isn't one (or a new folder inside another repository), they run in the folder
-itself and their report says so; run `git init` and commit once to give them worktrees.
+You don't need git. In a git repository with at least one commit, workers each get their own
+worktree and branch. In a folder that isn't one (or a new folder inside another repository), each
+worker gets its own folder `amp-work/<ticket>/` and nothing is committed: the chat banner and
+`amp-harness doctor` say so in one line. Run `git init` and commit once to give them worktrees.
+See `harness/git-and-the-harness.md`.
 
 ## Check it
 

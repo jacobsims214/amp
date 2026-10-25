@@ -1314,6 +1314,13 @@ impl Inner {
                 "",
             );
             line(&mut rows, "max workers", w.max_parallel.to_string(), src);
+            let (_, src) = setting(
+                "workers",
+                "isolation",
+                amp_core::workspace::ENV_ISOLATION,
+                "",
+            );
+            line(&mut rows, "isolation", w.isolation.as_str().to_owned(), src);
             line(
                 &mut rows,
                 "worker limits",

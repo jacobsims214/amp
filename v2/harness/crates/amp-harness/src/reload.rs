@@ -82,6 +82,8 @@ impl Live {
             .reload(&SystemKeys::from_env(), &env)
             .await
             .map_err(|e| format!("{e}; nothing was changed"))?;
+        // #2364: the manager's `workers_workspace:` line, as at start (git may have changed).
+        let workspace = self.supervisor.as_ref().map(|s| s.workspace_context());
         let refreshed = self
             .rt
             .refresh_session(LiveSession {
@@ -89,7 +91,7 @@ impl Live {
                 role: &self.role,
                 cwd: &self.cwd,
                 project: self.project.as_ref(),
-                extra_context: None,
+                extra_context: workspace.as_deref(),
                 policy: &self.policy,
                 // amp_run_ticket's description lists the roster: a fresh one lists the new one.
                 replace_tools: self.supervisor.iter().map(|s| s.tool()).collect(),

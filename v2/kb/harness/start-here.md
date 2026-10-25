@@ -36,6 +36,7 @@ the manager. Until the first release is published, build it from source instead
 | add MCP servers (stdio, http, sse), import them from other tools | `harness/mcp-servers.md` |
 | know which file a setting comes from, use another config, reload | `harness/configuration.md` |
 | chat, run headless, dispatch workers, approvals, worker limits | `harness/running-work.md` |
+| know what needs git, run business or ops work in a plain folder, clean up `.worktrees` | `harness/git-and-the-harness.md` |
 | fix something (`doctor`, keychain, TLS, models) | `harness/troubleshooting.md` |
 | use your company's own model endpoint, or roll it out to a team | `harness/enterprise-provider.md` |
 

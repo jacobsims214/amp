@@ -788,15 +788,22 @@ fn shell_info(s: &session::Session, marker_warning: Option<&str>) -> ShellInfo {
         amp_tui::shell::short_role(&s.agent.role.id)
     );
     let session_line = session_banner(s.agent.session_file.as_deref());
+    // #2364: one line when workers won't get git worktrees here (not a git repository...).
+    let workspace = s.supervisor.as_ref().and_then(|sup| sup.workspace_banner());
+    let marker_warning = marker_warning
+        .map(str::to_owned)
+        .into_iter()
+        .chain(workspace)
+        .collect::<Vec<_>>();
     // #2346: compact folds the five lines into three: who and which model, where, the session.
     let banner = if amp_tui::density::compact() {
         let mut banner = vec![format!("{title} · {model}"), connection];
-        banner.extend(marker_warning.map(str::to_owned));
+        banner.extend(marker_warning.iter().cloned());
         banner.push(format!("{session_line} · /help for commands"));
         banner
     } else {
         let mut banner = vec![title, connection];
-        banner.extend(marker_warning.map(str::to_owned));
+        banner.extend(marker_warning.iter().cloned());
         banner.extend([
             model,
             session_line,

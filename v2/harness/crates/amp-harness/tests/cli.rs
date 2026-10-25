@@ -430,7 +430,9 @@ async fn doctor_json_is_pinned() {
             ("mcp", "skip"),
             ("skills", "ok"),
             ("agents", "ok"),
-            ("config-check", "ok")
+            ("config-check", "ok"),
+            // #2364: where workers work in this folder (never a failure).
+            ("workspace", "ok")
         ]
     );
     assert_eq!(model_checks[2]["detail"], "key from env OPENROUTER_API_KEY");
@@ -702,7 +704,9 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
             ("mcp", "skip"),
             ("skills", "ok"),
             ("agents", "ok"),
-            ("config-check", "ok")
+            ("config-check", "ok"),
+            // #2364: where workers work in this folder (never a failure).
+            ("workspace", "ok")
         ]
     );
     let fix = v["checks"][3]["fix"].as_str().unwrap();

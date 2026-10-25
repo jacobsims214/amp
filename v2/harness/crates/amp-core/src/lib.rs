@@ -65,6 +65,10 @@
 //! - [`mcp_stdio`]: a resolved stdio server as an [`amp_mcp::StdioSpec`]: the D7 child environment
 //!   (the bash scrub of #2142 plus the server's own env and keychain secrets), cwd, stderr log.
 //!
+//! #2364:
+//! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
+//!   the manager's folder: git worktrees in a usable repository, a folder per ticket outside git.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -100,3 +104,4 @@ pub mod text_tool_calls;
 pub mod tickets;
 pub mod tools;
 pub mod worker_session;
+pub mod workspace;

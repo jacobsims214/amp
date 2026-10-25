@@ -60,6 +60,7 @@ use crate::{
     roles::Role,
     tools::call_json,
     worker_session::{self, WorkerFeed},
+    workspace::{self, ENV_ISOLATION, Isolation, Placement, Repo, WORK_DIR},
 };
 
 /// The AMP tools that close a ticket. A worker that ends without one of them succeeding on its
@@ -84,6 +85,9 @@ pub struct SupervisorConfig {
     pub max_turns: u32,
     /// How long an aborted worker gets to wind down before it is dropped.
     pub abort_grace: Duration,
+    /// Where workers that edit files work (`isolation`, `AMP_HARNESS_WORKER_ISOLATION`, #2364).
+    /// Default `auto`: a git worktree in a usable repository, else a folder per ticket.
+    pub isolation: Isolation,
 }
 
 impl Default for SupervisorConfig {
@@ -93,6 +97,7 @@ impl Default for SupervisorConfig {
             timeout: Duration::from_secs(60 * 60),
             max_turns: 400,
             abort_grace: Duration::from_secs(10),
+            isolation: Isolation::Auto,
         }
     }
 }
@@ -107,6 +112,7 @@ struct WorkersTable {
     max_parallel: Option<usize>,
     timeout_minutes: Option<f64>,
     max_turns: Option<u32>,
+    isolation: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -150,6 +156,9 @@ impl SupervisorConfig {
         if let Some(t) = w.max_turns {
             self.max_turns = t;
         }
+        if let Some(i) = w.isolation {
+            self.isolation = i.parse()?;
+        }
         Ok(())
     }
 
@@ -170,6 +179,9 @@ impl SupervisorConfig {
         }
         if let Some(v) = get(ENV_WORKER_MAX_TURNS) {
             self.max_turns = num(ENV_WORKER_MAX_TURNS, v)? as u32;
+        }
+        if let Some(v) = get(ENV_ISOLATION) {
+            self.isolation = v.parse().map_err(|e| format!("{ENV_ISOLATION}: {e}"))?;
         }
         Ok(())
     }
@@ -268,6 +280,15 @@ pub struct WorkerInfo {
     pub cwd: PathBuf,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// Where it works (#2364): its own worktree, its own folder `amp-work/<ticket>/`, or the
+    /// manager's folder (`shared`, also for read-only roles).
+    pub workspace: Placement,
+    /// The manager's folder is in a git repository (usable for worktrees or not).
+    pub git: bool,
+    /// The role can edit files.
+    pub edits: bool,
+    /// The manager's folder (the person's files).
+    pub manager_cwd: PathBuf,
     /// The worker's live usage totals, updated as each event is emitted (so a before-tool hook on
     /// `amp_complete_task` sees every assistant message before that call).
     #[serde(skip)]
@@ -290,6 +311,8 @@ pub struct WorkerReport {
     pub cwd: PathBuf,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// `worktree`, `folder` or `shared` (#2364).
+    pub workspace: Placement,
     pub session_file: Option<PathBuf>,
     pub turns: u32,
     pub tool_calls: u32,
@@ -353,6 +376,9 @@ pub enum RunTicketError {
     Cancelled,
     #[error("bad arguments: {0}")]
     BadArguments(String),
+    /// `[workers] isolation = "worktree"` in a folder without a usable git repository (#2364).
+    #[error("{0}; nothing was dispatched")]
+    Workspace(String),
     /// The person stopped the worker from the chat while it waited for a slot (#2252).
     #[error(
         "{by} stopped the worker on #{task_id} from the chat before it started; nothing was dispatched. Ask them before running it again"
@@ -473,6 +499,9 @@ pub struct Supervisor {
     peak: AtomicUsize,
     /// Serializes `git worktree` changes (git's own lock fails rather than waits).
     git_lock: tokio::sync::Mutex<()>,
+    /// Held by a worker that edits files in the manager's own folder under `isolation =
+    /// "shared"`, so two of them never write there at once (#2364).
+    writer: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -507,6 +536,7 @@ impl Supervisor {
             running: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             git_lock: tokio::sync::Mutex::new(()),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -746,12 +776,13 @@ impl Supervisor {
     pub fn tool_description(&self) -> String {
         let mut text = format!(
             "Run a specialist agent on one AMP ticket and wait for it to finish. Marks the ticket \
-             dispatched in AMP (amp_dispatch_task), gives the worker its own git worktree at \
-             .worktrees/<task_id> when its role edits files, runs it on its own model, and returns \
+             dispatched in AMP (amp_dispatch_task), gives a worker whose role edits files its own \
+             place to work ({}), runs it on its own model, and returns \
              its final message and outcome (completed, blocked, stopped, error, timeout, cancelled \
              or turn_budget) as JSON. Call it once per ticket in the same message to run tickets in \
              parallel: at most {} run at once, extra calls wait for a free slot; each worker has \
              {} of wall-clock time. agent_id is the ticket's assigned_to.\n\nAgents:",
+            self.place_description(),
             self.config.max_parallel,
             human_duration(self.config.timeout),
         );
@@ -764,6 +795,23 @@ impl Supervisor {
             text.push_str(&format!("\n- amp:{}: {desc}", role.id));
         }
         text
+    }
+
+    /// `amp_run_ticket`'s words for where editing workers work, for this folder now (#2364).
+    fn place_description(&self) -> String {
+        let repo = Repo::probe(&self.manager.cwd);
+        match workspace::placement(self.config.isolation, &repo, &self.manager.cwd, false) {
+            Ok(Placement::Worktree) => {
+                "a git worktree at .worktrees/<task_id> on branch amp-<task_id>".to_owned()
+            }
+            Ok(Placement::Folder) => {
+                format!("a folder {WORK_DIR}/<task_id>/; no git branch, workers don't commit")
+            }
+            Ok(Placement::Shared) => {
+                "this folder, one editing worker at a time; workers don't commit".to_owned()
+            }
+            Err(e) => format!("none: {e}"),
+        }
     }
 
     fn resolve_role(&self, agent: &str) -> Result<Role, RunTicketError> {
@@ -801,6 +849,39 @@ impl Supervisor {
         let agent_id = format!("amp:{}", role.id);
         let _guard = self.claim(req.task_id, &agent_id)?;
         let (stop, stopped_by) = self.stop_handle(req.task_id);
+
+        // #2364: where it will work, decided before anything happens in AMP.
+        let edits = role.tool_policy(&self.manager.cwd).exposes("edit");
+        let repo = self.probe().await;
+        let place = if req.worktree.unwrap_or(edits) {
+            Some(
+                workspace::placement(
+                    self.config.isolation,
+                    &repo,
+                    &self.manager.cwd,
+                    req.base.is_some(),
+                )
+                .map_err(RunTicketError::Workspace)?,
+            )
+        } else {
+            None
+        };
+        // Under `isolation = "shared"`, workers that edit files take turns in the manager's
+        // folder. (An explicit `worktree: false` is the manager's own call and doesn't wait.)
+        let _writer = if edits && place == Some(Placement::Shared) {
+            Some(tokio::select! {
+                biased;
+                _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
+                _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
+                _ = stop.cancelled() => {
+                    let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                    return Err(RunTicketError::Stopped { task_id: req.task_id, by });
+                }
+                g = Arc::clone(&self.writer).lock_owned() => g,
+            })
+        } else {
+            None
+        };
 
         // Wait for a slot; a cancelled wait dispatches nothing.
         let permit = tokio::select! {
@@ -841,7 +922,14 @@ impl Supervisor {
         }
 
         let report = self
-            .run_dispatched(&req, &role, &agent_id, signal, stop, stopped_by)
+            .run_dispatched(
+                &req,
+                &role,
+                &agent_id,
+                Where { repo, place, edits },
+                signal,
+                (stop, stopped_by),
+            )
             .await;
         drop(permit);
         Ok(report)
@@ -886,9 +974,9 @@ impl Supervisor {
         req: &RunRequest,
         role: &Role,
         agent_id: &str,
+        at: Where,
         signal: CancellationToken,
-        stop: CancellationToken,
-        stopped_by: Arc<Mutex<Option<String>>>,
+        (stop, stopped_by): (CancellationToken, Arc<Mutex<Option<String>>>),
     ) -> WorkerReport {
         let started = Instant::now();
         let feed = self
@@ -907,10 +995,7 @@ impl Supervisor {
             .map(|r| r.model.context_window)
             .filter(|w| *w > 0);
 
-        // Where the worker runs.
-        let wants_worktree = req
-            .worktree
-            .unwrap_or_else(|| role.tool_policy(&self.manager.cwd).exposes("edit"));
+        // Where the worker runs (#2364: decided in run_ticket).
         let mut info = WorkerInfo {
             task_id: req.task_id,
             agent_id: agent_id.to_owned(),
@@ -919,11 +1004,15 @@ impl Supervisor {
             cwd: self.manager.cwd.clone(),
             worktree: None,
             branch: None,
+            workspace: at.place.unwrap_or(Placement::Shared),
+            git: at.repo.is_git(),
+            edits: at.edits,
+            manager_cwd: self.manager.cwd.clone(),
             totals: Arc::clone(&totals),
         };
-        if wants_worktree {
-            match self.worktree(req).await {
-                Ok(Ok(wt)) => {
+        match at.place {
+            Some(Placement::Worktree) => match self.worktree(req, &at.repo).await {
+                Ok(wt) => {
                     if wt.reused {
                         notes.push(format!(
                             "reused the existing worktree {}",
@@ -934,7 +1023,6 @@ impl Supervisor {
                     info.worktree = Some(wt.path);
                     info.branch = wt.branch;
                 }
-                Ok(Err(why)) => notes.push(no_worktree_note(&self.manager.cwd, why.as_deref())),
                 Err(e) => {
                     return self
                         .finish(
@@ -945,7 +1033,26 @@ impl Supervisor {
                         )
                         .await;
                 }
-            }
+            },
+            Some(Placement::Folder) => match ticket_folder(&self.manager.cwd, req.task_id) {
+                Ok((path, reused)) => {
+                    if reused {
+                        notes.push(format!("reused its folder {}", path.display()));
+                    }
+                    if self.config.isolation == Isolation::Auto
+                        && let Some(why) = at.repo.why_not(&self.manager.cwd)
+                    {
+                        notes.push(no_worktree_note(&self.manager.cwd, &why, &path, &at.repo));
+                    }
+                    info.cwd = path;
+                }
+                Err(e) => {
+                    return self
+                        .finish(&info, started, notes, Finish::error(format!("folder: {e}")))
+                        .await;
+                }
+            },
+            Some(Placement::Shared) | None => {}
         }
         {
             let mut live = self.live.lock().unwrap();
@@ -1165,6 +1272,7 @@ impl Supervisor {
             cwd: info.cwd.clone(),
             worktree: info.worktree.clone(),
             branch: info.branch.clone(),
+            workspace: info.workspace,
             session_file: finish.session_file,
             turns: totals.turns,
             tool_calls: totals.tool_calls,
@@ -1186,40 +1294,38 @@ impl Supervisor {
         report
     }
 
-    /// Creates or reuses `<repo>/.worktrees/<task_id>`. `Ok(Err(why))` when the worker runs in the
-    /// manager's directory instead: `None` when that is not in a git repository (#2356).
-    async fn worktree(&self, req: &RunRequest) -> Result<Result<Worktree, Option<String>>, String> {
+    /// Git about the manager's folder, asked off the async threads.
+    async fn probe(&self) -> Repo {
+        let cwd = self.manager.cwd.clone();
+        tokio::task::spawn_blocking(move || Repo::probe(&cwd))
+            .await
+            .unwrap_or(Repo::NotGit)
+    }
+
+    /// One line on where this manager's workers work, for its `<amp_context>` (#2364).
+    pub fn workspace_context(&self) -> String {
+        let repo = Repo::probe(&self.manager.cwd);
+        workspace::manager_context(self.config.isolation, &self.manager.cwd, &repo)
+    }
+
+    /// The chat banner's line about where workers work, when it isn't git worktrees (#2364).
+    pub fn workspace_banner(&self) -> Option<String> {
+        let repo = Repo::probe(&self.manager.cwd);
+        workspace::banner_line(self.config.isolation, &self.manager.cwd, &repo)
+    }
+
+    /// Creates or reuses `<repo>/.worktrees/<task_id>` in `repo` (usable, or with no commit when
+    /// the call names a base: [`workspace::placement`] decided that).
+    async fn worktree(&self, req: &RunRequest, repo: &Repo) -> Result<Worktree, String> {
         let _lock = self.git_lock.lock().await;
-        let cwd = &self.manager.cwd;
-        let Ok(top) = git(cwd, &["rev-parse", "--show-toplevel"]).await else {
-            return Ok(Err(None));
+        let top = match repo {
+            Repo::Usable { top } | Repo::NoCommit { top } => top.clone(),
+            other => {
+                return Err(other
+                    .why_not(&self.manager.cwd)
+                    .unwrap_or_else(|| "no git repository".to_owned()));
+            }
         };
-        let top = PathBuf::from(top);
-        // #2356: a folder inside another repository that tracks none of its files (a new folder
-        // under a linked one) would get a worktree of that other repository, without its files.
-        // And a repository with no commit has nothing to branch from. Both run in place, said.
-        if !same_path(&top, cwd)
-            && git(cwd, &["ls-files", "--", "."])
-                .await
-                .is_ok_and(|out| out.is_empty())
-        {
-            return Ok(Err(Some(format!(
-                "{} is inside the git repository {} but none of its files are in it, so a \
-                 worktree of that repository would not contain this folder",
-                cwd.display(),
-                top.display()
-            ))));
-        }
-        if req.base.is_none()
-            && git(&top, &["rev-parse", "--verify", "--quiet", "HEAD"])
-                .await
-                .is_err()
-        {
-            return Ok(Err(Some(format!(
-                "the git repository {} has no commit yet, so there is nothing to branch from",
-                top.display()
-            ))));
-        }
         let path = top.join(".worktrees").join(req.task_id.to_string());
         exclude_worktrees_dir(&top).await;
 
@@ -1237,11 +1343,11 @@ impl Supervisor {
                 .await
                 .ok()
                 .filter(|b| !b.is_empty());
-            return Ok(Ok(Worktree {
+            return Ok(Worktree {
                 path,
                 branch,
                 reused: true,
-            }));
+            });
         }
 
         let branch = req
@@ -1267,12 +1373,31 @@ impl Supervisor {
             let base = req.base.clone().unwrap_or_else(|| "HEAD".to_owned());
             git(&top, &["worktree", "add", "-b", &branch, &path_str, &base]).await?;
         }
-        Ok(Ok(Worktree {
+        Ok(Worktree {
             path,
             branch: Some(branch),
             reused: false,
-        }))
+        })
     }
+}
+
+/// Where run_ticket decided the worker works (#2364).
+struct Where {
+    repo: Repo,
+    /// `None`: the manager's folder (read-only roles, or `worktree: false`).
+    place: Option<Placement>,
+    /// The role can edit files.
+    edits: bool,
+}
+
+/// Creates (or reuses) the worker's own folder `<cwd>/amp-work/<task_id>` (#2364).
+fn ticket_folder(cwd: &Path, task_id: i64) -> Result<(PathBuf, bool), String> {
+    let path = cwd.join(WORK_DIR).join(task_id.to_string());
+    if path.is_dir() {
+        return Ok((path, true));
+    }
+    std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    Ok((path, false))
 }
 
 struct Worktree {
@@ -1492,6 +1617,10 @@ impl AgentEmitter for WorkerEmitter {
     }
 }
 
+/// What a worker outside its own git worktree is told about git (#2364): nothing to commit.
+const NO_GIT_STEPS: &str = "don't commit, branch, push or open a pull request, and leave branch, \
+     commit, pushed and pr_url out of amp_complete_task";
+
 fn worker_context(info: &WorkerInfo, manager: &str) -> String {
     let mut lines = vec![
         format!("ticket: #{}", info.task_id),
@@ -1500,12 +1629,35 @@ fn worker_context(info: &WorkerInfo, manager: &str) -> String {
     ];
     match (&info.worktree, &info.branch) {
         (Some(wt), branch) => {
+            lines.push("workspace: worktree".to_owned());
             lines.push(format!("worktree: {}", wt.display()));
             if let Some(b) = branch {
                 lines.push(format!("branch: {b}"));
             }
+            lines.push("git: yes (commit your work on your branch)".to_owned());
         }
-        (None, _) => lines.push("worktree: none (working in the manager's directory)".to_owned()),
+        (None, _) => {
+            lines.push(match info.workspace {
+                Placement::Folder => format!(
+                    "workspace: folder {} (your own, for this ticket; the person's files are in {})",
+                    info.cwd.display(),
+                    info.manager_cwd.display()
+                ),
+                _ if info.edits => format!(
+                    "workspace: shared {} (the person's folder; workers that edit files take turns in it)",
+                    info.cwd.display()
+                ),
+                _ => format!("workspace: the manager's folder {}", info.cwd.display()),
+            });
+            lines.push("worktree: none".to_owned());
+            if !info.git {
+                lines.push(format!("git: none (not a git repository): {NO_GIT_STEPS}"));
+            } else if info.edits {
+                lines.push(format!(
+                    "git: not yours here (no branch of your own): {NO_GIT_STEPS}"
+                ));
+            }
+        }
     }
     lines.join("\n")
 }
@@ -1530,10 +1682,36 @@ fn worker_prompt(info: &WorkerInfo, req: &RunRequest, project: Option<&ProjectMa
             "\n\nYour working directory is the git worktree {}.",
             wt.display()
         )),
-        (None, _) => text.push_str(&format!(
-            "\n\nYour working directory is {}.",
-            info.cwd.display()
-        )),
+        (None, _) => {
+            match info.workspace {
+                Placement::Folder => text.push_str(&format!(
+                    "\n\nYour working directory is {}, a folder of your own for this ticket inside \
+                     {}. Put everything you make for this ticket in it. Read any file in {} you \
+                     need, but don't change files outside your folder: other workers may be \
+                     running at the same time.",
+                    info.cwd.display(),
+                    info.manager_cwd.display(),
+                    info.manager_cwd.display()
+                )),
+                _ if info.edits => text.push_str(&format!(
+                    "\n\nYour working directory is {}, the person's own folder. Workers that edit \
+                     files take turns in it, so you are the only one editing now.",
+                    info.cwd.display()
+                )),
+                _ => text.push_str(&format!(
+                    "\n\nYour working directory is {}.",
+                    info.cwd.display()
+                )),
+            }
+            if info.edits {
+                text.push_str(&format!(
+                    " This work is not on a git branch of yours: {NO_GIT_STEPS}. In your \
+                     completion comment, list the files you made or changed, with their paths."
+                ));
+            } else if !info.git {
+                text.push_str(" It is not a git repository.");
+            }
+        }
     }
     if let Some(extra) = req
         .instructions
@@ -1565,17 +1743,14 @@ fn same_path(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// The note a worker's report carries when it ran in the manager's directory `cwd` without a
-/// worktree: `why` is the reason, `None` when `cwd` is not in a git repository (#2356).
-fn no_worktree_note(cwd: &Path, why: Option<&str>) -> String {
-    let why = why.map_or_else(
-        || format!("{} is not in a git repository", cwd.display()),
-        str::to_owned,
-    );
+/// The note a worker's report carries when `auto` gave it a folder instead of a worktree:
+/// `why` is the reason (#2356, #2364).
+fn no_worktree_note(cwd: &Path, why: &str, folder: &Path, repo: &Repo) -> String {
     format!(
-        "{why}; the worker ran in {} without a worktree (its own branch). To give workers their \
-         own worktrees, run `git init` in {} and commit once",
-        cwd.display(),
+        "{why}; the worker worked in its own folder {} (no branch, nothing committed). To give \
+         workers their own git worktrees, {} in {}",
+        folder.display(),
+        repo.fix().replace(" here", ""),
         cwd.display()
     )
 }
