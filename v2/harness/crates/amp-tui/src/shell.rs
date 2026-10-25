@@ -146,6 +146,8 @@ enum ShellMsg {
     },
     /// The file watcher saw the configuration change: reload (not counted in `in_flight`).
     ReloadRequest,
+    /// The chat's `.amp.json` changed (#2383). Not counted in `in_flight`.
+    ProjectLinked(ProjectLinked),
     /// A line from a background task the shell did not start ([`Notifier`]); not counted in
     /// `in_flight`.
     Notice {
@@ -231,6 +233,25 @@ impl Notifier {
     pub fn reload(&self) {
         let _ = self.0.send(ShellMsg::ReloadRequest);
     }
+
+    /// The chat's folder is linked to another project now (#2383: the manager wrote
+    /// `.amp.json`); see [`ProjectLinked`].
+    pub fn project_linked(&self, link: ProjectLinked) {
+        let _ = self.0.send(ShellMsg::ProjectLinked(link));
+    }
+}
+
+/// The chat's folder is linked to another project now (#2383): what changes on screen.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectLinked {
+    /// The header, status line and board follow it (`None`: no project).
+    pub project_id: Option<i64>,
+    /// The `/project` panel's note for a parent folder's marker (#2356).
+    pub marker: Option<(i64, String)>,
+    /// A notice for the transcript.
+    pub notice: String,
+    /// The banner's project text: (what it says now, what it says from now on).
+    pub banner: Option<(String, String)>,
 }
 
 /// What `/connect` did: a message for the transcript (never a secret), and the providers and
@@ -642,7 +663,22 @@ pub struct Shell {
     remote: Option<crate::remote_ui::RemoteUi>,
     /// Compaction progress from the harness (#2388).
     _compaction: BusWatch,
+    /// The tool call the model is writing right now (#2384), for the spinner line.
+    streaming: Option<StreamingCall>,
 }
+
+/// A tool call whose arguments are still streaming (#2384).
+struct StreamingCall {
+    index: usize,
+    name: String,
+    /// The arguments so far (partial JSON).
+    json: String,
+    /// When the spinner line last changed for it: re-parsing the arguments is throttled.
+    shown_at: Instant,
+}
+
+/// How often the spinner line follows a streaming tool call (parsing its partial arguments).
+const STREAMING_EVERY: Duration = Duration::from_millis(250);
 
 impl Shell {
     /// The shell and the receiver its runs finish on (select on it next to the agent events).
@@ -710,6 +746,7 @@ impl Shell {
                 remote_status: None,
                 remote: None,
                 _compaction: compaction,
+                streaming: None,
             },
             done_rx,
         )
@@ -1813,6 +1850,7 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        self.follow_streaming(event);
         // #2355: a worker's run has ended (the supervisor recorded it) by the time its
         // `amp_run_ticket` returns: the strip stops saying running, and its finished notice lands
         // now, before the manager's reply, not on the next tick.
@@ -1876,6 +1914,91 @@ impl Shell {
                 amp_core::repeat::stopped(&amp_core::events::tool_result_text(result))
         {
             self.view.add_warning(&stop.user_line("/model"));
+        }
+    }
+
+    /// #2384: while the model writes a tool call's arguments (a plan's `amp_create_tasks` can
+    /// stream for 40 s), the spinner line says what it is writing and how far it got
+    /// ([`amp_render::streaming_line`]) instead of only "Working…". Back to "Working…" once the
+    /// call is complete.
+    fn follow_streaming(&mut self, event: &AgentEvent) {
+        use rpi_ai::types::{AssistantMessageEvent as E, Content};
+        let now = Instant::now();
+        let streamed = match event {
+            AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    E::ToolCallStart {
+                        content_index,
+                        partial,
+                    },
+                ..
+            } => Some((*content_index, partial, "")),
+            AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    E::ToolCallDelta {
+                        content_index,
+                        partial,
+                        delta,
+                    },
+                ..
+            } => Some((*content_index, partial, delta.as_str())),
+            _ => None,
+        };
+        if let Some((index, partial, delta)) = streamed {
+            match &mut self.streaming {
+                Some(call) if call.index == index => {
+                    call.json.push_str(delta);
+                    // Some providers name the call after its first delta.
+                    if call.name.is_empty()
+                        && let Some(Content::ToolCall(tc)) = partial.content.get(index)
+                    {
+                        call.name = tc.name.clone();
+                    }
+                    if now.duration_since(call.shown_at) >= STREAMING_EVERY {
+                        call.shown_at = now;
+                        self.show_working();
+                    }
+                }
+                _ => {
+                    if let Some(Content::ToolCall(call)) = partial.content.get(index) {
+                        self.streaming = Some(StreamingCall {
+                            index,
+                            name: call.name.clone(),
+                            json: delta.to_owned(),
+                            shown_at: now,
+                        });
+                        self.show_working();
+                    }
+                }
+            }
+            return;
+        }
+        let complete = matches!(
+            event,
+            AgentEvent::MessageUpdate {
+                assistant_message_event: E::ToolCallEnd { .. },
+                ..
+            } | AgentEvent::MessageEnd { .. }
+                | AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::AgentEnd { .. }
+        );
+        if complete && self.streaming.take().is_some() {
+            self.show_working();
+        }
+    }
+
+    /// The spinner's message when no hint is shown: what the model is writing, else "Working…".
+    fn working_text(&self) -> String {
+        match &self.streaming {
+            Some(call) => amp_render::streaming_line(&call.name, &call.json),
+            None => WORKING.to_owned(),
+        }
+    }
+
+    /// Puts [`Self::working_text`] on the spinner line, unless the Esc hint is up.
+    fn show_working(&self) {
+        if self.esc_hint_until.is_none() {
+            self.view.set_working_message(&self.working_text());
         }
     }
 
@@ -2035,6 +2158,7 @@ impl Shell {
     pub fn finish_run(&mut self, result: RunDone) {
         self.running = false;
         self.esc_hint_until = None;
+        self.streaming = None;
         self.view.set_working(false);
         let stopping = self.view.stopping();
         self.view.set_stopping(false);
@@ -2274,7 +2398,7 @@ impl Shell {
 
     fn clear_esc_hint(&mut self) {
         if self.esc_hint_until.take().is_some() {
-            self.view.set_working_message(WORKING);
+            self.show_working();
         }
     }
 
@@ -2874,6 +2998,16 @@ impl Shell {
                 self.reload_command(ReloadCause::Watcher);
                 continue;
             }
+            if let ShellMsg::ProjectLinked(link) = msg {
+                if let Some(meta) = &self.meta {
+                    meta.link_project(link.project_id, link.marker);
+                }
+                if let Some((from, to)) = &link.banner {
+                    self.view.replace_in_banner(from, to);
+                }
+                self.view.add_notice(&link.notice);
+                continue;
+            }
             let msg = match msg {
                 ShellMsg::Remote(call) => {
                     self.remote_call(call);
@@ -2933,6 +3067,7 @@ impl Shell {
                 ShellMsg::Notice { .. }
                 | ShellMsg::ReloadRequest
                 | ShellMsg::Remote(_)
+                | ShellMsg::ProjectLinked(_)
                 | ShellMsg::Compaction { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {

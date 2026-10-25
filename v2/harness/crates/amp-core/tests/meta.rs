@@ -998,6 +998,42 @@ async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_
     .await;
 }
 
+/// #2383: a poller started with no project (the chat's folder had no `.amp.json`) follows the
+/// project the folder is linked to later, with the `/project` panel's parent-folder note, and
+/// fetches its project and board.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_project_moves_a_poller_with_no_project_onto_one() {
+    let server = serve(Mock::new(default_board())).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_marker: None,
+            project_id: None,
+            ticket_id: None,
+            intervals: fast(150),
+            connector: None,
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "the user", |m| m.user.get().is_some()).await;
+    assert_eq!(server.mock.count("amp_get_project"), 0);
+    meta.link_project(
+        Some(2),
+        Some((2, "../.amp.json (a parent folder's: /x)".into())),
+    );
+    let m = wait_for(&meta, "the linked project and its board", |m| {
+        m.project.get().is_some() && m.board.get().is_some()
+    })
+    .await;
+    assert_eq!(m.project_id, Some(2));
+    assert_eq!(m.project.get().unwrap().name, "AMP");
+    assert_eq!(m.project_marker.as_ref().map(|(id, _)| *id), Some(2));
+    // Linked again without the note (the folder got its own .amp.json): the note goes.
+    meta.link_project(Some(2), None);
+    wait_for(&meta, "the note cleared", |m| m.project_marker.is_none()).await;
+    assert_eq!(meta.snapshot().project_id, Some(2));
+}
+
 /// #2160: a slash command's write that the caller already reported as failed (no answer in
 /// time, because the poller was stuck in a refresh against a hung AMP) is never sent afterwards.
 /// Otherwise `/questions` says "not answered", the user answers again, and both answers land.

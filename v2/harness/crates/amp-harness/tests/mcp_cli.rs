@@ -424,7 +424,10 @@ impl T {
         let mut child = cmd.spawn().expect("spawn amp-harness");
         if let Some(input) = stdin {
             let mut pipe = child.stdin.take().unwrap();
-            pipe.write_all(input.as_bytes()).await.unwrap();
+            // A run that ends without reading all its input closes the pipe first (#2385).
+            if let Err(e) = pipe.write_all(input.as_bytes()).await {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+            }
             drop(pipe);
         }
         let out = tokio::time::timeout(Duration::from_secs(90), child.wait_with_output())

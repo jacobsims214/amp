@@ -14,6 +14,11 @@
 //!   string field holds an object, returns an error that names the tool the arguments were meant
 //!   for and the exact call shape.
 //!
+//! Every built-in tool's parameter schema is also compacted ([`compact_schema`], #2367): rpi's
+//! schemars output carries `$schema`, `title`, Rust-facing descriptions ("Mirrors TS
+//! `ReadToolInput`") and `"default": null` on every optional field, all sent with every request
+//! and none of it telling the model anything.
+//!
 //! Everything else (execution, labels, modes) is the inner tool's.
 
 use std::sync::Arc;
@@ -148,18 +153,63 @@ impl AgentTool for Guided {
     }
 }
 
-/// Wraps the built-in tools that have an [`extra_description`]; the others are returned as they
-/// are.
+/// A built-in tool's parameter schema without what only Rust needs: `$schema`, the top-level
+/// `title` and `description` (the tool's own description says it), `title` in definitions, and
+/// `"default": null` (an optional field's absence already means that). Validation is unchanged:
+/// none of these keywords constrains a value.
+pub fn compact_schema(schema: &Value) -> Value {
+    fn strip(v: &mut Value, top: bool) {
+        match v {
+            Value::Object(map) => {
+                map.remove("$schema");
+                map.remove("title");
+                if top {
+                    map.remove("description");
+                }
+                if map.get("default").is_some_and(Value::is_null) {
+                    map.remove("default");
+                }
+                for (key, child) in map.iter_mut() {
+                    // A property named "title" or "default" is a field, not a keyword.
+                    if key == "properties" || key == "definitions" || key == "$defs" {
+                        if let Value::Object(fields) = child {
+                            for field in fields.values_mut() {
+                                strip(field, false);
+                            }
+                        }
+                    } else {
+                        strip(child, false);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(|i| strip(i, false)),
+            _ => {}
+        }
+    }
+    let mut out = schema.clone();
+    strip(&mut out, true);
+    if let Some(defs) = out.get_mut("definitions").and_then(Value::as_object_mut) {
+        for def in defs.values_mut() {
+            if let Some(d) = def.as_object_mut() {
+                // "JSON-schema-facing edit shape (camelCase to match the TS wire contract)."
+                d.remove("description");
+            }
+        }
+    }
+    out
+}
+
+/// Wraps every built-in tool: a compacted schema ([`compact_schema`]) and, where there is one,
+/// the [`extra_description`].
 pub fn guide_tools(tools: Vec<HarnessTool>) -> Vec<HarnessTool> {
     tools
         .into_iter()
         .map(|t| {
-            let schema = t.tool.schema();
-            let Some(extra) = extra_description(&schema.name) else {
-                return t;
-            };
-            let mut schema = schema.clone();
-            schema.description = format!("{} {extra}", schema.description.trim_end());
+            let mut schema = t.tool.schema().clone();
+            if let Some(extra) = extra_description(&schema.name) {
+                schema.description = format!("{} {extra}", schema.description.trim_end());
+            }
+            schema.parameters = rpi_ai::types::Schema(compact_schema(&schema.parameters.0));
             HarnessTool {
                 tool: Arc::new(Guided {
                     inner: t.tool,
@@ -221,6 +271,48 @@ mod tests {
         ] {
             assert_eq!(misrouted(tool, &args), None, "{tool} {args}");
         }
+    }
+
+    #[test]
+    fn compact_schema_drops_rust_noise_and_keeps_constraints() {
+        let raw = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "title": "EditInput",
+            "description": "Input for the edit tool. Mirrors TS `EditToolInput`.",
+            "type": "object",
+            "required": ["edits", "path"],
+            "properties": {
+                "path": {"description": "Path to the file.", "type": "string"},
+                "title": {"description": "A field named title.", "type": "string", "default": null},
+                "limit": {"default": null, "type": ["integer", "null"], "minimum": 0.0},
+                "edits": {"type": "array", "items": {"$ref": "#/definitions/E"}}
+            },
+            "definitions": {"E": {
+                "description": "JSON-schema-facing edit shape.",
+                "type": "object",
+                "required": ["oldText"],
+                "properties": {"oldText": {"description": "Exact text.", "type": "string"}}
+            }}
+        });
+        let out = compact_schema(&raw);
+        assert_eq!(
+            out,
+            json!({
+                "type": "object",
+                "required": ["edits", "path"],
+                "properties": {
+                    "path": {"description": "Path to the file.", "type": "string"},
+                    "title": {"description": "A field named title.", "type": "string"},
+                    "limit": {"type": ["integer", "null"], "minimum": 0.0},
+                    "edits": {"type": "array", "items": {"$ref": "#/definitions/E"}}
+                },
+                "definitions": {"E": {
+                    "type": "object",
+                    "required": ["oldText"],
+                    "properties": {"oldText": {"description": "Exact text.", "type": "string"}}
+                }}
+            })
+        );
     }
 
     #[test]

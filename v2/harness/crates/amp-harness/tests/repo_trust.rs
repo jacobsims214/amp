@@ -163,7 +163,10 @@ impl Repo {
         {
             use tokio::io::AsyncWriteExt;
             let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(answers.as_bytes()).await.unwrap();
+            // A run that ends without reading all its input closes the pipe first (#2385).
+            if let Err(e) = stdin.write_all(answers.as_bytes()).await {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+            }
         }
         let out = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
             .await

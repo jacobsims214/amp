@@ -539,7 +539,10 @@ fn build_inner(
 ) -> Result<Inner, String> {
     let models: Vec<Model> = provider.models.values().cloned().collect();
     if provider.api == ProviderApi::Faux {
-        let script = FauxScript::new();
+        let mut script = FauxScript::new();
+        if let Some(tps) = crate::faux::tokens_per_second(&|k| std::env::var(k).ok()) {
+            script = script.with_tokens_per_second(tps);
+        }
         let faux: Arc<dyn Provider> = FauxProvider::with_models(script.clone(), models);
         return Ok((faux, Some(script), None));
     }

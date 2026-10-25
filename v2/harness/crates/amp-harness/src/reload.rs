@@ -56,7 +56,8 @@ struct Live {
     policy: Arc<ToolPolicy>,
     role: String,
     cwd: PathBuf,
-    project: Option<ProjectMarker>,
+    /// The chat's `.amp.json` now: changed by [`ChatReload::relink`] (#2383).
+    project: std::sync::Mutex<Option<ProjectMarker>>,
     supervisor: Option<Arc<Supervisor>>,
 }
 
@@ -68,13 +69,54 @@ impl ChatReload {
             policy: Arc::clone(&session.agent.policy),
             role: session.agent.role.id.clone(),
             cwd: session.cwd.clone(),
-            project: session.project.clone(),
+            project: std::sync::Mutex::new(session.project.clone()),
             supervisor: session.supervisor.clone(),
         }))
+    }
+
+    /// The chat's folder is linked to `project` now (#2383: the manager wrote `.amp.json`):
+    /// the manager's `<amp_context>` names it from its next request, and later `/reload`s keep it.
+    pub async fn relink(&self, project: Option<ProjectMarker>) -> Result<(), String> {
+        *self
+            .0
+            .project
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = project;
+        self.0.refresh(Vec::new()).await.map(|_| ())
     }
 }
 
 impl Live {
+    fn project(&self) -> Option<ProjectMarker> {
+        self.project
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Rebuilds the live session's prompt, skills and tools from the runtime as it is now
+    /// ([`Runtime::refresh_session`]), with `replace_tools` put in place of their namesakes.
+    async fn refresh(
+        &self,
+        replace_tools: Vec<rpi_harness::types::HarnessTool>,
+    ) -> Result<amp_core::agent::Refreshed, String> {
+        // #2364: the manager's `workers_workspace:` line, as at start (git may have changed).
+        let workspace = self.supervisor.as_ref().map(|s| s.workspace_context());
+        let project = self.project();
+        self.rt
+            .refresh_session(LiveSession {
+                harness: &self.harness,
+                role: &self.role,
+                cwd: &self.cwd,
+                project: project.as_ref(),
+                extra_context: workspace.as_deref(),
+                policy: &self.policy,
+                replace_tools,
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn run(self: Arc<Self>) -> Result<ReloadReply, String> {
         let env = |k: &str| std::env::var(k).ok();
         let report = self
@@ -82,22 +124,10 @@ impl Live {
             .reload(&SystemKeys::from_env(), &env)
             .await
             .map_err(|e| format!("{e}; nothing was changed"))?;
-        // #2364: the manager's `workers_workspace:` line, as at start (git may have changed).
-        let workspace = self.supervisor.as_ref().map(|s| s.workspace_context());
+        // amp_run_ticket's description lists the roster: a fresh one lists the new one.
         let refreshed = self
-            .rt
-            .refresh_session(LiveSession {
-                harness: &self.harness,
-                role: &self.role,
-                cwd: &self.cwd,
-                project: self.project.as_ref(),
-                extra_context: workspace.as_deref(),
-                policy: &self.policy,
-                // amp_run_ticket's description lists the roster: a fresh one lists the new one.
-                replace_tools: self.supervisor.iter().map(|s| s.tool()).collect(),
-            })
-            .await
-            .map_err(|e| e.to_string())?;
+            .refresh(self.supervisor.iter().map(|s| s.tool()).collect())
+            .await?;
         let mut lines = report.lines();
         if lines.is_empty() && refreshed.prompt_changed {
             lines.push("the manager's prompt changed (AGENTS.md)".to_owned());

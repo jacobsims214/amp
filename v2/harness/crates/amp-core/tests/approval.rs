@@ -438,16 +438,21 @@ fn results(messages: &[AgentMessage]) -> Vec<(String, bool, String)> {
         .collect()
 }
 
+// The refused dispatch is amp_run_ticket: the manager's policy denies amp_dispatch_task (#2367).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_refusal_ends_the_managers_turn_without_another_model_call() {
     let ran = Arc::new(Mutex::new(Vec::new()));
     let tools = vec![
-        fake("amp_dispatch_task", GATE_REFUSAL, true, &ran),
+        fake("amp_run_ticket", GATE_REFUSAL, true, &ran),
         fake("amp_list_tasks", "{}", false, &ran),
     ];
     let script = vec![
         assistant(
-            vec![call("c1", "amp_dispatch_task", json!({"task_id": 7}))],
+            vec![call(
+                "c1",
+                "amp_run_ticket",
+                json!({"task_id": 7, "agent_id": "amp:amp-worker-docs"}),
+            )],
             StopReason::ToolUse,
         ),
         // Never asked for: the refusal ended the run.
@@ -461,7 +466,7 @@ async fn a_refusal_ends_the_managers_turn_without_another_model_call() {
         llm_calls, 1,
         "the model was not called again after the refusal"
     );
-    assert_eq!(ran.lock().unwrap().clone(), vec!["amp_dispatch_task"]);
+    assert_eq!(ran.lock().unwrap().clone(), vec!["amp_run_ticket"]);
     let r = results(&messages);
     assert_eq!(r.len(), 1);
     assert!(r[0].1 && r[0].2.contains(approval::PLAN_GATE_MARK) && r[0].2.contains(TURN_ENDED));
@@ -471,7 +476,7 @@ async fn a_refusal_ends_the_managers_turn_without_another_model_call() {
 async fn a_refusal_in_a_mixed_batch_blocks_the_retry_and_ends_the_run() {
     let ran = Arc::new(Mutex::new(Vec::new()));
     let tools = vec![
-        fake("amp_dispatch_task", GATE_REFUSAL, true, &ran),
+        fake("amp_run_ticket", GATE_REFUSAL, true, &ran),
         fake("amp_list_tasks", "{}", false, &ran),
         fake("amp_approve_plan", PLAN_REFUSAL, true, &ran),
     ];
@@ -480,7 +485,11 @@ async fn a_refusal_in_a_mixed_batch_blocks_the_retry_and_ends_the_run() {
         // model again...
         assistant(
             vec![
-                call("c1", "amp_dispatch_task", json!({"task_id": 7})),
+                call(
+                    "c1",
+                    "amp_run_ticket",
+                    json!({"task_id": 7, "agent_id": "amp:amp-worker-docs"}),
+                ),
                 call("c2", "amp_list_tasks", json!({})),
             ],
             StopReason::ToolUse,
@@ -489,7 +498,11 @@ async fn a_refusal_in_a_mixed_batch_blocks_the_retry_and_ends_the_run() {
         assistant(
             vec![
                 call("c3", "amp_approve_plan", json!({"project_id": 2})),
-                call("c4", "amp_dispatch_task", json!({"task_id": 7})),
+                call(
+                    "c4",
+                    "amp_run_ticket",
+                    json!({"task_id": 7, "agent_id": "amp:amp-worker-docs"}),
+                ),
             ],
             StopReason::ToolUse,
         ),
@@ -504,7 +517,7 @@ async fn a_refusal_in_a_mixed_batch_blocks_the_retry_and_ends_the_run() {
         assert_eq!(llm_calls, 2, "{mode:?}");
         let mut got = ran.lock().unwrap().clone();
         got.sort();
-        assert_eq!(got, vec!["amp_dispatch_task", "amp_list_tasks"], "{mode:?}");
+        assert_eq!(got, vec!["amp_list_tasks", "amp_run_ticket"], "{mode:?}");
         let r = results(&messages);
         assert_eq!(r.len(), 4, "{mode:?}");
         for blocked in &r[2..] {

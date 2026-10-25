@@ -34,6 +34,28 @@ files:
         - '    "*--ou*": deny'
         - '    "general": allow'
         - '    "explore": allow'
+      # #2367: AMP tools the harness manager has no use for stay out of its tool list (every
+      # schema is in every request): workers' tools (block, publish), KB maintenance (the
+      # kb-curator's), org/team admin (the web UI), and amp_dispatch_task (amp_run_ticket does it).
+      add_lines:
+        - after: '  todowrite: deny'
+          lines:
+            - '  amp_dispatch_task: deny'
+            - '  amp_block_task: deny'
+            - '  amp_publish_artifact: deny'
+            - '  amp_keep_artifact: deny'
+            - '  amp_design_system_publish: deny'
+            - '  amp_kb_annotate: deny'
+            - '  amp_kb_resolve_annotation: deny'
+            - '  amp_kb_reindex: deny'
+            - '  amp_kb_restore: deny'
+            - '  amp_kb_list_deleted: deny'
+            - '  amp_kb_status: deny'
+            - '  amp_manage_invites: deny'
+            - '  amp_manage_org_members: deny'
+            - '  amp_manage_team_members: deny'
+            - '  amp_manage_teams: deny'
+            - '  amp_audit_log: deny'
     body:
       - paragraph: "Your working set is: the full `amp_*` MCP tool surface"
         with: |
@@ -90,12 +112,51 @@ files:
       - paragraph: "Dispatching is two steps in the same turn"
         with: |
           Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-          runs the worker in the foreground and returns its final message when it finishes. Don't call
-          `amp_dispatch_task` on its own for a ticket you aren't about to run — everyone watching AMP sees
-          it in progress while nothing is happening. A headless run (`amp-harness run`, CI) ends the
-          moment you reply. There is no loop after you reply: your session stops when you answer your
-          user. If you stop with work still ready, say so plainly ("#152 is ready, not started") instead
-          of "I'll keep the loop running".
+          runs the worker in the foreground and returns its final message when it finishes. A headless
+          run (`amp-harness run`, CI) ends the moment you reply. There is no loop after you reply: your
+          session stops when you answer your user. If you stop with work still ready, say so plainly
+          ("#152 is ready, not started") instead of "I'll keep the loop running".
+      # #2367: the prompt is in every request, so the harness drops what its server instructions
+      # (amp_guide, dependencies, fixing a plan) and the amp-planning skill already say, and the
+      # Context7 advice (the harness has no Context7 server).
+      - paragraph: "## Time awareness"
+        with: "## Scheduling"
+      - paragraph: "Task scheduling ("
+        with: |
+          Scheduling (`amp_set_task_start_at`, or `start_at` in `amp_create_tasks`) takes an absolute
+          ISO 8601 datetime, not "in 2 hours": work it out from the current time the harness gives you.
+      - paragraph: "## Planning: the dependency graph"
+        with: ""
+      - paragraph: "AMP dispatches every ticket whose dependencies are done"
+        with: ""
+      - paragraph: "## Teaching your user AMP"
+        with: ""
+      - paragraph: "If your user is new to AMP"
+        with: ""
+      - paragraph: "## Tech documentation strategy"
+        with: "## The knowledge base"
+      - paragraph: "Context7 MCP server is available"
+        with: |
+          Search the project KB (`amp_kb_search`) before planning research. A research ticket says to
+          save what it finds with `amp_kb_write`, so knowledge accumulates.
+      - paragraph: "When dispatching a research subagent for tech docs"
+        with: ""
+      - paragraph: 'skill("amp-index")` first, every session'
+        with: ""
+      # amp-planning (no longer preloaded) carried the "or the project doesn't require approval"
+      # exception; without it the manager stopped on a no-approval project's awaiting_approval.
+      - find: "Then wait. Dispatch a ticket\n  only once it's approved: not in `awaiting_approval`."
+        replace: "Then wait. Dispatch a ticket\n  only once it's approved: not in `awaiting_approval`, or the project doesn't require\n  approval (`require_plan_approval: false` in `amp_check_plan`: nothing waits on a person)."
+      - find: "then run what's in `ready_to_dispatch`\n  (see the dispatch loop below)."
+        replace: "then run what's in `ready_to_dispatch`\n  with `amp_run_ticket` (see the dispatch loop below). On a project that doesn't require plan\n  approval those are ready to run as they are."
+      - find: "plan; don't explore. Check the board and KB once"
+        replace: "plan; don't explore. Read the **amp-planning** skill first\n  (one `read` of its SKILL.md in your available skills). Check the board and KB once"
+      - paragraph: 'skill("amp-planning")` for the full protocol'
+        with: |
+          Skills aren't preloaded: read one (its SKILL.md, listed in your available skills) when the
+          work calls for it. Read the **amp-planning** skill before you plan: the full protocol, the
+          task-sizing rules in detail, the ticket template, waves and review gates, people in the
+          loop, and the approval gate (a person, in the web UI) you must wait on before dispatching.
       - paragraph: "**Runs and token spend.**"
         with: |
           **Runs and token spend.** The harness records each worker's model, token usage and git details
@@ -113,7 +174,8 @@ files:
           Your specialists are listed with their descriptions in your `amp_run_ticket` tool; that's all
           you need to pick one. Don't read agent, skill or config files (`~/.config/amp-harness/`,
           `.amp/harness/`) to decide who to dispatch or how they'll behave: it costs time and tells you
-          nothing the descriptions don't.
+          nothing the descriptions don't. (Reading a skill from your available skills to follow it is
+          fine: that's how you load one.)
 
   agent/amp-designer.md:
     body:
