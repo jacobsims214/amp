@@ -2,6 +2,11 @@
 //! resolve the working directory and `.amp.json`, connect to AMP, load the [`Runtime`], and
 //! build the role's harness with a [`ChannelEmitter`] so the caller sees its events.
 //!
+//! Remote control M1 (#2370): the harness's emitter is a [`FanOutEmitter`]. Its first sink is
+//! that channel (the TUI, or `run`'s printer: what they see is unchanged), its second the
+//! session's [`ManagerFeed`]; a later client (the remote link) adds a sink or subscribes through
+//! [`Session::fanout`], or reads the numbered chat from [`Session::feed`].
+//!
 //! A primary role (the manager) also gets a worker [`Supervisor`] and its `amp_run_ticket` tool
 //! (D7, M2-5), limited by config.toml `[workers]` and `AMP_HARNESS_MAX_WORKERS` /
 //! `AMP_HARNESS_WORKER_TIMEOUT_SECS` / `AMP_HARNESS_WORKER_MAX_TURNS`. Aborting the manager's run
@@ -27,7 +32,8 @@ use std::{
 
 use amp_core::{
     agent::{AgentSpec, BuiltAgent, Runtime, RuntimeOptions, SessionKind},
-    events::{ChannelEmitter, Totals, TotalsEmitter},
+    events::{ChannelEmitter, FanOutEmitter, Totals, TotalsEmitter},
+    manager_feed::ManagerFeed,
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::SystemKeys,
     run_report::{RunReporter, SessionUsageTool},
@@ -61,6 +67,12 @@ pub struct Session {
     pub rt: Arc<Runtime>,
     pub agent: BuiltAgent,
     pub events: UnboundedReceiver<AgentEvent>,
+    /// Every event of the harness, for more consumers than `events` (#2370).
+    #[allow(dead_code, reason = "the remote link (#2373) subscribes here")]
+    pub fanout: FanOutEmitter,
+    /// The session's chat as numbered [`amp_core::chat_event::ChatEvent`]s (#2370). Its deltas
+    /// are numbered once flushed: run [`ManagerFeed::spawn_flusher`] where something reads it.
+    pub feed: Arc<ManagerFeed>,
     pub project: Option<ProjectMarker>,
     pub cwd: PathBuf,
     /// The manager's worker supervisor (`None` for a worker role).
@@ -173,6 +185,10 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         None
     };
     let (emitter, events) = ChannelEmitter::new();
+    let fanout = FanOutEmitter::new();
+    fanout.add_sink(emitter.into_emitter());
+    let feed = ManagerFeed::new();
+    fanout.add_sink(feed.emitter());
     let totals = Arc::new(Mutex::new(Totals::default()));
     let model = role
         .resolve_model(&rt.current_models())
@@ -188,8 +204,9 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         Arc::clone(&totals),
         false,
     ));
-    spec.emitter =
-        Some(TotalsEmitter::new(Arc::clone(&totals), Some(emitter.into_emitter())).into_emitter());
+    spec.emitter = Some(
+        TotalsEmitter::new(Arc::clone(&totals), Some(fanout.clone().into_emitter())).into_emitter(),
+    );
     spec.session = if req.memory {
         SessionKind::Memory
     } else {
@@ -213,6 +230,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         rt,
         agent,
         events,
+        fanout,
+        feed,
         project,
         cwd,
         supervisor,
