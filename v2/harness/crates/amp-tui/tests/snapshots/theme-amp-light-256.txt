@@ -10,7 +10,7 @@
   AMP harness 0.1.0 · manager
   ␛[38;5;242mproject #2 AMP · http://amp.test/mcp␛[0m
 
- ␛]133;A␛[48;5;255m Theme check: show me everything.                                             ␛[0m␛]133;B␛]133;C
+ ␛[48;5;255m Theme check: show me everything.                                             ␛[0m
 
  ␛[49m ␛[38;5;25m●␛[0m␛[49m ␛[38;5;234mget_task #2103␛[0m␛[49m                                                             ␛[0m
 

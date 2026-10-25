@@ -20,8 +20,8 @@
 //! - [`ThinkingBlock`]: a thinking section, collapsed to one live `▸ Thinking · 18s` line by
 //!   default (#2177), `▸ Thought for 18s` once it ends (#2345); expanded, plain dim text behind
 //!   a `│` gutter ([`ThinkingDisplay`]). A click on its line or Ctrl+T opens and closes it.
-//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers; plain
-//!   text, shown exactly as typed (#2350).
+//! - [`UserBlock`]: the user's message on its surface; plain text, shown exactly as typed
+//!   (#2350), with no OSC 133 prompt markers (#2357).
 //! - [`ToolBlock`]: a tool call on one line (status glyph, title, argument, the result's
 //!   summary, `12 ms`), its details under it when expanded (Ctrl+O, [`ToolDisplay`]); a failed
 //!   call shows its error. [`ToolGroup`] holds consecutive calls as one block (#2183).
@@ -1096,14 +1096,18 @@ impl Component for AssistantBlock {
     }
 }
 
-const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
-const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
-const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
-
-/// The user's message: plain text on the theme's surface colour inside a padded box, between
-/// OSC 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped. It is shown exactly
-/// as typed, not as markdown (#2350): paths like `mathx/__init__.py`, `snake_case` and `*.rs`
-/// globs are what engineers type, and emphasis parsing would change them on screen.
+/// The user's message: plain text on the theme's surface colour inside a padded box,
+/// word-wrapped. It is shown exactly as typed, not as markdown (#2350): paths like
+/// `mathx/__init__.py`, `snake_case` and `*.rs` globs are what engineers type, and emphasis
+/// parsing would change them on screen.
+///
+/// No OSC 133 prompt-zone markers (pi's `UserMessageComponent` has them, #2357): `133;A` means
+/// "prompt start, fresh-line", and iTerm2 (by default) and other terminals following the
+/// semantic-prompts spec answer it with CR+LF when the cursor isn't in column 0. A frame row
+/// never starts the marker there (the inset's padding comes first, and the differ redraws from
+/// mid-row), so the bubble's first row landed one row down and was drawn over: in compact
+/// density that row is the first line of the message, which vanished. On the alternate screen
+/// the marks have no use (no scrollback to jump through), so they are not sent at all.
 pub struct UserBlock {
     text: String,
     inner: Mutex<(u64, BgBox)>,
@@ -1164,14 +1168,6 @@ impl Component for UserBlock {
             *inner = (revision, user_box(&self.text));
         }
         let mut lines = inner.1.render(width);
-        if let Some(first) = lines.first_mut() {
-            first.insert_str(0, OSC133_ZONE_START);
-        }
-        // The zone ends after the text: at the end of the last row, so a one-row bubble
-        // (compact, #2346) still reads start, text, end.
-        if let Some(last) = lines.last_mut() {
-            last.push_str(&format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}"));
-        }
         if self.margin_above && !lines.is_empty() {
             lines.insert(0, String::new());
         }
@@ -2032,17 +2028,69 @@ mod tests {
 
     const TYPED: &str = "export it from mathx/__init__.py, rename a_b_c, match *.rs and keep **x**";
 
+    /// #2357: what a long message looks like after sending, at the chat's widths and both
+    /// densities: every character is on the bubble's rows, in order, and every row fits.
     #[test]
-    fn a_one_row_message_marks_its_prompt_zone_in_order() {
-        let rows = UserBlock::new("hi").render(40);
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        let (a, b, c) = (
-            rows[0].find(OSC133_ZONE_START).unwrap(),
-            rows[0].find(OSC133_ZONE_END).unwrap(),
-            rows[0].find(OSC133_ZONE_FINAL).unwrap(),
+    fn a_long_message_shows_every_character_and_every_row_fits() {
+        let paragraph = (0..120)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let url = format!(
+            "https://example.com/{}/END",
+            (0..60).map(|i| format!("seg{i:03}")).collect::<String>()
         );
-        let text = rows[0].find("hi").unwrap();
-        assert!(a < text && text < b && b < c, "{:?}", rows[0]);
+        let lines = (0..30)
+            .map(|i| format!("line{i:02} text"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pasted = format!("{lines}\n{paragraph}");
+        let wide = (0..40)
+            .map(|i| format!("e{i:02}🚀中文字"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for text in [&paragraph, &url, &lines, &pasted, &wide] {
+            for density in [crate::Density::Compact, crate::Density::Comfortable] {
+                // The transcript's width inside the inset at 80, 120 and 200 columns, and narrow.
+                for width in [40, 78, 116, 196] {
+                    let rows = crate::density::with(density, || {
+                        UserBlock::new(text.as_str()).render(width)
+                    });
+                    let raw = rows.join("\n");
+                    assert!(!raw.contains("\x1b]133"), "{density:?} {width}: {raw:?}");
+                    for row in &rows {
+                        assert!(
+                            visible_width_of(row) <= width,
+                            "{density:?} {width}: {row:?} is {} wide",
+                            visible_width_of(row)
+                        );
+                        assert!(!plain(row).contains('…'), "{density:?} {width}: {row:?}");
+                    }
+                    let shown: String = plain_rows(&rows).concat().split_whitespace().collect();
+                    let sent: String = text.split_whitespace().collect();
+                    assert_eq!(
+                        shown,
+                        sent,
+                        "{density:?} {width}:\n{}",
+                        plain_rows(&rows).join("\n")
+                    );
+                    // The first line of the message is on the bubble's first text row (compact:
+                    // its first row), the row a fresh-line from `133;A` used to lose.
+                    let first_text = plain_rows(&rows)
+                        .into_iter()
+                        .find(|r| !r.trim().is_empty())
+                        .unwrap();
+                    let start: String = text.chars().take(3).collect();
+                    assert!(
+                        first_text.trim_start().starts_with(&start),
+                        "{density:?} {width}: {first_text:?}"
+                    );
+                    if density == crate::Density::Compact {
+                        assert!(!plain(&rows[0]).trim().is_empty(), "{rows:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
