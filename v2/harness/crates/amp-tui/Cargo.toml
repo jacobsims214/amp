@@ -40,6 +40,10 @@ amp-core = { workspace = true, features = ["mock-relay"] }
 # tests/provider_error.rs: a provider that refuses every request (#2207).
 async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# tests/remote_live.rs (#2379): the browser side against the real Go relay (HTTP + SSE).
+futures.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+sse-stream.workspace = true
 
 [lints]
 workspace = true

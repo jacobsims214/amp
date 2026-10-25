@@ -8,17 +8,30 @@ import type {
   SessionStatus, Usage, WorkerInfo,
 } from './types'
 
+/** A run of thinking or text inside one assistant message, with when it started and ended
+ *  (harness clock, the envelope's `ts`), so thinking reads "Thought for 9s" as in the TUI. */
+export interface Block { kind: 'thinking' | 'text'; text: string; startedAt: number; endedAt: number | null }
+
 export type TranscriptItem =
-  | { kind: 'user'; key: string; prompt_id: string; text: string; origin: 'local' | 'remote'; device_name: string | null }
-  | { kind: 'assistant'; key: string; message_id: string; model: string; provider: string; text: string; thinking: string;
-      done: boolean; stop_reason: string | null; error: string | null; usage: Usage | null }
-  | { kind: 'tool'; key: string; tool_call_id: string; name: string; arguments_json: string; args_truncated: boolean;
+  | { kind: 'user'; key: string; prompt_id: string; text: string; origin: 'local' | 'remote'; device_id: string | null; device_name: string | null; at: number }
+  | { kind: 'assistant'; key: string; message_id: string; model: string; provider: string; blocks: Block[];
+      done: boolean; stop_reason: string | null; error: string | null; usage: Usage | null; at: number }
+  | { kind: 'tool'; key: string; message_id: string | null; tool_call_id: string; name: string; arguments_json: string; args_truncated: boolean;
+      startedAt: number | null; endedAt: number | null;
       result: { text: string; is_error: boolean; truncated: boolean; full_bytes: number } | null }
-  | { kind: 'run_end'; key: string; run_id: string; outcome: string; error: string | null }
-  | { kind: 'notice'; key: string; level: 'info' | 'warn' | 'error'; code: string | null; text: string }
-  | { kind: 'retry'; key: string; attempt: number; max_retries: number; delay_ms: number; error: string }
+  /** `covered`: the TUI shows nothing for it (completed), or a notice/error line already said it. */
+  | { kind: 'run_end'; key: string; run_id: string; outcome: string; error: string | null; covered: boolean; at: number; startedAt: number | null }
+  | { kind: 'notice'; key: string; level: 'info' | 'warn' | 'error'; code: string | null; text: string; at: number }
+  | { kind: 'retry'; key: string; attempt: number; max_retries: number; delay_ms: number; error: string; at: number }
   | { kind: 'gap'; key: string }
   | { kind: 'security'; key: string; verdict: EventVerdict }
+
+/** All the text of one kind in an assistant message. */
+export const blockText = (a: { blocks: Block[] }, kind: Block['kind']) => a.blocks.filter(b => b.kind === kind).map(b => b.text).join('')
+
+/** Token totals from the `message_end` events this page has seen. */
+export interface Totals { input: number; output: number; cache_read: number; cache_write: number; cost_usd_micros: number; messages: number }
+const noTotals: Totals = { input: 0, output: 0, cache_read: 0, cache_write: 0, cost_usd_micros: 0, messages: 0 }
 
 /** A prompt or command this browser sent, until the harness answers. */
 export interface Outgoing {
@@ -46,6 +59,11 @@ export interface SessionState {
   connection: Connection
   /** The run the harness is in, from run_start/run_end. */
   running: string | null
+  /** When that run started (harness clock). */
+  runStartedAt: number | null
+  totals: Totals
+  /** When the last worker_status arrived (harness clock). */
+  workersAt: number | null
   ended: { reason: string } | null
   /** The harness speaks a newer protocol: stop applying events (5.7 step 3). */
   versionMismatch: boolean
@@ -54,7 +72,7 @@ export interface SessionState {
 
 export const initialSessionState: SessionState = {
   hello: null, status: null, items: [], queue: [], workers: [], outgoing: [], online: null,
-  connection: 'connecting', running: null, ended: null, versionMismatch: false, lastAppliedSeq: 0,
+  connection: 'connecting', running: null, runStartedAt: null, totals: noTotals, workersAt: null, ended: null, versionMismatch: false, lastAppliedSeq: 0,
 }
 
 export type SessionAction =
@@ -88,7 +106,7 @@ export function refusalText(code: string, message?: string | null): string {
   return known[code] ?? (message ? message : `The laptop refused it (${code}).`)
 }
 
-function applyChat(s: SessionState, ev: ChatEvent): SessionState {
+function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
   const items = s.items
   const replaceWhere = <K extends TranscriptItem['kind']>(kind: K, pred: (i: Extract<TranscriptItem, { kind: K }>) => boolean,
     fn: (i: Extract<TranscriptItem, { kind: K }>) => TranscriptItem): TranscriptItem[] | null => {
@@ -102,56 +120,90 @@ function applyChat(s: SessionState, ev: ChatEvent): SessionState {
     }
     return null
   }
-  const assistant = (message_id: string, model = '', provider = ''): TranscriptItem => ({
-    kind: 'assistant', key: nextKey('a'), message_id, model, provider, text: '', thinking: '', done: false,
-    stop_reason: null, error: null, usage: null,
+  type Assistant = Extract<TranscriptItem, { kind: 'assistant' }>
+  const assistant = (message_id: string, model = '', provider = ''): Assistant => ({
+    kind: 'assistant', key: nextKey('a'), message_id, model, provider, blocks: [], done: false,
+    stop_reason: null, error: null, usage: null, at: ts,
   })
+  /** Closes the open block (a thinking section ends when anything else starts). */
+  const closeBlocks = (blocks: Block[]): Block[] => blocks.map(b => b.endedAt == null ? { ...b, endedAt: ts } : b)
 
   switch (ev.type) {
     case 'user_message':
       return {
         ...s,
-        items: [...items, { kind: 'user', key: nextKey('u'), prompt_id: ev.prompt_id, text: ev.text, origin: ev.origin, device_name: ev.device_name ?? null }],
+        items: [...items, { kind: 'user', key: nextKey('u'), prompt_id: ev.prompt_id, text: ev.text, origin: ev.origin,
+          device_id: ev.device_id ?? null, device_name: ev.device_name ?? null, at: ts }],
         // Our own prompt is now in the transcript: drop its outgoing placeholder.
         outgoing: s.outgoing.filter(o => o.prompt_id !== ev.prompt_id),
       }
     case 'run_start':
-      return { ...s, running: ev.run_id }
+      return { ...s, running: ev.run_id, runStartedAt: ts }
     case 'message_start':
       return { ...s, items: [...items, assistant(ev.message_id, ev.model, ev.provider)] }
     case 'text_delta':
     case 'thinking_delta': {
-      const field = ev.type === 'text_delta' ? 'text' : 'thinking'
-      const next = replaceWhere('assistant', a => a.message_id === ev.message_id, a => ({ ...a, [field]: a[field] + ev.delta }))
+      const kind: Block['kind'] = ev.type === 'text_delta' ? 'text' : 'thinking'
+      const add = (a: Assistant): Assistant => {
+        const last = a.blocks.at(-1)
+        if (last && last.kind === kind && last.endedAt == null) {
+          return { ...a, blocks: [...a.blocks.slice(0, -1), { ...last, text: last.text + ev.delta }] }
+        }
+        return { ...a, blocks: [...closeBlocks(a.blocks), { kind, text: ev.delta, startedAt: ts, endedAt: null }] }
+      }
+      const next = replaceWhere('assistant', a => a.message_id === ev.message_id, add)
       if (next) return { ...s, items: next }
       // A delta whose message_start was before our buffer (a gap): start the block here.
-      const a = assistant(ev.message_id) as Extract<TranscriptItem, { kind: 'assistant' }>
-      return { ...s, items: [...items, { ...a, [field]: ev.delta }] }
+      return { ...s, items: [...items, add(assistant(ev.message_id))] }
     }
-    case 'tool_start':
-      return { ...s, items: [...items, { kind: 'tool', key: nextKey('t'), tool_call_id: ev.tool_call_id, name: ev.name,
-        arguments_json: ev.arguments_json, args_truncated: !!ev.truncated, result: null }] }
+    case 'tool_start': {
+      // The message's thinking ends when its first call starts.
+      const closed = replaceWhere('assistant', a => a.message_id === ev.message_id, a => ({ ...a, blocks: closeBlocks(a.blocks) })) ?? items
+      return { ...s, items: [...closed, { kind: 'tool', key: nextKey('t'), message_id: ev.message_id, tool_call_id: ev.tool_call_id, name: ev.name,
+        arguments_json: ev.arguments_json, args_truncated: !!ev.truncated, startedAt: ts, endedAt: null, result: null }] }
+    }
     case 'tool_end': {
       const result = { text: ev.text, is_error: !!ev.is_error, truncated: !!ev.truncated, full_bytes: ev.full_bytes }
-      const next = replaceWhere('tool', t => t.tool_call_id === ev.tool_call_id, t => ({ ...t, result }))
-      return { ...s, items: next ?? [...items, { kind: 'tool', key: nextKey('t'), tool_call_id: ev.tool_call_id, name: ev.name,
-        arguments_json: '', args_truncated: false, result }] }
+      const next = replaceWhere('tool', t => t.tool_call_id === ev.tool_call_id, t => ({ ...t, result, endedAt: ts }))
+      return { ...s, items: next ?? [...items, { kind: 'tool', key: nextKey('t'), message_id: null, tool_call_id: ev.tool_call_id, name: ev.name,
+        arguments_json: '', args_truncated: false, startedAt: null, endedAt: ts, result }] }
     }
     case 'message_end': {
       const patch = { done: true, stop_reason: ev.stop_reason, error: ev.error ?? null, usage: ev.usage ?? null, model: ev.model, provider: ev.provider }
-      const next = replaceWhere('assistant', a => a.message_id === ev.message_id, a => ({ ...a, ...patch }))
-      return { ...s, items: next ?? [...items, { ...(assistant(ev.message_id) as Extract<TranscriptItem, { kind: 'assistant' }>), ...patch }] }
+      const next = replaceWhere('assistant', a => a.message_id === ev.message_id, a => ({ ...a, ...patch, blocks: closeBlocks(a.blocks) }))
+      const u = ev.usage
+      const totals = u ? {
+        input: s.totals.input + (u.input_tokens || 0), output: s.totals.output + (u.output_tokens || 0),
+        cache_read: s.totals.cache_read + (u.cache_read_tokens || 0), cache_write: s.totals.cache_write + (u.cache_write_tokens || 0),
+        cost_usd_micros: s.totals.cost_usd_micros + (u.cost_usd_micros || 0), messages: s.totals.messages + 1,
+      } : s.totals
+      return { ...s, totals, items: next ?? [...items, { ...assistant(ev.message_id), ...patch }] }
     }
     case 'retry':
-      return { ...s, items: [...items, { kind: 'retry', key: nextKey('r'), attempt: ev.attempt, max_retries: ev.max_retries, delay_ms: ev.delay_ms, error: ev.error }] }
-    case 'run_end':
-      return { ...s, running: null, items: [...items, { kind: 'run_end', key: nextKey('e'), run_id: ev.run_id, outcome: ev.outcome, error: ev.error ?? null }] }
-    case 'notice':
-      return { ...s, items: [...items, { kind: 'notice', key: nextKey('n'), level: ev.level, code: ev.code ?? null, text: ev.text }] }
+      return { ...s, items: [...items, { kind: 'retry', key: nextKey('r'), attempt: ev.attempt, max_retries: ev.max_retries, delay_ms: ev.delay_ms, error: ev.error, at: ts }] }
+    case 'run_end': {
+      // The TUI shows nothing when a run completes; a stopped or failed run ends with the shell's
+      // "Stopped." or error line, which arrives as a notice (or the reply's own error line).
+      let said = false
+      for (let n = items.length - 1; n >= 0; n--) {
+        const it = items[n]
+        if (it.kind === 'user') break
+        if ((it.kind === 'notice' && (it.level !== 'info' || it.text.trim() === 'Stopped.')) || (it.kind === 'assistant' && it.error && it.stop_reason !== 'aborted')) { said = true; break }
+      }
+      return { ...s, running: null, runStartedAt: null, items: [...items, { kind: 'run_end', key: nextKey('e'), run_id: ev.run_id, outcome: ev.outcome,
+        error: ev.error ?? null, covered: ev.outcome === 'completed' || said, at: ts, startedAt: s.runStartedAt }] }
+    }
+    case 'notice': {
+      // The shell's run-outcome line may come just after run_end: then it says it, not run_end.
+      const last = items.at(-1)
+      const base = last?.kind === 'run_end' && !last.covered && (ev.level !== 'info' || ev.text.trim() === 'Stopped.')
+        ? [...items.slice(0, -1), { ...last, covered: true }] : items
+      return { ...s, items: [...base, { kind: 'notice', key: nextKey('n'), level: ev.level, code: ev.code ?? null, text: ev.text, at: ts }] }
+    }
     case 'queue':
       return { ...s, queue: Array.isArray(ev.items) ? ev.items : [] }
     case 'worker_status':
-      return { ...s, workers: Array.isArray(ev.workers) ? ev.workers : [] }
+      return { ...s, workers: Array.isArray(ev.workers) ? ev.workers : [], workersAt: ts }
     default:
       return s // unknown types are ignored (6.4)
   }
@@ -167,7 +219,7 @@ function applyEvent(s: SessionState, env: Envelope, myDeviceId: string | null): 
     case 'status':
       return { ...base, status: env.body as SessionStatus }
     case 'chat_event':
-      return applyChat(base, env.body as ChatEvent)
+      return applyChat(base, env.body as ChatEvent, typeof env.ts === 'number' ? env.ts : Date.now())
     case 'ack': {
       const b = env.body as AckBody
       if (!myDeviceId || env.device_id !== myDeviceId || b.ref?.device_id !== myDeviceId) return base
@@ -189,7 +241,7 @@ function applyEvent(s: SessionState, env: Envelope, myDeviceId: string | null): 
       // the reader when the laptop accepted another device, so a pairing they didn't make shows.
       const b = env.body as PairResultBody
       if (b.result !== 'accepted' || env.device_id === myDeviceId) return base
-      return { ...base, items: [...base.items, { kind: 'notice', key: nextKey('n'), level: 'warn', code: 'device_paired',
+      return { ...base, items: [...base.items, { kind: 'notice', key: nextKey('n'), level: 'warn', code: 'device_paired', at: env.ts,
         text: 'The laptop paired another device for remote control. If that wasn\'t you, run /remote off on the laptop.' }] }
     }
     default:
@@ -216,7 +268,7 @@ export function sessionReducer(s: SessionState, a: SessionAction): SessionState 
       const f = a.frame
       if (f.type === 'attached') return { ...s, online: f.online, connection: 'live' }
       if (f.type === 'online') return { ...s, online: true }
-      if (f.type === 'offline') return { ...s, online: false, running: null }
+      if (f.type === 'offline') return { ...s, online: false, running: null, runStartedAt: null }
       if (f.type === 'gap') return { ...s, items: [...s.items, { kind: 'gap', key: nextKey('g') }] }
       if (f.type === 'ended') return { ...s, ended: { reason: f.reason } }
       return s
@@ -243,6 +295,12 @@ export function sessionReducer(s: SessionState, a: SessionAction): SessionState 
 /** The agent is working: a run is open, or the harness says busy. */
 export function isBusy(s: SessionState): boolean {
   return s.running !== null || !!s.status?.busy
+}
+
+/** The session's tokens for the status line: the harness's status doesn't carry totals (yet),
+ *  so these are the replies this page has seen. */
+export function tokenTotal(t: Totals): number {
+  return t.input + t.output + t.cache_read + t.cache_write
 }
 
 /** People-facing words for end reasons (protocol 12.2). */

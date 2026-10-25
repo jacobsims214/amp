@@ -20,7 +20,9 @@ const sse = (frame: { event: string; data: string; id?: number }) =>
 export function relayHandlers(relay: MockRelay) {
   const notFound = () => HttpResponse.json({ error: 'Not found', code: 'not_found' }, { status: 404 })
   return [
-    http.get('*/api/sessions', () => HttpResponse.json({ sessions: relay.ended ? [] : [relay.summary()] })),
+    http.get('*/api/sessions', () => HttpResponse.json({ sessions: relay.list() })),
+
+    http.post('*/api/sessions/revoke-all', () => HttpResponse.json(relay.revokeAll())),
 
     http.get('*/api/sessions/:id', ({ params }) => {
       if (params.id !== relay.sessionId) return notFound()

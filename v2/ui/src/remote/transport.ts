@@ -43,6 +43,8 @@ export interface RelayTransport {
   /** POSTs one signed command. Resolves on 202; rejects with RelayError otherwise. */
   postCommand(id: string, env: CommandEnvelope): Promise<void>
   disconnect(id: string): Promise<void>
+  /** Ends every live session of the caller and forgets their devices (protocol 8.3). */
+  revokeAll(): Promise<{ ended: number; devices_revoked: number }>
   /** POSTs a pair request (protocol 7.3). Resolves on 202 with the pairing window's expiry. */
   pair(id: string, msg: PairMessage): Promise<{ expires_at_ms: number | null }>
 }
@@ -147,6 +149,13 @@ export const httpTransport: RelayTransport = {
   async disconnect(id) {
     const res = await fetch(`/api/sessions/${enc(id)}/disconnect`, { method: 'POST' })
     if (!res.ok) throw await errorFrom(res)
+  },
+
+  async revokeAll() {
+    const res = await fetch('/api/sessions/revoke-all', { method: 'POST' })
+    if (!res.ok) throw await errorFrom(res)
+    const body = await res.json().catch(() => ({})) as { ended?: number; devices_revoked?: number }
+    return { ended: body.ended ?? 0, devices_revoked: body.devices_revoked ?? 0 }
   },
 
   async pair(id, msg) {

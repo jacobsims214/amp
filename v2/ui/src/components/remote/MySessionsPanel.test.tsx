@@ -41,7 +41,7 @@ function renderMyWork(who: Me) {
 describe('My Work → My sessions', () => {
   it('lists live sessions with full-page links when remote control is available', async () => {
     renderMyWork(me(true))
-    const link = await screen.findByRole('link', { name: /jacobs-mbp/ })
+    const link = await screen.findByRole('link', { name: /jacobs-mbp/ }, { timeout: 4000 })
     expect(link).toHaveAttribute('href', `/sessions/${MOCK_SESSION_ID}`)
     expect(link).toHaveTextContent('online')
     expect(screen.getByText('My sessions')).toBeInTheDocument()

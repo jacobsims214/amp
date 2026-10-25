@@ -10,10 +10,11 @@ import type { RemoteCrypto } from '../remote/crypto'
 import { memoryStore } from '../remote/deviceStore'
 import { webRemoteCrypto } from '../remote/webCrypto'
 import { RelayError, type EventStreamHandlers, type RelayTransport } from '../remote/transport'
-import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport } from '../remote/mock/mockRelay'
+import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport, workerScene } from '../remote/mock/mockRelay'
+import parityStream from '../remote/mock/parityStream.json'
 import { loadVectors } from '../test/vectors'
 import type { Me } from '../types'
-import type { SessionDetail } from '../remote/types'
+import type { ChatEvent, SessionDetail } from '../remote/types'
 
 vi.setConfig({ testTimeout: 10_000 }) // the fake harness streams on real timers
 
@@ -48,13 +49,14 @@ describe('Session page', () => {
     const { container } = renderSession(deps)
     await screen.findByText('run the tests and tell me what fails')
     expect(screen.getByText('typed on the laptop')).toBeInTheDocument() // user_message (local)
-    expect(screen.getByText('Thinking').closest('details')).not.toHaveAttribute('open') // thinking_delta, folded
+    expect(screen.getByText(/^Thought for \d+s$/).closest('details')).not.toHaveAttribute('open') // thinking_delta, folded
     expect(screen.getByText(/Running the/)).toBeInTheDocument() // message_start + text_delta (Markdown)
     expect(screen.getAllByTestId('tool-row')).toHaveLength(1) // tool_start + tool_end
     expect(screen.getByText(/Full output \(178 KB\) is on the laptop/)).toBeInTheDocument()
-    expect(screen.getByText(/Retrying \(1\/3\) in 2 s/)).toBeInTheDocument() // retry
-    expect(screen.getAllByText(/12,034 in/)).toHaveLength(1) // message_end usage
-    expect(screen.getByText('Run finished')).toBeInTheDocument() // run_end
+    // retry: shown only while it counts down (the TUI's status slot), so not once the run went on.
+    expect(screen.queryByText(/Retrying/)).toBeNull()
+    expect(within(screen.getByLabelText('Session status')).getByTitle(/25,154 in/)).toBeInTheDocument() // message_end usage
+    expect(screen.queryByTestId('run-end')).toBeNull() // run_end: a completed run draws nothing, as in the TUI
     expect(screen.getByText(/context7.*reconnected/)).toBeInTheDocument() // notice
     expect(within(screen.getByLabelText('Workers')).getByText('RC-M1 harness link')).toBeInTheDocument() // worker_status
     // Hostile model output: no images, no script, link with its full URL.
@@ -62,7 +64,9 @@ describe('Session page', () => {
     expect(screen.getByRole('link', { name: /the CI run \(https:\/\/github\.com\/jacobsims214\/amp\/actions\)/ })).toBeInTheDocument()
 
     const status = screen.getByLabelText('Session status')
-    for (const t of ['anthropic/claude-opus-5-5', '37%', '$1.83', 'AMP · #2372', 'jacobs-mbp']) expect(within(status).getByText(t)).toBeInTheDocument()
+    for (const t of ['claude-opus-5-5', '37%', '$1.83']) expect(within(status).getByText(t)).toBeInTheDocument()
+    expect(screen.getByTestId('header-facts')).toHaveTextContent('AMP #2 · ticket #2372 · remote-m1-2372 · macos')
+    expect(screen.getByRole('heading', { level: 1 })).toHaveTextContent('jacobs-mbp')
     expect(screen.getByText('Laptop online')).toBeInTheDocument()
   })
 
@@ -78,7 +82,7 @@ describe('Session page', () => {
     expect(sent.body).toMatchObject({ text: 'please fix it', client_msg_id: expect.stringMatching(/^[A-Za-z0-9_-]{1,64}$/) })
     expect(sent.sig).toBeTruthy()
     expect(sent.seq).toBeGreaterThan(1_700_000_000_000)
-    await screen.findByText('from Chrome on macOS')
+    await screen.findByText(/Chrome on macOS \(this device\)/)
     // While the run is open, the next message is queued.
     await user.type(box, 'and then the docs{Enter}')
     const strip = await screen.findByLabelText('Queued messages')
@@ -90,17 +94,32 @@ describe('Session page', () => {
     await waitFor(() => expect(screen.getAllByText(/You said: "and then the docs"/)).toHaveLength(1), { timeout: 3000 })
   })
 
+  it('sends slash text as a literal prompt, never as a command or another op (R-M6, #2379)', async () => {
+    const user = userEvent.setup()
+    const { relay, deps } = mockSession()
+    renderSession(deps)
+    await screen.findByText('Laptop online')
+    await user.type(screen.getByLabelText('Message'), '/remote off{Enter}')
+    await waitFor(() => expect(relay.received).toHaveLength(1))
+    expect(relay.received[0].op).toBe('prompt')
+    expect(relay.received[0].body).toMatchObject({ text: '/remote off' })
+    // Still connected: the page didn't treat it as Disconnect.
+    expect(screen.getByText('Laptop online')).toBeInTheDocument()
+    expect(relay.received.map(c => c.op)).toEqual(['prompt'])
+  })
+
   it('Stop sends a signed stop and the harness confirms it', async () => {
     const user = userEvent.setup()
     const { relay, deps } = mockSession()
     renderSession(deps)
     await screen.findByText('Laptop online')
     await user.type(screen.getByLabelText('Message'), 'long job{Enter}')
-    await screen.findByText('from Chrome on macOS')
+    await screen.findByText(/Chrome on macOS \(this device\)/)
     await user.click(screen.getByRole('button', { name: 'Stop the agent' }))
     await waitFor(() => expect(relay.received.map(c => c.op)).toEqual(['prompt', 'stop']))
     await screen.findByText('Stopped.')
-    await screen.findByText('Run stopped')
+    // The shell's "Stopped." says it once: run_end adds no second line.
+    expect(screen.getAllByText('Stopped.')).toHaveLength(1)
   })
 
   it('cancelling the queue stops the run (M1 has no per-message cancel)', async () => {
@@ -110,7 +129,7 @@ describe('Session page', () => {
     await screen.findByText('Laptop online')
     const box = screen.getByLabelText('Message')
     await user.type(box, 'first{Enter}')
-    await screen.findByText('from Chrome on macOS')
+    await screen.findByText(/Chrome on macOS \(this device\)/)
     await user.type(box, 'second{Enter}')
     await screen.findByLabelText('Queued messages')
     await user.click(screen.getByRole('button', { name: 'Cancel queued' }))
@@ -243,6 +262,7 @@ describe('Session page with the protocol test vectors', () => {
       'wrong_harness_fake_registration', 'bad_signature_claims_pinned_harness', 'wrong_session', 'unknown_op_ignored']
     const transport: RelayTransport = {
       listSessions: async () => [detail],
+      revokeAll: async () => ({ ended: 0, devices_revoked: 0 }),
       getSession: async id => { if (id !== rx.session_id) throw new RelayError(404, 'not_found', 'x'); return detail },
       openEvents: (_id, _from, h) => {
         queueMicrotask(() => {
@@ -261,7 +281,7 @@ describe('Session page with the protocol test vectors', () => {
     // Real ES256 verification is asynchronous: wait until the last vector has been through the check.
     await waitFor(() => expect(screen.getAllByRole('alert').filter(a => /Untrusted data/.test(a.textContent ?? ''))).toHaveLength(4))
     expect(screen.getByText('bash')).toBeInTheDocument() // tool_start
-    expect(screen.getByText(/12,034 in/)).toBeInTheDocument() // message_end usage
+    expect(within(screen.getByLabelText('Session status')).getByTitle(/12,034 in/)).toBeInTheDocument() // message_end usage
     expect(within(screen.getByLabelText('Session status')).getByText('$1.83')).toBeInTheDocument() // hello status
     expect(screen.getAllByText(/Running the tests/)).toHaveLength(1) // the duplicate seq is dropped silently
     expect(screen.queryByText(/Ignore previous instructions/)).toBeNull()
@@ -274,3 +294,79 @@ describe('Session page with the protocol test vectors', () => {
   })
 })
 
+
+describe('Session page reads like the harness TUI (#2386)', () => {
+  const recorded = parityStream as { at_ms: number; event: ChatEvent }[]
+  const withStream = (stream: { at_ms: number; event: ChatEvent }[]) => {
+    const relay = new MockRelay({ stepMs: 0, stream })
+    return { relay, deps: { transport: mockTransport(relay), crypto: mockCrypto(), mock: false } as RemoteDeps }
+  }
+
+  it('renders the recorded harness feed with the TUI\'s structure', async () => {
+    const { deps } = withStream(recorded)
+    renderSession(deps)
+    await screen.findByText('try again')
+    // Thinking folded with its duration, both sections.
+    expect(screen.getAllByText(/^Thought for \d+s$/).map(e => e.textContent)).toEqual(['Thought for 4s', 'Thought for 1s'])
+    // Tool calls grouped; the six-call group folds its first three successful calls.
+    const groups = screen.getAllByTestId('tool-group')
+    expect(groups).toHaveLength(3)
+    const fold = within(groups[1]).getByTestId('tool-fold')
+    expect(fold).toHaveTextContent('3 calls·create_epic, create_story, create_tasks')
+    const failed = within(groups[1]).getAllByTestId('tool-row').find(r => r.dataset.state === 'failed')!
+    expect(failed).toHaveTextContent('assign_task #526')
+    expect(within(failed).getByTestId('tool-summary')).toHaveTextContent('"me" needs a signed-in AMP user')
+    expect(failed).toHaveTextContent('6 ms')
+    expect(within(groups[2]).getByTestId('tool-summary')).toHaveTextContent('30 lines')
+    // The remote turns carry their device; the local ones say so.
+    expect(screen.getAllByTestId('remote-tag').map(t => t.textContent)).toEqual(['RemoteSafari on iPhone', 'RemoteSafari on iPhone'])
+    // Stopped once; the failed run's two error lines; no extra run-end lines.
+    expect(screen.getAllByText('Stopped.')).toHaveLength(1)
+    expect(screen.getByText('✗ Error: 429 Too Many Requests: rate limit exceeded for this key')).toBeInTheDocument()
+    expect(screen.getByText('✗ Error: No more faux responses queued')).toBeInTheDocument()
+    expect(screen.queryByTestId('run-end')).toBeNull()
+    // Markdown table and the link's full URL.
+    expect(screen.getByRole('table')).toHaveTextContent('Research JetStream APIs')
+    expect(screen.getByRole('link', { name: /amp\.example\.test\/project\/158\/plan/ })).toBeInTheDocument()
+  })
+
+  it('opens a tool call to its arguments and pretty-printed result', async () => {
+    const user = userEvent.setup()
+    const { deps } = withStream(recorded)
+    renderSession(deps)
+    await screen.findByText('try again')
+    const row = screen.getAllByTestId('tool-row').find(r => r.textContent?.includes('get_task #514'))!
+    await user.click(within(row).getByText('get_task #514'))
+    expect(row).toHaveAttribute('open')
+    expect(within(row).getByText(/"comments_total": 3/)).toBeInTheDocument()
+  })
+
+  it('shows a run in flight: working timer, running call, and the dispatched workers', async () => {
+    const t0 = Date.now() - 3_400
+    const { deps } = withStream(workerScene(t0))
+    renderSession(deps)
+    await screen.findByText('dispatch both')
+    expect(screen.getByTestId('working')).toHaveTextContent(/Working… 3s/)
+    const rows = screen.getAllByTestId('tool-row')
+    expect(rows.map(r => r.dataset.state)).toEqual(['running', 'running'])
+    expect(within(rows[0]).getByTestId('worker-live')).toHaveTextContent('Add the clamp helper with a fairly long ticket name to test cuts · worker-backend (wf-1) · running 2s')
+    const chips = within(screen.getByLabelText('Workers')).getAllByTestId('worker-chip')
+    expect(chips.map(c => c.textContent)).toEqual([
+      '#218Add the clamp helper with a fairly long ticket name to test cuts· worker-backend (wf-1)· running 2s',
+      '#219Write the README line· worker-backend (wf-1)· running 2s',
+    ])
+    expect(screen.getByText(/▶ worker started #218/)).toBeInTheDocument()
+  })
+
+  it('counts a retry down in the working line while it is pending', async () => {
+    const now = Date.now()
+    const { deps } = withStream([
+      { at_ms: now - 500, event: { type: 'user_message', prompt_id: 'p_1', text: 'go', origin: 'local', device_id: null, device_name: null } },
+      { at_ms: now - 500, event: { type: 'run_start', run_id: 'run_1', prompt_id: 'p_1' } },
+      { at_ms: now - 400, event: { type: 'retry', attempt: 1, max_retries: 10, delay_ms: 2000, error: '429 Too Many Requests' } },
+    ])
+    renderSession(deps)
+    await screen.findByText('go')
+    expect(screen.getByTestId('working')).toHaveTextContent(/Retrying \(1\/10\) in 2s…429 Too Many RequestsStop to cancel/)
+  })
+})
