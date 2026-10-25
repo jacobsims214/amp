@@ -21,6 +21,24 @@ pub fn build_http_client(ca_file: Option<&Path>) -> Result<reqwest::Client, McpE
         .map_err(|e| McpError::Http(e.to_string()))
 }
 
+/// [`build_http_client`] that keeps idle connections open for reuse (#2380): same roots
+/// (`ca_file` included) and same-origin redirect policy, but one TLS connection carries call after
+/// call instead of a new DNS lookup, TCP connect and TLS handshake for each. For clients that make
+/// many small calls to one origin, such as the remote-control relay link, which posts an event
+/// batch about every 100 ms while a reply streams. On a Mac where the server's name is slow to
+/// resolve (a `.local` name waits ~5 s for an IPv6 mDNS answer), a fresh connection per batch put
+/// that delay on every batch.
+pub fn build_keepalive_http_client(ca_file: Option<&Path>) -> Result<reqwest::Client, McpError> {
+    base_builder(ca_file)?
+        .pool_max_idle_per_host(usize::MAX)
+        .pool_idle_timeout(KEEPALIVE_IDLE)
+        .build()
+        .map_err(|e| McpError::Http(e.to_string()))
+}
+
+/// How long [`build_keepalive_http_client`] keeps an idle connection (reqwest's default).
+pub const KEEPALIVE_IDLE: Duration = Duration::from_secs(90);
+
 /// [`build_http_client`] whose connections all go to the unix socket at `socket` (`[mcp.<name>]
 /// socket = ..`). The URL still gives the Host header and path; an `https` URL still uses TLS.
 #[cfg(unix)]

@@ -324,15 +324,21 @@ export function sessionTokens(status: SessionStatus | null, t: Totals):
   return total ? { input: t.input, output: t.output, cache_read: t.cache_read, cache_write: t.cache_write, total, fromHarness: false } : null
 }
 
-/** People-facing words for end reasons (protocol 12.2). */
-export function endReasonText(reason: string): string {
+/**
+ * People-facing words for end reasons (protocol 12.2). `idleTimeoutS` is the session's idle limit
+ * from the harness's hello, when known: the org sets it (5-240 min), so the text never assumes 30.
+ */
+export function endReasonText(reason: string, idleTimeoutS?: number | null): string {
+  const idleMin = idleTimeoutS ? Math.round(idleTimeoutS / 60) : null
   const m: Record<string, string> = {
     harness_ended: 'Remote control was turned off on the laptop.',
     detached: 'You disconnected this session.',
     disconnected: 'You disconnected this session.',
     revoked: 'All your remote sessions were revoked.',
     policy_off: 'Remote control was turned off for your organization.',
-    idle: 'The session ended after 30 minutes without remote activity.',
+    idle: idleMin
+      ? `The session ended after ${idleMin} minute${idleMin === 1 ? '' : 's'} without remote activity.`
+      : 'The session ended after its idle time without remote activity (your org sets it).',
     expired: 'The session reached its 12-hour limit.',
     killed: 'An admin ended this session.',
   }

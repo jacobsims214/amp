@@ -100,7 +100,7 @@ describe('Sessions page', () => {
     expect(within(box).getByText('openai/gpt-5.5')).toBeInTheDocument()
     expect(within(box).getByRole('link', { name: '#2389 Sessions list' })).toHaveAttribute('href', '/project/158/board?task=2389')
     expect(within(box).getByText('Chrome on Pixel 9')).toBeInTheDocument()
-    expect(within(box).getByText(/in 27d|in 648h/)).toBeInTheDocument() // the device's pin expiry
+    expect(within(box).getByText(/in 27 days|in 28 days/)).toBeInTheDocument() // the device's pin expiry
     expect(within(box).getByText('Paired device').closest('div')).toHaveAttribute('title', expect.stringMatching(/^Chrome on Pixel 9: paired .*, trusted until /))
   })
 
@@ -113,7 +113,7 @@ describe('Sessions page', () => {
     expect(screen.getByText('1 in the last 7 days')).toBeInTheDocument()
     expect(within(row).getByText('old-laptop')).toBeInTheDocument()
     expect(within(row).getByText(/Ended · Idle timeout/)).toBeInTheDocument()
-    expect(within(row).getByText(/ended after 30 minutes without remote activity/)).toBeInTheDocument()
+    expect(within(row).getByText(/ended after its idle time without remote activity/)).toBeInTheDocument()
     expect(within(row).getByText('Ended', { selector: 'dt' }).nextSibling).toHaveTextContent('1d ago')
     expect(within(row).getByText('anthropic/claude-opus-5-5')).toBeInTheDocument()
     expect(within(row).getByRole('link', { name: '#77' })).toBeInTheDocument() // a ticket AMP has no name for
@@ -179,5 +179,7 @@ describe('Sessions page', () => {
     expect(inTime(now + (4 * 60 + 5) * 60_000, now)).toBe('in 4h 05m')
     expect(inTime(now, now)).toBe('now')
     expect(inTime(now + 6 * 3_600_000 + 59.7 * 60_000, now)).toBe('in 7h 00m')
+    expect(inTime(now + 30 * 86_400_000 - 9 * 60_000, now)).toBe('in 30 days')
+    expect(inTime(now + 47 * 3_600_000, now)).toBe('in 47h 00m')
   })
 })

@@ -50,8 +50,8 @@ pub use health::Health;
 #[cfg(unix)]
 pub use http::build_unix_socket_http_client;
 pub use http::{
-    DEFAULT_OAUTH_REQUEST_TIMEOUT, OAUTH_CONNECT_TIMEOUT, build_http_client,
-    build_oauth_http_client, load_ca_file,
+    DEFAULT_OAUTH_REQUEST_TIMEOUT, KEEPALIVE_IDLE, OAUTH_CONNECT_TIMEOUT, build_http_client,
+    build_keepalive_http_client, build_oauth_http_client, load_ca_file,
 };
 pub use keychain::{
     ENV_KEYCHAIN_PROMPTS, ENV_KEYCHAIN_TRACE, KEYCHAIN_REPAIR_HINT, KeychainError,

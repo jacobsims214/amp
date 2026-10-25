@@ -175,9 +175,12 @@ impl std::fmt::Debug for RelayClient {
 }
 
 impl RelayClient {
-    /// `base` is the AMP server's origin (`https://amp.example`); `ca_file` as for MCP.
+    /// `base` is the AMP server's origin (`https://amp.example`); `ca_file` as for MCP. The client
+    /// keeps its connections open (#2380): the link posts an event batch about every 100 ms while
+    /// a reply streams, and a new connection per batch cost a DNS lookup and TLS handshake each
+    /// time (5 s a batch on a Mac resolving `amp.local`).
     pub fn new(base: &str, ca_file: Option<&Path>) -> Result<Self, String> {
-        let http = amp_mcp::build_http_client(ca_file).map_err(|e| e.to_string())?;
+        let http = amp_mcp::build_keepalive_http_client(ca_file).map_err(|e| e.to_string())?;
         Ok(Self {
             http,
             base: base.trim_end_matches('/').to_owned(),

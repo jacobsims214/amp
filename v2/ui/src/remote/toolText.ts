@@ -392,10 +392,11 @@ export function ago(ms: number, now = Date.now()): string {
   return `${Math.round(d / 86_400_000)}d ago`
 }
 
-/** `in 4h 10m`, `in 25m`, `now`. */
+/** `in 4h 10m`, `in 25m`, `now`; from 2 days on, `in 30 days` (a device's 30-day pin, #2380). */
 export function inTime(ms: number, now = Date.now()): string {
   const d = ms - now
   if (d <= 60_000) return 'now'
+  if (d >= 2 * 86_400_000) return `in ${Math.round(d / 86_400_000)} days`
   const mins = Math.round(d / 60_000)
   const h = Math.floor(mins / 60)
   const m = mins % 60
