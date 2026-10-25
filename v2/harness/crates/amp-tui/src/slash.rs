@@ -163,6 +163,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         "the AMP servers; switch to another",
     ),
     CommandSpec::new(
+        Group::Amp,
+        "remote",
+        "[on|off|pair]",
+        "chat from AMP on a phone; /remote devices too",
+    ),
+    CommandSpec::new(
         Group::Config,
         "model",
         "[p/m|roles|role]",

@@ -1136,6 +1136,9 @@ pub struct UserBlock {
     inner: Mutex<(u64, BgBox)>,
     /// A blank row above the bubble, when what comes before it doesn't end with one (#2188).
     margin_above: bool,
+    /// A line above the bubble saying where the prompt came from (`[remote: Safari on
+    /// iPhone]`, #2376).
+    tag: Option<String>,
 }
 
 fn user_box(text: &str) -> BgBox {
@@ -1170,12 +1173,19 @@ impl UserBlock {
             text,
             inner,
             margin_above: false,
+            tag: None,
         }
     }
 
     /// Puts a blank row above the bubble (see [`crate::view::ChatView::add_user`]).
     pub fn with_margin_above(mut self, margin: bool) -> Self {
         self.margin_above = margin;
+        self
+    }
+
+    /// A tag line above the bubble (`[remote: <device>]`, #2376), control characters dropped.
+    pub fn with_tag(mut self, tag: Option<String>) -> Self {
+        self.tag = tag.map(|t| verbatim(&t).replace('\n', " "));
         self
     }
 }
@@ -1191,6 +1201,12 @@ impl Component for UserBlock {
             *inner = (revision, user_box(&self.text));
         }
         let mut lines = inner.1.render(width);
+        if let Some(tag) = &self.tag
+            && !lines.is_empty()
+        {
+            let tag = crate::chrome::shorten(tag, width);
+            lines.insert(0, theme().colors.accent.fg(&tag));
+        }
         if self.margin_above && !lines.is_empty() {
             lines.insert(0, String::new());
         }

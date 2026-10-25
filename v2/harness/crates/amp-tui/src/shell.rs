@@ -154,6 +154,15 @@ enum ShellMsg {
     },
     /// A remote link's call (#2373): start a prompt or stop the run. Not counted in `in_flight`.
     Remote(crate::remote::RemoteCall),
+    /// A `/remote` command's call finished (#2376).
+    RemoteDone(RemoteReply),
+}
+
+/// What a `/remote` command's call returned (#2376).
+enum RemoteReply {
+    Enabled(Result<amp_core::remote::Enabled, amp_core::remote::RemoteError>),
+    Disabled,
+    Pair(Result<(String, i64), String>),
 }
 
 /// Carries the remote link's calls to the shell (#2373).
@@ -599,6 +608,8 @@ pub struct Shell {
     fed_workers: Option<amp_core::chat_event::ChatEvent>,
     /// The status the remote link reports (#2373), refreshed on every poll once it exists.
     remote_status: Option<Arc<std::sync::Mutex<amp_core::remote::HostStatus>>>,
+    /// `/remote` (#2376), once the caller gave the chat its remote link.
+    remote: Option<crate::remote_ui::RemoteUi>,
 }
 
 impl Shell {
@@ -664,6 +675,7 @@ impl Shell {
                 run_id: None,
                 fed_workers: None,
                 remote_status: None,
+                remote: None,
             },
             done_rx,
         )
@@ -697,7 +709,14 @@ impl Shell {
         if text.is_empty() || self.running || self.switching {
             return false;
         }
-        self.view.add_user(text);
+        // #2376: a prompt from a paired device says so above its bubble.
+        let tag = match &origin {
+            amp_core::chat_event::PromptOrigin::Remote { device_name, .. } => {
+                Some(format!("[remote: {device_name}]"))
+            }
+            amp_core::chat_event::PromptOrigin::Local => None,
+        };
+        self.view.add_user_tagged(text, tag);
         self.start_run_as(text.to_owned(), origin, prompt_id);
         true
     }
@@ -781,6 +800,320 @@ impl Shell {
         self.refresh_remote_status();
     }
 
+    /// Gives the chat its remote link for `/remote` (#2376), or why remote control can't be used
+    /// from here (`/remote` says so). `warning`: shown each time it is turned on (the loopback dev
+    /// override). Without a call, `/remote` says it isn't available in this session.
+    pub fn set_remote(
+        &mut self,
+        link: Result<amp_core::remote::RemoteLink, String>,
+        warning: Option<String>,
+    ) {
+        self.remote = Some(crate::remote_ui::RemoteUi::new(link, warning));
+    }
+
+    /// A pairing question is waiting for its local `y`/`N` (#2376).
+    pub fn pairing_pending(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| r.pending.is_some())
+    }
+
+    /// Answers the pairing question (#2376): `allow` only from a `y` typed on this keyboard.
+    pub fn answer_pairing(&mut self, allow: bool) {
+        let Some(prompt) = self.remote.as_mut().and_then(|r| r.pending.take()) else {
+            return;
+        };
+        let name = prompt.device_name.clone();
+        let delivered = prompt.answer.send(allow).is_ok();
+        let line = match (allow, delivered) {
+            (true, true) => format!(
+                "Allowed \"{name}\": it can now send prompts and Stop to this chat. /remote \
+                 devices lists paired devices and revokes them."
+            ),
+            (true, false) => {
+                format!("Too late: the pairing request from \"{name}\" had already ended.")
+            }
+            (false, _) => format!("Refused \"{name}\": it was not paired."),
+        };
+        self.view.add_notice(&line);
+    }
+
+    /// The screen's size for the QR code: the last one seen, else the terminal's, else 80x24.
+    fn screen_size(&self) -> (usize, usize) {
+        self.screen
+            .or_else(|| {
+                crossterm::terminal::size()
+                    .ok()
+                    .map(|(w, h)| (usize::from(w), usize::from(h)))
+            })
+            .unwrap_or((80, 24))
+    }
+
+    /// `/remote [on|off|pair|devices [revoke <n|all>]|status]` (#2376).
+    fn remote_command(&mut self, arg: &str) {
+        const USAGE: &str = "/remote: use /remote (turn it on), /remote off, /remote pair, \
+                             /remote devices, /remote devices revoke <n|all>";
+        let Some(ui) = &self.remote else {
+            self.view.add_notice(
+                "/remote: not available in this session (remote control needs the interactive \
+                 chat in a terminal)",
+            );
+            return;
+        };
+        let link = match &ui.link {
+            Ok(link) => link.clone(),
+            Err(why) => {
+                self.view.add_error(&format!("/remote: {why}"));
+                return;
+            }
+        };
+        let busy = ui.busy;
+        let warning = ui.warning.clone();
+        let mut words = arg.split_whitespace();
+        let verb = words.next().unwrap_or("on");
+        let rest: Vec<&str> = words.collect();
+        let now = amp_core::remote::relay::now_ms();
+        if busy && matches!(verb, "on" | "off" | "pair") {
+            self.view
+                .add_notice("/remote: still working on the last /remote; try again in a moment");
+            return;
+        }
+        match (verb, rest.as_slice()) {
+            ("on", []) if link.is_on() => self.remote_status(&link, now),
+            ("on", []) => {
+                if let Some(w) = warning {
+                    self.view.add_warning(&w);
+                }
+                self.view
+                    .add_notice("Turning remote control on: registering this chat with AMP...");
+                self.remote_job(async move { RemoteReply::Enabled(link.enable().await) });
+            }
+            ("status", []) => self.remote_status(&link, now),
+            ("off", []) if !link.is_on() => self.view.add_notice("Remote control is already off."),
+            ("off", []) => {
+                self.remote_job(async move {
+                    link.disable().await;
+                    RemoteReply::Disabled
+                });
+            }
+            ("pair", []) if !link.is_on() => self
+                .view
+                .add_notice("/remote pair: remote control is off; /remote turns it on first."),
+            ("pair", []) => {
+                self.remote_job(async move { RemoteReply::Pair(link.new_pairing_link().await) });
+            }
+            ("devices", []) => match link.devices() {
+                Ok(devices) => {
+                    let devices = crate::remote_ui::sorted(&devices);
+                    for line in crate::remote_ui::device_lines(&devices, now) {
+                        self.view.add_notice(&line);
+                    }
+                }
+                Err(e) => self.view.add_error(&format!("/remote devices: {e}")),
+            },
+            ("devices", ["revoke", which]) | ("revoke", [which]) => {
+                self.remote_revoke(&link, which)
+            }
+            ("devices", ["revoke"]) | ("revoke", []) => self.view.add_notice(
+                "/remote devices revoke: which one? A number from /remote devices, or all",
+            ),
+            _ => self.view.add_notice(USAGE),
+        }
+    }
+
+    /// Runs one `/remote` call in the background; [`Shell::poll`] applies its reply.
+    fn remote_job(&mut self, job: impl Future<Output = RemoteReply> + Send + 'static) {
+        if let Some(ui) = &mut self.remote {
+            ui.busy = true;
+        }
+        self.in_flight += 1;
+        let tx = self.msgs_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(ShellMsg::RemoteDone(job.await));
+        });
+    }
+
+    /// `/remote devices revoke <n|id|all>`: unpins on this laptop (the device must pair again).
+    fn remote_revoke(&mut self, link: &amp_core::remote::RemoteLink, which: &str) {
+        if which == "all" {
+            match link.unpin_all() {
+                Ok(0) => self.view.add_notice("No paired devices to revoke."),
+                Ok(n) => self.view.add_notice(&format!(
+                    "Revoked all {n} paired device{}: each must pair again (/remote pair).",
+                    if n == 1 { "" } else { "s" }
+                )),
+                Err(e) => self.view.add_error(&format!("/remote devices revoke: {e}")),
+            }
+            return;
+        }
+        let devices = match link.devices() {
+            Ok(d) => crate::remote_ui::sorted(&d),
+            Err(e) => {
+                self.view.add_error(&format!("/remote devices revoke: {e}"));
+                return;
+            }
+        };
+        let pin = match crate::remote_ui::pick(&devices, which) {
+            Ok(pin) => pin.clone(),
+            Err(e) => {
+                self.view
+                    .add_notice(&format!("/remote devices revoke: {e}"));
+                return;
+            }
+        };
+        match link.unpin(&pin.device_id) {
+            Ok(_) => self.view.add_notice(&format!(
+                "Revoked \"{}\": its commands are refused from now on; it must pair again.",
+                pin.name
+            )),
+            Err(e) => self.view.add_error(&format!("/remote devices revoke: {e}")),
+        }
+    }
+
+    /// `/remote` while it is on: who is watching, until when, and the open pairing link.
+    fn remote_status(&mut self, link: &amp_core::remote::RemoteLink, now: i64) {
+        use crate::remote_ui::{clock, span};
+        let amp_core::remote::RemoteState::On(on) = link.current() else {
+            self.view
+                .add_notice("Remote control is starting; /remote again shows its state.");
+            return;
+        };
+        let connection = if on.online {
+            "connected"
+        } else {
+            "offline, reconnecting"
+        };
+        self.view.add_notice(&format!(
+            "Remote control is on ({connection}): {} device{} watching, {} paired. It turns off \
+             at {} or after {} without remote activity (now at {}). /remote off ends it.",
+            on.viewers,
+            if on.viewers == 1 { "" } else { "s" },
+            on.devices,
+            clock(on.expires_at_ms, now),
+            span(on.idle_deadline_ms - now),
+            clock(on.idle_deadline_ms, now),
+        ));
+        match (on.link, on.link_expires_at_ms) {
+            (Some(url), Some(until)) if until > now => self.show_pairing_link(&url, until, now),
+            _ => self
+                .view
+                .add_notice("No pairing link is open: /remote pair makes one."),
+        }
+    }
+
+    /// The pairing link, its QR code when the window has room, and how long it works.
+    fn show_pairing_link(&mut self, url: &str, until_ms: i64, now: i64) {
+        use crate::remote_ui::{QrBlock, clock, qr_fits, qr_size, span};
+        self.view.add_notice(&format!(
+            "Pair a phone or another computer: open this link there, signed in to AMP as you, \
+             then check the code and answer y here. It works once, for {} (until {}).",
+            span(until_ms - now),
+            clock(until_ms, now)
+        ));
+        self.view
+            .add_to_transcript(Arc::new(crate::remote_ui::LinkBlock::new(url)));
+        let (w, h) = self.screen_size();
+        if qr_fits(url, w, h)
+            && let Some(qr) = QrBlock::new(url)
+        {
+            self.view.add_to_transcript(Arc::new(qr));
+        } else if let Some((cols, rows)) = qr_size(url) {
+            self.view.add_notice(&format!(
+                "(No QR code: it needs a window of about {}x{}; this one is {w}x{h}. Use the link.)",
+                cols + 4,
+                rows + 12
+            ));
+        }
+    }
+
+    /// Applies a `/remote` call's reply.
+    fn remote_done(&mut self, reply: RemoteReply) {
+        use crate::remote_ui::{clock, span};
+        if let Some(ui) = &mut self.remote {
+            ui.busy = false;
+        }
+        let now = amp_core::remote::relay::now_ms();
+        match reply {
+            RemoteReply::Enabled(Ok(on)) => {
+                let feed = self.view.feed();
+                if let Some(ui) = &mut self.remote {
+                    ui.watch_queue(feed.as_ref());
+                }
+                let idle = match self.remote.as_ref().map(|r| r.current()) {
+                    Some(amp_core::remote::RemoteState::On(s)) => {
+                        format!(
+                            ", or after {} without remote activity",
+                            span(s.idle_deadline_ms - now)
+                        )
+                    }
+                    _ => String::new(),
+                };
+                self.view.add_notice(&format!(
+                    "Remote control is on until {} ({}){idle}. /remote off ends it; this laptop's \
+                     key is {}.",
+                    clock(on.expires_at_ms, now),
+                    span(on.expires_at_ms - now),
+                    on.fingerprint
+                ));
+                self.show_pairing_link(&on.link, on.link_expires_at_ms, now);
+            }
+            RemoteReply::Enabled(Err(e)) => self.view.add_error(&format!("/remote: {}", e.message)),
+            // The link says "Remote control is off." itself.
+            RemoteReply::Disabled => {}
+            RemoteReply::Pair(Ok((url, until))) => self.show_pairing_link(&url, until, now),
+            RemoteReply::Pair(Err(e)) => self.view.add_error(&format!("/remote pair: {e}")),
+        }
+    }
+
+    /// The link's news since the last poll (#2376): notices, the pairing question, the badge
+    /// and queued remote prompts. Returns whether anything changed.
+    fn poll_remote(&mut self) -> bool {
+        let Some(ui) = &mut self.remote else {
+            return false;
+        };
+        let link = ui.link.as_ref().ok().cloned();
+        let devices = move || {
+            link.as_ref()
+                .and_then(|l| l.devices().ok())
+                .unwrap_or_default()
+        };
+        let now = amp_core::remote::relay::now_ms();
+        let events = ui.drain(now, &devices);
+        let changed = !events.is_empty();
+        for event in events {
+            match event {
+                crate::remote_ui::UiEvent::Line(level, text) => match level {
+                    amp_core::chat_event::NoticeLevel::Info => self.view.add_notice(&text),
+                    amp_core::chat_event::NoticeLevel::Warn => self.view.add_warning(&text),
+                    amp_core::chat_event::NoticeLevel::Error => self.view.add_error(&text),
+                },
+                crate::remote_ui::UiEvent::Pairing => self.show_pairing_question(now),
+                crate::remote_ui::UiEvent::Badge(badge) => self.view.footer().set_badge(badge),
+            }
+        }
+        changed
+    }
+
+    /// The pairing question, on this terminal only.
+    fn show_pairing_question(&mut self, now: i64) {
+        let Some(p) = self.remote.as_ref().and_then(|r| r.pending.as_ref()) else {
+            return;
+        };
+        let question = p.question();
+        let mut hint = format!(
+            "Press y to allow it, any other key to refuse. Only this keyboard can answer; with no \
+             answer by {} it is refused.",
+            crate::remote_ui::clock(p.expires_at_ms, now)
+        );
+        if !p.user_agent.is_empty() {
+            hint.push_str(&format!(
+                " Browser: {}",
+                crate::chrome::shorten(&p.user_agent, 60)
+            ));
+        }
+        self.view.add_local_line(&question, true);
+        self.view.add_local_line(&hint, false);
+        self.view.scroll().to_end();
+    }
+
     pub fn view(&self) -> &ChatView {
         &self.view
     }
@@ -800,6 +1133,7 @@ impl Shell {
     pub fn input_focused(&self) -> bool {
         if self.secret.is_some()
             || self.stop_confirm.is_some()
+            || self.pairing_pending()
             || self.viewing.is_some()
             || self.view.strip().is_focused()
         {
@@ -1746,6 +2080,15 @@ impl Shell {
     /// doesn't stop it: the spinner line says [`ESC_HINT`] for [`ESC_HINT_FOR`], naming this
     /// chat's live workers ([`esc_hint`]), and the next Esc stops the reply (#2181, #2354).
     pub async fn key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
+        // #2376: a pairing question takes the next key: `y` allows, anything else refuses.
+        if self.pairing_pending() {
+            let plain = !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+            let allow = plain && matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y'));
+            self.answer_pairing(allow);
+            return true;
+        }
         // #2252: a stop waiting for its answer takes the next key; a worker's session takes
         // every key while it is shown (the editor is hidden).
         if self.stop_confirm.is_some() {
@@ -2009,6 +2352,7 @@ impl Shell {
             "open" => self.open_command(arg),
             "server" => self.server_command(arg),
             "reload" => self.reload_command(ReloadCause::Command),
+            "remote" => self.remote_command(arg),
             "close" => self.view.panel().close(),
             "" => self.view.add_notice("empty command (try /help)"),
             other => self
@@ -2413,7 +2757,11 @@ impl Shell {
         if self.secret_key(&key) {
             return Ok(true);
         }
-        if self.stop_confirm.is_some() || self.viewing.is_some() || self.view.strip().is_focused() {
+        if self.stop_confirm.is_some()
+            || self.pairing_pending()
+            || self.viewing.is_some()
+            || self.view.strip().is_focused()
+        {
             return Ok(self.key(&key, true).await);
         }
         let used = self.panel_key(&key, true);
@@ -2470,6 +2818,7 @@ impl Shell {
     /// Returns whether anything changed. The terminal loop calls it on its tick.
     pub fn poll(&mut self) -> bool {
         let mut changed = self.expire_hints(Instant::now());
+        changed |= self.poll_remote();
         changed |= self.build_roster();
         changed |= self.pump_sessions();
         while let Ok(msg) = self.msgs_rx.try_recv() {
@@ -2541,6 +2890,7 @@ impl Shell {
                     }
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
+                ShellMsg::RemoteDone(reply) => self.remote_done(reply),
                 ShellMsg::Notice { .. } | ShellMsg::ReloadRequest | ShellMsg::Remote(_) => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {

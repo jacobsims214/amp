@@ -691,8 +691,16 @@ impl ChatView {
     /// end with one already) and from the reply after it ([`Self::start_assistant`] gives the
     /// reply a gap), so the first message and later ones look the same (#2188).
     pub fn add_user(&self, text: &str) {
+        self.add_user_tagged(text, None);
+    }
+
+    /// [`Self::add_user`] with a tag line above the bubble: `[remote: Safari on iPhone]` for a
+    /// prompt sent from a paired device (#2376).
+    pub fn add_user_tagged(&self, text: &str, tag: Option<String>) {
         self.end_group();
-        let block = UserBlock::new(text).with_margin_above(!self.transcript_ends_blank());
+        let block = UserBlock::new(text)
+            .with_tag(tag)
+            .with_margin_above(!self.transcript_ends_blank());
         self.transcript.add_child(Arc::new(block));
         self.scroll.to_end();
     }
@@ -730,6 +738,14 @@ impl ChatView {
     pub fn add_warning(&self, text: &str) {
         self.add_line(text, theme().colors.warning);
         self.feed_notice(NoticeLevel::Warn, None, text);
+    }
+
+    /// A line for this terminal only (#2376): never sent to the manager feed, so remote viewers
+    /// don't get it (the pairing question and its hint). `warn` draws it as a warning, else
+    /// dim.
+    pub fn add_local_line(&self, text: &str, warn: bool) {
+        let c = theme().colors;
+        self.add_line(text, if warn { c.warning } else { c.dim });
     }
 
     /// An error line in the transcript.
