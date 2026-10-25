@@ -27,7 +27,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
       - name: chart dependencies
-        run: helm dependency build v2/deploy/helm/amp
+        run: |
+          helm repo add valkey https://valkey.io/valkey-helm/
+          helm dependency build v2/deploy/helm/amp
       - name: PyYAML
         run: python3 -m pip install --user pyyaml
       - name: relay on/off template tests + envoy validate
