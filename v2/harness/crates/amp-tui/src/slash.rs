@@ -222,7 +222,7 @@ pub const KEYS: &[(&str, &str)] = &[
     ("\\ Enter", "new line: Enter right after a \\"),
     ("↑/↓", "earlier prompts (empty or one-line editor)"),
     ("/", "commands: ↑↓ choose, Tab complete, Enter run"),
-    ("Esc", "stop the reply, or close a panel or the menu"),
+    ("Esc", "stop the reply, or close a panel or session"),
     ("Ctrl+C", "stop the reply, clear the editor; twice quits"),
     ("Ctrl+D", "quit (empty editor, at the latest output)"),
     ("Ctrl+T", "open or close the thinking in sight, or click it"),
