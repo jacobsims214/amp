@@ -2,7 +2,8 @@ name: Test amp-api
 
 # Runs vet + the full amp-api test suite (unit, MCP transport over real HTTP
 # in both protocol eras, OAuth broker, and the Postgres- and Typesense-backed
-# integration tests; Valkey for the queued KB write path) on every PR and on main. The e2e suite in test/e2e needs a deployed
+# integration tests; Valkey for the queued KB write path) on every PR and on main and the
+# milestone integration branches (harness-m*, remote-m*). The e2e suite in test/e2e needs a deployed
 # stack and is run manually — see v2/docs/deploy-architecture.md.
 
 on:
@@ -11,7 +12,7 @@ on:
       - "v2/amp-api/**"
       - ".github/workflows/test.yml"
   push:
-    branches: [main]
+    branches: [main, "harness-m*", "remote-m*"]
     paths:
       - "v2/amp-api/**"
       - ".github/workflows/test.yml"
@@ -67,6 +68,8 @@ jobs:
           cache-dependency-path: v2/amp-api/go.sum
       - name: wait for typesense
         run: timeout 60 bash -c 'until curl -sf localhost:8108/health | grep -q "\"ok\":true"; do sleep 1; done'
+      - name: go build
+        run: go build ./...
       - name: go vet
         run: go vet ./... && go vet -tags e2e ./test/e2e/
       - name: go test (race)

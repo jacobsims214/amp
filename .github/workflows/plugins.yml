@@ -22,7 +22,7 @@ on:
       - "v2/plugins/**"
       - ".github/workflows/plugins.yml"
   push:
-    branches: [main]
+    branches: [main, "harness-m*", "remote-m*"]
     paths:
       - "v2/.opencode/**"
       - "v2/opencode.json"

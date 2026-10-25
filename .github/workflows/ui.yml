@@ -1,0 +1,42 @@
+name: UI
+
+# Lint (eslint) and production build (tsc -b && vite build) for the web UI in v2/ui, on every PR
+# touching it and on pushes to main and the milestone integration branches (harness-m*, remote-m*).
+# v2/ui has no unit-test script yet; when one is added, add an `npm test` step here.
+
+on:
+  pull_request:
+    paths:
+      - "v2/ui/**"
+      - ".github/workflows/ui.yml"
+  push:
+    branches: [main, "harness-m*", "remote-m*"]
+    paths:
+      - "v2/ui/**"
+      - ".github/workflows/ui.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2/ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: v2/ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: lint
+        run: npm run lint
+      - name: build
+        run: npm run build

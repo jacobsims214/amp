@@ -16,7 +16,7 @@ on:
       - "v2/scripts/lib/harness_overrides.yaml"
       - ".github/workflows/harness.yml"
   push:
-    branches: [main, "harness-m*"]
+    branches: [main, "harness-m*", "remote-m*"]
     paths:
       - "v2/harness/**"
       - "v2/.opencode/**"

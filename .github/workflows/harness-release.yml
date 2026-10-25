@@ -13,7 +13,7 @@ name: Harness release
 on:
   push:
     tags: ["harness-v*"]
-    branches: [main, "harness-m*"]
+    branches: [main, "harness-m*", "remote-m*"]
     paths:
       - "v2/harness/install.sh"
       - "v2/harness/scripts/package.sh"
