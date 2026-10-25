@@ -41,6 +41,7 @@ type stream struct {
 	ch   chan frame
 	done chan struct{}
 	once sync.Once
+	want int64 // a viewer's: the seq it asked to resume from (0: none)
 }
 
 func newStream(n int) *stream { return &stream{ch: make(chan frame, n), done: make(chan struct{})} }
@@ -138,8 +139,7 @@ type Live struct {
 	attaches *bucket                // 20/min
 	refused  map[string]time.Time   // the last remote.refused audit per code
 
-	tokenHashes []string // connect tokens minted here, for the 410 after the end
-	ended       bool
+	ended bool
 }
 
 func newLive(sess *domain.RemoteSession) *Live {
@@ -255,6 +255,28 @@ func (l *Live) end(reason string) {
 		l.harness = nil
 	}
 	l.broadcast(relayFrame(map[string]any{"type": "ended", "reason": reason}))
+	for v := range l.viewers {
+		v.close()
+	}
+	l.viewers = map[*stream]struct{}{}
+	l.ring, l.ringBytes, l.hello, l.status = nil, 0, nil, nil
+	l.pending = map[string]pendingPair{}
+}
+
+// release forgets the session here without ending it (another replica took
+// it over): the streams close with no end frame, so the harness and the
+// viewers reconnect and are passed to the new holder.
+func (l *Live) release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.ended {
+		return
+	}
+	l.ended = true
+	if l.harness != nil {
+		l.harness.close()
+		l.harness = nil
+	}
 	for v := range l.viewers {
 		v.close()
 	}

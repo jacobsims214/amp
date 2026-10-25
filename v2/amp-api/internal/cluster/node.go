@@ -112,6 +112,10 @@ func (n *Node) ID() string { return n.opts.ID }
 // Addr is where other replicas reach this one.
 func (n *Node) Addr() string { return n.opts.Addr }
 
+// TTL is how long after its last heartbeat this replica's work may be taken
+// over by another.
+func (n *Node) TTL() time.Duration { return n.opts.TTL }
+
 // Token authenticates calls between replicas.
 func (n *Node) Token() string { return n.token }
 

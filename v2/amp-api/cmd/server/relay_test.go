@@ -69,11 +69,18 @@ func newRelayEnv(t *testing.T, tune func(*relay.Config)) *relayEnv {
 	t.Helper()
 	w := newRBACWorld(t)
 	enableOrg(t, w.s.repo, w.org.ID, true)
+	return newRelayEnvIn(t, w, &testClock{at: time.Now()}, tune)
+}
+
+// newRelayEnvIn is newRelayEnv on an existing world and clock: several
+// relays (replicas) can share them.
+func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*relay.Config)) *relayEnv {
+	t.Helper()
 	agent := *w.alice
 	agentUser := *w.alice.User
 	agentUser.Kind = domain.UserKindAgent
 	agent.User = &agentUser
-	e := &relayEnv{w: w, clock: &testClock{at: time.Now()}, ids: map[string]*auth.Identity{
+	e := &relayEnv{w: w, clock: clock, ids: map[string]*auth.Identity{
 		"alice": w.alice, "bob": w.bob, "owner": w.owner, "outsider": w.outsider, "root": w.root, "agent": &agent,
 		"orgadmin": w.orgadmin,
 	}}

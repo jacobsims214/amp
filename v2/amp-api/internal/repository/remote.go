@@ -186,7 +186,8 @@ func (r *Repo) TouchRemoteActivity(ctx context.Context, id string) (bool, error)
 }
 
 // EndRemoteSession ends an active session with reason and returns it; nil
-// (and no error) when it had already ended. The connect token stops working.
+// (and no error) when it had already ended. The connect token stops working
+// (calls with it get 410).
 func (r *Repo) EndRemoteSession(ctx context.Context, id, reason string) (*domain.RemoteSession, error) {
 	ended, err := r.endRemoteSessions(ctx, `id = $2`, reason, id)
 	if err != nil || len(ended) == 0 {
@@ -225,15 +226,99 @@ func (r *Repo) EndExpiredRemoteSessions(ctx context.Context, now time.Time, grac
 }
 
 // endRemoteSessions ends the active sessions matching where ($2.. are args)
-// and returns them as they are now.
+// and returns them as they are now. The connect token's hash is kept (the
+// token itself is useless once the session ended), so a harness call with it
+// gets 410 session_ended with the reason on every replica, not a 401.
 func (r *Repo) endRemoteSessions(ctx context.Context, where, reason string, args ...any) ([]domain.RemoteSession, error) {
-	rows, err := r.db.Query(ctx, `UPDATE remote_sessions SET state = 'ended', end_reason = $1, ended_at = NOW(),
-		connect_token_hash = NULL, connect_token_expires_at = NULL
+	rows, err := r.db.Query(ctx, `UPDATE remote_sessions SET state = 'ended', end_reason = $1, ended_at = NOW()
 		WHERE state = 'active' AND `+where+` RETURNING `+remoteSessionCols, append([]any{reason}, args...)...)
 	if err != nil {
 		return nil, fmt.Errorf("end remote sessions: %w", err)
 	}
 	return collect(rows, scanRemoteSession)
+}
+
+// ---- Which replica holds a session (multi-replica relay, #2377) ----
+
+// RemoteHolder is the replica that holds a session's live state (its
+// harness stream, viewers, buffer and limits).
+type RemoteHolder struct {
+	NodeID string // "" when the session has no holder
+	Addr   string // the holder's internal listener
+	Alive  bool   // the holder heartbeated within the TTL
+	Active bool   // the session hasn't ended
+}
+
+// RemoteSessionHolder reports who holds session id, judging the holder alive
+// when its api_nodes heartbeat is within ttl (by the database clock, as
+// ClaimProject does).
+func (r *Repo) RemoteSessionHolder(ctx context.Context, id string, ttl time.Duration) (RemoteHolder, error) {
+	var h RemoteHolder
+	var node, addr *string
+	var alive *bool
+	var state string
+	err := r.db.QueryRow(ctx, `SELECT s.state, s.holder_node, n.addr, n.heartbeat_at > NOW() - $2::float8 * interval '1 second'
+		FROM remote_sessions s LEFT JOIN api_nodes n ON n.id = s.holder_node WHERE s.id = $1`, id, ttl.Seconds()).
+		Scan(&state, &node, &addr, &alive)
+	if err == pgx.ErrNoRows {
+		return h, fmt.Errorf("remote session: %w", ErrNotFound)
+	}
+	if err != nil {
+		return h, err
+	}
+	h.Active = state == domain.RemoteSessionActive
+	if node != nil {
+		h.NodeID = *node
+	}
+	if addr != nil {
+		h.Addr = *addr
+	}
+	h.Alive = alive != nil && *alive
+	return h, nil
+}
+
+// TakeRemoteSession makes node the holder of active session id unless a
+// replica that heartbeated within ttl already holds it. It reports whether
+// node holds it now.
+func (r *Repo) TakeRemoteSession(ctx context.Context, id, node string, ttl time.Duration) (bool, error) {
+	tag, err := r.db.Exec(ctx, `UPDATE remote_sessions s SET holder_node = $2
+		WHERE s.id = $1 AND s.state = 'active' AND (s.holder_node IS NULL OR s.holder_node = $2 OR NOT EXISTS (
+			SELECT 1 FROM api_nodes n WHERE n.id = s.holder_node AND n.heartbeat_at > NOW() - $3::float8 * interval '1 second'))`,
+		id, node, ttl.Seconds())
+	return tag.RowsAffected() > 0, err
+}
+
+// NodeAddr is a replica's internal address, and whether it heartbeated
+// within ttl. An unknown node is not alive.
+func (r *Repo) NodeAddr(ctx context.Context, node string, ttl time.Duration) (string, bool, error) {
+	var addr string
+	var alive bool
+	err := r.db.QueryRow(ctx, `SELECT addr, heartbeat_at > NOW() - $2::float8 * interval '1 second' FROM api_nodes WHERE id = $1`,
+		node, ttl.Seconds()).Scan(&addr, &alive)
+	if err == pgx.ErrNoRows {
+		return "", false, nil
+	}
+	return addr, alive, err
+}
+
+// RemoteSessionsByID returns the sessions with these ids, active or ended.
+func (r *Repo) RemoteSessionsByID(ctx context.Context, ids []string) ([]domain.RemoteSession, error) {
+	rows, err := r.db.Query(ctx, `SELECT `+remoteSessionCols+` FROM remote_sessions WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	return collect(rows, scanRemoteSession)
+}
+
+// RecentRemoteRegistrations counts ownerUserID's sessions started within
+// window (on any replica) and how long until the oldest of them leaves it.
+func (r *Repo) RecentRemoteRegistrations(ctx context.Context, ownerUserID int, window time.Duration) (int, time.Duration, error) {
+	var n int
+	var wait float64
+	err := r.db.QueryRow(ctx, `SELECT COUNT(*), COALESCE(EXTRACT(EPOCH FROM MIN(started_at) + $2::float8 * interval '1 second' - NOW()), 0)
+		FROM remote_sessions WHERE owner_user_id = $1 AND started_at > NOW() - $2::float8 * interval '1 second'`,
+		ownerUserID, window.Seconds()).Scan(&n, &wait)
+	return n, time.Duration(wait * float64(time.Second)), err
 }
 
 // ---- Devices ----

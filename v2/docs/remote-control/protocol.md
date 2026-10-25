@@ -817,10 +817,10 @@ The per-device `DELETE /api/sessions/devices/:device_id` and the device list are
 
 - Defaults: `enabled: false`; `idle_timeout_min` 5..240, default 30; `device_pin_days` 0..30, default 30.
 - `PUT` audits `remote.policy.set`.
-- Turning `enabled` off ends every live session in the org within seconds (reason `policy_off`). The relay
-  applies the change at once on its own replica and fans the small control message to other replicas through
-  the existing cluster event relay. That relay is fine for small control messages; it is never used for chat
-  payloads.
+- Turning `enabled` off ends every live session in the org within seconds (reason `policy_off`). The replica
+  that takes the `PUT` ends the sessions in Postgres and tells each session's holding replica with a small
+  control call on the internal `:3003` listener (section 11), which closes the streams. Chat payloads never
+  cross replicas this way, and nothing goes through Postgres NOTIFY.
 
 #### Capability flag: `GET /api/me` (additive)
 
@@ -923,13 +923,30 @@ harness sends don't count.
   the oldest first. The latest `hello` and `status` are kept outside the ring (the snapshot slot).
 - The ring lives only in the memory of the replica that holds the harness connection. It is **never** written to
   Postgres, the logs or traces, and it is dropped when the session ends.
-- **Multiple replicas.** The `remote_sessions` row names the replica that holds the command stream. A browser
-  call that lands on another replica is forwarded over the internal `:3003` listener with
-  `X-AMP-Cluster-Token`, in the same way as project actors: the stream is proxied and POSTs are forwarded. The
-  Postgres NOTIFY relay is never used for events.
-- **Failover.** If the holding replica dies, the harness reconnects to any replica, which takes ownership of the
-  session (the row's replica and heartbeat). That replica has an empty buffer: it accepts the harness's next
-  batch as the new start, and viewers get a `gap` frame.
+- **Multiple replicas.** The `remote_sessions` row names the replica that holds the session (`holder_node`):
+  the replica that registered it, until that one is gone. Every call for a session, on either leg (the
+  browser's stream, commands, pairing, disconnect; the harness's command stream, events, heartbeat, pairing
+  window, `DELETE`), is served on the holder. A call that lands on another replica is proxied over the
+  internal `:3003` listener with `X-AMP-Cluster-Token`, in the same way as project actors: SSE streams are
+  proxied as they flow, and a request is sent again only when it certainly wasn't delivered (the connection
+  failed, or the target answered that it doesn't hold the session). The Postgres NOTIFY relay is never used
+  for events.
+  - Ends started on another replica (the org switch, revoke-all, the idle/lifetime sweep) reach the holder by
+    a control call, which closes its streams; revoke-all's `device_revoked` and the presence shown by
+    `GET /api/sessions` come from the holder the same way. The holder also checks its sessions against
+    Postgres every few seconds, as a backstop.
+  - The per-session limits (prompt and op rates, viewers, attaches, pairing tries) are enforced on the holder,
+    which sees all of the session's traffic, so they hold across replicas. The registration limit is also
+    checked against the sessions started in the last minute in Postgres.
+  - After an end, every replica answers the connect token with `410` and the reason (Postgres keeps the
+    ended session's token hash).
+- **Failover.** A replica takes a session over only when the holder's cluster heartbeat is older than the
+  cluster TTL (10 s; at once after a graceful shutdown). Until the harness reconnects, the session is offline
+  there: viewers attach with `online: false` and commands get `409 harness_offline`. The harness reconnects to
+  whichever replica it reaches, which passes it to the new holder. That replica has an empty buffer: it
+  accepts the harness's next batch as the new start, and a viewer that asked to resume from an earlier seq
+  gets a `gap` frame. A replica that was judged gone and comes back releases such sessions: their streams
+  close without an `end`, and the harness and viewers reconnect to the new holder.
 - **Browser reconnect.** It reconnects with `Last-Event-ID` (`EventSource` does that itself), or with `from_seq`
   after a manual reopen. It drops duplicates by seq.
 - **Harness resync** ("replay from my own feed or JSONL" when the buffer can't cover a gap) is **M2**. In M1 a

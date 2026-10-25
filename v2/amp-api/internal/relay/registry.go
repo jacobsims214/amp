@@ -7,10 +7,10 @@ import (
 	"github.com/simstech/amp-api/internal/domain"
 )
 
-// Registry holds the live state of the sessions this replica serves. With one
-// replica (M1) every session is local: LocalRegistry. The multi-replica work
-// (#2377) keeps this interface and adds a Forwarder that sends a browser call
-// to the replica named in remote_sessions.holder_node.
+// Registry holds the live state of the sessions this replica holds
+// (remote_sessions.holder_node). LocalRegistry is the in-memory map; with
+// several replicas the Forwarder (cluster.go) makes sure only the holder
+// ever creates or uses an entry.
 type Registry interface {
 	// Get returns the session's live state on this replica, nil if none.
 	Get(id string) *Live
@@ -23,9 +23,9 @@ type Registry interface {
 	All() []*Live
 }
 
-// Forwarder serves a browser call for a session whose harness stream another
-// replica holds. It returns false when the call should be served here. M1
-// runs one replica, so the default (nil) serves everything locally.
+// Forwarder serves a call (either leg) for a session another replica holds.
+// It returns false when the call should be served here. nil serves
+// everything here (one replica); Config.Cluster installs the cluster one.
 type Forwarder interface {
 	Forward(w http.ResponseWriter, r *http.Request, sess *domain.RemoteSession) bool
 }
