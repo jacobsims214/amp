@@ -16,6 +16,8 @@ amp-core.workspace = true
 amp-mcp.workspace = true
 amp-tui.workspace = true
 clap.workspace = true
+# The remote link's host and login traits (#2373) use futures' BoxFuture.
+futures.workspace = true
 # Hidden key entry in raw mode (setup). Same version and features rpi-tui uses.
 crossterm.workspace = true
 toml.workspace = true

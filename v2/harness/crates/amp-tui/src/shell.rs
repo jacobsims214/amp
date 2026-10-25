@@ -152,6 +152,19 @@ enum ShellMsg {
         text: String,
         error: bool,
     },
+    /// A remote link's call (#2373): start a prompt or stop the run. Not counted in `in_flight`.
+    Remote(crate::remote::RemoteCall),
+}
+
+/// Carries the remote link's calls to the shell (#2373).
+#[derive(Clone)]
+pub(crate) struct RemoteSender(UnboundedSender<ShellMsg>);
+
+impl RemoteSender {
+    /// False when the shell is gone.
+    pub(crate) fn send(&self, call: crate::remote::RemoteCall) -> bool {
+        self.0.send(ShellMsg::Remote(call)).is_ok()
+    }
 }
 
 /// Puts lines in the transcript from a task the shell did not start (#2178: the chat's retry
@@ -584,6 +597,8 @@ pub struct Shell {
     run_id: Option<String>,
     /// The worker chips last sent to the manager feed (#2370).
     fed_workers: Option<amp_core::chat_event::ChatEvent>,
+    /// The status the remote link reports (#2373), refreshed on every poll once it exists.
+    remote_status: Option<Arc<std::sync::Mutex<amp_core::remote::HostStatus>>>,
 }
 
 impl Shell {
@@ -648,6 +663,7 @@ impl Shell {
                 history: PromptHistory::new(),
                 run_id: None,
                 fed_workers: None,
+                remote_status: None,
             },
             done_rx,
         )
@@ -664,13 +680,105 @@ impl Shell {
     /// Sends a prompt to the agent as a user turn, never as a slash command (#2370: the remote
     /// link's way in). False, and nothing is sent, while a run or a server switch is going on.
     pub fn send_prompt(&mut self, text: &str, origin: amp_core::chat_event::PromptOrigin) -> bool {
+        self.send_prompt_as(text, origin, None)
+    }
+
+    /// [`Shell::send_prompt`] with the prompt id the feed's `user_message` gets (#2373: the
+    /// remote link's ids, so a queued prompt keeps the id its `ack` gave it); `None`: `p_N`.
+    /// A remote prompt reaches the model tagged `[remote: <device name>]` (R-M16); the feed and
+    /// the transcript show the plain text.
+    pub fn send_prompt_as(
+        &mut self,
+        text: &str,
+        origin: amp_core::chat_event::PromptOrigin,
+        prompt_id: Option<String>,
+    ) -> bool {
         let text = text.trim();
         if text.is_empty() || self.running || self.switching {
             return false;
         }
         self.view.add_user(text);
-        self.start_run_from(text.to_owned(), origin);
+        self.start_run_as(text.to_owned(), origin, prompt_id);
         true
+    }
+
+    /// The remote link's way in (#2373): a [`amp_core::remote::RemoteHost`] whose calls this
+    /// shell applies in [`Shell::poll`].
+    pub fn remote_host(&mut self) -> Arc<dyn amp_core::remote::RemoteHost> {
+        let status = Arc::clone(
+            self.remote_status
+                .get_or_insert_with(|| Arc::new(std::sync::Mutex::new(Default::default()))),
+        );
+        self.refresh_remote_status();
+        Arc::new(crate::remote::ShellRemote::new(
+            RemoteSender(self.msgs_tx.clone()),
+            status,
+        ))
+    }
+
+    /// The status the remote link reports: model, busy, context, cost, project, ticket.
+    fn refresh_remote_status(&self) {
+        let Some(cell) = &self.remote_status else {
+            return;
+        };
+        let meta = self.meta.as_ref().map(|m| m.snapshot());
+        let window = self.info.context_window.max(1) as i64;
+        let ctx = self.totals.context_tokens;
+        let status = amp_core::remote::HostStatus {
+            model: self.info.model_ref(),
+            busy: self.running,
+            context_pct: (ctx > 0).then(|| (ctx * 100 / window).clamp(0, 100)),
+            cost_usd_micros: amp_core::chat_event::usd_micros(self.totals.usage.cost_usd),
+            project: meta.as_ref().and_then(|m| {
+                let id = m.project_id?;
+                let name = m
+                    .project
+                    .get()
+                    .filter(|p| p.id == id)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                Some((id, name))
+            }),
+            ticket_id: meta.as_ref().and_then(|m| m.ticket_id),
+            branch: self.info.git_branch.clone(),
+            workers_running: self
+                .supervisor
+                .as_ref()
+                .map_or(0, |s| s.workers().len() as i64),
+        };
+        *cell.lock().unwrap_or_else(|e| e.into_inner()) = status;
+    }
+
+    /// Applies one remote call (#2373).
+    fn remote_call(&mut self, call: crate::remote::RemoteCall) {
+        match call {
+            crate::remote::RemoteCall::Start {
+                prompt_id,
+                text,
+                origin,
+                reply,
+            } => {
+                let started = self.send_prompt_as(&text, origin, Some(prompt_id));
+                let _ = reply.send(started);
+            }
+            crate::remote::RemoteCall::Stop { reply } => {
+                // As Esc / `/abort`: the reply stops, and with it the manager's workers.
+                if self.running {
+                    let live = self.live_tickets();
+                    if !live.is_empty() {
+                        self.view.add_warning(&worker_stop_notice(&live));
+                    }
+                    self.view.set_stopping(true);
+                    self.clear_esc_hint();
+                    let harness = Arc::clone(&self.harness);
+                    tokio::spawn(async move {
+                        let _ = harness.abort().await;
+                    });
+                }
+                let _ = reply.send(());
+            }
+        }
+        self.refresh_remote_status();
     }
 
     pub fn view(&self) -> &ChatView {
@@ -1477,11 +1585,27 @@ impl Shell {
     }
 
     fn start_run_from(&mut self, prompt: String, origin: amp_core::chat_event::PromptOrigin) {
+        self.start_run_as(prompt, origin, None);
+    }
+
+    fn start_run_as(
+        &mut self,
+        prompt: String,
+        origin: amp_core::chat_event::PromptOrigin,
+        prompt_id: Option<String>,
+    ) {
         self.refresh_pending_plan();
         self.running = true;
         self.prompts += 1;
+        // R-M16: the model sees where a remote turn came from; the feed shows the plain text.
+        let model_text = match &origin {
+            amp_core::chat_event::PromptOrigin::Remote { device_name, .. } => {
+                format!("[remote: {device_name}] {prompt}")
+            }
+            amp_core::chat_event::PromptOrigin::Local => prompt.clone(),
+        };
         if self.view.feed().is_some() {
-            let prompt_id = format!("p_{}", self.prompts);
+            let prompt_id = prompt_id.unwrap_or_else(|| format!("p_{}", self.prompts));
             let run_id = format!("run_{}", self.prompts);
             self.view
                 .feed_push(amp_core::chat_event::ChatEvent::user_message(
@@ -1502,7 +1626,8 @@ impl Shell {
         let done = self.done_tx.clone();
         tokio::spawn(async move {
             // The run gets its own task so a panic in it still reports back here.
-            let run = tokio::spawn(async move { harness.prompt_text(&prompt, Vec::new()).await });
+            let run =
+                tokio::spawn(async move { harness.prompt_text(&model_text, Vec::new()).await });
             let result = match run.await {
                 Ok(Ok(r)) => Ok(r),
                 Ok(Err(e)) => Err(e.to_string()),
@@ -2361,6 +2486,13 @@ impl Shell {
                 self.reload_command(ReloadCause::Watcher);
                 continue;
             }
+            let msg = match msg {
+                ShellMsg::Remote(call) => {
+                    self.remote_call(call);
+                    continue;
+                }
+                other => other,
+            };
             self.in_flight = self.in_flight.saturating_sub(1);
             match msg {
                 ShellMsg::Plan {
@@ -2409,7 +2541,7 @@ impl Shell {
                     }
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
-                ShellMsg::Notice { .. } | ShellMsg::ReloadRequest => {}
+                ShellMsg::Notice { .. } | ShellMsg::ReloadRequest | ShellMsg::Remote(_) => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
                         self.view.panel().update(|s| {
@@ -2431,6 +2563,7 @@ impl Shell {
                 },
             }
         }
+        self.refresh_remote_status();
         // The Done marker first (sync_meta), then let the finished ticket go.
         let synced = self.sync_meta();
         changed | synced | self.clear_done_ticket()

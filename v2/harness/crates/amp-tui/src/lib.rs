@@ -60,6 +60,7 @@ pub mod history;
 pub mod inset;
 pub mod newline;
 pub mod overlay;
+pub mod remote;
 pub mod roster;
 pub mod scroll;
 pub mod shell;

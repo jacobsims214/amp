@@ -363,6 +363,21 @@ pub fn resolve_secret_headers(
     Ok(out)
 }
 
+/// Every provider key and secret header value `config` resolves to, for redaction (#2373: the
+/// remote link never sends them). Values only; nothing here is logged.
+pub fn secret_values(config: &crate::models::ModelsConfig, keys: &dyn KeyLookup) -> Vec<String> {
+    let mut out = Vec::new();
+    for provider in config.providers.values() {
+        if let (Some(secret), _) = resolve_key(provider, keys) {
+            out.push(secret.expose().to_owned());
+        }
+        if let Ok(headers) = resolve_secret_headers(provider, keys) {
+            out.extend(headers.into_values());
+        }
+    }
+    out
+}
+
 /// Find a provider's key: `key_env`, then the keychain.
 pub fn resolve_key(provider: &ProviderConfig, keys: &dyn KeyLookup) -> (Option<Secret>, KeySource) {
     if !provider.needs_key {

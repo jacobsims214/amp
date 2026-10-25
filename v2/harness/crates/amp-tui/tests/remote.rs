@@ -1,0 +1,903 @@
+//! #2373: the remote link end to end. A real chat `Shell` on a faux provider, the manager feed,
+//! the link, and the in-process mock relay (protocol.md section 8.2). The test plays the browser:
+//! it pairs a device (the local y/N answered yes), sends signed commands and reads the signed
+//! events the relay accepted.
+//!
+//! Covered: register, pair, a prompt arriving as a user turn tagged remote (literal text, never
+//! a slash command), a prompt queued while busy, stop (clears the queue), every rejection case,
+//! reconnect with seq resume, detach, the idle and lifetime timeouts, a relay-side end, `amp_`
+//! tokens and an AMP without remote control refused, and no secret in any event.
+
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use amp_core::{
+    agent::memory_session,
+    events::{ChannelEmitter, FanOutEmitter},
+    manager_feed::ManagerFeed,
+    remote::{
+        FixedToken, LinkTuning, LocalEvent, RemoteDeps, RemoteLink, RemoteSetup, RemoteState,
+        crypto::{self, KeyPair, KeyStore},
+        envelope, jcs,
+        mock_relay::{MockOptions, MockRelay, is_chat},
+        pairing,
+        redact::Redactor,
+        relay::now_ms,
+    },
+};
+use amp_tui::{RunDone, Shell, ShellInfo};
+use rpi_agent::AgentEvent;
+use rpi_ai::{
+    ThinkingLevel,
+    providers::faux::{FauxProvider, FauxScript, FauxStep, faux_assistant_message},
+    types::StopReason,
+};
+use rpi_harness::{agent_harness::AgentHarness, types::AgentHarnessOptions};
+use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+const WAIT: Duration = Duration::from_secs(20);
+const USER: i64 = 1001;
+/// A provider key the harness knows: it must never leave in an event.
+const PROVIDER_KEY: &str = "sk-test-provider-key-0123456789abcdef";
+
+struct Rig {
+    shell: Shell,
+    events: UnboundedReceiver<AgentEvent>,
+    done: UnboundedReceiver<RunDone>,
+    mock: MockRelay,
+    link: RemoteLink,
+    local: UnboundedReceiver<LocalEvent>,
+    seen: Arc<Mutex<Vec<String>>>,
+    script: FauxScript,
+    log: std::path::PathBuf,
+    _dir: TempDir,
+}
+
+struct TempDir(std::path::PathBuf);
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temp_dir(tag: &str) -> TempDir {
+    let dir = std::env::temp_dir().join(format!(
+        "amp-remote-{tag}-{}-{}",
+        std::process::id(),
+        crypto::b64u(&crypto::random_bytes(6))
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    TempDir(dir)
+}
+
+fn tuning() -> LinkTuning {
+    LinkTuning {
+        batch_every: Duration::from_millis(30),
+        silence: Duration::from_secs(5),
+        backoff_base: Duration::from_millis(100),
+        backoff_max: Duration::from_millis(400),
+        status_min: Duration::from_millis(200),
+        status_max: Duration::from_secs(60),
+        tick: Duration::from_millis(50),
+        bye_wait: Duration::from_secs(3),
+        refused_every: Duration::ZERO,
+    }
+}
+
+/// A reply step that records what the model was sent.
+fn recording(seen: &Arc<Mutex<Vec<String>>>, reply: String) -> FauxStep {
+    let seen = Arc::clone(seen);
+    FauxStep::factory(move |ctx| {
+        seen.lock().unwrap().push(format!("{ctx:?}"));
+        faux_assistant_message(reply.clone(), StopReason::Stop)
+    })
+}
+
+async fn rig(opts: MockOptions, tag: &str, token: &str) -> Rig {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let script = FauxScript::new().with_tokens_per_second(40.0);
+    let provider = FauxProvider::new(script.clone());
+    let model = provider.default_model().clone();
+    let (tui, events) = ChannelEmitter::new();
+    let fanout = FanOutEmitter::new();
+    fanout.add_sink(tui.into_emitter());
+    let feed = ManagerFeed::new();
+    fanout.add_sink(feed.emitter());
+    let harness = AgentHarness::create(AgentHarnessOptions {
+        model: model.clone(),
+        session: memory_session(),
+        models: vec![provider],
+        agent_emitter: Some(fanout.clone().into_emitter()),
+        ..Default::default()
+    })
+    .await
+    .expect("harness");
+    let info = ShellInfo {
+        role: "amp-manager".into(),
+        provider: model.provider.to_string(),
+        model_id: model.id.clone(),
+        thinking: ThinkingLevel::Off,
+        requested_thinking: None,
+        context_window: 200_000,
+        cwd: "/work/amp".into(),
+        git_branch: Some("remote-m1-2373".into()),
+        session_file: None,
+        banner: vec!["AMP harness · manager".into()],
+    };
+    let (mut shell, done) = Shell::new(Arc::new(harness), info, vec![]);
+    shell.set_feed(Some(Arc::clone(&feed)));
+    let _flusher = feed.spawn_flusher();
+    let mock = MockRelay::start(opts).await;
+    let dir = temp_dir(tag);
+    let redactor = Redactor::new();
+    redactor.add_values([PROVIDER_KEY]);
+    let log = dir.0.join("remote-actions.log");
+    let link = RemoteLink::new(RemoteDeps {
+        setup: RemoteSetup {
+            api_base: mock.base.clone(),
+            web_origin: "https://amp.example.test".into(),
+            ca_file: None,
+            project_id: Some(2),
+            host: "test-host".into(),
+            os: "macos".into(),
+            version: "0.0.0-test".into(),
+        },
+        tokens: Arc::new(FixedToken(token.into(), USER)),
+        host: shell.remote_host(),
+        feed: Arc::clone(&feed),
+        // Never the real keychain in tests (the Mac may be locked).
+        keys: KeyStore::memory(),
+        pins: Some(dir.0.join("remote-devices.json")),
+        action_log: Some(log.clone()),
+        redactor,
+        switches: Arc::new(|| Ok(())),
+        tuning: tuning(),
+    });
+    let local = link.take_local_events().expect("local events");
+    Rig {
+        shell,
+        events,
+        done,
+        mock,
+        link,
+        local,
+        seen,
+        script,
+        log,
+        _dir: dir,
+    }
+}
+
+impl Rig {
+    /// Drives the shell (as the terminal loop does) until `cond` holds for the relay.
+    async fn drive(&mut self, timeout: Duration, cond: impl Fn(&MockRelay) -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            self.shell.poll();
+            if cond(&self.mock) {
+                return true;
+            }
+            if tokio::time::Instant::now() > deadline {
+                return false;
+            }
+            tokio::select! {
+                Some(e) = self.events.recv() => self.shell.handle_event(&e),
+                Some(r) = self.done.recv() => {
+                    while let Ok(e) = self.events.try_recv() {
+                        self.shell.handle_event(&e);
+                    }
+                    self.shell.finish_run(r);
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    fn sid(&self) -> String {
+        self.mock.session_id().unwrap()
+    }
+
+    fn hello(&self) -> Value {
+        self.mock
+            .events()
+            .into_iter()
+            .find(|e| e["op"] == "hello")
+            .expect("hello")
+    }
+
+    fn hid(&self) -> String {
+        self.hello()["harness_id"].as_str().unwrap().to_owned()
+    }
+
+    fn command(&self, device: &KeyPair, seq: i64, op: &str, body: Value) -> String {
+        envelope::sign_command(
+            device,
+            &self.sid(),
+            &self.hid(),
+            seq,
+            now_ms(),
+            &crypto::new_nonce(),
+            op,
+            body,
+        )
+    }
+
+    fn count(&self, pred: impl Fn(&Value) -> bool) -> usize {
+        self.mock.events().iter().filter(|e| pred(e)).count()
+    }
+
+    /// Enables the link and pairs `device` (answering y locally). Returns the device.
+    async fn enable_and_pair(&mut self) -> KeyPair {
+        let enabled = self.link.enable().await.expect("enable");
+        assert!(
+            enabled
+                .link
+                .starts_with("https://amp.example.test/sessions/rs_")
+        );
+        assert!(
+            self.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "hello"))
+                .await,
+            "hello"
+        );
+        let (secret, h) = pairing::parse_link_fragment(&enabled.link).unwrap();
+        assert_eq!(h, self.hid());
+        assert_eq!(
+            self.mock.pairing().unwrap().0,
+            pairing::pairing_id(&secret),
+            "the relay got the pairing window"
+        );
+        let device = KeyPair::generate();
+        let msg = pairing::build_pair_request(
+            &secret,
+            &self.sid(),
+            &self.hid(),
+            &device,
+            "Safari on iPhone",
+            now_ms(),
+        );
+        assert!(self.mock.send_pair_request(msg, USER, "jsims@example.test"));
+        let prompt = match tokio::time::timeout(WAIT, self.local.recv()).await {
+            Ok(Some(LocalEvent::Pairing(p))) => p,
+            other => panic!("expected a pairing prompt, got {other:?}"),
+        };
+        let harness_pub = crypto::b64u_decode(
+            self.hello()["body"]["harness"]["harness_pub"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            prompt.code,
+            pairing::sas_code(&secret, &self.sid(), &harness_pub, device.public_raw()),
+            "the laptop shows the browser's code"
+        );
+        assert!(
+            prompt
+                .question()
+                .contains("\"Safari on iPhone\" (jsims@example.test)")
+        );
+        prompt.answer.send(true).unwrap();
+        let dev = device.id().to_owned();
+        assert!(
+            self.drive(WAIT, |m| m
+                .events()
+                .iter()
+                .any(|e| e["op"] == "pair_result"
+                    && e["device_id"] == dev.as_str()
+                    && e["body"]["result"] == "accepted"))
+                .await,
+            "pair_result accepted"
+        );
+        device
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_link_end_to_end() {
+    let mut r = rig(
+        MockOptions::default(),
+        "e2e",
+        &MockOptions::default().oauth_token,
+    )
+    .await;
+    r.script.set_responses(vec![
+        recording(
+            &r.seen,
+            format!("The key is {PROVIDER_KEY} and that is all."),
+        ),
+        FauxStep::text("first reply ".repeat(40)),
+        FauxStep::text("queued reply"),
+        FauxStep::text("long reply ".repeat(200)),
+        FauxStep::text("never sent"),
+    ]);
+    let device = r.enable_and_pair().await;
+    let dev = device.id().to_owned();
+    let mut seq = now_ms();
+
+    // A signed prompt arrives as a user turn tagged remote; a leading `/` is literal text.
+    seq += 1;
+    let text = r.command(
+        &device,
+        seq,
+        "prompt",
+        json!({"text": "/quit please", "client_msg_id": "m-1"}),
+    );
+    assert!(r.mock.send_command(&text));
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| is_chat(e, "run_end")))
+            .await,
+        "the remote prompt ran"
+    );
+    let events = r.mock.events();
+    let ack = events.iter().find(|e| e["op"] == "ack").unwrap();
+    assert_eq!(ack["device_id"], dev.as_str());
+    assert_eq!(ack["body"]["result"], "started");
+    let prompt_id = ack["body"]["prompt_id"].as_str().unwrap().to_owned();
+    let user = events.iter().find(|e| is_chat(e, "user_message")).unwrap();
+    assert_eq!(user["body"]["text"], "/quit please");
+    assert_eq!(user["body"]["origin"], "remote");
+    assert_eq!(user["body"]["device_name"], "Safari on iPhone");
+    assert_eq!(user["body"]["prompt_id"], prompt_id.as_str());
+    assert!(
+        r.seen.lock().unwrap()[0].contains("[remote: Safari on iPhone] /quit please"),
+        "the model sees the remote tag"
+    );
+    // The ack comes before the turn it started.
+    let pos = |pred: &dyn Fn(&Value) -> bool| events.iter().position(pred).unwrap();
+    assert!(pos(&|e| e["op"] == "ack") < pos(&|e| is_chat(e, "user_message")));
+
+    // While busy, a second prompt is queued and runs when the first ends.
+    seq += 1;
+    let a = r.command(
+        &device,
+        seq,
+        "prompt",
+        json!({"text": "first", "client_msg_id": "m-2"}),
+    );
+    assert!(r.mock.send_command(&a));
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .filter(|e| is_chat(e, "run_start"))
+            .count()
+            == 2)
+            .await
+    );
+    seq += 1;
+    let b = r.command(
+        &device,
+        seq,
+        "prompt",
+        json!({"text": "second", "client_msg_id": "m-3"}),
+    );
+    assert!(r.mock.send_command(&b));
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .any(|e| e["op"] == "ack" && e["body"]["result"] == "queued"))
+            .await
+    );
+    let queued = r
+        .mock
+        .events()
+        .into_iter()
+        .find(|e| e["op"] == "ack" && e["body"]["result"] == "queued")
+        .unwrap();
+    assert_eq!(queued["body"]["queue_position"], 1);
+    let queued_id = queued["body"]["prompt_id"].as_str().unwrap().to_owned();
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(
+            |e| is_chat(e, "queue") && e["body"]["items"].as_array().is_some_and(|i| i.len() == 1)
+        ))
+        .await
+    );
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| is_chat(
+            e,
+            "user_message"
+        ) && e["body"]["prompt_id"]
+            == queued_id.as_str()))
+            .await,
+        "the queued prompt started after the first run"
+    );
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .filter(|e| is_chat(e, "run_end"))
+            .count()
+            == 3)
+            .await
+    );
+
+    // Stop: a long run is aborted, and a queued prompt behind it is dropped.
+    seq += 1;
+    let long = r.command(
+        &device,
+        seq,
+        "prompt",
+        json!({"text": "long one", "client_msg_id": "m-4"}),
+    );
+    assert!(r.mock.send_command(&long));
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .filter(|e| is_chat(e, "run_start"))
+            .count()
+            == 4)
+            .await
+    );
+    seq += 1;
+    let behind = r.command(
+        &device,
+        seq,
+        "prompt",
+        json!({"text": "behind", "client_msg_id": "m-5"}),
+    );
+    assert!(r.mock.send_command(&behind));
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .filter(|e| e["op"] == "ack" && e["body"]["result"] == "queued")
+            .count()
+            == 2)
+            .await
+    );
+    seq += 1;
+    let stop = r.command(&device, seq, "stop", json!({}));
+    assert!(r.mock.send_command(&stop));
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(
+            |e| is_chat(e, "run_end") && e["body"]["outcome"] == "aborted"
+        ))
+        .await,
+        "stop aborts the run"
+    );
+    let events = r.mock.events();
+    assert!(
+        events.iter().any(|e| e["op"] == "ack"
+            && e["body"]["op"] == "stop"
+            && e["body"]["result"] == "done")
+    );
+    let last_queue = events.iter().rev().find(|e| is_chat(e, "queue")).unwrap();
+    assert_eq!(
+        last_queue["body"]["items"],
+        json!([]),
+        "stop clears the queue"
+    );
+    // Nothing else starts.
+    r.drive(Duration::from_millis(600), |_| false).await;
+    assert_eq!(r.count(|e| is_chat(e, "run_start")), 4);
+
+    // Every rejection case is refused (and logged locally).
+    let sid = r.sid();
+    let hid = r.hid();
+    let stranger = KeyPair::generate();
+    let ts = now_ms();
+    let mut cases: Vec<(&str, String)> = Vec::new();
+    seq += 1;
+    cases.push((
+        "unknown_device",
+        envelope::sign_command(
+            &stranger,
+            &sid,
+            &hid,
+            seq,
+            ts,
+            &crypto::new_nonce(),
+            "stop",
+            json!({}),
+        ),
+    ));
+    let valid = r.command(&device, seq, "stop", json!({}));
+    let mut tampered: Value = serde_json::from_str(&valid).unwrap();
+    tampered["op"] = json!("detach");
+    cases.push(("bad_signature", tampered.to_string()));
+    cases.push((
+        "wrong_session",
+        envelope::sign_command(
+            &device,
+            "rs_AAAAAAAAAAAAAAAAAAAAAA",
+            &hid,
+            seq,
+            ts,
+            &crypto::new_nonce(),
+            "stop",
+            json!({}),
+        ),
+    ));
+    cases.push((
+        "wrong_harness",
+        envelope::sign_command(
+            &device,
+            &sid,
+            KeyPair::generate().id(),
+            seq,
+            ts,
+            &crypto::new_nonce(),
+            "stop",
+            json!({}),
+        ),
+    ));
+    cases.push((
+        "stale_ts",
+        envelope::sign_command(
+            &device,
+            &sid,
+            &hid,
+            seq,
+            ts - 61_000,
+            &crypto::new_nonce(),
+            "stop",
+            json!({}),
+        ),
+    ));
+    cases.push((
+        "seq_not_increasing",
+        envelope::sign_command(
+            &device,
+            &sid,
+            &hid,
+            5,
+            ts,
+            &crypto::new_nonce(),
+            "stop",
+            json!({}),
+        ),
+    ));
+    cases.push((
+        "unknown_op",
+        r.command(&device, seq + 1, "set_model", json!({"model": "x"})),
+    ));
+    cases.push((
+        "invalid_body",
+        r.command(
+            &device,
+            seq + 2,
+            "prompt",
+            json!({"text": "  ", "client_msg_id": "m-6"}),
+        ),
+    ));
+    cases.push((
+        "invalid_body",
+        r.command(&device, seq + 3, "stop", json!({"now": true})),
+    ));
+    let mut v2: Value =
+        serde_json::from_str(&r.command(&device, seq + 4, "stop", json!({}))).unwrap();
+    v2["v"] = json!(2);
+    cases.push(("unsupported_version", v2.to_string()));
+    let mut alg: Value =
+        serde_json::from_str(&r.command(&device, seq + 5, "stop", json!({}))).unwrap();
+    alg["alg"] = json!("EdDSA");
+    cases.push(("unsupported_alg", alg.to_string()));
+    let mut extra: Value =
+        serde_json::from_str(&r.command(&device, seq + 6, "stop", json!({}))).unwrap();
+    extra["x"] = json!(1);
+    cases.push(("malformed", extra.to_string()));
+    seq += 10;
+    let replayed = r.command(&device, seq, "stop", json!({}));
+    cases.push((
+        "too_large",
+        r.command(
+            &device,
+            seq + 1,
+            "prompt",
+            json!({"text": "y".repeat(70_000), "client_msg_id": "m-8"}),
+        ),
+    ));
+    for (_, text) in &cases {
+        // The relay forwards compact JSON; too_large is checked on the received size.
+        assert!(r.mock.push("command", text));
+    }
+    // The replay: the same (valid) command twice. The first is done, the second is refused.
+    assert!(r.mock.send_command(&replayed));
+    assert!(r.mock.send_command(&replayed));
+    let want: Vec<&str> = cases
+        .iter()
+        .map(|(c, _)| *c)
+        .chain(["replayed_nonce"])
+        .collect();
+    assert!(
+        r.drive(WAIT, |m| {
+            let got: Vec<String> = m
+                .events()
+                .iter()
+                .filter(|e| e["op"] == "refused")
+                .map(|e| e["body"]["code"].as_str().unwrap_or_default().to_owned())
+                .collect();
+            want.iter().all(|w| got.iter().any(|g| g == w))
+        })
+        .await,
+        "every rejection is refused: {:?}",
+        r.mock
+            .events()
+            .iter()
+            .filter(|e| e["op"] == "refused")
+            .map(|e| e["body"]["code"].clone())
+            .collect::<Vec<_>>()
+    );
+    let log = std::fs::read_to_string(&r.log).unwrap();
+    for w in &want {
+        assert!(log.contains(&format!("\"result\":\"{w}\"")), "{w} logged");
+    }
+    assert!(
+        !log.contains("/quit please"),
+        "the local log holds no payloads"
+    );
+    // A refusal names its command (ref) and never echoes content.
+    let refused = r
+        .mock
+        .events()
+        .into_iter()
+        .find(|e| e["op"] == "refused" && e["body"]["code"] == "seq_not_increasing")
+        .unwrap();
+    assert_eq!(refused["body"]["ref"]["seq"], 5);
+    assert!(refused["body"]["last_seq"].as_i64().unwrap() > 5);
+
+    // Reconnect: the stream drops; the link reconnects, says hello again, and seqs continue.
+    let hellos = r.count(|e| e["op"] == "hello");
+    r.mock.drop_stream();
+    assert!(
+        r.drive(WAIT, |m| m.streams_opened() >= 2
+            && m.events().iter().filter(|e| e["op"] == "hello").count()
+                > hellos)
+            .await,
+        "reconnected"
+    );
+    let seqs: Vec<i64> = r
+        .mock
+        .events()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        seqs,
+        (1..=seqs.len() as i64).collect::<Vec<_>>(),
+        "contiguous across the reconnect"
+    );
+    assert!(
+        r.mock.requests().iter().any(|q| q == "token"),
+        "the token was refreshed on reconnect"
+    );
+    seq += 10;
+    let after = r.command(&device, seq, "stop", json!({}));
+    assert!(r.mock.send_command(&after));
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .filter(|e| e["op"] == "ack" && e["body"]["op"] == "stop")
+            .count()
+            >= 2)
+            .await,
+        "commands work after the reconnect"
+    );
+
+    // No secret in any event: the provider key, the pairing secret, tokens.
+    let all = serde_json::to_string(&r.mock.events()).unwrap();
+    assert!(!all.contains(PROVIDER_KEY), "provider key leaked");
+    // Not even split across streamed deltas.
+    assert!(
+        !all.contains("sk-test-p"),
+        "a piece of the provider key leaked"
+    );
+    assert!(
+        all.contains("[redacted]"),
+        "the reply's key was redacted: {}",
+        r.mock
+            .events()
+            .iter()
+            .filter(|e| is_chat(e, "text_delta"))
+            .map(|e| e["body"]["delta"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>()
+            .join("|")
+    );
+    assert!(!all.contains("oauth-access-token-for-tests"));
+    assert!(!all.contains("rct_"));
+    // Every event verifies with the harness key the browser pinned.
+    let hello = r.hello();
+    let hpub =
+        crypto::b64u_decode(hello["body"]["harness"]["harness_pub"].as_str().unwrap()).unwrap();
+    assert_eq!(crypto::fingerprint(&hpub), hid);
+    for (i, e) in r.mock.events().iter().enumerate() {
+        assert_eq!(
+            envelope::check_event_for_test(
+                jcs::canonical(e).as_bytes(),
+                &sid,
+                &hid,
+                &hpub,
+                i as i64
+            ),
+            "ok"
+        );
+    }
+
+    // Detach: ack, bye, DELETE; the local session goes on.
+    seq += 1;
+    let detach = r.command(&device, seq, "detach", json!({}));
+    assert!(r.mock.send_command(&detach));
+    assert!(r.drive(WAIT, |m| m.ended().is_some()).await, "detached");
+    assert_eq!(r.mock.ended().as_deref(), Some("detached"));
+    let events = r.mock.events();
+    assert_eq!(events.last().unwrap()["op"], "bye");
+    assert_eq!(events.last().unwrap()["body"]["reason"], "detached");
+    let mut state = r.link.state();
+    let _ = tokio::time::timeout(
+        WAIT,
+        state.wait_for(|s| matches!(s, RemoteState::Off { .. })),
+    )
+    .await;
+    assert_eq!(
+        r.link.current(),
+        RemoteState::Off {
+            reason: Some("detached".into())
+        }
+    );
+    // The pin stays for the next session (30 days).
+    let devices = r.link.devices().unwrap();
+    assert_eq!(devices.len(), 1);
+    assert!(devices[0].pinned_until_ms > now_ms() + 29 * pairing::DAY_MS);
+    assert_eq!(r.link.unpin_all().unwrap(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idle_and_lifetime_timeouts_end_remote() {
+    let opts = MockOptions {
+        idle_timeout_s: 1,
+        ..MockOptions::default()
+    };
+    let mut r = rig(opts.clone(), "idle", &opts.oauth_token).await;
+    r.link.enable().await.expect("enable");
+    assert!(r.drive(WAIT, |m| m.ended().is_some()).await, "idle end");
+    assert_eq!(r.mock.ended().as_deref(), Some("idle"));
+    assert_eq!(r.mock.events().last().unwrap()["body"]["reason"], "idle");
+    let notice = loop {
+        match tokio::time::timeout(WAIT, r.local.recv()).await {
+            Ok(Some(LocalEvent::Notice { text, .. })) => break text,
+            Ok(Some(_)) => continue,
+            other => panic!("no notice: {other:?}"),
+        }
+    };
+    assert!(notice.contains("without remote activity"), "{notice}");
+
+    let opts = MockOptions {
+        lifetime_ms: 1500,
+        ..MockOptions::default()
+    };
+    let mut r = rig(opts.clone(), "life", &opts.oauth_token).await;
+    r.link.enable().await.expect("enable");
+    assert!(r.drive(WAIT, |m| m.ended().is_some()).await, "lifetime end");
+    assert_eq!(r.mock.ended().as_deref(), Some("expired"));
+    let mut state = r.link.state();
+    tokio::time::timeout(
+        WAIT,
+        state.wait_for(|s| matches!(s, RemoteState::Off { .. })),
+    )
+    .await
+    .expect("off")
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relay_end_pairing_no_and_refusals() {
+    // An amp_ token never registers.
+    let opts = MockOptions::default();
+    let r = rig(opts.clone(), "amp", "amp_0123456789abcdef0123").await;
+    let e = r.link.enable().await.unwrap_err();
+    assert!(e.message.contains("amp_"), "{e}");
+    assert!(
+        !r.mock.requests().iter().any(|q| q == "register"),
+        "refused before any request"
+    );
+
+    // An AMP without remote control (404) or an org with it off (403).
+    let opts = MockOptions {
+        refuse_register: Some((404, "not_found")),
+        ..MockOptions::default()
+    };
+    let r = rig(opts.clone(), "404", &opts.oauth_token).await;
+    let e = r.link.enable().await.unwrap_err();
+    assert_eq!(
+        e.message,
+        "Remote control isn't available on this AMP server."
+    );
+    let opts = MockOptions {
+        refuse_register: Some((403, "remote_disabled")),
+        ..MockOptions::default()
+    };
+    let r = rig(opts.clone(), "403", &opts.oauth_token).await;
+    let e = r.link.enable().await.unwrap_err();
+    assert!(e.message.contains("turned off"), "{e}");
+
+    // Pairing answered N, then the relay ends the session (Disconnect).
+    let opts = MockOptions::default();
+    let mut r = rig(opts.clone(), "no", &opts.oauth_token).await;
+    let enabled = r.link.enable().await.unwrap();
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "hello"))
+            .await
+    );
+    let (secret, _) = pairing::parse_link_fragment(&enabled.link).unwrap();
+    let device = KeyPair::generate();
+    let msg = pairing::build_pair_request(&secret, &r.sid(), &r.hid(), &device, "Chrome", now_ms());
+    assert!(
+        r.mock
+            .send_pair_request(msg.clone(), USER, "x@example.test")
+    );
+    match tokio::time::timeout(WAIT, r.local.recv()).await {
+        Ok(Some(LocalEvent::Pairing(p))) => p.answer.send(false).unwrap(),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"]
+            == "pair_result"
+            && e["body"]["result"] == "rejected"))
+            .await
+    );
+    // The secret is single use: the same request again is unknown_pairing.
+    assert!(r.mock.send_pair_request(msg, USER, "x@example.test"));
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"]
+            == "pair_result"
+            && e["body"]["code"] == "unknown_pairing"))
+            .await
+    );
+    // A fresh link works for another user? No: wrong_user spends a try.
+    let (link2, _) = r.link.new_pairing_link().await.unwrap();
+    let (secret2, _) = pairing::parse_link_fragment(&link2).unwrap();
+    let msg =
+        pairing::build_pair_request(&secret2, &r.sid(), &r.hid(), &device, "Chrome", now_ms());
+    assert!(r.mock.send_pair_request(msg, 4242, "other@example.test"));
+    assert!(
+        r.drive(WAIT, |m| m
+            .events()
+            .iter()
+            .any(|e| e["op"] == "pair_result"
+                && e["body"]["code"] == "wrong_user"
+                && e["body"]["tries_left"] == 4))
+            .await
+    );
+    // An unpaired device's command is refused.
+    let cmd = envelope::sign_command(
+        &device,
+        &r.sid(),
+        &r.hid(),
+        now_ms(),
+        now_ms(),
+        &crypto::new_nonce(),
+        "stop",
+        json!({}),
+    );
+    assert!(r.mock.send_command(&cmd));
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(
+            |e| e["op"] == "refused" && e["body"]["code"] == "unknown_device"
+        ))
+        .await
+    );
+    // The relay ends it: remote turns off locally, without a DELETE.
+    r.mock.end_session("disconnected");
+    let mut state = r.link.state();
+    tokio::time::timeout(
+        WAIT,
+        state.wait_for(|s| matches!(s, RemoteState::Off { .. })),
+    )
+    .await
+    .expect("off")
+    .unwrap();
+    assert_eq!(
+        r.link.current(),
+        RemoteState::Off {
+            reason: Some("disconnected".into())
+        }
+    );
+    assert!(!r.mock.requests().iter().any(|q| q == "delete"));
+}
