@@ -65,6 +65,11 @@ ampApi:
   # n8n on your LAN). Off: a project owner's webhook URL can't be used to
   # reach services inside the cluster.
   webhookAllowPrivateNetworks: false
+  # The web app's origin as browsers see it ("https://amp.example" or
+  # "https://amp.local:8443"), no trailing slash. Links in MCP replies and the
+  # remote control relay's Origin check use it. Empty: https://<global.domain>
+  # (derived from MCP_PUBLIC_URL).
+  appPublicUrl: ""
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
@@ -73,8 +78,22 @@ ampApi:
 # instance switch. Off by default. When on, an org admin still has to turn it
 # on for their org (org settings), and each person turns it on per session
 # with /remote in the harness. Needs auth (it stays off without Dex).
+#
+# Org default: always off. Each org's switch (and its idle timeout, 5-240 min,
+# default 30, and device pin days) is an org setting in the database, edited by
+# org admins in the web app (PUT /api/orgs/:id/remote-control), not here.
+# With relay.enabled the chart adds the Envoy routes (/relay/ without
+# ext_authz, and an unbounded timeout on /api/sessions/*/events). amp-api only
+# accepts browser POSTs whose Origin is exactly the web address (ampApi.
+# appPublicUrl, else https://<global.domain>), so set ampApi.appPublicUrl when
+# people reach AMP on another origin (a port-forward such as :8443, or a
+# different public host).
+# Anything in front of Envoy (Traefik, a cloud LB) must not cut long SSE
+# streams either: see KB how-to/remote-control-local-test.md.
 relay:
   enabled: false
+  # Envoy's cap on one /relay/ stream: the session's 12-hour lifetime.
+  maxStreamDuration: 43200s
 
 ui:
   image: amp-ui

@@ -123,6 +123,12 @@ spec:
             # Remote control of harness sessions (epic 165): the instance switch.
             - name: RELAY_ENABLED
               value: {{ .Values.relay.enabled | default false | quote }}
+            {{- with .Values.ampApi.appPublicUrl }}
+            # The web origin (links, and the relay's exact Origin check on
+            # browser POSTs). Unset: derived from MCP_PUBLIC_URL.
+            - name: APP_PUBLIC_URL
+              value: {{ . | trimSuffix "/" | quote }}
+            {{- end }}
             {{- if .Values.valkey.enabled }}
             - name: REDIS_ADDR
               value: "amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379"
