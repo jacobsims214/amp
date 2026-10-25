@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,11 +132,32 @@ func TestWebhooks_ProjectEventsAreSignedAndFiltered(t *testing.T) {
 	owner.call(t, "amp_dispatch_task", map[string]any{"task_id": float64(id), "agent_id": "worker"})
 	owner.call(t, "amp_complete_task", map[string]any{"task_id": float64(id)})
 
-	got := rc.wait(t, "created and completed", func(g []received) bool { return len(g) >= 2 })
-	time.Sleep(100 * time.Millisecond) // anything else would have arrived by now
-	got = rc.wait(t, "", func([]received) bool { return true })
-	if ev := events(got); len(ev) != 2 || ev[0] != "task.created" || ev[1] != "task.completed" {
-		t.Fatalf("events = %v (dispatch is filtered out)", ev)
+	rc.wait(t, "created and completed", func(g []received) bool { return len(g) >= 2 })
+	hookID := int(hook["id"].(float64))
+	deliveriesURL := fmt.Sprintf("/api/webhooks/%d/deliveries", hookID)
+	// The dispatcher matches events in order, one at a time, so once task.completed was sent
+	// the earlier task.dispatched was matched too: had it passed the filter, it would be a
+	// delivery row here. Every row is recorded as delivered only after the receiver answered,
+	// so wait for that rather than for time to pass.
+	var deliveries []any
+	eventually(t, "both deliveries to be recorded as delivered", func() bool {
+		deliveries = ra.want(t, 200, "owner", "GET", deliveriesURL, nil)["deliveries"].([]any)
+		for _, d := range deliveries {
+			if d.(map[string]any)["status"] != "delivered" {
+				return false
+			}
+		}
+		return len(deliveries) >= 2
+	})
+	if len(deliveries) != 2 {
+		t.Errorf("deliveries = %v (dispatch is filtered out)", deliveries)
+	}
+	// Deliveries are sent a few at once, so they can arrive in either order.
+	got := rc.wait(t, "", func([]received) bool { return true })
+	ev := events(got)
+	sort.Strings(ev)
+	if len(ev) != 2 || ev[0] != "task.completed" || ev[1] != "task.created" {
+		t.Fatalf("events = %v, want task.created and task.completed once each (dispatch is filtered out)", events(got))
 	}
 	for _, r := range got {
 		// Checked the way a receiver would, without AMP's code.
@@ -158,12 +180,7 @@ func TestWebhooks_ProjectEventsAreSignedAndFiltered(t *testing.T) {
 		}
 	}
 
-	hookID := int(hook["id"].(float64))
-	deliveries := ra.want(t, 200, "owner", "GET", fmt.Sprintf("/api/webhooks/%d/deliveries", hookID), nil)["deliveries"].([]any)
-	if len(deliveries) != 2 || deliveries[0].(map[string]any)["status"] != "delivered" {
-		t.Errorf("deliveries = %v", deliveries)
-	}
-	ra.want(t, 403, "alice", "GET", fmt.Sprintf("/api/webhooks/%d/deliveries", hookID), nil)
+	ra.want(t, 403, "alice", "GET", deliveriesURL, nil)
 
 	// Rotating the secret changes the signature; turning it off stops it.
 	newSecret := ra.want(t, 200, "owner", "POST", fmt.Sprintf("/api/webhooks/%d/rotate-secret", hookID), nil)["webhook"].(map[string]any)["secret"].(string)

@@ -105,7 +105,10 @@ impl T {
         let mut child = cmd.spawn().expect("spawn amp-harness");
         if let Some(input) = stdin {
             let mut pipe = child.stdin.take().unwrap();
-            pipe.write_all(input.as_bytes()).unwrap();
+            // A run that ends without reading all its input closes the pipe first (#2385).
+            if let Err(e) = pipe.write_all(input.as_bytes()) {
+                assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(60);
         while child.try_wait().unwrap().is_none() {

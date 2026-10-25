@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -106,27 +108,95 @@ func assertScheduleConsumed(t *testing.T, s *mcpStack, id int, r *releaseEvents)
 	}
 }
 
+// waitScheduleFired waits for a ticket's timer to have fired and its effects to
+// be visible (a release event published, start_at gone from the database),
+// then checks them with assertScheduleConsumed. When the effects land after
+// start_at depends on the machine's load, so this waits on them, not on time.
+func waitScheduleFired(t *testing.T, s *mcpStack, id int, r *releaseEvents) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		n := len(r.evts)
+		r.mu.Unlock()
+		stored, err := s.repo.GetTask(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n > 0 && stored.StartAt == nil {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	assertScheduleConsumed(t, s, id, r)
+}
+
+// beforeStartAt runs setup, which schedules a ticket lead from now, checks
+// what must hold before its start time (returning what did not), and starts
+// watching for its release. Those checks mean something only if setup ended
+// before the start time: on a loaded machine (the full suite, -race,
+// TEST_CLUSTER) it may not have, and the timer may have fired partway through.
+// Then it tries again with twice the lead, rather than failing or passing on
+// what it saw after the start time.
+func beforeStartAt(t *testing.T, setup func(lead time.Duration) (int, time.Time, *releaseEvents, []string)) (int, *releaseEvents) {
+	t.Helper()
+	for lead := 2 * time.Second; ; lead *= 2 {
+		id, at, release, problems := setup(lead)
+		if time.Now().Before(at) {
+			if len(problems) > 0 {
+				t.Fatal(strings.Join(problems, "\n"))
+			}
+			return id, release
+		}
+		if lead >= 16*time.Second {
+			t.Fatalf("setup took longer than %v, past the start time it was checking against", lead)
+		}
+		t.Logf("setup ended after its start time (lead %v); trying again with a longer lead", lead)
+	}
+}
+
+// callFails calls a tool and returns its error message, or "" if it succeeded.
+func (s *mcpStack) callFails(toolName string, args map[string]interface{}) string {
+	raw, _ := json.Marshal(map[string]interface{}{
+		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+		"params": map[string]interface{}{"name": toolName, "arguments": args},
+	})
+	respBytes, _ := json.Marshal(s.srv.HandleMessage(s.callCtx(), raw))
+	var rpcResp struct {
+		Error *struct{ Message string } `json:"error"`
+	}
+	_ = json.Unmarshal(respBytes, &rpcResp)
+	if rpcResp.Error != nil {
+		return rpcResp.Error.Message
+	}
+	return ""
+}
+
 // The start time arrives while a dependency is still unfinished: the ticket
 // stays blocked (on its dependencies, no longer on its schedule), and is
 // released only when the dependency completes.
 func TestScheduledDeps_StartAtFiresWithUnfinishedDependencyStaysBlocked(t *testing.T) {
 	s := setupMCP(t)
-	dep := mkIn(t, s, s.storyID, "build API")
-	id := mkIn(t, s, s.storyID, "build UI", dep)
-	if st := stateOf(t, s, id); st != "blocked" {
-		t.Fatalf("ticket with an unfinished dependency: %s", st)
-	}
+	var dep int
+	id, release := beforeStartAt(t, func(lead time.Duration) (int, time.Time, *releaseEvents, []string) {
+		dep = mkIn(t, s, s.storyID, "build API")
+		id := mkIn(t, s, s.storyID, "build UI", dep)
+		if st := stateOf(t, s, id); st != "blocked" {
+			t.Fatalf("ticket with an unfinished dependency: %s", st)
+		}
 
-	at := time.Now().Add(time.Second)
-	scheduleAt(t, s, id, &at)
-	if st := stateOf(t, s, id); st != "blocked" {
-		t.Fatalf("scheduled ticket: %s", st)
-	}
-	release := watchRelease(s, id)
+		at := time.Now().Add(lead)
+		scheduleAt(t, s, id, &at)
+		var problems []string
+		if st := stateOf(t, s, id); st != "blocked" {
+			problems = append(problems, "scheduled ticket: "+st)
+		}
+		// Watching from before the start time, so the release event is seen.
+		return id, at, watchRelease(s, id), problems
+	})
 
 	// Let the timer fire.
-	time.Sleep(time.Until(at) + 500*time.Millisecond)
-	assertScheduleConsumed(t, s, id, release)
+	waitScheduleFired(t, s, id, release)
 
 	task := planTask(t, s, id)
 	if st := task["state"].(string); st != "blocked" {
@@ -168,8 +238,8 @@ func TestScheduledDeps_DependencyDoneFirstWaitsForStartAt(t *testing.T) {
 	if time.Now().Before(at) {
 		t.Fatal("released before its start time")
 	}
-	time.Sleep(200 * time.Millisecond) // the actor clears start_at in the DB just after the state
-	assertScheduleConsumed(t, s, id, release)
+	// The actor clears start_at in the DB just after the state.
+	waitScheduleFired(t, s, id, release)
 }
 
 // The start time passed while no actor ran the project (a restart or a
@@ -545,44 +615,50 @@ func TestScheduledDeps_AnswerKeepsFutureSchedule(t *testing.T) {
 	}
 
 	t.Run("future start_at", func(t *testing.T) {
-		id := mkIn(t, s, s.storyID, "scheduled, then asked")
-		at := time.Now().Add(2 * time.Second).Truncate(time.Microsecond)
-		scheduleAt(t, s, id, &at)
+		id, release := beforeStartAt(t, func(lead time.Duration) (int, time.Time, *releaseEvents, []string) {
+			id := mkIn(t, s, s.storyID, "scheduled, then asked")
+			at := time.Now().Add(lead).Truncate(time.Microsecond)
+			scheduleAt(t, s, id, &at)
 
-		out := askAndAnswer(id)
-		if out["state"] != "blocked" {
-			t.Fatalf("answered before its start time: state %v, want blocked (on its schedule)", out["state"])
-		}
-		got := stored(id)
-		if got.State != domain.TaskStateBlocked || got.BlockReason != "scheduled:"+at.Format(time.RFC3339) {
-			t.Fatalf("db: state %q, block_reason %q; want blocked scheduled:%s", got.State, got.BlockReason, at.Format(time.RFC3339))
-		}
-		if got.StartAt == nil || !got.StartAt.Equal(at) {
-			t.Fatalf("db: start_at %v, want %v unchanged", got.StartAt, at)
-		}
-		// Not dispatchable before its start time.
-		s.callExpectError(t, "amp_dispatch_task", map[string]interface{}{"task_id": float64(id), "agent_id": "agent"})
+			var problems []string
+			if out := askAndAnswer(id); out["state"] != "blocked" {
+				problems = append(problems, fmt.Sprintf("answered before its start time: state %v, want blocked (on its schedule)", out["state"]))
+			}
+			got := stored(id)
+			if got.State != domain.TaskStateBlocked || got.BlockReason != "scheduled:"+at.Format(time.RFC3339) {
+				problems = append(problems, fmt.Sprintf("db: state %q, block_reason %q; want blocked scheduled:%s", got.State, got.BlockReason, at.Format(time.RFC3339)))
+			}
+			if got.StartAt == nil || !got.StartAt.Equal(at) {
+				problems = append(problems, fmt.Sprintf("db: start_at %v, want %v unchanged", got.StartAt, at))
+			}
+			// Not dispatchable before its start time.
+			if s.callFails("amp_dispatch_task", map[string]interface{}{"task_id": float64(id), "agent_id": "agent"}) == "" {
+				problems = append(problems, "dispatched before its start time")
+			}
+			return id, at, watchRelease(s, id), problems
+		})
 
 		// The re-armed timer releases it.
-		release := watchRelease(s, id)
-		time.Sleep(time.Until(at) + 500*time.Millisecond)
+		waitScheduleFired(t, s, id, release)
 		waitState(t, s, id, string(domain.TaskStateBacklog))
-		assertScheduleConsumed(t, s, id, release)
 	})
 
 	t.Run("future start_at with an unfinished dependency", func(t *testing.T) {
-		dep := mkIn(t, s, s.storyID, "dependency")
-		id := mkIn(t, s, s.storyID, "scheduled with a dependency, then asked", dep)
-		at := time.Now().Add(2 * time.Second)
-		scheduleAt(t, s, id, &at)
+		var dep int
+		id, release := beforeStartAt(t, func(lead time.Duration) (int, time.Time, *releaseEvents, []string) {
+			dep = mkIn(t, s, s.storyID, "dependency")
+			id := mkIn(t, s, s.storyID, "scheduled with a dependency, then asked", dep)
+			at := time.Now().Add(lead)
+			scheduleAt(t, s, id, &at)
 
-		askAndAnswer(id)
-		if got := stored(id); got.State != domain.TaskStateBlocked || !strings.HasPrefix(got.BlockReason, "scheduled:") {
-			t.Fatalf("answered before its start time: state %q, block_reason %q; want blocked scheduled:...", got.State, got.BlockReason)
-		}
-		release := watchRelease(s, id)
-		time.Sleep(time.Until(at) + 500*time.Millisecond)
-		assertScheduleConsumed(t, s, id, release)
+			askAndAnswer(id)
+			var problems []string
+			if got := stored(id); got.State != domain.TaskStateBlocked || !strings.HasPrefix(got.BlockReason, "scheduled:") {
+				problems = append(problems, fmt.Sprintf("answered before its start time: state %q, block_reason %q; want blocked scheduled:...", got.State, got.BlockReason))
+			}
+			return id, at, watchRelease(s, id), problems
+		})
+		waitScheduleFired(t, s, id, release)
 		// Released from its schedule but still waiting on its dependency.
 		if got := stored(id); got.State != domain.TaskStateBlocked || got.BlockReason != "" {
 			t.Fatalf("after start_at with dependency unfinished: state %q, block_reason %q; want blocked, \"\"", got.State, got.BlockReason)
