@@ -7,6 +7,8 @@ description: Initialize a new AMP project — create the project, scan the codeb
 
 Use this skill when there is no `.amp.json` in the current directory.
 
+In amp-harness, a folder is linked by `amp-harness init` (the person; it creates or picks the project, writes `.amp.json` and never overwrites a parent folder's), or by you with this skill when there is no `.amp.json` here or above. If `<amp_context>` has a `project_marker_note`, the session's `.amp.json` belongs to a parent folder: when the person asks to set up a new project here, don't create it or plan in the parent's project — tell them which project the folder uses now and where its `.amp.json` is, and ask them to run `amp-harness init` in this folder and start the chat again. Never write `.amp.json` over a parent folder's.
+
 ---
 
 ## What needs to happen

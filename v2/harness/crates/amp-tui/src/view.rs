@@ -174,6 +174,8 @@ pub struct ChatView {
     roster: Roster,
     /// The workers above the editor (#2347).
     strip: Arc<WorkerStrip>,
+    /// While [`Self::apply_at`] applies an event: when it happened (`Some(None)`: not known).
+    event_time: Option<Option<Instant>>,
 }
 
 impl Default for ChatView {
@@ -286,6 +288,7 @@ impl ChatView {
             gap,
             roster,
             strip,
+            event_time: None,
         }
     }
 
@@ -808,8 +811,23 @@ impl ChatView {
     }
 
     /// Applies one rpi agent event to the transcript and footer.
+    /// [`Self::apply`] for an event that happened `at` rather than now (#2355): a worker's
+    /// session caught up from its feed or its file, so earlier tool calls and thinking show how
+    /// long they took. `None`: not known, so they show no duration rather than `0 ms`.
+    pub fn apply_at(&mut self, event: &AgentEvent, at: Option<Instant>) {
+        self.event_time = Some(at);
+        self.apply(event);
+        self.event_time = None;
+    }
+
+    /// When the event being applied happened.
+    fn event_time(&self) -> Option<Instant> {
+        self.event_time.unwrap_or_else(|| Some(Instant::now()))
+    }
+
     pub fn apply(&mut self, event: &AgentEvent) {
         self.scroll.touch();
+        let at = self.event_time();
         self.chrome.observe(event);
         match event {
             AgentEvent::MessageStart {
@@ -827,7 +845,7 @@ impl ChatView {
                 message: AgentMessage::Assistant(m),
             } => {
                 let component = self.current_assistant();
-                component.finish();
+                component.finish_at(at);
                 self.update_assistant(&component, &blocks(m));
                 // A reply the person stopped keeps what it streamed, with no error line: the
                 // shell adds one dim "Stopped." when the run ends (#2181).
@@ -852,7 +870,7 @@ impl ChatView {
                 args,
             } => {
                 let component = self.add_tool(tool_name, args);
-                component.set_running();
+                component.set_running_at(at);
                 self.tools.insert(tool_call_id.clone(), component);
             }
             AgentEvent::ToolExecutionEnd {
@@ -873,7 +891,7 @@ impl ChatView {
                     // #2226: the shell's ApprovalNotice right under it says it all, with the
                     // server's sentence and the link: not the same sentence twice.
                     let line = amp_render::REFUSED_LINE;
-                    component.set_result(line, line, true);
+                    component.set_result_at(line, line, true, at);
                 } else if amp_render::is_amp_tool(tool_name) {
                     let summary = amp_render::result_summary(tool_name, &text, *is_error);
                     let detail = if *is_error {
@@ -881,9 +899,9 @@ impl ChatView {
                     } else {
                         pretty_json(&text)
                     };
-                    component.set_result(&summary, &detail, *is_error);
+                    component.set_result_at(&summary, &detail, *is_error, at);
                 } else {
-                    component.set_result(&output_summary(&text), &text, *is_error);
+                    component.set_result_at(&output_summary(&text), &text, *is_error, at);
                 }
             }
             AgentEvent::RetryScheduled {
@@ -935,7 +953,7 @@ impl ChatView {
     }
 
     fn update_assistant(&mut self, component: &Arc<AssistantBlock>, blocks: &[Block]) {
-        component.update_blocks(blocks);
+        component.update_blocks_at(blocks, self.event_time());
         if component.has_thinking() {
             // Only the transcript's last thinking says how to open it (#2345).
             if let Some(old) = &self.last_thinking

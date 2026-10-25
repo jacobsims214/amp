@@ -870,33 +870,126 @@ fn list_of<'a>(v: &'a Value, key: &str) -> Vec<&'a Value> {
     }
 }
 
-/// The repository root of `cwd` (git), else `cwd`.
-fn marker_dir(plan: &Plan) -> PathBuf {
-    if let Some(dir) = &plan.dir {
-        return dir.clone();
-    }
+/// `git <args>` in `dir`: its trimmed stdout when it succeeds.
+fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
     std::process::Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&plan.cwd)
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stderr(std::process::Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| PathBuf::from(s.trim()))
+        .map(|s| s.trim().to_owned())
+}
+
+/// The root of the git repository `dir` is in, if any.
+fn git_toplevel(dir: &Path) -> Option<PathBuf> {
+    git_out(dir, &["rev-parse", "--show-toplevel"])
+        .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
-        // Never above AMP_HARNESS_CEILING_DIR, where the marker search would not find it.
-        .filter(|root| {
-            std::env::var_os(ENV_CEILING_DIR)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .is_none_or(|ceiling| {
-                    let canon =
-                        |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-                    canon(root).starts_with(canon(&ceiling))
-                })
-        })
-        .unwrap_or_else(|| plan.cwd.clone())
+}
+
+/// Whether the repository `dir` is in tracks any file in or below `dir` (an empty or brand-new
+/// folder inside a repository tracks none).
+fn has_tracked_files(dir: &Path) -> bool {
+    git_out(dir, &["ls-files", "--", "."]).is_some_and(|out| !out.is_empty())
+}
+
+fn canon(p: &Path) -> PathBuf {
+    std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// How a `.amp.json` found from the working directory relates to it (#2356).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MarkerPlace {
+    /// The marker is in the working directory.
+    Here,
+    /// The marker is at (or below) the root of the git repository the working directory is in,
+    /// and the repository tracks files in the working directory: an ordinary subfolder of a
+    /// linked repository (`cd src/`). Used without asking.
+    Repo,
+    /// The marker is in a parent folder this folder may not belong to: a new, empty or untracked
+    /// folder inside the parent's repository, a folder with its own git repository, or no git
+    /// repository at all. The first run says so and lets the person link this folder.
+    Parent,
+}
+
+/// Where `marker` (found from `cwd`) is, as [`MarkerPlace`] (#2356).
+pub(crate) fn marker_place(cwd: &Path, marker: &ProjectMarker) -> MarkerPlace {
+    if !marker.in_parent_of(cwd) {
+        return MarkerPlace::Here;
+    }
+    match repo_root(cwd) {
+        Some(root) if canon(marker.dir()).starts_with(canon(&root)) && has_tracked_files(cwd) => {
+            MarkerPlace::Repo
+        }
+        _ => MarkerPlace::Parent,
+    }
+}
+
+/// The root of the git repository `dir` is in, never above `AMP_HARNESS_CEILING_DIR` (where the
+/// marker search would not find a marker).
+fn repo_root(dir: &Path) -> Option<PathBuf> {
+    git_toplevel(dir).filter(|root| {
+        std::env::var_os(ENV_CEILING_DIR)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .is_none_or(|ceiling| canon(root).starts_with(canon(&ceiling)))
+    })
+}
+
+/// The repository root of `cwd` (git), else `cwd`.
+fn marker_dir(plan: &Plan) -> PathBuf {
+    if let Some(dir) = &plan.dir {
+        return dir.clone();
+    }
+    repo_root(&plan.cwd).unwrap_or_else(|| plan.cwd.clone())
+}
+
+/// Where a new `.amp.json` goes when `found` is the marker the working directory sees now
+/// (#2206, #2356): `--dir` when given; with no marker, the repository root (else the working
+/// directory). A marker in the working directory is replaced in place. A marker in a parent
+/// folder is never written over: the new file goes at the repository root when that is below the
+/// parent's marker (so it is found first), else in the working directory.
+fn link_dir(plan: &Plan, found: Option<&ProjectMarker>) -> PathBuf {
+    let usual = marker_dir(plan);
+    let Some(old) = found.filter(|_| plan.dir.is_none()) else {
+        return usual;
+    };
+    if !old.in_parent_of(&plan.cwd) {
+        return plan.cwd.clone();
+    }
+    let (old_dir, usual_c) = (canon(old.dir()), canon(&usual));
+    if usual_c != old_dir && usual_c.starts_with(&old_dir) {
+        usual
+    } else {
+        plan.cwd.clone()
+    }
+}
+
+/// The note for a folder just linked whose workers can't get worktrees (#2356): it is in no git
+/// repository, is a folder another repository doesn't track, or its repository has no commit.
+/// Workers then run in it directly (see the supervisor).
+fn no_repo_note(dir: &Path) -> Option<String> {
+    let root = repo_root(dir).filter(|root| canon(root) == canon(dir) || has_tracked_files(dir));
+    let lead = match root {
+        Some(root) if git_out(&root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_some() => {
+            return None;
+        }
+        Some(root) => format!("the git repository {} has no commit yet", root.display()),
+        None => format!("{} is not a git repository of its own", dir.display()),
+    };
+    let fix = if lead.ends_with("no commit yet") {
+        "Commit once there"
+    } else {
+        "Run `git init` there and commit once"
+    };
+    Some(format!(
+        "Note: {lead}, so workers will work in this folder directly instead of each on its own \
+         branch. {fix} to give them their own worktrees."
+    ))
 }
 
 /// Writes `.amp.json` in `dir`, keeping any other fields an existing file has. `amp_api` is the
@@ -1009,26 +1102,6 @@ fn listed_codes(projects: &[ProjectInfo]) -> BTreeSet<String> {
         .collect()
 }
 
-/// Where a new `.amp.json` goes when it replaces `old`, a marker made for another server (#2206):
-/// the usual place (`--dir`, else the repository root) when the new file shadows `old` there or
-/// overwrites it, else the working directory. So a parent folder's marker for another server is
-/// shadowed, not rewritten.
-fn replacement_dir(plan: &Plan, old: &ProjectMarker) -> PathBuf {
-    let usual = marker_dir(plan);
-    if plan.dir.is_some() {
-        return usual;
-    }
-    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let old_dir = old.path.parent().map(canon).unwrap_or_default();
-    let usual_c = canon(&usual);
-    // `old` sits below the usual place: a file there would not be found first.
-    if old_dir != usual_c && old_dir.starts_with(&usual_c) {
-        plan.cwd.clone()
-    } else {
-        usual
-    }
-}
-
 /// Returns the linked project and whether the person had no projects before this run. Warnings
 /// about the marker (#2206) go to `warnings`.
 async fn project_step(
@@ -1042,6 +1115,8 @@ async fn project_step(
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     let existing = ProjectMarker::find_within(&plan.cwd, ceiling.as_deref());
+    // The marker this folder sees now: a new one never goes over it when it is a parent's (#2356).
+    let found: Option<ProjectMarker> = existing.as_ref().ok().cloned().flatten();
     let summary = |p: &ProjectInfo, marker: PathBuf, created: bool| ProjectSummary {
         id: p.id,
         name: p.name.clone(),
@@ -1050,24 +1125,38 @@ async fn project_step(
         created,
         linked_now: true,
     };
-    // A marker made for another server, which the picker below may replace (#2206).
+    // A marker made for another server (#2206), or a parent folder's marker this folder may not
+    // belong to (#2356), which the picker below may replace (never overwrite).
     let mut replacing: Option<ProjectMarker> = None;
-    let link_dir = |replacing: &Option<ProjectMarker>| match replacing {
-        Some(old) => replacement_dir(plan, old),
-        None => marker_dir(plan),
-    };
+    let mut inherited: Option<ProjectMarker> = None;
+    let dir = link_dir(plan, found.as_ref());
     let link = |ui: &mut dyn Ui,
                 p: &ProjectInfo,
                 created: bool,
-                dir: PathBuf|
+                dir: &Path|
      -> Result<ProjectSummary, CliError> {
-        let path = write_marker(&dir, p, &settings.url)?;
+        let path = write_marker(dir, p, &settings.url)?;
         ui.say(&format!(
             "{} {} and linked this folder ({}).",
             if created { "Created" } else { "Using" },
             p.label(),
             path.display()
         ));
+        if let Some(old) = found
+            .as_ref()
+            .filter(|old| old.in_parent_of(&plan.cwd) && canon(&old.path) != canon(&path))
+        {
+            ui.say(&format!(
+                "The parent folder's {} (#{}) is unchanged.",
+                old.path.display(),
+                old.project_id
+            ));
+        }
+        if ui.interactive()
+            && let Some(note) = no_repo_note(dir)
+        {
+            ui.say(&note);
+        }
         Ok(summary(p, path, created))
     };
 
@@ -1078,7 +1167,7 @@ async fn project_step(
             let p = ProjectInfo::from_value(&v).ok_or_else(|| {
                 CliError::new(format!("amp_get_project {id}: no project in the answer"))
             })?;
-            return Ok((Some(link(ui, &p, false, marker_dir(plan))?), false));
+            return Ok((Some(link(ui, &p, false, &dir)?), false));
         }
         ProjectArg::Create {
             name,
@@ -1115,7 +1204,7 @@ async fn project_step(
                         e
                     }
                 })?;
-            return Ok((Some(link(ui, &p, true, marker_dir(plan))?), false));
+            return Ok((Some(link(ui, &p, true, &dir)?), false));
         }
         ProjectArg::Auto => {}
     }
@@ -1127,6 +1216,7 @@ async fn project_step(
                 marker.project_id,
                 marker.project_name.as_deref().unwrap_or("")
             );
+            let label = label.trim_end();
             // #2206: project ids are per server. A marker made for another server, or naming
             // another project than this server's, is said; the former is not used silently.
             let foreign = marker.other_server(&settings.url).is_some();
@@ -1149,18 +1239,38 @@ async fn project_step(
                 }
                 warnings.push(w);
             }
-            let keep = (foreign && !ui.interactive())
-                || (!foreign && plan.mode == Mode::FirstRun)
-                || (!foreign && !ui.interactive())
-                || (!foreign
-                    && ui.confirm(
-                        &format!(
-                            "This folder is linked to project {} ({}). Keep it?",
-                            label.trim_end(),
-                            marker.path.display()
-                        ),
-                        true,
-                    )?);
+            // #2356: a parent folder's marker is used without asking only for an ordinary
+            // subfolder of the linked repository (`cd src/`).
+            let place = marker_place(&plan.cwd, &marker);
+            let shown = marker.shown_from(&plan.cwd);
+            let keep = if foreign {
+                !ui.interactive()
+            } else if !ui.interactive() {
+                if place == MarkerPlace::Parent {
+                    warnings.push(format!(
+                        "this folder uses project {label} from {shown} in a parent folder; \
+                         `amp-harness init --project ID` (or --create NAME) here links it on its \
+                         own"
+                    ));
+                }
+                true
+            } else if plan.mode == Mode::FirstRun {
+                place != MarkerPlace::Parent
+            } else {
+                let question = if place == MarkerPlace::Here {
+                    format!(
+                        "This folder is linked to project {label} ({}). Keep it?",
+                        marker.path.display()
+                    )
+                } else {
+                    format!(
+                        "This folder uses project {label} from {shown} in a parent folder ({}). \
+                         Keep it?",
+                        marker.path.display()
+                    )
+                };
+                ui.confirm(&question, true)?
+            };
             let kept = ProjectSummary {
                 id: marker.project_id,
                 name: marker.project_name.clone(),
@@ -1174,6 +1284,20 @@ async fn project_step(
             }
             if foreign {
                 replacing = Some(marker);
+            } else if place != MarkerPlace::Here {
+                if plan.mode == Mode::FirstRun {
+                    let folder = plan
+                        .cwd
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| plan.cwd.display().to_string());
+                    ui.say(&format!(
+                        "This folder ({folder}) has no .amp.json of its own: it would use project \
+                         {label} from {shown} in a parent folder ({}).",
+                        marker.path.display()
+                    ));
+                }
+                inherited = Some(marker);
             }
         }
         Ok(None) => {}
@@ -1200,7 +1324,7 @@ async fn project_step(
         .into_iter()
         .filter(|p| p.state.as_deref().is_none_or(|s| s == "active"))
         .collect();
-    let default_name = marker_dir(plan)
+    let default_name = dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "My project".to_owned());
@@ -1216,18 +1340,28 @@ async fn project_step(
     });
     let skip =
         |ui: &mut dyn Ui, new_user: bool| -> Result<(Option<ProjectSummary>, bool), CliError> {
+            // #2356: Enter on a parent's project links this folder to it too, so the next start
+            // does not ask again; the parent's file stays as it is.
+            if let Some(m) = &inherited {
+                let p = ProjectInfo {
+                    id: m.project_id,
+                    name: m.project_name.clone(),
+                    code: m.project_code.clone(),
+                    state: None,
+                };
+                return Ok((Some(link(ui, &p, false, &dir)?), new_user));
+            }
             match &kept {
-            Some(k) => ui.say(&format!(
-                "Keeping #{} from {} for now: run `amp-harness init` here to link this server's \
-                 project.",
-                k.id,
-                k.marker.display()
-            )),
-            None => ui.say("No project for now: run `amp-harness init` later to link one."),
-        }
+                Some(k) => ui.say(&format!(
+                    "Keeping #{} from {} for now: run `amp-harness init` here to link this \
+                     server's project.",
+                    k.id,
+                    k.marker.display()
+                )),
+                None => ui.say("No project for now: run `amp-harness init` later to link one."),
+            }
             Ok((kept.clone(), new_user))
         };
-    let dir = link_dir(&replacing);
 
     if projects.is_empty() {
         ui.say("You have no AMP projects yet. Projects hold the plan, the tickets and the knowledge base.");
@@ -1235,11 +1369,13 @@ async fn project_step(
             return skip(ui, true);
         }
         let p = create_interactive(ui, client, &default_name, taken.clone()).await?;
-        return Ok((Some(link(ui, &p, true, dir.clone())?), true));
+        return Ok((Some(link(ui, &p, true, &dir)?), true));
     }
 
     ui.say(if replacing.is_some() {
         "Pick this server's project for this folder, or create a new one:"
+    } else if inherited.is_some() {
+        "Pick a project for this folder, or create a new one:"
     } else {
         "This folder isn't linked to an AMP project yet. Pick one, or create a new one:"
     });
@@ -1253,12 +1389,16 @@ async fn project_step(
         ));
     }
     ui.say("   n) a new project");
-    let question = match &replacing {
-        Some(m) => format!(
+    let question = match (&replacing, &inherited) {
+        (Some(m), _) => format!(
             "Project (number, #id, n, or Enter to keep #{} from .amp.json)",
             m.project_id
         ),
-        None => "Project (number, #id, n, or Enter to skip)".to_owned(),
+        (None, Some(m)) => format!(
+            "Project (number, #id, n, or Enter to use #{} here too)",
+            m.project_id
+        ),
+        (None, None) => "Project (number, #id, n, or Enter to skip)".to_owned(),
     };
     loop {
         let answer = ui.ask(&question, Some(""))?;
@@ -1268,7 +1408,7 @@ async fn project_step(
         }
         if answer.eq_ignore_ascii_case("n") || answer.eq_ignore_ascii_case("new") {
             let p = create_interactive(ui, client, &default_name, taken.clone()).await?;
-            return Ok((Some(link(ui, &p, true, dir.clone())?), false));
+            return Ok((Some(link(ui, &p, true, &dir)?), false));
         }
         let chosen = if let Some(id) = answer.strip_prefix('#') {
             id.trim().parse::<i64>().ok().and_then(|id| {
@@ -1309,7 +1449,7 @@ async fn project_step(
                 }
             }
         }
-        return Ok((Some(link(ui, &p, false, dir.clone())?), false));
+        return Ok((Some(link(ui, &p, false, &dir)?), false));
     }
 }
 

@@ -173,6 +173,13 @@ files:
 
   skills/amp-init/SKILL.md:
     body:
+      # #2356: in the harness, linking a folder is `amp-harness init`'s job, and a parent folder's
+      # .amp.json must never be overwritten. #2363: with no .amp.json at all, the manager links it.
+      - find: "Use this skill when there is no `.amp.json` in the current directory."
+        replace: |-
+          Use this skill when there is no `.amp.json` in the current directory.
+
+          In amp-harness, a folder is linked by `amp-harness init` (the person; it creates or picks the project, writes `.amp.json` and never overwrites a parent folder's), or by you with this skill when there is no `.amp.json` here or above. If `<amp_context>` has a `project_marker_note`, the session's `.amp.json` belongs to a parent folder: when the person asks to set up a new project here, don't create it or plan in the parent's project — tell them which project the folder uses now and where its `.amp.json` is, and ask them to run `amp-harness init` in this folder and start the chat again. Never write `.amp.json` over a parent folder's.
       - paragraph: "You also need the URL of the user's AMP server for `amp_api`."
         with: |
           You also need the URL of the user's AMP server for `amp_api`: in the harness it is the

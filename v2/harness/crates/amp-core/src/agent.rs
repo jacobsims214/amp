@@ -1518,6 +1518,19 @@ fn amp_context(
                 lines.push(format!("project_code: {code}"));
             }
             lines.push(format!("project_marker: {}", p.path.display()));
+            // #2356: a parent folder's marker. "Set up a new project here" is not a plan in it.
+            if p.in_parent_of(cwd) {
+                lines.push(format!(
+                    "project_marker_note: this .amp.json is in a parent folder ({}), not in the \
+                     working directory. If your user asks to set up a new project for this \
+                     folder, don't create or plan it in #{id}: tell them this folder uses #{id} \
+                     from that parent's .amp.json and that running `amp-harness init` here links \
+                     this folder to its own project (it writes .amp.json here and never changes \
+                     the parent's), then restart the chat here.",
+                    p.dir().display(),
+                    id = p.project_id
+                ));
+            }
         }
         None => lines.push(
             "project_id: none (no .amp.json found; ask which project, or use amp_list_projects)"
@@ -1901,6 +1914,23 @@ mod tests {
             text.contains("\namp_web_ui: http://localhost:5173 ("),
             "{text}"
         );
+        assert!(!text.contains("project_marker_note"), "{text}");
+        // #2356: from a folder below the marker, the manager is told it is a parent's and to
+        // point at `amp-harness init` for a new project here.
+        let text = amp_context(
+            manager,
+            &compose,
+            Some(&marker),
+            Path::new("/repo/new-folder"),
+            None,
+        );
+        let note = text
+            .lines()
+            .find(|l| l.starts_with("project_marker_note: "))
+            .expect("a note");
+        assert!(note.contains("parent folder (/repo)"), "{note}");
+        assert!(note.contains("`amp-harness init` here"), "{note}");
+        assert!(note.contains("don't create or plan it in #2"), "{note}");
         let text = amp_context(manager, &session("u", None), None, Path::new("/r"), None);
         assert!(text.contains("project_id: none"), "{text}");
     }

@@ -23,7 +23,9 @@ use amp_core::{
     supervisor::{ManagerContext, Supervisor, SupervisorConfig, WorkerHooks, WorkerOutcome},
 };
 use amp_mcp::{AmpMcpClient, ClientOptions};
-use amp_tui::{Shell, ShellInfo, chrome::sample, workers::READ_ONLY_KEYS};
+use amp_tui::{
+    ESC_HINT, ESC_HINT_FOR, Shell, ShellInfo, chrome::sample, esc_hint, workers::READ_ONLY_KEYS,
+};
 use common::{MockAmp, Running, spawn};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
@@ -539,5 +541,81 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     assert!(
         screen.contains("/worker: #123456 has no worker session in this chat or on disk"),
         "{screen}"
+    );
+}
+
+/// #2354: Esc that leaves a worker's session during the reply doesn't make the next Esc stop the
+/// reply (and every worker) unannounced: the spinner line says so first, naming the workers, as
+/// it does after Esc closes a panel; the Esc after that stops them, and the transcript says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn esc_leaving_a_session_hints_before_the_next_esc_stops_the_workers() {
+    let mut r = rig("esc-after-session").await;
+    r.shell.submit("run both tickets").await;
+    r.until("both workers", |r| r.sup.workers().len() == 2)
+        .await;
+    let live = r.shell.live_tickets();
+    assert_eq!(live.len(), 2, "{live:?}");
+    let hint = esc_hint(&live);
+    assert_eq!(
+        hint,
+        format!("{ESC_HINT} and the workers on #{}, #{}", live[0], live[1])
+    );
+
+    r.shell.submit(&format!("/worker {A}")).await;
+    assert_eq!(r.shell.viewing(), Some(A));
+    assert!(r.press(KeyCode::Esc).await);
+    assert_eq!(r.shell.viewing(), None);
+    assert!(
+        r.shell.is_running(),
+        "leaving the session doesn't stop the reply"
+    );
+    assert_eq!(
+        r.shell.view().working_message().as_deref(),
+        Some(hint.as_str())
+    );
+    assert!(r.screen().contains(&hint), "{}", r.screen());
+
+    // The hint goes after ESC_HINT_FOR; until then nothing has stopped.
+    r.pump();
+    assert_eq!(r.sup.workers().len(), 2);
+    assert!(r.shell.expire_hints(Instant::now() + ESC_HINT_FOR));
+    assert_eq!(
+        r.shell.view().working_message().as_deref(),
+        Some("Working…")
+    );
+
+    // Back in, out again: the hint is back, and the next Esc stops the reply and its workers,
+    // naming them.
+    r.shell.submit(&format!("/worker {B}")).await;
+    assert!(r.press(KeyCode::Esc).await);
+    assert_eq!(
+        r.shell.view().working_message().as_deref(),
+        Some(hint.as_str())
+    );
+    assert!(r.press(KeyCode::Esc).await);
+    assert!(
+        r.screen().contains(&format!(
+            "stopping the workers on #{}, #{} too; their tickets go back to ready",
+            live[0], live[1]
+        )),
+        "{}",
+        r.screen()
+    );
+    r.until("the reply and both workers to stop", |r| {
+        !r.shell.is_running() && r.finished(A) && r.finished(B)
+    })
+    .await;
+}
+
+#[test]
+fn esc_hint_names_one_worker_or_caps_many() {
+    assert_eq!(esc_hint(&[]), ESC_HINT);
+    assert_eq!(
+        esc_hint(&[222]),
+        format!("{ESC_HINT} and the worker on #222")
+    );
+    assert_eq!(
+        esc_hint(&[1, 2, 3, 4, 5]),
+        format!("{ESC_HINT} and the workers on #1, #2, #3 +2 more")
     );
 }

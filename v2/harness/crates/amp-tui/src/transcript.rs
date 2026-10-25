@@ -20,8 +20,8 @@
 //! - [`ThinkingBlock`]: a thinking section, collapsed to one live `▸ Thinking · 18s` line by
 //!   default (#2177), `▸ Thought for 18s` once it ends (#2345); expanded, plain dim text behind
 //!   a `│` gutter ([`ThinkingDisplay`]). A click on its line or Ctrl+T opens and closes it.
-//! - [`UserBlock`]: the user's message on its surface, with the OSC 133 prompt markers; plain
-//!   text, shown exactly as typed (#2350).
+//! - [`UserBlock`]: the user's message on its surface; plain text, shown exactly as typed
+//!   (#2350), with no OSC 133 prompt markers (#2357).
 //! - [`ToolBlock`]: a tool call on one line (status glyph, title, argument, the result's
 //!   summary, `12 ms`), its details under it when expanded (Ctrl+O, [`ToolDisplay`]); a failed
 //!   call shows its error. [`ToolGroup`] holds consecutive calls as one block (#2183).
@@ -586,9 +586,11 @@ impl ThinkingDisplay {
 
 struct ThinkingState {
     text: String,
-    started: Instant,
+    /// When it started (`None`: not known, #2355).
+    started: Option<Instant>,
     ended: Option<Instant>,
-    /// Whether it was seen streaming (a replayed message has no duration to show).
+    /// Whether it was seen streaming with known times (a replayed message has no duration to
+    /// show).
     timed: bool,
     /// A blank row after it (something visible follows).
     spacer: bool,
@@ -621,10 +623,15 @@ impl ThinkingBlock {
     const PAD: usize = 1;
 
     pub fn new(display: ThinkingDisplay, text: impl Into<String>) -> Self {
+        Self::new_at(display, text, Some(Instant::now()))
+    }
+
+    /// A section that started `at` (`None`: not known, so it shows no duration; #2355).
+    pub fn new_at(display: ThinkingDisplay, text: impl Into<String>, at: Option<Instant>) -> Self {
         Self {
             state: Mutex::new(ThinkingState {
                 text: text.into(),
-                started: Instant::now(),
+                started: at,
                 ended: None,
                 timed: true,
                 spacer: false,
@@ -648,11 +655,16 @@ impl ThinkingBlock {
     /// The thinking is over (the answer started, or the message ended). `timed: false` when it
     /// was never seen streaming.
     pub fn end(&self, timed: bool) {
+        self.end_at(timed, Some(Instant::now()));
+    }
+
+    /// [`Self::end`] at `at` (`None`: not known, so no duration; #2355).
+    pub fn end_at(&self, timed: bool, at: Option<Instant>) {
         if let Ok(mut s) = self.state.lock()
             && s.ended.is_none()
         {
-            s.ended = Some(Instant::now());
-            s.timed = timed;
+            s.ended = Some(at.unwrap_or_else(Instant::now));
+            s.timed = timed && at.is_some();
         }
     }
 
@@ -693,13 +705,13 @@ impl ThinkingBlock {
 
     /// `Thinking · 18s` while it streams, `Thought for 18s` after, `Thinking` without a duration.
     fn label(s: &ThinkingState) -> String {
-        if !s.timed {
+        let Some(started) = s.started.filter(|_| s.timed) else {
             return "Thinking".to_owned();
-        }
+        };
         let secs = s
             .ended
             .unwrap_or_else(Instant::now)
-            .duration_since(s.started)
+            .saturating_duration_since(started)
             .as_secs();
         if s.ended.is_some() {
             format!("Thought for {secs}s")
@@ -879,13 +891,19 @@ impl AssistantBlock {
     }
 
     pub fn update_blocks(&self, blocks: &[Block]) {
+        self.update_blocks_at(blocks, Some(Instant::now()));
+    }
+
+    /// [`Self::update_blocks`] for an update that happened `at` (a session caught up from its
+    /// feed or file, #2355; `None`: not known).
+    pub fn update_blocks_at(&self, blocks: &[Block], at: Option<Instant>) {
         if let Ok(mut b) = self.blocks.lock() {
             if *b == blocks {
                 return;
             }
             *b = blocks.to_vec();
         }
-        self.rebuild(blocks);
+        self.rebuild(blocks, at);
     }
 
     /// It comes right after a tool group: a blank row separates them when it shows anything
@@ -896,10 +914,15 @@ impl AssistantBlock {
 
     /// The message is complete: its thinking stops its timers.
     pub fn finish(&self) {
+        self.finish_at(Some(Instant::now()));
+    }
+
+    /// [`Self::finish`] for a message that ended `at` (#2355; `None`: not known).
+    pub fn finish_at(&self, at: Option<Instant>) {
         self.finished.store(true, Ordering::Relaxed);
         if let Ok(t) = self.thinking.lock() {
             for block in t.iter() {
-                block.end(true);
+                block.end_at(true, at);
             }
         }
     }
@@ -983,7 +1006,7 @@ impl AssistantBlock {
         rows
     }
 
-    fn rebuild(&self, blocks: &[Block]) {
+    fn rebuild(&self, blocks: &[Block], at: Option<Instant>) {
         self.content.clear();
         let visible = |b: &Block| match b {
             Block::Text(t) | Block::Thinking(t) => !t.trim().is_empty(),
@@ -1026,17 +1049,17 @@ impl AssistantBlock {
                             Arc::clone(b)
                         }
                         None => {
-                            let b = Arc::new(ThinkingBlock::new(display, text));
+                            let b = Arc::new(ThinkingBlock::new_at(display, text, at));
                             // Seen complete at once (a replayed message): no duration.
                             if followed || finished {
-                                b.end(false);
+                                b.end_at(false, at);
                             }
                             thinking.push(Arc::clone(&b));
                             b
                         }
                     };
                     if followed || finished {
-                        block.end(true);
+                        block.end_at(true, at);
                     }
                     block.set_spacer(followed);
                     self.content.add_child(block);
@@ -1086,7 +1109,7 @@ impl Component for AssistantBlock {
     fn invalidate(&self) {
         let blocks = self.blocks.lock().map(|b| b.clone()).unwrap_or_default();
         if !blocks.is_empty() {
-            self.rebuild(&blocks);
+            self.rebuild(&blocks, Some(Instant::now()));
         }
         self.content.invalidate();
     }
@@ -1096,14 +1119,18 @@ impl Component for AssistantBlock {
     }
 }
 
-const OSC133_ZONE_START: &str = "\x1b]133;A\x07";
-const OSC133_ZONE_END: &str = "\x1b]133;B\x07";
-const OSC133_ZONE_FINAL: &str = "\x1b]133;C\x07";
-
-/// The user's message: plain text on the theme's surface colour inside a padded box, between
-/// OSC 133 prompt-zone markers (pi's `UserMessageComponent`), word-wrapped. It is shown exactly
-/// as typed, not as markdown (#2350): paths like `mathx/__init__.py`, `snake_case` and `*.rs`
-/// globs are what engineers type, and emphasis parsing would change them on screen.
+/// The user's message: plain text on the theme's surface colour inside a padded box,
+/// word-wrapped. It is shown exactly as typed, not as markdown (#2350): paths like
+/// `mathx/__init__.py`, `snake_case` and `*.rs` globs are what engineers type, and emphasis
+/// parsing would change them on screen.
+///
+/// No OSC 133 prompt-zone markers (pi's `UserMessageComponent` has them, #2357): `133;A` means
+/// "prompt start, fresh-line", and iTerm2 (by default) and other terminals following the
+/// semantic-prompts spec answer it with CR+LF when the cursor isn't in column 0. A frame row
+/// never starts the marker there (the inset's padding comes first, and the differ redraws from
+/// mid-row), so the bubble's first row landed one row down and was drawn over: in compact
+/// density that row is the first line of the message, which vanished. On the alternate screen
+/// the marks have no use (no scrollback to jump through), so they are not sent at all.
 pub struct UserBlock {
     text: String,
     inner: Mutex<(u64, BgBox)>,
@@ -1164,14 +1191,6 @@ impl Component for UserBlock {
             *inner = (revision, user_box(&self.text));
         }
         let mut lines = inner.1.render(width);
-        if let Some(first) = lines.first_mut() {
-            first.insert_str(0, OSC133_ZONE_START);
-        }
-        // The zone ends after the text: at the end of the last row, so a one-row bubble
-        // (compact, #2346) still reads start, text, end.
-        if let Some(last) = lines.last_mut() {
-            last.push_str(&format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}"));
-        }
         if self.margin_above && !lines.is_empty() {
             lines.insert(0, String::new());
         }
@@ -1326,9 +1345,15 @@ impl ToolBlock {
     }
 
     pub fn set_running(&self) {
+        self.set_running_at(Some(Instant::now()));
+    }
+
+    /// The call started `at` (a session caught up from its feed or file, #2355; `None`: not
+    /// known, so it shows no duration).
+    pub fn set_running_at(&self, at: Option<Instant>) {
         if let Ok(mut i) = self.inner.lock() {
             i.state = ToolState::Running;
-            i.started = Some(Instant::now());
+            i.started = at;
         }
         self.clear_cache();
     }
@@ -1336,6 +1361,12 @@ impl ToolBlock {
     /// The call ended: `summary` goes on its line, `detail` (the result, or the error) under it
     /// when expanded, and always for an error.
     pub fn set_result(&self, summary: &str, detail: &str, is_error: bool) {
+        self.set_result_at(summary, detail, is_error, Some(Instant::now()));
+    }
+
+    /// [`Self::set_result`] for a call that ended `at` (#2355; `None`: not known, so no
+    /// duration rather than a wrong one).
+    pub fn set_result_at(&self, summary: &str, detail: &str, is_error: bool, at: Option<Instant>) {
         if let Ok(mut i) = self.inner.lock() {
             i.summary = summary.to_owned();
             i.detail = Some(detail.to_owned());
@@ -1344,7 +1375,7 @@ impl ToolBlock {
             } else {
                 ToolState::Completed
             };
-            i.finished = Some(Instant::now());
+            i.finished = at;
         }
         self.clear_cache();
     }
@@ -1367,7 +1398,7 @@ impl ToolBlock {
     /// How long the call took, once it has ended.
     fn took(&self) -> Option<Duration> {
         let i = self.inner.lock().ok()?;
-        Some(i.finished?.duration_since(i.started?))
+        Some(i.finished?.saturating_duration_since(i.started?))
     }
 
     fn clear_cache(&self) {
@@ -1429,7 +1460,7 @@ impl ToolBlock {
         let elapsed = match (inner.state, inner.started, inner.finished) {
             (ToolState::Running, Some(s), _) => running_elapsed(s.elapsed()),
             (ToolState::Completed | ToolState::Failed, Some(s), Some(f)) => {
-                format_elapsed(f.duration_since(s))
+                format_elapsed(f.saturating_duration_since(s))
             }
             _ => String::new(),
         };
@@ -1665,14 +1696,15 @@ impl ToolGroup {
     /// The folded calls' line: `✓ 4 calls · get_task ×3, list_tasks · 140 ms`.
     fn folded_line(calls: &[&Arc<ToolBlock>], width: usize) -> String {
         let mut kinds: Vec<(String, usize)> = Vec::new();
-        let mut took = Duration::ZERO;
+        // Unknown when any call's duration is (#2355): no total rather than a short one.
+        let mut took = Some(Duration::ZERO);
         for call in calls {
             let kind = call.kind();
             match kinds.iter_mut().find(|(k, _)| *k == kind) {
                 Some((_, n)) => *n += 1,
                 None => kinds.push((kind, 1)),
             }
-            took += call.took().unwrap_or_default();
+            took = took.zip(call.took()).map(|(a, b)| a + b);
         }
         let names: Vec<String> = kinds
             .iter()
@@ -1692,7 +1724,7 @@ impl ToolGroup {
                 args: "",
                 summary: &names.join(", "),
                 error: false,
-                elapsed: &format_elapsed(took),
+                elapsed: &took.map(format_elapsed).unwrap_or_default(),
             },
             width,
         )
@@ -2032,17 +2064,69 @@ mod tests {
 
     const TYPED: &str = "export it from mathx/__init__.py, rename a_b_c, match *.rs and keep **x**";
 
+    /// #2357: what a long message looks like after sending, at the chat's widths and both
+    /// densities: every character is on the bubble's rows, in order, and every row fits.
     #[test]
-    fn a_one_row_message_marks_its_prompt_zone_in_order() {
-        let rows = UserBlock::new("hi").render(40);
-        assert_eq!(rows.len(), 1, "{rows:?}");
-        let (a, b, c) = (
-            rows[0].find(OSC133_ZONE_START).unwrap(),
-            rows[0].find(OSC133_ZONE_END).unwrap(),
-            rows[0].find(OSC133_ZONE_FINAL).unwrap(),
+    fn a_long_message_shows_every_character_and_every_row_fits() {
+        let paragraph = (0..120)
+            .map(|i| format!("w{i:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let url = format!(
+            "https://example.com/{}/END",
+            (0..60).map(|i| format!("seg{i:03}")).collect::<String>()
         );
-        let text = rows[0].find("hi").unwrap();
-        assert!(a < text && text < b && b < c, "{:?}", rows[0]);
+        let lines = (0..30)
+            .map(|i| format!("line{i:02} text"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let pasted = format!("{lines}\n{paragraph}");
+        let wide = (0..40)
+            .map(|i| format!("e{i:02}🚀中文字"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        for text in [&paragraph, &url, &lines, &pasted, &wide] {
+            for density in [crate::Density::Compact, crate::Density::Comfortable] {
+                // The transcript's width inside the inset at 80, 120 and 200 columns, and narrow.
+                for width in [40, 78, 116, 196] {
+                    let rows = crate::density::with(density, || {
+                        UserBlock::new(text.as_str()).render(width)
+                    });
+                    let raw = rows.join("\n");
+                    assert!(!raw.contains("\x1b]133"), "{density:?} {width}: {raw:?}");
+                    for row in &rows {
+                        assert!(
+                            visible_width_of(row) <= width,
+                            "{density:?} {width}: {row:?} is {} wide",
+                            visible_width_of(row)
+                        );
+                        assert!(!plain(row).contains('…'), "{density:?} {width}: {row:?}");
+                    }
+                    let shown: String = plain_rows(&rows).concat().split_whitespace().collect();
+                    let sent: String = text.split_whitespace().collect();
+                    assert_eq!(
+                        shown,
+                        sent,
+                        "{density:?} {width}:\n{}",
+                        plain_rows(&rows).join("\n")
+                    );
+                    // The first line of the message is on the bubble's first text row (compact:
+                    // its first row), the row a fresh-line from `133;A` used to lose.
+                    let first_text = plain_rows(&rows)
+                        .into_iter()
+                        .find(|r| !r.trim().is_empty())
+                        .unwrap();
+                    let start: String = text.chars().take(3).collect();
+                    assert!(
+                        first_text.trim_start().starts_with(&start),
+                        "{density:?} {width}: {first_text:?}"
+                    );
+                    if density == crate::Density::Compact {
+                        assert!(!plain(&rows[0]).trim().is_empty(), "{rows:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -923,7 +923,7 @@ impl Supervisor {
         };
         if wants_worktree {
             match self.worktree(req).await {
-                Ok(Some(wt)) => {
+                Ok(Ok(wt)) => {
                     if wt.reused {
                         notes.push(format!(
                             "reused the existing worktree {}",
@@ -934,10 +934,7 @@ impl Supervisor {
                     info.worktree = Some(wt.path);
                     info.branch = wt.branch;
                 }
-                Ok(None) => notes.push(format!(
-                    "{} is not in a git repository; the worker ran there without a worktree",
-                    self.manager.cwd.display()
-                )),
+                Ok(Err(why)) => notes.push(no_worktree_note(&self.manager.cwd, why.as_deref())),
                 Err(e) => {
                     return self
                         .finish(
@@ -1189,14 +1186,40 @@ impl Supervisor {
         report
     }
 
-    /// Creates or reuses `<repo>/.worktrees/<task_id>`. `Ok(None)` when the manager is not in a
-    /// git repository.
-    async fn worktree(&self, req: &RunRequest) -> Result<Option<Worktree>, String> {
+    /// Creates or reuses `<repo>/.worktrees/<task_id>`. `Ok(Err(why))` when the worker runs in the
+    /// manager's directory instead: `None` when that is not in a git repository (#2356).
+    async fn worktree(&self, req: &RunRequest) -> Result<Result<Worktree, Option<String>>, String> {
         let _lock = self.git_lock.lock().await;
-        let Ok(top) = git(&self.manager.cwd, &["rev-parse", "--show-toplevel"]).await else {
-            return Ok(None);
+        let cwd = &self.manager.cwd;
+        let Ok(top) = git(cwd, &["rev-parse", "--show-toplevel"]).await else {
+            return Ok(Err(None));
         };
         let top = PathBuf::from(top);
+        // #2356: a folder inside another repository that tracks none of its files (a new folder
+        // under a linked one) would get a worktree of that other repository, without its files.
+        // And a repository with no commit has nothing to branch from. Both run in place, said.
+        if !same_path(&top, cwd)
+            && git(cwd, &["ls-files", "--", "."])
+                .await
+                .is_ok_and(|out| out.is_empty())
+        {
+            return Ok(Err(Some(format!(
+                "{} is inside the git repository {} but none of its files are in it, so a \
+                 worktree of that repository would not contain this folder",
+                cwd.display(),
+                top.display()
+            ))));
+        }
+        if req.base.is_none()
+            && git(&top, &["rev-parse", "--verify", "--quiet", "HEAD"])
+                .await
+                .is_err()
+        {
+            return Ok(Err(Some(format!(
+                "the git repository {} has no commit yet, so there is nothing to branch from",
+                top.display()
+            ))));
+        }
         let path = top.join(".worktrees").join(req.task_id.to_string());
         exclude_worktrees_dir(&top).await;
 
@@ -1214,7 +1237,7 @@ impl Supervisor {
                 .await
                 .ok()
                 .filter(|b| !b.is_empty());
-            return Ok(Some(Worktree {
+            return Ok(Ok(Worktree {
                 path,
                 branch,
                 reused: true,
@@ -1244,7 +1267,7 @@ impl Supervisor {
             let base = req.base.clone().unwrap_or_else(|| "HEAD".to_owned());
             git(&top, &["worktree", "add", "-b", &branch, &path_str, &base]).await?;
         }
-        Ok(Some(Worktree {
+        Ok(Ok(Worktree {
             path,
             branch: Some(branch),
             reused: false,
@@ -1540,6 +1563,21 @@ fn same_path(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// The note a worker's report carries when it ran in the manager's directory `cwd` without a
+/// worktree: `why` is the reason, `None` when `cwd` is not in a git repository (#2356).
+fn no_worktree_note(cwd: &Path, why: Option<&str>) -> String {
+    let why = why.map_or_else(
+        || format!("{} is not in a git repository", cwd.display()),
+        str::to_owned,
+    );
+    format!(
+        "{why}; the worker ran in {} without a worktree (its own branch). To give workers their \
+         own worktrees, run `git init` in {} and commit once",
+        cwd.display(),
+        cwd.display()
+    )
 }
 
 /// Runs git in `dir`; stdout trimmed, or stderr as the error.

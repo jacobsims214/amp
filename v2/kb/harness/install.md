@@ -78,7 +78,8 @@ Press Enter to keep the value in [brackets]:
 2. **Login.** "Log in with your browser now?" Setup opens AMP's sign-in page and keeps the login
    in your OS keychain.
 3. **Project.** Setup links this folder to an AMP project: an existing one, or a new one it
-   creates. It writes `.amp.json` at the repository root.
+   creates. It writes `.amp.json` at the repository root (or in this folder when it isn't in a
+   git repository). See "A folder inside a linked folder" below.
 4. **Model provider.** If no provider has a key yet, setup asks which one to use:
    OpenRouter (the shipped roster), an Anthropic API key, an OpenAI API key, or your own
    OpenAI-compatible endpoint (`harness/enterprise-provider.md`). The key is typed hidden,
@@ -91,6 +92,29 @@ For scripts, everything has a flag (`amp-harness setup --help`): `--url`, `--pro
 `--create NAME`, `--no-project`, `--key-env VAR`, `--profile NAME`, `--preset FILE|URL`,
 `--yes` (never ask) and `--json`. With `--yes` and no `--login`, setup doesn't open a browser.
 `--url` takes the same forms as `server set`: `amp.example.com`, `localhost:18000` or a full URL.
+
+## A folder inside a linked folder
+
+The harness uses the nearest `.amp.json` in this folder or any folder above it. A subfolder of a
+linked repository (`cd src/`) uses the repository's project without asking. A folder that may be
+a project of its own is asked about once:
+
+- a new, empty or untracked folder inside a linked repository,
+- a folder with its own git repository below a linked folder,
+- a folder that is in no git repository, below a linked folder.
+
+The first run says `This folder (my-app) has no .amp.json of its own: it would use project #45
+Harness play from ../.amp.json in a parent folder` and shows the project picker. Pick or create
+a project to give this folder its own `.amp.json`, or press Enter to use the parent's project
+here too (that also writes a `.amp.json` here, so you aren't asked again). `amp-harness init` in
+that folder does the same. Setup never writes over a parent folder's `.amp.json`: the new one
+goes in this folder (or at its own repository's root), and setup says the parent's file is
+unchanged. The chat banner and `/project` show where the `.amp.json` is when it is in a parent
+folder (`project #45 Harness play (from ../.amp.json)`).
+
+Workers need a git repository with at least one commit to get their own worktree and branch.
+In a folder that isn't one (or a new folder inside another repository), they run in the folder
+itself and their report says so; run `git init` and commit once to give them worktrees.
 
 ## Check it
 
