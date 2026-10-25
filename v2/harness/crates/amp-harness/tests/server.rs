@@ -53,7 +53,10 @@ async fn server_answering(dir: &Path, args: &[&str], stdin: &str) -> Output {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().expect("spawn amp-harness");
     let mut input = child.stdin.take().unwrap();
-    input.write_all(stdin.as_bytes()).await.unwrap();
+    // A run that ends without reading all its input closes the pipe first (#2385).
+    if let Err(e) = input.write_all(stdin.as_bytes()).await {
+        assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe, "{e}");
+    }
     drop(input);
     let out = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
         .await
