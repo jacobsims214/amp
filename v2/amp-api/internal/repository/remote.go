@@ -394,3 +394,15 @@ func (r *Repo) PruneRemoteDevices(ctx context.Context, ownerUserID int, harnessI
 		AND NOT (device_id = ANY($3))`, ownerUserID, harnessID, keep)
 	return int(tag.RowsAffected()), err
 }
+
+// MigrationApplied reports whether amp-api has applied the migration version
+// (e.g. "027_remote_control"). amp-relay never migrates; it waits for this.
+func (r *Repo) MigrationApplied(ctx context.Context, version string) (bool, error) {
+	var ok bool
+	err := r.db.QueryRow(ctx, `SELECT to_regclass('schema_migrations') IS NOT NULL`).Scan(&ok)
+	if err != nil || !ok {
+		return false, err
+	}
+	err = r.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)`, version).Scan(&ok)
+	return ok, err
+}

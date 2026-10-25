@@ -412,6 +412,7 @@ data:
             endpoints:
               - lb_endpoints:
                   - endpoint: { address: { socket_address: { address: amp-api.{{ .Values.global.namespace }}.svc.cluster.local, port_value: 3001 } } }
+        {{- include "amp.relayCluster" . | nindent 8 }}
         - name: amp_api_mcp
           type: STRICT_DNS
           lb_policy: ROUND_ROBIN

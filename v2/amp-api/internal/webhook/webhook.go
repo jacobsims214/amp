@@ -179,6 +179,11 @@ func (d *Dispatcher) Run(ctx context.Context) {
 	d.deliverLoop(ctx)
 }
 
+// RunMatching only matches: it writes the outbox rows, and the dispatchers
+// that Run (amp-api's) deliver them. amp-relay uses it for its remote.* audit
+// entries, so the relay never makes outbound webhook calls itself.
+func (d *Dispatcher) RunMatching(ctx context.Context) { d.matchLoop(ctx) }
+
 func (d *Dispatcher) matchLoop(ctx context.Context) {
 	for {
 		select {

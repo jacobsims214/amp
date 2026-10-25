@@ -1,6 +1,6 @@
 name: Build & push AMP images
 
-# Builds the four AMP v2 service images and pushes them to GHCR
+# Builds the AMP v2 service images and pushes them to GHCR
 # (ghcr.io/<owner>/amp/<component>). The Helm chart's values-prod.yaml
 # points image.registry at this same path.
 #
@@ -37,6 +37,8 @@ jobs:
         include:
           - component: amp-api
             dockerfile: v2/amp-api/Dockerfile
+          - component: amp-relay
+            dockerfile: v2/amp-api/Dockerfile.relay
           - component: amp-authadmin
             dockerfile: v2/amp-api/Dockerfile.authadmin
           - component: amp-mcpoauth

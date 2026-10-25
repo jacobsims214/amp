@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Remote control M1 (#2379): the real Rust harness link against the real Go relay.
 #
-# Builds amp-tui's tests/remote_live.rs and runs amp-api's TestRelay_LiveRustHarness, which serves
-# the relay on a real Postgres and runs that binary (laptop + browser) against it.
+# Builds amp-tui's tests/remote_live.rs and runs TestRelay_LiveRustHarness, which serves amp-relay's router (#2387)
+# on a real Postgres and runs that binary (laptop + browser) against it.
 #
 # Needs a Postgres (and Typesense) for the amp-api tests, as `go test ./cmd/server` does:
 #   TEST_DATABASE_URL, TEST_TYPESENSE_URL, TEST_TYPESENSE_KEY
