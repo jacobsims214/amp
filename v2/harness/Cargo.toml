@@ -113,6 +113,16 @@ sse-stream = "=0.2.6"
 futures = "0.3"
 bytes = "1"
 
+# Remote control (#2373, v2/docs/remote-control/protocol.md): ECDSA P-256 signatures in the IEEE
+# P1363 form (`p256` does not normalize s on verify, which the protocol requires), HKDF/HMAC for
+# pairing on the same digest major as p256 (sha2 0.10), the OS CSPRNG, and token patterns for
+# redaction (regex is already in the tree through rpi-tools).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256", "std"] }
+hkdf = "0.12"
+hmac = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+regex = "1"
+
 # Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
 axum = "0.8"
 base64 = "0.22"

@@ -160,7 +160,7 @@
         },
         "last_applied_seq": 42
       },
-      "wire": "{\"sig\": \"vezI0s-jzg1kDm7IDp_DDH0UMakLxV1m4XKkScQtWrmVaf28V8zSRgrtnErhjXvqdDsHxI8PAW-5GKcGmWIBHw\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"HdZwiIfIALl2GkPHX9cScA\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"-DgqaaGm84DMGbygNGucJoOINe5X7GUwgOaIPfxEphM\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "wire": "{\"sig\": \"e-aQUBkAA013MuA81kr7E2KcwGcFn3fyQdAepOEyskPrZWVi0bj9S9ThniSAWrdA_dGP0UyG11NfA8M-ukofXg\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"code\": null, \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"HdZwiIfIALl2GkPHX9cScA\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"-DgqaaGm84DMGbygNGucJoOINe5X7GUwgOaIPfxEphM\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
       "expect": "wrong_harness"
     },
     {
@@ -175,7 +175,7 @@
         },
         "last_applied_seq": 42
       },
-      "wire": "{\"sig\": \"b0G0GsjwDUVmydHKSlmm4f-Umh3gAj3S1YIxa1VRY_DuP8TVJM901EwX2hVgXY8o2dV0VHJsZbwbnfqRxAAN3Q\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"6WVOArhbtvX0kFAuL-5NtA\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "wire": "{\"sig\": \"ZeKbCSE8xpnmAesLQnDMHQ9vdS3ATtn4OAAxH3iqMHI31vaVqtyNPtzmfkz_A1eFDc-E1OoI5oZ9zsF1SUQ4ZQ\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"code\": null, \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"6WVOArhbtvX0kFAuL-5NtA\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
       "expect": "bad_signature"
     },
     {
@@ -190,7 +190,7 @@
         },
         "last_applied_seq": 42
       },
-      "wire": "{\"sig\": \"0lFvs1al056wP2ImhKuDYOuW6LLyg2Eu6lAroKCsRNvUCTNCP0Nknok12LPvNHRKOnTCyIHFHy2O7KnQzgW4kQ\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"N3-0YRp8OExxqHWmw2vA3A\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_s3cUyQ38jiPOI7P0i7BJoA\", \"alg\": \"ES256\", \"v\": 1}",
+      "wire": "{\"sig\": \"UpVL4ek1v8mSDSZ2QJgMCfmIlI0bq2tvRJOjMUjnbBEWoE79oVSVog7chriiMXfadtnBySLR43rBcZGire9-PA\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"code\": null, \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"N3-0YRp8OExxqHWmw2vA3A\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_s3cUyQ38jiPOI7P0i7BJoA\", \"alg\": \"ES256\", \"v\": 1}",
       "expect": "wrong_session"
     },
     {
@@ -220,7 +220,7 @@
         },
         "last_applied_seq": 42
       },
-      "wire": "{\"sig\": \"MjJOEClYx0uTI_opBZQxNSGDw4_G18Wwvy8SvrNFJnDUX-CPIIZ5aeSOFomjoN10OFjKWjd-PnL5LGHMVFD6Mg\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"yWfilo4GPRtrskYztHTYHQ\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 2}",
+      "wire": "{\"sig\": \"kukWZQqS4lgpQCNLGF0ySwqKWCc8e24C3i9-D1u8CRHOIGxWprKgopbYy1S2WGyQ-H0MWVZz3Gl2ves-C7trEA\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"code\": null, \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"yWfilo4GPRtrskYztHTYHQ\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 2}",
       "expect": "unsupported_version"
     }
   ]

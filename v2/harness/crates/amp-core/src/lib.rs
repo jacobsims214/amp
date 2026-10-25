@@ -77,6 +77,10 @@
 //! - [`manager_feed`]: the manager's append-only, sequence-numbered, bounded chat feed with replay
 //!   from any seq and a resync from the session file.
 //!
+//! Remote control M1 (#2373):
+//! - [`remote`]: the remote link: protocol (JCS, envelopes, signatures, pairing), the relay
+//!   client, secret redaction, the local off switches and [`remote::RemoteLink`].
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
@@ -102,6 +106,7 @@ pub mod project;
 pub mod provider_auth;
 pub mod provider_error;
 pub mod providers;
+pub mod remote;
 pub mod repeat;
 pub mod repo_config;
 pub mod repo_trust;

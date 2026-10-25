@@ -421,6 +421,26 @@ pub async fn has_login(url: &str, backend: &CredentialBackend) -> Result<bool, M
         .is_some_and(|c| c.token_response.is_some()))
 }
 
+/// A fresh OAuth access token for the login stored for `url` (refreshed when it is about to
+/// expire), for the remote control relay (#2373). Never logged or formatted. Fails with
+/// [`McpError::AuthRequired`] when there is no stored login.
+pub async fn access_token(
+    url: &str,
+    ca_file: Option<&std::path::Path>,
+    backend: &CredentialBackend,
+) -> Result<String, McpError> {
+    let store = backend.store_for(url);
+    if !has_login(url, backend).await? {
+        return Err(McpError::AuthRequired { challenge: None });
+    }
+    let mut manager = new_manager(url, ca_file, DEFAULT_OAUTH_REQUEST_TIMEOUT).await?;
+    manager.set_credential_store(store);
+    if !manager.initialize_from_store().await.map_err(oauth_error)? {
+        return Err(McpError::AuthRequired { challenge: None });
+    }
+    manager.get_access_token().await.map_err(oauth_error)
+}
+
 /// Connects with the best credentials available, in D3's order:
 /// 1. `options.auth` is a static token (`AMP_TOKEN`): use it; stored logins are not touched.
 /// 2. A stored login for `options.url`: OAuth through rmcp's `AuthClient` (refreshes as needed).

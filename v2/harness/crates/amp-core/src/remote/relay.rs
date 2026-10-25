@@ -1,0 +1,453 @@
+//! The harness leg of the relay API (protocol.md section 8.2): register, token refresh, the
+//! command stream (SSE), event batches, heartbeat, pairing windows and the session's end.
+//!
+//! Nothing here logs a token, an envelope or a body.
+
+use std::{
+    path::Path,
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicI64, Ordering},
+    },
+    time::Duration,
+};
+
+use futures::StreamExt as _;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+/// One HTTP call's bound (the command stream has none: it lives for hours).
+pub const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A relay answer that isn't a success: the status, the `code` member and the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayError {
+    /// 0: the request never got an answer (network, timeout).
+    pub status: u16,
+    pub code: Option<String>,
+    pub message: String,
+    /// `expected_seq` / `accepted_through` / `reason` members, when present.
+    pub body: Box<Value>,
+}
+
+impl std::fmt::Display for RelayError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.status, &self.code) {
+            (0, _) => write!(f, "{}", self.message),
+            (s, Some(c)) => write!(f, "{s} {c}: {}", self.message),
+            (s, None) => write!(f, "{s}: {}", self.message),
+        }
+    }
+}
+
+impl RelayError {
+    fn network(e: impl std::fmt::Display) -> Self {
+        Self {
+            status: 0,
+            code: None,
+            message: amp_mcp::redact_urls(&e.to_string()),
+            body: Box::new(Value::Null),
+        }
+    }
+
+    pub fn is_network(&self) -> bool {
+        self.status == 0
+    }
+
+    /// The session is over (`410 session_ended`); `reason` from the body.
+    pub fn ended_reason(&self) -> Option<String> {
+        (self.status == 410).then(|| {
+            self.body
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("ended")
+                .to_owned()
+        })
+    }
+
+    /// What to tell the person when registration fails (decision section 9).
+    pub fn register_message(&self) -> String {
+        match (self.status, self.code.as_deref()) {
+            (404, _) => "Remote control isn't available on this AMP server.".to_owned(),
+            (403, Some("remote_disabled")) => {
+                "Remote control is turned off for this project's organization (an org admin can \
+                 turn it on in the org settings)."
+                    .to_owned()
+            }
+            (403, Some("token_not_allowed")) => {
+                "AMP refused an API token for remote control; run `amp-harness login`.".to_owned()
+            }
+            (403, Some("agent_not_allowed")) => {
+                "Remote control is for people: this login is an agent account.".to_owned()
+            }
+            (401, _) => "AMP did not accept the login; run `amp-harness login`.".to_owned(),
+            (429, Some("too_many_sessions")) => {
+                "You already have 5 remote sessions; turn one off first.".to_owned()
+            }
+            (429, _) => "Too many remote control requests; try again in a minute.".to_owned(),
+            (400, Some("unsupported_version")) => {
+                "This AMP server speaks another remote control version; update amp-harness."
+                    .to_owned()
+            }
+            (503, Some("audit_unavailable")) => {
+                "AMP couldn't record the audit entry, so it refused; try again shortly.".to_owned()
+            }
+            (0, _) => format!("AMP could not be reached: {}", self.message),
+            _ => format!("AMP refused remote control: {self}"),
+        }
+    }
+}
+
+/// `POST /relay/v1/sessions`'s answer (201).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Registered {
+    pub session_id: String,
+    pub protocol_version: i64,
+    pub connect_token: String,
+    pub connect_token_expires_at_ms: i64,
+    pub started_at_ms: i64,
+    pub expires_at_ms: i64,
+    pub idle_timeout_s: i64,
+    #[serde(default = "default_pin_days")]
+    pub device_pin_max_days: i64,
+    #[serde(default = "default_interval")]
+    pub heartbeat_interval_s: i64,
+    #[serde(default)]
+    pub session_url: Option<String>,
+}
+
+fn default_pin_days() -> i64 {
+    30
+}
+
+fn default_interval() -> i64 {
+    20
+}
+
+/// `POST …/token`'s answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Refreshed {
+    pub connect_token: String,
+    pub connect_token_expires_at_ms: i64,
+}
+
+/// `POST …/events`' answer.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Accepted {
+    pub accepted_through: i64,
+}
+
+/// One frame of the command stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Frame {
+    Command(String),
+    PairRequest(String),
+    Viewers(u32),
+    DeviceRevoked {
+        device_id: Option<String>,
+        all: bool,
+    },
+    End(String),
+    /// An event the harness doesn't know (ignored).
+    Other(String),
+}
+
+/// The relay client for one AMP server.
+#[derive(Clone)]
+pub struct RelayClient {
+    http: reqwest::Client,
+    base: String,
+}
+
+impl std::fmt::Debug for RelayClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayClient")
+            .field("base", &self.base)
+            .finish()
+    }
+}
+
+impl RelayClient {
+    /// `base` is the AMP server's origin (`https://amp.example`); `ca_file` as for MCP.
+    pub fn new(base: &str, ca_file: Option<&Path>) -> Result<Self, String> {
+        let http = amp_mcp::build_http_client(ca_file).map_err(|e| e.to_string())?;
+        Ok(Self {
+            http,
+            base: base.trim_end_matches('/').to_owned(),
+        })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}/relay/v1/sessions{path}", self.base)
+    }
+
+    async fn call(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        bearer: &str,
+        body: Option<Value>,
+    ) -> Result<Value, RelayError> {
+        let mut req = self
+            .http
+            .request(method, self.url(path))
+            .bearer_auth(bearer);
+        if let Some(body) = body {
+            req = req
+                .header(
+                    reqwest::header::CONTENT_TYPE,
+                    "application/json; charset=utf-8",
+                )
+                .body(body.to_string());
+        }
+        let send = async {
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| RelayError::network(e.without_url()))?;
+            let status = resp.status().as_u16();
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| RelayError::network(e.without_url()))?;
+            let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if (200..300).contains(&status) {
+                return Ok(value);
+            }
+            Err(RelayError {
+                status,
+                code: value.get("code").and_then(Value::as_str).map(str::to_owned),
+                message: value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("no error message")
+                    .chars()
+                    .take(200)
+                    .collect(),
+                body: Box::new(value),
+            })
+        };
+        tokio::time::timeout(CALL_TIMEOUT, send)
+            .await
+            .unwrap_or_else(|_| Err(RelayError::network("the request timed out")))
+    }
+
+    fn parse<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, RelayError> {
+        serde_json::from_value(v).map_err(|e| RelayError {
+            status: 0,
+            code: Some("malformed".into()),
+            message: format!("AMP's answer has an unexpected shape: {e}"),
+            body: Box::new(Value::Null),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register(
+        &self,
+        oauth_token: &str,
+        harness_id: &str,
+        harness_pub: &str,
+        host: &str,
+        os: &str,
+        version: &str,
+        project_id: Option<i64>,
+    ) -> Result<Registered, RelayError> {
+        let body = json!({
+            "protocol_versions": [1],
+            "harness_id": harness_id, "harness_pub": harness_pub,
+            "host": host, "os": os, "harness_version": version,
+            "project_id": project_id,
+        });
+        let v = self
+            .call(reqwest::Method::POST, "", oauth_token, Some(body))
+            .await?;
+        Self::parse(v)
+    }
+
+    pub async fn refresh(
+        &self,
+        session_id: &str,
+        oauth_token: &str,
+    ) -> Result<Refreshed, RelayError> {
+        let v = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/{session_id}/token"),
+                oauth_token,
+                Some(json!({})),
+            )
+            .await?;
+        Self::parse(v)
+    }
+
+    /// Posts envelopes (compact JSON texts) as one batch.
+    pub async fn post_events(
+        &self,
+        session_id: &str,
+        token: &str,
+        envelopes: &[String],
+    ) -> Result<Accepted, RelayError> {
+        // The envelopes are already JSON: splice them in without re-serializing.
+        let body = format!("{{\"events\":[{}]}}", envelopes.join(","));
+        let value: Value = serde_json::from_str(&body).map_err(RelayError::network)?;
+        let v = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/{session_id}/events"),
+                token,
+                Some(value),
+            )
+            .await?;
+        Self::parse(v)
+    }
+
+    pub async fn heartbeat(&self, session_id: &str, token: &str) -> Result<Value, RelayError> {
+        self.call(
+            reqwest::Method::POST,
+            &format!("/{session_id}/heartbeat"),
+            token,
+            Some(json!({})),
+        )
+        .await
+    }
+
+    pub async fn open_pairing(
+        &self,
+        session_id: &str,
+        token: &str,
+        pairing_id: &str,
+        expires_at_ms: i64,
+    ) -> Result<(), RelayError> {
+        self.call(
+            reqwest::Method::POST,
+            &format!("/{session_id}/pairings"),
+            token,
+            Some(json!({"pairing_id": pairing_id, "expires_at_ms": expires_at_ms})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn end(&self, session_id: &str, token: &str, reason: &str) -> Result<(), RelayError> {
+        self.call(
+            reqwest::Method::DELETE,
+            &format!("/{session_id}"),
+            token,
+            Some(json!({"reason": reason})),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// Opens the command stream. Frames go to `on_frame`; `last_byte_ms` is updated on every
+    /// chunk (keepalive comments included), so the caller can spot a silent stream. Returns when
+    /// the stream ends (`Ok`) or fails to open (`Err`).
+    pub async fn command_stream(
+        &self,
+        session_id: &str,
+        token: &str,
+        last_byte_ms: Arc<AtomicI64>,
+        on_open: impl FnOnce(),
+        mut on_frame: impl FnMut(Frame) -> bool,
+    ) -> Result<(), RelayError> {
+        let open = self
+            .http
+            .get(self.url(&format!("/{session_id}/commands")))
+            .bearer_auth(token)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send();
+        let resp = tokio::time::timeout(CALL_TIMEOUT, open)
+            .await
+            .map_err(|_| RelayError::network("opening the command stream timed out"))?
+            .map_err(|e| RelayError::network(e.without_url()))?;
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            let text = resp.text().await.unwrap_or_default();
+            let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            return Err(RelayError {
+                status,
+                code: value.get("code").and_then(Value::as_str).map(str::to_owned),
+                message: value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the command stream was refused")
+                    .chars()
+                    .take(200)
+                    .collect(),
+                body: Box::new(value),
+            });
+        }
+        last_byte_ms.store(now_ms(), Ordering::Relaxed);
+        on_open();
+        let marker = Arc::clone(&last_byte_ms);
+        let bytes = resp.bytes_stream().map(move |chunk| {
+            marker.store(now_ms(), Ordering::Relaxed);
+            chunk
+        });
+        let mut events = Box::pin(sse_stream::SseStream::from_bytes_stream(bytes));
+        while let Some(event) = events.next().await {
+            let Ok(event) = event else { break };
+            let data = event.data.unwrap_or_default();
+            let frame = match event.event.as_deref() {
+                Some("command") => Frame::Command(data),
+                Some("pair_request") => Frame::PairRequest(data),
+                Some("viewers") => Frame::Viewers(
+                    serde_json::from_str::<Value>(&data)
+                        .ok()
+                        .and_then(|v| v.get("count").and_then(Value::as_u64))
+                        .unwrap_or(0) as u32,
+                ),
+                Some("device_revoked") => {
+                    let v: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+                    Frame::DeviceRevoked {
+                        device_id: v
+                            .get("device_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        all: v.get("all").and_then(Value::as_bool).unwrap_or(false),
+                    }
+                }
+                Some("end") => Frame::End(
+                    serde_json::from_str::<Value>(&data)
+                        .ok()
+                        .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_else(|| "ended".to_owned()),
+                ),
+                other => Frame::Other(other.unwrap_or("message").to_owned()),
+            };
+            let end = matches!(frame, Frame::End(_));
+            if !on_frame(frame) || end {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Unix milliseconds now.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The connect token, shared by the link's tasks (never printed).
+#[derive(Clone, Default)]
+pub struct ConnectToken(Arc<RwLock<String>>);
+
+impl std::fmt::Debug for ConnectToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConnectToken(<redacted>)")
+    }
+}
+
+impl ConnectToken {
+    pub fn set(&self, token: &str) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = token.to_owned();
+    }
+
+    pub fn get(&self) -> String {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}

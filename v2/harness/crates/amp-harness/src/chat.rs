@@ -356,7 +356,21 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
                 .set_workers(Arc::new(move || sup.workers()));
         }
         let session_file = session.agent.session_file.clone();
+        // #2373: the remote link (off until `/remote` turns it on, #2376). `Err` says why remote
+        // control can't be used from here (a switch, the login, plain http); `/remote` shows it.
+        let remote: Result<_, String> = crate::remote::build(
+            &session.rt,
+            &session.feed,
+            project_id,
+            &settings,
+            shell.remote_host(),
+        )
+        .await;
         let result = amp_tui::terminal::run(shell, events, done).await;
+        // Leaving the chat ends remote control (bye + DELETE).
+        if let Ok((link, _)) = &remote {
+            link.disable().await;
+        }
         if let Some(watcher) = watcher {
             watcher.abort();
         }

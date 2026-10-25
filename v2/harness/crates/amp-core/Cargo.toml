@@ -40,6 +40,22 @@ sha2.workspace = true
 chrono.workspace = true
 iana-time-zone.workspace = true
 
+# #2373: the remote link (protocol, pairing, signing, the relay client).
+p256.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand_core.workspace = true
+regex.workspace = true
+base64.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+sse-stream.workspace = true
+futures.workspace = true
+# The in-process mock relay (`remote::mock_relay`) for the remote link's end-to-end tests.
+axum = { workspace = true, optional = true }
+
+[features]
+mock-relay = ["dep:axum", "tokio/net"]
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 # The metadata poller's tests: a mock AMP on rmcp's Streamable HTTP server (tests/meta.rs).
