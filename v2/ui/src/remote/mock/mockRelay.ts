@@ -2,11 +2,13 @@
  * An in-memory relay plus a fake harness, following protocol.md's browser leg.
  * Used by the tests and by `VITE_REMOTE_MOCK=1 npm run dev` until the real relay
  * (amp-api) and harness link exist. Envelopes carry MOCK_SIG instead of an
- * ES256 signature; `mockCrypto` is the matching stand-in for the #2375 signer.
+ * ES256 signature; `mockCrypto` is the matching stand-in for the real WebCrypto
+ * signer (webCrypto.ts). Tests of real signatures use src/test/signedHarness.ts.
  *
  * Never imported by production code paths (RemoteProvider loads it only in dev).
  */
 import type { RemoteCrypto } from '../crypto'
+import { pairingLinkFor } from '../pairingLink'
 import type { RemoteDeps } from '../remote-context'
 import { RelayError, type EventStreamHandlers, type RelayTransport } from '../transport'
 import type {
@@ -15,14 +17,20 @@ import type {
 
 export const MOCK_SIG = 'mock-signature'
 export const MOCK_SESSION_ID = 'rs_MockSessionAAAAAAAAAAA'
-export const MOCK_HARNESS_ID = 'MockHarnessFingerprintAAAAAAAAAAAAAAAAAAAAA'
-export const MOCK_HARNESS_PUB = 'BMockHarnessPublicKey'
-export const MOCK_DEVICE_ID = 'MockDeviceFingerprintAAAAAAAAAAAAAAAAAAAAAA'
+// Public keys of the shared test vectors (keys.json harness-1 and device-a; test-only, never real),
+// so a pairing link for the mock passes the page's fp(harness_pub) == h check.
+export const MOCK_HARNESS_ID = 'KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY'
+export const MOCK_HARNESS_PUB = 'BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8'
+export const MOCK_DEVICE_ID = 'X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs'
 export const MOCK_DEVICE_NAME = 'Chrome on macOS'
+export const MOCK_DEVICE_PUB = 'BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4'
 
-/** Stand-in for #2375's signer and verifier. `paired: false` behaves like an unpaired browser. */
+/**
+ * Stand-in for the WebCrypto signer and verifier. `paired: false` behaves like an
+ * unpaired browser until a pairing pins the harness.
+ */
 export function mockCrypto(opts: { paired?: boolean } = {}): RemoteCrypto {
-  const paired = opts.paired ?? true
+  let paired = opts.paired ?? true
   return {
     harnessPin: async harnessId => paired && harnessId === MOCK_HARNESS_ID
       ? { harness_id: MOCK_HARNESS_ID, harness_pub: MOCK_HARNESS_PUB, host: 'jacobs-mbp', pinned_until_ms: Date.now() + 30 * 86_400_000 }
@@ -30,6 +38,9 @@ export function mockCrypto(opts: { paired?: boolean } = {}): RemoteCrypto {
     deviceId: async () => paired ? MOCK_DEVICE_ID : null,
     signCommand: async cmd => ({ ...cmd, sig: MOCK_SIG }),
     verifyEvent: async (env, pin: HarnessPin) => env.sig === MOCK_SIG && pin.harness_id === env.harness_id,
+    ensureDevice: async () => ({ device_id: MOCK_DEVICE_ID, device_pub: MOCK_DEVICE_PUB }),
+    signPairRequest: async () => MOCK_SIG,
+    pinHarness: async pin => { paired = true; return pin },
   }
 }
 
@@ -281,11 +292,22 @@ export function mockTransport(relay: MockRelay): RelayTransport {
     },
     postCommand: async (id, env) => { check(id); relay.receive(env) },
     disconnect: async id => { check(id); relay.end('disconnected') },
+    pair: async (id, msg) => {
+      check(id)
+      // The mock laptop says yes after a few seconds, long enough to see the code.
+      setTimeout(() => relay.emit('pair_result', { pairing_id: msg.request.pairing_id, result: 'accepted', code: null, tries_left: null,
+        pinned_until_ms: Date.now() + 30 * 86_400_000 }, msg.request.device_id), 4_000)
+      return { expires_at_ms: Date.now() + 300_000 }
+    },
   }
 }
 
-/** Dev wiring for `VITE_REMOTE_MOCK=1`: a seeded session at /sessions/rs_MockSessionAAAAAAAAAAA. */
+/**
+ * Dev wiring for `VITE_REMOTE_MOCK=1`: a seeded session at /sessions/rs_MockSessionAAAAAAAAAAA.
+ * Opened with a pairing link (`#p=<any 32 bytes b64u>&h=<MOCK_HARNESS_ID>`) it starts unpaired
+ * and shows the pairing screen; the mock laptop accepts after 4 s.
+ */
 export function devMockDeps(): RemoteDeps {
   const relay = new MockRelay({ seed: true })
-  return { transport: mockTransport(relay), crypto: mockCrypto(), mock: true }
+  return { transport: mockTransport(relay), crypto: mockCrypto({ paired: !pairingLinkFor(MOCK_SESSION_ID) }), mock: true }
 }

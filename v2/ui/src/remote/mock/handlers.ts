@@ -6,6 +6,7 @@
 import { http, HttpResponse } from 'msw'
 import { RelayError } from '../transport'
 import type { CommandEnvelope } from '../types'
+import type { PairMessage } from '../protocol'
 import type { MockRelay } from './mockRelay'
 
 const err = (e: unknown) => {
@@ -52,6 +53,14 @@ export function relayHandlers(relay: MockRelay) {
         relay.receive(await request.json() as CommandEnvelope)
         return HttpResponse.json({ status: 'forwarded' }, { status: 202 })
       } catch (e) { return err(e) }
+    }),
+
+    http.post('*/api/sessions/:id/pair', async ({ params, request }) => {
+      if (params.id !== relay.sessionId) return notFound()
+      const msg = await request.json() as PairMessage
+      relay.emit('pair_result', { pairing_id: msg.request.pairing_id, result: 'accepted', code: null, tries_left: null,
+        pinned_until_ms: Date.now() + 30 * 86_400_000 }, msg.request.device_id)
+      return HttpResponse.json({ status: 'pending', expires_at_ms: Date.now() + 300_000 }, { status: 202 })
     }),
 
     http.post('*/api/sessions/:id/disconnect', ({ params }) => {
