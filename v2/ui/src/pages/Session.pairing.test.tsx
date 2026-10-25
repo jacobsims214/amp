@@ -52,6 +52,7 @@ function fakeLaptop(opts: { verdict?: Verdict; detail?: Partial<SessionDetail> }
   }
   const transport: RelayTransport = {
     listSessions: async () => [detail],
+    revokeAll: async () => ({ ended: 0, devices_revoked: 0 }),
     getSession: async id => { calls.push(['getSession', id]); return detail },
     openEvents: (id, from, l) => {
       calls.push(['openEvents', id, from])

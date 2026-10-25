@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { formatCost, initialSessionState, isBusy, sessionReducer, type SessionAction, type SessionState } from './session'
+import { blockText, formatCost, initialSessionState, isBusy, sessionReducer, type SessionAction, type SessionState } from './session'
 import { seedChatEvents } from './mock/mockRelay'
 import { CHAT_EVENT_TYPES, type ChatEvent, type Envelope } from './types'
 
@@ -18,7 +18,9 @@ describe('sessionReducer', () => {
     const s = run(seedChatEvents().map(chat))
     expect(s.items.map(i => i.kind)).toEqual(['user', 'assistant', 'tool', 'retry', 'assistant', 'run_end', 'notice'])
     const a = s.items[1]
-    expect(a.kind === 'assistant' && a).toMatchObject({ thinking: expect.stringContaining('amp-core'), text: 'Running the **amp-core** tests first.', done: true })
+    expect(a.kind === 'assistant' && a).toMatchObject({ done: true })
+    expect(a.kind === 'assistant' && blockText(a, 'thinking')).toContain('amp-core')
+    expect(a.kind === 'assistant' && blockText(a, 'text')).toBe('Running the **amp-core** tests first.')
     const t = s.items[2]
     expect(t.kind === 'tool' && t.result).toMatchObject({ is_error: true, truncated: true, full_bytes: 182_331 })
     expect(s.workers).toHaveLength(2)
