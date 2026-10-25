@@ -18,7 +18,7 @@
 
 use std::{
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use amp_core::{
@@ -143,6 +143,9 @@ pub struct SessionView {
     keys: Arc<KeysBar>,
     /// The worker is live (its feed still grows).
     live: bool,
+    /// Its first event's wall-clock time and [`Instant`]: how event times map to the view's
+    /// clock (#2355).
+    anchor: Option<(SystemTime, Instant)>,
     /// Usage counted from the events (sessions read from disk; the supervisor has the rest).
     totals: Totals,
     model: String,
@@ -168,6 +171,7 @@ impl SessionView {
             bar: Arc::new(SessionBar::default()),
             keys: Arc::new(KeysBar::default()),
             live: false,
+            anchor: None,
             totals: Totals::default(),
             model: String::new(),
         };
@@ -180,13 +184,18 @@ impl SessionView {
     pub fn pump(&mut self) -> bool {
         let (events, seen) = self.feed.since(self.seen);
         self.seen = seen;
-        for event in &events {
-            self.apply(event);
+        let (now, wall) = (Instant::now(), SystemTime::now());
+        for (at, event) in &events {
+            let at = at.map(|at| {
+                let anchor = *self.anchor.get_or_insert_with(|| anchor(at, now, wall));
+                instant(at, anchor)
+            });
+            self.apply(event, at);
         }
         !events.is_empty()
     }
 
-    fn apply(&mut self, event: &AgentEvent) {
+    fn apply(&mut self, event: &AgentEvent, at: Option<Instant>) {
         if let Some(e) = RunEvent::from_agent(event) {
             self.totals.observe(&e);
         }
@@ -213,9 +222,9 @@ impl SessionView {
                 message: AgentMessage::Assistant(m),
             } if self.model.is_empty() => {
                 self.model = format!("{}/{}", m.provider, m.model);
-                self.view.apply(event);
+                self.view.apply_at(event, at);
             }
-            _ => self.view.apply(event),
+            _ => self.view.apply_at(event, at),
         }
     }
 
@@ -342,6 +351,22 @@ pub fn session_state(i: &WorkerSessionInfo, now: SystemTime) -> String {
     }
 }
 
+/// The session's first event time `at` and its [`Instant`], given that `wall` is `now`
+/// (#2355). An `at` the monotonic clock can't go back to (from before this machine started)
+/// maps to `now`: only differences between event times matter then.
+fn anchor(at: SystemTime, now: Instant, wall: SystemTime) -> (SystemTime, Instant) {
+    let ago = wall.duration_since(at).unwrap_or(Duration::ZERO);
+    (at, now.checked_sub(ago).unwrap_or(now))
+}
+
+/// The [`Instant`] of a wall-clock time `at`, by its distance from `anchor`.
+fn instant(at: SystemTime, (wall, instant): (SystemTime, Instant)) -> Instant {
+    match at.duration_since(wall) {
+        Ok(after) => instant + after,
+        Err(e) => instant.checked_sub(e.duration()).unwrap_or(instant),
+    }
+}
+
 fn duration(d: Duration) -> String {
     crate::roster::duration(d)
 }
@@ -396,6 +421,134 @@ mod tests {
         assert_eq!(
             session_state(&info(None, Some(WorkerOutcome::TurnBudget), None), now),
             "turn budget after 3m10s"
+        );
+    }
+
+    fn message(
+        blocks: Vec<rpi_ai::providers::faux::FauxBlock>,
+    ) -> Arc<rpi_ai::types::AssistantMessage> {
+        Arc::new(rpi_ai::providers::faux::faux_assistant_message(
+            blocks,
+            rpi_ai::types::StopReason::ToolUse,
+        ))
+    }
+
+    fn rows(session: &SessionView) -> Vec<String> {
+        session
+            .view()
+            .transcript_component()
+            .render(100)
+            .iter()
+            .map(|r| rpi_tui::strip_ansi(r).trim_end().to_owned())
+            .collect()
+    }
+
+    /// #2355: a session opened after its worker did some turns shows how long the earlier
+    /// thinking and tool calls took, from the feed's times, not `Thinking` and `0 ms`.
+    #[test]
+    fn a_session_opened_mid_run_shows_earlier_durations_from_the_feed() {
+        use rpi_ai::providers::faux::FauxBlock;
+        let t0 = SystemTime::now() - Duration::from_secs(120);
+        let at = |s: u64| Some(t0 + Duration::from_secs(s));
+        let feed = WorkerFeed::new();
+        let thinking = message(vec![FauxBlock::thinking("Looking at the tests first.")]);
+        let answered = message(vec![
+            FauxBlock::thinking("Looking at the tests first."),
+            FauxBlock::text("Running them."),
+        ]);
+        let update = |m: &Arc<rpi_ai::types::AssistantMessage>| AgentEvent::MessageUpdate {
+            message: Arc::clone(m),
+            assistant_message_event: rpi_ai::types::AssistantMessageEvent::Start {
+                partial: Arc::clone(m),
+            },
+        };
+        let empty = message(Vec::new());
+        feed.push_at(&AgentEvent::TurnStart, at(0));
+        feed.push_at(
+            &AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(Box::new((*empty).clone())),
+            },
+            at(0),
+        );
+        feed.push_at(&update(&thinking), at(1));
+        feed.push_at(&update(&thinking), at(3));
+        // The answer starts 7s in: the thinking took 6s.
+        feed.push_at(&update(&answered), at(7));
+        feed.push_at(&update(&answered), at(8));
+        feed.push_at(
+            &AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(Box::new((*answered).clone())),
+            },
+            at(8),
+        );
+        feed.push_at(
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                args: serde_json::json!({"command": "sleep 20"}),
+            },
+            at(8),
+        );
+        feed.push_at(
+            &AgentEvent::ToolExecutionEnd {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                result: rpi_agent::AgentToolResult::text("ok"),
+                is_error: false,
+            },
+            at(26),
+        );
+        let session = SessionView::new(7, Source::Chat, feed, ThinkingDisplay::Collapsed);
+        let rows = rows(&session);
+        let text = rows.join("\n");
+        assert!(
+            rows.iter()
+                .any(|r| r.trim_start().starts_with("▸ Thought for 6s")),
+            "{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("bash") && r.ends_with("· 18.0s")),
+            "{text}"
+        );
+        assert!(!text.contains("0 ms"), "{text}");
+    }
+
+    /// #2355: a session read from its file takes the file's times; a call that never returned
+    /// shows no duration rather than `0 ms`.
+    #[test]
+    fn a_session_file_replays_with_its_own_durations() {
+        let text = [
+            r#"{"kind":"entry","type":"message","timestamp":1000,"message":{"kind":"user","role":"user","content":"go","timestamp":1000}}"#,
+            r#"{"kind":"entry","type":"message","timestamp":2500,"message":{"kind":"assistant","role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"Running both."},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"sleep 18"}},{"type":"toolCall","id":"c2","name":"bash","arguments":{"command":"sleep 99"}}],"api":"openai-completions","provider":"faux","model":"m","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"tooluse","timestamp":1100}}"#,
+            r#"{"kind":"entry","type":"message","timestamp":20500,"message":{"kind":"tool_result","role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"ok"}],"details":null,"isError":false,"timestamp":20500}}"#,
+        ]
+        .join("\n");
+        let events = amp_core::worker_session::replay_text(&text);
+        let session = SessionView::new(
+            7,
+            Source::File("x.jsonl".into()),
+            WorkerFeed::from_events(events),
+            ThinkingDisplay::Collapsed,
+        );
+        let rows = rows(&session);
+        let all = rows.join("\n");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("sleep 18") && r.ends_with("· 18.0s")),
+            "{all}"
+        );
+        let unfinished = rows
+            .iter()
+            .find(|r| r.contains("sleep 99"))
+            .unwrap_or_else(|| panic!("{all}"));
+        assert!(!unfinished.ends_with(" ms"), "{all}");
+        assert!(!all.contains("0 ms"), "{all}");
+        // Seen complete at once: the thinking's own duration isn't in the file.
+        assert!(
+            rows.iter()
+                .any(|r| r.trim_start().starts_with("▸ Thinking ·")),
+            "{all}"
         );
     }
 
