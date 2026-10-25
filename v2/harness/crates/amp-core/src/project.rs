@@ -168,6 +168,27 @@ impl ProjectMarker {
         Ok(None)
     }
 
+    /// The folder holding the marker.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new(""))
+    }
+
+    /// Whether the marker is in a parent folder of `cwd`, not in `cwd` itself (#2356). Paths are
+    /// compared after resolving symlinks (`/tmp` and `/private/tmp` are one folder on macOS).
+    pub fn in_parent_of(&self, cwd: &Path) -> bool {
+        canon(self.dir()) != canon(cwd)
+    }
+
+    /// How to name the marker to someone in `cwd` (#2356): `.amp.json` when it is in `cwd`,
+    /// `../.amp.json` (`../../.amp.json`, …) when it is in a parent folder, else its full path.
+    pub fn shown_from(&self, cwd: &Path) -> String {
+        let (dir, cwd) = (canon(self.dir()), canon(cwd));
+        match cwd.strip_prefix(&dir) {
+            Ok(rest) => format!("{}{MARKER_FILE}", "../".repeat(rest.components().count())),
+            Err(_) => self.path.display().to_string(),
+        }
+    }
+
     /// [`Self::find`] from the current directory, honouring `AMP_HARNESS_CEILING_DIR`.
     pub fn find_from_cwd() -> Result<Option<Self>, MarkerError> {
         let ceiling = std::env::var_os(ENV_CEILING_DIR)
@@ -178,6 +199,11 @@ impl ProjectMarker {
             Err(_) => Ok(None),
         }
     }
+}
+
+/// `path` with symlinks resolved, or as given when it can't be.
+fn canon(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// `scheme://host[:port]` of `url`, lower-cased, without a default port, with loopback names
@@ -353,6 +379,22 @@ mod tests {
                 .unwrap()
                 .project_id,
             6
+        );
+
+        // #2356: where the marker is, said from the working directory.
+        assert!(m.in_parent_of(&deep));
+        assert_eq!(m.shown_from(&deep), "../../.amp.json");
+        assert!(!m.in_parent_of(&root.join("a")));
+        assert!(
+            !m.in_parent_of(&root.join("a/b/..")),
+            "compared after resolving"
+        );
+        assert_eq!(m.shown_from(&root.join("a")), ".amp.json");
+        assert_eq!(m.dir(), root.join("a"));
+        assert_eq!(
+            m.shown_from(&root),
+            root.join("a").join(MARKER_FILE).display().to_string(),
+            "not above the working directory: the full path"
         );
 
         std::fs::write(root.join("a").join(MARKER_FILE), "{").unwrap();

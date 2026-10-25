@@ -88,7 +88,7 @@ pub use shell::{
     CTRL_D_SETTLE, ConfigControl, ConfigFuture, ConfigReply, ConnectFuture, ConnectReply, CtrlC,
     CtrlD, ESC_HINT, ESC_HINT_FOR, ModelChoice, Notifier, Opener, ProviderConnect, QUIT_HINT,
     QUIT_HINT_FOR, ReloadControl, ReloadFuture, ReloadReply, RunDone, STOPPED, ServerControl,
-    ServerSwitched, Shell, ShellInfo, Submit,
+    ServerSwitched, Shell, ShellInfo, Submit, esc_hint,
 };
 pub use slash::{
     COMMANDS, CommandMenu, CommandSpec, DRAG_KEY, Group, HelpBlock, KEYS, LEGACY_SHIFT_ENTER,

@@ -801,6 +801,8 @@ pub struct AmpMeta {
     pub health: MetaHealth,
     pub user: Fetched<User>,
     pub project_id: Option<i64>,
+    /// A parent folder's `.amp.json` the session uses: its project id and where it is (#2356).
+    pub project_marker: Option<(i64, String)>,
     pub project: Fetched<Project>,
     pub board: Fetched<Board>,
     pub ticket_id: Option<i64>,
@@ -1023,6 +1025,9 @@ pub type Connector = Arc<
 pub struct MetaOptions {
     /// The project from `.amp.json`.
     pub project_id: Option<i64>,
+    /// When that `.amp.json` is in a parent folder: its project id and where it is, for `/project`
+    /// (#2356).
+    pub project_marker: Option<(i64, String)>,
     /// A ticket to show from the start (a worker session's own ticket).
     pub ticket_id: Option<i64>,
     pub intervals: Intervals,
@@ -1347,6 +1352,7 @@ impl MetaPoller {
     pub fn spawn(client: Option<Arc<AmpMcpClient>>, options: MetaOptions) -> MetaHandle {
         let meta = AmpMeta {
             project_id: options.project_id,
+            project_marker: options.project_marker,
             ticket_id: options.ticket_id,
             instance: client
                 .as_deref()
