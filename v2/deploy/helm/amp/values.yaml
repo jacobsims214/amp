@@ -69,6 +69,13 @@ ampApi:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
 
+# Remote control of a harness session from the web app (epic 165): the
+# instance switch. Off by default. When on, an org admin still has to turn it
+# on for their org (org settings), and each person turns it on per session
+# with /remote in the harness. Needs auth (it stays off without Dex).
+relay:
+  enabled: false
+
 ui:
   image: amp-ui
   tag: local

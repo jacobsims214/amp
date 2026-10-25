@@ -35,6 +35,23 @@ import (
 type Error struct {
 	Status int
 	Msg    string
+	// Code is a stable machine-readable code, sent as the "code" member next
+	// to "error" when set (the remote control API's codes, protocol 9.1).
+	Code string
+}
+
+// Coded is an Error with a stable code.
+func Coded(status int, code, format string, a ...any) error {
+	return &Error{Status: status, Msg: fmt.Sprintf(format, a...), Code: code}
+}
+
+// CodeOf returns err's stable code, "" when it has none.
+func CodeOf(err error) string {
+	var ae *Error
+	if errors.As(err, &ae) {
+		return ae.Code
+	}
+	return ""
 }
 
 func (e *Error) Error() string { return e.Msg }
