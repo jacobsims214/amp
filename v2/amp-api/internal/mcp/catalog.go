@@ -75,7 +75,7 @@ var toolCatalog = map[string]toolInfo{
 	"amp_get_epic":              {title: "Get epic", readOnly: true, listing: hiddenAlias},
 	"amp_get_story":             {title: "Get story", readOnly: true, listing: hiddenAlias},
 	"amp_check_plan":            {title: "Check plan", keywords: "validate the plan before dispatching, find unconnected tickets", readOnly: true},
-	"amp_approve_plan":          {title: "Approve plan", keywords: "record that the user approved the plan", listing: personOnly},
+	"amp_approve_plan":          {title: "Plan approval status", keywords: "is the plan approved, where a person approves the plan (agents can't)"},
 	"amp_find_by_metadata":      {title: "Find by metadata", keywords: "find projects, epics, stories or tickets by metadata (jira key, cost center)", readOnly: true},
 	"amp_set_task_dependencies": {title: "Set ticket dependencies", keywords: "add or remove a dependency, what a ticket waits on, fix ticket order", idempotent: true},
 

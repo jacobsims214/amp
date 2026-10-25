@@ -14,8 +14,8 @@ in My work, in Mission and on the Board.
 
 Either:
 - **In the UI.** Open the ticket and answer the question.
-- **Through your agent.** Tell your manager the answer; it records it with
-  `amp_answer_question(task_id, answer)`.
+- **Through your agent.** Tell your manager the answer; it relays it with
+  `amp_answer_question(task_id, answer)`. AMP shows it as "<your email> (relayed by agent)".
 
 Both post the answer as a comment and put the ticket back to ready. The next worker reads the
 comments first, finds the answer, and continues from where the last one stopped.
@@ -23,7 +23,8 @@ comments first, finds the answer, and continues from where the last one stopped.
 ## Rules for managers
 
 - Don't answer for your user unless the ticket, its comments, or what your user already said this
-  session settles it, and then quote where the answer came from.
+  session settles it, and then quote where the answer came from. Never answer a question that
+  asks for an approval (a plan, an artifact, a sign-off): that's the person's click in the UI.
 - Ask your user plainly: the question, the options, the worker's recommendation, the ticket ID.
   Batch several questions together.
 - Keep everything else moving. Tickets that depend on the question wait; nothing else should.

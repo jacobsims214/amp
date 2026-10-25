@@ -29,7 +29,8 @@ tags: [ui, onboarding, navigation]
 - **Board** — tickets by state. Filter by person, epic or text. **Hand over …** moves the
   filtered tickets to someone else with a reason.
 - **Flight plan** — the plan as epics, stories and tickets in order, the plan check verdict
-  (GO / WARN / NO-GO), and **Approve plan** when the project requires approval.
+  (GO / WARN / NO-GO), and **Approve plan** when the project requires approval (your own tickets under **Yours**;
+  leads can approve **Others'** on their behalf).
 - **Graph** — the dependency graph.
 - **Reports** — progress, velocity, people (with who each person is blocked by), the standup
   sheet, tokens and cost by model, epic, person and metadata, with a Markdown export.

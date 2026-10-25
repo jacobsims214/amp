@@ -25,6 +25,9 @@ func (s *Service) RecordRun(ctx context.Context, p authz.Principal, taskID int, 
 	if err != nil {
 		return domain.Run{}, err
 	}
+	if err := s.checkRunOutcome(p, t, run.Outcome); err != nil {
+		return domain.Run{}, err
+	}
 	return s.recordRun(ctx, p, t, run)
 }
 

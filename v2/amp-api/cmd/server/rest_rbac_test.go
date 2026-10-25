@@ -38,7 +38,16 @@ func newRestAs(t *testing.T, w *rbacWorld) *restAs {
 	}}
 	ra.server = httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if ident, ok := ra.ids[r.Header.Get("X-Test-As")]; ok {
-			r = r.WithContext(auth.WithIdentity(r.Context(), ident))
+			// The web UI's session on the REST listener, unless the test
+			// says the request came another way (X-Test-Channel: an MCP-
+			// audience token, an API token).
+			c := *ident
+			c.Listener, c.Channel = "rest", auth.ChannelUI
+			if ch := r.Header.Get("X-Test-Channel"); ch != "" {
+				c.Channel = ch
+				c.APIToken = ch == auth.ChannelToken
+			}
+			r = r.WithContext(auth.WithIdentity(r.Context(), &c))
 		}
 		mux.ServeHTTP(rw, r)
 	}))
@@ -47,6 +56,13 @@ func newRestAs(t *testing.T, w *rbacWorld) *restAs {
 }
 
 func (ra *restAs) do(t *testing.T, who, method, path string, body any) (int, map[string]any) {
+	t.Helper()
+	return ra.doVia(t, "", who, method, path, body)
+}
+
+// doVia is do over a channel other than the web UI (auth.ChannelToken,
+// auth.ChannelRESTOther); "" is the UI.
+func (ra *restAs) doVia(t *testing.T, channel, who, method, path string, body any) (int, map[string]any) {
 	t.Helper()
 	var rd *strings.Reader
 	if body != nil {
@@ -59,6 +75,9 @@ func (ra *restAs) do(t *testing.T, who, method, path string, body any) (int, map
 	req.Header.Set("Content-Type", "application/json")
 	if who != "" {
 		req.Header.Set("X-Test-As", who)
+	}
+	if channel != "" {
+		req.Header.Set("X-Test-Channel", channel)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

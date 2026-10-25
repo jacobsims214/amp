@@ -152,6 +152,24 @@ impl Rig {
         used
     }
 
+    /// A key as the terminal loop routes it: to the open panel, else to the editor.
+    async fn typ(&mut self, code: KeyCode) {
+        let empty = self.editor_text().is_empty();
+        if !self.shell.key(&key(code), empty).await {
+            self.shell.editor_key(key(code));
+        }
+        self.settle().await;
+    }
+
+    fn editor_text(&self) -> String {
+        self.shell.view().editor().get_text()
+    }
+
+    fn focused(&self) -> bool {
+        assert!(self.shell.view().panel().is_open(), "open");
+        !self.shell.input_focused()
+    }
+
     fn screen(&self) -> String {
         self.shell.view().render_plain(W, H).join("\n")
     }
@@ -182,7 +200,7 @@ async fn amp_shows_the_connection_and_esc_closes_it() {
         "user     ada@example.com · human",
         "health   ● connected",
         "project  simstech › AMP #2",
-        "Enter / o open in browser · Esc close",
+        "Enter open in browser · Tab editor · Esc close",
     ] {
         assert!(screen.contains(want), "{want}\n{screen}");
     }
@@ -239,8 +257,8 @@ async fn ticket_shows_and_switches_the_current_ticket() {
         "{screen}"
     );
 
-    // o opens the ticket's board drawer.
-    assert!(rig.press(KeyCode::Char('o')).await);
+    // Enter opens the ticket's board drawer.
+    assert!(rig.press(KeyCode::Enter).await);
     assert_eq!(
         rig.opened(),
         vec!["https://amp.simstech.cloud/project/2/board?task=2106".to_owned()]
@@ -376,9 +394,9 @@ async fn workers_lists_local_and_remote_workers() {
         frame.contains(&c.muted.fg("amp:amp-worker-backend")),
         "{frame:?}"
     );
-    // ↓ then o: the second worker's ticket.
+    // ↓ then Enter: the second worker's ticket.
     rig.press(KeyCode::Down).await;
-    rig.press(KeyCode::Char('o')).await;
+    rig.press(KeyCode::Enter).await;
     assert_eq!(
         rig.opened(),
         vec!["https://amp.simstech.cloud/project/2/board?task=2111".to_owned()]
@@ -928,5 +946,67 @@ async fn a_run_ticket_refusal_says_whose_ticket() {
         screen.contains("Approve it in AMP: https://amp.simstech.cloud/project/2/plan"),
         "{screen}"
     );
+    assert_fits(&rig);
+}
+
+/// #2161: with a panel open and an empty editor, a prompt that starts with `o` ("ok…") goes to the
+/// editor and opens nothing; once typing starts (or a prompt is sent) ↑ is the editor's again,
+/// and Tab gives the keys back to the panel. (On harness-m4 the workers panel keeps its `x`/`o`
+/// commands, #2252, and configuration panels their letters, #2245; every other panel types.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_with_a_panel_open_goes_to_the_editor() {
+    let mut rig = rig(vec![FauxStep::text("fine")], true).await;
+    rig.say("/questions").await;
+    assert!(rig.focused());
+    assert!(
+        rig.screen()
+            .contains("↑↓ select · Enter answer · Tab editor · Esc close")
+    );
+
+    rig.typ(KeyCode::Char('o')).await;
+    rig.typ(KeyCode::Char('k')).await;
+    assert_eq!(rig.editor_text(), "ok");
+    assert!(rig.opened().is_empty(), "{:?}", rig.opened());
+    assert!(rig.shell.view().panel().is_open(), "the panel stays docked");
+    assert!(!rig.focused());
+    // Enter and arrows are the editor's while it has text.
+    assert!(!rig.shell.panel_key(&key(KeyCode::Down), false));
+    assert!(!rig.shell.panel_key(&key(KeyCode::Enter), false));
+
+    // A prompt is sent (the panel stays, unfocused) and the editor is empty again: ↑ and Enter
+    // still belong to the editor, so nothing opens.
+    rig.shell.view().editor().clear();
+    rig.say("ok, go on").await;
+    assert!(rig.shell.view().panel().is_open());
+    assert!(!rig.focused());
+    assert!(!rig.shell.panel_key(&key(KeyCode::Up), true));
+    assert!(!rig.shell.panel_key(&key(KeyCode::Enter), true));
+    assert_eq!(rig.shell.view().panel().state().unwrap().selected, 0);
+    for c in "one or only".chars() {
+        rig.typ(KeyCode::Char(c)).await;
+    }
+    assert_eq!(rig.editor_text(), "one or only");
+    assert!(rig.opened().is_empty(), "{:?}", rig.opened());
+
+    // Tab (empty editor) gives the keys back; ↓ selects again.
+    rig.shell.view().editor().clear();
+    assert!(rig.press(KeyCode::Tab).await);
+    assert!(rig.focused());
+    assert!(rig.press(KeyCode::Down).await);
+    assert_eq!(rig.shell.view().panel().state().unwrap().selected, 1);
+    // Tab again hands the keys to the editor; Tab with text in the editor is the editor's.
+    assert!(rig.press(KeyCode::Tab).await);
+    assert!(!rig.focused());
+    assert!(!rig.shell.panel_key(&key(KeyCode::Tab), false));
+
+    // A paste hands the keys to the editor, too.
+    assert!(rig.press(KeyCode::Tab).await);
+    assert!(rig.focused());
+    rig.shell.paste("pasted");
+    assert!(!rig.focused());
+    assert_eq!(rig.editor_text(), "pasted");
+    // Esc still closes the panel.
+    rig.typ(KeyCode::Esc).await;
+    assert!(!rig.shell.view().panel().is_open());
     assert_fits(&rig);
 }

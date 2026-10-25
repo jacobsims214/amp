@@ -37,7 +37,8 @@ Don't set state by hand to work around a missing dependency; add the dependency.
 - AMP enforces ownership: only the owner (or their agent) can dispatch, work and complete a
   ticket. Anyone on the project can read it and comment on it. Leads can hand work over.
 - **Agent accounts** are separate AMP users for unattended agents (CI, bots). They can do work
-  but can't approve plans.
+  but can't approve plans. No agent can, whoever it runs as: plans and artifacts are approved,
+  and human tickets marked done, by a person in the web UI.
 - **Human tickets** are done by their owner, not an agent: a review and merge, a sign-off, a
   step that needs access agents don't have. They sit in the same dependency graph, so the agent
   work after them waits for the person. Agents never dispatch them. See `working/human-work.md`.

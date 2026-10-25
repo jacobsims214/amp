@@ -43,10 +43,10 @@ func (s *Server) registerArtifacts(mcp *server.MCPServer) {
 		}), wrap(ctx, s.open(s.publishArtifact)))
 
 	mcp.AddTool(tool("amp_review_artifact",
-		"Record the user's verdict on an artifact's latest version: approve it, or request changes with what to change. Call it "+
-			"only when the user gives that verdict in chat (\"looks good, approve it\", \"move Save to the bottom\"), never on your own "+
-			"judgment; people can also review in AMP. The verdict is posted on the artifact's ticket, and if the ticket is waiting on "+
-			"review it goes back to ready for the next dispatch. Agent accounts can't review.",
+		"Record a person's request for changes on an artifact's latest version (approve=false, with what to change), relayed from "+
+			"your chat. Approving (approve=true) is done only by a person in AMP's web UI: over MCP it fails with the artifact's link. "+
+			"The verdict is posted on the artifact's ticket, and if the ticket is waiting on review it goes back to ready for the next "+
+			"dispatch. Agent accounts can't review.",
 		props{
 			"artifact_id": num("REQUIRED. Artifact ID."),
 			"approve":     boolean("REQUIRED. true to approve, false to request changes."),

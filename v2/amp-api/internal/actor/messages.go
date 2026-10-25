@@ -90,9 +90,20 @@ type MsgDispatchTask struct {
 }
 
 type MsgCompleteTask struct {
-	TaskID  int
-	By      *int // acting user, for the activity log
-	ReplyCh chan ReplySimple
+	TaskID int
+	By     *int // acting user, for the activity log
+	// ByName names the caller in the activity log (an email, or "local-dev")
+	// when the ticket has no agent to name.
+	ByName string
+	// RequireStarted refuses unless the ticket is in progress (or already
+	// completed): agents complete only work that was dispatched. Checked in
+	// the actor so a state change racing the caller's check can't slip by.
+	RequireStarted bool
+	// RequireDeps refuses while any dependency is incomplete (re-read from
+	// the database), so a dependency added or reopened after dispatch still
+	// holds an agent's completion. Set off the web UI.
+	RequireDeps bool
+	ReplyCh     chan ReplySimple
 }
 
 type MsgBlockTask struct {
@@ -113,14 +124,24 @@ type MsgAssignTask struct {
 	// RequireIdle refuses the change if the ticket is in progress (set when
 	// only the project's open-reassign setting allows it).
 	RequireIdle bool
-	By          *int
-	ByName      string
-	ReplyCh     chan ReplyGetTask
+	// ByLead is set when the person making the change is a project lead or
+	// above acting in the AMP web UI (not over MCP or an API token, AMP
+	// #2223): their reassignment keeps the ticket's plan approval. Anyone
+	// else's drops it when the ticket stops being the person it was approved
+	// for (domain.Task.DropsApprovalOn, AMP #2218).
+	ByLead  bool
+	By      *int
+	ByName  string
+	ReplyCh chan ReplyGetTask
 }
 
 type MsgUpdateTask struct {
-	Req     domain.UpdateTaskRequest
-	ReplyCh chan ReplySimple
+	Req domain.UpdateTaskRequest
+	// KeepHuman, when set, refuses (with this message) switching a person's
+	// ticket to agent work. The task actor checks it atomically with the
+	// update; a string so it survives remote encoding.
+	KeepHuman string
+	ReplyCh   chan ReplySimple
 }
 
 type MsgAddComment struct {
@@ -134,11 +155,22 @@ type MsgGetComments struct {
 }
 
 type MsgSetTaskState struct {
-	TaskID  int
-	State   domain.TaskState
-	Reason  string
-	By      *int
-	ReplyCh chan ReplySimple
+	TaskID int
+	State  domain.TaskState
+	Reason string
+	By     *int
+	// ByName names who changed it in the activity log (default "manager").
+	ByName string
+	// RequireStarted refuses unless the ticket is in progress (see
+	// MsgCompleteTask).
+	RequireStarted bool
+	// RequireDeps (set off the web UI) keeps a ticket with an incomplete
+	// dependency from being made ready or done by hand: to completed or
+	// in_progress it's refused; to backlog it's refused from backlog or
+	// blocked, and work moved back from in progress or completed lands
+	// blocked on its dependencies instead.
+	RequireDeps bool
+	ReplyCh     chan ReplySimple
 }
 
 // MsgSetTaskStartAt updates a task's start_at schedule.
@@ -147,6 +179,22 @@ type MsgSetTaskStartAt struct {
 	TaskID  int
 	StartAt *time.Time
 	ReplyCh chan ReplySimple
+}
+
+// MsgApproveTask records a person's approval of one ticket's plan (AMP
+// #2198). The task actor approves it only if, at that moment, it is still
+// open, not already approved as planned now, planned at or before AsOf
+// (when set: what the person saw), and owned by ExpectOwner (whom the
+// service checked the approver may approve for). Otherwise it replies with
+// Approved false and Why. ByName/OnBehalfOf word the history entry.
+type MsgApproveTask struct {
+	TaskID      int
+	AsOf        *time.Time
+	ExpectOwner *int
+	By          *int
+	ByName      string
+	OnBehalfOf  string
+	ReplyCh     chan ReplyApproveTask
 }
 
 // MsgScheduledUnblock is sent by the timer goroutine to the TaskActor
@@ -360,6 +408,15 @@ type ReplyGetTask struct {
 type ReplyListTasks struct {
 	Tasks []domain.Task
 	Err   error
+}
+
+// ReplyApproveTask answers MsgApproveTask: the ticket as it is now, whether
+// this call approved it, and why not when it didn't.
+type ReplyApproveTask struct {
+	Task     *domain.Task
+	Approved bool
+	Why      string
+	Err      error
 }
 
 type ReplySimple struct {
