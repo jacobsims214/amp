@@ -987,7 +987,8 @@ pub struct Switcher {
     policy: Arc<ToolPolicy>,
     /// The session's `.amp.json`: its project stays selected after a switch, and a marker made
     /// for another server than the new one is called out (#2228, like the start's banner, #2206).
-    marker: Option<ProjectMarker>,
+    /// Changed by [`Switcher::set_marker`] when the chat's folder is linked (#2383).
+    marker: Mutex<Option<ProjectMarker>>,
     /// Start a metadata poller for the new server (the chat has one).
     with_meta: bool,
     state: Mutex<SwitchState>,
@@ -1026,7 +1027,7 @@ impl Switcher {
             rt,
             harness,
             policy,
-            marker,
+            marker: Mutex::new(marker),
             with_meta,
             state: Mutex::new(SwitchState {
                 settings,
@@ -1076,6 +1077,18 @@ impl Switcher {
                  restart the chat to use AMP."
             ),
         }))
+    }
+
+    /// The chat's `.amp.json` now (#2383): a later `/server` keeps this project selected.
+    pub fn set_marker(&self, marker: Option<ProjectMarker>) {
+        *self.marker.lock().unwrap_or_else(PoisonError::into_inner) = marker;
+    }
+
+    fn marker(&self) -> Option<ProjectMarker> {
+        self.marker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn current(&self) -> Settings {
@@ -1227,10 +1240,11 @@ impl Switcher {
                 "note: {ENV_MCP_URL} still names the old server for the next start"
             ));
         }
-        if let Some(line) = self.marker.as_ref().map(|m| marker_line(m, &settings.url)) {
+        let marker = self.marker();
+        if let Some(line) = marker.as_ref().map(|m| marker_line(m, &settings.url)) {
             lines.push(line);
         }
-        let project_id = self.marker.as_ref().map(|m| m.project_id);
+        let project_id = marker.as_ref().map(|m| m.project_id);
         let meta = self
             .with_meta
             .then(|| crate::chat::start_meta_with(settings, project_id, None));

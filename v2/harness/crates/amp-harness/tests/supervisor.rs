@@ -751,6 +751,59 @@ async fn manager_and_worker_requests_carry_the_current_time_but_transcripts_do_n
     assert!(!manager_text.contains("<current_time>"), "{manager_text}");
 }
 
+/// #2383: the chat started with no project and the manager then wrote `.amp.json`; the chat
+/// moves the supervisor onto it ([`Supervisor::set_project`]), so a worker dispatched afterwards
+/// gets the project in its prompt and its `<amp_context>`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workers_dispatched_after_a_relink_get_the_new_project() {
+    let f = fixture("relink").await;
+    let hooks = Arc::new(Recorder::default());
+    let sup = Supervisor::with_hooks(
+        Arc::clone(&f.rt),
+        ManagerContext {
+            project: None,
+            ..f.manager()
+        },
+        config(),
+        Some(Arc::clone(&hooks) as Arc<dyn WorkerHooks>),
+    );
+    assert_eq!(sup.project(), None);
+    sup.set_project(f.manager().project);
+    assert_eq!(sup.project().map(|p| p.project_id), Some(2));
+    f.script(
+        "boss",
+        vec![
+            template(
+                "",
+                json!([{"name": "amp_run_ticket", "arguments": {"task_id": 2085, "agent_id": "amp:amp-worker-backend"}}]),
+            ),
+            template("done", json!([])),
+        ],
+    );
+    f.script(
+        "wf",
+        vec![template(
+            "wp={{context:project_id}} wn={{context:project_name}}",
+            json!([]),
+        )],
+    );
+    let mut spec = AgentSpec::new("amp-manager", f.repo.clone());
+    spec.extra_tools = vec![sup.tool()];
+    let manager = f.rt.build(spec).await.expect("build the manager");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        manager.harness.prompt_text("run #2085", Vec::new()),
+    )
+    .await
+    .expect("the manager finished")
+    .expect("the run");
+    let reports = hooks.reports();
+    assert_eq!(reports.len(), 1);
+    let worker = std::fs::read_to_string(reports[0].session_file.as_ref().unwrap()).unwrap();
+    assert!(worker.contains("wp=2 wn=AMP v2"), "{worker}");
+    assert!(worker.contains("#2085 in project 2."), "{worker}");
+}
+
 /// #2356: a manager in a new folder that the surrounding repository doesn't track, or in a
 /// repository with no commit yet, can't give a worker a useful worktree (it would be a checkout of
 /// the other repository, or there is nothing to branch from). The worker runs in the folder

@@ -21,7 +21,9 @@
 //! - `{{last_tool_result}}`: the text of the newest tool result, without the clock stamp;
 //! - `{{system_prompt}}`: the whole system prompt;
 //! - `{{current_time}}`: the newest clock stamp the request carried (#2250,
-//!   [`crate::request_time`]), or `none`.
+//!   [`crate::request_time`]), or `none`;
+//! - `{{context:KEY}}`: the value of the system prompt's `<amp_context>` line `KEY: …` (#2383,
+//!   e.g. `{{context:project_id}}`), or `none`.
 //!
 //! When the script runs out, the faux provider answers with an error ("No more faux responses
 //! queued"), so a script that is too short fails the run instead of hanging it.
@@ -161,6 +163,7 @@ impl StepSpec {
                 "{{last_tool_result}}",
                 "{{system_prompt}}",
                 "{{current_time}}",
+                "{{context:",
             ]
             .iter()
             .any(|p| t.contains(p))
@@ -230,13 +233,43 @@ fn fill(template: &str, ctx: &Context) -> String {
             crate::request_time::last_stamp(&text).map(str::to_owned)
         })
         .unwrap_or_else(|| "none".to_owned());
-    template
+    let system = ctx.system_prompt.as_deref().unwrap_or_default();
+    let filled = template
         .replace("{{last_tool_result}}", &last_tool_result)
-        .replace("{{current_time}}", &current_time)
-        .replace(
-            "{{system_prompt}}",
-            ctx.system_prompt.as_deref().unwrap_or_default(),
-        )
+        .replace("{{current_time}}", &current_time);
+    fill_context(&filled, system).replace("{{system_prompt}}", system)
+}
+
+/// Fills each `{{context:KEY}}` in `text` with the value of the `KEY: …` line in `system`'s
+/// `<amp_context>` block, or `none`.
+fn fill_context(text: &str, system: &str) -> String {
+    const OPEN: &str = "{{context:";
+    let block = system
+        .find("<amp_context>")
+        .map(|at| {
+            let rest = &system[at..];
+            &rest[..rest.find("</amp_context>").unwrap_or(rest.len())]
+        })
+        .unwrap_or_default();
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        let Some(len) = rest[at + OPEN.len()..].find("}}") else {
+            break;
+        };
+        let key = &rest[at + OPEN.len()..at + OPEN.len() + len];
+        out.push_str(&rest[..at]);
+        let prefix = format!("{key}: ");
+        out.push_str(
+            block
+                .lines()
+                .find_map(|l| l.strip_prefix(&prefix))
+                .unwrap_or("none"),
+        );
+        rest = &rest[at + OPEN.len() + len + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -294,6 +327,20 @@ mod tests {
             crate::events::assistant_text(&m),
             "got {\"user_id\":7} / SYS"
         );
+    }
+
+    #[test]
+    fn context_placeholders_read_the_amp_context_lines() {
+        let system = "role prompt\nproject_id: 1 (outside)\n<amp_context>\nrole: manager\n\
+                      project_id: 159\nproject_name: Go API\n</amp_context>\nafter";
+        assert_eq!(
+            fill_context(
+                "#{{context:project_id}} {{context:project_name}} {{context:nope}} {{context:x",
+                system
+            ),
+            "#159 Go API none {{context:x"
+        );
+        assert_eq!(fill_context("{{context:project_id}}", "no block"), "none");
     }
 
     #[test]
