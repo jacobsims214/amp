@@ -340,6 +340,7 @@ func main() {
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
+	restHandler.SetRemoteControl(remoteConfig())
 	restHandler.Register(mux)
 	// Artifacts nobody kept are deleted after the retention period.
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
@@ -494,4 +495,17 @@ func kbReconcileInterval() time.Duration {
 		return def
 	}
 	return d
+}
+
+// remoteConfig is the instance's remote control configuration (epic 165).
+// RELAY_ENABLED (Helm relay.enabled) is the instance switch, off unless set
+// to true; it never turns on with auth off (OIDC_ISSUER_URL empty: compose
+// and local dev, where every caller is a global admin).
+func remoteConfig() service.RemoteConfig {
+	on, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("RELAY_ENABLED")))
+	cfg := service.RemoteConfig{InstanceEnabled: on, AuthEnabled: os.Getenv("OIDC_ISSUER_URL") != ""}
+	if cfg.InstanceEnabled && !cfg.AuthEnabled {
+		slog.Warn("RELAY_ENABLED is set but auth is off (no OIDC_ISSUER_URL): remote control stays unavailable")
+	}
+	return cfg
 }

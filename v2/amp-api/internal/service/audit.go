@@ -39,6 +39,12 @@ func OnAudit(fn func(domain.AuditEntry)) (unregister func()) {
 // audit records an entry made by p. Recording is best effort: the change
 // it describes has already happened, so a failure is logged, not returned.
 func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEntry) {
+	_ = s.writeAudit(ctx, p, e)
+}
+
+// writeAudit is audit that also returns the failure, for the few actions that
+// must not happen without their audit entry (remote.enable, remote.pair).
+func (s *Service) writeAudit(ctx context.Context, p authz.Principal, e domain.AuditEntry) error {
 	e.ActorUserID = p.UserRef()
 	e.ActorEmail = p.Email
 	e.ViaToken = p.ViaToken
@@ -60,13 +66,14 @@ func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEn
 	stored, err := s.Repo.InsertAudit(context.WithoutCancel(ctx), e)
 	if err != nil {
 		slog.Error("audit log write failed", "action", e.Action, "target", e.TargetType+":"+e.TargetID, "err", err)
-		return
+		return err
 	}
 	auditMu.RLock()
 	defer auditMu.RUnlock()
 	for _, fn := range auditSinks {
 		fn(*stored)
 	}
+	return nil
 }
 
 // Record adds an audit entry for a change made outside the service (project
