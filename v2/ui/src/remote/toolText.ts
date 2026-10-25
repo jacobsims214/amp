@@ -344,9 +344,32 @@ export function formatSpan(ms: number): string {
 
 /** `48k tok`, `1.2M tok`. */
 export function tokLabel(n: number): string {
-  if (n < 1000) return `${n} tok`
-  if (n < 1_000_000) return `${(n / 1000).toFixed(n < 10_000 ? 1 : 0)}k tok`
-  return `${(n / 1_000_000).toFixed(1)}M tok`
+  return `${tokens(n)} tok`
+}
+
+/** `7.8k`, `48.0k`, `1.2M` (amp-tui overlay.rs `tokens`, which the roster and `/usage` use). */
+export function tokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1_000) return `${(n / 1e3).toFixed(1)}k`
+  return String(n)
+}
+
+/** `ctx 31%`, `ctx <1%` for a sliver (amp-tui footer.rs `context_label`). */
+export function ctxLabel(percent: number): string {
+  return percent > 0 && percent < 1 ? 'ctx <1%' : `ctx ${percent.toFixed(0)}%`
+}
+
+/** A worker's context use in percent, once both its context and its model's window are known. */
+export function workerContextPercent(tokensUsed: number | null | undefined, window: number | null | undefined): number | null {
+  return tokensUsed && window && tokensUsed > 0 && window > 0 ? tokensUsed / window * 100 : null
+}
+
+/** `45s`, `3m12s`, `1h05m` (amp-tui roster.rs `duration`, the chips' times). */
+export function rosterDuration(ms: number): string {
+  const s = Math.floor(Math.max(0, ms) / 1000)
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`
+  return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`
 }
 
 /** `amp:amp-worker-backend` → `worker-backend`; `anthropic/claude-opus-5-5` → `claude-opus-5-5`. */

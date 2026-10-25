@@ -92,6 +92,9 @@ export function seedChatEvents(): ChatEvent[] {
       { task_id: 2371, name: 'RC-M1 relay routes', role: 'backend', state: 'done', model: null, started_at_ms: null },
     ] },
     { type: 'queue', items: [] },
+    // #2388: a compaction that started and finished.
+    { type: 'compaction', active: true, manual: false },
+    { type: 'compaction', active: false, manual: false },
   ]
 }
 
