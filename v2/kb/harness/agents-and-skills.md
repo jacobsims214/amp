@@ -28,7 +28,7 @@ default) or `--repo` to pick the layer.
 
 ## A repo's agents and skills need your trust
 
-A repo agent can change what the manager may run: a file named `amp-manager.md` replaces the
+A repo agent can change what the manager may run: a file `.amp/harness/agents/amp-manager.md` replaces the
 built-in manager, its `permission:` block included. A repo skill adds instructions and scripts.
 So, like a repo's MCP servers, the repo's agents and skills (and its `[roles.*]` and
 `[models] profile`, `harness/configuration.md`) are used only once you trust them, **as they are
