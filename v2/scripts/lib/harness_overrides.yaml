@@ -39,14 +39,26 @@ files:
         with: |
           Your working set is: the full `amp_*` MCP tool surface (projects, epics, stories, tasks, and the
           knowledge base) — they're already in your tool list under their own names, so call them
-          directly — and the `amp_run_ticket` tool for running specialist workers. You cannot edit
-          files, and your `bash` is limited to `git status`, `git diff`, `git log` and `ls`. You do not
-          have `webfetch` — if you need information from the web, dispatch a research subagent to fetch
+          directly — and the `amp_run_ticket` tool for running specialist workers. You do not have
+          `webfetch` — if you need information from the web, dispatch a research subagent to fetch
           and report it back to you. You do not have `todowrite` either — AMP tickets and comments are
           the only place work is planned and tracked in this system; never reach for a built-in planning
           tool as a substitute. A worker cannot run a further worker: the harness doesn't give workers
           `amp_run_ticket`, so don't try to route around it. `amp_run_ticket` runs only the `amp-*`
           specialists its description lists.
+
+          Your built-in tools, and what each takes:
+          - `ls {"path": "dir"}` lists a directory, `read {"path": "file"}` reads a file, `find` and
+            `grep` search. None of them runs a command, and none takes AMP arguments.
+          - `bash {"command": "..."}` runs read-only commands: `git status`, `git diff`, `git log`,
+            `git show`, `git rev-parse`, `git ls-files`, `ls`, `pwd`, `date`, `echo`, `cat`, `head`,
+            `tail`, `wc`, `grep`, `sort`, and pipes between them (`git log --oneline | head -5`). Anything
+            that writes or runs a build is denied, and a denied command is denied again if you retry it.
+          - `write`/`edit` only for `.amp.json` in the working directory (the amp-init skill). Every
+            other file is a worker's job.
+          - `git log` in a repo with no commits fails with "does not have any commits yet": that's a
+            new repo, not a problem.
+          - AMP tools (`amp_*`) are their own tools: call them by name with their own arguments.
       - paragraph: "You never implement, edit project code, run builds, or fetch the web yourself."
         with: |
           You never implement, edit project code, run builds, or fetch the web yourself. Every unit of
@@ -161,8 +173,17 @@ files:
 
   skills/amp-init/SKILL.md:
     body:
-      - find: "(e.g. the `amp` entry in `opencode.json`, `.mcp.json` or the plugin's MCP settings)"
-        replace: "(e.g. the server `amp-harness doctor` reports)"
+      - paragraph: "You also need the URL of the user's AMP server for `amp_api`."
+        with: |
+          You also need the URL of the user's AMP server for `amp_api`: in the harness it is the
+          origin of `amp_server` in your `<amp_context>` (e.g. `http://localhost:18000` for
+          `http://localhost:18000/mcp`). Use it; don't ask.
+      - paragraph: "- If the harness's AMP MCP config already points at a server"
+        with: ""
+      - find: "If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation."
+        replace: "If your user didn't give a name and code, pick them from what they told you about the project (the folder name only when that's all you have), create the project, and say they can rename it. Don't stop to ask first."
+      - find: "Write that to `.amp.json` in the current directory. Commit it — everyone working here shares the same project."
+        replace: "Write that to `.amp.json` in the working directory with the `write` tool (the one file you may write). Don't commit it yourself: tell your user to commit it, or let the first worker's ticket include it, so everyone working here shares the same project."
 
   skills/amp-design-tools/SKILL.md:
     body:

@@ -1726,12 +1726,13 @@ mod tests {
         ModelsConfig::from_files(ModelsFile::defaults(), Some(user), "config test", env)
     }
 
-    /// The opencode roster: v2/.opencode/agent/amp-<role>.md `model` + `variant`.
+    /// The shipped roles: the opencode roster (v2/.opencode/agent/amp-<role>.md `model` +
+    /// `variant`) except the roles in [`NOT_OPENCODE`].
     const OPENCODE: &[(&str, &str, ThinkingLevel)] = &[
         (
             "manager",
-            "openrouter/xiaomi/mimo-v2.6-pro",
-            ThinkingLevel::High,
+            "openrouter/openai/gpt-6.1-sol",
+            ThinkingLevel::Low,
         ),
         (
             "researcher",
@@ -1991,12 +1992,28 @@ thinking = "low"
             assert_eq!(r.model.base_url, "https://openrouter.ai/api/v1");
         }
         // opencode's mimo variant "on" is a body field, not an effort.
-        let manager = c.resolve_role("amp-manager").unwrap();
+        let researcher = c.resolve_role("amp-researcher").unwrap();
         assert_eq!(
-            manager.model.sampling_params.unwrap()["reasoning"],
+            researcher.model.sampling_params.unwrap()["reasoning"],
             serde_json::json!({"enabled": true})
         );
+        // #2363: the manager runs on GPT-6.1 Sol at low effort, with no MiMo body.
+        let manager = c.resolve_role("amp-manager").unwrap();
+        assert!(
+            manager
+                .model
+                .sampling_params
+                .as_ref()
+                .is_none_or(|p| !p.contains_key("reasoning")),
+            "{:?}",
+            manager.model.sampling_params
+        );
     }
+
+    /// Roles whose shipped model deliberately differs from the opencode agent file (#2363: the
+    /// manager eval showed MiMo with reasoning on was too slow for the harness manager; opencode's
+    /// own config is left as it is).
+    const NOT_OPENCODE: &[&str] = &["amp-manager"];
 
     #[test]
     fn opencode_agent_files_match_the_defaults() {
@@ -2021,6 +2038,10 @@ thinking = "low"
             let Some(model) = field("model") else {
                 continue;
             };
+            if NOT_OPENCODE.contains(&stem) {
+                seen += 1;
+                continue;
+            }
             let r = c.resolve_role(stem).unwrap();
             assert_eq!(r.model_ref(), model, "{stem}");
             let expected = match field("variant").as_deref() {
@@ -2130,10 +2151,10 @@ model = "anthropic/claude-opus-5-5"
 
     #[test]
     fn user_thinking_only_override_keeps_the_model() {
-        let c = config("[roles.manager]\nthinking = \"low\"\n").unwrap();
+        let c = config("[roles.manager]\nthinking = \"medium\"\n").unwrap();
         let manager = c.resolve_role("manager").unwrap();
-        assert_eq!(manager.model_ref(), "openrouter/xiaomi/mimo-v2.6-pro");
-        assert_eq!(manager.thinking, ThinkingLevel::Low);
+        assert_eq!(manager.model_ref(), "openrouter/openai/gpt-6.1-sol");
+        assert_eq!(manager.thinking, ThinkingLevel::Medium);
         assert_eq!(manager.source, "default + config test");
     }
 
@@ -2182,7 +2203,7 @@ model = "openrouter/openai/gpt-oss-120b"
         assert_eq!(or.timeouts.header, Some(Duration::from_secs(90)));
         assert_eq!(or.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(or.key_env.as_deref(), Some("OPENROUTER_API_KEY"));
-        assert_eq!(or.models.len(), 4);
+        assert_eq!(or.models.len(), 5);
     }
 
     #[test]

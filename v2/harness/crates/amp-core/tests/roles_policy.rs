@@ -245,6 +245,19 @@ fn manager_policy() {
         "git status && git log -1",
         "ls 2>/dev/null",
         "git log 2>&1",
+        // #2363: the user's session had these denied and retried them.
+        "git status 2>&1 | head -20; echo \"---\"; pwd; ls -la",
+        "git status --short --branch 2>&1 | head -20; echo \"---LOG---\"; git log --oneline -5 2>&1 | head -5",
+        "git log --oneline | head -5",
+        "git show HEAD --stat",
+        "git rev-parse --show-toplevel",
+        "git ls-files | wc -l",
+        "grep -o amp_[a-z_]* notes.md | sort -u",
+        "cat README.md | grep -n TODO",
+        "grep -rn amp_ src | head -20",
+        "tail -n 20 notes.md",
+        "date -u",
+        "pwd",
     ] {
         assert!(bash(&p, ok), "manager should run: {ok}");
     }
@@ -256,8 +269,22 @@ fn manager_policy() {
         "git status && rm -rf x",
         "ls; curl https://example.com",
         "git log | sh",
-        // Every command of a pipeline is checked: `head` is not on the manager's list.
-        "git log | head",
+        // Every command of a pipeline is checked: `sh`, `xargs`, `tee` are not on the list.
+        "git log | xargs rm",
+        "cat x | tee y",
+        "grep -rl x . | xargs sed -i s/a/b/",
+        // #2363: read-only pipes are fine, following a file forever is not.
+        "tail -f log.txt",
+        "tail -n 5 -f log.txt",
+        "tail -F x",
+        "tail --follow=name x",
+        "cat x > y",
+        "echo hi >> notes.md",
+        "sort -o x y",
+        "sort -u x -o y",
+        "uniq a b",
+        "find . -delete",
+        "git branch -D main",
         "mkdir -p .opencode/agent",
         "git diff $(rm -rf x)",
         "git log `id`",
@@ -336,12 +363,16 @@ fn manager_policy() {
         DenialReason::Redirect
     );
 
-    // edit/write: denied everywhere, and not even offered.
+    // edit/write: only `.amp.json` in the working directory (#2363: the amp-init skill writes the
+    // project marker), denied everywhere else.
     for path in [
         "src/main.rs",
         ".opencode/agent/x.md",
         "opencode.json",
         "/etc/hosts",
+        "sub/.amp.json",
+        "../.amp.json",
+        ".amp.json.bak",
     ] {
         assert!(!write(&p, path), "{path}");
         assert!(
@@ -349,7 +380,8 @@ fn manager_policy() {
             "{path}"
         );
     }
-    assert!(!p.exposes("edit") && !p.exposes("write"));
+    assert!(write(&p, ".amp.json"));
+    assert!(p.exposes("edit") && p.exposes("write"));
     assert!(p.exposes("bash"));
 
     // web and todos: denied.
@@ -502,6 +534,14 @@ fn opencode_manager_bash_rules_hold_without_the_lexer() {
         "ls -la v2",
         "mkdir -p .opencode/agent",
         "mkdir -p .opencode/skills/new-skill",
+        // #2363: opencode checks each command of a pipeline on its own.
+        "head -20",
+        "tail -n 5 notes.md",
+        "cat README.md",
+        "grep -rn TODO src",
+        "wc -l",
+        "git show HEAD --stat",
+        "pwd",
     ] {
         assert!(allows(ok), "opencode manager should run: {ok}");
     }
@@ -531,6 +571,13 @@ fn opencode_manager_bash_rules_hold_without_the_lexer() {
         "mkdir -p .opencode/x>~/.zshrc",
         "mkdir /etc/x",
         "rm -rf x",
+        "tail -f log.txt",
+        "tail -n 5 -f log.txt",
+        "tail --follow=name x",
+        "cat x > y",
+        "echo x >> notes.md",
+        "git show --output=x",
+        "xargs rm",
     ] {
         assert!(!allows(denied), "opencode manager must not run: {denied}");
     }
@@ -1047,7 +1094,16 @@ fn filter_tools_drops_what_a_role_can_never_use() {
     };
     assert_eq!(
         names(&policy("amp-manager")),
-        ["read", "bash", QUESTION_TOOL, DISPATCH_TOOL, "amp_get_task"]
+        // #2363: edit/write stay for `.amp.json` only (the amp-init skill).
+        [
+            "read",
+            "bash",
+            "edit",
+            "write",
+            QUESTION_TOOL,
+            DISPATCH_TOOL,
+            "amp_get_task"
+        ]
     );
     assert_eq!(
         names(&policy("amp-worker-backend")),

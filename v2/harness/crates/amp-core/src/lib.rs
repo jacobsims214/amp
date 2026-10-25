@@ -98,5 +98,6 @@ pub mod supervisor;
 pub mod templates;
 pub mod text_tool_calls;
 pub mod tickets;
+pub mod tool_guide;
 pub mod tools;
 pub mod worker_session;

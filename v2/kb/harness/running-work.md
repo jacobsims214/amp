@@ -45,6 +45,22 @@ a plain drag doesn't select. Hold Fn (Terminal.app) or Option (iTerm2) while dra
 `[tui] mouse = false` (plain drag selects again; clicking a worker then doesn't work, Ctrl+W
 still does).
 
+## What to ask the manager
+
+- **"Set up a new project here"** in a folder with no `.amp.json` (an empty folder or a repo with
+  no commits is fine): it creates the AMP project, writes `.amp.json` in the folder (the one file
+  the manager may write) and a project overview in the project's KB, then offers to plan. Commit
+  `.amp.json` so everyone in the repo uses the same project.
+- **"Plan this" / "plan out X"**: it checks the board and KB once, then creates the epics,
+  stories and tickets with their dependencies (research tickets first when the stack needs study),
+  runs the plan check and gives you the link to approve your tickets. It doesn't start anything
+  until they're approved.
+- **"What's on the board?"**: a read-only summary, with links for what waits on you.
+- **"Run the ready tickets"**: it runs a worker on each approved, ready ticket.
+
+The manager's shell is read-only: `git status`/`diff`/`log`/`show`, `ls`, `cat`, `head`, `tail`,
+`grep`, `wc`, `sort` and pipes between them. Anything that writes or builds is a worker's job.
+
 ## Watching a worker
 
 While workers run, each one has a line above the message box, with a hint under them:
