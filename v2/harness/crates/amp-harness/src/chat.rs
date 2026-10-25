@@ -241,6 +241,21 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
     let project_id = session.project.as_ref().map(|p| p.project_id);
+    // #2356: `/project` says where a parent folder's marker is.
+    let project_marker = session
+        .project
+        .as_ref()
+        .filter(|p| p.in_parent_of(&session.cwd))
+        .map(|p| {
+            (
+                p.project_id,
+                format!(
+                    "{} (a parent folder's: {})",
+                    p.shown_from(&session.cwd),
+                    p.path.display()
+                ),
+            )
+        });
     // `/server` (#2164): list the saved servers and switch this session to another one.
     let switcher = Arc::new(
         Switcher::new(
@@ -318,7 +333,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let hub = Arc::clone(&session.rt.mcp_hub);
 
     let Some((width, height)) = args.snapshot else {
-        shell.set_meta(start_meta(&args.conn, project_id)?);
+        shell.set_meta(start_meta(&args.conn, project_id, project_marker.clone())?);
         // The same as `/reload`, when the configuration files change (#2242).
         let watcher = crate::reload::auto_reload(&|k| std::env::var(k).ok()).then(|| {
             let notes = shell.notifier();
@@ -359,7 +374,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         Err("--snapshot does not open a browser".to_owned())
     }));
     let meta = if args.meta {
-        let meta = start_meta(&args.conn, project_id)?;
+        let meta = start_meta(&args.conn, project_id, project_marker.clone())?;
         shell.set_meta(meta.clone());
         if let Some(sup) = session.supervisor.clone() {
             shell
@@ -610,12 +625,24 @@ fn load_density(args: &ChatArgs) -> Result<amp_tui::Density, CliError> {
 /// Its calls never go through the model. `--snapshot` does not start it, so its screen has no AMP
 /// header or status line and the model's calls are the only AMP calls; `debug render-chrome
 /// --live` is the render check with live metadata.
-fn start_meta(conn: &ConnArgs, project_id: Option<i64>) -> Result<MetaHandle, CliError> {
-    Ok(start_meta_with(conn.settings()?, project_id))
+fn start_meta(
+    conn: &ConnArgs,
+    project_id: Option<i64>,
+    project_marker: Option<(i64, String)>,
+) -> Result<MetaHandle, CliError> {
+    Ok(start_meta_with(
+        conn.settings()?,
+        project_id,
+        project_marker,
+    ))
 }
 
 /// [`start_meta`] for given settings (`/server` starts one for the new server, #2164).
-pub(crate) fn start_meta_with(settings: amp_mcp::Settings, project_id: Option<i64>) -> MetaHandle {
+pub(crate) fn start_meta_with(
+    settings: amp_mcp::Settings,
+    project_id: Option<i64>,
+    project_marker: Option<(i64, String)>,
+) -> MetaHandle {
     let web_url = settings.web_url.clone();
     let connector: Connector = Arc::new(move || {
         let settings = settings.clone();
@@ -625,6 +652,7 @@ pub(crate) fn start_meta_with(settings: amp_mcp::Settings, project_id: Option<i6
         None,
         MetaOptions {
             project_id,
+            project_marker,
             connector: Some(connector),
             web_url,
             ..MetaOptions::default()
@@ -723,10 +751,18 @@ fn shell_info(s: &session::Session, marker_warning: Option<&str>) -> ShellInfo {
     let resolved = &s.agent.resolved;
     let mcp = s.rt.mcp.session();
     let project = match &s.project {
-        Some(p) => match &p.project_name {
-            Some(name) => format!("project #{} {name}", p.project_id),
-            None => format!("project #{}", p.project_id),
-        },
+        Some(p) => {
+            let project = match &p.project_name {
+                Some(name) => format!("project #{} {name}", p.project_id),
+                None => format!("project #{}", p.project_id),
+            };
+            // #2356: a parent folder's marker says where it is.
+            if p.in_parent_of(&s.cwd) {
+                format!("{project} (from {})", p.shown_from(&s.cwd))
+            } else {
+                project
+            }
+        }
         None => "no .amp.json here (no project)".to_owned(),
     };
     let home = std::env::var_os("HOME").map(PathBuf::from);

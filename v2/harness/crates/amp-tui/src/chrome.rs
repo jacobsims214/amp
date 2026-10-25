@@ -1127,6 +1127,7 @@ pub mod sample {
             worker_ids: Vec::new(),
             workers: Default::default(),
             project_id: Some(2),
+            project_marker: None,
             project: ok(Project {
                 id: 2,
                 name: "AMP".to_owned(),

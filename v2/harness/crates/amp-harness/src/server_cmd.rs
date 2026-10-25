@@ -1233,7 +1233,7 @@ impl Switcher {
         let project_id = self.marker.as_ref().map(|m| m.project_id);
         let meta = self
             .with_meta
-            .then(|| crate::chat::start_meta_with(settings, project_id));
+            .then(|| crate::chat::start_meta_with(settings, project_id, None));
         Ok(ServerSwitched {
             notice: lines.join("\n"),
             meta,
