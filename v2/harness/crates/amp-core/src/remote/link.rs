@@ -72,6 +72,59 @@ pub struct HostStatus {
     pub ticket_id: Option<i64>,
     pub branch: Option<String>,
     pub workers_running: i64,
+    // #2388: the rest of what the TUI's header, footer and status line show (section 6.3).
+    /// The current ticket's name, board state (`in_progress`, …), epic and story.
+    pub ticket_name: Option<String>,
+    pub ticket_state: Option<String>,
+    pub epic: Option<String>,
+    pub story: Option<String>,
+    /// The session's token totals (its cost is `cost_usd_micros`).
+    pub usage: Option<SessionTokens>,
+    /// The thinking level (`off`, `low`, …) and the agent role (`manager`).
+    pub thinking: Option<String>,
+    pub role: Option<String>,
+    /// The working directory. Only its last component leaves the laptop.
+    pub cwd: Option<String>,
+    /// The project board's counts, while known.
+    pub board: Option<BoardCounts>,
+    /// Tickets awaiting plan approval: the person's own, and others'.
+    pub plan_approval: Option<(i64, i64)>,
+    /// The harness's own AMP connection.
+    pub amp_connection: Option<AmpConnection>,
+}
+
+/// The session's token totals (`status.usage`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionTokens {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: i64,
+    pub cache_write: i64,
+}
+
+/// The board counts the TUI's status line shows (`status.board`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BoardCounts {
+    pub in_progress: i64,
+    pub ready: i64,
+    pub question: i64,
+    pub scheduled: i64,
+}
+
+/// The harness's connection to AMP (`status.amp_connection`), as the TUI header's dot says it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AmpConnection {
+    /// `connecting`, `connected`, `slow`, `degraded`, `login_needed` or `disconnected`.
+    pub state: String,
+    /// The latency, while `slow`.
+    pub latency_ms: Option<i64>,
+}
+
+/// The last component of `path` (`/Users/ada/dev/amp` → `amp`); never the whole path.
+pub fn cwd_basename(path: &str) -> Option<String> {
+    let trimmed = path.trim().trim_end_matches(['/', '\\']);
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    (!base.is_empty()).then(|| cap(base, 64))
 }
 
 /// The harness's AMP login: a person's OAuth access token, fetched fresh for register and token
@@ -798,6 +851,28 @@ impl Actor {
             "queue_len": self.queue.len(),
             "workers_running": s.workers_running,
             "devices": devices,
+            // #2388 (optional within v1: an older harness leaves these out).
+            "ticket_name": s.ticket_name.as_deref().map(|t| cap(t, 200)),
+            "ticket_state": s.ticket_state,
+            "epic": s.epic.as_deref().map(|t| cap(t, 200)),
+            "story": s.story.as_deref().map(|t| cap(t, 200)),
+            "usage": s.usage.map(|u| json!({
+                "input_tokens": u.input, "output_tokens": u.output,
+                "cache_read_tokens": u.cache_read, "cache_write_tokens": u.cache_write,
+            })),
+            "thinking": s.thinking,
+            "role": s.role,
+            "cwd": s.cwd.as_deref().and_then(cwd_basename),
+            "board": s.board.map(|b| json!({
+                "in_progress": b.in_progress, "ready": b.ready,
+                "question": b.question, "scheduled": b.scheduled,
+            })),
+            "plan_approval": s.plan_approval.map(|(yours, others)| json!({
+                "yours": yours, "others": others,
+            })),
+            "amp_connection": s.amp_connection.map(|c| json!({
+                "state": c.state, "latency_ms": c.latency_ms,
+            })),
         })
     }
 
@@ -1505,6 +1580,7 @@ impl Actor {
                 text,
                 truncated,
                 full_bytes,
+                refused_line,
             } => ChatEvent::ToolEnd {
                 text: if truncated {
                     redact::drop_partial_tail(&text).to_owned()
@@ -1516,6 +1592,7 @@ impl Actor {
                 is_error,
                 truncated,
                 full_bytes,
+                refused_line,
             },
             other => other,
         };

@@ -4,7 +4,8 @@ import {
   shortTool, ticketIds, toolArgs, toolTitle,
 } from './toolText'
 import { blockText, initialSessionState, sessionReducer, type SessionState, type TranscriptItem } from './session'
-import { thinkingLabel, workerLine } from './transcriptView'
+import { ampConnectionWord, errorDetail, errorLine as replyErrorLine, planApprovalText, thinkingLabel, workerLine } from './transcriptView'
+import { ctxLabel, rosterDuration, tokLabel } from './toolText'
 import parity from './mock/parityStream.json'
 import type { ChatEvent, Envelope } from './types'
 
@@ -123,6 +124,46 @@ describe('the recorded harness feed reads like the TUI', () => {
   it('draws a worker the way the roster chip does', () => {
     const w = { task_id: 218, name: 'Add the clamp helper', role: 'amp:amp-worker-backend', state: 'running' as const, model: 'wf-1', started_at_ms: 1000 }
     expect(workerLine(w, 4_200, true)).toBe('#218 Add the clamp helper · worker-backend (wf-1) · running 3s')
-    expect(workerLine({ ...w, state: 'done' }, 4_200, false)).toBe('Add the clamp helper · worker-backend (wf-1) · done')
+    expect(workerLine({ ...w, state: 'done' }, 4_200, false)).toBe('Add the clamp helper · worker-backend (wf-1) · completed')
+  })
+})
+
+describe('the TUI\'s words for #2388\'s facts', () => {
+  it('formats tokens, context and durations as amp-tui does', () => {
+    expect([tokLabel(950), tokLabel(7_800), tokLabel(48_000), tokLabel(1_240_000)]).toEqual(['950 tok', '7.8k tok', '48.0k tok', '1.2M tok'])
+    expect([ctxLabel(0.4), ctxLabel(8), ctxLabel(31.4)]).toEqual(['ctx <1%', 'ctx 8%', 'ctx 31%'])
+    expect([rosterDuration(5_000), rosterDuration(192_000), rosterDuration(3_900_000)]).toEqual(['5s', '3m12s', '1h05m'])
+  })
+
+  it('draws a worker chip with its epic, tokens, context and cost (roster.rs chip)', () => {
+    const w = {
+      task_id: 2142, name: 'Fix installer setup hand-off', role: 'amp:amp-worker-backend', state: 'running' as const, model: 'wf/wf-1',
+      started_at_ms: 0, ended_at_ms: null, epic: 'AMP Harness', story: 'M4', ticket_state: 'in_progress',
+      usage: { input_tokens: 40_000, output_tokens: 8_000, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd_micros: 40_000 },
+      context_tokens: 39_680, context_window: 128_000,
+    }
+    expect(workerLine(w, 192_000, true)).toBe('#2142 Fix installer setup hand-off · AMP Harness › M4 · worker-backend (wf-1) · running 3m12s · 48.0k tok · ctx 31% · $0.04')
+    expect(workerLine({ ...w, state: 'done', ended_at_ms: 190_000 }, 999_999, false))
+      .toBe('Fix installer setup hand-off · AMP Harness › M4 · worker-backend (wf-1) · completed after 3m10s · 48.0k tok · ctx 31% · $0.04')
+  })
+
+  it('says the reply\'s error in the TUI\'s sentence, with the raw text as detail', () => {
+    const a: Extract<TranscriptItem, { kind: 'assistant' }> = {
+      kind: 'assistant', key: 'a', message_id: 'm', model: '', provider: 'openrouter', blocks: [], done: true, stop_reason: 'error',
+      error: 'http error 429: {"error":{"message":"Rate limit exceeded"}}', usage: null, at: 0,
+      error_summary: 'OpenRouter rate-limited the request (429): Rate limit exceeded.' }
+    expect(replyErrorLine(a)?.text).toBe('✗ Error: OpenRouter rate-limited the request (429): Rate limit exceeded.')
+    expect(errorDetail(a)).toBe('http error 429: {"error":{"message":"Rate limit exceeded"}}')
+    // An older harness: the raw first line, as before.
+    expect(replyErrorLine({ ...a, error_summary: null })?.text).toBe('✗ Error: http error 429: {"error":{"message":"Rate limit exceeded"}}')
+  })
+
+  it('words the AMP connection and plan approval as the TUI does', () => {
+    expect(ampConnectionWord({ state: 'slow', latency_ms: 812 })).toEqual({ word: 'slow 812 ms', tone: 'warn' })
+    expect(ampConnectionWord({ state: 'login_needed', latency_ms: null })?.word).toBe('re-login needed')
+    expect(ampConnectionWord(null)).toBeNull()
+    expect(planApprovalText({ yours: 2, others: 0 })).toBe('plan: 2 waiting for your approval')
+    expect(planApprovalText({ yours: 0, others: 3 })).toBe('plan: 3 others\' waiting for their owners\' approval')
+    expect(planApprovalText({ yours: 0, others: 0 })).toBeNull()
   })
 })

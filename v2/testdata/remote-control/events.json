@@ -222,6 +222,86 @@
       },
       "wire": "{\"sig\": \"kukWZQqS4lgpQCNLGF0ySwqKWCc8e24C3i9-D1u8CRHOIGxWprKgopbYy1S2WGyQ-H0MWVZz3Gl2ves-C7trEA\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"code\": null, \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"yWfilo4GPRtrskYztHTYHQ\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 2}",
       "expect": "unsupported_version"
+    },
+    {
+      "name": "status_tui_facts_valid",
+      "note": "#2388: a status with the TUI's header, footer and status-line facts (ticket name/state/epic/story, session token totals, thinking, role, cwd's last component, board counts, plan approval, the harness's AMP connection). Integers only.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 48
+      },
+      "wire": "{\"sig\": \"PEhEhGnTwlIEAQ-mw1LnqApdQQ0JaO9cKzTO58jPwjMuMZC3nYePKQfyC1alaW24_r5ZqmbInrfM4MvS-wTJjg\", \"body\": {\"model\": \"anthropic/claude-opus-5-5\", \"busy\": true, \"context_pct\": 41, \"cost_usd_micros\": 2104400, \"project\": {\"id\": 2, \"name\": \"AMP\"}, \"ticket_id\": 2388, \"branch\": \"remote-m1-2388\", \"queue_len\": 0, \"workers_running\": 1, \"devices\": [{\"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"name\": \"Safari on iPhone\"}], \"ticket_name\": \"RC-M1 harness + UI: ChatEvent carries everything the TUI shows\", \"ticket_state\": \"in_progress\", \"epic\": \"Remote control\", \"story\": \"M1\", \"usage\": {\"input_tokens\": 120340, \"output_tokens\": 8311, \"cache_read_tokens\": 901200, \"cache_write_tokens\": 0}, \"thinking\": \"high\", \"role\": \"manager\", \"cwd\": \"amp\", \"board\": {\"in_progress\": 3, \"ready\": 5, \"question\": 1, \"scheduled\": 0}, \"plan_approval\": {\"yours\": 2, \"others\": 0}, \"amp_connection\": {\"state\": \"slow\", \"latency_ms\": 812}}, \"op\": \"status\", \"nonce\": \"QlhZRPBkdHM5omPdk0ZD4A\", \"ts\": 1792948799200, \"seq\": 49, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"amp_connection\":{\"latency_ms\":812,\"state\":\"slow\"},\"board\":{\"in_progress\":3,\"question\":1,\"ready\":5,\"scheduled\":0},\"branch\":\"remote-m1-2388\",\"busy\":true,\"context_pct\":41,\"cost_usd_micros\":2104400,\"cwd\":\"amp\",\"devices\":[{\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"name\":\"Safari on iPhone\"}],\"epic\":\"Remote control\",\"model\":\"anthropic/claude-opus-5-5\",\"plan_approval\":{\"others\":0,\"yours\":2},\"project\":{\"id\":2,\"name\":\"AMP\"},\"queue_len\":0,\"role\":\"manager\",\"story\":\"M1\",\"thinking\":\"high\",\"ticket_id\":2388,\"ticket_name\":\"RC-M1 harness + UI: ChatEvent carries everything the TUI shows\",\"ticket_state\":\"in_progress\",\"usage\":{\"cache_read_tokens\":901200,\"cache_write_tokens\":0,\"input_tokens\":120340,\"output_tokens\":8311},\"workers_running\":1},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"QlhZRPBkdHM5omPdk0ZD4A\",\"op\":\"status\",\"seq\":49,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_worker_status_tui_facts_valid",
+      "note": "#2388: worker chips with tokens/cost, context, ended time, epic › story and the ticket's state.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 49
+      },
+      "wire": "{\"sig\": \"ARuK_WFDdSkOkLMqxlLH_7v_U7v2feeedqE9-yoCO2mSZyU8FXLX3ek-uFrnirR5-fpil-VTQJIIoJhdrojKPw\", \"body\": {\"type\": \"worker_status\", \"workers\": [{\"task_id\": 2390, \"name\": \"Watch workers\", \"role\": \"amp-worker-backend\", \"state\": \"running\", \"model\": \"openrouter/deepseek/deepseek-v4.1\", \"started_at_ms\": 1792948608000, \"ended_at_ms\": null, \"usage\": {\"input_tokens\": 6100, \"output_tokens\": 1200, \"cache_read_tokens\": 500, \"cache_write_tokens\": 0, \"cost_usd_micros\": 40000}, \"context_tokens\": 10240, \"context_window\": 128000, \"epic\": \"QA3d epic\", \"story\": \"Watch workers\", \"ticket_state\": \"in_progress\"}, {\"task_id\": 2391, \"name\": \"Docs\", \"role\": \"amp-worker-docs\", \"state\": \"done\", \"model\": null, \"started_at_ms\": 1792948400000, \"ended_at_ms\": 1792948590000, \"usage\": null, \"context_tokens\": null, \"context_window\": null, \"epic\": null, \"story\": null, \"ticket_state\": \"done\"}]}, \"op\": \"chat_event\", \"nonce\": \"yDHJFIUrek11TaFk8CVmLw\", \"ts\": 1792948799200, \"seq\": 50, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"type\":\"worker_status\",\"workers\":[{\"context_tokens\":10240,\"context_window\":128000,\"ended_at_ms\":null,\"epic\":\"QA3d epic\",\"model\":\"openrouter/deepseek/deepseek-v4.1\",\"name\":\"Watch workers\",\"role\":\"amp-worker-backend\",\"started_at_ms\":1792948608000,\"state\":\"running\",\"story\":\"Watch workers\",\"task_id\":2390,\"ticket_state\":\"in_progress\",\"usage\":{\"cache_read_tokens\":500,\"cache_write_tokens\":0,\"cost_usd_micros\":40000,\"input_tokens\":6100,\"output_tokens\":1200}},{\"context_tokens\":null,\"context_window\":null,\"ended_at_ms\":1792948590000,\"epic\":null,\"model\":null,\"name\":\"Docs\",\"role\":\"amp-worker-docs\",\"started_at_ms\":1792948400000,\"state\":\"done\",\"story\":null,\"task_id\":2391,\"ticket_state\":\"done\",\"usage\":null}]},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"yDHJFIUrek11TaFk8CVmLw\",\"op\":\"chat_event\",\"seq\":50,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_compaction_valid",
+      "note": "#2388: the harness is compacting the context (automatic).",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 50
+      },
+      "wire": "{\"sig\": \"0LsyDS9_cxwhxkvvl9ZIGKa3ez9xIe30cvOHWaUE-9Gu7hS4pGbRnITzMUZvp3yQjw5jupzPw_Z67eEzOxXkaw\", \"body\": {\"type\": \"compaction\", \"active\": true, \"manual\": false}, \"op\": \"chat_event\", \"nonce\": \"EBxl3vYaRI86oztk0o2zsA\", \"ts\": 1792948799200, \"seq\": 51, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"active\":true,\"manual\":false,\"type\":\"compaction\"},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"EBxl3vYaRI86oztk0o2zsA\",\"op\":\"chat_event\",\"seq\":51,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_message_end_error_summary_valid",
+      "note": "#2388: a failed reply with the TUI's one sentence (error_summary) and the raw provider text (error) as detail.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 51
+      },
+      "wire": "{\"sig\": \"vFLhEWCYveRjfbmI6r92UtjtDHSJ-qduPJJ-RZIR4QrBTlwsPK81FgZBhnI1pRVvoCyFRB5qxyi8JrA7pZ9yVg\", \"body\": {\"type\": \"message_end\", \"message_id\": \"msg_8\", \"stop_reason\": \"error\", \"error\": \"http error 429: {\\\"error\\\":{\\\"message\\\":\\\"Rate limit exceeded: free-models-per-day\\\",\\\"code\\\":429}}\", \"model\": \"deepseek/deepseek-v4.1\", \"provider\": \"openrouter\", \"usage\": {\"input_tokens\": 0, \"output_tokens\": 0, \"cache_read_tokens\": 0, \"cache_write_tokens\": 0, \"cost_usd_micros\": 0}, \"error_summary\": \"OpenRouter rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model.\"}, \"op\": \"chat_event\", \"nonce\": \"m3Wcb8wySruAdBwnsmNkWA\", \"ts\": 1792948799200, \"seq\": 52, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"error\":\"http error 429: {\\\"error\\\":{\\\"message\\\":\\\"Rate limit exceeded: free-models-per-day\\\",\\\"code\\\":429}}\",\"error_summary\":\"OpenRouter rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model.\",\"message_id\":\"msg_8\",\"model\":\"deepseek/deepseek-v4.1\",\"provider\":\"openrouter\",\"stop_reason\":\"error\",\"type\":\"message_end\",\"usage\":{\"cache_read_tokens\":0,\"cache_write_tokens\":0,\"cost_usd_micros\":0,\"input_tokens\":0,\"output_tokens\":0}},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"m3Wcb8wySruAdBwnsmNkWA\",\"op\":\"chat_event\",\"seq\":52,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_tool_end_refused_valid",
+      "note": "#2388: an AMP call refused for a person's step carries the TUI's fixed row line.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 52
+      },
+      "wire": "{\"sig\": \"bPPWjaJXeqpOKw7eVuvfzEPO8RnzI88c1GII-1zGcsv3maIgskR4JEE-bwDNLZDaca5hwvDsPJuOQNIiDoB9iw\", \"body\": {\"type\": \"tool_end\", \"tool_call_id\": \"call_9\", \"name\": \"amp_approve_plan\", \"is_error\": true, \"text\": \"Approving the plan is done by a person in the AMP web UI.\", \"truncated\": false, \"full_bytes\": 57, \"refused_line\": \"AMP refused: this needs a person in the AMP web UI (below)\"}, \"op\": \"chat_event\", \"nonce\": \"-JVvhpwFrwts9azeex-bIg\", \"ts\": 1792948799200, \"seq\": 53, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"full_bytes\":57,\"is_error\":true,\"name\":\"amp_approve_plan\",\"refused_line\":\"AMP refused: this needs a person in the AMP web UI (below)\",\"text\":\"Approving the plan is done by a person in the AMP web UI.\",\"tool_call_id\":\"call_9\",\"truncated\":false,\"type\":\"tool_end\"},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"-JVvhpwFrwts9azeex-bIg\",\"op\":\"chat_event\",\"seq\":53,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
     }
   ]
 }

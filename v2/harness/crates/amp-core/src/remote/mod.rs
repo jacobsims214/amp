@@ -23,6 +23,7 @@ pub mod redact;
 pub mod relay;
 
 pub use link::{
-    Enabled, FixedToken, HostStatus, LinkTuning, LocalEvent, PairingPrompt, RemoteDeps,
-    RemoteError, RemoteHost, RemoteLink, RemoteOn, RemoteSetup, RemoteState, TokenSource,
+    AmpConnection, BoardCounts, Enabled, FixedToken, HostStatus, LinkTuning, LocalEvent,
+    PairingPrompt, RemoteDeps, RemoteError, RemoteHost, RemoteLink, RemoteOn, RemoteSetup,
+    RemoteState, SessionTokens, TokenSource, cwd_basename,
 };

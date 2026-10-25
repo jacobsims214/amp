@@ -18,8 +18,8 @@ import { BandLoader } from '../components/brand/BandLoader'
 import { PairingPanel } from '../components/remote/PairingPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import {
-  Banner, Composer, HeaderFacts, OutgoingRow, PresenceBadge, QueueStrip, StatusLine, ToolGroup, TranscriptRow, WorkerChips,
-  WorkingLine,
+  AmpConnectionBadge, Banner, Composer, HeaderFacts, OutgoingRow, PresenceBadge, QueueStrip, StatusLine, TicketLine, ToolGroup,
+  TranscriptRow, WorkerChips, WorkingLine,
 } from '../components/remote/SessionParts'
 import { groupRows, useNow } from '../remote/transcriptView'
 
@@ -124,10 +124,12 @@ function SessionView({ sessionId }: { sessionId: string }) {
 
   return (
     <Frame title={host} sub={<HeaderFacts status={status} os={state.hello?.harness.os ?? detail.os} />} right={<>
+      <AmpConnectionBadge status={status} />
       <PresenceBadge online={ended ? false : state.online} connection={state.connection} />
       {!ended && <ConfirmButton label="Disconnect" confirmLabel="Disconnect now" icon={<Unplug size={13} />}
         onConfirm={() => { disconnect().catch(() => {}) }} />}
     </>}>
+      <TicketLine status={status} />
       {ended && <Banner tone="info">{endReasonText(ended.reason)} The laptop session keeps running locally.</Banner>}
       {state.versionMismatch && <Banner tone="danger">This laptop runs a newer harness; update AMP. Nothing more from it is shown.</Banner>}
       {!ended && state.online === false && <Banner tone="warn">Laptop offline. It may be asleep or off the network; this page catches up when it's back.</Banner>}
@@ -146,7 +148,7 @@ function SessionView({ sessionId }: { sessionId: string }) {
       </div>
 
       <WorkerChips workers={state.workers} now={now} />
-      <WorkingLine busy={busy && !ended} runStartedAt={state.runStartedAt} retry={retry} now={now} />
+      <WorkingLine busy={busy && !ended} runStartedAt={state.runStartedAt} retry={retry} compaction={ended ? null : state.compaction} now={now} />
       <QueueStrip queue={state.queue} myDeviceId={phase.deviceId} online={online} onClear={stop} />
       <Composer disabled={composerDisabled} disabledReason={disabledReason} busy={busy} online={online && canSign}
         onSend={sendPrompt} onStop={stop} />

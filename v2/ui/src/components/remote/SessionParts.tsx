@@ -19,13 +19,18 @@ import { useState } from 'react'
 import { Check, ChevronRight, Loader2, OctagonX, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
 import { SafeMarkdown } from './SafeMarkdown'
 import { promptProblem } from '../../remote/envelope'
-import { formatCost, tokenTotal, type Block, type Outgoing, type Totals, type TranscriptItem } from '../../remote/session'
+import { formatCost, sessionTokens, type Block, type Outgoing, type Totals, type TranscriptItem } from '../../remote/session'
 import {
   WORKER_TOOLS, clean, formatElapsed, formatSpan, latestSentence, parseArgs, resultDetail, resultSummary,
-  runningElapsed, shortModel, shortRole, ticketIds, tokLabel, toolArgs, toolTitle,
+  runningElapsed, shortModel, shortRole, ticketIds, tokens as tokenCount, toolArgs, toolTitle,
 } from '../../remote/toolText'
-import { errorLine, thinkingLabel, workerLine } from '../../remote/transcriptView'
+import {
+  ampConnectionWord, compactionLabel, displayStateOf, epicStory, errorDetail, errorLine, planApprovalText, thinkingLabel,
+  workerLine, workerState, workerUsage,
+} from '../../remote/transcriptView'
 import type { QueueItem, SessionStatus, WorkerInfo } from '../../remote/types'
+import { StateDot, StateTag } from '../ui/StateTag'
+import { STATE_LABEL } from '../../lib/ticketState'
 
 type Tool = Extract<TranscriptItem, { kind: 'tool' }>
 type Assistant = Extract<TranscriptItem, { kind: 'assistant' }>
@@ -66,13 +71,23 @@ function Thinking({ block, now }: { block: Block; now: number }) {
 
 function AssistantMessage({ item, now }: { item: Assistant; now: number }) {
   const err = errorLine(item)
+  const detail = errorDetail(item)
   const visible = item.blocks.filter(b => b.text.trim())
   return (
     <div className="min-w-0 grid gap-2" data-testid="assistant-message">
       {visible.map((b, i) => b.kind === 'thinking'
         ? <Thinking key={i} block={b} now={now} />
         : <SafeMarkdown key={i}>{b.text}</SafeMarkdown>)}
-      {err && <p className={`m-0 text-[13px] ${err.tone === 'danger' ? 'text-danger-ink' : 'text-warning-ink'}`}>{err.text}</p>}
+      {err && <p className={`m-0 text-[13px] ${err.tone === 'danger' ? 'text-danger-ink' : 'text-warning-ink'}`} data-testid="reply-error">{err.text}</p>}
+      {detail && (
+        // #2388: the TUI shows only the sentence; the provider's own text is one click away here.
+        <details className="group text-[12px]" data-testid="reply-error-detail">
+          <summary className="inline-flex items-center gap-1 cursor-pointer select-none list-none text-ink-3 hover:text-ink-2">
+            <ChevronRight size={12} className="shrink-0 transition-transform group-open:rotate-90" aria-hidden="true" />The provider's message
+          </summary>
+          <pre className="m-0 mt-1 p-2 bg-surface border border-line font-mono text-[11.5px] leading-relaxed whitespace-pre-wrap break-all max-h-60 overflow-auto text-ink-2">{detail}</pre>
+        </details>
+      )}
     </div>
   )
 }
@@ -86,7 +101,8 @@ function ToolDetail({ item }: { item: Tool }) {
   const r = item.result
   let argsText = item.arguments_json
   try { if (argsText) argsText = JSON.stringify(JSON.parse(argsText), null, 2) } catch { /* shown as sent */ }
-  const detail = r ? resultDetail(item.name, r.text, r.is_error) : ''
+  // #2388: a call AMP refused for a person's step reads as the TUI's fixed line (the approval notice under it has the rest).
+  const detail = r ? (r.refused_line ?? resultDetail(item.name, r.text, r.is_error)) : ''
   const lines = detail.replace(/\r\n?/g, '\n').split('\n')
   const hidden = Math.max(0, lines.length - RESULT_PREVIEW_LINES)
   return (
@@ -119,7 +135,7 @@ function ToolRow({ item, workers, now }: { item: Tool; workers: WorkerInfo[]; no
   const args = parseArgs(item.arguments_json)
   const r = item.result
   const state = !r ? 'running' : r.is_error ? 'failed' : 'ok'
-  const summary = r ? resultSummary(item.name, r.text, r.is_error) : ''
+  const summary = r ? (r.refused_line ?? resultSummary(item.name, r.text, r.is_error)) : ''
   const elapsed = item.startedAt == null ? ''
     : r ? (item.endedAt != null ? formatElapsed(item.endedAt - item.startedAt) : '')
     : runningElapsed(now - item.startedAt)
@@ -292,22 +308,33 @@ const WORKER_STATE_INK: Record<string, string> = {
   running: 'text-st-prog', done: 'text-ink-2', failed: 'text-danger-ink', stopped: 'text-ink-3', blocked: 'text-st-flag',
 }
 
-/** The chat's workers, read-only (watching and stopping one from here is M2). */
+/** A chip's context colour, as roster.rs `ctx_color`: calm, amber from 80%, red from 95%. */
+const chipCtxTone = (p: number) => p >= 95 ? 'text-danger-ink' : p >= 80 ? 'text-warning-ink' : 'text-ink-3'
+
+/** The chat's workers, read-only (watching and stopping one from here is M2): the TUI's roster chips,
+ *  `#2142 Name · Epic › Story · worker-backend (model) · running 3m12s · 48.0k tok · ctx 31% · $0.04`. */
 export function WorkerChips({ workers, now }: { workers: WorkerInfo[]; now: number }) {
   if (!workers.length) return null
   const running = workers.filter(w => w.state === 'running').length
   return (
     <div className="grid gap-1 px-3 sm:px-5 py-2 border-t border-line bg-surface" aria-label="Workers">
       {workers.map(w => {
-        const elapsed = w.state === 'running' && w.started_at_ms ? runningElapsed(now - w.started_at_ms) : ''
         const role = shortRole(w.role)
+        const es = epicStory(w.epic, w.story)
+        const u = workerUsage(w)
+        const ticket = displayStateOf(w.ticket_state)
         return (
           <div key={w.task_id} className={`flex items-center gap-1.5 min-w-0 border-l-2 pl-2 text-[12px] ${WORKER_TONE[w.state] ?? 'border-line'}`} data-testid="worker-chip"
-            title={`#${w.task_id} ${w.name} · ${w.role}${w.model ? ` · ${w.model}` : ''} · ${w.state}`}>
+            title={workerLine(w, now, true)}>
+            {ticket && <span title={`Ticket: ${STATE_LABEL[ticket]}`} className="inline-flex shrink-0"><StateDot state={ticket} size={7} /></span>}
             <span className="amp-num font-semibold text-accent shrink-0">#{w.task_id}</span>
             <span className="truncate min-w-0 text-ink">{clean(w.name)}</span>
+            {es && <span className="text-ink-3 shrink-[2] truncate min-w-0 hidden md:inline" data-testid="worker-epic">· {es}</span>}
             {role && <span className="text-ink-3 shrink-0 hidden sm:inline">· {role}{w.model ? <span className="text-ink-3"> ({shortModel(w.model)})</span> : null}</span>}
-            <span className={`amp-num shrink-0 ${WORKER_STATE_INK[w.state] ?? 'text-ink-2'}`}>· {w.state}{elapsed ? ` ${elapsed}` : ''}</span>
+            <span className={`amp-num shrink-0 ${WORKER_STATE_INK[w.state] ?? 'text-ink-2'}`} data-testid="worker-state">· {workerState(w, now)}</span>
+            {u.tokens && <span className="amp-num shrink-0 text-ink-3" data-testid="worker-tokens">· {u.tokens}</span>}
+            {u.ctx && <span className={`amp-num shrink-0 ${chipCtxTone(u.ctxPercent ?? 0)}`} data-testid="worker-ctx">· {u.ctx}</span>}
+            {u.cost && <span className="amp-num shrink-0 text-ink-3 hidden sm:inline" data-testid="worker-cost">· {u.cost}</span>}
           </div>
         )
       })}
@@ -317,68 +344,127 @@ export function WorkerChips({ workers, now }: { workers: WorkerInfo[]; now: numb
 }
 
 /** The TUI's spinner line: `Working… 12s`, or the retry countdown while one is scheduled. */
-export function WorkingLine({ busy, runStartedAt, retry, now }: {
-  busy: boolean; runStartedAt: number | null; retry: Extract<TranscriptItem, { kind: 'retry' }> | null; now: number
+export function WorkingLine({ busy, runStartedAt, retry, compaction = null, now }: {
+  busy: boolean; runStartedAt: number | null; retry: Extract<TranscriptItem, { kind: 'retry' }> | null
+  /** #2388: the harness is compacting the context (the TUI's status slot says so meanwhile). */
+  compaction?: { manual: boolean; since: number } | null; now: number
 }) {
-  if (!busy) return null
+  if (!busy && !compaction) return null
   const left = retry ? Math.max(0, Math.ceil((retry.at + retry.delay_ms - now) / 1000)) : 0
-  const text = retry
+  const text = compaction
+    ? `${compactionLabel(compaction.manual)} ${runningElapsed(now - compaction.since) || ''}`
+    : retry
     ? `Retrying (${retry.attempt}/${retry.max_retries}) in ${left}s…`
     : `Working…${runStartedAt ? ` ${runningElapsed(now - runStartedAt) || ''}` : ''}`
   return (
-    <div className="flex items-center gap-2 px-3 sm:px-5 py-1.5 border-t border-line bg-surface text-[12.5px] min-w-0" role="status" data-testid="working">
+    <div className="flex items-center gap-2 px-3 sm:px-5 py-1.5 border-t border-line bg-surface text-[12.5px] min-w-0" role="status" data-testid="working" data-compaction={compaction ? 'true' : undefined}>
       <Loader2 size={13} className={`shrink-0 animate-spin ${retry ? 'text-warning-ink' : 'text-st-prog'}`} aria-hidden="true" />
       <span className={retry ? 'text-warning-ink' : 'text-ink-2'}>{text.trim()}</span>
-      {retry && <span className="truncate min-w-0 text-ink-3">{clean(retry.error)}</span>}
+      {retry && !compaction && <span className="truncate min-w-0 text-ink-3">{clean(retry.error)}</span>}
       <span className="ml-auto shrink-0 text-[11px] text-ink-3">Stop to {retry ? 'cancel' : 'interrupt'}</span>
     </div>
   )
 }
 
-/** Context use in the TUI's colours: calm, then amber from 60%, red from 80%. */
-const ctxTone = (p: number) => p >= 80 ? 'text-danger-ink' : p >= 60 ? 'text-warning-ink' : 'text-ink'
+/** Context use in the TUI footer's colours (footer.rs): calm, amber above 70%, red above 90%. */
+const ctxTone = (p: number) => p > 90 ? 'text-danger-ink' : p > 70 ? 'text-warning-ink' : 'text-ink'
 
 /**
- * The status line (the TUI's bottom line: `$0.177 · ctx 4% · model`, plus the chat's workers),
- * with the session's tokens and how long it has been up.
+ * The status line: the TUI footer's usage half (`$0.004 · ctx 4% · model • thinking`) and its AMP
+ * status line (questions, workers, plan approval, board counts), with the session's tokens and how
+ * long it has been up. Tokens and cost are the harness's own totals (#2388); a harness that predates
+ * them falls back to the replies this page has seen.
  */
 export function StatusLine({ status, totals, startedAt, workers, now }: {
   status: SessionStatus | null; totals: Totals; startedAt: number | null; workers: WorkerInfo[]; now: number
 }) {
   const s = status
   const running = s?.workers_running ?? workers.filter(w => w.state === 'running').length
-  const tokens = tokenTotal(totals)
+  const t = sessionTokens(s, totals)
+  const thinking = s?.thinking ? (s.thinking === 'off' ? 'thinking off' : clean(s.thinking)) : null
   const parts: [string, React.ReactNode, string?][] = [
-    ['Model', s?.model ? shortModel(s.model) : '—', s?.model ?? undefined],
+    ['Model', s?.model ? <>{shortModel(s.model)}{thinking && <span className="text-ink-3"> • {thinking}</span>}</> : '—', s?.model ?? undefined],
     ['Context', s?.context_pct != null ? <span className={ctxTone(s.context_pct)}>{s.context_pct}%</span> : '—'],
-    ['Tokens', tokens ? tokLabel(tokens).replace(' tok', '') : '—',
-      tokens ? `${totals.input.toLocaleString()} in · ${totals.output.toLocaleString()} out · ${totals.cache_read.toLocaleString()} cached, over the ${totals.messages} replies shown here` : undefined],
+    ['Tokens', t ? tokenCount(t.total) : '—',
+      t ? `${t.input.toLocaleString()} in · ${t.output.toLocaleString()} out · ${t.cache_read.toLocaleString()} cached${t.cache_write ? ` · ${t.cache_write.toLocaleString()} cache write` : ''}${t.fromHarness ? ', the session\'s totals on the laptop' : `, over the ${totals.messages} replies shown here`}` : undefined],
     ['Cost', formatCost(s?.cost_usd_micros)],
     ['Up', startedAt ? formatSpan(now - startedAt) : '—'],
     ['Workers', running ? `${running} running` : '0'],
   ]
+  const b = s?.board
+  const plan = planApprovalText(s?.plan_approval)
+  const counts: [keyof NonNullable<SessionStatus['board']>, 'prog' | 'ready' | 'sched'][] = [['in_progress', 'prog'], ['ready', 'ready'], ['scheduled', 'sched']]
   return (
-    <dl className="m-0 flex flex-wrap gap-x-4 gap-y-0.5 px-3 sm:px-5 py-1.5 border-t border-line bg-surface-2 text-[11.5px]" aria-label="Session status">
-      {parts.map(([k, v, title]) => (
-        <div key={k} className="flex items-baseline gap-1.5 min-w-0" title={title}>
-          <dt className="amp-label !text-[10px]">{k}</dt>
-          <dd className="m-0 amp-num text-ink truncate max-w-[220px]">{v}</dd>
+    <div className="border-t border-line bg-surface-2 px-3 sm:px-5 py-1.5 grid gap-1">
+      <dl className="m-0 flex flex-wrap gap-x-4 gap-y-0.5 text-[11.5px]" aria-label="Session status">
+        {parts.map(([k, v, title]) => (
+          <div key={k} className="flex items-baseline gap-1.5 min-w-0" title={title}>
+            <dt className="amp-label !text-[10px]">{k}</dt>
+            <dd className="m-0 amp-num text-ink truncate max-w-[260px]">{v}</dd>
+          </div>
+        ))}
+      </dl>
+      {(b || plan) && (
+        // The TUI's AMP status line: the questions chip first, then plan approval, then the board's counts.
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11.5px] min-w-0" aria-label="Board" data-testid="board-line">
+          {b && b.question > 0 && <StateTag state="flag" label={`${b.question} question${b.question === 1 ? '' : 's'}`} />}
+          {plan && <span className="text-warning-ink" data-testid="plan-approval">{plan}</span>}
+          {b && (counts.some(([k]) => b[k] > 0)
+            ? counts.filter(([k]) => b[k] > 0).map(([k, st]) => (
+                <span key={k} className="inline-flex items-center gap-1 amp-num text-ink-2"><StateDot state={st} size={7} />{b[k]} {STATE_LABEL[st]}</span>
+              ))
+            : !b.question && <span className="text-ink-3">no open tickets</span>)}
         </div>
-      ))}
-    </dl>
+      )}
+    </div>
   )
 }
 
-/** The page's header facts (the TUI's header): project, ticket and branch. */
+/** The page's header facts (the TUI's header and footer): project, working directory (its
+ *  last component only), branch, role and OS. */
 export function HeaderFacts({ status, os }: { status: SessionStatus | null; os: string | null }) {
   const s = status
   const facts: string[] = []
   if (s?.project) facts.push(`${s.project.name} #${s.project.id}`)
-  if (s?.ticket_id != null) facts.push(`ticket #${s.ticket_id}`)
-  if (s?.branch) facts.push(s.branch)
+  // The ticket line below names the ticket when the harness sends its name; an older one sends only the id.
+  if (s?.ticket_id != null && !s.ticket_name && !s.ticket_state) facts.push(`ticket #${s.ticket_id}`)
+  // The TUI footer's `cwd (branch)`.
+  const cwd = s?.cwd ? clean(s.cwd) : '', branch = s?.branch ? clean(s.branch) : ''
+  const where = cwd && branch ? `${cwd} (${branch})` : cwd || branch
+  if (where) facts.push(where)
+  if (s?.role) facts.push(clean(s.role))
   if (os) facts.push(os)
   if (!facts.length) return null
   return <span className="amp-num text-[11.5px] text-ink-2 truncate min-w-0" data-testid="header-facts">{facts.join(' · ')}</span>
+}
+
+/** The TUI header's second line while a ticket is current: `■ In progress #2388 Name    ▌ Epic › Story`. */
+export function TicketLine({ status }: { status: SessionStatus | null }) {
+  const s = status
+  if (s?.ticket_id == null || (!s.ticket_name && !s.ticket_state)) return null
+  const st = displayStateOf(s.ticket_state)
+  const es = epicStory(s.epic, s.story)
+  return (
+    <div className="bg-surface border-b border-line px-3 sm:px-5 py-1.5 flex items-center gap-2 min-w-0 text-[12.5px]" data-testid="ticket-line">
+      {st && <StateTag state={st} />}
+      <span className="amp-num font-semibold text-ink shrink-0">#{s.ticket_id}</span>
+      {s.ticket_name && <span className="truncate min-w-0 text-ink">{clean(s.ticket_name)}</span>}
+      {es && <span className="ml-auto shrink-[2] truncate min-w-0 pl-2 border-l-2 border-accent text-ink-3 hidden sm:inline" data-testid="ticket-epic">{es}</span>}
+    </div>
+  )
+}
+
+/** The harness's own AMP connection (the TUI header's `● connected`), when its status carries it. */
+export function AmpConnectionBadge({ status }: { status: SessionStatus | null }) {
+  const c = ampConnectionWord(status?.amp_connection)
+  if (!c) return null
+  const cls = c.tone === 'ok' ? 'text-success-ink' : c.tone === 'warn' ? 'text-warning-ink' : 'text-danger-ink'
+  return (
+    <span className="inline-flex items-center gap-1.5 text-[11.5px] whitespace-nowrap text-ink-2" data-testid="amp-connection"
+      title="The laptop's own connection to AMP (its AMP tools), as the harness header shows it">
+      <span className="amp-label !text-[9.5px]">AMP</span><span className={`w-1.5 h-1.5 rounded-full bg-current ${cls}`} aria-hidden="true" /><span className={c.tone === 'ok' ? '' : cls}>{c.word}</span>
+    </span>
+  )
 }
 
 export function PresenceBadge({ online, connection }: { online: boolean | null; connection: 'connecting' | 'live' | 'reconnecting' }) {

@@ -145,6 +145,8 @@ pub struct ChatView {
     tool_display: Arc<ToolDisplay>,
     /// The retry indicator in the status slot, if one is shown.
     retry: Option<Arc<StatusIndicator>>,
+    /// The compaction indicator in the status slot, while the context is compacted (#2388).
+    compaction: Option<Arc<StatusIndicator>>,
     /// How thinking shows (`[tui] show_thinking`, #2177).
     show_thinking: ThinkingDisplay,
     /// The last assistant message with thinking: what Ctrl+T expands when no thinking header is
@@ -279,6 +281,7 @@ impl ChatView {
             group: Mutex::new(None),
             tool_display: Arc::new(ToolDisplay::default()),
             retry: None,
+            compaction: None,
             show_thinking: ThinkingDisplay::default(),
             last_thinking: None,
             mouse: true,
@@ -847,15 +850,43 @@ impl ChatView {
         std::mem::take(&mut self.error_shown)
     }
 
-    /// Ticks the retry countdown; returns whether one is shown.
+    /// Ticks the retry countdown; returns whether one (or the compaction spinner) is shown.
     pub fn tick(&self) -> bool {
         match &self.retry {
             Some(indicator) => {
                 indicator.tick_countdown();
                 true
             }
-            None => false,
+            None => self.compaction.is_some(),
         }
+    }
+
+    /// Shows rpi's compaction indicator in the status slot while the harness compacts the
+    /// context (`Auto-compacting…`, or `Compacting context…` when asked for), and tells the
+    /// manager feed (#2388). An end without a start changes nothing.
+    pub fn set_compaction(&mut self, active: bool, manual: bool) {
+        if active {
+            let reason = if manual {
+                rpi_tui::CompactionReason::Manual
+            } else {
+                rpi_tui::CompactionReason::Threshold
+            };
+            let indicator = Arc::new(StatusIndicator::compaction(reason));
+            self.retry = None;
+            self.status.clear();
+            self.status.add_child(indicator.clone());
+            self.compaction = Some(indicator);
+        } else if self.compaction.take().is_some() {
+            self.status.clear();
+        } else {
+            return;
+        }
+        self.feed_push(ChatEvent::Compaction { active, manual });
+    }
+
+    /// Whether the compaction indicator is shown.
+    pub fn compacting(&self) -> bool {
+        self.compaction.is_some()
     }
 
     /// Applies one rpi agent event to the transcript and footer.

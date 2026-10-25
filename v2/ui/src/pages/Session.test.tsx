@@ -370,3 +370,72 @@ describe('Session page reads like the harness TUI (#2386)', () => {
     expect(screen.getByTestId('working')).toHaveTextContent(/Retrying \(1\/10\) in 2s…429 Too Many RequestsStop to cancel/)
   })
 })
+
+describe('Session page shows what the TUI shows besides (#2388)', () => {
+  interface V { name: string; wire: string; receiver: { session_id: string; pinned_harness: { harness_id: string; harness_pub: string } } }
+  const vectors = loadVectors<{ vectors: V[] }>('events.json').vectors
+  const rx = vectors[0].receiver
+  it('renders the #2388 vectors: ticket line, board, AMP connection, worker chips, compaction, error sentence, refused line', async () => {
+    const store = memoryStore()
+    await store.putPin({ ...rx.pinned_harness, pinned_until_ms: Date.now() + 86_400_000 })
+    const detail: SessionDetail = {
+      session_id: rx.session_id, harness_id: rx.pinned_harness.harness_id, harness_pub: rx.pinned_harness.harness_pub,
+      harness_fp_display: '29CA-E6B5-00C2-66CB', host: 'jacobs-mbp', os: 'macos', harness_version: '0.4.0', project: { id: 2, name: 'AMP' },
+      online: true, viewers: 1, started_at_ms: 0, expires_at_ms: 0, last_activity_at_ms: 0, protocol_version: 1,
+    }
+    const order = ['hello_valid', 'status_tui_facts_valid', 'chat_worker_status_tui_facts_valid', 'chat_compaction_valid',
+      'chat_message_end_error_summary_valid', 'chat_tool_end_refused_valid']
+    const transport: RelayTransport = {
+      listSessions: async () => [detail],
+      revokeAll: async () => ({ ended: 0, devices_revoked: 0 }),
+      getSession: async () => detail,
+      openEvents: (_id, _from, h) => {
+        queueMicrotask(() => {
+          h.onOpen()
+          h.onRelay({ type: 'attached', online: true, oldest_seq: 42, latest_seq: 53 })
+          for (const n of order) h.onEnvelope(vectors.find(v => v.name === n)!.wire)
+        })
+        return () => {}
+      },
+      postCommand: async () => {},
+      disconnect: async () => {},
+      pair: async () => { throw new Error('not used') },
+    }
+    renderSession({ transport, crypto: webRemoteCrypto(store), mock: false }, { id: rx.session_id })
+    // The last vector (refused line) has been through the real ES256 check.
+    const refused = await screen.findByTestId('tool-summary')
+    expect(refused).toHaveTextContent('AMP refused: this needs a person in the AMP web UI (below)')
+    expect(refused.closest('[data-testid=tool-row]')).toHaveAttribute('data-state', 'failed')
+    // Gap 2: the TUI's ticket line, header facts and status line.
+    const ticket = screen.getByTestId('ticket-line')
+    expect(ticket).toHaveTextContent('In progress')
+    expect(ticket).toHaveTextContent('#2388')
+    expect(ticket).toHaveTextContent('RC-M1 harness + UI: ChatEvent carries everything the TUI shows')
+    expect(within(ticket).getByTestId('ticket-epic')).toHaveTextContent('Remote control › M1')
+    expect(screen.getByTestId('header-facts')).toHaveTextContent('AMP #2 · amp (remote-m1-2388) · manager · macos')
+    const status = screen.getByLabelText('Session status')
+    expect(within(status).getByText('• high')).toBeInTheDocument()
+    expect(within(status).getByText('1.0M')).toBeInTheDocument() // the harness's totals, not this page's sum
+    expect(within(status).getByTitle(/120,340 in · 8,311 out · 901,200 cached, the session's totals on the laptop/)).toBeInTheDocument()
+    expect(within(status).getByText('$2.10')).toBeInTheDocument()
+    const board = screen.getByTestId('board-line')
+    expect(board).toHaveTextContent('1 question')
+    expect(board).toHaveTextContent('3 In progress')
+    expect(board).toHaveTextContent('5 Ready')
+    expect(within(board).getByTestId('plan-approval')).toHaveTextContent('plan: 2 waiting for your approval')
+    // Gap 6: the harness's own AMP connection.
+    expect(screen.getByTestId('amp-connection')).toHaveTextContent('slow 812 ms')
+    // Gap 1: worker chips with epic › story, tokens, context and cost.
+    const chips = screen.getAllByTestId('worker-chip')
+    expect(within(chips[0]).getByTestId('worker-epic')).toHaveTextContent('QA3d epic › Watch workers')
+    expect(within(chips[0]).getByTestId('worker-tokens')).toHaveTextContent('7.8k tok')
+    expect(within(chips[0]).getByTestId('worker-ctx')).toHaveTextContent('ctx 8%')
+    expect(within(chips[0]).getByTestId('worker-cost')).toHaveTextContent('$0.04')
+    expect(within(chips[1]).getByTestId('worker-state')).toHaveTextContent('completed after 3m10s')
+    // Gap 3: compaction in the working line.
+    expect(screen.getByTestId('working')).toHaveTextContent('Auto-compacting…')
+    // Gap 4: the TUI's one sentence, the raw provider text one click away.
+    expect(screen.getByTestId('reply-error')).toHaveTextContent('✗ Error: OpenRouter rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model.')
+    expect(within(screen.getByTestId('reply-error-detail')).getByText(/^http error 429:/)).toBeInTheDocument()
+  })
+})

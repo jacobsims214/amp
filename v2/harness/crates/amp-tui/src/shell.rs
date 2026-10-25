@@ -156,6 +156,36 @@ enum ShellMsg {
     Remote(crate::remote::RemoteCall),
     /// A `/remote` command's call finished (#2376).
     RemoteDone(RemoteReply),
+    /// The harness started or finished compacting the context (#2388). Not counted in
+    /// `in_flight`.
+    Compaction {
+        active: bool,
+        manual: bool,
+    },
+}
+
+/// The shell's watch on its harness's event bus (#2388: compaction progress). rpi's watch
+/// handle doesn't unsubscribe when dropped; this does.
+struct BusWatch(rpi_harness::events::WatchHandle<()>);
+
+impl Drop for BusWatch {
+    fn drop(&mut self) {
+        self.0.unsubscribe();
+    }
+}
+
+/// Watches `harness`'s bus for compaction progress and sends it to the shell.
+fn watch_compaction(harness: &AgentHarness, tx: UnboundedSender<ShellMsg>) -> BusWatch {
+    let mut handle = harness.events().watch(|| ());
+    handle.start(Arc::new(move |event| {
+        if let rpi_harness::events::HarnessEvent::CompactionProgress(p) = event {
+            let _ = tx.send(ShellMsg::Compaction {
+                active: p.active,
+                manual: p.manual,
+            });
+        }
+    }));
+    BusWatch(handle)
 }
 
 /// What a `/remote` command's call returned (#2376).
@@ -610,6 +640,8 @@ pub struct Shell {
     remote_status: Option<Arc<std::sync::Mutex<amp_core::remote::HostStatus>>>,
     /// `/remote` (#2376), once the caller gave the chat its remote link.
     remote: Option<crate::remote_ui::RemoteUi>,
+    /// Compaction progress from the harness (#2388).
+    _compaction: BusWatch,
 }
 
 impl Shell {
@@ -621,6 +653,7 @@ impl Shell {
     ) -> (Self, UnboundedReceiver<RunDone>) {
         let (done_tx, done_rx) = unbounded_channel();
         let (msgs_tx, msgs_rx) = unbounded_channel();
+        let compaction = watch_compaction(&harness, msgs_tx.clone());
         let view = ChatView::new();
         view.set_footer(&info.footer(None));
         view.add_banner(&info.banner);
@@ -676,6 +709,7 @@ impl Shell {
                 fed_workers: None,
                 remote_status: None,
                 remote: None,
+                _compaction: compaction,
             },
             done_rx,
         )
@@ -764,6 +798,7 @@ impl Shell {
                 .supervisor
                 .as_ref()
                 .map_or(0, |s| s.workers().len() as i64),
+            ..remote_status_more(meta.as_deref(), &self.info, &self.totals)
         };
         *cell.lock().unwrap_or_else(|e| e.into_inner()) = status;
     }
@@ -2831,6 +2866,10 @@ impl Shell {
                 }
                 continue;
             }
+            if let ShellMsg::Compaction { active, manual } = &msg {
+                self.view.set_compaction(*active, *manual);
+                continue;
+            }
             if let ShellMsg::ReloadRequest = &msg {
                 self.reload_command(ReloadCause::Watcher);
                 continue;
@@ -2891,7 +2930,10 @@ impl Shell {
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
                 ShellMsg::RemoteDone(reply) => self.remote_done(reply),
-                ShellMsg::Notice { .. } | ShellMsg::ReloadRequest | ShellMsg::Remote(_) => {}
+                ShellMsg::Notice { .. }
+                | ShellMsg::ReloadRequest
+                | ShellMsg::Remote(_)
+                | ShellMsg::Compaction { .. } => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
                         self.view.panel().update(|s| {
@@ -3663,11 +3705,24 @@ impl Shell {
         }
         // #2370: the chips in the manager feed, when they changed.
         if self.view.feed().is_some() {
+            // #2388: with what the chip shows besides: epic › story, the ticket's state, the
+            // model's window (tokens and cost come from the supervisor).
             let chips = amp_core::chat_event::ChatEvent::worker_status(&sessions, |id| {
-                entries
-                    .get(&id)
-                    .map(|e| e.name.clone())
-                    .filter(|n| !n.is_empty())
+                let e = entries.get(&id);
+                let ticket = snap
+                    .as_ref()
+                    .and_then(|m| m.workers.get(&id))
+                    .and_then(|f| f.get())
+                    .map(|w| &w.ticket);
+                amp_core::chat_event::ChipMeta {
+                    name: e.map(|e| e.name.clone()),
+                    epic: e.map(|e| e.epic.clone()),
+                    story: e.map(|e| e.story.clone()),
+                    ticket_state: ticket.map(|t| t.status.word().to_owned()),
+                    context_window: e
+                        .map(|e| e.context_window)
+                        .and_then(|w| i64::try_from(w).ok()),
+                }
             });
             if self.fed_workers.as_ref() != Some(&chips) {
                 let empty_first = self.fed_workers.is_none()
@@ -3988,6 +4043,72 @@ fn clean_answer(text: &str) -> String {
 }
 
 /// `amp-manager` -> `manager`, `amp:amp-worker-backend` -> `worker-backend`.
+/// #2388: what the remote link's status carries besides the basics: the rest of the TUI's
+/// header (ticket name, state, epic › story, the AMP connection), footer (thinking, role, cwd,
+/// session tokens) and status line (board counts, plan approval).
+fn remote_status_more(
+    meta: Option<&amp_core::meta::AmpMeta>,
+    info: &ShellInfo,
+    totals: &Totals,
+) -> amp_core::remote::HostStatus {
+    use amp_core::meta::Connection;
+    use amp_core::remote::{AmpConnection, BoardCounts, HostStatus, SessionTokens};
+    let ticket = meta.and_then(|m| {
+        let id = m.ticket_id?;
+        m.ticket.get().filter(|t| t.id == id)
+    });
+    let u = &totals.usage;
+    let used = u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens;
+    HostStatus {
+        ticket_name: ticket
+            .map(|t| t.name.clone())
+            .filter(|n| !n.trim().is_empty()),
+        ticket_state: ticket.map(|t| t.status.word().to_owned()),
+        epic: ticket
+            .and_then(|t| t.epic.as_ref())
+            .map(|e| e.name.clone())
+            .filter(|n| !n.trim().is_empty()),
+        story: ticket
+            .and_then(|t| t.story.as_ref())
+            .map(|s| s.name.clone())
+            .filter(|n| !n.trim().is_empty()),
+        usage: (used > 0).then_some(SessionTokens {
+            input: u.input_tokens,
+            output: u.output_tokens,
+            cache_read: u.cache_read_tokens,
+            cache_write: u.cache_write_tokens,
+        }),
+        thinking: Some(thinking_name(info.thinking).to_owned()),
+        role: Some(short_role(&info.role).to_owned()).filter(|r| !r.is_empty()),
+        cwd: Some(info.cwd.clone()).filter(|c| !c.is_empty()),
+        board: meta.and_then(|m| m.board.get()).map(|b| BoardCounts {
+            in_progress: i64::from(b.count(Status::InProgress)),
+            ready: i64::from(b.count(Status::Ready)),
+            question: i64::from(b.count(Status::Question)),
+            scheduled: i64::from(b.count(Status::Scheduled)),
+        }),
+        plan_approval: meta
+            .filter(|m| m.plan_required())
+            .and_then(|m| m.plan.get())
+            .map(|p| (p.yours().len() as i64, p.others().len() as i64)),
+        amp_connection: meta.map(|m| {
+            let (state, latency_ms) = match &m.health.connection {
+                Connection::Connecting => ("connecting", None),
+                Connection::Ok => ("connected", None),
+                Connection::Slow { latency } => ("slow", i64::try_from(latency.as_millis()).ok()),
+                Connection::Degraded { .. } => ("degraded", None),
+                Connection::AuthRequired => ("login_needed", None),
+                Connection::Down { .. } => ("disconnected", None),
+            };
+            AmpConnection {
+                state: state.to_owned(),
+                latency_ms,
+            }
+        }),
+        ..HostStatus::default()
+    }
+}
+
 pub fn short_role(role: &str) -> &str {
     let role = role.rsplit(':').next().unwrap_or(role);
     role.strip_prefix("amp-").unwrap_or(role)
@@ -4011,6 +4132,75 @@ mod tests {
         assert_eq!(
             clean_answer("  dark\x1b[31m  please \n\nok\n"),
             "dark[31m please\n\nok"
+        );
+    }
+
+    /// #2388: the remote status carries the TUI's header, footer and status line facts.
+    #[test]
+    fn remote_status_has_what_the_chrome_shows() {
+        use amp_core::remote::{AmpConnection, BoardCounts, SessionTokens};
+        let meta = crate::chrome::sample::meta(true);
+        let info = super::ShellInfo {
+            role: "amp-manager".into(),
+            provider: "anthropic".into(),
+            model_id: "claude".into(),
+            thinking: rpi_ai::ThinkingLevel::High,
+            requested_thinking: None,
+            context_window: 200_000,
+            cwd: "/Users/ada/dev/amp".into(),
+            git_branch: None,
+            banner: vec![],
+            session_file: None,
+        };
+        let mut totals = amp_core::events::Totals::default();
+        totals.usage.input_tokens = 1200;
+        totals.usage.cache_read_tokens = 9000;
+        let s = super::remote_status_more(Some(&meta), &info, &totals);
+        assert_eq!(
+            s.ticket_name.as_deref(),
+            Some("M3-3 Header and AMP status line")
+        );
+        assert_eq!(s.ticket_state.as_deref(), Some("in_progress"));
+        assert_eq!(s.epic.as_deref(), Some("AMP Harness"));
+        assert_eq!(s.story.as_deref(), Some("M3 theme + metadata"));
+        assert_eq!(s.thinking.as_deref(), Some("high"));
+        assert_eq!(s.role.as_deref(), Some("manager"));
+        assert_eq!(
+            s.usage,
+            Some(SessionTokens {
+                input: 1200,
+                output: 0,
+                cache_read: 9000,
+                cache_write: 0
+            })
+        );
+        assert_eq!(
+            s.board,
+            Some(BoardCounts {
+                in_progress: 3,
+                ready: 5,
+                question: 2,
+                scheduled: 1
+            })
+        );
+        assert_eq!(s.plan_approval, Some((2, 0)));
+        assert_eq!(
+            s.amp_connection,
+            Some(AmpConnection {
+                state: "connected".into(),
+                latency_ms: None
+            })
+        );
+        // The link sends only the folder's name.
+        assert_eq!(
+            amp_core::remote::cwd_basename(s.cwd.as_deref().unwrap()).as_deref(),
+            Some("amp")
+        );
+        // Without the poller: no AMP facts, and no usage before the first reply.
+        let s = super::remote_status_more(None, &info, &Default::default());
+        assert_eq!(
+            (s.ticket_name, s.board, s.amp_connection, s.usage),
+            (None, None, None, None)
         );
     }
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { blockText, formatCost, initialSessionState, isBusy, sessionReducer, type SessionAction, type SessionState } from './session'
+import { blockText, formatCost, initialSessionState, isBusy, sessionReducer, sessionTokens, type SessionAction, type SessionState } from './session'
 import { seedChatEvents } from './mock/mockRelay'
 import { CHAT_EVENT_TYPES, type ChatEvent, type Envelope } from './types'
 
@@ -88,5 +88,43 @@ describe('sessionReducer', () => {
     expect(formatCost(41_250)).toBe('$0.04')
     expect(formatCost(12_500_000)).toBe('$13')
     expect(formatCost(null)).toBe('—')
+  })
+})
+
+describe('what the TUI shows besides (#2388)', () => {
+  it('follows compaction, keeps the TUI\'s error sentence and refused line, and reads older bodies', () => {
+    let s = run([chat({ type: 'compaction', active: true, manual: false })])
+    expect(s.compaction).toMatchObject({ manual: false })
+    s = run([chat({ type: 'compaction', active: false, manual: false })], s)
+    expect(s.compaction).toBeNull()
+    s = run([
+      chat({ type: 'message_end', message_id: 'm1', stop_reason: 'error', error: 'http error 429: {"error":{}}', model: 'x', provider: 'openrouter',
+        usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd_micros: 0 },
+        error_summary: 'OpenRouter rate-limited the request (429).' }),
+      chat({ type: 'tool_end', tool_call_id: 'c1', name: 'amp_approve_plan', is_error: true, text: 'nope', truncated: false, full_bytes: 4,
+        refused_line: 'AMP refused: this needs a person in the AMP web UI (below)' }),
+      // An older harness: no new members.
+      chat({ type: 'tool_end', tool_call_id: 'c2', name: 'bash', is_error: false, text: 'ok', truncated: false, full_bytes: 2 }),
+    ])
+    const a = s.items.find(i => i.kind === 'assistant')
+    expect(a?.kind === 'assistant' && a.error_summary).toBe('OpenRouter rate-limited the request (429).')
+    const tools = s.items.filter(i => i.kind === 'tool')
+    expect(tools.map(t => t.kind === 'tool' && t.result?.refused_line)).toEqual(['AMP refused: this needs a person in the AMP web UI (below)', null])
+  })
+
+  it('a run that ends clears a compaction that never said it finished', () => {
+    const s = run([chat({ type: 'run_start', run_id: 'r', prompt_id: 'p' }), chat({ type: 'compaction', active: true, manual: true }),
+      chat({ type: 'run_end', run_id: 'r', outcome: 'aborted', error: null })])
+    expect(s.compaction).toBeNull()
+  })
+})
+
+describe('sessionTokens (#2388)', () => {
+  const totals = { input: 10, output: 5, cache_read: 0, cache_write: 0, cost_usd_micros: 0, messages: 1 }
+  it('prefers the harness\'s own totals, and falls back to the replies seen', () => {
+    const status = { usage: { input_tokens: 120340, output_tokens: 8311, cache_read_tokens: 901200, cache_write_tokens: 0 } } as never
+    expect(sessionTokens(status, totals)).toMatchObject({ total: 1_029_851, fromHarness: true })
+    expect(sessionTokens(null, totals)).toMatchObject({ total: 15, fromHarness: false })
+    expect(sessionTokens(null, { ...totals, input: 0, output: 0 })).toBeNull()
   })
 })

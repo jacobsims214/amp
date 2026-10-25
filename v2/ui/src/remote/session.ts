@@ -15,10 +15,12 @@ export interface Block { kind: 'thinking' | 'text'; text: string; startedAt: num
 export type TranscriptItem =
   | { kind: 'user'; key: string; prompt_id: string; text: string; origin: 'local' | 'remote'; device_id: string | null; device_name: string | null; at: number }
   | { kind: 'assistant'; key: string; message_id: string; model: string; provider: string; blocks: Block[];
-      done: boolean; stop_reason: string | null; error: string | null; usage: Usage | null; at: number }
+      done: boolean; stop_reason: string | null; error: string | null; usage: Usage | null; at: number
+      /** The TUI's one sentence for `error` (#2388); null from an older harness. */
+      error_summary: string | null }
   | { kind: 'tool'; key: string; message_id: string | null; tool_call_id: string; name: string; arguments_json: string; args_truncated: boolean;
       startedAt: number | null; endedAt: number | null;
-      result: { text: string; is_error: boolean; truncated: boolean; full_bytes: number } | null }
+      result: { text: string; is_error: boolean; truncated: boolean; full_bytes: number; refused_line: string | null } | null }
   /** `covered`: the TUI shows nothing for it (completed), or a notice/error line already said it. */
   | { kind: 'run_end'; key: string; run_id: string; outcome: string; error: string | null; covered: boolean; at: number; startedAt: number | null }
   | { kind: 'notice'; key: string; level: 'info' | 'warn' | 'error'; code: string | null; text: string; at: number }
@@ -64,6 +66,8 @@ export interface SessionState {
   totals: Totals
   /** When the last worker_status arrived (harness clock). */
   workersAt: number | null
+  /** The harness is compacting the context (#2388): since when (harness clock), and whether asked for. */
+  compaction: { manual: boolean; since: number } | null
   ended: { reason: string } | null
   /** The harness speaks a newer protocol: stop applying events (5.7 step 3). */
   versionMismatch: boolean
@@ -72,7 +76,7 @@ export interface SessionState {
 
 export const initialSessionState: SessionState = {
   hello: null, status: null, items: [], queue: [], workers: [], outgoing: [], online: null,
-  connection: 'connecting', running: null, runStartedAt: null, totals: noTotals, workersAt: null, ended: null, versionMismatch: false, lastAppliedSeq: 0,
+  connection: 'connecting', running: null, runStartedAt: null, totals: noTotals, workersAt: null, compaction: null, ended: null, versionMismatch: false, lastAppliedSeq: 0,
 }
 
 export type SessionAction =
@@ -123,7 +127,7 @@ function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
   type Assistant = Extract<TranscriptItem, { kind: 'assistant' }>
   const assistant = (message_id: string, model = '', provider = ''): Assistant => ({
     kind: 'assistant', key: nextKey('a'), message_id, model, provider, blocks: [], done: false,
-    stop_reason: null, error: null, usage: null, at: ts,
+    stop_reason: null, error: null, usage: null, at: ts, error_summary: null,
   })
   /** Closes the open block (a thinking section ends when anything else starts). */
   const closeBlocks = (blocks: Block[]): Block[] => blocks.map(b => b.endedAt == null ? { ...b, endedAt: ts } : b)
@@ -163,13 +167,15 @@ function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
         arguments_json: ev.arguments_json, args_truncated: !!ev.truncated, startedAt: ts, endedAt: null, result: null }] }
     }
     case 'tool_end': {
-      const result = { text: ev.text, is_error: !!ev.is_error, truncated: !!ev.truncated, full_bytes: ev.full_bytes }
+      const result = { text: ev.text, is_error: !!ev.is_error, truncated: !!ev.truncated, full_bytes: ev.full_bytes,
+        refused_line: typeof ev.refused_line === 'string' && ev.refused_line ? ev.refused_line : null }
       const next = replaceWhere('tool', t => t.tool_call_id === ev.tool_call_id, t => ({ ...t, result, endedAt: ts }))
       return { ...s, items: next ?? [...items, { kind: 'tool', key: nextKey('t'), message_id: null, tool_call_id: ev.tool_call_id, name: ev.name,
         arguments_json: '', args_truncated: false, startedAt: null, endedAt: ts, result }] }
     }
     case 'message_end': {
-      const patch = { done: true, stop_reason: ev.stop_reason, error: ev.error ?? null, usage: ev.usage ?? null, model: ev.model, provider: ev.provider }
+      const patch = { done: true, stop_reason: ev.stop_reason, error: ev.error ?? null, usage: ev.usage ?? null, model: ev.model, provider: ev.provider,
+        error_summary: typeof ev.error_summary === 'string' && ev.error_summary ? ev.error_summary : null }
       const next = replaceWhere('assistant', a => a.message_id === ev.message_id, a => ({ ...a, ...patch, blocks: closeBlocks(a.blocks) }))
       const u = ev.usage
       const totals = u ? {
@@ -190,7 +196,7 @@ function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
         if (it.kind === 'user') break
         if ((it.kind === 'notice' && (it.level !== 'info' || it.text.trim() === 'Stopped.')) || (it.kind === 'assistant' && it.error && it.stop_reason !== 'aborted')) { said = true; break }
       }
-      return { ...s, running: null, runStartedAt: null, items: [...items, { kind: 'run_end', key: nextKey('e'), run_id: ev.run_id, outcome: ev.outcome,
+      return { ...s, running: null, runStartedAt: null, compaction: null, items: [...items, { kind: 'run_end', key: nextKey('e'), run_id: ev.run_id, outcome: ev.outcome,
         error: ev.error ?? null, covered: ev.outcome === 'completed' || said, at: ts, startedAt: s.runStartedAt }] }
     }
     case 'notice': {
@@ -204,6 +210,8 @@ function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
       return { ...s, queue: Array.isArray(ev.items) ? ev.items : [] }
     case 'worker_status':
       return { ...s, workers: Array.isArray(ev.workers) ? ev.workers : [], workersAt: ts }
+    case 'compaction':
+      return { ...s, compaction: ev.active ? { manual: !!ev.manual, since: ts } : null }
     default:
       return s // unknown types are ignored (6.4)
   }
@@ -268,7 +276,7 @@ export function sessionReducer(s: SessionState, a: SessionAction): SessionState 
       const f = a.frame
       if (f.type === 'attached') return { ...s, online: f.online, connection: 'live' }
       if (f.type === 'online') return { ...s, online: true }
-      if (f.type === 'offline') return { ...s, online: false, running: null, runStartedAt: null }
+      if (f.type === 'offline') return { ...s, online: false, running: null, runStartedAt: null, compaction: null }
       if (f.type === 'gap') return { ...s, items: [...s.items, { kind: 'gap', key: nextKey('g') }] }
       if (f.type === 'ended') return { ...s, ended: { reason: f.reason } }
       return s
@@ -297,10 +305,23 @@ export function isBusy(s: SessionState): boolean {
   return s.running !== null || !!s.status?.busy
 }
 
-/** The session's tokens for the status line: the harness's status doesn't carry totals (yet),
- *  so these are the replies this page has seen. */
+/** The tokens of the replies this page has seen (the fallback for a harness whose status has no
+ *  totals, before #2388). */
 export function tokenTotal(t: Totals): number {
   return t.input + t.output + t.cache_read + t.cache_write
+}
+
+/** The session's tokens for the status line: the harness's own totals when its status carries
+ *  them (#2388), else what this page has seen (which undercounts after a gap). */
+export function sessionTokens(status: SessionStatus | null, t: Totals):
+  { input: number; output: number; cache_read: number; cache_write: number; total: number; fromHarness: boolean } | null {
+  const u = status?.usage
+  if (u && typeof u.input_tokens === 'number') {
+    const v = { input: u.input_tokens, output: u.output_tokens || 0, cache_read: u.cache_read_tokens || 0, cache_write: u.cache_write_tokens || 0 }
+    return { ...v, total: v.input + v.output + v.cache_read + v.cache_write, fromHarness: true }
+  }
+  const total = tokenTotal(t)
+  return total ? { input: t.input, output: t.output, cache_read: t.cache_read, cache_write: t.cache_write, total, fromHarness: false } : null
 }
 
 /** People-facing words for end reasons (protocol 12.2). */

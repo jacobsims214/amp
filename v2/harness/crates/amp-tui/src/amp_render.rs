@@ -601,7 +601,7 @@ pub fn marker_component(meta: &AmpMeta) -> Arc<TicketMarker> {
 }
 
 /// A refused call's own row: the [`ApprovalNotice`] under it carries the server's sentence.
-pub const REFUSED_LINE: &str = "AMP refused: this needs a person in the AMP web UI (below)";
+pub use amp_core::approval::REFUSED_LINE;
 
 /// What the person sees when AMP refused a step only they take, in the web UI (#2171): drawn
 /// under the refused tool call.

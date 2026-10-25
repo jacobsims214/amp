@@ -48,6 +48,30 @@ export interface SessionStatus {
   queue_len: number
   workers_running: number
   devices: DeviceRef[]
+  // #2388 (protocol 6.3): what the TUI's header, footer and status line show besides. Optional: a
+  // harness that predates them omits them, which reads as "not known".
+  /** The current ticket's board state: `ready`, `in_progress`, `question`, `scheduled`, `waiting`, `done`. */
+  ticket_state?: string | null
+  epic?: string | null
+  story?: string | null
+  /** The session's token totals, as the harness counted them (its cost is `cost_usd_micros`). */
+  usage?: SessionTokens | null
+  /** The thinking level (`off`, `low`, …) and the agent role (`manager`). */
+  thinking?: string | null
+  role?: string | null
+  /** The last component of the working directory only. */
+  cwd?: string | null
+  board?: BoardCounts | null
+  plan_approval?: { yours: number; others: number } | null
+  amp_connection?: AmpConnection | null
+}
+
+export interface SessionTokens { input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number }
+export interface BoardCounts { in_progress: number; ready: number; question: number; scheduled: number }
+/** The harness's own connection to AMP, as the TUI header's dot says it. */
+export interface AmpConnection {
+  state: 'connecting' | 'connected' | 'slow' | 'degraded' | 'login_needed' | 'disconnected' | string
+  latency_ms: number | null
 }
 
 export interface HelloBody {
@@ -98,7 +122,17 @@ export interface Usage {
 
 export interface QueueItem { prompt_id: string; origin: 'local' | 'remote'; device_id: string | null; preview: string }
 export type WorkerState = 'running' | 'done' | 'failed' | 'stopped' | 'blocked'
-export interface WorkerInfo { task_id: number; name: string; role: string; state: WorkerState; model: string | null; started_at_ms: number | null }
+export interface WorkerInfo {
+  task_id: number; name: string; role: string; state: WorkerState; model: string | null; started_at_ms: number | null
+  // #2388 (protocol 6.4): what the TUI's chip shows besides. Optional: an older harness omits them.
+  ended_at_ms?: number | null
+  usage?: Usage | null
+  context_tokens?: number | null
+  context_window?: number | null
+  epic?: string | null
+  story?: string | null
+  ticket_state?: string | null
+}
 
 /** ChatEvent (protocol 6.4), selected by `type`. */
 export type ChatEvent =
@@ -108,17 +142,23 @@ export type ChatEvent =
   | { type: 'text_delta'; message_id: string; delta: string }
   | { type: 'thinking_delta'; message_id: string; delta: string }
   | { type: 'tool_start'; message_id: string; tool_call_id: string; name: string; arguments_json: string; truncated: boolean }
-  | { type: 'tool_end'; tool_call_id: string; name: string; is_error: boolean; text: string; truncated: boolean; full_bytes: number }
-  | { type: 'message_end'; message_id: string; stop_reason: string; error: string | null; model: string; provider: string; usage: Usage }
+  | { type: 'tool_end'; tool_call_id: string; name: string; is_error: boolean; text: string; truncated: boolean; full_bytes: number
+      /** #2388: the TUI's line for a call AMP refused for a person's step. */
+      refused_line?: string | null }
+  | { type: 'message_end'; message_id: string; stop_reason: string; error: string | null; model: string; provider: string; usage: Usage
+      /** #2388: the TUI's one sentence for `error` (which stays the raw detail). */
+      error_summary?: string | null }
   | { type: 'retry'; attempt: number; max_retries: number; delay_ms: number; error: string }
   | { type: 'run_end'; run_id: string; outcome: 'completed' | 'aborted' | 'failed' | 'suspended'; error: string | null }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; code: string | null; text: string }
   | { type: 'queue'; items: QueueItem[] }
   | { type: 'worker_status'; workers: WorkerInfo[] }
+  /** #2388: the harness started (`active`) or finished compacting the context. */
+  | { type: 'compaction'; active: boolean; manual: boolean }
 
 export const CHAT_EVENT_TYPES = [
   'user_message', 'run_start', 'message_start', 'text_delta', 'thinking_delta', 'tool_start', 'tool_end',
-  'message_end', 'retry', 'run_end', 'notice', 'queue', 'worker_status',
+  'message_end', 'retry', 'run_end', 'notice', 'queue', 'worker_status', 'compaction',
 ] as const
 
 // ── Relay frames (unsigned status from AMP, protocol 8.3) ───────────────────

@@ -860,6 +860,72 @@ def events_file():
     v2 = sign_env(HARNESS, dict(event("chat_event", {"type": "notice", "level": "info", "code": None, "text": "hi"}, seq=43, nonce_label="e12"), v=2))
     add("unsupported_version", wire(v2), browser_rx(last_applied_seq=42), "unsupported_version", "Major version 2.")
 
+    # #2388: what the TUI shows besides, all additive within v1 (an older harness omits these members; the
+    # vectors above keep the older shapes).
+    st = sign_env(HARNESS, event("status", {
+        "model": "anthropic/claude-opus-5-5",
+        "busy": True,
+        "context_pct": 41,
+        "cost_usd_micros": 2104400,
+        "project": {"id": 2, "name": "AMP"},
+        "ticket_id": 2388,
+        "branch": "remote-m1-2388",
+        "queue_len": 0,
+        "workers_running": 1,
+        "devices": [{"device_id": DEVICE_A.fp, "name": "Safari on iPhone"}],
+        "ticket_name": "RC-M1 harness + UI: ChatEvent carries everything the TUI shows",
+        "ticket_state": "in_progress",
+        "epic": "Remote control",
+        "story": "M1",
+        "usage": {"input_tokens": 120340, "output_tokens": 8311, "cache_read_tokens": 901200, "cache_write_tokens": 0},
+        "thinking": "high",
+        "role": "manager",
+        "cwd": "amp",
+        "board": {"in_progress": 3, "ready": 5, "question": 1, "scheduled": 0},
+        "plan_approval": {"yours": 2, "others": 0},
+        "amp_connection": {"state": "slow", "latency_ms": 812},
+    }, seq=49, nonce_label="e13"))
+    add("status_tui_facts_valid", wire(st), browser_rx(last_applied_seq=48), "ok",
+        "#2388: a status with the TUI's header, footer and status-line facts (ticket name/state/epic/story, session "
+        "token totals, thinking, role, cwd's last component, board counts, plan approval, the harness's AMP "
+        "connection). Integers only.", st, True)
+
+    ws2 = sign_env(HARNESS, event("chat_event", {"type": "worker_status", "workers": [
+        {"task_id": 2390, "name": "Watch workers", "role": "amp-worker-backend", "state": "running",
+         "model": "openrouter/deepseek/deepseek-v4.1", "started_at_ms": NOW_MS - 192_000, "ended_at_ms": None,
+         "usage": {"input_tokens": 6100, "output_tokens": 1200, "cache_read_tokens": 500, "cache_write_tokens": 0, "cost_usd_micros": 40000},
+         "context_tokens": 10240, "context_window": 128000, "epic": "QA3d epic", "story": "Watch workers",
+         "ticket_state": "in_progress"},
+        {"task_id": 2391, "name": "Docs", "role": "amp-worker-docs", "state": "done",
+         "model": None, "started_at_ms": NOW_MS - 400_000, "ended_at_ms": NOW_MS - 210_000,
+         "usage": None, "context_tokens": None, "context_window": None, "epic": None, "story": None,
+         "ticket_state": "done"},
+    ]}, seq=50, nonce_label="e14"))
+    add("chat_worker_status_tui_facts_valid", wire(ws2), browser_rx(last_applied_seq=49), "ok",
+        "#2388: worker chips with tokens/cost, context, ended time, epic \u203a story and the ticket's state.", ws2, True)
+
+    comp = sign_env(HARNESS, event("chat_event", {"type": "compaction", "active": True, "manual": False}, seq=51, nonce_label="e15"))
+    add("chat_compaction_valid", wire(comp), browser_rx(last_applied_seq=50), "ok",
+        "#2388: the harness is compacting the context (automatic).", comp, True)
+
+    merr = sign_env(HARNESS, event("chat_event", {
+        "type": "message_end", "message_id": "msg_8", "stop_reason": "error",
+        "error": "http error 429: {\"error\":{\"message\":\"Rate limit exceeded: free-models-per-day\",\"code\":429}}",
+        "model": "deepseek/deepseek-v4.1", "provider": "openrouter",
+        "usage": {"input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd_micros": 0},
+        "error_summary": "OpenRouter rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model.",
+    }, seq=52, nonce_label="e16"))
+    add("chat_message_end_error_summary_valid", wire(merr), browser_rx(last_applied_seq=51), "ok",
+        "#2388: a failed reply with the TUI's one sentence (error_summary) and the raw provider text (error) as detail.", merr, True)
+
+    tref = sign_env(HARNESS, event("chat_event", {
+        "type": "tool_end", "tool_call_id": "call_9", "name": "amp_approve_plan", "is_error": True,
+        "text": "Approving the plan is done by a person in the AMP web UI.", "truncated": False, "full_bytes": 57,
+        "refused_line": "AMP refused: this needs a person in the AMP web UI (below)",
+    }, seq=53, nonce_label="e17"))
+    add("chat_tool_end_refused_valid", wire(tref), browser_rx(last_applied_seq=52), "ok",
+        "#2388: an AMP call refused for a person's step carries the TUI's fixed row line.", tref, True)
+
     return {
         "description": "Harness -> browser events. Run each `wire` text through the browser's event check with `receiver` and "
         "expect `expect`: \"ok\", \"duplicate\" (drop silently), \"ignored_unknown_op\" (verified, seq advanced, not rendered) or "
