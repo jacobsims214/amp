@@ -78,6 +78,34 @@ describe('sessionReducer', () => {
     expect(s.ended).toEqual({ reason: 'idle' })
   })
 
+  it('ignores hello and status snapshots older than what is shown (#2393)', () => {
+    const st = (model: string) => ({ model, busy: false, context_pct: 1, cost_usd_micros: 0, project: null, ticket_id: null, branch: null, queue_len: 0, workers_running: 0, devices: [] })
+    const at = (op: string, body: unknown, n: number): Envelope => ({ ...env(op, body), seq: n })
+    const hello = (n: number, model: string) => at('hello', { harness: { harness_id: 'h', harness_pub: 'p', host: `host-${n}`, os: 'macos', version: '1' }, user_id: 1, ops: [], started_at_ms: 0, expires_at_ms: 0, idle_timeout_s: 1800, status: st(model) }, n)
+    // The stream applied status 40 and hello 30.
+    let s = run([
+      { type: 'event', env: hello(30, 'from-hello-30'), myDeviceId: 'me' },
+      { type: 'event', env: at('status', st('status-40'), 40), myDeviceId: 'me' },
+    ])
+    expect(s).toMatchObject({ status: { model: 'status-40' }, statusSeq: 40, helloSeq: 30 })
+    // A relay replays genuine but older snapshots: nothing changes.
+    s = run([{ type: 'snapshot', env: at('status', st('status-12'), 12) }, { type: 'snapshot', env: hello(5, 'from-hello-5') }], s)
+    expect(s.status?.model).toBe('status-40')
+    expect(s.hello?.harness.host).toBe('host-30')
+    // The same latest status again (a reconnect's snapshot) is fine; a newer one replaces it.
+    s = run([{ type: 'snapshot', env: at('status', st('status-40'), 40) }, { type: 'snapshot', env: at('status', st('status-41'), 41) }], s)
+    expect(s).toMatchObject({ status: { model: 'status-41' }, statusSeq: 41 })
+    // A newer hello replaces the hello, but its status only counts when it is newer than the one shown.
+    s = run([{ type: 'snapshot', env: hello(35, 'from-hello-35') }], s)
+    expect(s).toMatchObject({ hello: { harness: { host: 'host-35' } }, helloSeq: 35, status: { model: 'status-41' } })
+    s = run([{ type: 'snapshot', env: hello(50, 'from-hello-50') }], s)
+    expect(s).toMatchObject({ status: { model: 'from-hello-50' }, statusSeq: 50 })
+    // Buffered events replayed after a newer snapshot don't roll the status back either.
+    s = run([{ type: 'event', env: at('status', st('status-45'), 45), myDeviceId: 'me' }], s)
+    expect(s.status?.model).toBe('from-hello-50')
+    expect(s.lastAppliedSeq).toBe(45) // the event still counts as applied
+  })
+
   it('stops applying events after a version mismatch', () => {
     const s = run([{ type: 'version_mismatch' }, chat({ type: 'notice', level: 'info', code: null, text: 'x' })])
     expect(s.items).toEqual([])

@@ -21,7 +21,10 @@ use std::{any::Any, collections::BTreeSet};
 use amp_core::{
     chat_event::{ChatEvent, NoticeLevel, Origin, QueueItem},
     manager_feed::FeedEntry,
-    remote::{LocalEvent, PairingPrompt, RemoteLink, RemoteState, pairing::StoredPin},
+    remote::{
+        LocalEvent, PairingPrompt, RemoteLink, RemoteState,
+        pairing::{StoredPin, sanitize_for_terminal},
+    },
 };
 use chrono::TimeZone;
 use qrcodegen::{QrCode, QrCodeEcc};
@@ -247,13 +250,15 @@ fn queue_lines(
             .as_deref()
             .and_then(|id| devices.iter().find(|d| d.device_id == id))
             .map_or_else(|| "a paired device".to_owned(), |d| d.name.clone());
+        // #2391 (L2): the preview is remote text; nothing in it may reach the terminal raw.
         out.push(UiEvent::Line(
             NoticeLevel::Info,
             format!(
-                "[remote: {who}] queued #{}: \"{}\" runs when the current reply ends (Esc drops \
+                "[remote: {}] queued #{}: \"{}\" runs when the current reply ends (Esc drops \
                  the queue).",
+                sanitize_for_terminal(&who, 64),
                 pos + 1,
-                item.preview
+                sanitize_for_terminal(&item.preview.replace(['\n', '\t'], " "), 400)
             ),
         ));
     }
@@ -511,6 +516,37 @@ mod tests {
             queue_len,
             fingerprint: "AAAA-BBBB".into(),
         })
+    }
+
+    /// #2391 (L2): a queued remote prompt's preview is shown without escape sequences,
+    /// invisible or bidi characters, on one line.
+    #[test]
+    fn queued_preview_is_sanitized() {
+        let pin = StoredPin {
+            device_id: "dv_1".into(),
+            device_pub: String::new(),
+            name: "Pho\u{200B}ne".into(),
+            user_id: 7,
+            paired_at_ms: 1,
+            pinned_until_ms: 2,
+            session_only: false,
+        };
+        let item = QueueItem {
+            prompt_id: "p_1".into(),
+            origin: Origin::Remote,
+            device_id: Some("dv_1".into()),
+            preview: "hi\u{1b}]52;c;Zm9v\u{7} there\u{202E}\u{2028}\nnext\u{1b}[2J".into(),
+        };
+        let mut seen = BTreeSet::new();
+        let lines = queue_lines(&mut seen, &[item], &[pin]);
+        let [UiEvent::Line(_, line)] = lines.as_slice() else {
+            panic!("one line");
+        };
+        assert_eq!(
+            line,
+            "[remote: Phone] queued #1: \"hi]52;c;Zm9v there next[2J\" runs when the current \
+             reply ends (Esc drops the queue)."
+        );
     }
 
     #[test]

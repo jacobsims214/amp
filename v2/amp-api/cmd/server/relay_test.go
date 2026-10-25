@@ -31,6 +31,7 @@ import (
 	"github.com/simstech/amp-api/internal/cluster"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/relay"
+	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/relayserver"
 	"github.com/simstech/amp-api/internal/service"
 )
@@ -121,8 +122,17 @@ func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*rela
 		})
 	}
 
+	// amp-relay connects as its own least-privilege role (#2392): every relay
+	// test proves the relay needs no more than repository.GrantRelayRole.
+	relayRepo, _ := relayRole(t, w.s.repo)
+	relayToken, err := relayctl.Token(context.Background(), w.s.repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	// amp-relay always joins the replica group (cmd/relay): its replicas find
-	// each other there, and amp-api finds the one holding a session.
+	// each other there, and amp-api finds the one holding a session. It
+	// uses the relay cluster token, never amp-api's.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -130,7 +140,8 @@ func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*rela
 	opts := fastCluster
 	opts.ID = fmt.Sprintf("relay-%s-%d-%d", t.Name(), relayEnvSeq.Add(1), time.Now().UnixNano())
 	opts.Addr = ln.Addr().String()
-	node, err := cluster.Join(context.Background(), w.s.repo, opts)
+	opts.Token, opts.NoProjects = relayToken, true
+	node, err := cluster.Join(context.Background(), relayRepo, opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +150,7 @@ func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*rela
 	e.node, e.stop = node, cancel
 
 	// amp-relay.
-	e.svc = service.New(w.s.repo, nil, nil)
+	e.svc = service.New(relayRepo, nil, nil)
 	e.svc.Remote, e.svc.AppURL = remoteOn, relayOrigin
 	cfg := relay.Config{AppURL: relayOrigin, Now: e.clock.Now, Cluster: node}
 	if tune != nil {
