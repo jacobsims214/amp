@@ -69,15 +69,25 @@
 //! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
 //!   the manager's folder: git worktrees in a usable repository, a folder per ticket outside git.
 //!
+//! Remote control M1 (#2370):
+//! - [`events::FanOutEmitter`]: the manager's events go to the TUI, the manager feed and any later
+//!   subscriber (the remote link).
+//! - [`chat_event`]: everything the chat shows as [`chat_event::ChatEvent`]s, the wire shape of
+//!   `v2/docs/remote-control/protocol.md` section 6.4 (a superset of `run --json`'s events).
+//! - [`manager_feed`]: the manager's append-only, sequence-numbered, bounded chat feed with replay
+//!   from any seq and a resync from the session file.
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
 pub mod approval;
 pub mod assets;
+pub mod chat_event;
 pub mod config_check;
 pub mod events;
 pub mod faux;
 pub mod links;
+pub mod manager_feed;
 pub mod mcp_config;
 pub mod mcp_http;
 pub mod mcp_hub;

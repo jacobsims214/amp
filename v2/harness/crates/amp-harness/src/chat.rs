@@ -228,6 +228,10 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         &session.rt.current_providers(),
     );
     let (mut shell, mut done) = Shell::new(session.agent.harness.clone(), info, models);
+    // #2370: the chat as numbered ChatEvents (prompts, outcomes, notices, worker chips) next to
+    // the agent's own events, for the remote link; a quiet delta is numbered after ~100 ms.
+    shell.set_feed(Some(Arc::clone(&session.feed)));
+    let _feed_flusher = session.feed.spawn_flusher();
     shell.set_show_thinking(show_thinking);
     shell.set_mouse_capture(mouse);
     shell.set_padding(padding);

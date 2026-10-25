@@ -4,6 +4,9 @@
 //! - [`ChannelEmitter`] is the `AgentHarnessOptions::agent_emitter`: it forwards every rpi
 //!   [`AgentEvent`] into an unbounded channel, so the consumer (the headless printer, the M2-7 TUI,
 //!   the M2-5 worker supervisor) never slows the loop down.
+//! - [`FanOutEmitter`] (#2370) tees every event to several consumers: the TUI's channel, the
+//!   manager's [`crate::manager_feed::ManagerFeed`], and any subscriber added later (the remote
+//!   link, #2373). One slow or closed consumer never holds the others back.
 //! - [`RunEvent::from_agent`] maps rpi's events to ours. Streaming noise (thinking and tool-call
 //!   argument deltas, per-message starts) is dropped; text deltas, finished assistant messages
 //!   (with usage), tool starts/ends and retries are kept.
@@ -47,6 +50,115 @@ impl AgentEmitter for ChannelEmitter {
 
     fn try_emit(&self, event: AgentEvent) {
         let _ = self.tx.send(event);
+    }
+}
+
+/// Tees every rpi event to several consumers (#2370). Cheap to clone: clones share the sinks and
+/// subscribers.
+///
+/// - [`FanOutEmitter::add_sink`]: another [`AgentEmitter`] (the TUI's [`ChannelEmitter`], the
+///   manager feed's emitter). Sinks get every event in order; `emit` awaits them one after another.
+/// - [`FanOutEmitter::subscribe`]: an unbounded channel of every event from now on, for a consumer
+///   that joins later. A dropped receiver is forgotten on the next event.
+#[derive(Clone, Default)]
+pub struct FanOutEmitter {
+    inner: Arc<FanOutInner>,
+}
+
+#[derive(Default)]
+struct FanOutInner {
+    sinks: Mutex<Vec<Arc<dyn AgentEmitter>>>,
+    subscribers: Mutex<Vec<mpsc::UnboundedSender<AgentEvent>>>,
+}
+
+impl FanOutEmitter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a sink; it gets every event emitted from now on.
+    pub fn add_sink(&self, sink: Arc<dyn AgentEmitter>) {
+        self.inner
+            .sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sink);
+    }
+
+    /// A channel of every event emitted from now on.
+    pub fn subscribe(&self) -> mpsc::UnboundedReceiver<AgentEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(tx);
+        rx
+    }
+
+    /// How many sinks and live subscribers it feeds.
+    pub fn consumers(&self) -> usize {
+        let sinks = self
+            .inner
+            .sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .len();
+        let subs = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|s| !s.is_closed())
+            .count();
+        sinks + subs
+    }
+
+    pub fn into_emitter(self) -> Arc<dyn AgentEmitter> {
+        Arc::new(self)
+    }
+
+    fn sinks(&self) -> Vec<Arc<dyn AgentEmitter>> {
+        self.inner
+            .sinks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn send_subscribers(&self, event: &AgentEvent) {
+        let mut subs = self
+            .inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        subs.retain(|tx| tx.send(event.clone()).is_ok());
+    }
+}
+
+impl AgentEmitter for FanOutEmitter {
+    fn emit(&self, event: AgentEvent) -> futures_core_box::BoxFuture {
+        self.send_subscribers(&event);
+        // Each sink's emit is called now, in order (so a sink that records synchronously sees the
+        // event before the loop goes on); their futures are awaited one after another.
+        let futures: Vec<futures_core_box::BoxFuture> = self
+            .sinks()
+            .iter()
+            .map(|sink| sink.emit(event.clone()))
+            .collect();
+        Box::pin(async move {
+            for f in futures {
+                f.await;
+            }
+        })
+    }
+
+    fn try_emit(&self, event: AgentEvent) {
+        self.send_subscribers(&event);
+        for sink in self.sinks() {
+            sink.try_emit(event.clone());
+        }
     }
 }
 
@@ -431,5 +543,141 @@ mod tests {
         assert_eq!(t.usage.input_tokens, 20);
         assert_eq!(t.usage.cost_usd, 1.0);
         assert_eq!(t.last_text, "done");
+    }
+
+    /// A fixed script of rpi events: a turn with streamed text, a tool call, a retry and a
+    /// finished assistant message with usage.
+    fn script() -> Vec<AgentEvent> {
+        let mut m = faux_assistant_message(
+            vec![
+                FauxBlock::thinking("hmm"),
+                FauxBlock::text("Checking."),
+                FauxBlock::tool_call("bash", json!({"command": "ls", "timeout": 1.5})),
+            ],
+            StopReason::ToolUse,
+        );
+        m.model = "m".into();
+        m.provider = "p".into();
+        m.usage.input = 12;
+        m.usage.output = 3;
+        m.usage.cache_read = 100;
+        m.usage.cost.total = 0.04125;
+        let m = Arc::new(m);
+        vec![
+            AgentEvent::AgentStart,
+            AgentEvent::TurnStart,
+            AgentEvent::MessageStart {
+                message: AgentMessage::Assistant(Box::new((*m).clone())),
+            },
+            AgentEvent::MessageUpdate {
+                message: Arc::clone(&m),
+                assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: "hmm".into(),
+                    partial: Arc::clone(&m),
+                },
+            },
+            AgentEvent::MessageUpdate {
+                message: Arc::clone(&m),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 1,
+                    delta: "Check\u{2026}\n\"ing\"".into(),
+                    partial: Arc::clone(&m),
+                },
+            },
+            AgentEvent::MessageEnd {
+                message: AgentMessage::Assistant(Box::new((*m).clone())),
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                args: json!({"command": "ls", "timeout": 1.5}),
+            },
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id: "c1".into(),
+                tool_name: "bash".into(),
+                result: AgentToolResult::text("a\nb"),
+                is_error: false,
+            },
+            AgentEvent::RetryScheduled {
+                attempt: 1,
+                max_retries: 3,
+                delay_ms: 250,
+                error: "overloaded".into(),
+            },
+            AgentEvent::TurnEnd {
+                message: AgentMessage::Assistant(Box::new((*m).clone())),
+                tool_results: vec![],
+            },
+        ]
+    }
+
+    /// `run --json`'s event lines, byte for byte (#2370: the fan-out emitter and ChatEvent must
+    /// not change them). A change here breaks scripts: fields may be added, never renamed.
+    const RUN_JSON: &str = r#"{"type":"turn_start"}
+{"type":"text_delta","delta":"Check…\n\"ing\""}
+{"type":"assistant","text":"Checking.","tool_calls":[{"id":"call_2","name":"bash","arguments":{"command":"ls","timeout":1.5}}],"stop_reason":"tool_use","model":"m","provider":"p","usage":{"input_tokens":12,"output_tokens":3,"cache_read_tokens":100,"cache_write_tokens":0,"cost_usd":0.04125}}
+{"type":"tool_start","id":"c1","name":"bash","arguments":{"command":"ls","timeout":1.5}}
+{"type":"tool_end","id":"c1","name":"bash","is_error":false,"text":"a\nb"}
+{"type":"retry","attempt":1,"max_retries":3,"delay_ms":250,"error":"overloaded"}
+{"type":"turn_end"}"#;
+
+    fn run_json(events: &[AgentEvent]) -> String {
+        events
+            .iter()
+            .filter_map(RunEvent::from_agent)
+            .map(|e| serde_json::to_string(&e).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn run_json_lines_are_byte_identical() {
+        let got = run_json(&script());
+        // The faux tool call id is generated: pin it before comparing.
+        let id = got
+            .split("\"tool_calls\":[{\"id\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap()
+            .to_owned();
+        assert_eq!(got.replace(&id, "call_2"), RUN_JSON);
+    }
+
+    #[tokio::test]
+    async fn fan_out_gives_every_consumer_every_event_in_order() {
+        let fan = FanOutEmitter::new();
+        let (tui, mut tui_rx) = ChannelEmitter::new();
+        fan.add_sink(tui.into_emitter());
+        let mut late = fan.subscribe();
+        let dropped = fan.subscribe();
+        drop(dropped);
+        let totals = Arc::new(Mutex::new(Totals::default()));
+        let emitter = TotalsEmitter::new(Arc::clone(&totals), Some(fan.clone().into_emitter()))
+            .into_emitter();
+        let events = script();
+        for (i, e) in events.iter().enumerate() {
+            if i % 2 == 0 {
+                emitter.emit(e.clone()).await;
+            } else {
+                emitter.try_emit(e.clone());
+            }
+        }
+        let drain = |rx: &mut mpsc::UnboundedReceiver<AgentEvent>| {
+            let mut out = Vec::new();
+            while let Ok(e) = rx.try_recv() {
+                out.push(e);
+            }
+            out
+        };
+        let a = drain(&mut tui_rx);
+        let b = drain(&mut late);
+        assert_eq!(a.len(), events.len());
+        assert_eq!(b.len(), events.len());
+        // What the TUI and `run --json` see through the fan-out is what they saw before.
+        assert_eq!(run_json(&a), run_json(&events));
+        assert_eq!(run_json(&b), run_json(&events));
+        assert_eq!(totals.lock().unwrap().turns, 1);
+        assert_eq!(fan.consumers(), 2, "the dropped subscriber is forgotten");
     }
 }

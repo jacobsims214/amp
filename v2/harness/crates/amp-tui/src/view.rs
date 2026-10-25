@@ -48,7 +48,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use amp_core::chat_event::{ChatEvent, NoticeLevel};
 use amp_core::events::{stop_reason_str, tool_result_text};
+use amp_core::manager_feed::ManagerFeed;
 use amp_core::provider_error;
 
 use crate::amp_render;
@@ -176,6 +178,8 @@ pub struct ChatView {
     strip: Arc<WorkerStrip>,
     /// While [`Self::apply_at`] applies an event: when it happened (`Some(None)`: not known).
     event_time: Option<Option<Instant>>,
+    /// The manager's chat feed (#2370): every notice, warning and error line goes there too.
+    feed: Mutex<Option<Arc<ManagerFeed>>>,
 }
 
 impl Default for ChatView {
@@ -289,6 +293,7 @@ impl ChatView {
             roster,
             strip,
             event_time: None,
+            feed: Mutex::new(None),
         }
     }
 
@@ -718,16 +723,43 @@ impl ChatView {
     /// A dim one-off line in the transcript (command output, run outcome).
     pub fn add_notice(&self, text: &str) {
         self.add_line(text, theme().colors.dim);
+        self.feed_notice(NoticeLevel::Info, None, text);
     }
 
     /// A warning line in the transcript (something the person should decide on).
     pub fn add_warning(&self, text: &str) {
         self.add_line(text, theme().colors.warning);
+        self.feed_notice(NoticeLevel::Warn, None, text);
     }
 
     /// An error line in the transcript.
     pub fn add_error(&self, text: &str) {
         self.add_line(text, theme().colors.error);
+        self.feed_notice(NoticeLevel::Error, None, text);
+    }
+
+    /// Sends the transcript's notices to the manager's chat feed (#2370).
+    pub fn set_feed(&self, feed: Option<Arc<ManagerFeed>>) {
+        *self.feed.lock().unwrap_or_else(|e| e.into_inner()) = feed;
+    }
+
+    /// The manager's chat feed, if one was set.
+    pub fn feed(&self) -> Option<Arc<ManagerFeed>> {
+        self.feed.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Adds `event` to the manager's chat feed, if there is one.
+    pub fn feed_push(&self, event: ChatEvent) {
+        if let Some(feed) = self.feed() {
+            feed.push(event);
+        }
+    }
+
+    /// A notice line for the feed, as plain text (no ANSI styling).
+    pub fn feed_notice(&self, level: NoticeLevel, code: Option<&str>, text: &str) {
+        if let Some(feed) = self.feed() {
+            feed.push(ChatEvent::notice(level, code, &rpi_tui::strip_ansi(text)));
+        }
     }
 
     /// Shows or hides pi's working spinner in the editor's top border.

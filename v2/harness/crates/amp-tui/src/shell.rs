@@ -580,6 +580,10 @@ pub struct Shell {
     screen: Option<(usize, usize)>,
     /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
     history: PromptHistory,
+    /// The running prompt's run id in the manager feed (#2370).
+    run_id: Option<String>,
+    /// The worker chips last sent to the manager feed (#2370).
+    fed_workers: Option<amp_core::chat_event::ChatEvent>,
 }
 
 impl Shell {
@@ -642,9 +646,31 @@ impl Shell {
                 running_seen: Default::default(),
                 screen: None,
                 history: PromptHistory::new(),
+                run_id: None,
+                fed_workers: None,
             },
             done_rx,
         )
+    }
+
+    /// Sends the chat to the manager's feed (#2370): prompts with their origin, run starts and
+    /// outcomes, every notice line, approval refusals and the worker chips. The session's rpi
+    /// events reach the feed through its fan-out emitter, not through the shell.
+    pub fn set_feed(&mut self, feed: Option<Arc<amp_core::manager_feed::ManagerFeed>>) {
+        self.view.set_feed(feed);
+        self.fed_workers = None;
+    }
+
+    /// Sends a prompt to the agent as a user turn, never as a slash command (#2370: the remote
+    /// link's way in). False, and nothing is sent, while a run or a server switch is going on.
+    pub fn send_prompt(&mut self, text: &str, origin: amp_core::chat_event::PromptOrigin) -> bool {
+        let text = text.trim();
+        if text.is_empty() || self.running || self.switching {
+            return false;
+        }
+        self.view.add_user(text);
+        self.start_run_from(text.to_owned(), origin);
+        true
     }
 
     pub fn view(&self) -> &ChatView {
@@ -1351,6 +1377,15 @@ impl Shell {
                 refusal.ticket_id = call_ticket;
             }
             let snapshot = self.meta.as_ref().map(|m| m.snapshot());
+            let line = match &refusal.link {
+                Some(link) => format!("{} ({link})", refusal.message),
+                None => refusal.message.clone(),
+            };
+            self.view.feed_notice(
+                amp_core::chat_event::NoticeLevel::Warn,
+                Some("approval_refused"),
+                &line,
+            );
             self.view
                 .add_to_transcript(Arc::new(ApprovalNotice::new(refusal, snapshot.as_deref())));
         }
@@ -1438,9 +1473,29 @@ impl Shell {
     }
 
     fn start_run(&mut self, prompt: String) {
+        self.start_run_from(prompt, amp_core::chat_event::PromptOrigin::Local);
+    }
+
+    fn start_run_from(&mut self, prompt: String, origin: amp_core::chat_event::PromptOrigin) {
         self.refresh_pending_plan();
         self.running = true;
         self.prompts += 1;
+        if self.view.feed().is_some() {
+            let prompt_id = format!("p_{}", self.prompts);
+            let run_id = format!("run_{}", self.prompts);
+            self.view
+                .feed_push(amp_core::chat_event::ChatEvent::user_message(
+                    prompt_id.clone(),
+                    &prompt,
+                    &origin,
+                ));
+            self.view
+                .feed_push(amp_core::chat_event::ChatEvent::RunStart {
+                    run_id: run_id.clone(),
+                    prompt_id,
+                });
+            self.run_id = Some(run_id);
+        }
         self.view.take_error_shown();
         self.view.set_working(true);
         let harness = Arc::clone(&self.harness);
@@ -1491,6 +1546,39 @@ impl Shell {
         self.view.set_stopping(false);
         // The reply's error line already says what went wrong: say it once (#2207).
         let error_shown = self.view.take_error_shown();
+        if let Some(run_id) = self.run_id.take() {
+            use amp_core::chat_event::{ChatEvent, RunOutcome};
+            let (outcome, error) = match &result {
+                Ok(r) => match &r.outcome {
+                    HarnessRunOutcome::Completed { .. } => (RunOutcome::Completed, None),
+                    HarnessRunOutcome::Aborted { .. } => (RunOutcome::Aborted, None),
+                    HarnessRunOutcome::Failed { .. } if stopping => (RunOutcome::Aborted, None),
+                    HarnessRunOutcome::Failed {
+                        error,
+                        final_message,
+                        ..
+                    } => (
+                        RunOutcome::Failed,
+                        Some(amp_core::provider_error::run_failure(
+                            &error.code,
+                            &error.message,
+                            final_message.as_ref().map_or("", |m| m.provider.as_str()),
+                        )),
+                    ),
+                    HarnessRunOutcome::Suspended { .. } => (RunOutcome::Suspended, None),
+                },
+                Err(_) if stopping => (RunOutcome::Aborted, None),
+                Err(e) => (
+                    RunOutcome::Failed,
+                    Some(amp_core::provider_error::summarize("", e)),
+                ),
+            };
+            self.view.feed_push(ChatEvent::RunEnd {
+                run_id,
+                outcome,
+                error,
+            });
+        }
         match result {
             Ok(r) => match r.outcome {
                 HarnessRunOutcome::Completed { .. } => {}
@@ -3088,6 +3176,23 @@ impl Shell {
         for e in entries.values_mut() {
             if e.name.is_empty() {
                 e.name = self.ticket_name(e.task_id);
+            }
+        }
+        // #2370: the chips in the manager feed, when they changed.
+        if self.view.feed().is_some() {
+            let chips = amp_core::chat_event::ChatEvent::worker_status(&sessions, |id| {
+                entries
+                    .get(&id)
+                    .map(|e| e.name.clone())
+                    .filter(|n| !n.is_empty())
+            });
+            if self.fed_workers.as_ref() != Some(&chips) {
+                let empty_first = self.fed_workers.is_none()
+                    && matches!(&chips, amp_core::chat_event::ChatEvent::WorkerStatus { workers } if workers.is_empty());
+                if !empty_first {
+                    self.view.feed_push(chips.clone());
+                }
+                self.fed_workers = Some(chips);
             }
         }
         // Started and finished notices in the manager's transcript.
