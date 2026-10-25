@@ -144,7 +144,9 @@ Flags beat env, env beats the file (`$XDG_CONFIG_HOME` is honoured). A relative 
 to the config file. Which config file and directory are used is described in
 [Where configuration lives](#where-configuration-lives-2232). `.amp.json` is a project marker only; its `amp_api` is not read. The web UI
 setting only changes links (`/open`, the header's host): set it when the UI is not served from the
-MCP origin, as on docker compose (`AMP_WEB_URL=http://localhost:5173`).
+MCP origin, as on docker compose (`AMP_WEB_URL=http://localhost:5173`). The file's `web_url` belongs to
+the file's `url`: when `--url` or `AMP_MCP_URL` names another server, it is not used (#2380), so
+`--url https://amp.local/mcp` with a compose config gets links on `https://amp.local`.
 
 ```toml
 [server]
