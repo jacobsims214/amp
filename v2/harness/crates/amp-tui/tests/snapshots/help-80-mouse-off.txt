@@ -9,6 +9,7 @@
    /project [id]            the project and its board; switch to another
    /open [id|plan]          open the ticket (or the plan) in the browser
    /server [name|address]   the AMP servers; switch to another
+   /remote [on|off|pair]    chat from AMP on a phone; /remote devices too
  Config
    /model [p/m|roles|role]  this chat's model; /model roles: every role's
    /connect [provider]      model providers and their keys; add a key
