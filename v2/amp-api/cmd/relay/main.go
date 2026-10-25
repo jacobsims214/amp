@@ -7,14 +7,20 @@
 // harness.
 //
 // It shares the database with amp-api but never migrates it: it waits until
-// amp-api has applied the remote control migration. It joins the replica
+// amp-api has applied the remote control migration. In Kubernetes it connects
+// as its own least-privilege role (amp_relay, #2392), which amp-api grants
+// only what the relay uses (repository.GrantRelayRole): it never provisions
+// users (its verifier is lookup-only) and can't read amp-api's cluster token. It joins the replica
 // group (api_nodes) so its replicas can find each other and amp-api can reach
 // it (POST /internal/relay/ctl/end when an org turns remote control off); it
 // never runs project actors.
 //
 // Environment (the same names amp-api uses):
 //
-//	DATABASE_URL                 Postgres
+//	DATABASE_URL                 Postgres (the amp_relay role in Kubernetes)
+//	RELAY_CLUSTER_TOKEN          the relay's own cluster token (>= 32 chars), shared
+//	                             with amp-api's calls to it; default: its own
+//	                             cluster_settings row (needs amp-api's role)
 //	RELAY_ADDR                   public listener (default :3002)
 //	CLUSTER_ADDR                 internal listener (default :3003)
 //	CLUSTER_ADVERTISE_ADDR       how other replicas reach it (default host:port)
@@ -43,6 +49,7 @@ import (
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/cluster"
 	"github.com/simstech/amp-api/internal/relay"
+	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/relayserver"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/service"
@@ -87,6 +94,8 @@ func run() error {
 
 	// The same verifiers amp-api builds: the harness's OAuth token is checked
 	// for the MCP audience (as /mcp does), the browser's for the REST ones.
+	// Lookup-only: the person is already an AMP user (amp-api provisions on
+	// sign-in); the relay never writes users or reads API tokens.
 	uiClientID := os.Getenv("UI_CLIENT_ID")
 	if uiClientID == "" {
 		if auds := splitList(os.Getenv("REST_AUDIENCES")); len(auds) > 0 {
@@ -99,6 +108,7 @@ func run() error {
 		BootstrapAdmin: os.Getenv("BOOTSTRAP_ADMIN_EMAILS"),
 		Repo:           repo,
 		UIClientID:     uiClientID,
+		LookupOnly:     true,
 	})
 	if err != nil {
 		return fmt.Errorf("auth verifier: %w", err)
@@ -117,7 +127,13 @@ func run() error {
 		host, _ := os.Hostname()
 		advertise = host + internalAddr[strings.LastIndex(internalAddr, ":"):]
 	}
-	node, err := cluster.Join(ctx, repo, cluster.Options{Addr: advertise})
+	// The relay's own cluster token, never amp-api's: relay replicas use it
+	// with each other and amp-api uses it to reach them (relayctl).
+	token, err := relayctl.Token(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("relay cluster token (set %s): %w", relayctl.TokenEnv, err)
+	}
+	node, err := cluster.Join(ctx, repo, cluster.Options{Addr: advertise, Token: token, NoProjects: true})
 	if err != nil {
 		return fmt.Errorf("joining the replica group: %w", err)
 	}

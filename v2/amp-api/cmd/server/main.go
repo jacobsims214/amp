@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -80,6 +81,13 @@ func main() {
 	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		slog.Error("migration failed", "err", err)
 		os.Exit(1)
+	}
+	// amp-relay's own least-privilege database role (#2392): when the chart
+	// names it (RELAY_DB_ROLE), grant it exactly what the relay uses, now
+	// that the tables are current. The role may not exist yet (the operator
+	// creates it), so keep trying in the background.
+	if role := strings.TrimSpace(os.Getenv("RELAY_DB_ROLE")); role != "" {
+		go grantRelayRole(ctx, repo, role)
 	}
 
 	// Who may become an AMP user by signing in (e.g. through an SSO
@@ -348,6 +356,12 @@ func main() {
 	// is only the signal that a relay is deployed. Sessions an org admin ends
 	// here are closed on the relay replica holding them, over its internal
 	// listener (relayctl); with no relay running there is nothing to close.
+	// amp-relay's internal listener takes the relay cluster token
+	// (RELAY_CLUSTER_TOKEN, else its own database row), never amp-api's.
+	if _, err := relayctl.ConfiguredToken(); err != nil {
+		slog.Error("relay cluster token", "err", err)
+		os.Exit(1)
+	}
 	remoteCfg := remoteConfig()
 	restHandler.SetRemoteControl(remoteCfg)
 	hookRelayEnds(restHandler.Service(), repo, node)
@@ -474,6 +488,32 @@ func apiMux(h *api.RestHandler) *http.ServeMux {
 
 // hookRelayEnds makes sessions svc ends (an org turning remote control off)
 // close on the amp-relay replica holding them.
+// grantRelayRole applies amp-relay's grants (repository.GrantRelayRole),
+// retrying until the role exists and the grants succeed, or ctx ends.
+func grantRelayRole(ctx context.Context, repo *repository.Repo, role string) {
+	wait := 5 * time.Second
+	for {
+		err := repo.GrantRelayRole(ctx, role)
+		if err == nil {
+			slog.Info("amp-relay's database role has its grants", "role", role)
+			return
+		}
+		if errors.Is(err, repository.ErrNoSuchRole) {
+			slog.Info("amp-relay's database role doesn't exist yet; trying again", "role", role, "in", wait)
+		} else {
+			slog.Warn("granting amp-relay's database role failed; trying again", "role", role, "err", err, "in", wait)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		if wait < 2*time.Minute {
+			wait *= 2
+		}
+	}
+}
+
 func hookRelayEnds(svc *service.Service, repo *repository.Repo, node *cluster.Node) {
 	ttl := time.Duration(0)
 	if node != nil {

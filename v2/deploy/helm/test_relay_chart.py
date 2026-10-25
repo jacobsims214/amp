@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """Helm template tests for the remote control relay (epic 165, AMP #2387).
 
+Least privilege (#2392): amp-relay connects as its own CloudNativePG managed
+role (amp_relay, Secret amp-relay-db), never with amp-api's app credentials;
+it and amp-api share the relay's own cluster token (Secret
+amp-relay-cluster-token); amp-api names the role to grant (RELAY_DB_ROLE); and
+a NetworkPolicy admits :3002 only from Envoy and :3003 only from amp-relay and
+amp-api.
+
 relay.enabled=false must render nothing relay-related: no amp-relay
 Deployment, Service or PodDisruptionBudget, no Envoy amp_relay cluster, and
 no /relay/ or /api/sessions route (amp-api serves neither, so those paths
@@ -90,6 +97,87 @@ def first_match(routes, path):
     return None
 
 
+def has_env(dep, name):
+    return any(e["name"] == name for e in dep["spec"]["template"]["spec"]["containers"][0]["env"])
+
+
+def env_secret(dep, name):
+    """(secret name, key) an env var comes from, or None."""
+    for e in dep["spec"]["template"]["spec"]["containers"][0]["env"]:
+        if e["name"] == name:
+            ref = e.get("valueFrom", {}).get("secretKeyRef")
+            return (ref["name"], ref["key"]) if ref else None
+    return None
+
+
+def secret_refs(dep):
+    """Every Secret a Deployment's containers read (env and envFrom)."""
+    out = set()
+    for c in dep["spec"]["template"]["spec"]["containers"] + dep["spec"]["template"]["spec"].get("initContainers", []):
+        for e in c.get("env", []):
+            ref = e.get("valueFrom", {}).get("secretKeyRef")
+            if ref:
+                out.add(ref["name"])
+        for ef in c.get("envFrom", []):
+            if "secretRef" in ef:
+                out.add(ef["secretRef"]["name"])
+    for v in dep["spec"]["template"]["spec"].get("volumes", []):
+        if "secret" in v:
+            out.add(v["secret"]["secretName"])
+    return out
+
+
+def test_least_privilege(docs, label, db_secret="amp-relay-db", tok_secret="amp-relay-cluster-token", role="amp_relay",
+                         chart_secrets=True):
+    """#2392: the relay's own DB role and cluster token; amp-api's credentials not mounted in amp-relay."""
+    relay = find(docs, "Deployment", "amp-relay")[0]
+    api = find(docs, "Deployment", "amp-api")[0]
+    refs = secret_refs(relay)
+    check("amp-postgres-app" not in refs, f"{label}: amp-relay mounts amp-api's database Secret amp-postgres-app")
+    check(refs <= {db_secret, tok_secret}, f"{label}: amp-relay reads unexpected Secrets {sorted(refs - {db_secret, tok_secret})}")
+    check(env_secret(relay, "PGUSER") == (db_secret, "username"), f"{label}: amp-relay PGUSER from {env_secret(relay, 'PGUSER')}")
+    check(env_secret(relay, "PGPASSWORD") == (db_secret, "password"), f"{label}: amp-relay PGPASSWORD from {env_secret(relay, 'PGPASSWORD')}")
+    check(env_secret(relay, "RELAY_CLUSTER_TOKEN") == (tok_secret, "token"), f"{label}: amp-relay RELAY_CLUSTER_TOKEN")
+    check(env_secret(api, "RELAY_CLUSTER_TOKEN") == (tok_secret, "token"), f"{label}: amp-api RELAY_CLUSTER_TOKEN")
+    check(env_secret(api, "PGUSER") == ("amp-postgres-app", "username"), f"{label}: amp-api must keep its own DB role")
+    check(amp_api_env(docs, "RELAY_DB_ROLE") == role, f"{label}: amp-api RELAY_DB_ROLE {amp_api_env(docs, 'RELAY_DB_ROLE')}")
+    cnpg = find(docs, "Cluster", "amp-postgres")[0]
+    roles = cnpg["spec"].get("managed", {}).get("roles", [])
+    check(len(roles) == 1 and roles[0]["name"] == role, f"{label}: managed roles {roles}")
+    if roles:
+        r = roles[0]
+        check(r["login"] is True and r["ensure"] == "present", f"{label}: relay role must log in")
+        for flag in ("superuser", "createdb", "createrole", "replication", "bypassrls"):
+            check(r.get(flag) is False, f"{label}: relay role {flag} must be false")
+        check(r["passwordSecret"]["name"] == db_secret, f"{label}: relay role password Secret {r['passwordSecret']}")
+    sec = find(docs, "Secret", "amp-relay-db")
+    tok = find(docs, "Secret", "amp-relay-cluster-token")
+    if chart_secrets:
+        check(len(sec) == 1 and sec[0]["type"] == "kubernetes.io/basic-auth", f"{label}: amp-relay-db must be a basic-auth Secret")
+        if sec:
+            check(sec[0]["stringData"]["username"] == role, f"{label}: amp-relay-db username")
+            check(len(sec[0]["stringData"]["password"]) >= 32, f"{label}: amp-relay-db password too short")
+        check(len(tok) == 1 and len(tok[0]["stringData"]["token"]) >= 32, f"{label}: amp-relay-cluster-token")
+    else:
+        check(not sec and not tok, f"{label}: existingSecret set but the chart still makes the Secrets")
+    np = find(docs, "NetworkPolicy", "amp-relay")
+    check(len(np) == 1, f"{label}: no amp-relay NetworkPolicy")
+    if np:
+        spec = np[0]["spec"]
+        check(spec["podSelector"]["matchLabels"] == {"app": "amp-relay"}, f"{label}: NetworkPolicy selects {spec['podSelector']}")
+        check(spec["policyTypes"] == ["Ingress"], f"{label}: NetworkPolicy types {spec['policyTypes']}")
+        allowed = {}
+        for rule in spec["ingress"]:
+            ports = tuple(sorted(p["port"] for p in rule["ports"]))
+            apps = sorted(f["podSelector"]["matchLabels"]["app"] for f in rule["from"])
+            allowed[ports] = apps
+        check(allowed == {(3002,): ["envoy"], (3003,): ["amp-api", "amp-relay"]}, f"{label}: NetworkPolicy ingress {allowed}")
+        # The labels the policy names are the ones the pods carry.
+        for app in ("envoy", "amp-api", "amp-relay"):
+            d = find(docs, "Deployment", app)
+            check(d and d[0]["spec"]["template"]["metadata"]["labels"].get("app") == app, f"{label}: pod label app={app}")
+
+
 def ext_authz_disabled(r):
     return r.get("typed_per_filter_config", {}).get("envoy.filters.http.ext_authz", {}).get("disabled") is True
 
@@ -104,6 +192,13 @@ def test_off(args, label):
     for kind in ("Deployment", "Service", "PodDisruptionBudget"):
         check(not find(docs, kind, "amp-relay"), f"{label}: relay off renders {kind} amp-relay")
     check(amp_api_env(docs, "RELAY_ENABLED") == "false", f"{label}: amp-api RELAY_ENABLED should be \"false\"")
+    for name in ("RELAY_DB_ROLE", "RELAY_CLUSTER_TOKEN"):
+        check(not has_env(find(docs, "Deployment", "amp-api")[0], name), f"{label}: relay off still sets amp-api {name}")
+    check(not find(docs, "NetworkPolicy", "amp-relay"), f"{label}: relay off renders a NetworkPolicy")
+    for sec in ("amp-relay-db", "amp-relay-cluster-token"):
+        check(not find(docs, "Secret", sec), f"{label}: relay off renders Secret {sec}")
+    cnpg = find(docs, "Cluster", "amp-postgres")
+    check(cnpg and "managed" not in cnpg[0]["spec"], f"{label}: relay off still declares a managed role")
     _, routes = amp_routes(ev)
     for listener, rs in routes:
         for p in ("/relay/v1/sessions", "/api/sessions", "/api/sessions/rs_x/events"):
@@ -128,6 +223,7 @@ def test_on(args, label, replicas=2):
             check(k in env, f"{label}: amp-relay env {k} missing")
         check("RELAY_ENABLED" not in env, f"{label}: amp-relay doesn't need RELAY_ENABLED")
     check(amp_api_env(docs, "RELAY_ENABLED") == "true", f"{label}: amp-api RELAY_ENABLED should be \"true\" (capability)")
+    test_least_privilege(docs, label)
     ev = envoy_config(docs)
     cfg, routes = amp_routes(ev)
     clusters = {c["name"]: c for c in cfg["static_resources"]["clusters"]}
@@ -196,6 +292,19 @@ def main():
     configs["on-prod"] = test_on(["-f", os.path.join(CHART, "values-production.yaml")], "production")
     configs["on-tls-off"] = test_on(["--set", "global.tls.enabled=false"], "tls-off")
     configs["on-1-replica"] = test_on(["--set", "relay.replicas=1"], "1 replica", replicas=1)
+    # Secrets you manage instead of the chart's; the NetworkPolicy can be off.
+    _, docs = render("--set", "relay.enabled=true", "--set", "relay.database.existingSecret=my-relay-db",
+                     "--set", "relay.clusterToken.existingSecret=my-relay-token", "--set", "relay.database.role=relay_ro")
+    test_least_privilege(docs, "existing secrets", db_secret="my-relay-db", tok_secret="my-relay-token", role="relay_ro",
+                         chart_secrets=False)
+    _, docs = render("--set", "relay.enabled=true", "--set", "relay.networkPolicy.enabled=false")
+    check(not find(docs, "NetworkPolicy", "amp-relay"), "networkPolicy.enabled=false still renders it")
+    # Pinned values (ArgoCD) are used as given.
+    _, docs = render("--set", "relay.enabled=true", "--set", "global.secretOverrides.relayDbPassword=" + "p" * 40,
+                     "--set", "global.secretOverrides.relayClusterToken=" + "t" * 40)
+    sec, tok = find(docs, "Secret", "amp-relay-db"), find(docs, "Secret", "amp-relay-cluster-token")
+    check(sec and sec[0]["stringData"]["password"] == "p" * 40, "secretOverrides.relayDbPassword not used")
+    check(tok and tok[0]["stringData"]["token"] == "t" * 40, "secretOverrides.relayClusterToken not used")
     if "--envoy-validate" in sys.argv:
         for label, ev in configs.items():
             envoy_validate(label, ev)

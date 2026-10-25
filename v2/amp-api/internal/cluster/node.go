@@ -48,6 +48,15 @@ type Options struct {
 	// FenceAfter is how long without a successful heartbeat before the node
 	// stops serving its projects (default 6s). It must be well under TTL.
 	FenceAfter time.Duration
+	// Token, when set, is the token this node's internal calls use, instead
+	// of amp-api's own cluster token from the database. amp-relay sets its
+	// relay token (RELAY_CLUSTER_TOKEN, #2392): it never holds amp-api's.
+	Token string
+	// NoProjects marks a replica that never runs project actors (amp-relay):
+	// it can't claim projects, and it touches only its own api_nodes row
+	// (no pruning, no project_owners), which is all its database role
+	// allows.
+	NoProjects bool
 }
 
 func (o *Options) defaults() {
@@ -95,9 +104,12 @@ func Join(ctx context.Context, repo *repository.Repo, opts Options) (*Node, erro
 	if opts.FenceAfter >= opts.TTL {
 		return nil, fmt.Errorf("cluster: FenceAfter (%s) must be less than TTL (%s)", opts.FenceAfter, opts.TTL)
 	}
-	tok, err := repo.ClusterToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("cluster token: %w", err)
+	tok := opts.Token
+	if tok == "" {
+		var err error
+		if tok, err = repo.ClusterToken(ctx); err != nil {
+			return nil, fmt.Errorf("cluster token: %w", err)
+		}
 	}
 	n := &Node{repo: repo, opts: opts, token: tok, log: slog.Default().With("component", "cluster", "node", opts.ID)}
 	if err := n.beat(ctx); err != nil {
@@ -139,6 +151,9 @@ func (n *Node) OnFence(fn func()) {
 // already is. It returns "" when this replica owns the project, or the
 // owner's address.
 func (n *Node) Claim(ctx context.Context, projectID int) (string, error) {
+	if n.opts.NoProjects {
+		return "", fmt.Errorf("this replica doesn't run projects")
+	}
 	if !n.Alive() {
 		return "", fmt.Errorf("this replica can't reach the database to keep its claims")
 	}
@@ -177,6 +192,9 @@ func (n *Node) Run(ctx context.Context) {
 		case <-check.C:
 			n.checkFence()
 		case <-prune.C:
+			if n.opts.NoProjects {
+				continue // amp-api's replicas prune
+			}
 			if err := n.repo.PruneNodes(ctx, time.Hour); err != nil && ctx.Err() == nil {
 				n.log.Warn("pruning old replicas failed", "err", err)
 			}
@@ -218,5 +236,8 @@ func (n *Node) checkFence() {
 // others take its projects over immediately. Call it after the replica has
 // stopped serving.
 func (n *Node) Leave(ctx context.Context) error {
+	if n.opts.NoProjects {
+		return n.repo.RemoveRelayNode(ctx, n.opts.ID)
+	}
 	return n.repo.RemoveNode(ctx, n.opts.ID)
 }

@@ -51,15 +51,16 @@ spec:
           securityContext:
             {{- include "amp.containerSecurityContext" . | nindent 12 }}
           env:
-            # The same database as amp-api (the chart has one app role; a
-            # least-privilege relay role is a follow-up). amp-relay never
-            # migrates: it waits for amp-api's remote control migration.
+            # The same database as amp-api, as the relay's own least-privilege
+            # role (#2392), never amp-api's: amp-api grants it only what the
+            # relay uses. amp-relay never migrates: it waits for amp-api's
+            # remote control migration (and for those grants).
             - name: PGHOST
               value: "{{ .Values.cnpg.clusterName }}-rw.{{ .Values.global.namespace }}.svc.cluster.local"
             - name: PGUSER
-              valueFrom: { secretKeyRef: { name: {{ .Values.cnpg.clusterName }}-app, key: username } }
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayDbSecret" . }}, key: username } }
             - name: PGPASSWORD
-              valueFrom: { secretKeyRef: { name: {{ .Values.cnpg.clusterName }}-app, key: password } }
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayDbSecret" . }}, key: password } }
             - name: DATABASE_URL
               value: "postgres://$(PGUSER):$(PGPASSWORD)@$(PGHOST):5432/{{ .Values.cnpg.appDatabase }}?sslmode=require"
             - name: POD_IP
@@ -67,8 +68,11 @@ spec:
             - name: RELAY_ADDR
               value: ":3002"
             # Relay replicas pass a session's requests to the replica holding
-            # it on this port, and amp-api calls it to end sessions (cluster
-            # token). Not routed by Envoy.
+            # it on this port, and amp-api calls it to end sessions, with the
+            # relay's own cluster token. Not routed by Envoy; the
+            # NetworkPolicy below admits only amp-relay and amp-api.
+            - name: RELAY_CLUSTER_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayTokenSecret" . }}, key: {{ .Values.relay.clusterToken.key }} } }
             - name: CLUSTER_ADDR
               value: ":3003"
             - name: CLUSTER_ADVERTISE_ADDR
@@ -141,5 +145,41 @@ spec:
   selector:
     matchLabels:
       app: amp-relay
+{{- end }}
+{{- if .Values.relay.networkPolicy.enabled }}
+---
+# Who may reach amp-relay's pods (#2392): the relay port only from Envoy (the
+# only way in from outside), the internal port (forwarded requests and
+# control calls, behind the relay cluster token) only from amp-relay's own
+# replicas and amp-api. Kubelet probes come from the node and aren't pod
+# traffic. Egress is not limited. Needs a CNI that enforces NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-relay
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-relay" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-relay
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 3002 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: amp-relay
+        - podSelector:
+            matchLabels:
+              app: amp-api
+      ports:
+        - { protocol: TCP, port: 3003 }
 {{- end }}
 {{- end }}
