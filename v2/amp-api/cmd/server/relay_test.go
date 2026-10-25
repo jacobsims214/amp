@@ -1403,6 +1403,12 @@ func TestRelay_NoContentPersistedOrLogged(t *testing.T) {
 		s.event(t, "chat_event", nil, map[string]any{"type": "user_message", "text": "prompt " + marker}),
 		s.event(t, "chat_event", nil, map[string]any{"type": "text_delta", "message_id": "m", "delta": "answer " + marker}),
 		s.event(t, "chat_event", nil, map[string]any{"type": "tool_end", "text": "output " + marker}),
+		// #2389: the relay stores the status's model and ticket, and nothing
+		// else from it (branch, project, members it doesn't know).
+		s.event(t, "status", nil, map[string]any{
+			"model": "model-safe", "busy": true, "ticket_id": 7, "ticket_name": "ticket-safe", "branch": "b " + marker,
+			"project": map[string]any{"id": 1, "name": "p " + marker}, "notes": "n " + marker,
+		}),
 	)
 	v.waitFor(t, "envelope", "tool_end")
 	s.pin(t, dev, e.clock.Now().Add(time.Hour)) // after the hello, whose device list would prune it
@@ -1449,6 +1455,11 @@ func TestRelay_NoContentPersistedOrLogged(t *testing.T) {
 			t.Fatalf("message content stored: %s matched %d rows", q, n)
 		}
 	}
+	var model, ticketName *string
+	if err := db.QueryRow(context.Background(), `SELECT model, current_ticket_name FROM remote_sessions WHERE id = $1`, s.id).
+		Scan(&model, &ticketName); err != nil || model == nil || *model != "model-safe" || ticketName == nil || *ticketName != "ticket-safe" {
+		t.Fatalf("status metadata not stored: %v %v %v", model, ticketName, err)
+	}
 	var n int
 	if err := db.QueryRow(context.Background(), `SELECT COUNT(*) FROM remote_sessions WHERE row_to_json(remote_sessions)::text LIKE $1`,
 		"%"+s.token+"%").Scan(&n); err != nil || n != 0 {
@@ -1457,6 +1468,136 @@ func TestRelay_NoContentPersistedOrLogged(t *testing.T) {
 	// The audit trail did record the prompt, as metadata.
 	if a := remoteAudit(t, e.w.s.repo, e.w.org.ID, domain.AuditRemotePrompt, s.id); len(a) != 1 || a[0].Details["sha256"] == nil {
 		t.Fatalf("remote.prompt: %+v", a)
+	}
+}
+
+// GET /api/sessions (#2389): live sessions first, then the caller's sessions
+// that ended in the last 7 days, each with its state, end reason, model,
+// devices and current ticket. Owner only.
+func TestRelay_SessionListHistory(t *testing.T) {
+	e := newRelayEnv(t, nil)
+	ctx := context.Background()
+	list := func(who string) []map[string]any {
+		t.Helper()
+		st, body, _ := e.do(t, "GET", "/api/sessions", nil, as(who))
+		if st != 200 {
+			t.Fatalf("%s's list: %d %v", who, st, body)
+		}
+		var out []map[string]any
+		for _, r := range body["sessions"].([]any) {
+			out = append(out, r.(map[string]any))
+		}
+		return out
+	}
+	status := func(s *rcSession, body map[string]any) {
+		t.Helper()
+		body["busy"] = false
+		s.mustPublish(t, s.event(t, "status", nil, body))
+	}
+
+	s1 := e.register(t, "alice")
+	s1.connect(t)
+	s1.mustPublish(t, s1.event(t, "hello", nil, map[string]any{
+		"harness": map[string]any{"harness_id": s1.harness.id, "harness_pub": s1.harness.pub, "host": "jacobs-mbp", "os": "macos", "version": "0.4.0"},
+		"user_id": 1, "ops": []any{"prompt", "stop", "detach"}, "started_at_ms": 1, "expires_at_ms": 2, "idle_timeout_s": 1800,
+		"status": map[string]any{"busy": false, "devices": []any{}, "model": "anthropic/claude-opus-5-5", "ticket_id": 4242, "ticket_name": "Ship the list"},
+	}))
+	rows := list("alice")
+	if len(rows) != 1 {
+		t.Fatalf("alice's list: %v", rows)
+	}
+	r := rows[0]
+	if r["session_id"] != s1.id || r["state"] != "active" || r["end_reason"] != nil || r["ended_at_ms"] != nil ||
+		r["model"] != "anthropic/claude-opus-5-5" || len(r["devices"].([]any)) != 0 {
+		t.Fatalf("live row: %v", r)
+	}
+	if tk := r["ticket"].(map[string]any); tk["id"] != float64(4242) || tk["name"] != "Ship the list" {
+		t.Fatalf("ticket from hello: %v", r["ticket"])
+	}
+
+	// A paired device shows with its pairing times.
+	dev := newRCKey(t)
+	until := e.clock.Now().Add(24 * time.Hour)
+	s1.pin(t, dev, until)
+	devs := list("alice")[0]["devices"].([]any)
+	if len(devs) != 1 {
+		t.Fatalf("devices: %v", devs)
+	}
+	d := devs[0].(map[string]any)
+	if d["device_id"] != dev.id || d["name"] != "Test browser" || d["expires_at_ms"] != float64(until.UnixMilli()) || d["paired_at_ms"] == nil {
+		t.Fatalf("device: %v", d)
+	}
+
+	// A status naming a ticket without its name gets the name from AMP; a
+	// status without a ticket clears it.
+	task, err := e.w.s.repo.CreateTask(ctx, domain.CreateTaskRequest{
+		ProjectID: e.w.s.projectID, EpicID: e.w.s.epicID, StoryID: e.w.s.storyID, Name: "Real ticket", Priority: "1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	status(s1, map[string]any{"model": "openai/gpt-x", "ticket_id": task.ID})
+	r = list("alice")[0]
+	if tk, _ := r["ticket"].(map[string]any); r["model"] != "openai/gpt-x" || tk == nil || tk["id"] != float64(task.ID) || tk["name"] != "Real ticket" {
+		t.Fatalf("after status: %v", r)
+	}
+	status(s1, map[string]any{"model": nil, "ticket_id": nil})
+	if r = list("alice")[0]; r["model"] != nil || r["ticket"] != nil {
+		t.Fatalf("after a status without model or ticket: %v", r)
+	}
+
+	// An ended session stays listed, after the live ones, with its reason.
+	s2 := e.register(t, "alice")
+	if st, _, _ := e.do(t, "POST", "/api/sessions/"+s2.id+"/disconnect", nil, as("alice")); st != 204 {
+		t.Fatalf("disconnect: %d", st)
+	}
+	rows = list("alice")
+	if len(rows) != 2 || rows[0]["session_id"] != s1.id || rows[1]["session_id"] != s2.id {
+		t.Fatalf("alice's list after an end: %v", rows)
+	}
+	if r = rows[1]; r["state"] != "ended" || r["end_reason"] != "disconnected" || r["ended_at_ms"] == nil || r["online"] != false {
+		t.Fatalf("ended row: %v", r)
+	}
+	// It stays 410 on its own URL.
+	st, body, _ := e.do(t, "GET", "/api/sessions/"+s2.id, nil, as("alice"))
+	wantStatus(t, "ended session", st, body, 410, "session_ended")
+
+	// Owner only: bob's sessions, live or ended, are his alone.
+	b := e.register(t, "bob")
+	if st, _, _ := e.do(t, "POST", "/api/sessions/"+b.id+"/disconnect", nil, as("bob")); st != 204 {
+		t.Fatalf("bob's disconnect: %d", st)
+	}
+	if rows = list("bob"); len(rows) != 1 || rows[0]["session_id"] != b.id {
+		t.Fatalf("bob's list: %v", rows)
+	}
+	for _, who := range []string{"orgadmin", "owner", "root", "outsider"} {
+		if rows := list(who); len(rows) != 0 {
+			t.Fatalf("%s sees %v", who, rows)
+		}
+	}
+	if rows = list("alice"); len(rows) != 2 {
+		t.Fatalf("alice sees bob's session: %v", rows)
+	}
+
+	// Sessions that ended more than 7 days ago drop out.
+	db, err := pgx.Connect(ctx, testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	if _, err := db.Exec(ctx, `UPDATE remote_sessions SET ended_at = NOW() - interval '8 days' WHERE id = $1`, s2.id); err != nil {
+		t.Fatal(err)
+	}
+	if rows = list("alice"); len(rows) != 1 || rows[0]["session_id"] != s1.id {
+		t.Fatalf("an 8-day-old session is still listed: %v", rows)
+	}
+	// An ended session's metadata no longer changes.
+	late := "late-model"
+	if err := e.w.s.repo.SetRemoteStatusMeta(ctx, s2.id, domain.RemoteStatusMeta{Model: &late}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := e.w.s.repo.GetRemoteSession(ctx, s2.id); err != nil || got.Model != nil {
+		t.Fatalf("an ended session's model changed: %v %v", got, err)
 	}
 }
 

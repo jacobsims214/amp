@@ -66,7 +66,8 @@ flowchart LR
   the browser pinned from the pairing link. The relay can read the traffic, because it is TLS only, but it cannot
   forge, change or replay anything.
 - **The relay never stores payloads.** Events live only in a bounded in-memory buffer (section 11). Logs and
-  audit rows hold metadata only (D3).
+  audit rows hold metadata only (D3). The only members of a harness event the relay writes to Postgres are the
+  status's `model`, `ticket_id` and `ticket_name` (section 6.3), for the session list (section 8.3).
 
 ## 2. Identifiers and encodings
 
@@ -381,6 +382,7 @@ browser MUST ignore body members it doesn't know, because later v1 harnesses may
     "cost_usd_micros": 1834200,
     "project": {"id": 2, "name": "AMP"},
     "ticket_id": 2369,
+    "ticket_name": "RC-M1 amp-relay: sessions list",
     "branch": "remote-m1-2369",
     "queue_len": 0,
     "workers_running": 1,
@@ -391,7 +393,16 @@ browser MUST ignore body members it doesn't know, because later v1 harnesses may
 
 - `harness.harness_pub` MUST hash to `harness_id`. The browser checks this against its pin; the relay checks it
   against the registered key.
-- `status.project` is `{id, name}|null`. `ticket_id` and `branch` are nullable. `context_pct` is an integer
+- `status.project` is `{id, name}|null`. `ticket_id` and `branch` are nullable. `ticket_name` (string|null, the
+  current ticket's name; added by #2389) is optional within v1: a harness that predates it omits it, and the relay
+  then shows the ticket's name from AMP when the ticket is in the session's project.
+- **What the relay stores from a status** (#2389). From `hello.body.status` and from each `status` event, the relay
+  stores `model`, `ticket_id` and `ticket_name` on the session row (`remote_sessions.model`,
+  `current_ticket_id`, `current_ticket_name`) so that `GET /api/sessions` can list them, including for sessions
+  that have ended. It stores nothing else from the status, and nothing from any other event. A member that is
+  missing, null or of the wrong type is stored as null; `model` and `ticket_name` are trimmed and cut to 200
+  bytes; `ticket_name` is kept only with a positive `ticket_id`. A status after the session ended changes
+  nothing. `context_pct` is an integer
   0-100, or null. `devices` lists the devices **currently pinned at the harness** for this user. The relay uses it
   to reconcile its device table (section 7.6).
 - `host` and `os` are display strings ≤ 64 chars. `os` is one of `macos`, `linux`, `windows`.
@@ -729,16 +740,36 @@ audits `remote.disable` (or `remote.expire` for `idle` and `expired`). The harne
 
 #### `GET /api/sessions`
 
-The caller's own live sessions, newest first:
+The caller's own sessions: the live ones first (newest started first), then the ones that **ended in the last 7
+days** (most recently ended first, at most 100). Owner only, like every browser-leg call: nobody else's session
+appears, global admins and org owners included.
 
 ```json
 {"sessions": [{
   "session_id": "rs_…", "harness_id": "…", "harness_fp_display": "29CA-E6B5-00C2-66CB",
   "host": "jacobs-mbp", "os": "macos", "harness_version": "0.4.0",
   "project": {"id": 2, "name": "AMP"}, "online": true, "viewers": 1,
-  "started_at_ms": …, "expires_at_ms": …, "last_activity_at_ms": …, "protocol_version": 1
+  "started_at_ms": …, "expires_at_ms": …, "last_activity_at_ms": …, "protocol_version": 1,
+  "state": "active", "end_reason": null, "ended_at_ms": null,
+  "model": "anthropic/claude-opus-5-5",
+  "ticket": {"id": 2369, "name": "RC-M1 amp-relay: sessions list"},
+  "devices": [{"device_id": "…", "name": "Safari on iPhone", "paired_at_ms": …, "expires_at_ms": …}]
 }]}
 ```
+
+The members after `protocol_version` were added by #2389 (additive; a client that predates them ignores them):
+- `state` is `active` or `ended`. `end_reason` is the reason of section 12.2 for an ended session, else null, and
+  `ended_at_ms` is when it ended, else null. An ended session is always `online: false, viewers: 0`.
+- `model` is the last `status.model` the harness sent, or null (section 6.3).
+- `ticket` is `{id, name: string|null}` from the last status's `ticket_id` and `ticket_name`, or null when the
+  status named no ticket. When the harness sent no name, `name` is the ticket's name in AMP if the ticket is in
+  the session's project, else null.
+- `devices` lists the browsers paired with this **harness install** (pins are per harness, section 7.7) that are
+  neither revoked nor expired: `device_id`, `name`, `paired_at_ms`, `expires_at_ms`. For an ended session it is
+  that harness's current pins.
+
+`GET /api/sessions/:id/...` on an ended session stays `410 session_ended`; the list is the only place ended
+sessions show.
 
 #### `GET /api/sessions/:id`
 

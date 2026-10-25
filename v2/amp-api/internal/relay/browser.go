@@ -106,7 +106,9 @@ func (rl *Relay) ownSession(w http.ResponseWriter, r *http.Request, p authz.Prin
 }
 
 // sessionView is a session as GET /api/sessions shows it (metadata only).
-func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, names map[int]string, withPub bool) map[string]any {
+// devices maps harness_id to the devices paired with it; a harness missing
+// from it is looked up.
+func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, names map[int]string, devices map[string][]domain.RemoteDevice, withPub bool) map[string]any {
 	var project any
 	if name, ok := names[sess.ProjectID]; ok {
 		project = map[string]any{"id": sess.ProjectID, "name": name}
@@ -114,13 +116,41 @@ func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, na
 		names[sess.ProjectID] = proj.Name
 		project = map[string]any{"id": sess.ProjectID, "name": proj.Name}
 	}
-	online, viewers := rl.presence(ctx, sess)
+	online, viewers := false, 0
+	if sess.Active() {
+		online, viewers = rl.presence(ctx, sess)
+	}
+	devs, ok := devices[sess.HarnessID]
+	if !ok {
+		list, err := rl.repo.ListRemoteDevices(ctx, sess.OwnerUserID, sess.HarnessID)
+		if err != nil {
+			slog.Warn("listing remote devices failed", "session", sess.ID, "err", err)
+		}
+		devs = list
+	}
+	devOut := make([]map[string]any, 0, len(devs))
+	for _, d := range devs {
+		devOut = append(devOut, map[string]any{
+			"device_id": d.DeviceID, "name": d.Name, "paired_at_ms": ms(d.PairedAt), "expires_at_ms": ms(d.ExpiresAt),
+		})
+	}
+	var ticket any
+	if sess.CurrentTicketID != nil {
+		ticket = map[string]any{"id": *sess.CurrentTicketID, "name": sess.CurrentTicketName}
+	}
+	var endedAt any
+	if sess.EndedAt != nil {
+		endedAt = ms(*sess.EndedAt)
+	}
 	v := map[string]any{
 		"session_id": sess.ID, "harness_id": sess.HarnessID, "harness_fp_display": FingerprintDisplay(sess.HarnessPub),
 		"host": sess.Host, "os": sess.OS, "harness_version": sess.HarnessVersion, "project": project,
 		"online": online, "viewers": viewers,
 		"started_at_ms": ms(sess.StartedAt), "expires_at_ms": ms(sess.ExpiresAt),
 		"last_activity_at_ms": ms(sess.LastActivityAt), "protocol_version": sess.ProtocolVersion,
+		// #2389, additive: state, end reason, model, devices and current ticket.
+		"state": sess.State, "end_reason": sess.EndReason, "ended_at_ms": endedAt,
+		"model": sess.Model, "ticket": ticket, "devices": devOut,
 	}
 	if withPub {
 		v["harness_pub"] = sess.HarnessPub
@@ -128,17 +158,34 @@ func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, na
 	return v
 }
 
-// listSessions is GET /api/sessions: the caller's own live sessions.
+// listSessions is GET /api/sessions: the caller's own live sessions, then
+// the ones that ended in the last 7 days (#2389).
 func (rl *Relay) listSessions(w http.ResponseWriter, r *http.Request, p authz.Principal) {
-	list, err := rl.repo.ListActiveRemoteSessions(r.Context(), p.UserID)
+	list, err := rl.repo.ListRecentRemoteSessions(r.Context(), p.UserID, domain.RemoteListEndedFor, domain.RemoteListEndedMax)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	devices := map[string][]domain.RemoteDevice{}
+	if len(list) > 0 {
+		all, err := rl.repo.ListRemoteDevices(r.Context(), p.UserID, "")
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		for _, s := range list {
+			devices[s.HarnessID] = nil // listed, even with no devices
+		}
+		for _, d := range all {
+			if _, ok := devices[d.HarnessID]; ok {
+				devices[d.HarnessID] = append(devices[d.HarnessID], d)
+			}
+		}
+	}
 	names := map[int]string{}
 	out := make([]map[string]any, 0, len(list))
 	for i := range list {
-		out = append(out, rl.sessionView(r.Context(), &list[i], names, false))
+		out = append(out, rl.sessionView(r.Context(), &list[i], names, devices, false))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sessions": out})
 }
@@ -149,7 +196,7 @@ func (rl *Relay) getSession(w http.ResponseWriter, r *http.Request, p authz.Prin
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, rl.sessionView(r.Context(), sess, map[int]string{}, true))
+	writeJSON(w, http.StatusOK, rl.sessionView(r.Context(), sess, map[int]string{}, nil, true))
 }
 
 // eventStream is GET /api/sessions/:id/events: replay from the buffer

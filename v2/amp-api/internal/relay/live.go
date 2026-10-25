@@ -134,6 +134,7 @@ type Live struct {
 	pairing  *pairingWindow
 	pending  map[string]pendingPair // device_id -> the forwarded request
 	devices  string                 // the last status.devices set reconciled
+	meta     string                 // the last status model/ticket stored (#2389)
 	prompts  *bucket                // 20/min, burst 5
 	ops      *bucket                // 120/min
 	attaches *bucket                // 20/min

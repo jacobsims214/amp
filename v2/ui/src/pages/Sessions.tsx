@@ -1,28 +1,41 @@
 /**
  * /sessions — every harness session of yours that is open for remote control, across all your
  * projects and orgs: where it runs, its project, whether the laptop is online, when it started,
- * its last activity and when it expires. Open one, disconnect it, or revoke them all.
+ * its last activity and when it expires, the model, the current ticket and the paired devices.
+ * Open one, disconnect it, or revoke them all. Sessions that ended in the last 7 days are listed
+ * below the live ones, with why they ended.
  *
- * The list comes from GET /api/sessions (protocol 8.3), which returns the caller's live sessions
- * only. Ended sessions, the model, the paired devices and the current ticket aren't in it; the
- * session page shows the last three once it's open.
+ * The list comes from GET /api/sessions (protocol 8.3). A relay that predates #2389 leaves out
+ * state, model, ticket and devices: every session it lists is live, and the facts it lacks show "—".
  */
 import { useCallback, useEffect, useState } from 'react'
-import { ExternalLink, MonitorSmartphone, RefreshCw, ShieldOff, Unplug } from 'lucide-react'
+import { ExternalLink, History, MonitorSmartphone, RefreshCw, ShieldOff, Unplug } from 'lucide-react'
+import { Link } from 'react-router-dom'
 import { PageHeader, Panel } from '../components/ui/PageHeader'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import { BandLoader } from '../components/brand/BandLoader'
 import { useAuth } from '../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
-import type { SessionSummary } from '../remote/types'
+import type { SessionDevice, SessionSummary } from '../remote/types'
 import { ago, inTime } from '../remote/toolText'
+import { endReasonLabel, endReasonText } from '../remote/session'
 
 const when = (ms: number) => new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 
-function StateBadge({ online }: { online: boolean }) {
+const isEnded = (s: SessionSummary) => s.state === 'ended'
+
+function StateBadge({ s }: { s: SessionSummary }) {
+  if (isEnded(s)) {
+    return (
+      <span className="inline-flex items-center gap-1.5 border border-line-str px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap text-ink-2"
+        title={endReasonText(s.end_reason ?? '')}>
+        <span className="w-1.5 h-1.5 rounded-full bg-current" aria-hidden="true" />Ended · {endReasonLabel(s.end_reason)}
+      </span>
+    )
+  }
   return (
-    <span className={`inline-flex items-center gap-1.5 border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${online ? 'border-success text-success-ink' : 'border-danger text-danger-ink'}`}>
-      <span className="w-1.5 h-1.5 rounded-full bg-current" aria-hidden="true" />{online ? 'Laptop online' : 'Laptop offline'}
+    <span className={`inline-flex items-center gap-1.5 border px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap ${s.online ? 'border-success text-success-ink' : 'border-danger text-danger-ink'}`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-current" aria-hidden="true" />{s.online ? 'Laptop online' : 'Laptop offline'}
     </span>
   )
 }
@@ -36,26 +49,63 @@ function Fact({ label, children, title }: { label: string; children: React.React
   )
 }
 
+function TicketFact({ s }: { s: SessionSummary }) {
+  const t = s.ticket
+  if (!t) return <Fact label="Ticket">—</Fact>
+  const text = t.name ? `#${t.id} ${t.name}` : `#${t.id}`
+  return (
+    <Fact label="Ticket" title={text}>
+      {s.project
+        ? <Link to={`/project/${s.project.id}/board?task=${t.id}`} className="text-link hover:underline">{text}</Link>
+        : text}
+    </Fact>
+  )
+}
+
+function DevicesFact({ devices, now }: { devices: SessionDevice[] | undefined; now: number }) {
+  if (devices == null) return <Fact label="Paired devices">—</Fact>
+  if (devices.length === 0) return <Fact label="Paired devices">None</Fact>
+  const title = devices.map(d => `${d.name || 'Unnamed browser'}: paired ${when(d.paired_at_ms)}, trusted until ${when(d.expires_at_ms)}`).join('\n')
+  return (
+    <Fact label={devices.length === 1 ? 'Paired device' : `Paired devices (${devices.length})`} title={title}>
+      {devices.map(d => d.name || 'Unnamed browser').join(', ')}
+      {devices.length === 1 && <span className="text-ink-3"> · {inTime(devices[0].expires_at_ms, now)}</span>}
+    </Fact>
+  )
+}
+
 function SessionRow({ s, now, onDisconnect, busy }: { s: SessionSummary; now: number; onDisconnect: () => void; busy: boolean }) {
+  const ended = isEnded(s)
   // A full page load (not client-side routing), so the session page gets its strict CSP header.
   const href = `/sessions/${encodeURIComponent(s.session_id)}`
   return (
-    <li className="px-4 py-3 border-t border-line first:border-t-0 grid gap-2.5" data-testid="session-row">
+    <li className="px-4 py-3 border-t border-line first:border-t-0 grid gap-2.5" data-testid={ended ? 'ended-session-row' : 'session-row'}>
       <div className="flex items-center gap-2.5 flex-wrap min-w-0">
-        <MonitorSmartphone size={18} className="text-ink shrink-0" aria-hidden="true" />
-        <a href={href} className="text-[14.5px] font-semibold text-ink hover:underline truncate min-w-0">{s.host}</a>
-        <StateBadge online={s.online} />
+        <MonitorSmartphone size={18} className={`${ended ? 'text-ink-3' : 'text-ink'} shrink-0`} aria-hidden="true" />
+        {ended
+          ? <span className="text-[14.5px] font-semibold text-ink-2 truncate min-w-0">{s.host}</span>
+          : <a href={href} className="text-[14.5px] font-semibold text-ink hover:underline truncate min-w-0">{s.host}</a>}
+        <StateBadge s={s} />
         <span className="text-[12px] text-ink-2 truncate min-w-0">{s.project ? `${s.project.name} #${s.project.id}` : 'no project'}</span>
-        <span className="ml-auto flex items-center gap-1.5">
-          <a href={href} className="amp-btn amp-btn-sm amp-btn-primary"><ExternalLink size={12} />Open</a>
-          <ConfirmButton label="Disconnect" confirmLabel="Disconnect now" icon={<Unplug size={12} />} busy={busy} onConfirm={onDisconnect} />
-        </span>
+        {!ended && (
+          <span className="ml-auto flex items-center gap-1.5">
+            <a href={href} className="amp-btn amp-btn-sm amp-btn-primary"><ExternalLink size={12} />Open</a>
+            <ConfirmButton label="Disconnect" confirmLabel="Disconnect now" icon={<Unplug size={12} />} busy={busy} onConfirm={onDisconnect} />
+          </span>
+        )}
       </div>
       <dl className="m-0 grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-x-4 gap-y-2">
+        <Fact label="Model" title={s.model ?? undefined}>{s.model ?? '—'}</Fact>
+        <TicketFact s={s} />
+        <DevicesFact devices={s.devices} now={now} />
         <Fact label="Started" title={when(s.started_at_ms)}>{ago(s.started_at_ms, now)}</Fact>
-        <Fact label="Last activity" title={when(s.last_activity_at_ms)}>{ago(s.last_activity_at_ms, now)}</Fact>
-        <Fact label="Expires" title={when(s.expires_at_ms)}>{inTime(s.expires_at_ms, now)}</Fact>
-        <Fact label="Watching">{s.viewers === 1 ? '1 browser' : `${s.viewers} browsers`}</Fact>
+        {ended
+          ? <Fact label="Ended" title={s.ended_at_ms ? when(s.ended_at_ms) : undefined}>{s.ended_at_ms ? ago(s.ended_at_ms, now) : '—'}</Fact>
+          : <Fact label="Last activity" title={when(s.last_activity_at_ms)}>{ago(s.last_activity_at_ms, now)}</Fact>}
+        {ended
+          ? <Fact label="Why" title={endReasonText(s.end_reason ?? '')}>{endReasonText(s.end_reason ?? '')}</Fact>
+          : <Fact label="Expires" title={when(s.expires_at_ms)}>{inTime(s.expires_at_ms, now)}</Fact>}
+        {!ended && <Fact label="Watching">{s.viewers === 1 ? '1 browser' : `${s.viewers} browsers`}</Fact>}
         <Fact label="Laptop">{s.os} · harness {s.harness_version}</Fact>
         <Fact label="Laptop key" title="Check it matches the key the harness prints">{s.harness_fp_display}</Fact>
       </dl>
@@ -110,35 +160,43 @@ export function Sessions() {
     )
   }
 
-  const online = sessions?.filter(s => s.online).length ?? 0
+  const live = sessions?.filter(s => !isEnded(s)) ?? null
+  const ended = sessions?.filter(isEnded) ?? []
+  const online = live?.filter(s => s.online).length ?? 0
   return (
     <div className="flex flex-col min-h-full bg-bg">
       <PageHeader crumb="Remote control" title="Sessions"
         meta={<>Harness sessions you opened with <code className="font-mono">/remote</code>, in every project and org.</>}
         actions={<>
           <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={() => load()} aria-label="Refresh"><RefreshCw size={12} />Refresh</button>
-          {!!sessions?.length && <ConfirmButton danger label="Revoke all" confirmLabel="End all and forget devices" icon={<ShieldOff size={12} />}
+          {!!live?.length && <ConfirmButton danger label="Revoke all" confirmLabel="End all and forget devices" icon={<ShieldOff size={12} />}
             busy={busy === 'all'} onConfirm={() => { revokeAll() }} />}
         </>} />
 
       <div className="px-4 sm:px-7 py-5 grid gap-4 max-w-[1100px]">
         {note && <p className="m-0 border-l-[3px] border-success bg-surface px-3 py-2 text-[13px] text-ink-2" role="status">{note}</p>}
         {error && <p className="m-0 border-l-[3px] border-danger bg-surface px-3 py-2 text-[13px] text-danger-ink" role="alert">{error}</p>}
-        <Panel label="Live" title={sessions == null ? 'Loading…' : sessions.length ? `${sessions.length} session${sessions.length === 1 ? '' : 's'}` : 'No live sessions'}
-          right={sessions?.length ? <span>{online} online · {sessions.length - online} offline</span> : undefined}>
+        <Panel label="Live" title={live == null ? 'Loading…' : live.length ? `${live.length} session${live.length === 1 ? '' : 's'}` : 'No live sessions'}
+          right={live?.length ? <span>{online} online · {live.length - online} offline</span> : undefined}>
           {sessions == null && !error && <div className="flex justify-center py-8"><BandLoader label="Loading sessions" /></div>}
-          {sessions?.length === 0 && (
+          {live?.length === 0 && (
             <p className="m-0 px-4 py-4 text-[13px] text-ink-2">Run <code className="font-mono">/remote</code> in the harness on your laptop, then open the link it prints on this device or your phone.</p>
           )}
-          {!!sessions?.length && (
+          {!!live?.length && (
             <ul className="m-0 p-0 list-none" aria-label="Sessions">
-              {sessions.map(s => <SessionRow key={s.session_id} s={s} now={now} busy={busy === s.session_id} onDisconnect={() => { disconnect(s.session_id) }} />)}
+              {live.map(s => <SessionRow key={s.session_id} s={s} now={now} busy={busy === s.session_id} onDisconnect={() => { disconnect(s.session_id) }} />)}
             </ul>
           )}
         </Panel>
+        {!!ended.length && (
+          <Panel label="Ended" title={`${ended.length} in the last 7 days`} right={<History size={13} aria-hidden="true" />}>
+            <ul className="m-0 p-0 list-none" aria-label="Ended sessions">
+              {ended.map(s => <SessionRow key={s.session_id} s={s} now={now} busy={false} onDisconnect={() => {}} />)}
+            </ul>
+          </Panel>
+        )}
         <p className="m-0 text-[12px] text-ink-3 max-w-[720px]">
-          Ended sessions aren't listed: AMP keeps only live ones here. The model, current ticket and paired devices show inside each session.
-          Disconnecting ends remote control; the session keeps running on the laptop.
+          Ended sessions stay listed for 7 days. Disconnecting ends remote control; the session keeps running on the laptop.
         </p>
       </div>
     </div>

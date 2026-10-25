@@ -50,7 +50,7 @@ import (
 )
 
 // schemaVersion is the amp-api migration the relay needs.
-const schemaVersion = "027_remote_control"
+const schemaVersion = "028_remote_session_meta"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", "amp-relay"))

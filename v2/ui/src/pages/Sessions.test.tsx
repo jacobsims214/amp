@@ -30,10 +30,28 @@ const other: SessionSummary = {
   os: 'linux', harness_version: '0.4.0', project: { id: 158, name: 'QA 2365 plan' }, online: false, viewers: 0,
   started_at_ms: Date.now() - 5 * 3_600_000, expires_at_ms: Date.now() + 7 * 3_600_000 + 10 * 60_000,
   last_activity_at_ms: Date.now() - 42 * 60_000, protocol_version: 1,
+  state: 'active', end_reason: null, ended_at_ms: null, model: 'openai/gpt-5.5', ticket: { id: 2389, name: 'Sessions list' },
+  devices: [{ device_id: 'd-pixel', name: 'Chrome on Pixel 9', paired_at_ms: Date.now() - 3 * 86_400_000, expires_at_ms: Date.now() + 27 * 86_400_000 + 60_000 }],
 }
 
-function setup(available = true) {
-  const relay = new MockRelay({ stepMs: 0, others: [{ ...other }] })
+const old: SessionSummary = {
+  session_id: 'rs_EndedSessionCCCCCCCCCC', harness_id: 'h3', harness_fp_display: '41B0-77E2-0C5A-D913', host: 'old-laptop',
+  os: 'macos', harness_version: '0.3.9', project: { id: 2, name: 'AMP' }, online: false, viewers: 0,
+  started_at_ms: Date.now() - 30 * 3_600_000, expires_at_ms: Date.now() - 18 * 3_600_000, last_activity_at_ms: Date.now() - 26 * 3_600_000,
+  protocol_version: 1, state: 'ended', end_reason: 'idle', ended_at_ms: Date.now() - 25 * 3_600_000, model: 'anthropic/claude-opus-5-5',
+  ticket: { id: 77, name: null }, devices: [],
+}
+
+/** A session as a relay from before #2389 lists it: no state, model, ticket or devices. */
+const legacy: SessionSummary = {
+  session_id: 'rs_LegacySessionDDDDDDDDD', harness_id: 'h4', harness_fp_display: '0000-1111-2222-3333', host: 'legacy-box',
+  os: 'linux', harness_version: '0.4.0', project: null, online: true, viewers: 1,
+  started_at_ms: Date.now() - 3_600_000, expires_at_ms: Date.now() + 11 * 3_600_000, last_activity_at_ms: Date.now(), protocol_version: 1,
+}
+
+function setup(available = true, others: SessionSummary[] = [{ ...other }]) {
+  const relay = new MockRelay({ stepMs: 0, others: others.map(o => ({ ...o })),
+    status: { model: 'anthropic/claude-opus-5-5', ticket_id: 2369, ticket_name: 'Remote control M1', devices: [{ device_id: 'd-1', name: 'Safari on iPhone' }] } })
   const deps: RemoteDeps = { transport: mockTransport(relay), crypto: mockCrypto(), mock: false }
   const view = render(
     <AuthContext.Provider value={{ me: me(available), loading: false, error: null, isAdmin: false }}>
@@ -56,7 +74,9 @@ describe('Sessions page', () => {
     expect(rows).toHaveLength(2)
     const [mine, box] = rows
     // Full page loads to the session page, so it gets its CSP header.
-    expect(within(mine).getAllByRole('link').every(a => a.getAttribute('href') === `/sessions/${MOCK_SESSION_ID}`)).toBe(true)
+    for (const name of ['jacobs-mbp', /Open/]) {
+      expect(within(mine).getByRole('link', { name })).toHaveAttribute('href', `/sessions/${MOCK_SESSION_ID}`)
+    }
     expect(within(mine).getByText('jacobs-mbp')).toBeInTheDocument()
     expect(within(mine).getByText('Laptop online')).toBeInTheDocument()
     expect(within(mine).getByText('AMP #2')).toBeInTheDocument()
@@ -67,7 +87,52 @@ describe('Sessions page', () => {
     expect(within(box).getByText('in 7h 10m')).toBeInTheDocument() // expires
     expect(within(box).getByText('linux · harness 0.4.0')).toBeInTheDocument()
     expect(within(box).getByText('8F1D-02AA-71C3-9E40')).toBeInTheDocument()
-    expect(screen.getByText(/Ended sessions aren't listed/)).toBeInTheDocument()
+    expect(screen.queryByText(/Ended sessions aren't listed/)).toBeNull()
+    expect(screen.getByText(/Ended sessions stay listed for 7 days/)).toBeInTheDocument()
+  })
+
+  it('shows the model, current ticket and paired devices of each session', async () => {
+    setup()
+    const [mine, box] = await screen.findAllByTestId('session-row')
+    expect(within(mine).getByText('anthropic/claude-opus-5-5')).toBeInTheDocument()
+    expect(within(mine).getByRole('link', { name: '#2369 Remote control M1' })).toHaveAttribute('href', '/project/2/board?task=2369')
+    expect(within(mine).getByText('Safari on iPhone')).toBeInTheDocument()
+    expect(within(box).getByText('openai/gpt-5.5')).toBeInTheDocument()
+    expect(within(box).getByRole('link', { name: '#2389 Sessions list' })).toHaveAttribute('href', '/project/158/board?task=2389')
+    expect(within(box).getByText('Chrome on Pixel 9')).toBeInTheDocument()
+    expect(within(box).getByText(/in 27d|in 648h/)).toBeInTheDocument() // the device's pin expiry
+    expect(within(box).getByText('Paired device').closest('div')).toHaveAttribute('title', expect.stringMatching(/^Chrome on Pixel 9: paired .*, trusted until /))
+  })
+
+  it('lists ended sessions of the last 7 days below the live ones, with why they ended', async () => {
+    setup(true, [{ ...other }, { ...old }])
+    await screen.findAllByTestId('session-row')
+    const endedList = screen.getByRole('list', { name: 'Ended sessions' })
+    const [row] = within(endedList).getAllByTestId('ended-session-row')
+    expect(screen.getAllByTestId('session-row')).toHaveLength(2)
+    expect(screen.getByText('1 in the last 7 days')).toBeInTheDocument()
+    expect(within(row).getByText('old-laptop')).toBeInTheDocument()
+    expect(within(row).getByText(/Ended · Idle timeout/)).toBeInTheDocument()
+    expect(within(row).getByText(/ended after 30 minutes without remote activity/)).toBeInTheDocument()
+    expect(within(row).getByText('Ended', { selector: 'dt' }).nextSibling).toHaveTextContent('1d ago')
+    expect(within(row).getByText('anthropic/claude-opus-5-5')).toBeInTheDocument()
+    expect(within(row).getByRole('link', { name: '#77' })).toBeInTheDocument() // a ticket AMP has no name for
+    expect(within(row).getByText('None')).toBeInTheDocument() // no paired devices
+    // An ended session can't be opened or disconnected.
+    expect(within(row).queryByRole('button', { name: /Disconnect/ })).toBeNull()
+    expect(within(row).queryByRole('link', { name: /Open/ })).toBeNull()
+    expect(within(row).queryByRole('link', { name: 'old-laptop' })).toBeNull()
+  })
+
+  it('reads a list from a relay that predates ended sessions', async () => {
+    setup(true, [{ ...legacy }])
+    const rows = await screen.findAllByTestId('session-row')
+    expect(rows).toHaveLength(2)
+    const row = rows[1]
+    expect(within(row).getByText('legacy-box')).toBeInTheDocument()
+    expect(within(row).getByText('Laptop online')).toBeInTheDocument()
+    expect(within(row).getAllByText('—')).toHaveLength(3) // model, ticket, devices
+    expect(screen.queryByRole('list', { name: 'Ended sessions' })).toBeNull()
   })
 
   it('disconnects one session after a confirm', async () => {
@@ -78,6 +143,10 @@ describe('Sessions page', () => {
     await user.click(within(rows[1]).getByRole('button', { name: 'Disconnect now' }))
     await waitFor(() => expect(screen.getAllByTestId('session-row')).toHaveLength(1))
     expect(screen.getByRole('status')).toHaveTextContent(/keeps running locally/)
+    // It moves to the ended list.
+    const [ended] = within(screen.getByRole('list', { name: 'Ended sessions' })).getAllByTestId('ended-session-row')
+    expect(within(ended).getByText('build-box')).toBeInTheDocument()
+    expect(within(ended).getByText(/Ended · Disconnected/)).toBeInTheDocument()
   })
 
   it('revokes all after a confirm', async () => {
@@ -89,6 +158,9 @@ describe('Sessions page', () => {
     await screen.findByText('No live sessions')
     expect(relay.ended).toBe('revoked')
     expect(screen.getByRole('status')).toHaveTextContent('Ended 2 sessions and forgot 1 paired device.')
+    expect(screen.getAllByTestId('ended-session-row')).toHaveLength(2)
+    expect(screen.getAllByText(/Ended · Revoked/)).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: /Revoke all/ })).toBeNull()
   })
 
   it('has no nav entry and no list when remote control is unavailable', async () => {
