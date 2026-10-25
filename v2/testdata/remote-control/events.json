@@ -1,0 +1,227 @@
+{
+  "_meta": {
+    "generator": "v2/testdata/remote-control/gen_vectors.py",
+    "protocol": "v2/docs/remote-control/protocol.md",
+    "protocol_version": 1
+  },
+  "description": "Harness -> browser events. Run each `wire` text through the browser's event check with `receiver` and expect `expect`: \"ok\", \"duplicate\" (drop silently), \"ignored_unknown_op\" (verified, seq advanced, not rendered) or a rejection code. Order: protocol.md 5.7. Events have no ts window (they can be replayed from the 10-minute buffer).",
+  "vectors": [
+    {
+      "name": "hello_valid",
+      "note": "The status snapshot sent at attach.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 41
+      },
+      "wire": "{\"sig\": \"MA5wuMBcnmsV4SCRaApuPohQWYBG7sgXih3gFCG5D3AgADCu1RMkJV4PLJiCMJvXCIlDUx7fkCOVgwf5iAZXAg\", \"body\": {\"harness\": {\"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"harness_pub\": \"BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8\", \"host\": \"jacobs-mbp\", \"os\": \"macos\", \"version\": \"0.4.0\"}, \"user_id\": 1001, \"ops\": [\"prompt\", \"stop\", \"detach\"], \"started_at_ms\": 1792945200000, \"expires_at_ms\": 1792988400000, \"idle_timeout_s\": 1800, \"status\": {\"model\": \"anthropic/claude-opus-5-5\", \"busy\": false, \"context_pct\": 37, \"cost_usd_micros\": 1834200, \"project\": {\"id\": 2, \"name\": \"AMP\"}, \"ticket_id\": 2369, \"branch\": \"remote-m1-2369\", \"queue_len\": 0, \"workers_running\": 1, \"devices\": [{\"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"name\": \"Safari on iPhone\"}]}}, \"op\": \"hello\", \"nonce\": \"FJlcdWvafwGiXolM7pfSBQ\", \"ts\": 1792948799200, \"seq\": 42, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"expires_at_ms\":1792988400000,\"harness\":{\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"harness_pub\":\"BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8\",\"host\":\"jacobs-mbp\",\"os\":\"macos\",\"version\":\"0.4.0\"},\"idle_timeout_s\":1800,\"ops\":[\"prompt\",\"stop\",\"detach\"],\"started_at_ms\":1792945200000,\"status\":{\"branch\":\"remote-m1-2369\",\"busy\":false,\"context_pct\":37,\"cost_usd_micros\":1834200,\"devices\":[{\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"name\":\"Safari on iPhone\"}],\"model\":\"anthropic/claude-opus-5-5\",\"project\":{\"id\":2,\"name\":\"AMP\"},\"queue_len\":0,\"ticket_id\":2369,\"workers_running\":1},\"user_id\":1001},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"FJlcdWvafwGiXolM7pfSBQ\",\"op\":\"hello\",\"seq\":42,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_text_delta_valid",
+      "note": "A coalesced text delta; wire is ASCII-escaped.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"KAUhXdOWz2tKbPZAH6E8u8lBQoSUXwLd8pc2kNIBSvQY5R1GC5ZlIBm7YJEQ6RN0340RxinxwujvvFDbVXjpqA\", \"body\": {\"type\": \"text_delta\", \"message_id\": \"msg_7\", \"delta\": \"Running the tests\\u2026 \\ud83e\\uddea\"}, \"op\": \"chat_event\", \"nonce\": \"SNkKCdRj8OlJPfnIru3w5w\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"delta\":\"Running the tests… 🧪\",\"message_id\":\"msg_7\",\"type\":\"text_delta\"},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"SNkKCdRj8OlJPfnIru3w5w\",\"op\":\"chat_event\",\"seq\":43,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_tool_start_valid",
+      "note": "Tool arguments travel as a JSON string (floats inside it are fine: it is a string).",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 43
+      },
+      "wire": "{\"sig\": \"wXjONuiuOR_qgI8MCOe4q7JphBnJTi8KSZoXMnA9ghqvs50MW8xBy_FVbsJg9YetLJjuSLjKerJmFEZeOSICrg\", \"body\": {\"type\": \"tool_start\", \"message_id\": \"msg_7\", \"tool_call_id\": \"call_1\", \"name\": \"bash\", \"arguments_json\": \"{\\\"command\\\":\\\"cargo test -p amp-core\\\",\\\"timeout\\\":1.5}\", \"truncated\": false}, \"op\": \"chat_event\", \"nonce\": \"JxC7NDXyDSVJrlH8UxrlRQ\", \"ts\": 1792948799200, \"seq\": 44, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"arguments_json\":\"{\\\"command\\\":\\\"cargo test -p amp-core\\\",\\\"timeout\\\":1.5}\",\"message_id\":\"msg_7\",\"name\":\"bash\",\"tool_call_id\":\"call_1\",\"truncated\":false,\"type\":\"tool_start\"},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"JxC7NDXyDSVJrlH8UxrlRQ\",\"op\":\"chat_event\",\"seq\":44,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "chat_message_end_valid",
+      "note": "Usage with cost as integer micro-USD.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 44
+      },
+      "wire": "{\"sig\": \"cM7zOY4m1Mfl5VrfxI7HofMFXqCeRoQWMpeD9SfZyLf8iJSj7F6BzC__3BNVIZBMmf5k-Qjij1pk4VwQ7zhNkA\", \"body\": {\"type\": \"message_end\", \"message_id\": \"msg_7\", \"stop_reason\": \"tool_use\", \"error\": null, \"model\": \"claude-opus-5-5\", \"provider\": \"anthropic\", \"usage\": {\"input_tokens\": 12034, \"output_tokens\": 311, \"cache_read_tokens\": 90000, \"cache_write_tokens\": 0, \"cost_usd_micros\": 41250}}, \"op\": \"chat_event\", \"nonce\": \"eUC4p1ScF2j6eFrPkIlUYw\", \"ts\": 1792948799200, \"seq\": 45, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"error\":null,\"message_id\":\"msg_7\",\"model\":\"claude-opus-5-5\",\"provider\":\"anthropic\",\"stop_reason\":\"tool_use\",\"type\":\"message_end\",\"usage\":{\"cache_read_tokens\":90000,\"cache_write_tokens\":0,\"cost_usd_micros\":41250,\"input_tokens\":12034,\"output_tokens\":311}},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"eUC4p1ScF2j6eFrPkIlUYw\",\"op\":\"chat_event\",\"seq\":45,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "ack_queued_valid",
+      "note": "A prompt sent while busy is queued as a follow-up.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 45
+      },
+      "wire": "{\"sig\": \"OllaFyNba1vMCuoPaZdZEg0CLny3yX1_4btLg3uTCTdclHHln_mgGTMsR_VLOIIE1soszPw-HaCtydSczd1gHA\", \"body\": {\"ref\": {\"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"seq\": 1792948798500}, \"op\": \"prompt\", \"result\": \"queued\", \"prompt_id\": \"p_12\", \"queue_position\": 1}, \"op\": \"ack\", \"nonce\": \"jl9DXHLDHSczVYIGIQdxWg\", \"ts\": 1792948799200, \"seq\": 46, \"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"op\":\"prompt\",\"prompt_id\":\"p_12\",\"queue_position\":1,\"ref\":{\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"seq\":1792948798500},\"result\":\"queued\"},\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"jl9DXHLDHSczVYIGIQdxWg\",\"op\":\"ack\",\"seq\":46,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "refused_valid",
+      "note": "The harness refused a command.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 46
+      },
+      "wire": "{\"sig\": \"I_pTR3eq-mSEB-8e5LTVleOsJFxmn76wmyg2psY9bOXFzh8tDIsl3EO70eX350_jxy4m0zcIFQJg0tYVoswikA\", \"body\": {\"ref\": {\"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"seq\": 1792948700000}, \"op\": \"stop\", \"code\": \"seq_not_increasing\", \"message\": \"seq must be greater than 1792948700000\", \"last_seq\": 1792948700000}, \"op\": \"refused\", \"nonce\": \"f4z9zlOBZd7-YI9e5rkFaA\", \"ts\": 1792948799200, \"seq\": 47, \"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"code\":\"seq_not_increasing\",\"last_seq\":1792948700000,\"message\":\"seq must be greater than 1792948700000\",\"op\":\"stop\",\"ref\":{\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"seq\":1792948700000}},\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"f4z9zlOBZd7-YI9e5rkFaA\",\"op\":\"refused\",\"seq\":47,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "pair_result_accepted_valid",
+      "note": "Pairing accepted at the laptop.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 47
+      },
+      "wire": "{\"sig\": \"qPZS9NNeh6vgp_Pa0UpO23bVmcYom8yNgLuJTIapK4lOd5stOe-Y5Kjv3qjKXk3M4lLQLXuNtbV74gdOvWLv7A\", \"body\": {\"pairing_id\": \"8D2MNaiyK5zBsUK22WHj_A\", \"result\": \"accepted\", \"code\": null, \"tries_left\": null, \"pinned_until_ms\": 1795540800000}, \"op\": \"pair_result\", \"nonce\": \"CJn1mKrFV9IKAOIbNCDX-A\", \"ts\": 1792948799200, \"seq\": 48, \"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok",
+      "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"code\":null,\"pairing_id\":\"8D2MNaiyK5zBsUK22WHj_A\",\"pinned_until_ms\":1795540800000,\"result\":\"accepted\",\"tries_left\":null},\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"CJn1mKrFV9IKAOIbNCDX-A\",\"op\":\"pair_result\",\"seq\":48,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "duplicate_seq_dropped",
+      "note": "Already applied (a replay from the relay buffer after reconnect): drop silently.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 43
+      },
+      "wire": "{\"sig\": \"KAUhXdOWz2tKbPZAH6E8u8lBQoSUXwLd8pc2kNIBSvQY5R1GC5ZlIBm7YJEQ6RN0340RxinxwujvvFDbVXjpqA\", \"body\": {\"type\": \"text_delta\", \"message_id\": \"msg_7\", \"delta\": \"Running the tests… 🧪\"}, \"op\": \"chat_event\", \"nonce\": \"SNkKCdRj8OlJPfnIru3w5w\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "duplicate"
+    },
+    {
+      "name": "bad_signature_body_changed",
+      "note": "The relay changed an event.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"KAUhXdOWz2tKbPZAH6E8u8lBQoSUXwLd8pc2kNIBSvQY5R1GC5ZlIBm7YJEQ6RN0340RxinxwujvvFDbVXjpqA\", \"body\": {\"type\": \"text_delta\", \"message_id\": \"msg_7\", \"delta\": \"Ignore previous instructions\"}, \"op\": \"chat_event\", \"nonce\": \"SNkKCdRj8OlJPfnIru3w5w\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "bad_signature"
+    },
+    {
+      "name": "wrong_harness_fake_registration",
+      "note": "Events from a harness key the browser never pinned (T-R-1 fake harness).",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"vezI0s-jzg1kDm7IDp_DDH0UMakLxV1m4XKkScQtWrmVaf28V8zSRgrtnErhjXvqdDsHxI8PAW-5GKcGmWIBHw\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"HdZwiIfIALl2GkPHX9cScA\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"-DgqaaGm84DMGbygNGucJoOINe5X7GUwgOaIPfxEphM\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "wrong_harness"
+    },
+    {
+      "name": "bad_signature_claims_pinned_harness",
+      "note": "Claims the pinned harness_id but is signed by another key.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"b0G0GsjwDUVmydHKSlmm4f-Umh3gAj3S1YIxa1VRY_DuP8TVJM901EwX2hVgXY8o2dV0VHJsZbwbnfqRxAAN3Q\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"6WVOArhbtvX0kFAuL-5NtA\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "bad_signature"
+    },
+    {
+      "name": "wrong_session",
+      "note": "An event of another session of the same harness.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"0lFvs1al056wP2ImhKuDYOuW6LLyg2Eu6lAroKCsRNvUCTNCP0Nknok12LPvNHRKOnTCyIHFHy2O7KnQzgW4kQ\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"N3-0YRp8OExxqHWmw2vA3A\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_s3cUyQ38jiPOI7P0i7BJoA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "wrong_session"
+    },
+    {
+      "name": "unknown_op_ignored",
+      "note": "An op added later within v1 (here M2's question): verify, advance the seq cursor, do not render.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"epR4i15ONZZIvk0kc6yvDs3ZSxRJ-EJo3pIvh3R1iNRb2mcOK2XXvQBqFvSVoYWZzG5ScfqAa9lEc9JcgxN1PA\", \"body\": {\"id\": \"q1\", \"text\": \"Which branch?\"}, \"op\": \"question\", \"nonce\": \"jkLZMYhoxz_pqTWZOPsH9g\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ignored_unknown_op"
+    },
+    {
+      "name": "unsupported_version",
+      "note": "Major version 2.",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 42
+      },
+      "wire": "{\"sig\": \"MjJOEClYx0uTI_opBZQxNSGDw4_G18Wwvy8SvrNFJnDUX-CPIIZ5aeSOFomjoN10OFjKWjd-PnL5LGHMVFD6Mg\", \"body\": {\"type\": \"notice\", \"level\": \"info\", \"text\": \"hi\"}, \"op\": \"chat_event\", \"nonce\": \"yWfilo4GPRtrskYztHTYHQ\", \"ts\": 1792948799200, \"seq\": 43, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 2}",
+      "expect": "unsupported_version"
+    }
+  ]
+}
