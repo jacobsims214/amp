@@ -1,3 +1,4 @@
+import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 import { httpTransport, RelayError, SSEParser, type EventStreamHandlers } from './transport'
@@ -60,6 +61,21 @@ describe('httpTransport against the mocked browser leg (protocol 8.3)', () => {
     expect(relay.received).toHaveLength(1)
     relay.setOnline(false)
     await expect(httpTransport.postCommand(MOCK_SESSION_ID, command(Date.now() + 1))).rejects.toMatchObject({ status: 409, code: 'harness_offline' })
+  })
+
+  it('reads a proxy 502/503/504 without a relay code as the relay service being down', async () => {
+    for (const status of [502, 503, 504]) {
+      server.use(http.get('*/api/sessions', () => new HttpResponse('no healthy upstream', { status })))
+      await expect(httpTransport.listSessions()).rejects.toMatchObject({
+        status, code: 'relay_down', message: "Remote control is unavailable right now (the relay service isn't running).",
+      })
+    }
+    // A 503 the relay itself sends keeps its code and message.
+    server.use(http.get('*/api/sessions', () => HttpResponse.json({ code: 'relay_unavailable', error: 'the replica holding this session is unreachable; try again' }, { status: 503 })))
+    await expect(httpTransport.listSessions()).rejects.toMatchObject({ code: 'relay_unavailable', message: 'the replica holding this session is unreachable; try again' })
+    // Other failures are unchanged.
+    server.use(http.get('*/api/sessions', () => new HttpResponse('boom', { status: 500 })))
+    await expect(httpTransport.listSessions()).rejects.toMatchObject({ code: 'http_500', message: 'Request failed (500)' })
   })
 
   it('disconnects', async () => {

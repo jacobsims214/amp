@@ -9,7 +9,7 @@ import type { RemoteDeps } from '../remote/remote-context'
 import type { RemoteCrypto } from '../remote/crypto'
 import { memoryStore } from '../remote/deviceStore'
 import { webRemoteCrypto } from '../remote/webCrypto'
-import { RelayError, type EventStreamHandlers, type RelayTransport } from '../remote/transport'
+import { httpTransport, RelayError, type EventStreamHandlers, type RelayTransport } from '../remote/transport'
 import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport, workerScene } from '../remote/mock/mockRelay'
 import parityStream from '../remote/mock/parityStream.json'
 import { loadVectors } from '../test/vectors'
@@ -437,5 +437,20 @@ describe('Session page shows what the TUI shows besides (#2388)', () => {
     // Gap 4: the TUI's one sentence, the raw provider text one click away.
     expect(screen.getByTestId('reply-error')).toHaveTextContent('✗ Error: OpenRouter rate-limited the request (429): Rate limit exceeded: free-models-per-day. Wait a minute and try again, or pick another model.')
     expect(within(screen.getByTestId('reply-error-detail')).getByText(/^http error 429:/)).toBeInTheDocument()
+  })
+})
+
+describe('Session page while amp-relay is down', () => {
+  it('says remote control is unavailable instead of a raw 503', async () => {
+    const fetchMock = vi.fn(async () => new Response('no healthy upstream', { status: 503, headers: { 'Content-Type': 'text/plain' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      renderSession({ transport: httpTransport, crypto: mockCrypto(), mock: false })
+      expect(await screen.findByText("Remote control is unavailable right now (the relay service isn't running).")).toBeInTheDocument()
+      expect(screen.queryByText(/Request failed/)).toBeNull()
+      expect(fetchMock).toHaveBeenCalled()
+    } finally {
+      vi.unstubAllGlobals()
+    }
   })
 })

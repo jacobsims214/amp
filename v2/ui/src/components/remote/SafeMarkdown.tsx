@@ -6,11 +6,13 @@
  *  - no images: an image becomes a text placeholder with its URL, so nothing
  *    is fetched (images are a prompt-injection exfiltration channel);
  *  - links only for http(s) and mailto, always showing the full URL, opened
- *    in a new tab without referrer or opener.
+ *    in a new tab without referrer or opener;
+ *  - a single newline is a line break, as in the terminal (remarkSoftBreaks).
  */
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { safeUrl } from '../../lib/safeUrl'
+import remarkSoftBreaks from './remarkSoftBreaks'
 
 
 const nodeText = (children: React.ReactNode): string =>
@@ -51,7 +53,7 @@ const components: Components = {
 export function SafeMarkdown({ children }: { children: string }) {
   return (
     <div className="min-w-0 break-words">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} urlTransform={safeUrl} components={components}>
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkSoftBreaks]} urlTransform={safeUrl} components={components}>
         {children}
       </ReactMarkdown>
     </div>
