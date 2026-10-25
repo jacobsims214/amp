@@ -580,7 +580,22 @@ pub struct Shell {
     screen: Option<(usize, usize)>,
     /// The prompts sent in this chat, for ↑↓ in the editor (#2348).
     history: PromptHistory,
+    /// The tool call the model is writing right now (#2384), for the spinner line.
+    streaming: Option<StreamingCall>,
 }
+
+/// A tool call whose arguments are still streaming (#2384).
+struct StreamingCall {
+    index: usize,
+    name: String,
+    /// The arguments so far (partial JSON).
+    json: String,
+    /// When the spinner line last changed for it: re-parsing the arguments is throttled.
+    shown_at: Instant,
+}
+
+/// How often the spinner line follows a streaming tool call (parsing its partial arguments).
+const STREAMING_EVERY: Duration = Duration::from_millis(250);
 
 impl Shell {
     /// The shell and the receiver its runs finish on (select on it next to the agent events).
@@ -642,6 +657,7 @@ impl Shell {
                 running_seen: Default::default(),
                 screen: None,
                 history: PromptHistory::new(),
+                streaming: None,
             },
             done_rx,
         )
@@ -1306,6 +1322,7 @@ impl Shell {
             meta.observe(event);
         }
         self.view.apply(event);
+        self.follow_streaming(event);
         // #2355: a worker's run has ended (the supervisor recorded it) by the time its
         // `amp_run_ticket` returns: the strip stops saying running, and its finished notice lands
         // now, before the manager's reply, not on the next tick.
@@ -1360,6 +1377,91 @@ impl Shell {
                 amp_core::repeat::stopped(&amp_core::events::tool_result_text(result))
         {
             self.view.add_warning(&stop.user_line("/model"));
+        }
+    }
+
+    /// #2384: while the model writes a tool call's arguments (a plan's `amp_create_tasks` can
+    /// stream for 40 s), the spinner line says what it is writing and how far it got
+    /// ([`amp_render::streaming_line`]) instead of only "Working…". Back to "Working…" once the
+    /// call is complete.
+    fn follow_streaming(&mut self, event: &AgentEvent) {
+        use rpi_ai::types::{AssistantMessageEvent as E, Content};
+        let now = Instant::now();
+        let streamed = match event {
+            AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    E::ToolCallStart {
+                        content_index,
+                        partial,
+                    },
+                ..
+            } => Some((*content_index, partial, "")),
+            AgentEvent::MessageUpdate {
+                assistant_message_event:
+                    E::ToolCallDelta {
+                        content_index,
+                        partial,
+                        delta,
+                    },
+                ..
+            } => Some((*content_index, partial, delta.as_str())),
+            _ => None,
+        };
+        if let Some((index, partial, delta)) = streamed {
+            match &mut self.streaming {
+                Some(call) if call.index == index => {
+                    call.json.push_str(delta);
+                    // Some providers name the call after its first delta.
+                    if call.name.is_empty()
+                        && let Some(Content::ToolCall(tc)) = partial.content.get(index)
+                    {
+                        call.name = tc.name.clone();
+                    }
+                    if now.duration_since(call.shown_at) >= STREAMING_EVERY {
+                        call.shown_at = now;
+                        self.show_working();
+                    }
+                }
+                _ => {
+                    if let Some(Content::ToolCall(call)) = partial.content.get(index) {
+                        self.streaming = Some(StreamingCall {
+                            index,
+                            name: call.name.clone(),
+                            json: delta.to_owned(),
+                            shown_at: now,
+                        });
+                        self.show_working();
+                    }
+                }
+            }
+            return;
+        }
+        let complete = matches!(
+            event,
+            AgentEvent::MessageUpdate {
+                assistant_message_event: E::ToolCallEnd { .. },
+                ..
+            } | AgentEvent::MessageEnd { .. }
+                | AgentEvent::ToolExecutionStart { .. }
+                | AgentEvent::AgentEnd { .. }
+        );
+        if complete && self.streaming.take().is_some() {
+            self.show_working();
+        }
+    }
+
+    /// The spinner's message when no hint is shown: what the model is writing, else "Working…".
+    fn working_text(&self) -> String {
+        match &self.streaming {
+            Some(call) => amp_render::streaming_line(&call.name, &call.json),
+            None => WORKING.to_owned(),
+        }
+    }
+
+    /// Puts [`Self::working_text`] on the spinner line, unless the Esc hint is up.
+    fn show_working(&self) {
+        if self.esc_hint_until.is_none() {
+            self.view.set_working_message(&self.working_text());
         }
     }
 
@@ -1479,6 +1581,7 @@ impl Shell {
     pub fn finish_run(&mut self, result: RunDone) {
         self.running = false;
         self.esc_hint_until = None;
+        self.streaming = None;
         self.view.set_working(false);
         let stopping = self.view.stopping();
         self.view.set_stopping(false);
@@ -1676,7 +1779,7 @@ impl Shell {
 
     fn clear_esc_hint(&mut self) {
         if self.esc_hint_until.take().is_some() {
-            self.view.set_working_message(WORKING);
+            self.show_working();
         }
     }
 
