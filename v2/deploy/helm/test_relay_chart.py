@@ -172,6 +172,12 @@ def envoy_validate(label, envoy_yaml):
                         "-keyout", os.path.join(tls, "tls.key"), "-out", os.path.join(tls, "tls.crt")],
                        check=True, capture_output=True)
         os.chmod(os.path.join(tls, "tls.key"), 0o644)
+        # Envoy runs as a non-root user in its image: on Linux it must be able
+        # to read the mounted files (TemporaryDirectory is 0700).
+        for p in (d, tls):
+            os.chmod(p, 0o755)
+        for p in (path, os.path.join(tls, "tls.crt")):
+            os.chmod(p, 0o644)
         p = subprocess.run(
             ["docker", "run", "--rm", "-v", f"{d}:/cfg:ro", "-v", f"{tls}:/etc/envoy-tls:ro", ENVOY_IMAGE,
              "envoy", "--mode", "validate", "-c", "/cfg/envoy.yaml"],
