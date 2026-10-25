@@ -586,9 +586,11 @@ impl ThinkingDisplay {
 
 struct ThinkingState {
     text: String,
-    started: Instant,
+    /// When it started (`None`: not known, #2355).
+    started: Option<Instant>,
     ended: Option<Instant>,
-    /// Whether it was seen streaming (a replayed message has no duration to show).
+    /// Whether it was seen streaming with known times (a replayed message has no duration to
+    /// show).
     timed: bool,
     /// A blank row after it (something visible follows).
     spacer: bool,
@@ -621,10 +623,15 @@ impl ThinkingBlock {
     const PAD: usize = 1;
 
     pub fn new(display: ThinkingDisplay, text: impl Into<String>) -> Self {
+        Self::new_at(display, text, Some(Instant::now()))
+    }
+
+    /// A section that started `at` (`None`: not known, so it shows no duration; #2355).
+    pub fn new_at(display: ThinkingDisplay, text: impl Into<String>, at: Option<Instant>) -> Self {
         Self {
             state: Mutex::new(ThinkingState {
                 text: text.into(),
-                started: Instant::now(),
+                started: at,
                 ended: None,
                 timed: true,
                 spacer: false,
@@ -648,11 +655,16 @@ impl ThinkingBlock {
     /// The thinking is over (the answer started, or the message ended). `timed: false` when it
     /// was never seen streaming.
     pub fn end(&self, timed: bool) {
+        self.end_at(timed, Some(Instant::now()));
+    }
+
+    /// [`Self::end`] at `at` (`None`: not known, so no duration; #2355).
+    pub fn end_at(&self, timed: bool, at: Option<Instant>) {
         if let Ok(mut s) = self.state.lock()
             && s.ended.is_none()
         {
-            s.ended = Some(Instant::now());
-            s.timed = timed;
+            s.ended = Some(at.unwrap_or_else(Instant::now));
+            s.timed = timed && at.is_some();
         }
     }
 
@@ -693,13 +705,13 @@ impl ThinkingBlock {
 
     /// `Thinking · 18s` while it streams, `Thought for 18s` after, `Thinking` without a duration.
     fn label(s: &ThinkingState) -> String {
-        if !s.timed {
+        let Some(started) = s.started.filter(|_| s.timed) else {
             return "Thinking".to_owned();
-        }
+        };
         let secs = s
             .ended
             .unwrap_or_else(Instant::now)
-            .duration_since(s.started)
+            .saturating_duration_since(started)
             .as_secs();
         if s.ended.is_some() {
             format!("Thought for {secs}s")
@@ -879,13 +891,19 @@ impl AssistantBlock {
     }
 
     pub fn update_blocks(&self, blocks: &[Block]) {
+        self.update_blocks_at(blocks, Some(Instant::now()));
+    }
+
+    /// [`Self::update_blocks`] for an update that happened `at` (a session caught up from its
+    /// feed or file, #2355; `None`: not known).
+    pub fn update_blocks_at(&self, blocks: &[Block], at: Option<Instant>) {
         if let Ok(mut b) = self.blocks.lock() {
             if *b == blocks {
                 return;
             }
             *b = blocks.to_vec();
         }
-        self.rebuild(blocks);
+        self.rebuild(blocks, at);
     }
 
     /// It comes right after a tool group: a blank row separates them when it shows anything
@@ -896,10 +914,15 @@ impl AssistantBlock {
 
     /// The message is complete: its thinking stops its timers.
     pub fn finish(&self) {
+        self.finish_at(Some(Instant::now()));
+    }
+
+    /// [`Self::finish`] for a message that ended `at` (#2355; `None`: not known).
+    pub fn finish_at(&self, at: Option<Instant>) {
         self.finished.store(true, Ordering::Relaxed);
         if let Ok(t) = self.thinking.lock() {
             for block in t.iter() {
-                block.end(true);
+                block.end_at(true, at);
             }
         }
     }
@@ -983,7 +1006,7 @@ impl AssistantBlock {
         rows
     }
 
-    fn rebuild(&self, blocks: &[Block]) {
+    fn rebuild(&self, blocks: &[Block], at: Option<Instant>) {
         self.content.clear();
         let visible = |b: &Block| match b {
             Block::Text(t) | Block::Thinking(t) => !t.trim().is_empty(),
@@ -1026,17 +1049,17 @@ impl AssistantBlock {
                             Arc::clone(b)
                         }
                         None => {
-                            let b = Arc::new(ThinkingBlock::new(display, text));
+                            let b = Arc::new(ThinkingBlock::new_at(display, text, at));
                             // Seen complete at once (a replayed message): no duration.
                             if followed || finished {
-                                b.end(false);
+                                b.end_at(false, at);
                             }
                             thinking.push(Arc::clone(&b));
                             b
                         }
                     };
                     if followed || finished {
-                        block.end(true);
+                        block.end_at(true, at);
                     }
                     block.set_spacer(followed);
                     self.content.add_child(block);
@@ -1086,7 +1109,7 @@ impl Component for AssistantBlock {
     fn invalidate(&self) {
         let blocks = self.blocks.lock().map(|b| b.clone()).unwrap_or_default();
         if !blocks.is_empty() {
-            self.rebuild(&blocks);
+            self.rebuild(&blocks, Some(Instant::now()));
         }
         self.content.invalidate();
     }
@@ -1326,9 +1349,15 @@ impl ToolBlock {
     }
 
     pub fn set_running(&self) {
+        self.set_running_at(Some(Instant::now()));
+    }
+
+    /// The call started `at` (a session caught up from its feed or file, #2355; `None`: not
+    /// known, so it shows no duration).
+    pub fn set_running_at(&self, at: Option<Instant>) {
         if let Ok(mut i) = self.inner.lock() {
             i.state = ToolState::Running;
-            i.started = Some(Instant::now());
+            i.started = at;
         }
         self.clear_cache();
     }
@@ -1336,6 +1365,12 @@ impl ToolBlock {
     /// The call ended: `summary` goes on its line, `detail` (the result, or the error) under it
     /// when expanded, and always for an error.
     pub fn set_result(&self, summary: &str, detail: &str, is_error: bool) {
+        self.set_result_at(summary, detail, is_error, Some(Instant::now()));
+    }
+
+    /// [`Self::set_result`] for a call that ended `at` (#2355; `None`: not known, so no
+    /// duration rather than a wrong one).
+    pub fn set_result_at(&self, summary: &str, detail: &str, is_error: bool, at: Option<Instant>) {
         if let Ok(mut i) = self.inner.lock() {
             i.summary = summary.to_owned();
             i.detail = Some(detail.to_owned());
@@ -1344,7 +1379,7 @@ impl ToolBlock {
             } else {
                 ToolState::Completed
             };
-            i.finished = Some(Instant::now());
+            i.finished = at;
         }
         self.clear_cache();
     }
@@ -1367,7 +1402,7 @@ impl ToolBlock {
     /// How long the call took, once it has ended.
     fn took(&self) -> Option<Duration> {
         let i = self.inner.lock().ok()?;
-        Some(i.finished?.duration_since(i.started?))
+        Some(i.finished?.saturating_duration_since(i.started?))
     }
 
     fn clear_cache(&self) {
@@ -1429,7 +1464,7 @@ impl ToolBlock {
         let elapsed = match (inner.state, inner.started, inner.finished) {
             (ToolState::Running, Some(s), _) => running_elapsed(s.elapsed()),
             (ToolState::Completed | ToolState::Failed, Some(s), Some(f)) => {
-                format_elapsed(f.duration_since(s))
+                format_elapsed(f.saturating_duration_since(s))
             }
             _ => String::new(),
         };
@@ -1665,14 +1700,15 @@ impl ToolGroup {
     /// The folded calls' line: `✓ 4 calls · get_task ×3, list_tasks · 140 ms`.
     fn folded_line(calls: &[&Arc<ToolBlock>], width: usize) -> String {
         let mut kinds: Vec<(String, usize)> = Vec::new();
-        let mut took = Duration::ZERO;
+        // Unknown when any call's duration is (#2355): no total rather than a short one.
+        let mut took = Some(Duration::ZERO);
         for call in calls {
             let kind = call.kind();
             match kinds.iter_mut().find(|(k, _)| *k == kind) {
                 Some((_, n)) => *n += 1,
                 None => kinds.push((kind, 1)),
             }
-            took += call.took().unwrap_or_default();
+            took = took.zip(call.took()).map(|(a, b)| a + b);
         }
         let names: Vec<String> = kinds
             .iter()
@@ -1692,7 +1728,7 @@ impl ToolGroup {
                 args: "",
                 summary: &names.join(", "),
                 error: false,
-                elapsed: &format_elapsed(took),
+                elapsed: &took.map(format_elapsed).unwrap_or_default(),
             },
             width,
         )
