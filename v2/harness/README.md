@@ -1004,6 +1004,24 @@ python3 -I scripts/manager-eval.py --report target/manager-eval/<dir> ...   # on
 
 Results for #2363 are in the project KB (`discoveries/amp-harness-manager-eval.md`).
 
+### Prompt size (#2367)
+
+A role's system prompt and tool schemas go with every request, so they set most of a session's
+cost. `amp-harness run --print-system-prompt` and `--print-tools` print them without calling a
+model; `scripts/prompt-size.py` breaks them down (role prompt, server instructions, AMP context,
+preloaded skills, skill list, built-in and AMP tools, largest tools first):
+
+```sh
+( source ~/.config/amp-harness/dev-keys.env
+  python3 -I scripts/prompt-size.py --cwd /path/to/repo [--role amp-manager] [--json] )
+```
+
+#2367 took the manager from ~38k to ~22k prompt tokens (first request, measured) and the four
+eval scenarios from $0.56 to $0.40 at list price, all still passing: no preloaded skills (it reads
+amp-planning when it plans), no AMP tools a manager never uses (the `amp_*: deny` lines in
+`harness_overrides.yaml`), no role-prompt paragraphs the server instructions already give, AMP
+descriptions without their "Use for:" keyword line, and compact built-in schemas.
+
 Offline runs use a faux provider and a scripted model:
 
 ```toml
@@ -1220,9 +1238,10 @@ The roster and skills are generated from `v2/.opencode` into `v2/harness/assets/
 `v2/scripts/build-harness-assets.sh` (`make -C v2/harness assets`; `assets-check` fails on drift)
 and embedded in the binary. Each agent file `agents/amp-<id>.md` is one role: its markdown body is
 the system prompt, its frontmatter `permission` block is the tool policy, and a `skills:` list (else
-a built-in table) names the skills preloaded into its prompt in full. The manager preloads
-`amp-index` and `amp-planning`, workers `amp-execution`, reviewers `amp-review` plus their review
-skill. Every other skill is listed with its path, for the agent to read when it needs it.
+a built-in table) names the skills preloaded into its prompt in full. Workers preload
+`amp-execution`, reviewers `amp-review` plus their review skill. The manager preloads nothing
+(#2367): its prompt says to read `amp-planning` when it plans. Every other skill is listed with its
+path, for the agent to read when it needs it.
 
 You can override or add agents and skills from disk. Later layers win:
 

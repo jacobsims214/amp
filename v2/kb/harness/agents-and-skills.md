@@ -169,9 +169,9 @@ amp-harness skills validate
 ```
 
 - **Preloading:** an agent's `skills:` list is put into its prompt in full
-  (`agents skills <id> add|remove <skill>`). The manager preloads `amp-index` and
-  `amp-planning`, workers `amp-execution`, reviewers `amp-review`. Every other skill is listed by
-  name, description and path, and the agent reads it when the work calls for it. So a good
-  `--description` says when to use the skill.
+  (`agents skills <id> add|remove <skill>`). Workers preload `amp-execution`, reviewers
+  `amp-review`. The manager preloads nothing: its prompt goes with every request, so it reads
+  `amp-planning` when it plans. Every other skill is listed by name, description and path, and the
+  agent reads it when the work calls for it. So a good `--description` says when to use the skill.
 - Names are lowercase letters, digits and hyphens.
 - **In the chat:** `/skills` and `/skills <name>`.
