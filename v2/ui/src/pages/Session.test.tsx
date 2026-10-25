@@ -90,6 +90,20 @@ describe('Session page', () => {
     await waitFor(() => expect(screen.getAllByText(/You said: "and then the docs"/)).toHaveLength(1), { timeout: 3000 })
   })
 
+  it('sends slash text as a literal prompt, never as a command or another op (R-M6, #2379)', async () => {
+    const user = userEvent.setup()
+    const { relay, deps } = mockSession()
+    renderSession(deps)
+    await screen.findByText('Laptop online')
+    await user.type(screen.getByLabelText('Message'), '/remote off{Enter}')
+    await waitFor(() => expect(relay.received).toHaveLength(1))
+    expect(relay.received[0].op).toBe('prompt')
+    expect(relay.received[0].body).toMatchObject({ text: '/remote off' })
+    // Still connected: the page didn't treat it as Disconnect.
+    expect(screen.getByText('Laptop online')).toBeInTheDocument()
+    expect(relay.received.map(c => c.op)).toEqual(['prompt'])
+  })
+
   it('Stop sends a signed stop and the harness confirms it', async () => {
     const user = userEvent.setup()
     const { relay, deps } = mockSession()
