@@ -6,6 +6,7 @@
  * EventSource, so the page sees keepalive comments (EventSource hides them and
  * can't notice a silent stream) and controls `from_seq` itself on reconnect.
  */
+import type { PairMessage } from './protocol'
 import type { CommandEnvelope, RelayFrame, SessionDetail, SessionSummary } from './types'
 
 export class RelayError extends Error {
@@ -42,6 +43,8 @@ export interface RelayTransport {
   /** POSTs one signed command. Resolves on 202; rejects with RelayError otherwise. */
   postCommand(id: string, env: CommandEnvelope): Promise<void>
   disconnect(id: string): Promise<void>
+  /** POSTs a pair request (protocol 7.3). Resolves on 202 with the pairing window's expiry. */
+  pair(id: string, msg: PairMessage): Promise<{ expires_at_ms: number | null }>
 }
 
 async function errorFrom(res: Response): Promise<RelayError> {
@@ -144,5 +147,14 @@ export const httpTransport: RelayTransport = {
   async disconnect(id) {
     const res = await fetch(`/api/sessions/${enc(id)}/disconnect`, { method: 'POST' })
     if (!res.ok) throw await errorFrom(res)
+  },
+
+  async pair(id, msg) {
+    const res = await fetch(`/api/sessions/${enc(id)}/pair`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json; charset=utf-8' }, body: JSON.stringify(msg),
+    })
+    if (!res.ok) throw await errorFrom(res)
+    const body = await res.json().catch(() => ({})) as { expires_at_ms?: number }
+    return { expires_at_ms: typeof body.expires_at_ms === 'number' ? body.expires_at_ms : null }
   },
 }

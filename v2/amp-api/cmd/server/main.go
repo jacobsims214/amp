@@ -28,6 +28,7 @@ import (
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
+	"github.com/simstech/amp-api/internal/relay"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/service"
 	"github.com/simstech/amp-api/internal/webhook"
@@ -340,7 +341,27 @@ func main() {
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
+	remoteCfg := remoteConfig()
+	restHandler.SetRemoteControl(remoteCfg)
 	restHandler.Register(mux)
+
+	// ---- 6a. Remote control relay (epic 165, protocol.md) ----
+	// Only with the instance switch and auth on; otherwise every relay URL
+	// is a plain 404. The browser leg (/api/sessions) is on the REST mux,
+	// behind restVerifier like the rest of /api. The harness leg (/relay/)
+	// is not: register and token refresh take the harness's OAuth token
+	// through the MCP-audience verifier (as /mcp does), and the rest take
+	// the session's connect token.
+	relayNode := ""
+	if node != nil {
+		relayNode = node.ID()
+	}
+	relayHandler, rl := setupRelay(remoteCfg, restHandler, mux, mcpVerifier.Middleware,
+		relay.Config{AppURL: appPublicURL(), Node: relayNode})
+	if rl != nil {
+		go rl.Run(ctx)
+		slog.Info("remote control relay enabled", "app_url", appPublicURL())
+	}
 	// Artifacts nobody kept are deleted after the retention period.
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
@@ -378,6 +399,7 @@ func main() {
 	var apiHandler http.Handler = mux
 	apiHandler = api.RejectCrossSiteWrites(apiHandler)
 	apiHandler = authExceptHealth(restVerifier, apiHandler)
+	apiHandler = relayBypass(relayHandler, apiHandler)
 	apiHandler = corsMiddleware.Handler(apiHandler)
 
 	apiServer := &http.Server{
@@ -453,6 +475,33 @@ func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	})
 }
 
+// setupRelay registers the remote control relay when the instance switch and
+// auth are both on: the browser leg on mux, and the harness leg returned as
+// the handler for /relay/. Otherwise nothing is registered and the returned
+// handler answers every /relay/ URL with a plain 404 (protocol 8.1).
+func setupRelay(cfg service.RemoteConfig, h *api.RestHandler, mux *http.ServeMux,
+	oauth func(http.Handler) http.Handler, rcfg relay.Config) (http.Handler, *relay.Relay) {
+	if !cfg.InstanceEnabled || !cfg.AuthEnabled {
+		return http.HandlerFunc(http.NotFound), nil
+	}
+	rl := relay.New(h.Service(), oauth, rcfg)
+	rl.RegisterBrowser(mux)
+	return rl.HarnessHandler(), rl
+}
+
+// relayBypass sends the remote control harness leg (/relay/) to relay, which
+// authenticates it itself, and everything else to next (behind restVerifier,
+// which accepts only the REST audiences and would mis-classify the harness).
+func relayBypass(relay, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/relay" || strings.HasPrefix(r.URL.Path, "/relay/") {
+			relay.ServeHTTP(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // appPublicURL is AMP's public address, for links to pages in the UI:
 // APP_PUBLIC_URL, or MCP_PUBLIC_URL without its /mcp path. Empty when
 // neither is set (local dev), and links are left out.
@@ -494,4 +543,17 @@ func kbReconcileInterval() time.Duration {
 		return def
 	}
 	return d
+}
+
+// remoteConfig is the instance's remote control configuration (epic 165).
+// RELAY_ENABLED (Helm relay.enabled) is the instance switch, off unless set
+// to true; it never turns on with auth off (OIDC_ISSUER_URL empty: compose
+// and local dev, where every caller is a global admin).
+func remoteConfig() service.RemoteConfig {
+	on, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("RELAY_ENABLED")))
+	cfg := service.RemoteConfig{InstanceEnabled: on, AuthEnabled: os.Getenv("OIDC_ISSUER_URL") != ""}
+	if cfg.InstanceEnabled && !cfg.AuthEnabled {
+		slog.Warn("RELAY_ENABLED is set but auth is off (no OIDC_ISSUER_URL): remote control stays unavailable")
+	}
+	return cfg
 }

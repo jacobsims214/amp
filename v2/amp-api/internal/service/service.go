@@ -30,6 +30,13 @@ type Service struct {
 	// ArtifactRetention is how long an artifact lives after its last version
 	// unless someone keeps it (0: the default, 45 days).
 	ArtifactRetention time.Duration
+	// Remote is the instance's remote control configuration (off unless
+	// RELAY_ENABLED and auth are on).
+	Remote RemoteConfig
+	// OnRemoteEnded, when set, is told about remote sessions the service
+	// ended (policy off, revoke-all, expiry), so the relay closes their
+	// streams. It must not block.
+	OnRemoteEnded func([]domain.RemoteSession)
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {

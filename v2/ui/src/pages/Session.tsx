@@ -14,6 +14,7 @@ import { remoteAvailable, useRemote } from '../remote/remote-context'
 import { useRemoteSession } from '../remote/useRemoteSession'
 import { endReasonText, isBusy } from '../remote/session'
 import { BandLoader } from '../components/brand/BandLoader'
+import { PairingPanel } from '../components/remote/PairingPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import {
   Banner, Composer, OutgoingRow, PresenceBadge, QueueStrip, StatusBar, TranscriptRow, WorkerChips,
@@ -62,7 +63,7 @@ export function Session() {
 }
 
 function SessionView({ sessionId }: { sessionId: string }) {
-  const { phase, state, sendPrompt, stop, disconnect, canSign } = useRemoteSession(sessionId)
+  const { phase, state, sendPrompt, stop, disconnect, paired, canSign } = useRemoteSession(sessionId)
   const scroller = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
 
@@ -83,6 +84,9 @@ function SessionView({ sessionId }: { sessionId: string }) {
   if (phase.kind === 'not_found') return <Message title="No such session"><p className="m-0">It may have ended, or it belongs to someone else. Only the person who started a session can open it.</p></Message>
   if (phase.kind === 'gone') return <Message title="This session has ended"><p className="m-0">Run <code className="font-mono">/remote</code> in the harness on your laptop to start a new one.</p></Message>
   if (phase.kind === 'error') return <Message title="Couldn't open the session"><p className="m-0">{phase.message}</p></Message>
+  if (phase.kind === 'pairing') {
+    return <Frame title="Remote session"><PairingPanel detail={phase.detail} link={phase.link} onPaired={paired} /></Frame>
+  }
   if (phase.kind === 'unpaired') {
     return <Message title="Pair this device from the laptop">
       <p className="m-0">This browser isn't paired with <b className="text-ink">{phase.detail.host}</b> yet, so it can't show or send anything for this session.</p>
