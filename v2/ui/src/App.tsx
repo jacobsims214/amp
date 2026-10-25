@@ -16,6 +16,8 @@ import { Trace } from './pages/Trace'
 import { Portfolio } from './pages/Portfolio'
 import { Artifacts } from './pages/Artifacts'
 import { ArtifactView } from './pages/ArtifactView'
+import { Session } from './pages/Session'
+import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 import { LaunchSequence } from './components/brand/LaunchSequence'
@@ -39,9 +41,12 @@ function NotFound() {
 export default function App() {
   return (
     <AuthProvider>
+      <RemoteProvider>
       <LaunchSequence />
       <BrowserRouter>
         <Routes>
+          {/* Standalone (no sidebar) so it works on a phone; served with a strict CSP. */}
+          <Route path="/sessions/:sessionId" element={<Session />} />
           <Route element={<AppShell />}>
             <Route path="/" element={<MyWork />} />
             <Route path="/projects" element={<Projects />} />
@@ -68,6 +73,7 @@ export default function App() {
           </Route>
         </Routes>
       </BrowserRouter>
+      </RemoteProvider>
     </AuthProvider>
   )
 }
