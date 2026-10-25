@@ -12,10 +12,10 @@ export function RemoteProvider({ children, deps }: { children: ReactNode; deps?:
   const [mockDeps, setMockDeps] = useState<RemoteDeps | null>(null)
   useEffect(() => {
     if (deps) return
-    const flag = import.meta.env.VITE_REMOTE_MOCK
-    if (flag === '1') {
+    // Compared inline (not through a variable) so a normal build drops both branches and the mock.
+    if (import.meta.env.VITE_REMOTE_MOCK === '1') {
       import('./mock/mockRelay').then(m => setMockDeps(m.devMockDeps()))
-    } else if (flag === 'parity') {
+    } else if (import.meta.env.VITE_REMOTE_MOCK === 'parity') {
       // The feed recorded from the real harness chat (#2386), for side-by-side checks with the TUI.
       Promise.all([import('./mock/mockRelay'), import('./mock/parityStream.json')])
         .then(([m, s]) => setMockDeps(m.devMockDeps('parity', s.default as Parameters<typeof m.devMockDeps>[1], {
