@@ -35,7 +35,10 @@ Terminal.app over ssh, send Shift+Enter as a plain Enter, so it **sends** the me
 Up in an empty (or one-line) editor recalls the prompts you sent earlier in this chat, newest first; Down goes forward again, and Down past the
 newest gives back what you had typed. In a multi-line draft Up and Down move the cursor, and in
 the `/` menu and the panels they move the selection. Workers' prompts are not in this history.
-Esc stops the reply. The model's thinking shows as one `▸ Thought for 12s` line: click it, or
+Esc stops the reply, and with it any worker this chat started (the transcript names them). Esc that
+closes a panel, the `/` menu or a worker's session doesn't: for 2 s the spinner line says `Esc again to
+stop the reply` (naming the live workers, e.g. `… and the worker on #222`), and only the next Esc stops it.
+The model's thinking shows as one `▸ Thought for 12s` line: click it, or
 press Ctrl+T, to open it (Ctrl+T opens the lowest one on screen), and `/config thinking` switches
 between collapsed, full and hidden (see [configuration](configuration.md)). Ctrl+O shows tool
 calls in full. Ctrl+W (with an empty message box) picks a running worker.
@@ -83,7 +86,7 @@ amp:amp-worker-backend · openrouter/deepseek/deepseek-v4.1 · AMP Harness › M
 in 12.3k · out 1.2k · cached 34.5k · $0.04                       ctx ███░░░░░░░ 31% of 128.0k
 ```
 
-Keys: Esc back to the chat (where you left it, scroll included), Tab/→ and Shift+Tab/← the next
+Keys: Esc back to the chat (where you left it, scroll included; a second Esc there stops the reply, see above), Tab/→ and Shift+Tab/← the next
 or previous worker, `x` stop (asks first), `o` open the ticket in AMP, PgUp/PgDn scroll. The chat
 keeps running underneath. A finished worker's session stays viewable (read-only) until the chat
 ends; an earlier chat's worker opens from its session file with `/worker <id>`.

@@ -369,8 +369,33 @@ pub enum QuitOutcome {
 /// The transcript line a run the person stopped ends with: dim, no error colour (#2181).
 pub const STOPPED: &str = "Stopped.";
 
-/// What the spinner line says, for [`ESC_HINT_FOR`], after Esc closed a panel during a run.
+/// What the spinner line says, for [`ESC_HINT_FOR`], after Esc closed a panel, the `/` menu or a
+/// worker's session during a run (#2181, #2354). With this chat's workers live it names them
+/// ([`esc_hint`]).
 pub const ESC_HINT: &str = "Esc again to stop the reply";
+
+/// [`ESC_HINT`], naming this chat's live workers, which stopping the reply stops too (#2354).
+pub fn esc_hint(tickets: &[i64]) -> String {
+    match tickets.len() {
+        0 => ESC_HINT.to_owned(),
+        1 => format!("{ESC_HINT} and the worker on #{}", tickets[0]),
+        _ => format!("{ESC_HINT} and the workers on {}", ticket_list(tickets)),
+    }
+}
+
+/// `#1, #2, #3`, or `#1, #2, #3 +2 more` past three (it has to fit the spinner line).
+fn ticket_list(tickets: &[i64]) -> String {
+    let shown = tickets
+        .iter()
+        .take(3)
+        .map(|id| format!("#{id}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match tickets.len() {
+        n if n > 3 => format!("{shown} +{} more", n - 3),
+        _ => shown,
+    }
+}
 
 /// How long [`ESC_HINT`] stays next to the spinner.
 pub const ESC_HINT_FOR: Duration = Duration::from_secs(2);
@@ -1485,8 +1510,9 @@ impl Shell {
     /// (Enter on the menu puts the chosen command in the editor and returns false, so the editor
     /// submits it).
     ///
-    /// Esc that closes a panel during a run doesn't stop it: the spinner line says
-    /// [`ESC_HINT`] for [`ESC_HINT_FOR`], and the next Esc stops the reply (#2181).
+    /// Esc that closes a panel (or a worker's session, [`Shell::session_key`]) during a run
+    /// doesn't stop it: the spinner line says [`ESC_HINT`] for [`ESC_HINT_FOR`], naming this
+    /// chat's live workers ([`esc_hint`]), and the next Esc stops the reply (#2181, #2354).
     pub async fn key(&mut self, key: &KeyEvent, editor_empty: bool) -> bool {
         // #2252: a stop waiting for its answer takes the next key; a worker's session takes
         // every key while it is shown (the editor is hidden).
@@ -1632,7 +1658,8 @@ impl Shell {
 
     fn show_esc_hint(&mut self) {
         self.esc_hint_until = Some(Instant::now() + ESC_HINT_FOR);
-        self.view.set_working_message(ESC_HINT);
+        self.view
+            .set_working_message(&esc_hint(&self.live_tickets()));
     }
 
     fn clear_esc_hint(&mut self) {
@@ -2805,7 +2832,14 @@ impl Shell {
             return true;
         }
         match key.code {
-            KeyCode::Esc => self.close_worker(),
+            KeyCode::Esc => {
+                self.close_worker();
+                // #2354: like closing a panel, leaving a session never makes the next Esc stop
+                // the reply (and every worker) unannounced.
+                if self.running {
+                    self.show_esc_hint();
+                }
+            }
             KeyCode::Tab | KeyCode::Right => {
                 self.switch_worker(1);
             }
