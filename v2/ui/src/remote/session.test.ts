@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { blockText, formatCost, initialSessionState, isBusy, sessionReducer, sessionTokens, type SessionAction, type SessionState } from './session'
+import { blockText, endReasonText, formatCost, initialSessionState, isBusy, sessionReducer, sessionTokens, type SessionAction, type SessionState } from './session'
 import { seedChatEvents } from './mock/mockRelay'
 import { CHAT_EVENT_TYPES, type ChatEvent, type Envelope } from './types'
 
@@ -126,5 +126,14 @@ describe('sessionTokens (#2388)', () => {
     expect(sessionTokens(status, totals)).toMatchObject({ total: 1_029_851, fromHarness: true })
     expect(sessionTokens(null, totals)).toMatchObject({ total: 15, fromHarness: false })
     expect(sessionTokens(null, { ...totals, input: 0, output: 0 })).toBeNull()
+  })
+})
+
+describe('endReasonText', () => {
+  it("states the session's own idle limit, not a fixed 30 minutes (#2380)", () => {
+    expect(endReasonText('idle', 300)).toBe('The session ended after 5 minutes without remote activity.')
+    expect(endReasonText('idle', 1800)).toBe('The session ended after 30 minutes without remote activity.')
+    expect(endReasonText('idle')).toBe('The session ended after its idle time without remote activity (your org sets it).')
+    expect(endReasonText('detached', 300)).toBe('You disconnected this session.')
   })
 })

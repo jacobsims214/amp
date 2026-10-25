@@ -109,7 +109,7 @@ function SessionView({ sessionId }: { sessionId: string }) {
   const host = state.hello?.harness.host ?? detail.host
   const online = state.online === true && !state.ended
   const ended = state.ended
-  const disabledReason = ended ? endReasonText(ended.reason)
+  const disabledReason = ended ? endReasonText(ended.reason, state.hello?.idle_timeout_s)
     : state.versionMismatch ? 'Update AMP to talk to this laptop.'
     : !canSign ? 'This browser can\'t sign messages yet. Pair it from the laptop.'
     : state.online === false ? 'The laptop is offline. Messages aren\'t queued while it\'s away.'
@@ -130,7 +130,7 @@ function SessionView({ sessionId }: { sessionId: string }) {
         onConfirm={() => { disconnect().catch(() => {}) }} />}
     </>}>
       <TicketLine status={status} />
-      {ended && <Banner tone="info">{endReasonText(ended.reason)} The laptop session keeps running locally.</Banner>}
+      {ended && <Banner tone="info">{endReasonText(ended.reason, state.hello?.idle_timeout_s)} The laptop session keeps running locally.</Banner>}
       {state.versionMismatch && <Banner tone="danger">This laptop runs a newer harness; update AMP. Nothing more from it is shown.</Banner>}
       {!ended && state.online === false && <Banner tone="warn">Laptop offline. It may be asleep or off the network; this page catches up when it's back.</Banner>}
       {!ended && state.connection === 'reconnecting' && state.online !== false && <Banner tone="info">Reconnecting to AMP… Nothing is lost: the page picks up where it left off.</Banner>}
