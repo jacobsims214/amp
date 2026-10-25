@@ -1,0 +1,44 @@
+name: Guide docs
+
+# The shipped AMP guide (v2/kb/**) is checked by TestGuide_ShippedDocs in
+# v2/amp-api/cmd/server/guide_test.go (pages parse, start page exists, cross-references resolve).
+# test.yml only triggers on v2/amp-api/** changes, so a docs-only change under v2/kb/ got no check
+# on the milestone branches (found on harness-m4, #2366). This runs just that test (it needs no
+# Postgres/Typesense/Valkey) for v2/kb changes pushed to, or PR'd into, the milestone integration
+# branches. Scoped to harness-m*/remote-m* so main's CI behaviour is unchanged.
+
+on:
+  pull_request:
+    branches: ["harness-m*", "remote-m*"]
+    paths:
+      - "v2/kb/**"
+      - "v2/amp-api/cmd/server/guide_test.go"
+      - ".github/workflows/guide-docs.yml"
+  push:
+    branches: ["harness-m*", "remote-m*"]
+    paths:
+      - "v2/kb/**"
+      - "v2/amp-api/cmd/server/guide_test.go"
+      - ".github/workflows/guide-docs.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guide-docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guide:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v2/amp-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: v2/amp-api/go.mod
+          cache-dependency-path: v2/amp-api/go.sum
+      - name: guide docs check
+        run: go test -count=1 -run '^TestGuide_ShippedDocs$' ./cmd/server
