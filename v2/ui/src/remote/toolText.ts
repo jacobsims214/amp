@@ -373,7 +373,8 @@ export function ago(ms: number, now = Date.now()): string {
 export function inTime(ms: number, now = Date.now()): string {
   const d = ms - now
   if (d <= 60_000) return 'now'
-  const h = Math.floor(d / 3_600_000)
-  const m = Math.round((d % 3_600_000) / 60_000)
+  const mins = Math.round(d / 60_000)
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
   return h ? `in ${h}h ${String(m).padStart(2, '0')}m` : `in ${m}m`
 }

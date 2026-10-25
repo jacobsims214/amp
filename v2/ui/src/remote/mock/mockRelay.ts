@@ -144,6 +144,9 @@ export class MockRelay {
     return [...(this.ended ? [] : [this.summary()]), ...this.others]
   }
 
+  /** A replayed feed that stops inside a run: the fake harness counts as busy, so prompts queue. */
+  markRunning(run_id: string) { this.running = run_id; this.statusBody = { ...this.statusBody, busy: true } }
+
   /** POST /api/sessions/revoke-all. */
   revokeAll(): { ended: number; devices_revoked: number } {
     const ended = this.list().length
@@ -367,7 +370,7 @@ export function workerScene(t0: number): { at_ms: number; event: ChatEvent }[] {
   ]
 }
 
-export function devMockDeps(kind: string = '1', stream?: { at_ms: number; event: ChatEvent }[], opts: { cut?: number; scene?: string } = {}): RemoteDeps {
+export function devMockDeps(kind: string = '1', stream?: { at_ms: number; event: ChatEvent }[], opts: { cut?: number; scene?: string; offline?: boolean } = {}): RemoteDeps {
   const now = Date.now()
   const others: SessionSummary[] = [
     { session_id: 'rs_OtherSessionBBBBBBBBBB', harness_id: 'h-other', harness_fp_display: '8F1D-02AA-71C3-9E40', host: 'build-box',
@@ -385,8 +388,11 @@ export function devMockDeps(kind: string = '1', stream?: { at_ms: number; event:
     }
   }
   const relay = replay
-    ? new MockRelay({ stream: replay, others, status: { model: 'faux/faux-1', context_pct: 4, cost_usd_micros: 177_000,
+    ? new MockRelay({ stream: replay, others, online: !opts.offline, status: { model: 'faux/faux-1', context_pct: 4, cost_usd_micros: 177_000,
         project: { id: 158, name: 'QA 2365 plan' }, ticket_id: 514, branch: 'remote-m1', workers_running: opts.scene === 'workers' ? 2 : 0 } })
     : new MockRelay({ seed: true, others })
+  // Stopped inside a run (a cut replay, the worker scene): the fake harness is busy.
+  const open = replay?.reduce<string | null>((run, e) => e.event.type === 'run_start' ? e.event.run_id : e.event.type === 'run_end' ? null : run, null)
+  if (open) relay.markRunning(open)
   return { transport: mockTransport(relay), crypto: mockCrypto({ paired: !pairingLinkFor(MOCK_SESSION_ID) }), mock: true }
 }

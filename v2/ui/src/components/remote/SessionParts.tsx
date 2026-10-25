@@ -127,21 +127,25 @@ function ToolRow({ item, workers, now }: { item: Tool; workers: WorkerInfo[]; no
   const tone = state === 'failed' ? 'bg-[color-mix(in_srgb,var(--danger)_7%,var(--surface))]' : state === 'running' ? 'bg-surface-2' : ''
   return (
     <details className={`group ${tone}`} data-testid="tool-row" data-state={state}>
-      <summary className="flex items-center gap-2 px-2.5 py-[5px] cursor-pointer list-none text-[12.5px] min-w-0 hover:bg-surface-3">
-        <ToolGlyph state={state} />
-        <span className="font-mono font-semibold text-ink shrink-0 max-w-[45%] truncate">{toolTitle(item.name, args)}</span>
-        <span className="font-mono text-ink-3 truncate min-w-0 shrink">{toolArgs(item.name, args)}</span>
-        {summary && <><span className="text-line-str shrink-0" aria-hidden="true">·</span>
-          <span className={`truncate min-w-0 shrink-[2] ${state === 'failed' ? 'text-danger-ink' : 'text-ink-2'}`} data-testid="tool-summary">{summary}</span></>}
-        {elapsed && <span className="amp-num text-[11px] text-ink-3 shrink-0 ml-auto pl-1">{elapsed}</span>}
-        <ChevronRight size={12} className={`shrink-0 text-ink-3 transition-transform group-open:rotate-90 ${elapsed ? '' : 'ml-auto'}`} aria-hidden="true" />
-      </summary>
-      {worker && (
-        <div className="flex items-center gap-1.5 pl-[26px] pr-2.5 pb-1.5 -mt-0.5 text-[11.5px] text-ink-2 min-w-0" data-testid="worker-live">
-          <span className="w-px self-stretch bg-line-str" aria-hidden="true" />
-          <span className="truncate">{workerLine(worker, now, false)}</span>
+      <summary className="block cursor-pointer list-none hover:bg-surface-3">
+        <div className="flex items-center gap-2 px-2.5 py-[5px] text-[12.5px] min-w-0">
+          <ToolGlyph state={state} />
+          <span className="font-mono font-semibold text-ink shrink-0 max-w-[45%] truncate">{toolTitle(item.name, args)}</span>
+          {/* The arguments give way first (to a third of the line), as in the TUI. */}
+          <span className="font-mono text-ink-3 truncate min-w-0 shrink-[3] max-w-[33%] sm:max-w-none">{toolArgs(item.name, args)}</span>
+          {summary && <><span className="text-line-str shrink-0" aria-hidden="true">·</span>
+            <span className={`truncate min-w-0 shrink ${state === 'failed' ? 'text-danger-ink' : 'text-ink-2'}`} data-testid="tool-summary">{summary}</span></>}
+          {elapsed && <span className="amp-num text-[11px] text-ink-3 shrink-0 ml-auto pl-1">{elapsed}</span>}
+          <ChevronRight size={12} className={`shrink-0 text-ink-3 transition-transform group-open:rotate-90 ${elapsed ? '' : 'ml-auto'}`} aria-hidden="true" />
         </div>
-      )}
+        {/* A dispatched worker's live status, under its call (#2347); part of the line, so it shows while folded. */}
+        {worker && (
+          <div className="flex items-center gap-1.5 pl-[26px] pr-2.5 pb-1.5 -mt-0.5 text-[11.5px] text-ink-2 min-w-0" data-testid="worker-live">
+            <span className="w-px self-stretch bg-line-str" aria-hidden="true" />
+            <span className="truncate">{workerLine(worker, now, false)}</span>
+          </div>
+        )}
+      </summary>
       <ToolDetail item={item} />
     </details>
   )

@@ -106,5 +106,6 @@ describe('Sessions page', () => {
     expect(inTime(now + 25 * 60_000, now)).toBe('in 25m')
     expect(inTime(now + (4 * 60 + 5) * 60_000, now)).toBe('in 4h 05m')
     expect(inTime(now, now)).toBe('now')
+    expect(inTime(now + 6 * 3_600_000 + 59.7 * 60_000, now)).toBe('in 7h 00m')
   })
 })

@@ -19,7 +19,7 @@ export function RemoteProvider({ children, deps }: { children: ReactNode; deps?:
       // The feed recorded from the real harness chat (#2386), for side-by-side checks with the TUI.
       Promise.all([import('./mock/mockRelay'), import('./mock/parityStream.json')])
         .then(([m, s]) => setMockDeps(m.devMockDeps('parity', s.default as Parameters<typeof m.devMockDeps>[1], {
-          cut: Number(import.meta.env.VITE_PARITY_CUT ?? 0), scene: import.meta.env.VITE_PARITY_SCENE,
+          cut: Number(import.meta.env.VITE_PARITY_CUT ?? 0), scene: import.meta.env.VITE_PARITY_SCENE, offline: import.meta.env.VITE_PARITY_OFFLINE === '1',
         })))
     }
   }, [deps])
