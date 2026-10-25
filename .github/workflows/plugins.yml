@@ -31,6 +31,8 @@ on:
       - "v2/scripts/lib/**"
       - "v2/plugins/**"
       - ".github/workflows/plugins.yml"
+  # manual run, e.g. to confirm a milestone branch head is green when no path filter fired
+  workflow_dispatch:
 
 permissions:
   contents: read

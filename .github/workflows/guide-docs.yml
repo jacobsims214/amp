@@ -20,6 +20,8 @@ on:
       - "v2/kb/**"
       - "v2/amp-api/cmd/server/guide_test.go"
       - ".github/workflows/guide-docs.yml"
+  # manual run, e.g. to confirm a milestone branch head is green when no path filter fired
+  workflow_dispatch:
 
 permissions:
   contents: read

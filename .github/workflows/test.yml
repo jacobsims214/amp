@@ -16,6 +16,8 @@ on:
     paths:
       - "v2/amp-api/**"
       - ".github/workflows/test.yml"
+  # manual run, e.g. to confirm a milestone branch head is green when no path filter fired
+  workflow_dispatch:
 
 permissions:
   contents: read

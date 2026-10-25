@@ -14,6 +14,8 @@ on:
     paths:
       - "v2/ui/**"
       - ".github/workflows/ui.yml"
+  # manual run, e.g. to confirm a milestone branch head is green when no path filter fired
+  workflow_dispatch:
 
 permissions:
   contents: read

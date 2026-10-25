@@ -26,6 +26,8 @@ on:
       - "v2/scripts/lib/build_opencode_plugin.py"
       - "v2/scripts/lib/harness_overrides.yaml"
       - ".github/workflows/harness.yml"
+  # manual run, e.g. to confirm a milestone branch head is green when no path filter fired
+  workflow_dispatch:
 
 permissions:
   contents: read
