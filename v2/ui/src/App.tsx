@@ -42,7 +42,8 @@ export default function App() {
   return (
     <AuthProvider>
       <RemoteProvider>
-      <LaunchSequence />
+      {/* The remote session page skips the launch animation: on a phone you want the chat now. */}
+      {!window.location.pathname.startsWith('/sessions/') && <LaunchSequence />}
       <BrowserRouter>
         <Routes>
           {/* Standalone (no sidebar) so it works on a phone; served with a strict CSP. */}

@@ -42,8 +42,8 @@ const components: Components = {
     )
   },
   img: ({ src, alt }) => (
-    <span className="inline-flex items-baseline gap-1 px-1 border border-dashed border-line-str text-[12px] text-ink-2" data-blocked-image="">
-      [image not loaded{alt ? `: ${alt}` : ''}]{typeof src === 'string' && src ? <span className="font-mono break-all">{src}</span> : null}
+    <span className="px-1 border border-dashed border-line-str text-[12px] text-ink-2 break-all" data-blocked-image="">
+      [image not loaded{alt ? `: ${alt}` : ''}]{typeof src === 'string' && src ? <span className="font-mono"> {src}</span> : null}
     </span>
   ),
 }

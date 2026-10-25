@@ -119,7 +119,7 @@ function SessionView({ sessionId }: { sessionId: string }) {
       {!ended && state.online === false && <Banner tone="warn">Laptop offline. It may be asleep or off the network; this page catches up when it's back.</Banner>}
 
       <div ref={scroller} className="flex-1 min-h-0 overflow-y-auto" aria-label="Transcript" aria-live="polite">
-        <div className="max-w-[860px] mx-auto px-3 sm:px-5 py-4 grid gap-3">
+        <div className="max-w-[860px] mx-auto px-3 sm:px-5 py-4 grid grid-cols-[minmax(0,1fr)] gap-3">
           {state.items.length === 0 && visibleOutgoing.length === 0 && (
             <p className="m-0 text-[13px] text-ink-3 text-center py-8">{state.connection === 'live' ? 'Nothing here yet. Send a message to the agent.' : 'Connecting…'}</p>
           )}
