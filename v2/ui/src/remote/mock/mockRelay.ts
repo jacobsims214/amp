@@ -12,7 +12,7 @@ import { pairingLinkFor } from '../pairingLink'
 import type { RemoteDeps } from '../remote-context'
 import { RelayError, type EventStreamHandlers, type RelayTransport } from '../transport'
 import type {
-  ChatEvent, CommandEnvelope, HarnessPin, HelloBody, PromptBody, QueueItem, RelayFrame, SessionDetail, SessionStatus,
+  ChatEvent, CommandEnvelope, HarnessPin, HelloBody, PromptBody, QueueItem, RelayFrame, SessionDetail, SessionStatus, SessionSummary,
 } from '../types'
 
 export const MOCK_SIG = 'mock-signature'
@@ -53,6 +53,12 @@ export interface MockRelayOptions {
   /** Seed the buffer with a transcript that uses every ChatEvent type. */
   seed?: boolean
   online?: boolean
+  /** Replay a recorded harness feed instead (`at_ms` becomes each envelope's `ts`). */
+  stream?: { at_ms: number; event: ChatEvent }[]
+  /** Status fields to use instead of the defaults. */
+  status?: Partial<SessionStatus>
+  /** More sessions for the list (the Sessions page in dev), besides this one. */
+  others?: SessionSummary[]
 }
 
 const baseStatus = (): SessionStatus => ({
@@ -108,10 +114,15 @@ export class MockRelay {
   private stepMs: number
   /** Every command the relay received, for tests. */
   readonly received: CommandEnvelope[] = []
+  readonly others: SessionSummary[]
+  /** Set by revoke-all. */
+  revoked = false
 
   constructor(opts: MockRelayOptions = {}) {
     this.stepMs = opts.stepMs ?? 250
     this.online = opts.online ?? true
+    this.others = opts.others ?? []
+    if (opts.status) this.statusBody = { ...this.statusBody, ...opts.status }
     const hello: HelloBody = {
       harness: { harness_id: MOCK_HARNESS_ID, harness_pub: MOCK_HARNESS_PUB, host: 'jacobs-mbp', os: 'macos', version: '0.4.0' },
       user_id: 1001, ops: ['prompt', 'stop', 'detach'],
@@ -119,7 +130,26 @@ export class MockRelay {
       status: this.statusBody,
     }
     this.emit('hello', hello)
-    if (opts.seed) for (const ev of seedChatEvents()) this.chat(ev)
+    if (opts.stream) for (const e of opts.stream) this.emit('chat_event', e.event, null, e.at_ms)
+    else if (opts.seed) {
+      // A little time between the seeded events, so durations read like a real run.
+      const t0 = Date.now() - 120_000
+      seedChatEvents().forEach((ev, i) => this.emit('chat_event', ev, null, t0 + i * 900))
+    }
+  }
+
+  /** What GET /api/sessions returns. */
+  list(): SessionSummary[] {
+    if (this.revoked) return []
+    return [...(this.ended ? [] : [this.summary()]), ...this.others]
+  }
+
+  /** POST /api/sessions/revoke-all. */
+  revokeAll(): { ended: number; devices_revoked: number } {
+    const ended = this.list().length
+    this.revoked = true
+    if (!this.ended) this.end('revoked')
+    return { ended, devices_revoked: 1 }
   }
 
   summary(): SessionDetail {
@@ -131,9 +161,9 @@ export class MockRelay {
   }
 
   /** Builds and publishes a harness event (the wire text a real harness would sign). */
-  emit(op: string, body: unknown, device_id: string | null = null): string {
+  emit(op: string, body: unknown, device_id: string | null = null, ts = Date.now()): string {
     const env = { v: 1, alg: 'ES256', session_id: this.sessionId, harness_id: MOCK_HARNESS_ID, device_id,
-      seq: ++this.seq, ts: Date.now(), nonce: `n${this.seq}`, op, body, sig: MOCK_SIG }
+      seq: ++this.seq, ts, nonce: `n${this.seq}`, op, body, sig: MOCK_SIG }
     const wire = JSON.stringify(env)
     if (op === 'hello') this.hello = wire
     if (op === 'status') this.status = wire
@@ -267,7 +297,8 @@ export class MockRelay {
 export function mockTransport(relay: MockRelay): RelayTransport {
   const check = (id: string) => { if (id !== relay.sessionId) throw new RelayError(404, 'not_found', 'No such session.') }
   return {
-    listSessions: async () => relay.ended ? [] : [relay.summary()],
+    listSessions: async () => relay.list(),
+    revokeAll: async () => relay.revokeAll(),
     getSession: async id => {
       check(id)
       if (relay.ended) throw new RelayError(410, 'session_ended', 'The session has ended.')
@@ -291,7 +322,11 @@ export function mockTransport(relay: MockRelay): RelayTransport {
       return () => { closed = true; unsub() }
     },
     postCommand: async (id, env) => { check(id); relay.receive(env) },
-    disconnect: async id => { check(id); relay.end('disconnected') },
+    disconnect: async id => {
+      const other = relay.others.findIndex(o => o.session_id === id)
+      if (other >= 0) { relay.others.splice(other, 1); return }
+      check(id); relay.end('disconnected')
+    },
     pair: async (id, msg) => {
       check(id)
       // The mock laptop says yes after a few seconds, long enough to see the code.
@@ -307,7 +342,51 @@ export function mockTransport(relay: MockRelay): RelayTransport {
  * Opened with a pairing link (`#p=<any 32 bytes b64u>&h=<MOCK_HARNESS_ID>`) it starts unpaired
  * and shows the pairing screen; the mock laptop accepts after 4 s.
  */
-export function devMockDeps(): RemoteDeps {
-  const relay = new MockRelay({ seed: true })
+/**
+ * The worker scene of the TUI capture qa-3d U120-05 (two dispatched workers running, #2347), as
+ * ChatEvents: the harness feed that produced the capture wasn't recorded, so this one is
+ * rebuilt from the capture's text. `t0` is when the prompt was sent.
+ */
+export function workerScene(t0: number): { at_ms: number; event: ChatEvent }[] {
+  const m = 'msg_w1'
+  const ev = (dt: number, event: ChatEvent) => ({ at_ms: t0 + dt, event })
+  const worker = (task_id: number, name: string) => ({ task_id, name, role: 'amp:amp-worker-backend', state: 'running' as const,
+    model: 'wf-1', started_at_ms: t0 + 900 })
+  return [
+    ev(0, { type: 'user_message', prompt_id: 'p_w1', text: 'dispatch both', origin: 'local', device_id: null, device_name: null }),
+    ev(0, { type: 'run_start', run_id: 'run_w1', prompt_id: 'p_w1' }),
+    ev(10, { type: 'message_start', message_id: m, model: 'boss-1', provider: 'boss' }),
+    ev(200, { type: 'thinking_delta', message_id: m, delta: 'Both tickets are ready; dispatch them together.' }),
+    ev(600, { type: 'message_end', message_id: m, stop_reason: 'tool_use', error: null, model: 'boss-1', provider: 'boss',
+      usage: { input_tokens: 7400, output_tokens: 120, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd_micros: 0 } }),
+    ev(610, { type: 'tool_start', message_id: m, tool_call_id: 'c_218', name: 'amp_run_ticket', arguments_json: '{"task_id":218}', truncated: false }),
+    ev(611, { type: 'tool_start', message_id: m, tool_call_id: 'c_219', name: 'amp_run_ticket', arguments_json: '{"task_id":219}', truncated: false }),
+    ev(900, { type: 'notice', level: 'info', code: null, text: '▶ worker started  #218 Add the clamp helper with a fairly long… · QA3d epic › Watch workers · worker-backend (wf-1)' }),
+    ev(901, { type: 'notice', level: 'info', code: null, text: '▶ worker started  #219 Write the README line · QA3d epic › Watch workers · worker-backend (wf-1)' }),
+    ev(902, { type: 'worker_status', workers: [worker(218, 'Add the clamp helper with a fairly long ticket name to test cuts'), worker(219, 'Write the README line')] }),
+  ]
+}
+
+export function devMockDeps(kind: string = '1', stream?: { at_ms: number; event: ChatEvent }[], opts: { cut?: number; scene?: string } = {}): RemoteDeps {
+  const now = Date.now()
+  const others: SessionSummary[] = [
+    { session_id: 'rs_OtherSessionBBBBBBBBBB', harness_id: 'h-other', harness_fp_display: '8F1D-02AA-71C3-9E40', host: 'build-box',
+      os: 'linux', harness_version: '0.4.0', project: { id: 158, name: 'QA 2365 plan' }, online: false, viewers: 0,
+      started_at_ms: now - 5 * 3_600_000, expires_at_ms: now + 7 * 3_600_000, last_activity_at_ms: now - 42 * 60_000, protocol_version: 1 },
+  ]
+  let replay: { at_ms: number; event: ChatEvent }[] | undefined
+  if (kind === 'parity') {
+    if (opts.scene === 'workers') replay = workerScene(now - 3_400)
+    else if (stream?.length) {
+      // Replay the recorded feed as if it had just happened (cut part way to see a run in flight).
+      const cut = opts.cut && opts.cut > 0 ? stream.slice(0, opts.cut) : stream
+      const shift = now - 1_500 - cut[cut.length - 1].at_ms
+      replay = cut.map(e => ({ at_ms: e.at_ms + shift, event: e.event }))
+    }
+  }
+  const relay = replay
+    ? new MockRelay({ stream: replay, others, status: { model: 'faux/faux-1', context_pct: 4, cost_usd_micros: 177_000,
+        project: { id: 158, name: 'QA 2365 plan' }, ticket_id: 514, branch: 'remote-m1', workers_running: opts.scene === 'workers' ? 2 : 0 } })
+    : new MockRelay({ seed: true, others })
   return { transport: mockTransport(relay), crypto: mockCrypto({ paired: !pairingLinkFor(MOCK_SESSION_ID) }), mock: true }
 }

@@ -17,6 +17,7 @@ import { Portfolio } from './pages/Portfolio'
 import { Artifacts } from './pages/Artifacts'
 import { ArtifactView } from './pages/ArtifactView'
 import { Session } from './pages/Session'
+import { Sessions } from './pages/Sessions'
 import { RemoteProvider } from './remote/RemoteProvider'
 import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
@@ -50,6 +51,7 @@ export default function App() {
           <Route path="/sessions/:sessionId" element={<Session />} />
           <Route element={<AppShell />}>
             <Route path="/" element={<MyWork />} />
+            <Route path="/sessions" element={<Sessions />} />
             <Route path="/projects" element={<Projects />} />
             <Route path="/project/:projectId" element={<Mission />} />
             <Route path="/project/:projectId/board" element={<Board />} />

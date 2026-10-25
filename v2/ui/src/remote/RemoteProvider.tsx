@@ -2,7 +2,7 @@ import { type ReactNode, useEffect, useState } from 'react'
 import { defaultRemoteDeps, RemoteContext, type RemoteDeps } from './remote-context'
 
 /**
- * Provides the relay transport and the signing hook. With VITE_REMOTE_MOCK=1
+ * Provides the relay transport and the signing hook. With VITE_REMOTE_MOCK=1 (or =parity, the recorded harness feed)
  * at build or dev time (`VITE_REMOTE_MOCK=1 npm run dev`) it swaps in the
  * in-memory mock relay and harness, so the page can be worked on before the
  * relay exists. Normal builds never include the mock: the flag is replaced at
@@ -12,8 +12,15 @@ export function RemoteProvider({ children, deps }: { children: ReactNode; deps?:
   const [mockDeps, setMockDeps] = useState<RemoteDeps | null>(null)
   useEffect(() => {
     if (deps) return
-    if (import.meta.env.VITE_REMOTE_MOCK === '1') {
+    const flag = import.meta.env.VITE_REMOTE_MOCK
+    if (flag === '1') {
       import('./mock/mockRelay').then(m => setMockDeps(m.devMockDeps()))
+    } else if (flag === 'parity') {
+      // The feed recorded from the real harness chat (#2386), for side-by-side checks with the TUI.
+      Promise.all([import('./mock/mockRelay'), import('./mock/parityStream.json')])
+        .then(([m, s]) => setMockDeps(m.devMockDeps('parity', s.default as Parameters<typeof m.devMockDeps>[1], {
+          cut: Number(import.meta.env.VITE_PARITY_CUT ?? 0), scene: import.meta.env.VITE_PARITY_SCENE,
+        })))
     }
   }, [deps])
   return <RemoteContext.Provider value={deps ?? mockDeps ?? defaultRemoteDeps}>{children}</RemoteContext.Provider>
