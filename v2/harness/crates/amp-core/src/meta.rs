@@ -1041,6 +1041,8 @@ pub struct MetaOptions {
 enum Command {
     Refresh(Topics),
     SetProject(Option<i64>),
+    /// The session's `.amp.json` changed (#2383): its project and the parent folder note.
+    Link(Option<i64>, Option<(i64, String)>),
     SetTicket(Option<i64>),
     SetWorkers(Vec<i64>),
     Call(Call),
@@ -1111,6 +1113,12 @@ impl MetaHandle {
         let _ = self.0.commands.send(Command::SetProject(project_id));
     }
 
+    /// The chat's folder was linked to another project, or its `.amp.json` changed (#2383): like
+    /// [`Self::set_project`], and the `/project` panel's parent-folder note (`marker`) is replaced.
+    pub fn link_project(&self, project_id: Option<i64>, marker: Option<(i64, String)>) {
+        let _ = self.0.commands.send(Command::Link(project_id, marker));
+    }
+
     /// Switches the current ticket (`/ticket`, a claim): clears its items and refetches them.
     pub fn set_ticket(&self, ticket_id: Option<i64>) {
         let _ = self.0.commands.send(Command::SetTicket(ticket_id));
@@ -1176,6 +1184,10 @@ impl MetaHandle {
                 match cmd {
                     Command::Refresh(_) => {}
                     Command::SetProject(id) => bump(&|m| m.project_id = id),
+                    Command::Link(id, marker) => bump(&|m| {
+                        m.project_id = id;
+                        m.project_marker = marker.clone();
+                    }),
                     Command::SetTicket(id) => bump(&|m| m.ticket_id = id),
                     Command::SetWorkers(ids) => bump(&|m| m.worker_ids = ids.clone()),
                     Command::Call(c) => {
@@ -1461,6 +1473,12 @@ impl MetaPoller {
             Command::Call(call) => {
                 self.calls.push(call);
                 Topics::NONE
+            }
+            Command::Link(id, marker) => {
+                if self.meta().project_marker != marker {
+                    self.update(|m| m.project_marker = marker);
+                }
+                self.apply(Command::SetProject(id))
             }
             Command::SetProject(id) => {
                 if self.meta().project_id == id {

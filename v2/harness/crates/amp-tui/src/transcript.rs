@@ -94,7 +94,7 @@ fn wrap_lines(text: &str, pad: &str, width: usize) -> Vec<String> {
 /// Lines of text, word-wrapped: rpi's `Text` (left padding, blank rows above and below), with
 /// hanging indents under a line's leading spaces.
 pub struct WrapText {
-    text: String,
+    text: Mutex<String>,
     padding_x: usize,
     padding_y: usize,
     /// The blank rows above it too (else only below).
@@ -107,7 +107,7 @@ pub struct WrapText {
 impl WrapText {
     pub fn new(text: impl Into<String>, padding_x: usize, padding_y: usize) -> Self {
         Self {
-            text: text.into(),
+            text: Mutex::new(text.into()),
             padding_x,
             padding_y,
             padding_top: true,
@@ -127,6 +127,19 @@ impl WrapText {
         self.padding_bottom = bottom;
         self
     }
+
+    /// The text now.
+    pub fn text(&self) -> String {
+        self.text.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    /// Replaces the text (#2383: the banner's project line after the folder was linked).
+    pub fn set_text(&self, text: impl Into<String>) {
+        if let Ok(mut t) = self.text.lock() {
+            *t = text.into();
+        }
+        self.cache.clear();
+    }
 }
 
 impl Component for WrapText {
@@ -136,7 +149,7 @@ impl Component for WrapText {
             let mut lines = vec![String::new(); above];
             let content_width = width.saturating_sub(self.padding_x).max(1);
             lines.extend(wrap_lines(
-                &self.text,
+                &self.text(),
                 &" ".repeat(self.padding_x),
                 content_width,
             ));

@@ -32,7 +32,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -488,6 +488,9 @@ struct LiveWorker {
 pub struct Supervisor {
     rt: Arc<Runtime>,
     manager: ManagerContext,
+    /// The manager's `.amp.json` now: [`ManagerContext::project`] until the chat's folder is
+    /// linked to another project ([`Supervisor::set_project`], #2383).
+    project: Mutex<Option<ProjectMarker>>,
     config: SupervisorConfig,
     slots: Arc<Semaphore>,
     cancel: CancellationToken,
@@ -527,6 +530,7 @@ impl Supervisor {
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(config.max_parallel.max(1))),
             rt,
+            project: Mutex::new(manager.project.clone()),
             manager,
             config,
             cancel: CancellationToken::new(),
@@ -542,6 +546,20 @@ impl Supervisor {
 
     pub fn config(&self) -> &SupervisorConfig {
         &self.config
+    }
+
+    /// The project marker workers get from now on (#2383: the manager wrote `.amp.json` in the
+    /// chat). Running workers keep the one they were started with.
+    pub fn set_project(&self, project: Option<ProjectMarker>) {
+        *self.project.lock().unwrap_or_else(PoisonError::into_inner) = project;
+    }
+
+    /// The project marker new workers get.
+    pub fn project(&self) -> Option<ProjectMarker> {
+        self.project
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The manager's `amp_run_ticket` tool, for [`AgentSpec::extra_tools`].
@@ -1083,7 +1101,7 @@ impl Supervisor {
             w.watch = Some(Arc::clone(&watch));
         }
         let mut spec = AgentSpec::new(role.id.clone(), info.cwd.clone());
-        spec.project = self.manager.project.clone();
+        spec.project = self.project();
         spec.extra_context = Some(worker_context(&info, &self.manager.role));
         spec.session = SessionKind::Jsonl {
             dir: self
@@ -1123,7 +1141,7 @@ impl Supervisor {
         info.model = built.resolved.model_ref();
         let session_file = built.session_file.clone();
         let harness = Arc::clone(&built.harness);
-        let prompt = worker_prompt(&info, req, self.manager.project.as_ref());
+        let prompt = worker_prompt(&info, req, self.project().as_ref());
         // The chat's session view starts with the prompt (#2252); rpi doesn't emit it.
         watch.feed.push(&AgentEvent::MessageStart {
             message: rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage {

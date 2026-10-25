@@ -146,6 +146,8 @@ enum ShellMsg {
     },
     /// The file watcher saw the configuration change: reload (not counted in `in_flight`).
     ReloadRequest,
+    /// The chat's `.amp.json` changed (#2383). Not counted in `in_flight`.
+    ProjectLinked(ProjectLinked),
     /// A line from a background task the shell did not start ([`Notifier`]); not counted in
     /// `in_flight`.
     Notice {
@@ -179,6 +181,25 @@ impl Notifier {
     pub fn reload(&self) {
         let _ = self.0.send(ShellMsg::ReloadRequest);
     }
+
+    /// The chat's folder is linked to another project now (#2383: the manager wrote
+    /// `.amp.json`); see [`ProjectLinked`].
+    pub fn project_linked(&self, link: ProjectLinked) {
+        let _ = self.0.send(ShellMsg::ProjectLinked(link));
+    }
+}
+
+/// The chat's folder is linked to another project now (#2383): what changes on screen.
+#[derive(Debug, Clone, Default)]
+pub struct ProjectLinked {
+    /// The header, status line and board follow it (`None`: no project).
+    pub project_id: Option<i64>,
+    /// The `/project` panel's note for a parent folder's marker (#2356).
+    pub marker: Option<(i64, String)>,
+    /// A notice for the transcript.
+    pub notice: String,
+    /// The banner's project text: (what it says now, what it says from now on).
+    pub banner: Option<(String, String)>,
 }
 
 /// What `/connect` did: a message for the transcript (never a secret), and the providers and
@@ -2248,6 +2269,16 @@ impl Shell {
                 self.reload_command(ReloadCause::Watcher);
                 continue;
             }
+            if let ShellMsg::ProjectLinked(link) = msg {
+                if let Some(meta) = &self.meta {
+                    meta.link_project(link.project_id, link.marker);
+                }
+                if let Some((from, to)) = &link.banner {
+                    self.view.replace_in_banner(from, to);
+                }
+                self.view.add_notice(&link.notice);
+                continue;
+            }
             self.in_flight = self.in_flight.saturating_sub(1);
             match msg {
                 ShellMsg::Plan {
@@ -2296,7 +2327,7 @@ impl Shell {
                     }
                 }
                 ShellMsg::Config { result, command } => self.apply_config(result, &command),
-                ShellMsg::Notice { .. } | ShellMsg::ReloadRequest => {}
+                ShellMsg::Notice { .. } | ShellMsg::ReloadRequest | ShellMsg::ProjectLinked(_) => {}
                 ShellMsg::Answered { ticket, result } => match result {
                     Ok(_) => {
                         self.view.panel().update(|s| {

@@ -69,6 +69,7 @@ use std::{
 use amp_core::{
     meta::{Connector, MetaHandle, MetaOptions, MetaPoller},
     models::{ModelsConfig, thinking_name},
+    project::ProjectMarker,
     providers::ProviderSet,
 };
 use amp_tui::{AmpTheme, ModelChoice, Notifier, Shell, ShellInfo, Submit, ThemeSettings};
@@ -245,17 +246,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     let project_marker = session
         .project
         .as_ref()
-        .filter(|p| p.in_parent_of(&session.cwd))
-        .map(|p| {
-            (
-                p.project_id,
-                format!(
-                    "{} (a parent folder's: {})",
-                    p.shown_from(&session.cwd),
-                    p.path.display()
-                ),
-            )
-        });
+        .and_then(|p| crate::relink::parent_note(p, &session.cwd));
     // `/server` (#2164): list the saved servers and switch this session to another one.
     let switcher = Arc::new(
         Switcher::new(
@@ -271,7 +262,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     );
     shell.set_server_control(Arc::clone(&switcher) as Arc<dyn amp_tui::ServerControl>);
     // `/reload` (#2242): CLI changes made in another terminal, without a restart.
-    shell.set_reload(Arc::new(crate::reload::ChatReload::new(&session)));
+    let reload = Arc::new(crate::reload::ChatReload::new(&session));
+    shell.set_reload(Arc::clone(&reload) as Arc<dyn amp_tui::ReloadControl>);
     // #2245: `/mcp`, `/agents`, `/skills`, `/model roles`, `/config`; their changes reload.
     shell.set_config(Arc::new(crate::chat_config::ChatConfig::new(
         crate::chat_config::ChatConfigParts {
@@ -345,6 +337,34 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
                 move || notes.reload(),
             ))
         });
+        // #2383: the manager (or anyone) writes or changes `.amp.json` here: the header, status
+        // line, board, the manager's context and new workers follow it.
+        let relinker = {
+            let relink = Arc::new(crate::relink::Relink {
+                cwd: session.cwd.clone(),
+                reload: Arc::clone(&reload),
+                supervisor: session.supervisor.clone(),
+                switcher: Arc::clone(&switcher),
+                notes: shell.notifier(),
+                banner: std::sync::Mutex::new(banner_project(
+                    session.project.as_ref(),
+                    &session.cwd,
+                )),
+            });
+            let ceiling = std::env::var_os(amp_core::project::ENV_CEILING_DIR)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from);
+            tokio::spawn(crate::relink::watch(
+                session.cwd.clone(),
+                ceiling,
+                session.project.clone(),
+                crate::relink::WATCH_EVERY,
+                move |marker| {
+                    let relink = Arc::clone(&relink);
+                    async move { relink.apply(marker).await }
+                },
+            ))
+        };
         if let Some(sup) = session.supervisor.clone() {
             shell
                 .view()
@@ -356,6 +376,7 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         if let Some(watcher) = watcher {
             watcher.abort();
         }
+        relinker.abort();
         // Stdio MCP servers get EOF and their process groups are killed before we exit.
         hub.shutdown().await;
         // Back on the main screen: where the conversation was saved (#2184).
@@ -713,6 +734,25 @@ fn session_id(path: &Path) -> String {
     format!("{head}…{tail}")
 }
 
+/// The banner's project text: `project #45 Harness play`, with where a parent folder's marker is
+/// (#2356), or that there is none. [`crate::relink`] replaces it when the folder is linked.
+pub(crate) fn banner_project(marker: Option<&ProjectMarker>, cwd: &Path) -> String {
+    match marker {
+        Some(p) => {
+            let project = match &p.project_name {
+                Some(name) => format!("project #{} {name}", p.project_id),
+                None => format!("project #{}", p.project_id),
+            };
+            if p.in_parent_of(cwd) {
+                format!("{project} (from {})", p.shown_from(cwd))
+            } else {
+                project
+            }
+        }
+        None => "no .amp.json here (no project)".to_owned(),
+    }
+}
+
 /// How long the banner waits for this server's name of the marker's project (#2206).
 const MARKER_CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -750,21 +790,7 @@ async fn marker_warning(s: &session::Session) -> Option<String> {
 fn shell_info(s: &session::Session, marker_warning: Option<&str>) -> ShellInfo {
     let resolved = &s.agent.resolved;
     let mcp = s.rt.mcp.session();
-    let project = match &s.project {
-        Some(p) => {
-            let project = match &p.project_name {
-                Some(name) => format!("project #{} {name}", p.project_id),
-                None => format!("project #{}", p.project_id),
-            };
-            // #2356: a parent folder's marker says where it is.
-            if p.in_parent_of(&s.cwd) {
-                format!("{project} (from {})", p.shown_from(&s.cwd))
-            } else {
-                project
-            }
-        }
-        None => "no .amp.json here (no project)".to_owned(),
-    };
+    let project = banner_project(s.project.as_ref(), &s.cwd);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let session_file = s
         .agent
