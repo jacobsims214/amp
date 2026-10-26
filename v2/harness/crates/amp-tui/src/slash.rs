@@ -166,7 +166,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Group::Amp,
         "remote",
         "[on|off|pair]",
-        "chat from AMP on a phone; /remote devices too",
+        "chat from a phone; /remote copy, open, devices",
     ),
     CommandSpec::new(
         Group::Config,

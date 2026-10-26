@@ -58,6 +58,7 @@
 
 pub mod amp_render;
 pub mod chrome;
+pub mod clipboard;
 pub mod density;
 pub mod footer;
 pub mod history;
@@ -79,10 +80,12 @@ pub mod workers;
 pub mod wrap;
 
 pub use chrome::{Chrome, ChromeData, ReportState};
+pub use clipboard::{Copied, Desktop, Platform};
 pub use density::Density;
 pub use history::{HISTORY_LIMIT, PromptHistory, Recall};
 pub use inset::{
-    DEFAULT_PADDING, Gap, Inset, MAX_PADDING, MIN_INNER, NARROW, Padding, SHORT, VERTICAL,
+    DEFAULT_PADDING, FLUSH_LEFT, Gap, Inset, MAX_PADDING, MIN_INNER, NARROW, Padding, SHORT,
+    VERTICAL,
 };
 pub use newline::NewlineMode;
 pub use overlay::{

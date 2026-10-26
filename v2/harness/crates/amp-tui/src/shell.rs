@@ -582,6 +582,9 @@ pub struct Shell {
     /// The AMP metadata poller (#2104), if the caller started one.
     meta: Option<MetaHandle>,
     opener: Opener,
+    /// The clipboard and browser for `/remote`'s pairing link (#2423): off until the terminal
+    /// loop turns the real one on ([`Shell::attach_terminal`]); tests set recording stand-ins.
+    desktop: crate::clipboard::Desktop,
     msgs_tx: UnboundedSender<ShellMsg>,
     msgs_rx: UnboundedReceiver<ShellMsg>,
     /// Command calls still running.
@@ -706,6 +709,7 @@ impl Shell {
                 done_tx,
                 meta: None,
                 opener: Arc::new(|url: &str| amp_mcp::oauth::open_browser(url)),
+                desktop: crate::clipboard::Desktop::off(),
                 msgs_tx,
                 msgs_rx,
                 in_flight: 0,
@@ -925,10 +929,11 @@ impl Shell {
             .unwrap_or((80, 24))
     }
 
-    /// `/remote [on|off|pair|devices [revoke <n|all>]|status]` (#2376).
+    /// `/remote [on|off|pair|copy|open|devices [revoke <n|all>]|status]` (#2376, #2423).
     fn remote_command(&mut self, arg: &str) {
         const USAGE: &str = "/remote: use /remote (turn it on), /remote off, /remote pair, \
-                             /remote devices, /remote devices revoke <n|all>";
+                             /remote copy, /remote open, /remote devices, \
+                             /remote devices revoke <n|all>";
         let Some(ui) = &self.remote else {
             self.view.add_notice(
                 "/remote: not available in this session (remote control needs the interactive \
@@ -965,6 +970,37 @@ impl Shell {
                 self.remote_job(async move { RemoteReply::Enabled(link.enable().await) });
             }
             ("status", []) => self.remote_status(&link, now),
+            ("copy", []) | ("open", []) => {
+                let open_link = match link.current() {
+                    amp_core::remote::RemoteState::On(on) => on
+                        .link
+                        .filter(|_| on.link_expires_at_ms.is_some_and(|until| until > now)),
+                    _ => {
+                        self.view.add_notice(&format!(
+                            "/remote {verb}: remote control is off; /remote turns it on and \
+                             makes a pairing link."
+                        ));
+                        return;
+                    }
+                };
+                match open_link {
+                    None => self.view.add_notice(&format!(
+                        "/remote {verb}: no pairing link is open (each one works once); \
+                         /remote pair makes a new one."
+                    )),
+                    Some(url) if verb == "copy" => self.copy_pairing_link(&url, true),
+                    Some(url) => match self.desktop.open(&url) {
+                        Ok(_) => self.view.add_notice(
+                            "Opened the pairing link in this computer's browser: sign in to AMP \
+                             there if asked, then answer y here.",
+                        ),
+                        Err(e) => self.view.add_error(&format!(
+                            "/remote open: couldn't open the browser ({e}); /remote copy copies \
+                             the link instead."
+                        )),
+                    },
+                }
+            }
             ("off", []) if !link.is_on() => self.view.add_notice("Remote control is already off."),
             ("off", []) => {
                 self.remote_job(async move {
@@ -1088,6 +1124,14 @@ impl Shell {
         ));
         self.view
             .add_to_transcript(Arc::new(crate::remote_ui::LinkBlock::new(url)));
+        // #2423: how else to get the link out of the chat.
+        self.view.add_notice(if self.mouse_capture {
+            "/remote copy copies the link again, /remote open opens it in this computer's \
+             browser. To select it yourself: Option-drag (iTerm2) or Fn-drag (Terminal.app)."
+        } else {
+            "/remote copy copies the link again, /remote open opens it in this computer's \
+             browser, or select it with the mouse."
+        });
         let (w, h) = self.screen_size();
         if qr_fits(url, w, h)
             && let Some(qr) = QrBlock::new(url)
@@ -1098,6 +1142,31 @@ impl Shell {
                 "(No QR code: it needs a window of about {}x{}; this one is {w}x{h}. Use the link.)",
                 cols + 4,
                 rows + 12
+            ));
+        }
+        self.copy_pairing_link(url, false);
+    }
+
+    /// Puts the pairing link on the clipboard (#2423) and says so, never showing or logging it
+    /// again. `asked`: `/remote copy` (so a chat with no clipboard says why nothing happened).
+    fn copy_pairing_link(&mut self, url: &str, asked: bool) {
+        let copied = self.desktop.copy(url);
+        let failed = copied
+            .tool_error
+            .as_deref()
+            .map(|e| format!(" ({e})"))
+            .unwrap_or_default();
+        if copied.tool.is_some() {
+            self.view
+                .add_notice("Pairing link copied to the clipboard.");
+        } else if copied.osc52 {
+            self.view.add_notice(&format!(
+                "Pairing link sent to the terminal's clipboard (OSC 52){failed}. If pasting gives \
+                 nothing, your terminal doesn't allow it: /remote open, or select the link."
+            ));
+        } else if asked || copied.tool_error.is_some() {
+            self.view.add_notice(&format!(
+                "/remote copy: no clipboard here{failed}; /remote open, or select the link."
             ));
         }
     }
@@ -1846,6 +1915,22 @@ impl Shell {
     /// Replaces the browser opener (tests record the URL instead of opening it).
     pub fn set_opener(&mut self, opener: Opener) {
         self.opener = opener;
+    }
+
+    /// The clipboard and browser `/remote` copies and opens its pairing link with (#2423).
+    pub fn set_desktop(&mut self, desktop: crate::clipboard::Desktop) {
+        self.desktop = desktop;
+    }
+
+    /// The terminal loop started: unless a test set one, the system's clipboard tools and
+    /// browser; OSC 52 goes through `write`.
+    pub fn attach_terminal(&mut self, write: crate::clipboard::TerminalWrite) {
+        let desktop = if self.desktop.is_on() {
+            self.desktop.clone()
+        } else {
+            crate::clipboard::Desktop::system()
+        };
+        self.desktop = desktop.with_terminal(write);
     }
 
     pub fn handle_event(&mut self, event: &AgentEvent) {

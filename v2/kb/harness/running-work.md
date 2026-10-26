@@ -47,7 +47,8 @@ calls in full. Ctrl+W (with an empty message box) picks a running worker.
 **Selecting text.** The chat reports the mouse to itself (wheel scrolling, clicking a worker), so
 a plain drag doesn't select. Hold Fn (Terminal.app) or Option (iTerm2) while dragging, or set
 `[tui] mouse = false` (plain drag selects again; clicking a worker then doesn't work, Ctrl+W
-still does).
+still does). The `/remote` pairing link is copied for you, and `/remote copy` and `/remote open`
+copy or open it again (see [remote control](remote-control.md)).
 
 ## What to ask the manager
 
