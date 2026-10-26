@@ -1,11 +1,15 @@
 /**
  * The org's remote control policy (protocol 8.3 "Org policy"):
- * GET / PUT /api/orgs/:id/remote-control with {enabled, idle_timeout_min, device_pin_days}.
+ * GET / PUT /api/orgs/:id/remote-control with {enabled, idle_timeout_min, max_lifetime_hours, device_pin_days}.
  * Org admins only; the API is authoritative. PUT sends only what changed.
  */
 import { RelayError } from './transport'
 
-export interface OrgRemotePolicy { enabled: boolean; idle_timeout_min: number; device_pin_days: number }
+/**
+ * `idle_timeout_min` and `max_lifetime_hours` are 0 for "no limit", the default (#2424).
+ * `max_lifetime_hours` is missing from an API that predates it.
+ */
+export interface OrgRemotePolicy { enabled: boolean; idle_timeout_min: number; max_lifetime_hours?: number; device_pin_days: number }
 
 async function failure(res: Response): Promise<RelayError> {
   const body = await res.json().catch(() => ({})) as { error?: string; code?: string }

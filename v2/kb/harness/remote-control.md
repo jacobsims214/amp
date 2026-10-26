@@ -34,8 +34,8 @@ In the chat:
 
 The harness registers the chat with AMP and prints:
 
-- **when it ends:** at the latest 12 hours after you turned it on, sooner after 30 minutes with no
-  remote activity;
+- **when it ends:** by default only when you end it (it has no time limit); if your org set an
+  idle limit or a maximum length, the time it ends;
 - **a pairing link**, and under it a **QR code** to scan with your phone. The QR code needs a
   window of about 60 columns by 40 rows; in a smaller one (80x24) you get the link alone, so
   enlarge the window or copy the link;
@@ -88,14 +88,20 @@ Secrets the harness knows (provider keys, tokens) are blanked out of everything 
 A revoked device's commands are refused straight away; it must pair again. A device revoked in
 AMP shows a notice in the chat too.
 
-## Timeouts and what happens when the laptop sleeps
+## Sleep, network loss and restarts
 
-- Remote control turns itself off after **30 minutes without remote activity** and always **12
-  hours** after `/remote`. The chat says so; the laptop session keeps running.
-- If the laptop sleeps or loses the network, the footer shows `REMOTE OFFLINE · reconnecting` and
-  the page shows "Laptop offline". Messages sent meanwhile are refused, not kept for later. When
-  the network is back, the harness reconnects by itself and the chat says "Remote control
-  reconnected." If a time limit passed meanwhile, it stays off until you run `/remote` again.
+- Remote control has **no time limit** by default: it stays on until you end it (below). An org
+  admin can add an idle limit or a maximum length in the org settings; then the chat says when it
+  ends, and turns it off at that time. The laptop session keeps running either way.
+- If the laptop sleeps, loses the network, or AMP's relay restarts or is down for a while, the
+  footer shows `REMOTE OFFLINE · reconnecting` and the page shows "Laptop offline". Messages sent
+  meanwhile are refused, not kept for later. The harness keeps trying (every 30 seconds at most)
+  however long it takes, and when AMP is reachable again it reconnects by itself and the page
+  catches up. Nothing needs pairing again.
+- If the harness is killed or the laptop restarts, remote control is off in the new chat (the
+  harness can't resume a chat). AMP lists the old session as offline until you press
+  **Disconnect** on it, or run `/remote` again on this laptop, which ends it and starts a new
+  one. Your paired devices keep working with the new session; you don't pair again.
 
 ## Turn it off
 

@@ -1,6 +1,7 @@
 # AMP remote control: wire protocol v1 (M1)
 
-**Status:** contract for milestone M1 (epic 165, story 402). Ticket #2369. Written 2026-10-25.
+**Status:** contract for milestone M1 (epic 165, story 402). Ticket #2369. Written 2026-10-25. Session limits
+amended by #2424 (2026-10-26): no idle limit or lifetime by default (section 12.5).
 **Implemented by:** the Rust harness (`v2/harness`), the Go relay service amp-relay (`v2/amp-api/cmd/relay`,
 its own binary, image and Deployment since #2387; the code is shared in the `v2/amp-api` module) and the
 TypeScript web app (`v2/ui`). All three test suites load the shared vectors in
@@ -374,8 +375,8 @@ browser MUST ignore body members it doesn't know, because later v1 harnesses may
   "user_id": 1001,
   "ops": ["prompt", "stop", "detach"],
   "started_at_ms": 1792945200000,
-  "expires_at_ms": 1792988400000,
-  "idle_timeout_s": 1800,
+  "expires_at_ms": null,
+  "idle_timeout_s": null,
   "status": {
     "model": "anthropic/claude-opus-5-5",
     "busy": false,
@@ -439,6 +440,9 @@ browser MUST ignore body members it doesn't know, because later v1 harnesses may
     says it. `state` is one of `connecting`, `connected`, `slow` (with `latency_ms`, an integer), `degraded`,
     `login_needed`, `disconnected` (the harness keeps retrying). `latency_ms` is `null` except for `slow`. This is
     the harness's MCP connection, independent of the remote link itself.
+
+`hello.expires_at_ms` and `hello.idle_timeout_s` repeat the register answer (8.2): `null` when the org set no
+lifetime or no idle limit, the default since #2424; numbers when it did.
 
 ### 6.4 ChatEvent (`op: "chat_event"`)
 
@@ -622,7 +626,8 @@ for `rejected`, `failed` and `locked` results.
   in a 0600 state file such as `<state>/remote-devices.json`. Public keys aren't secret; the harness private
   key stays in the keychain.
 - `pinned_until_ms = accepted_at + min(30 days, org device_pin_days)`. An org value of 0 means "re-pair every
-  session": the pin lasts until that session ends.
+  session": the pin lasts until that session ends (the harness keeps it in memory only; with no session lifetime
+  its `pinned_until_ms` is `accepted_at + 30 days`).
 - A pin works for any later session of the same install, the same user and an unexpired pin, with no new pairing.
 - The harness checks pins again on every reconnect.
 - **Unpin:** locally with `/remote devices` (M1 only needs "unpin all"; the list is M2), or when the relay sends
@@ -644,7 +649,8 @@ for `rejected`, `failed` and `locked` results.
   `Content-Type` gets `415 unsupported_media_type`.
 - **Harness leg (`/relay/v1/…`).** Envoy routes `/relay/` with ext_authz off. The command stream
   (`…/commands`) has `timeout: 0s`, `idle_timeout: 120s` and `max_stream_duration: 12h`; every other harness call
-  has a 30 s timeout (#2399).
+  has a 30 s timeout (#2399). The 12 h cap is per stream, not per session: a stream Envoy cuts is reopened by the
+  harness (or the browser) at once, and the session carries on (#2424).
   - `POST /relay/v1/sessions` and `POST …/token` take the harness's **OAuth access token**: a Dex JWT whose
     audience includes `amp-mcp`, verified as `/mcp` verifies it. `POST …/token` also takes a proof signed by
     the session's harness key (8.2): the OAuth login alone never renews a session's connect token.
@@ -691,14 +697,19 @@ Request (≤ 8 KiB):
   "session_id": "rs_…",
   "protocol_version": 1,
   "connect_token": "rct_…", "connect_token_expires_at_ms": 1792949700000,
-  "started_at_ms": 1792948800000, "expires_at_ms": 1792992000000,
-  "idle_timeout_s": 1800, "device_pin_max_days": 30,
+  "started_at_ms": 1792948800000, "expires_at_ms": null,
+  "idle_timeout_s": null, "device_pin_max_days": 30,
   "heartbeat_interval_s": 20, "keepalive_interval_s": 20,
   "session_url": "https://amp.example/sessions/rs_…",
   "limits": {"command_bytes": 65536, "event_bytes": 1048576, "batch_bytes": 2097152, "batch_events": 64,
              "prompts_per_min": 20, "ops_per_min": 120, "viewers": 3, "pairing_tries": 5}
 }
 ```
+
+`expires_at_ms` is when the session's lifetime ends and `idle_timeout_s` its idle limit. Both are `null` unless the
+project's org set them (section 12.5, #2424): by default a session has no time limit. A harness MUST treat `null`
+(and a non-positive number) as "no limit". A harness built before #2424 can't read `null` and fails to turn remote
+control on; remote-m1 is unreleased, so update the harness with the relay.
 
 The relay checks:
 
@@ -777,7 +788,12 @@ Frames (the relay never sends `id:`, because commands are never replayed):
 | *(comment)* | `: ka` every 20 s |
 
 The harness reconnects when the stream drops, or when it hears nothing for 60 s: backoff 1, 2, 4 … up to 30 s
-with ±20% jitter. It stops trying once the session's `expires_at_ms` or idle limit has passed.
+with ±20% jitter. There is no deadline (#2424): after a sleep, a network loss, a relay restart or rollout, or a
+relay outage of any length it keeps trying, and renews its connect token with the signed proof (`POST …/token`)
+however long ago the token expired. It stops only when the session has ended (`410`, an `end` frame, the relay's
+own `404 not_found`, `403 remote_disabled` on the refresh) or, when the org set them, once the session's
+`expires_at_ms` or idle limit has passed. An answer that isn't the relay's (a bare `404`, a `503` from Envoy, the web
+app's HTML when the relay is switched off) is a pause, not an end: the session comes back with the relay.
 
 #### `POST /relay/v1/sessions/:id/events`: publish events
 
@@ -809,7 +825,7 @@ latest `hello` and `status` in the snapshot slot.
 
 Auth: the connect token. Empty body. Sent every 20 s.
 
-- `200 {"viewers": n, "idle_deadline_ms": …, "expires_at_ms": …}`
+- `200 {"viewers": n, "idle_deadline_ms": …|null, "expires_at_ms": …|null}` (`null`: no such limit, #2424)
 - `410 session_ended {"reason"}`
 
 The relay marks the harness **offline** after 60 s without a heartbeat, or when the command stream closes,
@@ -830,7 +846,7 @@ audits `remote.disable` (or `remote.expire` for `idle` and `expired`). The harne
 **An end the relay missed (#2396).** When `/remote off`, `detach` or the harness exiting can't reach the relay
 (no answer, a `5xx`, `429`, or `401` because the connect token lapsed during an outage), remote control is
 off on the laptop at once, and the harness SHOULD still tell the relay. Otherwise AMP lists the session as
-live and offline until its idle limit. The harness records the end locally
+live and offline until its idle limit, or, with no limits (the default), until someone ends it. The harness records the end locally
 (`<state>/remote-pending-ends.json`, mode 0600: the AMP origin, session id, harness id, reason and a
 deadline; never a token). It then sends the end in the background while it runs, and again when it next
 starts. Sending it is a token refresh signed with the harness key (`POST …/token`, above), then this
@@ -842,7 +858,7 @@ The harness drops the entry when:
 - the org switch is off (`403 remote_disabled`): the relay ended the org's sessions itself;
 - another `4xx` means it can never succeed (a proof from another key, for example);
 - the deadline passes. The deadline is the earlier of the session's idle deadline and its lifetime, because by
-  then the relay ends the session by itself.
+  then the relay ends the session by itself; with neither (the default), 30 days after the end (#2424).
 
 An end with reason `idle` or `expired` is never recorded, for the same reason. Only the AMP origin that the
 session belongs to is ever sent its end. The relay serves both calls on any replica: a holder that's gone is
@@ -861,13 +877,15 @@ appears, global admins and org owners included.
   "session_id": "rs_…", "harness_id": "…", "harness_fp_display": "29CA-E6B5-00C2-66CB",
   "host": "jacobs-mbp", "os": "macos", "harness_version": "0.4.0",
   "project": {"id": 2, "name": "AMP"}, "online": true, "viewers": 1,
-  "started_at_ms": …, "expires_at_ms": …, "last_activity_at_ms": …, "protocol_version": 1,
+  "started_at_ms": …, "expires_at_ms": null, "last_activity_at_ms": …, "protocol_version": 1,
   "state": "active", "end_reason": null, "ended_at_ms": null,
   "model": "anthropic/claude-opus-5-5",
   "ticket": {"id": 2369, "name": "RC-M1 amp-relay: sessions list"},
   "devices": [{"device_id": "…", "name": "Safari on iPhone", "paired_at_ms": …, "expires_at_ms": …}]
 }]}
 ```
+
+`expires_at_ms` is `null` for a session with no lifetime, the default since #2424 (the UI shows "Never").
 
 The members after `protocol_version` were added by #2389 (additive; a client that predates them ignores them):
 - `state` is `active` or `ended`. `end_reason` is the reason of section 12.2 for an ended session, else null, and
@@ -958,10 +976,14 @@ The per-device `DELETE /api/sessions/devices/:device_id` and the device list are
 `GET /api/orgs/:id/remote-control` and `PUT /api/orgs/:id/remote-control` with
 
 ```json
-{"enabled": false, "idle_timeout_min": 30, "device_pin_days": 30}
+{"enabled": false, "idle_timeout_min": 0, "max_lifetime_hours": 0, "device_pin_days": 30}
 ```
 
-- Defaults: `enabled: false`; `idle_timeout_min` 5..240, default 30; `device_pin_days` 0..30, default 30.
+- Defaults: `enabled: false`; `idle_timeout_min` 0 (no idle limit) or 5..240, default 0; `max_lifetime_hours` 0
+  (no lifetime) or 1..720, default 0; `device_pin_days` 0..30, default 30. Members left out of a `PUT` keep their
+  values, so a client that predates `max_lifetime_hours` (#2424) never changes it.
+- The idle limit applies to live sessions (the relay's sweep reads it every 30 s). The lifetime is fixed when a
+  session registers, so a new value applies to sessions started after it.
 - `PUT` audits `remote.policy.set`.
 - Served by **amp-api** (not the relay). Turning `enabled` off ends every live session in the org within
   seconds (reason `policy_off`). amp-api ends the sessions in Postgres and tells each session's holding
@@ -1060,16 +1082,24 @@ Clients MUST treat an unknown `code` as a generic failure of that HTTP status. N
 | Harness heartbeat | every 20 s; offline after 60 s | harness, relay |
 | Silence reconnect | 60 s without bytes | harness, browser |
 | Connect token | 15 min; refresh at 10 min | relay |
-| Idle timeout | 30 min without remote activity (org: 5-240 min) | harness (authoritative), relay (backstop: +60 s) |
-| Max lifetime | 12 h from registration | harness, relay |
+| Idle timeout | none by default; an org may set 5-240 min without remote activity (#2424) | harness (authoritative), relay (backstop: +60 s) |
+| Max lifetime | none by default; an org may set 1-720 h from registration (#2424) | harness, relay |
 | Device pin | 30 days (org: 0-30 days) | harness, browser |
 | Resync buffer | 200 events or 2 MiB, whichever is smaller; 10 min TTL; in memory only | relay |
 | Missing ack in the UI | 10 s | browser |
-| Envoy `/relay/` | The command stream: `timeout: 0s`, `idle_timeout: 120s` (`relay.streamIdleTimeout`), `max_stream_duration: 12h` (`relay.maxStreamDuration`); the other calls `timeout: 30s` (`relay.requestTimeout`) | Helm |
+| Envoy `/relay/` | The command stream: `timeout: 0s`, `idle_timeout: 120s` (`relay.streamIdleTimeout`), `max_stream_duration: 12h` (`relay.maxStreamDuration`, per stream: the harness reopens it); the other calls `timeout: 30s` (`relay.requestTimeout`) | Helm |
 | Envoy `/api/sessions/` | `…/events` as the command stream; the other calls `timeout: 30s` | Helm |
 
 **Remote activity**, for the idle timer, is a command the harness accepted or a new viewer attach. Events the
 harness sends don't count.
+
+**Keepalives and proxies (#2424).** With no session limit a stream can stay open for days, so every hop must
+keep it. The relay writes `: ka` every 20 s on both streams and the harness posts a heartbeat every 20 s, well
+inside Envoy's 120 s stream idle timeout (#2399). Keepalives can't help with a proxy that caps a whole request:
+Traefik v3's entry point `respondingTimeouts.readTimeout` defaults to 60 s and cuts SSE streams, so set it to 0
+in front of AMP (KB how-to/remote-control-local-test.md). Anything else in front of Envoy must not cut a stream
+that is quiet for less than 60 s. When a hop cuts one anyway (Envoy's 12 h
+`max_stream_duration`, a proxy restart), the harness and the browser reopen it at once.
 
 ## 11. Buffering, resume and presence
 
@@ -1148,8 +1178,8 @@ laptop registers a new session, and the device pins still apply.
 | `disconnected` | The browser's Disconnect endpoint |
 | `revoked` | Revoke-all, or the owner's AMP account was deactivated |
 | `policy_off` | The org or instance switch was turned off |
-| `idle` | 30 min (or the org value) without remote activity |
-| `expired` | 12 h since registration |
+| `idle` | The org's idle limit without remote activity (only when the org set one, #2424) |
+| `expired` | The org's lifetime since registration (only when the org set one, #2424) |
 | `replaced` | Command stream only: a newer stream of the same session took over (not a session end) |
 | `killed` | Reserved for the M2 admin kill |
 
@@ -1158,8 +1188,8 @@ Every path ends in under 5 s. The relay closes all of the session's streams (R-M
 ### 12.3 Re-checks
 
 - On every reconnect, the harness re-reads the local disable switch, re-checks its own idle and lifetime
-  deadlines (after sleep they may have passed, and then it ends locally), refreshes the token (the relay
-  re-checks org policy) and reloads its pins.
+  deadlines when the org set them (after sleep they may have passed, and then it ends locally), refreshes the
+  token (the relay re-checks org policy) and reloads its pins.
 - The relay re-checks org policy on register, on token refresh and on policy change.
 - **Deactivating a person** (`POST /api/users/:id/deactivate`) ends all of their live sessions with reason
   `revoked`, audited as `remote.disable`; amp-api tells the holder as for the org switch, so the streams close
@@ -1198,6 +1228,40 @@ insert into `audit_log` or the webhook outbox. amp-api's webhook dispatcher take
 
 The harness also keeps a local log of remote ops (op, device, time, result), with no payloads.
 
+### 12.5 What ends a session (#2424)
+
+User decision, 2026-10-26: "I want the remote session to live, reconnect automatically and keep itself alive until
+a user disconnects it." So by default a session has **no idle limit and no lifetime**. It ends only on:
+
+- `/remote off` or quitting the chat on the laptop (`harness_ended`), or a signed `detach` (`detached`);
+- **Disconnect** on the session page (`disconnected`), or **Revoke all** on Sessions (`revoked`);
+- the org switch turned off (`policy_off`), the owner deactivated or losing access to the project (`revoked`);
+- an org admin's opt-in idle limit (`idle`) or lifetime (`expired`), when set (8.3 "Org policy").
+
+The **relay's kill switch** (amp-relay scaled to 0, or `relay.enabled: false`) is a pause, not an end: the session
+stays `active`, the harness keeps trying (8.2) and the page shows "Laptop offline", and both resume when the relay
+is back. Sleep, network loss, a relay restart or rollout, and a relay outage of any length are the same.
+
+**Harness restart.** The harness has no chat resume: a chat started again is a new chat, with remote control
+off until `/remote` (R-M2: it is turned on per session by a local action). A chat that exits normally ends its
+session. A chat that is killed, or a reboot, leaves its session `active` and offline in AMP's list. Each running
+session holds a locked record in `<state>/remote-live/<session_id>.json` (0600; the AMP origin, session id and
+harness id, never a token); the OS drops the lock when the process dies. The next `/remote` on that computer
+ends every session whose record nobody holds (for the same AMP origin) with a signed token refresh and
+`DELETE` (reason `harness_ended`), the same way as an end the relay missed (8.2), and then registers the new
+session. Until then the left-behind session stays listed, and Disconnect on the web page ends it. Devices paired
+before the restart keep working without pairing again, because pins belong to the harness install (7.7).
+
+**What mitigates a forgotten session** (threat model T-H-6, which the idle limit used to cover):
+
+- the `REMOTE ON` badge in the TUI footer, always visible while remote control is on;
+- the session list on `/sessions` (live sessions, online or offline) with Disconnect, and **Revoke all**;
+- the org switch, which ends every session in the org within seconds, and deactivation or lost access;
+- device trust of at most 30 days (`device_pin_days`): an unpaired or expired device can't drive the session;
+- every command is signed by a device the owner paired on the laptop (R-M4, R-M5), so a live session is useless to
+  anyone else;
+- an org that wants the old behaviour sets an idle limit and a lifetime.
+
 ## 13. Versioning and compatibility
 
 - **The envelope's `v` is the protocol major version.** This document is `v: 1`. A receiver MUST refuse any
@@ -1220,6 +1284,9 @@ The harness also keeps a local log of remote ops (op, device, time, result), wit
 - **Backward compatibility (decision section 9):**
   - Old harness with new AMP: nothing changes.
   - New harness with old AMP: `404`, and the harness says "not available".
+  - #2424 made `expires_at_ms` and `idle_timeout_s` nullable (no limit). A harness from before it can't parse the
+    `null` and fails to turn remote control on. M1 is unreleased (remote-m1), so this was amended within v1;
+    update the harness together with amp-relay. A harness from after it reads the old numbers as before.
   - Instance off: `404`. Org off: `403 remote_disabled`.
   - `RunEvent` and `run --json` are unchanged. DB changes are new tables and a new org setting only.
 
@@ -1340,8 +1407,8 @@ sequenceDiagram
   B->>R: POST commands
   R-->>B: 409 harness_offline (never queued)
   Note over H: laptop wakes
-  H->>H: deadlines passed? then end locally + DELETE. Otherwise re-check the disable switch and pins
-  H->>R: POST .../token (OAuth), the relay re-checks policy
+  H->>H: org limits set and passed? then end locally + DELETE (none by default, #2424). Else re-check the switch and pins
+  H->>R: POST .../token (OAuth + signed proof, even hours after the token expired), the relay re-checks policy
   H->>R: GET .../commands (SSE, new stream replaces the old)
   H->>R: POST events [hello (seq continues)]
   R-->>B: event: relay {type: online}, event: envelope hello
@@ -1359,7 +1426,7 @@ sequenceDiagram
   participant B as Browser
   participant R as Relay
   participant H as Harness
-  alt idle 30 min or 12 h lifetime (harness clock)
+  alt the org's opt-in idle limit or lifetime (harness clock; none by default, #2424)
     H->>R: POST events [bye {reason: idle|expired}]
     H->>R: DELETE /relay/v1/sessions/:id {reason}
     R->>R: audit remote.expire, drop the buffer
@@ -1372,7 +1439,7 @@ sequenceDiagram
   end
   R-->>B: event: relay {type: ended, reason}, the stream closes
   H->>H: REMOTE OFF, the local session continues
-  Note over R: relay backstop: idle + 60 s or expires_at, it ends the session itself
+  Note over R: relay backstop (org limits only): idle + 60 s or expires_at, it ends the session itself
 ```
 
 ## 15. Notes for implementers

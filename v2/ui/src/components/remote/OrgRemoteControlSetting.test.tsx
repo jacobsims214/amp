@@ -8,7 +8,7 @@ import { Orgs } from '../../pages/Orgs'
 import { AuthContext } from '../../contexts/auth-context'
 import type { Me, Org, OrgRole } from '../../types'
 
-let policy = { enabled: false, idle_timeout_min: 30, device_pin_days: 30 }
+let policy = { enabled: false, idle_timeout_min: 0, max_lifetime_hours: 0, device_pin_days: 30 }
 let puts: unknown[] = []
 let role: OrgRole = 'admin'
 let available = true
@@ -32,7 +32,7 @@ const server = setupServer(
   }),
 )
 beforeAll(() => server.listen({ onUnhandledFrame: 'bypass' }))
-afterEach(() => { policy = { enabled: false, idle_timeout_min: 30, device_pin_days: 30 }; puts = []; role = 'admin'; available = true })
+afterEach(() => { policy = { enabled: false, idle_timeout_min: 0, max_lifetime_hours: 0, device_pin_days: 30 }; puts = []; role = 'admin'; available = true })
 afterAll(() => server.close())
 
 const me: Me = { subject: 's', email: 'jsims@example.com', name: 'Jacob', roles: [], user_id: 1001 }
@@ -63,6 +63,41 @@ describe('Org settings → Allow remote control of harness sessions', () => {
     await user.click(box)
     await waitFor(() => expect(box).not.toBeChecked())
     expect(puts).toEqual([{ enabled: true }, { enabled: false }])
+  })
+
+  it('has no time limit by default, and an admin can opt into an idle limit and a lifetime (#2424)', async () => {
+    const user = userEvent.setup()
+    policy = { ...policy, enabled: true }
+    renderOrgs()
+    await user.click(await screen.findByRole('button', { name: 'settings' }))
+    expect(await screen.findByText(/has no time limit: it reconnects by itself after sleep/)).toBeInTheDocument()
+    const idle = screen.getByRole('combobox', { name: /no remote activity for/ })
+    const life = screen.getByRole('combobox', { name: /this long after it started/ })
+    expect(idle).toHaveValue('0')
+    expect(life).toHaveValue('0')
+    expect(within(idle).getByRole('option', { name: 'No limit (default)' })).toBeInTheDocument()
+
+    await user.selectOptions(idle, '30')
+    await waitFor(() => expect(puts).toEqual([{ idle_timeout_min: 30 }]))
+    await user.selectOptions(life, '12')
+    await waitFor(() => expect(puts).toEqual([{ idle_timeout_min: 30 }, { max_lifetime_hours: 12 }]))
+    expect(await screen.findByText(/ends after 30 min without remote activity, or 12 h after it started/)).toBeInTheDocument()
+
+    await user.selectOptions(idle, '0')
+    await user.selectOptions(life, '0')
+    await waitFor(() => expect(puts).toHaveLength(4))
+    expect(puts.slice(2)).toEqual([{ idle_timeout_min: 0 }, { max_lifetime_hours: 0 }])
+    expect(await screen.findByText(/has no time limit/)).toBeInTheDocument()
+  })
+
+  it('shows an idle limit set through the API that the list doesn\'t have', async () => {
+    const user = userEvent.setup()
+    policy = { ...policy, enabled: true, idle_timeout_min: 45 }
+    renderOrgs()
+    await user.click(await screen.findByRole('button', { name: 'settings' }))
+    const idle = await screen.findByRole('combobox', { name: /no remote activity for/ })
+    expect(idle).toHaveValue('45')
+    expect(screen.getByText(/ends after 45 min without remote activity/)).toBeInTheDocument()
   })
 
   it('is not offered to org members who aren\'t admins', async () => {

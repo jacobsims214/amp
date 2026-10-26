@@ -85,7 +85,9 @@ describe('Sessions page', () => {
     expect(within(box).getByText('QA 2365 plan #158')).toBeInTheDocument()
     expect(within(box).getByText('5h ago')).toBeInTheDocument() // started
     expect(within(box).getByText('42m ago')).toBeInTheDocument() // last activity
-    expect(within(box).getByText('in 7h 10m')).toBeInTheDocument() // expires
+    expect(within(box).getByText('in 7h 10m')).toBeInTheDocument() // expires: its org set a lifetime
+    // #2424: by default a session has no lifetime.
+    expect(within(mine).getByText('Expires', { selector: 'dt' }).nextSibling).toHaveTextContent('Never')
     expect(within(box).getByText('linux · harness 0.4.0')).toBeInTheDocument()
     expect(within(box).getByText('8F1D-02AA-71C3-9E40')).toBeInTheDocument()
     expect(screen.queryByText(/Ended sessions aren't listed/)).toBeNull()
