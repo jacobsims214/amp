@@ -63,7 +63,8 @@ fn registry_has_every_role_with_prompt_skills_and_model_key() {
     let manager = reg.manager();
     assert_eq!(manager.id, "amp-manager");
     assert!(manager.primary);
-    assert_eq!(manager.skills, ["amp-index", "amp-planning"]);
+    // #2367: nothing preloaded; the manager reads amp-planning when it plans.
+    assert!(manager.skills.is_empty());
     assert_eq!(manager.model_role, "manager");
 
     let expect_skills: &[(&str, &[&str])] = &[
@@ -137,6 +138,94 @@ fn manager_dispatches_exactly_the_ten_workers() {
     assert!(reg.dispatchable(worker).is_empty());
 }
 
+/// #2234 (D11): `dispatch: true` lets the manager run a subagent whose id doesn't match its
+/// `task` rules, in `dispatchable` and in the before-tool hook alike; a manager rule that names
+/// the agent with deny still wins.
+#[test]
+fn dispatch_true_opts_a_subagent_in_unless_the_manager_names_it_denied() {
+    let base = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("roles-dispatch");
+    let _ = std::fs::remove_dir_all(&base);
+    let agents = base.join("user/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let agent = |id: &str, extra: &str| {
+        std::fs::write(
+            agents.join(format!("{id}.md")),
+            format!("---\ndescription: {id}\nmode: subagent\n{extra}---\nDo {id}.\n"),
+        )
+        .unwrap();
+    };
+    agent("sql-expert", "dispatch: true\n");
+    agent("helper", "");
+    agent("blocked", "dispatch: true\n");
+    let load = || {
+        let assets = Assets::load(&OverrideDirs {
+            user: Some(base.join("user")),
+            repo: None,
+        })
+        .unwrap();
+        RoleRegistry::from_assets(&assets).unwrap()
+    };
+    let reg = load();
+    let ids: Vec<&str> = reg
+        .dispatchable(reg.manager())
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"sql-expert") && ids.contains(&"blocked"),
+        "{ids:?}"
+    );
+    assert!(!ids.contains(&"helper"), "{ids:?}");
+    let hook = reg.manager().tool_policy(ROOT);
+    assert!(allowed(
+        &hook,
+        "amp_run_ticket",
+        json!({"task_id": 1, "agent_id": "amp:sql-expert"})
+    ));
+    assert!(!allowed(
+        &hook,
+        "amp_run_ticket",
+        json!({"task_id": 1, "agent_id": "amp:helper"})
+    ));
+
+    // A manager override that denies `blocked` by name keeps it out; the catch-all doesn't.
+    let manager = Assets::embedded_agent_text("amp-manager").unwrap().replace(
+        "    \"amp-*\": allow\n",
+        "    \"amp-*\": allow\n    \"blocked\": deny\n",
+    );
+    assert!(manager.contains("\"blocked\": deny"));
+    std::fs::write(agents.join("amp-manager.md"), manager).unwrap();
+    let reg = load();
+    let ids: Vec<&str> = reg
+        .dispatchable(reg.manager())
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(
+        ids.contains(&"sql-expert") && !ids.contains(&"blocked"),
+        "{ids:?}"
+    );
+    let hook = reg.manager().tool_policy(ROOT);
+    assert!(!allowed(
+        &hook,
+        "amp_run_ticket",
+        json!({"task_id": 1, "agent_id": "blocked"})
+    ));
+
+    // Bad values are errors naming the agent.
+    agent("bad", "dispatch: yes please\n");
+    let assets = Assets::load(&OverrideDirs {
+        user: Some(base.join("user")),
+        repo: None,
+    })
+    .unwrap();
+    let e = RoleRegistry::from_assets(&assets).unwrap_err().to_string();
+    assert!(
+        e.contains("agent bad: dispatch must be true or false"),
+        "{e}"
+    );
+}
+
 // ------------------------------------------------------------------------------------------------
 // The manager.
 // ------------------------------------------------------------------------------------------------
@@ -157,6 +246,19 @@ fn manager_policy() {
         "git status && git log -1",
         "ls 2>/dev/null",
         "git log 2>&1",
+        // #2363: the user's session had these denied and retried them.
+        "git status 2>&1 | head -20; echo \"---\"; pwd; ls -la",
+        "git status --short --branch 2>&1 | head -20; echo \"---LOG---\"; git log --oneline -5 2>&1 | head -5",
+        "git log --oneline | head -5",
+        "git show HEAD --stat",
+        "git rev-parse --show-toplevel",
+        "git ls-files | wc -l",
+        "grep -o amp_[a-z_]* notes.md | sort -u",
+        "cat README.md | grep -n TODO",
+        "grep -rn amp_ src | head -20",
+        "tail -n 20 notes.md",
+        "date -u",
+        "pwd",
     ] {
         assert!(bash(&p, ok), "manager should run: {ok}");
     }
@@ -168,8 +270,22 @@ fn manager_policy() {
         "git status && rm -rf x",
         "ls; curl https://example.com",
         "git log | sh",
-        // Every command of a pipeline is checked: `head` is not on the manager's list.
-        "git log | head",
+        // Every command of a pipeline is checked: `sh`, `xargs`, `tee` are not on the list.
+        "git log | xargs rm",
+        "cat x | tee y",
+        "grep -rl x . | xargs sed -i s/a/b/",
+        // #2363: read-only pipes are fine, following a file forever is not.
+        "tail -f log.txt",
+        "tail -n 5 -f log.txt",
+        "tail -F x",
+        "tail --follow=name x",
+        "cat x > y",
+        "echo hi >> notes.md",
+        "sort -o x y",
+        "sort -u x -o y",
+        "uniq a b",
+        "find . -delete",
+        "git branch -D main",
         "mkdir -p .opencode/agent",
         "git diff $(rm -rf x)",
         "git log `id`",
@@ -248,12 +364,16 @@ fn manager_policy() {
         DenialReason::Redirect
     );
 
-    // edit/write: denied everywhere, and not even offered.
+    // edit/write: only `.amp.json` in the working directory (#2363: the amp-init skill writes the
+    // project marker), denied everywhere else.
     for path in [
         "src/main.rs",
         ".opencode/agent/x.md",
         "opencode.json",
         "/etc/hosts",
+        "sub/.amp.json",
+        "../.amp.json",
+        ".amp.json.bak",
     ] {
         assert!(!write(&p, path), "{path}");
         assert!(
@@ -261,7 +381,8 @@ fn manager_policy() {
             "{path}"
         );
     }
-    assert!(!p.exposes("edit") && !p.exposes("write"));
+    assert!(write(&p, ".amp.json"));
+    assert!(p.exposes("edit") && p.exposes("write"));
     assert!(p.exposes("bash"));
 
     // web and todos: denied.
@@ -414,6 +535,14 @@ fn opencode_manager_bash_rules_hold_without_the_lexer() {
         "ls -la v2",
         "mkdir -p .opencode/agent",
         "mkdir -p .opencode/skills/new-skill",
+        // #2363: opencode checks each command of a pipeline on its own.
+        "head -20",
+        "tail -n 5 notes.md",
+        "cat README.md",
+        "grep -rn TODO src",
+        "wc -l",
+        "git show HEAD --stat",
+        "pwd",
     ] {
         assert!(allows(ok), "opencode manager should run: {ok}");
     }
@@ -443,6 +572,13 @@ fn opencode_manager_bash_rules_hold_without_the_lexer() {
         "mkdir -p .opencode/x>~/.zshrc",
         "mkdir /etc/x",
         "rm -rf x",
+        "tail -f log.txt",
+        "tail -n 5 -f log.txt",
+        "tail --follow=name x",
+        "cat x > y",
+        "echo x >> notes.md",
+        "git show --output=x",
+        "xargs rm",
     ] {
         assert!(!allows(denied), "opencode manager must not run: {denied}");
     }
@@ -959,7 +1095,16 @@ fn filter_tools_drops_what_a_role_can_never_use() {
     };
     assert_eq!(
         names(&policy("amp-manager")),
-        ["read", "bash", QUESTION_TOOL, DISPATCH_TOOL, "amp_get_task"]
+        // #2363: edit/write stay for `.amp.json` only (the amp-init skill).
+        [
+            "read",
+            "bash",
+            "edit",
+            "write",
+            QUESTION_TOOL,
+            DISPATCH_TOOL,
+            "amp_get_task"
+        ]
     );
     assert_eq!(
         names(&policy("amp-worker-backend")),
@@ -968,6 +1113,199 @@ fn filter_tools_drops_what_a_role_can_never_use() {
     assert_eq!(
         names(&policy("amp-reviewer")),
         ["read", "bash", "amp_get_task"]
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// External MCP servers: the `mcp` permission (#2240, H7).
+// ------------------------------------------------------------------------------------------------
+
+/// A worker whose frontmatter has `mcp` rules (catch-all first, last match wins).
+const MCP_WORKER: &str = "---\ndescription: mcp\nmode: subagent\npermission:\n  edit: allow\n  bash: allow\n  mcp:\n    \"*\": deny\n    \"github/*\": allow\n    \"github/delete_*\": deny\n    \"github/delete_branch\": allow\n    \"fs/*\": allow\n    \"fs/write.*\": ask\n  mcp__fs__nuke: deny\n---\nPrompt.\n";
+
+fn mcp_policy(name: &str) -> ToolPolicy {
+    let reg = load_with_repo_agent(name, "amp-worker-docs.md", MCP_WORKER).unwrap();
+    let p = reg.get("worker-docs").unwrap().tool_policy(ROOT);
+    // As the hub names them: `write.file` is sanitised to `write_file`.
+    p.learn_mcp_subjects([
+        ("mcp__github__get_issue", "github/get_issue"),
+        ("mcp__github__delete_repo", "github/delete_repo"),
+        ("mcp__github__delete_branch", "github/delete_branch"),
+        ("mcp__fs__read", "fs/read"),
+        ("mcp__fs__write_file", "fs/write.file"),
+        ("mcp__fs__nuke", "fs/nuke"),
+        ("mcp__db__query", "db/query"),
+    ]);
+    p
+}
+
+#[test]
+fn mcp_permission_judges_server_slash_tool_last_match_wins() {
+    let p = mcp_policy("mcp-rules");
+    let ok = |t: &str| p.check(t, &json!({})).is_ok();
+    assert!(ok("mcp__github__get_issue"));
+    assert!(!ok("mcp__github__delete_repo"));
+    // A later, narrower allow wins over the earlier deny.
+    assert!(ok("mcp__github__delete_branch"));
+    assert!(ok("mcp__fs__read"));
+    // The subject is the server's own tool name (`write.file`), not the sanitised one; ask = deny.
+    let d = p.check("mcp__fs__write_file", &json!({})).unwrap_err();
+    assert_eq!(d.reason, DenialReason::Ask);
+    assert_eq!(
+        (d.permission.as_str(), d.subject.as_str()),
+        ("mcp", "fs/write.file")
+    );
+    // The catch-all denies a server no rule names.
+    assert!(!ok("mcp__db__query"));
+    // A key named after the tool itself still applies, after `mcp`.
+    let d = p.check("mcp__fs__nuke", &json!({})).unwrap_err();
+    assert_eq!(d.permission, "mcp__fs__nuke");
+    // A name the hub never reported is read from the name: `<server>/<rest>`.
+    assert_eq!(
+        p.mcp_subject("mcp__github__list_prs").unwrap(),
+        "github/list_prs"
+    );
+    assert!(ok("mcp__github__list_prs"));
+    assert!(!ok("mcp__github__delete_tag"));
+    assert_eq!(p.mcp_subject("amp_get_task"), None);
+    // AMP's own tools are not `mcp`.
+    assert!(ok("amp_get_task"));
+}
+
+#[test]
+fn mcp_denial_is_visible_and_names_the_rule() {
+    let p = mcp_policy("mcp-denial");
+    let text = p
+        .check("mcp__github__delete_repo", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        text.contains("Denied by the amp-worker-docs tool policy: mcp `github/delete_repo` matches the rule \"github/delete_*\": deny"),
+        "{text}"
+    );
+    assert!(text.contains("never asks for approval"), "{text}");
+    let text = p
+        .check("mcp__fs__write_file", &json!({}))
+        .unwrap_err()
+        .to_string();
+    assert!(text.contains("(ask is treated as deny)"), "{text}");
+}
+
+#[test]
+fn tools_a_role_can_never_use_are_left_out_of_its_list() {
+    let p = mcp_policy("mcp-filter");
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let names: Vec<String> = p
+        .filter_tools(vec![
+            recorder("read", &ran),
+            recorder("amp_get_task", &ran),
+            recorder("mcp__github__get_issue", &ran),
+            recorder("mcp__github__delete_repo", &ran),
+            recorder("mcp__github__delete_branch", &ran),
+            recorder("mcp__fs__read", &ran),
+            recorder("mcp__fs__write_file", &ran),
+            recorder("mcp__fs__nuke", &ran),
+            recorder("mcp__db__query", &ran),
+        ])
+        .iter()
+        .map(|t| t.schema().name.clone())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "read",
+            "amp_get_task",
+            "mcp__github__get_issue",
+            "mcp__github__delete_branch",
+            "mcp__fs__read"
+        ]
+    );
+
+    // `mcp: deny` hides every external tool and nothing else.
+    let reg = load_with_repo_agent(
+        "mcp-none",
+        "amp-worker-docs.md",
+        "---\ndescription: none\nmode: subagent\npermission:\n  mcp: deny\n---\nPrompt.\n",
+    )
+    .unwrap();
+    let p = reg.get("worker-docs").unwrap().tool_policy(ROOT);
+    assert!(!p.exposes("mcp__github__get_issue"));
+    assert!(p.check("mcp__github__get_issue", &json!({})).is_err());
+    assert!(p.exposes("amp_get_task") && p.exposes("read"));
+}
+
+#[test]
+fn with_no_mcp_rule_every_shipped_role_sees_every_server() {
+    let reg = registry();
+    for role in reg.roles() {
+        let p = role.tool_policy(ROOT);
+        p.learn_mcp_subjects([("mcp__github__delete_repo", "github/delete_repo")]);
+        assert!(
+            p.exposes("mcp__github__delete_repo")
+                && p.check("mcp__github__delete_repo", &json!({})).is_ok(),
+            "{}",
+            role.id
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_mcp_call_never_runs_and_the_model_sees_why() {
+    let policy = Arc::new(mcp_policy("mcp-loop"));
+    let ran = Arc::new(Mutex::new(Vec::new()));
+    let tools = vec![
+        recorder("mcp__github__get_issue", &ran),
+        recorder("mcp__github__delete_repo", &ran),
+    ];
+    let script = scripted(vec![
+        assistant(
+            vec![
+                call("c1", "mcp__github__delete_repo", json!({"repo": "x"})),
+                call("c2", "mcp__github__get_issue", json!({"n": 1})),
+            ],
+            StopReason::ToolUse,
+        ),
+        assistant(vec![Content::text("done")], StopReason::Stop),
+    ]);
+    let context = AgentContext {
+        system_prompt: String::new(),
+        messages: Vec::new(),
+        tools,
+    };
+    let prompt = AgentMessage::User(UserMessage::new(UserContent::Text("go".into()), 0));
+    let (collector, _events) = rpi_agent::CollectorEmitter::new();
+    let messages = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        rpi_agent::run_agent_loop(
+            vec![prompt],
+            context,
+            loop_config(policy.before_tool_call()),
+            Arc::new(collector),
+            script,
+        ),
+    )
+    .await
+    .expect("the loop finished")
+    .unwrap();
+    assert_eq!(ran.lock().unwrap().clone(), vec![json!({"n": 1})]);
+    let denied = messages
+        .iter()
+        .find_map(|m| match m {
+            AgentMessage::ToolResult(t) if t.tool_call_id == "c1" => Some(t),
+            _ => None,
+        })
+        .unwrap();
+    let body: String = denied
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        denied.is_error && body.contains("mcp `github/delete_repo`"),
+        "{body}"
     );
 }
 

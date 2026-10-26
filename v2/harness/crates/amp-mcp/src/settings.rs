@@ -7,7 +7,7 @@
 //! | URL      | `--url`       | `AMP_MCP_URL`      | `url`                    | `https://amp.simstech.cloud/mcp` |
 //! | CA file  | `--ca-file`   | `AMP_CA_FILE`      | `ca_file`                | none (system roots only)         |
 //! | protocol | `--protocol`  | `AMP_MCP_PROTOCOL` | `protocol`               | `auto`                           |
-//! | web UI   |               | `AMP_WEB_URL`      | `web_url`                | the MCP URL's origin             |
+//! | web UI   |               | `AMP_WEB_URL`      | `web_url` (its own URL's)| the MCP URL's origin             |
 //!
 //! The config file is `$XDG_CONFIG_HOME/amp-harness/config.toml`, else
 //! `~/.config/amp-harness/config.toml`. A relative `ca_file` in it is relative to the file's directory.
@@ -150,12 +150,11 @@ impl FileConfig {
     }
 }
 
-/// The default config file path, from `XDG_CONFIG_HOME` or `HOME`.
+/// The user config file in effect ([`crate::config_paths::current`]): the installed paths
+/// (`--config`, `--config-dir`), else `AMP_HARNESS_CONFIG`, `AMP_HARNESS_CONFIG_DIR`,
+/// `XDG_CONFIG_HOME` or `HOME` from `env`.
 pub fn default_config_path(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let base = non_empty(env("XDG_CONFIG_HOME"))
-        .map(PathBuf::from)
-        .or_else(|| non_empty(env("HOME")).map(|home| Path::new(&home).join(".config")))?;
-    Some(base.join("amp-harness").join("config.toml"))
+    crate::config_paths::current(env).user_file
 }
 
 /// The settings a connection needs, resolved from flags, env, config file and defaults.
@@ -253,14 +252,24 @@ impl Settings {
             (ProtocolMode::Auto, Source::Default)
         };
 
-        // Web UI origin: AMP_WEB_URL > config > none (the MCP URL's origin).
-        let web_url = if let Some(url) = non_empty(env(ENV_WEB_URL)) {
+        // Web UI origin: AMP_WEB_URL > config > none (the MCP URL's origin). The config's
+        // `web_url` belongs to the config's server: with `--url`/`AMP_MCP_URL` naming another
+        // server it doesn't apply (#2380: a compose `web_url` sent a docker-desktop session's
+        // pairing link to the compose UI).
+        let config_server = non_empty(file.server.url.clone());
+        let same_server = match &url_source {
+            Source::Flag | Source::Env(_) => config_server
+                .as_deref()
+                .is_none_or(|c| crate::url_origin(c) == crate::url_origin(&url)),
+            _ => true,
+        };
+        let web_url = if let Some(raw) = non_empty(env(ENV_WEB_URL)) {
             Some(validate_web_url(
-                &url,
+                &raw,
                 &Source::Env(ENV_WEB_URL.to_owned()),
             )?)
-        } else if let Some(url) = non_empty(file.server.web_url.clone()) {
-            Some(validate_web_url(&url, &file_source())?)
+        } else if let Some(raw) = non_empty(file.server.web_url.clone()).filter(|_| same_server) {
+            Some(validate_web_url(&raw, &file_source())?)
         } else {
             None
         };
@@ -511,6 +520,37 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.web_url.as_deref(), Some("https://ui.example"));
+        // #2380: the config's web_url is its own server's; --url / AMP_MCP_URL naming another
+        // server don't inherit it (and the same server, by origin, does).
+        write_config(
+            &dir,
+            "[server]\nurl = \"http://localhost:18000/mcp\"\nweb_url = \"http://localhost:5173/\"\n",
+        );
+        let other = Overrides {
+            url: Some("https://amp.local/mcp".into()),
+            ..Overrides::default()
+        };
+        let s = Settings::resolve_with_env(&other, &env_of(&[("XDG_CONFIG_HOME", xdg)])).unwrap();
+        assert_eq!(s.web_url, None);
+        let s = Settings::resolve_with_env(
+            &Overrides::default(),
+            &env_of(&[
+                ("XDG_CONFIG_HOME", xdg),
+                (ENV_MCP_URL, "https://amp.local/mcp"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(s.web_url, None);
+        let same = Overrides {
+            url: Some("http://localhost:18000/mcp/".into()),
+            ..Overrides::default()
+        };
+        let s = Settings::resolve_with_env(&same, &env_of(&[("XDG_CONFIG_HOME", xdg)])).unwrap();
+        assert_eq!(s.web_url.as_deref(), Some("http://localhost:5173"));
+        let s =
+            Settings::resolve_with_env(&Overrides::default(), &env_of(&[("XDG_CONFIG_HOME", xdg)]))
+                .unwrap();
+        assert_eq!(s.web_url.as_deref(), Some("http://localhost:5173"));
         assert!(
             Settings::resolve_with_env(
                 &Overrides::default(),

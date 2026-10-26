@@ -60,8 +60,9 @@ type Identity struct {
 	AuthMethod string
 	// TokenID is the api_tokens.id of the API token used (never the token).
 	TokenID int64
-	// SessionID identifies the Dex session a JWT belongs to: a truncated
-	// SHA-256 of its sub and iat (Dex issues no sid). Never the token.
+	// SessionID identifies the Dex sign-in a JWT belongs to, the same
+	// across refreshes when the token has auth_time or a nonce
+	// (DexSessionID). Never the token.
 	SessionID string
 
 	// provisioned is what JIT provisioning changed on this request (a new
@@ -161,6 +162,9 @@ type Verifier struct {
 	// token whose audience names it is a person in the web UI.
 	uiClientID string
 
+	// lookupOnly: see Config.LookupOnly.
+	lookupOnly bool
+
 	// OnEvent, when set, receives authentication events for the audit log
 	// (sign-ins, refused sign-ups, new accounts and accepted invites, API
 	// token use and failures). It runs on the request path and must be
@@ -190,6 +194,12 @@ type Config struct {
 	// Only REST requests carrying a token issued to it count as the web UI
 	// (ChannelUI). Empty: no Dex token counts as the UI.
 	UIClientID string
+	// LookupOnly makes the verifier read-only (amp-relay, #2392): a Dex
+	// token's user is looked up by subject, never provisioned or updated
+	// (amp-api does that when the person signs in to AMP), and AMP API
+	// tokens are refused without being looked up, so the caller's database
+	// role needs no write on users and no read of api_tokens.
+	LookupOnly bool
 }
 
 // NewVerifier builds a Verifier. When cfg.IssuerURL is empty, auth is disabled
@@ -222,7 +232,8 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	keySet := oidc.NewRemoteKeySet(ctx, strings.TrimSuffix(discoveryURL, "/")+"/keys")
 	verifier := oidc.NewVerifier(cfg.IssuerURL, keySet, &oidc.Config{SkipClientIDCheck: true})
 
-	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID)}
+	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID),
+		lookupOnly: cfg.LookupOnly}
 	return v, nil
 }
 
@@ -348,6 +359,11 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 		// EmailVerified is a pointer so an absent claim (Dex's password
 		// DB omits it on some versions) isn't read as false.
 		EmailVerified *bool `json:"email_verified"`
+		// Nonce and AuthTime identify the sign-in a token was issued for:
+		// Dex copies the authorization's nonce into every token it
+		// refreshes, and newer Dex versions set auth_time (#2440).
+		Nonce    string `json:"nonce"`
+		AuthTime int64  `json:"auth_time"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		http.Error(w, `{"error":"malformed claims"}`, http.StatusUnauthorized)
@@ -364,7 +380,7 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 
 	ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name,
 		Audience: append([]string(nil), idToken.Audience...), AZP: claims.AZP,
-		SessionID: SessionID(claims.Subject, idToken.IssuedAt)}
+		SessionID: DexSessionID(claims.Subject, claims.AuthTime, claims.Nonce, idToken.IssuedAt)}
 	if v.repo == nil {
 		return ident
 	}
@@ -374,6 +390,17 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 		slog.Warn("JIT user provisioning refused: email not verified", "subject", claims.Subject, "email", claims.Email)
 		v.emit(r.Context(), Event{Kind: EventSignupRefused, Subject: claims.Subject, Email: claims.Email,
 			Reason: "email not verified: an unverified email is never provisioned or linked to an AMP user"})
+		return ident
+	}
+	if v.lookupOnly {
+		u, err := v.repo.GetUserBySubject(r.Context(), claims.Subject)
+		if err != nil {
+			// Not yet an AMP user here (or the lookup failed): no user on the
+			// identity, which the handlers refuse (authz.FromContext).
+			slog.Warn("token's user not found (lookup only: sign in to AMP first)", "listener", v.label, "subject", claims.Subject, "err", err)
+			return ident
+		}
+		ident.User = u
 		return ident
 	}
 	u, pv, err := v.repo.ProvisionUserFromClaims(r.Context(), claims.Subject, claims.Email, claims.Name, v.bootstrapAdmins)
@@ -414,6 +441,15 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, rawToken string) *Identity {
 	if v.repo == nil {
 		v.writeUnauthorized(w, "API tokens are not available")
+		return nil
+	}
+	if v.lookupOnly {
+		// The relay refuses API tokens anyway (remote control is for a
+		// person signed in with amp-harness login); refuse them here, with
+		// the relay's code, without reading api_tokens.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"error":"API tokens can't use remote control; sign in with `+"`amp-harness login`"+`","code":"token_not_allowed"}`)
 		return nil
 	}
 	u, tokenID, err := v.repo.UserAndTokenForAPIToken(r.Context(), HashAPIToken(rawToken))
@@ -467,15 +503,43 @@ func (v *Verifier) authMethodOf(ident *Identity) string {
 	return AuthOAuthMCP
 }
 
+// DexSessionID derives the id of the sign-in a Dex JWT belongs to, stable
+// across token refreshes (#2440, review #2432 L3), from the first of:
+//   - auth_time, when Dex sets it (newer versions): when the person signed in;
+//   - nonce: Dex copies the authorization request's nonce into every token
+//     it refreshes from that sign-in (verified on Dex v2.42.0), and
+//     oauth2-proxy sends one when --insecure-oidc-skip-nonce=false (the
+//     chart sets it);
+//   - iat, as SessionID: then each refreshed token counts as a new session.
+//
+// oauth2-proxy refreshes the UI's token hourly (--cookie-refresh=1h), so
+// without auth_time or a nonce every hour looked like a new sign-in.
+func DexSessionID(subject string, authTime int64, nonce string, issuedAt time.Time) string {
+	switch {
+	case subject == "":
+		return ""
+	case authTime > 0:
+		return sessionHash(subject + "\x00auth_time:" + strconv.FormatInt(authTime, 10))
+	case nonce != "":
+		return sessionHash(subject + "\x00nonce:" + nonce)
+	}
+	return SessionID(subject, issuedAt)
+}
+
+func sessionHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:16])
+}
+
 // SessionID derives a stable, non-reversible id for the Dex session a JWT
 // belongs to from its sub and iat: the first 16 bytes of SHA-256, in hex.
-// Empty when either is missing.
+// Empty when either is missing. Used for tokens that carry neither
+// auth_time nor a nonce (DexSessionID).
 func SessionID(subject string, issuedAt time.Time) string {
 	if subject == "" || issuedAt.IsZero() {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(subject + "\x00" + strconv.FormatInt(issuedAt.Unix(), 10)))
-	return hex.EncodeToString(sum[:16])
+	return sessionHash(subject + "\x00" + strconv.FormatInt(issuedAt.Unix(), 10))
 }
 
 // IsUI reports whether the request came from a person in the web UI.

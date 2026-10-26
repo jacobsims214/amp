@@ -250,6 +250,7 @@ func (s *Service) AddOrgMember(ctx context.Context, p authz.Principal, orgID int
 	s.audit(ctx, p, domain.AuditEntry{Action: "org.member.set", OrgID: intRef(orgID), TargetType: "user", TargetID: idStr(userID),
 		Summary: "set " + s.userLabel(ctx, userID) + " to org " + role + roleChange(current), Details: map[string]any{"role": role, "previous": current},
 		Before: roleValue(current), After: roleValue(role)})
+	s.endRemoteAfterAccessChange(ctx, p, userID) // an org admin made a plain member
 	return &MemberResult{Added: true, UserID: userID, Role: role}, nil
 }
 
@@ -278,6 +279,7 @@ func (s *Service) RemoveOrgMember(ctx context.Context, p authz.Principal, orgID 
 	s.audit(ctx, p, domain.AuditEntry{Action: "org.member.remove", OrgID: intRef(orgID), TargetType: "user", TargetID: idStr(userID),
 		Summary: "removed " + s.userLabel(ctx, userID) + " from the org (was " + current + ")", Details: map[string]any{"previous": current},
 		Before: roleValue(current), After: roleValue("")})
+	s.endRemoteAfterAccessChange(ctx, p, userID)
 	return userID, nil
 }
 
@@ -363,6 +365,7 @@ func (s *Service) DeleteTeam(ctx context.Context, p authz.Principal, teamID int)
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "team.delete", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
 		Summary: "deleted team " + team.Name})
+	s.endRemoteAfterAccessChange(ctx, p) // anyone who reached a project only through it
 	s.dropKB(kb.Team(teamID))
 	return nil
 }
@@ -422,6 +425,7 @@ func (s *Service) RemoveTeamMember(ctx context.Context, p authz.Principal, teamI
 	s.audit(ctx, p, domain.AuditEntry{Action: "team.member.remove", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
 		TargetName: team.Name, Summary: "removed " + s.userLabel(ctx, userID) + " from team " + team.Name,
 		Details: map[string]any{"user_id": userID, "previous": previous}, Before: roleValue(previous), After: roleValue("")})
+	s.endRemoteAfterAccessChange(ctx, p, userID)
 	return userID, nil
 }
 
@@ -588,6 +592,7 @@ func (s *Service) RemoveProjectTeam(ctx context.Context, p authz.Principal, proj
 	s.audit(ctx, p, domain.AuditEntry{Action: "project.team.remove", ProjectID: intRef(projectID), TargetType: "team", TargetID: idStr(teamID),
 		Summary: "unlinked " + s.teamLabel(ctx, teamID) + " from the project", Details: map[string]any{"previous": previous},
 		Before: roleValue(previous), After: roleValue("")})
+	s.endRemoteAfterAccessChange(ctx, p) // the team's members, unless another link keeps them in
 	return s.Repo.ListProjectTeams(ctx, projectID)
 }
 

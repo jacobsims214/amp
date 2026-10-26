@@ -88,7 +88,8 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
     assert_eq!(session["mcp"]["server"], "amp-mock");
     assert_eq!(session["mcp"]["instructions"], true);
     assert_eq!(session["faux_scripted"], json!(["faux"]));
-    assert_eq!(session["skills"], json!(["amp-index", "amp-planning"]));
+    // #2367: the manager preloads no skill; it reads amp-planning when it plans.
+    assert_eq!(session["skills"], json!([]));
     let tools: Vec<&str> = session["tools"]
         .as_array()
         .unwrap()
@@ -106,10 +107,10 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
     ] {
         assert!(tools.contains(&name), "{name} missing from {tools:?}");
     }
-    // The manager never gets edit/write (its policy denies them outright), and no tool is
-    // double-prefixed.
+    // The manager gets edit/write only for `.amp.json` (#2363, the amp-init skill); the policy
+    // denies every other path. No tool is double-prefixed.
     assert!(
-        !tools.contains(&"edit") && !tools.contains(&"write"),
+        tools.contains(&"edit") && tools.contains(&"write"),
         "{tools:?}"
     );
     assert!(
@@ -172,6 +173,51 @@ async fn run_calls_an_amp_tool_natively_and_reports_json_events() {
     );
 }
 
+/// #2205 (QA pass 1): compose's amp-api has no APP_PUBLIC_URL, so `approve_url` is relative and
+/// the manager used to hand out `http://localhost:18000/project/N/plan` (the MCP port). With the
+/// web UI configured (`AMP_WEB_URL`, as setup saves `[server] web_url`), the model gets the web
+/// UI link in the tool result and the web UI origin in its context.
+#[tokio::test]
+async fn a_planning_turn_gets_the_web_ui_link_not_the_mcp_origin() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup(
+        "run-web-links",
+        json!([
+            {"tool_calls": [{"name": "amp_check_plan", "arguments": {"project_id": 2}, "id": "c-1"}]},
+            {"text": "Approve it here: {{last_tool_result}}\n---\n{{system_prompt}}"}
+        ]),
+    );
+    let state = dir.join("home/.local/state");
+    let script = dir.join("script.json");
+    let out = run(
+        &dir,
+        &amp.url,
+        &["run", "-p", "plan it", "--json", "--no-session"],
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("AMP_WEB_URL", "http://localhost:5173"),
+        ],
+    )
+    .await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let events = json_lines(&out);
+    let text = events.last().unwrap()["text"].as_str().unwrap();
+    let mcp_origin = amp.url.trim_end_matches("/mcp");
+    assert!(!text.contains(&format!("{mcp_origin}/project")), "{text}");
+
+    let (result, prompt) = text.split_once("\n---\n").unwrap();
+    assert!(
+        result.contains(r#""approve_url":"http://localhost:5173/project/2/plan""#),
+        "{result}"
+    );
+    // The manager's context names the web UI origin.
+    assert!(
+        prompt.contains("\namp_web_ui: http://localhost:5173 (AMP's web UI: every link you give a person is on this origin, e.g. http://localhost:5173/project/<id>/plan"),
+        "no amp_web_ui line"
+    );
+}
+
 #[tokio::test]
 async fn the_model_receives_amp_instructions_and_project_context() {
     let amp = spawn(MockAmp::new(), None).await;
@@ -205,17 +251,28 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     );
     // 3. The project from .amp.json (its stale amp_api is ignored).
     let project_dir = std::fs::canonicalize(dir.join("project")).unwrap();
+    // #2205: the web UI line; without a web URL it is the MCP URL's origin.
+    let origin = amp.url.trim_end_matches("/mcp");
     assert!(prompt.contains(&format!(
-        "<amp_context>\nrole: amp-manager\namp_server: {}\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\n</amp_context>",
+        "<amp_context>\nrole: amp-manager\namp_server: {}\namp_web_ui: {origin} (AMP's web UI: every link you give a person is on this origin, e.g. {origin}/project/<id>/plan to approve a plan; never build links from amp_server)\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\nworkers_workspace: ",
         amp.url,
         project_dir.join(".amp.json").display(),
-        project_dir.display()
+        project_dir.display(),
     )), "no amp_context block");
+    // #2364: the manager's `workers_workspace:` line (this folder is untracked in the checkout
+    // the tests run in, so its workers get folders), then the clock line.
+    assert!(
+        prompt.contains("amp-work/<ticket>/ and nothing is committed"),
+        "no workers_workspace line"
+    );
+    assert!(prompt.contains(&format!(
+        "\n{}\n</amp_context>",
+        amp_core::request_time::CONTEXT_LINE
+    )));
     assert!(!prompt.contains("stale.invalid"));
-    // 4. The manager's preloaded skills, in full.
-    assert!(prompt.contains("<preloaded_skills>"));
-    assert!(prompt.contains("<skill name=\"amp-index\""));
-    assert!(prompt.contains("<skill name=\"amp-planning\""));
+    // 4. The manager preloads no skill (#2367): its prompt says to read amp-planning to plan.
+    assert!(!prompt.contains("<preloaded_skills>"));
+    assert!(prompt.contains("Read the **amp-planning** skill before you plan"));
     // 5. AGENTS.md.
     assert!(prompt.contains("<project_context>"));
     assert!(prompt.contains("Repo rule: run make check before committing."));
@@ -226,7 +283,6 @@ async fn the_model_receives_amp_instructions_and_project_context() {
         "# AMP Manager",
         "<amp_server_instructions",
         "<amp_context>",
-        "<preloaded_skills>",
         "<project_context>",
         "<available_skills>",
     ];
@@ -249,6 +305,31 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     let out = harness(&dir, &amp.url, &["run", "--print-system-prompt"]).await;
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_eq!(out.stdout.trim_end(), prompt.trim_end());
+
+    // #2367: --print-tools prints the tools as one JSON array, built-in schemas compacted.
+    let out = harness(&dir, &amp.url, &["run", "--print-tools"]).await;
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let tools: Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    let names: Vec<&str> = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"amp_run_ticket") && names.contains(&"amp_whoami"),
+        "{names:?}"
+    );
+    // The manager's policy keeps amp_dispatch_task out (amp_run_ticket dispatches).
+    assert!(!names.contains(&"amp_dispatch_task"), "{names:?}");
+    let read = tools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "read")
+        .unwrap();
+    assert!(read["parameters"].get("$schema").is_none(), "{read}");
+    assert_eq!(read["parameters"]["required"], json!(["path"]));
 }
 
 #[tokio::test]
@@ -281,9 +362,16 @@ async fn policy_denials_and_amp_tool_errors_reach_the_model_and_the_run_goes_on(
     );
     assert_eq!(end("c2")["is_error"], true);
     assert!(end("c2")["text"].as_str().unwrap().contains("it broke"));
-    // The manager has no write tool at all.
+    // The manager may write `.amp.json` only (#2363): any other file is denied.
     assert_eq!(end("c3")["is_error"], true);
-    assert!(end("c3")["text"].as_str().unwrap().contains("not found"));
+    assert!(
+        end("c3")["text"]
+            .as_str()
+            .unwrap()
+            .contains("Denied by the amp-manager tool policy"),
+        "{}",
+        end("c3")
+    );
     assert!(!dir.join("project/x.txt").exists());
     let result = events.last().unwrap();
     assert_eq!(result["outcome"], "completed");

@@ -20,6 +20,26 @@ spec:
       owner: {{ .Values.cnpg.appOwner }}
   monitoring:
     enablePodMonitor: false
+  {{- if .Values.relay.enabled }}
+  # amp-relay's own login role (#2392). CloudNativePG creates it and keeps its
+  # password in step with the Secret; amp-api (which owns the tables) grants
+  # it only what the relay uses, after migrating (RELAY_DB_ROLE).
+  managed:
+    roles:
+      - name: {{ .Values.relay.database.role }}
+        ensure: present
+        comment: amp-relay (remote control relay), least privilege
+        login: true
+        superuser: false
+        createdb: false
+        createrole: false
+        inherit: false
+        replication: false
+        bypassrls: false
+        connectionLimit: 20
+        passwordSecret:
+          name: {{ include "amp.relayDbSecret" . }}
+  {{- end }}
 ---
 # Dex gets its own database in the same cluster, owned by the same app role —
 # this is a small, single-tenant-trust stack so one role owning two databases

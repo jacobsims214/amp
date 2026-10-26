@@ -86,27 +86,41 @@ async fn the_chat_talks_to_the_manager() {
     assert!(screen.contains("project #2"), "{screen}");
     assert!(screen.contains(amp.url.as_str()), "{screen}");
     assert!(screen.contains("faux/faux-1 • thinking"), "{screen}");
-    assert!(screen.contains("session "), "{screen}");
+    // #2186: the banner names the session by its short id, on a row of its own; /usage names
+    // the file, and the context the footer's `ctx N%` stands for.
+    assert!(screen.contains("\n   session "), "{screen}");
+    assert!(screen.contains(" (/usage for path)"), "{screen}");
+    assert!(
+        screen.contains("session: ~/.local/state/amp-harness/sessions/"),
+        "{screen}"
+    );
+    assert!(screen.contains(".jsonl"), "{screen}");
+    assert!(screen.contains("context: "), "{screen}");
 
     // Transcript: both prompts, the AMP tool call, both replies.
     for text in [
         "who am I?",
         "Checking who you are.",
-        // M3-4 (#2108): AMP tools are titled the web UI's way, with a compact result.
-        "✓ AMP · whoami",
-        "email: local-dev@example.com",
+        // M3-4 (#2108): AMP tools are titled the web UI's way; #2183: one line, a human summary.
+        "✓ whoami · local-dev@example.com · 1 org",
         "You are local-dev.",
         "are you still there?",
         "Still here, same conversation.",
-        "usage this session: 2 prompt(s), 3 turn(s), 1 tool call(s) (0 failed)",
+        "usage this session: 2 prompts, 3 turns, 1 tool call",
     ] {
         assert!(screen.contains(text), "missing {text:?} in\n{screen}");
     }
+    // #2188: proper plurals, no `(s)`.
+    assert!(!screen.contains("(s)"), "{screen}");
+    // #2250: every request carries a clock stamp; the transcript never shows it.
+    assert!(!screen.contains("current_time"), "{screen}");
     assert_eq!(amp.mock.calls_to("amp_whoami"), vec![json!({})]);
 
-    // pi's footer: cwd • role, then usage … model • thinking (220 columns fit the long test cwd).
+    // The footer, one row at 220 columns (compact, #2346): cwd • role … `ctx N%` · model •
+    // thinking; then the blank bottom row (#2344).
     assert!(lines[58].contains("• manager"), "{}", lines[58]);
-    assert!(lines[59].contains("faux-1 • "), "{}", lines[59]);
+    assert!(lines[58].contains("faux-1 • "), "{}", lines[58]);
+    assert_eq!(lines[59].trim(), "", "{screen}");
 
     // The session was written to the JSONL state dir, like run -p.
     let sessions = dir.join("home/.local/state/amp-harness/sessions/amp-manager");
@@ -131,7 +145,9 @@ async fn model_switches_and_quit_in_the_chat() {
             "--input",
             "/model",
             "--input",
-            "/model faux/faux-2",
+            "key:down",
+            "--input",
+            "key:enter",
             "--input",
             "/quit",
             "--input",
@@ -145,14 +161,13 @@ async fn model_switches_and_quit_in_the_chat() {
         out.stderr, out.stdout
     );
     let screen = &out.stdout;
-    assert!(
-        screen.contains("available: faux/faux-1, faux/faux-2"),
-        "{screen}"
-    );
+    // #2188: /model is a picker; ↓ Enter picks faux-2, and the panel closes.
+    assert!(!screen.contains("── model"), "{screen}");
     assert!(screen.contains("model: faux/faux-2"), "{screen}");
     assert!(screen.contains("session in memory"), "{screen}");
     assert!(!screen.contains("never sent"), "{screen}");
-    let last = screen.lines().last().unwrap();
+    // The footer's last row is above the blank bottom row (#2344).
+    let last = screen.lines().rev().nth(1).unwrap();
     assert!(last.contains("faux-2 • "), "{last}");
 }
 
@@ -354,4 +369,34 @@ async fn open_uses_the_web_url_setting() {
     .await;
     assert_ne!(out.code, 0, "stdout: {}", out.stdout);
     assert!(out.stderr.contains("AMP_WEB_URL"), "{}", out.stderr);
+}
+
+/// #2206: the banner warns when `.amp.json` was made for another server, and is quiet when the
+/// marker was made for this one.
+#[tokio::test]
+async fn the_banner_warns_about_a_marker_made_for_another_server() {
+    let amp = spawn(MockAmp::new(), None).await;
+    let dir = setup("chat-foreign-marker", json!([]));
+    let marker = dir.join("project/.amp.json");
+    let out = harness(&dir, &amp.url, &["--snapshot", "500x30"]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    let want = format!(
+        "warning: .amp.json at {} was made for https://stale.invalid; this server's #2 is \
+         \"AMP v2\". If that's not this folder's project here, `amp-harness init` picks this \
+         server's.",
+        marker.display()
+    );
+    assert!(out.stdout.contains(&want), "{}", out.stdout);
+
+    std::fs::write(
+        &marker,
+        json!({"project_id": 2, "project_name": "AMP v2",
+               "amp_api": amp.url.trim_end_matches("/mcp")})
+        .to_string(),
+    )
+    .unwrap();
+    let out = harness(&dir, &amp.url, &["--snapshot", "500x30"]).await;
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+    assert!(out.stdout.contains("project #2 AMP v2"), "{}", out.stdout);
+    assert!(!out.stdout.contains("warning: .amp.json"), "{}", out.stdout);
 }

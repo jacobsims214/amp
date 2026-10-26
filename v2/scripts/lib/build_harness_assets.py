@@ -80,6 +80,15 @@ def apply_frontmatter_rules(fm, spec, where):
             raise RuleError(f"{where}: frontmatter line {line!r} matched {len(hits)} times, want 1")
         del lines[hits[0]]
         fm = "\n".join(lines)
+    # add_lines: [{after: <exact line>, lines: [...]}] inserts lines after the one matching line
+    # (#2367: the harness manager's AMP tool denials, which opencode's agent file doesn't have).
+    for add in spec.get("add_lines", []):
+        lines = fm.split("\n")
+        hits = [i for i, l in enumerate(lines) if l == add["after"]]
+        if len(hits) != 1:
+            raise RuleError(f"{where}: frontmatter line {add['after']!r} matched {len(hits)} times, want 1")
+        lines[hits[0] + 1:hits[0] + 1] = list(add["lines"])
+        fm = "\n".join(lines)
     return fm
 
 

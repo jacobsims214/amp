@@ -4,7 +4,7 @@ use amp_core::tools::{ToolCallError, call_as};
 use amp_mcp::AmpMcpClient;
 use serde::{Deserialize, Serialize};
 
-use crate::conn::{CliError, ConnArgs, connect, print_json};
+use crate::conn::{CliError, ConnArgs, connect_cli, print_json};
 
 /// `whoami --json`. Add fields, never rename or remove them.
 #[derive(Debug, Clone, Serialize)]
@@ -132,7 +132,7 @@ impl Whoami {
 
 pub async fn run(conn: ConnArgs, json: bool) -> Result<(), CliError> {
     let settings = conn.settings()?;
-    let client = connect(&settings).await?;
+    let client = connect_cli(&settings).await?;
     let me = fetch(&client).await;
     let auth = client.session().auth.clone();
     client.close().await;

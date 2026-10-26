@@ -281,7 +281,10 @@ func (d *Dispatcher) Wake() {
 	}
 }
 
-// Run matches and delivers until ctx ends.
+// Run matches and delivers until ctx ends. Audit entries, amp-relay's
+// remote.* ones included, come from audit_outbox (auditLoop); m1's separate
+// relay_audit_outbox loop is gone, since relay_record_audit's rows are queued
+// by audit_outbox's trigger like every other (AMP #2433).
 func (d *Dispatcher) Run(ctx context.Context) {
 	go d.matchLoop(ctx)
 	go d.auditLoop(ctx)

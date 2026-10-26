@@ -112,6 +112,18 @@ ampApi:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
 
+# amp-relay (remote control, epic 165): rendered only with relay.enabled
+# (off here). Its image is built by build-images.yml like the others.
+relay:
+  tag: ""   # empty = use global.imageTag
+  # Before turning the relay on here: ArgoCD can't keep the chart's
+  # lookup-or-random secrets stable (see secretOverrides above), so point
+  # database.existingSecret (basic-auth, username amp_relay) and
+  # clusterToken.existingSecret at Secrets you create, or pin
+  # global.secretOverrides.relayDbPassword / relayClusterToken. The chart
+  # refuses to render with relay.enabled until you do.
+  requirePinnedSecrets: true
+
 ui:
   tag: ""
   replicas: 2

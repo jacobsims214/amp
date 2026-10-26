@@ -10,6 +10,10 @@
 //!   transport, auth): a tool error with the reason, never a hang;
 //! - a cancelled run: the call is dropped (rmcp then sends `notifications/cancelled`).
 //!
+//! In all of these, AMP's web UI links (a relative `approve_url`, a refusal's `/project/N/plan`, a
+//! page on the MCP origin) are pointed at the web UI first ([`crate::links`], #2205), so the model
+//! never builds a link from the MCP URL.
+//!
 //! Tools AMP marks `readOnlyHint` are registered with [`ToolReplay::Safe`], so crash recovery may
 //! re-run them; everything else stays `Never` (rpi's default).
 
@@ -25,7 +29,10 @@ use rpi_harness::types::{HarnessTool, ToolReplay};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::tools::result_text;
+use crate::{
+    links::{web_links, web_links_json},
+    tools::result_text,
+};
 
 /// One AMP tool, called through the shared MCP client.
 pub struct McpTool {
@@ -45,13 +52,14 @@ impl std::fmt::Debug for McpTool {
 }
 
 impl McpTool {
-    /// Adapts one `tools/list` entry. The name, description and input schema are AMP's, unchanged.
+    /// Adapts one `tools/list` entry. The name and input schema are AMP's, unchanged; the
+    /// description is AMP's minus its "Use for: ..." line ([`without_use_for`]).
     pub fn new(tool: &amp_mcp::rmcp::model::Tool, client: Arc<AmpMcpClient>) -> Self {
         let name = tool.name.to_string();
         let description = tool
             .description
             .as_deref()
-            .map(str::to_owned)
+            .map(without_use_for)
             .unwrap_or_else(|| name.clone());
         let label = tool
             .title
@@ -122,9 +130,13 @@ pub fn model_text(result: &CallToolResult) -> String {
         .count();
     match (text.trim().is_empty(), others) {
         (_, 0) => text,
-        (true, n) => format!("[{n} non-text content block(s)]"),
-        (false, n) => format!("{text}\n[{n} non-text content block(s)]"),
+        (true, n) => format!("[{n} non-text content {}]", blocks(n)),
+        (false, n) => format!("{text}\n[{n} non-text content {}]", blocks(n)),
     }
+}
+
+fn blocks(n: usize) -> &'static str {
+    if n == 1 { "block" } else { "blocks" }
 }
 
 fn arguments(params: Value) -> Result<Option<JsonObject>, AgentError> {
@@ -161,8 +173,12 @@ impl AgentTool for McpTool {
             _ = signal.cancelled() => return Err(AgentError::Abort),
             r = call => r,
         };
-        let result = result.map_err(|e| AgentError::Tool(format!("{}: {e}", self.schema.name)))?;
-        let text = model_text(&result);
+        let session = self.client.session();
+        let (web, mcp) = (session.web_base(), session.mcp_origin());
+        let links = |s: &str| web_links(s, &web, &mcp).into_owned();
+        let result =
+            result.map_err(|e| AgentError::Tool(links(&format!("{}: {e}", self.schema.name))))?;
+        let text = links(&model_text(&result));
         if result.is_error == Some(true) {
             let message = if text.trim().is_empty() {
                 "the tool reported an error".to_owned()
@@ -174,6 +190,7 @@ impl AgentTool for McpTool {
         let mut out = AgentToolResult::text(text);
         if let Some(structured) = &result.structured_content {
             out.details = structured.clone();
+            web_links_json(&mut out.details, &web, &mcp);
         }
         Ok(out)
     }
@@ -184,18 +201,53 @@ pub fn text_result(text: &str) -> CallToolResult {
     CallToolResult::success(vec![ContentBlock::text(text.to_owned())])
 }
 
+/// AMP's description without its trailing "Use for: <phrases>." line (#2367). Those phrases are
+/// for clients that search a deferred tool list by keyword (Claude Code's tool search); the harness
+/// puts every tool in the prompt, where they repeat the description in every request (~1k tokens
+/// over AMP's tools). A description without one is returned as it is.
+pub fn without_use_for(description: &str) -> String {
+    match description.rfind("Use for:") {
+        // Only a last line: a "Use for:" with more text after it is part of the description.
+        Some(at) if at > 0 && !description[at..].contains('\n') => {
+            description[..at].trim_end().to_owned()
+        }
+        _ => description.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn use_for_lines_are_dropped_from_descriptions() {
+        assert_eq!(
+            without_use_for("List tasks. By default yours. Use for: my tickets, the board."),
+            "List tasks. By default yours."
+        );
+        assert_eq!(
+            without_use_for("Read a doc.\nUse for: read a doc by path."),
+            "Read a doc."
+        );
+        assert_eq!(without_use_for("No trailer."), "No trailer.");
+        assert_eq!(
+            without_use_for("Use for: everything."),
+            "Use for: everything."
+        );
+        assert_eq!(
+            without_use_for("Desc. Use for: x.\nMore text after it."),
+            "Desc. Use for: x.\nMore text after it."
+        );
+    }
 
     #[test]
     fn model_text_names_non_text_blocks() {
         assert_eq!(model_text(&text_result(r#"{"a":1}"#)), r#"{"a":1}"#);
         let image = ContentBlock::image("aGk=", "image/png");
         let r = CallToolResult::success(vec![image.clone()]);
-        assert_eq!(model_text(&r), "[1 non-text content block(s)]");
+        assert_eq!(model_text(&r), "[1 non-text content block]");
         let r = CallToolResult::success(vec![ContentBlock::text("x"), image]);
-        assert_eq!(model_text(&r), "x\n[1 non-text content block(s)]");
+        assert_eq!(model_text(&r), "x\n[1 non-text content block]");
     }
 
     #[test]

@@ -30,8 +30,19 @@ type restAs struct {
 
 func newRestAs(t *testing.T, w *rbacWorld) *restAs {
 	t.Helper()
+	return newRestAsWith(t, w, nil)
+}
+
+// newRestAsWith is newRestAs with the handler configured by configure first
+// (nil: as main() leaves it by default).
+func newRestAsWith(t *testing.T, w *rbacWorld, configure func(*api.RestHandler)) *restAs {
+	t.Helper()
 	mux := http.NewServeMux()
-	api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb).Register(mux)
+	h := api.NewRestHandler(w.s.reg, w.s.repo, w.s.hub, w.s.kb)
+	if configure != nil {
+		configure(h)
+	}
+	h.Register(mux)
 	ra := &restAs{w: w, ids: map[string]*auth.Identity{
 		"owner": w.owner, "alice": w.alice, "bob": w.bob, "lead": w.lead, "carol": w.carol,
 		"dave": w.dave, "orgadmin": w.orgadmin, "outsider": w.outsider, "root": w.root,

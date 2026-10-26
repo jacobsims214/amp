@@ -31,7 +31,7 @@ amp_kb_search(project_id=PROJECT_ID, query="<task name + key terms>")
 - Nothing relevant → proceed
 
 Then search the team KB once for how this team works — branches, commits, pushing, review,
-secrets. Team conventions live there, not in the project KB:
+secrets (the git parts apply only when your work is in git; see Step 6). Team conventions live there, not in the project KB:
 
 ```
 amp_kb_search(project_id=PROJECT_ID, scope="team", query="conventions branches commits review")
@@ -225,6 +225,14 @@ undetected. If you cannot actually verify something (no build command applies, n
 programmatically), write "COULD NOT VERIFY: [why]" instead of asserting VERIFIED anyway — that's
 honest and still useful; a false VERIFIED is not.
 
+**Not all work is in git.** Business and ops work (research, a comparison doc, a customer email
+draft, a spreadsheet) often runs in a plain folder. If your working directory is not a git
+repository, or your harness says you have no branch of your own (AMP Harness: `git: none` or
+`git: not yours here` in your context), don't commit, branch, push or open a pull request. Under
+"Where it is" list the files you made or changed, with their full paths, and leave `branch`,
+`commit`, `pushed` and `pr_url` out of `amp_complete_task`. Everything else in this step still
+applies. The rest of this paragraph is for work in git.
+
 Commit your work, following the team's conventions from Step 0.5 (branch naming, commit
 format). Put the ticket ref (e.g. `NWC-149`) in the commit message, so `git log` leads back to AMP
 just as AMP leads to the commit. `git status` should show nothing of yours left uncommitted: changes left on disk are
@@ -242,6 +250,7 @@ Work complete.
 Summary: [what was done]
 
 Where it is: [branch] @ [commit sha] — [pushed to origin / PR #N / NOT pushed: why]
+            (outside git: the folder and the files you made, with paths)
 
 Files changed:
 - [path]: [what and why]
@@ -268,7 +277,7 @@ amp_complete_task(task_id=YOUR_TASK_ID,
 ```
 
 Report what you know and leave the rest out — never estimate token counts. If your harness can't
-tell you your usage, still report the model and the git fields. The same fields go on
+tell you your usage, still report the model and (in git) the git fields. The same fields go on
 `amp_block_task` when you stop on a question.
 
 ---
