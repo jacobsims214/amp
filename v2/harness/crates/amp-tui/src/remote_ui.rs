@@ -6,6 +6,9 @@
 //!   window has room ([`QrBlock`], [`qr_fits`]; otherwise the link alone) and when it ends.
 //!   `/remote off` ends it, `/remote pair` makes a new link, `/remote devices` lists the paired
 //!   devices and `/remote devices revoke <n|all>` unpins them.
+//! - The link is copied to the clipboard as it is shown (#2423, [`crate::clipboard`]): OSC 52 and
+//!   `pbcopy`/`wl-copy`/`xclip`. `/remote copy` copies it again, `/remote open` opens it in this
+//!   computer's browser, and its rows start at the left edge so a selection of them is the link.
 //! - The footer's badge ([`badge`]): `REMOTE ON · 1 device`, `REMOTE OFFLINE · reconnecting`,
 //!   `· 2 queued` while remote prompts wait.
 //! - The pairing question: `Allow "Safari on iPhone" (jsims@…) to control this session? code
@@ -385,6 +388,10 @@ pub fn qr_fits(link: &str, width: usize, height: usize) -> bool {
 /// The pairing link on its own rows (#2376): cut at the width (a link has no spaces to wrap
 /// at), each piece an OSC 8 hyperlink to the whole link, so a click on any row opens all of it
 /// in terminals that support hyperlinks. Never sent to the manager feed.
+///
+/// #2423: the rows start at the screen's left edge ([`crate::inset::FLUSH_LEFT`]: no padding,
+/// no leading space), so a terminal selection from the first character to the last is the link
+/// plus the line breaks, which browsers drop from a pasted address.
 pub struct LinkBlock {
     url: String,
 }
@@ -400,14 +407,15 @@ impl LinkBlock {
 
 impl Component for LinkBlock {
     fn render(&self, width: usize) -> Vec<String> {
-        let room = width.saturating_sub(1).max(1);
+        let room = width.max(1);
         let chars: Vec<char> = self.url.chars().collect();
         let accent = theme().colors.accent;
         let mut out = vec![String::new()];
         for piece in chars.chunks(room) {
             let piece: String = piece.iter().collect();
             out.push(format!(
-                " \x1b]8;;{}\x07{}\x1b]8;;\x07",
+                "{}\x1b]8;;{}\x07{}\x1b]8;;\x07",
+                crate::inset::FLUSH_LEFT,
                 self.url,
                 accent.fg(&piece)
             ));

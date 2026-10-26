@@ -163,6 +163,8 @@ struct Inputs {
     last_report: Option<i64>,
     /// Report calls in flight: call id → ticket.
     pending: HashMap<String, i64>,
+    /// The chat waits for a person's plan approval in AMP (#2425): the Flight plan link.
+    approval_wait: Option<String>,
 }
 
 /// Everything one frame of the chrome shows.
@@ -176,6 +178,9 @@ pub struct ChromeData {
     pub mcp: Option<amp_core::mcp_hub::HubSummary>,
     /// What each worker is for and how it is doing (#2347; empty without a shell).
     pub roster: Vec<crate::roster::WorkerEntry>,
+    /// The chat waits for a person's plan approval in AMP and resumes the manager by itself
+    /// (#2425): the Flight plan link.
+    pub approval_wait: Option<String>,
 }
 
 impl ChromeData {
@@ -187,6 +192,7 @@ impl ChromeData {
             last_report: None,
             mcp: None,
             roster: Vec::new(),
+            approval_wait: None,
         }
     }
 }
@@ -225,6 +231,17 @@ impl Chrome {
     /// What each worker is for (#2347; the chat view's roster).
     pub fn set_roster(&self, roster: crate::roster::Roster) {
         self.with(|i| i.roster = Some(roster));
+    }
+
+    /// The chat waits for a person's plan approval (#2425): `Some(plan link)` puts "⏸ waiting for
+    /// plan approval in AMP · <link>" on the status line; `None` takes it away.
+    pub fn set_approval_wait(&self, plan_link: Option<String>) {
+        self.with(|i| i.approval_wait = plan_link);
+    }
+
+    /// The link [`Self::set_approval_wait`] set, while the chat waits.
+    pub fn approval_wait(&self) -> Option<String> {
+        self.with(|i| i.approval_wait.clone())
     }
 
     /// Where the MCP servers' health comes from (the session's hub, #2245).
@@ -277,7 +294,7 @@ impl Chrome {
 
     /// This frame's data, or `None` without a metadata source (the chrome is then hidden).
     pub fn data(&self) -> Option<ChromeData> {
-        let (meta, workers, mcp, reports, last_report, roster) = self.with(|i| {
+        let (meta, workers, mcp, reports, last_report, roster, approval_wait) = self.with(|i| {
             let meta = match (&i.fixed, &i.handle) {
                 (Some(m), _) => Some(Arc::clone(m)),
                 (None, Some(h)) => Some(h.snapshot()),
@@ -290,6 +307,7 @@ impl Chrome {
                 i.reports.clone(),
                 i.last_report,
                 i.roster.clone(),
+                i.approval_wait.clone(),
             )
         });
         Some(ChromeData {
@@ -299,6 +317,7 @@ impl Chrome {
             last_report,
             mcp: mcp.map(|f| f()).filter(|s| s.total > 0),
             roster: roster.map(|r| r.all()).unwrap_or_default(),
+            approval_wait,
         })
     }
 
@@ -312,6 +331,7 @@ impl Chrome {
             }
             d.reports.hash(&mut h);
             d.last_report.hash(&mut h);
+            d.approval_wait.hash(&mut h);
             self.with(|i| i.roster.as_ref().map(|r| r.revision()))
                 .hash(&mut h);
             if let Some(m) = d.mcp {
@@ -874,7 +894,13 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         // #2198: approval is per ticket. The chip counts the person's own tickets; others' wait
         // for their owners (or a lead), so they get a quieter segment that goes first.
         let yours = plan.yours().len();
-        if yours > 0 {
+        if let Some(url) = &data.approval_wait {
+            // #2425: the manager's turn ended asking for approval, and the chat waits for it:
+            // it resumes the manager by itself once a person approves in the web UI.
+            let painted = style.paint(c.warning, "⏸ waiting for plan approval in AMP", false);
+            left.push(Seg::new(link(url, &painted), Lead::Bar, 1));
+            left.push(Seg::new(link(url, &c.muted.fg(&clean(url))), Lead::Dot, 6));
+        } else if yours > 0 {
             let text = if plan.per_ticket() {
                 format!("plan: {yours} of yours waiting for your approval")
             } else {
@@ -1191,9 +1217,11 @@ pub mod sample {
                 require_plan_approval: true,
                 awaiting_approval: vec![2108, 2109],
                 plan_approved_at: None,
+                plan_approved_by: None,
                 approve_url: Some("https://amp.simstech.cloud/project/2/plan".into()),
                 tickets: None,
             }),
+            plan_awaiting_since: None,
             artifacts: ok(Vec::new()),
         }
     }

@@ -21,9 +21,10 @@ every role's `provider/model`. Then one line per check:
 | `config`, `credentials`, `ca`, `connect`, `versions` | the AMP server setting, where logins are kept, TLS, the connection |
 | `tools`, `contract`, `whoami`, `project` | AMP's tools, who you are, the folder's `.amp.json` project |
 | `roles`, `fallback` | every role resolves to a model; what a role with no model of its own runs on |
-| `key:<provider>`, `models:<provider>` | the key is there; the endpoint answers with it and lists every model a role uses |
+| `key:<provider>`, `headers:<provider>`, `models:<provider>` | the key (and any secret headers) is there; the endpoint answers with it and lists every model a role uses |
 | `mcp`, `mcp:<server>` | each MCP server: health, trust, how it authenticates, which roles may use it |
 | `skills`, `agents`, `config-check` | your agents and skills load; a repo's untrusted ones are `not trusted, not used` (a warning); every problem `config check` finds |
+| `workspace` | where workers will work in this folder: a git worktree each, or a folder `amp-work/<ticket>/` each outside git (`harness/git-and-the-harness.md`); it warns only when `isolation = "worktree"` can't work here |
 
 It exits 1 when a check fails (warnings don't count). It never prints a key or token. Only
 where a secret comes from.

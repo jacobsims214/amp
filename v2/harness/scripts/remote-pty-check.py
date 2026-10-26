@@ -10,10 +10,17 @@ credential store is the file (no keychain, no GUI). Needs pexpect and pyte:
     target/pyenv/bin/python scripts/remote-pty-check.py 120x40
     target/pyenv/bin/python scripts/remote-pty-check.py 80x24
     target/pyenv/bin/python scripts/remote-pty-check.py errors
+    target/pyenv/bin/python scripts/remote-pty-check.py copy
+
+`copy` (#2423) checks that the link is copied as it is shown, `/remote copy` and `/remote open`,
+and that the rows on screen, joined, are the link. Every mode puts recording stand-ins for
+pbcopy, wl-copy, xclip, xsel, open and xdg-open first on the chat's PATH, so nothing here touches
+the real clipboard or browser; OSC 52 goes to the pty, which records it.
 
 Run from v2/harness after `cargo build -p amp-harness --all-targets`.
 """
 
+import base64
 import json
 import os
 import re
@@ -94,6 +101,34 @@ class Rig:
             self.proc.kill()
 
 
+STUB_TOOLS = ["pbcopy", "wl-copy", "xclip", "xsel", "open", "xdg-open"]
+
+
+def stubs(dir_):
+    """Recording stand-ins for the clipboard tools and browser openers: each run writes its stdin
+    (copy tools) or its last argument (openers) to <dir>/bin/<name>.<pid>.out."""
+    bin_ = os.path.join(dir_, "bin")
+    os.makedirs(bin_, exist_ok=True)
+    for name in STUB_TOOLS:
+        path = os.path.join(bin_, name)
+        with open(path, "w") as f:
+            if name in ("open", "xdg-open"):
+                f.write('#!/bin/sh\nfor a; do last="$a"; done\nprintf %s "$last" > "$0.$$.out"\n')
+            else:
+                f.write('#!/bin/sh\ncat > "$0.$$.out"\n')
+        os.chmod(path, 0o755)
+    return bin_
+
+
+def recorded(dir_, name):
+    """What each run of the stand-in `name` got, oldest first."""
+    bin_ = os.path.join(dir_, "bin")
+    files = [os.path.join(bin_, f) for f in os.listdir(bin_)
+             if f.startswith(name + ".") and f.endswith(".out")]
+    files.sort(key=os.path.getmtime)
+    return [open(f).read() for f in files]
+
+
 def home_env(dir_, url, extra=None):
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("AMP_") and k not in ("ANTHROPIC_API_KEY", "OPENROUTER_API_KEY",
@@ -111,6 +146,8 @@ def home_env(dir_, url, extra=None):
         "AMP_HARNESS_AUTO_RELOAD": "0",
         "TERM": "xterm-256color",
         "COLORTERM": "truecolor",
+        # #2423: the stand-ins come first, so the real clipboard and browser are never used.
+        "PATH": stubs(dir_) + os.pathsep + os.environ.get("PATH", ""),
     })
     env.update(extra or {})
     return env
@@ -166,6 +203,7 @@ class Chat:
         self.cols, self.rows = cols, rows
         self.screen = pyte.Screen(cols, rows)
         self.stream = pyte.ByteStream(self.screen)
+        self.raw = b""
         self.child = pexpect.spawn(BIN, ["--no-setup"], cwd=os.path.join(dir_, "project"),
                                    env=env, dimensions=(rows, cols))
 
@@ -174,6 +212,7 @@ class Chat:
         while time.time() < end:
             try:
                 data = self.child.read_nonblocking(65536, timeout=0.05)
+                self.raw += data
                 self.stream.feed(data)
             except pexpect.TIMEOUT:
                 pass
@@ -325,6 +364,58 @@ def flow(cols, rows):
     rig.close()
 
 
+def copy():
+    """#2423: the link is copied as it is shown; /remote copy, /remote open; a selection."""
+    cols, rows = 80, 30  # no room for the QR code: the link stays on screen
+    d = workdir("copy")
+    rig = Rig(dict(os.environ, AMP_REMOTE_RIG="1"))
+    env = home_env(d, rig.url)
+    login(d, env)
+    chat = Chat(d, env, cols, rows)
+    chat.wait("/help for commands")
+    chat.enter("/remote")
+    chat.wait("Pairing link copied to the clipboard.")
+    show("/remote", chat)
+    tool = "pbcopy" if sys.platform == "darwin" else None
+    copies = [c for t in ("pbcopy", "wl-copy", "xclip", "xsel") for c in recorded(d, t)]
+    assert len(copies) == 1, copies
+    link = copies[0]
+    assert tool is None or recorded(d, tool) == [link], recorded(d, tool)
+    osc = re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]+)\x07", chat.raw)
+    assert [base64.b64decode(o).decode() for o in osc] == [link], osc
+
+    # A plain selection: from the link's first character to its last, as the terminal has it.
+    screen = [line.rstrip() for line in chat.screen.display]
+    first = next(i for i, l in enumerate(screen) if l.startswith("http://127.0.0.1"))
+    sel = []
+    for l in screen[first:]:
+        if not l or l.startswith(" ") or " " in l:
+            break
+        sel.append(l)
+    print(f"selection: {len(sel)} rows, starting at column 0")
+    assert len(sel) > 1, "the link wraps at 80 columns"
+    assert "".join(sel) == link, (sel, "not the copied link")
+    print("selection joined == the copied link: yes")
+
+    chat.enter("/remote copy")
+    chat.pump(1.0)
+    copies = [c for t in ("pbcopy", "wl-copy", "xclip", "xsel") for c in recorded(d, t)]
+    assert copies == [link, link], len(copies)
+    print("/remote copy: copied again (stand-in got the same link)")
+    chat.enter("/remote open")
+    chat.wait("Opened the pairing link")
+    opened = recorded(d, "open") + recorded(d, "xdg-open")
+    assert opened == [link], opened
+    print("/remote open: the stand-in opener got the exact link")
+    show("/remote copy and /remote open", chat, r"copied|Opened|remote")
+
+    chat.child.sendcontrol("c")
+    chat.child.sendcontrol("c")
+    chat.child.expect(pexpect.EOF, timeout=20)
+    rig.close()
+    print("copy: OK")
+
+
 def errors():
     cols, rows = 80, 24
 
@@ -358,6 +449,8 @@ if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else "120x40"
     if arg == "errors":
         errors()
+    elif arg == "copy":
+        copy()
     else:
         c, r = arg.lower().split("x")
         flow(int(c), int(r))

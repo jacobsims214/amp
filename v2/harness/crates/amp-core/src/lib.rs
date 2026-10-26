@@ -85,6 +85,7 @@
 
 pub mod agent;
 pub mod approval;
+pub mod approval_wait;
 pub mod assets;
 pub mod chat_event;
 pub mod config_check;

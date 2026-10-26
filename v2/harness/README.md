@@ -5,11 +5,13 @@ AMP's own agent harness: a Rust binary built on pi-rust's core crates (`rpi-*`) 
 
 Status: **M4.** `amp-harness` with no subcommand is a chat with the manager, which plans on the
 board and dispatches specialist workers itself (`amp_run_ticket`); every worker's run, tokens and
-commit are reported to its ticket automatically. The CLI sets everything up without editing a file:
-`setup` (first run, org presets), `server`, `login`/`logout`, `connect`/`disconnect` (model
-providers), `models`, `agents`, `skills`, `mcp` (any MCP server, import, trust), `config show|check`,
-`doctor`, `whoami`, `tickets list|get` and `run -p` (a headless agent run). `make smoke` runs them
-against a real local AMP.
+commit are reported to its ticket automatically. Workers get a git worktree each in a repository,
+or a folder each (`amp-work/<ticket>/`) anywhere else, so business and ops work needs no git. The
+CLI sets everything up without editing a file: `setup` (first run, org presets), `server
+show|set|use|remove`, `login`/`logout`, `connect`/`disconnect` (model providers), `models`,
+`agents`, `skills`, `mcp` (any MCP server, import, trust), `trust`/`untrust` (a repo's agents,
+skills, roles and MCP servers), `config show|check`, `doctor`, `whoami`, `tickets list|get` and
+`run -p` (a headless agent run). `make smoke` runs them against a real local AMP.
 
 **User guide:** the AMP guide's harness pages, `v2/kb/harness/` (served by `amp_guide`; start at
 [`v2/kb/harness/start-here.md`](../kb/harness/start-here.md)). They cover install, servers,
@@ -112,6 +114,50 @@ manager which project to use. `amp-harness run -p "What is on the board?"` does 
 the TUI. In the chat, `/server` lists the saved servers and `/server <name>` switches to one without
 a restart. `--url` / `AMP_MCP_URL` still work for one command or one shell.
 
+## First run: `amp-harness setup`
+
+`amp-harness setup` (alias `init`; the installer offers it, and plain `amp-harness` runs it before
+the chat opens unless `--no-setup`) asks only for what isn't set up yet, in this order:
+
+1. **AMP server**: `host`, `host:port` or a full URL, normalised like `server set`. It is checked
+   before it is saved. Once a server is saved, setup in another folder keeps it (`AMP server: …
+   (already set up …)`); `--url` or `amp-harness server set` changes it.
+2. **Login**: the browser OAuth login (`login` below), kept in the OS keychain per server URL.
+3. **Project**: link this folder to an existing AMP project or create one, and write `.amp.json`
+   (at the git root, or in this folder outside git).
+4. **Model provider**, when no provider has a key yet: OpenRouter (the shipped roles), an
+   Anthropic API key, an OpenAI API key, or your own OpenAI-compatible endpoint
+   ([own endpoint](#your-companys-own-endpoint-models-per-role-org-presets-2275)). The key is
+   read hidden, checked with the provider and kept in the OS keychain.
+
+Every answer has a flag for scripts (`amp-harness setup --help`): `--url` (and `--web-url`,
+`--ca-file`), `--project ID`, `--create NAME` (with `--code`, `--org`, `--team`) or
+`--no-project`, `--dir DIR` (where `.amp.json` goes), `--key-env VAR` (with `--provider ID`),
+`--profile NAME`, `--preset FILE|URL` (with `--force`), `--yes` (never ask; add `--login` to still
+open the browser login), `--no-browser` and `--json`. Setup is safe to run
+again: what is done is kept. In a folder with no usable git repository it says that workers
+will each get a folder `amp-work/<ticket>/` (see [Dispatching workers](#dispatching-workers-m2-5)).
+
+**`.amp.json` in a parent folder (#2356).** The harness uses the nearest `.amp.json` upwards
+(`AMP_HARNESS_CEILING_DIR` stops the search). The first run uses a parent folder's marker without
+asking only for an ordinary subfolder of the parent's git repository (the repository's root is at
+or above the marker, and it tracks files in this folder, e.g. `cd src/`). Anywhere else (a new,
+empty or untracked folder inside the parent's repository, a folder with its own repository, or
+no repository at all) it says `This folder (x) has no .amp.json of its own: it would use project
+#45 … from ../.amp.json in a parent folder (<path>).` and shows the project picker; Enter writes a
+`./.amp.json` naming the parent's project, so it isn't asked again. Setup never writes over a
+parent folder's `.amp.json`: the new marker goes in this folder, or at this folder's own
+repository root when that is below the parent's marker, and setup says the parent's file is
+unchanged. `init --yes` without `--project`/`--create` keeps the parent's project and warns. The
+chat banner (`project #45 Harness play (from ../.amp.json)`) and `/project`'s `marker` row show
+where the marker is, and the manager is told not to plan in the parent's project here.
+
+**The manager can link the folder too (#2363, #2383).** Ask it to "set up a new project here":
+it creates the AMP project, writes `.amp.json` (the one file the manager may write) and a project
+overview in the KB. The chat watches for the marker every second, so the header, status line,
+banner, the manager's context and workers started afterwards follow the new project at once
+(`Linked this folder to project #N <name>.`).
+
 ## Layout (D1)
 
 ```
@@ -172,12 +218,14 @@ an HTTPS server signed by a throwaway CA for `--ca-file`.
 Nobody has to edit config.toml or export `AMP_MCP_URL` to point the harness at an AMP:
 
 ```sh
-amp-harness server [--json]                      # the server in effect: URL, web UI, CA file, protocol, auth,
+amp-harness server [show] [--json]               # the server in effect: URL, web UI, CA file, protocol, auth,
                                                  # each with its source (flag / env / config / default), and the saved servers
 amp-harness server set <url> [--name N] [--web-url U] [--ca-file PEM] [--protocol P] [--yes] [--json]
 amp-harness server use <name> [--yes] [--json]   # make a saved server the active one
 amp-harness server remove <name>
 ```
+
+`server` with no action is `server show`.
 
 - `set` takes `host`, `host:port` or a full URL, like the first run (`localhost` gets http, anything
   else https, `/mcp` is added when there is no path). It connects first (discovery, then
@@ -514,8 +562,9 @@ Every command below takes the connection flags `--url`, `--ca-file`, `--protocol
 else no credentials.
 
 ```sh
-amp-harness doctor [--json] [--offline]  # config, credentials, connect, tools, contract, whoami, project,
-                                        # roles, fallback, keys, models, mcp, skills, agents, config-check
+amp-harness doctor [--json] [--offline]  # config, credentials, ca, connect, versions, tools, contract, whoami,
+                                        # project, roles, fallback, key/headers/models per provider, mcp,
+                                        # skills, agents, config-check, workspace
 amp-harness whoami [--json]
 amp-harness tickets list [--project N] [--owner mine|unassigned|any|EMAIL] [--state S[,S]] [--json]
 amp-harness tickets get ID [--comments] [--json]
@@ -540,10 +589,59 @@ amp-harness mcp tools [--json] [--server NAME]     # AMP's tools, or a configure
   `[roles.<id>]` runs on) and `config-check` (the rest of `amp-harness config check`). `roles` lists
   every agent with no model of its own as `(no model of its own: fallback worker-backend)`, and
   `config show`, `models list`, `/config` and `/model roles` show the same.
+- Since #2364 the last check is `workspace`: where workers will work here (`isolation auto: <cwd>
+  is not in a git repository: each worker that edits files gets its own folder amp-work/<ticket>/
+  …`). It is never a failure; it warns only when `isolation = "worktree"` can't work in this folder.
 - `mcp call` prints the tool's JSON (or text); a tool error goes to stderr with exit 1. Bad
   arguments exit 2.
 - `--json` output is a contract for scripts: fields are added, never renamed or removed. The full
   shapes are pinned in `crates/amp-harness/tests/cli.rs` against a mock AMP (`tests/common`).
+
+## Troubleshooting with `doctor`
+
+Start every problem with `amp-harness doctor` (`--offline` skips the providers' live model
+catalogs and MCP connections; `--json` is for scripts and agents). It prints the server and its
+source, the models line, each provider in use with its endpoint, key source and auth, every
+role's `provider/model` and the fallback model, then one line per check, `[ok  ]`, `[warn]`,
+`[FAIL]` or `[skip]`, with a `fix:` line under anything that isn't ok, and a `Failed: …` summary.
+It exits 1 when a check fails (warnings don't count) and never prints a secret.
+
+| check | looks at | usual fix |
+|---|---|---|
+| `config` | the AMP server setting and where it comes from | `amp-harness server set <url>` |
+| `credentials` | where logins are kept (keychain, or the file store) | unset `AMP_CREDENTIAL_STORE`; `amp-harness login` |
+| `ca` | TLS: the system roots plus `--ca-file` / `[server] ca_file` | `amp-harness server set <url> --ca-file PEM` |
+| `connect` | discovery / `initialize` against the server | start AMP, or `server set` / `server use` another |
+| `versions` | harness, rpi, rmcp and assets versions, the MCP protocol era | |
+| `tools`, `contract` | AMP's tool list and the D11 contract tools the harness needs | upgrade the AMP server |
+| `whoami`, `project` | who you are; the `.amp.json` project exists and you can see it | `amp-harness login`; `amp-harness init` |
+| `roles`, `fallback` | every role resolves to a model; what a role with no model of its own runs on | `amp-harness models set …` |
+| `key:<provider>`, `headers:<provider>` | the provider's key and secret headers are there (env or keychain) | `amp-harness connect <provider>`, or set its `*_API_KEY` |
+| `models:<provider>` | the endpoint answers its catalog call with that key and lists every model a role uses | `models list --available`; `models set … --no-check` |
+| `mcp`, `mcp:<server>` | each MCP server: health and tool count, trust, auth (by source), which roles may use it | `mcp test`, `mcp login`, `mcp secret`, `trust` |
+| `skills`, `agents` | they load; which agents the manager can dispatch; a repo's untrusted ones are left out | `agents validate`, `skills validate`, `trust` |
+| `config-check` | everything `amp-harness config check` finds, in every layer | the file and key it names |
+| `workspace` | where workers will work in this folder (`[workers] isolation`) | `git init` and commit once, or change `isolation` |
+
+Common failures:
+
+- **"Can't reach AMP at …"** (connection refused, host not found, no answer): see
+  [When AMP can't be reached](#when-amp-cant-be-reached-2178). `--verbose` adds the cause chain.
+- **"needs you to log in" / "AMP login required"**: `amp-harness login`; an open chat reconnects
+  within 15 s.
+- **A role has no key**: `amp-harness connect <provider>`, or export the provider's variable
+  (headless); `models list` shows which roles are ready.
+- **A model is not listed**: `amp-harness models list --available --check`, then `models set`, or
+  `--no-check` for an endpoint that serves models it doesn't list.
+- **Keychain dialogs or `Not asking (OSStatus …)`**: see [Keychain on macOS](#keychain-on-macos-2165);
+  the message names the item and the command that stores it again.
+- **A repo's agents, skills, roles or MCP servers are not used**: they are untrusted; `amp-harness
+  trust` lists them and `trust --all` (or the chat's question) trusts them.
+- **A worker went quiet**: it is reported on its ticket as abandoned with the reason; raise
+  `[workers]` limits if the work needs them.
+- **The chat says "needs a terminal"** (exit 2): use `amp-harness run -p` in scripts.
+
+User guide: `v2/kb/harness/troubleshooting.md`.
 
 ## Connecting model providers (#2163)
 
@@ -1063,10 +1161,14 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   servers). `/mcp`, `/agents`, `/skills`, `/model roles` and `/config` are panels over the same
   settings as the CLI (health, details, enable/disable, trust, per-role models, every setting with
   its source). `/reload` picks up agents, skills, models and MCP servers changed from another
-  terminal (see below). AMP: `/ticket`, `/project`, `/questions`, `/plan`, `/open`, `/workers`,
-  `/worker`, `/amp`. `/usage` prints the session's tokens and cost, `/help`, `/abort`, `/close`,
-  `/quit` (also `/exit`, `/q`).
-- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply. A new line also comes
+  terminal (see below). AMP: `/amp` (server, user, MCP health), `/ticket [id|none]`, `/project
+  [id]`, `/questions`, `/plan`, `/open [id|plan]`, `/workers`, `/worker [id]`. `/usage` prints the
+  session's tokens and cost, `/help` (also `/?`), `/abort`, `/close` (the open panel), `/quit`
+  (also `/exit`, `/q`). Typing `/` opens a completion menu (↑↓ choose, Tab complete, Enter run).
+- Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply (and the workers it
+  started; an Esc that closes a panel, the `/` menu or a worker's session doesn't, and for 2 s the
+  spinner line says `Esc again to stop the reply`). Up/Down in an empty or one-line editor recall
+  earlier prompts; Down past the newest restores the draft. A new line also comes
   from Ctrl+J (every terminal), Alt+Enter (`ESC CR`: Option as Esc+/Meta on a Mac) and `\` then
   Enter (#2349). Without the kitty keyboard protocol most terminals send Shift+Enter as a plain CR,
   so it sends; a local Terminal.app is the exception (rpi-tui reads the Shift key from macOS), and
@@ -1075,6 +1177,15 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   sends (`amp_tui::newline`). Ctrl-C aborts a run,
   else clears the editor, else quits; Ctrl-D on an empty editor quits. Ctrl+T opens (or closes
   again) the lowest thinking section on screen, else the last one (#2345); Ctrl+O shows (or hides) every tool call's arguments and result.
+- Workers (#2347, #2395): while workers run, each has a line above the editor (ticket, story ›
+  epic, agent and model, state, elapsed, tokens, context %). Click one, press Ctrl+W (←/→, Enter),
+  pick a `/workers` row or run `/worker <id>` to watch its live session (Esc back, Tab/Shift+Tab
+  next/previous, `x` stop with a confirmation, `o` open the ticket in AMP, PgUp/PgDn). While
+  `/workers` is open, typing goes to the message box, so the panel's actions are chords: ↑↓ select
+  (empty message box), Enter or a click watches, **Ctrl+X** stops the selected worker (asks
+  first: y or Enter stops), **Ctrl+G** opens its ticket in AMP, Esc closes. A finished worker's
+  session stays viewable until the chat ends; an earlier chat's opens from its session file with
+  `/worker <id>`.
 - Scrolling the transcript (#2185): the mouse wheel; PageUp/PageDown a page; with an empty editor,
   Ctrl+U/Ctrl+D half a page and End back to the latest output (Ctrl+End jumps from anywhere; with
   text in the editor these keys stay the editor's). Ctrl+D at the latest output still quits, but not
@@ -1087,6 +1198,13 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   iTerm2). To get plain click-drag selection back, turn mouse reporting off with `[tui] mouse =
   false` (or `AMP_HARNESS_MOUSE=off`); the wheel then no longer scrolls the transcript (Terminal.app
   may send it as ↑↓ instead), and PageUp/PageDown do.
+- The `/remote` pairing link (#2423) is copied as it is shown: OSC 52 to the terminal plus
+  `pbcopy` (macOS), `wl-copy` (Wayland) or `xclip`/`xsel` (X11) when found in `PATH`
+  (`amp_tui::clipboard`). `/remote copy` copies it again, `/remote open` opens it with `open` /
+  `xdg-open`. Its rows start at the window's left edge (`inset::FLUSH_LEFT`: no padding), so a
+  modifier-drag from its first character to its last is the link plus line breaks. Only the
+  terminal loop turns the real clipboard on (`Shell::attach_terminal`); tests use
+  `Desktop::with_path` and recording stand-ins.
 - Tool calls (#2183) are one line each: `✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms`.
   AMP calls get a sentence for what they did (the contract tools, `kb_search` and `create_tasks`;
   any other falls back to the result's `key: value` list), durations under a second are in ms,
@@ -1146,6 +1264,7 @@ with square borders and AMP's ticket-state, epic and brand colours.
 | thinking | -         | `AMP_HARNESS_SHOW_THINKING` | `show_thinking`       | `collapsed` |
 | mouse    | -         | `AMP_HARNESS_MOUSE`         | `mouse`               | `true`      |
 | padding  | -         | `AMP_HARNESS_PADDING`       | `padding`             | `2`         |
+| density  | -         | `AMP_HARNESS_DENSITY`       | `density`             | `compact`   |
 
 - `theme`: `auto` asks the terminal for its background (OSC 11) and picks light on a light
   background, else dark. Use `dark` / `light` to skip the query, or give a path to your own theme
@@ -1163,6 +1282,9 @@ with square borders and AMP's ticket-state, epic and brand colours.
   (the default 2 becomes 1), and it shrinks further so the content keeps at least 40 columns
   (none at 41 columns or fewer). A blank row sits above the header and below the footer too,
   except on terminals shorter than 24 rows.
+- `density` (#2346): `compact` (one blank row between turns, one-row message bubbles and footer,
+  bold only for headings, one-line failed tool calls, a three-line banner) or `comfortable` (the
+  roomier earlier layout).
 
 The message box shows the terminal's cursor as a blinking bar at the insertion point whenever it
 has the keys: on start, after a panel closes, and after a click into it (with mouse reporting on,
@@ -1289,13 +1411,18 @@ call and returns the worker's final message, outcome, usage and where its work i
 1. The agent must be in the roster and allowed by the manager's `task` policy; otherwise nothing
    happens in AMP.
 2. It waits for a worker slot, then calls `amp_dispatch_task` (AMP refusing it ends the call).
-3. Roles that edit files run in a git worktree `<repo>/.worktrees/<ticket>` on branch
-   `amp-<ticket>` off `HEAD` (reused if it exists; `worktree`, `branch` and `base` override this).
-   Read-only roles run in the manager's directory. `.worktrees/` is added to the repo's
-   `info/exclude` if nothing ignores it yet.
-4. The worker is its own agent session: its role's model and thinking, its prompt plus the ticket,
-   worktree and branch, tools bound to its directory, and a JSONL session under
-   `~/.local/state/amp-harness/sessions/<ticket>/`.
+3. Roles that edit files get a place of their own, chosen by `[workers] isolation` (below). In
+   a usable git repository (one with a commit that tracks this folder) that is a worktree
+   `<repo>/.worktrees/<ticket>` on branch `amp-<ticket>` off `HEAD` (reused if it exists;
+   `worktree`, `branch` and `base` override this; `.worktrees/` is added to the repo's
+   `info/exclude` if nothing ignores it yet). Anywhere else it is a folder
+   `<cwd>/amp-work/<ticket>/`. Read-only roles run in the manager's directory.
+4. The worker is its own agent session: its role's model and thinking, its prompt plus the ticket
+   and its workspace, tools bound to its directory, and a JSONL session under
+   `~/.local/state/amp-harness/sessions/<ticket>/`. Its AMP context says `workspace:
+   worktree|folder|shared <path>` and `git: yes` (commit on your branch), `git: none` or `git: not
+   yours here` (don't commit, branch, push or open a pull request; list the files you made in the
+   completion comment).
 5. It runs until it stops, hits the timeout or the turn budget, or is cancelled (the manager's run
    was aborted). Ending a worker early aborts its in-flight tools.
 
@@ -1306,9 +1433,38 @@ Limits, in `~/.config/amp-harness/config.toml` or the environment (env wins):
 max_parallel = 4          # AMP_HARNESS_MAX_WORKERS: workers at once; extra calls wait for a slot
 timeout_minutes = 60      # AMP_HARNESS_WORKER_TIMEOUT_SECS (seconds): wall clock per worker
 max_turns = 400           # AMP_HARNESS_WORKER_MAX_TURNS: model turns per worker; 0 = no limit
+isolation = "auto"        # AMP_HARNESS_WORKER_ISOLATION: auto | worktree | folder | shared
 ```
 
-Unknown keys and non-positive `max_parallel` or timeouts are errors.
+Unknown keys and non-positive `max_parallel` or timeouts are errors. `[workers]` is read when the
+chat starts and only from your user config (a repo's `.amp/harness/config.toml` can't set it).
+
+### Where a worker works: `[workers] isolation` (#2364)
+
+| isolation | usable git repository | anywhere else (no repository, a folder the surrounding repository doesn't track, a repository with no commit) |
+|---|---|---|
+| `auto` (default) | worktree `.worktrees/<ticket>`, branch `amp-<ticket>` | folder `amp-work/<ticket>/` |
+| `worktree` | worktree | refused before anything is dispatched, saying to `git init` and commit, or use `auto` |
+| `folder` | folder `amp-work/<ticket>/` | folder |
+| `shared` | the manager's folder; editing workers take turns | the same |
+
+- A folder per ticket keeps workers parallel outside git: with the worker's working directory
+  set to `amp-work/<ticket>/`, its `edit`/`write` outside it are denied (`external_directory`),
+  while reads anywhere are allowed. It can read your files but never overwrite them. `shared` is
+  for work that must edit files in place; a waiting editor holds no slot. The manager's explicit
+  `worktree: false` still runs one worker in its folder without waiting.
+- The manager's context gets `workers_workspace: <summary>`; outside worktrees it is told not to
+  plan commit, branch, pull-request or review-and-merge steps.
+- The chat banner says it in one line when workers won't get worktrees (`not a git repository:
+  workers each get a folder amp-work/<ticket>/, no branches or commits`), `doctor` has a
+  `workspace` check (warns only when `worktree` can't work here), `/config` has an `isolation`
+  row, and the worker report's `workspace` is `worktree`, `folder` or `shared`, with a note when
+  `auto` fell back to a folder.
+- Nothing is cleaned up for you: remove a merged worktree with `git worktree remove
+  .worktrees/<ticket>` and `git branch -d amp-<ticket>`; move what you want out of
+  `amp-work/<ticket>/` and delete it.
+
+User guide: `v2/kb/harness/git-and-the-harness.md`.
 
 ## Run reporting (M2-6)
 
@@ -1319,7 +1475,9 @@ them in for every worker it dispatches:
 - When a worker completes or blocks **its own ticket**, the harness fills `model`, `input_tokens`,
   `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `cost_usd`, `branch`, `commit` and
   `pushed`, but only the fields the model left out. Usage is the worker's live totals; git comes from
-  its worktree.
+  its worktree. A worker with no git of its own (a folder, or no repository) never reports
+  `branch`, `commit`, `pushed` or a non-URL `pr_url`: the harness drops them even when the model
+  sends them.
 - A worker that ends without closing its ticket (error, timeout, cancel, turn budget, stopped for
   repeating one tool call, or it just stopped) is reported with `amp_report_run`, outcome `abandoned` and a note
   `abandoned: <reason>`, with the same usage and git fields, so the board shows the run and its

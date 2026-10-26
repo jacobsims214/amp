@@ -166,7 +166,7 @@ pub const COMMANDS: &[CommandSpec] = &[
         Group::Amp,
         "remote",
         "[on|off|pair]",
-        "chat from AMP on a phone; /remote devices too",
+        "chat from a phone; /remote copy, open, devices",
     ),
     CommandSpec::new(
         Group::Config,
@@ -212,6 +212,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new(Group::Chat, "usage", "", "tokens and cost this session"),
     CommandSpec::new(Group::Chat, "abort", "", "stop the reply"),
+    CommandSpec::new(
+        Group::Chat,
+        "stop",
+        "",
+        "stop the reply, or the wait for plan approval",
+    ),
     CommandSpec::new(Group::Chat, "close", "", "close the open panel"),
     CommandSpec::new(Group::Chat, "help", "", "this list").aliases(&["?"]),
     CommandSpec::new(Group::Chat, "quit", "", "leave the chat").aliases(&["exit", "q"]),

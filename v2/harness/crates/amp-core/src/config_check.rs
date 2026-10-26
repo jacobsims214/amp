@@ -162,6 +162,7 @@ pub const CHECKERS: &[(&str, Checker)] = &[
     ("providers", check_providers),
     ("roles", check_roles),
     ("workers", check_workers),
+    ("manager", check_manager),
     ("tools", check_tools),
     ("mcp", check_mcp),
     ("skills", check_skills),
@@ -178,6 +179,7 @@ pub const USER_TABLES: &[&str] = &[
     "roles",
     "profiles",
     "workers",
+    "manager",
     "tools",
     "secrets",
     "tui",
@@ -553,6 +555,24 @@ fn check_workers(inputs: &Inputs) -> Vec<Problem> {
     }
 }
 
+/// `[manager]` (#2425): `auto_resume_on_approval`, a boolean.
+fn check_manager(inputs: &Inputs) -> Vec<Problem> {
+    let Some(text) = &inputs.user_text else {
+        return Vec::new();
+    };
+    let Ok(doc) = toml::from_str::<toml::Table>(text) else {
+        return Vec::new();
+    };
+    match crate::approval_wait::manager_auto_resume(&doc) {
+        Ok(_) => Vec::new(),
+        Err(e) => vec![
+            Problem::error("manager", Layer::User, clean(&e))
+                .file(inputs.user_file())
+                .key("manager"),
+        ],
+    }
+}
+
 /// `[tools]` and `[secrets]` as a session reads them.
 fn check_tools(inputs: &Inputs) -> Vec<Problem> {
     let (Some(text), Some(_)) = (&inputs.user_text, &inputs.user) else {
@@ -776,6 +796,7 @@ mod tests {
                 "providers",
                 "roles",
                 "workers",
+                "manager",
                 "tools",
                 "mcp",
                 "skills",

@@ -58,6 +58,10 @@ pub struct MockAmp {
     pub omit: Vec<&'static str>,
     /// Every `tools/call` as (name, arguments).
     pub calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// #2425: what `amp_check_plan` answers, changed by the test as a person's approval in the
+    /// web UI would change it; with it, project 2 requires plan approval. `None`: the fixed
+    /// answer below.
+    pub plan: Option<Arc<Mutex<Value>>>,
 }
 
 impl MockAmp {
@@ -66,6 +70,7 @@ impl MockAmp {
             legacy_only: false,
             omit: Vec::new(),
             calls: Arc::default(),
+            plan: None,
         }
     }
 
@@ -235,7 +240,8 @@ impl ServerHandler for MockAmp {
             "amp_whoami" => ok_json(whoami_json()),
             "amp_get_project" => match args["project_id"].as_i64() {
                 Some(2) => ok_json(
-                    json!({"project": {"id": 2, "name": "AMP v2", "code": "amp-v2", "state": "active"}}),
+                    json!({"project": {"id": 2, "name": "AMP v2", "code": "amp-v2", "state": "active",
+                                       "require_plan_approval": self.plan.is_some()}}),
                 ),
                 _ => tool_error("project not found"),
             },
@@ -292,6 +298,9 @@ impl ServerHandler for MockAmp {
             ]})),
             "amp_list_artifacts" => ok_json(json!({"artifacts": []})),
             // #2205: amp-api without APP_PUBLIC_URL (compose) gives relative web UI links.
+            "amp_check_plan" if self.plan.is_some() => {
+                ok_json(self.plan.as_ref().unwrap().lock().unwrap().clone())
+            }
             "amp_check_plan" => ok_json(json!({
                 "project_id": 2, "require_plan_approval": true, "awaiting_approval": [4042],
                 "approve_url": "/project/2/plan"
