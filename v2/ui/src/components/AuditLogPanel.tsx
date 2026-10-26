@@ -9,7 +9,7 @@ import { Pill, When } from './admin'
 import { errMsg, fieldCls, quietBtnCls, smallSelectCls } from '../lib/adminStyles'
 import {
   ACTOR_TYPE_LABEL, AUTH_METHOD_LABEL, CLIENT_LABEL, activeFilterCount, actorName, auditExportUrl, auditVerifyUrl, diffValues,
-  hasDetails, isoToLocal, localToISO, targetLabel, verifyVerdict, type AuditScope,
+  authHeaderChange, hasDetails, isoToLocal, localToISO, targetLabel, verifyCoverage, verifyVerdict, type AuditScope,
 } from '../lib/audit'
 
 // The audit log for one scope: an org (its own changes and its projects'),
@@ -107,6 +107,7 @@ export function AuditRow({ e, showProject, first }: { e: AuditEntry; showProject
   const expandable = hasDetails(e)
   const refused = e.outcome === 'denied' || e.outcome === 'failed'
   const details = e.details && Object.keys(e.details).length ? e.details : null
+  const headerChange = authHeaderChange(e)
   return (
     <li className={`${first ? '' : 'border-t border-line'}`}>
       <div className="px-4 py-2.5 flex items-start gap-3">
@@ -121,6 +122,11 @@ export function AuditRow({ e, showProject, first }: { e: AuditEntry; showProject
             {refused && <Pill tone="red" title={e.reason || undefined}><ShieldAlert size={9} />{e.outcome}</Pill>}
             {e.client && <Pill tone="gray" title="How it arrived">{CLIENT_LABEL[e.client] ?? e.client}</Pill>}
             {e.via_token && <Pill tone="gray" title="Made with an API token"><KeyRound size={9} />API token</Pill>}
+            {headerChange && (
+              <Pill tone="amber" title="The webhook's auth header value was changed. The value itself is never recorded.">
+                <KeyRound size={9} />auth header {headerChange}
+              </Pill>
+            )}
             {e.source_ip && <span className="amp-num text-[11px] text-ink-2" title="Source address">{e.source_ip}</span>}
             {showProject && e.project_id != null && <span className="text-[10px] text-ink-3">project {e.project_id}</span>}
           </div>
@@ -184,8 +190,12 @@ export function VerifyStatus({ report, error, loading, orgId, onRecheck }: {
     else if (verdict.status === 'unproven') { tone = 'amber'; label = `Unproven · ${rows}` }
     else { tone = 'green'; label = `Chain verified · ${rows}` }
   }
+  const coverage = report ? verifyCoverage(report) : null
   const title = error ?? (report && verdict
     ? `${report.chains.length} chain(s) checked ${new Date(report.checked_at).toLocaleString()}.` +
+      (coverage?.incremental
+        ? ` Only the ${coverage.rowsRead.toLocaleString()} entr${coverage.rowsRead === 1 ? 'y' : 'ies'} written since the last check were read; every entry was last re-read in full ${coverage.fullCheckAt ? new Date(coverage.fullCheckAt).toLocaleString() : 'earlier'}.`
+        : '') +
       (verdict.status === 'unproven'
         ? ` No problems found, but nothing signed proves it: ${verdict.reasons.join('; ') || 'no signed checkpoint yet'}. Someone with database access could have rewritten it.`
         : '')

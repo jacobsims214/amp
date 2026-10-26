@@ -274,6 +274,7 @@ func TestAuditUI_InstanceWebhookAndAuthHeader(t *testing.T) {
 	w := newRBACWorld(t)
 	ra := newRestAs(t, w)
 	allowPrivateWebhooks(t)
+	withSecretsKey(t, w.s.repo, testSecretsKey(0x42)) // auth headers are stored encrypted (#2441)
 	siem := newHeaderReceiver(t, "Authorization")
 	orgRC := newHeaderReceiver(t, "Authorization")
 	const token = "Splunk 0f8b-test-hec-token"
@@ -363,6 +364,7 @@ func TestAuditUI_InstanceWebhookAndAuthHeader(t *testing.T) {
 func TestAuditUI_AuthHeaderNeedsHTTPS(t *testing.T) {
 	w := newRBACWorld(t)
 	ra := newRestAs(t, w)
+	withSecretsKey(t, w.s.repo, testSecretsKey(0x42))
 	ra.want(t, 400, "root", "POST", "/api/webhooks", map[string]any{"url": "http://siem.example.com/in", "auth_header": "DD-API-KEY: k"})
 	hook := ra.want(t, 200, "root", "POST", "/api/webhooks", map[string]any{"url": "https://siem.example.com/in", "auth_header": "dd-api-key: k"})["webhook"].(map[string]any)
 	id := int(hook["id"].(float64))

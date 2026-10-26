@@ -598,6 +598,11 @@ func (d *Dispatcher) auditDropped(ctx context.Context, dd repository.DueDelivery
 
 // post sends one delivery; any non-2xx answer is an error.
 func (d *Dispatcher) post(ctx context.Context, dd repository.DueDelivery) (int, error) {
+	if dd.SecretsErr != nil {
+		// Never send unsigned, or without the header the receiver needs:
+		// fail the attempt (it retries) until the key is back (#2441).
+		return 0, fmt.Errorf("not sent: can't decrypt the webhook's stored secrets: %w", dd.SecretsErr)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, dd.URL, bytes.NewReader([]byte(dd.Body)))
 	if err != nil {
 		return 0, err

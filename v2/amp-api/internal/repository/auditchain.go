@@ -106,6 +106,17 @@ const chainRowCols = `id, at, actor_email, via_token, org_id, project_id, action
 // with each row in seq order, then (for "global" only, since they can't be
 // placed in an org's chain) any rows that have no chain at all.
 func (r *Repo) ReadAuditChain(ctx context.Context, key string, start func(*auditchain.Head, []auditchain.Checkpoint), row func(auditchain.Row)) error {
+	return r.ReadAuditChainAfter(ctx, key, func(h *auditchain.Head, cps []auditchain.Checkpoint) int64 {
+		start(h, cps)
+		return 0
+	}, row)
+}
+
+// ReadAuditChainAfter is ReadAuditChain where start, having seen the head
+// and checkpoints, says which rows to read: those after the seq it returns
+// (0: all), for verifying incrementally from where a previous verification
+// ended (#2441 L2). Unchained rows (global only) are always read.
+func (r *Repo) ReadAuditChainAfter(ctx context.Context, key string, start func(*auditchain.Head, []auditchain.Checkpoint) int64, row func(auditchain.Row)) error {
 	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 	if err != nil {
 		return err
@@ -128,13 +139,13 @@ func (r *Repo) ReadAuditChain(ctx context.Context, key string, start func(*audit
 	if err != nil {
 		return fmt.Errorf("audit checkpoints: %w", err)
 	}
-	start(head, cps)
-	q := `SELECT ` + chainRowCols + ` FROM audit_log WHERE chain_key = $1 ORDER BY chain_seq`
+	after := start(head, cps)
+	q := `SELECT ` + chainRowCols + ` FROM audit_log WHERE chain_key = $1 AND chain_seq > $2 ORDER BY chain_seq`
 	if key == "global" {
-		q = `SELECT ` + chainRowCols + ` FROM audit_log WHERE chain_key = $1 OR chain_key IS NULL
+		q = `SELECT ` + chainRowCols + ` FROM audit_log WHERE (chain_key = $1 AND chain_seq > $2) OR chain_key IS NULL
 			ORDER BY chain_key IS NULL, chain_seq, id`
 	}
-	rs, err := tx.Query(ctx, q, key)
+	rs, err := tx.Query(ctx, q, key, after)
 	if err != nil {
 		return fmt.Errorf("read audit chain: %w", err)
 	}

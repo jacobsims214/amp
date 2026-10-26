@@ -103,6 +103,14 @@ The export is streamed, so there is no row limit, and each export is itself reco
   - `actor_mismatch`: `actor_user_id` was re-pointed to another user.
 - Warnings, which don't fail the check: entries newer than the last signed checkpoint, and
   pre-key unsigned checkpoints accepted under `AUDIT_SIGNING_SINCE`.
+- **The REST check is incremental.** Each amp-api replica remembers where its last check of a
+  chain ended, and the next check reads only the entries written since then. The new entries are
+  checked as strictly as in a full check, and a new checkpoint at the seam is compared too.
+  About once an hour, after a failed check, after a new retention anchor, and after a change of
+  keys, it re-reads the whole chain instead. An edit to an old entry made with the guard trigger
+  off is therefore found by the next full read, not necessarily by the next page load. Each
+  chain in the report says `incremental`, `rows_read` and `full_check_at` (when every entry was
+  last re-read); the UI's chain status says the same. The CLI always reads every entry.
 
 ### Retention
 
@@ -183,10 +191,41 @@ Any webhook can also send one **auth header** for collectors that want a static 
 Splunk HEC (`Authorization: Splunk <token>`) or Datadog (`DD-API-KEY: <key>`). The header:
 
 - is set as `"auth_header": "Name: value"`;
-- can't be read back, logged or recorded: the audit entry keeps only its name;
+- can't be read back, logged or recorded: the audit entry keeps only its name, and a change of
+  the value shows as `auth_header_changed` (and `auth_header_removed`) in the `webhook.update`
+  entry's details, and as "auth header replaced" in the audit log;
+- is stored encrypted (below), and can't be added at all until an encryption key is set;
 - is sent only to https URLs;
 - must be entered again when the webhook's URL changes;
 - can't replace a header AMP sets (`X-AMP-*`, `Content-Type`, `Host`...).
+
+**Webhook secrets are encrypted at rest.** Auth header values and webhook signing secrets are
+stored encrypted (AES-256-GCM) under a key that lives only in a Kubernetes Secret, so a database
+dump or backup holds ciphertext. amp-api decrypts them only to send a delivery.
+
+- **Set the key** (once per install, before adding auth headers):
+
+  ```sh
+  openssl rand -base64 32 | tr -d '\n' > encryption-key
+  kubectl -n amp create secret generic amp-secrets-encryption --from-file=encryption-key=encryption-key
+  rm encryption-key
+  ```
+
+  and set Helm `ampApi.secretsEncryption.existingSecret: amp-secrets-encryption` (the production
+  values already do). Keep a copy of the key somewhere safe: without it, encrypted values can't
+  be read back, and their webhooks stop delivering.
+- **At every startup** amp-api encrypts any value still stored in plaintext (from before this
+  existed, or from a time without a key), and re-encrypts values under a retired key.
+- **Rotating:** put the new key in `encryption-key` and the old one in `retired-keys`
+  (comma-separated if more than one) in the same Secret, restart amp-api, check the log line
+  `webhook secrets are encrypted at rest` with the new `key_id`, then remove `retired-keys`.
+- **Without a key:** new or changed auth headers are refused with a 400 that says what to set;
+  removing one still works. Signing secrets are stored in plaintext, as before. Auth headers
+  already stored in plaintext keep being sent, and amp-api logs a warning with their count at
+  startup. A value encrypted under a key that is no longer configured isn't sent at all: those
+  deliveries fail and retry with "can't decrypt the webhook's stored secrets" until the key is
+  back, and amp-api logs an error at startup. A malformed key counts as no key (logged as an
+  error). The key itself is never logged, only its id.
 
 Deliveries are still signed (`X-AMP-Signature`). Webhook URLs can't point at private, loopback,
 link-local, CGNAT or NAT64 addresses. AMP checks this when the URL is saved and again on every

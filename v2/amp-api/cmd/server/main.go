@@ -87,6 +87,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Webhook secrets at rest (#2441): auth headers and signing secrets are
+	// encrypted with AMP_SECRETS_KEY (Helm ampApi.secretsEncryption). Every
+	// startup seals legacy plaintext and re-seals values under a retired key.
+	configureSecretsKeys(ctx, repo)
+
 	// Who may become an AMP user by signing in (e.g. through an SSO
 	// connector): emails in these domains, invited emails, and bootstrap
 	// admins. Unset allows anyone who can sign in to Dex.

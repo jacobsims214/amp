@@ -20,6 +20,13 @@ describe('AuditRow', () => {
     expect(html).toContain('project 5')
     expect(html).toContain('aria-expanded="false"')
   })
+  it('shows on the line itself that a webhook change replaced its auth header, without any value (#2441)', () => {
+    const html = renderToStaticMarkup(<ul><AuditRow e={entry({ action: 'webhook.update', outcome: 'success', details: { auth_header_changed: true },
+      before: { delivery_header: 'Authorization' }, after: { delivery_header: 'Authorization' } })} showProject first /></ul>)
+    expect(html).toContain('auth header replaced')
+    const plain = renderToStaticMarkup(<ul><AuditRow e={entry({ action: 'webhook.update', outcome: 'success', details: { url: 'https://x' } })} showProject first /></ul>)
+    expect(plain).not.toContain('auth header')
+  })
   it('shows a v1 entry with only its original fields', () => {
     const html = renderToStaticMarkup(<ul><AuditRow e={{ id: 2, at: '2026-01-01T00:00:00Z', actor_email: '', action: 'org.rename', summary: 'renamed' }} showProject={false} first /></ul>)
     expect(html).toContain('AMP')
@@ -66,6 +73,13 @@ describe('VerifyStatus', () => {
     expect(html).toContain('no signing key')
     // A key, but no signed checkpoint yet: still unproven.
     expect(render(report({ ok: false, status: 'unproven' }))).toContain('Unproven')
+  })
+  it('says when a check read only the new entries, and when everything was last re-read (#2441)', () => {
+    const html = render(report({ chains: [{ chain_key: 'org:3', ok: true, rows: 1204, head_seq: 1204, checkpoints_matched: 3, signed_checkpoints: 3, problems: [],
+      rows_read: 2, incremental: true, full_check_at: '2026-10-26T11:15:00Z' }] }))
+    expect(html).toMatch(/Chain verified · 1[,.\s]?204 rows/)
+    expect(html).toContain('Only the 2 entries written since the last check were read; every entry was last re-read in full')
+    expect(render(report())).not.toContain('Only the')
   })
   it('treats an unsigned "ok" from an older server as unproven, and says when the check failed', () => {
     expect(render(report({ signing: { configured: false } }))).toContain('Unproven')

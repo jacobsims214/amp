@@ -83,6 +83,22 @@ ampApi:
     # Public keys (base64, comma-separated) of retired signing keys, so
     # checkpoints signed before a rotation still verify. Not secret.
     retiredPublicKeys: ""
+  # Encryption at rest for webhook auth headers and signing secrets (#2441):
+  # AES-256-GCM under a key that lives only in this Secret, never in the
+  # database or in git. Make one with
+  #   openssl rand -base64 32 | tr -d '\n' > encryption-key
+  #   kubectl -n amp create secret generic amp-secrets-encryption --from-file=encryption-key=encryption-key
+  #   rm encryption-key        # keep a copy somewhere safe first
+  # Unset (or the Secret missing): auth headers can't be added (the API
+  # says why), signing secrets are stored in plaintext as before, and
+  # existing plaintext values keep working. amp-api encrypts plaintext
+  # values at startup once a key is set. To rotate, put the new key in
+  # `key` and the old one(s) in `retiredKeysKey` (comma-separated), restart,
+  # then remove the retired entry: startup re-encrypts under the new key.
+  secretsEncryption:
+    existingSecret: ""
+    key: encryption-key
+    retiredKeysKey: retired-keys
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }

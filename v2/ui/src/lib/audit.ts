@@ -119,6 +119,31 @@ export function verifyVerdict(r: AuditVerifyReport): { status: AuditVerifyStatus
 }
 
 /**
+ * How much of the chain a check read. The server verifies incrementally
+ * (only entries written since its last check) and re-reads everything
+ * about hourly (#2441), so an incremental result relies on the last full
+ * read for older entries: say when that was. fullCheckAt is the oldest
+ * full read among the incremental chains.
+ */
+export function verifyCoverage(r: AuditVerifyReport): { incremental: boolean; rowsRead: number; fullCheckAt: string | null } {
+  const inc = r.chains.filter(c => c.incremental)
+  const rowsRead = r.chains.reduce((n, c) => n + (c.rows_read ?? c.rows), 0)
+  const fulls = inc.map(c => c.full_check_at).filter((t): t is string => !!t).sort()
+  return { incremental: inc.length > 0, rowsRead, fullCheckAt: fulls[0] ?? null }
+}
+
+/**
+ * A webhook change that replaced or removed its auth header. The value is
+ * a secret and never recorded, so before/after can look identical while
+ * the credential was swapped; the server flags it in details (#2441).
+ */
+export function authHeaderChange(e: AuditEntry): 'replaced' | 'removed' | null {
+  const d = e.details
+  if (!d || d.auth_header_changed !== true) return null
+  return d.auth_header_removed === true ? 'removed' : 'replaced'
+}
+
+/**
  * Audit webhooks that have stopped carrying the stream: turned off (by a
  * person, or by AMP after repeated failures), or failing now. An instance
  * webhook is never turned off by AMP, so a failing one is reported as

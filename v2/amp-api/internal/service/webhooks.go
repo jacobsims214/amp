@@ -10,6 +10,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/secretbox"
 	"github.com/simstech/amp-api/internal/webhook"
 )
 
@@ -108,6 +109,9 @@ func (s *Service) CreateWebhook(ctx context.Context, p authz.Principal, orgID, p
 	if err := checkAuthHeaderTransport(&w); err != nil {
 		return nil, err
 	}
+	if err := s.checkAuthHeaderStorable(w.AuthHeaderValue); err != nil {
+		return nil, err
+	}
 	secret, err := webhook.NewSecret()
 	if err != nil {
 		return nil, err
@@ -142,12 +146,26 @@ func (s *Service) UpdateWebhook(ctx context.Context, p authz.Principal, id int, 
 	if err := checkAuthHeaderTransport(w); err != nil {
 		return nil, err
 	}
+	if c.AuthHeader != nil {
+		if err := s.checkAuthHeaderStorable(w.AuthHeaderValue); err != nil {
+			return nil, err
+		}
+	}
 	updated, err := s.Repo.UpdateWebhook(ctx, *w, c.AuthHeader != nil)
 	if err != nil {
 		return nil, err
 	}
 	e := webhookAudit("webhook.update", updated, "changed webhook "+describeWebhook(updated))
 	e.Before, e.After = before, webhookValue(updated)
+	if c.AuthHeader != nil {
+		// The value is a secret and never recorded, so before/after can look
+		// identical (same header name) while the credential was swapped: say
+		// that it was replaced or removed (#2441 L4).
+		e.Details["auth_header_changed"] = true
+		if !updated.AuthHeaderSet {
+			e.Details["auth_header_removed"] = true
+		}
+	}
 	s.audit(ctx, p, e)
 	return updated, nil
 }
@@ -255,6 +273,15 @@ func applyWebhookChange(w *domain.Webhook, c WebhookChange) error {
 	}
 	if c.IncludeContext != nil {
 		w.IncludeContext = *c.IncludeContext
+	}
+	return nil
+}
+
+// checkAuthHeaderStorable refuses a new auth header when there is no key
+// to encrypt it with: AMP never stores one in plaintext (#2441).
+func (s *Service) checkAuthHeaderStorable(value string) error {
+	if value != "" && !s.Repo.CanSealSecrets() {
+		return authz.BadRequest("auth headers are stored encrypted, and this server has no encryption key: an admin sets one (Helm ampApi.secretsEncryption.existingSecret, env %s) before auth headers can be added", secretbox.EnvKey)
 	}
 	return nil
 }

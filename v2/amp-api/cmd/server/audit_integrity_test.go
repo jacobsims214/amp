@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/simstech/amp-api/internal/auditchain"
+	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/service"
@@ -797,5 +798,82 @@ func TestAuditIntegrity_UnsignedIsUnproven(t *testing.T) {
 	var out, errOut bytes.Buffer
 	if code := runAuditCLI([]string{"verify"}, &out, &errOut); code != 3 || !strings.Contains(out.String(), "UNPROVEN") {
 		t.Fatalf("CLI verify, unsigned: exit %d\n%s%s", code, out.String(), errOut.String())
+	}
+}
+
+// #2441 L2: the verify endpoint doesn't re-read a whole chain on every
+// audit panel load. It continues from where the last verification ended,
+// reading only the new rows, and re-reads everything once
+// AuditVerifyFullEvery has passed (which is when an edit to an old row,
+// made with the guard trigger off, shows). The CLI always reads everything.
+func TestAuditIntegrity_VerifyIsIncremental(t *testing.T) {
+	withSigningKey(t)
+	d := newIntegrityDB(t)
+	ctx := context.Background()
+	root := authz.Principal{Super: true}
+	for i := 0; i < 5; i++ {
+		d.write(t, 61, fmt.Sprintf("team.create.%d", i))
+	}
+	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil {
+		t.Fatal(err)
+	}
+	chainOf := func(r auditchain.Report) auditchain.ChainReport {
+		t.Helper()
+		if len(r.Chains) != 1 || r.Chains[0].ChainKey != "org:61" {
+			t.Fatalf("report = %+v", r)
+		}
+		return r.Chains[0]
+	}
+	verify := func() auditchain.ChainReport {
+		t.Helper()
+		r, err := d.svc.VerifyAudit(ctx, root, 61)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return chainOf(r)
+	}
+
+	first := verify()
+	if !first.OK || first.Incremental || first.RowsRead != 6 || first.FullCheckAt == nil { // 5 rows + the checkpoint announcement
+		t.Fatalf("first verification = %+v", first)
+	}
+	// Nothing new: nothing read.
+	if again := verify(); !again.OK || !again.Incremental || again.RowsRead != 0 || again.Rows != 6 || !again.FullCheckAt.Equal(*first.FullCheckAt) {
+		t.Fatalf("unchanged chain = %+v", again)
+	}
+	// Two new rows and a new signed checkpoint at the head: only those.
+	d.write(t, 61, "team.create.5")
+	d.write(t, 61, "team.create.6")
+	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil {
+		t.Fatal(err)
+	}
+	inc := verify()
+	if !inc.OK || !inc.Incremental || inc.RowsRead != 3 || inc.Rows != 9 || inc.LastSeq != 9 || inc.SignedCheckpoints != 2 {
+		t.Fatalf("incremental verification = %+v", inc)
+	}
+	// New rows are still checked: an altered new row fails at once.
+	d.write(t, 61, "team.create.7")
+	d.exec(t, `ALTER TABLE audit_log DISABLE TRIGGER USER`)
+	d.exec(t, `UPDATE audit_log SET summary = 'nothing happened' WHERE chain_key = 'org:61' AND chain_seq = 10`)
+	if r := verify(); r.OK || !r.Incremental || r.RowsRead != 1 || !strings.Contains(fmt.Sprint(r.Problems), auditchain.ProblemAltered) {
+		t.Fatalf("altered new row = %+v", r)
+	}
+	// A failed chain is read in full every time, so it can't heal.
+	d.exec(t, `UPDATE audit_log SET summary = 'team.create.7' WHERE chain_key = 'org:61' AND chain_seq = 10`)
+	if r := verify(); !r.OK || r.Incremental || r.RowsRead != 10 {
+		t.Fatalf("after the failure = %+v", r)
+	}
+	// An edit to an old row shows at the next full read.
+	d.exec(t, `UPDATE audit_log SET summary = 'nothing happened' WHERE chain_key = 'org:61' AND chain_seq = 2`)
+	d.exec(t, `ALTER TABLE audit_log ENABLE TRIGGER USER`)
+	prev := service.AuditVerifyFullEvery
+	service.AuditVerifyFullEvery = 0
+	t.Cleanup(func() { service.AuditVerifyFullEvery = prev })
+	if r := verify(); r.OK || r.Incremental || r.RowsRead != 10 || !strings.Contains(fmt.Sprint(r.Problems), auditchain.ProblemAltered) {
+		t.Fatalf("full re-read after an old row was edited = %+v", r)
+	}
+	// The CLI path reads everything.
+	if full := d.verify(t); full.Chains[0].Incremental || full.OK {
+		t.Fatalf("VerifyAuditChains = %+v", full.Chains[0])
 	}
 }

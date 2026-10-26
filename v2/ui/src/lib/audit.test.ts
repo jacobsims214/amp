@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { activeFilterCount, auditExportUrl, auditQuery, auditVerifyUrl, diffValues, isoToLocal, localToISO, actorName, targetLabel, stoppedAuditStreams, verifyVerdict } from './audit'
+import { activeFilterCount, auditExportUrl, auditQuery, auditVerifyUrl, diffValues, isoToLocal, localToISO, actorName, targetLabel, stoppedAuditStreams, verifyVerdict, verifyCoverage, authHeaderChange } from './audit'
 import type { AuditEntry, AuditVerifyReport, Webhook } from '../types'
 
 describe('auditQuery', () => {
@@ -107,5 +107,32 @@ describe('stoppedAuditStreams', () => {
       [3, '3 deliveries in a row failed: HTTP 503'],
       [5, '1 deliveries in a row failed'],
     ])
+  })
+})
+
+describe('verifyCoverage (#2441)', () => {
+  const chain = (over: Partial<AuditVerifyReport['chains'][number]> = {}) =>
+    ({ chain_key: 'global', ok: true, rows: 50, head_seq: 50, checkpoints_matched: 1, signed_checkpoints: 1, problems: [], ...over })
+  const rep = (chains: AuditVerifyReport['chains']): AuditVerifyReport =>
+    ({ ok: true, status: 'ok', checked_at: '2026-10-26T12:00:00Z', signing: { configured: true }, chains })
+  it('reports an incremental check with what it read and the oldest full read', () => {
+    expect(verifyCoverage(rep([
+      chain({ rows_read: 3, incremental: true, full_check_at: '2026-10-26T11:30:00Z' }),
+      chain({ chain_key: 'org:2', rows_read: 0, incremental: true, full_check_at: '2026-10-26T11:10:00Z' }),
+    ]))).toEqual({ incremental: true, rowsRead: 3, fullCheckAt: '2026-10-26T11:10:00Z' })
+  })
+  it('treats a full read, or an older server, as not incremental', () => {
+    expect(verifyCoverage(rep([chain({ rows_read: 50, full_check_at: '2026-10-26T12:00:00Z' })]))).toEqual({ incremental: false, rowsRead: 50, fullCheckAt: null })
+    expect(verifyCoverage(rep([chain()]))).toEqual({ incremental: false, rowsRead: 50, fullCheckAt: null })
+  })
+})
+
+describe('authHeaderChange (#2441)', () => {
+  const e = (details?: Record<string, unknown>): AuditEntry => ({ id: 1, at: '', actor_email: '', action: 'webhook.update', summary: '', details })
+  it('says whether a webhook change replaced or removed the auth header', () => {
+    expect(authHeaderChange(e({ auth_header_changed: true }))).toBe('replaced')
+    expect(authHeaderChange(e({ auth_header_changed: true, auth_header_removed: true }))).toBe('removed')
+    expect(authHeaderChange(e({ url: 'https://x' }))).toBeNull()
+    expect(authHeaderChange(e())).toBeNull()
   })
 })

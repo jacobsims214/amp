@@ -136,6 +136,17 @@ spec:
               value: {{ . | quote }}
             {{- end }}
             {{- end }}
+            {{- with .Values.ampApi.secretsEncryption }}
+            {{- if .existingSecret }}
+            # Webhook secrets encryption key (values.yaml
+            # ampApi.secretsEncryption). optional: a missing Secret means no
+            # key (auth headers refused), not a pod that can't start.
+            - name: AMP_SECRETS_KEY
+              valueFrom: { secretKeyRef: { name: {{ .existingSecret }}, key: {{ .key | default "encryption-key" }}, optional: true } }
+            - name: AMP_SECRETS_RETIRED_KEYS
+              valueFrom: { secretKeyRef: { name: {{ .existingSecret }}, key: {{ .retiredKeysKey | default "retired-keys" }}, optional: true } }
+            {{- end }}
+            {{- end }}
             {{- if .Values.valkey.enabled }}
             - name: REDIS_ADDR
               value: "amp-valkey.{{ .Values.global.namespace }}.svc.cluster.local:6379"

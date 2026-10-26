@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/secretbox"
 )
 
 // Repo is a thin wrapper around pgxpool.
@@ -17,6 +18,9 @@ type Repo struct {
 	db *pgxpool.Pool
 	// signupDomains limits first sign-ins (see SetSignupDomains).
 	signupDomains []string
+	// secrets seals the secrets stored in the database (webhook auth
+	// headers and signing secrets, #2441); see SetSecretsKeys.
+	secrets *secretbox.Keyring
 }
 
 func New(ctx context.Context, dsn string) (*Repo, error) {

@@ -542,6 +542,11 @@ export interface AuditVerifyReport {
     last_signed_seq?: number
     problems: { kind: string; seq?: number; audit_id?: number; detail: string }[]
     warnings?: string[]
+    /** Rows read by this check: with incremental, only those written since the last one (#2441). Older servers omit it. */
+    rows_read?: number
+    incremental?: boolean
+    /** When every row of the chain was last re-read in full. */
+    full_check_at?: string
   }[]
 }
 
