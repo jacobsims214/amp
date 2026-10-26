@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
-import { ChevronDown, ChevronRight, KeyRound, Loader2, Pencil, Plus, Power, Send, Trash2 } from 'lucide-react'
+import { AlertTriangle, ChevronDown, ChevronRight, KeyRound, Loader2, Pencil, Plus, Power, Send, Trash2 } from 'lucide-react'
 import { api } from '../api/client'
 import type { Webhook, WebhookChange, WebhookDelivery, WebhookFormat } from '../types'
 import { Notice, Pill, SecretReveal, When } from './admin'
 import { dangerBtnCls, errMsg, fieldCls, primaryBtnCls, quietBtnCls, smallSelectCls } from '../lib/adminStyles'
 import { labelCls } from './CrudModal'
+import { stoppedAuditStreams } from '../lib/audit'
 
 // Webhooks for a project (project owners), an org (org admins), or the
 // whole instance (global admins: audit entries only, all of them, the SIEM
@@ -62,10 +63,14 @@ export function WebhookForm({ initial, instance, submitLabel, onSubmit, onCancel
   const [headerMode, setHeaderMode] = useState<HeaderMode>(initial.auth_header_set ? 'keep' : 'remove')
   const [headerName, setHeaderName] = useState(initial.auth_header_name || 'Authorization')
   const [headerValue, setHeaderValue] = useState('')
+  // Audit entries' request context is personal data: org and project
+  // webhooks opt in, instance webhooks (the SIEM stream) default to it.
+  const [includeContext, setIncludeContext] = useState(initial.include_context ?? !!instance)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const toggle = (v: string) => setEvents(es => es.includes(v) ? es.filter(e => e !== v) : [...es, v])
   const choices = instance ? INSTANCE_EVENT_CHOICES : EVENT_CHOICES
+  const sendsAudit = !!instance || events.some(e => e === '*' || e.startsWith('audit.'))
   // A stored header goes wherever the URL points, so moving the webhook needs it entered again.
   const urlMoved = !!initial.auth_header_set && !!initial.url && url.trim() !== initial.url
   const headerNeeded = urlMoved && headerMode === 'keep'
@@ -75,7 +80,7 @@ export function WebhookForm({ initial, instance, submitLabel, onSubmit, onCancel
     if (headerNeeded) { setError('The URL changed: enter the auth header again, or remove it.'); return }
     if (headerMode === 'set' && (!headerName.trim() || !headerValue)) { setError('Enter the header name and its value, or choose no header.'); return }
     setBusy(true); setError(null)
-    const change: WebhookChange = { name: name.trim(), url: url.trim(), format, events }
+    const change: WebhookChange = { name: name.trim(), url: url.trim(), format, events, include_context: includeContext }
     if (headerMode === 'set') change.auth_header = `${headerName.trim()}: ${headerValue}`
     else if (headerMode === 'remove' && initial.auth_header_set) change.auth_header = ''
     try { await onSubmit(change); setHeaderValue('') }
@@ -147,6 +152,15 @@ export function WebhookForm({ initial, instance, submitLabel, onSubmit, onCancel
           })}
         </div>
       </div>
+      {sendsAudit && format === 'json' && (
+        <label className="flex items-start gap-2 text-xs text-ink-2 cursor-pointer">
+          <input type="checkbox" checked={includeContext} onChange={e => setIncludeContext(e.target.checked)} className="mt-0.5" />
+          <span>
+            <span className="text-ink">Include request context</span> in audit entries: client IP, user agent, session and token ids, and
+            before/after values. This is personal data; send it only to a receiver you are allowed to share it with.
+          </span>
+        </label>
+      )}
       <div className="flex items-center gap-2">
         <button type="submit" disabled={busy || !url.trim()} className={primaryBtnCls}>
           {busy && <Loader2 size={12} className="animate-spin" />}{submitLabel}
@@ -218,6 +232,7 @@ function WebhookRow({ hook, canManage, onChanged, onSecret }: {
             {hook.name && <span className="font-mono">{hook.url} · </span>}
             {hook.format === 'slack' ? 'Slack' : 'JSON'} · {describeEvents(hook.events)}
             {hook.auth_header_set && <> · <KeyRound size={10} className="inline -mt-0.5" aria-hidden /> sends {hook.auth_header_name}</>}
+            {hook.include_context && <> · with request context</>}
           </p>
         </div>
         {!hook.active && <Pill tone="gray">off</Pill>}
@@ -257,7 +272,26 @@ function WebhookRow({ hook, canManage, onChanged, onSecret }: {
   )
 }
 
-export function WebhooksPanel({ orgId, projectId, instance, canManage }: Scope & { canManage: boolean }) {
+/** A warning when audit webhooks have stopped carrying the stream (turned off, or failing). */
+export function StoppedStreamWarning({ hooks, siem }: { hooks: Webhook[]; siem?: boolean }) {
+  const stopped = stoppedAuditStreams(hooks)
+  if (stopped.length === 0) return null
+  return (
+    <div role="alert" className="rounded-xl px-3 py-2 text-xs flex gap-2 items-start"
+      style={{ background: 'color-mix(in srgb, var(--warning) 12%, transparent)', border: '1px solid color-mix(in srgb, var(--warning) 45%, transparent)' }}>
+      <AlertTriangle size={14} className="text-warning-ink flex-shrink-0 mt-px" aria-hidden />
+      <div className="min-w-0 space-y-0.5">
+        <p className="m-0 text-ink font-medium">{siem ? 'SIEM stream stopped' : 'Audit stream stopped'}: entries are not reaching {stopped.length === 1 ? 'this receiver' : `${stopped.length} receivers`}.</p>
+        {stopped.map(({ hook, why }) => (
+          <p key={hook.id} className="m-0 text-ink-2 break-words">{hook.name || hook.url}: {why}</p>
+        ))}
+        <p className="m-0 text-ink-3">The audit log has a webhook.disable or webhook.delivery.dropped entry for each.</p>
+      </div>
+    </div>
+  )
+}
+
+export function WebhooksPanel({ orgId, projectId, instance, canManage, onHooks }: Scope & { canManage: boolean; onHooks?: (hooks: Webhook[]) => void }) {
   const [hooks, setHooks] = useState<Webhook[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -267,6 +301,7 @@ export function WebhooksPanel({ orgId, projectId, instance, canManage }: Scope &
     api.listWebhooks({ orgId, projectId }).then(setHooks).catch(e => setError(errMsg(e, 'Failed to load webhooks')))
   }, [orgId, projectId])
   useEffect(() => { if (canManage) load() }, [canManage, load])
+  useEffect(() => { if (hooks) onHooks?.(hooks) }, [hooks, onHooks])
 
   if (!canManage) {
     return <p className="text-xs text-ink-3">{instance ? 'Global admins' : orgId ? 'Org owners and admins' : 'Project owners'} manage {instance ? 'instance ' : ''}webhooks.</p>
@@ -277,6 +312,7 @@ export function WebhooksPanel({ orgId, projectId, instance, canManage }: Scope &
   return (
     <div className="space-y-3">
       {error && <p className="text-xs text-danger-ink">{error}</p>}
+      {hooks && !onHooks && <StoppedStreamWarning hooks={hooks} siem={instance} />}
       {secret?.secret && (
         <SecretReveal title={`Signing secret for ${secret.name || secret.url}`} secret={secret.secret} onDone={() => setSecret(null)}
           note="Copy it now: it's only shown when the webhook is created or its secret rotated.">
@@ -308,7 +344,13 @@ export function WebhooksPanel({ orgId, projectId, instance, canManage }: Scope &
       ) : (
         <button onClick={() => setCreating(true)} className={quietBtnCls}><Plus size={12} />Add webhook</button>
       )}
-      {hooks && hooks.length > 0 && <p className="text-[11px] text-ink-3">Failed deliveries are retried for a few hours. After 20 deliveries in a row fail, a webhook turns itself off.</p>}
+      {hooks && hooks.length > 0 && (
+        <p className="text-[11px] text-ink-3">
+          {instance
+            ? 'Failed deliveries are retried for a few hours, then dropped and recorded in the audit log. Instance webhooks never turn themselves off.'
+            : 'Failed deliveries are retried for a few hours. After 20 deliveries in a row fail, a webhook turns itself off; both are recorded in the audit log.'}
+        </p>
+      )}
     </div>
   )
 }

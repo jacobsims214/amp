@@ -521,13 +521,19 @@ export interface AuditFilter {
 }
 
 /** GET /api/audit/verify */
+export type AuditVerifyStatus = 'ok' | 'unproven' | 'failed'
+
 export interface AuditVerifyReport {
+  /** True only when status is ok. */
   ok: boolean
+  /** ok: verified and signed; unproven: no problems, but nothing signed proves it; failed: tampering or loss. Missing from older servers. */
+  status?: AuditVerifyStatus
   checked_at: string
   signing: { configured: boolean; key_id?: string }
   chains: {
     chain_key: string
     ok: boolean
+    status?: AuditVerifyStatus
     rows: number
     head_seq: number
     anchor_seq?: number
@@ -557,6 +563,8 @@ export interface Webhook {
   auth_header_set?: boolean
   /** A webhook of the whole AMP: audit entries only, all of them. */
   instance?: boolean
+  /** Audit entries carry their request context (IP, user agent, session and token ids, before/after). Opt-in; on by default for instance webhooks. */
+  include_context?: boolean
   created_by?: number
   created_at: string
   updated_at: string
@@ -574,6 +582,7 @@ export interface WebhookChange {
   active?: boolean
   /** "Name: value" sets it, "" removes it, absent keeps it. */
   auth_header?: string
+  include_context?: boolean
 }
 
 export interface WebhookDelivery {

@@ -55,8 +55,20 @@ describe('VerifyStatus', () => {
       problems: [{ kind: 'hash_mismatch', seq: 4, detail: 'row 4 altered' }, { kind: 'gap', seq: 7, detail: 'seq 7 missing' }] }] }))
     expect(html).toContain('Chain broken: 2 problems')
   })
-  it('warns when checkpoints are unsigned, and when the check failed', () => {
-    expect(render(report({ signing: { configured: false } }))).toContain('unsigned checkpoints')
+  it('says unproven, not verified, when nothing signed vouches for the chain (#2439)', () => {
+    const unproven = report({ ok: false, status: 'unproven', signing: { configured: false },
+      chains: [{ chain_key: 'org:3', ok: false, status: 'unproven', rows: 12, head_seq: 12, checkpoints_matched: 0, signed_checkpoints: 0, problems: [],
+        warnings: ['unproven: no signing key is configured (AUDIT_SIGNING_KEY): the chain can\'t be proven against someone with database access'] }] })
+    const html = render(unproven)
+    expect(html).toContain('Unproven · 12 rows')
+    expect(html).not.toContain('Chain verified')
+    expect(html).not.toContain('Chain broken')
+    expect(html).toContain('no signing key')
+    // A key, but no signed checkpoint yet: still unproven.
+    expect(render(report({ ok: false, status: 'unproven' }))).toContain('Unproven')
+  })
+  it('treats an unsigned "ok" from an older server as unproven, and says when the check failed', () => {
+    expect(render(report({ signing: { configured: false } }))).toContain('Unproven')
     expect(render(null, 'forbidden')).toContain("Couldn&#x27;t check the chain")
   })
 })

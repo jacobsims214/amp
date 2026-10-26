@@ -292,7 +292,8 @@ func TestAuditUI_InstanceWebhookAndAuthHeader(t *testing.T) {
 	hook := ra.want(t, 200, "root", "POST", "/api/webhooks", body)["webhook"].(map[string]any)
 	id := int(hook["id"].(float64))
 	t.Cleanup(func() { _ = w.s.repo.DeleteWebhook(context.Background(), id) })
-	if hook["instance"] != true || hook["auth_header_name"] != "Authorization" || hook["auth_header_set"] != true ||
+	// Instance webhooks get the request context by default (#2439 M2).
+	if hook["instance"] != true || hook["include_context"] != true || hook["auth_header_name"] != "Authorization" || hook["auth_header_set"] != true ||
 		fmt.Sprint(hook["events"]) != "[audit.*]" || strings.Contains(mustJSON(hook), token) {
 		t.Fatalf("created = %v", hook)
 	}
@@ -406,5 +407,42 @@ func TestAuditUI_MCPAuditLog(t *testing.T) {
 	}
 	if msg := mcpCall(t, as, as.callCtx(), "amp_audit_log", map[string]any{"org_id": float64(w.org.ID), "ip": "nope"}); !strings.Contains(msg, "ip must be") {
 		t.Errorf("bad ip: %q", msg)
+	}
+}
+
+// The SIEM stream never turns itself off (#2439 M4): an instance webhook
+// that keeps failing stays on and backs off, and the deliveries it drops
+// are recorded as webhook.delivery.dropped.
+func TestAuditUI_InstanceWebhookIsNeverAutoDisabled(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	allowPrivateWebhooks(t)
+	down := newReceiver(t)
+	down.respond = func(int) int { return 503 }
+	hook := ra.want(t, 200, "root", "POST", "/api/webhooks", map[string]any{"name": "dead SIEM", "url": down.srv.URL})["webhook"].(map[string]any)
+	id := int(hook["id"].(float64))
+	t.Cleanup(func() { _ = w.s.repo.DeleteWebhook(context.Background(), id) })
+	startWebhooks(t, w, webhook.Options{AllowPrivateNetworks: true, MaxAttempts: 1, DisableAfter: 1})
+	for i := 0; i < 2; i++ {
+		ra.want(t, 200, "alice", "POST", "/api/users/me/tokens", map[string]any{"name": fmt.Sprintf("dead-siem-%d-%d", i, time.Now().UnixNano())})
+	}
+	eventually(t, "two deliveries failed for good", func() bool {
+		got, _ := w.s.repo.GetWebhook(context.Background(), id)
+		return got != nil && got.ConsecutiveFailures >= 2
+	})
+	got, _ := w.s.repo.GetWebhook(context.Background(), id)
+	if !got.Active {
+		t.Fatalf("instance webhook turned off after %d failures", got.ConsecutiveFailures)
+	}
+	if off := auditRows(t, w.s.repo, domain.AuditFilter{Action: "webhook.disable", TargetType: "webhook", TargetID: fmt.Sprint(id)}); len(off) != 0 {
+		t.Fatalf("webhook.disable for an instance webhook: %+v", off)
+	}
+	var dropped []domain.AuditEntry
+	eventually(t, "a webhook.delivery.dropped entry", func() bool {
+		dropped, _ = w.s.repo.ListAudit(context.Background(), domain.AuditFilter{Action: "webhook.delivery.dropped", TargetType: "webhook", TargetID: fmt.Sprint(id)})
+		return len(dropped) > 0
+	})
+	if dropped[0].ActorType != domain.AuditActorSystem || dropped[0].OrgID != nil {
+		t.Fatalf("dropped entry = %+v", dropped[0])
 	}
 }

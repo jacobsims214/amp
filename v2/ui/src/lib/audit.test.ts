@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { activeFilterCount, auditExportUrl, auditQuery, auditVerifyUrl, diffValues, isoToLocal, localToISO, actorName, targetLabel } from './audit'
-import type { AuditEntry } from '../types'
+import { activeFilterCount, auditExportUrl, auditQuery, auditVerifyUrl, diffValues, isoToLocal, localToISO, actorName, targetLabel, stoppedAuditStreams, verifyVerdict } from './audit'
+import type { AuditEntry, AuditVerifyReport, Webhook } from '../types'
 
 describe('auditQuery', () => {
   it('puts the scope first and leaves out empty filters', () => {
@@ -71,5 +71,41 @@ describe('labels', () => {
   it('describes the target', () => {
     expect(targetLabel(e({ target_type: 'project', target_id: '12', target_name: 'Apollo' }))).toBe('project 12 · Apollo')
     expect(targetLabel(e({}))).toBe('')
+  })
+})
+
+describe('verifyVerdict', () => {
+  const chain = (over: Partial<AuditVerifyReport['chains'][number]> = {}) =>
+    ({ chain_key: 'global', ok: true, rows: 5, head_seq: 5, checkpoints_matched: 1, signed_checkpoints: 1, problems: [], ...over })
+  const rep = (over: Partial<AuditVerifyReport> = {}): AuditVerifyReport =>
+    ({ ok: true, status: 'ok', checked_at: '2026-10-26T12:00:00Z', signing: { configured: true, key_id: 'k' }, chains: [chain()], ...over })
+  it('follows the server status', () => {
+    expect(verifyVerdict(rep()).status).toBe('ok')
+    const v = verifyVerdict(rep({ ok: false, status: 'unproven', chains: [chain({ ok: false, status: 'unproven', warnings: ['unproven: no signed checkpoint covers this chain yet (they are written hourly)'] })] }))
+    expect(v).toMatchObject({ status: 'unproven', problems: 0, rows: 5, reasons: ['no signed checkpoint covers this chain yet (they are written hourly)'] })
+    expect(verifyVerdict(rep({ ok: false, status: 'failed', chains: [chain({ problems: [{ kind: 'altered', detail: 'x' }] })] }))).toMatchObject({ status: 'failed', problems: 1 })
+  })
+  it('never calls an unsigned chain from an older server ok', () => {
+    expect(verifyVerdict(rep({ status: undefined, signing: { configured: false } }))).toMatchObject({ status: 'unproven', reasons: ['no signing key is configured'] })
+    expect(verifyVerdict(rep({ status: undefined })).status).toBe('ok')
+  })
+})
+
+describe('stoppedAuditStreams', () => {
+  const hook = (over: Partial<Webhook>): Webhook => ({ id: 1, name: 'SIEM', url: 'https://siem.example', format: 'json', events: ['audit.*'], active: true,
+    created_at: '', updated_at: '', consecutive_failures: 0, ...over })
+  it('lists audit webhooks that are off or failing, and ignores healthy and non-audit ones', () => {
+    const got = stoppedAuditStreams([
+      hook({ id: 1 }),
+      hook({ id: 2, active: false, consecutive_failures: 20 }),
+      hook({ id: 3, consecutive_failures: 3, last_error: 'HTTP 503' }),
+      hook({ id: 4, events: ['task.completed'], active: false }),
+      hook({ id: 5, instance: true, events: [], consecutive_failures: 1 }),
+    ])
+    expect(got.map(s => [s.hook.id, s.why])).toEqual([
+      [2, 'turned off after 20 failed deliveries'],
+      [3, '3 deliveries in a row failed: HTTP 503'],
+      [5, '1 deliveries in a row failed'],
+    ])
   })
 })

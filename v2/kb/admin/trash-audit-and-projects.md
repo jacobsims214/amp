@@ -208,14 +208,17 @@ de-duplicate on `id`**. Most SIEMs can do this at ingest.
 `X-Forwarded-For` in `details.xff`. It is personal data, so an org or project webhook receives it
 only with `include_context` turned on. This is off for every webhook made before audit log v2,
 and off by default for new ones. Turn it on with **Include request context** in the webhook form,
-or `"include_context": true` on create and update.
+or `"include_context": true` on create and update. Instance webhooks have it on by default.
 
-**A stream that stops is recorded.** If a webhook's deliveries keep failing, AMP turns it off
-after 20 deliveries in a row have failed for good, and writes a `webhook.disable` entry
-(actor: system). A delivery that runs out of retries is dropped and recorded as
+**A stream that stops is recorded.** If an org or project webhook's deliveries keep failing, AMP
+turns it off after 20 deliveries in a row have failed for good, and writes a `webhook.disable`
+entry (actor: system). Instance webhooks, the SIEM stream, are never turned off: their deliveries
+keep being retried with backoff. A delivery that runs out of retries is dropped and recorded as
 `webhook.delivery.dropped`. That entry is written at most once an hour per webhook, and counts
 the drops since the previous one. Both entries go to the audit log and to the other audit
-webhooks, so a SIEM that stops receiving can be noticed.
+webhooks, so a SIEM that stops receiving can be noticed. **Admin → Audit log** shows a "SIEM
+stream stopped" warning while an instance webhook is off or failing, and each webhooks panel
+shows the same warning for its own audit webhooks.
 
 ## Project lifecycle
 

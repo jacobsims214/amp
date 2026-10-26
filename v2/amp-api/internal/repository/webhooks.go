@@ -159,8 +159,10 @@ type DeliveryOutcome struct {
 }
 
 // FinishDelivery records an attempt. retryAt nil with ok false means the
-// delivery has failed for good. disableAfter turns the webhook off after
-// that many deliveries in a row have failed for good.
+// delivery has failed for good. disableAfter turns an org or project
+// webhook off after that many deliveries in a row have failed for good.
+// Instance webhooks (the SIEM stream) are never turned off: their
+// deliveries keep backing off, and each one dropped is audited (#2439 M4).
 func (r *Repo) FinishDelivery(ctx context.Context, d DueDelivery, ok bool, status int, errMsg string, retryAt *time.Time, disableAfter int) (DeliveryOutcome, error) {
 	var out DeliveryOutcome
 	var statusPtr *int
@@ -189,7 +191,7 @@ func (r *Repo) FinishDelivery(ctx context.Context, d DueDelivery, ok bool, statu
 		WITH before AS (SELECT active FROM webhooks WHERE id = $1 FOR UPDATE)
 		UPDATE webhooks w SET last_delivery_at = NOW(), last_status = $2, last_error = $3,
 		consecutive_failures = CASE WHEN $4 THEN 0 WHEN $5 THEN w.consecutive_failures + 1 ELSE w.consecutive_failures END,
-		active = w.active AND NOT ($5 AND w.consecutive_failures + 1 >= $6)
+		active = w.active AND NOT ($5 AND w.consecutive_failures + 1 >= $6 AND (w.org_id IS NOT NULL OR w.project_id IS NOT NULL))
 		FROM before WHERE w.id = $1
 		RETURNING before.active AND NOT w.active, w.org_id, w.project_id, w.consecutive_failures`,
 		d.WebhookID, statusPtr, errMsg, ok, out.Failed, disableAfter).Scan(&out.Disabled, &out.OrgID, &out.ProjectID, &out.ConsecutiveFailures)

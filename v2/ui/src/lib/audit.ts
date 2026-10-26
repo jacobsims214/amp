@@ -1,4 +1,4 @@
-import type { AuditEntry, AuditFilter } from '../types'
+import type { AuditEntry, AuditFilter, AuditVerifyReport, AuditVerifyStatus, Webhook } from '../types'
 
 // Pure helpers for the audit log screens: the query string the list,
 // export and verify endpoints share, the before/after diff, and labels.
@@ -102,4 +102,35 @@ export function targetLabel(e: AuditEntry): string {
 export function hasDetails(e: AuditEntry): boolean {
   return !!(e.source_ip || e.user_agent || e.request_id || e.auth_method || e.reason || e.before || e.after ||
     (e.details && Object.keys(e.details).length) || e.chain_key || e.target_type)
+}
+
+/**
+ * The verdict of a chain check. Servers before #2439 sent only `ok`, and
+ * said ok for an unsigned chain; a server that sends `status` says
+ * "unproven" when nothing signed vouches for the chain, which is not OK.
+ */
+export function verifyVerdict(r: AuditVerifyReport): { status: AuditVerifyStatus; problems: number; rows: number; reasons: string[] } {
+  const problems = r.chains.reduce((n, c) => n + c.problems.length, 0)
+  const rows = r.chains.reduce((n, c) => n + c.rows, 0)
+  const status: AuditVerifyStatus = r.status ?? (problems > 0 ? 'failed' : r.signing.configured ? 'ok' : 'unproven')
+  const reasons = Array.from(new Set(r.chains.flatMap(c => (c.warnings ?? []).filter(w => w.startsWith('unproven: ')).map(w => w.slice('unproven: '.length)))))
+  if (status === 'unproven' && reasons.length === 0 && !r.signing.configured) reasons.push('no signing key is configured')
+  return { status, problems, rows, reasons }
+}
+
+/**
+ * Audit webhooks that have stopped carrying the stream: turned off (by a
+ * person, or by AMP after repeated failures), or failing now. An instance
+ * webhook is never turned off by AMP, so a failing one is reported as
+ * failing with its error.
+ */
+export function stoppedAuditStreams(hooks: Webhook[]): { hook: Webhook; why: string }[] {
+  const carriesAudit = (h: Webhook) => h.instance || h.events.some(e => e === '*' || e.startsWith('audit.'))
+  return hooks.filter(carriesAudit).flatMap(h => {
+    if (!h.active) return [{ hook: h, why: h.consecutive_failures > 0 ? `turned off after ${h.consecutive_failures} failed deliveries` : 'turned off' }]
+    if (h.consecutive_failures > 0) {
+      return [{ hook: h, why: `${h.consecutive_failures} deliveries in a row failed${h.last_error ? `: ${h.last_error}` : ''}` }]
+    }
+    return []
+  })
 }

@@ -9,7 +9,7 @@ import { Pill, When } from './admin'
 import { errMsg, fieldCls, quietBtnCls, smallSelectCls } from '../lib/adminStyles'
 import {
   ACTOR_TYPE_LABEL, AUTH_METHOD_LABEL, CLIENT_LABEL, activeFilterCount, actorName, auditExportUrl, auditVerifyUrl, diffValues,
-  hasDetails, isoToLocal, localToISO, targetLabel, type AuditScope,
+  hasDetails, isoToLocal, localToISO, targetLabel, verifyVerdict, type AuditScope,
 } from '../lib/audit'
 
 // The audit log for one scope: an org (its own changes and its projects'),
@@ -165,7 +165,7 @@ export function AuditRow({ e, showProject, first }: { e: AuditEntry; showProject
   )
 }
 
-/** The chain check of the scope: verified, problems, or unsigned, with the full report one click away. */
+/** The chain check of the scope: verified, problems, or unproven, with the full report one click away. */
 export function VerifyStatus({ report, error, loading, orgId, onRecheck }: {
   report: AuditVerifyReport | null
   error: string | null
@@ -173,19 +173,22 @@ export function VerifyStatus({ report, error, loading, orgId, onRecheck }: {
   orgId?: number
   onRecheck: () => void
 }) {
-  const rows = report?.chains.reduce((n, c) => n + c.rows, 0) ?? 0
-  const problems = report?.chains.reduce((n, c) => n + c.problems.length, 0) ?? 0
+  const verdict = report ? verifyVerdict(report) : null
   let tone: 'green' | 'red' | 'amber' | 'gray' = 'gray'
   let label = 'Checking the chain…'
   if (error) { tone = 'amber'; label = "Couldn't check the chain" }
-  else if (report && !report.ok) { tone = 'red'; label = `Chain broken: ${problems} problem${problems === 1 ? '' : 's'}` }
-  else if (report) {
-    tone = report.signing.configured ? 'green' : 'amber'
-    label = report.chains.length === 0 ? 'Chain empty' : `Chain verified · ${rows.toLocaleString()} row${rows === 1 ? '' : 's'}`
+  else if (report && verdict) {
+    const rows = `${verdict.rows.toLocaleString()} row${verdict.rows === 1 ? '' : 's'}`
+    if (verdict.status === 'failed') { tone = 'red'; label = `Chain broken: ${verdict.problems} problem${verdict.problems === 1 ? '' : 's'}` }
+    else if (report.chains.length === 0) { tone = verdict.status === 'ok' ? 'green' : 'amber'; label = 'Chain empty' }
+    else if (verdict.status === 'unproven') { tone = 'amber'; label = `Unproven · ${rows}` }
+    else { tone = 'green'; label = `Chain verified · ${rows}` }
   }
-  const title = error ?? (report
+  const title = error ?? (report && verdict
     ? `${report.chains.length} chain(s) checked ${new Date(report.checked_at).toLocaleString()}.` +
-      (report.signing.configured ? '' : ' Checkpoints are not signed: no signing key is configured.')
+      (verdict.status === 'unproven'
+        ? ` No problems found, but nothing signed proves it: ${verdict.reasons.join('; ') || 'no signed checkpoint yet'}. Someone with database access could have rewritten it.`
+        : '')
     : undefined)
   return (
     <span className="inline-flex items-center gap-1.5" role="status" aria-live="polite">
@@ -193,7 +196,7 @@ export function VerifyStatus({ report, error, loading, orgId, onRecheck }: {
         {loading ? <Loader2 size={9} className="animate-spin" /> : tone === 'red' || tone === 'amber' ? <ShieldAlert size={9} /> : <ShieldCheck size={9} />}
         {label}
       </Pill>
-      {report && !report.signing.configured && !error && report.ok && <span className="text-[11px] text-warning-ink">unsigned checkpoints</span>}
+      {verdict?.status === 'unproven' && !error && !report?.signing.configured && <span className="text-[11px] text-warning-ink">no signing key</span>}
       <a href={auditVerifyUrl(orgId)} target="_blank" rel="noreferrer" className="text-[11px] text-link hover:underline inline-flex items-center gap-0.5">
         Report<ExternalLink size={10} aria-hidden />
       </a>
