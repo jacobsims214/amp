@@ -14,12 +14,12 @@ import (
 // webhookCols never reads auth_header_value: only the delivery loop
 // (ClaimDueDeliveries) needs it.
 const webhookCols = `id, org_id, project_id, name, url, format, events, active, created_by, created_at, updated_at,
-	last_delivery_at, last_status, last_error, consecutive_failures, auth_header_name, auth_header_value <> ''`
+	last_delivery_at, last_status, last_error, consecutive_failures, auth_header_name, auth_header_value <> '', include_context`
 
 func scanWebhook(row rowScanner, w *domain.Webhook) error {
 	err := row.Scan(&w.ID, &w.OrgID, &w.ProjectID, &w.Name, &w.URL, &w.Format, &w.Events, &w.Active, &w.CreatedBy,
 		&w.CreatedAt, &w.UpdatedAt, &w.LastDeliveryAt, &w.LastStatus, &w.LastError, &w.ConsecutiveFailures,
-		&w.AuthHeaderName, &w.AuthHeaderSet)
+		&w.AuthHeaderName, &w.AuthHeaderSet, &w.IncludeContext)
 	w.Instance = w.OrgID == nil && w.ProjectID == nil
 	return err
 }
@@ -28,10 +28,10 @@ func scanWebhook(row rowScanner, w *domain.Webhook) error {
 func (r *Repo) CreateWebhook(ctx context.Context, w domain.Webhook) (*domain.Webhook, error) {
 	out := &domain.Webhook{}
 	err := scanWebhook(r.db.QueryRow(ctx, `
-		INSERT INTO webhooks (org_id, project_id, name, url, format, secret, events, active, created_by, auth_header_name, auth_header_value)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING `+webhookCols,
+		INSERT INTO webhooks (org_id, project_id, name, url, format, secret, events, active, created_by, auth_header_name, auth_header_value, include_context)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING `+webhookCols,
 		w.OrgID, w.ProjectID, w.Name, w.URL, w.Format, w.Secret, w.Events, w.Active, w.CreatedBy,
-		w.AuthHeaderName, w.AuthHeaderValue), out)
+		w.AuthHeaderName, w.AuthHeaderValue, w.IncludeContext), out)
 	if err != nil {
 		return nil, fmt.Errorf("create webhook: %w", err)
 	}
@@ -66,12 +66,12 @@ func (r *Repo) ListWebhooks(ctx context.Context, orgID, projectID *int) ([]domai
 func (r *Repo) UpdateWebhook(ctx context.Context, w domain.Webhook, setAuthHeader bool) (*domain.Webhook, error) {
 	out := &domain.Webhook{}
 	err := scanWebhook(r.db.QueryRow(ctx, `
-		UPDATE webhooks SET name = $2, url = $3, format = $4, events = $5, active = $6, updated_at = NOW(),
+		UPDATE webhooks SET name = $2, url = $3, format = $4, events = $5, active = $6, include_context = $10, updated_at = NOW(),
 		       consecutive_failures = CASE WHEN url <> $3 OR (NOT active AND $6) THEN 0 ELSE consecutive_failures END,
 		       auth_header_name = CASE WHEN $7 THEN $8 ELSE auth_header_name END,
 		       auth_header_value = CASE WHEN $7 THEN $9 ELSE auth_header_value END
 		WHERE id = $1 RETURNING `+webhookCols, w.ID, w.Name, w.URL, w.Format, w.Events, w.Active,
-		setAuthHeader, w.AuthHeaderName, w.AuthHeaderValue), out)
+		setAuthHeader, w.AuthHeaderName, w.AuthHeaderValue, w.IncludeContext), out)
 	return out, err
 }
 
@@ -146,17 +146,30 @@ func (r *Repo) ClaimDueDeliveries(ctx context.Context, limit int, lease time.Dur
 	})
 }
 
+// DeliveryOutcome is what FinishDelivery did to the delivery's webhook.
+type DeliveryOutcome struct {
+	// Failed: the delivery failed for good (no retry left), so it is
+	// dropped.
+	Failed bool
+	// Disabled: this failure turned the webhook off (DisableAfter).
+	Disabled bool
+	// The webhook's scope and failure count, for auditing either.
+	OrgID, ProjectID    *int
+	ConsecutiveFailures int
+}
+
 // FinishDelivery records an attempt. retryAt nil with ok false means the
 // delivery has failed for good. disableAfter turns the webhook off after
 // that many deliveries in a row have failed for good.
-func (r *Repo) FinishDelivery(ctx context.Context, d DueDelivery, ok bool, status int, errMsg string, retryAt *time.Time, disableAfter int) error {
+func (r *Repo) FinishDelivery(ctx context.Context, d DueDelivery, ok bool, status int, errMsg string, retryAt *time.Time, disableAfter int) (DeliveryOutcome, error) {
+	var out DeliveryOutcome
 	var statusPtr *int
 	if status != 0 {
 		statusPtr = &status
 	}
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
-		return err
+		return out, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 	state := "pending"
@@ -166,18 +179,24 @@ func (r *Repo) FinishDelivery(ctx context.Context, d DueDelivery, ok bool, statu
 	case retryAt == nil:
 		state = "failed"
 	}
+	out.Failed = state == "failed"
 	if _, err := tx.Exec(ctx, `UPDATE webhook_deliveries SET status = $2, attempts = attempts + 1, last_status = $3, last_error = $4,
 		next_attempt_at = COALESCE($5, next_attempt_at), delivered_at = CASE WHEN $2 = 'delivered' THEN NOW() END WHERE id = $1`,
 		d.ID, state, statusPtr, errMsg, retryAt); err != nil {
-		return err
+		return out, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE webhooks SET last_delivery_at = NOW(), last_status = $2, last_error = $3,
-		consecutive_failures = CASE WHEN $4 THEN 0 WHEN $5 THEN consecutive_failures + 1 ELSE consecutive_failures END,
-		active = active AND NOT ($5 AND consecutive_failures + 1 >= $6)
-		WHERE id = $1`, d.WebhookID, statusPtr, errMsg, ok, state == "failed", disableAfter); err != nil {
-		return err
+	err = tx.QueryRow(ctx, `
+		WITH before AS (SELECT active FROM webhooks WHERE id = $1 FOR UPDATE)
+		UPDATE webhooks w SET last_delivery_at = NOW(), last_status = $2, last_error = $3,
+		consecutive_failures = CASE WHEN $4 THEN 0 WHEN $5 THEN w.consecutive_failures + 1 ELSE w.consecutive_failures END,
+		active = w.active AND NOT ($5 AND w.consecutive_failures + 1 >= $6)
+		FROM before WHERE w.id = $1
+		RETURNING before.active AND NOT w.active, w.org_id, w.project_id, w.consecutive_failures`,
+		d.WebhookID, statusPtr, errMsg, ok, out.Failed, disableAfter).Scan(&out.Disabled, &out.OrgID, &out.ProjectID, &out.ConsecutiveFailures)
+	if err != nil && err != pgx.ErrNoRows { // the webhook was deleted meanwhile
+		return out, err
 	}
-	return tx.Commit(ctx)
+	return out, tx.Commit(ctx)
 }
 
 // ListDeliveries returns a webhook's most recent deliveries.

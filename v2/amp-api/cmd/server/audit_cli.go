@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"strconv"
@@ -53,23 +54,49 @@ func auditRetentionFromEnv() time.Duration {
 		slog.Warn("bad AUDIT_RETENTION_DAYS; using the default", "value", v, "default_days", int(service.DefaultAuditRetention/(24*time.Hour)))
 		return service.DefaultAuditRetention
 	}
-	return time.Duration(d) * 24 * time.Hour
+	r := time.Duration(d) * 24 * time.Hour
+	if r < service.MinAuditRetention {
+		// audit_purge() refuses younger rows anyway (migration 035).
+		slog.Warn("AUDIT_RETENTION_DAYS is below the minimum; using the minimum", "value", v, "min_days", int(service.MinAuditRetention/(24*time.Hour)))
+		return service.MinAuditRetention
+	}
+	return r
+}
+
+// purgeRoleSQL is migration 035's "audit_purge role setup" block: what a
+// superuser runs once in AMP's database so retention can delete (#2439 H1).
+func purgeRoleSQL() (string, error) {
+	b, err := fs.ReadFile(migrationFS, "migrations/035_audit_integrity_review.sql")
+	if err != nil {
+		return "", err
+	}
+	const begin, end = "-- BEGIN audit_purge role setup\n", "-- END audit_purge role setup\n"
+	s := string(b)
+	i, j := strings.Index(s, begin), strings.Index(s, end)
+	if i < 0 || j < i {
+		return "", errors.New("migration 035 has no audit_purge role setup block")
+	}
+	return s[i : j+len(end)], nil
 }
 
 const auditUsage = `usage: amp-api audit <command>
 
   verify [-org ID] [-json]   recompute the audit hash chains (every chain, or one org's)
-                             and check the signed checkpoints; exits 1 if anything is wrong
+                             and check the signed checkpoints; exits 1 if anything is wrong,
+                             3 if nothing is wrong but nothing signed proves it (unproven)
   checkpoint                 sign every chain's head now (the server does this hourly)
   keygen -out FILE           make a checkpoint signing key: writes the private key to FILE
                              (mode 0600) and prints only the public key and its id
+  purge-role-sql             print the SQL a superuser runs once so retention can delete
+                             (the amp_audit_purge role); retention is off until then
 
-verify and checkpoint read DATABASE_URL, and AUDIT_SIGNING_KEY (or AUDIT_SIGNING_KEY_FILE)
-and AUDIT_SIGNING_PUBLIC_KEYS like the server.
+verify and checkpoint read DATABASE_URL, and AUDIT_SIGNING_KEY (or AUDIT_SIGNING_KEY_FILE),
+AUDIT_SIGNING_PUBLIC_KEYS, AUDIT_SIGNING_SINCE and AUDIT_RETENTION_DAYS like the server.
 `
 
 // runAuditCLI runs `amp-api audit <args>` and returns the exit code: 0 fine,
-// 1 verification found problems, 2 usage or runtime error.
+// 1 verification found problems, 2 usage or runtime error, 3 verification
+// found no problems but nothing signed proves the chains (unproven).
 func runAuditCLI(args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprint(stderr, auditUsage)
@@ -79,6 +106,14 @@ func runAuditCLI(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	switch args[0] {
+	case "purge-role-sql":
+		sql, err := purgeRoleSQL()
+		if err != nil {
+			fmt.Fprintln(stderr, err)
+			return 2
+		}
+		fmt.Fprint(stdout, sql)
+		return 0
 	case "keygen":
 		fs := flag.NewFlagSet("keygen", flag.ContinueOnError)
 		fs.SetOutput(stderr)
@@ -109,7 +144,7 @@ func runAuditCLI(args []string, stdout, stderr io.Writer) int {
 				return 2
 			}
 		}
-		report, err := service.VerifyAuditChains(ctx, repo, loadAuditKeys(), chains)
+		report, err := service.VerifyAuditChains(ctx, repo, loadAuditKeys(), auditchain.Policy{Retention: auditRetentionFromEnv()}, chains)
 		if err != nil {
 			fmt.Fprintln(stderr, err)
 			return 2
@@ -121,10 +156,13 @@ func runAuditCLI(args []string, stdout, stderr io.Writer) int {
 		} else {
 			printReport(stdout, report)
 		}
-		if !report.OK {
-			return 1
+		switch report.Status {
+		case auditchain.StatusOK:
+			return 0
+		case auditchain.StatusUnproven:
+			return 3
 		}
-		return 0
+		return 1
 	case "checkpoint":
 		repo, err := cliRepo(ctx)
 		if err != nil {
@@ -192,8 +230,11 @@ func printReport(w io.Writer, r auditchain.Report) {
 	fmt.Fprintf(w, "audit verify: %d chain(s), signing %s\n", len(r.Chains), signing)
 	for _, c := range r.Chains {
 		status := "OK"
-		if !c.OK {
+		switch c.Status {
+		case auditchain.StatusFailed:
 			status = fmt.Sprintf("FAILED (%d problem(s))", len(c.Problems))
+		case auditchain.StatusUnproven:
+			status = "UNPROVEN"
 		}
 		fmt.Fprintf(w, "  %-12s %s: rows %d (seq %d..%d), head %d, anchor %d, checkpoints matched %d, signed %d\n",
 			c.ChainKey, status, c.Rows, c.FirstSeq, c.LastSeq, c.HeadSeq, c.AnchorSeq, c.CheckpointsMatched, c.SignedCheckpoints)
@@ -204,9 +245,12 @@ func printReport(w io.Writer, r auditchain.Report) {
 			fmt.Fprintf(w, "    ! %s\n", wn)
 		}
 	}
-	if r.OK {
+	switch r.Status {
+	case auditchain.StatusOK:
 		fmt.Fprintln(w, "result: OK")
-	} else {
+	case auditchain.StatusUnproven:
+		fmt.Fprintln(w, "result: UNPROVEN (no problems found, but no valid signature vouches for every chain)")
+	default:
 		fmt.Fprintln(w, "result: TAMPERING OR LOSS DETECTED")
 	}
 }

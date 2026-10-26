@@ -36,6 +36,10 @@ type WebhookChange struct {
 	// "Name: value" (e.g. "Authorization: Splunk <token>"); "" removes it.
 	// Write-only: reads show only its name.
 	AuthHeader *string `json:"auth_header"`
+	// IncludeContext: send audit entries' request context (IP, user
+	// agent, session and token ids, before/after). Default off for org and
+	// project webhooks, on for instance webhooks.
+	IncludeContext *bool `json:"include_context"`
 }
 
 // requireWebhookScope checks p may manage webhooks for an org, a project,
@@ -87,8 +91,11 @@ func (s *Service) CreateWebhook(ctx context.Context, p authz.Principal, orgID, p
 	if err := s.requireWebhookScope(ctx, p, orgID, projectID); err != nil {
 		return nil, err
 	}
+	// Instance webhooks (a global admin's SIEM stream) get the request
+	// context by default; org and project ones opt in (#2439 M2).
+	instance := orgID == nil && projectID == nil
 	w := domain.Webhook{OrgID: orgID, ProjectID: projectID, Format: domain.WebhookFormatJSON, Active: true, CreatedBy: p.UserRef(), Events: []string{},
-		Instance: orgID == nil && projectID == nil}
+		Instance: instance, IncludeContext: instance}
 	if c.URL == nil {
 		return nil, authz.BadRequest("url is required")
 	}
@@ -245,6 +252,9 @@ func applyWebhookChange(w *domain.Webhook, c WebhookChange) error {
 			return err
 		}
 		w.AuthHeaderName, w.AuthHeaderValue, w.AuthHeaderSet = name, value, name != ""
+	}
+	if c.IncludeContext != nil {
+		w.IncludeContext = *c.IncludeContext
 	}
 	return nil
 }

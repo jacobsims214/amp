@@ -30,8 +30,14 @@ type Webhook struct {
 	// Instance is a webhook of the whole AMP (no org, no project): global
 	// admins only, audit entries only, every one of them, including
 	// account-level rows that belong to no org (user.*, token.*, auth.*).
-	Instance            bool       `json:"instance,omitempty"`
-	Active              bool       `json:"active"`
+	Instance bool `json:"instance,omitempty"`
+	Active   bool `json:"active"`
+	// IncludeContext opts an audit webhook into the request context of
+	// each entry: source_ip, user_agent, session_id, token_id, before and
+	// after (personal data, audit log v2). Off by default, and for every
+	// org or project webhook made before v2; on by default for instance
+	// webhooks (#2439 M2).
+	IncludeContext      bool       `json:"include_context"`
 	CreatedBy           *int       `json:"created_by,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`

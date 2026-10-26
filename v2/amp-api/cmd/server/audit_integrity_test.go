@@ -94,11 +94,20 @@ func (d *integrityDB) verify(t *testing.T) auditchain.Report {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r, err := service.VerifyAuditChains(context.Background(), d.repo, service.AuditKeys, keys)
+	r, err := service.VerifyAuditChains(context.Background(), d.repo, service.AuditKeys, auditchain.Policy{Retention: service.DefaultAuditRetention}, keys)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return r
+}
+
+// wantNoProblems: nothing wrong was found (the chains may still be
+// unproven, e.g. without a signing key).
+func wantNoProblems(t *testing.T, what string, r auditchain.Report) {
+	t.Helper()
+	if r.Status == auditchain.StatusFailed {
+		t.Fatalf("%s: %s", what, problemKinds(r))
+	}
 }
 
 func problemKinds(r auditchain.Report) string {
@@ -167,7 +176,7 @@ func TestAuditIntegrity_CanonicalMatchesPostgres(t *testing.T) {
 	if err != nil || checked != 1 {
 		t.Fatalf("read org:3: %d rows, %v", checked, err)
 	}
-	if r := d.verify(t); !r.OK || len(r.Chains) != 2 {
+	if r := d.verify(t); r.Status != auditchain.StatusUnproven || len(r.Chains) != 2 {
 		t.Fatalf("verify: %+v", r)
 	}
 }
@@ -205,11 +214,11 @@ func TestAuditIntegrity_BackfillsExistingRows(t *testing.T) {
 	if _, err := repo.InsertAudit(ctx, domain.AuditEntry{Action: "new", OrgID: &org}); err != nil {
 		t.Fatal(err)
 	}
-	r, err := service.VerifyAuditChains(ctx, repo, nil, []string{"global", "org:4"})
+	r, err := service.VerifyAuditChains(ctx, repo, nil, auditchain.Policy{}, []string{"global", "org:4"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.OK || r.Chains[0].Rows != 3 || r.Chains[1].Rows != 4 || r.Chains[1].LastSeq != 4 {
+	if r.Status != auditchain.StatusUnproven || r.Chains[0].Rows != 3 || r.Chains[1].Rows != 4 || r.Chains[1].LastSeq != 4 {
 		t.Fatalf("after backfill: %+v", r)
 	}
 }
@@ -288,9 +297,7 @@ func TestAuditIntegrity_AppendOnly(t *testing.T) {
 	if err := d.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM audit_outbox WHERE audit_id = $1)`, id).Scan(&queued); err != nil || !queued || seq == 0 {
 		t.Fatalf("app row: seq %d queued %v err %v", seq, queued, err)
 	}
-	if r := d.verify(t); !r.OK {
-		t.Fatalf("verify after refused writes: %s", problemKinds(r))
-	}
+	wantNoProblems(t, "verify after refused writes", d.verify(t))
 }
 
 // Deleting a user still works: the users FK sets actor_user_id to NULL
@@ -321,9 +328,7 @@ func TestAuditIntegrity_UserDeleteStillWorks(t *testing.T) {
 	if actor != nil || email != "gone@x" {
 		t.Fatalf("after user delete: actor %v email %q", actor, email)
 	}
-	if r := d.verify(t); !r.OK {
-		t.Fatalf("verify after user delete: %s", problemKinds(r))
-	}
+	wantNoProblems(t, "verify after user delete", d.verify(t))
 }
 
 // verify (service and CLI) finds each kind of tampering by someone who can
@@ -560,11 +565,237 @@ func TestAuditIntegrity_VerifyEndpoint(t *testing.T) {
 	path := fmt.Sprintf("/api/audit/verify?org_id=%d", w.org.ID)
 	got := ra.want(t, 200, "orgadmin", "GET", path, nil)
 	chains, _ := got["chains"].([]any)
-	if got["ok"] != true || len(chains) != 1 || chains[0].(map[string]any)["chain_key"] != fmt.Sprintf("org:%d", w.org.ID) {
+	// No signing key in the test server: unproven, not OK (#2439 H2).
+	if got["ok"] != false || got["status"] != "unproven" || len(chains) != 1 || chains[0].(map[string]any)["chain_key"] != fmt.Sprintf("org:%d", w.org.ID) {
 		t.Fatalf("org admin verify = %v", got)
 	}
 	ra.want(t, 200, "root", "GET", path, nil)
 	ra.want(t, 403, "alice", "GET", path, nil)
 	ra.want(t, 404, "outsider", "GET", path, nil) // not a member: the org is hidden
 	ra.want(t, 403, "orgadmin", "GET", "/api/audit/verify", nil)
+}
+
+// #2439 H1: someone with the app role's password (prod's `amp` owns the
+// tables) can't reach retention's delete path without DDL: not by setting
+// the old session flag, not by inserting their own anchor, and not by
+// calling audit_purge() on rows younger than 30 days. If they do use DDL
+// (disable the guard), verify fails the chain once a key is configured.
+func TestAuditIntegrity_ForgedAnchorCantPurge(t *testing.T) {
+	withSigningKey(t)
+	d := newIntegrityDB(t)
+	ctx := context.Background()
+	if ready, err := d.repo.AuditPurgeRoleReady(ctx); err != nil || !ready {
+		t.Fatalf("the test database runs migrations as a superuser, so 035 sets up amp_audit_purge: ready=%v %v", ready, err)
+	}
+	org := 9
+	old := time.Now().Add(-400 * 24 * time.Hour)
+	for i := 0; i < 4; i++ {
+		d.writeAt(t, &org, fmt.Sprintf("old.%d", i), old)
+	}
+	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var hash3 []byte
+	if err := d.db.QueryRow(ctx, `SELECT hash FROM audit_log WHERE chain_key = 'org:9' AND chain_seq = 3`).Scan(&hash3); err != nil {
+		t.Fatal(err)
+	}
+
+	// The owner/superuser connection, the way an attacker with `amp`'s
+	// password would try it under migration 033.
+	tx, err := d.db.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO audit_checkpoints (id, chain_key, upto_seq, hash, at, kind) VALUES (-1, 'org:9', 3, $1, NOW(), 'anchor')`, hash3)
+	tx.Rollback(ctx) //nolint:errcheck
+	wantPrivilegeError(t, "insert a forged anchor", err)
+
+	tx, _ = d.db.Begin(ctx)
+	tx.Exec(ctx, `SELECT set_config('amp.audit_purge', 'on', true)`) //nolint:errcheck
+	_, err = tx.Exec(ctx, `DELETE FROM audit_log WHERE chain_key = 'org:9' AND chain_seq <= 3`)
+	tx.Rollback(ctx) //nolint:errcheck
+	wantPrivilegeError(t, "delete with the session flag", err)
+
+	// audit_purge() itself refuses rows younger than 30 days.
+	young := d.write(t, 9, "young")
+	var youngHash []byte
+	var youngSeq int64
+	if err := d.db.QueryRow(ctx, `SELECT chain_seq, hash FROM audit_log WHERE id = $1`, young.ID).Scan(&youngSeq, &youngHash); err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.db.Exec(ctx, `SELECT * FROM audit_purge('org:9', $1, $2, NOW(), '', NULL)`, youngSeq, youngHash)
+	wantPrivilegeError(t, "audit_purge of a young row", err)
+
+	var n int
+	if err := d.db.QueryRow(ctx, `SELECT COUNT(*) FROM audit_log WHERE chain_key = 'org:9'`).Scan(&n); err != nil || n < 5 {
+		t.Fatalf("rows left: %d %v", n, err)
+	}
+	if r := d.verify(t); !r.OK {
+		t.Fatalf("after the refused attempts: %s", problemKinds(r))
+	}
+
+	// With DDL: the guards off, the same forgery, verify catches it.
+	d.exec(t, `ALTER TABLE audit_checkpoints DISABLE TRIGGER USER`)
+	d.exec(t, `ALTER TABLE audit_log DISABLE TRIGGER USER`)
+	d.exec(t, `INSERT INTO audit_checkpoints (id, chain_key, upto_seq, hash, at, kind) VALUES (-1, 'org:9', 3, $1, NOW(), 'anchor')`, hash3)
+	d.exec(t, `DELETE FROM audit_log WHERE chain_key = 'org:9' AND chain_seq <= 3`)
+	d.exec(t, `ALTER TABLE audit_log ENABLE TRIGGER USER`)
+	d.exec(t, `ALTER TABLE audit_checkpoints ENABLE TRIGGER USER`)
+	r := d.verify(t)
+	if r.OK || !strings.Contains(problemKinds(r), "org:9:signature") || !strings.Contains(problemKinds(r), "org:9:missing_start") {
+		t.Fatalf("forged anchor with the guard off: ok=%v %s", r.OK, problemKinds(r))
+	}
+}
+
+// #2439 H1: deleting the rows up to an hourly signed (periodic) checkpoint,
+// with the guard off, fails verify: only an anchor may start a chain.
+func TestAuditIntegrity_PeriodicCheckpointIsNoStart(t *testing.T) {
+	withSigningKey(t)
+	d := newIntegrityDB(t)
+	ctx := context.Background()
+	for i := 0; i < 3; i++ {
+		d.write(t, 11, fmt.Sprintf("team.create.%d", i))
+	}
+	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil { // signs org:11 at seq 3
+		t.Fatal(err)
+	}
+	d.write(t, 11, "team.create.later")
+	if r := d.verify(t); !r.OK {
+		t.Fatalf("before: %s", problemKinds(r))
+	}
+	d.exec(t, `ALTER TABLE audit_log DISABLE TRIGGER USER`)
+	d.exec(t, `DELETE FROM audit_log WHERE chain_key = 'org:11' AND chain_seq <= 3`)
+	d.exec(t, `ALTER TABLE audit_log ENABLE TRIGGER USER`)
+	if r := d.verify(t); r.OK || !strings.Contains(problemKinds(r), "org:11:missing_start") {
+		t.Fatalf("deleted up to a periodic checkpoint: ok=%v %s", r.OK, problemKinds(r))
+	}
+}
+
+// #2439 H1: until a superuser hands audit_purge() to amp_audit_purge (as on
+// CloudNativePG, where the app role isn't one), retention deletes nothing.
+func TestAuditIntegrity_RetentionNeedsPurgeRole(t *testing.T) {
+	withSigningKey(t)
+	d := newIntegrityDB(t)
+	ctx := context.Background()
+	var app string
+	if err := d.db.QueryRow(ctx, `SELECT current_user`).Scan(&app); err != nil {
+		t.Fatal(err)
+	}
+	d.exec(t, `ALTER FUNCTION audit_purge(TEXT, BIGINT, BYTEA, TIMESTAMPTZ, TEXT, BYTEA) OWNER TO `+app)
+	if ready, err := d.repo.AuditPurgeRoleReady(ctx); err != nil || ready {
+		t.Fatalf("ready after giving the function back: %v %v", ready, err)
+	}
+	org := 12
+	d.writeAt(t, &org, "old", time.Now().Add(-400*24*time.Hour))
+	deleted, err := d.svc.PurgeAudit(ctx, time.Now().Add(-service.DefaultAuditRetention), service.DefaultAuditRetention)
+	if err == nil || len(deleted) != 0 || !strings.Contains(err.Error(), "purge-role-sql") {
+		t.Fatalf("purge without the role: %v %v", deleted, err)
+	}
+	// The SQL the CLI prints sets it up again.
+	var out, errOut bytes.Buffer
+	if code := runAuditCLI([]string{"purge-role-sql"}, &out, &errOut); code != 0 {
+		t.Fatalf("purge-role-sql: %d %s", code, errOut.String())
+	}
+	d.exec(t, out.String())
+	if deleted, err := d.svc.PurgeAudit(ctx, time.Now().Add(-service.DefaultAuditRetention), service.DefaultAuditRetention); err != nil || deleted["org:12"] != 1 {
+		t.Fatalf("purge after setup: %v %v", deleted, err)
+	}
+}
+
+// #2439 L7: the first purge of a large chain goes in batches, each with its
+// own anchor, and the chain still verifies.
+func TestAuditIntegrity_RetentionInBatches(t *testing.T) {
+	withSigningKey(t)
+	d := newIntegrityDB(t)
+	ctx := context.Background()
+	prev := repository.AuditPurgeBatch
+	repository.AuditPurgeBatch = 2
+	t.Cleanup(func() { repository.AuditPurgeBatch = prev })
+	org := 13
+	for i := 0; i < 5; i++ {
+		d.writeAt(t, &org, fmt.Sprintf("old.%d", i), time.Now().Add(-400*24*time.Hour))
+	}
+	d.write(t, 13, "recent")
+	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := d.svc.PurgeAudit(ctx, time.Now().Add(-service.DefaultAuditRetention), service.DefaultAuditRetention)
+	if err != nil || deleted["org:13"] != 5 {
+		t.Fatalf("purge: %v %v", deleted, err)
+	}
+	var anchors []int64
+	rows, _ := d.db.Query(ctx, `SELECT upto_seq FROM audit_checkpoints WHERE chain_key = 'org:13' AND kind = 'anchor' ORDER BY id`)
+	anchors, _ = pgx.CollectRows(rows, pgx.RowTo[int64])
+	if fmt.Sprint(anchors) != "[2 4 5]" {
+		t.Fatalf("anchors = %v, want one per batch", anchors)
+	}
+	// (The global chain, which only has the new audit.purge entry, waits
+	// for its first signed checkpoint: unproven.)
+	r := d.verify(t)
+	wantNoProblems(t, "verify after batched purge", r)
+	for _, c := range r.Chains {
+		if c.ChainKey == "org:13" && (!c.OK || c.AnchorSeq != 5 || c.FirstSeq != 6) {
+			t.Fatalf("org:13 after batched purge: %+v", c)
+		}
+	}
+}
+
+// #2439 L1: re-pointing actor_user_id to another user (guard off) fails
+// verify; the user's own deletion (FK SET NULL) doesn't.
+func TestAuditIntegrity_ActorRepointDetected(t *testing.T) {
+	withSigningKey(t)
+	d := newIntegrityDB(t)
+	ctx := context.Background()
+	a, err := d.repo.UpsertUserFromClaims(ctx, "sub-a", "a@x", "A", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := d.repo.UpsertUserFromClaims(ctx, "sub-b", "b@x", "B", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := d.repo.InsertAudit(ctx, domain.AuditEntry{ActorUserID: &a.ID, ActorEmail: a.Email, Action: "token.create"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var atWrite *int
+	if err := d.db.QueryRow(ctx, `SELECT actor_id_at_write FROM audit_log WHERE id = $1`, e.ID).Scan(&atWrite); err != nil || atWrite == nil || *atWrite != a.ID {
+		t.Fatalf("actor_id_at_write = %v, %v", atWrite, err)
+	}
+	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := d.verify(t); !r.OK {
+		t.Fatalf("before: %s", problemKinds(r))
+	}
+	d.exec(t, `ALTER TABLE audit_log DISABLE TRIGGER USER`)
+	d.exec(t, `UPDATE audit_log SET actor_user_id = $1 WHERE id = $2`, b.ID, e.ID)
+	d.exec(t, `ALTER TABLE audit_log ENABLE TRIGGER USER`)
+	if r := d.verify(t); r.OK || problemKinds(r) != "global:actor_mismatch" {
+		t.Fatalf("re-pointed actor: %s", problemKinds(r))
+	}
+}
+
+// #2439 H2: without a signing key, verify (service, REST and CLI) says
+// "unproven", not OK.
+func TestAuditIntegrity_UnsignedIsUnproven(t *testing.T) {
+	prev := service.AuditKeys
+	service.AuditKeys = nil
+	t.Cleanup(func() { service.AuditKeys = prev })
+	d := newIntegrityDB(t)
+	d.write(t, 14, "team.create")
+	if _, err := d.svc.WriteAuditCheckpoints(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r := d.verify(t)
+	if r.OK || r.Status != auditchain.StatusUnproven || len(r.Chains) == 0 || r.Chains[0].Status != auditchain.StatusUnproven {
+		t.Fatalf("unsigned chain: %+v", r)
+	}
+	t.Setenv("DATABASE_URL", d.dsn)
+	t.Setenv(auditchain.EnvSigningKey, "")
+	t.Setenv(auditchain.EnvPublicKeys, "")
+	var out, errOut bytes.Buffer
+	if code := runAuditCLI([]string{"verify"}, &out, &errOut); code != 3 || !strings.Contains(out.String(), "UNPROVEN") {
+		t.Fatalf("CLI verify, unsigned: exit %d\n%s%s", code, out.String(), errOut.String())
+	}
 }
