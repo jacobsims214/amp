@@ -139,7 +139,6 @@ type Relay struct {
 
 	mu          sync.Mutex
 	registers   map[int]*bucket // per user: 10 registration attempts a minute here
-	proofNonces nonceCache      // refresh-proof nonces seen here (token.go)
 
 	viewerBytes *byteBudget  // bytes queued for all viewers here
 	userBytes   *userBudgets // bytes queued for each owner's viewers here

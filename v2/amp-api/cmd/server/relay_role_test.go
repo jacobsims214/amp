@@ -27,7 +27,6 @@ import (
 	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/cluster"
-	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/hub"
 	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/repository"
@@ -129,6 +128,12 @@ func TestRelayRole_LeastPrivilege(t *testing.T) {
 		`DELETE FROM project_owners`,
 		`DELETE FROM audit_log WHERE id = 0`,
 		`INSERT INTO cluster_settings (key, value) VALUES ('relay_token', 'x')`,
+		// No direct audit or webhook writes (#2399, re-review #2394 N3): only
+		// relay_record_audit.
+		`INSERT INTO audit_log (action) VALUES ('task.completed')`,
+		`INSERT INTO webhook_deliveries (webhook_id, event_type, body) VALUES (1, 'task.completed', '{}')`,
+		`SELECT id, url, events FROM webhooks LIMIT 1`,
+		`DELETE FROM relay_audit_outbox`,
 	}
 	for _, q := range denied {
 		_, err := conn.Exec(ctx, q)
@@ -136,10 +141,26 @@ func TestRelayRole_LeastPrivilege(t *testing.T) {
 			t.Errorf("%s: want permission denied, got %v", q, err)
 		}
 	}
+	// Checked as privileges too: an INSERT can also be refused for the
+	// serial sequence, which would hide a table grant.
+	for _, c := range []struct{ table, priv string }{
+		{"audit_log", "INSERT"}, {"webhook_deliveries", "INSERT"}, {"webhook_deliveries", "UPDATE"},
+		{"relay_audit_outbox", "INSERT"}, {"relay_audit_outbox", "DELETE"}, {"api_tokens", "SELECT"},
+	} {
+		var has bool
+		if err := conn.QueryRow(ctx, `SELECT has_table_privilege(current_user, $1, $2)`, c.table, c.priv).Scan(&has); err != nil || has {
+			t.Errorf("the relay role has %s on %s (%v)", c.priv, c.table, err)
+		}
+	}
+	for _, table := range []string{"webhooks", "audit_log", "webhook_deliveries"} {
+		var has bool
+		if err := conn.QueryRow(ctx, `SELECT has_any_column_privilege(current_user, $1, 'SELECT')`, table).Scan(&has); err != nil || has {
+			t.Errorf("the relay role can read %s (%v)", table, err)
+		}
+	}
 	allowed := []string{
 		`SELECT id, subject, email FROM users LIMIT 1`,
 		`SELECT id FROM remote_sessions LIMIT 1`,
-		`SELECT id, url, events FROM webhooks LIMIT 1`,
 		`SELECT version FROM schema_migrations LIMIT 1`,
 		`SELECT id, addr FROM api_nodes LIMIT 1`,
 	}
@@ -147,27 +168,6 @@ func TestRelayRole_LeastPrivilege(t *testing.T) {
 		if _, err := conn.Exec(ctx, q); err != nil {
 			t.Errorf("%s: %v", q, err)
 		}
-	}
-
-	// What the relay writes besides its own tables: the audit entry and the
-	// webhook delivery for it, through the repository as the relay does.
-	rr, _ := relayRole(t, w.s.repo)
-	org := w.org.ID
-	if _, err := rr.InsertAudit(ctx, domain.AuditEntry{ActorUserID: &w.alice.User.ID, ActorEmail: w.alice.Email, OrgID: &org,
-		Action: "remote.test", TargetType: "remote_session", TargetID: "rs_role", Summary: "role test"}); err != nil {
-		t.Fatalf("audit insert as the relay: %v", err)
-	}
-	hook, err := w.s.repo.CreateWebhook(ctx, domain.Webhook{OrgID: &org, Name: "relay role", URL: "https://hooks.example.test/x",
-		Format: "json", Secret: "s3cret-not-for-the-relay", Events: []string{"audit.remote.*"}, Active: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	hooks, err := rr.WebhooksForEvent(ctx, 0, org)
-	if err != nil || len(hooks) == 0 {
-		t.Fatalf("webhooks as the relay: %v %v", hooks, err)
-	}
-	if _, err := rr.EnqueueDelivery(ctx, hook.ID, "audit.remote.test", "{}"); err != nil {
-		t.Fatalf("delivery as the relay: %v", err)
 	}
 
 	// Granting again is idempotent, and a missing role is reported as such.

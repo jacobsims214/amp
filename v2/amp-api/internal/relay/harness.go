@@ -205,14 +205,24 @@ func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 	}
 	key, _ := parsePub(sess.HarnessPub)
 	now := rl.cfg.Now()
+	var nonceErr error
 	code := CheckTokenProof(body, TokenProofReceiver{
 		NowMS: now.UnixMilli(), SessionID: sess.ID, HarnessID: sess.HarnessID, Harness: key,
+		// In the database, so a proof used on one replica can't be used
+		// again on another (re-review #2394 N6).
 		Seen: func(nonce string) bool {
-			rl.mu.Lock()
-			defer rl.mu.Unlock()
-			return rl.proofNonces.seenOrAdd(sess.ID+" "+nonce, now, 2*TSWindow)
+			replayed, err := rl.repo.UseProofNonce(ctx, sess.ID, nonce, now, now.Add(2*TSWindow))
+			if err != nil {
+				nonceErr = err
+				return true
+			}
+			return replayed
 		},
 	})
+	if nonceErr != nil {
+		writeErr(w, nonceErr)
+		return
+	}
 	if code != CodeOK {
 		status := 400
 		switch code {
@@ -222,7 +232,23 @@ func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 			status = 413
 		}
 		slog.Warn("remote token refresh refused", "session", sess.ID, "user_id", p.UserID, "code", code)
-		writeErr(w, errf(status, code, "the token refresh needs a proof signed by the session's harness key: %s", code))
+		e := errf(status, code, "the token refresh needs a proof signed by the session's harness key: %s", code)
+		if code == CodeStaleTS {
+			// The harness tells its person how far off the laptop's clock is
+			// (re-review #2394 N5).
+			e = e.with("now_ms", now.UnixMilli())
+		}
+		writeErr(w, e)
+		return
+	}
+	// The person may have lost access to the project (removed from its team
+	// or org) since the session started: that ends the session, as
+	// deactivation does (re-review #2394 N7).
+	if ended, err := rl.svc.EndRemoteWithoutAccess(ctx, authz.Principal{}, sess.OwnerUserID); err != nil {
+		writeErr(w, err)
+		return
+	} else if slices.ContainsFunc(ended, func(x domain.RemoteSession) bool { return x.ID == sess.ID }) {
+		writeErr(w, errf(410, domain.RemoteCodeSessionEnded, "remote session has ended").with("reason", domain.RemoteEndRevoked))
 		return
 	}
 	pol, _, err := rl.repo.ProjectRemotePolicy(ctx, sess.ProjectID)

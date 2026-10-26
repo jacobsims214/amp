@@ -10,7 +10,6 @@ package relay
 import (
 	"crypto/ecdsa"
 	"regexp"
-	"time"
 )
 
 const sigPrefixToken = "amp-rc/1 token\n"
@@ -106,29 +105,4 @@ func SignTokenProof(priv *ecdsa.PrivateKey, sessionID, harnessID string, ts int6
 	}
 	out := append([]byte(`{"proof":`), signed...)
 	return append(out, '}'), nil
-}
-
-// nonceCache remembers refresh-proof nonces for twice the ts window, so a
-// captured proof can't be replayed while its ts is still accepted. It only
-// grows with proofs whose signature verified (the harness's own).
-type nonceCache struct {
-	seen map[string]time.Time
-}
-
-// seenOrAdd reports whether key was recorded in the last ttl, and records it.
-// The caller holds the lock that guards the cache.
-func (c *nonceCache) seenOrAdd(key string, now time.Time, ttl time.Duration) bool {
-	if c.seen == nil {
-		c.seen = map[string]time.Time{}
-	}
-	for k, at := range c.seen {
-		if now.Sub(at) > ttl {
-			delete(c.seen, k)
-		}
-	}
-	if _, ok := c.seen[key]; ok {
-		return true
-	}
-	c.seen[key] = now
-	return false
 }
