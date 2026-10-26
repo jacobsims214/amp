@@ -382,7 +382,7 @@ Two layers of files, built-in defaults below both:
 `--config` and `--config-dir` are global flags: they go before or after any subcommand
 (`amp-harness --config F run -p …` and `amp-harness run -p … --config F` are the same) and apply to
 every setting and every command, readers and writers alike: `[server]`, `[models]`, `[roles]`,
-`[providers]`, `[profiles]`, `[workers]`, `[tools]`, `[secrets]` and `[tui]`, and `server`,
+`[providers]`, `[profiles]`, `[workers]`, `[tools]`, `[secrets]`, `[manager]` and `[tui]`, and `server`,
 `connect`, `disconnect`, `init` and the chat's `/connect` and `/server` write that file.
 `--config` moves only the file; `--config-dir` moves the whole user layer: `config.toml`,
 `agents/`, `skills/`, `AGENTS.md` and `credentials.json`. A file named with `--config` /
@@ -1163,7 +1163,8 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   its source). `/reload` picks up agents, skills, models and MCP servers changed from another
   terminal (see below). AMP: `/amp` (server, user, MCP health), `/ticket [id|none]`, `/project
   [id]`, `/questions`, `/plan`, `/open [id|plan]`, `/workers`, `/worker [id]`. `/usage` prints the
-  session's tokens and cost, `/help` (also `/?`), `/abort`, `/close` (the open panel), `/quit`
+  session's tokens and cost, `/help` (also `/?`), `/abort`, `/stop` (the reply, or the wait for
+  plan approval), `/close` (the open panel), `/quit`
   (also `/exit`, `/q`). Typing `/` opens a completion menu (↑↓ choose, Tab complete, Enter run).
 - Keys: Enter sends, Shift+Enter is a new line, Esc aborts the running reply (and the workers it
   started; an Esc that closes a panel, the `/` menu or a worker's session doesn't, and for 2 s the
@@ -1335,7 +1336,8 @@ transcript shows, under the refused call:
     The manager stopped here; nothing else was run. Reply once it's done.
 ```
 
-and the manager's turn ends: it doesn't retry another way. Approve in the web UI, then reply.
+and the manager's turn ends: it doesn't retry another way. Approve in the web UI; the chat then
+carries on by itself (#2425, below).
 
 **Per-ticket approval (#2198, #2201).** On servers that approve each ticket (its owner approves it;
 a project lead may approve it on their behalf), `amp_check_plan` says whose each awaiting ticket
@@ -1351,6 +1353,18 @@ dispatch refusal names whose approval it waits for:
 
 (`⏸ Waiting for #N's owner to approve it …` when the ticket isn't in the last plan check). Older
 servers, without `awaiting_approval_tickets`, keep the words above: one approval covers the plan.
+
+**The manager carries on once you approve (#2425).** When a manager turn ends waiting for
+approval, the chat shows `⏸ Waiting for plan approval in AMP (#…)` with the Flight plan link and
+the status line says `⏸ waiting for plan approval in AMP`. The harness reads `amp_check_plan` on
+its own AMP connection (never through the model, and it never approves anything): every 5 s while
+tickets wait, every 15 s after 2 minutes, every 60 s after 15 minutes. Once a person approves, the
+chat says `✓ Plan approved in AMP by … ` and starts the manager's next turn itself, naming the
+approved tickets (and any that still wait). The wait ends without a turn when the tickets stop
+waiting some other way, plan approval is turned off, or the chat switches project or server.
+Esc or `/stop` (which also stops a running reply) stops waiting, and so does typing a message.
+Turn it off with `[manager] auto_resume_on_approval = false` (or `AMP_HARNESS_AUTO_RESUME=false`);
+the chat then waits for your reply. Code: `amp-core/src/approval_wait.rs`.
 
 The manager's tool policy adds (all roles for the first two):
 
