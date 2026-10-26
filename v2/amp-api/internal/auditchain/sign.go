@@ -35,6 +35,11 @@ type Checkpoint struct {
 	Kind      string    `json:"kind"`
 	KeyID     string    `json:"key_id,omitempty"`
 	Signature []byte    `json:"-"`
+	// RowAt is when the anchored row was written (anchors written by
+	// audit_purge since migration 035 only): verify checks the row was past
+	// retention when it was purged. Not part of the signed message;
+	// audit_purge takes it from the row itself.
+	RowAt *time.Time `json:"row_at,omitempty"`
 }
 
 // Message is the exact byte string a checkpoint's signature covers.
@@ -53,6 +58,11 @@ const (
 	// EnvPublicKeys lists more public keys (base64, comma-separated) that
 	// verification accepts: retired signing keys after a rotation.
 	EnvPublicKeys = "AUDIT_SIGNING_PUBLIC_KEYS"
+	// EnvSigningSince is when signing started (RFC 3339, or a date): once a
+	// key is configured, every checkpoint must be signed, except ones
+	// written before this time (history from before there was a key). Unset:
+	// no unsigned checkpoint is accepted when a key is configured.
+	EnvSigningSince = "AUDIT_SIGNING_SINCE"
 )
 
 // Keyring signs checkpoints with the configured key, and checks them
@@ -61,6 +71,9 @@ type Keyring struct {
 	signer   ed25519.PrivateKey
 	signerID string
 	public   map[string]ed25519.PublicKey
+	// since: unsigned checkpoints written before it are pre-key history
+	// (EnvSigningSince); zero means none are.
+	since time.Time
 }
 
 // KeyID names a public key: the first 8 bytes of its SHA-256, in hex.
@@ -121,8 +134,53 @@ func LoadKeyring(getenv func(string) string) (*Keyring, error) {
 		}
 		extra = append(extra, p)
 	}
-	return NewKeyring(priv, extra...), errors.Join(errs...)
+	k := NewKeyring(priv, extra...)
+	if v := strings.TrimSpace(getenv(EnvSigningSince)); v != "" {
+		t, err := ParseSince(v)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", EnvSigningSince, err))
+		} else {
+			k.since = t
+		}
+	}
+	return k, errors.Join(errs...)
 }
+
+// ParseSince reads an RFC 3339 time or a YYYY-MM-DD date (midnight UTC).
+func ParseSince(v string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	t, err := time.Parse("2006-01-02", v)
+	if err != nil {
+		return time.Time{}, errors.New("want an RFC 3339 time or a YYYY-MM-DD date")
+	}
+	return t, nil
+}
+
+// WithSince returns a copy of k that accepts unsigned checkpoints written
+// before t as pre-key history (EnvSigningSince).
+func (k *Keyring) WithSince(t time.Time) *Keyring {
+	c := NewKeyring(nil)
+	if k != nil {
+		*c = *k
+	}
+	c.since = t
+	return c
+}
+
+// Since is EnvSigningSince (zero when unset).
+func (k *Keyring) Since() time.Time {
+	if k == nil {
+		return time.Time{}
+	}
+	return k.since
+}
+
+// HasKeys reports whether the keyring can check signatures at all: a
+// signing key or a public key is configured. Without one, every chain is
+// unproven: anyone with database access could have rewritten it.
+func (k *Keyring) HasKeys() bool { return k != nil && len(k.public) > 0 }
 
 func decodeB64(s string) ([]byte, error) {
 	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {

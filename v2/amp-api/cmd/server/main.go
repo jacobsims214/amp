@@ -361,7 +361,18 @@ func main() {
 	// delete entries past AUDIT_RETENTION_DAYS daily through the anchored
 	// path. One replica at a time runs each (advisory locks).
 	service.AuditKeys = loadAuditKeys()
+	// The dispatcher records turning a failing webhook off and dropping
+	// deliveries (#2439 M4).
+	webhooks.OnSystemAudit(service.New(repo, registry, kbSvc).RecordSystem)
 	auditRetention := auditRetentionFromEnv()
+	service.AuditRetention = auditRetention
+	if auditRetention > 0 {
+		if ready, err := repo.AuditPurgeRoleReady(ctx); err != nil {
+			slog.Warn("can't tell whether audit retention can run", "err", err)
+		} else if !ready {
+			slog.Warn("audit retention is off until a superuser sets up the amp_audit_purge role: run `amp-api audit purge-role-sql` and feed it to psql as a superuser (see KB admin/trash-audit-and-projects)")
+		}
+	}
 	go service.New(repo, registry, kbSvc).RunAuditCheckpoints(ctx, time.Hour, repo.TryNamedLock)
 	go service.New(repo, registry, kbSvc).RunAuditRetention(ctx, auditRetention, 24*time.Hour, repo.TryNamedLock)
 

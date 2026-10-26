@@ -126,8 +126,10 @@ spec:
             - name: AUDIT_RETENTION_DAYS
               value: {{ .retentionDays | toString | quote }}
             {{- if .signingKey.existingSecret }}
+            # optional: a missing Secret means no key (verify says
+            # "unproven"), not a pod that can't start.
             - name: AUDIT_SIGNING_KEY
-              valueFrom: { secretKeyRef: { name: {{ .signingKey.existingSecret }}, key: {{ .signingKey.key | default "signing-key" }} } }
+              valueFrom: { secretKeyRef: { name: {{ .signingKey.existingSecret }}, key: {{ .signingKey.key | default "signing-key" }}, optional: true } }
             {{- end }}
             {{- with .retiredPublicKeys }}
             - name: AUDIT_SIGNING_PUBLIC_KEYS

@@ -28,6 +28,15 @@ var AuditKeys *auditchain.Keyring
 // AUDIT_RETENTION_DAYS is unset.
 const DefaultAuditRetention = 365 * 24 * time.Hour
 
+// MinAuditRetention is the shortest retention: audit_purge() (migration
+// 035) refuses rows younger than this.
+const MinAuditRetention = 30 * 24 * time.Hour
+
+// AuditRetention is the configured retention (AUDIT_RETENTION_DAYS; main
+// sets it). Verify flags an anchor whose row was younger than this when
+// it was purged. 0: entries are kept forever, and anchors aren't checked.
+var AuditRetention time.Duration
+
 // systemPrincipal is AMP itself, for entries its jobs write.
 var systemPrincipal = authz.Principal{Email: "AMP"}
 
@@ -50,19 +59,19 @@ func (s *Service) VerifyAudit(ctx context.Context, p authz.Principal, orgID int)
 	default:
 		return auditchain.Report{}, authz.Forbidden("verifying every audit chain is for global admins; pass an org you administer")
 	}
-	return VerifyAuditChains(ctx, s.Repo, AuditKeys, chains)
+	return VerifyAuditChains(ctx, s.Repo, AuditKeys, auditchain.Policy{Retention: AuditRetention}, chains)
 }
 
 // VerifyAuditChains recomputes each chain from its latest anchor and checks
-// its checkpoints against keys. It reads only; problems are in the report,
-// and err is for failing to read.
-func VerifyAuditChains(ctx context.Context, repo *repository.Repo, keys *auditchain.Keyring, chains []string) (auditchain.Report, error) {
+// its checkpoints against keys and policy. It reads only; problems are in
+// the report, and err is for failing to read.
+func VerifyAuditChains(ctx context.Context, repo *repository.Repo, keys *auditchain.Keyring, policy auditchain.Policy, chains []string) (auditchain.Report, error) {
 	var reports []auditchain.ChainReport
 	for _, key := range chains {
 		var v *auditchain.ChainVerifier
 		err := repo.ReadAuditChain(ctx, key,
 			func(head *auditchain.Head, cps []auditchain.Checkpoint) {
-				v = auditchain.NewChainVerifier(key, head, cps, keys)
+				v = auditchain.NewChainVerifier(key, head, cps, keys, policy)
 			},
 			func(r auditchain.Row) { v.Add(r) })
 		if err != nil {
@@ -118,6 +127,12 @@ func (s *Service) WriteAuditCheckpoints(ctx context.Context) (int, error) {
 	return n, nil
 }
 
+// RecordSystem writes an audit entry made by AMP itself (actor system),
+// e.g. the webhook dispatcher turning a failing webhook off (#2439 M4).
+func (s *Service) RecordSystem(ctx context.Context, e domain.AuditEntry) {
+	s.audit(ctx, systemPrincipal, e)
+}
+
 // checkpointEntry is the audit entry announcing a checkpoint.
 func checkpointEntry(cp *auditchain.Checkpoint, summary string) domain.AuditEntry {
 	details := map[string]any{"chain_key": cp.ChainKey, "upto_seq": cp.UptoSeq, "hash": hex.EncodeToString(cp.Hash),
@@ -137,8 +152,10 @@ func checkpointEntry(cp *auditchain.Checkpoint, summary string) domain.AuditEntr
 }
 
 // PurgeAudit deletes audit entries written before cutoff, chain by chain,
-// through the anchored path (repository.PurgeAuditChain), and records an
-// audit.purge entry with what went. It returns the rows deleted per chain.
+// through the anchored path (repository.PurgeAuditChain), batch by batch
+// (each with its own anchor, so writers are never held up for long), and
+// records an audit.purge entry with what went. It returns the rows deleted
+// per chain.
 func (s *Service) PurgeAudit(ctx context.Context, cutoff time.Time, retention time.Duration) (map[string]int64, error) {
 	chains, err := s.Repo.AuditChainKeys(ctx)
 	if err != nil {
@@ -149,23 +166,32 @@ func (s *Service) PurgeAudit(ctx context.Context, cutoff time.Time, retention ti
 	var total int64
 	var firstErr error
 	for _, key := range chains {
-		cp, n, err := s.Repo.PurgeAuditChain(ctx, key, cutoff, AuditKeys.Sign)
-		if err != nil {
-			slog.Error("audit retention: purging a chain failed", "chain", key, "err", err)
-			if firstErr == nil {
-				firstErr = err
+		var last *auditchain.Checkpoint
+		var n, batches int64
+		for ctx.Err() == nil {
+			cp, k, err := s.Repo.PurgeAuditChain(ctx, key, cutoff, repository.AuditPurgeBatch, AuditKeys.Sign)
+			if err != nil {
+				slog.Error("audit retention: purging a chain failed", "chain", key, "err", err)
+				if firstErr == nil {
+					firstErr = err
+				}
+				break
 			}
-			continue
+			if cp == nil {
+				break
+			}
+			last, n, batches = cp, n+k, batches+1
 		}
-		if cp == nil {
+		if last == nil {
 			continue
 		}
 		deleted[key] = n
 		total += n
-		perChain[key] = map[string]any{"deleted": n, "anchor_seq": cp.UptoSeq, "anchor_id": cp.ID,
-			"anchor_hash": hex.EncodeToString(cp.Hash), "signed": len(cp.Signature) > 0}
-		// The anchor's signature goes out with the chain's own webhooks.
-		s.audit(ctx, systemPrincipal, checkpointEntry(cp, fmt.Sprintf("retention anchor of %s at seq %d (%d older entries deleted)", key, cp.UptoSeq, n)))
+		perChain[key] = map[string]any{"deleted": n, "batches": batches, "anchor_seq": last.UptoSeq, "anchor_id": last.ID,
+			"anchor_hash": hex.EncodeToString(last.Hash), "signed": len(last.Signature) > 0}
+		// The last anchor's signature goes out with the chain's own
+		// webhooks (each batch's anchor is in audit_checkpoints).
+		s.audit(ctx, systemPrincipal, checkpointEntry(last, fmt.Sprintf("retention anchor of %s at seq %d (%d older entries deleted)", key, last.UptoSeq, n)))
 	}
 	if total > 0 {
 		s.audit(ctx, systemPrincipal, domain.AuditEntry{Action: "audit.purge", TargetType: "audit_log",

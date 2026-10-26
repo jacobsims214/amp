@@ -29,6 +29,9 @@ type WebhookChange struct {
 	Format *string   `json:"format"`
 	Events *[]string `json:"events"`
 	Active *bool     `json:"active"`
+	// IncludeContext: send audit entries' request context (IP, user
+	// agent, session and token ids, before/after). Default off.
+	IncludeContext *bool `json:"include_context"`
 }
 
 // requireWebhookScope checks p may manage webhooks for an org or a project
@@ -192,6 +195,9 @@ func applyWebhookChange(w *domain.Webhook, c WebhookChange) error {
 	}
 	if c.Active != nil {
 		w.Active = *c.Active
+	}
+	if c.IncludeContext != nil {
+		w.IncludeContext = *c.IncludeContext
 	}
 	return nil
 }

@@ -15,8 +15,9 @@ const (
 	ProblemBrokenLink = "broken_link"
 	// ProblemMissing: seqs are missing between two rows (rows deleted).
 	ProblemMissing = "missing"
-	// ProblemMissingStart: the chain starts after seq 1 and no checkpoint
-	// anchors where it starts (the oldest rows were deleted, not purged).
+	// ProblemMissingStart: the chain starts after seq 1 and no anchor
+	// checkpoint anchors where it starts (the oldest rows were deleted, not
+	// purged).
 	ProblemMissingStart = "missing_start"
 	// ProblemMissingTail: the head or a checkpoint is past the last row
 	// (the newest rows were deleted).
@@ -27,14 +28,46 @@ const (
 	// seq (history was rewritten and re-hashed after it was signed).
 	ProblemCheckpoint = "checkpoint_mismatch"
 	// ProblemSignature: a checkpoint's signature is bad, by an unknown key,
-	// or missing on a checkpoint written after signed ones.
+	// or missing while a signing key is configured (#2439 H1).
 	ProblemSignature = "signature"
+	// ProblemAnchor: a retention anchor that retention can't have written:
+	// its row was younger than the retention period, or it is unsigned and
+	// signed history before it is gone (#2439 H1).
+	ProblemAnchor = "anchor"
+	// ProblemActor: the row's actor_user_id isn't the actor it was written
+	// with (actor_id_at_write, which the hash covers) (#2439 L1).
+	ProblemActor = "actor_mismatch"
 	// ProblemUnchained: a row has no chain columns (written while the
 	// chain trigger was disabled).
 	ProblemUnchained = "unchained"
 	// ProblemMisfiled: a row's chain isn't the one its org belongs to.
 	ProblemMisfiled = "misfiled"
 )
+
+// Chain and report statuses.
+const (
+	// StatusOK: no problems, and signed checkpoints vouch for the chain.
+	StatusOK = "ok"
+	// StatusUnproven: no problems found, but nothing signed vouches for the
+	// chain (no signing key, no signed checkpoint yet, or it starts at an
+	// unsigned anchor), so someone with database access could have
+	// rewritten it consistently. Not OK (#2439 H2).
+	StatusUnproven = "unproven"
+	// StatusFailed: tampering or loss detected.
+	StatusFailed = "failed"
+)
+
+// Policy is what verification checks against besides the keys.
+type Policy struct {
+	// Retention is the configured retention period (AUDIT_RETENTION_DAYS):
+	// an anchor whose row was younger than this when it was written wasn't
+	// written by retention. 0 skips the check.
+	Retention time.Duration
+}
+
+// anchorSlack allows for clock skew between the database (a row's at) and
+// the replica that wrote the anchor.
+const anchorSlack = time.Hour
 
 // Problem is one thing wrong with a chain.
 type Problem struct {
@@ -48,7 +81,9 @@ type Problem struct {
 // ChainReport is the result of verifying one chain.
 type ChainReport struct {
 	ChainKey string `json:"chain_key"`
-	OK       bool   `json:"ok"`
+	// OK is Status == StatusOK.
+	OK     bool   `json:"ok"`
+	Status string `json:"status"`
 	// Rows is how many rows were checked, FirstSeq..LastSeq.
 	Rows     int   `json:"rows"`
 	FirstSeq int64 `json:"first_seq,omitempty"`
@@ -68,7 +103,11 @@ type ChainReport struct {
 
 // Report is a verification of one or more chains.
 type Report struct {
-	OK        bool          `json:"ok"`
+	// OK is Status == StatusOK: every chain verified and is vouched for by
+	// a signature.
+	OK bool `json:"ok"`
+	// Status is the worst chain status (StatusOK with no chains).
+	Status    string        `json:"status"`
 	CheckedAt time.Time     `json:"checked_at"`
 	Signing   SigningStatus `json:"signing"`
 	Chains    []ChainReport `json:"chains"`
@@ -82,14 +121,20 @@ type SigningStatus struct {
 
 // NewReport assembles chain reports.
 func NewReport(keys *Keyring, chains []ChainReport) Report {
-	r := Report{OK: true, CheckedAt: time.Now().UTC(), Chains: chains,
+	r := Report{Status: StatusOK, CheckedAt: time.Now().UTC(), Chains: chains,
 		Signing: SigningStatus{Configured: keys.CanSign(), KeyID: keys.SignerID()}}
 	if r.Chains == nil {
 		r.Chains = []ChainReport{}
 	}
 	for _, c := range chains {
-		r.OK = r.OK && c.OK
+		switch {
+		case c.Status == StatusFailed:
+			r.Status = StatusFailed
+		case c.Status == StatusUnproven && r.Status == StatusOK:
+			r.Status = StatusUnproven
+		}
 	}
+	r.OK = r.Status == StatusOK
 	return r
 }
 
@@ -103,18 +148,30 @@ type Head struct {
 type ChainVerifier struct {
 	rep     ChainReport
 	head    *Head
+	keys    *Keyring
 	cps     []Checkpoint
-	trusted map[int64][]Checkpoint // by upto_seq, signature valid or (legitimately) unsigned
+	trusted map[int64][]Checkpoint // by upto_seq: signature valid, or unsigned where that is allowed
 	all     map[int64][]Checkpoint // by upto_seq
 	started bool
 	last    int64
 	lastH   []byte
+	// startedAt is the anchor the chain starts from (nil: seq 1, or none).
+	startedAt *Checkpoint
+	// unproven says why nothing signed vouches for the chain ("" if it is).
+	unproven string
 }
 
 // NewChainVerifier starts verifying chain key, whose head is head (nil if
-// it has none), with its checkpoints, checked against keys.
-func NewChainVerifier(key string, head *Head, checkpoints []Checkpoint, keys *Keyring) *ChainVerifier {
-	v := &ChainVerifier{rep: ChainReport{ChainKey: key, Problems: []Problem{}}, head: head,
+// it has none), with its checkpoints, checked against keys and policy.
+//
+// Trust rules (#2439 H1): when keys holds any key, a checkpoint must carry
+// a valid signature, whatever its id or kind; an unsigned one is a problem
+// unless it was written before keys.Since() (history from before signing
+// started). Without any key nothing can be proven: unsigned checkpoints are
+// used, and the chain is at best unproven. Only an anchor may start a
+// chain, and an anchor must be older than the retention period.
+func NewChainVerifier(key string, head *Head, checkpoints []Checkpoint, keys *Keyring, policy Policy) *ChainVerifier {
+	v := &ChainVerifier{rep: ChainReport{ChainKey: key, Problems: []Problem{}}, head: head, keys: keys,
 		trusted: map[int64][]Checkpoint{}, all: map[int64][]Checkpoint{}}
 	if head != nil {
 		v.rep.HeadSeq = head.Seq
@@ -122,22 +179,27 @@ func NewChainVerifier(key string, head *Head, checkpoints []Checkpoint, keys *Ke
 	cps := append([]Checkpoint(nil), checkpoints...)
 	sort.Slice(cps, func(i, j int) bool { return cps[i].ID < cps[j].ID }) // the order they were written
 	v.cps = cps
-	signedSeen, unsigned := false, 0
+	unsigned, preKey := 0, 0
+	since := keys.Since()
 	for _, c := range cps {
 		v.all[c.UptoSeq] = append(v.all[c.UptoSeq], c)
 		trusted := false
 		switch keys.Check(c) {
 		case SigOK:
 			v.rep.SignedCheckpoints++
-			signedSeen, trusted = true, true
+			trusted = true
 			v.rep.LastSignedSeq = max(v.rep.LastSignedSeq, c.UptoSeq)
 		case SigUnsigned:
-			if signedSeen {
-				v.problem(Problem{Kind: ProblemSignature, Seq: c.UptoSeq, CheckpointID: c.ID,
-					Detail: "unsigned checkpoint written after signed ones: the signing key was removed, or someone else wrote it"})
-			} else {
+			switch {
+			case !keys.HasKeys():
 				unsigned++
 				trusted = true
+			case !since.IsZero() && c.At.Before(since):
+				preKey++
+				trusted = true
+			default:
+				v.problem(Problem{Kind: ProblemSignature, Seq: c.UptoSeq, CheckpointID: c.ID,
+					Detail: fmt.Sprintf("unsigned %s checkpoint while a signing key is configured: someone without the key wrote it (set %s if it is history from before signing started)", c.Kind, EnvSigningSince)})
 			}
 		case SigBad:
 			v.problem(Problem{Kind: ProblemSignature, Seq: c.UptoSeq, CheckpointID: c.ID,
@@ -146,16 +208,27 @@ func NewChainVerifier(key string, head *Head, checkpoints []Checkpoint, keys *Ke
 			v.problem(Problem{Kind: ProblemSignature, Seq: c.UptoSeq, CheckpointID: c.ID,
 				Detail: fmt.Sprintf("signed by key %s, which isn't configured: add its public key to %s if it is a retired key", c.KeyID, EnvPublicKeys)})
 		}
-		if trusted {
-			v.trusted[c.UptoSeq] = append(v.trusted[c.UptoSeq], c)
-			if c.Kind == KindAnchor {
-				v.rep.AnchorSeq = max(v.rep.AnchorSeq, c.UptoSeq)
+		if !trusted {
+			continue
+		}
+		v.trusted[c.UptoSeq] = append(v.trusted[c.UptoSeq], c)
+		if c.Kind == KindAnchor {
+			v.rep.AnchorSeq = max(v.rep.AnchorSeq, c.UptoSeq)
+			if policy.Retention > 0 && c.RowAt != nil && c.RowAt.After(c.At.Add(-policy.Retention+anchorSlack)) {
+				v.problem(Problem{Kind: ProblemAnchor, Seq: c.UptoSeq, CheckpointID: c.ID,
+					Detail: fmt.Sprintf("the anchored row was written %s, less than the %d-day retention before the anchor (%s): retention didn't delete it (if retention was lengthened since, the anchor may be older policy)",
+						c.RowAt.UTC().Format(time.RFC3339), int(policy.Retention/(24*time.Hour)), c.At.UTC().Format(time.RFC3339))})
 			}
 		}
 	}
-	if unsigned > 0 {
-		v.rep.Warnings = append(v.rep.Warnings, fmt.Sprintf(
-			"%d checkpoint(s) are unsigned (no %s was configured when they were written): they show where the chain was, but don't prove it against someone with database access", unsigned, EnvSigningKey))
+	switch {
+	case !keys.HasKeys():
+		v.unproven = fmt.Sprintf("no signing key is configured (%s): the chain can't be proven against someone with database access", EnvSigningKey)
+		if unsigned > 0 {
+			v.rep.Warnings = append(v.rep.Warnings, fmt.Sprintf("%d checkpoint(s) are unsigned: they show where the chain was, but prove nothing", unsigned))
+		}
+	case preKey > 0:
+		v.rep.Warnings = append(v.rep.Warnings, fmt.Sprintf("%d unsigned checkpoint(s) from before %s (%s) were accepted as pre-key history", preKey, since.UTC().Format(time.RFC3339), EnvSigningSince))
 	}
 	return v
 }
@@ -181,11 +254,12 @@ func (v *ChainVerifier) Add(r Row) {
 		v.rep.FirstSeq = seq
 		if seq == 1 {
 			prev = ZeroHash
-		} else if cps := v.trusted[seq-1]; len(cps) > 0 {
-			prev = cps[0].Hash
+		} else if a := v.startAnchor(seq - 1); a != nil {
+			prev = a.Hash
+			v.startedAt = a
 		} else {
 			v.problem(Problem{Kind: ProblemMissingStart, Seq: seq, AuditID: r.ID,
-				Detail: fmt.Sprintf("the chain starts at seq %d, and no checkpoint anchors seq %d: rows were deleted outside retention", seq, seq-1)})
+				Detail: fmt.Sprintf("the chain starts at seq %d, and no anchor checkpoint anchors seq %d: rows were deleted outside retention", seq, seq-1)})
 			linkChecked = false
 		}
 	case seq != v.last+1:
@@ -198,6 +272,10 @@ func (v *ChainVerifier) Add(r Row) {
 	if linkChecked && !bytes.Equal(r.PrevHash, prev) {
 		v.problem(Problem{Kind: ProblemBrokenLink, Seq: seq, AuditID: r.ID,
 			Detail: "prev_hash isn't the previous row's hash (rows reordered, replaced or re-hashed)"})
+	}
+	if r.ActorIDAtWrite != nil && r.ActorUserID != nil && *r.ActorIDAtWrite != *r.ActorUserID {
+		v.problem(Problem{Kind: ProblemActor, Seq: seq, AuditID: r.ID,
+			Detail: fmt.Sprintf("actor_user_id is %d but the row was written by user %d: it was re-pointed", *r.ActorUserID, *r.ActorIDAtWrite)})
 	}
 	if !bytes.Equal(LinkHash(r.PrevHash, Canonical(r)), r.Hash) {
 		v.problem(Problem{Kind: ProblemAltered, Seq: seq, AuditID: r.ID,
@@ -222,13 +300,9 @@ func (v *ChainVerifier) Finish() ChainReport {
 		// Nothing left: retention may have purged everything, up to an
 		// anchor at the head.
 		if v.head != nil && v.head.Seq > 0 {
-			ok := false
-			for _, c := range v.trusted[v.head.Seq] {
-				if c.Kind == KindAnchor && bytes.Equal(c.Hash, v.head.Hash) {
-					ok = true
-				}
-			}
-			if !ok {
+			if a := v.startAnchor(v.head.Seq); a != nil && bytes.Equal(a.Hash, v.head.Hash) {
+				v.startedAt = a
+			} else {
 				v.problem(Problem{Kind: ProblemMissingTail, Seq: v.head.Seq,
 					Detail: fmt.Sprintf("the chain head is at seq %d but no rows remain, and no anchor covers them", v.head.Seq)})
 			}
@@ -249,9 +323,50 @@ func (v *ChainVerifier) Finish() ChainReport {
 				Detail: fmt.Sprintf("a %s checkpoint covers seq %d but the chain ends at %d: the newest rows were deleted", c.Kind, c.UptoSeq, end)})
 		}
 	}
+	if a := v.startedAt; a != nil && len(a.Signature) == 0 {
+		// Only pre-key history (or a keyless setup) may start at an
+		// unsigned anchor, and pre-key history can't have signed
+		// checkpoints in the part it purged: a signed checkpoint at or
+		// below the start was written after signing began, so the rows it
+		// vouched for were deleted by someone without the key.
+		for _, c := range v.cps {
+			if c.UptoSeq <= a.UptoSeq && len(c.Signature) > 0 && v.keys.Check(c) == SigOK {
+				v.problem(Problem{Kind: ProblemAnchor, Seq: a.UptoSeq, CheckpointID: a.ID,
+					Detail: fmt.Sprintf("the chain starts at an unsigned anchor (seq %d), but signed checkpoint %d at seq %d is before it: signed history was deleted without the key", a.UptoSeq, c.ID, c.UptoSeq)})
+				break
+			}
+		}
+		if v.unproven == "" {
+			v.unproven = fmt.Sprintf("the chain starts at an unsigned anchor (seq %d): what was deleted before it isn't proven", a.UptoSeq)
+		}
+	}
+	if v.unproven == "" && v.rep.SignedCheckpoints == 0 && (v.started || v.rep.HeadSeq > 0) {
+		v.unproven = "no signed checkpoint covers this chain yet (they are written hourly)"
+	}
 	if v.started && v.rep.LastSignedSeq < v.last && v.rep.SignedCheckpoints > 0 {
 		v.rep.Warnings = append(v.rep.Warnings, fmt.Sprintf("seq %d to %d are newer than the last signed checkpoint", v.rep.LastSignedSeq+1, v.last))
 	}
-	v.rep.OK = len(v.rep.Problems) == 0
+	switch {
+	case len(v.rep.Problems) > 0:
+		v.rep.Status = StatusFailed
+	case v.unproven != "":
+		v.rep.Status = StatusUnproven
+		v.rep.Warnings = append(v.rep.Warnings, "unproven: "+v.unproven)
+	default:
+		v.rep.Status = StatusOK
+	}
+	v.rep.OK = v.rep.Status == StatusOK
 	return v.rep
+}
+
+// startAnchor is the trusted anchor the chain may start after seq (only
+// an anchor: a periodic checkpoint marks where the chain was, not where
+// retention cut it), or nil.
+func (v *ChainVerifier) startAnchor(seq int64) *Checkpoint {
+	for i := range v.trusted[seq] {
+		if c := v.trusted[seq][i]; c.Kind == KindAnchor {
+			return &c
+		}
+	}
+	return nil
 }

@@ -9,7 +9,8 @@
 //
 // where prev_hash is 32 zero bytes for seq 1. Canonical is the text of a
 // jsonb object of every column except actor_user_id (the users FK nulls it
-// when a user is deleted) and the hashes; this package builds the same text
+// when a user is deleted; actor_id_at_write, hashed, keeps it) and the
+// hashes; this package builds the same text
 // in Go, so verification never trusts a function stored in the database.
 //
 // amp-api signs each chain's head hourly (Checkpoint) with an Ed25519 key
@@ -58,6 +59,14 @@ type Row struct {
 	TraceID          *string
 	Before           *string // jsonb text
 	After            *string // jsonb text
+
+	// ActorUserID is not hashed (the users FK nulls it when a user is
+	// deleted). ActorIDAtWrite is the same id as the chain trigger saw it
+	// on insert (migration 035, #2439 L1): it has no FK, is hashed when
+	// set, and verify checks ActorUserID is either it or NULL. Rows written
+	// before 035 have none.
+	ActorUserID    *int64
+	ActorIDAtWrite *int64
 
 	ChainKey *string
 	ChainSeq *int64
@@ -134,6 +143,14 @@ func Canonical(r Row) string {
 		{"after", raw(r.After)},
 		{"chain_key", str(r.ChainKey)},
 		{"chain_seq", num(r.ChainSeq)},
+	}
+	// Only when set, so rows written before migration 035 keep the text
+	// they were hashed with.
+	if r.ActorIDAtWrite != nil {
+		fields = append(fields, struct {
+			k string
+			v string
+		}{"actor_id_at_write", num(r.ActorIDAtWrite)})
 	}
 	// jsonb keeps object keys ordered by length, then bytewise.
 	sort.Slice(fields, func(i, j int) bool {

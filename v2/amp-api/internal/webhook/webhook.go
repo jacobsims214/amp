@@ -92,7 +92,23 @@ type Dispatcher struct {
 
 	mu       sync.Mutex
 	projects map[int]projectInfo // names and orgs for rendering, cached briefly
+	// systemAudit records the dispatcher's own audit entries (OnSystemAudit).
+	systemAudit func(context.Context, domain.AuditEntry)
+	// dropped counts each webhook's dropped deliveries since its last
+	// webhook.delivery.dropped entry.
+	dropped map[int]*dropCount
 }
+
+// dropCount is a webhook's dropped deliveries not yet in an audit entry.
+type dropCount struct {
+	n    int
+	last time.Time // when the last entry was written
+}
+
+// DroppedAuditEvery is how often, at most, a webhook's dropped deliveries
+// are recorded (webhook.delivery.dropped): a dead receiver drops every
+// delivery, and each entry is itself delivered to it.
+const DroppedAuditEvery = time.Hour
 
 type projectInfo struct {
 	name  string
@@ -123,7 +139,7 @@ func New(repo *repository.Repo, opts Options) *Dispatcher {
 		opts.DisableAfter = DisableAfter
 	}
 	d := &Dispatcher{repo: repo, opts: opts, in: make(chan item, 4096), wake: make(chan struct{}, 1), auditWake: make(chan struct{}, 1),
-		projects: map[int]projectInfo{}}
+		projects: map[int]projectInfo{}, dropped: map[int]*dropCount{}}
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	if !opts.AllowPrivateNetworks {
 		// Checked on the resolved address of every connection, so DNS
@@ -172,6 +188,25 @@ func (d *Dispatcher) Audit(domain.AuditEntry) {
 	select {
 	case d.auditWake <- struct{}{}:
 	default:
+	}
+}
+
+// OnSystemAudit sets how the dispatcher records its own audit entries
+// (#2439 M4): webhook.disable when it turns a failing webhook off, and
+// webhook.delivery.dropped when deliveries fail for good, so the SIEM
+// stream can't stop unnoticed. main passes the service's system writer.
+func (d *Dispatcher) OnSystemAudit(fn func(context.Context, domain.AuditEntry)) {
+	d.mu.Lock()
+	d.systemAudit = fn
+	d.mu.Unlock()
+}
+
+func (d *Dispatcher) recordSystem(ctx context.Context, e domain.AuditEntry) {
+	d.mu.Lock()
+	fn := d.systemAudit
+	d.mu.Unlock()
+	if fn != nil {
+		fn(context.WithoutCancel(ctx), e)
 	}
 }
 
@@ -293,7 +328,7 @@ func (d *Dispatcher) match(ctx context.Context, it item) error {
 		if !domain.WebhookMatches(h.Events, typ) {
 			continue
 		}
-		body, err := d.render(ctx, h.Format, env, it)
+		body, err := d.render(ctx, h.Format, forHook(env, it, h), it)
 		if err != nil {
 			return err
 		}
@@ -333,6 +368,30 @@ func envelope(it item, typ string, projectID, orgID int) Envelope {
 	if env.At.IsZero() {
 		env.At = time.Now()
 	}
+	return env
+}
+
+// forHook is env as webhook h may see it: an audit entry's request context
+// (source_ip, user_agent, session_id, token_id, before, after, and the raw
+// X-Forwarded-For in details.xff: personal data added by audit log v2) only
+// goes to webhooks that opted in with include_context (#2439 M2). Hooks
+// made before v2 keep the v1 shape.
+func forHook(env Envelope, it item, h domain.Webhook) Envelope {
+	if it.audit == nil || h.IncludeContext {
+		return env
+	}
+	e := *it.audit
+	e.SourceIP, e.UserAgent, e.SessionID, e.TokenID, e.Before, e.After = "", "", "", nil, nil, nil
+	if _, ok := e.Details["xff"]; ok {
+		details := make(map[string]any, len(e.Details))
+		for k, v := range e.Details {
+			if k != "xff" {
+				details[k] = v
+			}
+		}
+		e.Details = details
+	}
+	env.Data = &e
 	return env
 }
 
@@ -431,9 +490,47 @@ func (d *Dispatcher) deliver(ctx context.Context, dd repository.DueDelivery) {
 		}
 		slog.Warn("webhook delivery failed", "webhook_id", dd.WebhookID, "delivery_id", dd.ID, "attempt", dd.Attempts+1, "status", status, "err", msg, "will_retry", retryAt != nil)
 	}
-	if err := d.repo.FinishDelivery(context.WithoutCancel(ctx), dd, ok, status, msg, retryAt, d.opts.DisableAfter); err != nil {
+	out, err := d.repo.FinishDelivery(context.WithoutCancel(ctx), dd, ok, status, msg, retryAt, d.opts.DisableAfter)
+	if err != nil {
 		slog.Error("recording webhook delivery failed", "delivery_id", dd.ID, "err", err)
+		return
 	}
+	if out.Failed {
+		d.auditDropped(ctx, dd, out, status, msg)
+	}
+	if out.Disabled {
+		slog.Warn("webhook turned off after repeated failures", "webhook_id", dd.WebhookID, "consecutive_failures", out.ConsecutiveFailures)
+		d.recordSystem(ctx, domain.AuditEntry{Action: "webhook.disable", TargetType: "webhook", TargetID: strconv.Itoa(dd.WebhookID),
+			OrgID: out.OrgID, ProjectID: out.ProjectID,
+			Summary: fmt.Sprintf("turned webhook %d off after %d deliveries in a row failed", dd.WebhookID, out.ConsecutiveFailures),
+			Details: map[string]any{"reason": "consecutive_failures", "consecutive_failures": out.ConsecutiveFailures,
+				"last_status": status, "last_error": truncate(msg, 300)}})
+	}
+}
+
+// auditDropped records a delivery that failed for good, at most once per
+// webhook per DroppedAuditEvery (the entry counts the drops since the last
+// one).
+func (d *Dispatcher) auditDropped(ctx context.Context, dd repository.DueDelivery, out repository.DeliveryOutcome, status int, msg string) {
+	d.mu.Lock()
+	c := d.dropped[dd.WebhookID]
+	if c == nil {
+		c = &dropCount{}
+		d.dropped[dd.WebhookID] = c
+	}
+	c.n++
+	if !c.last.IsZero() && time.Since(c.last) < DroppedAuditEvery {
+		d.mu.Unlock()
+		return
+	}
+	n := c.n
+	c.n, c.last = 0, time.Now()
+	d.mu.Unlock()
+	d.recordSystem(ctx, domain.AuditEntry{Action: "webhook.delivery.dropped", TargetType: "webhook", TargetID: strconv.Itoa(dd.WebhookID),
+		OrgID: out.OrgID, ProjectID: out.ProjectID,
+		Summary: fmt.Sprintf("dropped %d delivery(ies) to webhook %d after %d attempts each", n, dd.WebhookID, d.opts.MaxAttempts),
+		Details: map[string]any{"dropped": n, "event_type": dd.EventType, "delivery_id": dd.ID, "attempts": d.opts.MaxAttempts,
+			"last_status": status, "last_error": truncate(msg, 300), "consecutive_failures": out.ConsecutiveFailures}})
 }
 
 // post sends one delivery; any non-2xx answer is an error.

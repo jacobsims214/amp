@@ -28,7 +28,11 @@ func chain(key string, org *int64, n int) []Row {
 }
 
 func verify(key string, rows []Row, head *Head, cps []Checkpoint, keys *Keyring) ChainReport {
-	v := NewChainVerifier(key, head, cps, keys)
+	return verifyWith(key, rows, head, cps, keys, Policy{})
+}
+
+func verifyWith(key string, rows []Row, head *Head, cps []Checkpoint, keys *Keyring, policy Policy) ChainReport {
+	v := NewChainVerifier(key, head, cps, keys, policy)
 	for _, r := range rows {
 		v.Add(r)
 	}
@@ -66,10 +70,49 @@ func TestCanonical_EscapingAndKeyOrder(t *testing.T) {
 	}
 }
 
+// testKeys is a keyring with a fresh signing key.
+func testKeys(t *testing.T) *Keyring {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return NewKeyring(priv)
+}
+
+// signed is a checkpoint signed by keys.
+func signed(keys *Keyring, id int64, kind string, row Row) Checkpoint {
+	c := Checkpoint{ID: id, ChainKey: *row.ChainKey, UptoSeq: *row.ChainSeq, Hash: row.Hash, At: time.Now(), Kind: kind}
+	keys.Sign(&c)
+	return c
+}
+
+// An intact chain is OK only when a valid signature vouches for it; with
+// no key, or no signed checkpoint yet, it is unproven, which isn't OK
+// (#2439 H2).
 func TestVerify_IntactChain(t *testing.T) {
 	rows := chain("org:5", ip(5), 4)
-	if r := verify("org:5", rows, headOf(rows), nil, nil); !r.OK || r.Rows != 4 || r.LastSeq != 4 {
-		t.Fatalf("intact chain: %+v", r)
+	r := verify("org:5", rows, headOf(rows), nil, nil)
+	if r.OK || r.Status != StatusUnproven || len(r.Problems) != 0 || r.Rows != 4 || r.LastSeq != 4 {
+		t.Fatalf("intact chain, no key: %+v", r)
+	}
+	keys := testKeys(t)
+	if r := verify("org:5", rows, headOf(rows), nil, keys); r.OK || r.Status != StatusUnproven {
+		t.Fatalf("intact chain, key but no checkpoint yet: %+v", r)
+	}
+	cp := signed(keys, 1, KindPeriodic, rows[3])
+	if r := verify("org:5", rows, headOf(rows), []Checkpoint{cp}, keys); !r.OK || r.Status != StatusOK {
+		t.Fatalf("intact chain, signed: %+v", r)
+	}
+	// Unsigned checkpoints without a key show where the chain was, but
+	// prove nothing.
+	unsigned := Checkpoint{ID: 1, ChainKey: "org:5", UptoSeq: 4, Hash: rows[3].Hash, At: time.Now(), Kind: KindPeriodic}
+	if r := verify("org:5", rows, headOf(rows), []Checkpoint{unsigned}, nil); r.OK || r.Status != StatusUnproven {
+		t.Fatalf("unsigned checkpoints, no key: %+v", r)
+	}
+	rep := NewReport(nil, []ChainReport{verify("org:5", rows, headOf(rows), []Checkpoint{cp}, keys), r})
+	if rep.OK || rep.Status != StatusUnproven {
+		t.Fatalf("report of an ok and an unproven chain: %+v", rep)
 	}
 }
 
@@ -109,7 +152,7 @@ func TestVerify_DetectsTampering(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			rows, head := tc.mutate(chain("org:5", ip(5), 4))
 			r := verify("org:5", rows, head, nil, nil)
-			if r.OK || !strings.Contains(kinds(r), tc.want) {
+			if r.OK || r.Status != StatusFailed || !strings.Contains(kinds(r), tc.want) {
 				t.Fatalf("want %s, got ok=%v problems=%s", tc.want, r.OK, kinds(r))
 			}
 		})
@@ -149,19 +192,136 @@ func TestVerify_RehashedHistoryFailsTheCheckpoint(t *testing.T) {
 
 // After retention, verification starts at the anchor.
 func TestVerify_StartsAtAnchor(t *testing.T) {
+	keys := testKeys(t)
 	rows := chain("global", nil, 5)
-	anchor := Checkpoint{ID: 1, ChainKey: "global", UptoSeq: 2, Hash: rows[1].Hash, At: time.Now(), Kind: KindAnchor}
-	r := verify("global", rows[2:], headOf(rows), []Checkpoint{anchor}, nil)
+	anchor := signed(keys, 1, KindAnchor, rows[1])
+	r := verify("global", rows[2:], headOf(rows), []Checkpoint{anchor}, keys)
 	if !r.OK || r.FirstSeq != 3 || r.AnchorSeq != 2 || len(r.Warnings) == 0 {
 		t.Fatalf("after purge: %+v", r)
 	}
 	// Everything purged: the anchor at the head is enough.
-	all := Checkpoint{ID: 2, ChainKey: "global", UptoSeq: 5, Hash: rows[4].Hash, At: time.Now(), Kind: KindAnchor}
-	if r := verify("global", nil, headOf(rows), []Checkpoint{anchor, all}, nil); !r.OK {
+	all := signed(keys, 2, KindAnchor, rows[4])
+	if r := verify("global", nil, headOf(rows), []Checkpoint{anchor, all}, keys); !r.OK {
 		t.Fatalf("all purged: %+v", r)
 	}
-	if r := verify("global", nil, headOf(rows), []Checkpoint{anchor}, nil); r.OK {
+	if r := verify("global", nil, headOf(rows), []Checkpoint{anchor}, keys); r.Status != StatusFailed {
 		t.Fatal("rows gone without an anchor passed")
+	}
+	// Without a key the same purge has no problems, but is unproven.
+	unsignedAnchor := Checkpoint{ID: 1, ChainKey: "global", UptoSeq: 2, Hash: rows[1].Hash, At: time.Now(), Kind: KindAnchor}
+	if r := verify("global", rows[2:], headOf(rows), []Checkpoint{unsignedAnchor}, nil); r.Status != StatusUnproven || len(r.Problems) != 0 {
+		t.Fatalf("keyless purge: %+v", r)
+	}
+}
+
+// #2439 H1: forgeries by someone with database access but not the key.
+func TestVerify_ForgedStarts(t *testing.T) {
+	keys := testKeys(t)
+	rows := chain("org:5", ip(5), 6)
+	p2, p4 := signed(keys, 1, KindPeriodic, rows[1]), signed(keys, 2, KindPeriodic, rows[3])
+	if r := verify("org:5", rows, headOf(rows), []Checkpoint{p2, p4}, keys); !r.OK {
+		t.Fatalf("before: %+v", r)
+	}
+	t.Run("unsigned anchor with id -1", func(t *testing.T) {
+		// INSERT an anchor that sorts before every signed checkpoint, then
+		// delete the rows it "covers".
+		forged := Checkpoint{ID: -1, ChainKey: "org:5", UptoSeq: 3, Hash: rows[2].Hash, At: time.Now(), Kind: KindAnchor}
+		r := verify("org:5", rows[3:], headOf(rows), []Checkpoint{p2, p4, forged}, keys)
+		if r.Status != StatusFailed || !strings.Contains(kinds(r), ProblemSignature) || !strings.Contains(kinds(r), ProblemMissingStart) {
+			t.Fatalf("forged unsigned anchor: %s %+v", kinds(r), r)
+		}
+	})
+	t.Run("signed periodic checkpoint as the start", func(t *testing.T) {
+		// Delete the rows up to an hourly signed checkpoint.
+		r := verify("org:5", rows[2:], headOf(rows), []Checkpoint{p2, p4}, keys)
+		if r.Status != StatusFailed || !strings.Contains(kinds(r), ProblemMissingStart) {
+			t.Fatalf("periodic start: %s", kinds(r))
+		}
+	})
+	t.Run("signed anchor younger than retention", func(t *testing.T) {
+		a := Checkpoint{ID: 3, ChainKey: "org:5", UptoSeq: 2, Hash: rows[1].Hash, At: time.Now(), Kind: KindAnchor}
+		young := a.At.Add(-24 * time.Hour)
+		a.RowAt = &young
+		keys.Sign(&a)
+		policy := Policy{Retention: 365 * 24 * time.Hour}
+		r := verifyWith("org:5", rows[2:], headOf(rows), []Checkpoint{p2, p4, a}, keys, policy)
+		if r.Status != StatusFailed || kinds(r) != ProblemAnchor {
+			t.Fatalf("young anchor: %s", kinds(r))
+		}
+		old := a.At.Add(-400 * 24 * time.Hour)
+		a.RowAt = &old
+		if r := verifyWith("org:5", rows[2:], headOf(rows), []Checkpoint{p2, p4, a}, keys, policy); !r.OK {
+			t.Fatalf("anchor past retention: %+v", r)
+		}
+	})
+}
+
+// AUDIT_SIGNING_SINCE: unsigned checkpoints from before signing started
+// are accepted as pre-key history (unproven, not failed), but an unsigned
+// anchor can't start the chain past a signed checkpoint.
+func TestVerify_SigningSince(t *testing.T) {
+	keys := testKeys(t)
+	rows := chain("global", nil, 6)
+	before := time.Now().Add(-48 * time.Hour)
+	preKey := Checkpoint{ID: 1, ChainKey: "global", UptoSeq: 2, Hash: rows[1].Hash, At: before, Kind: KindAnchor}
+	p4 := signed(keys, 2, KindPeriodic, rows[3])
+	if r := verify("global", rows[2:], headOf(rows), []Checkpoint{preKey, p4}, keys); r.Status != StatusFailed || kinds(r) != ProblemSignature+","+ProblemMissingStart {
+		t.Fatalf("pre-key anchor without AUDIT_SIGNING_SINCE: %s", kinds(r))
+	}
+	since := keys.WithSince(before.Add(time.Hour))
+	r := verify("global", rows[2:], headOf(rows), []Checkpoint{preKey, p4}, since)
+	if r.Status != StatusUnproven || len(r.Problems) != 0 {
+		t.Fatalf("pre-key anchor with AUDIT_SIGNING_SINCE: %+v", r)
+	}
+	// A backdated unsigned anchor past a signed checkpoint.
+	forged := Checkpoint{ID: 3, ChainKey: "global", UptoSeq: 4, Hash: rows[3].Hash, At: before, Kind: KindAnchor}
+	if r := verify("global", rows[4:], headOf(rows), []Checkpoint{preKey, p4, forged}, since); r.Status != StatusFailed || kinds(r) != ProblemAnchor {
+		t.Fatalf("backdated anchor past signed history: %s", kinds(r))
+	}
+	// An unsigned checkpoint written after AUDIT_SIGNING_SINCE fails.
+	late := Checkpoint{ID: 4, ChainKey: "global", UptoSeq: 5, Hash: rows[4].Hash, At: time.Now(), Kind: KindPeriodic}
+	if r := verify("global", rows[2:], headOf(rows), []Checkpoint{preKey, p4, late}, since); kinds(r) != ProblemSignature {
+		t.Fatalf("unsigned after AUDIT_SIGNING_SINCE: %s", kinds(r))
+	}
+	env := map[string]string{EnvSigningSince: "2026-10-01"}
+	k, err := LoadKeyring(func(n string) string { return env[n] })
+	if err != nil || !k.Since().Equal(time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("load since: %v %v", k.Since(), err)
+	}
+	env[EnvSigningSince] = "yesterday"
+	if _, err := LoadKeyring(func(n string) string { return env[n] }); err == nil {
+		t.Fatal("bad AUDIT_SIGNING_SINCE accepted")
+	}
+}
+
+// #2439 L1: actor_id_at_write is hashed when set (and left out of the
+// text when not, so older rows keep their hashes), and actor_user_id must
+// be it or NULL.
+func TestVerify_ActorAtWrite(t *testing.T) {
+	r := chain("global", nil, 1)[0]
+	without := Canonical(r)
+	r.ActorIDAtWrite = ip(5)
+	with := Canonical(r)
+	if strings.Contains(without, "actor_id_at_write") || !strings.Contains(with, `"actor_id_at_write": 5`) {
+		t.Fatalf("canonical:\n%s\n%s", without, with)
+	}
+	keys := testKeys(t)
+	build := func(actor *int64) []Row {
+		rows := chain("global", nil, 2)
+		rows[1].ActorIDAtWrite = ip(5)
+		rows[1].Hash = LinkHash(rows[1].PrevHash, Canonical(rows[1]))
+		rows[1].ActorUserID = actor
+		return rows
+	}
+	for name, tc := range map[string]struct {
+		actor *int64
+		want  string
+	}{"same": {ip(5), ""}, "user deleted": {nil, ""}, "re-pointed": {ip(6), ProblemActor}} {
+		rows := build(tc.actor)
+		cp := signed(keys, 1, KindPeriodic, rows[1])
+		if got := kinds(verify("global", rows, headOf(rows), []Checkpoint{cp}, keys)); got != tc.want {
+			t.Errorf("%s: problems %q, want %q", name, got, tc.want)
+		}
 	}
 }
 

@@ -35,10 +35,10 @@ func (r *Repo) AuditChainHead(ctx context.Context, key string) (*auditchain.Head
 	return &h, nil
 }
 
-const checkpointCols = `id, chain_key, upto_seq, hash, at, kind, key_id, signature`
+const checkpointCols = `id, chain_key, upto_seq, hash, at, kind, key_id, signature, row_at`
 
 func scanCheckpoint(row rowScanner, c *auditchain.Checkpoint) error {
-	return row.Scan(&c.ID, &c.ChainKey, &c.UptoSeq, &c.Hash, &c.At, &c.Kind, &c.KeyID, &c.Signature)
+	return row.Scan(&c.ID, &c.ChainKey, &c.UptoSeq, &c.Hash, &c.At, &c.Kind, &c.KeyID, &c.Signature, &c.RowAt)
 }
 
 // AuditCheckpoints lists a chain's checkpoints, oldest first.
@@ -98,7 +98,7 @@ func (r *Repo) AuditActionAt(ctx context.Context, key string, seq int64) (string
 const chainRowCols = `id, at, actor_email, via_token, org_id, project_id, action, target_type, target_id, summary, details::text,
 	schema_version, actor_type, auth_method, token_id, session_id, on_behalf_of_user_id, agent_profile, target_name,
 	outcome, reason, source_ip::text, user_agent, client, request_id, trace_id, "before"::text, "after"::text,
-	chain_key, chain_seq, prev_hash, hash`
+	chain_key, chain_seq, prev_hash, hash, actor_user_id, actor_id_at_write`
 
 // ReadAuditChain reads one chain from a single snapshot, so a verification
 // running while entries are written or purged sees a consistent chain: it
@@ -141,15 +141,16 @@ func (r *Repo) ReadAuditChain(ctx context.Context, key string, start func(*audit
 	defer rs.Close()
 	for rs.Next() {
 		var c auditchain.Row
-		var orgID, projectID, onBehalf *int32
+		var orgID, projectID, onBehalf, actor, actorAtWrite *int32
 		var schema int16
 		if err := rs.Scan(&c.ID, &c.At, &c.ActorEmail, &c.ViaToken, &orgID, &projectID, &c.Action, &c.TargetType, &c.TargetID,
 			&c.Summary, &c.Details, &schema, &c.ActorType, &c.AuthMethod, &c.TokenID, &c.SessionID, &onBehalf, &c.AgentProfile,
 			&c.TargetName, &c.Outcome, &c.Reason, &c.SourceIP, &c.UserAgent, &c.Client, &c.RequestID, &c.TraceID, &c.Before, &c.After,
-			&c.ChainKey, &c.ChainSeq, &c.PrevHash, &c.Hash); err != nil {
+			&c.ChainKey, &c.ChainSeq, &c.PrevHash, &c.Hash, &actor, &actorAtWrite); err != nil {
 			return fmt.Errorf("read audit chain row: %w", err)
 		}
 		c.OrgID, c.ProjectID, c.OnBehalfOfUserID = widen(orgID), widen(projectID), widen(onBehalf)
+		c.ActorUserID, c.ActorIDAtWrite = widen(actor), widen(actorAtWrite)
 		c.SchemaVersion = int64(schema)
 		row(c)
 	}
@@ -164,34 +165,39 @@ func widen(n *int32) *int64 {
 	return &v
 }
 
-// PurgeAuditChain deletes the rows of chain key written before cutoff,
-// through audit_purge(): it signs (sign) and stores an anchor checkpoint at
-// the last row it deletes, then deletes up to it, in one transaction. Only a
-// prefix of the chain is deleted, so a row older than cutoff that follows a
-// newer one (clock skew between writers) waits for the next run. It returns
-// the anchor and how many rows went (nil, 0 when nothing was due).
-func (r *Repo) PurgeAuditChain(ctx context.Context, key string, cutoff time.Time, sign func(*auditchain.Checkpoint)) (*auditchain.Checkpoint, int64, error) {
+// AuditPurgeBatch is the most rows one retention step deletes: each step
+// is its own transaction with its own anchor, so the first purge of a large
+// chain doesn't hold one long delete (#2439 L7). A variable for tests.
+var AuditPurgeBatch = 5000
+
+// PurgeAuditChain deletes up to batch of the oldest rows of chain key
+// written before cutoff, through audit_purge(): it reads the last row it
+// will delete, signs (sign) an anchor checkpoint at it, and audit_purge
+// stores the anchor and deletes up to it, in one transaction. Only a prefix
+// of the chain is deleted, so a row older than cutoff that follows a newer
+// one (clock skew between writers) waits for the next run. Writers to the
+// chain aren't blocked: the rows deleted are all below its head. It returns
+// the anchor and how many rows went (nil, 0 when nothing was due); call it
+// again until it returns nil to purge everything due.
+func (r *Repo) PurgeAuditChain(ctx context.Context, key string, cutoff time.Time, batch int, sign func(*auditchain.Checkpoint)) (*auditchain.Checkpoint, int64, error) {
+	if batch <= 0 {
+		batch = AuditPurgeBatch
+	}
 	tx, err := r.db.Begin(ctx)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	// Hold the head so nothing joins the chain meanwhile.
-	var head auditchain.Head
-	if err := tx.QueryRow(ctx, `SELECT seq, hash FROM audit_chain_heads WHERE chain_key = $1 FOR UPDATE`, key).Scan(&head.Seq, &head.Hash); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, 0, nil
-		}
-		return nil, 0, fmt.Errorf("lock audit chain head: %w", err)
-	}
-	// The last seq before the first row that is still in retention.
+	// The last seq of this batch: below the first row still in retention,
+	// and at most batch rows past the chain's first row.
 	var upto int64
 	var hash []byte
 	err = tx.QueryRow(ctx, `
-		WITH keep AS (SELECT MIN(chain_seq) AS seq FROM audit_log WHERE chain_key = $1 AND at >= $2)
-		SELECT l.chain_seq, l.hash FROM audit_log l, keep
-		WHERE l.chain_key = $1 AND l.chain_seq < COALESCE(keep.seq, $3 + 1)
-		ORDER BY l.chain_seq DESC LIMIT 1`, key, cutoff, head.Seq).Scan(&upto, &hash)
+		WITH keep AS (SELECT MIN(chain_seq) AS seq FROM audit_log WHERE chain_key = $1 AND at >= $2),
+		     first AS (SELECT MIN(chain_seq) AS seq FROM audit_log WHERE chain_key = $1)
+		SELECT l.chain_seq, l.hash FROM audit_log l, keep, first
+		WHERE l.chain_key = $1 AND (keep.seq IS NULL OR l.chain_seq < keep.seq) AND l.chain_seq < first.seq + $3
+		ORDER BY l.chain_seq DESC LIMIT 1`, key, cutoff, batch).Scan(&upto, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, 0, nil // nothing old enough
 	}
@@ -200,17 +206,28 @@ func (r *Repo) PurgeAuditChain(ctx context.Context, key string, cutoff time.Time
 	}
 	cp := &auditchain.Checkpoint{ChainKey: key, UptoSeq: upto, Hash: hash, At: time.Now(), Kind: auditchain.KindAnchor}
 	sign(cp)
-	if err := insertCheckpoint(ctx, tx, cp); err != nil {
-		return nil, 0, err
-	}
 	var n int64
-	if err := tx.QueryRow(ctx, `SELECT audit_purge($1, $2)`, key, upto).Scan(&n); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT anchor_id, deleted, row_at FROM audit_purge($1, $2, $3, $4, $5, $6)`,
+		key, upto, hash, cp.At, cp.KeyID, cp.Signature).Scan(&cp.ID, &n, &cp.RowAt); err != nil {
 		return nil, 0, fmt.Errorf("audit_purge: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, 0, err
 	}
 	return cp, n, nil
+}
+
+// AuditPurgeRoleReady reports whether audit_purge() belongs to the
+// amp_audit_purge role (migration 035's setup, run by a superuser): until
+// it does, retention deletes nothing.
+func (r *Repo) AuditPurgeRoleReady(ctx context.Context) (bool, error) {
+	var owner string
+	err := r.db.QueryRow(ctx, `SELECT p.proowner::regrole::text FROM pg_proc p
+		WHERE p.oid = 'audit_purge(TEXT, BIGINT, BYTEA, TIMESTAMPTZ, TEXT, BYTEA)'::regprocedure`).Scan(&owner)
+	if err != nil {
+		return false, fmt.Errorf("audit_purge owner: %w", err)
+	}
+	return owner == "amp_audit_purge", nil
 }
 
 // ---- Durable audit outbox (audit_outbox, filled by a trigger) ----
