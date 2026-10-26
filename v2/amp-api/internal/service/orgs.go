@@ -163,11 +163,16 @@ func (s *Service) RenameOrg(ctx context.Context, p authz.Principal, orgID int, n
 	if strings.TrimSpace(name) == "" {
 		return nil, authz.BadRequest("name is required")
 	}
+	var before map[string]any
+	if prev, err := s.Repo.GetOrg(ctx, orgID); err == nil {
+		before = map[string]any{"name": prev.Name}
+	}
 	if err := s.Repo.RenameOrg(ctx, orgID, strings.TrimSpace(name)); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "org.rename", OrgID: intRef(orgID), TargetType: "org", TargetID: idStr(orgID),
-		Summary: "renamed org to " + strings.TrimSpace(name)})
+		TargetName: strings.TrimSpace(name), Summary: "renamed org to " + strings.TrimSpace(name),
+		Before: before, After: map[string]any{"name": strings.TrimSpace(name)}})
 	return s.Repo.GetOrg(ctx, orgID)
 }
 
@@ -243,7 +248,8 @@ func (s *Service) AddOrgMember(ctx context.Context, p authz.Principal, orgID int
 		return nil, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "org.member.set", OrgID: intRef(orgID), TargetType: "user", TargetID: idStr(userID),
-		Summary: "set " + s.userLabel(ctx, userID) + " to org " + role + roleChange(current), Details: map[string]any{"role": role, "previous": current}})
+		Summary: "set " + s.userLabel(ctx, userID) + " to org " + role + roleChange(current), Details: map[string]any{"role": role, "previous": current},
+		Before: roleValue(current), After: roleValue(role)})
 	return &MemberResult{Added: true, UserID: userID, Role: role}, nil
 }
 
@@ -270,7 +276,8 @@ func (s *Service) RemoveOrgMember(ctx context.Context, p authz.Principal, orgID 
 		return 0, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "org.member.remove", OrgID: intRef(orgID), TargetType: "user", TargetID: idStr(userID),
-		Summary: "removed " + s.userLabel(ctx, userID) + " from the org (was " + current + ")", Details: map[string]any{"previous": current}})
+		Summary: "removed " + s.userLabel(ctx, userID) + " from the org (was " + current + ")", Details: map[string]any{"previous": current},
+		Before: roleValue(current), After: roleValue("")})
 	return userID, nil
 }
 
@@ -386,11 +393,13 @@ func (s *Service) AddTeamMember(ctx context.Context, p authz.Principal, teamID i
 		}
 		return nil, err
 	}
+	previous, _ := s.Repo.GetTeamRole(ctx, teamID, userID)
 	if err := s.Repo.SetTeamMember(ctx, teamID, userID, role); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "team.member.set", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
-		Summary: "set " + s.userLabel(ctx, userID) + " to " + role + " of team " + team.Name, Details: map[string]any{"user_id": userID, "role": role}})
+		TargetName: team.Name, Summary: "set " + s.userLabel(ctx, userID) + " to " + role + " of team " + team.Name,
+		Details: map[string]any{"user_id": userID, "role": role, "previous": previous}, Before: roleValue(previous), After: roleValue(role)})
 	return &MemberResult{Added: true, UserID: userID, Role: role}, nil
 }
 
@@ -406,11 +415,13 @@ func (s *Service) RemoveTeamMember(ctx context.Context, p authz.Principal, teamI
 	if err != nil {
 		return 0, err
 	}
+	previous, _ := s.Repo.GetTeamRole(ctx, teamID, userID)
 	if err := s.Repo.RemoveTeamMember(ctx, teamID, userID); err != nil {
 		return 0, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "team.member.remove", OrgID: intRef(team.OrgID), TargetType: "team", TargetID: idStr(teamID),
-		Summary: "removed " + s.userLabel(ctx, userID) + " from team " + team.Name, Details: map[string]any{"user_id": userID}})
+		TargetName: team.Name, Summary: "removed " + s.userLabel(ctx, userID) + " from team " + team.Name,
+		Details: map[string]any{"user_id": userID, "previous": previous}, Before: roleValue(previous), After: roleValue("")})
 	return userID, nil
 }
 
@@ -483,8 +494,12 @@ func (s *Service) invite(ctx context.Context, p authz.Principal, inv domain.Invi
 	s.audit(ctx, p, domain.AuditEntry{Action: "invite.create", OrgID: intRef(inv.OrgID), TargetType: "invite", TargetID: idStr(created.ID),
 		Summary: "invited " + inv.Email + " as org " + inv.OrgRole, Details: map[string]any{"team_id": inv.TeamID, "team_role": inv.TeamRole}})
 	if u, err := s.Repo.GetUserByEmail(ctx, inv.Email); err == nil {
-		if _, err := s.Repo.AcceptInvites(ctx, u.ID, u.Email); err != nil {
+		accepted, err := s.Repo.AcceptInvitesList(ctx, u.ID, u.Email)
+		if err != nil {
 			return nil, err
+		}
+		for _, a := range accepted {
+			s.auditInviteAccept(ctx, p, u.ID, u.Email, a, "at once (the user already has an AMP account)")
 		}
 		return &MemberResult{Added: true, UserID: u.ID}, nil
 	}
@@ -543,11 +558,13 @@ func (s *Service) SetProjectTeam(ctx context.Context, p authz.Principal, project
 			return nil, err
 		}
 	}
+	previous := s.projectTeamRole(ctx, projectID, teamID)
 	if err := s.Repo.SetProjectTeam(ctx, projectID, teamID, role); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "project.team.set", ProjectID: intRef(projectID), TargetType: "team", TargetID: idStr(teamID),
-		Summary: "linked " + s.teamLabel(ctx, teamID) + " to the project as " + role, Details: map[string]any{"role": role}})
+		Summary: "linked " + s.teamLabel(ctx, teamID) + " to the project as " + role, Details: map[string]any{"role": role, "previous": previous},
+		Before: roleValue(previous), After: roleValue(role)})
 	return s.Repo.ListProjectTeams(ctx, projectID)
 }
 
@@ -564,11 +581,13 @@ func (s *Service) RemoveProjectTeam(ctx context.Context, p authz.Principal, proj
 			return nil, err
 		}
 	}
+	previous := s.projectTeamRole(ctx, projectID, teamID)
 	if err := s.Repo.RemoveProjectTeam(ctx, projectID, teamID); err != nil {
 		return nil, err
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "project.team.remove", ProjectID: intRef(projectID), TargetType: "team", TargetID: idStr(teamID),
-		Summary: "unlinked " + s.teamLabel(ctx, teamID) + " from the project"})
+		Summary: "unlinked " + s.teamLabel(ctx, teamID) + " from the project", Details: map[string]any{"previous": previous},
+		Before: roleValue(previous), After: roleValue("")})
 	return s.Repo.ListProjectTeams(ctx, projectID)
 }
 
@@ -701,4 +720,28 @@ func roleChange(previous string) string {
 		return " (added)"
 	}
 	return " (was " + previous + ")"
+}
+
+// roleValue is a membership role as an audit before/after value; "" (no
+// membership) is {"role": null}.
+func roleValue(role string) map[string]any {
+	if role == "" {
+		return map[string]any{"role": nil}
+	}
+	return map[string]any{"role": role}
+}
+
+// projectTeamRole is teamID's role on projectID ("" when not linked, or
+// when the links can't be read).
+func (s *Service) projectTeamRole(ctx context.Context, projectID, teamID int) string {
+	links, err := s.Repo.ListProjectTeams(ctx, projectID)
+	if err != nil {
+		return ""
+	}
+	for _, l := range links {
+		if l.TeamID == teamID {
+			return l.Role
+		}
+	}
+	return ""
 }

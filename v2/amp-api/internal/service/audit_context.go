@@ -174,6 +174,13 @@ type deniedState struct {
 // action and target is written per 10 minutes: the next one written carries
 // how many were skipped in details.suppressed.
 func (s *Service) auditDenied(ctx context.Context, p authz.Principal, action string, e domain.AuditEntry, err error) {
+	// The listener's generic access.denied hook skips a request whose
+	// refusal is recorded here (even when the row below is rate-limited).
+	req := p.Req
+	if req == nil {
+		req, _ = reqctx.FromContext(ctx)
+	}
+	req.MarkDeniedAudited()
 	e.Action = deniedAction(action)
 	e.Outcome = domain.AuditOutcomeDenied
 	if e.Reason == "" && err != nil {

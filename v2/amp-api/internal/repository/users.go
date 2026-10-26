@@ -91,6 +91,32 @@ func userDest(u *domain.User) []any {
 //     and return a sentinel error so callers can handle it (e.g., log and
 //     continue without an identity rather than failing the request).
 func (r *Repo) UpsertUserFromClaims(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool) (*domain.User, error) {
+	u, _, err := r.ProvisionUserFromClaims(ctx, subject, email, displayName, bootstrapAdmins)
+	return u, err
+}
+
+// Provisioned is what a sign-in's JIT provisioning changed, for the audit
+// log: whether this sign-in created the account (it had no global role
+// yet, so the initial one was granted), and the pending invites it
+// accepted, each granting org and team roles.
+type Provisioned struct {
+	Created     bool
+	InitialRole string
+	Invites     []domain.Invite
+}
+
+// ProvisionUserFromClaims is UpsertUserFromClaims that also reports what
+// provisioning changed (Provisioned; never nil when err is nil).
+func (r *Repo) ProvisionUserFromClaims(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool) (*domain.User, *Provisioned, error) {
+	pv := &Provisioned{}
+	u, err := r.upsertUserFromClaims(ctx, subject, email, displayName, bootstrapAdmins, pv)
+	if err != nil {
+		return nil, nil, err
+	}
+	return u, pv, nil
+}
+
+func (r *Repo) upsertUserFromClaims(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool, pv *Provisioned) (*domain.User, error) {
 	if email == "" {
 		return nil, EmptyEmailClaimError
 	}
@@ -123,19 +149,19 @@ func (r *Repo) UpsertUserFromClaims(ctx context.Context, subject, email, display
 			// A new subject arrived with an email that already exists — fall
 			// back to updating the existing row's subject and other fields
 			// instead of failing forever.
-			return r.updateExistingUserByEmail(ctx, subject, email, displayName, bootstrapAdmins)
+			return r.updateExistingUserByEmail(ctx, subject, email, displayName, bootstrapAdmins, pv)
 		}
 		return nil, fmt.Errorf("upsert user: %w", err)
 	}
 
-	return r.finishUpsert(ctx, u, email, bootstrapAdmins)
+	return r.finishUpsert(ctx, u, email, bootstrapAdmins, pv)
 }
 
 // updateExistingUserByEmail handles the fallback path when a new OIDC subject
 // presents an email that already belongs to an existing user row. We update
 // that row's subject (and display name if provided) so the provisioning
 // succeeds, then continue with the normal role-granting flow.
-func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool) (*domain.User, error) {
+func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, displayName string, bootstrapAdmins map[string]bool, pv *Provisioned) (*domain.User, error) {
 	u := &domain.User{}
 	err := r.db.QueryRow(ctx,
 		`UPDATE users
@@ -153,13 +179,13 @@ func (r *Repo) updateExistingUserByEmail(ctx context.Context, subject, email, di
 	if err != nil {
 		return nil, fmt.Errorf("update existing user by email: %w", err)
 	}
-	return r.finishUpsert(ctx, u, email, bootstrapAdmins)
+	return r.finishUpsert(ctx, u, email, bootstrapAdmins, pv)
 }
 
 // finishUpsert completes the provisioning flow after a successful user row
 // upsert: fetches roles, grants the initial role if needed, and returns the
 // populated user object.
-func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, bootstrapAdmins map[string]bool) (*domain.User, error) {
+func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, bootstrapAdmins map[string]bool, pv *Provisioned) (*domain.User, error) {
 	roles, err := r.getUserRoles(ctx, u.ID)
 	if err != nil {
 		return nil, err
@@ -185,6 +211,7 @@ func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, b
 			return nil, fmt.Errorf("grant initial role: %w", err)
 		}
 		roles = []string{role}
+		pv.Created, pv.InitialRole = true, role
 	}
 
 	u.Roles = roles
@@ -198,9 +225,11 @@ func (r *Repo) finishUpsert(ctx context.Context, u *domain.User, email string, b
 		return nil, fmt.Errorf("check invites: %w", err)
 	}
 	if pending {
-		if _, err := r.AcceptInvites(ctx, u.ID, email); err != nil {
+		accepted, err := r.AcceptInvitesList(ctx, u.ID, email)
+		if err != nil {
 			return nil, fmt.Errorf("accept invites: %w", err)
 		}
+		pv.Invites = accepted
 	}
 	return u, nil
 }
@@ -349,4 +378,10 @@ func (r *Repo) DeleteUser(ctx context.Context, userID int) error {
 	}
 	_, err := r.db.Exec(ctx, `DELETE FROM users WHERE id = $1`, userID)
 	return err
+}
+
+// UserRoles returns a user's global roles (for the audit log's before and
+// after on a role change).
+func (r *Repo) UserRoles(ctx context.Context, userID int) ([]string, error) {
+	return r.getUserRoles(ctx, userID)
 }

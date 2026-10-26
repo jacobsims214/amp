@@ -112,13 +112,17 @@ func (h *RestHandler) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RestHandler) Register(mux *http.ServeMux) {
+	h.register(&deniedMux{mux: mux, h: h})
+}
+
+func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/projects", h.projects)
 	mux.HandleFunc("/api/projects/", h.projectSub)
 	mux.HandleFunc("/api/epics/", h.epicSub)
 	mux.HandleFunc("/api/stories/", h.storySub)
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
-	mux.HandleFunc("/api/events", h.events)
+	mux.mux.HandleFunc("/api/events", h.events) // SSE: streams, never a 403 after it starts
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
 	mux.HandleFunc("/api/teams/", h.teamSub)
@@ -838,6 +842,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		bundle.KBDocs = kbDocs
+		h.svc.RecordProjectExport(r.Context(), pr, projectID, bundle)
 
 		// Set Content-Disposition header for file download
 		filename := fmt.Sprintf("amp-export-%s-%s.json", bundle.Project.Code, time.Now().Format("2006-01-02"))
@@ -1789,6 +1794,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 500)
 				return
 			}
+			h.svc.AuditKB(r.Context(), pr, "kb.write", k, body.Path, map[string]any{"reason": strings.TrimSpace(body.Reason)})
 			jsonOK(w, doc)
 
 		case http.MethodDelete:
@@ -1805,6 +1811,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 500)
 				return
 			}
+			h.svc.AuditKB(r.Context(), pr, "kb.delete", k, path, nil)
 			jsonOK(w, map[string]interface{}{"deleted": true, "path": path})
 
 		default:

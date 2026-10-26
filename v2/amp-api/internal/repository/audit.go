@@ -184,3 +184,23 @@ func (r *Repo) CountArtifactVersions(ctx context.Context, id int) (int, error) {
 	err := r.db.QueryRow(ctx, `SELECT COUNT(*) FROM artifact_versions WHERE artifact_id = $1`, id).Scan(&n)
 	return n, err
 }
+
+// AuditLoginSeen reports whether an auth.login row already exists for the
+// Dex session sessionID (any replica wrote it), so a sign-in is recorded
+// once per session (index idx_audit_login_session, migration 032).
+func (r *Repo) AuditLoginSeen(ctx context.Context, sessionID string) (bool, error) {
+	var seen bool
+	err := r.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM audit_log WHERE action = 'auth.login' AND session_id = $1)`, sessionID).Scan(&seen)
+	return seen, err
+}
+
+// AuditTokenIPSeen reports whether any audit row since since was made with
+// API token tokenID from address ip (index idx_audit_token_ip, migration
+// 032). token.use.new_ip is written when this is false.
+func (r *Repo) AuditTokenIPSeen(ctx context.Context, tokenID int64, ip string, since time.Time) (bool, error) {
+	var seen bool
+	err := r.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM audit_log WHERE token_id = $1 AND source_ip = $2::inet AND at >= $3)`, tokenID, ip, since).Scan(&seen)
+	return seen, err
+}

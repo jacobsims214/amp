@@ -320,6 +320,10 @@ func main() {
 	mcpVerifier.ResourceMetadataURL = mcpCfg.PublicURL + "/.well-known/oauth-protected-resource"
 	mcpVerifier.Scope = strings.Join(mcpCfg.Scopes, " ")
 	restVerifier := verifier.WithAudiences("rest", restAudiences...)
+	// Sign-ins, accounts created at first sign-in, accepted invites, API
+	// token use from a new address, and rejected tokens go to the audit log.
+	authEvents := service.New(repo, registry, kbSvc).RecordAuthEvent
+	mcpVerifier.OnEvent, restVerifier.OnEvent = authEvents, authEvents
 	slog.Info("token audience policy", "mcp", mcpAudience, "rest", restAudiences, "ui_client", uiClientID)
 	if os.Getenv("OIDC_ISSUER_URL") != "" && uiClientID == "" {
 		slog.Warn("UI_CLIENT_ID and REST_AUDIENCES unset: no request counts as the web UI, so nobody can approve a plan")
