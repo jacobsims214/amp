@@ -4,7 +4,8 @@
 //!
 //! Layers, lowest to highest precedence (a later layer replaces the same file of an earlier one):
 //! 1. embedded: `v2/harness/assets/{agents,skills}` at build time;
-//! 2. user: `$XDG_CONFIG_HOME/amp-harness/{agents,skills}/` (else `~/.config/amp-harness/...`);
+//! 2. user: `<user config dir>/{agents,skills}/`: `--config-dir`, `AMP_HARNESS_CONFIG_DIR`, else
+//!    `$XDG_CONFIG_HOME/amp-harness`, else `~/.config/amp-harness` ([`amp_mcp::config_paths`]);
 //! 3. repo: `<repo>/.amp/harness/{agents,skills}/`.
 //!
 //! An agent is one file, `agents/<id>.md` (YAML frontmatter + system prompt), so an override
@@ -104,20 +105,22 @@ impl OverrideDirs {
         repo_root: Option<&Path>,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Self {
+        Self::from_paths(&amp_mcp::config_paths::current(env).with_repo(repo_root))
+    }
+
+    /// The user and repo directories of resolved [`amp_mcp::ConfigPaths`].
+    pub fn from_paths(paths: &amp_mcp::ConfigPaths) -> Self {
         Self {
-            user: user_dir(env),
-            repo: repo_root.map(|r| r.join(".amp").join("harness")),
+            user: paths.user_dir.clone(),
+            repo: paths.repo_dir.clone(),
         }
     }
 }
 
-/// `$XDG_CONFIG_HOME/amp-harness`, else `$HOME/.config/amp-harness` (same base as config.toml).
+/// The user config directory in effect: `--config-dir` / `AMP_HARNESS_CONFIG_DIR`, else
+/// `$XDG_CONFIG_HOME/amp-harness`, else `$HOME/.config/amp-harness` (same dir as config.toml).
 pub fn user_dir(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    let non_empty = |k: &str| env(k).filter(|v| !v.is_empty());
-    let base = non_empty("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| non_empty("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("amp-harness"))
+    amp_mcp::config_paths::current(env).user_dir
 }
 
 /// One agent role: frontmatter plus its system prompt.
@@ -255,8 +258,19 @@ impl Assets {
         Self::load(&OverrideDirs::default())
     }
 
-    /// The embedded assets with the user and repo overrides layered on top.
+    /// The embedded assets with the user and repo overrides layered on top, every repo file
+    /// included (for inspecting the files; sessions use [`Assets::load_gated`]).
     pub fn load(dirs: &OverrideDirs) -> Result<Self, AssetError> {
+        Self::load_gated(dirs, &crate::repo_trust::Gate::open())
+    }
+
+    /// [`Assets::load`], with each repo agent and skill only if `gate` trusts it as it is on disk
+    /// now (#2310): an untrusted repo file is left out, so the built-in or user one is used.
+    pub fn load_gated(
+        dirs: &OverrideDirs,
+        gate: &crate::repo_trust::Gate,
+    ) -> Result<Self, AssetError> {
+        use crate::repo_trust::{ItemKind, agent_fingerprint, skill_fingerprint};
         let manifest_file = EMBEDDED
             .get_file("manifest.json")
             .ok_or_else(|| AssetError::invalid("embedded manifest.json", "missing"))?;
@@ -293,12 +307,16 @@ impl Assets {
             (dirs.repo.as_deref(), Origin::Repo as fn(PathBuf) -> Origin),
         ] {
             let Some(root) = root else { continue };
+            let repo = dirs.repo.as_deref() == Some(root);
             for path in list_dir(&root.join(AGENTS_DIR))? {
                 let Some(id) = md_stem(&path) else { continue };
                 if !path.is_file() {
                     continue;
                 }
                 let text = read_utf8(&path)?;
+                if repo && !gate.allows(ItemKind::Agent, &id, &agent_fingerprint(text.as_bytes())) {
+                    continue;
+                }
                 let label = path.display().to_string();
                 agent_files.insert(id, (text, origin(path), label));
             }
@@ -307,8 +325,20 @@ impl Assets {
                     continue;
                 }
                 let name = file_name(&skill_dir);
-                let files = skill_files.entry(name).or_default();
-                collect_disk(&skill_dir, &skill_dir, origin, files)?;
+                let mut found = BTreeMap::new();
+                collect_disk(&skill_dir, &skill_dir, origin, &mut found)?;
+                if repo
+                    && !gate.allows(
+                        ItemKind::Skill,
+                        &name,
+                        &skill_fingerprint(
+                            found.iter().map(|(k, f)| (k.as_str(), f.bytes.as_slice())),
+                        ),
+                    )
+                {
+                    continue;
+                }
+                skill_files.entry(name).or_default().extend(found);
             }
         }
 
@@ -351,6 +381,64 @@ impl Assets {
 
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The text of the embedded (built-in) agent file `id`, if there is one.
+    pub fn embedded_agent_text(id: &str) -> Option<&'static str> {
+        EMBEDDED
+            .get_file(format!("{AGENTS_DIR}/{id}.md"))
+            .and_then(|f| f.contents_utf8())
+    }
+
+    /// The embedded (built-in) skill file `<name>/<rel>`, if there is one.
+    pub fn embedded_skill_file(name: &str, rel: &str) -> Option<&'static [u8]> {
+        EMBEDDED
+            .get_file(format!("{SKILLS_DIR}/{name}/{rel}"))
+            .map(|f| f.contents())
+    }
+
+    /// Whether a built-in skill `name` exists.
+    pub fn is_embedded_skill(name: &str) -> bool {
+        EMBEDDED.get_dir(format!("{SKILLS_DIR}/{name}")).is_some()
+    }
+
+    /// Adds or replaces agent `id` with `text` as if it had been read from `origin`, with the same
+    /// checks as [`Assets::load`]. The CLI validates a new or edited agent this way before it
+    /// writes the file.
+    pub fn put_agent(&mut self, id: &str, text: &str, origin: Origin) -> Result<(), AssetError> {
+        let label = match &origin {
+            Origin::Embedded => format!("embedded {AGENTS_DIR}/{id}.md"),
+            Origin::User(p) | Origin::Repo(p) => p.display().to_string(),
+        };
+        let asset = AgentAsset::parse(id, text, origin, &label)?;
+        self.agents.insert(id.to_owned(), asset);
+        Ok(())
+    }
+
+    /// Adds or replaces file `rel` (`/`-separated, e.g. `SKILL.md`) of skill `name` (creating
+    /// the skill), with the same checks as [`Assets::load`].
+    pub fn put_skill_file(
+        &mut self,
+        name: &str,
+        rel: &str,
+        bytes: Vec<u8>,
+        origin: Origin,
+    ) -> Result<(), AssetError> {
+        if !valid_name(name) {
+            return Err(AssetError::invalid(
+                format!("{SKILLS_DIR}/{name}"),
+                "skill directory name must be lowercase letters, digits and hyphens",
+            ));
+        }
+        let mut files = self
+            .skills
+            .get(name)
+            .map(|s| s.files.clone())
+            .unwrap_or_default();
+        files.insert(rel.to_owned(), SkillFile { bytes, origin });
+        let skill = SkillAsset::from_files(name, files)?;
+        self.skills.insert(name.to_owned(), skill);
+        Ok(())
     }
 
     /// The TUI's default role: the manifest's `default_agent`, else the first primary agent.
@@ -446,8 +534,16 @@ fn collect_disk(
     Ok(())
 }
 
+/// Every file of a skill directory on disk (the same files [`Assets::load`] takes: dot-names
+/// skipped), by `/`-separated relative path.
+pub(crate) fn read_skill_dir(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, AssetError> {
+    let mut files = BTreeMap::new();
+    collect_disk(dir, dir, Origin::Repo, &mut files)?;
+    Ok(files.into_iter().map(|(k, f)| (k, f.bytes)).collect())
+}
+
 /// Sorted entries of a directory; a missing directory is empty.
-fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, AssetError> {
+pub(crate) fn list_dir(dir: &Path) -> Result<Vec<PathBuf>, AssetError> {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -484,14 +580,14 @@ fn rel_key(rel: &Path) -> String {
         .join("/")
 }
 
-fn file_name(path: &Path) -> String {
+pub(crate) fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
 /// `amp-worker-backend` for `.../amp-worker-backend.md`; `None` for anything else.
-fn md_stem(path: &Path) -> Option<String> {
+pub(crate) fn md_stem(path: &Path) -> Option<String> {
     if path.extension()? != "md" {
         return None;
     }
@@ -499,7 +595,7 @@ fn md_stem(path: &Path) -> Option<String> {
 }
 
 /// Lowercase letters, digits and single hyphens, as rpi's skill names (and AMP agent ids).
-fn valid_name(name: &str) -> bool {
+pub fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name

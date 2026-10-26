@@ -76,12 +76,9 @@ pub async fn run(command: DebugCommand) -> Result<(), CliError> {
 
 async fn render_chrome(args: RenderChromeArgs) -> Result<(), CliError> {
     let env = |k: &str| std::env::var(k).ok();
-    let config_path = args
-        .conn
-        .config
-        .clone()
-        .or_else(|| amp_mcp::default_config_path(&env));
-    let config = config_path.and_then(|p| std::fs::read_to_string(p).ok());
+    let config = conn::config_paths()
+        .user_file
+        .and_then(|p| std::fs::read_to_string(p).ok());
     let mut settings = ThemeSettings::resolve(args.theme.as_deref(), &env, config.as_deref())
         .map_err(|e| CliError::usage(e.to_string()))?;
     if let Some(color) = args.color {
@@ -132,7 +129,7 @@ async fn live_meta(args: &RenderChromeArgs) -> Result<(AmpMeta, bool), CliError>
         None => ProjectMarker::find_from_cwd()?.map(|m| m.project_id),
     };
     let settings = args.conn.settings()?;
-    let client = Arc::new(conn::connect(&settings).await?);
+    let client = Arc::new(conn::connect_cli(&settings).await?);
     let handle = MetaPoller::spawn(
         Some(client),
         MetaOptions {

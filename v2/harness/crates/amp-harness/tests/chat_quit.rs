@@ -71,6 +71,10 @@ impl WorkerHooks for SlowReporter {
         tokio::time::sleep(SLOW_REPORT).await;
         self.0.on_finish(worker, report).await;
     }
+
+    async fn release(&self, task_id: i64, why: &str) -> Result<(), String> {
+        self.0.release(task_id, why).await
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) {
@@ -232,6 +236,36 @@ impl Rig {
         self.amp.mock.calls_to("amp_report_run")
     }
 
+    /// `amp_set_task_state` calls: tickets handed back to ready (#2204).
+    fn releases(&self) -> Vec<Value> {
+        self.amp.mock.calls_to("amp_set_task_state")
+    }
+
+    /// Quits (nothing skips the wait) and expects every worker to settle.
+    async fn quit_and_settle(&mut self) {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            self.shell.quit(
+                &mut self.events,
+                &mut self.done,
+                std::future::pending::<()>(),
+                |_| {},
+            ),
+        )
+        .await
+        .expect("quit is bounded");
+        assert_eq!(outcome, QuitOutcome::Settled);
+    }
+
+    /// Waits until the supervisor has no live worker (its report and release are done).
+    async fn workers_gone(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !self.sup.workers().is_empty() {
+            assert!(Instant::now() < deadline, "the worker never finished");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     fn screen(&self) -> String {
         self.shell.view().render_plain(120, 40).join("\n")
     }
@@ -284,6 +318,11 @@ async fn quitting_mid_dispatch_waits_for_the_abandoned_run_report() {
         screen.contains("stopping 1 worker and reporting its runs"),
         "{screen}"
     );
+    // #2204: and the ticket is no longer in progress with nobody on it.
+    let released = r.releases();
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["task_id"], 2144);
+    assert_eq!(released[0]["state"], "backlog");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -305,14 +344,96 @@ async fn a_second_ctrl_c_skips_the_wait() {
     // The report is still on its way: the terminal names this ticket as unreported.
     assert_eq!(r.shell.live_tickets(), vec![2145]);
     assert!(r.reports().is_empty());
-    assert!(r.screen().contains("quitting without waiting"));
+    let screen = r.screen();
+    assert!(screen.contains("quitting without waiting"), "{screen}");
+    // #2204: the worker's own on_finish won't get to run, so the quit handed the ticket back.
+    assert!(
+        screen.contains("returning #2145 to ready in AMP"),
+        "{screen}"
+    );
+    assert_eq!(r.shell.released(), &[(2145, Ok(()))]);
+    let released = r.releases();
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["task_id"], 2145);
+    assert_eq!(released[0]["state"], "backlog");
+    assert!(
+        released[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("quit without waiting"),
+        "{}",
+        released[0]
+    );
 
     // Let the worker finish its report so the test leaves nothing running.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !r.sup.workers().is_empty() {
-        assert!(Instant::now() < deadline, "the worker never finished");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    r.workers_gone().await;
+}
+
+/// #2204: Ctrl+C with a worker of this chat running asks before anything stops: the reply (and so
+/// the worker) keeps going until the person confirms, and a confirmation that comes too late asks
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl_c_with_a_worker_running_asks_before_quitting() {
+    use amp_tui::shell::{CtrlC, QUIT_CONFIRM_FOR};
+
+    let mut r = rig("confirm-ctrl-c", 2147).await;
+    r.dispatch().await;
+    let t0 = Instant::now();
+    assert_eq!(r.shell.ctrl_c(t0).await, CtrlC::Confirm);
+    let screen = r.screen();
+    assert!(
+        screen.contains("a worker is running on #2147 — quit anyway? it will be returned to ready"),
+        "{screen}"
+    );
+    assert!(r.shell.is_running(), "nothing was stopped");
+    assert_eq!(r.shell.live_tickets(), vec![2147]);
+    assert!(r.reports().is_empty() && r.releases().is_empty());
+
+    // Too late: it asks again.
+    let late = t0 + QUIT_CONFIRM_FOR + Duration::from_millis(1);
+    assert_eq!(r.shell.ctrl_c(late).await, CtrlC::Confirm);
+    assert!(r.shell.is_running());
+    // In time: quit. The terminal loop then calls quit, which stops and reports the worker and
+    // hands its ticket back.
+    assert_eq!(
+        r.shell.ctrl_c(late + Duration::from_millis(500)).await,
+        CtrlC::Quit
+    );
+    r.quit_and_settle().await;
+    assert_eq!(r.reports().len(), 1);
+    let released = r.releases();
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["task_id"], 2147);
+    assert_eq!(released[0]["state"], "backlog");
+}
+
+/// #2204: `/quit` and Ctrl+D ask the same way; either confirms the other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slash_quit_and_ctrl_d_with_a_worker_running_ask_first() {
+    use amp_tui::{
+        Submit,
+        shell::{CtrlD, QUIT_CONFIRM_HINT},
+    };
+
+    let mut r = rig("confirm-quit", 2148).await;
+    r.dispatch().await;
+    assert_eq!(r.shell.submit("/quit").await, Submit::Continue);
+    assert!(r.shell.quit_confirm_pending());
+    assert_eq!(
+        r.shell.view().editor_hint().as_deref(),
+        Some(QUIT_CONFIRM_HINT)
+    );
+    assert!(
+        r.screen()
+            .contains("a worker is running on #2148 — quit anyway?")
+    );
+    assert!(r.shell.is_running());
+    assert_eq!(r.shell.ctrl_d(Instant::now()).await, CtrlD::Quit);
+    r.quit_and_settle().await;
+    assert_eq!(r.releases()[0]["task_id"], 2148);
+
+    // With nothing running any more, /quit quits at once.
+    assert_eq!(r.shell.submit("/quit").await, Submit::Quit);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -32,7 +32,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -59,6 +59,8 @@ use crate::{
     project::ProjectMarker,
     roles::Role,
     tools::call_json,
+    worker_session::{self, WorkerFeed},
+    workspace::{self, ENV_ISOLATION, Isolation, Placement, Repo, WORK_DIR},
 };
 
 /// The AMP tools that close a ticket. A worker that ends without one of them succeeding on its
@@ -83,6 +85,9 @@ pub struct SupervisorConfig {
     pub max_turns: u32,
     /// How long an aborted worker gets to wind down before it is dropped.
     pub abort_grace: Duration,
+    /// Where workers that edit files work (`isolation`, `AMP_HARNESS_WORKER_ISOLATION`, #2364).
+    /// Default `auto`: a git worktree in a usable repository, else a folder per ticket.
+    pub isolation: Isolation,
 }
 
 impl Default for SupervisorConfig {
@@ -92,6 +97,7 @@ impl Default for SupervisorConfig {
             timeout: Duration::from_secs(60 * 60),
             max_turns: 400,
             abort_grace: Duration::from_secs(10),
+            isolation: Isolation::Auto,
         }
     }
 }
@@ -106,6 +112,7 @@ struct WorkersTable {
     max_parallel: Option<usize>,
     timeout_minutes: Option<f64>,
     max_turns: Option<u32>,
+    isolation: Option<String>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -149,6 +156,9 @@ impl SupervisorConfig {
         if let Some(t) = w.max_turns {
             self.max_turns = t;
         }
+        if let Some(i) = w.isolation {
+            self.isolation = i.parse()?;
+        }
         Ok(())
     }
 
@@ -169,6 +179,9 @@ impl SupervisorConfig {
         }
         if let Some(v) = get(ENV_WORKER_MAX_TURNS) {
             self.max_turns = num(ENV_WORKER_MAX_TURNS, v)? as u32;
+        }
+        if let Some(v) = get(ENV_ISOLATION) {
+            self.isolation = v.parse().map_err(|e| format!("{ENV_ISOLATION}: {e}"))?;
         }
         Ok(())
     }
@@ -222,7 +235,8 @@ pub enum WorkerOutcome {
     Completed,
     /// The worker blocked its ticket with a question (`amp_block_task` succeeded).
     Blocked,
-    /// The worker stopped on its own without completing or blocking its ticket.
+    /// The worker stopped on its own without completing or blocking its ticket, or the repeat
+    /// guard stopped its model (#2225; `error` then says so).
     Stopped,
     /// The worker could not be set up (worktree, model key, ...) or its run failed (model error).
     Error,
@@ -266,6 +280,15 @@ pub struct WorkerInfo {
     pub cwd: PathBuf,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// Where it works (#2364): its own worktree, its own folder `amp-work/<ticket>/`, or the
+    /// manager's folder (`shared`, also for read-only roles).
+    pub workspace: Placement,
+    /// The manager's folder is in a git repository (usable for worktrees or not).
+    pub git: bool,
+    /// The role can edit files.
+    pub edits: bool,
+    /// The manager's folder (the person's files).
+    pub manager_cwd: PathBuf,
     /// The worker's live usage totals, updated as each event is emitted (so a before-tool hook on
     /// `amp_complete_task` sees every assistant message before that call).
     #[serde(skip)]
@@ -288,6 +311,8 @@ pub struct WorkerReport {
     pub cwd: PathBuf,
     pub worktree: Option<PathBuf>,
     pub branch: Option<String>,
+    /// `worktree`, `folder` or `shared` (#2364).
+    pub workspace: Placement,
     pub session_file: Option<PathBuf>,
     pub turns: u32,
     pub tool_calls: u32,
@@ -321,6 +346,15 @@ pub trait WorkerHooks: Send + Sync {
     /// goes back to the manager. Run reporting calls `amp_report_run` here when
     /// `!report.outcome.closed_ticket()` and adds a note to the report.
     async fn on_finish(&self, _worker: &WorkerInfo, _report: &mut WorkerReport) {}
+
+    /// Hands ticket `task_id` back after this process abandoned its worker (#2204): AMP moves it
+    /// from in progress to ready, so it isn't left in progress with nobody on it. `why` is one
+    /// line for the ticket's history. Run reporting calls it from `on_finish` for a `cancelled`
+    /// worker (the chat stopped or quit), and [`Supervisor::release_unfinished`] calls it when
+    /// the chat quits without waiting for `on_finish`.
+    async fn release(&self, _task_id: i64, _why: &str) -> Result<(), String> {
+        Err("no run reporting in this process".to_owned())
+    }
 }
 
 /// Why `amp_run_ticket` refused or failed before a worker was dispatched.
@@ -342,6 +376,70 @@ pub enum RunTicketError {
     Cancelled,
     #[error("bad arguments: {0}")]
     BadArguments(String),
+    /// `[workers] isolation = "worktree"` in a folder without a usable git repository (#2364).
+    #[error("{0}; nothing was dispatched")]
+    Workspace(String),
+    /// The person stopped the worker from the chat while it waited for a slot (#2252).
+    #[error(
+        "{by} stopped the worker on #{task_id} from the chat before it started; nothing was dispatched. Ask them before running it again"
+    )]
+    Stopped { task_id: i64, by: String },
+}
+
+/// Why [`Supervisor::stop_worker`] did nothing.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StopError {
+    #[error("#{0} has no worker in this chat")]
+    NotFound(i64),
+    #[error("the worker on #{0} has already finished")]
+    Finished(i64),
+    #[error("the worker on #{0} is already stopping")]
+    AlreadyStopping(i64),
+}
+
+/// A worker's session as the chat lists it (#2252): live (running or queued) or finished in this
+/// process.
+#[derive(Debug, Clone)]
+pub struct WorkerSessionInfo {
+    pub task_id: i64,
+    pub agent_id: String,
+    /// `Some` while the worker is live; `None` once it has finished.
+    pub phase: Option<WorkerPhase>,
+    pub model: Option<String>,
+    pub cwd: Option<PathBuf>,
+    /// When it started running (or was queued).
+    pub since: SystemTime,
+    /// When it finished.
+    pub ended: Option<SystemTime>,
+    pub totals: Totals,
+    /// How it ended (finished workers).
+    pub outcome: Option<WorkerOutcome>,
+    pub error: Option<String>,
+    /// Who stopped it from the chat, once someone has asked it to stop.
+    pub stopped_by: Option<String>,
+    pub session_file: Option<PathBuf>,
+    /// The worktree's branch, once the worker has one (#2347).
+    pub branch: Option<String>,
+    /// The worker model's context window in tokens, when known (#2347: the chat's `ctx N%`).
+    pub context_window: Option<u64>,
+}
+
+impl WorkerSessionInfo {
+    pub fn is_live(&self) -> bool {
+        self.phase.is_some()
+    }
+}
+
+/// A worker that finished in this process: its feed stays viewable.
+struct FinishedWorker {
+    info: WorkerSessionInfo,
+    feed: Arc<WorkerFeed>,
+}
+
+/// What a stop from the chat says (#2252): the worker's error, the abandoned run's note
+/// (`abandoned: cancelled: stopped by ... from the chat`) and the reason the ticket is handed back.
+pub fn stopped_from_chat(by: &str) -> String {
+    format!("stopped by {by} from the chat")
 }
 
 /// A worker's phase, for a `/workers` view.
@@ -367,11 +465,22 @@ pub struct WorkerStatus {
 
 struct LiveWorker {
     agent_id: String,
+    /// AMP has the dispatch (the ticket is in progress).
+    dispatched: bool,
+    /// Whether the worker has closed its ticket yet (set once it is running).
+    watch: Option<Arc<WorkerWatch>>,
     phase: WorkerPhase,
     model: Option<String>,
     cwd: Option<PathBuf>,
     since: SystemTime,
     totals: Option<Arc<Mutex<Totals>>>,
+    /// Every event the worker emitted, for the chat's session view (#2252).
+    feed: Arc<WorkerFeed>,
+    /// Cancelled by [`Supervisor::stop_worker`]; `stopped_by` says who.
+    stop: CancellationToken,
+    stopped_by: Arc<Mutex<Option<String>>>,
+    branch: Option<String>,
+    context_window: Option<u64>,
 }
 
 /// Runs workers for one manager. Share it as `Arc<Supervisor>`; [`Supervisor::tool`] is the
@@ -379,15 +488,23 @@ struct LiveWorker {
 pub struct Supervisor {
     rt: Arc<Runtime>,
     manager: ManagerContext,
+    /// The manager's `.amp.json` now: [`ManagerContext::project`] until the chat's folder is
+    /// linked to another project ([`Supervisor::set_project`], #2383).
+    project: Mutex<Option<ProjectMarker>>,
     config: SupervisorConfig,
     slots: Arc<Semaphore>,
     cancel: CancellationToken,
     hooks: Option<Arc<dyn WorkerHooks>>,
     live: Mutex<BTreeMap<i64, LiveWorker>>,
+    /// Workers that finished in this process, by ticket (the latest run of each).
+    finished: Mutex<BTreeMap<i64, FinishedWorker>>,
     running: AtomicUsize,
     peak: AtomicUsize,
     /// Serializes `git worktree` changes (git's own lock fails rather than waits).
     git_lock: tokio::sync::Mutex<()>,
+    /// Held by a worker that edits files in the manager's own folder under `isolation =
+    /// "shared"`, so two of them never write there at once (#2364).
+    writer: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -413,19 +530,36 @@ impl Supervisor {
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(config.max_parallel.max(1))),
             rt,
+            project: Mutex::new(manager.project.clone()),
             manager,
             config,
             cancel: CancellationToken::new(),
             hooks,
             live: Mutex::new(BTreeMap::new()),
+            finished: Mutex::new(BTreeMap::new()),
             running: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             git_lock: tokio::sync::Mutex::new(()),
+            writer: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     pub fn config(&self) -> &SupervisorConfig {
         &self.config
+    }
+
+    /// The project marker workers get from now on (#2383: the manager wrote `.amp.json` in the
+    /// chat). Running workers keep the one they were started with.
+    pub fn set_project(&self, project: Option<ProjectMarker>) {
+        *self.project.lock().unwrap_or_else(PoisonError::into_inner) = project;
+    }
+
+    /// The project marker new workers get.
+    pub fn project(&self) -> Option<ProjectMarker> {
+        self.project
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// The manager's `amp_run_ticket` tool, for [`AgentSpec::extra_tools`].
@@ -458,19 +592,186 @@ impl Supervisor {
             .collect()
     }
 
+    /// Tickets AMP has as dispatched to a live worker of this process that hasn't closed its
+    /// ticket (completed or blocked) yet: what quitting now would leave in progress.
+    pub fn unfinished(&self) -> Vec<i64> {
+        let live = self.live.lock().unwrap();
+        live.iter()
+            .filter(|(_, w)| {
+                w.dispatched
+                    && w.watch
+                        .as_ref()
+                        .is_none_or(|watch| watch.closed.lock().unwrap().is_none())
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// Returns every [`Supervisor::unfinished`] ticket to ready through the hooks
+    /// ([`WorkerHooks::release`]), all at once, within `bound`. Quitting without waiting calls
+    /// it, because the workers' own `on_finish` will not get to run (#2204). Each ticket comes
+    /// back with its result; one still going when `bound` passes says so.
+    pub async fn release_unfinished(
+        &self,
+        why: &str,
+        bound: Duration,
+    ) -> Vec<(i64, Result<(), String>)> {
+        let ids = self.unfinished();
+        let Some(hooks) = self.hooks.clone() else {
+            return ids
+                .into_iter()
+                .map(|id| (id, Err("no run reporting in this process".to_owned())))
+                .collect();
+        };
+        let mut set = tokio::task::JoinSet::new();
+        for id in &ids {
+            let (hooks, id, why) = (Arc::clone(&hooks), *id, why.to_owned());
+            set.spawn(async move { (id, hooks.release(id, &why).await) });
+        }
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(bound, async {
+            while let Some(done) = set.join_next().await {
+                if let Ok(r) = done {
+                    out.push(r);
+                }
+            }
+        })
+        .await;
+        for id in ids {
+            if !out.iter().any(|(d, _)| *d == id) {
+                out.push((
+                    id,
+                    Err(format!(
+                        "AMP did not answer within {}",
+                        human_duration(bound)
+                    )),
+                ));
+            }
+        }
+        out.sort_by_key(|(id, _)| *id);
+        out
+    }
+
     /// The most workers that ran at the same time.
     pub fn peak_running(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
     }
 
-    fn manager_role(&self) -> Option<&Role> {
-        self.rt.roles.get(&self.manager.role)
+    /// Every worker session of this chat: the live ones (by ticket), then the finished ones
+    /// (by ticket) that have no live run (#2252).
+    pub fn sessions(&self) -> Vec<WorkerSessionInfo> {
+        let mut out: Vec<WorkerSessionInfo> = {
+            let live = self.live.lock().unwrap();
+            live.iter().map(|(id, w)| live_info(*id, w)).collect()
+        };
+        let finished = self.finished.lock().unwrap();
+        for (id, f) in finished.iter() {
+            if !out.iter().any(|s| s.task_id == *id) {
+                out.push(f.info.clone());
+            }
+        }
+        out
     }
 
-    /// The roles this manager may dispatch.
-    pub fn dispatchable(&self) -> Vec<&Role> {
-        match self.manager_role() {
-            Some(m) => self.rt.roles.dispatchable(m),
+    /// One worker session of this chat, live or finished.
+    pub fn session(&self, task_id: i64) -> Option<WorkerSessionInfo> {
+        if let Some(w) = self.live.lock().unwrap().get(&task_id) {
+            return Some(live_info(task_id, w));
+        }
+        self.finished
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .map(|f| f.info.clone())
+    }
+
+    /// The events of ticket `task_id`'s worker in this chat (live, or the last finished run).
+    pub fn feed(&self, task_id: i64) -> Option<Arc<WorkerFeed>> {
+        if let Some(w) = self.live.lock().unwrap().get(&task_id) {
+            return Some(Arc::clone(&w.feed));
+        }
+        self.finished
+            .lock()
+            .unwrap()
+            .get(&task_id)
+            .map(|f| Arc::clone(&f.feed))
+    }
+
+    /// The newest session file a worker on `task_id` wrote, in this process or an earlier one.
+    pub fn latest_session_file(&self, task_id: i64) -> Option<PathBuf> {
+        worker_session::latest_session(&self.rt.state_dir, task_id)
+    }
+
+    /// Stops the live worker on `task_id` because `by` (the person at the chat) asked to
+    /// (#2252). Its run ends as `cancelled` with the error [`stopped_from_chat`]: run reporting
+    /// records it abandoned and hands the ticket back to ready (#2204), and the manager's
+    /// `amp_run_ticket` returns with a note saying who stopped it. A worker still waiting for a
+    /// slot is never dispatched.
+    pub fn stop_worker(&self, task_id: i64, by: &str) -> Result<(), StopError> {
+        let live = self.live.lock().unwrap();
+        let Some(w) = live.get(&task_id) else {
+            return Err(if self.finished.lock().unwrap().contains_key(&task_id) {
+                StopError::Finished(task_id)
+            } else {
+                StopError::NotFound(task_id)
+            });
+        };
+        if w.stop.is_cancelled() {
+            return Err(StopError::AlreadyStopping(task_id));
+        }
+        let by = by.trim();
+        *w.stopped_by.lock().unwrap() = Some(if by.is_empty() {
+            "the person".to_owned()
+        } else {
+            by.to_owned()
+        });
+        w.stop.cancel();
+        Ok(())
+    }
+
+    /// Keeps a finished worker's session viewable, and forgets it from the live map's point of
+    /// view (the live guard removes it right after).
+    fn record_finished(&self, report: &WorkerReport) {
+        let (feed, since, stopped_by, context_window) = {
+            let live = self.live.lock().unwrap();
+            match live.get(&report.task_id) {
+                Some(w) => (
+                    Arc::clone(&w.feed),
+                    w.since,
+                    w.stopped_by.lock().unwrap().clone(),
+                    w.context_window,
+                ),
+                None => (WorkerFeed::new(), SystemTime::now(), None, None),
+            }
+        };
+        let info = WorkerSessionInfo {
+            task_id: report.task_id,
+            agent_id: report.agent_id.clone(),
+            phase: None,
+            model: Some(report.model.clone()).filter(|m| !m.is_empty()),
+            cwd: Some(report.cwd.clone()),
+            since,
+            ended: Some(SystemTime::now()),
+            totals: report.totals.clone(),
+            outcome: Some(report.outcome),
+            error: report.error.clone(),
+            stopped_by,
+            session_file: report.session_file.clone(),
+            branch: report.branch.clone(),
+            context_window,
+        };
+        self.finished
+            .lock()
+            .unwrap()
+            .insert(report.task_id, FinishedWorker { info, feed });
+    }
+
+    /// The roles this manager may dispatch, from the roster as it is now (a `/reload` may have
+    /// changed it, #2242).
+    pub fn dispatchable(&self) -> Vec<Role> {
+        let catalog = self.rt.catalog();
+        match catalog.roles.get(&self.manager.role) {
+            Some(m) => catalog.roles.dispatchable(m).into_iter().cloned().collect(),
             None => Vec::new(),
         }
     }
@@ -493,12 +794,13 @@ impl Supervisor {
     pub fn tool_description(&self) -> String {
         let mut text = format!(
             "Run a specialist agent on one AMP ticket and wait for it to finish. Marks the ticket \
-             dispatched in AMP (amp_dispatch_task), gives the worker its own git worktree at \
-             .worktrees/<task_id> when its role edits files, runs it on its own model, and returns \
+             dispatched in AMP (amp_dispatch_task), gives a worker whose role edits files its own \
+             place to work ({}), runs it on its own model, and returns \
              its final message and outcome (completed, blocked, stopped, error, timeout, cancelled \
              or turn_budget) as JSON. Call it once per ticket in the same message to run tickets in \
              parallel: at most {} run at once, extra calls wait for a free slot; each worker has \
              {} of wall-clock time. agent_id is the ticket's assigned_to.\n\nAgents:",
+            self.place_description(),
             self.config.max_parallel,
             human_duration(self.config.timeout),
         );
@@ -513,12 +815,28 @@ impl Supervisor {
         text
     }
 
+    /// `amp_run_ticket`'s words for where editing workers work, for this folder now (#2364).
+    fn place_description(&self) -> String {
+        let repo = Repo::probe(&self.manager.cwd);
+        match workspace::placement(self.config.isolation, &repo, &self.manager.cwd, false) {
+            Ok(Placement::Worktree) => {
+                "a git worktree at .worktrees/<task_id> on branch amp-<task_id>".to_owned()
+            }
+            Ok(Placement::Folder) => {
+                format!("a folder {WORK_DIR}/<task_id>/; no git branch, workers don't commit")
+            }
+            Ok(Placement::Shared) => {
+                "this folder, one editing worker at a time; workers don't commit".to_owned()
+            }
+            Err(e) => format!("none: {e}"),
+        }
+    }
+
     fn resolve_role(&self, agent: &str) -> Result<Role, RunTicketError> {
         let role = self
             .rt
-            .roles
-            .get(agent)
-            .ok_or_else(|| RunTicketError::UnknownAgent {
+            .role(agent)
+            .map_err(|_| RunTicketError::UnknownAgent {
                 agent: agent.to_owned(),
                 available: self.available(),
             })?;
@@ -529,7 +847,7 @@ impl Supervisor {
                 available: self.available(),
             });
         }
-        Ok(role.clone())
+        Ok(role)
     }
 
     /// Runs one ticket. `Err` means nothing was dispatched; once AMP has the dispatch, every end
@@ -548,12 +866,50 @@ impl Supervisor {
         let role = self.resolve_role(&req.agent_id)?;
         let agent_id = format!("amp:{}", role.id);
         let _guard = self.claim(req.task_id, &agent_id)?;
+        let (stop, stopped_by) = self.stop_handle(req.task_id);
+
+        // #2364: where it will work, decided before anything happens in AMP.
+        let edits = role.tool_policy(&self.manager.cwd).exposes("edit");
+        let repo = self.probe().await;
+        let place = if req.worktree.unwrap_or(edits) {
+            Some(
+                workspace::placement(
+                    self.config.isolation,
+                    &repo,
+                    &self.manager.cwd,
+                    req.base.is_some(),
+                )
+                .map_err(RunTicketError::Workspace)?,
+            )
+        } else {
+            None
+        };
+        // Under `isolation = "shared"`, workers that edit files take turns in the manager's
+        // folder. (An explicit `worktree: false` is the manager's own call and doesn't wait.)
+        let _writer = if edits && place == Some(Placement::Shared) {
+            Some(tokio::select! {
+                biased;
+                _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
+                _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
+                _ = stop.cancelled() => {
+                    let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                    return Err(RunTicketError::Stopped { task_id: req.task_id, by });
+                }
+                g = Arc::clone(&self.writer).lock_owned() => g,
+            })
+        } else {
+            None
+        };
 
         // Wait for a slot; a cancelled wait dispatches nothing.
         let permit = tokio::select! {
             biased;
             _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
             _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
+            _ = stop.cancelled() => {
+                let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                return Err(RunTicketError::Stopped { task_id: req.task_id, by });
+            }
             p = Arc::clone(&self.slots).acquire_owned() => p.map_err(|_| RunTicketError::Cancelled)?,
         };
         let _running = Running::start(self);
@@ -564,14 +920,45 @@ impl Supervisor {
             json!({"task_id": req.task_id, "agent_id": agent_id}),
         )
         .await
-        .map_err(|e| RunTicketError::Dispatch {
-            task_id: req.task_id,
-            message: e.to_string(),
+        .map_err(|e| {
+            // #2226: AMP's refusals link the web UI; without a public URL the link is relative.
+            // Same rewrite as every other AMP tool result (#2205), so the model and the TUI see
+            // the web UI's absolute link, not `/project/71/plan`.
+            let session = self.rt.mcp.session();
+            RunTicketError::Dispatch {
+                task_id: req.task_id,
+                message: crate::links::web_links(
+                    &e.to_string(),
+                    &session.web_base(),
+                    &session.mcp_origin(),
+                )
+                .into_owned(),
+            }
         })?;
+        if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
+            w.dispatched = true;
+        }
 
-        let report = self.run_dispatched(&req, &role, &agent_id, signal).await;
+        let report = self
+            .run_dispatched(
+                &req,
+                &role,
+                &agent_id,
+                Where { repo, place, edits },
+                signal,
+                (stop, stopped_by),
+            )
+            .await;
         drop(permit);
         Ok(report)
+    }
+
+    fn stop_handle(&self, task_id: i64) -> (CancellationToken, Arc<Mutex<Option<String>>>) {
+        let live = self.live.lock().unwrap();
+        match live.get(&task_id) {
+            Some(w) => (w.stop.clone(), Arc::clone(&w.stopped_by)),
+            None => (CancellationToken::new(), Arc::default()),
+        }
     }
 
     fn claim(&self, task_id: i64, agent_id: &str) -> Result<LiveGuard<'_>, RunTicketError> {
@@ -583,11 +970,18 @@ impl Supervisor {
             task_id,
             LiveWorker {
                 agent_id: agent_id.to_owned(),
+                dispatched: false,
+                watch: None,
                 phase: WorkerPhase::Queued,
                 model: None,
                 cwd: None,
                 since: SystemTime::now(),
                 totals: None,
+                feed: WorkerFeed::new(),
+                stop: CancellationToken::new(),
+                stopped_by: Arc::default(),
+                branch: None,
+                context_window: None,
             },
         );
         Ok(LiveGuard { sup: self, task_id })
@@ -598,22 +992,28 @@ impl Supervisor {
         req: &RunRequest,
         role: &Role,
         agent_id: &str,
+        at: Where,
         signal: CancellationToken,
+        (stop, stopped_by): (CancellationToken, Arc<Mutex<Option<String>>>),
     ) -> WorkerReport {
         let started = Instant::now();
+        let feed = self
+            .live
+            .lock()
+            .unwrap()
+            .get(&req.task_id)
+            .map(|w| Arc::clone(&w.feed))
+            .unwrap_or_default();
         let mut notes = Vec::new();
         let totals = Arc::new(Mutex::new(Totals::default()));
-        let model = self
-            .rt
-            .models
-            .resolve_role(&role.model_role)
-            .map(|r| r.model_ref())
-            .unwrap_or_default();
+        let resolved = role.resolve_model(&self.rt.current_models()).ok();
+        let model = resolved.as_ref().map(|r| r.model_ref()).unwrap_or_default();
+        let context_window = resolved
+            .as_ref()
+            .map(|r| r.model.context_window)
+            .filter(|w| *w > 0);
 
-        // Where the worker runs.
-        let wants_worktree = req
-            .worktree
-            .unwrap_or_else(|| role.tool_policy(&self.manager.cwd).exposes("edit"));
+        // Where the worker runs (#2364: decided in run_ticket).
         let mut info = WorkerInfo {
             task_id: req.task_id,
             agent_id: agent_id.to_owned(),
@@ -622,11 +1022,15 @@ impl Supervisor {
             cwd: self.manager.cwd.clone(),
             worktree: None,
             branch: None,
+            workspace: at.place.unwrap_or(Placement::Shared),
+            git: at.repo.is_git(),
+            edits: at.edits,
+            manager_cwd: self.manager.cwd.clone(),
             totals: Arc::clone(&totals),
         };
-        if wants_worktree {
-            match self.worktree(req).await {
-                Ok(Some(wt)) => {
+        match at.place {
+            Some(Placement::Worktree) => match self.worktree(req, &at.repo).await {
+                Ok(wt) => {
                     if wt.reused {
                         notes.push(format!(
                             "reused the existing worktree {}",
@@ -637,10 +1041,6 @@ impl Supervisor {
                     info.worktree = Some(wt.path);
                     info.branch = wt.branch;
                 }
-                Ok(None) => notes.push(format!(
-                    "{} is not in a git repository; the worker ran there without a worktree",
-                    self.manager.cwd.display()
-                )),
                 Err(e) => {
                     return self
                         .finish(
@@ -651,7 +1051,26 @@ impl Supervisor {
                         )
                         .await;
                 }
-            }
+            },
+            Some(Placement::Folder) => match ticket_folder(&self.manager.cwd, req.task_id) {
+                Ok((path, reused)) => {
+                    if reused {
+                        notes.push(format!("reused its folder {}", path.display()));
+                    }
+                    if self.config.isolation == Isolation::Auto
+                        && let Some(why) = at.repo.why_not(&self.manager.cwd)
+                    {
+                        notes.push(no_worktree_note(&self.manager.cwd, &why, &path, &at.repo));
+                    }
+                    info.cwd = path;
+                }
+                Err(e) => {
+                    return self
+                        .finish(&info, started, notes, Finish::error(format!("folder: {e}")))
+                        .await;
+                }
+            },
+            Some(Placement::Shared) | None => {}
         }
         {
             let mut live = self.live.lock().unwrap();
@@ -661,6 +1080,8 @@ impl Supervisor {
                 w.cwd = Some(info.cwd.clone());
                 w.since = SystemTime::now();
                 w.totals = Some(Arc::clone(&totals));
+                w.branch = info.branch.clone();
+                w.context_window = context_window;
             }
         }
 
@@ -673,9 +1094,14 @@ impl Supervisor {
             budget: budget.clone(),
             closing: Mutex::new(HashMap::new()),
             closed: Mutex::new(None),
+            repeat_stop: Mutex::new(None),
+            feed,
         });
+        if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
+            w.watch = Some(Arc::clone(&watch));
+        }
         let mut spec = AgentSpec::new(role.id.clone(), info.cwd.clone());
-        spec.project = self.manager.project.clone();
+        spec.project = self.project();
         spec.extra_context = Some(worker_context(&info, &self.manager.role));
         spec.session = SessionKind::Jsonl {
             dir: self
@@ -691,6 +1117,14 @@ impl Supervisor {
             spec.before_tool_call = hooks.before_tool_call(&info);
             spec.extra_tools.extend(hooks.extra_tools(&info));
         }
+        // #2239: a worker waits for shared MCP servers still on their first attempt (a no-op once
+        // they are up) and gets its own instances of worktree-scoped ones, released in finish().
+        let key = req.task_id.to_string();
+        self.rt.mcp_hub.wait_started(true).await;
+        if let Some(worktree) = &info.worktree {
+            spec.mcp.worktree = self.rt.mcp_hub.start_worktree(&key, worktree).await;
+        }
+        spec.mcp.output_key = Some(key);
         let built = match self.rt.build(spec).await {
             Ok(b) => b,
             Err(e) => {
@@ -707,7 +1141,17 @@ impl Supervisor {
         info.model = built.resolved.model_ref();
         let session_file = built.session_file.clone();
         let harness = Arc::clone(&built.harness);
-        let prompt = worker_prompt(&info, req, self.manager.project.as_ref());
+        let prompt = worker_prompt(&info, req, self.project().as_ref());
+        // The chat's session view starts with the prompt (#2252); rpi doesn't emit it.
+        watch.feed.push(&AgentEvent::MessageStart {
+            message: rpi_agent::AgentMessage::User(rpi_ai::types::UserMessage {
+                role: Default::default(),
+                content: rpi_ai::types::UserContent::Text(prompt.clone()),
+                timestamp: SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64),
+            }),
+        });
 
         // Run it in the foreground of this call.
         let run = harness.prompt_text(&prompt, Vec::new());
@@ -721,6 +1165,10 @@ impl Supervisor {
             _ = self.cancel.cancelled() => Stop::Ended(WorkerOutcome::Cancelled, "every worker was cancelled".to_owned()),
             _ = &mut deadline => Stop::Ended(WorkerOutcome::Timeout, format!("no result after {}", human_duration(self.config.timeout))),
             _ = budget.cancelled() => Stop::Ended(WorkerOutcome::TurnBudget, format!("turn budget of {} turns used up", self.config.max_turns)),
+            _ = stop.cancelled() => {
+                let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                Stop::Ended(WorkerOutcome::Cancelled, stopped_from_chat(&by))
+            }
         };
         let result = match stop {
             Stop::Returned(r) => Some(r),
@@ -748,6 +1196,16 @@ impl Supervisor {
                 }
                 // Read after the abort settled: a closing call can end during the grace period.
                 let closed = *watch.closed.lock().unwrap();
+                if closed.is_none()
+                    && let Some(by) = stopped_by.lock().unwrap().clone()
+                {
+                    // #2252: the manager reads this in amp_run_ticket's result.
+                    notes.push(format!(
+                        "{by} watched this worker and stopped it from the chat; ask them \
+                         before running #{} again",
+                        req.task_id
+                    ));
+                }
                 let finish = finish.after_closing(closed, &mut notes);
                 return self.finish(&info, started, notes, finish).await;
             }
@@ -759,7 +1217,18 @@ impl Supervisor {
             Some(Ok(r)) => match r.outcome {
                 HarnessRunOutcome::Completed { final_message, .. } => Finish {
                     outcome: closed.unwrap_or(WorkerOutcome::Stopped),
-                    error: None,
+                    // #2225: say why it stopped (the abandoned run's note carries it).
+                    error: closed
+                        .is_none()
+                        .then(|| {
+                            watch
+                                .repeat_stop
+                                .lock()
+                                .unwrap()
+                                .as_ref()
+                                .map(|s| s.reason())
+                        })
+                        .flatten(),
                     text: assistant_text(&final_message),
                     session_file: None,
                 },
@@ -775,7 +1244,12 @@ impl Supervisor {
                     ..
                 } => Finish {
                     outcome: WorkerOutcome::Error,
-                    error: Some(format!("{}: {}", error.code, error.message)),
+                    // One line, no response body (#2207): the manager reads this as a tool result.
+                    error: Some(crate::provider_error::run_failure(
+                        &error.code,
+                        &error.message,
+                        final_message.as_ref().map_or("", |m| m.provider.as_str()),
+                    )),
                     text: final_message
                         .as_ref()
                         .map(assistant_text)
@@ -816,6 +1290,7 @@ impl Supervisor {
             cwd: info.cwd.clone(),
             worktree: info.worktree.clone(),
             branch: info.branch.clone(),
+            workspace: info.workspace,
             session_file: finish.session_file,
             turns: totals.turns,
             tool_calls: totals.tool_calls,
@@ -825,20 +1300,50 @@ impl Supervisor {
             notes,
             totals,
         };
+        // #2239: the worker's worktree-scoped MCP server instances end with it.
+        self.rt
+            .mcp_hub
+            .release_worktree(&info.task_id.to_string())
+            .await;
         if let Some(hooks) = &self.hooks {
             hooks.on_finish(info, &mut report).await;
         }
+        self.record_finished(&report);
         report
     }
 
-    /// Creates or reuses `<repo>/.worktrees/<task_id>`. `Ok(None)` when the manager is not in a
-    /// git repository.
-    async fn worktree(&self, req: &RunRequest) -> Result<Option<Worktree>, String> {
+    /// Git about the manager's folder, asked off the async threads.
+    async fn probe(&self) -> Repo {
+        let cwd = self.manager.cwd.clone();
+        tokio::task::spawn_blocking(move || Repo::probe(&cwd))
+            .await
+            .unwrap_or(Repo::NotGit)
+    }
+
+    /// One line on where this manager's workers work, for its `<amp_context>` (#2364).
+    pub fn workspace_context(&self) -> String {
+        let repo = Repo::probe(&self.manager.cwd);
+        workspace::manager_context(self.config.isolation, &self.manager.cwd, &repo)
+    }
+
+    /// The chat banner's line about where workers work, when it isn't git worktrees (#2364).
+    pub fn workspace_banner(&self) -> Option<String> {
+        let repo = Repo::probe(&self.manager.cwd);
+        workspace::banner_line(self.config.isolation, &self.manager.cwd, &repo)
+    }
+
+    /// Creates or reuses `<repo>/.worktrees/<task_id>` in `repo` (usable, or with no commit when
+    /// the call names a base: [`workspace::placement`] decided that).
+    async fn worktree(&self, req: &RunRequest, repo: &Repo) -> Result<Worktree, String> {
         let _lock = self.git_lock.lock().await;
-        let Ok(top) = git(&self.manager.cwd, &["rev-parse", "--show-toplevel"]).await else {
-            return Ok(None);
+        let top = match repo {
+            Repo::Usable { top } | Repo::NoCommit { top } => top.clone(),
+            other => {
+                return Err(other
+                    .why_not(&self.manager.cwd)
+                    .unwrap_or_else(|| "no git repository".to_owned()));
+            }
         };
-        let top = PathBuf::from(top);
         let path = top.join(".worktrees").join(req.task_id.to_string());
         exclude_worktrees_dir(&top).await;
 
@@ -856,11 +1361,11 @@ impl Supervisor {
                 .await
                 .ok()
                 .filter(|b| !b.is_empty());
-            return Ok(Some(Worktree {
+            return Ok(Worktree {
                 path,
                 branch,
                 reused: true,
-            }));
+            });
         }
 
         let branch = req
@@ -886,12 +1391,31 @@ impl Supervisor {
             let base = req.base.clone().unwrap_or_else(|| "HEAD".to_owned());
             git(&top, &["worktree", "add", "-b", &branch, &path_str, &base]).await?;
         }
-        Ok(Some(Worktree {
+        Ok(Worktree {
             path,
             branch: Some(branch),
             reused: false,
-        }))
+        })
     }
+}
+
+/// Where run_ticket decided the worker works (#2364).
+struct Where {
+    repo: Repo,
+    /// `None`: the manager's folder (read-only roles, or `worktree: false`).
+    place: Option<Placement>,
+    /// The role can edit files.
+    edits: bool,
+}
+
+/// Creates (or reuses) the worker's own folder `<cwd>/amp-work/<task_id>` (#2364).
+fn ticket_folder(cwd: &Path, task_id: i64) -> Result<(PathBuf, bool), String> {
+    let path = cwd.join(WORK_DIR).join(task_id.to_string());
+    if path.is_dir() {
+        return Ok((path, true));
+    }
+    std::fs::create_dir_all(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    Ok((path, false))
 }
 
 struct Worktree {
@@ -1005,10 +1529,15 @@ struct WorkerWatch {
     /// Tool call id -> the outcome it means, for calls that close this ticket.
     closing: Mutex<HashMap<String, WorkerOutcome>>,
     closed: Mutex<Option<WorkerOutcome>>,
+    /// #2225: the repeat guard stopped the worker's model.
+    repeat_stop: Mutex<Option<crate::repeat::RepeatStop>>,
+    /// The chat's session view reads the worker's events from here (#2252).
+    feed: Arc<WorkerFeed>,
 }
 
 impl WorkerWatch {
     fn observe(&self, event: &AgentEvent) {
+        self.feed.push(event);
         let Some(e) = RunEvent::from_agent(event) else {
             return;
         };
@@ -1037,15 +1566,43 @@ impl WorkerWatch {
                     self.closing.lock().unwrap().insert(id.clone(), outcome);
                 }
             }
-            RunEvent::ToolEnd { id, is_error, .. } => {
+            RunEvent::ToolEnd {
+                id, is_error, text, ..
+            } => {
                 if let Some(outcome) = self.closing.lock().unwrap().remove(id)
                     && !is_error
                 {
                     *self.closed.lock().unwrap() = Some(outcome);
                 }
+                if *is_error && let Some(stop) = crate::repeat::stopped(text) {
+                    *self.repeat_stop.lock().unwrap() = Some(stop);
+                }
             }
             _ => {}
         }
+    }
+}
+
+fn live_info(task_id: i64, w: &LiveWorker) -> WorkerSessionInfo {
+    WorkerSessionInfo {
+        task_id,
+        agent_id: w.agent_id.clone(),
+        phase: Some(w.phase),
+        model: w.model.clone(),
+        cwd: w.cwd.clone(),
+        since: w.since,
+        ended: None,
+        totals: w
+            .totals
+            .as_ref()
+            .map(|t| t.lock().unwrap().clone())
+            .unwrap_or_default(),
+        outcome: None,
+        error: None,
+        stopped_by: w.stopped_by.lock().unwrap().clone(),
+        session_file: None,
+        branch: w.branch.clone(),
+        context_window: w.context_window,
     }
 }
 
@@ -1078,6 +1635,10 @@ impl AgentEmitter for WorkerEmitter {
     }
 }
 
+/// What a worker outside its own git worktree is told about git (#2364): nothing to commit.
+const NO_GIT_STEPS: &str = "don't commit, branch, push or open a pull request, and leave branch, \
+     commit, pushed and pr_url out of amp_complete_task";
+
 fn worker_context(info: &WorkerInfo, manager: &str) -> String {
     let mut lines = vec![
         format!("ticket: #{}", info.task_id),
@@ -1086,12 +1647,35 @@ fn worker_context(info: &WorkerInfo, manager: &str) -> String {
     ];
     match (&info.worktree, &info.branch) {
         (Some(wt), branch) => {
+            lines.push("workspace: worktree".to_owned());
             lines.push(format!("worktree: {}", wt.display()));
             if let Some(b) = branch {
                 lines.push(format!("branch: {b}"));
             }
+            lines.push("git: yes (commit your work on your branch)".to_owned());
         }
-        (None, _) => lines.push("worktree: none (working in the manager's directory)".to_owned()),
+        (None, _) => {
+            lines.push(match info.workspace {
+                Placement::Folder => format!(
+                    "workspace: folder {} (your own, for this ticket; the person's files are in {})",
+                    info.cwd.display(),
+                    info.manager_cwd.display()
+                ),
+                _ if info.edits => format!(
+                    "workspace: shared {} (the person's folder; workers that edit files take turns in it)",
+                    info.cwd.display()
+                ),
+                _ => format!("workspace: the manager's folder {}", info.cwd.display()),
+            });
+            lines.push("worktree: none".to_owned());
+            if !info.git {
+                lines.push(format!("git: none (not a git repository): {NO_GIT_STEPS}"));
+            } else if info.edits {
+                lines.push(format!(
+                    "git: not yours here (no branch of your own): {NO_GIT_STEPS}"
+                ));
+            }
+        }
     }
     lines.join("\n")
 }
@@ -1116,10 +1700,36 @@ fn worker_prompt(info: &WorkerInfo, req: &RunRequest, project: Option<&ProjectMa
             "\n\nYour working directory is the git worktree {}.",
             wt.display()
         )),
-        (None, _) => text.push_str(&format!(
-            "\n\nYour working directory is {}.",
-            info.cwd.display()
-        )),
+        (None, _) => {
+            match info.workspace {
+                Placement::Folder => text.push_str(&format!(
+                    "\n\nYour working directory is {}, a folder of your own for this ticket inside \
+                     {}. Put everything you make for this ticket in it. Read any file in {} you \
+                     need, but don't change files outside your folder: other workers may be \
+                     running at the same time.",
+                    info.cwd.display(),
+                    info.manager_cwd.display(),
+                    info.manager_cwd.display()
+                )),
+                _ if info.edits => text.push_str(&format!(
+                    "\n\nYour working directory is {}, the person's own folder. Workers that edit \
+                     files take turns in it, so you are the only one editing now.",
+                    info.cwd.display()
+                )),
+                _ => text.push_str(&format!(
+                    "\n\nYour working directory is {}.",
+                    info.cwd.display()
+                )),
+            }
+            if info.edits {
+                text.push_str(&format!(
+                    " This work is not on a git branch of yours: {NO_GIT_STEPS}. In your \
+                     completion comment, list the files you made or changed, with their paths."
+                ));
+            } else if !info.git {
+                text.push_str(" It is not a git repository.");
+            }
+        }
     }
     if let Some(extra) = req
         .instructions
@@ -1149,6 +1759,18 @@ fn same_path(a: &Path, b: &Path) -> bool {
         (Ok(a), Ok(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// The note a worker's report carries when `auto` gave it a folder instead of a worktree:
+/// `why` is the reason (#2356, #2364).
+fn no_worktree_note(cwd: &Path, why: &str, folder: &Path, repo: &Repo) -> String {
+    format!(
+        "{why}; the worker worked in its own folder {} (no branch, nothing committed). To give \
+         workers their own git worktrees, {} in {}",
+        folder.display(),
+        repo.fix().replace(" here", ""),
+        cwd.display()
+    )
 }
 
 /// Runs git in `dir`; stdout trimmed, or stderr as the error.
@@ -1340,6 +1962,8 @@ mod tests {
             budget: CancellationToken::new(),
             closing: Mutex::default(),
             closed: Mutex::default(),
+            repeat_stop: Mutex::default(),
+            feed: WorkerFeed::new(),
         };
         let start = |id: &str, name: &str, task: i64| AgentEvent::ToolExecutionStart {
             tool_call_id: id.into(),

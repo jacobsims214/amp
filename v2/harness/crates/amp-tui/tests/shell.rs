@@ -7,6 +7,7 @@ use std::{sync::Arc, time::Duration};
 
 use amp_core::{agent::memory_session, events::ChannelEmitter};
 use amp_tui::{ModelChoice, Shell, ShellInfo, Submit};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rpi_agent::AgentEvent;
 use rpi_ai::{
     Model, ThinkingLevel,
@@ -19,6 +20,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 const W: usize = 100;
 const H: usize = 30;
+/// The blank row above and below the screen (#2344).
+const V: usize = amp_tui::VERTICAL;
 const WAIT: Duration = Duration::from_secs(20);
 
 struct Rig {
@@ -52,6 +55,7 @@ async fn rig(steps: Vec<FauxStep>) -> Rig {
         context_window: 200_000,
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m2".into()),
+        session_file: None,
         banner: vec![
             "AMP harness · manager".into(),
             "project #2 AMP · http://amp.test/mcp".into(),
@@ -106,16 +110,17 @@ async fn a_prompt_renders_the_reply_and_the_footer() {
 
     let lines = rig.shell.view().render_plain(W, H);
     assert_eq!(lines.len(), H, "the frame fills the screen");
-    // pi's two-line footer is the last two lines: cwd (branch) • role, then stats … model.
-    let footer1 = &lines[H - 2];
-    let footer2 = &lines[H - 1];
+    // The one-row footer (compact, #2346) is the last line above the bottom padding row
+    // (#2344): cwd (branch) • role, then stats … model.
+    assert_eq!(lines[H - 1], "", "a blank row below the footer");
+    let footer = &lines[H - V - 1];
     assert!(
-        footer1.contains("/work/amp (harness-m2) • manager"),
-        "{footer1}"
+        footer.contains("/work/amp (harness-m2) • manager"),
+        "{footer}"
     );
     assert!(
-        footer2.ends_with(&format!("{} • thinking off", rig.model.id)),
-        "{footer2}"
+        footer.ends_with(&format!("{} • thinking off", rig.model.id)),
+        "{footer}"
     );
     assert!(!rig.shell.is_running());
 }
@@ -173,24 +178,48 @@ async fn slash_commands() {
 
     rig.say("/usage").await;
     let screen = rig.screen();
+    // #2188: proper plurals; no failed count when nothing failed.
     assert!(
-        screen.contains("usage this session: 1 prompt(s), 1 turn(s), 0 tool call(s)"),
+        screen.contains("usage this session: 1 prompt, 1 turn, 0 tool calls"),
         "{screen}"
     );
+    assert!(!screen.contains("failed"), "{screen}");
+    assert!(!screen.contains("(s)"), "{screen}");
 
+    // #2188: /model opens a picker with the current model selected; ↓ Enter switches.
     rig.say("/model").await;
     let screen = rig.screen();
-    assert!(screen.contains("available: faux/"), "{screen}");
-
-    rig.say(&format!("/model {}/faux-2", rig.model.provider))
-        .await;
+    assert!(screen.contains("── model "), "{screen}");
+    let current = format!("› ● {}/{}", rig.model.provider, rig.model.id);
+    assert!(screen.contains(&current), "{screen}");
+    assert!(
+        screen.contains(&format!("○ {}/faux-2", rig.model.provider)),
+        "{screen}"
+    );
+    assert!(screen.contains("current"), "{screen}");
+    assert!(screen.contains("Enter switch"), "{screen}");
+    assert!(!screen.contains("available:"), "no comma list: {screen}");
+    let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+    assert!(rig.shell.key(&key(KeyCode::Down), true).await);
+    assert!(
+        rig.screen()
+            .contains(&format!("› ○ {}/faux-2", rig.model.provider))
+    );
+    assert!(rig.shell.key(&key(KeyCode::Enter), true).await);
+    assert!(!rig.shell.view().panel().is_open());
+    assert_eq!(rig.shell.info().model_id, "faux-2");
     let lines = rig.shell.view().render_plain(W, H);
     assert!(
-        lines[H - 1].ends_with("faux-2 • thinking off"),
+        lines[H - V - 1].ends_with("faux-2 • thinking off"),
         "{}",
-        lines[H - 1]
+        lines[H - V - 1]
     );
-    assert_eq!(rig.shell.info().model_id, "faux-2");
+    assert!(rig.screen().contains("model: faux/faux-2"));
+
+    // Typing a reference still switches directly.
+    rig.say(&format!("/model {}/{}", rig.model.provider, rig.model.id))
+        .await;
+    assert_eq!(rig.shell.info().model_id, rig.model.id);
 
     rig.say("/model nope/nope").await;
     assert!(rig.screen().contains("unknown model `nope/nope`"));
@@ -199,7 +228,9 @@ async fn slash_commands() {
     assert!(rig.screen().contains("unknown command: /bogus"));
 
     rig.say("/help").await;
-    assert!(rig.screen().contains("/model [provider/model]"));
+    // Tall enough for the whole list.
+    let help = rig.shell.view().render_plain(W, 90).join("\n");
+    assert!(help.contains("/model [p/m|roles|role]"), "{help}");
 
     assert_eq!(rig.shell.submit("/quit").await, Submit::Quit);
     assert_eq!(rig.shell.submit("/exit").await, Submit::Quit);
@@ -216,14 +247,19 @@ async fn the_chrome_slots_render_nothing_without_metadata() {
     // Without a header the banner is the first content (after its one-line top padding).
     let lines = view.render_plain(W, H);
     assert!(
-        lines[..3].iter().any(|l| l.contains("AMP harness")),
+        lines[..3 + V].iter().any(|l| l.contains("AMP harness")),
         "{lines:#?}"
     );
     // A component in the header slot shows above the transcript.
     view.header_slot()
         .add_child(Arc::new(rpi_tui::Text::new("HEADER", 0, 0)));
     let lines = view.render_plain(W, H);
-    assert_eq!(lines[0], "HEADER");
+    // Inside the left padding (#2251), under the top padding row (#2344).
+    assert_eq!(lines[0], "");
+    assert_eq!(
+        lines[V],
+        format!("{}HEADER", " ".repeat(amp_tui::DEFAULT_PADDING))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

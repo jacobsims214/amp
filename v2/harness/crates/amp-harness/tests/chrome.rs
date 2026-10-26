@@ -27,7 +27,7 @@ async fn render_chrome_draws_the_sample() {
     assert!(lines[0].ends_with("● connected 2026-07-28"), "{}", lines[0]);
     assert!(lines[1].starts_with("■ In progress #2106 M3-3 Header and AMP status line"));
     assert!(lines[1].ends_with("▌ AMP Harness › M3 theme + metadata"));
-    assert!(lines[2].starts_with("■  2 QUESTIONS  │ workers 3 ■ running · 1 queued"));
+    assert!(lines[2].starts_with("■  2 QUESTIONS  │ workers 1 ■ running · 1 queued"));
     assert!(lines[2].ends_with("unreported #2106"), "{}", lines[2]);
     assert!(lines.iter().all(|l| l.chars().count() <= 160));
 
@@ -138,7 +138,9 @@ async fn render_chrome_live_reads_the_poller() {
     assert!(lines[1].ends_with("▌ AMP Harness › M1 CLI"), "{}", lines[1]);
     assert!(
         lines[2].starts_with(
-            "■  1 QUESTION  │ workers 1 ■ running │ ■ 1 In progress · □ 1 Ready · ■ 1 Scheduled"
+            // #2204: #2085 is in progress elsewhere (not a worker of this chat): the board counts
+            // it, the workers count doesn't.
+            "■  1 QUESTION  │ workers 0 │ ■ 1 In progress · □ 1 Ready · ■ 1 Scheduled"
         ),
         "{}",
         lines[2]

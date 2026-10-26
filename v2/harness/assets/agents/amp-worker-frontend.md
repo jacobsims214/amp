@@ -44,7 +44,8 @@ Then load whichever of these fit the specific work, on demand:
 - For anything visual (new UI, layout, styling), read AMP's design guide first:
   `amp_guide(topic="design/visual-craft.md")`, `design/ux-patterns.md` and
   `design/accessibility-and-responsive.md`, and check your result against `design/critique.md`
-- the **git-workflow** skill — commit/branch/PR conventions
+- the **git-workflow** skill — commit/branch/PR conventions (only when your work is in git; outside
+  git there is nothing to commit, see `amp-execution` Step 6)
 
 If your task name contains "check", "review", or "Code Review:", you are a reviewer, not an
 implementer for this ticket — load the **amp-review** skill instead of the implementation skills

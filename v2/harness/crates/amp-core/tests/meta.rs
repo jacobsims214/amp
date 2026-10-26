@@ -71,6 +71,10 @@ struct Mock {
     unauthorized: Arc<AtomicBool>,
     /// HTTP requests seen, rejected ones included.
     requests: Arc<AtomicU64>,
+    /// The plan was approved (in the web UI): `amp_check_plan` reports nothing awaiting.
+    approved: Arc<AtomicBool>,
+    /// The awaiting tickets are someone else's (#2198 per-ticket answer, `yours: false`).
+    others: Arc<AtomicBool>,
 }
 
 impl Mock {
@@ -82,6 +86,8 @@ impl Mock {
             delay_ms: Arc::default(),
             unauthorized: Arc::default(),
             requests: Arc::default(),
+            approved: Arc::default(),
+            others: Arc::default(),
         }
     }
 
@@ -225,12 +231,28 @@ impl ServerHandler for Mock {
                     {"id": 393, "name": "M3 theme + metadata", "state": "active", "tickets": {}}
                 ]}
             ]})),
-            "amp_check_plan" => ok(json!({
-                "ok": true, "awaiting_approval": [2105, 2106],
+            "amp_check_plan" => {
+                let awaiting: Vec<i64> = if self.approved.load(Ordering::SeqCst) {
+                    vec![]
+                } else {
+                    vec![2105, 2106]
+                };
+                let mut plan = json!({
+                "ok": true,
+                "awaiting_approval": awaiting,
                 "require_plan_approval": board.require_plan_approval, "tasks": 40,
                 "open_tasks": 10, "dependencies": 30, "ready_now": [], "longest_chain": 5,
                 "issues": [], "human_gates": [], "summary": "GO"
-            })),
+                });
+                if self.others.load(Ordering::SeqCst) {
+                    plan["awaiting_approval_tickets"] = awaiting
+                        .iter()
+                        .map(|id| json!({"task_id": id, "owner_user_id": 9, "yours": false}))
+                        .collect();
+                    plan["awaiting_yours"] = json!([]);
+                }
+                ok(plan)
+            }
             "amp_list_artifacts" => ok(json!({"artifacts": [
                 {"id": 3, "project_id": 2, "task_id": args["task_id"], "title": "Header mock",
                  "kind": "html", "status": board.artifact_status, "current_version": 2}
@@ -309,6 +331,7 @@ fn fast(board_ms: u64) -> Intervals {
         board: Duration::from_millis(board_ms),
         ticket: Duration::from_millis(board_ms),
         plan: Duration::from_millis(board_ms),
+        plan_pending: Duration::from_millis(board_ms),
         artifacts: Duration::from_millis(board_ms),
         idle_ping: Duration::from_secs(3600),
         call_timeout: Duration::from_secs(5),
@@ -384,6 +407,7 @@ async fn loads_every_item_on_start_and_polls_on_the_intervals() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             intervals: fast(150),
@@ -437,6 +461,93 @@ async fn loads_every_item_on_start_and_polls_on_the_intervals() {
     assert!(meta.snapshot().revision > m.revision);
 }
 
+/// #2230: only others' tickets wait, and a lead approves them on their owners' behalf. The others'
+/// chip clears on the fast `plan_pending` poll too, not after the 60 s plan poll.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_on_behalf_approval_clears_the_others_chip_on_the_fast_poll() {
+    let mock = Mock::new(default_board());
+    mock.others.store(true, Ordering::SeqCst);
+    let server = serve(mock).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_marker: None,
+            project_id: Some(2),
+            ticket_id: None,
+            intervals: Intervals {
+                plan: Duration::from_secs(60),
+                plan_pending: Duration::from_millis(150),
+                ..fast(150)
+            },
+            connector: None,
+            web_url: None,
+        },
+    );
+    let m = wait_for(&meta, "others' tickets waiting", |m| m.plan_awaiting()).await;
+    let plan = m.plan.get().unwrap();
+    assert_eq!((plan.yours(), plan.others()), (vec![], vec![2105, 2106]));
+    assert!(!m.plan_pending(), "none of them are yours");
+    wait_calls(&server.mock, "a fast plan poll", |m| {
+        m.count("amp_check_plan") >= 3
+    })
+    .await;
+
+    // A lead approves on the owners' behalf; nothing tells this harness.
+    server.mock.approved.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let m = wait_for(&meta, "the others' chip to clear", |m| !m.plan_awaiting()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cleared after {:?}",
+        started.elapsed()
+    );
+    assert!(m.plan.get().unwrap().others().is_empty());
+}
+
+/// #2209: approving in the web UI clears the "waiting for your approval" chip on the fast
+/// `plan_pending` poll, not the 60 s plan poll; once nothing is pending the plan poll slows down.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_approval_in_the_web_ui_clears_the_pending_plan_on_the_fast_poll() {
+    let server = serve(Mock::new(default_board())).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_marker: None,
+            project_id: Some(2),
+            ticket_id: None,
+            intervals: Intervals {
+                plan: Duration::from_secs(60),
+                plan_pending: Duration::from_millis(150),
+                ..fast(150)
+            },
+            connector: None,
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "the plan waiting for approval", |m| m.plan_pending()).await;
+    // While pending, the plan is polled on the fast interval, not the 60 s one.
+    wait_calls(&server.mock, "a fast plan poll", |m| {
+        m.count("amp_check_plan") >= 3
+    })
+    .await;
+
+    // A person approves in the web UI; nothing tells the harness.
+    server.mock.approved.store(true, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let m = wait_for(&meta, "the chip to clear", |m| !m.plan_pending()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "cleared after {:?}",
+        started.elapsed()
+    );
+    assert!(m.plan.get().unwrap().awaiting_approval.is_empty());
+
+    // Nothing pending: back on the 60 s plan poll.
+    let before = server.mock.count("amp_check_plan");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(server.mock.count("amp_check_plan"), before);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn polls_only_what_applies() {
     // A done ticket, no plan approval, an approved artifact: only the board keeps polling.
@@ -449,6 +560,7 @@ async fn polls_only_what_applies() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             intervals: fast(100),
@@ -479,6 +591,7 @@ async fn amp_tool_calls_refresh_at_once() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             // Nothing is due again for an hour: every later call comes from a tool trigger.
@@ -681,6 +794,7 @@ async fn re_login_needed_heals_by_reconnecting_through_the_connector() {
     let meta = MetaPoller::spawn(
         Some(client(&old.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2107),
             intervals: iv,
@@ -744,6 +858,74 @@ async fn re_login_needed_heals_by_reconnecting_through_the_connector() {
     assert_eq!(meta.snapshot().health.connection, Connection::Ok);
 }
 
+/// #2159: the session's own client (the model's amp_* tools, run reporting, the supervisor all
+/// share it) heals after `amp-harness login` the same way the poller does: the next tool call
+/// after the login reconnects through its reconnector and runs on the new connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_models_amp_tools_heal_after_a_re_login() {
+    use amp_core::mcp_tools::McpTool;
+    use rpi_agent::{AgentTool, ToolResultPartial};
+    use tokio_util::sync::CancellationToken;
+
+    let old = serve(Mock::new(default_board())).await;
+    let new = serve(Mock::new(default_board())).await;
+    let shared = client(&old.url).await;
+    let logged_in = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicU64::new(0));
+    let reconnector: Connector = {
+        let (old_url, new_url) = (old.url.clone(), new.url.clone());
+        let (logged_in, attempts) = (logged_in.clone(), attempts.clone());
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let url = if logged_in.load(Ordering::SeqCst) {
+                new_url.clone()
+            } else {
+                old_url.clone()
+            };
+            Box::pin(async move {
+                AmpMcpClient::connect(
+                    ClientOptions::new(url).with_connect_timeout(Duration::from_secs(2)),
+                )
+                .await
+            })
+        })
+    };
+    // The poller's Connector and the client's Reconnector are the same closure type.
+    shared.set_reconnector(Some(reconnector));
+    let interval = Duration::from_millis(300);
+    shared.set_reconnect_interval(interval);
+    let catalog = shared.catalog().await.expect("catalog");
+    let tool = McpTool::new(
+        catalog.get("amp_whoami").expect("amp_whoami"),
+        shared.clone(),
+    );
+    async fn run(tool: &McpTool) -> Result<AgentToolResult, rpi_agent::AgentError> {
+        tool.execute(
+            "call-1",
+            json!({}),
+            CancellationToken::new(),
+            Arc::new(|_: ToolResultPartial| {}),
+        )
+        .await
+    }
+    run(&tool).await.expect("works before");
+
+    old.mock.unauthorized.store(true, Ordering::SeqCst);
+    let err = run(&tool).await.unwrap_err();
+    assert!(err.to_string().contains("amp-harness login"), "{err}");
+
+    logged_in.store(true, Ordering::SeqCst);
+    tokio::time::sleep(interval).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), run(&tool))
+        .await
+        .expect("no hang")
+        .expect("the same tool works again after the login");
+    assert!(!format!("{:?}", result.content).is_empty());
+    assert_eq!(new.mock.count("amp_whoami"), 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(shared.generation(), 1);
+}
+
 /// #2108: a ticket that doesn't exist is that item's error (the header shows it unavailable); the
 /// connection stays healthy. Slash commands' own calls run on the poller's connection.
 #[tokio::test(flavor = "multi_thread")]
@@ -753,6 +935,7 @@ async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(99_999),
             intervals: fast(3_600_000),
@@ -815,6 +998,42 @@ async fn tool_errors_mark_the_item_not_the_connection_and_commands_call_through_
     .await;
 }
 
+/// #2383: a poller started with no project (the chat's folder had no `.amp.json`) follows the
+/// project the folder is linked to later, with the `/project` panel's parent-folder note, and
+/// fetches its project and board.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_project_moves_a_poller_with_no_project_onto_one() {
+    let server = serve(Mock::new(default_board())).await;
+    let meta = MetaPoller::spawn(
+        Some(client(&server.url).await),
+        MetaOptions {
+            project_marker: None,
+            project_id: None,
+            ticket_id: None,
+            intervals: fast(150),
+            connector: None,
+            web_url: None,
+        },
+    );
+    wait_for(&meta, "the user", |m| m.user.get().is_some()).await;
+    assert_eq!(server.mock.count("amp_get_project"), 0);
+    meta.link_project(
+        Some(2),
+        Some((2, "../.amp.json (a parent folder's: /x)".into())),
+    );
+    let m = wait_for(&meta, "the linked project and its board", |m| {
+        m.project.get().is_some() && m.board.get().is_some()
+    })
+    .await;
+    assert_eq!(m.project_id, Some(2));
+    assert_eq!(m.project.get().unwrap().name, "AMP");
+    assert_eq!(m.project_marker.as_ref().map(|(id, _)| *id), Some(2));
+    // Linked again without the note (the folder got its own .amp.json): the note goes.
+    meta.link_project(Some(2), None);
+    wait_for(&meta, "the note cleared", |m| m.project_marker.is_none()).await;
+    assert_eq!(meta.snapshot().project_id, Some(2));
+}
+
 /// #2160: a slash command's write that the caller already reported as failed (no answer in
 /// time, because the poller was stuck in a refresh against a hung AMP) is never sent afterwards.
 /// Otherwise `/questions` says "not answered", the user answers again, and both answers land.
@@ -830,6 +1049,7 @@ async fn a_call_the_caller_gave_up_on_is_never_sent() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             intervals: iv,
@@ -887,6 +1107,7 @@ async fn a_refresh_stops_at_the_first_timeout_but_not_at_an_amp_error() {
     let meta = MetaPoller::spawn(
         Some(client(&server.url).await),
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             ticket_id: Some(2104),
             intervals: iv,
@@ -980,6 +1201,7 @@ async fn connects_in_the_background_and_retries() {
     let meta = MetaPoller::spawn(
         None,
         MetaOptions {
+            project_marker: None,
             project_id: Some(2),
             intervals: fast(3_600_000),
             connector: Some(connector),

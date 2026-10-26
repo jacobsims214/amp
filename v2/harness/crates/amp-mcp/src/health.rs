@@ -31,13 +31,12 @@ impl Health {
         match result {
             Ok(()) => Self::Connected,
             Err(e) if e.is_server_error() => Self::Connected,
-            Err(McpError::AuthRequired { .. }) => Self::AuthRequired,
+            Err(McpError::AuthRequired { .. } | McpError::ServerAuth { .. }) => Self::AuthRequired,
             Err(McpError::Closed) => Self::Disconnected {
                 reason: "connection closed".to_owned(),
             },
-            Err(e) => Self::Degraded {
-                reason: e.to_string(),
-            },
+            // A plain reason for the header and `/amp` (#2178), never rmcp's type names.
+            Err(e) => Self::Degraded { reason: e.reason() },
         }
     }
 }

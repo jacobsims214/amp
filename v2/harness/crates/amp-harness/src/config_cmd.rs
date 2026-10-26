@@ -1,19 +1,23 @@
-//! `amp-harness config show [--json] [--check] [--config PATH]`: the providers and the provider/model
-//! each role resolves to (M2-3, #2091).
+//! `amp-harness [--config FILE] [--config-dir DIR] config show [--json] [--check]`: the providers
+//! and the provider/model each role resolves to (M2-3, #2091), from the user config.toml and the
+//! repo's `.amp/harness/config.toml` (#2232).
 //!
 //! Never prints a key: a provider's key is described by where it came from (`env OPENROUTER_API_KEY`,
 //! `keychain`, `missing (...)`). `--check` asks each provider in use for its live model catalog and
 //! marks roles whose model id it does not list. Exit code 1 when a role does not resolve or a
 //! checked model is missing.
+//!
+//! `config check [--json] [--live]` (#2235) validates every layer (user file, repo file, defaults
+//! as overridden) area by area through [`amp_core::config_check`], naming the file and key of each
+//! problem and how to fix it. Exit code 1 when there is an error (warnings alone exit 0).
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::collections::{BTreeMap, BTreeSet};
 
 use amp_core::{
-    models::{ModelsConfig, Selection, thinking_name},
+    config_check::{self, Layer, Problem, Severity},
+    models::{ModelHints, ModelsConfig, Selection, thinking_name},
     providers::{KeyLookup, SystemKeys, live_model_ids, resolve_key},
+    roles::RoleRegistry,
 };
 use clap::{Args, Subcommand};
 use serde::Serialize;
@@ -24,6 +28,19 @@ use crate::conn::{CliError, print_json};
 pub enum ConfigCommand {
     /// Show the providers and the provider/model/thinking level each role resolves to.
     Show(ShowArgs),
+    /// Check every layer (user config.toml, the repo's .amp/harness/config.toml) and report each
+    /// problem with its file, key and a fix. Exit code 1 on errors.
+    Check(CheckArgs),
+}
+
+#[derive(Args)]
+pub struct CheckArgs {
+    /// Print JSON.
+    #[arg(long)]
+    json: bool,
+    /// Also check each role's model against its provider's live catalog (network; needs keys).
+    #[arg(long)]
+    live: bool,
 }
 
 #[derive(Args)]
@@ -34,9 +51,6 @@ pub struct ShowArgs {
     /// Check each model id against the provider's live catalog (network; Anthropic needs its key).
     #[arg(long)]
     check: bool,
-    /// Config file (default: $XDG_CONFIG_HOME/amp-harness/config.toml, else ~/.config/...).
-    #[arg(long)]
-    config: Option<PathBuf>,
 }
 
 /// `config show --json`. Add fields, never rename or remove them.
@@ -45,6 +59,8 @@ pub struct Report {
     pub ok: bool,
     pub config_file: Option<String>,
     pub config_found: bool,
+    /// The repo's `.amp/harness/config.toml`, when one was merged in (#2232).
+    pub repo_file: Option<String>,
     /// `profile` or `inherit`.
     pub mode: &'static str,
     /// Profile name, or the inherited `provider/model`.
@@ -53,6 +69,9 @@ pub struct Report {
     pub profiles: Vec<ProfileReport>,
     pub providers: Vec<ProviderReport>,
     pub roles: Vec<RoleReport>,
+    /// Repo agents not used (so not in `roles`) because they are not trusted as they are now
+    /// (#2338).
+    pub untrusted_agents: Vec<crate::roster::UntrustedRow>,
 }
 
 #[derive(Debug, Serialize)]
@@ -95,6 +114,9 @@ pub struct RoleReport {
     /// The level the config asked for, when it differs or was unset.
     pub requested_thinking: Option<&'static str>,
     pub source: Option<String>,
+    /// How a role with no `[roles.<id>]` of its own got its model (#2246): `fallback
+    /// worker-backend`, `[models] fallback`, `based_on <role>` or `agent file model`.
+    pub fallback: Option<String>,
     /// The provider has a key (or needs none).
     pub ready: bool,
     /// `--check`: `true` listed, `false` missing, `null` not checked.
@@ -105,14 +127,158 @@ pub struct RoleReport {
 pub async fn run(command: ConfigCommand) -> Result<(), CliError> {
     match command {
         ConfigCommand::Show(args) => show(args).await,
+        ConfigCommand::Check(args) => check(args).await,
+    }
+}
+
+/// Checks only the harness binary can run (they need crates amp-core doesn't depend on).
+pub(crate) const HARNESS_CHECKERS: &[(&str, config_check::Checker)] = &[("tui", check_tui)];
+
+/// `[tui]` as the chat reads it.
+fn check_tui(inputs: &config_check::Inputs) -> Vec<Problem> {
+    let (Some(text), Some(_)) = (&inputs.user_text, &inputs.user) else {
+        return Vec::new();
+    };
+    let home = (inputs.env)("HOME");
+    let env = move |k: &str| (k == "HOME").then(|| home.clone()).flatten();
+    match amp_tui::ThemeSettings::resolve(None, &env, Some(text)) {
+        Ok(_) => Vec::new(),
+        Err(e) => vec![
+            Problem::error("tui", Layer::User, e.0)
+                .file(inputs.user_file())
+                .key("tui"),
+        ],
+    }
+}
+
+async fn check(args: CheckArgs) -> Result<(), CliError> {
+    let cwd =
+        std::env::current_dir().map_err(|e| CliError::new(format!("current directory: {e}")))?;
+    let paths = crate::conn::config_paths_in(&cwd);
+    let env = |k: &str| std::env::var(k).ok();
+    let keys = SystemKeys::from_env();
+    let mut report = config_check::check(&paths, &env, &keys, HARNESS_CHECKERS);
+    if args.live {
+        let inputs = config_check::read_inputs(&paths, &env, &keys);
+        report.extend("catalog", live_problems(&inputs, &keys).await);
+    }
+    if args.json {
+        print_json(&report)?;
+    } else {
+        print_check(&report);
+    }
+    if report.ok {
+        Ok(())
+    } else {
+        Err(CliError::silent(1))
+    }
+}
+
+/// `--live`: roles whose model the provider's live catalog does not list.
+async fn live_problems(inputs: &config_check::Inputs<'_>, keys: &dyn KeyLookup) -> Vec<Problem> {
+    let Some(config) = &inputs.models else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut live: BTreeMap<String, Result<BTreeSet<String>, String>> = BTreeMap::new();
+    for (role, resolved) in config.resolve_all() {
+        let Ok(r) = resolved else { continue };
+        let Some(provider) = config.providers.get(&r.provider) else {
+            continue;
+        };
+        if !live.contains_key(&r.provider) {
+            let (key, source) = resolve_key(provider, keys);
+            let ids = if provider.needs_key && key.is_none() {
+                Err(format!("no key ({source})"))
+            } else {
+                live_model_ids(provider, keys).await
+            };
+            if let Err(e) = &ids {
+                out.push(
+                    Problem::warning(
+                        "catalog",
+                        Layer::Env,
+                        format!("{}'s live catalog was not checked: {e}", r.provider),
+                    )
+                    .key(format!("providers.{}", r.provider)),
+                );
+            }
+            live.insert(r.provider.clone(), ids);
+        }
+        if let Some(Ok(ids)) = live.get(&r.provider)
+            && !ids.contains(&r.model_id)
+        {
+            let (layer, file) = inputs.role_layer(&role);
+            out.push(
+                Problem::error(
+                    "catalog",
+                    layer,
+                    format!(
+                        "role `{role}` uses {}, which {}'s live catalog does not list",
+                        r.model_ref(),
+                        r.provider
+                    ),
+                )
+                .file(file.as_deref())
+                .key(format!("roles.{role}.model"))
+                .fix(format!(
+                    "`amp-harness models list --available --check` lists the models; `amp-harness models set {role} <provider/model>`"
+                )),
+            );
+        }
+    }
+    out
+}
+
+fn print_check(r: &config_check::CheckReport) {
+    let file = |path: &Option<std::path::PathBuf>, found: bool| match path {
+        Some(p) if found => p.display().to_string(),
+        Some(p) => format!("{} (not found)", p.display()),
+        None => "none".to_owned(),
+    };
+    println!("User config: {}", file(&r.user_file, r.user_file_found));
+    println!("Repo config: {}", file(&r.repo_file, r.repo_file_found));
+    println!("Checked:     {}", r.areas.join(", "));
+    for p in &r.problems {
+        let severity = match p.severity {
+            Severity::Error => "ERROR",
+            Severity::Warning => "warning",
+        };
+        let layer = serde_json::to_value(p.layer)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let mut head = format!("\n{severity} [{layer} {}]", p.area);
+        if let Some(key) = &p.key {
+            head.push_str(&format!(" {key}"));
+        }
+        if let Some(file) = &p.file {
+            head.push_str(&format!(" in {}", file.display()));
+        }
+        println!("{head}");
+        println!("  {}", p.message);
+        if let Some(fix) = &p.fix {
+            println!("  fix: {fix}");
+        }
+    }
+    let (errors, warnings) = (r.errors(), r.warnings());
+    if errors == 0 && warnings == 0 {
+        println!("\nOK: no problems.");
+    } else {
+        println!("\n{errors} error(s), {warnings} warning(s).");
     }
 }
 
 async fn show(args: ShowArgs) -> Result<(), CliError> {
-    let config = ModelsConfig::load_with_env(&|k| std::env::var(k).ok(), args.config.clone())
+    let cwd =
+        std::env::current_dir().map_err(|e| CliError::new(format!("current directory: {e}")))?;
+    let paths = crate::conn::config_paths_in(&cwd);
+    let config = ModelsConfig::load_paths(&|k| std::env::var(k).ok(), &paths)
         .map_err(|e| CliError::new(e.to_string()))?;
     let keys = SystemKeys::from_env();
-    let report = build_report(&config, &keys, args.check).await;
+    let (hints, untrusted) = agents_in_use(&paths);
+    let mut report = build_report_with(&config, &keys, args.check, &hints).await;
+    report.untrusted_agents = untrusted;
     if args.json {
         print_json(&report)?;
     } else {
@@ -125,8 +291,57 @@ async fn show(args: ShowArgs) -> Result<(), CliError> {
     }
 }
 
+/// Every agent's model role and fallback hints, from the agents sessions here use: a repo agent
+/// only when it is trusted (#2338); none when they do not load (`agents validate` reports that).
+/// Also the repo agents left out because they are not trusted.
+pub fn agents_in_use(
+    paths: &amp_mcp::ConfigPaths,
+) -> (Vec<(String, ModelHints)>, Vec<crate::roster::UntrustedRow>) {
+    let gate = crate::roster::gate(paths);
+    let untrusted = crate::roster::rows(
+        &crate::roster::untrusted(paths, &gate),
+        amp_core::repo_trust::ItemKind::Agent,
+    );
+    let hints = crate::roster::load_assets(paths, &gate)
+        .ok()
+        .and_then(|assets| RoleRegistry::from_assets(&assets).ok())
+        .map(|roles| {
+            roles
+                .roles()
+                .map(|r| (r.model_role.clone(), r.model_hints()))
+                .collect()
+        })
+        .unwrap_or_default();
+    (hints, untrusted)
+}
+
+/// Under the roles table: the repo agents left out, and how to trust them (#2338).
+pub fn print_untrusted_agents(r: &Report) {
+    if let Some(footer) =
+        crate::roster::footer(amp_core::repo_trust::ItemKind::Agent, &r.untrusted_agents)
+    {
+        println!("\n{footer}");
+    }
+}
+
+/// The configured roles only. Use [`build_report_with`] to add the agents with no model of
+/// their own.
 pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bool) -> Report {
-    let in_use = config.providers_in_use();
+    build_report_with(config, keys, check, &[]).await
+}
+
+/// The configured roles plus every agent in `agents` that falls back (#2246).
+pub async fn build_report_with(
+    config: &ModelsConfig,
+    keys: &dyn KeyLookup,
+    check: bool,
+    agents: &[(String, ModelHints)],
+) -> Report {
+    let resolved = config.resolve_agents(agents);
+    let in_use: BTreeSet<String> = resolved
+        .iter()
+        .filter_map(|(_, r)| r.as_ref().ok().map(|r| r.provider.clone()))
+        .collect();
     let mut live: BTreeMap<String, Result<BTreeSet<String>, String>> = BTreeMap::new();
     if check {
         for id in &in_use {
@@ -166,8 +381,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
         .collect();
 
     let mut ok = true;
-    let roles = config
-        .resolve_all()
+    let roles = resolved
         .into_iter()
         .map(|(role, resolved)| match resolved {
             Ok(r) => {
@@ -190,6 +404,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
                     thinking: Some(thinking_name(r.thinking)),
                     requested_thinking: requested,
                     source: Some(r.source.clone()),
+                    fallback: r.fell_back(),
                     live,
                     error: None,
                     role,
@@ -204,6 +419,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
                     thinking: None,
                     requested_thinking: None,
                     source: None,
+                    fallback: None,
                     ready: false,
                     live: None,
                     error: Some(e.to_string()),
@@ -220,6 +436,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
         ok,
         config_file: config.config_file.as_ref().map(|p| p.display().to_string()),
         config_found: config.config_found,
+        repo_file: config.repo_file.as_ref().map(|p| p.display().to_string()),
         mode,
         selection,
         selection_source,
@@ -233,6 +450,7 @@ pub async fn build_report(config: &ModelsConfig, keys: &dyn KeyLookup, check: bo
             .collect(),
         providers,
         roles,
+        untrusted_agents: Vec::new(),
     }
 }
 
@@ -241,6 +459,9 @@ fn print_human(r: &Report) {
         (Some(path), true) => println!("Config:    {path}"),
         (Some(path), false) => println!("Config:    {path} (not found; shipped defaults)"),
         (None, _) => println!("Config:    none (shipped defaults)"),
+    }
+    if let Some(repo) = &r.repo_file {
+        println!("Repo:      {repo}");
     }
     let mode = if r.mode == "inherit" {
         format!("inherit {}", r.selection)
@@ -280,6 +501,19 @@ fn print_human(r: &Report) {
     }
 
     println!("\nRoles:");
+    print_roles(r);
+    print_untrusted_agents(r);
+}
+
+/// The ROLE / PROVIDER/MODEL / THINKING / READY / SOURCE table (`config show`, `connect`).
+pub fn print_roles(r: &Report) {
+    print!("{}", roles_table(r));
+}
+
+/// [`print_roles`]' text. THINKING is as wide as its widest cell, so "off (asked low)" keeps
+/// READY and SOURCE in line (#2336).
+fn roles_table(r: &Report) -> String {
+    use std::fmt::Write as _;
     let width = r
         .roles
         .iter()
@@ -290,47 +524,66 @@ fn print_human(r: &Report) {
                 .map(|(p, m)| p.len() + m.len() + 1)
         })
         .max()
-        .unwrap_or(20);
+        .unwrap_or(20)
+        .max("PROVIDER/MODEL".len());
+    let thinking_of = |role: &RoleReport| {
+        let mut thinking = role.thinking.unwrap_or("-").to_owned();
+        if let Some(req) = role.requested_thinking
+            && req != "unset"
+        {
+            thinking = format!("{thinking} (asked {req})");
+        }
+        thinking
+    };
+    let think_w = r
+        .roles
+        .iter()
+        .filter(|x| x.provider.is_some() && x.model.is_some())
+        .map(|x| thinking_of(x).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(8);
     let ready_w = if r.roles.iter().any(|x| x.live.is_some()) {
         22
     } else {
         7
     };
-    println!(
-        "  {:<18} {:<width$}  {:<8} {:<ready_w$} SOURCE",
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "  {:<18} {:<width$}  {:<think_w$} {:<ready_w$} SOURCE",
         "ROLE", "PROVIDER/MODEL", "THINKING", "READY"
     );
     for role in &r.roles {
         match (&role.provider, &role.model) {
             (Some(p), Some(m)) => {
-                let mut thinking = role.thinking.unwrap_or("-").to_owned();
-                if let Some(req) = role.requested_thinking
-                    && req != "unset"
-                {
-                    thinking = format!("{thinking} (asked {req})");
-                }
                 let mut ready = if role.ready { "yes" } else { "no key" }.to_owned();
                 match role.live {
                     Some(true) => ready.push_str(", live ok"),
                     Some(false) => ready.push_str(", NOT IN CATALOG"),
                     None => {}
                 }
-                println!(
-                    "  {:<18} {:<width$}  {:<8} {:<ready_w$} {}",
+                let _ = writeln!(
+                    out,
+                    "  {:<18} {:<width$}  {:<think_w$} {:<ready_w$} {}",
                     role.role,
                     format!("{p}/{m}"),
-                    thinking,
+                    thinking_of(role),
                     ready,
                     role.source.as_deref().unwrap_or("")
                 );
             }
-            _ => println!(
-                "  {:<18} ERROR: {}",
-                role.role,
-                role.error.as_deref().unwrap_or("unresolved")
-            ),
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "  {:<18} ERROR: {}",
+                    role.role,
+                    role.error.as_deref().unwrap_or("unresolved")
+                );
+            }
         }
     }
+    out
 }
 
 #[cfg(test)]
@@ -376,5 +629,45 @@ mod tests {
         assert_eq!(anthropic.key, "env");
         assert_eq!(anthropic.key_source, "env ANTHROPIC_API_KEY");
         assert!(anthropic.in_use);
+    }
+
+    /// #2336: "off (asked low)" is wider than THINKING; READY and SOURCE still line up.
+    #[test]
+    fn the_roles_table_columns_line_up_with_asked_thinking() {
+        let role = |name: &str, thinking, requested| RoleReport {
+            role: name.into(),
+            provider: Some("wf".into()),
+            model: Some("wf-1".into()),
+            thinking: Some(thinking),
+            requested_thinking: requested,
+            source: Some("config config.toml".into()),
+            fallback: None,
+            ready: true,
+            live: None,
+            error: None,
+        };
+        let report = Report {
+            ok: true,
+            config_file: None,
+            config_found: true,
+            repo_file: None,
+            mode: "profile",
+            selection: "x".into(),
+            selection_source: "test".into(),
+            profiles: vec![],
+            providers: vec![],
+            roles: vec![
+                role("manager", "high", None),
+                role("worker-docs", "off", Some("low")),
+            ],
+            untrusted_agents: vec![],
+        };
+        let table = roles_table(&report);
+        let cols: Vec<usize> = table
+            .lines()
+            .map(|l| l.find("yes").or_else(|| l.find("READY")).unwrap())
+            .collect();
+        assert!(cols.windows(2).all(|w| w[0] == w[1]), "{table}");
+        assert!(table.contains("off (asked low) yes"), "{table}");
     }
 }

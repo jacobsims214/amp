@@ -112,10 +112,11 @@ fn embedded_markdown_has_no_host_glue() {
     }
     let manager = assets.agent("amp-manager").unwrap();
     assert!(manager.prompt.contains("amp_run_ticket"));
-    // The manager may no longer edit .opencode/** or opencode.json.
+    // The manager may no longer edit .opencode/** or opencode.json; only `.amp.json` (#2363).
     let edit = &manager.frontmatter["permission"]["edit"];
-    assert_eq!(edit.as_object().unwrap().len(), 1, "{edit}");
+    assert_eq!(edit.as_object().unwrap().len(), 2, "{edit}");
     assert_eq!(edit["*"], "deny");
+    assert_eq!(edit[".amp.json"], "allow");
 }
 
 #[test]

@@ -191,6 +191,14 @@ func (h *RestHandler) me(w http.ResponseWriter, r *http.Request) {
 	if ident.LocalDev {
 		resp["roles"] = []string{domain.RoleAdmin}
 	}
+	// What this AMP and the caller's orgs let the UI offer (additive: an old
+	// UI ignores it; a UI talking to an old API treats it as unavailable).
+	rc, err := h.remoteCapability(r)
+	if err != nil {
+		jsonErr(w, err, 500)
+		return
+	}
+	resp["capabilities"] = map[string]any{"remote_control": rc}
 	jsonOK(w, resp)
 }
 
@@ -1629,7 +1637,13 @@ func jsonOK(w http.ResponseWriter, v interface{}) {
 func jsonErr(w http.ResponseWriter, err error, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+	body := map[string]string{"error": err.Error()}
+	// A stable code next to the message, when the error has one (additive:
+	// clients that read only "error" are unaffected).
+	if c := authz.CodeOf(err); c != "" {
+		body["code"] = c
+	}
+	json.NewEncoder(w).Encode(body)
 }
 
 func errorf(msg string) error {
