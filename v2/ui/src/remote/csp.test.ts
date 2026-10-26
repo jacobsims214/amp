@@ -94,3 +94,50 @@ describe('no client-side navigation to a session page (#2381 M6)', () => {
     expect(bad.test('<a href={`/sessions/${id}`}>')).toBe(false)
   })
 })
+
+/**
+ * The baseline CSP has no 'unsafe-inline', so static HTML the nginx serves must keep its
+ * script and styles in files. #2471: /home/ shipped with an inline <style>, <script> and
+ * style="" attributes and rendered unstyled in prod once the CSP went on.
+ */
+describe('no inline script or style in served HTML (#2471)', () => {
+  const html = (dir: string): string[] => readdirSync(dir).flatMap(n => {
+    const p = join(dir, n)
+    return statSync(p).isDirectory() ? html(p) : /\.html?$/.test(n) ? [p] : []
+  })
+  /** What the baseline CSP would block in one HTML document. */
+  const inlineCode = (doc: string): string[] => {
+    const found: string[] = []
+    const tags = doc.replace(/<!--[\s\S]*?-->/g, '').match(/<[a-zA-Z][^>]*>/g) ?? []
+    for (const tag of tags) {
+      const name = tag.slice(1).split(/[\s>/]/)[0].toLowerCase()
+      if (name === 'style') found.push('<style> element')
+      if (name === 'script' && !/\ssrc\s*=/i.test(tag) && !/\stype\s*=\s*["']?application\/(ld\+)?json/i.test(tag)) found.push('inline <script>')
+      if (/\sstyle\s*=/i.test(tag)) found.push(`style= attribute: ${tag.slice(0, 80)}`)
+      if (/\son[a-z]+\s*=/i.test(tag)) found.push(`inline event handler: ${tag.slice(0, 80)}`)
+      if (/=\s*["']?\s*javascript:/i.test(tag)) found.push(`javascript: URL: ${tag.slice(0, 80)}`)
+    }
+    return found
+  }
+
+  it('finds none in index.html or anything under public/', () => {
+    const root = process.cwd()
+    const docs = [resolve(root, 'index.html'), ...html(resolve(root, 'public'))]
+    expect(docs.some(f => f.endsWith(join('public', 'home', 'index.html')))).toBe(true)
+    const offenders = Object.fromEntries(docs.map(f => [f.slice(root.length + 1), inlineCode(readFileSync(f, 'utf8'))]).filter(([, v]) => v.length))
+    expect(offenders).toEqual({})
+  })
+
+  it('catches each kind if added', () => {
+    expect(inlineCode('<style>body{}</style>')).toEqual(['<style> element'])
+    expect(inlineCode('<script>alert(1)</script>')).toEqual(['inline <script>'])
+    expect(inlineCode('<div style="color:red">')).toHaveLength(1)
+    expect(inlineCode('<path class="flow" style=\'animation-delay:-.3s\'/>')).toHaveLength(1)
+    expect(inlineCode('<button onclick="go()">')).toHaveLength(1)
+    expect(inlineCode('<a href="javascript:go()">')).toHaveLength(1)
+    // Allowed: external files, JSON data blocks, the word "style" in text, comments.
+    expect(inlineCode('<script src="/home/home.js" defer></script><script type="module" src="/src/main.tsx"></script>')).toEqual([])
+    expect(inlineCode('<script type="application/ld+json">{}</script>')).toEqual([])
+    expect(inlineCode('<link rel="stylesheet" href="/home/home.css"><p>in style</p><!-- <style> -->')).toEqual([])
+  })
+})
