@@ -200,9 +200,13 @@ func (s *Service) GetOrgRemotePolicy(ctx context.Context, p authz.Principal, org
 
 // ValidateRemotePolicy checks a policy's values are in range.
 func ValidateRemotePolicy(pol domain.RemotePolicy) error {
-	if pol.IdleTimeoutMin < domain.RemoteIdleTimeoutMin || pol.IdleTimeoutMin > domain.RemoteIdleTimeoutMax {
-		return authz.Coded(400, domain.RemoteCodeMalformed, "idle_timeout_min must be %d..%d",
+	if pol.IdleTimeoutMin != 0 && (pol.IdleTimeoutMin < domain.RemoteIdleTimeoutMin || pol.IdleTimeoutMin > domain.RemoteIdleTimeoutMax) {
+		return authz.Coded(400, domain.RemoteCodeMalformed, "idle_timeout_min must be 0 (no idle limit) or %d..%d",
 			domain.RemoteIdleTimeoutMin, domain.RemoteIdleTimeoutMax)
+	}
+	if pol.MaxLifetimeHours < 0 || pol.MaxLifetimeHours > domain.RemoteMaxLifetimeMax {
+		return authz.Coded(400, domain.RemoteCodeMalformed, "max_lifetime_hours must be 0 (no lifetime limit) or 1..%d",
+			domain.RemoteMaxLifetimeMax)
 	}
 	if pol.DevicePinDays < 0 || pol.DevicePinDays > domain.RemoteDevicePinMax {
 		return authz.Coded(400, domain.RemoteCodeMalformed, "device_pin_days must be 0..%d", domain.RemoteDevicePinMax)
@@ -236,7 +240,8 @@ func (s *Service) SetOrgRemotePolicy(ctx context.Context, p authz.Principal, org
 		OrgID: intRef(orgID), Action: domain.AuditRemotePolicySet, TargetType: "org", TargetID: idStr(orgID),
 		Summary: fmt.Sprintf("set remote control for org %s: enabled=%v", s.orgLabel(ctx, orgID), pol.Enabled),
 		Details: map[string]any{
-			"enabled": pol.Enabled, "idle_timeout_min": pol.IdleTimeoutMin, "device_pin_days": pol.DevicePinDays,
+			"enabled": pol.Enabled, "idle_timeout_min": pol.IdleTimeoutMin, "max_lifetime_hours": pol.MaxLifetimeHours,
+			"device_pin_days": pol.DevicePinDays,
 			"was_enabled": before.Enabled,
 		},
 	})
@@ -368,7 +373,8 @@ func (s *Service) EnableRemoteSession(ctx context.Context, p authz.Principal, re
 		ID: id, OwnerUserID: p.UserID, ProjectID: reg.ProjectID,
 		Host: clip(reg.Host, 255), OS: clip(reg.OS, 64), HarnessVersion: clip(reg.HarnessVersion, 64),
 		HarnessID: reg.HarnessID, HarnessPub: reg.HarnessPub, ProtocolVersion: reg.ProtocolVersion,
-		ExpiresAt: time.Now().Add(domain.RemoteMaxLifetime),
+		// No lifetime unless the org set one (#2424).
+		ExpiresAt: pol.SessionExpiry(time.Now()),
 	}
 	if reg.Node != "" {
 		sess.HolderNode = &reg.Node
@@ -412,7 +418,8 @@ func (s *Service) RecordRemotePair(ctx context.Context, p authz.Principal, sess 
 
 // PinRemoteDevice records a device the harness accepted (a signed
 // pair_result), trusted until now + the org's device_pin_days; 0 days means
-// until the session ends.
+// until the session ends (its lifetime, or the longest pin when it has none:
+// the harness keeps such pins in memory only, so they end with the session).
 func (s *Service) PinRemoteDevice(ctx context.Context, sess *domain.RemoteSession, deviceID, devicePub, name string) (*domain.RemoteDevice, error) {
 	fp, err := RemoteFingerprint(devicePub)
 	if err != nil {
@@ -426,7 +433,10 @@ func (s *Service) PinRemoteDevice(ctx context.Context, sess *domain.RemoteSessio
 		return nil, err
 	}
 	now := time.Now()
-	until := sess.ExpiresAt
+	until := now.Add(domain.RemoteDevicePinMax * 24 * time.Hour)
+	if sess.ExpiresAt != nil {
+		until = *sess.ExpiresAt
+	}
 	if pol.DevicePinDays > 0 {
 		until = now.Add(time.Duration(pol.DevicePinDays) * 24 * time.Hour)
 	}
@@ -506,7 +516,8 @@ func (s *Service) endRemoteAfterAccessChange(ctx context.Context, p authz.Princi
 // ending a session itself (the harness is authoritative; this is the backstop).
 const RemoteIdleGrace = 60 * time.Second
 
-// ExpireRemoteSessions ends sessions past their 12 h lifetime or idle limit,
+// ExpireRemoteSessions ends sessions past their lifetime or idle limit (both
+// opt-in per org, #2424),
 // audited as remote.expire, and sessions whose owner lost access to the
 // project (remote.disable, reason revoked). The relay calls it periodically.
 func (s *Service) ExpireRemoteSessions(ctx context.Context, now time.Time) ([]domain.RemoteSession, error) {

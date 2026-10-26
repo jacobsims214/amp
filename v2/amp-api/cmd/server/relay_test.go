@@ -576,14 +576,20 @@ func TestRelay_HarnessLegAuth(t *testing.T) {
 
 	st, body, _ = e.do(t, "POST", "/relay/v1/sessions", reg, as("alice"))
 	wantStatus(t, "register", st, body, 201, "")
-	for _, k := range []string{"session_id", "connect_token", "connect_token_expires_at_ms", "expires_at_ms", "session_url", "limits"} {
+	for _, k := range []string{"session_id", "connect_token", "connect_token_expires_at_ms", "session_url", "limits"} {
 		if body[k] == nil {
 			t.Fatalf("register response lacks %s: %v", k, body)
 		}
 	}
+	// #2424: no lifetime and no idle limit by default: both members are null.
+	for _, k := range []string{"expires_at_ms", "idle_timeout_s"} {
+		if v, ok := body[k]; !ok || v != nil {
+			t.Fatalf("register response %s = %v, want null", k, body)
+		}
+	}
 	id, tok := body["session_id"].(string), body["connect_token"].(string)
 	if !strings.HasPrefix(tok, "rct_") || body["session_url"] != relayOrigin+"/sessions/"+id ||
-		body["idle_timeout_s"] != float64(1800) || body["keepalive_interval_s"] != float64(20) {
+		body["keepalive_interval_s"] != float64(20) {
 		t.Fatalf("register response: %v", body)
 	}
 
@@ -598,7 +604,8 @@ func TestRelay_HarnessLegAuth(t *testing.T) {
 	wantStatus(t, "another session's token", st, body, 401, "unauthenticated")
 	st, body, _ = e.do(t, "POST", hb, nil, bearer(tok))
 	wantStatus(t, "heartbeat", st, body, 200, "")
-	if body["viewers"] != float64(0) || body["idle_deadline_ms"] == nil {
+	// #2424: no idle limit and no lifetime by default, so both deadlines are null.
+	if _, ok := body["idle_deadline_ms"]; body["viewers"] != float64(0) || !ok || body["idle_deadline_ms"] != nil || body["expires_at_ms"] != nil {
 		t.Fatalf("heartbeat: %v", body)
 	}
 	// The OAuth leg of the token: only the owner refreshes, after the policy check.
@@ -1234,7 +1241,8 @@ func breakRemoteAudit(t *testing.T, email, action string) (undo func()) {
 	return undo
 }
 
-// Keepalives, presence, the one-stream rule, and the idle and lifetime ends.
+// Keepalives, presence, the one-stream rule, and the idle and lifetime ends
+// of an org that opted into them (#2424: both are off by default).
 func TestRelay_KeepalivePresenceAndTimeouts(t *testing.T) {
 	e := newRelayEnv(t, func(c *relay.Config) {
 		c.Keepalive = 50 * time.Millisecond
@@ -1242,6 +1250,7 @@ func TestRelay_KeepalivePresenceAndTimeouts(t *testing.T) {
 		c.Sweep = 20 * time.Millisecond
 		c.Expire = time.Hour // the test runs the sweep itself
 	})
+	setOrgLimits(t, e.w.s.repo, e.w.org.ID, 30, 12)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go e.rl.Run(ctx)
@@ -1317,7 +1326,7 @@ func TestRelay_KeepalivePresenceAndTimeouts(t *testing.T) {
 		t.Fatalf("remote.expire: %+v", a)
 	}
 
-	// Max lifetime: 12 h from registration.
+	// Max lifetime: the org's 12 h from registration.
 	s2 := e.register(t, "alice")
 	hc4 := s2.connect(t)
 	if _, err := db.Exec(context.Background(), `UPDATE remote_sessions SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, s2.id); err != nil {

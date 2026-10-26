@@ -25,8 +25,11 @@ const (
 	RemoteEndKilled       = "killed"
 )
 
-// RemoteMaxLifetime is how long a session lives after `/remote` (protocol 10).
-const RemoteMaxLifetime = 12 * time.Hour
+// A session has no time limit by default (#2424, user decision 2026-10-26:
+// "keep itself alive until a user disconnects it"). It ends on an explicit
+// action: /remote off or quitting the chat, Disconnect or Revoke in the web
+// app, the org switch, deactivation or lost access. An org admin can opt into
+// an idle limit and a maximum lifetime (RemotePolicy).
 
 // RemoteListEndedFor is how far back GET /api/sessions lists ended sessions,
 // and RemoteListEndedMax how many of them at most (#2389).
@@ -63,7 +66,9 @@ type RemoteSession struct {
 	StartedAt       time.Time  `json:"started_at"`
 	HeartbeatAt     *time.Time `json:"heartbeat_at,omitempty"`
 	LastActivityAt  time.Time  `json:"last_activity_at"`
-	ExpiresAt       time.Time  `json:"expires_at"`
+	// ExpiresAt is when the session's maximum lifetime ends: nil (the
+	// default) when its org set no lifetime at registration (#2424).
+	ExpiresAt *time.Time `json:"expires_at"`
 	EndedAt         *time.Time `json:"ended_at,omitempty"`
 	// Model and the current ticket are copied from the harness's signed
 	// status (protocol 6.3, #2389): metadata for the session list, never
@@ -94,24 +99,46 @@ type RemoteDevice struct {
 }
 
 // RemotePolicy is an org's remote control setting (protocol 8.3 "Org policy").
+// IdleTimeoutMin and MaxLifetimeHours are 0 when off, the default (#2424).
 type RemotePolicy struct {
-	Enabled        bool `json:"enabled"`
-	IdleTimeoutMin int  `json:"idle_timeout_min"`
-	DevicePinDays  int  `json:"device_pin_days"`
+	Enabled          bool `json:"enabled"`
+	IdleTimeoutMin   int  `json:"idle_timeout_min"`
+	MaxLifetimeHours int  `json:"max_lifetime_hours"`
+	DevicePinDays    int  `json:"device_pin_days"`
 }
 
-// Defaults and bounds of RemotePolicy.
+// Defaults and bounds of RemotePolicy. The idle limit and the lifetime are
+// off (0) by default; an admin may set 5..240 minutes and 1..720 hours.
 const (
-	RemoteIdleTimeoutDefault = 30
+	RemoteIdleTimeoutDefault = 0
 	RemoteIdleTimeoutMin     = 5
 	RemoteIdleTimeoutMax     = 240
+	RemoteMaxLifetimeDefault = 0
+	RemoteMaxLifetimeMax     = 720
 	RemoteDevicePinDefault   = 30
 	RemoteDevicePinMax       = 30
 )
 
-// DefaultRemotePolicy is every org's policy until an admin changes it: off.
+// DefaultRemotePolicy is every org's policy until an admin changes it: off,
+// and with no time limits once turned on.
 func DefaultRemotePolicy() RemotePolicy {
-	return RemotePolicy{Enabled: false, IdleTimeoutMin: RemoteIdleTimeoutDefault, DevicePinDays: RemoteDevicePinDefault}
+	return RemotePolicy{Enabled: false, IdleTimeoutMin: RemoteIdleTimeoutDefault,
+		MaxLifetimeHours: RemoteMaxLifetimeDefault, DevicePinDays: RemoteDevicePinDefault}
+}
+
+// IdleTimeout is the idle limit, 0 when there is none.
+func (p RemotePolicy) IdleTimeout() time.Duration {
+	return time.Duration(p.IdleTimeoutMin) * time.Minute
+}
+
+// SessionExpiry is when a session registered at start ends by lifetime: nil
+// when the policy sets no lifetime.
+func (p RemotePolicy) SessionExpiry(start time.Time) *time.Time {
+	if p.MaxLifetimeHours <= 0 {
+		return nil
+	}
+	t := start.Add(time.Duration(p.MaxLifetimeHours) * time.Hour)
+	return &t
 }
 
 // RemoteCapability is /api/me's capabilities.remote_control: whether the UI

@@ -18,8 +18,9 @@ import (
 // GetOrgRemotePolicy is orgID's remote control setting.
 func (r *Repo) GetOrgRemotePolicy(ctx context.Context, orgID int) (domain.RemotePolicy, error) {
 	var p domain.RemotePolicy
-	err := r.db.QueryRow(ctx, `SELECT remote_control_enabled, remote_idle_timeout_min, remote_device_pin_days
-		FROM orgs WHERE id = $1`, orgID).Scan(&p.Enabled, &p.IdleTimeoutMin, &p.DevicePinDays)
+	err := r.db.QueryRow(ctx, `SELECT remote_control_enabled, remote_idle_timeout_min, remote_max_lifetime_hours,
+		remote_device_pin_days FROM orgs WHERE id = $1`, orgID).Scan(&p.Enabled, &p.IdleTimeoutMin, &p.MaxLifetimeHours,
+		&p.DevicePinDays)
 	if err == pgx.ErrNoRows {
 		return p, fmt.Errorf("org %d: %w", orgID, ErrNotFound)
 	}
@@ -30,7 +31,8 @@ func (r *Repo) GetOrgRemotePolicy(ctx context.Context, orgID int) (domain.Remote
 // already be in range (the table checks them too).
 func (r *Repo) SetOrgRemotePolicy(ctx context.Context, orgID int, p domain.RemotePolicy) error {
 	tag, err := r.db.Exec(ctx, `UPDATE orgs SET remote_control_enabled = $2, remote_idle_timeout_min = $3,
-		remote_device_pin_days = $4 WHERE id = $1`, orgID, p.Enabled, p.IdleTimeoutMin, p.DevicePinDays)
+		remote_device_pin_days = $4, remote_max_lifetime_hours = $5 WHERE id = $1`,
+		orgID, p.Enabled, p.IdleTimeoutMin, p.DevicePinDays, p.MaxLifetimeHours)
 	if err == nil && tag.RowsAffected() == 0 {
 		return fmt.Errorf("org %d: %w", orgID, ErrNotFound)
 	}
@@ -54,9 +56,10 @@ func (r *Repo) ProjectRemotePolicy(ctx context.Context, projectID int) (domain.R
 	p := domain.DefaultRemotePolicy()
 	var orgID *int
 	var enabled *bool
-	var idle, pin *int
-	err := r.db.QueryRow(ctx, `SELECT p.org_id, o.remote_control_enabled, o.remote_idle_timeout_min, o.remote_device_pin_days
-		FROM projects p LEFT JOIN orgs o ON o.id = p.org_id WHERE p.id = $1`, projectID).Scan(&orgID, &enabled, &idle, &pin)
+	var idle, life, pin *int
+	err := r.db.QueryRow(ctx, `SELECT p.org_id, o.remote_control_enabled, o.remote_idle_timeout_min,
+		o.remote_max_lifetime_hours, o.remote_device_pin_days
+		FROM projects p LEFT JOIN orgs o ON o.id = p.org_id WHERE p.id = $1`, projectID).Scan(&orgID, &enabled, &idle, &life, &pin)
 	if err == pgx.ErrNoRows {
 		return p, nil, fmt.Errorf("project %d: %w", projectID, ErrNotFound)
 	}
@@ -64,7 +67,7 @@ func (r *Repo) ProjectRemotePolicy(ctx context.Context, projectID int) (domain.R
 		return p, nil, err
 	}
 	if enabled != nil {
-		p = domain.RemotePolicy{Enabled: *enabled, IdleTimeoutMin: *idle, DevicePinDays: *pin}
+		p = domain.RemotePolicy{Enabled: *enabled, IdleTimeoutMin: *idle, MaxLifetimeHours: *life, DevicePinDays: *pin}
 	}
 	return p, orgID, nil
 }
@@ -82,8 +85,8 @@ func scanRemoteSession(row rowScanner, s *domain.RemoteSession) error {
 }
 
 // CreateRemoteSession inserts an active session. ID, OwnerUserID, ProjectID,
-// HarnessID, HarnessPub and ExpiresAt are required; the times not given
-// default to now.
+// HarnessID and HarnessPub are required; ExpiresAt is nil for a session with
+// no lifetime (#2424); the times not given default to now.
 func (r *Repo) CreateRemoteSession(ctx context.Context, s domain.RemoteSession) (*domain.RemoteSession, error) {
 	if s.ProtocolVersion == 0 {
 		s.ProtocolVersion = 1
@@ -278,17 +281,19 @@ func (r *Repo) EndRemoteSessionsWithoutAccess(ctx context.Context, reason string
 	return r.endRemoteSessions(ctx, `NOT `+remoteOwnerHasAccess, reason)
 }
 
-// EndExpiredRemoteSessions ends live sessions past their 12 h lifetime
-// (reason expired) and those idle longer than their org's idle timeout plus
-// grace (reason idle; the harness is authoritative, this is the backstop).
+// EndExpiredRemoteSessions ends live sessions past their lifetime (reason
+// expired) and those idle longer than their org's idle timeout plus grace
+// (reason idle; the harness is authoritative, this is the backstop). Both are
+// opt-in (#2424): a session with no expires_at has no lifetime, and an org
+// whose idle timeout is 0 (the default) has no idle limit.
 func (r *Repo) EndExpiredRemoteSessions(ctx context.Context, now time.Time, grace time.Duration) ([]domain.RemoteSession, error) {
-	expired, err := r.endRemoteSessions(ctx, `expires_at <= $2`, domain.RemoteEndExpired, now)
+	expired, err := r.endRemoteSessions(ctx, `expires_at IS NOT NULL AND expires_at <= $2`, domain.RemoteEndExpired, now)
 	if err != nil {
 		return nil, err
 	}
-	idle, err := r.endRemoteSessions(ctx, `last_activity_at + make_interval(mins => COALESCE(
-			(SELECT o.remote_idle_timeout_min FROM projects p JOIN orgs o ON o.id = p.org_id WHERE p.id = project_id),
-			`+fmt.Sprint(domain.RemoteIdleTimeoutDefault)+`)) + make_interval(secs => $3) <= $2`,
+	idle, err := r.endRemoteSessions(ctx, `EXISTS (SELECT 1 FROM projects p JOIN orgs o ON o.id = p.org_id
+			WHERE p.id = project_id AND o.remote_idle_timeout_min > 0
+			AND last_activity_at + make_interval(mins => o.remote_idle_timeout_min) + make_interval(secs => $3) <= $2)`,
 		domain.RemoteEndIdle, now, grace.Seconds())
 	if err != nil {
 		return nil, err
