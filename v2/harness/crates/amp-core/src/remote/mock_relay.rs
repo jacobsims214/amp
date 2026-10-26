@@ -90,6 +90,8 @@ struct App {
     changed: Arc<Notify>,
     /// The relay service is down (#2396): every call gets the proxy's `503`.
     down: Arc<std::sync::atomic::AtomicBool>,
+    /// Added to the mock's clock (a laptop whose clock is off, #2399).
+    clock_offset_ms: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// While the relay is "down", answer as Envoy does with no amp-relay behind it: `503`, a text
@@ -276,10 +278,14 @@ async fn refresh(
     // The harness key's proof (protocol 8.2, #2390).
     let (harness_id, harness_pub) = (s.harness_id.clone(), s.harness_pub.clone());
     let nonces = &mut s.proof_nonces;
+    let relay_now = now_ms()
+        + app
+            .clock_offset_ms
+            .load(std::sync::atomic::Ordering::SeqCst);
     let code = super::token::check(
         &body,
         super::token::ProofReceiver {
-            now_ms: now_ms(),
+            now_ms: relay_now,
             session_id: &id,
             harness_id: &harness_id,
             harness_pub: &harness_pub,
@@ -292,7 +298,13 @@ async fn refresh(
     );
     if code != "ok" {
         let status = if code == "bad_signature" { 403 } else { 400 };
-        return err(status, code, json!({}));
+        // A stale proof's answer carries the relay's clock, as amp-relay's does.
+        let extra = if code == "stale_ts" {
+            json!({"now_ms": relay_now})
+        } else {
+            json!({})
+        };
+        return err(status, code, extra);
     }
     s.tokens.push(connect.clone());
     ok(
@@ -468,6 +480,7 @@ impl MockRelay {
             inner: Default::default(),
             changed: Arc::new(Notify::new()),
             down: Default::default(),
+            clock_offset_ms: Default::default(),
         };
         let router = Router::new()
             .route("/relay/v1/sessions", post(register))
@@ -550,6 +563,14 @@ impl MockRelay {
         if down {
             self.drop_stream();
         }
+    }
+
+    /// Moves the relay's clock `ms` away from the harness's (#2399): with more than 60 s,
+    /// every token refresh is refused as `stale_ts`.
+    pub fn set_clock_offset(&self, ms: i64) {
+        self.app
+            .clock_offset_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Forgets the session's connect tokens, as if they lapsed during an outage: only a token

@@ -306,13 +306,20 @@ pub fn drop_partial_tail(s: &str) -> &str {
     &s[..trailing_word_start(s)]
 }
 
+/// The longest run of held text without a word boundary. A token-like word that grows past it
+/// is redacted whole (see [`DeltaGuard::push`]).
+pub const MAX_HELD_WORD: usize = 8 * 1024;
+
 /// Holds back the trailing token-like word of a delta stream, so redaction sees whole words.
 #[derive(Debug, Default)]
 pub struct DeltaGuard {
     /// `(message_id, thinking)` of the held text, and the text.
     held: Option<(String, bool, String)>,
-    /// When the held text last grew.
+    /// When the held text last grew; `None` once a quiet flush has sent what it could.
     since: Option<std::time::Instant>,
+    /// `(message_id, thinking)` of an over-long word that was redacted whole: the rest of that
+    /// word is dropped until its first boundary (#2399, re-review #2394 N4b).
+    skipping: Option<(String, bool)>,
 }
 
 impl DeltaGuard {
@@ -320,6 +327,10 @@ impl DeltaGuard {
     /// without its trailing word or any tail that could start one of `redactor`'s known values
     /// (held until the next delta or a flush). Anything held for another message comes back in
     /// `flushed` first.
+    ///
+    /// A word with no boundary that reaches [`MAX_HELD_WORD`] bytes is sent as [`REDACTED`]
+    /// and the rest of it is dropped: cutting it would split whatever secret spans the cut, and
+    /// an unbroken run that long is an opaque blob, not prose (N4b).
     pub fn push(
         &mut self,
         message_id: &str,
@@ -334,15 +345,46 @@ impl DeltaGuard {
             Some(other) => flushed = Some(other),
             None => {}
         }
+        let mut delta = delta;
+        if let Some((id, th)) = &self.skipping {
+            if id != message_id || *th != thinking {
+                self.skipping = None;
+            } else {
+                // Still inside the redacted word: drop up to its first boundary.
+                match delta.char_indices().find(|&(_, c)| !token_char(c)) {
+                    Some((i, _)) => {
+                        delta = &delta[i..];
+                        self.skipping = None;
+                    }
+                    None => return (flushed, String::new()),
+                }
+            }
+        }
         text.push_str(delta);
         self.since = Some(std::time::Instant::now());
         let cut = redactor.safe_cut(&text, trailing_word_start(&text));
         // A whole delta of one word (no boundary yet) is held, up to a bound.
-        if cut == 0 && text.len() < 8 * 1024 {
-            self.held = Some((message_id.to_owned(), thinking, text));
+        if cut == 0 && text.len() < MAX_HELD_WORD {
+            if !text.is_empty() {
+                self.held = Some((message_id.to_owned(), thinking, text));
+            }
             return (flushed, String::new());
         }
-        let cut = if cut == 0 { text.len() } else { cut };
+        let cut = if cut == 0 {
+            if trailing_word_start(&text) == 0 {
+                // One unbroken word at the bound: redact it rather than split it.
+                self.skipping = Some((message_id.to_owned(), thinking));
+                return (flushed, REDACTED.to_owned());
+            }
+            // Held only because a known value may continue past the end: send what can't
+            // be part of one, and redact the lot if nothing can be sent.
+            match redactor.safe_cut(&text, text.len()) {
+                0 => return (flushed, REDACTED.to_owned()),
+                c => c,
+            }
+        } else {
+            cut
+        };
         let rest = text.split_off(cut);
         if !rest.is_empty() {
             self.held = Some((message_id.to_owned(), thinking, rest));
@@ -350,17 +392,35 @@ impl DeltaGuard {
         (flushed, text)
     }
 
-    /// Whatever is held: `(message_id, thinking, text)`.
+    /// Whatever is held: `(message_id, thinking, text)`. For the end of a message (another
+    /// event, or the run ending): a known value's prefix still held then never got the rest.
     pub fn flush(&mut self) -> Option<(String, bool, String)> {
+        self.since = None;
         self.held.take().filter(|(_, _, t)| !t.is_empty())
+    }
+
+    /// What the feed's quiet may send (#2399, re-review #2394 N4a): the held text up to any
+    /// tail that could start one of `redactor`'s known values. That tail stays held, whatever
+    /// the wait, until the message's next delta or its end ([`flush`](Self::flush)): a model
+    /// that stalls in the middle of a secret would otherwise send it in two halves, and neither
+    /// half matches. The tail is shorter than the longest known value.
+    pub fn flush_quiet(&mut self, redactor: &Redactor) -> Option<(String, bool, String)> {
+        let (id, thinking, mut text) = self.held.take()?;
+        self.since = None;
+        let cut = redactor.safe_cut(&text, text.len());
+        let rest = text.split_off(cut);
+        if !rest.is_empty() {
+            self.held = Some((id.clone(), thinking, rest));
+        }
+        (!text.is_empty()).then_some((id, thinking, text))
     }
 
     pub fn is_holding(&self) -> bool {
         self.held.is_some()
     }
 
-    /// Whether the held text has waited at least `quiet` for more (then flush it: the stream
-    /// paused or ended).
+    /// Whether the held text has waited at least `quiet` for more since it last grew (then
+    /// [`flush_quiet`](Self::flush_quiet) it: the stream paused or ended).
     pub fn is_stale(&self, quiet: std::time::Duration) -> bool {
         self.held.is_some() && self.since.is_some_and(|t| t.elapsed() >= quiet)
     }
@@ -494,6 +554,130 @@ mod tests {
                 "seed {seed}: the deltas sent differ from the whole text redacted"
             );
         }
+    }
+
+    /// N4a (#2399): the model stalls mid-secret. Quiet flushes at random points (as on_tick
+    /// sends after 400 ms without a delta) never send a known value in two halves.
+    #[test]
+    fn a_quiet_flush_mid_secret_never_leaks() {
+        let secret_chars: Vec<char> = "abcXYZ019@:!#$%&*-_./+=~ é".chars().collect();
+        let text_chars: Vec<char> = "abc xyz@:!.,\n é".chars().collect();
+        for seed in 1..=3000u64 {
+            let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            let len = MIN_SECRET_LEN + rng.below(24);
+            let mut secret: String = (0..len).map(|_| rng.pick(&secret_chars)).collect();
+            secret = format!("q{}z", secret.trim());
+            let r = Redactor::new();
+            r.add_values([secret.as_str()]);
+            let around = |rng: &mut Rng| -> String {
+                (0..rng.below(12)).map(|_| rng.pick(&text_chars)).collect()
+            };
+            let stream = format!("{}{}{}", around(&mut rng), secret, around(&mut rng));
+            let bounds: Vec<usize> = stream.char_indices().map(|(i, _)| i).collect();
+            let mut cuts: Vec<usize> = (0..1 + rng.below(5))
+                .map(|_| bounds[rng.below(bounds.len())])
+                .collect();
+            cuts.sort_unstable();
+            cuts.dedup();
+            let mut g = DeltaGuard::default();
+            let mut sent = String::new();
+            let mut at = 0;
+            for c in cuts.into_iter().chain([stream.len()]) {
+                if c <= at {
+                    continue;
+                }
+                let (_, now) = g.push("m1", false, &stream[at..c], &r);
+                sent.push_str(&r.redact(&now));
+                at = c;
+                // The feed goes quiet here, possibly in the middle of the secret.
+                if rng.below(2) == 0
+                    && let Some((_, _, q)) = g.flush_quiet(&r)
+                {
+                    sent.push_str(&r.redact(&q));
+                }
+            }
+            if let Some((_, _, rest)) = g.flush() {
+                sent.push_str(&r.redact(&rest));
+            }
+            assert!(
+                !sent.contains(&secret),
+                "seed {seed}: {secret:?} leaked from {stream:?} as {sent:?}"
+            );
+            assert_eq!(sent, r.redact(&stream), "seed {seed}");
+        }
+    }
+
+    /// The held tail is kept however long the quiet lasts, and only what can't start the
+    /// secret is sent.
+    #[test]
+    fn a_quiet_flush_keeps_a_secret_prefix() {
+        let r = Redactor::new();
+        r.add_values(["tok:9f8e7d6c5b4a"]);
+        let mut g = DeltaGuard::default();
+        let (_, a) = g.push("m1", false, "the token is tok:9f8e", &r);
+        let q = g.flush_quiet(&r).map(|x| x.2).unwrap_or_default();
+        let again = g.flush_quiet(&r);
+        assert!(again.is_none(), "{again:?}");
+        assert!(!g.is_stale(std::time::Duration::ZERO));
+        let (_, b) = g.push("m1", false, "7d6c5b4a, done", &r);
+        let rest = g.flush().map(|x| x.2).unwrap_or_default();
+        let sent = [a, q, b, rest]
+            .iter()
+            .map(|x| r.redact(x))
+            .collect::<String>();
+        assert_eq!(sent, "the token is [redacted], done");
+    }
+
+    /// N4b (#2399): a word with no boundary for 8 KiB is redacted whole, never cut where a
+    /// secret (known or token-shaped) may span the cut, and the rest of it is dropped.
+    #[test]
+    fn an_overlong_word_is_redacted_not_split() {
+        let secret = "known-secret-0123456789abcdef";
+        for at in [
+            MAX_HELD_WORD - 10,
+            MAX_HELD_WORD - 1,
+            MAX_HELD_WORD,
+            MAX_HELD_WORD + 7,
+        ] {
+            for split in [3, 11, secret.len() - 1] {
+                let r = Redactor::new();
+                r.add_values([secret]);
+                let word = format!("{}{}{}", "x".repeat(at), secret, "y".repeat(50));
+                let (first, second) = word.split_at(at + split);
+                let mut g = DeltaGuard::default();
+                let mut sent = String::new();
+                for d in [first, second, " and then prose."] {
+                    let (_, now) = g.push("m1", false, d, &r);
+                    sent.push_str(&r.redact(&now));
+                }
+                if let Some((_, _, rest)) = g.flush() {
+                    sent.push_str(&r.redact(&rest));
+                }
+                assert!(!sent.contains(secret), "at {at} split {split}: {sent:.80}");
+                assert!(
+                    !sent.contains(&secret[..split]),
+                    "at {at} split {split}: a prefix was sent"
+                );
+                assert_eq!(sent, "[redacted] and then prose.", "at {at} split {split}");
+            }
+        }
+        // A token-shaped secret at the cut (no known value at all) isn't split either.
+        let r = Redactor::new();
+        let mut g = DeltaGuard::default();
+        let blob = format!(
+            "{}ghp_abcdefghijklmnopqrstuvwxyz0123",
+            "A".repeat(MAX_HELD_WORD - 8)
+        );
+        let (one, two) = blob.split_at(MAX_HELD_WORD + 2);
+        let (_, a) = g.push("m1", false, one, &r);
+        let (_, b) = g.push("m1", false, two, &r);
+        let (_, c) = g.push("m1", false, " ok ", &r);
+        assert_eq!(format!("{a}{b}{c}"), "[redacted] ok ");
+        // Another message ends the skipping.
+        let (_, d) = g.push("m1", false, &"B".repeat(MAX_HELD_WORD), &r);
+        assert_eq!(d, REDACTED);
+        let (_, e) = g.push("m2", false, "fresh text ", &r);
+        assert_eq!(e, "fresh text ");
     }
 
     #[test]
