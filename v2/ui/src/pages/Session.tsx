@@ -70,7 +70,7 @@ export function Session() {
 }
 
 function SessionView({ sessionId }: { sessionId: string }) {
-  const { phase, state, sendPrompt, stop, disconnect, paired, canSign } = useRemoteSession(sessionId)
+  const { phase, state, sendPrompt, stop, disconnect, paired, retryLoad, canSign } = useRemoteSession(sessionId)
   const scroller = useRef<HTMLDivElement>(null)
   const stick = useRef(true)
   const busy = isBusy(state)
@@ -93,6 +93,16 @@ function SessionView({ sessionId }: { sessionId: string }) {
   if (phase.kind === 'loading') return <Frame title="Remote session"><div className="flex justify-center py-16"><BandLoader label="Connecting to the session" /></div></Frame>
   if (phase.kind === 'not_found') return <Message title="No such session"><p className="m-0">It may have ended, or it belongs to someone else. Only the person who started a session can open it.</p></Message>
   if (phase.kind === 'gone') return <Message title="This session has ended"><p className="m-0">Run <code className="font-mono">/remote</code> in the harness on your laptop to start a new one.</p></Message>
+  if (phase.kind === 'error' && phase.retrying) {
+    // A passing failure (relay down, network): the page keeps trying and opens the session by itself (#2455).
+    return <Message title="Waiting to open the session">
+      <div role="status" className="grid gap-2">
+        <p className="m-0">{phase.message}</p>
+        <p className="m-0">This page keeps trying and opens the session as soon as it can. Nothing on the laptop is lost.</p>
+      </div>
+      <div><button type="button" className="amp-btn amp-btn-sm" onClick={retryLoad}>Try now</button></div>
+    </Message>
+  }
   if (phase.kind === 'error') return <Message title="Couldn't open the session"><p className="m-0">{phase.message}</p></Message>
   if (phase.kind === 'pairing') {
     return <Frame title="Remote session"><PairingPanel detail={phase.detail} link={phase.link} onPaired={paired} /></Frame>

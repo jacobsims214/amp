@@ -192,7 +192,8 @@ func TestRelay_StaleProofSaysTheRelaysTime(t *testing.T) {
 	}
 }
 
-// N7: losing access to the session's project ends the session the way
+// N7: losing access to the session's project ends the session (reason
+// access_lost, #2455; not revoked, which is Revoke all) the way
 // deactivation does: removed from the team, the team unlinked, removed from
 // the org; and, as a backstop for access lost any other way, the token
 // refresh and the relay's sweep check again.
@@ -201,14 +202,14 @@ func TestRelay_LosingProjectAccessEndsSessions(t *testing.T) {
 	ctx := context.Background()
 	ended := func(what string, s *rcSession, hc *sseConn) {
 		t.Helper()
-		if f := hc.waitFor(t, "end", ""); dataOf(t, f)["reason"] != domain.RemoteEndRevoked {
+		if f := hc.waitFor(t, "end", ""); dataOf(t, f)["reason"] != domain.RemoteEndAccessLost {
 			t.Fatalf("%s: end %v", what, f)
 		}
 		st, body, _ := e.do(t, "POST", "/relay/v1/sessions/"+s.id+"/heartbeat", nil, bearer(s.token))
 		if st != 410 {
 			t.Fatalf("%s: heartbeat %d %v", what, st, body)
 		}
-		if a := remoteAudit(t, e.w.s.repo, e.w.org.ID, domain.AuditRemoteDisable, s.id); len(a) != 1 || a[0].Details["reason"] != domain.RemoteEndRevoked {
+		if a := remoteAudit(t, e.w.s.repo, e.w.org.ID, domain.AuditRemoteDisable, s.id); len(a) != 1 || a[0].Details["reason"] != domain.RemoteEndAccessLost {
 			t.Fatalf("%s: remote.disable %+v", what, a)
 		}
 	}
@@ -259,6 +260,9 @@ func TestRelay_LosingProjectAccessEndsSessions(t *testing.T) {
 	}
 	st, body, _ = e.do(t, "POST", "/relay/v1/sessions/"+s2.id+"/token", e.tokenProof(t, s2.harness, s2.id), as("alice"))
 	wantStatus(t, "refresh after losing access", st, body, 410, domain.RemoteCodeSessionEnded)
+	if body["reason"] != domain.RemoteEndAccessLost {
+		t.Fatalf("refresh after losing access: reason %v, want %s (#2455)", body["reason"], domain.RemoteEndAccessLost)
+	}
 	ended("refresh", s2, hc2)
 
 	// ...and so does the relay's sweep.

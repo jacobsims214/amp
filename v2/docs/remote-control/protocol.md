@@ -1201,7 +1201,9 @@ laptop registers a new session, and the device pins still apply.
 | `harness_ended` | `/remote off`, harness exit, or `DELETE` without a reason |
 | `detached` | A signed `detach` command |
 | `disconnected` | The browser's Disconnect endpoint |
-| `revoked` | Revoke-all, or the owner's AMP account was deactivated |
+| `revoked` | Revoke-all |
+| `access_lost` | The owner can no longer see the session's project: removed from its team or org, the team unlinked, an admin role removed (#2455; `revoked` before) |
+| `deactivated` | The owner's AMP account was deactivated (#2455; `revoked` before) |
 | `policy_off` | The org or instance switch was turned off |
 | `idle` | The org's idle limit without remote activity (only when the org set one, #2424) |
 | `expired` | The org's lifetime since registration (only when the org set one, #2424) |
@@ -1210,6 +1212,9 @@ laptop registers a new session, and the device pins still apply.
 
 Every path ends in under 5 s. The relay closes all of the session's streams (R-M7).
 
+The harness and the session page show each reason in its own words. A client that meets a reason it doesn't know
+(an older harness or page against a newer AMP) says the session ended and names the reason; it never retries.
+
 ### 12.3 Re-checks
 
 - On every reconnect, the harness re-reads the local disable switch, re-checks its own idle and lifetime
@@ -1217,10 +1222,10 @@ Every path ends in under 5 s. The relay closes all of the session's streams (R-M
   token (the relay re-checks org policy) and reloads its pins.
 - The relay re-checks org policy on register, on token refresh and on policy change.
 - **Deactivating a person** (`POST /api/users/:id/deactivate`) ends all of their live sessions with reason
-  `revoked`, audited as `remote.disable`; amp-api tells the holder as for the org switch, so the streams close
+  `deactivated`, audited as `remote.disable`; amp-api tells the holder as for the org switch, so the streams close
   at once. The connect token of a deactivated owner is refused (`401`) on every replica even if that end
   didn't happen (#2390).
-- **Losing access to the project** ends the session the same way (reason `revoked`, audited as
+- **Losing access to the project** ends the session the same way (reason `access_lost`, audited as
   `remote.disable` with no actor when the relay finds it): amp-api checks right after a team member, a team, a
   project's team link, an org member or a global admin role is removed; the relay checks again on every token
   refresh (`410 session_ended`) and in its 30 s sweep, for access lost any other way (#2399).
@@ -1260,7 +1265,7 @@ a user disconnects it." So by default a session has **no idle limit and no lifet
 
 - `/remote off` or quitting the chat on the laptop (`harness_ended`), or a signed `detach` (`detached`);
 - **Disconnect** on the session page (`disconnected`), or **Revoke all** on Sessions (`revoked`);
-- the org switch turned off (`policy_off`), the owner deactivated or losing access to the project (`revoked`);
+- the org switch turned off (`policy_off`), the owner deactivated (`deactivated`) or losing access to the project (`access_lost`);
 - an org admin's opt-in idle limit (`idle`) or lifetime (`expired`), when set (8.3 "Org policy").
 
 The **relay's kill switch** (amp-relay scaled to 0, or `relay.enabled: false`) is a pause, not an end: the session

@@ -18,11 +18,18 @@ const (
 	RemoteEndHarnessEnded = "harness_ended"
 	RemoteEndDetached     = "detached"
 	RemoteEndDisconnected = "disconnected"
-	RemoteEndRevoked      = "revoked"
-	RemoteEndPolicyOff    = "policy_off"
-	RemoteEndIdle         = "idle"
-	RemoteEndExpired      = "expired"
-	RemoteEndKilled       = "killed"
+	RemoteEndRevoked      = "revoked" // Revoke all (the owner's own action)
+	// RemoteEndAccessLost: the owner can no longer see the session's project
+	// (removed from its team or org, the team unlinked, an admin role
+	// removed). Before #2455 this was "revoked".
+	RemoteEndAccessLost = "access_lost"
+	// RemoteEndDeactivated: the owner's AMP account was deactivated. Before
+	// #2455 this was "revoked".
+	RemoteEndDeactivated = "deactivated"
+	RemoteEndPolicyOff   = "policy_off"
+	RemoteEndIdle        = "idle"
+	RemoteEndExpired     = "expired"
+	RemoteEndKilled      = "killed"
 )
 
 // A session has no time limit by default (#2424, user decision 2026-10-26:
@@ -69,7 +76,7 @@ type RemoteSession struct {
 	// ExpiresAt is when the session's maximum lifetime ends: nil (the
 	// default) when its org set no lifetime at registration (#2424).
 	ExpiresAt *time.Time `json:"expires_at"`
-	EndedAt         *time.Time `json:"ended_at,omitempty"`
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
 	// Model and the current ticket are copied from the harness's signed
 	// status (protocol 6.3, #2389): metadata for the session list, never
 	// message content. CurrentTicketName falls back to the ticket's name in

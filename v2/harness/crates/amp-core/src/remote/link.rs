@@ -2228,28 +2228,11 @@ impl Actor {
         }
         self.log_action("end", None, reason);
         *lock(&self.link.shared.control) = None;
-        let text = match reason {
-            "idle" => format!(
-                "Remote control turned off after {} without remote activity. That is the \
-                 organization's limit.",
-                human_duration(self.idle_timeout_ms.unwrap_or(0))
-            ),
-            "expired" => format!(
-                "Remote control turned off: {} since it was turned on (the organization's limit).",
-                human_duration(
-                    self.expires_at_ms
-                        .map_or(0, |t| (t - self.started_at_ms).max(0))
-                )
-            ),
-            "detached" => "Remote control turned off from the paired device (detach).".to_owned(),
-            "harness_ended" => "Remote control is off.".to_owned(),
-            "disconnected" => "Remote control turned off from the web app (Disconnect).".to_owned(),
-            "revoked" => {
-                "Remote control turned off: all remote sessions were revoked in AMP.".to_owned()
-            }
-            "policy_off" => "Remote control turned off by the organization's setting.".to_owned(),
-            other => format!("Remote control turned off ({other})."),
-        };
+        let text = end_notice(
+            reason,
+            self.idle_timeout_ms,
+            self.expires_at_ms.map(|t| (t - self.started_at_ms).max(0)),
+        );
         self.link.notice(NoticeLevel::Info, text);
         if late_end {
             self.link.notice(
@@ -2277,6 +2260,37 @@ pub const NO_LIMIT_PENDING_MS: i64 = 30 * 24 * 3600 * 1000;
 /// now (#2424: the relay's kill switch pauses a session, it doesn't end it).
 fn session_gone(e: &RelayError) -> bool {
     e.status == 404 && e.code.as_deref() == Some("not_found")
+}
+
+/// What the person is told when remote control ends, one sentence per end reason (protocol 12.2).
+/// `idle_timeout_ms` and `lifetime_ms` are the org's limits, when it set them (#2424). Each reason
+/// has its own words (#2455): losing access to the project is not a Revoke all. A reason this
+/// harness doesn't know yet (a newer AMP) is named as it is.
+fn end_notice(reason: &str, idle_timeout_ms: Option<i64>, lifetime_ms: Option<i64>) -> String {
+    match reason {
+        "idle" => format!(
+            "Remote control turned off after {} without remote activity. That is the \
+             organization's limit.",
+            human_duration(idle_timeout_ms.unwrap_or(0))
+        ),
+        "expired" => format!(
+            "Remote control turned off: {} since it was turned on (the organization's limit).",
+            human_duration(lifetime_ms.unwrap_or(0))
+        ),
+        "detached" => "Remote control turned off from the paired device (detach).".to_owned(),
+        "harness_ended" => "Remote control is off.".to_owned(),
+        "disconnected" => "Remote control turned off from the web app (Disconnect).".to_owned(),
+        "revoked" => {
+            "Remote control turned off: all remote sessions were revoked in AMP.".to_owned()
+        }
+        "access_lost" => {
+            "Remote control ended: you no longer have access to this project.".to_owned()
+        }
+        "deactivated" => "Remote control ended: your AMP account was deactivated.".to_owned(),
+        "policy_off" => "Remote control turned off by the organization's setting.".to_owned(),
+        "killed" => "Remote control ended: an AMP admin ended this session.".to_owned(),
+        other => format!("Remote control turned off ({other})."),
+    }
 }
 
 /// `30 minutes`, `1 hour`, `45 seconds`.
@@ -2454,6 +2468,57 @@ impl Poster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2455: every end reason has its own words; losing project access isn't a Revoke all.
+    #[test]
+    fn end_notice_per_reason() {
+        assert_eq!(
+            end_notice("access_lost", None, None),
+            "Remote control ended: you no longer have access to this project."
+        );
+        assert_eq!(
+            end_notice("deactivated", None, None),
+            "Remote control ended: your AMP account was deactivated."
+        );
+        assert_eq!(
+            end_notice("revoked", None, None),
+            "Remote control turned off: all remote sessions were revoked in AMP."
+        );
+        assert_eq!(
+            end_notice("idle", Some(30 * 60_000), None),
+            "Remote control turned off after 30 minutes without remote activity. That is the \
+             organization's limit."
+        );
+        assert_eq!(
+            end_notice("expired", None, Some(3_600_000)),
+            "Remote control turned off: 1 hour since it was turned on (the organization's limit)."
+        );
+        let reasons = [
+            "idle",
+            "expired",
+            "detached",
+            "harness_ended",
+            "disconnected",
+            "revoked",
+            "access_lost",
+            "deactivated",
+            "policy_off",
+            "killed",
+        ];
+        let texts: std::collections::HashSet<String> =
+            reasons.iter().map(|r| end_notice(r, None, None)).collect();
+        assert_eq!(texts.len(), reasons.len(), "two reasons share a sentence");
+        for r in reasons {
+            assert!(
+                !end_notice(r, None, None).contains(&format!("({r})")),
+                "{r} falls through to the generic text"
+            );
+        }
+        assert_eq!(
+            end_notice("something_new", None, None),
+            "Remote control turned off (something_new)."
+        );
+    }
 
     fn refused(status: u16, code: &str, body: Value) -> RelayError {
         RelayError {

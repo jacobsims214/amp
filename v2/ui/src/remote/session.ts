@@ -374,6 +374,8 @@ export function endReasonText(reason: string, idleTimeoutS?: number | null): str
     detached: 'You disconnected this session.',
     disconnected: 'You disconnected this session.',
     revoked: 'All your remote sessions were revoked.',
+    access_lost: 'Remote control ended: you no longer have access to this project.',
+    deactivated: 'Remote control ended: your AMP account was deactivated.',
     policy_off: 'Remote control was turned off for your organization.',
     idle: idleMin
       ? `The session ended after ${idleMin} minute${idleMin === 1 ? '' : 's'} without remote activity.`
@@ -391,9 +393,11 @@ export function endReasonLabel(reason: string | null | undefined): string {
     detached: 'Detached on the laptop',
     disconnected: 'Disconnected',
     revoked: 'Revoked',
+    access_lost: 'Project access removed',
+    deactivated: 'Account deactivated',
     policy_off: 'Turned off by your org',
     idle: 'Idle timeout',
-    expired: '12-hour limit',
+    expired: 'Time limit',
     killed: 'Ended by an admin',
   }
   return (reason && m[reason]) || 'Ended'

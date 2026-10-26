@@ -57,6 +57,12 @@ spec:
                 name: {{ . }}
           {{- end }}
           env:
+            {{- with (.Values.dex.storage | default dict).pgOptions }}
+            # Session settings for Dex's Postgres connections only (lib/pq
+            # sends PGOPTIONS as the startup "options"). See dex.storage.
+            - name: PGOPTIONS
+              value: {{ . | quote }}
+            {{- end }}
             - name: DEX_UI_CLIENT_ID
               valueFrom:
                 secretKeyRef:
@@ -90,6 +96,29 @@ spec:
               mountPath: /srv/dex/web/themes/amp
               readOnly: true
             {{- end }}
+          {{- $probe := .Values.dex.storageProbe | default dict }}
+          {{- if $probe.enabled }}
+          {{- /*
+            Goes through storage on every call (see dex.storageProbe in
+            values.yaml): an unknown client_id makes Dex read the client table
+            and answer 401. 401 is healthy; anything else, or a hang, fails.
+          */}}
+          {{- $cmd := printf "wget -q -T %d -O /dev/null --post-data 'grant_type=authorization_code&client_id=%s' http://127.0.0.1:%d/dex/token 2>&1 | grep -q ' 401 '" (int (sub (int $probe.timeoutSeconds) 1)) $probe.clientID (int .Values.dex.httpPort) }}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", {{ $cmd | quote }}]
+            initialDelaySeconds: 3
+            periodSeconds: {{ $probe.readiness.periodSeconds }}
+            timeoutSeconds: {{ $probe.timeoutSeconds }}
+            failureThreshold: {{ $probe.readiness.failureThreshold }}
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", {{ $cmd | quote }}]
+            initialDelaySeconds: 20
+            periodSeconds: {{ $probe.liveness.periodSeconds }}
+            timeoutSeconds: {{ $probe.timeoutSeconds }}
+            failureThreshold: {{ $probe.liveness.failureThreshold }}
+          {{- else }}
           readinessProbe:
             httpGet: { path: /dex/healthz, port: http }
             initialDelaySeconds: 3
@@ -98,6 +127,7 @@ spec:
             httpGet: { path: /dex/healthz, port: http }
             initialDelaySeconds: 10
             periodSeconds: 15
+          {{- end }}
           resources:
             {{- toYaml .Values.dex.resources | nindent 12 }}
       volumes:
