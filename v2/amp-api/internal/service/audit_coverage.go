@@ -310,8 +310,7 @@ func (s *Service) RecordProjectExport(ctx context.Context, p authz.Principal, pr
 func (s *Service) RecordAuditExport(ctx context.Context, p authz.Principal, f domain.AuditFilter, format string, rows int) {
 	e := domain.AuditEntry{Action: "audit.export", TargetType: "audit_log",
 		Summary: fmt.Sprintf("exported %d audit log row(s) as %s", rows, format),
-		Details: map[string]any{"format": format, "rows": rows, "filter": map[string]any{
-			"org_id": f.OrgID, "project_id": f.ProjectID, "actor_user_id": f.ActorUserID, "action": f.Action, "before_id": f.BeforeID}}}
+		Details: map[string]any{"format": format, "rows": rows, "filter": f.Values()}}
 	if f.OrgID != 0 {
 		e.OrgID = intRef(f.OrgID)
 	}

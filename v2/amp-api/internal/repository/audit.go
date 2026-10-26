@@ -91,6 +91,7 @@ func scanAudit(row rowScanner, e *domain.AuditEntry) error {
 		&e.ChainKey, &e.ChainSeq, &e.Hash); err != nil {
 		return err
 	}
+	e.At = e.At.UTC() // the log speaks UTC (KB decisions/audit-log-v2.md section 3)
 	if err := json.Unmarshal(details, &e.Details); err != nil {
 		return err
 	}
@@ -131,6 +132,35 @@ func (r *Repo) ListAudit(ctx context.Context, f domain.AuditFilter) ([]domain.Au
 		} else {
 			where = append(where, "action = "+arg(f.Action))
 		}
+	}
+	if f.Actor != "" {
+		// A substring of the actor's email; LIKE's wildcards in it are literal.
+		esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(f.Actor)
+		where = append(where, "actor_email ILIKE '%' || "+arg(esc)+" || '%'")
+	}
+	if f.ActorType != "" {
+		where = append(where, "actor_type = "+arg(f.ActorType))
+	}
+	if f.TargetType != "" {
+		where = append(where, "target_type = "+arg(f.TargetType))
+	}
+	if f.TargetID != "" {
+		where = append(where, "target_id = "+arg(f.TargetID))
+	}
+	if f.IP != "" {
+		where = append(where, "source_ip <<= "+arg(f.IP)+"::inet")
+	}
+	if f.Outcome != "" {
+		where = append(where, "outcome = "+arg(f.Outcome))
+	}
+	if f.Client != "" {
+		where = append(where, "client = "+arg(f.Client))
+	}
+	if f.From != nil {
+		where = append(where, "at >= "+arg(*f.From))
+	}
+	if f.To != nil {
+		where = append(where, "at < "+arg(*f.To))
 	}
 	if f.BeforeID != 0 {
 		where = append(where, "id < "+arg(f.BeforeID))

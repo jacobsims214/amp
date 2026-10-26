@@ -22,7 +22,14 @@
 //	X-AMP-Signature: t=1760000000,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>
 //
 // A receiver checks the signature with the webhook's secret and rejects
-// old timestamps to stop replays.
+// old timestamps to stop replays. A webhook may also carry one static
+// header of its own (AuthHeaderName, e.g. "Authorization: Splunk <token>")
+// for SIEM collectors that authenticate that way; its value is a secret
+// and is never logged.
+//
+// Instance webhooks (no org, no project; global admins) receive every
+// audit entry, including the account-level ones no org owns: the SIEM
+// stream of the whole AMP.
 package webhook
 
 import (
@@ -40,6 +47,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -150,11 +158,66 @@ func New(repo *repository.Repo, opts Options) *Dispatcher {
 
 // Blocked reports whether ip is off limits without AllowPrivateNetworks.
 func Blocked(ip net.IP) bool {
-	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-		ip.IsUnspecified() || ip.IsMulticast() || cgnat.Contains(ip)
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, n := range blockedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
-var _, cgnat, _ = net.ParseCIDR("100.64.0.0/10")
+// blockedNets are the other ranges a webhook must not reach: carrier-grade
+// NAT, "this network", benchmarking, reserved, and NAT64 (which maps any
+// IPv4 address, private ones included, into IPv6).
+var blockedNets = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{"100.64.0.0/10", "0.0.0.0/8", "198.18.0.0/15", "240.0.0.0/4", "64:ff9b::/96", "64:ff9b:1::/48"} {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
+// ValidAuthHeader checks a webhook's extra header: a plain header name
+// that doesn't replace one AMP sets or one that shapes the request, and a
+// value with no line breaks.
+func ValidAuthHeader(name, value string) error {
+	if name == "" || len(name) > 64 {
+		return errors.New("the header name must be 1 to 64 characters")
+	}
+	for _, c := range name {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return fmt.Errorf("the header name %q may only use letters, digits, '-' and '_'", name)
+		}
+	}
+	canon := http.CanonicalHeaderKey(name)
+	if reservedHeaders[canon] || strings.HasPrefix(canon, "X-Amp-") || strings.HasPrefix(canon, "Proxy-") || strings.HasPrefix(canon, "Sec-") {
+		return fmt.Errorf("the header %s is set by AMP or by HTTP itself; pick another", canon)
+	}
+	if value == "" || len(value) > 4096 {
+		return errors.New("the header value must be 1 to 4096 characters")
+	}
+	for _, c := range value {
+		if c == '\r' || c == '\n' || c == 0 {
+			return errors.New("the header value can't contain line breaks")
+		}
+	}
+	return nil
+}
+
+var reservedHeaders = map[string]bool{
+	"Host": true, "Content-Type": true, "Content-Length": true, "Content-Encoding": true, "Transfer-Encoding": true,
+	"Connection": true, "Keep-Alive": true, "Upgrade": true, "Te": true, "Trailer": true, "Expect": true,
+	"User-Agent": true, "Cookie": true, "Forwarded": true, "X-Forwarded-For": true, "X-Forwarded-Host": true,
+	"X-Forwarded-Proto": true, "X-Real-Ip": true,
+}
 
 // Event queues a hub event. It never blocks (the hub calls it inline).
 func (d *Dispatcher) Event(e domain.Event) {
@@ -276,11 +339,11 @@ func (d *Dispatcher) match(ctx context.Context, it item) error {
 		if it.audit.OrgID != nil {
 			orgID = *it.audit.OrgID
 		}
-		if projectID == 0 && orgID == 0 {
-			return nil // account-level entries belong to no org
-		}
+		// Account-level entries (no org, no project) reach only the
+		// instance webhooks, which WebhooksForEvent adds for every audit
+		// entry.
 	}
-	hooks, err := d.repo.WebhooksForEvent(ctx, projectID, orgID)
+	hooks, err := d.repo.WebhooksForEvent(ctx, projectID, orgID, it.audit != nil)
 	if err != nil || len(hooks) == 0 {
 		return err
 	}
@@ -448,6 +511,11 @@ func (d *Dispatcher) post(ctx context.Context, dd repository.DueDelivery) (int, 
 	req.Header.Set("X-AMP-Event", dd.EventType)
 	req.Header.Set("X-AMP-Delivery", strconv.FormatInt(dd.ID, 10))
 	req.Header.Set("X-AMP-Signature", "t="+ts+",v1="+Sign(dd.Secret, ts, dd.Body))
+	if dd.AuthHeaderName != "" {
+		// Validated when saved (ValidAuthHeader); it can't replace the
+		// headers above.
+		req.Header.Set(dd.AuthHeaderName, dd.AuthHeaderValue)
+	}
 	resp, err := d.client.Do(req)
 	if err != nil {
 		var opErr *net.OpError

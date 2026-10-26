@@ -17,8 +17,20 @@ type Webhook struct {
 	Format    string `json:"format"` // WebhookFormatJSON or WebhookFormatSlack
 	// Secret signs each delivery (X-AMP-Signature). Only returned when a
 	// webhook is created or its secret rotated.
-	Secret              string     `json:"secret,omitempty"`
-	Events              []string   `json:"events"` // patterns, see WebhookMatches
+	Secret string   `json:"secret,omitempty"`
+	Events []string `json:"events"` // patterns, see WebhookMatches
+	// AuthHeaderName is an extra header sent with every delivery (e.g.
+	// "Authorization" for Splunk HEC, "DD-API-KEY" for Datadog), for
+	// receivers that want a static credential rather than checking the
+	// signature. Its value is a secret: write-only, never returned or
+	// logged; AuthHeaderSet says one is stored.
+	AuthHeaderName  string `json:"auth_header_name,omitempty"`
+	AuthHeaderSet   bool   `json:"auth_header_set"`
+	AuthHeaderValue string `json:"-"`
+	// Instance is a webhook of the whole AMP (no org, no project): global
+	// admins only, audit entries only, every one of them, including
+	// account-level rows that belong to no org (user.*, token.*, auth.*).
+	Instance            bool       `json:"instance,omitempty"`
 	Active              bool       `json:"active"`
 	CreatedBy           *int       `json:"created_by,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`

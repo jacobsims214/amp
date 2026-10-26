@@ -15,7 +15,9 @@ import (
 //	POST /api/projects/:id/webhooks          {name, url, format, events}  → includes the secret, once
 //	GET  /api/orgs/:id/webhooks              org owners/admins
 //	POST /api/orgs/:id/webhooks
-//	PATCH  /api/webhooks/:id                 {name?, url?, format?, events?, active?}
+//	GET  /api/webhooks                       instance webhooks: global admins (audit entries only, all of them)
+//	POST /api/webhooks
+//	PATCH  /api/webhooks/:id                 {name?, url?, format?, events?, active?, auth_header?}
 //	DELETE /api/webhooks/:id
 //	POST /api/webhooks/:id/rotate-secret     → the new secret
 //	POST /api/webhooks/:id/test              queues a ping
@@ -45,6 +47,14 @@ func (h *RestHandler) webhookCollection(w http.ResponseWriter, r *http.Request, 
 	default:
 		http.Error(w, "method not allowed", 405)
 	}
+}
+
+func (h *RestHandler) instanceWebhooks(w http.ResponseWriter, r *http.Request) {
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	h.webhookCollection(w, r, pr, nil, nil)
 }
 
 func (h *RestHandler) webhookSub(w http.ResponseWriter, r *http.Request) {
