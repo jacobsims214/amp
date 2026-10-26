@@ -29,10 +29,13 @@ var ErrSecretsKeyMissing = errors.New("webhook auth headers are stored encrypted
 
 // SetSecretsKeys sets the keyring that seals webhook secrets (main sets it
 // from the environment). nil: no key.
-func (r *Repo) SetSecretsKeys(k *secretbox.Keyring) { r.secrets = k }
+func (r *Repo) SetSecretsKeys(k *secretbox.Keyring) { r.secretsKeys.Store(k) }
+
+// secrets is the current keyring (nil: no key).
+func (r *Repo) secrets() *secretbox.Keyring { return r.secretsKeys.Load() }
 
 // CanSealSecrets reports whether an encryption key is configured.
-func (r *Repo) CanSealSecrets() bool { return r.secrets.CanSeal() }
+func (r *Repo) CanSealSecrets() bool { return r.secrets().CanSeal() }
 
 // sealAuthHeader seals an auth header value; it can't be stored without a
 // key.
@@ -40,20 +43,20 @@ func (r *Repo) sealAuthHeader(v string) (string, error) {
 	if v == "" {
 		return "", nil
 	}
-	if !r.secrets.CanSeal() {
+	if !r.secrets().CanSeal() {
 		return "", ErrSecretsKeyMissing
 	}
-	return r.secrets.Seal(secretbox.PurposeWebhookAuthHeader, v)
+	return r.secrets().Seal(secretbox.PurposeWebhookAuthHeader, v)
 }
 
 // sealSigningSecret seals a signing secret, or keeps it in plaintext
 // without a key (it only signs requests to the receiver; refusing to
 // create webhooks without a key would break every existing install).
 func (r *Repo) sealSigningSecret(v string) (string, error) {
-	if !r.secrets.CanSeal() {
+	if !r.secrets().CanSeal() {
 		return v, nil
 	}
-	return r.secrets.Seal(secretbox.PurposeWebhookSecret, v)
+	return r.secrets().Seal(secretbox.PurposeWebhookSecret, v)
 }
 
 // webhookCols never reads auth_header_value: only the delivery loop
@@ -214,10 +217,10 @@ func (r *Repo) ClaimDueDeliveries(ctx context.Context, limit int, lease time.Dur
 			return err
 		}
 		// The one place the secrets are opened.
-		secret, err := r.secrets.Open(secretbox.PurposeWebhookSecret, d.Secret)
+		secret, err := r.secrets().Open(secretbox.PurposeWebhookSecret, d.Secret)
 		if err == nil {
 			d.Secret = secret
-			d.AuthHeaderValue, err = r.secrets.Open(secretbox.PurposeWebhookAuthHeader, d.AuthHeaderValue)
+			d.AuthHeaderValue, err = r.secrets().Open(secretbox.PurposeWebhookAuthHeader, d.AuthHeaderValue)
 		}
 		if err != nil {
 			d.Secret, d.AuthHeaderValue, d.SecretsErr = "", "", fmt.Errorf("webhook %d: %w", d.WebhookID, err)
@@ -264,18 +267,18 @@ func (r *Repo) ResealWebhookSecrets(ctx context.Context, ids ...int) (SecretsRep
 		return rep, fmt.Errorf("read webhook secrets: %w", err)
 	}
 	reseal := func(id int, col, purpose, v string) error {
-		if v != "" && !secretbox.IsSealed(v) && purpose == secretbox.PurposeWebhookAuthHeader && !r.secrets.CanSeal() {
+		if v != "" && !secretbox.IsSealed(v) && purpose == secretbox.PurposeWebhookAuthHeader && !r.secrets().CanSeal() {
 			rep.PlaintextHeaders++
 		}
-		plain, err := r.secrets.Open(purpose, v)
+		plain, err := r.secrets().Open(purpose, v)
 		if err != nil {
 			rep.Unopenable++
 			return nil
 		}
-		if !r.secrets.NeedsReseal(v) {
+		if !r.secrets().NeedsReseal(v) {
 			return nil
 		}
-		sealed, err := r.secrets.Seal(purpose, plain)
+		sealed, err := r.secrets().Seal(purpose, plain)
 		if err != nil {
 			return err
 		}

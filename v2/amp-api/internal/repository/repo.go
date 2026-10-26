@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,9 +19,11 @@ type Repo struct {
 	db *pgxpool.Pool
 	// signupDomains limits first sign-ins (see SetSignupDomains).
 	signupDomains []string
-	// secrets seals the secrets stored in the database (webhook auth
-	// headers and signing secrets, #2441); see SetSecretsKeys.
-	secrets *secretbox.Keyring
+	// secretsKeys seals the secrets stored in the database (webhook auth
+	// headers and signing secrets, #2441); see SetSecretsKeys. Atomic: the
+	// webhook dispatcher reads it while a key change (startup, tests) sets
+	// it.
+	secretsKeys atomic.Pointer[secretbox.Keyring]
 }
 
 func New(ctx context.Context, dsn string) (*Repo, error) {
