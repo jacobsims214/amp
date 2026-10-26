@@ -322,3 +322,43 @@ func TestAuthMethodAndSession(t *testing.T) {
 		t.Fatal("session id without sub or iat")
 	}
 }
+
+// #2440 (review #2432 L3): oauth2-proxy refreshes the UI token hourly. Dex
+// keeps the sign-in's nonce in every refreshed token but issues a new iat,
+// so the session id follows the nonce (or auth_time), and auth.login is
+// written once per sign-in, not once an hour.
+func TestSessionSurvivesRefresh(t *testing.T) {
+	idp := newTestIdP(t)
+	v, err := NewVerifier(context.Background(), Config{IssuerURL: testIssuer, DiscoveryURL: idp.server.URL, UIClientID: "amp-ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	v = v.WithAudiences("rest", "amp-ui")
+	t0 := time.Now().Add(-2 * time.Hour).Truncate(time.Second)
+	sid := func(claims map[string]any) string {
+		t.Helper()
+		claims["aud"] = "amp-ui"
+		return identitySeen(t, v, "Bearer "+idp.token(t, claims)).SessionID
+	}
+	signIn := sid(map[string]any{"iat": t0.Unix(), "nonce": "n-1"})
+	refreshed := sid(map[string]any{"iat": t0.Add(time.Hour).Unix(), "nonce": "n-1"})
+	again := sid(map[string]any{"iat": t0.Add(2 * time.Hour).Unix(), "nonce": "n-1"})
+	if signIn == "" || refreshed != signIn || again != signIn {
+		t.Fatalf("a refreshed token (same nonce, new iat) changed the session: %q %q %q", signIn, refreshed, again)
+	}
+	if other := sid(map[string]any{"iat": t0.Add(time.Hour).Unix(), "nonce": "n-2"}); other == signIn {
+		t.Fatal("a new sign-in (new nonce) kept the session id")
+	}
+	// auth_time wins over the nonce when Dex sets it.
+	at := sid(map[string]any{"iat": t0.Unix(), "auth_time": t0.Unix(), "nonce": "n-1"})
+	if at2 := sid(map[string]any{"iat": t0.Add(time.Hour).Unix(), "auth_time": t0.Unix(), "nonce": "n-9"}); at2 != at || at == signIn {
+		t.Fatalf("auth_time session ids: %q %q (nonce one %q)", at, at2, signIn)
+	}
+	// Neither: iat, as before (so existing rows keep their meaning).
+	if got := sid(map[string]any{"iat": t0.Unix()}); got != SessionID("user-1", t0) {
+		t.Fatalf("no nonce: %q, want the sub+iat id", got)
+	}
+	if DexSessionID("", 1, "n", t0) != "" {
+		t.Fatal("session id without a subject")
+	}
+}

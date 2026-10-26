@@ -60,8 +60,9 @@ type Identity struct {
 	AuthMethod string
 	// TokenID is the api_tokens.id of the API token used (never the token).
 	TokenID int64
-	// SessionID identifies the Dex session a JWT belongs to: a truncated
-	// SHA-256 of its sub and iat (Dex issues no sid). Never the token.
+	// SessionID identifies the Dex sign-in a JWT belongs to, the same
+	// across refreshes when the token has auth_time or a nonce
+	// (DexSessionID). Never the token.
 	SessionID string
 
 	// provisioned is what JIT provisioning changed on this request (a new
@@ -348,6 +349,11 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 		// EmailVerified is a pointer so an absent claim (Dex's password
 		// DB omits it on some versions) isn't read as false.
 		EmailVerified *bool `json:"email_verified"`
+		// Nonce and AuthTime identify the sign-in a token was issued for:
+		// Dex copies the authorization's nonce into every token it
+		// refreshes, and newer Dex versions set auth_time (#2440).
+		Nonce    string `json:"nonce"`
+		AuthTime int64  `json:"auth_time"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		http.Error(w, `{"error":"malformed claims"}`, http.StatusUnauthorized)
@@ -364,7 +370,7 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 
 	ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name,
 		Audience: append([]string(nil), idToken.Audience...), AZP: claims.AZP,
-		SessionID: SessionID(claims.Subject, idToken.IssuedAt)}
+		SessionID: DexSessionID(claims.Subject, claims.AuthTime, claims.Nonce, idToken.IssuedAt)}
 	if v.repo == nil {
 		return ident
 	}
@@ -467,15 +473,43 @@ func (v *Verifier) authMethodOf(ident *Identity) string {
 	return AuthOAuthMCP
 }
 
+// DexSessionID derives the id of the sign-in a Dex JWT belongs to, stable
+// across token refreshes (#2440, review #2432 L3), from the first of:
+//   - auth_time, when Dex sets it (newer versions): when the person signed in;
+//   - nonce: Dex copies the authorization request's nonce into every token
+//     it refreshes from that sign-in (verified on Dex v2.42.0), and
+//     oauth2-proxy sends one when --insecure-oidc-skip-nonce=false (the
+//     chart sets it);
+//   - iat, as SessionID: then each refreshed token counts as a new session.
+//
+// oauth2-proxy refreshes the UI's token hourly (--cookie-refresh=1h), so
+// without auth_time or a nonce every hour looked like a new sign-in.
+func DexSessionID(subject string, authTime int64, nonce string, issuedAt time.Time) string {
+	switch {
+	case subject == "":
+		return ""
+	case authTime > 0:
+		return sessionHash(subject + "\x00auth_time:" + strconv.FormatInt(authTime, 10))
+	case nonce != "":
+		return sessionHash(subject + "\x00nonce:" + nonce)
+	}
+	return SessionID(subject, issuedAt)
+}
+
+func sessionHash(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:16])
+}
+
 // SessionID derives a stable, non-reversible id for the Dex session a JWT
 // belongs to from its sub and iat: the first 16 bytes of SHA-256, in hex.
-// Empty when either is missing.
+// Empty when either is missing. Used for tokens that carry neither
+// auth_time nor a nonce (DexSessionID).
 func SessionID(subject string, issuedAt time.Time) string {
 	if subject == "" || issuedAt.IsZero() {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(subject + "\x00" + strconv.FormatInt(issuedAt.Unix(), 10)))
-	return hex.EncodeToString(sum[:16])
+	return sessionHash(subject + "\x00" + strconv.FormatInt(issuedAt.Unix(), 10))
 }
 
 // IsUI reports whether the request came from a person in the web UI.
