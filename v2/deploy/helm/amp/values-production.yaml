@@ -118,6 +118,14 @@ clientIP:
 
 networkPolicy:
   enabled: true
+  # Only Traefik (talos: namespace traefik, chart traefik) may call Envoy.
+  # Any other pod would be a trusted hop (the pod CIDR is trusted above) and
+  # could forge the client IP.
+  envoyFrom:
+    - namespaceSelector:
+        matchLabels: { kubernetes.io/metadata.name: traefik }
+      podSelector:
+        matchLabels: { app.kubernetes.io/name: traefik }
 
 image:
   # Built + pushed by .github/workflows/build-images.yml on every push to

@@ -50,6 +50,10 @@ clientIP:
 # (templates/networkpolicy.yaml). Needs a CNI that enforces them.
 networkPolicy:
   enabled: true
+  # NetworkPolicyPeers allowed to open Envoy's listeners (8080, 8443): the
+  # ingress controller in front of it. Empty: no pod. docker-desktop reaches
+  # Envoy only through `kubectl port-forward`, which policies don't affect.
+  envoyFrom: []
 
 image:
   pullPolicy: IfNotPresent

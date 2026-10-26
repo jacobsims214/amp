@@ -4,7 +4,8 @@
 # CIDR (Traefik's and Envoy's pods). Without these policies any pod in the
 # cluster could call amp-api directly and forge the client IP in the audit
 # log. Envoy is the only way in, so only Envoy's pods may open the public
-# ports; amp-api's replica-to-replica port (3003) admits only amp-api. On
+# ports; amp-api's replica-to-replica port (3003) admits only amp-api; and
+# only networkPolicy.envoyFrom may reach Envoy (see the last policy). On
 # remote-m1, amp-relay has its own policy (relay.networkPolicy).
 #
 # Not affected: kubelet probes (from the node, not a pod) and
@@ -77,4 +78,34 @@ spec:
               app: envoy
       ports:
         - { protocol: TCP, port: 8091 }
+---
+# Who may reach Envoy itself. Envoy appends its TCP peer to X-Forwarded-For
+# and the services trust the whole pod CIDR, so a pod that could call Envoy
+# directly would be a trusted hop and could put any address to its left.
+# Only the ingress controller in front of Envoy (networkPolicy.envoyFrom:
+# Traefik in production) may open Envoy's listeners. Empty (docker-desktop):
+# no pod may; `kubectl port-forward` and the kubelet's readiness probe on
+# the admin port don't go through the pod network and still work.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: envoy
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "envoy" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: envoy
+  policyTypes: [Ingress]
+  {{- with .Values.networkPolicy.envoyFrom }}
+  ingress:
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8443 }
+  {{- else }}
+  ingress: []
+  {{- end }}
 {{- end }}

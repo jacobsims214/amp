@@ -12,7 +12,9 @@ KB decisions/audit-log-v2.md, section 2:
   CIDR or an address (the services trust nothing if one doesn't).
 - NetworkPolicies admit only Envoy to the public ports of amp-api (3001,
   8000), authadmin (8090) and mcpoauth (8091), and only amp-api to amp-api's
-  replica port (3003). networkPolicy.enabled=false renders none.
+  replica port (3003). Only networkPolicy.envoyFrom (Traefik in
+  production, no pod locally) may reach Envoy. networkPolicy.enabled=false
+  renders none.
 
 Usage (needs helm, PyYAML, and the valkey subchart in deploy/helm/amp/charts,
 e.g. `helm dependency build deploy/helm/amp`):
@@ -120,13 +122,30 @@ def test_trusted(docs, label, want):
                 check(False, f"{label}: {dep} trusted entry {e!r} is not a CIDR: {err}")
 
 
+def test_envoy_policy(docs, label, want_from):
+    pol = find(docs, "NetworkPolicy", "envoy")
+    check(pol, f"{label}: no NetworkPolicy envoy")
+    if not pol:
+        return
+    spec = pol[0]["spec"]
+    check(spec["podSelector"]["matchLabels"] == {"app": "envoy"}, f"{label}: envoy policy selects {spec['podSelector']}")
+    check(spec["policyTypes"] == ["Ingress"], f"{label}: envoy policy policyTypes {spec['policyTypes']}")
+    if not want_from:
+        check(spec.get("ingress") == [], f"{label}: envoy policy must admit no pod, got {spec.get('ingress')}")
+        return
+    rules = spec.get("ingress") or []
+    check(len(rules) == 1 and rules[0]["from"] == want_from
+          and sorted(p["port"] for p in rules[0]["ports"]) == [8080, 8443],
+          f"{label}: envoy policy ingress {rules}, want {want_from} on 8080/8443")
+
+
 def test_policies(docs, label, enabled=True):
     want = {
         "amp-api": ("amp-api", {(3001, 8000): ["envoy"], (3003,): ["amp-api"]}),
         "amp-authadmin": ("amp-authadmin", {(8090,): ["envoy"]}),
         "amp-mcpoauth": ("amp-mcpoauth", {(8091,): ["envoy"]}),
     }
-    pols = [d for d in docs if d.get("kind") == "NetworkPolicy" and d["metadata"]["name"] in want]
+    pols = [d for d in docs if d.get("kind") == "NetworkPolicy" and d["metadata"]["name"] in list(want) + ["envoy"]]
     if not enabled:
         check(not pols, f"{label}: networkPolicy.enabled=false still renders {[p['metadata']['name'] for p in pols]}")
         return
@@ -172,28 +191,33 @@ def envoy_validate(label, ev):
         print(f"envoy validate {label}: {'OK' if ok else 'FAILED'}")
 
 
-def prod_trusted():
+def prod_values():
     with open(os.path.join(CHART, "values-production.yaml")) as f:
-        return yaml.safe_load(f)["clientIP"]["trustedProxies"]
+        return yaml.safe_load(f)
 
 
 def main():
-    prod = prod_trusted()
+    pv = prod_values()
+    prod = pv["clientIP"]["trustedProxies"]
+    traefik = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "traefik"}},
+                "podSelector": {"matchLabels": {"app.kubernetes.io/name": "traefik"}}}]
+    check(pv["networkPolicy"]["envoyFrom"] == traefik, "production: only Traefik may reach Envoy")
     check(prod[0] == "10.244.0.0/16", "production: the pod CIDR comes first")
     check(len([c for c in prod if ":" not in c]) == 16 and len([c for c in prod if ":" in c]) == 7,
           f"production: want the pod CIDR + 15 Cloudflare v4 + 7 v6 ranges, got {len(prod)}")
     cases = [
-        ("local (tls on)", [], ["10.244.0.0/16"]),
-        ("local (tls off)", ["--set", "global.tls.enabled=false"], ["10.244.0.0/16"]),
-        ("production", ["-f", os.path.join(CHART, "values-production.yaml")], prod),
+        ("local (tls on)", [], ["10.244.0.0/16"], []),
+        ("local (tls off)", ["--set", "global.tls.enabled=false"], ["10.244.0.0/16"], []),
+        ("production", ["-f", os.path.join(CHART, "values-production.yaml")], prod, traefik),
     ]
     rendered = {}
-    for label, args, want in cases:
+    for label, args, want, envoy_from in cases:
         docs = render(*args)
         rendered[label] = envoy_yaml(docs)
         test_envoy(docs, label)
         test_trusted(docs, label, want)
         test_policies(docs, label)
+        test_envoy_policy(docs, label, envoy_from)
     docs = render("--set", "networkPolicy.enabled=false")
     test_policies(docs, "policies off", enabled=False)
     docs = render("--set-json", "clientIP.trustedProxies=[]")
