@@ -17,6 +17,20 @@ data:
         password: __AMP_DEX_DB_PASSWORD__
         ssl:
           mode: require
+        {{- with .Values.dex.storage }}
+        {{- if .maxOpenConns }}
+        maxOpenConns: {{ int .maxOpenConns }}
+        {{- end }}
+        {{- if .maxIdleConns }}
+        maxIdleConns: {{ int .maxIdleConns }}
+        {{- end }}
+        {{- if .connMaxLifetime }}
+        connMaxLifetime: {{ int .connMaxLifetime }}
+        {{- end }}
+        {{- if .connectionTimeout }}
+        connectionTimeout: {{ int .connectionTimeout }}
+        {{- end }}
+        {{- end }}
 
     web:
       http: 0.0.0.0:{{ .Values.dex.httpPort }}
