@@ -115,6 +115,30 @@ export function refusalText(code: string, message?: string | null): string {
   return known[code] ?? (message ? message : `The laptop refused it (${code}).`)
 }
 
+/** The harness dropped events here (a relay outage outlasted what it holds, protocol 11, #2438). */
+export const GAP_NOTICE = 'events_dropped'
+
+/**
+ * A gap notice: what the dropped events would have ended is unknown, so nothing before it is
+ * shown as still going. The run, compaction and open thinking are cleared, and a call without
+ * its result is shown as "result not available" (`endedAt` set, `result` null) unless its
+ * result arrives later. The harness follows with a fresh hello (status), the queue and the newest
+ * events, which the page applies as usual.
+ */
+function resyncAfterGap(s: SessionState, ev: Extract<ChatEvent, { type: 'notice' }>, ts: number): SessionState {
+  const items: TranscriptItem[] = s.items.map(it => {
+    if (it.kind === 'assistant' && !it.done) {
+      return { ...it, blocks: it.blocks.map(b => b.endedAt == null ? { ...b, endedAt: ts } : b) }
+    }
+    if (it.kind === 'tool' && !it.result && it.endedAt == null) return { ...it, endedAt: ts }
+    return it
+  })
+  return {
+    ...s, running: null, runStartedAt: null, compaction: null,
+    items: [...items, { kind: 'notice', key: nextKey('n'), level: ev.level, code: ev.code ?? null, text: ev.text, at: ts }],
+  }
+}
+
 function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
   const items = s.items
   const replaceWhere = <K extends TranscriptItem['kind']>(kind: K, pred: (i: Extract<TranscriptItem, { kind: K }>) => boolean,
@@ -205,6 +229,7 @@ function applyChat(s: SessionState, ev: ChatEvent, ts: number): SessionState {
         error: ev.error ?? null, covered: ev.outcome === 'completed' || said, at: ts, startedAt: s.runStartedAt }] }
     }
     case 'notice': {
+      if (ev.code === GAP_NOTICE) return resyncAfterGap(s, ev, ts)
       // The shell's run-outcome line may come just after run_end: then it says it, not run_end.
       const last = items.at(-1)
       const base = last?.kind === 'run_end' && !last.covered && (ev.level !== 'info' || ev.text.trim() === 'Stopped.')

@@ -948,6 +948,17 @@ def events_file():
         "#2424: a session with no lifetime and no idle limit (the default): expires_at_ms and idle_timeout_s are null.",
         hello_nl, True)
 
+    # #2438: a gap marker. The harness dropped events during a long relay outage (it holds at most
+    # 200 events / 2 MiB) and says so where the gap is, before the newest events and a fresh hello.
+    gap = sign_env(HARNESS, event("chat_event", {
+        "type": "notice", "level": "warn", "code": "events_dropped",
+        "text": "1840 chat events from the laptop were dropped while AMP's relay was out of reach; "
+                "the transcript has a gap. Showing the latest.",
+    }, seq=55, nonce_label="e19"))
+    add("notice_events_dropped_valid", wire(gap), browser_rx(last_applied_seq=54), "ok",
+        "#2438: a gap notice (code events_dropped). The browser clears what was running, shows the notice, and resyncs "
+        "from the hello, queue and newest events that follow (protocol 11).", gap)
+
     return {
         "description": "Harness -> browser events. Run each `wire` text through the browser's event check with `receiver` and "
         "expect `expect`: \"ok\", \"duplicate\" (drop silently), \"ignored_unknown_op\" (verified, seq advanced, not rendered) or "

@@ -11,6 +11,7 @@
 //! - [`token`]: the token refresh proof signed with the harness key (section 8.2).
 //! - [`pending`]: session ends the relay hasn't heard yet, sent when it's back (#2396).
 //! - [`live`]: running sessions' records, and the ones a killed chat left behind (#2424).
+//! - [`outbox`]: the events waiting for the relay, capped, with a gap notice and resync (#2438).
 //! - [`link`]: [`link::RemoteLink`], the outbound link the chat turns on with `/remote`.
 //! - `mock_relay` (feature `mock-relay`): an in-process relay for end-to-end tests.
 
@@ -21,6 +22,7 @@ pub mod link;
 pub mod live;
 #[cfg(feature = "mock-relay")]
 pub mod mock_relay;
+pub mod outbox;
 pub mod pairing;
 pub mod pending;
 pub mod policy;
@@ -33,3 +35,4 @@ pub use link::{
     PairingPrompt, RemoteDeps, RemoteError, RemoteHost, RemoteLink, RemoteOn, RemoteSetup,
     RemoteState, SessionTokens, TokenSource, cwd_basename,
 };
+pub use outbox::{OutboxLimits, OutboxStats};

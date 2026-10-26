@@ -465,6 +465,25 @@ impl EventSigner {
         self.next_seq += 1;
         Ok(jcs::canonical(&env))
     }
+
+    /// As [`Self::sign`], but an event over `max_bytes` is not returned and takes no seq
+    /// (`Ok(None)`), so leaving it out never opens a gap in the seqs (section 6.1).
+    pub fn sign_at_most(
+        &mut self,
+        op: &str,
+        device_id: Option<&str>,
+        body: Value,
+        now_ms: i64,
+        max_bytes: usize,
+    ) -> Result<Option<String>, jcs::Malformed> {
+        let seq = self.next_seq;
+        let env = self.sign(op, device_id, body, now_ms)?;
+        if env.len() > max_bytes {
+            self.next_seq = seq;
+            return Ok(None);
+        }
+        Ok(Some(env))
+    }
 }
 
 /// `refused.body` (section 6.2).
