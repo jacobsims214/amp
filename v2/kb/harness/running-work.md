@@ -20,7 +20,7 @@ workers, plan approval and the board counts.
 | `/plan`, `/open [id\|plan]` | plan approval, epics and stories; open a ticket or the plan in the browser |
 | `/workers`, `/worker [id]` | workers here and elsewhere (Ctrl+X stops one, Ctrl+G opens its ticket); watch one live |
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
-| `/usage`, `/abort`, `/close`, `/help`, `/quit` | tokens and cost, stop the reply, close the open panel, every command, leave |
+| `/usage`, `/abort`, `/stop`, `/close`, `/help`, `/quit` | tokens and cost, stop the reply (`/stop` also stops waiting for plan approval), close the open panel, every command, leave |
 
 Enter sends and Shift+Enter starts a new line. Ctrl+J also starts a new line in every terminal,
 as does Alt+Enter where Option/Alt sends Esc+ (iTerm2's Option key set to "Esc+", Terminal.app's
@@ -221,5 +221,6 @@ the web UI, the chat says so and starts the manager's next turn itself:
   [manager]
   auto_resume_on_approval = false
   ```
-- **Remote control.** The waiting and approved lines are ordinary chat notices, so a paired
-  browser following the chat sees them, and the resumed turn, as they happen.
+- **Remote control** (following the chat from a browser) is coming with the remote-m1 branch.
+  The waiting and approved lines are ordinary chat notices, so it will show them, and the resumed
+  turn, as they happen.
