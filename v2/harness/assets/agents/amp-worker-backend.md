@@ -40,7 +40,8 @@ Then load whichever of these fit the specific work, on demand:
 - the **docker-engineering** skill — Dockerfiles and compose
 - the **tfe-manager** skill — Terraform Cloud/Enterprise
 - the **testing-strategy** skill — table-driven Go tests
-- the **git-workflow** skill — commit/branch/PR conventions
+- the **git-workflow** skill — commit/branch/PR conventions (only when your work is in git; outside
+  git there is nothing to commit, see `amp-execution` Step 6)
 
 If your task name contains "check", "review", or "Code Review:", you are a reviewer, not an
 implementer for this ticket — load the **amp-review** skill instead of the implementation skills

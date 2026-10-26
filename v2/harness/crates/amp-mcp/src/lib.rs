@@ -10,37 +10,60 @@
 //! - [`oauth`]: browser login (`login`/`logout`) and [`oauth::connect`], which picks `AMP_TOKEN`,
 //!   else a stored OAuth login (refreshed as needed), else no credentials (D3).
 //! - [`CredentialBackend`]: logins in the OS keychain keyed by server URL, or a 0600 file.
+//! - [`external`]: clients for third-party MCP servers ([`ExternalClient`]): stdio child processes
+//!   (#2236) and Streamable HTTP with headers, bearer and OAuth ([`external::http`], #2237).
 //!
 //! This crate must never depend on rpi (D1).
 
 mod catalog;
 mod client;
+pub mod config_paths;
 mod credentials;
 mod error;
+pub mod external;
 mod health;
 mod http;
+mod keychain;
 pub mod oauth;
 mod protocol;
+mod redact;
 mod settings;
 
 pub use catalog::{Catalog, MAX_CATALOG_TTL, TtlSource};
 pub use client::{
-    AmpMcpClient, ClientOptions, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT, ServerSession,
+    AmpMcpClient, ClientOptions, DEFAULT_CALL_TIMEOUT, DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_RECONNECT_INTERVAL, RECONNECT_TIMEOUT, Reconnector, ServerSession,
+    origin as url_origin,
 };
+pub use config_paths::{ConfigPaths, ENV_CONFIG, ENV_CONFIG_DIR};
 pub use credentials::{
     AmpCredentialStore, CREDENTIALS_FILE_NAME, CredentialBackend, ENV_CREDENTIAL_STORE,
-    KEYCHAIN_SERVICE, credential_key, keychain_available,
+    ENV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE, credential_key, keychain_available, keychain_service,
+    scoped_credential_key,
 };
-pub use error::McpError;
+pub use error::{FailureKind, McpError};
+pub use external::{
+    ExternalClient, ExternalInfo, ExternalOptions, Secret, StdioSpec,
+    http::{HeaderSource, HttpAuth, HttpHeader, HttpServerOptions},
+};
 pub use health::Health;
+#[cfg(unix)]
+pub use http::build_unix_socket_http_client;
 pub use http::{
-    DEFAULT_OAUTH_REQUEST_TIMEOUT, OAUTH_CONNECT_TIMEOUT, build_http_client,
-    build_oauth_http_client, load_ca_file,
+    DEFAULT_OAUTH_REQUEST_TIMEOUT, KEEPALIVE_IDLE, OAUTH_CONNECT_TIMEOUT, build_http_client,
+    build_keepalive_http_client, build_oauth_http_client, load_ca_file,
+};
+pub use keychain::{
+    ENV_KEYCHAIN_PROMPTS, ENV_KEYCHAIN_TRACE, KEYCHAIN_REPAIR_HINT, KeychainError,
+    KeychainErrorKind, amp_login_repair_hint, keychain_cached_secrets, keychain_delete,
+    keychain_forget, keychain_generation, keychain_get, keychain_prompts_allowed, keychain_reads,
+    keychain_set, mcp_login_repair_hint, mcp_secret_repair_hint, provider_repair_hint, repair_hint,
 };
 pub use protocol::{Era, ProtocolMode};
+pub use redact::{REDACTED, redact_url, redact_urls, scrub_values};
 pub use settings::{
-    Auth, DEFAULT_MCP_URL, ENV_CA_FILE, ENV_MCP_URL, ENV_PROTOCOL, ENV_TOKEN, FileConfig,
-    Overrides, ServerSection, Settings, Source, StaticToken, default_config_path,
+    Auth, DEFAULT_MCP_URL, ENV_CA_FILE, ENV_MCP_URL, ENV_PROTOCOL, ENV_TOKEN, ENV_WEB_URL,
+    FileConfig, Overrides, ServerSection, Settings, Source, StaticToken, default_config_path,
 };
 
 /// The rmcp crate this client is built on, re-exported so downstream crates use the pinned version.

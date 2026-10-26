@@ -59,3 +59,8 @@ Run `amp_check_plan`; it repairs tickets left stuck that way.
 ## I deleted the wrong thing
 
 Tickets, stories and epics: the trash (`admin/trash-audit-and-projects.md`).
+
+## AMP Harness problems
+
+Run `amp-harness doctor`: every failing check says how to fix it. More in
+`harness/troubleshooting.md`.

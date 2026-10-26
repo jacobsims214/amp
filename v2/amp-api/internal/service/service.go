@@ -30,6 +30,19 @@ type Service struct {
 	// ArtifactRetention is how long an artifact lives after its last version
 	// unless someone keeps it (0: the default, 45 days).
 	ArtifactRetention time.Duration
+	// Remote is the instance's remote control configuration (off unless
+	// RELAY_ENABLED and auth are on).
+	Remote RemoteConfig
+	// OnRemoteEnded, when set, is told about remote sessions the service
+	// ended (policy off, revoke-all, expiry), so the relay closes their
+	// streams. It must not block.
+	OnRemoteEnded func([]domain.RemoteSession)
+	// RelayAudit is set in amp-relay (cmd/relay): audit entries go through
+	// the database's relay_record_audit function (the relay's role can't
+	// insert into audit_log), and amp-api's webhook dispatcher picks them up
+	// from there, so no in-process audit sink (OnAudit) sees them (#2399,
+	// re-review #2394 N3).
+	RelayAudit bool
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {

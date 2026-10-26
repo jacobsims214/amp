@@ -1,0 +1,30 @@
+ 
+   AMP harness · manager
+ 
+▌  one
+ 
+   first answer
+ 
+▌  two
+ 
+   ✗ ls · Tool ls not found · 0 ms
+   second answer
+ 
+▌  three
+ 
+   third answer
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+  ──────────────────────────────────────────────────────────
+  / for commands
+  ──────────────────────────────────────────────────────────
+  manager                              faux-1 • thinking off
+ 

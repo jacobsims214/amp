@@ -13,6 +13,8 @@ members = [
     "crates/amp-tui",
     "crates/amp-harness",
 ]
+# vendor/ holds patched upstream crates ([patch.crates-io] below), not workspace members.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,16 +37,31 @@ rpi-tools = "=0.8.0"
 rpi-harness = "=0.8.0"
 rpi-tui = "=0.8.0"
 
-# MCP client: exact pin (D2, D3). Streamable HTTP over reqwest with rustls, OAuth (`auth`).
+# MCP client: exact pin (D2, D3). Streamable HTTP over reqwest with rustls, OAuth (`auth`), and
+# stdio child processes for local servers (#2236, `transport-child-process`).
 # Default features (server, macros) are off; tests that need an in-process server add them as dev-deps.
 rmcp = { version = "=3.6.0", default-features = false, features = [
     "client",
     "transport-streamable-http-client-reqwest",
     "auth",
     "reqwest",
+    "transport-child-process",
 ] }
 
+# Local date/time for the per-request clock stamp (#2250). Both already in the tree through rmcp.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+iana-time-zone = "0.1.65"
+# Stdio MCP servers (#2236): spawn in their own session/process group and kill the whole group. The
+# same major rmcp's `transport-child-process` uses, so there is one copy.
+process-wrap = { version = "10.0", features = ["tokio1"] }
+
 clap = { version = "4.6", features = ["derive"] }
+# Raw-mode key reading for hidden secret entry in setup. Same version rpi-tui 0.8.0 uses.
+# use-dev-tty (#2330): read keys with poll() (select() on macOS, via filedescriptor) instead of mio.
+# mio's kqueue can't register a fd opened from /dev/tty on macOS (EINVAL), so `setup </dev/tty`
+# (install.sh's hand-off under `curl | sh`) failed with "Failed to initialize input reader".
+# Features unify, so the chat TUI (amp-tui, rpi-tui) reads keys the same way.
+crossterm = { version = "0.27", default-features = false, features = ["events", "use-dev-tty"] }
 
 # Tool-path resolution in the policy (#2141) copies rpi-tools 0.8.0's: the same home dir (dirs) and
 # the read tools' NFD variant (unicode-normalization). Same versions rpi-tools uses.
@@ -59,14 +76,29 @@ yaml_serde = "=0.10.2"
 # OAuth credential store (D3): OS keychain via keyring 4.x (macOS Keychain, Windows Credential Manager,
 # Secret Service on Linux), with a 0600 file fallback. rmcp's CredentialStore trait is #[async_trait].
 keyring = "4.2"
+# macOS only: turn keychain dialogs off when nobody can answer them, and read Security status codes
+# (#2165). The same version keyring's apple-native store already uses, so there is one copy.
+security-framework = "3.7"
 async-trait = "0.1"
 # For the TokenResponse trait on rmcp's token type (rmcp does not re-export oauth2). Same version rmcp uses.
 oauth2 = { version = "5.0", default-features = false }
+
+# doctor's CA check reads the CA file's subjects and validity dates (#2114). Same version rcgen
+# already brings in, so there is one copy.
+x509-parser = { version = "0.18", default-features = false }
 
 # Shared runtime/util crates (amp-mcp and up).
 # reqwest must stay on rmcp's major (0.13) so our reqwest::Client is the type rmcp's transport takes.
 # rmcp's `reqwest` feature already turns on reqwest's rustls backend; features unify.
 reqwest = { version = "0.13", default-features = false }
+# rpi-ai's own reqwest major (0.12), renamed: amp-core builds the provider HTTP client rpi takes
+# (#2277: a provider's CA file, mTLS identity and proxy), so it needs that major's Certificate,
+# Identity and Proxy types. The exact version already in the lock (one copy). native-roots adds the
+# OS trust store (macOS Keychain, Linux /etc/ssl) to webpki's roots; features unify with rpi's.
+rpi-reqwest = { package = "reqwest", version = "=0.12.28", default-features = false, features = [
+    "rustls-tls",
+    "rustls-tls-native-roots",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -75,6 +107,21 @@ toml = "1"
 # rpi-ai's CancellationToken type (amp-core's provider stall guard).
 tokio-util = "0.7"
 tracing = "0.1"
+# Legacy HTTP+SSE MCP client (#2238): rmcp 3.6.0 has none, so amp-mcp parses the event stream with
+# the same sse-stream rmcp's Streamable HTTP client uses (exact: one copy), and futures for streams.
+sse-stream = "=0.2.6"
+futures = "0.3"
+bytes = "1"
+
+# Remote control (#2373, v2/docs/remote-control/protocol.md): ECDSA P-256 signatures in the IEEE
+# P1363 form (`p256` does not normalize s on verify, which the protocol requires), HKDF/HMAC for
+# pairing on the same digest major as p256 (sha2 0.10), the OS CSPRNG, and token patterns for
+# redaction (regex is already in the tree through rpi-tools).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "sha256", "std"] }
+hkdf = "0.12"
+hmac = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+regex = "1"
 
 # Test-only (in-process MCP servers, TLS fixtures, the mock OAuth authorization server).
 axum = "0.8"
@@ -83,6 +130,12 @@ sha2 = "0.10"
 rcgen = "0.14"
 time = "0.3"
 tokio-rustls = "0.26"
+
+# crossterm 0.27.0 with one parser fix (#2349, vendor/crossterm/PATCHED.md): xterm's modifyOtherKeys
+# `CSI 27;mod;key~` (Shift+Enter is `CSI 27;2;13~`) is decoded instead of dropped. rpi-tui reads
+# through the same crossterm, so the patch covers both.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

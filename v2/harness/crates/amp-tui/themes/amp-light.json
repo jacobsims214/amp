@@ -30,8 +30,8 @@
   },
   "amp": {
     "state": { "ready": "#16181B", "prog": "#2C66B8", "progFill": "#2C66B8", "wait": "#676C74",
-               "flag": "#CF4426", "flagText": "#B23A20", "onFlag": "#FFFFFF", "sched": "#7A5BB5", "done": "#16181B" },
-    "state256": { "ready": 234, "prog": 25, "progFill": 25, "wait": 242, "flag": 124, "flagText": 88, "onFlag": 231, "sched": 97, "done": 234 },
+               "flag": "#CF4426", "flagText": "#B23A20", "onFlag": "#FFFFFF", "sched": "#7A5BB5", "done": "#2A6E45" },
+    "state256": { "ready": 234, "prog": 25, "progFill": 25, "wait": 242, "flag": 124, "flagText": 88, "onFlag": 231, "sched": 97, "done": 29 },
     "glyph": { "ready": "□", "prog": "■", "wait": "□", "flag": "■", "sched": "■", "done": "■" },
     "epic": ["#3D5A98", "#1F7F74", "#8A4F9E", "#66732A", "#B8457A", "#94642B"],
     "epic256": [25, 30, 97, 58, 168, 94],

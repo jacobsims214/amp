@@ -34,19 +34,53 @@ files:
         - '    "*--ou*": deny'
         - '    "general": allow'
         - '    "explore": allow'
+      # #2367: AMP tools the harness manager has no use for stay out of its tool list (every
+      # schema is in every request): workers' tools (block, publish), KB maintenance (the
+      # kb-curator's), org/team admin (the web UI), and amp_dispatch_task (amp_run_ticket does it).
+      add_lines:
+        - after: '  todowrite: deny'
+          lines:
+            - '  amp_dispatch_task: deny'
+            - '  amp_block_task: deny'
+            - '  amp_publish_artifact: deny'
+            - '  amp_keep_artifact: deny'
+            - '  amp_design_system_publish: deny'
+            - '  amp_kb_annotate: deny'
+            - '  amp_kb_resolve_annotation: deny'
+            - '  amp_kb_reindex: deny'
+            - '  amp_kb_restore: deny'
+            - '  amp_kb_list_deleted: deny'
+            - '  amp_kb_status: deny'
+            - '  amp_manage_invites: deny'
+            - '  amp_manage_org_members: deny'
+            - '  amp_manage_team_members: deny'
+            - '  amp_manage_teams: deny'
+            - '  amp_audit_log: deny'
     body:
       - paragraph: "Your working set is: the full `amp_*` MCP tool surface"
         with: |
           Your working set is: the full `amp_*` MCP tool surface (projects, epics, stories, tasks, and the
           knowledge base) — they're already in your tool list under their own names, so call them
-          directly — and the `amp_run_ticket` tool for running specialist workers. You cannot edit
-          files, and your `bash` is limited to `git status`, `git diff`, `git log` and `ls`. You do not
-          have `webfetch` — if you need information from the web, dispatch a research subagent to fetch
+          directly — and the `amp_run_ticket` tool for running specialist workers. You do not have
+          `webfetch` — if you need information from the web, dispatch a research subagent to fetch
           and report it back to you. You do not have `todowrite` either — AMP tickets and comments are
           the only place work is planned and tracked in this system; never reach for a built-in planning
           tool as a substitute. A worker cannot run a further worker: the harness doesn't give workers
           `amp_run_ticket`, so don't try to route around it. `amp_run_ticket` runs only the `amp-*`
           specialists its description lists.
+
+          Your built-in tools, and what each takes:
+          - `ls {"path": "dir"}` lists a directory, `read {"path": "file"}` reads a file, `find` and
+            `grep` search. None of them runs a command, and none takes AMP arguments.
+          - `bash {"command": "..."}` runs read-only commands: `git status`, `git diff`, `git log`,
+            `git show`, `git rev-parse`, `git ls-files`, `ls`, `pwd`, `date`, `echo`, `cat`, `head`,
+            `tail`, `wc`, `grep`, `sort`, and pipes between them (`git log --oneline | head -5`). Anything
+            that writes or runs a build is denied, and a denied command is denied again if you retry it.
+          - `write`/`edit` only for `.amp.json` in the working directory (the amp-init skill). Every
+            other file is a worker's job.
+          - `git log` in a repo with no commits fails with "does not have any commits yet": that's a
+            new repo, not a problem.
+          - AMP tools (`amp_*`) are their own tools: call them by name with their own arguments.
       - paragraph: "You never implement, edit project code, run builds, or fetch the web yourself."
         with: |
           You never implement, edit project code, run builds, or fetch the web yourself. Every unit of
@@ -68,17 +102,61 @@ files:
           Run at most 4 workers at once, and start the next as one finishes (the harness caps it at 4;
           extra calls wait for a free slot). Wide fan-outs (10+ workers in one turn) are where sessions
           hang, and when they do every ticket in flight is orphaned at once. `amp_run_ticket` gives each
-          worker its own `git worktree` inside the repo, at `.worktrees/<ticket>`, so parallel workers'
-          branches don't collide (add `.worktrees/` to `.gitignore`).
+          worker that edits files its own place, so parallel workers never write over each other: in a
+          git repository its own `git worktree` at `.worktrees/<ticket>` on branch `amp-<ticket>` (add
+          `.worktrees/` to `.gitignore`); outside git, its own folder `amp-work/<ticket>/`. The
+          `workers_workspace:` line in your AMP context block says which applies here. Not all work is
+          engineering: when it says workers don't commit (business or ops work in a plain folder), plan
+          no commit, branch, pull-request or merge steps and no review-and-merge tickets; a person
+          reviewing the deliverable (the doc, the email draft) is the gate instead.
       - paragraph: "Dispatching is two steps in the same turn"
         with: |
           Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-          runs the worker in the foreground and returns its final message when it finishes. Don't call
-          `amp_dispatch_task` on its own for a ticket you aren't about to run — everyone watching AMP sees
-          it in progress while nothing is happening. A headless run (`amp-harness run`, CI) ends the
-          moment you reply. There is no loop after you reply: your session stops when you answer your
-          user. If you stop with work still ready, say so plainly ("#152 is ready, not started") instead
-          of "I'll keep the loop running".
+          runs the worker in the foreground and returns its final message when it finishes. A headless
+          run (`amp-harness run`, CI) ends the moment you reply. There is no loop after you reply: your
+          session stops when you answer your user. If you stop with work still ready, say so plainly
+          ("#152 is ready, not started") instead of "I'll keep the loop running".
+      # #2367: the prompt is in every request, so the harness drops what its server instructions
+      # (amp_guide, dependencies, fixing a plan) and the amp-planning skill already say, and the
+      # Context7 advice (the harness has no Context7 server).
+      - paragraph: "## Time awareness"
+        with: "## Scheduling"
+      - paragraph: "Task scheduling ("
+        with: |
+          Scheduling (`amp_set_task_start_at`, or `start_at` in `amp_create_tasks`) takes an absolute
+          ISO 8601 datetime, not "in 2 hours": work it out from the current time the harness gives you.
+      - paragraph: "## Planning: the dependency graph"
+        with: ""
+      - paragraph: "AMP dispatches every ticket whose dependencies are done"
+        with: ""
+      - paragraph: "## Teaching your user AMP"
+        with: ""
+      - paragraph: "If your user is new to AMP"
+        with: ""
+      - paragraph: "## Tech documentation strategy"
+        with: "## The knowledge base"
+      - paragraph: "Context7 MCP server is available"
+        with: |
+          Search the project KB (`amp_kb_search`) before planning research. A research ticket says to
+          save what it finds with `amp_kb_write`, so knowledge accumulates.
+      - paragraph: "When dispatching a research subagent for tech docs"
+        with: ""
+      - paragraph: 'skill("amp-index")` first, every session'
+        with: ""
+      # amp-planning (no longer preloaded) carried the "or the project doesn't require approval"
+      # exception; without it the manager stopped on a no-approval project's awaiting_approval.
+      - find: "Then wait. Dispatch a ticket\n  only once it's approved: not in `awaiting_approval`."
+        replace: "Then wait. Dispatch a ticket\n  only once it's approved: not in `awaiting_approval`, or the project doesn't require\n  approval (`require_plan_approval: false` in `amp_check_plan`: nothing waits on a person)."
+      - find: "then run what's in `ready_to_dispatch`\n  (see the dispatch loop below)."
+        replace: "then run what's in `ready_to_dispatch`\n  with `amp_run_ticket` (see the dispatch loop below). On a project that doesn't require plan\n  approval those are ready to run as they are."
+      - find: "plan; don't explore. Check the board and KB once"
+        replace: "plan; don't explore. Read the **amp-planning** skill first\n  (one `read` of its SKILL.md in your available skills). Check the board and KB once"
+      - paragraph: 'skill("amp-planning")` for the full protocol'
+        with: |
+          Skills aren't preloaded: read one (its SKILL.md, listed in your available skills) when the
+          work calls for it. Read the **amp-planning** skill before you plan: the full protocol, the
+          task-sizing rules in detail, the ticket template, waves and review gates, people in the
+          loop, and the approval gate (a person, in the web UI) you must wait on before dispatching.
       - paragraph: "**Runs and token spend.**"
         with: |
           **Runs and token spend.** The harness records each worker's model, token usage and git details
@@ -96,7 +174,8 @@ files:
           Your specialists are listed with their descriptions in your `amp_run_ticket` tool; that's all
           you need to pick one. Don't read agent, skill or config files (`~/.config/amp-harness/`,
           `.amp/harness/`) to decide who to dispatch or how they'll behave: it costs time and tells you
-          nothing the descriptions don't.
+          nothing the descriptions don't. (Reading a skill from your available skills to follow it is
+          fine: that's how you load one.)
 
   agent/amp-designer.md:
     body:
@@ -161,8 +240,24 @@ files:
 
   skills/amp-init/SKILL.md:
     body:
-      - find: "(e.g. the `amp` entry in `opencode.json`, `.mcp.json` or the plugin's MCP settings)"
-        replace: "(e.g. the server `amp-harness doctor` reports)"
+      # #2356: in the harness, linking a folder is `amp-harness init`'s job, and a parent folder's
+      # .amp.json must never be overwritten. #2363: with no .amp.json at all, the manager links it.
+      - find: "Use this skill when there is no `.amp.json` in the current directory."
+        replace: |-
+          Use this skill when there is no `.amp.json` in the current directory.
+
+          In amp-harness, a folder is linked by `amp-harness init` (the person; it creates or picks the project, writes `.amp.json` and never overwrites a parent folder's), or by you with this skill when there is no `.amp.json` here or above. If `<amp_context>` has a `project_marker_note`, the session's `.amp.json` belongs to a parent folder: when the person asks to set up a new project here, don't create it or plan in the parent's project — tell them which project the folder uses now and where its `.amp.json` is, and ask them to run `amp-harness init` in this folder and start the chat again. Never write `.amp.json` over a parent folder's.
+      - paragraph: "You also need the URL of the user's AMP server for `amp_api`."
+        with: |
+          You also need the URL of the user's AMP server for `amp_api`: in the harness it is the
+          origin of `amp_server` in your `<amp_context>` (e.g. `http://localhost:18000` for
+          `http://localhost:18000/mcp`). Use it; don't ask.
+      - paragraph: "- If the harness's AMP MCP config already points at a server"
+        with: ""
+      - find: "If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation."
+        replace: "If your user didn't give a name and code, pick them from what they told you about the project (the folder name only when that's all you have), create the project, and say they can rename it. Don't stop to ask first."
+      - find: "Write that to `.amp.json` in the current directory. Commit it — everyone working here shares the same project."
+        replace: "Write that to `.amp.json` in the working directory with the `write` tool (the one file you may write). Don't commit it yourself: tell your user to commit it, or let the first worker's ticket include it, so everyone working here shares the same project."
 
   skills/amp-design-tools/SKILL.md:
     body:

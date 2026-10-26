@@ -19,6 +19,10 @@ use super::{AmpTheme, ThemeError, relative_luminance};
 
 pub const ENV_THEME: &str = "AMP_HARNESS_THEME";
 pub const ENV_COLOR: &str = "AMP_HARNESS_COLOR";
+pub const ENV_SHOW_THINKING: &str = "AMP_HARNESS_SHOW_THINKING";
+pub const ENV_MOUSE: &str = "AMP_HARNESS_MOUSE";
+pub const ENV_PADDING: &str = "AMP_HARNESS_PADDING";
+pub const ENV_DENSITY: &str = "AMP_HARNESS_DENSITY";
 
 /// Dark or light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,6 +108,145 @@ struct ConfigFile {
 struct TuiTable {
     theme: Option<String>,
     color: Option<String>,
+    show_thinking: Option<String>,
+    /// `true`/`false` (or `"on"`/`"off"`), #2185.
+    mouse: Option<toml::Value>,
+    /// Columns left and right of the chat, #2251.
+    padding: Option<toml::Value>,
+    /// `compact` or `comfortable`, #2346.
+    density: Option<String>,
+}
+
+/// How the chat shows thinking (#2177): `AMP_HARNESS_SHOW_THINKING`, then config.toml `[tui]
+/// show_thinking`, then `collapsed`. Values: `collapsed`, `full`, `hidden`.
+pub fn resolve_show_thinking(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<crate::ThinkingDisplay, ThemeError> {
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match env(ENV_SHOW_THINKING)
+        .filter(|v| !v.trim().is_empty())
+        .map(|v| (v, ENV_SHOW_THINKING))
+        .or_else(|| {
+            table
+                .show_thinking
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| (v, "[tui] show_thinking"))
+        }) {
+        Some((v, from)) => {
+            crate::ThinkingDisplay::parse(&v).map_err(|e| ThemeError(format!("{from}: {e}")))
+        }
+        None => Ok(crate::ThinkingDisplay::default()),
+    }
+}
+
+/// Whether the chat turns on mouse reporting (#2185): `AMP_HARNESS_MOUSE`, then config.toml
+/// `[tui] mouse`, then on. On, the wheel scrolls the transcript and the "↓ new output" pill is
+/// clickable, and the terminal's click-drag selection needs a modifier (Fn in Terminal.app,
+/// Option in iTerm2). Off, plain click-drag selects and PageUp/PageDown scroll. Values: `on`,
+/// `off`, `true`, `false` (TOML booleans too).
+pub fn resolve_mouse(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<bool, ThemeError> {
+    if let Some(v) = env(ENV_MOUSE).filter(|v| !v.trim().is_empty()) {
+        return parse_on_off(&v).map_err(|e| ThemeError(format!("{ENV_MOUSE}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.mouse {
+        None => Ok(true),
+        Some(toml::Value::Boolean(on)) => Ok(on),
+        Some(toml::Value::String(v)) => {
+            parse_on_off(&v).map_err(|e| ThemeError(format!("[tui] mouse: {e}")))
+        }
+        Some(other) => Err(ThemeError(format!(
+            "[tui] mouse: unknown value `{other}`: use true or false"
+        ))),
+    }
+}
+
+/// Columns of space left and right of the chat (#2251): `AMP_HARNESS_PADDING`, then config.toml
+/// `[tui] padding`, then [`crate::DEFAULT_PADDING`]. A whole number from 0 to
+/// [`crate::MAX_PADDING`].
+pub fn resolve_padding(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<usize, ThemeError> {
+    if let Some(v) = env(ENV_PADDING).filter(|v| !v.trim().is_empty()) {
+        return parse_padding(v.trim()).map_err(|e| ThemeError(format!("{ENV_PADDING}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.padding {
+        None => Ok(crate::DEFAULT_PADDING),
+        Some(toml::Value::Integer(n)) => {
+            parse_padding(&n.to_string()).map_err(|e| ThemeError(format!("[tui] padding: {e}")))
+        }
+        Some(toml::Value::String(v)) => {
+            parse_padding(v.trim()).map_err(|e| ThemeError(format!("[tui] padding: {e}")))
+        }
+        Some(other) => Err(ThemeError(format!(
+            "[tui] padding: unknown value `{other}`: use a number of columns from 0 to {}",
+            crate::MAX_PADDING
+        ))),
+    }
+}
+
+/// How tightly the chat is laid out (#2346): `AMP_HARNESS_DENSITY`, then config.toml `[tui]
+/// density`, then compact. Values: `compact`, `comfortable`.
+pub fn resolve_density(
+    env: &dyn Fn(&str) -> Option<String>,
+    config: Option<&str>,
+) -> Result<crate::Density, ThemeError> {
+    if let Some(v) = env(ENV_DENSITY).filter(|v| !v.trim().is_empty()) {
+        return crate::Density::parse(&v).map_err(|e| ThemeError(format!("{ENV_DENSITY}: {e}")));
+    }
+    let table = match config {
+        Some(text) => toml::from_str::<ConfigFile>(text)
+            .map_err(|e| ThemeError(format!("config.toml [tui]: {e}")))?
+            .tui
+            .unwrap_or_default(),
+        None => TuiTable::default(),
+    };
+    match table.density {
+        None => Ok(crate::Density::default()),
+        Some(v) => crate::Density::parse(&v).map_err(|e| ThemeError(format!("[tui] density: {e}"))),
+    }
+}
+
+fn parse_padding(v: &str) -> Result<usize, String> {
+    match v.parse::<usize>() {
+        Ok(n) if n <= crate::MAX_PADDING => Ok(n),
+        _ => Err(format!(
+            "unknown value `{v}`: use a number of columns from 0 to {}",
+            crate::MAX_PADDING
+        )),
+    }
+}
+
+fn parse_on_off(v: &str) -> Result<bool, String> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" | "1" => Ok(true),
+        "off" | "false" | "no" | "0" => Ok(false),
+        other => Err(format!("unknown value `{other}`: use on or off")),
+    }
 }
 
 /// The resolved theme settings, before the terminal is asked anything.
@@ -400,6 +543,103 @@ mod tests {
     }
 
     #[test]
+    fn mouse_from_env_then_config_then_on() {
+        let none = env_of(&[]);
+        assert!(resolve_mouse(&none, None).unwrap());
+        assert!(resolve_mouse(&none, Some("[tui]\ntheme = \"dark\"\n")).unwrap());
+        assert!(!resolve_mouse(&none, Some("[tui]\nmouse = false\n")).unwrap());
+        assert!(!resolve_mouse(&none, Some("[tui]\nmouse = \"off\"\n")).unwrap());
+        assert!(resolve_mouse(&none, Some("[tui]\nmouse = true\n")).unwrap());
+        let off = env_of(&[(ENV_MOUSE, "off")]);
+        assert!(!resolve_mouse(&off, Some("[tui]\nmouse = true\n")).unwrap());
+        let on = env_of(&[(ENV_MOUSE, "ON")]);
+        assert!(resolve_mouse(&on, Some("[tui]\nmouse = false\n")).unwrap());
+        let e = resolve_mouse(&none, Some("[tui]\nmouse = 3\n")).unwrap_err();
+        assert!(e.0.contains("[tui] mouse"), "{}", e.0);
+        let e = resolve_mouse(&env_of(&[(ENV_MOUSE, "maybe")]), None).unwrap_err();
+        assert!(e.0.contains(ENV_MOUSE), "{}", e.0);
+    }
+
+    #[test]
+    fn density_from_env_then_config_then_compact() {
+        let none = |_: &str| None;
+        assert_eq!(
+            resolve_density(&none, None).unwrap(),
+            crate::Density::Compact
+        );
+        assert_eq!(
+            resolve_density(&none, Some("[tui]\ndensity = \"comfortable\"\n")).unwrap(),
+            crate::Density::Comfortable
+        );
+        let env = env_of(&[(ENV_DENSITY, "compact")]);
+        assert_eq!(
+            resolve_density(&env, Some("[tui]\ndensity = \"comfortable\"\n")).unwrap(),
+            crate::Density::Compact
+        );
+        let e = resolve_density(&none, Some("[tui]\ndensity = \"cosy\"\n")).unwrap_err();
+        assert!(e.0.contains("[tui] density"), "{}", e.0);
+    }
+
+    #[test]
+    fn padding_from_env_then_config_then_default() {
+        let none = env_of(&[]);
+        assert_eq!(
+            resolve_padding(&none, None).unwrap(),
+            crate::DEFAULT_PADDING
+        );
+        assert_eq!(
+            resolve_padding(&none, Some("[tui]\ntheme = \"dark\"\n")).unwrap(),
+            crate::DEFAULT_PADDING
+        );
+        assert_eq!(
+            resolve_padding(&none, Some("[tui]\npadding = 0\n")).unwrap(),
+            0
+        );
+        assert_eq!(
+            resolve_padding(&none, Some("[tui]\npadding = \"3\"\n")).unwrap(),
+            3
+        );
+        let env = env_of(&[(ENV_PADDING, "1")]);
+        assert_eq!(
+            resolve_padding(&env, Some("[tui]\npadding = 4\n")).unwrap(),
+            1
+        );
+        let e = resolve_padding(&none, Some("[tui]\npadding = 9\n")).unwrap_err();
+        assert!(e.0.contains("[tui] padding"), "{}", e.0);
+        let e = resolve_padding(&none, Some("[tui]\npadding = -1\n")).unwrap_err();
+        assert!(e.0.contains("[tui] padding"), "{}", e.0);
+        let e = resolve_padding(&none, Some("[tui]\npadding = true\n")).unwrap_err();
+        assert!(e.0.contains("[tui] padding"), "{}", e.0);
+        let e = resolve_padding(&env_of(&[(ENV_PADDING, "wide")]), None).unwrap_err();
+        assert!(e.0.contains(ENV_PADDING), "{}", e.0);
+    }
+
+    #[test]
+    fn show_thinking_from_env_then_config_then_collapsed() {
+        use crate::ThinkingDisplay;
+        let none = env_of(&[]);
+        assert_eq!(
+            resolve_show_thinking(&none, None).unwrap(),
+            ThinkingDisplay::Collapsed
+        );
+        let config = "[tui]\ntheme = \"dark\"\nshow_thinking = \"full\"\n";
+        assert_eq!(
+            resolve_show_thinking(&none, Some(config)).unwrap(),
+            ThinkingDisplay::Full
+        );
+        // The theme settings accept the key too.
+        assert!(ThemeSettings::resolve(None, &none, Some(config)).is_ok());
+        let env = env_of(&[(ENV_SHOW_THINKING, "Hidden")]);
+        assert_eq!(
+            resolve_show_thinking(&env, Some(config)).unwrap(),
+            ThinkingDisplay::Hidden
+        );
+        let e =
+            resolve_show_thinking(&none, Some("[tui]\nshow_thinking = \"some\"\n")).unwrap_err();
+        assert!(e.0.contains("[tui] show_thinking"), "{}", e.0);
+    }
+
+    #[test]
     fn depth_detection() {
         assert_eq!(
             detect_depth(&env_of(&[("COLORTERM", "truecolor")])),
@@ -505,11 +745,16 @@ mod pty_tests {
         (File::from(pair.master), File::from(pair.slave))
     }
 
-    /// Plays `script` (delay from start, bytes) on the terminal side, in a thread that ends by
-    /// itself once the script is done.
-    fn terminal(master: &File, script: Vec<(u64, &'static [u8])>) -> thread::JoinHandle<()> {
+    /// Plays `script` (delay from `start`, bytes) on the terminal side, in a thread that ends by
+    /// itself once the script is done. `start` is the test's own clock (#2278): with one shared
+    /// origin, a byte scripted at `at` is never written before `start + at`, so a test that
+    /// measures from `start` can assert lower bounds without racing the thread's setup.
+    fn terminal(
+        master: &File,
+        start: Instant,
+        script: Vec<(u64, &'static [u8])>,
+    ) -> thread::JoinHandle<()> {
         let mut master = master.try_clone().unwrap();
-        let start = Instant::now();
         thread::spawn(move || {
             for (at, bytes) in script {
                 let at = Duration::from_millis(at);
@@ -557,8 +802,8 @@ mod pty_tests {
         let (master, slave) = pty();
         let reply = concat(&[OSC11_REPLY, DA1_REPLY]);
         let reply: &'static [u8] = Box::leak(reply.into_boxed_slice());
-        let term = terminal(&master, vec![(20, reply)]);
         let started = Instant::now();
+        let term = terminal(&master, started, vec![(20, reply)]);
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         assert!(
             started.elapsed() < FIRST,
@@ -575,6 +820,7 @@ mod pty_tests {
         let (master, slave) = pty();
         let term = terminal(
             &master,
+            Instant::now(),
             vec![(20, b"\x1b]11;rgb:0000/0000/0000\x07\x1b[?1;2ck")],
         );
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
@@ -587,8 +833,8 @@ mod pty_tests {
     #[test]
     fn da1_only_ends_the_exchange() {
         let (master, slave) = pty();
-        let term = terminal(&master, vec![(20, DA1_REPLY)]);
         let started = Instant::now();
+        let term = terminal(&master, started, vec![(20, DA1_REPLY)]);
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         assert!(started.elapsed() < FIRST);
         term.join().unwrap();
@@ -617,16 +863,19 @@ mod pty_tests {
     #[test]
     fn a_reply_finishing_past_the_first_bound_is_drained() {
         let (master, slave) = pty();
-        // Starts inside the first bound, finishes (DA1) after it but inside the drain.
+        // Starts inside the first bound, finishes (DA1) after it but inside the drain. The script
+        // runs on the test's clock, so the DA1 byte exists no earlier than `started + 550ms` and
+        // `exchange` cannot have read it, and returned, any sooner.
+        let started = Instant::now();
         let term = terminal(
             &master,
+            started,
             vec![
                 (100, &OSC11_REPLY[..8]),
                 (500, &OSC11_REPLY[8..]),
                 (550, DA1_REPLY),
             ],
         );
-        let started = Instant::now();
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         let took = started.elapsed();
         term.join().unwrap();
@@ -643,8 +892,8 @@ mod pty_tests {
     #[test]
     fn an_incomplete_reply_stops_at_the_drain_bound() {
         let (master, slave) = pty();
-        let term = terminal(&master, vec![(50, &OSC11_REPLY[..8])]);
         let started = Instant::now();
+        let term = terminal(&master, started, vec![(50, &OSC11_REPLY[..8])]);
         let got = exchange(&slave, FIRST, DRAIN).unwrap();
         let took = started.elapsed();
         term.join().unwrap();

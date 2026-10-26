@@ -1,0 +1,64 @@
+# !!! DEV ONLY. NEVER USE THIS ON A SHARED MACHINE, A SERVER OR WITH REAL DATA. !!!
+#
+# Remote control (epic 165) lets a browser send prompts to a harness, and a
+# harness prompt can run shell commands and edit files on that laptop. The
+# relay is its own service, amp-relay (#2387), and the default compose stack
+# doesn't run it: amp-api serves no /relay/ or /api/sessions route at all, so
+# there is nothing to reach.
+#
+# This override is for poking at the relay's endpoints from this machine only:
+#   - it adds the amp-relay service and tells amp-api a relay is deployed
+#     (RELAY_ENABLED=true, the /api/me capability only);
+#   - it binds amp-relay's and amp-api's ports to 127.0.0.1, so nothing on
+#     your network can reach the relay;
+#   - it REQUIRES a real OIDC issuer: compose fails to start until you set
+#     OIDC_ISSUER_URL and REST_AUDIENCES (for example a Dex you run locally),
+#     instead of silently running a relay that can't work (amp-relay also
+#     refuses to start without OIDC_ISSUER_URL).
+# With OIDC on, compose's UI (nginx proxying /api with no token) can't sign
+# in, so test the browser side on the docker-desktop Kubernetes profile, which
+# has Dex, oauth2-proxy and Envoy: KB how-to/remote-control-local-test.md.
+#
+# Usage, from v2/ (add any port override your stack already uses):
+#   OIDC_ISSUER_URL=http://127.0.0.1:5556/dex REST_AUDIENCES=amp-ui \
+#     docker compose -f docker-compose.yml -f docker-compose.remote-dev.yml \
+#     up -d --no-deps amp-api amp-relay
+# The relay legs are then on http://127.0.0.1:${AMP_RELAY_HOST_PORT:-3002}
+# (/relay/v1/..., /api/sessions/...); compose has no Envoy in front.
+# Undo: `docker compose -f docker-compose.yml -f docker-compose.remote-dev.yml
+# rm -sf amp-relay`, then `up -d --no-deps amp-api` without this file.
+services:
+  amp-api:
+    ports: !override
+      - "127.0.0.1:${AMP_MCP_HOST_PORT:-8000}:8000"
+      - "127.0.0.1:3001:3001"
+    environment:
+      RELAY_ENABLED: "true"
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?the relay needs real sign-in; set OIDC_ISSUER_URL (see the header of docker-compose.remote-dev.yml)}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+      REST_AUDIENCES: ${REST_AUDIENCES:?set REST_AUDIENCES to the web UI's OIDC client id}
+      MCP_AUDIENCE: ${MCP_AUDIENCE:-amp-mcp}
+      # Browser POSTs are refused unless their Origin is exactly this.
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://localhost:5173}
+
+  amp-relay:
+    build:
+      context: .
+      dockerfile: amp-api/Dockerfile.relay
+    container_name: amp-relay
+    ports:
+      - "127.0.0.1:${AMP_RELAY_HOST_PORT:-3002}:3002"
+    environment:
+      DATABASE_URL: postgres://amp:amp@postgres:5432/amp?sslmode=disable
+      RELAY_ADDR: :3002
+      CLUSTER_ADDR: :3003
+      CLUSTER_ADVERTISE_ADDR: amp-relay:3003
+      OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?the relay needs real sign-in; set OIDC_ISSUER_URL (see the header of docker-compose.remote-dev.yml)}
+      OIDC_DISCOVERY_URL: ${OIDC_DISCOVERY_URL:-}
+      REST_AUDIENCES: ${REST_AUDIENCES:?set REST_AUDIENCES to the web UI's OIDC client id}
+      MCP_AUDIENCE: ${MCP_AUDIENCE:-amp-mcp}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:-http://localhost:5173}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
