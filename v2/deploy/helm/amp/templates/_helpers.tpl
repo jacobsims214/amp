@@ -92,20 +92,30 @@ runAsUser: 0
      (#2387): amp-api serves no relay route, so with amp-relay scaled to 0
      Envoy has no upstream and nobody can reach a harness. Like /mcp,
      ext_authz is off because amp-relay checks the bearer (an OAuth token,
-     then the rct_ connect token) itself. The commands stream is long-lived:
-     timeout 0s turns off the 15s per-route default, and max_stream_duration
-     cuts it at the session's 12-hour lifetime (the harness reconnects on its
-     own if it is still valid). Keepalives every 20s keep it under
-     stream_idle_timeout. */}}
+     then the rct_ connect token) itself. Only the command stream is
+     long-lived: timeout 0s turns off the per-route response timeout,
+     max_stream_duration cuts it at the session's 12-hour lifetime (the
+     harness reconnects on its own if it is still valid) and idle_timeout
+     cuts a dead one (keepalives every 20s). Every other /relay/ call is a
+     short request with an ordinary timeout (#2399). */}}
 {{- define "amp.relayHarnessRoutes" -}}
 {{- if .Values.relay.enabled }}
 # ---- Remote control relay, harness leg (amp-relay): bearer auth in the relay, not ext_authz ----
-- match: { prefix: "/relay/" }
+- match: { safe_regex: { regex: "^/relay/v1/sessions/[^/]+/commands$" } }
   route:
     cluster: amp_relay
     timeout: 0s
+    idle_timeout: {{ .Values.relay.streamIdleTimeout | default "120s" }}
     max_stream_duration:
       max_stream_duration: {{ .Values.relay.maxStreamDuration | default "43200s" }}
+  typed_per_filter_config:
+    envoy.filters.http.ext_authz:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+      disabled: true
+- match: { prefix: "/relay/" }
+  route:
+    cluster: amp_relay
+    timeout: {{ .Values.relay.requestTimeout | default "30s" }}
   typed_per_filter_config:
     envoy.filters.http.ext_authz:
       "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
@@ -114,18 +124,24 @@ runAsUser: 0
 {{- end -}}
 
 {{/* amp.relayBrowserRoutes: the relay's browser leg, /api/sessions, goes to
-     amp-relay behind the cookie session (ext_authz stays on); its per-session
-     SSE stream needs the unbounded timeout, like /api/events. Matched before
-     the /api prefix (amp-api). */}}
+     amp-relay behind the cookie session (ext_authz stays on). Its
+     per-session SSE stream is long-lived like the harness's command stream
+     (no response timeout, the same lifetime cap and idle timeout); the rest
+     are short requests. Matched before the /api prefix (amp-api). */}}
 {{- define "amp.relayBrowserRoutes" -}}
 {{- if .Values.relay.enabled }}
 # ---- Remote control relay, browser leg (amp-relay) ----
 - match: { safe_regex: { regex: "^/api/sessions/[^/]+/events$" } }
-  route: { cluster: amp_relay, timeout: 0s }
+  route:
+    cluster: amp_relay
+    timeout: 0s
+    idle_timeout: {{ .Values.relay.streamIdleTimeout | default "120s" }}
+    max_stream_duration:
+      max_stream_duration: {{ .Values.relay.maxStreamDuration | default "43200s" }}
 - match: { path: "/api/sessions" }
-  route: { cluster: amp_relay }
+  route: { cluster: amp_relay, timeout: {{ .Values.relay.requestTimeout | default "30s" }} }
 - match: { prefix: "/api/sessions/" }
-  route: { cluster: amp_relay }
+  route: { cluster: amp_relay, timeout: {{ .Values.relay.requestTimeout | default "30s" }} }
 {{- end }}
 {{- end -}}
 

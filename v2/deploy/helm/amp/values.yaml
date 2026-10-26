@@ -104,8 +104,21 @@ relay:
   # 2+ keeps remote control up through a pod or node failure: a session lives
   # on one replica, the others forward to it, and take it over if it dies.
   replicas: 2
-  # Envoy's cap on one /relay/ stream: the session's 12-hour lifetime.
+  # Envoy's cap on one relay stream (the harness's command stream and a
+  # browser's event stream): the session's 12-hour lifetime.
   maxStreamDuration: 43200s
+  # A relay stream with no bytes for this long is cut (the relay sends a
+  # keepalive every 20 s, so only a dead peer gets there).
+  streamIdleTimeout: 120s
+  # Every other relay call (register, token refresh, event batches,
+  # heartbeats, pairing, end, the browser's commands) is a short request.
+  requestTimeout: 30s
+  # Refuse to render with relay.enabled unless the relay's database password
+  # and cluster token are pinned (database.existingSecret or
+  # global.secretOverrides.relayDbPassword, clusterToken.existingSecret or
+  # global.secretOverrides.relayClusterToken). values-production.yaml turns it
+  # on: under ArgoCD the generated values change on every sync.
+  requirePinnedSecrets: false
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 500m, memory: 256Mi }

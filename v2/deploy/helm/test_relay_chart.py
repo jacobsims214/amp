@@ -49,6 +49,12 @@ def render(*args):
     return out, [d for d in yaml.safe_load_all(out) if d]
 
 
+def render_error(*args):
+    """helm template's error output, or None when it renders."""
+    p = subprocess.run(["helm", "template", "amp", CHART, "-n", "amp", *args], capture_output=True, text=True)
+    return None if p.returncode == 0 else p.stderr
+
+
 def find(docs, kind, name):
     return [d for d in docs if d.get("kind") == kind and d["metadata"]["name"] == name]
 
@@ -237,16 +243,32 @@ def test_on(args, label, replicas=2):
         h = first_match(rs, "/relay/v1/sessions/rs_x/commands")
         check(h is not None and h["route"]["cluster"] == "amp_relay", f"{where}: /relay/ not routed to amp_relay")
         if h:
-            check(h["route"].get("timeout") == "0s", f"{where}: /relay/ timeout")
-            check(h["route"].get("max_stream_duration", {}).get("max_stream_duration") == "43200s", f"{where}: /relay/ max stream")
+            check(h["route"].get("timeout") == "0s", f"{where}: command stream timeout")
+            check(h["route"].get("max_stream_duration", {}).get("max_stream_duration") == "43200s", f"{where}: command stream max")
+            check(h["route"].get("idle_timeout") == "120s", f"{where}: command stream idle timeout")
             check(ext_authz_disabled(h), f"{where}: /relay/ must skip ext_authz")
+        # #2399: only the stream is unbounded; the short harness calls keep a timeout.
+        for p in ("/relay/v1/sessions", "/relay/v1/sessions/rs_x/token", "/relay/v1/sessions/rs_x/events",
+                  "/relay/v1/sessions/rs_x/heartbeat", "/relay/v1/sessions/rs_x/pairings", "/relay/v1/sessions/rs_x",
+                  "/relay/v1/sessions/rs_x/commands/x"):
+            r = first_match(rs, p)
+            check(r is not None and r["route"]["cluster"] == "amp_relay", f"{where}: {p} not routed to amp_relay")
+            if r:
+                check(r["route"].get("timeout") == "30s", f"{where}: {p} timeout {r['route'].get('timeout')}")
+                check("max_stream_duration" not in r["route"], f"{where}: {p} is not a stream")
+                check(ext_authz_disabled(r), f"{where}: {p} must skip ext_authz")
         for p in ("/api/sessions", "/api/sessions/revoke-all", "/api/sessions/rs_x", "/api/sessions/rs_x/commands"):
             r = first_match(rs, p)
             check(r is not None and r["route"]["cluster"] == "amp_relay", f"{where}: {p} not routed to amp_relay")
             check(r is None or not ext_authz_disabled(r), f"{where}: {p} must keep ext_authz")
+        for p in ("/api/sessions", "/api/sessions/rs_x/commands"):
+            r = first_match(rs, p)
+            check(r is not None and r["route"].get("timeout") == "30s", f"{where}: {p} timeout")
         r = first_match(rs, "/api/sessions/rs_x/events")
         check(r is not None and r["route"]["cluster"] == "amp_relay" and r["route"].get("timeout") == "0s",
               f"{where}: events stream route")
+        check(r is not None and r["route"].get("max_stream_duration", {}).get("max_stream_duration") == "43200s"
+              and r["route"].get("idle_timeout") == "120s", f"{where}: events stream bounds")
         check(r is None or not ext_authz_disabled(r), f"{where}: events stream must keep ext_authz")
         r = first_match(rs, "/api/me")
         check(r is not None and r["route"]["cluster"] == "amp_api_rest", f"{where}: /api/me must stay on amp-api")
@@ -289,7 +311,20 @@ def main():
     configs["off"] = test_off([], "default")
     configs["off-prod"] = test_off(["-f", os.path.join(CHART, "values-production.yaml")], "production")
     configs["on"] = test_on([], "default")
-    configs["on-prod"] = test_on(["-f", os.path.join(CHART, "values-production.yaml")], "production")
+    prod = ["-f", os.path.join(CHART, "values-production.yaml")]
+    # #2399: production refuses the relay until its password and token are pinned.
+    err = render_error(*prod, "--set", "relay.enabled=true")
+    check(err is not None and "relay.database.existingSecret" in err, f"production without pinned relay secrets rendered: {err}")
+    err = render_error(*prod, "--set", "relay.enabled=true", "--set", "relay.database.existingSecret=my-relay-db")
+    check(err is not None and "relay.clusterToken.existingSecret" in err, f"production without a pinned token rendered: {err}")
+    check(render_error(*prod, "--set", "relay.enabled=false") is None, "production with the relay off must render")
+    check(render_error("--set", "relay.enabled=true") is None, "the default profile must render without pins")
+    _, docs = render(*prod, "--set", "relay.enabled=true", "--set", "relay.database.existingSecret=my-relay-db",
+                     "--set", "relay.clusterToken.existingSecret=my-relay-token")
+    test_least_privilege(docs, "production existing secrets", db_secret="my-relay-db", tok_secret="my-relay-token",
+                         chart_secrets=False)
+    configs["on-prod"] = test_on(prod + ["--set", "global.secretOverrides.relayDbPassword=" + "p" * 40,
+                                         "--set", "global.secretOverrides.relayClusterToken=" + "t" * 40], "production")
     configs["on-tls-off"] = test_on(["--set", "global.tls.enabled=false"], "tls-off")
     configs["on-1-replica"] = test_on(["--set", "relay.replicas=1"], "1 replica", replicas=1)
     # Secrets you manage instead of the chart's; the NetworkPolicy can be off.
