@@ -120,6 +120,41 @@ dex:
   #   connectorSecret: amp-dex-connectors   # keys GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET
   connectors: []
   connectorSecret: ""
+  # Dex's Postgres connection pool and session settings. These apply to Dex's
+  # own connections (database "dex") only; amp-api is not affected.
+  #
+  # Why (incident 2026-10-26, KB discoveries/dex-frozen-replica-incident.md):
+  # Dex v2.42 refreshes a token inside a SERIALIZABLE transaction and, while
+  # that transaction holds a pooled connection, asks the password connector to
+  # re-read the user, which needs a second connection. With the default pool
+  # of 5, five concurrent refreshes on one replica deadlock the pool for good:
+  # five sessions sit "idle in transaction" holding row locks, the replica
+  # stops answering anything that touches storage, and /dex/healthz stays
+  # green. A bigger pool makes that much less likely; the timeout below ends
+  # the stuck sessions so they stop blocking the other replica; the storage
+  # probe further down restarts the frozen replica.
+  storage:
+    maxOpenConns: 20        # Dex default 5. Per replica; Postgres max_connections is 100.
+    maxIdleConns: 5
+    connMaxLifetime: 1800   # seconds
+    connectionTimeout: 10   # seconds to open a connection (Dex default: wait forever)
+    # Sent by lib/pq as the startup "options" (PGOPTIONS env on the Dex
+    # container), so it is a session setting of Dex's connections only.
+    # Empty disables it.
+    pgOptions: "-c idle_in_transaction_session_timeout=60s"
+  # Probe that goes through storage on every call. Dex's /dex/healthz can't be
+  # trusted for this: its storage check has no timeout and keeps reporting its
+  # last result while blocked, and /dex/keys is cached until key rotation.
+  # The probe POSTs an unknown client_id to /dex/token, which makes Dex look
+  # the client up in Postgres (a read, nothing is written) and answer 401.
+  # Any other answer, or none within timeoutSeconds, is a failure.
+  # Set enabled: false to go back to the plain /dex/healthz probes.
+  storageProbe:
+    enabled: true
+    clientID: amp-storage-probe   # must NOT be a real client
+    timeoutSeconds: 5
+    readiness: { periodSeconds: 10, failureThreshold: 2 }   # out of the Service in ~20s
+    liveness: { periodSeconds: 15, failureThreshold: 4 }    # restarted after ~60s
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits: { cpu: 300m, memory: 256Mi }
