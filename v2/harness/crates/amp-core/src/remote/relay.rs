@@ -139,14 +139,32 @@ pub struct Registered {
     pub connect_token: String,
     pub connect_token_expires_at_ms: i64,
     pub started_at_ms: i64,
-    pub expires_at_ms: i64,
-    pub idle_timeout_s: i64,
+    /// The session's lifetime: `None` (JSON null, the default since #2424) when it has none.
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
+    /// The org's idle limit: `None` (null, the default since #2424) when it has none.
+    #[serde(default)]
+    pub idle_timeout_s: Option<i64>,
     #[serde(default = "default_pin_days")]
     pub device_pin_max_days: i64,
     #[serde(default = "default_interval")]
     pub heartbeat_interval_s: i64,
     #[serde(default)]
     pub session_url: Option<String>,
+}
+
+impl Registered {
+    /// The lifetime deadline, if the org set one (a non-positive value counts as none).
+    pub fn expires_at(&self) -> Option<i64> {
+        self.expires_at_ms.filter(|&t| t > 0)
+    }
+
+    /// The idle limit in milliseconds, if the org set one.
+    pub fn idle_timeout_ms(&self) -> Option<i64> {
+        self.idle_timeout_s
+            .filter(|&s| s > 0)
+            .map(|s| s.saturating_mul(1000))
+    }
 }
 
 fn default_pin_days() -> i64 {

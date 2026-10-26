@@ -37,8 +37,10 @@ use super::relay::now_ms;
 pub struct MockOptions {
     /// The OAuth access token the mock accepts for register and refresh.
     pub oauth_token: String,
-    pub idle_timeout_s: i64,
-    pub lifetime_ms: i64,
+    /// `None` (the default, like the relay since #2424): no idle limit, sent as null.
+    pub idle_timeout_s: Option<i64>,
+    /// `None` (the default): no lifetime, `expires_at_ms` null.
+    pub lifetime_ms: Option<i64>,
     pub device_pin_max_days: i64,
     pub connect_token_ttl_ms: i64,
     pub heartbeat_interval_s: i64,
@@ -50,8 +52,8 @@ impl Default for MockOptions {
     fn default() -> Self {
         Self {
             oauth_token: "oauth-access-token-for-tests".into(),
-            idle_timeout_s: 1800,
-            lifetime_ms: 12 * 3600 * 1000,
+            idle_timeout_s: None,
+            lifetime_ms: None,
             device_pin_max_days: 30,
             connect_token_ttl_ms: 15 * 60 * 1000,
             heartbeat_interval_s: 20,
@@ -90,6 +92,11 @@ struct App {
     changed: Arc<Notify>,
     /// The relay service is down (#2396): every call gets the proxy's `503`.
     down: Arc<std::sync::atomic::AtomicBool>,
+    /// The relay is switched off (#2424): every call gets the web app's HTML page, as
+    /// `/relay/` does with `relay.enabled: false`.
+    html: Arc<std::sync::atomic::AtomicBool>,
+    /// No relay route (#2424): every call gets a bare `404 page not found`, no relay `code`.
+    gone: Arc<std::sync::atomic::AtomicBool>,
     /// Added to the mock's clock (a laptop whose clock is off, #2399).
     clock_offset_ms: Arc<std::sync::atomic::AtomicI64>,
 }
@@ -101,6 +108,24 @@ async fn proxy(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if app.gone.load(std::sync::atomic::Ordering::SeqCst) {
+        app.note(format!("gone:{} {}", req.method(), req.uri().path()));
+        return (
+            StatusCode::NOT_FOUND,
+            [("content-type", "text/plain")],
+            "404 page not found",
+        )
+            .into_response();
+    }
+    if app.html.load(std::sync::atomic::Ordering::SeqCst) {
+        app.note(format!("html:{} {}", req.method(), req.uri().path()));
+        return (
+            StatusCode::OK,
+            [("content-type", "text/html")],
+            "<!doctype html><title>AMP</title>",
+        )
+            .into_response();
+    }
     if app.down.load(std::sync::atomic::Ordering::SeqCst) {
         app.note(format!("down:{} {}", req.method(), req.uri().path()));
         return (
@@ -239,7 +264,7 @@ async fn register(State(app): State<App>, headers: HeaderMap, body: Bytes) -> Re
             "session_id": session_id, "protocol_version": 1,
             "connect_token": connect,
             "connect_token_expires_at_ms": now + app.opts.connect_token_ttl_ms,
-            "started_at_ms": now, "expires_at_ms": now + app.opts.lifetime_ms,
+            "started_at_ms": now, "expires_at_ms": app.opts.lifetime_ms.map(|l| now + l),
             "idle_timeout_s": app.opts.idle_timeout_s,
             "device_pin_max_days": app.opts.device_pin_max_days,
             "heartbeat_interval_s": app.opts.heartbeat_interval_s,
@@ -480,6 +505,8 @@ impl MockRelay {
             inner: Default::default(),
             changed: Arc::new(Notify::new()),
             down: Default::default(),
+            html: Default::default(),
+            gone: Default::default(),
             clock_offset_ms: Default::default(),
         };
         let router = Router::new()
@@ -563,6 +590,33 @@ impl MockRelay {
         if down {
             self.drop_stream();
         }
+    }
+
+    /// Switches the relay off (`true`) or on again (#2424): every call gets the web app's HTML
+    /// (what `/relay/` reaches with `relay.enabled: false`), and the command stream is cut.
+    pub fn set_html(&self, on: bool) {
+        self.app.html.store(on, std::sync::atomic::Ordering::SeqCst);
+        if on {
+            self.drop_stream();
+        }
+    }
+
+    /// Takes the relay's routes away (`true`) or brings them back (#2424): every call gets a bare
+    /// `404` with no relay `code`, and the command stream is cut.
+    pub fn set_gone(&self, on: bool) {
+        self.app.gone.store(on, std::sync::atomic::Ordering::SeqCst);
+        if on {
+            self.drop_stream();
+        }
+    }
+
+    /// How the relay ended session `id`, if it did.
+    pub fn ended_of(&self, id: &str) -> Option<String> {
+        self.app
+            .lock()
+            .sessions
+            .get(id)
+            .and_then(|s| s.ended.clone())
     }
 
     /// Moves the relay's clock `ms` away from the harness's (#2399): with more than 60 s,

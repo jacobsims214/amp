@@ -10,8 +10,9 @@
 //! Inside, one actor task owns the session: it reads the command stream, checks every command
 //! (section 5.6), runs the follow-up queue, numbers and signs events (hello, status, chat events
 //! from the manager feed, ack, refused, pair_result, bye) on one seq counter (section 6.1),
-//! redacts secrets before signing, keeps the idle and lifetime deadlines, and reconnects with
-//! backoff. A poster task batches events (~100 ms) and resends what the relay hasn't accepted; a
+//! redacts secrets before signing, keeps the idle and lifetime deadlines when the org set them
+//! (#2424: by default there are none, and the session lives until a person ends it), and
+//! reconnects with backoff for as long as it takes. A poster task batches events (~100 ms) and resends what the relay hasn't accepted; a
 //! heartbeat task beats every 20 s.
 
 use std::{
@@ -32,6 +33,7 @@ use super::crypto::{KeyPair, KeyStore};
 use super::envelope::{
     self, Code, Command, CommandContext, EventSigner, Refusal, ReplayState, VerifiedCommand,
 };
+use super::live::{self, LiveEntry, LiveRecord};
 use super::pairing::{
     self, PairCandidate, PairCheckInput, PairResult, PairingWindow, PinStore, StoredPin,
 };
@@ -245,8 +247,10 @@ pub struct RemoteOn {
     pub devices: usize,
     /// The command stream is connected.
     pub online: bool,
-    pub expires_at_ms: i64,
-    pub idle_deadline_ms: i64,
+    /// When the session's lifetime ends: `None` (the default, #2424) when it has none.
+    pub expires_at_ms: Option<i64>,
+    /// When it ends without remote activity: `None` when the org set no idle limit.
+    pub idle_deadline_ms: Option<i64>,
     pub queue_len: usize,
     /// The harness key's display fingerprint (`29CA-E6B5-00C2-66CB`).
     pub fingerprint: String,
@@ -311,7 +315,8 @@ pub struct Enabled {
     pub session_id: String,
     pub link: String,
     pub link_expires_at_ms: i64,
-    pub expires_at_ms: i64,
+    /// `None`: no lifetime (#2424).
+    pub expires_at_ms: Option<i64>,
     pub fingerprint: String,
 }
 
@@ -324,6 +329,11 @@ enum Control {
         reply: oneshot::Sender<Result<(String, i64), String>>,
     },
     DevicesChanged,
+    /// Tests only: stop as a killed process would (no `bye`, no `DELETE`, the record left).
+    #[cfg(feature = "mock-relay")]
+    Abandon {
+        done: oneshot::Sender<()>,
+    },
 }
 
 struct Shared {
@@ -455,6 +465,20 @@ impl RemoteLink {
         rx.await.map_err(|_| "remote control is off".to_owned())?
     }
 
+    /// Tests only (#2424): stops the link as a killed process would. Nothing reaches the relay,
+    /// which keeps the session live and offline, and the session's record stays on disk with no
+    /// lock on it, as after a crash or a reboot.
+    #[cfg(feature = "mock-relay")]
+    pub async fn abandon_for_tests(&self) {
+        let tx = lock(&self.shared.control).clone();
+        if let Some(tx) = tx {
+            let (done, rx) = oneshot::channel();
+            if tx.send(Control::Abandon { done }).is_ok() {
+                let _ = tokio::time::timeout(Duration::from_secs(10), rx).await;
+            }
+        }
+    }
+
     /// Ends remote control (`/remote off`, harness exit): `bye`, then `DELETE`. The local session
     /// keeps running.
     pub async fn disable(&self) {
@@ -493,6 +517,9 @@ impl RemoteLink {
             ));
         }
         self.shared.state.send_replace(RemoteState::Starting);
+        // Sessions a chat on this computer left behind when it was killed (#2424): turning
+        // remote on again here ends them, so they don't stay listed forever.
+        self.end_orphans();
         // Ends the relay missed earlier (#2396) go out too, now that it may be back.
         self.retry_pending_ends();
         let result = self.enable_inner().await;
@@ -589,10 +616,25 @@ impl RemoteLink {
             session_id: reg.session_id.clone(),
             link: link.clone(),
             link_expires_at_ms: window.expires_at_ms(),
-            expires_at_ms: reg.expires_at_ms,
+            expires_at_ms: reg.expires_at(),
             fingerprint: key.display_fingerprint(),
         };
-        let actor = Actor::new(
+        // #2424: hold this session's record while the process lives (see [`live`]).
+        let record = self.live_dir().and_then(|dir| {
+            live::claim(
+                &dir,
+                &LiveEntry {
+                    v: 1,
+                    api_base: deps.setup.api_base.clone(),
+                    session_id: reg.session_id.clone(),
+                    harness_id: key.id().to_owned(),
+                    started_at_ms: reg.started_at_ms,
+                },
+            )
+            .map_err(|e| tracing::warn!(error = %e, "remote: no live session record"))
+            .ok()
+        });
+        let mut actor = Actor::new(
             self.clone(),
             key,
             client,
@@ -602,6 +644,7 @@ impl RemoteLink {
             user_id,
             ctl_rx,
         );
+        actor.live = record;
         tokio::spawn(actor.run());
         Ok(enabled)
     }
@@ -617,6 +660,45 @@ impl RemoteLink {
             .map_err(|e| format!("the harness key: {e}"))??;
         *lock(&self.shared.key) = Some(key.clone());
         Ok(key)
+    }
+
+    /// Where running sessions keep their records (`<state>/remote-live/`, next to the pending
+    /// ends): `None` when the link keeps its state in memory.
+    fn live_dir(&self) -> Option<PathBuf> {
+        let file = self.shared.deps.pending_ends.as_ref()?;
+        Some(file.parent()?.join(live::LIVE_DIR))
+    }
+
+    /// Records the end of every session a dead chat on this computer left behind for this AMP
+    /// server (#2424, see [`live`]). [`Self::retry_pending_ends`] sends them.
+    fn end_orphans(&self) {
+        let Some(dir) = self.live_dir() else {
+            return;
+        };
+        let now = now_ms();
+        for orphan in live::take_orphans(&dir, &self.shared.deps.setup.api_base) {
+            let end = PendingEnd {
+                api_base: orphan.api_base,
+                session_id: orphan.session_id.clone(),
+                harness_id: orphan.harness_id,
+                reason: "harness_ended".to_owned(),
+                until_ms: now + NO_LIMIT_PENDING_MS,
+            };
+            if let Err(e) = lock(&self.shared.pending).add(end, now) {
+                tracing::warn!(error = %e, "remote: a left-behind session's end was not saved");
+            }
+            self.log_line("end_orphan", &orphan.session_id);
+        }
+    }
+
+    fn log_line(&self, op: &str, session_id: &str) {
+        if let Some(path) = &self.shared.deps.action_log {
+            let line = json!({
+                "at_ms": now_ms(), "session_id": session_id, "op": op,
+                "device_id": null, "result": "recorded",
+            });
+            append_private(path, &format!("{line}\n"));
+        }
     }
 
     /// The session ends recorded for this AMP server that the relay hasn't heard yet (#2396).
@@ -893,9 +975,12 @@ struct Actor {
     viewers: u32,
     online: bool,
     started_at_ms: i64,
-    expires_at_ms: i64,
-    idle_timeout_ms: i64,
+    /// `None`: no lifetime; `idle_timeout_ms` `None`: no idle limit (the defaults, #2424).
+    expires_at_ms: Option<i64>,
+    idle_timeout_ms: Option<i64>,
     last_activity_ms: i64,
+    /// This session's record while the process lives (#2424).
+    live: Option<LiveRecord>,
     pin_days: i64,
     heartbeat_every: Duration,
     last_status: Option<Value>,
@@ -953,9 +1038,10 @@ impl Actor {
             viewers: 0,
             online: false,
             started_at_ms: reg.started_at_ms,
-            expires_at_ms: reg.expires_at_ms,
-            idle_timeout_ms: reg.idle_timeout_s.max(1) * 1000,
+            expires_at_ms: reg.expires_at(),
+            idle_timeout_ms: reg.idle_timeout_ms(),
             last_activity_ms: now,
+            live: None,
             pin_days: reg.device_pin_max_days,
             heartbeat_every: Duration::from_secs(reg.heartbeat_interval_s.clamp(1, 60) as u64),
             last_status: None,
@@ -1011,7 +1097,7 @@ impl Actor {
                 devices: self.active_pins().len(),
                 online: self.online,
                 expires_at_ms: self.expires_at_ms,
-                idle_deadline_ms: self.last_activity_ms + self.idle_timeout_ms,
+                idle_deadline_ms: self.idle_deadline(),
                 queue_len: self.queue.len(),
                 fingerprint: self.key.display_fingerprint(),
             }));
@@ -1097,8 +1183,9 @@ impl Actor {
             "user_id": self.user_id,
             "ops": OPS,
             "started_at_ms": self.started_at_ms,
+            // null: no lifetime / no idle limit (#2424).
             "expires_at_ms": self.expires_at_ms,
-            "idle_timeout_s": self.idle_timeout_ms / 1000,
+            "idle_timeout_s": self.idle_timeout_ms.map(|ms| ms / 1000),
             "status": self.status_body(),
         });
         self.send("hello", None, body);
@@ -1231,6 +1318,20 @@ impl Actor {
                         self.maybe_status(true);
                         self.publish_state();
                     }
+                    #[cfg(feature = "mock-relay")]
+                    Some(Control::Abandon { done }) => {
+                        for t in self.tasks.drain(..) {
+                            t.abort();
+                        }
+                        // Closing the file drops the lock; the record stays, as after a crash.
+                        drop(self.live.take());
+                        *lock(&self.link.shared.control) = None;
+                        self.link.shared.state.send_replace(RemoteState::Off {
+                            reason: Some("abandoned".into()),
+                        });
+                        let _ = done.send(());
+                        return;
+                    }
                     None => break Some(("harness_ended".to_owned(), true)),
                 },
                 inbound = self.inbound_rx.recv() => {
@@ -1293,13 +1394,27 @@ impl Actor {
         }
     }
 
-    async fn on_tick(&mut self) -> Option<(String, bool)> {
-        let now = now_ms();
-        if now >= self.expires_at_ms {
+    /// When the session ends without remote activity, if the org set an idle limit.
+    fn idle_deadline(&self) -> Option<i64> {
+        self.idle_timeout_ms
+            .map(|t| self.last_activity_ms.saturating_add(t))
+    }
+
+    /// `expired` or `idle` once a limit the org set has passed; never without limits (#2424).
+    fn time_limit_passed(&self, now: i64) -> Option<(String, bool)> {
+        if self.expires_at_ms.is_some_and(|t| now >= t) {
             return Some(("expired".into(), true));
         }
-        if now >= self.last_activity_ms + self.idle_timeout_ms {
+        if self.idle_deadline().is_some_and(|t| now >= t) {
             return Some(("idle".into(), true));
+        }
+        None
+    }
+
+    async fn on_tick(&mut self) -> Option<(String, bool)> {
+        let now = now_ms();
+        if let Some(end) = self.time_limit_passed(now) {
+            return Some(end);
         }
         // A delta whose last word waits for more text: send it once the feed is quiet.
         // (The feed numbers a quiet delta after ~100 ms, so a word still growing arrives sooner.)
@@ -1390,6 +1505,15 @@ impl Actor {
                 }
                 if let Some(reason) = e.ended_reason() {
                     let _ = self.inbound_tx.send(Inbound::Fatal(reason, None));
+                } else if session_gone(&e) {
+                    // The relay doesn't know the session (a reset database): it can't come back.
+                    let _ = self.inbound_tx.send(Inbound::Fatal(
+                        "harness_ended".into(),
+                        Some(
+                            "AMP no longer has this remote session; /remote starts a new one."
+                                .into(),
+                        ),
+                    ));
                 } else if let Some(text) =
                     refused_refresh_notice(&e, now_ms(), self.token_expires_ms - now_ms())
                 {
@@ -1437,12 +1561,10 @@ impl Actor {
 
     /// Section 12.3: re-check the switch, the deadlines, the token and the pins, then reopen.
     async fn reconnect(&mut self) -> Option<(String, bool)> {
-        let now = now_ms();
-        if now >= self.expires_at_ms {
-            return Some(("expired".into(), true));
-        }
-        if now >= self.last_activity_ms + self.idle_timeout_ms {
-            return Some(("idle".into(), true));
+        // With no limits (the default, #2424) there is no deadline: it keeps trying, however long
+        // the laptop slept or the relay was away.
+        if let Some(end) = self.time_limit_passed(now_ms()) {
+            return Some(end);
         }
         if let Err(why) = (self.deps().switches)() {
             self.link.notice(NoticeLevel::Warn, why);
@@ -1474,7 +1596,10 @@ impl Actor {
                 if err.as_ref().is_some_and(|e| e.status == 401) {
                     self.refresh_token().await;
                 }
-                if err.as_ref().is_some_and(|e| e.status == 404) {
+                // The relay's own 404 says the session is gone. A 404 or a page that isn't the
+                // relay's means it isn't there right now (switched off, a rollout): a pause, so
+                // keep trying (#2424).
+                if err.as_ref().is_some_and(session_gone) {
                     return Some(("harness_ended".into(), false));
                 }
                 self.stream_down(err);
@@ -1940,7 +2065,11 @@ impl Actor {
             return;
         }
         let now = now_ms();
-        let until = pairing::pin_until(now, self.pin_days, self.expires_at_ms);
+        // A session-only pin lasts the session: its lifetime, or the longest pin without one.
+        let session_end = self
+            .expires_at_ms
+            .unwrap_or(now + pairing::MAX_PIN_DAYS * pairing::DAY_MS);
+        let until = pairing::pin_until(now, self.pin_days, session_end);
         let pin = StoredPin {
             device_id: cand.device_id.clone(),
             device_pub: crate::remote::crypto::b64u(&cand.device_pub),
@@ -2027,9 +2156,13 @@ impl Actor {
                 // #2396: the relay is out of reach (or the token lapsed during an outage).
                 // Remote control is off here now; the relay hears it when it's back. An idle or
                 // expired session needs nothing: the relay ends it by itself.
-                let until_ms = self
-                    .expires_at_ms
-                    .min(self.last_activity_ms + self.idle_timeout_ms);
+                // With no limits (#2424) the relay never ends it by itself: keep trying for
+                // NO_LIMIT_PENDING_MS.
+                let until_ms = [self.expires_at_ms, self.idle_deadline()]
+                    .into_iter()
+                    .flatten()
+                    .min()
+                    .unwrap_or(now_ms() + NO_LIMIT_PENDING_MS);
                 if pending_ends::outcome(&e) == pending_ends::Outcome::Retry
                     && matches!(delete_reason, "harness_ended" | "detached")
                     && until_ms > now_ms()
@@ -2053,6 +2186,10 @@ impl Actor {
         for t in self.tasks.drain(..) {
             t.abort();
         }
+        // Ended here (or its end is a pending end now): nothing is left behind (#2424).
+        if let Some(record) = self.live.take() {
+            record.release();
+        }
         if !self.queue.is_empty() {
             self.queue.clear();
             self.push_queue_event();
@@ -2066,10 +2203,17 @@ impl Actor {
         *lock(&self.link.shared.control) = None;
         let text = match reason {
             "idle" => format!(
-                "Remote control turned off after {} without remote activity.",
-                human_duration(self.idle_timeout_ms)
+                "Remote control turned off after {} without remote activity (the organization's \
+                 limit).",
+                human_duration(self.idle_timeout_ms.unwrap_or(0))
             ),
-            "expired" => "Remote control turned off: 12 hours since it was turned on.".to_owned(),
+            "expired" => format!(
+                "Remote control turned off: {} since it was turned on (the organization's limit).",
+                human_duration(
+                    self.expires_at_ms
+                        .map_or(0, |t| (t - self.started_at_ms).max(0))
+                )
+            ),
             "detached" => "Remote control turned off from the paired device (detach).".to_owned(),
             "harness_ended" => "Remote control is off.".to_owned(),
             "disconnected" => "Remote control turned off from the web app (Disconnect).".to_owned(),
@@ -2095,6 +2239,17 @@ impl Actor {
             self.link.retry_pending_ends();
         }
     }
+}
+
+/// How long a missed end is retried when the session has no limit (#2424): the relay never ends
+/// such a session by itself, so the end is worth sending for as long as a device stays trusted.
+pub const NO_LIMIT_PENDING_MS: i64 = 30 * 24 * 3600 * 1000;
+
+/// Whether a command stream error says the session is gone for good: the relay's own `404
+/// not_found`. A bare 404, or an answer that isn't the relay's, is a relay that isn't there right
+/// now (#2424: the relay's kill switch pauses a session, it doesn't end it).
+fn session_gone(e: &RelayError) -> bool {
+    e.status == 404 && e.code.as_deref() == Some("not_found")
 }
 
 /// `30 minutes`, `1 hour`, `45 seconds`.

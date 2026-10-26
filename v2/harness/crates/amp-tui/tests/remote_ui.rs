@@ -248,7 +248,11 @@ async fn remote_in_the_chat() {
     } else {
         r.until("https://amp.local/sessions/").await
     };
-    assert!(screen.contains("Remote control is on until"), "{screen}");
+    // #2424: no limit by default, so no end time.
+    assert!(
+        screen.contains("Remote control is on until you end it: it reconnects by itself"),
+        "{screen}"
+    );
     assert!(screen.contains("It works once, for 5 min"), "{screen}");
     assert!(screen.contains("████"), "the QR code:\n{screen}");
     assert!(!screen.contains("No QR code"), "{screen}");
@@ -380,4 +384,45 @@ async fn refusals_are_clear() {
     r.shell.submit("/remote").await;
     r.until("/remote: remote control needs your AMP login")
         .await;
+}
+
+/// #2424: `/remote` and `/remote status` say when remote control ends: never by itself by
+/// default (the footer is a plain `REMOTE ON`), or at the organization's limits when it set them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_says_it_has_no_end_time_unless_the_org_set_one() {
+    let mut r = rig("nolimit", MockOptions::default(), (120, 40)).await;
+    r.shell.submit("/remote").await;
+    r.until("REMOTE ON · 0 devices").await;
+    r.wait_hello().await;
+    r.shell.submit("/remote status").await;
+    let screen = r
+        .until("It stays on, through sleep and network changes")
+        .await;
+    assert!(!screen.contains("turns off at"), "{screen}");
+    assert!(!screen.contains("without remote activity"), "{screen}");
+    r.shell.submit("/remote off").await;
+    r.until("Remote control is off.").await;
+
+    let opts = MockOptions {
+        idle_timeout_s: Some(1800),
+        lifetime_ms: Some(12 * 3_600_000),
+        ..MockOptions::default()
+    };
+    let mut r = rig("limits", opts, (120, 40)).await;
+    r.shell.submit("/remote").await;
+    let screen = r.until("REMOTE ON · 0 devices").await;
+    let screen = if screen.contains("(your organization's limit)") {
+        screen
+    } else {
+        r.until("(your organization's limit)").await
+    };
+    assert!(
+        screen.contains("(12 h), or after 30 min without remote activity"),
+        "{screen}"
+    );
+    r.wait_hello().await;
+    r.shell.submit("/remote status").await;
+    r.until("without remote activity (now at").await;
+    r.shell.submit("/remote off").await;
+    r.until("Remote control is off.").await;
 }

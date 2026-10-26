@@ -328,6 +328,14 @@ async fn live_go_relay() {
         .await;
     assert_eq!(st, 200, "{session}");
     assert_eq!(session["harness_id"], h.as_str());
+    // #2424: the real relay gives a session no lifetime and no idle limit by default, and the
+    // harness reads its nulls.
+    assert_eq!(enabled.expires_at_ms, None);
+    assert!(session["expires_at_ms"].is_null(), "{session}");
+    match link.current() {
+        RemoteState::On(on) => assert_eq!((on.expires_at_ms, on.idle_deadline_ms), (None, None)),
+        other => panic!("not on: {other:?}"),
+    }
     let hpub = crypto::b64u_decode(session["harness_pub"].as_str().unwrap()).unwrap();
     assert_eq!(crypto::fingerprint(&hpub), h, "fp(harness_pub) == h");
     let frames = browser.watch(me, &sid).await.expect("watch");

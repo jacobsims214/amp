@@ -21,7 +21,7 @@
 //! - `quit`.
 //!
 //! `AMP_REMOTE_RIG_REFUSE=404|403` answers every register with 404, or 403 `remote_disabled`;
-//! `AMP_REMOTE_RIG_IDLE=<s>` sets the idle timeout.
+//! `AMP_REMOTE_RIG_IDLE=<s>` sets an idle timeout (by default there is none, #2424).
 //!
 //! First line out: `URL http://127.0.0.1:<port>/mcp`.
 
@@ -341,10 +341,10 @@ async fn main() {
         MockOptions {
             oauth_token: TOKEN.into(),
             refuse_register: refuse,
+            // No idle limit unless asked (#2424: the relay's default).
             idle_timeout_s: std::env::var("AMP_REMOTE_RIG_IDLE")
                 .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1800),
+                .and_then(|v| v.parse().ok()),
             ..MockOptions::default()
         },
         listener,

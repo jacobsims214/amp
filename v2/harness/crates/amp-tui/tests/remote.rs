@@ -776,7 +776,7 @@ async fn remote_link_end_to_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_and_lifetime_timeouts_end_remote() {
     let opts = MockOptions {
-        idle_timeout_s: 1,
+        idle_timeout_s: Some(1),
         ..MockOptions::default()
     };
     let mut r = rig(opts.clone(), "idle", &opts.oauth_token).await;
@@ -794,7 +794,7 @@ async fn idle_and_lifetime_timeouts_end_remote() {
     assert!(notice.contains("without remote activity"), "{notice}");
 
     let opts = MockOptions {
-        lifetime_ms: 1500,
+        lifetime_ms: Some(1500),
         ..MockOptions::default()
     };
     let mut r = rig(opts.clone(), "life", &opts.oauth_token).await;
@@ -1574,4 +1574,201 @@ async fn a_refused_token_refresh_is_told_not_silent() {
     let said = notices(&mut r.local).join("\n");
     assert!(said.contains("clock is 5 min behind AMP's"), "{said}");
     assert!(said.contains("remote control stops"), "{said}");
+}
+
+/// Waits until the link's state passes `pred`.
+async fn wait_state(link: &RemoteLink, pred: impl Fn(&RemoteState) -> bool) -> bool {
+    let mut state = link.state();
+    tokio::time::timeout(WAIT, state.wait_for(|s| pred(s)))
+        .await
+        .is_ok()
+}
+
+fn online(s: &RemoteState) -> Option<bool> {
+    match s {
+        RemoteState::On(on) => Some(on.online),
+        _ => None,
+    }
+}
+
+/// #2424: by default a session has no lifetime and no idle limit, and it comes back by itself
+/// after any outage: the relay service down (scaled to 0) for many reconnect rounds while the
+/// connect token lapses (an outage or a sleep of hours, shortened), then the relay switched off
+/// (`/relay/` answers the web app's HTML), then no relay route at all (a bare `404`). It never
+/// ends, the paired device keeps working, and a signed token refresh brings it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_time_limit_by_default_and_any_outage_recovers() {
+    let opts = MockOptions::default();
+    let mut r = rig(opts.clone(), "nolimit", &opts.oauth_token).await;
+    let device = r.enable_and_pair().await;
+    let dev = device.id().to_owned();
+    let hello = r.hello();
+    assert!(
+        hello["body"]["expires_at_ms"].is_null() && hello["body"]["idle_timeout_s"].is_null(),
+        "hello says no limits: {hello}"
+    );
+    match r.link.current() {
+        RemoteState::On(on) => {
+            assert_eq!((on.expires_at_ms, on.idle_deadline_ms), (None, None));
+        }
+        other => panic!("not on: {other:?}"),
+    }
+    let mut seq = now_ms();
+
+    for (round, outage) in ["down", "html", "gone"].into_iter().enumerate() {
+        let opened = r.mock.streams_opened();
+        let tokens_before = r.mock.requests().iter().filter(|q| *q == "token").count();
+        match outage {
+            "down" => r.mock.set_down(true),
+            "html" => r.mock.set_html(true),
+            _ => r.mock.set_gone(true),
+        }
+        assert!(
+            wait_state(&r.link, |s| online(s) == Some(false)).await,
+            "{outage}: offline"
+        );
+        // Many reconnect rounds (backoff 100..400 ms) while the relay is away.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(online(&r.link.current()), Some(false), "{outage}: still on");
+        let tried = r
+            .mock
+            .requests()
+            .iter()
+            .filter(|q| q.starts_with(&format!("{outage}:")))
+            .count();
+        assert!(tried >= 3, "{outage}: it kept trying ({tried})");
+        r.mock.expire_tokens(); // the outage outlasted the connect token
+        match outage {
+            "down" => r.mock.set_down(false),
+            "html" => r.mock.set_html(false),
+            _ => r.mock.set_gone(false),
+        }
+        assert!(
+            r.drive(WAIT, |m| m.streams_opened() > opened && m.stream_open())
+                .await,
+            "{outage}: the command stream is back"
+        );
+        assert!(
+            wait_state(&r.link, |s| online(s) == Some(true)).await,
+            "{outage}: online"
+        );
+        let tokens_after = r.mock.requests().iter().filter(|q| *q == "token").count();
+        assert!(tokens_after > tokens_before, "{outage}: a signed refresh");
+        assert_eq!(r.mock.ended(), None, "{outage}: the session never ended");
+        assert!(
+            r.drive(WAIT, |m| m
+                .events()
+                .iter()
+                .filter(|e| e["op"] == "hello")
+                .count()
+                >= round + 2)
+                .await,
+            "{outage}: hello again"
+        );
+        // The paired device drives it again, with no new pairing.
+        seq += 1;
+        assert!(
+            r.mock
+                .send_command(&r.command(&device, seq, "stop", json!({})))
+        );
+        assert!(
+            r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "ack"
+                && e["device_id"] == dev.as_str()
+                && e["body"]["ref"]["seq"] == seq))
+                .await,
+            "{outage}: the device's command is accepted"
+        );
+    }
+    r.link.disable().await;
+    assert_eq!(r.mock.ended().as_deref(), Some("harness_ended"));
+}
+
+/// #2424: a chat that is killed (or a reboot) leaves its session listed in AMP, live and offline.
+/// The harness has no chat resume, so starting the chat again leaves it alone; turning `/remote`
+/// on again on this computer ends it (a signed refresh, then `DELETE`) and starts a new one, and
+/// the device paired before keeps working without pairing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_killed_chat_s_session_is_ended_by_the_next_remote_on_and_devices_still_work() {
+    let opts = MockOptions::default();
+    let mut r = rig(opts.clone(), "killed", &opts.oauth_token).await;
+    let device = r.enable_and_pair().await;
+    let dev = device.id().to_owned();
+    let old = r.sid();
+    let live_dir = r._dir.0.join("remote-live");
+    let old_record = live_dir.join(format!("{old}.json"));
+    assert!(old_record.exists(), "a running session has a record");
+    let text = std::fs::read_to_string(&old_record).unwrap();
+    assert!(!text.contains("rct_") && text.contains(&old), "{text}");
+
+    r.link.abandon_for_tests().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(r.mock.ended_of(&old), None, "the relay heard nothing");
+    assert!(old_record.exists(), "the record stays behind");
+
+    let next = RemoteLink::new(RemoteDeps {
+        setup: RemoteSetup {
+            api_base: r.mock.base.clone(),
+            web_origin: "https://amp.example.test".into(),
+            ca_file: None,
+            project_id: Some(2),
+            host: "test-host".into(),
+            os: "macos".into(),
+            version: "0.0.0-test".into(),
+        },
+        tokens: Arc::new(FixedToken(opts.oauth_token.clone(), USER)),
+        host: r.shell.remote_host(),
+        feed: ManagerFeed::new(),
+        keys: r.keys.clone(),
+        pins: Some(r._dir.0.join("remote-devices.json")),
+        action_log: Some(r.log.clone()),
+        pending_ends: Some(r._dir.0.join("remote-pending-ends.json")),
+        redactor: Redactor::new(),
+        switches: Arc::new(|| Ok(())),
+        tuning: tuning(),
+    });
+    // Starting the chat again doesn't end it: it stays listed until it's ended or remote is on.
+    next.retry_pending_ends();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        r.mock.ended_of(&old),
+        None,
+        "a new chat alone leaves it listed"
+    );
+    assert!(next.devices().unwrap().iter().any(|p| p.device_id == dev));
+
+    let enabled = next.enable().await.expect("remote on again");
+    assert_ne!(enabled.session_id, old);
+    assert_eq!(enabled.expires_at_ms, None);
+    assert!(
+        r.mock
+            .wait_until(WAIT, |m| m.ended_of(&old).as_deref()
+                == Some("harness_ended"))
+            .await,
+        "the left-behind session is ended"
+    );
+    assert!(!old_record.exists());
+    let new_record = live_dir.join(format!("{}.json", enabled.session_id));
+    assert!(new_record.exists());
+    let log = std::fs::read_to_string(&r.log).unwrap();
+    assert!(log.contains(r#""op":"end_orphan""#), "{log}");
+
+    // The device paired with this harness before the crash drives the new session as it is.
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "hello"))
+            .await
+    );
+    let seq = now_ms();
+    assert!(
+        r.mock
+            .send_command(&r.command(&device, seq, "stop", json!({})))
+    );
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "ack"
+            && e["device_id"] == dev.as_str()
+            && e["body"]["ref"]["seq"] == seq))
+            .await,
+        "a pinned device needs no new pairing"
+    );
+    next.disable().await;
+    assert!(!new_record.exists(), "a clean end removes the record");
 }
