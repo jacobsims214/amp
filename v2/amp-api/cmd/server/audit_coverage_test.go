@@ -33,7 +33,7 @@ import (
 
 // auditREST is the REST listener as main() builds it (reqctx outermost,
 // then the identity the auth middleware would resolve), with the test
-// client trusted as a proxy so X-Forwarded-For names the client.
+// client standing in for Envoy, so its X-Amp-Client-Ip names the client.
 type auditREST struct {
 	w   *rbacWorld
 	srv *httptest.Server
@@ -63,14 +63,14 @@ func newAuditREST(t *testing.T, w *rbacWorld) *auditREST {
 	return a
 }
 
-// do sends a request as who from client address ip (via X-Forwarded-For).
+// do sends a request as who from client address ip (via X-Amp-Client-Ip, as Envoy sets it).
 func (a *auditREST) do(t *testing.T, who, ip, method, path string, body any, hdr ...string) (int, map[string]any) {
 	t.Helper()
 	b, _ := json.Marshal(body)
 	req, _ := http.NewRequest(method, a.srv.URL+path, strings.NewReader(string(b)))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Test-As", who)
-	req.Header.Set("X-Forwarded-For", ip)
+	req.Header.Set(reqctx.HeaderClientIP, ip)
 	req.Header.Set("User-Agent", "Mozilla/5.0 (coverage test)")
 	for i := 0; i+1 < len(hdr); i += 2 {
 		req.Header.Set(hdr[i], hdr[i+1])
