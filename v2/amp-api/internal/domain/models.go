@@ -540,6 +540,14 @@ type AuditEntry struct {
 	TraceID          string         `json:"trace_id,omitempty"`
 	Before           map[string]any `json:"before,omitempty"`
 	After            map[string]any `json:"after,omitempty"`
+
+	// Tamper evidence (#2429): the row's place in its chain ("org:<id>" or
+	// "global") and its hash, hex. A copy kept elsewhere (a SIEM via
+	// webhooks) can later prove what the row said. Empty on an entry not
+	// yet read back from the database.
+	ChainKey string `json:"chain_key,omitempty"`
+	ChainSeq int64  `json:"chain_seq,omitempty"`
+	Hash     string `json:"hash,omitempty"`
 }
 
 // AuditSchemaVersion is what writers put in AuditEntry.SchemaVersion.

@@ -17,9 +17,14 @@ type Webhook struct {
 	Format    string `json:"format"` // WebhookFormatJSON or WebhookFormatSlack
 	// Secret signs each delivery (X-AMP-Signature). Only returned when a
 	// webhook is created or its secret rotated.
-	Secret              string     `json:"secret,omitempty"`
-	Events              []string   `json:"events"` // patterns, see WebhookMatches
-	Active              bool       `json:"active"`
+	Secret string   `json:"secret,omitempty"`
+	Events []string `json:"events"` // patterns, see WebhookMatches
+	Active bool     `json:"active"`
+	// IncludeContext opts an audit webhook into the request context of
+	// each entry: source_ip, user_agent, session_id, token_id, before and
+	// after (personal data, audit log v2). Off by default, and for every
+	// webhook made before v2 (#2439 M2).
+	IncludeContext      bool       `json:"include_context"`
 	CreatedBy           *int       `json:"created_by,omitempty"`
 	CreatedAt           time.Time  `json:"created_at"`
 	UpdatedAt           time.Time  `json:"updated_at"`

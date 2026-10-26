@@ -60,6 +60,11 @@ func mustLoadMigrations() []repository.Migration {
 }
 
 func main() {
+	// `amp-api audit ...`: verify the audit chain, write checkpoints now,
+	// or make a signing key (audit_cli.go).
+	if len(os.Args) > 1 && os.Args[1] == "audit" {
+		os.Exit(runAuditCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	dsn := envOrDefault("DATABASE_URL", "postgres://amp:amp@localhost:5432/amp?sslmode=disable")
@@ -329,6 +334,10 @@ func main() {
 	mcpVerifier.ResourceMetadataURL = mcpCfg.PublicURL + "/.well-known/oauth-protected-resource"
 	mcpVerifier.Scope = strings.Join(mcpCfg.Scopes, " ")
 	restVerifier := verifier.WithAudiences("rest", restAudiences...)
+	// Sign-ins, accounts created at first sign-in, accepted invites, API
+	// token use from a new address, and rejected tokens go to the audit log.
+	authEvents := service.New(repo, registry, kbSvc).RecordAuthEvent
+	mcpVerifier.OnEvent, restVerifier.OnEvent = authEvents, authEvents
 	slog.Info("token audience policy", "mcp", mcpAudience, "rest", restAudiences, "ui_client", uiClientID)
 	if os.Getenv("OIDC_ISSUER_URL") != "" && uiClientID == "" {
 		slog.Warn("UI_CLIENT_ID and REST_AUDIENCES unset: no request counts as the web UI, so nobody can approve a plan")
@@ -376,6 +385,25 @@ func main() {
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
 	// are deleted. Idempotent, so every replica can run it.
 	go service.New(repo, registry, kbSvc).RunTrashPurge(context.Background(), time.Hour)
+
+	// Audit log integrity (#2429): sign each chain's head hourly, and
+	// delete entries past AUDIT_RETENTION_DAYS daily through the anchored
+	// path. One replica at a time runs each (advisory locks).
+	service.AuditKeys = loadAuditKeys()
+	// The dispatcher records turning a failing webhook off and dropping
+	// deliveries (#2439 M4).
+	webhooks.OnSystemAudit(service.New(repo, registry, kbSvc).RecordSystem)
+	auditRetention := auditRetentionFromEnv()
+	service.AuditRetention = auditRetention
+	if auditRetention > 0 {
+		if ready, err := repo.AuditPurgeRoleReady(ctx); err != nil {
+			slog.Warn("can't tell whether audit retention can run", "err", err)
+		} else if !ready {
+			slog.Warn("audit retention is off until a superuser sets up the amp_audit_purge role: run `amp-api audit purge-role-sql` and feed it to psql as a superuser (see KB admin/trash-audit-and-projects)")
+		}
+	}
+	go service.New(repo, registry, kbSvc).RunAuditCheckpoints(ctx, time.Hour, repo.TryNamedLock)
+	go service.New(repo, registry, kbSvc).RunAuditRetention(ctx, auditRetention, 24*time.Hour, repo.TryNamedLock)
 
 	// Health check (unauthenticated, used by k8s probes)
 	var draining atomic.Bool

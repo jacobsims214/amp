@@ -121,6 +121,22 @@ spec:
             {{- end }}
             - name: WEBHOOK_ALLOW_PRIVATE_NETWORKS
               value: {{ .Values.ampApi.webhookAllowPrivateNetworks | default false | quote }}
+            {{- with .Values.ampApi.audit }}
+            # Audit retention, and the checkpoint signing key from its Secret
+            # (never in the database; see values.yaml ampApi.audit).
+            - name: AUDIT_RETENTION_DAYS
+              value: {{ .retentionDays | toString | quote }}
+            {{- if .signingKey.existingSecret }}
+            # optional: a missing Secret means no key (verify says
+            # "unproven"), not a pod that can't start.
+            - name: AUDIT_SIGNING_KEY
+              valueFrom: { secretKeyRef: { name: {{ .signingKey.existingSecret }}, key: {{ .signingKey.key | default "signing-key" }}, optional: true } }
+            {{- end }}
+            {{- with .retiredPublicKeys }}
+            - name: AUDIT_SIGNING_PUBLIC_KEYS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             # Remote control of harness sessions (epic 165): the instance switch.
             - name: RELAY_ENABLED
               value: {{ .Values.relay.enabled | default false | quote }}

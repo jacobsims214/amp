@@ -112,13 +112,17 @@ func (h *RestHandler) events(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *RestHandler) Register(mux *http.ServeMux) {
+	h.register(&deniedMux{mux: mux, h: h})
+}
+
+func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/projects", h.projects)
 	mux.HandleFunc("/api/projects/", h.projectSub)
 	mux.HandleFunc("/api/epics/", h.epicSub)
 	mux.HandleFunc("/api/stories/", h.storySub)
 	mux.HandleFunc("/api/tasks/", h.taskSub)
 	mux.HandleFunc("/api/kb/", h.kbDoc)
-	mux.HandleFunc("/api/events", h.events)
+	mux.mux.HandleFunc("/api/events", h.events) // SSE: streams, never a 403 after it starts
 	mux.HandleFunc("/api/orgs", h.orgs)
 	mux.HandleFunc("/api/orgs/", h.orgSub)
 	mux.HandleFunc("/api/teams/", h.teamSub)
@@ -128,6 +132,7 @@ func (h *RestHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tokens/", h.tokenSub)
 	mux.HandleFunc("/api/agents", h.agents)
 	mux.HandleFunc("/api/audit", h.audit)
+	mux.HandleFunc("/api/audit/verify", h.auditVerify)
 	mux.HandleFunc("/api/webhooks/", h.webhookSub)
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
@@ -386,6 +391,28 @@ func (h *RestHandler) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]interface{}{"entries": entries})
+}
+
+// GET /api/audit/verify?org_id= recomputes the audit hash chain of an org
+// (its owners and admins, and global admins), or of every chain (no org_id:
+// global admins), and checks the signed checkpoints. 200 with the report
+// whether or not it found problems: "ok" says which.
+func (h *RestHandler) auditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	orgID, _ := strconv.Atoi(r.URL.Query().Get("org_id"))
+	report, err := h.svc.VerifyAudit(r.Context(), pr, orgID)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, report)
 }
 
 // ---- /api/projects ----
@@ -846,6 +873,7 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		bundle.KBDocs = kbDocs
+		h.svc.RecordProjectExport(r.Context(), pr, projectID, bundle)
 
 		// Set Content-Disposition header for file download
 		filename := fmt.Sprintf("amp-export-%s-%s.json", bundle.Project.Code, time.Now().Format("2006-01-02"))
@@ -1803,6 +1831,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 500)
 				return
 			}
+			h.svc.AuditKB(r.Context(), pr, "kb.write", k, body.Path, map[string]any{"reason": strings.TrimSpace(body.Reason)})
 			jsonOK(w, doc)
 
 		case http.MethodDelete:
@@ -1819,6 +1848,7 @@ func (h *RestHandler) kbDoc(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 500)
 				return
 			}
+			h.svc.AuditKB(r.Context(), pr, "kb.delete", k, path, nil)
 			jsonOK(w, map[string]interface{}{"deleted": true, "path": path})
 
 		default:

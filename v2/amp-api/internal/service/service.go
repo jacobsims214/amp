@@ -30,6 +30,9 @@ type Service struct {
 	// ArtifactRetention is how long an artifact lives after its last version
 	// unless someone keeps it (0: the default, 45 days).
 	ArtifactRetention time.Duration
+	// Denied rate-limits refusal rows (nil: the limiter shared by every
+	// Service, which main uses).
+	Denied *DeniedLimiter
 	// Remote is the instance's remote control configuration (off unless
 	// RELAY_ENABLED and auth are on).
 	Remote RemoteConfig
@@ -365,6 +368,7 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 	}
 	proj, err := s.Repo.GetProject(ctx, t.ProjectID)
 	if err := planApprovalGate(proj, err, t, s.PlanURL(t.ProjectID)); err != nil {
+		s.auditTaskDenied(ctx, p, "task.dispatch", t, err, map[string]any{"agent_id": agentID})
 		return nil, err
 	}
 	pid, err := s.Registry.Get(t.ProjectID)
@@ -433,14 +437,23 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	// only a person in the web UI can. Turning it on is fine from anywhere.
 	if u.RequirePlanApproval != nil && !*u.RequirePlanApproval {
 		if err := authz.RequireUI(p, "Turning plan approval off", s.SettingsURL(projectID)); err != nil {
+			s.auditDenied(ctx, p, "project.settings", domain.AuditEntry{ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+				Summary: "refused turning plan approval off for " + p.Label(), Details: map[string]any{"require_plan_approval": false}}, err)
 			return nil, err
 		}
 	}
+	// The settings as they were, for the audit row's before/after.
+	prev, prevErr := s.Repo.GetProject(ctx, projectID)
 	proj, err := s.Repo.UpdateProject(ctx, projectID, u)
 	if err == nil {
-		s.audit(ctx, p, domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
-			Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
-				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata, "channel": p.Channel}})
+		e := domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
+			TargetName: proj.Name, Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
+				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata, "channel": p.Channel},
+			After: projectSettingsOf(proj)}
+		if prevErr == nil {
+			e.Before = projectSettingsOf(prev)
+		}
+		s.audit(ctx, p, e)
 	}
 	return proj, err
 }
@@ -567,4 +580,22 @@ func (s *Service) FindByMetadata(ctx context.Context, p authz.Principal, kind st
 		return nil, authz.BadRequest("%s", err.Error())
 	}
 	return found, err
+}
+
+// projectSettingsOf is a project's settings as an audit before/after value
+// (the description only as its length: it's content, not a setting).
+func projectSettingsOf(p *domain.Project) map[string]any {
+	if p == nil {
+		return nil
+	}
+	m := map[string]any{"name": p.Name, "description_length": len(p.Description), "open_reassign": p.OpenReassign,
+		"require_plan_approval": p.RequirePlanApproval}
+	if len(p.Metadata) > 0 {
+		md := make(map[string]any, len(p.Metadata))
+		for k, v := range p.Metadata {
+			md[k] = v
+		}
+		m["metadata"] = md
+	}
+	return m
 }

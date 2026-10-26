@@ -79,6 +79,7 @@ func (s *Service) CompleteTask(ctx context.Context, p authz.Principal, taskID in
 		return nil, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
 	}
 	if err := s.checkAgentCompletion(ctx, p, t); err != nil {
+		s.auditTaskDenied(ctx, p, "task.complete", t, err, nil)
 		return nil, err
 	}
 	if err := s.sendComplete(ctx, p, t, !p.InUI()); err != nil {
@@ -175,43 +176,10 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	if state == domain.TaskStateBlocked && strings.HasPrefix(strings.TrimSpace(reason), "scheduled:") {
 		return nil, authz.BadRequest("ticket %d: a block reason can't start with \"scheduled:\"; schedule a ticket with amp_set_task_start_at", taskID)
 	}
-	requireStarted := false
-	if !p.InUI() {
-		// A ticket waiting on a person's answer keeps its question until it's
-		// answered: off the UI, no state change may replace or clear it, so
-		// the answer always leaves a "relayed by agent" record.
-		if hasOpenQuestion(t) && (state != domain.TaskStateBlocked || reason != t.BlockReason) {
-			switch state {
-			case domain.TaskStateBacklog, domain.TaskStateBlocked:
-				return nil, authz.Forbidden("ticket %d is waiting on a question (%q); a state change doesn't answer or replace it. A person answers it "+
-					"in the AMP web UI (%s), or relay their answer with amp_answer_question.", taskID, t.BlockReason, s.TaskURL(t.ProjectID, taskID))
-			}
-		}
-		// A ticket waiting on its dependencies isn't made ready by hand:
-		// it becomes ready when the last one completes (dispatch checks
-		// again regardless). Moving work back from in progress or
-		// completed stays allowed; the actor leaves it blocked on its
-		// dependencies rather than ready.
-		if state == domain.TaskStateBacklog && t.State != domain.TaskStateInProgress && t.State != domain.TaskStateCompleted {
-			if err := s.openDepsGate(ctx, t, "made ready (backlog)"); err != nil {
-				return nil, err
-			}
-		}
-		switch state {
-		case domain.TaskStateInProgress:
-			if t.State != domain.TaskStateInProgress {
-				return nil, authz.Forbidden("ticket %d: agents can't set a ticket in progress by hand; dispatch it with amp_dispatch_task "+
-					"(it needs the plan approved by a person in the AMP web UI: %s)", taskID, s.PlanURL(t.ProjectID))
-			}
-		case domain.TaskStateCompleted:
-			if t.IsHuman() {
-				return nil, authz.RequireUI(p, fmt.Sprintf("Marking ticket %d (a person's ticket) done", taskID), s.TaskURL(t.ProjectID, taskID))
-			}
-			if err := s.checkAgentCompletion(ctx, p, t); err != nil {
-				return nil, err
-			}
-			requireStarted = t.State != domain.TaskStateCompleted
-		}
+	requireStarted, err := s.offUIStateGate(ctx, p, t, state, reason)
+	if err != nil {
+		s.auditTaskDenied(ctx, p, "task.state", t, err, map[string]any{"to": string(state)})
+		return nil, err
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgSetTaskState{
@@ -229,6 +197,51 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	}
 	t.State = state
 	return t, nil
+}
+
+// offUIStateGate applies SetTaskState's rules for callers off the web UI
+// (see SetTaskState), returning whether the actor must re-check that the
+// ticket is still in progress.
+func (s *Service) offUIStateGate(ctx context.Context, p authz.Principal, t *domain.Task, state domain.TaskState, reason string) (bool, error) {
+	requireStarted := false
+	if !p.InUI() {
+		// A ticket waiting on a person's answer keeps its question until it's
+		// answered: off the UI, no state change may replace or clear it, so
+		// the answer always leaves a "relayed by agent" record.
+		if hasOpenQuestion(t) && (state != domain.TaskStateBlocked || reason != t.BlockReason) {
+			switch state {
+			case domain.TaskStateBacklog, domain.TaskStateBlocked:
+				return false, authz.Forbidden("ticket %d is waiting on a question (%q); a state change doesn't answer or replace it. A person answers it "+
+					"in the AMP web UI (%s), or relay their answer with amp_answer_question.", t.ID, t.BlockReason, s.TaskURL(t.ProjectID, t.ID))
+			}
+		}
+		// A ticket waiting on its dependencies isn't made ready by hand:
+		// it becomes ready when the last one completes (dispatch checks
+		// again regardless). Moving work back from in progress or
+		// completed stays allowed; the actor leaves it blocked on its
+		// dependencies rather than ready.
+		if state == domain.TaskStateBacklog && t.State != domain.TaskStateInProgress && t.State != domain.TaskStateCompleted {
+			if err := s.openDepsGate(ctx, t, "made ready (backlog)"); err != nil {
+				return false, err
+			}
+		}
+		switch state {
+		case domain.TaskStateInProgress:
+			if t.State != domain.TaskStateInProgress {
+				return false, authz.Forbidden("ticket %d: agents can't set a ticket in progress by hand; dispatch it with amp_dispatch_task "+
+					"(it needs the plan approved by a person in the AMP web UI: %s)", t.ID, s.PlanURL(t.ProjectID))
+			}
+		case domain.TaskStateCompleted:
+			if t.IsHuman() {
+				return false, authz.RequireUI(p, fmt.Sprintf("Marking ticket %d (a person's ticket) done", t.ID), s.TaskURL(t.ProjectID, t.ID))
+			}
+			if err := s.checkAgentCompletion(ctx, p, t); err != nil {
+				return false, err
+			}
+			requireStarted = t.State != domain.TaskStateCompleted
+		}
+	}
+	return requireStarted, nil
 }
 
 // hasOpenQuestion reports whether t is blocked on a question for a person

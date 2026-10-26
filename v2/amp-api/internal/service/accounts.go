@@ -187,15 +187,18 @@ func (s *Service) SetUserRole(ctx context.Context, p authz.Principal, userID int
 	if grant && role == domain.RoleAdmin && u.IsAgent() {
 		return authz.BadRequest("agent accounts can't be global admins")
 	}
+	before, _ := s.Repo.UserRoles(ctx, userID)
 	if err := s.Repo.SetUserRole(ctx, userID, role, grant); err != nil {
 		return err
 	}
+	after, _ := s.Repo.UserRoles(ctx, userID)
 	verb := "revoked "
 	if grant {
 		verb = "granted "
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "user.role", TargetType: "user", TargetID: idStr(userID),
-		Summary: verb + role + " for " + u.Email, Details: map[string]any{"role": role, "grant": grant}})
+		TargetName: u.Email, Summary: verb + role + " for " + u.Email, Details: map[string]any{"role": role, "grant": grant},
+		Before: map[string]any{"roles": rolesValue(before)}, After: map[string]any{"roles": rolesValue(after)}})
 	if !grant {
 		s.endRemoteAfterAccessChange(ctx, p, userID) // a global admin who reached projects only as one
 	}
@@ -288,4 +291,13 @@ func (s *Service) RevokeToken(ctx context.Context, p authz.Principal, tokenID in
 	s.audit(ctx, p, domain.AuditEntry{Action: "token.revoke", TargetType: "user", TargetID: idStr(tok.UserID),
 		Summary: "revoked API token " + tok.Prefix + "… (" + tok.Name + ") of " + u.Email, Details: map[string]any{"token_id": tokenID}})
 	return nil
+}
+
+// rolesValue is a user's global roles as an audit before/after value.
+func rolesValue(roles []string) []any {
+	out := make([]any, 0, len(roles))
+	for _, r := range roles {
+		out = append(out, r)
+	}
+	return out
 }

@@ -89,7 +89,23 @@ type Info struct {
 	// Listener is the surface that served the request (the Listener
 	// constants).
 	Listener string
+
+	// deniedAudited is set once a specific refusal (plan.approve.denied,
+	// task.dispatch.denied, ...) has been audited for this request, so the
+	// listener's generic access.denied hook doesn't record it twice.
+	deniedAudited atomic.Bool
 }
+
+// MarkDeniedAudited records that this request's refusal is already in the
+// audit log. Safe on a nil Info.
+func (i *Info) MarkDeniedAudited() {
+	if i != nil {
+		i.deniedAudited.Store(true)
+	}
+}
+
+// DeniedAudited reports whether MarkDeniedAudited was called.
+func (i *Info) DeniedAudited() bool { return i != nil && i.deniedAudited.Load() }
 
 type ctxKey struct{}
 

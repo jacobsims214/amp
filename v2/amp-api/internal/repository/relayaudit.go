@@ -95,32 +95,6 @@ func (r *Repo) InsertRelayAudit(ctx context.Context, actorUserID *int, sessionID
 	return &e, nil
 }
 
-// ClaimRelayAudits takes up to limit entries amp-relay recorded off the queue
-// and returns them, oldest first, for amp-api's webhook dispatcher. Each entry
-// is taken by exactly one amp-api replica (SKIP LOCKED); like an event still
-// in a dispatcher's memory, an entry taken by a replica that dies before
-// matching it is not delivered.
-func (r *Repo) ClaimRelayAudits(ctx context.Context, limit int) ([]domain.AuditEntry, error) {
-	rows, err := r.db.Query(ctx, `
-		WITH taken AS (
-			DELETE FROM relay_audit_outbox WHERE audit_id IN (
-				SELECT audit_id FROM relay_audit_outbox ORDER BY audit_id LIMIT $1 FOR UPDATE SKIP LOCKED)
-			RETURNING audit_id)
-		SELECT id, at, actor_user_id, actor_email, via_token, org_id, project_id, action, target_type, target_id, summary, details
-		FROM audit_log WHERE id IN (SELECT audit_id FROM taken) ORDER BY id`, limit)
-	if err != nil {
-		return nil, fmt.Errorf("claim relay audit entries: %w", err)
-	}
-	return collect(rows, func(row rowScanner, e *domain.AuditEntry) error {
-		var details []byte
-		if err := row.Scan(&e.ID, &e.At, &e.ActorUserID, &e.ActorEmail, &e.ViaToken, &e.OrgID, &e.ProjectID,
-			&e.Action, &e.TargetType, &e.TargetID, &e.Summary, &details); err != nil {
-			return err
-		}
-		return json.Unmarshal(details, &e.Details)
-	})
-}
-
 // UseProofNonce records a verified refresh proof's nonce for sessionID until
 // expires, and reports whether it was already recorded and not yet expired:
 // a replay, on this replica or any other (re-review #2394 N6). now is the

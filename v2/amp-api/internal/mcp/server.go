@@ -1028,7 +1028,9 @@ func (s *Server) approvePlan(rctx context.Context, args map[string]interface{}) 
 		status["plan_approved_at"] = r.ApprovedAt
 	}
 	detail, _ := json.Marshal(status)
-	return nil, fmt.Errorf("%w %s", authz.UIOnly("Plan approval", s.svc.PlanURL(id)), detail)
+	refusal := authz.UIOnly("Plan approval", s.svc.PlanURL(id))
+	s.svc.AuditApproveDenied(rctx, p, id, service.ApproveRequest{}, nil, refusal)
+	return nil, fmt.Errorf("%w %s", refusal, detail)
 }
 
 func (s *Server) updateProjectSettings(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -2163,7 +2165,7 @@ func (s *Server) listProjectStories(_ context.Context, args map[string]interface
 
 // ---- Export/Import handlers ----
 
-func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) exportProject(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
 	projectID, err := reqInt(args, "project_id")
 	if err != nil {
 		return nil, err
@@ -2189,6 +2191,7 @@ func (s *Server) exportProject(_ context.Context, args map[string]interface{}) (
 
 	// 3. Assemble the complete bundle with KB docs
 	bundle.KBDocs = kbDocs
+	s.svc.RecordProjectExport(rctx, caller(rctx).p, projectID, bundle)
 
 	return jsonResult(bundle)
 }
@@ -2502,6 +2505,7 @@ func (s *Server) kbWrite(ctx context.Context, args map[string]interface{}) (*mcp
 	if err != nil {
 		return nil, err
 	}
+	s.svc.AuditKB(ctx, caller(ctx).p, "kb.write", k, path, map[string]any{"reason": reason})
 	return jsonResult(doc)
 }
 
@@ -2620,6 +2624,7 @@ func (s *Server) kbDelete(ctx context.Context, args map[string]interface{}) (*mc
 	if err := s.kb.DeleteDoc(ctx, k.Scope, path, authorOf(ctx, nil)); err != nil {
 		return nil, err
 	}
+	s.svc.AuditKB(ctx, caller(ctx).p, "kb.delete", k, path, nil)
 	return jsonResult(map[string]interface{}{"deleted": true, "path": path, "kb": k})
 }
 
@@ -2658,6 +2663,7 @@ func (s *Server) kbRestore(ctx context.Context, args map[string]interface{}) (*m
 	if err != nil {
 		return nil, err
 	}
+	s.svc.AuditKB(ctx, caller(ctx).p, "kb.restore", k, path, nil)
 	return jsonResult(map[string]interface{}{"restored": true, "kb": k, "doc": doc})
 }
 
@@ -2692,6 +2698,7 @@ func (s *Server) kbReindex(ctx context.Context, args map[string]interface{}) (*m
 		}
 		return nil, err
 	}
+	s.svc.AuditKB(ctx, caller(ctx).p, "kb.reindex", k, "", nil)
 	return jsonResult(map[string]interface{}{"reindex": "started", "kb": k})
 }
 
