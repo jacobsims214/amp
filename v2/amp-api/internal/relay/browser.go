@@ -227,7 +227,8 @@ func (rl *Relay) eventStream(w http.ResponseWriter, r *http.Request, p authz.Pri
 
 	live := rl.reg.Ensure(sess)
 	now := rl.cfg.Now()
-	st := newViewerStream(rl.viewerBytes)
+	st := newViewerStream(rl.userBytes.acquire(sess.OwnerUserID), rl.viewerBytes)
+	defer rl.userBytes.release(sess.OwnerUserID) // after st.drain below
 	live.mu.Lock()
 	if live.ended {
 		live.mu.Unlock()

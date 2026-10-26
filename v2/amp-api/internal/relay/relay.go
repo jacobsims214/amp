@@ -78,6 +78,11 @@ type Config struct {
 	// MaxQueuedBytes bounds the bytes queued for all viewers on this
 	// replica (DefaultQueuedBytes); a viewer that would pass it is dropped.
 	MaxQueuedBytes int64
+	// MaxUserQueuedBytes bounds the bytes queued for the viewers of one
+	// person's sessions on this replica (DefaultUserQueuedBytes), so one
+	// person can't use up MaxQueuedBytes; a viewer that would pass it is
+	// dropped.
+	MaxUserQueuedBytes int64
 	// WriteTimeout bounds one write to a stream (30 s), so a client that
 	// stops reading can't hold its handler and queue forever.
 	WriteTimeout time.Duration
@@ -111,6 +116,9 @@ func (c *Config) defaults() {
 	if c.MaxQueuedBytes <= 0 {
 		c.MaxQueuedBytes = DefaultQueuedBytes
 	}
+	if c.MaxUserQueuedBytes <= 0 {
+		c.MaxUserQueuedBytes = DefaultUserQueuedBytes
+	}
 	if c.WriteTimeout <= 0 {
 		c.WriteTimeout = 30 * time.Second
 	}
@@ -133,7 +141,8 @@ type Relay struct {
 	registers   map[int]*bucket // per user: 10 registration attempts a minute here
 	proofNonces nonceCache      // refresh-proof nonces seen here (token.go)
 
-	viewerBytes *byteBudget // bytes queued for all viewers here
+	viewerBytes *byteBudget  // bytes queued for all viewers here
+	userBytes   *userBudgets // bytes queued for each owner's viewers here
 }
 
 // New builds the relay on svc (whose Remote config must have the instance
@@ -147,6 +156,7 @@ func New(svc *service.Service, oauth func(http.Handler) http.Handler, cfg Config
 		svc: svc, repo: svc.Repo, cfg: cfg, reg: cfg.Registry, oauth: oauth,
 		client: newInternalClient(), registers: map[int]*bucket{},
 		viewerBytes: newByteBudget(cfg.MaxQueuedBytes),
+		userBytes:   newUserBudgets(cfg.MaxUserQueuedBytes),
 	}
 	if cfg.Cluster != nil && cfg.Forwarder == nil {
 		rl.cfg.Forwarder = &clusterForwarder{rl: rl, client: rl.client}
@@ -166,6 +176,10 @@ func (rl *Relay) Registry() Registry { return rl.reg }
 
 // QueuedViewerBytes is the bytes queued for all viewers on this replica.
 func (rl *Relay) QueuedViewerBytes() int64 { return rl.viewerBytes.Used() }
+
+// QueuedUserViewerBytes is the bytes queued here for the viewers of owner's
+// sessions.
+func (rl *Relay) QueuedUserViewerBytes(owner int) int64 { return rl.userBytes.used(owner) }
 
 // sessionsEnded closes the streams of sessions that just ended: here, and on
 // the replica holding each one when that's another.

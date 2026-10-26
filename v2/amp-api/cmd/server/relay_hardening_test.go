@@ -86,9 +86,15 @@ func (s *rcSession) pad(t *testing.T, n int) json.RawMessage {
 }
 
 // stalledViewer attaches a viewer on a raw connection that never reads a
-// byte, and waits until the relay and the harness count it.
+// byte, as the session's owner, and waits until the relay and the harness
+// count it.
 func stalledViewer(t *testing.T, e *relayEnv, s *rcSession, hc *sseConn) net.Conn {
 	t.Helper()
+	live := e.rl.Registry().Get(s.id)
+	want := 1
+	if live != nil {
+		want = live.Viewers() + 1
+	}
 	u, _ := url.Parse(e.srv.URL)
 	conn, err := net.Dial("tcp", u.Host)
 	if err != nil {
@@ -98,16 +104,18 @@ func stalledViewer(t *testing.T, e *relayEnv, s *rcSession, hc *sseConn) net.Con
 	if tc, ok := conn.(*net.TCPConn); ok {
 		_ = tc.SetReadBuffer(4 << 10)
 	}
-	fmt.Fprintf(conn, "GET /api/sessions/%s/events HTTP/1.1\r\nHost: %s\r\nX-Test-As: alice\r\nAccept: text/event-stream\r\n\r\n", s.id, u.Host)
-	live := e.rl.Registry().Get(s.id)
+	fmt.Fprintf(conn, "GET /api/sessions/%s/events HTTP/1.1\r\nHost: %s\r\nX-Test-As: %s\r\nAccept: text/event-stream\r\n\r\n", s.id, u.Host, s.who)
 	deadline := time.Now().Add(5 * time.Second)
-	for live.Viewers() != 1 {
+	for {
+		if live = e.rl.Registry().Get(s.id); live != nil && live.Viewers() == want {
+			break
+		}
 		if time.Now().After(deadline) {
 			t.Fatal("the viewer never attached")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	hc.waitFor(t, "viewers", `"count":1`)
+	hc.waitFor(t, "viewers", fmt.Sprintf(`"count":%d`, want))
 	return conn
 }
 
@@ -157,6 +165,55 @@ func TestRelay_SlowViewerBoundedByBytes(t *testing.T) {
 	// A reading viewer still works.
 	v := s.watch(t, "")
 	v.expect(t, "relay")
+}
+
+// One person's stalled viewers can't get another person's viewer dropped
+// (#2398, re-review N1): they fill that person's own bound on the replica,
+// not the replica-wide one. The bounds are scaled down (10 MiB per replica,
+// 5 MiB per person) so a few 900 KiB events show it; without the per-person
+// bound alice's three stalled viewers hold about 9.7 MiB of the 10 and bob's
+// next event drops his viewer.
+func TestRelay_OnePersonsStalledViewersSpareOthers(t *testing.T) {
+	e := newRelayEnv(t, func(c *relay.Config) {
+		c.WriteTimeout = 5 * time.Minute // only the byte bounds drop viewers here
+		c.MaxQueuedBytes = 10 << 20
+		c.MaxUserQueuedBytes = 5 << 20
+	})
+	a := e.register(t, "alice")
+	ahc := a.connect(t)
+	a.mustPublish(t, a.hello(t))
+	b := e.register(t, "bob")
+	bhc := b.connect(t)
+	b.mustPublish(t, b.hello(t))
+	bv := b.watch(t, "")
+	bv.expect(t, "relay")
+	bhc.waitFor(t, "viewers", `"count":1`)
+
+	for i := 0; i < relay.MaxViewers; i++ {
+		stalledViewer(t, e, a, ahc)
+	}
+	hers := e.rl.Registry().Get(a.id)
+	for i := 0; i < 12 && hers.Viewers() > 0; i++ {
+		e.clock.Add(2 * time.Second) // keep under the event byte rate
+		a.mustPublish(t, a.pad(t, 900<<10))
+	}
+	if n := hers.Viewers(); n != 0 {
+		t.Fatalf("alice's stalled viewers weren't dropped (%d left)", n)
+	}
+	if q := e.rl.QueuedUserViewerBytes(e.w.alice.User.ID); q > 5<<20 {
+		t.Fatalf("alice's viewers hold %d bytes, over her 5 MiB", q)
+	}
+
+	// Bob's reading viewer gets his events and stays attached.
+	his := e.rl.Registry().Get(b.id)
+	for i := 0; i < 3; i++ {
+		e.clock.Add(2 * time.Second)
+		b.mustPublish(t, b.pad(t, 900<<10))
+		if his.Viewers() != 1 {
+			t.Fatalf("bob's viewer was dropped by alice's stalled ones (replica holds %d bytes)", e.rl.QueuedViewerBytes())
+		}
+		bv.waitFor(t, "envelope", `"pad"`)
+	}
 }
 
 // A client that stops reading can't hold its handler (and the frames it

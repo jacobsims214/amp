@@ -36,6 +36,12 @@ const (
 	// DefaultQueuedBytes bounds the bytes queued for all viewers on one
 	// replica (Config.MaxQueuedBytes), counting a frame once per viewer.
 	DefaultQueuedBytes = 64 << 20
+	// DefaultUserQueuedBytes bounds the bytes queued for the viewers of one
+	// person's sessions on one replica (Config.MaxUserQueuedBytes, #2398):
+	// well under the replica bound, so one person's stalled viewers (up to
+	// 5 sessions x 3 viewers x 4 MiB) can't fill it and get everyone else's
+	// viewers dropped.
+	DefaultUserQueuedBytes = 16 << 20
 	// EventBytesPerSec and EventBytesBurst limit the event bytes one
 	// session's harness posts (#2390): 2 MiB/s, burst 8 MiB, else 429.
 	EventBytesPerSec = 2 << 20
@@ -78,6 +84,57 @@ func (b *byteBudget) release(n int64) {
 	}
 }
 
+// userBudgets are the per-owner viewer bounds on one replica (#2398). A
+// person's bound exists while they have a viewer here.
+type userBudgets struct {
+	max int64
+	mu  sync.Mutex
+	m   map[int]*userBudget
+}
+
+type userBudget struct {
+	b    *byteBudget
+	refs int
+}
+
+func newUserBudgets(max int64) *userBudgets {
+	return &userBudgets{max: max, m: map[int]*userBudget{}}
+}
+
+// acquire is owner's bound for one more viewer; call release once that
+// viewer's stream is drained.
+func (u *userBudgets) acquire(owner int) *byteBudget {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	ub := u.m[owner]
+	if ub == nil {
+		ub = &userBudget{b: newByteBudget(u.max)}
+		u.m[owner] = ub
+	}
+	ub.refs++
+	return ub.b
+}
+
+func (u *userBudgets) release(owner int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if ub := u.m[owner]; ub != nil {
+		if ub.refs--; ub.refs <= 0 {
+			delete(u.m, owner)
+		}
+	}
+}
+
+// used is the bytes queued for owner's viewers here.
+func (u *userBudgets) used(owner int) int64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if ub := u.m[owner]; ub != nil {
+		return ub.b.Used()
+	}
+	return 0
+}
+
 // Used is the bytes currently reserved.
 func (b *byteBudget) Used() int64 {
 	if b == nil {
@@ -88,24 +145,25 @@ func (b *byteBudget) Used() int64 {
 
 // stream is one open SSE response (the harness's command stream or a
 // viewer's event stream). Frames are queued without blocking; close ends it.
-// A viewer's queue is bounded by bytes as well as frames: its own bound and
-// the replica-wide one.
+// A viewer's queue is bounded by bytes as well as frames: its own bound, its
+// session owner's bound and the replica-wide one.
 type stream struct {
 	ch     chan frame
 	done   chan struct{}
 	once   sync.Once
 	want   int64       // a viewer's: the seq it asked to resume from (0: none)
 	own    *byteBudget // nil: no byte bound
+	user   *byteBudget // the session owner's, on this replica; nil: none
 	shared *byteBudget // nil: no byte bound
 }
 
 func newStream(n int) *stream { return &stream{ch: make(chan frame, n), done: make(chan struct{})} }
 
-// newViewerStream is a viewer's stream: 512 frames, ViewerQueueBytes, and
-// the replica's shared bound.
-func newViewerStream(shared *byteBudget) *stream {
+// newViewerStream is a viewer's stream: 512 frames, ViewerQueueBytes, the
+// session owner's bound (user) and the replica's shared bound.
+func newViewerStream(user, shared *byteBudget) *stream {
 	st := newStream(viewerQueue)
-	st.own, st.shared = newByteBudget(ViewerQueueBytes), shared
+	st.own, st.user, st.shared = newByteBudget(ViewerQueueBytes), user, shared
 	return st
 }
 
@@ -121,7 +179,14 @@ func (s *stream) send(f frame) bool {
 	if !s.own.reserve(n) {
 		return false
 	}
+	// The owner's bound before the shared one: a person whose viewers are
+	// stalled runs out of their own bound first and never fills the shared.
+	if !s.user.reserve(n) {
+		s.own.release(n)
+		return false
+	}
 	if !s.shared.reserve(n) {
+		s.user.release(n)
 		s.own.release(n)
 		return false
 	}
@@ -129,8 +194,7 @@ func (s *stream) send(f frame) bool {
 	case s.ch <- f:
 		return true
 	default:
-		s.own.release(n)
-		s.shared.release(n)
+		s.dequeued(f)
 		return false
 	}
 }
@@ -139,6 +203,7 @@ func (s *stream) send(f frame) bool {
 func (s *stream) dequeued(f frame) {
 	n := f.size()
 	s.own.release(n)
+	s.user.release(n)
 	s.shared.release(n)
 }
 
