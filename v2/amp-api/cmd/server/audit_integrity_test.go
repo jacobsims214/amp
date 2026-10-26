@@ -220,7 +220,15 @@ func TestAuditIntegrity_BackfillsExistingRows(t *testing.T) {
 func TestAuditIntegrity_AppendOnly(t *testing.T) {
 	d := newIntegrityDB(t)
 	ctx := context.Background()
-	e := d.write(t, 1, "org.rename")
+	u, err := d.repo.UpsertUserFromClaims(ctx, "sub-actor", "actor@x", "Actor", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	org := 1
+	e, err := d.repo.InsertAudit(ctx, domain.AuditEntry{ActorUserID: &u.ID, ActorEmail: u.Email, OrgID: &org, Action: "org.rename"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	d.write(t, 1, "org.rename")
 	if _, err := d.svc.WriteAuditCheckpoints(ctx); err != nil {
 		t.Fatal(err)
@@ -239,9 +247,9 @@ func TestAuditIntegrity_AppendOnly(t *testing.T) {
 	})
 	d.exec(t, `GRANT ALL ON audit_log, audit_checkpoints TO `+role)
 	d.exec(t, `GRANT USAGE ON SEQUENCE audit_log_id_seq TO `+role)
-	u, _ := url.Parse(d.dsn)
-	u.User = url.UserPassword(role, "pw")
-	app, err := pgx.Connect(ctx, u.String())
+	dsnURL, _ := url.Parse(d.dsn)
+	dsnURL.User = url.UserPassword(role, "pw")
+	app, err := pgx.Connect(ctx, dsnURL.String())
 	if err != nil {
 		t.Fatalf("connect as app role: %v", err)
 	}
