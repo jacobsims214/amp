@@ -175,7 +175,17 @@ mod tests {
         // The process "dies": its lock goes with the handle, the file stays.
         drop(dead);
         drop(other);
-        let found = take_orphans(&d, "https://amp.example");
+        // This flaked under `make test` (seen twice in #2438): the lock can outlive the handle
+        // for a moment, likely a child another test in this process is spawning, which shares
+        // our open files until it execs. A real orphan's process is gone; retry briefly.
+        let mut found = Vec::new();
+        for _ in 0..100 {
+            found = take_orphans(&d, "https://amp.example");
+            if !found.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert_eq!(
             found
                 .iter()
