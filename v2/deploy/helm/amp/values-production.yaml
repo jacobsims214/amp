@@ -133,17 +133,28 @@ ampApi:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }
 
-# amp-relay (remote control, epic 165): rendered only with relay.enabled
-# (off here). Its image is built by build-images.yml like the others.
+# amp-relay (remote control, epic 165). Its image is built by
+# build-images.yml like the others. Turning the relay off (enabled: false) is
+# a pause, not an end: sessions stay active and resume when it is back.
 relay:
+  enabled: true
   tag: ""   # empty = use global.imageTag
-  # Before turning the relay on here: ArgoCD can't keep the chart's
-  # lookup-or-random secrets stable (see secretOverrides above), so point
-  # database.existingSecret (basic-auth, username amp_relay) and
-  # clusterToken.existingSecret at Secrets you create, or pin
-  # global.secretOverrides.relayDbPassword / relayClusterToken. The chart
-  # refuses to render with relay.enabled until you do.
+  # ArgoCD can't keep the chart's lookup-or-random secrets stable (see
+  # secretOverrides above), so the relay's database password and cluster
+  # token come from Secrets created by hand in namespace amp (#2470). Copies
+  # are kept off the cluster. The chart refuses to render with the relay on
+  # unless both are pinned.
   requirePinnedSecrets: true
+  database:
+    # kubernetes.io/basic-auth: username amp_relay, password (URL-safe: it
+    # goes into DATABASE_URL). Labelled cnpg.io/reload=true, so CloudNativePG
+    # sets the managed role's password from it and follows a rotation.
+    existingSecret: amp-relay-db
+  clusterToken:
+    # Opaque, key "token" (32+ random characters). Mounted in amp-relay and
+    # amp-api as RELAY_CLUSTER_TOKEN; amp-api's own cluster token stays in
+    # the database.
+    existingSecret: amp-relay-cluster-token
 
 ui:
   tag: ""
