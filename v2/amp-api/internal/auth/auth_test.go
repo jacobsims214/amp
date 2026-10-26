@@ -255,3 +255,70 @@ func TestChannel(t *testing.T) {
 		t.Fatalf("auth off, MCP: %q", got)
 	}
 }
+
+// identitySeen runs one request through v and returns the identity.
+func identitySeen(t *testing.T, v *Verifier, authz string) *Identity {
+	t.Helper()
+	var got *Identity
+	h := v.Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, _ = FromContext(r.Context())
+	}))
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	if authz != "" {
+		req.Header.Set("Authorization", authz)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("request refused: %d %s", rec.Code, rec.Body)
+	}
+	return got
+}
+
+// The audit log's auth_method and session_id: the UI's session, an MCP
+// client's OAuth token, authadmin (no listener label, behind oauth2-proxy)
+// and auth off. The session id is derived from sub+iat, never the token.
+func TestAuthMethodAndSession(t *testing.T) {
+	idp := newTestIdP(t)
+	base, err := NewVerifier(context.Background(), Config{IssuerURL: testIssuer, DiscoveryURL: idp.server.URL, UIClientID: "amp-ui"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	iat := time.Now().Add(-time.Minute).Truncate(time.Second)
+	ui := idp.token(t, map[string]any{"aud": "amp-ui", "iat": iat.Unix()})
+	mcpTok := idp.token(t, map[string]any{"aud": []string{"amp-mcp"}, "azp": "mcp-1234", "iat": iat.Unix()})
+	for _, tc := range []struct {
+		name string
+		v    *Verifier
+		tok  string
+		want string
+	}{
+		{"UI token on REST", base.WithAudiences("rest", "amp-ui", "amp-mcp"), ui, AuthDexSession},
+		{"MCP token on REST", base.WithAudiences("rest", "amp-ui", "amp-mcp"), mcpTok, AuthOAuthMCP},
+		{"MCP token on MCP", base.WithAudiences("mcp", "amp-mcp"), mcpTok, AuthOAuthMCP},
+		{"authadmin (no label)", base, ui, AuthDexSession},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ident := identitySeen(t, tc.v, "Bearer "+tc.tok)
+			if ident.AuthMethod != tc.want {
+				t.Fatalf("auth method = %q, want %q", ident.AuthMethod, tc.want)
+			}
+			if want := SessionID("user-1", iat); ident.SessionID != want || len(want) != 32 {
+				t.Fatalf("session id = %q, want %q", ident.SessionID, want)
+			}
+			if strings.Contains(tc.tok, ident.SessionID) {
+				t.Fatal("session id is part of the token")
+			}
+		})
+	}
+	off, _ := NewVerifier(context.Background(), Config{})
+	if got := identitySeen(t, off.WithAudiences("rest"), ""); got.AuthMethod != AuthLocalDev {
+		t.Fatalf("auth off: %q", got.AuthMethod)
+	}
+	if SessionID("user-1", iat) == SessionID("user-1", iat.Add(time.Second)) {
+		t.Fatal("a new sign-in (new iat) kept the session id")
+	}
+	if SessionID("", iat) != "" || SessionID("user-1", time.Time{}) != "" {
+		t.Fatal("session id without sub or iat")
+	}
+}

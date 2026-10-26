@@ -473,7 +473,10 @@ func TestRemote_AuditIsMetadataOnly(t *testing.T) {
 		if strings.Contains(string(b), "STRIPE") || strings.Contains(string(b), "cat .env") {
 			t.Fatalf("%s entry holds prompt text: %s", e.Action, b)
 		}
-		allowed := []string{"session_id", "harness_id", "harness_host", "op", "device_id", "key_fp", "reason", "code", "len", "sha256", "channel"}
+		// ip_reason and xff are the audit v2 request context (#2427), not
+		// content.
+		allowed := []string{"session_id", "harness_id", "harness_host", "op", "device_id", "key_fp", "reason", "code", "len", "sha256", "channel",
+			"ip_reason", "xff"}
 		for k := range e.Details {
 			if !slices.Contains(allowed, k) {
 				t.Fatalf("%s: unexpected details key %q", e.Action, k)

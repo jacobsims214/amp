@@ -519,7 +519,57 @@ type AuditEntry struct {
 	TargetID    string         `json:"target_id,omitempty"`
 	Summary     string         `json:"summary"`
 	Details     map[string]any `json:"details,omitempty"`
+
+	// Audit log v2 (KB decisions/audit-log-v2.md). Every field is new and
+	// omitempty, so consumers of the v1 shape see only additions. Rows
+	// written before v2 read SchemaVersion 1 with these empty.
+	SchemaVersion    int            `json:"schema_version,omitempty"`
+	ActorType        string         `json:"actor_type,omitempty"`  // AuditActor*
+	AuthMethod       string         `json:"auth_method,omitempty"` // dex_session, oauth_mcp, api_token, cluster, local_dev, none
+	TokenID          *int64         `json:"token_id,omitempty"`    // api_tokens.id, never the token
+	SessionID        string         `json:"session_id,omitempty"`
+	OnBehalfOfUserID *int           `json:"on_behalf_of_user_id,omitempty"`
+	AgentProfile     string         `json:"agent_profile,omitempty"`
+	TargetName       string         `json:"target_name,omitempty"`
+	Outcome          string         `json:"outcome,omitempty"` // AuditOutcome*
+	Reason           string         `json:"reason,omitempty"`
+	SourceIP         string         `json:"source_ip,omitempty"`
+	UserAgent        string         `json:"user_agent,omitempty"`
+	Client           string         `json:"client,omitempty"` // AuditClient*
+	RequestID        string         `json:"request_id,omitempty"`
+	TraceID          string         `json:"trace_id,omitempty"`
+	Before           map[string]any `json:"before,omitempty"`
+	After            map[string]any `json:"after,omitempty"`
 }
+
+// AuditSchemaVersion is what writers put in AuditEntry.SchemaVersion.
+const AuditSchemaVersion = 2
+
+// Who made an audited change (AuditEntry.ActorType).
+const (
+	AuditActorHuman     = "human"
+	AuditActorAgent     = "agent"
+	AuditActorSystem    = "system"
+	AuditActorAnonymous = "anonymous"
+)
+
+// The result of an audited action (AuditEntry.Outcome).
+const (
+	AuditOutcomeSuccess = "success"
+	AuditOutcomeDenied  = "denied"
+	AuditOutcomeFailed  = "failed"
+)
+
+// The surface an audited change came through (AuditEntry.Client).
+const (
+	AuditClientWeb     = "web"
+	AuditClientMCP     = "mcp"
+	AuditClientHarness = "harness"
+	AuditClientAPI     = "api"
+	AuditClientRelay   = "relay"
+	AuditClientCLI     = "cli"
+	AuditClientSystem  = "system"
+)
 
 // AuditFilter selects audit entries; zero fields don't filter.
 type AuditFilter struct {

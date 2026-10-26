@@ -52,6 +52,7 @@ import (
 	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/relayserver"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/reqctx"
 	"github.com/simstech/amp-api/internal/service"
 )
 
@@ -154,6 +155,7 @@ func run() error {
 		Relay:       relay.Config{AppURL: appURL, Cluster: node},
 		HarnessAuth: harnessVerifier.Middleware,
 		BrowserAuth: browserVerifier.Middleware,
+		ClientIP:    reqctx.FromEnv(),
 		Ready: func() error {
 			switch {
 			case draining.Load():
