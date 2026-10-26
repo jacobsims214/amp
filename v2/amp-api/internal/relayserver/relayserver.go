@@ -28,6 +28,7 @@ import (
 
 	"github.com/simstech/amp-api/internal/api"
 	"github.com/simstech/amp-api/internal/relay"
+	"github.com/simstech/amp-api/internal/reqctx"
 	"github.com/simstech/amp-api/internal/service"
 )
 
@@ -41,6 +42,10 @@ type Options struct {
 	// BrowserAuth verifies the browser leg's caller (the REST audiences: the
 	// web UI's oauth2-proxy token).
 	BrowserAuth func(http.Handler) http.Handler
+	// ClientIP resolves the caller's address for the audit log (#2433):
+	// AMP_TRUSTED_PROXIES in cmd/relay. nil trusts no proxy, so the TCP
+	// peer is recorded.
+	ClientIP *reqctx.Resolver
 	// Ready reports whether this replica can serve (nil: always). Called by
 	// /ready; a non-nil error answers 503 with its text.
 	Ready func() error
@@ -92,7 +97,13 @@ func New(svc *service.Service, o Options) *Server {
 	mux.Handle("/api/sessions", browser)
 	mux.Handle("/api/sessions/", browser)
 	mux.HandleFunc("/", http.NotFound)
-	s.public = mux
+	// Every public request's client IP, user agent and request id, for the
+	// remote.* audit entries (relay_record_audit's context).
+	res := o.ClientIP
+	if res == nil {
+		res = reqctx.NewResolver(nil)
+	}
+	s.public = reqctx.Middleware(reqctx.ListenerRelay, res)(mux)
 	return s
 }
 

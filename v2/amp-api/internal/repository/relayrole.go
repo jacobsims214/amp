@@ -63,8 +63,13 @@ var relaySequences = [][2]string{{"remote_devices", "id"}}
 // (migration 030) writes a remote.* audit entry it validates itself and
 // queues it for amp-api's webhook dispatcher: a compromised relay can't
 // write other audit entries or make amp-api sign webhook bodies of its
-// choosing (#2399, re-review #2394 N3).
-var relayFunctions = []string{"relay_record_audit(INT, TEXT, TEXT, JSONB)"}
+// choosing (#2399, re-review #2394 N3). The five-argument version (036,
+// #2433) also takes the request context, validated the same way; the
+// four-argument one stays for relays that don't send it.
+var relayFunctions = []string{
+	"relay_record_audit(INT, TEXT, TEXT, JSONB)",
+	"relay_record_audit(INT, TEXT, TEXT, JSONB, JSONB)",
+}
 
 // relayNodePolicies keep the relay's role to its own api_nodes rows (#2398,
 // re-review #2394 N2). amp-api sends its cluster token to the address in an

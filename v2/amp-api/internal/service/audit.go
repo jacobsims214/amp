@@ -66,7 +66,8 @@ func (s *Service) writeAudit(ctx context.Context, p authz.Principal, e domain.Au
 		if e.TargetType == "remote_session" {
 			sessionID = e.TargetID
 		}
-		if _, err := s.Repo.InsertRelayAudit(context.WithoutCancel(ctx), e.ActorUserID, sessionID, e.Action, e.Details); err != nil {
+		if _, err := s.Repo.InsertRelayAudit(context.WithoutCancel(ctx), e.ActorUserID, sessionID, e.Action,
+			relayAuditDetails(e.Details), relayAuditContext(e)); err != nil {
 			slog.Error("audit log write failed", "action", e.Action, "target", e.TargetType+":"+e.TargetID, "err", err)
 			return err
 		}
