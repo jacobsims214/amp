@@ -7,9 +7,12 @@ KB decisions/audit-log-v2.md, section 2:
   (xff_num_trusted_hops: 0), treats no address as internal (an explicit,
   empty internal_address_config) and never keeps a client-sent request id.
 - amp-api, authadmin and mcpoauth get AMP_TRUSTED_PROXIES from
-  clientIP.trustedProxies: the pod CIDR locally; the pod CIDR plus
+  clientIP.trustedProxies: nothing locally; the pod CIDR plus
   Cloudflare's ranges in values-production.yaml. Every entry parses as a
-  CIDR or an address (the services trust nothing if one doesn't).
+  CIDR or an address (the services trust nothing if one doesn't). Locally
+  (docker-desktop) the list is empty: Envoy's peer through kubectl
+  port-forward is Envoy's own pod address, so trusting the pod CIDR there
+  would only make a forged header believable.
 - NetworkPolicies admit only Envoy to the public ports of amp-api (3001,
   8000), authadmin (8090) and mcpoauth (8091), and only amp-api to amp-api's
   replica port (3003). Only networkPolicy.envoyFrom (Traefik in
@@ -206,8 +209,9 @@ def main():
     check(len([c for c in prod if ":" not in c]) == 16 and len([c for c in prod if ":" in c]) == 7,
           f"production: want the pod CIDR + 15 Cloudflare v4 + 7 v6 ranges, got {len(prod)}")
     cases = [
-        ("local (tls on)", [], ["10.244.0.0/16"], []),
-        ("local (tls off)", ["--set", "global.tls.enabled=false"], ["10.244.0.0/16"], []),
+        ("local (tls on)", [], [], []),
+        ("local (tls off)", ["--set", "global.tls.enabled=false"], [], []),
+        ("local, walk on", ["--set", "clientIP.trustedProxies={10.244.0.0/16}"], ["10.244.0.0/16"], []),
         ("production", ["-f", os.path.join(CHART, "values-production.yaml")], prod, traefik),
     ]
     rendered = {}
@@ -220,9 +224,6 @@ def main():
         test_envoy_policy(docs, label, envoy_from)
     docs = render("--set", "networkPolicy.enabled=false")
     test_policies(docs, "policies off", enabled=False)
-    docs = render("--set-json", "clientIP.trustedProxies=[]")
-    for dep in ("amp-api", "amp-authadmin", "amp-mcpoauth"):
-        check(env_value(docs, dep, "AMP_TRUSTED_PROXIES") == "", f"empty list: {dep} must get an empty AMP_TRUSTED_PROXIES")
     if "--envoy-validate" in sys.argv:
         for label, ev in rendered.items():
             envoy_validate(label, ev)

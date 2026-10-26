@@ -13,8 +13,8 @@
 {{/* amp.envoyClientIP: the client-IP settings of Envoy's
      HttpConnectionManager, the same on every listener that routes to AMP
      (#2430). Envoy is the first hop the chart owns: it appends its TCP peer
-     (Traefik's pod in production, 127.0.0.1 through kubectl port-forward)
-     to X-Forwarded-For and trusts no hop before it; the services choose the
+     (Traefik's pod in production; Envoy's own pod address through kubectl
+     port-forward on containerd 2.x) to X-Forwarded-For and trusts no hop before it; the services choose the
      client with AMP_TRUSTED_PROXIES. No address counts as internal, so
      Envoy always replaces a client-sent x-request-id and strips x-envoy-*
      headers, whatever the peer. Side effect: X-Forwarded-Proto becomes
