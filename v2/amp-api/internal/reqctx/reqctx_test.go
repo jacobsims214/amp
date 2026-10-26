@@ -3,14 +3,13 @@ package reqctx
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/netip"
 	"strings"
 	"testing"
 )
 
-// The production trust list after #2430: the pod CIDR (Traefik, Envoy) and
-// a Cloudflare range of each family.
-const prodTrusted = "10.244.0.0/16, 173.245.48.0/20 2400:cb00::/32"
+// Envoy's pods (a pod CIDR) and, for a mesh sidecar in front of each
+// service, the sidecar's inbound passthrough address.
+const envoyHops = "10.244.0.0/16, fd00:10:244::/56, 127.0.0.6"
 
 func mustResolver(t *testing.T, list string) *Resolver {
 	t.Helper()
@@ -21,68 +20,59 @@ func mustResolver(t *testing.T, list string) *Resolver {
 	return NewResolver(p)
 }
 
-// The spoof-proof rule (KB decisions/audit-log-v2.md, section 2).
+// The rule (KB decisions/audit-log-v2.md, as built by #2469): Envoy decides
+// the client and says so in X-Amp-Client-Ip; the services believe that one
+// header from a trusted peer and nothing else.
 func TestClientIP(t *testing.T) {
 	cases := []struct {
 		name    string
 		trusted string
 		remote  string
-		xff     []string
+		hdr     []string
 		want    string
 	}{
 		// Nothing trusted (AMP_TRUSTED_PROXIES unset): always the peer.
 		{"untrusted peer, no header", "", "203.0.113.7:5555", nil, "203.0.113.7"},
-		{"untrusted peer ignores a spoofed XFF", "", "203.0.113.7:5555", []string{"6.6.6.6"}, "203.0.113.7"},
-		{"peer outside the list ignores XFF", prodTrusted, "198.51.100.9:443", []string{"6.6.6.6, 10.244.1.5"}, "198.51.100.9"},
+		{"nothing trusted ignores the header", "", "10.244.0.12:5555", []string{"6.6.6.6"}, "10.244.0.12"},
+		// A peer outside the list (anything that bypassed Envoy) can't
+		// choose its address.
+		{"untrusted peer's header is ignored", envoyHops, "198.51.100.9:443", []string{"6.6.6.6"}, "198.51.100.9"},
+		{"untrusted v6 peer", envoyHops, "[2001:db8::2]:443", []string{"6.6.6.6"}, "2001:db8::2"},
 
-		// Through Cloudflare, Traefik and Envoy: [spoofed, client, cf-edge, traefik].
-		{"real chain through the edge", prodTrusted, "10.244.0.12:40000",
-			[]string{"6.6.6.6, 203.0.113.7, 173.245.48.10, 10.244.1.5"}, "203.0.113.7"},
-		{"spoof left of the client is never reached", prodTrusted, "10.244.0.12:40000",
-			[]string{"1.1.1.1, 2.2.2.2, 203.0.113.7, 10.244.1.5"}, "203.0.113.7"},
-		{"several XFF headers are joined in order", prodTrusted, "10.244.0.12:40000",
-			[]string{"6.6.6.6", "203.0.113.7, 173.245.48.10", "10.244.1.5"}, "203.0.113.7"},
-		// Direct to origin: Traefik strips XFF, so [attacker, traefik].
-		{"direct to origin records the attacker", prodTrusted, "10.244.0.12:40000",
-			[]string{"198.51.100.66, 10.244.1.5"}, "198.51.100.66"},
-		// A pod forging a header still sits on the right, as the peer.
-		{"client address only from trusted hops", prodTrusted, "10.244.0.12:40000",
-			[]string{"10.244.3.3, 10.244.1.5"}, "10.244.3.3"},
-		{"trusted peer, no header: the peer", prodTrusted, "10.244.0.12:40000", nil, "10.244.0.12"},
-		{"garbage stops the walk at the last trusted hop", prodTrusted, "10.244.0.12:40000",
-			[]string{"203.0.113.7, not-an-ip, 10.244.1.5"}, "10.244.1.5"},
-		{"empty entries are skipped", prodTrusted, "10.244.0.12:40000",
-			[]string{" , 203.0.113.7,, 10.244.1.5 "}, "203.0.113.7"},
-		{"ip:port in XFF is garbage, not a client", prodTrusted, "10.244.0.12:40000",
-			[]string{"203.0.113.7:1234, 10.244.1.5"}, "10.244.1.5"},
-
-		// IPv6.
-		{"v6 client through a v6 edge", prodTrusted, "10.244.0.12:40000",
-			[]string{"2001:db8::1, 2400:cb00::7, 10.244.1.5"}, "2001:db8::1"},
-		{"v6 peer untrusted", prodTrusted, "[2001:db8::2]:443", []string{"6.6.6.6"}, "2001:db8::2"},
-		{"v4-mapped peer is unmapped and trusted", prodTrusted, "[::ffff:10.244.0.12]:40000",
-			[]string{"203.0.113.7"}, "203.0.113.7"},
-		{"v4-mapped client is unmapped", prodTrusted, "10.244.0.12:40000",
-			[]string{"::ffff:203.0.113.7"}, "203.0.113.7"},
-
-		// docker-desktop: kubectl port-forward makes Envoy's peer 127.0.0.1.
-		{"local: spoof through port-forward", "10.244.0.0/16", "10.244.0.30:5000",
-			[]string{"6.6.6.6, 127.0.0.1"}, "127.0.0.1"},
+		// From Envoy: its decision.
+		{"Envoy's decision", envoyHops, "10.244.0.12:40000", []string{"203.0.113.7"}, "203.0.113.7"},
+		{"Envoy's decision, v6", envoyHops, "10.244.0.12:40000", []string{"2001:db8::1"}, "2001:db8::1"},
+		{"Envoy over v6", envoyHops, "[fd00:10:244::12]:40000", []string{"203.0.113.7"}, "203.0.113.7"},
+		{"surrounding space is trimmed", envoyHops, "10.244.0.12:40000", []string{" 203.0.113.7 "}, "203.0.113.7"},
+		{"v4-mapped peer is unmapped and trusted", envoyHops, "[::ffff:10.244.0.12]:40000", []string{"203.0.113.7"}, "203.0.113.7"},
+		{"v4-mapped client is unmapped", envoyHops, "10.244.0.12:40000", []string{"::ffff:203.0.113.7"}, "203.0.113.7"},
+		// Behind a mesh sidecar the services' peer is the sidecar.
+		{"through a sidecar (127.0.0.6)", envoyHops, "127.0.0.6:51000", []string{"203.0.113.7"}, "203.0.113.7"},
+		{"sidecar address not listed", "10.244.0.0/16", "127.0.0.6:51000", []string{"203.0.113.7"}, "127.0.0.6"},
 		{"bare address in the trust list", "127.0.0.1", "127.0.0.1:9", []string{"203.0.113.7"}, "203.0.113.7"},
+
+		// What Envoy never sends is not believed: the peer is recorded.
+		{"trusted peer, no header: the peer", envoyHops, "10.244.0.12:40000", nil, "10.244.0.12"},
+		{"two headers: the peer", envoyHops, "10.244.0.12:40000", []string{"203.0.113.7", "6.6.6.6"}, "10.244.0.12"},
+		{"a list: the peer", envoyHops, "10.244.0.12:40000", []string{"6.6.6.6, 203.0.113.7"}, "10.244.0.12"},
+		{"ip:port: the peer", envoyHops, "10.244.0.12:40000", []string{"203.0.113.7:1234"}, "10.244.0.12"},
+		{"zone: the peer", envoyHops, "10.244.0.12:40000", []string{"fe80::1%eth0"}, "10.244.0.12"},
+		{"garbage: the peer", envoyHops, "10.244.0.12:40000", []string{"not-an-ip"}, "10.244.0.12"},
+		{"empty: the peer", envoyHops, "10.244.0.12:40000", []string{""}, "10.244.0.12"},
 		{"RemoteAddr without a port", "", "203.0.113.7", nil, "203.0.113.7"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, reason := mustResolver(t, c.trusted).ClientIP(c.remote, c.xff)
+			got, reason := mustResolver(t, c.trusted).ClientIP(c.remote, c.hdr)
 			if got.String() != c.want || reason != "" {
-				t.Fatalf("ClientIP(%q, %q) = %v (%q), want %s", c.remote, c.xff, got, reason, c.want)
+				t.Fatalf("ClientIP(%q, %q) = %v (%q), want %s", c.remote, c.hdr, got, reason, c.want)
 			}
 		})
 	}
 }
 
 func TestClientIP_UnparseablePeer(t *testing.T) {
-	got, reason := mustResolver(t, prodTrusted).ClientIP("@unix", []string{"203.0.113.7"})
+	got, reason := mustResolver(t, envoyHops).ClientIP("@unix", []string{"203.0.113.7"})
 	if got.IsValid() || reason == "" {
 		t.Fatalf("got %v %q, want no address and a reason", got, reason)
 	}
@@ -96,15 +86,15 @@ func TestClientIP_NilResolverTrustsNothing(t *testing.T) {
 }
 
 func TestParseTrusted(t *testing.T) {
-	p, err := ParseTrusted(" 10.244.0.0/16,\n173.245.48.0/20  2400:cb00::/32,127.0.0.1 ::1 ::ffff:10.0.0.0/104 ")
+	p, err := ParseTrusted(" 10.244.0.0/16,\n192.0.2.0/24  2001:db8::/32,127.0.0.6 ::1 ::ffff:10.0.0.0/104 ")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(p) != 6 {
 		t.Fatalf("got %v", p)
 	}
-	if p[5].String() != "10.0.0.0/8" {
-		t.Fatalf("v4-mapped prefix = %v, want 10.0.0.0/8", p[5])
+	if p[3].String() != "127.0.0.6/32" || p[5].String() != "10.0.0.0/8" {
+		t.Fatalf("got %v, want 127.0.0.6/32 and v4-mapped 10.0.0.0/8", p)
 	}
 	for _, bad := range []string{"10.244.0.0/33", "not-an-ip", "10.0.0.0/8, nope"} {
 		if _, err := ParseTrusted(bad); err == nil {
@@ -124,20 +114,18 @@ func TestFromEnv_BadListTrustsNothing(t *testing.T) {
 	}
 }
 
-// The middleware ignores every header but X-Forwarded-For, and only via
-// the walk.
+// Spoofing: X-Forwarded-For never chooses the client, and no forwarding or
+// vendor client-IP header is read, whoever the peer is.
 func TestMiddleware(t *testing.T) {
 	var got *Info
-	h := Middleware(ListenerREST, mustResolver(t, prodTrusted))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := Middleware(ListenerREST, mustResolver(t, envoyHops))(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got, _ = FromContext(r.Context())
 	}))
 
 	req := httptest.NewRequest("POST", "/api/x", nil)
 	req.RemoteAddr = "10.244.0.12:40000"
+	req.Header.Set(HeaderClientIP, "203.0.113.7")
 	req.Header.Set("X-Forwarded-For", "6.6.6.6, 203.0.113.7, 10.244.1.5")
-	req.Header.Set("CF-Connecting-IP", "6.6.6.6")
-	req.Header.Set("X-Real-IP", "6.6.6.6")
-	req.Header.Set("Forwarded", "for=6.6.6.6")
 	req.Header.Set("User-Agent", "amp-test/1 "+strings.Repeat("x", 600))
 	req.Header.Set("X-Request-Id", "0f1e2d3c-aaaa-4bbb-8ccc-123456789abc")
 	req.Header.Set("Traceparent", "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01")
@@ -163,15 +151,31 @@ func TestMiddleware(t *testing.T) {
 		t.Errorf("xff = %q", got.XFF)
 	}
 
-	// Only CF-Connecting-IP / X-Real-IP / Forwarded set: they are ignored.
+	// From Envoy, without its header: nothing else is believed.
+	for _, hdr := range [][2]string{
+		{"X-Forwarded-For", "6.6.6.6"},
+		{"Forwarded", "for=6.6.6.6"},
+		{"X-Real-IP", "6.6.6.6"},
+		{"True-Client-IP", "6.6.6.6"},
+		{"CF-Connecting-IP", "6.6.6.6"},
+		{"X-Envoy-External-Address", "6.6.6.6"},
+	} {
+		req = httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "10.244.0.12:40000"
+		req.Header.Set(hdr[0], hdr[1])
+		h.ServeHTTP(httptest.NewRecorder(), req)
+		if got.SourceIP.String() != "10.244.0.12" {
+			t.Errorf("%s was believed: %v", hdr[0], got.SourceIP)
+		}
+	}
+
+	// Bypassing Envoy: the caller's own X-Amp-Client-Ip is ignored.
 	req = httptest.NewRequest("GET", "/", nil)
-	req.RemoteAddr = "10.244.0.12:40000"
-	req.Header.Set("CF-Connecting-IP", "6.6.6.6")
-	req.Header.Set("X-Real-IP", "6.6.6.6")
-	req.Header.Set("Forwarded", "for=6.6.6.6")
+	req.RemoteAddr = "198.51.100.9:443"
+	req.Header.Set(HeaderClientIP, "6.6.6.6")
 	h.ServeHTTP(httptest.NewRecorder(), req)
-	if got.SourceIP.String() != "10.244.0.12" {
-		t.Errorf("a non-XFF header was trusted: %v", got.SourceIP)
+	if got.SourceIP.String() != "198.51.100.9" {
+		t.Errorf("an untrusted peer chose its address: %v", got.SourceIP)
 	}
 }
 
@@ -211,68 +215,5 @@ func TestClip(t *testing.T) {
 	}
 	if got := Clip("ééé", 5); got != "éé" {
 		t.Errorf("Clip cut inside a rune: %q", got)
-	}
-}
-
-// H3 (#2440, review #2432): Cloudflare Workers and WARP egress from
-// Cloudflare's own ranges and can send any X-Forwarded-For. Pod-CIDR hops
-// are skipped any number of times, but at most ONE edge (public) hop: the
-// entry before the first edge hop is the client, even if it is in an edge
-// range itself.
-func TestClientIP_AtMostOneEdgeHop(t *testing.T) {
-	cases := []struct {
-		name   string
-		remote string
-		xff    []string
-		want   string
-	}{
-		// A Worker (egress 104.24.x, inside Cloudflare's 104.24.0.0/14) calls
-		// amp through Cloudflare with a forged XFF. Cloudflare appends the
-		// Worker's egress, Traefik the edge, Envoy Traefik's pod:
-		// [forged, worker, cf-edge, traefik]. Skipping every Cloudflare hop
-		// returned the forged 6.6.6.6.
-		{"forged chain from a Worker records the Worker", "10.244.0.12:40000",
-			[]string{"6.6.6.6, 104.24.5.6, 173.245.48.10, 10.244.1.5"}, "104.24.5.6"},
-		{"forged chain from a Worker, forged entry in a Cloudflare range", "10.244.0.12:40000",
-			[]string{"6.6.6.6, 104.24.9.9, 104.24.5.6, 173.245.48.10, 10.244.1.5"}, "104.24.5.6"},
-		{"a caller egressing from another Cloudflare range is its own egress", "10.244.0.12:40000",
-			[]string{"6.6.6.6, 104.16.1.2, 173.245.48.10, 10.244.1.5"}, "104.16.1.2"},
-		{"v6 Worker egress is the client", "10.244.0.12:40000",
-			[]string{"2001:db8::66, 2400:cb00::99, 2400:cb00::7, 10.244.1.5"}, "2400:cb00::99"},
-		// Any number of internal hops before the edge.
-		{"several pod hops, then one edge", "10.244.0.12:40000",
-			[]string{"203.0.113.7, 173.245.48.10, 10.244.2.2, 10.244.1.5"}, "203.0.113.7"},
-		// After the edge hop the next entry is the client whatever it is.
-		{"a private address before the edge is the client", "10.244.0.12:40000",
-			[]string{"6.6.6.6, 10.244.9.9, 173.245.48.10, 10.244.1.5"}, "10.244.9.9"},
-		// The edge as the TCP peer counts as the one edge hop.
-		{"edge peer: the last XFF entry is the client", "173.245.48.10:443",
-			[]string{"6.6.6.6, 104.24.5.6"}, "104.24.5.6"},
-		{"edge peer, no header: the edge", "173.245.48.10:443", nil, "173.245.48.10"},
-		{"only an edge hop: the edge", "10.244.0.12:40000",
-			[]string{"173.245.48.10, 10.244.1.5"}, "173.245.48.10"},
-		{"garbage right after the edge stops at the edge", "10.244.0.12:40000",
-			[]string{"6.6.6.6, junk, 173.245.48.10, 10.244.1.5"}, "173.245.48.10"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			got, reason := mustResolver(t, prodTrusted+" 104.24.0.0/14 104.16.0.0/13").ClientIP(c.remote, c.xff)
-			if got.String() != c.want || reason != "" {
-				t.Fatalf("ClientIP(%q, %q) = %v (%q), want %s", c.remote, c.xff, got, reason, c.want)
-			}
-		})
-	}
-}
-
-func TestIsInternalPrefix(t *testing.T) {
-	for p, want := range map[string]bool{
-		"10.244.0.0/16": true, "10.0.0.0/8": true, "172.16.0.0/12": true, "192.168.8.0/24": true,
-		"100.64.0.0/10": true, "127.0.0.1/32": true, "fd00::/8": true, "::1/128": true,
-		"10.0.0.0/7": false, "173.245.48.0/20": false, "104.24.0.0/14": false,
-		"2400:cb00::/32": false, "0.0.0.0/0": false, "203.0.113.7/32": false,
-	} {
-		if got := IsInternalPrefix(netip.MustParsePrefix(p)); got != want {
-			t.Errorf("IsInternalPrefix(%s) = %v, want %v", p, got, want)
-		}
 	}
 }

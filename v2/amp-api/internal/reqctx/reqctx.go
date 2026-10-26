@@ -1,34 +1,27 @@
 // Package reqctx resolves who is on the other end of an HTTP request, for
-// the audit log: the trusted client IP, the user agent, the request id and
-// the trace id. Every AMP listener (amp-api REST and MCP, authadmin,
-// mcpoauth, and the relay on remote-m1) wraps its handler in Middleware, and
-// the audit writer reads the result back with FromContext.
+// the audit log: the client IP, the user agent, the request id and the
+// trace id. Every AMP listener (amp-api REST and MCP, authadmin, mcpoauth
+// and amp-relay's public listener) wraps its handler in Middleware, and the
+// audit writer reads the result back with FromContext.
 //
-// # The client IP (KB decisions/audit-log-v2.md, section 2)
+// # The client IP (KB decisions/audit-log-v2.md, as built by #2469)
 //
-// Client-sent headers are spoofable, so the resolver trusts only what a
-// trusted proxy added:
+// AMP's boundary is its own Envoy. Envoy decides who the client is, from its
+// TCP peer and the hops the operator told it to trust in front of it (the
+// chart's envoy.clientIP values), and puts that one address in the
+// X-Amp-Client-Ip request header, replacing any value a client sent. The
+// services don't re-decide it:
 //
-//   - CF-Connecting-IP, X-Real-IP and Forwarded are never read.
-//   - If the TCP peer (RemoteAddr) is not in AMP_TRUSTED_PROXIES, the peer
-//     is the client and every header is ignored.
-//   - Otherwise every X-Forwarded-For header is joined and walked right to
-//     left, skipping trusted addresses; the first untrusted address is the
-//     client. A value the client made up sits to the left of the address
-//     the first trusted proxy appended, so the walk never reaches it.
-//   - Trusted prefixes come in two kinds (#2440, review #2432 H3). An
-//     internal prefix (private, loopback, link-local or CGNAT space: the pod
-//     CIDR, Traefik's and Envoy's pods) may be skipped any number of times.
-//     A public prefix is an edge (Cloudflare) and at most ONE edge hop is
-//     skipped: the entry before the first edge hop is the client, whatever
-//     it is, even when it is itself in an edge range. Cloudflare Workers and
-//     WARP egress from Cloudflare's own ranges and can send any
-//     X-Forwarded-For, so skipping every Cloudflare address would let any
-//     Cloudflare customer choose the recorded IP; with one hop, such a
-//     caller is recorded as its own Cloudflare egress address.
-//   - If every address examined is skipped, the leftmost one is the client.
-//   - An entry that isn't an IP address stops the walk, and the last trusted
-//     hop is the client.
+//   - If the TCP peer (RemoteAddr) is not in AMP_TRUSTED_PROXIES (the
+//     addresses Envoy reaches the services from), the peer is the client and
+//     every header is ignored.
+//   - If the peer is trusted, the client is the address in X-Amp-Client-Ip.
+//     It must be exactly one header holding exactly one IP address; anything
+//     else (missing, repeated, a list, a port, garbage) is not believed and
+//     the peer is recorded instead.
+//   - X-Forwarded-For is never used to choose the client (it is kept raw in
+//     the row for checking later), and no other forwarding or vendor header
+//     (Forwarded, X-Real-IP, any CDN's client-IP header) is ever read.
 //
 // With AMP_TRUSTED_PROXIES unset nothing is trusted, so the peer is always
 // the client: never spoofable, but behind Envoy it records Envoy's address.
@@ -50,8 +43,15 @@ import (
 )
 
 // EnvTrustedProxies names the environment variable holding the trusted
-// proxy list: comma- or space-separated CIDRs or bare addresses.
+// proxy list: comma- or space-separated CIDRs or bare addresses of the
+// places AMP's Envoy connects to the services from (its pods, or the
+// sidecar's address when a mesh sidecar sits in front of each service).
 const EnvTrustedProxies = "AMP_TRUSTED_PROXIES"
+
+// HeaderClientIP is the request header AMP's Envoy sets to the client
+// address it decided, overwriting whatever a client sent (the chart's
+// envoy-configmap.yaml). It is believed only from a trusted peer.
+const HeaderClientIP = "X-Amp-Client-Ip"
 
 // Limits on what a request may put in an audit row.
 const (
@@ -81,7 +81,7 @@ type Info struct {
 	XFF string
 	// UserAgent is the client-asserted User-Agent, clipped to MaxUserAgent.
 	UserAgent string
-	// RequestID is the edge proxy's x-request-id when it is well formed,
+	// RequestID is Envoy's x-request-id when it is well formed,
 	// otherwise one generated here.
 	RequestID string
 	// TraceID is the W3C traceparent trace id, if the request carried one.
@@ -120,58 +120,22 @@ func FromContext(ctx context.Context) (*Info, bool) {
 	return info, ok && info != nil
 }
 
-// Resolver resolves client addresses. The zero value trusts nothing.
+// Resolver resolves client addresses. The zero value (and nil) trusts
+// nothing.
 type Resolver struct {
-	internal []netip.Prefix // skipped any number of times
-	edge     []netip.Prefix // at most one hop is skipped
+	trusted []netip.Prefix
+	warned  atomic.Bool
 }
 
-// NewResolver returns a resolver that trusts the given proxy prefixes,
-// sorted into internal and edge prefixes by IsInternalPrefix.
+// NewResolver returns a resolver that believes X-Amp-Client-Ip from peers in
+// the given prefixes: the addresses AMP's Envoy reaches the services from.
 func NewResolver(trusted []netip.Prefix) *Resolver {
-	r := &Resolver{}
-	for _, p := range trusted {
-		if IsInternalPrefix(p) {
-			r.internal = append(r.internal, p)
-		} else {
-			r.edge = append(r.edge, p)
-		}
-	}
-	return r
-}
-
-// internalSpace is the address space a trusted proxy may sit in and still
-// count as internal: private (RFC 1918, fc00::/7), loopback, link-local and
-// shared/CGNAT space (100.64.0.0/10, used as a pod CIDR by some clusters).
-// No CDN edge egresses from these.
-var internalSpace = []netip.Prefix{
-	netip.MustParsePrefix("10.0.0.0/8"),
-	netip.MustParsePrefix("172.16.0.0/12"),
-	netip.MustParsePrefix("192.168.0.0/16"),
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("127.0.0.0/8"),
-	netip.MustParsePrefix("169.254.0.0/16"),
-	netip.MustParsePrefix("fc00::/7"),
-	netip.MustParsePrefix("::1/128"),
-	netip.MustParsePrefix("fe80::/10"),
-}
-
-// IsInternalPrefix reports whether every address of p lies in internal
-// address space. A prefix that reaches outside it (a Cloudflare range, or a
-// too-wide private one such as 10.0.0.0/7) is an edge prefix.
-func IsInternalPrefix(p netip.Prefix) bool {
-	p = p.Masked()
-	for _, s := range internalSpace {
-		if s.Bits() <= p.Bits() && s.Contains(p.Addr()) {
-			return true
-		}
-	}
-	return false
+	return &Resolver{trusted: trusted}
 }
 
 // ParseTrusted parses a comma- or whitespace-separated list of CIDRs and
-// bare addresses ("10.244.0.0/16, 173.245.48.0/20 2400:cb00::/32 127.0.0.1").
-// A bare address is a single-host prefix.
+// bare addresses ("10.244.0.0/16, fd00::/8 127.0.0.6"). A bare address is a
+// single-host prefix.
 func ParseTrusted(s string) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
@@ -206,10 +170,7 @@ func ResolverFromEnv() (*Resolver, error) {
 	if len(trusted) == 0 {
 		slog.Info(EnvTrustedProxies + " is empty: audit rows record each request's TCP peer as its client IP")
 	} else {
-		r := NewResolver(trusted)
-		slog.Info("trusted proxies for client IP resolution", "prefixes", len(trusted),
-			"internal", len(r.internal), "edge_one_hop", len(r.edge))
-		return r, nil
+		slog.Info("client IP: "+HeaderClientIP+" is believed from these proxy prefixes", "prefixes", len(trusted))
 	}
 	return NewResolver(trusted), nil
 }
@@ -226,73 +187,42 @@ func FromEnv() *Resolver {
 	return r
 }
 
-// Trusted reports whether a is one of the trusted proxies, internal or edge.
+// Trusted reports whether a is one of the trusted proxies.
 func (r *Resolver) Trusted(a netip.Addr) bool {
-	return r.kind(a) != hopClient
-}
-
-type hopKind int
-
-const (
-	hopClient hopKind = iota
-	hopInternal
-	hopEdge
-)
-
-func (r *Resolver) kind(a netip.Addr) hopKind {
 	if r == nil || !a.IsValid() {
-		return hopClient
+		return false
 	}
 	a = a.Unmap().WithZone("")
-	for _, p := range r.internal {
+	for _, p := range r.trusted {
 		if p.Contains(a) {
-			return hopInternal
+			return true
 		}
 	}
-	for _, p := range r.edge {
-		if p.Contains(a) {
-			return hopEdge
-		}
-	}
-	return hopClient
+	return false
 }
 
 // ClientIP resolves the client address from the TCP peer (an http.Request's
 // RemoteAddr, "host:port" or a bare address) and the request's
-// X-Forwarded-For header values, by the rule in the package comment. reason
+// X-Amp-Client-Ip header values, by the rule in the package comment. reason
 // is set when the result is invalid.
-func (r *Resolver) ClientIP(remoteAddr string, xff []string) (ip netip.Addr, reason string) {
+func (r *Resolver) ClientIP(remoteAddr string, clientIPHeader []string) (ip netip.Addr, reason string) {
 	peer, ok := parsePeer(remoteAddr)
 	if !ok {
 		return netip.Addr{}, "unparseable remote address"
 	}
-	k := r.kind(peer)
-	if k == hopClient {
+	if !r.Trusted(peer) {
 		return peer, ""
 	}
-	edgeSeen := k == hopEdge
-	hops := splitXFF(xff)
-	last := peer
-	for i := len(hops) - 1; i >= 0; i-- {
-		a, err := netip.ParseAddr(hops[i])
-		if err != nil {
-			return last, "" // garbage: stop at the last trusted hop
+	if len(clientIPHeader) == 1 {
+		if a, err := netip.ParseAddr(strings.TrimSpace(clientIPHeader[0])); err == nil && a.Zone() == "" {
+			return a.Unmap(), ""
 		}
-		a = a.Unmap().WithZone("")
-		if edgeSeen {
-			// The edge appended this entry: it is the client, whatever it
-			// is (a Worker or WARP caller is in an edge range itself).
-			return a, ""
-		}
-		switch r.kind(a) {
-		case hopClient:
-			return a, ""
-		case hopEdge:
-			edgeSeen = true
-		}
-		last = a
 	}
-	return last, ""
+	if len(clientIPHeader) == 0 && r.warned.CompareAndSwap(false, true) {
+		slog.Warn("a trusted proxy sent no "+HeaderClientIP+" header: recording its own address as the client; "+
+			"is AMP's Envoy config from the current chart?", "peer", peer.String())
+	}
+	return peer, ""
 }
 
 func parsePeer(remoteAddr string) (netip.Addr, bool) {
@@ -308,18 +238,6 @@ func parsePeer(remoteAddr string) (netip.Addr, bool) {
 		return netip.Addr{}, false
 	}
 	return a.Unmap().WithZone(""), true
-}
-
-func splitXFF(values []string) []string {
-	var hops []string
-	for _, v := range values {
-		for _, h := range strings.Split(v, ",") {
-			if h = strings.TrimSpace(h); h != "" {
-				hops = append(hops, h)
-			}
-		}
-	}
-	return hops
 }
 
 // Middleware resolves the request's Info and stores it on the request
@@ -338,7 +256,7 @@ func Middleware(listener string, res *Resolver) func(http.Handler) http.Handler 
 // Capture builds a request's Info (Middleware without the wrapping).
 func Capture(r *http.Request, listener string, res *Resolver) *Info {
 	xff := r.Header.Values("X-Forwarded-For")
-	ip, reason := res.ClientIP(r.RemoteAddr, xff)
+	ip, reason := res.ClientIP(r.RemoteAddr, r.Header.Values(HeaderClientIP))
 	info := &Info{
 		SourceIP:  ip,
 		IPReason:  reason,
