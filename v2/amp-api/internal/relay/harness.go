@@ -249,7 +249,7 @@ func (rl *Relay) refresh(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	} else if slices.ContainsFunc(ended, func(x domain.RemoteSession) bool { return x.ID == sess.ID }) {
-		writeErr(w, errf(410, domain.RemoteCodeSessionEnded, "remote session has ended").with("reason", domain.RemoteEndRevoked))
+		writeErr(w, errf(410, domain.RemoteCodeSessionEnded, "remote session has ended").with("reason", domain.RemoteEndAccessLost))
 		return
 	}
 	pol, _, err := rl.repo.ProjectRemotePolicy(ctx, sess.ProjectID)

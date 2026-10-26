@@ -17,12 +17,27 @@ import type { CommandBody, CommandOp, HarnessPin, RefusedBody, SessionDetail } f
 export const SILENCE_MS = 60_000
 /** Show "no answer from the laptop" after this long without an ack or refusal (5.2). */
 export const ACK_TIMEOUT_MS = 10_000
+/** Opening the session is retried after a passing failure: first after about this long, doubling… */
+export const LOAD_RETRY_FIRST_MS = 1_000
+/** …up to this long between tries (the event stream's reconnect uses the same 30 s cap). */
+export const LOAD_RETRY_MAX_MS = 30_000
+
+/**
+ * Whether a failure to open the session can pass by itself: the relay isn't there (the proxy's
+ * 502/503/504, or the relay's own 503 relay_unavailable), any other 5xx, 408 or 429, or the network
+ * (fetch throws a TypeError). A 4xx refusal, or a local key error, won't pass by retrying.
+ */
+export function isTransientLoadError(e: unknown): boolean {
+  if (e instanceof RelayError) return e.status >= 500 || e.status === 408 || e.status === 429 || e.status === 0
+  return e instanceof TypeError
+}
 
 export type Phase =
   | { kind: 'loading' }
   | { kind: 'not_found' }
   | { kind: 'gone'; reason: string }
-  | { kind: 'error'; message: string }
+  /** `retrying`: the failure can pass (relay down, network, 5xx) and the page tries again by itself. */
+  | { kind: 'error'; message: string; retrying: boolean }
   | { kind: 'unpaired'; detail: SessionDetail }
   /** Not paired yet, but the page was opened from a pairing link (protocol 7.1). */
   | { kind: 'pairing'; detail: SessionDetail; link: PairingLink }
@@ -44,9 +59,17 @@ export function useRemoteSession(sessionId: string) {
   const [loads, setLoads] = useState(0)
 
   // ── Load the session and the pin ──────────────────────────────────────────
+  // A failure that can pass (the relay down or restarting, a network blip, a 5xx) is retried with
+  // backoff until it works, so a page opened during a relay outage opens the session by itself once
+  // the relay is back (#2455), as a page that was already open does. 404, 410 and other refusals are
+  // final.
   useEffect(() => {
     let cancelled = false
-    ;(async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let backoff = LOAD_RETRY_FIRST_MS
+    const load = async () => {
+      clearTimeout(timer)
+      timer = undefined // set again only while a retry is pending
       try {
         const detail = await transport.getSession(sessionId)
         const [pin, deviceId] = await Promise.all([crypto.harnessPin(detail.harness_id), crypto.deviceId()])
@@ -64,13 +87,31 @@ export function useRemoteSession(sessionId: string) {
         if (cancelled) return
         if (e instanceof RelayError && e.status === 404) setPhase({ kind: 'not_found' })
         else if (e instanceof RelayError && e.status === 410) setPhase({ kind: 'gone', reason: 'session_ended' })
-        else setPhase({ kind: 'error', message: e instanceof Error ? e.message : 'Failed to load the session' })
+        else {
+          const message = e instanceof Error ? e.message : 'Failed to load the session'
+          const retrying = isTransientLoadError(e)
+          setPhase({ kind: 'error', message, retrying })
+          if (retrying) {
+            timer = setTimeout(load, backoff * (0.8 + Math.random() * 0.4))
+            backoff = Math.min(backoff * 2, LOAD_RETRY_MAX_MS)
+          }
+        }
       }
-    })()
-    return () => { cancelled = true }
+    }
+    // Back online while a retry is pending: try at once instead of waiting out the backoff.
+    const onOnline = () => {
+      if (cancelled || timer === undefined) return
+      backoff = LOAD_RETRY_FIRST_MS
+      void load()
+    }
+    window.addEventListener('online', onOnline)
+    void load()
+    return () => { cancelled = true; clearTimeout(timer); window.removeEventListener('online', onOnline) }
   }, [sessionId, transport, crypto, loads])
 
   const paired = useCallback(() => setLoads(n => n + 1), [])
+  /** Try opening the session again now (the backoff starts over). */
+  const retryLoad = paired
 
   const deviceId = phase.kind === 'ready' ? phase.deviceId : null
   const pin = phase.kind === 'ready' ? phase.pin : null
@@ -231,5 +272,5 @@ export function useRemoteSession(sessionId: string) {
     }
   }, [transport, sessionId, deviceId, sendCommand])
 
-  return { phase, state, sendPrompt, stop, disconnect, paired, canSign: !!deviceId }
+  return { phase, state, sendPrompt, stop, disconnect, paired, retryLoad, canSign: !!deviceId }
 }

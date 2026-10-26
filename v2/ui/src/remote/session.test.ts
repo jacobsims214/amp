@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { blockText, endReasonText, formatCost, initialSessionState, isBusy, sessionReducer, sessionTokens, type SessionAction, type SessionState } from './session'
+import { blockText, endReasonLabel, endReasonText, formatCost, initialSessionState, isBusy, sessionReducer, sessionTokens, type SessionAction, type SessionState } from './session'
 import { seedChatEvents } from './mock/mockRelay'
 import { CHAT_EVENT_TYPES, type ChatEvent, type Envelope } from './types'
 
@@ -163,5 +163,20 @@ describe('endReasonText', () => {
     expect(endReasonText('idle', 1800)).toBe('The session ended after 30 minutes without remote activity.')
     expect(endReasonText('idle')).toBe('The session ended after its idle time without remote activity (your org sets it).')
     expect(endReasonText('detached', 300)).toBe('You disconnected this session.')
+  })
+
+  it('gives each end reason its own words; losing access is not a revoke (#2455)', () => {
+    expect(endReasonText('access_lost')).toBe('Remote control ended: you no longer have access to this project.')
+    expect(endReasonText('deactivated')).toBe('Remote control ended: your AMP account was deactivated.')
+    expect(endReasonText('revoked')).toBe('All your remote sessions were revoked.')
+    expect(endReasonLabel('access_lost')).toBe('Project access removed')
+    expect(endReasonLabel('deactivated')).toBe('Account deactivated')
+    const reasons = ['harness_ended', 'disconnected', 'revoked', 'access_lost', 'deactivated', 'policy_off', 'idle', 'expired', 'killed']
+    const texts = reasons.map(r => endReasonText(r))
+    expect(new Set(texts).size).toBe(reasons.length)
+    expect(texts).not.toContain('This session has ended.')
+    expect(new Set(reasons.map(endReasonLabel)).size).toBe(reasons.length)
+    // An unknown reason from a newer server still reads sensibly.
+    expect(endReasonText('something_new')).toBe('This session has ended.')
   })
 })
