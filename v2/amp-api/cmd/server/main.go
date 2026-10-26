@@ -29,6 +29,7 @@ import (
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/reqctx"
 	"github.com/simstech/amp-api/internal/service"
 	"github.com/simstech/amp-api/internal/webhook"
 )
@@ -324,9 +325,13 @@ func main() {
 		slog.Warn("UI_CLIENT_ID and REST_AUDIENCES unset: no request counts as the web UI, so nobody can approve a plan")
 	}
 
+	// Every listener resolves the trusted client IP, user agent and request
+	// id for the audit log (AMP_TRUSTED_PROXIES; see internal/reqctx).
+	ipResolver := reqctx.FromEnv()
+
 	mcpPublicServer := &http.Server{
 		Addr:    mcpAddr,
-		Handler: newMCPHTTPHandler(mcpSrv, mcpVerifier, mcpCfg),
+		Handler: reqctx.Middleware(reqctx.ListenerMCP, ipResolver)(newMCPHTTPHandler(mcpSrv, mcpVerifier, mcpCfg)),
 	}
 	go func() {
 		slog.Info("MCP public server listening (Streamable HTTP, auth-enforced)", "addr", mcpAddr)
@@ -379,6 +384,7 @@ func main() {
 	apiHandler = api.RejectCrossSiteWrites(apiHandler)
 	apiHandler = authExceptHealth(restVerifier, apiHandler)
 	apiHandler = corsMiddleware.Handler(apiHandler)
+	apiHandler = reqctx.Middleware(reqctx.ListenerREST, ipResolver)(apiHandler)
 
 	apiServer := &http.Server{
 		Addr:    apiAddr,

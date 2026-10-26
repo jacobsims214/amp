@@ -42,6 +42,7 @@ func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEn
 	e.ActorUserID = p.UserRef()
 	e.ActorEmail = p.Email
 	e.ViaToken = p.ViaToken
+	fillAuditContext(ctx, p, &e)
 	// How the change arrived (ui, mcp, token): approvals are only valid
 	// from the web UI, and the log shows which channel each one used.
 	if p.Channel != "" {

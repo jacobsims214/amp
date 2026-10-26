@@ -14,6 +14,7 @@ import (
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/reqctx"
 	"google.golang.org/grpc"
 )
 
@@ -156,5 +157,46 @@ func TestPasswordChangesAreAudited(t *testing.T) {
 	}
 	if _, ok := users.byEmail[bob.Email]; ok {
 		t.Error("bob's AMP user was not deleted")
+	}
+}
+
+// authadmin's audit rows carry the request context: main() wraps the
+// handler in reqctx.Middleware outside auth, so the principal the writer
+// gets holds the trusted client IP, user agent and request id, and a
+// spoofed X-Forwarded-For from an untrusted peer is ignored.
+func TestPasswordAuditCarriesRequestContext(t *testing.T) {
+	admin := &domain.User{ID: 1, Email: "root@amp.test", Roles: []string{domain.RoleAdmin}}
+	bob := &domain.User{ID: 7, Email: "bob@amp.test", Roles: []string{domain.RoleMember}}
+	users := &fakeUsers{byEmail: map[string]*domain.User{admin.Email: admin, bob.Email: bob}}
+	var got []recorded
+	s := &server{dex: &fakeDex{hashes: map[string][]byte{}}, repo: users, audit: func(_ context.Context, p authz.Principal, e domain.AuditEntry) {
+		got = append(got, recorded{p, e})
+	}}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/authadmin/users", auth.RequireRole(domain.RoleAdmin, s.listOrCreateUser))
+	authed := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ident := &auth.Identity{Subject: "s", Email: admin.Email, User: admin, AuthMethod: auth.AuthDexSession, SessionID: "sess"}
+		mux.ServeHTTP(w, r.WithContext(auth.WithIdentity(r.Context(), ident)))
+	})
+	h := reqctx.Middleware(reqctx.ListenerAuthAdmin, reqctx.NewResolver(nil))(authed)
+
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(map[string]string{"email": "carol@amp.test", "password": "a-Long-enough-pw-1"})
+	req := httptest.NewRequest("POST", "/authadmin/users", &buf)
+	req.RemoteAddr = "198.51.100.20:4444"
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 || len(got) != 1 {
+		t.Fatalf("create = %d %s, %d entries", rec.Code, rec.Body, len(got))
+	}
+	p := got[0].p
+	if p.Req == nil || p.Req.SourceIP.String() != "198.51.100.20" || p.Req.UserAgent != "Mozilla/5.0" ||
+		p.Req.Listener != reqctx.ListenerAuthAdmin || p.Req.RequestID == "" || p.Req.RequestID != rec.Header().Get("X-Request-Id") {
+		t.Fatalf("principal's request context = %+v", p.Req)
+	}
+	if p.AuthMethod != auth.AuthDexSession || p.SessionID != "sess" {
+		t.Fatalf("principal = %+v", p)
 	}
 }

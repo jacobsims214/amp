@@ -12,12 +12,16 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coreos/go-oidc/v3/oidc"
 	"github.com/simstech/amp-api/internal/domain"
@@ -51,7 +55,27 @@ type Identity struct {
 	// only ChannelUI is a person in the web UI. Set by Middleware; empty
 	// (treated as not the UI) for in-process callers.
 	Channel string
+	// AuthMethod is how the request authenticated, for the audit log (the
+	// AuthMethod constants). Set by Middleware.
+	AuthMethod string
+	// TokenID is the api_tokens.id of the API token used (never the token).
+	TokenID int64
+	// SessionID identifies the Dex session a JWT belongs to: a truncated
+	// SHA-256 of its sub and iat (Dex issues no sid). Never the token.
+	SessionID string
 }
+
+// How a request authenticated, recorded as the audit log's auth_method.
+const (
+	// AuthDexSession: a Dex token from the web UI's oauth2-proxy session.
+	AuthDexSession = "dex_session"
+	// AuthOAuthMCP: a Dex token obtained by an MCP client's OAuth flow.
+	AuthOAuthMCP = "oauth_mcp"
+	// AuthAPIToken: an AMP API token (amp_...).
+	AuthAPIToken = "api_token"
+	// AuthLocalDev: auth is disabled (no OIDC_ISSUER_URL).
+	AuthLocalDev = "local_dev"
+)
 
 // Channels a request can arrive on. Approvals (a plan, an artifact, a
 // person's own ticket) need ChannelUI.
@@ -183,6 +207,7 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		if !v.enabled {
 			ident := &Identity{Subject: "local-dev", Email: "local-dev@amp.local", Name: "Local Dev", LocalDev: true, Listener: v.label}
 			ident.Channel = v.channelOf(ident)
+			ident.AuthMethod = AuthLocalDev
 			r = r.WithContext(context.WithValue(r.Context(), identityCtxKey, ident))
 			next.ServeHTTP(w, r)
 			return
@@ -208,6 +233,7 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 		}
 		ident.Listener = v.label
 		ident.Channel = v.channelOf(ident)
+		ident.AuthMethod = v.authMethodOf(ident)
 		if ident.User != nil && ident.User.DisabledAt != nil {
 			slog.Warn("request refused: account deactivated", "listener", v.label, "user_id", ident.User.ID, "email", ident.User.Email)
 			w.Header().Set("Content-Type", "application/json")
@@ -258,7 +284,8 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 	}
 
 	ident := &Identity{Subject: claims.Subject, Email: claims.Email, Name: claims.Name,
-		Audience: append([]string(nil), idToken.Audience...), AZP: claims.AZP}
+		Audience: append([]string(nil), idToken.Audience...), AZP: claims.AZP,
+		SessionID: SessionID(claims.Subject, idToken.IssuedAt)}
 	if v.repo == nil {
 		return ident
 	}
@@ -305,7 +332,7 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 		v.writeUnauthorized(w, "API tokens are not available")
 		return nil
 	}
-	u, err := v.repo.UserForAPIToken(r.Context(), HashAPIToken(rawToken))
+	u, tokenID, err := v.repo.UserAndTokenForAPIToken(r.Context(), HashAPIToken(rawToken))
 	if err != nil {
 		if !errors.Is(err, repository.ErrNotFound) {
 			slog.Error("API token lookup failed", "err", err)
@@ -313,7 +340,7 @@ func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, 
 		v.writeUnauthorized(w, "invalid, expired, or revoked API token")
 		return nil
 	}
-	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true}
+	return &Identity{Subject: u.Subject, Email: u.Email, Name: u.DisplayName, User: u, APIToken: true, TokenID: tokenID}
 }
 
 // channelOf decides how a request reached AMP (see the Channel constants).
@@ -334,6 +361,34 @@ func (v *Verifier) channelOf(ident *Identity) string {
 		return ChannelUI
 	}
 	return ChannelRESTOther
+}
+
+// authMethodOf names how ident authenticated, for the audit log. A Dex
+// token is the web UI's session when it was issued to the UI (ChannelUI),
+// and on a verifier with no listener label (authadmin, whose only route
+// sits behind oauth2-proxy); on the MCP listener, or an MCP-audience token
+// on REST, it came from an MCP client's OAuth flow.
+func (v *Verifier) authMethodOf(ident *Identity) string {
+	switch {
+	case ident.LocalDev:
+		return AuthLocalDev
+	case ident.APIToken:
+		return AuthAPIToken
+	case ident.Channel == ChannelUI, v.label == "":
+		return AuthDexSession
+	}
+	return AuthOAuthMCP
+}
+
+// SessionID derives a stable, non-reversible id for the Dex session a JWT
+// belongs to from its sub and iat: the first 16 bytes of SHA-256, in hex.
+// Empty when either is missing.
+func SessionID(subject string, issuedAt time.Time) string {
+	if subject == "" || issuedAt.IsZero() {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(subject + "\x00" + strconv.FormatInt(issuedAt.Unix(), 10)))
+	return hex.EncodeToString(sum[:16])
 }
 
 // IsUI reports whether the request came from a person in the web UI.

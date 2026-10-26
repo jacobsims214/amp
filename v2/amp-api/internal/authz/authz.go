@@ -27,6 +27,7 @@ import (
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
+	"github.com/simstech/amp-api/internal/reqctx"
 )
 
 // ---- Errors ----
@@ -81,6 +82,20 @@ type Principal struct {
 	// the web UI, otherwise mcp, token, rest-other, or empty (in-process).
 	// See RequireUI.
 	Channel string
+
+	// For the audit log: how the request authenticated (the auth.Auth*
+	// constants; empty for in-process callers such as background jobs),
+	// the API token's id, the Dex session id, and for an agent account the
+	// person who manages it.
+	AuthMethod string
+	TokenID    int64
+	SessionID  string
+	ManagedBy  *int
+	// Req is what the listener learned about the request (client IP, user
+	// agent, request id); nil for in-process callers. It rides on the
+	// Principal so it reaches the audit writer even where the request's
+	// context doesn't.
+	Req *reqctx.Info
 }
 
 // InUI reports whether p is a person acting in AMP's web UI: the only
@@ -133,8 +148,9 @@ func FromContext(ctx context.Context) (Principal, error) {
 	if !ok {
 		return Principal{}, &Error{Status: 401, Msg: "not authenticated"}
 	}
+	req, _ := reqctx.FromContext(ctx)
 	if ident.LocalDev {
-		return Principal{Super: true, Email: ident.Email, Channel: ident.Channel}, nil
+		return Principal{Super: true, Email: ident.Email, Channel: ident.Channel, AuthMethod: ident.AuthMethod, Req: req}, nil
 	}
 	if ident.User == nil {
 		return Principal{}, Forbidden("this token has no AMP user (missing email claim); sign in again")
@@ -146,6 +162,12 @@ func FromContext(ctx context.Context) (Principal, error) {
 		Agent:    ident.User.IsAgent(),
 		ViaToken: ident.APIToken,
 		Channel:  ident.Channel,
+
+		AuthMethod: ident.AuthMethod,
+		TokenID:    ident.TokenID,
+		SessionID:  ident.SessionID,
+		ManagedBy:  ident.User.ManagedBy,
+		Req:        req,
 	}, nil
 }
 
