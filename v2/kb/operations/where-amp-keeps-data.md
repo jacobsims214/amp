@@ -17,7 +17,8 @@ Postgres dump alone is not enough**. The knowledge bases live only in Typesense.
 | Orgs, teams, members, invites, roles, project access | Postgres `amp` | |
 | AMP users and API tokens | Postgres `amp` (`users`, `api_tokens`) | Tokens are stored as SHA-256 hashes with no server secret, so they keep working on a new stack. |
 | Artifacts (mockups, diagrams, images, documents) and every version | Postgres `amp` (`artifacts`, `artifact_versions`, content in `BYTEA`) | Usually the largest part of the dump. Retention dates come along unchanged. |
-| Design system versions, audit log, webhooks and their secrets | Postgres `amp` | |
+| Design system versions, audit log (with its hash chains, checkpoints and webhook outbox), webhooks and their secrets | Postgres `amp` | Restore audit tables with a full dump, or a data-only restore with `--disable-triggers`. See `admin/trash-audit-and-projects.md`. |
+| Audit checkpoint signing key | Kubernetes Secret named in `ampApi.audit.signingKey.existingSecret` (never in the database) | Move it with the database. Without it, `audit verify` can't check old signatures unless you list its public key in `ampApi.audit.retiredPublicKeys`. |
 | Sign-in: local passwords, registered MCP clients, refresh tokens, Dex's signing keys | Postgres, database `dex` (same CNPG cluster) | Only Dex reads it. With SSO connectors there are no passwords here, but the rest still matters. |
 | **Project, team and org knowledge bases** | **Typesense only**, one collection per KB: `kb_<project id>`, `kb_team_<id>`, `kb_org_<id>` | **No copy anywhere else.** Collection names carry Postgres IDs, so the KBs and the database must come from the same moment. |
 | Secrets the stack was installed with | Kubernetes Secrets, ideally pinned in `global.secretOverrides` | `amp-oauth2-proxy` (client and cookie secret), `amp-valkey-users`, `amp-bootstrap-admin`, `typesense.apiKey`, any SSO connector secrets. |

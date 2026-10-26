@@ -78,7 +78,8 @@ func jsonOrNil(m map[string]any) ([]byte, error) {
 const auditCols = `id, at, actor_user_id, actor_email, via_token, org_id, project_id, action, target_type, target_id, summary, details,
 	schema_version, actor_type, auth_method, token_id, COALESCE(session_id, ''), on_behalf_of_user_id, COALESCE(agent_profile, ''),
 	COALESCE(target_name, ''), outcome, reason, COALESCE(host(source_ip), ''), COALESCE(user_agent, ''), client,
-	COALESCE(request_id, ''), COALESCE(trace_id, ''), "before", "after"`
+	COALESCE(request_id, ''), COALESCE(trace_id, ''), "before", "after",
+	COALESCE(chain_key, ''), COALESCE(chain_seq, 0), COALESCE(encode(hash, 'hex'), '')`
 
 func scanAudit(row rowScanner, e *domain.AuditEntry) error {
 	var details, before, after []byte
@@ -86,7 +87,8 @@ func scanAudit(row rowScanner, e *domain.AuditEntry) error {
 		&e.Action, &e.TargetType, &e.TargetID, &e.Summary, &details,
 		&e.SchemaVersion, &e.ActorType, &e.AuthMethod, &e.TokenID, &e.SessionID, &e.OnBehalfOfUserID, &e.AgentProfile,
 		&e.TargetName, &e.Outcome, &e.Reason, &e.SourceIP, &e.UserAgent, &e.Client,
-		&e.RequestID, &e.TraceID, &before, &after); err != nil {
+		&e.RequestID, &e.TraceID, &before, &after,
+		&e.ChainKey, &e.ChainSeq, &e.Hash); err != nil {
 		return err
 	}
 	if err := json.Unmarshal(details, &e.Details); err != nil {

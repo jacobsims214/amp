@@ -6,8 +6,14 @@
 // webhook_deliveries outbox; a delivery loop then POSTs them, retrying with
 // backoff. The outbox lives in Postgres and deliveries are leased, so
 // several replicas can run dispatchers and a restart loses nothing already
-// written. (An event still queued in memory when the process dies is lost;
-// the queue is drained in milliseconds.)
+// written. (A hub event still queued in memory when the process dies is
+// lost; the queue is drained in milliseconds.)
+//
+// Audit entries never pass through memory: a trigger queues every audit_log
+// row in audit_outbox in the statement that writes it (migration 033), and
+// the audit loop leases them from there, matches them, and removes them, so
+// each is matched at least once even across restarts and a full queue (the
+// SIEM path; #2429). Audit only wakes that loop.
 //
 // Every POST carries:
 //
@@ -81,6 +87,8 @@ type Dispatcher struct {
 	client *http.Client
 	in     chan item
 	wake   chan struct{}
+	// auditWake nudges the audit loop (Audit).
+	auditWake chan struct{}
 
 	mu       sync.Mutex
 	projects map[int]projectInfo // names and orgs for rendering, cached briefly
@@ -114,7 +122,8 @@ func New(repo *repository.Repo, opts Options) *Dispatcher {
 	if opts.DisableAfter <= 0 {
 		opts.DisableAfter = DisableAfter
 	}
-	d := &Dispatcher{repo: repo, opts: opts, in: make(chan item, 4096), wake: make(chan struct{}, 1), projects: map[int]projectInfo{}}
+	d := &Dispatcher{repo: repo, opts: opts, in: make(chan item, 4096), wake: make(chan struct{}, 1), auditWake: make(chan struct{}, 1),
+		projects: map[int]projectInfo{}}
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	if !opts.AllowPrivateNetworks {
 		// Checked on the resolved address of every connection, so DNS
@@ -156,12 +165,13 @@ func (d *Dispatcher) Event(e domain.Event) {
 	}
 }
 
-// Audit queues an audit entry. It never blocks.
-func (d *Dispatcher) Audit(e domain.AuditEntry) {
+// Audit is told about each audit entry this process writes, and wakes the
+// audit loop; the entry itself is read from audit_outbox, where a trigger
+// queued it. It never blocks.
+func (d *Dispatcher) Audit(domain.AuditEntry) {
 	select {
-	case d.in <- item{audit: &e}:
+	case d.auditWake <- struct{}{}:
 	default:
-		slog.Warn("webhook queue full: audit entry dropped", "action", e.Action)
 	}
 }
 
@@ -176,7 +186,63 @@ func (d *Dispatcher) Wake() {
 // Run matches and delivers until ctx ends.
 func (d *Dispatcher) Run(ctx context.Context) {
 	go d.matchLoop(ctx)
+	go d.auditLoop(ctx)
 	d.deliverLoop(ctx)
+}
+
+// auditOutboxBatch is how many audit entries the audit loop leases at once,
+// and auditOutboxLease how long it has to match them before another
+// dispatcher may.
+const (
+	auditOutboxBatch = 100
+	auditOutboxLease = time.Minute
+)
+
+// auditLoop matches the audit entries queued in audit_outbox, whoever wrote
+// them (any replica, authadmin, or m1's relay), until ctx ends.
+func (d *Dispatcher) auditLoop(ctx context.Context) {
+	tick := time.NewTicker(d.opts.Poll)
+	defer tick.Stop()
+	for {
+		d.drainAudit(ctx)
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		case <-d.auditWake:
+		}
+	}
+}
+
+// drainAudit matches queued audit entries until none are due. An entry
+// whose matching fails stays queued and is retried when its lease ends.
+func (d *Dispatcher) drainAudit(ctx context.Context) {
+	for ctx.Err() == nil {
+		entries, err := d.repo.ClaimAuditOutbox(ctx, auditOutboxBatch, auditOutboxLease)
+		if err != nil {
+			if ctx.Err() == nil {
+				slog.Error("reading the audit outbox failed", "err", err)
+			}
+			return
+		}
+		done := make([]int64, 0, len(entries))
+		for i := range entries {
+			if err := d.match(ctx, item{audit: &entries[i]}); err != nil {
+				if ctx.Err() == nil {
+					slog.Error("webhook matching failed; the audit entry stays queued", "audit_id", entries[i].ID, "action", entries[i].Action, "err", err)
+				}
+				continue
+			}
+			done = append(done, entries[i].ID)
+		}
+		if err := d.repo.AckAuditOutbox(context.WithoutCancel(ctx), done); err != nil {
+			slog.Error("removing matched audit entries from the outbox failed; they will be matched again", "err", err)
+			return
+		}
+		if len(entries) < auditOutboxBatch {
+			return
+		}
+	}
 }
 
 func (d *Dispatcher) matchLoop(ctx context.Context) {
@@ -260,6 +326,9 @@ func envelope(it item, typ string, projectID, orgID int) Envelope {
 		env.At, env.Data = it.event.At, it.event.Payload
 	} else {
 		env.At, env.Data = it.audit.At, it.audit
+		// Delivery is at least once: a stable id lets receivers drop a
+		// repeat.
+		env.ID = fmt.Sprintf("evt_audit_%d", it.audit.ID)
 	}
 	if env.At.IsZero() {
 		env.At = time.Now()
