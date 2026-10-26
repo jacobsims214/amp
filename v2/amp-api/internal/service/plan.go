@@ -1194,9 +1194,13 @@ func (s *Service) ApprovePlan(ctx context.Context, p authz.Principal, projectID 
 func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, projectID int, req ApproveRequest) (*ApproveResult, error) {
 	lvl, err := s.Authz.RequireProject(ctx, p, projectID, authz.Member)
 	if err != nil {
+		if authz.StatusOf(err, 0) == 403 {
+			s.AuditApproveDenied(ctx, p, projectID, req, nil, err)
+		}
 		return nil, err
 	}
 	if err := authz.RequireUI(p, "Plan approval", s.PlanURL(projectID)); err != nil {
+		s.AuditApproveDenied(ctx, p, projectID, req, nil, err)
 		return nil, err
 	}
 	tasks, err := s.Repo.ListTasks(ctx, projectID, "")
@@ -1250,13 +1254,17 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 		}
 	}
 	if len(others) > 0 && !req.OnBehalf {
-		return nil, authz.Forbidden("tickets %v aren't yours (they're owned by, or were planned by, someone else); approving them is "+
+		err := authz.Forbidden("tickets %v aren't yours (they're owned by, or were planned by, someone else); approving them is "+
 			"approving on their owner's behalf: send on_behalf: true (project leads, owners and admins only), or approve only your "+
 			"own tickets. Nothing was approved.", others)
+		s.AuditApproveDenied(ctx, p, projectID, req, others, err)
+		return nil, err
 	}
 	if len(others) > 0 && lvl < authz.Lead {
-		return nil, authz.Forbidden("approving other people's tickets %v on their behalf needs lead access or above on project %d; "+
+		err := authz.Forbidden("approving other people's tickets %v on their behalf needs lead access or above on project %d; "+
 			"you can approve your own tickets, and their owners (or a lead) approve theirs. Nothing was approved.", others, projectID)
+		s.AuditApproveDenied(ctx, p, projectID, req, others, err)
+		return nil, err
 	}
 
 	// Approve each through its task actor, which re-checks it as it is now.
@@ -1362,12 +1370,21 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 		}
 	}
 
+	// Who approved, from where and with what client come from the request
+	// (fillAuditContext). The row also says which tickets the approval
+	// covered (ids and count, plus the plan's link) and which version of
+	// the plan was approved: plan_as_of is the as_of the page sent (the
+	// plan as the person saw it), or when not sent, the approval time.
+	approvedAt := time.Now().UTC()
 	details := map[string]any{
 		"channel": p.Channel, "approved": res.Approved, "owners": owners, "approved_by": p.UserRef(),
 		"on_behalf": res.OnBehalf, "on_behalf_of": onBehalfOf, "still_awaiting": res.AwaitingApproval,
+		"approved_count": len(res.Approved), "plan_url": s.PlanURL(projectID),
+		"approved_at": approvedAt.Format(time.RFC3339Nano), "plan_as_of": approvedAt.Format(time.RFC3339Nano),
 	}
 	if req.AsOf != nil {
 		details["as_of"] = req.AsOf.UTC().Format(time.RFC3339Nano)
+		details["plan_as_of"] = details["as_of"]
 	}
 	if req.TaskIDs != nil {
 		details["task_ids"] = req.TaskIDs
@@ -1387,7 +1404,7 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 		summary += ", some on their owners' behalf"
 	}
 	s.audit(fin, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
-		Summary: summary, Details: details})
+		TargetName: name, Summary: summary, Details: details})
 	// Published here, not by the REST or MCP handler, so every way of
 	// approving refreshes open Flight plan pages the same way.
 	if res.Project != nil {

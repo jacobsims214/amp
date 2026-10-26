@@ -7,7 +7,6 @@ import (
 	"net/netip"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/simstech/amp-api/internal/auth"
@@ -158,24 +157,24 @@ func auditClient(actorType, authMethod string, req *reqctx.Info) string {
 // target); repeats inside it are counted, not written.
 const deniedWindow = 10 * time.Minute
 
-var (
-	deniedMu   sync.Mutex
-	deniedSeen = map[string]*deniedState{}
-)
-
-type deniedState struct {
-	until      time.Time
-	suppressed int
-}
-
 // auditDenied records a refused action. action is the action that was
 // attempted ("plan.approve"); the row's action is it with ".denied"
 // appended, so a consumer that ignores outcome never reads a refusal as the
 // change itself. e carries the target and any details; reason is the
 // refusal (err's message, clipped, never secrets). One row per actor,
 // action and target is written per 10 minutes: the next one written carries
-// how many were skipped in details.suppressed.
+// how many were skipped in details.suppressed. An anonymous caller is keyed
+// by its address block (/64 for IPv6), and anonymous refusals share a
+// global cap per action per minute whose excess is written as one summary
+// row (DeniedLimiter; #2440).
 func (s *Service) auditDenied(ctx context.Context, p authz.Principal, action string, e domain.AuditEntry, err error) {
+	// The listener's generic access.denied hook skips a request whose
+	// refusal is recorded here (even when the row below is rate-limited).
+	req := p.Req
+	if req == nil {
+		req, _ = reqctx.FromContext(ctx)
+	}
+	req.MarkDeniedAudited()
 	e.Action = deniedAction(action)
 	e.Outcome = domain.AuditOutcomeDenied
 	if e.Reason == "" && err != nil {
@@ -186,14 +185,22 @@ func (s *Service) auditDenied(ctx context.Context, p authz.Principal, action str
 			e.Reason = err.Error()
 		}
 	}
-	key := fmt.Sprintf("%d|%s|%s|%s|%s:%s", p.UserID, p.Email, func() string {
-		if p.Req != nil && p.Req.SourceIP.IsValid() && p.UserID == 0 {
-			return p.Req.SourceIP.String() // anonymous: per address
-		}
-		return ""
-	}(), e.Action, e.TargetType, e.TargetID)
-	write, suppressed := deniedAllow(key, time.Now())
+	anonymous := p.UserID == 0
+	block := ""
+	if anonymous && req != nil {
+		block = anonymousBlock(req.SourceIP)
+	}
+	key := fmt.Sprintf("%d|%s|%s|%s|%s:%s", p.UserID, p.Email, block, e.Action, e.TargetType, e.TargetID)
+	lim, now := s.deniedLimiter(), time.Now()
+	write, suppressed := lim.allow(key, now)
 	if !write {
+		return
+	}
+	if anonymous && !lim.allowGlobal(e.Action, now, func(n int, start, end time.Time) {
+		// No request context: the row stands for many callers, so it
+		// carries none of this request's address or ids.
+		s.auditDeniedSummary(context.Background(), e.Action, n, start, end)
+	}) {
 		return
 	}
 	if suppressed > 0 {
@@ -205,29 +212,23 @@ func (s *Service) auditDenied(ctx context.Context, p authz.Principal, action str
 	s.audit(ctx, p, e)
 }
 
-// deniedAllow reports whether a refusal under key is written at now, and
-// how many were skipped since the last one written.
+// auditDeniedSummary writes the row standing in for the n anonymous
+// refusals of action that the global cap suppressed between start and end.
+func (s *Service) auditDeniedSummary(ctx context.Context, action string, n int, start, end time.Time) {
+	if n <= 0 {
+		return
+	}
+	s.audit(ctx, authz.Principal{}, domain.AuditEntry{Action: action, Outcome: domain.AuditOutcomeDenied,
+		ActorType: domain.AuditActorAnonymous, TargetType: "audit", TargetID: "suppressed",
+		Summary: fmt.Sprintf("%d more %s suppressed (over %d a minute from anonymous callers)", n, action, s.deniedLimiter().globalCap),
+		Reason:  "rate limit: anonymous refusals over the per-minute cap are counted, not written one by one",
+		Details: map[string]any{"suppressed": n, "aggregate": true, "window_start": start.UTC().Format(time.RFC3339),
+			"window_end": end.UTC().Format(time.RFC3339), "ip_reason": "aggregate of many callers"}})
+}
+
+// deniedAllow is DeniedLimiter.allow on the shared limiter.
 func deniedAllow(key string, now time.Time) (write bool, suppressed int) {
-	deniedMu.Lock()
-	defer deniedMu.Unlock()
-	st, seen := deniedSeen[key]
-	if seen && now.Before(st.until) {
-		st.suppressed++
-		return false, 0
-	}
-	if seen {
-		suppressed = st.suppressed
-	}
-	deniedSeen[key] = &deniedState{until: now.Add(deniedWindow)}
-	// Forget windows long past so the map stays small.
-	if len(deniedSeen) > 10000 {
-		for k, v := range deniedSeen {
-			if now.After(v.until) {
-				delete(deniedSeen, k)
-			}
-		}
-	}
-	return true, suppressed
+	return defaultDenied.allow(key, now)
 }
 
 // deniedAction is the action name a refusal is recorded under.

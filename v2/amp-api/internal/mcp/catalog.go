@@ -211,6 +211,7 @@ func (s *Server) ServerOptions() []server.ServerOption {
 	})
 	return []server.ServerOption{
 		server.WithToolHandlerMiddleware(Middleware()),
+		server.WithToolHandlerMiddleware(s.deniedMiddleware()),
 		server.WithHooks(hooks),
 	}
 }

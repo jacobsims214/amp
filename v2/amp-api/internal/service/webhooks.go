@@ -91,7 +91,9 @@ func (s *Service) CreateWebhook(ctx context.Context, p authz.Principal, orgID, p
 	if err != nil {
 		return nil, err
 	}
-	s.audit(ctx, p, webhookAudit("webhook.create", created, "added webhook "+describeWebhook(created)))
+	e := webhookAudit("webhook.create", created, "added webhook "+describeWebhook(created))
+	e.After = webhookValue(created)
+	s.audit(ctx, p, e)
 	return created, nil
 }
 
@@ -100,6 +102,7 @@ func (s *Service) UpdateWebhook(ctx context.Context, p authz.Principal, id int, 
 	if err != nil {
 		return nil, err
 	}
+	before := webhookValue(w)
 	if err := applyWebhookChange(w, c); err != nil {
 		return nil, err
 	}
@@ -107,7 +110,9 @@ func (s *Service) UpdateWebhook(ctx context.Context, p authz.Principal, id int, 
 	if err != nil {
 		return nil, err
 	}
-	s.audit(ctx, p, webhookAudit("webhook.update", updated, "changed webhook "+describeWebhook(updated)))
+	e := webhookAudit("webhook.update", updated, "changed webhook "+describeWebhook(updated))
+	e.Before, e.After = before, webhookValue(updated)
+	s.audit(ctx, p, e)
 	return updated, nil
 }
 
@@ -119,7 +124,9 @@ func (s *Service) DeleteWebhook(ctx context.Context, p authz.Principal, id int) 
 	if err := s.Repo.DeleteWebhook(ctx, id); err != nil {
 		return err
 	}
-	s.audit(ctx, p, webhookAudit("webhook.delete", w, "deleted webhook "+describeWebhook(w)))
+	e := webhookAudit("webhook.delete", w, "deleted webhook "+describeWebhook(w))
+	e.Before = webhookValue(w)
+	s.audit(ctx, p, e)
 	return nil
 }
 
@@ -239,3 +246,14 @@ func redactURL(raw string) string {
 }
 
 func asAuthz(err error, target **authz.Error) bool { return errors.As(err, target) }
+
+// webhookValue is a webhook's configuration as an audit before/after
+// value. The signing secret never appears, and redact() cuts the URL to
+// scheme and host (its path is often itself a credential).
+func webhookValue(w *domain.Webhook) map[string]any {
+	events := make([]any, 0, len(w.Events))
+	for _, e := range w.Events {
+		events = append(events, e)
+	}
+	return map[string]any{"name": w.Name, "url": w.URL, "format": w.Format, "events": events, "active": w.Active}
+}
