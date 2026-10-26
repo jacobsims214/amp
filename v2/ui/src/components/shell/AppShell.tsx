@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck,
+  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck, ScrollText,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
@@ -111,12 +111,14 @@ export function AppShell() {
               <Group>Admin</Group>
               {isAdmin && <NavLink to="/admin/users" className={navCls}><ShieldCheck size={14} />People & agents</NavLink>}
               <NavLink to="/admin/orgs" className={navCls}><Building2 size={14} />Teams & orgs</NavLink>
+              {isAdmin && <NavLink to="/admin/audit" className={navCls}><ScrollText size={14} />Audit log</NavLink>}
             </>
           )}
           {!isAdmin && !orgAdmin && me && (
             <>
               <Group>Organization</Group>
               <NavLink to="/admin/orgs" className={navCls}><Building2 size={14} />Teams & orgs</NavLink>
+              {isAdmin && <NavLink to="/admin/audit" className={navCls}><ScrollText size={14} />Audit log</NavLink>}
             </>
           )}
         </nav>

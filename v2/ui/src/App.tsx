@@ -11,6 +11,7 @@ import { ProjectSettings } from './pages/ProjectSettings'
 import { DayReports } from './pages/DayReports'
 import { Users } from './pages/Users'
 import { Orgs } from './pages/Orgs'
+import { AdminAudit } from './pages/AdminAudit'
 import { Access } from './pages/Access'
 import { Trace } from './pages/Trace'
 import { Portfolio } from './pages/Portfolio'
@@ -59,6 +60,7 @@ export default function App() {
             <Route path="/reports" element={<DayReports />} />
             <Route path="/admin/users" element={<Users />} />
             <Route path="/admin/orgs" element={<Orgs />} />
+            <Route path="/admin/audit" element={<AdminAudit />} />
             <Route path="/access" element={<Access />} />
             <Route path="/guide" element={<KB />} />
             <Route path="/trace" element={<Trace />} />

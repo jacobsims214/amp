@@ -293,12 +293,12 @@ function OrgDetail({ org, isGlobalAdmin, meId, onChanged }: {
       {tab === 'webhooks' && (
         <div className="space-y-3">
           <p className="text-xs text-ink-2 leading-relaxed">
-            Org webhooks fire for every project in {org.name}. Pick "Audit log entries" to stream membership, access, and deletion changes to a SIEM or a Slack channel.
+            Org webhooks fire for every project in {org.name}. Pick "Audit log entries" to stream this org's audit entries to a SIEM or a Slack channel. Sign-ins, accounts and API tokens belong to no org: global admins stream those with an instance webhook (Admin › Audit log).
           </p>
           <WebhooksPanel orgId={org.id} canManage={canManage} />
         </div>
       )}
-      {tab === 'audit' && <AuditLogPanel orgId={org.id} />}
+      {tab === 'audit' && <AuditLogPanel orgId={org.id} verify />}
       </div>
 
       {confirmDelete && (

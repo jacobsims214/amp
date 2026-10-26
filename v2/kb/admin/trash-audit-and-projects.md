@@ -22,7 +22,30 @@ can restore it.
 ## Audit log
 
 Every change to access (org, teams, project links, roles, accounts, tokens) and to settings is
-recorded: **Settings → Audit log** for a project, or `amp_audit_log`.
+recorded, and so are refused attempts (`outcome: denied`). Where to read it:
+
+- **Admin → Audit log** for global admins (every entry), **Teams & orgs → Audit log** for org
+  owners and admins, **Settings → Audit log** for project owners, or `amp_audit_log`.
+- Each entry shows who (person, agent or AMP), the action and its outcome, the client (web,
+  MCP, API...) and the source address. Open an entry for the user agent, sign-in method, request
+  id, target, the before/after of a change field by field, and its place in the chain.
+- **Filters:** action (or a prefix like `plan.`), outcome, actor email, actor type, client, IP
+  address or CIDR (`203.0.113.0/24`), target type and id, project, and a time range. REST and
+  `amp_audit_log` take the same names: `action`, `outcome`, `actor`, `actor_type`, `client`,
+  `ip`, `target_type`, `target_id`, `project_id`, `from`, `to` (RFC 3339 or a date; `to` is
+  exclusive, and a date means the end of that day, UTC).
+
+### Exporting
+
+**CSV** and **NDJSON** next to the filters download every entry the filters select, not just
+the loaded pages (`GET /api/audit/export?format=csv|ndjson&<filters>`, same access as reading).
+The export is streamed, so there is no row limit, and each export is itself recorded as an
+`audit.export` entry with its filter and row count.
+
+- NDJSON has one entry per line, exactly as the API and webhooks send it.
+- CSV has one flat row per entry. `details`, `before` and `after` are JSON in their cells.
+- A CSV cell that a spreadsheet would run as a formula (starting with `=`, `+`, `-` or `@`) gets
+  a leading `'`. User agents and summaries can be chosen by whoever made the request.
 
 ### Append-only and tamper-evident
 
@@ -108,6 +131,27 @@ Restoring the database:
 
 Projects and orgs can send events to your own endpoints (**Settings → Webhooks**), e.g. to post
 completions into Slack or update another tracker.
+
+**Streaming the audit log to a SIEM.** An org webhook with "Audit log entries" receives that
+org's entries. Sign-ins, accounts and API tokens belong to no org. To stream those too, a global
+admin adds an **instance webhook** (**Admin → Audit log → Stream to a SIEM**, or
+`POST /api/webhooks`). Instance webhooks:
+
+- receive every audit entry of the whole AMP, and audit entries only;
+- send JSON with every audit field.
+
+Any webhook can also send one **auth header** for collectors that want a static token, such as
+Splunk HEC (`Authorization: Splunk <token>`) or Datadog (`DD-API-KEY: <key>`). The header:
+
+- is set as `"auth_header": "Name: value"`;
+- can't be read back, logged or recorded: the audit entry keeps only its name;
+- is sent only to https URLs;
+- must be entered again when the webhook's URL changes;
+- can't replace a header AMP sets (`X-AMP-*`, `Content-Type`, `Host`...).
+
+Deliveries are still signed (`X-AMP-Signature`). Webhook URLs can't point at private, loopback,
+link-local, CGNAT or NAT64 addresses. AMP checks this when the URL is saved and again on every
+connection, and never follows redirects.
 
 Audit entries reach webhooks through a database outbox (`audit_outbox`). The trigger that
 chains an entry also queues it, so an entry is delivered at least once, even if amp-api restarts

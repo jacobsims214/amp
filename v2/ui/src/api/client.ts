@@ -4,9 +4,10 @@ import type {
   CreateEpicRequest, UpdateEpicRequest, CreateStoryRequest, UpdateStoryRequest, CreateTaskRequest, UpdateTaskRequest,
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
-  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
+  Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
   ApproveRequest, ApproveResponse, ApproveResult,
 } from '../types'
+import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 
 const BASE = '/api'
 
@@ -76,8 +77,9 @@ async function del<T = void>(path: string): Promise<T> {
   return res.json().catch(() => undefined) as Promise<T>
 }
 
+// Org, project, or (neither) instance webhooks.
 const webhookBase = (scope: { orgId?: number; projectId?: number }) =>
-  scope.orgId ? `/orgs/${scope.orgId}/webhooks` : `/projects/${scope.projectId}/webhooks`
+  scope.orgId ? `/orgs/${scope.orgId}/webhooks` : scope.projectId ? `/projects/${scope.projectId}/webhooks` : '/webhooks'
 
 // The API accepts users as an email or numeric id, always sent as a string.
 const userRef = (user: string | number) => String(user)
@@ -367,16 +369,14 @@ export const api = {
   revokeToken: (tokenId: number) => del(`/tokens/${tokenId}`),
 
   // Audit log: global admins any; org admins pass orgId; project owners projectId
-  audit: (q: { orgId?: number; projectId?: number; actorId?: number; action?: string; before?: number; limit?: number }) => {
-    const p = new URLSearchParams()
-    if (q.orgId) p.set('org_id', String(q.orgId))
-    if (q.projectId) p.set('project_id', String(q.projectId))
-    if (q.actorId) p.set('actor_id', String(q.actorId))
-    if (q.action) p.set('action', q.action)
-    if (q.before) p.set('before', String(q.before))
-    if (q.limit) p.set('limit', String(q.limit))
+  audit: (q: AuditScope & { filter?: AuditFilter; action?: string; before?: number; limit?: number }) => {
+    const f: AuditFilter = { ...q.filter }
+    if (q.action && !f.action) f.action = q.action
+    const p = auditQuery(q, f, { before: q.before, limit: q.limit })
     return get<{ entries: AuditEntry[] | null }>(`/audit?${p}`).then(r => r.entries ?? [])
   },
+  // The hash chain check: org admins pass orgId; global admins may omit it (every chain)
+  auditVerify: (orgId?: number) => get<AuditVerifyReport>(auditVerifyUrl(orgId).slice(BASE.length)),
 
   // Webhooks
   listWebhooks: (scope: { orgId?: number; projectId?: number }) =>
