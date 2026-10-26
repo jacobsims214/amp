@@ -18,6 +18,9 @@
 //!   (`disconnected`, `revoked`, `policy_off`).
 //! - `slow <ms>`: every MCP call waits that long (a busy run, for the queue); `slow 0` undoes it.
 //! - `events`: the accepted event ops, one per line.
+//! - `down on|off`: the relay service goes down (Envoy's `503`) or comes back; `expire`: the
+//!   session's connect tokens lapse; `stream`: whether the command stream is open; `session`: the
+//!   latest session id; `ended <id>`: how that session ended, or `none` (#2424).
 //! - `quit`.
 //!
 //! `AMP_REMOTE_RIG_REFUSE=404|403` answers every register with 404, or 403 `remote_disabled`;
@@ -394,6 +397,24 @@ async fn main() {
                 b.mock.end_session(arg.trim());
                 say("ENDED");
             }
+            // #2424: an outage of the relay service (Envoy's 503s) and tokens that lapse in it.
+            "down" => {
+                b.mock.set_down(arg.trim() != "off");
+                say(format!("DOWN {}", arg.trim() != "off"));
+            }
+            "expire" => {
+                b.mock.expire_tokens();
+                say("EXPIRED");
+            }
+            "stream" => say(format!("STREAM {}", b.mock.stream_open())),
+            "session" => say(format!(
+                "SESSION {}",
+                b.mock.session_id().unwrap_or_else(|| "none".into())
+            )),
+            "ended" => say(format!(
+                "ENDED_OF {}",
+                b.mock.ended_of(arg.trim()).unwrap_or_else(|| "none".into())
+            )),
             "events" => {
                 for e in b.mock.events() {
                     say(format!("EVENT {} {}", e["op"], e["body"]["type"]));

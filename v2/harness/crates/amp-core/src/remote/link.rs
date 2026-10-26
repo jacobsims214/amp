@@ -2203,8 +2203,8 @@ impl Actor {
         *lock(&self.link.shared.control) = None;
         let text = match reason {
             "idle" => format!(
-                "Remote control turned off after {} without remote activity (the organization's \
-                 limit).",
+                "Remote control turned off after {} without remote activity. That is the \
+                 organization's limit.",
                 human_duration(self.idle_timeout_ms.unwrap_or(0))
             ),
             "expired" => format!(
