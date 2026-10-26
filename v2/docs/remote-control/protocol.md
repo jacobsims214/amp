@@ -1037,7 +1037,7 @@ Clients MUST treat an unknown `code` as a generic failure of that HTTP status. N
 | Event envelope | ≤ 1 048 576 bytes | harness, relay, browser |
 | Event batch | ≤ 64 envelopes and ≤ 2 MiB | relay |
 | Event bytes per session | 2 MiB/s, burst 8 MiB (`429 rate_limited`) | relay |
-| Viewer queue | 512 frames and 4 MiB per viewer; 64 MiB for all viewers on one relay replica. A viewer past either is dropped and resumes with `Last-Event-ID` | relay |
+| Viewer queue | 512 frames and 4 MiB per viewer; 16 MiB for all the viewers of one person's sessions on one relay replica; 64 MiB for all viewers on one relay replica. A viewer past any of them is dropped and resumes with `Last-Event-ID`. The per-person bound keeps one person's stalled viewers from using up the replica's and getting other people's viewers dropped (#2398) | relay |
 | Stream write | 30 s per write; a client that stops reading is dropped | relay |
 | `tool_start.arguments_json` / `tool_end.text` / deltas | ≤ 16 KiB / 32 KiB / 16 KiB | harness |
 | Register and pair request bodies | ≤ 8 KiB | relay |
@@ -1084,6 +1084,10 @@ harness sends don't count.
   running nobody can reach a harness. amp-relay never migrates the database: it waits for amp-api's
   remote control migration. Its replicas join the same replica group (`api_nodes`) as amp-api's, which is
   how relay replicas find a session's holder and how amp-api reaches it, but they never run project actors.
+  Each `api_nodes` row records the database role that registered it (`registered_by`, filled by Postgres).
+  Row-level security lets the relay's role write only its own rows, and amp-api sends its cluster token only
+  to project owners registered by amp-api's role, so a compromised relay can't point an amp-api replica's
+  address at itself to receive that token (#2398).
 - The ring lives only in the memory of the relay replica that holds the harness connection. It is **never** written to
   Postgres, the logs or traces, and it is dropped when the session ends.
 - **Multiple replicas.** The `remote_sessions` row names the replica that holds the session (`holder_node`):

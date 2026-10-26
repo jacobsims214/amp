@@ -1,14 +1,18 @@
 package relay
 
 // Unit checks for the #2390 hardening: the forwarded request carries no
-// caller credentials (L3), and the byte bounds on stream queues (M2).
+// caller credentials (L3), and the byte bounds on stream queues (M2,
+// and the per-person bound from #2398).
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/simstech/amp-api/internal/domain"
 )
 
 type fakeCluster struct{}
@@ -64,7 +68,7 @@ func TestForwardStripsCallerCredentials(t *testing.T) {
 
 func TestStreamByteBounds(t *testing.T) {
 	shared := newByteBudget(6 << 20)
-	a, b := newViewerStream(shared), newViewerStream(shared)
+	a, b := newViewerStream(nil, shared), newViewerStream(nil, shared)
 	big := frame{event: "envelope", data: make([]byte, 1<<20)}
 	n := 0
 	for a.send(big) {
@@ -110,5 +114,71 @@ func TestBucketTakeN(t *testing.T) {
 	}
 	if ok, _ := b.takeN(now.Add(time.Second), 2<<20); !ok {
 		t.Fatal("refilled bucket refused")
+	}
+}
+
+// One person's stalled viewers (#2398, re-review N1): 5 sessions with 3
+// viewers each that never read. A dropped viewer keeps its queued bytes until
+// its handler's write deadline (30 s), and re-attaching is allowed, so she can
+// keep piling up stalled viewers. They fill her own bound, not the replica's,
+// so another person's viewer keeps getting frames and is never dropped.
+func TestUserBoundKeepsOtherViewers(t *testing.T) {
+	shared := newByteBudget(DefaultQueuedBytes)
+	users := newUserBudgets(DefaultUserQueuedBytes)
+	const alice, bob = 1, 2
+	big := frame{event: "envelope", data: make([]byte, 900<<10)}
+
+	var hers []*Live
+	for i := 0; i < 5; i++ {
+		hers = append(hers, newLive(&domain.RemoteSession{ID: fmt.Sprintf("rs_alice%d", i), OwnerUserID: alice}))
+	}
+	his := newLive(&domain.RemoteSession{ID: "rs_bob", OwnerUserID: bob})
+	reader := newViewerStream(users.acquire(bob), shared)
+	his.viewers[reader] = struct{}{}
+
+	// Three rounds of: attach 3 stalled viewers to each of her sessions, and
+	// post until every one of them is dropped. Nothing reads or drains them.
+	for round := 0; round < 3; round++ {
+		for _, l := range hers {
+			for j := 0; j < MaxViewers; j++ {
+				l.viewers[newViewerStream(users.acquire(alice), shared)] = struct{}{}
+			}
+		}
+		for n := 0; n < 10; n++ {
+			for _, l := range hers {
+				l.broadcast(big)
+			}
+		}
+		for _, l := range hers {
+			if len(l.viewers) != 0 {
+				t.Fatalf("alice's stalled viewers weren't all dropped: %d left", len(l.viewers))
+			}
+		}
+	}
+	if got := users.used(alice); got > DefaultUserQueuedBytes {
+		t.Fatalf("alice holds %d bytes, over her bound", got)
+	}
+
+	// Bob's viewer reads as it goes: it gets every frame and stays.
+	for i := 0; i < 20; i++ {
+		his.broadcast(big)
+		if _, ok := his.viewers[reader]; !ok {
+			t.Fatalf("bob's reading viewer was dropped at frame %d (replica holds %d bytes, alice %d)", i, shared.Used(), users.used(alice))
+		}
+		reader.dequeued(<-reader.ch)
+	}
+}
+
+func TestUserBudgetsRelease(t *testing.T) {
+	u := newUserBudgets(10)
+	a, b := u.acquire(7), u.acquire(7)
+	if a != b || !a.reserve(6) || a.reserve(6) {
+		t.Fatal("one person's viewers don't share one bound")
+	}
+	a.release(6)
+	u.release(7)
+	u.release(7)
+	if len(u.m) != 0 {
+		t.Fatal("the bound outlived the person's last viewer")
 	}
 }

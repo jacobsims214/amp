@@ -1,0 +1,15 @@
+-- Which database role registered each replica (AMP #2398, re-review #2394 N2).
+--
+-- amp-relay registers its replicas in api_nodes too, as its own
+-- least-privilege role (amp_relay, #2392). amp-api sends its own cluster
+-- token to the address of a project's owner, so amp-api must only ever use
+-- rows amp-api registered, and amp-relay must not be able to change them.
+-- registered_by is filled by the database (current_user), so a client can't
+-- choose it; GrantRelayRole adds row-level security that keeps the relay's
+-- role to rows registered_by itself, and amp-api only forwards to owners
+-- registered_by its own role (repository.ClaimProject).
+--
+-- Additive and idempotent. Existing rows get the role running this
+-- migration (amp-api's); a relay replica restarted with the new image
+-- registers under a new id, and old rows are pruned after an hour.
+ALTER TABLE api_nodes ADD COLUMN IF NOT EXISTS registered_by TEXT NOT NULL DEFAULT current_user;
