@@ -16,7 +16,17 @@
 //     left, skipping trusted addresses; the first untrusted address is the
 //     client. A value the client made up sits to the left of the address
 //     the first trusted proxy appended, so the walk never reaches it.
-//   - If every address is trusted, the leftmost one examined is the client.
+//   - Trusted prefixes come in two kinds (#2440, review #2432 H3). An
+//     internal prefix (private, loopback, link-local or CGNAT space: the pod
+//     CIDR, Traefik's and Envoy's pods) may be skipped any number of times.
+//     A public prefix is an edge (Cloudflare) and at most ONE edge hop is
+//     skipped: the entry before the first edge hop is the client, whatever
+//     it is, even when it is itself in an edge range. Cloudflare Workers and
+//     WARP egress from Cloudflare's own ranges and can send any
+//     X-Forwarded-For, so skipping every Cloudflare address would let any
+//     Cloudflare customer choose the recorded IP; with one hop, such a
+//     caller is recorded as its own Cloudflare egress address.
+//   - If every address examined is skipped, the leftmost one is the client.
 //   - An entry that isn't an IP address stops the walk, and the last trusted
 //     hop is the client.
 //
@@ -95,12 +105,51 @@ func FromContext(ctx context.Context) (*Info, bool) {
 
 // Resolver resolves client addresses. The zero value trusts nothing.
 type Resolver struct {
-	trusted []netip.Prefix
+	internal []netip.Prefix // skipped any number of times
+	edge     []netip.Prefix // at most one hop is skipped
 }
 
-// NewResolver returns a resolver that trusts the given proxy prefixes.
+// NewResolver returns a resolver that trusts the given proxy prefixes,
+// sorted into internal and edge prefixes by IsInternalPrefix.
 func NewResolver(trusted []netip.Prefix) *Resolver {
-	return &Resolver{trusted: append([]netip.Prefix(nil), trusted...)}
+	r := &Resolver{}
+	for _, p := range trusted {
+		if IsInternalPrefix(p) {
+			r.internal = append(r.internal, p)
+		} else {
+			r.edge = append(r.edge, p)
+		}
+	}
+	return r
+}
+
+// internalSpace is the address space a trusted proxy may sit in and still
+// count as internal: private (RFC 1918, fc00::/7), loopback, link-local and
+// shared/CGNAT space (100.64.0.0/10, used as a pod CIDR by some clusters).
+// No CDN edge egresses from these.
+var internalSpace = []netip.Prefix{
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("::1/128"),
+	netip.MustParsePrefix("fe80::/10"),
+}
+
+// IsInternalPrefix reports whether every address of p lies in internal
+// address space. A prefix that reaches outside it (a Cloudflare range, or a
+// too-wide private one such as 10.0.0.0/7) is an edge prefix.
+func IsInternalPrefix(p netip.Prefix) bool {
+	p = p.Masked()
+	for _, s := range internalSpace {
+		if s.Bits() <= p.Bits() && s.Contains(p.Addr()) {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseTrusted parses a comma- or whitespace-separated list of CIDRs and
@@ -140,7 +189,10 @@ func ResolverFromEnv() (*Resolver, error) {
 	if len(trusted) == 0 {
 		slog.Info(EnvTrustedProxies + " is empty: audit rows record each request's TCP peer as its client IP")
 	} else {
-		slog.Info("trusted proxies for client IP resolution", "prefixes", len(trusted))
+		r := NewResolver(trusted)
+		slog.Info("trusted proxies for client IP resolution", "prefixes", len(trusted),
+			"internal", len(r.internal), "edge_one_hop", len(r.edge))
+		return r, nil
 	}
 	return NewResolver(trusted), nil
 }
@@ -157,18 +209,35 @@ func FromEnv() *Resolver {
 	return r
 }
 
-// Trusted reports whether a is one of the trusted proxies.
+// Trusted reports whether a is one of the trusted proxies, internal or edge.
 func (r *Resolver) Trusted(a netip.Addr) bool {
+	return r.kind(a) != hopClient
+}
+
+type hopKind int
+
+const (
+	hopClient hopKind = iota
+	hopInternal
+	hopEdge
+)
+
+func (r *Resolver) kind(a netip.Addr) hopKind {
 	if r == nil || !a.IsValid() {
-		return false
+		return hopClient
 	}
 	a = a.Unmap().WithZone("")
-	for _, p := range r.trusted {
+	for _, p := range r.internal {
 		if p.Contains(a) {
-			return true
+			return hopInternal
 		}
 	}
-	return false
+	for _, p := range r.edge {
+		if p.Contains(a) {
+			return hopEdge
+		}
+	}
+	return hopClient
 }
 
 // ClientIP resolves the client address from the TCP peer (an http.Request's
@@ -180,9 +249,11 @@ func (r *Resolver) ClientIP(remoteAddr string, xff []string) (ip netip.Addr, rea
 	if !ok {
 		return netip.Addr{}, "unparseable remote address"
 	}
-	if !r.Trusted(peer) {
+	k := r.kind(peer)
+	if k == hopClient {
 		return peer, ""
 	}
+	edgeSeen := k == hopEdge
 	hops := splitXFF(xff)
 	last := peer
 	for i := len(hops) - 1; i >= 0; i-- {
@@ -191,8 +262,16 @@ func (r *Resolver) ClientIP(remoteAddr string, xff []string) (ip netip.Addr, rea
 			return last, "" // garbage: stop at the last trusted hop
 		}
 		a = a.Unmap().WithZone("")
-		if !r.Trusted(a) {
+		if edgeSeen {
+			// The edge appended this entry: it is the client, whatever it
+			// is (a Worker or WARP caller is in an edge range itself).
 			return a, ""
+		}
+		switch r.kind(a) {
+		case hopClient:
+			return a, ""
+		case hopEdge:
+			edgeSeen = true
 		}
 		last = a
 	}

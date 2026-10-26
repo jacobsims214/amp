@@ -3,6 +3,7 @@ package reqctx
 import (
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 )
@@ -210,5 +211,68 @@ func TestClip(t *testing.T) {
 	}
 	if got := Clip("ééé", 5); got != "éé" {
 		t.Errorf("Clip cut inside a rune: %q", got)
+	}
+}
+
+// H3 (#2440, review #2432): Cloudflare Workers and WARP egress from
+// Cloudflare's own ranges and can send any X-Forwarded-For. Pod-CIDR hops
+// are skipped any number of times, but at most ONE edge (public) hop: the
+// entry before the first edge hop is the client, even if it is in an edge
+// range itself.
+func TestClientIP_AtMostOneEdgeHop(t *testing.T) {
+	cases := []struct {
+		name   string
+		remote string
+		xff    []string
+		want   string
+	}{
+		// A Worker (egress 104.24.x, inside Cloudflare's 104.24.0.0/14) calls
+		// amp through Cloudflare with a forged XFF. Cloudflare appends the
+		// Worker's egress, Traefik the edge, Envoy Traefik's pod:
+		// [forged, worker, cf-edge, traefik]. Skipping every Cloudflare hop
+		// returned the forged 6.6.6.6.
+		{"forged chain from a Worker records the Worker", "10.244.0.12:40000",
+			[]string{"6.6.6.6, 104.24.5.6, 173.245.48.10, 10.244.1.5"}, "104.24.5.6"},
+		{"forged chain from a Worker, forged entry in a Cloudflare range", "10.244.0.12:40000",
+			[]string{"6.6.6.6, 104.24.9.9, 104.24.5.6, 173.245.48.10, 10.244.1.5"}, "104.24.5.6"},
+		{"a caller egressing from another Cloudflare range is its own egress", "10.244.0.12:40000",
+			[]string{"6.6.6.6, 104.16.1.2, 173.245.48.10, 10.244.1.5"}, "104.16.1.2"},
+		{"v6 Worker egress is the client", "10.244.0.12:40000",
+			[]string{"2001:db8::66, 2400:cb00::99, 2400:cb00::7, 10.244.1.5"}, "2400:cb00::99"},
+		// Any number of internal hops before the edge.
+		{"several pod hops, then one edge", "10.244.0.12:40000",
+			[]string{"203.0.113.7, 173.245.48.10, 10.244.2.2, 10.244.1.5"}, "203.0.113.7"},
+		// After the edge hop the next entry is the client whatever it is.
+		{"a private address before the edge is the client", "10.244.0.12:40000",
+			[]string{"6.6.6.6, 10.244.9.9, 173.245.48.10, 10.244.1.5"}, "10.244.9.9"},
+		// The edge as the TCP peer counts as the one edge hop.
+		{"edge peer: the last XFF entry is the client", "173.245.48.10:443",
+			[]string{"6.6.6.6, 104.24.5.6"}, "104.24.5.6"},
+		{"edge peer, no header: the edge", "173.245.48.10:443", nil, "173.245.48.10"},
+		{"only an edge hop: the edge", "10.244.0.12:40000",
+			[]string{"173.245.48.10, 10.244.1.5"}, "173.245.48.10"},
+		{"garbage right after the edge stops at the edge", "10.244.0.12:40000",
+			[]string{"6.6.6.6, junk, 173.245.48.10, 10.244.1.5"}, "173.245.48.10"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, reason := mustResolver(t, prodTrusted+" 104.24.0.0/14 104.16.0.0/13").ClientIP(c.remote, c.xff)
+			if got.String() != c.want || reason != "" {
+				t.Fatalf("ClientIP(%q, %q) = %v (%q), want %s", c.remote, c.xff, got, reason, c.want)
+			}
+		})
+	}
+}
+
+func TestIsInternalPrefix(t *testing.T) {
+	for p, want := range map[string]bool{
+		"10.244.0.0/16": true, "10.0.0.0/8": true, "172.16.0.0/12": true, "192.168.8.0/24": true,
+		"100.64.0.0/10": true, "127.0.0.1/32": true, "fd00::/8": true, "::1/128": true,
+		"10.0.0.0/7": false, "173.245.48.0/20": false, "104.24.0.0/14": false,
+		"2400:cb00::/32": false, "0.0.0.0/0": false, "203.0.113.7/32": false,
+	} {
+		if got := IsInternalPrefix(netip.MustParsePrefix(p)); got != want {
+			t.Errorf("IsInternalPrefix(%s) = %v, want %v", p, got, want)
+		}
 	}
 }
