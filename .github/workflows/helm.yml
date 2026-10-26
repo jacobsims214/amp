@@ -34,3 +34,5 @@ jobs:
         run: python3 -m pip install --user pyyaml
       - name: relay on/off template tests + envoy validate
         run: python3 v2/deploy/helm/test_relay_chart.py --envoy-validate
+      - name: client IP template tests (audit log, AMP #2430/#2433) + envoy validate
+        run: python3 v2/deploy/helm/test_client_ip_chart.py --envoy-validate

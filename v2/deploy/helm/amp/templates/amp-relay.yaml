@@ -67,6 +67,9 @@ spec:
               valueFrom: { fieldRef: { fieldPath: status.podIP } }
             - name: RELAY_ADDR
               value: ":3002"
+            # The client IP in the remote.* audit entries (#2433): the same
+            # trusted hops as amp-api, since Envoy routes /relay/ here too.
+            {{- include "amp.trustedProxiesEnv" . | nindent 12 }}
             # Relay replicas pass a session's requests to the replica holding
             # it on this port, and amp-api calls it to end sessions, with the
             # relay's own cluster token. Not routed by Envoy; the

@@ -5,8 +5,8 @@
 # cluster could call amp-api directly and forge the client IP in the audit
 # log. Envoy is the only way in, so only Envoy's pods may open the public
 # ports; amp-api's replica-to-replica port (3003) admits only amp-api; and
-# only networkPolicy.envoyFrom may reach Envoy (see the last policy). On
-# remote-m1, the relay has its own policy (relay.networkPolicy).
+# only networkPolicy.envoyFrom may reach Envoy (see the last policy).
+# The relay has its own policy (relay.networkPolicy).
 #
 # Not affected: kubelet probes (from the node, not a pod) and
 # `kubectl port-forward` (it enters the pod's own network namespace).

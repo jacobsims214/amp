@@ -6,7 +6,8 @@ KB decisions/audit-log-v2.md, section 2:
   X-Forwarded-For (use_remote_address: true), trusts no earlier hop
   (xff_num_trusted_hops: 0), treats no address as internal (an explicit,
   empty internal_address_config) and never keeps a client-sent request id.
-- amp-api, authadmin and mcpoauth get AMP_TRUSTED_PROXIES from
+- amp-api, authadmin, mcpoauth (and amp-relay when relay.enabled, #2433)
+  get AMP_TRUSTED_PROXIES from
   clientIP.trustedProxies: nothing locally; the pod CIDR plus
   Cloudflare's ranges in values-production.yaml. Every entry parses as a
   CIDR or an address (the services trust nothing if one doesn't). Locally
@@ -110,8 +111,12 @@ def test_envoy(docs, label):
         check(hcm.get("generate_request_id") is True, f"{label}/{name}: generate_request_id must be true")
 
 
-def test_trusted(docs, label, want):
-    for dep in ("amp-api", "amp-authadmin", "amp-mcpoauth"):
+def test_trusted(docs, label, want, relay=False):
+    deps = ["amp-api", "amp-authadmin", "amp-mcpoauth"]
+    if relay:
+        # amp-relay's public listener records remote.* entries (#2433).
+        deps.append("amp-relay")
+    for dep in deps:
         v = env_value(docs, dep, "AMP_TRUSTED_PROXIES")
         check(v is not None, f"{label}: {dep} has no AMP_TRUSTED_PROXIES")
         if v is None:
@@ -222,6 +227,11 @@ def main():
         test_trusted(docs, label, want)
         test_policies(docs, label)
         test_envoy_policy(docs, label, envoy_from)
+    relay_on = ["--set", "relay.enabled=true"]
+    relay_prod = ["-f", os.path.join(CHART, "values-production.yaml"), *relay_on,
+                  "--set", "relay.database.existingSecret=relay-db", "--set", "relay.clusterToken.existingSecret=relay-token"]
+    for label, args, want in (("local, relay on", relay_on, []), ("production, relay on", relay_prod, prod)):
+        test_trusted(render(*args), label, want, relay=True)
     docs = render("--set", "networkPolicy.enabled=false")
     test_policies(docs, "policies off", enabled=False)
     if "--envoy-validate" in sys.argv:
