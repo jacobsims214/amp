@@ -1,17 +1,16 @@
 {{- if .Values.networkPolicy.enabled }}
-# Who may reach AMP's own services (#2430). The services trust
-# X-Forwarded-For only from clientIP.trustedProxies, which includes the pod
-# CIDR (Traefik's and Envoy's pods). Without these policies any pod in the
-# cluster could call amp-api directly and forge the client IP in the audit
-# log. Envoy is the only way in, so only Envoy's pods may open the public
-# ports; amp-api's replica-to-replica port (3003) admits only amp-api; and
-# only networkPolicy.envoyFrom may reach Envoy (see the last policy).
-# The relay has its own policy (relay.networkPolicy).
+# Who may reach AMP's own services (#2430, #2469). The services believe the
+# client address Envoy sends (X-Amp-Client-Ip) from clientIP.trustedProxies,
+# so nothing but Envoy may open their public ports: otherwise a pod that
+# could call amp-api directly from a trusted address could choose the client
+# IP in the audit log. amp-api's replica-to-replica port (3003) admits only
+# amp-api. The relay has its own policy (relay.networkPolicy).
 #
-# Not affected: kubelet probes (from the node, not a pod) and
-# `kubectl port-forward` (it enters the pod's own network namespace).
-# Egress is not limited. Needs a CNI that enforces NetworkPolicy (Cilium in
-# production, kindnet on docker-desktop); without one these are inert.
+# These select only this chart's own pods by their labels, so they assume
+# nothing about what sits in front of Envoy. Not affected: kubelet probes
+# (from the node, not a pod) and `kubectl port-forward` (it enters the pod's
+# own network namespace). Egress is not limited. They need a CNI that
+# enforces NetworkPolicy; without one they are inert.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -78,27 +77,27 @@ spec:
               app: envoy
       ports:
         - { protocol: TCP, port: 8091 }
+{{- with .Values.networkPolicy.envoyIngress }}
+{{- if .enabled }}
 ---
-# Who may reach Envoy itself. Envoy appends its TCP peer to X-Forwarded-For
-# and the services trust the whole pod CIDR, so a pod that could call Envoy
-# directly would be a trusted hop and could put any address to its left.
-# Only the ingress controller in front of Envoy (networkPolicy.envoyFrom:
-# Traefik in production) may open Envoy's listeners. Empty (docker-desktop):
-# no pod may; `kubectl port-forward` and the kubelet's readiness probe on
-# the admin port don't go through the pod network and still work.
+# Who may reach Envoy itself (networkPolicy.envoyIngress, off by default).
+# What sits in front of Envoy is the deployment's choice, so the peers come
+# from values (NetworkPolicyPeers: namespace/pod selectors and/or ipBlocks).
+# Enabled with an empty list: no pod or address may open Envoy's listeners
+# (`kubectl port-forward` and the kubelet's probes still work).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: envoy
-  namespace: {{ .Values.global.namespace }}
+  namespace: {{ $.Values.global.namespace }}
   labels:
-    {{- include "amp.componentLabels" (dict "component" "envoy" "Release" .Release) | nindent 4 }}
+    {{- include "amp.componentLabels" (dict "component" "envoy" "Release" $.Release) | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
       app: envoy
   policyTypes: [Ingress]
-  {{- with .Values.networkPolicy.envoyFrom }}
+  {{- with .from }}
   ingress:
     - from:
         {{- toYaml . | nindent 8 }}
@@ -108,4 +107,6 @@ spec:
   {{- else }}
   ingress: []
   {{- end }}
+{{- end }}
+{{- end }}
 {{- end }}

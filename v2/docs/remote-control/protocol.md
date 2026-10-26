@@ -1101,9 +1101,9 @@ harness sends don't count.
 **Keepalives and proxies (#2424).** With no session limit a stream can stay open for days, so every hop must
 keep it. The relay writes `: ka` every 20 s on both streams and the harness posts a heartbeat every 20 s, well
 inside Envoy's 120 s stream idle timeout (#2399). Keepalives can't help with a proxy that caps a whole request:
-Traefik v3's entry point `respondingTimeouts.readTimeout` defaults to 60 s and cuts SSE streams, so set it to 0
-in front of AMP (KB how-to/remote-control-local-test.md). Anything else in front of Envoy must not cut a stream
-that is quiet for less than 60 s. When a hop cuts one anyway (Envoy's 12 h
+whatever runs in front of Envoy is the deployment's choice, and it must not cut a stream that is quiet for less
+than 60 s. For example, Traefik v3's entry point `respondingTimeouts.readTimeout` defaults to 60 s and cuts SSE
+streams, so a deployment that puts Traefik in front of AMP sets it to 0 (KB how-to/remote-control-local-test.md). When a hop cuts one anyway (Envoy's 12 h
 `max_stream_duration`, a proxy restart), the harness and the browser reopen it at once.
 
 ## 11. Buffering, resume and presence

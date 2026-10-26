@@ -37,6 +37,7 @@ data:
                           "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                     route_config:
                       name: amp_routes
+                      {{- include "amp.envoyClientIPHeader" . | nindent 22 }}
                       virtual_hosts:
                         - name: amp
                           domains: ["*"]
@@ -240,6 +241,7 @@ data:
                           "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                     route_config:
                       name: amp_routes
+                      {{- include "amp.envoyClientIPHeader" . | nindent 22 }}
                       virtual_hosts:
                         - name: amp
                           domains: ["*"]

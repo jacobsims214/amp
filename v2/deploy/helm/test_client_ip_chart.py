@@ -1,32 +1,34 @@
 #!/usr/bin/env python3
-"""Helm template tests for the audit log's client IP (AMP #2430).
+"""Helm template tests for the audit log's client IP (AMP #2430, #2469).
 
-KB decisions/audit-log-v2.md, section 2:
-- Every Envoy listener that routes to AMP appends its TCP peer to
-  X-Forwarded-For (use_remote_address: true), trusts no earlier hop
-  (xff_num_trusted_hops: 0), treats no address as internal (an explicit,
-  empty internal_address_config) and never keeps a client-sent request id.
-- amp-api, authadmin, mcpoauth (and amp-relay when relay.enabled, #2433)
-  get AMP_TRUSTED_PROXIES from
-  clientIP.trustedProxies: nothing locally; the pod CIDR plus
-  Cloudflare's ranges in values-production.yaml. Every entry parses as a
-  CIDR or an address (the services trust nothing if one doesn't). Locally
-  (docker-desktop) the list is empty: Envoy's peer through kubectl
-  port-forward is Envoy's own pod address, so trusting the pod CIDR there
-  would only make a forged header believable.
+KB decisions/audit-log-v2.md. AMP's boundary is its own Envoy; whatever sits
+in front of it belongs to the deployment and is described only by values:
+- Every Envoy listener that routes to AMP decides the client from
+  envoy.clientIP: xffNumTrustedHops (default 0, use_remote_address) or
+  trustedCIDRs (Envoy's xff original-IP detection), never both. It treats no
+  address as internal and never keeps a client-sent request id (hop mode).
+- Its amp_routes route config always overwrites X-Amp-Client-Ip with the
+  address Envoy decided (%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%).
+- amp-api, authadmin, mcpoauth (and amp-relay when relay.enabled) get
+  AMP_TRUSTED_PROXIES from clientIP.trustedProxies: empty by default, the
+  pod CIDR in values-production.yaml. Every entry parses as a CIDR.
 - NetworkPolicies admit only Envoy to the public ports of amp-api (3001,
   8000), authadmin (8090) and mcpoauth (8091), and only amp-api to amp-api's
-  replica port (3003). Only networkPolicy.envoyFrom (Traefik in
-  production, no pod locally) may reach Envoy. networkPolicy.enabled=false
-  renders none.
+  replica port (3003). The Envoy policy renders only with
+  networkPolicy.envoyIngress.enabled, with the peers from values.
+  networkPolicy.enabled=false renders none.
+- Nothing in the chart names an ingress controller, CDN or mesh vendor.
 
 Usage (needs helm, PyYAML, and the valkey subchart in deploy/helm/amp/charts,
 e.g. `helm dependency build deploy/helm/amp`):
 
-    python3 v2/deploy/helm/test_client_ip_chart.py [--envoy-validate]
+    python3 v2/deploy/helm/test_client_ip_chart.py [--envoy-validate] [--envoy-run]
 
 --envoy-validate also runs `envoy --mode validate` (Docker image
 envoyproxy/envoy:v1.31-latest) on every rendered Envoy config.
+--envoy-run starts the rendered Envoy in Docker in front of an echo upstream
+and checks which client address reaches the services, including spoofed
+X-Forwarded-For and X-Amp-Client-Ip headers.
 """
 import ipaddress
 import os
@@ -96,19 +98,38 @@ def policy_rules(pol):
     return out
 
 
-def test_envoy(docs, label):
+def test_envoy(docs, label, hops=0, cidrs=None):
     cfg = yaml.safe_load(envoy_yaml(docs))
     hcms = amp_hcms(cfg)
     check(hcms, f"{label}: no listener routes amp_routes")
     for name, hcm in hcms:
-        check(hcm.get("use_remote_address") is True, f"{label}/{name}: use_remote_address must be true")
-        check(hcm.get("xff_num_trusted_hops") == 0, f"{label}/{name}: xff_num_trusted_hops must be 0")
+        if cidrs:
+            check(hcm.get("use_remote_address") is False, f"{label}/{name}: CIDR mode needs use_remote_address false")
+            check("xff_num_trusted_hops" not in hcm, f"{label}/{name}: CIDR mode can't set xff_num_trusted_hops")
+            ext = hcm.get("original_ip_detection_extensions") or []
+            got = None
+            if len(ext) == 1 and ext[0]["name"] == "envoy.extensions.http.original_ip_detection.xff":
+                got = [f"{c['address_prefix']}/{c['prefix_len']}" for c in ext[0]["typed_config"]["xff_trusted_cidrs"]["cidrs"]]
+            check(got == cidrs, f"{label}/{name}: xff_trusted_cidrs = {got}, want {cidrs}")
+        else:
+            check(hcm.get("use_remote_address") is True, f"{label}/{name}: use_remote_address must be true")
+            check(hcm.get("xff_num_trusted_hops") == hops, f"{label}/{name}: xff_num_trusted_hops must be {hops}")
+            check("original_ip_detection_extensions" not in hcm, f"{label}/{name}: hop mode has no detection extension")
         check(hcm.get("skip_xff_append") is False, f"{label}/{name}: skip_xff_append must be false")
         iac = hcm.get("internal_address_config")
         check(iac == {"unix_sockets": False, "cidr_ranges": []},
               f"{label}/{name}: internal_address_config must be explicit and empty, got {iac}")
         check(hcm.get("preserve_external_request_id") is False, f"{label}/{name}: preserve_external_request_id must be false")
         check(hcm.get("generate_request_id") is True, f"{label}/{name}: generate_request_id must be true")
+        add = hcm["route_config"].get("request_headers_to_add")
+        check(add == [{"header": {"key": "x-amp-client-ip", "value": "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT%"},
+                       "append_action": "OVERWRITE_IF_EXISTS_OR_ADD"}],
+              f"{label}/{name}: amp_routes must overwrite x-amp-client-ip with Envoy's decision, got {add}")
+
+
+def render_fails(*args):
+    p = subprocess.run(["helm", "template", "amp", CHART, "-n", "amp", *args], capture_output=True, text=True)
+    return p.returncode != 0
 
 
 def test_trusted(docs, label, want, relay=False):
@@ -131,7 +152,11 @@ def test_trusted(docs, label, want, relay=False):
 
 
 def test_envoy_policy(docs, label, want_from):
+    """want_from None: no Envoy policy; [] : one that admits nobody."""
     pol = find(docs, "NetworkPolicy", "envoy")
+    if want_from is None:
+        check(not pol, f"{label}: an Envoy NetworkPolicy rendered without networkPolicy.envoyIngress.enabled")
+        return
     check(pol, f"{label}: no NetworkPolicy envoy")
     if not pol:
         return
@@ -175,7 +200,12 @@ def test_policies(docs, label, enabled=True):
               f"{label}: Deployment {dep} pods aren't labelled app={app}")
 
 
-def envoy_validate(label, ev):
+def envoy_image(docs):
+    dep = find(docs, "Deployment", "envoy")
+    return dep[0]["spec"]["template"]["spec"]["containers"][0]["image"]
+
+
+def envoy_validate(label, ev, image=ENVOY_IMAGE):
     with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(__file__))) as d:
         path = os.path.join(d, "envoy.yaml")
         with open(path, "w") as f:
@@ -190,13 +220,13 @@ def envoy_validate(label, ev):
         for p in (path, os.path.join(tls, "tls.crt"), os.path.join(tls, "tls.key")):
             os.chmod(p, 0o644)
         p = subprocess.run(
-            ["docker", "run", "--rm", "-v", f"{d}:/cfg:ro", "-v", f"{tls}:/etc/envoy-tls:ro", ENVOY_IMAGE,
+            ["docker", "run", "--rm", "-v", f"{d}:/cfg:ro", "-v", f"{tls}:/etc/envoy-tls:ro", image,
              "envoy", "--mode", "validate", "-c", "/cfg/envoy.yaml"],
             capture_output=True, text=True,
         )
         ok = p.returncode == 0 and "OK" in p.stdout
         check(ok, f"{label}: envoy --mode validate failed: {p.stdout[-400:]} {p.stderr[-400:]}")
-        print(f"envoy validate {label}: {'OK' if ok else 'FAILED'}")
+        print(f"envoy validate {label} ({image}): {'OK' if ok else 'FAILED'}")
 
 
 def prod_values():
@@ -204,39 +234,199 @@ def prod_values():
         return yaml.safe_load(f)
 
 
+VENDORS = ("cloudflare", "traefik", "istio", "cilium", "calico", "nginx", "alb", "aws", "gke", "azure")
+
+
+def test_no_vendor_assumptions():
+    """Templates may mention a vendor only in a comment that is an example."""
+    tdir = os.path.join(CHART, "templates")
+    for fn in sorted(os.listdir(tdir)):
+        if fn == "cert-issuers.yaml":
+            continue  # its comment names cert-manager DNS-01 provider examples
+        with open(os.path.join(tdir, fn)) as f:
+            for i, line in enumerate(f, 1):
+                low = line.lower()
+                for v in ("cloudflare", "traefik"):
+                    check(v not in low, f"templates/{fn}:{i} mentions {v}: {line.strip()}")
+
+
+# The echo upstream for --envoy-run: answers every request with the
+# headers it got, as JSON. Stands in for every cluster the config routes to.
+ECHO = """
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+class H(BaseHTTPRequestHandler):
+    def _h(self):
+        b = json.dumps({k.lower(): v for k, v in self.headers.items()}).encode()
+        self.send_response(200); self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+    do_GET = do_POST = do_HEAD = _h
+    def log_message(self, *a): pass
+ThreadingHTTPServer(("0.0.0.0", int(__import__("sys").argv[1])), H).serve_forever()
+"""
+
+CLIENT = """
+import json, sys, urllib.request
+req = urllib.request.Request("http://envoy:8080/mcp", headers=json.loads(sys.argv[1]))
+print(urllib.request.urlopen(req, timeout=10).read().decode())
+"""
+
+# envoy.clientIP.trustedCIDRs needs Envoy 1.32+ (the chart's default tag is
+# v1.31-latest), so the CIDR cases render with this tag.
+CIDR_TAG = ["--set", "envoy.tag=" + os.environ.get("ENVOY_CIDR_TAG", "v1.32-latest")]
+
+PY_IMAGE = os.environ.get("PY_IMAGE", "python:3.12-alpine")
+
+
+def docker(*args, check_rc=True):
+    p = subprocess.run(["docker", *args], capture_output=True, text=True)
+    if check_rc and p.returncode != 0:
+        raise RuntimeError(f"docker {' '.join(args[:3])}: {p.stderr[-400:]}")
+    return p.stdout.strip()
+
+
+def envoy_run():
+    """Rendered Envoy (tls off) in front of an echo upstream, in Docker."""
+    import json
+    import time
+    tag = f"amp-ip-{os.getpid()}"
+    net = tag
+    hosts = ["ui", "amp-api", "amp-authadmin", "amp-asynqmon", "amp-mcpoauth", "dex", "oauth2-proxy"]
+    ports = sorted({80, 3001, 8000, 8090, 8091, 8092, 4180, 5556})
+    containers = []
+    with tempfile.TemporaryDirectory(dir=os.path.dirname(os.path.abspath(__file__))) as d:
+        os.chmod(d, 0o755)
+        with open(os.path.join(d, "echo.py"), "w") as f:
+            f.write(ECHO)
+        with open(os.path.join(d, "client.py"), "w") as f:
+            f.write(CLIENT)
+        for fn in ("echo.py", "client.py"):
+            os.chmod(os.path.join(d, fn), 0o644)
+        try:
+            docker("network", "create", net)
+            subnet = json.loads(docker("network", "inspect", net))[0]["IPAM"]["Config"][0]["Subnet"]
+            for port in ports:
+                name = f"{tag}-echo-{port}"
+                aliases = []
+                for h in hosts:
+                    aliases += ["--network-alias", f"{h}.amp.svc.cluster.local"]
+                docker("run", "-d", "--rm", "--name", name, "--network", net, *aliases,
+                       "-v", f"{d}:/t:ro", PY_IMAGE, "python", "/t/echo.py", str(port))
+                containers.append(name)
+
+            def run_case(label, args, sends, want):
+                """sends: request headers; want: X-Amp-Client-Ip at the service, or 'CLIENT' for
+                the client container's own address."""
+                docs = render("--set", "global.tls.enabled=false", *args)
+                ev = envoy_yaml(docs)
+                cfg_path = os.path.join(d, "envoy.yaml")
+                with open(cfg_path, "w") as f:
+                    f.write(ev)
+                os.chmod(cfg_path, 0o644)
+                name = f"{tag}-envoy"
+                docker("rm", "-f", name, check_rc=False)
+                docker("run", "-d", "--rm", "--name", name, "--network", net, "--network-alias", "envoy",
+                       "-v", f"{d}:/cfg:ro", envoy_image(docs), "envoy", "-c", "/cfg/envoy.yaml", "--log-level", "warn")
+                containers.append(name)
+                out = None
+                for _ in range(40):
+                    p = subprocess.run(["docker", "run", "--rm", "--network", net, "-v", f"{d}:/t:ro", PY_IMAGE,
+                                        "sh", "-c", f"hostname -i; python /t/client.py '{json.dumps(sends)}'"],
+                                       capture_output=True, text=True)
+                    if p.returncode == 0:
+                        lines = p.stdout.strip().splitlines()
+                        out = (lines[0].split()[0], json.loads(lines[-1]))
+                        break
+                    time.sleep(0.5)
+                docker("rm", "-f", name, check_rc=False)
+                if out is None:
+                    check(False, f"envoy-run {label}: no answer through Envoy")
+                    return
+                client_ip, seen = out
+                exp = client_ip if want == "CLIENT" else want
+                got = seen.get("x-amp-client-ip")
+                check(got == exp, f"envoy-run {label}: X-Amp-Client-Ip = {got!r}, want {exp!r} (xff {seen.get('x-forwarded-for')!r})")
+                print(f"envoy-run {label}: {'OK' if got == exp else 'FAILED'} (client {client_ip}, X-Amp-Client-Ip {got}, XFF {seen.get('x-forwarded-for')})")
+
+            spoof = {"X-Forwarded-For": "6.6.6.6, 203.0.113.7", "X-Amp-Client-Ip": "6.6.6.6"}
+            run_case("hops 0, no headers", [], {}, "CLIENT")
+            run_case("hops 0 ignores a spoofed XFF and X-Amp-Client-Ip", [], spoof, "CLIENT")
+            run_case("hops 1 takes the rightmost XFF entry", ["--set", "envoy.clientIP.xffNumTrustedHops=1"], spoof, "203.0.113.7")
+            run_case("hops 1 without XFF: the peer", ["--set", "envoy.clientIP.xffNumTrustedHops=1"], {}, "CLIENT")
+            run_case("hops 2 takes the second from the right", ["--set", "envoy.clientIP.xffNumTrustedHops=2"],
+                     {"X-Forwarded-For": "6.6.6.6, 203.0.113.7, 198.51.100.1"}, "203.0.113.7")
+            # CIDR mode. The client container plays the trusted proxy (or a mesh
+            # sidecar, which is Envoy's peer at 127.0.0.6 under Istio).
+            run_case("CIDRs: untrusted peer ignores XFF", [*CIDR_TAG, "--set", "envoy.clientIP.trustedCIDRs={192.0.2.0/24}"],
+                     spoof, "CLIENT")
+            run_case("CIDRs: trusted peer, first untrusted entry from the right",
+                     [*CIDR_TAG, "--set", f"envoy.clientIP.trustedCIDRs={{{subnet}}}"],
+                     {"X-Forwarded-For": "6.6.6.6, 203.0.113.7, 198.51.100.1", "X-Amp-Client-Ip": "6.6.6.6"}, "198.51.100.1")
+            run_case("CIDRs: trusted entries are skipped",
+                     [*CIDR_TAG, "--set", f"envoy.clientIP.trustedCIDRs={{{subnet},198.51.100.0/24}}"],
+                     {"X-Forwarded-For": "6.6.6.6, 203.0.113.7, 198.51.100.1"}, "203.0.113.7")
+            run_case("CIDRs: trusted peer without XFF: the peer", [*CIDR_TAG, "--set", f"envoy.clientIP.trustedCIDRs={{{subnet}}}"],
+                     {}, "CLIENT")
+        finally:
+            for c in containers:
+                docker("rm", "-f", c, check_rc=False)
+            docker("network", "rm", net, check_rc=False)
+
+
 def main():
     pv = prod_values()
     prod = pv["clientIP"]["trustedProxies"]
-    traefik = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "traefik"}},
-                "podSelector": {"matchLabels": {"app.kubernetes.io/name": "traefik"}}}]
-    check(pv["networkPolicy"]["envoyFrom"] == traefik, "production: only Traefik may reach Envoy")
-    check(prod[0] == "10.244.0.0/16", "production: the pod CIDR comes first")
-    check(len([c for c in prod if ":" not in c]) == 16 and len([c for c in prod if ":" in c]) == 7,
-          f"production: want the pod CIDR + 15 Cloudflare v4 + 7 v6 ranges, got {len(prod)}")
+    check(prod == ["10.244.0.0/16"], f"production: services trust Envoy's pod CIDR only, got {prod}")
+    check("clientIP" not in (pv.get("envoy") or {}), "production: envoy.clientIP stays at the chart default")
+    check(pv["networkPolicy"].get("envoyIngress", {}).get("enabled") is False, "production: no Envoy ingress policy")
+    test_no_vendor_assumptions()
+    peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ingress"}},
+              "podSelector": {"matchLabels": {"app.kubernetes.io/name": "my-ingress"}}},
+             {"ipBlock": {"cidr": "192.0.2.0/24"}}]
+    peer_args = ["--set", "networkPolicy.envoyIngress.enabled=true",
+                 "--set-json", f"networkPolicy.envoyIngress.from={__import__('json').dumps(peers)}"]
     cases = [
-        ("local (tls on)", [], [], []),
-        ("local (tls off)", ["--set", "global.tls.enabled=false"], [], []),
-        ("local, walk on", ["--set", "clientIP.trustedProxies={10.244.0.0/16}"], ["10.244.0.0/16"], []),
-        ("production", ["-f", os.path.join(CHART, "values-production.yaml")], prod, traefik),
+        # label, args, trusted, envoy policy peers, hops, cidrs
+        ("local (tls on)", [], [], None, 0, None),
+        ("local (tls off)", ["--set", "global.tls.enabled=false"], [], None, 0, None),
+        ("services trust a pod CIDR", ["--set", "clientIP.trustedProxies={10.244.0.0/16}"], ["10.244.0.0/16"], None, 0, None),
+        ("hops 2", ["--set", "envoy.clientIP.xffNumTrustedHops=2"], [], None, 2, None),
+        ("mesh: CIDRs", [*CIDR_TAG, "--set", "envoy.clientIP.trustedCIDRs={127.0.0.6/32,10.0.0.0/8,fd00::/8,192.0.2.7}",
+                         "--set", "clientIP.trustedProxies={10.244.0.0/16,127.0.0.6}"],
+         ["10.244.0.0/16", "127.0.0.6"], None, 0, ["127.0.0.6/32", "10.0.0.0/8", "fd00::/8", "192.0.2.7/32"]),
+        ("mesh: CIDRs, tls off", [*CIDR_TAG, "--set", "global.tls.enabled=false", "--set", "envoy.clientIP.trustedCIDRs={127.0.0.6/32}"],
+         [], None, 0, ["127.0.0.6/32"]),
+        ("envoy policy with peers", peer_args, [], peers, 0, None),
+        ("envoy policy admitting nobody", ["--set", "networkPolicy.envoyIngress.enabled=true"], [], [], 0, None),
+        ("production", ["-f", os.path.join(CHART, "values-production.yaml")], prod, None, 0, None),
     ]
     rendered = {}
-    for label, args, want, envoy_from in cases:
+    for label, args, want, envoy_from, hops, cidrs in cases:
         docs = render(*args)
-        rendered[label] = envoy_yaml(docs)
-        test_envoy(docs, label)
+        rendered[label] = (envoy_yaml(docs), envoy_image(docs))
+        test_envoy(docs, label, hops, cidrs)
         test_trusted(docs, label, want)
         test_policies(docs, label)
         test_envoy_policy(docs, label, envoy_from)
+    check(render_fails(*CIDR_TAG, "--set", "envoy.clientIP.xffNumTrustedHops=1", "--set", "envoy.clientIP.trustedCIDRs={10.0.0.0/8}"),
+          "hops and CIDRs together must fail to render")
+    check(render_fails("--set", "envoy.clientIP.trustedCIDRs={10.0.0.0/8}"),
+          "CIDRs with the default Envoy 1.31 tag must fail to render (no xff_trusted_cidrs before 1.32)")
+    check(render_fails("--set", "envoy.clientIP.xffNumTrustedHops=-1"), "negative hops must fail to render")
     relay_on = ["--set", "relay.enabled=true"]
     relay_prod = ["-f", os.path.join(CHART, "values-production.yaml"), *relay_on,
                   "--set", "relay.database.existingSecret=relay-db", "--set", "relay.clusterToken.existingSecret=relay-token"]
     for label, args, want in (("local, relay on", relay_on, []), ("production, relay on", relay_prod, prod)):
-        test_trusted(render(*args), label, want, relay=True)
-    docs = render("--set", "networkPolicy.enabled=false")
+        docs = render(*args)
+        test_trusted(docs, label, want, relay=True)
+        test_envoy(docs, label)
+    docs = render("--set", "networkPolicy.enabled=false", "--set", "networkPolicy.envoyIngress.enabled=true")
     test_policies(docs, "policies off", enabled=False)
     if "--envoy-validate" in sys.argv:
-        for label, ev in rendered.items():
-            envoy_validate(label, ev)
+        for label, (ev, image) in rendered.items():
+            envoy_validate(label, ev, image)
+    if "--envoy-run" in sys.argv:
+        envoy_run()
     if failures:
         print(f"\n{len(failures)} failure(s)")
         sys.exit(1)

@@ -37,34 +37,47 @@ global:
     relayDbPassword: ""
     relayClusterToken: ""
 
-# Client IP in the audit log (#2430; KB decisions/audit-log-v2.md, section 2).
-# AMP_TRUSTED_PROXIES for amp-api, authadmin and mcpoauth: the proxies whose
-# X-Forwarded-For entries the services believe. They walk the header right to
-# left past these and record the first address that isn't one of them.
-# Empty: nothing is trusted and each row records its TCP peer (Envoy's pod).
+# Client IP in the audit log (KB decisions/audit-log-v2.md; #2430, #2469).
 #
-# docker-desktop keeps it empty. Envoy is reached only through `kubectl
-# port-forward`, and with containerd 2.x port-forward connects to the pod's
-# own IP, so Envoy's peer (and the address it appends) is Envoy's own pod
-# address, not 127.0.0.1. Trusting the pod CIDR here would record that same
-# address for every real request and would believe any X-Forwarded-For sent
-# through the port-forward (verified in #2430). Production trusts the pod
-# CIDR plus Cloudflare (values-production.yaml), where Traefik is the peer.
-# To exercise the walk locally: --set 'clientIP.trustedProxies={10.244.0.0/16}'.
-# Never list an address a client can send from, and keep networkPolicy on
-# whenever the pod CIDR is trusted.
+# AMP's boundary is its own Envoy. Envoy decides who the client is
+# (envoy.clientIP, below under envoy:) and passes that one address to the
+# services in X-Amp-Client-Ip, replacing anything a client sent. What sits in
+# front of Envoy is your deployment's business, not this chart's: configure
+# how many trusted hops, or which CIDRs, sit in front of Envoy for your
+# environment.
+#
+# clientIP.trustedProxies (AMP_TRUSTED_PROXIES for amp-api, authadmin,
+# mcpoauth and amp-relay): the addresses Envoy reaches the services from.
+# Only from these is X-Amp-Client-Ip believed. Typically your pod CIDR (keep
+# networkPolicy.enabled so only Envoy reaches the services); add 127.0.0.6
+# when a mesh sidecar (Istio) sits in front of each service, because the
+# services then see the sidecar as their TCP peer. Empty (the default):
+# nothing is trusted and each row records its TCP peer, Envoy's address.
+# Never list an address a client can connect to the services from.
+# Example: --set 'clientIP.trustedProxies={10.244.0.0/16}'.
 clientIP:
   trustedProxies: []
 
-# NetworkPolicies so only Envoy reaches amp-api, authadmin and mcpoauth
-# (templates/networkpolicy.yaml). Needs a CNI that enforces them.
+# NetworkPolicies (templates/networkpolicy.yaml). They need a CNI that
+# enforces them; without one they are inert.
 networkPolicy:
+  # Only Envoy may open the public ports of amp-api, authadmin and mcpoauth
+  # (these select this chart's own pods, nothing outside it).
   enabled: true
-  # NetworkPolicyPeers allowed to open Envoy's listeners (8080, 8443): the
-  # ingress controller in front of it. Empty: no pod. docker-desktop reaches
-  # Envoy only through `kubectl port-forward`, which policies don't affect
-  # (verified on kindnet in #2430).
-  envoyFrom: []
+  # Who may open Envoy's listeners (8080, 8443). Off by default: what reaches
+  # Envoy is your ingress design. Turn it on to admit only the proxies in
+  # front of Envoy, listed as NetworkPolicyPeers. Worth it whenever
+  # envoy.clientIP.xffNumTrustedHops > 0, because anything that reaches Envoy
+  # directly can then choose its recorded address. Examples (pick yours):
+  #   from:                            # an ingress controller in the cluster
+  #     - namespaceSelector: { matchLabels: { kubernetes.io/metadata.name: ingress } }
+  #       podSelector: { matchLabels: { app.kubernetes.io/name: my-ingress } }
+  #   from:                            # a load balancer's subnets
+  #     - ipBlock: { cidr: 192.0.2.0/24 }
+  # Enabled with an empty list admits no pod or address at all.
+  envoyIngress:
+    enabled: false
+    from: []
 
 image:
   pullPolicy: IfNotPresent
@@ -124,7 +137,7 @@ ampApi:
 # (ampApi.appPublicUrl, else https://<global.domain>), so set
 # ampApi.appPublicUrl when people reach AMP on another origin (a port-forward
 # such as :8443, or a different public host).
-# Anything in front of Envoy (Traefik, a cloud LB) must not cut long SSE
+# Anything in front of Envoy (an ingress controller, a cloud LB) must not cut long SSE
 # streams either: see KB how-to/remote-control-local-test.md.
 relay:
   enabled: false
@@ -298,8 +311,34 @@ envoy:
   image: envoyproxy/envoy
   tag: v1.31-latest
   replicas: 1
+  # How Envoy decides the client address for the audit log (see the
+  # clientIP comment above and templates/_clientip.tpl). Set one of:
+  #   xffNumTrustedHops: how many proxies in front of Envoy append to
+  #     X-Forwarded-For. 0 (default): the client is Envoy's TCP peer and any
+  #     X-Forwarded-For a client sends is ignored. N: the client is the Nth
+  #     entry from the right.
+  #   trustedCIDRs (needs envoy.tag 1.32 or later): the addresses of the
+  #     proxies in front of Envoy. Envoy
+  #     reads X-Forwarded-For only when its peer is one of them, skipping
+  #     every trusted entry from the right.
+  # Examples only, not features of this chart:
+  #   - Clients connect straight to Envoy (a LoadBalancer Service that keeps
+  #     the source address, e.g. externalTrafficPolicy: Local, or a TCP/NLB
+  #     pass-through): leave the default.
+  #   - One HTTP proxy in front (an ingress controller, a cloud application
+  #     load balancer) that appends the client to X-Forwarded-For:
+  #     xffNumTrustedHops: 1, or trustedCIDRs: [<its pod CIDR or subnets>].
+  #     A CDN or WAF in front of that proxy adds a hop only if the proxy
+  #     trusts its X-Forwarded-For; count the hops that end up in the header.
+  #   - A service mesh with a sidecar on Envoy's pod: the sidecar is Envoy's
+  #     TCP peer (127.0.0.6 in Istio's default mode), so use trustedCIDRs:
+  #     [127.0.0.6/32, <the mesh ingress gateway's pod CIDR>]. mTLS and the
+  #     mesh itself are configured outside this chart.
+  clientIP:
+    xffNumTrustedHops: 0
+    trustedCIDRs: []
   service:
-    type: ClusterIP   # Traefik handles external ingress now
+    type: ClusterIP   # put whatever ingress you use in front of it
     httpsPort: 443
     httpPort: 80          # kept open only for ACME HTTP-01 + local convenience redirect to https
   resources:
