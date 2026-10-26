@@ -557,7 +557,9 @@ async fn the_pairing_link_is_copied_opened_and_selectable() {
     assert_eq!(recorded(&r.stubs, "open"), vec![link.clone()]);
 
     // A failing pbcopy: OSC 52 still went, and the chat says what failed (not the link).
-    stub(&r.stubs, "pbcopy", "exit 3");
+    // It reads the link first: one that exits at once makes the write a broken pipe instead,
+    // depending on timing (this flaked on CI in #2438).
+    stub(&r.stubs, "pbcopy", "cat >/dev/null; exit 3");
     r.shell.submit("/remote copy").await;
     let screen = r.until("(OSC 52) (pbcopy: exited with").await;
     assert!(screen.contains("If pasting gives nothing"), "{screen}");
