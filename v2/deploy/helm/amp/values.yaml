@@ -105,10 +105,14 @@ relay:
   # on one replica, the others forward to it, and take it over if it dies.
   replicas: 2
   # Envoy's cap on one relay stream (the harness's command stream and a
-  # browser's event stream): the session's 12-hour lifetime.
+  # browser's event stream). Per stream, not per session: a session has no
+  # time limit by default (#2424), and the harness and the browser reopen a
+  # stream Envoy cuts at once, so this only bounds how long one connection
+  # is held.
   maxStreamDuration: 43200s
   # A relay stream with no bytes for this long is cut (the relay sends a
-  # keepalive every 20 s, so only a dead peer gets there).
+  # keepalive every 20 s and the harness a heartbeat every 20 s, so only a
+  # dead peer gets there).
   streamIdleTimeout: 120s
   # Every other relay call (register, token refresh, event batches,
   # heartbeats, pairing, end, the browser's commands) is a short request.

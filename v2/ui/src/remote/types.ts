@@ -79,8 +79,9 @@ export interface HelloBody {
   user_id: number
   ops: string[]
   started_at_ms: number
-  expires_at_ms: number
-  idle_timeout_s: number
+  /** null: no lifetime; idle_timeout_s null: no idle limit (the defaults, #2424). */
+  expires_at_ms: number | null
+  idle_timeout_s: number | null
   status: SessionStatus
 }
 
@@ -183,7 +184,8 @@ export interface SessionSummary {
   online: boolean
   viewers: number
   started_at_ms: number
-  expires_at_ms: number
+  /** null: the session has no lifetime, the default (#2424); it lasts until someone ends it. */
+  expires_at_ms: number | null
   last_activity_at_ms: number
   protocol_version: number
   // Added by #2389 (protocol 8.3). Optional, because a relay that predates them leaves them out.

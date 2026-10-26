@@ -11,7 +11,10 @@
 //! - State: the harness key in the keychain (or `remote-harness-key.json` 0600 when logins are in
 //!   a file), pins in `<state>/remote-devices.json`, the local action log in
 //!   `<state>/remote-actions.log` (metadata only), session ends the relay hasn't heard yet in
-//!   `<state>/remote-pending-ends.json` (#2396).
+//!   `<state>/remote-pending-ends.json` (#2396), and one locked record per running session in
+//!   `<state>/remote-live/` so the next `/remote` ends a session a killed chat left behind (#2424).
+//! - Lifetime: none unless the org set an idle limit or a maximum lifetime (#2424); the link
+//!   reconnects and renews its token for as long as it takes.
 //! - Redaction: provider keys and secret headers, secret-looking environment values, the login's
 //!   tokens.
 

@@ -146,7 +146,7 @@ func (rl *Relay) sessionView(ctx context.Context, sess *domain.RemoteSession, na
 		"session_id": sess.ID, "harness_id": sess.HarnessID, "harness_fp_display": FingerprintDisplay(sess.HarnessPub),
 		"host": sess.Host, "os": sess.OS, "harness_version": sess.HarnessVersion, "project": project,
 		"online": online, "viewers": viewers,
-		"started_at_ms": ms(sess.StartedAt), "expires_at_ms": ms(sess.ExpiresAt),
+		"started_at_ms": ms(sess.StartedAt), "expires_at_ms": msOrNull(sess.ExpiresAt),
 		"last_activity_at_ms": ms(sess.LastActivityAt), "protocol_version": sess.ProtocolVersion,
 		// #2389, additive: state, end reason, model, devices and current ticket.
 		"state": sess.State, "end_reason": sess.EndReason, "ended_at_ms": endedAt,

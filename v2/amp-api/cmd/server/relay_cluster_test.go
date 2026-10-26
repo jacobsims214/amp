@@ -328,7 +328,9 @@ func TestRelayCluster_EndsReachTheHolder(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 
-	// The lifetime sweep on B ends the session held on A.
+	// The lifetime sweep on B ends the session held on A (an org that opted
+	// into a lifetime, #2424).
+	setOrgLimits(t, a.w.s.repo, a.w.org.ID, 0, 12)
 	s = a.register(t, "alice")
 	hc = s.connect(t)
 	a.clock.Add(13 * time.Hour)

@@ -104,7 +104,9 @@ function SessionRow({ s, now, onDisconnect, busy }: { s: SessionSummary; now: nu
           : <Fact label="Last activity" title={when(s.last_activity_at_ms)}>{ago(s.last_activity_at_ms, now)}</Fact>}
         {ended
           ? <Fact label="Why" title={endReasonText(s.end_reason ?? '')}>{endReasonText(s.end_reason ?? '')}</Fact>
-          : <Fact label="Expires" title={when(s.expires_at_ms)}>{inTime(s.expires_at_ms, now)}</Fact>}
+          : s.expires_at_ms == null
+            ? <Fact label="Expires" title="No time limit: it stays on, reconnecting after sleep, until you disconnect it or turn it off on the laptop">Never</Fact>
+            : <Fact label="Expires" title={when(s.expires_at_ms)}>{inTime(s.expires_at_ms, now)}</Fact>}
         {!ended && <Fact label="Watching">{s.viewers === 1 ? '1 browser' : `${s.viewers} browsers`}</Fact>}
         <Fact label="Laptop">{s.os} · harness {s.harness_version}</Fact>
         <Fact label="Laptop key" title="Check it matches the key the harness prints">{s.harness_fp_display}</Fact>

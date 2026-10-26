@@ -927,6 +927,27 @@ def events_file():
     add("chat_tool_end_refused_valid", wire(tref), browser_rx(last_applied_seq=52), "ok",
         "#2388: an AMP call refused for a person's step carries the TUI's fixed row line.", tref, True)
 
+    # #2424: by default a session has no lifetime and no idle limit; hello says so with nulls.
+    hello_nl = sign_env(HARNESS, event("hello", {
+        "harness": {
+            "harness_id": HARNESS.fp,
+            "harness_pub": b64u(HARNESS.pub_raw),
+            "host": "jacobs-mbp",
+            "os": "macos",
+            "version": "0.5.0",
+        },
+        "user_id": OWNER_USER_ID,
+        "ops": ["prompt", "stop", "detach"],
+        "started_at_ms": NOW_MS - 3_600_000,
+        "expires_at_ms": None,
+        "idle_timeout_s": None,
+        "status": {"model": "anthropic/claude-opus-5-5", "busy": False, "queue_len": 0, "workers_running": 0,
+                   "devices": [{"device_id": DEVICE_A.fp, "name": "Safari on iPhone"}]},
+    }, seq=54, nonce_label="e18"))
+    add("hello_no_limits_valid", wire(hello_nl), browser_rx(last_applied_seq=53), "ok",
+        "#2424: a session with no lifetime and no idle limit (the default): expires_at_ms and idle_timeout_s are null.",
+        hello_nl, True)
+
     return {
         "description": "Harness -> browser events. Run each `wire` text through the browser's event check with `receiver` and "
         "expect `expect`: \"ok\", \"duplicate\" (drop silently), \"ignored_unknown_op\" (verified, seq advanced, not rendered) or "

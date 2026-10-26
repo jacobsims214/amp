@@ -129,7 +129,7 @@ export class MockRelay {
     const hello: HelloBody = {
       harness: { harness_id: MOCK_HARNESS_ID, harness_pub: MOCK_HARNESS_PUB, host: 'jacobs-mbp', os: 'macos', version: '0.4.0' },
       user_id: 1001, ops: ['prompt', 'stop', 'detach'],
-      started_at_ms: Date.now() - 3_600_000, expires_at_ms: Date.now() + 11 * 3_600_000, idle_timeout_s: 1800,
+      started_at_ms: Date.now() - 3_600_000, expires_at_ms: null, idle_timeout_s: null,
       status: this.statusBody,
     }
     this.emit('hello', hello)
@@ -166,7 +166,7 @@ export class MockRelay {
     return {
       session_id: this.sessionId, harness_id: MOCK_HARNESS_ID, harness_fp_display: '29CA-E6B5-00C2-66CB', harness_pub: MOCK_HARNESS_PUB,
       host: 'jacobs-mbp', os: 'macos', harness_version: '0.4.0', project: { id: 2, name: 'AMP' }, online: this.online, viewers: this.listeners.size,
-      started_at_ms: Date.now() - 3_600_000, expires_at_ms: Date.now() + 11 * 3_600_000, last_activity_at_ms: Date.now(), protocol_version: 1,
+      started_at_ms: Date.now() - 3_600_000, expires_at_ms: null, last_activity_at_ms: Date.now(), protocol_version: 1,
       state: 'active', end_reason: null, ended_at_ms: null, model: this.statusBody.model,
       ticket: this.statusBody.ticket_id == null ? null : { id: this.statusBody.ticket_id, name: this.statusBody.ticket_name ?? null },
       devices: this.statusBody.devices.map(d => ({ ...d, paired_at_ms: Date.now() - 2 * 86_400_000, expires_at_ms: Date.now() + 28 * 86_400_000 })),

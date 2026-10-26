@@ -75,6 +75,17 @@ func enableOrg(t *testing.T, repo *repository.Repo, orgID int, on bool) {
 	}
 }
 
+// setOrgLimits turns remote control on for orgID with an admin's opt-in idle
+// limit (minutes) and lifetime (hours); 0 is off, the default (#2424).
+func setOrgLimits(t *testing.T, repo *repository.Repo, orgID, idleMin, lifetimeHours int) {
+	t.Helper()
+	pol := domain.DefaultRemotePolicy()
+	pol.Enabled, pol.IdleTimeoutMin, pol.MaxLifetimeHours = true, idleMin, lifetimeHours
+	if err := repo.SetOrgRemotePolicy(context.Background(), orgID, pol); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // remoteAudit returns the remote.* audit entries about session id (or, with
 // id "", all of the org's), newest first.
 func remoteAudit(t *testing.T, repo *repository.Repo, orgID int, action, id string) []domain.AuditEntry {
@@ -258,7 +269,8 @@ func TestRemote_OrgSettingEndpoint(t *testing.T) {
 	path := fmt.Sprintf("/api/orgs/%d/remote-control", w.org.ID)
 
 	got := ra.want(t, 200, "orgadmin", "GET", path, nil)
-	if got["enabled"] != false || got["idle_timeout_min"] != float64(30) || got["device_pin_days"] != float64(30) {
+	if got["enabled"] != false || got["idle_timeout_min"] != float64(0) || got["max_lifetime_hours"] != float64(0) ||
+		got["device_pin_days"] != float64(30) {
 		t.Fatalf("default policy = %v", got)
 	}
 	ra.want(t, 403, "alice", "GET", path, nil)
@@ -275,14 +287,34 @@ func TestRemote_OrgSettingEndpoint(t *testing.T) {
 	if code != 400 || out["code"] != domain.RemoteCodeMalformed || out["error"] == "" {
 		t.Fatalf("PUT idle 4: %d %v", code, out)
 	}
+	code, out = ra.do(t, "orgadmin", "PUT", path, map[string]any{"enabled": true, "max_lifetime_hours": 721})
+	if code != 400 || out["code"] != domain.RemoteCodeMalformed {
+		t.Fatalf("PUT lifetime 721: %d %v", code, out)
+	}
 	got = ra.want(t, 200, "orgadmin", "PUT", path, map[string]any{"enabled": true, "device_pin_days": 0})
-	if got["enabled"] != true || got["device_pin_days"] != float64(0) || got["idle_timeout_min"] != float64(30) {
+	if got["enabled"] != true || got["device_pin_days"] != float64(0) || got["idle_timeout_min"] != float64(0) ||
+		got["max_lifetime_hours"] != float64(0) {
 		t.Fatalf("PUT on = %v", got)
+	}
+	// #2424: an admin opts into limits, and back out (0 is off); members left
+	// out keep their values.
+	got = ra.want(t, 200, "orgadmin", "PUT", path, map[string]any{"idle_timeout_min": 30, "max_lifetime_hours": 12})
+	if got["enabled"] != true || got["idle_timeout_min"] != float64(30) || got["max_lifetime_hours"] != float64(12) {
+		t.Fatalf("PUT limits = %v", got)
+	}
+	got = ra.want(t, 200, "orgadmin", "PUT", path, map[string]any{"idle_timeout_min": 0})
+	if got["idle_timeout_min"] != float64(0) || got["max_lifetime_hours"] != float64(12) {
+		t.Fatalf("PUT idle off = %v", got)
+	}
+	got = ra.want(t, 200, "orgadmin", "PUT", path, map[string]any{"max_lifetime_hours": 0})
+	if got["idle_timeout_min"] != float64(0) || got["max_lifetime_hours"] != float64(0) {
+		t.Fatalf("PUT lifetime off = %v", got)
 	}
 	ra.want(t, 200, "root", "GET", path, nil)
 
 	sets := remoteAudit(t, w.s.repo, w.org.ID, domain.AuditRemotePolicySet, "")
-	if len(sets) != 1 || sets[0].Details["enabled"] != true || sets[0].Details["was_enabled"] != false {
+	if len(sets) != 4 || sets[3].Details["enabled"] != true || sets[3].Details["was_enabled"] != false ||
+		sets[2].Details["max_lifetime_hours"] != float64(12) {
 		t.Fatalf("remote.policy.set entries: %+v", sets)
 	}
 
@@ -352,7 +384,7 @@ func TestRemote_EnableSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.HasPrefix(sess.ID, "rs_") || len(sess.ID) != 25 || sess.OwnerUserID != w.alice.User.ID ||
-		!sess.Active() || sess.Host != "jacobs-mbp" || sess.ExpiresAt.Sub(sess.StartedAt) < 11*time.Hour {
+		!sess.Active() || sess.Host != "jacobs-mbp" || sess.ExpiresAt != nil {
 		t.Fatalf("session = %+v", sess)
 	}
 	en := remoteAudit(t, w.s.repo, w.org.ID, domain.AuditRemoteEnable, sess.ID)
@@ -601,8 +633,10 @@ func TestRemote_SessionAndDeviceStore(t *testing.T) {
 	}
 	dev2Pub, dev2ID := remoteKey(t)
 	d2, err := svc.PinRemoteDevice(ctx, sess, dev2ID, dev2Pub, "Chrome on macOS")
-	if err != nil || !d2.ExpiresAt.Equal(sess.ExpiresAt) {
-		t.Fatalf("pin with 0 days: %+v %v (session expires %v)", d2, err, sess.ExpiresAt)
+	// The session has no lifetime (#2424), so the relay's row lasts the
+	// longest pin; the harness keeps a 0-day pin in memory only.
+	if days := d2.ExpiresAt.Sub(d2.PairedAt).Hours() / 24; err != nil || days < 29.9 || days > 30.1 {
+		t.Fatalf("pin with 0 days: %+v %v", d2, err)
 	}
 	if l, _ := repo.ListRemoteDevices(ctx, w.alice.User.ID, fp); len(l) != 2 {
 		t.Fatalf("devices: %+v", l)
@@ -637,8 +671,10 @@ func TestRemote_SessionAndDeviceStore(t *testing.T) {
 		t.Fatalf("remote.disable on revoke-all: %+v", d)
 	}
 
-	// The sweep: a session past its lifetime ends as expired, one idle past
-	// its org's timeout (+ grace) as idle, a fresh one stays.
+	// The sweep, with an admin's opt-in limits (#2424): a session past its
+	// lifetime ends as expired, one idle past its org's timeout (+ grace) as
+	// idle, a fresh one stays.
+	setOrgLimits(t, repo, w.org.ID, 30, 12)
 	mk := func() *domain.RemoteSession {
 		s, err := svc.EnableRemoteSession(ctx, alice, reg)
 		if err != nil {

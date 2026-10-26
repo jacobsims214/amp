@@ -11,6 +11,13 @@ credential store is the file (no keychain, no GUI). Needs pexpect and pyte:
     target/pyenv/bin/python scripts/remote-pty-check.py 80x24
     target/pyenv/bin/python scripts/remote-pty-check.py errors
     target/pyenv/bin/python scripts/remote-pty-check.py copy
+    target/pyenv/bin/python scripts/remote-pty-check.py outage
+    target/pyenv/bin/python scripts/remote-pty-check.py restart
+
+`outage` (#2424) takes the relay down past the connect token's life and checks that remote control
+comes back by itself, with the paired device still working. `restart` (#2424) kills the chat with
+SIGKILL, starts it again, and checks that the left-behind session stays listed until `/remote`
+ends it, and that the device paired before needs no new pairing.
 
 `copy` (#2423) checks that the link is copied as it is shown, `/remote copy` and `/remote open`,
 and that the rows on screen, joined, are the link. Every mode puts recording stand-ins for
@@ -416,6 +423,108 @@ def copy():
     print("copy: OK")
 
 
+def pair_y(chat, rig):
+    """Pairs the rig's browser with the link on screen, answered y at the laptop."""
+    link = chat.link()
+    rig.send(f"pair {link}", until="CODE")
+    chat.wait("to control this session?")
+    chat.child.send("y")
+    out = rig.proc.stdout.readline().strip()
+    assert out.replace('"', "") == "PAIRED accepted", out
+    chat.wait("Allowed")
+
+
+def wait_rig(rig, cmd, want, timeout=60):
+    end = time.time() + timeout
+    while time.time() < end:
+        line = rig.send(cmd)[-1]
+        if line == want:
+            return line
+        time.sleep(0.5)
+    raise SystemExit(f"rig never said {want!r} to {cmd!r} (last: {line!r})")
+
+
+def outage():
+    """#2424: no time limit, and remote control comes back by itself after a relay outage whose
+    length outlasts the connect token; the device paired before it keeps working."""
+    cols, rows = 100, 30
+    d = workdir("outage")
+    rig = Rig(dict(os.environ, AMP_REMOTE_RIG="1"))
+    env = home_env(d, rig.url)
+    login(d, env)
+    chat = Chat(d, env, cols, rows)
+    chat.wait("/help for commands")
+    chat.enter("/remote")
+    chat.wait("REMOTE ON")
+    chat.wait("until you end it")
+    pair_y(chat, rig)
+    sid = rig.send("session")[-1].split()[-1]
+    show("/remote with no time limit", chat, r"Remote control|REMOTE")
+
+    print(rig.send("down on"))
+    chat.wait("REMOTE OFFLINE", timeout=90)
+    show("relay down", chat, r"REMOTE")
+    time.sleep(20)  # several reconnect rounds, up to the 30 s backoff cap
+    print(rig.send("expire"))  # the outage outlasted the connect token
+    chat.pump(0.5)
+    assert "REMOTE OFFLINE" in chat.text(), chat.text()
+    print(rig.send("down off"))
+    wait_rig(rig, "stream", "STREAM true", timeout=90)
+    chat.wait(lambda t: "REMOTE ON" in t and "REMOTE OFFLINE" not in t, timeout=30)
+    assert rig.send(f"ended {sid}")[-1] == "ENDED_OF none"
+    print(rig.send("prompt hello after the outage", until="ACK"))
+    chat.wait("this reply came from the laptop")
+    show("back by itself; the paired phone drives it again", chat, r"REMOTE|remote|laptop")
+
+    chat.child.sendcontrol("c")
+    chat.child.sendcontrol("c")
+    chat.child.expect(pexpect.EOF, timeout=20)
+    rig.close()
+    print("outage: OK")
+
+
+def restart():
+    """#2424: the chat is killed (SIGKILL). Its session stays listed; a new chat leaves it alone;
+    /remote in the new chat ends it, starts a new one, and the phone paired before still works."""
+    cols, rows = 100, 30
+    d = workdir("restart")
+    rig = Rig(dict(os.environ, AMP_REMOTE_RIG="1"))
+    env = home_env(d, rig.url)
+    login(d, env)
+    chat = Chat(d, env, cols, rows)
+    chat.wait("/help for commands")
+    chat.enter("/remote")
+    chat.wait("REMOTE ON")
+    pair_y(chat, rig)
+    old = rig.send("session")[-1].split()[-1]
+    chat.child.kill(9)
+    chat.child.wait()
+    print(f"killed the chat; session {old}")
+    time.sleep(1)
+    assert rig.send(f"ended {old}")[-1] == "ENDED_OF none", "the relay heard nothing"
+
+    chat = Chat(d, env, cols, rows)
+    chat.wait("/help for commands")
+    chat.pump(3)
+    assert rig.send(f"ended {old}")[-1] == "ENDED_OF none", "a new chat alone leaves it listed"
+    assert "REMOTE ON" not in chat.text(), "remote is off in a new chat"
+    chat.enter("/remote")
+    chat.wait("REMOTE ON")
+    wait_rig(rig, f"ended {old}", "ENDED_OF harness_ended", timeout=30)
+    new = rig.send("session")[-1].split()[-1]
+    assert new != old, (new, old)
+    print(f"/remote ended the left-behind {old} and started {new}")
+    print(rig.send("prompt hello after the restart", until="ACK"))
+    chat.wait("this reply came from the laptop")
+    show("a restarted chat: no pairing again", chat, r"REMOTE|remote|laptop|Allow")
+
+    chat.child.sendcontrol("c")
+    chat.child.sendcontrol("c")
+    chat.child.expect(pexpect.EOF, timeout=20)
+    rig.close()
+    print("restart: OK")
+
+
 def errors():
     cols, rows = 80, 24
 
@@ -451,6 +560,10 @@ if __name__ == "__main__":
         errors()
     elif arg == "copy":
         copy()
+    elif arg == "outage":
+        outage()
+    elif arg == "restart":
+        restart()
     else:
         c, r = arg.lower().split("x")
         flow(int(c), int(r))

@@ -30,7 +30,7 @@ import (
 //	POST   /api/orgs/:id/invites           {email, org_role?, team_id?, team_role?}
 //	DELETE /api/orgs/:id/invites/:inviteId                             org admin
 //	GET    /api/orgs/:id/remote-control                                org admin (remote.go)
-//	PUT    /api/orgs/:id/remote-control  {enabled, idle_timeout_min, device_pin_days}  org admin, web UI
+//	PUT    /api/orgs/:id/remote-control  {enabled, idle_timeout_min, max_lifetime_hours, device_pin_days}  org admin, web UI
 //	GET    /api/teams/:id                  team + members
 //	PATCH  /api/teams/:id                  {name}                      org admin
 //	DELETE /api/teams/:id                                              org admin

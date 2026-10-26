@@ -3,6 +3,7 @@ package service
 import (
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
@@ -73,20 +74,26 @@ func TestRemotePerson(t *testing.T) {
 
 func TestValidateRemotePolicy(t *testing.T) {
 	tests := []struct {
-		idle, pin int
-		ok        bool
+		idle, life, pin int
+		ok              bool
 	}{
-		{30, 30, true}, {5, 0, true}, {240, 30, true},
-		{4, 30, false}, {241, 30, false}, {30, -1, false}, {30, 31, false},
+		{30, 0, 30, true}, {5, 0, 0, true}, {240, 0, 30, true},
+		// #2424: 0 is "no limit" for both, and the default.
+		{0, 0, 30, true}, {0, 1, 30, true}, {0, 720, 30, true}, {30, 12, 30, true},
+		{4, 0, 30, false}, {241, 0, 30, false}, {-1, 0, 30, false}, {30, 0, -1, false}, {30, 0, 31, false},
+		{0, -1, 30, false}, {0, 721, 30, false},
 	}
 	for _, tt := range tests {
-		err := ValidateRemotePolicy(domain.RemotePolicy{IdleTimeoutMin: tt.idle, DevicePinDays: tt.pin})
+		err := ValidateRemotePolicy(domain.RemotePolicy{IdleTimeoutMin: tt.idle, MaxLifetimeHours: tt.life, DevicePinDays: tt.pin})
 		if (err == nil) != tt.ok {
-			t.Errorf("idle %d pin %d: err %v, want ok=%v", tt.idle, tt.pin, err, tt.ok)
+			t.Errorf("idle %d life %d pin %d: err %v, want ok=%v", tt.idle, tt.life, tt.pin, err, tt.ok)
 		}
 		if err != nil && authz.CodeOf(err) != domain.RemoteCodeMalformed {
-			t.Errorf("idle %d pin %d: code %q", tt.idle, tt.pin, authz.CodeOf(err))
+			t.Errorf("idle %d life %d pin %d: code %q", tt.idle, tt.life, tt.pin, authz.CodeOf(err))
 		}
+	}
+	if d := domain.DefaultRemotePolicy(); d.IdleTimeoutMin != 0 || d.MaxLifetimeHours != 0 || d.SessionExpiry(time.Now()) != nil {
+		t.Errorf("default policy has a limit: %+v", d)
 	}
 }
 

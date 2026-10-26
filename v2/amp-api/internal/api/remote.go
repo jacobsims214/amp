@@ -32,8 +32,11 @@ func (h *RestHandler) remoteCapability(r *http.Request) (domain.RemoteCapability
 
 // orgRemoteControl serves /api/orgs/:id/remote-control.
 //
-//	GET  → {"enabled", "idle_timeout_min", "device_pin_days"}   org owners/admins
-//	PUT  {"enabled", "idle_timeout_min"?, "device_pin_days"?}   org owners/admins, web UI only
+//	GET  → {"enabled", "idle_timeout_min", "max_lifetime_hours", "device_pin_days"}   org owners/admins
+//	PUT  {"enabled", "idle_timeout_min"?, "max_lifetime_hours"?, "device_pin_days"?}   org owners/admins, web UI only
+//
+// idle_timeout_min and max_lifetime_hours are 0 for "no limit", the default
+// (#2424); an older client that doesn't send max_lifetime_hours keeps it.
 //
 // Members left out of a PUT keep their current values. Turning it off ends
 // the org's live sessions.
@@ -50,8 +53,9 @@ func (h *RestHandler) orgRemoteControl(w http.ResponseWriter, r *http.Request, p
 	case http.MethodPut:
 		var body struct {
 			Enabled        *bool `json:"enabled"`
-			IdleTimeoutMin *int  `json:"idle_timeout_min"`
-			DevicePinDays  *int  `json:"device_pin_days"`
+			IdleTimeoutMin   *int  `json:"idle_timeout_min"`
+			MaxLifetimeHours *int  `json:"max_lifetime_hours"`
+			DevicePinDays    *int  `json:"device_pin_days"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&body); err != nil {
 			jsonErr(w, authz.Coded(400, domain.RemoteCodeMalformed, "bad JSON: %v", err), 400)
@@ -67,6 +71,9 @@ func (h *RestHandler) orgRemoteControl(w http.ResponseWriter, r *http.Request, p
 		}
 		if body.IdleTimeoutMin != nil {
 			cur.IdleTimeoutMin = *body.IdleTimeoutMin
+		}
+		if body.MaxLifetimeHours != nil {
+			cur.MaxLifetimeHours = *body.MaxLifetimeHours
 		}
 		if body.DevicePinDays != nil {
 			cur.DevicePinDays = *body.DevicePinDays

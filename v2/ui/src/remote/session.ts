@@ -340,7 +340,7 @@ export function sessionTokens(status: SessionStatus | null, t: Totals):
 
 /**
  * People-facing words for end reasons (protocol 12.2). `idleTimeoutS` is the session's idle limit
- * from the harness's hello, when known: the org sets it (5-240 min), so the text never assumes 30.
+ * from the harness's hello, when known: an org may set one (5-240 min; none by default, #2424).
  */
 export function endReasonText(reason: string, idleTimeoutS?: number | null): string {
   const idleMin = idleTimeoutS ? Math.round(idleTimeoutS / 60) : null
@@ -353,7 +353,7 @@ export function endReasonText(reason: string, idleTimeoutS?: number | null): str
     idle: idleMin
       ? `The session ended after ${idleMin} minute${idleMin === 1 ? '' : 's'} without remote activity.`
       : 'The session ended after its idle time without remote activity (your org sets it).',
-    expired: 'The session reached its 12-hour limit.',
+    expired: 'The session reached the time limit your organization set.',
     killed: 'An admin ended this session.',
   }
   return m[reason] ?? 'This session has ended.'

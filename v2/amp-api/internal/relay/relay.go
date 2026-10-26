@@ -209,7 +209,8 @@ func (rl *Relay) endHere(id, reason string) {
 }
 
 // Run sweeps presence and buffers, and ends sessions past their idle limit
-// or 12 h lifetime (the harness is authoritative; this is the backstop).
+// or lifetime, when the org set them (the harness is authoritative; this is
+// the backstop).
 func (rl *Relay) Run(ctx context.Context) {
 	sweep := time.NewTicker(rl.cfg.Sweep)
 	defer sweep.Stop()
@@ -461,3 +462,21 @@ func (rl *Relay) pump(ctx context.Context, out *sse, st *stream) {
 }
 
 func ms(t time.Time) int64 { return t.UnixMilli() }
+
+// msOrNull is ms(*t), or nil (JSON null) when there is no time: a session
+// with no lifetime or no idle limit (#2424).
+func msOrNull(t *time.Time) any {
+	if t == nil {
+		return nil
+	}
+	return t.UnixMilli()
+}
+
+// idleSeconds is the register answer's idle_timeout_s: null when the org set
+// no idle limit (#2424).
+func idleSeconds(pol domain.RemotePolicy) any {
+	if pol.IdleTimeoutMin <= 0 {
+		return nil
+	}
+	return pol.IdleTimeoutMin * 60
+}

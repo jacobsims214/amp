@@ -1115,15 +1115,34 @@ impl Shell {
         } else {
             "offline, reconnecting"
         };
+        // #2424: no limits unless the organization set them.
+        let limits = match (on.expires_at_ms, on.idle_deadline_ms) {
+            (None, None) => "It stays on, through sleep and network changes, until you end it: \
+                             /remote off, quitting this chat, or Disconnect in AMP."
+                .to_owned(),
+            (Some(exp), None) => format!(
+                "It turns off at {} (your organization's limit). /remote off ends it.",
+                clock(exp, now)
+            ),
+            (None, Some(idle)) => format!(
+                "It turns off after {} without remote activity (now at {}; your \
+                 organization's limit). /remote off ends it.",
+                span(idle - now),
+                clock(idle, now)
+            ),
+            (Some(exp), Some(idle)) => format!(
+                "It turns off at {} or after {} without remote activity (now at {}; your \
+                 organization's limits). /remote off ends it.",
+                clock(exp, now),
+                span(idle - now),
+                clock(idle, now)
+            ),
+        };
         self.view.add_notice(&format!(
-            "Remote control is on ({connection}): {} device{} watching, {} paired. It turns off \
-             at {} or after {} without remote activity (now at {}). /remote off ends it.",
+            "Remote control is on ({connection}): {} device{} watching, {} paired. {limits}",
             on.viewers,
             if on.viewers == 1 { "" } else { "s" },
             on.devices,
-            clock(on.expires_at_ms, now),
-            span(on.idle_deadline_ms - now),
-            clock(on.idle_deadline_ms, now),
         ));
         match (on.link, on.link_expires_at_ms) {
             (Some(url), Some(until)) if until > now => self.show_pairing_link(&url, until, now),
@@ -1205,21 +1224,33 @@ impl Shell {
                     ui.watch_queue(feed.as_ref());
                 }
                 let idle = match self.remote.as_ref().map(|r| r.current()) {
-                    Some(amp_core::remote::RemoteState::On(s)) => {
-                        format!(
-                            ", or after {} without remote activity",
-                            span(s.idle_deadline_ms - now)
-                        )
-                    }
+                    Some(amp_core::remote::RemoteState::On(amp_core::remote::RemoteOn {
+                        idle_deadline_ms: Some(idle),
+                        ..
+                    })) => format!(", or after {} without remote activity", span(idle - now)),
                     _ => String::new(),
                 };
-                self.view.add_notice(&format!(
-                    "Remote control is on until {} ({}){idle}. /remote off ends it; this laptop's \
-                     key is {}.",
-                    clock(on.expires_at_ms, now),
-                    span(on.expires_at_ms - now),
-                    on.fingerprint
-                ));
+                // #2424: by default a session has no lifetime and no idle limit.
+                let text = match on.expires_at_ms {
+                    Some(exp) => format!(
+                        "Remote control is on until {} ({}){idle} (your organization's limit). \
+                         /remote off ends it; this laptop's key is {}.",
+                        clock(exp, now),
+                        span(exp - now),
+                        on.fingerprint
+                    ),
+                    None if !idle.is_empty() => format!(
+                        "Remote control is on until you end it{idle} (your organization's \
+                         limit). /remote off ends it; this laptop's key is {}.",
+                        on.fingerprint
+                    ),
+                    None => format!(
+                        "Remote control is on until you end it: it reconnects by itself after \
+                         sleep or a network change. /remote off ends it; this laptop's key is {}.",
+                        on.fingerprint
+                    ),
+                };
+                self.view.add_notice(&text);
                 self.show_pairing_link(&on.link, on.link_expires_at_ms, now);
             }
             RemoteReply::Enabled(Err(e)) => self.view.add_error(&format!("/remote: {}", e.message)),

@@ -519,8 +519,8 @@ mod tests {
             viewers,
             devices: 1,
             online,
-            expires_at_ms: 0,
-            idle_deadline_ms: 0,
+            expires_at_ms: None,
+            idle_deadline_ms: None,
             queue_len,
             fingerprint: "AAAA-BBBB".into(),
         })

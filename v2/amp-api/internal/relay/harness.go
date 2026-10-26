@@ -162,8 +162,9 @@ func (rl *Relay) register(w http.ResponseWriter, r *http.Request) {
 		"connect_token":               tok,
 		"connect_token_expires_at_ms": ms(exp),
 		"started_at_ms":               ms(sess.StartedAt),
-		"expires_at_ms":               ms(sess.ExpiresAt),
-		"idle_timeout_s":              pol.IdleTimeoutMin * 60,
+		// null: no lifetime / no idle limit, the default (#2424).
+		"expires_at_ms":               msOrNull(sess.ExpiresAt),
+		"idle_timeout_s":              idleSeconds(pol),
 		"device_pin_max_days":         pol.DevicePinDays,
 		"heartbeat_interval_s":        20,
 		"keepalive_interval_s":        int(rl.cfg.Keepalive / time.Second),
@@ -650,9 +651,13 @@ func (rl *Relay) heartbeat(w http.ResponseWriter, r *http.Request, sess *domain.
 	live.updatePresence(now, rl.cfg.OfflineAfter)
 	viewers := len(live.viewers)
 	live.mu.Unlock()
-	idle := sess.LastActivityAt.Add(time.Duration(pol.IdleTimeoutMin) * time.Minute)
+	var idle *time.Time
+	if pol.IdleTimeoutMin > 0 {
+		t := sess.LastActivityAt.Add(pol.IdleTimeout())
+		idle = &t
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"viewers": viewers, "idle_deadline_ms": ms(idle), "expires_at_ms": ms(sess.ExpiresAt),
+		"viewers": viewers, "idle_deadline_ms": msOrNull(idle), "expires_at_ms": msOrNull(sess.ExpiresAt),
 	})
 }
 
