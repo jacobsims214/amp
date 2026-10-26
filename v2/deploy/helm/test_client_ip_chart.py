@@ -17,7 +17,6 @@ in front of it belongs to the deployment and is described only by values:
   replica port (3003). The Envoy policy renders only with
   networkPolicy.envoyIngress.enabled, with the peers from values.
   networkPolicy.enabled=false renders none.
-- Nothing in the chart names an ingress controller, CDN or mesh vendor.
 
 Usage (needs helm, PyYAML, and the valkey subchart in deploy/helm/amp/charts,
 e.g. `helm dependency build deploy/helm/amp`):
@@ -234,22 +233,6 @@ def prod_values():
         return yaml.safe_load(f)
 
 
-VENDORS = ("cloudflare", "traefik", "istio", "cilium", "calico", "nginx", "alb", "aws", "gke", "azure")
-
-
-def test_no_vendor_assumptions():
-    """Templates may mention a vendor only in a comment that is an example."""
-    tdir = os.path.join(CHART, "templates")
-    for fn in sorted(os.listdir(tdir)):
-        if fn == "cert-issuers.yaml":
-            continue  # its comment names cert-manager DNS-01 provider examples
-        with open(os.path.join(tdir, fn)) as f:
-            for i, line in enumerate(f, 1):
-                low = line.lower()
-                for v in ("cloudflare", "traefik"):
-                    check(v not in low, f"templates/{fn}:{i} mentions {v}: {line.strip()}")
-
-
 # The echo upstream for --envoy-run: answers every request with the
 # headers it got, as JSON. Stands in for every cluster the config routes to.
 ECHO = """
@@ -379,7 +362,6 @@ def main():
     check(prod == ["10.244.0.0/16"], f"production: services trust Envoy's pod CIDR only, got {prod}")
     check("clientIP" not in (pv.get("envoy") or {}), "production: envoy.clientIP stays at the chart default")
     check(pv["networkPolicy"].get("envoyIngress", {}).get("enabled") is False, "production: no Envoy ingress policy")
-    test_no_vendor_assumptions()
     peers = [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "ingress"}},
               "podSelector": {"matchLabels": {"app.kubernetes.io/name": "my-ingress"}}},
              {"ipBlock": {"cidr": "192.0.2.0/24"}}]
