@@ -217,3 +217,55 @@ func TestClip(t *testing.T) {
 		t.Errorf("Clip cut inside a rune: %q", got)
 	}
 }
+
+// Kubelet probes reach the services from the node, whose address is often
+// inside the trusted pod CIDR (a CNI's host interface), without Envoy's
+// header. They must not trip the "trusted proxy sent no header" warning,
+// which is one-shot and would then be spent on probes instead of on a real
+// misconfigured Envoy, and they get no audit Info.
+func TestMiddleware_ProbesAreNotResolved(t *testing.T) {
+	res := mustResolver(t, envoyHops)
+	var got *Info
+	var called bool
+	h := Middleware(ListenerREST, res)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		got, _ = FromContext(r.Context())
+	}))
+	for _, path := range []string{"/health", "/ready"} {
+		called, got = false, nil
+		req := httptest.NewRequest("GET", path, nil)
+		req.RemoteAddr = "10.244.0.145:51234"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if !called {
+			t.Fatalf("%s: handler not called", path)
+		}
+		if got != nil {
+			t.Errorf("%s: probe got audit Info %+v", path, got)
+		}
+		if rec.Header().Get("X-Request-Id") != "" {
+			t.Errorf("%s: probe got a request id", path)
+		}
+	}
+	if res.warned.Load() {
+		t.Error("a probe spent the missing-header warning")
+	}
+
+	// A real request from a trusted peer without the header still warns.
+	req := httptest.NewRequest("GET", "/api/me", nil)
+	req.RemoteAddr = "10.244.0.12:40000"
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !res.warned.Load() {
+		t.Error("a trusted peer without the header on /api/me did not warn")
+	}
+	if got == nil || got.SourceIP.String() != "10.244.0.12" {
+		t.Errorf("Info = %+v", got)
+	}
+
+	// Only the exact probe paths are skipped.
+	for _, p := range []string{"/healthz", "/health/x", "/api/health", "/readyz"} {
+		if ProbePath(p) {
+			t.Errorf("ProbePath(%q) = true", p)
+		}
+	}
+}

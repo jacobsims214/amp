@@ -240,12 +240,26 @@ func parsePeer(remoteAddr string) (netip.Addr, bool) {
 	return a.Unmap().WithZone(""), true
 }
 
+// ProbePath reports whether path is one of the health endpoints the
+// orchestrator's probes call (/health, /ready). Probes come from the node
+// (the kubelet), not through Envoy, and on many CNIs the node's address sits
+// inside the pod CIDR an operator lists in AMP_TRUSTED_PROXIES, so a probe
+// looks like "a trusted proxy that sent no X-Amp-Client-Ip". Nothing on
+// these paths is audited, so Middleware doesn't resolve them at all.
+func ProbePath(path string) bool { return path == "/health" || path == "/ready" }
+
 // Middleware resolves the request's Info and stores it on the request
 // context for the audit writer. It echoes the request id back in the
-// X-Request-Id response header so a caller can quote it.
+// X-Request-Id response header so a caller can quote it. Health probes
+// (ProbePath) pass straight through: no Info, no client IP, and no
+// missing-header warning from the kubelet's address.
 func Middleware(listener string, res *Resolver) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if ProbePath(r.URL.Path) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			info := Capture(r, listener, res)
 			w.Header().Set("X-Request-Id", info.RequestID)
 			next.ServeHTTP(w, r.WithContext(WithInfo(r.Context(), info)))
