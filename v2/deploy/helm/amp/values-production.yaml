@@ -89,6 +89,16 @@ image:
 ampApi:
   tag: ""   # empty = use global.imageTag
   replicas: 1
+  # Audit checkpoint signing key (#2439 H2). The Secret's value is never in
+  # git. Create it once, before this chart version reaches prod:
+  #   amp-api audit keygen -out signing-key   # prints the public key and key id: keep a copy off-box
+  #   kubectl -n amp create secret generic amp-audit-signing --from-file=signing-key=signing-key
+  #   rm signing-key
+  # The reference is optional: until the Secret exists amp-api starts without
+  # a key, checkpoints are unsigned and /api/audit/verify says "unproven".
+  audit:
+    signingKey:
+      existingSecret: amp-audit-signing
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }

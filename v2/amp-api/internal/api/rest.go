@@ -132,6 +132,7 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/tokens/", h.tokenSub)
 	mux.HandleFunc("/api/agents", h.agents)
 	mux.HandleFunc("/api/audit", h.audit)
+	mux.HandleFunc("/api/audit/verify", h.auditVerify)
 	mux.HandleFunc("/api/webhooks/", h.webhookSub)
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
@@ -390,6 +391,28 @@ func (h *RestHandler) audit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonOK(w, map[string]interface{}{"entries": entries})
+}
+
+// GET /api/audit/verify?org_id= recomputes the audit hash chain of an org
+// (its owners and admins, and global admins), or of every chain (no org_id:
+// global admins), and checks the signed checkpoints. 200 with the report
+// whether or not it found problems: "ok" says which.
+func (h *RestHandler) auditVerify(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	orgID, _ := strconv.Atoi(r.URL.Query().Get("org_id"))
+	report, err := h.svc.VerifyAudit(r.Context(), pr, orgID)
+	if err != nil {
+		fail(w, err, 500)
+		return
+	}
+	jsonOK(w, report)
 }
 
 // ---- /api/projects ----

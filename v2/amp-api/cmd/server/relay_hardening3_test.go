@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/simstech/amp-api/internal/domain"
@@ -134,6 +135,20 @@ func TestRelay_RemoteAuditWebhooksSentByAmpAPI(t *testing.T) {
 		if !strings.Contains(r.signature, "v1=") {
 			t.Fatalf("unsigned delivery: %+v", r)
 		}
+	}
+	// Delivered once: audit_outbox carries relay rows, and nothing else
+	// queues them (relayAuditLoop and relay_audit_outbox are retired, #2433).
+	time.Sleep(300 * time.Millisecond)
+	rc.mu.Lock()
+	enables := 0
+	for _, r := range rc.got {
+		if r.event == "audit.remote.enable" && strings.Contains(r.body, s.id) {
+			enables++
+		}
+	}
+	rc.mu.Unlock()
+	if enables != 1 {
+		t.Fatalf("remote.enable delivered %d times", enables)
 	}
 	// Nothing is left queued once amp-api has matched it.
 	conn, err := pgx.Connect(context.Background(), testDSN(t))
