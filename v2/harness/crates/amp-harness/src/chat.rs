@@ -236,6 +236,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_show_thinking(show_thinking);
     shell.set_mouse_capture(mouse);
     shell.set_padding(padding);
+    // #2425: after asking for plan approval, wait for it in AMP and resume the manager.
+    shell.set_auto_resume(load_auto_resume(&args)?);
     // A suggested first prompt (new project: seed the KB; new user: the AMP guide). Nothing is
     // sent until the person presses Enter.
     if let Some(text) = outcome.and_then(|o| o.prefill) {
@@ -661,6 +663,14 @@ fn load_padding(args: &ChatArgs) -> Result<usize, CliError> {
     let env = |k: &str| std::env::var(k).ok();
     amp_tui::theme::select::resolve_padding(&env, config_text(args).as_deref())
         .map_err(|e| CliError::usage(e.to_string()))
+}
+
+/// `[manager] auto_resume_on_approval` (#2425): `AMP_HARNESS_AUTO_RESUME`, then config.toml,
+/// else on.
+fn load_auto_resume(args: &ChatArgs) -> Result<bool, CliError> {
+    let env = |k: &str| std::env::var(k).ok();
+    amp_core::approval_wait::resolve_auto_resume(&env, config_text(args).as_deref())
+        .map_err(CliError::usage)
 }
 
 /// How tightly the chat is laid out (#2346): `AMP_HARNESS_DENSITY`, then config.toml `[tui]

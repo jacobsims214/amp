@@ -14,13 +14,14 @@ workers, plan approval and the board counts.
 
 | command | what it does |
 |---|---|
-| `/ticket [id]`, `/project [id]` | the current ticket or project; switch to another |
+| `/amp` | the AMP connection: server, you, MCP health |
+| `/ticket [id\|none]`, `/project [id]` | the current ticket or project; switch to another (`none` clears the ticket) |
 | `/questions` | tickets waiting on an answer; answer them right there |
 | `/plan`, `/open [id\|plan]` | plan approval, epics and stories; open a ticket or the plan in the browser |
 | `/workers`, `/worker [id]` | workers here and elsewhere (Ctrl+X stops one, Ctrl+G opens its ticket); watch one live |
 | `/remote [off\|pair\|devices]` | control this chat from the AMP web app or a phone (`harness/remote-control.md`) |
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
-| `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
+| `/usage`, `/abort`, `/close`, `/help`, `/quit` | tokens and cost, stop the reply, close the open panel, every command, leave |
 
 Enter sends and Shift+Enter starts a new line. Ctrl+J also starts a new line in every terminal,
 as does Alt+Enter where Option/Alt sends Esc+ (iTerm2's Option key set to "Esc+", Terminal.app's
@@ -174,11 +175,53 @@ same tool call is stopped after the fifth time, in the chat and in workers.
       The manager stopped here; nothing else was run. Reply once it's done.
   ```
 
-  The manager's turn ends there and it doesn't try another way. Approve in the web UI, then
-  reply.
+  The manager's turn ends there and it doesn't try another way. Approve in the web UI; the
+  manager carries on by itself (below).
 - **Per-ticket approval.** On servers where each ticket is approved by its owner, the status
   line counts `N of yours` apart from `others' waiting for their owners`, and a refusal names
   whose approval it waits for (`⏸ Waiting for its owner's approval: #2204 is someone else's`).
 
 The harness also always denies agents `amp_approve_plan`, and changes to a project's
 `require_plan_approval` or `open_reassign` setting.
+
+### The manager carries on once you approve
+
+You don't have to come back to the chat after approving. When a manager turn ends asking for
+approval (it planned or checked the plan and your tickets await approval, or AMP refused it a
+dispatch for want of one), the chat waits for your click in AMP:
+
+```text
+  ⏸ Waiting for plan approval in AMP (#2201, #2202). The manager carries on by itself once you
+  approve; no need to come back here (Esc or /stop stops waiting). Approve it: https://amp.example.com/project/2/plan
+```
+
+and the status line says `⏸ waiting for plan approval in AMP · <link>`. Once a person approves in
+the web UI, the chat says so and starts the manager's next turn itself:
+
+```text
+  ✓ Plan approved in AMP by you@example.com at 14:02 (#2201, #2202). The manager carries on.
+  [amp-harness] The plan was approved in AMP by you@example.com: #2201, #2202 are approved now.
+  Carry on with the plan: dispatch the approved tickets that are ready.
+```
+
+- **It only reacts.** The harness never approves anything: it reads the plan (`amp_check_plan`)
+  on its own AMP connection, never through the model, and resumes when a person's approval
+  shows there. Reads come every 5 seconds while tickets wait, every 15 seconds once the same
+  tickets have waited 2 minutes, and every 60 seconds after 15 minutes, so a late approval can
+  take up to a minute to be noticed. The fast reads stop as soon as nothing waits.
+- **Partly approved.** If you approve some of the tickets, the manager carries on with those
+  and is told which still wait, so it doesn't start them.
+- **Changed instead.** If the tickets stop waiting without an approval (deleted, or done some
+  other way), or plan approval is turned off, or the chat switches project or server, the chat
+  says so and stops waiting; nothing starts until you reply.
+- **Stop waiting:** Esc, or `/stop` (which also stops a running reply). Typing a new message
+  ends the wait too: that turn decides for itself.
+- **Turn it off** in config.toml (or with `AMP_HARNESS_AUTO_RESUME=false`); the chat then waits
+  for your reply, as before:
+
+  ```toml
+  [manager]
+  auto_resume_on_approval = false
+  ```
+- **Remote control.** The waiting and approved lines are ordinary chat notices, so a paired
+  browser following the chat sees them, and the resumed turn, as they happen.
