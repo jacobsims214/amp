@@ -76,11 +76,12 @@ func TestAuditContext_REST(t *testing.T) {
 		return resp.StatusCode, resp.Header.Get("X-Request-Id")
 	}
 
-	// The test client is a trusted proxy (127.0.0.1), so the walk runs: the
-	// spoofed entries left of the real client are never reached, and the
-	// headers AMP never trusts are ignored.
+	// The test client stands in for Envoy (127.0.0.1 is trusted), so its
+	// X-Amp-Client-Ip is the client; X-Forwarded-For is only kept raw, and
+	// the headers AMP never trusts are ignored.
 	slug := fmt.Sprintf("audit-ctx-%d", time.Now().UnixNano())
 	code, rid := post("root", map[string]string{
+		"X-Amp-Client-Ip":  "203.0.113.7",
 		"X-Forwarded-For":  "6.6.6.6, 203.0.113.7, 10.244.1.5",
 		"CF-Connecting-IP": "6.6.6.6",
 		"X-Real-IP":        "6.6.6.6",
