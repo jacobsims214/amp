@@ -30,6 +30,7 @@ data:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: amp_https
                     stream_idle_timeout: 3600s
+                    {{- include "amp.envoyClientIP" . | nindent 20 }}
                     access_log:
                       - name: envoy.access_loggers.stdout
                         typed_config:
@@ -230,6 +231,7 @@ data:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: amp_http
                     stream_idle_timeout: 3600s
+                    {{- include "amp.envoyClientIP" . | nindent 20 }}
                     access_log:
                       - name: envoy.access_loggers.stdout
                         typed_config:

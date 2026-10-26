@@ -1,0 +1,80 @@
+{{- if .Values.networkPolicy.enabled }}
+# Who may reach AMP's own services (#2430). The services trust
+# X-Forwarded-For only from clientIP.trustedProxies, which includes the pod
+# CIDR (Traefik's and Envoy's pods). Without these policies any pod in the
+# cluster could call amp-api directly and forge the client IP in the audit
+# log. Envoy is the only way in, so only Envoy's pods may open the public
+# ports; amp-api's replica-to-replica port (3003) admits only amp-api. On
+# remote-m1, amp-relay has its own policy (relay.networkPolicy).
+#
+# Not affected: kubelet probes (from the node, not a pod) and
+# `kubectl port-forward` (it enters the pod's own network namespace).
+# Egress is not limited. Needs a CNI that enforces NetworkPolicy (Cilium in
+# production, kindnet on docker-desktop); without one these are inert.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-api
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-api" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 3001 }
+        - { protocol: TCP, port: 8000 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: amp-api
+      ports:
+        - { protocol: TCP, port: 3003 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-authadmin
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "authadmin" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-authadmin
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 8090 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-mcpoauth
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "mcpoauth" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-mcpoauth
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 8091 }
+{{- end }}

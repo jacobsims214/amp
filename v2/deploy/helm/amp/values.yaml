@@ -33,6 +33,24 @@ global:
     oauth2ProxyCookieSecret: ""
     valkeyPassword: ""
 
+# Client IP in the audit log (#2430; KB decisions/audit-log-v2.md, section 2).
+# AMP_TRUSTED_PROXIES for amp-api, authadmin and mcpoauth: the proxies whose
+# X-Forwarded-For entries the services believe. They walk the header right to
+# left past these and record the first address that isn't one of them.
+# docker-desktop: the pod CIDR (Envoy's pods). Through `kubectl port-forward`
+# Envoy's peer is 127.0.0.1, so every local row records 127.0.0.1; that is
+# expected. Never list an address a client can send from, and keep
+# networkPolicy on: the pod CIDR is trusted, so only Envoy may reach the
+# services. Empty: nothing is trusted and rows record Envoy's pod address.
+clientIP:
+  trustedProxies:
+    - 10.244.0.0/16
+
+# NetworkPolicies so only Envoy reaches amp-api, authadmin and mcpoauth
+# (templates/networkpolicy.yaml). Needs a CNI that enforces them.
+networkPolicy:
+  enabled: true
+
 image:
   pullPolicy: IfNotPresent
   registry: ""   # empty = local images built straight into the docker-desktop node, no registry needed

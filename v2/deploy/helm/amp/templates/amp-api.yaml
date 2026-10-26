@@ -66,6 +66,7 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ .Values.cnpg.clusterName }}-app, key: password } }
             - name: DATABASE_URL
               value: "postgres://$(PGUSER):$(PGPASSWORD)@$(PGHOST):5432/{{ .Values.cnpg.appDatabase }}?sslmode=require"
+            {{- include "amp.trustedProxiesEnv" . | nindent 12 }}
             - name: POD_IP
               valueFrom: { fieldRef: { fieldPath: status.podIP } }
             # Replicas share projects (internal/cluster): each runs the

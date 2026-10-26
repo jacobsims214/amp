@@ -80,6 +80,45 @@ global:
   # matching how odoo-operator's Application overrides `image.tag`.
   imageTag: "latest"   # override per release, e.g. sha-763788d
 
+# Client IP in the audit log (#2430). The chain in production is
+# client -> Cloudflare -> Traefik -> Envoy -> service, and the services trust:
+#   - 10.244.0.0/16: the pod CIDR (Traefik's and Envoy's pods; networkPolicy
+#     keeps every other pod away from the services);
+#   - Cloudflare's edge ranges, which Traefik sees as its peer once its
+#     Service has externalTrafficPolicy: Local (the talos change shipped with
+#     #2430). https://www.cloudflare.com/ips-v4 and /ips-v6, fetched
+#     2026-10-26; refresh them when Cloudflare changes them.
+# Until the talos change is applied the walk stops at a Cloudflare or SNAT
+# address: wrong, but not spoofable.
+clientIP:
+  trustedProxies:
+    - 10.244.0.0/16
+    - 173.245.48.0/20
+    - 103.21.244.0/22
+    - 103.22.200.0/22
+    - 103.31.4.0/22
+    - 141.101.64.0/18
+    - 108.162.192.0/18
+    - 190.93.240.0/20
+    - 188.114.96.0/20
+    - 197.234.240.0/22
+    - 198.41.128.0/17
+    - 162.158.0.0/15
+    - 104.16.0.0/13
+    - 104.24.0.0/14
+    - 172.64.0.0/13
+    - 131.0.72.0/22
+    - 2400:cb00::/32
+    - 2606:4700::/32
+    - 2803:f800::/32
+    - 2405:b500::/32
+    - 2405:8100::/32
+    - 2a06:98c0::/29
+    - 2c0f:f248::/32
+
+networkPolicy:
+  enabled: true
+
 image:
   # Built + pushed by .github/workflows/build-images.yml on every push to
   # main / tag. Namespace matches env.IMAGE_NAMESPACE in that workflow.
