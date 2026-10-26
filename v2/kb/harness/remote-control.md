@@ -41,6 +41,34 @@ The harness registers the chat with AMP and prints:
   enlarge the window or copy the link;
 - this laptop's key fingerprint (`29CA-E6B5-…`).
 
+The link is **copied to your clipboard** as it is shown: the chat says "Pairing link copied to the
+clipboard." Paste it into a message to your phone, or into a browser on another computer.
+
+### Getting the link out of the chat
+
+| You want to | Do this |
+|---|---|
+| copy it (again) | `/remote copy` |
+| open it in this computer's browser | `/remote open` (uses `open` on macOS, `xdg-open` on Linux) |
+| click it | Cmd-click (macOS) or Ctrl-click it, in terminals that show links (iTerm2, kitty, WezTerm, recent GNOME Terminal); Terminal.app doesn't |
+| select it yourself | drag across it holding **Option** (iTerm2) or **Fn** (Terminal.app); see below |
+
+How the copy works: the chat sends the link to the terminal's clipboard (OSC 52, which also
+works over SSH where the terminal allows it: iTerm2 needs "Applications in terminal may access
+clipboard" on, tmux needs `set -g set-clipboard on`) and runs the system's tool when there is
+one: `pbcopy` on macOS, `wl-copy` under Wayland, `xclip` or `xsel` under X11. If none of them
+works, the chat says so; use `/remote open` or select it. The link is never written to a log.
+
+Selecting it: the chat reports the mouse to itself (for the wheel and clicking workers), so a
+plain drag doesn't select. Hold Option (iTerm2) or Fn (Terminal.app) while you drag, or set
+`[tui] mouse = false` in your config.toml (`harness/configuration.md`) for plain click-drag
+selection. The link is drawn from the left edge of the window, so selecting from its first
+character to its last copies a working link: the line breaks inside it are dropped when you paste
+it into a browser's address bar.
+
+`/remote open` opens it on *this* computer: useful to pair the AMP web app in this computer's
+browser. The link works once, so open it where you mean to pair.
+
 The footer shows the state at its left: `REMOTE ON · 0 devices` (devices watching right now),
 `REMOTE OFFLINE · reconnecting` while the connection to AMP is down, and `· 2 queued` while
 messages from the web wait for the current reply to finish.
@@ -54,7 +82,8 @@ messages from the web wait for the current reply to finish.
    included, refuses; so does no answer before the link expires. The question can only be
    answered at the laptop's keyboard: nothing sent from the web can answer it.
 
-The link works once, for 5 minutes. `/remote pair` makes a new one (the old one stops working).
+The link works once, for 5 minutes. `/remote pair` makes a new one (the old one stops working),
+and copies it too. Once a link is used or expired, `/remote copy` says so: run `/remote pair`.
 A paired device stays trusted for 30 days (your org may set it shorter); after that, pair again.
 Pair your phone before you leave the laptop: pairing always needs the laptop.
 

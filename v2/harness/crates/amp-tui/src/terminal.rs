@@ -249,6 +249,11 @@ pub async fn run(
 ) -> Result<(), String> {
     install_panic_hook();
     let terminal = Arc::new(ProcessTerminal::new());
+    // #2423: `/remote` copies its pairing link with the system's tools and OSC 52.
+    {
+        let terminal = Arc::clone(&terminal);
+        shell.attach_terminal(Arc::new(move |seq: &str| terminal.write(seq)));
+    }
     let tui = Arc::new(TuiAltScreen::new(
         Box::new(MouseGate {
             inner: Arc::clone(&terminal),

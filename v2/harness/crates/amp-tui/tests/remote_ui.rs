@@ -2,8 +2,17 @@
 //! the browser and reads the screen: the badge, the pairing link with (or without) its QR code,
 //! the local-only y/N with No as the default, a remote prompt tagged `[remote: …]`, `/remote
 //! devices` (list, revoke), the notices on a relay-side end, and the errors before turning on.
+//!
+//! #2423: the link is copied as it is shown, `/remote copy` and `/remote open` work, and a plain
+//! selection of its rows is the link. The clipboard and browser are recording stand-ins on the
+//! chat's search path (`pbcopy`, `open`) plus a recording OSC 52 writer: nothing here touches
+//! the real clipboard or browser.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use amp_core::{
     agent::memory_session,
@@ -19,7 +28,7 @@ use amp_core::{
         relay::now_ms,
     },
 };
-use amp_tui::{RunDone, Shell, ShellInfo};
+use amp_tui::{Desktop, Platform, RunDone, Shell, ShellInfo, clipboard::osc52};
 use rpi_agent::AgentEvent;
 use rpi_ai::{
     ThinkingLevel,
@@ -39,6 +48,39 @@ struct Rig {
     mock: MockRelay,
     script: FauxScript,
     dir: std::path::PathBuf,
+    /// The stand-in clipboard and browser tools (#2423).
+    stubs: PathBuf,
+    /// What the chat sent the terminal (OSC 52).
+    terminal: Arc<Mutex<Vec<String>>>,
+}
+
+/// A recording stand-in for a tool: `pbcopy` keeps its input, `open` its argument, each run in
+/// its own `<name>.<pid>.out`.
+fn stub(dir: &Path, name: &str, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// What each run of the stand-in `name` recorded.
+fn recorded(dir: &Path, name: &str) -> Vec<String> {
+    let mut out: Vec<(std::time::SystemTime, String)> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.starts_with(&format!("{name}.")) && n.ends_with(".out")
+        })
+        .map(|e| {
+            (
+                e.metadata().unwrap().modified().unwrap(),
+                std::fs::read_to_string(e.path()).unwrap(),
+            )
+        })
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, s)| s).collect()
 }
 
 impl Drop for Rig {
@@ -102,6 +144,18 @@ async fn rig(tag: &str, opts: MockOptions, size: (usize, usize)) -> Rig {
         crypto::b64u(&crypto::random_bytes(6))
     ));
     std::fs::create_dir_all(&dir).unwrap();
+    let stubs = dir.join("bin");
+    std::fs::create_dir_all(&stubs).unwrap();
+    stub(&stubs, "pbcopy", "cat > \"$0.$$.out\"");
+    stub(&stubs, "open", "printf '%s' \"$1\" > \"$0.$$.out\"");
+    let terminal = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&terminal);
+    // macOS's tools on every OS, so CI on Linux runs the same stand-ins.
+    shell.set_desktop(
+        Desktop::with_path(Platform::Mac, &stubs).with_terminal(Arc::new(move |s: &str| {
+            sink.lock().unwrap().push(s.to_owned())
+        })),
+    );
     let link = RemoteLink::new(RemoteDeps {
         setup: RemoteSetup {
             api_base: mock.base.clone(),
@@ -131,6 +185,8 @@ async fn rig(tag: &str, opts: MockOptions, size: (usize, usize)) -> Rig {
         mock,
         script,
         dir,
+        stubs,
+        terminal,
     }
 }
 
@@ -380,4 +436,120 @@ async fn refusals_are_clear() {
     r.shell.submit("/remote").await;
     r.until("/remote: remote control needs your AMP login")
         .await;
+}
+
+/// #2423: the pairing link is copied as it is shown (the stand-in `pbcopy` and OSC 52 get it,
+/// exactly), `/remote copy` copies it again, `/remote open` opens it, and the rows it is drawn
+/// on, selected and joined, are the link: no padding, no leading space.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_pairing_link_is_copied_opened_and_selectable() {
+    let mut r = rig("copy", MockOptions::default(), (80, 24)).await;
+
+    r.shell.submit("/remote copy").await;
+    r.until("/remote copy: remote control is off").await;
+    r.shell.submit("/remote open").await;
+    r.until("/remote open: remote control is off").await;
+    assert!(recorded(&r.stubs, "pbcopy").is_empty());
+
+    r.shell.submit("/remote").await;
+    let screen = r.until("Pairing link copied to the clipboard.").await;
+    assert!(
+        screen.contains("/remote copy copies the link again"),
+        "{screen}"
+    );
+    assert!(screen.contains("Option-drag (iTerm2)"), "{screen}");
+    let copies = recorded(&r.stubs, "pbcopy");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let link = copies[0].clone();
+    assert!(link.starts_with("https://amp.local/sessions/"), "{link}");
+    pairing::parse_link_fragment(&link).expect("the copied link is a pairing link");
+    assert_eq!(*r.terminal.lock().unwrap(), vec![osc52(&link)]);
+    // The link itself is never in a notice (only in its own block).
+    assert_eq!(screen.matches(&link[..40]).count(), 1, "{screen}");
+
+    // A plain selection: from the first character of the link to the last, at a width that
+    // wraps it. The rows start at the left edge, so joined they are the link.
+    for width in [60, 80, 120] {
+        let rows: Vec<String> = r
+            .shell
+            .view()
+            .render_frame(width, 300)
+            .iter()
+            .map(|l| rpi_tui::strip_ansi(l).trim_end().to_owned())
+            .collect();
+        let first = rows
+            .iter()
+            .position(|l| l.starts_with("https://amp.local/sessions/"))
+            .unwrap_or_else(|| panic!("the link at column 0 ({width}):\n{}", rows.join("\n")));
+        let selected: Vec<&String> = rows[first..]
+            .iter()
+            .take_while(|l| !l.is_empty() && !l.starts_with(' ') && !l.contains(' '))
+            .collect();
+        if width < 100 {
+            assert!(selected.len() > 1, "it wraps at {width}");
+        }
+        let joined: String = selected.iter().map(|s| s.as_str()).collect();
+        assert_eq!(joined, link, "a selection at {width} columns");
+    }
+
+    // Again, and open.
+    r.shell.submit("/remote copy").await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while recorded(&r.stubs, "pbcopy").len() < 2 {
+        assert!(tokio::time::Instant::now() < deadline, "no second copy");
+        r.shell.poll();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        recorded(&r.stubs, "pbcopy"),
+        vec![link.clone(), link.clone()]
+    );
+    assert_eq!(r.terminal.lock().unwrap().len(), 2);
+    r.shell.submit("/remote open").await;
+    r.until("Opened the pairing link in this computer's browser")
+        .await;
+    assert_eq!(recorded(&r.stubs, "open"), vec![link.clone()]);
+
+    // A failing pbcopy: OSC 52 still went, and the chat says what failed (not the link).
+    stub(&r.stubs, "pbcopy", "exit 3");
+    r.shell.submit("/remote copy").await;
+    let screen = r.until("(OSC 52) (pbcopy: exited with").await;
+    assert!(screen.contains("If pasting gives nothing"), "{screen}");
+    assert_eq!(r.terminal.lock().unwrap().len(), 3);
+
+    // No clipboard and no browser at all.
+    r.shell.set_desktop(Desktop::off());
+    r.shell.submit("/remote copy").await;
+    r.until("/remote copy: no clipboard here; /remote open, or select the link.")
+        .await;
+    r.shell.submit("/remote open").await;
+    r.until("/remote open: couldn't open the browser (no browser in this session)")
+        .await;
+
+    // Off: nothing to copy.
+    r.shell.submit("/remote off").await;
+    r.until("Remote control is off.").await;
+    r.shell.submit("/remote copy").await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while r
+        .screen()
+        .matches("/remote copy: remote control is off")
+        .count()
+        < 2
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no second refusal");
+        r.shell.poll();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// #2423: with mouse capture off the hint says plain selection works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_mouse_capture_the_hint_says_select_it() {
+    let mut r = rig("nomouse", MockOptions::default(), (80, 24)).await;
+    r.shell.set_mouse_capture(false);
+    r.shell.submit("/remote").await;
+    let screen = r.until("Pairing link copied to the clipboard.").await;
+    assert!(screen.contains("or select it with the mouse"), "{screen}");
+    assert!(!screen.contains("Option-drag"), "{screen}");
 }

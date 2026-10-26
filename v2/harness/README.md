@@ -1087,6 +1087,13 @@ terminal on stdin and stdout; without one it exits 2 and points at `run -p`.
   iTerm2). To get plain click-drag selection back, turn mouse reporting off with `[tui] mouse =
   false` (or `AMP_HARNESS_MOUSE=off`); the wheel then no longer scrolls the transcript (Terminal.app
   may send it as ↑↓ instead), and PageUp/PageDown do.
+- The `/remote` pairing link (#2423) is copied as it is shown: OSC 52 to the terminal plus
+  `pbcopy` (macOS), `wl-copy` (Wayland) or `xclip`/`xsel` (X11) when found in `PATH`
+  (`amp_tui::clipboard`). `/remote copy` copies it again, `/remote open` opens it with `open` /
+  `xdg-open`. Its rows start at the window's left edge (`inset::FLUSH_LEFT`: no padding), so a
+  modifier-drag from its first character to its last is the link plus line breaks. Only the
+  terminal loop turns the real clipboard on (`Shell::attach_terminal`); tests use
+  `Desktop::with_path` and recording stand-ins.
 - Tool calls (#2183) are one line each: `✓ list_tasks · 3 tickets: 1 ready, 1 waiting · 12 ms`.
   AMP calls get a sentence for what they did (the contract tools, `kb_search` and `create_tasks`;
   any other falls back to the result's `key: value` list), durations under a second are in ms,

@@ -1,8 +1,8 @@
 //! Left and right padding around the chat (#2251): `[tui] padding` columns on each side.
 //!
 //! [`Inset`] wraps a component: it renders the child [`Padding::columns`] narrower and indents
-//! every row, so the right edge keeps the same gap (the child wraps, truncates and right-aligns
-//! at the narrower width). [`crate::ChatView`] wraps every area in one: the header, the
+//! every row (except a [`FLUSH_LEFT`] one), so the right edge keeps the same gap (the child
+//! wraps, truncates and right-aligns at the narrower width). [`crate::ChatView`] wraps every area in one: the header, the
 //! transcript (inside its scroll view, so the scroll view still spans the screen and the
 //! "↓ new output" pill stays centred), the status slot, the AMP panels, the `/` menu, the editor,
 //! the AMP status line and the footer. They share one [`Padding`], so changing it moves them all.
@@ -30,6 +30,11 @@ pub const MIN_INNER: usize = 40;
 /// At this many columns or fewer the padding is halved, rounded up (#2344): 1 column each side
 /// by default on an 80-column terminal, 2 on wider ones.
 pub const NARROW: usize = 80;
+
+/// A row that starts with this is not indented (#2423): the pairing link's rows start at the
+/// screen's left edge, so a terminal selection of them has no padding to remove. It is an OSC 8
+/// end-of-hyperlink with no hyperlink open: the terminal draws and does nothing.
+pub const FLUSH_LEFT: &str = "\x1b]8;;\x07";
 
 /// Blank rows above and below the chat (#2344).
 pub const VERTICAL: usize = 1;
@@ -141,7 +146,7 @@ impl Component for Inset {
         lines
             .into_iter()
             .map(|line| {
-                if line.is_empty() {
+                if line.is_empty() || line.starts_with(FLUSH_LEFT) {
                     line
                 } else {
                     format!("{indent}{line}")
@@ -191,6 +196,23 @@ mod tests {
         let lines = inset.render(80);
         assert_eq!(lines[0], format!(" {}", "x".repeat(78)));
         assert_eq!(lines[1], "", "blank rows stay blank");
+    }
+
+    /// #2423: a [`FLUSH_LEFT`] row (the pairing link) keeps the left edge.
+    #[test]
+    fn flush_left_rows_are_not_indented() {
+        struct Link;
+        impl Component for Link {
+            fn render(&self, _: usize) -> Vec<String> {
+                vec![format!("{FLUSH_LEFT}https://a"), "b".into()]
+            }
+            fn invalidate(&self) {}
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+        let lines = Inset::new(Arc::new(Link), Padding::new(2)).render(120);
+        assert_eq!(lines, vec![format!("{FLUSH_LEFT}https://a"), "  b".into()]);
     }
 
     #[test]
