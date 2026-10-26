@@ -45,6 +45,8 @@ var relayTableGrants = []struct{ privs, table string }{
 	{"SELECT, INSERT, UPDATE, DELETE", "remote_sessions"},
 	{"SELECT, INSERT, UPDATE, DELETE", "remote_devices"},
 	// Replica membership: its own heartbeat row, and finding the holder.
+	// Row-level security (relayNodePolicies) limits the writes to rows the
+	// relay's role registered.
 	{"SELECT, INSERT, UPDATE, DELETE", "api_nodes"},
 	// remote.* audit entries (INSERT ... RETURNING id, at) and their webhook
 	// deliveries (RETURNING id); the relay reads neither table back.
@@ -60,6 +62,31 @@ var relayTableGrants = []struct{ privs, table string }{
 
 // relaySequences are the serial sequences behind the relay's INSERTs.
 var relaySequences = [][2]string{{"audit_log", "id"}, {"webhook_deliveries", "id"}, {"remote_devices", "id"}}
+
+// relayNodePolicies keep the relay's role to its own api_nodes rows (#2398,
+// re-review #2394 N2). amp-api sends its cluster token to the address in an
+// amp-api node's row; a relay that could rewrite that address would receive
+// the token. registered_by is current_user by default, and the relay's role
+// may insert, update and delete only rows registered_by itself (and can't
+// change who registered a row). It still reads every row. amp-api owns the
+// table, so row-level security doesn't apply to it; every other role keeps
+// full access through api_nodes_visible.
+func relayNodePolicies(role string) []string {
+	return []string{
+		`ALTER TABLE api_nodes ENABLE ROW LEVEL SECURITY`,
+		`DROP POLICY IF EXISTS api_nodes_visible ON api_nodes`,
+		`DROP POLICY IF EXISTS api_nodes_relay_insert ON api_nodes`,
+		`DROP POLICY IF EXISTS api_nodes_relay_update ON api_nodes`,
+		`DROP POLICY IF EXISTS api_nodes_relay_delete ON api_nodes`,
+		`CREATE POLICY api_nodes_visible ON api_nodes USING (true) WITH CHECK (true)`,
+		`CREATE POLICY api_nodes_relay_insert ON api_nodes AS RESTRICTIVE FOR INSERT TO ` + role +
+			` WITH CHECK (registered_by = current_user)`,
+		`CREATE POLICY api_nodes_relay_update ON api_nodes AS RESTRICTIVE FOR UPDATE TO ` + role +
+			` USING (registered_by = current_user) WITH CHECK (registered_by = current_user)`,
+		`CREATE POLICY api_nodes_relay_delete ON api_nodes AS RESTRICTIVE FOR DELETE TO ` + role +
+			` USING (registered_by = current_user)`,
+	}
+}
 
 var roleName = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
@@ -97,6 +124,7 @@ func (r *Repo) GrantRelayRole(ctx context.Context, role string) error {
 	for _, g := range relayTableGrants {
 		stmts = append(stmts, fmt.Sprintf(`GRANT %s ON TABLE %s TO %s`, g.privs, pgx.Identifier{g.table}.Sanitize(), id))
 	}
+	stmts = append(stmts, relayNodePolicies(id)...)
 	for _, s := range stmts {
 		if _, err := tx.Exec(ctx, s); err != nil {
 			return fmt.Errorf("granting the relay role: %s: %w", s, err)
@@ -145,7 +173,7 @@ func (r *Repo) settingToken(ctx context.Context, key string) (string, error) {
 }
 
 // RemoveRelayNode forgets a relay replica (which never owns projects): only
-// its own api_nodes row.
+// its own api_nodes row (row-level security allows no other).
 func (r *Repo) RemoveRelayNode(ctx context.Context, id string) error {
 	_, err := r.db.Exec(ctx, `DELETE FROM api_nodes WHERE id = $1`, id)
 	return err

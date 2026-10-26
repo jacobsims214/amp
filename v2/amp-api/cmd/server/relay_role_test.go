@@ -182,6 +182,107 @@ func TestRelayRole_LeastPrivilege(t *testing.T) {
 	}
 }
 
+// The relay's role can't touch amp-api's replica rows (#2398, re-review
+// #2394 N2). amp-api sends its own cluster token to a project owner's
+// address; a relay that could rewrite an amp-api node's addr (or register a
+// row amp-api would trust) would receive that token. Row-level security keeps
+// the relay to the rows its role registered, and amp-api uses only rows its
+// own role registered.
+func TestRelayRole_CantRedirectAmpAPINodes(t *testing.T) {
+	w := newRBACWorld(t)
+	rr, dsn := relayRole(t, w.s.repo)
+	ctx := context.Background()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close(ctx)
+
+	suffix := fmt.Sprint(time.Now().UnixNano())
+	apiNode, relayNode := "api-n2-"+suffix, "relay-n2-"+suffix
+	const apiAddr, evilAddr = "10.0.0.7:3003", "10.0.0.66:3003"
+	if err := w.s.repo.NodeHeartbeat(ctx, apiNode, apiAddr); err != nil {
+		t.Fatal(err)
+	}
+	if err := rr.NodeHeartbeat(ctx, relayNode, evilAddr); err != nil {
+		t.Fatalf("the relay's own heartbeat: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = w.s.repo.RemoveNode(context.Background(), apiNode)
+		_ = w.s.repo.RemoveNode(context.Background(), relayNode)
+	})
+
+	// Writes to amp-api's row: refused (an error) or filtered out (no row).
+	for _, q := range []string{
+		`UPDATE api_nodes SET addr = '` + evilAddr + `' WHERE id = '` + apiNode + `'`,
+		`DELETE FROM api_nodes WHERE id = '` + apiNode + `'`,
+		`INSERT INTO api_nodes (id, addr) VALUES ('` + apiNode + `', '` + evilAddr + `')
+		   ON CONFLICT (id) DO UPDATE SET addr = EXCLUDED.addr`,
+		`INSERT INTO api_nodes (id, addr, registered_by) VALUES ('forged-` + suffix + `', '` + evilAddr + `', current_user || 'x')`,
+		`UPDATE api_nodes SET registered_by = 'amp' WHERE id = '` + relayNode + `'`,
+	} {
+		tag, err := conn.Exec(ctx, q)
+		switch {
+		case err != nil && pgCode(err) != "42501":
+			t.Errorf("%s: want a row-level security refusal, got %v", q, err)
+		case err == nil && tag.RowsAffected() > 0:
+			t.Errorf("%s: allowed (%d rows)", q, tag.RowsAffected())
+		}
+	}
+	owner, err := pgx.Connect(ctx, testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer owner.Close(ctx)
+	var addr, by string
+	if err := owner.QueryRow(ctx, `SELECT addr, registered_by FROM api_nodes WHERE id = $1`, apiNode).Scan(&addr, &by); err != nil {
+		t.Fatalf("amp-api's row: %v", err)
+	}
+	if addr != apiAddr {
+		t.Fatalf("the relay's role rewrote amp-api's node address to %s", addr)
+	}
+	if err := owner.QueryRow(ctx, `SELECT registered_by FROM api_nodes WHERE id = $1`, relayNode).Scan(&by); err != nil || by != testRelayRole {
+		t.Fatalf("the relay's row is registered by %q (%v), want %s", by, err, testRelayRole)
+	}
+	// What the relay does with its own row still works.
+	if err := rr.NodeHeartbeat(ctx, relayNode, evilAddr); err != nil {
+		t.Fatalf("the relay's second heartbeat: %v", err)
+	}
+	if got, _, err := rr.NodeAddr(ctx, apiNode, time.Minute); err != nil || got != apiAddr {
+		t.Fatalf("the relay can't read replica addresses: %v", err)
+	}
+
+	// amp-api never gives its token to an address the relay registered: a
+	// project pointed at the relay's row (which the relay itself can't do; a
+	// stale or forged ownership row stands in for it) is taken over, not
+	// forwarded to the relay.
+	project := 900000000 + int(time.Now().UnixNano()%1000000)
+	if _, err := owner.Exec(ctx, `INSERT INTO project_owners (project_id, node_id) VALUES ($1, $2)`, project, relayNode); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = owner.Exec(context.Background(), `DELETE FROM project_owners WHERE project_id = $1`, project)
+	})
+	o, err := w.s.repo.ClaimProject(ctx, project, apiNode, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if o.NodeID != apiNode || o.Addr == evilAddr {
+		t.Fatalf("amp-api's claim on a project pointed at the relay's row: owner %s at %q, want itself", o.NodeID, o.Addr)
+	}
+	// And a project owned by a live amp-api replica is forwarded to that
+	// replica's own address.
+	other := "api-n2b-" + suffix
+	if err := w.s.repo.NodeHeartbeat(ctx, other, "10.0.0.8:3003"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = w.s.repo.RemoveNode(context.Background(), other) })
+	o, err = w.s.repo.ClaimProject(ctx, project, other, time.Minute)
+	if err != nil || o.NodeID != apiNode || o.Addr != apiAddr {
+		t.Fatalf("another replica's claim: %+v %v, want %s at %s", o, err, apiNode, apiAddr)
+	}
+}
+
 // The relay's cluster token is its own: never amp-api's, refused by amp-api's
 // actor listener, and amp-api's token is refused by the relay's internal
 // listener. amp-api's end notifier uses the relay's token.
