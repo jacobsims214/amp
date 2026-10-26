@@ -58,6 +58,11 @@ func mustLoadMigrations() []repository.Migration {
 }
 
 func main() {
+	// `amp-api audit ...`: verify the audit chain, write checkpoints now,
+	// or make a signing key (audit_cli.go).
+	if len(os.Args) > 1 && os.Args[1] == "audit" {
+		os.Exit(runAuditCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	dsn := envOrDefault("DATABASE_URL", "postgres://amp:amp@localhost:5432/amp?sslmode=disable")
@@ -355,6 +360,14 @@ func main() {
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
 	// are deleted. Idempotent, so every replica can run it.
 	go service.New(repo, registry, kbSvc).RunTrashPurge(context.Background(), time.Hour)
+
+	// Audit log integrity (#2429): sign each chain's head hourly, and
+	// delete entries past AUDIT_RETENTION_DAYS daily through the anchored
+	// path. One replica at a time runs each (advisory locks).
+	service.AuditKeys = loadAuditKeys()
+	auditRetention := auditRetentionFromEnv()
+	go service.New(repo, registry, kbSvc).RunAuditCheckpoints(ctx, time.Hour, repo.TryNamedLock)
+	go service.New(repo, registry, kbSvc).RunAuditRetention(ctx, auditRetention, 24*time.Hour, repo.TryNamedLock)
 
 	// Health check (unauthenticated, used by k8s probes)
 	var draining atomic.Bool

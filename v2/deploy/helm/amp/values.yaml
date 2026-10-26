@@ -65,6 +65,24 @@ ampApi:
   # n8n on your LAN). Off: a project owner's webhook URL can't be used to
   # reach services inside the cluster.
   webhookAllowPrivateNetworks: false
+  # Audit log integrity and retention (KB decisions/audit-log-v2.md).
+  audit:
+    # Entries older than this are deleted daily, through a signed anchor
+    # checkpoint so the rest still verifies. 0 keeps them forever.
+    retentionDays: 365
+    # Ed25519 key that signs the hourly audit checkpoints. It lives only in
+    # this Secret, never in the database. Make one with
+    #   amp-api audit keygen -out signing-key
+    #   kubectl -n amp create secret generic amp-audit-signing --from-file=signing-key=signing-key
+    # Unset: checkpoints are written unsigned (amp-api logs a warning, and
+    # `audit verify` reports them as unsigned): the hash chain still shows
+    # edits, but can't prove them against someone with database access.
+    signingKey:
+      existingSecret: ""
+      key: signing-key
+    # Public keys (base64, comma-separated) of retired signing keys, so
+    # checkpoints signed before a rotation still verify. Not secret.
+    retiredPublicKeys: ""
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
