@@ -587,6 +587,46 @@ type AuditFilter struct {
 	Action      string // exact action, or a prefix ending in "." (e.g. "org.")
 	BeforeID    int64  // page backwards from here
 	Limit       int
+
+	// Audit log v2 filters (#2431).
+	Actor      string     // actor email, case-insensitive substring
+	ActorType  string     // AuditActor*
+	TargetType string     // exact
+	TargetID   string     // exact
+	IP         string     // an address or a CIDR prefix (source_ip <<= IP)
+	Outcome    string     // AuditOutcome*
+	Client     string     // AuditClient*
+	From       *time.Time // at >= From
+	To         *time.Time // at < To
+}
+
+// Values is the filter as it was asked for, without the paging fields:
+// what an audit.export row records.
+func (f AuditFilter) Values() map[string]any {
+	out := map[string]any{}
+	set := func(k string, v any, zero bool) {
+		if !zero {
+			out[k] = v
+		}
+	}
+	set("org_id", f.OrgID, f.OrgID == 0)
+	set("project_id", f.ProjectID, f.ProjectID == 0)
+	set("actor_user_id", f.ActorUserID, f.ActorUserID == 0)
+	set("action", f.Action, f.Action == "")
+	set("actor", f.Actor, f.Actor == "")
+	set("actor_type", f.ActorType, f.ActorType == "")
+	set("target_type", f.TargetType, f.TargetType == "")
+	set("target_id", f.TargetID, f.TargetID == "")
+	set("ip", f.IP, f.IP == "")
+	set("outcome", f.Outcome, f.Outcome == "")
+	set("client", f.Client, f.Client == "")
+	if f.From != nil {
+		out["from"] = f.From.UTC().Format(time.RFC3339)
+	}
+	if f.To != nil {
+		out["to"] = f.To.UTC().Format(time.RFC3339)
+	}
+	return out
 }
 
 // IsAgent reports whether u is an agent account.

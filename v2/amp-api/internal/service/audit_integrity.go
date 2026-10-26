@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/simstech/amp-api/internal/auditchain"
@@ -59,7 +60,81 @@ func (s *Service) VerifyAudit(ctx context.Context, p authz.Principal, orgID int)
 	default:
 		return auditchain.Report{}, authz.Forbidden("verifying every audit chain is for global admins; pass an org you administer")
 	}
-	return VerifyAuditChains(ctx, s.Repo, AuditKeys, auditchain.Policy{Retention: AuditRetention}, chains)
+	return s.verifyAuditCached(ctx, chains, time.Now())
+}
+
+// AuditVerifyFullEvery is how often the verify endpoint re-reads a whole
+// chain; in between it verifies incrementally, reading only the rows
+// written since the last verification (#2441 L2: a full read on every
+// audit panel load is O(rows) per page view). The CLI (`amp-api audit
+// verify`) always reads everything. A variable for tests.
+var AuditVerifyFullEvery = time.Hour
+
+// verifyCache keeps, per chain, where the last verification ended.
+type verifyCache struct {
+	mu sync.Mutex
+	m  map[verifyCacheKey]verifyCacheEntry
+}
+
+type verifyCacheKey struct {
+	repo  *repository.Repo
+	chain string
+}
+
+type verifyCacheEntry struct {
+	state  *auditchain.State
+	fullAt time.Time
+	// What it was verified against: a change of keys or policy needs a
+	// full verification.
+	keys   *auditchain.Keyring
+	policy auditchain.Policy
+}
+
+// auditVerifyCache is shared by every Service of a process (they share
+// the repository; the key includes it).
+var auditVerifyCache = &verifyCache{m: map[verifyCacheKey]verifyCacheEntry{}}
+
+// verifyAuditCached verifies chains, each from where its last verification
+// ended when that is recent enough, else in full.
+func (s *Service) verifyAuditCached(ctx context.Context, chains []string, now time.Time) (auditchain.Report, error) {
+	keys, policy := AuditKeys, auditchain.Policy{Retention: AuditRetention}
+	var reports []auditchain.ChainReport
+	for _, key := range chains {
+		ck := verifyCacheKey{s.Repo, key}
+		auditVerifyCache.mu.Lock()
+		prev, cached := auditVerifyCache.m[ck]
+		auditVerifyCache.mu.Unlock()
+		resumable := cached && prev.keys == keys && prev.policy == policy && now.Sub(prev.fullAt) < AuditVerifyFullEvery
+		var v *auditchain.ChainVerifier
+		err := s.Repo.ReadAuditChainAfter(ctx, key,
+			func(head *auditchain.Head, cps []auditchain.Checkpoint) int64 {
+				v = auditchain.NewChainVerifier(key, head, cps, keys, policy)
+				if resumable && v.Resume(prev.state) {
+					return prev.state.LastSeq()
+				}
+				resumable = false
+				return 0
+			},
+			func(r auditchain.Row) { v.Add(r) })
+		if err != nil {
+			return auditchain.Report{}, err
+		}
+		rep := v.Finish()
+		fullAt := now
+		if resumable {
+			fullAt = prev.fullAt
+		}
+		rep.FullCheckAt = &fullAt
+		auditVerifyCache.mu.Lock()
+		if st := v.State(); st != nil {
+			auditVerifyCache.m[ck] = verifyCacheEntry{state: st, fullAt: fullAt, keys: keys, policy: policy}
+		} else {
+			delete(auditVerifyCache.m, ck) // a failed chain is read in full every time
+		}
+		auditVerifyCache.mu.Unlock()
+		reports = append(reports, rep)
+	}
+	return auditchain.NewReport(keys, reports), nil
 }
 
 // VerifyAuditChains recomputes each chain from its latest anchor and checks

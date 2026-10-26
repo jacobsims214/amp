@@ -99,6 +99,15 @@ ampApi:
   audit:
     signingKey:
       existingSecret: amp-audit-signing
+  # Webhook auth headers and signing secrets are encrypted at rest with the
+  # key in this Secret (#2441). Its value is never in git. Create it once:
+  #   openssl rand -base64 32 | tr -d '\n' > encryption-key   # keep a copy off-box
+  #   kubectl -n amp create secret generic amp-secrets-encryption --from-file=encryption-key=encryption-key
+  #   rm encryption-key
+  # The reference is optional: until the Secret exists amp-api starts without
+  # a key, and webhook auth headers can't be added.
+  secretsEncryption:
+    existingSecret: amp-secrets-encryption
   resources:
     requests: { cpu: 250m, memory: 256Mi }
     limits: { cpu: "1", memory: 1Gi }

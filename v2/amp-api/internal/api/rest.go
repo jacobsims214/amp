@@ -133,6 +133,8 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/agents", h.agents)
 	mux.HandleFunc("/api/audit", h.audit)
 	mux.HandleFunc("/api/audit/verify", h.auditVerify)
+	mux.HandleFunc("/api/audit/export", h.auditExport)
+	mux.HandleFunc("/api/webhooks", h.instanceWebhooks)
 	mux.HandleFunc("/api/webhooks/", h.webhookSub)
 	mux.HandleFunc("/api/day-reports", h.dayReports)
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
@@ -369,28 +371,65 @@ func (h *RestHandler) agents(w http.ResponseWriter, r *http.Request) {
 }
 
 // /api/audit?org_id=&project_id=&actor_id=&action=&before=&limit=
+//
+//	&actor=&actor_type=&target_type=&target_id=&ip=&outcome=&client=&from=&to=
+//
 // Global admins read everything; org owners/admins their org; project
-// owners their project.
+// owners their project. Filters: service.ParseAuditFilter.
 func (h *RestHandler) audit(w http.ResponseWriter, r *http.Request) {
 	pr, ok := h.principal(w, r)
 	if !ok {
 		return
 	}
-	q := r.URL.Query()
-	num := func(k string) int {
-		n, _ := strconv.Atoi(q.Get(k))
-		return n
+	f, err := service.ParseAuditFilter(r.URL.Query().Get)
+	if err != nil {
+		fail(w, err, 400)
+		return
 	}
-	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
-	entries, err := h.svc.Audit(r.Context(), pr, domain.AuditFilter{
-		OrgID: num("org_id"), ProjectID: num("project_id"), ActorUserID: num("actor_id"),
-		Action: q.Get("action"), BeforeID: before, Limit: num("limit"),
-	})
+	entries, err := h.svc.Audit(r.Context(), pr, f)
 	if err != nil {
 		fail(w, err, 500)
 		return
 	}
 	jsonOK(w, map[string]interface{}{"entries": entries})
+}
+
+// GET /api/audit/export?format=csv|ndjson&<the /api/audit filters>
+// streams every matching entry (no row cap), newest first, as a download,
+// and records an audit.export row. Same access as /api/audit.
+func (h *RestHandler) auditExport(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	pr, ok := h.principal(w, r)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	f, err := service.ParseAuditFilter(q.Get)
+	if err != nil {
+		fail(w, err, 400)
+		return
+	}
+	format := q.Get("format")
+	if format == "" {
+		format = service.AuditExportCSV
+	}
+	ex := newAuditExporter(w, format, f)
+	_, err = h.svc.ExportAudit(r.Context(), pr, f, format, ex.write)
+	switch {
+	case err == nil:
+		ex.finish()
+	case !ex.started:
+		// Refused (or failed) before the first row: an ordinary error.
+		fail(w, err, 500)
+	default:
+		// Part way through: the status is already sent, so cut the
+		// connection rather than hand over a short file that looks whole.
+		slog.Error("audit export failed part way", "rows", ex.rows, "err", err)
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // GET /api/audit/verify?org_id= recomputes the audit hash chain of an org

@@ -481,6 +481,77 @@ export interface AuditEntry {
   target_id?: string
   summary: string
   details?: Record<string, unknown>
+  // Audit log v2: all optional; entries from before v2 have schema_version 1 (or none) and none of these.
+  schema_version?: number
+  actor_type?: AuditActorType
+  auth_method?: string
+  token_id?: number
+  session_id?: string
+  on_behalf_of_user_id?: number
+  agent_profile?: string
+  target_name?: string
+  outcome?: AuditOutcome
+  reason?: string
+  source_ip?: string
+  user_agent?: string
+  client?: AuditClient
+  request_id?: string
+  trace_id?: string
+  before?: Record<string, unknown>
+  after?: Record<string, unknown>
+  chain_key?: string
+  chain_seq?: number
+  hash?: string
+}
+
+export type AuditActorType = 'human' | 'agent' | 'system' | 'anonymous'
+export type AuditOutcome = 'success' | 'denied' | 'failed'
+export type AuditClient = 'web' | 'mcp' | 'harness' | 'api' | 'relay' | 'cli' | 'system'
+
+/** What the audit log is narrowed to; empty fields don't filter. Same names as GET /api/audit. */
+export interface AuditFilter {
+  action?: string
+  actor?: string
+  actor_type?: AuditActorType | ''
+  target_type?: string
+  target_id?: string
+  ip?: string
+  outcome?: AuditOutcome | ''
+  client?: AuditClient | ''
+  project_id?: number
+  /** ISO times; to is exclusive. */
+  from?: string
+  to?: string
+}
+
+/** GET /api/audit/verify */
+export type AuditVerifyStatus = 'ok' | 'unproven' | 'failed'
+
+export interface AuditVerifyReport {
+  /** True only when status is ok. */
+  ok: boolean
+  /** ok: verified and signed; unproven: no problems, but nothing signed proves it; failed: tampering or loss. Missing from older servers. */
+  status?: AuditVerifyStatus
+  checked_at: string
+  signing: { configured: boolean; key_id?: string }
+  chains: {
+    chain_key: string
+    ok: boolean
+    status?: AuditVerifyStatus
+    rows: number
+    head_seq: number
+    anchor_seq?: number
+    checkpoints_matched: number
+    signed_checkpoints: number
+    last_signed_seq?: number
+    problems: { kind: string; seq?: number; audit_id?: number; detail: string }[]
+    warnings?: string[]
+    /** Rows read by this check: with incremental, only those written since the last one (#2441). Older servers omit it. */
+    rows_read?: number
+    incremental?: boolean
+    /** When every row of the chain was last re-read in full. */
+    full_check_at?: string
+  }[]
 }
 
 export type WebhookFormat = 'json' | 'slack'
@@ -496,6 +567,13 @@ export interface Webhook {
   secret?: string
   events: string[]
   active: boolean
+  /** The extra header sent with each delivery (its value is never shown). */
+  auth_header_name?: string
+  auth_header_set?: boolean
+  /** A webhook of the whole AMP: audit entries only, all of them. */
+  instance?: boolean
+  /** Audit entries carry their request context (IP, user agent, session and token ids, before/after). Opt-in; on by default for instance webhooks. */
+  include_context?: boolean
   created_by?: number
   created_at: string
   updated_at: string
@@ -511,6 +589,9 @@ export interface WebhookChange {
   format?: WebhookFormat
   events?: string[]
   active?: boolean
+  /** "Name: value" sets it, "" removes it, absent keeps it. */
+  auth_header?: string
+  include_context?: boolean
 }
 
 export interface WebhookDelivery {

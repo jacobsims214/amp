@@ -105,18 +105,26 @@ func idStr(n int) string { return fmt.Sprint(n) }
 // owners and admins their org's (f.OrgID required); project owners their
 // project's (f.ProjectID required).
 func (s *Service) Audit(ctx context.Context, p authz.Principal, f domain.AuditFilter) ([]domain.AuditEntry, error) {
+	if err := s.authorizeAudit(ctx, p, f); err != nil {
+		return nil, err
+	}
+	return s.Repo.ListAudit(ctx, f)
+}
+
+// authorizeAudit is the read rule of the audit log (listing and export).
+func (s *Service) authorizeAudit(ctx context.Context, p authz.Principal, f domain.AuditFilter) error {
 	switch {
 	case p.Super:
 	case f.OrgID != 0:
 		if _, err := s.Authz.RequireOrgAdmin(ctx, p, f.OrgID); err != nil {
-			return nil, err
+			return err
 		}
 	case f.ProjectID != 0:
 		if _, err := s.Authz.RequireProject(ctx, p, f.ProjectID, authz.Owner); err != nil {
-			return nil, err
+			return err
 		}
 	default:
-		return nil, authz.Forbidden("the full audit log is for global admins; pass an org you administer or a project you own")
+		return authz.Forbidden("the full audit log is for global admins; pass an org you administer or a project you own")
 	}
-	return s.Repo.ListAudit(ctx, f)
+	return nil
 }

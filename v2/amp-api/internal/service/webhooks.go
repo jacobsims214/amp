@@ -4,18 +4,22 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/secretbox"
 	"github.com/simstech/amp-api/internal/webhook"
 )
 
 // Webhooks: project owners manage their project's; org owners and admins
 // manage org-wide ones, which fire for every project in the org. Either
 // can opt into audit entries for its scope ("audit.*"): the same entries
-// its managers can read in the audit log.
+// its managers can read in the audit log. Global admins manage instance
+// webhooks (no org, no project), which carry audit entries only, all of
+// them: the SIEM stream of the whole AMP (#2431).
 
 // AllowPrivateWebhooks lets webhook URLs point at private, loopback, and
 // link-local addresses (set from WEBHOOK_ALLOW_PRIVATE_NETWORKS; the
@@ -29,17 +33,27 @@ type WebhookChange struct {
 	Format *string   `json:"format"`
 	Events *[]string `json:"events"`
 	Active *bool     `json:"active"`
+	// AuthHeader sets the extra header sent with every delivery, as
+	// "Name: value" (e.g. "Authorization: Splunk <token>"); "" removes it.
+	// Write-only: reads show only its name.
+	AuthHeader *string `json:"auth_header"`
 	// IncludeContext: send audit entries' request context (IP, user
-	// agent, session and token ids, before/after). Default off.
+	// agent, session and token ids, before/after). Default off for org and
+	// project webhooks, on for instance webhooks.
 	IncludeContext *bool `json:"include_context"`
 }
 
-// requireWebhookScope checks p may manage webhooks for an org or a project
-// (exactly one of them).
+// requireWebhookScope checks p may manage webhooks for an org, a project,
+// or (neither) the instance.
 func (s *Service) requireWebhookScope(ctx context.Context, p authz.Principal, orgID, projectID *int) error {
 	switch {
-	case (orgID == nil) == (projectID == nil):
-		return authz.BadRequest("a webhook belongs to exactly one org or one project")
+	case orgID != nil && projectID != nil:
+		return authz.BadRequest("a webhook belongs to one org, one project, or the whole instance")
+	case orgID == nil && projectID == nil:
+		if !p.Super {
+			return authz.Forbidden("instance webhooks are for global admins")
+		}
+		return nil
 	case orgID != nil:
 		_, err := s.Authz.RequireOrgAdmin(ctx, p, *orgID)
 		return err
@@ -78,11 +92,24 @@ func (s *Service) CreateWebhook(ctx context.Context, p authz.Principal, orgID, p
 	if err := s.requireWebhookScope(ctx, p, orgID, projectID); err != nil {
 		return nil, err
 	}
-	w := domain.Webhook{OrgID: orgID, ProjectID: projectID, Format: domain.WebhookFormatJSON, Active: true, CreatedBy: p.UserRef(), Events: []string{}}
+	// Instance webhooks (a global admin's SIEM stream) get the request
+	// context by default; org and project ones opt in (#2439 M2).
+	instance := orgID == nil && projectID == nil
+	w := domain.Webhook{OrgID: orgID, ProjectID: projectID, Format: domain.WebhookFormatJSON, Active: true, CreatedBy: p.UserRef(), Events: []string{},
+		Instance: instance, IncludeContext: instance}
 	if c.URL == nil {
 		return nil, authz.BadRequest("url is required")
 	}
+	if w.Instance && (c.Events == nil || len(*c.Events) == 0) {
+		c.Events = &[]string{"audit.*"} // all an instance webhook can carry
+	}
 	if err := applyWebhookChange(&w, c); err != nil {
+		return nil, err
+	}
+	if err := checkAuthHeaderTransport(&w); err != nil {
+		return nil, err
+	}
+	if err := s.checkAuthHeaderStorable(w.AuthHeaderValue); err != nil {
 		return nil, err
 	}
 	secret, err := webhook.NewSecret()
@@ -106,15 +133,39 @@ func (s *Service) UpdateWebhook(ctx context.Context, p authz.Principal, id int, 
 		return nil, err
 	}
 	before := webhookValue(w)
+	oldURL := w.URL
 	if err := applyWebhookChange(w, c); err != nil {
 		return nil, err
 	}
-	updated, err := s.Repo.UpdateWebhook(ctx, *w)
+	if w.URL != oldURL && w.AuthHeaderSet && c.AuthHeader == nil {
+		// The stored header would go to the new address: whoever moves the
+		// webhook must supply it again (or remove it), so editing a URL
+		// can't be used to collect a credential someone else entered.
+		return nil, authz.BadRequest("this webhook sends an auth header: changing its URL needs auth_header again (or \"\" to remove it)")
+	}
+	if err := checkAuthHeaderTransport(w); err != nil {
+		return nil, err
+	}
+	if c.AuthHeader != nil {
+		if err := s.checkAuthHeaderStorable(w.AuthHeaderValue); err != nil {
+			return nil, err
+		}
+	}
+	updated, err := s.Repo.UpdateWebhook(ctx, *w, c.AuthHeader != nil)
 	if err != nil {
 		return nil, err
 	}
 	e := webhookAudit("webhook.update", updated, "changed webhook "+describeWebhook(updated))
 	e.Before, e.After = before, webhookValue(updated)
+	if c.AuthHeader != nil {
+		// The value is a secret and never recorded, so before/after can look
+		// identical (same header name) while the credential was swapped: say
+		// that it was replaced or removed (#2441 L4).
+		e.Details["auth_header_changed"] = true
+		if !updated.AuthHeaderSet {
+			e.Details["auth_header_removed"] = true
+		}
+	}
 	s.audit(ctx, p, e)
 	return updated, nil
 }
@@ -198,15 +249,69 @@ func applyWebhookChange(w *domain.Webhook, c WebhookChange) error {
 		if err != nil {
 			return authz.BadRequest("%s", err.Error())
 		}
+		if w.Instance {
+			if len(events) == 0 {
+				return authz.BadRequest(`an instance webhook carries audit entries: pick "audit.*" or audit actions`)
+			}
+			for _, e := range events {
+				if e != "*" && !strings.HasPrefix(e, "audit.") {
+					return authz.BadRequest("an instance webhook carries audit entries only; %q is a project event", e)
+				}
+			}
+		}
 		w.Events = events
 	}
 	if c.Active != nil {
 		w.Active = *c.Active
 	}
+	if c.AuthHeader != nil {
+		name, value, err := parseAuthHeader(*c.AuthHeader)
+		if err != nil {
+			return err
+		}
+		w.AuthHeaderName, w.AuthHeaderValue, w.AuthHeaderSet = name, value, name != ""
+	}
 	if c.IncludeContext != nil {
 		w.IncludeContext = *c.IncludeContext
 	}
 	return nil
+}
+
+// checkAuthHeaderStorable refuses a new auth header when there is no key
+// to encrypt it with: AMP never stores one in plaintext (#2441).
+func (s *Service) checkAuthHeaderStorable(value string) error {
+	if value != "" && !s.Repo.CanSealSecrets() {
+		return authz.BadRequest("auth headers are stored encrypted, and this server has no encryption key: an admin sets one (Helm ampApi.secretsEncryption.existingSecret, env %s) before auth headers can be added", secretbox.EnvKey)
+	}
+	return nil
+}
+
+// checkAuthHeaderTransport refuses to send an auth header over plain
+// http, where anyone on the path could read it (allowed only where private
+// networks are, for local development).
+func checkAuthHeaderTransport(w *domain.Webhook) error {
+	if w.AuthHeaderSet && !AllowPrivateWebhooks && !strings.HasPrefix(strings.ToLower(w.URL), "https://") {
+		return authz.BadRequest("an auth header is only sent to https URLs")
+	}
+	return nil
+}
+
+// parseAuthHeader splits "Name: value" ("" means none). Errors never
+// quote the value: it is a secret.
+func parseAuthHeader(raw string) (name, value string, err error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", "", nil
+	}
+	name, value, ok := strings.Cut(raw, ":")
+	if !ok {
+		return "", "", authz.BadRequest(`auth_header must be "Name: value", e.g. "Authorization: Splunk <token>"`)
+	}
+	name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+	if err := webhook.ValidAuthHeader(name, value); err != nil {
+		return "", "", authz.BadRequest("auth_header: %s", err.Error())
+	}
+	return http.CanonicalHeaderKey(name), value, nil
 }
 
 func validateWebhookURL(raw string) (string, error) {
@@ -261,5 +366,8 @@ func webhookValue(w *domain.Webhook) map[string]any {
 	for _, e := range w.Events {
 		events = append(events, e)
 	}
-	return map[string]any{"name": w.Name, "url": w.URL, "format": w.Format, "events": events, "active": w.Active}
+	// The auth header's value is a secret: only its name is recorded, under
+	// a key redact() leaves readable.
+	return map[string]any{"name": w.Name, "url": w.URL, "format": w.Format, "events": events, "active": w.Active,
+		"delivery_header": w.AuthHeaderName}
 }

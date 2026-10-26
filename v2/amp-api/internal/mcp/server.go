@@ -95,15 +95,28 @@ func (s *Server) Register(mcp *server.MCPServer) {
 
 	mcp.AddTool(tool("amp_audit_log",
 		"Read the audit log: who changed access (org, team, project links, roles, accounts, API tokens), settings, or "+
-			"integrations, and who deleted what. Global admins read everything; org owners/admins pass org_id; "+
-			"project owners pass project_id. Newest first.",
+			"integrations, who deleted what, and refused attempts (outcome denied). Global admins read everything; "+
+			"org owners/admins pass org_id; project owners pass project_id. Newest first. Each entry has who "+
+			"(actor_email, actor_type, auth_method, on_behalf_of_user_id), from where (source_ip, user_agent, client, "+
+			"request_id), what (action, target_type/target_id/target_name, summary, details, before/after), the "+
+			"outcome and reason, and its place in the tamper-evident chain (chain_key, chain_seq, hash). Fields are "+
+			"left out when empty; entries from before audit log v2 have schema_version 1 and only the original fields.",
 		props{
-			"org_id":     num("Optional. Entries for this org and its projects."),
-			"project_id": num("Optional. Entries for this project."),
-			"actor_id":   num("Optional. Only changes made by this user id."),
-			"action":     str("Optional. An action (e.g. 'org.member.set') or a prefix ending in '.' (e.g. 'team.')."),
-			"before_id":  num("Optional. Page back: entries older than this id."),
-			"limit":      num("Optional. Default 100, max 500."),
+			"org_id":      num("Optional. Entries for this org and its projects."),
+			"project_id":  num("Optional. Entries for this project."),
+			"actor_id":    num("Optional. Only changes made by this user id."),
+			"actor":       str("Optional. Only entries whose actor email contains this text."),
+			"actor_type":  str("Optional. human, agent, system or anonymous."),
+			"action":      str("Optional. An action (e.g. 'org.member.set') or a prefix ending in '.' (e.g. 'team.')."),
+			"target_type": str("Optional. What was acted on, e.g. 'project', 'user', 'webhook'."),
+			"target_id":   str("Optional. With target_type: that one target's id."),
+			"ip":          str("Optional. Source address (203.0.113.7) or CIDR prefix (203.0.113.0/24)."),
+			"outcome":     str("Optional. success, denied or failed."),
+			"client":      str("Optional. web, mcp, harness, api, relay, cli or system."),
+			"from":        str("Optional. Entries at or after this time: RFC 3339 or a date (2026-10-26)."),
+			"to":          str("Optional. Entries before this time: RFC 3339, or a date (up to the end of that day, UTC)."),
+			"before_id":   num("Optional. Page back: entries older than this id."),
+			"limit":       num("Optional. Default 100, max 500."),
 		}), wrap(ctx, s.open(s.auditLog)))
 
 	mcp.AddTool(tool("amp_list_project_members",
@@ -928,10 +941,21 @@ func (s *Server) whoami(rctx context.Context, _ map[string]interface{}) (*mcpgo.
 }
 
 func (s *Server) auditLog(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
-	entries, err := s.svc.Audit(rctx, caller(rctx).p, domain.AuditFilter{
-		OrgID: optInt(args, "org_id", 0), ProjectID: optInt(args, "project_id", 0), ActorUserID: optInt(args, "actor_id", 0),
-		Action: optStr(args, "action", ""), BeforeID: int64(optInt(args, "before_id", 0)), Limit: optInt(args, "limit", 0),
+	f, err := service.ParseAuditFilter(func(k string) string {
+		switch v := args[k].(type) {
+		case string:
+			return v
+		case float64:
+			return strconv.FormatInt(int64(v), 10)
+		case int:
+			return strconv.Itoa(v)
+		}
+		return ""
 	})
+	if err != nil {
+		return nil, err
+	}
+	entries, err := s.svc.Audit(rctx, caller(rctx).p, f)
 	if err != nil {
 		return nil, err
 	}

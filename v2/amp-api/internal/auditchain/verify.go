@@ -99,6 +99,15 @@ type ChainReport struct {
 	LastSignedSeq int64     `json:"last_signed_seq,omitempty"`
 	Problems      []Problem `json:"problems"`
 	Warnings      []string  `json:"warnings,omitempty"`
+	// RowsRead is how many rows this verification read: all of them, or
+	// with Incremental only those after the previous verification's end
+	// (#2441 L2). Rows still counts every row the result covers.
+	RowsRead    int  `json:"rows_read"`
+	Incremental bool `json:"incremental,omitempty"`
+	// FullCheckAt is when every row of the chain was last read and
+	// re-hashed (an incremental result relies on that check for the rows
+	// before it). Set by the caller that caches results.
+	FullCheckAt *time.Time `json:"full_check_at,omitempty"`
 }
 
 // Report is a verification of one or more chains.
@@ -238,6 +247,7 @@ func (v *ChainVerifier) problem(p Problem) { v.rep.Problems = append(v.rep.Probl
 // Add checks the next row. Rows must come in chain_seq order.
 func (v *ChainVerifier) Add(r Row) {
 	v.rep.Rows++
+	v.rep.RowsRead++
 	if r.ChainKey == nil || r.ChainSeq == nil || len(r.Hash) == 0 {
 		v.problem(Problem{Kind: ProblemUnchained, AuditID: r.ID, Detail: "row has no chain position or hash"})
 		return
