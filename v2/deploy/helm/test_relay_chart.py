@@ -309,9 +309,16 @@ def envoy_validate(label, envoy_yaml):
 def main():
     configs = {}
     configs["off"] = test_off([], "default")
-    configs["off-prod"] = test_off(["-f", os.path.join(CHART, "values-production.yaml")], "production")
+    prod_shipped = ["-f", os.path.join(CHART, "values-production.yaml")]
+    configs["off-prod"] = test_off(prod_shipped + ["--set", "relay.enabled=false"], "production")
     configs["on"] = test_on([], "default")
-    prod = ["-f", os.path.join(CHART, "values-production.yaml")]
+    # #2470: production ships with the relay on, its password and token in
+    # Secrets created by hand (the chart renders neither).
+    _, docs = render(*prod_shipped)
+    test_least_privilege(docs, "production as shipped", db_secret="amp-relay-db", tok_secret="amp-relay-cluster-token",
+                         chart_secrets=False)
+    # The cases below start from production with those pins cleared.
+    prod = prod_shipped + ["--set", "relay.database.existingSecret=", "--set", "relay.clusterToken.existingSecret="]
     # #2399: production refuses the relay until its password and token are pinned.
     err = render_error(*prod, "--set", "relay.enabled=true")
     check(err is not None and "relay.database.existingSecret" in err, f"production without pinned relay secrets rendered: {err}")
