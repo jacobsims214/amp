@@ -16,7 +16,7 @@
  * never as HTML.
  */
 import { useState } from 'react'
-import { Check, ChevronRight, Loader2, OctagonX, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
+import { Check, ChevronRight, Loader2, Minus, OctagonX, ShieldAlert, Square, TriangleAlert, X } from 'lucide-react'
 import { SafeMarkdown } from './SafeMarkdown'
 import { promptProblem } from '../../remote/envelope'
 import { formatCost, sessionTokens, type Block, type Outgoing, type Totals, type TranscriptItem } from '../../remote/session'
@@ -125,8 +125,10 @@ function ToolDetail({ item }: { item: Tool }) {
   )
 }
 
-function ToolGlyph({ state }: { state: 'running' | 'ok' | 'failed' }) {
+function ToolGlyph({ state }: { state: 'running' | 'ok' | 'failed' | 'unknown' }) {
   if (state === 'running') return <Loader2 size={13} className="shrink-0 animate-spin text-st-prog" aria-label="running" />
+  // Its result was lost in a gap (#2438): the laptop has it.
+  if (state === 'unknown') return <Minus size={13} strokeWidth={3} className="shrink-0 text-ink-3" aria-label="result not available" />
   if (state === 'failed') return <X size={13} strokeWidth={3} className="shrink-0 text-danger-ink" aria-label="failed" />
   return <Check size={13} strokeWidth={3} className="shrink-0 text-success-ink" aria-label="done" />
 }
@@ -134,11 +136,11 @@ function ToolGlyph({ state }: { state: 'running' | 'ok' | 'failed' }) {
 function ToolRow({ item, workers, now }: { item: Tool; workers: WorkerInfo[]; now: number }) {
   const args = parseArgs(item.arguments_json)
   const r = item.result
-  const state = !r ? 'running' : r.is_error ? 'failed' : 'ok'
+  const state = !r ? (item.endedAt != null ? 'unknown' : 'running') : r.is_error ? 'failed' : 'ok'
   const summary = r ? (r.refused_line ?? resultSummary(item.name, r.text, r.is_error)) : ''
   const elapsed = item.startedAt == null ? ''
     : r ? (item.endedAt != null ? formatElapsed(item.endedAt - item.startedAt) : '')
-    : runningElapsed(now - item.startedAt)
+    : item.endedAt != null ? '' : runningElapsed(now - item.startedAt)
   const worker = WORKER_TOOLS.includes(item.name) ? workers.find(w => w.task_id === ticketIds(args)[0]) : undefined
   const tone = state === 'failed' ? 'bg-[color-mix(in_srgb,var(--danger)_7%,var(--surface))]' : state === 'running' ? 'bg-surface-2' : ''
   return (

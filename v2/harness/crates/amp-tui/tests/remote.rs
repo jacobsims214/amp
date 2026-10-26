@@ -16,10 +16,12 @@ use std::{
 
 use amp_core::{
     agent::memory_session,
+    chat_event::{ChatEvent, NoticeLevel},
     events::{ChannelEmitter, FanOutEmitter},
     manager_feed::ManagerFeed,
     remote::{
-        FixedToken, LinkTuning, LocalEvent, RemoteDeps, RemoteLink, RemoteSetup, RemoteState,
+        FixedToken, LinkTuning, LocalEvent, OutboxLimits, RemoteDeps, RemoteLink, RemoteSetup,
+        RemoteState,
         crypto::{self, KeyPair, KeyStore},
         envelope, jcs,
         mock_relay::{MockOptions, MockRelay, is_chat},
@@ -56,6 +58,7 @@ struct Rig {
     script: FauxScript,
     log: std::path::PathBuf,
     keys: KeyStore,
+    feed: Arc<ManagerFeed>,
     _dir: TempDir,
 }
 
@@ -89,6 +92,7 @@ fn tuning() -> LinkTuning {
         bye_wait: Duration::from_secs(3),
         refused_every: Duration::ZERO,
         end_retry: Duration::from_millis(200),
+        outbox: Default::default(),
     }
 }
 
@@ -193,6 +197,7 @@ async fn rig_tuned(
         script,
         log,
         keys,
+        feed,
         _dir: dir,
     }
 }
@@ -1771,4 +1776,204 @@ async fn a_killed_chat_s_session_is_ended_by_the_next_remote_on_and_devices_stil
     );
     next.disable().await;
     assert!(!new_record.exists(), "a clean end removes the record");
+}
+
+/// #2438: a long relay outage while the agent is chatty. The harness holds no more than its
+/// outbox limits (here 40 events / 256 KiB; by default the relay's 200 / 2 MiB), dropping the
+/// oldest, and when the relay is back the page resyncs: the relay gets contiguous signed events,
+/// a gap notice where the dropped ones were, the newest events (the transcript tail), and a
+/// fresh `hello` with the current status and the follow-up queue after the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_outage_is_capped_and_the_page_resyncs() {
+    let opts = MockOptions::default();
+    let limits = OutboxLimits {
+        max_events: 40,
+        max_bytes: 256 * 1024,
+    };
+    let mut r = rig_tuned(
+        opts.clone(),
+        "outage-cap",
+        &opts.oauth_token,
+        Arc::new(|| Ok(())),
+        LinkTuning {
+            outbox: limits,
+            ..tuning()
+        },
+    )
+    .await;
+    let device = r.enable_and_pair().await;
+    assert!(
+        r.drive(WAIT, |_| true).await && {
+            let link = r.link.clone();
+            r.mock
+                .wait_until(WAIT, move |_| link.outbox_stats().held_events == 0)
+                .await
+        },
+        "everything before the outage reached the relay"
+    );
+    let before = r.mock.events().len();
+
+    r.mock.set_down(true);
+    assert!(
+        wait_state(&r.link, |s| online(s) == Some(false)).await,
+        "offline"
+    );
+    // A chatty agent: 3000 chat events while the relay is away, far past the limits.
+    const CHATTY: usize = 3000;
+    for i in 0..CHATTY {
+        r.feed.push(ChatEvent::notice(
+            NoticeLevel::Info,
+            None,
+            &format!("chatty {i:04} {}", "x".repeat(i % 700)),
+        ));
+        if i % 50 == 49 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let s = r.link.outbox_stats();
+            assert!(
+                s.held_events <= limits.max_events && s.held_bytes <= limits.max_bytes,
+                "held {s:?} after {i} events"
+            );
+        }
+    }
+    let feed = Arc::clone(&r.feed);
+    let link = r.link.clone();
+    assert!(
+        r.mock
+            .wait_until(WAIT, move |_| link.outbox_stats().dropped as usize
+                + link.outbox_stats().held_events
+                >= CHATTY
+                && feed.last_seq() > 0)
+            .await,
+        "the link took every event: {:?}",
+        r.link.outbox_stats()
+    );
+    let s = r.link.outbox_stats();
+    assert!(
+        s.peak_events <= limits.max_events && s.peak_bytes <= limits.max_bytes,
+        "the outage stayed under the cap: {s:?}"
+    );
+    assert!(s.dropped > 0, "the oldest were dropped: {s:?}");
+    assert_eq!(
+        r.mock.events().len(),
+        before,
+        "nothing reached the relay while it was down"
+    );
+
+    // The relay is back.
+    r.mock.set_down(false);
+    let last = format!("chatty {:04}", CHATTY - 1);
+    assert!(
+        r.drive(WAIT, |m| {
+            let ev = m.events();
+            let gap = ev
+                .iter()
+                .rposition(|e| is_chat(e, "notice") && e["body"]["code"] == "events_dropped");
+            gap.is_some_and(|g| {
+                ev[g..].iter().any(|e| e["op"] == "hello")
+                    && ev[g..].iter().any(|e| is_chat(e, "queue"))
+                    && ev[g..].iter().any(|e| {
+                        e["body"]["text"]
+                            .as_str()
+                            .is_some_and(|t| t.starts_with(&last))
+                    })
+            })
+        })
+        .await,
+        "the page resyncs: a gap notice, the newest events and a fresh hello: {:?} {:?}",
+        r.link.outbox_stats(),
+        r.mock.events()[before..]
+            .iter()
+            .map(|e| format!(
+                "{} {} {}",
+                e["seq"],
+                e["op"],
+                e["body"]["text"]
+                    .as_str()
+                    .unwrap_or("")
+                    .chars()
+                    .take(30)
+                    .collect::<String>()
+            ))
+            .collect::<Vec<_>>()
+    );
+    let ev = r.mock.events();
+    // Contiguous seqs from 1 (the relay requires them, and the browser would drop nothing).
+    for (i, e) in ev.iter().enumerate() {
+        assert_eq!(e["seq"].as_i64(), Some(i as i64 + 1), "seq {i}: {e}");
+    }
+    let new = &ev[before..];
+    let gaps: Vec<usize> = new
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_chat(e, "notice") && e["body"]["code"] == "events_dropped")
+        .map(|(i, _)| i)
+        .collect();
+    // One notice per gap (one more when the outbox overflowed before its first batch); together
+    // they count every dropped event.
+    assert!((1..=2).contains(&gaps.len()), "gap notices: {gaps:?}");
+    let counted: u64 = gaps
+        .iter()
+        .map(|&g| {
+            let text = new[g]["body"]["text"].as_str().unwrap();
+            text.split(' ').next().unwrap().parse::<u64>().unwrap()
+        })
+        .sum();
+    let s = r.link.outbox_stats();
+    assert_eq!(counted, s.dropped, "the notices count the dropped events");
+    assert!(
+        s.peak_events <= limits.max_events && s.peak_bytes <= limits.max_bytes,
+        "still under the cap after the resync: {s:?}"
+    );
+    let g = *gaps.last().unwrap();
+    let chatty = |e: &Value| {
+        e["body"]["text"]
+            .as_str()
+            .and_then(|t| t.strip_prefix("chatty "))
+            .and_then(|t| t[..4].parse::<usize>().ok())
+    };
+    let delivered: Vec<usize> = new.iter().filter_map(chatty).collect();
+    assert!(
+        delivered.len() < CHATTY && delivered.windows(2).all(|w| w[0] < w[1]),
+        "fewer, in order: {} of {CHATTY}",
+        delivered.len()
+    );
+    // Before the gap only what was in flight when the relay went away (the oldest); after it the
+    // newest, ending with the last one.
+    let after: Vec<usize> = new[g..].iter().filter_map(chatty).collect();
+    assert_eq!(after.last(), Some(&(CHATTY - 1)));
+    let before_gap: Vec<usize> = new[..g].iter().filter_map(chatty).collect();
+    if let (Some(b), Some(a)) = (before_gap.last(), after.first()) {
+        assert!(
+            a - b > 1,
+            "the dropped events sit at the gap ({b} then {a})"
+        );
+    }
+    // The fresh snapshot after the gap: hello with the current status, and the queue.
+    let hello = new[g..].iter().find(|e| e["op"] == "hello").unwrap();
+    assert_eq!(hello["body"]["status"]["busy"], false, "{hello}");
+    assert_eq!(hello["body"]["status"]["queue_len"], 0, "{hello}");
+    let queue = new[g..].iter().find(|e| is_chat(e, "queue")).unwrap();
+    assert_eq!(queue["body"]["items"], json!([]), "{queue}");
+    // Nothing is held any more, and the paired device drives the session again.
+    let link = r.link.clone();
+    assert!(
+        r.mock
+            .wait_until(WAIT, move |_| link.outbox_stats().held_events == 0)
+            .await
+    );
+    let dev = device.id().to_owned();
+    let seq = now_ms();
+    assert!(
+        r.mock
+            .send_command(&r.command(&device, seq, "stop", json!({})))
+    );
+    assert!(
+        r.drive(WAIT, |m| m.events().iter().any(|e| e["op"] == "ack"
+            && e["device_id"] == dev.as_str()
+            && e["body"]["ref"]["seq"] == seq))
+            .await,
+        "the device's command is accepted after the resync"
+    );
+    r.link.disable().await;
+    assert_eq!(r.mock.ended().as_deref(), Some("harness_ended"));
 }

@@ -63,6 +63,48 @@ describe('sessionReducer', () => {
     expect(s.outgoing.map(o => o.state)).toEqual(['no_answer', 'queued'])
   })
 
+  // #2438: after a long relay outage the harness marks the gap and sends a fresh snapshot.
+  it('resyncs after a gap: nothing before it stays running, the snapshot and the tail apply', () => {
+    let s = run([
+      chat({ type: 'user_message', prompt_id: 'p1', text: 'go', origin: 'local', device_id: null, device_name: null }),
+      chat({ type: 'run_start', run_id: 'r1', prompt_id: 'p1' }),
+      chat({ type: 'message_start', message_id: 'm1', model: 'x', provider: 'y' }),
+      chat({ type: 'thinking_delta', message_id: 'm1', delta: 'hmm' }),
+      chat({ type: 'tool_start', message_id: 'm1', tool_call_id: 't1', name: 'bash', arguments_json: '{}', truncated: false }),
+      chat({ type: 'tool_start', message_id: 'm1', tool_call_id: 't2', name: 'bash', arguments_json: '{}', truncated: false }),
+      chat({ type: 'compaction', active: true, manual: false }),
+      chat({ type: 'queue', items: [{ prompt_id: 'p2', origin: 'remote', device_id: 'me', preview: 'next' }] }),
+    ])
+    expect(isBusy(s)).toBe(true)
+    // The gap: the run's end, t1's result, the compaction's end and the queue change were dropped.
+    s = run([chat({ type: 'notice', level: 'warn', code: 'events_dropped', text: '120 chat events from the laptop were dropped' })], s)
+    expect(s.running).toBeNull()
+    expect(s.compaction).toBeNull()
+    const a = s.items.find(i => i.kind === 'assistant')
+    expect(a?.kind === 'assistant' && a.blocks.every(b => b.endedAt != null)).toBe(true)
+    const tools = s.items.filter(i => i.kind === 'tool')
+    expect(tools.every(t => t.kind === 'tool' && t.endedAt != null && t.result == null)).toBe(true)
+    expect(s.items.at(-1)).toMatchObject({ kind: 'notice', code: 'events_dropped', level: 'warn' })
+    // The tail: t2's result arrives, and a message whose start was dropped.
+    s = run([
+      chat({ type: 'tool_end', tool_call_id: 't2', name: 'bash', is_error: false, text: 'ok', truncated: false, full_bytes: 2, refused_line: null }),
+      chat({ type: 'text_delta', message_id: 'm9', delta: 'latest words' }),
+    ], s)
+    const t2 = s.items.find(i => i.kind === 'tool' && i.tool_call_id === 't2')
+    expect(t2?.kind === 'tool' && t2.result?.text).toBe('ok')
+    const m9 = s.items.find(i => i.kind === 'assistant' && i.message_id === 'm9')
+    expect(m9?.kind === 'assistant' && blockText(m9, 'text')).toBe('latest words')
+    // The fresh snapshot: hello with the current status, then the queue as it is now.
+    const status = { model: 'now', busy: false, context_pct: 2, cost_usd_micros: 9, project: null, ticket_id: null, branch: null, queue_len: 0, workers_running: 0, devices: [] }
+    s = run([
+      { type: 'event', env: env('hello', { harness: { harness_id: 'h', harness_pub: 'p', host: 'x', os: 'macos', version: '1' }, user_id: 1, ops: ['prompt', 'stop', 'detach'], started_at_ms: 0, expires_at_ms: null, idle_timeout_s: null, status }), myDeviceId: 'me' },
+      chat({ type: 'queue', items: [] }),
+    ], s)
+    expect(s.status?.model).toBe('now')
+    expect(s.queue).toEqual([])
+    expect(isBusy(s)).toBe(false)
+  })
+
   it('follows relay presence and endings, and keeps snapshots off the seq counter', () => {
     let s = run([{ type: 'relay', frame: { type: 'attached', online: true, oldest_seq: 1, latest_seq: 5 } }])
     expect(s).toMatchObject({ online: true, connection: 'live' })

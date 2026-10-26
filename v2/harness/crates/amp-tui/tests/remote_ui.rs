@@ -101,6 +101,7 @@ fn tuning() -> LinkTuning {
         bye_wait: Duration::from_secs(3),
         refused_every: Duration::ZERO,
         end_retry: Duration::from_millis(200),
+        outbox: Default::default(),
     }
 }
 

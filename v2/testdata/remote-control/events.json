@@ -318,6 +318,21 @@
       "wire": "{\"sig\": \"WFMIogxkZMoy4hpbrz-9jMOu4YOLWQrqGRH6k3fmqetxEL6t9w62IdyGqXqJ0uBWUMHLFGbMAB6VoZNzlKuMWQ\", \"body\": {\"harness\": {\"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"harness_pub\": \"BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8\", \"host\": \"jacobs-mbp\", \"os\": \"macos\", \"version\": \"0.5.0\"}, \"user_id\": 1001, \"ops\": [\"prompt\", \"stop\", \"detach\"], \"started_at_ms\": 1792945200000, \"expires_at_ms\": null, \"idle_timeout_s\": null, \"status\": {\"model\": \"anthropic/claude-opus-5-5\", \"busy\": false, \"queue_len\": 0, \"workers_running\": 0, \"devices\": [{\"device_id\": \"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\", \"name\": \"Safari on iPhone\"}]}}, \"op\": \"hello\", \"nonce\": \"9jE00GTA4D6yQH-gni7wFw\", \"ts\": 1792948799200, \"seq\": 54, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
       "expect": "ok",
       "signing_input": "amp-rc/1 envelope\n{\"alg\":\"ES256\",\"body\":{\"expires_at_ms\":null,\"harness\":{\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"harness_pub\":\"BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8\",\"host\":\"jacobs-mbp\",\"os\":\"macos\",\"version\":\"0.5.0\"},\"idle_timeout_s\":null,\"ops\":[\"prompt\",\"stop\",\"detach\"],\"started_at_ms\":1792945200000,\"status\":{\"busy\":false,\"devices\":[{\"device_id\":\"X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs\",\"name\":\"Safari on iPhone\"}],\"model\":\"anthropic/claude-opus-5-5\",\"queue_len\":0,\"workers_running\":0},\"user_id\":1001},\"device_id\":null,\"harness_id\":\"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\",\"nonce\":\"9jE00GTA4D6yQH-gni7wFw\",\"op\":\"hello\",\"seq\":54,\"session_id\":\"rs_YIL0d-r7J-AHLPpZ00o2bA\",\"ts\":1792948799200,\"v\":1}"
+    },
+    {
+      "name": "notice_events_dropped_valid",
+      "note": "#2438: a gap notice (code events_dropped). The browser clears what was running, shows the notice, and resyncs from the hello, queue and newest events that follow (protocol 11).",
+      "receiver": {
+        "now_ms": 1792948800000,
+        "session_id": "rs_YIL0d-r7J-AHLPpZ00o2bA",
+        "pinned_harness": {
+          "harness_id": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+          "harness_pub": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8"
+        },
+        "last_applied_seq": 54
+      },
+      "wire": "{\"sig\": \"h2CvXxM9pe3w-Z7AYEMIo7vTYInPVoXpECFISy6ltTOxu1f9B_4GAZQm0_nr1Z0ZK-n1_Scy0P7zRuW8J6KTzg\", \"body\": {\"type\": \"notice\", \"level\": \"warn\", \"code\": \"events_dropped\", \"text\": \"1840 chat events from the laptop were dropped while AMP's relay was out of reach; the transcript has a gap. Showing the latest.\"}, \"op\": \"chat_event\", \"nonce\": \"stlZnax7k_hDTmI5OfsJBA\", \"ts\": 1792948799200, \"seq\": 55, \"device_id\": null, \"harness_id\": \"KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY\", \"session_id\": \"rs_YIL0d-r7J-AHLPpZ00o2bA\", \"alg\": \"ES256\", \"v\": 1}",
+      "expect": "ok"
     }
   ]
 }

@@ -1,7 +1,8 @@
 # AMP remote control: wire protocol v1 (M1)
 
 **Status:** contract for milestone M1 (epic 165, story 402). Ticket #2369. Written 2026-10-25. Session limits
-amended by #2424 (2026-10-26): no idle limit or lifetime by default (section 12.5).
+amended by #2424 (2026-10-26): no idle limit or lifetime by default (section 12.5). The harness's outage cap and
+resync added by #2438 (2026-10-26, section 11).
 **Implemented by:** the Rust harness (`v2/harness`), the Go relay service amp-relay (`v2/amp-api/cmd/relay`,
 its own binary, image and Deployment since #2387; the code is shared in the `v2/amp-api` module) and the
 TypeScript web app (`v2/ui`). All three test suites load the shared vectors in
@@ -348,6 +349,9 @@ the op body beyond the size limits and the per-op rate limits.
   relay's `accepted_through` is a retry: the relay skips those envelopes and takes the rest.
 - Deltas are **not** snapshots. Unlike `WorkerFeed`, events on the wire are never replaced or renumbered: the
   harness coalesces text and thinking deltas for about 100 ms **before** assigning a seq.
+- **A seq is assigned when the event is signed for a batch, not when it is made** (#2438). An event the harness
+  drops before that (section 11, "Harness outage cap") never had a seq, so the seqs the relay sees stay
+  contiguous and no seq is ever used for two different events. A signed event is kept until the relay accepts it.
 
 ### 6.2 Event ops
 
@@ -462,7 +466,7 @@ harness keeps `run --json` unchanged (decision section 9).
 | `message_end` | `message_id`, `stop_reason`, `error: string\|null`, `model`, `provider`, `usage`, `error_summary: string\|null` | `MessageEnd` (assistant). `usage` = `{input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_micros}`, all integers. `cost_usd_micros = round(cost_usd × 1e6)`. `error` is the provider's raw text (the detail); `error_summary` (#2388) is the one sentence the TUI shows for it (`provider_error::summarize`), `null` without an error. |
 | `retry` | `attempt`, `max_retries`, `delay_ms`, `error` | `RetryScheduled` (the error text already goes through `provider_error::redact`) |
 | `run_end` | `run_id`, `outcome: "completed"\|"aborted"\|"failed"\|"suspended"`, `error: string\|null` | `finish_run` in the shell |
-| `notice` | `level: "info"\|"warn"\|"error"`, `code: string\|null`, `text` | Notices the TUI shows: MCP hub changes, approval refusals, repeat guard, "Stopped.", offline |
+| `notice` | `level: "info"\|"warn"\|"error"`, `code: string\|null`, `text` | Notices the TUI shows: MCP hub changes, approval refusals, repeat guard, "Stopped.", offline. Code `events_dropped` (`warn`) marks a gap: the harness dropped events at this point (section 11, #2438) |
 | `queue` | `items: [{prompt_id, origin, device_id: string\|null, preview}]` | The follow-up queue changed. `preview` is the first 80 chars. |
 | `worker_status` | `workers: [{task_id, name, role, state: "running"\|"done"\|"failed"\|"stopped"\|"blocked", model: string\|null, started_at_ms: integer\|null, ended_at_ms: integer\|null, usage: {…}\|null, context_tokens: integer\|null, context_window: integer\|null, epic: string\|null, story: string\|null, ticket_state: string\|null}]` | A snapshot from `Supervisor::workers()` when the roster changes (also when a worker's tokens change). M1 shows read-only chips. The members after `started_at_ms` are #2388's (below). |
 | `compaction` | `active: boolean`, `manual: boolean` | #2388. The harness started (`active: true`) or finished (`false`) compacting the context; `manual` when the person asked for it, else automatic (the context crossed its threshold). The TUI shows `Auto-compacting…` / `Compacting context…` in its status slot meanwhile; the UI shows the same while the latest compaction is active. |
@@ -1086,6 +1090,7 @@ Clients MUST treat an unknown `code` as a generic failure of that HTTP status. N
 | Max lifetime | none by default; an org may set 1-720 h from registration (#2424) | harness, relay |
 | Device pin | 30 days (org: 0-30 days) | harness, browser |
 | Resync buffer | 200 events or 2 MiB, whichever is smaller; 10 min TTL; in memory only | relay |
+| Events held for the relay (outage cap) | 200 events and 2 MiB (signed and unsigned together); the oldest unsigned ones are dropped beyond it; one batch takes at most half | harness (#2438) |
 | Missing ack in the UI | 10 s | browser |
 | Envoy `/relay/` | The command stream: `timeout: 0s`, `idle_timeout: 120s` (`relay.streamIdleTimeout`), `max_stream_duration: 12h` (`relay.maxStreamDuration`, per stream: the harness reopens it); the other calls `timeout: 30s` (`relay.requestTimeout`) | Helm |
 | Envoy `/api/sessions/` | `…/events` as the command stream; the other calls `timeout: 30s` | Helm |
@@ -1157,8 +1162,28 @@ that is quiet for less than 60 s. When a hop cuts one anyway (Envoy's 12 h
   close without an `end`, and the harness and viewers reconnect to the new holder.
 - **Browser reconnect.** It reconnects with `Last-Event-ID` (`EventSource` does that itself), or with `from_seq`
   after a manual reopen. It drops duplicates by seq.
-- **Harness resync** ("replay from my own feed or JSONL" when the buffer can't cover a gap) is **M2**. In M1 a
-  gap shows as a notice, and the `hello`/`status` snapshot restores the status bar.
+- **Harness outage cap and resync (#2438).** While the relay is out of reach (an outage, a sleep, the relay
+  switched off) and the chat keeps going, the harness holds the events it hasn't delivered, but **at most 200
+  events and 2 MiB** together, the same as the relay's buffer: holding more would only be replayed past what a
+  viewer can resume from. It keeps them unsigned until it batches them (6.1); one batch takes at most half the
+  limit, so the other half keeps the newest events while that batch waits. Past the limit it drops the
+  **oldest** unsigned events. When it next signs a batch after a drop, it first sends a `chat_event`
+  `notice {level: "warn", code: "events_dropped", text}` at the place of the gap (the text says how many were
+  dropped), then the newest events it kept (the transcript tail). Once the relay has accepted that notice (so it
+  is reachable again), the harness sends a fresh snapshot: a `hello` (with the current `status`) and a `queue`
+  chat event with the follow-up queue as it is now. The page resyncs from the notice, that snapshot and what
+  follows, instead of a replay of the whole outage:
+  - On `events_dropped` the browser treats everything before it as possibly incomplete: it clears the current
+    run, compaction and live thinking, and shows a tool call still without a result as "result not
+    available" (its result may still arrive in the tail). It shows the notice. The `hello`/`status` and `queue`
+    that follow restore the status bar and the queue; events from the tail apply as usual (a delta whose
+    `message_start` was dropped starts its message there, as after a buffer gap).
+  - The same notice and snapshot follow when the harness's own chat feed dropped events before the link read
+    them.
+  - The wire is unchanged (a `notice` code within v1). A browser from before #2438 shows the notice and
+    resyncs its status bar from the `hello`; only the clearing of the run is new.
+- **Replay from the laptop's own transcript** (when the buffer can't cover a gap) is **M2**; the dropped events are
+  still in the laptop's transcript.
 - **Presence.** The harness is online while its command stream is open **and** a heartbeat has arrived within
   60 s. Viewers get `relay {online|offline}`, and offline sessions refuse commands.
 

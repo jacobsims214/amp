@@ -8,12 +8,14 @@
 //! unpin devices.
 //!
 //! Inside, one actor task owns the session: it reads the command stream, checks every command
-//! (section 5.6), runs the follow-up queue, numbers and signs events (hello, status, chat events
-//! from the manager feed, ack, refused, pair_result, bye) on one seq counter (section 6.1),
-//! redacts secrets before signing, keeps the idle and lifetime deadlines when the org set them
-//! (#2424: by default there are none, and the session lives until a person ends it), and
-//! reconnects with backoff for as long as it takes. A poster task batches events (~100 ms) and resends what the relay hasn't accepted; a
-//! heartbeat task beats every 20 s.
+//! (section 5.6), runs the follow-up queue, builds events (hello, status, chat events from the
+//! manager feed, ack, refused, pair_result, bye), redacts secrets in them, keeps the idle and
+//! lifetime deadlines when the org set them (#2424: by default there are none, and the session
+//! lives until a person ends it), and reconnects with backoff for as long as it takes. Events go
+//! into the [`Outbox`] (#2438), which holds at most its limits during an outage and drops the
+//! oldest; a poster task numbers and signs them on one seq counter (section 6.1) as it batches
+//! them (~100 ms), resends what the relay hasn't accepted, and marks a gap with a notice, after
+//! which the actor sends a fresh snapshot. A heartbeat task beats every 20 s.
 
 use std::{
     collections::VecDeque,
@@ -34,6 +36,7 @@ use super::envelope::{
     self, Code, Command, CommandContext, EventSigner, Refusal, ReplayState, VerifiedCommand,
 };
 use super::live::{self, LiveEntry, LiveRecord};
+use super::outbox::{Outbox, OutboxLimits, OutboxStats};
 use super::pairing::{
     self, PairCandidate, PairCheckInput, PairResult, PairingWindow, PinStore, StoredPin,
 };
@@ -170,6 +173,9 @@ pub struct LinkTuning {
     /// The first wait before sending an end the relay didn't hear again (#2396); it doubles up
     /// to a minute.
     pub end_retry: Duration,
+    /// The most events held for the relay during an outage; beyond it the oldest are dropped
+    /// and the page resyncs (#2438).
+    pub outbox: OutboxLimits,
 }
 
 impl Default for LinkTuning {
@@ -185,6 +191,7 @@ impl Default for LinkTuning {
             bye_wait: Duration::from_secs(3),
             refused_every: Duration::from_secs(1),
             end_retry: Duration::from_secs(5),
+            outbox: OutboxLimits::default(),
         }
     }
 }
@@ -348,6 +355,8 @@ struct Shared {
     pending: Mutex<PendingStore>,
     sending_pending: tokio::sync::Mutex<()>,
     retrying: std::sync::atomic::AtomicBool,
+    /// The current session's outbox, as numbers (#2438).
+    outbox_stats: Arc<Mutex<OutboxStats>>,
 }
 
 /// The remote link of one chat. Cheap to clone.
@@ -374,6 +383,7 @@ impl RemoteLink {
                 pending,
                 sending_pending: tokio::sync::Mutex::new(()),
                 retrying: std::sync::atomic::AtomicBool::new(false),
+                outbox_stats: Arc::new(Mutex::new(OutboxStats::default())),
                 deps,
                 state,
                 local_tx,
@@ -396,6 +406,11 @@ impl RemoteLink {
 
     pub fn is_on(&self) -> bool {
         !matches!(*self.shared.state.borrow(), RemoteState::Off { .. })
+    }
+
+    /// What the current session holds for the relay, and the most it held (#2438).
+    pub fn outbox_stats(&self) -> OutboxStats {
+        *lock(&self.shared.outbox_stats)
     }
 
     /// Pairing prompts and notices for the chat (once: the first caller gets the receiver).
@@ -898,6 +913,8 @@ enum Inbound {
     Fatal(String, Option<String>),
     TokenExpired,
     Viewers(u32),
+    /// The poster sent a gap notice: send a fresh snapshot (#2438).
+    Resync,
 }
 
 /// A prompt waiting in the follow-up queue.
@@ -940,7 +957,6 @@ impl Bucket {
 }
 
 enum PosterMsg {
-    Envelope(String),
     Flush(oneshot::Sender<()>),
 }
 
@@ -959,7 +975,9 @@ struct Actor {
     /// The refusal code of a token refresh the person was told about (once per code, until a
     /// refresh works again).
     told_refresh: Option<String>,
-    signer: EventSigner,
+    /// Events for the relay, numbered and signed when the poster takes them (#2438).
+    outbox: Arc<Mutex<Outbox>>,
+    outbox_wake: Arc<tokio::sync::Notify>,
     replay: ReplayState,
     window: Option<PairingWindow>,
     window_link: Option<String>,
@@ -1013,7 +1031,12 @@ impl Actor {
         let (poster, poster_rx) = mpsc::unbounded_channel();
         let now = now_ms();
         Self {
-            signer: EventSigner::new(key.clone(), reg.session_id.clone()),
+            outbox: Arc::new(Mutex::new(Outbox::new(
+                EventSigner::new(key.clone(), reg.session_id.clone()),
+                link.shared.deps.tuning.outbox,
+                Arc::clone(&link.shared.outbox_stats),
+            ))),
+            outbox_wake: Arc::new(tokio::sync::Notify::new()),
             key,
             client,
             user_id,
@@ -1114,20 +1137,19 @@ impl Actor {
         append_private(path, &format!("{line}\n"));
     }
 
-    /// Signs one event (after redaction) and hands it to the poster.
+    /// Hands one event (after redaction) to the poster, which numbers and signs it (#2438).
     fn send(&mut self, op: &str, device_id: Option<&str>, mut body: Value) {
         self.deps().redactor.redact_value(&mut body);
-        match self.signer.sign(op, device_id, body, now_ms()) {
-            Ok(env) => {
-                // Section 6.5: an event never exceeds 1 MiB (the feed's caps keep it far below).
-                if env.len() > envelope::MAX_EVENT_BYTES {
-                    tracing::warn!(op, "remote: an event over 1 MiB was dropped");
-                    return;
-                }
-                let _ = self.poster.send(PosterMsg::Envelope(env));
-            }
-            Err(e) => tracing::warn!(op, error = %e, "remote: an event could not be signed"),
-        }
+        lock(&self.outbox).push(op, device_id, body);
+        self.outbox_wake.notify_one();
+    }
+
+    /// Events were dropped (an outage outlasted the outbox, or the feed's own gap): send what
+    /// the page needs to resync, a fresh `hello` with its status and the follow-up queue. The
+    /// newest events follow as they come (section 11, #2438).
+    fn resync(&mut self) {
+        self.send_hello();
+        self.push_queue_event();
     }
 
     fn status_body(&self) -> Value {
@@ -1217,6 +1239,8 @@ impl Actor {
                 token: self.token.clone(),
                 every: self.tuning().batch_every,
                 inbound: self.inbound_tx.clone(),
+                outbox: Arc::clone(&self.outbox),
+                wake: Arc::clone(&self.outbox_wake),
             };
             self.tasks.push(tokio::spawn(poster.run(rx)));
         }
@@ -1381,7 +1405,8 @@ impl Actor {
                 }
             }
             Err(gap) => {
-                // M1: no resync (section 11); say so and go on from the newest event.
+                // The feed dropped events before we read them: mark the gap and resync, then go
+                // on from the newest event (section 11).
                 self.feed_seen = gap.last;
                 let body = serde_json::to_value(ChatEvent::notice(
                     NoticeLevel::Warn,
@@ -1390,6 +1415,7 @@ impl Actor {
                 ))
                 .unwrap_or(Value::Null);
                 self.send("chat_event", None, body);
+                self.resync();
             }
         }
     }
@@ -1615,6 +1641,7 @@ impl Actor {
             }
             Inbound::TokenExpired => self.refresh_token().await,
             Inbound::Viewers(n) => self.set_viewers(n),
+            Inbound::Resync => self.resync(),
         }
         None
     }
@@ -2301,76 +2328,65 @@ fn append_private(path: &std::path::Path, line: &str) {
     }
 }
 
-/// Batches signed envelopes (about every 100 ms, ≤ 64 / 2 MiB a batch) and posts them in
-/// order, keeping each one until the relay has accepted it.
+/// Batches events (about every 100 ms, ≤ 64 / 2 MiB a batch) from the outbox and posts them in
+/// order, keeping each one until the relay has accepted it. The outbox is shared with the actor,
+/// so events keep arriving (and the oldest are dropped past its limits) while a post waits on
+/// an outage (#2438).
 struct Poster {
     client: RelayClient,
     session_id: String,
     token: ConnectToken,
     every: Duration,
     inbound: mpsc::UnboundedSender<Inbound>,
+    outbox: Arc<Mutex<Outbox>>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 const BATCH_EVENTS: usize = 64;
 const BATCH_BYTES: usize = 2 * 1024 * 1024 - 64;
 
-fn seq_of(env: &str) -> i64 {
-    serde_json::from_str::<Value>(env)
-        .ok()
-        .and_then(|v| v.get("seq").and_then(Value::as_i64))
-        .unwrap_or(0)
-}
-
 impl Poster {
     async fn run(self, mut rx: mpsc::UnboundedReceiver<PosterMsg>) {
-        let mut pending: VecDeque<(i64, String)> = VecDeque::new();
         let mut flushes: Vec<oneshot::Sender<()>> = Vec::new();
         let mut retry = Duration::from_millis(250);
         loop {
             // Wait for something to send.
-            if pending.is_empty() {
-                match rx.recv().await {
-                    Some(PosterMsg::Envelope(e)) => pending.push_back((seq_of(&e), e)),
-                    Some(PosterMsg::Flush(done)) => {
-                        let _ = done.send(());
-                        continue;
-                    }
-                    None => return,
+            if lock(&self.outbox).is_empty() {
+                tokio::select! {
+                    _ = self.wake.notified() => {}
+                    msg = rx.recv() => match msg {
+                        // The event a flush follows (`bye`) may have arrived with it.
+                        Some(PosterMsg::Flush(done)) if lock(&self.outbox).is_empty() => {
+                            let _ = done.send(());
+                            continue;
+                        }
+                        Some(PosterMsg::Flush(done)) => flushes.push(done),
+                        None => return,
+                    },
                 }
             }
             // Gather for one batch interval.
             let deadline = tokio::time::Instant::now() + self.every;
-            loop {
-                tokio::select! {
-                    msg = rx.recv() => match msg {
-                        Some(PosterMsg::Envelope(e)) => pending.push_back((seq_of(&e), e)),
-                        Some(PosterMsg::Flush(done)) => { flushes.push(done); break; }
-                        None => break,
-                    },
-                    _ = tokio::time::sleep_until(deadline) => break,
-                }
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(PosterMsg::Flush(done)) => flushes.push(done),
+                    None => return,
+                },
+                _ = tokio::time::sleep_until(deadline) => {}
             }
-            while !pending.is_empty() {
-                let mut batch = Vec::new();
-                let mut bytes = 0;
-                for (_, e) in pending.iter() {
-                    if batch.len() >= BATCH_EVENTS || bytes + e.len() > BATCH_BYTES {
-                        break;
-                    }
-                    bytes += e.len() + 1;
-                    batch.push(e.clone());
+            loop {
+                let batch = lock(&self.outbox).next_batch(BATCH_EVENTS, BATCH_BYTES);
+                if batch.envelopes.is_empty() {
+                    break;
                 }
                 match self
                     .client
-                    .post_events(&self.session_id, &self.token.get(), &batch)
+                    .post_events(&self.session_id, &self.token.get(), &batch.envelopes)
                     .await
                 {
                     Ok(a) => {
-                        while pending
-                            .front()
-                            .is_some_and(|(s, _)| *s <= a.accepted_through)
-                        {
-                            pending.pop_front();
+                        if lock(&self.outbox).accepted(a.accepted_through) {
+                            let _ = self.inbound.send(Inbound::Resync);
                         }
                         retry = Duration::from_millis(250);
                     }
@@ -2381,14 +2397,19 @@ impl Poster {
                             .get("accepted_through")
                             .and_then(Value::as_i64)
                             .unwrap_or(0);
-                        while pending.front().is_some_and(|(s, _)| *s <= through) {
-                            pending.pop_front();
-                        }
-                        let expected = e.body.get("expected_seq").and_then(Value::as_i64);
-                        if expected.is_some_and(|x| pending.front().is_some_and(|(s, _)| *s > x)) {
-                            // The relay lost events we no longer hold (a failover): it takes
-                            // the next batch as a new start (section 11), so drop nothing more.
-                            tracing::debug!("remote: the relay's buffer starts over");
+                        {
+                            let mut outbox = lock(&self.outbox);
+                            if outbox.accepted(through) {
+                                let _ = self.inbound.send(Inbound::Resync);
+                            }
+                            let expected = e.body.get("expected_seq").and_then(Value::as_i64);
+                            if expected
+                                .is_some_and(|x| outbox.first_unaccepted().is_some_and(|s| s > x))
+                            {
+                                // The relay lost events we no longer hold (a failover): it takes
+                                // the next batch as a new start (section 11), so drop nothing more.
+                                tracing::debug!("remote: the relay's buffer starts over");
+                            }
                         }
                         tokio::time::sleep(retry).await;
                         retry = (retry * 2).min(Duration::from_secs(5));
@@ -2426,10 +2447,15 @@ impl Poster {
                         return;
                     }
                     Err(_) => {
-                        // Network trouble: keep everything and try again.
+                        // Network trouble: keep the batch and try again. New events wait in
+                        // the outbox, within its limits.
                         tokio::time::sleep(retry).await;
                         retry = (retry * 2).min(Duration::from_secs(5));
                     }
+                }
+                // A flush asked for meanwhile is answered once the outbox is empty.
+                while let Ok(PosterMsg::Flush(done)) = rx.try_recv() {
+                    flushes.push(done);
                 }
             }
             for f in flushes.drain(..) {
