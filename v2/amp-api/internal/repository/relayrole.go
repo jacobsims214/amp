@@ -48,20 +48,23 @@ var relayTableGrants = []struct{ privs, table string }{
 	// Row-level security (relayNodePolicies) limits the writes to rows the
 	// relay's role registered.
 	{"SELECT, INSERT, UPDATE, DELETE", "api_nodes"},
-	// remote.* audit entries (INSERT ... RETURNING id, at) and their webhook
-	// deliveries (RETURNING id); the relay reads neither table back.
-	{"INSERT", "audit_log"},
-	{"SELECT (id, at)", "audit_log"},
-	{"INSERT", "webhook_deliveries"},
-	{"SELECT (id)", "webhook_deliveries"},
-	// Matching webhooks for those entries: every column but the signing
-	// secret (webhookCols never selects it).
-	{"SELECT (id, org_id, project_id, name, url, format, events, active, created_by, created_at, updated_at, " +
-		"last_delivery_at, last_status, last_error, consecutive_failures)", "webhooks"},
+	// Refresh-proof nonces, shared by every replica (#2399, re-review #2394
+	// N6): INSERT ... ON CONFLICT DO UPDATE, and the sweep's DELETE.
+	{"SELECT, INSERT, UPDATE, DELETE", "remote_proof_nonces"},
+	// No audit_log, webhook_deliveries or webhooks: the relay records its
+	// remote.* audit entries through relayFunctions (#2399, re-review #2394
+	// N3), and amp-api renders, signs and sends their webhook deliveries.
 }
 
 // relaySequences are the serial sequences behind the relay's INSERTs.
-var relaySequences = [][2]string{{"audit_log", "id"}, {"webhook_deliveries", "id"}, {"remote_devices", "id"}}
+var relaySequences = [][2]string{{"remote_devices", "id"}}
+
+// relayFunctions are the functions the relay may call. relay_record_audit
+// (migration 030) writes a remote.* audit entry it validates itself and
+// queues it for amp-api's webhook dispatcher: a compromised relay can't
+// write other audit entries or make amp-api sign webhook bodies of its
+// choosing (#2399, re-review #2394 N3).
+var relayFunctions = []string{"relay_record_audit(INT, TEXT, TEXT, JSONB)"}
 
 // relayNodePolicies keep the relay's role to its own api_nodes rows (#2398,
 // re-review #2394 N2). amp-api sends its cluster token to the address in an
@@ -119,10 +122,16 @@ func (r *Repo) GrantRelayRole(ctx context.Context, role string) error {
 	stmts := []string{
 		`REVOKE ALL ON ALL TABLES IN SCHEMA public FROM ` + id,
 		`REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM ` + id,
+		`REVOKE ALL ON ALL FUNCTIONS IN SCHEMA public FROM ` + id,
 		`GRANT USAGE ON SCHEMA public TO ` + id,
 	}
 	for _, g := range relayTableGrants {
 		stmts = append(stmts, fmt.Sprintf(`GRANT %s ON TABLE %s TO %s`, g.privs, pgx.Identifier{g.table}.Sanitize(), id))
+	}
+	for _, f := range relayFunctions {
+		// Executable by PUBLIC unless revoked (migration 030 does; this
+		// keeps it so).
+		stmts = append(stmts, `REVOKE ALL ON FUNCTION `+f+` FROM PUBLIC`, `GRANT EXECUTE ON FUNCTION `+f+` TO `+id)
 	}
 	stmts = append(stmts, relayNodePolicies(id)...)
 	for _, s := range stmts {

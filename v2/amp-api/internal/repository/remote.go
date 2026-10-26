@@ -256,6 +256,28 @@ func (r *Repo) EndOrgRemoteSessions(ctx context.Context, orgID int, reason strin
 	return r.endRemoteSessions(ctx, `project_id IN (SELECT id FROM projects WHERE org_id = $2)`, reason, orgID)
 }
 
+// remoteOwnerHasAccess is true when a session's owner can still see its
+// project: the same rule as authz.ProjectLevel >= Member (a global admin, an
+// owner or admin of the project's org, or a member of a team linked to the
+// project).
+const remoteOwnerHasAccess = `(
+	EXISTS (SELECT 1 FROM user_roles ur WHERE ur.user_id = remote_sessions.owner_user_id AND ur.role = 'admin')
+	OR EXISTS (SELECT 1 FROM org_members om JOIN projects p ON p.org_id = om.org_id
+		WHERE p.id = remote_sessions.project_id AND om.user_id = remote_sessions.owner_user_id AND om.role IN ('owner', 'admin'))
+	OR EXISTS (SELECT 1 FROM project_teams pt JOIN team_members tm ON tm.team_id = pt.team_id
+		WHERE pt.project_id = remote_sessions.project_id AND tm.user_id = remote_sessions.owner_user_id))`
+
+// EndRemoteSessionsWithoutAccess ends (with reason) the live sessions whose
+// owner can no longer see the session's project: removed from its team, the
+// team unlinked, removed from the org (re-review #2394 N7). With owners, only
+// their sessions are checked; with none, every live session.
+func (r *Repo) EndRemoteSessionsWithoutAccess(ctx context.Context, reason string, owners ...int) ([]domain.RemoteSession, error) {
+	if len(owners) > 0 {
+		return r.endRemoteSessions(ctx, `owner_user_id = ANY($2) AND NOT `+remoteOwnerHasAccess, reason, owners)
+	}
+	return r.endRemoteSessions(ctx, `NOT `+remoteOwnerHasAccess, reason)
+}
+
 // EndExpiredRemoteSessions ends live sessions past their 12 h lifetime
 // (reason expired) and those idle longer than their org's idle timeout plus
 // grace (reason idle; the harness is authoritative, this is the backstop).

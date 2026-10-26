@@ -642,8 +642,9 @@ for `rejected`, `failed` and `locked` results.
 - **Content types:** requests and responses are `application/json; charset=utf-8`. Streams are
   `text/event-stream` with `Cache-Control: no-store` and `X-Accel-Buffering: no`. A POST with another
   `Content-Type` gets `415 unsupported_media_type`.
-- **Harness leg (`/relay/v1/…`).** Envoy route `/relay/` has ext_authz off, `timeout: 0s` and
-  `max_stream_duration: 12h`.
+- **Harness leg (`/relay/v1/…`).** Envoy routes `/relay/` with ext_authz off. The command stream
+  (`…/commands`) has `timeout: 0s`, `idle_timeout: 120s` and `max_stream_duration: 12h`; every other harness call
+  has a 30 s timeout (#2399).
   - `POST /relay/v1/sessions` and `POST …/token` take the harness's **OAuth access token**: a Dex JWT whose
     audience includes `amp-mcp`, verified as `/mcp` verifies it. `POST …/token` also takes a proof signed by
     the session's harness key (8.2): the OAuth login alone never renews a session's connect token.
@@ -738,9 +739,15 @@ a fresh random `nonce` (16 bytes, b64u) and the current `ts` every time. The rel
    `400 wrong_harness`
 4. the signature verifies with the **registered** `harness_pub` (`remote_sessions.harness_pub`) → else
    `403 bad_signature`
-5. `ts` within ±60 s → else `400 stale_ts`
-6. the nonce wasn't used in the last 120 s → else `400 replayed_nonce` (a per-replica cache; a captured proof
-   is useless after 60 s anyway)
+5. `ts` within ±60 s → else `400 stale_ts`, whose body also carries the relay's clock, `now_ms`, so the harness
+   can tell its person how far off the computer's clock is (#2399)
+6. the nonce wasn't used for this session in the last 120 s → else `400 replayed_nonce`. The used nonces are kept
+   in Postgres (`remote_proof_nonces`), so a proof used on one relay replica is refused on every other (#2399)
+
+The harness tells its person once (a TUI notice, and a `notice` chat event with code `token_refresh_refused`
+for the web page) when a refresh is refused with `stale_ts`, `bad_signature`, `wrong_harness`, `wrong_session`,
+`malformed` or an unsupported version: retrying won't help, and remote control stops when the current token
+runs out (#2399).
 
 Ownership comes first (someone else's session `404`, an ended one `410`), then the proof, then the org policy
 (`403 remote_disabled`). Response `200 {"connect_token", "connect_token_expires_at_ms"}`. The token lasts
@@ -883,7 +890,7 @@ fingerprint matches a pin or the link's `h`.
 
 #### `GET /api/sessions/:id/events?from_seq=N`: the event stream (SSE)
 
-Envoy route: `timeout: 0s`. There are at most 3 concurrent streams per session (`429 too_many_viewers`) and
+Envoy route: `timeout: 0s`, `idle_timeout: 120s`, `max_stream_duration: 12h` (#2399). There are at most 3 concurrent streams per session (`429 too_many_viewers`) and
 20 attaches a minute (`429 rate_limited`). Each attach is audited as `remote.attach`.
 
 **Where the replay starts.** With `Last-Event-ID: L`, events with `seq ≥ L+1`. Otherwise with `from_seq=N`,
@@ -1058,8 +1065,8 @@ Clients MUST treat an unknown `code` as a generic failure of that HTTP status. N
 | Device pin | 30 days (org: 0-30 days) | harness, browser |
 | Resync buffer | 200 events or 2 MiB, whichever is smaller; 10 min TTL; in memory only | relay |
 | Missing ack in the UI | 10 s | browser |
-| Envoy `/relay/` | `timeout: 0s`, `max_stream_duration: 12h`; HCM `stream_idle_timeout` 3600 s stays as it is (keepalives keep streams alive) | Helm |
-| Envoy `/api/sessions/` | `timeout: 0s` on `…/events` | Helm |
+| Envoy `/relay/` | The command stream: `timeout: 0s`, `idle_timeout: 120s` (`relay.streamIdleTimeout`), `max_stream_duration: 12h` (`relay.maxStreamDuration`); the other calls `timeout: 30s` (`relay.requestTimeout`) | Helm |
+| Envoy `/api/sessions/` | `…/events` as the command stream; the other calls `timeout: 30s` | Helm |
 
 **Remote activity**, for the idle timer, is a command the harness accepted or a new viewer attach. Events the
 harness sends don't count.
@@ -1158,6 +1165,10 @@ Every path ends in under 5 s. The relay closes all of the session's streams (R-M
   `revoked`, audited as `remote.disable`; amp-api tells the holder as for the org switch, so the streams close
   at once. The connect token of a deactivated owner is refused (`401`) on every replica even if that end
   didn't happen (#2390).
+- **Losing access to the project** ends the session the same way (reason `revoked`, audited as
+  `remote.disable` with no actor when the relay finds it): amp-api checks right after a team member, a team, a
+  project's team link, an org member or a global admin role is removed; the relay checks again on every token
+  refresh (`410 session_ended`) and in its 30 s sweep, for access lost any other way (#2399).
 
 ### 12.4 Audit (D3: metadata only)
 
@@ -1177,6 +1188,13 @@ harness_host, op}`. **No prompt text, tool output or secrets.**
 | `remote.stop` | Forwarded stop | Best effort |
 | `remote.refused` | Relay refusal (sampled) | Best effort |
 | `remote.policy.set` | Org PUT | Best effort |
+
+amp-relay writes these rows only through the database function `relay_record_audit` (#2399): it accepts only the
+actions above that the relay records (not `remote.policy.set` or `remote.kill`), about a session the actor owns,
+with the detail members above (`len`, `sha256`, `reason`, `code`, `channel`, `devices`, `sessions` too) as
+short scalars, and fills the email, org, project, target and summary itself. The relay's database role can't
+insert into `audit_log` or the webhook outbox. amp-api's webhook dispatcher takes the relay's rows from
+`relay_audit_outbox` and renders and signs their deliveries from the stored row.
 
 The harness also keeps a local log of remote ops (op, device, time, result), with no payloads.
 

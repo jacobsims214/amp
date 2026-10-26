@@ -1545,3 +1545,33 @@ async fn a_pending_end_only_goes_to_its_own_server() {
     let log = std::fs::read_to_string(&r.log).unwrap();
     assert!(!log.contains("end_late"), "{log}");
 }
+
+/// #2399 (re-review #2394 N5): when the relay refuses the token refresh's proof (here the
+/// laptop's clock is 5 minutes off), the person is told once, here and on the web page, how far
+/// off the clock is, instead of remote control stopping without a word when the token runs out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_token_refresh_is_told_not_silent() {
+    let opts = MockOptions {
+        // Under five minutes: the link renews at once.
+        connect_token_ttl_ms: 4 * 60 * 1000,
+        ..MockOptions::default()
+    };
+    let mut r = rig(opts.clone(), "clock", &opts.oauth_token).await;
+    r.mock.set_clock_offset(5 * 60 * 1000);
+    r.link.enable().await.expect("enable");
+    let event = r
+        .mock
+        .wait_event(WAIT, |e| {
+            is_chat(e, "notice") && e["body"]["code"] == "token_refresh_refused"
+        })
+        .await
+        .expect("the web page is told");
+    let text = event["body"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(text.contains("clock is 5 min behind AMP's"), "{text}");
+    let said = notices(&mut r.local).join("\n");
+    assert!(said.contains("clock is 5 min behind AMP's"), "{said}");
+    assert!(said.contains("remote control stops"), "{said}");
+}

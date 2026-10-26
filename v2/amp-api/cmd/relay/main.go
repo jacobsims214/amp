@@ -53,11 +53,10 @@ import (
 	"github.com/simstech/amp-api/internal/relayserver"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/service"
-	"github.com/simstech/amp-api/internal/webhook"
 )
 
 // schemaVersion is the amp-api migration the relay needs.
-const schemaVersion = "029_api_nodes_registered_by"
+const schemaVersion = "030_relay_audit_function"
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("service", "amp-relay"))
@@ -141,14 +140,12 @@ func run() error {
 	defer stopCluster()
 	go node.Run(clusterCtx)
 
-	// remote.* audit entries still reach webhooks: the relay writes the
-	// outbox rows, amp-api delivers them (the relay makes no outbound calls).
-	webhooks := webhook.New(repo, webhook.Options{})
-	service.OnAudit(webhooks.Audit)
-	go webhooks.RunMatching(ctx)
-
 	appURL := appPublicURL(mcpPublicURL)
 	svc := service.New(repo, nil, nil)
+	// remote.* audit entries go through relay_record_audit, which queues
+	// them for amp-api: amp-api renders, signs and sends their webhooks (the
+	// relay writes no deliveries and makes no outbound calls).
+	svc.RelayAudit = true
 	svc.AppURL = appURL
 	svc.Remote = service.RemoteConfig{InstanceEnabled: true, AuthEnabled: true}
 

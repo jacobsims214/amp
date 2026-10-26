@@ -58,6 +58,19 @@ func (s *Service) writeAudit(ctx context.Context, p authz.Principal, e domain.Au
 			e.Details["channel"] = p.Channel
 		}
 	}
+	if s.RelayAudit {
+		// The function fills email, org, project, target and summary from
+		// the session row, and queues the entry for amp-api's webhooks.
+		sessionID := ""
+		if e.TargetType == "remote_session" {
+			sessionID = e.TargetID
+		}
+		if _, err := s.Repo.InsertRelayAudit(context.WithoutCancel(ctx), e.ActorUserID, sessionID, e.Action, e.Details); err != nil {
+			slog.Error("audit log write failed", "action", e.Action, "target", e.TargetType+":"+e.TargetID, "err", err)
+			return err
+		}
+		return nil
+	}
 	if e.ProjectID != nil && e.OrgID == nil {
 		if proj, err := s.Repo.GetProject(ctx, *e.ProjectID); err == nil {
 			e.OrgID = proj.OrgID

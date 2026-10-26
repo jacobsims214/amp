@@ -196,6 +196,9 @@ func (s *Service) SetUserRole(ctx context.Context, p authz.Principal, userID int
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "user.role", TargetType: "user", TargetID: idStr(userID),
 		Summary: verb + role + " for " + u.Email, Details: map[string]any{"role": role, "grant": grant}})
+	if !grant {
+		s.endRemoteAfterAccessChange(ctx, p, userID) // a global admin who reached projects only as one
+	}
 	return nil
 }
 

@@ -478,17 +478,51 @@ func (s *Service) RevokeAllRemote(ctx context.Context, p authz.Principal) (ended
 	return ended, devices, nil
 }
 
+// EndRemoteWithoutAccess ends the live sessions of owners (every live
+// session when none are given) whose owner can no longer see the session's
+// project, with reason revoked, audited as remote.disable, and tells the
+// relay to close their streams: losing project or org access ends a session
+// the way deactivation does (re-review #2394 N7). p is who caused it (the
+// zero Principal for the relay's own checks).
+func (s *Service) EndRemoteWithoutAccess(ctx context.Context, p authz.Principal, owners ...int) ([]domain.RemoteSession, error) {
+	ended, err := s.Repo.EndRemoteSessionsWithoutAccess(ctx, domain.RemoteEndRevoked, owners...)
+	if err != nil {
+		return nil, err
+	}
+	s.remoteEnded(ctx, p, ended, domain.AuditRemoteDisable)
+	return ended, nil
+}
+
+// endRemoteAfterAccessChange is EndRemoteWithoutAccess after a membership
+// change, best effort: the change itself has happened, and the relay's
+// sweep and the next token refresh check again.
+func (s *Service) endRemoteAfterAccessChange(ctx context.Context, p authz.Principal, owners ...int) {
+	if _, err := s.EndRemoteWithoutAccess(context.WithoutCancel(ctx), p, owners...); err != nil {
+		slog.Warn("ending remote sessions after an access change failed", "err", err)
+	}
+}
+
 // RemoteIdleGrace is how long past the idle timeout the relay waits before
 // ending a session itself (the harness is authoritative; this is the backstop).
 const RemoteIdleGrace = 60 * time.Second
 
 // ExpireRemoteSessions ends sessions past their 12 h lifetime or idle limit,
-// audited as remote.expire. The relay calls it periodically.
+// audited as remote.expire, and sessions whose owner lost access to the
+// project (remote.disable, reason revoked). The relay calls it periodically.
 func (s *Service) ExpireRemoteSessions(ctx context.Context, now time.Time) ([]domain.RemoteSession, error) {
 	ended, err := s.Repo.EndExpiredRemoteSessions(ctx, now, RemoteIdleGrace)
 	if err != nil {
 		return nil, err
 	}
 	s.remoteEnded(ctx, authz.Principal{}, ended, domain.AuditRemoteExpire)
-	return ended, nil
+	// The backstop for access lost by any route (a team or org change made
+	// while amp-api couldn't end the session, or a direct database edit).
+	lost, err := s.EndRemoteWithoutAccess(ctx, authz.Principal{})
+	if err != nil {
+		return ended, err
+	}
+	if err := s.Repo.PruneProofNonces(ctx, now); err != nil {
+		slog.Warn("pruning remote refresh-proof nonces failed", "err", err)
+	}
+	return append(ended, lost...), nil
 }

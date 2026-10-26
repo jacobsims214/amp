@@ -152,6 +152,7 @@ func newRelayEnvIn(t *testing.T, w *rbacWorld, clock *testClock, tune func(*rela
 	// amp-relay.
 	e.svc = service.New(relayRepo, nil, nil)
 	e.svc.Remote, e.svc.AppURL = remoteOn, relayOrigin
+	e.svc.RelayAudit = true // as cmd/relay: audit entries through relay_record_audit
 	cfg := relay.Config{AppURL: relayOrigin, Now: e.clock.Now, Cluster: node}
 	if tune != nil {
 		tune(&cfg)

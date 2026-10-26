@@ -746,6 +746,63 @@ impl RemoteLink {
     }
 }
 
+/// What to tell the person when the relay refuses a token refresh's proof (protocol 8.2), or
+/// `None` for an answer that isn't one (a replayed nonce is a retry's, and any other failure is
+/// retried quietly). `local_now_ms` is this computer's clock, `token_left_ms` how long the current
+/// connect token still works.
+pub(crate) fn refused_refresh_notice(
+    e: &RelayError,
+    local_now_ms: i64,
+    token_left_ms: i64,
+) -> Option<String> {
+    if e.status != 400 && e.status != 403 {
+        return None;
+    }
+    let code = e.code.as_deref()?;
+    let stops = if token_left_ms > 60_000 {
+        format!(
+            "remote control stops when its current token runs out, in about {} min",
+            token_left_ms / 60_000
+        )
+    } else {
+        "remote control stops now".to_owned()
+    };
+    match code {
+        "stale_ts" => {
+            let off = match e.body.get("now_ms").and_then(Value::as_i64) {
+                Some(relay_now) => {
+                    let d = local_now_ms - relay_now;
+                    let secs = d.unsigned_abs().div_ceil(1000);
+                    let amount = if secs >= 120 {
+                        format!("{} min", secs.div_ceil(60))
+                    } else {
+                        format!("{secs} s")
+                    };
+                    format!(
+                        "this computer's clock is {amount} {} AMP's",
+                        if d > 0 { "ahead of" } else { "behind" }
+                    )
+                }
+                None => "this computer's clock is more than a minute off AMP's".to_owned(),
+            };
+            Some(format!(
+                "Remote control can't renew its token: {off}. Set the clock automatically \
+                 (System Settings > General > Date & Time); until then {stops}."
+            ))
+        }
+        "bad_signature"
+        | "wrong_harness"
+        | "wrong_session"
+        | "malformed"
+        | "unsupported_version"
+        | "unsupported_alg" => Some(format!(
+            "Remote control can't renew its token: AMP refused this session's key ({code}); \
+             {stops}. Run /remote again to start a new session."
+        )),
+        _ => None,
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -817,6 +874,9 @@ struct Actor {
     refresh_after_ms: i64,
     /// The person was told their login was refused (once).
     told_login: bool,
+    /// The refusal code of a token refresh the person was told about (once per code, until a
+    /// refresh works again).
+    told_refresh: Option<String>,
     signer: EventSigner,
     replay: ReplayState,
     window: Option<PairingWindow>,
@@ -877,6 +937,7 @@ impl Actor {
             token_expires_ms: reg.connect_token_expires_at_ms,
             refresh_after_ms: 0,
             told_login: false,
+            told_refresh: None,
             replay: ReplayState::default(),
             window: Some(window),
             window_link: Some(window_link),
@@ -1242,8 +1303,12 @@ impl Actor {
         }
         // A delta whose last word waits for more text: send it once the feed is quiet.
         // (The feed numbers a quiet delta after ~100 ms, so a word still growing arrives sooner.)
+        // A tail that could start a known secret stays held (#2399, N4a).
         if self.guard.is_stale(Duration::from_millis(400)) {
-            self.flush_guard();
+            let redactor = self.deps().redactor.clone();
+            if let Some((message_id, thinking, text)) = self.guard.flush_quiet(&redactor) {
+                self.send_delta(&message_id, thinking, text);
+            }
         }
         // Silence: no byte (not even a keepalive) for too long.
         if self.online
@@ -1310,6 +1375,7 @@ impl Actor {
                 self.token_expires_ms = r.connect_token_expires_at_ms;
                 self.refresh_after_ms = 0;
                 self.told_login = false;
+                self.told_refresh = None;
             }
             Err(e) => {
                 self.refresh_after_ms = now_ms() + 30_000;
@@ -1324,6 +1390,24 @@ impl Actor {
                 }
                 if let Some(reason) = e.ended_reason() {
                     let _ = self.inbound_tx.send(Inbound::Fatal(reason, None));
+                } else if let Some(text) =
+                    refused_refresh_notice(&e, now_ms(), self.token_expires_ms - now_ms())
+                {
+                    // The relay refused the harness key's proof (#2399, re-review #2394 N5): a
+                    // clock that's off, or a key it doesn't know. Retrying won't help, and
+                    // without a word remote control would just stop when the token runs out.
+                    let code = e.code.clone().unwrap_or_default();
+                    if self.told_refresh.as_deref() != Some(code.as_str()) {
+                        self.told_refresh = Some(code);
+                        self.link.notice(NoticeLevel::Warn, text.clone());
+                        let body = serde_json::to_value(ChatEvent::notice(
+                            NoticeLevel::Warn,
+                            Some("token_refresh_refused"),
+                            &text,
+                        ))
+                        .unwrap_or(Value::Null);
+                        self.send("chat_event", None, body);
+                    }
                 } else if e.status == 403 && e.code.as_deref() == Some("remote_disabled") {
                     // The org switch went off (section 12.3). Another 403 (a refused proof,
                     // #2390) is retried like any other failure.
@@ -2182,6 +2266,59 @@ impl Poster {
             for f in flushes.drain(..) {
                 let _ = f.send(());
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refused(status: u16, code: &str, body: Value) -> RelayError {
+        RelayError {
+            status,
+            code: Some(code.to_owned()),
+            message: String::new(),
+            body: Box::new(body),
+        }
+    }
+
+    /// #2399 (N5): what the person is told when a token refresh is refused, and when not.
+    #[test]
+    fn refused_refresh_notices() {
+        let now = 1_800_000_000_000;
+        let ahead = refused(400, "stale_ts", json!({"now_ms": now - 75_000}));
+        let text = refused_refresh_notice(&ahead, now, 10 * 60_000).unwrap();
+        assert!(text.contains("clock is 75 s ahead of AMP's"), "{text}");
+        assert!(text.contains("in about 10 min"), "{text}");
+        let behind = refused(400, "stale_ts", json!({"now_ms": now + 3 * 3_600_000}));
+        let text = refused_refresh_notice(&behind, now, 30_000).unwrap();
+        assert!(text.contains("clock is 180 min behind AMP's"), "{text}");
+        assert!(text.contains("remote control stops now"), "{text}");
+        let unknown = refused(400, "stale_ts", json!({}));
+        assert!(
+            refused_refresh_notice(&unknown, now, 0)
+                .unwrap()
+                .contains("more than a minute off")
+        );
+        for code in ["bad_signature", "wrong_harness"] {
+            let status = if code == "bad_signature" { 403 } else { 400 };
+            let text = refused_refresh_notice(&refused(status, code, json!({})), now, 0).unwrap();
+            assert!(text.contains(code) && text.contains("/remote"), "{text}");
+        }
+        // A retry's own replay, policy, login and outages are handled elsewhere (or retried).
+        for (status, code) in [
+            (400, "replayed_nonce"),
+            (403, "remote_disabled"),
+            (401, "unauthenticated"),
+            (503, "relay_unavailable"),
+            (429, "rate_limited"),
+        ] {
+            assert_eq!(
+                refused_refresh_notice(&refused(status, code, json!({})), now, 0),
+                None,
+                "{code}"
+            );
         }
     }
 }
