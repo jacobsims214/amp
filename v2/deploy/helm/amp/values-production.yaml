@@ -80,6 +80,27 @@ global:
   # matching how odoo-operator's Application overrides `image.tag`.
   imageTag: "latest"   # override per release, e.g. sha-763788d
 
+# Client IP in the audit log (#2430, #2469). See values.yaml for what these
+# mean. The services believe the client address Envoy sends only from
+# Envoy's pods, which run in this cluster's pod CIDR; the networkPolicy
+# below keeps every other pod away from the services.
+# envoy.clientIP stays at the chart default (xffNumTrustedHops: 0): rows
+# record Envoy's TCP peer, which is whatever proxy sits in front of Envoy
+# here. Not spoofable, but not the end client either. To record the end
+# client, describe the hops in front of Envoy (envoy.clientIP) once they pass
+# it on: an operator choice, see the release notes (#2436).
+clientIP:
+  trustedProxies:
+    - 10.244.0.0/16
+
+networkPolicy:
+  enabled: true
+  # Who may reach Envoy is left open (the chart default). With
+  # envoy.clientIP.xffNumTrustedHops at 0 nothing in front of Envoy can
+  # choose its recorded address, so this isn't needed for the audit log.
+  envoyIngress:
+    enabled: false
+
 image:
   # Built + pushed by .github/workflows/build-images.yml on every push to
   # main / tag. Namespace matches env.IMAGE_NAMESPACE in that workflow.

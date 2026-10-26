@@ -35,6 +35,7 @@ spec:
           securityContext:
             {{- include "amp.containerSecurityContext" . | nindent 12 }}
           env:
+            {{- include "amp.trustedProxiesEnv" . | nindent 12 }}
             - name: ADDR
               value: ":8091"
             - name: MCP_OAUTH_PUBLIC_URL

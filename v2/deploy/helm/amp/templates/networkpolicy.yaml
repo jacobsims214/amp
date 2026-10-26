@@ -1,0 +1,112 @@
+{{- if .Values.networkPolicy.enabled }}
+# Who may reach AMP's own services (#2430, #2469). The services believe the
+# client address Envoy sends (X-Amp-Client-Ip) from clientIP.trustedProxies,
+# so nothing but Envoy may open their public ports: otherwise a pod that
+# could call amp-api directly from a trusted address could choose the client
+# IP in the audit log. amp-api's replica-to-replica port (3003) admits only
+# amp-api. The relay has its own policy (relay.networkPolicy).
+#
+# These select only this chart's own pods by their labels, so they assume
+# nothing about what sits in front of Envoy. Not affected: kubelet probes
+# (from the node, not a pod) and `kubectl port-forward` (it enters the pod's
+# own network namespace). Egress is not limited. They need a CNI that
+# enforces NetworkPolicy; without one they are inert.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-api
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-api" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-api
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 3001 }
+        - { protocol: TCP, port: 8000 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: amp-api
+      ports:
+        - { protocol: TCP, port: 3003 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-authadmin
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "authadmin" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-authadmin
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 8090 }
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-mcpoauth
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "mcpoauth" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-mcpoauth
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 8091 }
+{{- with .Values.networkPolicy.envoyIngress }}
+{{- if .enabled }}
+---
+# Who may reach Envoy itself (networkPolicy.envoyIngress, off by default).
+# What sits in front of Envoy is the deployment's choice, so the peers come
+# from values (NetworkPolicyPeers: namespace/pod selectors and/or ipBlocks).
+# Enabled with an empty list: no pod or address may open Envoy's listeners
+# (`kubectl port-forward` and the kubelet's probes still work).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: envoy
+  namespace: {{ $.Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "envoy" "Release" $.Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: envoy
+  policyTypes: [Ingress]
+  {{- with .from }}
+  ingress:
+    - from:
+        {{- toYaml . | nindent 8 }}
+      ports:
+        - { protocol: TCP, port: 8080 }
+        - { protocol: TCP, port: 8443 }
+  {{- else }}
+  ingress: []
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

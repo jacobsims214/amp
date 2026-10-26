@@ -30,12 +30,14 @@ data:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: amp_https
                     stream_idle_timeout: 3600s
+                    {{- include "amp.envoyClientIP" . | nindent 20 }}
                     access_log:
                       - name: envoy.access_loggers.stdout
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                     route_config:
                       name: amp_routes
+                      {{- include "amp.envoyClientIPHeader" . | nindent 22 }}
                       virtual_hosts:
                         - name: amp
                           domains: ["*"]
@@ -232,12 +234,14 @@ data:
                     "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
                     stat_prefix: amp_http
                     stream_idle_timeout: 3600s
+                    {{- include "amp.envoyClientIP" . | nindent 20 }}
                     access_log:
                       - name: envoy.access_loggers.stdout
                         typed_config:
                           "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
                     route_config:
                       name: amp_routes
+                      {{- include "amp.envoyClientIPHeader" . | nindent 22 }}
                       virtual_hosts:
                         - name: amp
                           domains: ["*"]
