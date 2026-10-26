@@ -158,7 +158,7 @@ func (s *Service) SetUserDisabled(ctx context.Context, p authz.Principal, userID
 	if disabled {
 		// A deactivated person's remote sessions end now (#2390), which also
 		// voids their connect tokens; the relay is told to close the streams.
-		ended, err := s.Repo.EndOwnerRemoteSessions(ctx, userID, domain.RemoteEndRevoked)
+		ended, err := s.Repo.EndOwnerRemoteSessions(ctx, userID, domain.RemoteEndDeactivated)
 		if err != nil {
 			slog.Warn("ending a deactivated account's remote sessions failed", "user_id", userID, "err", err)
 		} else {

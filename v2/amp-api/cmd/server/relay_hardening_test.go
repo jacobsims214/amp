@@ -262,7 +262,7 @@ func TestRelay_HarnessEventByteRate(t *testing.T) {
 	s.mustPublish(t, s.pad(t, 900<<10), s.pad(t, 900<<10))
 }
 
-// Deactivating a person ends their live sessions (reason revoked): the
+// Deactivating a person ends their live sessions (reason deactivated, #2455): the
 // harness's stream gets end, the connect token stops working, and the
 // relay refuses a deactivated owner's token even for a session left active.
 func TestRelay_DeactivationEndsSessions(t *testing.T) {
@@ -277,7 +277,7 @@ func TestRelay_DeactivationEndsSessions(t *testing.T) {
 	if st != 200 {
 		t.Fatalf("deactivate: %d %v", st, body)
 	}
-	if f := hc.waitFor(t, "end", ""); dataOf(t, f)["reason"] != domain.RemoteEndRevoked {
+	if f := hc.waitFor(t, "end", ""); dataOf(t, f)["reason"] != domain.RemoteEndDeactivated {
 		t.Fatalf("end: %v", f)
 	}
 	v.waitFor(t, "relay", `"ended"`)
@@ -285,7 +285,7 @@ func TestRelay_DeactivationEndsSessions(t *testing.T) {
 	if st != 401 && st != 410 {
 		t.Fatalf("heartbeat after deactivation: %d %v", st, body)
 	}
-	if a := remoteAudit(t, e.w.s.repo, e.w.org.ID, domain.AuditRemoteDisable, s.id); len(a) != 1 || a[0].Details["reason"] != domain.RemoteEndRevoked {
+	if a := remoteAudit(t, e.w.s.repo, e.w.org.ID, domain.AuditRemoteDisable, s.id); len(a) != 1 || a[0].Details["reason"] != domain.RemoteEndDeactivated {
 		t.Fatalf("remote.disable: %+v", a)
 	}
 	// Someone else's session is untouched.

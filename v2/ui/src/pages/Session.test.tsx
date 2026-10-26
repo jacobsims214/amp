@@ -9,7 +9,7 @@ import type { RemoteDeps } from '../remote/remote-context'
 import type { RemoteCrypto } from '../remote/crypto'
 import { memoryStore } from '../remote/deviceStore'
 import { webRemoteCrypto } from '../remote/webCrypto'
-import { httpTransport, RelayError, type EventStreamHandlers, type RelayTransport } from '../remote/transport'
+import { httpTransport, RELAY_DOWN_MESSAGE, RelayError, type EventStreamHandlers, type RelayTransport } from '../remote/transport'
 import { MOCK_SESSION_ID, MockRelay, mockCrypto, mockTransport, workerScene } from '../remote/mock/mockRelay'
 import parityStream from '../remote/mock/parityStream.json'
 import { loadVectors } from '../test/vectors'
@@ -441,6 +441,51 @@ describe('Session page shows what the TUI shows besides (#2388)', () => {
 })
 
 describe('Session page while amp-relay is down', () => {
+  /** A transport whose getSession fails with `err` for the first `failures` calls, then works. */
+  function outage(failures: number, err: () => Error) {
+    const { relay, deps } = mockSession()
+    const calls = { n: 0 }
+    const inner = deps.transport
+    const transport: RelayTransport = {
+      ...inner,
+      getSession: async id => { calls.n++; if (calls.n <= failures) throw err(); return inner.getSession(id) },
+    }
+    return { relay, deps: { ...deps, transport }, calls }
+  }
+
+  it('a page opened during the outage opens the session by itself once the relay is back (#2455)', async () => {
+    const { deps, calls } = outage(2, () => new RelayError(503, 'relay_down', RELAY_DOWN_MESSAGE))
+    renderSession(deps)
+    expect(await screen.findByText('Waiting to open the session')).toBeInTheDocument()
+    expect(screen.getByText(RELAY_DOWN_MESSAGE)).toBeInTheDocument()
+    expect(screen.getByText(/keeps trying and opens the session as soon as it can/)).toBeInTheDocument()
+    expect(screen.queryByText("Couldn't open the session")).toBeNull()
+    // No reload: the backoff (about 1 s, then about 2 s) tries again and the session opens.
+    expect(await screen.findByText('Laptop online', {}, { timeout: 6_000 })).toBeInTheDocument()
+    expect(calls.n).toBe(3)
+    expect(screen.queryByText('Waiting to open the session')).toBeNull()
+  })
+
+  it('a network failure is retried too, and Try now tries at once', async () => {
+    const user = userEvent.setup()
+    const { deps, calls } = outage(1, () => new TypeError('Failed to fetch'))
+    renderSession(deps)
+    await screen.findByText('Waiting to open the session')
+    await user.click(screen.getByRole('button', { name: 'Try now' }))
+    expect(await screen.findByText('Laptop online', {}, { timeout: 500 })).toBeInTheDocument()
+    expect(calls.n).toBe(2)
+  })
+
+  it('a refusal is final: no retry loop', async () => {
+    const { deps, calls } = outage(99, () => new RelayError(403, 'forbidden', 'Not allowed.'))
+    renderSession(deps)
+    expect(await screen.findByText("Couldn't open the session")).toBeInTheDocument()
+    expect(screen.getByText('Not allowed.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Try now' })).toBeNull()
+    await new Promise(r => setTimeout(r, 1_500))
+    expect(calls.n).toBe(1)
+  })
+
   it('says remote control is unavailable instead of a raw 503', async () => {
     const fetchMock = vi.fn(async () => new Response('no healthy upstream', { status: 503, headers: { 'Content-Type': 'text/plain' } }))
     vi.stubGlobal('fetch', fetchMock)

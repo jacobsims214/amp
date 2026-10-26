@@ -490,12 +490,12 @@ func (s *Service) RevokeAllRemote(ctx context.Context, p authz.Principal) (ended
 
 // EndRemoteWithoutAccess ends the live sessions of owners (every live
 // session when none are given) whose owner can no longer see the session's
-// project, with reason revoked, audited as remote.disable, and tells the
+// project, with reason access_lost (#2455), audited as remote.disable, and tells the
 // relay to close their streams: losing project or org access ends a session
 // the way deactivation does (re-review #2394 N7). p is who caused it (the
 // zero Principal for the relay's own checks).
 func (s *Service) EndRemoteWithoutAccess(ctx context.Context, p authz.Principal, owners ...int) ([]domain.RemoteSession, error) {
-	ended, err := s.Repo.EndRemoteSessionsWithoutAccess(ctx, domain.RemoteEndRevoked, owners...)
+	ended, err := s.Repo.EndRemoteSessionsWithoutAccess(ctx, domain.RemoteEndAccessLost, owners...)
 	if err != nil {
 		return nil, err
 	}
@@ -519,7 +519,7 @@ const RemoteIdleGrace = 60 * time.Second
 // ExpireRemoteSessions ends sessions past their lifetime or idle limit (both
 // opt-in per org, #2424),
 // audited as remote.expire, and sessions whose owner lost access to the
-// project (remote.disable, reason revoked). The relay calls it periodically.
+// project (remote.disable, reason access_lost). The relay calls it periodically.
 func (s *Service) ExpireRemoteSessions(ctx context.Context, now time.Time) ([]domain.RemoteSession, error) {
 	ended, err := s.Repo.EndExpiredRemoteSessions(ctx, now, RemoteIdleGrace)
 	if err != nil {
