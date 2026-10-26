@@ -30,6 +30,9 @@ type Service struct {
 	// ArtifactRetention is how long an artifact lives after its last version
 	// unless someone keeps it (0: the default, 45 days).
 	ArtifactRetention time.Duration
+	// Denied rate-limits refusal rows (nil: the limiter shared by every
+	// Service, which main uses).
+	Denied *DeniedLimiter
 }
 
 func New(repo *repository.Repo, registry *actor.Registry, kbSvc *kb.Service) *Service {
