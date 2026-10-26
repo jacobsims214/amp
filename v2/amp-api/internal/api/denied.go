@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/simstech/amp-api/internal/authz"
+	"github.com/simstech/amp-api/internal/service"
 )
 
 // Every REST route that answers 403 records access.denied (rate-limited
@@ -66,8 +68,34 @@ func (h *RestHandler) denied(fn http.HandlerFunc) http.HandlerFunc {
 		if err != nil {
 			return // not authenticated: the auth middleware answers those
 		}
-		h.svc.AuditAccessDenied(r.Context(), p, "route", r.Method+" "+r.URL.Path, errors.New(deniedReason(rec.body)))
+		h.svc.AuditAccessDenied(r.Context(), p, "route", r.Method+" "+r.URL.Path, accessScopeOf(r), errors.New(deniedReason(rec.body)))
 	}
+}
+
+// accessScopeOf reads what a request targets from its path
+// (/api/projects/{id}/..., /api/orgs/{id}, /api/teams/{id}, /api/tasks/{id},
+// /api/epics/{id}, /api/stories/{id}) and its project_id/org_id query
+// parameters, so its access.denied row is filed under that org or project.
+func accessScopeOf(r *http.Request) service.AccessScope {
+	var sc service.AccessScope
+	ids := map[string]*int{"projects": &sc.ProjectID, "orgs": &sc.OrgID, "teams": &sc.TeamID,
+		"tasks": &sc.TaskID, "epics": &sc.EpicID, "stories": &sc.StoryID}
+	if parts := splitPath(strings.TrimPrefix(r.URL.Path, "/api/")); len(parts) >= 2 {
+		if dst, ok := ids[parts[0]]; ok {
+			if n, err := strconv.Atoi(parts[1]); err == nil && n > 0 {
+				*dst = n
+			}
+		}
+	}
+	q := r.URL.Query()
+	for k, dst := range map[string]*int{"project_id": &sc.ProjectID, "org_id": &sc.OrgID} {
+		if *dst == 0 {
+			if n, err := strconv.Atoi(q.Get(k)); err == nil && n > 0 {
+				*dst = n
+			}
+		}
+	}
+	return sc
 }
 
 // deniedReason pulls the message out of a {"error": "..."} body, or

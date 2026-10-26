@@ -80,8 +80,11 @@ var (
 
 // RecordAuthEvent writes the audit rows for an authentication event (wired
 // to auth.Verifier.OnEvent in main):
-//   - auth.login once per Dex session (sub+iat; a refreshed token is a new
-//     session), checked across replicas in the database;
+//   - auth.login once per Dex sign-in, checked across replicas in the
+//     database. The session id is stable across token refreshes when the
+//     token has auth_time or a nonce (auth.DexSessionID; oauth2-proxy sends
+//     a nonce), so oauth2-proxy's hourly refresh is not audited: it is the
+//     same sign-in (#2440). A token with neither still counts per iat;
 //   - user.create when a first sign-in creates the account, and
 //     invite.accept for each pending invite it accepted, with the roles
 //     granted;
@@ -194,12 +197,21 @@ func (s *Service) recordTokenUse(ctx context.Context, p authz.Principal) {
 
 // ---- Refusals ----
 
+// AccessScope names what a refused request was aimed at, as far as the
+// listener can tell from the route or the tool's arguments (0: not given).
+// AuditAccessDenied resolves it to the org and project the row is filed
+// under, so org admins and org/project webhooks see refused attempts on
+// their resources (#2440, review #2432 L5).
+type AccessScope struct {
+	ProjectID, OrgID, TaskID, EpicID, StoryID, TeamID int
+}
+
 // AuditAccessDenied records a request a listener refused with 403
 // (access.denied, rate-limited per actor and target), unless a specific
 // refusal (plan.approve.denied, task.dispatch.denied, ...) was already
 // recorded for it. surface is "route" (REST: method and path) or "tool"
-// (MCP: the tool name), op the route or tool.
-func (s *Service) AuditAccessDenied(ctx context.Context, p authz.Principal, surface, op string, err error) {
+// (MCP: the tool name), op the route or tool, and scope what it targeted.
+func (s *Service) AuditAccessDenied(ctx context.Context, p authz.Principal, surface, op string, scope AccessScope, err error) {
 	req := p.Req
 	if req == nil {
 		req, _ = reqctx.FromContext(ctx)
@@ -207,8 +219,55 @@ func (s *Service) AuditAccessDenied(ctx context.Context, p authz.Principal, surf
 	if req.DeniedAudited() {
 		return
 	}
-	s.auditDenied(ctx, p, "access", domain.AuditEntry{TargetType: surface, TargetID: reqctx.Clip(op, 200),
-		Summary: "refused " + p.Label() + ": " + reqctx.Clip(op, 200)}, err)
+	e := domain.AuditEntry{TargetType: surface, TargetID: reqctx.Clip(op, 200),
+		Summary: "refused " + p.Label() + ": " + reqctx.Clip(op, 200)}
+	e.ProjectID, e.OrgID = s.resolveAccessScope(ctx, scope)
+	s.auditDenied(ctx, p, "access", e, err)
+}
+
+// resolveAccessScope returns the project and org scope points at, each nil
+// when it names none or doesn't exist (a made-up id files nothing under
+// anyone). A ticket, epic or story gives its project; a team its org; a
+// project's org is filled in by audit.
+func (s *Service) resolveAccessScope(ctx context.Context, sc AccessScope) (projectID, orgID *int) {
+	if s.Repo == nil {
+		return nil, nil
+	}
+	pid := sc.ProjectID
+	switch {
+	case pid != 0:
+	case sc.TaskID != 0:
+		if t, err := s.Repo.GetTask(ctx, sc.TaskID); err == nil {
+			pid = t.ProjectID
+		}
+	case sc.StoryID != 0:
+		if st, err := s.Repo.GetStory(ctx, sc.StoryID); err == nil {
+			pid = st.ProjectID
+		}
+	case sc.EpicID != 0:
+		if ep, err := s.Repo.GetEpic(ctx, sc.EpicID); err == nil {
+			pid = ep.ProjectID
+		}
+	}
+	if pid != 0 {
+		if proj, err := s.Repo.GetProject(ctx, pid); err == nil {
+			projectID, orgID = intRef(proj.ID), proj.OrgID
+		}
+	}
+	if orgID == nil {
+		oid := sc.OrgID
+		if oid == 0 && sc.TeamID != 0 {
+			if tm, err := s.Repo.GetTeam(ctx, sc.TeamID); err == nil {
+				oid = tm.OrgID
+			}
+		}
+		if oid != 0 {
+			if org, err := s.Repo.GetOrg(ctx, oid); err == nil {
+				orgID = intRef(org.ID)
+			}
+		}
+	}
+	return projectID, orgID
 }
 
 // AuditApproveDenied records a refused plan approval (plan.approve.denied):

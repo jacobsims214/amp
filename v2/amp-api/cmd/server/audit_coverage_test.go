@@ -344,6 +344,73 @@ func TestAuditCoverage_AccessDenied(t *testing.T) {
 	}
 }
 
+// #2440 (review #2432 L5): a refused request is filed under the org and
+// project it targeted, so the org's admins (and its webhooks) see it, not
+// only global admins.
+func TestAuditCoverage_AccessDeniedScope(t *testing.T) {
+	w := newRBACWorld(t)
+	rest := newAuditREST(t, w)
+	pid := w.s.projectID
+	orgOf := func(e domain.AuditEntry) int {
+		if e.OrgID == nil {
+			return 0
+		}
+		return *e.OrgID
+	}
+
+	// REST, org route.
+	if code, _ := rest.do(t, "alice", "203.0.113.21", "POST", fmt.Sprintf("/api/orgs/%d/members", w.org.ID),
+		map[string]any{"user": w.bob.Email, "role": "admin"}); code != 403 {
+		t.Fatalf("member add by a non-admin: %d", code)
+	}
+	// REST, team route: the team's org.
+	if code, _ := rest.do(t, "alice", "203.0.113.21", "DELETE", fmt.Sprintf("/api/teams/%d", w.devs.ID), nil); code != 403 {
+		t.Fatalf("team delete by a member: %d", code)
+	}
+	// REST, project route: the project and its org.
+	if code, _ := rest.do(t, "alice", "203.0.113.21", "PATCH", fmt.Sprintf("/api/projects/%d", pid),
+		map[string]any{"metadata": map[string]any{"jira": "X"}}); code != 403 {
+		t.Fatalf("project settings by a member: %d", code)
+	}
+	rows := auditRows(t, w.s.repo, domain.AuditFilter{ActorUserID: w.alice.User.ID, Action: "access.denied"})
+	if len(rows) != 3 {
+		t.Fatalf("access.denied rows = %+v", rows)
+	}
+	proj, team, org := rows[0], rows[1], rows[2]
+	if orgOf(org) != w.org.ID || org.ProjectID != nil {
+		t.Fatalf("org route row: org %v project %v", org.OrgID, org.ProjectID)
+	}
+	if orgOf(team) != w.org.ID {
+		t.Fatalf("team route row: org %v", team.OrgID)
+	}
+	if orgOf(proj) != w.org.ID || proj.ProjectID == nil || *proj.ProjectID != pid {
+		t.Fatalf("project route row: org %v project %v", proj.OrgID, proj.ProjectID)
+	}
+
+	// MCP: the tool's org_id argument.
+	alice := w.s.as(w.alice)
+	if msg := mcpCall(t, alice, mcpFrom(alice, "198.51.100.81", "x"), "amp_audit_log", map[string]any{"org_id": float64(w.org.ID)}); msg == "" {
+		t.Fatal("amp_audit_log for a non-admin succeeded")
+	}
+	rows = auditRows(t, w.s.repo, domain.AuditFilter{ActorUserID: w.alice.User.ID, Action: "access.denied", Limit: 1})
+	if len(rows) != 1 || rows[0].TargetID != "amp_audit_log" || orgOf(rows[0]) != w.org.ID {
+		t.Fatalf("MCP access.denied = %+v", rows)
+	}
+
+	// The org's own log (what its admins read) now holds the refusals.
+	if n := len(auditRows(t, w.s.repo, domain.AuditFilter{OrgID: w.org.ID, Action: "access.denied", ActorUserID: w.alice.User.ID})); n != 4 {
+		t.Fatalf("org log has %d of alice's refusals, want 4", n)
+	}
+	// A made-up id files nothing under anyone.
+	if code, _ := rest.do(t, "alice", "203.0.113.21", "POST", "/api/orgs/987654321/members",
+		map[string]any{"user": w.bob.Email, "role": "admin"}); code == 403 {
+		rows = auditRows(t, w.s.repo, domain.AuditFilter{ActorUserID: w.alice.User.ID, Action: "access.denied", Limit: 1})
+		if rows[0].OrgID != nil {
+			t.Fatalf("unknown org filed under %v", *rows[0].OrgID)
+		}
+	}
+}
+
 // Membership, role, org and webhook changes carry before/after; webhook
 // secrets and URL paths never reach the log.
 func TestAuditCoverage_BeforeAfter(t *testing.T) {
@@ -575,6 +642,72 @@ func TestAuditCoverage_APITokens(t *testing.T) {
 	}
 	if !strings.Contains(details, `"token_prefix": "amp_ZZZZZZ"`) || strings.Contains(details, bad) || actorType != "anonymous" || outcome != "denied" {
 		t.Fatalf("auth.token.fail = %s %s %s", details, actorType, outcome)
+	}
+}
+
+// #2440 (review #2432 M1): rotating addresses can't turn bad-token
+// requests into one audit row each. Addresses in one IPv6 /64 are one
+// caller, and anonymous refusals share a global cap per minute whose excess
+// becomes one "N more suppressed" row.
+func TestAuditCoverage_TokenFailFlood(t *testing.T) {
+	w := newRBACWorld(t)
+	repo := w.s.repo
+	ctx := context.Background()
+	svc := service.New(repo, w.s.reg, w.s.kb)
+	svc.Denied = service.NewDeniedLimiter(10*time.Minute, 1000, 5, 5*time.Second)
+	v := auth.NewAPITokenVerifier(repo)
+	v.OnEvent = svc.RecordAuthEvent
+	h := reqctx.Middleware(reqctx.ListenerREST, reqctx.NewResolver(nil))(v.Middleware(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {})))
+	tag := fmt.Sprintf("%04x", time.Now().UnixNano()&0xffff)
+	call := func(remote string) {
+		req := httptest.NewRequest("GET", "/api/me", nil)
+		req.RemoteAddr = remote
+		req.Header.Set("Authorization", "Bearer amp_"+strings.Repeat("Q", 43))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != 401 {
+			t.Fatalf("bad token: %d", rec.Code)
+		}
+	}
+	db, err := pgx.Connect(ctx, testDSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(ctx)
+	var mark int64
+	if err := db.QueryRow(ctx, `SELECT coalesce(max(id), 0) FROM audit_log`).Scan(&mark); err != nil {
+		t.Fatal(err)
+	}
+	// 200 addresses rotating inside one /64: one caller.
+	for i := range 200 {
+		call(fmt.Sprintf("[2001:db8:%s:1::%x]:1", tag, i+1))
+	}
+	// 300 callers, each from its own /64.
+	for i := range 300 {
+		call(fmt.Sprintf("[2001:db8:%s:%x::1]:1", tag, i+2))
+	}
+	block := fmt.Sprintf("2001:db8:%s::/48", tag)
+	var n int
+	if err := db.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'auth.token.fail' AND source_ip <<= $1::inet`, block).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 {
+		t.Fatalf("%d auth.token.fail rows from 500 requests, want 5 (the global cap)", n)
+	}
+	// The other 296 callers (300 - 4 after the /64's one) are summed into one
+	// row when the window ends.
+	deadline := time.Now().Add(20 * time.Second)
+	suppressed := -1
+	for time.Now().Before(deadline) {
+		err := db.QueryRow(ctx, `SELECT (details->>'suppressed')::int FROM audit_log WHERE action = 'auth.token.fail'
+			AND details->>'aggregate' = 'true' AND id > $1 ORDER BY id LIMIT 1`, mark).Scan(&suppressed)
+		if err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if suppressed != 296 {
+		t.Fatalf("summary row suppressed = %d, want 296 (-1: none written)", suppressed)
 	}
 }
 
