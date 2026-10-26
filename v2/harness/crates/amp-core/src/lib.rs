@@ -48,20 +48,77 @@
 //!   MCP client, never the model; polled on #2078 §2's intervals and refreshed right after any
 //!   `amp_*` tool call; the TUI reads one shared [`meta::AmpMeta`] snapshot.
 //!
+//! #2225:
+//! - [`repeat`]: the repeat guard. A model that makes the same tool call (same name, same
+//!   arguments) again and again is nudged, then stopped, for every role.
+//!
+//! Story 397 (#2233, H2):
+//! - [`mcp_config`]: `[mcp.<name>]` external MCP servers in the user and repo config files:
+//!   schema, validation, layering, `${...}` substitution, keychain accounts and `mcp__<server>__<tool>`
+//!   names.
+//!
+//! Story 397 (#2237, H4):
+//! - [`mcp_http`]: a resolved http `[mcp.<name>]` table to amp-mcp's `HttpServerOptions`, reading
+//!   its secrets (keychain `secret_headers` / OAuth client secret, `bearer_env`).
+//!
+//! Story 397 (#2236, H3):
+//! - [`mcp_stdio`]: a resolved stdio server as an [`amp_mcp::StdioSpec`]: the D7 child environment
+//!   (the bash scrub of #2142 plus the server's own env and keychain secrets), cwd, stderr log.
+//!
+//! #2364:
+//! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
+//!   the manager's folder: git worktrees in a usable repository, a folder per ticket outside git.
+//!
+//! Remote control M1 (#2370):
+//! - [`events::FanOutEmitter`]: the manager's events go to the TUI, the manager feed and any later
+//!   subscriber (the remote link).
+//! - [`chat_event`]: everything the chat shows as [`chat_event::ChatEvent`]s, the wire shape of
+//!   `v2/docs/remote-control/protocol.md` section 6.4 (a superset of `run --json`'s events).
+//! - [`manager_feed`]: the manager's append-only, sequence-numbered, bounded chat feed with replay
+//!   from any seq and a resync from the session file.
+//!
+//! Remote control M1 (#2373):
+//! - [`remote`]: the remote link: protocol (JCS, envelopes, signatures, pairing), the relay
+//!   client, secret redaction, the local off switches and [`remote::RemoteLink`].
+//!
 //! Depends on amp-mcp and rpi-ai/agent/tools/harness, never on amp-tui.
 
 pub mod agent;
+pub mod approval;
+pub mod approval_wait;
 pub mod assets;
+pub mod chat_event;
+pub mod config_check;
 pub mod events;
 pub mod faux;
+pub mod links;
+pub mod manager_feed;
+pub mod mcp_config;
+pub mod mcp_http;
+pub mod mcp_hub;
+pub mod mcp_stamp;
+pub mod mcp_stdio;
 pub mod mcp_tools;
+pub mod mcp_trust;
 pub mod meta;
 pub mod models;
 pub mod policy;
 pub mod project;
+pub mod provider_auth;
+pub mod provider_error;
 pub mod providers;
+pub mod remote;
+pub mod repeat;
+pub mod repo_config;
+pub mod repo_trust;
+pub mod request_time;
 pub mod roles;
 pub mod run_report;
 pub mod supervisor;
+pub mod templates;
+pub mod text_tool_calls;
 pub mod tickets;
+pub mod tool_guide;
 pub mod tools;
+pub mod worker_session;
+pub mod workspace;

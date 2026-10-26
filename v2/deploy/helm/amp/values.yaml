@@ -32,6 +32,10 @@ global:
     oauth2ProxyClientSecret: ""
     oauth2ProxyCookieSecret: ""
     valkeyPassword: ""
+    # amp-relay's database role password and its cluster token (relay.enabled
+    # only; see relay.database and relay.clusterToken).
+    relayDbPassword: ""
+    relayClusterToken: ""
 
 image:
   pullPolicy: IfNotPresent
@@ -65,9 +69,92 @@ ampApi:
   # n8n on your LAN). Off: a project owner's webhook URL can't be used to
   # reach services inside the cluster.
   webhookAllowPrivateNetworks: false
+  # The web app's origin as browsers see it ("https://amp.example" or
+  # "https://amp.local:8443"), no trailing slash. Links in MCP replies and the
+  # remote control relay's Origin check use it. Empty: https://<global.domain>
+  # (derived from MCP_PUBLIC_URL).
+  appPublicUrl: ""
   resources:
     requests: { cpu: 100m, memory: 128Mi }
     limits: { cpu: 500m, memory: 512Mi }
+
+# Remote control of a harness session from the web app (epic 165). Off by
+# default. relay.enabled deploys amp-relay, the relay's own service (#2387),
+# adds Envoy's routes to it (/relay/ without ext_authz, /api/sessions behind
+# the cookie session, unbounded timeouts on the streams), and tells amp-api a
+# relay exists (RELAY_ENABLED: the /api/me capability). amp-api serves no relay
+# route, so scaling amp-relay to 0 turns remote control off for everyone.
+# When on, an org admin still has to turn it on for their org (org settings),
+# and each person turns it on per session with /remote in the harness. Needs
+# auth (amp-relay refuses to start without Dex).
+#
+# Org default: always off. Each org's switch (and its idle timeout, 5-240 min,
+# default 30, and device pin days) is an org setting in the database, edited by
+# org admins in the web app (PUT /api/orgs/:id/remote-control), not here.
+# amp-relay only accepts browser POSTs whose Origin is exactly the web address
+# (ampApi.appPublicUrl, else https://<global.domain>), so set
+# ampApi.appPublicUrl when people reach AMP on another origin (a port-forward
+# such as :8443, or a different public host).
+# Anything in front of Envoy (Traefik, a cloud LB) must not cut long SSE
+# streams either: see KB how-to/remote-control-local-test.md.
+relay:
+  enabled: false
+  image: amp-relay
+  tag: local
+  # 2+ keeps remote control up through a pod or node failure: a session lives
+  # on one replica, the others forward to it, and take it over if it dies.
+  replicas: 2
+  # Envoy's cap on one relay stream (the harness's command stream and a
+  # browser's event stream). Per stream, not per session: a session has no
+  # time limit by default (#2424), and the harness and the browser reopen a
+  # stream Envoy cuts at once, so this only bounds how long one connection
+  # is held.
+  maxStreamDuration: 43200s
+  # A relay stream with no bytes for this long is cut (the relay sends a
+  # keepalive every 20 s and the harness a heartbeat every 20 s, so only a
+  # dead peer gets there).
+  streamIdleTimeout: 120s
+  # Every other relay call (register, token refresh, event batches,
+  # heartbeats, pairing, end, the browser's commands) is a short request.
+  requestTimeout: 30s
+  # Refuse to render with relay.enabled unless the relay's database password
+  # and cluster token are pinned (database.existingSecret or
+  # global.secretOverrides.relayDbPassword, clusterToken.existingSecret or
+  # global.secretOverrides.relayClusterToken). values-production.yaml turns it
+  # on: under ArgoCD the generated values change on every sync.
+  requirePinnedSecrets: false
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { cpu: 500m, memory: 256Mi }
+  # Least privilege (#2392): amp-relay connects to Postgres as its own role,
+  # never amp-api's. The chart declares it as a CloudNativePG managed role
+  # (cnpg-cluster.yaml) with the password in a basic-auth Secret, and amp-api
+  # grants it only the tables and columns the relay uses (RELAY_DB_ROLE) after
+  # every migration run.
+  database:
+    role: amp_relay
+    # A kubernetes.io/basic-auth Secret you manage (username = role,
+    # password). Empty: the chart makes amp-relay-db (password from
+    # global.secretOverrides.relayDbPassword, else the existing Secret's,
+    # else random). Under ArgoCD use this or the override: a password
+    # regenerated on a sync changes the role's password under running pods.
+    existingSecret: ""
+  # The relay's own cluster token: relay replicas use it with each other and
+  # amp-api uses it to call them (/internal/relay/ only). Never amp-api's own
+  # cluster token, which stays in the database where the relay's role can't
+  # read it. Mounted in amp-relay and amp-api as RELAY_CLUSTER_TOKEN.
+  clusterToken:
+    # A Secret you manage with the token (32+ random characters) under key.
+    # Empty: the chart makes amp-relay-cluster-token (value from
+    # global.secretOverrides.relayClusterToken, else the existing Secret's,
+    # else random).
+    existingSecret: ""
+    key: token
+  # NetworkPolicy for amp-relay's pods: :3002 (the relay) only from Envoy,
+  # :3003 (internal: forwarding and control calls) only from amp-relay and
+  # amp-api. Needs a CNI that enforces NetworkPolicy; without one it's inert.
+  networkPolicy:
+    enabled: true
 
 ui:
   image: amp-ui

@@ -247,7 +247,7 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
 
 | Reason (`human_reason`) | Examples |
 |---|---|
-| `review` | A person reviews and merges the PR (the team requires human review, or it's a protected branch) |
+| `review` | A person reviews and merges the PR (the team requires human review, or it's a protected branch); outside git (business or ops work), a person reviews the deliverable: the doc, the email draft, the sheet |
 | `approval` | Sign-off on a prod release, a spend, a security or legal change, a customer-facing launch |
 | `access` | Access agents don't have: a prod console, a vendor dashboard, rotating a secret, a paid account |
 | `judgment` | A decision known at plan time that only a person can make: which vendor, pricing, a trade-off |

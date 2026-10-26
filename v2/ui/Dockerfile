@@ -16,15 +16,9 @@ RUN npm run build
 
 FROM nginxinc/nginx-unprivileged:alpine
 COPY --from=builder /app/dist /usr/share/nginx/html
-# Route all paths to index.html for SPA. nginx-unprivileged already listens
-# on 8080 as a non-root UID (101) — needed to run under a "restricted" Pod
-# Security Standard securityContext (runAsNonRoot, no privileged ports).
-RUN echo 'server { \
-  listen 8080; \
-  root /usr/share/nginx/html; \
-  absolute_redirect off; \
-  location / { try_files $uri $uri/ /index.html; } \
-  location /api/ { proxy_pass http://amp-api:3001; proxy_http_version 1.1; \
-    proxy_set_header Connection ""; proxy_buffering off; } \
-}' > /etc/nginx/conf.d/default.conf
+# nginx.conf: every path falls back to index.html (SPA); /sessions/ also gets the
+# remote session page's strict CSP. nginx-unprivileged already listens on 8080 as
+# a non-root UID (101) — needed to run under a "restricted" Pod Security Standard
+# securityContext (runAsNonRoot, no privileged ports).
+COPY ui/nginx.conf /etc/nginx/conf.d/default.conf
 EXPOSE 8080

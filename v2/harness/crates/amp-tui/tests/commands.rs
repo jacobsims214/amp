@@ -81,6 +81,7 @@ async fn rig(steps: Vec<FauxStep>, with_meta: bool) -> Rig {
         context_window: 200_000,
         cwd: "/work/amp".into(),
         git_branch: Some("harness-m3".into()),
+        session_file: None,
         banner: vec!["AMP harness · manager".into()],
     };
     let (mut shell, done) = Shell::new(Arc::new(harness), info, Vec::new());
@@ -153,7 +154,10 @@ impl Rig {
 
     /// A key as the terminal loop routes it: to the open panel, else to the editor.
     async fn typ(&mut self, code: KeyCode) {
-        assert!(self.shell.key(key(code)));
+        let empty = self.editor_text().is_empty();
+        if !self.shell.key(&key(code), empty).await {
+            self.shell.editor_key(key(code));
+        }
         self.settle().await;
     }
 
@@ -162,7 +166,8 @@ impl Rig {
     }
 
     fn focused(&self) -> bool {
-        self.shell.view().panel().state().expect("open").focused
+        assert!(self.shell.view().panel().is_open(), "open");
+        !self.shell.input_focused()
     }
 
     fn screen(&self) -> String {
@@ -228,6 +233,16 @@ async fn ticket_shows_and_switches_the_current_ticket() {
         screen.contains("state in_progress · assigned amp:amp-worker-backend"),
         "{screen}"
     );
+    // #2213: the dispatch time is relative like the rest of the chrome, not raw RFC 3339.
+    let amp_row = screen
+        .lines()
+        .find(|l| l.contains("AMP      state in_progress"))
+        .unwrap_or_else(|| panic!("AMP row\n{screen}"));
+    assert!(
+        amp_row.contains("· dispatched ") && amp_row.trim_end().ends_with(" ago"),
+        "{amp_row}"
+    );
+    assert!(!amp_row.contains("2026-10-22T"), "{amp_row}");
     assert!(
         screen.contains("this session has not reported a run"),
         "{screen}"
@@ -268,6 +283,64 @@ async fn ticket_shows_and_switches_the_current_ticket() {
 
     rig.say("/ticket abc").await;
     assert!(rig.screen().contains("/ticket: `abc` is not a ticket id"));
+    assert_fits(&rig);
+}
+
+/// UX review #2175 finding 12 (#2187): a current ticket that completes stops being current (no
+/// "■ Done #id" pinned under the header for the rest of the session), and the /ticket panel
+/// leaves empty fields out instead of printing "-".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_done_ticket_stops_being_current() {
+    let mut rig = rig(vec![], true).await;
+    rig.settle().await;
+    assert_eq!(rig.meta.snapshot().ticket_id, Some(2106));
+    assert!(rig.screen().contains("manager · #2106"), "{}", rig.screen());
+
+    // The ticket completes mid-session (a poll finds it done, no assignee or dispatch time).
+    rig.meta.stub_update(|m| {
+        let t = m.ticket.value.as_mut().unwrap();
+        t.state = "completed".into();
+        t.status = amp_core::tickets::Status::Done;
+        t.assigned_to = None;
+        t.dispatched_at = None;
+    });
+    rig.settle().await;
+    assert_eq!(rig.meta.snapshot().ticket_id, None, "cleared on completion");
+    let screen = rig.screen();
+    assert!(
+        screen.contains("── ■ Done #2106 M3-3 Header and AMP status line ──"),
+        "the Done marker says what happened\n{screen}"
+    );
+    assert!(
+        !screen.contains("no current ticket"),
+        "no second marker\n{screen}"
+    );
+    assert!(
+        !screen.contains("#2106\n") && !screen.contains("· #2106"),
+        "{screen}"
+    );
+
+    // `/ticket 2106` on the done ticket: it stays current while its panel is open, the AMP row
+    // has no "-" placeholders, and it goes when the panel closes.
+    rig.say("/ticket 2106").await;
+    assert_eq!(rig.meta.snapshot().ticket_id, Some(2106));
+    let screen = rig.screen();
+    assert!(screen.contains("› ■ Done #2106"), "{screen}");
+    let amp_row = screen
+        .lines()
+        .find(|l| l.contains("AMP      state completed"))
+        .unwrap_or_else(|| panic!("AMP row\n{screen}"));
+    assert!(!amp_row.contains(" -"), "{amp_row}");
+    assert!(
+        !amp_row.contains("assigned") && !amp_row.contains("dispatched"),
+        "{amp_row}"
+    );
+    assert!(rig.press(KeyCode::Esc).await);
+    assert_eq!(
+        rig.meta.snapshot().ticket_id,
+        None,
+        "cleared once the panel closed"
+    );
     assert_fits(&rig);
 }
 
@@ -321,9 +394,30 @@ async fn workers_lists_local_and_remote_workers() {
         frame.contains(&c.muted.fg("amp:amp-worker-backend")),
         "{frame:?}"
     );
-    // ↓ then Enter: the second worker's ticket.
+    // #2395: printable keys belong to the editor while /workers is open, even an empty one.
+    for c in ['x', 'o', 'X', 'O', 'y', ' '] {
+        assert!(
+            !rig.press(KeyCode::Char(c)).await,
+            "{c:?} goes to the editor"
+        );
+    }
+    assert!(rig.opened().is_empty(), "o opened nothing");
+    assert!(
+        rig.shell.stop_pending().is_none(),
+        "x asked to stop nothing"
+    );
+    // Typing gave the editor the keys (#2161); Tab gives them back to the panel.
+    assert!(rig.press(KeyCode::Tab).await);
+    // ↓ then Ctrl+G: the second worker's ticket.
     rig.press(KeyCode::Down).await;
-    rig.press(KeyCode::Enter).await;
+    assert!(
+        rig.shell.panel_key(
+            &KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            false
+        ),
+        "Ctrl+G opens whatever the editor holds"
+    );
+    rig.settle().await;
     assert_eq!(
         rig.opened(),
         vec!["https://amp.simstech.cloud/project/2/board?task=2111".to_owned()]
@@ -429,9 +523,21 @@ async fn plan_shows_the_tree_and_approval() {
     rig.say("/plan").await;
     let screen = rig.screen();
     assert!(screen.contains("AMP · plan"), "{screen}");
+    // #2171: the person approves, in the web UI; the row and its hint link the Flight plan page.
     assert!(
-        screen.contains("approval 2 awaiting approval #2108 #2109"),
+        screen.contains("approval 2 waiting for your approval #2108 #2109"),
         "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "approve the plan in AMP: https://amp.simstech.cloud/project/2/plan (o or /open plan)"
+        ),
+        "{screen}"
+    );
+    let frame = rig.shell.view().render_frame(W, H).join("\n");
+    assert!(
+        frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07"),
+        "the plan link is an OSC 8 hyperlink"
     );
     assert!(screen.contains("▌ Earlier ■ 12 Done"), "{screen}");
     // The six web words with state marks: the story's three blocked tickets are a question, a
@@ -458,10 +564,11 @@ async fn plan_shows_the_tree_and_approval() {
             json!({"project_id": 2, "owner": "any", "state": "blocked", "format": "full"})
         )
     );
+    // The first row is the approval: Enter opens the Flight plan page.
     rig.press(KeyCode::Enter).await;
     assert_eq!(
         rig.opened(),
-        vec!["https://amp.simstech.cloud/project/2".to_owned()]
+        vec!["https://amp.simstech.cloud/project/2/plan".to_owned()]
     );
     assert_fits(&rig);
 }
@@ -506,6 +613,12 @@ async fn open_opens_only_urls_from_the_helpers() {
     );
     rig.say("/open nope").await;
     assert!(rig.screen().contains("/open: `nope` is not a ticket id"));
+    // `/open plan`: the Flight plan page, where a person approves (#2171).
+    rig.say("/open plan").await;
+    assert_eq!(
+        rig.opened().last().unwrap(),
+        "https://amp.simstech.cloud/project/2/plan"
+    );
     // No current ticket: the project's Mission page.
     rig.say("/ticket none").await;
     rig.say("/open").await;
@@ -538,10 +651,11 @@ async fn without_metadata_the_commands_say_so() {
     assert!(!rig.shell.view().panel().is_open());
     assert!(rig.opened().is_empty());
     rig.say("/help").await;
-    assert!(
-        rig.screen()
-            .contains("/questions  /plan  /project [id]  /open [id]")
-    );
+    // Tall enough for the whole list (#2245 added the Config group).
+    let screen = rig.shell.view().render_plain(W, 90).join("\n");
+    for usage in ["/questions", "/plan", "/project [id]", "/open [id|plan]"] {
+        assert!(screen.contains(usage), "{usage}\n{screen}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,7 +675,27 @@ async fn amp_tool_calls_are_titled_with_their_ticket() {
     rig.say("finish it").await;
     let screen = rig.screen();
     assert!(
-        screen.contains("✗ AMP · complete_task #2078 all done"),
+        screen.contains("✗ complete_task #2078 all done"),
+        "{screen}"
+    );
+    // #2183: one line per call, and the two calls in a row share one block (no blank between).
+    let rows: Vec<&str> = screen.lines().collect();
+    let at = rows
+        .iter()
+        .position(|r| r.contains("✗ complete_task #2078"))
+        .unwrap();
+    assert!(
+        rows[at + 1..]
+            .iter()
+            .take(6)
+            .any(|r| r.starts_with("   ✗ read README.md")),
+        "{screen}"
+    );
+    assert!(
+        rows[at + 1..]
+            .iter()
+            .take_while(|r| !r.contains("read README.md"))
+            .all(|r| !r.trim().is_empty()),
         "{screen}"
     );
     assert!(!screen.contains("amp_complete_task {"), "{screen}");
@@ -569,17 +703,285 @@ async fn amp_tool_calls_are_titled_with_their_ticket() {
     assert!(screen.contains("read README.md"), "{screen}");
 }
 
+/// #2171: AMP refused a step only a person takes. The transcript says so plainly, with the link
+/// built from the instance (not the server's text), under the refused call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
+    let mut rig = rig(vec![], true).await;
+    let refused = |name: &str, text: &str| AgentEvent::ToolExecutionEnd {
+        tool_call_id: format!("call-{name}"),
+        tool_name: name.into(),
+        result: rpi_agent::AgentToolResult::text(text),
+        is_error: true,
+    };
+    rig.shell.handle_event(&refused(
+        "amp_dispatch_task",
+        "ticket 2108 was planned after the plan was last approved; this project needs the plan \
+         approved before agents start new tickets. A person approves it in the AMP web UI (Approve \
+         plan): http://localhost:5173/project/2/plan. Agents can't approve: stop and ask your \
+         person to approve it there.\n[amp-harness] This needs a person in the AMP web UI.",
+    ));
+    let screen = rig.screen();
+    assert!(screen.contains("⏸ Waiting for your approval"), "{screen}");
+    // #2183: the notice stays right under the refused call's line and its error, prominent.
+    let rows: Vec<&str> = screen.lines().collect();
+    let call = rows
+        .iter()
+        .position(|r| r.starts_with("   ✗ dispatch_task"))
+        .expect(&screen);
+    let notice = rows
+        .iter()
+        .position(|r| r.contains("⏸ Waiting for your approval"))
+        .unwrap();
+    assert!(notice > call && notice - call <= 7, "{screen}");
+    assert!(
+        screen.contains(
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"
+        ),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("The manager stopped here; nothing else was run."),
+        "{screen}"
+    );
+    // The notice quotes the server's sentence, not the harness's note to the model.
+    let notice = &screen[screen.find("⏸").unwrap()..];
+    assert!(!notice.contains("[amp-harness]"), "{notice}");
+    let frame = rig.shell.view().render_frame(W, H).join("\n");
+    assert!(frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07"));
+
+    // A person's ticket: the board drawer for that ticket.
+    rig.shell.handle_event(&refused(
+        "amp_complete_task",
+        "Marking ticket 2110 (a person's ticket) done is done by a person in the AMP web UI, not \
+         by an agent or over MCP: http://localhost:5173/project/2/board?task=2110. Stop and ask \
+         your person to do it there.",
+    ));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for you in the AMP web UI"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Do it in AMP: https://amp.simstech.cloud/project/2/board?task=2110"),
+        "{screen}"
+    );
+
+    // Other errors are just errors.
+    let before = rig.screen().matches("⏸").count();
+    rig.shell.handle_event(&refused(
+        "amp_complete_task",
+        "ticket 5 is backlog: it was never dispatched, so an agent can't complete it",
+    ));
+    assert_eq!(rig.screen().matches("⏸").count(), before);
+    assert_fits(&rig);
+}
+
+/// #2201: per-ticket approval (#2198). `amp_check_plan` says whose each awaiting ticket is.
+fn per_ticket_plan(m: &mut amp_core::meta::AmpMeta) {
+    let plan = amp_core::meta::PlanApproval::from_check_plan(&json!({
+        "require_plan_approval": true,
+        "awaiting_approval": [2108, 2109, 2203],
+        "awaiting_approval_tickets": [
+            {"task_id": 2108, "owner_user_id": 7, "yours": true},
+            {"task_id": 2109, "owner_user_id": 7, "yours": true},
+            {"task_id": 2203, "owner_user_id": 9, "yours": false}
+        ],
+        "awaiting_yours": [2108, 2109],
+        "approve_url": "http://localhost:5173/project/2/plan"
+    }));
+    m.plan.value = Some(plan);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_shows_yours_apart_from_others() {
+    let mut rig = rig(vec![], true).await;
+    rig.meta.stub_update(per_ticket_plan);
+    rig.say("/plan").await;
+    let screen = rig.screen();
+    assert!(
+        screen.contains("approval 2 of yours waiting for your approval #2108 #2109"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "approve yours in AMP: https://amp.simstech.cloud/project/2/plan (o or /open plan)"
+        ),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("others' 1 waiting for their owners' approval #2203"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("their owners approve them in AMP (a project lead may, on their behalf)"),
+        "{screen}"
+    );
+    // The status line counts the person's own (the others' segment goes first when narrow; see
+    // tests/chrome.rs).
+    assert!(
+        screen.contains("│ plan: 2 of yours waiting for your approval"),
+        "{screen}"
+    );
+    assert_fits(&rig);
+
+    // None of the person's own: the panel says so, the chip names only others'.
+    rig.meta.stub_update(|m| {
+        let plan = m.plan.value.as_mut().unwrap();
+        for t in plan.tickets.as_mut().unwrap() {
+            t.yours = false;
+        }
+    });
+    rig.say("/plan").await;
+    let screen = rig.screen();
+    assert!(
+        screen.contains("approval none of yours waiting"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("others' 3 waiting for their owners' approval #2108 #2109 #2203"),
+        "{screen}"
+    );
+    assert!(!screen.contains("waiting for your approval"), "{screen}");
+}
+
+/// #2201: a per-ticket refusal (#2198) says whose approval the ticket waits for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_ticket_refusal_says_whose_approval() {
+    let mut rig = rig(vec![], true).await;
+    rig.meta.stub_update(per_ticket_plan);
+    let refused = |id: i64| AgentEvent::ToolExecutionEnd {
+        tool_call_id: format!("call-{id}"),
+        tool_name: "amp_dispatch_task".into(),
+        result: rpi_agent::AgentToolResult::text(format!(
+            "tool error: amp_dispatch_task: tools/call amp_dispatch_task: Mcp error: -32603: ticket \
+             {id} isn't approved: nobody has approved it since it was planned or its scope last \
+             changed, and this project needs each ticket approved before agents start it. Its owner \
+             approves it in the AMP web UI (Approve plan; a project lead may approve it on their \
+             behalf): http://localhost:5173/project/2/plan. Agents can't approve: stop and ask your \
+             person to approve it there.\n[amp-harness] This needs a person in the AMP web UI."
+        )),
+        is_error: true,
+    };
+    rig.shell.handle_event(&refused(2108));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for your approval: #2108 is yours"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"
+        ),
+        "{screen}"
+    );
+
+    rig.shell.handle_event(&refused(2203));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for its owner's approval: #2203 is someone else's"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Flight plan: https://amp.simstech.cloud/project/2/plan"),
+        "{screen}"
+    );
+
+    // Not in the last plan check: its owner's, possibly the person's own.
+    rig.shell.handle_event(&refused(4242));
+    let screen = rig.screen();
+    assert!(
+        screen.contains("⏸ Waiting for #4242's owner to approve it"),
+        "{screen}"
+    );
+    assert_fits(&rig);
+}
+
+/// #2226: `amp_run_ticket` wraps the dispatch refusal ("AMP refused to dispatch ticket #N: …");
+/// the notice still says whose ticket it is (from the call's own `task_id`), shows the server's
+/// sentence once without the transport's prefix, and no relative link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_ticket_refusal_says_whose_ticket() {
+    let mut rig = rig(vec![], true).await;
+    rig.meta.stub_update(per_ticket_plan);
+    // `named` is the ticket the error's text names; the call's own `task_id` wins.
+    let mut refuse = |id: i64, named: i64| {
+        let call = format!("run-{id}");
+        rig.shell.handle_event(&AgentEvent::ToolExecutionStart {
+            tool_call_id: call.clone(),
+            tool_name: "amp_run_ticket".into(),
+            args: serde_json::json!({"task_id": id, "agent_id": "amp-worker-backend"}),
+        });
+        rig.shell.handle_event(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: call,
+            tool_name: "amp_run_ticket".into(),
+            result: rpi_agent::AgentToolResult::text(format!(
+                "tool error: AMP refused to dispatch ticket #{named}: tools/call amp_dispatch_task: \
+                 Mcp error: -32603: ticket {named} isn't approved: nobody has approved it since it \
+                 was planned or its scope last changed, and this project needs each ticket \
+                 approved before agents start it. Its owner approves it in the AMP web UI \
+                 (Approve plan; a project lead may approve it on their behalf): /project/2/plan. \
+                 Agents can't approve: stop and ask your person to approve it there.\n\
+                 [amp-harness] This needs a person in the AMP web UI."
+            )),
+            is_error: true,
+        });
+    };
+    refuse(2108, 2108);
+    // Structured over parsed: a text naming another ticket still reads as the call's.
+    refuse(2203, 4242);
+    // Words, not rows: the sentence wraps.
+    let screen = rig
+        .screen()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        screen.contains("⏸ Waiting for your approval: #2108 is yours"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("⏸ Waiting for its owner's approval: #2203 is someone else's"),
+        "{screen}"
+    );
+    assert!(!screen.contains("#4242"), "{screen}");
+    for noise in [
+        "tool error",
+        "tools/call",
+        "Mcp error",
+        "-32603",
+        "refused to dispatch",
+    ] {
+        assert!(!screen.contains(noise), "{noise}: {screen}");
+    }
+    assert!(!screen.contains(": /project/"), "{screen}");
+    assert!(!screen.contains(" /project/"), "{screen}");
+    // The sentence once per refusal (the tool rows point at the notice instead).
+    assert_eq!(
+        screen.matches("isn't approved: nobody").count(),
+        2,
+        "{screen}"
+    );
+    assert!(screen.contains("on their behalf). Agents"), "{screen}");
+    assert!(
+        screen.contains("Approve it in AMP: https://amp.simstech.cloud/project/2/plan"),
+        "{screen}"
+    );
+    assert_fits(&rig);
+}
+
 /// #2161: with a panel open and an empty editor, a prompt that starts with `o` ("ok…") goes to the
-/// editor and opens nothing; once typing starts (or a prompt is sent) ↑ is the editor's history
-/// again, and Tab gives the keys back to the panel.
+/// editor and opens nothing; once typing starts (or a prompt is sent) ↑ is the editor's again,
+/// and Tab gives the keys back to the panel. (Configuration panels keep their letters, #2245;
+/// every other panel types, the workers panel included since #2395: Ctrl+X stops, Ctrl+G opens.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_with_a_panel_open_goes_to_the_editor() {
     let mut rig = rig(vec![FauxStep::text("fine")], true).await;
-    rig.say("/workers").await;
+    rig.say("/questions").await;
     assert!(rig.focused());
     assert!(
         rig.screen()
-            .contains("↑↓ select · Enter open in browser · Tab editor · Esc close")
+            .contains("↑↓ select · Enter answer · Tab editor · Esc close")
     );
 
     rig.typ(KeyCode::Char('o')).await;
@@ -588,18 +990,12 @@ async fn typing_with_a_panel_open_goes_to_the_editor() {
     assert!(rig.opened().is_empty(), "{:?}", rig.opened());
     assert!(rig.shell.view().panel().is_open(), "the panel stays docked");
     assert!(!rig.focused());
-    let screen = rig.screen();
-    assert!(screen.contains("Tab select · Esc close"), "{screen}");
-    assert!(
-        !screen.contains("› ■"),
-        "no selection marker while unfocused\n{screen}"
-    );
     // Enter and arrows are the editor's while it has text.
     assert!(!rig.shell.panel_key(&key(KeyCode::Down), false));
     assert!(!rig.shell.panel_key(&key(KeyCode::Enter), false));
 
     // A prompt is sent (the panel stays, unfocused) and the editor is empty again: ↑ and Enter
-    // still belong to the editor, so ↑ recalls history and nothing opens.
+    // still belong to the editor, so nothing opens.
     rig.shell.view().editor().clear();
     rig.say("ok, go on").await;
     assert!(rig.shell.view().panel().is_open());
@@ -607,30 +1003,26 @@ async fn typing_with_a_panel_open_goes_to_the_editor() {
     assert!(!rig.shell.panel_key(&key(KeyCode::Up), true));
     assert!(!rig.shell.panel_key(&key(KeyCode::Enter), true));
     assert_eq!(rig.shell.view().panel().state().unwrap().selected, 0);
-    // Every other letter, too: nothing but an explicit panel action opens a browser.
     for c in "one or only".chars() {
         rig.typ(KeyCode::Char(c)).await;
     }
     assert_eq!(rig.editor_text(), "one or only");
     assert!(rig.opened().is_empty(), "{:?}", rig.opened());
 
-    // Tab (empty editor) refocuses; ↓ and Enter act on the panel again.
+    // Tab (empty editor) gives the keys back; ↓ selects again.
     rig.shell.view().editor().clear();
     assert!(rig.press(KeyCode::Tab).await);
     assert!(rig.focused());
     assert!(rig.press(KeyCode::Down).await);
-    assert!(rig.press(KeyCode::Enter).await);
-    assert_eq!(
-        rig.opened(),
-        vec!["https://amp.simstech.cloud/project/2/board?task=2111".to_owned()]
-    );
+    assert_eq!(rig.shell.view().panel().state().unwrap().selected, 1);
     // Tab again hands the keys to the editor; Tab with text in the editor is the editor's.
     assert!(rig.press(KeyCode::Tab).await);
     assert!(!rig.focused());
     assert!(!rig.shell.panel_key(&key(KeyCode::Tab), false));
 
-    // A paste unfocuses, too.
+    // A paste hands the keys to the editor, too.
     assert!(rig.press(KeyCode::Tab).await);
+    assert!(rig.focused());
     rig.shell.paste("pasted");
     assert!(!rig.focused());
     assert_eq!(rig.editor_text(), "pasted");

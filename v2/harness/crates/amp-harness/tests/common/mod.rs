@@ -3,6 +3,8 @@
 //! with an isolated HOME, a file credential store and no AMP_* variables leaking in.
 #![allow(dead_code, reason = "each test binary uses a different subset")]
 
+pub mod provider;
+
 use std::{
     borrow::Cow,
     path::{Path, PathBuf},
@@ -56,6 +58,10 @@ pub struct MockAmp {
     pub omit: Vec<&'static str>,
     /// Every `tools/call` as (name, arguments).
     pub calls: Arc<Mutex<Vec<(String, Value)>>>,
+    /// #2425: what `amp_check_plan` answers, changed by the test as a person's approval in the
+    /// web UI would change it; with it, project 2 requires plan approval. `None`: the fixed
+    /// answer below.
+    pub plan: Option<Arc<Mutex<Value>>>,
 }
 
 impl MockAmp {
@@ -64,6 +70,7 @@ impl MockAmp {
             legacy_only: false,
             omit: Vec::new(),
             calls: Arc::default(),
+            plan: None,
         }
     }
 
@@ -212,7 +219,7 @@ impl ServerHandler for MockAmp {
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = CONTRACT
             .iter()
-            .chain(&["amp_kb_search", "amp_fail"])
+            .chain(&["amp_kb_search", "amp_fail", "amp_set_task_state"])
             .filter(|name| !self.omit.contains(name))
             .map(|name| tool(name))
             .collect();
@@ -233,7 +240,8 @@ impl ServerHandler for MockAmp {
             "amp_whoami" => ok_json(whoami_json()),
             "amp_get_project" => match args["project_id"].as_i64() {
                 Some(2) => ok_json(
-                    json!({"project": {"id": 2, "name": "AMP v2", "code": "amp-v2", "state": "active"}}),
+                    json!({"project": {"id": 2, "name": "AMP v2", "code": "amp-v2", "state": "active",
+                                       "require_plan_approval": self.plan.is_some()}}),
                 ),
                 _ => tool_error("project not found"),
             },
@@ -275,15 +283,54 @@ impl ServerHandler for MockAmp {
                 Some(id) => ok_json(json!({"task_id": id, "outcome": args["outcome"]})),
                 None => tool_error("task_id is required"),
             },
+            // #2204: an abandoned ticket handed back to ready; ticket 4042 is refused (as AMP
+            // refuses moving someone else's ticket).
+            "amp_set_task_state" => match args["task_id"].as_i64() {
+                Some(4042) => tool_error("task 4042 is owned by someone else"),
+                Some(id) => ok_json(
+                    json!({"task_id": id, "from_state": "in_progress", "to_state": args["state"]}),
+                ),
+                None => tool_error("task_id is required"),
+            },
             "amp_get_plan" => ok_json(json!({"project_id": 2, "epics": [
                 {"id": 150, "name": "Earlier", "stories": []},
                 {"id": 161, "name": "AMP Harness", "stories": [{"id": 391, "name": "M1 CLI"}]}
             ]})),
             "amp_list_artifacts" => ok_json(json!({"artifacts": []})),
+            // #2205: amp-api without APP_PUBLIC_URL (compose) gives relative web UI links.
+            "amp_check_plan" if self.plan.is_some() => {
+                ok_json(self.plan.as_ref().unwrap().lock().unwrap().clone())
+            }
+            "amp_check_plan" => ok_json(json!({
+                "project_id": 2, "require_plan_approval": true, "awaiting_approval": [4042],
+                "approve_url": "/project/2/plan"
+            })),
             // M3-4: /questions answers through the metadata poller's connection.
             "amp_answer_question" => match args["task_id"].as_i64() {
                 Some(2084) => ok_json(json!({"task_id": 2084, "state": "backlog", "ok": true})),
                 _ => tool_error("task is not blocked with a question"),
+            },
+            // M4-1 setup: the project picker and project creation.
+            "amp_list_projects" => ok_json(json!({"projects": [
+                {"id": 2, "name": "AMP v2", "code": "AV", "state": "active", "org_id": 1},
+                {"id": 9, "name": "Old", "code": "OLD", "state": "archived", "org_id": 1},
+                {"id": 68, "name": "QA throwaway", "code": "QT", "state": "archived", "org_id": 1}
+            ]})),
+            "amp_list_orgs" => ok_json(json!({"orgs": [{"id": 1, "name": "Default"}]})),
+            "amp_create_project" => match (args["name"].as_str(), args["code"].as_str()) {
+                // Codes are unique, archived projects included (OLD and QT are archived; HI
+                // belongs to a project this user can't list). Like compose, the refusal is a
+                // JSON-RPC error (-32603), not a tool result.
+                (Some(_), Some(code @ ("AV" | "OLD" | "QT" | "HI"))) => {
+                    Err(ErrorData::internal_error(
+                        format!("project code \"{code}\" already exists"),
+                        None,
+                    ))
+                }
+                (Some(name), Some(code)) if !name.is_empty() && !code.is_empty() => ok_json(
+                    json!({"id": 77, "name": name, "code": code, "state": "active", "org_id": 1}),
+                ),
+                _ => tool_error("name and code are required"),
             },
             "amp_fail" => tool_error("it broke"),
             "amp_kb_search" => Ok(CallToolResult::success(vec![ContentBlock::text(
@@ -313,6 +360,35 @@ impl Drop for Running {
 
 /// Serves `mock` at `/mcp`. With `bearer`, requests without that token get a 401 challenge.
 pub async fn spawn(mock: MockAmp, bearer: Option<&'static str>) -> Running {
+    let app = app(&mock, bearer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Running {
+        url: format!("http://{addr}/mcp"),
+        mock,
+        task,
+    }
+}
+
+/// Serves `app` (built from `mock`, e.g. [`app`] plus more routes) on a loopback port.
+pub async fn serve(app: axum::Router, mock: MockAmp) -> Running {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Running {
+        url: format!("http://{addr}/mcp"),
+        mock,
+        task,
+    }
+}
+
+/// The mock's axum app (`/mcp`), for tests that serve it themselves (tests/doctor.rs: over TLS).
+pub fn app(mock: &MockAmp, bearer: Option<&'static str>) -> axum::Router {
     let served = mock.clone();
     let service: StreamableHttpService<MockAmp, LocalSessionManager> = StreamableHttpService::new(
         move || Ok(served.clone()),
@@ -325,16 +401,7 @@ pub async fn spawn(mock: MockAmp, bearer: Option<&'static str>) -> Running {
             require_bearer(token, req, next)
         }));
     }
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-    Running {
-        url: format!("http://{addr}/mcp"),
-        mock,
-        task,
-    }
+    app
 }
 
 async fn require_bearer(token: &'static str, req: Request, next: Next) -> Response {
@@ -390,6 +457,27 @@ impl Output {
     }
 }
 
+/// `--snapshot` rows of a `width`-column screen without the chat's padding: the left padding
+/// (`[tui] padding`, #2251; halved at 80 columns or fewer, #2344) and the blank row above and
+/// below the screen (#2344, checked blank), so a test that checks where something sits reads rows
+/// and columns as before. amp-tui's `tests/padding.rs` covers the padding itself.
+pub fn unpad(mut rows: Vec<String>, width: usize) -> Vec<String> {
+    let gap = amp_tui::Gap::rows_at(rows.len());
+    for _ in 0..gap {
+        assert!(rows[0].trim().is_empty(), "top padding row: {rows:#?}");
+        assert!(
+            rows[rows.len() - 1].trim().is_empty(),
+            "bottom padding row: {rows:#?}"
+        );
+        rows.remove(0);
+        rows.pop();
+    }
+    let pad = " ".repeat(amp_tui::Padding::new(amp_tui::DEFAULT_PADDING).at(width));
+    rows.into_iter()
+        .map(|r| r.strip_prefix(&pad).map(str::to_owned).unwrap_or(r))
+        .collect()
+}
+
 /// Runs the binary in `dir/project` with HOME in `dir/home`, the file credential store,
 /// `AMP_MCP_URL=url` and no other AMP_* settings. `env` adds variables.
 pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
@@ -404,6 +492,7 @@ pub async fn run(dir: &Path, url: &str, args: &[&str], env: &[(&str, &str)]) -> 
         .env("AMP_HARNESS_CEILING_DIR", dir)
         .env_remove("AMP_TOKEN")
         .env_remove("AMP_CA_FILE")
+        .env_remove("AMP_WEB_URL")
         .env_remove("AMP_MCP_PROTOCOL")
         .env_remove("AMP_HARNESS_PROFILE")
         .env_remove("ANTHROPIC_API_KEY")

@@ -39,6 +39,12 @@ func OnAudit(fn func(domain.AuditEntry)) (unregister func()) {
 // audit records an entry made by p. Recording is best effort: the change
 // it describes has already happened, so a failure is logged, not returned.
 func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEntry) {
+	_ = s.writeAudit(ctx, p, e)
+}
+
+// writeAudit is audit that also returns the failure, for the few actions that
+// must not happen without their audit entry (remote.enable, remote.pair).
+func (s *Service) writeAudit(ctx context.Context, p authz.Principal, e domain.AuditEntry) error {
 	e.ActorUserID = p.UserRef()
 	e.ActorEmail = p.Email
 	e.ViaToken = p.ViaToken
@@ -52,6 +58,19 @@ func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEn
 			e.Details["channel"] = p.Channel
 		}
 	}
+	if s.RelayAudit {
+		// The function fills email, org, project, target and summary from
+		// the session row, and queues the entry for amp-api's webhooks.
+		sessionID := ""
+		if e.TargetType == "remote_session" {
+			sessionID = e.TargetID
+		}
+		if _, err := s.Repo.InsertRelayAudit(context.WithoutCancel(ctx), e.ActorUserID, sessionID, e.Action, e.Details); err != nil {
+			slog.Error("audit log write failed", "action", e.Action, "target", e.TargetType+":"+e.TargetID, "err", err)
+			return err
+		}
+		return nil
+	}
 	if e.ProjectID != nil && e.OrgID == nil {
 		if proj, err := s.Repo.GetProject(ctx, *e.ProjectID); err == nil {
 			e.OrgID = proj.OrgID
@@ -60,13 +79,14 @@ func (s *Service) audit(ctx context.Context, p authz.Principal, e domain.AuditEn
 	stored, err := s.Repo.InsertAudit(context.WithoutCancel(ctx), e)
 	if err != nil {
 		slog.Error("audit log write failed", "action", e.Action, "target", e.TargetType+":"+e.TargetID, "err", err)
-		return
+		return err
 	}
 	auditMu.RLock()
 	defer auditMu.RUnlock()
 	for _, fn := range auditSinks {
 		fn(*stored)
 	}
+	return nil
 }
 
 // Record adds an audit entry for a change made outside the service (project

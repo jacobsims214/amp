@@ -1,0 +1,50 @@
+{
+  "_meta": {
+    "generator": "v2/testdata/remote-control/gen_vectors.py",
+    "protocol": "v2/docs/remote-control/protocol.md",
+    "protocol_version": 1
+  },
+  "description": "Test-only P-256 key pairs (private scalar derived from a public label: never use outside tests). public_raw is the 65-byte uncompressed SEC1 point; fingerprint = base64url(SHA-256(public_raw)) without padding; fingerprint_display = the first 8 bytes of that hash as upper-case hex in groups of 4.",
+  "keys": [
+    {
+      "label": "harness-1",
+      "private_scalar_hex": "899a0ac4b3d34f376c085275e109919e0bf8ef785f6c96adf306e4c1600b1595",
+      "public_raw_b64u": "BFmykUTI3U73uc1ZQmpJ37t0-N5FYstMT3sSLzS42CUH_YHHlRDmGhqKfmLjtRlEqVqBnVfl7ixE0sDuL6h5uo8",
+      "public_raw_hex": "0459b29144c8dd4ef7b9cd59426a49dfbb74f8de4562cb4c4f7b122f34b8d82507fd81c79510e61a1a8a7e62e3b51944a95a819d57e5ee2c44d2c0ee2fa879ba8f",
+      "fingerprint": "KcrmtQDCZstbc69koLwXJWQvwvQbZAufZBMxCffV6DY",
+      "fingerprint_display": "29CA-E6B5-00C2-66CB"
+    },
+    {
+      "label": "harness-2",
+      "private_scalar_hex": "8a0fe1ddf3f7dd8d3bdb5402aed505743400ff57dcedf9b3ade7be6f4cd5eb1c",
+      "public_raw_b64u": "BA010lP8bQxHAgOQAm2n4uY3zWulLjS_cynuQr7KHKmmgZ0-JqVOYZSJDuu1ejTSdXO-cXI9PJlHV3WkjkXvu54",
+      "public_raw_hex": "040d35d253fc6d0c47020390026da7e2e637cd6ba52e34bf7329ee42beca1ca9a6819d3e26a54e6194890eebb57a34d27573be71723d3c99475775a48e45efbb9e",
+      "fingerprint": "-DgqaaGm84DMGbygNGucJoOINe5X7GUwgOaIPfxEphM",
+      "fingerprint_display": "F838-2A69-A1A6-F380"
+    },
+    {
+      "label": "device-a",
+      "private_scalar_hex": "989b83f1f4863a4854bf8830cf2e151c6b39c38b6ea1a8439d277054105fee83",
+      "public_raw_b64u": "BOXV9BkDJ0hi2xzrV6sXLcp_zjyplXQ3P-w2JNb4vdok_OFQPMoA6uNSJ774mnyYxIee90qeY7dDFJWJdgFm_L4",
+      "public_raw_hex": "04e5d5f41903274862db1ceb57ab172dca7fce3ca99574373fec3624d6f8bdda24fce1503cca00eae35227bef89a7c98c4879ef74a9e63b743149589760166fcbe",
+      "fingerprint": "X5Pp2GXb6NEr3Jh05qAy4qnPP9oOBKhSltxS5yIPExs",
+      "fingerprint_display": "5F93-E9D8-65DB-E8D1"
+    },
+    {
+      "label": "device-b",
+      "private_scalar_hex": "b3f7a5e9f451842d220593d619e51a85267ad042e1d62df16f810c73ff237951",
+      "public_raw_b64u": "BELn0AnhW9HwYf9-SObGslJ5rNQnczFQJD_H-g84_ManxIDVBX3mdasLhIsvzul0Fg6lXVp86Kl-zGOAN8fC9Pc",
+      "public_raw_hex": "0442e7d009e15bd1f061ff7e48e6c6b25279acd427733150243fc7fa0f38fcc6a7c480d5057de675ab0b848b2fcee974160ea55d5a7ce8a97ecc638037c7c2f4f7",
+      "fingerprint": "5bgVLzzeYlwWrwJhd0NCW2PYcAqFNxGmO3mQ1mbPYDM",
+      "fingerprint_display": "E5B8-152F-3CDE-625C"
+    },
+    {
+      "label": "device-c",
+      "private_scalar_hex": "2d4dae88d9404f44326002befb18a05f782a616aad85ff3a1dd9fb07c072d95e",
+      "public_raw_b64u": "BPAalEpIY_jQ5yoOGq0MU-MC0IVllVNx074Y7g_4mkG-1VX-Xx8eEUfStILC-0rpfFddWiCAUq8iAb6pby-aNNY",
+      "public_raw_hex": "04f01a944a4863f8d0e72a0e1aad0c53e302d08565955371d3be18ee0ff89a41bed555fe5f1f1e1147d2b482c2fb4ae97c575d5a208052af2201bea96f2f9a34d6",
+      "fingerprint": "0UWm5hUB1wbB-zYXZ7NFVCC4FPlk7atcBs1WSmATXIo",
+      "fingerprint_display": "D145-A6E6-1501-D706"
+    }
+  ]
+}

@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Radar, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck,
+  Activity, BookOpen, Home, Menu, MonitorSmartphone, Radar, X, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
+import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
 import { Avatar } from '../ui/Avatar'
 
@@ -42,6 +43,9 @@ export function AppShell() {
   const projectMatch = useMatch('/project/:projectId/*')
   const currentId = projectMatch?.params.projectId
   const [projects, setProjects] = useState<Project[]>([])
+  const remote = useRemote()
+  // Below md the sidebar is a drawer behind a menu button, so pages fit a phone.
+  const [navOpen, setNavOpen] = useState(false)
 
   // Refresh the list when moving around (a project may have been created,
   // renamed, or archived on the page just left).
@@ -58,7 +62,10 @@ export function AppShell() {
 
   return (
     <div className="relative flex h-screen overflow-hidden bg-bg">
-      <aside className="w-[232px] flex-shrink-0 flex flex-col bg-surface-2 border-r border-line overflow-y-auto" aria-label="Main">
+      {navOpen && <div className="fixed inset-0 z-30 bg-[var(--scrim)] md:hidden" onClick={() => setNavOpen(false)} aria-hidden="true" />}
+      <aside id="main-nav" className={`w-[232px] flex-shrink-0 flex-col bg-surface-2 border-r border-line overflow-y-auto fixed inset-y-0 left-0 z-40 md:static md:z-auto md:flex ${navOpen ? 'flex' : 'hidden'}`} aria-label="Main"
+        onClick={e => { if ((e.target as HTMLElement).closest('a')) setNavOpen(false) }}>
+        <button type="button" className="md:hidden absolute top-3 right-2 p-1.5 text-ink-3 hover:text-ink" onClick={() => setNavOpen(false)} aria-label="Close menu"><X size={16} /></button>
         <NavLink to="/" className="flex items-center gap-2.5 px-4 pt-4 pb-3" aria-label="AMP home">
           {/* Relights on every page change (keyed by path). */}
           <span key={location.pathname} className="amp-mark amp-ignite" aria-hidden="true">
@@ -70,6 +77,7 @@ export function AppShell() {
         <nav className="flex flex-col px-2 pb-4">
           <Group>Overview</Group>
           <NavLink to="/" end className={navCls}><Home size={14} />My work</NavLink>
+          {remoteAvailable(me, remote) && <NavLink to="/sessions" className={navCls}><MonitorSmartphone size={14} />Sessions</NavLink>}
           <NavLink to="/projects" className={navCls}><FolderKanban size={14} />Projects
             <span className="ml-auto amp-num text-[11px] text-ink-3">{projects.length || ''}</span></NavLink>
           <NavLink to="/reports" className={navCls}><CalendarDays size={14} />Day reports</NavLink>
@@ -140,6 +148,10 @@ export function AppShell() {
       </aside>
 
       <main className="relative flex-1 min-w-0 h-full overflow-auto">
+        <div className="md:hidden sticky top-0 z-20 flex items-center gap-2 h-11 px-2 bg-surface border-b border-line">
+          <button type="button" className="p-2 text-ink" onClick={() => setNavOpen(true)} aria-label="Open menu" aria-expanded={navOpen} aria-controls="main-nav"><Menu size={18} /></button>
+          <span className="text-[15px] font-bold tracking-[0.16em] text-ink">AMP</span>
+        </div>
         <Outlet />
       </main>
     </div>

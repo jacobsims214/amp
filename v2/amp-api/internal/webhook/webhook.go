@@ -173,10 +173,46 @@ func (d *Dispatcher) Wake() {
 	}
 }
 
-// Run matches and delivers until ctx ends.
+// Run matches and delivers until ctx ends. It also matches the remote.*
+// audit entries amp-relay recorded (relayAuditLoop).
 func (d *Dispatcher) Run(ctx context.Context) {
 	go d.matchLoop(ctx)
+	go d.relayAuditLoop(ctx)
 	d.deliverLoop(ctx)
+}
+
+// relayAuditLoop takes the audit entries amp-relay recorded (through
+// relay_record_audit, which queues them in relay_audit_outbox) and matches
+// them like amp-api's own. amp-relay writes no webhook deliveries: amp-api
+// renders and signs every body from the stored entry, so a compromised relay
+// can't make AMP sign content of its choosing (#2399, re-review #2394 N3).
+func (d *Dispatcher) relayAuditLoop(ctx context.Context) {
+	tick := time.NewTicker(d.opts.Poll)
+	defer tick.Stop()
+	for {
+		for {
+			entries, err := d.repo.ClaimRelayAudits(ctx, 100)
+			if err != nil {
+				if ctx.Err() == nil {
+					slog.Warn("reading amp-relay's audit entries failed", "err", err)
+				}
+				break
+			}
+			for i := range entries {
+				if err := d.match(ctx, item{audit: &entries[i]}); err != nil && ctx.Err() == nil {
+					slog.Error("webhook matching failed", "action", entries[i].Action, "err", err)
+				}
+			}
+			if len(entries) < 100 {
+				break
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
 }
 
 func (d *Dispatcher) matchLoop(ctx context.Context) {

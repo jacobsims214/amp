@@ -36,7 +36,31 @@
 //! | `websearch` | `websearch` | the query |
 //! | `todowrite`, `todoread` | `todowrite` | `*` |
 //! | `read`, `grep`, `find`, `ls` | `read`, `grep`, `glob`, `list` | the path, else `*` |
+//! | external MCP tools (`mcp__<server>__<tool>`) | `mcp`, then the tool name | `<server>/<tool>` (the server's own tool name), then `*` |
 //! | anything else (`amp_*` MCP tools) | the tool name | `*` |
+//!
+//! # External MCP servers (`mcp`, #2240)
+//!
+//! A tool of an external MCP server is checked under the `mcp` permission with the subject
+//! `<server>/<tool>`, where `<tool>` is the name the server gave it (before sanitising to
+//! `mcp__<server>__<tool>`), so `"github/delete_*": deny` works whatever the model-facing name is:
+//!
+//! ```yaml
+//! permission:
+//!   mcp:
+//!     "*": allow
+//!     "github/*": allow
+//!     "github/delete_*": deny
+//!     "db/*": deny
+//! ```
+//!
+//! No `mcp` rule means allow, so every role sees every server it is let in by the server's
+//! `roles = [...]` filter (applied first, by the hub). `ask` is deny. The model-facing name is also
+//! checked under its own name with subject `*` afterwards, so a key like
+//! `mcp__github__delete_repo: deny` works too. Because the subject names one tool exactly, a tool
+//! the rules deny is never usable and is left out of the role's tool list
+//! ([`ToolPolicy::exposes`]); a call that still arrives is denied with the rule in the error.
+//! The hub tells the policy each tool's subject ([`ToolPolicy::learn_mcp_subjects`]).
 //!
 //! Under a restricted bash policy (any bash rule that isn't `allow`), command substitution
 //! (`$(…)`, backticks, `<(…)`, `>(…)`) and output redirection to a file are denied outright. An
@@ -70,17 +94,40 @@ use std::{
     future::Future,
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use rpi_agent::{AgentTool, BeforeToolCall, BeforeToolCallContext, BeforeToolCallResult};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+/// The permission external MCP server tools are checked under (#2240), with subject
+/// `<server>/<tool>`.
+pub const MCP_PERMISSION: &str = "mcp";
+
 /// The manager's dispatch tool (D7). Children never get it.
 pub const DISPATCH_TOOL: &str = "amp_run_ticket";
 /// The interactive question tool. Children never get it.
 pub const QUESTION_TOOL: &str = "question";
+/// No role approves a plan (#2171, epic 162): a person does, in the AMP web UI (the server refuses
+/// it too). The tool stays in the list so a call shows its denial instead of "no such tool".
+pub const APPROVE_PLAN_TOOL: &str = "amp_approve_plan";
+/// Project settings: no role changes the [`PERSON_ONLY_SETTINGS`] with it. Its name, description
+/// and metadata (the tracker key, cost centre… the manager prompt records) stay allowed.
+pub const PROJECT_SETTINGS_TOOL: &str = "amp_update_project_settings";
+/// The settings a person changes in the web UI (`require_plan_approval`: turning it off is refused
+/// by the server; `open_reassign`: who may take tickets over).
+pub const PERSON_ONLY_SETTINGS: &[&str] = &["require_plan_approval", "open_reassign"];
+
+/// Whether a call is a person's step no role takes ([`APPROVE_PLAN_TOOL`], or
+/// [`PROJECT_SETTINGS_TOOL`] with one of the [`PERSON_ONLY_SETTINGS`]).
+pub fn person_only(tool: &str, args: &Value) -> bool {
+    tool == APPROVE_PLAN_TOOL
+        || (tool == PROJECT_SETTINGS_TOOL
+            && PERSON_ONLY_SETTINGS
+                .iter()
+                .any(|k| args.get(*k).is_some_and(|v| !v.is_null())))
+}
 
 /// What a rule does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +233,11 @@ impl Policy {
 
     pub fn rules(&self) -> &[Rule] {
         &self.rules
+    }
+
+    /// Add a rule after the others (so it wins over earlier matches).
+    pub fn push(&mut self, rule: Rule) {
+        self.rules.push(rule);
     }
 
     /// The last rule matching `(permission, subject)`, or `None` when the default applies.
@@ -681,6 +733,8 @@ pub enum DenialReason {
     ChildQuestion,
     /// Children never get the dispatch tool.
     ChildDispatch,
+    /// No role approves a plan or changes the person-only project settings ([`person_only`]).
+    PersonOnly,
     /// Command substitution under a restricted bash policy.
     Substitution,
     /// Output written to a file under a restricted bash policy: a redirect
@@ -711,6 +765,16 @@ impl fmt::Display for Denial {
                 f,
                 "{who}: workers cannot dispatch other agents (`{}`). Only the manager does.",
                 self.tool
+            ),
+            DenialReason::PersonOnly => write!(
+                f,
+                "{who}: `{}` {} is a person's step, in the AMP web UI (approving the plan, \
+                 plan approval and reassignment settings); no agent takes it. For approval, run \
+                 amp_check_plan: give your user its approve_url, tell them how many of their \
+                 own tickets await approval (awaiting_yours; others' tickets wait for their \
+                 owners, or a project lead on their behalf), and stop until they've approved \
+                 them. For a setting, tell your user what to change in the project's settings.",
+                self.tool, self.subject
             ),
             DenialReason::Substitution => write!(
                 f,
@@ -779,13 +843,30 @@ impl Check {
     }
 }
 
-/// A role's policy bound to a worktree root: what the before-tool hook enforces.
-#[derive(Debug, Clone)]
+/// A role's policy bound to a worktree root: what the before-tool hook enforces. Its rules can be
+/// replaced in place ([`ToolPolicy::replace_policy`], #2242), so every holder (the hook, the MCP
+/// hub, `/server`) enforces the new ones from the next call.
+#[derive(Debug)]
 pub struct ToolPolicy {
     role: String,
     child: bool,
-    policy: Policy,
+    policy: std::sync::RwLock<Policy>,
     root: PathBuf,
+    /// Model-facing `mcp__…` name -> `<server>/<tool>` (the server's own tool name), as the hub
+    /// named the tools this session was given. Shared by clones.
+    mcp_subjects: Arc<RwLock<std::collections::HashMap<String, String>>>,
+}
+
+impl Clone for ToolPolicy {
+    fn clone(&self) -> Self {
+        Self {
+            role: self.role.clone(),
+            child: self.child,
+            policy: std::sync::RwLock::new(self.policy()),
+            root: self.root.clone(),
+            mcp_subjects: Arc::clone(&self.mcp_subjects),
+        }
+    }
 }
 
 type HookFuture = Pin<Box<dyn Future<Output = Option<BeforeToolCallResult>> + Send>>;
@@ -802,9 +883,40 @@ impl ToolPolicy {
         Self {
             role: role.into(),
             child,
-            policy,
+            policy: std::sync::RwLock::new(policy),
             root: lexical_normalize(&root.into()),
+            mcp_subjects: Arc::default(),
         }
+    }
+
+    /// Records the `mcp` subject (`<server>/<tool>`) of external MCP tools by their model-facing
+    /// names, as the hub named them for this session. Call it before [`Self::filter_tools`] /
+    /// [`Self::exposes`] for those tools. Names are only added or updated, never removed, so a
+    /// call to a tool the session still has from an older view is judged by its real subject.
+    pub fn learn_mcp_subjects<'a>(&self, subjects: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let mut map = self.mcp_subjects.write().unwrap_or_else(|e| e.into_inner());
+        for (name, subject) in subjects {
+            map.insert(name.to_owned(), subject.to_owned());
+        }
+    }
+
+    /// The `mcp` subject of an external MCP tool (`mcp__<server>__<tool>`): the one the hub
+    /// recorded ([`Self::learn_mcp_subjects`]), else read from the name (`<server>/<rest>`; server
+    /// names have no `_`, so the first `__` ends the server). `None` for other tools.
+    pub fn mcp_subject(&self, tool: &str) -> Option<String> {
+        let rest = tool.strip_prefix(crate::mcp_config::TOOL_PREFIX)?;
+        if let Some(subject) = self
+            .mcp_subjects
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(tool)
+        {
+            return Some(subject.clone());
+        }
+        Some(match rest.split_once("__") {
+            Some((server, name)) => format!("{server}/{name}"),
+            None => format!("{rest}/*"),
+        })
     }
 
     pub fn role(&self) -> &str {
@@ -815,8 +927,19 @@ impl ToolPolicy {
         self.child
     }
 
-    pub fn policy(&self) -> &Policy {
-        &self.policy
+    /// The rules in force now (a copy).
+    pub fn policy(&self) -> Policy {
+        self.rules().clone()
+    }
+
+    /// Puts `policy` in force in place of the current rules (a role's permissions changed and
+    /// the live session takes them: `/reload`, #2242).
+    pub fn replace_policy(&self, policy: Policy) {
+        *self.policy.write().unwrap_or_else(|e| e.into_inner()) = policy;
+    }
+
+    fn rules(&self) -> std::sync::RwLockReadGuard<'_, Policy> {
+        self.policy.read().unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn root(&self) -> &Path {
@@ -830,7 +953,13 @@ impl ToolPolicy {
         if self.child && (tool == QUESTION_TOOL || tool == DISPATCH_TOOL) {
             return false;
         }
-        !self.policy.denies_everything(permission_for(tool))
+        if let Some(subject) = self.mcp_subject(tool) {
+            // One exact subject per tool: the rules decide it once and for all.
+            if !self.rules().evaluate(MCP_PERMISSION, &subject).allows() {
+                return false;
+            }
+        }
+        !self.rules().denies_everything(permission_for(tool))
     }
 
     /// Keep the tools this role may see ([`Self::exposes`]).
@@ -862,12 +991,25 @@ impl ToolPolicy {
             let agent = str_arg(args, &["agent_id"]).unwrap_or("*").to_string();
             return Err(deny(agent, DenialReason::ChildDispatch));
         }
+        if person_only(tool, args) {
+            let subject = if tool == APPROVE_PLAN_TOOL {
+                "(plan approval)".to_owned()
+            } else {
+                let keys: Vec<&str> = PERSON_ONLY_SETTINGS
+                    .iter()
+                    .copied()
+                    .filter(|k| args.get(*k).is_some_and(|v| !v.is_null()))
+                    .collect();
+                format!("({})", keys.join(", "))
+            };
+            return Err(deny(subject, DenialReason::PersonOnly));
+        }
         let missing = || deny(String::new(), DenialReason::BadArguments);
         Ok(match tool {
             "bash" | "powershell" => {
                 let script = str_arg(args, &["command"]).ok_or_else(missing)?;
                 let scan = scan_shell(script);
-                if !self.policy.allows_everything("bash") {
+                if !self.rules().allows_everything("bash") {
                     // First: when the split itself is in doubt, the other flags are too.
                     if scan.unparseable {
                         return Err(deny(script.to_string(), DenialReason::Unparseable));
@@ -917,15 +1059,25 @@ impl ToolPolicy {
                     .unwrap_or_else(|| "*".into());
                 vec![Check::new(permission, subject)]
             }
-            _ => vec![Check::new(permission, "*")],
+            _ => match self.mcp_subject(tool) {
+                Some(subject) => vec![
+                    Check::new(MCP_PERMISSION, subject),
+                    Check::new(permission, "*"),
+                ],
+                None => vec![Check::new(permission, "*")],
+            },
         })
     }
 
     /// `Ok(())` to let the call run, `Err` with the reason the model will see.
     pub fn check(&self, tool: &str, args: &Value) -> Result<(), Box<Denial>> {
         for check in self.checks(tool, args)? {
-            let rule = self.policy.matching_rule(&check.permission, &check.subject);
+            let rule = self
+                .rules()
+                .matching_rule(&check.permission, &check.subject)
+                .cloned();
             let action = rule
+                .as_ref()
                 .map(|r| r.action)
                 .unwrap_or_else(|| default_action(&check.permission));
             if !action.allows() {
@@ -934,7 +1086,7 @@ impl ToolPolicy {
                     tool: tool.to_string(),
                     permission: check.permission,
                     subject: check.subject,
-                    rule: rule.cloned(),
+                    rule,
                     reason: if action == Action::Ask {
                         DenialReason::Ask
                     } else {

@@ -21,6 +21,13 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "time", "macros", "signal"] }
+# /remote (#2376): the expiry times in local time.
+chrono.workspace = true
+# /remote (#2376): the pairing link's QR code. Nayuki's QR Code generator, pure Rust, no
+# dependencies, MIT licence.
+qrcodegen = "1.8"
+# Column widths for word wrapping (#2176). The same version rpi-tui measures text with.
+unicode-width = "=0.1.14"
 
 # select(2) on the tty for the OSC 11 background query (#2155): poll(2) is POLLNVAL on macOS
 # /dev/tty. "term" is for openpty in its pty tests.
@@ -28,7 +35,15 @@ tokio = { workspace = true, features = ["rt", "time", "macros", "signal"] }
 nix = { version = "0.29", default-features = false, features = ["poll", "term"] }
 
 [dev-dependencies]
+# tests/remote.rs (#2373): the remote link end to end against the in-process mock relay.
+amp-core = { workspace = true, features = ["mock-relay"] }
+# tests/provider_error.rs: a provider that refuses every request (#2207).
+async-trait.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# tests/remote_live.rs (#2379): the browser side against the real Go relay (HTTP + SSE).
+futures.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+sse-stream.workspace = true
 
 [lints]
 workspace = true

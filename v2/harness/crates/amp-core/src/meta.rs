@@ -17,6 +17,7 @@
 //! | current ticket (`TICKET`) + its epic/story names (`TREE`, `amp_get_plan`, cached) | `amp_get_task` | every 30 s while the ticket is not done | after an `amp_*` call naming it |
 //! | plan approval (`PLAN`) | `amp_check_plan` | every 60 s, only when the project requires approval | after `amp_create_tasks` / `amp_approve_plan` / `amp_set_task_dependencies` / … |
 //! | the ticket's artifacts (`ARTIFACTS`) | `amp_list_artifacts(task_id)` | every 60 s while one is in review | after `amp_publish_artifact` / `amp_review_artifact` |
+//! | workers' tickets (`WORKERS`, #2347) | `amp_get_task(include=runs)` per ticket | every 30 s while the chat shows workers ([`MetaHandle::set_workers`]) | when a new worker shows |
 //! | MCP health | every call above | `amp_whoami` after 60 s without any call | — |
 //!
 //! Immediate refresh: feed the session's agent events to [`MetaHandle::observe`] (the chat shell
@@ -85,6 +86,9 @@ impl Topics {
     pub const PING: Self = Self(1 << 6);
     /// `amp_get_plan`: epic and story names (and epic order, for the cat colours).
     pub const TREE: Self = Self(1 << 7);
+    /// `amp_get_task(include=runs)` on each ticket the chat shows a worker for
+    /// ([`MetaHandle::set_workers`], #2347): name, story › epic, dependencies, the last run.
+    pub const WORKERS: Self = Self(1 << 8);
     /// Everything fetched on start and after a reconnect.
     pub const ALL: Self = Self(
         Self::WHOAMI.0
@@ -93,7 +97,8 @@ impl Topics {
             | Self::TICKET.0
             | Self::PLAN.0
             | Self::ARTIFACTS.0
-            | Self::TREE.0,
+            | Self::TREE.0
+            | Self::WORKERS.0,
     );
 
     pub fn contains(self, other: Self) -> bool {
@@ -113,6 +118,7 @@ impl Topics {
             (Self::TICKET, "ticket"),
             (Self::PLAN, "plan"),
             (Self::ARTIFACTS, "artifacts"),
+            (Self::WORKERS, "workers"),
             (Self::PING, "ping"),
         ]
         .into_iter()
@@ -328,6 +334,11 @@ impl Instance {
         format!("{}/artifacts/{artifact_id}", self.web_base)
     }
 
+    /// The Flight plan page, where a person approves the plan (`approve_url` in AMP).
+    pub fn plan_url(&self, project_id: i64) -> String {
+        format!("{}/project/{project_id}/plan", self.web_base)
+    }
+
     pub fn kb_url(&self, project_id: i64) -> String {
         format!("{}/project/{project_id}/kb", self.web_base)
     }
@@ -335,12 +346,7 @@ impl Instance {
 
 /// `scheme://host[:port]` of a URL (everything before the path).
 pub fn web_base(url: &str) -> String {
-    let url = url.trim();
-    let start = url.find("://").map_or(0, |i| i + 3);
-    let end = url[start..]
-        .find(['/', '?', '#'])
-        .map_or(url.len(), |i| start + i);
-    url[..end].to_owned()
+    amp_mcp::url_origin(url)
 }
 
 /// The MCP connection as the header shows it (§2 item 2).
@@ -496,6 +502,67 @@ pub struct Ticket {
     pub epic_index: Option<usize>,
 }
 
+/// A ticket a worker runs (#2347): what the chat shows next to the worker. From
+/// `amp_get_task(include=runs)`, polled with the current ticket's interval while the chat shows it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerTicket {
+    /// Name, state, assignee, story and epic (the same reading as the current ticket's).
+    pub ticket: Ticket,
+    pub dependency_ids: Vec<i64>,
+    /// The dependencies not completed yet.
+    pub waiting_on: Vec<i64>,
+    /// The newest run AMP recorded on it (a worker elsewhere reports its usage there).
+    pub last_run: Option<RunRecord>,
+}
+
+/// One run AMP recorded on a ticket (`amp_get_task`'s `runs`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunRecord {
+    pub agent_id: String,
+    pub model: String,
+    pub outcome: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_usd: Option<f64>,
+    pub branch: String,
+    /// When AMP recorded it.
+    pub recorded_at: Option<std::time::SystemTime>,
+}
+
+impl RunRecord {
+    /// The newest of `amp_get_task`'s `runs` (by `created_at`), if any.
+    pub fn latest(runs: &Value) -> Option<Self> {
+        let num = |r: &Value, k: &str| r[k].as_i64().unwrap_or(0);
+        let text = |r: &Value, k: &str| r[k].as_str().unwrap_or("").to_owned();
+        runs.as_array()?
+            .iter()
+            .max_by(|a, b| text(a, "created_at").cmp(&text(b, "created_at")))
+            .map(|r| Self {
+                agent_id: text(r, "agent_id"),
+                model: text(r, "model"),
+                outcome: text(r, "outcome"),
+                input_tokens: num(r, "input_tokens"),
+                output_tokens: num(r, "output_tokens"),
+                cache_read_tokens: num(r, "cache_read_tokens"),
+                cache_write_tokens: num(r, "cache_write_tokens"),
+                cost_usd: r["cost_usd"].as_f64(),
+                branch: text(r, "branch"),
+                recorded_at: r["created_at"]
+                    .as_str()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map(std::time::SystemTime::from),
+            })
+    }
+
+    /// Whether the run reported any token counts.
+    pub fn has_usage(&self) -> bool {
+        self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
+            > 0
+    }
+}
+
 /// A ticket waiting on a person's answer.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Question {
@@ -608,9 +675,100 @@ impl Board {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlanApproval {
     pub require_plan_approval: bool,
-    /// Open tickets planned since the last approval.
+    /// Open tickets awaiting approval, anyone's (project-wide, board order).
     pub awaiting_approval: Vec<i64>,
     pub plan_approved_at: Option<String>,
+    /// The Flight plan page AMP gave (`approve_url`, #2167) while tickets await approval. Untrusted
+    /// text: links are built with [`Instance::plan_url`].
+    pub approve_url: Option<String>,
+    /// Who made the project's last approval (`plan_approved_by`, a user id; #2425 names them when
+    /// the manager resumes).
+    pub plan_approved_by: Option<i64>,
+    /// Per-ticket approval (#2198): each awaiting ticket with its owner and whether it is the
+    /// caller's own (`awaiting_approval_tickets`). `None` from servers before #2198, which have
+    /// one project-wide approval: then every awaiting ticket is shown as the person's to approve.
+    pub tickets: Option<Vec<AwaitingTicket>>,
+}
+
+/// A ticket awaiting approval, from `amp_check_plan`'s `awaiting_approval_tickets` (#2198).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AwaitingTicket {
+    pub task_id: i64,
+    /// The ticket's owner (`None`: unassigned, approved by whoever planned it).
+    pub owner_user_id: Option<i64>,
+    /// The caller's own: their click approves it. Others' wait for their owners (or a project
+    /// lead, on their behalf).
+    pub yours: bool,
+}
+
+impl PlanApproval {
+    /// From an `amp_check_plan` result. Works with servers before and after #2198.
+    pub fn from_check_plan(v: &Value) -> Self {
+        let ids = |key: &str| -> Vec<i64> {
+            v[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .collect()
+        };
+        let awaiting_approval = ids("awaiting_approval");
+        let tickets = v["awaiting_approval_tickets"].as_array().map(|list| {
+            let yours_ids = v["awaiting_yours"]
+                .as_array()
+                .map(|_| ids("awaiting_yours"));
+            list.iter()
+                .filter_map(|t| {
+                    let task_id = t["task_id"].as_i64()?;
+                    let yours = match t["yours"].as_bool() {
+                        Some(y) => y,
+                        None => yours_ids.as_ref().is_some_and(|y| y.contains(&task_id)),
+                    };
+                    Some(AwaitingTicket {
+                        task_id,
+                        owner_user_id: t["owner_user_id"].as_i64(),
+                        yours,
+                    })
+                })
+                .collect()
+        });
+        PlanApproval {
+            require_plan_approval: v["require_plan_approval"].as_bool().unwrap_or(false),
+            awaiting_approval,
+            plan_approved_at: v["plan_approved_at"].as_str().map(str::to_owned),
+            plan_approved_by: v["plan_approved_by"].as_i64(),
+            approve_url: v["approve_url"].as_str().map(str::to_owned),
+            tickets,
+        }
+    }
+
+    /// Whether the server approves per ticket (#2198) and said whose each ticket is.
+    pub fn per_ticket(&self) -> bool {
+        self.tickets.is_some()
+    }
+
+    /// The awaiting tickets the person approves themselves. Before #2198 that is every awaiting
+    /// ticket (one click approved the whole plan).
+    pub fn yours(&self) -> Vec<i64> {
+        match &self.tickets {
+            Some(t) => t.iter().filter(|t| t.yours).map(|t| t.task_id).collect(),
+            None => self.awaiting_approval.clone(),
+        }
+    }
+
+    /// The awaiting tickets that are someone else's: their owners approve them (or a project
+    /// lead, on their behalf). Always empty before #2198.
+    pub fn others(&self) -> Vec<i64> {
+        match &self.tickets {
+            Some(t) => t.iter().filter(|t| !t.yours).map(|t| t.task_id).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whose approval ticket `id` waits for, when AMP said (#2198).
+    pub fn whose(&self, id: i64) -> Option<&AwaitingTicket> {
+        self.tickets.as_ref()?.iter().find(|t| t.task_id == id)
+    }
 }
 
 /// An artifact of the current ticket (§2 item 11).
@@ -647,12 +805,22 @@ pub struct AmpMeta {
     pub health: MetaHealth,
     pub user: Fetched<User>,
     pub project_id: Option<i64>,
+    /// A parent folder's `.amp.json` the session uses: its project id and where it is (#2356).
+    pub project_marker: Option<(i64, String)>,
     pub project: Fetched<Project>,
     pub board: Fetched<Board>,
     pub ticket_id: Option<i64>,
     pub ticket: Fetched<Ticket>,
     pub plan: Fetched<PlanApproval>,
+    /// Since when the same tickets have waited for approval (#2425): set when the awaiting list
+    /// changes, cleared when nothing waits. The plan poll slows down the longer it holds
+    /// ([`Intervals::plan_pending_after`]).
+    pub plan_awaiting_since: Option<Instant>,
     pub artifacts: Fetched<Vec<Artifact>>,
+    /// The tickets the chat shows workers for ([`MetaHandle::set_workers`], #2347).
+    pub worker_ids: Vec<i64>,
+    /// Their tickets, by id (a failed fetch keeps the last value).
+    pub workers: std::collections::BTreeMap<i64, Fetched<WorkerTicket>>,
 }
 
 impl AmpMeta {
@@ -682,6 +850,23 @@ impl AmpMeta {
         self.project.get().is_some_and(|p| p.require_plan_approval)
     }
 
+    /// Whether tickets wait for this person's approval (the status line's "waiting for your
+    /// approval" chip is up). Since per-ticket approval (#2198) only their own count.
+    pub fn plan_pending(&self) -> bool {
+        self.plan_required() && self.plan.get().is_some_and(|p| !p.yours().is_empty())
+    }
+
+    /// Whether any ticket waits for approval, the person's own or others' (either plan chip is
+    /// up). The plan is polled fast while this holds (#2209, #2230): a lead may approve others'
+    /// tickets on their behalf, and the others' chip must clear as soon as the person's own.
+    pub fn plan_awaiting(&self) -> bool {
+        self.plan_required()
+            && self
+                .plan
+                .get()
+                .is_some_and(|p| !p.awaiting_approval.is_empty())
+    }
+
     fn ticket_open(&self) -> bool {
         self.ticket_id.is_some() && self.ticket.get().is_none_or(|t| t.status != Status::Done)
     }
@@ -700,6 +885,10 @@ pub struct Intervals {
     pub ticket: Duration,
     /// Plan approval, when the project requires it (60 s).
     pub plan: Duration,
+    /// Plan approval while any ticket waits for approval (5 s, #2209, #2230): the person (or a lead
+    /// on an owner's behalf) approves in the web UI, and the status line's plan chips must clear
+    /// soon after.
+    pub plan_pending: Duration,
     /// The ticket's artifacts while one is in review (60 s).
     pub artifacts: Duration,
     /// A health probe after this long without any call (60 s).
@@ -715,12 +904,37 @@ pub struct Intervals {
     pub call_queue_grace: Duration,
 }
 
+/// After this long with the same tickets waiting for approval, the plan is polled every
+/// [`PLAN_PENDING_SLOW`] instead of every [`Intervals::plan_pending`] (#2425).
+pub const PLAN_SLOW_AFTER: Duration = Duration::from_secs(2 * 60);
+/// The plan poll while approval has waited [`PLAN_SLOW_AFTER`] (#2425).
+pub const PLAN_PENDING_SLOW: Duration = Duration::from_secs(15);
+/// After this long, a pending plan is polled only every [`Intervals::plan`] (60 s, #2425).
+pub const PLAN_SLOWEST_AFTER: Duration = Duration::from_secs(15 * 60);
+
+impl Intervals {
+    /// How often a pending plan is polled once the same tickets have waited `pending_for`
+    /// (#2425): every `plan_pending` (5 s) at first, so an approval in the web UI shows (and the
+    /// waiting manager resumes) within seconds; every 15 s after [`PLAN_SLOW_AFTER`]; every
+    /// `plan` (60 s) after [`PLAN_SLOWEST_AFTER`]. Never faster than `plan_pending`.
+    pub fn plan_pending_after(&self, pending_for: Duration) -> Duration {
+        if pending_for < PLAN_SLOW_AFTER {
+            self.plan_pending
+        } else if pending_for < PLAN_SLOWEST_AFTER {
+            PLAN_PENDING_SLOW.min(self.plan).max(self.plan_pending)
+        } else {
+            self.plan.max(self.plan_pending)
+        }
+    }
+}
+
 impl Default for Intervals {
     fn default() -> Self {
         Self {
             board: Duration::from_secs(30),
             ticket: Duration::from_secs(30),
             plan: Duration::from_secs(60),
+            plan_pending: Duration::from_secs(5),
             artifacts: Duration::from_secs(60),
             idle_ping: Duration::from_secs(60),
             call_timeout: Duration::from_secs(10),
@@ -737,7 +951,14 @@ pub struct Conditions {
     pub project: bool,
     pub ticket_open: bool,
     pub plan_required: bool,
+    /// Tickets wait for approval, anyone's (polled every `plan_pending`; `AmpMeta::plan_awaiting`).
+    pub plan_pending: bool,
+    /// Since when the same tickets have waited ([`AmpMeta::plan_awaiting_since`]): the pending
+    /// poll backs off from it (#2425). `None`: polled every `plan_pending`.
+    pub plan_pending_since: Option<Instant>,
     pub artifacts_in_review: bool,
+    /// The chat shows workers ([`AmpMeta::worker_ids`]).
+    pub workers: bool,
 }
 
 impl Conditions {
@@ -746,7 +967,10 @@ impl Conditions {
             project: meta.project_id.is_some(),
             ticket_open: meta.ticket_open(),
             plan_required: meta.plan_required(),
+            plan_pending: meta.plan_awaiting(),
+            plan_pending_since: meta.plan_awaiting_since,
             artifacts_in_review: !meta.artifacts_in_review().is_empty(),
+            workers: !meta.worker_ids.is_empty(),
         }
     }
 }
@@ -759,19 +983,27 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    const PERIODIC: [Topics; 4] = [
+    const PERIODIC: [Topics; 5] = [
         Topics::BOARD,
         Topics::TICKET,
         Topics::PLAN,
         Topics::ARTIFACTS,
+        Topics::WORKERS,
     ];
 
-    fn interval(iv: &Intervals, t: Topics, c: Conditions) -> Option<Duration> {
+    fn interval(iv: &Intervals, t: Topics, c: Conditions, now: Instant) -> Option<Duration> {
         match t {
             Topics::BOARD if c.project => Some(iv.board),
             Topics::TICKET if c.ticket_open => Some(iv.ticket),
+            Topics::PLAN if c.plan_required && c.plan_pending => Some(
+                iv.plan_pending_after(
+                    c.plan_pending_since
+                        .map_or(Duration::ZERO, |at| now.saturating_duration_since(at)),
+                ),
+            ),
             Topics::PLAN if c.plan_required => Some(iv.plan),
             Topics::ARTIFACTS if c.artifacts_in_review => Some(iv.artifacts),
+            Topics::WORKERS if c.workers => Some(iv.ticket),
             _ => None,
         }
     }
@@ -794,7 +1026,7 @@ impl Schedule {
     pub fn due(&self, iv: &Intervals, c: Conditions, now: Instant) -> Topics {
         let mut due = Topics::NONE;
         for t in Self::PERIODIC {
-            if let Some(every) = Self::interval(iv, t, c) {
+            if let Some(every) = Self::interval(iv, t, c, now) {
                 match self.last.get(&t.0) {
                     Some(at) if now.saturating_duration_since(*at) < every => {}
                     _ => due |= t,
@@ -815,13 +1047,37 @@ impl Schedule {
     pub fn next_wake(&self, iv: &Intervals, c: Conditions, now: Instant) -> Instant {
         let mut next = self.last_call.map_or(now, |at| at + iv.idle_ping);
         for t in Self::PERIODIC {
-            if let Some(every) = Self::interval(iv, t, c) {
+            if let Some(every) = Self::interval(iv, t, c, now) {
                 let at = self.last.get(&t.0).map_or(now, |at| *at + every);
                 next = next.min(at);
             }
         }
         next.max(now)
     }
+}
+
+/// [`AmpMeta::plan_awaiting_since`] after a plan read (#2425): unchanged while the same tickets
+/// wait, `now` when the list changed (or started), `None` when nothing waits.
+pub fn awaiting_since(
+    before: Option<&[i64]>,
+    after: Option<&[i64]>,
+    since: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    match after {
+        None => since,
+        Some([]) => None,
+        Some(ids) => match (since, before) {
+            (Some(at), Some(old)) if sorted(old) == sorted(ids) => Some(at),
+            _ => Some(now),
+        },
+    }
+}
+
+fn sorted(ids: &[i64]) -> Vec<i64> {
+    let mut v = ids.to_vec();
+    v.sort_unstable();
+    v
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -838,6 +1094,9 @@ pub type Connector = Arc<
 pub struct MetaOptions {
     /// The project from `.amp.json`.
     pub project_id: Option<i64>,
+    /// When that `.amp.json` is in a parent folder: its project id and where it is, for `/project`
+    /// (#2356).
+    pub project_marker: Option<(i64, String)>,
     /// A ticket to show from the start (a worker session's own ticket).
     pub ticket_id: Option<i64>,
     pub intervals: Intervals,
@@ -851,7 +1110,10 @@ pub struct MetaOptions {
 enum Command {
     Refresh(Topics),
     SetProject(Option<i64>),
+    /// The session's `.amp.json` changed (#2383): its project and the parent folder note.
+    Link(Option<i64>, Option<(i64, String)>),
     SetTicket(Option<i64>),
+    SetWorkers(Vec<i64>),
     Call(Call),
 }
 
@@ -879,10 +1141,15 @@ struct Inner {
     started: Mutex<HashMap<String, (String, Value)>>,
     /// [`MetaHandle::stub`] only: the calls it answered.
     stub_calls: Option<CallLog>,
+    /// [`MetaHandle::stub`] only: its snapshot's sender, for [`MetaHandle::stub_update`].
+    stub_meta: Option<Arc<watch::Sender<Arc<AmpMeta>>>>,
 }
 
 /// The calls a [`MetaHandle::stub`] answered: (tool, arguments).
 type CallLog = Arc<Mutex<Vec<(String, Value)>>>;
+
+/// The most worker tickets [`MetaHandle::set_workers`] follows (one `amp_get_task` each per poll).
+pub const MAX_WORKER_TICKETS: usize = 8;
 
 /// How long [`MetaHandle::call`] waits beyond its own timeout for the poller to get to the call
 /// (it may be in the middle of a refresh, whose calls have their own 10 s timeouts).
@@ -921,9 +1188,27 @@ impl MetaHandle {
         let _ = self.0.commands.send(Command::SetProject(project_id));
     }
 
+    /// The chat's folder was linked to another project, or its `.amp.json` changed (#2383): like
+    /// [`Self::set_project`], and the `/project` panel's parent-folder note (`marker`) is replaced.
+    pub fn link_project(&self, project_id: Option<i64>, marker: Option<(i64, String)>) {
+        let _ = self.0.commands.send(Command::Link(project_id, marker));
+    }
+
     /// Switches the current ticket (`/ticket`, a claim): clears its items and refetches them.
     pub fn set_ticket(&self, ticket_id: Option<i64>) {
         let _ = self.0.commands.send(Command::SetTicket(ticket_id));
+    }
+
+    /// The tickets the chat shows workers for (#2347; at most [`MAX_WORKER_TICKETS`], in order).
+    /// New ones are fetched at once, then with the current ticket's interval; ones no longer
+    /// shown are dropped. Nothing is sent when the set is unchanged, so call it on every tick.
+    pub fn set_workers(&self, ids: &[i64]) {
+        let mut ids: Vec<i64> = ids.iter().copied().filter(|id| *id > 0).collect();
+        ids.dedup();
+        ids.truncate(MAX_WORKER_TICKETS);
+        if self.0.meta.borrow().worker_ids != ids {
+            let _ = self.0.commands.send(Command::SetWorkers(ids));
+        }
     }
 
     /// Calls an AMP tool on the poller's own connection (a slash command's read or write; never
@@ -961,6 +1246,8 @@ impl MetaHandle {
     /// also recorded in [`Self::stub_calls`]. Must be called inside a tokio runtime.
     pub fn stub(meta: AmpMeta, responder: StubResponder) -> Self {
         let (tx, rx) = watch::channel(Arc::new(meta));
+        let tx = Arc::new(tx);
+        let stub_meta = Arc::clone(&tx);
         let (commands, mut command_rx) = unbounded_channel::<Command>();
         let calls: CallLog = Arc::default();
         let recorded = Arc::clone(&calls);
@@ -976,7 +1263,12 @@ impl MetaHandle {
                 match cmd {
                     Command::Refresh(_) => {}
                     Command::SetProject(id) => bump(&|m| m.project_id = id),
+                    Command::Link(id, marker) => bump(&|m| {
+                        m.project_id = id;
+                        m.project_marker = marker.clone();
+                    }),
                     Command::SetTicket(id) => bump(&|m| m.ticket_id = id),
+                    Command::SetWorkers(ids) => bump(&|m| m.worker_ids = ids.clone()),
                     Command::Call(c) => {
                         if let Ok(mut log) = recorded.lock() {
                             log.push((c.tool.clone(), c.args.clone()));
@@ -992,7 +1284,20 @@ impl MetaHandle {
             started: Mutex::new(HashMap::new()),
             call_queue_grace: CALL_QUEUE_GRACE,
             stub_calls: Some(calls),
+            stub_meta: Some(stub_meta),
         }))
+    }
+
+    /// [`Self::stub`] only: changes the snapshot (bumping its revision), as a poll that found a
+    /// change would. Does nothing on a real poller's handle.
+    pub fn stub_update(&self, f: impl FnOnce(&mut AmpMeta)) {
+        if let Some(tx) = &self.0.stub_meta {
+            tx.send_modify(|arc| {
+                let m = Arc::make_mut(arc);
+                f(m);
+                m.revision += 1;
+            });
+        }
     }
 
     /// The calls a [`Self::stub`] handle answered, in order (empty for a real poller).
@@ -1037,7 +1342,7 @@ impl MetaHandle {
                 tool_call_id,
                 tool_name,
                 is_error,
-                ..
+                result,
             } if tool_name.starts_with("amp_") => {
                 let started = self
                     .0
@@ -1046,6 +1351,10 @@ impl MetaHandle {
                     .ok()
                     .and_then(|mut s| s.remove(tool_call_id));
                 if *is_error {
+                    // A refusal that needs a person (#2171): show the approval state as it is now.
+                    if crate::approval::refusal(&agent_result_text(result)).is_some() {
+                        self.refresh(Topics::PROJECT | Topics::PLAN | Topics::BOARD);
+                    }
                     return;
                 }
                 let args = started.map(|(_, a)| a).unwrap_or(Value::Null);
@@ -1054,6 +1363,19 @@ impl MetaHandle {
             _ => {}
         }
     }
+}
+
+/// The text blocks of an agent tool result.
+fn agent_result_text(result: &rpi_agent::AgentToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            rpi_agent::TextContentOrImage::Text(t) => Some(t.text.as_str()),
+            rpi_agent::TextContentOrImage::Image(_) => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1130,6 +1452,7 @@ impl MetaPoller {
     pub fn spawn(client: Option<Arc<AmpMcpClient>>, options: MetaOptions) -> MetaHandle {
         let meta = AmpMeta {
             project_id: options.project_id,
+            project_marker: options.project_marker,
             ticket_id: options.ticket_id,
             instance: client
                 .as_deref()
@@ -1161,6 +1484,7 @@ impl MetaPoller {
             meta: rx,
             started: Mutex::new(HashMap::new()),
             stub_calls: None,
+            stub_meta: None,
         }))
     }
 
@@ -1246,6 +1570,12 @@ impl MetaPoller {
                 self.calls.push(call);
                 Topics::NONE
             }
+            Command::Link(id, marker) => {
+                if self.meta().project_marker != marker {
+                    self.update(|m| m.project_marker = marker);
+                }
+                self.apply(Command::SetProject(id))
+            }
             Command::SetProject(id) => {
                 if self.meta().project_id == id {
                     return Topics::NONE;
@@ -1269,6 +1599,18 @@ impl MetaPoller {
                     m.artifacts = Fetched::default();
                 });
                 Topics::TICKET | Topics::ARTIFACTS
+            }
+            Command::SetWorkers(ids) => {
+                let meta = self.meta();
+                if meta.worker_ids == ids {
+                    return Topics::NONE;
+                }
+                let added = ids.iter().any(|id| !meta.workers.contains_key(id));
+                self.update(|m| {
+                    m.workers.retain(|id, _| ids.contains(id));
+                    m.worker_ids = ids;
+                });
+                if added { Topics::WORKERS } else { Topics::NONE }
             }
         }
     }
@@ -1331,9 +1673,8 @@ impl MetaPoller {
                 let connection = if e.is_auth_required() {
                     Connection::AuthRequired
                 } else {
-                    Connection::Down {
-                        reason: e.to_string(),
-                    }
+                    // A plain reason for `/amp` (#2178), never rmcp's type names.
+                    Connection::Down { reason: e.reason() }
                 };
                 self.update(|m| m.health.connection = connection);
                 false
@@ -1446,13 +1787,14 @@ impl MetaPoller {
         topics: Topics,
         commands: &mut UnboundedReceiver<Command>,
     ) -> Topics {
-        const STEPS: [Topics; 6] = [
+        const STEPS: [Topics; 7] = [
             Topics::WHOAMI,
             Topics::PROJECT,
             Topics::BOARD,
             Topics::TICKET,
             Topics::PLAN,
             Topics::ARTIFACTS,
+            Topics::WORKERS,
         ];
         let now = Instant::now();
         if topics.contains(Topics::TREE) {
@@ -1548,17 +1890,17 @@ impl MetaPoller {
                 let r = self
                     .call("amp_check_plan", json!({"project_id": pid}))
                     .await;
-                let r = r.map(|v| PlanApproval {
-                    require_plan_approval: v["require_plan_approval"].as_bool().unwrap_or(false),
-                    awaiting_approval: v["awaiting_approval"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_i64)
-                        .collect(),
-                    plan_approved_at: v["plan_approved_at"].as_str().map(str::to_owned),
+                let r = r.map(|v| PlanApproval::from_check_plan(&v));
+                self.update(|m| {
+                    let before = m.plan.get().map(|p| p.awaiting_approval.clone());
+                    m.plan.set(r);
+                    m.plan_awaiting_since = awaiting_since(
+                        before.as_deref(),
+                        m.plan.get().map(|p| p.awaiting_approval.as_slice()),
+                        m.plan_awaiting_since,
+                        Instant::now(),
+                    );
                 });
-                self.update(|m| m.plan.set(r));
             }
             Topics::ARTIFACTS => {
                 let Some(tid) = ticket_id else { return };
@@ -1575,12 +1917,55 @@ impl MetaPoller {
                     }
                 });
             }
+            Topics::WORKERS => {
+                for id in self.meta().worker_ids.clone() {
+                    let r = self.fetch_worker_ticket(id).await;
+                    self.update(|m| {
+                        if m.worker_ids.contains(&id) {
+                            m.workers.entry(id).or_default().set(r);
+                        }
+                    });
+                    if self.failed {
+                        // A transport failure stops the pass (#2160); the rest wait for the next.
+                        return;
+                    }
+                }
+            }
             _ => {}
         }
     }
 
+    /// A worker's ticket with its dependencies and newest run (#2347).
+    async fn fetch_worker_ticket(&mut self, id: i64) -> Result<WorkerTicket, String> {
+        let (ticket, v) = self
+            .fetch_task(json!({"task_id": id, "include": ["runs"], "limit": 5}))
+            .await?;
+        let ids = |k: &str| -> Vec<i64> {
+            v["task"][k]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_i64)
+                .collect()
+        };
+        Ok(WorkerTicket {
+            ticket,
+            dependency_ids: ids("dependency_ids"),
+            waiting_on: ids("blocked_by_ids"),
+            last_run: RunRecord::latest(&v["runs"]),
+        })
+    }
+
     async fn fetch_ticket(&mut self, id: i64) -> Result<Ticket, String> {
-        let v = self.call("amp_get_task", json!({"task_id": id})).await?;
+        self.fetch_task(json!({"task_id": id}))
+            .await
+            .map(|(ticket, _)| ticket)
+    }
+
+    /// `amp_get_task(args)` read as a [`Ticket`] (with its story and epic names), plus the
+    /// whole result.
+    async fn fetch_task(&mut self, args: Value) -> Result<(Ticket, Value), String> {
+        let v = self.call("amp_get_task", args).await?;
         let t: TaskRecord =
             serde_json::from_value(v["task"].clone()).map_err(|e| format!("amp_get_task: {e}"))?;
         let mut ticket = Ticket {
@@ -1626,7 +2011,7 @@ impl MetaPoller {
                 });
             }
         }
-        Ok(ticket)
+        Ok((ticket, v))
     }
 }
 
@@ -1733,7 +2118,10 @@ mod tests {
             project: true,
             ticket_open: true,
             plan_required: false,
+            plan_pending: false,
+            plan_pending_since: None,
             artifacts_in_review: false,
+            workers: false,
         };
         // Nothing ran yet: board and ticket are due (plan and artifacts don't apply).
         assert_eq!(s.due(&iv, c, t0), Topics::BOARD | Topics::TICKET);
@@ -1766,6 +2154,156 @@ mod tests {
             ..c
         };
         assert_eq!(s.due(&iv, c, t0 + Duration::from_secs(45)), Topics::BOARD);
+    }
+
+    /// #2209: a person approves the plan in the web UI; the poller must notice soon. A faux clock
+    /// steps the pure schedule in 100 ms ticks, running whatever is due (the "server" answers the
+    /// plan with the approval state at that instant), for approvals landing at every offset of
+    /// a poll cycle. The chip (AmpMeta::plan_pending) clears within 10 s of the approval, and
+    /// with nothing pending the plan goes back to the 60 s poll.
+    #[test]
+    fn a_pending_plan_is_polled_fast_so_the_chip_clears_within_10s_of_approval() {
+        let iv = iv();
+        assert!(iv.plan_pending <= Duration::from_secs(5));
+        let project = Project {
+            id: 2,
+            name: "AMP".into(),
+            code: "amp".into(),
+            state: "active".into(),
+            org_id: None,
+            require_plan_approval: true,
+        };
+        let plan = |awaiting: Vec<i64>| PlanApproval {
+            require_plan_approval: true,
+            awaiting_approval: awaiting,
+            ..PlanApproval::default()
+        };
+        let tick = Duration::from_millis(100);
+        let t0 = Instant::now();
+        for approve_at_ms in (0..=65_000u64).step_by(700) {
+            let approve_at = t0 + Duration::from_secs(1) + Duration::from_millis(approve_at_ms);
+            let mut meta = AmpMeta {
+                project_id: Some(2),
+                ..AmpMeta::default()
+            };
+            meta.project.set(Ok(project.clone()));
+            meta.plan.set(Ok(plan(vec![2105])));
+            let mut s = Schedule::default();
+            s.ran(Topics::ALL, t0);
+            s.called(t0);
+            assert!(meta.plan_pending(), "the chip is up");
+            let mut now = t0;
+            let cleared = loop {
+                now += tick;
+                assert!(
+                    now < approve_at + Duration::from_secs(120),
+                    "never cleared (approval at +{approve_at_ms} ms)"
+                );
+                let due = s.due(&iv, Conditions::of(&meta), now);
+                if due.contains(Topics::PLAN) {
+                    let awaiting = if now >= approve_at {
+                        vec![]
+                    } else {
+                        vec![2105]
+                    };
+                    meta.plan.set(Ok(plan(awaiting)));
+                }
+                s.ran(due, now);
+                s.called(now);
+                if !meta.plan_pending() {
+                    break now;
+                }
+            };
+            let lag = cleared.saturating_duration_since(approve_at);
+            assert!(
+                lag <= Duration::from_secs(10),
+                "cleared {lag:?} after an approval at +{approve_at_ms} ms"
+            );
+        }
+        // Nothing pending: the plan is back on its 60 s poll.
+        let c = Conditions {
+            project: true,
+            plan_required: true,
+            ..Conditions::default()
+        };
+        let mut s = Schedule::default();
+        s.ran(Topics::PLAN, t0);
+        assert!(
+            !s.due(&iv, c, t0 + Duration::from_secs(59))
+                .contains(Topics::PLAN)
+        );
+        assert!(
+            s.due(&iv, c, t0 + Duration::from_secs(60))
+                .contains(Topics::PLAN)
+        );
+        let pending = Conditions {
+            plan_pending: true,
+            ..c
+        };
+        assert!(
+            s.due(&iv, pending, t0 + Duration::from_secs(5))
+                .contains(Topics::PLAN)
+        );
+        assert!(s.next_wake(&iv, pending, t0) <= t0 + Duration::from_secs(5));
+        // Pending but the project doesn't require approval: the plan isn't polled at all.
+        let off = Conditions {
+            plan_required: false,
+            ..pending
+        };
+        assert!(
+            !s.due(&iv, off, t0 + Duration::from_secs(600))
+                .contains(Topics::PLAN)
+        );
+    }
+
+    /// #2230: only others' tickets wait (a lead then approves them on their owners' behalf).
+    /// They keep the plan on the fast poll too, so the others' chip clears within the fast-poll
+    /// interval rather than after the 60 s plan poll.
+    #[test]
+    fn others_waiting_keep_the_plan_on_the_fast_poll() {
+        let iv = iv();
+        let mut meta = AmpMeta {
+            project_id: Some(2),
+            ..AmpMeta::default()
+        };
+        meta.project.set(Ok(Project {
+            id: 2,
+            name: "AMP".into(),
+            code: "amp".into(),
+            state: "active".into(),
+            org_id: None,
+            require_plan_approval: true,
+        }));
+        let others = |ids: Vec<i64>| PlanApproval {
+            require_plan_approval: true,
+            awaiting_approval: ids.clone(),
+            tickets: Some(
+                ids.iter()
+                    .map(|&task_id| AwaitingTicket {
+                        task_id,
+                        owner_user_id: Some(9),
+                        yours: false,
+                    })
+                    .collect(),
+            ),
+            ..PlanApproval::default()
+        };
+        meta.plan.set(Ok(others(vec![196])));
+        assert!(!meta.plan_pending(), "none of yours wait");
+        assert!(meta.plan_awaiting(), "others' wait");
+        let c = Conditions::of(&meta);
+        assert!(c.plan_pending);
+        let t0 = Instant::now();
+        let mut s = Schedule::default();
+        s.ran(Topics::ALL, t0);
+        assert!(s.due(&iv, c, t0 + iv.plan_pending).contains(Topics::PLAN));
+        // Approved on behalf: nothing waits, back to the 60 s poll.
+        meta.plan.set(Ok(others(vec![])));
+        assert!(!meta.plan_awaiting());
+        assert!(
+            !s.due(&iv, Conditions::of(&meta), t0 + Duration::from_secs(59))
+                .contains(Topics::PLAN)
+        );
     }
 
     #[test]
@@ -1851,5 +2389,125 @@ mod tests {
         );
         assert_eq!(Connection::AuthRequired.level(), HealthLevel::Down);
         assert_eq!(Connection::Connecting.level(), HealthLevel::Degraded);
+    }
+
+    /// #2425: while the same tickets wait, the plan poll backs off (5 s, then 15 s after 2 min,
+    /// then 60 s after 15 min); a change to the awaiting list starts it over, and once nothing
+    /// waits the fast poll stops (back to the 60 s plan poll).
+    #[test]
+    fn a_long_pending_plan_is_polled_less_often() {
+        let iv = Intervals::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        assert_eq!(
+            iv.plan_pending_after(Duration::ZERO),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(119)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(120)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(899)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(900)),
+            Duration::from_secs(60)
+        );
+        // Never faster than plan_pending, whatever the intervals.
+        let slow = Intervals {
+            plan_pending: Duration::from_secs(20),
+            ..iv
+        };
+        assert_eq!(
+            slow.plan_pending_after(Duration::from_secs(300)),
+            Duration::from_secs(20)
+        );
+
+        let c = Conditions {
+            project: true,
+            plan_required: true,
+            plan_pending: true,
+            plan_pending_since: Some(t0),
+            ..Conditions::default()
+        };
+        let mut s = Schedule::default();
+        // At first: every 5 s.
+        s.ran(Topics::PLAN, at(10));
+        assert!(!s.due(&iv, c, at(14)).contains(Topics::PLAN));
+        assert!(s.due(&iv, c, at(15)).contains(Topics::PLAN));
+        // After 2 min: every 15 s.
+        s.ran(Topics::PLAN, at(200));
+        assert!(!s.due(&iv, c, at(214)).contains(Topics::PLAN));
+        assert!(s.due(&iv, c, at(215)).contains(Topics::PLAN));
+        // After 15 min: every 60 s.
+        s.ran(Topics::PLAN, at(1000));
+        assert!(!s.due(&iv, c, at(1059)).contains(Topics::PLAN));
+        assert!(s.due(&iv, c, at(1060)).contains(Topics::PLAN));
+        // Approved: nothing pending, the plan poll is the 60 s one.
+        let done = Conditions {
+            plan_pending: false,
+            plan_pending_since: None,
+            ..c
+        };
+        s.ran(Topics::PLAN, at(1100));
+        assert!(!s.due(&iv, done, at(1159)).contains(Topics::PLAN));
+
+        // The since time: kept while the same tickets wait, reset when they change, cleared
+        // when nothing waits; a failed read keeps it.
+        let t1 = at(50);
+        assert_eq!(awaiting_since(None, Some(&[1, 2]), None, t1), Some(t1));
+        assert_eq!(
+            awaiting_since(Some(&[1, 2]), Some(&[2, 1]), Some(t0), t1),
+            Some(t0)
+        );
+        assert_eq!(
+            awaiting_since(Some(&[1, 2]), Some(&[1, 2, 3]), Some(t0), t1),
+            Some(t1)
+        );
+        assert_eq!(awaiting_since(Some(&[1, 2]), Some(&[]), Some(t0), t1), None);
+        assert_eq!(awaiting_since(Some(&[1]), None, Some(t0), t1), Some(t0));
+    }
+
+    #[test]
+    fn plan_approval_reads_old_and_per_ticket_servers() {
+        // Before #2198: one project-wide approval; every awaiting ticket is the person's to approve.
+        let old = PlanApproval::from_check_plan(&json!({
+            "require_plan_approval": true, "awaiting_approval": [3, 4],
+            "approve_url": "/project/2/plan"
+        }));
+        assert!(!old.per_ticket());
+        assert_eq!((old.yours(), old.others()), (vec![3, 4], vec![]));
+        assert_eq!(old.whose(3), None);
+
+        // #2198: owners and `yours` per ticket.
+        let new = PlanApproval::from_check_plan(&json!({
+            "require_plan_approval": true, "awaiting_approval": [3, 4, 5],
+            "awaiting_approval_tickets": [
+                {"task_id": 3, "owner_user_id": 7, "yours": true},
+                {"task_id": 4, "owner_user_id": 9, "yours": false},
+                {"task_id": 5, "owner_user_id": null}
+            ],
+            "awaiting_yours": [3, 5]
+        }));
+        assert!(new.per_ticket());
+        // `yours` missing on an item falls back to awaiting_yours.
+        assert_eq!((new.yours(), new.others()), (vec![3, 5], vec![4]));
+        assert_eq!(
+            new.whose(4).map(|t| (t.owner_user_id, t.yours)),
+            Some((Some(9), false))
+        );
+        assert_eq!(new.whose(5).map(|t| t.owner_user_id), Some(None));
+
+        // Nothing awaiting on a per-ticket server.
+        let none = PlanApproval::from_check_plan(&json!({
+            "awaiting_approval": [], "awaiting_approval_tickets": [], "awaiting_yours": []
+        }));
+        assert!(none.per_ticket() && none.yours().is_empty() && none.others().is_empty());
     }
 }
