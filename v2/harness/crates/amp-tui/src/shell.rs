@@ -505,6 +505,10 @@ pub enum CtrlC {
     Quit,
 }
 
+/// What stopping the wait for plan approval says (#2425).
+pub const STOPPED_WAITING: &str = "Stopped waiting for plan approval. The manager carries on when \
+                                   you reply.";
+
 /// The spinner's own message while a run is going.
 const WORKING: &str = "Working…";
 
@@ -603,6 +607,15 @@ pub struct Shell {
     history: PromptHistory,
     /// The tool call the model is writing right now (#2384), for the spinner line.
     streaming: Option<StreamingCall>,
+    /// `[manager] auto_resume_on_approval` (#2425): wait for a person's plan approval after a
+    /// manager turn that asked for it, and start the next turn when it comes.
+    auto_resume: bool,
+    /// This turn planned or looked at the plan ([`amp_core::approval_wait::touches_plan`]).
+    turn_plan: bool,
+    /// This turn's plan-approval refusals.
+    turn_refusals: Vec<amp_core::approval::Refusal>,
+    /// The wait for a person's plan approval (#2425), between turns.
+    approval_wait: Option<amp_core::approval_wait::ApprovalWait>,
 }
 
 /// A tool call whose arguments are still streaming (#2384).
@@ -679,6 +692,10 @@ impl Shell {
                 screen: None,
                 history: PromptHistory::new(),
                 streaming: None,
+                auto_resume: true,
+                turn_plan: false,
+                turn_refusals: Vec::new(),
+                approval_wait: None,
             },
             done_rx,
         )
@@ -1323,6 +1340,113 @@ impl Shell {
     pub fn set_meta(&mut self, meta: MetaHandle) {
         self.view.chrome().set_meta(meta.clone());
         self.meta = Some(meta);
+        // Another server's plan: the wait was for this one's.
+        self.stop_approval_wait(None);
+    }
+
+    /// `[manager] auto_resume_on_approval` (#2425, default on): after a manager turn that asked
+    /// for plan approval, wait for a person to approve it in AMP and start the next turn then.
+    /// Off: the chat waits for the person to reply, as before.
+    pub fn set_auto_resume(&mut self, on: bool) {
+        self.auto_resume = on;
+        if !on {
+            self.stop_approval_wait(None);
+        }
+    }
+
+    /// Whether the chat waits for a person's plan approval (#2425).
+    pub fn waiting_for_approval(&self) -> bool {
+        self.approval_wait.is_some()
+    }
+
+    /// Ends the wait for plan approval, if there is one, saying `why` (`None`: quietly).
+    /// Returns whether there was one.
+    fn stop_approval_wait(&mut self, why: Option<&str>) -> bool {
+        self.view.chrome().set_approval_wait(None);
+        if self.approval_wait.take().is_none() {
+            return false;
+        }
+        if let Some(why) = why {
+            self.view.add_notice(why);
+        }
+        true
+    }
+
+    /// Starts waiting for a person's plan approval after a manager turn (#2425), when the turn
+    /// asked for it: it planned or looked at the plan, or AMP refused a step for want of
+    /// approval. A fresh plan read then decides ([`Shell::watch_approval`]): with nothing of the
+    /// person's awaiting, there is nothing to wait for.
+    fn begin_approval_wait(&mut self) {
+        let turn_plan = std::mem::take(&mut self.turn_plan);
+        let refusals = std::mem::take(&mut self.turn_refusals);
+        if !self.auto_resume || short_role(&self.info.role) != "manager" {
+            return;
+        }
+        if !turn_plan && refusals.is_empty() {
+            return;
+        }
+        let Some(meta) = &self.meta else {
+            return;
+        };
+        let snapshot = meta.snapshot();
+        let Some(project_id) = snapshot.project_id else {
+            return;
+        };
+        self.approval_wait = Some(amp_core::approval_wait::ApprovalWait::new(
+            project_id,
+            &refusals,
+            &snapshot,
+            Instant::now(),
+        ));
+        meta.refresh(Topics::PLAN);
+    }
+
+    /// Follows the wait for plan approval on each poll (#2425): says it is waiting once AMP's
+    /// plan confirms tickets await the person, and when a person approves, says so and starts
+    /// the manager's next turn (once: the wait ends there). Tickets that stop waiting without an
+    /// approval, approval turned off or another project end the wait with a note, no turn.
+    /// Never while a reply runs or a server switch is going on.
+    fn watch_approval(&mut self) -> bool {
+        use amp_core::approval_wait::{self as aw, WaitCheck};
+        if self.running || self.switching {
+            return false;
+        }
+        let (Some(meta), Some(wait)) = (&self.meta, self.approval_wait.as_mut()) else {
+            return false;
+        };
+        let snapshot = meta.snapshot();
+        let link = snapshot
+            .instance
+            .as_ref()
+            .map(|i| i.plan_url(wait.project_id));
+        match wait.check(&snapshot) {
+            WaitCheck::Unknown | WaitCheck::Waiting => false,
+            WaitCheck::Nothing => {
+                self.stop_approval_wait(None);
+                false
+            }
+            WaitCheck::Armed(tickets) => {
+                self.view
+                    .add_warning(&aw::waiting_line(&tickets, link.as_deref()));
+                self.view
+                    .chrome()
+                    .set_approval_wait(Some(link.unwrap_or_default()));
+                true
+            }
+            WaitCheck::Changed(why) => {
+                self.stop_approval_wait(Some(&why));
+                true
+            }
+            WaitCheck::Approved(approval) => {
+                self.stop_approval_wait(None);
+                let me = snapshot.user.get();
+                self.view.add_notice(&aw::approved_line(&approval, me));
+                let prompt = aw::resume_prompt(&approval, me);
+                self.view.add_user(&prompt);
+                self.start_run(prompt);
+                true
+            }
+        }
     }
 
     /// The AMP metadata poller, for the header and status line (M3-3).
@@ -1358,9 +1482,13 @@ impl Shell {
             args,
         } = event
             && tool_name.starts_with("amp_")
-            && let Some(id) = amp_core::approval::task_id_arg(args)
         {
-            self.call_tickets.insert(tool_call_id.clone(), id);
+            if amp_core::approval_wait::touches_plan(tool_name) {
+                self.turn_plan = true;
+            }
+            if let Some(id) = amp_core::approval::task_id_arg(args) {
+                self.call_tickets.insert(tool_call_id.clone(), id);
+            }
         }
         let call_ticket = match event {
             AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
@@ -1383,6 +1511,9 @@ impl Shell {
         {
             if call_ticket.is_some() {
                 refusal.ticket_id = call_ticket;
+            }
+            if amp_core::approval_wait::waits_for_approval(&refusal) {
+                self.turn_refusals.push(refusal.clone());
             }
             let snapshot = self.meta.as_ref().map(|m| m.snapshot());
             self.view
@@ -1555,6 +1686,10 @@ impl Shell {
 
     fn start_run(&mut self, prompt: String) {
         self.refresh_pending_plan();
+        // A new turn: it says for itself whether it waits for approval when it ends (#2425).
+        self.stop_approval_wait(None);
+        self.turn_plan = false;
+        self.turn_refusals.clear();
         self.running = true;
         self.prompts += 1;
         self.view.take_error_shown();
@@ -1610,7 +1745,7 @@ impl Shell {
         let error_shown = self.view.take_error_shown();
         match result {
             Ok(r) => match r.outcome {
-                HarnessRunOutcome::Completed { .. } => {}
+                HarnessRunOutcome::Completed { .. } => self.begin_approval_wait(),
                 HarnessRunOutcome::Aborted { .. } => self.view.add_notice(STOPPED),
                 // The provider may report a stopped request as an error ("Request was
                 // aborted"): the person asked for it, so it is not one.
@@ -1710,6 +1845,10 @@ impl Shell {
         }
         if is_esc && self.running {
             self.abort().await;
+            return true;
+        }
+        // #2425: Esc stops waiting for plan approval (the manager then waits for a reply).
+        if is_esc && self.stop_approval_wait(Some(STOPPED_WAITING)) {
             return true;
         }
         false
@@ -1903,6 +2042,14 @@ impl Shell {
             "mcp" | "agents" | "skills" | "config" => self.config_command(name, arg),
             "connect" => self.connect_command(arg),
             "abort" => self.abort().await,
+            // #2425: stops the reply, or the wait for plan approval.
+            "stop" => {
+                if self.running {
+                    self.abort().await;
+                } else if !self.stop_approval_wait(Some(STOPPED_WAITING)) {
+                    self.view.add_notice("/stop: nothing to stop");
+                }
+            }
             "amp" => self.open_panel("amp", PanelKind::Amp),
             "workers" => self.open_panel("workers", PanelKind::Workers),
             "worker" => self.worker_command(arg),
@@ -2474,7 +2621,8 @@ impl Shell {
         }
         // The Done marker first (sync_meta), then let the finished ticket go.
         let synced = self.sync_meta();
-        changed | synced | self.clear_done_ticket()
+        let watched = self.watch_approval();
+        changed | synced | watched | self.clear_done_ticket()
     }
 
     /// A current ticket stops being current once it is done (UX review #2175 finding 12,

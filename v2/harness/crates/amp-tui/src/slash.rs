@@ -206,6 +206,12 @@ pub const COMMANDS: &[CommandSpec] = &[
     ),
     CommandSpec::new(Group::Chat, "usage", "", "tokens and cost this session"),
     CommandSpec::new(Group::Chat, "abort", "", "stop the reply"),
+    CommandSpec::new(
+        Group::Chat,
+        "stop",
+        "",
+        "stop the reply, or the wait for plan approval",
+    ),
     CommandSpec::new(Group::Chat, "close", "", "close the open panel"),
     CommandSpec::new(Group::Chat, "help", "", "this list").aliases(&["?"]),
     CommandSpec::new(Group::Chat, "quit", "", "leave the chat").aliases(&["exit", "q"]),

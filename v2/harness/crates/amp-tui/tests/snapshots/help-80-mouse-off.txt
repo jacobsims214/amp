@@ -20,6 +20,7 @@
  Chat
    /usage                   tokens and cost this session
    /abort                   stop the reply
+   /stop                    stop the reply, or the wait for plan approval
    /close                   close the open panel
    /help                    this list
    /quit                    leave the chat

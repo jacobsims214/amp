@@ -1281,6 +1281,15 @@ impl Inner {
             },
         );
 
+        head(&mut rows, "manager [manager]");
+        let (v, src) = setting(
+            "manager",
+            "auto_resume_on_approval",
+            amp_core::approval_wait::ENV_AUTO_RESUME,
+            "true",
+        );
+        line(&mut rows, "auto_resume_on_approval", v, src);
+
         head(&mut rows, "tools, workers, secrets");
         let (bash, bash_src) = match (
             env(amp_core::agent::ENV_BASH_TIMEOUT_SECS),
