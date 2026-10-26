@@ -14,12 +14,13 @@ workers, plan approval and the board counts.
 
 | command | what it does |
 |---|---|
-| `/ticket [id]`, `/project [id]` | the current ticket or project; switch to another |
+| `/amp` | the AMP connection: server, you, MCP health |
+| `/ticket [id\|none]`, `/project [id]` | the current ticket or project; switch to another (`none` clears the ticket) |
 | `/questions` | tickets waiting on an answer; answer them right there |
 | `/plan`, `/open [id\|plan]` | plan approval, epics and stories; open a ticket or the plan in the browser |
 | `/workers`, `/worker [id]` | workers here and elsewhere (Ctrl+X stops one, Ctrl+G opens its ticket); watch one live |
 | `/model`, `/connect`, `/mcp`, `/agents`, `/skills`, `/config`, `/reload`, `/server` | settings (see the other harness pages) |
-| `/usage`, `/abort`, `/help`, `/quit` | tokens and cost, stop the reply, every command, leave |
+| `/usage`, `/abort`, `/close`, `/help`, `/quit` | tokens and cost, stop the reply, close the open panel, every command, leave |
 
 Enter sends and Shift+Enter starts a new line. Ctrl+J also starts a new line in every terminal,
 as does Alt+Enter where Option/Alt sends Esc+ (iTerm2's Option key set to "Esc+", Terminal.app's
