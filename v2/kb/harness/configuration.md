@@ -93,6 +93,9 @@ mcp_max_output_tokens = 25000
 [secrets]
 pass_to_bash = []         # provider keys and AMP_TOKEN are hidden from agents' bash unless listed here
 
+[manager]
+auto_resume_on_approval = true   # resume the manager once a person approves its plan in AMP (AMP_HARNESS_AUTO_RESUME); harness/running-work.md
+
 [tui]
 theme = "auto"            # auto | dark | light | a theme .json file (--theme, AMP_HARNESS_THEME)
 show_thinking = "collapsed"   # collapsed | full | hidden

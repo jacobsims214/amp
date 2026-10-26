@@ -681,6 +681,9 @@ pub struct PlanApproval {
     /// The Flight plan page AMP gave (`approve_url`, #2167) while tickets await approval. Untrusted
     /// text: links are built with [`Instance::plan_url`].
     pub approve_url: Option<String>,
+    /// Who made the project's last approval (`plan_approved_by`, a user id; #2425 names them when
+    /// the manager resumes).
+    pub plan_approved_by: Option<i64>,
     /// Per-ticket approval (#2198): each awaiting ticket with its owner and whether it is the
     /// caller's own (`awaiting_approval_tickets`). `None` from servers before #2198, which have
     /// one project-wide approval: then every awaiting ticket is shown as the person's to approve.
@@ -733,6 +736,7 @@ impl PlanApproval {
             require_plan_approval: v["require_plan_approval"].as_bool().unwrap_or(false),
             awaiting_approval,
             plan_approved_at: v["plan_approved_at"].as_str().map(str::to_owned),
+            plan_approved_by: v["plan_approved_by"].as_i64(),
             approve_url: v["approve_url"].as_str().map(str::to_owned),
             tickets,
         }
@@ -808,6 +812,10 @@ pub struct AmpMeta {
     pub ticket_id: Option<i64>,
     pub ticket: Fetched<Ticket>,
     pub plan: Fetched<PlanApproval>,
+    /// Since when the same tickets have waited for approval (#2425): set when the awaiting list
+    /// changes, cleared when nothing waits. The plan poll slows down the longer it holds
+    /// ([`Intervals::plan_pending_after`]).
+    pub plan_awaiting_since: Option<Instant>,
     pub artifacts: Fetched<Vec<Artifact>>,
     /// The tickets the chat shows workers for ([`MetaHandle::set_workers`], #2347).
     pub worker_ids: Vec<i64>,
@@ -893,6 +901,30 @@ pub struct Intervals {
     pub reconnect: Duration,
 }
 
+/// After this long with the same tickets waiting for approval, the plan is polled every
+/// [`PLAN_PENDING_SLOW`] instead of every [`Intervals::plan_pending`] (#2425).
+pub const PLAN_SLOW_AFTER: Duration = Duration::from_secs(2 * 60);
+/// The plan poll while approval has waited [`PLAN_SLOW_AFTER`] (#2425).
+pub const PLAN_PENDING_SLOW: Duration = Duration::from_secs(15);
+/// After this long, a pending plan is polled only every [`Intervals::plan`] (60 s, #2425).
+pub const PLAN_SLOWEST_AFTER: Duration = Duration::from_secs(15 * 60);
+
+impl Intervals {
+    /// How often a pending plan is polled once the same tickets have waited `pending_for`
+    /// (#2425): every `plan_pending` (5 s) at first, so an approval in the web UI shows (and the
+    /// waiting manager resumes) within seconds; every 15 s after [`PLAN_SLOW_AFTER`]; every
+    /// `plan` (60 s) after [`PLAN_SLOWEST_AFTER`]. Never faster than `plan_pending`.
+    pub fn plan_pending_after(&self, pending_for: Duration) -> Duration {
+        if pending_for < PLAN_SLOW_AFTER {
+            self.plan_pending
+        } else if pending_for < PLAN_SLOWEST_AFTER {
+            PLAN_PENDING_SLOW.min(self.plan).max(self.plan_pending)
+        } else {
+            self.plan.max(self.plan_pending)
+        }
+    }
+}
+
 impl Default for Intervals {
     fn default() -> Self {
         Self {
@@ -917,6 +949,9 @@ pub struct Conditions {
     pub plan_required: bool,
     /// Tickets wait for approval, anyone's (polled every `plan_pending`; `AmpMeta::plan_awaiting`).
     pub plan_pending: bool,
+    /// Since when the same tickets have waited ([`AmpMeta::plan_awaiting_since`]): the pending
+    /// poll backs off from it (#2425). `None`: polled every `plan_pending`.
+    pub plan_pending_since: Option<Instant>,
     pub artifacts_in_review: bool,
     /// The chat shows workers ([`AmpMeta::worker_ids`]).
     pub workers: bool,
@@ -929,6 +964,7 @@ impl Conditions {
             ticket_open: meta.ticket_open(),
             plan_required: meta.plan_required(),
             plan_pending: meta.plan_awaiting(),
+            plan_pending_since: meta.plan_awaiting_since,
             artifacts_in_review: !meta.artifacts_in_review().is_empty(),
             workers: !meta.worker_ids.is_empty(),
         }
@@ -951,11 +987,16 @@ impl Schedule {
         Topics::WORKERS,
     ];
 
-    fn interval(iv: &Intervals, t: Topics, c: Conditions) -> Option<Duration> {
+    fn interval(iv: &Intervals, t: Topics, c: Conditions, now: Instant) -> Option<Duration> {
         match t {
             Topics::BOARD if c.project => Some(iv.board),
             Topics::TICKET if c.ticket_open => Some(iv.ticket),
-            Topics::PLAN if c.plan_required && c.plan_pending => Some(iv.plan_pending),
+            Topics::PLAN if c.plan_required && c.plan_pending => Some(
+                iv.plan_pending_after(
+                    c.plan_pending_since
+                        .map_or(Duration::ZERO, |at| now.saturating_duration_since(at)),
+                ),
+            ),
             Topics::PLAN if c.plan_required => Some(iv.plan),
             Topics::ARTIFACTS if c.artifacts_in_review => Some(iv.artifacts),
             Topics::WORKERS if c.workers => Some(iv.ticket),
@@ -981,7 +1022,7 @@ impl Schedule {
     pub fn due(&self, iv: &Intervals, c: Conditions, now: Instant) -> Topics {
         let mut due = Topics::NONE;
         for t in Self::PERIODIC {
-            if let Some(every) = Self::interval(iv, t, c) {
+            if let Some(every) = Self::interval(iv, t, c, now) {
                 match self.last.get(&t.0) {
                     Some(at) if now.saturating_duration_since(*at) < every => {}
                     _ => due |= t,
@@ -1002,13 +1043,37 @@ impl Schedule {
     pub fn next_wake(&self, iv: &Intervals, c: Conditions, now: Instant) -> Instant {
         let mut next = self.last_call.map_or(now, |at| at + iv.idle_ping);
         for t in Self::PERIODIC {
-            if let Some(every) = Self::interval(iv, t, c) {
+            if let Some(every) = Self::interval(iv, t, c, now) {
                 let at = self.last.get(&t.0).map_or(now, |at| *at + every);
                 next = next.min(at);
             }
         }
         next.max(now)
     }
+}
+
+/// [`AmpMeta::plan_awaiting_since`] after a plan read (#2425): unchanged while the same tickets
+/// wait, `now` when the list changed (or started), `None` when nothing waits.
+pub fn awaiting_since(
+    before: Option<&[i64]>,
+    after: Option<&[i64]>,
+    since: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
+    match after {
+        None => since,
+        Some([]) => None,
+        Some(ids) => match (since, before) {
+            (Some(at), Some(old)) if sorted(old) == sorted(ids) => Some(at),
+            _ => Some(now),
+        },
+    }
+}
+
+fn sorted(ids: &[i64]) -> Vec<i64> {
+    let mut v = ids.to_vec();
+    v.sort_unstable();
+    v
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1724,7 +1789,16 @@ impl MetaPoller {
                 .call("amp_check_plan", json!({"project_id": pid}))
                 .await;
             let r = r.map(|v| PlanApproval::from_check_plan(&v));
-            self.update(|m| m.plan.set(r));
+            self.update(|m| {
+                let before = m.plan.get().map(|p| p.awaiting_approval.clone());
+                m.plan.set(r);
+                m.plan_awaiting_since = awaiting_since(
+                    before.as_deref(),
+                    m.plan.get().map(|p| p.awaiting_approval.as_slice()),
+                    m.plan_awaiting_since,
+                    Instant::now(),
+                );
+            });
             ran |= Topics::PLAN;
         }
         if topics.contains(Topics::ARTIFACTS)
@@ -1943,6 +2017,7 @@ mod tests {
             ticket_open: true,
             plan_required: false,
             plan_pending: false,
+            plan_pending_since: None,
             artifacts_in_review: false,
             workers: false,
         };
@@ -2212,6 +2287,89 @@ mod tests {
         );
         assert_eq!(Connection::AuthRequired.level(), HealthLevel::Down);
         assert_eq!(Connection::Connecting.level(), HealthLevel::Degraded);
+    }
+
+    /// #2425: while the same tickets wait, the plan poll backs off (5 s, then 15 s after 2 min,
+    /// then 60 s after 15 min); a change to the awaiting list starts it over, and once nothing
+    /// waits the fast poll stops (back to the 60 s plan poll).
+    #[test]
+    fn a_long_pending_plan_is_polled_less_often() {
+        let iv = Intervals::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        assert_eq!(
+            iv.plan_pending_after(Duration::ZERO),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(119)),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(120)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(899)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            iv.plan_pending_after(Duration::from_secs(900)),
+            Duration::from_secs(60)
+        );
+        // Never faster than plan_pending, whatever the intervals.
+        let slow = Intervals {
+            plan_pending: Duration::from_secs(20),
+            ..iv
+        };
+        assert_eq!(
+            slow.plan_pending_after(Duration::from_secs(300)),
+            Duration::from_secs(20)
+        );
+
+        let c = Conditions {
+            project: true,
+            plan_required: true,
+            plan_pending: true,
+            plan_pending_since: Some(t0),
+            ..Conditions::default()
+        };
+        let mut s = Schedule::default();
+        // At first: every 5 s.
+        s.ran(Topics::PLAN, at(10));
+        assert!(!s.due(&iv, c, at(14)).contains(Topics::PLAN));
+        assert!(s.due(&iv, c, at(15)).contains(Topics::PLAN));
+        // After 2 min: every 15 s.
+        s.ran(Topics::PLAN, at(200));
+        assert!(!s.due(&iv, c, at(214)).contains(Topics::PLAN));
+        assert!(s.due(&iv, c, at(215)).contains(Topics::PLAN));
+        // After 15 min: every 60 s.
+        s.ran(Topics::PLAN, at(1000));
+        assert!(!s.due(&iv, c, at(1059)).contains(Topics::PLAN));
+        assert!(s.due(&iv, c, at(1060)).contains(Topics::PLAN));
+        // Approved: nothing pending, the plan poll is the 60 s one.
+        let done = Conditions {
+            plan_pending: false,
+            plan_pending_since: None,
+            ..c
+        };
+        s.ran(Topics::PLAN, at(1100));
+        assert!(!s.due(&iv, done, at(1159)).contains(Topics::PLAN));
+
+        // The since time: kept while the same tickets wait, reset when they change, cleared
+        // when nothing waits; a failed read keeps it.
+        let t1 = at(50);
+        assert_eq!(awaiting_since(None, Some(&[1, 2]), None, t1), Some(t1));
+        assert_eq!(
+            awaiting_since(Some(&[1, 2]), Some(&[2, 1]), Some(t0), t1),
+            Some(t0)
+        );
+        assert_eq!(
+            awaiting_since(Some(&[1, 2]), Some(&[1, 2, 3]), Some(t0), t1),
+            Some(t1)
+        );
+        assert_eq!(awaiting_since(Some(&[1, 2]), Some(&[]), Some(t0), t1), None);
+        assert_eq!(awaiting_since(Some(&[1]), None, Some(t0), t1), Some(t0));
     }
 
     #[test]

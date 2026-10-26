@@ -56,6 +56,10 @@ own agent drafted**: the manager waits for its human. Any person on the project 
 accounts can't. Flight plan shows who approved and when. New scope added later needs approving
 again.
 
+In the AMP harness chat you don't need to go back and say you've approved: the chat waits for
+your approval in AMP and starts the manager's next turn by itself once it sees it
+(`harness/running-work.md`).
+
 ## Scheduling
 
 A ticket can wait for a time: `start_at` on create, or `amp_set_task_start_at` (an absolute
