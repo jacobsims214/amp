@@ -23,20 +23,51 @@ serde.workspace = true
 # through schemars' feature unification today; this makes it explicit.
 serde_json = { workspace = true, features = ["preserve_order"] }
 thiserror.workspace = true
+# #2239: the MCP hub logs reconnects and skipped tools.
+tracing.workspace = true
 include_dir.workspace = true
 yaml_serde.workspace = true
 async-trait.workspace = true
-keyring.workspace = true
 # process: `git worktree` for workers (supervisor). macros: the metadata poller's select!.
 tokio = { workspace = true, features = ["rt", "time", "process", "macros"] }
 tokio-util.workspace = true
+# #2277: the provider HTTP client (CA file, mTLS, proxy) and the token endpoint calls.
+rpi-reqwest.workspace = true
 toml.workspace = true
+# #2241: repo MCP server trust is recorded against a sha256 of the server's table.
+sha2.workspace = true
+# #2250: the per-request clock stamp (request_time).
+chrono.workspace = true
+iana-time-zone.workspace = true
+
+# #2373: the remote link (protocol, pairing, signing, the relay client).
+p256.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+rand_core.workspace = true
+regex.workspace = true
+base64.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+sse-stream.workspace = true
+futures.workspace = true
+# The in-process mock relay (`remote::mock_relay`) for the remote link's end-to-end tests.
+axum = { workspace = true, optional = true }
+
+[features]
+mock-relay = ["dep:axum", "tokio/net"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 # The metadata poller's tests: a mock AMP on rmcp's Streamable HTTP server (tests/meta.rs).
 axum.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
+# The legacy SSE mock (tests/mcp_http.rs includes amp-mcp's tests/common/legacy_sse.rs, #2238).
+futures.workspace = true
+serde.workspace = true
+# tests/provider_auth.rs (#2277): HTTPS and mTLS mock endpoints signed by a private CA.
+rcgen.workspace = true
+time.workspace = true
+tokio-rustls.workspace = true
 
 [lints]
 workspace = true

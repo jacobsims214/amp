@@ -750,6 +750,47 @@ mod tests {
         assert!(fails.is_empty(), "{fails:#?}");
     }
 
+    /// Ticket states are told apart by colour, not only by `□`/`■` (UX review #2175 finding 12,
+    /// #2187): Done is the success token, In progress the accent, Scheduled purple, Question the
+    /// flag red, Waiting dim and Ready the text colour, in every theme and depth. Ready and Waiting
+    /// share the hollow glyph, so they must differ by colour too.
+    #[test]
+    fn ticket_states_differ_by_colour() {
+        for t in both() {
+            let c = &t.theme.colors;
+            let p = &t.palette;
+            let at = format!("{} {:?}", t.name, t.depth);
+            assert_eq!(p.done.mark, c.success, "{at}: Done is the success token");
+            assert_eq!(p.done.text, c.success, "{at}");
+            assert_eq!(p.ready.text, c.text, "{at}: Ready is ink");
+            assert_eq!(p.waiting.text, c.dim, "{at}: Waiting is dim");
+            assert_eq!(
+                p.in_progress.text, c.accent,
+                "{at}: In progress is the accent"
+            );
+            let styles = [
+                &p.ready,
+                &p.in_progress,
+                &p.waiting,
+                &p.question,
+                &p.scheduled,
+                &p.done,
+            ];
+            for (i, a) in styles.iter().enumerate() {
+                for b in &styles[i + 1..] {
+                    assert_ne!(
+                        (a.mark, a.text),
+                        (b.mark, b.text),
+                        "{at}: {} and {} look the same",
+                        a.label,
+                        b.label
+                    );
+                    assert_ne!(a.text, b.text, "{at}: {} / {} text", a.label, b.label);
+                }
+            }
+        }
+    }
+
     #[test]
     fn missing_256_values_are_derived() {
         let mut v: serde_json::Value = serde_json::from_str(AMP_DARK_JSON).unwrap();

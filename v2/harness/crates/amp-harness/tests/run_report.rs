@@ -455,6 +455,43 @@ async fn abandoned_runs_are_reported_with_usage_git_and_a_note() {
         "{:?}",
         r.notes
     );
+
+    // #2204: none of these was stopped by the chat, so their manager decides what happens to the
+    // ticket next; nothing was handed back.
+    assert!(f.calls("amp_set_task_state").is_empty());
+}
+
+/// #2225: a worker whose model repeats one call is stopped at the 5th identical call, and its
+/// abandoned run says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_stopped_for_repeating_one_call_records_an_abandoned_run_saying_why() {
+    let f = fixture("repeating", false).await;
+    let sup = f.supervisor(config());
+    let mut steps: Vec<FauxStep> = (0..8)
+        .map(|_| {
+            template(
+                "Looking.",
+                json!([{"name": "bash", "arguments": {"command": "ls"}}]),
+            )
+        })
+        .collect();
+    steps.push(template("never reached", json!([])));
+    f.script(steps);
+    let r = sup
+        .run_ticket(req(2225, "worker-backend"), CancellationToken::new())
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Stopped, "{r:?}");
+    let why = "the model kept repeating `bash ls` (5 identical calls in a row) and was stopped";
+    assert_eq!(r.error.as_deref(), Some(why), "{r:?}");
+    assert_eq!(r.tool_calls, 5, "nothing ran after the stop: {r:?}");
+    assert_eq!(r.tool_errors, 1, "{r:?}");
+    let runs = f.calls("amp_report_run");
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    assert_eq!(runs[0]["task_id"], 2225);
+    assert_eq!(runs[0]["outcome"], "abandoned");
+    assert_eq!(runs[0]["run_note"], format!("abandoned: stopped: {why}"));
+    assert!(f.calls("amp_complete_task").is_empty());
 }
 
 /// A step that cancels `token` (as the manager's abort or Ctrl-C would, mid-turn), then starts a
@@ -569,6 +606,26 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
         "{}",
         runs[0]
     );
+    // #2204: the chat stopped it, so nobody is on the ticket: it is handed back to ready.
+    let released = f.calls("amp_set_task_state");
+    assert_eq!(released.len(), 1, "{released:?}");
+    assert_eq!(released[0]["task_id"], 2090);
+    assert_eq!(released[0]["state"], "backlog");
+    assert!(
+        released[0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("returned to ready by amp-harness: abandoned: cancelled"),
+        "{}",
+        released[0]
+    );
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n == "returned #2090 to ready in AMP (nobody is working on it now)"),
+        "{:?}",
+        r.notes
+    );
 
     // 5. Closing some other ticket does not close its own: cancelled after it is still abandoned.
     let signal = CancellationToken::new();
@@ -581,4 +638,22 @@ async fn a_worker_stopped_after_closing_its_ticket_is_not_abandoned() {
     let runs = f.calls("amp_report_run");
     assert_eq!(runs.len(), 2, "{runs:?}");
     assert_eq!(runs[1]["task_id"], 2091);
+    assert_eq!(f.calls("amp_set_task_state")[1]["task_id"], 2091);
+
+    // 6. AMP refuses to take the ticket back: the report says so, nothing fails.
+    let signal = CancellationToken::new();
+    f.script(vec![cancel_then_sleep(signal.clone())]);
+    let r = sup
+        .run_ticket(req(4042, "worker-backend"), signal)
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, WorkerOutcome::Cancelled, "{r:?}");
+    assert!(
+        r.notes
+            .iter()
+            .any(|n| n.starts_with("could not return #4042 to ready in AMP")
+                && n.contains("owned by someone else")),
+        "{:?}",
+        r.notes
+    );
 }

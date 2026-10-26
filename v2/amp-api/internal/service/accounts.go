@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -154,6 +155,16 @@ func (s *Service) SetUserDisabled(ctx context.Context, p authz.Principal, userID
 		action, verb = "user.deactivate", "deactivated "
 	}
 	s.audit(ctx, p, domain.AuditEntry{Action: action, TargetType: "user", TargetID: idStr(userID), Summary: verb + u.Email})
+	if disabled {
+		// A deactivated person's remote sessions end now (#2390), which also
+		// voids their connect tokens; the relay is told to close the streams.
+		ended, err := s.Repo.EndOwnerRemoteSessions(ctx, userID, domain.RemoteEndDeactivated)
+		if err != nil {
+			slog.Warn("ending a deactivated account's remote sessions failed", "user_id", userID, "err", err)
+		} else {
+			s.remoteEnded(ctx, p, ended, domain.AuditRemoteDisable)
+		}
+	}
 	// The account's tokens were revoked with it, so a reactivated account
 	// needs new ones. Each is audited like a normal revoke.
 	for _, tok := range revoked {
@@ -188,6 +199,9 @@ func (s *Service) SetUserRole(ctx context.Context, p authz.Principal, userID int
 	s.audit(ctx, p, domain.AuditEntry{Action: "user.role", TargetType: "user", TargetID: idStr(userID),
 		TargetName: u.Email, Summary: verb + role + " for " + u.Email, Details: map[string]any{"role": role, "grant": grant},
 		Before: map[string]any{"roles": rolesValue(before)}, After: map[string]any{"roles": rolesValue(after)}})
+	if !grant {
+		s.endRemoteAfterAccessChange(ctx, p, userID) // a global admin who reached projects only as one
+	}
 	return nil
 }
 

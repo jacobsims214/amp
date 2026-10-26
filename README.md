@@ -12,6 +12,22 @@ parallel, and every run, comment, token and commit lands on the ticket it belong
 
 The active codebase is in [`v2/`](./v2/). AMP is licensed under [Apache-2.0](./LICENSE).
 
+**Install the AMP harness** (macOS and Linux) with one line:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh
+```
+
+With your company's preset (AMP server, model endpoint, models per role; no secrets):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/install.sh | sh -s -- --preset https://intranet.example.com/amp-preset.toml
+```
+
+It installs `amp-harness` to `~/.local/bin`, then offers to run `amp-harness setup`. Run the same line
+again to upgrade; add `--uninstall` to remove it. Options:
+[v2/harness/README.md](./v2/harness/README.md#install).
+
 ---
 
 ## What it does

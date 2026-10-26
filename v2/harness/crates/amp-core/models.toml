@@ -90,6 +90,17 @@ cost = { input = 0.435, output = 0.87, cache_read = 0.0036 }
 # The roles send opencode's variant body ("on") as extra_body.
 compat = { supports_reasoning_effort = false }
 
+# The manager's default since #2363 (manager eval: every scenario passed, no silent think over
+# ~17 s, ~$0.1-0.2 a scenario at OpenRouter's list price). OpenRouter caches its prompts
+# automatically: cache reads 0.1, cache writes 2.5 per Mtok (checked live 2026-10-25).
+[providers.openrouter.models."openai/gpt-6.1-sol"]
+name = "GPT-6.1 Sol"
+reasoning = true
+context_window = 1050000
+max_tokens = 65536
+input = ["text", "image"]
+cost = { input = 2.0, output = 10.0, cache_read = 0.1, cache_write = 2.5 }
+
 [providers.openrouter.models."deepseek/deepseek-v4.1-flash-1017"]
 name = "DeepSeek V4.1 Flash (1017)"
 reasoning = true
@@ -121,13 +132,17 @@ cost = { input = 0.239, output = 11.936, cache_read = 0.21 }
 thinking_map = { off = "none", minimal = "low", low = "low", medium = "high", high = "high", max = "max" }
 
 # ---------------------------------------------------------------------------------------------------
-# Roles: the opencode roster (v2/.opencode/agent/amp-<role>.md `model` + `variant`).
+# Roles: the opencode roster (v2/.opencode/agent/amp-<role>.md `model` + `variant`), except the
+# manager.
 # ---------------------------------------------------------------------------------------------------
 
+# The manager differs from the opencode roster (#2363). On xiaomi/mimo-v2.6-pro with reasoning on,
+# the manager thought silently for 2-8 minutes before acting, put bash arguments into `ls`, and in
+# the manager eval (v2/harness/scripts/manager-eval.py) never finished planning a new project
+# within 8 minutes. GPT-6.1 Sol at low effort passed every scenario. The workers stay cheap.
 [roles.manager]
-model = "openrouter/xiaomi/mimo-v2.6-pro"
-thinking = "high"
-extra_body = { reasoning = { enabled = true } }
+model = "openrouter/openai/gpt-6.1-sol"
+thinking = "low"
 
 [roles.researcher]
 model = "openrouter/xiaomi/mimo-v2.6-pro"

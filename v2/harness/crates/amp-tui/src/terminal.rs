@@ -5,8 +5,28 @@
 //! The terminal is always given back: [`TerminalGuard`] stops the TUI (leave the alternate screen,
 //! raw mode off, cursor, mouse and bracketed paste restored) when the loop returns or unwinds, and
 //! a panic hook does the same before the panic message prints. Ctrl-C in raw mode is a key, not
-//! a signal: it aborts a running prompt, else clears the editor, else quits. SIGINT, SIGTERM and
-//! SIGHUP quit cleanly too.
+//! a signal: it aborts a running prompt, else clears the editor, else shows "Press Ctrl+C again to
+//! quit", and a second Ctrl+C within 1.5 s quits ([`Shell::ctrl_c`]). Ctrl-D on the empty editor,
+//! `/quit`, SIGINT, SIGTERM and SIGHUP quit at once.
+//!
+//! Scrolling (#2185): the wheel, PageUp/PageDown, Ctrl+U/Ctrl+D and End move the transcript
+//! ([`Shell::scroll_key`], [`Shell::ctrl_d`]); while it is scrolled up and output arrives, rpi-tui's
+//! jump-to-end indicator shows [`crate::NEW_OUTPUT`] (clicking it jumps to the end). Mouse
+//! reporting is on unless [`Shell::mouse_capture`] is off (`[tui] mouse = false`), so the
+//! terminal's own click-drag selection needs a modifier while it is on: Fn-drag in Terminal.app,
+//! Option-drag in iTerm2 (see the README).
+//!
+//! The cursor (#2344): while the input has focus ([`Shell::input_focused`]) the terminal's own
+//! cursor shows at the insertion point as a blinking bar (`SetCursorStyle::BlinkingBar` on
+//! entering raw mode); while a panel or prompt has the keys it is hidden. A left click into the
+//! editor box focuses it and moves the insertion point there ([`Shell::click`]). Leaving raw mode
+//! (quit, suspend), the guard and the panic hook put back the terminal's default cursor shape
+//! and show it.
+//!
+//! Workers (#2347): a left click on a worker chip above the editor, a `/workers` row, a worker
+//! notice or dispatch line, or a `#ticket` with a worker session opens that worker's live session
+//! ([`Shell::click`]); Ctrl+W (with an empty editor) gives the worker strip the keys
+//! ([`Shell::toggle_workers_focus`]).
 //!
 //! Quitting with a prompt or workers still running goes through [`Shell::quit`]: the workers are
 //! cancelled and the screen says it is waiting for their run reports (bounded; a second Ctrl-C or
@@ -18,20 +38,43 @@ use std::{
         Arc, Once,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind};
+use crossterm::cursor::SetCursorStyle;
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use rpi_agent::AgentEvent;
-use rpi_tui::{ProcessTerminal, TUI, TuiAltScreen, TuiStopOptions};
+use rpi_tui::{ProcessTerminal, TUI, Terminal, TerminalInfo, TuiAltScreen, TuiStopOptions};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::shell::{QuitOutcome, RunDone, Shell, Submit};
+use crate::newline::NewlineMode;
+use crate::scroll::WHEEL_LINES;
+use crate::shell::{CtrlC, CtrlD, QuitOutcome, RunDone, Shell, Submit};
 
 /// Escape sequences that undo everything the TUI turns on: mouse tracking, bracketed paste,
-/// the kitty keyboard protocol, a hidden cursor and the alternate screen.
+/// the kitty keyboard protocol, the bar cursor (back to the terminal's default shape), a hidden
+/// cursor and the alternate screen.
 const RESTORE_SEQ: &str =
-    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[?25h\x1b[?1049l";
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[<u\x1b[0 q\x1b[?25h\x1b[?1049l";
+
+/// A crossterm command as the escape sequence it writes.
+fn ansi(command: impl crossterm::Command) -> String {
+    let mut out = String::new();
+    let _ = command.write_ansi(&mut out);
+    out
+}
+
+/// The input's cursor: a blinking bar (#2344).
+pub fn cursor_bar() -> String {
+    ansi(SetCursorStyle::BlinkingBar)
+}
+
+/// The terminal's own cursor shape, put back on the way out.
+pub fn cursor_default() -> String {
+    ansi(SetCursorStyle::DefaultUserShape)
+}
 
 /// Puts the terminal back the way the shell found it, best effort, without the TUI object.
 pub fn restore_terminal() {
@@ -81,6 +124,119 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// The process terminal, with mouse reporting kept off when `mouse` is false (`[tui] mouse`):
+/// rpi-tui turns it on whenever it enters the alternate screen or raw mode.
+struct MouseGate {
+    /// Shared with [`run`], which reads whether the kitty keyboard protocol was negotiated.
+    inner: Arc<ProcessTerminal>,
+    mouse: bool,
+}
+
+impl Terminal for MouseGate {
+    fn info(&self) -> TerminalInfo {
+        let mut info = self.inner.info();
+        info.supports_mouse &= self.mouse;
+        info
+    }
+    fn write(&self, data: &str) {
+        self.inner.write(data)
+    }
+    fn hide_cursor(&self) {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&self) {
+        self.inner.show_cursor()
+    }
+    fn move_cursor(&self, row: usize, col: usize) {
+        self.inner.move_cursor(row, col)
+    }
+    fn clear_screen(&self) {
+        self.inner.clear_screen()
+    }
+    fn set_title(&self, title: &str) {
+        self.inner.set_title(title)
+    }
+    fn enable_mouse(&self) {
+        if self.mouse {
+            self.inner.enable_mouse()
+        } else {
+            self.inner.disable_mouse()
+        }
+    }
+    fn disable_mouse(&self) {
+        self.inner.disable_mouse()
+    }
+    fn enter_raw_mode(&self) {
+        self.inner.enter_raw_mode();
+        if !self.mouse {
+            self.inner.disable_mouse();
+        }
+        // #2344: the input's cursor is a blinking bar while the chat owns the terminal.
+        self.inner.write(&cursor_bar());
+    }
+    fn exit_raw_mode(&self) {
+        // Suspend and quit: the shell gets its own cursor shape back, showing.
+        self.inner.write(&cursor_default());
+        self.inner.show_cursor();
+        self.inner.exit_raw_mode()
+    }
+    fn refresh_size(&self) {
+        self.inner.refresh_size()
+    }
+    fn start(
+        &self,
+        on_input: Box<dyn Fn(rpi_tui::terminal::InputEvent) + Send + Sync>,
+        on_resize: Box<dyn Fn() + Send + Sync>,
+    ) {
+        self.inner.start(on_input, on_resize);
+        if !self.mouse {
+            self.inner.disable_mouse();
+        }
+        self.inner.write(&cursor_bar());
+    }
+    fn stop(&self) {
+        self.inner.write(&cursor_default());
+        self.inner.show_cursor();
+        self.inner.stop()
+    }
+    fn is_tty(&self) -> bool {
+        self.inner.is_tty()
+    }
+    fn set_progress(&self, active: bool) {
+        self.inner.set_progress(active)
+    }
+    fn flush(&self) {
+        self.inner.flush()
+    }
+}
+
+/// Shows or hides the cursor for who has the keys, then asks for a frame (#2344).
+fn repaint(shell: &mut Shell, tui: &TuiAltScreen) {
+    shell.sync_focus();
+    fit_height(shell);
+    tui.request_render(false);
+}
+
+/// The blank rows above and below the chat for the terminal's height (#2344). Returns whether
+/// they changed.
+fn fit_height(shell: &Shell) -> bool {
+    let Ok((_, rows)) = crossterm::terminal::size() else {
+        return false;
+    };
+    let before = shell.view().vertical_padding();
+    shell.view().set_height(usize::from(rows));
+    before != shell.view().vertical_padding()
+}
+
+/// A key as the reader hands it on (#2349): rpi-tui's normalization for this protocol (a local
+/// Terminal.app's Shift+Enter, legacy iTerm2's Option+arrows; `kitty`: whether the kitty keyboard
+/// protocol is on), then Alt+Enter as Shift+Enter ([`crate::newline::normalize`]).
+pub fn read_key(key: KeyEvent, kitty: bool) -> KeyEvent {
+    crate::newline::normalize(rpi_tui::terminal::normalize_key_event_with_protocol(
+        key, kitty,
+    ))
+}
+
 fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char(ch)
 }
@@ -92,11 +248,24 @@ pub async fn run(
     mut done: UnboundedReceiver<RunDone>,
 ) -> Result<(), String> {
     install_panic_hook();
+    let terminal = Arc::new(ProcessTerminal::new());
+    // #2423: `/remote` copies its pairing link with the system's tools and OSC 52.
+    {
+        let terminal = Arc::clone(&terminal);
+        shell.attach_terminal(Arc::new(move |seq: &str| terminal.write(seq)));
+    }
     let tui = Arc::new(TuiAltScreen::new(
-        Box::new(ProcessTerminal::new()),
-        false,
+        Box::new(MouseGate {
+            inner: Arc::clone(&terminal),
+            mouse: shell.mouse_capture(),
+        }),
+        // #2344: the terminal's cursor at the editor's insertion point (rpi-tui's cursor marker).
+        true,
         None,
     ));
+    // "↓ new output" while the transcript is scrolled up and output arrives (#2185).
+    let scroll = shell.view().scroll().clone();
+    tui.set_scroll_to_end_indicator(Some(Arc::new(move || scroll.pill_label())));
     tui.set_title(&format!("amp-harness · {}", shell.info().role));
     tui.set_layout_root(Some(shell.view().root()));
     tui.set_focus(Some(shell.view().editor().clone()));
@@ -107,6 +276,11 @@ pub async fn run(
     };
     tui.start_render_scheduler();
     tui.start_readerless();
+    // #2349: entering raw mode negotiated the kitty keyboard protocol (or not). Our reader does
+    // what rpi-tui's own reader does with each key (Terminal.app's Shift+Enter, iTerm2's
+    // Option+arrows), and Alt+Enter becomes a new line.
+    let kitty = terminal.info().supports_kitty_keyboard;
+    shell.set_newline_mode(NewlineMode::detect(kitty));
 
     let (submit_tx, mut submit_rx) = unbounded_channel::<String>();
     shell.view().editor().on_submit(Arc::new(move |text: &str| {
@@ -127,6 +301,10 @@ pub async fn run(
                 }
                 match crossterm::event::read() {
                     Ok(event) => {
+                        let event = match event {
+                            Event::Key(key) => Event::Key(read_key(key, kitty)),
+                            other => other,
+                        };
                         if input_tx.send(event).is_err() {
                             break;
                         }
@@ -137,6 +315,8 @@ pub async fn run(
         })
     };
 
+    shell.sync_focus();
+    fit_height(&shell);
     tui.request_render(true);
     let mut signals = Signals::new();
     let outcome = event_loop(
@@ -184,6 +364,15 @@ pub async fn run(
             ids.join(", ")
         );
     }
+    // #2204: what became of the tickets whose workers the quit abandoned.
+    for (id, result) in shell.released() {
+        match result {
+            Ok(()) => eprintln!("amp-harness: #{id} was returned to ready in AMP"),
+            Err(e) => eprintln!(
+                "amp-harness: #{id} is still in progress in AMP (could not return it to ready: {e})"
+            ),
+        }
+    }
     outcome
 }
 
@@ -204,50 +393,98 @@ async fn event_loop(
         tokio::select! {
             Some(event) = events.recv() => {
                 shell.handle_event(&event);
-                tui.request_render(false);
+                repaint(shell, tui);
             }
             Some(result) = done.recv() => {
                 while let Ok(event) = events.try_recv() {
                     shell.handle_event(&event);
                 }
                 shell.finish_run(result);
-                tui.request_render(false);
+                repaint(shell, tui);
             }
             maybe_input = input_rx.recv() => {
                 let Some(input) = maybe_input else { break };
                 match input {
-                    Event::Resize(..) => tui.note_resize(),
+                    Event::Resize(cols, rows) => {
+                        // #2376: `/remote` sizes its QR code by the screen.
+                        shell.set_screen(usize::from(cols), usize::from(rows));
+                        shell.view().set_height(usize::from(rows));
+                        tui.note_resize();
+                    }
                     Event::Mouse(mouse) => {
                         if tui.handle_scroll_to_end_indicator_mouse_event(&mouse) {
                             continue;
                         }
                         match mouse.kind {
-                            MouseEventKind::ScrollUp => tui.scroll_by(-3),
-                            MouseEventKind::ScrollDown => tui.scroll_by(3),
+                            MouseEventKind::ScrollUp => shell.view().scroll().scroll_by(-WHEEL_LINES),
+                            MouseEventKind::ScrollDown => shell.view().scroll().scroll_by(WHEEL_LINES),
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                // #2344: a click into the editor focuses it, cursor where it landed;
+                                // #2347: a click on a worker (or its #ticket) opens its session.
+                                // #2345: one on a thinking header opens or closes it.
+                                if let Ok((w, h)) = crossterm::terminal::size() {
+                                    shell.click(
+                                        usize::from(w),
+                                        usize::from(h),
+                                        usize::from(mouse.row),
+                                        usize::from(mouse.column),
+                                    );
+                                }
+                            }
                             _ => {}
                         }
-                        tui.request_render(false);
+                        repaint(shell, tui);
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
-                        let editor = shell.view().editor().clone();
-                        let editor_empty = editor.get_text().is_empty();
-                        if is_ctrl(&key, 'c') || (is_ctrl(&key, 'd') && editor_empty) {
-                            if shell.is_running() {
-                                shell.abort().await;
-                            } else if !editor.get_text().is_empty() {
-                                editor.clear();
-                            } else {
+                        let editor_empty = shell.view().editor().get_text().is_empty();
+                        if !is_ctrl(&key, 'c') {
+                            // The quit window is two Ctrl+Cs in a row.
+                            shell.clear_quit_hint();
+                        }
+                        if shell.secret_key(&key) {
+                            // A `/connect` key is being typed: it never reaches the editor.
+                        } else if is_ctrl(&key, 'c') {
+                            // Stop the reply, else clear the editor, else "Press Ctrl+C again
+                            // to quit", and the second one quits (#2184).
+                            if shell.ctrl_c(Instant::now()).await == CtrlC::Quit {
                                 break;
                             }
-                        } else if !shell.key(key) && shell.is_running() {
-                            // An Esc that no AMP panel took aborts the run.
-                            shell.abort().await;
+                        } else if is_ctrl(&key, 'd') && editor_empty {
+                            // Half a page down while scrolled up; at the latest output it stops
+                            // the reply or quits, as before (#2185).
+                            if shell.ctrl_d(Instant::now()).await == CtrlD::Quit {
+                                break;
+                            }
+                        } else if is_ctrl(&key, 'w')
+                            && (editor_empty
+                                || shell.viewing().is_some()
+                                || shell.view().strip().is_focused())
+                            && shell.toggle_workers_focus()
+                        {
+                            // #2347: the workers above the editor take the keys (←/→, Enter).
+                        } else if is_ctrl(&key, 't') {
+                            // Expand or collapse the thinking in sight, else the last (#2177,
+                            // #2345).
+                            if let Ok((w, h)) = crossterm::terminal::size() {
+                                shell.set_screen(usize::from(w), usize::from(h));
+                            }
+                            shell.toggle_thinking();
+                        } else if is_ctrl(&key, 'o') {
+                            // Show or hide the tool calls' details (#2183).
+                            shell.toggle_tools();
+                        } else if shell.key(&key, editor_empty).await {
+                            // An open AMP panel took it (select, answer, open, close), or Esc
+                            // stopped the run (Esc that closes a panel mid-run only hints).
+                        } else {
+                            // `\` Enter starts a new line; the rest is the editor's (#2349).
+                            shell.editor_key(key);
                         }
-                        tui.request_render(false);
+                        repaint(shell, tui);
                     }
                     Event::Paste(text) => {
+                        // Into the hidden `/connect` key when one is being typed.
                         shell.paste(&text);
-                        tui.request_render(false);
+                        repaint(shell, tui);
                     }
                     _ => {}
                 }
@@ -255,7 +492,7 @@ async fn event_loop(
             Some(text) = submit_rx.recv() => {
                 let action = shell.submit(&text).await;
                 shell.view().editor().clear();
-                tui.request_render(false);
+                repaint(shell, tui);
                 if action == Submit::Quit {
                     break;
                 }
@@ -263,14 +500,18 @@ async fn event_loop(
             _ = signals.recv() => break,
             _ = ticker.tick() => {
                 tui.ensure_size();
+                let resized = fit_height(shell);
                 let retrying = shell.view().tick();
                 // Finished AMP command calls, the ticket marker and the footer's #ticket.
                 let amp_changed = shell.poll();
                 let chrome = shell.view().chrome().fingerprint();
                 let chrome_changed = chrome != chrome_seen;
                 chrome_seen = chrome;
-                if shell.is_running() || retrying || chrome_changed || amp_changed {
-                    tui.request_render(false);
+                let focused = shell.view().input_focused();
+                shell.sync_focus();
+                let focus_changed = focused != shell.view().input_focused();
+                if shell.is_running() || retrying || chrome_changed || amp_changed || focus_changed || resized {
+                    repaint(shell, tui);
                 }
             }
         }
@@ -353,5 +594,13 @@ mod tests {
         assert!(RESTORE_SEQ.contains("\x1b[?1049l"));
         assert!(RESTORE_SEQ.contains("\x1b[?25h"));
         assert!(RESTORE_SEQ.contains("\x1b[?2004l"));
+        // #2344: and the terminal's own cursor shape.
+        assert!(RESTORE_SEQ.contains(&cursor_default()));
+    }
+
+    #[test]
+    fn the_cursor_is_a_blinking_bar_and_goes_back_to_the_default_shape() {
+        assert_eq!(cursor_bar(), "\x1b[5 q");
+        assert_eq!(cursor_default(), "\x1b[0 q");
     }
 }

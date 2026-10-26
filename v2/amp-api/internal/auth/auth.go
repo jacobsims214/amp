@@ -162,6 +162,9 @@ type Verifier struct {
 	// token whose audience names it is a person in the web UI.
 	uiClientID string
 
+	// lookupOnly: see Config.LookupOnly.
+	lookupOnly bool
+
 	// OnEvent, when set, receives authentication events for the audit log
 	// (sign-ins, refused sign-ups, new accounts and accepted invites, API
 	// token use and failures). It runs on the request path and must be
@@ -191,6 +194,12 @@ type Config struct {
 	// Only REST requests carrying a token issued to it count as the web UI
 	// (ChannelUI). Empty: no Dex token counts as the UI.
 	UIClientID string
+	// LookupOnly makes the verifier read-only (amp-relay, #2392): a Dex
+	// token's user is looked up by subject, never provisioned or updated
+	// (amp-api does that when the person signs in to AMP), and AMP API
+	// tokens are refused without being looked up, so the caller's database
+	// role needs no write on users and no read of api_tokens.
+	LookupOnly bool
 }
 
 // NewVerifier builds a Verifier. When cfg.IssuerURL is empty, auth is disabled
@@ -223,7 +232,8 @@ func NewVerifier(ctx context.Context, cfg Config) (*Verifier, error) {
 	keySet := oidc.NewRemoteKeySet(ctx, strings.TrimSuffix(discoveryURL, "/")+"/keys")
 	verifier := oidc.NewVerifier(cfg.IssuerURL, keySet, &oidc.Config{SkipClientIDCheck: true})
 
-	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID)}
+	v := &Verifier{inner: verifier, enabled: true, repo: cfg.Repo, bootstrapAdmins: admins, uiClientID: strings.TrimSpace(cfg.UIClientID),
+		lookupOnly: cfg.LookupOnly}
 	return v, nil
 }
 
@@ -382,6 +392,17 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 			Reason: "email not verified: an unverified email is never provisioned or linked to an AMP user"})
 		return ident
 	}
+	if v.lookupOnly {
+		u, err := v.repo.GetUserBySubject(r.Context(), claims.Subject)
+		if err != nil {
+			// Not yet an AMP user here (or the lookup failed): no user on the
+			// identity, which the handlers refuse (authz.FromContext).
+			slog.Warn("token's user not found (lookup only: sign in to AMP first)", "listener", v.label, "subject", claims.Subject, "err", err)
+			return ident
+		}
+		ident.User = u
+		return ident
+	}
 	u, pv, err := v.repo.ProvisionUserFromClaims(r.Context(), claims.Subject, claims.Email, claims.Name, v.bootstrapAdmins)
 	switch {
 	case errors.Is(err, repository.EmptyEmailClaimError):
@@ -420,6 +441,15 @@ func (v *Verifier) identityFromJWT(w http.ResponseWriter, r *http.Request, rawTo
 func (v *Verifier) identityFromAPIToken(w http.ResponseWriter, r *http.Request, rawToken string) *Identity {
 	if v.repo == nil {
 		v.writeUnauthorized(w, "API tokens are not available")
+		return nil
+	}
+	if v.lookupOnly {
+		// The relay refuses API tokens anyway (remote control is for a
+		// person signed in with amp-harness login); refuse them here, with
+		// the relay's code, without reading api_tokens.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, `{"error":"API tokens can't use remote control; sign in with `+"`amp-harness login`"+`","code":"token_not_allowed"}`)
 		return nil
 	}
 	u, tokenID, err := v.repo.UserAndTokenForAPIToken(r.Context(), HashAPIToken(rawToken))

@@ -1,0 +1,166 @@
+name: Harness release
+
+# Release archives for amp-harness (AMP KB decisions/amp-harness-architecture.md D11/D12, ticket #2115).
+#
+# Builds the four v1 targets natively (no cross-compiling), packs each as
+# amp-harness-<version>-<target>.tar.gz + .sha256 with v2/harness/scripts/package.sh, installs each
+# archive through v2/harness/install.sh on its own runner and runs it, then renders the Homebrew
+# formula from the four checksums. Everything is uploaded as workflow artifacts only.
+#
+# NOTHING IS PUBLISHED HERE YET. M5-1 adds the publish job (GitHub Release for harness-v* tags with
+# the archives, .sha256 files, SHA256SUMS and install.sh; tap update) on top of `package`.
+
+on:
+  push:
+    tags: ["harness-v*"]
+    branches: [main, "harness-m*", "remote-m*"]
+    paths:
+      - "v2/harness/install.sh"
+      - "v2/harness/scripts/package.sh"
+      - "v2/harness/scripts/render-formula.sh"
+      - "v2/harness/scripts/test-install.sh"
+      - "v2/harness/scripts/test-install-distros.sh"
+      - "v2/harness/scripts/pty-run.py"
+      - "v2/harness/packaging/**"
+      - "v2/harness/Makefile"
+      - "v2/harness/Cargo.toml"
+      - "v2/harness/Cargo.lock"
+      - "v2/harness/rust-toolchain.toml"
+      - ".github/workflows/harness-release.yml"
+  pull_request:
+    paths:
+      - "v2/harness/install.sh"
+      - "v2/harness/scripts/package.sh"
+      - "v2/harness/scripts/render-formula.sh"
+      - "v2/harness/scripts/test-install.sh"
+      - "v2/harness/scripts/test-install-distros.sh"
+      - "v2/harness/scripts/pty-run.py"
+      - "v2/harness/packaging/**"
+      - "v2/harness/Makefile"
+      - "v2/harness/Cargo.toml"
+      - "v2/harness/Cargo.lock"
+      - "v2/harness/rust-toolchain.toml"
+      - ".github/workflows/harness-release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: harness-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Offline installer tests (stub binary, file:// release mirror, temp HOME) on both OS families:
+  # Linux runs install.sh under dash, macOS under bash-as-sh. Fresh install, upgrade (old → new),
+  # --uninstall, --preset passthrough, no-TTY output, and the setup handoff on a pseudo-terminal
+  # (scripts/pty-run.py, python3 from the runner image). Linux also runs install.sh inside distro
+  # containers: Debian slim (no curl/wget), Ubuntu with wget only, glibc 2.31 and Alpine (refused).
+  install-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck -s sh v2/harness/install.sh v2/harness/scripts/package.sh v2/harness/scripts/render-formula.sh v2/harness/scripts/test-install.sh v2/harness/scripts/test-install-distros.sh
+      - name: installer tests
+        run: |
+          python3 --version
+          v2/harness/scripts/test-install.sh
+      - name: installer on Linux distributions (docker)
+        if: runner.os == 'Linux'
+        run: v2/harness/scripts/test-install-distros.sh
+
+  build:
+    needs: install-test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          # ubuntu-22.04 keeps the glibc floor at 2.35.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: v2/harness
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+      - name: host is the target
+        run: |
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          echo "host $host, target ${{ matrix.target }}"
+          test "$host" = "${{ matrix.target }}"
+      - name: tag matches the crate version
+        if: startsWith(github.ref, 'refs/tags/harness-v')
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          test "harness-v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != harness-v$version"; exit 1; }
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: v2/harness
+          key: release-${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked -p amp-harness
+      - name: package
+        run: |
+          archive=$(scripts/package.sh --target ${{ matrix.target }} | tail -n 1)
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+          cat "$archive.sha256"
+      - name: install the archive with install.sh and run it
+        run: |
+          ./install.sh --archive "$ARCHIVE" --prefix "$RUNNER_TEMP/bin" --no-path-check
+          "$RUNNER_TEMP/bin/amp-harness" --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: amp-harness-${{ matrix.target }}
+          path: |
+            v2/harness/target/dist/*.tar.gz
+            v2/harness/target/dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  # All four archives together: SHA256SUMS and the rendered Homebrew formula (proves the formula
+  # template covers every target). M5-1's publish job starts from this artifact.
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: amp-harness-*
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum -c ./*.sha256
+          cat ./*.sha256 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Homebrew formula
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' v2/harness/Cargo.toml | head -n 1)
+          v2/harness/scripts/render-formula.sh "$version" dist > dist/amp-harness.rb
+          ruby -c dist/amp-harness.rb
+          cp v2/harness/install.sh dist/install.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: harness-release
+          path: dist/
+          if-no-files-found: error

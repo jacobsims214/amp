@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strings"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/simstech/amp-api/internal/auth"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
+	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/reqctx"
 )
 
@@ -282,4 +284,50 @@ func redactValue(v any) any {
 		return t
 	}
 	return v
+}
+
+// ---- amp-relay's entries (#2433) ----
+
+// relayAuditDetails is e's details without the members fillAuditContext adds
+// (ip_reason, xff): relay_record_audit accepts only its fixed detail list,
+// and the request context travels separately (relayAuditContext).
+func relayAuditDetails(d map[string]any) map[string]any {
+	if d == nil {
+		return nil
+	}
+	out := make(map[string]any, len(d))
+	for k, v := range d {
+		if k == "ip_reason" || k == "xff" {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+var hexSessionID = regexp.MustCompile(`^[0-9a-f]{1,64}$`)
+
+// relayAuditContext is the request context of an entry amp-relay records,
+// in the shape relay_record_audit validates (migration 036): members it
+// would refuse are left out rather than failing the entry.
+func relayAuditContext(e domain.AuditEntry) *repository.RelayAuditContext {
+	rc := &repository.RelayAuditContext{
+		UserAgent: reqctx.Clip(e.UserAgent, reqctx.MaxUserAgent),
+	}
+	if ip, err := netip.ParseAddr(e.SourceIP); err == nil {
+		rc.IP = ip.Unmap().String()
+	}
+	if reqctx.ValidRequestID(e.RequestID) {
+		rc.RequestID = e.RequestID
+	}
+	if e.ActorUserID != nil {
+		switch e.AuthMethod {
+		case auth.AuthDexSession, auth.AuthOAuthMCP:
+			rc.AuthMethod = e.AuthMethod
+		}
+		if hexSessionID.MatchString(e.SessionID) {
+			rc.SessionID = e.SessionID
+		}
+	}
+	return rc
 }

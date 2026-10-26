@@ -6,7 +6,7 @@
 //! ▀▀▀▀▀▀▀▀ amp.simstech.cloud · ada@example.com · simstech › AMP #2      ● connected 2026-07-28
 //! ■ In progress #2106 M3-3 Header and AMP status line                    ▌ AMP Harness › M3
 //! ...transcript, editor...
-//! ■  2 QUESTIONS  │ workers 2 ■ running · 1 queued │ plan: 2 awaiting approval │ ■ 3 In progress · □ 5 Ready   reported ✓ #2106
+//! ■  2 QUESTIONS  │ workers 1 ■ running · 1 queued │ plan: 2 waiting for your approval │ ■ 3 In progress · □ 5 Ready   reported ✓ #2106
 //! ```
 //!
 //! - **Header line 1:** the brand bands, the AMP host, the user, `org › project` (an OSC 8 link
@@ -15,8 +15,10 @@
 //! - **Header line 2** (only while a ticket is current): the web UI's state mark, `#id` (a link to
 //!   the board with the ticket's drawer open), the name, and `▌ Epic › Story` in the epic's cat
 //!   colour.
-//! - **Status line:** the red questions chip, workers (local from the supervisor, remote from the
-//!   board's in-progress tickets), plan approval, the board counts in the web UI's words, the
+//! - **Status line:** the red questions chip, this chat's workers (from its supervisor only;
+//!   tickets in progress elsewhere are in the board counts), plan approval ("N of yours waiting
+//!   for your approval", and others' tickets apart since per-ticket approval (#2198), links to
+//!   the Flight plan page), the board counts in the web UI's words, the
 //!   current ticket's artifacts in review, and, right-aligned, whether this session reported its
 //!   run to AMP.
 //!
@@ -26,13 +28,15 @@
 //! without control characters ([`link`]).
 //!
 //! When a line is too wide, segments are dropped by rank (the board counts first, the questions
-//! chip and the ticket id never); only the ticket name is shortened, as plain text before it is
+//! chip and the ticket id never); on the status line a dropped chip that still fits in what is
+//! left comes back (#2230). Only the ticket name is shortened, as plain text before it is
 //! styled, so a cut never lands inside an escape sequence or a link. An item whose last refresh
 //! failed keeps its last value, drawn dimmed. Without a metadata source both components render no
 //! lines at all.
 
 use std::{
     any::Any,
+    borrow::Borrow,
     collections::{BTreeMap, HashMap, HashSet},
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
@@ -134,6 +138,9 @@ pub fn shorten(text: &str, max: usize) -> String {
 /// Live workers for the status line (the manager's `Supervisor::workers`).
 pub type WorkersFn = Arc<dyn Fn() -> Vec<WorkerStatus> + Send + Sync>;
 
+/// The MCP hub's health for the status line (#2245): `mcp 3/4` (ready of those that should run).
+pub type McpFn = Arc<dyn Fn() -> amp_core::mcp_hub::HubSummary + Send + Sync>;
+
 /// Whether this session's run is on a ticket (§2 item 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReportState {
@@ -148,11 +155,16 @@ struct Inputs {
     handle: Option<MetaHandle>,
     fixed: Option<Arc<AmpMeta>>,
     workers: Option<WorkersFn>,
+    mcp: Option<McpFn>,
+    /// What each worker is for (#2347), for `/workers`.
+    roster: Option<crate::roster::Roster>,
     /// Report outcomes by ticket, and the most recent one.
     reports: BTreeMap<i64, ReportState>,
     last_report: Option<i64>,
     /// Report calls in flight: call id → ticket.
     pending: HashMap<String, i64>,
+    /// The chat waits for a person's plan approval in AMP (#2425): the Flight plan link.
+    approval_wait: Option<String>,
 }
 
 /// Everything one frame of the chrome shows.
@@ -162,6 +174,13 @@ pub struct ChromeData {
     pub workers: Vec<WorkerStatus>,
     pub reports: BTreeMap<i64, ReportState>,
     pub last_report: Option<i64>,
+    /// The external MCP servers' health (`None`: no hub, or no server that should run).
+    pub mcp: Option<amp_core::mcp_hub::HubSummary>,
+    /// What each worker is for and how it is doing (#2347; empty without a shell).
+    pub roster: Vec<crate::roster::WorkerEntry>,
+    /// The chat waits for a person's plan approval in AMP and resumes the manager by itself
+    /// (#2425): the Flight plan link.
+    pub approval_wait: Option<String>,
 }
 
 impl ChromeData {
@@ -171,6 +190,9 @@ impl ChromeData {
             workers: Vec::new(),
             reports: BTreeMap::new(),
             last_report: None,
+            mcp: None,
+            roster: Vec::new(),
+            approval_wait: None,
         }
     }
 }
@@ -204,6 +226,27 @@ impl Chrome {
     /// Where local workers come from (the manager's supervisor).
     pub fn set_workers(&self, workers: WorkersFn) {
         self.with(|i| i.workers = Some(workers));
+    }
+
+    /// What each worker is for (#2347; the chat view's roster).
+    pub fn set_roster(&self, roster: crate::roster::Roster) {
+        self.with(|i| i.roster = Some(roster));
+    }
+
+    /// The chat waits for a person's plan approval (#2425): `Some(plan link)` puts "⏸ waiting for
+    /// plan approval in AMP · <link>" on the status line; `None` takes it away.
+    pub fn set_approval_wait(&self, plan_link: Option<String>) {
+        self.with(|i| i.approval_wait = plan_link);
+    }
+
+    /// The link [`Self::set_approval_wait`] set, while the chat waits.
+    pub fn approval_wait(&self) -> Option<String> {
+        self.with(|i| i.approval_wait.clone())
+    }
+
+    /// Where the MCP servers' health comes from (the session's hub, #2245).
+    pub fn set_mcp(&self, mcp: McpFn) {
+        self.with(|i| i.mcp = Some(mcp));
     }
 
     /// Records a report outcome for `ticket` directly.
@@ -251,19 +294,30 @@ impl Chrome {
 
     /// This frame's data, or `None` without a metadata source (the chrome is then hidden).
     pub fn data(&self) -> Option<ChromeData> {
-        let (meta, workers, reports, last_report) = self.with(|i| {
+        let (meta, workers, mcp, reports, last_report, roster, approval_wait) = self.with(|i| {
             let meta = match (&i.fixed, &i.handle) {
                 (Some(m), _) => Some(Arc::clone(m)),
                 (None, Some(h)) => Some(h.snapshot()),
                 (None, None) => None,
             };
-            (meta, i.workers.clone(), i.reports.clone(), i.last_report)
+            (
+                meta,
+                i.workers.clone(),
+                i.mcp.clone(),
+                i.reports.clone(),
+                i.last_report,
+                i.roster.clone(),
+                i.approval_wait.clone(),
+            )
         });
         Some(ChromeData {
             meta: meta?,
             workers: workers.map(|f| f()).unwrap_or_default(),
             reports,
             last_report,
+            mcp: mcp.map(|f| f()).filter(|s| s.total > 0),
+            roster: roster.map(|r| r.all()).unwrap_or_default(),
+            approval_wait,
         })
     }
 
@@ -277,6 +331,12 @@ impl Chrome {
             }
             d.reports.hash(&mut h);
             d.last_report.hash(&mut h);
+            d.approval_wait.hash(&mut h);
+            self.with(|i| i.roster.as_ref().map(|r| r.revision()))
+                .hash(&mut h);
+            if let Some(m) = d.mcp {
+                (m.ready, m.total, m.level as u8).hash(&mut h);
+            }
         }
         h.finish()
     }
@@ -385,11 +445,11 @@ impl Seg {
 }
 
 /// The lead actually drawn before `segs[i]` (`None` for the first).
-fn lead_of(segs: &[Seg], i: usize) -> Option<Lead> {
+fn lead_of<S: Borrow<Seg>>(segs: &[S], i: usize) -> Option<Lead> {
     match i {
         0 => None,
-        _ if segs[i - 1].then_space => Some(Lead::Space),
-        _ => Some(segs[i].lead),
+        _ if segs[i - 1].borrow().then_space => Some(Lead::Space),
+        _ => Some(segs[i].borrow().lead),
     }
 }
 
@@ -425,10 +485,10 @@ impl Style {
     }
 }
 
-fn side_width(style: &Style, segs: &[Seg]) -> usize {
+fn side_width<S: Borrow<Seg>>(style: &Style, segs: &[S]) -> usize {
     segs.iter()
         .enumerate()
-        .map(|(i, s)| s.width + lead_of(segs, i).map_or(0, |l| style.lead(l).1))
+        .map(|(i, s)| s.borrow().width + lead_of(segs, i).map_or(0, |l| style.lead(l).1))
         .sum()
 }
 
@@ -436,7 +496,7 @@ fn side_width(style: &Style, segs: &[Seg]) -> usize {
 /// as one phrase (#2148). When they don't fit with this gap, `fit` drops segments by rank.
 pub const MIN_GAP: usize = 3;
 
-fn line_width(style: &Style, left: &[Seg], right: &[Seg]) -> usize {
+fn line_width<S: Borrow<Seg>>(style: &Style, left: &[S], right: &[S]) -> usize {
     let (l, r) = (side_width(style, left), side_width(style, right));
     if right.is_empty() {
         l
@@ -447,26 +507,37 @@ fn line_width(style: &Style, left: &[Seg], right: &[Seg]) -> usize {
     }
 }
 
-/// Drops the highest-ranked segment (the rightmost of equal rank). False when none can go.
-fn drop_one(left: &mut Vec<Seg>, right: &mut Vec<Seg>) -> bool {
-    let best = left
-        .iter()
+/// The highest-ranked droppable segment of `left` (`false`) or `right` (`true`), the rightmost of
+/// equal rank.
+fn worst(left: &[(usize, Seg)], right: &[(usize, Seg)]) -> Option<(bool, usize)> {
+    left.iter()
         .enumerate()
-        .map(|(i, s)| (s.rank, false, i))
-        .chain(right.iter().enumerate().map(|(i, s)| (s.rank, true, i)))
+        .map(|(i, (_, s))| (s.rank, false, i))
+        .chain(
+            right
+                .iter()
+                .enumerate()
+                .map(|(i, (_, s))| (s.rank, true, i)),
+        )
         .filter(|(rank, _, _)| *rank > 0)
-        .max_by_key(|(rank, on_right, i)| (*rank, *on_right, *i));
-    match best {
-        Some((_, true, i)) => {
-            right.remove(i);
-            true
-        }
-        Some((_, false, i)) => {
-            left.remove(i);
-            true
-        }
-        None => false,
+        .max_by_key(|(rank, on_right, i)| (*rank, *on_right, *i))
+        .map(|(_, on_right, i)| (on_right, i))
+}
+
+fn segs(side: &[(usize, Seg)]) -> Vec<&Seg> {
+    side.iter().map(|(_, s)| s).collect()
+}
+
+/// Puts `seg` back at its place (by original index) in `side`. A `·`-led segment whose original
+/// predecessor is gone leads with the bar: it starts a group of its own (#2230: `□ 1 Ready` kept
+/// after `■ 1 In progress` was dropped).
+fn restore(side: &mut Vec<(usize, Seg)>, at: usize, mut seg: Seg) {
+    let pos = side.partition_point(|(i, _)| *i < at);
+    let follows_its_own = pos > 0 && side[pos - 1].0 + 1 == at;
+    if matches!(seg.lead, Lead::Dot) && !follows_its_own {
+        seg.lead = Lead::Bar;
     }
+    side.insert(pos, (at, seg));
 }
 
 fn join(style: &Style, segs: &[Seg]) -> String {
@@ -482,12 +553,51 @@ fn join(style: &Style, segs: &[Seg]) -> String {
 
 /// Lays `left` and right-aligned `right` out in `width` cells, dropping segments by rank until
 /// they fit. The result is never wider than `width`.
-fn fit(style: &Style, mut left: Vec<Seg>, mut right: Vec<Seg>, width: usize) -> String {
-    while line_width(style, &left, &right) > width {
-        if !drop_one(&mut left, &mut right) {
+fn fit(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> String {
+    fit_with(style, left, right, width, false)
+}
+
+/// [`fit`], then each dropped segment, most important (lowest rank) first, comes back if it still
+/// fits in what is left. The status line's chips are independent facts, so a narrow one outlasts
+/// a wide one of higher priority that had to go (#2230: `□ 1 Ready` after the others' plan chip
+/// was dropped). The header keeps plain drop order: its segments read as one phrase.
+fn fit_keeping(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize) -> String {
+    fit_with(style, left, right, width, true)
+}
+
+fn fit_with(style: &Style, left: Vec<Seg>, right: Vec<Seg>, width: usize, keep: bool) -> String {
+    let mut l: Vec<(usize, Seg)> = left.into_iter().enumerate().collect();
+    let mut r: Vec<(usize, Seg)> = right.into_iter().enumerate().collect();
+    let width_of = |l: &[(usize, Seg)], r: &[(usize, Seg)]| {
+        let (ls, rs) = (segs(l), segs(r));
+        line_width(style, &ls, &rs)
+    };
+    let mut dropped: Vec<(bool, usize, Seg)> = Vec::new();
+    while width_of(&l, &r) > width {
+        let Some((on_right, i)) = worst(&l, &r) else {
             break;
+        };
+        let (at, seg) = if on_right { r.remove(i) } else { l.remove(i) };
+        dropped.push((on_right, at, seg));
+    }
+    if keep && !dropped.is_empty() && width_of(&l, &r) <= width {
+        // Lowest rank first; on equal ranks the left side, then the leftmost.
+        dropped.sort_by_key(|(on_right, at, s)| (s.rank, *on_right, *at));
+        for (on_right, at, seg) in dropped {
+            let side = if on_right { &mut r } else { &mut l };
+            restore(side, at, seg);
+            if width_of(&l, &r) > width {
+                let side = if on_right { &mut r } else { &mut l };
+                let pos = side
+                    .iter()
+                    .position(|(i, _)| *i == at)
+                    .expect("just restored");
+                side.remove(pos);
+            }
         }
     }
+    let left: Vec<Seg> = l.into_iter().map(|(_, s)| s).collect();
+    let right: Vec<Seg> = r.into_iter().map(|(_, s)| s).collect();
     let used = line_width(style, &left, &right);
     if used > width {
         // Only unbreakable segments are left and they still don't fit: plain text, cut.
@@ -511,6 +621,13 @@ fn stale<T>(f: &Fetched<T>) -> bool {
     f.value.is_some() && f.error.is_some()
 }
 
+/// The poller's connection is closed (its first attempt failed, or it dropped): nothing is
+/// loading, so the chrome says "not connected" / "retrying…" rather than an ellipsis that never
+/// ends next to "● disconnected" (#2215).
+fn disconnected(meta: &AmpMeta) -> bool {
+    matches!(meta.health.connection, Connection::Down { .. })
+}
+
 // ------------------------------------------------------------------------------------------------
 // Header
 // ------------------------------------------------------------------------------------------------
@@ -531,7 +648,14 @@ fn header_line1(style: &Style, data: &ChromeData, p: &AmpPalette, width: usize) 
     let mut left = vec![Seg::new(p.brand_bands(BAND_CELLS), Lead::Space, 4).then_space()];
     match &meta.instance {
         Some(inst) => left.push(Seg::new(c.muted.fg(&clean(inst.host())), Lead::Space, 8)),
-        None => left.push(Seg::new(c.dim.fg("connecting…"), Lead::Space, 8)),
+        None => {
+            let word = if disconnected(meta) {
+                "retrying…"
+            } else {
+                "connecting…"
+            };
+            left.push(Seg::new(c.dim.fg(word), Lead::Space, 8));
+        }
     }
     if let Some(user) = meta.user.get() {
         let email = clean(&user.email);
@@ -553,9 +677,11 @@ fn header_line1(style: &Style, data: &ChromeData, p: &AmpPalette, width: usize) 
         HealthLevel::Degraded => c.warning,
         HealthLevel::Down => c.error,
     };
+    // The dot and its word ("connected") outlast everything else on the line (#2186): the
+    // protocol goes first, then the left side from the host to the project.
     let mut right = vec![
         Seg::new(dot.fg("●"), Lead::Space, 1),
-        Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 7),
+        Seg::new(c.muted.fg(&health_word(health)), Lead::Space, 1),
     ];
     if let Some(inst) = &meta.instance {
         let protocol = clean(&inst.protocol);
@@ -630,6 +756,7 @@ fn ticket_line(style: &Style, data: &ChromeData, p: &AmpPalette, id: i64, width:
     let Some(ticket) = meta.ticket.get() else {
         let note = match &meta.ticket.error {
             Some(_) => "unavailable",
+            None if disconnected(meta) => "not connected",
             None => "loading…",
         };
         let left = vec![
@@ -737,17 +864,61 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
 
     left.push(workers_seg(&style, data, p));
 
+    // #2245: the external MCP servers, `mcp 3/4` (/mcp lists them).
+    if let Some(m) = data.mcp {
+        use amp_core::mcp_hub::HubLevel;
+        let color = match m.level {
+            HubLevel::Ok => c.muted,
+            HubLevel::Degraded => c.warning,
+            HubLevel::Down => c.error,
+        };
+        left.push(Seg::new(
+            color.fg(&format!("mcp {}/{}", m.ready, m.total)),
+            Lead::Bar,
+            9,
+        ));
+    }
+
     // Plan approval.
     if meta.plan_required()
         && let Some(plan) = meta.plan.get()
         && !plan.awaiting_approval.is_empty()
     {
-        let text = format!("plan: {} awaiting approval", plan.awaiting_approval.len());
-        left.push(Seg::new(
-            style.paint(c.warning, &text, stale(&meta.plan)),
-            Lead::Bar,
-            4,
-        ));
+        let plan_link = |painted: String| match (&meta.instance, meta.project_id) {
+            (Some(inst), Some(pid)) => link(&inst.plan_url(pid), &painted),
+            _ => painted,
+        };
+        // #2171: the plan waits on the person at the keyboard; the chip links to the Flight plan
+        // page where they approve it (`/open plan` opens it too). Their next step outranks the
+        // workers count when the line is narrow (only the questions chip stays longer).
+        // #2198: approval is per ticket. The chip counts the person's own tickets; others' wait
+        // for their owners (or a lead), so they get a quieter segment that goes first.
+        let yours = plan.yours().len();
+        if let Some(url) = &data.approval_wait {
+            // #2425: the manager's turn ended asking for approval, and the chat waits for it:
+            // it resumes the manager by itself once a person approves in the web UI.
+            let painted = style.paint(c.warning, "⏸ waiting for plan approval in AMP", false);
+            left.push(Seg::new(link(url, &painted), Lead::Bar, 1));
+            left.push(Seg::new(link(url, &c.muted.fg(&clean(url))), Lead::Dot, 6));
+        } else if yours > 0 {
+            let text = if plan.per_ticket() {
+                format!("plan: {yours} of yours waiting for your approval")
+            } else {
+                format!("plan: {yours} waiting for your approval")
+            };
+            let painted = style.paint(c.warning, &text, stale(&meta.plan));
+            left.push(Seg::new(plan_link(painted), Lead::Bar, 2));
+        }
+        let others = plan.others().len();
+        if others > 0 {
+            let text = if yours > 0 {
+                format!("{others} others' waiting for their owners")
+            } else {
+                format!("plan: {others} others' waiting for their owners' approval")
+            };
+            let painted = style.paint(c.muted, &text, stale(&meta.plan));
+            left.push(Seg::new(plan_link(painted), Lead::Bar, 7));
+        }
     }
 
     // Artifacts of the current ticket in review.
@@ -801,6 +972,8 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         None if meta.project_id.is_some() => {
             let note = if meta.board.error.is_some() {
                 "board unavailable"
+            } else if disconnected(meta) {
+                "board: not connected"
             } else {
                 "board…"
             };
@@ -810,11 +983,14 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
     }
 
     let right: Vec<Seg> = report_seg(&style, data).into_iter().collect();
-    vec![fit(&style, left, right, width)]
+    vec![fit_keeping(&style, left, right, width)]
 }
 
-/// `workers 3 ■ running · 1 queued · 1 ■ question`: local workers plus the board's other
-/// in-progress tickets (workers elsewhere).
+/// `workers 1 ■ running · 1 queued · 1 ■ question`: the workers **this chat** runs (its
+/// supervisor). Tickets in progress elsewhere (another chat, another person, or a run this chat
+/// abandoned) are not workers of this chat: they stay in the board's `In progress` count, and
+/// `/workers` lists them as "elsewhere" (#2204: a fresh chat used to count a dead ticket as a
+/// running worker).
 fn workers_seg(style: &Style, data: &ChromeData, p: &AmpPalette) -> Seg {
     let c = &style.colors;
     let meta = &data.meta;
@@ -822,7 +998,6 @@ fn workers_seg(style: &Style, data: &ChromeData, p: &AmpPalette) -> Seg {
     let questions: HashSet<i64> = board
         .map(|b| b.questions.iter().map(|q| q.id).collect())
         .unwrap_or_default();
-    let local: HashSet<i64> = data.workers.iter().map(|w| w.task_id).collect();
     let mut running = 0;
     let mut queued = 0;
     let mut asking = 0;
@@ -835,14 +1010,6 @@ fn workers_seg(style: &Style, data: &ChromeData, p: &AmpPalette) -> Seg {
             running += 1;
         }
     }
-    running += board
-        .map(|b| {
-            b.in_progress_tickets
-                .iter()
-                .filter(|t| !local.contains(&t.id))
-                .count()
-        })
-        .unwrap_or(0);
 
     let is_stale = stale(&meta.board);
     let prog = p.state(Status::InProgress);
@@ -983,7 +1150,10 @@ pub mod sample {
                     slug: "simstech".to_owned(),
                 }],
             }),
+            worker_ids: Vec::new(),
+            workers: Default::default(),
             project_id: Some(2),
+            project_marker: None,
             project: ok(Project {
                 id: 2,
                 name: "AMP".to_owned(),
@@ -1047,12 +1217,17 @@ pub mod sample {
                 require_plan_approval: true,
                 awaiting_approval: vec![2108, 2109],
                 plan_approved_at: None,
+                plan_approved_by: None,
+                approve_url: Some("https://amp.simstech.cloud/project/2/plan".into()),
+                tickets: None,
             }),
+            plan_awaiting_since: None,
             artifacts: ok(Vec::new()),
         }
     }
 
-    fn worker(task_id: i64, phase: WorkerPhase) -> WorkerStatus {
+    /// A live worker of this chat on `task_id`.
+    pub fn worker(task_id: i64, phase: WorkerPhase) -> WorkerStatus {
         WorkerStatus {
             task_id,
             agent_id: "amp:amp-worker-backend".to_owned(),
