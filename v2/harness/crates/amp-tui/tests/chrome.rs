@@ -14,7 +14,7 @@ use std::{
 };
 
 use amp_core::{
-    meta::{AmpMeta, Fetched},
+    meta::{AmpMeta, Connection, Fetched},
     supervisor::WorkerPhase,
     tickets::Status,
 };
@@ -114,16 +114,22 @@ fn plain_layout_at_80_and_160() {
     assert!(wide[1].ends_with("▌ AMP Harness › M3 theme + metadata"));
     assert!(wide[2].contains("│ ■ 3 In progress · □ 5 Ready · ■ 1 Scheduled"));
     assert!(wide[2].ends_with("unreported #2106"));
-    // Narrow: the protocol, the story and the board counts go first; the name stays whole.
+    // Narrow: the protocol, the story and the board counts go first; the name stays whole. The
+    // plan chip (#2171: the person's next step) outranks the workers count.
     let narrow = at(80);
     assert!(narrow[0].ends_with("● connected"), "{}", narrow[0]);
     assert_eq!(
         narrow[1],
         "■ In progress #2106 M3-3 Header and AMP status line                ▌ AMP Harness"
     );
+    // The workers count is dropped; `unreported #id` (dropped before it) still fits, with the
+    // three-cell gap, so it stays (#2230).
     assert_eq!(
         narrow[2],
-        "■  2 QUESTIONS  │ workers 3 ■ running · 1 queued │ plan: 2 awaiting approval"
+        "■  2 QUESTIONS  │ plan: 2 waiting for your approval             unreported #2106"
+    );
+    assert!(
+        wide[2].contains("│ workers 1 ■ running · 1 queued │ plan: 2 waiting for your approval │")
     );
 }
 
@@ -146,7 +152,7 @@ fn every_width_fits() {
 }
 
 /// `data` shaped like the live board the #2109 review saw at 80 columns: two questions, two
-/// workers running elsewhere, eight tickets awaiting plan approval, and the current ticket #67
+/// workers of this chat running (#67, #68), eight tickets awaiting plan approval, and the current ticket #67
 /// unreported.
 fn live_like() -> ChromeData {
     let mut meta = sample::meta(true);
@@ -159,7 +165,28 @@ fn live_like() -> ChromeData {
     board.in_progress_tickets[0].id = 67;
     board.in_progress_tickets[1].id = 68;
     meta.plan.value.as_mut().unwrap().awaiting_approval = (100..108).collect();
-    ChromeData::new(meta)
+    let mut data = ChromeData::new(meta);
+    data.workers = vec![
+        sample::worker(67, WorkerPhase::Running),
+        sample::worker(68, WorkerPhase::Running),
+    ];
+    data
+}
+
+#[test]
+fn tickets_in_progress_elsewhere_are_not_workers_of_this_chat() {
+    // #2204: a fresh chat whose board has tickets in progress (another chat's, or a run an
+    // earlier chat abandoned) has no workers of its own: `workers 0`, and the board counts them.
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let mut data = live_like();
+    data.workers.clear();
+    let status = plain(&render_status(&data, &palette(), 160)[0]);
+    assert!(
+        status.starts_with(
+            "■  2 QUESTIONS  │ workers 0 │ plan: 8 waiting for your approval │ ■ 2 In progress"
+        ),
+        "{status}"
+    );
 }
 
 /// The blank cells before the right-aligned item that starts with `marker`, if it is drawn after
@@ -179,13 +206,13 @@ fn right_items_keep_a_three_cell_gap() {
     let status = |w| plain(&render_status(&live_like(), &palette(), w)[0]);
     assert_eq!(
         status(80),
-        "■  2 QUESTIONS  │ workers 2 ■ running │ plan: 8 awaiting approval"
+        "■  2 QUESTIONS  │ workers 2 ■ running │ plan: 8 waiting for your approval"
     );
-    // Two cells wider, it fits with exactly the minimum gap.
-    let wider = status(82);
+    // At 90 (73 cells + the 3-cell gap + 14), it fits with exactly the minimum gap.
+    let wider = status(90);
     assert!(wider.ends_with("approval   unreported #67"), "{wider}");
     assert_eq!(gap_before(&wider, "unreported #67"), Some(MIN_GAP));
-    assert!(gap_before(&status(81), "unreported").is_none());
+    assert!(gap_before(&status(89), "unreported").is_none());
 
     let markers = ["●", "▌", "unreported #", "reported ✓ #", "report failed #"];
     for data in [sample::data(true), sample::data(false), live_like()] {
@@ -332,18 +359,23 @@ fn no_ticket_hides_line_two_and_no_source_hides_everything() {
             .any(|l| l.contains('▀') || l.contains("workers"))
     );
 
-    // With one, the header is on top and the status line sits between the editor and pi's
-    // footer (whose cwd line is empty here, so it is one line).
+    // With one, the header is on top and the status line sits between the editor and the
+    // footer (#2186: with no cwd, model or usage set, the footer has no rows).
     view.chrome().set_snapshot(sample::meta(true));
     let screen = view.render_plain(160, 20);
-    assert!(screen[0].starts_with("▀▀▀▀▀▀▀▀ amp.simstech.cloud"));
-    assert!(screen[1].starts_with("■ In progress #2106"));
-    assert!(screen[17].starts_with("────"), "{screen:#?}");
     assert!(
-        screen[18].starts_with("■  2 QUESTIONS  │ workers 3 ■ running │"),
+        screen[0]
+            .trim_start()
+            .starts_with("▀▀▀▀▀▀▀▀ amp.simstech.cloud")
+    );
+    assert!(screen[1].trim_start().starts_with("■ In progress #2106"));
+    assert!(screen[18].trim_start().starts_with("────"), "{screen:#?}");
+    assert!(
+        screen[19]
+            .trim_start()
+            .starts_with("■  2 QUESTIONS  │ workers 0 │"),
         "{screen:#?}"
     );
-    assert!(screen[19].starts_with("Enter send"), "{screen:#?}");
 }
 
 #[test]
@@ -381,7 +413,7 @@ fn stale_items_are_dimmed_and_loading_is_shown() {
     let out = plain(&render_status(&ChromeData::new(meta), &palette(), 120)[0]);
     assert_eq!(
         out,
-        "workers 0 │ plan: 2 awaiting approval │ no open tickets"
+        "workers 0 │ plan: 2 waiting for your approval │ no open tickets"
     );
 
     let meta = AmpMeta::default();
@@ -398,6 +430,41 @@ fn stale_items_are_dimmed_and_loading_is_shown() {
     assert_eq!(out[1], "workers 0 │ no project");
 }
 
+/// #2215: a disconnected start (AMP down) used to read `connecting… · project #68 … ●
+/// disconnected` with `board…` forever. Once the first attempt fails the header says
+/// `retrying…` and the status line `board: not connected`, matching the red dot.
+#[test]
+fn disconnected_start_does_not_say_connecting_or_loading() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let mut meta = AmpMeta {
+        project_id: Some(68),
+        ticket_id: Some(2106),
+        ..Default::default()
+    };
+    meta.health.connection = Connection::Down {
+        reason: "connection refused".to_owned(),
+    };
+    let out: Vec<String> = lines(&ChromeData::new(meta.clone()), 120)
+        .iter()
+        .map(|l| plain(l))
+        .collect();
+    assert!(out[0].starts_with("▀▀▀▀▀▀▀▀ retrying… · "), "{}", out[0]);
+    assert!(!out[0].contains("connecting"), "{}", out[0]);
+    assert!(out[0].ends_with(" ● disconnected"), "{}", out[0]);
+    assert_eq!(out[1], "#2106 not connected");
+    assert!(out[2].ends_with("│ board: not connected"), "{}", out[2]);
+    assert!(!out[2].contains('…'), "{}", out[2]);
+
+    // Still connecting (no failure yet): the ellipses stay.
+    meta.health.connection = Connection::Connecting;
+    let out: Vec<String> = lines(&ChromeData::new(meta), 120)
+        .iter()
+        .map(|l| plain(l))
+        .collect();
+    assert!(out[0].starts_with("▀▀▀▀▀▀▀▀ connecting… · "), "{}", out[0]);
+    assert!(out[2].ends_with("│ board…"), "{}", out[2]);
+}
+
 #[test]
 fn local_workers_that_ask_show_as_questions() {
     let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
@@ -406,7 +473,7 @@ fn local_workers_that_ask_show_as_questions() {
     data.workers[1].phase = WorkerPhase::Running;
     let status = plain(&render_status(&data, &palette(), 200)[0]);
     assert!(
-        status.contains("workers 3 ■ running · 1 ■ question"),
+        status.contains("workers 1 ■ running · 1 ■ question"),
         "{status}"
     );
     let q = palette();
@@ -465,5 +532,150 @@ fn run_reports_come_from_the_sessions_tool_calls() {
     assert_eq!(
         view.chrome().data().unwrap().reports.get(&2106),
         Some(&ReportState::Reported)
+    );
+}
+
+/// #2186: header line 1 drops the protocol, then the left side (host, email, bands, project),
+/// and keeps the health dot and its word to the last.
+#[test]
+fn the_header_keeps_the_dot_and_connected_longest() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let p = palette();
+    let data = sample::data(false);
+    for width in 11..=160 {
+        let line = plain(&render_header(&data, &p, width)[0]);
+        assert!(visible_width(&line) <= width, "{width}: {line}");
+        assert!(line.ends_with("● connected") || line.ends_with("● connected 2026-07-28"));
+        if !line.ends_with("2026-07-28") && width >= 100 {
+            panic!("{width}: the protocol went with room to spare: {line}");
+        }
+    }
+    // Before "connected" goes, everything on the left has.
+    let line = plain(&render_header(&data, &p, 30)[0]);
+    assert_eq!(line.trim_start(), "● connected", "{line}");
+    let line = plain(&render_header(&data, &p, 50)[0]);
+    assert!(line.contains("AMP #2") && !line.contains('@'), "{line}");
+}
+
+/// #2201: per-ticket approval (#2198). The chip counts the person's own tickets; others' are a
+/// quieter segment, dropped before the workers count. Old servers keep "N waiting for your
+/// approval" (the sample data has no per-ticket list; see plain_layout_at_80_and_160).
+#[test]
+fn plan_chip_counts_yours_apart_from_others() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let with = |yours: &[i64], others: &[i64]| {
+        let mut meta = sample::meta(true);
+        let plan = meta.plan.value.as_mut().unwrap();
+        plan.awaiting_approval = yours.iter().chain(others).copied().collect();
+        plan.tickets = Some(
+            yours
+                .iter()
+                .map(|&id| (id, true))
+                .chain(others.iter().map(|&id| (id, false)))
+                .map(|(task_id, yours)| amp_core::meta::AwaitingTicket {
+                    task_id,
+                    owner_user_id: Some(if yours { 7 } else { 9 }),
+                    yours,
+                })
+                .collect(),
+        );
+        ChromeData::new(meta)
+    };
+    let status = |d: &ChromeData, w| plain(&render_status(d, &palette(), w)[0]);
+
+    let both = with(&[2108, 2109], &[2203]);
+    let wide = status(&both, 200);
+    assert!(
+        wide.contains(
+            "│ plan: 2 of yours waiting for your approval │ 1 others' waiting for their owners │"
+        ),
+        "{wide}"
+    );
+    // Narrow: others' go first; the person's own chip stays.
+    assert_eq!(
+        status(&both, 80),
+        "■  2 QUESTIONS  │ workers 0 │ plan: 2 of yours waiting for your approval"
+    );
+    // Both link the Flight plan page.
+    let raw = render_status(&both, &palette(), 200)[0].clone();
+    assert_eq!(
+        raw.matches("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07")
+            .count(),
+        2,
+        "{}",
+        visible(&raw)
+    );
+
+    let only_others = status(&with(&[], &[2203]), 200);
+    assert!(
+        only_others.contains("│ plan: 1 others' waiting for their owners' approval │"),
+        "{only_others}"
+    );
+    assert!(!only_others.contains("your approval"), "{only_others}");
+
+    let only_yours = status(&with(&[2108], &[]), 200);
+    assert!(
+        only_yours.contains("│ plan: 1 of yours waiting for your approval │"),
+        "{only_yours}"
+    );
+    assert!(!only_yours.contains("others'"), "{only_yours}");
+}
+
+/// #2230 (QA pass 2): at 80 columns with 1 of yours + 1 others' awaiting, the others' chip (rank
+/// 7) has to go, but the board's `□ 1 Ready` (rank 10) fits in what is left and stays. Every width
+/// still fits, and a dropped chip never comes back wider than the line.
+#[test]
+fn a_chip_that_fits_after_a_wider_one_was_dropped_is_kept() {
+    let _guard = themed(Variant::Dark, ColorDepth::TrueColor);
+    let mut meta = sample::meta(false);
+    let plan = meta.plan.value.as_mut().unwrap();
+    plan.awaiting_approval = vec![196, 197];
+    plan.tickets = Some(vec![
+        amp_core::meta::AwaitingTicket {
+            task_id: 196,
+            owner_user_id: Some(7),
+            yours: true,
+        },
+        amp_core::meta::AwaitingTicket {
+            task_id: 197,
+            owner_user_id: Some(9),
+            yours: false,
+        },
+    ]);
+    let board = meta.board.value.as_mut().unwrap();
+    board.in_progress = 0;
+    board.ready = 1;
+    board.question = 0;
+    board.scheduled = 0;
+    board.questions.clear();
+    board.in_progress_tickets.clear();
+    let data = ChromeData::new(meta);
+    let status = |w| plain(&render_status(&data, &palette(), w)[0]);
+
+    let wide = status(200);
+    assert!(
+        wide.contains(
+            "workers 0 │ plan: 1 of yours waiting for your approval │ 1 others' waiting for their owners │ □ 1 Ready"
+        ),
+        "{wide}"
+    );
+    assert_eq!(
+        status(80),
+        "workers 0 │ plan: 1 of yours waiting for your approval │ □ 1 Ready"
+    );
+    for w in 10..=220 {
+        let line = status(w);
+        assert!(visible_width(&line) <= w, "{w}: {line}");
+    }
+
+    // `■ 3 In progress` doesn't fit at 70 but `□ 1 Ready` does: it comes back after a bar, not
+    // a dot, since the count it followed is gone.
+    let mut meta = data.meta.as_ref().clone();
+    meta.board.value.as_mut().unwrap().in_progress = 3;
+    let data = ChromeData::new(meta);
+    let line = plain(&render_status(&data, &palette(), 70)[0]);
+    assert_eq!(
+        line,
+        "workers 0 │ plan: 1 of yours waiting for your approval │ □ 1 Ready"
     );
 }

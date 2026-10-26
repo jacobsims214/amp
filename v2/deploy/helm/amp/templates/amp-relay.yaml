@@ -1,0 +1,185 @@
+{{- if .Values.relay.enabled }}
+# amp-relay: the remote control relay (epic 165), its own service (#2387).
+# It serves only /relay/ (harness leg) and /api/sessions (browser leg); amp-api
+# serves neither, so scaling this Deployment to 0 makes remote control
+# impossible. Rendered only with relay.enabled (as are Envoy's relay routes).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: amp-relay
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-relay" "Release" .Release) | nindent 4 }}
+spec:
+  replicas: {{ .Values.relay.replicas }}
+  revisionHistoryLimit: 3
+  strategy:
+    rollingUpdate: { maxSurge: 1, maxUnavailable: 0 }
+  selector:
+    matchLabels:
+      app: amp-relay
+  template:
+    metadata:
+      labels:
+        app: amp-relay
+    spec:
+      securityContext:
+        {{- include "amp.podSecurityContext" . | nindent 8 }}
+      {{- if gt (int .Values.relay.replicas) 1 }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: amp-relay
+      {{- end }}
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          securityContext:
+            {{- include "amp.containerSecurityContext" (dict "runAsUser" 65534) | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z {{ .Values.cnpg.clusterName }}-rw 5432; do echo waiting for postgres; sleep 3; done
+      containers:
+        - name: amp-relay
+          image: {{ include "amp.image" (dict "image" .Values.relay.image "tag" .Values.relay.tag "root" $) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "amp.containerSecurityContext" . | nindent 12 }}
+          env:
+            # The same database as amp-api, as the relay's own least-privilege
+            # role (#2392), never amp-api's: amp-api grants it only what the
+            # relay uses. amp-relay never migrates: it waits for amp-api's
+            # remote control migration (and for those grants).
+            - name: PGHOST
+              value: "{{ .Values.cnpg.clusterName }}-rw.{{ .Values.global.namespace }}.svc.cluster.local"
+            - name: PGUSER
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayDbSecret" . }}, key: username } }
+            - name: PGPASSWORD
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayDbSecret" . }}, key: password } }
+            - name: DATABASE_URL
+              value: "postgres://$(PGUSER):$(PGPASSWORD)@$(PGHOST):5432/{{ .Values.cnpg.appDatabase }}?sslmode=require"
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: RELAY_ADDR
+              value: ":3002"
+            # Relay replicas pass a session's requests to the replica holding
+            # it on this port, and amp-api calls it to end sessions, with the
+            # relay's own cluster token. Not routed by Envoy; the
+            # NetworkPolicy below admits only amp-relay and amp-api.
+            - name: RELAY_CLUSTER_TOKEN
+              valueFrom: { secretKeyRef: { name: {{ include "amp.relayTokenSecret" . }}, key: {{ .Values.relay.clusterToken.key }} } }
+            - name: CLUSTER_ADDR
+              value: ":3003"
+            - name: CLUSTER_ADVERTISE_ADDR
+              value: "$(POD_IP):3003"
+            - name: SHUTDOWN_DELAY
+              value: "5s"
+            - name: MCP_PUBLIC_URL
+              value: "https://{{ .Values.global.domain }}/mcp"
+            - name: OIDC_ISSUER_URL
+              value: "https://{{ .Values.global.domain }}/dex"
+            - name: OIDC_DISCOVERY_URL
+              value: "http://dex.{{ .Values.global.namespace }}.svc.cluster.local:{{ .Values.dex.httpPort }}/dex"
+            - name: BOOTSTRAP_ADMIN_EMAILS
+              value: {{ .Values.global.bootstrapAdminEmails | quote }}
+            - name: MCP_AUDIENCE
+              value: {{ .Values.auth.mcpAudience | quote }}
+            - name: REST_AUDIENCES
+              value: {{ .Values.oauth2Proxy.clientID | quote }}
+            - name: UI_CLIENT_ID
+              value: {{ .Values.auth.uiClientID | default .Values.oauth2Proxy.clientID | quote }}
+            {{- with .Values.ampApi.signupAllowedDomains }}
+            - name: SIGNUP_ALLOWED_DOMAINS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.ampApi.appPublicUrl }}
+            # The web origin: the only Origin the browser leg accepts.
+            - name: APP_PUBLIC_URL
+              value: {{ . | trimSuffix "/" | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 3002
+            - name: cluster
+              containerPort: 3003
+          readinessProbe:
+            httpGet: { path: /ready, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.relay.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: amp-relay
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-relay" "Release" .Release) | nindent 4 }}
+spec:
+  selector:
+    app: amp-relay
+  ports:
+    - name: http
+      port: 3002
+      targetPort: http
+{{- if gt (int .Values.relay.replicas) 1 }}
+---
+# Voluntary disruptions (node drains, upgrades) keep at least one replica.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: amp-relay
+  namespace: {{ .Values.global.namespace }}
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: amp-relay
+{{- end }}
+{{- if .Values.relay.networkPolicy.enabled }}
+---
+# Who may reach amp-relay's pods (#2392): the relay port only from Envoy (the
+# only way in from outside), the internal port (forwarded requests and
+# control calls, behind the relay cluster token) only from amp-relay's own
+# replicas and amp-api. Kubelet probes come from the node and aren't pod
+# traffic. Egress is not limited. Needs a CNI that enforces NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: amp-relay
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "amp.componentLabels" (dict "component" "amp-relay" "Release" .Release) | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: amp-relay
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: envoy
+      ports:
+        - { protocol: TCP, port: 3002 }
+    - from:
+        - podSelector:
+            matchLabels:
+              app: amp-relay
+        - podSelector:
+            matchLabels:
+              app: amp-api
+      ports:
+        - { protocol: TCP, port: 3003 }
+{{- end }}
+{{- end }}

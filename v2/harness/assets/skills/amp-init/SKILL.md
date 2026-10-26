@@ -7,6 +7,8 @@ description: Initialize a new AMP project — create the project, scan the codeb
 
 Use this skill when there is no `.amp.json` in the current directory.
 
+In amp-harness, a folder is linked by `amp-harness init` (the person; it creates or picks the project, writes `.amp.json` and never overwrites a parent folder's), or by you with this skill when there is no `.amp.json` here or above. If `<amp_context>` has a `project_marker_note`, the session's `.amp.json` belongs to a parent folder: when the person asks to set up a new project here, don't create it or plan in the parent's project — tell them which project the folder uses now and where its `.amp.json` is, and ask them to run `amp-harness init` in this folder and start the chat again. Never write `.amp.json` over a parent folder's.
+
 ---
 
 ## What needs to happen
@@ -23,18 +25,17 @@ How you get there is up to you. The guidance below covers what each step involve
 
 ## Creating the project
 
-If you don't already have a name and code from the user, infer them from the directory name and ask for confirmation. The code is the ticket prefix — refs read `CODE-149` everywhere (reports, commits, branches) — so keep it to 2–6 letters, like `NWC` for Northwind Commerce, not the full name.
+If your user didn't give a name and code, pick them from what they told you about the project (the folder name only when that's all you have), create the project, and say they can rename it. Don't stop to ask first. The code is the ticket prefix — refs read `CODE-149` everywhere (reports, commits, branches) — so keep it to 2–6 letters, like `NWC` for Northwind Commerce, not the full name.
 
-You also need the URL of the user's AMP server for `amp_api`. AMP is self-hosted, so there is no default — never guess one or fill in a placeholder:
-
-- If the harness's AMP MCP config already points at a server (e.g. the server `amp-harness doctor` reports), take the base URL from there and confirm it with the user: "Your AMP server is `<url>` — is that right?"
-- Otherwise, ask the user for it. For a local dev instance it's usually something like `http://localhost:8000`; mention that only as an example, not as the answer.
+You also need the URL of the user's AMP server for `amp_api`: in the harness it is the
+origin of `amp_server` in your `<amp_context>` (e.g. `http://localhost:18000` for
+`http://localhost:18000/mcp`). Use it; don't ask.
 
 ```json
 { "project_id": <id>, "project_name": "<name>", "project_code": "<code>", "amp_api": "<the AMP server URL the user confirmed>" }
 ```
 
-Write that to `.amp.json` in the current directory. Commit it — everyone working here shares the same project.
+Write that to `.amp.json` in the working directory with the `write` tool (the one file you may write). Don't commit it yourself: tell your user to commit it, or let the first worker's ticket include it, so everyone working here shares the same project.
 
 ---
 

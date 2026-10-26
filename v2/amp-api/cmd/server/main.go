@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -28,6 +29,7 @@ import (
 	"github.com/simstech/amp-api/internal/kb"
 	"github.com/simstech/amp-api/internal/mcp"
 	"github.com/simstech/amp-api/internal/queue"
+	"github.com/simstech/amp-api/internal/relayctl"
 	"github.com/simstech/amp-api/internal/repository"
 	"github.com/simstech/amp-api/internal/reqctx"
 	"github.com/simstech/amp-api/internal/service"
@@ -80,6 +82,13 @@ func main() {
 	if err := repo.RunMigrations(ctx, migrations); err != nil {
 		slog.Error("migration failed", "err", err)
 		os.Exit(1)
+	}
+	// amp-relay's own least-privilege database role (#2392): when the chart
+	// names it (RELAY_DB_ROLE), grant it exactly what the relay uses, now
+	// that the tables are current. The role may not exist yet (the operator
+	// creates it), so keep trying in the background.
+	if role := strings.TrimSpace(os.Getenv("RELAY_DB_ROLE")); role != "" {
+		go grantRelayRole(ctx, repo, role)
 	}
 
 	// Who may become an AMP user by signing in (e.g. through an SSO
@@ -341,11 +350,27 @@ func main() {
 	}()
 
 	// ---- 6. REST + SSE API (port 3001) ----
-	mux := http.NewServeMux()
 	restHandler := api.NewRestHandler(registry, repo, sseHub, kbSvc)
 	restHandler.SetAppURL(appPublicURL())
 	restHandler.SetArtifactRetention(artifactRetention())
-	restHandler.Register(mux)
+	// ---- 6a. Remote control (epic 165) ----
+	// The relay itself is its own service, amp-relay (cmd/relay): amp-api
+	// serves none of its routes (/relay/, /api/sessions). It keeps the org
+	// setting (/api/orgs/:id/remote-control) and the capability on /api/me,
+	// where RELAY_ENABLED (Helm relay.enabled, which also deploys amp-relay)
+	// is only the signal that a relay is deployed. Sessions an org admin ends
+	// here are closed on the relay replica holding them, over its internal
+	// listener (relayctl); with no relay running there is nothing to close.
+	// amp-relay's internal listener takes the relay cluster token
+	// (RELAY_CLUSTER_TOKEN, else its own database row), never amp-api's.
+	if _, err := relayctl.ConfiguredToken(); err != nil {
+		slog.Error("relay cluster token", "err", err)
+		os.Exit(1)
+	}
+	remoteCfg := remoteConfig()
+	restHandler.SetRemoteControl(remoteCfg)
+	hookRelayEnds(restHandler.Service(), repo, node)
+	mux := apiMux(restHandler)
 	// Artifacts nobody kept are deleted after the retention period.
 	go restHandler.RunArtifactPurge(context.Background(), time.Hour)
 	// Trash rows (deleted tickets, epics, stories) past the 30-day retention
@@ -459,6 +484,50 @@ func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	})
 }
 
+// apiMux is amp-api's REST routes (the /health and /ready probes are added
+// by main). It has no remote control relay route: the relay is amp-relay.
+func apiMux(h *api.RestHandler) *http.ServeMux {
+	mux := http.NewServeMux()
+	h.Register(mux)
+	return mux
+}
+
+// hookRelayEnds makes sessions svc ends (an org turning remote control off)
+// close on the amp-relay replica holding them.
+// grantRelayRole applies amp-relay's grants (repository.GrantRelayRole),
+// retrying until the role exists and the grants succeed, or ctx ends.
+func grantRelayRole(ctx context.Context, repo *repository.Repo, role string) {
+	wait := 5 * time.Second
+	for {
+		err := repo.GrantRelayRole(ctx, role)
+		if err == nil {
+			slog.Info("amp-relay's database role has its grants", "role", role)
+			return
+		}
+		if errors.Is(err, repository.ErrNoSuchRole) {
+			slog.Info("amp-relay's database role doesn't exist yet; trying again", "role", role, "in", wait)
+		} else {
+			slog.Warn("granting amp-relay's database role failed; trying again", "role", role, "err", err, "in", wait)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		if wait < 2*time.Minute {
+			wait *= 2
+		}
+	}
+}
+
+func hookRelayEnds(svc *service.Service, repo *repository.Repo, node *cluster.Node) {
+	ttl := time.Duration(0)
+	if node != nil {
+		ttl = node.TTL()
+	}
+	svc.OnRemoteEnded = relayctl.NewEndNotifier(repo, ttl).Notify
+}
+
 // appPublicURL is AMP's public address, for links to pages in the UI:
 // APP_PUBLIC_URL, or MCP_PUBLIC_URL without its /mcp path. Empty when
 // neither is set (local dev), and links are left out.
@@ -500,4 +569,18 @@ func kbReconcileInterval() time.Duration {
 		return def
 	}
 	return d
+}
+
+// remoteConfig is the instance's remote control configuration (epic 165).
+// RELAY_ENABLED (Helm relay.enabled, which also deploys amp-relay) says a
+// relay is deployed, so /api/me can offer remote control; off unless set to
+// true, and never on with auth off (OIDC_ISSUER_URL empty: compose and local
+// dev, where every caller is a global admin). It turns no route on here.
+func remoteConfig() service.RemoteConfig {
+	on, _ := strconv.ParseBool(strings.TrimSpace(os.Getenv("RELAY_ENABLED")))
+	cfg := service.RemoteConfig{InstanceEnabled: on, AuthEnabled: os.Getenv("OIDC_ISSUER_URL") != ""}
+	if cfg.InstanceEnabled && !cfg.AuthEnabled {
+		slog.Warn("RELAY_ENABLED is set but auth is off (no OIDC_ISSUER_URL): remote control stays unavailable")
+	}
+	return cfg
 }

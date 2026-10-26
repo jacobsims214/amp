@@ -9,7 +9,7 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::conn::{CliError, ConnArgs, connect, print_json};
+use crate::conn::{CliError, ConnArgs, connect_cli, print_json};
 
 #[derive(Subcommand)]
 pub enum TicketsCommand {
@@ -93,7 +93,7 @@ async fn list(args: ListArgs) -> Result<(), CliError> {
         None => "open".parse().expect("valid filter"),
     };
     let settings = args.conn.settings()?;
-    let client = connect(&settings).await?;
+    let client = connect_cli(&settings).await?;
     let mut params = json!({"project_id": project_id, "format": "full"});
     if let Some(owner) = &args.owner {
         params["owner"] = json!(owner);
@@ -258,7 +258,7 @@ async fn get(args: GetArgs) -> Result<(), CliError> {
         .filter(|id| *id > 0)
         .ok_or_else(|| CliError::usage(format!("not a ticket id: {:?}", args.id)))?;
     let settings = args.conn.settings()?;
-    let client = connect(&settings).await?;
+    let client = connect_cli(&settings).await?;
     let mut params = json!({"task_id": id});
     if args.comments {
         params["include"] = json!(["comments"]);

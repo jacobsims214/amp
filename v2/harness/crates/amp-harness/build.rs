@@ -1,7 +1,9 @@
 //! Stamps the resolved rpi and rmcp versions from the workspace Cargo.lock into the binary, so
-//! `amp-harness --version` reports what was actually linked (D11), not a hand-copied string.
+//! `amp-harness --version` reports what was actually linked (D11), not a hand-copied string. It also
+//! stamps the commit that last changed the embedded agent/skill assets (`AMP_ASSETS_COMMIT`), with
+//! `-dirty` when the working tree has uncommitted asset changes, or `unknown` without git.
 
-use std::{env, fs, path::PathBuf};
+use std::{env, fs, path::Path, path::PathBuf, process::Command};
 
 /// Crates whose resolved versions `--version` reports, and the env var each is exported as.
 const PINNED: &[(&str, &str)] = &[
@@ -23,6 +25,59 @@ fn main() {
         let version = locked_version(&contents, name).unwrap_or_else(|| "unknown".to_string());
         println!("cargo::rustc-env={var}={version}");
     }
+
+    let assets = manifest_dir.join("../../assets");
+    println!("cargo::rerun-if-changed={}", assets.display());
+    // A new commit (or checkout) changes the worktree's HEAD log; rebuild the stamp then too.
+    if let Some(log) = git(
+        &manifest_dir,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "logs/HEAD",
+        ],
+    ) && Path::new(&log).exists()
+    {
+        println!("cargo::rerun-if-changed={log}");
+    }
+    println!(
+        "cargo::rustc-env=AMP_ASSETS_COMMIT={}",
+        assets_commit(&manifest_dir)
+    );
+}
+
+/// The short commit that last touched `v2/harness/assets`, `-dirty` when it has local changes.
+fn assets_commit(manifest_dir: &Path) -> String {
+    let Some(commit) = git(
+        manifest_dir,
+        &["log", "-1", "--format=%h", "--", "../../assets"],
+    )
+    .filter(|c| !c.is_empty()) else {
+        return "unknown".to_owned();
+    };
+    let dirty = git(
+        manifest_dir,
+        &["status", "--porcelain", "--", "../../assets"],
+    )
+    .is_some_and(|s| !s.is_empty());
+    if dirty {
+        format!("{commit}-dirty")
+    } else {
+        commit
+    }
+}
+
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
 /// Finds `version` for the `[[package]]` named `name` in a Cargo.lock. Assumes one version of each

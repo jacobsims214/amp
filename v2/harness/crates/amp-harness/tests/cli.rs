@@ -6,6 +6,10 @@ mod common;
 use common::{MockAmp, run, spawn, workdir};
 use serde_json::{Value, json};
 
+/// doctor's model-side checks need a key for the manager's provider (the shipped roster is all
+/// OpenRouter); `--offline` keeps them off the network. A fake value: it must never be printed.
+const OR_KEY: (&str, &str) = ("OPENROUTER_API_KEY", "sk-or-FAKE-not-printed");
+
 fn row(id: i64, name: &str, status: &str, label: &str, state: &str, extra: Value) -> Value {
     let mut r = json!({
         "id": id, "name": name, "status": status, "status_label": label, "state": state,
@@ -339,9 +343,9 @@ async fn mcp_call_prints_json_text_raw_and_errors() {
     assert_eq!(out.code, 2);
     assert!(out.stderr.contains("JSON object"), "{}", out.stderr);
 
-    // Hidden from --help.
+    // #2243: the `mcp` group is no longer hidden (it manages MCP servers now).
     let out = run(&dir, &amp.url, &["--help"], &[]).await;
-    assert!(!out.stdout.contains("\n  mcp "), "{}", out.stdout);
+    assert!(out.stdout.contains("\n  mcp "), "{}", out.stdout);
     assert!(out.stdout.contains("doctor") && out.stdout.contains("tickets"));
 }
 
@@ -358,7 +362,7 @@ async fn mcp_tools_lists_the_catalog() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names.len(), common::CONTRACT.len() + 2);
+    assert_eq!(names.len(), common::CONTRACT.len() + 3);
     assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted: {names:?}");
 }
 
@@ -368,11 +372,92 @@ async fn doctor_json_is_pinned() {
     let dir = workdir("doctor-json", Some(2));
     let creds = dir.join("home/.config/amp-harness/credentials.json");
     let marker = dir.join("project/.amp.json");
+    // A marker made for this server (#2206: one made for another server is a warning).
+    std::fs::write(
+        &marker,
+        json!({"project_id": 2, "project_name": "AMP v2",
+               "amp_api": amp.url.trim_end_matches("/mcp")})
+        .to_string(),
+    )
+    .unwrap();
 
-    let out = run(&dir, &amp.url, &["doctor", "--json"], &[]).await;
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
     assert_eq!(out.code, 0, "{}\n{}", out.stdout, out.stderr);
+    assert!(!out.stdout.contains(OR_KEY.1));
+    let mut v = out.json();
+    // Build-dependent parts are checked here, the rest is pinned in full below.
+    let versions = v.as_object_mut().unwrap().remove("versions").unwrap();
+    assert_eq!(versions["harness"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(versions["mcp_protocol"], "2026-07-28");
+    assert!(versions["rmcp"].as_str().unwrap().starts_with("3."));
+    assert!(
+        versions["assets_commit"]
+            .as_str()
+            .is_some_and(|c| !c.is_empty())
+    );
+    assert_eq!(versions["assets_source_sha256"].as_str().unwrap().len(), 64);
+    let models = v.as_object_mut().unwrap().remove("models").unwrap();
+    assert_eq!(models["mode"], "profile");
+    assert_eq!(models["selection"], "opencode");
+    assert_eq!(models["config_found"], false);
+    assert_eq!(models["providers"][0]["id"], "openrouter");
+    assert_eq!(models["providers"][0]["key"], "env");
     assert_eq!(
-        out.json(),
+        models["providers"][0]["key_source"],
+        "env OPENROUTER_API_KEY"
+    );
+    assert_eq!(models["providers"][0]["catalog_checked"], false);
+    let checks = v["checks"].as_array_mut().unwrap();
+    let model_checks: Vec<Value> = checks.drain(9..).collect();
+    let tail: Vec<(&str, &str)> = model_checks
+        .iter()
+        .map(|c| (c["name"].as_str().unwrap(), c["status"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            ("roles", "ok"),
+            ("fallback", "ok"),
+            ("key:openrouter", "ok"),
+            ("models:openrouter", "skip"),
+            // #2246: MCP servers (none here), skills, agents and the rest of `config check`.
+            ("mcp", "skip"),
+            ("skills", "ok"),
+            ("agents", "ok"),
+            ("config-check", "ok"),
+            // #2364: where workers work in this folder (never a failure).
+            ("workspace", "ok")
+        ]
+    );
+    assert_eq!(model_checks[2]["detail"], "key from env OPENROUTER_API_KEY");
+    let versions_check = checks[4]["detail"].as_str().unwrap().to_owned();
+    assert!(
+        versions_check.starts_with(&format!("harness {}, rpi ", env!("CARGO_PKG_VERSION")))
+            && versions_check.ends_with(", MCP 2026-07-28"),
+        "{versions_check}"
+    );
+    checks[4]["detail"] = json!("<versions>");
+    let obj = v.as_object_mut().unwrap();
+    let mcp = obj.remove("mcp").unwrap();
+    assert_eq!(
+        mcp,
+        json!({"servers": [], "broken": [], "shadowed": [], "ready": 0, "checked": 0})
+    );
+    let agents = obj.remove("agents").unwrap();
+    assert!(agents["count"].as_u64().unwrap() > 0, "{agents}");
+    assert_eq!(agents["custom"], json!([]));
+    assert_eq!(agents["problems"], json!([]));
+    let skills = obj.remove("skills").unwrap();
+    assert!(skills["count"].as_u64().unwrap() > 0, "{skills}");
+    assert_eq!(skills["custom"], json!([]));
+    assert_eq!(
+        v,
         json!({
             "ok": true,
             "harness_version": env!("CARGO_PKG_VERSION"),
@@ -393,23 +478,30 @@ async fn doctor_json_is_pinned() {
                 "server_name": "amp-mock", "server_version": "1.2.3",
                 "instructions": true, "error": null
             },
-            "tools": {"count": common::CONTRACT.len() + 2, "missing_contract": []},
+            "tools": {"count": common::CONTRACT.len() + 3, "missing_contract": []},
             "whoami": {"user_id": 7, "email": "local-dev@example.com", "account": "human"},
             "project": {
                 "marker": marker.display().to_string(), "id": 2, "name": "AMP v2",
-                "marker_name": "AMP v2", "found": true
+                "marker_name": "AMP v2", "found": true, "warning": null
+            },
+            "ca": {
+                "trust": "none", "file": null, "file_source": null, "certificates": [],
+                "tls_error": null
             },
             "checks": [
-                {"name": "config", "status": "ok", "detail": format!("server {}", amp.url)},
+                {"name": "config", "status": "ok", "detail": format!("server {}", amp.url), "fix": null},
                 {"name": "credentials", "status": "warn", "detail": format!(
-                    "no OS keychain; logins are kept in file {} (mode 0600)", creds.display())},
+                    "no OS keychain; logins are kept in file {} (mode 0600)", creds.display()),
+                 "fix": "unset AMP_CREDENTIAL_STORE to keep logins in the OS keychain instead"},
+                {"name": "ca", "status": "skip", "detail": "plain http: no TLS", "fix": null},
                 {"name": "connect", "status": "ok",
-                 "detail": "MCP 2026-07-28 (stateless), server amp-mock 1.2.3"},
-                {"name": "tools", "status": "ok", "detail": format!("{} tools", common::CONTRACT.len() + 2)},
-                {"name": "contract", "status": "ok", "detail": "all 15 contract tools present"},
-                {"name": "whoami", "status": "ok", "detail": "local-dev@example.com (user 7)"},
+                 "detail": "MCP 2026-07-28 (stateless), server amp-mock 1.2.3", "fix": null},
+                {"name": "versions", "status": "ok", "detail": "<versions>", "fix": null},
+                {"name": "tools", "status": "ok", "detail": format!("{} tools", common::CONTRACT.len() + 3), "fix": null},
+                {"name": "contract", "status": "ok", "detail": "all 15 contract tools present", "fix": null},
+                {"name": "whoami", "status": "ok", "detail": "local-dev@example.com (user 7)", "fix": null},
                 {"name": "project", "status": "ok",
-                 "detail": format!("#2 AMP v2 (from {})", marker.display())}
+                 "detail": format!("#2 AMP v2 (from {})", marker.display()), "fix": null}
             ]
         })
     );
@@ -426,7 +518,13 @@ async fn doctor_reports_legacy_fallback_and_forced_protocol() {
     )
     .await;
     let dir = workdir("doctor-legacy", None);
-    let out = run(&dir, &amp.url, &["doctor", "--json"], &[]).await;
+    let out = run(
+        &dir,
+        &amp.url,
+        &["doctor", "--json", "--offline"],
+        &[OR_KEY],
+    )
+    .await;
     assert_eq!(out.code, 0, "{}", out.stdout);
     let v = out.json();
     assert_eq!(v["connection"]["protocol_version"], "2025-11-25");
@@ -446,8 +544,8 @@ async fn doctor_reports_legacy_fallback_and_forced_protocol() {
     let out = run(
         &dir,
         &modern.url,
-        &["doctor", "--json", "--protocol", "2025-11-25"],
-        &[],
+        &["doctor", "--json", "--offline", "--protocol", "2025-11-25"],
+        &[OR_KEY],
     )
     .await;
     let v = out.json();
@@ -477,15 +575,24 @@ async fn doctor_reports_missing_contract_tools() {
         json!(["amp_report_run", "amp_kb_write"])
     );
 
-    let out = run(&dir, &amp.url, &["doctor"], &[]).await;
+    let out = run(&dir, &amp.url, &["doctor", "--offline"], &[OR_KEY]).await;
     assert_eq!(out.code, 1);
+    let line = out
+        .stdout
+        .lines()
+        .find(|l| l.contains("[FAIL] contract"))
+        .unwrap_or_else(|| panic!("{}", out.stdout));
+    assert!(
+        line.ends_with(" missing: amp_report_run, amp_kb_write"),
+        "{line}"
+    );
     assert!(
         out.stdout
-            .contains("[FAIL] contract    missing: amp_report_run, amp_kb_write"),
+            .contains("fix: this AMP server (1.2.3) lacks tools"),
         "{}",
         out.stdout
     );
-    assert!(out.stdout.contains("Failed: contract"), "{}", out.stdout);
+    assert!(out.stdout.contains("Failed: contract\n"), "{}", out.stdout);
 }
 
 #[tokio::test]
@@ -500,6 +607,18 @@ async fn doctor_with_a_static_token_never_prints_it() {
     let v = out.json();
     assert_eq!(v["connection"]["reachable"], true);
     assert_eq!(v["connection"]["connected"], false);
+    let connect = &v["checks"][3];
+    assert_eq!(
+        (&connect["name"], &connect["status"]),
+        (&json!("connect"), &json!("fail"))
+    );
+    assert_eq!(
+        connect["fix"],
+        format!(
+            "run `amp-harness login --url {}` (or export AMP_TOKEN=<token from the AMP web UI>)",
+            amp.url
+        )
+    );
     let out = run(&dir, &amp.url, &["doctor"], &[]).await;
     assert!(
         out.stdout.contains("Hint: run `amp-harness login`"),
@@ -508,11 +627,21 @@ async fn doctor_with_a_static_token_never_prints_it() {
     );
     let out = run(&dir, &amp.url, &["whoami"], &[]).await;
     assert_eq!(out.code, 1);
-    assert!(out.stderr.contains("AMP login required"), "{}", out.stderr);
+    // #2178: one plain sentence with the next step.
+    assert!(
+        out.stderr
+            .contains("needs you to log in (401). Run `amp-harness login --url"),
+        "{}",
+        out.stderr
+    );
 
     // With it: connected, described by its source only.
-    for args in [&["doctor", "--json"][..], &["doctor"][..], &["whoami"][..]] {
-        let out = run(&dir, &amp.url, args, &[("AMP_TOKEN", TOKEN)]).await;
+    for args in [
+        &["doctor", "--json", "--offline"][..],
+        &["doctor", "--offline"][..],
+        &["whoami"][..],
+    ] {
+        let out = run(&dir, &amp.url, args, &[("AMP_TOKEN", TOKEN), OR_KEY]).await;
         assert_eq!(out.code, 0, "{args:?}: {}{}", out.stdout, out.stderr);
         assert!(
             out.stdout.contains("static token (env AMP_TOKEN)"),
@@ -524,8 +653,8 @@ async fn doctor_with_a_static_token_never_prints_it() {
     let out = run(
         &dir,
         &amp.url,
-        &["doctor", "--json"],
-        &[("AMP_TOKEN", TOKEN)],
+        &["doctor", "--json", "--offline"],
+        &[("AMP_TOKEN", TOKEN), OR_KEY],
     )
     .await;
     let v = out.json();
@@ -559,12 +688,40 @@ async fn doctor_fails_cleanly_when_nothing_answers() {
         [
             ("config", "ok"),
             ("credentials", "warn"),
+            ("ca", "skip"),
             ("connect", "fail"),
+            ("versions", "ok"),
             ("tools", "skip"),
             ("contract", "skip"),
             ("whoami", "skip"),
-            ("project", "skip")
+            ("project", "skip"),
+            // The model side still runs: no OpenRouter key for the manager.
+            ("roles", "ok"),
+            ("fallback", "ok"),
+            ("key:openrouter", "fail"),
+            ("models:openrouter", "skip"),
+            // #2246: and the configuration checks.
+            ("mcp", "skip"),
+            ("skills", "ok"),
+            ("agents", "ok"),
+            ("config-check", "ok"),
+            // #2364: where workers work in this folder (never a failure).
+            ("workspace", "ok")
         ]
+    );
+    let fix = v["checks"][3]["fix"].as_str().unwrap();
+    // #2164: AMP_MCP_URL named the server: unset it, or switch with `amp-harness server`.
+    assert!(
+        fix.contains("unset AMP_MCP_URL") && fix.contains("amp-harness server set"),
+        "{fix}"
+    );
+    assert!(
+        v["checks"][11]["fix"]
+            .as_str()
+            .unwrap()
+            .starts_with("set OPENROUTER_API_KEY in the environment"),
+        "{}",
+        v["checks"][11]
     );
 
     // A bad URL fails at config.

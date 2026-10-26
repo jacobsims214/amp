@@ -5,9 +5,12 @@
 //! 1. the shipped defaults, [`DEFAULTS_TOML`] (`crates/amp-core/models.toml`): the Anthropic and
 //!    OpenRouter providers, their models, the opencode roster as `[roles.*]` and the alternative
 //!    `[profiles.anthropic]`;
-//! 2. the user's `config.toml` (`$XDG_CONFIG_HOME/amp-harness/config.toml`, else
-//!    `~/.config/amp-harness/config.toml`). Its `[providers.*]`, `[roles.*]` and `[profiles.*]` are
-//!    merged over the defaults, and its `[models]` table picks the assignment mode.
+//! 2. the user's `config.toml` (`--config`, `AMP_HARNESS_CONFIG`, `--config-dir`, else
+//!    `$XDG_CONFIG_HOME/amp-harness/config.toml`, else `~/.config/amp-harness/config.toml`; see
+//!    [`amp_mcp::config_paths`]). Its `[providers.*]`, `[roles.*]` and `[profiles.*]` are merged
+//!    over the defaults, and its `[models]` table picks the assignment mode;
+//! 3. the repo's `<repo>/.amp/harness/config.toml` ([`crate::repo_config`]): only `[roles.*]` and
+//!    `[models] profile`, merged over the user file.
 //!
 //! There is no default provider. Each role names its own `provider/model` (the model id may contain
 //! `/`, e.g. `openrouter/xiaomi/mimo-v2.6-pro`; the provider is everything before the first `/`).
@@ -16,10 +19,11 @@
 //! 1. `[roles.<role>]` in the defaults (the opencode roster);
 //! 2. the selected profile's `[profiles.<name>.roles.<role>]`, or, in inherit mode, the one
 //!    `[models] inherit = "provider/model"` for every role;
-//! 3. `[roles.<role>]` in config.toml.
+//! 3. `[roles.<role>]` in config.toml;
+//! 4. `[roles.<role>]` in the repo config.
 //!
-//! The mode comes from `AMP_HARNESS_PROFILE`, then `[models] profile`, then `opencode` (the defaults
-//! as shipped). `inherit` is a mode, not a profile name.
+//! The mode comes from `AMP_HARNESS_PROFILE`, then the repo's `[models] profile`, then the user's,
+//! then `opencode` (the defaults as shipped). `inherit` is a mode, not a profile name.
 //!
 //! When a layer changes a role's `model`, the `extra_body` of the layers below is dropped (it was
 //! written for the other model), while `thinking` carries over unless the layer sets it too.
@@ -40,6 +44,8 @@ use rpi_ai::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::repo_config::RepoConfig;
+
 /// The shipped defaults (embedded).
 pub const DEFAULTS_TOML: &str = include_str!("../models.toml");
 /// Overrides `[models] profile` (handy for one run, CI and the smoke test).
@@ -50,6 +56,9 @@ pub const DEFAULT_PROFILE: &str = "opencode";
 pub const INHERIT: &str = "inherit";
 /// Thinking level for a role that names none (and whose model reasons).
 pub const DEFAULT_THINKING: ThinkingLevel = ThinkingLevel::Medium;
+/// The role whose model an unconfigured role falls back to, unless `[models] fallback` says
+/// otherwise (#2234, D11).
+pub const DEFAULT_FALLBACK_ROLE: &str = "worker-backend";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelsError(pub String);
@@ -95,20 +104,64 @@ pub struct ModelsSection {
     pub inherit: Option<String>,
     /// Thinking level for every role in inherit mode.
     pub inherit_thinking: Option<String>,
+    /// The model a role with no `[roles.<id>]` runs on when its agent file names no usable model
+    /// and no `based_on` role (#2234, D11): a role name (`worker-backend`, the default) or a
+    /// `provider/model`.
+    pub fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderSpec {
+    /// Display name (`amp-harness connect --list`, the chat). Default: the id.
+    pub name: Option<String>,
     /// `anthropic-messages`, `openai-completions` or `faux` (scripted, offline; tests and smoke).
     pub api: Option<String>,
     pub base_url: Option<String>,
     /// Environment variable holding the key. The keychain is the fallback.
     pub key_env: Option<String>,
-    /// `key` (default for HTTP providers) or `none` (local endpoints that take no key).
+    /// How requests authenticate (#2277): `bearer` (default; `key` is the same), `header` (the key
+    /// in `auth_header`, e.g. Azure OpenAI's `api-key`), `none`, `command` (a token printed by
+    /// `auth_command`), `oauth-client-credentials` or `azure-entra`. See [`ProviderAuth`].
     pub auth: Option<String>,
+    /// `auth = "header"`: the header the key goes in (default `api-key`).
+    pub auth_header: Option<String>,
+    /// `auth = "command"` (or `azure-entra` with your own helper): the program and its arguments.
+    /// It prints a token, or JSON `{"token"|"access_token"|"accessToken", "expires_in"|"expires_on"}`.
+    pub auth_command: Option<Vec<String>>,
+    /// How long `auth_command` may run (default 30 s).
+    pub auth_command_timeout_secs: Option<u64>,
+    /// `auth = "oauth-client-credentials"`: the token endpoint.
+    pub token_url: Option<String>,
+    /// OAuth / Entra client id (not a secret; the client secret is the provider's key).
+    pub client_id: Option<String>,
+    /// OAuth scopes (Entra default: `https://cognitiveservices.azure.com/.default`).
+    pub scopes: Option<Vec<String>>,
+    /// `auth = "azure-entra"`: the Microsoft Entra tenant (with `client_id`: client credentials;
+    /// without: `az account get-access-token`).
+    pub tenant_id: Option<String>,
+    /// Entra authority (default `https://login.microsoftonline.com`; sovereign clouds differ).
+    pub authority_host: Option<String>,
+    /// OpenAI's `OpenAI-Organization` header.
+    pub organization: Option<String>,
+    /// OpenAI's `OpenAI-Project` header.
+    pub project: Option<String>,
+    /// Query parameters on every request, e.g. `{ "api-version" = "2024-10-21" }` (Azure OpenAI).
+    pub query: Option<BTreeMap<String, String>>,
+    /// PEM bundle of extra CA certificates for this endpoint (added to the OS trust store).
+    pub ca_file: Option<String>,
+    /// mTLS: the client certificate (PEM; may also hold the key).
+    pub client_cert: Option<String>,
+    /// mTLS: the client key file (PEM). Left out: the cert file's key, else the keychain
+    /// (`provider:<id>:client-key`).
+    pub client_key: Option<String>,
+    /// Proxy for this endpoint (`http://proxy:3128`), or `direct`. Default: HTTPS_PROXY/NO_PROXY.
+    pub proxy: Option<String>,
     /// Extra HTTP headers on every request.
     pub headers: Option<BTreeMap<String, String>>,
+    /// Headers whose values are secrets: kept in the OS keychain (account
+    /// `provider:<id>:header:<name>`, written by `amp-harness connect`), never in a file.
+    pub secret_headers: Option<Vec<String>>,
     pub connect_timeout_secs: Option<u64>,
     /// Time to the first streamed event. 0 turns it off.
     pub header_timeout_secs: Option<u64>,
@@ -158,7 +211,7 @@ pub struct CostSpec {
     pub cache_write: f64,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoleSpec {
     /// `provider/model`.
@@ -220,11 +273,31 @@ fn over_table(base: &mut Option<toml::Table>, top: Option<toml::Table>) {
 }
 
 fn merge_provider(base: &mut ProviderSpec, top: ProviderSpec) {
+    over(&mut base.name, top.name);
     over(&mut base.api, top.api);
     over(&mut base.base_url, top.base_url);
     over(&mut base.key_env, top.key_env);
     over(&mut base.auth, top.auth);
+    over(&mut base.auth_header, top.auth_header);
+    over(&mut base.auth_command, top.auth_command);
+    over(
+        &mut base.auth_command_timeout_secs,
+        top.auth_command_timeout_secs,
+    );
+    over(&mut base.token_url, top.token_url);
+    over(&mut base.client_id, top.client_id);
+    over(&mut base.scopes, top.scopes);
+    over(&mut base.tenant_id, top.tenant_id);
+    over(&mut base.authority_host, top.authority_host);
+    over(&mut base.organization, top.organization);
+    over(&mut base.project, top.project);
+    over_map(&mut base.query, top.query);
+    over(&mut base.ca_file, top.ca_file);
+    over(&mut base.client_cert, top.client_cert);
+    over(&mut base.client_key, top.client_key);
+    over(&mut base.proxy, top.proxy);
     over_map(&mut base.headers, top.headers);
+    over(&mut base.secret_headers, top.secret_headers);
     over(&mut base.connect_timeout_secs, top.connect_timeout_secs);
     over(&mut base.header_timeout_secs, top.header_timeout_secs);
     over(
@@ -305,7 +378,7 @@ pub enum ProviderApi {
 }
 
 impl ProviderApi {
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "anthropic-messages" | "anthropic" => Some(Self::AnthropicMessages),
             "openai-completions" | "openai-compatible" => Some(Self::OpenaiCompletions),
@@ -340,6 +413,381 @@ pub struct Timeouts {
     pub request: Option<Duration>,
 }
 
+/// How a provider's requests authenticate (#2277). Secrets are never here: the API key or client
+/// secret is the provider's key (`key_env`, else the keychain), tokens live in memory only.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ProviderAuth {
+    /// `Authorization: Bearer <key>` (Anthropic Messages: `x-api-key`). `auth = "bearer"` / `"key"`.
+    #[default]
+    Bearer,
+    /// The key in a header of its own (`auth_header`, default `api-key`).
+    Header { name: String },
+    /// No credentials.
+    None,
+    /// A token printed by a program, sent as a bearer token; re-run at expiry and once on 401.
+    Command {
+        argv: Vec<String>,
+        timeout: Duration,
+    },
+    /// OAuth 2.0 client credentials (client secret = the provider's key), sent as a bearer token.
+    ClientCredentials {
+        token_url: String,
+        client_id: String,
+        scopes: Vec<String>,
+    },
+    /// Microsoft Entra ID: client credentials against the tenant's token endpoint, or a command
+    /// (`az account get-access-token` by default).
+    AzureEntra(Box<ProviderAuth>),
+}
+
+impl ProviderAuth {
+    /// The `auth` word it was configured with.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Bearer => "bearer",
+            Self::Header { .. } => "header",
+            Self::None => "none",
+            Self::Command { .. } => "command",
+            Self::ClientCredentials { .. } => "oauth-client-credentials",
+            Self::AzureEntra(_) => "azure-entra",
+        }
+    }
+
+    /// Whether the provider's key (API key or client secret) is needed.
+    pub fn needs_key(&self) -> bool {
+        match self {
+            Self::Bearer | Self::Header { .. } | Self::ClientCredentials { .. } => true,
+            Self::None | Self::Command { .. } => false,
+            Self::AzureEntra(inner) => inner.needs_key(),
+        }
+    }
+
+    /// Whether requests carry a short-lived token (fetched, cached, refreshed).
+    pub fn is_token(&self) -> bool {
+        matches!(
+            self,
+            Self::Command { .. } | Self::ClientCredentials { .. } | Self::AzureEntra(_)
+        )
+    }
+
+    /// What the key is called in prompts and messages.
+    pub fn key_word(&self) -> &'static str {
+        if matches!(self, Self::ClientCredentials { .. } | Self::AzureEntra(_)) {
+            "client secret"
+        } else {
+            "key"
+        }
+    }
+
+    /// One line for people (doctor, connect --list): never a secret.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Bearer => "bearer key".to_owned(),
+            Self::Header { name } => format!("key in the {name} header"),
+            Self::None => "none".to_owned(),
+            Self::Command { argv, .. } => format!(
+                "token from `{}`",
+                argv.first().map(String::as_str).unwrap_or("")
+            ),
+            Self::ClientCredentials {
+                token_url,
+                client_id,
+                ..
+            } => format!("OAuth client credentials ({client_id} at {token_url})"),
+            Self::AzureEntra(inner) => match inner.as_ref() {
+                Self::ClientCredentials { client_id, .. } => {
+                    format!("Microsoft Entra ID (client {client_id})")
+                }
+                other => format!("Microsoft Entra ID, {}", other.describe()),
+            },
+        }
+    }
+}
+
+/// The Entra scope for Azure OpenAI / AI Foundry.
+pub const ENTRA_COGNITIVE_SCOPE: &str = "https://cognitiveservices.azure.com/.default";
+/// The public-cloud Entra authority.
+pub const ENTRA_AUTHORITY: &str = "https://login.microsoftonline.com";
+/// Default bound on `auth_command`.
+pub const DEFAULT_AUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The command `auth = "azure-entra"` runs when no client id is configured.
+pub fn az_cli_command(scope: &str) -> Vec<String> {
+    [
+        "az",
+        "account",
+        "get-access-token",
+        "--scope",
+        scope,
+        "--output",
+        "json",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect()
+}
+
+/// A provider's TLS settings (#2277). Paths only; key material in the keychain is read when the
+/// HTTP client is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderTls {
+    pub ca_file: Option<PathBuf>,
+    pub client_cert: Option<PathBuf>,
+    pub client_key: Option<PathBuf>,
+}
+
+impl ProviderTls {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A provider's `proxy`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProxySetting {
+    /// `http(s)://host:port`
+    Url(String),
+    /// `direct`: no proxy, whatever HTTPS_PROXY says.
+    Direct,
+}
+
+fn expand_home(path: &str) -> PathBuf {
+    match path.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(path)),
+        None => PathBuf::from(path),
+    }
+}
+
+fn nonempty(value: Option<String>) -> Option<String> {
+    value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
+}
+
+fn https_or_local(url: &str, what: &str) -> Result<(), String> {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    if let Some(rest) = lower.strip_prefix("http://") {
+        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+        let name = if host.starts_with('[') {
+            host.split(']')
+                .next()
+                .unwrap_or(host)
+                .trim_start_matches('[')
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
+        if matches!(name, "localhost" | "127.0.0.1" | "::1") {
+            return Ok(());
+        }
+    }
+    Err(format!(
+        "{what} `{url}` must be https:// (plain http only to localhost)"
+    ))
+}
+
+/// `auth` and its fields, checked. Every field that does not apply to the chosen auth is an error,
+/// so a typo or a leftover surfaces.
+fn build_auth(api: ProviderApi, spec: &ProviderSpec) -> Result<ProviderAuth, String> {
+    let word = spec
+        .auth
+        .as_deref()
+        .map(|a| a.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "bearer".to_owned());
+    let timeout = spec
+        .auth_command_timeout_secs
+        .filter(|s| *s > 0)
+        .map_or(DEFAULT_AUTH_COMMAND_TIMEOUT, Duration::from_secs);
+    let command = spec
+        .auth_command
+        .clone()
+        .map(|argv| {
+            argv.into_iter()
+                .map(|a| a.trim().to_owned())
+                .collect::<Vec<_>>()
+        })
+        .filter(|argv| !argv.is_empty());
+    if command.as_ref().is_some_and(|a| a[0].is_empty()) {
+        return Err("`auth_command` needs the program as its first element".to_owned());
+    }
+    let scopes: Vec<String> = spec
+        .scopes
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let client_id = nonempty(spec.client_id.clone());
+    let token_url = nonempty(spec.token_url.clone());
+    let tenant = nonempty(spec.tenant_id.clone());
+    let authority = nonempty(spec.authority_host.clone());
+    let only = |field: &str, present: bool, allowed: &[&str]| -> Result<(), String> {
+        if present && !allowed.contains(&word.as_str()) {
+            return Err(format!(
+                "`{field}` applies to auth = {} (this provider has auth = \"{word}\")",
+                allowed
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            ));
+        }
+        Ok(())
+    };
+    only("auth_header", spec.auth_header.is_some(), &["header"])?;
+    only(
+        "auth_command",
+        command.is_some(),
+        &["command", "azure-entra"],
+    )?;
+    only(
+        "auth_command_timeout_secs",
+        spec.auth_command_timeout_secs.is_some(),
+        &["command", "azure-entra"],
+    )?;
+    only(
+        "token_url",
+        token_url.is_some(),
+        &["oauth-client-credentials"],
+    )?;
+    only(
+        "client_id",
+        client_id.is_some(),
+        &["oauth-client-credentials", "azure-entra"],
+    )?;
+    only(
+        "scopes",
+        !scopes.is_empty(),
+        &["oauth-client-credentials", "azure-entra"],
+    )?;
+    only("tenant_id", tenant.is_some(), &["azure-entra"])?;
+    only("authority_host", authority.is_some(), &["azure-entra"])?;
+    Ok(match word.as_str() {
+        "bearer" | "key" => ProviderAuth::Bearer,
+        "none" => ProviderAuth::None,
+        "header" => {
+            let name = nonempty(spec.auth_header.clone()).unwrap_or_else(|| match api {
+                ProviderApi::AnthropicMessages => "x-api-key".to_owned(),
+                _ => "api-key".to_owned(),
+            });
+            if !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_".contains(c))
+            {
+                return Err(format!("`auth_header` `{name}` is not a header name"));
+            }
+            // rpi's Anthropic provider only sends a request whose auth it recognises.
+            if api == ProviderApi::AnthropicMessages
+                && !["x-api-key", "authorization", "cf-aig-authorization"]
+                    .contains(&name.to_ascii_lowercase().as_str())
+            {
+                return Err(format!(
+                    "anthropic-messages providers take the key in x-api-key, authorization or                      cf-aig-authorization, not `{name}`"
+                ));
+            }
+            ProviderAuth::Header { name }
+        }
+        "command" => ProviderAuth::Command {
+            argv: command
+                .ok_or("auth = \"command\" needs `auth_command = [\"program\", \"arg\"]`")?,
+            timeout,
+        },
+        "oauth-client-credentials" | "client-credentials" | "oauth" => {
+            let token_url =
+                token_url.ok_or("auth = \"oauth-client-credentials\" needs `token_url`")?;
+            https_or_local(&token_url, "token_url")?;
+            ProviderAuth::ClientCredentials {
+                token_url,
+                client_id: client_id
+                    .ok_or("auth = \"oauth-client-credentials\" needs `client_id`")?,
+                scopes,
+            }
+        }
+        "azure-entra" | "entra" | "azure-ad" => {
+            let scopes = if scopes.is_empty() {
+                vec![ENTRA_COGNITIVE_SCOPE.to_owned()]
+            } else {
+                scopes
+            };
+            let inner = match (command, tenant, client_id) {
+                (Some(argv), None, None) => ProviderAuth::Command { argv, timeout },
+                (Some(_), _, _) => {
+                    return Err(
+                        "azure-entra: use either `auth_command` or `tenant_id` + `client_id`"
+                            .to_owned(),
+                    );
+                }
+                (None, Some(tenant), Some(client_id)) => {
+                    let authority = authority.unwrap_or_else(|| ENTRA_AUTHORITY.to_owned());
+                    https_or_local(&authority, "authority_host")?;
+                    ProviderAuth::ClientCredentials {
+                        token_url: format!(
+                            "{}/{tenant}/oauth2/v2.0/token",
+                            authority.trim_end_matches('/')
+                        ),
+                        client_id,
+                        scopes,
+                    }
+                }
+                (None, None, None) => ProviderAuth::Command {
+                    argv: az_cli_command(&scopes[0]),
+                    timeout,
+                },
+                (None, _, _) => {
+                    return Err(
+                        "azure-entra client credentials need both `tenant_id` and `client_id`                          (or neither, to use `az account get-access-token`)"
+                            .to_owned(),
+                    );
+                }
+            };
+            ProviderAuth::AzureEntra(Box::new(inner))
+        }
+        other => {
+            return Err(format!(
+                "unknown auth `{other}` (bearer, header, none, command, oauth-client-credentials,                  azure-entra)"
+            ));
+        }
+    })
+}
+
+fn build_proxy(proxy: Option<String>) -> Result<Option<ProxySetting>, String> {
+    let Some(proxy) = nonempty(proxy) else {
+        return Ok(None);
+    };
+    if matches!(
+        proxy.to_ascii_lowercase().as_str(),
+        "direct" | "none" | "off"
+    ) {
+        return Ok(Some(ProxySetting::Direct));
+    }
+    let lower = proxy.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return Err(format!(
+            "`proxy` must be an http:// or https:// URL, or \"direct\" (SOCKS and PAC are not supported), not `{proxy}`"
+        ));
+    }
+    let authority = proxy
+        .split_once("://")
+        .map_or("", |(_, r)| r)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    if let Some((userinfo, _)) = authority.rsplit_once('@')
+        && userinfo.contains(':')
+    {
+        return Err(
+            "`proxy` holds a password: config files never hold secrets. Put the proxy URL with \
+             its credentials in HTTPS_PROXY instead"
+                .to_owned(),
+        );
+    }
+    Ok(Some(ProxySetting::Url(proxy)))
+}
+
 fn secs(value: Option<u64>) -> Option<Duration> {
     value.filter(|s| *s > 0).map(Duration::from_secs)
 }
@@ -347,11 +795,27 @@ fn secs(value: Option<u64>) -> Option<Duration> {
 #[derive(Debug, Clone)]
 pub struct ProviderConfig {
     pub id: String,
+    /// Display name, if the config gives one.
+    pub name: Option<String>,
     pub api: ProviderApi,
     pub base_url: String,
     pub key_env: Option<String>,
-    /// False for `auth = "none"` and faux.
+    /// True when the provider needs its key (`key_env` / keychain `provider:<id>`): bearer and
+    /// header auth (the API key), OAuth client credentials and Entra client credentials (the client
+    /// secret). False for `none`, `command`, Entra through `az`, and faux.
     pub needs_key: bool,
+    /// How requests authenticate (#2277).
+    pub auth: ProviderAuth,
+    /// Query parameters added to every request (#2277).
+    pub query: BTreeMap<String, String>,
+    /// CA file and mTLS identity (#2277).
+    pub tls: ProviderTls,
+    /// `proxy`: `None` follows HTTPS_PROXY/NO_PROXY.
+    pub proxy: Option<ProxySetting>,
+    /// Provider-level headers (already merged into every model's headers).
+    pub headers: BTreeMap<String, String>,
+    /// Header names whose values come from the keychain (see [`ProviderSpec::secret_headers`]).
+    pub secret_headers: Vec<String>,
     pub timeouts: Timeouts,
     pub max_retries: Option<u32>,
     /// By model id; each `Model` has `provider = id`, the provider's base URL and headers.
@@ -381,9 +845,25 @@ pub struct ModelsConfig {
     /// The config.toml looked at, and whether it exists.
     pub config_file: Option<PathBuf>,
     pub config_found: bool,
+    /// The repo config that was merged in (it existed), if any.
+    pub repo_file: Option<PathBuf>,
     /// Profiles available (shipped and user), with descriptions.
     pub profiles: BTreeMap<String, Option<String>>,
+    /// `[models] fallback` and the layer that set it; `None` means [`DEFAULT_FALLBACK_ROLE`].
+    pub fallback: Option<(String, String)>,
     roles: BTreeMap<String, RoleEntry>,
+}
+
+/// What an agent file says about its model, for roles with no `[roles.<id>]` (#2234, D11).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModelHints {
+    /// The frontmatter `model` (`provider/model`). Used only when that provider and model are
+    /// configured; opencode's ids for other setups are skipped.
+    pub model: Option<String>,
+    /// The frontmatter `variant`, used as the thinking level when it is one.
+    pub thinking: Option<String>,
+    /// The frontmatter `based_on`: the role whose model this one shares (`agents new --from`).
+    pub based_on: Option<String>,
 }
 
 /// One role's provider, model and thinking level, ready for an `AgentHarness`.
@@ -407,6 +887,29 @@ impl ResolvedRole {
     pub fn model_ref(&self) -> String {
         format!("{}/{}", self.provider, self.model_id)
     }
+
+    /// How the role got its model when it has no assignment of its own (D11's chain, #2246):
+    /// `agent file model`, `based_on <role>`, `fallback <role>` or `[models] fallback`. `None` when
+    /// the role has its own `[roles.<id>]` (or runs in inherit mode).
+    pub fn fell_back(&self) -> Option<String> {
+        let head = self.source.split(" (").next().unwrap_or_default();
+        let fell = head == "agent file model"
+            || head == "[models] fallback"
+            || head.starts_with("based_on ")
+            || head.starts_with("fallback ");
+        fell.then(|| head.to_owned())
+    }
+}
+
+/// What [`ModelsConfig::fallback`] resolves to, for display (doctor, `/model roles`).
+#[derive(Debug, Clone)]
+pub struct FallbackModel {
+    /// `[models] fallback` as written, or [`DEFAULT_FALLBACK_ROLE`].
+    pub setting: String,
+    /// Where the setting came from (`default`, `config <path>`, `inherit ...`).
+    pub source: String,
+    /// The model it resolves to (`Err` when it does not resolve).
+    pub resolved: Result<ResolvedRole, ModelsError>,
 }
 
 impl ModelsConfig {
@@ -416,12 +919,35 @@ impl ModelsConfig {
     }
 
     /// `config_path` overrides the default location; `env` is looked up for `XDG_CONFIG_HOME`,
-    /// `HOME` and `AMP_HARNESS_PROFILE`.
+    /// `HOME`, `AMP_HARNESS_CONFIG[_DIR]` and `AMP_HARNESS_PROFILE`. No repo layer: use
+    /// [`ModelsConfig::load_paths`] for that.
     pub fn load_with_env(
         env: &dyn Fn(&str) -> Option<String>,
         config_path: Option<PathBuf>,
     ) -> Result<Self, ModelsError> {
-        let path = config_path.or_else(|| amp_mcp::default_config_path(env));
+        let mut paths = amp_mcp::config_paths::current(env).with_repo(None);
+        if let Some(path) = config_path {
+            paths = paths.with_user_file(path, amp_mcp::Source::Flag);
+        }
+        Self::load_paths(env, &paths)
+    }
+
+    /// Defaults + `paths.user_file` + `paths.repo_file()` (each only if it exists). A repo file
+    /// with keys other than `[roles]`, `[mcp]` and `[models] profile` is an error. The repo's
+    /// `[roles.*]` tables and `[models] profile` count only once trusted (#2310,
+    /// [`crate::repo_trust`]; the trust store and `--trust-repo` are looked up through `env`).
+    pub fn load_paths(
+        env: &dyn Fn(&str) -> Option<String>,
+        paths: &amp_mcp::ConfigPaths,
+    ) -> Result<Self, ModelsError> {
+        let path = paths.user_file.clone();
+        let mut repo = match paths.repo_file() {
+            Some(file) => RepoConfig::load(&file)?,
+            None => None,
+        };
+        if let Some(repo) = repo.as_mut() {
+            repo.retain_trusted(&crate::repo_trust::Gate::from_env(paths, env));
+        }
         let user = match &path {
             Some(path) => ModelsFile::load(path)?,
             None => None,
@@ -431,7 +957,8 @@ impl ModelsConfig {
             .as_ref()
             .map(|p| format!("config {}", p.display()))
             .unwrap_or_else(|| "config".to_owned());
-        let mut config = Self::from_files(ModelsFile::defaults(), user, &label, env)?;
+        let mut config =
+            Self::from_layers(ModelsFile::defaults(), user, &label, repo.as_ref(), env)?;
         config.config_file = path;
         config.config_found = found;
         Ok(config)
@@ -444,7 +971,21 @@ impl ModelsConfig {
         user_label: &str,
         env: &dyn Fn(&str) -> Option<String>,
     ) -> Result<Self, ModelsError> {
+        Self::from_layers(defaults, user, user_label, None, env)
+    }
+
+    /// Merge `user` over `defaults`, then `repo` (its `[roles]` and `[models] profile`) over both.
+    /// `user_label` names the user layer in sources; the repo layer is `repo <path>`.
+    pub fn from_layers(
+        defaults: ModelsFile,
+        user: Option<ModelsFile>,
+        user_label: &str,
+        repo: Option<&RepoConfig>,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Self, ModelsError> {
         let user = user.unwrap_or_default();
+        let repo_label = repo.map(RepoConfig::label).unwrap_or_default();
+        let repo_layer = repo.map(RepoConfig::models_file).unwrap_or_default();
 
         // Providers and models.
         let mut provider_specs = defaults.providers;
@@ -483,10 +1024,15 @@ impl ModelsConfig {
 
         // Mode.
         let env_profile = env(ENV_PROFILE).filter(|s| !s.trim().is_empty());
-        let (profile, profile_source) = match (env_profile, user.models.profile.clone()) {
-            (Some(p), _) => (p.trim().to_owned(), format!("env {ENV_PROFILE}")),
-            (None, Some(p)) => (p.trim().to_owned(), user_label.to_owned()),
-            (None, None) => (DEFAULT_PROFILE.to_owned(), "default".to_owned()),
+        let (profile, profile_source) = match (
+            env_profile,
+            repo_layer.models.profile.clone(),
+            user.models.profile.clone(),
+        ) {
+            (Some(p), _, _) => (p.trim().to_owned(), format!("env {ENV_PROFILE}")),
+            (None, Some(p), _) => (p.trim().to_owned(), repo_label.clone()),
+            (None, None, Some(p)) => (p.trim().to_owned(), user_label.to_owned()),
+            (None, None, None) => (DEFAULT_PROFILE.to_owned(), "default".to_owned()),
         };
 
         let mut roles: BTreeMap<String, RoleEntry> = BTreeMap::new();
@@ -548,12 +1094,33 @@ impl ModelsConfig {
             let entry = overlay_role(roles.remove(&role), top, user_label);
             roles.insert(role, entry);
         }
+        for (role, top) in repo_layer.roles {
+            let role = normalize_role(&role).to_owned();
+            let entry = overlay_role(roles.remove(&role), top, &repo_label);
+            roles.insert(role, entry);
+        }
+
+        let fallback = user
+            .models
+            .fallback
+            .clone()
+            .map(|f| f.trim().to_owned())
+            .filter(|f| !f.is_empty())
+            .map(|f| (f, user_label.to_owned()));
+        if let Some((value, source)) = &fallback
+            && value.contains('/')
+        {
+            parse_model_ref(value)
+                .map_err(|e| ModelsError(format!("[models] fallback ({source}): {e}")))?;
+        }
 
         Ok(Self {
             providers,
             selection,
             config_file: None,
             config_found: false,
+            repo_file: repo.map(|r| r.path.clone()),
+            fallback,
             profiles: profiles
                 .into_iter()
                 .map(|(name, spec)| (name, spec.description))
@@ -562,13 +1129,139 @@ impl ModelsConfig {
         })
     }
 
+    /// Which layers set `role`'s assignment (`default`, `profile anthropic`, `config <path>`,
+    /// `config <path> + repo <path>`, ...); `None` for a role nobody configured.
+    pub fn role_source(&self, role: &str) -> Option<&str> {
+        self.roles
+            .get(normalize_role(role))
+            .map(|entry| entry.source.as_str())
+    }
+
+    /// Sets `role`'s model in memory only (the chat's `/model <role> <provider/model>`, #2245):
+    /// it wins over every layer until the process ends or the role is set again. `source` says
+    /// where it came from. No `extra_body` (that was written for another model).
+    pub fn override_role(
+        &mut self,
+        role: &str,
+        model_ref: &str,
+        thinking: Option<&str>,
+        source: &str,
+    ) -> Result<ResolvedRole, ModelsError> {
+        let role = normalize_role(role);
+        if !self.knows_model(model_ref) {
+            return err(format!(
+                "`{model_ref}` is not a configured model (`amp-harness models list --available` \
+                 lists them)"
+            ));
+        }
+        if let Some(t) = thinking {
+            parse_thinking(t)?;
+        }
+        let entry = RoleEntry {
+            spec: RoleSpec {
+                model: Some(model_ref.trim().to_owned()),
+                thinking: thinking.map(str::to_owned),
+                extra_body: None,
+            },
+            source: source.to_owned(),
+        };
+        let resolved = self.resolve_entry(role, entry.clone())?;
+        self.roles.insert(role.to_owned(), entry);
+        Ok(resolved)
+    }
+
     /// Every role with an assignment, sorted.
     pub fn role_names(&self) -> Vec<String> {
         self.roles.keys().cloned().collect()
     }
 
+    /// Whether `role` has an assignment of its own (defaults, profile, user or repo `[roles]`).
+    pub fn has_role(&self, role: &str) -> bool {
+        self.roles.contains_key(normalize_role(role))
+    }
+
+    /// Resolve an agent's role with D11's fallback chain, so a new agent always gets a model:
+    /// 1. its own assignment ([`Self::resolve_role`]: `[roles.<id>]`, repo over user over the
+    ///    defaults; or inherit mode);
+    /// 2. the agent file's `model` (and `variant` as thinking), if that provider and model are
+    ///    configured;
+    /// 3. the `based_on` role's assignment;
+    /// 4. `[models] fallback`: a role name or `provider/model` (default: [`DEFAULT_FALLBACK_ROLE`]).
+    pub fn resolve_with(
+        &self,
+        role: &str,
+        hints: &ModelHints,
+    ) -> Result<ResolvedRole, ModelsError> {
+        let role = normalize_role(role);
+        if self.roles.contains_key(role) || matches!(self.selection, Selection::Inherit { .. }) {
+            return self.resolve_role(role);
+        }
+        let thinking = hints.thinking.clone().filter(|t| parse_thinking(t).is_ok());
+        if let Some(model_ref) = hints.model.as_deref()
+            && self.knows_model(model_ref)
+        {
+            return self.resolve_entry(
+                role,
+                RoleEntry {
+                    spec: RoleSpec {
+                        model: Some(model_ref.trim().to_owned()),
+                        thinking,
+                        extra_body: None,
+                    },
+                    source: "agent file model".to_owned(),
+                },
+            );
+        }
+        if let Some(base) = hints.based_on.as_deref().map(normalize_role)
+            && base != role
+            && let Some(entry) = self.roles.get(base)
+        {
+            let mut entry = entry.clone();
+            entry.source = format!("based_on {base} ({})", entry.source);
+            return self.resolve_entry(role, entry);
+        }
+        let (value, source) = self
+            .fallback
+            .clone()
+            .unwrap_or_else(|| (DEFAULT_FALLBACK_ROLE.to_owned(), "default".to_owned()));
+        if value.contains('/') {
+            return self.resolve_entry(
+                role,
+                RoleEntry {
+                    spec: RoleSpec {
+                        model: Some(value.clone()),
+                        thinking,
+                        extra_body: None,
+                    },
+                    source: format!("[models] fallback ({source})"),
+                },
+            );
+        }
+        let base = normalize_role(&value);
+        match self.roles.get(base) {
+            Some(entry) if base != role => {
+                let mut entry = entry.clone();
+                entry.source = format!("fallback {base} ({})", entry.source);
+                self.resolve_entry(role, entry)
+            }
+            _ => err(format!(
+                "no model for role `{role}`: add [roles.{role}] model = \"provider/model\" to config.toml, or set [models] fallback (the fallback role `{base}` has no model; configured roles: {})",
+                self.role_names().join(", ")
+            )),
+        }
+    }
+
+    /// Whether `provider/model` names a configured provider and one of its models.
+    pub fn knows_model(&self, model_ref: &str) -> bool {
+        parse_model_ref(model_ref).is_ok_and(|(p, m)| {
+            self.providers
+                .get(p)
+                .is_some_and(|provider| provider.models.contains_key(m))
+        })
+    }
+
     /// Resolve one role (`amp-` prefix optional). A role nobody configured resolves only in inherit
-    /// mode.
+    /// mode; agents should use [`Self::resolve_with`], which falls back.
     pub fn resolve_role(&self, role: &str) -> Result<ResolvedRole, ModelsError> {
         let role = normalize_role(role);
         let entry = match (self.roles.get(role), &self.selection) {
@@ -595,6 +1288,10 @@ impl ModelsConfig {
                 ));
             }
         };
+        self.resolve_entry(role, entry)
+    }
+
+    fn resolve_entry(&self, role: &str, entry: RoleEntry) -> Result<ResolvedRole, ModelsError> {
         let Some(model_ref) = entry.spec.model.as_deref() else {
             return err(format!("role `{role}` has no model ({})", entry.source));
         };
@@ -648,6 +1345,55 @@ impl ModelsConfig {
             .collect()
     }
 
+    /// The configured roles plus every agent in `agents` (its model role and hints) that has no
+    /// assignment of its own, resolved with the fallback chain ([`Self::resolve_with`]), sorted by
+    /// role. This is what each role really runs on (#2246: doctor, `config show`, `models list`).
+    pub fn resolve_agents(
+        &self,
+        agents: &[(String, ModelHints)],
+    ) -> Vec<(String, Result<ResolvedRole, ModelsError>)> {
+        let mut all: BTreeMap<String, Result<ResolvedRole, ModelsError>> =
+            self.resolve_all().into_iter().collect();
+        for (role, hints) in agents {
+            let role = normalize_role(role);
+            if !all.contains_key(role) {
+                all.insert(role.to_owned(), self.resolve_with(role, hints));
+            }
+        }
+        all.into_iter().collect()
+    }
+
+    /// The model a role with no assignment and no agent-file hints runs on (`[models] fallback`,
+    /// default [`DEFAULT_FALLBACK_ROLE`]'s model; in inherit mode the inherited model).
+    pub fn fallback_model(&self) -> FallbackModel {
+        let (setting, source) = match (&self.selection, &self.fallback) {
+            (Selection::Inherit { model, source, .. }, _) => {
+                (model.clone(), format!("inherit ({source})"))
+            }
+            (_, Some((value, source))) => (value.clone(), source.clone()),
+            (_, None) => (DEFAULT_FALLBACK_ROLE.to_owned(), "default".to_owned()),
+        };
+        // A role name no file can configure, so only the fallback chain applies.
+        const PROBE: &str = "(fallback)";
+        let resolved = self
+            .resolve_with(PROBE, &ModelHints::default())
+            .map_err(|e| {
+                if e.0.starts_with("no model for role `(fallback)`") {
+                    ModelsError(format!(
+                        "the fallback role `{setting}` has no model (configured roles: {})",
+                        self.role_names().join(", ")
+                    ))
+                } else {
+                    ModelsError(e.0.replace("role `(fallback)`: ", "the fallback: "))
+                }
+            });
+        FallbackModel {
+            setting,
+            source,
+            resolved,
+        }
+    }
+
     /// Providers some role uses.
     pub fn providers_in_use(&self) -> BTreeSet<String> {
         self.resolve_all()
@@ -685,6 +1431,19 @@ pub fn thinking_name(level: ThinkingLevel) -> &'static str {
     }
 }
 
+/// Each provider of `defaults` merged with `user` that would not build, as (`id`, why), for
+/// `config check` (#2235): [`ModelsConfig::from_layers`] stops at the first one.
+pub fn provider_problems(defaults: &ModelsFile, user: &ModelsFile) -> Vec<(String, String)> {
+    let mut specs = defaults.providers.clone();
+    for (id, spec) in user.providers.clone() {
+        merge_provider(specs.entry(id).or_default(), spec);
+    }
+    specs
+        .into_iter()
+        .filter_map(|(id, spec)| build_provider(&id, spec).err().map(|e| (id, e.0)))
+        .collect()
+}
+
 // ------------------------------------------------------------------------------------------------
 // Building rpi models.
 // ------------------------------------------------------------------------------------------------
@@ -704,18 +1463,51 @@ fn build_provider(id: &str, spec: ProviderSpec) -> Result<ProviderConfig, Models
             "unknown api `{api_name}` (anthropic-messages, openai-completions, faux)"
         ))
     })?;
+    let auth_spec = spec.clone();
     let base_url = match (api, spec.base_url) {
         (_, Some(url)) => url.trim_end_matches('/').to_owned(),
         (ProviderApi::Faux, None) => "faux://local".to_owned(),
         (_, None) => return Err(ctx("missing `base_url`".into())),
     };
-    let needs_key = match (api, spec.auth.as_deref()) {
-        (ProviderApi::Faux, _) => false,
-        (_, None | Some("key")) => true,
-        (_, Some("none")) => false,
-        (_, Some(other)) => return Err(ctx(format!("unknown auth `{other}` (key, none)"))),
+    let auth = match api {
+        ProviderApi::Faux => ProviderAuth::None,
+        _ => build_auth(api, &auth_spec).map_err(ctx)?,
     };
-    let headers = spec.headers.unwrap_or_default();
+    let needs_key = auth.needs_key();
+    let mut headers = spec.headers.clone().unwrap_or_default();
+    // OpenAI's optional organization / project headers (#2277).
+    for (field, header, value) in [
+        ("organization", "OpenAI-Organization", &spec.organization),
+        ("project", "OpenAI-Project", &spec.project),
+    ] {
+        if let Some(value) = nonempty(value.clone()) {
+            if headers.keys().any(|k| k.eq_ignore_ascii_case(header)) {
+                return Err(ctx(format!(
+                    "`{field}` and headers.{header} both set it: keep one"
+                )));
+            }
+            headers.insert(header.to_owned(), value);
+        }
+    }
+    let query: BTreeMap<String, String> = spec
+        .query
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k.trim().to_owned(), v.trim().to_owned()))
+        .collect();
+    if query.keys().any(String::is_empty) {
+        return Err(ctx("`query` has an empty parameter name".into()));
+    }
+    let tls = ProviderTls {
+        ca_file: nonempty(spec.ca_file.clone()).map(|p| expand_home(&p)),
+        client_cert: nonempty(spec.client_cert.clone()).map(|p| expand_home(&p)),
+        client_key: nonempty(spec.client_key.clone()).map(|p| expand_home(&p)),
+    };
+    if tls.client_key.is_some() && tls.client_cert.is_none() {
+        return Err(ctx("`client_key` needs `client_cert`".into()));
+    }
+    let proxy = build_proxy(spec.proxy.clone()).map_err(ctx)?;
     let mut models = BTreeMap::new();
     for (model_id, model_spec) in spec.models {
         let model = build_model(id, api, &base_url, &headers, &model_id, model_spec)
@@ -724,10 +1516,23 @@ fn build_provider(id: &str, spec: ProviderSpec) -> Result<ProviderConfig, Models
     }
     Ok(ProviderConfig {
         id: id.to_owned(),
+        name: spec.name.filter(|n| !n.trim().is_empty()),
         api,
         base_url,
         key_env: spec.key_env.filter(|s| !s.trim().is_empty()),
         needs_key,
+        auth,
+        query,
+        tls,
+        proxy,
+        headers,
+        secret_headers: spec
+            .secret_headers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|h| h.trim().to_owned())
+            .filter(|h| !h.is_empty())
+            .collect(),
         timeouts: Timeouts {
             connect: secs(spec.connect_timeout_secs),
             header: secs(spec.header_timeout_secs),
@@ -921,12 +1726,13 @@ mod tests {
         ModelsConfig::from_files(ModelsFile::defaults(), Some(user), "config test", env)
     }
 
-    /// The opencode roster: v2/.opencode/agent/amp-<role>.md `model` + `variant`.
+    /// The shipped roles: the opencode roster (v2/.opencode/agent/amp-<role>.md `model` +
+    /// `variant`) except the roles in [`NOT_OPENCODE`].
     const OPENCODE: &[(&str, &str, ThinkingLevel)] = &[
         (
             "manager",
-            "openrouter/xiaomi/mimo-v2.6-pro",
-            ThinkingLevel::High,
+            "openrouter/openai/gpt-6.1-sol",
+            ThinkingLevel::Low,
         ),
         (
             "researcher",
@@ -976,6 +1782,196 @@ mod tests {
         ),
     ];
 
+    /// #2234 (D11): a role with no [roles.<id>] still resolves: agent file model (if configured),
+    /// then based_on, then [models] fallback (a role or provider/model), default worker-backend.
+    /// #2245: the chat's `/model <role> <provider/model>`: in memory, over every layer.
+    #[test]
+    fn a_role_override_wins_and_is_checked() {
+        let user = r#"
+[providers.wf]
+api = "faux"
+[providers.wf.models."wf-1"]
+[providers.wf.models."wf-2"]
+reasoning = true
+
+[roles.worker-backend]
+model = "wf/wf-1"
+extra_body = { seed = 1 }
+"#;
+        let mut c = config(user).unwrap();
+        let r = c
+            .override_role("amp-worker-backend", "wf/wf-2", Some("high"), "this chat")
+            .unwrap();
+        assert_eq!(r.model_ref(), "wf/wf-2");
+        let again = c.resolve_role("worker-backend").unwrap();
+        assert_eq!(again.model_ref(), "wf/wf-2");
+        assert_eq!(again.source, "this chat");
+        assert_eq!(again.requested_thinking, Some(ThinkingLevel::High));
+        // The old model's extra_body is not carried over.
+        assert!(!format!("{:?}", again.model).contains("seed"));
+        // Unknown models and bad thinking levels change nothing.
+        assert!(
+            c.override_role("worker-backend", "wf/nope", None, "x")
+                .is_err()
+        );
+        assert!(
+            c.override_role("worker-backend", "wf/wf-1", Some("loud"), "x")
+                .is_err()
+        );
+        assert_eq!(
+            c.resolve_role("worker-backend").unwrap().model_ref(),
+            "wf/wf-2"
+        );
+    }
+
+    #[test]
+    fn unconfigured_roles_fall_back() {
+        let user = r#"
+[providers.f]
+api = "faux"
+[providers.f.models."one"]
+[providers.f.models."two"]
+[roles.worker-backend]
+model = "f/one"
+[roles.reviewer]
+model = "f/two"
+thinking = "low"
+"#;
+        let c = config(user).unwrap();
+        let hints =
+            |model: Option<&str>, thinking: Option<&str>, based_on: Option<&str>| ModelHints {
+                model: model.map(str::to_owned),
+                thinking: thinking.map(str::to_owned),
+                based_on: based_on.map(str::to_owned),
+            };
+        // Its own [roles] wins over everything.
+        let r = c
+            .resolve_with(
+                "amp-reviewer",
+                &hints(Some("f/one"), None, Some("worker-backend")),
+            )
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        // Nothing: worker-backend's model.
+        let r = c
+            .resolve_with("sql-expert", &ModelHints::default())
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/one");
+        assert!(
+            r.source.starts_with("fallback worker-backend (config test"),
+            "{}",
+            r.source
+        );
+        // A configured frontmatter model, with its variant as thinking.
+        let r = c
+            .resolve_with(
+                "sql-expert",
+                &hints(Some("f/two"), Some("high"), Some("worker-backend")),
+            )
+            .unwrap();
+        assert_eq!(
+            (r.model_ref().as_str(), r.source.as_str()),
+            ("f/two", "agent file model")
+        );
+        assert_eq!(r.requested_thinking, Some(ThinkingLevel::High));
+        // opencode's ids for providers that aren't configured are skipped; `on` isn't a level.
+        let r = c
+            .resolve_with(
+                "sql-expert",
+                &hints(Some("nowhere/x"), Some("on"), Some("amp-reviewer")),
+            )
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        assert_eq!(r.requested_thinking, Some(ThinkingLevel::Low));
+        assert!(r.source.starts_with("based_on reviewer ("), "{}", r.source);
+        // [models] fallback: a role, or a provider/model.
+        let c = config(&format!("{user}\n[models]\nfallback = \"reviewer\"\n")).unwrap();
+        let r = c.resolve_with("x", &ModelHints::default()).unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        let c = config(&format!("{user}\n[models]\nfallback = \"f/two\"\n")).unwrap();
+        let r = c.resolve_with("x", &ModelHints::default()).unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+        assert!(
+            r.source.starts_with("[models] fallback (config test"),
+            "{}",
+            r.source
+        );
+        assert!(config(&format!("{user}\n[models]\nfallback = \"/\"\n")).is_err());
+        let c = config(&format!("{user}\n[models]\nfallback = \"nobody\"\n")).unwrap();
+        let e = c.resolve_with("x", &ModelHints::default()).unwrap_err();
+        assert!(e.0.contains("no model for role `x`"), "{e}");
+        // Inherit mode still gives every role its one model.
+        let c = config(&format!(
+            "{user}\n[models]\nprofile = \"inherit\"\ninherit = \"f/two\"\n"
+        ))
+        .unwrap();
+        let r = c
+            .resolve_with("x", &hints(Some("f/one"), None, Some("worker-backend")))
+            .unwrap();
+        assert_eq!(r.model_ref(), "f/two");
+    }
+
+    #[test]
+    fn fallback_roles_are_listed_and_named() {
+        let user = "[providers.f]\napi = \"faux\"\n[providers.f.models.\"one\"]\n\
+                    [providers.f.models.\"two\"]\n[roles.worker-backend]\nmodel = \"f/one\"\n\
+                    [roles.reviewer]\nmodel = \"f/two\"\n";
+        let c = config(user).unwrap();
+        let agents = vec![
+            ("sql-expert".to_owned(), ModelHints::default()),
+            (
+                "amp-copy".to_owned(),
+                ModelHints {
+                    based_on: Some("reviewer".into()),
+                    ..ModelHints::default()
+                },
+            ),
+            ("reviewer".to_owned(), ModelHints::default()),
+        ];
+        let all = c.resolve_agents(&agents);
+        let get = |role: &str| {
+            all.iter()
+                .find(|(r, _)| r == role)
+                .unwrap_or_else(|| panic!("no {role}"))
+                .1
+                .as_ref()
+                .unwrap()
+        };
+        assert_eq!(get("sql-expert").model_ref(), "f/one");
+        assert_eq!(
+            get("sql-expert").fell_back().as_deref(),
+            Some("fallback worker-backend")
+        );
+        assert_eq!(
+            get("copy").fell_back().as_deref(),
+            Some("based_on reviewer")
+        );
+        assert_eq!(get("reviewer").fell_back(), None);
+        // Configured roles come first-class, so every shipped role is still there once.
+        assert_eq!(all.iter().filter(|(r, _)| r == "reviewer").count(), 1);
+        let f = c.fallback_model();
+        assert_eq!(
+            (f.setting.as_str(), f.source.as_str()),
+            ("worker-backend", "default")
+        );
+        assert_eq!(f.resolved.unwrap().model_ref(), "f/one");
+        let c = config(&format!("{user}\n[models]\nfallback = \"nobody\"\n")).unwrap();
+        let e = c.fallback_model().resolved.unwrap_err();
+        assert!(
+            e.0.starts_with("the fallback role `nobody` has no model")
+                && !e.0.contains("(fallback)"),
+            "{e}"
+        );
+        let c = config(&format!(
+            "{user}\n[models]\nprofile = \"inherit\"\ninherit = \"f/two\"\n"
+        ))
+        .unwrap();
+        let f = c.fallback_model();
+        assert_eq!(f.setting, "f/two");
+        assert!(f.source.starts_with("inherit"), "{}", f.source);
+        assert_eq!(f.resolved.unwrap().model_ref(), "f/two");
+    }
+
     #[test]
     fn shipped_defaults_mirror_the_opencode_roster() {
         let c = config("").unwrap();
@@ -996,12 +1992,28 @@ mod tests {
             assert_eq!(r.model.base_url, "https://openrouter.ai/api/v1");
         }
         // opencode's mimo variant "on" is a body field, not an effort.
-        let manager = c.resolve_role("amp-manager").unwrap();
+        let researcher = c.resolve_role("amp-researcher").unwrap();
         assert_eq!(
-            manager.model.sampling_params.unwrap()["reasoning"],
+            researcher.model.sampling_params.unwrap()["reasoning"],
             serde_json::json!({"enabled": true})
         );
+        // #2363: the manager runs on GPT-6.1 Sol at low effort, with no MiMo body.
+        let manager = c.resolve_role("amp-manager").unwrap();
+        assert!(
+            manager
+                .model
+                .sampling_params
+                .as_ref()
+                .is_none_or(|p| !p.contains_key("reasoning")),
+            "{:?}",
+            manager.model.sampling_params
+        );
     }
+
+    /// Roles whose shipped model deliberately differs from the opencode agent file (#2363: the
+    /// manager eval showed MiMo with reasoning on was too slow for the harness manager; opencode's
+    /// own config is left as it is).
+    const NOT_OPENCODE: &[&str] = &["amp-manager"];
 
     #[test]
     fn opencode_agent_files_match_the_defaults() {
@@ -1026,6 +2038,10 @@ mod tests {
             let Some(model) = field("model") else {
                 continue;
             };
+            if NOT_OPENCODE.contains(&stem) {
+                seen += 1;
+                continue;
+            }
             let r = c.resolve_role(stem).unwrap();
             assert_eq!(r.model_ref(), model, "{stem}");
             let expected = match field("variant").as_deref() {
@@ -1135,10 +2151,10 @@ model = "anthropic/claude-opus-5-5"
 
     #[test]
     fn user_thinking_only_override_keeps_the_model() {
-        let c = config("[roles.manager]\nthinking = \"low\"\n").unwrap();
+        let c = config("[roles.manager]\nthinking = \"medium\"\n").unwrap();
         let manager = c.resolve_role("manager").unwrap();
-        assert_eq!(manager.model_ref(), "openrouter/xiaomi/mimo-v2.6-pro");
-        assert_eq!(manager.thinking, ThinkingLevel::Low);
+        assert_eq!(manager.model_ref(), "openrouter/openai/gpt-6.1-sol");
+        assert_eq!(manager.thinking, ThinkingLevel::Medium);
         assert_eq!(manager.source, "default + config test");
     }
 
@@ -1187,7 +2203,7 @@ model = "openrouter/openai/gpt-oss-120b"
         assert_eq!(or.timeouts.header, Some(Duration::from_secs(90)));
         assert_eq!(or.base_url, "https://openrouter.ai/api/v1");
         assert_eq!(or.key_env.as_deref(), Some("OPENROUTER_API_KEY"));
-        assert_eq!(or.models.len(), 4);
+        assert_eq!(or.models.len(), 5);
     }
 
     #[test]
@@ -1287,6 +2303,64 @@ thinking = "high"
         );
         assert_eq!(c.resolve_role("reviewer").unwrap().model_id, "z-ai/glm-5.3");
         assert!(c.profiles.contains_key("anthropic") && c.profiles.contains_key("cheap"));
+    }
+
+    /// #2232: the repo layer's [roles] and [models] profile beat the user file's;
+    /// AMP_HARNESS_PROFILE beats both; sources name the repo file.
+    #[test]
+    fn repo_layer_merges_over_the_user_file() {
+        let user = ModelsFile::parse(
+            "[models]\nprofile = \"anthropic\"\n[roles.reviewer]\nmodel = \"openrouter/xiaomi/mimo-v2.6-pro\"\nthinking = \"low\"\n",
+            "user",
+        )
+        .unwrap();
+        let repo = crate::repo_config::RepoConfig::parse(
+            "[models]\nprofile = \"opencode\"\n[roles.reviewer]\nthinking = \"high\"\n",
+            Path::new("/r/.amp/harness/config.toml"),
+        )
+        .unwrap();
+        let c = ModelsConfig::from_layers(
+            ModelsFile::defaults(),
+            Some(user.clone()),
+            "config u",
+            Some(&repo),
+            &|_| None,
+        )
+        .unwrap();
+        match &c.selection {
+            Selection::Profile { name, source } => {
+                assert_eq!(name, "opencode");
+                assert_eq!(source, "repo /r/.amp/harness/config.toml");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            c.repo_file,
+            Some(PathBuf::from("/r/.amp/harness/config.toml"))
+        );
+        let reviewer = c.resolve_role("reviewer").unwrap();
+        // The user's model, the repo's thinking.
+        assert_eq!(reviewer.model_ref(), "openrouter/xiaomi/mimo-v2.6-pro");
+        assert_eq!(reviewer.requested_thinking, Some(ThinkingLevel::High));
+        assert_eq!(
+            reviewer.source,
+            "config u + repo /r/.amp/harness/config.toml"
+        );
+
+        let env = |k: &str| (k == ENV_PROFILE).then(|| "anthropic".to_owned());
+        let c = ModelsConfig::from_layers(
+            ModelsFile::defaults(),
+            Some(user),
+            "config u",
+            Some(&repo),
+            &env,
+        )
+        .unwrap();
+        assert!(
+            matches!(&c.selection, Selection::Profile { name, .. } if name == "anthropic"),
+            "{:?}",
+            c.selection
+        );
     }
 
     #[test]
