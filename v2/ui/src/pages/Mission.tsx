@@ -281,7 +281,7 @@ export function Mission() {
           { label: 'Questions', value: counts.flag, color: counts.flag ? 'var(--st-flag)' : undefined,
             sub: yours ? `${yours.answer} for you` : counts.flag ? 'waiting on an answer' : 'none' },
           { label: 'Merge needed', value: mergeNeeded, color: mergeNeeded ? 'var(--teal)' : undefined,
-            sub: yours ? `${yours.merge} yours` : mergeNeeded ? 'done, not merged' : 'none' },
+            sub: yours ? `${yours.merge} yours` : mergeNeeded ? 'dependents wait on them' : 'none' },
           { label: 'Done', value: <>{counts.done}<span className="text-[13px] text-ink-3">/{tasks.length}</span></>,
             sub: tasks.length ? `${Math.round(counts.done / tasks.length * 100)}% of the plan` : 'no tickets yet' },
         ]} />

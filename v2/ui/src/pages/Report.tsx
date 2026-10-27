@@ -131,7 +131,7 @@ export function Report() {
     const lines = [
       `# Report · project ${pid} · ${RANGE_LABELS[range]}`, '',
       `${report.completed} done, ${report.dispatched} started, ${report.created} created. Median time to done ${hours(report.median_cycle_hours)}.`, '',
-      '## Standup', '', '| Person | Done | Now | Waiting on them | Ready next |', '|---|---:|---|---|---:|',
+      '## Standup', '', '| Person | Done | Now | Questions | Ready next |', '|---|---:|---|---|---:|',
       ...peopleRows(tasks, activity, people, since).map(r => `| ${r.name} | ${r.done.length} | ${r.flying.map(t => `#${t.id} ${t.name}`).join('; ') || '—'} | ${r.questions.map(t => `#${t.id} ${t.block_reason}`).join('; ') || '—'} | ${r.ready} |`), '',
       '## Token spend', '', `${tokens((report.usage?.input_tokens ?? 0) + (report.usage?.output_tokens ?? 0))} tokens, ${usd(report.usage?.cost_usd ?? 0)} over ${report.usage?.runs ?? 0} runs.`, '',
       '| Model | Runs | Input | Output | Cost |', '|---|---:|---:|---:|---:|',

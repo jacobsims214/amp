@@ -813,7 +813,7 @@ export interface MyWorkCounts {
   projects: Record<string, WaitCounts>
 }
 
-/** One thing waiting on a person: "approve:<epic id>" (one per epic) or "task:<ticket id>". */
+/** One thing waiting on you (Waiting on you): "approve:<epic id>" (one per epic) or "task:<ticket id>". */
 export interface WaitItem {
   kind: WaitKind | 'coming_up'
   key: string

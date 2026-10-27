@@ -304,7 +304,7 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
         {task && <Link to={projectLink(projectId, 'board', taskId)} className="text-[12.5px] text-link truncate">{task.name}</Link>}
       </div>
       {task?.state === 'blocked' && task.block_reason && (
-        <p className="m-0 text-[12.5px] text-ink border-l-2 pl-2.5" style={{ borderColor: 'var(--st-flag)' }}>Waiting on a person: {task.block_reason}</p>
+        <p className="m-0 text-[12.5px] text-ink border-l-2 pl-2.5" style={{ borderColor: 'var(--st-flag)' }}>Question: {task.block_reason}</p>
       )}
       <ol className="m-0 p-0 list-none grid gap-2.5">
         {comments.slice(-12).map(c => (

@@ -4,7 +4,7 @@ import type { Task } from '../types'
 // a person reads differently. The UI shows six:
 //   ready      backlog with nothing left to wait on
 //   prog       in progress
-//   wait       blocked by unfinished dependencies (block_reason empty) — no one needs to act
+//   wait       waiting on dependencies that aren't done (or done but not merged yet; block_reason empty)
 //   flag       a question: blocked with a reason (an agent called amp_block_task) — needs a person
 //   sched      blocked until start_at (block_reason "scheduled:…")
 //   done       completed
@@ -19,8 +19,8 @@ export const STATE_LABEL: Record<DisplayState, string> = {
 export const STATE_HINT: Record<DisplayState, string> = {
   ready: 'Nothing to wait on; can be dispatched now',
   prog: 'An agent or person is working it',
-  wait: 'Waiting on unfinished dependencies; unblocks by itself',
-  flag: 'An agent asked a question and stopped; answer it to put the ticket back to ready',
+  wait: 'Waiting on its dependencies (or on a done one to be merged); it becomes Ready by itself when they are',
+  flag: 'An agent asked a question and stopped; answer it in My work to put the ticket back to Ready',
   sched: 'Waiting for its start time',
   done: 'Completed',
 }

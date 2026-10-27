@@ -265,7 +265,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           {task.blocked_by_ids?.length ? (
             <div className="flex items-center gap-1.5 text-xs text-danger-ink">
               <AlertCircle size={11} />
-              <span>Blocked by #{task.blocked_by_ids.join(', #')}</span>
+              <span>Waiting on #{task.blocked_by_ids.join(', #')}</span>
             </div>
           ) : null}
           {task.state === 'completed' && task.completed_at && (
