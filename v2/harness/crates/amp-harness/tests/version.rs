@@ -56,3 +56,33 @@ fn version_prints_harness_version_and_exact_pins() {
         }
     }
 }
+
+/// #2122: `--version` ends with the commit the binary was built from, which the release workflow
+/// checks against the tagged commit. Here it must be a prefix of this checkout's HEAD (`-dirty`
+/// allowed), unless AMP_HARNESS_BUILD_COMMIT overrode it or there is no git.
+#[test]
+fn version_stamps_the_build_commit() {
+    let out = run(&["--version"]);
+    let stamp = out
+        .lines()
+        .last()
+        .and_then(|l| l.strip_prefix("commit "))
+        .unwrap_or_else(|| panic!("no `commit` line last in:\n{out}"));
+    assert!(!stamp.is_empty(), "{out}");
+    if std::env::var_os("AMP_HARNESS_BUILD_COMMIT").is_some() || stamp == "unknown" {
+        return;
+    }
+    let head = Command::new("git")
+        .args(["-C", env!("CARGO_MANIFEST_DIR"), "rev-parse", "HEAD"])
+        .output()
+        .expect("git rev-parse HEAD");
+    let head = String::from_utf8(head.stdout)
+        .expect("utf-8")
+        .trim()
+        .to_owned();
+    let sha = stamp.strip_suffix("-dirty").unwrap_or(stamp);
+    assert!(
+        sha.len() >= 7 && head.starts_with(sha),
+        "stamp {stamp} is not HEAD {head}"
+    );
+}

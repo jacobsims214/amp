@@ -147,7 +147,9 @@ latest_version() {
     api=${AMP_HARNESS_RELEASES_URL:-"https://api.github.com/repos/$REPO/releases?per_page=100"}
     tmp_json="$1/releases.json"
     fetch "$api" "$tmp_json" || err "could not list releases from $api (pass --version X.Y.Z)"
-    v=$(sed -n "s/.*\"tag_name\": *\"$TAG_PREFIX\\([^\"]*\\)\".*/\\1/p" "$tmp_json" | head -n 1)
+    # Prereleases (a SemVer version with a '-', e.g. 0.2.0-rc.1) are skipped: they install only by
+    # --version. Drafts are not in the unauthenticated list at all.
+    v=$(sed -n "s/.*\"tag_name\": *\"$TAG_PREFIX\\([^\"]*\\)\".*/\\1/p" "$tmp_json" | grep -v -- - | head -n 1)
     [ -n "$v" ] || err "no $TAG_PREFIX* release found on $REPO yet (pass --version, or --archive for a local build)"
     echo "$v"
 }

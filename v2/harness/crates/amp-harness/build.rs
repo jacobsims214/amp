@@ -1,7 +1,10 @@
 //! Stamps the resolved rpi and rmcp versions from the workspace Cargo.lock into the binary, so
 //! `amp-harness --version` reports what was actually linked (D11), not a hand-copied string. It also
 //! stamps the commit that last changed the embedded agent/skill assets (`AMP_ASSETS_COMMIT`), with
-//! `-dirty` when the working tree has uncommitted asset changes, or `unknown` without git.
+//! `-dirty` when the working tree has uncommitted asset changes, or `unknown` without git. And it
+//! stamps the commit the binary was built from (`AMP_BUILD_COMMIT`, M5-1 #2122): the short HEAD,
+//! `-dirty` when tracked files under v2/harness have uncommitted changes, `unknown` without git.
+//! `AMP_HARNESS_BUILD_COMMIT` overrides it, for builds from a source tree that isn't a git checkout.
 
 use std::{env, fs, path::Path, path::PathBuf, process::Command};
 
@@ -45,6 +48,41 @@ fn main() {
         "cargo::rustc-env=AMP_ASSETS_COMMIT={}",
         assets_commit(&manifest_dir)
     );
+
+    println!("cargo::rerun-if-env-changed=AMP_HARNESS_BUILD_COMMIT");
+    let build_commit = env::var("AMP_HARNESS_BUILD_COMMIT")
+        .ok()
+        .filter(|c| !c.trim().is_empty())
+        .map(|c| c.trim().to_owned())
+        .unwrap_or_else(|| build_commit(&manifest_dir));
+    println!("cargo::rustc-env=AMP_BUILD_COMMIT={build_commit}");
+}
+
+/// The short HEAD commit, `-dirty` when tracked files under v2/harness have local changes. Only a
+/// new commit reruns this (see the HEAD log above), so a dev build can keep a stale `-dirty`; the
+/// release workflow builds from a clean checkout and checks the stamp against the tag's commit.
+fn build_commit(manifest_dir: &Path) -> String {
+    let Some(commit) =
+        git(manifest_dir, &["rev-parse", "--short", "HEAD"]).filter(|c| !c.is_empty())
+    else {
+        return "unknown".to_owned();
+    };
+    let dirty = git(
+        manifest_dir,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--",
+            "../..",
+        ],
+    )
+    .is_some_and(|s| !s.is_empty());
+    if dirty {
+        format!("{commit}-dirty")
+    } else {
+        commit
+    }
 }
 
 /// The short commit that last touched `v2/harness/assets`, `-dirty` when it has local changes.
