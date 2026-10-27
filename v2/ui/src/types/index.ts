@@ -807,6 +807,12 @@ export interface WaitCounts {
   coming_up: number
 }
 
+/** GET /my-work/counts: the badges. `projects` holds only projects with something waiting or coming up. */
+export interface MyWorkCounts {
+  counts: WaitCounts
+  projects: Record<string, WaitCounts>
+}
+
 /** One thing waiting on a person: "approve:<epic id>" (one per epic) or "task:<ticket id>". */
 export interface WaitItem {
   kind: WaitKind | 'coming_up'
