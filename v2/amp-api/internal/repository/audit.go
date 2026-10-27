@@ -15,6 +15,14 @@ import (
 // ---- Audit log (append-only) ----
 
 func (r *Repo) InsertAudit(ctx context.Context, e domain.AuditEntry) (*domain.AuditEntry, error) {
+	return insertAudit(ctx, r.db, e, true)
+}
+
+// insertAudit writes e through q (the pool, or a transaction so the entry
+// commits or rolls back with the change it records). v1Fallback retries in
+// the v1 shape when the database predates migration 031; never inside a
+// transaction, where the failed statement has already aborted it.
+func insertAudit(ctx context.Context, q queryRower, e domain.AuditEntry, v1Fallback bool) (*domain.AuditEntry, error) {
 	if e.Details == nil {
 		e.Details = map[string]any{}
 	}
@@ -36,7 +44,7 @@ func (r *Repo) InsertAudit(ctx context.Context, e domain.AuditEntry) (*domain.Au
 	if e.Outcome == "" {
 		e.Outcome = domain.AuditOutcomeSuccess
 	}
-	err = r.db.QueryRow(ctx, `
+	err = q.QueryRow(ctx, `
 		INSERT INTO audit_log (actor_user_id, actor_email, via_token, org_id, project_id, action, target_type, target_id, summary, details,
 			schema_version, actor_type, auth_method, token_id, session_id, on_behalf_of_user_id, agent_profile, target_name,
 			outcome, reason, source_ip, user_agent, client, request_id, trace_id, "before", "after")
@@ -49,12 +57,12 @@ func (r *Repo) InsertAudit(ctx context.Context, e domain.AuditEntry) (*domain.Au
 		e.Outcome, e.Reason, e.SourceIP, e.UserAgent, e.Client, e.RequestID, e.TraceID, before, after,
 	).Scan(&e.ID, &e.At)
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42703" {
+	if v1Fallback && errors.As(err, &pgErr) && pgErr.Code == "42703" {
 		// undefined_column: this process is newer than the database
 		// (authadmin doesn't migrate, so it can start before amp-api has
 		// applied 031). Keep the row in the v1 shape rather than lose it.
 		e.SchemaVersion = 1
-		err = r.db.QueryRow(ctx, `
+		err = q.QueryRow(ctx, `
 			INSERT INTO audit_log (actor_user_id, actor_email, via_token, org_id, project_id, action, target_type, target_id, summary, details)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id, at`,
 			e.ActorUserID, e.ActorEmail, e.ViaToken, e.OrgID, e.ProjectID, e.Action, e.TargetType, e.TargetID, e.Summary, details,

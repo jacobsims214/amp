@@ -65,6 +65,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "audit" {
 		os.Exit(runAuditCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	// `amp-api backfill-owners [-apply]`: one-off owner = creator backfill
+	// on open, unowned tickets a person created (backfill_cli.go, #2476).
+	if len(os.Args) > 1 && os.Args[1] == "backfill-owners" {
+		os.Exit(runBackfillOwnersCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	dsn := envOrDefault("DATABASE_URL", "postgres://amp:amp@localhost:5432/amp?sslmode=disable")
