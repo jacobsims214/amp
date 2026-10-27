@@ -94,10 +94,13 @@ jobs:
           while kill -0 "$pid" 2>/dev/null; do sleep 5; done
           tail -n 20 "$RUNNER_TEMP/compose-build.log"
           docker compose -f docker-compose.yml up -d postgres typesense amp-api ui
-          for i in $(seq 1 90); do
-            if curl -fsS -m 5 http://localhost:3001/ready >/dev/null 2>&1 &&
-               curl -sS -m 5 -o /dev/null http://localhost:8000/mcp 2>/dev/null; then
-              echo "AMP is up after ${i}s"; exit 0
+          # REST /ready, and any HTTP answer from the MCP listener. Probe MCP with a POST: a GET on
+          # /mcp opens the Streamable HTTP event stream and never returns.
+          for i in $(seq 1 60); do
+            code="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+              -d '{}' http://localhost:8000/mcp 2>/dev/null || true)"
+            if curl -fsS -m 5 http://localhost:3001/ready >/dev/null 2>&1 && [ "${code:-000}" != 000 ]; then
+              echo "AMP is up (try $i, MCP answered $code)"; exit 0
             fi
             sleep 2
           done
