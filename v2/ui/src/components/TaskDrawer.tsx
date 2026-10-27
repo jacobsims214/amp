@@ -6,6 +6,7 @@ import { approvalOf, approvalOwner, formatWhen, isRelayed, isYours, relayedFor }
 import { projectLink } from '../lib/projectLink'
 import { HumanActions } from './human/HumanActions'
 import { mergeStatusText } from '../lib/humanActions'
+import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
@@ -15,7 +16,7 @@ import { displayState } from '../lib/ticketState'
 import { ConfirmDeleteModal } from './ConfirmDeleteModal'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
 import { activityActor, canPlanTask, canTakeOverTask, canWorkTask, lookupPerson, peopleById, personName, type Person } from '../lib/people'
-import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story, HumanReason } from '../types'
+import type { Task, Comment, ActivityLog, ProjectMember, ProjectAccess, Metadata, Epic, Story, HumanReason, Run } from '../types'
 import { DependencyPicker } from './DependencyPicker'
 import { MetadataEditor } from './MetadataEditor'
 import { metadataPatch } from '../lib/metadata'
@@ -281,6 +282,7 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
               <span>{mergeStatusText(task)}</span>
             </div>
           )}
+          <MergeGateNote task={task} />
         </div>
 
         {/* An agent's question, answered in place (the same HumanActions as My work) */}
@@ -939,5 +941,51 @@ function MergePanel({ task, canWork, onChanged }: { task: Task; canWork: boolean
       <span className="amp-label" style={{ color: 'var(--teal)' }}>Merge</span>
       <HumanActions task={task} kind="merge" canAct={canWork} prUrl={pr.url} branch={pr.branch} onChanged={onChanged} />
     </div>
+  )
+}
+
+// The merge gate's two exceptions, read from the effective metadata (#2597):
+// a done ticket whose run went to the integration branch (its dependents
+// don't wait; the merge to main comes later), and a ticket that starts when its
+// dependencies are done without waiting for their merge (waits_for_merge: false).
+function MergeGateNote({ task }: { task: Task }) {
+  const [inherited, setInherited] = useState<Metadata | undefined>()
+  const [runs, setRuns] = useState<Run[]>([])
+  const meta = useMemo(() => effectiveMetadata(inherited, task.metadata), [inherited, task.metadata])
+  const branch = integrationBranch(meta)
+  const wantRuns = task.state === 'completed' && !!branch
+
+  useEffect(() => {
+    let live = true
+    api.inheritedMetadata('task', task.id).then(m => { if (live) setInherited(m) }).catch(() => {})
+    return () => { live = false }
+  }, [task.id])
+
+  useEffect(() => {
+    if (!wantRuns) { setRuns([]); return }
+    let live = true
+    api.taskRuns(task.id).then(r => { if (live) setRuns(r.runs) }).catch(() => {})
+    return () => { live = false }
+  }, [task.id, wantRuns, task.merge_state])
+
+  const into = mergedIntoIntegration(task, meta, runs)
+  const noWait = !waitsForMerge(meta) && task.state !== 'completed' && task.dependency_ids.length > 0
+  if (!into && !noWait) return null
+  return (
+    <>
+      {into && (
+        <div className="flex items-center gap-1.5 text-xs text-ink-2" data-testid="merge-integration"
+          title="Tickets that depend on it don't wait for this merge.">
+          <GitMerge size={11} aria-hidden="true" />
+          <span>Merged into {into}, waiting on the merge to main</span>
+        </div>
+      )}
+      {noWait && (
+        <div className="flex items-center gap-1.5 text-xs text-ink-2" data-testid="merge-no-wait">
+          <GitBranch size={11} aria-hidden="true" />
+          <span>Starts when its dependencies are done; doesn't wait for their merge</span>
+        </div>
+      )}
+    </>
   )
 }
