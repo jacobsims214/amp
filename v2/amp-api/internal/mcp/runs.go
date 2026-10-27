@@ -212,7 +212,7 @@ func (s *Server) restoreTasks(rctx context.Context, args map[string]interface{})
 // compactTasks is amp_list_tasks' default, small overview: one line per open
 // ticket under its epic (completed ones only when asked), the buckets as
 // IDs, and the questions with their text.
-func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, people []PersonWait, withDone bool) (*mcpgo.CallToolResult, error) {
+func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domain.Task, ownerMode string, quiet []map[string]interface{}, people, comingUp []PersonWait, withDone bool) (*mcpgo.CallToolResult, error) {
 	epics, err := s.repo.ListEpics(rctx, projectID)
 	if err != nil {
 		return nil, err
@@ -279,7 +279,8 @@ func (s *Server) compactTasks(rctx context.Context, projectID int, tasks []domai
 		"scheduled":         len(buckets["scheduled"]),
 		"completed":         len(buckets["completed"]),
 		"quiet":             quiet,
-		"waiting_on_people": people, // never dispatch these: tell your user who the work is waiting on
+		"waiting_on_people": people,   // never dispatch these: tell your user who the work is waiting on, by kind
+		"coming_up":         comingUp, // people's human tickets not actionable yet
 		"by_epic":           byEpic,
 		"count":             len(tasks),
 		"owner_filter":      ownerMode,
@@ -295,8 +296,30 @@ func (s *Server) listUnmerged(rctx context.Context, args map[string]interface{})
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"waiting_to_merge": runs, "count": len(runs),
-		"note": "Completed tickets whose pushed work no run has reported merged. After merging, record it: amp_report_run(task_id, outcome='completed', merged=true, commit=<merge sha>)."})
+	// Each run with its ticket's merge_state (additive: the run's own fields
+	// are unchanged). Abandoned tickets stay listed: they hold their
+	// dependents until reopened or marked not needed.
+	ids := make([]int, len(runs))
+	for i, r := range runs {
+		ids[i] = r.TaskID
+	}
+	sums, err := s.repo.DepSummaries(rctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	type unmerged struct {
+		domain.Run
+		MergeState string `json:"merge_state"` // needed | abandoned | none (completed before merges were tracked)
+	}
+	out := make([]unmerged, len(runs))
+	for i, r := range runs {
+		out[i] = unmerged{Run: r, MergeState: sums[r.TaskID].MergeState}
+		if out[i].MergeState == "" {
+			out[i].MergeState = domain.MergeNone
+		}
+	}
+	return jsonResult(map[string]interface{}{"waiting_to_merge": out, "count": len(out),
+		"note": "Merge needed: completed tickets whose pushed work no run has reported merged. After merging, record it: amp_report_merged, or amp_report_run(task_id, outcome='completed', merged=true, commit=<merge sha>)."})
 }
 
 func (s *Server) projectDayReports(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

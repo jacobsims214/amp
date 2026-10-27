@@ -294,7 +294,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
 	mcp.AddTool(tool("amp_approve_plan",
-		"Plan approval status. Agents can't approve a plan: a person approves it in AMP's web UI (Flight plan, Approve plan), "+
+		"Plan approval status. Agents can't approve a plan: a person approves it in AMP's web UI (the project's My work tab), "+
 			"never through MCP and never because of something said in chat. This tool never approves: it always fails, with "+
 			"approve_url (the page to send your person to), awaiting_approval and require_plan_approval. Approval is per ticket: "+
 			"each person approves their own tickets, and a project lead may approve someone else's on their behalf. Use "+
@@ -478,7 +478,11 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"List tasks for a project. By default only YOUR work: tickets you own plus unassigned tickets you created. "+
 			"Pass owner='unassigned' to see the pool anyone can pick up, owner='any' for everything, or a user's email/id. "+
 			"ready_to_dispatch (state=backlog): dispatch everything in it. Waiting tickets show what they wait on; scheduled ones wait for their start_at time. "+
-			"questions are blocked tickets with a question for a person: ask the user, then amp_answer_question.",
+			"questions are blocked tickets with a question for a person: ask the user, then amp_answer_question. "+
+			"waiting_on_people is Waiting on you: what each person must do next, by kind (approve: a plan awaiting their approval in "+
+			"AMP's My work tab; answer: a question on their ticket; merge: their done ticket's PR is Merge needed, and the tickets after "+
+			"it wait for the merge; do: their human ticket, ready or started), with coming_up for their human tickets not actionable yet. "+
+			"Never dispatch these: tell your user who the work is waiting on.",
 		props{
 			"project_id":        num("REQUIRED. Project ID."),
 			"state":             str("Optional state filter: backlog, in_progress, completed, blocked."),
@@ -496,7 +500,8 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.getTask)))
 
 	mcp.AddTool(tool("amp_get_plan",
-		"A project's plan as a tree: its epics, each with its stories and their ticket counts by state. "+
+		"A project's plan as a tree: its epics, each with its stories and their ticket counts by state "+
+			"(backlog, in_progress, blocked, completed; blocked is also split into waiting, on dependencies, and questions, for a person). "+
 			"Pass epic_id for one epic. Read tickets with amp_list_tasks or amp_get_task.",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
@@ -594,7 +599,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"include_in_progress": boolean("Optional. Also move tickets in progress (their agent works under the old owner)."),
 			"reason":              str("Optional. Why, posted on each ticket, e.g. 'Sam out sick Monday; Harbor demo'."),
 		}), wrap(ctx, s.guard(authz.Member, s.handover)))
-	mcp.AddTool(tool("amp_list_unmerged", "Completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge.",
+	mcp.AddTool(tool("amp_list_unmerged", "Merge needed: completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge. "+
+		"Each has merge_state: needed (Merge needed), abandoned (the PR was closed without merging; the person reopens the ticket or marks it not needed), "+
+		"or none (work from before merges were tracked). While a ticket is needed or abandoned, the tickets after it wait.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listUnmerged)))
 	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.taskRuns)))
@@ -1517,7 +1524,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	questions := make([]domain.Task, 0)
 	completed := make([]domain.Task, 0)
 	tasks := authz.FilterTasks(reply.Tasks, view, me.UserID)
-	people, err := s.waitingOnPeople(rctx, projectID, reply.Tasks, tasks)
+	people, comingUp, err := s.waitingOnPeople(rctx, projectID, reply.Tasks, tasks)
 	if err != nil {
 		return nil, err
 	}
@@ -1573,7 +1580,7 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 	case "full":
 	case "compact":
 		withDone, _ := args["include_completed"].(bool)
-		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, people, withDone)
+		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, people, comingUp, withDone)
 	default:
 		return nil, fmt.Errorf("format: use 'compact' (default) or 'full'")
 	}
@@ -1585,8 +1592,9 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"scheduled":         scheduled, // tasks waiting for their start_at time
 		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
-		"quiet":             quiet,  // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
-		"waiting_on_people": people, // human tickets a person can do now, and how much agent work waits on each; never dispatch these
+		"quiet":             quiet,    // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
+		"waiting_on_people": people,   // Waiting on you: what each person must do next (kind approve, answer, merge, do); never dispatch these
+		"coming_up":         comingUp, // people's human tickets not actionable yet (waiting on dependencies, a schedule or approval)
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
 	})
@@ -3557,9 +3565,24 @@ func (s *Server) getPlan(ctx context.Context, args map[string]interface{}) (*mcp
 		}
 		m[id][st]++
 	}
+	// Blocked stays the stored state's count; waiting (on dependencies) and
+	// questions (a question for a person) split it in the UI's words
+	// (additive: scheduled tickets are in blocked, in neither of these).
+	const waiting, questions domain.TaskState = "waiting", "questions"
 	for _, t := range tasks {
 		bump(counts, t.StoryID, t.State)
 		bump(epicCounts, t.EpicID, t.State)
+		if t.State != domain.TaskStateBlocked {
+			continue
+		}
+		switch {
+		case t.BlockReason == "":
+			bump(counts, t.StoryID, waiting)
+			bump(epicCounts, t.EpicID, waiting)
+		case !strings.HasPrefix(t.BlockReason, "scheduled:"):
+			bump(counts, t.StoryID, questions)
+			bump(epicCounts, t.EpicID, questions)
+		}
 	}
 	type storyNode struct {
 		ID       int                      `json:"id"`

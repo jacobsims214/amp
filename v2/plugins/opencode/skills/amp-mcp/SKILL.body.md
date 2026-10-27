@@ -135,9 +135,14 @@ ticket, so whatever `depends_on` it waits for the person.
 
 - **Never dispatched.** `amp_dispatch_task` refuses it. Its owner clicks Start and Mark done in
   AMP's web UI. It isn't in `ready_to_dispatch` or `in_progress`, and it's never `quiet`.
-- **`amp_list_tasks` → `waiting_on_people`**: the human tickets a person can do now that matter to
-  you. Each has `owner` (email), `reason`, `state` (ready | in_progress), `waiting_hours`,
-  `holding_up` (open ticket IDs downstream) and `stale` (48h with no activity).
+- **`amp_list_tasks` → `waiting_on_people`** (Waiting on you): what a person must do next that
+  matters to you. Each item has a `kind`: `approve` (a plan awaiting their approval in the My work
+  tab; `epic_id`, `count`, `task_ids`), `answer` (a question on their ticket; `question`), `merge`
+  (their done ticket is Merge needed, or its PR closed: `merge_state`, `pr_url`) or `do` (their
+  human ticket, ready or started). Each also has `id`, `owner` (email), `reason`, `state`,
+  `waiting_hours`, `holding_up` (open ticket IDs downstream) and, for `do`, `stale` (48h with no
+  activity). `coming_up` lists their human tickets not actionable yet (`waits_on`,
+  `awaiting_approval`, `start_at`). Never dispatch these; tell your user who the work waits on.
 - **Only the person marks it done, in the web UI.** `amp_complete_task` on a human ticket is
   refused for every MCP caller, even on your user's word; give them the ticket link instead.
 - **Switching who does it**: `amp_update_task(task_id, performer, human_reason)`. Not while it's
