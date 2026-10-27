@@ -29,9 +29,13 @@ func (s *Service) link(path string) string {
 	return strings.TrimSuffix(s.AppURL, "/") + path
 }
 
-// PlanURL is the project's Flight plan page, where a person approves the plan.
+// PlanURL is where a person approves the plan: the project's My work tab
+// with the Approve view open on everything awaiting them (KB
+// decisions/human-work-ux.md: approval happens only in My work). Callers keep
+// returning it as approve_url / plan_url; the old /project/:id/plan link still
+// works, because Flight plan links on to My work.
 func (s *Service) PlanURL(projectID int) string {
-	return s.link(fmt.Sprintf("/project/%d/plan", projectID))
+	return s.link(fmt.Sprintf("/project/%d/my-work?approve=all", projectID))
 }
 
 // TaskURL opens the ticket on its project's board.
@@ -71,21 +75,7 @@ func (s *Service) approvalGate(ctx context.Context, p authz.Principal, t *domain
 // agent that skipped the dispatch. Human tickets go through
 // CompleteHumanTask.
 func (s *Service) CompleteTask(ctx context.Context, p authz.Principal, taskID int) (*domain.Task, error) {
-	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
-	if err != nil {
-		return nil, err
-	}
-	if t.IsHuman() {
-		return nil, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
-	}
-	if err := s.checkAgentCompletion(ctx, p, t); err != nil {
-		s.auditTaskDenied(ctx, p, "task.complete", t, err, nil)
-		return nil, err
-	}
-	if err := s.sendComplete(ctx, p, t, !p.InUI()); err != nil {
-		return nil, err
-	}
-	return s.Repo.GetTask(ctx, taskID)
+	return s.CompleteTaskWithRun(ctx, p, taskID, nil)
 }
 
 // checkAgentCompletion applies the off-UI completion rules to agent ticket t.
@@ -145,9 +135,16 @@ func (s *Service) openDepsGate(ctx context.Context, t *domain.Task, doing string
 // atomically, that the ticket is still in progress and that its
 // dependencies are complete.
 func (s *Service) sendComplete(ctx context.Context, p authz.Principal, t *domain.Task, offUI bool) error {
+	return s.sendCompleteMerge(ctx, p, t, offUI, false, "")
+}
+
+// sendCompleteMerge is sendComplete for work that may wait on a merge
+// (MsgCompleteTask.MergeRequired).
+func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *domain.Task, offUI, mergeRequired bool, mergeWhere string) error {
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgCompleteTask{
-		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI, ReplyCh: replyCh,
+		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI,
+		MergeRequired: mergeRequired, MergeWhere: mergeWhere, ReplyCh: replyCh,
 	}); err != nil {
 		return err
 	}
@@ -190,6 +187,14 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	}
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	if t.State == domain.TaskStateCompleted && state != domain.TaskStateCompleted {
+		// Reopened: the tickets after it re-read their dependencies, so none
+		// keeps saying why it waited on the done ticket (its PR closed
+		// without merging, "reopen it") once the ticket is open again.
+		if deps, err := s.Repo.OpenDependents(ctx, []int{taskID}); err == nil {
+			s.ReconcileDependents(ctx, t.ProjectID, deps[taskID], nil)
+		}
 	}
 	// The actor may have kept it blocked on its dependencies.
 	if cur, err := s.Repo.GetTask(ctx, taskID); err == nil {

@@ -41,8 +41,8 @@ Explain the shape using *their* data, not an abstract example. Open one of their
   `scheduled`, `quiet`, `blocked`, `completed`.
 
 Point them at the UI as you go: **My work** (home), **Projects**, and inside a project
-**Mission**, **Board**, **Flight plan**, **Graph**, **Reports**, **Library**, **Settings**
-(`ui-tour.md`).
+**Mission**, **My work** (where they approve, answer, merge and do their own steps), **Board**,
+**Flight plan**, **Graph**, **Reports**, **Library**, **Settings** (`ui-tour.md`).
 
 ## Step 2: make sure their agent is set up right
 

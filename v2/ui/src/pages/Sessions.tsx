@@ -19,6 +19,7 @@ import { remoteAvailable, useRemote } from '../remote/remote-context'
 import type { SessionDevice, SessionSummary } from '../remote/types'
 import { ago, inTime } from '../remote/toolText'
 import { endReasonLabel, endReasonText } from '../remote/session'
+import { projectLink } from '../lib/projectLink'
 
 const when = (ms: number) => new Date(ms).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
 
@@ -56,7 +57,7 @@ function TicketFact({ s }: { s: SessionSummary }) {
   return (
     <Fact label="Ticket" title={text}>
       {s.project
-        ? <Link to={`/project/${s.project.id}/board?task=${t.id}`} className="text-link hover:underline">{text}</Link>
+        ? <Link to={projectLink(s.project.id, 'board', t.id)} className="text-link hover:underline">{text}</Link>
         : text}
     </Fact>
   )

@@ -190,17 +190,29 @@ pub struct AmpTask {
     pub updated_at: Option<String>,
 }
 
-/// A human ticket from `amp_list_tasks`' `waiting_on_people` (AMP lists open human tickets there
-/// rather than in the state buckets).
+/// An item of `amp_list_tasks`' `waiting_on_people` (Waiting on you). AMP lists ready and started
+/// human tickets there rather than in the state buckets (kind `do`, or no kind from older AMPs);
+/// newer AMPs also list plans to approve, questions and merges (kinds `approve`, `answer`,
+/// `merge`), whose tickets are in the buckets already.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PersonWait {
     pub id: i64,
     pub name: String,
     #[serde(default)]
     pub owner: Option<String>,
-    /// `ready` or `in_progress`.
+    /// For kind `do`: `ready` or `in_progress`.
     #[serde(default, deserialize_with = "null_as_default")]
     pub state: String,
+    /// `approve`, `answer`, `merge` or `do`; empty from AMPs before kinds.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub kind: String,
+}
+
+impl PersonWait {
+    /// A person's own ticket to do, missing from the state buckets.
+    pub fn is_todo(&self) -> bool {
+        self.kind.is_empty() || self.kind == "do"
+    }
 }
 
 /// One row of `tickets list`, and the summary part of `tickets get`. This is the `--json` contract:
@@ -333,7 +345,12 @@ impl FullTaskList {
             .chain(&self.scheduled)
             .chain(&self.completed)
             .map(TicketRow::from)
-            .chain(self.waiting_on_people.iter().map(TicketRow::from))
+            .chain(
+                self.waiting_on_people
+                    .iter()
+                    .filter(|p| p.is_todo())
+                    .map(TicketRow::from),
+            )
             .collect();
         rows.sort_by_key(|r| (r.status, r.id));
         rows.dedup_by_key(|r| r.id);
@@ -393,7 +410,11 @@ mod tests {
             "questions": [{"id": 4, "name": "four", "state": "blocked", "block_reason": "Which DB?"}],
             "scheduled": [{"id": 7, "name": "seven", "state": "blocked", "block_reason": "scheduled: later", "start_at": "2026-11-01T00:00:00Z"}],
             "completed": [{"id": 1, "name": "one", "state": "completed"}],
-            "waiting_on_people": [{"id": 9, "name": "merge", "owner": "a@b.c", "state": "ready", "waiting_hours": 2}],
+            "waiting_on_people": [
+                {"id": 9, "name": "merge", "owner": "a@b.c", "state": "ready", "waiting_hours": 2},
+                {"id": 1, "name": "one", "owner": "a@b.c", "state": "completed", "kind": "merge", "merge_state": "needed"},
+                {"id": 5, "name": "Approve plan: E (1 ticket)", "owner": "a@b.c", "state": "awaiting_approval", "kind": "approve", "task_ids": [5]}
+            ],
             "count": 7
         }))
         .unwrap();

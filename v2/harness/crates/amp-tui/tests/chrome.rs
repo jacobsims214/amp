@@ -596,10 +596,10 @@ fn plan_chip_counts_yours_apart_from_others() {
         status(&both, 80),
         "■  2 QUESTIONS  │ workers 0 │ plan: 2 of yours waiting for your approval"
     );
-    // Both link the Flight plan page.
+    // Both link the My work tab.
     let raw = render_status(&both, &palette(), 200)[0].clone();
     assert_eq!(
-        raw.matches("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07")
+        raw.matches("\x1b]8;;https://amp.simstech.cloud/project/2/my-work?approve=all\x07")
             .count(),
         2,
         "{}",

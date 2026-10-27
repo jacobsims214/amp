@@ -128,10 +128,11 @@ and ask your person to do it there." When you get one, do exactly that: give you
 say what to click, and stop. Don't look for another way round it.
 
 - **Approving a plan.** Never call `amp_approve_plan`; it never approves. Approval is per
-  ticket: each person approves **their own** tickets in the web UI (Flight plan, "Approve plan"),
-  and a project lead (or owner, admin) may approve someone else's on their behalf. After you plan,
-  run `amp_check_plan`: when tickets await approval it returns `approve_url` (the Flight plan
-  page), `awaiting_approval_tickets` (each with its `owner_user_id` and `yours`) and
+  ticket: each person approves **their own** tickets in the project's **My work** tab in the web
+  UI ("Approve"; Flight plan, the Board and the ticket drawer only link there), and a project lead
+  (or owner, admin) may approve someone else's on their behalf. After you plan, run
+  `amp_check_plan`: when tickets await approval it returns `approve_url` (the link to send your
+  user to), `awaiting_approval_tickets` (each with its `owner_user_id` and `yours`) and
   `awaiting_yours` (your user's own). That's where you stop: tell your user which of **their**
   tickets await approval ("#12, #14 and #15 are yours to approve: <approve_url>"), and that
   others' tickets wait for their owners (or a lead on their behalf). Then wait. Dispatch a ticket
@@ -140,8 +141,9 @@ say what to click, and stop. Don't look for another way round it.
   nothing. Re-check `amp_check_plan`; if work still awaits approval, send the link again.
 - **Approving an artifact** (`approve=true`). Your user clicks Approve on the artifact page. You
   may relay a "change X" verdict (`approve=false` with their note).
-- **Marking a human ticket done** (a merge, a deploy, a sign-off), theirs or a teammate's. The
-  person does it in the UI; `amp_complete_task` on a human ticket is refused with its link.
+- **Marking a human ticket done** (a deploy, a sign-off), theirs or a teammate's. The person
+  does it in the project's My work tab; `amp_complete_task` on a human ticket is refused with its
+  link.
 - **Turning plan approval off** for a project.
 
 Two refusals tell you the order of work instead: a dispatch refused because the ticket "isn't
@@ -286,27 +288,47 @@ turn, and tell your user what you changed:
 - the decision itself → a doc under `decisions/` in the project KB.
 
 **People in the loop.** When a step only a person can do is part of the plan, plan it as a human ticket.
-- **What counts:** a person reviews and merges the PR, signs off a release or a spend, uses access
-  agents don't have, makes a decision you can see coming, waits on someone outside the team, or
-  does offline work.
+- **What counts:** a person signs off a release or a spend, reviews a deliverable outside git (a
+  doc, an email draft), uses access agents don't have, makes a decision you can see coming, waits
+  on someone outside the team, or does offline work.
+- **Not a merge.** Never plan a "review and merge" human ticket. A ticket that completes with a PR
+  (or a pushed branch) is Done · Merge needed, and the tickets that depend on it wait for the
+  merge on their own. Wire the next agent work straight to the ticket that opens the PR (see
+  "Merging" below).
 - **How:** `performer: "human"`, a `human_reason`, and the person as `owner`. Wire it into
   `depends_on` both ways, so the agent work after it waits for them. See "People in the loop" in
   the `amp-planning` skill.
 - **Never dispatch one.** They're not in `ready_to_dispatch`. `waiting_on_people` tells you who
-  the plan waits on and what each one is holding up, so say it plainly to your user.
-- **Your user's own:** they mark it done in AMP's web UI (ticket drawer or My Work). You can't
+  the plan waits on and what each one is holding up, so say it plainly to your user. Each item
+  has a `kind`:
+  - `approve`: tickets await that person's plan approval (one item per epic, with `task_ids` and
+    `count`);
+  - `answer`: a ticket they own is blocked on a `question`;
+  - `merge`: a done ticket of theirs whose PR isn't merged yet (`pr_url`, `branch`,
+    `merge_state`: `needed`, or `abandoned` when the PR was closed without merging);
+  - `do`: a human ticket of theirs that is ready or in progress.
+
+  `coming_up` (in `amp_list_tasks`) lists human tickets still waiting on dependencies, a schedule
+  or approval. Mention them, but nobody can act on them yet.
+- **Your user's own:** they act in the project's **My work** tab in AMP's web UI: approve, answer,
+  mark merged, start and mark done, all in one place. You can't
   record it for them: `amp_complete_task` on a human ticket is refused. If they tell you it's
   done, check the board; if it's still open, give them the ticket link to mark it done there.
-- **A teammate's:** only its owner marks it done, in the UI; your user's word that "Sam merged
-  it" doesn't change that. Check the board first: it's usually done already, and the work after it
+- **A teammate's:** only its owner marks it done, in the UI; your user's word that "Sam signed
+  it off" doesn't change that. Check the board first: it's usually done already, and the work after it
   is ready. If it's still open, tell your user it's waiting on that person to mark it done.
 - **Human impact:** `amp_human_impact` answers "what slowed us down?" and "what could agents take
   over?" from the numbers.
 
-**Merging.** Finished work that waits on a person to merge shows in `amp_list_unmerged` (and in
-the UI's Mission, where people can mark it merged). When your user merges, or tells you to and
-the team's conventions allow it, record it: `amp_report_run(task_id, outcome="completed",
-merged=true, commit=<merge sha>)`. Tell your user what's waiting to merge at the end of a pass.
+**Merging.** Finished work that waits on a merge shows as Merge needed: in `amp_list_unmerged`
+(with its `merge_state`) and as `merge` items in `waiting_on_people`. Its dependents wait
+("Waiting on merge of #N") until the merge is recorded, once, by whichever comes first: the
+project's GitHub webhook, CI calling `amp_report_merged`, or the owner clicking **Mark merged** in
+the project's My work tab. So you rarely record one yourself. When your user merges somewhere AMP
+can't see, or tells you to and the team's conventions allow it, record it with
+`amp_report_merged` (or `amp_report_run(task_id, outcome="completed", merged=true, commit=<merge
+sha>)`); a second report is a no-op. Tell your user what's waiting to merge at the end of a pass,
+with the PR links.
 
 **Mistakes.** Deleted tickets, stories and epics stay in the trash for 30 days:
 `amp_list_deleted_tasks`, then `amp_restore_tasks` with `task_ids`, `story_ids` or `epic_ids`
@@ -325,7 +347,7 @@ permissions and the audit trail.
    (whose step the plan is waiting on; a `stale` one is worth a nudge).
 3. Read yesterday's day reports for the project — `amp_project_day_reports(project_id,
    date=<yesterday>, tz=…)` gives everyone's in one call — for handoffs ("ticketed #204 for
-   Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a person.
+   Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a merge.
 Then tell your user where things stand and what you'll start.
 
 ## Don't read the harness

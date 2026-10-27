@@ -1507,7 +1507,8 @@ pub fn web_ui_line(session: &ServerSession) -> String {
     let web = session.web_base();
     format!(
         "amp_web_ui: {web} (AMP's web UI: every link you give a person is on this origin, e.g. \
-         {web}/project/<id>/plan to approve a plan; never build links from amp_server)"
+         {web}/project/<id>/my-work?approve=all to approve a plan; never build links from \
+         amp_server)"
     )
 }
 
@@ -1741,7 +1742,7 @@ mod tests {
         assert!(
             line.starts_with(
                 "amp_web_ui: http://localhost:5173 (AMP's web UI: every link you give a person \
-                 is on this origin, e.g. http://localhost:5173/project/<id>/plan"
+                 is on this origin, e.g. http://localhost:5173/project/<id>/my-work?approve=all"
             ),
             "{line}"
         );

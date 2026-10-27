@@ -405,7 +405,7 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 	}
 	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
 		return authz.Forbidden("ticket %d isn't approved: nobody has approved it since it was planned or its scope last changed, and "+
-			"this project needs each ticket approved before agents start it. Its owner approves it in the AMP web UI (Approve plan; "+
+			"this project needs each ticket approved before agents start it. Its owner approves it in the AMP web UI (My work, Review and approve; "+
 			"a project lead may approve it on their behalf): %s. "+
 			"Agents can't approve: stop and ask your person to approve it there.", t.ID, planURL)
 	}
@@ -417,8 +417,8 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 // UpdateProject changes a project's name, description, or settings; it
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
-	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.Metadata == nil {
-		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, or metadata")
+	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil && u.Metadata == nil {
+		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, or metadata")
 	}
 	if _, _, err := u.Metadata.Split(); err != nil {
 		return nil, authz.BadRequest("%s", err.Error())
@@ -448,12 +448,18 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 	if err == nil {
 		e := domain.AuditEntry{Action: "project.settings", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 			TargetName: proj.Name, Summary: "changed project settings", Details: map[string]any{"name": u.Name, "description_changed": u.Description != nil,
-				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "metadata": u.Metadata, "channel": p.Channel},
+				"open_reassign": u.OpenReassign, "require_plan_approval": u.RequirePlanApproval, "require_merge": u.RequireMerge,
+				"metadata": u.Metadata, "channel": p.Channel},
 			After: projectSettingsOf(proj)}
 		if prevErr == nil {
 			e.Before = projectSettingsOf(prev)
 		}
 		s.audit(ctx, p, e)
+		// Switching require_merge holds or releases the tickets waiting on
+		// done-but-unmerged work.
+		if u.RequireMerge != nil && (prevErr != nil || prev.RequireMerge != proj.RequireMerge) {
+			s.reconcileMergeGated(ctx, projectID)
+		}
 	}
 	return proj, err
 }
@@ -589,7 +595,7 @@ func projectSettingsOf(p *domain.Project) map[string]any {
 		return nil
 	}
 	m := map[string]any{"name": p.Name, "description_length": len(p.Description), "open_reassign": p.OpenReassign,
-		"require_plan_approval": p.RequirePlanApproval}
+		"require_plan_approval": p.RequirePlanApproval, "require_merge": p.RequireMerge}
 	if len(p.Metadata) > 0 {
 		md := make(map[string]any, len(p.Metadata))
 		for k, v := range p.Metadata {

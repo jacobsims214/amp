@@ -98,10 +98,10 @@ describe('Sessions page', () => {
     setup()
     const [mine, box] = await screen.findAllByTestId('session-row')
     expect(within(mine).getByText('anthropic/claude-opus-5-5')).toBeInTheDocument()
-    expect(within(mine).getByRole('link', { name: '#2369 Remote control M1' })).toHaveAttribute('href', '/project/2/board?task=2369')
+    expect(within(mine).getByRole('link', { name: '#2369 Remote control M1' })).toHaveAttribute('href', '/project/2/board?focus=2369')
     expect(within(mine).getByText('Safari on iPhone')).toBeInTheDocument()
     expect(within(box).getByText('openai/gpt-5.5')).toBeInTheDocument()
-    expect(within(box).getByRole('link', { name: '#2389 Sessions list' })).toHaveAttribute('href', '/project/158/board?task=2389')
+    expect(within(box).getByRole('link', { name: '#2389 Sessions list' })).toHaveAttribute('href', '/project/158/board?focus=2389')
     expect(within(box).getByText('Chrome on Pixel 9')).toBeInTheDocument()
     expect(within(box).getByText(/in 27 days|in 28 days/)).toBeInTheDocument() // the device's pin expiry
     expect(within(box).getByText('Paired device').closest('div')).toHaveAttribute('title', expect.stringMatching(/^Chrome on Pixel 9: paired .*, trusted until /))

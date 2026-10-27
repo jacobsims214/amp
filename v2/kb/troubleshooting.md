@@ -30,7 +30,7 @@ lead hand it over (`working/changes-outside-amp.md`). Don't work it anyway.
 ## Dispatch is refused because the plan isn't approved
 
 The project requires plan approval and the ticket was planned (or edited) since it was last
-approved. Approval is per ticket: its owner approves it in **Flight plan** in the web UI, or a
+approved. Approval is per ticket: its owner approves it in the project's **My work** tab in the web UI, or a
 project lead approves it on their behalf; the refusal carries the link
 (`working/planning-and-approval.md`). Your click doesn't approve a teammate's tickets, and an
 agent can't approve anything for you.

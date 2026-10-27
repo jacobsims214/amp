@@ -508,7 +508,7 @@ mod tests {
         let t0 = Instant::now();
         let refusal = crate::approval::refusal(
             "ticket 3 isn't approved: nobody has approved it since it was planned or its scope \
-             last changed. Its owner approves it in the AMP web UI: /project/2/plan",
+             last changed. Its owner approves it in the AMP web UI: /project/2/my-work?approve=all",
         )
         .expect("refusal");
         let m0 = meta(&[3], &[], None, t0);

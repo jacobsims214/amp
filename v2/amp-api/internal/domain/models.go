@@ -58,6 +58,13 @@ type Project struct {
 	PlanApprovedAt      *time.Time `json:"plan_approved_at,omitempty"`
 	PlanApprovedBy      *int       `json:"plan_approved_by,omitempty"`
 	RequirePlanApproval bool       `json:"require_plan_approval"`
+	// RequireMerge (default on): a ticket that completes with a PR or a
+	// pushed branch holds the tickets that depend on it until its merge is
+	// recorded (Task.MergeState). Off, dependents start on completion.
+	// RequireMergeSince is when it last went on: tickets completed before
+	// then are never gated.
+	RequireMerge      bool       `json:"require_merge"`
+	RequireMergeSince *time.Time `json:"require_merge_since,omitempty"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
@@ -80,6 +87,8 @@ type ProjectSettings struct {
 	// RequirePlanApproval: tickets planned after the last approval can't be
 	// dispatched until someone approves the plan again.
 	RequirePlanApproval *bool `json:"require_plan_approval"`
+	// RequireMerge: done tickets with an unmerged PR hold their dependents.
+	RequireMerge *bool `json:"require_merge"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
@@ -183,6 +192,41 @@ type Task struct {
 	// approval is dropped; a project lead's reassignment and dispatch's
 	// automatic claim keep it (AMP #2218, Task.DropsApprovalOn).
 	ApprovedFor *int `json:"approved_for,omitempty"`
+	// Merge signal (AMP #2475). MergeRequired is set when the ticket
+	// completes with a PR or pushed branch while its project requires
+	// merges; MergeState is then "needed" until the merge is recorded, and
+	// the tickets that depend on it wait (see MergeGates). MergedAt and
+	// MergeSource are the first merge report (ui, ci or github).
+	MergeRequired bool       `json:"merge_required"`
+	MergeState    string     `json:"merge_state"`
+	MergedAt      *time.Time `json:"merged_at,omitempty"`
+	MergeSource   string     `json:"merge_source,omitempty"`
+	// WaitingDetail says why a ticket still waits when a dependency it
+	// waits on is done but not merged ("Waiting on merge of #N (PR …)").
+	// Computed by its actor, never stored.
+	WaitingDetail string `json:"waiting_detail,omitempty"`
+}
+
+// Merge states (Task.MergeState).
+const (
+	MergeNone      = "none"
+	MergeNeeded    = "needed"
+	MergeMerged    = "merged"
+	MergeAbandoned = "abandoned"
+)
+
+// Merge sources: who recorded a merge first.
+const (
+	MergeSourceUI     = "ui"
+	MergeSourceCI     = "ci"
+	MergeSourceGitHub = "github"
+)
+
+// MergeGates reports whether a done ticket in merge state ms still holds
+// the tickets that depend on it: its PR waits to be merged, or was closed
+// without merging and nobody has said it isn't needed.
+func MergeGates(ms string) bool {
+	return ms == MergeNeeded || ms == MergeAbandoned
 }
 
 // Approved reports whether a person approved the ticket as it's planned

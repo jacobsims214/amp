@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -39,22 +40,88 @@ func (r *Repo) DepInfos(ctx context.Context, ids []int) (map[int]DepInfo, error)
 	return out, rows.Err()
 }
 
-// CompletedAmong returns which of ids are completed tasks, wherever they are
-// in the project.
+// satisfiedSQL is when a dependency no longer holds the tickets after it:
+// it is completed and, while its project requires merges, its work isn't
+// waiting on a merge (merge_state needed, or abandoned: a PR closed without
+// merging). AMP #2475.
+const satisfiedSQL = `t.state = 'completed' AND (t.merge_state NOT IN ('needed', 'abandoned')
+	OR NOT (SELECT p.require_merge FROM projects p WHERE p.id = t.project_id))`
+
+// CompletedAmong returns which of ids are done as far as the tickets that
+// depend on them are concerned (satisfiedSQL), wherever they are in the
+// project.
 func (r *Repo) CompletedAmong(ctx context.Context, ids []int) (map[int]bool, error) {
-	out := map[int]bool{}
+	done, _, err := r.DepStates(ctx, ids)
+	return done, err
+}
+
+// DepStates returns which of ids are satisfied dependencies (as
+// CompletedAmong), and for each one that is completed but still waits on
+// its merge, why: "Waiting on merge of #N (PR …)".
+func (r *Repo) DepStates(ctx context.Context, ids []int) (map[int]bool, map[int]string, error) {
+	done, waits := map[int]bool{}, map[int]string{}
 	if len(ids) == 0 {
-		return out, nil
+		return done, waits, nil
 	}
-	rows, err := r.db.Query(ctx, `SELECT id FROM tasks WHERE id = ANY($1) AND state = 'completed'`, ids)
+	rows, err := r.db.Query(ctx, `SELECT t.id, (`+satisfiedSQL+`), t.state = 'completed', t.merge_state,
+		COALESCE((SELECT CASE WHEN tr.pr_url <> '' THEN 'PR ' || tr.pr_url ELSE 'branch ' || tr.branch END
+		            FROM task_runs tr WHERE tr.task_id = t.id AND (tr.pr_url <> '' OR tr.branch <> '')
+		           ORDER BY tr.created_at DESC, tr.id DESC LIMIT 1), '')
+		FROM tasks t WHERE t.id = ANY($1)`, ids)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int
+		var ok, completed bool
+		var ms, where string
+		if err := rows.Scan(&id, &ok, &completed, &ms, &where); err != nil {
+			return nil, nil, err
+		}
+		switch {
+		case ok:
+			done[id] = true
+		case completed:
+			waits[id] = MergeWaitDetail(id, ms, where)
+		}
+	}
+	return done, waits, rows.Err()
+}
+
+// MergeWaitDetail says why a done ticket still holds its dependents.
+func MergeWaitDetail(id int, mergeState, where string) string {
+	if mergeState == domain.MergeAbandoned {
+		s := fmt.Sprintf("Waiting on #%d: its PR was closed without merging", id)
+		if where != "" {
+			s += " (" + where + ")"
+		}
+		return s + "; reopen it or mark the merge not needed"
+	}
+	s := fmt.Sprintf("Waiting on merge of #%d", id)
+	if where != "" {
+		s += " (" + where + ")"
+	}
+	return s
+}
+
+// MergeGatedTasks lists a project's completed tickets whose merge state
+// would hold their dependents (needed or abandoned).
+func (r *Repo) MergeGatedTasks(ctx context.Context, projectID int) ([]int, error) {
+	rows, err := r.db.Query(ctx, `SELECT id FROM tasks WHERE project_id = $1 AND state = 'completed'
+		AND merge_state IN ('needed', 'abandoned') ORDER BY id`, projectID)
 	if err != nil {
 		return nil, err
 	}
-	done, err := pgx.CollectRows(rows, pgx.RowTo[int])
-	for _, id := range done {
-		out[id] = true
-	}
-	return out, err
+	return pgx.CollectRows(rows, pgx.RowTo[int])
+}
+
+// SetTaskMerge writes a ticket's merge fields. required nil keeps
+// merge_required; at and source are stored as given (nil/"" clear them).
+func (r *Repo) SetTaskMerge(ctx context.Context, taskID int, required *bool, state string, at *time.Time, source string) error {
+	_, err := r.db.Exec(ctx, `UPDATE tasks SET merge_required = COALESCE($2, merge_required), merge_state = $3,
+		merged_at = $4, merge_source = $5, updated_at = NOW() WHERE id = $1`, taskID, required, state, at, source)
+	return err
 }
 
 // TaskDependencies returns the tasks a task depends on.

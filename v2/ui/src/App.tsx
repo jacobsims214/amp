@@ -3,6 +3,8 @@ import { Projects } from './pages/Projects'
 import { MyWork } from './pages/MyWork'
 import { Board } from './pages/Board'
 import { Mission } from './pages/Mission'
+import { ProjectMyWork } from './pages/ProjectMyWork'
+import { ProjectLanding } from './pages/ProjectLanding'
 import { FlightPlan } from './pages/FlightPlan'
 import { DAGView } from './pages/DAG'
 import { Report } from './pages/Report'
@@ -24,7 +26,7 @@ import { AuthProvider } from './contexts/AuthContext'
 import { AppShell } from './components/shell/AppShell'
 import { LaunchSequence } from './components/brand/LaunchSequence'
 
-/** An unknown view under a project lands on its Mission page. */
+/** An unknown view under a project opens the project (My work or Mission, by the landing rule). */
 function ProjectFallback() {
   const { projectId } = useParams()
   return <Navigate to={`/project/${projectId}`} replace />
@@ -54,7 +56,10 @@ export default function App() {
             <Route path="/" element={<MyWork />} />
             <Route path="/sessions" element={<Sessions />} />
             <Route path="/projects" element={<Projects />} />
-            <Route path="/project/:projectId" element={<Mission />} />
+            {/* No tab: My work when something waits on you here, else Mission (lib/landing.ts). */}
+            <Route path="/project/:projectId" element={<ProjectLanding />} />
+            <Route path="/project/:projectId/mission" element={<Mission />} />
+            <Route path="/project/:projectId/my-work" element={<ProjectMyWork />} />
             <Route path="/project/:projectId/board" element={<Board />} />
             <Route path="/project/:projectId/plan" element={<FlightPlan />} />
             <Route path="/project/:projectId/dag" element={<DAGView />} />

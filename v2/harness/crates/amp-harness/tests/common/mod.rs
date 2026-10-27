@@ -303,7 +303,7 @@ impl ServerHandler for MockAmp {
             }
             "amp_check_plan" => ok_json(json!({
                 "project_id": 2, "require_plan_approval": true, "awaiting_approval": [4042],
-                "approve_url": "/project/2/plan"
+                "approve_url": "/project/2/my-work?approve=all"
             })),
             // M3-4: /questions answers through the metadata poller's connection.
             "amp_answer_question" => match args["task_id"].as_i64() {

@@ -696,7 +696,7 @@ pub use amp_core::approval::REFUSED_LINE;
 ///   ⏸ Waiting for your approval          (per-ticket servers, #2198: "… #2203 is yours", or
 ///                                         "Waiting for its owner's approval: #2203 is someone else's")
 ///     Plan approval is done by a person in the AMP web UI, not by an agent or over MCP: …
-///     Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)
+///     Approve it in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all   (/open plan)
 ///     The manager stopped here; nothing else was run.
 /// ```
 ///
@@ -741,7 +741,17 @@ impl ApprovalNotice {
             let inst = m.instance.as_ref()?;
             let pid = refusal.project_id.or(m.project_id)?;
             Some(match (refusal.kind, refusal.ticket_id) {
-                (RefusalKind::PlanApproval, _) => (inst.plan_url(pid), "/open plan"),
+                (RefusalKind::PlanApproval, _) => (
+                    // The refusal's own link says which page this AMP approves on (#2495).
+                    inst.approve_url(
+                        pid,
+                        refusal
+                            .link
+                            .as_deref()
+                            .or_else(|| m.plan.get().and_then(|p| p.approve_url.as_deref())),
+                    ),
+                    "/open plan",
+                ),
                 (_, Some(t)) => (inst.ticket_url(pid, t), "/open <id>"),
                 _ => (inst.project_url(pid), "/open"),
             })
@@ -770,7 +780,7 @@ impl ApprovalNotice {
 
 /// The server's sentence without its link (#2226): the notice's own link line follows, built
 /// from the instance's web URL, so a relative `/project/…` isn't shown twice. "… on their behalf):
-/// /project/71/plan. Agents …" reads "… on their behalf). Agents …".
+/// /project/71/my-work?approve=all. Agents …" reads "… on their behalf). Agents …".
 fn without_link(message: &str, link: Option<&str>) -> String {
     let Some(link) = link.filter(|l| !l.is_empty()) else {
         return message.to_owned();
@@ -834,7 +844,7 @@ impl Component for ApprovalNotice {
                     "⏸ Waiting for its owner's approval: {ticket} is someone else's (a project \
                      lead may approve it on their behalf)"
                 ),
-                "Flight plan:",
+                "Approval in AMP:",
             ),
             (RefusalKind::PlanApproval, Whose::Unknown) => (
                 format!(

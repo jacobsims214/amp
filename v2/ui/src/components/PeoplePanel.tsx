@@ -27,7 +27,7 @@ export function PeoplePanel({ tasks, activity, people, since, rangeLabel, onOpen
         <div className="overflow-x-auto">
           <table className="w-full border-collapse text-[13px]">
             <thead><tr className="bg-surface-2">
-              {['Person', 'Done', 'Now', 'Waiting on them', 'Blocked by', 'Ready next', 'Tokens', 'Last activity'].map(h =>
+              {['Person', 'Done', 'Now', 'Questions', 'Waiting on', 'Ready next', 'Tokens', 'Last activity'].map(h =>
                 <th key={h} className="amp-label text-left px-3 py-2.5 border-b border-line whitespace-nowrap">{h}</th>)}
             </tr></thead>
             <tbody>

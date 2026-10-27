@@ -184,6 +184,14 @@ func (a *StoryActor) Receive(ctx actor.Context) {
 		}
 		ctx.Send(pid, msg)
 
+	case *MsgSetMergeState:
+		pid, ok := a.tasks[msg.TaskID]
+		if !ok {
+			msg.ReplyCh <- ReplyMergeState{Err: fmt.Errorf("task %d not found in story %d", msg.TaskID, a.story.ID)}
+			return
+		}
+		ctx.Send(pid, msg)
+
 	case *MsgAddComment:
 		pid, ok := a.tasks[msg.Req.TaskID]
 		if !ok {
@@ -300,21 +308,24 @@ func (a *StoryActor) loadAndSpawnTasks(ctx actor.Context) {
 	for _, t := range tasks {
 		allDeps = append(allDeps, t.DependencyIDs...)
 	}
-	completedSet, err := a.repo.CompletedAmong(context.Background(), allDeps)
+	completedSet, waitSet, err := a.repo.DepStates(context.Background(), allDeps)
 	if err != nil {
 		a.log.Error("failed to load dependency states", "err", err)
-		completedSet = map[int]bool{}
+		completedSet, waitSet = map[int]bool{}, map[int]string{}
 	}
 
 	for _, t := range tasks {
 		// Build this task's completedDeps from the completed set.
 		completedDeps := make(map[int]bool)
+		mergeWaits := make(map[int]string)
 		for _, depID := range t.DependencyIDs {
 			if completedSet[depID] {
 				completedDeps[depID] = true
+			} else if w, ok := waitSet[depID]; ok {
+				mergeWaits[depID] = w
 			}
 		}
-		pid := a.spawnTaskActor(ctx, t, completedDeps)
+		pid := a.spawnTaskActor(ctx, t, completedDeps, mergeWaits)
 		a.tasks[t.ID] = pid
 		a.taskStates[t.ID] = t.State
 	}
@@ -331,11 +342,11 @@ func (a *StoryActor) adoptTask(ctx actor.Context, taskID int) (*domain.Task, err
 	if t.DependencyIDs, err = a.repo.TaskDependencies(context.Background(), taskID); err != nil {
 		return nil, err
 	}
-	done, err := a.repo.CompletedAmong(context.Background(), t.DependencyIDs)
+	done, waits, err := a.repo.DepStates(context.Background(), t.DependencyIDs)
 	if err != nil {
 		return nil, err
 	}
-	a.tasks[t.ID] = a.spawnTaskActor(ctx, *t, done)
+	a.tasks[t.ID] = a.spawnTaskActor(ctx, *t, done, waits)
 	a.taskStates[t.ID] = t.State
 	for _, d := range t.DependencyIDs {
 		if !done[d] {
@@ -346,9 +357,11 @@ func (a *StoryActor) adoptTask(ctx actor.Context, taskID int) (*domain.Task, err
 	return t, nil
 }
 
-func (a *StoryActor) spawnTaskActor(ctx actor.Context, t domain.Task, completedDeps map[int]bool) *actor.PID {
+func (a *StoryActor) spawnTaskActor(ctx actor.Context, t domain.Task, completedDeps map[int]bool, mergeWaits map[int]string) *actor.PID {
 	props := actor.PropsFromProducer(func() actor.Actor {
-		return NewTaskActorFromTask(t, completedDeps, ctx.Self(), a.projectPID, a.repo, a.hub)
+		ta := NewTaskActorFromTask(t, completedDeps, ctx.Self(), a.projectPID, a.repo, a.hub).(*TaskActor)
+		ta.mergeWaits = mergeWaits
+		return ta
 	})
 	name := fmt.Sprintf("story-%d-task-%d", a.story.ID, t.ID)
 	pid, err := ctx.SpawnNamed(props, name)
@@ -369,7 +382,7 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 
 	// Derive initial state from deps — which are already completed, wherever
 	// they are in the project.
-	completedDeps, err := a.repo.CompletedAmong(context.Background(), req.DependencyIDs)
+	completedDeps, mergeWaits, err := a.repo.DepStates(context.Background(), req.DependencyIDs)
 	if err != nil {
 		return nil, fmt.Errorf("db dependency states: %w", err)
 	}
@@ -388,7 +401,7 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 	}
 
 	// Spawn TaskActor.
-	pid := a.spawnTaskActor(ctx, *task, completedDeps)
+	pid := a.spawnTaskActor(ctx, *task, completedDeps, mergeWaits)
 	a.tasks[task.ID] = pid
 	a.taskStates[task.ID] = task.State
 

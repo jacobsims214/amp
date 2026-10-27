@@ -65,6 +65,11 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "audit" {
 		os.Exit(runAuditCLI(os.Args[2:], os.Stdout, os.Stderr))
 	}
+	// `amp-api backfill-owners [-apply]`: one-off owner = creator backfill
+	// on open, unowned tickets a person created (backfill_cli.go, #2476).
+	if len(os.Args) > 1 && os.Args[1] == "backfill-owners" {
+		os.Exit(runBackfillOwnersCLI(os.Args[2:], os.Stdout, os.Stderr))
+	}
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	dsn := envOrDefault("DATABASE_URL", "postgres://amp:amp@localhost:5432/amp?sslmode=disable")
@@ -505,11 +510,13 @@ func envOrDefault(key, def string) string {
 }
 
 // authExceptHealth applies the auth verifier to every path except /health
-// and /ready, which k8s liveness/readiness probes hit unauthenticated.
+// and /ready, which k8s liveness/readiness probes hit unauthenticated, and
+// GitHub's webhook deliveries (api.GitHubHookPrefix), which carry no AMP
+// session and are authenticated by their HMAC signature instead.
 func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	authed := v.Middleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}

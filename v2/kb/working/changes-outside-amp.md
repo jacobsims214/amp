@@ -12,7 +12,7 @@ the same turn.** Say it in your own words; the manager knows where each kind of 
 
 | What was decided | Where it goes in AMP |
 |---|---|
-| New scope | New epic, stories and tickets; each ticket's owner approves it in Flight plan (the agent gives you the link) if the project requires it |
+| New scope | New epic, stories and tickets; each ticket's owner approves it in their My work tab (the agent gives you the link) if the project requires it |
 | Work moves to someone else | `amp_handover_tasks` (all or some of a person's open tickets, with a reason posted on each), or `amp_assign_task` for one ticket |
 | A tracker key, cost centre, capitalizable, budget | Metadata on the project (`amp_update_project_settings`, project owners) or epic (`amp_update_epic`) |
 | Why any of the above | A doc under `decisions/` in the project KB |

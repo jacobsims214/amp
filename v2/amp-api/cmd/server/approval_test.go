@@ -19,7 +19,7 @@ import (
 // with a token issued to the UI's client) approves a plan; agents over MCP,
 // API tokens and other tokens on REST are refused with the Flight plan link.
 
-func planPath(projectID int) string { return fmt.Sprintf("/project/%d/plan", projectID) }
+func planPath(projectID int) string { return fmt.Sprintf("/project/%d/my-work?approve=all", projectID) }
 
 func approvalOn(t *testing.T, s *mcpStack) {
 	t.Helper()

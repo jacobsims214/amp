@@ -3,7 +3,13 @@ import { NavLink } from 'react-router-dom'
 // The top of every page: where you are (crumb), the title, page actions on
 // the right, and optional view tabs underneath.
 
-export interface PageTab { to: string; label: string; end?: boolean; count?: number }
+export interface PageTab {
+  to: string; label: string; end?: boolean; count?: number
+  /** the count needs the viewer (white on the accent); otherwise it's quiet */
+  hot?: boolean
+  /** what the count is, for the link's accessible name ("My work, 6 waiting on you") */
+  countLabel?: string
+}
 
 export function PageHeader({ crumb, title, meta, actions, tabs, children }: {
   crumb?: React.ReactNode
@@ -27,10 +33,12 @@ export function PageHeader({ crumb, title, meta, actions, tabs, children }: {
       {tabs && (
         <nav className="flex px-7 gap-0 -mb-px overflow-x-auto" aria-label="Views">
           {tabs.map(t => (
-            <NavLink key={t.to} to={t.to} end={t.end}
+            <NavLink key={t.to} to={t.to} end={t.end} aria-label={t.count != null && t.countLabel ? `${t.label}, ${t.count} ${t.countLabel}` : undefined}
               className={({ isActive }) => `font-label text-[12px] font-semibold uppercase tracking-[0.16em] px-3.5 pt-3 pb-2.5 border-b-2 whitespace-nowrap ${
                 isActive ? 'text-ink border-accent' : 'text-ink-3 border-transparent hover:text-ink-2'}`}>
-              {t.label}{t.count != null && <span className="amp-num ml-1.5 text-ink-3">{t.count}</span>}
+              {t.label}{t.count != null && (
+                <span className={`amp-num ml-1.5 tracking-normal ${t.hot ? 'text-white bg-accent px-[5px] py-px' : 'text-ink-3'}`}>{t.count}</span>
+              )}
             </NavLink>
           ))}
         </nav>
@@ -69,11 +77,15 @@ export function Panel({ title, label, right, top, className = '', children }: {
 }
 
 /** A row of large numbers (readouts) under a black top rule. */
-export function Readouts({ items }: { items: { label: string; value: React.ReactNode; sub?: React.ReactNode; color?: string; alarm?: boolean }[] }) {
+export function Readouts({ items, wrap }: {
+  items: { label: string; value: React.ReactNode; sub?: React.ReactNode; color?: string; alarm?: boolean }[]
+  /** On a phone, three per row instead of all in one row. */
+  wrap?: boolean
+}) {
   return (
-    <div className="amp-panel amp-panel-top grid" style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}>
+    <div className={`amp-panel amp-panel-top grid ${wrap ? 'amp-readouts-wrap' : ''}`} style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}>
       {items.map((it, i) => (
-        <div key={it.label} className={`px-4 py-3 grid gap-1.5 ${i ? 'border-l border-line' : ''}`}
+        <div key={it.label} className={`amp-readout px-4 py-3 grid gap-1.5 ${i ? 'border-l border-line' : ''}`}
           style={it.alarm ? { background: 'var(--st-flag)' } : undefined}>
           <span className="amp-label" style={it.alarm ? { color: '#fff' } : undefined}>{it.label}</span>
           <span className="amp-num text-[26px] leading-none" style={{ color: it.alarm ? '#fff' : it.color ?? 'var(--ink)' }}>{it.value}</span>

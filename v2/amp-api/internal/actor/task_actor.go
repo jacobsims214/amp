@@ -30,9 +30,12 @@ import (
 type TaskActor struct {
 	task          domain.Task
 	completedDeps map[int]bool // which of task.DependencyIDs are already done
-	detached      bool         // stopped for a move: don't deregister from routing
-	storyPID      *actor.PID   // parent StoryActor — receives upward notifications
-	projectPID    *actor.PID   // ProjectActor — receives MsgRegisterTask on start
+	// mergeWaits: dependencies that are done but whose merge isn't recorded
+	// (they still hold this task), with why (repository.MergeWaitDetail).
+	mergeWaits    map[int]string
+	detached      bool       // stopped for a move: don't deregister from routing
+	storyPID      *actor.PID // parent StoryActor — receives upward notifications
+	projectPID    *actor.PID // ProjectActor — receives MsgRegisterTask on start
 	projectID     int
 	repo          *repository.Repo
 	hub           *hub.Hub
@@ -197,9 +200,32 @@ func (a *TaskActor) Receive(ctx actor.Context) {
 		msg.ReplyCh <- ReplySimple{Err: err}
 
 	case *MsgDepCompleted:
+		if msg.MergeWait != "" {
+			// A dependency is done but waits on its merge: it still holds
+			// this task. Re-derive from the database (it may have been
+			// released before, if the merge was reported after completion).
+			if a.dependsOn(msg.CompletedTaskID) {
+				if err := a.reconcileDeps("a dependency waits on its merge"); err != nil {
+					a.log.Error("failed to reconcile on a merge wait", "err", err)
+				}
+				// The sender knows the PR even before its run is recorded.
+				if !a.completedDeps[msg.CompletedTaskID] {
+					if a.mergeWaits == nil {
+						a.mergeWaits = map[int]string{}
+					}
+					a.mergeWaits[msg.CompletedTaskID] = msg.MergeWait
+					a.publish(domain.EventTaskUpdated, a.withBlockedBy())
+				}
+			}
+			return
+		}
 		// A dependency finished — check if we are now unblocked.
 		a.completedDeps[msg.CompletedTaskID] = true
+		delete(a.mergeWaits, msg.CompletedTaskID)
 		a.checkUnblock(ctx)
+
+	case *MsgSetMergeState:
+		msg.ReplyCh <- a.handleSetMergeState(ctx, msg)
 
 	case *MsgScheduledUnblock:
 		// Timer fired — transition task from blocked to backlog
@@ -327,6 +353,21 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) erro
 	if err := a.saveState(domain.TaskStateCompleted, ""); err != nil {
 		return fmt.Errorf("db complete: %w", err)
 	}
+	mergeWait := ""
+	if msg.MergeRequired {
+		// Done, but its work waits on a merge: the tickets after it keep
+		// waiting until the merge is recorded (AMP #2475).
+		yes := true
+		if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &yes, domain.MergeNeeded, nil, ""); err != nil {
+			return fmt.Errorf("db merge needed: %w", err)
+		}
+		a.task.MergeRequired, a.task.MergeState, a.task.MergedAt, a.task.MergeSource = true, domain.MergeNeeded, nil, ""
+		mergeWait = repository.MergeWaitDetail(a.task.ID, domain.MergeNeeded, msg.MergeWhere)
+	} else if domain.MergeGates(a.task.MergeState) {
+		// Reopened and done again while its earlier work still waits on a
+		// merge: it keeps holding its dependents.
+		mergeWait = repository.MergeWaitDetail(a.task.ID, a.task.MergeState, "")
+	}
 
 	a.publish(domain.EventTaskCompleted, a.withBlockedBy())
 	if a.task.IsHuman() {
@@ -348,9 +389,14 @@ func (a *TaskActor) handleComplete(ctx actor.Context, msg *MsgCompleteTask) erro
 	// Synchronously ask ProjectActor to fan MsgDepCompleted to ALL epics/stories/tasks.
 	// We WAIT for this to complete before returning, so that any caller who reads
 	// task state after MsgCompleteTask returns will see the unblocked state immediately.
+	// With a merge needed the fan-out tells dependents why they still wait.
 	fanReplyCh := make(chan ReplySimple, 1)
-	ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, ReplyCh: fanReplyCh})
+	ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, MergeWait: mergeWait, ReplyCh: fanReplyCh})
 	<-fanReplyCh
+	if msg.MergeRequired {
+		a.logActivity("system", "merge_needed", "", "", "Done; its work waits on a merge ("+nameOr(msg.MergeWhere, "pushed work")+
+			"), so the tickets that depend on it wait until the merge is recorded")
+	}
 
 	// Then notify parent StoryActor for state rollup (async is fine for rollup).
 	ctx.Send(a.storyPID, &MsgTaskCompleted{TaskID: a.task.ID})
@@ -698,11 +744,10 @@ func (a *TaskActor) checkUnblock(ctx actor.Context) {
 // dependencies becomes ready once none are left. Tasks in progress,
 // completed, or blocked for another reason keep their state.
 func (a *TaskActor) reconcileDeps(why string) error {
-	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	done, err := a.readDeps()
 	if err != nil {
 		return fmt.Errorf("read dependency states: %w", err)
 	}
-	a.completedDeps = done
 	waiting := false
 	for _, d := range a.task.DependencyIDs {
 		if !done[d] {
@@ -742,11 +787,10 @@ func (a *TaskActor) openDeps() ([]int, error) {
 	if len(a.task.DependencyIDs) == 0 {
 		return nil, nil
 	}
-	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	done, err := a.readDeps()
 	if err != nil {
 		return nil, err
 	}
-	a.completedDeps = done
 	var open []int
 	for _, d := range a.task.DependencyIDs {
 		if !done[d] {
@@ -797,16 +841,115 @@ func (a *TaskActor) holdForDeps(want domain.TaskState) (domain.TaskState, error)
 	return want, a.refuseOpenDeps(doing)
 }
 
-// withBlockedBy returns a copy of the task with BlockedByIDs computed from completedDeps.
+// withBlockedBy returns a copy of the task with BlockedByIDs computed from
+// completedDeps, and WaitingDetail naming the dependencies among them that
+// are done but wait on their merge.
 func (a *TaskActor) withBlockedBy() domain.Task {
 	t := a.task
 	t.BlockedByIDs = nil
+	t.WaitingDetail = ""
+	var waits []string
 	for _, depID := range a.task.DependencyIDs {
 		if !a.completedDeps[depID] {
 			t.BlockedByIDs = append(t.BlockedByIDs, depID)
+			if w := a.mergeWaits[depID]; w != "" {
+				waits = append(waits, w)
+			}
 		}
 	}
+	t.WaitingDetail = strings.Join(waits, "; ")
 	return t
+}
+
+// readDeps re-reads which dependencies are satisfied, and which of the
+// rest are done but wait on their merge, into completedDeps/mergeWaits.
+func (a *TaskActor) readDeps() (map[int]bool, error) {
+	done, waits, err := a.repo.DepStates(context.Background(), a.task.DependencyIDs)
+	if err != nil {
+		return nil, err
+	}
+	a.completedDeps, a.mergeWaits = done, waits
+	return done, nil
+}
+
+// dependsOn reports whether id is one of the task's dependencies.
+func (a *TaskActor) dependsOn(id int) bool {
+	for _, d := range a.task.DependencyIDs {
+		if d == id {
+			return true
+		}
+	}
+	return false
+}
+
+// handleSetMergeState applies MsgSetMergeState. A change that stops the
+// ticket holding its dependents (merged, or not needed) releases them the
+// way completion does; one that starts holding them (a PR reported after
+// completion, an abandoned PR) makes them wait again.
+func (a *TaskActor) handleSetMergeState(ctx actor.Context, msg *MsgSetMergeState) ReplyMergeState {
+	cur := a.task.MergeState
+	if cur == "" {
+		cur = domain.MergeNone
+	}
+	if len(msg.From) > 0 {
+		ok := false
+		for _, f := range msg.From {
+			ok = ok || f == cur
+		}
+		if !ok {
+			t := a.withBlockedBy()
+			return ReplyMergeState{Task: &t}
+		}
+	}
+	required := a.task.MergeRequired
+	if msg.Required != nil {
+		required = *msg.Required
+	}
+	if cur == msg.State && required == a.task.MergeRequired {
+		t := a.withBlockedBy()
+		return ReplyMergeState{Task: &t}
+	}
+	at, source := a.task.MergedAt, a.task.MergeSource
+	if msg.State == domain.MergeMerged {
+		at, source = msg.At, msg.Source
+		if at == nil {
+			now := time.Now()
+			at = &now
+		}
+	} else if msg.State != cur {
+		at, source = nil, ""
+	}
+	if err := a.repo.SetTaskMerge(context.Background(), a.task.ID, &required, msg.State, at, source); err != nil {
+		return ReplyMergeState{Err: fmt.Errorf("db merge state: %w", err)}
+	}
+	done := a.task.State == domain.TaskStateCompleted
+	heldBefore := done && domain.MergeGates(cur)
+	heldAfter := done && domain.MergeGates(msg.State)
+	a.task.MergeRequired, a.task.MergeState, a.task.MergedAt, a.task.MergeSource = required, msg.State, at, source
+	a.task.UpdatedAt = time.Now()
+
+	detail := msg.Detail
+	if detail == "" {
+		detail = "Merge state " + cur + " → " + msg.State
+	}
+	a.logActivityBy(nameOr(msg.ByName, "system"), msg.By, "merge_"+msg.State, "", "", detail)
+	t := a.withBlockedBy()
+	a.publish(domain.EventTaskUpdated, t)
+
+	switch {
+	case heldBefore && !heldAfter:
+		fan := make(chan ReplySimple, 1)
+		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID, ReplyCh: fan})
+		<-fan
+	case heldAfter:
+		// Newly held, or held for a new reason (an abandoned PR): dependents
+		// wait (again) and say why.
+		fan := make(chan ReplySimple, 1)
+		ctx.Send(a.projectPID, &MsgFanDepCompleted{CompletedTaskID: a.task.ID,
+			MergeWait: repository.MergeWaitDetail(a.task.ID, msg.State, msg.Where), ReplyCh: fan})
+		<-fan
+	}
+	return ReplyMergeState{Task: &t, Changed: true}
 }
 
 func (a *TaskActor) publish(evtType domain.EventType, payload interface{}) {
@@ -974,11 +1117,10 @@ func (a *TaskActor) handleScheduledUnblock(ctx actor.Context) {
 // reason — "waiting on its dependencies" — which checkUnblock/reconcileDeps
 // release once the last dependency completes. Publishes and logs the change.
 func (a *TaskActor) releaseFromSchedule(why string) error {
-	done, err := a.repo.CompletedAmong(context.Background(), a.task.DependencyIDs)
+	done, err := a.readDeps()
 	if err != nil {
 		return fmt.Errorf("read dependency states: %w", err)
 	}
-	a.completedDeps = done
 	waiting := 0
 	for _, d := range a.task.DependencyIDs {
 		if !done[d] {

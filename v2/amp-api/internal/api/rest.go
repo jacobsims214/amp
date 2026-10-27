@@ -140,10 +140,14 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
 	mux.HandleFunc("/api/my-work", h.myWork)
+	mux.HandleFunc("/api/my-work/", h.myWork)
 	mux.HandleFunc("/api/trace", h.trace)
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 	mux.HandleFunc("/api/artifacts/", h.artifactSub)
+	// GitHub's deliveries: no AMP session, authenticated by their HMAC
+	// signature only (main leaves this prefix out of the auth middleware).
+	mux.mux.HandleFunc(GitHubHookPrefix, h.githubHook)
 }
 
 // ---- /api/me ----
@@ -784,6 +788,25 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, report)
 		return
 
+	case "my-work":
+		h.projectMyWork(w, r, pr, projectID)
+		return
+
+	case "waiting-on-people":
+		// Mission's Waiting on people: each person's counts by kind and
+		// ticket ids, from the same WaitingOn as My work and MCP. Any member.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		out, err := h.svc.ProjectWaitingOnPeople(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, out)
+		return
+
 	case "plan-check":
 		report, err := h.svc.CheckPlan(r.Context(), pr, projectID)
 		if err != nil {
@@ -830,6 +853,14 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	case "webhooks":
 		h.webhookCollection(w, r, pr, nil, &projectID)
+		return
+
+	case "github-hook":
+		sub := ""
+		if len(parts) > 2 {
+			sub = parts[2]
+		}
+		h.projectGitHubHook(w, r, pr, projectID, sub)
 		return
 
 	case "reset":
@@ -1389,6 +1420,41 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "merge":
+		// POST /tasks/{id}/merge {merge_commit?}: Mark merged (recorded once;
+		// a repeat returns the first record). POST /tasks/{id}/merge/not-needed:
+		// the work won't be merged, release what waits on it (AMP #2475).
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var rec service.MergeRecord
+		var err error
+		switch {
+		case len(parts) == 2:
+			var body struct {
+				MergeCommit string `json:"merge_commit"`
+			}
+			if r.ContentLength != 0 {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					jsonErr(w, err, 400)
+					return
+				}
+			}
+			rec, err = h.svc.MarkTaskMerged(r.Context(), pr, taskID, "", body.MergeCommit)
+		case len(parts) == 3 && parts[2] == "not-needed":
+			rec, err = h.svc.MarkMergeNotNeeded(r.Context(), pr, taskID)
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, rec)
+		return
+
 	case "runs":
 		if r.Method == http.MethodPost {
 			// Record a run (e.g. a person marking the work merged).
@@ -1607,6 +1673,31 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, map[string]interface{}{"task": updated})
 
+	case "reopen":
+		// POST /tasks/{id}/reopen: a done ticket goes back to ready (or
+		// waiting, when a dependency is open). My work's "Reopen ticket" on
+		// a PR closed without merging (AMP #2483); the same as setting the
+		// state to backlog in the web UI.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		cur, err := h.svc.Repo.GetTask(r.Context(), taskID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		if cur.State != domain.TaskStateCompleted {
+			jsonErr(w, fmt.Errorf("ticket %d isn't done (it is %s); only a done ticket is reopened", taskID, cur.State), 409)
+			return
+		}
+		t, err := h.svc.SetTaskState(r.Context(), pr, taskID, domain.TaskStateBacklog, "")
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]any{"task": t})
+
 	case "start_at":
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)
@@ -1640,7 +1731,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 // the ticket is "work" on it.
 func taskActionFor(method, sub string) authz.TaskAction {
 	switch {
-	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch":
+	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch", sub == "merge":
 		return authz.TaskRead
 	case sub == "" && method == http.MethodDelete:
 		return authz.TaskDelete

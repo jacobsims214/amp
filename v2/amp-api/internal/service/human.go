@@ -109,6 +109,12 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if done.HoursWorked != nil {
 		details["hours_worked"] = *done.HoursWorked
 	}
+	// Bridge (AMP #2475): a person's ticket done with a PR link (a legacy
+	// merge ticket) records that PR merged on the agent tickets that
+	// produced it, so one acknowledgement clears both.
+	if ids := s.bridgeHumanMerge(ctx, p, t, run.PRURL); len(ids) > 0 {
+		details["merged_task_ids"] = ids
+	}
 	s.audit(ctx, p, domain.AuditEntry{Action: "task.human.complete", ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID),
 		TargetName: t.Name, Summary: fmt.Sprintf("%s marked their ticket %d done", p.Label(), taskID), Details: details})
 	updated, err := s.Repo.GetTask(ctx, taskID)

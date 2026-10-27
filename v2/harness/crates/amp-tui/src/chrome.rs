@@ -18,7 +18,7 @@
 //! - **Status line:** the red questions chip, this chat's workers (from its supervisor only;
 //!   tickets in progress elsewhere are in the board counts), plan approval ("N of yours waiting
 //!   for your approval", and others' tickets apart since per-ticket approval (#2198), links to
-//!   the Flight plan page), the board counts in the web UI's words, the
+//!   the My work tab where they approve, #2495), the board counts in the web UI's words, the
 //!   current ticket's artifacts in review, and, right-aligned, whether this session reported its
 //!   run to AMP.
 //!
@@ -163,7 +163,7 @@ struct Inputs {
     last_report: Option<i64>,
     /// Report calls in flight: call id → ticket.
     pending: HashMap<String, i64>,
-    /// The chat waits for a person's plan approval in AMP (#2425): the Flight plan link.
+    /// The chat waits for a person's plan approval in AMP (#2425): the approval link (My work).
     approval_wait: Option<String>,
 }
 
@@ -179,7 +179,7 @@ pub struct ChromeData {
     /// What each worker is for and how it is doing (#2347; empty without a shell).
     pub roster: Vec<crate::roster::WorkerEntry>,
     /// The chat waits for a person's plan approval in AMP and resumes the manager by itself
-    /// (#2425): the Flight plan link.
+    /// (#2425): the approval link (the project's My work tab, #2495).
     pub approval_wait: Option<String>,
 }
 
@@ -884,12 +884,13 @@ pub fn render_status(data: &ChromeData, p: &AmpPalette, width: usize) -> Vec<Str
         && let Some(plan) = meta.plan.get()
         && !plan.awaiting_approval.is_empty()
     {
-        let plan_link = |painted: String| match (&meta.instance, meta.project_id) {
-            (Some(inst), Some(pid)) => link(&inst.plan_url(pid), &painted),
-            _ => painted,
-        };
-        // #2171: the plan waits on the person at the keyboard; the chip links to the Flight plan
-        // page where they approve it (`/open plan` opens it too). Their next step outranks the
+        let plan_link =
+            |painted: String| match meta.project_id.and_then(|pid| meta.approve_url(pid)) {
+                Some(url) => link(&url, &painted),
+                None => painted,
+            };
+        // #2171: the plan waits on the person at the keyboard; the chip links to the project's My
+        // work tab where they approve it (#2495) (`/open plan` opens it too). Their next step outranks the
         // workers count when the line is narrow (only the questions chip stays longer).
         // #2198: approval is per ticket. The chip counts the person's own tickets; others' wait
         // for their owners (or a lead), so they get a quieter segment that goes first.
@@ -1218,7 +1219,9 @@ pub mod sample {
                 awaiting_approval: vec![2108, 2109],
                 plan_approved_at: None,
                 plan_approved_by: None,
-                approve_url: Some("https://amp.simstech.cloud/project/2/plan".into()),
+                approve_url: Some(
+                    "https://amp.simstech.cloud/project/2/my-work?approve=all".into(),
+                ),
                 tickets: None,
             }),
             plan_awaiting_since: None,

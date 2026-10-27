@@ -60,7 +60,8 @@ const DISPATCH_TOOLS: &[&str] = &["amp_run_ticket", "amp_dispatch_task"];
 /// What a refusal asks of the person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusalKind {
-    /// The plan waits for a person's approval (the Flight plan page).
+    /// The plan waits for a person's approval (the project's My work tab; Flight plan before
+    /// #2495).
     PlanApproval,
     /// Another step only a person takes in the web UI (an artifact, a person's ticket, settings).
     PersonInUi,
@@ -107,9 +108,11 @@ pub fn refusal(text: &str) -> Option<Refusal> {
         .as_deref()
         .and_then(|l| number_after(l, "task="))
         .or_else(|| gate.then(|| ticket_named(text)).flatten());
+    // The approval page: My work (`/project/N/my-work?approve=all`, #2495), or Flight plan
+    // (`/project/N/plan`) from an AMP older than My work.
     let plan_link = link
         .as_deref()
-        .is_some_and(|l| l.trim_end_matches('/').ends_with("/plan"));
+        .is_some_and(|l| crate::meta::is_my_work_link(l) || crate::meta::is_flight_plan_link(l));
     let kind = if gate || plan_link || message.contains("Plan approval is done by a person") {
         RefusalKind::PlanApproval
     } else {
@@ -469,6 +472,31 @@ mod tests {
         assert_eq!(
             (r.kind, r.ticket_id, r.per_ticket),
             (RefusalKind::PlanApproval, Some(77), true)
+        );
+
+        // #2495: approval links point at the project's My work tab.
+        let my_work = "ticket 2203 isn't approved: nobody has approved it since it was planned or \
+             its scope last changed, and this project needs each ticket approved before agents \
+             start it. Its owner approves it in the AMP web UI (My work, Review and approve; a \
+             project lead may approve it on their behalf): /project/2/my-work?approve=all. Agents \
+             can't approve: stop and ask your person to approve it there.";
+        let r = refusal(my_work).unwrap();
+        assert_eq!(r.kind, RefusalKind::PlanApproval);
+        assert_eq!(r.link.as_deref(), Some("/project/2/my-work?approve=all"));
+        assert_eq!((r.project_id, r.ticket_id), (Some(2), Some(2203)));
+        assert!(r.per_ticket);
+        let ui_only = "Plan approval is done by a person in the AMP web UI, not by an agent or \
+             over MCP: https://amp.test/project/5/my-work?approve=all. Stop and ask your person \
+             to do it there. {\"approve_url\":\"https://amp.test/project/5/my-work?approve=all\"}";
+        let r = refusal(ui_only).unwrap();
+        assert_eq!(r.kind, RefusalKind::PlanApproval);
+        assert_eq!(
+            (r.link.as_deref(), r.project_id, r.ticket_id),
+            (
+                Some("https://amp.test/project/5/my-work?approve=all"),
+                Some(5),
+                None
+            )
         );
 
         for other in [

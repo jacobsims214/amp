@@ -125,6 +125,9 @@ func (a *EpicActor) Receive(ctx actor.Context) {
 	case *MsgApproveTask:
 		a.routeToStory(ctx, msg.TaskID, msg)
 
+	case *MsgSetMergeState:
+		a.routeToStory(ctx, msg.TaskID, msg)
+
 	case *MsgAddComment:
 		a.routeToStory(ctx, msg.Req.TaskID, msg)
 

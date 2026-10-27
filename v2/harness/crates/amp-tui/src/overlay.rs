@@ -1721,7 +1721,8 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
             ])),
             Some(plan) => {
                 // #2171: a person approves in the web UI; agents can't. Say so, and link the
-                // Flight plan page (`o` on these rows, or `/open plan`).
+                // project's My work tab, where they approve (#2495; `o` on these rows, or
+                // `/open plan`).
                 // #2198: approval is per ticket. The person's own tickets are theirs to approve;
                 // others' wait for their owners (a project lead may approve them on their behalf).
                 let ids = |list: &[i64]| -> String {
@@ -1732,7 +1733,7 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
                     }
                     out.join(" ")
                 };
-                let approve = m.instance.as_ref().map(|i| i.plan_url(pid));
+                let approve = m.approve_url(pid);
                 let target = |row: Row| match &approve {
                     Some(url) => row.target(Target::Page(url.clone())),
                     None => row,
@@ -1759,7 +1760,7 @@ fn plan_rows(state: &PanelState, data: &ChromeData, p: &AmpPalette) -> Vec<Row> 
                             })),
                             match &approve {
                                 Some(url) => fixed(link(url, &c.accent.fg(url))),
-                                None => flex("the project's Flight plan page", c.dim),
+                                None => flex("the project's My work tab", c.dim),
                             },
                             fixed(c.dim.fg("(o or /open plan)")),
                         ])

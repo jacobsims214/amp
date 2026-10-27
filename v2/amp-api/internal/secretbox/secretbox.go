@@ -45,6 +45,9 @@ const Prefix = "enc:v1:"
 const (
 	PurposeWebhookAuthHeader = "webhooks.auth_header_value"
 	PurposeWebhookSecret     = "webhooks.secret"
+	// PurposeGitHubHookSecret is a project's inbound GitHub webhook
+	// secret (AMP #2479).
+	PurposeGitHubHookSecret = "project_github_hooks.secret"
 )
 
 // ErrNoKey: there is no current key to seal with.
