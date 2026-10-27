@@ -153,8 +153,20 @@ def test_least_privilege(docs, label, db_secret="amp-relay-db", tok_secret="amp-
     if roles:
         r = roles[0]
         check(r["login"] is True and r["ensure"] == "present", f"{label}: relay role must log in")
+        # Least privilege: none of these may be granted. CNPG's default for
+        # each is false, and #2474: the chart must not write them as `false`
+        # either, because CNPG drops false omitempty booleans when it stores
+        # the Cluster and ArgoCD's diff then never matches (endless
+        # OutOfSync/self-heal). Absent is the only allowed value.
         for flag in ("superuser", "createdb", "createrole", "replication", "bypassrls"):
-            check(r.get(flag) is False, f"{label}: relay role {flag} must be false")
+            check(flag not in r, f"{label}: relay role renders {flag}: {r.get(flag)!r} (omit it; CNPG's default is false)")
+        check(r.get("inherit") is False, f"{label}: relay role inherit must be false")
+    # #2474: no managed role renders a false flag CNPG would drop. inherit is
+    # the one boolean CNPG keeps as false (a pointer defaulting to true).
+    for role_ in roles:
+        dropped = sorted(k for k, v in role_.items() if v is False and k != "inherit")
+        check(not dropped, f"{label}: managed role {role_.get('name')} renders false flags CNPG drops: {dropped}")
+    if roles:
         check(r["passwordSecret"]["name"] == db_secret, f"{label}: relay role password Secret {r['passwordSecret']}")
     sec = find(docs, "Secret", "amp-relay-db")
     tok = find(docs, "Secret", "amp-relay-cluster-token")

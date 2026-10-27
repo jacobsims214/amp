@@ -24,18 +24,20 @@ spec:
   # amp-relay's own login role (#2392). CloudNativePG creates it and keeps its
   # password in step with the Secret; amp-api (which owns the tables) grants
   # it only what the relay uses, after migrating (RELAY_DB_ROLE).
+  #
+  # Only fields that differ from CNPG's defaults, or that CNPG stores as
+  # given, are written (#2474). superuser, createdb, createrole, replication
+  # and bypassrls are plain omitempty booleans in CNPG's API: `false` is
+  # already the default and is dropped when the Cluster is stored, so writing
+  # it makes a GitOps diff (ArgoCD) never match and re-apply forever. inherit
+  # is a pointer defaulting to true, so its `false` is kept and stored.
   managed:
     roles:
       - name: {{ .Values.relay.database.role }}
         ensure: present
         comment: amp-relay (remote control relay), least privilege
         login: true
-        superuser: false
-        createdb: false
-        createrole: false
         inherit: false
-        replication: false
-        bypassrls: false
         connectionLimit: 20
         passwordSecret:
           name: {{ include "amp.relayDbSecret" . }}
