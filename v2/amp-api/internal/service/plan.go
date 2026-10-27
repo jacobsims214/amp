@@ -434,6 +434,115 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 	if len(r.AwaitingApproval) > 0 {
 		r.ApproveURL = s.PlanURL(projectID)
 	}
+	stuck := planGraph(r, tasks, stories)
+
+	// Metadata drift: epics missing keys most of their sibling epics carry
+	// (e.g. capitalizable, jira_epic), often under a near-miss name instead.
+	// Reports group by these keys, so a missing or misspelled one silently
+	// drops the epic's work from a finance or Jira rollup.
+	if epics, err := s.Repo.ListEpics(ctx, projectID); err == nil && len(epics) >= 3 {
+		freq := map[string]int{}
+		for _, e := range epics {
+			for k := range e.Metadata {
+				freq[k]++
+			}
+		}
+		expected := map[string]bool{}
+		for k, n := range freq {
+			if n >= 2 && n*10 >= len(epics)*6 { // on at least 60% of epics
+				expected[k] = true
+			}
+		}
+		var drift []string
+		for _, e := range epics {
+			var missing, odd []string
+			for k := range expected {
+				if _, ok := e.Metadata[k]; !ok {
+					missing = append(missing, k)
+				}
+			}
+			if len(missing) == 0 {
+				continue
+			}
+			for k := range e.Metadata {
+				if !expected[k] && freq[k] == 1 {
+					odd = append(odd, k)
+				}
+			}
+			sort.Strings(missing)
+			sort.Strings(odd)
+			line := fmt.Sprintf("epic %q (#%d) lacks %s", e.Name, e.ID, strings.Join(missing, ", "))
+			if len(odd) > 0 {
+				line += " but has " + strings.Join(odd, ", ") + " (only this epic uses that)"
+			}
+			drift = append(drift, line)
+		}
+		if len(drift) > 0 {
+			sort.Strings(drift)
+			r.Issues = append(r.Issues, PlanIssue{
+				Kind: "metadata_drift", Severity: "warn",
+				Message: "Epics don't carry the same metadata: " + strings.Join(drift, "; ") + ". Reports group by these keys, so this work drops out of those rollups.",
+				Fix:     "Set the missing keys with amp_update_epic metadata (use the same key names the other epics use), and remove a misspelled key by setting it to null.",
+			})
+		}
+	}
+
+	// A plan with an empty project KB: the decisions behind it live only in
+	// the planner's session, and the next session or engineer starts blind.
+	if r.OpenTasks > 0 && s.KB != nil {
+		if n, err := s.KB.CountDocs(ctx, kb.Project(projectID)); err == nil && n == 0 {
+			r.Issues = append(r.Issues, PlanIssue{
+				Kind:    "no_context",
+				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
+				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
+			})
+		}
+	}
+
+	// Blocked by dependencies that are all done: left stuck by older versions
+	// of AMP. The ticket should be ready; repair it.
+	if len(stuck) > 0 {
+		s.ReconcileDependents(ctx, projectID, stuck, nil)
+		r.RepairedTaskIDs = stuck
+	}
+
+	r.LongestChain = longestChain(tasks)
+	r.OK = true
+	for _, iss := range r.Issues {
+		if iss.Severity != "warn" {
+			r.OK = false
+		}
+	}
+	r.Summary = fmt.Sprintf("%d tickets (%d open), %d dependencies, %d ready to dispatch now, longest chain %d.",
+		r.Tasks, r.OpenTasks, r.Dependencies, len(r.ReadyNow), r.LongestChain)
+	warns := 0
+	for _, iss := range r.Issues {
+		if iss.Severity == "warn" {
+			warns++
+		}
+	}
+	switch {
+	case r.OK && warns == 0:
+		r.Summary += " No problems found."
+	case r.OK:
+		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
+	}
+	if n := len(r.HumanGates); n > 0 {
+		r.Summary += fmt.Sprintf(" %d step(s) are done by people (human_gates); the work after them waits for them.", n)
+	}
+	if len(stuck) > 0 {
+		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
+	}
+	return r, nil
+}
+
+// planGraph adds to r what the dependency graph of tasks (a whole project's
+// tickets) and its stories show: dependency and open counts, the tickets
+// ready now, isolated tickets, too much starting at once, empty stories,
+// human gates, human tickets without an owner and gates coupling people's
+// work. It returns the tickets stuck blocked on dependencies that are all
+// done. Pure: CheckPlan and the My work approval plan both use it.
+func planGraph(r *PlanReport, tasks []domain.Task, stories []domain.Story) (stuck []int) {
 	byID := map[int]domain.Task{}
 	dependents := map[int]int{}
 	for _, t := range tasks {
@@ -444,7 +553,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 		}
 	}
 
-	var isolated, stuck []int
+	var isolated []int
 	for _, t := range tasks {
 		if t.State == domain.TaskStateCompleted {
 			continue
@@ -585,105 +694,7 @@ func (s *Service) CheckPlan(ctx context.Context, p authz.Principal, projectID in
 			Fix: "If the waiting tickets only need part of it, split the gate (e.g. one check per stack or per person) and re-point dependencies with amp_set_task_dependencies.",
 		})
 	}
-
-	// Metadata drift: epics missing keys most of their sibling epics carry
-	// (e.g. capitalizable, jira_epic), often under a near-miss name instead.
-	// Reports group by these keys, so a missing or misspelled one silently
-	// drops the epic's work from a finance or Jira rollup.
-	if epics, err := s.Repo.ListEpics(ctx, projectID); err == nil && len(epics) >= 3 {
-		freq := map[string]int{}
-		for _, e := range epics {
-			for k := range e.Metadata {
-				freq[k]++
-			}
-		}
-		expected := map[string]bool{}
-		for k, n := range freq {
-			if n >= 2 && n*10 >= len(epics)*6 { // on at least 60% of epics
-				expected[k] = true
-			}
-		}
-		var drift []string
-		for _, e := range epics {
-			var missing, odd []string
-			for k := range expected {
-				if _, ok := e.Metadata[k]; !ok {
-					missing = append(missing, k)
-				}
-			}
-			if len(missing) == 0 {
-				continue
-			}
-			for k := range e.Metadata {
-				if !expected[k] && freq[k] == 1 {
-					odd = append(odd, k)
-				}
-			}
-			sort.Strings(missing)
-			sort.Strings(odd)
-			line := fmt.Sprintf("epic %q (#%d) lacks %s", e.Name, e.ID, strings.Join(missing, ", "))
-			if len(odd) > 0 {
-				line += " but has " + strings.Join(odd, ", ") + " (only this epic uses that)"
-			}
-			drift = append(drift, line)
-		}
-		if len(drift) > 0 {
-			sort.Strings(drift)
-			r.Issues = append(r.Issues, PlanIssue{
-				Kind: "metadata_drift", Severity: "warn",
-				Message: "Epics don't carry the same metadata: " + strings.Join(drift, "; ") + ". Reports group by these keys, so this work drops out of those rollups.",
-				Fix:     "Set the missing keys with amp_update_epic metadata (use the same key names the other epics use), and remove a misspelled key by setting it to null.",
-			})
-		}
-	}
-
-	// A plan with an empty project KB: the decisions behind it live only in
-	// the planner's session, and the next session or engineer starts blind.
-	if r.OpenTasks > 0 && s.KB != nil {
-		if n, err := s.KB.CountDocs(ctx, kb.Project(projectID)); err == nil && n == 0 {
-			r.Issues = append(r.Issues, PlanIssue{
-				Kind:    "no_context",
-				Message: "The project knowledge base is empty. The decisions behind this plan exist only in the session that made it.",
-				Fix:     "Write architecture/project-overview.md (what this is, the stack, how it's laid out) and a doc per decision the user made under decisions/ (what, why, when) with amp_kb_write.",
-			})
-		}
-	}
-
-	// Blocked by dependencies that are all done: left stuck by older versions
-	// of AMP. The ticket should be ready; repair it.
-	if len(stuck) > 0 {
-		s.ReconcileDependents(ctx, projectID, stuck, nil)
-		r.RepairedTaskIDs = stuck
-	}
-
-	r.LongestChain = longestChain(tasks)
-	r.OK = true
-	for _, iss := range r.Issues {
-		if iss.Severity != "warn" {
-			r.OK = false
-		}
-	}
-	r.Summary = fmt.Sprintf("%d tickets (%d open), %d dependencies, %d ready to dispatch now, longest chain %d.",
-		r.Tasks, r.OpenTasks, r.Dependencies, len(r.ReadyNow), r.LongestChain)
-	warns := 0
-	for _, iss := range r.Issues {
-		if iss.Severity == "warn" {
-			warns++
-		}
-	}
-	switch {
-	case r.OK && warns == 0:
-		r.Summary += " No problems found."
-	case r.OK:
-		r.Summary += fmt.Sprintf(" No blocking problems; %d warning(s) worth a look.", warns)
-	}
-	if n := len(r.HumanGates); n > 0 {
-		r.Summary += fmt.Sprintf(" %d step(s) are done by people (human_gates); the work after them waits for them.", n)
-	}
-	if len(stuck) > 0 {
-		r.Summary += fmt.Sprintf(" Repaired %d ticket(s) stuck blocked although all their dependencies are done; they are ready now: %s.", len(stuck), joinIDs(stuck))
-	}
-	return r, nil
+	return stuck
 }
 
 func longestChain(tasks []domain.Task) int {
