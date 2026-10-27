@@ -16,6 +16,13 @@ name: Harness release
 # a prerelease (install.sh's "newest" lookup skips those); one with '-test' is a draft as well, for
 # exercising this workflow without anything installable. No signing in v1; the Homebrew tap update
 # is a template until a tap repo exists. How-to: AMP KB how-to/harness-release.md.
+#
+# Gate (#2607): on a harness-v* tag, `gate` requires a successful `Harness` (harness.yml) run AND a
+# successful `Harness smoke` (harness-smoke.yml) run on the tagged commit (GITHUB_SHA); `publish`
+# needs it, so an untested or red commit is never published. The builds run in parallel with it.
+# Skipped for -test versions (draft dry runs on off-branch commits have no CI runs). When a
+# workflow has no run on the commit (no path filter fired): `gh workflow run <file> --ref <tag>`,
+# wait for it to pass, then `gh run rerun <release run id> --failed`.
 
 on:
   push:
@@ -198,10 +205,46 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # harness-v* tags only: the GitHub Release. Uses GITHUB_TOKEN (no extra secrets).
+  # harness-v* tags only: the tagged commit must have passed `Harness` and `Harness smoke`. Fails
+  # closed: no successful run of either workflow on GITHUB_SHA, or an API error, fails the job and
+  # so blocks `publish`. Runs alongside install-test/build; only publish waits on it.
+  gate:
+    if: startsWith(github.ref, 'refs/tags/harness-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Harness and Harness smoke passed on the tagged commit
+        run: |
+          version=${TAG#harness-v}
+          case "$version" in
+            *-test*) echo "$TAG is a -test version (draft dry run on an off-branch commit): gate skipped"; exit 0 ;;
+          esac
+          failed=0
+          for wf in harness.yml harness-smoke.yml; do
+            n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$GITHUB_SHA&status=success&per_page=1" --jq .total_count) || n=""
+            case "$n" in
+              ''|*[!0-9]*)
+                echo "::error::could not list $wf runs for $GITHUB_SHA (got '$n')"
+                failed=1 ;;
+              0)
+                echo "::error::$wf has no successful run on $GITHUB_SHA. Run it on the tag: gh workflow run $wf --ref $TAG, wait for it to pass, then re-run this release run: gh run rerun $GITHUB_RUN_ID --failed"
+                failed=1 ;;
+              *)
+                echo "$wf: $n successful run(s) on $GITHUB_SHA" ;;
+            esac
+          done
+          exit "$failed"
+
+  # harness-v* tags only: the GitHub Release. Uses GITHUB_TOKEN (no extra secrets). Needs `gate`.
   publish:
     if: startsWith(github.ref, 'refs/tags/harness-v')
-    needs: package
+    needs: [package, gate]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
