@@ -188,6 +188,14 @@ func (s *Service) SetTaskState(ctx context.Context, p authz.Principal, taskID in
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
 	}
+	if t.State == domain.TaskStateCompleted && state != domain.TaskStateCompleted {
+		// Reopened: the tickets after it re-read their dependencies, so none
+		// keeps saying why it waited on the done ticket (its PR closed
+		// without merging, "reopen it") once the ticket is open again.
+		if deps, err := s.Repo.OpenDependents(ctx, []int{taskID}); err == nil {
+			s.ReconcileDependents(ctx, t.ProjectID, deps[taskID], nil)
+		}
+	}
 	// The actor may have kept it blocked on its dependencies.
 	if cur, err := s.Repo.GetTask(ctx, taskID); err == nil {
 		return cur, nil

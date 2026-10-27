@@ -30,6 +30,7 @@ import { HumanActions } from '../components/human/HumanActions'
 import { useApproveParam } from '../hooks/useApproveParam'
 import { useFocusParam } from '../hooks/useFocusParam'
 import { useSSE } from '../hooks/useSSE'
+import { personName } from '../lib/people'
 import { ago } from '../lib/approval'
 import { reasonLabel } from '../lib/human'
 import { KIND_LABEL } from '../lib/humanActions'
@@ -149,6 +150,21 @@ export function ProjectMyWork() {
   const name = project?.name ?? 'this project'
   const items = useMemo(() => (data ? itemsOf(data) : []), [data])
   const approveItems = items.filter(i => i.kind === 'approve')
+  const readOnly = !!data?.read_only
+  // Whose list a lead is reading, for the labels screen readers hear.
+  const readUser = readOnly ? data?.user_id : undefined
+  const [person, setPerson] = useState<{ key: string; name: string } | null>(null)
+  useEffect(() => {
+    if (readUser == null) return
+    const k = `${pid}:${readUser}`
+    api.listProjectMembers(pid)
+      .then(r => {
+        const m = (r.members ?? []).find(x => x.user_id === readUser)
+        setPerson({ key: k, name: m ? personName(m) : `User #${readUser}` })
+      })
+      .catch(() => setPerson({ key: k, name: `User #${readUser}` }))
+  }, [pid, readUser])
+  const who = readUser == null ? 'you' : person?.key === `${pid}:${readUser}` ? person.name : 'them'
 
   // The Approve view replaces the list, full width (artifact #24 v2).
   if (approveParam.approve) {
@@ -169,7 +185,6 @@ export function ProjectMyWork() {
     )
   }
 
-  const readOnly = !!data?.read_only
   return (
     <div className="flex flex-col min-h-full">
       <ProjectNav projectId={pid} currentView="my-work" project={project}
@@ -184,7 +199,7 @@ export function ProjectMyWork() {
         )}
         {!data && !error && <div className="py-16 flex justify-center"><BandLoader label="Loading My work" /></div>}
         {data && <Body data={data} items={items} name={name} pid={pid} focusId={focusId} setFocus={setFocus}
-          onReview={approveParam.open} onChanged={changed} readOnly={readOnly} />}
+          onReview={approveParam.open} onChanged={changed} readOnly={readOnly} who={who} />}
       </div>
     </div>
   )
@@ -200,9 +215,11 @@ interface BodyProps {
   onReview: ReturnType<typeof useApproveParam>['open']
   onChanged: () => void
   readOnly: boolean
+  /** whose list, for screen readers: "you", or the person a lead is reading */
+  who: string
 }
 
-function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, readOnly }: BodyProps) {
+function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, readOnly, who }: BodyProps) {
   const counts = data.counts
   const done = data.done_today ?? []
   const coming = data.coming_up ?? []
@@ -223,7 +240,7 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
 
   return (
     <>
-      <div className="amp-panel amp-panel-top pmw-ro" role="group" aria-label={`Waiting on you in ${name}`}>
+      <div className="amp-panel amp-panel-top pmw-ro" role="group" aria-label={`Waiting on ${who} in ${name}`}>
         <div className={`ro ${counts.waiting > 0 ? 'alarm' : 'calm'}`}>
           <span className="amp-label">Waiting on {readOnly ? 'them' : 'you'}</span>
           <span className="v">{counts.waiting}</span>
@@ -250,7 +267,7 @@ function Body({ data, items, name, pid, focusId, setFocus, onReview, onChanged, 
       )}
 
       <div className="pmw-layout">
-        <section aria-label={state === 'busy' ? 'Waiting on you' : state === 'done' ? 'Cleared today' : 'Nothing waits on you'} className="grid gap-2 min-w-0">
+        <section aria-label={state === 'busy' ? `Waiting on ${who}` : state === 'done' ? 'Cleared today' : `Nothing waits on ${who}`} className="grid gap-2 min-w-0">
           {state === 'busy' && <>
             <div className="flex items-center gap-3 mb-1">
               <span className="amp-label whitespace-nowrap">Waiting on {readOnly ? 'them' : 'you'} · oldest first within each kind</span>

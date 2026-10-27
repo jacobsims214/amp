@@ -28,6 +28,7 @@ const server = setupServer(
     return q.get('approve') ? HttpResponse.json({ plan: data.items.approve[0]?.plan }) : HttpResponse.json(data)
   }),
   http.get('*/api/my-work/counts', () => { countsCalls++; return HttpResponse.json(counts) }),
+  http.get('*/api/projects/2/members', () => HttpResponse.json({ members: [], my_access: 'lead' })),
   http.get('*/api/projects/:id', () => HttpResponse.json({ project: { id: 2, name: 'AMP v2', code: 'AMPV2' } })),
   http.post('*/api/tasks/2471/merge', ({ request }) => {
     posts.push(new URL(request.url).pathname)
@@ -125,6 +126,17 @@ describe('My work tab: states', () => {
     expect(loads[0]).toContain('user=7')
     expect(screen.queryByRole('button', { name: /mark merged/i })).toBeNull()
     expect(screen.queryByRole('button', { name: /send answer/i })).toBeNull()
+  })
+
+  it('names whose list it is for screen readers, not "you"', async () => {
+    data = myWork('busy', { read_only: true, user_id: 7 })
+    server.use(http.get('*/api/projects/2/members', () => HttpResponse.json({
+      members: [{ user_id: 7, email: 'riley@example.com', display_name: 'Riley Lane' }], my_access: 'lead' })))
+    at('/project/2/my-work?user=7')
+    expect(await screen.findByRole('group', { name: 'Waiting on Riley Lane in AMP v2' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: 'Waiting on Riley Lane' })).toBeInTheDocument()
+    expect(screen.queryByRole('region', { name: 'Waiting on you' })).toBeNull()
+    expect(screen.queryByRole('group', { name: /waiting on you/i })).toBeNull()
   })
 
   it('shows an error with Try again', async () => {

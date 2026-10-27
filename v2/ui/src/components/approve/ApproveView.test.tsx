@@ -82,7 +82,17 @@ describe('ApproveView', () => {
     expect(approveBodies).toEqual([{ task_ids: [1, 3, 2, 4, 5], as_of: AS_OF }])
     expect(onApproved).toHaveBeenCalled()
     expect(screen.getByText(/3 follow over 3 more steps/)).toBeInTheDocument()
-    expect(screen.getByText(/#5 Ticket 5\. It's under Coming up/)).toBeInTheDocument()
+    expect(screen.getByText(/#5 Ticket 5\. It's under Coming up and moves to Do when #4 is done\./)).toBeInTheDocument()
+  })
+
+  it('says a ready step of yours is under Do, not Coming up', async () => {
+    plan = busyPlan()
+    plan.tickets = plan.tickets.map(t => t.id === 5 ? { ...t, dependency_ids: [], waits_on: [] } : t)
+    approveReply = { project: { id: 2 }, approved: [1, 2, 3, 4, 5], awaiting_yours: [], skipped: {} }
+    render(<View />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Approve 5 tickets' }))
+    expect(await screen.findByText(/#5 Ticket 5\. It's ready: it's under Do in My work\./)).toBeInTheDocument()
+    expect(screen.queryByText(/#5 Ticket 5\. It's under Coming up/)).toBeNull()
   })
 
   it('says which tickets changed while the person was reading', async () => {

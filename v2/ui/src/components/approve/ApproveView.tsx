@@ -15,7 +15,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { ArrowLeft, Loader2, ShieldCheck, TriangleAlert } from 'lucide-react'
 import { api } from '../../api/client'
-import { buildModel, canTick, defaultTicks, selectionEffect, heldIds, awaitingForUser, type PlanModel } from '../../lib/approvePlan'
+import { buildModel, canTick, defaultTicks, selectionEffect, heldIds, awaitingForUser, yourStepWhere, type PlanModel } from '../../lib/approvePlan'
 import { projectLink } from '../../lib/projectLink'
 import type { ApproveSet } from '../../hooks/useApproveParam'
 import type { ApprovalPlan, ApproveResult } from '../../types'
@@ -371,7 +371,7 @@ function Result(props: ApproveViewProps & { outcome: Outcome; onReview: (focus: 
     <>
       {startsNow.length > 0 && <div><span className="amp-label">Starting now</span><span><Ids list={startsNow} onSelect={id => props.onFocus(id)} />: your manager agent can dispatch {startsNow.length === 1 ? 'it' : 'these'} now.</span></div>}
       {follow > 0 && <div><span className="amp-label">Then</span><span>{follow} follow over {plural(Math.max(1, lastStep - 1), 'more step')} as their dependencies finish.{ticked.length === plan.awaiting_ids.length && !stale.length ? ' Nothing else needs your approval.' : ''}</span></div>}
-      {yourSteps.map(id => <div key={id}><span className="amp-label" style={{ color: 'var(--violet)' }}>Your step</span><span>#{id} {name(id)}. It's under Coming up and moves to Do when it's ready.</span></div>)}
+      {yourSteps.map(id => <div key={id}><span className="amp-label" style={{ color: 'var(--violet)' }}>Your step</span><span>#{id} {name(id)}. {yourStepWhere(model.byId.get(id)?.waits_on ?? [])}</span></div>)}
       <div><span className="amp-label">Recorded</span><span>Approved by you at {hm(props.outcome.at)}{props.outcome.asOf ? `, as of ${hms(props.outcome.asOf)}` : ''}. In each ticket's history and the audit log.</span></div>
     </>
   )

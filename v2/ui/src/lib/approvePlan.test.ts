@@ -84,6 +84,16 @@ describe('suggestAnswers', () => {
       .toEqual(['Fall back to a 0600 file under ~/.config/amp', 'Fail with a clear error'])
     expect(suggestAnswers('Avalara or Stripe Tax?')).toEqual(['Avalara', 'Stripe Tax'])
   })
+  it('keeps the question out of the options when its subject is a noun', () => {
+    expect(suggestAnswers('Should widgets use UUID or bigint ids?')).toEqual(['UUID', 'Bigint ids'])
+    expect(suggestAnswers('Should the API return JSON or XML?')).toEqual(['JSON', 'XML'])
+    expect(suggestAnswers('Is the bug in the API or the UI?')).toEqual(['The API', 'The UI'])
+    // A stem that doesn't come off cleanly gives no chips, not a chip with the question in it.
+    expect(suggestAnswers('Should UUID or bigint be used?')).toEqual([])
+    for (const q of ['Should widgets use UUID or bigint ids?', 'Should I fall back to a file, or fail?']) {
+      expect(suggestAnswers(q).some(c => /^(should|shall|do|does|can|is|are)\b/i.test(c))).toBe(false)
+    }
+  })
   it('suggests nothing for an open question', () => {
     expect(suggestAnswers('Which provider do you want?')).toEqual([])
     expect(suggestAnswers('Ship it.')).toEqual([])

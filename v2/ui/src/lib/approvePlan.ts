@@ -274,3 +274,10 @@ export function newer(a: string | undefined, b: string | undefined): string | un
 export function awaitingForUser(plan: ApprovalPlan): number[] {
   return plan.for_user_ids?.length ? plan.for_user_ids : plan.yours_ids
 }
+
+/** Where a person's own approved step is now: Do when nothing it depends on is open, else Coming up. */
+export function yourStepWhere(waitsOn: number[]): string {
+  if (waitsOn.length === 0) return "It's ready: it's under Do in My work."
+  const ids = waitsOn.map(i => `#${i}`).join(', ')
+  return `It's under Coming up and moves to Do when ${ids} ${waitsOn.length === 1 ? 'is' : 'are'} done.`
+}

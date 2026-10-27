@@ -245,6 +245,10 @@ func TestMerge_AbandonedAndNotNeeded(t *testing.T) {
 	if st := stateOf(t, alice, d2); st != "blocked" {
 		t.Fatalf("dependent of a reopened ticket = %s", st)
 	}
+	// It waits on the reopened ticket being done again, not on its closed PR.
+	if wd := fmt.Sprint(planTask(t, alice, d2)["waiting_detail"]); strings.Contains(wd, "reopen it") || strings.Contains(wd, "closed without merging") {
+		t.Fatalf("dependent of a reopened ticket still says %q", wd)
+	}
 	finishWith(t, alice, b2, map[string]any{"pr_url": pr + "-3"})
 	if ms := mergeStateOf(t, alice, b2); ms != domain.MergeNeeded {
 		t.Fatalf("re-completed with a new PR: %q, want needed", ms)
