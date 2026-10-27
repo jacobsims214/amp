@@ -569,8 +569,9 @@ async fn versions_report_pins_assets_and_protocol() {
     assert_eq!(status(&v, "versions"), "ok");
     let detail = check(&v, "versions")["detail"].as_str().unwrap();
     let commit = v["versions"]["assets_commit"].as_str().unwrap();
+    let build = v["versions"]["commit"].as_str().unwrap();
     assert!(
-        detail.contains(&format!("assets {commit}, MCP 2026-07-28")),
+        detail.contains(&format!("assets {commit}, commit {build}, MCP 2026-07-28")),
         "{detail}"
     );
     assert_eq!(v["versions"]["mcp_protocol"], "2026-07-28");

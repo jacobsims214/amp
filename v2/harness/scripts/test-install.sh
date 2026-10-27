@@ -145,7 +145,8 @@ if grep -q "not on your login shell's PATH" "$T/out"; then bad "login PATH now i
 out_has "next step uses amp-harness once on PATH" "Next: run \`amp-harness setup\`"
 
 # Upgrades: a file:// mirror with an older and the current release, and a release list (newest
-# first, with a non-harness AMP tag on top) to find the newest harness-v* release.
+# first, with a non-harness AMP tag and a harness prerelease on top) to find the newest harness-v*
+# release that isn't a prerelease (#2122).
 sum() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 old=0.0.1
 mirror="$T/mirror"
@@ -162,6 +163,10 @@ cat >"$mirror/releases.json" <<JSON
   {
     "tag_name": "v9.9.9",
     "name": "AMP 9.9.9"
+  },
+  {
+    "tag_name": "harness-v9.0.0-rc.1",
+    "name": "amp-harness 9.0.0-rc.1 (prerelease: never picked as the newest)"
   },
   {
     "tag_name": "harness-v$version",

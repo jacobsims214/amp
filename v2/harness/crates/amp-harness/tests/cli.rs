@@ -401,6 +401,7 @@ async fn doctor_json_is_pinned() {
             .as_str()
             .is_some_and(|c| !c.is_empty())
     );
+    assert!(versions["commit"].as_str().is_some_and(|c| !c.is_empty()));
     assert_eq!(versions["assets_source_sha256"].as_str().unwrap().len(), 64);
     let models = v.as_object_mut().unwrap().remove("models").unwrap();
     assert_eq!(models["mode"], "profile");

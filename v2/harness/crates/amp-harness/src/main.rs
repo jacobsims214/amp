@@ -59,7 +59,8 @@ use amp_mcp::{
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
 /// Harness version, the exact upstream versions it was built against, and the commit of the
-/// embedded agent/skill assets (D11).
+/// embedded agent/skill assets, and the commit it was built from (D11, #2122). install.sh reads only
+/// the first line; the release workflow checks the `commit` line against the tagged commit.
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nrpi-ai ",
@@ -76,6 +77,8 @@ const LONG_VERSION: &str = concat!(
     env!("AMP_PIN_RMCP"),
     "\nassets ",
     env!("AMP_ASSETS_COMMIT"),
+    "\ncommit ",
+    env!("AMP_BUILD_COMMIT"),
 );
 
 #[derive(Parser)]

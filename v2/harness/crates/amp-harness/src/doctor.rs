@@ -92,6 +92,8 @@ pub struct VersionsReport {
     pub rmcp: &'static str,
     /// The commit that last changed the embedded agent/skill assets (`-dirty`, or `unknown`).
     pub assets_commit: &'static str,
+    /// The commit the binary was built from (`-dirty`, or `unknown`).
+    pub commit: &'static str,
     /// The assets manifest's hash of the `.opencode` sources they were generated from.
     pub assets_source_sha256: Option<String>,
     /// The MCP protocol negotiated with AMP (`null` when not connected).
@@ -109,6 +111,7 @@ impl VersionsReport {
             rpi_tui: env!("AMP_PIN_RPI_TUI"),
             rmcp: env!("AMP_PIN_RMCP"),
             assets_commit: env!("AMP_ASSETS_COMMIT"),
+            commit: env!("AMP_BUILD_COMMIT"),
             assets_source_sha256: amp_core::assets::Assets::embedded()
                 .ok()
                 .map(|a| a.manifest().source_sha256.clone()),
@@ -132,10 +135,11 @@ impl VersionsReport {
             )
         };
         format!(
-            "harness {}, {rpi}, rmcp {}, assets {}, MCP {}",
+            "harness {}, {rpi}, rmcp {}, assets {}, commit {}, MCP {}",
             self.harness,
             self.rmcp,
             self.assets_commit,
+            self.commit,
             self.mcp_protocol.as_deref().unwrap_or("not connected")
         )
     }
