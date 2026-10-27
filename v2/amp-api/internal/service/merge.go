@@ -298,6 +298,11 @@ func (s *Service) MarkMergedFrom(ctx context.Context, p authz.Principal, commit,
 	if err != nil {
 		return nil, err
 	}
+	return s.markHitsMerged(ctx, p, hits, mergeCommit, source)
+}
+
+// markHitsMerged records the merge on every agent ticket among hits.
+func (s *Service) markHitsMerged(ctx context.Context, p authz.Principal, hits []TraceHit, mergeCommit, source string) ([]MergeRecord, error) {
 	out := []MergeRecord{}
 	for _, h := range hits {
 		if h.Task.IsHuman() {
@@ -329,6 +334,12 @@ func (s *Service) MarkAbandonedFrom(ctx context.Context, p authz.Principal, comm
 	if err != nil {
 		return nil, err
 	}
+	return s.markHitsAbandoned(ctx, p, hits, source)
+}
+
+// markHitsAbandoned marks abandoned the tickets among hits that wait on
+// their merge.
+func (s *Service) markHitsAbandoned(ctx context.Context, p authz.Principal, hits []TraceHit, source string) ([]MergeRecord, error) {
 	out := []MergeRecord{}
 	for _, h := range hits {
 		if h.Task.IsHuman() || h.Task.MergeState != domain.MergeNeeded {

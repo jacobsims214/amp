@@ -29,6 +29,13 @@ func configureSecretsKeys(ctx context.Context, repo *repository.Repo) {
 		slog.Error("encrypting stored webhook secrets failed", "err", err)
 		return
 	}
+	// Projects' GitHub merge webhook secrets (AMP #2479), the same way.
+	ghSealed, ghUnopenable, err := repo.ResealGitHubHookSecrets(ctx)
+	if err != nil {
+		slog.Error("encrypting stored GitHub webhook secrets failed", "err", err)
+	}
+	rep.Resealed += ghSealed
+	rep.Unopenable += ghUnopenable
 	switch {
 	case keys.CanSeal():
 		slog.Info("webhook secrets are encrypted at rest", "key_id", keys.CurrentID(), "sealed_now", rep.Resealed)
