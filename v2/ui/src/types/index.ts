@@ -18,6 +18,9 @@ export interface Project {
   plan_approved_at?: string
   plan_approved_by?: number
   require_plan_approval?: boolean
+  /** done tickets with an unmerged PR hold their dependents until the merge is recorded (default on) */
+  require_merge?: boolean
+  require_merge_since?: string
 }
 
 export interface Epic {
@@ -617,6 +620,40 @@ export interface WebhookDelivery {
   last_error?: string
   created_at: string
   delivered_at?: string
+}
+
+/** A project's inbound GitHub merge webhook (GET /projects/:id/github-hook). */
+export interface GitHubHook {
+  project_id: number
+  created_by?: number
+  created_at: string
+  rotated_at: string
+  rejected_count: number
+  last_rejected_at?: string
+}
+
+/** One signed delivery GitHub made to a project's hook. */
+export interface GitHubHookDelivery {
+  delivery_id: string
+  event: string
+  action?: string
+  status: number
+  result: string
+  task_ids: number[] | null
+  received_at: string
+}
+
+export interface GitHubHookInfo {
+  configured: boolean
+  /** where GitHub posts; relative when the server has no public URL configured */
+  url: string
+  hook?: GitHubHook
+  deliveries: GitHubHookDelivery[] | null
+  /** only in the answer to generating or rotating the secret: shown once */
+  secret?: string
+  /** the secret is stored encrypted (the server has an encryption key) */
+  encrypted: boolean
+  setup?: { payload_url?: string; content_type?: string; events?: string }
 }
 
 export interface AmpUser {
