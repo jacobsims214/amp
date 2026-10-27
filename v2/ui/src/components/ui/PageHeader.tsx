@@ -77,11 +77,15 @@ export function Panel({ title, label, right, top, className = '', children }: {
 }
 
 /** A row of large numbers (readouts) under a black top rule. */
-export function Readouts({ items }: { items: { label: string; value: React.ReactNode; sub?: React.ReactNode; color?: string; alarm?: boolean }[] }) {
+export function Readouts({ items, wrap }: {
+  items: { label: string; value: React.ReactNode; sub?: React.ReactNode; color?: string; alarm?: boolean }[]
+  /** On a phone, three per row instead of all in one row. */
+  wrap?: boolean
+}) {
   return (
-    <div className="amp-panel amp-panel-top grid" style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}>
+    <div className={`amp-panel amp-panel-top grid ${wrap ? 'amp-readouts-wrap' : ''}`} style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}>
       {items.map((it, i) => (
-        <div key={it.label} className={`px-4 py-3 grid gap-1.5 ${i ? 'border-l border-line' : ''}`}
+        <div key={it.label} className={`amp-readout px-4 py-3 grid gap-1.5 ${i ? 'border-l border-line' : ''}`}
           style={it.alarm ? { background: 'var(--st-flag)' } : undefined}>
           <span className="amp-label" style={it.alarm ? { color: '#fff' } : undefined}>{it.label}</span>
           <span className="amp-num text-[26px] leading-none" style={{ color: it.alarm ? '#fff' : it.color ?? 'var(--ink)' }}>{it.value}</span>
