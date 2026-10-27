@@ -23,3 +23,8 @@ export function mergeWait(t: Pick<Task, 'state' | 'waiting_detail'>): string | n
   const d = t.waiting_detail?.trim()
   return d ? d : null
 }
+
+/** Done with a PR nobody merged yet (or one closed without merging): it holds its dependents. Mission's Merge needed readout. */
+export function needsMerge(t: Pick<Task, 'state' | 'merge_state'>): boolean {
+  return t.state === 'completed' && (t.merge_state === 'needed' || t.merge_state === 'abandoned')
+}

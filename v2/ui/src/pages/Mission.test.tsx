@@ -9,7 +9,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { Mission } from './Mission'
 import { AuthContext } from '../contexts/auth-context'
 import { resetWaitCounts } from '../lib/waitCounts'
-import type { MyWorkCounts, ProjectAccess, Task } from '../types'
+import type { MyWorkCounts, PeopleWaiting, ProjectAccess, Task } from '../types'
 
 const ME = 7
 const at = '2026-10-27T10:00:00Z'
@@ -30,6 +30,18 @@ const tasks: Task[] = [
   task(2491, { owner_user_id: 8, state: 'in_progress', agent_id: 'amp:amp-worker-frontend', dispatched_at: at }),
 ]
 let counts: MyWorkCounts = { counts: { waiting: 3, approve: 0, answer: 1, merge: 1, do: 1, coming_up: 0 }, projects: { 2: { waiting: 3, approve: 0, answer: 1, merge: 1, do: 1, coming_up: 0 } } }
+// Waiting on people comes from the server (Service.WaitingOn per person), in
+// user id order; the panel orders it (you first, then most waiting).
+const wc = (o: Partial<MyWorkCounts['counts']>) => ({ waiting: 0, approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0, ...o })
+const PEOPLE: PeopleWaiting = { project_id: 2, people: [
+  { user_id: ME, counts: wc({ waiting: 3, answer: 1, merge: 1, do: 1 }), coming_up: [], items: [
+    { kind: 'answer', task_ids: [2473], since: at }, { kind: 'merge', task_ids: [2471], since: at }, { kind: 'do', task_ids: [2481], since: at }] },
+  { user_id: 8, counts: wc({ waiting: 2, answer: 1, merge: 1 }), coming_up: [], items: [
+    { kind: 'answer', task_ids: [2477], since: at }, { kind: 'merge', task_ids: [2462], since: at }] },
+  { user_id: 9, counts: wc({ coming_up: 1 }), coming_up: [2490], items: [] },
+] }
+let peopleWaiting: PeopleWaiting = PEOPLE
+let peopleCalls = 0
 let access: ProjectAccess = 'lead'
 let inFlight = 0
 
@@ -45,6 +57,7 @@ const server = setupServer(
   http.get('*/api/projects/2/activity', () => HttpResponse.json({ activity: [], count: 0 })),
   http.get('*/api/audit', () => HttpResponse.json({ entries: [] })),
   http.get('*/api/my-work/counts', () => HttpResponse.json(counts)),
+  http.get('*/api/projects/2/waiting-on-people', () => { peopleCalls++; return HttpResponse.json(peopleWaiting) }),
   http.get('*/api/projects/2', () => HttpResponse.json({ project: { id: 2, name: 'AMP v2', code: 'AMPV2', require_plan_approval: true } })),
   http.get('*/api/*', () => HttpResponse.json({})),
 )
@@ -52,7 +65,7 @@ server.events.on('request:start', () => { inFlight++ })
 server.events.on('request:end', () => { inFlight-- })
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen({ onUnhandledFrame: 'error' }) })
-beforeEach(() => { resetWaitCounts(); access = 'lead' })
+beforeEach(() => { resetWaitCounts(); access = 'lead'; peopleWaiting = PEOPLE; peopleCalls = 0 })
 afterEach(async () => {
   await waitFor(() => expect(inFlight).toBe(0))
   server.resetHandlers()
@@ -117,6 +130,28 @@ describe('Mission (informational)', () => {
     expect(rows[0]).toHaveAttribute('href', '/project/2/my-work?focus=2473')
     expect(rows[1]).toHaveAttribute('href', '/project/2/my-work?user=8&focus=2477')
     expect(rows[2]).toHaveAttribute('href', '/project/2/my-work?user=9&focus=2490')
+  })
+
+  it('Waiting on people is what the server says, not worked out from the Board', async () => {
+    // An approval the Board's tickets alone wouldn't produce (they're all approved).
+    peopleWaiting = { project_id: 2, people: [
+      { user_id: 9, counts: wc({ waiting: 1, approve: 1 }), coming_up: [], items: [{ kind: 'approve', task_ids: [2470, 2490], epic_id: 172, epic_name: 'Human work UX', since: at }] },
+    ] }
+    const panel = (await open()).closest('section')!
+    await waitFor(() => expect(within(panel).getAllByRole('link').map(r => r.getAttribute('aria-label'))).toEqual([
+      'Priya Kumar: 1 waiting. Approve 1 (2 tickets)',
+    ]))
+    expect(within(panel).getByRole('link')).toHaveAttribute('href', '/project/2/my-work?user=9&focus=2470')
+    expect(peopleCalls).toBeGreaterThan(0)
+    // Nothing waits on the viewer in it, so no square is outlined.
+    const epic = await screen.findByRole('region', { name: 'Epic Human work UX' })
+    expect(epic.querySelectorAll('[data-for-you]')).toHaveLength(0)
+  })
+
+  it('says so when nothing waits on anyone', async () => {
+    peopleWaiting = { project_id: 2, people: [] }
+    const panel = (await open()).closest('section')!
+    expect(await within(panel).findByText('Nothing waits on anyone here.')).toBeInTheDocument()
   })
 
   it("for a member, others' rows open the ticket on the Board", async () => {

@@ -813,6 +813,32 @@ export interface MyWorkCounts {
   projects: Record<string, WaitCounts>
 }
 
+/** One item in a person's Waiting on people row: a ticket, or for approve, an epic's tickets awaiting them. */
+export interface PersonWaitItem {
+  kind: WaitKind
+  task_ids: number[]
+  /** approve only */
+  epic_id?: number
+  epic_name?: string
+  since: string
+}
+
+/** One person in GET /projects/:id/waiting-on-people (service.WaitingOn for them). */
+export interface PersonWaiting {
+  user_id: number
+  counts: WaitCounts
+  /** approve, answer, merge, do; oldest first within each */
+  items: PersonWaitItem[]
+  /** ticket ids of their Coming up */
+  coming_up: number[]
+}
+
+/** GET /projects/:id/waiting-on-people: Mission's Waiting on people, every person with something waiting or coming up. */
+export interface PeopleWaiting {
+  project_id: number
+  people: PersonWaiting[]
+}
+
 /** One thing waiting on you (Waiting on you): "approve:<epic id>" (one per epic) or "task:<ticket id>". */
 export interface WaitItem {
   kind: WaitKind | 'coming_up'

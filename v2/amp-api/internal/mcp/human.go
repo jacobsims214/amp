@@ -56,7 +56,8 @@ type PersonWait struct {
 }
 
 // waitingOnPeople is what the project waits on people for, from the one
-// definition (service.WaitingOn) run for everyone with work in it, and the
+// definition (service.WaitingOnPeople: WaitingOn run for everyone with work
+// in it, shared with the REST endpoint Mission reads), and the
 // human tickets coming up for them. Only items that matter to the caller are
 // kept: one of the item's tickets is in their view, or holds up one that is.
 // all is every ticket in the project; view is the caller's.
@@ -67,21 +68,11 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 	items, comingUp = []PersonWait{}, []PersonWait{}
 	byID := map[int]*domain.Task{}
 	dependents := map[int][]int{}
-	people := map[int]bool{}
 	for i := range all {
 		t := &all[i]
 		byID[t.ID] = t
 		for _, d := range t.DependencyIDs {
 			dependents[d] = append(dependents[d], t.ID)
-		}
-		if t.State == domain.TaskStateCompleted && !domain.MergeGates(t.MergeState) {
-			continue
-		}
-		if t.OwnerUserID != nil {
-			people[*t.OwnerUserID] = true
-		}
-		if who := t.ApprovalOwner(); who != nil && t.State != domain.TaskStateCompleted && !t.Approved() {
-			people[*who] = true
 		}
 	}
 	inView := map[int]bool{}
@@ -137,17 +128,13 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 		return fmt.Sprintf("user %d", *id)
 	}
 
-	uids := make([]int, 0, len(people))
-	for id := range people {
-		uids = append(uids, id)
+	// The same per-person WaitingOn as GET /api/projects/{id}/waiting-on-people.
+	everyone, err := s.svc.WaitingOnPeople(ctx, projectID, all)
+	if err != nil {
+		return nil, nil, err
 	}
-	sort.Ints(uids)
-	for _, uid := range uids {
-		w, err := s.svc.WaitingOn(ctx, uid, []int{projectID})
-		if err != nil {
-			return nil, nil, err
-		}
-		who := uid
+	for _, w := range everyone {
+		who := w.UserID
 		for _, it := range w.Items {
 			if !relevant(it.TaskIDs) {
 				continue

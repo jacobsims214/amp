@@ -28,12 +28,13 @@ import { Avatar } from '../components/ui/Avatar'
 import { PriorityMark } from '../components/ui/PriorityMark'
 import { countStates, displayState, QUIET_MS, silentFor, STATE_LABEL, STATE_VAR, type DisplayState } from '../lib/ticketState'
 import { activityActor, lookupPerson } from '../lib/people'
-import type { ActivityLog, AuditEntry, Epic, Story, Task, WaitCounts } from '../types'
+import type { ActivityLog, AuditEntry, Epic, PersonWaiting, Story, Task, WaitCounts } from '../types'
 import { isHuman, reasonLabel } from '../lib/human'
 import { canApproveOnBehalf } from '../lib/approval'
 import { projectLink } from '../lib/projectLink'
 import { projectCounts, refreshWaitCounts, useWaitCounts } from '../lib/waitCounts'
-import { countsSummary, kindSummary, needsMerge, panelOrder, personLink, ticketsWaitingOn, waitingOnPeople, type PersonWaiting } from '../lib/waitingOnPeople'
+import { needsMerge } from '../lib/merge'
+import { countsSummary, kindSummary, panelOrder, personLink, ticketsWaitingOn } from '../lib/waitingPanel'
 import { BandLoader } from '../components/brand/BandLoader'
 
 function ago(iso?: string | null): string {
@@ -177,13 +178,17 @@ export function Mission() {
   const { me } = useAuth()
   const waitCounts = useWaitCounts()
   const yours = projectCounts(waitCounts, pid)
-  // Whether the project requires plan approval: approve items only count when it does.
-  const [requireApproval, setRequireApproval] = useState(false)
-  useEffect(() => {
+  // Waiting on people: every person's items, from the server's one definition
+  // (GET /projects/:id/waiting-on-people), refetched shortly after tickets change.
+  // Kept with its project id so another project's people never show here.
+  const [waitingFor, setWaitingFor] = useState<{ pid: number; people: PersonWaiting[] } | null>(null)
+  const waiting = useMemo(() => (waitingFor?.pid === pid ? waitingFor.people : []), [waitingFor, pid])
+  const loadWaiting = useCallback(() => {
     let live = true
-    api.getProject(pid).then(p => { if (live) setRequireApproval(!!p.require_plan_approval) }).catch(() => {})
+    api.waitingOnPeople(pid).then(r => { if (live) setWaitingFor({ pid, people: r.people ?? [] }) }).catch(() => {})
     return () => { live = false }
   }, [pid])
+  useEffect(() => loadWaiting(), [loadWaiting])
   // ?focus=ID (or the old ?ticket=) opens a ticket; it stays in the URL until closed.
   const [selectedId, setSelectedId] = useFocusParam()
   const [showDone, setShowDone] = useState(false)
@@ -227,12 +232,12 @@ export function Mission() {
   // Keep the strip's numbers in step when tickets change under us (an answer, a merge).
   useEffect(() => {
     if (!tasks.length) return
-    const t = setTimeout(() => { refreshWaitCounts() }, 1200)
-    return () => clearTimeout(t)
-  }, [tasks])
+    let stop: (() => void) | undefined
+    const t = setTimeout(() => { refreshWaitCounts(); stop = loadWaiting() }, 1200)
+    return () => { clearTimeout(t); stop?.() }
+  }, [tasks, loadWaiting])
   const mergeNeeded = useMemo(() => tasks.filter(needsMerge).length, [tasks])
-  const waiting = useMemo(() => waitingOnPeople(tasks, { requireApproval }), [tasks, requireApproval])
-  const mine = useMemo(() => ticketsWaitingOn(me?.user_id != null ? waiting.get(me.user_id) : undefined), [waiting, me?.user_id])
+  const mine = useMemo(() => ticketsWaitingOn(waiting.find(p => p.user_id === me?.user_id)), [waiting, me?.user_id])
   const waitingPeople = useMemo(() => panelOrder(waiting, me?.user_id), [waiting, me?.user_id])
   const flying = useMemo(() => tasks.filter(t => t.state === 'in_progress')
     .sort((a, b) => (a.dispatched_at ?? '').localeCompare(b.dispatched_at ?? '')), [tasks])
@@ -324,8 +329,8 @@ export function Mission() {
               {waitingPeople.length === 0
                 ? <p className="m-0 px-4 py-4 text-[13px] text-ink-2">Nothing waits on anyone here.</p>
                 : waitingPeople.map(p => (
-                  <PersonRow key={p.userId} p={p} mine={p.userId === me?.user_id}
-                    name={lookupPerson(people, p.userId)?.name ?? `User #${p.userId}`}
+                  <PersonRow key={p.user_id} p={p} mine={p.user_id === me?.user_id}
+                    name={lookupPerson(people, p.user_id)?.name ?? `User #${p.user_id}`}
                     href={personLink(pid, p, { meId: me?.user_id, canReadOthers: canApproveOnBehalf(myAccess) })} />
                 ))}
               <p className="m-0 px-4 pt-2 pb-3 border-t border-line text-[12px] text-ink-3 leading-snug">

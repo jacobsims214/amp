@@ -792,6 +792,21 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 		h.projectMyWork(w, r, pr, projectID)
 		return
 
+	case "waiting-on-people":
+		// Mission's Waiting on people: each person's counts by kind and
+		// ticket ids, from the same WaitingOn as My work and MCP. Any member.
+		if r.Method != http.MethodGet {
+			http.Error(w, "GET required", 405)
+			return
+		}
+		out, err := h.svc.ProjectWaitingOnPeople(r.Context(), pr, projectID)
+		if err != nil {
+			fail(w, err, 500)
+			return
+		}
+		jsonOK(w, out)
+		return
+
 	case "plan-check":
 		report, err := h.svc.CheckPlan(r.Context(), pr, projectID)
 		if err != nil {

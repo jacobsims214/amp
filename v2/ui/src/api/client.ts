@@ -5,7 +5,7 @@ import type {
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
   Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
-  ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts,
+  ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork, MyWorkCounts, PeopleWaiting,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 
@@ -362,6 +362,8 @@ export const api = {
   myWork: () => get<MyWork>('/my-work'),
   /** The sidebar and tab badges: what waits on the caller, in total and per project (only projects with something). */
   myWorkCounts: () => get<MyWorkCounts>('/my-work/counts'),
+  /** Mission's Waiting on people: each person's counts by kind and ticket ids (any member). */
+  waitingOnPeople: (projectId: number) => get<PeopleWaiting>(`/projects/${projectId}/waiting-on-people`),
   /** The project's My work tab: what waits on the caller (or `user`, for a lead), each approve item with its plan. */
   projectMyWork: (projectId: number, opts: { user?: string; tz?: string } = {}) => {
     const q = new URLSearchParams()
