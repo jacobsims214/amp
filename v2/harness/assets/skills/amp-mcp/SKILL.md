@@ -48,9 +48,9 @@ stop. Don't retry, and don't try another tool or the REST API.
 
 | Step | Where the person does it | What you get over MCP |
 |---|---|---|
-| Approving a plan (per ticket: each person their own; a lead on someone's behalf) | Flight plan, "Approve plan" | `amp_approve_plan` always refuses, with `approve_url`, `awaiting_approval`, `require_plan_approval`, `plan_approved_at`. Never call it to approve. |
+| Approving a plan (per ticket: each person their own; a lead on someone's behalf) | The project's My work tab, "Approve" (Flight plan only links there) | `amp_approve_plan` always refuses, with `approve_url`, `awaiting_approval`, `require_plan_approval`, `plan_approved_at`. Never call it to approve. |
 | Approving an artifact | Artifact page, Approve | `amp_review_artifact(approve=true)` refuses; `approve=false` with a note still works |
-| Marking a human ticket done | Ticket drawer or My Work, Mark done | `amp_complete_task` / `amp_set_task_state(completed)` refuse with the ticket link |
+| Marking a human ticket done | The project's My work tab (or the ticket drawer), Mark done | `amp_complete_task` / `amp_set_task_state(completed)` refuse with the ticket link |
 | Turning `require_plan_approval` off | Project settings | `amp_update_project_settings` refuses; turning it on works |
 
 The approval gate in practice:
