@@ -371,6 +371,16 @@ envoy:
   clientIP:
     xffNumTrustedHops: 0
     trustedCIDRs: []
+  # Inbound webhooks (/api/hooks/, e.g. a project's GitHub merge webhook):
+  # senders like GitHub have no AMP session, so this prefix skips the
+  # oauth2-proxy check and amp-api authenticates each delivery by its HMAC
+  # signature (per-project secret) instead. false keeps the prefix behind
+  # the login session, which turns the webhooks off. Whatever sits in front
+  # of Envoy only has to pass /api/hooks/ through; the chart configures
+  # nothing there.
+  inboundHooks:
+    enabled: true
+    timeout: 15s
   service:
     type: ClusterIP   # put whatever ingress you use in front of it
     httpsPort: 443

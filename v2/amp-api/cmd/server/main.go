@@ -510,11 +510,13 @@ func envOrDefault(key, def string) string {
 }
 
 // authExceptHealth applies the auth verifier to every path except /health
-// and /ready, which k8s liveness/readiness probes hit unauthenticated.
+// and /ready, which k8s liveness/readiness probes hit unauthenticated, and
+// GitHub's webhook deliveries (api.GitHubHookPrefix), which carry no AMP
+// session and are authenticated by their HMAC signature instead.
 func authExceptHealth(v *auth.Verifier, next http.Handler) http.Handler {
 	authed := v.Middleware(next)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" || r.URL.Path == "/ready" {
+		if r.URL.Path == "/health" || r.URL.Path == "/ready" || strings.HasPrefix(r.URL.Path, api.GitHubHookPrefix) {
 			next.ServeHTTP(w, r)
 			return
 		}

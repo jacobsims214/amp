@@ -112,6 +112,12 @@ func (s *Service) Trace(ctx context.Context, p authz.Principal, commit, branch, 
 	if err != nil {
 		return nil, err
 	}
+	return s.traceHits(ctx, runs), nil
+}
+
+// traceHits groups runs (newest first) by ticket, skipping tickets that
+// were deleted.
+func (s *Service) traceHits(ctx context.Context, runs []domain.Run) []TraceHit {
 	byTask := map[int]*TraceHit{}
 	order := []int{}
 	for _, r := range runs {
@@ -135,7 +141,7 @@ func (s *Service) Trace(ctx context.Context, p authz.Principal, commit, branch, 
 	for _, id := range order {
 		out = append(out, *byTask[id])
 	}
-	return out, nil
+	return out
 }
 
 // UsageRow is token spend for one model.

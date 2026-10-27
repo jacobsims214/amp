@@ -118,6 +118,7 @@ data:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
                             {{- include "amp.relayHarnessRoutes" . | nindent 28 }}
+                            {{- include "amp.inboundHookRoutes" . | nindent 28 }}
                             # ---- Public: the home page, and what the app needs to load and check
                             # its session. Signed out at "/", the app sends you to /home/; every
                             # other path still goes through oauth2-proxy to sign in.
@@ -320,6 +321,7 @@ data:
                                   "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
                                   disabled: true
                             {{- include "amp.relayHarnessRoutes" . | nindent 28 }}
+                            {{- include "amp.inboundHookRoutes" . | nindent 28 }}
                             # ---- Public: the home page, and what the app needs to load and check
                             # its session. Signed out at "/", the app sends you to /home/; every
                             # other path still goes through oauth2-proxy to sign in.

@@ -144,6 +144,9 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
 	mux.HandleFunc("/api/artifacts/", h.artifactSub)
+	// GitHub's deliveries: no AMP session, authenticated by their HMAC
+	// signature only (main leaves this prefix out of the auth middleware).
+	mux.mux.HandleFunc(GitHubHookPrefix, h.githubHook)
 }
 
 // ---- /api/me ----
@@ -830,6 +833,14 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 
 	case "webhooks":
 		h.webhookCollection(w, r, pr, nil, &projectID)
+		return
+
+	case "github-hook":
+		sub := ""
+		if len(parts) > 2 {
+			sub = parts[2]
+		}
+		h.projectGitHubHook(w, r, pr, projectID, sub)
 		return
 
 	case "reset":
