@@ -15,6 +15,7 @@ import { ArrowRight, Bot, Check, Loader2, ShieldCheck, UserRound, Users } from '
 import { ago, approvalOwner, canApproveOnBehalf, formatWhen, listNames, newestPlannedAt, planPath, plannedAt, splitAwaiting } from '../lib/approval'
 import { lookupPerson, type Person } from '../lib/people'
 import type { Project, ProjectAccess, Task } from '../types'
+import { projectLink } from '../lib/projectLink'
 
 /** What the banner asks the page to approve. */
 export interface ApproveSelection {
@@ -135,7 +136,7 @@ export function PlanApprovalView({ projectId, project, awaiting, people, meId, m
 
   const { yours, others } = splitAwaiting(awaiting, meId)
   const lead = canApproveOnBehalf(myAccess)
-  const ticketLink = (id: number) => `/project/${projectId}/board?task=${id}`
+  const ticketLink = (id: number) => projectLink(projectId, 'board', id)
   const flightPlan = `${planPath(projectId)}#approve`
   const accent = required ? 'var(--accent)' : 'var(--warning)'
   const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`

@@ -181,7 +181,7 @@ describe('PlanApprovalBanner (Flight plan)', () => {
   })
 
   it('links ticket ids to the board drawer when there is no drawer on the page', () => {
-    expect(render({ awaiting: [mine(11)] })).toContain('href="/project/3/board?task=11"')
+    expect(render({ awaiting: [mine(11)] })).toContain('href="/project/3/board?focus=11"')
   })
 })
 

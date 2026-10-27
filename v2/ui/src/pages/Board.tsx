@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
+import { useFocusParam } from '../hooks/useFocusParam'
 import { RefreshCw, WifiOff, ChevronDown, ChevronRight, EyeOff, Eye, GitBranch, MoreHorizontal, Plus, Users, ListChecks } from 'lucide-react'
 import { useBoardData } from '../hooks/useBoardData'
 import { useSSE } from '../hooks/useSSE'
@@ -71,9 +72,8 @@ export function Board() {
   const meId = me?.user_id
   // Track the selected task by id so the drawer reflects live updates
   // (assign responses, SSE) instead of a stale snapshot.
-  const [searchParams] = useSearchParams()
-  // ?task=ID opens that ticket (links from artifacts and elsewhere).
-  const [selectedTaskId, setSelectedTaskId] = useState<number | null>(() => Number(searchParams.get('task')) || null)
+  // ?focus=ID (or the old ?task=) opens that ticket's drawer; it stays in the URL until closed.
+  const [selectedTaskId, setSelectedTaskId] = useFocusParam()
   const selectedTask = selectedTaskId === null ? null : tasks.find(t => t.id === selectedTaskId) ?? null
   const [filter, setFilter] = useState<FilterState>(DEFAULT_FILTER)
   const [collapsedEpics, setCollapsedEpics] = useState<Set<number>>(new Set())

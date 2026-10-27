@@ -16,6 +16,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
+import { useFocusParam } from '../hooks/useFocusParam'
 import { GitBranch, Loader2, RefreshCw } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
@@ -110,8 +111,9 @@ export function FlightPlan() {
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
   const { me } = useAuth()
-  const [focus, setFocus] = useState<number | null>(null)
-  const [openId, setOpenId] = useState<number | null>(null)
+  // ?focus=ID opens that ticket's drawer (and lights its chain on arrival); it stays in the URL until closed.
+  const [openId, setOpenId] = useFocusParam()
+  const [focus, setFocus] = useState<number | null>(() => openId)
   const [hideDone, setHideDone] = useState(false)
   const [report, setReport] = useState<PlanReport | null>(null)
   // Bumped on each check, so the GO stamps replay like a fresh poll.

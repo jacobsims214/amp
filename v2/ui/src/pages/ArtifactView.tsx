@@ -8,6 +8,7 @@ import { Markdown } from '../components/ui/Markdown'
 import { ArtifactKindIcon, ArtifactStatusTag } from '../components/artifacts/ArtifactBits'
 import { KIND_LABEL, expiresIn } from '../lib/artifacts'
 import type { Artifact, ArtifactVersion, AuditEntry, Comment, Task } from '../types'
+import { projectLink } from '../lib/projectLink'
 
 const VIEWPORTS = [
   { id: 'desktop', label: 'Desktop', width: '100%', Icon: Monitor },
@@ -300,7 +301,7 @@ function TicketThread({ projectId, taskId }: { projectId: number; taskId: number
     <div className="px-5 py-4 border-t border-line grid gap-3">
       <div className="flex items-center gap-2">
         <span className="amp-label">Ticket</span>
-        {task && <Link to={`/project/${projectId}/board?task=${taskId}`} className="text-[12.5px] text-link truncate">{task.name}</Link>}
+        {task && <Link to={projectLink(projectId, 'board', taskId)} className="text-[12.5px] text-link truncate">{task.name}</Link>}
       </div>
       {task?.state === 'blocked' && task.block_reason && (
         <p className="m-0 text-[12.5px] text-ink border-l-2 pl-2.5" style={{ borderColor: 'var(--st-flag)' }}>Waiting on a person: {task.block_reason}</p>

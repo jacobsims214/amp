@@ -26,6 +26,7 @@ import { StateBar } from '../components/ui/StateTag'
 import type { DisplayState } from '../lib/ticketState'
 import type { ActivityLog, ProjectReport, ReportGroup, ReportStates } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
+import { projectLink } from '../lib/projectLink'
 
 type Range = '1d' | '7d' | '30d' | 'all'
 const RANGE_LABELS: Record<Range, string> = { '1d': '24h', '7d': '7 days', '30d': '30 days', all: 'All time' }
@@ -182,12 +183,12 @@ export function Report() {
 
           <PeoplePanel tasks={tasks} activity={activity} people={people} since={since} rangeLabel={RANGE_LABELS[range]}
             usageByPerson={new Map((report.people ?? []).map(g => [g.key, g.usage]))}
-            onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
+            onOpen={id => navigate(projectLink(pid, 'mission', id))} />
 
           <StandupSheet projectId={pid} />
 
           <HumanWorkPanel work={report.work} people={people} rangeLabel={RANGE_LABELS[range]}
-            onOpen={id => navigate(`/project/${pid}?ticket=${id}`)} />
+            onOpen={id => navigate(projectLink(pid, 'mission', id))} />
 
           <Panel label="Spend" title="Tokens by model" right={<span>runs recorded in {RANGE_LABELS[range].toLowerCase()}</span>}>
             {!report.usage_by_model?.length ? (

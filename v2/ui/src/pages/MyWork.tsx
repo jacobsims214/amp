@@ -20,6 +20,7 @@ import { UserRound } from 'lucide-react'
 import { isHuman, reasonLabel } from '../lib/human'
 import { MySessionsPanel } from '../components/remote/MySessionsPanel'
 import { remoteAvailable, useRemote } from '../remote/remote-context'
+import { projectLink } from '../lib/projectLink'
 
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone
 const NEXT_UP: DisplayState[] = ['prog', 'flag', 'ready', 'wait', 'sched', 'done']
@@ -41,7 +42,7 @@ function greeting(name: string) {
 
 /** Opens a ticket on its project's Mission page. */
 function ticketLink(t: WorkTask) {
-  return `/project/${t.project_id}?ticket=${t.id}`
+  return projectLink(t.project_id, 'mission', t.id)
 }
 
 function Velocity({ days }: { days: VelocityDay[] }) {

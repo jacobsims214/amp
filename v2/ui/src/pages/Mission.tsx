@@ -9,7 +9,8 @@
  * Clicking any ticket opens it in the drawer.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useParams, useSearchParams } from 'react-router-dom'
+import { useParams } from 'react-router-dom'
+import { useFocusParam } from '../hooks/useFocusParam'
 import { Loader2 } from 'lucide-react'
 import { api } from '../api/client'
 import { useBoardData } from '../hooks/useBoardData'
@@ -164,13 +165,8 @@ export function Mission() {
   const { epics, stories, tasks, loading, error, refresh, applyTask } = useBoardData(pid)
   const { members, myAccess, openReassign, people } = useProjectPeople(pid)
   const { me } = useAuth()
-  // ?ticket=ID opens a ticket on arrival (links from My work and elsewhere).
-  const [params, setParams] = useSearchParams()
-  const [selectedId, setSelected] = useState<number | null>(() => Number(params.get('ticket')) || null)
-  const setSelectedId = (id: number | null) => {
-    setSelected(id)
-    if (params.has('ticket')) { params.delete('ticket'); setParams(params, { replace: true }) }
-  }
+  // ?focus=ID (or the old ?ticket=) opens a ticket; it stays in the URL until closed.
+  const [selectedId, setSelectedId] = useFocusParam()
   const [showDone, setShowDone] = useState(false)
   const [activity, setActivity] = useState<FeedItem[]>([])
   // Last sign of life per ticket (any activity), and a clock that moves on

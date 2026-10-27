@@ -14,6 +14,7 @@ import { Markdown } from '../components/ui/Markdown'
 import { RunsPanel } from '../components/RunsPanel'
 import { displayState } from '../lib/ticketState'
 import type { ActivityLog, Comment, TraceHit } from '../types'
+import { projectLink } from '../lib/projectLink'
 
 /** A pasted value as a trace query: a URL is a PR, 7–40 hex chars a commit, anything else a branch. */
 function asQuery(v: string): { commit?: string; branch?: string; pr?: string } {
@@ -44,7 +45,7 @@ function Story({ hit }: { hit: TraceHit }) {
         <div className="flex items-center gap-3 flex-wrap text-[12.5px]">
           <StateTag state={displayState(hit.task)} />
           <span className="amp-num text-ink-2">{hit.runs.length} matching run{hit.runs.length === 1 ? '' : 's'}</span>
-          <Link to={`/project/${hit.task.project_id}?ticket=${hit.task.id}`} className="amp-btn amp-btn-sm">Open ticket</Link>
+          <Link to={projectLink(hit.task.project_id, 'mission', hit.task.id)} className="amp-btn amp-btn-sm">Open ticket</Link>
           <button type="button" className="amp-btn amp-btn-sm amp-btn-ghost" onClick={toggle} aria-expanded={open}>{open ? 'Hide' : 'Show'} how it got here</button>
         </div>
         {open && (
