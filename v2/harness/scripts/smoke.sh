@@ -739,7 +739,10 @@ firstrun_leg() {
       die "[$LEG] first run: expected '$want'"
     }
   done
-  { grep -qF "project #$pid $name" <<<"$out" && grep -qF "Set up this new project" <<<"$out"; } || {
+  # The editor's set-up prompt: a person with no projects before (newp=y) gets the onboarding one.
+  local setup_prompt="Set up this new project"
+  [[ "$newp" == n ]] || setup_prompt="I'm new to AMP: show me around"
+  { grep -qF "project #$pid $name" <<<"$out" && grep -qF "$setup_prompt" <<<"$out"; } || {
     printf '%s\n' "$out" >&2
     die "[$LEG] first run: the chat does not show project #$pid with the set-up prompt in the editor"
   }
@@ -764,7 +767,7 @@ firstrun_leg() {
     cat "$root/err" >&2
     die "[$LEG] second start asked or said something on stderr"
   }
-  { grep -qF "project #$pid" <<<"$out" && ! grep -qF "Set up this new project" <<<"$out"; } ||
+  { grep -qF "project #$pid" <<<"$out" && ! grep -qF "$setup_prompt" <<<"$out"; } ||
     die "[$LEG] second start: expected project #$pid and no set-up prompt"
   log "[$LEG] second start ok: nothing asked"
 
