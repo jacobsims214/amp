@@ -962,13 +962,15 @@ function MergeGateNote({ task }: { task: Task }) {
   }, [task.id])
 
   useEffect(() => {
-    if (!wantRuns) { setRuns([]); return }
+    if (!wantRuns) return
     let live = true
     api.taskRuns(task.id).then(r => { if (live) setRuns(r.runs) }).catch(() => {})
     return () => { live = false }
   }, [task.id, wantRuns, task.merge_state])
 
-  const into = mergedIntoIntegration(task, meta, runs)
+  // Runs are only read while they matter; otherwise ignore any stale ones
+  // (derived here rather than reset with setState inside the effect).
+  const into = mergedIntoIntegration(task, meta, wantRuns ? runs : [])
   const noWait = !waitsForMerge(meta) && task.state !== 'completed' && task.dependency_ids.length > 0
   if (!into && !noWait) return null
   return (
