@@ -34,13 +34,31 @@ type Run struct {
 	CreatedAt        time.Time `json:"created_at"`
 	// HoursWorked is what a person reports spending on a human ticket.
 	HoursWorked *float64 `json:"hours_worked,omitempty"`
+	// BaseBranch is the branch the work went into: the PR's target, or the
+	// branch it was merged or pushed into (AMP #2596).
+	BaseBranch string `json:"base_branch,omitempty"`
+}
+
+// LandsOn reports whether the run put its work on integration branch ib:
+// it says it went into ib (base_branch), or, saying nothing, it has no PR
+// and its branch is ib (merged or pushed straight into it). A PR whose head
+// is ib and whose base is something else, or not said, is ib's own PR to
+// main: it doesn't land on ib (AMP #2596).
+func (r Run) LandsOn(ib string) bool {
+	if ib == "" {
+		return false
+	}
+	if r.BaseBranch != "" {
+		return r.BaseBranch == ib
+	}
+	return r.PRURL == "" && r.Branch == ib
 }
 
 // HasDetail reports whether a run carries anything beyond its outcome, so
 // callers only record runs that tell us something.
 func (r Run) HasDetail() bool {
 	return r.Model != "" || r.InputTokens != nil || r.OutputTokens != nil || r.CostUSD != nil ||
-		r.Branch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != "" || r.HoursWorked != nil
+		r.Branch != "" || r.BaseBranch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != "" || r.HoursWorked != nil
 }
 
 // OpensMerge reports whether the run put work somewhere it waits to be
