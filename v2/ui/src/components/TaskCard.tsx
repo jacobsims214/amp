@@ -1,8 +1,9 @@
-import { Calendar, GitBranch, UserRound } from 'lucide-react'
+import { Calendar, GitBranch, GitMerge, UserRound } from 'lucide-react'
 import { isHuman, reasonLabel } from '../lib/human'
 import type { Task } from '../types'
 import type { Person } from '../lib/people'
 import { displayState, STATE_LABEL, STATE_VAR } from '../lib/ticketState'
+import { mergeBadge, mergeWait } from '../lib/merge'
 import { PriorityMark } from './ui/PriorityMark'
 import { Avatar } from './ui/Avatar'
 import { OwnerAvatar, UnassignedPill } from './OwnerAvatar'
@@ -29,12 +30,14 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null }: Props)
   const state = displayState(task)
   const startAt = state === 'sched' ? (task.start_at ?? task.block_reason?.replace('scheduled:', '')) : null
   const waitingOn = task.blocked_by_ids?.length ?? 0
+  const merge = mergeBadge(task)
+  const mergeWaiting = state === 'wait' ? mergeWait(task) : null
 
   return (
     <button
       type="button"
       onClick={onClick}
-      aria-label={`Ticket ${task.id}: ${task.name}, ${STATE_LABEL[state]}`}
+      aria-label={`Ticket ${task.id}: ${task.name}, ${STATE_LABEL[state]}${merge ? ` · ${merge.label}` : ''}`}
       className={`w-full text-left bg-surface border border-line hover:border-ink cursor-pointer transition-colors grid gap-1.5 ${dimmed ? 'opacity-35' : ''}`}
       style={{ padding: '8px 10px 9px 12px', boxShadow: `inset 3px 0 0 ${STATE_VAR[state]}`, borderRadius: 'var(--radius)' }}
     >
@@ -44,12 +47,21 @@ export function TaskCard({ task, onClick, dimmed = false, owner = null }: Props)
         {state === 'flag' && (
           <span className="ml-auto font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[3px] bg-st-flag text-white">Question</span>
         )}
+        {merge && (
+          <span className="ml-auto inline-flex items-center gap-1 font-label text-[10px] font-semibold uppercase tracking-[0.1em] px-1.5 py-[2px] border border-teal text-teal"
+            title={merge.hint}>
+            <GitMerge size={10} aria-hidden="true" />{merge.label}
+          </span>
+        )}
       </span>
 
       <span className="text-[13px] font-medium text-ink leading-snug line-clamp-2">{task.name}</span>
 
       {state === 'flag' && task.block_reason && (
         <span className="text-[12px] leading-snug text-danger-ink line-clamp-3">{task.block_reason}</span>
+      )}
+      {mergeWaiting && (
+        <span className="flex items-start gap-1.5 text-[11.5px] leading-snug text-teal"><GitMerge size={11} className="flex-shrink-0 mt-[2px]" aria-hidden="true" /><span className="line-clamp-2">{mergeWaiting}</span></span>
       )}
       {startAt && (
         <span className="flex items-center gap-1.5 text-[11.5px] text-violet"><Calendar size={11} className="flex-shrink-0" />Starts {formatStart(startAt)}</span>

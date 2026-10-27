@@ -26,7 +26,7 @@ import { lookupPerson, ownerFilterNarrows, peopleById, personName, taskMatchesOw
 import type { Task, TaskState, Epic, Story, ProjectMember, ProjectAccess, Metadata, HumanReason } from '../types'
 import { HUMAN_REASONS } from '../lib/human'
 import { BandLoader } from '../components/brand/BandLoader'
-import { PlanApprovalBanner } from '../components/PlanApprovalBanner'
+import { ApprovalLink } from '../components/ApprovalLink'
 import { usePlanApproval } from '../hooks/usePlanApproval'
 import { awaitingApproval } from '../lib/approval'
 
@@ -87,7 +87,7 @@ export function Board() {
   const [openReassign, setOpenReassign] = useState(false)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
-  // Tickets waiting on the person's approval, shown above the board.
+  // Tickets waiting on approval: a one-line link to My work, where approving happens.
   const approval = usePlanApproval(pid)
   const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
   const ownersOf = (ids: number[] | undefined): Person[] =>
@@ -384,10 +384,7 @@ export function Board() {
 
       {awaiting.length > 0 && (
         <div className="px-5 pt-3 flex-shrink-0">
-          <PlanApprovalBanner variant="compact" projectId={pid} project={approval.project} awaiting={awaiting} people={people}
-            meId={meId} myAccess={myAccess}
-            onApprove={sel => { approval.approve(sel).then(r => { if (r.changed) refresh() }) }}
-            approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setSelectedTaskId} />
+          <ApprovalLink projectId={pid} project={approval.project} awaiting={awaiting} people={people} meId={meId} />
         </div>
       )}
 

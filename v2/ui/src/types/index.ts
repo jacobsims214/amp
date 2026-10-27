@@ -84,11 +84,22 @@ export interface Task {
   approved_at?: string
   /** who approved it (null with approved_at set: a migration kept an earlier approval) */
   approved_by?: number | null
+  /** set when it completed with a PR or pushed branch while its project requires merges (#2475) */
+  merge_required?: boolean
+  /** none | needed | merged | abandoned; needed and abandoned hold its dependents (#2475) */
+  merge_state?: MergeState
+  /** the first merge report: when, and by what (ui, ci or github) */
+  merged_at?: string
+  merge_source?: string
+  /** why it still waits when a dependency is done but not merged: "Waiting on merge of #N (PR …)" */
+  waiting_detail?: string
   /** free-form key/value data for integrations (its own, not inherited) */
   metadata?: Metadata
   created_at: string
   updated_at: string
 }
+
+export type MergeState = 'none' | 'needed' | 'merged' | 'abandoned' | ''
 
 export type HumanReason = 'review' | 'approval' | 'access' | 'judgment' | 'external' | 'physical' | 'other'
 
