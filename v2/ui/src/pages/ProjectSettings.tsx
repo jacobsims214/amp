@@ -11,6 +11,7 @@ import { metadataPatch } from '../lib/metadata'
 import { inputCls, labelCls } from '../components/CrudModal'
 import { canManageProject } from '../lib/people'
 import { WebhooksPanel } from '../components/WebhooksPanel'
+import { GitHubHookPanel } from '../components/GitHubHookPanel'
 import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
@@ -110,7 +111,7 @@ export function ProjectSettings() {
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-[200px_minmax(0,1fr)] gap-6 px-7 py-6 items-start">
         <nav className="hidden lg:grid gap-0.5 sticky top-6" aria-label="Settings sections">
           <span className="amp-label px-2.5 pb-2">Settings</span>
-          {['General', 'Plan approval', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
+          {['General', 'Plan approval', 'Merges', 'Metadata', 'Team access', 'Knowledge bases', 'Trash', ...(canManage ? ['GitHub merge webhook', 'Webhooks', 'Audit log', 'Danger zone'] : [])].map(t => (
             <a key={t} href={`#${slug(t)}`} className="px-2.5 py-1.5 text-[13px] text-ink-2 hover:text-ink hover:bg-surface-3">{t}</a>
           ))}
         </nav>
@@ -185,6 +186,25 @@ export function ProjectSettings() {
                 </p>
               </Section>
 
+              <Section title="Merges"
+                description="An agent's work isn't in the codebase until its pull request is merged. With this on, a ticket that finishes with a PR or a pushed branch is done but waits on its merge, and the tickets that depend on it don't start until the merge is recorded: Mark merged on the ticket, CI calling amp_report_merged, or the GitHub merge webhook.">
+                <label className="flex items-center gap-3 text-[13px] text-ink cursor-pointer select-none">
+                  <input type="checkbox" className="w-4 h-4 accent-[var(--ink)]" disabled={!canManage}
+                    checked={project.require_merge !== false}
+                    onChange={async e => {
+                      const on = e.target.checked
+                      try { setProject(await api.updateProjectSettings(pid, { require_merge: on })) }
+                      catch (err) { setError(err instanceof Error ? err.message : 'Could not change the setting') }
+                    }} />
+                  Hold dependent tickets until the work they build on is merged
+                </label>
+                <p className="m-0 mt-2 text-[12px] text-ink-2 leading-relaxed">
+                  {project.require_merge !== false
+                    ? <>On. Mark merged, or Not needed, on a waiting ticket releases the tickets after it.</>
+                    : <>Off: dependents start as soon as a ticket is done, merged or not. Turning it back on holds the tickets waiting on unmerged work again.</>}
+                </p>
+              </Section>
+
               <Section title="Metadata"
                 description="Free-form fields for integrations and reporting, e.g. jira_board, initiative, capitalizable. Every epic, story, and ticket in the project inherits them and can override them.">
                 <MetadataEditor key={project.id} initial={project.metadata} readOnly={!canManage}
@@ -238,6 +258,13 @@ export function ProjectSettings() {
                 description="Tickets deleted in the last 30 days. Restoring brings back their text, owner, state, comments, history, and dependency links.">
                 <TrashPanel projectId={pid} />
               </Section>
+
+              {canManage && (
+                <Section title="GitHub merge webhook"
+                  description="Let GitHub tell AMP when a pull request is merged or closed. A merged PR records the merge on the tickets that produced it and releases the tickets waiting on them; a PR closed without merging marks them abandoned. GitHub signs each delivery with this project's secret.">
+                  <GitHubHookPanel projectId={pid} />
+                </Section>
+              )}
 
               {canManage && (
                 <Section title="Webhooks"
