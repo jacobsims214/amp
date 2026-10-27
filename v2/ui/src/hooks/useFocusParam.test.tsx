@@ -94,7 +94,8 @@ describe('useFocusParam', () => {
 describe('projectLink', () => {
   it('builds every project route with ?focus=', () => {
     expect(projectLink(2)).toBe('/project/2')
-    expect(projectLink(2, 'mission', 5)).toBe('/project/2?focus=5')
+    expect(projectLink(2, 'mission')).toBe('/project/2/mission')
+    expect(projectLink(2, 'mission', 5)).toBe('/project/2/mission?focus=5')
     expect(projectLink(2, 'board', 5)).toBe('/project/2/board?focus=5')
     expect(projectLink(2, 'plan', 5)).toBe('/project/2/plan?focus=5')
     expect(projectLink(2, 'my-work', 5)).toBe('/project/2/my-work?focus=5')

@@ -29,8 +29,14 @@ const server = setupServer(
 )
 // The drawer's artifact list listens for live updates.
 class FakeEventSource { onmessage = null; onerror = null; addEventListener() {} removeEventListener() {} close() {} }
+// The drawer keeps loading (runs, history, comments) after a synchronous test
+// ends; let those requests finish before the server goes away, or under load
+// a late fetch escapes to the network (ECONNREFUSED :3000, an unhandled error).
+let inFlight = 0
+server.events.on('request:start', () => { inFlight++ })
+server.events.on('request:end', () => { inFlight-- })
 beforeAll(() => { vi.stubGlobal('EventSource', FakeEventSource); server.listen({ onUnhandledFrame: 'error' }) })
-afterEach(() => { server.resetHandlers(); posts.length = 0 })
+afterEach(async () => { await waitFor(() => expect(inFlight).toBe(0)); server.resetHandlers(); posts.length = 0 })
 afterAll(() => { server.close(); vi.unstubAllGlobals() })
 
 const access = { project_id: 2, role: 'member', level: 1 } as unknown as ProjectAccess

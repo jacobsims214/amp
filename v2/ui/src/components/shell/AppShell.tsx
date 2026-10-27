@@ -1,20 +1,22 @@
 import { useEffect, useState } from 'react'
 import { NavLink, Outlet, useLocation, useMatch } from 'react-router-dom'
 import {
-  Activity, BookOpen, Home, Menu, MonitorSmartphone, Radar, X, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck, ScrollText,
+  Activity, BookOpen, Home, Inbox, Menu, MonitorSmartphone, Radar, X, Rows3, Building2, CalendarDays, FolderKanban, GitBranch, GitCommitHorizontal, GraduationCap, KeyRound, LogOut, PieChart, LayoutGrid, Settings, Shapes, ShieldCheck, ScrollText,
 } from 'lucide-react'
 import { api } from '../../api/client'
 import { useAuth } from '../../hooks/useAuth'
 import { remoteAvailable, useRemote } from '../../remote/remote-context'
 import type { Project } from '../../types'
+import { refreshWaitCounts, useWaitCounts } from '../../lib/waitCounts'
 import { Avatar } from '../ui/Avatar'
 
 // The frame around every page: one sidebar to get anywhere, the page beside
 // it. The current project's views sit under it in the sidebar, so nothing
 // needs a back button.
 
-const PROJECT_VIEWS: { to: (id: string) => string; label: string; icon: React.ReactNode; end?: boolean }[] = [
-  { to: id => `/project/${id}`, label: 'Mission', icon: <Radar size={14} />, end: true },
+const PROJECT_VIEWS: { to: (id: string) => string; label: string; icon: React.ReactNode; badge?: boolean }[] = [
+  { to: id => `/project/${id}/mission`, label: 'Mission', icon: <Radar size={14} /> },
+  { to: id => `/project/${id}/my-work`, label: 'My work', icon: <Inbox size={14} />, badge: true },
   { to: id => `/project/${id}/board`, label: 'Board', icon: <LayoutGrid size={14} /> },
   { to: id => `/project/${id}/plan`, label: 'Flight plan', icon: <Rows3 size={14} /> },
   { to: id => `/project/${id}/dag`, label: 'Graph', icon: <GitBranch size={14} /> },
@@ -31,6 +33,17 @@ function navCls({ isActive }: { isActive: boolean }) {
       ? 'bg-surface text-ink font-semibold shadow-[inset_3px_0_0_var(--accent),0_0_0_1px_var(--line)]'
       : 'text-ink-2 hover:bg-surface-3 hover:text-ink',
   ].join(' ')
+}
+
+/** A "waiting on you" count: white on the accent, read as "N waiting on you". */
+function Badge({ n }: { n?: number }) {
+  if (!n) return null
+  return <span className="ml-auto amp-num text-[11px] leading-none text-white bg-accent px-[5px] py-[2px] shrink-0" aria-hidden="true">{n}</span>
+}
+
+/** The accessible name of a link with a Badge: "My work, 6 waiting on you". */
+function badged(label: string, n?: number) {
+  return n ? `${label}, ${n} waiting on you` : undefined
 }
 
 function Group({ children }: { children: React.ReactNode }) {
@@ -51,7 +64,12 @@ export function AppShell() {
   // renamed, or archived on the page just left).
   useEffect(() => {
     api.listProjects().then(setProjects).catch(() => setProjects([]))
+    refreshWaitCounts()
   }, [location.pathname])
+  const wait = useWaitCounts()
+  const waitIn = (id: number | string) => wait?.projects[String(id)]?.waiting
+  // The phone bar: this project's count inside a project, the total elsewhere.
+  const phoneWaiting = (currentId ? waitIn(currentId) : wait?.counts.waiting) ?? 0
 
   const orgAdmin = (me?.orgs ?? []).some(o => o.my_role === 'owner' || o.my_role === 'admin')
   // The role people know themselves by: org owner or admin, else member.
@@ -76,7 +94,7 @@ export function AppShell() {
 
         <nav className="flex flex-col px-2 pb-4">
           <Group>Overview</Group>
-          <NavLink to="/" end className={navCls}><Home size={14} />My work</NavLink>
+          <NavLink to="/" end className={navCls} aria-label={badged('My work', wait?.counts.waiting)}><Home size={14} />My work<Badge n={wait?.counts.waiting} /></NavLink>
           {remoteAvailable(me, remote) && <NavLink to="/sessions" className={navCls}><MonitorSmartphone size={14} />Sessions</NavLink>}
           <NavLink to="/projects" className={navCls}><FolderKanban size={14} />Projects
             <span className="ml-auto amp-num text-[11px] text-ink-3">{projects.length || ''}</span></NavLink>
@@ -94,8 +112,8 @@ export function AppShell() {
                 {current.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 border border-line px-1 py-px ml-auto shrink-0">{current.code}</span>}
               </div>
               {PROJECT_VIEWS.map(v => (
-                <NavLink key={v.label} to={v.to(currentId!)} end={v.end} className={p => `${navCls(p)} pl-5`}>
-                  {v.icon}{v.label}
+                <NavLink key={v.label} to={v.to(currentId!)} className={p => `${navCls(p)} pl-5`} aria-label={v.badge ? badged(v.label, waitIn(currentId!)) : undefined}>
+                  {v.icon}{v.label}{v.badge && <Badge n={waitIn(currentId!)} />}
                 </NavLink>
               ))}
             </>
@@ -105,10 +123,11 @@ export function AppShell() {
             <>
               <Group>{current ? 'Other projects' : 'Projects'}</Group>
               {others.map(p => (
-                <NavLink key={p.id} to={`/project/${p.id}`} className={navCls} title={p.name}>
+                <NavLink key={p.id} to={`/project/${p.id}`} className={navCls} title={p.name} aria-label={badged(p.name, waitIn(p.id))}>
                   <span className="truncate">{p.name}</span>
-                  {/* Long slugs crowd the name out of a narrow sidebar; only short codes earn the space. */}
-                  {p.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 ml-auto shrink-0">{p.code}</span>}
+                  {/* Something waiting beats the code; long slugs crowd the name out of a narrow sidebar. */}
+                  {waitIn(p.id) ? <Badge n={waitIn(p.id)} />
+                    : p.code.length <= 8 && <span className="amp-num text-[10.5px] text-ink-3 ml-auto shrink-0">{p.code}</span>}
                 </NavLink>
               ))}
             </>
@@ -153,6 +172,10 @@ export function AppShell() {
         <div className="md:hidden sticky top-0 z-20 flex items-center gap-2 h-11 px-2 bg-surface border-b border-line">
           <button type="button" className="p-2 text-ink" onClick={() => setNavOpen(true)} aria-label="Open menu" aria-expanded={navOpen} aria-controls="main-nav"><Menu size={18} /></button>
           <span className="text-[15px] font-bold tracking-[0.16em] text-ink">AMP</span>
+          {phoneWaiting > 0 && (
+            <NavLink to={currentId ? `/project/${currentId}/my-work` : '/'} className="ml-auto mr-1 amp-num text-[11px] text-white bg-accent px-1.5 py-0.5">
+              {phoneWaiting} waiting on you</NavLink>
+          )}
         </div>
         <Outlet />
       </main>
