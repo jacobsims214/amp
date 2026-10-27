@@ -251,6 +251,16 @@ the owner clicking **Mark merged** in the project's My work tab. So wire the nex
 straight to the agent ticket that opens the PR; never plan a "review and merge" ticket between
 them. (A project can turn this off with `require_merge`; then dependents start on completion.)
 
+Two plan shapes need the next ticket before the merge to main. Mark them with metadata (inherited
+project → epic → story → ticket; it never needs re-approval):
+- **Integration branch:** the epic's or story's tickets merge into a shared branch, and one PR
+  takes it to main. Set `integration_branch: "<branch>"` on the epic or story, and tell its
+  workers to report `branch=<it>` (merged in) or `base_branch=<it>` (a PR into it). Each ticket
+  then releases the next on completion and stays unmerged until the integration branch merges.
+  The ticket that opens the integration PR to main still gates whatever comes after it.
+- **Review of an open PR:** give the review ticket `waits_for_merge: false`. It starts once the
+  PR's ticket is done; the PR's other dependents still wait for the merge.
+
 **Put a person in the loop when the step needs**:
 
 | Reason (`human_reason`) | Examples |

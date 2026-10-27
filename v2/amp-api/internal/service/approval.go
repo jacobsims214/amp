@@ -106,7 +106,7 @@ func (s *Service) openDepsGate(ctx context.Context, t *domain.Task, doing string
 	if len(t.DependencyIDs) == 0 {
 		return nil
 	}
-	done, err := s.Repo.CompletedAmong(ctx, t.DependencyIDs)
+	done, _, err := s.Repo.DepStatesFor(ctx, t.ID, t.DependencyIDs)
 	if err != nil {
 		return &authz.Error{Status: 503, Msg: fmt.Sprintf("ticket %d: couldn't check its dependencies (%v); nothing changed, try again", t.ID, err)}
 	}
@@ -326,5 +326,6 @@ func (s *Service) UpdateTask(ctx context.Context, p authz.Principal, t *domain.T
 		}
 		return &authz.Error{Status: 400, Msg: reply.Err.Error()}
 	}
+	s.ReconcileMergeMetadata(ctx, p, t.ProjectID, req.Metadata)
 	return nil
 }

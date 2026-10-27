@@ -313,6 +313,17 @@ func (a *StoryActor) loadAndSpawnTasks(ctx actor.Context) {
 		a.log.Error("failed to load dependency states", "err", err)
 		completedSet, waitSet = map[int]bool{}, map[int]string{}
 	}
+	// Tickets that wait only for completion, not merges (AMP #2596).
+	var noWait map[int]bool
+	if len(waitSet) > 0 {
+		ids := make([]int, 0, len(tasks))
+		for _, t := range tasks {
+			ids = append(ids, t.ID)
+		}
+		if noWait, err = a.repo.NoMergeWait(context.Background(), ids); err != nil {
+			a.log.Error("failed to load waits_for_merge", "err", err)
+		}
+	}
 
 	for _, t := range tasks {
 		// Build this task's completedDeps from the completed set.
@@ -324,6 +335,9 @@ func (a *StoryActor) loadAndSpawnTasks(ctx actor.Context) {
 			} else if w, ok := waitSet[depID]; ok {
 				mergeWaits[depID] = w
 			}
+		}
+		if noWait[t.ID] {
+			repository.RelaxMergeWaits(completedDeps, mergeWaits)
 		}
 		pid := a.spawnTaskActor(ctx, t, completedDeps, mergeWaits)
 		a.tasks[t.ID] = pid
@@ -342,7 +356,7 @@ func (a *StoryActor) adoptTask(ctx actor.Context, taskID int) (*domain.Task, err
 	if t.DependencyIDs, err = a.repo.TaskDependencies(context.Background(), taskID); err != nil {
 		return nil, err
 	}
-	done, waits, err := a.repo.DepStates(context.Background(), t.DependencyIDs)
+	done, waits, err := a.repo.DepStatesFor(context.Background(), t.ID, t.DependencyIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -382,7 +396,7 @@ func (a *StoryActor) handleCreateTask(ctx actor.Context, req domain.CreateTaskRe
 
 	// Derive initial state from deps — which are already completed, wherever
 	// they are in the project.
-	completedDeps, mergeWaits, err := a.repo.DepStates(context.Background(), req.DependencyIDs)
+	completedDeps, mergeWaits, err := a.repo.DepStatesFor(context.Background(), task.ID, req.DependencyIDs)
 	if err != nil {
 		return nil, fmt.Errorf("db dependency states: %w", err)
 	}

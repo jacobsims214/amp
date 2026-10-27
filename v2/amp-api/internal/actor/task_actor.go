@@ -862,9 +862,11 @@ func (a *TaskActor) withBlockedBy() domain.Task {
 }
 
 // readDeps re-reads which dependencies are satisfied, and which of the
-// rest are done but wait on their merge, into completedDeps/mergeWaits.
+// rest are done but wait on their merge, into completedDeps/mergeWaits. A
+// task whose effective metadata says waits_for_merge: false waits only for
+// its dependencies to complete (AMP #2596).
 func (a *TaskActor) readDeps() (map[int]bool, error) {
-	done, waits, err := a.repo.DepStates(context.Background(), a.task.DependencyIDs)
+	done, waits, err := a.repo.DepStatesFor(context.Background(), a.task.ID, a.task.DependencyIDs)
 	if err != nil {
 		return nil, err
 	}
