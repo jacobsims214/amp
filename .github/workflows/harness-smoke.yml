@@ -93,14 +93,29 @@ jobs:
           pid="$(cat "$RUNNER_TEMP/compose-build.pid")"
           while kill -0 "$pid" 2>/dev/null; do sleep 5; done
           tail -n 20 "$RUNNER_TEMP/compose-build.log"
-          docker compose -f docker-compose.yml up -d postgres typesense amp-api ui
+          # amp-api's pgx pool defaults to max(4, CPUs) connections. On the 4-CPU runner its startup
+          # jobs (each holding an advisory-lock connection while using another) can starve the pool,
+          # so the cluster heartbeat fails and every MCP call times out. Give it a bigger pool here;
+          # the server-side fix is tracked separately (see the AMP KB note on this job).
+          cat >"$RUNNER_TEMP/compose-ci.yml" <<'YAML'
+          services:
+            amp-api:
+              environment:
+                DATABASE_URL: postgres://amp:amp@postgres:5432/amp?sslmode=disable&pool_max_conns=20
+          YAML
+          docker compose -f docker-compose.yml -f "$RUNNER_TEMP/compose-ci.yml" up -d postgres typesense amp-api ui
           # REST /ready, and any HTTP answer from the MCP listener. Probe MCP with a POST: a GET on
           # /mcp opens the Streamable HTTP event stream and never returns.
           for i in $(seq 1 60); do
             code="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
               -d '{}' http://localhost:8000/mcp 2>/dev/null || true)"
+            # /ready is 503 while the replica can't heartbeat: require it three times in a row (~6s,
+            # longer than one heartbeat interval) so a stalled server fails here, not mid-smoke.
             if curl -fsS -m 5 http://localhost:3001/ready >/dev/null 2>&1 && [ "${code:-000}" != 000 ]; then
-              echo "AMP is up (try $i, MCP answered $code)"; exit 0
+              ok=$((${ok:-0} + 1))
+              if [ "$ok" -ge 3 ]; then echo "AMP is up (try $i, MCP answered $code)"; exit 0; fi
+            else
+              ok=0
             fi
             sleep 2
           done
