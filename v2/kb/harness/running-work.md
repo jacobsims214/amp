@@ -163,8 +163,8 @@ same tool call is stopped after the fifth time, in the chat and in workers.
 **Only a person approves a plan, in AMP's web UI.** No agent can, not even one signed in as you
 (`working/planning-and-approval.md`). The harness makes the wait visible:
 
-- The status line says `plan: N waiting for your approval`, linked to the project's Flight plan
-  page. `/plan` shows the same, and `/open plan` opens the page.
+- The status line says `plan: N waiting for your approval`, linked to your My work tab in the
+  project (Flight plan on an AMP older than My work). `/plan` shows the same, and `/open plan` opens the page.
 - When AMP refuses the manager a step that is yours (dispatching a ticket planned after your
   last approval, marking your ticket done), the transcript shows:
 

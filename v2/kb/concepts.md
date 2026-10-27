@@ -39,8 +39,9 @@ Don't set state by hand to work around a missing dependency; add the dependency.
 - **Agent accounts** are separate AMP users for unattended agents (CI, bots). They can do work
   but can't approve plans. No agent can, whoever it runs as: plans and artifacts are approved,
   and human tickets marked done, by a person in the web UI.
-- **Human tickets** are done by their owner, not an agent: a review and merge, a sign-off, a
-  step that needs access agents don't have. They sit in the same dependency graph, so the agent
+- **Human tickets** are done by their owner, not an agent: a sign-off, a decision, a
+  step that needs access agents don't have. (Merging a PR isn't one: the ticket shows **Merge
+  needed** and the work after it waits for the merge; see `working/merging-and-ci.md`.) They sit in the same dependency graph, so the agent
   work after them waits for the person. Agents never dispatch them. See `working/human-work.md`.
 
 ## Access levels on a project
