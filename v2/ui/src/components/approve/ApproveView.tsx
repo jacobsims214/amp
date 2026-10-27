@@ -298,16 +298,16 @@ function Loaded(props: ApproveViewProps & { plan: ApprovalPlan; onReload: () => 
             {effect.held.size > 0 && <span><i className="apv-sw held" />Held</span>}
           </div>
           <PlanOutline model={model} ticks={ticks} effect={effect} canOnBehalf={canOnBehalf} selected={selected} collapsed={collapsed} filter={filter}
-            showCritical={showCritical} multiEpic={multi} onSelect={select} onTick={tick} formatTime={when}
+            showCritical={showCritical} showNew={!!lastApproved} multiEpic={multi} onSelect={select} onTick={tick} formatTime={when}
             onToggleStory={sid => setCollapsed(c => { const n = new Set(c); if (n.has(sid)) n.delete(sid); else n.add(sid); return n })} />
         </section>
         {!narrow && selected != null && (
-          <TicketReader projectId={projectId} model={model} id={selected} ticks={ticks} effect={effect} canOnBehalf={canOnBehalf} showCritical={showCritical}
+          <TicketReader projectId={projectId} model={model} id={selected} ticks={ticks} effect={effect} canOnBehalf={canOnBehalf} showCritical={showCritical} showNew={!!lastApproved}
             onSelect={select} onStep={step} onTick={tick} formatTime={when} />
         )}
       </div>
       {narrow && sheetOpen && selected != null && (
-        <TicketReader sheet projectId={projectId} model={model} id={selected} ticks={ticks} effect={effect} canOnBehalf={canOnBehalf} showCritical={showCritical}
+        <TicketReader sheet projectId={projectId} model={model} id={selected} ticks={ticks} effect={effect} canOnBehalf={canOnBehalf} showCritical={showCritical} showNew={!!lastApproved}
           onSelect={select} onStep={step} onTick={tick} formatTime={when} onClose={() => setSheetOpen(false)} />
       )}
 

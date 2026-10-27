@@ -125,9 +125,9 @@ function MergeAction({ task, canAct, prUrl, branch, onChanged }: HumanActionsPro
   }, () => undefined)
   return (
     <div className="grid gap-2.5" data-action="merge">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px] text-ink-2 amp-num">
-        {prUrl && <span>{prLabel(prUrl)}</span>}
-        {branch && <span>{branch}</span>}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[12.5px] text-ink-2">
+        {prUrl && <span className="amp-num">{prLabel(prUrl)}</span>}
+        {branch && <span className="amp-num">{branch}</span>}
         <span>{abandoned ? 'PR closed without merging. What depends on it still waits.' : 'Done · Merge needed. What depends on it waits for the merge.'}</span>
       </div>
       {record && (

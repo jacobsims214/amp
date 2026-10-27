@@ -1,10 +1,12 @@
 /* The Approve view (artifact #24 v2). Tokens from index.css; layout only here. */
-.apv {
+.apv, .apv-card, .apv-approve, .apv-sheet {
   --k-approve: var(--violet);
   --up: var(--link);
   --up-tint: color-mix(in srgb, var(--link) 8%, transparent);
   --held-tint: color-mix(in srgb, var(--warning) 12%, transparent);
   --cell: 18px;
+}
+.apv {
   display: grid;
   gap: 16px;
   padding-bottom: 8px;

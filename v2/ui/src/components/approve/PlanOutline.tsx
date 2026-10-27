@@ -20,6 +20,8 @@ export interface OutlineProps {
   /** find box text: rows that don't match are hidden */
   filter: string
   showCritical: boolean
+  /** mark New tickets: only once the person has approved something here (otherwise everything is new) */
+  showNew: boolean
   multiEpic: boolean
   onSelect: (id: number) => void
   onTick: (ids: number[], on: boolean) => void
@@ -173,7 +175,7 @@ function Row(p: OutlineProps & { story: StorySection; id: number; ups: Set<numbe
       <span className="t">
         <span className="nid">#{id}</span>
         <button type="button" className="tt" onClick={() => p.onSelect(id)}>{t.name}</button>
-        {t.change === 'new' && <span className="apv-badge">New</span>}
+        {t.change === 'new' && p.showNew && <span className="apv-badge">New</span>}
         {t.change === 'changed' && <span className="apv-badge chg">Changed</span>}
         <span className="meta">
           <span className="stepn">Step {step}</span>

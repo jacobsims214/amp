@@ -118,13 +118,14 @@ export function buildModel(plan: ApprovalPlan): PlanModel {
     sections.push({ story, ids, firstStep: Math.min(...ss), lastStep: Math.max(...ss), color: '', allApproved: ids.every(id => !byId.get(id)!.awaiting) })
   }
   sections.sort((a, b) => (a.firstStep - b.firstStep) || (a.story.id - b.story.id))
-  sections.forEach((s, i) => { s.color = STORY_COLORS[i % STORY_COLORS.length] })
 
   const epics: EpicSection[] = epicList.map(epic => {
     const stories = sections.filter(s => (s.story.epic_id ?? epicOf(byId.get(s.ids[0])!)) === epic.id)
     return { epic, stories, firstStep: stories.length ? Math.min(...stories.map(s => s.firstStep)) : Infinity, ticketCount: stories.reduce((n, s) => n + s.ids.length, 0) }
   }).filter(e => e.stories.length > 0)
   epics.sort((a, b) => a.firstStep - b.firstStep || epicList.indexOf(a.epic) - epicList.indexOf(b.epic))
+  // Colours follow the outline: epic by epic, story by story.
+  epics.flatMap(e => e.stories).forEach((s, i) => { s.color = STORY_COLORS[i % STORY_COLORS.length] })
 
   const storyOf = new Map<number, StorySection>()
   sections.forEach(s => s.ids.forEach(id => storyOf.set(id, s)))

@@ -21,6 +21,8 @@ export interface ReaderProps {
   effect: SelectionEffect
   canOnBehalf: boolean
   showCritical: boolean
+  /** mark New: only once the person has approved something here */
+  showNew?: boolean
   onSelect: (id: number) => void
   onStep: (dir: 1 | -1) => void
   onTick: (ids: number[], on: boolean) => void
@@ -101,7 +103,7 @@ export function TicketReader(p: ReaderProps) {
           <span className="apv-tag">Priority {t.priority}{PRIORITY[Number(t.priority)] ? ` · ${PRIORITY[Number(t.priority)]}` : ''}</span>
           {story && <span className="apv-tag" style={{ '--sc': story.color } as CSSProperties}><i aria-hidden="true" />Story {story.story.id}</span>}
           {p.showCritical && model.critical.has(id) && <span className="apv-tag crit">Critical path</span>}
-          {t.change === 'new' && <span className="apv-badge">New</span>}
+          {t.change === 'new' && p.showNew && <span className="apv-badge">New</span>}
           {t.change === 'changed' && <span className="apv-badge chg">Changed</span>}
         </div>
 
