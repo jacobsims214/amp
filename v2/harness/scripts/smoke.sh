@@ -281,7 +281,9 @@ approve_plan() {
     return 0
   fi
   local url waited=0
-  url="$(grep -Eo '(https?://[^ "]+)?/project/[0-9]+/plan' "$WORK/err" | head -n 1 || true)"
+  # The approval page: /project/P/plan on older servers, My work (/project/P/my-work?approve=...) since
+  # human-work UX (#2498). The harness may redact the query, so stop at the path.
+  url="$(grep -Eo '(https?://[^ "]+)?/project/[0-9]+/(plan|my-work)' "$WORK/err" | head -n 1 || true)"
   [[ "$url" == /* ]] && url="$LEG_WEB_BASE$url"
   ((APPROVE_WAIT > 0)) ||
     die "[$LEG] plan approval needs a person: approve ${url:-the plan of project $P_ID} in the web UI, or set AMP_SMOKE_APPROVE_WAIT=SECS and approve while the smoke waits"
@@ -579,7 +581,7 @@ run_leg() {
     log "[$LEG] note: the server dispatched before the plan was approved (approval not required here)"
     call amp_set_task_state "{\"task_id\":$t1,\"to_state\":\"backlog\"}" >/dev/null
   else
-    grep -q "/project/$P_ID/plan" "$WORK/err" || {
+    grep -Eq "/project/$P_ID/(plan|my-work)" "$WORK/err" || {
       cat "$WORK/err" >&2
       die "[$LEG] dispatch before approval: the refusal has no link to the plan"
     }
