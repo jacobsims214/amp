@@ -20,12 +20,24 @@ Tagging is a person's step. Agents prepare the commit, and a person pushes the t
       so tag a commit on `main`, after the harness branch has merged.
 - [ ] `Harness` (`harness.yml`: fmt, clippy, tests, asset drift) and `Harness smoke`
       (`harness-smoke.yml`: the smoke test in modes auto, 2026-07-28 and 2025-11-25) are green
-      on that commit. **The release workflow runs neither of them.** It only runs the installer
-      tests and the version checks, so check these two yourself:
+      on that commit. The release workflow doesn't run them itself, but its `gate` job
+      **enforces** this: on a `harness-v*` tag it fails, and nothing is published, unless
+      **both** workflows have a successful run on the tagged commit. Check beforehand so the
+      release run doesn't stop at the gate:
 
       ```sh
       gh run list --workflow harness.yml --commit <sha>
       gh run list --workflow harness-smoke.yml --commit <sha>
+      ```
+
+      Both workflows have path filters, so a commit that changed nothing they watch may have
+      no run of one or both. Run them on the commit (on the tag, once pushed; both have
+      `workflow_dispatch`), wait for them to pass, then re-run the failed release run:
+
+      ```sh
+      gh workflow run harness.yml --ref harness-vX.Y.Z
+      gh workflow run harness-smoke.yml --ref harness-vX.Y.Z
+      gh run rerun <release run id> --failed     # re-runs gate, then publish
       ```
 
 - [ ] Choose the version under D14 (semver).
@@ -76,8 +88,15 @@ A run takes about 15 minutes, mostly the Intel macOS build.
 
 ## 4. What CI checks on a tag
 
-The jobs run in order, and the release is created only if all of them pass.
+The jobs run in order, and the release is created only if all of them pass. `gate` runs alongside
+them; only `publish` waits for it.
 
+0. **gate** (`harness-v*` tags only; `actions: read`): for each of `harness.yml` and
+   `harness-smoke.yml` it asks the API for successful runs on the tagged commit
+   (`actions/workflows/<file>/runs?head_sha=$GITHUB_SHA&status=success`). If **either** has
+   none, or the API call fails, the job fails with an `::error::` that gives the
+   `gh workflow run <file> --ref <tag>` recovery (section 1), and `publish` doesn't run. It is
+   skipped (passes at once) for `-test` versions, whose off-branch commits have no CI runs.
 1. **install-test** (ubuntu-latest and macos-latest): shellcheck (Linux), then
    `scripts/test-install.sh`, the offline installer tests. On Linux it also runs
    `scripts/test-install-distros.sh`, which installs in Debian, Ubuntu, glibc 2.31 and Alpine
@@ -105,8 +124,8 @@ The jobs run in order, and the release is created only if all of them pass.
      - All six pins are listed: rpi-ai, rpi-agent, rpi-tools, rpi-harness, rpi-tui and rmcp.
 3. **package**: `sha256sum -c` on every archive, then writes `SHA256SUMS`. It renders the
    Homebrew formula `amp-harness.rb` from the four checksums (`ruby -c`) and copies `install.sh`.
-4. **publish** (`harness-v*` tags only; `contents: write` with `GITHUB_TOKEN`, so no extra
-   secrets): it checks `SHA256SUMS` again, expects exactly 4 lines in it, and checks that
+4. **publish** (`harness-v*` tags only; needs `package` and `gate`; `contents: write` with
+   `GITHUB_TOKEN`, so no extra secrets): it checks `SHA256SUMS` again, expects exactly 4 lines in it, and checks that
    `install.sh` and `amp-harness.rb` are not empty. Then it creates the release.
 
 ## 5. What gets published
