@@ -64,13 +64,28 @@ func (r *Repo) FindRuns(ctx context.Context, projectIDs []int, commit, branch, p
 
 // UnmergedWork lists, for a project's completed tickets, the latest run that
 // put work on a branch or PR, where no run on the ticket has reported it
-// merged: work the agents finished that waits on a person to merge.
+// merged: work the agents finished that waits on a person to merge. A
+// person's own run (agent_id "human": the link they gave when marking their
+// ticket done) doesn't put their ticket here, and neither does a ticket
+// whose merge was recorded or marked not needed (AMP #2475).
 func (r *Repo) UnmergedWork(ctx context.Context, projectID int) ([]domain.Run, error) {
 	return r.queryRuns(ctx, `WHERE id IN (
 		SELECT DISTINCT ON (tr.task_id) tr.id
 		  FROM task_runs tr JOIN tasks t ON t.id = tr.task_id
 		 WHERE tr.project_id = $1 AND t.state = 'completed' AND (tr.branch <> '' OR tr.pr_url <> '')
+		   AND tr.agent_id <> '`+domain.HumanAgentID+`' AND t.performer <> '`+domain.PerformerHuman+`'
+		   AND t.merge_state <> 'merged' AND NOT (t.merge_required AND t.merge_state = 'none')
 		   AND NOT EXISTS (SELECT 1 FROM task_runs m WHERE m.task_id = tr.task_id AND m.merged)
 		 ORDER BY tr.task_id, tr.created_at DESC, tr.id DESC)
 		ORDER BY created_at`, projectID)
+}
+
+// FirstMergedRun returns the earliest run on a ticket that reported its work
+// merged, or nil.
+func (r *Repo) FirstMergedRun(ctx context.Context, taskID int) (*domain.Run, error) {
+	runs, err := r.queryRuns(ctx, `WHERE task_id = $1 AND merged ORDER BY created_at, id LIMIT 1`, taskID)
+	if err != nil || len(runs) == 0 {
+		return nil, err
+	}
+	return &runs[0], nil
 }

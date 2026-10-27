@@ -35,12 +35,7 @@ func (r *Repo) workTasks(ctx context.Context, where string, args ...any) ([]Work
 	for rows.Next() {
 		var w WorkTask
 		t := &w.Task
-		if err := rows.Scan(
-			&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID, &t.Name, &t.Description, &t.AcceptanceCriteria,
-			&t.State, &t.Priority, &t.AssignedTo, &t.AgentID, &t.DispatchedAt, &t.CompletedAt, &t.BlockReason, &t.StartAt,
-			&t.CreatedBy, &t.OwnerUserID, &t.Metadata, &t.CreatedAt, &t.UpdatedAt,
-			&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor, &w.ProjectCode, &w.ProjectName, &w.LastActivityAt,
-		); err != nil {
+		if err := rows.Scan(append(taskFields(t), &w.ProjectCode, &w.ProjectName, &w.LastActivityAt)...); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

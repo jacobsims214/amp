@@ -43,6 +43,23 @@ func (r Run) HasDetail() bool {
 		r.Branch != "" || r.Commit != "" || r.PRURL != "" || r.Pushed != nil || r.Merged != nil || r.Note != "" || r.HoursWorked != nil
 }
 
+// OpensMerge reports whether the run put work somewhere it waits to be
+// merged: a PR, or a branch it pushed. A run that reports the work already
+// merged doesn't.
+func (r Run) OpensMerge() bool {
+	if r.Merged != nil && *r.Merged {
+		return false
+	}
+	return r.PRURL != "" || (r.Branch != "" && r.Pushed != nil && *r.Pushed)
+}
+
+// IsMergeReport reports whether the run only records a merge (merged=true
+// and no usage): a fact about the code, which anyone on the project may
+// report, recorded once per ticket.
+func (r Run) IsMergeReport() bool {
+	return r.Merged != nil && *r.Merged && r.InputTokens == nil && r.OutputTokens == nil && r.CostUSD == nil
+}
+
 // Usage totals runs' token spend.
 type Usage struct {
 	Runs             int      `json:"runs"`

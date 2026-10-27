@@ -109,11 +109,13 @@ func (r *Repo) Close() { r.db.Close() }
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at`
+const projectCols = `id, name, code, description, state, org_id, created_by, open_reassign, plan_approved_at, plan_approved_by, require_plan_approval, metadata, created_at, updated_at,
+	require_merge, require_merge_since`
 
 func scanProject(row rowScanner, p *domain.Project) error {
 	return row.Scan(&p.ID, &p.Name, &p.Code, &p.Description, &p.State, &p.OrgID, &p.CreatedBy, &p.OpenReassign,
-		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt)
+		&p.PlanApprovedAt, &p.PlanApprovedBy, &p.RequirePlanApproval, &p.Metadata, &p.CreatedAt, &p.UpdatedAt,
+		&p.RequireMerge, &p.RequireMergeSince)
 }
 
 const epicCols = `e.id, e.project_id, e.name, e.description, e.state, e.priority, e.created_by,
@@ -134,10 +136,12 @@ func scanStory(row rowScanner, st *domain.Story) error {
 
 const taskCols = `id, project_id, epic_id, story_id, name, description, acceptance_criteria, state, priority,
 	assigned_to, agent_id, dispatched_at, completed_at, block_reason, start_at, created_by, owner_user_id, metadata, created_at, updated_at,
-	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for`
+	performer, human_reason, ready_at, planned_at, approved_at, approved_by, approved_for,
+	merge_required, merge_state, merged_at, merge_source`
 
-func scanTask(row rowScanner, t *domain.Task) error {
-	return row.Scan(
+// taskFields are the scan targets for taskCols, in order.
+func taskFields(t *domain.Task) []any {
+	return []any{
 		&t.ID, &t.ProjectID, &t.EpicID, &t.StoryID,
 		&t.Name, &t.Description, &t.AcceptanceCriteria,
 		&t.State, &t.Priority,
@@ -145,7 +149,12 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		&t.CreatedBy, &t.OwnerUserID, &t.Metadata,
 		&t.CreatedAt, &t.UpdatedAt,
 		&t.Performer, &t.HumanReason, &t.ReadyAt, &t.PlannedAt, &t.ApprovedAt, &t.ApprovedBy, &t.ApprovedFor,
-	)
+		&t.MergeRequired, &t.MergeState, &t.MergedAt, &t.MergeSource,
+	}
+}
+
+func scanTask(row rowScanner, t *domain.Task) error {
+	return row.Scan(taskFields(t)...)
 }
 
 func collect[T any](rows pgx.Rows, scan func(rowScanner, *T) error) ([]T, error) {
@@ -236,9 +245,11 @@ func (r *Repo) UpdateProject(ctx context.Context, id int, u domain.ProjectSettin
 		   open_reassign = COALESCE($4, open_reassign),
 		   metadata = (metadata || $5::jsonb) - $6::text[],
 		   require_plan_approval = COALESCE($7, require_plan_approval),
+		   require_merge_since = CASE WHEN $8::bool AND NOT require_merge THEN NOW() ELSE require_merge_since END,
+		   require_merge = COALESCE($8, require_merge),
 		   updated_at = NOW()
 		 WHERE id = $1 RETURNING `+projectCols,
-		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval,
+		id, u.Name, u.Description, u.OpenReassign, set, removeOrEmpty(remove), u.RequirePlanApproval, u.RequireMerge,
 	), p)
 	if err == pgx.ErrNoRows {
 		return nil, fmt.Errorf("project %d not found", id)
