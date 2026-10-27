@@ -330,6 +330,18 @@ can't see, or tells you to and the team's conventions allow it, record it with
 sha>)`); a second report is a no-op. Tell your user what's waiting to merge at the end of a pass,
 with the PR links.
 
+Two metadata keys shape the gate. Neither needs re-approval:
+- **Integration branch.** When an epic's or story's tickets merge into a shared branch and one
+  PR takes it to main, set `integration_branch: "<branch>"` on that epic or story
+  (`amp_update_epic` / `amp_update_story` metadata). Tell its workers to report
+  `branch=<integration branch>` when they merge into it, or `base_branch=<integration branch>`
+  with their PR into it. Their dependents then start on completion. The ticket that opens the
+  integration PR to main still gates, and `amp_report_merged(branch=<integration branch>)` marks
+  the whole chain merged.
+- **Review tickets.** A ticket that reviews an open PR (e.g. an `amp-github-reviewer` ticket that
+  depends on the ticket opening the PR) gets `waits_for_merge: false` in its metadata. Otherwise
+  it waits for the merge it's meant to come before.
+
 **Mistakes.** Deleted tickets, stories and epics stay in the trash for 30 days:
 `amp_list_deleted_tasks`, then `amp_restore_tasks` with `task_ids`, `story_ids` or `epic_ids`
 (a story or epic comes back with its tickets). Restore rather than re-create.

@@ -3,7 +3,9 @@ package repository
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -26,8 +28,23 @@ type Repo struct {
 	secretsKeys atomic.Pointer[secretbox.Keyring]
 }
 
+// MinDefaultPoolConns is the smallest pool New makes when DATABASE_URL
+// doesn't set pool_max_conns. pgxpool's own default is max(4, NumCPU):
+// only 4 on a small host, which the background jobs (audit checkpoints and
+// retention, KB backfill and reconciler, webhook dispatcher, scheduled
+// tickets, cluster heartbeat and relay) can fill on their own and leave
+// requests waiting (#2598). An explicit pool_max_conns always wins.
+const MinDefaultPoolConns = 16
+
 func New(ctx context.Context, dsn string) (*Repo, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse database url: %w", err)
+	}
+	if !hasPoolMaxConns(dsn) && cfg.MaxConns < MinDefaultPoolConns {
+		cfg.MaxConns = MinDefaultPoolConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
@@ -35,6 +52,20 @@ func New(ctx context.Context, dsn string) (*Repo, error) {
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
 	return &Repo{db: pool}, nil
+}
+
+// hasPoolMaxConns reports whether dsn (URL or keyword/value form) sets
+// pool_max_conns.
+func hasPoolMaxConns(dsn string) bool {
+	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") {
+		return u.Query().Has("pool_max_conns")
+	}
+	for _, f := range strings.Fields(dsn) {
+		if k, _, ok := strings.Cut(f, "="); ok && strings.TrimSpace(k) == "pool_max_conns" {
+			return true
+		}
+	}
+	return false
 }
 
 // Migration is one versioned schema change, applied at most once.

@@ -251,6 +251,13 @@ isn't on the main line yet. Leave `pr_url` out and they start straight away. A P
 completing goes on `amp_report_run` with `pr_url`; it gates the dependents from then on. Never
 report your own PR as merged.
 
+**On an integration branch** (your ticket's `effective_metadata` has `integration_branch`, or your
+ticket says to merge into a shared branch): if you merged or pushed into that branch, report
+`branch=<integration branch>`. If you opened a PR into it, pass `pr_url`, your `branch` and
+`base_branch=<integration branch>`. Either way the tickets after yours start on completion, and the
+integration branch's own merge to main later marks yours merged. Only the ticket that opens the
+integration PR to main reports `base_branch=main`.
+
 Post a completion summary:
 
 ```

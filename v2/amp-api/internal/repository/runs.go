@@ -8,23 +8,23 @@ import (
 )
 
 const runCols = `id, task_id, project_id, user_id, agent_id, outcome, model, input_tokens, output_tokens,
-	cache_read_tokens, cache_write_tokens, cost_usd::float8, branch, commit_sha, pr_url, pushed, merged, note, created_at, hours_worked::float8`
+	cache_read_tokens, cache_write_tokens, cost_usd::float8, branch, commit_sha, pr_url, pushed, merged, note, created_at, hours_worked::float8, base_branch`
 
 func scanRun(row pgx.Row) (domain.Run, error) {
 	var r domain.Run
 	err := row.Scan(&r.ID, &r.TaskID, &r.ProjectID, &r.UserID, &r.AgentID, &r.Outcome, &r.Model, &r.InputTokens,
 		&r.OutputTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.CostUSD, &r.Branch, &r.Commit, &r.PRURL,
-		&r.Pushed, &r.Merged, &r.Note, &r.CreatedAt, &r.HoursWorked)
+		&r.Pushed, &r.Merged, &r.Note, &r.CreatedAt, &r.HoursWorked, &r.BaseBranch)
 	return r, err
 }
 
 // AddRun records one agent run on a ticket.
 func (r *Repo) AddRun(ctx context.Context, run domain.Run) (domain.Run, error) {
 	return scanRun(r.db.QueryRow(ctx, `INSERT INTO task_runs (task_id, project_id, user_id, agent_id, outcome, model,
-		input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, branch, commit_sha, pr_url, pushed, merged, note, hours_worked)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING `+runCols,
+		input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, branch, commit_sha, pr_url, pushed, merged, note, hours_worked, base_branch)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING `+runCols,
 		run.TaskID, run.ProjectID, run.UserID, run.AgentID, run.Outcome, run.Model, run.InputTokens, run.OutputTokens,
-		run.CacheReadTokens, run.CacheWriteTokens, run.CostUSD, run.Branch, run.Commit, run.PRURL, run.Pushed, run.Merged, run.Note, run.HoursWorked))
+		run.CacheReadTokens, run.CacheWriteTokens, run.CostUSD, run.Branch, run.Commit, run.PRURL, run.Pushed, run.Merged, run.Note, run.HoursWorked, run.BaseBranch))
 }
 
 func (r *Repo) queryRuns(ctx context.Context, q string, args ...any) ([]domain.Run, error) {
@@ -55,10 +55,13 @@ func (r *Repo) ProjectRuns(ctx context.Context, projectID int, since, until any)
 }
 
 // FindRuns finds runs by commit (a prefix of at least 7 characters), branch,
-// or PR URL, in the given projects (nil: every project).
+// or PR URL, in the given projects (nil: every project). A branch also finds
+// the runs whose work went into it as their ticket's integration branch
+// (base_branch = it), so reporting that branch merged reaches them (#2596).
 func (r *Repo) FindRuns(ctx context.Context, projectIDs []int, commit, branch, pr string) ([]domain.Run, error) {
 	return r.queryRuns(ctx, `WHERE ($1::int[] IS NULL OR project_id = ANY($1))
-		AND (($2 <> '' AND commit_sha LIKE $2 || '%') OR ($3 <> '' AND branch = $3) OR ($4 <> '' AND pr_url = $4))
+		AND (($2 <> '' AND commit_sha LIKE $2 || '%') OR ($3 <> '' AND branch = $3) OR ($4 <> '' AND pr_url = $4)
+		     OR ($3 <> '' AND `+intoIntegration("$3")+`))
 		ORDER BY created_at DESC, id DESC LIMIT 100`, projectIDs, commit, branch, pr)
 }
 
@@ -88,4 +91,13 @@ func (r *Repo) FirstMergedRun(ctx context.Context, taskID int) (*domain.Run, err
 		return nil, err
 	}
 	return &runs[0], nil
+}
+
+// intoIntegration is the SQL condition, on a task_runs row, that its work
+// went into the branch named by placeholder param (e.g. "$3") as its
+// ticket's effective integration_branch: base_branch is that branch and so
+// is the ticket's integration_branch (AMP #2596).
+func intoIntegration(param string) string {
+	return `(base_branch <> '' AND base_branch = ` + param + ` AND EXISTS (SELECT 1 FROM tasks t WHERE t.id = task_runs.task_id
+		AND btrim(COALESCE(` + effectiveTaskMetaSQL + ` ->> '` + domain.MetaIntegrationBranch + `', '')) = ` + param + `))`
 }

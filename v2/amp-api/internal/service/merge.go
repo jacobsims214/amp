@@ -72,7 +72,53 @@ func (s *Service) mergeGateFor(ctx context.Context, t *domain.Task, run *domain.
 	if completedAt != nil && proj.RequireMergeSince != nil && completedAt.Before(*proj.RequireMergeSince) {
 		return false // completed before merges were required: never gated
 	}
+	if run.LandsOn(s.integrationBranch(ctx, t)) {
+		// The work is merged into (or its PR targets) the ticket's
+		// integration branch, where it belongs: nothing after it waits. It
+		// stays unmerged (none) until that branch's merge is reported.
+		return false
+	}
 	return true
+}
+
+// integrationBranch is ticket t's effective integration_branch metadata
+// (project → epic → story → ticket), or "" (AMP #2596).
+func (s *Service) integrationBranch(ctx context.Context, t *domain.Task) string {
+	inherited, err := s.Repo.InheritedMetadata(ctx, "task", t.ID)
+	if err != nil {
+		inherited = domain.Metadata{}
+	}
+	return inherited.Merge(t.Metadata).IntegrationBranch()
+}
+
+// ReconcileMergeMetadata follows a metadata change on an item in projectID
+// that sets or removes integration_branch or waits_for_merge (AMP #2596):
+// done tickets waiting on a merge whose work is already on their integration
+// branch stop holding their dependents (merge_state back to none, still
+// unmerged), and the dependents of the tickets that still wait on a merge
+// re-read their dependencies, so a waits_for_merge change takes effect now.
+// It never touches planned_at: metadata isn't part of the plan's approval.
+func (s *Service) ReconcileMergeMetadata(ctx context.Context, p authz.Principal, projectID int, patch domain.MetadataPatch) {
+	if !patch.TouchesMergeGate() {
+		return
+	}
+	ids, err := s.Repo.IntegrationMerged(ctx, projectID)
+	if err != nil {
+		slog.Warn("integration merges", "project_id", projectID, "err", err)
+	}
+	no := false
+	for _, id := range ids {
+		t, err := s.Repo.GetTask(ctx, id)
+		if err != nil {
+			continue
+		}
+		if _, err := s.setMergeState(ctx, p, t, actor.MsgSetMergeState{State: domain.MergeNone, Required: &no, From: []string{domain.MergeNeeded},
+			Detail: "Its work is on its integration branch (" + s.integrationBranch(ctx, t) + "): the tickets that depend on it no longer wait; " +
+				"it stays unmerged until that branch is merged"}); err != nil {
+			slog.Warn("release integration merge", "task_id", id, "err", err)
+		}
+	}
+	s.reconcileMergeGated(ctx, projectID)
 }
 
 // CompleteTaskWithRun completes agent ticket taskID as CompleteTask does,
