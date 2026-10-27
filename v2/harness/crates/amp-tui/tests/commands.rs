@@ -523,20 +523,20 @@ async fn plan_shows_the_tree_and_approval() {
     rig.say("/plan").await;
     let screen = rig.screen();
     assert!(screen.contains("AMP · plan"), "{screen}");
-    // #2171: the person approves, in the web UI; the row and its hint link the Flight plan page.
+    // #2171: the person approves, in the web UI; the row and its hint link the My work tab.
     assert!(
         screen.contains("approval 2 waiting for your approval #2108 #2109"),
         "{screen}"
     );
     assert!(
         screen.contains(
-            "approve the plan in AMP: https://amp.simstech.cloud/project/2/plan (o or /open plan)"
+            "approve the plan in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all (o or /open plan)"
         ),
         "{screen}"
     );
     let frame = rig.shell.view().render_frame(W, H).join("\n");
     assert!(
-        frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07"),
+        frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/my-work?approve=all\x07"),
         "the plan link is an OSC 8 hyperlink"
     );
     assert!(screen.contains("▌ Earlier ■ 12 Done"), "{screen}");
@@ -564,11 +564,11 @@ async fn plan_shows_the_tree_and_approval() {
             json!({"project_id": 2, "owner": "any", "state": "blocked", "format": "full"})
         )
     );
-    // The first row is the approval: Enter opens the Flight plan page.
+    // The first row is the approval: Enter opens My work.
     rig.press(KeyCode::Enter).await;
     assert_eq!(
         rig.opened(),
-        vec!["https://amp.simstech.cloud/project/2/plan".to_owned()]
+        vec!["https://amp.simstech.cloud/project/2/my-work?approve=all".to_owned()]
     );
     assert_fits(&rig);
 }
@@ -613,11 +613,11 @@ async fn open_opens_only_urls_from_the_helpers() {
     );
     rig.say("/open nope").await;
     assert!(rig.screen().contains("/open: `nope` is not a ticket id"));
-    // `/open plan`: the Flight plan page, where a person approves (#2171).
+    // `/open plan`: My work, where a person approves (#2171).
     rig.say("/open plan").await;
     assert_eq!(
         rig.opened().last().unwrap(),
-        "https://amp.simstech.cloud/project/2/plan"
+        "https://amp.simstech.cloud/project/2/my-work?approve=all"
     );
     // No current ticket: the project's Mission page.
     rig.say("/ticket none").await;
@@ -718,7 +718,7 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
         "amp_dispatch_task",
         "ticket 2108 was planned after the plan was last approved; this project needs the plan \
          approved before agents start new tickets. A person approves it in the AMP web UI (Approve \
-         plan): http://localhost:5173/project/2/plan. Agents can't approve: stop and ask your \
+         plan): http://localhost:5173/project/2/my-work?approve=all. Agents can't approve: stop and ask your \
          person to approve it there.\n[amp-harness] This needs a person in the AMP web UI.",
     ));
     let screen = rig.screen();
@@ -736,7 +736,7 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
     assert!(notice > call && notice - call <= 7, "{screen}");
     assert!(
         screen.contains(
-            "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all   (/open plan)"
         ),
         "{screen}"
     );
@@ -748,7 +748,7 @@ async fn a_refusal_shows_waiting_for_your_approval_with_the_link() {
     let notice = &screen[screen.find("⏸").unwrap()..];
     assert!(!notice.contains("[amp-harness]"), "{notice}");
     let frame = rig.shell.view().render_frame(W, H).join("\n");
-    assert!(frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/plan\x07"));
+    assert!(frame.contains("\x1b]8;;https://amp.simstech.cloud/project/2/my-work?approve=all\x07"));
 
     // A person's ticket: the board drawer for that ticket.
     rig.shell.handle_event(&refused(
@@ -788,7 +788,7 @@ fn per_ticket_plan(m: &mut amp_core::meta::AmpMeta) {
             {"task_id": 2203, "owner_user_id": 9, "yours": false}
         ],
         "awaiting_yours": [2108, 2109],
-        "approve_url": "http://localhost:5173/project/2/plan"
+        "approve_url": "http://localhost:5173/project/2/my-work?approve=all"
     }));
     m.plan.value = Some(plan);
 }
@@ -805,7 +805,7 @@ async fn plan_shows_yours_apart_from_others() {
     );
     assert!(
         screen.contains(
-            "approve yours in AMP: https://amp.simstech.cloud/project/2/plan (o or /open plan)"
+            "approve yours in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all (o or /open plan)"
         ),
         "{screen}"
     );
@@ -858,7 +858,7 @@ async fn a_per_ticket_refusal_says_whose_approval() {
              {id} isn't approved: nobody has approved it since it was planned or its scope last \
              changed, and this project needs each ticket approved before agents start it. Its owner \
              approves it in the AMP web UI (Approve plan; a project lead may approve it on their \
-             behalf): http://localhost:5173/project/2/plan. Agents can't approve: stop and ask your \
+             behalf): http://localhost:5173/project/2/my-work?approve=all. Agents can't approve: stop and ask your \
              person to approve it there.\n[amp-harness] This needs a person in the AMP web UI."
         )),
         is_error: true,
@@ -871,7 +871,7 @@ async fn a_per_ticket_refusal_says_whose_approval() {
     );
     assert!(
         screen.contains(
-            "Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)"
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all   (/open plan)"
         ),
         "{screen}"
     );
@@ -883,7 +883,8 @@ async fn a_per_ticket_refusal_says_whose_approval() {
         "{screen}"
     );
     assert!(
-        screen.contains("Flight plan: https://amp.simstech.cloud/project/2/plan"),
+        screen
+            .contains("Approval in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all"),
         "{screen}"
     );
 
@@ -920,7 +921,7 @@ async fn a_run_ticket_refusal_says_whose_ticket() {
                  Mcp error: -32603: ticket {named} isn't approved: nobody has approved it since it \
                  was planned or its scope last changed, and this project needs each ticket \
                  approved before agents start it. Its owner approves it in the AMP web UI \
-                 (Approve plan; a project lead may approve it on their behalf): /project/2/plan. \
+                 (Approve plan; a project lead may approve it on their behalf): /project/2/my-work?approve=all. \
                  Agents can't approve: stop and ask your person to approve it there.\n\
                  [amp-harness] This needs a person in the AMP web UI."
             )),
@@ -964,7 +965,9 @@ async fn a_run_ticket_refusal_says_whose_ticket() {
     );
     assert!(screen.contains("on their behalf). Agents"), "{screen}");
     assert!(
-        screen.contains("Approve it in AMP: https://amp.simstech.cloud/project/2/plan"),
+        screen.contains(
+            "Approve it in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all"
+        ),
         "{screen}"
     );
     assert_fits(&rig);

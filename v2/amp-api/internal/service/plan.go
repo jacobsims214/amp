@@ -360,8 +360,8 @@ type PlanReport struct {
 	ApprovedAt          *time.Time `json:"plan_approved_at,omitempty"`
 	ApprovedBy          *int       `json:"plan_approved_by,omitempty"`
 	RequirePlanApproval bool       `json:"require_plan_approval"`
-	// ApproveURL, when tickets await approval, is the Flight plan page where
-	// a person approves them (agents can't).
+	// ApproveURL, when tickets await approval, is the project's My work tab
+	// (Approve view) where a person approves them (agents can't).
 	ApproveURL   string      `json:"approve_url,omitempty"`
 	Tasks        int         `json:"tasks"`
 	OpenTasks    int         `json:"open_tasks"`
@@ -1417,7 +1417,7 @@ func (s *Service) ApproveTickets(ctx context.Context, p authz.Principal, project
 	s.audit(fin, p, domain.AuditEntry{Action: "plan.approve", ProjectID: intRef(projectID), TargetType: "project", TargetID: idStr(projectID),
 		TargetName: name, Summary: summary, Details: details})
 	// Published here, not by the REST or MCP handler, so every way of
-	// approving refreshes open Flight plan pages the same way.
+	// approving refreshes open My work and Flight plan pages the same way.
 	if res.Project != nil {
 		s.Registry.Publish(domain.Event{Type: domain.EventProjectUpdated, ProjectID: projectID, Payload: res.Project, At: time.Now()})
 	}

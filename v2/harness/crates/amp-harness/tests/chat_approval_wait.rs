@@ -3,7 +3,7 @@
 //! (120x40), against the in-process mock AMP whose `amp_check_plan` answer the test changes the
 //! way a person's click on "Approve plan" changes AMP's (the harness never approves: the mock
 //! plays the person). The faux manager checks the plan and asks for approval; the status line
-//! then says "⏸ waiting for plan approval in AMP" with the Flight plan link and the transcript
+//! then says "⏸ waiting for plan approval in AMP" with the My work link and the transcript
 //! says so too. Once "approved", the transcript says who approved, the manager's next turn runs
 //! exactly once, and the waiting segment goes. Esc stops the wait: an approval after it starts
 //! nothing.
@@ -299,7 +299,7 @@ fn awaiting() -> Value {
         "awaiting_approval_tickets": [{"task_id": 4050, "owner_user_id": 7, "yours": true}],
         "awaiting_yours": [4050],
         "plan_approved_at": "2026-10-26T10:00:00Z", "plan_approved_by": 7,
-        "approve_url": "/project/2/plan"
+        "approve_url": "/project/2/my-work?approve=all"
     })
 }
 
@@ -345,7 +345,8 @@ async fn asked_for_approval(
         .to_string(),
     )
     .unwrap();
-    let mut chat = Chat::start(&dir, &amp.url, 120, 40, &[]);
+    // 140 columns: the status line keeps the approval link's text (`/my-work?approve=all`, #2495).
+    let mut chat = Chat::start(&dir, &amp.url, 140, 40, &[]);
     chat.wait_for("the editor", |s| shown(s).contains("/ for commands"))
         .await;
     chat.send(b"plan the work\r");
@@ -368,12 +369,12 @@ async fn the_manager_resumes_once_a_person_approves() {
         .await;
     show("waiting", &screen);
     let t = shown(&screen);
-    // The status line names the Flight plan page (built from the instance, not the server's text).
+    // The status line names the My work tab (built from the instance, not the server's text).
     let status = screen
         .iter()
         .find(|l| l.contains("⏸ waiting for plan approval in AMP"))
         .unwrap();
-    assert!(status.contains("/project/2/plan"), "{t}");
+    assert!(status.contains("/project/2/my-work?approve=all"), "{t}");
     assert!(!t.contains("Resumed"), "{t}");
 
     // Still waiting a while later: no approval, no turn.

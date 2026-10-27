@@ -208,12 +208,12 @@ async fn a_planning_turn_gets_the_web_ui_link_not_the_mcp_origin() {
 
     let (result, prompt) = text.split_once("\n---\n").unwrap();
     assert!(
-        result.contains(r#""approve_url":"http://localhost:5173/project/2/plan""#),
+        result.contains(r#""approve_url":"http://localhost:5173/project/2/my-work?approve=all""#),
         "{result}"
     );
     // The manager's context names the web UI origin.
     assert!(
-        prompt.contains("\namp_web_ui: http://localhost:5173 (AMP's web UI: every link you give a person is on this origin, e.g. http://localhost:5173/project/<id>/plan"),
+        prompt.contains("\namp_web_ui: http://localhost:5173 (AMP's web UI: every link you give a person is on this origin, e.g. http://localhost:5173/project/<id>/my-work?approve=all"),
         "no amp_web_ui line"
     );
 }
@@ -254,7 +254,7 @@ async fn the_model_receives_amp_instructions_and_project_context() {
     // #2205: the web UI line; without a web URL it is the MCP URL's origin.
     let origin = amp.url.trim_end_matches("/mcp");
     assert!(prompt.contains(&format!(
-        "<amp_context>\nrole: amp-manager\namp_server: {}\namp_web_ui: {origin} (AMP's web UI: every link you give a person is on this origin, e.g. {origin}/project/<id>/plan to approve a plan; never build links from amp_server)\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\nworkers_workspace: ",
+        "<amp_context>\nrole: amp-manager\namp_server: {}\namp_web_ui: {origin} (AMP's web UI: every link you give a person is on this origin, e.g. {origin}/project/<id>/my-work?approve=all to approve a plan; never build links from amp_server)\nproject_id: 2\nproject_name: AMP v2\nproject_code: amp-v2\nproject_marker: {}\nworking_directory: {}\nworkers_workspace: ",
         amp.url,
         project_dir.join(".amp.json").display(),
         project_dir.display(),

@@ -334,9 +334,21 @@ impl Instance {
         format!("{}/artifacts/{artifact_id}", self.web_base)
     }
 
-    /// The Flight plan page, where a person approves the plan (`approve_url` in AMP).
+    /// The Flight plan page: the plan for reading. Approving happens in My work
+    /// ([`Instance::approve_url`]); an AMP older than My work approves here.
     pub fn plan_url(&self, project_id: i64) -> String {
         format!("{}/project/{project_id}/plan", self.web_base)
+    }
+
+    /// Where a person approves the plan (#2495): the project's My work tab with the Approve view
+    /// open on everything awaiting them (`approve_url` in AMP). `server` is the approval link AMP
+    /// gave (`approve_url`, a refusal's link), if any. It is untrusted and only read: an AMP older
+    /// than My work gives its Flight plan page (`…/plan`), and then [`Instance::plan_url`] is used.
+    pub fn approve_url(&self, project_id: i64, server: Option<&str>) -> String {
+        if server.is_some_and(is_flight_plan_link) {
+            return self.plan_url(project_id);
+        }
+        format!("{}/project/{project_id}/my-work?approve=all", self.web_base)
     }
 
     pub fn kb_url(&self, project_id: i64) -> String {
@@ -347,6 +359,18 @@ impl Instance {
 /// `scheme://host[:port]` of a URL (everything before the path).
 pub fn web_base(url: &str) -> String {
     amp_mcp::url_origin(url)
+}
+
+/// An approval link AMP gave is its Flight plan page (`…/project/N/plan`, before #2495).
+pub fn is_flight_plan_link(link: &str) -> bool {
+    let path = link.split(['?', '#']).next().unwrap_or(link);
+    path.trim_end_matches('/').ends_with("/plan")
+}
+
+/// An approval link AMP gave is its My work tab (`…/project/N/my-work…`, since #2495).
+pub fn is_my_work_link(link: &str) -> bool {
+    let path = link.split(['?', '#']).next().unwrap_or(link);
+    path.trim_end_matches('/').ends_with("/my-work")
 }
 
 /// The MCP connection as the header shows it (§2 item 2).
@@ -678,8 +702,9 @@ pub struct PlanApproval {
     /// Open tickets awaiting approval, anyone's (project-wide, board order).
     pub awaiting_approval: Vec<i64>,
     pub plan_approved_at: Option<String>,
-    /// The Flight plan page AMP gave (`approve_url`, #2167) while tickets await approval. Untrusted
-    /// text: links are built with [`Instance::plan_url`].
+    /// The approval page AMP gave (`approve_url`, #2167) while tickets await approval: My work
+    /// (`/project/N/my-work?approve=all`) since #2495, Flight plan (`/project/N/plan`) before.
+    /// Untrusted text: links are built with [`Instance::approve_url`].
     pub approve_url: Option<String>,
     /// Who made the project's last approval (`plan_approved_by`, a user id; #2425 names them when
     /// the manager resumes).
@@ -824,6 +849,14 @@ pub struct AmpMeta {
 }
 
 impl AmpMeta {
+    /// Where a person approves `project_id`'s plan (#2495): [`Instance::approve_url`], told which
+    /// page this AMP approves on by the last plan check's `approve_url`. `None` before the
+    /// instance is known.
+    pub fn approve_url(&self, project_id: i64) -> Option<String> {
+        let server = self.plan.get().and_then(|p| p.approve_url.as_deref());
+        Some(self.instance.as_ref()?.approve_url(project_id, server))
+    }
+
     /// The project's org name (from `amp_whoami`'s orgs).
     pub fn org_name(&self) -> Option<&str> {
         let org_id = self.project.get()?.org_id?;
@@ -2050,6 +2083,22 @@ mod tests {
         assert_eq!(i.project_url(2), "https://amp.simstech.cloud/project/2");
         assert_eq!(i.artifact_url(3), "https://amp.simstech.cloud/artifacts/3");
         assert_eq!(i.kb_url(2), "https://amp.simstech.cloud/project/2/kb");
+        // #2495: approving happens in My work; an older AMP's Flight plan link keeps Flight plan.
+        let my_work = "https://amp.simstech.cloud/project/2/my-work?approve=all";
+        assert_eq!(i.approve_url(2, None), my_work);
+        assert_eq!(
+            i.approve_url(2, Some("/project/2/my-work?approve=all")),
+            my_work
+        );
+        assert_eq!(i.approve_url(2, Some("http://evil.test/x")), my_work);
+        assert_eq!(
+            i.approve_url(2, Some("/project/2/plan")),
+            "https://amp.simstech.cloud/project/2/plan"
+        );
+        assert!(is_flight_plan_link("https://a.test/project/2/plan/"));
+        assert!(!is_flight_plan_link("/project/2/my-work?approve=all"));
+        assert!(is_my_work_link("/project/2/my-work?approve=all&focus=3"));
+        assert!(!is_my_work_link("/project/2/plan"));
     }
 
     #[test]

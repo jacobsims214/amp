@@ -579,5 +579,19 @@ mod tests {
             "[waiting for #2203's owner to approve it in AMP (you, if it's yours; or a project \
              lead on their behalf)] /project/2/plan (the manager stopped here)"
         );
+        // #2495: AMP links the project's My work tab.
+        let r = amp_core::approval::refusal(
+            "ticket 2203 isn't approved: nobody has approved it since it was planned or its scope \
+             last changed. Its owner approves it in the AMP web UI (My work, Review and approve; \
+             a project lead may approve it on their behalf): /project/2/my-work?approve=all. \
+             Agents can't approve.",
+        )
+        .unwrap();
+        assert!(
+            refusal_line(&r)
+                .ends_with("] /project/2/my-work?approve=all (the manager stopped here)"),
+            "{}",
+            refusal_line(&r)
+        );
     }
 }

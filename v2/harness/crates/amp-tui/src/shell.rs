@@ -2031,10 +2031,7 @@ impl Shell {
             return false;
         };
         let snapshot = meta.snapshot();
-        let link = snapshot
-            .instance
-            .as_ref()
-            .map(|i| i.plan_url(wait.project_id));
+        let link = snapshot.approve_url(wait.project_id);
         match wait.check(&snapshot) {
             WaitCheck::Unknown | WaitCheck::Waiting => false,
             WaitCheck::Nothing => {
@@ -2956,11 +2953,12 @@ impl Shell {
             return;
         };
         let m = meta.snapshot();
-        // `/open plan`: the Flight plan page, where a person approves the plan (#2171).
+        // `/open plan`: where a person approves the plan (#2171): the project's My work tab with
+        // the Approve view open (#2495; Flight plan on an AMP older than My work).
         if arg.eq_ignore_ascii_case("plan") {
             match (&m.instance, m.project_id) {
-                (Some(inst), Some(pid)) => {
-                    let url = inst.plan_url(pid);
+                (Some(_), Some(pid)) => {
+                    let url = m.approve_url(pid).unwrap_or_default();
                     self.open_url(&url);
                     self.refresh_pending_plan();
                 }

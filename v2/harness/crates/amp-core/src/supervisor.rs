@@ -923,7 +923,7 @@ impl Supervisor {
         .map_err(|e| {
             // #2226: AMP's refusals link the web UI; without a public URL the link is relative.
             // Same rewrite as every other AMP tool result (#2205), so the model and the TUI see
-            // the web UI's absolute link, not `/project/71/plan`.
+            // the web UI's absolute link, not `/project/71/my-work?approve=all`.
             let session = self.rt.mcp.session();
             RunTicketError::Dispatch {
                 task_id: req.task_id,

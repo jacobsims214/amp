@@ -163,7 +163,7 @@ async fn waiting(rig: &mut Rig) {
     );
     assert_eq!(
         rig.shell.view().chrome().approval_wait().as_deref(),
-        Some("https://amp.simstech.cloud/project/2/plan")
+        Some("https://amp.simstech.cloud/project/2/my-work?approve=all")
     );
 }
 

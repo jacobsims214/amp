@@ -1322,8 +1322,10 @@ built-in sample or (`--live`) from AMP, for screenshots and render checks.
 
 Only a person approves a plan, in AMP's web UI (epic 162): no agent can, not even one signed in as
 you. When tickets wait for approval, the status line says `plan: N waiting for your approval` (a
-link to the project's Flight plan page, kept even on a narrow line), `/plan` puts the same words
-and the link first, and `/open plan` opens the page.
+link to the project's My work tab with the Approve view open, `/project/N/my-work?approve=all`,
+kept even on a narrow line), `/plan` puts the same words and the link first, and `/open plan` opens
+the page. Since #2495 approving happens only in My work; against an AMP older than My work (its
+`approve_url` is still `/project/N/plan`) the links go to Flight plan as before.
 
 When AMP refuses the manager a step that is a person's (approving the plan, dispatching a ticket
 planned after the last approval, marking a person's ticket done, turning plan approval off), the
@@ -1332,7 +1334,7 @@ transcript shows, under the refused call:
 ```text
   ⏸ Waiting for your approval
     ticket 2108 was planned after the plan was last approved; … A person approves it in the AMP web UI …
-    Approve it in AMP: https://amp.simstech.cloud/project/2/plan   (/open plan)
+    Approve it in AMP: https://amp.simstech.cloud/project/2/my-work?approve=all   (/open plan)
     The manager stopped here; nothing else was run. Reply once it's done.
 ```
 
@@ -1343,7 +1345,7 @@ carries on by itself (#2425, below).
 a project lead may approve it on their behalf), `amp_check_plan` says whose each awaiting ticket
 is. The status line then says `plan: N of yours waiting for your approval`, and others' tickets get
 a quieter `M others' waiting for their owners` (dropped first on a narrow line). `/plan` shows an
-`approval` row for yours and an `others'` row for theirs, both linking the Flight plan page. A
+`approval` row for yours and an `others'` row for theirs, both linking the My work tab. A
 dispatch refusal names whose approval it waits for:
 
 ```text
@@ -1355,7 +1357,7 @@ dispatch refusal names whose approval it waits for:
 servers, without `awaiting_approval_tickets`, keep the words above: one approval covers the plan.
 
 **The manager carries on once you approve (#2425).** When a manager turn ends waiting for
-approval, the chat shows `⏸ Waiting for plan approval in AMP (#…)` with the Flight plan link and
+approval, the chat shows `⏸ Waiting for plan approval in AMP (#…)` with the My work link and
 the status line says `⏸ waiting for plan approval in AMP`. The harness reads `amp_check_plan` on
 its own AMP connection (never through the model, and it never approves anything): every 5 s while
 tickets wait, every 15 s after 2 minutes, every 60 s after 15 minutes. Once a person approves, the
@@ -1538,7 +1540,7 @@ front, checks that dispatching before approval is refused with the plan link, an
 once as the person: on compose with `POST /api/projects/P/approve-plan` on the REST listener
 (`AMP_SMOKE_REST_URL`; auth off, so it counts as the web UI), sending `as_of` = the newest
 `planned_at` of the open tickets. The cluster leg tries `amp_approve_plan`, which only servers from
-before human-only approval accept, and otherwise fails with the Flight plan link, or waits
+before human-only approval accept, and otherwise fails with the approval link (My work), or waits
 `AMP_SMOKE_APPROVE_WAIT` seconds for a person to approve there. Ticket one is dispatched before it is
 completed (completing it undispatched must be refused as "never dispatched"). On compose a person's
 ticket must be refused over MCP and is marked done with `POST /api/tasks/T/complete`. Three more legs

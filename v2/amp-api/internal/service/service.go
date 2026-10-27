@@ -405,7 +405,7 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 	}
 	if proj.RequirePlanApproval && proj.AwaitsApproval(t) {
 		return authz.Forbidden("ticket %d isn't approved: nobody has approved it since it was planned or its scope last changed, and "+
-			"this project needs each ticket approved before agents start it. Its owner approves it in the AMP web UI (Approve plan; "+
+			"this project needs each ticket approved before agents start it. Its owner approves it in the AMP web UI (My work, Review and approve; "+
 			"a project lead may approve it on their behalf): %s. "+
 			"Agents can't approve: stop and ask your person to approve it there.", t.ID, planURL)
 	}

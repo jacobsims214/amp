@@ -194,7 +194,7 @@ func TestApprovalScope_EachPersonApprovesTheirOwn(t *testing.T) {
 			t.Fatalf("%s's amp_check_plan awaiting = %v, want every ticket %v", name, got, all)
 		}
 		r := s.call(t, "amp_check_plan", map[string]any{"project_id": pid})
-		if r["approve_url"] != fmt.Sprintf("/project/%d/plan", s.projectID) {
+		if r["approve_url"] != fmt.Sprintf("/project/%d/my-work?approve=all", s.projectID) {
 			t.Fatalf("%s's approve_url = %v", name, r["approve_url"])
 		}
 	}

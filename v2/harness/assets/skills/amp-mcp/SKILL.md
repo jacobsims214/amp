@@ -58,7 +58,7 @@ The approval gate in practice:
 - **Approval is per ticket.** Each person approves their own tickets in the web UI; a project
   lead (or owner, admin) may approve someone else's on their behalf. A ticket you plan for your
   person is theirs to approve (an unassigned ticket belongs to whoever planned it).
-- **`amp_check_plan`** returns `approve_url` (the Flight plan link) whenever `awaiting_approval`
+- **`amp_check_plan`** returns `approve_url` (the My work link, `/project/N/my-work?approve=all`) whenever `awaiting_approval`
   isn't empty. `awaiting_approval` is every open ticket awaiting approval, anyone's;
   `awaiting_approval_tickets` lists them as `{task_id, owner_user_id, yours}`, and
   `awaiting_yours` is your person's own. That's the hand-off point: tell your person which of
