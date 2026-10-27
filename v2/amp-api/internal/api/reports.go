@@ -132,7 +132,8 @@ func (h *RestHandler) myWork(w http.ResponseWriter, r *http.Request) {
 
 // projectMyWork is the project's My work tab: GET /api/projects/{id}/my-work
 // ?user=<id|email> (a lead reading someone's list) &tz= &plan_offset=
-// &plan_limit=, or with &approve=<epic id> just that epic's approval plan.
+// &plan_limit=, or with &approve=<epic id>[,<epic id>…] (or all) just the
+// approval plan of those epics, together.
 func (h *RestHandler) projectMyWork(w http.ResponseWriter, r *http.Request, pr authz.Principal, projectID int) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "GET required", 405)
@@ -151,12 +152,18 @@ func (h *RestHandler) projectMyWork(w http.ResponseWriter, r *http.Request, pr a
 		}
 	}
 	if v := q.Get("approve"); v != "" {
-		epicID, err := strconv.Atoi(v)
-		if err != nil {
-			jsonErr(w, errorf("approve must be an epic id"), 400)
-			return
+		var epicIDs []int
+		if !strings.EqualFold(strings.TrimSpace(v), "all") {
+			for _, part := range strings.Split(v, ",") {
+				epicID, err := strconv.Atoi(strings.TrimSpace(part))
+				if err != nil || epicID <= 0 {
+					jsonErr(w, errorf("approve must be an epic id, a comma-separated list of epic ids, or all"), 400)
+					return
+				}
+				epicIDs = append(epicIDs, epicID)
+			}
 		}
-		plan, err := h.svc.ApprovalPlanFor(r.Context(), pr, projectID, epicID, opt)
+		plan, err := h.svc.ApprovalPlanFor(r.Context(), pr, projectID, epicIDs, opt)
 		if err != nil {
 			fail(w, err, 500)
 			return

@@ -1658,6 +1658,31 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		}
 		jsonOK(w, map[string]interface{}{"task": updated})
 
+	case "reopen":
+		// POST /tasks/{id}/reopen: a done ticket goes back to ready (or
+		// waiting, when a dependency is open). My work's "Reopen ticket" on
+		// a PR closed without merging (AMP #2483); the same as setting the
+		// state to backlog in the web UI.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		cur, err := h.svc.Repo.GetTask(r.Context(), taskID)
+		if err != nil {
+			jsonErr(w, err, 404)
+			return
+		}
+		if cur.State != domain.TaskStateCompleted {
+			jsonErr(w, fmt.Errorf("ticket %d isn't done (it is %s); only a done ticket is reopened", taskID, cur.State), 409)
+			return
+		}
+		t, err := h.svc.SetTaskState(r.Context(), pr, taskID, domain.TaskStateBacklog, "")
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]any{"task": t})
+
 	case "start_at":
 		if r.Method != http.MethodPost {
 			http.Error(w, "POST required", 405)

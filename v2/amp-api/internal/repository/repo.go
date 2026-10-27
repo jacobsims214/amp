@@ -278,13 +278,19 @@ func (r *Repo) RecordPlanApproval(ctx context.Context, id int, by *int) (*domain
 // or before asOf (the newest planned_at the person saw); it returns nil,
 // nil when that no longer holds. approved_for becomes whose ticket it is
 // at that moment (owner, else creator), returned with it (AMP #2218).
+// approved_snapshot keeps the ticket's text and dependencies as approved,
+// so a later re-plan can be shown as a diff (AMP #2483, ApprovedSnapshots).
 // Callers go through the task actor
 // (MsgApproveTask), which keeps its copy of the ticket in step.
 func (r *Repo) ApproveTask(ctx context.Context, id int, by *int, asOf *time.Time) (*time.Time, *int, error) {
 	var at time.Time
 	var forUser *int
 	err := r.db.QueryRow(ctx, `UPDATE tasks SET approved_at = clock_timestamp(), approved_by = $2,
-		       approved_for = COALESCE(owner_user_id, created_by)
+		       approved_for = COALESCE(owner_user_id, created_by),
+		       approved_snapshot = jsonb_build_object(
+		           'name', name, 'description', description, 'acceptance_criteria', acceptance_criteria,
+		           'dependency_ids', COALESCE((SELECT jsonb_agg(td.depends_on ORDER BY td.depends_on)
+		                                         FROM task_dependencies td WHERE td.task_id = tasks.id), '[]'::jsonb))
 		WHERE id = $1 AND ($3::timestamptz IS NULL OR planned_at <= $3::timestamptz)
 		RETURNING approved_at, approved_for`, id, by, asOf).Scan(&at, &forUser)
 	if err == pgx.ErrNoRows {
@@ -1234,4 +1240,40 @@ func (r *Repo) FindByMetadata(ctx context.Context, kind string, match domain.Met
 	return collect(rows, func(row rowScanner, m *MetadataMatch) error {
 		return row.Scan(&m.Kind, &m.ID, &m.ProjectID, &m.Name, &m.State, &m.Metadata)
 	})
+}
+
+// ApprovedSnapshot is a ticket as it was when last approved (migration
+// 040): its name, description, acceptance criteria and dependency ids.
+type ApprovedSnapshot struct {
+	Name               string `json:"name"`
+	Description        string `json:"description"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	DependencyIDs      []int  `json:"dependency_ids"`
+}
+
+// ApprovedSnapshots returns the stored approval snapshot of each of ids
+// that has one. Tickets approved before migration 040 have none.
+func (r *Repo) ApprovedSnapshots(ctx context.Context, ids []int) (map[int]ApprovedSnapshot, error) {
+	out := map[int]ApprovedSnapshot{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := r.db.Query(ctx, `SELECT id, approved_snapshot FROM tasks
+		WHERE id = ANY($1) AND approved_snapshot IS NOT NULL`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int
+		var snap ApprovedSnapshot
+		if err := rows.Scan(&id, &snap); err != nil {
+			return nil, err
+		}
+		if snap.DependencyIDs == nil {
+			snap.DependencyIDs = []int{}
+		}
+		out[id] = snap
+	}
+	return out, rows.Err()
 }
