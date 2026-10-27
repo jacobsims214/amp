@@ -1091,3 +1091,184 @@ export interface ArtifactVersion {
   created_by_email?: string
   created_at: string
 }
+
+// ---- The project's My work tab and its Approve view (AMP #2478, #2483) ----
+
+/** A ticket outside the approval set that the set depends on, or that depends on it. */
+export interface DepSummary {
+  id: number
+  project_id: number
+  epic_id: number
+  story_id: number
+  name: string
+  state: string
+  block_reason?: string
+  performer: string
+  owner_user_id?: number | null
+  merge_state: string
+  /** the tickets after it may start (done and, while merges are required, merged) */
+  satisfied: boolean
+  waiting_detail?: string
+}
+
+export interface OutsideTicket extends DepSummary {
+  epic_name: string
+  project_code?: string
+  project_name?: string
+  relation: 'dependency' | 'dependent' | 'both'
+}
+
+/** A human ticket in the plan and how much open work waits on it (amp_check_plan). */
+export interface HumanGate {
+  id: number
+  name: string
+  reason: string
+  owner_user_id?: number | null
+  holding_up: number
+}
+
+/** A ticket as it was when last approved (stored at approval, migration 040). */
+export interface ApprovedSnapshot {
+  name: string
+  description: string
+  acceptance_criteria: string
+  dependency_ids: number[]
+}
+
+export interface ChangedSince {
+  at: string
+  by?: string
+  last_approved_at?: string
+  /** absent for tickets approved before AMP stored snapshots */
+  previous?: ApprovedSnapshot
+}
+
+export interface PlanEpic {
+  id: number
+  name: string
+  description: string
+  caller_last_approved_at?: string
+  ticket_count?: number
+  awaiting_ids?: number[]
+}
+
+export interface PlanStory {
+  id: number
+  epic_id?: number
+  name: string
+  description: string
+  acceptance_criteria: string
+  task_ids: number[]
+  awaiting_ids: number[]
+}
+
+/** One open ticket in an approval plan, in full. */
+export interface PlanTicket {
+  id: number
+  epic_id?: number
+  story_id: number
+  name: string
+  description: string
+  acceptance_criteria: string
+  priority: Priority
+  state: TaskState
+  block_reason?: string
+  performer: 'agent' | 'human' | string
+  human_reason?: string
+  assigned_to?: string
+  owner_user_id?: number | null
+  owner_name: string
+  created_by?: number | null
+  planned_at: string
+  approved_at?: string
+  approved_by?: number | null
+  approved_for?: number | null
+  merge_state: string
+  /** not approved as planned now */
+  awaiting: boolean
+  /** the caller approves it as their own */
+  yours: boolean
+  change: 'new' | 'changed' | null
+  changed_since?: ChangedSince
+  dependency_ids: number[]
+  dependent_ids: number[]
+  /** dependencies not satisfied now */
+  waits_on: number[]
+  starts_on_approval: boolean
+}
+
+/** GET /projects/:id/my-work?approve=<epic ids|all> → {plan}. */
+export interface ApprovalPlan {
+  /** the first epic of the set (older servers: the only one) */
+  epic: PlanEpic
+  /** every epic in the set; older servers send only `epic` */
+  epics?: PlanEpic[]
+  stories: PlanStory[]
+  done_stories?: PlanStory[]
+  /** the newest planned_at returned: send it back verbatim as approve-plan's as_of */
+  as_of?: string
+  caller_last_approved_at?: string
+  require_plan_approval: boolean
+  can_approve_on_behalf: boolean
+  tickets: PlanTicket[]
+  tickets_total: number
+  offset: number
+  limit: number
+  more: boolean
+  awaiting_ids: number[]
+  yours_ids: number[]
+  for_user_ids: number[]
+  new_ids: number[]
+  changed_ids: number[]
+  starts_on_approval: number[]
+  human_gates: HumanGate[]
+  issues: PlanIssue[]
+  outside: OutsideTicket[]
+}
+
+/** A ticket's merge state after Mark merged / Not needed (service.MergeRecord). */
+export interface MergeRecord {
+  task_id: number
+  merge_state: MergeState
+  merge_source?: string
+  merged_at?: string
+  /** an earlier report recorded the merge; this one changed nothing */
+  already_recorded: boolean
+  message: string
+  run?: Run
+  task?: Task
+}
+
+/** A ticket's place in a project's My work list (WaitItem with its detail). */
+export interface ProjectWaitItem extends WaitItem {
+  task?: Task
+  plan?: ApprovalPlan
+  waits_on?: DepSummary[]
+}
+
+export interface DoneItem {
+  kind: WaitKind
+  task_id?: number
+  task_ids: number[]
+  epic_id?: number
+  name: string
+  at: string
+  count: number
+  merge_source?: string
+  merge_state?: string
+}
+
+/** GET /projects/:id/my-work */
+export interface ProjectMyWork {
+  project_id: number
+  user_id: number
+  /** a lead reading someone else's list: the actions are theirs */
+  read_only: boolean
+  kinds: WaitKind[]
+  counts: WaitCounts
+  items: Record<WaitKind, ProjectWaitItem[]>
+  coming_up: ProjectWaitItem[]
+  done_today: DoneItem[]
+  agents: { project_id: number; in_progress: number; ready: number; waiting: number; done_today: number }
+  day: string
+}

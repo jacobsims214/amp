@@ -16,7 +16,7 @@ import { AuditLogPanel } from '../components/AuditLogPanel'
 import { ConfirmButton } from '../components/ui/ConfirmButton'
 import type { KBSource, Metadata, Org, Project, ProjectAccess } from '../types'
 import { BandLoader } from '../components/brand/BandLoader'
-import { LastApproved } from '../components/PlanApprovalBanner'
+import { LastApproved } from '../components/LastApproved'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { planPath } from '../lib/approval'
 

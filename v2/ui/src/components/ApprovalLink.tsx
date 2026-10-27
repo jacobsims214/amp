@@ -10,7 +10,7 @@ import { splitAwaiting } from '../lib/approval'
 import { projectLink } from '../lib/projectLink'
 import type { Person } from '../lib/people'
 import type { Project, Task } from '../types'
-import { LastApproved } from './PlanApprovalBanner'
+import { LastApproved } from './LastApproved'
 
 export interface ApprovalLinkProps {
   projectId: number
