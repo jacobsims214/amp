@@ -159,7 +159,7 @@ func (r *Repo) FindRunsForPR(ctx context.Context, projectID int, commits []strin
 		commits = []string{}
 	}
 	return r.queryRuns(ctx, `WHERE project_id = $1 AND (
-		($3 <> '' AND pr_url = $3) OR ($2 <> '' AND branch = $2)
+		($3 <> '' AND pr_url = $3) OR ($2 <> '' AND branch = $2) OR ($2 <> '' AND `+intoIntegration("$2")+`)
 		OR (length(commit_sha) >= 7 AND EXISTS (SELECT 1 FROM unnest($4::text[]) c
 			WHERE length(c) >= 7 AND (c LIKE commit_sha || '%' OR commit_sha LIKE c || '%'))))
 		ORDER BY created_at DESC, id DESC LIMIT 200`, projectID, branch, pr, commits)

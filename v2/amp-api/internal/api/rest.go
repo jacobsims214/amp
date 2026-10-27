@@ -1148,6 +1148,7 @@ func (h *RestHandler) epicSub(w http.ResponseWriter, r *http.Request) {
 				jsonErr(w, err, 400)
 				return
 			}
+			h.svc.ReconcileMergeMetadata(r.Context(), pr, epic.ProjectID, req.Metadata)
 			updated, err := h.repo.GetEpic(r.Context(), epicID)
 			if err != nil {
 				jsonErr(w, err, 500)
@@ -1293,6 +1294,7 @@ func (h *RestHandler) storySub(w http.ResponseWriter, r *http.Request) {
 			jsonErr(w, err, 400)
 			return
 		}
+		h.svc.ReconcileMergeMetadata(r.Context(), pr, story.ProjectID, req.Metadata)
 		updated, err := h.repo.GetStory(r.Context(), storyID)
 		if err != nil {
 			jsonErr(w, err, 500)

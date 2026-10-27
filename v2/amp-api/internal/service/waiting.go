@@ -289,10 +289,18 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 		if err != nil {
 			return nil, err
 		}
+		comingIDs := make([]int, 0, len(w.ComingUp))
+		for _, it := range w.ComingUp {
+			comingIDs = append(comingIDs, it.Task.ID)
+		}
+		noWait, err := s.Repo.NoMergeWait(ctx, comingIDs)
+		if err != nil {
+			return nil, err
+		}
 		for i := range w.ComingUp {
 			it := &w.ComingUp[i]
 			for _, d := range it.Task.DependencyIDs {
-				if ds, ok := sums[d]; ok && !ds.Satisfied {
+				if ds, ok := sums[d]; ok && !depSatisfiedFor(ds, noWait[it.Task.ID]) {
 					it.WaitsOn = append(it.WaitsOn, ds)
 				}
 			}
@@ -603,6 +611,14 @@ func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Pr
 	if err != nil {
 		return nil, err
 	}
+	openIDs := make([]int, 0, len(open))
+	for _, t := range open {
+		openIDs = append(openIDs, t.ID)
+	}
+	noWait, err := s.Repo.NoMergeWait(ctx, openIDs)
+	if err != nil {
+		return nil, err
+	}
 	storyIdx := map[int]int{}
 	for _, st := range pc.stories {
 		if _, ok := epicIdx[st.EpicID]; ok {
@@ -636,7 +652,7 @@ func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Pr
 			pt.AssignedTo = ""
 		}
 		for _, d := range t.DependencyIDs {
-			if !sums[d].Satisfied {
+			if !depSatisfiedFor(sums[d], noWait[t.ID]) {
 				pt.WaitsOn = append(pt.WaitsOn, d)
 			}
 		}
@@ -1156,4 +1172,11 @@ func (s *Service) MyWorkCounts(ctx context.Context, p authz.Principal) (*MyWorkC
 	}
 	out.Counts, out.Projects = w.Counts, w.ByProject
 	return out, nil
+}
+
+// depSatisfiedFor reports whether dependency ds no longer holds a dependent
+// that does (noWait false) or doesn't (waits_for_merge: false, AMP #2596)
+// wait for its dependencies' merges.
+func depSatisfiedFor(ds repository.DepSummary, noWait bool) bool {
+	return ds.Satisfied || (noWait && ds.State == string(domain.TaskStateCompleted))
 }

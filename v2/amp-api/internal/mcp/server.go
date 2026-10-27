@@ -410,7 +410,12 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"tickets are created in dependency order. Returns the ID created for each ref. Tickets not connected to "+
 			"anything are reported, since they can all start at once. A step only a person can do (review and merge a PR, "+
 			"a sign-off, prod access, a decision, someone outside the team) is a ticket too: performer 'human' with its "+
-			"owner as the person, wired into depends_on, so the agent tickets after it wait for them.",
+			"owner as the person, wired into depends_on, so the agent tickets after it wait for them. "+
+			"Merges: a ticket finished with a PR or pushed branch holds the tickets after it until the merge is recorded. "+
+			"Two metadata keys change that (inherited project -> epic -> story -> ticket; no re-approval): set "+
+			"integration_branch: '<branch>' on an epic or story whose work merges into an integration branch first, so its "+
+			"tickets don't wait on each other's merges to main (the ticket that opens the integration PR to main still does); "+
+			"set waits_for_merge: false on a ticket that needs the PR open, not merged (a review of the PR).",
 		props{
 			"project_id": num("REQUIRED. Project ID."),
 			"tasks": map[string]interface{}{
@@ -433,7 +438,7 @@ func (s *Server) Register(mcp *server.MCPServer) {
 						"priority":     str("0=low, 1=normal (default), 2=high, 3=critical."),
 						"owner":        str("Optional: omit for yourself, 'none' for unassigned, or a project member."),
 						"start_at":     str("Optional. ISO 8601 datetime to schedule it; it's held until then."),
-						"metadata":     obj("Optional key/value metadata."),
+						"metadata":     obj("Optional key/value metadata. waits_for_merge: false makes this ticket wait only for its dependencies to complete, not for their PRs to merge (use it on review tickets)."),
 						"performer":    str("Optional. 'agent' (default: dispatched to an agent) or 'human': its owner does it and marks it done in AMP; agents never dispatch it."),
 						"human_reason": str("With performer 'human': why a person does it. " + humanReasonList() + "."),
 					},
@@ -512,7 +517,10 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		"Update a ticket's name, description, acceptance criteria, priority, assigned_to, agent_id, metadata, or who does "+
 			"it (performer: hand it to a person; turning a person's ticket into agent work is done by a person in the AMP web UI, "+
 			"and is refused here with the ticket's link) — pass only what changes. To change what it depends on use amp_set_task_dependencies; to move it to another story, "+
-			"amp_move_task; to schedule it, amp_set_task_start_at. Its creator, its owner, and team leads can change it.",
+			"amp_move_task; to schedule it, amp_set_task_start_at. Its creator, its owner, and team leads can change it. "+
+			"Metadata never re-plans a ticket. Two keys steer the merge gate: integration_branch (its work merges into that "+
+			"branch, so the tickets after it don't wait on a merge to main) and waits_for_merge: false (this ticket waits only "+
+			"for its dependencies to complete, not their merges). Setting either takes effect at once.",
 		props{
 			"task_id":             num("REQUIRED. Task ID."),
 			"name":                str("New ticket name."),
@@ -601,7 +609,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.handover)))
 	mcp.AddTool(tool("amp_list_unmerged", "Merge needed: completed tickets whose pushed work isn't merged yet — done by an agent, waiting on a person to review and merge. "+
 		"Each has merge_state: needed (Merge needed), abandoned (the PR was closed without merging; the person reopens the ticket or marks it not needed), "+
-		"or none (work from before merges were tracked). While a ticket is needed or abandoned, the tickets after it wait.",
+		"or none (work from before merges were tracked, or work merged into its integration_branch: it waits for that "+
+		"branch's merge, which amp_report_merged(branch=<integration branch>) records for the whole chain, but holds nothing). "+
+		"While a ticket is needed or abandoned, the tickets after it wait, except those with waits_for_merge: false.",
 		props{"project_id": num("REQUIRED. Project ID.")}), wrap(ctx, s.guard(authz.Member, s.listUnmerged)))
 	mcp.AddTool(tool("amp_get_task_runs", "A ticket's recorded runs (model, tokens, cost, branch, commit, PR) and their totals.",
 		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.taskRuns)))
@@ -616,7 +626,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 	mcp.AddTool(tool("amp_report_merged",
 		"Record that code is merged: every ticket whose runs produced the commit, branch or PR gets a run marked merged, "+
 			"across the projects you can see. One call after merging, made by CI (an amp_ token that can read the project is "+
-			"enough) or by a person. Give merge_commit to record the merge SHA. Returns the ticket IDs it marked.",
+			"enough) or by a person. Give merge_commit to record the merge SHA. Returns the ticket IDs it marked. "+
+			"An integration branch's merge (branch=<integration_branch>) also marks the tickets whose work went into it "+
+			"(their run's branch or base_branch is that branch).",
 		props{
 			"commit":       str("The commit SHA the work was recorded with, or at least its first 7 characters."),
 			"branch":       str("The branch that was merged."),
@@ -1739,6 +1751,7 @@ func (s *Server) updateEpic(rctx context.Context, args map[string]interface{}) (
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
+	s.svc.ReconcileMergeMetadata(rctx, caller(rctx).p, epic.ProjectID, req.Metadata)
 	if err := s.changeOwners(rctx, "epic", epicID, epic.ProjectID, args); err != nil {
 		return nil, err
 	}
@@ -1785,6 +1798,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 	if reply.Err != nil {
 		return nil, reply.Err
 	}
+	s.svc.ReconcileMergeMetadata(rctx, caller(rctx).p, story.ProjectID, req.Metadata)
 	if err := s.changeOwners(rctx, "story", storyID, story.ProjectID, args); err != nil {
 		return nil, err
 	}
