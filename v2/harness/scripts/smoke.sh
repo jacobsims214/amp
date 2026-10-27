@@ -281,7 +281,9 @@ approve_plan() {
     return 0
   fi
   local url waited=0
-  url="$(grep -Eo '(https?://[^ "]+)?/project/[0-9]+/plan' "$WORK/err" | head -n 1 || true)"
+  # The approval page: /project/P/plan on older servers, My work (/project/P/my-work?approve=...) since
+  # human-work UX (#2498). The harness may redact the query, so stop at the path.
+  url="$(grep -Eo '(https?://[^ "]+)?/project/[0-9]+/(plan|my-work)' "$WORK/err" | head -n 1 || true)"
   [[ "$url" == /* ]] && url="$LEG_WEB_BASE$url"
   ((APPROVE_WAIT > 0)) ||
     die "[$LEG] plan approval needs a person: approve ${url:-the plan of project $P_ID} in the web UI, or set AMP_SMOKE_APPROVE_WAIT=SECS and approve while the smoke waits"
@@ -579,7 +581,7 @@ run_leg() {
     log "[$LEG] note: the server dispatched before the plan was approved (approval not required here)"
     call amp_set_task_state "{\"task_id\":$t1,\"to_state\":\"backlog\"}" >/dev/null
   else
-    grep -q "/project/$P_ID/plan" "$WORK/err" || {
+    grep -Eq "/project/$P_ID/(plan|my-work)" "$WORK/err" || {
       cat "$WORK/err" >&2
       die "[$LEG] dispatch before approval: the refusal has no link to the plan"
     }
@@ -709,8 +711,16 @@ firstrun_leg() {
     server="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
   fi
 
-  # 1. The chat's first run, from a subfolder: server, then n (new project), name, code.
-  out="$(cd "$repo/sub" && printf '%s\nn\n%s\n%s\n' "$server" "$name" "$code" |
+  # 1. The chat's first run, from a subfolder: server, then a new project, name, code. With active
+  # projects the first run shows a picker (answer n, a new one); with none (a fresh server, e.g. CI's
+  # compose stack) it asks "Create a project for this folder now? [Y/n]" (answer y).
+  local newp=n listed
+  listed="$(AMP_MCP_URL="$COMPOSE_URL" "$BIN" mcp call amp_list_projects '{}' 2>/dev/null)" ||
+    die "[$LEG] amp_list_projects failed"
+  if jq -e '[(.projects // .)[]? | select((.state // "active") == "active")] | length == 0' >/dev/null <<<"$listed"; then
+    newp=y
+  fi
+  out="$(cd "$repo/sub" && printf '%s\n%s\n%s\n%s\n' "$server" "$newp" "$name" "$code" |
     "${FRESH[@]}" AMP_HARNESS_PROMPTS=stdin "$BIN" --snapshot 120x30 --no-session 2>"$root/err")" || {
     cat "$root/err" >&2
     die "[$LEG] the chat's first run failed"
@@ -729,7 +739,10 @@ firstrun_leg() {
       die "[$LEG] first run: expected '$want'"
     }
   done
-  { grep -qF "project #$pid $name" <<<"$out" && grep -qF "Set up this new project" <<<"$out"; } || {
+  # The editor's set-up prompt: a person with no projects before (newp=y) gets the onboarding one.
+  local setup_prompt="Set up this new project"
+  [[ "$newp" == n ]] || setup_prompt="I'm new to AMP: show me around"
+  { grep -qF "project #$pid $name" <<<"$out" && grep -qF "$setup_prompt" <<<"$out"; } || {
     printf '%s\n' "$out" >&2
     die "[$LEG] first run: the chat does not show project #$pid with the set-up prompt in the editor"
   }
@@ -754,7 +767,7 @@ firstrun_leg() {
     cat "$root/err" >&2
     die "[$LEG] second start asked or said something on stderr"
   }
-  { grep -qF "project #$pid" <<<"$out" && ! grep -qF "Set up this new project" <<<"$out"; } ||
+  { grep -qF "project #$pid" <<<"$out" && ! grep -qF "$setup_prompt" <<<"$out"; } ||
     die "[$LEG] second start: expected project #$pid and no set-up prompt"
   log "[$LEG] second start ok: nothing asked"
 
