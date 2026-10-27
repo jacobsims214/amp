@@ -328,13 +328,23 @@ func (s *Service) waitingOn(ctx context.Context, userID int, projectIDs []int, o
 
 // ---- The plan in place (approve items) ----
 
-// ApprovalPlan is everything the My work Approve view shows about one
-// epic's tickets awaiting approval (design #2494, artifact #24): every open
-// ticket in the epic in full (awaiting and already approved: the graph
-// needs both), their dependencies outside it, and what approving does.
+// ApprovalPlan is everything the My work Approve view shows about one or
+// more epics' tickets awaiting approval (design #2494, artifact #24 v2):
+// every open ticket in the epics in full (awaiting and already approved:
+// the outline needs both), their dependencies outside the set, and what
+// approving does. With several epics (?approve=172,2 or all) everything is
+// computed over the whole set, so a dependency between two of the epics
+// counts as inside it, and there is one as_of.
 type ApprovalPlan struct {
-	Epic    PlanEpic    `json:"epic"`
+	// Epic is the first epic of the set (kept for single-epic readers);
+	// Epics lists every epic in the set, in the order asked for.
+	Epic  PlanEpic   `json:"epic"`
+	Epics []PlanEpic `json:"epics"`
+	// Stories: every story with an open ticket in the set, including ones
+	// whose tickets are all approved already (the view collapses those).
 	Stories []PlanStory `json:"stories"`
+	// DoneStories: stories in the set whose tickets are all completed.
+	DoneStories []PlanStory `json:"done_stories"`
 	// AsOf is the newest planned_at among the tickets returned: send it
 	// back verbatim as approve-plan's as_of, so anything re-planned while
 	// the person read is skipped instead of approved unseen.
@@ -378,16 +388,23 @@ type ApprovalPlan struct {
 	Outside []OutsideTicket `json:"outside"`
 }
 
-// PlanEpic is the epic an approval covers.
+// PlanEpic is an epic an approval covers.
 type PlanEpic struct {
 	ID          int    `json:"id"`
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	// CallerLastApprovedAt: when the caller last approved a ticket in this epic.
+	CallerLastApprovedAt *time.Time `json:"caller_last_approved_at,omitempty"`
+	// TicketCount: open tickets in this epic; AwaitingIDs those awaiting approval.
+	TicketCount int   `json:"ticket_count"`
+	AwaitingIDs []int `json:"awaiting_ids"`
 }
 
-// PlanStory is a story with open tickets in the epic.
+// PlanStory is a story with open tickets in the set (or, in DoneStories,
+// one with only completed tickets).
 type PlanStory struct {
 	ID                 int    `json:"id"`
+	EpicID             int    `json:"epic_id"`
 	Name               string `json:"name"`
 	Description        string `json:"description"`
 	AcceptanceCriteria string `json:"acceptance_criteria"`
@@ -398,6 +415,7 @@ type PlanStory struct {
 // PlanTicket is one open ticket in an approval plan, in full.
 type PlanTicket struct {
 	ID                 int        `json:"id"`
+	EpicID             int        `json:"epic_id"`
 	StoryID            int        `json:"story_id"`
 	Name               string     `json:"name"`
 	Description        string     `json:"description"`
@@ -433,16 +451,16 @@ type PlanTicket struct {
 	StartsOnApproval bool  `json:"starts_on_approval"`
 }
 
-// ChangedSince says what changed on a ticket since it was last approved.
-// Today it carries when it was re-planned (and by whom when that's known);
-// Previous is the seam for the ticket as it was approved (name,
-// description, acceptance criteria, dependencies), filled once AMP stores
-// a snapshot at approval time.
+// ChangedSince says what changed on a ticket since it was last approved:
+// when it was re-planned (and by whom when that's known), and Previous,
+// the ticket as it was approved (name, description, acceptance criteria,
+// dependency ids) from the snapshot ApproveTask stores (migration 040).
+// Previous is absent for tickets approved before that snapshot existed.
 type ChangedSince struct {
-	At             time.Time      `json:"at"`
-	By             string         `json:"by,omitempty"`
-	LastApprovedAt *time.Time     `json:"last_approved_at,omitempty"`
-	Previous       map[string]any `json:"previous,omitempty"`
+	At             time.Time                    `json:"at"`
+	By             string                       `json:"by,omitempty"`
+	LastApprovedAt *time.Time                   `json:"last_approved_at,omitempty"`
+	Previous       *repository.ApprovedSnapshot `json:"previous,omitempty"`
 }
 
 // OutsideTicket is a ticket outside the approval's epic that its tickets
@@ -525,30 +543,53 @@ func (s *Service) userName(ctx context.Context, cache map[int]string, id *int) s
 	return n
 }
 
-// approvalPlan builds the plan for epicID: caller is who reads it (yours,
-// on-behalf), forUser whose list it is. offset/limit page the tickets.
-func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Principal, lvl authz.Level, forUser, epicID, offset, limit int) (*ApprovalPlan, error) {
+// approvalPlan builds the plan for the epics in epicIDs (one or more, in
+// the order given): caller is who reads it (yours, on-behalf), forUser
+// whose list it is. offset/limit page the tickets.
+func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Principal, lvl authz.Level, forUser int, epicIDs []int, offset, limit int) (*ApprovalPlan, error) {
 	if limit <= 0 || limit > MaxPlanTickets {
 		limit = MaxPlanTickets
 	}
 	if offset < 0 {
 		offset = 0
 	}
-	e, ok := pc.epics[epicID]
-	if !ok {
-		return nil, authz.NotFound("epic %d not found in project %d", epicID, pc.proj.ID)
-	}
-	ap := &ApprovalPlan{Epic: PlanEpic{ID: e.ID, Name: e.Name, Description: e.Description}, Stories: []PlanStory{},
+	ap := &ApprovalPlan{Epics: []PlanEpic{}, Stories: []PlanStory{}, DoneStories: []PlanStory{},
 		RequirePlanApproval: pc.proj.RequirePlanApproval, CanApproveOnBehalf: lvl >= authz.Lead && caller.InUI(),
 		Tickets: []PlanTicket{}, Offset: offset, Limit: limit, AwaitingIDs: []int{}, YoursIDs: []int{}, ForUserIDs: []int{},
 		NewIDs: []int{}, ChangedIDs: []int{}, StartsOnApproval: []int{}, HumanGates: []HumanGate{}, Issues: []PlanIssue{},
 		Outside: []OutsideTicket{}}
 
+	epicIdx := map[int]int{} // epic id -> index in ap.Epics
+	for _, id := range epicIDs {
+		if _, dup := epicIdx[id]; dup {
+			continue
+		}
+		e, ok := pc.epics[id]
+		if !ok {
+			return nil, authz.NotFound("epic %d not found in project %d", id, pc.proj.ID)
+		}
+		epicIdx[id] = len(ap.Epics)
+		ap.Epics = append(ap.Epics, PlanEpic{ID: e.ID, Name: e.Name, Description: e.Description, AwaitingIDs: []int{}})
+	}
+	// lastApproved records a caller approval at t in epic ei.
+	lastApproved := func(ei int, t *domain.Task) {
+		if t.ApprovedBy == nil || *t.ApprovedBy != caller.UserID || t.ApprovedAt == nil {
+			return
+		}
+		at := *t.ApprovedAt
+		if e := &ap.Epics[ei]; e.CallerLastApprovedAt == nil || at.After(*e.CallerLastApprovedAt) {
+			e.CallerLastApprovedAt = &at
+		}
+		if ap.CallerLastApprovedAt == nil || at.After(*ap.CallerLastApprovedAt) {
+			ap.CallerLastApprovedAt = &at
+		}
+	}
+
 	var open []*domain.Task
-	inEpic := map[int]bool{}
+	inEpic := map[int]bool{} // open tickets in the set
 	for i := range pc.all {
 		t := &pc.all[i]
-		if t.EpicID == epicID && t.State != domain.TaskStateCompleted {
+		if _, ok := epicIdx[t.EpicID]; ok && t.State != domain.TaskStateCompleted {
 			open = append(open, t)
 			inEpic[t.ID] = true
 		}
@@ -564,15 +605,28 @@ func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Pr
 	}
 	storyIdx := map[int]int{}
 	for _, st := range pc.stories {
-		if st.EpicID == epicID {
+		if _, ok := epicIdx[st.EpicID]; ok {
 			storyIdx[st.ID] = len(ap.Stories)
-			ap.Stories = append(ap.Stories, PlanStory{ID: st.ID, Name: st.Name, Description: st.Description,
+			ap.Stories = append(ap.Stories, PlanStory{ID: st.ID, EpicID: st.EpicID, Name: st.Name, Description: st.Description,
 				AcceptanceCriteria: st.AcceptanceCriteria, TaskIDs: []int{}, AwaitingIDs: []int{}})
 		}
 	}
+	// The approval snapshots of re-planned tickets, for the diff.
+	var changedIDs []int
+	for _, t := range open {
+		if !t.Approved() && t.ApprovedAt != nil {
+			changedIDs = append(changedIDs, t.ID)
+		}
+	}
+	snaps, err := s.Repo.ApprovedSnapshots(ctx, changedIDs)
+	if err != nil {
+		return nil, err
+	}
 	tickets := make([]PlanTicket, 0, len(open))
 	for _, t := range open {
-		pt := PlanTicket{ID: t.ID, StoryID: t.StoryID, Name: t.Name, Description: t.Description, AcceptanceCriteria: t.AcceptanceCriteria,
+		ei := epicIdx[t.EpicID]
+		ap.Epics[ei].TicketCount++
+		pt := PlanTicket{ID: t.ID, EpicID: t.EpicID, StoryID: t.StoryID, Name: t.Name, Description: t.Description, AcceptanceCriteria: t.AcceptanceCriteria,
 			Priority: t.Priority, State: string(t.State), BlockReason: t.BlockReason, Performer: t.Performer, HumanReason: t.HumanReason,
 			AssignedTo: t.AssignedTo, OwnerUserID: t.OwnerUserID, OwnerName: s.userName(ctx, pc.names, t.ApprovalOwner()), CreatedBy: t.CreatedBy,
 			PlannedAt: t.Planned(), ApprovedAt: t.ApprovedAt, ApprovedBy: t.ApprovedBy, ApprovedFor: t.ApprovedFor, MergeState: t.MergeState,
@@ -591,6 +645,7 @@ func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Pr
 		}
 		if pt.Awaiting {
 			ap.AwaitingIDs = append(ap.AwaitingIDs, t.ID)
+			ap.Epics[ei].AwaitingIDs = append(ap.Epics[ei].AwaitingIDs, t.ID)
 			if i, ok := storyIdx[t.StoryID]; ok {
 				ap.Stories[i].AwaitingIDs = append(ap.Stories[i].AwaitingIDs, t.ID)
 			}
@@ -604,6 +659,9 @@ func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Pr
 			if t.ApprovedAt != nil {
 				change = "changed"
 				pt.ChangedSince = &ChangedSince{At: t.Planned(), LastApprovedAt: t.ApprovedAt}
+				if snap, ok := snaps[t.ID]; ok {
+					pt.ChangedSince.Previous = &snap
+				}
 				ap.ChangedIDs = append(ap.ChangedIDs, t.ID)
 			} else {
 				ap.NewIDs = append(ap.NewIDs, t.ID)
@@ -618,30 +676,44 @@ func (s *Service) approvalPlan(ctx context.Context, pc *planCtx, caller authz.Pr
 			at := pt.PlannedAt
 			ap.AsOf = &at
 		}
-		if t.ApprovedBy != nil && *t.ApprovedBy == caller.UserID && t.ApprovedAt != nil &&
-			(ap.CallerLastApprovedAt == nil || t.ApprovedAt.After(*ap.CallerLastApprovedAt)) {
-			at := *t.ApprovedAt
-			ap.CallerLastApprovedAt = &at
-		}
 		tickets = append(tickets, pt)
 	}
-	// Completed tickets the caller approved count for "since your last approval" too.
+	// Every ticket the caller approved counts for "since your last
+	// approval", completed ones too; completed tickets mark done stories.
+	storyDone := map[int]int{} // story id -> completed tickets
 	for i := range pc.all {
 		t := &pc.all[i]
-		if t.EpicID == epicID && t.ApprovedBy != nil && *t.ApprovedBy == caller.UserID && t.ApprovedAt != nil &&
-			(ap.CallerLastApprovedAt == nil || t.ApprovedAt.After(*ap.CallerLastApprovedAt)) {
-			at := *t.ApprovedAt
-			ap.CallerLastApprovedAt = &at
+		ei, ok := epicIdx[t.EpicID]
+		if !ok {
+			continue
+		}
+		lastApproved(ei, t)
+		if t.State == domain.TaskStateCompleted {
+			storyDone[t.StoryID]++
 		}
 	}
-	// Stories with no open tickets aren't part of the approval.
-	stories := ap.Stories[:0]
+	// Stories with open tickets are part of the approval, even when all of
+	// them are approved already; stories with only completed tickets are
+	// listed apart, as done.
+	stories := make([]PlanStory, 0, len(ap.Stories))
 	for _, st := range ap.Stories {
-		if len(st.TaskIDs) > 0 {
+		switch {
+		case len(st.TaskIDs) > 0:
 			stories = append(stories, st)
+		case storyDone[st.ID] > 0:
+			st.TaskIDs = []int{}
+			for i := range pc.all {
+				if pc.all[i].StoryID == st.ID {
+					st.TaskIDs = append(st.TaskIDs, pc.all[i].ID)
+				}
+			}
+			ap.DoneStories = append(ap.DoneStories, st)
 		}
 	}
 	ap.Stories = stories
+	if len(ap.Epics) > 0 {
+		ap.Epic = ap.Epics[0]
+	}
 
 	// The plan check, narrowed to this epic's tickets.
 	for _, iss := range pc.graph.Issues {
@@ -825,7 +897,7 @@ func (s *Service) ProjectMyWork(ctx context.Context, p authz.Principal, projectI
 					return nil, err
 				}
 			}
-			if it.Plan, err = s.approvalPlan(ctx, pc, p, lvl, uid, it.EpicID, opt.PlanOffset, opt.PlanLimit); err != nil {
+			if it.Plan, err = s.approvalPlan(ctx, pc, p, lvl, uid, []int{it.EpicID}, opt.PlanOffset, opt.PlanLimit); err != nil {
 				return nil, err
 			}
 		}
@@ -877,19 +949,33 @@ func (s *Service) ProjectMyWork(ctx context.Context, p authz.Principal, projectI
 	return out, nil
 }
 
-// ApprovalPlanFor returns one epic's approval plan in projectID, for the
-// full Approve view (?approve=<epic id>), paged by offset/limit. It is
-// returned whether or not anything in it awaits the person.
-func (s *Service) ApprovalPlanFor(ctx context.Context, p authz.Principal, projectID, epicID int, opt ProjectMyWorkOptions) (*ApprovalPlan, error) {
+// ApprovalPlanFor returns the approval plan of one or more epics in
+// projectID, for the full Approve view (?approve=<epic id>[,<epic id>…]),
+// paged by offset/limit. It is returned whether or not anything in it
+// awaits the person. With no epic ids (?approve=all) the set is every epic
+// with tickets awaiting the person's approval, oldest first; when nothing
+// awaits them the plan has no epics and no tickets.
+func (s *Service) ApprovalPlanFor(ctx context.Context, p authz.Principal, projectID int, epicIDs []int, opt ProjectMyWorkOptions) (*ApprovalPlan, error) {
 	uid, lvl, err := s.myWorkSubject(ctx, p, projectID, opt.User)
 	if err != nil {
 		return nil, err
+	}
+	if len(epicIDs) == 0 {
+		w, err := s.waitingOn(ctx, uid, []int{projectID}, waitOptions{})
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range w.Items {
+			if it.Kind == WaitApprove {
+				epicIDs = append(epicIDs, it.EpicID)
+			}
+		}
 	}
 	pc, err := s.loadPlanCtx(ctx, projectID)
 	if err != nil {
 		return nil, err
 	}
-	return s.approvalPlan(ctx, pc, p, lvl, uid, epicID, opt.PlanOffset, opt.PlanLimit)
+	return s.approvalPlan(ctx, pc, p, lvl, uid, epicIDs, opt.PlanOffset, opt.PlanLimit)
 }
 
 // ---- Across projects: the summary and the badge ----

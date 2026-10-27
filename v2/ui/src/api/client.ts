@@ -5,7 +5,7 @@ import type {
   Me, AmpUser, AuthAdminUser, Org, OrgRole, Team, TeamRole, Member, ProjectMember, ProjectAccess, ProjectTeam,
   ProjectTeamRole, Invite, AddMemberResult, CreateProjectRequest,
   Artifact, ArtifactVersion, APIToken, NewAPIToken, AuditEntry, AuditFilter, AuditVerifyReport, Webhook, WebhookChange, WebhookDelivery, GitHubHookInfo, Run, Usage, TraceHit, DeletedTask, DeletedGroup, ProjectTrash, GroupRestoreResult, Portfolio,
-  ApproveRequest, ApproveResponse, ApproveResult,
+  ApproveRequest, ApproveResponse, ApproveResult, ApprovalPlan, MergeRecord, ProjectMyWork,
 } from '../types'
 import { auditQuery, auditVerifyUrl, type AuditScope } from '../lib/audit'
 
@@ -360,6 +360,31 @@ export const api = {
 
   // Agent accounts and API tokens ("me" is the caller)
   myWork: () => get<MyWork>('/my-work'),
+  /** The project's My work tab: what waits on the caller (or `user`, for a lead), each approve item with its plan. */
+  projectMyWork: (projectId: number, opts: { user?: string; tz?: string } = {}) => {
+    const q = new URLSearchParams()
+    if (opts.user) q.set('user', opts.user)
+    q.set('tz', opts.tz ?? Intl.DateTimeFormat().resolvedOptions().timeZone)
+    return get<ProjectMyWork>(`/projects/${projectId}/my-work?${q}`)
+  },
+  /**
+   * The Approve view's plan: one or more epics together (one as_of), or
+   * 'all' = every epic awaiting the caller's approval, oldest first.
+   */
+  approvalPlan: (projectId: number, epics: number[] | 'all', opts: { user?: string; offset?: number; limit?: number } = {}) => {
+    const q = new URLSearchParams({ approve: epics === 'all' ? 'all' : epics.join(',') })
+    if (opts.user) q.set('user', opts.user)
+    if (opts.offset) q.set('plan_offset', String(opts.offset))
+    if (opts.limit) q.set('plan_limit', String(opts.limit))
+    return get<{ plan: ApprovalPlan }>(`/projects/${projectId}/my-work?${q}`).then(r => r.plan)
+  },
+  /** Mark merged: recorded once; a repeat answers already_recorded with the first record. */
+  markMerged: (taskId: number, mergeCommit?: string) =>
+    post<MergeRecord>(`/tasks/${taskId}/merge`, mergeCommit ? { merge_commit: mergeCommit } : undefined),
+  /** Not needed: the work won't be merged; what waits on it is released. */
+  mergeNotNeeded: (taskId: number) => post<MergeRecord>(`/tasks/${taskId}/merge/not-needed`),
+  /** Reopen a done ticket (a PR closed without merging): back to ready, or waiting on its dependencies. */
+  reopenTask: (taskId: number) => post<{ task: Task }>(`/tasks/${taskId}/reopen`).then(r => r.task),
   listAgents: () => get<{ agents: AmpUser[] }>('/agents').then(r => r.agents),
   createAgent: (name: string, teamIds: number[]) =>
     post<{ agent: AmpUser }>('/agents', { name, team_ids: teamIds }).then(r => r.agent),
