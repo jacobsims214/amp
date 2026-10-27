@@ -711,8 +711,16 @@ firstrun_leg() {
     server="${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
   fi
 
-  # 1. The chat's first run, from a subfolder: server, then n (new project), name, code.
-  out="$(cd "$repo/sub" && printf '%s\nn\n%s\n%s\n' "$server" "$name" "$code" |
+  # 1. The chat's first run, from a subfolder: server, then a new project, name, code. With active
+  # projects the first run shows a picker (answer n, a new one); with none (a fresh server, e.g. CI's
+  # compose stack) it asks "Create a project for this folder now? [Y/n]" (answer y).
+  local newp=n listed
+  listed="$(AMP_MCP_URL="$COMPOSE_URL" "$BIN" mcp call amp_list_projects '{}' 2>/dev/null)" ||
+    die "[$LEG] amp_list_projects failed"
+  if jq -e '[(.projects // .)[]? | select((.state // "active") == "active")] | length == 0' >/dev/null <<<"$listed"; then
+    newp=y
+  fi
+  out="$(cd "$repo/sub" && printf '%s\n%s\n%s\n%s\n' "$server" "$newp" "$name" "$code" |
     "${FRESH[@]}" AMP_HARNESS_PROMPTS=stdin "$BIN" --snapshot 120x30 --no-session 2>"$root/err")" || {
     cat "$root/err" >&2
     die "[$LEG] the chat's first run failed"
