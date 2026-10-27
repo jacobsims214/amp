@@ -18,6 +18,9 @@ export interface Project {
   plan_approved_at?: string
   plan_approved_by?: number
   require_plan_approval?: boolean
+  /** done tickets with an unmerged PR hold their dependents until the merge is recorded (default on) */
+  require_merge?: boolean
+  require_merge_since?: string
 }
 
 export interface Epic {
@@ -619,6 +622,40 @@ export interface WebhookDelivery {
   delivered_at?: string
 }
 
+/** A project's inbound GitHub merge webhook (GET /projects/:id/github-hook). */
+export interface GitHubHook {
+  project_id: number
+  created_by?: number
+  created_at: string
+  rotated_at: string
+  rejected_count: number
+  last_rejected_at?: string
+}
+
+/** One signed delivery GitHub made to a project's hook. */
+export interface GitHubHookDelivery {
+  delivery_id: string
+  event: string
+  action?: string
+  status: number
+  result: string
+  task_ids: number[] | null
+  received_at: string
+}
+
+export interface GitHubHookInfo {
+  configured: boolean
+  /** where GitHub posts; relative when the server has no public URL configured */
+  url: string
+  hook?: GitHubHook
+  deliveries: GitHubHookDelivery[] | null
+  /** only in the answer to generating or rotating the secret: shown once */
+  secret?: string
+  /** the secret is stored encrypted (the server has an encryption key) */
+  encrypted: boolean
+  setup?: { payload_url?: string; content_type?: string; events?: string }
+}
+
 export interface AmpUser {
   id: number
   subject: string
@@ -739,6 +776,87 @@ export interface MyWork {
   flags: WorkTask[]
   agents: MyAgent[]
   done_24h: number
+  /* The "waiting on you" summary (service.MyWorkSummary, AMP #2478). Optional:
+     older servers don't send it. KB architecture/waiting-on-you.md. */
+  counts?: WaitCounts
+  /** projects with anything waiting or coming up, most waiting first */
+  projects?: ProjectWait[]
+  projects_total?: number
+  projects_offset?: number
+  projects_limit?: number
+  projects_more?: boolean
+  rows_per_project?: number
+  /** the person's projects with nothing for them */
+  clear_projects?: ProjectRef[]
+  agents_in_progress?: number
+  owned_truncated?: boolean
+  flags_truncated?: boolean
+}
+
+// ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
+
+export type WaitKind = 'approve' | 'answer' | 'merge' | 'do'
+
+/** Waiting is approve + answer + merge + do; coming_up is shown, never counted. */
+export interface WaitCounts {
+  waiting: number
+  approve: number
+  answer: number
+  merge: number
+  do: number
+  coming_up: number
+}
+
+/** One thing waiting on a person: "approve:<epic id>" (one per epic) or "task:<ticket id>". */
+export interface WaitItem {
+  kind: WaitKind | 'coming_up'
+  key: string
+  project_id: number
+  project_code: string
+  project_name: string
+  /** the ticket, for every kind but approve */
+  task_id?: number
+  /** every ticket the item contains, so ?focus=<any of them> finds it */
+  task_ids: number[]
+  /** the ticket's name, or the epic's for approve */
+  name: string
+  state?: string
+  since: string
+  performer?: string
+  human_reason?: string
+  owner_user_id?: number
+  epic_id?: number
+  epic_name?: string
+  /** approve: how many tickets await */
+  count?: number
+  question?: string
+  merge_state?: string
+  pr_url?: string
+  branch?: string
+  completed_at?: string
+  /** merge: open tickets that depend on it directly */
+  holding_up?: number[]
+  awaiting_approval?: boolean
+  start_at?: string
+}
+
+/** One project's card in the top-level My work summary. */
+export interface ProjectWait {
+  project_id: number
+  project_code: string
+  project_name: string
+  counts: WaitCounts
+  /** the first items in display order, at most rows_per_project */
+  rows: WaitItem[]
+  /** how many more items there are in the project */
+  more: number
+  agents_in_progress: number
+}
+
+export interface ProjectRef {
+  id: number
+  code: string
+  name: string
 }
 
 // ---- Project report (GET /projects/:id/report) ----
