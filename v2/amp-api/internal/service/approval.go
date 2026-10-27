@@ -71,21 +71,7 @@ func (s *Service) approvalGate(ctx context.Context, p authz.Principal, t *domain
 // agent that skipped the dispatch. Human tickets go through
 // CompleteHumanTask.
 func (s *Service) CompleteTask(ctx context.Context, p authz.Principal, taskID int) (*domain.Task, error) {
-	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
-	if err != nil {
-		return nil, err
-	}
-	if t.IsHuman() {
-		return nil, authz.BadRequest("ticket %d is a person's ticket; they mark it done in AMP: %s", taskID, s.TaskURL(t.ProjectID, taskID))
-	}
-	if err := s.checkAgentCompletion(ctx, p, t); err != nil {
-		s.auditTaskDenied(ctx, p, "task.complete", t, err, nil)
-		return nil, err
-	}
-	if err := s.sendComplete(ctx, p, t, !p.InUI()); err != nil {
-		return nil, err
-	}
-	return s.Repo.GetTask(ctx, taskID)
+	return s.CompleteTaskWithRun(ctx, p, taskID, nil)
 }
 
 // checkAgentCompletion applies the off-UI completion rules to agent ticket t.
@@ -145,9 +131,16 @@ func (s *Service) openDepsGate(ctx context.Context, t *domain.Task, doing string
 // atomically, that the ticket is still in progress and that its
 // dependencies are complete.
 func (s *Service) sendComplete(ctx context.Context, p authz.Principal, t *domain.Task, offUI bool) error {
+	return s.sendCompleteMerge(ctx, p, t, offUI, false, "")
+}
+
+// sendCompleteMerge is sendComplete for work that may wait on a merge
+// (MsgCompleteTask.MergeRequired).
+func (s *Service) sendCompleteMerge(ctx context.Context, p authz.Principal, t *domain.Task, offUI, mergeRequired bool, mergeWhere string) error {
 	replyCh := make(chan actor.ReplySimple, 1)
 	if err := s.Registry.Send(t.ProjectID, &actor.MsgCompleteTask{
-		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI, ReplyCh: replyCh,
+		TaskID: t.ID, By: p.UserRef(), ByName: p.Label(), RequireStarted: offUI, RequireDeps: offUI,
+		MergeRequired: mergeRequired, MergeWhere: mergeWhere, ReplyCh: replyCh,
 	}); err != nil {
 		return err
 	}

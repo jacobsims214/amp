@@ -18,7 +18,7 @@ func (s *Service) RecordRun(ctx context.Context, p authz.Principal, taskID int, 
 	// Reporting a merge is a fact about the code, not work on the ticket: anyone
 	// on the project may record it (a reviewer, or CI with its own token).
 	action := authz.TaskWork
-	if run.Merged != nil && *run.Merged && run.InputTokens == nil && run.OutputTokens == nil && run.CostUSD == nil {
+	if run.IsMergeReport() {
 		action = authz.TaskRead
 	}
 	t, _, err := s.LoadTask(ctx, p, taskID, action)
@@ -28,7 +28,23 @@ func (s *Service) RecordRun(ctx context.Context, p authz.Principal, taskID int, 
 	if err := s.checkRunOutcome(p, t, run.Outcome); err != nil {
 		return domain.Run{}, err
 	}
-	return s.recordRun(ctx, p, t, run)
+	if run.IsMergeReport() {
+		// Recorded once (AMP #2475): a repeat returns the first report's run.
+		rec, err := s.recordMergeReport(ctx, p, t, run, "")
+		if err != nil {
+			return domain.Run{}, err
+		}
+		if rec.Run != nil {
+			return *rec.Run, nil
+		}
+		return domain.Run{TaskID: t.ID, ProjectID: t.ProjectID, Outcome: domain.RunCompleted, Merged: run.Merged, Note: rec.Message}, nil
+	}
+	saved, err := s.recordRun(ctx, p, t, run)
+	if err != nil {
+		return saved, err
+	}
+	s.afterRun(ctx, p, t, saved)
+	return saved, nil
 }
 
 func (s *Service) recordRun(ctx context.Context, p authz.Principal, t *domain.Task, run domain.Run) (domain.Run, error) {
@@ -161,25 +177,14 @@ func (s *Service) UnmergedWork(ctx context.Context, p authz.Principal, projectID
 
 // MarkMerged records that the work on a branch, PR, or commit is merged, on
 // every ticket whose runs produced it (in projects p can see). It's how CI
-// reports merges: one call after merging, with the merge commit.
+// reports merges: one call after merging, with the merge commit. It returns
+// every ticket that matched; a ticket whose merge was already recorded keeps
+// its first record (MarkMergedFrom says which).
 func (s *Service) MarkMerged(ctx context.Context, p authz.Principal, commit, branch, pr, mergeCommit string) ([]int, error) {
-	hits, err := s.Trace(ctx, p, commit, branch, pr)
-	if err != nil {
-		return nil, err
-	}
+	recs, err := s.MarkMergedFrom(ctx, p, commit, branch, pr, mergeCommit, mergeSourceOf(p))
 	merged := []int{}
-	yes := true
-	for _, h := range hits {
-		last := h.Runs[0]
-		run := domain.Run{Outcome: domain.RunCompleted, Merged: &yes, Branch: last.Branch, PRURL: last.PRURL,
-			Commit: last.Commit, Note: "merged"}
-		if mergeCommit != "" {
-			run.Commit, run.Note = mergeCommit, "merged as "+mergeCommit
-		}
-		if _, err := s.RecordRun(ctx, p, h.Task.ID, run); err != nil {
-			return merged, err
-		}
-		merged = append(merged, h.Task.ID)
+	for _, r := range recs {
+		merged = append(merged, r.TaskID)
 	}
-	return merged, nil
+	return merged, err
 }

@@ -1389,6 +1389,41 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch parts[1] {
+	case "merge":
+		// POST /tasks/{id}/merge {merge_commit?}: Mark merged (recorded once;
+		// a repeat returns the first record). POST /tasks/{id}/merge/not-needed:
+		// the work won't be merged, release what waits on it (AMP #2475).
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var rec service.MergeRecord
+		var err error
+		switch {
+		case len(parts) == 2:
+			var body struct {
+				MergeCommit string `json:"merge_commit"`
+			}
+			if r.ContentLength != 0 {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					jsonErr(w, err, 400)
+					return
+				}
+			}
+			rec, err = h.svc.MarkTaskMerged(r.Context(), pr, taskID, "", body.MergeCommit)
+		case len(parts) == 3 && parts[2] == "not-needed":
+			rec, err = h.svc.MarkMergeNotNeeded(r.Context(), pr, taskID)
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, rec)
+		return
+
 	case "runs":
 		if r.Method == http.MethodPost {
 			// Record a run (e.g. a person marking the work merged).
@@ -1640,7 +1675,7 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 // the ticket is "work" on it.
 func taskActionFor(method, sub string) authz.TaskAction {
 	switch {
-	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch":
+	case method == http.MethodGet, sub == "comments", sub == "history", sub == "runs", sub == "assign", sub == "dispatch", sub == "merge":
 		return authz.TaskRead
 	case sub == "" && method == http.MethodDelete:
 		return authz.TaskDelete

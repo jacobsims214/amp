@@ -103,7 +103,46 @@ type MsgCompleteTask struct {
 	// the database), so a dependency added or reopened after dispatch still
 	// holds an agent's completion. Set off the web UI.
 	RequireDeps bool
-	ReplyCh     chan ReplySimple
+	// MergeRequired: the run that finished it put work on a PR or a pushed
+	// branch and its project requires merges, so it completes with
+	// merge_state "needed" and its dependents keep waiting until the merge
+	// is recorded (AMP #2475). MergeWhere names the PR or branch for the
+	// waiting detail. Old replicas ignore both (gob drops unknown fields).
+	MergeRequired bool
+	MergeWhere    string
+	ReplyCh       chan ReplySimple
+}
+
+// MsgSetMergeState changes a ticket's merge state in its actor (AMP #2475):
+// a merge recorded, a PR abandoned, a merge marked not needed, or a PR
+// reported after completion. When the change releases or holds the
+// ticket's dependents, the actor tells them, as completion does.
+type MsgSetMergeState struct {
+	TaskID int
+	State  string // domain.MergeNone / MergeNeeded / MergeMerged / MergeAbandoned
+	// Required sets merge_required (nil keeps it).
+	Required *bool
+	// Source and At record who reported a merge and when (State merged).
+	Source string
+	At     *time.Time
+	// Where names the PR or branch, for the waiting detail when it gates.
+	Where string
+	// From applies the change only while the ticket's merge state is one of
+	// these (empty: any). The reply says whether it changed.
+	From   []string
+	By     *int
+	ByName string
+	// Detail is the activity-log line.
+	Detail  string
+	ReplyCh chan ReplyMergeState
+}
+
+// ReplyMergeState is the ticket after MsgSetMergeState, and whether its
+// merge state changed.
+type ReplyMergeState struct {
+	Task    *domain.Task
+	Changed bool
+	Err     error
 }
 
 type MsgBlockTask struct {
@@ -245,6 +284,9 @@ type MsgDeleteTask struct {
 // whenever any task completes. Each TaskActor checks its own deps.
 type MsgDepCompleted struct {
 	CompletedTaskID int
+	// MergeWait, when set, means the task is done but its merge isn't
+	// recorded: dependents keep waiting, and show this as why.
+	MergeWait string
 }
 
 // MsgTaskDispatched bubbles up: TaskActor → StoryActor → EpicActor → ProjectActor
@@ -265,6 +307,7 @@ type MsgTaskCompleted struct {
 // immediately after MsgCompleteTask returns.
 type MsgFanDepCompleted struct {
 	CompletedTaskID int
+	MergeWait       string // see MsgDepCompleted
 	ReplyCh         chan ReplySimple
 }
 

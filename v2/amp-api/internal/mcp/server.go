@@ -287,6 +287,9 @@ func (s *Server) Register(mcp *server.MCPServer) {
 				"its owner (or a project lead on their behalf) approves it, as it is currently planned, in AMP's web UI. Creating a ticket, " +
 				"restoring it, or changing its name, description or acceptance criteria makes it wait for approval again. " +
 				"Agents can turn it on; only a person in the web UI can turn it off."),
+			"require_merge": boolean("Optional. When true (the default), a ticket completed with a PR or a pushed branch shows Merge needed, " +
+				"and the tickets that depend on it wait until the merge is recorded (amp_report_merged, the GitHub webhook, or Mark merged in AMP). " +
+				"False: dependents start when it completes."),
 			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
@@ -1069,6 +1072,9 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	if on, ok := args["require_plan_approval"].(bool); ok {
 		u.RequirePlanApproval = &on
 	}
+	if on, ok := args["require_merge"].(bool); ok {
+		u.RequireMerge = &on
+	}
 	if v, ok := args["name"].(string); ok {
 		u.Name = &v
 	}
@@ -1832,7 +1838,9 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed", "human_work": true, "run": run})
 	}
 	// Only dispatched (in-progress), approved work: see Service.CompleteTask.
-	if _, err := s.svc.CompleteTask(rctx, caller(rctx).p, taskID); err != nil {
+	// The run it reports decides whether its work waits on a merge.
+	finish := runFromArgs(args, domain.RunCompleted)
+	if _, err := s.svc.CompleteTaskWithRun(rctx, caller(rctx).p, taskID, &finish); err != nil {
 		return nil, err
 	}
 	out := map[string]interface{}{"task_id": taskID, "state": "completed"}

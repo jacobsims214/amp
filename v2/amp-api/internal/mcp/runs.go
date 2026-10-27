@@ -145,12 +145,22 @@ func (s *Server) reportMerged(rctx context.Context, args map[string]interface{})
 	if pr == "" {
 		pr = optStr(args, "pr", "") // the REST endpoint's name for it
 	}
-	ids, err := s.svc.MarkMerged(rctx, caller(rctx).p, optStr(args, "commit", ""), optStr(args, "branch", ""), pr,
-		strings.TrimSpace(optStr(args, "merge_commit", "")))
+	p := caller(rctx).p
+	recs, err := s.svc.MarkMergedFrom(rctx, p, optStr(args, "commit", ""), optStr(args, "branch", ""), pr,
+		strings.TrimSpace(optStr(args, "merge_commit", "")), domain.MergeSourceCI)
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"merged_task_ids": ids, "count": len(ids)})
+	// merged_task_ids is every ticket that matched (as before AMP #2475);
+	// already_merged_task_ids are those an earlier report had recorded.
+	ids, already := []int{}, []int{}
+	for _, r := range recs {
+		ids = append(ids, r.TaskID)
+		if r.AlreadyRecorded {
+			already = append(already, r.TaskID)
+		}
+	}
+	return jsonResult(map[string]interface{}{"merged_task_ids": ids, "count": len(ids), "already_merged_task_ids": already})
 }
 
 func (s *Server) listDeleted(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
