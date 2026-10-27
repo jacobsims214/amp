@@ -140,6 +140,7 @@ func (h *RestHandler) register(mux *deniedMux) {
 	mux.HandleFunc("/api/day-reports/", h.dayReports)
 	mux.HandleFunc("/api/velocity", h.velocity)
 	mux.HandleFunc("/api/my-work", h.myWork)
+	mux.HandleFunc("/api/my-work/", h.myWork)
 	mux.HandleFunc("/api/trace", h.trace)
 	mux.HandleFunc("/api/trace/merged", h.traceMerged)
 	mux.HandleFunc("/api/metadata/", h.metadata)
@@ -782,6 +783,10 @@ func (h *RestHandler) projectSub(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		jsonOK(w, report)
+		return
+
+	case "my-work":
+		h.projectMyWork(w, r, pr, projectID)
 		return
 
 	case "plan-check":
