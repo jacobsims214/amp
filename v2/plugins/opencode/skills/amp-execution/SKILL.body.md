@@ -177,8 +177,10 @@ First decide which kind of stop this is:
   dependency and re-dispatches.
 - **The next step is a person's job, not a question** (merging your PR, a prod deploy only they
   can run, a sign-off). Don't do it, and don't pretend it's done. Finish your part and complete
-  your ticket, and say in your completion comment what the person has to do next. The plan
-  usually has a human ticket for that step (a ticket done by a person, which agents never
+  your ticket, and say in your completion comment what the person has to do next. **Merging your
+  PR needs no ticket:** complete yours with `pr_url` and `branch` (Step 6), and AMP shows it as
+  Merge needed and holds the tickets after it until the merge is recorded. For any other step the
+  plan usually has a human ticket (a ticket done by a person, which agents never
   dispatch). If it doesn't, say so in your final message so the orchestrator adds one. Only the
   person marks a human ticket done, in AMP's web UI; never try to complete it or approve anything
   (a plan, an artifact) yourself. AMP refuses those over MCP ("… is done by a person in the AMP
@@ -240,6 +242,14 @@ invisible to everyone else, and the next agent in this checkout can't tell whose
 done in AMP but whose code exists only in one checkout blocks them without anyone noticing. If the
 conventions say to push (or open a PR), do it; if they say nothing, push the branch you committed
 on. If you can't push (no remote, no access), say so in the completion comment.
+
+**Report the branch and the PR, always.** When your work opened a pull request, pass `pr_url`
+and `branch` to `amp_complete_task` (and `pushed=true`). That's what marks your ticket **Merge
+needed**: the tickets that depend on yours then wait until the merge is recorded (by GitHub's
+webhook, CI's `amp_report_merged`, or the owner's Mark merged), instead of starting on code that
+isn't on the main line yet. Leave `pr_url` out and they start straight away. A PR you open after
+completing goes on `amp_report_run` with `pr_url`; it gates the dependents from then on. Never
+report your own PR as merged.
 
 Post a completion summary:
 

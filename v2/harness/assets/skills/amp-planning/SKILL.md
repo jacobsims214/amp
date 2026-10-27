@@ -248,11 +248,19 @@ owned by the person who does it, that agents never dispatch. The agent work that
 `depends_on` it, so it waits for the person and starts the moment they mark it done in AMP. The
 chain of work stays unbroken, and the board shows exactly who the plan is waiting on.
 
+**Merging a PR is not a human ticket.** AMP gates on merges by itself. A ticket that completes
+with a pull request (or a pushed branch) is **Done · Merge needed**, and every ticket that
+`depends_on` it waits ("Waiting on merge of #30 (PR …)") until the merge is recorded. The merge is
+recorded once, by whichever comes first: the GitHub webhook, CI calling `amp_report_merged`, or
+the owner clicking **Mark merged** in the project's My work tab. So wire the next agent work
+straight to the agent ticket that opens the PR; never plan a "review and merge" ticket between
+them. (A project can turn this off with `require_merge`; then dependents start on completion.)
+
 **Put a person in the loop when the step needs**:
 
 | Reason (`human_reason`) | Examples |
 |---|---|
-| `review` | A person reviews and merges the PR (the team requires human review, or it's a protected branch); outside git (business or ops work), a person reviews the deliverable: the doc, the email draft, the sheet |
+| `review` | A person reviews a deliverable outside git (business or ops work): the doc, the email draft, the sheet. Not a PR merge: merges gate dependents on their own (above) |
 | `approval` | Sign-off on a prod release, a spend, a security or legal change, a customer-facing launch |
 | `access` | Access agents don't have: a prod console, a vendor dashboard, rotating a secret, a paid account |
 | `judgment` | A decision known at plan time that only a person can make: which vendor, pricing, a trade-off |
@@ -262,10 +270,12 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
 **Not a human ticket**:
 - **A question that comes up mid-work.** A worker blocks its own ticket with the question
   (`amp_block_task`), and you answer it. Human tickets are steps you can see at plan time.
+- **Merging a PR.** A done ticket with a PR shows Merge needed, and its dependents wait on the
+  merge (above). Its owner records it, or the webhook or CI does.
 - **Approving a mockup.** That's the design ticket's artifact review.
-- **Approving the plan.** Each person approves their own tickets in AMP's web UI (Flight plan,
-  "Approve plan"); a lead may approve on someone's behalf. It isn't a ticket, and no agent can do
-  it.
+- **Approving the plan.** Each person approves their own tickets in AMP's web UI (the project's
+  My work tab, "Approve"); a lead may approve on someone's behalf. It isn't a ticket, and no agent
+  can do it.
 - **Anything an agent can do with the tools it has.** Don't hand agents' work to people. If an
   agent could do it but lacks a tool or access, say so in the plan; that gap is worth knowing.
 
@@ -274,28 +284,29 @@ chain of work stays unbroken, and the board shows exactly who the plan is waitin
   who does it (their email).
   - It's your user's by default. Ask if it's not obvious whose it is: a human ticket with no
     owner is a NO-GO in `amp_check_plan`, because nobody would ever do it.
-  - A teammate's human ticket shows up in their My Work, under "To do myself".
+  - A teammate's human ticket shows up in their My work tab in the project, under "Do".
 - **One person, one action, a clear done.**
-  - Name it for the action: `Review and merge: quotes API PR`, `Approve: prod release 2.4`,
-    `Rotate: Stripe live key`.
-  - Acceptance criteria say what done means for a person: "PR merged to main", "release
-    approved in the change log".
+  - Name it for the action: `Approve: prod release 2.4`, `Rotate: Stripe live key`,
+    `Decide: Avalara or Stripe Tax`.
+  - Acceptance criteria say what done means for a person: "release approved in the change
+    log", "new key in the vault and the old one revoked".
   - The description says what they need: the PR link or branch, what to check, where to do it.
 - **Wire it both ways:**
-  - it `depends_on` the agent work it needs (the PR exists before anyone reviews it);
-  - the agent work after it `depends_on` it (deploy after the merge).
+  - it `depends_on` the agent work it needs (staging is deployed before anyone signs off);
+  - the agent work after it `depends_on` it (the prod deploy waits for the sign-off).
 
   A human ticket with nothing waiting on it is usually a step you should have wired in.
 - **Leave out `assigned_to`.** No agent runs it.
 
 ```
 Wave 1:  #30 Build quotes API              → amp-worker-backend   (ready)
-Gate:    #31 Review and merge: quotes PR   → person: sam@acme.com (review)   (blocked by #30)
-Wave 2:  #32 Deploy quotes to staging      → amp-worker-backend   (blocked by #31)
+Wave 2:  #31 Deploy quotes to staging      → amp-worker-backend   (blocked by #30; waits on its PR merge)
+Gate:    #32 Approve: quotes in prod       → person: sam@acme.com (approval)   (blocked by #31)
+Wave 3:  #33 Deploy quotes to prod         → amp-worker-backend   (blocked by #32)
 ```
 
 `amp_check_plan` lists every human ticket under `human_gates`, with how many open tickets wait on
-each. When one gate holds up most of the plan, say so when you present it. The user may want to
+each (merges aren't in it; they aren't tickets). When one gate holds up most of the plan, say so when you present it. The user may want to
 book that person's time, or move the step later.
 
 ---
@@ -564,8 +575,8 @@ Total: X tasks (Y implementation + Z wave checks + 1 code review per story)
 
 Every task shows: its ID, name, assigned agent, and either `(ready)` or `(blocked by #N, ...)`.
 Wave checks and code reviews must be clearly labeled. A human ticket shows the person and why in
-place of an agent (`→ person: sam@acme.com (review)`), and the phases name who the plan waits on:
-"Phase 2 — unblocks when Sam merges #31".
+place of an agent (`→ person: sam@acme.com (approval)`), and the phases name who the plan waits on:
+"Phase 3 — unblocks when Sam approves #32".
 If a task has no agent or no blocker status shown — fix it before presenting.
 
 **After the task tree, state the result of the file conflict check explicitly** — don't leave it
@@ -591,8 +602,8 @@ plausible-looking.
 
 ## ⛔ Stop after presenting — a person approves in the web UI
 
-**You never approve a plan.** Only a person can, in AMP's web UI: the project's Flight plan page,
-"Approve plan". Approval is per ticket: each person approves **their own** tickets, and a project
+**You never approve a plan.** Only a person can, in AMP's web UI: the project's **My work** tab,
+"Approve" (Flight plan only links there). Approval is per ticket: each person approves **their own** tickets, and a project
 lead (or owner, admin) may approve someone else's on their behalf. There is no tool for it. `amp_approve_plan` always refuses (it only reports the
 approval status and the link), and so does anything else that tries to approve over MCP, whatever
 the user says in chat. Don't call it.
@@ -601,7 +612,7 @@ After presenting the plan:
 
 1. Run `amp_check_plan(project_id)` one last time. When tickets await approval it returns
    `awaiting_approval` (everyone's), `awaiting_approval_tickets` (`{task_id, owner_user_id,
-   yours}`), `awaiting_yours` (your user's own) and **`approve_url`**, the Flight plan link.
+   yours}`), `awaiting_yours` (your user's own) and **`approve_url`**, the link to approve them.
    That's where you stop.
 2. Hand off, in plain words, with the link, naming **their** tickets:
    "The plan is on the board. #12, #14 and #15 are yours to approve in AMP when you're happy
@@ -656,15 +667,20 @@ amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
 After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
 
 **Human tickets are never dispatched.** They aren't in `ready_to_dispatch`.
-- `waiting_on_people` lists the ones a person can do now, and for each:
+- `waiting_on_people` lists what a person can do now (each item has a `kind`: `approve`,
+  `answer`, `merge` or `do`), and for each:
   - who owns it;
   - how long it has waited;
   - what it is `holding_up`;
   - whether it's `stale` (no activity for two days).
-- Tell your user plainly: "Waiting on Sam to review and merge #31; nothing else can start until
-  then." Keep dispatching everything that doesn't wait on it.
+- Tell your user plainly: "Waiting on Sam to approve #32; nothing else can start until then."
+  Keep dispatching everything that doesn't wait on it.
+- **A merge item** is a done ticket whose PR isn't merged yet; its dependents wait on it. Give
+  your user the PR link. It clears itself when GitHub or CI reports the merge, or when the owner
+  clicks Mark merged in My work. Don't create a ticket for it, and only record a merge
+  (`amp_report_merged`) when your user tells you it's merged.
 - **Only the person marks a human ticket done, in AMP's web UI** (Start and Mark done in the
-  ticket drawer or My Work). You can't: `amp_complete_task` on a human ticket is refused with the
+  project's My work tab or the ticket drawer). You can't: `amp_complete_task` on a human ticket is refused with the
   ticket's link. When your user says theirs is done, re-read the board; if it's still open, give
   them the link and ask them to mark it done there. A stale one is worth a nudge to its owner.
 - A teammate's human ticket is theirs to mark done in the UI, even when your user tells you it's
