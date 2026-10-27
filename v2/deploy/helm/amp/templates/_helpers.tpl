@@ -123,6 +123,30 @@ runAsUser: 0
 {{- end }}
 {{- end -}}
 
+{{/* amp.inboundHookRoutes: amp-api's inbound webhooks (/api/hooks/, the
+     GitHub merge webhook, AMP #2479). The sender (GitHub) has no AMP
+     session, so ext_authz is off for this prefix only; amp-api
+     authenticates each delivery by its HMAC signature against the
+     project's secret, and limits body size and request rate itself.
+     Matched before the /api prefix, which stays behind the session.
+     envoy.inboundHooks.enabled=false leaves the prefix behind the session
+     too (deliveries then fail at sign-in). Nothing in front of Envoy is
+     configured here: whatever ingress, CDN or firewall a deployment puts
+     there only has to pass /api/hooks/ through. */}}
+{{- define "amp.inboundHookRoutes" -}}
+{{- if .Values.envoy.inboundHooks.enabled }}
+# ---- Inbound webhooks: HMAC-signed by the sender and checked by amp-api, not ext_authz ----
+- match: { prefix: "/api/hooks/" }
+  route:
+    cluster: amp_api_rest
+    timeout: {{ .Values.envoy.inboundHooks.timeout | default "15s" }}
+  typed_per_filter_config:
+    envoy.filters.http.ext_authz:
+      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+      disabled: true
+{{- end }}
+{{- end -}}
+
 {{/* amp.relayBrowserRoutes: the relay's browser leg, /api/sessions, goes to
      amp-relay behind the cookie session (ext_authz stays on). Its
      per-session SSE stream is long-lived like the harness's command stream

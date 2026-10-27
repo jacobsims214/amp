@@ -85,8 +85,16 @@ export function canTakeOverTask(task: Task, access: ProjectAccess | null | undef
 
 // ---- Board owner filter ----
 
-/** 'mine' (default) | 'unassigned' | 'everyone' | a project member's user id */
-export type OwnerFilter = 'mine' | 'unassigned' | 'everyone' | number
+/** 'mine' (default) | 'unowned' | 'everyone' | a project member's user id */
+export type OwnerFilter = 'mine' | 'unowned' | 'everyone' | number
+
+/** A stored or typed filter value; the old 'unassigned' reads as 'unowned'. */
+export function parseOwnerFilter(v: string): OwnerFilter {
+  if (v === 'mine' || v === 'unowned' || v === 'everyone') return v
+  if (v === 'unassigned') return 'unowned'
+  const n = Number(v)
+  return Number.isInteger(n) && n > 0 ? n : 'mine'
+}
 
 /**
  * Whether the owner filter actually narrows the view. "Mine" without a known
@@ -99,20 +107,19 @@ export function ownerFilterNarrows(filter: OwnerFilter, meId: number | undefined
 }
 
 /**
- * "My work" = tickets I own, unassigned tickets I created, and legacy
- * unassigned tickets with no creator.
+ * Mine = tickets I own (owner_user_id = me), nothing else (decisions/human-work-ux.md §1).
+ * Unowned = tickets nobody owns, including ones I created, so they stay findable.
  */
 export function taskMatchesOwner(task: Task, filter: OwnerFilter, meId: number | undefined): boolean {
   const owner = task.owner_user_id ?? null
-  const creator = task.created_by ?? null
   switch (filter) {
     case 'everyone':
       return true
-    case 'unassigned':
+    case 'unowned':
       return owner === null
     case 'mine':
       if (meId == null) return true
-      return owner === meId || (owner === null && (creator === meId || creator === null))
+      return owner === meId
     default:
       return owner === filter
   }

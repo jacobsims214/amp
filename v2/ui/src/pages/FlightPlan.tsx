@@ -10,9 +10,9 @@
  * on it; the critical path is outlined. AMP's plan check sits beside it as a
  * GO / NO-GO poll.
  *
- * It is also where a person approves the plan: /project/{id}/plan is the link
- * agents get when they're refused for want of approval, so the approval
- * banner (what waits, who planned it, Approve plan) sits at the top.
+ * It is for reading the plan, not approving it (decisions/human-work-ux.md §2):
+ * approving happens only in the project's My work tab. A one-line link at the
+ * top says how many tickets await your approval and goes there.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
@@ -24,7 +24,7 @@ import { useAuth } from '../hooks/useAuth'
 import { useProjectPeople } from '../hooks/useProjectPeople'
 import { usePlanApproval } from '../hooks/usePlanApproval'
 import { awaitingApproval } from '../lib/approval'
-import { PlanApprovalBanner, type ApproveSelection } from '../components/PlanApprovalBanner'
+import { ApprovalLink } from '../components/ApprovalLink'
 import { ProjectNav } from '../components/ProjectNav'
 import { TaskDrawer } from '../components/TaskDrawer'
 import { Panel, Readouts } from '../components/ui/PageHeader'
@@ -128,12 +128,7 @@ export function FlightPlan() {
   const runCheck = () => { setChecking(true); check() }
   const approval = usePlanApproval(pid)
   const awaiting = useMemo(() => awaitingApproval(tasks, approval.project), [tasks, approval.project])
-  const approve = async (sel: ApproveSelection) => {
-    const r = await approval.approve(sel)
-    if (r.changed) refresh()
-    if (r.ok || r.changed) check()
-  }
-  // The link agents are given lands here; bring the approval into view once it's drawn.
+  // Older approve links (/plan#approve) land here; bring the link to My work into view.
   const approvalShown = !!approval.project && !(loading && !tasks.length)
   useEffect(() => {
     if (approvalShown && window.location.hash === '#approve') document.getElementById('approve')?.scrollIntoView({ block: 'nearest' })
@@ -201,8 +196,7 @@ export function FlightPlan() {
       </>} />
       <div className="p-7 pt-5 grid gap-4">
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
-        <PlanApprovalBanner projectId={pid} project={approval.project} awaiting={awaiting} people={people}
-          meId={me?.user_id} myAccess={myAccess} onApprove={approve} approving={approval.approving} error={approval.error} notice={approval.notice} onOpen={setOpenId} />
+        <ApprovalLink projectId={pid} project={approval.project} awaiting={awaiting} people={people} meId={me?.user_id} showApproved />
         <Readouts items={[
           { label: 'Tickets', value: tasks.length, sub: `${openCount} open` },
           { label: 'Epics · stories', value: <>{epics.length}<span className="text-[14px] text-ink-3"> · {stories.length}</span></>, sub: 'in this plan' },
