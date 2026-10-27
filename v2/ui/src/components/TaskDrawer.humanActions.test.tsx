@@ -1,11 +1,11 @@
 // The TaskDrawer uses HumanActions for Answer, Merge and Do, and never
 // approves: approval is a link to My work (KB decisions/human-work-ux.md §2).
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { http, HttpResponse } from 'msw'
 import { setupServer } from 'msw/node'
 import { MemoryRouter } from 'react-router-dom'
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TaskDrawer } from './TaskDrawer'
 import type { ProjectAccess, Task } from '../types'
 
@@ -82,5 +82,63 @@ describe('TaskDrawer human actions', () => {
     open(task({ performer: 'human', approved_at: '2026-10-27T10:30:00Z', approved_by: 9 }))
     expect(screen.getByRole('button', { name: /^start$/i })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /mark done…/i })).toBeInTheDocument()
+  })
+})
+
+describe('TaskDrawer merge gate exceptions (#2597)', () => {
+  let runReads = 0
+  beforeEach(() => { runReads = 0 })
+  const runsAt = (branch: string) => http.get('*/api/tasks/5/runs', () => (runReads++, HttpResponse.json({ runs: [{ id: 1, task_id: 5, project_id: 2, outcome: 'completed', branch, pushed: true, created_at: '2026-10-27T10:00:00Z' }], usage: { runs: 1 } })))
+  // The runs were read and rendered: a missing line is really missing.
+  const settled = async () => {
+    await waitFor(() => expect(runReads).toBeGreaterThan(0))
+    await waitFor(() => expect(inFlight).toBe(0))
+    await act(() => new Promise(r => setTimeout(r, 20)))
+  }
+  const inherited = (m: object) => http.get('*/api/metadata/inherited', () => HttpResponse.json({ inherited: m }))
+  const doneTask = (over: Partial<Task> = {}) => task({ state: 'completed', completed_at: '2026-10-27T11:00:00Z', merge_state: 'none', approved_at: '2026-10-27T10:30:00Z', approved_by: 9, ...over })
+
+  it('shows "Merged into <branch>" for a run pushed to the inherited integration branch, with no merge actions', async () => {
+    server.use(inherited({ integration_branch: 'fix/merge-gate' }), runsAt('fix/merge-gate'))
+    open(doneTask())
+    expect(await screen.findByTestId('merge-integration')).toHaveTextContent('Merged into fix/merge-gate, waiting on the merge to main')
+    expect(screen.queryByTestId('merge-status')).toBeNull()
+    expect(screen.queryByText(/merge needed/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /mark merged/i })).toBeNull()
+  })
+
+  it('uses the ticket\'s own integration_branch over the inherited one', async () => {
+    server.use(inherited({ integration_branch: 'fix/other' }), runsAt('fix/merge-gate'))
+    open(doneTask({ metadata: { integration_branch: 'fix/merge-gate' } }))
+    expect(await screen.findByTestId('merge-integration')).toHaveTextContent('Merged into fix/merge-gate')
+  })
+
+  it('says nothing when the run went to another branch', async () => {
+    server.use(inherited({ integration_branch: 'fix/merge-gate' }), runsAt('fix/unrelated'))
+    open(doneTask())
+    await settled()
+    expect(screen.queryByTestId('merge-integration')).toBeNull()
+  })
+
+  it('shows Merged, not the integration line, once the merge to main is recorded', async () => {
+    server.use(inherited({ integration_branch: 'fix/merge-gate' }), runsAt('fix/merge-gate'))
+    open(doneTask({ merge_state: 'merged', merge_source: 'github', merged_at: '2026-10-27T14:20:00Z' }))
+    expect(screen.getByTestId('merge-status')).toHaveTextContent(/^Merged/)
+    await settled()
+    expect(screen.queryByTestId('merge-integration')).toBeNull()
+  })
+
+  it('says a waits_for_merge: false ticket starts when its dependencies are done', async () => {
+    server.use(inherited({ waits_for_merge: false }))
+    open(task({ dependency_ids: [4], approved_at: '2026-10-27T10:30:00Z', approved_by: 9 }))
+    expect(await screen.findByTestId('merge-no-wait')).toHaveTextContent("Starts when its dependencies are done; doesn't wait for their merge")
+  })
+
+  it('says nothing about merges for a dependent that waits as usual', async () => {
+    server.use(inherited({ waits_for_merge: true }))
+    open(task({ dependency_ids: [4], approved_at: '2026-10-27T10:30:00Z', approved_by: 9 }))
+    await waitFor(() => expect(inFlight).toBe(0))
+    await act(() => new Promise(r => setTimeout(r, 20)))
+    expect(screen.queryByTestId('merge-no-wait')).toBeNull()
   })
 })
