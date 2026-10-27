@@ -460,6 +460,7 @@ func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectI
 		if u.RequireMerge != nil && (prevErr != nil || prev.RequireMerge != proj.RequireMerge) {
 			s.reconcileMergeGated(ctx, projectID)
 		}
+		s.ReconcileMergeMetadata(ctx, p, projectID, u.Metadata)
 	}
 	return proj, err
 }

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/simstech/amp-api/internal/actor"
 	"github.com/simstech/amp-api/internal/authz"
 	"github.com/simstech/amp-api/internal/domain"
 	"github.com/simstech/amp-api/internal/repository"
@@ -278,6 +279,13 @@ func (s *Service) handleGitHubEvent(ctx context.Context, projectID int, event st
 	}
 	hits := s.traceHits(ctx, runs)
 	var recs []MergeRecord
+	var into []int
+	if pr.Merged {
+		// A PR merged into a ticket's integration branch isn't its merge to
+		// main: the ticket stops holding its dependents and stays unmerged
+		// until the integration branch is merged (AMP #2596).
+		hits, into = s.releaseIntegrationHits(ctx, hits, strings.TrimSpace(pr.Base.Ref))
+	}
 	if pr.Merged {
 		recs, err = s.markHitsMerged(ctx, githubPrincipal, hits, strings.ToLower(pr.MergeCommitSHA), domain.MergeSourceGitHub)
 	} else {
@@ -299,8 +307,11 @@ func (s *Service) handleGitHubEvent(ctx context.Context, projectID int, event st
 	if !pr.Merged {
 		what = "closed without merging"
 	}
+	changed = append(changed, into...)
 	res := GitHubResult{Status: http.StatusOK, TaskIDs: changed}
 	switch {
+	case len(into) > 0 && len(recs) == 0:
+		res.Result = "PR merged into integration branch " + pr.Base.Ref + ": released the tickets waiting on " + ticketList(into) + " (still unmerged)"
 	case len(recs) == 0 && len(hits) == 0:
 		res.Result = "PR " + what + ": no ticket in this project has its PR, branch or commits"
 	case len(changed) == 0:
@@ -327,4 +338,35 @@ func ticketList(ids []int) string {
 		parts[i] = fmt.Sprintf("#%d", id)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// releaseIntegrationHits splits off the hits whose ticket's integration
+// branch is base: their work just landed where it belongs. A ticket waiting
+// on that merge goes back to merge_state none (still unmerged), releasing
+// its dependents. It returns the other hits, and the tickets it released.
+func (s *Service) releaseIntegrationHits(ctx context.Context, hits []TraceHit, base string) ([]TraceHit, []int) {
+	if base == "" {
+		return hits, nil
+	}
+	var rest []TraceHit
+	var released []int
+	no := false
+	for _, h := range hits {
+		t := h.Task
+		if t.IsHuman() || s.integrationBranch(ctx, &t) != base {
+			rest = append(rest, h)
+			continue
+		}
+		if t.MergeState != domain.MergeNeeded {
+			continue // nothing held; leave it unmerged for the integration PR
+		}
+		if _, err := s.setMergeState(ctx, githubPrincipal, &t, actor.MsgSetMergeState{State: domain.MergeNone, Required: &no,
+			From: []string{domain.MergeNeeded}, Detail: "Its PR was merged into its integration branch (" + base +
+				"): the tickets that depend on it no longer wait; it stays unmerged until that branch is merged"}); err != nil {
+			slog.Warn("github webhook: release integration merge", "task_id", t.ID, "err", err)
+			continue
+		}
+		released = append(released, t.ID)
+	}
+	return rest, released
 }

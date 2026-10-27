@@ -32,6 +32,28 @@ its ticket.
 build on is merged"). Off, dependents start as soon as a ticket is done, merged or not. Agents set
 it with `amp_update_project_settings(require_merge)`.
 
+## Integration branches and reviews of open PRs
+
+Two plan shapes need the work after a ticket to start before its merge to main. Each one is a
+metadata key, inherited from the project to the epic, story and ticket like any metadata. Setting
+one is not a change to the plan, so nothing needs approving again, and it takes effect at once.
+
+- **An integration branch.** An epic's or story's tickets merge into a shared branch (say
+  `harness-m5`), and one PR takes that branch to main at the end. Set
+  `integration_branch: "harness-m5"` on the epic or story. A worker reports that branch, either
+  `branch=harness-m5` when it merged or pushed straight into it, or `base_branch=harness-m5` with
+  its `pr_url` when it opened a PR into it. Its ticket is then done without holding anything: the
+  next ticket starts on completion. The ticket still counts as unmerged (it's in
+  `amp_list_unmerged`, merge state none) until the integration branch reaches main. Then one
+  `amp_report_merged(branch="harness-m5")`, or the webhook for the integration PR, marks the whole
+  chain merged. The ticket that opens the integration PR to main gates as usual, so whatever comes
+  after the integration waits for it. A PR the GitHub webhook sees merged into a ticket's
+  integration branch releases that ticket the same way. Setting the key after the fact releases
+  tickets whose work already landed there.
+- **A review of an open PR.** A ticket that needs the PR open, not merged (a code review), gets
+  `waits_for_merge: false`. It starts once the ticket before it is done. Other tickets that depend
+  on the same ticket still wait for the merge.
+
 ## How a merge is recorded
 
 Once, by whichever comes first. Later reports change nothing and say who recorded it ("already
