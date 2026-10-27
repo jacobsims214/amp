@@ -89,7 +89,7 @@ Pair your phone before you leave the laptop: pairing always needs the laptop.
 
 ## What the web can and can't do
 
-From the session page (My Work → My sessions, or the link) you can:
+From the session page (My work → My sessions, or the link) you can:
 
 - read the chat live: your messages, the replies, folded thinking, tool calls and their results
   (shortened), and the worker chips;
@@ -102,7 +102,7 @@ From the session page (My Work → My sessions, or the link) you can:
 You can't, from the web: run slash commands (a message starting with `/` is sent as text),
 connect providers or keys, trust MCP servers or repo items, change configuration or the AMP
 server, open URLs on the laptop, pair another device, extend the timeouts, or approve plans
-(that stays on the Flight plan page in AMP).
+(that stays in the project's My work tab in AMP).
 
 Secrets the harness knows (provider keys, tokens) are blanked out of everything it sends.
 

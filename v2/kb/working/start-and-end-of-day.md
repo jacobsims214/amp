@@ -30,7 +30,8 @@ Everything for a standup is already in AMP:
   (`amp_project_day_reports`).
 - **Reports → People**: each person's done, in progress, questions, tokens, and **blocked by**:
   whose unfinished tickets they're waiting on.
-- **Mission**: what's quiet, what's waiting to merge, open questions.
+- **Mission**: what's quiet, what needs merging, open questions, and **Waiting on people**: what
+  waits on each person, by kind.
 
 A lead can run standup from these without asking anyone for status, and spend the meeting on
 blockers and decisions.
