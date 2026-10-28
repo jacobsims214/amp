@@ -176,14 +176,17 @@ curl -fsSL https://raw.githubusercontent.com/jacobsims214/amp/main/v2/harness/in
 ## 7. Homebrew (template)
 
 There is no tap repo yet. The `publish` job's last step, "Homebrew tap (template, not wired)",
-only prints a message. It is skipped for prereleases. The rendered formula `amp-harness.rb` is
-attached to every release. To publish it by hand, or to wire the step up later:
+only prints a message. It runs only when the job's `ver` step sets `prerelease=false`, that is
+when the version (the tag minus `harness-v`) has no `-`: it runs for `harness-v0.1.0` and is
+skipped for `harness-v0.2.0-rc.1` and `harness-v0.0.0-test.1`. The rendered formula
+`amp-harness.rb` is attached to every release. To publish it by hand, or to wire the step up later:
 
 1. A person creates the tap repo (e.g. `homebrew-amp`) and adds a deploy key or fine-grained
    token as a repo secret.
 2. Copy the release's `amp-harness.rb` to `Formula/amp-harness.rb` in the tap and push.
 3. To automate it, replace the template step with a checkout of the tap, that copy and a push.
-   Keep it skipped for versions with a `-`.
+   Keep its `if: steps.ver.outputs.prerelease == 'false'`. Never test `github.ref_name` for a
+   `-`: the `harness-v` prefix has one, so that skips every release.
 
 The formula template is `packaging/homebrew/`, rendered by `scripts/render-formula.sh`.
 

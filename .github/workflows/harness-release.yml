@@ -14,8 +14,10 @@ name: Harness release
 # the archives, their .sha256 files, SHA256SUMS, install.sh and the rendered Homebrew formula, using
 # GITHUB_TOKEN. It is never marked "latest" (AMP's own releases keep that). A version with a '-' is
 # a prerelease (install.sh's "newest" lookup skips those); one with '-test' is a draft as well, for
-# exercising this workflow without anything installable. No signing in v1; the Homebrew tap update
-# is a template until a tap repo exists. How-to: AMP KB how-to/harness-release.md.
+# exercising this workflow without anything installable. The `ver` step decides this from the
+# version (the tag minus "harness-v", whose own '-' must not count). No signing in v1; the Homebrew
+# tap update is a template until a tap repo exists, and is skipped for prereleases. How-to: AMP KB
+# how-to/harness-release.md.
 #
 # Gate (#2607): on a harness-v* tag, `gate` requires a successful `Harness` (harness.yml) run AND a
 # successful `Harness smoke` (harness-smoke.yml) run on the tagged commit (GITHUB_SHA); `publish`
@@ -275,14 +277,34 @@ jobs:
           sha256sum -c SHA256SUMS
           test "$(wc -l < SHA256SUMS)" -eq 4
           test -s install.sh && test -s amp-harness.rb
-      - name: create the GitHub Release
+      # The version is the tag minus "harness-v". Test the version, not the tag: the prefix itself
+      # contains a '-', so any check on github.ref_name would call every tag a prerelease.
+      - name: version and prerelease
+        id: ver
         run: |
           version=${TAG#harness-v}
-          flags="--latest=false"
           case "$version" in
-            *-test*) flags="$flags --draft --prerelease" ;;
-            *-*) flags="$flags --prerelease" ;;
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
           esac
+          echo "version $version, prerelease $prerelease"
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+      - name: create the GitHub Release
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+        run: |
+          version=$VERSION
+          flags="--latest=false"
+          if [ "$PRERELEASE" = true ]; then
+            case "$version" in
+              *-test*) flags="$flags --draft --prerelease" ;;
+              *) flags="$flags --prerelease" ;;
+            esac
+          fi
           cat > notes.md <<EOF
           amp-harness $version, built from ${GITHUB_SHA}.
 
@@ -305,7 +327,8 @@ jobs:
 
       # Homebrew tap (template, Q4: no tap repo yet). When one exists: add a deploy key or a
       # fine-grained token as a secret, check out the tap, copy dist/amp-harness.rb to
-      # Formula/amp-harness.rb and push. Skipped for prereleases.
+      # Formula/amp-harness.rb and push. Skipped for prereleases (a '-' in the version, not the
+      # tag: see the `ver` step), so it runs for harness-v0.1.0 but not harness-v0.2.0-rc.1.
       - name: Homebrew tap (template, not wired)
-        if: ${{ !contains(github.ref_name, '-') }}
+        if: steps.ver.outputs.prerelease == 'false'
         run: echo "No Homebrew tap yet; amp-harness.rb is attached to the release."
