@@ -73,4 +73,5 @@ jobs:
         run: cargo test --workspace --locked
       # The test step includes the render snapshots (amp-tui tests/chrome.rs and tests/theme.rs
       # against tests/snapshots/*.txt; a missing or changed snapshot fails without UPDATE_SNAPSHOTS).
-      # No smoke step: scripts/smoke.sh needs a live AMP. It joins CI in M5-2 (compose stack in the job, three protocol modes).
+      # No smoke step here: scripts/smoke.sh needs a live AMP. harness-smoke.yml runs it against the
+      # compose stack in three protocol modes (M5-2, #2123).

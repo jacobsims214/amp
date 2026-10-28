@@ -145,11 +145,15 @@ if grep -q "not on your login shell's PATH" "$T/out"; then bad "login PATH now i
 out_has "next step uses amp-harness once on PATH" "Next: run \`amp-harness setup\`"
 
 # Upgrades: a file:// mirror with an older and the current release, and a release list (newest
-# first, with a non-harness AMP tag on top) to find the newest harness-v* release.
+# first, with a non-harness AMP tag and a harness prerelease on top) to find the newest harness-v*
+# release that isn't a prerelease (#2122).
 sum() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1; }
 old=0.0.1
+# A fixed "current" release, so a prerelease crate version (a -test tag build) does not change what
+# the newest-release lookup should pick.
+new=1.2.3
 mirror="$T/mirror"
-for v in "$old" "$version"; do
+for v in "$old" "$new"; do
     d="$T/build-$v"
     stub "$d/amp-harness-$v-$tgt" "$v"
     mkdir -p "$mirror/harness-v$v"
@@ -164,8 +168,12 @@ cat >"$mirror/releases.json" <<JSON
     "name": "AMP 9.9.9"
   },
   {
-    "tag_name": "harness-v$version",
-    "name": "amp-harness $version"
+    "tag_name": "harness-v9.0.0-rc.1",
+    "name": "amp-harness 9.0.0-rc.1 (prerelease: never picked as the newest)"
+  },
+  {
+    "tag_name": "harness-v$new",
+    "name": "amp-harness $new"
   },
   {
     "tag_name": "harness-v$old",
@@ -177,16 +185,31 @@ export AMP_HARNESS_BASE_URL="file://$mirror" AMP_HARNESS_RELEASES_URL="file://$m
 expect_ok "install an older release" sh "$install_sh" --version "$old" --target "$tgt" --prefix "$T/up" --no-path-check
 out_has "older release installed" "Installed amp-harness $old to $T/up/amp-harness"
 expect_ok "re-run upgrades in place" sh "$install_sh" --target "$tgt" --prefix "$T/up" --no-path-check
-out_has "the newest harness-v release is picked" "Downloading amp-harness $version for $tgt"
-out_has "says old → new" "Updated amp-harness $old → $version at $T/up/amp-harness"
-if [ "$("$T/up/amp-harness" --version)" = "amp-harness $version (stub)" ]; then ok "upgraded binary runs"; else bad "upgraded binary runs"; fi
+out_has "the newest harness-v release is picked" "Downloading amp-harness $new for $tgt"
+out_has "says old → new" "Updated amp-harness $old → $new at $T/up/amp-harness"
+if [ "$("$T/up/amp-harness" --version)" = "amp-harness $new (stub)" ]; then ok "upgraded binary runs"; else bad "upgraded binary runs"; fi
 expect_ok "re-run with curl | sh when up to date" sh -c "cat '$install_sh' | sh -s -- --target $tgt --prefix '$T/up' --no-path-check"
-out_has "says already up to date" "Reinstalled amp-harness $version at $T/up/amp-harness (already up to date)"
+out_has "says already up to date" "Reinstalled amp-harness $new at $T/up/amp-harness (already up to date)"
+# #2615: the API lists releases by creation date, so a patch to an older line can come first. The
+# highest version wins whatever the order: 1.1.9 and 1.1.10 (a two-digit part) listed above 1.2.3.
+cat >"$mirror/releases-unordered.json" <<JSON
+[
+  { "tag_name": "harness-v1.1.9", "name": "amp-harness 1.1.9 (a patch cut after $new)" },
+  { "tag_name": "harness-v1.1.10", "name": "amp-harness 1.1.10" },
+  { "tag_name": "v9.9.9", "name": "AMP 9.9.9" },
+  { "tag_name": "harness-v9.0.0-rc.1", "name": "amp-harness 9.0.0-rc.1" },
+  { "tag_name": "harness-v$old", "name": "amp-harness $old" },
+  { "tag_name": "harness-v$new", "name": "amp-harness $new" }
+]
+JSON
+expect_ok "out-of-order release list" env AMP_HARNESS_RELEASES_URL="file://$mirror/releases-unordered.json" \
+    sh "$install_sh" --target "$tgt" --prefix "$T/unordered" --no-path-check
+out_has "the highest version is picked, not the first listed" "Downloading amp-harness $new for $tgt"
 # #2341: an older release over a newer one is a downgrade, not an update.
 expect_ok "install an older release over a newer one" sh "$install_sh" --version "$old" --target "$tgt" --prefix "$T/down" --no-path-check
-expect_ok "install the newer one first" sh "$install_sh" --version "$version" --target "$tgt" --prefix "$T/down" --no-path-check
+expect_ok "install the newer one first" sh "$install_sh" --version "$new" --target "$tgt" --prefix "$T/down" --no-path-check
 expect_ok "then the older one over it" sh "$install_sh" --version "$old" --target "$tgt" --prefix "$T/down" --no-path-check
-out_has "says Downgraded new → old" "Downgraded amp-harness $version → $old at $T/down/amp-harness"
+out_has "says Downgraded new → old" "Downgraded amp-harness $new → $old at $T/down/amp-harness"
 if grep -qF "Updated" "$T/out"; then bad "a downgrade does not say Updated"; else ok "a downgrade does not say Updated"; fi
 unset AMP_HARNESS_BASE_URL AMP_HARNESS_RELEASES_URL
 
@@ -195,7 +218,7 @@ mkdir -p "$XDG_CONFIG_HOME/amp-harness"
 echo '# kept' >"$XDG_CONFIG_HOME/amp-harness/config.toml"
 expect_ok "--uninstall" sh "$install_sh" --uninstall --prefix "$T/up"
 if [ -e "$T/up/amp-harness" ]; then bad "binary removed"; else ok "binary removed"; fi
-out_has "names what it removed" "Removed amp-harness $version from $T/up/amp-harness."
+out_has "names what it removed" "Removed amp-harness $new from $T/up/amp-harness."
 out_has "says the settings are kept, and where" "your settings: $XDG_CONFIG_HOME/amp-harness"
 out_has "says the saved keys are kept, and where" "items with service \"amp-harness\""
 # #2341: with the keychain turned off, the keys are in the file store, not the keychain.

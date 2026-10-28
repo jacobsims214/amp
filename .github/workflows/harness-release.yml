@@ -5,10 +5,33 @@ name: Harness release
 # Builds the four v1 targets natively (no cross-compiling), packs each as
 # amp-harness-<version>-<target>.tar.gz + .sha256 with v2/harness/scripts/package.sh, installs each
 # archive through v2/harness/install.sh on its own runner and runs it, then renders the Homebrew
-# formula from the four checksums. Everything is uploaded as workflow artifacts only.
+# formula from the four checksums. Branches, PRs and manual runs stop there (workflow artifacts).
 #
-# NOTHING IS PUBLISHED HERE YET. M5-1 adds the publish job (GitHub Release for harness-v* tags with
-# the archives, .sha256 files, SHA256SUMS and install.sh; tap update) on top of `package`.
+# Version stamping (D11, #2122): every build checks that `amp-harness --version` reports the crate
+# version (which a tag must match) and the commit it was built from, clean (no -dirty).
+#
+# Publishing (M5-1 #2122): only a harness-v* tag runs `publish`, which makes a GitHub Release with
+# the archives, their .sha256 files, SHA256SUMS, install.sh and the rendered Homebrew formula, using
+# GITHUB_TOKEN. It is never marked "latest" (AMP's own releases keep that). A version with a '-' is
+# a prerelease (install.sh's "newest" lookup skips those); one with '-test' is a draft as well, for
+# exercising this workflow without anything installable. The `ver` step decides this from the
+# version (the tag minus "harness-v", whose own '-' must not count). No signing in v1; the Homebrew
+# tap update is a template until a tap repo exists, and is skipped for prereleases. How-to: AMP KB
+# how-to/harness-release.md.
+#
+# Gate (#2607): on a harness-v* tag, `gate` requires a successful `Harness` (harness.yml) run AND a
+# successful `Harness smoke` (harness-smoke.yml) run on the tagged commit (GITHUB_SHA); `publish`
+# needs it, so an untested or red commit is never published. The builds run in parallel with it.
+# Skipped for -test versions (draft dry runs on off-branch commits have no CI runs). When a
+# workflow has no run on the commit (no path filter fired): `gh workflow run <file> --ref <tag>`,
+# wait for it to pass, then `gh run rerun <release run id> --failed`.
+#
+# Action pinning (#2614): every `uses:` here and in harness-smoke.yml is a full 40-hex commit SHA with
+# a `# vX.Y.Z` comment, never a mutable tag, because these jobs build and publish what users install.
+# To bump one: pick the newest release of the same major, resolve its commit with
+# `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` (if .object.type is "tag", it is annotated:
+# follow it with `gh api repos/<owner>/<repo>/git/tags/<object.sha>` to get the commit), replace
+# the SHA and the comment in every file, and run actionlint. Release (tag) builds skip rust-cache.
 
 on:
   push:
@@ -64,7 +87,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: shellcheck
         if: runner.os == 'Linux'
         run: shellcheck -s sh v2/harness/install.sh v2/harness/scripts/package.sh v2/harness/scripts/render-formula.sh v2/harness/scripts/test-install.sh v2/harness/scripts/test-install-distros.sh
@@ -98,7 +121,11 @@ jobs:
     env:
       CARGO_TERM_COLOR: always
     steps:
-      - uses: actions/checkout@v4
+      # Full history: build.rs stamps the commit that last touched assets/ (`git log -- assets`),
+      # which a shallow clone would report as HEAD.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
       - name: install toolchain from rust-toolchain.toml
         run: rustup toolchain install
       - name: host is the target
@@ -111,7 +138,10 @@ jobs:
         run: |
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           test "harness-v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != harness-v$version"; exit 1; }
-      - uses: Swatinem/rust-cache@v2
+      # Not on tags: release binaries build from a clean target/ (a tag run could otherwise restore
+      # the default branch's cache). Branch and PR runs keep the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           workspaces: v2/harness
           key: release-${{ matrix.target }}
@@ -126,7 +156,29 @@ jobs:
         run: |
           ./install.sh --archive "$ARCHIVE" --prefix "$RUNNER_TEMP/bin" --no-path-check
           "$RUNNER_TEMP/bin/amp-harness" --version
-      - uses: actions/upload-artifact@v4
+      # The installed binary must report the crate version and this exact, clean commit.
+      - name: version stamp
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          out=$("$RUNNER_TEMP/bin/amp-harness" --version)
+          first=$(printf '%s\n' "$out" | head -n 1)
+          test "$first" = "amp-harness $version" || { echo "::error::first line '$first', want 'amp-harness $version'"; exit 1; }
+          commit=$(printf '%s\n' "$out" | sed -n 's/^commit //p')
+          head=$(git rev-parse HEAD)
+          case "$commit" in
+            *-dirty|unknown|"") echo "::error::build commit stamp is '$commit'"; exit 1 ;;
+          esac
+          case "$head" in
+            "$commit"*) echo "stamped commit $commit = HEAD $head" ;;
+            *) echo "::error::stamped commit $commit is not HEAD $head"; exit 1 ;;
+          esac
+          assets=$(printf '%s\n' "$out" | sed -n 's/^assets //p')
+          want=$(git log -1 --format=%h -- assets)
+          test "$assets" = "$want" || { echo "::error::assets stamp '$assets', want '$want'"; exit 1; }
+          for pin in rpi-ai rpi-agent rpi-tools rpi-harness rpi-tui rmcp; do
+            printf '%s\n' "$out" | grep -q "^$pin [0-9]" || { echo "::error::no $pin pin in --version"; exit 1; }
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: amp-harness-${{ matrix.target }}
           path: |
@@ -140,8 +192,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: amp-harness-*
           path: dist
@@ -159,8 +211,124 @@ jobs:
           v2/harness/scripts/render-formula.sh "$version" dist > dist/amp-harness.rb
           ruby -c dist/amp-harness.rb
           cp v2/harness/install.sh dist/install.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: harness-release
           path: dist/
           if-no-files-found: error
+
+  # harness-v* tags only: the tagged commit must have passed `Harness` and `Harness smoke`. Fails
+  # closed: no successful run of either workflow on GITHUB_SHA, or an API error, fails the job and
+  # so blocks `publish`. Runs alongside install-test/build; only publish waits on it.
+  gate:
+    if: startsWith(github.ref, 'refs/tags/harness-v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Harness and Harness smoke passed on the tagged commit
+        run: |
+          version=${TAG#harness-v}
+          case "$version" in
+            *-test*) echo "$TAG is a -test version (draft dry run on an off-branch commit): gate skipped"; exit 0 ;;
+          esac
+          failed=0
+          for wf in harness.yml harness-smoke.yml; do
+            n=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$wf/runs?head_sha=$GITHUB_SHA&status=success&per_page=1" --jq .total_count) || n=""
+            case "$n" in
+              ''|*[!0-9]*)
+                echo "::error::could not list $wf runs for $GITHUB_SHA (got '$n')"
+                failed=1 ;;
+              0)
+                echo "::error::$wf has no successful run on $GITHUB_SHA. Run it on the tag: gh workflow run $wf --ref $TAG, wait for it to pass, then re-run this release run: gh run rerun $GITHUB_RUN_ID --failed"
+                failed=1 ;;
+              *)
+                echo "$wf: $n successful run(s) on $GITHUB_SHA" ;;
+            esac
+          done
+          exit "$failed"
+
+  # harness-v* tags only: the GitHub Release. Uses GITHUB_TOKEN (no extra secrets). Needs `gate`.
+  publish:
+    if: startsWith(github.ref, 'refs/tags/harness-v')
+    needs: [package, gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: harness-release
+          path: dist
+      - name: verify the release files
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum -c SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 4
+          test -s install.sh && test -s amp-harness.rb
+      # The version is the tag minus "harness-v". Test the version, not the tag: the prefix itself
+      # contains a '-', so any check on github.ref_name would call every tag a prerelease.
+      - name: version and prerelease
+        id: ver
+        run: |
+          version=${TAG#harness-v}
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          echo "version $version, prerelease $prerelease"
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+      - name: create the GitHub Release
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+        run: |
+          version=$VERSION
+          flags="--latest=false"
+          if [ "$PRERELEASE" = true ]; then
+            case "$version" in
+              *-test*) flags="$flags --draft --prerelease" ;;
+              *) flags="$flags --prerelease" ;;
+            esac
+          fi
+          cat > notes.md <<EOF
+          amp-harness $version, built from ${GITHUB_SHA}.
+
+          Install or upgrade (macOS and Linux, no sudo):
+
+          \`\`\`sh
+          curl -fsSL https://raw.githubusercontent.com/${GH_REPO}/main/v2/harness/install.sh | sh -s -- --version $version
+          \`\`\`
+
+          Each archive has a .sha256 next to it, and SHA256SUMS lists all four. \`amp-harness --version\` reports the rpi/rmcp pins, the embedded assets commit and the build commit. Not signed (v1). amp-harness.rb is the rendered Homebrew formula, for a tap.
+          EOF
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists: replacing its files"
+            gh release upload "$TAG" dist/* --clobber
+          else
+            # shellcheck disable=SC2086 # flags is a word list
+            gh release create "$TAG" dist/* --verify-tag --title "amp-harness $version" --notes-file notes.md $flags
+          fi
+          gh release view "$TAG" --json tagName,isDraft,isPrerelease,url,assets --jq '{tagName,isDraft,isPrerelease,url,assets:[.assets[].name]}'
+
+      # Homebrew tap (template, Q4: no tap repo yet). When one exists: add a deploy key or a
+      # fine-grained token as a secret, check out the tap, copy dist/amp-harness.rb to
+      # Formula/amp-harness.rb and push. Skipped for prereleases (a '-' in the version, not the
+      # tag: see the `ver` step), so it runs for harness-v0.1.0 but not harness-v0.2.0-rc.1.
+      - name: Homebrew tap (template, not wired)
+        if: steps.ver.outputs.prerelease == 'false'
+        run: echo "No Homebrew tap yet; amp-harness.rb is attached to the release."

@@ -141,13 +141,19 @@ sha256_of() {
     fi
 }
 
-# Newest harness-v* tag from the GitHub API. The repo also publishes AMP releases, so GitHub's own
-# "latest release" can't be used. Releases come newest first; drafts are not listed without auth.
+# Highest harness-v* version from the GitHub API. The repo also publishes AMP releases, so GitHub's
+# own "latest release" can't be used. The API lists releases by creation date, so a 0.1.x patch cut
+# after 0.2.0 comes first: the versions are sorted numerically instead, and the highest wins.
+# Drafts are not listed without auth. per_page=100 is one page shared with AMP's own releases; a
+# harness release older than the newest 100 releases is not seen (only the highest matters here).
 latest_version() {
     api=${AMP_HARNESS_RELEASES_URL:-"https://api.github.com/repos/$REPO/releases?per_page=100"}
     tmp_json="$1/releases.json"
     fetch "$api" "$tmp_json" || err "could not list releases from $api (pass --version X.Y.Z)"
-    v=$(sed -n "s/.*\"tag_name\": *\"$TAG_PREFIX\\([^\"]*\\)\".*/\\1/p" "$tmp_json" | head -n 1)
+    # Prereleases (a SemVer version with a '-', e.g. 0.2.0-rc.1) are skipped: they install only by
+    # --version. Drafts are not in the unauthenticated list at all.
+    v=$(sed -n "s/.*\"tag_name\": *\"$TAG_PREFIX\\([^\"]*\\)\".*/\\1/p" "$tmp_json" | grep -v -- - |
+        sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
     [ -n "$v" ] || err "no $TAG_PREFIX* release found on $REPO yet (pass --version, or --archive for a local build)"
     echo "$v"
 }
