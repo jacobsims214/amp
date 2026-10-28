@@ -5,7 +5,7 @@ from AMP's server images, and follows [Semantic Versioning](https://semver.org/)
 tagged `harness-vX.Y.Z`. The versioning and compatibility policy is D14 in the AMP project 2 KB,
 `decisions/amp-harness-architecture.md`. How to cut a release: [RELEASING.md](RELEASING.md).
 
-## [0.1.0] - unreleased
+## [0.1.0] - 2026-10-28
 
 The first release. AMP Harness is AMP's own coding-agent harness: a single Rust binary, built on
 pi-rust's core crates (`rpi-*` 0.8.0) with an MCP client on `rmcp` 3.6.0. You chat with AMP's
@@ -152,6 +152,9 @@ Not yet supported: Windows, and musl-based Linux such as Alpine.
   checksums, `SHA256SUMS`, `install.sh` and a rendered Homebrew formula (#2115, #2122).
 - Compatibility CI: the smoke test runs against a real AMP stack in three MCP protocol modes
   (auto, forced 2026-07-28, forced 2025-11-25) (#2086, #2123).
+- Publish gate: a release is published only if `Harness` and `Harness smoke` both have a
+  successful run on the tagged commit. Otherwise the release run fails and nothing is
+  published. `-test` versions skip the gate (#2607).
 
 ### Known limitations
 
