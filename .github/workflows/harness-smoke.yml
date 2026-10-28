@@ -60,7 +60,7 @@ jobs:
       CARGO_TERM_COLOR: always
       COMPOSE_PROJECT_NAME: amp-smoke
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # `make build` (--all-targets) plus the amp-api and ui images don't fit the runner's free disk.
       - name: free disk space
@@ -79,7 +79,7 @@ jobs:
       - name: install toolchain from rust-toolchain.toml
         working-directory: v2/harness
         run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: v2/harness
           # one cache for all three modes: they build the same thing
