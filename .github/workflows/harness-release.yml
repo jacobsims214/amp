@@ -23,6 +23,13 @@ name: Harness release
 # Skipped for -test versions (draft dry runs on off-branch commits have no CI runs). When a
 # workflow has no run on the commit (no path filter fired): `gh workflow run <file> --ref <tag>`,
 # wait for it to pass, then `gh run rerun <release run id> --failed`.
+#
+# Action pinning (#2614): every `uses:` here and in harness-smoke.yml is a full 40-hex commit SHA with
+# a `# vX.Y.Z` comment, never a mutable tag, because these jobs build and publish what users install.
+# To bump one: pick the newest release of the same major, resolve its commit with
+# `gh api repos/<owner>/<repo>/git/ref/tags/<tag>` (if .object.type is "tag", it is annotated:
+# follow it with `gh api repos/<owner>/<repo>/git/tags/<object.sha>` to get the commit), replace
+# the SHA and the comment in every file, and run actionlint. Release (tag) builds skip rust-cache.
 
 on:
   push:
@@ -78,7 +85,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: shellcheck
         if: runner.os == 'Linux'
         run: shellcheck -s sh v2/harness/install.sh v2/harness/scripts/package.sh v2/harness/scripts/render-formula.sh v2/harness/scripts/test-install.sh v2/harness/scripts/test-install-distros.sh
@@ -114,7 +121,7 @@ jobs:
     steps:
       # Full history: build.rs stamps the commit that last touched assets/ (`git log -- assets`),
       # which a shallow clone would report as HEAD.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
       - name: install toolchain from rust-toolchain.toml
@@ -129,7 +136,10 @@ jobs:
         run: |
           version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           test "harness-v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != harness-v$version"; exit 1; }
-      - uses: Swatinem/rust-cache@v2
+      # Not on tags: release binaries build from a clean target/ (a tag run could otherwise restore
+      # the default branch's cache). Branch and PR runs keep the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         with:
           workspaces: v2/harness
           key: release-${{ matrix.target }}
@@ -166,7 +176,7 @@ jobs:
           for pin in rpi-ai rpi-agent rpi-tools rpi-harness rpi-tui rmcp; do
             printf '%s\n' "$out" | grep -q "^$pin [0-9]" || { echo "::error::no $pin pin in --version"; exit 1; }
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: amp-harness-${{ matrix.target }}
           path: |
@@ -180,8 +190,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: amp-harness-*
           path: dist
@@ -199,7 +209,7 @@ jobs:
           v2/harness/scripts/render-formula.sh "$version" dist > dist/amp-harness.rb
           ruby -c dist/amp-harness.rb
           cp v2/harness/install.sh dist/install.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: harness-release
           path: dist/
@@ -254,7 +264,7 @@ jobs:
       GH_REPO: ${{ github.repository }}
       TAG: ${{ github.ref_name }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: harness-release
           path: dist
