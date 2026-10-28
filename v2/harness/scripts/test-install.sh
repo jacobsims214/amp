@@ -190,6 +190,21 @@ out_has "says old → new" "Updated amp-harness $old → $new at $T/up/amp-harne
 if [ "$("$T/up/amp-harness" --version)" = "amp-harness $new (stub)" ]; then ok "upgraded binary runs"; else bad "upgraded binary runs"; fi
 expect_ok "re-run with curl | sh when up to date" sh -c "cat '$install_sh' | sh -s -- --target $tgt --prefix '$T/up' --no-path-check"
 out_has "says already up to date" "Reinstalled amp-harness $new at $T/up/amp-harness (already up to date)"
+# #2615: the API lists releases by creation date, so a patch to an older line can come first. The
+# highest version wins whatever the order: 1.1.9 and 1.1.10 (a two-digit part) listed above 1.2.3.
+cat >"$mirror/releases-unordered.json" <<JSON
+[
+  { "tag_name": "harness-v1.1.9", "name": "amp-harness 1.1.9 (a patch cut after $new)" },
+  { "tag_name": "harness-v1.1.10", "name": "amp-harness 1.1.10" },
+  { "tag_name": "v9.9.9", "name": "AMP 9.9.9" },
+  { "tag_name": "harness-v9.0.0-rc.1", "name": "amp-harness 9.0.0-rc.1" },
+  { "tag_name": "harness-v$old", "name": "amp-harness $old" },
+  { "tag_name": "harness-v$new", "name": "amp-harness $new" }
+]
+JSON
+expect_ok "out-of-order release list" env AMP_HARNESS_RELEASES_URL="file://$mirror/releases-unordered.json" \
+    sh "$install_sh" --target "$tgt" --prefix "$T/unordered" --no-path-check
+out_has "the highest version is picked, not the first listed" "Downloading amp-harness $new for $tgt"
 # #2341: an older release over a newer one is a downgrade, not an update.
 expect_ok "install an older release over a newer one" sh "$install_sh" --version "$old" --target "$tgt" --prefix "$T/down" --no-path-check
 expect_ok "install the newer one first" sh "$install_sh" --version "$new" --target "$tgt" --prefix "$T/down" --no-path-check
