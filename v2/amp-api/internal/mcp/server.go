@@ -8,7 +8,7 @@
 //	amp_create_story     amp_list_stories    amp_get_story     amp_update_story
 //	amp_create_task      amp_list_tasks      amp_get_task
 //	amp_update_task      amp_dispatch_task   amp_complete_task
-//	amp_block_task       amp_add_task_comment
+//	amp_block_task       amp_add_task_comment   amp_return_task
 //	amp_export_project   amp_import_project
 //	amp_whoami           amp_list_project_members   amp_claim_task   amp_assign_task
 //	amp_list_orgs        amp_create_org             amp_manage_org_members
@@ -290,6 +290,10 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"require_merge": boolean("Optional. When true (the default), a ticket completed with a PR or a pushed branch shows Merge needed, " +
 				"and the tickets that depend on it wait until the merge is recorded (amp_report_merged, the GitHub webhook, or Mark merged in AMP). " +
 				"False: dependents start when it completes."),
+			"not_started_flag_minutes": num("Optional. A dispatched ticket no worker has started is flagged after this many minutes " +
+				"(default 10; 0 turns the flag off): it shows in amp_list_tasks' not_started list and in its owner's waiting_on_people."),
+			"not_started_return_minutes": num("Optional. A dispatched ticket no worker has started is returned to ready after this many " +
+				"minutes (default 30; 0 turns returning off, leaving it only flagged)."),
 			"metadata": obj("Optional. Metadata changes: keys with a value are set (string, number, or boolean), keys set to null are removed, other keys are kept."),
 		}), wrap(ctx, s.guard(authz.Owner, s.updateProjectSettings)))
 
@@ -536,9 +540,14 @@ func (s *Server) Register(mcp *server.MCPServer) {
 		}), wrap(ctx, s.guard(authz.Member, s.updateTask)))
 
 	mcp.AddTool(tool("amp_claim_task",
-		"Take ownership of an unassigned ticket so you (and your agents) can work it. Fails if someone else already owns it: "+
-			"claiming never takes a ticket from anyone (to take one over, use amp_assign_task with user='me').",
-		props{"task_id": num("REQUIRED. Task ID.")}), wrap(ctx, s.guard(authz.Member, s.claimTask)))
+		"Claim the ticket you were dispatched for: amp_claim_task(task_id, dispatch_id), with the dispatch_id from your dispatch "+
+			"result or prompt. That is what marks the ticket started, posts \"{agent} picked this up\", and tells AMP which agent "+
+			"has it. Without a dispatch_id it only takes an unassigned ticket, and never takes one from its owner (to take one over, "+
+			"use amp_assign_task with user='me'). Claiming twice is harmless.",
+		props{
+			"task_id":     num("REQUIRED. Task ID."),
+			"dispatch_id": str("Optional. The dispatch_id from your dispatch result or worker prompt. Pass it to start the ticket you were dispatched for; a stale one is refused."),
+		}), wrap(ctx, s.guard(authz.Member, s.claimTask)))
 
 	mcp.AddTool(tool("amp_assign_task",
 		"Assign a ticket to a project member (it then shows up in their work), or release it with user='none' so anyone can pick it up. "+
@@ -550,20 +559,30 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"user":    str("REQUIRED. Email or user id of a project member, 'me', or 'none' to unassign."),
 		}), wrap(ctx, s.guard(authz.Member, s.assignTask)))
 
-	mcp.AddTool(tool("amp_dispatch_task", "Start work on a ticket (task): dispatch it to an agent (sets state to in_progress). Fails if task is blocked. An unassigned ticket becomes yours; a ticket owned by someone else can't be dispatched. Human tickets (performer 'human') are never dispatched: their owner does them.",
+	mcp.AddTool(tool("amp_dispatch_task",
+		"Start work on a ticket (task): mark it dispatched to an agent (state in_progress, not started) and get everything needed to start "+
+			"that worker NOW: dispatch_id, worker_prompt (its ready-to-use prompt) and next. Start the worker in the same turn — the "+
+			"ticket stays \"not started\" until the worker calls amp_claim_task with the dispatch_id, and AMP returns it to ready if "+
+			"nobody does. If you aren't starting a worker, don't dispatch: amp_set_task_state(backlog) undoes it. Fails if the ticket "+
+			"is blocked or isn't approved yet. An unassigned ticket becomes yours; someone else's can't be dispatched. Human tickets "+
+			"are never dispatched: their owner does them.",
 		props{
 			"task_id":  num("REQUIRED. Task ID."),
 			"agent_id": str("REQUIRED. Agent identifier, e.g. 'amp-worker'."),
 		}), wrap(ctx, s.guard(authz.Member, s.dispatchTask)))
 
 	mcp.AddTool(tool("amp_complete_task", "Mark a task completed. Auto-unblocks any tasks that were waiting on it. "+
-		"Also record the run: the model you used, your token usage if your harness can tell you (opencode: amp_session_usage), "+
-		"and where the work is (branch, commit, PR, pushed). AMP reports token spend and traces code back to tickets from these. "+
-		"Only a ticket that was dispatched (in progress) can be completed by an agent. A person's own human ticket is marked done by "+
-		"that person in AMP's web UI, not through this tool.",
+		"A worker completes its own ticket: pass the dispatch_id you were dispatched with. Without it (or with an old one) the "+
+		"completion is recorded as a closeout — someone closing a ticket that wasn't its worker's — which is allowed, labelled in "+
+		"history and runs, and takes closeout_reason (never dispatch a ticket just to complete it: close out a ready ticket with "+
+		"runs directly). Also record the run: the model you used, your token usage if your harness can tell you (opencode: "+
+		"amp_session_usage), and where the work is (branch, commit, PR, pushed, base_branch). AMP reports token spend and traces "+
+		"code back to tickets from these. A person's own human ticket is marked done by that person in AMP's web UI, not here.",
 		withRunProps(props{
-			"task_id":      num("REQUIRED. Task ID."),
-			"hours_worked": num("Human tickets: the hours the person says they spent on it."),
+			"task_id":         num("REQUIRED. Task ID."),
+			"dispatch_id":     str("The dispatch_id you were dispatched with. Pass it: it is what makes this the worker's own completion rather than a closeout."),
+			"closeout_reason": str("Closing out a ticket that isn't your own work: why its worker couldn't finish it (connection lost, timed out, approved after the worker blocked). Recorded as a closeout."),
+			"hours_worked":    num("Human tickets: the hours the person says they spent on it."),
 		})), wrap(ctx, s.guard(authz.Member, s.completeTask)))
 	mcp.AddTool(tool("amp_report_run",
 		"Record an agent run on a ticket without changing its state: the model, token usage, and where the work went. "+
@@ -643,9 +662,19 @@ func (s *Server) Register(mcp *server.MCPServer) {
 			"amp_answer_question) the answer is posted on the ticket and it goes back to ready to be dispatched again. "+
 			"Not for waiting on other tickets: that's what dependencies are for.",
 		withRunProps(props{
-			"task_id": num("REQUIRED. Task ID."),
-			"reason":  str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
+			"task_id":     num("REQUIRED. Task ID."),
+			"reason":      str("REQUIRED. The question for a person, e.g. 'Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month.'"),
+			"dispatch_id": str("Optional. The dispatch_id you were dispatched with (records which run stopped; the ticket is started either way)."),
 		})), wrap(ctx, s.guard(authz.Member, s.blockTask)))
+	mcp.AddTool(tool("amp_return_task",
+		"Send a dispatched ticket back to ready because its worker never started it or ended without closing it: a harness "+
+			"releasing a run that crashed, timed out or was stopped, or a manager undoing a dispatch. Clears the dispatch, records "+
+			"returned_at/returned_reason so the ticket shows under amp_list_tasks' returned list until it is dispatched again, and "+
+			"writes history and an audit entry. Refused on a started ticket: block or close that one out instead.",
+		props{
+			"task_id": num("REQUIRED. Task ID."),
+			"reason":  str("REQUIRED. Why it is being returned, naming the outcome: e.g. 'worker amp:amp-worker-backend timed out after 20 min'."),
+		}), wrap(ctx, s.guard(authz.Member, s.returnTask)))
 	mcp.AddTool(tool("amp_answer_question",
 		"Answer a ticket's question (a ticket an agent blocked with amp_block_task): the answer is posted on the ticket as a comment "+
 			"and the ticket goes back to ready (or to waiting, if it still depends on unfinished tickets), so the next dispatch picks it up "+
@@ -1001,11 +1030,23 @@ func (s *Server) claimTask(rctx context.Context, args map[string]interface{}) (*
 	if err != nil {
 		return nil, err
 	}
-	t, err := s.svc.ClaimTask(rctx, caller(rctx).p, taskID)
+	dispatchID := strings.TrimSpace(optStr(args, "dispatch_id", ""))
+	t, res, err := s.svc.ClaimTask(rctx, caller(rctx).p, taskID, dispatchID)
 	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"task": t})
+	out := map[string]interface{}{"task": t, "phase": t.Phase, "next": claimNext(t)}
+	if t.StartedAt != nil {
+		out["started_at"] = t.StartedAt
+		out["started_by"] = t.StartedBy
+	}
+	if res.DispatchID != "" {
+		out["dispatch_id"] = res.DispatchID
+	}
+	if res.AlreadyStarted {
+		out["already_started"] = true
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) assignTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1093,6 +1134,12 @@ func (s *Server) updateProjectSettings(rctx context.Context, args map[string]int
 	}
 	if on, ok := args["require_merge"].(bool); ok {
 		u.RequireMerge = &on
+	}
+	if v := optIntPtr(args, "not_started_flag_minutes"); v != nil {
+		u.NotStartedFlagMinutes = v
+	}
+	if v := optIntPtr(args, "not_started_return_minutes"); v != nil {
+		u.NotStartedReturnMinutes = v
 	}
 	if v, ok := args["name"].(string); ok {
 		u.Name = &v
@@ -1588,11 +1635,22 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		}
 	}
 
+	// Dispatched, no worker started (AMP #2801): flagged once the project's
+	// not_started_flag_minutes have passed; a read, nothing to write.
+	notStarted, err := s.notStartedList(rctx, projectID, tasks)
+	if err != nil {
+		return nil, err
+	}
+	returned, err := s.returnedList(rctx, projectID, tasks)
+	if err != nil {
+		return nil, err
+	}
+
 	switch optStr(args, "format", "compact") {
 	case "full":
 	case "compact":
 		withDone, _ := args["include_completed"].(bool)
-		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, people, comingUp, withDone)
+		return s.compactTasks(rctx, projectID, tasks, view.Mode, quiet, people, comingUp, withDone, notStarted, returned)
 	default:
 		return nil, fmt.Errorf("format: use 'compact' (default) or 'full'")
 	}
@@ -1604,9 +1662,11 @@ func (s *Server) listTasks(rctx context.Context, args map[string]interface{}) (*
 		"scheduled":         scheduled, // tasks waiting for their start_at time
 		"questions":         questions, // blocked with a question for a person (also listed in blocked); answer with amp_answer_question
 		"completed":         completed,
-		"quiet":             quiet,    // in progress with no activity for 15+ min: the worker likely died; check comments, reset to backlog, re-dispatch
-		"waiting_on_people": people,   // Waiting on you: what each person must do next (kind approve, answer, merge, do); never dispatch these
-		"coming_up":         comingUp, // people's human tickets not actionable yet (waiting on dependencies, a schedule or approval)
+		"quiet":             quiet,      // in progress with no activity for 15+ min: the worker likely died; check comments, close out or reset to backlog, re-dispatch
+		"not_started":       notStarted, // dispatched but no worker started it: start the worker now, or undo the dispatch
+		"returned":          returned,   // returned to ready because no worker started it; re-dispatch knowingly or ask the user
+		"waiting_on_people": people,     // Waiting on you: what each person must do next (kind approve, answer, merge, start, do); never dispatch these
+		"coming_up":         comingUp,   // people's human tickets not actionable yet (waiting on dependencies, a schedule or approval)
 		"count":             len(tasks),
 		"owner_filter":      view.Mode, // pass owner='unassigned' or 'any' to widen
 	})
@@ -1809,7 +1869,7 @@ func (s *Server) updateStory(rctx context.Context, args map[string]interface{}) 
 	return jsonResult(map[string]interface{}{"story_id": storyID, "updated": true, "story": updated})
 }
 
-func (s *Server) dispatchTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+func (s *Server) dispatchTask(rctx context.Context, args map[string]interface{}) (result *mcpgo.CallToolResult, err error) {
 	taskID, err := reqInt(args, "task_id")
 	if err != nil {
 		return nil, err
@@ -1825,10 +1885,33 @@ func (s *Server) dispatchTask(rctx context.Context, args map[string]interface{})
 	if err := s.checkProjectNotArchived(context.Background(), task.ProjectID); err != nil {
 		return nil, err
 	}
-	if _, err := s.svc.Dispatch(rctx, caller(rctx).p, task.ID, agentID); err != nil {
+	// The ticket it was before this dispatch: a re-dispatch of a returned
+	// ticket says so in its result, so a manager re-dispatches knowingly.
+	wasReturned, wasReason := task.ReturnedAt != nil, task.ReturnedReason
+	t, err := s.svc.Dispatch(rctx, caller(rctx).p, task.ID, agentID)
+	if err != nil {
 		return nil, err
 	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "dispatched_to": agentID})
+	flagMin, returnMin := s.watchdogMinutes(rctx, t.ProjectID)
+	returnAt := returnAt(time.Now(), returnMin)
+	out := map[string]interface{}{
+		"task_id": taskID, "dispatched_to": agentID, "state": t.State, "phase": t.Phase,
+		"next": dispatchNext(t, agentID, returnAt, returnMin),
+	}
+	if flagMin > 0 {
+		out["flag_after_minutes"] = flagMin
+	}
+	if t.DispatchID != "" {
+		out["dispatch_id"] = t.DispatchID
+		out["worker_prompt"] = workerPrompt(t, agentID)
+	}
+	if returnAt != nil {
+		out["start_by"] = returnAt.UTC().Format(time.RFC3339)
+	}
+	if wasReturned {
+		out["previously_returned"] = wasReason
+	}
+	return jsonResult(out)
 }
 
 func (s *Server) completeTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1859,17 +1942,49 @@ func (s *Server) completeTask(rctx context.Context, args map[string]interface{})
 		}
 		return jsonResult(map[string]interface{}{"task_id": taskID, "state": "completed", "human_work": true, "run": run})
 	}
-	// Only dispatched (in-progress), approved work: see Service.CompleteTask.
+	// Dispatched and approved work, as its worker (with the dispatch_id it
+	// was given) or as a closeout (AMP #2801): see Service.CompleteTask.
 	// The run it reports decides whether its work waits on a merge.
 	finish := runFromArgs(args, domain.RunCompleted)
-	if _, err := s.svc.CompleteTaskWithRun(rctx, caller(rctx).p, taskID, &finish); err != nil {
+	claim := service.CompleteClaim{DispatchID: strings.TrimSpace(optStr(args, "dispatch_id", "")),
+		Reason: optStr(args, "closeout_reason", "")}
+	if claim.Reason == "" {
+		claim.Reason = finish.Note
+	}
+	t, closed, err := s.svc.CompleteTaskWithRun(rctx, caller(rctx).p, taskID, &finish, claim)
+	if err != nil {
 		return nil, err
 	}
-	out := map[string]interface{}{"task_id": taskID, "state": "completed"}
-	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
+	out := map[string]interface{}{"task_id": taskID, "state": "completed", "next": completeNext(t, closed.Closeout)}
+	if closed.Closeout {
+		out["closeout"] = true
+		if closed.Reason != "" {
+			out["closeout_reason"] = closed.Reason
+		}
+		// The run says so too, so reports and lists can tell a manager's
+		// closeout from a worker's completion without reading history. A
+		// closeout always records one, even with nothing else to report:
+		// that the ticket was closed by someone other than its worker is
+		// the record's point.
+		if args == nil {
+			args = map[string]interface{}{}
+		}
+		note := service.CloseoutNote(closed.Reason)
+		if prev := strings.TrimSpace(optStr(args, "run_note", "")); prev != "" {
+			note = service.CloseoutNote(prev)
+		}
+		args["run_note"] = note
+		finish.Note = note
+		if _, err := s.svc.RecordRun(rctx, caller(rctx).p, taskID, finish); err != nil {
+			out["run_error"] = err.Error()
+		}
+	} else if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunCompleted); err != nil {
 		out["run_error"] = err.Error()
 	} else if run != nil {
 		out["run"] = run
+	}
+	if runs, err := s.repo.TaskRuns(rctx, taskID); err == nil && len(runs) > 0 {
+		out["run"] = runs[len(runs)-1]
 	}
 	return jsonResult(out)
 }
@@ -1907,6 +2022,11 @@ func (s *Server) blockTask(rctx context.Context, args map[string]interface{}) (*
 		return nil, reply.Err
 	}
 	out := map[string]interface{}{"task_id": taskID, "state": "blocked"}
+	if t, err := s.repo.GetTask(rctx, taskID); err == nil {
+		out["next"] = blockNext(t)
+	} else {
+		out["next"] = fmt.Sprintf("Stop now and end your final message with: QUESTION on task %d: <your question>.", taskID)
+	}
 	if run, err := s.recordRunFromArgs(rctx, taskID, args, domain.RunBlocked); err != nil {
 		out["run_error"] = err.Error()
 	} else if run != nil {
@@ -1935,11 +2055,7 @@ func (s *Server) answerQuestion(rctx context.Context, args map[string]interface{
 	if err != nil {
 		return nil, err
 	}
-	next := "It's ready: dispatch it again and the worker will find the answer in the ticket's comments."
-	if task.State == domain.TaskStateBlocked {
-		next = "It still waits on unfinished dependencies; it becomes ready when they're done."
-	}
-	return jsonResult(map[string]interface{}{"task_id": taskID, "state": task.State, "next": next})
+	return jsonResult(map[string]interface{}{"task_id": taskID, "state": task.State, "next": answerNext(task)})
 }
 
 func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
@@ -1973,6 +2089,13 @@ func (s *Server) addComment(rctx context.Context, args map[string]interface{}) (
 	reply := actor.Await(rctx, replyCh)
 	if reply.Err != nil {
 		return nil, reply.Err
+	}
+	// A comment is the first activity on a dispatched ticket for a plugin
+	// that doesn't claim: it starts the ticket (AMP #2801), so start it and
+	// re-read it, rather than reporting the state it had before.
+	s.svc.InferStart(rctx, taskID)
+	if cur, err := s.repo.GetTask(context.Background(), taskID); err == nil {
+		return jsonResult(map[string]interface{}{"task_id": taskID, "comment_added": true, "next": commentNext(cur)})
 	}
 	return jsonResult(map[string]interface{}{"task_id": taskID, "comment_added": true})
 }
@@ -2136,7 +2259,8 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 
 	// Through the service, which keeps agents from moving work forward by
 	// hand (see Service.SetTaskState), then the actor hierarchy.
-	updated, err := s.svc.SetTaskState(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason)
+	updated, err := s.svc.SetTaskStateAs(rctx, caller(rctx).p, taskID, domain.TaskState(stateStr), reason,
+		strings.TrimSpace(optStr(args, "dispatch_id", "")))
 	if err != nil {
 		return nil, err
 	}
@@ -2145,13 +2269,37 @@ func (s *Server) setTaskState(rctx context.Context, args map[string]interface{})
 		"from_state": fromState,
 		"to_state":   string(updated.State),
 		"reason":     reason,
+		"next":       stateNext(updated),
 	}
 	if string(updated.State) != stateStr {
 		// Moved back while a dependency is open: it waits on it.
 		out["note"] = fmt.Sprintf("ticket %d waits on incomplete dependencies (of %v), so it's %s rather than %s; it becomes ready when they complete",
 			taskID, updated.DependencyIDs, updated.State, stateStr)
 	}
+	if stateStr == "completed" && fromState != "completed" && !updated.IsHuman() &&
+		strings.TrimSpace(optStr(args, "dispatch_id", "")) == "" {
+		out["closeout"] = true
+	}
 	return jsonResult(out)
+}
+
+// returnTask is amp_return_task: the harness's (or a manager's) release of a
+// dispatched ticket whose worker ended without closing it (AMP #2801).
+func (s *Server) returnTask(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {
+	taskID, err := reqInt(args, "task_id")
+	if err != nil {
+		return nil, err
+	}
+	reason, err := reqStr(args, "reason")
+	if err != nil || strings.TrimSpace(reason) == "" {
+		return nil, fmt.Errorf("reason is required: it names why the worker didn't finish, e.g. \"worker amp:amp-worker-backend timed out after 20 min\"")
+	}
+	t, err := s.svc.ReturnTask(rctx, caller(rctx).p, taskID, reason, false)
+	if err != nil {
+		return nil, err
+	}
+	return jsonResult(map[string]interface{}{"task_id": taskID, "state": t.State, "returned": true,
+		"returned_reason": t.ReturnedReason, "next": returnNext(t)})
 }
 
 func (s *Server) setTaskStartAt(rctx context.Context, args map[string]interface{}) (*mcpgo.CallToolResult, error) {

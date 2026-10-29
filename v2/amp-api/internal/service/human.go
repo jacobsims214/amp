@@ -87,8 +87,8 @@ func (s *Service) CompleteHumanTask(ctx context.Context, p authz.Principal, task
 	if err != nil {
 		return nil, nil, err
 	}
-	replyCh := make(chan actor.ReplySimple, 1)
-	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ByName: p.Label(), ReplyCh: replyCh})
+	replyCh := make(chan actor.ReplyComplete, 1)
+	s.Registry.System().Root.Send(pid, &actor.MsgCompleteTask{TaskID: taskID, By: p.UserRef(), ByName: p.Label(), InUI: p.InUI(), ReplyCh: replyCh})
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, nil, reply.Err
 	}

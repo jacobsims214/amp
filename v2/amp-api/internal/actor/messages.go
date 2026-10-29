@@ -85,8 +85,60 @@ type MsgDispatchTask struct {
 	// Human is set when a person starts their own human ticket (the UI's
 	// Start). Agents never start human tickets, and people don't start
 	// agent tickets this way.
-	Human   bool
-	ReplyCh chan ReplySimple
+	Human bool
+	// DispatchID is the token this dispatch hands out (AMP #2801). The
+	// worker presents it to start the ticket (MsgClaimStart) and to
+	// complete it. Empty for a person's own start of a human ticket, which
+	// is started on the spot (a person works the ticket they started).
+	DispatchID string
+	ReplyCh    chan ReplySimple
+}
+
+// MsgClaimStart is a worker starting the ticket it was dispatched for
+// (amp_claim_task with a dispatch_id), or the fallback start of a plugin
+// whose first activity counts as one (AMP #2801).
+//
+// DispatchID is the token the caller presents, or "" for the fallback.
+// Inferred marks the fallback: the ticket is started but nothing is posted
+// on it, and there is no claim to refuse. A token that isn't the current
+// one is refused ("the ticket was returned and re-dispatched"), so a worker
+// from an earlier dispatch can't silently take the new run.
+type MsgClaimStart struct {
+	TaskID     int
+	DispatchID string
+	Inferred   bool
+	// By names the agent starting it for the record ("" for inferred).
+	By     string
+	ByName string
+	// Post is the comment body to post when the caller isn't inferred ("":
+	// none), so the claim shows on the ticket as well as in the history.
+	Post    string
+	ByUser  *int
+	ReplyCh chan ReplyStart
+}
+
+// ReplyStart answers MsgClaimStart: the ticket as it is after the start,
+// whether this call started it (false: it already was, which is not an
+// error), and the dispatch it started under.
+type ReplyStart struct {
+	Task           *domain.Task
+	Started        bool
+	DispatchID     string
+	AlreadyStarted bool
+	Err            error
+}
+
+// MsgReturnTask sends a dispatched ticket back to ready because no worker
+// started it (AMP #2801): the watchdog's automatic return, or a harness
+// releasing a ticket whose worker ended without closing it
+// (amp_return_task).
+type MsgReturnTask struct {
+	TaskID int
+	Reason string
+	// By names who returned it in the history ("system" for the watchdog).
+	By      *int
+	ByName  string
+	ReplyCh chan ReplyGetTask
 }
 
 type MsgCompleteTask struct {
@@ -110,7 +162,29 @@ type MsgCompleteTask struct {
 	// waiting detail. Old replicas ignore both (gob drops unknown fields).
 	MergeRequired bool
 	MergeWhere    string
-	ReplyCh       chan ReplySimple
+	// DispatchID is the dispatch token the caller presents (AMP #2801). The
+	// current one makes this the worker's own completion; anything else
+	// (none, or a token from an earlier dispatch) is a closeout, which the
+	// actor records as such. CloseoutReason is the why, for the record.
+	DispatchID     string
+	CloseoutReason string
+	// CloseoutOK lets a completion of a ticket that was never dispatched
+	// through as a closeout: it needs prior work on the ticket (the service
+	// checks), which is how a ready ticket with runs is closed out without
+	// dispatching it first (#2473/#2494).
+	CloseoutOK bool
+	// InUI is set when a person completes the ticket in the AMP web UI: that
+	// is their own act, recorded as theirs, never as a manager's closeout.
+	InUI    bool
+	ReplyCh chan ReplyComplete
+}
+
+// ReplyComplete answers MsgCompleteTask: the ticket after the completion and
+// whether it was recorded as a closeout (the caller wasn't its worker).
+type ReplyComplete struct {
+	Task     *domain.Task
+	Closeout bool
+	Err      error
 }
 
 // MsgSetMergeState changes a ticket's merge state in its actor (AMP #2475):
@@ -198,6 +272,13 @@ type MsgSetTaskState struct {
 	State  domain.TaskState
 	Reason string
 	By     *int
+	// DispatchID is the dispatch token the caller presents (AMP #2801): set,
+	// the caller claims to be the ticket's worker, so its completion to
+	// completed isn't recorded as a closeout.
+	DispatchID string
+	// InUI is set when a person changes the state in the AMP web UI: their
+	// own act, never a manager's closeout.
+	InUI bool
 	// ByName names who changed it in the activity log (default "manager").
 	ByName string
 	// RequireStarted refuses unless the ticket is in progress (see

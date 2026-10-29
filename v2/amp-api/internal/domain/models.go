@@ -65,6 +65,11 @@ type Project struct {
 	// then are never gated.
 	RequireMerge      bool       `json:"require_merge"`
 	RequireMergeSince *time.Time `json:"require_merge_since,omitempty"`
+	// Dispatch watchdog (AMP #2801): a dispatched ticket no worker starts is
+	// flagged after NotStartedFlagMinutes and returned to ready after
+	// NotStartedReturnMinutes. 0 turns either off; both default on (10, 30).
+	NotStartedFlagMinutes   int `json:"not_started_flag_minutes"`
+	NotStartedReturnMinutes int `json:"not_started_return_minutes"`
 	// Metadata is free-form key/value data for integrations (see Metadata).
 	Metadata  Metadata  `json:"metadata"`
 	CreatedAt time.Time `json:"created_at"`
@@ -89,6 +94,10 @@ type ProjectSettings struct {
 	RequirePlanApproval *bool `json:"require_plan_approval"`
 	// RequireMerge: done tickets with an unmerged PR hold their dependents.
 	RequireMerge *bool `json:"require_merge"`
+	// NotStartedFlagMinutes / NotStartedReturnMinutes: the dispatch
+	// watchdog's timeouts (AMP #2801); 0 disables each.
+	NotStartedFlagMinutes   *int `json:"not_started_flag_minutes"`
+	NotStartedReturnMinutes *int `json:"not_started_return_minutes"`
 	// Metadata sets keys; null removes one (see MetadataPatch).
 	Metadata MetadataPatch `json:"metadata,omitempty"`
 }
@@ -205,6 +214,106 @@ type Task struct {
 	// waits on is done but not merged ("Waiting on merge of #N (PR …)").
 	// Computed by its actor, never stored.
 	WaitingDetail string `json:"waiting_detail,omitempty"`
+
+	// Dispatch integrity (AMP #2801, epic 180). A dispatched ticket isn't
+	// started until its worker claims it: the four states are unchanged and
+	// "dispatched, not started" is derived (Task.Phase) from StartedAt.
+	//
+	// DispatchID is the token amp_dispatch_task handed out for the current
+	// dispatch. A worker claims with it (amp_claim_task) and completes with
+	// it; a completion without it is a closeout. Empty when not dispatched
+	// (or after a return).
+	DispatchID string `json:"dispatch_id,omitempty"`
+	// StartedAt is when the ticket was started: a worker's claim, or the
+	// first activity of a plugin that doesn't claim (StartedBy "inferred").
+	// NULL on an in_progress ticket means no worker has started it yet.
+	StartedAt *time.Time `json:"started_at,omitempty"`
+	// StartedBy names the agent that started it ("inferred" for the
+	// fallback, "backfill" for tickets in flight when it landed).
+	StartedBy string `json:"started_by,omitempty"`
+	// ReturnedAt and ReturnedReason record a dispatched ticket the watchdog
+	// (or amp_return_task) sent back to ready; the next dispatch clears them.
+	ReturnedAt     *time.Time `json:"returned_at,omitempty"`
+	ReturnedReason string     `json:"returned_reason,omitempty"`
+	// Phase is the derived display phase: PhaseNotStarted (in_progress with
+	// no StartedAt), PhaseStarted (in_progress with one), or "" for any
+	// other state. Computed on read, never stored.
+	Phase string `json:"phase,omitempty"`
+}
+
+// Display phases of an in-progress ticket (Task.Phase, AMP #2801). There is
+// no new task state: in_progress + no started_at is "not started".
+const (
+	PhaseNotStarted = "not_started"
+	PhaseStarted    = "started"
+)
+
+// PhaseOf returns the display phase for a ticket in state with the given
+// started_at.
+func PhaseOf(state TaskState, startedAt *time.Time) string {
+	if state != TaskStateInProgress {
+		return ""
+	}
+	if startedAt == nil {
+		return PhaseNotStarted
+	}
+	return PhaseStarted
+}
+
+// Started reports whether the ticket has been started (claimed, or started
+// by the fallback). A ticket in any state but in_progress is past starting.
+func (t *Task) Started() bool { return t.StartedAt != nil }
+
+// StartedBy values that mean "no worker presented a dispatch token": the
+// first-activity fallback of a plugin that doesn't claim, and the backfill
+// of tickets that were in flight when AMP #2801 landed. A run started this
+// way is closed by its own completion (see TaskActor.handleComplete).
+const (
+	StartedByInferred = "inferred"
+	StartedByBackfill = "backfill"
+	// StartedByCloseout marks a closeout of a ticket nobody had started.
+	StartedByCloseout = "closeout"
+)
+
+// InferredStart reports whether a ticket's start came from the fallback
+// rather than a claim: no worker holds its dispatch token.
+func InferredStart(startedBy string) bool {
+	return startedBy == StartedByInferred || startedBy == StartedByBackfill
+}
+
+// CompleteIsCloseout reports whether a completion that presents dispatchID
+// is a closeout: the caller isn't the ticket's worker (AMP #2801).
+//
+// Three cases aren't:
+//   - the caller presented the current token: it is the worker;
+//   - a ticket started by the fallback (or the backfill): nobody there
+//     presented a token, because its plugin doesn't claim, and this
+//     completion is the end of the run that its first activity started;
+//   - a dispatched ticket nobody has started yet: the completion is itself
+//     that fallback start (an old plugin whose only write is the completion),
+//     not somebody closing a ticket that wasn't theirs.
+//
+// Everything else is: a done ticket with no current token on it is being
+// closed by someone other than its worker, mostly from ready (the
+// #2473/#2494 pattern) or after its worker's run died.
+func (t *Task) CompleteIsCloseout(dispatchID string) bool {
+	if t.IsHuman() || t.CurrentDispatch(dispatchID) || InferredStart(t.StartedBy) {
+		return false
+	}
+	if t.State != TaskStateInProgress {
+		return true
+	}
+	return t.StartedAt != nil
+}
+
+// CurrentDispatch reports whether id is the ticket's current dispatch token.
+// An empty id never matches: a caller that presents none is a closeout.
+func (t *Task) CurrentDispatch(id string) bool { return id != "" && id == t.DispatchID }
+
+// WithPhase returns a copy of t with Phase filled in, for a read.
+func (t Task) WithPhase() Task {
+	t.Phase = PhaseOf(t.State, t.StartedAt)
+	return t
 }
 
 // Merge states (Task.MergeState).
