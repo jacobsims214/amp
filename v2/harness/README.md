@@ -1439,8 +1439,12 @@ call and returns the worker's final message, outcome, usage and where its work i
    worktree|folder|shared <path>` and `git: yes` (commit on your branch), `git: none` or `git: not
    yours here` (don't commit, branch, push or open a pull request; list the files you made in the
    completion comment).
-5. It runs until it stops, hits the timeout or the turn budget, or is cancelled (the manager's run
-   was aborted). Ending a worker early aborts its in-flight tools.
+5. **Before the worker's first turn, the harness starts the ticket for it** (#2802, below): the
+   dispatch result carries a `dispatch_id`, and the harness calls `amp_claim_task(task_id,
+   dispatch_id)` itself once the worker exists.
+6. It runs until it stops, hits the timeout or the turn budget, or is cancelled (the manager's run
+   was aborted). Ending a worker early aborts its in-flight tools. Every end that doesn't close the
+   ticket hands it back (#2802, below).
 
 Limits, in `~/.config/amp-harness/config.toml` or the environment (env wins):
 
@@ -1482,6 +1486,67 @@ chat starts and only from your user config (a repo's `.amp/harness/config.toml` 
 
 User guide: `v2/kb/harness/git-and-the-harness.md`.
 
+### Dispatch integrity: the harness starts the ticket, and never leaves one in progress (#2802)
+
+AMP #2801 made a dispatched ticket `in_progress` with `started_at` NULL until a worker claims it,
+gave `amp_dispatch_task` a `dispatch_id`, and made a returned ticket show under the manager's
+`returned` list. Since it is the harness, not a model, that puts a worker behind a ticket, the
+harness keeps the other half:
+
+- **Start = the harness's claim.** `amp_claim_task(task_id, dispatch_id)` is called by the
+  supervisor, not by the worker model, at the point where the worker exists and is about to prompt
+  (worktree built, harness built). That is the robust choice of the two the ticket offered: the
+  moment is the harness's own, no model turn can be lost between dispatch and start, a worker that
+  never gets built leaves a ticket AMP can still *return* (`amp_return_task` refuses a started
+  one), and the claim is idempotent, so a worker that calls it too just sees `already_started`. A
+  claim AMP refuses (a stale token: the ticket was returned and dispatched again) ends the run as
+  an error with zero model turns instead of working a dispatch that is no longer current.
+- **The `dispatch_id` travels with the worker.** It is in the worker's `<amp_context>` and prompt,
+  and the harness fills it into the worker's own `amp_complete_task` / `amp_block_task` when the
+  model leaves it out (exactly as it fills the usage and git fields). A completion with it is the
+  worker's own; without it AMP records a closeout.
+- **Every end that doesn't close the ticket hands it back.** Error, timeout, turn budget, stopped,
+  cancelled: the harness reports the run (`amp_report_run`, `abandoned: <reason>`) and then returns
+  the ticket, so nothing stays in progress with nobody on it. The order is AMP's own:
+  `amp_return_task(task_id, reason)` first — it clears the dispatch and records
+  `returned_at`/`returned_reason`, which is what the manager's `returned` list and the ticket's
+  history read. AMP refuses it on a *started* ticket (it will not pull a live run out from under
+  its worker), and a worker that got to its first turn has started one: then the harness uses
+  `amp_set_task_state(task_id, state="backlog", reason=…)`, the manager's documented escape hatch
+  and the same call the #2204 cancellation path has always used. The run's notes name both calls,
+  so the fallback is visible rather than silent. Neither path ever marks a failed run completed.
+- **The manager is told, in words.** Every hand-back adds a line to the run's notes — which is
+  `amp_run_ticket`'s result, the manager's own conversation — naming the ticket, the agent, what
+  happened and the next step (`#123 was returned: worker amp:amp-worker-backend timed out after 20
+  min. It's back in ready; re-dispatch it or ask your user.`), plus the machine-readable
+  `returned` field. The `/workers` panel shows `ticket returned to ready` under the finished
+  worker, or `ticket NOT returned: <why>`. It is deliberately not also a transcript paragraph per
+  run: the `■ worker finished` line already marks the run, and the duplicate pushed the
+  conversation off an 80x24 screen (#2347's chat).
+- **A startup sweep is said out loud.** An orphan has no run to carry its note, so each one it
+  hands back is a line in the transcript, with what to do next (a `returned to ready` notice, or an
+  error naming AMP's refusal).
+- **Startup releases what a dead chat left.** Every dispatch is recorded in
+  `~/.local/state/amp-harness/dispatches/t<ticket>.json`, and each harness process holds
+  `live-<pid>.lock` for its whole life (the OS releases it however the process ends). At startup
+  the chat hands back every record whose process is gone — the chat crashed, was killed, or the
+  machine rebooted — with a reason naming what happened, and tells the person. A record AMP won't
+  take back (the ticket moved on) is dropped, or kept for the next startup when AMP says it may
+  still be in progress. This covers the case AMP's own watchdog cannot: the watchdog only returns
+  tickets nobody *started*, and a crashed chat's ticket was started.
+- **`amp_dispatch_task` stays denied to the built-in manager** (its `permission` list). The
+  harness dispatches through `amp_run_ticket`, which is the atomic dispatch-and-spawn. A role
+  override (your `~/.config/amp-harness/agents/`, or a repo's `.amp/harness/agents/`) can drop that
+  deny; the harness then still handles what happens — the raw dispatch result carries
+  `worker_prompt` and `next` for the model to launch a worker with, and running that ticket with
+  `amp_run_ticket` claims and closes it like any other. `doctor` reports a manager whose role file
+  no longer denies `amp_dispatch_task`.
+
+`amp_claim_task` is in the harness's contract tools (`CONTRACT_TOOLS`), so `doctor` says when an
+AMP server is too old for it. A server without `dispatch_id` is still supported: the claim is
+skipped, the worker's first write starts the ticket by AMP's fallback, and the completion carries
+no token.
+
 ## Run reporting (M2-6)
 
 AMP reports token spend per ticket and traces code to tickets from the run fields on
@@ -1497,7 +1562,8 @@ them in for every worker it dispatches:
 - A worker that ends without closing its ticket (error, timeout, cancel, turn budget, stopped for
   repeating one tool call, or it just stopped) is reported with `amp_report_run`, outcome `abandoned` and a note
   `abandoned: <reason>`, with the same usage and git fields, so the board shows the run and its
-  tokens.
+  tokens. Its ticket is then handed back to ready (see "Dispatch integrity" above), and the person
+  at the chat is told in one line.
 - Only numbers the provider reported are sent: no token fields without usage, and no `cost_usd` when
   the cost is 0 (a model without prices in models.toml, or the faux provider).
 - Every session also has a native `amp_session_usage` tool (the session's model, tokens and cost so

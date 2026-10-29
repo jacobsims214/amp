@@ -320,6 +320,15 @@ impl Drop for Chat {
     }
 }
 
+/// The calls that took a ticket out of progress, either path (AMP #2802): `amp_return_task` is
+/// the returned path the harness prefers, `amp_set_task_state` the fallback for a ticket AMP
+/// refuses to return because it was started.
+fn handed_back(amp: &common::Running) -> Vec<serde_json::Value> {
+    let mut all = amp.mock.calls_to("amp_return_task");
+    all.extend(amp.mock.calls_to("amp_set_task_state"));
+    all
+}
+
 fn dump(title: &str, screen: &Screen) {
     if std::env::var_os("AMP_TEST_DUMP").is_some() {
         eprintln!(
@@ -712,7 +721,7 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
     assert!(t.contains("AMP · workers"), "the panel stays open: {t}");
     assert!(!t.contains("stop the worker on"), "x asked nothing: {t}");
     assert!(!opened.exists(), "o opened nothing: {t}");
-    assert!(amp.mock.calls_to("amp_set_task_state").is_empty(), "{t}");
+    assert!(handed_back(&amp).is_empty(), "{t}");
     assert!(s.text().contains("2 running"), "{}", s.text());
 
     // Ctrl+G opens the selected row's ticket in AMP, whatever the editor holds.
@@ -748,7 +757,7 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
     dump("stop question in the workers panel", &s);
     chat.send(b"y");
     let deadline = Instant::now() + Duration::from_secs(20);
-    while amp.mock.calls_to("amp_set_task_state").is_empty() {
+    while handed_back(&amp).is_empty() {
         assert!(
             Instant::now() < deadline,
             "y stopped nothing:\n{}",
@@ -756,7 +765,10 @@ async fn typing_with_the_workers_panel_open_goes_to_the_editor() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    let states = amp.mock.calls_to("amp_set_task_state");
+    // AMP #2802: a stopped worker's ticket goes back through `amp_return_task` (the returned
+    // path); `amp_set_task_state` is only the fallback for a ticket AMP won't return. What
+    // matters here is that the ticket is out of progress, once.
+    let states = handed_back(&amp);
     assert_eq!(states.len(), 1, "{states:?}");
     assert_eq!(states[0]["task_id"], json!(id), "{states:?}");
     let s = chat.screen();

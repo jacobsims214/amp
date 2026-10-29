@@ -65,6 +65,10 @@
 //! - [`mcp_stdio`]: a resolved stdio server as an [`amp_mcp::StdioSpec`]: the D7 child environment
 //!   (the bash scrub of #2142 plus the server's own env and keychain secrets), cwd, stderr log.
 //!
+//! AMP #2802 (story 444, dispatch integrity):
+//! - [`dispatch_ledger`]: the tickets this machine dispatched, with a per-process liveness lock,
+//!   so a chat that dies is noticed and its tickets are handed back at the next startup.
+//!
 //! #2364:
 //! - [`workspace`]: `[workers] isolation` (auto | worktree | folder | shared) and what git offers
 //!   the manager's folder: git worktrees in a usable repository, a folder per ticket outside git.
@@ -89,6 +93,7 @@ pub mod approval_wait;
 pub mod assets;
 pub mod chat_event;
 pub mod config_check;
+pub mod dispatch_ledger;
 pub mod events;
 pub mod faux;
 pub mod links;

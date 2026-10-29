@@ -4063,6 +4063,7 @@ impl Shell {
                     context_tokens: i.totals.context_tokens,
                     context_window: window,
                     branch: i.branch.clone(),
+                    returned: i.returned.clone(),
                     viewable: true,
                     local: true,
                     ..WorkerEntry::default()
