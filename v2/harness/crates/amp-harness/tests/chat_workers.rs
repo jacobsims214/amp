@@ -296,6 +296,16 @@ impl Rig {
             .collect()
     }
 
+    /// The calls that took `task` out of progress, either path (AMP #2802): `amp_return_task` is
+    /// the returned path the harness prefers, `amp_set_task_state` the fallback for a ticket AMP
+    /// refuses to return because it was started. What these tests care about is that the ticket
+    /// is out of progress, once, with the right reason.
+    fn handed_back(&self, task: i64) -> Vec<Value> {
+        let mut all = self.calls("amp_return_task", task);
+        all.extend(self.calls("amp_set_task_state", task));
+        all
+    }
+
     /// Whether `task`'s worker has started its run and its first bash call (the `sleep 30`).
     fn in_bash(&self, task: i64) -> bool {
         self.sup.feed(task).is_some_and(|feed| {
@@ -412,9 +422,12 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
         note.contains(&format!("stopped by {PERSON} from the chat")),
         "{note}"
     );
-    let released = r.calls("amp_set_task_state", A);
+    let released = r.handed_back(A);
     assert_eq!(released.len(), 1, "{released:?}");
-    assert_eq!(released[0]["state"], "backlog");
+    // `amp_set_task_state` (the fallback) takes the state as an argument.
+    if !released[0]["state"].is_null() {
+        assert_eq!(released[0]["state"], "backlog", "{}", released[0]);
+    }
     assert!(
         released[0]["reason"]
             .as_str()
@@ -507,7 +520,7 @@ async fn open_follow_switch_stop_and_read_a_finished_worker() {
     assert_eq!(r.shell.stop_pending(), Some(B));
     assert!(r.press(KeyCode::Enter).await, "Enter confirms too");
     r.until("B to finish", |r| r.finished(B)).await;
-    assert_eq!(r.calls("amp_set_task_state", B).len(), 1);
+    assert_eq!(r.handed_back(B).len(), 1);
 
     // Both results went back to the manager, which was told who stopped them.
     r.until("the manager's reply", |r| !r.shell.is_running())

@@ -1384,6 +1384,12 @@ fn roster_rows(data: &ChromeData, p: &AmpPalette) -> Vec<Row> {
         if let Some(b) = e.branch.as_deref().filter(|b| !b.is_empty()) {
             detail.push(format!("branch {}", clean(b)));
         }
+        // AMP #2802: where the worker's ticket went once its run ended without closing it.
+        match &e.returned {
+            Some(Ok(())) => detail.push("ticket returned to ready".to_owned()),
+            Some(Err(why)) => detail.push(format!("ticket NOT returned: {}", clean(why))),
+            None => {}
+        }
         if !e.waiting_on.is_empty() {
             let ids: Vec<String> = e.waiting_on.iter().map(|id| format!("#{id}")).collect();
             detail.push(format!("waits on {}", ids.join(", ")));

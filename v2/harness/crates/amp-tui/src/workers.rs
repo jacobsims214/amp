@@ -393,6 +393,7 @@ mod tests {
             outcome,
             error: None,
             stopped_by: by.map(str::to_owned),
+            returned: None,
             session_file: None,
             branch: None,
             context_window: None,

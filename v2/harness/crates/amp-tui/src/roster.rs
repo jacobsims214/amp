@@ -83,6 +83,9 @@ pub struct WorkerEntry {
     /// `Some`: the usage is AMP's record of the last run, made then (a worker elsewhere); `None`:
     /// live from this process.
     pub usage_recorded: Option<SystemTime>,
+    /// What handing its ticket back did (`None`: it closed the ticket, or nothing was reported).
+    /// AMP #2802: the `/workers` panel says `ticket returned to ready`, or why it wasn't.
+    pub returned: Option<Result<(), String>>,
     /// Whether its session can be opened here (a worker of this chat, or a session file).
     pub viewable: bool,
     /// A worker of this chat.

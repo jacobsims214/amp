@@ -33,7 +33,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -54,6 +54,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent::{AgentSpec, Runtime, SessionKind},
+    dispatch_ledger::{DispatchRecord, Ledger},
     events::{RunEvent, Totals, assistant_text},
     policy::DISPATCH_TOOL,
     project::ProjectMarker,
@@ -67,6 +68,20 @@ use crate::{
 /// ticket ended abnormally (D8).
 pub const COMPLETE_TOOL: &str = "amp_complete_task";
 pub const BLOCK_TOOL: &str = "amp_block_task";
+/// The tool a worker starts its ticket with (AMP #2801, #2802).
+pub const CLAIM_TOOL: &str = "amp_claim_task";
+/// The tool that hands a dispatched ticket back to ready (AMP #2801); refused once it is started.
+pub const RETURN_TOOL: &str = "amp_return_task";
+/// The manager's escape hatch back to ready, used when a ticket cannot be returned (it was
+/// started, so `amp_return_task` refuses it).
+pub const SET_STATE_TOOL: &str = "amp_set_task_state";
+/// The AMP state "ready" is stored as (AMP keeps it blocked while a dependency is open).
+pub const READY_STATE: &str = "backlog";
+/// How long the harness's own claim may take before the run gives up (one AMP call, made before
+/// the worker's first turn).
+pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long handing tickets back at startup may take.
+pub const ORPHAN_RELEASE_TIMEOUT: Duration = Duration::from_secs(20);
 /// `config.toml` table with the supervisor's settings.
 pub const CONFIG_TABLE: &str = "workers";
 
@@ -267,6 +282,100 @@ impl WorkerOutcome {
     }
 }
 
+/// What `amp_dispatch_task` answered (AMP #2801's result, read for what the harness needs).
+/// Every field is optional: an older AMP returns only `task_id` and `dispatched_to`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct DispatchResult {
+    #[serde(default)]
+    pub task_id: i64,
+    /// The agent AMP recorded (AMP's own answer, not what we asked for).
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    #[serde(default)]
+    pub dispatched_to: Option<String>,
+    /// The token the worker presents to start and to close the ticket; empty on an old server.
+    #[serde(default)]
+    pub dispatch_id: String,
+    /// `backlog`, `in_progress`, ... as AMP recorded it.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// `not_started` | `started`.
+    #[serde(default)]
+    pub phase: Option<String>,
+    /// When AMP returns it if nobody starts it (RFC3339), when the watchdog is on.
+    #[serde(default)]
+    pub start_by: Option<String>,
+    /// A ready-made prompt for the worker subagent, when the server sends one.
+    #[serde(default)]
+    pub worker_prompt: Option<String>,
+    /// What the dispatching model is told to do next (AMP #2801).
+    #[serde(default)]
+    pub next: Option<String>,
+    /// The project's flag timeout in minutes, omitted when 0 (off).
+    #[serde(default)]
+    pub flag_after_minutes: Option<i64>,
+}
+
+impl DispatchResult {
+    /// The agent AMP says this dispatch is for.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent_id
+            .as_deref()
+            .or(self.dispatched_to.as_deref())
+            .filter(|a| !a.is_empty())
+    }
+}
+
+/// What [`Supervisor::release_orphans`] did with one ticket a dead process left dispatched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanRelease {
+    pub record: DispatchRecord,
+    /// `Ok`: AMP has the ticket back in ready. `Err`: AMP refused, and why.
+    pub result: Result<(), String>,
+}
+
+impl OrphanRelease {
+    /// What the person is told, in one line.
+    pub fn notice(&self) -> String {
+        orphan_notice(&self.record, &self.result)
+    }
+}
+
+/// The reason an orphaned ticket is handed back with: it names the ticket, the agent and what
+/// happened, so the history reads as the incident it was.
+pub fn orphan_reason(rec: &DispatchRecord) -> String {
+    format!(
+        "the chat that dispatched it to {} is gone (harness process {} ended with it in progress)",
+        rec.agent_id, rec.pid
+    )
+}
+
+/// The line the person at the chat is shown for an orphaned ticket, whatever the outcome.
+pub fn orphan_notice(rec: &DispatchRecord, result: &Result<(), String>) -> String {
+    match result {
+        Ok(()) => format!(
+            "#{0} was returned to ready: the chat that dispatched it to {1} ended before its worker \
+             finished. Re-dispatch it, or ask your user.",
+            rec.task_id, rec.agent_id
+        ),
+        Err(e) => format!(
+            "#{0} was dispatched to {1} by a chat that ended before its worker finished, and AMP \
+             would not take it back: {2}. It may still be in progress; check the ticket.",
+            rec.task_id, rec.agent_id, e
+        ),
+    }
+}
+
+/// Whether AMP's refusal means the record is spent and can be dropped: the ticket isn't in
+/// progress any more (completed or blocked by someone since), so there is nothing to hand back.
+fn record_is_stale(err: &Result<(), String>) -> bool {
+    let Err(e) = err else {
+        return false;
+    };
+    let e = e.to_ascii_lowercase();
+    e.contains("not in progress") || e.contains("not found") || e.contains("unknown task")
+}
+
 /// What a worker is, known before it starts (hooks get this).
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerInfo {
@@ -275,6 +384,10 @@ pub struct WorkerInfo {
     pub agent_id: String,
     /// The role id: `amp-worker-backend`.
     pub role: String,
+    /// The dispatch token AMP gave this worker (AMP #2801/#2802): what starts the ticket and what
+    /// makes its completion the worker's own rather than a closeout. Empty on a server without
+    /// one.
+    pub dispatch_id: String,
     /// `provider/model`.
     pub model: String,
     pub cwd: PathBuf,
@@ -302,6 +415,20 @@ pub struct WorkerReport {
     pub agent_id: String,
     pub role: String,
     pub outcome: WorkerOutcome,
+    /// The dispatch token this run worked under (AMP #2801/#2802); empty on an old server.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dispatch_id: String,
+    /// Whether the ticket was started for this run (the harness claimed it, or AMP's fallback did
+    /// on the worker's first write). A worker that ended before that leaves a ticket AMP can still
+    /// *return* rather than one that has to be set back by hand.
+    #[serde(default)]
+    pub started: bool,
+    /// What handing the ticket back did, once run reporting tried: `Some(Ok(()))` when AMP has it
+    /// back in ready, `Some(Err(why))` when AMP refused. `None` when the worker closed its ticket
+    /// (nothing to hand back) or no run reporting is in this process (AMP #2802). The `/workers`
+    /// panel shows it, so a person looking at a finished worker sees where its ticket went.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub returned: Option<Result<(), String>>,
     /// The worker's last assistant text.
     pub final_message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -355,6 +482,12 @@ pub trait WorkerHooks: Send + Sync {
     async fn release(&self, _task_id: i64, _why: &str) -> Result<(), String> {
         Err("no run reporting in this process".to_owned())
     }
+
+    /// Tells the person at the manager's chat something the harness noticed about a ticket, above
+    /// the editor (`⚠ #123 was returned: worker amp-x timed out after 20 min`). The default does
+    /// nothing; a process with a chat prints it. AMP #2802: a returned ticket whose manager was
+    /// never told is the bug this whole ticket exists to fix.
+    fn notice(&self, _text: &str) {}
 }
 
 /// Why `amp_run_ticket` refused or failed before a worker was dispatched.
@@ -417,6 +550,9 @@ pub struct WorkerSessionInfo {
     pub error: Option<String>,
     /// Who stopped it from the chat, once someone has asked it to stop.
     pub stopped_by: Option<String>,
+    /// What handing its ticket back did (`None`: it closed the ticket, or nothing was reported).
+    /// The `/workers` panel says so under the finished worker (AMP #2802).
+    pub returned: Option<Result<(), String>>,
     pub session_file: Option<PathBuf>,
     /// The worktree's branch, once the worker has one (#2347).
     pub branch: Option<String>,
@@ -505,6 +641,9 @@ pub struct Supervisor {
     /// Held by a worker that edits files in the manager's own folder under `isolation =
     /// "shared"`, so two of them never write there at once (#2364).
     writer: Arc<tokio::sync::Mutex<()>>,
+    /// The tickets this machine dispatched (AMP #2802): what the next startup hands back if this
+    /// process dies with one in progress.
+    ledger: Arc<Ledger>,
 }
 
 impl std::fmt::Debug for Supervisor {
@@ -527,6 +666,19 @@ impl Supervisor {
         config: SupervisorConfig,
         hooks: Option<Arc<dyn WorkerHooks>>,
     ) -> Arc<Self> {
+        let ledger = Arc::new(Ledger::open(&rt.state_dir));
+        Self::with_hooks_and_ledger(rt, manager, config, hooks, ledger)
+    }
+
+    /// [`Supervisor::with_hooks`] on a ledger the caller made (one per process, so every chat of
+    /// it shares the liveness lock and the records).
+    pub fn with_hooks_and_ledger(
+        rt: Arc<Runtime>,
+        manager: ManagerContext,
+        config: SupervisorConfig,
+        hooks: Option<Arc<dyn WorkerHooks>>,
+        ledger: Arc<Ledger>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             slots: Arc::new(Semaphore::new(config.max_parallel.max(1))),
             rt,
@@ -541,7 +693,13 @@ impl Supervisor {
             peak: AtomicUsize::new(0),
             git_lock: tokio::sync::Mutex::new(()),
             writer: Arc::new(tokio::sync::Mutex::new(())),
+            ledger,
         })
+    }
+
+    /// The dispatch ledger this supervisor shares.
+    pub fn ledger(&self) -> &Arc<Ledger> {
+        &self.ledger
     }
 
     pub fn config(&self) -> &SupervisorConfig {
@@ -570,6 +728,37 @@ impl Supervisor {
     /// Cancels every queued and running worker (the TUI's Ctrl-C, or shutdown).
     pub fn cancel_all(&self) {
         self.cancel.cancel();
+    }
+
+    /// Starts ticket `task_id` in AMP on `agent_id`'s behalf with `dispatch_id`, the token
+    /// `amp_dispatch_task` gave it (AMP #2802). This is the option the ticket asks for: the
+    /// harness claims for its worker, right before the worker's first turn, rather than trusting
+    /// the model to make `amp_claim_task` its first call.
+    ///
+    /// Why here: the harness controls this point exactly (the worker exists, its worktree and
+    /// harness are built, it is about to prompt), a worker that never gets this far is still
+    /// *returnable* by AMP (`amp_return_task` only refuses a started ticket), and the claim is
+    /// idempotent (`already_started`), so nothing breaks if the worker also calls it.
+    async fn claim_for_worker(
+        &self,
+        task_id: i64,
+        dispatch_id: &str,
+        agent_id: &str,
+    ) -> Result<(), String> {
+        let Value::Object(args) = json!({"task_id": task_id, "dispatch_id": dispatch_id}) else {
+            unreachable!()
+        };
+        let out = self
+            .rt
+            .mcp
+            .call_tool_with_timeout(CLAIM_TOOL, Some(args), CLAIM_TIMEOUT)
+            .await
+            .map_err(|e| e.to_string())?;
+        if out.is_error == Some(true) {
+            return Err(crate::tools::result_text(&out).trim().to_owned());
+        }
+        tracing::debug!(ticket = task_id, agent = agent_id, "started the ticket");
+        Ok(())
     }
 
     /// Live workers, by ticket.
@@ -650,6 +839,49 @@ impl Supervisor {
         }
         out.sort_by_key(|(id, _)| *id);
         out
+    }
+
+    /// Releases the tickets this machine dispatched whose harness process is gone (AMP #2802):
+    /// the chat crashed, was killed, or the machine rebooted between a dispatch and its worker
+    /// closing the ticket. Called once at startup, before any worker runs.
+    ///
+    /// Each orphan is handed back with the reason naming what happened, and every outcome is told
+    /// to the person through [`WorkerHooks::notice`] — a ticket silently reset is almost as bad
+    /// as one stuck in progress. A record whose ticket AMP won't take back (already completed,
+    /// someone else's run since) is dropped only when AMP says it isn't in progress any more;
+    /// otherwise it is kept, so the next startup tries again.
+    pub async fn release_orphans(&self) -> Vec<OrphanRelease> {
+        let orphans = self.ledger.orphans();
+        if orphans.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for rec in orphans {
+            let why = orphan_reason(&rec);
+            let result = match self.hooks.clone() {
+                Some(hooks) => hooks.release(rec.task_id, &why).await,
+                None => Err("no run reporting in this process".to_owned()),
+            };
+            if result.is_ok() || record_is_stale(&result) {
+                self.ledger.clear(rec.task_id);
+            }
+            if let Some(hooks) = &self.hooks {
+                hooks.notice(&orphan_notice(&rec, &result));
+            }
+            out.push(OrphanRelease {
+                record: rec,
+                result,
+            });
+        }
+        out
+    }
+
+    /// Releases the tickets this machine dispatched whose harness process is gone, within `bound`.
+    /// `release_orphans` with a deadline, for a startup that must not hang on AMP.
+    pub async fn release_orphans_within(&self, bound: Duration) -> Vec<OrphanRelease> {
+        tokio::time::timeout(bound, self.release_orphans())
+            .await
+            .unwrap_or_default()
     }
 
     /// The most workers that ran at the same time.
@@ -756,6 +988,7 @@ impl Supervisor {
             outcome: Some(report.outcome),
             error: report.error.clone(),
             stopped_by,
+            returned: report.returned.clone(),
             session_file: report.session_file.clone(),
             branch: report.branch.clone(),
             context_window,
@@ -866,7 +1099,7 @@ impl Supervisor {
         let role = self.resolve_role(&req.agent_id)?;
         let agent_id = format!("amp:{}", role.id);
         let _guard = self.claim(req.task_id, &agent_id)?;
-        let (stop, stopped_by) = self.stop_handle(req.task_id);
+        let stops = self.stop_handle(req.task_id, signal.clone());
 
         // #2364: where it will work, decided before anything happens in AMP.
         let edits = role.tool_policy(&self.manager.cwd).exposes("edit");
@@ -891,8 +1124,8 @@ impl Supervisor {
                 biased;
                 _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
                 _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
-                _ = stop.cancelled() => {
-                    let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+                _ = stops.stop.cancelled() => {
+                    let by = stops.stopped_by.lock().unwrap().clone().unwrap_or_default();
                     return Err(RunTicketError::Stopped { task_id: req.task_id, by });
                 }
                 g = Arc::clone(&self.writer).lock_owned() => g,
@@ -906,15 +1139,15 @@ impl Supervisor {
             biased;
             _ = signal.cancelled() => return Err(RunTicketError::Cancelled),
             _ = self.cancel.cancelled() => return Err(RunTicketError::Cancelled),
-            _ = stop.cancelled() => {
-                let by = stopped_by.lock().unwrap().clone().unwrap_or_default();
+            _ = stops.stop.cancelled() => {
+                let by = stops.stopped_by.lock().unwrap().clone().unwrap_or_default();
                 return Err(RunTicketError::Stopped { task_id: req.task_id, by });
             }
             p = Arc::clone(&self.slots).acquire_owned() => p.map_err(|_| RunTicketError::Cancelled)?,
         };
         let _running = Running::start(self);
 
-        call_json(
+        let dispatched = call_json(
             &self.rt.mcp,
             "amp_dispatch_task",
             json!({"task_id": req.task_id, "agent_id": agent_id}),
@@ -938,26 +1171,51 @@ impl Supervisor {
         if let Some(w) = self.live.lock().unwrap().get_mut(&req.task_id) {
             w.dispatched = true;
         }
+        // AMP #2801's result says what the dispatch gave us: the token the worker presents to
+        // start and close the ticket, and the agent AMP recorded. An older server sends neither;
+        // then the worker starts by fallback (its first write) exactly as before.
+        let dispatched =
+            serde_json::from_value::<DispatchResult>(dispatched).unwrap_or_else(|_| {
+                DispatchResult {
+                    task_id: req.task_id,
+                    ..DispatchResult::default()
+                }
+            });
+        let dispatch = Dispatch::new(&dispatched.dispatch_id);
+        // The ledger is what the next startup sweeps: this ticket is ours from here until its
+        // worker closes it or it is handed back.
+        if let Err(e) = self.ledger.record(
+            req.task_id,
+            &dispatched.dispatch_id,
+            dispatched.agent().unwrap_or(&agent_id),
+        ) {
+            tracing::warn!(ticket = req.task_id, error = %e, "could not record the dispatch");
+        }
 
         let report = self
             .run_dispatched(
                 &req,
                 &role,
                 &agent_id,
+                &dispatch,
                 Where { repo, place, edits },
-                signal,
-                (stop, stopped_by),
+                stops,
             )
             .await;
         drop(permit);
         Ok(report)
     }
 
-    fn stop_handle(&self, task_id: i64) -> (CancellationToken, Arc<Mutex<Option<String>>>) {
+    fn stop_handle(&self, task_id: i64, signal: CancellationToken) -> StopHandle {
         let live = self.live.lock().unwrap();
-        match live.get(&task_id) {
+        let (stop, stopped_by) = match live.get(&task_id) {
             Some(w) => (w.stop.clone(), Arc::clone(&w.stopped_by)),
             None => (CancellationToken::new(), Arc::default()),
+        };
+        StopHandle {
+            signal,
+            stop,
+            stopped_by,
         }
     }
 
@@ -992,10 +1250,15 @@ impl Supervisor {
         req: &RunRequest,
         role: &Role,
         agent_id: &str,
+        dispatch: &Dispatch,
         at: Where,
-        signal: CancellationToken,
-        (stop, stopped_by): (CancellationToken, Arc<Mutex<Option<String>>>),
+        stops: StopHandle,
     ) -> WorkerReport {
+        let StopHandle {
+            signal,
+            stop,
+            stopped_by,
+        } = stops;
         let started = Instant::now();
         let feed = self
             .live
@@ -1018,6 +1281,7 @@ impl Supervisor {
             task_id: req.task_id,
             agent_id: agent_id.to_owned(),
             role: role.id.clone(),
+            dispatch_id: dispatch.id.clone(),
             model,
             cwd: self.manager.cwd.clone(),
             worktree: None,
@@ -1048,6 +1312,7 @@ impl Supervisor {
                             started,
                             notes,
                             Finish::error(format!("worktree: {e}")),
+                            dispatch,
                         )
                         .await;
                 }
@@ -1066,7 +1331,13 @@ impl Supervisor {
                 }
                 Err(e) => {
                     return self
-                        .finish(&info, started, notes, Finish::error(format!("folder: {e}")))
+                        .finish(
+                            &info,
+                            started,
+                            notes,
+                            Finish::error(format!("folder: {e}")),
+                            dispatch,
+                        )
                         .await;
                 }
             },
@@ -1134,6 +1405,7 @@ impl Supervisor {
                         started,
                         notes,
                         Finish::error(format!("build the worker: {e}")),
+                        dispatch,
                     )
                     .await;
             }
@@ -1141,6 +1413,41 @@ impl Supervisor {
         info.model = built.resolved.model_ref();
         let session_file = built.session_file.clone();
         let harness = Arc::clone(&built.harness);
+        // AMP #2802: the ticket is started by the harness, on its worker's behalf, at the moment
+        // the worker actually exists and is about to run its first turn. Not by the model's first
+        // tool call (a model that never makes one would leave the ticket unstarted and let AMP's
+        // watchdog return it under a live worker), and not before the worker is built (a build
+        // failure must leave the ticket *returnable*: AMP returns a dispatched-but-unstarted
+        // ticket and refuses a started one). The claim is idempotent and posts "{agent} picked
+        // this up" on the ticket, which is what makes the run visible on the board.
+        if !dispatch.id.is_empty() {
+            match self
+                .claim_for_worker(req.task_id, &dispatch.id, agent_id)
+                .await
+            {
+                Ok(()) => {
+                    dispatch.claimed.store(true, Ordering::SeqCst);
+                    notes.push(format!(
+                        "started #{0} in AMP (amp_claim_task with its dispatch_id)",
+                        req.task_id
+                    ));
+                }
+                Err(e) => {
+                    // A stale token means this dispatch is over (AMP returned the ticket and
+                    // dispatched it again): the run must not go on as if it held the ticket.
+                    notes.push(format!("could not start #{0} in AMP: {e}", req.task_id));
+                    return self
+                        .finish(
+                            &info,
+                            started,
+                            notes,
+                            Finish::error(format!("the claim was refused: {e}")),
+                            dispatch,
+                        )
+                        .await;
+                }
+            }
+        }
         let prompt = worker_prompt(&info, req, self.project().as_ref());
         // The chat's session view starts with the prompt (#2252); rpi doesn't emit it.
         watch.feed.push(&AgentEvent::MessageStart {
@@ -1207,7 +1514,7 @@ impl Supervisor {
                     ));
                 }
                 let finish = finish.after_closing(closed, &mut notes);
-                return self.finish(&info, started, notes, finish).await;
+                return self.finish(&info, started, notes, finish, dispatch).await;
             }
         };
 
@@ -1268,7 +1575,7 @@ impl Supervisor {
         }
         finish.session_file = session_file;
         let finish = finish.after_closing(closed, &mut notes);
-        self.finish(&info, started, notes, finish).await
+        self.finish(&info, started, notes, finish, dispatch).await
     }
 
     async fn finish(
@@ -1277,6 +1584,7 @@ impl Supervisor {
         started: Instant,
         notes: Vec<String>,
         finish: Finish,
+        dispatch: &Dispatch,
     ) -> WorkerReport {
         let totals = info.totals.lock().unwrap().clone();
         let mut report = WorkerReport {
@@ -1284,6 +1592,9 @@ impl Supervisor {
             agent_id: info.agent_id.clone(),
             role: info.role.clone(),
             outcome: finish.outcome,
+            dispatch_id: dispatch.id.clone(),
+            started: dispatch.started(),
+            returned: None,
             final_message: finish.text,
             error: finish.error,
             model: info.model.clone(),
@@ -1400,12 +1711,47 @@ impl Supervisor {
 }
 
 /// Where run_ticket decided the worker works (#2364).
+/// How a run can be stopped: the manager's run being cancelled (`signal`), and the person asking
+/// this worker to stop (`stop`, with who asked in `stopped_by`). Passed as one thing — they are
+/// only ever used together, and separately they made `run_dispatched` a seven-argument function.
+#[derive(Clone)]
+struct StopHandle {
+    signal: CancellationToken,
+    stop: CancellationToken,
+    stopped_by: Arc<Mutex<Option<String>>>,
+}
+
 struct Where {
     repo: Repo,
     /// `None`: the manager's folder (read-only roles, or `worktree: false`).
     place: Option<Placement>,
     /// The role can edit files.
     edits: bool,
+}
+
+/// What a dispatch gave this run (AMP #2801/#2802): the token its worker starts and closes the
+/// ticket with. Empty on a server that doesn't issue tokens, which skips the claim and lets the
+/// worker's first write start the ticket (AMP's fallback).
+#[derive(Debug, Clone, Default)]
+struct Dispatch {
+    /// `d_…`.
+    id: String,
+    /// Whether the ticket was started for this run: the harness's claim, or AMP's fallback on the
+    /// worker's first write. Shared, because the worker's hooks see the same run.
+    claimed: Arc<AtomicBool>,
+}
+
+impl Dispatch {
+    fn new(id: &str) -> Self {
+        Self {
+            id: id.to_owned(),
+            claimed: Arc::default(),
+        }
+    }
+
+    fn started(&self) -> bool {
+        self.claimed.load(Ordering::SeqCst)
+    }
 }
 
 /// Creates (or reuses) the worker's own folder `<cwd>/amp-work/<task_id>` (#2364).
@@ -1600,6 +1946,7 @@ fn live_info(task_id: i64, w: &LiveWorker) -> WorkerSessionInfo {
         outcome: None,
         error: None,
         stopped_by: w.stopped_by.lock().unwrap().clone(),
+        returned: None,
         session_file: None,
         branch: w.branch.clone(),
         context_window: w.context_window,
@@ -1645,6 +1992,17 @@ fn worker_context(info: &WorkerInfo, manager: &str) -> String {
         format!("agent_id: {}", info.agent_id),
         format!("dispatched_by: {manager} (amp_run_ticket)"),
     ];
+    // AMP #2801/#2802: the token is what makes this run's completion the worker's own rather
+    // than a closeout. The harness already started the ticket with it and fills it into
+    // amp_complete_task/amp_block_task; saying so keeps the worker from passing something else.
+    if !info.dispatch_id.is_empty() {
+        lines.push(format!("dispatch_id: {}", info.dispatch_id));
+        lines.push(
+            "started: amp-harness called amp_claim_task for you with that dispatch_id; pass it on \
+             amp_complete_task and amp_block_task (the harness fills it in when you leave it out)"
+                .to_owned(),
+        );
+    }
     match (&info.worktree, &info.branch) {
         (Some(wt), branch) => {
             lines.push("workspace: worktree".to_owned());
@@ -1691,6 +2049,19 @@ fn worker_prompt(info: &WorkerInfo, req: &RunRequest, project: Option<&ProjectMa
             .map(|p| format!(" in project {}", p.project_id))
             .unwrap_or_default(),
     );
+    // AMP #2802 item 6: the dispatch result's own worker_prompt tells a worker to claim first.
+    // The harness has already claimed (it controls the moment the worker starts, so no model
+    // turn can be lost between the two), so the prompt says what is true rather than asking for
+    // a call that would only report already_started.
+    if !info.dispatch_id.is_empty() {
+        text.push_str(&format!(
+            "\n\nThe harness started this ticket for you (amp_claim_task with dispatch_id \
+             \"{}\"). Pass that dispatch_id to amp_complete_task and amp_block_task: it is what \
+             makes the completion yours rather than a closeout. The harness fills it in if you \
+             leave it out.",
+            info.dispatch_id
+        ));
+    }
     match (&info.worktree, &info.branch) {
         (Some(wt), Some(branch)) => text.push_str(&format!(
             "\n\nYour working directory is the git worktree {} on branch {branch}; commit your work there.",

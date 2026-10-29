@@ -247,6 +247,31 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
     shell.set_connect(crate::connect::ChatConnect::new(Arc::clone(&session.rt))?);
     // Quitting mid-dispatch cancels the manager's workers and waits for their run reports (D8).
     shell.set_supervisor(session.supervisor.clone());
+    // AMP #2802: a ticket that comes back (returned by this chat) is said to the person, above
+    // the editor, as well as to the manager.
+    if let Some(reporter) = &session.reporter {
+        let notes = shell.notifier();
+        reporter.set_notice(Arc::new(move |text: &str| notes.notice(text)));
+    }
+    // AMP #2802: tickets this machine dispatched whose chat is gone (it crashed, was killed, or
+    // the machine rebooted) are handed back now, before the manager's first turn: nothing is
+    // left in progress with nobody on it. Bounded, so a slow AMP can't hold the chat up.
+    if let Some(sup) = session.supervisor.clone() {
+        let notes = shell.notifier();
+        tokio::spawn(async move {
+            for release in sup
+                .release_orphans_within(amp_core::supervisor::ORPHAN_RELEASE_TIMEOUT)
+                .await
+            {
+                let text = release.notice();
+                if release.result.is_ok() {
+                    notes.notice(text);
+                } else {
+                    notes.error(text);
+                }
+            }
+        });
+    }
     let project_id = session.project.as_ref().map(|p| p.project_id);
     // #2356: `/project` says where a parent folder's marker is.
     let project_marker = session

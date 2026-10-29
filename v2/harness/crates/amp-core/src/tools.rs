@@ -20,6 +20,7 @@ pub const CONTRACT_TOOLS: &[&str] = &[
     "amp_get_plan",
     "amp_check_plan",
     "amp_dispatch_task",
+    "amp_claim_task",
     "amp_complete_task",
     "amp_block_task",
     "amp_report_run",

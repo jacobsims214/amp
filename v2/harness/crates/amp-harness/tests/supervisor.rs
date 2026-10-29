@@ -869,7 +869,10 @@ async fn workers_run_in_place_without_a_usable_repository_and_say_why() {
         r.worktree.as_deref(),
         Some(child.join(".worktrees/13").as_path())
     );
-    assert!(r.notes.is_empty(), "{r:?}");
+    // Nothing to say about the workspace. AMP #2802: the one note is that the harness started
+    // the ticket for its worker, which is true of every run it dispatches.
+    assert_eq!(r.notes.len(), 1, "{r:?}");
+    assert!(r.notes[0].contains("started #13"), "{r:?}");
 }
 
 /// The ticket a worker works, from its prompt ("You are working AMP ticket #N").

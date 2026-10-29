@@ -31,6 +31,16 @@ use rmcp::{
 };
 use serde_json::{Value, json};
 
+/// The tools the mock serves that are not contract tools: one for the KB, one that always fails,
+/// and the two AMP tools from #2204/#2801 a harness may have to do without (an old server has
+/// neither, and the harness's fallbacks cover it).
+pub const EXTRA_TOOLS: &[&str] = &[
+    "amp_kb_search",
+    "amp_fail",
+    "amp_set_task_state",
+    "amp_return_task",
+];
+
 /// The D11 contract (kept in sync by `doctor_reports_missing_contract_tools`).
 pub const CONTRACT: &[&str] = &[
     "amp_whoami",
@@ -41,6 +51,7 @@ pub const CONTRACT: &[&str] = &[
     "amp_get_plan",
     "amp_check_plan",
     "amp_dispatch_task",
+    "amp_claim_task",
     "amp_complete_task",
     "amp_block_task",
     "amp_report_run",
@@ -219,7 +230,7 @@ impl ServerHandler for MockAmp {
     ) -> Result<ListToolsResult, ErrorData> {
         let tools = CONTRACT
             .iter()
-            .chain(&["amp_kb_search", "amp_fail", "amp_set_task_state"])
+            .chain(EXTRA_TOOLS)
             .filter(|name| !self.omit.contains(name))
             .map(|name| tool(name))
             .collect();
@@ -268,10 +279,60 @@ impl ServerHandler for MockAmp {
                 }
                 _ => tool_error("task not found"),
             },
-            // M2-5: ticket 4040 belongs to someone else, like AMP's refusal.
+            // M2-5: ticket 4040 belongs to someone else, like AMP's refusal. Since AMP #2801 the
+            // answer also carries the dispatch token the worker starts and closes the ticket
+            // with; ticket 4043 answers like an older server (no token at all).
             "amp_dispatch_task" => match args["task_id"].as_i64() {
                 Some(4040) => tool_error("task 4040 is owned by someone else"),
-                Some(id) => ok_json(json!({"task_id": id, "dispatched_to": args["agent_id"]})),
+                Some(4043) => ok_json(json!({
+                    "task_id": 4043, "dispatched_to": args["agent_id"], "state": "in_progress",
+                })),
+                Some(id) => ok_json(json!({
+                    "task_id": id,
+                    "agent_id": args["agent_id"],
+                    "state": "in_progress",
+                    "phase": "not_started",
+                    "dispatch_id": format!("d_mock{id}"),
+                    "start_by": "2026-10-29T15:40:00Z",
+                    "flag_after_minutes": 10,
+                    "next": "Start the worker now, in this same turn.",
+                })),
+                None => tool_error("task_id is required"),
+            },
+            // AMP #2801: the worker starts its ticket with the token from dispatch. A stale one
+            // is refused, as AMP refuses it (the ticket was returned and dispatched again);
+            // ticket 4044's token is stale, and 4045's claim is refused for another reason.
+            "amp_claim_task" => match args["task_id"].as_i64() {
+                Some(4045) => {
+                    tool_error("ticket 4045 is not dispatched: there is nothing to start")
+                }
+                Some(id) => match args["dispatch_id"].as_str() {
+                    None | Some("") => {
+                        ok_json(json!({"task": {"id": id}, "already_started": true}))
+                    }
+                    Some(d) if d == format!("d_mock{id}") => ok_json(json!({
+                        "task": {"id": id}, "started_at": "2026-10-29T15:41:00Z",
+                        "phase": "started", "dispatch_id": d, "already_started": false,
+                    })),
+                    Some(d) => tool_error(&format!(
+                        "ticket {id}: dispatch {d} is no longer current (current: d_mock{id})"
+                    )),
+                },
+                None => tool_error("task_id is required"),
+            },
+            // AMP #2801: the returned path. It refuses a started ticket — that is what the
+            // harness's fallback is for, so the mock tells them apart by task id: 4046's ticket
+            // was started, everything else is still dispatched-and-unstarted.
+            "amp_return_task" => match args["task_id"].as_i64() {
+                Some(4046) | Some(4048) => tool_error(
+                    "task 4046 was started (by amp:amp-worker-backend): returning it would pull                      it out from under a worker that is running. Block it with a question, or                      close it out with closeout_reason",
+                ),
+                Some(4047) => tool_error("task 4047 not found"),
+                Some(4042) => tool_error("task 4042 is owned by someone else"),
+                Some(id) => ok_json(json!({
+                    "task_id": id, "state": "backlog", "returned": true,
+                    "returned_reason": args["reason"],
+                })),
                 None => tool_error("task_id is required"),
             },
             "amp_complete_task" | "amp_block_task" => {
@@ -287,6 +348,9 @@ impl ServerHandler for MockAmp {
             // refuses moving someone else's ticket).
             "amp_set_task_state" => match args["task_id"].as_i64() {
                 Some(4042) => tool_error("task 4042 is owned by someone else"),
+                // #2802: the fallback path for a ticket amp_return_task refused because it was
+                // started. 4048 refuses here too, so a test can see both refusals reported.
+                Some(4048) => tool_error("task 4048 cannot be set back to backlog"),
                 Some(id) => ok_json(
                     json!({"task_id": id, "from_state": "in_progress", "to_state": args["state"]}),
                 ),

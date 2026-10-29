@@ -77,6 +77,9 @@ pub struct Session {
     pub cwd: PathBuf,
     /// The manager's worker supervisor (`None` for a worker role).
     pub supervisor: Option<Arc<Supervisor>>,
+    /// Automatic run reporting (D8), kept so a chat can give it its notifier (AMP #2802: a
+    /// returned ticket is told to the person, not only to the manager's tool result).
+    pub reporter: Option<Arc<RunReporter>>,
     /// Why AMP could not be reached, when the session started offline (`allow_offline`).
     pub offline: Option<amp_mcp::McpError>,
     /// MCP hub changes from before the hub started (a server ready, failed, its tools changed).
@@ -167,11 +170,17 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         .role(&role_name)
         .map_err(|e| CliError::usage(e.to_string()))?;
     let role_id = role.id.clone();
+    // AMP #2802: the tickets this machine dispatched, shared by the supervisor (which records
+    // them) and the reporter (which forgets them once a ticket is closed or handed back).
+    let ledger = Arc::new(amp_core::dispatch_ledger::Ledger::open(&rt.state_dir));
+    let mut reporter_slot: Option<Arc<RunReporter>> = None;
     let supervisor = if role.primary {
         // #2232: [workers] from the same config.toml the runtime loaded (not the default path).
         let config =
             SupervisorConfig::load(&env, rt.paths.user_file.clone()).map_err(CliError::new)?;
-        Some(Supervisor::with_hooks(
+        let reporter = RunReporter::new(Arc::clone(&client)).with_ledger(Arc::clone(&ledger));
+        reporter_slot = Some(Arc::clone(&reporter));
+        Some(Supervisor::with_hooks_and_ledger(
             Arc::clone(&rt),
             ManagerContext {
                 role: role_id.clone(),
@@ -179,7 +188,8 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
                 project: project.clone(),
             },
             config,
-            Some(RunReporter::new(Arc::clone(&client)) as Arc<dyn WorkerHooks>),
+            Some(reporter as Arc<dyn WorkerHooks>),
+            Arc::clone(&ledger),
         ))
     } else {
         None
@@ -235,6 +245,7 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         project,
         cwd,
         supervisor,
+        reporter: reporter_slot,
         offline,
         mcp_events,
         mcp_starting,

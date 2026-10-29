@@ -362,7 +362,10 @@ async fn mcp_tools_lists_the_catalog() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names.len(), common::CONTRACT.len() + 3);
+    assert_eq!(
+        names.len(),
+        common::CONTRACT.len() + common::EXTRA_TOOLS.len()
+    );
     assert!(names.windows(2).all(|w| w[0] < w[1]), "sorted: {names:?}");
 }
 
@@ -479,7 +482,7 @@ async fn doctor_json_is_pinned() {
                 "server_name": "amp-mock", "server_version": "1.2.3",
                 "instructions": true, "error": null
             },
-            "tools": {"count": common::CONTRACT.len() + 3, "missing_contract": []},
+            "tools": {"count": common::CONTRACT.len() + common::EXTRA_TOOLS.len(), "missing_contract": []},
             "whoami": {"user_id": 7, "email": "local-dev@example.com", "account": "human"},
             "project": {
                 "marker": marker.display().to_string(), "id": 2, "name": "AMP v2",
@@ -498,8 +501,14 @@ async fn doctor_json_is_pinned() {
                 {"name": "connect", "status": "ok",
                  "detail": "MCP 2026-07-28 (stateless), server amp-mock 1.2.3", "fix": null},
                 {"name": "versions", "status": "ok", "detail": "<versions>", "fix": null},
-                {"name": "tools", "status": "ok", "detail": format!("{} tools", common::CONTRACT.len() + 3), "fix": null},
-                {"name": "contract", "status": "ok", "detail": "all 15 contract tools present", "fix": null},
+                {
+                 "name": "tools", "status": "ok",
+                 "detail": format!("{} tools", common::CONTRACT.len() + common::EXTRA_TOOLS.len()),
+                 "fix": null},
+                {
+                 "name": "contract", "status": "ok",
+                 "detail": format!("all {} contract tools present", common::CONTRACT.len()),
+                 "fix": null},
                 {"name": "whoami", "status": "ok", "detail": "local-dev@example.com (user 7)", "fix": null},
                 {"name": "project", "status": "ok",
                  "detail": format!("#2 AMP v2 (from {})", marker.display()), "fix": null}
