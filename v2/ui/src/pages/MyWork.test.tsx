@@ -14,8 +14,8 @@ import type { MyWork as MyWorkData, WaitCounts, WaitItem, WorkTask } from '../ty
 
 const hourAgo = new Date(Date.now() - 3_600_000).toISOString()
 const counts = (c: Partial<WaitCounts>): WaitCounts => {
-  const base = { approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0, ...c }
-  return { ...base, waiting: base.approve + base.answer + base.merge + base.do }
+  const base = { approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0, ...c }
+  return { ...base, waiting: base.approve + base.answer + base.merge + base.start + base.do }
 }
 const item = (over: Partial<WaitItem>): WaitItem => ({
   kind: 'answer', key: `task:${over.task_id}`, project_id: 2, project_code: 'AMPV2', project_name: 'AMP v2',
@@ -143,5 +143,28 @@ describe('top-level My work summary', () => {
     payload = { owned: [], flags: [], agents: [], done_24h: 0 }
     renderMyWork()
     expect(await screen.findByText('No project needs you right now.')).toBeInTheDocument()
+  })
+})
+
+// Dispatch integrity in the summary (AMP #2801, story 444): a ticket of yours
+// dispatched to an agent that no worker started is a "start" row, with the
+// server's minutes, linking to where the action lives.
+describe('top-level My work: a dispatched ticket no worker started', () => {
+  it('counts it, names the agent and the minutes, and links into My work', async () => {
+    const started = item({
+      kind: 'start', task_id: 2803, name: 'UI: not started states', state: 'not_started',
+      agent_id: 'amp:amp-worker-frontend', not_started_minutes: 32,
+    })
+    payload = {
+      ...busy,
+      counts: counts({ start: 1 }),
+      projects: [{ project_id: 2, project_code: 'AMPV2', project_name: 'AMP v2', agents_in_progress: 0, more: 0,
+        counts: counts({ start: 1 }), rows: [started] }],
+    }
+    renderMyWork()
+    const amp = await screen.findByRole('article', { name: /AMP v2/ })
+    expect(amp.textContent).toMatch(/Start 1/)
+    expect(within(amp).getByText('Dispatched to amp:amp-worker-frontend 32 min ago; no worker has started it')).toBeInTheDocument()
+    expect(within(amp).getByRole('link', { name: /#2803/ })).toHaveAttribute('href', '/project/2/my-work?focus=2803')
   })
 })

@@ -34,12 +34,13 @@ import { personName } from '../lib/people'
 import { ago } from '../lib/approval'
 import { reasonLabel } from '../lib/human'
 import { KIND_LABEL } from '../lib/humanActions'
+import { startItemText } from '../lib/dispatchState'
 import { projectLink } from '../lib/projectLink'
 import { refreshWaitCounts } from '../lib/waitCounts'
 import type { DepSummary, DoneItem, Project, ProjectMyWork as Data, ProjectWaitItem, WaitKind } from '../types'
 import './projectMyWork.css'
 
-const KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'do']
+const KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`
 /** "3h" from "3h ago"; "just now" stays. */
 const short = (iso?: string) => ago(iso).replace(/ ago$/, '')
@@ -49,6 +50,9 @@ const UNIT: Record<WaitKind, (n: number) => string> = {
   approve: n => (n === 1 ? 'plan' : 'plans'),
   answer: n => (n === 1 ? 'question' : 'questions'),
   merge: n => (n === 1 ? 'PR' : 'PRs'),
+  // A ticket of yours dispatched to an agent that no worker has started yet
+  // (AMP #2801): its run was never launched, so nothing is happening on it.
+  start: n => (n === 1 ? 'not started' : 'not started'),
   do: n => (n === 1 ? 'your ticket' : 'your tickets'),
 }
 
@@ -66,6 +70,7 @@ function oldestLabel(it: ProjectWaitItem): string {
     case 'approve': return 'the plan approval'
     case 'answer': return `the question on #${it.task_id}`
     case 'merge': return `the merge of #${it.task_id}`
+    case 'start': return `#${it.task_id}, not started`
     default: return `#${it.task_id}`
   }
 }
@@ -332,6 +337,7 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
     meta.push(`${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)}`)
     meta.push(reasonLabel(it.human_reason ?? t?.human_reason))
   }
+  if (kind === 'start') meta.push(startItemText(it))
   return (
     <>
       <article className={frame} data-item-key={it.key} data-focused={focused || undefined} aria-label={`${KIND_LABEL[kind]}: #${it.task_id} ${it.name}`}>
@@ -341,10 +347,12 @@ function ItemCard({ it, pid, all, readOnly, focused, onDismiss, onReview, onChan
           <Link to={projectLink(pid, 'board', it.task_id)} className="it-title hover:underline">{it.name}</Link>
           <span className="it-id">#{it.task_id}</span>
           {kind === 'do' && <span className="amp-label border border-line px-1.5 py-1 leading-none">{it.state === 'in_progress' ? 'In progress' : 'Ready'}</span>}
+          {kind === 'start' && <span className="amp-label border px-1.5 py-1 leading-none" style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}>Not started</span>}
         </div>
         <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-[12.5px] text-ink-2">{meta.map(m => <span key={m}>{m}</span>)}</div>
         <div className="mt-3">
-          {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch} onChanged={() => onChanged()} />
+          {t ? <HumanActions task={t} kind={kind} canAct={!readOnly} prUrl={it.pr_url} branch={it.branch}
+            minutes={it.not_started_minutes} onChanged={() => onChanged()} />
             : <span className="text-[12.5px] text-ink-2">{it.question ?? ''}</span>}
         </div>
       </article>
@@ -370,7 +378,8 @@ function ClearPanel({ name, readOnly }: { name: string; readOnly: boolean }) {
       <p>When this project needs {readOnly ? 'them' : 'you'}, it shows up here, with the button to do it:</p>
       <div className="flex flex-wrap gap-x-3.5 gap-y-2 mt-1.5">
         <KindMark kind="approve" label="Approve a plan" /><KindMark kind="answer" label="Answer a question" />
-        <KindMark kind="merge" label="Merge a PR" /><KindMark kind="do" label="Do a ticket only you can do" />
+        <KindMark kind="merge" label="Merge a PR" /><KindMark kind="start" label="Launch a run that never started" />
+        <KindMark kind="do" label="Do a ticket only you can do" />
       </div>
       <p className="text-[12.5px] text-ink-3">The same count shows on this tab, in the sidebar, and in My work across projects.</p>
     </div>

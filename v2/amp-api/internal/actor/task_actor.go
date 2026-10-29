@@ -1090,6 +1090,18 @@ func (a *TaskActor) withBlockedBy() domain.Task {
 	}
 	t.WaitingDetail = strings.Join(waits, "; ")
 	t.Phase = domain.PhaseOf(t.State, t.StartedAt)
+	// How long it has waited for a worker, so no client has to work it out
+	// from the timestamps (AMP #2801).
+	t.NotStartedMinutes = 0
+	if t.Phase == domain.PhaseNotStarted {
+		from := t.UpdatedAt
+		if t.DispatchedAt != nil {
+			from = *t.DispatchedAt
+		}
+		if m := int(time.Since(from).Minutes()); m > 0 {
+			t.NotStartedMinutes = m
+		}
+	}
 	return t
 }
 

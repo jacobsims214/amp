@@ -239,6 +239,11 @@ type Task struct {
 	// no StartedAt), PhaseStarted (in_progress with one), or "" for any
 	// other state. Computed on read, never stored.
 	Phase string `json:"phase,omitempty"`
+	// NotStartedMinutes is how long a dispatched ticket has gone without a
+	// worker starting it: set only while Phase is PhaseNotStarted, so no
+	// client has to do the arithmetic (the board's "18 min", My work's
+	// "not_started_minutes"). Computed on read, never stored.
+	NotStartedMinutes int `json:"not_started_minutes,omitempty"`
 }
 
 // Display phases of an in-progress ticket (Task.Phase, AMP #2801). There is

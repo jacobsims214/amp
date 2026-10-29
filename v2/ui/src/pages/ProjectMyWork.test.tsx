@@ -15,7 +15,7 @@ import { myWork } from '../test/myWorkFixture'
 import type { MyWorkCounts, ProjectMyWork as Data } from '../types'
 
 let data: Data = myWork('busy')
-let counts: MyWorkCounts = { counts: { waiting: 4, approve: 1, answer: 1, merge: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 4, approve: 1, answer: 1, merge: 1, do: 1, coming_up: 1 } } }
+let counts: MyWorkCounts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
 const posts: string[] = []
 const loads: string[] = []
 let countsCalls = 0
@@ -69,16 +69,17 @@ describe('My work tab: states', () => {
     const list = await screen.findByRole('region', { name: 'Waiting on you' })
     const ro = screen.getByRole('group', { name: 'Waiting on you in AMP v2' })
     expect(within(ro).getByText('Waiting on you').parentElement).toHaveClass('alarm')
-    expect(within(ro).getByText('Waiting on you').nextSibling).toHaveTextContent('4')
+    expect(within(ro).getByText('Waiting on you').nextSibling).toHaveTextContent('5')
     expect(within(ro).getByText(/^Oldest: 3h, the plan approval$/)).toBeInTheDocument()
     expect(within(ro).getByText('plan · 5 tickets')).toBeInTheDocument()
 
     const kinds = Array.from(list.querySelectorAll('[data-item-key]')).map(e => e.getAttribute('data-item-key'))
-    expect(kinds).toEqual(['approve:172', 'task:2473', 'task:2471', 'task:2481'])
+    expect(kinds).toEqual(['approve:172', 'task:2473', 'task:2471', 'task:2803', 'task:2481'])
     expect(within(list).getByRole('button', { name: 'Review and approve 5' })).toBeInTheDocument()
     expect(within(list).getByRole('button', { name: /send answer/i })).toBeInTheDocument()
     expect(within(list).getByRole('button', { name: /mark merged/i })).toBeInTheDocument()
     expect(within(list).getByText('2 tickets wait on the merge')).toBeInTheDocument()
+    expect(within(list).getByRole('button', { name: /return to ready/i })).toBeInTheDocument()
     expect(within(list).getByRole('button', { name: /mark done…/i })).toBeInTheDocument()
 
     const coming = screen.getByRole('region', { name: 'Coming up' })
@@ -200,11 +201,11 @@ describe('landing rule', () => {
   })
 
   it('opens Mission when nothing waits on you there', async () => {
-    counts = { counts: { waiting: 3, approve: 0, answer: 3, merge: 0, do: 0, coming_up: 0 }, projects: { 5: { waiting: 3, approve: 0, answer: 3, merge: 0, do: 0, coming_up: 0 } } }
+    counts = { counts: { waiting: 3, approve: 0, answer: 3, merge: 0, start: 0, do: 0, coming_up: 0 }, projects: { 5: { waiting: 3, approve: 0, answer: 3, merge: 0, start: 0, do: 0, coming_up: 0 } } }
     at('/project/2')
     expect(await screen.findByText('Mission page')).toBeInTheDocument()
     expect(where()).toBe('/project/2/mission')
-    counts = { counts: { waiting: 4, approve: 1, answer: 1, merge: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 4, approve: 1, answer: 1, merge: 1, do: 1, coming_up: 1 } } }
+    counts = { counts: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 }, projects: { 2: { waiting: 5, approve: 1, answer: 1, merge: 1, start: 1, do: 1, coming_up: 1 } } }
   })
 
   it('an explicit tab always wins', async () => {
@@ -231,7 +232,7 @@ describe('badges', () => {
     at('/project/2/mission')
     const { refreshWaitCounts } = await import('../lib/waitCounts')
     await refreshWaitCounts()
-    const tab = await screen.findByRole('link', { name: 'My work, 4 waiting on you' })
+    const tab = await screen.findByRole('link', { name: 'My work, 5 waiting on you' })
     expect(tab).toHaveAttribute('href', '/project/2/my-work')
     expect(tab.querySelector('span')).toHaveClass('bg-accent')
     expect(screen.getByRole('link', { name: 'Mission' })).toHaveAttribute('href', '/project/2/mission')

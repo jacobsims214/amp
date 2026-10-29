@@ -26,16 +26,17 @@ const ymd = (d: Date) => d.toLocaleDateString('en-CA', { timeZone: TZ })
 /** How many projects with nothing for you are listed before "N more". */
 const CLEAR_SHOWN = 8
 
-/** The four kinds, in display order. Color is always next to its label. */
+/** The five kinds, in display order. Color is always next to its label. */
 const KINDS: { kind: WaitKind; label: string; color: string; unit: (n: number) => string }[] = [
   { kind: 'approve', label: 'Approve', color: 'var(--violet)', unit: n => (n === 1 ? 'plan' : 'plans') },
   { kind: 'answer', label: 'Answer', color: 'var(--st-flag)', unit: n => (n === 1 ? 'question' : 'questions') },
   { kind: 'merge', label: 'Merge', color: 'var(--teal)', unit: n => (n === 1 ? 'PR' : 'PRs') },
+  { kind: 'start', label: 'Start', color: 'var(--warning)', unit: () => 'not started' },
   { kind: 'do', label: 'Do', color: 'var(--ink)', unit: n => (n === 1 ? 'your ticket' : 'your tickets') },
 ]
 const kindOf = (k: string) => KINDS.find(x => x.kind === k)
 
-const ZERO: WaitCounts = { waiting: 0, approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0 }
+const ZERO: WaitCounts = { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }
 
 function ago(iso?: string | null): string {
   if (!iso) return ''
@@ -76,6 +77,10 @@ function describe(it: WaitItem): { title: string; sub: string } {
       return { title: `#${it.task_id} ${pr ? `Merge ${pr}: ` : 'Merge: '}${it.name}`,
         sub: `${it.merge_state === 'abandoned' ? 'PR closed without merging' : `Done ${ago(it.completed_at ?? it.since)} ago`}${waitOn(it.holding_up?.length)}` }
     }
+    case 'start':
+      // The server's own minutes (not_started_minutes): no local arithmetic.
+      return { title: `#${it.task_id} ${it.name}`,
+        sub: `Dispatched${it.agent_id ? ` to ${it.agent_id}` : ''}${it.not_started_minutes != null ? ` ${it.not_started_minutes} min ago` : ''}; no worker has started it` }
     default:
       return { title: `#${it.task_id} ${it.name}`,
         sub: `${it.state === 'in_progress' ? 'Started' : 'Ready'} ${ago(it.since)} · ${reasonLabel(it.human_reason)}` }
@@ -214,7 +219,7 @@ export function MyWork() {
         {error && <div className="amp-panel px-4 py-3 text-[13px] text-danger-ink">{error}</div>}
         {!work && !error && <div className="flex justify-center py-16"><BandLoader label="Loading your work" /></div>}
         {work && <>
-          <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-6" aria-label="Waiting on you, across your projects">
+          <div className="amp-panel amp-panel-top grid grid-cols-3 md:grid-cols-7" aria-label="Waiting on you, across your projects">
             <div className="col-span-3 md:col-span-1 px-4 py-3 grid gap-1.5 border-b md:border-b-0 border-line"
               style={counts.waiting ? { background: 'var(--st-flag)', color: '#fff' } : undefined}>
               <span className="amp-label" style={counts.waiting ? { color: '#fff' } : undefined}>Waiting on you</span>

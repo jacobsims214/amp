@@ -1519,6 +1519,27 @@ func (h *RestHandler) taskSub(w http.ResponseWriter, r *http.Request) {
 		jsonOK(w, map[string]interface{}{"task_id": taskID, "dispatched_to": body.AgentID,
 			"state": t.State, "phase": t.Phase, "dispatch_id": t.DispatchID})
 
+	case "return":
+		// POST /tasks/{id}/return {reason}: a person sends a dispatched ticket
+		// no worker has started back to ready (AMP #2801). The watchdog does
+		// this by itself past the project's not_started_return_minutes;
+		// My work offers it earlier. A started ticket is refused: its run is
+		// live, so it is blocked or closed out instead.
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", 405)
+			return
+		}
+		var body struct {
+			Reason string `json:"reason"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		t, err := h.svc.ReturnTask(r.Context(), pr, taskID, body.Reason, false)
+		if err != nil {
+			fail(w, err, 400)
+			return
+		}
+		jsonOK(w, map[string]any{"task": t})
+
 	case "start":
 		// POST: a person starts their own human ticket.
 		if r.Method != http.MethodPost {

@@ -10,7 +10,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -573,6 +575,143 @@ func TestDispatchIntegrity_BackfillLeavesTicketsInFlightAlone(t *testing.T) {
 // lock sweep without one.
 func allowAll(context.Context, string) (func(), bool, error) {
 	return func() {}, true, nil
+}
+
+// The web UI's REST twin of amp_return_task: POST /api/tasks/{id}/return.
+// My work offers "Return to ready" on a dispatched ticket no worker started
+// (waiting_on_people kind "start"), and that button needs a route (#2803).
+func TestDispatchIntegrity_RestReturnTask(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	s := w.as(w.alice)
+
+	path := func(id int) string { return fmt.Sprintf("/api/tasks/%d/return", id) }
+	state := func(id int) *domain.Task {
+		t.Helper()
+		tk, err := w.s.repo.GetTask(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tk
+	}
+
+	// A dispatched ticket no worker started goes back to ready, with the reason.
+	id := mkIn(t, s, w.s.storyID, "no worker started it")
+	dispatchClaims(t, s, id)
+	out := ra.want(t, http.StatusOK, "alice", http.MethodPost, path(id), map[string]any{"reason": "no worker started it"})
+	task, _ := out["task"].(map[string]any)
+	if task == nil || task["state"] != "backlog" {
+		t.Fatalf("return = %v", out)
+	}
+	got := state(id)
+	if got.ReturnedAt == nil || !strings.Contains(got.ReturnedReason, "no worker started it") {
+		t.Fatalf("returned_at/reason = %v/%q", got.ReturnedAt, got.ReturnedReason)
+	}
+	if got.DispatchID != "" || got.DispatchedAt != nil {
+		t.Fatalf("the dispatch was not cleared: %q %v", got.DispatchID, got.DispatchedAt)
+	}
+
+	// A started ticket is somebody's live run: refused, like the tool.
+	busy := mkIn(t, s, w.s.storyID, "worker is running")
+	tok := dispatchClaims(t, s, busy)
+	s.call(t, "amp_claim_task", map[string]any{"task_id": float64(busy), "dispatch_id": tok})
+	if code, body := ra.do(t, "alice", http.MethodPost, path(busy), map[string]any{"reason": "give up"}); code != http.StatusConflict {
+		t.Fatalf("returning a started ticket: %d %v, want 409", code, body)
+	} else if !strings.Contains(fmt.Sprint(body["error"]), "was started") {
+		t.Fatalf("returning a started ticket said %v", body["error"])
+	}
+
+	// A ticket that isn't dispatched at all can't be returned either.
+	ready := mkIn(t, s, w.s.storyID, "never dispatched")
+	if code, _ := ra.do(t, "alice", http.MethodPost, path(ready), map[string]any{"reason": "x"}); code != http.StatusConflict {
+		t.Fatalf("returning a ready ticket: %d, want 409", code)
+	}
+
+	// A reason is required: it's what the manager and the history see.
+	other := mkIn(t, s, w.s.storyID, "no reason given")
+	dispatchClaims(t, s, other)
+	if code, _ := ra.do(t, "alice", http.MethodPost, path(other), map[string]any{}); code != http.StatusBadRequest {
+		t.Fatalf("returning without a reason: %d, want 400", code)
+	}
+
+	// GET isn't a return.
+	if code, _ := ra.do(t, "alice", http.MethodGet, path(id), nil); code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET return: %d, want 405", code)
+	}
+}
+
+// Every task read carries what the board and My work render (AMP #2803): the
+// phase, and how long a dispatched ticket has waited for a worker. The UI
+// does no arithmetic of its own, so these have to be on the ticket itself,
+// not only in the not_started list.
+func TestDispatchIntegrity_TaskReadCarriesPhaseAndMinutes(t *testing.T) {
+	w := newRBACWorld(t)
+	ra := newRestAs(t, w)
+	s := w.as(w.alice)
+
+	read := func(id int) map[string]any {
+		t.Helper()
+		out := ra.want(t, http.StatusOK, "alice", http.MethodGet, fmt.Sprintf("/api/tasks/%d", id), nil)
+		tk, _ := out["task"].(map[string]any)
+		if tk == nil {
+			t.Fatalf("task %d: no task in %v", id, out)
+		}
+		return tk
+	}
+
+	// Dispatched, not started, dispatched 20 minutes ago: not_started + 20.
+	waiting := mkIn(t, s, w.s.storyID, "no worker started it")
+	dispatchClaims(t, s, waiting)
+	ageDispatch(t, w.s, waiting, 20)
+	tk := read(waiting)
+	if tk["phase"] != domain.PhaseNotStarted {
+		t.Fatalf("phase = %v, want %q", tk["phase"], domain.PhaseNotStarted)
+	}
+	// The minutes are derived from the row, so a read straight from the
+	// repository sees the back-dated dispatch (the running project actor
+	// still holds the ticket's in-memory dispatch time).
+	aged, err := w.s.repo.GetTask(context.Background(), waiting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aged.NotStartedMinutes < 19 || aged.NotStartedMinutes > 21 {
+		t.Fatalf("repo not_started_minutes = %d, want about 20", aged.NotStartedMinutes)
+	}
+	// And it goes out under the name the UI reads.
+	b, _ := json.Marshal(aged)
+	if !strings.Contains(string(b), `"not_started_minutes":20`) && !strings.Contains(string(b), `"not_started_minutes":21`) {
+		t.Fatalf("the JSON has no not_started_minutes: %s", b)
+	}
+
+	// Started: phase started, and no minutes at all (it isn't waiting).
+	running := mkIn(t, s, w.s.storyID, "worker is running")
+	tok := dispatchClaims(t, s, running)
+	s.call(t, "amp_claim_task", map[string]any{"task_id": float64(running), "dispatch_id": tok})
+	tk = read(running)
+	if tk["phase"] != domain.PhaseStarted {
+		t.Fatalf("phase = %v, want %q", tk["phase"], domain.PhaseStarted)
+	}
+	if _, ok := tk["not_started_minutes"]; ok {
+		t.Fatalf("a started ticket carries not_started_minutes: %v", tk)
+	}
+
+	// Ready, done, blocked: no phase at all, so the UI shows nothing.
+	ready := mkIn(t, s, w.s.storyID, "never dispatched")
+	if tk = read(ready); tk["phase"] != nil {
+		t.Fatalf("a ready ticket has a phase: %v", tk["phase"])
+	}
+
+	// The project task list the board reads carries the phase too.
+	listed := ra.want(t, http.StatusOK, "alice", http.MethodGet, fmt.Sprintf("/api/projects/%d/tasks?owner=any", w.s.projectID), nil)
+	var found map[string]any
+	for _, x := range listed["tasks"].([]any) {
+		if m := x.(map[string]any); int(m["id"].(float64)) == waiting {
+			found = m
+		}
+	}
+	if found == nil || found["phase"] != domain.PhaseNotStarted {
+		t.Fatalf("the project task list's ticket = %v", found)
+	}
 }
 
 // allTaskIDs lists the test project's tickets.
