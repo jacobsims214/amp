@@ -116,6 +116,26 @@ files:
           run (`amp-harness run`, CI) ends the moment you reply. There is no loop after you reply: your
           session stops when you answer your user. If you stop with work still ready, say so plainly
           ("#152 is ready, not started") instead of "I'll keep the loop running".
+      # The dispatch result's `next` is quoted verbatim in the source (it is the server's wording,
+      # frozen in internal/mcp/next.go). The harness has one launch tool, so it names only that.
+      - find: "(the launch tool of your harness: Agent/Task\n> in Claude Code, the task tool in opencode, amp_run_ticket in the AMP harness)"
+        replace: "(your `amp_run_ticket` tool)"
+      - find: "(`opencode run`, CI)"
+        replace: "(`amp-harness run -p`, CI)"
+      # The quoted dispatch `next`/`worker_prompt` are for a manager that launches the worker
+      # itself. In the harness `amp_run_ticket` dispatches and launches in one call and claims
+      # for its worker, so quoting them would tell the manager to do something it can't.
+      - paragraph: "> Ticket #N is dispatched to <agent> but no worker has started it yet."
+        with: ""
+      - paragraph: "and `worker_prompt` is ready to hand over as it is:"
+        with: ""
+      - paragraph: "> Execute approved ticket #N in project P (dispatched to <agent>)."
+        with: ""
+      # ...so the remedy for an unclaimed ticket is to run it, not to launch a `worker_prompt`.
+      - find: "start the worker now with its `worker_prompt` (`amp_get_task` has the `dispatch_id`), or undo\n  the dispatch with `amp_set_task_state(state=\"backlog\", reason=\"not started\")`."
+        replace: "run it now with `amp_run_ticket` (it refuses a ticket it can't dispatch), or undo the\n  dispatch with `amp_set_task_state(state=\"backlog\", reason=\"not started\")`."
+      - find: "`not_started` one there is nothing to abandon: just launch the worker, or undo the dispatch."
+        replace: "`not_started` one there is nothing to abandon: just run it, or undo the dispatch."
       # #2367: the prompt is in every request, so the harness drops what its server instructions
       # (amp_guide, dependencies, fixing a plan) and the amp-planning skill already say, and the
       # Context7 advice (the harness has no Context7 server).
@@ -218,14 +238,64 @@ files:
           amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
           amp_run_ticket(task_id=ID, agent_id=<task's assigned_to>)
           ```
-      - paragraph: "**Step 2 — spawn workers in a single message**"
-        with: ""
-      - paragraph: "Step 1 must happen before step 2."
+      - find: "**Step 2 — launch each worker in the same message, with its returned `worker_prompt`,** as the prompt (so they run in parallel):\n```\ntask(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)\ntask(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)\n```"
+        replace: "`amp_run_ticket` does both steps in one call: it dispatches the ticket in AMP and starts the worker, then returns when the worker finishes."
+      - find: "The `worker_prompt` already carries the ticket ID, project ID and `dispatch_id`, and tells the\nworker to call `amp_claim_task(task_id, dispatch_id)` first and complete or block the ticket\nitself. Don't retype a prompt of your own:"
+        replace: "The harness handles the claim for its worker (the ticket is started when the worker process\nstarts, not before), and the worker completes or blocks the ticket itself. Don't write a prompt of\nyour own:"
+      - paragraph: "Step 1 must happen before step 2, and step 2 must happen before your turn ends."
         with: |
-          `amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board), and returns when the worker finishes.
+          `amp_run_ticket` marks each ticket dispatched in AMP before it starts the worker (this is what shows live progress on the board), and returns when the worker finishes. A dispatch the harness doesn't follow with a worker is returned to ready by AMP's watchdog (flagged at 10 minutes, returned at 30), and the harness releases the tickets it dispatched whose worker didn't run when it starts.
+      - find: "- `not_started` — dispatched, nobody claimed it yet; launch its worker now (its `worker_prompt` is\n  in `amp_get_task`'s `dispatch_id`/`next`) or undo the dispatch at once."
+        replace: "- `not_started` — dispatched, its worker never settled into the run; run it now with\n  `amp_run_ticket`, or undo the dispatch at once."
+      - find: "| `not_started` in `amp_list_tasks` (dispatched, no worker claimed it) | nobody ever launched the worker, or it died before its first call | launch the worker now with its `worker_prompt`; if you won't, `amp_set_task_state(task_id, state=\"backlog\", reason=\"not started\")` |"
+        replace: "| `not_started` in `amp_list_tasks` (dispatched, no worker running) | the run never settled into a worker, or it died before its first call | run it again now with `amp_run_ticket`; if you won't, `amp_set_task_state(task_id, state=\"backlog\", reason=\"not started\")` |"
 
   skills/amp-execution/SKILL.md:
     body:
+      # The harness claims for its worker (D7): amp_run_ticket reads the dispatch_id and calls
+      # amp_claim_task itself before the worker's first prompt. The skill keeps the opencode/Claude
+      # instructions; the harness asset says what is actually true there.
+      - paragraph: "## Step 0 — Claim your ticket (if you have a dispatch ID)"
+        with: |
+          ## Step 0 — Your ticket, and its dispatch
+
+          Your manager's `amp_run_ticket` call dispatched this ticket, and the harness **starts it as it
+          starts your run**: the ticket should already read `phase: "started"`, with `started_by` naming
+          your agent. The dispatch ID is in your `<amp_context>` block, and the harness puts it on your
+          `amp_complete_task` and `amp_block_task` calls itself, so there is nothing to pass by hand.
+
+          - If the ticket already reads `started`, go on to Step 0.5: it is yours.
+          - If it still reads `not_started` (an older harness that leaves the claim to the worker), call
+            `amp_claim_task(task_id=YOUR_TASK_ID, dispatch_id="<the dispatch ID in your context>")` first.
+            A failed claim is not a reason to stop: your first write on the ticket starts it as
+            `started_by: "inferred"`.
+
+          Never end a run without one of `amp_complete_task` or `amp_block_task` (Step 6 / Step 5): a
+          started ticket that goes silent for 15 minutes is flagged quiet, and the harness records an
+          abandoned run and returns the ticket to ready when your run ends without closing it.
+      # The opencode/Claude instructions that follow the header are for a manager that dispatches and
+      # relies on the worker to claim; the harness claims in amp_run_ticket, so they are replaced.
+      - paragraph: "A ticket is *dispatched* before a worker starts it, and until you claim it AMP shows it as"
+        with: ""
+      - paragraph: "amp_claim_task(task_id=YOUR_TASK_ID, dispatch_id=\"<your dispatch ID>\")"
+        with: ""
+      - paragraph: "- **Your prompt has a dispatch ID → claim first, before anything else.**"
+        with: ""
+      # amp_run_ticket's dispatch_id never reaches the prompt in the harness: the harness injects it
+      # into the worker's complete/block calls itself (D8), so the worker has nothing to pass.
+      - paragraph: "**Pass your `dispatch_id`.** It is what makes this *your* completion rather than a closeout:"
+        with: |
+          **The dispatch ID is filled in for you.** The harness injects it into your `amp_complete_task`
+          and `amp_block_task` calls, so AMP records "completed by <you>" rather than a closeout. Pass it
+          yourself too if you happen to have it (it's in your context block): it is never harmful. Your
+          model, tokens, git details and the run outcome are reported automatically as well — report them
+          only if you know something the harness can't (a PR opened after you finished, for instance).
+      - paragraph: "**Check the `dispatch_id` too.**"
+        with: |
+          **Check the ticket really is this run's.** The harness dispatched it to you and claimed it
+          seconds ago, so it should be `in_progress` and started by your agent. If it reads `in_progress`
+          but owned by someone else, or it was returned and dispatched again in the meantime, stop: comment
+          what you see and end your run rather than working a ticket another worker is on.
       - find: "(opencode's `execute`, scripts, tests)"
         replace: "(scripts, tests)"
       - find: "← if your harness has it (opencode with the AMP plugin): your model,"

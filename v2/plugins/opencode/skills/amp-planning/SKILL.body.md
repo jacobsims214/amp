@@ -648,8 +648,11 @@ give the user that link (saying whose ticket it is), and stop.
 
 Dispatch a ticket only once it's approved in the UI (by its owner, or a lead on their behalf): it
 isn't in `amp_check_plan`'s `awaiting_approval` (or the project doesn't require approval). Never complete or move forward a ticket that
-wasn't dispatched: AMP refuses it ("never dispatched … Dispatch it first"), and the fix is to
-dispatch it, not to find another path.
+was never dispatched and has no runs on it: AMP refuses it ("never dispatched and has no work
+recorded on it"), and the fix is a worker, not another path. Never dispatch a ticket *only* to
+complete it — a ticket that already has runs (a worker blocked with a question, and its answer
+arrived) is closed out directly with `amp_complete_task(closeout_reason=…)`; see "Closeouts"
+below.
 
 **Step 0 — re-run the file conflict check against the current batch:** before dispatching
 anything, look at everything currently in `ready_to_dispatch` (this includes fix tasks a reviewer
@@ -663,28 +666,58 @@ completes.
 
 For every task in `ready_to_dispatch`, do both steps in this order, using the task's own `assigned_to` value as the agent — not a fixed name:
 
-**Step 1 — dispatch each task** (marks it in_progress on the board):
+**Step 1 — dispatch each task** (marks it in_progress, *not started*):
 ```
 amp_dispatch_task(task_id=ID, agent_id=<task's assigned_to>)
 ```
 
-**Step 2 — spawn workers in a single message** (runs them in parallel):
+It returns `dispatch_id`, `worker_prompt`, `next` and `start_by`. The ticket is in progress but
+**not started**: nothing has picked it up yet.
+
+**Step 2 — launch each worker in the same message, with its returned `worker_prompt`,** as the prompt (so they run in parallel):
 ```
-task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
-task(prompt="Task ID: {id}. Project ID: {project_id}.", subagent_type=<task's assigned_to>)
+task(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)
+task(prompt=<the worker_prompt from dispatch>, subagent_type=<task's assigned_to>)
 ```
 
-Step 1 must happen before step 2. This is what shows live progress on the board.
+The `worker_prompt` already carries the ticket ID, project ID and `dispatch_id`, and tells the
+worker to call `amp_claim_task(task_id, dispatch_id)` first and complete or block the ticket
+itself. Don't retype a prompt of your own: yours would lose the `dispatch_id`, and the ticket
+would be flagged "not started" at 10 minutes and returned to ready at 30.
 
-After dispatch: monitor with `amp_list_tasks`. When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until `ready_to_dispatch` and `in_progress` are both empty.
+Step 1 must happen before step 2, and step 2 must happen before your turn ends. A dispatch you
+don't follow with a launched worker, in the same message, is the bug this order exists to prevent:
+everyone watching AMP sees a ticket in progress while nothing is happening. If you can't launch it
+after all, undo it at once with
+`amp_set_task_state(task_id=ID, state="backlog", reason="not started")`.
+
+**Don't move ticket state yourself.** Workers claim their own ticket and complete or block it; a
+`amp_complete_task` without a worker's `dispatch_id` is a **closeout**, and it's only for a worker
+that couldn't finish (see "Worker failure" below).
+
+After dispatch: monitor with `amp_list_tasks`. Three lists matter:
+- `not_started` — dispatched, nobody claimed it yet; launch its worker now (its `worker_prompt` is
+  in `amp_get_task`'s `dispatch_id`/`next`) or undo the dispatch at once.
+- `returned` — nobody claimed it before the deadline, or `amp_return_task` released it; it's ready
+  again, so re-dispatch it knowingly (and say so) or ask your user.
+- `quiet` — started, then silent; its worker died. See "Worker failure" below.
+
+When workers complete, blocked tasks auto-unblock and appear in `ready_to_dispatch`. Dispatch
+those. **After a review task completes, always check `ready_to_dispatch` — the reviewer may have
+created new fix tasks.** Re-run Step 0 against that new batch before dispatching it. Repeat until
+`ready_to_dispatch` and `in_progress` are both empty.
 
 **Human tickets are never dispatched.** They aren't in `ready_to_dispatch`.
 - `waiting_on_people` lists what a person can do now (each item has a `kind`: `approve`,
-  `answer`, `merge` or `do`), and for each:
+  `answer`, `merge`, `do` or `start`), and for each:
   - who owns it;
   - how long it has waited;
   - what it is `holding_up`;
   - whether it's `stale` (no activity for two days).
+- **A `start` item** is a ticket dispatched to them whose worker never claimed it
+  (`agent_id`, `not_started_minutes`): that's nobody working while AMP shows it in progress. It
+  clears itself when a worker claims the ticket, when you undo the dispatch, or when the watchdog
+  returns it to ready.
 - Tell your user plainly: "Waiting on Sam to approve #32; nothing else can start until then."
   Keep dispatching everything that doesn't wait on it.
 - **A merge item** is a done ticket whose PR isn't merged yet; its dependents wait on it. Give
@@ -717,6 +750,23 @@ A dispatched task can fail in ways that don't look like a normal "cannot proceed
 returns empty output, times out, or produces no comments and no completion within a reasonable
 window. Treat this as a real signal, not noise to route around quietly.
 
+**Two different failures, two different repairs.** AMP tells them apart for you:
+
+| What you see | What happened | What to do |
+|---|---|---|
+| `not_started` in `amp_list_tasks` (dispatched, no worker claimed it) | nobody ever launched the worker, or it died before its first call | launch the worker now with its `worker_prompt`; if you won't, `amp_set_task_state(task_id, state="backlog", reason="not started")` |
+| `returned` in `amp_list_tasks` | the watchdog returned it to ready (no claim before the deadline), or `amp_return_task` released it | it's ready again: re-dispatch it knowingly, or ask your user |
+| `quiet` | it *was* claimed, then went silent: the worker died mid-run | comment what happened, record the abandoned run, set it back to `backlog`, re-dispatch |
+| `in_progress` with `phase: "started"` and a worker that returned empty output | the worker ran and produced nothing | same as `quiet`, but you already know why |
+
+`amp_return_task(task_id, reason)` is the release path when a dispatch's worker died before
+claiming — a crash, a timeout, a cancel, an AMP connection lost — and nobody is going to run it.
+It sets the ticket back to ready (or to waiting, if it still has open dependencies), clears the
+dispatch, records `returned_at`/`returned_reason` and a `returned` history entry, and AMP shows it
+in `returned`. Name the outcome in `reason`, e.g. `worker amp:amp-worker-backend timed out after
+20 min`. It **refuses a ticket a worker already claimed**: a started ticket isn't pulled out from
+under its worker — block it with a question, or close it out if the worker is gone.
+
 1. **Detect it.** If a dispatched task has been in `in_progress` with no comments and no
    completion for longer than the work plausibly takes, or the subagent's response was empty,
    that's a failure — don't assume it's still working silently.
@@ -736,3 +786,38 @@ window. Treat this as a real signal, not noise to route around quietly.
    task still assigned to the tier that just failed, apply the same complexity test to each, and
    proactively reassign any that look like the same mismatch — rather than dispatching them one
    at a time and discovering the same failure repeatedly.
+
+---
+
+## Closeouts — when the worker didn't finish
+
+A worker completes or blocks its own ticket, passing the `dispatch_id` from its dispatch. When it
+can't (it died, timed out, or AMP lost the connection to it), **you** close the ticket out:
+
+```
+amp_complete_task(task_id=ID, closeout_reason="worker amp:amp-worker-backend timed out after 20 min;
+                 branch amp-2142 has the work", model=…, branch=…, commit=…)
+```
+
+- **No `dispatch_id`.** That's what makes it a closeout: AMP records `closeout: true`, history
+  action `closed_out` (`Closed out by <you> (not the worker): <reason>`), a run note prefixed
+  `closeout:`, and shows a Closeout tag on the ticket. Say in your report to the user that you
+  closed it, not the worker.
+- **Allowed only for a worker that couldn't finish:**
+  - a **started** ticket whose worker is gone (`in_progress`, claimed, no completion);
+  - or a ticket that is already ready/done/blocked and has **prior runs** — a worker blocked with
+    a question and the answer arrived, a design approved after the worker stopped, work done in
+    an earlier run. Close these **directly**: don't dispatch them first (that was the
+    #2473/#2494 workaround, and it's gone).
+- **Not a closeout** — don't pass `closeout_reason`, and don't tell your user it was one — when:
+  the ticket was started by the fallback (`started_by` `inferred` or `backfill`: a plugin that
+  never claimed), the ticket was dispatched but never started, or a person completes it in the
+  web UI. Those are ordinary completions.
+- **A ticket with no runs at all can't be closed out** ("never dispatched and has no work
+  recorded on it"). Dispatch it and let a worker do it, or a person completes it in the UI.
+- **Never dispatch a ticket just to complete it.** A ready ticket with runs is closed out
+  directly; a ticket with nothing on it gets a worker.
+
+A worker that died **before** claiming its ticket is the other case: `amp_return_task(task_id,
+reason)` releases it to ready, and you re-dispatch it or ask your user. Don't close out a ticket
+nobody ever started.

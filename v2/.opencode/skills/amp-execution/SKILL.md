@@ -6,7 +6,8 @@ description: Full protocol for executing an AMP task — reading the ticket, doi
 # AMP Execution Skill
 
 You have one job: execute the assigned task completely and correctly.
-Your task ID and project ID are in your dispatch prompt.
+Your task ID, project ID and **dispatch ID** are in your dispatch prompt (or your harness passes
+the dispatch ID in the context block it gives you).
 
 Your ticket's comments are the only place you log progress. Never use a built-in tool like
 `todowrite` (you shouldn't even have it — it's denied on this agent) or any other mechanism as a
@@ -14,7 +15,31 @@ substitute. Progress lives in `amp_add_task_comment`, nowhere else.
 
 ---
 
-## Step 0 — Read .amp.json
+## Step 0 — Claim your ticket (if you have a dispatch ID)
+
+A ticket is *dispatched* before a worker starts it, and until you claim it AMP shows it as
+"dispatched · not started". Claiming is what starts it:
+
+```
+amp_claim_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>")
+```
+
+- **Your prompt has a dispatch ID → claim first, before anything else.** It confirms the dispatch
+  is still current (a re-dispatched ticket has a new one, and a stale one is refused: "no longer
+  current … the ticket was returned and dispatched again"). The result's `next` tells you to read
+  the ticket and finish it yourself. `already_started: true` means you were resumed on a ticket
+  you already claimed: carry on.
+- **No dispatch ID** (an older manager, a harness that claims for you, or a ticket you were asked
+  to pick up by hand) → **skip the claim.** The first thing you write on the ticket — a comment, a
+  run, a block, or the completion — starts it for you, with `started_by: "inferred"`. That is the
+  supported fallback, not an error; don't stop because a claim was refused.
+- A ticket nobody claims within the project's timeout (10 minutes to flag, 30 to return) is
+  returned to ready by AMP. Never end a run silently: claim, then finish with `amp_complete_task`
+  or `amp_block_task` (Step 6 / Step 5), both passing your `dispatch_id`.
+
+---
+
+## Step 0.5 — Read .amp.json
 
 ```bash
 cat .amp.json
@@ -24,7 +49,7 @@ This gives you `project_id`. Every MCP call uses this value.
 
 ---
 
-## Step 0.5 — Search the KB before starting
+## Step 1 — Search the KB before starting
 
 Before reading the ticket, search the KB for relevant context:
 
@@ -63,7 +88,17 @@ amp_get_task(task_id=YOUR_TASK_ID, include=["comments"])
 **First, confirm this ticket is yours to work:** its `state` is `in_progress` and its
 `owner_user_id` is your user (`amp_whoami`). If it isn't — it's someone else's, or it was never
 dispatched — stop without touching any files and tell your manager. Another person's session may
-be running it; working it from here edits their files under your name.
+be running it; working it from here edits your files under your name.
+
+Its `phase` should already be `started` (from your claim in Step 0, or from the harness's claim on
+your behalf). If it still reads `not_started`, claim it with your dispatch ID before you write
+anything; with no dispatch ID, your first write starts it as `inferred`.
+
+**Check the `dispatch_id` too.** The ticket's `dispatch_id` is the one you were given, and the
+`next` on a mismatch is to go back to your manager rather than work a ticket someone else owns:
+a ticket that was returned and dispatched again has a new token, and yours would be stale. If you
+have no dispatch ID, the ticket simply starts on your first write (the fallback), and `started_by`
+will read `inferred` — that is normal for an older plugin.
 
 Read every field:
 - `description` — your complete instructions
@@ -205,12 +240,16 @@ Recommendation: [what you'd do and why, if you have a view]
 Done so far: [what's already in place, so the next worker doesn't redo it]
 """, author="amp-worker")
 
-amp_block_task(task_id=YOUR_TASK_ID, reason="[the question in one line, with the options]")
+amp_block_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>", reason="[the question in one line, with the options]")
 ```
 
 The `reason` is what people see in AMP as the question to answer, so make it stand on its own:
 "Avalara or Stripe Tax? Both work in the sandbox; Stripe is cheaper under 10k invoices a month."
 — not "blocked" or "see comments".
+
+Pass your `dispatch_id` too if you have one: it says which run stopped. It is never required —
+the block starts the ticket by itself when your plugin doesn't claim — and it never changes the
+block into something else.
 
 Then **stop**. Do NOT call `amp_complete_task`. End your final message with:
 
@@ -292,11 +331,17 @@ capitalizes token spend from these numbers, and traces code back to tickets from
 ```
 amp_session_usage()          ← if your harness has it (opencode with the AMP plugin): your model,
                                tokens and cost for this session. Pass them straight through.
-amp_complete_task(task_id=YOUR_TASK_ID,
+amp_complete_task(task_id=YOUR_TASK_ID, dispatch_id="<your dispatch ID>",
   model="<the model you ran on>",
   input_tokens=…, output_tokens=…, cache_read_tokens=…, cost_usd=…,   ← only numbers your harness gave you
-  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>")
+  branch="<branch>", commit="<sha>", pushed=true|false, pr_url="<if one>", base_branch="<if a PR")
 ```
+
+**Pass your `dispatch_id`.** It is what makes this *your* completion rather than a closeout:
+with it AMP records "completed by <you>"; without it, the completion is recorded as someone else
+closing the ticket (history `closed_out`, a `closeout:` run note), which is the wrong story about
+who did the work. If your prompt has no dispatch ID (an older plugin), there is nothing to pass:
+your completion ends the run your first activity started, and it is not labelled a closeout.
 
 Report what you know and leave the rest out — never estimate token counts. If your harness can't
 tell you your usage, still report the model and (in git) the git fields. The same fields go on
@@ -307,10 +352,11 @@ tell you your usage, still report the model and (in git) the git fields. The sam
 ## MCP tools
 
 ```
+amp_claim_task {task_id, dispatch_id}   ← FIRST, if your prompt has a dispatch ID: starts the ticket
 amp_get_task {task_id, include: ["comments"]}   ← read before starting; answers to questions are in the comments
 amp_add_task_comment {task_id, body, author}
-amp_block_task {task_id, reason, …run fields}   ← only to ask a person a question (Step 5)
-amp_complete_task {task_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?}
+amp_block_task {task_id, dispatch_id?, reason, …run fields}   ← only to ask a person a question (Step 5)
+amp_complete_task {task_id, dispatch_id, model?, input_tokens?, output_tokens?, cache_read_tokens?, cost_usd?, branch?, commit?, pushed?, pr_url?, base_branch?}
 amp_report_run {task_id, outcome, …run fields}  ← a run that ended another way, or a PR opened later
 amp_session_usage {}                  ← opencode plugin: your own model/tokens/cost
 amp_get_task {task_id, include: ["history","runs"]}   ← what happened before you

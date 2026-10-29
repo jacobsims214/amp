@@ -129,16 +129,23 @@ It builds the same session as the chat and exits 0 when the run completes.
 
 When the manager dispatches a ticket (its `amp_run_ticket` tool), the harness:
 
-1. waits for a free worker slot, then marks the ticket dispatched in AMP;
-2. gives a role that edits files a place of its own (read-only roles work in your folder): in a
+1. waits for a free worker slot, then dispatches the ticket in AMP (`amp_dispatch_task`), which
+   hands back a dispatch ID and the ready-made worker prompt;
+2. starts the worker and **starts the ticket with it** (`amp_claim_task(task_id, dispatch_id)`):
+   the harness claims on its worker's behalf, so a ticket it dispatched is never left "not started",
+   and the dispatch ID is injected into the worker's `amp_complete_task` / `amp_block_task` calls;
+3. gives a role that edits files a place of its own (read-only roles work in your folder): in a
    git repository with a commit, a git worktree `<repo>/.worktrees/<ticket>` on branch
    `amp-<ticket>`; anywhere else (no git repository, a new folder another repository doesn't
    track, a repository with no commit yet), a folder `amp-work/<ticket>/`, and the worker is told
    not to commit or open pull requests. `[workers] isolation` changes this; see
    `harness/git-and-the-harness.md`;
-3. runs the worker on its role's model until it finishes, times out or uses up its turns;
-4. **reports the run to the ticket by itself**: model, tokens, cost, branch, commit. A worker
-   that stops without closing its ticket is recorded as abandoned, with the reason.
+4. runs the worker on its role's model until it finishes, times out or uses up its turns;
+5. **reports the run to the ticket by itself**: model, tokens, cost, branch, commit. A worker
+   that stops without closing its ticket is recorded as abandoned, with the reason, and the ticket
+   goes back to ready so you can re-dispatch it. A dispatch whose worker never ran (the harness
+   died between the two steps) is released when the harness starts again, or by AMP's watchdog at
+   30 minutes.
 
 Workers never wait on a prompt: their shell runs with no terminal input, and every command has a
 time limit.
