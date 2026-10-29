@@ -302,7 +302,7 @@ func TestScheduledDeps_StartAtPassedWhileDownWithUnfinishedDependency(t *testing
 
 	// Completing the dependency through the restarted actors hands the ticket
 	// on to backlog: the release left it where checkUnblock picks it up.
-	reply := make(chan actor.ReplySimple, 1)
+	reply := make(chan actor.ReplyComplete, 1)
 	if err := reg.Send(s.projectID, &actor.MsgCompleteTask{TaskID: dep, ReplyCh: reply}); err != nil {
 		t.Fatal(err)
 	}

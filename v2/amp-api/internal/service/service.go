@@ -306,19 +306,112 @@ func (s *Service) openReassign(ctx context.Context, taskID int, lvl authz.Level,
 // ClaimTask takes an unassigned ticket for p. Unlike AssignTask(…, "me"),
 // it never takes a ticket from its current owner, whatever p's level:
 // reassigning someone's work must be explicit.
-func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int) (*domain.Task, error) {
-	if !p.HasUser() {
-		return nil, authz.BadRequest("claiming needs a signed-in AMP user")
+//
+// It is also how a worker starts the ticket it was dispatched for (AMP
+// #2801): with a dispatchID, or on a ticket p owns that is in progress and
+// unstarted, it stamps started_at and posts "{agent} picked this up". The
+// two are one call because they are one act: the worker taking the ticket
+// and beginning it. Starting an already-started ticket is a no-op (a
+// retried claim), and a stale dispatch token is refused.
+func (s *Service) ClaimTask(ctx context.Context, p authz.Principal, taskID int, dispatchID string) (*domain.Task, ClaimResult, error) {
+	// Taking an unassigned ticket records its owner, which needs a user; a
+	// worker starting the ticket it was dispatched for needs only the token.
+	if !p.HasUser() && dispatchID == "" {
+		return nil, ClaimResult{}, authz.BadRequest("claiming needs a signed-in AMP user")
 	}
-	t, lvl, err := s.LoadTask(ctx, p, taskID, authz.TaskClaim)
+	action := authz.TaskClaim
+	if dispatchID != "" {
+		action = authz.TaskWork
+	}
+	t, lvl, err := s.LoadTask(ctx, p, taskID, action)
 	if err != nil {
-		return nil, err
+		// A worker starting the ticket it was dispatched for only needs to
+		// work the ticket; when the strict claim rules refuse because it
+		// already has an owner (its dispatcher), that isn't a refusal to
+		// start it.
+		if dispatchID == "" {
+			return nil, ClaimResult{}, err
+		}
+		t, lvl, err = s.LoadTask(ctx, p, taskID, authz.TaskWork)
+		if err != nil {
+			return nil, ClaimResult{}, err
+		}
+	}
+	start := dispatchID != "" || (t.State == domain.TaskStateInProgress && t.StartedAt == nil &&
+		t.OwnerUserID != nil && *t.OwnerUserID == p.UserID)
+	if start {
+		return s.startTask(ctx, p, t, dispatchID)
 	}
 	if t.OwnerUserID != nil && *t.OwnerUserID != p.UserID {
 		// Even global admins, who pass every check, don't claim taken work.
-		return nil, authz.Forbidden("task %d is owned by user %d; claiming only takes unassigned tickets, use assign to reassign it", t.ID, *t.OwnerUserID)
+		return nil, ClaimResult{}, authz.Forbidden("task %d is owned by user %d; claiming only takes unassigned tickets, use assign to reassign it", t.ID, *t.OwnerUserID)
 	}
-	return s.setOwner(ctx, p, t, p.UserRef(), false, leadInUI(p, lvl))
+	owned, err := s.setOwner(ctx, p, t, p.UserRef(), false, leadInUI(p, lvl))
+	if err != nil {
+		return nil, ClaimResult{}, err
+	}
+	return owned, ClaimResult{}, nil
+}
+
+// ClaimResult reports what a claim did beyond the ticket: whether it started
+// the ticket (false: it already was), which dispatch it started under, and
+// whether this call took ownership.
+type ClaimResult struct {
+	Started        bool   `json:"started"`
+	AlreadyStarted bool   `json:"already_started"`
+	DispatchID     string `json:"dispatch_id,omitempty"`
+	Agent          string `json:"-"`
+}
+
+// startTask starts t for the worker behind p (AMP #2801). With a token it
+// must be the current dispatch; without one the ticket must be dispatched,
+// unstarted and p's own, which is the older-worker path. The claim posts
+// "{agent} picked this up" so the ticket shows who has it.
+func (s *Service) startTask(ctx context.Context, p authz.Principal, t *domain.Task, dispatchID string) (*domain.Task, ClaimResult, error) {
+	if t.State != domain.TaskStateInProgress {
+		return nil, ClaimResult{}, authz.Forbidden("ticket %d is %s, not dispatched: there is nothing to start. "+
+			"A claim starts the ticket you were dispatched for; re-read it with amp_get_task", t.ID, t.State)
+	}
+	if dispatchID != "" && !t.CurrentDispatch(dispatchID) {
+		current := t.DispatchID
+		if current == "" {
+			current = "none (the ticket was returned to ready since)"
+		}
+		return nil, ClaimResult{}, &authz.Error{Status: 409, Msg: fmt.Sprintf(
+			"ticket %d: dispatch %q is no longer current (current: %s). The ticket was returned and dispatched again, so this run is over: "+
+				"stop, and tell your manager what you found instead of working it", t.ID, dispatchID, current)}
+	}
+	if t.StartedAt != nil {
+		cur, err := s.Repo.GetTask(ctx, t.ID)
+		if err != nil {
+			return nil, ClaimResult{}, err
+		}
+		return cur, ClaimResult{AlreadyStarted: true, DispatchID: t.DispatchID}, nil
+	}
+	agent := s.agentName(p, t)
+	post := fmt.Sprintf("%s picked this up", agent)
+	replyCh := make(chan actor.ReplyStart, 1)
+	msg := &actor.MsgClaimStart{TaskID: t.ID, DispatchID: dispatchID, By: agent, ByName: p.Label(), Post: post, ByUser: p.UserRef(), ReplyCh: replyCh}
+	if err := s.Registry.Send(t.ProjectID, msg); err != nil {
+		return nil, ClaimResult{}, err
+	}
+	reply := actor.Await(ctx, replyCh)
+	if reply.Err != nil {
+		return nil, ClaimResult{}, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	return reply.Task, ClaimResult{Started: reply.Started, AlreadyStarted: reply.AlreadyStarted, DispatchID: reply.DispatchID, Agent: agent}, nil
+}
+
+// agentName is who a claim is recorded as: the caller's agent profile when
+// it has one, else the ticket's, else the caller.
+func (s *Service) agentName(p authz.Principal, t *domain.Task) string {
+	if t.AgentID != "" {
+		return t.AgentID
+	}
+	if p.Email != "" {
+		return p.Email
+	}
+	return "agent"
 }
 
 // leadInUI reports whether an ownership change by p (at level lvl) keeps
@@ -361,6 +454,11 @@ func (s *Service) setOwner(ctx context.Context, p authz.Principal, t *domain.Tas
 
 // Dispatch starts work on a ticket; an unassigned ticket is claimed by the
 // dispatching user in the same step.
+//
+// It only marks the ticket dispatched (AMP #2801): its worker starts it with
+// a claim, and until then it reads as "not started" and the watchdog
+// returns it. The returned ticket carries the new dispatch_id, which the
+// caller hands to the worker.
 func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, agentID string) (*domain.Task, error) {
 	t, lvl, err := s.LoadTask(ctx, p, taskID, authz.TaskDispatch)
 	if err != nil {
@@ -371,20 +469,64 @@ func (s *Service) Dispatch(ctx context.Context, p authz.Principal, taskID int, a
 		s.auditTaskDenied(ctx, p, "task.dispatch", t, err, map[string]any{"agent_id": agentID})
 		return nil, err
 	}
-	pid, err := s.Registry.Get(t.ProjectID)
-	if err != nil {
-		return nil, err
+	dispatchID := ""
+	if !t.IsHuman() {
+		if dispatchID, err = repository.NewDispatchID(); err != nil {
+			return nil, fmt.Errorf("dispatch id: %w", err)
+		}
 	}
 	replyCh := make(chan actor.ReplySimple, 1)
-	s.Registry.System().Root.Send(pid, &actor.MsgDispatchTask{
-		TaskID: taskID, AgentID: agentID,
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgDispatchTask{
+		TaskID: taskID, AgentID: agentID, DispatchID: dispatchID,
 		By: p.UserRef(), Override: lvl >= authz.OrgAdmin,
 		ReplyCh: replyCh,
-	})
+	}); err != nil {
+		return nil, err
+	}
 	if reply := actor.Await(ctx, replyCh); reply.Err != nil {
 		return nil, reply.Err
 	}
-	return t, nil
+	return s.Repo.GetTask(ctx, taskID)
+}
+
+// ReturnTask sends a dispatched ticket back to ready because no worker
+// started it (AMP #2801): the watchdog's automatic return, and the harness's
+// release of a ticket whose worker ended without closing it
+// (amp_return_task). It clears the dispatch, records the reason, and writes
+// an audit entry. system marks the automatic return, which no caller asked
+// for; otherwise p is named.
+func (s *Service) ReturnTask(ctx context.Context, p authz.Principal, taskID int, reason string, system bool) (*domain.Task, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return nil, authz.BadRequest("reason is required: it's what the manager and the history see, e.g. \"worker amp-worker-x timed out after 20 min\"")
+	}
+	t, _, err := s.LoadTask(ctx, p, taskID, authz.TaskWork)
+	if err != nil {
+		return nil, err
+	}
+	byName := p.Label()
+	if system {
+		byName = "system"
+	}
+	replyCh := make(chan actor.ReplyGetTask, 1)
+	if err := s.Registry.Send(t.ProjectID, &actor.MsgReturnTask{TaskID: taskID, Reason: reason,
+		By: p.UserRef(), ByName: byName, ReplyCh: replyCh}); err != nil {
+		return nil, err
+	}
+	reply := actor.Await(ctx, replyCh)
+	if reply.Err != nil {
+		return nil, &authz.Error{Status: 409, Msg: reply.Err.Error()}
+	}
+	details := map[string]any{"reason": reason, "automatic": system}
+	if !system {
+		s.Record(ctx, p, domain.AuditEntry{ProjectID: intRef(t.ProjectID), TargetType: "task", TargetID: idStr(taskID), TargetName: t.Name,
+			Action: "task.return", Summary: fmt.Sprintf("returned ticket %d to ready (%s)", taskID, reason), Details: details})
+	}
+	cur, err := s.Repo.GetTask(ctx, taskID)
+	if err != nil {
+		return reply.Task, nil
+	}
+	return cur, nil
 }
 
 // planApprovalGate decides whether t may be dispatched as far as plan
@@ -417,8 +559,10 @@ func planApprovalGate(proj *domain.Project, lookupErr error, t *domain.Task, pla
 // UpdateProject changes a project's name, description, or settings; it
 // needs project owner access. Callers publish project.updated.
 func (s *Service) UpdateProject(ctx context.Context, p authz.Principal, projectID int, u domain.ProjectSettings) (*domain.Project, error) {
-	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil && u.Metadata == nil {
-		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, or metadata")
+	if u.Name == nil && u.Description == nil && u.OpenReassign == nil && u.RequirePlanApproval == nil && u.RequireMerge == nil &&
+		u.NotStartedFlagMinutes == nil && u.NotStartedReturnMinutes == nil && u.Metadata == nil {
+		return nil, authz.BadRequest("nothing to change: pass name, description, open_reassign, require_plan_approval, require_merge, " +
+			"not_started_flag_minutes, not_started_return_minutes, or metadata")
 	}
 	if _, _, err := u.Metadata.Split(); err != nil {
 		return nil, authz.BadRequest("%s", err.Error())

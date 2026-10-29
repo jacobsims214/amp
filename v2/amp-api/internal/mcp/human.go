@@ -45,6 +45,10 @@ type PersonWait struct {
 	Count    int    `json:"count,omitempty"`
 	// answer
 	Question string `json:"question,omitempty"`
+	// start (AMP #2801): the agent it was dispatched to and how long it has
+	// waited for a worker to start it.
+	AgentID           string `json:"agent_id,omitempty"`
+	NotStartedMinutes int    `json:"not_started_minutes,omitempty"`
 	// merge: needed (Merge needed) or abandoned (PR closed without merging)
 	MergeState string `json:"merge_state,omitempty"`
 	PRURL      string `json:"pr_url,omitempty"`
@@ -193,7 +197,7 @@ func (s *Server) waitingOnPeople(ctx context.Context, projectID int, all, view [
 			TaskIDs: []int{t.ID}, Name: t.Name, State: string(t.State), Since: since, HumanReason: t.HumanReason}, nil, "nobody", holding))
 	}
 
-	rank := map[string]int{service.WaitApprove: 0, service.WaitAnswer: 1, service.WaitMerge: 2, service.WaitDo: 3}
+	rank := map[string]int{service.WaitApprove: 0, service.WaitAnswer: 1, service.WaitMerge: 2, service.WaitStart: 3, service.WaitDo: 4}
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := items[i], items[j]
 		if rank[a.Kind] != rank[b.Kind] {
@@ -262,11 +266,20 @@ func (s *Server) personWait(it service.WaitItem, owner *int, ownerEmail string, 
 	case service.WaitMerge:
 		p.State = "completed"
 		p.MergeState, p.PRURL, p.Branch = it.MergeState, it.PRURL, it.Branch
+	case service.WaitStart:
+		p.State = domain.PhaseNotStarted
+		p.AgentID, p.NotStartedMinutes = it.AgentID, it.NotStartedMinutes
+		p.Reason = service.WaitStart
 	case service.WaitDo:
 		p.State = "ready"
 		if it.State == string(domain.TaskStateInProgress) {
 			p.State = "in_progress"
 		}
+	}
+	// A person's own start item says what to do, not "start" bare.
+	if it.Kind == service.WaitStart {
+		p.Question = fmt.Sprintf("Dispatched to %s %d min ago and no worker has started it: start the worker now, or undo the dispatch.",
+			nameOr(it.AgentID, "an agent"), it.NotStartedMinutes)
 	}
 	if it.Kind != service.WaitApprove {
 		p.HoldingUp = holding(p.ID)
@@ -279,4 +292,59 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// notStartedList is amp_list_tasks' not_started: dispatched tickets no worker
+// has started, once the project's not_started_flag_minutes have passed
+// (AMP #2801). It reads the project and keeps only what the caller's view
+// covers, so it says the same thing the tickets do; 0 turns the flag off.
+func (s *Server) notStartedList(ctx context.Context, projectID int, view []domain.Task) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
+	minutes, _ := s.watchdogMinutes(ctx, projectID)
+	if minutes <= 0 {
+		return out, nil
+	}
+	rows, err := s.repo.NotStarted(ctx, projectID, time.Duration(minutes)*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool, len(view))
+	for _, t := range view {
+		seen[t.ID] = true
+	}
+	for _, n := range rows {
+		if !seen[n.ID] {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"id": n.ID, "name": n.Name, "agent_id": n.AgentID, "minutes": n.Minutes,
+		})
+	}
+	return out, nil
+}
+
+// returnedList is amp_list_tasks' returned: tickets sent back to ready before
+// a worker started them, still not dispatched again (AMP #2801). It reads the
+// project, then keeps only what the caller's view covers, like every other
+// bucket.
+func (s *Server) returnedList(ctx context.Context, projectID int, view []domain.Task) ([]map[string]interface{}, error) {
+	out := []map[string]interface{}{}
+	rows, err := s.repo.Returned(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[int]bool, len(view))
+	for _, t := range view {
+		seen[t.ID] = true
+	}
+	for _, r := range rows {
+		if !seen[r.ID] {
+			continue
+		}
+		out = append(out, map[string]interface{}{
+			"id": r.ID, "name": r.Name, "agent_id": r.AgentID,
+			"returned_reason": r.ReturnedReason, "minutes": r.Minutes,
+		})
+	}
+	return out, nil
 }

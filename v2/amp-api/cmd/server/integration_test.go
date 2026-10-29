@@ -222,7 +222,7 @@ func TestIntegration_CompleteDepUnblocksDependent(t *testing.T) {
 		}
 
 		// Complete A — this should auto-unblock B.
-		chComplete := make(chan actor.ReplySimple, 1)
+		chComplete := make(chan actor.ReplyComplete, 1)
 		rComplete := sendMsg(t, reg, projectID, &actor.MsgCompleteTask{
 			TaskID: taskA, ReplyCh: chComplete,
 		}, chComplete)
@@ -284,7 +284,7 @@ func TestIntegration_DiamondDAG(t *testing.T) {
 			}
 		}
 		complete := func(id int) {
-			ch := make(chan actor.ReplySimple, 1)
+			ch := make(chan actor.ReplyComplete, 1)
 			r := sendMsg(t, reg, projectID, &actor.MsgCompleteTask{
 				TaskID: id, ReplyCh: ch,
 			}, ch)

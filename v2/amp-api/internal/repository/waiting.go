@@ -17,6 +17,9 @@ type WaitTask struct {
 	WorkTask
 	RequirePlanApproval bool `json:"-"`
 	RequireMerge        bool `json:"-"`
+	// NotStartedFlagMinutes: a dispatched ticket no worker started is the
+	// owner's to act on once it has waited this long (0: never, AMP #2801).
+	NotStartedFlagMinutes int `json:"-"`
 }
 
 // qualifiedTaskCols is taskCols with each column read from alias w.
@@ -36,6 +39,7 @@ var qualifiedTaskCols = func() string {
 // done. Each comes with its dependency ids.
 func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []int) ([]WaitTask, error) {
 	rows, err := r.db.Query(ctx, `SELECT `+qualifiedTaskCols+`, p.code, p.name, p.require_plan_approval, p.require_merge,
+		p.not_started_flag_minutes,
 		COALESCE((SELECT array_agg(d.depends_on ORDER BY d.depends_on) FROM task_dependencies d WHERE d.task_id = w.id), '{}')
 		FROM (SELECT * FROM tasks
 		       WHERE ($2::int[] IS NULL OR project_id = ANY($2))
@@ -44,6 +48,7 @@ func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []i
 		              AND (approved_at IS NULL OR approved_at < planned_at))
 		           OR (owner_user_id = $1 AND state = 'blocked' AND block_reason <> '' AND block_reason NOT LIKE 'scheduled:%')
 		           OR (owner_user_id = $1 AND state = 'completed' AND merge_state IN ('needed', 'abandoned'))
+		           OR (owner_user_id = $1 AND state = 'in_progress' AND started_at IS NULL AND performer <> 'human')
 		           OR (owner_user_id = $1 AND performer = 'human' AND state <> 'completed')
 		         )) w
 		JOIN projects p ON p.id = w.project_id
@@ -57,7 +62,7 @@ func (r *Repo) WaitingCandidates(ctx context.Context, userID int, projectIDs []i
 	for rows.Next() {
 		var w WaitTask
 		t := &w.Task
-		if err := rows.Scan(append(taskFields(t), &w.ProjectCode, &w.ProjectName, &w.RequirePlanApproval, &w.RequireMerge, &t.DependencyIDs)...); err != nil {
+		if err := rows.Scan(append(taskFields(t), &w.ProjectCode, &w.ProjectName, &w.RequirePlanApproval, &w.RequireMerge, &w.NotStartedFlagMinutes, &t.DependencyIDs)...); err != nil {
 			return nil, err
 		}
 		out = append(out, w)

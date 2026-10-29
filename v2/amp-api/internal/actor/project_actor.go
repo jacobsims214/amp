@@ -157,6 +157,12 @@ func (a *ProjectActor) Receive(ctx actor.Context) {
 	case *MsgDispatchTask:
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
 
+	case *MsgClaimStart:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
+	case *MsgReturnTask:
+		a.routeTaskMsg(ctx, msg.TaskID, msg)
+
 	case *MsgCompleteTask:
 		// Route to the task, then fan MsgDepCompleted to ALL epics.
 		a.routeTaskMsg(ctx, msg.TaskID, msg)
