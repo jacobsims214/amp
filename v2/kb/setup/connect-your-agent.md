@@ -95,6 +95,16 @@ the old `sync-global-config.sh`, rerun with `--clean` to remove the files it cop
 
 Check it works: ask your agent to call `amp_whoami`. It should name you and your orgs and teams.
 
+**Keep the plugin up to date.** AMP's plugins carry the manager and worker instructions, and the
+instructions changed when dispatching did: a dispatched ticket is no longer started until its
+worker claims it, so the manager has to launch the worker with the `worker_prompt` dispatch
+returns, and the worker's first call is `amp_claim_task(task_id, dispatch_id)`. An older plugin
+still works — AMP's fallback starts a ticket on its worker's first write — but its manager never
+sees `worker_prompt`/`next` and simply stops after dispatching, so the tickets it dispatches are
+flagged at 10 minutes and returned to ready at 30. Update with `claude plugin update amp@amp`
+(Claude Code) or `opencode plugin add amp-opencode` (opencode), and restart the harness. The
+plugin's README has the same note.
+
 ## 3. Settings that prevent most trouble (other harnesses)
 
 Learned the hard way in team trials (see `field-notes.md`):

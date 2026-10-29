@@ -125,8 +125,10 @@ don't. A dispatch of such a ticket is refused with "ticket N isn't approved … 
 it in the AMP web UI (My work, Review and approve; a project lead may approve it on their
 behalf): <link>".
 
-Agents also can't complete a ticket that was never dispatched ("never dispatched … Dispatch it
-first"), so work can't skip the gate by being marked done.
+Agents also can't complete a ticket that was never dispatched and has no runs on it ("it was never
+dispatched and has no work recorded on it"), so work can't skip the gate by being marked done. A
+ticket that already has runs is closed out rather than dispatched again — that's a labelled
+closeout, not a bypass (`working/running-work.md`).
 
 Only a person, in the UI, can turn **Plan approval** off for a project; agents can turn it on.
 

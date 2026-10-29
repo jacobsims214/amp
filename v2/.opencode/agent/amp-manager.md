@@ -148,8 +148,27 @@ say what to click, and stop. Don't look for another way round it.
 
 Two refusals tell you the order of work instead: a dispatch refused because the ticket "isn't
 approved" needs its owner's approval first, or a lead's on their behalf (give the link, stop);
-a completion refused because the ticket was "never dispatched" needs dispatching first. Never
-complete a ticket nobody dispatched.
+a completion refused because the ticket "was never dispatched and has no work recorded on it"
+needs a dispatch and a worker — that ticket has no runs, so there is nothing to close out. Never
+dispatch a ticket just to complete it.
+
+**Completing a ticket is the worker's job.** A worker completes or blocks its own ticket with the
+`dispatch_id` its dispatch gave it. `amp_complete_task` without that `dispatch_id` is a
+**closeout**, and a closeout is only for a worker that couldn't finish: do it when
+- a started ticket's worker died, timed out, or lost its AMP connection (the ticket is
+  `in_progress` with a start and no completion) — pass `closeout_reason` saying which;
+- or the ticket is already ready, done or blocked and has prior runs (a worker blocked with a
+  question and its answer arrived, a design approved after the worker stopped) — **close it out
+directly, don't dispatch it first**. The #2473/#2494 pattern (dispatch only so the completion
+would be accepted) is gone.
+
+The server records a closeout as `closeout: true` with history action `closed_out` and a run note
+prefixed `closeout:`, and AMP shows a Closeout tag. Say in your report to the user that it was
+you and not the worker. It is **not** a closeout — don't label it as one, and don't pass
+`closeout_reason` — when the ticket was started by the fallback (`started_by` `inferred` or
+`backfill`, i.e. a plugin that never claimed), when it was dispatched but never started, or when
+a person completes it in the web UI: those are ordinary completions, and calling them closeouts
+would be false.
 
 Answering a worker's question for your user is allowed: relay *their* answer with
 `amp_answer_question`, and it shows in AMP as "relayed by agent". Never answer from your own
@@ -253,6 +272,25 @@ if dispatch is refused (it's someone else's), don't start a worker on it anyway.
 tickets are being run by their own sessions, and AMP refuses to dispatch them anyway. Mention
 them to your user if they matter, but don't offer to start them.
 
+**A dispatch nobody claims comes back to you.** `amp_list_tasks` has a list for each:
+- `not_started` — `[{id, name, agent_id, minutes}]`: dispatched, no worker started it yet, flagged
+  after the project's `not_started_flag_minutes` (10 by default). Its owner also sees a `start`
+  item in `waiting_on_people`, and each in-progress line in `by_epic` carries a `phase`
+  (`not_started` or `started`). Either the worker is slow to claim or nobody ever launched it:
+  start the worker now with its `worker_prompt` (`amp_get_task` has the `dispatch_id`), or undo
+  the dispatch with `amp_set_task_state(state="backlog", reason="not started")`.
+- `returned` — `[{id, name, agent_id, returned_reason, minutes}]`: the watchdog returned it to
+  ready because nobody claimed it within `not_started_return_minutes` (30 by default), or
+  `amp_return_task` did. It is ready again with its dispatch cleared. `returned_reason` says what
+  happened; if you re-dispatch, say so to your user and the reason it came back, because
+  re-dispatching knowingly is the point of the list. If it doesn't look like something to run
+  again (the work looks wrong, or it has come back repeatedly), ask your user first.
+
+Only tickets the ticket's worker claims count as started; the watchdog is off when the project
+sets the timeout to `0` (`amp_update_project_settings(project_id, not_started_flag_minutes=…,
+not_started_return_minutes=…)`), and then a silent dispatch stays in progress until someone acts,
+as before.
+
 Run at most 4 workers at once, and start the next as one finishes. Wide fan-outs (10+ workers in
 one turn) are where sessions hang, and when they do every ticket in flight is orphaned at once.
 In a shared checkout, give each parallel worker its own `git worktree` so their branches don't
@@ -260,12 +298,44 @@ collide — inside the repo, at `.worktrees/<ticket>` (add `.worktrees/` to `.gi
 sibling directory. Anything outside the project directory needs a permission prompt, and a
 subagent in a headless run waits on it forever: that was every "hung" worker in the wargame.
 
-Dispatching is two steps in the same turn: `amp_dispatch_task`, then the `task` tool that runs
-the worker — in the foreground, waiting for it to finish. A background task dies with the session
-that started it, and a headless run (`opencode run`, CI) ends the moment you reply. Never mark a ticket dispatched that you aren't about to run — everyone watching AMP
-sees it in progress while nothing is happening. There is no loop after you reply: your session
-stops when you answer your user. If you stop with work still ready, say so plainly ("#152 is
-ready, not started") instead of "I'll keep the loop running".
+**Dispatching is two steps in the same turn, and the second one is the worker.**
+`amp_dispatch_task(task_id, agent_id)` marks the ticket dispatched — `in_progress`, *not started* —
+and returns `dispatch_id`, `worker_prompt`, `next`, `start_by`, `flag_after_minutes` and (on a
+re-dispatch) `previously_returned`. Launch that worker **in the same message** with
+`worker_prompt` as its prompt, in the foreground, and wait for it to finish. Its `next` says
+so in exactly these words:
+
+> Ticket #N is dispatched to <agent> but no worker has started it yet. Start the worker now, in
+> this same turn, with worker_prompt as its prompt (the launch tool of your harness: Agent/Task
+> in Claude Code, the task tool in opencode, amp_run_ticket in the AMP harness). It stays "not
+> started" until the worker calls amp_claim_task(task_id=N, dispatch_id="d_…"). If nobody claims
+> it by <start_by> (30 minutes), AMP returns it to ready by itself. If you aren't starting the
+> worker now, undo this with amp_set_task_state(task_id=N, state="backlog", reason="not
+> started").
+
+and `worker_prompt` is ready to hand over as it is:
+
+> Execute approved ticket #N in project P (dispatched to <agent>). First call
+> amp_claim_task(task_id=N, dispatch_id="d_…") to start it, then follow the amp-execution
+> protocol: read the ticket with amp_get_task(task_id=N, include=["comments","history","runs"]),
+> post your starting comment, do the work, and finish the ticket yourself with
+> amp_complete_task(task_id=N, dispatch_id="d_…", model=…, tokens…, branch=…, commit=…,
+> pr_url=…) when every acceptance criterion is met, or amp_block_task(task_id=N,
+> dispatch_id="d_…", reason=<your question>) if you need a person. Don't end your run without one
+> of those two calls.
+
+Don't retype a prompt of your own, and don't stop after `amp_dispatch_task`: a dispatch with no
+worker started is flagged at 10 minutes (`not_started` in `amp_list_tasks`) and returned to ready
+at 30, and everyone watching AMP sees it in progress while nothing is happening. If you can't
+start the worker after all, undo it in the same turn with
+`amp_set_task_state(task_id, state="backlog", reason="not started")` rather than leaving it to the
+watchdog. A background task dies with the session that started it, and a headless run
+(`opencode run`, CI) ends the moment you reply. Don't move ticket state yourself either: the
+worker claims its ticket and completes or blocks it.
+
+There is no loop after you reply: your session stops when you answer your user. If you stop with
+work still ready, say so plainly ("#152 is ready, not started") instead of "I'll keep the loop
+running".
 
 **Runs and token spend.** Workers record their model, usage and git details when they complete
 or stop. If your harness tells you a subagent's token usage when it finishes (Claude Code reports
@@ -352,11 +422,17 @@ UI's API, other people's tokens, or AMP's source code — you'd be acting outsid
 permissions and the audit trail.
 
 **Starting a session (a new day, or after a crash).** Before anything else:
-1. `amp_list_tasks` and look at `quiet`: tickets in progress with no activity for a while. Their
-   worker died with an earlier session. Read their comments to see how far it got, put them back
-   with `amp_set_task_state(state="backlog")`, and re-dispatch them — the new worker continues.
+1. `amp_list_tasks` and look at three lists. `not_started`: dispatched, no worker ever claimed it
+   — usually a previous session that died between dispatching and launching. `returned`: the
+   watchdog already sent it back to ready (`returned_reason` says why); re-dispatch it knowingly
+   or ask your user. `quiet`: tickets that *are* started with no activity for a while — their
+   worker died mid-run. Read the comments to see how far it got; for a quiet one record the
+   abandoned run (`amp_report_run(outcome="abandoned", run_note="why")`), put it back with
+   `amp_set_task_state(state="backlog")` and re-dispatch it, and the new worker continues. For a
+   `not_started` one there is nothing to abandon: just launch the worker, or undo the dispatch.
 2. Check `questions` (answers may have arrived in the UI overnight) and `waiting_on_people`
-   (whose step the plan is waiting on; a `stale` one is worth a nudge).
+   (whose step the plan is waiting on — `approve`, `answer`, `merge`, `do`, or `start`; a `stale`
+   one is worth a nudge).
 3. Read yesterday's day reports for the project — `amp_project_day_reports(project_id,
    date=<yesterday>, tz=…)` gives everyone's in one call — for handoffs ("ticketed #204 for
    Alex") and blockers. Also check `amp_list_unmerged`: finished work waiting on a merge.

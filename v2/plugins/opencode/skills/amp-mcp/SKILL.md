@@ -24,7 +24,7 @@ one feature with no obvious entry point — scheduling.
 - **Epics**: `amp_create_epic`, `amp_update_epic`, `amp_delete_epic` (destructive, cascades)
 - **Stories**: `amp_create_story`, `amp_update_story`, `amp_move_story`, `amp_delete_story`
 - **Planning**: `amp_create_tasks` (several tickets and their dependencies in one call), `amp_set_task_dependencies`, `amp_move_task`, `amp_check_plan` — see the `amp-planning` skill. Dependencies drive dispatch: never leave them out, and never delete and re-create tickets to fix them
-- **Tasks**: `amp_create_tasks`, `amp_list_tasks` (compact board; `format: "full"` for full records), `amp_get_task` (`include: ["comments","history","runs"]` for its comments, activity and runs), `amp_update_task`, `amp_dispatch_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan` (approval status only: it never approves; see below), `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_claim_task`, `amp_assign_task`, `amp_handover_tasks` (move a person's open tickets to someone else)
+- **Tasks**: `amp_create_tasks`, `amp_list_tasks` (compact board; `format: "full"` for full records), `amp_get_task` (`include: ["comments","history","runs"]` for its comments, activity and runs), `amp_update_task`, `amp_dispatch_task`, `amp_claim_task`, `amp_return_task`, `amp_complete_task`, `amp_block_task`, `amp_answer_question`, `amp_approve_plan` (approval status only: it never approves; see below), `amp_set_task_state`, `amp_set_task_start_at`, `amp_delete_task`, `amp_add_task_comment`, `amp_assign_task`, `amp_handover_tasks` (move a person's open tickets to someone else)
 - **Runs and trace**: `amp_report_run` (record a run without changing the ticket's state: killed, abandoned or handed over, usage learned afterwards, a PR opened after completion), `amp_trace` (commit, branch or PR → the tickets that produced it), `amp_list_unmerged` (done tickets whose pushed work isn't merged yet), `amp_report_merged` (CI or a person records a merge by `commit`, `branch` or `pr_url`, with `merge_commit` for the merge SHA; every ticket whose runs produced it gets a run marked merged; an integration branch's merge also reaches the runs whose `base_branch` is it). Runs take `base_branch` (the PR's target, or the branch the work was merged into). Metadata `integration_branch` (epic/story) and `waits_for_merge: false` (a review ticket) keep dependents from waiting on merges to main. `amp_session_usage` is not an AMP server tool: the harness plugin provides it (Claude Code with the AMP plugin, opencode) to report your own model, tokens and cost, which you pass to `amp_complete_task` / `amp_block_task`
 - **Trash**: `amp_list_deleted_tasks` (tickets, epics and stories deleted in the last 30 days), `amp_restore_tasks` (`task_ids`, `story_ids`, `epic_ids`; restore the epic, then its stories, then their tickets, in the same call)
 - **Artifacts**: `amp_publish_artifact` (mockups, prototypes, diagrams, images, PDFs, documents for review), `amp_get_artifact`, `amp_list_artifacts`, `amp_review_artifact` and `amp_keep_artifact` (people only: request changes, keep it from expiring; approving, `approve=true`, is done by a person on the artifact page in the web UI and refused over MCP). Design systems: `amp_design_context`, `amp_design_system_start`, `amp_design_system_publish`
@@ -53,6 +53,24 @@ stop. Don't retry, and don't try another tool or the REST API.
 | Marking a human ticket done | The project's My work tab (or the ticket drawer), Mark done | `amp_complete_task` / `amp_set_task_state(completed)` refuse with the ticket link |
 | Turning `require_plan_approval` off | Project settings | `amp_update_project_settings` refuses; turning it on works |
 
+## A worker's first call, and its last
+
+In a harness that dispatches with `amp_dispatch_task`, the two steps are the manager's launch and
+the worker's claim:
+
+1. The manager dispatches and launches the worker in the same message, passing the `worker_prompt`
+   that dispatch returned. The ticket is `in_progress` · `phase: "not_started"`.
+2. The worker's first call is `amp_claim_task(task_id, dispatch_id)`; the ticket becomes
+   `phase: "started"`.
+3. The worker's last call is `amp_complete_task(task_id, dispatch_id=…)` or
+   `amp_block_task(task_id, dispatch_id=…, reason=…)`. A run that ends without either leaves the
+   ticket started and silent (`quiet` after 15 minutes).
+
+A worker with no `dispatch_id` in its prompt (an older plugin) skips step 2: its first write on the
+ticket starts it as `started_by: "inferred"`, and AMP does not flag or return it. A harness may
+claim on the worker's behalf instead (`amp_run_ticket` does); then the worker has nothing to do
+for step 2 but must still finish the ticket itself.
+
 The approval gate in practice:
 
 - **Approval is per ticket.** Each person approves their own tickets in the web UI; a project
@@ -68,10 +86,59 @@ The approval gate in practice:
   Its owner approves it in the AMP web UI (Approve plan; a project lead may approve it on their
   behalf): <link>". A ticket is re-planned (needs approving again) when it's created, restored
   from the trash, or its name, description or acceptance criteria change.
-- **`amp_complete_task`** on a ticket that was never dispatched refuses: "never dispatched …
-  Dispatch it first". Off the UI a ticket can only be completed from `in_progress`.
+- **`amp_complete_task`** on a ticket that was never dispatched *and has no runs* refuses: "it was
+  never dispatched and has no work recorded on it". Give it a worker (or a person completes it in
+  the web UI). A ticket **with** runs (a worker blocked with a question, an approved design whose
+  worker stopped) is closed out directly with `closeout_reason` — don't dispatch it just to
+  complete it.
 - **`amp_set_task_state`** can't move a ticket to `in_progress` (use `amp_dispatch_task`) or take a
   question back to backlog (answer it). Moving work back (to backlog or blocked) is allowed.
+
+## Dispatch, claim and closeouts
+
+**The four ticket states are unchanged**; "dispatched" is `in_progress` with `started_at` unset,
+reported as `phase: "not_started"`. Old plugins, filters and REST clients see `in_progress` exactly
+as before, so an old plugin is not broken by this — it simply never claims.
+
+| Tool | Who | What it does |
+|---|---|---|
+| `amp_dispatch_task(task_id, agent_id)` | manager | Marks the ticket dispatched (`in_progress`, **not started**) and returns `dispatch_id`, `worker_prompt` (a ready-to-use prompt for the worker), `next`, `start_by` (when the watchdog would return it), `flag_after_minutes` (the project's flag timeout; omitted when 0) and, on a re-dispatch, `previously_returned` (the last return's reason). |
+| `amp_claim_task(task_id, dispatch_id?)` | worker | Starts the ticket: stamps `started_at`/`started_by` and posts "<agent> picked this up". With a token it must be the ticket's current one; a stale one is refused ("no longer current … the ticket was returned and dispatched again"). Idempotent (`already_started: true`). Without a token it still starts a dispatched, unstarted ticket the caller owns (the older-worker path), and it keeps its old job of taking an unassigned ticket. |
+| `amp_return_task(task_id, reason)` | harness or manager | Releases a dispatched, never-started ticket back to ready (or to waiting, if it still has open dependencies): clears the dispatch, records `returned_at`/`returned_reason`, history action `returned`, audit entry. **Refused on a started ticket** — block it or close it out instead. No `dispatch_id`: the token would add nothing. |
+| `amp_complete_task(…, dispatch_id?)` | worker, or a manager closing out | With the current `dispatch_id`: the worker's own completion. Without it: a **closeout** (see below). |
+| `amp_block_task(task_id, dispatch_id?, reason)` | worker | Blocks on a question. `dispatch_id` only annotates the run; the block starts the ticket by itself when needed. |
+
+**`next` on every state-changing result.** Each mutating tool returns a `next` written for its
+caller — the dispatch result says to launch the worker now with `worker_prompt`; the claim result
+says to finish the ticket yourself; the block result says to end your final message with
+`QUESTION on task N: …`; a closeout's says it was recorded as a closeout. Read it: it is the
+cheapest way to know what the tool expects next.
+
+**The watchdog.** Every minute, one replica sweeps: a ticket dispatched with no worker started is
+flagged after the project's `not_started_flag_minutes` (default 10) and returned to ready after
+`not_started_return_minutes` (default 30), with reason "not started within N min of dispatch to
+<agent>". Both are project settings (`amp_update_project_settings(project_id,
+not_started_flag_minutes=…, not_started_return_minutes=…)`, `0` = off; the backfill sets
+`started_at` on tickets already in flight, so a deploy doesn't return them).
+
+**What `amp_list_tasks` shows.**
+- `not_started`: `[{id, name, agent_id, minutes}]` — dispatched, no worker claimed it (empty when
+the project's flag timeout is 0).
+- `returned`: `[{id, name, agent_id, returned_reason, minutes}]` — returned and not re-dispatched.
+  Re-dispatch it knowingly, or ask the user.
+- `by_epic`: each in-progress line carries `phase` (`not_started` | `started`).
+- `waiting_on_people`: kind `start` — the ticket owner's "no worker started this" item, with
+  `agent_id` and `not_started_minutes`.
+- `quiet` is unchanged: started, then silent for 15 minutes.
+
+**Closeouts.** A completion is a closeout when the caller isn't the ticket's worker **and** none of
+these hold: it passed the current `dispatch_id`; `started_by` is `inferred` or `backfill` (a
+plugin that never claimed); the ticket was dispatched and not yet started (the completion *is* its
+fallback start); or a person completed it in the web UI. So the real closeouts are a
+ready/done/blocked ticket with prior runs (closed out directly — never dispatch a ticket just to
+complete it) and a claimed ticket closed by someone other than its worker (the worker's session
+died). Pass `closeout_reason`; it is recorded as `closeout: true`, history `closed_out`, run note
+`closeout: …`. A ticket with no runs at all can't be closed out.
 - **`amp_answer_question`** is allowed: it relays your person's answer, and AMP shows it as
   "<email> (relayed by agent)". Only relay what they said.
 
@@ -172,7 +239,8 @@ agent); `assigned_to`/`agent_id` still name the agent profile that runs it.
   everything, or a teammate's email.
 - Tickets you create are yours. Pass `owner: "none"` on a ticket in `amp_create_tasks` to leave it in the pool,
   or a teammate's email to give it to them.
-- `amp_claim_task` takes an unassigned ticket, and never someone else's. `amp_dispatch_task` on an
+- `amp_claim_task` with no `dispatch_id` takes an unassigned ticket, and never someone else's;
+  with a `dispatch_id` it starts the ticket you were dispatched to. `amp_dispatch_task` on an
   unassigned ticket claims it too. A ticket someone else owns can't be dispatched, completed, or
   edited by you.
 - To take one over, `amp_assign_task` with `user: "me"` (`user: "none"` releases it). In projects

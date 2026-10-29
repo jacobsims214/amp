@@ -38,7 +38,9 @@ Explain the shape using *their* data, not an abstract example. Open one of their
 - **Dependencies.** AMP runs every ticket whose dependencies are done, in parallel. The graph is
   the plan. (`concepts.md`)
 - **The buckets** in `amp_list_tasks`: `ready_to_dispatch`, `in_progress`, `questions`,
-  `scheduled`, `quiet`, `blocked`, `completed`.
+  `scheduled`, `quiet`, `blocked`, `completed`, plus two lists for dispatched work:
+  `not_started` (sent to an agent, no worker started it) and `returned` (AMP sent it back to ready
+  because nobody started it in time).
 
 Point them at the UI as you go: **My work** (home), **Projects**, and inside a project
 **Mission**, **My work** (where they approve, answer, merge and do their own steps), **Board**,
