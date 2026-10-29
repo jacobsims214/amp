@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check } from 'lucide-react'
+import { X, Clock, Bot, GitBranch, CheckCircle2, AlertCircle, Loader2, Pencil, Trash2, CalendarClock, Hand, UserMinus, UserRound, ShieldCheck, ShieldAlert, ArrowRight, GitMerge, Check, RotateCcw } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { HUMAN_REASONS, isHuman, reasonHint, reasonLabel } from '../lib/human'
 import { approvalOf, approvalOwner, formatWhen, isRelayed, isYours, relayedFor } from '../lib/approval'
@@ -8,6 +8,8 @@ import { HumanActions } from './human/HumanActions'
 import { mergeStatusText } from '../lib/humanActions'
 import { effectiveMetadata, integrationBranch, mergedIntoIntegration, waitsForMerge } from '../lib/merge'
 import { api } from '../api/client'
+import { NotStartedTag, ReturnedLine, ReturnedTag } from './DispatchTags'
+import { isNotStarted, wasReturned } from '../lib/dispatchState'
 import { TicketArtifacts } from './artifacts/ArtifactBits'
 import { withClears } from '../lib/clear'
 import { StatusBadge } from './StatusBadge'
@@ -37,6 +39,8 @@ interface Props {
   openReassign?: boolean
   /** called with the updated task after claim/assign/release */
   onTaskUpdated?: (task: Task) => void
+  /** the project's not_started_flag_minutes: past it the amber badge is filled (0 = flag off) */
+  notStartedFlagMinutes?: number
 }
 
 function relativeTime(iso: string) {
@@ -65,17 +69,29 @@ const ACTION_DOT: Record<string, string> = {
   dispatched: 'bg-link',
   started:    'bg-link',
   completed:  'bg-success',
+  // A completion that wasn't the worker's (AMP #2801): the work ended, but
+  // not with the agent that was dispatched to it.
+  closed_out: 'bg-warning',
+  // The watchdog (or amp_return_task) sent a ticket no worker started back to
+  // ready (AMP #2801).
+  returned:   'bg-warning',
   blocked:    'bg-danger',
   unblocked:  'bg-warning-ink',
   comment:    'bg-line-str ring-1 ring-ink-2/40',
   plan_approved: 'bg-success',
 }
 
+/** The history action in words: closed_out and returned read as the tags beside them say. */
+const ACTION_LABEL: Record<string, string> = {
+  closed_out: 'closed out',
+  returned: 'returned to ready',
+}
+
 const inputCls =
   'w-full bg-bg border border-line rounded-lg px-3 py-2 text-sm text-ink placeholder-ink-3 ' +
   'focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 transition-all font-[inherit]'
 
-export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated }: Props) {
+export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAccess = null, openReassign = false, onTaskUpdated, notStartedFlagMinutes }: Props) {
   const [history, setHistory] = useState<ActivityLog[]>([])
   const [comments, setComments] = useState<Comment[]>([])
   const [tab, setTab] = useState<'history' | 'details'>('details')
@@ -183,6 +199,8 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
             <div className="flex items-center gap-2.5 mb-2.5 flex-wrap">
               <span className="amp-num text-[13px] text-ink-3">#{task.id}</span>
               <StatusBadge state={task.state} blockReason={task.block_reason} />
+              <NotStartedTag task={task} flagMinutes={notStartedFlagMinutes} />
+              <ReturnedTag task={task} />
               <PriorityMark priority={task.priority} showLabel={task.priority === '2' || task.priority === '3'} />
             </div>
             <h2 className="text-[17px] font-semibold text-ink leading-snug m-0">{task.name}</h2>
@@ -248,7 +266,14 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           {task.dispatched_at && (
             <div className="flex items-center gap-1.5 text-xs text-ink-2">
               <Clock size={11} />
-              <span>Started {relativeTime(task.dispatched_at)}</span>
+              <span>{isNotStarted(task) ? 'Dispatched' : 'Started'} {relativeTime(task.dispatched_at)}</span>
+            </div>
+          )}
+          {/* A ticket the watchdog sent back to ready, with the server's reason (AMP #2801). */}
+          {wasReturned(task) && (
+            <div className="flex items-center gap-1.5 text-xs text-warning-ink">
+              <RotateCcw size={11} aria-hidden="true" />
+              <ReturnedLine task={task} />
             </div>
           )}
           {task.start_at && (
@@ -285,6 +310,23 @@ export function TaskDrawer({ task, onClose, onRefresh, members = [], meId, myAcc
           <MergeGateNote task={task} />
         </div>
 
+        {/* Dispatched to an agent that hasn't started it (AMP #2801) */}
+        {isNotStarted(task) && (
+          <div className="px-6 py-4 border-b border-line" data-testid="not-started-note"
+            style={{ background: 'color-mix(in srgb, var(--warning) 7%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--warning)' }}>
+            <span className="amp-label flex items-center gap-1.5" style={{ color: 'var(--warning-ink)' }}>
+              <Clock size={12} aria-hidden="true" />Dispatched · not started
+            </span>
+            <p className="m-0 mt-1.5 text-[13px] leading-relaxed text-ink-2">
+              Its worker starts it with a claim. If none does, AMP returns it to ready by itself, and the ticket shows that here.
+            </p>
+            <div className="mt-2.5">
+              <HumanActions key={`start-${task.id}`} task={task} kind="start" canAct={canWork}
+                minutes={task.not_started_minutes}
+                onChanged={t => { if (t) { if (onTaskUpdated) onTaskUpdated(t); else onRefresh?.() } else onRefresh?.() }} />
+            </div>
+          </div>
+        )}
         {/* An agent's question, answered in place (the same HumanActions as My work) */}
         {displayState(task) === 'flag' && (
           <div className="px-6 py-4 border-b border-line" style={{ background: 'color-mix(in srgb, var(--st-flag) 6%, var(--surface))', boxShadow: 'inset 3px 0 0 var(--st-flag)' }}>
@@ -866,7 +908,19 @@ function HistoryTab({ history, comments, people }: { history: ActivityLog[]; com
                   <Bot size={10} aria-hidden="true" />Relayed by agent</span>
               )}
               <span className="text-ink-3 text-xs">·</span>
-              <span className="text-xs text-ink-2 capitalize">{entry.action.replace('_', ' ')}</span>
+              <span className="text-xs text-ink-2 capitalize">{ACTION_LABEL[entry.action] ?? entry.action.replace('_', ' ')}</span>
+              {/* Closeout (AMP #2801): a completion that wasn't the worker's, or the watchdog's return. */}
+              {entry.action === 'closed_out' && (
+                <span className="inline-flex items-center font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border"
+                  style={{ borderColor: 'var(--warning)', color: 'var(--warning-ink)' }}
+                  title="Closed out by someone other than the ticket's worker. Its detail names who, and why.">
+                  Closeout</span>
+              )}
+              {entry.action === 'returned' && (
+                <span className="inline-flex items-center font-label text-[9.5px] font-semibold uppercase tracking-[0.1em] px-1 py-[2px] border border-line-str text-ink-2"
+                  title="The ticket went back to ready without a worker starting it.">
+                  Returned to ready (no worker started)</span>
+              )}
               {entry.from_state && entry.to_state && (
                 <span className="text-xs text-ink-3">
                   {entry.from_state} → {entry.to_state}

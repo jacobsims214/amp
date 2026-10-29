@@ -3,7 +3,7 @@ import { countsSummary, idList, kindSummary, panelOrder, personLink, ticketsWait
 import type { PersonWaiting, WaitCounts } from '../types'
 
 const at = '2026-10-27T10:00:00Z'
-const wc = (o: Partial<WaitCounts>): WaitCounts => ({ waiting: 0, approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0, ...o })
+const wc = (o: Partial<WaitCounts>): WaitCounts => ({ waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0, ...o })
 // As GET /projects/:id/waiting-on-people returns them (user id order).
 const people: PersonWaiting[] = [
   { user_id: 7, counts: wc({ waiting: 3, answer: 1, merge: 2 }), coming_up: [], items: [

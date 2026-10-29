@@ -85,6 +85,9 @@ export function Board() {
   const [members, setMembers] = useState<ProjectMember[]>([])
   const [myAccess, setMyAccess] = useState<ProjectAccess | null>(null)
   const [openReassign, setOpenReassign] = useState(false)
+  // The project's watchdog flag timeout (0 = off): past it the amber
+  // "Dispatched · not started" badge fills in (AMP #2801).
+  const [notStartedFlagMinutes, setNotStartedFlagMinutes] = useState<number | undefined>(undefined)
   const [teamAccessOpen, setTeamAccessOpen] = useState(false)
   const people = useMemo(() => peopleById(members), [members])
   // Tickets waiting on approval: a one-line link to My work, where approving happens.
@@ -98,7 +101,12 @@ export function Board() {
       .then(r => { setMembers(r.members); setMyAccess(r.my_access) })
       .catch(() => { /* names fall back to "User #id"; actions still surface API errors */ })
     api.getProject(pid)
-      .then(p => setOpenReassign(p.open_reassign ?? false))
+      .then(p => {
+        setOpenReassign(p.open_reassign ?? false)
+        // The flag timeout only decides how loud the amber badge is; the
+        // badge itself comes from the ticket's server-supplied phase.
+        setNotStartedFlagMinutes(p.not_started_flag_minutes)
+      })
       .catch(() => { /* the server still enforces the rule; this only shapes buttons */ })
   }, [pid])
 
@@ -634,6 +642,7 @@ export function Board() {
                                         dimmed={hasFilter && !filteredTaskIds.has(task.id)}
                                         isScheduled={col.state === 'scheduled'}
                                         owner={lookupPerson(people, task.owner_user_id)}
+                                        notStartedFlagMinutes={notStartedFlagMinutes}
                                       />
                                     ))}
                                     {colTasks.length === 0 && <div className="h-8" />}
@@ -663,6 +672,7 @@ export function Board() {
         myAccess={myAccess}
         openReassign={openReassign}
         onTaskUpdated={applyTask}
+        notStartedFlagMinutes={notStartedFlagMinutes}
       />
 
       {planCheckOpen && (

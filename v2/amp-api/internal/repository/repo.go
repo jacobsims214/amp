@@ -191,8 +191,19 @@ func scanTask(row rowScanner, t *domain.Task) error {
 		return err
 	}
 	// Derived on read, never stored (AMP #2801): a ticket in progress with
-	// no started_at is "dispatched, not started".
+	// no started_at is "dispatched, not started", and its age is how long it
+	// has waited for a worker. Both come from the row, so every read gets
+	// them without doing the arithmetic itself.
 	t.Phase = domain.PhaseOf(t.State, t.StartedAt)
+	if t.Phase == domain.PhaseNotStarted {
+		from := t.UpdatedAt
+		if t.DispatchedAt != nil {
+			from = *t.DispatchedAt
+		}
+		if m := int(time.Since(from).Minutes()); m > 0 {
+			t.NotStartedMinutes = m
+		}
+	}
 	return nil
 }
 

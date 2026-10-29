@@ -8,8 +8,8 @@
  */
 import type { PersonWaiting, WaitCounts, WaitKind } from '../types'
 
-export const WAIT_KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'do']
-export const WAIT_KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', merge: 'Merge', do: 'Do' }
+export const WAIT_KINDS: WaitKind[] = ['approve', 'answer', 'merge', 'start', 'do']
+export const WAIT_KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', merge: 'Merge', start: 'Start', do: 'Do' }
 
 /** The ticket ids that wait on one person (every ticket of their items). */
 export function ticketsWaitingOn(p: PersonWaiting | undefined): Set<number> {

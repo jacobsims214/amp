@@ -15,8 +15,10 @@ export function actionKindOf(t: Pick<Task, 'state' | 'block_reason' | 'performer
   return null
 }
 
-export const KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', merge: 'Merge', do: 'Do' }
-export const KIND_COLOR: Record<WaitKind, string> = { approve: 'var(--violet)', answer: 'var(--st-flag)', merge: 'var(--teal)', do: 'var(--ink)' }
+export const KIND_LABEL: Record<WaitKind, string> = { approve: 'Approve', answer: 'Answer', merge: 'Merge', start: 'Start', do: 'Do' }
+export const KIND_COLOR: Record<WaitKind, string> = {
+  approve: 'var(--violet)', answer: 'var(--st-flag)', merge: 'var(--teal)', start: 'var(--warning)', do: 'var(--ink)',
+}
 
 /**
  * A done ticket's merge, in one line: "Done · Merge needed", "Done · PR

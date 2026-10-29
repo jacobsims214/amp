@@ -10,7 +10,7 @@ import { useSyncExternalStore } from 'react'
 import { api } from '../api/client'
 import type { MyWorkCounts, WaitCounts } from '../types'
 
-export const ZERO_COUNTS: WaitCounts = { waiting: 0, approve: 0, answer: 0, merge: 0, do: 0, coming_up: 0 }
+export const ZERO_COUNTS: WaitCounts = { waiting: 0, approve: 0, answer: 0, merge: 0, start: 0, do: 0, coming_up: 0 }
 
 let current: MyWorkCounts | null = null
 let inflight: Promise<MyWorkCounts | null> | null = null

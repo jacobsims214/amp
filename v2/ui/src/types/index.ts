@@ -21,6 +21,10 @@ export interface Project {
   /** done tickets with an unmerged PR hold their dependents until the merge is recorded (default on) */
   require_merge?: boolean
   require_merge_since?: string
+  /** a dispatched ticket no worker starts is flagged after this many minutes; 0 = off (AMP #2801) */
+  not_started_flag_minutes?: number
+  /** a dispatched ticket no worker starts is returned to ready after this many minutes; 0 = off (AMP #2801) */
+  not_started_return_minutes?: number
 }
 
 export interface Epic {
@@ -81,6 +85,19 @@ export interface Task {
   human_reason?: HumanReason
   /** when it last became ready: ready → started is time waiting to be picked up */
   ready_at?: string
+  /** the current dispatch token (d_…); empty when it isn't dispatched (AMP #2801) */
+  dispatch_id?: string
+  /** when a worker started it (a claim, or an older plugin's first activity); null on an in_progress ticket = dispatched but not started (AMP #2801) */
+  started_at?: string | null
+  /** the agent that started it, "inferred" (an older plugin's first activity), or "backfill" (AMP #2801) */
+  started_by?: string
+  /** when the watchdog (or amp_return_task) sent it back to ready, and why; cleared by the next dispatch (AMP #2801) */
+  returned_at?: string | null
+  returned_reason?: string
+  /** server-derived, never recomputed here: "not_started" | "started" on an in_progress ticket, absent on any other state (AMP #2801) */
+  phase?: TaskPhase
+  /** server-derived: minutes a dispatched ticket has waited for a worker; only while phase is not_started (AMP #2801) */
+  not_started_minutes?: number
   /** when its scope (name, description, acceptance criteria) was last set; newer than the plan's approval = awaiting approval */
   planned_at?: string
   /** when a person last approved its plan (#2198); approved iff approved_at >= planned_at */
@@ -103,6 +120,9 @@ export interface Task {
 }
 
 export type MergeState = 'none' | 'needed' | 'merged' | 'abandoned' | ''
+
+/** Dispatch integrity (AMP #2801): how far an in_progress ticket is. Server-supplied. */
+export type TaskPhase = 'not_started' | 'started'
 
 export type HumanReason = 'review' | 'approval' | 'access' | 'judgment' | 'external' | 'physical' | 'other'
 
@@ -795,14 +815,16 @@ export interface MyWork {
 
 // ---- Waiting on you (service.WaitingOn; KB decisions/human-work-ux.md §1) ----
 
-export type WaitKind = 'approve' | 'answer' | 'merge' | 'do'
+export type WaitKind = 'approve' | 'answer' | 'merge' | 'start' | 'do'
 
-/** Waiting is approve + answer + merge + do; coming_up is shown, never counted. */
+/** Waiting is approve + answer + merge + start + do; coming_up is shown, never counted. */
 export interface WaitCounts {
   waiting: number
   approve: number
   answer: number
   merge: number
+  /** a ticket of yours dispatched to an agent that no worker has started (AMP #2801) */
+  start: number
   do: number
   coming_up: number
 }
@@ -821,6 +843,9 @@ export interface PersonWaitItem {
   epic_id?: number
   epic_name?: string
   since: string
+  /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
+  agent_id?: string
+  not_started_minutes?: number
 }
 
 /** One person in GET /projects/:id/waiting-on-people (service.WaitingOn for them). */
@@ -866,6 +891,9 @@ export interface WaitItem {
   pr_url?: string
   branch?: string
   completed_at?: string
+  /** start: the agent it was dispatched to, and how long it has waited (AMP #2801) */
+  agent_id?: string
+  not_started_minutes?: number
   /** merge: open tickets that depend on it directly */
   holding_up?: number[]
   awaiting_approval?: boolean

@@ -142,3 +142,80 @@ describe('TaskDrawer merge gate exceptions (#2597)', () => {
     expect(screen.queryByTestId('merge-no-wait')).toBeNull()
   })
 })
+
+// Dispatch integrity (AMP #2801, story 444): the drawer says whether a ticket
+// was started, why one came back to ready, and which completions were
+// closeouts. Everything comes from the server's fields.
+describe('TaskDrawer dispatch integrity', () => {
+  const started = (over: Partial<Task> = {}) => task({
+    state: 'in_progress', phase: 'started', started_at: '2026-10-29T14:00:00Z', dispatched_at: '2026-10-29T14:00:00Z',
+    agent_id: 'amp:amp-worker-frontend', approved_at: '2026-10-27T10:30:00Z', approved_by: 9, ...over,
+  })
+
+  it('marks a dispatched ticket no worker started, with who it went to', () => {
+    open(started({ phase: 'not_started', started_at: null }))
+    expect(screen.getByTestId('not-started')).toHaveTextContent('Dispatched · not started')
+    const note = screen.getByTestId('not-started-note')
+    expect(note).toHaveTextContent('amp:amp-worker-frontend')
+    expect(note).toHaveTextContent('no worker has started it')
+    // The meta strip says dispatched, never started.
+    expect(screen.getByText(/^Dispatched \d+[mhd]/)).toBeInTheDocument()
+    expect(screen.queryByText(/^Started /)).toBeNull()
+  })
+
+  it('says a started ticket started, with no not-started note', () => {
+    open(started())
+    expect(screen.queryByTestId('not-started')).toBeNull()
+    expect(screen.queryByTestId('not-started-note')).toBeNull()
+    expect(screen.getByText(/^Started /)).toBeInTheDocument()
+  })
+
+  it('shows "Returned: <reason>" until the ticket is dispatched again', async () => {
+    server.use(http.get('*/api/tasks/5/history', () => HttpResponse.json({ history: [], count: 0 })))
+    open(task({
+      state: 'backlog', approved_at: '2026-10-27T10:30:00Z', approved_by: 9,
+      returned_at: '2026-10-29T14:30:00Z', returned_reason: 'not started within 30 min of dispatch to amp:amp-worker-backend',
+    }))
+    expect(screen.getByTestId('returned')).toBeInTheDocument()
+    expect(screen.getByTestId('returned-line'))
+      .toHaveTextContent('Returned: not started within 30 min of dispatch to amp:amp-worker-backend')
+    await act(() => new Promise(r => setTimeout(r, 20)))
+  })
+
+  it('shows neither once it is dispatched again', async () => {
+    server.use(http.get('*/api/tasks/5/history', () => HttpResponse.json({ history: [], count: 0 })))
+    open(started({ returned_at: null, returned_reason: '' }))
+    expect(screen.queryByTestId('returned')).toBeNull()
+    expect(screen.queryByTestId('returned-line')).toBeNull()
+    await act(() => new Promise(r => setTimeout(r, 20)))
+  })
+
+  it('tags a closeout in history, and shows the worker\'s claim as picked this up', async () => {
+    server.use(http.get('*/api/tasks/5/history', () => HttpResponse.json({ history: [
+      { id: 1, task_id: 5, project_id: 2, actor: 'amp-worker-backend', action: 'started', detail: 'picked this up', created_at: '2026-10-29T14:00:00Z' },
+      { id: 2, task_id: 5, project_id: 2, actor: 'jacob.sims@simstech.cloud', action: 'closed_out',
+        detail: 'Closed out by jacob.sims@simstech.cloud (not the worker): approved after the worker blocked', created_at: '2026-10-29T15:00:00Z' },
+    ], count: 2 })))
+    open(started())
+    expect(await screen.findByText('Closeout')).toBeInTheDocument()
+    expect(screen.getByText(/Closed out by jacob\.sims@simstech\.cloud \(not the worker\)/)).toBeInTheDocument()
+    expect(screen.getByText('picked this up')).toBeInTheDocument()
+    // The claim is a start, not a closeout.
+    expect(screen.getAllByText('Closeout')).toHaveLength(1)
+    await act(() => new Promise(r => setTimeout(r, 20)))
+  })
+
+  it('tags a watchdog return in history as returned to ready', async () => {
+    server.use(http.get('*/api/tasks/5/history', () => HttpResponse.json({ history: [
+      { id: 3, task_id: 5, project_id: 2, actor: 'system', action: 'returned', from_state: 'in_progress', to_state: 'backlog',
+        detail: 'Returned to ready: not started within 30 min of dispatch to amp:amp-worker-backend', created_at: '2026-10-29T14:30:00Z' },
+    ], count: 1 })))
+    open(task({ state: 'backlog', approved_at: '2026-10-27T10:30:00Z', approved_by: 9 }))
+    // A ready ticket opens on Details; the history is one tab away.
+    await userEvent.click(screen.getByRole('button', { name: 'history' }))
+    expect(await screen.findByText('Returned to ready (no worker started)')).toBeInTheDocument()
+    expect(screen.getByText(/Returned to ready: not started within 30 min/)).toBeInTheDocument()
+    expect(screen.queryByText('Closeout')).toBeNull()
+    await act(() => new Promise(r => setTimeout(r, 20)))
+  })
+})
