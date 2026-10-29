@@ -112,10 +112,9 @@ files:
       - paragraph: "Dispatching is two steps in the same turn"
         with: |
           Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-          runs the worker in the foreground and returns its final message when it finishes. A headless
-          run (`amp-harness run`, CI) ends the moment you reply. There is no loop after you reply: your
-          session stops when you answer your user. If you stop with work still ready, say so plainly
-          ("#152 is ready, not started") instead of "I'll keep the loop running".
+          runs the worker in the foreground and returns its final message when it finishes (the harness
+          claims the ticket for the worker as it starts it, so it is never dispatched and then left
+          unstarted).
       # The dispatch result's `next` is quoted verbatim in the source (it is the server's wording,
       # frozen in internal/mcp/next.go). The harness has one launch tool, so it names only that.
       - find: "(the launch tool of your harness: Agent/Task\n> in Claude Code, the task tool in opencode, amp_run_ticket in the AMP harness)"
@@ -136,6 +135,11 @@ files:
         replace: "run it now with `amp_run_ticket` (it refuses a ticket it can't dispatch), or undo the\n  dispatch with `amp_set_task_state(state=\"backlog\", reason=\"not started\")`."
       - find: "`not_started` one there is nothing to abandon: just launch the worker, or undo the dispatch."
         replace: "`not_started` one there is nothing to abandon: just run it, or undo the dispatch."
+      # The manager cannot call amp_dispatch_task (it is denied for the built-in role), so the source's
+      # "don't stop after amp_dispatch_task" advice is replaced by what is true here: one call does both,
+      # and the harness claims, returns and releases. The trailing loop paragraph stays as it is.
+      - paragraph: "Don't retype a prompt of your own, and don't stop after `amp_dispatch_task`"
+        with: "Write no prompt of your own: `amp_run_ticket` composes the worker's prompt from the ticket and its\ndispatch. A run that ends without closing its ticket (it errored, timed out, ran out of turns, was\nstopped, or crashed) is recorded as abandoned and the ticket goes back to ready, and the harness\nreleases the tickets it dispatched whose worker never ran when it starts again. AMP's watchdog does\nthe same for anything left dispatched (flagged at 10 minutes as `not_started`, returned to ready at\n30), so `amp_list_tasks` shows you both and you re-dispatch knowingly or ask your user. Don't move\nticket state yourself either: the worker claims its ticket and completes or blocks it, and a\ncloseout (with `closeout_reason`) is only for a worker that couldn't finish."
       # #2367: the prompt is in every request, so the harness drops what its server instructions
       # (amp_guide, dependencies, fixing a plan) and the amp-planning skill already say, and the
       # Context7 advice (the harness has no Context7 server).

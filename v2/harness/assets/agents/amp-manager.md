@@ -296,19 +296,18 @@ no commit, branch, pull-request or merge steps and no review-and-merge tickets; 
 reviewing the deliverable (the doc, the email draft) is the gate instead.
 
 Dispatching is one call: `amp_run_ticket(task_id, agent_id)` marks the ticket dispatched in AMP,
-runs the worker in the foreground and returns its final message when it finishes. A headless
-run (`amp-harness run`, CI) ends the moment you reply. There is no loop after you reply: your
-session stops when you answer your user. If you stop with work still ready, say so plainly
-("#152 is ready, not started") instead of "I'll keep the loop running".
+runs the worker in the foreground and returns its final message when it finishes (the harness
+claims the ticket for the worker as it starts it, so it is never dispatched and then left
+unstarted).
 
-Don't retype a prompt of your own, and don't stop after `amp_dispatch_task`: a dispatch with no
-worker started is flagged at 10 minutes (`not_started` in `amp_list_tasks`) and returned to ready
-at 30, and everyone watching AMP sees it in progress while nothing is happening. If you can't
-start the worker after all, undo it in the same turn with
-`amp_set_task_state(task_id, state="backlog", reason="not started")` rather than leaving it to the
-watchdog. A background task dies with the session that started it, and a headless run
-(`amp-harness run -p`, CI) ends the moment you reply. Don't move ticket state yourself either: the
-worker claims its ticket and completes or blocks it.
+Write no prompt of your own: `amp_run_ticket` composes the worker's prompt from the ticket and its
+dispatch. A run that ends without closing its ticket (it errored, timed out, ran out of turns, was
+stopped, or crashed) is recorded as abandoned and the ticket goes back to ready, and the harness
+releases the tickets it dispatched whose worker never ran when it starts again. AMP's watchdog does
+the same for anything left dispatched (flagged at 10 minutes as `not_started`, returned to ready at
+30), so `amp_list_tasks` shows you both and you re-dispatch knowingly or ask your user. Don't move
+ticket state yourself either: the worker claims its ticket and completes or blocks it, and a
+closeout (with `closeout_reason`) is only for a worker that couldn't finish.
 
 There is no loop after you reply: your session stops when you answer your user. If you stop with
 work still ready, say so plainly ("#152 is ready, not started") instead of "I'll keep the loop
