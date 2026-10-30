@@ -519,3 +519,73 @@ async fn the_manager_has_a_native_amp_session_usage_tool() {
     // It is native: AMP never saw the call.
     assert!(amp.mock.calls_to("amp_session_usage").is_empty());
 }
+
+/// AMP #2884: `run -p` ends when the manager's reply ends, so it must never launch a worker in
+/// the background. With `[workers] dispatch = "launch"` in config.toml and
+/// AMP_HARNESS_WORKER_DISPATCH=launch, `amp_run_ticket` still waits: its result is the worker's
+/// report (not a launch ack), and the worker closed its ticket before the process exited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_waits_for_its_worker_even_when_config_and_env_say_launch() {
+    let amp = spawn(MockAmp::new(), None).await;
+    // One shared faux queue, popped in order because the manager waits: manager, worker, worker,
+    // manager.
+    let dir = setup(
+        "run-headless-await",
+        json!([
+            {"tool_calls": [{"name": "amp_run_ticket", "id": "call-1",
+                "arguments": {"task_id": 4242, "agent_id": "amp-worker-backend"}}]},
+            {"text": "Done.", "tool_calls": [{"name": "amp_complete_task", "arguments": {"task_id": 4242}}]},
+            {"text": "Finished #4242."},
+            {"text": "Worker said: {{last_tool_result}}"}
+        ]),
+    );
+    let config = dir.join("home/.config/amp-harness/config.toml");
+    let mut toml = std::fs::read_to_string(&config).unwrap();
+    toml.push_str("\n[workers]\ndispatch = \"launch\"\n");
+    std::fs::write(&config, toml).unwrap();
+
+    let script = dir.join("script.json");
+    let state = dir.join("home/.local/state");
+    let out = run(
+        &dir,
+        &amp.url,
+        &["run", "-p", "run #4242", "--json"],
+        &[
+            ("AMP_HARNESS_FAUX_SCRIPT", script.to_str().unwrap()),
+            ("XDG_STATE_HOME", state.to_str().unwrap()),
+            ("AMP_HARNESS_WORKER_DISPATCH", "launch"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        out.code, 0,
+        "stderr: {}\nstdout: {}",
+        out.stderr, out.stdout
+    );
+    let events = json_lines(&out);
+
+    let end = of_type(&events, "tool_end")
+        .into_iter()
+        .find(|e| e["id"] == "call-1")
+        .unwrap_or_else(|| panic!("no amp_run_ticket result: {}", out.stdout));
+    assert_eq!(end["is_error"], false, "{end}");
+    let text = end["text"].as_str().unwrap();
+    let report: Value = serde_json::from_str(text.trim())
+        .unwrap_or_else(|e| panic!("amp_run_ticket result is not a report ({e}): {text}"));
+    assert_eq!(report["outcome"], "completed", "{report}");
+    assert_eq!(report["task_id"], 4242, "{report}");
+    assert!(
+        report.get("queued").is_none(),
+        "a launch ack, not a report: {report}"
+    );
+    // The worker closed its ticket while the run was still alive.
+    assert_eq!(
+        amp.mock.calls_to("amp_complete_task").len(),
+        1,
+        "{}",
+        out.stderr
+    );
+    let result = events.last().unwrap();
+    assert_eq!(result["type"], "result");
+    assert_eq!(result["outcome"], "completed", "{result}");
+}

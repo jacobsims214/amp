@@ -219,6 +219,8 @@ pub async fn run(args: ChatArgs) -> Result<(), CliError> {
         wait_mcp: false,
         // #2241: ask about untrusted repo MCP servers (in the terminal, before the TUI opens).
         ask_trust: true,
+        // The chat keeps the configured `[workers] dispatch` (its own default is #2837's).
+        dispatch_override: None,
     })
     .await?;
     let settings = args.conn.settings()?;

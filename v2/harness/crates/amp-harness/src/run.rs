@@ -316,6 +316,9 @@ pub async fn run(args: RunArgs) -> Result<(), CliError> {
         wait_mcp: true,
         // #2241: headless never asks; untrusted repo MCP servers are skipped with a warning.
         ask_trust: false,
+        // AMP #2884: the process ends with the manager's reply, so `amp_run_ticket` must wait for
+        // its worker here whatever `[workers] dispatch` or AMP_HARNESS_WORKER_DISPATCH says.
+        dispatch_override: Some(amp_core::supervisor::DispatchMode::Await),
     });
     let session = tokio::select! {
         s = build => s?,

@@ -37,7 +37,7 @@ use amp_core::{
     project::{ENV_CEILING_DIR, ProjectMarker},
     providers::SystemKeys,
     run_report::{RunReporter, SessionUsageTool},
-    supervisor::{ManagerContext, Supervisor, SupervisorConfig, WorkerHooks},
+    supervisor::{DispatchMode, ManagerContext, Supervisor, SupervisorConfig, WorkerHooks},
 };
 use rpi_agent::AgentEvent;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -61,6 +61,11 @@ pub struct SessionRequest<'a> {
     /// Ask the person whether to trust this repo's untrusted MCP servers before they start (the
     /// chat, #2241). Headless runs never ask: untrusted repo servers are skipped.
     pub ask_trust: bool,
+    /// Replaces the configured `[workers] dispatch` / `AMP_HARNESS_WORKER_DISPATCH` (AMP #2884).
+    /// `run -p` sets `Await`: a headless run exits when the manager's reply ends, so a launched
+    /// worker would be left mid-run with its ticket in progress. `None` (the chat) keeps the
+    /// configured mode.
+    pub dispatch_override: Option<DispatchMode>,
 }
 
 pub struct Session {
@@ -86,6 +91,20 @@ pub struct Session {
     pub mcp_events: tokio::sync::broadcast::Receiver<amp_core::mcp_hub::HubEvent>,
     /// MCP servers still on their first attempt when the session was built.
     pub mcp_starting: Vec<String>,
+}
+
+/// Applies a caller's dispatch override (AMP #2884) to the loaded `[workers]` config, saying so
+/// on stderr with `--verbose` / `RUST_LOG` when it replaced a configured `launch`.
+fn override_dispatch(config: &mut SupervisorConfig, mode: Option<DispatchMode>) {
+    let Some(mode) = mode else { return };
+    if config.dispatch == DispatchMode::Launch && mode != DispatchMode::Launch && conn::verbose() {
+        eprintln!(
+            "debug: [workers] dispatch = \"{}\" ignored here; this run uses \"{}\"",
+            config.dispatch.as_str(),
+            mode.as_str()
+        );
+    }
+    config.dispatch = mode;
 }
 
 pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
@@ -176,8 +195,9 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
     let mut reporter_slot: Option<Arc<RunReporter>> = None;
     let supervisor = if role.primary {
         // #2232: [workers] from the same config.toml the runtime loaded (not the default path).
-        let config =
+        let mut config =
             SupervisorConfig::load(&env, rt.paths.user_file.clone()).map_err(CliError::new)?;
+        override_dispatch(&mut config, req.dispatch_override);
         let reporter = RunReporter::new(Arc::clone(&client)).with_ledger(Arc::clone(&ledger));
         reporter_slot = Some(Arc::clone(&reporter));
         Some(Supervisor::with_hooks_and_ledger(
@@ -250,4 +270,32 @@ pub async fn build(req: SessionRequest<'_>) -> Result<Session, CliError> {
         mcp_events,
         mcp_starting,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured(mode: DispatchMode) -> SupervisorConfig {
+        SupervisorConfig {
+            dispatch: mode,
+            ..SupervisorConfig::default()
+        }
+    }
+
+    /// AMP #2884: a headless override beats a configured `launch`; no override keeps it (the chat).
+    #[test]
+    fn a_dispatch_override_replaces_the_configured_mode_and_none_keeps_it() {
+        let mut headless = configured(DispatchMode::Launch);
+        override_dispatch(&mut headless, Some(DispatchMode::Await));
+        assert_eq!(headless.dispatch, DispatchMode::Await);
+
+        let mut chat = configured(DispatchMode::Launch);
+        override_dispatch(&mut chat, None);
+        assert_eq!(chat.dispatch, DispatchMode::Launch);
+
+        let mut chat_default = configured(DispatchMode::Await);
+        override_dispatch(&mut chat_default, None);
+        assert_eq!(chat_default.dispatch, DispatchMode::Await);
+    }
 }
