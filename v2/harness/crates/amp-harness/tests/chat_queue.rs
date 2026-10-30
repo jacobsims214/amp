@@ -1073,3 +1073,95 @@ async fn no_wake_once_quitting() {
     assert_eq!(r.wakes(), 0, "{:?}", r.turns());
     assert!(!r.shell.is_running());
 }
+
+/// The newest `status` the link sent: (`busy`, `workers_running`).
+fn last_status(mock: &MockRelay) -> Option<(bool, i64)> {
+    mock.events()
+        .into_iter()
+        .rev()
+        .find(|e| e["op"] == "status")
+        .map(|e| {
+            (
+                e["body"]["busy"].as_bool().unwrap_or(false),
+                e["body"]["workers_running"].as_i64().unwrap_or(-1),
+            )
+        })
+}
+
+/// AMP #2838: a paired device sees `busy` while a manager reply runs (an automatic wake turn is
+/// one) and never because workers run: an idle manager with a live worker reports not busy, with
+/// the worker in `workers_running`, and takes the device's prompt at once. A prompt sent during
+/// the wake turn queues, and starts as soon as the turn ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_busy_is_the_managers_reply_not_its_workers() {
+    let mut r = rig("remote-busy").await;
+    let mock = MockRelay::start(MockOptions::default()).await;
+    let (link, device) = r.pair(&mock).await;
+    r.shell.set_remote(Ok(link.clone()), None);
+    let mut seq = now_ms();
+    let acks = |result: &str| {
+        count(&mock, |e| {
+            e["op"] == "ack" && e["body"]["op"] == "prompt" && e["body"]["result"] == result
+        })
+    };
+
+    // An active reply is busy (its end held back, as a slow reply's would be).
+    seq += 1;
+    assert!(mock.send_command(&prompt(&mock, &device, seq, "run ticket 9001")));
+    r.until_holding("the launch reply, busy", |r| {
+        r.shell.is_running()
+            && r.turns().len() == 1
+            && r.worker_live()
+            && last_status(&mock).is_some_and(|(busy, _)| busy)
+    })
+    .await;
+
+    // The reply ends, the worker runs on: not busy, the worker counted apart.
+    r.until("idle with the worker running, not busy", |r| {
+        !r.shell.is_running() && r.worker_live() && last_status(&mock) == Some((false, 1))
+    })
+    .await;
+    seq += 1;
+    assert!(mock.send_command(&prompt(&mock, &device, seq, "status from the phone")));
+    r.until("the phone's prompt to start at once", |r| {
+        acks("started") == 2 && r.turns().len() == 2 && !r.shell.is_running()
+    })
+    .await;
+    assert_eq!(acks("queued"), 0, "a running worker queued the prompt");
+    assert!(r.worker_live());
+
+    // The worker ends: the automatic wake turn is a reply, so busy.
+    r.until("not busy again", |_| {
+        last_status(&mock).is_some_and(|(busy, _)| !busy)
+    })
+    .await;
+    r.open_gate(A);
+    r.until_holding("the wake turn, busy", |r| {
+        r.wakes() == 1 && last_status(&mock).is_some_and(|(busy, _)| busy)
+    })
+    .await;
+    assert!(r.shell.is_running());
+    seq += 1;
+    assert!(mock.send_command(&prompt(&mock, &device, seq, "and next?")));
+    r.until_holding("the prompt to queue behind the wake turn", |_| {
+        acks("queued") == 1
+    })
+    .await;
+
+    // The wake turn ends: busy clears and the queue starts the next prompt.
+    r.until("the queued prompt's turn", |r| {
+        r.turns().len() == 4 && !r.shell.is_running()
+    })
+    .await;
+    let turns = r.turns();
+    assert!(turns[2].contains(WAKE_PROMPT), "{turns:?}");
+    assert!(
+        turns[3].contains("[remote: Safari on iPhone] and next?"),
+        "{turns:?}"
+    );
+    r.until("not busy, no workers", |_| {
+        last_status(&mock) == Some((false, 0))
+    })
+    .await;
+    link.disable().await;
+}
